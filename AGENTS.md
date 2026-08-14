@@ -1,712 +1,784 @@
-# AGENTS.md（重构版）
+---
+# Glassbox
+
+> **面向 coding agents 的开源开发工具与实验基础设施**
+>
+> 看到你的 coding agent 实际做了什么
+> 调试它为什么失败
+> 对比什么有效
+> 将已验证的研究转化为可复用的 agent 能力
+
+Glassbox 运行在现有 coding agents 之上，例如 Claude Code、Codex 和 Pi。
+
+我们**不构建新的 coding agent**。
+`
+我们让现有 agent 变得：
+
+* 可观测（observable）
+* 可调试（debuggable）
+* 可对比（comparable）
+* 可复现（reproducible）
+* 可评估（evaluable）
+* 并最终可以通过证据持续改进
+
+项目背后的长期研究问题是：
+
+> **agent 的经验如何转化为能力？**
+
+产品问题更简单：
+
+> **我们能否让 agent 行为足够可观测，从而让改进 agent 变成工程问题，而不是猜测？**
 
 ---
 
-# 1. 项目是什么
+# 本项目是什么
 
-Glassbox Agent Harness 是一个面向本地 AI Agent 的：
+Glassbox 是一个**研究驱动的开源开发产品**。
 
-> **飞行记录器 + 实验室 + 可观测 Harness + 自我进化系统**
+研究负责发现机制。
 
-它的核心不是“做一个 Agent”，而是：
+产品负责将机制交付给用户。
 
-> **让 Claude Code / Codex / Pi 这些 Agent 的行为变得可观测、可复现、可比较、可进化**
+循环如下：
 
-我们不替代 Agent，我们只做一件事：
+```text
+论文 / 问题
+      ↓
+假设
+      ↓
+原型
+      ↓
+真实 agent 运行
+      ↓
+trace
+      ↓
+评估
+      ↓
+证据
+      ↓
+回归验证
+      ↓
+推广
+      ↓
+产品能力 / Glassbox Pack
+```
 
-* 让 Agent 的每一次执行都变成可分析的数据
+研究结果不是因为“论文复现成功”就结束。
 
-系统负责：
+而是在我们真正理解以下问题时才结束：
 
-* 启动 / 隔离 Agent Run
-* 捕获所有执行事件（Event Ledger）
-* 统一不同 Agent 的行为语义
-* 重建模型真实 Context
-* 追踪 Tool / Skill / Memory 生命周期
-* 保存 Workspace / Diff / Artifact
-* 做 Eval / Replay / Fork
-* 对比不同 Agent / 不同策略
-* 从 Trace 中提取 Experience
-* 为未来 Self-Improvement 提供数据基础
-
-核心问题：
-
-> **Agent 的经验，如何变成可验证的能力？**
+1. 它解决了什么问题
+2. 什么时候有效
+3. 什么时候失效
+4. 成本是什么
+5. 是否可泛化
+6. 是否值得成为产品能力
 
 ---
 
-# 2. 我们不是什么
+# 产品形态
+
+Glassbox 有三层产品结构：
+
+## Observe（观测层）
+
+理解 agent 实际做了什么。
+
+例如：
+
+* 执行时间线
+* tool 调用
+* tool 返回
+* 文件变更
+* context snapshot
+* context 来源
+* context diff
+* skill 生命周期
+* reasoning（显式或摘要）
+* 错误
+* 恢复过程
+* token / 时间数据
+
+可以理解为：
+
+> **agent 的飞行记录器**
+
+---
+
+## Lab（实验室）
+
+用于实验 agent 行为。
+
+例如：
+
+* Claude vs Codex vs Pi
+* Skill ON / OFF
+* Harness v1 vs v2
+* context policy A vs B
+* replay
+* rerun
+* fork
+* benchmark
+* 回归评估
+* failure attribution
+
+可以理解为：
+
+> **agent 的 A/B 测试与调试实验室**
+
+---
+
+## Packs（能力包）
+
+将已验证研究转化为可应用能力。
+
+例如：
+
+```text
+verification
+context-hygiene
+tool-recovery
+debugging
+skill-routing
+memory-policy
+```
+
+一个 Pack 可能包含：
+
+* trigger 逻辑
+* 指令
+* context policy
+* skill 行为
+* verification 规则
+* evaluator
+* 回归任务
+* 其存在的证据
+
+在至少两个真实能力被推广之前，不要设计通用 Pack 框架。
+
+抽象必须从证据中自然出现。
+
+---
+
+# 本项目不是什么
 
 Glassbox 不是：
 
-* Claude Code / Codex / Pi 的替代品
-* 聊天 UI
-* Prompt 管理工具
-* Agent workflow builder
-* LangChain / MCP 平台
-* “万能 Agent 框架”
-* Demo dashboard 工具
+* 另一个 Claude Code
+* 另一个 Codex
+* 另一个 Pi
+* chatbot 框架
+* 通用 agent builder
+* workflow 自动化平台
+* LangChain 替代品
+* prompt 管理 SaaS
+* MCP marketplace
+* 模型抽象层
+* 论文复现仓库
+* “漂亮 trace dashboard”
+* “自进化 AI 平台”
 
-原则只有一句：
+我们复用现有 agent。
 
-> **Reuse agents. Observe them. Compare them. Improve them.**
+我们观测它们、测试它们、理解它们，并改进它们周围的软件。
 
----
-
-# 3. 永远不能妥协的原则
-
-## 3.1 Context 必须可重建
-
-任何进入模型 Context 的内容必须能回答：
-
-* 是什么内容
-* 从哪里来
-* 谁引入的
-* 什么时候引入
-* 为什么引入
-* 属于哪个 Run / Event / File / Skill
-
-不能出现：
-
-> “应该在 context 里，但我们不知道具体是什么”
-
-否则必须标记：
-
-`opaque`
+> **带上你的 agent，保留你的 agent，在外面加一层 Glassbox**
 
 ---
 
-## 3.2 Event 是唯一事实源
+# Glassbox 的核心特性
 
-UI / DB / cache 都不是事实。
-
-唯一事实源：
-
-> **Event Ledger（追加式事件流）**
-
-结构必须是：
-
-Execution → Event → Projection → UI / Eval / Replay
-
-禁止反向推理 UI 状态。
+以下原则不可妥协：
 
 ---
 
-## 3.3 不允许伪造可观测性
+## 1. Glassbox 必须是“玻璃盒”
 
-所有 reasoning 必须分类：
+我们存在的原因是 agent 不透明。
 
-* exposed（模型真实输出）
-* summary（模型/系统总结）
-* derived（系统推导）
-* opaque（不可见）
+不能引入新的隐藏行为。
 
-禁止把 derived 当成 model internal thought。
+用户必须能够回答：
 
----
+```text
+发生了什么？
+agent 看到了什么？
+context 从哪里来？
+调用了哪个 tool？
+加载了哪个 skill？
+哪里失败了？
+哪里发生变化？
+有什么证据支持这个解释？
+```
 
-## 3.4 Context 必须有 provenance
+如果 Glassbox 不知道，就必须说不知道。
 
-每个 Context Block 必须包含：
-
-* content
-* source / source_id
-* introduced_at
-* introduced_by
-* scope
-* content_hash
-* token_count
-* visibility
-* reason（如果可知）
+不能编造。
 
 ---
 
-## 3.5 所有优化必须有证据
+## 2. model 所见必须可重建
 
-禁止：
+如果 Glassbox 声称某信息进入 context，则必须能恢复：
 
-* “感觉更好”
-* “应该提升效果”
+```text
+内容
+来源
+来源身份
+进入时间
+引入者
+作用域
+版本 / hash
+可见性
+token 贡献（如果可得）
+```
 
-必须有：
+context 不是字符串，而是：
 
-before / after + 可对比：
+```text
+内容 + 来源 + 生命周期 + 作用域
+```
+
+如果 provider 不支持完整恢复，则必须标记：
+
+* partial
+* opaque
+
+不能伪造完整性。
+
+---
+
+## 3. event 是唯一事实源
+
+核心数据流：
+
+```text
+执行
+  ↓
+原始事件
+  ↓
+标准化事件
+  ↓
+事件账本（Event Ledger）
+  ↓
+projection
+  ↓
+CLI / UI / eval / replay
+```
+
+UI 不能成为事实源。
+
+不能从 UI 反推历史事实。
+
+所有行为必须来自事件。
+
+---
+
+## 4. 原始证据不可变
+
+provider 原始输出是证据。
+
+一旦记录：
+
+* 不能静默修改
+* 不能覆盖
+
+可以演化的是：
+
+* normalization
+* classification
+* projection
+* annotation
+* evaluation
+* failure analysis
+
+但不能覆盖原始事实。
+
+---
+
+## 5. 不允许伪造可观测性
+
+不能声称访问模型未暴露的信息。
+
+必须区分：
+
+```text
+exposed（真实暴露）
+summary（摘要）
+derived（推导）
+opaque（不可见）
+```
+
+derived 必须明确标注。
+
+不能伪装成 hidden chain-of-thought。
+
+---
+
+## 6. 每个改进必须有证据
+
+不是证据：
+
+> “这个 prompt 感觉更好”
+
+也不是：
+
+> “论文说应该有效”
+
+必须有对比：
+
+```text
+baseline vs treatment
+```
+
+在相同条件下：
 
 * task
 * workspace
 * agent
 * environment
-* eval
+* config
+* evaluator
 
-没有 eval = 不算优化。
+记录：
+
+* 成功率
+* 失败
+* 回归
+* 成本
+* latency
+* tool 行为
+* context 影响
+* 质量指标
+
+没有证据，不进入产品。
 
 ---
 
-## 3.6 Failure 是核心数据
+## 7. failure 是一等数据
 
-失败不是垃圾。
+失败 run 往往比成功更有价值。
 
 必须保留：
 
-* event
+* events
 * context
-* tool call / result
+* tool calls
+* tool results
+* errors
 * workspace diff
-* error
 * skill lifecycle
-* eval
-* failure classification
+* evaluation
+* artifacts
 
-失败比成功更重要。
+不能只做：
 
----
-
-## 3.7 Adapter 必须隔离
-
-Claude / Codex / Pi 差异只能存在：
-
-> `adapters/`
-
-禁止污染 core：
-
-```ts
-if (agent === "claude") ...
+```text
+PASS / FAIL
 ```
 
-如果出现 → abstraction 已失败。
+---
+
+## 8. 现有 agent 保持原样
+
+Claude / Codex / Pi 仍然负责自己的执行循环。
+
+adapter 只是桥。
+
+不能重写 agent 行为。
+
+如果要实现：
+
+* planning loop
+* tool loop
+* autonomy
+
+必须先问：
+
+> 为什么现有 agent 不能自己做？
+
+没有强理由就不要做。
 
 ---
 
-## 3.8 原始数据不可修改
+## 9. 复杂性必须在边界
 
-Raw Event 一旦写入：
+provider 复杂性在 adapter。
 
-* 不可修改
-* 只能追加 normalization / projection / annotation
+副作用在 runtime。
 
----
+核心必须简单。
 
-## 3.9 Replay / Rerun / Fork 必须区分
+UI 只做 projection。
 
-* replay：重放事件
-* rerun：重新执行任务
-* fork：从状态分支新实验
-
-不能混用。
+不要把 provider 分支泄漏到 core。
 
 ---
 
-## 3.10 简单优先于聪明
+## 10. 本地优先
 
-优先：
+Glassbox 处理敏感信息：
 
-* 单模块
-* 明确接口
+* 源码
+* prompt
+* tool output
+* 文件路径
+* 可能的凭证
+* 对话历史
 
-禁止：
+不能默认上传。
 
-* 过早 plugin system
-* registry / factory / orchestrator 过度设计
+不能默认云依赖。
+
+所有远程能力必须显式。
 
 ---
 
-# 4. 项目负责人的说明
+## 11. 核心必须开放
 
-这是一个：
+核心必须可读、可 fork、可扩展。
 
-> **边研究 Agent，边构建真实系统的工程实验**
+研究逻辑必须可见。
 
-允许：
+benchmark 方法必须可见。
 
-* 推翻设计
-* 删除模块
-* 重做 schema
-* 承认失败方法
+Pack 必须可解释。
 
-禁止：
+---
 
-* 为了代码量保留错误设计
-* 为未来需求过度设计
-* 用 demo 替代真实能力
-* 制造假数据
+# 项目原则
 
-工程优先级：
+我们要用简单系统构建强能力。
 
+不要因为“已经写了”就保留复杂性。
+
+不要因为“看起来高级”就设计架构。
+
+不要因为论文权威就照搬实现。
+
+理解机制 → 测试 → 最小模型 → 删除多余抽象
+
+优先级：
+
+```text
 清晰 > 聪明
-证据 > 感觉
-真实 > Demo
-简单 > 完整
-删除 > 抽象
+证据 > 直觉
+真实运行 > demo
+机制 > 营销
+小系统 > 大平台
+删除 > 过早抽象
+```
 
 ---
 
-# 5. 共同领域语言
+# 共享语言
 
-必须统一以下概念：
+## you
 
-## Agent
+当前修改仓库的 agent / contributor
 
-外部执行系统（Claude / Codex / Pi）
+## we / maintainers
 
-## Adapter
+维护 Glassbox 的人
 
-将 Agent 行为转为统一 Event
+## user
+
+使用 Glassbox 的人
+
+## agent
+
+执行任务的 coding agent
+
+例如：
+
+```text
+Claude Code
+Codex
+Pi
+```
+
+## provider
+
+外部 agent runtime
+
+## adapter
+
+连接 provider 的适配层
 
 ## Run
 
-一次完整执行：
+一次 agent 执行
 
-Task + Agent + Workspace + Events + Result
+包含：
+
+* task
+* config
+* workspace
+* events
+* result
+* artifacts
+* evaluation
+
+## Session
+
+provider 原生会话
+
+## Turn
+
+一次交互轮次
+
+## Step
+
+内部执行单元（不统一）
+
+## Raw Event
+
+原始 provider 事件
 
 ## Event
 
-最小事实单位（tool call / file write / message）
+标准化事件
 
-## Event Ledger
-
-append-only 事件流
-
-## Context Block
-
-可追溯的模型输入单元
-
-## Trajectory
-
-Run 的行为序列 projection
-
-## Skill
-
-可加载能力单元
-
-## Workspace
-
-Agent 执行环境
-
-## Artifact
-
-输出产物
-
-## Eval
-
-对 Run / Behavior 的评估
-
-## Failure
-
-失败状态（可存在于成功 Run）
-
-## Replay / Rerun / Fork
-
-三种不同执行语义
-
----
-
-# 6. 最容易破坏系统的行为
-
-* 先做 dashboard（没有 event）
-* 统一所有 agent 行为（忽略差异）
-* 只保存 final output
-* log 用字符串
-* JSON blob 代替模型
-* 无限增加 event type
-* 过早 plugin system
-* 过早 microservice
-* 过早 database 复杂化
-* 自己重新实现 agent loop
-* 使用假数据做 eval
-
----
-
-# 7. 修改必须覆盖的范围
-
-## Adapter 修改
-
-必须检查：
-
-* raw event capture
-* normalization
-* lifecycle
-* capability
-* trace completeness
-
-## Event Schema 修改
-
-必须检查：
-
-* serialization
-* replay
-* projection
-* UI
-* migration
-* tests
-
-## Context 修改
-
-必须检查：
-
-* provenance
-* reconstruction
-* diff
-* token accounting
-
-## Skill 修改
-
-必须检查：
-
-* lifecycle
-* execution
-* failure
-* selection
-
-## Eval 修改
-
-必须检查：
-
-* deterministic
-* regression
-* input stability
-
-## Workspace 修改
-
-必须检查：
-
-* isolation
-* cleanup
-* failure recovery
-
-## UI 修改
-
-必须能回答：
-
-> 这个 UI 数据来自哪个 Event？
-
----
-
-# 8. 系统如何工作
-
-Task
-→ Run Config
-→ Workspace Isolation
-→ Adapter
-→ Agent Execution
-→ Raw Events
-→ Normalizer
-→ Event Ledger
-→ Projections
-→ Context / Trajectory / Artifact
-→ Eval
-→ Failure Analysis
-→ Replay / Fork / Experience
-
----
-
-# 9. P0 范围
-
-只做：
-
-* Adapter
-* Event Ledger
-* Workspace isolation
-* Context reconstruction
-* Trajectory
-* Basic Eval
-
-首批 Agent：
-
-* Claude Code
-* Codex
-* Pi
-
----
-
-# 10. 最小 Event 集合
+例如：
 
 ```text
 run.started
-run.completed
-run.failed
-
-turn.started
-turn.completed
-
-agent.message
-
 tool.call
-tool.result
-tool.error
-
 file.change
-
-context.snapshot
-
-reasoning.exposed
-reasoning.summary
-
-process.started
-process.completed
-
 error
+```
+
+## Event Ledger
+
+事件账本（唯一事实源）
+
+## Projection
+
+基于 event 的视图
+
+## Trajectory
+
+行为路径（projection）
+
+## Context Block
+
+context 单元
+
+## Context Snapshot
+
+某次模型输入的可重建状态
+
+## Context Diff
+
+snapshot 差异
+
+## Provenance
+
+来源链路
+
+## Skill
+
+可复用能力单元
+
+## Pack
+
+已验证能力集合
+
+## Workspace
+
+执行环境
+
+## Artifact
+
+输出结果
+
+## Eval
+
+评估过程
+
+## Failure
+
+失败行为
+
+## Replay
+
+重放历史
+
+## Rerun
+
+重新执行
+
+## Fork
+
+分支执行
+
+## Experiment
+
+实验
+
+## Evidence
+
+证据
+
+## Promotion
+
+从 research → product
+
+## Regression
+
+回归问题
+
+---
+
+# 最容易破坏 Glassbox 的方式
+
+## 1. 编造观测信息
+
+不能伪造不可见信息
+
+---
+
+## 2. 修改历史证据
+
+raw event 不可变
+
+---
+
+## 3. 破坏用户机器
+
+不能随意 kill process / 删除文件
+
+---
+
+## 4. provider 逻辑泄漏到 core
+
+禁止 if (provider === ...)
+
+---
+
+## 5. 过早产品化研究
+
+没有证据不能进 product
+
+---
+
+## 6. 先做 dashboard 再做数据
+
+数据优先
+
+---
+
+## 7. 为不存在的 provider 设计抽象
+
+只为真实 provider 建模
+
+---
+
+## 8. 把 Glassbox 变成 agent
+
+不要重写 agent loop
+
+---
+
+# Research 是一等流程
+
+```text
+问题
+↓
+论文
+↓
+假设
+↓
+原型
+↓
+真实运行
+↓
+测量
+↓
+失败分析
+↓
+结果
 ```
 
 ---
 
-# 11. Observability Capability
+# Research → Product gate
 
-每个 Adapter 必须声明：
+必须回答：
+
+* problem
+* hypothesis
+* baseline
+* treatment
+* real runs
+* eval
+* cost
+* regression
+* scope
+* evidence
+
+---
+
+# Stable vs Research
+
+## research/
+
+回答：
+
+> 什么可能有效
+
+## packages/
+
+回答：
+
+> 什么已经被证据证明值得产品化
+
+---
+
+# 产品形态
+
+* CLI
+* Web UI
+* Agent integration
+* Packs
+
+---
+
+# Observability
+
+必须区分：
 
 * full
 * partial
 * opaque
 
-不能假装有数据。
+---
+
+# Event / Context / Skill / Failure / Eval / Replay / Fork
+
+全部必须基于证据，不允许虚构。
 
 ---
 
-# 12. 数据设计原则
+# 工程原则
 
-* Event append-only（JSONL / SQLite）
-* ID 全局唯一（run_x / event_x）
-* UTC 时间
-* raw payload 保留
-* 不做过早 schema explosion
-
----
-
-# 13. 目录职责
-
-```
-apps/        UI / CLI 入口
-core/        领域模型（Run / Event / Context）
-adapters/    Claude / Codex / Pi
-runtime/     process / workspace
-trace/       event ledger / normalize / replay
-eval/        evaluation system
-ui/          visualization
-experiments/ research
-fixtures/    test traces
-```
+* KISS
+* DRY（谨慎）
+* YAGNI
+* 小而清晰
+* 可删除
+* 可追踪
+* 可解释
 
 ---
 
-# 14. 工具链：vp
-
-统一使用：
-
-```bash
-vp install
-vp dev
-vp check
-vp test
-vp build
-```
-
-禁止绕过 vp。
-
----
-
-# 15. 技术语言
-
-默认：
-
-> TypeScript
-
-原因：统一 CLI / Core / Adapter / UI / Eval。
-
----
-
-# 16. Code Style
-
-* explicit > clever
-* small functions
-* domain naming
-* no Manager / Utils / Helper
-* no any（用 unknown）
-* discriminated union for events
-* comments explain why
-
----
-
-# 17. KISS
-
-优先：
-
-* function
-* simple module
-* explicit interface
-
-禁止过早：
-
-* framework
-* plugin system
-* DSL
-
----
-
-# 18. DRY
-
-重复可以接受，直到：
-
-> 同一知识出现 3 次以上才抽象
-
----
-
-# 19. YAGNI
-
-禁止提前做：
-
-* distributed system
-* plugin marketplace
-* agent framework
-* RL training system
-* multi-agent orchestration
-
----
-
-# 20. Error Handling
-
-必须包含：
-
-* run id
-* agent
-* event
-* command
-* stderr
-* context
-
----
-
-# 21. Logging
-
-区分：
-
-* Application Log（系统自身）
-* Event Ledger（Agent 行为）
-
-不能混用。
-
----
-
-# 22. 最小验证
-
-每次修改必须：
-
-```bash
-vp check
-vp test
-```
-
----
-
-# 23. Adapter 测试
-
-必须有：
-
-* real session fixture
-* raw → normalized → expected
-
----
-
-# 24. Event Schema 测试
-
-必须验证：
-
-* serialize
-* deserialize
-* replay
-* identity
-
----
-
-# 25. Context 测试
-
-必须验证：
-
-* provenance
-* reconstruction
-
----
-
-# 26. Workspace 测试
-
-必须覆盖：
-
-* clean / dirty
-* success / failure
-* cleanup
-
----
-
-# 27. Bug 修复规则
-
-Reproduce → Test → Fix → Verify
-
-必须加 regression test。
-
----
-
-# 28. 修改完成标准
-
-必须满足：
-
-* 代码完成
-* 类型检查
-* 测试通过
-* 不破坏边界
-* 文档同步
-
----
-
-# 29. 工程品味
-
-核心原则：
-
-* boring core
-* data before UI
-* evidence before intelligence
-* observation before optimization
-* build mechanisms, not demos
-* delete aggressively
-* visible causality
-
----
-
-# 30. Agent 行为规范
-
-禁止：
-
-* 顺手重构
-* 未来优化
-* 引入新 abstraction
-* 修改无关代码
-* 伪造数据
-
-必须：
-
-* 最小修改
-* 保持语义
-* 明确报告未验证部分
-
----
-
-# 31. 当前优先级
-
-唯一目标：
-
-Claude / Codex / Pi → Event → Context → Trajectory → Eval
-
----
-
-# 32 coding style
-1. yagni
-2. kiss
-3. dry
-
-# 33. 最终原则
-
-> Every action is observable.
-> Every context has provenance.
-> Every improvement has evidence.
+# 最终原则
+
+> 每个行为都必须可观测
+> 每个 context 都必须有来源
+> 每个改进都必须有证据
 
 以及：
 
-> Keep the system small enough that we can still understand why the agent did what it did.
+> 系统必须小到我们仍然能解释 agent 为什么这么做
 
