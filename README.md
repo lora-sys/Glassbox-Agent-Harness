@@ -1,228 +1,238 @@
 # Glassbox
 
-> **看清你的编码 Agent 到底做了什么。**
+Glassbox 是一个以画布为核心的 AI Agent 工作台，用来运行、检查和干预本机上的 Agent。
 
-Glassbox 是一个开源的可观测性与实验层，用于编码 Agent。
+Agent 的工作不该埋在一条不断滚动的聊天记录里。Glassbox 会把计划、动作、文件、Diff、测试、产物、审批和结果变成画布上的对象。你可以检查、移动、分组、批注，也可以过一段时间再回来继续。
 
-它运行在你本地已经在使用的 Agent 之上——目前支持 **Claude Code、Codex 和 Pi**。
+## 为什么要做这个？
 
-Glassbox 不会替代它们。
+短任务用聊天就够了。任务一长，问题就出来了。
 
-它的作用是让它们更容易被**观察、调试、对比、评估与改进**。
+Agent 开始读文件、改代码、跑工具、生成 Diff、请求审批、留下各种产物。你很快会忘记它到底做了什么，重要结果夹在几十条消息中间，工具调用也会变成噪音。重新打开一次会话，往往要先滚半天聊天记录，再在脑子里把状态拼回来。
 
-```text
-Claude Code ─┐
-Codex ───────┼──→ Glassbox ──→ Trace / Context / Tools / Skills / Failures / Eval
-Pi ──────────┘
-```
+Glassbox 换了一种做法。
 
-## 为什么需要它？
+画布就是工作区。Agent 的活动先变成结构化状态，其中真正有用的部分再变成画布上的对象。
 
-编码 Agent 很强大，但它们的执行过程通常很难被看清。
+原始事件仍然可以查看，但不会默认全部变成节点。
 
-当一个 Agent 失败时，我们想知道：
+Glassbox 也不打算替代你已经在用的 Agent。Provider Adapter 负责连接现有 Agent Runtime，把它们放进同一个工作区，同时保留各自真正有用的能力。
 
-* 它到底“看到了”什么？
-* 这些上下文从哪里来的？
-* 调用了哪些工具？
-* 加载了哪些 skills？
-* 从哪里开始出错的？
-* 为什么一个 Agent 成功而另一个失败？
-* 一个新的 skill / prompt / harness 改动是否真的带来了提升？
+## Glassbox 不是什么
 
-Glassbox 把 Agent 的执行过程变成可以被**观察与实验**的对象。
+Glassbox 不是在聊天应用旁边加一块白板。
 
-可以理解为：
+它也不是那种必须先拖节点、搭流程，Agent 才能开始工作的 Workflow Builder。
 
-> **飞行记录器 + DevTools + Agent 实验室**
+它更不是一个要求所有 Provider 都长得一样的新 Agent Runtime。
 
-## 我们在做什么
+事情没那么复杂。让 Agent 真正跑起来，把它做过的工作留下来，再给人一个能看、能改、能继续指挥的地方。
 
-### 观察（Observe）
+## 它怎么工作
 
-查看真实的 Agent 运行过程：
+Web 客户端通过带类型的 HTTP 和 WebSocket Contract 连接本地 TypeScript Runtime。
 
-* 执行时间线
-* 工具调用与结果
-* 文件变更
-* 上下文快照
-* 上下文来源（provenance）
-* 上下文差异（diff）
-* skill 生命周期
-* 错误与恢复过程
-* token 与耗时数据
+用户操作先变成 Command。不同 Provider 的 Adapter 负责连接 Codex、Claude Code、Pi、ACP-compatible Agent 和其他 Runtime，再把各自的原生活动转换成 Glassbox Event。
 
----
+Session Reducer 根据这些 Event 得到当前 Run State。
 
-### 实验（Lab）
-
-运行对比实验：
+Canvas Projector 决定哪些状态值得出现在 tldraw Board 上。
 
 ```text
-Claude vs Codex vs Pi
-
-Skill 关闭 vs Skill 开启
-
-Harness v1 vs Harness v2
-
-Context A vs Context B
+Provider
+  ↓
+Adapter
+  ↓
+Glassbox Event
+  ↓
+Session State
+  ↓
+Canvas Projector
+  ↓
+tldraw Board
 ```
 
-可以回放运行过程，对比行为，分析失败路径，并最终基于某次执行状态“分叉”实验。
+画布不是 Agent 执行状态的 Source of Truth。
 
----
+Board 的布局、分组和用户批注属于工作区。Agent 的执行状态属于 Runtime。刷新浏览器不应该杀掉正在运行的任务。
 
-### 改进（Improve）
+## 最核心的想法
 
-Glassbox 同时也是一个研究项目。
+一次 Agent Run 可能产生几百甚至几千条 Event。
 
-我们会研究现代 Agent 相关方法，在真实编码 Agent 上验证，并只保留那些通过评估与回归测试的机制。
+把每一条都扔到画布上会非常糟糕。
 
-```text
-研究
-  ↓
-实验
-  ↓
-真实运行
-  ↓
-证据
-  ↓
-回归验证
-  ↓
-产品能力
+Glassbox 会保留需要检查的原始活动，再把真正有用的状态整理成对象，例如：
+
+- 任务和计划
+- 值得保留的工具活动
+- 文件和 Diff
+- 测试结果
+- 来源
+- 审批
+- 产物
+- 最终结果
+- 用户批注
+
+Object Model 会先保持小。只有真实使用证明需要更多类型时再加。
+
+## 从源码运行
+
+Glassbox 使用 Vite+。
+
+先安装全局 `vp` 命令。
+
+### macOS 和 Linux
+
+```bash
+curl -fsSL https://vite.plus | bash
 ```
 
-长期目标很简单：
+### Windows
 
-> **让 Agent 的改进变成一门科学。**
-
-## 核心原则
-
-Glassbox 由三条原则定义：
-
-> **每一个行为都必须可观测。**
-> **每一份上下文都必须有来源。**
-> **每一次改进都必须有证据。**
-
-如果某些信息无法被观测，Glassbox 会明确指出。
-
-我们不会伪造隐藏推理，也不会假装不完整的 trace 是完整的。
-
-## 当前状态
-
-Glassbox 仍然处于**非常早期阶段**。
-
-第一个目标刻意保持简单：
-
-```text
-Claude Code / Codex / Pi
-          ↓
-       Adapters
-          ↓
-   Universal Events
-          ↓
-     Event Ledger
-          ↓
-Context Reconstruction
-          ↓
-      Trajectory
-          ↓
-      Basic Eval
+```powershell
+irm https://vite.plus/ps1 | iex
 ```
-
-不做庞大的 Agent 平台。
-
-不引入新的 Agent loop。
-
-不做“自进化系统”的幻想设计。
-
-第一步只是：
-
-> 让现有 Agent 变得可见。
-
-然后再从可见性中学习。
-
-## 研究驱动开发
-
-研究与产品并行，但实验性想法不会自动进入产品。
-
-```text
-research/
-    ↓
-什么可能有效？
-
-packages/
-    ↓
-什么值得进入产品？
-```
-
-负结果同样有价值。
-
-我们更关心的是**为什么有效**，而不是简单收集论文里的功能。
-
-## 开发方式
-
-Glassbox 使用 **Vite+** 和 `vp` 作为工具链。
 
 安装依赖：
 
 ```bash
-vp install
+vp i
 ```
 
-启动开发：
+启动 Web App 和本地 Runtime：
 
 ```bash
-vp dev
+vp run dev
 ```
 
-检查项目：
+开发环境统一使用相对路径 `/api` 和 `/ws`。不要把 localhost 或固定开发端口写进客户端代码。
 
-```bash
-vp check
-```
+每个 worktree 都应该把可写的开发状态放在自己的、被 gitignore 的 `.glassbox/` 目录里。
 
-运行测试：
+不要让开发环境或测试指向真实 Glassbox 安装的数据。
 
-```bash
-vp test
-```
-
-构建：
-
-```bash
-vp build
-```
-
-在进行重大修改前，请先阅读 [`AGENTS.md`](./AGENTS.md)。
-
-其中包含项目的工程原则、领域语言、研究到产品的规则、架构边界与验证要求。
-
-## 项目方向
-
-Glassbox 的最终目标是：
-
-让你继续使用自己喜欢的 coding agent，同时在外层加一层统一的观测与实验能力。
+## 项目结构
 
 ```text
-                  Glassbox
+apps/
+  server/
+  web/
 
-        观察   实验   改进
-           │      │      │
-      ┌────┴──────┴──────┴────┐
-      │                        │
- Claude Code     Codex        Pi
+packages/
+  contracts/
+  shared/
+  agent-runtime/
+
+.repos/
+docs/
 ```
 
-带上你的 Agent。
+`apps/server` 负责本地 Runtime、HTTP 和 WebSocket Transport、Provider Adapter、Session 生命周期和 Event Normalization。
 
-保留你的 Agent。
+`apps/web` 负责 React 和 Vite+ 应用、tldraw 集成、Board Projection、Inspector、Composer 和用户交互。
 
-在外面加上 Glassbox。
+`packages/contracts` 放跨进程共享的 Schema、Command、Event Type 和少量 Helper。不要把 Provider 实现或重 Runtime 逻辑塞进这里。
 
----
+`packages/shared` 只放真正共享的小工具。Keep it boring.
 
-**Glassbox**
+`packages/agent-runtime` 只在多个 App 真的需要共享 Session、Run、Capability 或 Normalized Event 逻辑时再使用。不要因为“以后可能会共享”就提前搬进去。
 
-*面向编码 Agent 的开源开发工具与实验基础设施。*
+`.repos/` 放只读的上游参考项目。可以研究，不要修改，也不要让生产代码直接 import 这里的实现。
 
+## 我们在意的几条规则
+
+Provider 的怪脾气留在 Adapter 里。
+
+tldraw 的特殊逻辑留在 Web 的 Projection 和 Rendering 层。
+
+两边都不要漏进核心 Session Model。
+
+不要把每一条原始 Event 都变成节点。
+
+不要给还不存在的 Provider、Client、Protocol 或部署方式提前造抽象。
+
+UI 不能骗人。Spinner 出现时，底层工作必须真的还没结束。Success 出现时，底层状态必须真的已经完成。假的进度、过期的状态文字、没有回滚路径的乐观状态，都算 Bug。
+
+Canvas 在长时间 Agent Run 期间也要保持顺滑。注意大范围 React Re-render、过多的 Live Shape、一直在刷新的视觉效果、超大的 Diff，以及无限增长的 UI State。
+
+成熟实现已经解决好的问题，优先复用。拥有更多代码不是目标。
+
+## 测试
+
+除非你测试的就是 Empty State，否则不要只拿空工作区做测试。
+
+真实 Session、Board、文件和 Agent Run 更容易暴露小 Fixture 看不到的问题。
+
+测试状态留在 worktree 内。需要真实数据时，先复制或 Snapshot 到 worktree。
+
+不要把开发状态软链接到真实状态。
+
+测试 Agent 只能写测试工作区里的路径。
+
+> Copy in. Never point in. Never write back.
+
+修改代码后，用最小但足够证明结果的检查。
+
+默认不要跑整个仓库的检查。只跑和本次改动有关的测试、Lint 和 Typecheck。完整 Suite 交给 CI，除非 Maintainer 明确要求本地跑。
+
+异步测试必须等待真实完成信号或状态变化。不要靠随便 `sleep` 几秒让测试通过。
+
+如果改动涉及 Selection、Grouping、Persistence、Restore、Drag-and-drop 或 Inspector，Canvas 测试既要检查底层状态，也要检查真实 UI 行为。
+
+## Pull requests
+
+除非开发者明确要求，否则不要创建 PR。
+
+Commit 标题使用 Conventional Commit，语言直白：
+
+```text
+fix(canvas): restored boards keep node selection
+```
+
+PR Body 保持短。先说问题，再说怎么修。
+
+UI 改动需要 Before 和 After 图片。涉及 Motion、Timing 或 Drag-and-drop 时，需要一个短视频。
+
+一个 PR 只做一件事。如果描述里开始出现 "also" 或 "while here"，拆开。
+
+盯一个已经打开的 PR 时，只处理最后一次 Push 之后新增的 Check 和 Comment。Bot 的发现先回到源码验证，再决定要不要改。真的问题就修，误报就解释清楚。
+
+没新东西就别动。
+
+最新 Commit 全绿以后就停。
+
+## 文档
+
+项目文档放在 `docs/`。
+
+```text
+docs/
+  user/
+  internals/
+  operations/
+```
+
+用户能感知到的行为写进 `docs/user/`。
+
+架构和贡献者说明写进 `docs/internals/`。
+
+运维步骤写进 `docs/operations/`。
+
+共享术语统一放在：
+
+```text
+docs/internals/glossary.md
+```
+
+如果你要修改 Glassbox 本身，先读 `AGENTS.md`。
+
+## 当前状态
+
+Glassbox 还很早。
+
+Canvas Model、Provider Adapter、Persistence 规则和交互方式都会在真实使用中继续变化。
+
+这反而更需要现在把系统保持小。
+
+只做当前问题真的需要的东西。做出来，测一下，留下有效的。不要为一个还不存在的 Glassbox 版本提前把仓库塞满架构。
