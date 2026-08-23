@@ -1,5 +1,9 @@
 # Glassbox
 
+<p align="center">
+  <img src="./assets/readme/hero-v1.webp" width="100%" alt="Glassbox keeps plans, diffs, tests, approvals, and results visible on an inspectable agent canvas" />
+</p>
+
 Glassbox 是一个以画布为核心的 AI Agent 工作台，用来运行、检查和干预本机上的 Agent。
 
 Agent 的工作不该埋在一条不断滚动的聊天记录里。Glassbox 会把计划、动作、文件、Diff、测试、产物、审批和结果变成画布上的对象。你可以检查、移动、分组、批注，也可以过一段时间再回来继续。

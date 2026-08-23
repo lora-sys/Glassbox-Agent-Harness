@@ -1,0 +1,8 @@
+Use case: illustration-story
+Asset type: reusable transparent cutout subject for a GitHub README hero
+Reference: canonical lora + Mochi v2 character reference.
+Scene: lora stands in a focused three-quarter pose and arranges five floating paper artifact cards representing a plan, code diff, test, approval, and finished artifact. Mochi sits beside the lower cards and holds a blank result card. Cards have shapes only and no text.
+Style: cute Japanese-anime editorial illustration, clean charcoal-black line work, restrained warm paper coloring, not photorealistic and not 3D.
+Palette: black, off-white, cream, warm gray, brown, amber, and one muted teal accent.
+Background: perfectly uniform flat #00FF00 rectangle with no gradient, texture, vignette, glow, shadow, floor, reflection, noise, or lighting variation.
+Constraints: generous padding; nothing touches the border; no text, letters, logos, watermark, node graph, dashboard, neon, or extra characters beyond lora and Mochi. PNG.
