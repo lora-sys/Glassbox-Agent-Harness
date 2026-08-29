@@ -1,0 +1,19 @@
+{
+  "name": "@glassbox/server",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "scripts": {
+    "dev": "tsx --watch src/index.ts",
+    "start": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "effect": "npm:effect@4.0.0-rc.112"
+  },
+  "devDependencies": {
+    "@types/node": "^24",
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.0"
+  }
+}

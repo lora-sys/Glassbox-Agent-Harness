@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+.pnp/
+.pnp.*
+.npm
+
+# Build outputs
+dist/
+*.tsbuildinfo
+
+# Glassbox-specific
+.glassbox/
+
+# Claude Code local settings
+.claude/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Env
+.env
+.env.local
+.env.*.local
