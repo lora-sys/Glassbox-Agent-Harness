@@ -42,7 +42,17 @@ export interface SessionEndedPayload {
   sessionId: string;
 }
 
-export type ServerPush = LiveEventPayload | DerivedStatePayload | ErrorPayload | SessionEndedPayload;
+export interface ApprovalPushPayload {
+  type: "approval";
+  threadId: string;
+  turnId: string;
+  itemId: string;
+  startedAtMs: number;
+  reason: string | null;
+  grantRoot: string | null;
+}
+
+export type ServerPush = LiveEventPayload | DerivedStatePayload | ErrorPayload | SessionEndedPayload | ApprovalPushPayload;
 
 // ---------------------------------------------------------------------------
 // Internal subscriber tracking
@@ -94,6 +104,23 @@ export function broadcastDerivedState(sessionId: string, state: Record<string, u
 }
 
 /**
+ * Push a file-change approval request to every subscriber.
+ */
+export function broadcastApproval(sessionId: string, approval: Record<string, unknown>): void {
+  const room = subscribers.get(sessionId);
+  if (!room || room.size === 0) return;
+
+  const payload: ApprovalPushPayload = { type: "approval", ...approval } as ApprovalPushPayload;
+  const data = JSON.stringify(payload);
+
+  for (const sub of room) {
+    if (sub.ws.readyState === WebSocket.OPEN) {
+      sub.ws.send(data);
+    }
+  }
+}
+
+/**
  * Push a sessionEnded notification and clean up subscribers.
  */
 export function broadcastSessionEnded(sessionId: string): void {
@@ -122,7 +149,8 @@ export function broadcastSessionEnded(sessionId: string): void {
  */
 export function attachWebSocketServer(
   httpServer: Server,
-  onInterrupt: (sessionId: string) => Promise<void> | void
+  onInterrupt: (sessionId: string) => Promise<void> | void,
+  onSubscribe?: (sessionId: string) => ApprovalPushPayload[]
 ): WebSocketServer {
   const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
 
@@ -133,12 +161,12 @@ export function attachWebSocketServer(
     const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
     const sessionId = url.searchParams.get("sessionId") ?? "";
 
-    void handleSubscribe(ws, sessionId);
+      void handleSubscribe(ws, sessionId, onSubscribe);
 
     ws.on("message", (raw) => {
       try {
         const msg = JSON.parse(raw.toString()) as ClientMessage;
-        handleMessage(ws, msg, onInterrupt);
+        handleMessage(ws, msg, onInterrupt, onSubscribe);
       } catch {
         sendError(ws, "invalid json message");
       }
@@ -166,7 +194,11 @@ export function attachWebSocketServer(
 // Internal message handlers
 // ---------------------------------------------------------------------------
 
-async function handleSubscribe(ws: WebSocket, sessionId: string): Promise<void> {
+async function handleSubscribe(
+  ws: WebSocket,
+  sessionId: string,
+  onSubscribe?: (sessionId: string) => ApprovalPushPayload[]
+): Promise<void> {
   if (!sessionId) {
     sendError(ws, "missing sessionId in query or subscribe message");
     return;
@@ -179,12 +211,24 @@ async function handleSubscribe(ws: WebSocket, sessionId: string): Promise<void> 
 
   // Acknowledge subscription
   ws.send(JSON.stringify({ type: "subscribed", sessionId }));
+
+  // Catch-up: push approval requests that fired before this client
+  // subscribed. Without this, a decision that arrives between the run POST
+  // and the WS open is invisible to the UI and can never be answered.
+  if (onSubscribe) {
+    for (const approval of onSubscribe(sessionId)) {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify(approval));
+      }
+    }
+  }
 }
 
 async function handleMessage(
   ws: WebSocket,
   msg: ClientMessage,
-  onInterrupt: (sessionId: string) => Promise<void> | void
+  onInterrupt: (sessionId: string) => Promise<void> | void,
+  onSubscribe?: (sessionId: string) => ApprovalPushPayload[]
 ): Promise<void> {
   if (msg.action === "interrupt") {
     try {
@@ -194,7 +238,7 @@ async function handleMessage(
       sendError(ws, `interrupt failed for session ${msg.sessionId}`);
     }
   } else if (msg.action === "subscribe") {
-    await handleSubscribe(ws, msg.sessionId);
+    await handleSubscribe(ws, msg.sessionId, onSubscribe);
   } else {
     sendError(ws, `unknown action: ${(msg as { action: string }).action}`);
   }

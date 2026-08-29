@@ -1,6 +1,6 @@
 // apps/server — Glassbox runtime HTTP shell with Codex adapter endpoints.
 import http from "node:http";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 
 import { CodexAdapter } from "./codex/adapter.js";
@@ -17,10 +17,30 @@ import {
   broadcastEvent,
   broadcastDerivedState,
   broadcastSessionEnded,
+  broadcastApproval,
 } from "./ws/server.js";
 
 const PORT = Number.parseInt(process.env.PORT ?? "3030", 10);
 const WORKSPACE = "/tmp/glassbox-t2.2";
+
+// Known-broken fixture for the demo workspace. /run-demo rewrites this file
+// before every run so each demo starts from the same reproducible state.
+const BROKEN_UTILS_JS = `// Demo project: a tiny module with a deliberate off-by-one bug.
+// The \`sum\` function should return the sum of all numbers from 1 to n (inclusive).
+// Bug: it uses \`i < n\` instead of \`i <= n\`, so it misses the last number.
+
+export function sum(n) {
+  let total = 0;
+  for (let i = 1; i < n; i++) {
+    total += i;
+  }
+  return total;
+}
+
+export function multiply(a, b) {
+  return a * b;
+}
+`;
 
 mkdirSync(WORKSPACE, { recursive: true });
 
@@ -58,10 +78,21 @@ interface SessionRecord {
   threadId: string;
   /** Client-provided thread identifier (for display/debug). */
   clientThreadId: string;
+  /** Workspace path for this session (used for git diff scanning). */
+  workspace: string;
   /** Active turn UUID, or null when no turn is in progress. */
   activeTurnId: string | null;
   /** Ordered list of every turn UUID for this session. */
   turnIds: string[];
+  /** Pending file-change approval requests awaiting user decision. */
+  pendingApprovals: Array<{
+    itemId: string;
+    turnId: string;
+    threadId: string;
+    reason: string | null;
+    grantRoot: string | null;
+    startedAtMs: number;
+  }>;
 }
 
 const sessions = new Map<string, SessionRecord>();
@@ -73,6 +104,7 @@ const sessions = new Map<string, SessionRecord>();
 async function startNewTurn(
   session: SessionRecord,
   instruction: string,
+  workspace: string,
   traceCollector: (method: string, params: Record<string, unknown>) => void
 ): Promise<{
   turnId: string;
@@ -88,6 +120,9 @@ async function startNewTurn(
     });
   }
 
+  // S8: Snapshot workspace before turn — detects file changes missed by event stream
+  adapter.snapshotWorkspace(workspace);
+
   // ---- Fire the turn/start request first, then collect its events.
   // The adapter emits turn/started as soon as the provider receives the
   // request, so starting first then attaching the handler still captures
@@ -95,8 +130,12 @@ async function startNewTurn(
   const turn = await adapter.startTurn(session.threadId, [
     { type: "text", text: instruction },
   ], {
-    sandboxPolicy: { type: "readOnly", networkAccess: false },
-    cwd: WORKSPACE,
+    sandboxPolicy: {
+      type: "workspaceWrite",
+      writableRoots: [workspace],
+      networkAccess: false,
+    },
+    cwd: workspace,
   });
 
   // Now attach the event collector for the new turn.
@@ -123,12 +162,30 @@ async function startNewTurn(
 
   // Register the collection handler. pushTurnCompleted ensures the promise
   // resolves exactly once when turn/completed or turn/interrupted arrives.
+  // Fall back to a 45 s timeout: the Codex CLI may omit turn/completed,
+  // and the unbounded wait below would prevent action.steer/action.send
+  // from ever being recorded in the trace.
   const turnEndPromise = new Promise<void>((resolve) => {
     adapter.registerOnTurnEnd((_status: string) => resolve());
   });
 
   await adapter.collectTurnEvents(session.threadId, turn.id, 30_000, wrappedCollector);
-  await turnEndPromise;
+  await Promise.race([
+    turnEndPromise,
+    new Promise<void>((resolve) => setTimeout(resolve, 45_000)),
+  ]);
+
+  // S8: Post-turn workspace scan — detects file changes codex omitted from events
+  const scanResult = adapter.scanAndFireHooks(workspace);
+  if (scanResult.changes.length > 0) {
+    const itemId = "git-" + turn.id.slice(0, 8);
+    traceCollector("item/fileChange", {
+      itemId,
+      turnId: turn.id,
+      threadId: session.threadId,
+      changes: scanResult.changes,
+    });
+  }
 
   const finalTurnId = capturedTurnId || turn.id;
   session.activeTurnId = finalTurnId;
@@ -149,10 +206,51 @@ async function startNewTurn(
 }
 
 function makeTraceCollector(sessionId: string) {
+  let sinceLastDerive = 0;
   return (method: string, params: Record<string, unknown>) => {
     traceStore.append(sessionId, { method, params });
     broadcastEvent(sessionId, { method, params });
+    // Live canvas updates: re-derive and broadcast periodically so task,
+    // artifact, and result shapes appear while the turn is still running,
+    // not only after it completes.
+    sinceLastDerive++;
+    if (sinceLastDerive >= 25 || method === "turn/completed") {
+      sinceLastDerive = 0;
+      try {
+        const replayResult = replayTrace(sessionId);
+        broadcastDerivedState(sessionId, replayResult.state as unknown as Record<string, unknown>);
+      } catch { /* best-effort */ }
+    }
   };
+}
+
+// Attach an approval-event listener to the adapter for this session.
+// When codex requests approval, we surface it to the UI and record it
+// as a pending decision in the session. The /decide endpoint consumes
+// these pending approvals.
+function registerApprovalHandler(sessionId: string, _onDecide: (itemId: string, approved: boolean) => void) {
+  adapter.on("approval", (ev: { itemId: string; turnId: string; threadId: string; reason: string | null; grantRoot: string | null; startedAtMs: number }) => {
+    const session = sessions.get(sessionId);
+    if (session) {
+      session.pendingApprovals.push({
+        itemId: ev.itemId,
+        turnId: ev.turnId,
+        threadId: ev.threadId,
+        reason: ev.reason,
+        grantRoot: ev.grantRoot,
+        startedAtMs: ev.startedAtMs,
+      });
+    }
+    // Broadcast the approval request to WS subscribers
+    broadcastApproval(sessionId, {
+      threadId: ev.threadId,
+      turnId: ev.turnId,
+      itemId: ev.itemId,
+      startedAtMs: ev.startedAtMs,
+      reason: ev.reason,
+      grantRoot: ev.grantRoot,
+    });
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -217,6 +315,8 @@ const server = http.createServer(async (req, res) => {
         approvalPolicy: "on-request",
       });
 
+      adapter.snapshotWorkspace(WORKSPACE);
+
       const turn = await adapter.startTurn(thread.id, [
         { type: "text", text: prompt },
       ], {
@@ -227,8 +327,14 @@ const server = http.createServer(async (req, res) => {
       sessions.set(sessionId, {
         threadId: thread.id,
         clientThreadId,
+        workspace: WORKSPACE,
         activeTurnId: turn.id,
         turnIds: [turn.id],
+        pendingApprovals: [],
+      });
+
+      registerApprovalHandler(sessionId, (_itemId, _approved) => {
+        // Default no-op: the /decide endpoint handles decisions explicitly
       });
 
       // Return immediately so the caller can interact while turn is active
@@ -243,6 +349,19 @@ const server = http.createServer(async (req, res) => {
       // P6.4: Collect the event stream for up to 30 s in the background
       adapter.collectTurnEvents(thread.id, turn.id, 30_000, traceCollector)
         .then(() => {
+          // S8: post-turn workspace scan for file changes omitted from events
+          try {
+            var scanResult = adapter.scanAndFireHooks(WORKSPACE);
+            if (scanResult.changes.length > 0) {
+              var fileItemId = "git-" + (turn.id || "").slice(0, 8);
+              traceStore.append(sessionId, {
+                method: "item/fileChange",
+                params: { itemId: fileItemId, turnId: turn.id, changes: scanResult.changes },
+              });
+              traceCollector("item/fileChange", { itemId: fileItemId, turnId: turn.id, changes: scanResult.changes });
+            }
+          } catch { /* best-effort */ }
+
           const replayResult = replayTrace(sessionId);
           broadcastDerivedState(sessionId, replayResult.state as unknown as Record<string, unknown>);
           broadcastSessionEnded(sessionId);
@@ -261,8 +380,6 @@ const server = http.createServer(async (req, res) => {
     }
     return;
   }
-
-  // ---- POST /run-stream (same + live WS events, no final sessionEnded) ----
   // Returns immediately with sessionId; event collection runs in background.
   if (req.method === "POST" && req.url === "/run-stream") {
     try {
@@ -284,6 +401,8 @@ const server = http.createServer(async (req, res) => {
         approvalPolicy: "on-request",
       });
 
+      adapter.snapshotWorkspace(WORKSPACE);
+
       const turn = await adapter.startTurn(thread.id, [
         { type: "text", text: prompt },
       ], {
@@ -294,8 +413,14 @@ const server = http.createServer(async (req, res) => {
       sessions.set(sessionId, {
         threadId: thread.id,
         clientThreadId,
+        workspace: WORKSPACE,
         activeTurnId: turn.id,
         turnIds: [turn.id],
+        pendingApprovals: [],
+      });
+
+      registerApprovalHandler(sessionId, (_itemId, _approved) => {
+        // Default no-op: the /decide endpoint handles decisions explicitly
       });
 
       res.writeHead(200, { "content-type": "application/json" });
@@ -308,6 +433,19 @@ const server = http.createServer(async (req, res) => {
 
       adapter.collectTurnEvents(thread.id, turn.id, 30_000, traceCollector)
         .then(() => {
+          // S8: post-turn workspace scan for file changes omitted from events
+          try {
+            var scanResult = adapter.scanAndFireHooks(WORKSPACE);
+            if (scanResult.changes.length > 0) {
+              var fileItemId = "git-" + (turn.id || "").slice(0, 8);
+              traceStore.append(sessionId, {
+                method: "item/fileChange",
+                params: { itemId: fileItemId, turnId: turn.id, changes: scanResult.changes },
+              });
+              traceCollector("item/fileChange", { itemId: fileItemId, turnId: turn.id, changes: scanResult.changes });
+            }
+          } catch { /* best-effort */ }
+
           const replayResult = replayTrace(sessionId);
           broadcastDerivedState(sessionId, replayResult.state as unknown as Record<string, unknown>);
           const s = sessions.get(sessionId);
@@ -510,22 +648,25 @@ const server = http.createServer(async (req, res) => {
 
       const traceCollector = makeTraceCollector(sessionId);
 
-      // S1 protocol: if a turn is active, interrupt it first
+      // S1 protocol: if a turn is active, interrupt it first. Interrupt
+      // BEFORE waiting, and bound the wait: a turn hung on an unanswered
+      // approval must not deadlock steering.
       if (session.activeTurnId) {
         const { activeTurnId, threadId } = session;
 
-        // Register a hook so we wait for turn completion
-        await new Promise<void>((resolve) => {
-          adapter.registerOnTurnEnd((_status: string) => resolve());
+        const turnEnded = new Promise<void>((resolve) => {
+          adapter.registerOnTurnEnd(() => resolve());
         });
-
-        await adapter.interruptTurn(threadId, activeTurnId);
+        try {
+          await adapter.interruptTurn(threadId, activeTurnId);
+        } catch {
+          // The turn may already have finished; nothing to interrupt.
+        }
+        await Promise.race([
+          turnEnded,
+          new Promise<void>((resolve) => setTimeout(resolve, 10_000)),
+        ]);
         session.activeTurnId = null;
-
-        // Wait for the interrupted turn to finish recording
-        await new Promise<void>((resolve) => {
-          adapter.registerOnTurnEnd((_status: string) => resolve());
-        });
       }
 
       // Record the steer action after the new turn's events are in trace
@@ -543,7 +684,7 @@ const server = http.createServer(async (req, res) => {
       };
 
       // Start the new turn on the same thread
-      const summary = await startNewTurn(session, instruction, traceCollector);
+      const summary = await startNewTurn(session, instruction, session.workspace, traceCollector);
 
       // Now that startNewTurn has returned, we know the actual turnId.
       // Patch the steer record with turnId so the reducer can backfill
@@ -600,24 +741,28 @@ const server = http.createServer(async (req, res) => {
       const editedTask = task.trim();
       const traceCollector = makeTraceCollector(sessionId);
 
-      // If a turn is active, interrupt it first
+      // If a turn is active, interrupt it first (interrupt before waiting,
+      // bounded wait so a hung turn cannot deadlock the edit-and-send path)
       if (session.activeTurnId) {
         const { activeTurnId, threadId } = session;
 
-        await new Promise<void>((resolve) => {
-          adapter.registerOnTurnEnd((_status: string) => resolve());
+        const turnEnded = new Promise<void>((resolve) => {
+          adapter.registerOnTurnEnd(() => resolve());
         });
-
-        await adapter.interruptTurn(threadId, activeTurnId);
+        try {
+          await adapter.interruptTurn(threadId, activeTurnId);
+        } catch {
+          // The turn may already have finished; nothing to interrupt.
+        }
+        await Promise.race([
+          turnEnded,
+          new Promise<void>((resolve) => setTimeout(resolve, 10_000)),
+        ]);
         session.activeTurnId = null;
-
-        await new Promise<void>((resolve) => {
-          adapter.registerOnTurnEnd((_status: string) => resolve());
-        });
       }
 
       // Start the new turn on the same thread with the edited task text
-      const summary = await startNewTurn(session, editedTask, traceCollector);
+      const summary = await startNewTurn(session, editedTask, session.workspace, traceCollector);
 
       // Record action.send AFTER the turn's provider events are in the trace
       const sendRecord = {
@@ -647,6 +792,172 @@ const server = http.createServer(async (req, res) => {
         turnId: summary.turnId,
         turnStatus: summary.turnStatus,
         turnDurationMs: summary.turnDurationMs,
+      }, null, 2));
+    } catch (err) {
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        error: String(err instanceof Error ? err.message : err),
+      }));
+    }
+    return;
+  }
+
+  // ---- POST /run-demo — run a task against the controlled demo workspace ---- //
+  if (req.method === "POST" && req.url === "/run-demo") {
+    try {
+      await ensureInitialized();
+
+      const body = await parseBody(req);
+      const sessionId = randomUUID();
+      const clientThreadId =
+        typeof body.threadId === "string"
+          ? body.threadId
+          : `demo-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const prompt = typeof body.prompt === "string" ? body.prompt : "update utils.js so the tests pass";
+      const workspace = body.workspace && typeof body.workspace === "string"
+        ? body.workspace
+        : "/tmp/glassbox-demo-repo";
+
+      const traceCollector = makeTraceCollector(sessionId);
+
+      const thread = await adapter.startThread(clientThreadId, {
+        cwd: workspace,
+        sandbox: "workspace-write",
+        approvalPolicy: "on-request",
+      });
+
+      // Reset the demo fixture so every run starts from the same broken
+      // state (a previous run may have already fixed the file in place).
+      writeFileSync(`${workspace}/utils.js`, BROKEN_UTILS_JS);
+
+      adapter.snapshotWorkspace(workspace);
+
+      const turn = await adapter.startTurn(thread.id, [
+        { type: "text", text: prompt },
+      ], {
+        sandboxPolicy: {
+          type: "workspaceWrite",
+          writableRoots: [workspace],
+          networkAccess: false,
+          excludeTmpdirEnvVar: true,
+          excludeSlashTmp: true,
+        },
+        cwd: workspace,
+      });
+
+      sessions.set(sessionId, {
+        threadId: thread.id,
+        clientThreadId,
+        workspace: workspace,
+        activeTurnId: turn.id,
+        turnIds: [turn.id],
+        pendingApprovals: [],
+      });
+
+      registerApprovalHandler(sessionId, (_itemId, _approved) => {
+        // handled by /decide
+      });
+
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        sessionId,
+        threadId: thread.id,
+        turnId: turn.id,
+        workspace,
+        status: "running",
+      }));
+
+      adapter.collectTurnEvents(thread.id, turn.id, 30_000, traceCollector)
+        .then(() => {
+          // S8: post-turn workspace scan for file changes omitted from events
+          try {
+            var scanResult = adapter.scanAndFireHooks(workspace);
+            if (scanResult.changes.length > 0) {
+              var fileItemId = "git-" + (turn.id || "").slice(0, 8);
+              traceStore.append(sessionId, {
+                method: "item/fileChange",
+                params: { itemId: fileItemId, turnId: turn.id, changes: scanResult.changes },
+              });
+              traceCollector("item/fileChange", { itemId: fileItemId, turnId: turn.id, changes: scanResult.changes });
+            }
+          } catch { /* best-effort */ }
+
+          const replayResult = replayTrace(sessionId);
+          broadcastDerivedState(sessionId, replayResult.state as unknown as Record<string, unknown>);
+          const s = sessions.get(sessionId);
+          if (s) s.activeTurnId = null;
+        })
+        .catch((err) => {
+          console.error(`[run-demo background] session ${sessionId} failed:`, err);
+        });
+    } catch (err) {
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        error: String(err instanceof Error ? err.message : err),
+      }));
+    }
+    return;
+  }
+
+  // ---- POST /decide — record user's approval/decline and forward to provider -- //
+  if (req.method === "POST" && req.url === "/decide") {
+    try {
+      const body = await parseBody(req);
+      const sessionId = typeof body.sessionId === "string" ? body.sessionId : "";
+      const itemId = typeof body.itemId === "string" ? body.itemId : "";
+      const approved = body.approved === true;
+
+      if (!sessionId || !itemId) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "sessionId and itemId required" }));
+        return;
+      }
+
+      const session = sessions.get(sessionId);
+      if (!session) {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: `no session: ${sessionId}` }));
+        return;
+      }
+
+      // Remove from pending approvals
+      const beforeCount = session.pendingApprovals.length;
+      session.pendingApprovals = session.pendingApprovals.filter(
+        (a) => a.itemId !== itemId
+      );
+
+      // Find the adapter requestId for this itemId and respond
+      const requestId = adapter.findApprovalRequestId(itemId);
+      if (requestId !== null) {
+        adapter.respondToApproval(requestId, approved);
+      }
+
+      // Record the decision in the trace
+      const decideRecord = {
+        method: "action.decide",
+        params: {
+          kind: "action.decide",
+          source: "glassbox-user",
+          sessionId,
+          threadId: session.threadId,
+          itemId,
+          approved,
+          ts: new Date().toISOString(),
+        },
+      };
+      traceStore.append(sessionId, decideRecord);
+      broadcastEvent(sessionId, decideRecord.params);
+
+      const replayResult = replayTrace(sessionId);
+      broadcastDerivedState(sessionId, replayResult.state as unknown as Record<string, unknown>);
+
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        ok: true,
+        sessionId,
+        approved,
+        removedPending: beforeCount - session.pendingApprovals.length,
+        derivedState: replayResult.state,
       }, null, 2));
     } catch (err) {
       res.writeHead(500, { "content-type": "application/json" });
@@ -756,6 +1067,19 @@ attachWebSocketServer(server, async (_sessionId: string) => {
   // S6 explicit execution: no auto-interrupt on WS subscribe.
   // /pause, /stop, and /steer endpoints handle execution changes explicitly.
   // WS subscription is read-only: receives live events and derived state only.
+}, (sessionId: string) => {
+  // Catch-up for approvals that fired before the client subscribed.
+  const session = sessions.get(sessionId);
+  if (!session) return [];
+  return session.pendingApprovals.map((a) => ({
+    type: "approval" as const,
+    threadId: a.threadId,
+    turnId: a.turnId,
+    itemId: a.itemId,
+    startedAtMs: a.startedAtMs,
+    reason: a.reason,
+    grantRoot: a.grantRoot,
+  }));
 });
 
 server.listen(PORT, () => {
@@ -763,10 +1087,12 @@ server.listen(PORT, () => {
   console.log(`  WebSocket:          ws://localhost:${PORT}/ws?sessionId=<id>`);
   console.log(`  POST /run-test:     generate sessionId, run read-only turn`);
   console.log(`  POST /run-stream:   same + live WS events for sessionId`);
+  console.log(`  POST /run-demo:     run task against demo workspace with workspaceWrite`);
   console.log(`  POST /pause:        interrupt active turn (prepares for /steer)`);
   console.log(`  POST /stop:         interrupt active turn by sessionId`);
   console.log(`  POST /steer:        steering instruction for existing session`);
   console.log(`  POST /send-task:    edit task and start new turn on same thread`);
+  console.log(`  POST /decide:       approve/decline file-change request for session`);
   console.log(`  GET  /trace/:id:    raw trace entries`);
   console.log(`  GET  /state/:id:    derived state replay`);
 });

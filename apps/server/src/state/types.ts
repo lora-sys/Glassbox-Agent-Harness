@@ -22,6 +22,8 @@ export interface DerivedState {
   traceSummary: TraceSummary;
   /** Ordered history of every turn in this session, oldest first. */
   turns: TurnRecord[];
+  /** Internal: buffered diff events per turn, flushed to artifacts on turn/completed. */
+  _pendingDiffs: Array<{ itemId: string; turnId: string; files: { path: string; kind: string }[]; rawDiff: string }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -113,5 +115,6 @@ export function initialDerivedState(): DerivedState {
       tokenUsage: { promptTokens: null, completionTokens: null, totalTokens: null },
     },
     turns: [],
+    _pendingDiffs: [],
   };
 }

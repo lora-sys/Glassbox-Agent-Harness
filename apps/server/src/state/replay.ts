@@ -27,11 +27,13 @@ const METHOD_TO_TAG: Record<string, string> = {
   "item/fileChange": "itemFileChange",
   "item/fileChange/requestApproval": "requestApproval",
   "item/commandExecution/requestApproval": "requestApproval",
+  "turn/diff/updated": "turnDiffUpdated",
   // Glassbox-side Action records (counted, no product state change)
   "action.pause": "actionPause",
   "action.stop": "actionPause",
   "action.steer": "actionSteer",
   "action.send": "actionSend",
+  "action.decide": "actionDecide",
 };
 
 // ---------------------------------------------------------------------------
@@ -53,8 +55,24 @@ function rawToCodexEvent(entry: TraceEntry): CodexEvent | null {
   const tag = METHOD_TO_TAG[event.method];
   if (!tag) return null;
 
-  // Reconstruct a typed event from raw params by injecting _tag
-  return { _tag: tag as CodexEvent["_tag"], ...event.params } as CodexEvent;
+  // Some provider events place turn.id nested under params.turn rather than
+  // at params.turnId (the live adapter extracts it from { turn: { id } }).
+  // During replay we replicate that extraction so the reducer can match
+  // turn/diff/updated and item/fileChange diffs to their turns.
+  const p = event.params;
+  const inferredTurnId =
+    typeof (p as Record<string, unknown>).turnId === "string"
+      ? (p as Record<string, unknown>).turnId as string
+      : typeof ((p as Record<string, unknown>).turn as Record<string, unknown> | undefined)?.id === "string"
+        ? ((p as Record<string, unknown>).turn as Record<string, unknown>).id as string
+        : "";
+
+  const reconstructed: Record<string, unknown> = { _tag: tag as CodexEvent["_tag"], ...p };
+  if (inferredTurnId) {
+    (reconstructed as Record<string, unknown>).turnId = inferredTurnId;
+  }
+
+  return reconstructed as CodexEvent;
 }
 
 // ---------------------------------------------------------------------------

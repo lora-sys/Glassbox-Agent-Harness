@@ -130,6 +130,17 @@ export type ItemFileChangeParams = Schema.Schema.Type<
   typeof ItemFileChangeParams
 >;
 
+/** turn/diff/updated — notification of a filesystem diff during a turn */
+export const TurnDiffUpdatedParams = Schema.Struct({
+  _tag: Schema.Literal("turnDiffUpdated"),
+  threadId: Schema.String,
+  turnId: Schema.String,
+  diff: Schema.String,
+});
+export type TurnDiffUpdatedParams = Schema.Schema.Type<
+  typeof TurnDiffUpdatedParams
+>;
+
 /** item/{fileChange,commandExecution}/requestApproval notification params */
 export const RequestApprovalParams = Schema.Struct({
   _tag: Schema.Literal("requestApproval"),
@@ -205,6 +216,7 @@ export const CodexEvent = Schema.Union([
   ActionPauseParams,
   ActionSteerParams,
   ActionSendParams,
+  TurnDiffUpdatedParams,
 ]);
 
 export type CodexEvent = Schema.Schema.Type<typeof CodexEvent>;
@@ -225,6 +237,7 @@ export const METHOD_TAG: ReadonlyMap<string, CodexEvent["_tag"]> = new Map([
   ["item/commandExecution/requestApproval", "requestApproval"],
   ["action.steer", "actionSteer"],
   ["action.send", "actionSend"],
+  ["turn/diff/updated", "turnDiffUpdated"],
 ]);
 
 export const TAG_SCHEMA: Map<string, unknown> = new Map()
@@ -238,4 +251,5 @@ export const TAG_SCHEMA: Map<string, unknown> = new Map()
   .set("requestApproval", RequestApprovalParams)
   .set("actionPause", ActionPauseParams)
   .set("actionSteer", ActionSteerParams)
-  .set("actionSend", ActionSendParams);
+  .set("actionSend", ActionSendParams)
+  .set("turnDiffUpdated", TurnDiffUpdatedParams);

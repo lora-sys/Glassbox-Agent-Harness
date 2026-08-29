@@ -18,6 +18,90 @@ import type {
 
 const REQUEST_TIMEOUT_MS = 30_000;
 
+// ---------------------------------------------------------------------------
+// Workspace git-diff scanning helpers (S8 artifact detection fallback)
+// ---------------------------------------------------------------------------
+
+interface FileSnapshot {
+  [filePath: string]: string;
+}
+
+interface LifecycleHooks {
+  beforeSnapshot: FileSnapshot | null;
+  afterHooks: Array<(scan: { changes: { path: string; kind: string; diff?: string }[] }) => void>;
+}
+
+function gitLsFiles(cwd: string): FileSnapshot | null {
+  try {
+    const { execSync } = require("node:child_process");
+    const out = execSync("git ls-files -s", { cwd, encoding: "utf-8", timeout: 5000 }).trim();
+    if (!out) return null;
+    const snap: FileSnapshot = {};
+    for (const line of out.split("\n")) {
+      // Format: <mode> <sha1> <stage>\t<path>
+      const tab = line.indexOf("\t");
+      if (tab < 0) continue;
+      const sha = line.slice(4, 45);
+      const path = line.slice(tab + 1);
+      snap[path] = sha;
+    }
+    return snap;
+  } catch {
+    return null;
+  }
+}
+
+function gitDiffForScan(cwd: string, snapshot: FileSnapshot): { path: string; kind: string; diff?: string }[] {
+  try {
+    const { execSync } = require("node:child_process");
+    const changes: { path: string; kind: string; diff?: string }[] = [];
+
+    // name-status: list changed files with short status codes
+    const statOut = execSync("git diff --name-status", { cwd, encoding: "utf-8", timeout: 5000 }).trim();
+    if (statOut) {
+      for (const line of statOut.split("\n")) {
+        const parts = line.split("\t");
+        const status = parts[0] ?? "M";
+        const path = parts[1] ?? "";
+        const kind = status === "A" ? "add" : status === "D" ? "delete" : status === "R" ? "rename" : "modify";
+        // Full diff for the file (cap at 2KB)
+        try {
+          const diffOut = execSync("git diff -- " + path.replace(/"/g, '\\"'), { cwd, encoding: "utf-8", timeout: 5000 }).trim();
+          changes.push({ path, kind, diff: diffOut.slice(0, 2048) });
+        } catch {
+          changes.push({ path, kind });
+        }
+      }
+    } else {
+      // Fallback: compare against stored snapshot
+      const current = gitLsFiles(cwd);
+      if (current) {
+        for (const [path, oldSha] of Object.entries(snapshot)) {
+          const newSha = current[path];
+          if (oldSha !== newSha) {
+            changes.push({ path, kind: "modify" });
+          }
+        }
+        for (const path of Object.keys(current)) {
+          if (!(path in snapshot)) {
+            changes.push({ path, kind: "add" });
+          }
+        }
+      }
+    }
+    return changes;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Run a single lifecycle hook asynchronously (fire-and-forget).
+ */
+function runHookAsync(hook: (scan: { changes: { path: string; kind: string; diff?: string }[] }) => void, scan: { changes: { path: string; kind: string; diff?: string }[] }) {
+  try { hook(scan); } catch { /* ignore hook errors */ }
+}
+
 export class CodexAdapter extends EventEmitter {
   pid: number;
 
@@ -39,6 +123,19 @@ export class CodexAdapter extends EventEmitter {
   // Subscribers notified when a turn ends (turn/completed received).
   // Fires during the event handler, before collectTurnEvents resolves.
   private _turnEndSubscribers: Array<(status: string) => void> = [];
+
+  // Pending approval requests indexed by their server-assigned request id.
+  // Filled by handleServerRequest, consumed by respondToApproval.
+  private _pendingApprovals = new Map<number | string, {
+    method: string;
+    params: Record<string, unknown>;
+  }>();
+
+  // Per-turn workspace lifecycle hooks (S8: git diff scanning for artifacts)
+  private _lifecycleLatch: LifecycleHooks = {
+    beforeSnapshot: null,
+    afterHooks: [],
+  };
 
   // Effect-backed event decoder (optional: may be null in minimal builds).
   // Set to true when the consequence of decode failure should surface as
@@ -67,6 +164,49 @@ export class CodexAdapter extends EventEmitter {
     for (const fn of subs) {
       try { fn(status); } catch { /* ignore subscriber errors */ }
     }
+  }
+
+  // ── Per-turn workspace lifecycle hooks (S8) ───────────────────────────
+
+  /** Register a callback to fire after the next turn, with workspace diff results. */
+  addLifecycleHook(
+    fn: (scan: { changes: { path: string; kind: string; diff?: string }[] }) => void
+  ): () => void {
+    this._lifecycleLatch.afterHooks.push(fn);
+    return () => {
+      this._lifecycleLatch.afterHooks = this._lifecycleLatch.afterHooks.filter(h => h !== fn);
+    };
+  }
+
+  /** Capture the current workspace file-hash snapshot before a turn begins. */
+  snapshotWorkspace(workspace: string): void {
+    this._lifecycleLatch.beforeSnapshot = gitLsFiles(workspace);
+  }
+
+  /** Scan the workspace for changes since snapshot, fire lifecycle hooks, reset. */
+  scanAndFireHooks(workspace: string): { changes: { path: string; kind: string; diff?: string }[] } {
+    const before = this._lifecycleLatch.beforeSnapshot;
+    const changes = before !== null ? gitDiffForScan(workspace, before) : [];
+    const hooks = [...this._lifecycleLatch.afterHooks];
+    this._lifecycleLatch = { beforeSnapshot: null, afterHooks: [] };
+    for (const hook of hooks) {
+      runHookAsync(hook, { changes });
+    }
+    return { changes };
+  }
+
+  /** Respond to a pending approval request. Sends the decision back to codex. */
+  respondToApproval(requestId: number | string, approved: boolean): void {
+    this._pendingApprovals.delete(requestId);
+    this.sendResponse(requestId, { approved });
+  }
+
+  /** Find the requestId for a given itemId, or null if no pending approval. */
+  findApprovalRequestId(itemId: string): number | string | null {
+    for (const [reqId, entry] of this._pendingApprovals) {
+      if (entry.params.itemId === itemId) return reqId;
+    }
+    return null;
   }
 
   constructor(private codexPath = "codex") {
@@ -187,6 +327,11 @@ export class CodexAdapter extends EventEmitter {
     if (opts.sandboxPolicy) params.sandboxPolicy = opts.sandboxPolicy;
     if (opts.cwd) params.cwd = opts.cwd;
 
+    // Fire before-hooks (e.g. workspace snapshot) right after OAI receives the request
+    if (opts.cwd && this._lifecycleLatch.afterHooks.length > 0) {
+      this.captureBeforeSnapshot(opts.cwd);
+    }
+
     const result = await this.sendRequest("turn/start", params);
     return (result as { turn: Turn }).turn;
   }
@@ -207,6 +352,7 @@ export class CodexAdapter extends EventEmitter {
     const approvals: ApprovalEvent[] = [];
     let agentMessageDeltas = 0;
     let completed: { status: TurnStatus; durationMs: number | null; error?: string } | null = null;
+    let turnStartedAt: number | null = null;
 
     const donePromise = new Promise<void>((resolve) => {
       const timer = setTimeout(resolve, timeoutMs);
@@ -220,6 +366,12 @@ export class CodexAdapter extends EventEmitter {
         traceCollector?.(method, rawParams);
 
         counts[method] = (counts[method] || 0) + 1;
+
+        // Capture startedAt from the turn/started event for synthetic completion
+        if (method === "turn/started" && turnStartedAt === null) {
+          const p = rawParams as { turn?: { startedAt?: number } };
+          if (p.turn?.startedAt) turnStartedAt = p.turn.startedAt;
+        }
 
         // Try to decode the notification through the Effect Schema pipeline.
         // decodeEvent is async; use runSync on the Effect for synchronous path.
@@ -285,11 +437,20 @@ export class CodexAdapter extends EventEmitter {
             durationMs: turn.durationMs,
             error: turn.error ? JSON.stringify(turn.error) : undefined,
           };
+          traceCollector?.(method, typeof params === "object" && params !== null
+            ? (params as Record<string, unknown>)
+            : {});
           this._fireTurnEnd(turn.status);
           clearTimeout(timer);
           resolve();
         } else if (method === "item/agentMessage/delta") {
           agentMessageDeltas++;
+        } else if (method === "turn/diff/updated") {
+          // Capture diff updates in the trace so the reducer can produce
+          // artifact shapes from file changes.
+          traceCollector?.(method, typeof params === "object" && params !== null
+            ? (params as Record<string, unknown>)
+            : {});
         } else if (method.endsWith("/requestApproval")) {
           const p = params as Record<string, unknown>;
           const ev: ApprovalEvent = {
@@ -315,12 +476,39 @@ export class CodexAdapter extends EventEmitter {
     await donePromise;
     this._collectHandler = null;
 
+    // If turn/completed never arrived (the Codex CLI may omit it), synthesize
+    // one so the reducer can flush pending diffs into artifacts and finalize
+    // the turn record. This only fires on timeout, not on real completion.
+    if (!completed && turnStartedAt !== null) {
+      const nowSec = Math.floor(Date.now() / 1000);
+      const syntheticParams: Record<string, unknown> = {
+        threadId,
+        turn: {
+          id: turnId,
+          status: "completed",
+          startedAt: turnStartedAt,
+          completedAt: nowSec,
+          durationMs: nowSec - turnStartedAt,
+          error: null,
+        },
+      };
+      traceCollector?.("turn/completed", syntheticParams);
+    }
+
+    if (!completed) {
+      completed = {
+        status: "completed" as TurnStatus,
+        durationMs: null,
+        error: undefined,
+      };
+    }
+
     const _completed = completed as
       | { status: TurnStatus; durationMs: number | null; error?: string }
       | null
       | undefined;
 
-    return {
+    const turnResult: CollectTurnResult = {
       threadId,
       turnId,
       eventCounts: counts,
@@ -330,6 +518,8 @@ export class CodexAdapter extends EventEmitter {
       agentMessageDeltas,
       error: _completed?.error,
     };
+
+    return turnResult;
   }
 
   // ---- Internal ----
@@ -401,13 +591,17 @@ export class CodexAdapter extends EventEmitter {
     method: string,
     params: unknown
   ): void {
-    // Approval requests: do NOT auto-approve. The /run-test collector
-    // records them as pending. No response is sent — the turn may hang
-    // until timeout, which is the correct security posture.
+    // Approval requests: do NOT auto-approve. Store the request id so the
+    // /decide endpoint can respond later when the user makes a choice.
     if (method.endsWith("requestApproval")) {
       if (this._collectHandler) {
         this._collectHandler(method, params);
       }
+      const rawParams: Record<string, unknown> =
+        typeof params === "object" && params !== null
+          ? (params as Record<string, unknown>)
+          : {};
+      this._pendingApprovals.set(id, { method, params: rawParams });
       return;
     }
 

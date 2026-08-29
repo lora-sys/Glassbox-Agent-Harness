@@ -65,7 +65,10 @@ export function reduce(state: DerivedState, event: CodexEvent): DerivedState {
     }
 
     // -----------------------------------------------------------------------
-    // Turn started — capture task (first time only), push open turn entry
+    // Turn started — capture task (first time only). Previously-open turns
+    // are NOT eagerly closed here: turn/completed finalizes them (producing
+    // artifacts via pending-diff flush). Auto-closing on turnStarted dropped
+    // late-arriving diffs because turnStarted can fire before turn/completed.
     // -----------------------------------------------------------------------
     case "turnStarted": {
       counts["turn/started"] = (counts["turn/started"] ?? 0) + 1;
@@ -73,11 +76,14 @@ export function reduce(state: DerivedState, event: CodexEvent): DerivedState {
       const maybeInput = fullEvent.input as unknown;
       const text = userInputText(maybeInput);
 
-      // Capture task if not yet set (first turn's input becomes the persistent task)
+      // Codex may omit the input field in turn/started notifications.
+      // Fall back to item content[] if provided there (handled via itemStarted
+      // backfill below). Do NOT overwrite state.task with "".
       const task = state.task || text || "";
 
-      // Push an open turn entry
+      // Push the new open turn entry
       const turnId = (fullEvent.turn as { id?: string } | undefined)?.id || "";
+
       const newTurn: TurnRecord = {
         turnId,
         taskOrInstruction: text || "",
@@ -91,6 +97,8 @@ export function reduce(state: DerivedState, event: CodexEvent): DerivedState {
         turns: [...state.turns, newTurn],
         currentWork: null,
         testResult: null,
+        artifacts: state.artifacts,
+        _pendingDiffs: state._pendingDiffs,
         traceSummary: { ...state.traceSummary, eventCounts: counts, totalEvents: state.traceSummary.totalEvents + 1 },
       };
     }
@@ -106,11 +114,18 @@ export function reduce(state: DerivedState, event: CodexEvent): DerivedState {
       if (!itemText && Array.isArray((item as unknown as Record<string, unknown>).content)) {
         itemText = userInputText((item as unknown as Record<string, unknown>).content) ?? "";
       }
+      // Backfill open turn's taskOrInstruction from userMessage content
+      const turns = [...state.turns];
+      const openIdx = findOpenTurnIndex(turns);
+      if (openIdx >= 0 && !turns[openIdx].taskOrInstruction && itemText) {
+        turns[openIdx] = { ...turns[openIdx], taskOrInstruction: itemText };
+      }
       // If no task yet and this is a user message, capture text as task
       if (!state.task && item.type === "userMessage" && itemText) {
         return {
           ...state,
           task: itemText,
+          turns,
           currentWork: {
             itemType: item.type,
             itemId: item.id,
@@ -214,6 +229,60 @@ export function reduce(state: DerivedState, event: CodexEvent): DerivedState {
     }
 
     // -----------------------------------------------------------------------
+    // Diff updated — buffer file changes from the diff, create artifacts on
+    // turn completion -----------------------------------------------------------------------
+    case "turnDiffUpdated": {
+      counts["turn/diff/updated"] = (counts["turn/diff/updated"] ?? 0) + 1;
+
+      // Parse unified diff to extract file paths and kinds
+      const rawDiff = (event as unknown as { diff?: string }).diff || "";
+      const files: { path: string; kind: string }[] = [];
+      const diffRe = /^diff --git a\/([^ \t\n]+) b\/([^ \t\n]+)/gm;
+      let m: RegExpExecArray | null;
+      while ((m = diffRe.exec(rawDiff)) !== null) {
+        const aPath = m[1];
+        const bPath = m[2];
+        if (aPath === "/dev/null") { files.push({ path: bPath, kind: "add" }); continue; }
+        if (bPath === "/dev/null") { files.push({ path: aPath, kind: "delete" }); continue; }
+        files.push({ path: bPath, kind: aPath !== bPath ? "rename" : "modify" });
+      }
+      // Deduplicate: if the same path appears multiple times (e.g. renames), keep first
+      const seen = new Set<string>();
+      const unique = files.filter((f) => { if (seen.has(f.path)) return false; seen.add(f.path); return true; });
+
+      // Skip buffering if the diff belongs to an already-closed turn.
+      // Late-arriving diffs after turn/completed are silently dropped;
+      // the turn/flush logic in turnStarted and turnCompleted already handled
+      // the final diff for that turn.
+      const diffTurnId = (event as unknown as { turnId?: string }).turnId || "";
+      if (diffTurnId && state.turns.some(t => t.turnId === diffTurnId && t.finalResult !== null)) {
+        return {
+          ...state,
+          traceSummary: { ...state.traceSummary, eventCounts: counts, totalEvents: state.traceSummary.totalEvents + 1 },
+        };
+      }
+
+      // Buffer diffs per turnId; they become artifacts when turn/completed fires.
+      const diffItemId = diffTurnId
+        ? "diff-" + diffTurnId.slice(0, 8)
+        : "diff-" + String(state.turns.length);
+      const diffEntry = {
+        itemId: diffItemId,
+        turnId: diffTurnId,
+        files: unique,
+        rawDiff,
+      };
+      const deduped = state._pendingDiffs.filter(
+        (d) => d.turnId !== diffEntry.turnId || d.rawDiff !== diffEntry.rawDiff,
+      );
+      return {
+        ...state,
+        _pendingDiffs: [...deduped, diffEntry],
+        traceSummary: { ...state.traceSummary, eventCounts: counts, totalEvents: state.traceSummary.totalEvents + 1 },
+      } as DerivedState;
+    }
+
+    // -----------------------------------------------------------------------
     // Turn completed — finalize the open turn entry and set top-level finalResult
     // -----------------------------------------------------------------------
     case "turnCompleted": {
@@ -230,15 +299,48 @@ export function reduce(state: DerivedState, event: CodexEvent): DerivedState {
       // Finalize the open turn entry with finalResult
       const turns = [...state.turns];
       const openIdx = findOpenTurnIndex(turns);
+      let artifacts = [...state.artifacts];
+      let pendingDiffs = [...state._pendingDiffs];
+
+      // Flush pending diffs for this turn into artifacts
       if (openIdx >= 0) {
-        turns[openIdx] = { ...turns[openIdx], finalResult };
+        const turnId = turns[openIdx].turnId;
+        const turnDiffs = pendingDiffs.filter((d) => d.turnId === turnId);
+        for (const diff of turnDiffs) {
+          const changes = diff.files.map((f) => ({
+            path: f.path,
+            kind: f.kind,
+            diff: diff.rawDiff.length > 500 ? diff.rawDiff.slice(0, 500) + "…" : diff.rawDiff,
+          }));
+          artifacts.push({
+            itemId: diff.itemId,
+            changes,
+            status: "changed",
+          });
+        }
+        pendingDiffs = pendingDiffs.filter((d) => d.turnId !== turnId);
+        // Preserve agentMessageText (may have accumulated from deltas and a
+        // prior turn/completed with items). If this turn/completed did carry
+        // items, merge them in; otherwise keep the existing text.
+        const existing = turns[openIdx];
+        const itemTexts = (turn.items ?? [])
+          .filter((i: any) => i?.text)
+          .map((i: any) => i.text)
+          .join(" ");
+        turns[openIdx] = {
+          ...existing,
+          finalResult,
+          agentMessageText: existing.agentMessageText || itemTexts,
+        };
       }
 
       return {
         ...state,
         turns,
         currentWork: null,
+        artifacts,
         finalResult,
+        _pendingDiffs: pendingDiffs,
         traceSummary: {
           ...state.traceSummary,
           eventCounts: counts,

@@ -18,7 +18,10 @@ export function getGlassboxBase(): string {
   const here = new URL(".", import.meta.url).pathname;
   const segments = here.split("/").filter(Boolean);
   const repoRoot = segments.slice(0, segments.lastIndexOf("apps"));
-  return `${repoRoot.join("/")}/.glassbox`;
+  // filter(Boolean) drops the leading slash from the split, which would turn
+  // the absolute repo root into a cwd-relative path (traces then land under
+  // apps/server/data/... when the server runs with cwd=apps/server).
+  return `/${repoRoot.join("/")}/.glassbox`;
 }
 
 export function getTracePath(sessionId: string): string {
