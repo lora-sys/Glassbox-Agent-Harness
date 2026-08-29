@@ -230,6 +230,20 @@ function App() {
 	const [draftTask, setDraftTask] = useState<string | null>(null);
 	const [isApplying, setIsApplying] = useState(false);
 
+	// S8: Pending file-change decisions from codex, surfaced for the user.
+	const [pendingDecisions, setPendingDecisions] = useState<Array<{
+		itemId: string;
+		turnId: string;
+		threadId: string;
+		reason: string | null;
+		grantRoot: string | null;
+		startedAtMs: number;
+	}>>([]);
+	const [demoWorkspace, setDemoWorkspace] = useState("/tmp/glassbox-demo-repo");
+
+	// Ref to always-access latest handleDecide without re-triggering useEffect
+	const handleDecideRef = useRef<((itemId: string, approved: boolean) => void) | null>(null);
+
 	const shapeIdsRef = useRef<string[]>([]);
 	const sessionMetaRef = useRef(new Map<string, Map<string, ObjectMeta>>());
 	const tracedSessionsRef = useRef(new Set<string>());
@@ -313,6 +327,73 @@ function App() {
 			ed.zoomToFit({ target: "viewport", padding: 20 }).catch(function() {});
 		} catch {}
 	}, [currentSessionId, localState]);
+
+	// S8: Render pending decision shapes on the canvas
+	useEffect(() => {
+		var ed = editorRef.current;
+		if (!ed || !currentSessionId || !localState) return;
+
+		var sid = currentSessionId;
+		var meta = sessionMetaRef.current.get(sid) || new Map();
+
+		// Remove old decision shapes
+		var existingIds = shapeIdsRef.current.filter(function(id: string) {
+			return id.startsWith("shape:decision-");
+		});
+		if (existingIds.length > 0) {
+			ed.deleteShapes(existingIds);
+			existingIds.forEach(function(id: string) {
+				shapeIdsRef.current = shapeIdsRef.current.filter(function(x: string) { return x !== id; });
+				meta.delete(id);
+			});
+		}
+
+		if (pendingDecisions.length === 0) {
+			sessionMetaRef.current.set(sid, meta);
+			return;
+		}
+
+		var X = 120;
+		var y = 100;
+		var shapes: any[] = [];
+
+		// Put decisions below existing shapes
+		var allShapes = ed.getCurrentPageShapes();
+		for (var s of allShapes) {
+			if (s.type === "text" && s.y != null) {
+				var bottom = (s.y || 0) + 60;
+				if (bottom > y) y = bottom;
+			}
+		}
+
+		pendingDecisions.forEach(function(dec: any, idx: number) {
+			var shapeId = "shape:decision-" + dec.itemId.slice(0, 8);
+			var reason = (dec.reason || "File change").slice(0, 60);
+			var text = "DECISION NEEDED\n[fileChange] " + reason + "\nClick to Approve or Decline";
+			var shape = {
+				id: shapeId,
+				type: "text",
+				x: X,
+				y: y,
+				props: { richText: toRichText(text), w: 480, autoSize: true },
+			};
+			shapes.push(shape);
+			meta.set(shapeId, {
+				objectType: "decision",
+				itemId: dec.itemId,
+				reason: dec.reason,
+				grantRoot: dec.grantRoot,
+				_onApprove: function(itemId: string) { handleDecideRef.current && handleDecideRef.current(itemId, true); },
+				_onDecline: function(itemId: string) { handleDecideRef.current && handleDecideRef.current(itemId, false); },
+			} as any);
+			y += 100;
+		});
+
+		ed.createShapes(shapes);
+		var newIds = shapes.map(function(s: any) { return s.id; });
+		shapeIdsRef.current = shapeIdsRef.current.concat(newIds);
+		sessionMetaRef.current.set(sid, meta);
+	}, [currentSessionId, localState, pendingDecisions, handleDecideRef]);
 
 	// Selection -> Inspector (read-only for most objects)
 	var handleSelection = useCallback(function(sId: string | null) {
@@ -610,7 +691,7 @@ function App() {
 	}, [currentSessionId, steerText, addLog]);
 
 	// S7: Send edited task — starts a new turn on the same thread
-	var handleSendTask = useCallback(async function sendTask(taskText) {
+	var handleSendTask = useCallback(async function sendTask(taskText: string) {
 		if (!currentSessionId) return;
 		setIsApplying(true);
 		try {
@@ -637,7 +718,140 @@ function App() {
 		}
 	}, [currentSessionId, addLog]);
 
-	// Session reopen input state
+	// S8: Run demo task — starts a session against the controlled demo workspace
+	var handleRunDemo = useCallback(async function runDemo() {
+		setRunning(true);
+		setLog([]);
+		setSelectedShapeId(null);
+		setSelectedObject(null);
+		setPendingDecisions([]);
+		var ed = editorRef.current;
+		if (ed && shapeIdsRef.current.length > 0) {
+			ed.deleteShapes(shapeIdsRef.current);
+			shapeIdsRef.current = [];
+		}
+		setLocalState(null);
+		tracedSessionsRef.current.clear();
+		traceCacheRef.current.clear();
+		addLog("Starting /run-demo against " + demoWorkspace + "...");
+
+		var sessionId: string;
+		try {
+			var res = await fetch("/api/run-demo", {
+				method: "POST",
+				headers: { "Content-Type": "application/json", Accept: "application/json" },
+				body: JSON.stringify({ prompt: prompt || "Fix the off-by-one bug in utils.js and run the test file to verify.", workspace: demoWorkspace }),
+			});
+			if (!res.ok) throw new Error("HTTP " + res.status);
+			var data: any = await res.json();
+			if (data.error) throw new Error(data.error);
+			sessionId = data.sessionId;
+			setCurrentSessionId(sessionId);
+			if (data.derivedState) setLocalState(data.derivedState);
+			addLog("Session " + sessionId.slice(0, 8) + " started on workspace " + (data.workspace || ""));
+		} catch (err: any) {
+			addLog("Error: " + (err?.message || String(err)));
+			setRunning(false);
+			return;
+		}
+
+		// Same WS setup as handleRunTest
+		try {
+			var ws = new WebSocket("/ws?sessionId=" + sessionId);
+			wsRef.current = ws;
+
+			ws.onopen = function() {
+				setConnected(true);
+				addLog("WS connected");
+			};
+			ws.onmessage = function(ev: MessageEvent) {
+				var msg: any;
+				try { msg = JSON.parse(ev.data); } catch { return; }
+				switch (msg.type) {
+					case "subscribed":
+						addLog("Subscribed");
+						break;
+					case "error":
+						addLog("WS: " + msg.message);
+						break;
+					case "sessionEnded":
+						ws.close();
+						setConnected(false);
+						setRunning(false);
+						break;
+					case "approval": {
+						// S8: file-change decision request from codex
+						var approval = msg;
+						setPendingDecisions(function(prev) {
+							// Avoid duplicates by itemId
+							if (prev.some(function(d) { return d.itemId === approval.itemId; })) return prev;
+							return prev.concat([{
+								itemId: approval.itemId,
+								turnId: approval.turnId || "",
+								threadId: approval.threadId || "",
+								reason: approval.reason,
+								grantRoot: approval.grantRoot,
+								startedAtMs: approval.startedAtMs,
+							}]);
+						});
+						addLog("Decision needed: " + (approval.reason || "file change") + " [" + approval.itemId + "]");
+						break;
+					}
+					case "derivedState":
+						setLocalState(msg.derivedState ?? {});
+						break;
+					case "event": {
+						var method2 = msg.event?.method;
+						var p2 = msg.event?.params ?? {};
+						if (method2 === "action.decide" || method2 === "actionDecide") {
+							// Remove from pending decisions
+							setPendingDecisions(function(prev) {
+								return prev.filter(function(d) { return d.itemId !== p2.itemId; });
+							});
+							addLog("Decided: " + (p2.approved ? "approved" : "declined") + " " + p2.itemId);
+						}
+						break;
+					}
+				}
+			};
+			ws.onerror = function() { addLog("WS error"); };
+			ws.onclose = function() {
+				setConnected(false);
+				setRunning(false);
+				addLog("WS closed");
+			};
+		} catch (err: any) {
+			addLog("WS: " + (err?.message || String(err)));
+			setRunning(false);
+		}
+	}, [prompt, demoWorkspace, addLog]);
+
+	// S8: Handle user Approve/Decline decision for a file-change request
+	var handleDecide = useCallback(async function decide(itemId: string, approved: boolean) {
+		if (!currentSessionId) return;
+		addLog(approved ? "Approving " + itemId : "Declining " + itemId);
+		try {
+			var res = await fetch("/api/decide", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ sessionId: currentSessionId, itemId: itemId, approved: approved }),
+			});
+			if (!res.ok) {
+				var errData: any = await res.json();
+				throw new Error(errData.error || "HTTP " + res.status);
+			}
+			var data: any = await res.json();
+			// Remove from pending decisions locally
+			setPendingDecisions(function(prev) {
+				return prev.filter(function(d) { return d.itemId !== itemId; });
+			});
+			if (data.derivedState) setLocalState(data.derivedState);
+			addLog("Decision recorded: " + (approved ? "approved" : "declined"));
+		} catch (err: any) {
+			addLog("Decide error: " + (err?.message || String(err)));
+		}
+		handleDecideRef.current = handleDecide;
+	}, [currentSessionId, addLog]);
 	var sessionInputState = useState("");
 	var sessionInput = sessionInputState[0];
 	var setSessionInput = sessionInputState[1];
@@ -725,6 +939,44 @@ function App() {
 				>
 					{running ? "Running..." : "Run test"}
 				</button>
+				<button
+					onClick={handleRunDemo}
+					disabled={running}
+					title="Run demo task against controlled workspace"
+					style={{
+						padding: "6px 18px",
+						borderRadius: 6,
+						border: "1px solid #4ade80",
+						background: running ? "#1a2a1a" : "#1a332a",
+						color: running ? "#52525b" : "#4ade80",
+						fontSize: 12,
+						fontWeight: 600,
+						cursor: running ? "not-allowed" : "pointer",
+						transition: "all 0.15s",
+						whiteSpace: "nowrap",
+					}}
+				>
+					{running ? "Running..." : "Run demo"}
+				</button>
+				<input
+					type="text"
+					value={demoWorkspace}
+					onChange={(e) => setDemoWorkspace(e.target.value)}
+					disabled={running}
+					placeholder="/tmp/glassbox-demo-repo"
+					style={{
+						width: 200,
+						padding: "5px 8px",
+						borderRadius: 4,
+						border: "1px solid #2a2b35",
+						background: "#0f1117",
+						color: "#a1a1aa",
+						fontSize: 10,
+						fontFamily: "monospace",
+						outline: "none",
+					}}
+				/>
+				<span style={{ fontSize: 9, color: "#52525b" }}>workspace</span>
 				{currentSessionId && (
 					<>
 						<button

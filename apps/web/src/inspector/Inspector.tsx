@@ -3,7 +3,7 @@ import { type ReactNode } from "react";
 /* ── Public types ─────────────────────────────────────────── */
 
 export interface ObjectMeta {
-	objectType: "task" | "work" | "artifact" | "testResult" | "finalResult" | "traceSummary" | "steer" | "turnResult" | "turnAgentMessage";
+	objectType: "task" | "work" | "artifact" | "testResult" | "finalResult" | "traceSummary" | "steer" | "turnResult" | "turnAgentMessage" | "decision";
 	itemId?: string;
 	turnIndex?: number;
 	index?: number;
@@ -474,6 +474,56 @@ function ObjectFields({
 							<span style={{ color: textPrimary }}>{String(v)}</span>
 						</div>
 					))}
+				</div>
+			</Section>
+		);
+	}
+	if (selectedObject.objectType === "decision") {
+		const pending = selectedObject as any;
+		const itemId = pending.itemId || "";
+		const reason = pending.reason || "File change requested by agent";
+		const grantRoot = pending.grantRoot || "";
+		return (
+			<Section label="File-Change Decision">
+				<div style={{ fontSize: 11, lineHeight: 1.6, marginBottom: 8 }}>
+					<div><span style={{ color: muted }}>Item:</span> <span style={{ color: textPrimary, fontFamily: "monospace" }}>{itemId}</span></div>
+					<div><span style={{ color: muted }}>Reason:</span> <span style={{ color: textPrimary }}>{reason}</span></div>
+					{grantRoot && <div><span style={{ color: muted }}>Scope:</span> <span style={{ color: textPrimary, fontFamily: "monospace" }}>{grantRoot}</span></div>}
+				</div>
+				<div style={{ fontSize: 10, color: "#fbbf24", fontWeight: 600, marginBottom: 8 }}>
+					NEEDS YOUR DECISION
+				</div>
+				<div style={{ display: "flex", gap: 8 }}>
+					<button
+						onClick={() => { pending._onApprove && pending._onApprove(itemId); }}
+						style={{
+							padding: "6px 18px",
+							borderRadius: 4,
+							border: "none",
+							background: "#4ade80",
+							color: "#000",
+							fontSize: 12,
+							fontWeight: 700,
+							cursor: "pointer",
+						}}
+					>
+						Approve
+					</button>
+					<button
+						onClick={() => { pending._onDecline && pending._onDecline(itemId); }}
+						style={{
+							padding: "6px 18px",
+							borderRadius: 4,
+							border: "none",
+							background: "#f87171",
+							color: "#fff",
+							fontSize: 12,
+							fontWeight: 700,
+							cursor: "pointer",
+						}}
+					>
+						Decline
+					</button>
 				</div>
 			</Section>
 		);
