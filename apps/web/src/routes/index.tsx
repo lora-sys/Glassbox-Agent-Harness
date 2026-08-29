@@ -225,6 +225,11 @@ function App() {
 	const [traceEntries, setTraceEntries] = useState<TraceEntryLike[]>([]);
 	const [traceLoading, setTraceLoading] = useState(false);
 
+	// S7: Editable task — draft state lives in the parent so it survives
+	// selection changes and is easy to reset on session switches.
+	const [draftTask, setDraftTask] = useState<string | null>(null);
+	const [isApplying, setIsApplying] = useState(false);
+
 	const shapeIdsRef = useRef<string[]>([]);
 	const sessionMetaRef = useRef(new Map<string, Map<string, ObjectMeta>>());
 	const tracedSessionsRef = useRef(new Set<string>());
@@ -309,11 +314,12 @@ function App() {
 		} catch {}
 	}, [currentSessionId, localState]);
 
-	// Selection -> Inspector (read-only)
+	// Selection -> Inspector (read-only for most objects)
 	var handleSelection = useCallback(function(sId: string | null) {
 		setSelectedShapeId(sId);
 		if (!sId) {
 			setSelectedObject(null);
+			setDraftTask(null); // S7: cancel draft on deselection
 			return;
 		}
 		var sid = currentSidRef.current;
@@ -321,7 +327,12 @@ function App() {
 			setSelectedObject(null);
 			return;
 		}
-		setSelectedObject(sessionMetaRef.current.get(sid)?.get(sId) ?? null);
+		var obj = sessionMetaRef.current.get(sid)?.get(sId) ?? null;
+		setSelectedObject(obj);
+		// S7: reset draft when switching object type (only task supports editing)
+		if (obj?.objectType !== "task") {
+			setDraftTask(null);
+		}
 	}, []);
 
 	// Lazy trace fetch (cached per session)
@@ -598,6 +609,34 @@ function App() {
 		setSteerText("");
 	}, [currentSessionId, steerText, addLog]);
 
+	// S7: Send edited task — starts a new turn on the same thread
+	var handleSendTask = useCallback(async function sendTask(taskText) {
+		if (!currentSessionId) return;
+		setIsApplying(true);
+		try {
+			var res = await fetch("/api/send-task", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					sessionId: currentSessionId,
+					task: taskText,
+				}),
+			});
+			if (!res.ok) {
+				var errData: any = await res.json();
+				throw new Error(errData.error || "HTTP " + res.status);
+			}
+			var data: any = await res.json();
+			setDraftTask(null);
+			addLog("Sent: new turn " + data.turnId?.slice(0, 8) + " with edited task");
+			if (data.derivedState) setLocalState(data.derivedState);
+		} catch (err: any) {
+			addLog("Send error: " + (err?.message || String(err)));
+		} finally {
+			setIsApplying(false);
+		}
+	}, [currentSessionId, addLog]);
+
 	// Session reopen input state
 	var sessionInputState = useState("");
 	var sessionInput = sessionInputState[0];
@@ -859,6 +898,10 @@ function App() {
 							selectedObject={selectedObject}
 							traceEntries={entries}
 							derivedState={localState}
+							draftTask={draftTask}
+							onDraftChange={setDraftTask}
+							onApplyTask={handleSendTask}
+							isApplying={isApplying}
 						/>
 					</div>
 				)}

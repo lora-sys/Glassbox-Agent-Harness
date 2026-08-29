@@ -285,6 +285,28 @@ export function reduce(state: DerivedState, event: CodexEvent): DerivedState {
       }
       return { ...state, traceSummary: { ...state.traceSummary, eventCounts: counts, totalEvents: state.traceSummary.totalEvents + 1 } };
     }
+    case "actionSend": {
+      counts["action.send"] = (counts["action.send"] ?? 0) + 1;
+      // action.send follows a new turn that already captured the edited task
+      // text in its turnStarted event. Update the top-level task so the canvas
+      // and subsequent turns see the new text. Backfill the turn record if
+      // its taskOrInstruction is still empty.
+      const sendTurnId = (event as unknown as { turnId?: string }).turnId;
+      const newTaskText = (event as unknown as { task?: string }).task || state.task;
+      const turns = sendTurnId
+        ? state.turns.map(t =>
+            t.turnId === sendTurnId && !t.taskOrInstruction
+              ? { ...t, taskOrInstruction: newTaskText }
+              : t
+          )
+        : state.turns;
+      return {
+        ...state,
+        task: newTaskText,
+        turns,
+        traceSummary: { ...state.traceSummary, eventCounts: counts, totalEvents: state.traceSummary.totalEvents + 1 },
+      };
+    }
 
     // -----------------------------------------------------------------------
     // Unhandled / future event kinds — update summary counts from _tag

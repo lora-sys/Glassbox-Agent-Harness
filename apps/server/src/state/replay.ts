@@ -31,6 +31,7 @@ const METHOD_TO_TAG: Record<string, string> = {
   "action.pause": "actionPause",
   "action.stop": "actionPause",
   "action.steer": "actionSteer",
+  "action.send": "actionSend",
 };
 
 // ---------------------------------------------------------------------------

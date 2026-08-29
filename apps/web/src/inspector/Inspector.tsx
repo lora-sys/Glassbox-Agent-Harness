@@ -1,7 +1,3 @@
-// apps/web/src/inspector/Inspector.tsx
-// Inspector panel: shows per-object domain details + the trace
-// events that produced them.  Selection is read-only.
-
 import { type ReactNode } from "react";
 
 /* ── Public types ─────────────────────────────────────────── */
@@ -24,6 +20,14 @@ export interface InspectorProps {
 	selectedObject: ObjectMeta | null;
 	traceEntries: TraceEntryLike[];
 	derivedState: Record<string, unknown> | null;
+	/** Current draft value for the task, or null when no draft is active. */
+	draftTask: string | null;
+	/** Update the draft text. Pass null to cancel / revert. */
+	onDraftChange: (text: string | null) => void;
+	/** Trigger Apply — fires when the user clicks Confirm. */
+	onApplyTask: (task: string) => void;
+	/** True while the Apply request is in flight. */
+	isApplying: boolean;
 }
 
 /* ── Theme tokens ─────────────────────────────────────────── */
@@ -33,6 +37,7 @@ const muted = "#71717a";
 const dim = "#52525b";
 const textMuted = "#a1a1aa";
 const textPrimary = "#d4d4d8";
+const draftColor = "#fbbf24";
 
 /* ── Small building blocks ────────────────────────────────── */
 
@@ -69,6 +74,10 @@ function TraceLine({ entry }: { entry: TraceEntryLike }) {
 		detail = String(p.status);
 	} else if (p.error != null) {
 		detail = JSON.stringify(p.error).slice(0, 60);
+	} else if (p.task != null) {
+		detail = `"${String(p.task).slice(0, 42)}"`;
+	} else if (p.instruction != null) {
+		detail = `"${String(p.instruction).slice(0, 42)}"`;
 	}
 	return (
 		<div
@@ -103,7 +112,7 @@ function matchesObject(
 	const p = (e.event?.params ?? {}) as Record<string, unknown>;
 	switch (om.objectType) {
 		case "task":
-			return m === "thread/started" || m === "turn/started";
+			return ["thread/started", "turn/started"].includes(m ?? "");
 		case "work":
 			return (
 				["item/started", "item/agentMessage/delta"].includes(m ?? "") &&
@@ -121,7 +130,11 @@ function matchesObject(
 		case "traceSummary":
 			return true;
 		case "steer":
-			return (m === "action.steer" || m === "action.stop") && p.source === "glassbox-user";
+			return (
+				m === "action.steer" ||
+				m === "action.stop" ||
+				m === "action.send"
+			) && p.source === "glassbox-user";
 		case "turnResult":
 			return m === "turn/completed" || m === "turn/started";
 		case "turnAgentMessage":
@@ -136,22 +149,107 @@ function matchesObject(
 function ObjectFields({
 	selectedObject,
 	derivedState,
+	draftTask,
+	isApplying,
+	onDraftChange,
+	onApplyTask,
 }: {
 	selectedObject: ObjectMeta;
 	derivedState: Record<string, unknown> | null;
+	draftTask: string | null;
+	isApplying: boolean;
+	onDraftChange: (text: string | null) => void;
+	onApplyTask: (task: string) => void;
 }) {
 	if (selectedObject.objectType === "task") {
+		const appliedTask = (derivedState as { task?: string })?.task ?? "";
+		const isDrafting = draftTask !== null;
+		const displayTask = isDrafting ? draftTask : appliedTask;
+
 		return (
-			<Section label="Prompt">
-				<div
+			<Section label={isDrafting ? "Prompt (editing)" : "Prompt"}>
+				<textarea
+					value={displayTask}
+					onChange={(e) => onDraftChange(e.target.value)}
+					readOnly={isApplying}
+					rows={4}
 					style={{
+						width: "100%",
 						whiteSpace: "pre-wrap",
 						fontSize: 12,
 						color: textPrimary,
+						background: isDrafting ? "#2a2d1f" : "transparent",
+						border: isDrafting
+							? `1px solid ${draftColor}`
+							: "none",
+						borderRadius: 4,
+						padding: isDrafting ? 6 : 2,
+						resize: "vertical",
+						fontFamily: "inherit",
+						opacity: isApplying ? 0.7 : 1,
+						transition: "background 0.15s, border-color 0.15s",
 					}}
-				>
-					{(derivedState as { task?: string })?.task ?? "(empty)"}
-				</div>
+				/>
+				{isDrafting && (
+					<>
+						<div
+							style={{
+								fontSize: 10,
+								color: draftColor,
+								marginTop: 4,
+								fontWeight: 600,
+							}}
+						>
+							DRAFT — not applied
+						</div>
+						<div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+							<button
+								onClick={() => onApplyTask(draftTask)}
+								disabled={isApplying}
+								style={{
+									padding: "4px 14px",
+									borderRadius: 4,
+									border: "none",
+									background: isApplying ? "#3b3b55" : accent,
+									color: "#fff",
+									fontSize: 11,
+									fontWeight: 600,
+									cursor: isApplying
+										? "not-allowed"
+										: "pointer",
+									transition: "background 0.15s",
+								}}
+							>
+								{isApplying ? "Sending…" : "Send"}
+							</button>
+							<button
+								onClick={() => {
+									if (!isApplying) onDraftChange(null);
+								}}
+								disabled={isApplying}
+								style={{
+									padding: "4px 14px",
+									borderRadius: 4,
+									border: "1px solid #2a2b35",
+									background: isApplying
+										? "#1f2028"
+										: "#22232e",
+									color: isApplying
+										? "#52525b"
+										: "#a1a1aa",
+									fontSize: 11,
+									fontWeight: 600,
+									cursor: isApplying
+										? "not-allowed"
+										: "pointer",
+									transition: "all 0.15s",
+								}}
+							>
+								Cancel
+							</button>
+						</div>
+					</>
+				)}
 			</Section>
 		);
 	}
@@ -227,19 +325,13 @@ function ObjectFields({
 				>
 					<div>
 						Status:{" "}
-						<span style={{ color: textPrimary }}>
-							{tr?.status ?? "?"}
-						</span>
+						<span style={{ color: textPrimary }}>{tr?.status ?? "—"}</span>
 					</div>
 					{tr?.exitCode != null && (
 						<div>
 							Exit:{" "}
-							<span
-								style={{
-									color: tr.exitCode === 0 ? "#4ade80" : "#f87171",
-								}}
-							>
-								{tr.exitCode}
+							<span style={{ color: textPrimary }}>
+								{String(tr.exitCode)}
 							</span>
 						</div>
 					)}
@@ -247,7 +339,7 @@ function ObjectFields({
 						<div>
 							Duration:{" "}
 							<span style={{ color: textPrimary }}>
-								{tr.durationMs} ms
+								{tr.durationMs}ms
 							</span>
 						</div>
 					)}
@@ -255,11 +347,10 @@ function ObjectFields({
 						<pre
 							style={{
 								marginTop: 6,
-								whiteSpace: "pre-wrap",
-								maxHeight: 150,
-								overflowY: "auto",
-								fontSize: 10,
 								color: textMuted,
+								fontSize: 10,
+								maxHeight: 120,
+								overflowY: "auto",
 							}}
 						>
 							{tr.aggregatedOutput.slice(0, 500)}
@@ -270,41 +361,40 @@ function ObjectFields({
 		);
 	}
 	if (selectedObject.objectType === "finalResult") {
-		const fr = (derivedState as {
-			finalResult?:
-				| { status: string; durationMs: number; error: string | null }
-				| null;
-		}).finalResult;
+		const fr = (derivedState as { finalResult?: { status: string; startedAt: number; completedAt: number; durationMs: number; error: string | null } | null }).finalResult;
 		return (
-			<Section label="Turn Outcome">
+			<Section label="Result">
 				<div
 					style={{
 						fontFamily: "monospace",
 						fontSize: 11,
-						lineHeight: 1.7,
+						lineHeight: 1.6,
 					}}
 				>
 					<div>
 						Status:{" "}
 						<span
 							style={{
-								color: fr?.status === "completed" ? "#4ade80" : "#f87171",
+								color:
+									fr?.status === "completed" ? "#4ade80"
+									: fr?.status === "interrupted" ? "#fbbf24"
+									: "#f87171",
 							}}
 						>
-							{fr?.status ?? "?"}
+							{fr?.status ?? "—"}
 						</span>
 					</div>
 					{fr?.durationMs != null && (
 						<div>
 							Duration:{" "}
 							<span style={{ color: textPrimary }}>
-								{(fr.durationMs / 1000).toFixed(1)} s
+								{(fr.durationMs / 1000).toFixed(1)}s
 							</span>
 						</div>
 					)}
 					{fr?.error && (
 						<div style={{ color: "#f87171" }}>
-							{fr.error.slice(0, 300)}
+							Error: {fr.error.slice(0, 200)}
 						</div>
 					)}
 				</div>
@@ -312,34 +402,37 @@ function ObjectFields({
 		);
 	}
 	if (selectedObject.objectType === "turnResult") {
+		const turns = (derivedState as { turns?: Array<{ taskOrInstruction: string; finalResult: { status: string; durationMs: number; error: string | null } | null; agentMessageText: string }> }).turns ?? [];
 		const idx = selectedObject.turnIndex ?? 0;
-		const turns = ((derivedState as { turns?: Array<{
-			turnId: string;
-			taskOrInstruction: string;
-			finalResult: { status: string; durationMs: number; error: string | null } | null;
-			agentMessageText: string;
-		} | null> })?.turns) ?? [];
-		const t = turns[idx] || turns[turns.length - 1];
-		if (!t) return null;
+		const t = turns[idx];
+		if (!t) return <Section label="Turn"><div style={{ fontSize: 11, color: muted }}>Turn data not found</div></Section>;
 		return (
-			<Section label={"Turn " + (idx + 1) + " Outcome"}>
-				<div style={{ fontFamily: "monospace", fontSize: 11, lineHeight: 1.7 }}>
-					<div>Input: {t.taskOrInstruction || "(empty)"}</div>
+			<Section label="Turn Details">
+				<div style={{ fontSize: 11, lineHeight: 1.6 }}>
 					<div>
-						Status:{" "}
-						<span style={{ color: t.finalResult?.status === "completed" ? "#4ade80" : "#fbbf24" }}>
-							{t.finalResult?.status ?? "running..."}
+						Input:{" "}
+						<span style={{ color: textPrimary }}>
+							{t.taskOrInstruction || "(empty)"}
 						</span>
 					</div>
-					{t.finalResult?.durationMs != null && (
-						<div>Duration: {(t.finalResult.durationMs / 1000).toFixed(1)}s</div>
+					{t.finalResult && (
+						<div>
+							Status:{" "}
+							<span
+								style={{
+									color: t.finalResult.status === "completed" ? "#4ade80"
+										: t.finalResult.status === "interrupted" ? "#fbbf24"
+										: "#f87171",
+								}}
+							>
+								{t.finalResult.status}
+							</span>
+							{" "}({(t.finalResult.durationMs / 1000).toFixed(1)}s)
+						</div>
 					)}
 					{t.finalResult?.error && (
-						<div style={{ color: "#f87171" }}>{t.finalResult.error.slice(0, 200)}</div>
-					)}
-					{t.agentMessageText && (
-						<div style={{ marginTop: 6, color: textMuted, fontSize: 10 }}>
-							{t.agentMessageText.slice(0, 200)}
+						<div style={{ color: "#f87171" }}>
+							{t.finalResult.error.slice(0, 200)}
 						</div>
 					)}
 				</div>
@@ -347,17 +440,13 @@ function ObjectFields({
 		);
 	}
 	if (selectedObject.objectType === "turnAgentMessage") {
+		const turns = (derivedState as { turns?: Array<{ agentMessageText: string }> }).turns ?? [];
 		const idx = selectedObject.turnIndex ?? 0;
-		const turns = ((derivedState as { turns?: Array<{
-			agentMessageText: string;
-		} | null> })?.turns) ?? [];
 		const t = turns[idx];
-		if (!t) return null;
 		return (
-			<Section label={"Turn " + (idx + 1) + " Agent Message"}>
+			<Section label="Agent Message">
 				<pre
 					style={{
-						whiteSpace: "pre-wrap",
 						fontSize: 10,
 						color: textMuted,
 						maxHeight: 200,
@@ -365,16 +454,26 @@ function ObjectFields({
 						margin: 0,
 					}}
 				>
-					{t.agentMessageText || "(no message yet)"}
+					{t?.agentMessageText || "(no message yet)"}
 				</pre>
 			</Section>
 		);
 	}
-	if (selectedObject.objectType === "steer") {
+	if (selectedObject.objectType === "traceSummary") {
+		const ts = (derivedState as
+			| { traceSummary?: { eventCounts?: Record<string, number>; totalEvents?: number; totalDurationMs?: number | null } }
+			| null
+			| undefined)?.traceSummary;
+		if (!ts) return <Section label="Trace"><div style={{ fontSize: 11, color: muted }}>No trace data</div></Section>;
 		return (
-			<Section label="Steer Instruction">
-				<div style={{ whiteSpace: "pre-wrap", fontSize: 12, color: textPrimary }}>
-					{(derivedState as Record<string, unknown>)?.["lastSteer"] as string || "(steer action)"}
+			<Section label="Event Counts">
+				<div style={{ fontSize: 11, fontFamily: "monospace" }}>
+					{Object.entries(ts.eventCounts ?? {}).map(([k, v]) => (
+						<div key={k} style={{ padding: "1px 0" }}>
+							<span style={{ color: muted }}>{k}:</span>{" "}
+							<span style={{ color: textPrimary }}>{String(v)}</span>
+						</div>
+					))}
 				</div>
 			</Section>
 		);
@@ -388,8 +487,12 @@ export function Inspector({
 	selectedObject,
 	traceEntries = [],
 	derivedState,
+	draftTask,
+	isApplying,
+	onDraftChange,
+	onApplyTask,
 }: InspectorProps) {
-	/* — Filtered trace entries — */
+	/* -- Filtered trace entries -- */
 	const filtered = (() => {
 		if (!selectedObject) return traceEntries.slice(-25).reverse();
 		return traceEntries
@@ -399,47 +502,42 @@ export function Inspector({
 
 	const hasSelection = selectedObject != null;
 
-	/* -- Context section (depends on selection state) ----------- */
+	/* -- Context section (shown when nothing is selected) -- */
 	const overviewNode = ((): ReactNode => {
 		if (hasSelection) return null;
 		const ts = (derivedState as
-			| { traceSummary?: { eventCounts?: Record<string, number>; totalEvents?: number; totalDurationMs?: number | null; tokenUsage?: { totalTokens?: number | null } } }
+			| { traceSummary?: { eventCounts?: Record<string, number>; totalEvents?: number; totalDurationMs?: number | null } }
 			| null
 			| undefined)?.traceSummary;
 		if (!ts) return null;
 
-		const children: ReactNode[] = [
-			<Section key="events" label="Events">
-				{Object.entries(ts.eventCounts ?? {}).map(([k, v]) => (
-					<div
-						key={k}
-						style={{ fontSize: 11, color: textMuted, fontFamily: "monospace", padding: "1px 0" }}
-					>
-						{k}: <span style={{ color: textPrimary }}>{String(v)}</span>
-					</div>
-				))}
-			</Section>,
-			<Section key="totals" label="Totals">
-				<div style={{ fontSize: 11, color: textMuted }}>
-					Events: <span style={{ color: textPrimary }}>{ts.totalEvents}</span>
-				</div>
-				{ts.totalDurationMs != null && (
+		return (
+			<>
+				<Section label="Events">
+					{Object.entries(ts.eventCounts ?? {}).map(([k, v]) => (
+						<div
+							key={k}
+							style={{ fontSize: 11, color: textMuted, fontFamily: "monospace", padding: "1px 0" }}
+						>
+							{k}: <span style={{ color: textPrimary }}>{String(v)}</span>
+						</div>
+					))}
+				</Section>
+				<Section label="Totals">
 					<div style={{ fontSize: 11, color: textMuted }}>
-						Duration:{" "}
-						<span style={{ color: textPrimary }}>
-							{(ts.totalDurationMs / 1000).toFixed(1)}s
-						</span>
+						Events: <span style={{ color: textPrimary }}>{ts.totalEvents}</span>
 					</div>
-				)}
-				{ts.tokenUsage?.totalTokens && (
-					<div style={{ fontSize: 11, color: textMuted }}>
-						Tokens: <span style={{ color: textPrimary }}>{ts.tokenUsage.totalTokens}</span>
-					</div>
-				)}
-			</Section>,
-		];
-
-		return <div key="ov">{children}</div>;
+					{ts.totalDurationMs != null && (
+						<div style={{ fontSize: 11, color: textMuted }}>
+							Duration:{" "}
+							<span style={{ color: textPrimary }}>
+								{(ts.totalDurationMs / 1000).toFixed(1)}s
+							</span>
+						</div>
+					)}
+				</Section>
+			</>
+		);
 	})();
 
 	return (
@@ -488,7 +586,14 @@ export function Inspector({
 
 			{/* Object-specific fields */}
 			{hasSelection && selectedObject && (
-				<ObjectFields selectedObject={selectedObject} derivedState={derivedState} />
+				<ObjectFields
+					selectedObject={selectedObject}
+					derivedState={derivedState}
+					draftTask={draftTask}
+					isApplying={isApplying}
+					onDraftChange={onDraftChange}
+					onApplyTask={onApplyTask}
+				/>
 			)}
 			{overviewNode}
 

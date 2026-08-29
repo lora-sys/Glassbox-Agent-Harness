@@ -575,6 +575,88 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ---- POST /send-task — edit task and start new turn on same thread ----
+  if (req.method === "POST" && req.url === "/send-task") {
+    try {
+      await ensureInitialized();
+
+      const body = await parseBody(req);
+      const sessionId = typeof body.sessionId === "string" ? body.sessionId : "";
+      const task = typeof body.task === "string" ? body.task : "";
+
+      if (!sessionId || !task.trim()) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "sessionId and task required" }));
+        return;
+      }
+
+      const session = sessions.get(sessionId);
+      if (!session) {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: `no session: ${sessionId}` }));
+        return;
+      }
+
+      const editedTask = task.trim();
+      const traceCollector = makeTraceCollector(sessionId);
+
+      // If a turn is active, interrupt it first
+      if (session.activeTurnId) {
+        const { activeTurnId, threadId } = session;
+
+        await new Promise<void>((resolve) => {
+          adapter.registerOnTurnEnd((_status: string) => resolve());
+        });
+
+        await adapter.interruptTurn(threadId, activeTurnId);
+        session.activeTurnId = null;
+
+        await new Promise<void>((resolve) => {
+          adapter.registerOnTurnEnd((_status: string) => resolve());
+        });
+      }
+
+      // Start the new turn on the same thread with the edited task text
+      const summary = await startNewTurn(session, editedTask, traceCollector);
+
+      // Record action.send AFTER the turn's provider events are in the trace
+      const sendRecord = {
+        method: "action.send",
+        params: {
+          kind: "action.send",
+          source: "glassbox-user",
+          sessionId,
+          threadId: session.threadId,
+          turnId: summary.turnId,
+          task: editedTask,
+          ts: new Date().toISOString(),
+        },
+      };
+
+      traceStore.append(sessionId, sendRecord);
+      broadcastEvent(sessionId, sendRecord.params);
+
+      const replayResult = replayTrace(sessionId);
+      broadcastDerivedState(sessionId, replayResult.state as unknown as Record<string, unknown>);
+
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        ok: true,
+        sessionId,
+        derivedState: replayResult.state,
+        turnId: summary.turnId,
+        turnStatus: summary.turnStatus,
+        turnDurationMs: summary.turnDurationMs,
+      }, null, 2));
+    } catch (err) {
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        error: String(err instanceof Error ? err.message : err),
+      }));
+    }
+    return;
+  }
+
   // ---- GET /trace/:sessionId ----
   if (req.method === "GET" && req.url) {
     const match = req.url.match(/^\/trace\/([^/]+)$/);
@@ -684,6 +766,7 @@ server.listen(PORT, () => {
   console.log(`  POST /pause:        interrupt active turn (prepares for /steer)`);
   console.log(`  POST /stop:         interrupt active turn by sessionId`);
   console.log(`  POST /steer:        steering instruction for existing session`);
+  console.log(`  POST /send-task:    edit task and start new turn on same thread`);
   console.log(`  GET  /trace/:id:    raw trace entries`);
   console.log(`  GET  /state/:id:    derived state replay`);
 });

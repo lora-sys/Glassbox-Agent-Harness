@@ -235,7 +235,7 @@ function fail(msg) { log("FAIL: " + msg); }
     // ══ Step 4: Assert derived state (same thread, multiple turns) ═══════
     log("\n=== Step 4: Thread/turn continuity ===");
     if (sessionId) {
-      const stateRes = await fetch(`/api/state/${sessionId}`);
+      const stateRes = await fetch(`http://localhost:${SERVER_PORT}/state/${sessionId}`);
       if (!stateRes.ok) { fail("state endpoint failed"); exitCode = 1; }
       else {
         const { derivedState } = await stateRes.json();

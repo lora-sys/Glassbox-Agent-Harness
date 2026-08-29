@@ -144,6 +144,21 @@ export type RequestApprovalParams = Schema.Schema.Type<
   typeof RequestApprovalParams
 >;
 
+/** Glassbox action.send record (appended to trace after new turn starts with edited task) */
+export const ActionSendParams = Schema.Struct({
+  _tag: Schema.Literal("actionSend"),
+  kind: Schema.Literal("action.send"),
+  source: Schema.String,
+  sessionId: Schema.String,
+  threadId: Schema.String,
+  turnId: Schema.String,
+  task: Schema.String,
+  ts: Schema.String,
+});
+export type ActionSendParams = Schema.Schema.Type<
+  typeof ActionSendParams
+>;
+
 /** Glassbox action.pause record (appended to trace after turn/interrupt) */
 export const ActionPauseParams = Schema.Struct({
   _tag: Schema.Literal("actionPause"),
@@ -189,6 +204,7 @@ export const CodexEvent = Schema.Union([
   RequestApprovalParams,
   ActionPauseParams,
   ActionSteerParams,
+  ActionSendParams,
 ]);
 
 export type CodexEvent = Schema.Schema.Type<typeof CodexEvent>;
@@ -207,6 +223,8 @@ export const METHOD_TAG: ReadonlyMap<string, CodexEvent["_tag"]> = new Map([
   ["item/fileChange", "itemFileChange"],
   ["item/fileChange/requestApproval", "requestApproval"],
   ["item/commandExecution/requestApproval", "requestApproval"],
+  ["action.steer", "actionSteer"],
+  ["action.send", "actionSend"],
 ]);
 
 export const TAG_SCHEMA: Map<string, unknown> = new Map()
@@ -219,4 +237,5 @@ export const TAG_SCHEMA: Map<string, unknown> = new Map()
   .set("itemFileChange", ItemFileChangeParams)
   .set("requestApproval", RequestApprovalParams)
   .set("actionPause", ActionPauseParams)
-  .set("actionSteer", ActionSteerParams);
+  .set("actionSteer", ActionSteerParams)
+  .set("actionSend", ActionSendParams);
