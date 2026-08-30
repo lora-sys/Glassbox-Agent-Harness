@@ -28,7 +28,6 @@ const METHOD_TO_TAG: Record<string, string> = {
   "item/fileChange/requestApproval": "requestApproval",
   "item/commandExecution/requestApproval": "requestApproval",
   "turn/diff/updated": "turnDiffUpdated",
-  // Glassbox-side Action records (counted, no product state change)
   "action.pause": "actionPause",
   "action.stop": "actionPause",
   "action.steer": "actionSteer",
@@ -52,7 +51,12 @@ const METHOD_TO_TAG: Record<string, string> = {
  */
 function rawToCodexEvent(entry: TraceEntry): CodexEvent | null {
   const event = entry.event as { method: string; params: Record<string, unknown> };
-  const tag = METHOD_TO_TAG[event.method];
+  // Claude Code adapter prefixes inner SDK events with "sdk:" (e.g.
+  // "sdk:assistant", "sdk:system"). Strip that prefix before lookup so the
+  // same map works for both providers without adding duplicate entries.
+  const baseMethod = event.method.startsWith("sdk:")
+    ? event.method.slice(4) : event.method;
+  const tag = METHOD_TO_TAG[baseMethod];
   if (!tag) return null;
 
   // Some provider events place turn.id nested under params.turn rather than

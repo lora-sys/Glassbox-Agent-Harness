@@ -266,6 +266,42 @@ function App() {
 	const currentSidRef = useRef<string | null>(null);
 	currentSidRef.current = currentSessionId;
 
+	// P2.4: Session setup state
+	const [showSetup, setShowSetup] = useState(false);
+	const [provider, setProvider] = useState(function() {
+		try {
+			return localStorage.getItem("glassbox:provider") || "codex";
+		} catch { return "codex"; }
+	});
+	const [approvalPolicy, setApprovalPolicy] = useState("on-request");
+	const [sandboxType, setSandboxType] = useState("read-only");
+	const [permissionMode, setPermissionMode] = useState("default");
+	const [repoPath, setRepoPath] = useState("/tmp/glassbox-t2.2");
+	const [resolvedPath, setResolvedPath] = useState<string | null>(null);
+	const [pathError, setPathError] = useState<string | null>(null);
+
+	// Persist provider preference
+	useEffect(function() {
+		try { localStorage.setItem("glassbox:provider", provider); } catch {}
+	}, [provider]);
+
+	// Validate repo path on change (client-side only; server is authoritative)
+	useEffect(function() {
+		setPathError(null);
+		setResolvedPath(null);
+		if (!repoPath) return;
+		if (repoPath.includes("Glassbox-Agent-Harness")) {
+			setPathError("Glassbox repo path is not allowed");
+			return;
+		}
+		if (repoPath === "~/.glassbox" || repoPath.startsWith("~/.glassbox/")) {
+			setPathError("~/.glassbox is reserved");
+			return;
+		}
+		setResolvedPath(repoPath);
+	}, [repoPath]);
+
+
 	const addLog = useCallback((msg: string) => {
 		setLog((prev) => [
 			...prev.slice(-50),
@@ -580,10 +616,19 @@ function App() {
 					"Content-Type": "application/json",
 					Accept: "application/json",
 				},
-				body: JSON.stringify({ prompt: prompt }),
+				body: JSON.stringify({
+					prompt: prompt,
+					provider: provider,
+					repoPath: repoPath,
+					approvalPolicy: approvalPolicy,
+					sandboxPolicy: sandboxType,
+					permissionMode: permissionMode,
+				}),
 			});
-			if (!res.ok) throw new Error("HTTP " + res.status);
-			var data: any = await res.json();
+			var respText = await res.text();
+			console.error("[e2e] fetch status=" + res.status + " body=" + respText.slice(0, 200));
+			if (!res.ok) throw new Error("HTTP " + res.status + ": " + respText.slice(0, 200));
+			var data: any = JSON.parse(respText);
 			if (data.error) throw new Error(data.error);
 			sessionId = data.sessionId;
 			setCurrentSessionId(sessionId);
@@ -634,7 +679,7 @@ function App() {
 			addLog("WS: " + (err?.message || String(err)));
 			setRunning(false);
 		}
-	}, [prompt, addLog]);
+	}, [prompt, addLog, provider, repoPath, approvalPolicy, sandboxType, permissionMode]);
 	// Pause: end turn but keep session open for steering
 	var handlePause = useCallback(async function pause() {
 		if (!currentSessionId) return;
@@ -756,7 +801,14 @@ function App() {
 			var res = await fetch("/api/run-demo", {
 				method: "POST",
 				headers: { "Content-Type": "application/json", Accept: "application/json" },
-				body: JSON.stringify({ prompt: prompt || "Fix the off-by-one bug in utils.js and run the test file to verify.", workspace: demoWorkspace }),
+				body: JSON.stringify({
+					prompt: prompt || "Fix the off-by-one bug in utils.js and run the test file to verify.",
+					provider: provider,
+					repoPath: repoPath,
+					approvalPolicy: "on-request",
+					sandboxPolicy: "workspace-write",
+					permissionMode: permissionMode,
+				}),
 			});
 			if (!res.ok) throw new Error("HTTP " + res.status);
 			var data: any = await res.json();
@@ -840,7 +892,7 @@ function App() {
 			addLog("WS: " + (err?.message || String(err)));
 			setRunning(false);
 		}
-	}, [prompt, demoWorkspace, addLog]);
+	}, [prompt, demoWorkspace, provider, approvalPolicy, sandboxType, permissionMode, addLog]);
 
 	// S8: Handle user Approve/Decline decision for a file-change request
 	var handleDecide = useCallback(async function decide(itemId: string, approved: boolean) {
@@ -910,6 +962,26 @@ function App() {
 					flexShrink: 0,
 				}}
 			>
+					{/* P2.4: Setup toggle */}
+					<button
+						onClick={function() { setShowSetup(!showSetup); }}
+						title="Session setup: provider, permissions, workspace"
+						style={{
+							padding: "3px 7px",
+							borderRadius: 4,
+							border: showSetup ? "1px solid #7c6ff7" : "1px solid #2a2b35",
+							background: showSetup ? "#2a2545" : "#22232e",
+							color: showSetup ? "#a594f7" : "#71717a",
+							fontSize: 12,
+							cursor: "pointer",
+							transition: "all 0.15s",
+							display: "flex",
+							alignItems: "center",
+							gap: 3,
+						}}
+					>
+						⚙ {showSetup ? "Close" : "Setup"}
+					</button>
 				<span
 					style={{
 						fontWeight: 700,
@@ -1110,6 +1182,65 @@ function App() {
 					Open
 				</button>
 			</div>
+
+				{/* P2.4: Collapsible session setup bar */}
+				{showSetup && (
+					<div style={{
+						display: "flex",
+						alignItems: "center",
+						gap: 12,
+						padding: "6px 16px",
+						background: "#14151d",
+						borderBottom: "1px solid #2a2b35",
+						flexShrink: 0,
+						flexWrap: "wrap",
+					}}>
+						{/* Provider picker */}
+						<select
+							value={provider}
+							onChange={function(e) { setProvider((e.target as HTMLSelectElement).value); }}
+							title="Provider"
+							style={{ padding: "4px 8px", borderRadius: 4, border: "1px solid #2a2b35", background: "#0f1117", color: "#e4e4d7", fontSize: 12 }}
+						>
+							<option value="codex">codex</option>
+							<option value="claude-code">claude-code</option>
+						</select>
+
+						{/* Provider-aware permission controls */}
+						{provider === "codex" ? (
+							<>
+								<select value={approvalPolicy} onChange={function(e) { setApprovalPolicy((e.target as HTMLSelectElement).value); }} title="Codex approval policy"
+									style={{ padding: "4px 8px", borderRadius: 4, border: "1px solid #2a2b35", background: "#0f1117", color: "#e4e4d7", fontSize: 12 }}>
+									<option value="untrusted">Approval: untrusted (ask per file)</option>
+									<option value="on-request">Approval: on-request</option>
+									<option value="never">Approval: never (hands-off)</option>
+								</select>
+								<select value={sandboxType} onChange={function(e) { setSandboxType((e.target as HTMLSelectElement).value); }} title="Codex sandbox"
+									style={{ padding: "4px 8px", borderRadius: 4, border: sandboxType === "danger-full-access" ? "1px solid #f87171" : "1px solid #2a2b35", background: sandboxType === "danger-full-access" ? "#2a1515" : "#0f1117", color: sandboxType === "danger-full-access" ? "#f87171" : "#e4e4d7", fontSize: 12 }}>
+									<option value="read-only">Sandbox: readOnly</option>
+									<option value="workspace-write">Sandbox: workspaceWrite</option>
+									<option value="danger-full-access">Sandbox: dangerFullAccess ⚠</option>
+								</select>
+							</>
+						) : (
+							<select value={permissionMode} onChange={function(e) { setPermissionMode((e.target as HTMLSelectElement).value); }} title="Claude-code permission mode"
+								style={{ padding: "4px 8px", borderRadius: 4, border: permissionMode === "bypassPermissions" ? "1px solid #f87171" : "1px solid #2a2b35", background: permissionMode === "bypassPermissions" ? "#2a1515" : "#0f1117", color: permissionMode === "bypassPermissions" ? "#f87171" : "#e4e4d7", fontSize: 12 }}>
+								<option value="default">Permission: default</option>
+								<option value="plan">Permission: plan</option>
+								<option value="manual">Permission: manual (full manual)</option>
+								<option value="acceptEdits">Permission: acceptEdits</option>
+								<option value="auto">Permission: auto</option>
+								<option value="bypassPermissions">Permission: bypassPermissions ⚠</option>
+							</select>
+						)}
+
+						{/* Repo path input with guardrails */}
+						<input type="text" value={repoPath} onChange={function(e) { setRepoPath(e.target.value); setPathError(null); }} placeholder="Repo path (or use default)"
+							style={{ width: 200, padding: "4px 8px", borderRadius: 4, border: pathError ? "1px solid #f87171" : "1px solid #2a2b35", background: "#0f1117", color: pathError ? "#f87171" : "#e4e4d7", fontSize: 11, fontFamily: "monospace", outline: "none" }} />
+						{resolvedPath && !pathError && <span style={{ fontSize: 10, color: "#52525b" }}>→ {resolvedPath}</span>}
+						{pathError && <span style={{ fontSize: 10, color: "#f87171" }}>{pathError}</span>}
+					</div>
+				)}
 
 			<div style={{ flex: 1, position: "relative" }}>
 				<Tldraw components={{ StylePanel: () => null }}>

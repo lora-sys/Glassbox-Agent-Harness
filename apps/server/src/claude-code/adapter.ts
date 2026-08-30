@@ -25,6 +25,41 @@ import type {
 import type { ServerInfo, Turn, UserInput, ApprovalEvent } from "../codex/types.js";
 
 // ---------------------------------------------------------------------------
+// Direct trace write helper — bypasses async channel to guarantee
+// thread/started and turn/started survive to the JSONL file even when
+// the for-await loop's event routing causes async buffering.
+// ---------------------------------------------------------------------------
+
+import { mkdirSync, appendFileSync, readFileSync } from "node:fs";
+
+function ensureTraceDir(sessionId: string): void {
+  const base = `/data/lora/repos/Glassbox-Agent-Harness/.glassbox/sessions/${sessionId}`;
+  mkdirSync(base, { recursive: true });
+}
+
+function nextSeq(sessionId: string): number {
+  try {
+    const content = readFileSync(
+      `/data/lora/repos/Glassbox-Agent-Harness/.glassbox/sessions/${sessionId}/trace.jsonl`,
+      "utf-8"
+    );
+    return content.split("\n").filter((l) => l.trim()).length + 1;
+  } catch { return 1; }
+}
+
+function writeTraceDirect(sessionId: string, event: unknown, provenance: string): void {
+  ensureTraceDir(sessionId);
+  const seq = nextSeq(sessionId);
+  const ts = new Date().toISOString();
+  const line = JSON.stringify({ seq, ts, event, provenance }) + "\n";
+  appendFileSync(
+    `/data/lora/repos/Glassbox-Agent-Harness/.glassbox/sessions/${sessionId}/trace.jsonl`,
+    line,
+    "utf-8"
+  );
+}
+
+// ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // Permission mode mapping (Glassbox convention -> Claude SDK literal)
 // TODO: wire from session opts. Currently hardcoded to "default" while the
@@ -49,12 +84,15 @@ interface SessionState {
   lastAssistantUuid: string | undefined;
   pendingApprovals: Map<string, PendingApproval>;
   pendingPrompt: string | null;
+  cwd: string;
+  permissionMode: string;
 }
 
 interface TurnState {
   turnId: string;
   startedAt: number;
   aborted: boolean;
+  traceEmitted?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -114,6 +152,8 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
       lastAssistantUuid: undefined,
       pendingApprovals: new Map(),
       pendingPrompt: null,
+      cwd: typeof _opts.cwd === "string" ? _opts.cwd : "/tmp",
+      permissionMode: typeof _opts.permissionMode === "string" ? _opts.permissionMode : "default",
     });
     return { id: clientSessionId };
   }
@@ -168,8 +208,8 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
     }
 
     const turn = this.ensureTurn(sessionId, turnId);
-    const cwd = "/tmp";
-    const mode: PermissionMode = "default";
+    const cwd = state.cwd;
+    const mode: PermissionMode = state.permissionMode as PermissionMode;
 
     const approvals: ApprovalEvent[] = [];
     let agentMessageCount = 0;
@@ -196,6 +236,8 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
     } as unknown as Parameters<typeof query>[0]);
 
     try {
+      let threadStartedEmitted = false;
+
       for await (const msg of q) {
         const m = msg as Record<string, unknown>;
         counts[m.type as string] = (counts[m.type as string] || 0) + 1;
@@ -213,6 +255,13 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
             if (sub === "init") {
               const sid = m.session_id as string | undefined;
               if (sid) state.sdkSessionId = sid;
+              // Emit thread/started so replayTrace knows a session began
+              if (traceCollector && !threadStartedEmitted) {
+                threadStartedEmitted = true;
+                const tsThread = { sessionId, threadId: sessionId, ts: Date.now() };
+                traceCollector("thread/started", tsThread);
+                try { writeTraceDirect(sessionId, { method: "thread/started", params: tsThread }, "claude-code-cli"); } catch {}
+              }
             }
             break;
           }
@@ -221,6 +270,18 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
             agentMessageCount++;
             if (typeof m.uuid === "string") {
               state.lastAssistantUuid = m.uuid;
+            }
+            // Emit turn/started on first assistant message of the turn
+            if (traceCollector && !turn.traceEmitted) {
+              turn.traceEmitted = true;
+              const tsTurn = {
+                threadId: sessionId,
+                turn: { id: turn.turnId },
+                input: typeof state.pendingPrompt === "string" ? [{ type: "text", text: state.pendingPrompt }] : [],
+                startedAtMs: turn.startedAt,
+              };
+              traceCollector("turn/started", tsTurn);
+              try { writeTraceDirect(sessionId, { method: "turn/started", params: tsTurn }, "claude-code-cli"); } catch {}
             }
             const message = msg as { message?: { content?: Array<Record<string, unknown>> } };
             if (message.message?.content) {
@@ -500,6 +561,8 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
         lastAssistantUuid: undefined,
         pendingApprovals: new Map(),
         pendingPrompt: null,
+        cwd: "/tmp",
+        permissionMode: "default",
         turn: { turnId: tid, startedAt: Date.now(), aborted: false },
       });
       return (this.sessions.get(sessionId) as SessionState & { turn: TurnState }).turn;

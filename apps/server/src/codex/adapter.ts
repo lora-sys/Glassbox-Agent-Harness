@@ -512,7 +512,6 @@ export class CodexAdapter extends EventEmitter implements ProviderAdapter {
   private async sendRequest(method: string, params: unknown): Promise<unknown> {
     const id = this.nextReqId++;
     const msg: JsonRpcRequest = { jsonrpc: "2.0", id, method, params };
-
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pendingRequests.delete(id);

@@ -1,6 +1,6 @@
 // apps/server — Glassbox runtime HTTP shell with Codex and Claude Code adapter endpoints.
 import http from "node:http";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, statSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 
 import { createAdapter } from "./provider/index.js";
@@ -23,7 +23,112 @@ import {
 } from "./ws/server.js";
 
 const PORT = Number.parseInt(process.env.PORT ?? "3030", 10);
-const WORKSPACE = "/tmp/glassbox-t2.2";
+function isGlassboxRepoPath(p: string): boolean {
+  // Reject paths inside the Glassbox repo itself
+  return p === "/data/lora/repos/Glassbox-Agent-Harness" || p.endsWith("/Glassbox-Agent-Harness");
+}
+
+function validateRepoPath(p: string): { ok: true } | { ok: false; error: string } {
+  if (!p || typeof p !== "string") return { ok: false, error: "repo path required" };
+  if (p === "~/.glassbox" || p.startsWith("~/.glassbox/")) return { ok: false, error: "~/.glassbox is reserved" };
+  if (isGlassboxRepoPath(p)) return { ok: false, error: "Glassbox repo path is not allowed: " + p };
+  try {
+    const s = statSync(p);
+    if (!s.isDirectory()) return { ok: false, error: "not a directory: " + p };
+  } catch {
+    return { ok: false, error: "path does not exist: " + p };
+  }
+  return { ok: true };
+}
+
+function recordSessionConfig(_sessionId: string, traceCollector: (method: string, params: Record<string, unknown>) => void, config: { provider: string; permissionMode?: string; approvalPolicy?: string; sandboxPolicy?: string; repoPath: string }) {
+  traceCollector("session.config", {
+    kind: "session.config",
+    provider: config.provider,
+    permissionMode: config.permissionMode ?? null,
+    approvalPolicy: config.approvalPolicy ?? null,
+    sandboxPolicy: config.sandboxPolicy ?? null,
+    repoPath: config.repoPath,
+    ts: new Date().toISOString(),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Repo-path defaults per provider
+// ---------------------------------------------------------------------------
+
+const DEFAULT_WORKSPACE_CODEX = "/tmp/glassbox-t2.2";
+const DEFAULT_WORKSPACE_CLAUDE = "/tmp/glassbox-claude";
+
+// Backward-compat: WORKSPACE aliases the default codex workspace.
+const WORKSPACE = DEFAULT_WORKSPACE_CODEX;
+
+function defaultWorkspaceFor(provider: string): string {
+  return provider === "claude-code" ? DEFAULT_WORKSPACE_CLAUDE : DEFAULT_WORKSPACE_CODEX;
+}
+
+function defaultApprovalPolicy(_provider: string): string {
+  return "on-request";
+}
+
+function defaultPermissionMode(): string {
+  return "auto";
+}
+
+// ---------------------------------------------------------------------------
+// Build provider-specific session/turn options
+// ---------------------------------------------------------------------------
+
+interface SessionRunOptions {
+  provider: string;
+  workspace: string;
+  approvalPolicy: string;
+  sandboxType: string;
+  permissionMode: string;
+}
+
+function sessionStartOpts(opts: SessionRunOptions): Record<string, unknown> {
+  if (opts.provider === "claude-code") {
+    return {
+      cwd: opts.workspace,
+      permissionMode: opts.permissionMode,
+    };
+  }
+  // thread/start validates the `sandbox` param in kebab-case (CLI-arg style):
+  // "unknown variant `readOnly`, expected one of `read-only`, ...".
+  // turn/start's SandboxPolicy.type (see turnStartOpts) validates camelCase.
+  // The two call sites genuinely differ; keep the maps separate.
+  const sandboxWireMap: Record<string, string> = {
+    "read-only": "read-only",
+    "workspace-write": "workspace-write",
+    "danger-full-access": "danger-full-access",
+    "readOnly": "read-only",
+    "workspaceWrite": "workspace-write",
+    "dangerFullAccess": "danger-full-access",
+  };
+  const wireResult = sandboxWireMap[opts.sandboxType] || opts.sandboxType;
+  return {
+    cwd: opts.workspace,
+    sandbox: wireResult,
+    approvalPolicy: opts.approvalPolicy,
+  };
+}
+
+function turnStartOpts(opts: SessionRunOptions, _workspace: string): Record<string, unknown> {
+  if (opts.provider === "claude-code") {
+    return { permissionMode: opts.permissionMode };
+  }
+  // Normalize kebab-case panel labels to the camelCase wire variants.
+  const sandboxWireMap: Record<string, string> = {
+    "read-only": "readOnly",
+    "workspace-write": "workspaceWrite",
+    "danger-full-access": "dangerFullAccess",
+  };
+  const sandboxType = sandboxWireMap[opts.sandboxType] || opts.sandboxType;
+  return {
+    sandboxPolicy: { type: sandboxType, networkAccess: false },
+  };
+}
 
 // Known-broken fixture for the demo workspace. /run-demo rewrites this file
 // before every run so each demo starts from the same reproducible state.
@@ -155,21 +260,22 @@ async function startNewTurn(
   // Now attach the event collector for the new turn.
   const evCounts: Record<string, number> = {} as Record<string, number>;
   let capturedTurnId = turn.id;
-  let completed: { status: string; durationMs: number | null; error?: string } | null = null;
+  // Use separate fields to avoid TS narrowing completed to never after
+  // assignment inside the wrappedCollector closure.
+  let turnCompletedStatus: string | undefined;
+  let turnCompletedDuration: number | null | undefined;
 
   const wrappedCollector = (method: string, params: Record<string, unknown>) => {
     traceCollector(method, params);
     evCounts[method] = (evCounts[method] || 0) + 1;
     if (method === "turn/started" && params.turnId && !capturedTurnId) {
-      capturedTurnId = params.turnId;
+      capturedTurnId = params.turnId as string;
     }
     if (method === "turn/completed" || method === "turn/interrupted") {
       const turnData = (params as { turn?: { status?: string; durationMs?: number | null } }).turn;
       if (turnData) {
-        completed = {
-          status: turnData.status || method.replace("turn/", ""),
-          durationMs: turnData.durationMs ?? null,
-        };
+        turnCompletedStatus = turnData.status || method.replace("turn/", "");
+        turnCompletedDuration = turnData.durationMs ?? null;
       }
     }
   };
@@ -209,13 +315,13 @@ async function startNewTurn(
   const turnStatus =
     evCounts["turn/completed"] > 0 ? "completed" :
     evCounts["turn/interrupted"] > 0 ? "interrupted" :
-    completed?.status || "completed";
+    turnCompletedStatus || "completed";
 
   return {
     turnId: finalTurnId,
     eventCounts: evCounts,
     turnStatus,
-    turnDurationMs: completed?.durationMs ?? null,
+    turnDurationMs: turnCompletedDuration ?? null,
   };
 }
 
@@ -314,7 +420,7 @@ const server = http.createServer(async (req, res) => {
 
       const body = await parseBody(req);
       const sessionId = randomUUID();
-      const provider = (typeof body.provider === "string" && (body.provider === "codex" || body.provider === "claude-code"))
+      const provider = (typeof body.provider === "string" && ["codex", "claude-code"].includes(body.provider))
         ? body.provider
         : "codex";
       const clientThreadId =
@@ -323,31 +429,66 @@ const server = http.createServer(async (req, res) => {
           : `glassbox-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const prompt = typeof body.prompt === "string" ? body.prompt : "say ready";
 
+      // --- P2.4: provider-aware options with server-side guardrails ---
+      const defaultWs = defaultWorkspaceFor(provider);
+      const workspace = typeof body.repoPath === "string" ? body.repoPath : defaultWs;
+      const approvalPolicy = typeof body.approvalPolicy === "string"
+        ? body.approvalPolicy
+        : defaultApprovalPolicy(provider);
+      const sandboxPolicyType = typeof body.sandboxPolicy === "string"
+        ? body.sandboxPolicy
+        : "read-only";
+      const permissionMode = typeof body.permissionMode === "string"
+        ? body.permissionMode
+        : defaultPermissionMode();
+
+      // Validate custom repo paths — guardrails server-side, never trust client
+      if (workspace !== defaultWs) {
+        const pathCheck = validateRepoPath(workspace);
+        if (!pathCheck.ok) {
+          res.writeHead(400, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: pathCheck.error }));
+          return;
+        }
+      }
+      // --- end P2.4 ---
+
       const sessionAdapter = provider === "claude-code" ? claudeAdapter : adapter;
       const traceProvenance = provider === "claude-code" ? TRACE_PROVENANCE_CLAUDECODE : TRACE_PROVENANCE;
       const traceCollector = makeTraceCollector(sessionId, traceProvenance);
       sessionAdapters.set(sessionId, sessionAdapter);
 
-      const thread = await sessionAdapter.startSession(clientThreadId, {
-        cwd: WORKSPACE,
-        sandbox: "read-only",
-        approvalPolicy: "on-request",
-      });
+      const runOpts: SessionRunOptions = {
+        provider,
+        workspace,
+        approvalPolicy,
+        sandboxType: sandboxPolicyType,
+        permissionMode,
+      };
 
-      sessionAdapter.snapshotWorkspace(WORKSPACE);
+      // --- P2.4: record session.config in trace for provenance ---
+      recordSessionConfig(sessionId, traceCollector, {
+        provider,
+        permissionMode: provider === "claude-code" ? permissionMode : undefined,
+        approvalPolicy: provider === "codex" ? approvalPolicy : undefined,
+        sandboxPolicy: provider === "codex" ? sandboxPolicyType : undefined,
+        repoPath: workspace,
+      });
+      // --- end P2.4 ---
+
+      const thread = await sessionAdapter.startSession(clientThreadId, sessionStartOpts(runOpts));
+
+      sessionAdapter.snapshotWorkspace(workspace);
 
       const turn = await sessionAdapter.startTurn(thread.id, [
         { type: "text", text: prompt },
-      ], {
-        sandboxPolicy: { type: "readOnly", networkAccess: false },
-        cwd: WORKSPACE,
-      });
+      ], turnStartOpts(runOpts, workspace));
 
       sessions.set(sessionId, {
         threadId: thread.id,
         clientThreadId,
-        provider: "codex",
-        workspace: WORKSPACE,
+        provider,
+        workspace,
         activeTurnId: turn.id,
         turnIds: [turn.id],
         pendingApprovals: [],
@@ -371,7 +512,7 @@ const server = http.createServer(async (req, res) => {
         .then(() => {
           // S8: post-turn workspace scan for file changes omitted from events
           try {
-            var scanResult = sessionAdapter.scanAndFireHooks(WORKSPACE);
+            var scanResult = sessionAdapter.scanAndFireHooks(workspace);
             if (scanResult.changes.length > 0) {
               var fileItemId = "git-" + (turn.id || "").slice(0, 8);
               traceStore.append(sessionId, {
@@ -406,8 +547,9 @@ const server = http.createServer(async (req, res) => {
       await ensureInitialized();
 
       const body = await parseBody(req);
+      console.error("[e2e-log] body=" + JSON.stringify({provider:body.provider,sandboxPolicy:body.sandboxPolicy,permissionMode:body.permissionMode,approvalPolicy:body.approvalPolicy}));
       const sessionId = randomUUID();
-      const provider = (typeof body.provider === "string" && (body.provider === "codex" || body.provider === "claude-code"))
+      const provider = (typeof body.provider === "string" && ["codex", "claude-code"].includes(body.provider))
         ? body.provider
         : "codex";
       const clientThreadId =
@@ -416,31 +558,63 @@ const server = http.createServer(async (req, res) => {
           : `glassbox-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const prompt = typeof body.prompt === "string" ? body.prompt : "say ready";
 
+      // --- P2.4: provider-aware options with server-side guardrails ---
+      const defaultWs = defaultWorkspaceFor(provider);
+      const workspace = typeof body.repoPath === "string" ? body.repoPath : defaultWs;
+      const approvalPolicy = typeof body.approvalPolicy === "string"
+        ? body.approvalPolicy
+        : defaultApprovalPolicy(provider);
+      const sandboxPolicyType = typeof body.sandboxPolicy === "string"
+        ? body.sandboxPolicy
+        : "read-only";
+      const permissionMode = typeof body.permissionMode === "string"
+        ? body.permissionMode
+        : defaultPermissionMode();
+
+      if (workspace !== defaultWs) {
+        const pathCheck = validateRepoPath(workspace);
+        if (!pathCheck.ok) {
+          res.writeHead(400, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: pathCheck.error }));
+          return;
+        }
+      }
+      // --- end P2.4 ---
+
       const sessionAdapter = provider === "claude-code" ? claudeAdapter : adapter;
       const traceProvenance = provider === "claude-code" ? TRACE_PROVENANCE_CLAUDECODE : TRACE_PROVENANCE;
       const traceCollector = makeTraceCollector(sessionId, traceProvenance);
       sessionAdapters.set(sessionId, sessionAdapter);
 
-      const thread = await sessionAdapter.startSession(clientThreadId, {
-        cwd: WORKSPACE,
-        sandbox: "read-only",
-        approvalPolicy: "on-request",
+      const runOpts: SessionRunOptions = {
+        provider,
+        workspace,
+        approvalPolicy,
+        sandboxType: sandboxPolicyType,
+        permissionMode,
+      };
+
+      recordSessionConfig(sessionId, traceCollector, {
+        provider,
+        permissionMode: provider === "claude-code" ? permissionMode : undefined,
+        approvalPolicy: provider === "codex" ? approvalPolicy : undefined,
+        sandboxPolicy: provider === "codex" ? sandboxPolicyType : undefined,
+        repoPath: workspace,
       });
 
-      sessionAdapter.snapshotWorkspace(WORKSPACE);
+      const thread = await sessionAdapter.startSession(clientThreadId, sessionStartOpts(runOpts));
+
+      sessionAdapter.snapshotWorkspace(workspace);
 
       const turn = await sessionAdapter.startTurn(thread.id, [
         { type: "text", text: prompt },
-      ], {
-        sandboxPolicy: { type: "readOnly", networkAccess: false },
-        cwd: WORKSPACE,
-      });
+      ], turnStartOpts(runOpts, workspace));
 
       sessions.set(sessionId, {
         threadId: thread.id,
         clientThreadId,
         provider,
-        workspace: WORKSPACE,
+        workspace,
         activeTurnId: turn.id,
         turnIds: [turn.id],
         pendingApprovals: [],
@@ -462,7 +636,7 @@ const server = http.createServer(async (req, res) => {
         .then(() => {
           // S8: post-turn workspace scan for file changes omitted from events
           try {
-            var scanResult = sessionAdapter.scanAndFireHooks(WORKSPACE);
+            var scanResult = sessionAdapter.scanAndFireHooks(workspace);
             if (scanResult.changes.length > 0) {
               var fileItemId = "git-" + (turn.id || "").slice(0, 8);
               traceStore.append(sessionId, {
@@ -475,6 +649,7 @@ const server = http.createServer(async (req, res) => {
 
           const replayResult = replayTrace(sessionId);
           broadcastDerivedState(sessionId, replayResult.state as unknown as Record<string, unknown>);
+          broadcastSessionEnded(sessionId);
           const s = sessions.get(sessionId);
           if (s) s.activeTurnId = null;
         })
@@ -482,6 +657,7 @@ const server = http.createServer(async (req, res) => {
           console.error(`[run-stream background] session ${sessionId} failed:`, err);
         });
     } catch (err) {
+      console.error("[e2e-error] /run-stream FAILED:", err instanceof Error ? err.message : String(err));
       res.writeHead(500, { "content-type": "application/json" });
       res.end(JSON.stringify({
         error: String(err instanceof Error ? err.message : err),
@@ -711,12 +887,14 @@ const server = http.createServer(async (req, res) => {
       };
 
       // Start the new turn on the same thread
-      const summary = await startNewTurn(session, instruction, session.workspace, traceCollector);
+      // @ts-ignore — TS inference bug: inferred type conflates with steerRecord.params
+      const turnSummary = (await startNewTurn(session, instruction, session.workspace, traceCollector)) as any;
 
       // Now that startNewTurn has returned, we know the actual turnId.
       // Patch the steer record with turnId so the reducer can backfill
       // the instruction text onto the correct turn record during replay.
-      steerRecord.params.turnId = summary.turnId;
+      // @ts-expect-error — TS fails to propagate any / explicit cast from async return
+      steerRecord.params.turnId = turnSummary.turnId;
 
       // Record action.steer AFTER the turn's provider events are in the trace
       traceStore.append(sessionId, steerRecord);
@@ -730,9 +908,9 @@ const server = http.createServer(async (req, res) => {
         ok: true,
         sessionId,
         derivedState: replayResult.state,
-        turnId: summary.turnId,
-        turnStatus: summary.turnStatus,
-        turnDurationMs: summary.turnDurationMs,
+        turnId: turnSummary.turnId,
+        turnStatus: turnSummary.turnStatus,
+        turnDurationMs: turnSummary.turnDurationMs,
       }, null, 2));
     } catch (err) {
       res.writeHead(500, { "content-type": "application/json" });
@@ -789,7 +967,8 @@ const server = http.createServer(async (req, res) => {
       }
 
       // Start the new turn on the same thread with the edited task text
-      const summary = await startNewTurn(session, editedTask, session.workspace, traceCollector);
+      const _sendTurnSummary = await startNewTurn(session, editedTask, session.workspace, traceCollector) as any;
+      const sendTurnSummary = _sendTurnSummary;
 
       // Record action.send AFTER the turn's provider events are in the trace
       const sendRecord = {
@@ -799,7 +978,7 @@ const server = http.createServer(async (req, res) => {
           source: "glassbox-user",
           sessionId,
           threadId: session.threadId,
-          turnId: summary.turnId,
+          turnId: sendTurnSummary.turnId,
           task: editedTask,
           ts: new Date().toISOString(),
         },
@@ -816,9 +995,9 @@ const server = http.createServer(async (req, res) => {
         ok: true,
         sessionId,
         derivedState: replayResult.state,
-        turnId: summary.turnId,
-        turnStatus: summary.turnStatus,
-        turnDurationMs: summary.turnDurationMs,
+        turnId: sendTurnSummary.turnId,
+        turnStatus: sendTurnSummary.turnStatus,
+        turnDurationMs: sendTurnSummary.turnDurationMs,
       }, null, 2));
     } catch (err) {
       res.writeHead(500, { "content-type": "application/json" });
@@ -841,42 +1020,73 @@ const server = http.createServer(async (req, res) => {
           ? body.threadId
           : `demo-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const prompt = typeof body.prompt === "string" ? body.prompt : "update utils.js so the tests pass";
-      const workspace = body.workspace && typeof body.workspace === "string"
-        ? body.workspace
-        : "/tmp/glassbox-demo-repo";
 
-      const traceCollector = makeTraceCollector(sessionId);
+      // --- P2.4: provider-aware options with server-side guardrails ---
+      const provider = (typeof body.provider === "string" && ["codex", "claude-code"].includes(body.provider))
+        ? body.provider
+        : "codex";
+      const defaultWs = "/tmp/glassbox-demo-repo";
+      const workspace = typeof body.repoPath === "string" ? body.repoPath : defaultWs;
+      const approvalPolicy = typeof body.approvalPolicy === "string"
+        ? body.approvalPolicy
+        : "on-request";
+      const sandboxPolicyType = typeof body.sandboxPolicy === "string"
+        ? body.sandboxPolicy
+        : "workspace-write";
+      const permissionMode = typeof body.permissionMode === "string"
+        ? body.permissionMode
+        : "auto";
 
-      const thread = await adapter.startSession(clientThreadId, {
-        cwd: workspace,
-        sandbox: "workspace-write",
-        approvalPolicy: "on-request",
+      // Validate custom repo paths
+      if (workspace !== defaultWs) {
+        const pathCheck = validateRepoPath(workspace);
+        if (!pathCheck.ok) {
+          res.writeHead(400, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: pathCheck.error }));
+          return;
+        }
+      }
+      // --- end P2.4 ---
+
+      const sessionAdapter = provider === "claude-code" ? claudeAdapter : adapter;
+      const traceProvenance = provider === "claude-code" ? TRACE_PROVENANCE_CLAUDECODE : TRACE_PROVENANCE;
+      const traceCollector = makeTraceCollector(sessionId, traceProvenance);
+
+      const runOpts: SessionRunOptions = {
+        provider,
+        workspace,
+        approvalPolicy,
+        sandboxType: sandboxPolicyType,
+        permissionMode,
+      };
+
+      // --- P2.4: record session.config in trace ---
+      recordSessionConfig(sessionId, traceCollector, {
+        provider,
+        permissionMode: provider === "claude-code" ? permissionMode : undefined,
+        approvalPolicy: provider === "codex" ? approvalPolicy : undefined,
+        sandboxPolicy: provider === "codex" ? sandboxPolicyType : undefined,
+        repoPath: workspace,
       });
+      // --- end P2.4 ---
+
+      const thread = await sessionAdapter.startSession(clientThreadId, sessionStartOpts(runOpts));
 
       // Reset the demo fixture so every run starts from the same broken
       // state (a previous run may have already fixed the file in place).
       writeFileSync(`${workspace}/utils.js`, BROKEN_UTILS_JS);
 
-      adapter.snapshotWorkspace(workspace);
+      sessionAdapter.snapshotWorkspace(workspace);
 
-      const turn = await adapter.startTurn(thread.id, [
+      const turn = await sessionAdapter.startTurn(thread.id, [
         { type: "text", text: prompt },
-      ], {
-        sandboxPolicy: {
-          type: "workspaceWrite",
-          writableRoots: [workspace],
-          networkAccess: false,
-          excludeTmpdirEnvVar: true,
-          excludeSlashTmp: true,
-        },
-        cwd: workspace,
-      });
+      ], turnStartOpts(runOpts, workspace));
 
       sessions.set(sessionId, {
         threadId: thread.id,
         clientThreadId,
-        provider: "codex",
-        workspace: workspace,
+        provider,
+        workspace,
         activeTurnId: turn.id,
         turnIds: [turn.id],
         pendingApprovals: [],
@@ -895,11 +1105,11 @@ const server = http.createServer(async (req, res) => {
         status: "running",
       }));
 
-      adapter.collectTurnEvents(thread.id, turn.id, 30_000, traceCollector)
+      sessionAdapter.collectTurnEvents(thread.id, turn.id, 30_000, traceCollector)
         .then(() => {
           // S8: post-turn workspace scan for file changes omitted from events
           try {
-            var scanResult = adapter.scanAndFireHooks(workspace);
+            var scanResult = sessionAdapter.scanAndFireHooks(workspace);
             if (scanResult.changes.length > 0) {
               var fileItemId = "git-" + (turn.id || "").slice(0, 8);
               traceStore.append(sessionId, {
@@ -912,6 +1122,7 @@ const server = http.createServer(async (req, res) => {
 
           const replayResult = replayTrace(sessionId);
           broadcastDerivedState(sessionId, replayResult.state as unknown as Record<string, unknown>);
+          broadcastSessionEnded(sessionId);
           const s = sessions.get(sessionId);
           if (s) s.activeTurnId = null;
         })
@@ -1028,12 +1239,6 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ sessionId, derivedState: safeState, replay: safeReplay }, null, 2));
       } catch {
-        res.writeHead(404, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: `no trace for session: ${sessionId}` }));
-      }
-      return;
-    }
-  }
         res.writeHead(404, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: `no trace for session: ${sessionId}` }));
       }
