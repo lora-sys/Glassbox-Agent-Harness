@@ -4,6 +4,8 @@
 import { WebSocketServer, WebSocket } from "ws";
 import type { Server } from "node:http";
 
+import { screenValue } from "../screening/index.js";
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -71,12 +73,15 @@ const subscribers = new Map<string, Set<Subscriber>>();
 
 /**
  * Push a decoded event to every WebSocket subscriber for this session.
+ * Strings in the event payload are screened for secrets before shipping.
  */
 export function broadcastEvent(sessionId: string, event: Record<string, unknown>): void {
   const room = subscribers.get(sessionId);
   if (!room || room.size === 0) return;
 
-  const payload: LiveEventPayload = { type: "event", event };
+  // Screen event params for secrets without mutating the caller's object
+  const safeEvent = JSON.parse(JSON.stringify(event)) as Record<string, unknown>;
+  const payload: LiveEventPayload = { type: "event", event: screenValue(safeEvent) as Record<string, unknown> };
   const data = JSON.stringify(payload);
 
   for (const sub of room) {
@@ -88,12 +93,15 @@ export function broadcastEvent(sessionId: string, event: Record<string, unknown>
 
 /**
  * Push a derived-state snapshot to every subscriber.
+ * Strings in the state are screened for secrets before shipping.
  */
 export function broadcastDerivedState(sessionId: string, state: Record<string, unknown>): void {
   const room = subscribers.get(sessionId);
   if (!room || room.size === 0) return;
 
-  const payload: DerivedStatePayload = { type: "derivedState", derivedState: state };
+  // Screen derived state for secrets without mutating the caller's object
+  const safeState = JSON.parse(JSON.stringify(state)) as Record<string, unknown>;
+  const payload: DerivedStatePayload = { type: "derivedState", derivedState: screenValue(safeState) as Record<string, unknown> };
   const data = JSON.stringify(payload);
 
   for (const sub of room) {

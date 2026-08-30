@@ -13,6 +13,7 @@ import { RawTraceStore, TRACE_PROVENANCE, TRACE_PROVENANCE_CLAUDECODE } from "./
 import { loadTrace } from "./trace/load.js";
 import type { TraceEntry } from "./trace/store.js";
 import { replayTrace } from "./state/replay.js";
+import { screenValue } from "./screening/index.js";
 import {
   attachWebSocketServer,
   broadcastEvent,
@@ -1002,8 +1003,10 @@ const server = http.createServer(async (req, res) => {
       const sessionId = match[1];
       try {
         const trace: TraceEntry[] = loadTrace(sessionId);
+        // Screen entry params for secrets at the API boundary — raw trace on disk stays intact
+        const screened = screenValue(trace) as TraceEntry[];
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ sessionId, entries: trace }, null, 2));
+        res.end(JSON.stringify({ sessionId, entries: screened }, null, 2));
       } catch {
         res.writeHead(404, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: `no trace for session: ${sessionId}` }));
@@ -1019,9 +1022,18 @@ const server = http.createServer(async (req, res) => {
       const sessionId = match[1];
       try {
         const result = replayTrace(sessionId);
+        // Screen derived state for secrets at the API boundary
+        const safeState = screenValue(result.state) as Record<string, unknown>;
+        const safeReplay = { ...result, state: safeState };
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ sessionId, derivedState: result.state, replay: result }, null, 2));
+        res.end(JSON.stringify({ sessionId, derivedState: safeState, replay: safeReplay }, null, 2));
       } catch {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: `no trace for session: ${sessionId}` }));
+      }
+      return;
+    }
+  }
         res.writeHead(404, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: `no trace for session: ${sessionId}` }));
       }
