@@ -229,9 +229,23 @@ Do not launch unrelated browsers, simulators, external processes, or broad test 
 
 For tldraw behavior, test both the underlying Glassbox state and the visible Canvas behavior when both matter.
 
+## Delivery cadence
+
+These rules govern the build loop itself. They exist because slices were left uncommitted and roadmap entries went unlogged until the owner intervened.
+
+Commit directly to main as soon as a slice passes its verification (tests plus browser checks when they apply). Never accumulate more than one verified slice without a commit.
+
+Log the slice to the roadmap before starting the next one: update the Notion roadmap DB row when one exists, otherwise append a dated entry to the Delivery page. Keep roadmap writes append-only.
+
+One ticket, one concern. Before dispatching a browser-verification ticket, verify the server layer with curl or direct API calls first. Keep the slice small enough to finish in one session.
+
+Run tickets that will take longer than about 15 minutes detached: background process, a progress file the ticket appends to, and periodic polling. Never block on a foreground wait that a timeout will kill.
+
 ## Pull requests
 
-Do not create a Pull Request unless the user asks for one.
+Commit straight to main. Open a Pull Request only when the user asks for one.
+
+Push only when the user asks. Local commits ahead of the remote are an acceptable resting state between slices.
 
 Keep one main concern per PR.
 
