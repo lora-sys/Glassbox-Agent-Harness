@@ -3,7 +3,7 @@ import http from "node:http";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 
-import { CodexAdapter } from "./codex/adapter.js";
+import { createAdapter } from "./provider/index.js";
 
 import { contractsVersion } from "@glassbox/contracts";
 import { sharedVersion } from "@glassbox/shared";
@@ -44,7 +44,7 @@ export function multiply(a, b) {
 
 mkdirSync(WORKSPACE, { recursive: true });
 
-const adapter = new CodexAdapter();
+const adapter = createAdapter("codex");
 adapter.start();
 let adapterReady = false;
 const traceStore = new RawTraceStore();
@@ -309,7 +309,7 @@ const server = http.createServer(async (req, res) => {
 
       const traceCollector = makeTraceCollector(sessionId);
 
-      const thread = await adapter.startThread(clientThreadId, {
+      const thread = await adapter.startSession(clientThreadId, {
         cwd: WORKSPACE,
         sandbox: "read-only",
         approvalPolicy: "on-request",
@@ -395,7 +395,7 @@ const server = http.createServer(async (req, res) => {
 
       const traceCollector = makeTraceCollector(sessionId);
 
-      const thread = await adapter.startThread(clientThreadId, {
+      const thread = await adapter.startSession(clientThreadId, {
         cwd: WORKSPACE,
         sandbox: "read-only",
         approvalPolicy: "on-request",
@@ -820,7 +820,7 @@ const server = http.createServer(async (req, res) => {
 
       const traceCollector = makeTraceCollector(sessionId);
 
-      const thread = await adapter.startThread(clientThreadId, {
+      const thread = await adapter.startSession(clientThreadId, {
         cwd: workspace,
         sandbox: "workspace-write",
         approvalPolicy: "on-request",

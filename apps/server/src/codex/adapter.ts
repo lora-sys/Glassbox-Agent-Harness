@@ -15,6 +15,14 @@ import type {
   TurnStatus,
   UserInput,
 } from "./types.js";
+import type {
+  ProviderAdapter,
+  RunResult,
+  ScanResult,
+  Session,
+  SessionOpts,
+  TurnOpts,
+} from "../provider/types.js";
 
 const REQUEST_TIMEOUT_MS = 30_000;
 
@@ -102,7 +110,7 @@ function runHookAsync(hook: (scan: { changes: { path: string; kind: string; diff
   try { hook(scan); } catch { /* ignore hook errors */ }
 }
 
-export class CodexAdapter extends EventEmitter {
+export class CodexAdapter extends EventEmitter implements ProviderAdapter {
   pid: number;
 
   private child: ReturnType<typeof spawn> | null = null;
@@ -116,16 +124,13 @@ export class CodexAdapter extends EventEmitter {
   private closed = false;
 
   // Event collection state (set by collectTurnEvents, cleared when done)
-  private _collectHandler: ((method: string, params: unknown) => void) | null =
-    null;
+  private _collectHandler: ((method: string, params: unknown) => void) | null = null;
   private _decodeFailCount = 0;
 
   // Subscribers notified when a turn ends (turn/completed received).
-  // Fires during the event handler, before collectTurnEvents resolves.
   private _turnEndSubscribers: Array<(status: string) => void> = [];
 
   // Pending approval requests indexed by their server-assigned request id.
-  // Filled by handleServerRequest, consumed by respondToApproval.
   private _pendingApprovals = new Map<number | string, {
     method: string;
     params: Record<string, unknown>;
@@ -138,16 +143,16 @@ export class CodexAdapter extends EventEmitter {
   };
 
   // Effect-backed event decoder (optional: may be null in minimal builds).
-  // Set to true when the consequence of decode failure should surface as
-  // a typed Error rather than an unstructured crash.
   private _decodeEnabled = false;
 
-  /** Enable or disable the Effect Schema decode gate. Default: false. */
+  /** Enable or disable the Effect Schema decode gate. Default: false.
+   *  Codex-internal debug only — not part of ProviderAdapter. */
   setDecodeEnabled(enabled: boolean): void {
     this._decodeEnabled = enabled;
   }
 
-  /** Number of decode failures observed since the last reset. */
+  /** Number of decode failures observed since the last reset.
+   *  Codex-internal debug only — not part of ProviderAdapter. */
   get decodeFailCount(): number {
     return this._decodeFailCount;
   }
@@ -184,7 +189,7 @@ export class CodexAdapter extends EventEmitter {
   }
 
   /** Scan the workspace for changes since snapshot, fire lifecycle hooks, reset. */
-  scanAndFireHooks(workspace: string): { changes: { path: string; kind: string; diff?: string }[] } {
+  scanAndFireHooks(workspace: string): ScanResult {
     const before = this._lifecycleLatch.beforeSnapshot;
     const changes = before !== null ? gitDiffForScan(workspace, before) : [];
     const hooks = [...this._lifecycleLatch.afterHooks];
@@ -262,7 +267,7 @@ export class CodexAdapter extends EventEmitter {
     }
   }
 
-  // ---- Protocol ----
+  // ---- ProviderAdapter surface ----
 
   /** Initialize connection. Must be called once before other methods. */
   async initialize(): Promise<ServerInfo> {
@@ -276,78 +281,45 @@ export class CodexAdapter extends EventEmitter {
     return result as ServerInfo;
   }
 
-  /** Start a thread. Returns the server-assigned thread object. */
-  async startThread(
-    clientThreadId: string,
-    opts: { cwd?: string; sandbox?: string; approvalPolicy?: string } = {}
-  ): Promise<Thread> {
+  /** Start a session (Codex: thread). Returns the provider-assigned session object. */
+  async startSession(clientSessionId: string, opts: SessionOpts = {}): Promise<Session> {
     const result = await this.sendRequest("thread/start", {
-      threadId: clientThreadId,
+      threadId: clientSessionId,             // wire-level name
       cwd: opts.cwd ?? null,
-      sandbox: opts.sandbox ?? "read-only",
-      approvalPolicy: opts.approvalPolicy ?? "on-request",
+      sandbox: (opts as Record<string, unknown> & { sandbox?: string }).sandbox ?? "read-only",
+      approvalPolicy: (opts as Record<string, unknown> & { approvalPolicy?: string }).approvalPolicy ?? "on-request",
     });
-    return (result as { thread: Thread }).thread;
+    return { id: (result as { thread: Thread }).thread.id };
   }
 
-  /** Start a turn on an existing thread and collect events until completion. */
-  async startAndCollectTurn(
-    threadId: string,
-    input: UserInput[],
-    timeoutMs: number,
-    traceCollector?: (method: string, params: Record<string, unknown>) => void,
-    opts: { sandboxPolicy?: SandboxPolicy; cwd?: string } = {}
-  ): Promise<RunTestSummary> {
-    const params: Record<string, unknown> = { threadId, input };
-    if (opts.sandboxPolicy) params.sandboxPolicy = opts.sandboxPolicy;
-    if (opts.cwd) params.cwd = opts.cwd;
+  /** Start a turn on an existing session. */
+  async startTurn(sessionId: string, input: UserInput[], opts: TurnOpts = {}): Promise<Turn> {
+    const wireOpts: Record<string, unknown> = { threadId: sessionId, input };
+    if (opts.cwd) wireOpts.cwd = opts.cwd;
+    const sp = opts as Record<string, unknown> & { sandboxPolicy?: SandboxPolicy };
+    if (sp.sandboxPolicy) wireOpts.sandboxPolicy = sp.sandboxPolicy;
 
-    // Set up the event handler BEFORE starting the turn so we don't miss
-    // the adapter's immediate turn/started emission.
-    const summary = await this.collectTurnEvents(threadId, "", timeoutMs, traceCollector);
-    const result = await this.sendRequest("turn/start", params);
-    const turn = (result as { turn: Turn }).turn;
-    // Replace the pending promise with the actual turnId
-    // (handled by the collectTurnEvents re-entry logic via the handler)
-    // Actually, startTurn and collectTurnEvents are separate operations.
-    // The handler is ALREADY set from collectTurnEvents above.
-    // Turn 2's turn/started will be captured by it.
-    // But we need a reentrant: return summary once turn completes.
-    // Simplify: just return summary and signal P secondary
-    return { ...summary, turnId: turn.id, threadId };
-  }
-
-  /** Start a turn on an existing thread. */
-  async startTurn(
-    threadId: string,
-    input: UserInput[],
-    opts: { sandboxPolicy?: SandboxPolicy; cwd?: string } = {}
-  ): Promise<Turn> {
-    const params: Record<string, unknown> = { threadId, input };
-    if (opts.sandboxPolicy) params.sandboxPolicy = opts.sandboxPolicy;
-    if (opts.cwd) params.cwd = opts.cwd;
-
-    // Fire before-hooks (e.g. workspace snapshot) right after OAI receives the request
+    // Fire before-hooks (e.g. workspace snapshot) right after the server receives the request
     if (opts.cwd && this._lifecycleLatch.afterHooks.length > 0) {
-      this.captureBeforeSnapshot(opts.cwd);
+      this.snapshotWorkspace(opts.cwd);
     }
 
-    const result = await this.sendRequest("turn/start", params);
+    const result = await this.sendRequest("turn/start", wireOpts);
     return (result as { turn: Turn }).turn;
   }
 
-  /** Interrupt a running turn. Requires both threadId and turnId (server UUIDs). */
-  async interruptTurn(threadId: string, turnId: string): Promise<void> {
-    await this.sendRequest("turn/interrupt", { threadId, turnId });
+  /** Interrupt a running turn. */
+  async interruptTurn(sessionId: string, turnId: string): Promise<void> {
+    await this.sendRequest("turn/interrupt", { threadId: sessionId, turn: turnId });
   }
 
   /** Collect all events from a turn until turn/completed or timeout. */
   async collectTurnEvents(
-    threadId: string,
+    sessionId: string,
     turnId: string,
     timeoutMs: number,
     traceCollector?: (method: string, params: Record<string, unknown>) => void
-  ): Promise<RunTestSummary> {
+  ): Promise<RunResult> {
     const counts: Record<string, number> = {};
     const approvals: ApprovalEvent[] = [];
     let agentMessageDeltas = 0;
@@ -374,12 +346,9 @@ export class CodexAdapter extends EventEmitter {
         }
 
         // Try to decode the notification through the Effect Schema pipeline.
-        // decodeEvent is async; use runSync on the Effect for synchronous path.
         let decoded: unknown = null;
         if (this._decodeEnabled) {
           try {
-            // When _decodeEnabled is true, run async decode.
-            // In production (_decodeEnabled=false) this path is skipped.
             decodeEvent({ method, params }).then(r => { decoded = r; }).catch(() => {});
           } catch {
             this._decodeFailCount++;
@@ -394,9 +363,7 @@ export class CodexAdapter extends EventEmitter {
               completed = {
                 status: ev.turn.status as TurnStatus,
                 durationMs: ev.turn.durationMs,
-                error: ev.turn.error
-                  ? JSON.stringify(ev.turn.error)
-                  : undefined,
+                error: ev.turn.error ? JSON.stringify(ev.turn.error) : undefined,
               };
               this._fireTurnEnd(ev.turn.status as string);
               clearTimeout(timer);
@@ -446,17 +413,16 @@ export class CodexAdapter extends EventEmitter {
         } else if (method === "item/agentMessage/delta") {
           agentMessageDeltas++;
         } else if (method === "turn/diff/updated") {
-          // Capture diff updates in the trace so the reducer can produce
-          // artifact shapes from file changes.
           traceCollector?.(method, typeof params === "object" && params !== null
             ? (params as Record<string, unknown>)
             : {});
         } else if (method.endsWith("/requestApproval")) {
           const p = params as Record<string, unknown>;
+          const pThreadId = p.threadId as string;
           const ev: ApprovalEvent = {
             type: "approval",
             method,
-            threadId: p.threadId as string,
+            threadId: pThreadId,
             turnId: p.turnId as string,
             itemId: p.itemId as string,
             startedAtMs: p.startedAtMs as number,
@@ -465,7 +431,6 @@ export class CodexAdapter extends EventEmitter {
             action: "pending",
           };
           approvals.push(ev);
-          // Surface approval without auto-approving
           this.emit("approval", ev);
         }
       };
@@ -482,7 +447,7 @@ export class CodexAdapter extends EventEmitter {
     if (!completed && turnStartedAt !== null) {
       const nowSec = Math.floor(Date.now() / 1000);
       const syntheticParams: Record<string, unknown> = {
-        threadId,
+        threadId: sessionId,    // map neutral name back to wire-level
         turn: {
           id: turnId,
           status: "completed",
@@ -503,26 +468,41 @@ export class CodexAdapter extends EventEmitter {
       };
     }
 
-    const _completed = completed as
-      | { status: TurnStatus; durationMs: number | null; error?: string }
-      | null
-      | undefined;
-
-    const turnResult: CollectTurnResult = {
-      threadId,
+    const turnResult: RunResult = {
+      sessionId,     // was threadId — ProviderAdapter neutral name
       turnId,
       eventCounts: counts,
-      turnStatus: (_completed?.status as TurnStatus | undefined) ?? "failed",
-      turnDurationMs: _completed?.durationMs ?? null,
+      turnStatus: (completed?.status as TurnStatus | undefined) ?? "failed",
+      turnDurationMs: completed?.durationMs ?? null,
       approvals,
       agentMessageDeltas,
-      error: _completed?.error,
+      error: completed?.error,
     };
 
     return turnResult;
   }
 
-  // ---- Internal ----
+  // ---- Internal helpers (not on ProviderAdapter) ----
+
+  /** Convenience: start a turn and collect its events. Codex-internal only. */
+  async startAndCollectTurn(
+    threadId: string,
+    input: UserInput[],
+    timeoutMs: number,
+    traceCollector?: (method: string, params: Record<string, unknown>) => void,
+    opts: { sandboxPolicy?: SandboxPolicy; cwd?: string } = {}
+  ): Promise<RunTestSummary> {
+    const params: Record<string, unknown> = { threadId, input };
+    if (opts.sandboxPolicy) params.sandboxPolicy = opts.sandboxPolicy;
+    if (opts.cwd) params.cwd = opts.cwd;
+
+    const summary = await this.collectTurnEvents(threadId, "", timeoutMs, traceCollector);
+    const result = await this.sendRequest("turn/start", params);
+    const turn = (result as { turn: Turn }).turn;
+    return { ...summary, turnId: turn.id, threadId };
+  }
+
+  // ---- Protocol internals ----
 
   private sendNotification(method: string): void {
     const msg = { jsonrpc: "2.0", method } as const;
