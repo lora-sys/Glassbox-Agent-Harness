@@ -302,6 +302,8 @@ Follow the current repository structure.
 
 Do not create directories or shared packages only because an old design note proposed them. Follow the structure that actually exists and change it only when the current task needs a new boundary.
 
+`upstream/` holds reference implementations vendored from mature open-source projects. Each subdirectory names its source project and copied version. It is reference material only: nothing imports it at runtime. When a mature solution exists for a provider, harness, or UI problem, check `upstream/` first and copy the proven approach instead of inventing one.
+
 Keep provider-specific code near the provider integration.
 
 Keep tldraw-specific code near the Canvas projection and interaction code.
