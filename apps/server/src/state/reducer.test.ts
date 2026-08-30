@@ -361,6 +361,69 @@ describe("reduce", () => {
     expect(state.task).toBe("existing task"); // task unchanged
     expect(state.turns[1].taskOrInstruction).toBe("add a test"); // backfill works
   });
+
+  // ---- actionEditInput: updates systemInstruction when inputKind matches ---- //
+
+  it("sets systemInstruction from actionEditInput (systemInstruction kind)", () => {
+    let state = reduce(initialDerivedState(), {
+      _tag: "turnStarted" as const,
+      threadId: "th-1",
+      turn: { id: "tr-1", status: "inProgress" },
+      input: [{ type: "text", text: "initial task" }],
+    });
+
+    // Simulate action.editInput arriving after a turnStarted
+    state = reduce(state, {
+      _tag: "actionEditInput" as const,
+      inputKind: "systemInstruction",
+      value: "Always answer in three words.",
+      threadId: "th-1",
+      turnId: "tr-1",
+      kind: "action.editInput",
+      source: "glassbox-user",
+      sessionId: "s-1",
+      ts: new Date().toISOString(),
+    });
+
+    expect(state.systemInstruction).toBe("Always answer in three words.");
+    expect(state.traceSummary.eventCounts["action.editInput"]).toBe(1);
+  });
+
+  it("ignores actionEditInput for unrecognized inputKind", () => {
+    const state = reduce(initialDerivedState(), {
+      _tag: "actionEditInput" as const,
+      inputKind: "unknownInputKind",
+      value: "some value",
+      threadId: "th-1",
+      turnId: "tr-1",
+      kind: "action.editInput",
+      source: "glassbox-user",
+      sessionId: "s-1",
+      ts: new Date().toISOString(),
+    });
+
+    expect(state.systemInstruction).toBe("");
+    expect(state.traceSummary.eventCounts["action.editInput"]).toBe(1);
+  });
+
+  it("preserves initialDerivedState values after actionEditInput", () => {
+    const state = reduce(initialDerivedState(), {
+      _tag: "actionEditInput" as const,
+      inputKind: "systemInstruction",
+      value: "",
+      threadId: "th-1",
+      turnId: "",
+      kind: "action.editInput",
+      source: "glassbox-user",
+      sessionId: "s-1",
+      ts: new Date().toISOString(),
+    });
+
+    expect(state.systemInstruction).toBe("");
+    expect(state.task).toBe("");
+    expect(state.artifacts).toHaveLength(0);
+    expect(state.turns).toHaveLength(0);
+  });
 });
 
 // ---------------------------------------------------------------------------

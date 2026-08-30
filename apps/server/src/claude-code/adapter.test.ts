@@ -93,4 +93,43 @@ describe("ClaudeCodeAdapter", () => {
     expect(turn.status).toBe("inProgress");
     adapter.stop();
   });
+
+  it("getAppendSystemPrompt — returns empty string for missing session", async () => {
+    const adapter = new ClaudeCodeAdapter();
+    adapter.start();
+    // Session never started — getAppendSystemPrompt should not throw
+    expect(adapter.getAppendSystemPrompt("nonexistent-session")).toBe("");
+    adapter.stop();
+  });
+
+  it("getAppendSystemPrompt — returns initial value after startSession", async () => {
+    const adapter = new ClaudeCodeAdapter();
+    adapter.start();
+    await adapter.startSession("sess-5", {});
+    expect(adapter.getAppendSystemPrompt("sess-5")).toBe("");
+    adapter.stop();
+  });
+
+  it("getAppendSystemPrompt / setAppendSystemPrompt — round trip", async () => {
+    const adapter = new ClaudeCodeAdapter();
+    adapter.start();
+    await adapter.startSession("sess-6", {});
+    expect(adapter.getAppendSystemPrompt("sess-6")).toBe("");
+    adapter.setAppendSystemPrompt("sess-6", "Be concise.");
+    expect(adapter.getAppendSystemPrompt("sess-6")).toBe("Be concise.");
+    // Overwriting
+    adapter.setAppendSystemPrompt("sess-6", "New system instruction.");
+    expect(adapter.getAppendSystemPrompt("sess-6")).toBe("New system instruction.");
+    adapter.stop();
+  });
+
+  it("setAppendSystemPrompt on missing session — no throw", async () => {
+    const adapter = new ClaudeCodeAdapter();
+    adapter.start();
+    // Setting on a session that doesn't exist should not throw
+    expect(() => adapter.setAppendSystemPrompt("ghost-session", "x")).not.toThrow();
+    // Confirm it returned empty string
+    expect(adapter.getAppendSystemPrompt("ghost-session")).toBe("");
+    adapter.stop();
+  });
 });

@@ -23,6 +23,7 @@ function textShape(id: string, x: number, y: number, text: string) {
 function buildBoardObjects(
 	state: Record<string, unknown>,
 	sessionId: string,
+	provider: string,
 ) {
 	const shapes: { kind: string; id: string; text: string; meta: ObjectMeta }[] = [];
 	const meta = new Map<string, ObjectMeta>();
@@ -30,6 +31,13 @@ function buildBoardObjects(
 	// --- task ---
 	if (state.task) {
 		shapes.push({ kind: "task", id: "shape:task-" + sessionId.slice(0, 8), text: "Task: " + state.task, meta: { objectType: "task" } });
+	}
+
+	// --- system instruction (claude-code provider only) ---
+	if (provider === "claude-code") {
+		const si = (state.systemInstruction as string) || "";
+		const siText = si ? "System: " + si.slice(0, 80) + (si.length > 80 ? "..." : "") : "System: (empty) — click to edit";
+		shapes.push({ kind: "systemInstruction", id: "shape:si-" + sessionId.slice(0, 8), text: siText, meta: { objectType: "systemInstruction" } });
 	}
 
 	// --- per-turn shapes ---
@@ -243,6 +251,8 @@ function App() {
 	// S7: Editable task — draft state lives in the parent so it survives
 	// selection changes and is easy to reset on session switches.
 	const [draftTask, setDraftTask] = useState<string | null>(null);
+	// P2.5: Editable system instruction — same DRAFT pattern
+	const [draftSystemInstruction, setDraftSystemInstruction] = useState<string | null>(null);
 	const [isApplying, setIsApplying] = useState(false);
 
 	// S8: Pending file-change decisions from codex, surfaced for the user.
@@ -369,7 +379,7 @@ function App() {
 			ed.deleteShapes(pageShapes.map(function(s: any) { return s.id; }));
 		}
 
-		var templates = buildBoardObjects(localState, currentSessionId);
+		var templates = buildBoardObjects(localState, currentSessionId, provider);
 		var result = applyFlowLayout(ed, templates.shapes, currentSessionId);
 		ed.createShapes(result.shapes.map(function(s: any) { return Object.assign({}, s); }));
 		shapeIdsRef.current = result.shapes.map(function(s: any) { return s.id; });
@@ -453,6 +463,7 @@ function App() {
 		if (!sId) {
 			setSelectedObject(null);
 			setDraftTask(null); // S7: cancel draft on deselection
+			setDraftSystemInstruction(null); // P2.5
 			return;
 		}
 		var sid = currentSidRef.current;
@@ -465,6 +476,10 @@ function App() {
 		// S7: reset draft when switching object type (only task supports editing)
 		if (obj?.objectType !== "task") {
 			setDraftTask(null);
+		}
+		// P2.5: reset system instruction draft when switching away
+		if (obj?.objectType !== "systemInstruction") {
+			setDraftSystemInstruction(null);
 		}
 	}, []);
 
@@ -774,6 +789,35 @@ function App() {
 			if (data.derivedState) setLocalState(data.derivedState);
 		} catch (err: any) {
 			addLog("Send error: " + (err?.message || String(err)));
+		} finally {
+			setIsApplying(false);
+		}
+	}, [currentSessionId, addLog]);
+
+	// P2.5: Apply edited system instruction — calls /edit-input and starts a new turn
+	var handleApplySystemInstruction = useCallback(async function applyInstruction(value: string) {
+		if (!currentSessionId) return;
+		setIsApplying(true);
+		try {
+			var res = await fetch("/api/edit-input", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					sessionId: currentSessionId,
+					inputKind: "systemInstruction",
+					value: value,
+				}),
+			});
+			if (!res.ok) {
+				var errData: any = await res.json();
+				throw new Error(errData.error || "HTTP " + res.status);
+			}
+			var data: any = await res.json();
+			setDraftSystemInstruction(null);
+			addLog("System instruction applied: " + value.slice(0, 40) + " (turn " + data.turnId?.slice(0, 8) + ")");
+			if (data.derivedState) setLocalState(data.derivedState);
+		} catch (err: any) {
+			addLog("Edit-input error: " + (err?.message || String(err)));
 		} finally {
 			setIsApplying(false);
 		}
@@ -1301,8 +1345,11 @@ function App() {
 							onDraftChange={setDraftTask}
 							onApplyTask={handleSendTask}
 							isApplying={isApplying}
+							draftSystemInstruction={draftSystemInstruction}
+							onDraftSystemInstructionChange={setDraftSystemInstruction}
+							onApplySystemInstruction={handleApplySystemInstruction}
 						/>
-					</div>
+						</div>
 				)}
 			</div>
 

@@ -10,6 +10,8 @@
 export interface DerivedState {
   /** The user's original instruction (from first turn/start input). */
   task: string;
+  /** The current appended system instruction for the session (claude-code-specific). */
+  systemInstruction: string;
   /** The latest in-progress item, or null if nothing is running. */
   currentWork: CurrentWork | null;
   /** File changes observed so far during the active turn. */
@@ -105,7 +107,8 @@ export interface TurnRecord {
 export function initialDerivedState(): DerivedState {
   return {
     task: "",
-    currentWork: null,
+    systemInstruction: "",
+  currentWork: null,
     artifacts: [],
     testResult: null,
     finalResult: null,

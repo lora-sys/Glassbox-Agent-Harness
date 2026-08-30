@@ -85,6 +85,7 @@ interface SessionRunOptions {
   approvalPolicy: string;
   sandboxType: string;
   permissionMode: string;
+  appendSystemPrompt?: string;
 }
 
 function sessionStartOpts(opts: SessionRunOptions): Record<string, unknown> {
@@ -92,6 +93,7 @@ function sessionStartOpts(opts: SessionRunOptions): Record<string, unknown> {
     return {
       cwd: opts.workspace,
       permissionMode: opts.permissionMode,
+      ...(opts.appendSystemPrompt ? { appendSystemPrompt: opts.appendSystemPrompt } : {}),
     };
   }
   // thread/start validates the `sandbox` param in kebab-case (CLI-arg style):
@@ -456,8 +458,6 @@ const server = http.createServer(async (req, res) => {
       const sessionAdapter = provider === "claude-code" ? claudeAdapter : adapter;
       const traceProvenance = provider === "claude-code" ? TRACE_PROVENANCE_CLAUDECODE : TRACE_PROVENANCE;
       const traceCollector = makeTraceCollector(sessionId, traceProvenance);
-      sessionAdapters.set(sessionId, sessionAdapter);
-
       const runOpts: SessionRunOptions = {
         provider,
         workspace,
@@ -477,6 +477,7 @@ const server = http.createServer(async (req, res) => {
       // --- end P2.4 ---
 
       const thread = await sessionAdapter.startSession(clientThreadId, sessionStartOpts(runOpts));
+      sessionAdapters.set(thread.id, sessionAdapter);
 
       sessionAdapter.snapshotWorkspace(workspace);
 
@@ -584,8 +585,6 @@ const server = http.createServer(async (req, res) => {
       const sessionAdapter = provider === "claude-code" ? claudeAdapter : adapter;
       const traceProvenance = provider === "claude-code" ? TRACE_PROVENANCE_CLAUDECODE : TRACE_PROVENANCE;
       const traceCollector = makeTraceCollector(sessionId, traceProvenance);
-      sessionAdapters.set(sessionId, sessionAdapter);
-
       const runOpts: SessionRunOptions = {
         provider,
         workspace,
@@ -603,6 +602,7 @@ const server = http.createServer(async (req, res) => {
       });
 
       const thread = await sessionAdapter.startSession(clientThreadId, sessionStartOpts(runOpts));
+      sessionAdapters.set(thread.id, sessionAdapter);
 
       sessionAdapter.snapshotWorkspace(workspace);
 
@@ -1008,7 +1008,107 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // ---- POST /run-demo — run a task against the controlled demo workspace ---- //
+  // ---- POST /edit-input — edit a research input and start new turn on same thread ---- //
+  if (req.method === "POST" && req.url === "/edit-input") {
+    try {
+      await ensureInitialized();
+
+      const body = await parseBody(req);
+      const sessionId = typeof body.sessionId === "string" ? body.sessionId : "";
+      const inputKind = typeof body.inputKind === "string" ? body.inputKind : "";
+      const value = typeof body.value === "string" ? body.value : "";
+
+      if (!sessionId || !inputKind || value === undefined) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "sessionId, inputKind, and value required" }));
+        return;
+      }
+
+      const session = sessions.get(sessionId);
+      if (!session) {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: `no session: ${sessionId}` }));
+        return;
+      }
+
+      // Codex does not support editing system instructions yet.
+      if (session.provider === "codex") {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "input not supported for this provider yet: " + inputKind }));
+        return;
+      }
+
+      // Only systemInstruction is supported in P2.5.
+      if (inputKind !== "systemInstruction") {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "unsupported inputKind: " + inputKind }));
+        return;
+      }
+
+      const traceCollector = makeTraceCollector(sessionId);
+      const threadId = session.threadId;
+
+      // Set the new instruction on the adapter before starting the next turn
+      (getSessionAdapter(threadId) as any).setAppendSystemPrompt(threadId, value);
+
+      // If a turn is active, interrupt it first (bounded wait)
+      if (session.activeTurnId) {
+        const { activeTurnId } = session;
+        const turnEnded = new Promise<void>((resolve) => {
+          getSessionAdapter(threadId).registerOnTurnEnd(() => resolve());
+        });
+        try {
+          await getSessionAdapter(threadId).interruptTurn(threadId, activeTurnId);
+        } catch {
+          // turn may already have finished
+        }
+        await Promise.race([
+          turnEnded,
+          new Promise<void>((resolve) => setTimeout(resolve, 10_000)),
+        ]);
+        session.activeTurnId = null;
+      }
+
+      // Start the new turn on the same thread
+      const editTurnSummary = await startNewTurn(session, "say ready", session.workspace, traceCollector);
+
+      // Record action.editInput AFTER the turn's provider events are in the trace
+      const editRecord = {
+        method: "action.editInput",
+        params: {
+          kind: "action.editInput",
+          source: "glassbox-user",
+          sessionId,
+          threadId,
+          turnId: editTurnSummary.turnId,
+          inputKind,
+          value,
+          ts: new Date().toISOString(),
+        },
+      };
+      traceStore.append(sessionId, editRecord);
+      broadcastEvent(sessionId, editRecord.params);
+
+      const replayResult = replayTrace(sessionId);
+      broadcastDerivedState(sessionId, replayResult.state as unknown as Record<string, unknown>);
+
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        ok: true,
+        sessionId,
+        derivedState: replayResult.state,
+        turnId: editTurnSummary.turnId,
+        turnStatus: editTurnSummary.turnStatus,
+        turnDurationMs: editTurnSummary.turnDurationMs,
+      }, null, 2));
+    } catch (err) {
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        error: String(err instanceof Error ? err.message : err),
+      }));
+    }
+    return;
+  }
   if (req.method === "POST" && req.url === "/run-demo") {
     try {
       await ensureInitialized();

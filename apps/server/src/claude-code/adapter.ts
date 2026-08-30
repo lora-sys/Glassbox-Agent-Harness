@@ -86,6 +86,7 @@ interface SessionState {
   pendingPrompt: string | null;
   cwd: string;
   permissionMode: string;
+  appendSystemPrompt: string;
 }
 
 interface TurnState {
@@ -154,6 +155,7 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
       pendingPrompt: null,
       cwd: typeof _opts.cwd === "string" ? _opts.cwd : "/tmp",
       permissionMode: typeof _opts.permissionMode === "string" ? _opts.permissionMode : "default",
+      appendSystemPrompt: typeof _opts.appendSystemPrompt === "string" ? _opts.appendSystemPrompt : "",
     });
     return { id: clientSessionId };
   }
@@ -230,7 +232,7 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
         systemPrompt: {
           type: "preset" as const,
           preset: "claude_code" as const,
-          append: "",
+          append: state.appendSystemPrompt,
         },
       } as Parameters<typeof query>[0]["options"],
     } as unknown as Parameters<typeof query>[0]);
@@ -541,6 +543,15 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
     return null;
   }
 
+  getAppendSystemPrompt(sessionId: string): string {
+    return this.sessions.get(sessionId)?.appendSystemPrompt ?? "";
+  }
+
+  setAppendSystemPrompt(sessionId: string, value: string): void {
+    const s = this.sessions.get(sessionId);
+    if (s) s.appendSystemPrompt = value;
+  }
+
   // -------------------------------------------------------------------------
   // Workspace lifecycle hooks (S8 artifact detection)
   // -------------------------------------------------------------------------
@@ -588,10 +599,10 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
   // Turn/session state helpers
   // -------------------------------------------------------------------------
 
-  private ensureTurn(sessionId: string, turnId?: string): TurnState & { turnId: string } {
+  private ensureTurn(sessionId: string, _turnId?: string): TurnState & { turnId: string } {
     let s = this.sessions.get(sessionId);
     if (!s) {
-      const tid = turnId ?? crypto.randomUUID();
+      const tid = crypto.randomUUID();
       this.sessions.set(sessionId, {
         sdkSessionId: sessionId,
         resumeSessionId: undefined,
@@ -600,13 +611,16 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
         pendingPrompt: null,
         cwd: "/tmp",
         permissionMode: "default",
+        appendSystemPrompt: "",
         turn: { turnId: tid, startedAt: Date.now(), aborted: false },
       });
       return (this.sessions.get(sessionId) as SessionState & { turn: TurnState }).turn;
     }
-    if (!s.turn) {
-      s.turn = { turnId: turnId ?? crypto.randomUUID(), startedAt: Date.now(), aborted: false };
-    }
+    // Always create a fresh turn entry so subsequent startTurn calls get a
+    // unique turnId. This ensures the trace records a turn/started per turn,
+    // which the reducer needs to build the per-turn entries correctly.
+    const tid = crypto.randomUUID();
+    s.turn = { turnId: tid, startedAt: Date.now(), aborted: false };
     return s.turn;
   }
 }

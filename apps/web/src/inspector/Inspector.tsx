@@ -3,7 +3,7 @@ import { type ReactNode } from "react";
 /* ── Public types ─────────────────────────────────────────── */
 
 export interface ObjectMeta {
-	objectType: "task" | "work" | "artifact" | "testResult" | "finalResult" | "traceSummary" | "steer" | "turnResult" | "turnAgentMessage" | "decision";
+	objectType: "task" | "work" | "artifact" | "testResult" | "finalResult" | "traceSummary" | "steer" | "turnResult" | "turnAgentMessage" | "decision" | "systemInstruction";
 	itemId?: string;
 	turnIndex?: number;
 	index?: number;
@@ -28,6 +28,12 @@ export interface InspectorProps {
 	onApplyTask: (task: string) => void;
 	/** True while the Apply request is in flight. */
 	isApplying: boolean;
+	/** Current draft for the system instruction, or null when no draft. */
+	draftSystemInstruction: string | null;
+	/** Update the draft system instruction. Pass null to cancel. */
+	onDraftSystemInstructionChange: (text: string | null) => void;
+	/** Apply the system instruction (calls /edit-input). */
+	onApplySystemInstruction: (value: string) => void;
 }
 
 /* ── Theme tokens ─────────────────────────────────────────── */
@@ -78,6 +84,9 @@ function TraceLine({ entry }: { entry: TraceEntryLike }) {
 		detail = `"${String(p.task).slice(0, 42)}"`;
 	} else if (p.instruction != null) {
 		detail = `"${String(p.instruction).slice(0, 42)}"`;
+	} else if (p.value != null) {
+		const v = String(p.value);
+		detail = `"${v.slice(0, 42)}${v.length > 42 ? "…" : ""}"`;
 	}
 	return (
 		<div
@@ -153,6 +162,9 @@ function ObjectFields({
 	isApplying,
 	onDraftChange,
 	onApplyTask,
+	draftSystemInstruction,
+	onDraftSystemInstructionChange,
+	onApplySystemInstruction,
 }: {
 	selectedObject: ObjectMeta;
 	derivedState: Record<string, unknown> | null;
@@ -160,6 +172,9 @@ function ObjectFields({
 	isApplying: boolean;
 	onDraftChange: (text: string | null) => void;
 	onApplyTask: (task: string) => void;
+	draftSystemInstruction: string | null;
+	onDraftSystemInstructionChange: (text: string | null) => void;
+	onApplySystemInstruction: (value: string) => void;
 }) {
 	if (selectedObject.objectType === "task") {
 		const appliedTask = (derivedState as { task?: string })?.task ?? "";
@@ -528,6 +543,102 @@ function ObjectFields({
 			</Section>
 		);
 	}
+	if (selectedObject.objectType === "systemInstruction") {
+		const appliedInstruction = (derivedState as { systemInstruction?: string })?.systemInstruction ?? "";
+		const isDrafting = draftSystemInstruction !== null;
+		const displayValue = isDrafting ? draftSystemInstruction : appliedInstruction;
+		const isEmpty = !appliedInstruction && !isDrafting;
+
+		return (
+			<Section label={isDrafting ? "System Instruction (editing)" : "System Instruction"}>
+				{isEmpty && !isDrafting && (
+					<div style={{ fontSize: 11, color: muted, marginBottom: 6 }}>empty</div>
+				)}
+				<textarea
+					value={displayValue ?? ""}
+					onChange={(e) => onDraftSystemInstructionChange(e.target.value)}
+					readOnly={isApplying}
+					rows={isDrafting ? 6 : 3}
+					style={{
+						width: "100%",
+						whiteSpace: "pre-wrap",
+						fontSize: 12,
+						color: textPrimary,
+						background: isDrafting ? "#2a2d1f" : "transparent",
+						border: isDrafting
+							? `1px solid ${draftColor}`
+							: "none",
+						borderRadius: 4,
+						padding: isDrafting ? 6 : 2,
+						resize: "vertical",
+						fontFamily: "inherit",
+						opacity: isApplying ? 0.7 : 1,
+						transition: "background 0.15s, border-color 0.15s",
+					}}
+				/>
+				{isDrafting && (
+					<>
+						<div
+							style={{
+								fontSize: 10,
+								color: draftColor,
+								marginTop: 4,
+								fontWeight: 600,
+							}}
+						>
+							DRAFT — not applied
+						</div>
+						<div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+							<button
+								onClick={() => onApplySystemInstruction(draftSystemInstruction)}
+								disabled={isApplying}
+								style={{
+									padding: "4px 14px",
+									borderRadius: 4,
+									border: "none",
+									background: isApplying ? "#3b3b55" : accent,
+									color: "#fff",
+									fontSize: 11,
+									fontWeight: 600,
+									cursor: isApplying
+										? "not-allowed"
+										: "pointer",
+									transition: "background 0.15s",
+								}}
+							>
+								{isApplying ? "Sending…" : "Apply"}
+							</button>
+							<button
+								onClick={() => {
+									if (!isApplying) onDraftSystemInstructionChange(null);
+								}}
+								disabled={isApplying}
+								style={{
+									padding: "4px 14px",
+									borderRadius: 4,
+									border: "1px solid #2a2b35",
+									background: isApplying
+										? "#1f2028"
+										: "#22232e",
+									color: isApplying
+										? "#52525b"
+										: "#a1a1aa",
+									fontSize: 11,
+									fontWeight: 600,
+									cursor: isApplying
+										? "not-allowed"
+										: "pointer",
+									transition: "all 0.15s",
+								}}
+							>
+								Cancel
+							</button>
+						</div>
+					</>
+				)}
+			</Section>
+		);
+	}
 	return null;
 }
 
@@ -541,6 +652,9 @@ export function Inspector({
 	isApplying,
 	onDraftChange,
 	onApplyTask,
+	draftSystemInstruction,
+	onDraftSystemInstructionChange,
+	onApplySystemInstruction,
 }: InspectorProps) {
 	/* -- Filtered trace entries -- */
 	const filtered = (() => {
@@ -643,6 +757,9 @@ export function Inspector({
 					isApplying={isApplying}
 					onDraftChange={onDraftChange}
 					onApplyTask={onApplyTask}
+					draftSystemInstruction={draftSystemInstruction}
+					onDraftSystemInstructionChange={onDraftSystemInstructionChange}
+					onApplySystemInstruction={onApplySystemInstruction}
 				/>
 			)}
 			{overviewNode}

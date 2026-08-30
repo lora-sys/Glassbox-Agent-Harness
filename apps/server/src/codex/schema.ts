@@ -230,6 +230,22 @@ export type ActionSteerParams = Schema.Schema.Type<
   typeof ActionSteerParams
 >;
 
+/** Glassbox action.editInput record (appended to trace after editing a research input) */
+export const ActionEditInputParams = Schema.Struct({
+  _tag: Schema.Literal("actionEditInput"),
+  kind: Schema.Literal("action.editInput"),
+  source: Schema.String,
+  sessionId: Schema.String,
+  threadId: Schema.String,
+  turnId: Schema.String,
+  inputKind: Schema.String,
+  value: Schema.String,
+  ts: Schema.String,
+});
+export type ActionEditInputParams = Schema.Schema.Type<
+  typeof ActionEditInputParams
+>;
+
 // ---------------------------------------------------------------------------
 // Full event union
 // ---------------------------------------------------------------------------
@@ -246,6 +262,7 @@ export const CodexEvent = Schema.Union([
   ActionPauseParams,
   ActionSteerParams,
   ActionSendParams,
+  ActionEditInputParams,
   TurnDiffUpdatedParams,
   TokenUsageUpdatedParams,
 ]);
@@ -284,5 +301,6 @@ export const TAG_SCHEMA: Map<string, unknown> = new Map()
   .set("actionPause", ActionPauseParams)
   .set("actionSteer", ActionSteerParams)
   .set("actionSend", ActionSendParams)
+  .set("actionEditInput", ActionEditInputParams)
   .set("turnDiffUpdated", TurnDiffUpdatedParams)
   .set("tokenUsageUpdated", TokenUsageUpdatedParams);

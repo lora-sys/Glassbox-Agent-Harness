@@ -417,10 +417,6 @@ export function reduce(state: DerivedState, event: CodexEvent): DerivedState {
     }
     case "actionSend": {
       counts["action.send"] = (counts["action.send"] ?? 0) + 1;
-      // action.send follows a new turn that already captured the edited task
-      // text in its turnStarted event. Update the top-level task so the canvas
-      // and subsequent turns see the new text. Backfill the turn record if
-      // its taskOrInstruction is still empty.
       const sendTurnId = (event as unknown as { turnId?: string }).turnId;
       const newTaskText = (event as unknown as { task?: string }).task || state.task;
       const turns = sendTurnId
@@ -436,6 +432,29 @@ export function reduce(state: DerivedState, event: CodexEvent): DerivedState {
         turns,
         traceSummary: { ...state.traceSummary, eventCounts: counts, totalEvents: state.traceSummary.totalEvents + 1 },
       };
+    }
+    case "actionEditInput": {
+      counts["action.editInput"] = (counts["action.editInput"] ?? 0) + 1;
+      const ep = event as unknown as Record<string, unknown>;
+      const inputKind = (ep.inputKind as string) || "";
+      if (inputKind === "systemInstruction") {
+        const value = (ep.value as string) || "";
+        const editTurnId = (ep.turnId as string) || "";
+        const turns = editTurnId
+          ? state.turns.map(t =>
+              t.turnId === editTurnId && !t.taskOrInstruction
+                ? { ...t, taskOrInstruction: "[system]: " + value }
+                : t
+            )
+          : state.turns;
+        return {
+          ...state,
+          systemInstruction: value,
+          turns,
+          traceSummary: { ...state.traceSummary, eventCounts: counts, totalEvents: state.traceSummary.totalEvents + 1 },
+        };
+      }
+      return { ...state, traceSummary: { ...state.traceSummary, eventCounts: counts, totalEvents: state.traceSummary.totalEvents + 1 } };
     }
 
     // -----------------------------------------------------------------------
