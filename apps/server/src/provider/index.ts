@@ -1,4 +1,5 @@
 import { CodexAdapter } from "../codex/adapter.js";
+import { ClaudeCodeAdapter } from "../claude-code/adapter.js";
 import type { ProviderAdapter } from "./types.js";
 
 export function createAdapter(provider: "codex" | "claude-code"): ProviderAdapter {
@@ -6,6 +7,6 @@ export function createAdapter(provider: "codex" | "claude-code"): ProviderAdapte
     case "codex":
       return new CodexAdapter();
     case "claude-code":
-      throw new Error("claude-code adapter not yet implemented (P2.2)");
+      return new ClaudeCodeAdapter();
   }
 }

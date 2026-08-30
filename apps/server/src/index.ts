@@ -1,14 +1,15 @@
-// apps/server — Glassbox runtime HTTP shell with Codex adapter endpoints.
+// apps/server — Glassbox runtime HTTP shell with Codex and Claude Code adapter endpoints.
 import http from "node:http";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 
 import { createAdapter } from "./provider/index.js";
+import type { ProviderAdapter } from "./provider/types.js";
 
 import { contractsVersion } from "@glassbox/contracts";
 import { sharedVersion } from "@glassbox/shared";
 
-import { RawTraceStore } from "./trace/store.js";
+import { RawTraceStore, TRACE_PROVENANCE, TRACE_PROVENANCE_CLAUDECODE } from "./trace/store.js";
 import { loadTrace } from "./trace/load.js";
 import type { TraceEntry } from "./trace/store.js";
 import { replayTrace } from "./state/replay.js";
@@ -45,13 +46,23 @@ export function multiply(a, b) {
 mkdirSync(WORKSPACE, { recursive: true });
 
 const adapter = createAdapter("codex");
+const claudeAdapter = createAdapter("claude-code");
 adapter.start();
+claudeAdapter.start();
 let adapterReady = false;
 const traceStore = new RawTraceStore();
+
+// Session → provider adapter map (created when session starts, cleaned up on end)
+const sessionAdapters = new Map<string, ProviderAdapter>();
+
+function getSessionAdapter(sessionId: string): ProviderAdapter {
+  return sessionAdapters.get(sessionId) || adapter;
+}
 
 async function ensureInitialized(): Promise<void> {
   if (adapterReady) return;
   await adapter.initialize();
+  await claudeAdapter.initialize();
   adapterReady = true;
 }
 
@@ -78,6 +89,8 @@ interface SessionRecord {
   threadId: string;
   /** Client-provided thread identifier (for display/debug). */
   clientThreadId: string;
+  /** Which provider backs this session ("codex" | "claude-code"). */
+  provider: string;
   /** Workspace path for this session (used for git diff scanning). */
   workspace: string;
   /** Active turn UUID, or null when no turn is in progress. */
@@ -116,18 +129,18 @@ async function startNewTurn(
   // If a turn is already running, wait for it to end first
   if (session.activeTurnId) {
     await new Promise<void>((resolve) => {
-      adapter.registerOnTurnEnd((_status: string) => resolve());
+      getSessionAdapter(session.threadId).registerOnTurnEnd((_status: string) => resolve());
     });
   }
 
   // S8: Snapshot workspace before turn — detects file changes missed by event stream
-  adapter.snapshotWorkspace(workspace);
+  getSessionAdapter(session.threadId).snapshotWorkspace(workspace);
 
   // ---- Fire the turn/start request first, then collect its events.
   // The adapter emits turn/started as soon as the provider receives the
   // request, so starting first then attaching the handler still captures
   // that marker while avoiding a 30s timeout if no prior turn is in flight.
-  const turn = await adapter.startTurn(session.threadId, [
+  const turn = await getSessionAdapter(session.threadId).startTurn(session.threadId, [
     { type: "text", text: instruction },
   ], {
     sandboxPolicy: {
@@ -166,17 +179,17 @@ async function startNewTurn(
   // and the unbounded wait below would prevent action.steer/action.send
   // from ever being recorded in the trace.
   const turnEndPromise = new Promise<void>((resolve) => {
-    adapter.registerOnTurnEnd((_status: string) => resolve());
+    getSessionAdapter(session.threadId).registerOnTurnEnd((_status: string) => resolve());
   });
 
-  await adapter.collectTurnEvents(session.threadId, turn.id, 30_000, wrappedCollector);
+  await getSessionAdapter(session.threadId).collectTurnEvents(session.threadId, turn.id, 30_000, wrappedCollector);
   await Promise.race([
     turnEndPromise,
     new Promise<void>((resolve) => setTimeout(resolve, 45_000)),
   ]);
 
   // S8: Post-turn workspace scan — detects file changes codex omitted from events
-  const scanResult = adapter.scanAndFireHooks(workspace);
+  const scanResult = getSessionAdapter(session.threadId).scanAndFireHooks(workspace);
   if (scanResult.changes.length > 0) {
     const itemId = "git-" + turn.id.slice(0, 8);
     traceCollector("item/fileChange", {
@@ -205,14 +218,13 @@ async function startNewTurn(
   };
 }
 
-function makeTraceCollector(sessionId: string) {
+const defaultProvenance = TRACE_PROVENANCE;
+
+function makeTraceCollector(sessionId: string, provenance = defaultProvenance) {
   let sinceLastDerive = 0;
   return (method: string, params: Record<string, unknown>) => {
-    traceStore.append(sessionId, { method, params });
+    traceStore.append(sessionId, { method, params }, provenance);
     broadcastEvent(sessionId, { method, params });
-    // Live canvas updates: re-derive and broadcast periodically so task,
-    // artifact, and result shapes appear while the turn is still running,
-    // not only after it completes.
     sinceLastDerive++;
     if (sinceLastDerive >= 25 || method === "turn/completed") {
       sinceLastDerive = 0;
@@ -229,7 +241,7 @@ function makeTraceCollector(sessionId: string) {
 // as a pending decision in the session. The /decide endpoint consumes
 // these pending approvals.
 function registerApprovalHandler(sessionId: string, _onDecide: (itemId: string, approved: boolean) => void) {
-  adapter.on("approval", (ev: { itemId: string; turnId: string; threadId: string; reason: string | null; grantRoot: string | null; startedAtMs: number }) => {
+  getSessionAdapter(sessionId).on("approval", (ev: { itemId: string; turnId: string; threadId: string; reason: string | null; grantRoot: string | null; startedAtMs: number }) => {
     const session = sessions.get(sessionId);
     if (session) {
       session.pendingApprovals.push({
@@ -301,23 +313,29 @@ const server = http.createServer(async (req, res) => {
 
       const body = await parseBody(req);
       const sessionId = randomUUID();
+      const provider = (typeof body.provider === "string" && (body.provider === "codex" || body.provider === "claude-code"))
+        ? body.provider
+        : "codex";
       const clientThreadId =
         typeof body.threadId === "string"
           ? body.threadId
           : `glassbox-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const prompt = typeof body.prompt === "string" ? body.prompt : "say ready";
 
-      const traceCollector = makeTraceCollector(sessionId);
+      const sessionAdapter = provider === "claude-code" ? claudeAdapter : adapter;
+      const traceProvenance = provider === "claude-code" ? TRACE_PROVENANCE_CLAUDECODE : TRACE_PROVENANCE;
+      const traceCollector = makeTraceCollector(sessionId, traceProvenance);
+      sessionAdapters.set(sessionId, sessionAdapter);
 
-      const thread = await adapter.startSession(clientThreadId, {
+      const thread = await sessionAdapter.startSession(clientThreadId, {
         cwd: WORKSPACE,
         sandbox: "read-only",
         approvalPolicy: "on-request",
       });
 
-      adapter.snapshotWorkspace(WORKSPACE);
+      sessionAdapter.snapshotWorkspace(WORKSPACE);
 
-      const turn = await adapter.startTurn(thread.id, [
+      const turn = await sessionAdapter.startTurn(thread.id, [
         { type: "text", text: prompt },
       ], {
         sandboxPolicy: { type: "readOnly", networkAccess: false },
@@ -327,6 +345,7 @@ const server = http.createServer(async (req, res) => {
       sessions.set(sessionId, {
         threadId: thread.id,
         clientThreadId,
+        provider: "codex",
         workspace: WORKSPACE,
         activeTurnId: turn.id,
         turnIds: [turn.id],
@@ -347,11 +366,11 @@ const server = http.createServer(async (req, res) => {
       }));
 
       // P6.4: Collect the event stream for up to 30 s in the background
-      adapter.collectTurnEvents(thread.id, turn.id, 30_000, traceCollector)
+      sessionAdapter.collectTurnEvents(thread.id, turn.id, 30_000, traceCollector)
         .then(() => {
           // S8: post-turn workspace scan for file changes omitted from events
           try {
-            var scanResult = adapter.scanAndFireHooks(WORKSPACE);
+            var scanResult = sessionAdapter.scanAndFireHooks(WORKSPACE);
             if (scanResult.changes.length > 0) {
               var fileItemId = "git-" + (turn.id || "").slice(0, 8);
               traceStore.append(sessionId, {
@@ -387,23 +406,29 @@ const server = http.createServer(async (req, res) => {
 
       const body = await parseBody(req);
       const sessionId = randomUUID();
+      const provider = (typeof body.provider === "string" && (body.provider === "codex" || body.provider === "claude-code"))
+        ? body.provider
+        : "codex";
       const clientThreadId =
         typeof body.threadId === "string"
           ? body.threadId
           : `glassbox-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const prompt = typeof body.prompt === "string" ? body.prompt : "say ready";
 
-      const traceCollector = makeTraceCollector(sessionId);
+      const sessionAdapter = provider === "claude-code" ? claudeAdapter : adapter;
+      const traceProvenance = provider === "claude-code" ? TRACE_PROVENANCE_CLAUDECODE : TRACE_PROVENANCE;
+      const traceCollector = makeTraceCollector(sessionId, traceProvenance);
+      sessionAdapters.set(sessionId, sessionAdapter);
 
-      const thread = await adapter.startSession(clientThreadId, {
+      const thread = await sessionAdapter.startSession(clientThreadId, {
         cwd: WORKSPACE,
         sandbox: "read-only",
         approvalPolicy: "on-request",
       });
 
-      adapter.snapshotWorkspace(WORKSPACE);
+      sessionAdapter.snapshotWorkspace(WORKSPACE);
 
-      const turn = await adapter.startTurn(thread.id, [
+      const turn = await sessionAdapter.startTurn(thread.id, [
         { type: "text", text: prompt },
       ], {
         sandboxPolicy: { type: "readOnly", networkAccess: false },
@@ -413,6 +438,7 @@ const server = http.createServer(async (req, res) => {
       sessions.set(sessionId, {
         threadId: thread.id,
         clientThreadId,
+        provider,
         workspace: WORKSPACE,
         activeTurnId: turn.id,
         turnIds: [turn.id],
@@ -431,11 +457,11 @@ const server = http.createServer(async (req, res) => {
         status: "running",
       }));
 
-      adapter.collectTurnEvents(thread.id, turn.id, 30_000, traceCollector)
+      sessionAdapter.collectTurnEvents(thread.id, turn.id, 30_000, traceCollector)
         .then(() => {
           // S8: post-turn workspace scan for file changes omitted from events
           try {
-            var scanResult = adapter.scanAndFireHooks(WORKSPACE);
+            var scanResult = sessionAdapter.scanAndFireHooks(WORKSPACE);
             if (scanResult.changes.length > 0) {
               var fileItemId = "git-" + (turn.id || "").slice(0, 8);
               traceStore.append(sessionId, {
@@ -489,7 +515,7 @@ const server = http.createServer(async (req, res) => {
 
         // Register hook: append action.pause AFTER turn/completed flows through trace,
         // giving correct ordering: provider events → action.pause
-        adapter.registerOnTurnEnd((turnStatus) => {
+        getSessionAdapter(threadId).registerOnTurnEnd((turnStatus) => {
           traceStore.append(sessionId, {
             method: "action.pause",
             params: {
@@ -516,12 +542,12 @@ const server = http.createServer(async (req, res) => {
           });
         });
 
-        await adapter.interruptTurn(threadId, activeTurnId as string);
+        await getSessionAdapter(threadId).interruptTurn(threadId, activeTurnId as string);
         session.activeTurnId = null;
 
         // Wait for interrupted turn to finish and action.pause to be recorded
         await new Promise<void>((resolve) => {
-          adapter.registerOnTurnEnd((_status: string) => resolve());
+          getSessionAdapter(threadId).registerOnTurnEnd((_status: string) => resolve());
         });
       }
 
@@ -570,7 +596,7 @@ const server = http.createServer(async (req, res) => {
 
         // Register a hook: append action.stop to trace AFTER the turn/completed
         // event flows through, ensuring correct ordering in the trace.
-        adapter.registerOnTurnEnd((turnStatus) => {
+        getSessionAdapter(threadId).registerOnTurnEnd((turnStatus) => {
           traceStore.append(sessionId, {
             method: "action.stop",
             params: {
@@ -596,12 +622,12 @@ const server = http.createServer(async (req, res) => {
           });
         });
 
-        await adapter.interruptTurn(threadId, activeTurnId as string);
+        await getSessionAdapter(threadId).interruptTurn(threadId, activeTurnId as string);
         session.activeTurnId = null;
 
         // Wait for the turn to finish and action.stop to be recorded
         await new Promise<void>((resolve) => {
-          adapter.registerOnTurnEnd((_status: string) => resolve());
+          getSessionAdapter(threadId).registerOnTurnEnd((_status: string) => resolve());
         });
       }
 
@@ -655,10 +681,10 @@ const server = http.createServer(async (req, res) => {
         const { activeTurnId, threadId } = session;
 
         const turnEnded = new Promise<void>((resolve) => {
-          adapter.registerOnTurnEnd(() => resolve());
+          getSessionAdapter(threadId).registerOnTurnEnd(() => resolve());
         });
         try {
-          await adapter.interruptTurn(threadId, activeTurnId);
+          await getSessionAdapter(threadId).interruptTurn(threadId, activeTurnId);
         } catch {
           // The turn may already have finished; nothing to interrupt.
         }
@@ -747,10 +773,10 @@ const server = http.createServer(async (req, res) => {
         const { activeTurnId, threadId } = session;
 
         const turnEnded = new Promise<void>((resolve) => {
-          adapter.registerOnTurnEnd(() => resolve());
+          getSessionAdapter(threadId).registerOnTurnEnd(() => resolve());
         });
         try {
-          await adapter.interruptTurn(threadId, activeTurnId);
+          await getSessionAdapter(threadId).interruptTurn(threadId, activeTurnId);
         } catch {
           // The turn may already have finished; nothing to interrupt.
         }
@@ -848,6 +874,7 @@ const server = http.createServer(async (req, res) => {
       sessions.set(sessionId, {
         threadId: thread.id,
         clientThreadId,
+        provider: "codex",
         workspace: workspace,
         activeTurnId: turn.id,
         turnIds: [turn.id],
@@ -927,9 +954,9 @@ const server = http.createServer(async (req, res) => {
       );
 
       // Find the adapter requestId for this itemId and respond
-      const requestId = adapter.findApprovalRequestId(itemId);
+      const requestId = getSessionAdapter(session.threadId).findApprovalRequestId(itemId);
       if (requestId !== null) {
-        adapter.respondToApproval(requestId, approved);
+        getSessionAdapter(session.threadId).respondToApproval(requestId, approved);
       }
 
       // Record the decision in the trace
@@ -1023,7 +1050,7 @@ const server = http.createServer(async (req, res) => {
 
       // If we can trace it, record the interrupt as an action
       if (sessionId) {
-        adapter.registerOnTurnEnd((turnStatus) => {
+        getSessionAdapter(threadId).registerOnTurnEnd((turnStatus) => {
           traceStore.append(sessionId, {
             method: "action.interrupt",
             params: {
@@ -1038,7 +1065,7 @@ const server = http.createServer(async (req, res) => {
         });
       }
 
-      await adapter.interruptTurn(threadId, turnId);
+      await getSessionAdapter(threadId).interruptTurn(threadId, turnId);
 
       // Clear active turn from session if known
       if (sessionId) {
@@ -1095,13 +1122,16 @@ server.listen(PORT, () => {
   console.log(`  POST /decide:       approve/decline file-change request for session`);
   console.log(`  GET  /trace/:id:    raw trace entries`);
   console.log(`  GET  /state/:id:    derived state replay`);
+  console.log(`  POST /run-claude:   first turn via Claude Code adapter (provider: claude-code)`);
 });
 
 process.on("SIGINT", () => {
   adapter.stop();
+  claudeAdapter.stop();
   process.exit(0);
 });
 process.on("SIGTERM", () => {
   adapter.stop();
+  claudeAdapter.stop();
   process.exit(0);
 });

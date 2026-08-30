@@ -6,6 +6,7 @@
 import { mkdirSync, readFileSync, appendFileSync } from "node:fs";
 
 export const TRACE_PROVENANCE = "codex-app-server";
+export const TRACE_PROVENANCE_CLAUDECODE = "claude-code-cli";
 
 export interface TraceEntry<T = unknown> {
   seq: number;
@@ -45,14 +46,14 @@ export class RawTraceStore {
     }
   }
 
-  append(sessionId: string, event: unknown): void {
+  append(sessionId: string, event: unknown, provenance: string = TRACE_PROVENANCE): void {
     this.ensureDir(sessionId);
     const seq = this.nextSeq(sessionId);
     const entry: TraceEntry<typeof event> = {
       seq,
       ts: new Date().toISOString(),
       event,
-      provenance: TRACE_PROVENANCE,
+      provenance,
     };
     const line = JSON.stringify(entry) + "\n";
     appendFileSync(getTracePath(sessionId), line, "utf-8");
