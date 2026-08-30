@@ -185,6 +185,36 @@ export type ActionPauseParams = Schema.Schema.Type<
   typeof ActionPauseParams
 >;
 
+/** thread/tokenUsage/updated notification params (Codex usage event) */
+export const TokenUsageUpdatedParams = Schema.Struct({
+  _tag: Schema.Literal("tokenUsageUpdated"),
+  threadId: Schema.String,
+  turnId: Schema.String,
+  tokenUsage: Schema.Struct({
+    total: Schema.Struct({
+      totalTokens: Schema.Number,
+      inputTokens: Schema.Number,
+      cachedInputTokens: Schema.optional(Schema.Number),
+      cacheWriteInputTokens: Schema.optional(Schema.Number),
+      outputTokens: Schema.Number,
+      reasoningOutputTokens: Schema.optional(Schema.Number),
+    }),
+    last: Schema.Struct({
+      totalTokens: Schema.Number,
+      inputTokens: Schema.Number,
+      cachedInputTokens: Schema.optional(Schema.Number),
+      cacheWriteInputTokens: Schema.optional(Schema.Number),
+      outputTokens: Schema.Number,
+      reasoningOutputTokens: Schema.optional(Schema.Number),
+    }),
+    modelContextWindow: Schema.Number,
+  }),
+  costUsd: Schema.optional(Schema.Number),
+});
+export type TokenUsageUpdatedParams = Schema.Schema.Type<
+  typeof TokenUsageUpdatedParams
+>;
+
 /** Glassbox action.steer record (appended to trace after new turn starts) */
 export const ActionSteerParams = Schema.Struct({
   _tag: Schema.Literal("actionSteer"),
@@ -217,6 +247,7 @@ export const CodexEvent = Schema.Union([
   ActionSteerParams,
   ActionSendParams,
   TurnDiffUpdatedParams,
+  TokenUsageUpdatedParams,
 ]);
 
 export type CodexEvent = Schema.Schema.Type<typeof CodexEvent>;
@@ -235,6 +266,7 @@ export const METHOD_TAG: ReadonlyMap<string, CodexEvent["_tag"]> = new Map([
   ["item/fileChange", "itemFileChange"],
   ["item/fileChange/requestApproval", "requestApproval"],
   ["item/commandExecution/requestApproval", "requestApproval"],
+  ["thread/tokenUsage/updated", "tokenUsageUpdated"],
   ["action.steer", "actionSteer"],
   ["action.send", "actionSend"],
   ["turn/diff/updated", "turnDiffUpdated"],
@@ -252,4 +284,5 @@ export const TAG_SCHEMA: Map<string, unknown> = new Map()
   .set("actionPause", ActionPauseParams)
   .set("actionSteer", ActionSteerParams)
   .set("actionSend", ActionSendParams)
-  .set("turnDiffUpdated", TurnDiffUpdatedParams);
+  .set("turnDiffUpdated", TurnDiffUpdatedParams)
+  .set("tokenUsageUpdated", TokenUsageUpdatedParams);

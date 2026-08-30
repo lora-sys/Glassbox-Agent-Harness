@@ -353,6 +353,32 @@ export function reduce(state: DerivedState, event: CodexEvent): DerivedState {
     }
 
     // -----------------------------------------------------------------------
+    // Token usage — update traceSummary with latest cumulative values.
+    // Codex's thread/tokenUsage/updated events carry cumulative totals from the
+    // provider, so we replace (not accumulate). Claude emits costUsd separately.
+    // -----------------------------------------------------------------------
+    case "tokenUsageUpdated": {
+      counts["thread/tokenUsage/updated"] = (counts["thread/tokenUsage/updated"] ?? 0) + 1;
+      const usage = event.tokenUsage.total;
+      const current = state.traceSummary.tokenUsage;
+      const costUsdRaw = (event as unknown as { costUsd?: number | null }).costUsd;
+      return {
+        ...state,
+        traceSummary: {
+          ...state.traceSummary,
+          eventCounts: counts,
+          totalEvents: state.traceSummary.totalEvents + 1,
+          tokenUsage: {
+            inputTokens: usage.inputTokens ?? current.inputTokens,
+            outputTokens: usage.outputTokens ?? current.outputTokens,
+            totalTokens: usage.totalTokens ?? current.totalTokens,
+            costUsd: costUsdRaw != null ? (current.costUsd ?? 0) + costUsdRaw : current.costUsd,
+          },
+        },
+      };
+    }
+
+    // -----------------------------------------------------------------------
     // Approval requests — no product state change, count only
     // -----------------------------------------------------------------------
     case "requestApproval": {

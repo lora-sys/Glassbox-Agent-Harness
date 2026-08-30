@@ -336,6 +336,13 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
               duration_ms?: number;
               errors?: string[];
               result?: string;
+              total_cost_usd?: number;
+              usage?: {
+                input_tokens?: number;
+                output_tokens?: number;
+                cache_read_input_tokens?: number;
+              };
+              modelUsage?: Record<string, { inputTokens?: number; outputTokens?: number; costUSD?: number }>;
             };
             const isError = rmsg.subtype === "error_during_execution" || rmsg.is_error;
             const durationMs = (typeof rmsg.duration_ms === "number" ? rmsg.duration_ms : Date.now() - turn.startedAt) as number;
@@ -363,6 +370,36 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
                   error: completed!.error ?? null,
                 },
               });
+
+              // Emit token usage so both providers feed the same reducer case.
+              // Prefer aggregated modelUsage (cumulative across models), fall back
+              // to single-turn usage.
+              const usage = rmsg.usage ?? {};
+              const modelEntries = rmsg.modelUsage ? Object.values(rmsg.modelUsage) : [];
+              let aggInput = 0, aggOutput = 0, aggCost = 0;
+              for (const m of modelEntries) {
+                aggInput += m.inputTokens ?? 0;
+                aggOutput += m.outputTokens ?? 0;
+                aggCost += m.costUSD ?? 0;
+              }
+              const inputTokens = aggInput || usage.input_tokens || undefined;
+              const outputTokens = aggOutput || usage.output_tokens || undefined;
+              const costUsd = rmsg.total_cost_usd ?? (aggCost || undefined);
+
+              if (inputTokens || outputTokens || rmsg.total_cost_usd) {
+                traceCollector("thread/tokenUsage/updated", {
+                  threadId: sessionId,
+                  turnId: turn.turnId,
+                  tokenUsage: {
+                    total: {
+                      totalTokens: (inputTokens ?? 0) + (outputTokens ?? 0),
+                      inputTokens: inputTokens ?? 0,
+                      outputTokens: outputTokens ?? 0,
+                    },
+                  },
+                  costUsd,
+                });
+              }
             }
             this.turnEndSubscribers.forEach((fn) => fn(completed!.status));
             this.turnEndSubscribers = [];

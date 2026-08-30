@@ -75,14 +75,15 @@ export interface TraceSummary {
   totalEvents: number;
   /** Turn duration from turn/completed. */
   totalDurationMs: number | null;
-  /** Token usage from turn/completed (when available via provider extras). */
+  /** Cumulative token usage, accumulated from thread/tokenUsage/updated events. */
   tokenUsage: TokenUsage;
 }
 
 export interface TokenUsage {
-  promptTokens: number | null;
-  completionTokens: number | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
   totalTokens: number | null;
+  costUsd: number | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -112,7 +113,7 @@ export function initialDerivedState(): DerivedState {
       eventCounts: {},
       totalEvents: 0,
       totalDurationMs: null,
-      tokenUsage: { promptTokens: null, completionTokens: null, totalTokens: null },
+      tokenUsage: { inputTokens: null, outputTokens: null, totalTokens: null, costUsd: null },
     },
     turns: [],
     _pendingDiffs: [],

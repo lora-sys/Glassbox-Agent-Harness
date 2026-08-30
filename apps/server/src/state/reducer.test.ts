@@ -453,6 +453,95 @@ describe("replayEntries", () => {
     expect(state.traceSummary.totalEvents).toBe(8);
     expect(state.traceSummary.eventCounts["unknown/method"]).toBe(1);
   });
+
+  // ---- tokenUsageUpdated accumulates across turns (Codex path) ----
+
+  it("accumulates tokenUsage across multiple tokenUsageUpdated events", () => {
+    const trace = [
+      rawEntry("thread/started", { thread: { id: "th-1", sessionId: "s-1", status: { type: "active" }, cwd: "/tmp" } }),
+      rawEntry("thread/tokenUsage/updated", {
+        threadId: "th-1",
+        turnId: "tr-1",
+        tokenUsage: {
+          total: { totalTokens: 17924, inputTokens: 17740, outputTokens: 184 },
+        },
+      }),
+      rawEntry("thread/tokenUsage/updated", {
+        threadId: "th-1",
+        turnId: "tr-1",
+        tokenUsage: {
+          total: { totalTokens: 36314, inputTokens: 35973, outputTokens: 341 },
+        },
+      }),
+      rawEntry("thread/tokenUsage/updated", {
+        threadId: "th-1",
+        turnId: "tr-1",
+        tokenUsage: {
+          total: { totalTokens: 54825, inputTokens: 54434, outputTokens: 391 },
+        },
+      }),
+    ];
+
+    const state = replayEntries(trace);
+    // Each event reports cumulative totals from the provider, so the last
+    // event's values are the session totals.
+    expect(state.traceSummary.tokenUsage.totalTokens).toBe(54825);
+    expect(state.traceSummary.tokenUsage.inputTokens).toBe(54434);
+    expect(state.traceSummary.tokenUsage.outputTokens).toBe(391);
+    expect(state.traceSummary.tokenUsage.costUsd).toBeNull();
+    expect(state.traceSummary.eventCounts["thread/tokenUsage/updated"]).toBe(3);
+  });
+
+  it("accumulates costUsd from claude-style tokenUsageUpdated events", () => {
+    const trace = [
+      rawEntry("thread/started", { thread: { id: "th-1", sessionId: "s-1", status: { type: "active" }, cwd: "/tmp" } }),
+      rawEntry("thread/tokenUsage/updated", {
+        threadId: "th-1",
+        turnId: "tr-1",
+        tokenUsage: {
+          total: { totalTokens: 1000, inputTokens: 800, outputTokens: 200 },
+        },
+        costUsd: 0.005,
+      }),
+      rawEntry("thread/tokenUsage/updated", {
+        threadId: "th-1",
+        turnId: "tr-1",
+        tokenUsage: {
+          total: { totalTokens: 2500, inputTokens: 2000, outputTokens: 500 },
+        },
+        costUsd: 0.012,
+      }),
+    ];
+
+    const state = replayEntries(trace);
+    expect(state.traceSummary.tokenUsage.totalTokens).toBe(2500);
+    expect(state.traceSummary.tokenUsage.inputTokens).toBe(2000);
+    expect(state.traceSummary.tokenUsage.outputTokens).toBe(500);
+    expect(state.traceSummary.tokenUsage.costUsd).toBeCloseTo(0.017);
+  });
+
+  it("leaves tokenUsage null when no usage events are present", () => {
+    const state = replayEntries(syntheticTrace);
+    expect(state.traceSummary.tokenUsage.totalTokens).toBeNull();
+    expect(state.traceSummary.tokenUsage.inputTokens).toBeNull();
+    expect(state.traceSummary.tokenUsage.outputTokens).toBeNull();
+    expect(state.traceSummary.tokenUsage.costUsd).toBeNull();
+  });
+
+  it("is deterministic with tokenUsageUpdated events in trace", () => {
+    const traceWithUsage = [
+      rawEntry("thread/started", { thread: { id: "th-1", sessionId: "s-1", status: { type: "active" }, cwd: "/tmp" } }),
+      rawEntry("thread/tokenUsage/updated", {
+        threadId: "th-1",
+        turnId: "tr-1",
+        tokenUsage: { total: { totalTokens: 500, inputTokens: 400, outputTokens: 100 } },
+      }),
+    ];
+    const first = replayEntries(traceWithUsage);
+    const second = replayEntries(traceWithUsage);
+    expect(first).toEqual(second);
+    expect(first.traceSummary.tokenUsage.totalTokens).toBe(500);
+  });
 });
 
 // ---------------------------------------------------------------------------

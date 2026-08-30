@@ -27,6 +27,7 @@ const METHOD_TO_TAG: Record<string, string> = {
   "item/fileChange": "itemFileChange",
   "item/fileChange/requestApproval": "requestApproval",
   "item/commandExecution/requestApproval": "requestApproval",
+  "thread/tokenUsage/updated": "tokenUsageUpdated",
   "turn/diff/updated": "turnDiffUpdated",
   "action.pause": "actionPause",
   "action.stop": "actionPause",
