@@ -76,6 +76,8 @@ Treat performance regressions as bugs.
 
 Do not turn every raw event into a Canvas Object.
 
+Redline: a session with 1,000 or more trace events and 10 or more turns keeps Canvas interactions (select, pan, zoom, inspector open) responsive on the owner's machine. The number is measured once at phase acceptance with a real or synthetic large session, and the result is recorded. No speculative optimization before the redline actually fails.
+
 ## Project owner note
 
 When a requirement is ambiguous, choose the smaller implementation that preserves the product rules in this file.
