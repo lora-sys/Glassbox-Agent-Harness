@@ -121,6 +121,7 @@ export function reduce(state: DerivedState, event: CodexEvent): DerivedState {
         turns[openIdx] = { ...turns[openIdx], taskOrInstruction: itemText };
       }
       // If no task yet and this is a user message, capture text as task
+      // Task branch — return includes `turns` so the backfill above sticks.
       if (!state.task && item.type === "userMessage" && itemText) {
         return {
           ...state,
@@ -138,6 +139,7 @@ export function reduce(state: DerivedState, event: CodexEvent): DerivedState {
       }
       return {
         ...state,
+        turns,
         currentWork: {
           itemType: item.type,
           itemId: item.id,

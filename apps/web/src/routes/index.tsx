@@ -24,31 +24,15 @@ function buildBoardObjects(
 	state: Record<string, unknown>,
 	sessionId: string,
 ) {
-	const shapes: ReturnType<typeof textShape>[] = [];
+	const shapes: { kind: string; id: string; text: string; meta: ObjectMeta }[] = [];
 	const meta = new Map<string, ObjectMeta>();
-	const X = 120;
-	let y = 100;
-	const MAX_MSG = 120;
 
-	function push(
-		id: string,
-		text: string,
-		om: ObjectMeta,
-	) {
-		shapes.push(textShape(id, X, y, text));
-		meta.set(id, om);
-	}
-
+	// --- task ---
 	if (state.task) {
-		push(
-			"shape:task-" + sessionId.slice(0, 8),
-			"Task: " + state.task,
-			{ objectType: "task" },
-		);
-		y += 75;
+		shapes.push({ kind: "task", id: "shape:task-" + sessionId.slice(0, 8), text: "Task: " + state.task, meta: { objectType: "task" } });
 	}
 
-	// Per-turn result shapes (replaces single finalResult shape)
+	// --- per-turn shapes ---
 	const turns = (state.turns ?? []) as {
 		turnId: string;
 		taskOrInstruction: string;
@@ -64,114 +48,145 @@ function buildBoardObjects(
 			: t.finalResult?.status === "interrupted" ? "#fbbf24"
 			: t.finalResult?.status === "failed" ? "#f87171"
 			: "#71717a";
-		const lines = [
-			label,
-			statusColor + " " + (t.finalResult?.status ?? "running..."),
-		];
-		if (t.finalResult?.durationMs != null) {
-			lines.push("duration: " + (t.finalResult.durationMs / 1000).toFixed(1) + "s");
-		}
-		if (t.finalResult?.error) {
-			lines.push("error: " + t.finalResult.error.slice(0, 120));
-		}
-		const turnIdShort = (t.turnId || "").slice(0, 8);
+		const lines = [label, statusColor + " " + (t.finalResult?.status ?? "running...")];
+		if (t.finalResult?.durationMs != null) lines.push("duration: " + (t.finalResult.durationMs / 1000).toFixed(1) + "s");
+		if (t.finalResult?.error) lines.push("error: " + t.finalResult.error.slice(0, 120));
 		const id = "shape:turn-" + (t.turnId || ("turn" + i));
-		push(id, lines.join("\n"), { objectType: "turnResult", itemId: t.turnId, turnIndex: i });
-		y += 60;
+		shapes.push({ kind: "turn", id, text: lines.join("\n"), meta: { objectType: "turnResult", itemId: t.turnId, turnIndex: i } });
 
-		// Show agent message for this turn (collapsed)
 		if (t.agentMessageText) {
-			const msgText = t.agentMessageText.length > MAX_MSG
-				? t.agentMessageText.slice(0, MAX_MSG) + "..."
-				: t.agentMessageText;
+			const msgText = t.agentMessageText.length > 120 ? t.agentMessageText.slice(0, 120) + "..." : t.agentMessageText;
 			const msgId = "shape:msg-" + (t.turnId || ("msg" + i));
-			push(
-				msgId,
-				"Agent: " + msgText,
-				{ objectType: "turnAgentMessage", itemId: t.turnId, turnIndex: i },
-			);
-			y += 70;
+			shapes.push({ kind: "turn-msg", id: msgId, text: "Agent: " + msgText, meta: { objectType: "turnAgentMessage", itemId: t.turnId, turnIndex: i } });
 		}
 	}
 
-	const cw = state.currentWork as
-		| { itemId: string; text: string }
-		| null
-		| undefined;
+	// --- current work ---
+	const cw = state.currentWork as { itemId: string; text: string } | null | undefined;
 	if (cw?.text) {
-		const txt =
-			cw.text.length > 180
-				? cw.text.slice(0, 180) + "..."
-				: cw.text;
-		push(
-			"shape:work-" + cw.itemId.slice(0, 8),
-			"Agent: " + txt,
-			{ objectType: "work", itemId: cw.itemId },
-		);
-		y += 100;
+		const txt = cw.text.length > 180 ? cw.text.slice(0, 180) + "..." : cw.text;
+		shapes.push({ kind: "work", id: "shape:work-" + cw.itemId.slice(0, 8), text: "Agent: " + txt, meta: { objectType: "work", itemId: cw.itemId } });
 	}
 
-	const artifacts = (state.artifacts ??
-		[]) as {
-		itemId: string;
-		changes: { path: string; kind: string; diff?: string }[];
-	}[];
+	// --- artifacts ---
+	const artifacts = (state.artifacts ?? []) as { itemId: string; changes: { path: string; kind: string; diff?: string }[] }[];
 	for (let i = 0; i < artifacts.length; i++) {
 		const a = artifacts[i];
-		const list = (a.changes ?? [])
-			.map((c: any) => "[" + (c.kind ?? "?") + "] " + c.path)
-			.join("\n");
+		const list = (a.changes ?? []).map((c: any) => "[" + (c.kind ?? "?") + "] " + c.path).join("\n");
 		const id = "shape:art-" + a.itemId.slice(0, 8) + "-" + i;
-		push(
-			id,
-			"Artifact:\n" + (list || "(no paths)"),
-			{ objectType: "artifact", itemId: a.itemId, index: i },
-		);
-		y += 65;
+		shapes.push({ kind: "art", id, text: "Artifact:\n" + (list || "(no paths)"), meta: { objectType: "artifact", itemId: a.itemId, index: i } });
 	}
 
-	const tr = state.testResult as
-		| { itemId: string; status: string; exitCode: number | null; aggregatedOutput: string | null; durationMs: number | null }
-		| null
-		| undefined;
+	// --- test result ---
+	const tr = state.testResult as { itemId: string; status: string; exitCode: number | null; aggregatedOutput: string | null; durationMs: number | null } | null | undefined;
 	if (tr) {
 		const lines: string[] = ["Test: " + tr.status];
 		if (tr.exitCode != null) lines.push("exit: " + String(tr.exitCode));
-		if (tr.durationMs != null)
-			lines.push("duration: " + String(tr.durationMs) + "ms");
-		if (tr.aggregatedOutput)
-			lines.push("out: " + tr.aggregatedOutput.slice(0, 80));
-		const id = "shape:test-" + sessionId.slice(0, 8);
-		push(id, lines.join("\n"), { objectType: "testResult", itemId: tr.itemId });
-		y += 80;
+		if (tr.durationMs != null) lines.push("duration: " + String(tr.durationMs) + "ms");
+		if (tr.aggregatedOutput) lines.push("out: " + tr.aggregatedOutput.slice(0, 80));
+		shapes.push({ kind: "test", id: "shape:test-" + sessionId.slice(0, 8), text: lines.join("\n"), meta: { objectType: "testResult", itemId: tr.itemId } });
 	}
 
-	const ts = state.traceSummary as
-		| {
-				eventCounts?: Record<string, number>;
-				totalEvents?: number;
-				totalDurationMs?: number | null;
-				tokenUsage?: { totalTokens?: number | null };
-		  }
-		| undefined;
+	// --- trace summary ---
+	const ts = state.traceSummary as { eventCounts?: Record<string, number>; totalEvents?: number; totalDurationMs?: number | null; tokenUsage?: { totalTokens?: number | null } } | undefined;
 	if (ts?.eventCounts) {
 		const lines = [
 			"Trace: " + (ts.totalEvents ?? 0) + " events",
-			...Object.entries(ts.eventCounts)
-				.slice(0, 6)
-				.map(([k, v]) => "  " + k + ": " + v),
-			...(ts.totalDurationMs != null
-				? ["  duration: " + (ts.totalDurationMs / 1000).toFixed(1) + "s"]
-				: []),
-			...(ts.tokenUsage?.totalTokens
-				? ["  tokens: " + ts.tokenUsage.totalTokens]
-				: []),
+			...Object.entries(ts.eventCounts).slice(0, 6).map(([k, v]) => "  " + k + ": " + v),
+			...(ts.totalDurationMs != null ? ["  duration: " + (ts.totalDurationMs / 1000).toFixed(1) + "s"] : []),
+			...(ts.tokenUsage?.totalTokens ? ["  tokens: " + ts.tokenUsage.totalTokens] : []),
 		];
-		const id = "shape:trace-" + sessionId.slice(0, 8);
-		push(id, lines.join("\n"), { objectType: "traceSummary" });
+		shapes.push({ kind: "trace", id: "shape:trace-" + sessionId.slice(0, 8), text: lines.join("\n"), meta: { objectType: "traceSummary" } });
 	}
 
+	for (const s of shapes) meta.set(s.id, s.meta);
 	return { shapes, meta };
+}
+
+function applyFlowLayout(
+	editor: any,
+	templates: { id: string; text: string; meta: ObjectMeta }[],
+	sessionId: string,
+) {
+	const X = 120;
+	const MAX_WIDTH = 520;
+	const LINE_H = 22;
+	const GAP = 18;
+	const PAD_Y = 14;
+
+	function wrapLines(text: string, maxChars: number): string[] {
+		const raw = text.split("\n");
+		const out: string[] = [];
+		for (const line of raw) {
+			if (line.length <= maxChars) { out.push(line); continue; }
+			let remaining = line;
+			while (remaining.length > maxChars) {
+				let breakAt = remaining.lastIndexOf(" ", maxChars);
+				if (breakAt <= maxChars * 0.4) breakAt = maxChars;
+				out.push(remaining.slice(0, breakAt));
+				remaining = remaining.slice(breakAt).trimStart();
+			}
+			if (remaining.length > 0) out.push(remaining);
+		}
+		return out;
+	}
+
+	function estimateHeight(text: string): number {
+		const longest = Math.max(...wrapLines(text, 90).map(l => l.length), 1);
+		const growthFactor = Math.max(1, Math.ceil(longest / 65));
+		const lines = text.split("\n").length * growthFactor;
+		return PAD_Y + lines * LINE_H + PAD_Y;
+	}
+
+	// Pass 1: rough positioning — place each shape below the previous
+	let y = 100;
+	for (const t of templates) {
+		const estimatedRows = Math.max(t.text.split("\n").length, Math.ceil(t.text.length / 70));
+		(t as any)._y = y;
+		(t as any)._h = Math.max(PAD_Y + estimatedRows * LINE_H + PAD_Y, 60);
+		y = (t as any)._y + (t as any)._h + GAP;
+	}
+	const totalH = y - GAP;
+
+	// Pass 2: re-measure with editor.getShapeBounds (passes actual rendered heights back)
+	const tempShapes = templates.map(t => Object.assign({}, textShape(t.id, X, (t as any)._y, t.text)));
+	editor.createShapes(tempShapes);
+	editor.getCurrentPageShapes().forEach((s: any) => {
+		if (!s || !s.id) return;
+		for (const t of templates) {
+			if (t.id === s.id && s.bounds) {
+				y = (y = s.bounds.h) + GAP;
+				(t as any)._y = s.bounds.y;
+				(t as any)._h = s.bounds.h;
+				break;
+			}
+		}
+	});
+
+	// Do a second overlap-resolution pass after measurement
+	for (let i = 1; i < templates.length; i++) {
+		const prev = (templates[i - 1] as any);
+		const cur = (templates[i] as any);
+		const prevBottom = prev._y + prev._h;
+		if (cur._y < prevBottom) {
+			cur._y = prevBottom + GAP;
+			cur._h = Math.max(cur._h, PAD_Y + 40);
+		}
+	}
+	const totalH2 = templates.length > 0 ? (templates[templates.length - 1] as any)._y + (templates[templates.length - 1] as any)._h + GAP : y;
+
+	// Clean temp shapes and build final positioned shapes
+	editor.deleteShapes(editor.getCurrentPageShapes().map((s: any) => s.id));
+
+	const positioned = templates.map(t => {
+		const textShape_ = textShape(t.id, X, (t as any)._y, t.text) as any;
+		return Object.assign({}, textShape_, {
+			x: X,
+			y: (t as any)._y,
+		});
+	});
+
+	return { shapes: positioned, meta: new Map(templates.map(t => [t.id, t.meta])), totalHeight: Math.max(totalH2, y) };
 }
 
 function BoardLayer({
@@ -312,15 +327,16 @@ function App() {
 		var ed = editorRef.current;
 		if (!ed || !currentSessionId || !localState) return;
 
-		if (shapeIdsRef.current.length > 0) {
-			ed.deleteShapes(shapeIdsRef.current);
-			shapeIdsRef.current = [];
+		// Clean ALL canvas shapes (include stale shapes from previous sessions/turns).
+		var pageShapes = ed.getCurrentPageShapes();
+		if (pageShapes.length > 0) {
+			ed.deleteShapes(pageShapes.map(function(s: any) { return s.id; }));
 		}
 
-		var result = buildBoardObjects(localState, currentSessionId);
-		var newIds = result.shapes.map(function(s: any) { return s.id; });
+		var templates = buildBoardObjects(localState, currentSessionId);
+		var result = applyFlowLayout(ed, templates.shapes, currentSessionId);
 		ed.createShapes(result.shapes.map(function(s: any) { return Object.assign({}, s); }));
-		shapeIdsRef.current = newIds;
+		shapeIdsRef.current = result.shapes.map(function(s: any) { return s.id; });
 		sessionMetaRef.current.set(currentSessionId, result.meta);
 
 		try {
@@ -937,7 +953,7 @@ function App() {
 						transition: "background 0.15s",
 					}}
 				>
-					{running ? "Running..." : "Run test"}
+					{running ? "Stop" : "Run test"}
 				</button>
 				<button
 					onClick={handleRunDemo}
@@ -1096,7 +1112,7 @@ function App() {
 			</div>
 
 			<div style={{ flex: 1, position: "relative" }}>
-				<Tldraw>
+				<Tldraw components={{ StylePanel: () => null }}>
 					<BoardLayer
 						editorRef={editorRef}
 						onSelectionChange={handleSelection}

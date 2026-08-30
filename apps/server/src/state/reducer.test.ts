@@ -325,6 +325,42 @@ describe("reduce", () => {
     expect(state.currentWork?.itemId).toBe("fc-1");
     expect(state.artifacts).toHaveLength(1);
   });
+
+  // ---- Issue #4: itemStarted backfills turn even when state.task is already set ----
+
+  it("itemStarted backfills turn taskOrInstruction in task branch when state.task exists", () => {
+    // Simulate: turn/started with input (state.task = existing value)
+    // then item/started from a new turn WITHOUT turnOrInstruction
+    let state = reduce(initialDerivedState(), {
+      _tag: "turnStarted" as const,
+      threadId: "th-1",
+      turn: { id: "turn-1", status: "inProgress" },
+      input: [{ type: "text", text: "existing task" }],
+    });
+    // Second turn with no input (taskOrInstruction set to "")
+    state = reduce(state, {
+      _tag: "turnStarted" as const,
+      threadId: "th-1",
+      turn: { id: "turn-2", status: "inProgress" },
+    });
+    expect(state.turns).toHaveLength(2);
+    expect((state.turns[1] as any).taskOrInstruction).toBe("");
+
+    // item/started for userMessage with new task text → state.task stays "existing task"
+    // but the open turn should get backfilled with the userMessage text
+    state = reduce(state, {
+      _tag: "itemStarted" as const,
+      item: { type: "userMessage", id: "um-1", content: [{ type: "text", text: "add a test" }] },
+      threadId: "th-1",
+      turnId: "turn-2",
+      startedAtMs: 500,
+    });
+
+    // Before fix: turns[1].taskOrInstruction was empty because the second
+    // return branch of itemStarted omitted `turns`.
+    expect(state.task).toBe("existing task"); // task unchanged
+    expect(state.turns[1].taskOrInstruction).toBe("add a test"); // backfill works
+  });
 });
 
 // ---------------------------------------------------------------------------
