@@ -219,6 +219,10 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
     let completed:
       | { status: "completed" | "interrupted" | "failed"; durationMs: number; error?: string }
       | null = null;
+    // Track last assistant text block for the final-answer event (claude-code-
+    // specific: codex deltas are incremental tokens, so this event is not
+    // emitted for codex).
+    let lastAssistantText = "";
 
     const canUseTool: CanUseTool = this.buildCanUseTool(approvals, turn, sessionId);
 
@@ -287,6 +291,7 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
             }
             const message = msg as { message?: { content?: Array<Record<string, unknown>> } };
             if (message.message?.content) {
+              let lastText = "";
               for (const block of message.message.content as Array<Record<string, unknown>>) {
                 if (block.type === "tool_use" && traceCollector) {
                   traceCollector("item/started", {
@@ -296,14 +301,18 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
                     startedAtMs: Date.now(),
                   });
                 } else if (block.type === "text" && traceCollector) {
+                  lastText = block.text as string;
                   traceCollector("item/agentMessage/delta", {
                     threadId: sessionId,
                     turnId: turn.turnId,
                     itemId: "agent-0",
-                    delta: block.text as string,
+                    delta: lastText,
                   });
                 }
               }
+              // If this assistant message had text, remember it as the last text
+              // block for the turn — used in the item/agentMessage/final event.
+              if (lastText) lastAssistantText = lastText;
             }
             break;
           }
@@ -361,6 +370,18 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
             }
 
             if (traceCollector) {
+              // Emit the final answer BEFORE turn/completed: the reducer can
+              // only attach finalAnswer to an open turn, so closing the turn
+              // first would silently drop it.
+              if (lastAssistantText && traceCollector) {
+                traceCollector("item/agentMessage/final", {
+                  threadId: sessionId,
+                  turnId: turn.turnId,
+                  text: lastAssistantText,
+                  completedAtMs: Date.now(),
+                });
+              }
+
               traceCollector("turn/completed", {
                 threadId: sessionId,
                 turn: {
@@ -372,6 +393,9 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
                   error: completed!.error ?? null,
                 },
               });
+
+              // (The final-answer event is emitted above, before turn/completed,
+              // so the reducer can attach it to the still-open turn.)
 
               // Emit token usage so both providers feed the same reducer case.
               // Prefer aggregated modelUsage (cumulative across models), fall back

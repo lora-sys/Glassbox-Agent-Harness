@@ -3,7 +3,7 @@ import { type ReactNode } from "react";
 /* ── Public types ─────────────────────────────────────────── */
 
 export interface ObjectMeta {
-	objectType: "task" | "work" | "artifact" | "testResult" | "finalResult" | "traceSummary" | "steer" | "turnResult" | "turnAgentMessage" | "decision" | "systemInstruction";
+	objectType: "task" | "work" | "artifact" | "testResult" | "finalResult" | "traceSummary" | "steer" | "turnResult" | "turnAgentMessage" | "turnFinalAnswer" | "decision" | "systemInstruction";
 	itemId?: string;
 	turnIndex?: number;
 	index?: number;
@@ -148,6 +148,8 @@ function matchesObject(
 			return m === "turn/completed" || m === "turn/started";
 		case "turnAgentMessage":
 			return m === "item/agentMessage/delta";
+		case "turnFinalAnswer":
+			return m === "item/agentMessage/final";
 		default:
 			return false;
 	}
@@ -417,12 +419,30 @@ function ObjectFields({
 		);
 	}
 	if (selectedObject.objectType === "turnResult") {
-		const turns = (derivedState as { turns?: Array<{ taskOrInstruction: string; finalResult: { status: string; durationMs: number; error: string | null } | null; agentMessageText: string }> }).turns ?? [];
+		const turns = (derivedState as { turns?: Array<{ taskOrInstruction: string; finalResult: { status: string; durationMs: number; error: string | null } | null; agentMessageText: string; finalAnswer: string }> }).turns ?? [];
 		const idx = selectedObject.turnIndex ?? 0;
 		const t = turns[idx];
 		if (!t) return <Section label="Turn"><div style={{ fontSize: 11, color: muted }}>Turn data not found</div></Section>;
 		return (
 			<Section label="Turn Details">
+				{t.finalAnswer && (
+					<Section label="Answer">
+						<div
+							style={{
+								fontSize: 11,
+								color: textPrimary,
+								whiteSpace: "pre-wrap",
+								lineHeight: 1.5,
+								padding: "6px 8px",
+								background: "rgba(74, 222, 128, 0.06)",
+								borderRadius: 4,
+								marginBottom: 8,
+							}}
+						>
+							{t.finalAnswer}
+						</div>
+					</Section>
+				)}
 				<div style={{ fontSize: 11, lineHeight: 1.6 }}>
 					<div>
 						Input:{" "}
@@ -470,6 +490,28 @@ function ObjectFields({
 					}}
 				>
 					{t?.agentMessageText || "(no message yet)"}
+				</pre>
+			</Section>
+		);
+	}
+	if (selectedObject.objectType === "turnFinalAnswer") {
+		const turns = (derivedState as { turns?: Array<{ finalAnswer: string }> }).turns ?? [];
+		const idx = selectedObject.turnIndex ?? 0;
+		const t = turns[idx];
+		return (
+			<Section label="Answer">
+				<pre
+					style={{
+						fontSize: 11,
+						color: textPrimary,
+						whiteSpace: "pre-wrap",
+						maxHeight: 400,
+						overflowY: "auto",
+						margin: 0,
+						lineHeight: 1.5,
+					}}
+				>
+					{t?.finalAnswer || "(no answer yet)"}
 				</pre>
 			</Section>
 		);

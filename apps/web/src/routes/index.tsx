@@ -46,6 +46,7 @@ function buildBoardObjects(
 		taskOrInstruction: string;
 		finalResult: { status: string; durationMs: number; error: string | null } | null;
 		agentMessageText: string;
+		finalAnswer: string;
 	}[];
 	for (let i = 0; i < turns.length; i++) {
 		const t = turns[i];
@@ -66,6 +67,13 @@ function buildBoardObjects(
 			const msgText = t.agentMessageText.length > 120 ? t.agentMessageText.slice(0, 120) + "..." : t.agentMessageText;
 			const msgId = "shape:msg-" + (t.turnId || ("msg" + i));
 			shapes.push({ kind: "turn-msg", id: msgId, text: "Agent: " + msgText, meta: { objectType: "turnAgentMessage", itemId: t.turnId, turnIndex: i } });
+		}
+
+		// P2.8b: the turn's final answer gets its own full-text Answer object in
+		// the second column (see answerTemplates below) — never truncated.
+		if (t.finalAnswer) {
+			const answerId = "shape:answer-" + (t.turnId || ("ans" + i));
+			shapes.push({ kind: "turn-answer", id: answerId, text: "Answer:\n" + t.finalAnswer, meta: { objectType: "turnAnswer", itemId: t.turnId, turnIndex: i } });
 		}
 	}
 
@@ -113,10 +121,11 @@ function buildBoardObjects(
 
 function applyFlowLayout(
 	editor: any,
-	templates: { id: string; text: string; meta: ObjectMeta }[],
+	templates: { id: string; text: string; meta: ObjectMeta; kind?: string }[],
 	sessionId: string,
 ) {
 	const X = 120;
+	const ANSWER_X = 760;
 	const MAX_WIDTH = 520;
 	const LINE_H = 22;
 	const GAP = 18;
@@ -146,55 +155,72 @@ function applyFlowLayout(
 		return PAD_Y + lines * LINE_H + PAD_Y;
 	}
 
-	// Pass 1: rough positioning — place each shape below the previous
-	let y = 100;
-	for (const t of templates) {
-		const estimatedRows = Math.max(t.text.split("\n").length, Math.ceil(t.text.length / 70));
-		(t as any)._y = y;
-		(t as any)._h = Math.max(PAD_Y + estimatedRows * LINE_H + PAD_Y, 60);
-		y = (t as any)._y + (t as any)._h + GAP;
-	}
-	const totalH = y - GAP;
+	// Separate Answer shapes (kind "turn-answer") from regular shapes
+	const answerTemplates = templates.filter(t => (t as any).kind === "turn-answer");
+	const regularTemplates = templates.filter(t => (t as any).kind !== "turn-answer");
 
-	// Pass 2: re-measure with editor.getShapeBounds (passes actual rendered heights back)
-	const tempShapes = templates.map(t => Object.assign({}, textShape(t.id, X, (t as any)._y, t.text)));
+	// Pass 1: rough positioning for regular shapes — place each below the previous
+	let y = 100;
+	const measured = new Map<string, { _y: number; _h: number }>();
+	for (const t of regularTemplates) {
+		const estimatedRows = Math.max(t.text.split("\n").length, Math.ceil(t.text.length / 70));
+		const yPos = y;
+		const h = Math.max(PAD_Y + estimatedRows * LINE_H + PAD_Y, 60);
+		measured.set(t.id, { _y: yPos, _h: h });
+		y = yPos + h + GAP;
+	}
+
+	// Pass 2: re-measure regular shapes with editor.getShapeBounds
+	const tempShapes = regularTemplates.map(t => Object.assign({}, textShape(t.id, X, measured.get(t.id)!._y, t.text)));
 	editor.createShapes(tempShapes);
 	editor.getCurrentPageShapes().forEach((s: any) => {
 		if (!s || !s.id) return;
-		for (const t of templates) {
-			if (t.id === s.id && s.bounds) {
-				y = (y = s.bounds.h) + GAP;
-				(t as any)._y = s.bounds.y;
-				(t as any)._h = s.bounds.h;
-				break;
-			}
+		const m = measured.get(s.id);
+		if (m && s.bounds) {
+			measured.set(s.id, { _y: s.bounds.y, _h: s.bounds.h });
 		}
 	});
 
-	// Do a second overlap-resolution pass after measurement
-	for (let i = 1; i < templates.length; i++) {
-		const prev = (templates[i - 1] as any);
-		const cur = (templates[i] as any);
+	// Do a second overlap-resolution pass for regular shapes
+	const sortedRegular = [...regularTemplates].sort((a, b) => (measured.get(a.id)?._y ?? 0) - (measured.get(b.id)?._y ?? 0));
+	for (let i = 1; i < sortedRegular.length; i++) {
+		const prev = measured.get(sortedRegular[i - 1].id)!;
+		const cur = measured.get(sortedRegular[i].id)!;
 		const prevBottom = prev._y + prev._h;
 		if (cur._y < prevBottom) {
 			cur._y = prevBottom + GAP;
 			cur._h = Math.max(cur._h, PAD_Y + 40);
 		}
 	}
-	const totalH2 = templates.length > 0 ? (templates[templates.length - 1] as any)._y + (templates[templates.length - 1] as any)._h + GAP : y;
 
-	// Clean temp shapes and build final positioned shapes
+	// Position Answer shapes in the second column, aligned with their turn
+	for (const t of answerTemplates) {
+		const turnIdx = (t.meta as any).turnIndex ?? 0;
+		const turnId = (t.meta as any).itemId || "";
+		// Find the turn shape in the regular column to align with
+		const turnShape = regularTemplates.find(rt => rt.meta.objectType === "turnResult" && (rt.meta as any).itemId === turnId);
+		const turnY = turnShape ? (measured.get(turnShape.id)?._y ?? 100) : 100;
+		const estimatedRows = Math.max(t.text.split("\n").length, Math.ceil(t.text.length / 70));
+		measured.set(t.id, { _y: turnY, _h: Math.max(PAD_Y + estimatedRows * LINE_H + PAD_Y, 60) });
+	}
+
+	// Clean temp shapes
 	editor.deleteShapes(editor.getCurrentPageShapes().map((s: any) => s.id));
 
-	const positioned = templates.map(t => {
-		const textShape_ = textShape(t.id, X, (t as any)._y, t.text) as any;
-		return Object.assign({}, textShape_, {
-			x: X,
-			y: (t as any)._y,
+	// Build final positioned shapes
+	const allTemplates = [...regularTemplates, ...answerTemplates];
+	const positioned = allTemplates.map(t => {
+		const m = (t as any).kind === "turn-answer";
+		const xPos = m ? ANSWER_X : X;
+		const adjusted = Object.assign({}, textShape(t.id, xPos, measured.get(t.id)!._y, t.text));
+		return Object.assign({}, adjusted, {
+			x: xPos,
+			y: measured.get(t.id)!._y,
 		});
 	});
 
-	return { shapes: positioned, meta: new Map(templates.map(t => [t.id, t.meta])), totalHeight: Math.max(totalH2, y) };
+	const maxY = templates.length > 0 ? Math.max(...templates.map(t => (measured.get(t.id)?._y ?? 0) + (measured.get(t.id)?._h ?? 0))) : 0;
+	return { shapes: positioned, meta: new Map(templates.map(t => [t.id, t.meta])), totalHeight: Math.max(maxY, y) };
 }
 
 function BoardLayer({

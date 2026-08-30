@@ -80,6 +80,19 @@ export type AgentMessageDeltaParams = Schema.Schema.Type<
   typeof AgentMessageDeltaParams
 >;
 
+/** item/agentMessage/final notification params (claude-code-only: emitted on
+ *  result event with the last assistant text block of the turn). */
+export const AgentMessageFinalParams = Schema.Struct({
+  _tag: Schema.Literal("agentMessageFinal"),
+  threadId: Schema.String,
+  turnId: Schema.String,
+  text: Schema.String,
+  completedAtMs: Schema.Number,
+});
+export type AgentMessageFinalParams = Schema.Schema.Type<
+  typeof AgentMessageFinalParams
+>;
+
 /** item/completed notification params */
 export const ItemCompletedParams = Schema.Struct({
   _tag: Schema.Literal("itemCompleted"),
@@ -255,6 +268,7 @@ export const CodexEvent = Schema.Union([
   TurnStartedParams,
   ItemStartedParams,
   AgentMessageDeltaParams,
+  AgentMessageFinalParams,
   ItemCompletedParams,
   TurnCompletedParams,
   ItemFileChangeParams,
@@ -278,6 +292,7 @@ export const METHOD_TAG: ReadonlyMap<string, CodexEvent["_tag"]> = new Map([
   ["turn/started", "turnStarted"],
   ["item/started", "itemStarted"],
   ["item/agentMessage/delta", "agentMessageDelta"],
+  ["item/agentMessage/final", "agentMessageFinal"],
   ["item/completed", "itemCompleted"],
   ["turn/completed", "turnCompleted"],
   ["item/fileChange", "itemFileChange"],
@@ -294,6 +309,7 @@ export const TAG_SCHEMA: Map<string, unknown> = new Map()
   .set("turnStarted", TurnStartedParams)
   .set("itemStarted", ItemStartedParams)
   .set("agentMessageDelta", AgentMessageDeltaParams)
+  .set("agentMessageFinal", AgentMessageFinalParams)
   .set("itemCompleted", ItemCompletedParams)
   .set("turnCompleted", TurnCompletedParams)
   .set("itemFileChange", ItemFileChangeParams)

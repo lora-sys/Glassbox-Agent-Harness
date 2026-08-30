@@ -102,6 +102,8 @@ export interface TurnRecord {
   finalResult: FinalResult | null;
   /** Accumulated agent message text from agentMessageDelta events. */
   agentMessageText: string;
+  /** Full final answer text from the last assistant text block (claude-code-only). */
+  finalAnswer: string;
 }
 
 export function initialDerivedState(): DerivedState {

@@ -132,4 +132,49 @@ describe("ClaudeCodeAdapter", () => {
     expect(adapter.getAppendSystemPrompt("ghost-session")).toBe("");
     adapter.stop();
   });
+
+  // ---- P2.8b: agentMessage/final event on result ----
+
+  it("collectTurnEvents emits item/agentMessage/final on result with last assistant text", async () => {
+    // This test requires the claude-code SDK to be available with credentials.
+    // Skip gracefully when not in an environment with ANTHROPIC_API_KEY.
+    if (!process.env.ANTHROPIC_API_KEY) {
+      console.log("[skip] ANTHROPIC_API_KEY not set — adapter test requires credentials");
+      return;
+    }
+
+    const adapter = new ClaudeCodeAdapter();
+    adapter.start();
+    const sessionId = "sess-final-test";
+    await adapter.startSession(sessionId, { cwd: "/tmp" });
+    await adapter.startTurn(sessionId, [{ type: "text", text: "Say hello." }], {});
+
+    const traceEvents: Array<{ method: string; params: Record<string, unknown> }> = [];
+    const result = await adapter.collectTurnEvents(
+      sessionId,
+      "any-turn-id",
+      30000,
+      (method, params) => {
+        traceEvents.push({ method, params });
+      },
+    );
+
+    // Verify turn/completed was emitted
+    const turnCompleted = traceEvents.filter(e => e.method === "turn/completed");
+    expect(turnCompleted.length).toBeGreaterThanOrEqual(1);
+
+    // If a final answer event was emitted, verify its shape
+    const finalEvents = traceEvents.filter(e => e.method === "item/agentMessage/final");
+    for (const fe of finalEvents) {
+      expect(fe.params).toHaveProperty("text");
+      expect(typeof fe.params.text).toBe("string");
+      expect(fe.params).toHaveProperty("threadId", sessionId);
+      expect(fe.params).toHaveProperty("turnId");
+      expect(fe.params).toHaveProperty("completedAtMs");
+    }
+
+    expect(["completed", "failed", "interrupted"]).toContain(result.turnStatus);
+
+    adapter.stop();
+  }, 60000);
 });

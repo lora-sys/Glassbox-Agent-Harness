@@ -424,6 +424,59 @@ describe("reduce", () => {
     expect(state.artifacts).toHaveLength(0);
     expect(state.turns).toHaveLength(0);
   });
+
+  // ---- agentMessageFinal sets finalAnswer on the open turn ----
+
+  it("sets finalAnswer on the open turn from agentMessageFinal", () => {
+    let state = reduce(initialDerivedState(), {
+      _tag: "turnStarted" as const,
+      threadId: "th-1",
+      turn: { id: "tr-1", status: "inProgress" },
+      input: [{ type: "text", text: "answer me" }],
+    });
+    state = reduce(state, {
+      _tag: "agentMessageFinal" as const,
+      threadId: "th-1",
+      turnId: "tr-1",
+      text: "Here is the full answer text.",
+    } as any);
+    expect(state.turns).toHaveLength(1);
+    expect(state.turns[0].finalAnswer).toBe("Here is the full answer text.");
+    expect(state.traceSummary.eventCounts["item/agentMessage/final"]).toBe(1);
+  });
+
+  it("agentMessageFinal before turnStarted is ignored", () => {
+    const state = reduce(initialDerivedState(), {
+      _tag: "agentMessageFinal" as const,
+      threadId: "th-1",
+      turnId: "nonexistent",
+      text: "orphan answer",
+    } as any);
+    expect(state.turns).toHaveLength(0);
+    expect(state.traceSummary.eventCounts["item/agentMessage/final"]).toBe(1);
+  });
+
+  it("agentMessageFinal preserves finalAnswer through turn/completed", () => {
+    let state = reduce(initialDerivedState(), {
+      _tag: "turnStarted" as const,
+      threadId: "th-1",
+      turn: { id: "tr-1", status: "inProgress" },
+      input: [{ type: "text", text: "answer me" }],
+    });
+    state = reduce(state, {
+      _tag: "agentMessageFinal" as const,
+      threadId: "th-1",
+      turnId: "tr-1",
+      text: "The final answer.",
+    } as any);
+    state = reduce(state, {
+      _tag: "turnCompleted" as const,
+      threadId: "th-1",
+      turn: { id: "tr-1", status: "completed", startedAt: 0, completedAt: 1000, durationMs: 1000, error: null },
+    });
+    expect(state.turns[0].finalAnswer).toBe("The final answer.");
+    expect(state.turns[0].finalResult?.status).toBe("completed");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -604,6 +657,63 @@ describe("replayEntries", () => {
     const second = replayEntries(traceWithUsage);
     expect(first).toEqual(second);
     expect(first.traceSummary.tokenUsage.totalTokens).toBe(500);
+  });
+
+  // ---- agentMessageFinal sets finalAnswer in trace replay (claude-code path) ----
+
+  it("agentMessageFinal sets finalAnswer on the turn record", () => {
+    const trace = [
+      rawEntry("thread/started", { thread: { id: "th-1", sessionId: "s-1", status: { type: "active" }, cwd: "/tmp" } }),
+      rawEntry("turn/started", {
+        threadId: "th-1",
+        turn: { id: "tr-1", status: "inProgress" },
+        input: [{ type: "text", text: "what is 2+2?" }],
+      }),
+      rawEntry("item/agentMessage/delta", {
+        threadId: "th-1",
+        turnId: "tr-1",
+        itemId: "agent-0",
+        delta: "2+2 is 4.",
+      }),
+      rawEntry("item/agentMessage/final", {
+        threadId: "th-1",
+        turnId: "tr-1",
+        text: "2+2 is 4.",
+        completedAtMs: 5000,
+      }),
+      rawEntry("turn/completed", {
+        threadId: "th-1",
+        turn: { id: "tr-1", status: "completed", startedAt: 0, completedAt: 5000, durationMs: 5000, error: null },
+      }),
+    ];
+
+    const state = replayEntries(trace);
+    expect(state.turns).toHaveLength(1);
+    expect(state.turns[0].finalAnswer).toBe("2+2 is 4.");
+    expect(state.turns[0].agentMessageText).toBe("2+2 is 4.");
+    expect(state.traceSummary.eventCounts["item/agentMessage/final"]).toBe(1);
+    expect(state.traceSummary.eventCounts["item/agentMessage/delta"]).toBe(1);
+  });
+
+  it("replay is deterministic including agentMessageFinal", () => {
+    const trace = [
+      rawEntry("thread/started", { thread: { id: "th-1", sessionId: "s-1", status: { type: "active" }, cwd: "/tmp" } }),
+      rawEntry("turn/started", {
+        threadId: "th-1",
+        turn: { id: "tr-1", status: "inProgress" },
+        input: [{ type: "text", text: "test" }],
+      }),
+      rawEntry("item/agentMessage/delta", { threadId: "th-1", turnId: "tr-1", itemId: "agent-0", delta: "partial" }),
+      rawEntry("item/agentMessage/final", { threadId: "th-1", turnId: "tr-1", text: "full answer", completedAtMs: 3000 }),
+      rawEntry("turn/completed", {
+        threadId: "th-1",
+        turn: { id: "tr-1", status: "completed", startedAt: 0, completedAt: 3000, durationMs: 3000, error: null },
+      }),
+    ];
+    const a = replayEntries(trace);
+    const b = replayEntries(trace);
+    expect(a).toEqual(b);
+    expect(a.turns[0].finalAnswer).toBe("full answer");
   });
 });
 

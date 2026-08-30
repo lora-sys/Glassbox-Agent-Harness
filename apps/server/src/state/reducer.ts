@@ -89,6 +89,7 @@ export function reduce(state: DerivedState, event: CodexEvent): DerivedState {
         taskOrInstruction: text || "",
         finalResult: null,
         agentMessageText: "",
+        finalAnswer: "",
       };
 
       return {
@@ -333,6 +334,7 @@ export function reduce(state: DerivedState, event: CodexEvent): DerivedState {
           ...existing,
           finalResult,
           agentMessageText: existing.agentMessageText || itemTexts,
+          finalAnswer: existing.finalAnswer,
         };
       }
 
@@ -349,6 +351,29 @@ export function reduce(state: DerivedState, event: CodexEvent): DerivedState {
           totalEvents: state.traceSummary.totalEvents + 1,
           totalDurationMs: turn.durationMs,
         },
+      };
+    }
+
+    // -----------------------------------------------------------------------
+    // Agent message final — captures the last assistant text block as the
+    // turn's final answer. Claude-code-specific: emitted on the result event
+    // with the last text block seen during the turn. Codex deltas are true
+    // incremental tokens, so this event is not emitted for codex.
+    // -----------------------------------------------------------------------
+    case "agentMessageFinal": {
+      counts["item/agentMessage/final"] = (counts["item/agentMessage/final"] ?? 0) + 1;
+      const turns = [...state.turns];
+      // Prefer the open turn; if the final event arrived after turn/completed
+      // (older traces), fall back to the last turn so the answer is not lost.
+      let targetIdx = findOpenTurnIndex(turns);
+      if (targetIdx < 0 && turns.length > 0) targetIdx = turns.length - 1;
+      if (targetIdx >= 0) {
+        turns[targetIdx] = { ...turns[targetIdx], finalAnswer: event.text };
+      }
+      return {
+        ...state,
+        turns,
+        traceSummary: { ...state.traceSummary, eventCounts: counts, totalEvents: state.traceSummary.totalEvents + 1 },
       };
     }
 

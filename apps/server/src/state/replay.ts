@@ -22,6 +22,7 @@ const METHOD_TO_TAG: Record<string, string> = {
   "turn/started": "turnStarted",
   "item/started": "itemStarted",
   "item/agentMessage/delta": "agentMessageDelta",
+  "item/agentMessage/final": "agentMessageFinal",
   "item/completed": "itemCompleted",
   "turn/completed": "turnCompleted",
   "item/fileChange": "itemFileChange",
