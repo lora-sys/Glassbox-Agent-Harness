@@ -12,6 +12,50 @@ The acceptance sentence is:
 
 > The same Agent can serve an Owner and a Visitor, persist their Conversations across restart, expose public resources to both, keep Owner-private resources invisible to the Visitor, and prove every allow or deny decision in Trace.
 
+## The closed loop
+
+Plan 03 is not the full Personal Agent. It proves one security and persistence vertical slice end to end:
+
+```text
+Owner / Visitor request
+        ↓
+Resolve identity
+        ↓
+Resolve Principal + Conversation
+        ↓
+Authorization
+        ↓
+Load only authorized context
+        ↓
+Personal Agent Run
+        ↓
+Protected Tool re-authorization
+        ↓
+Result
+        ↓
+Persist Conversation + authorization state in Turso
+        ↓
+Write Run + AuthorizationDecision evidence to Trace
+        ↓
+Restart
+        ↓
+Resume the same Conversations with the same permission boundaries
+```
+
+The loop is successful only when all of these are true at the same time:
+
+- Owner and Visitor reach the same Agent identity
+- each Principal gets an isolated Conversation
+- public resources work for both
+- Owner-private resources never enter Visitor-visible model context
+- a Visitor cannot indirectly borrow Owner authority through a Tool or prompt injection
+- protected Tool calls recheck current authorization
+- revocation takes effect without rewriting old evidence
+- Turso survives restart and restores identity, relationships, grants, and Conversations
+- every Allow, Deny, and approval path can be explained from Trace without logging denied private contents
+
+After this works, a real WeChat or QQ adapter becomes an entry-point problem instead of a security-model problem. Memory, Mail, Calendar, Workers, LongTask, and Eval can all reuse the same Principal, Authorization, Conversation, persistence, and evidence boundaries.
+
 ## Why this phase comes first
 
 Remote channels, Memory, Mail, Calendar, Workers, LongTask, Eval, Journal, Skill evolution, and Asset Library all depend on one thing being correct first: who is acting and what that Principal is allowed to see or do.
