@@ -1,29 +1,58 @@
 # Plans
 
-This directory holds current implementation plans and durable technical findings.
+This directory contains the active implementation plan and durable technical findings.
 
-## Current status
+## Active plan
 
-Plan 01 and Plan 02 were completed historical phases from the earlier canvas-first coding-agent workbench. They were removed from the active tree during the Personal Agent reset. Their full text remains available in Git history.
+`03-personal-agent-foundation.md` is the only active plan.
 
-The current product direction is defined by `README.md`. Stable engineering and safety rules live in `AGENTS.md`.
+Its goal is to establish the first durable Personal Agent foundation:
 
-Create a new numbered plan only when implementation of the next product slice actually starts. Do not keep an old phase in the active tree merely because it once described the roadmap.
+```text
+Identity
+  ↓
+Authorization
+  ↓
+Conversation
+  ↓
+Turso persistence
+  ↓
+Run / Authorization Trace
+```
+
+Authorization is P0. Do not start real WeChat, QQ, Mail, Calendar, Memory consolidation, Skill evolution, LongTask, Eval, Arena, or AGY integration before Plan 03's completion gate is satisfied.
+
+## Read order for implementation
+
+1. `../AGENTS.md`
+2. `03-personal-agent-foundation.md`
+3. only the relevant files under `findings/`
+4. the relevant upstream source or documentation
+5. current production code and focused tests
+
+`README.md` defines product direction. `AGENTS.md` defines stable engineering and safety rules. The active plan defines the current scope.
+
+## Historical phases
+
+Plan 01 and Plan 02 were completed phases of the earlier canvas-first coding-agent workbench. They and their completed Ticket files were removed from the active tree. Their full history remains in Git.
+
+Do not restore old plans merely to preserve history.
 
 ## Keep here
 
-- active numbered plans
+- one active numbered plan unless parallel work is explicitly intentional
 - reusable technical findings
 - provider and protocol spikes with evidence
-- acceptance measurements worth reusing
-- architecture decisions that still constrain current implementation
+- performance measurements worth comparing later
+- architecture decisions that still constrain current work
 
 ## Do not keep here
 
-- completed ticket scratch files
+- completed Ticket scratch files
 - commit chores
-- one-off debugging breadcrumbs
+- generated logs
+- test output
+- debugging breadcrumbs that are already represented by code or tests
 - copied roadmap status that is no longer current
-- generated logs or test output
 
-`findings/` is intentionally retained. It contains verified evidence about the existing runtime, providers, Raw Trace, Derived State, WebSocket contracts, and performance behavior. Treat those files as historical technical evidence, not as the current product roadmap.
+`findings/` is intentionally retained as historical technical evidence. A finding is not permission to expand the current plan.
