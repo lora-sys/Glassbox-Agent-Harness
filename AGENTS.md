@@ -1,6 +1,6 @@
 # Glassbox
 
-Glassbox is evolving from a canvas-native coding-agent research workbench into a Personal Agent workbench with inspectable execution, long-running tasks, external chat channels, memory, and evals.
+Glassbox is evolving from a canvas-native coding-agent research workbench into a Personal Agent workbench with inspectable execution, long-running tasks, external chat channels, memory, evals, and delegated workers.
 
 The current repository still implements the earlier coding-agent workbench. Do not pretend future systems already exist. Preserve working behavior while moving the product toward the newer architecture in small verified slices.
 
@@ -10,7 +10,7 @@ The long-term product has one durable Personal Agent.
 
 Workbench, WeChat, QQ, and other chat integrations are entry points to that Agent. They are not separate agents.
 
-Codex, Claude Code, OpenHarness, and other runtimes may be connected providers or specialized execution capabilities. They are not the product identity.
+Codex, Claude Code, OpenHarness, AGY, and other runtimes or workers may be connected providers or specialized execution capabilities. They are not the product identity.
 
 Canvas is a useful workspace and inspection view, but it is not the entire product and it is not the source of truth for execution.
 
@@ -23,7 +23,7 @@ Identity + Conversation
         ↓
    Personal Agent
         ↓
- Skill / Tool / Provider
+ Skill / Tool / Provider / Worker
         ↓
        Run
         ↓
@@ -40,6 +40,7 @@ Personal Agent
 ├── Memory
 ├── Skills
 ├── Tools
+├── Worker Delegation
 ├── LongTask Engine
 └── Experiment / Eval Runner
 ```
@@ -52,7 +53,8 @@ Preserve enough evidence to answer:
 
 - What did the Agent receive?
 - Which user and Conversation caused the Run?
-- Which Memory, Skill, Tool, Provider, or configuration did it use?
+- Which Memory, Skill, Tool, Provider, Worker, or configuration did it use?
+- What work was delegated and to which Worker?
 - What actions did it take?
 - What changed?
 - Which approvals were requested or granted?
@@ -79,18 +81,21 @@ Add to context
 Remove from context
 Use from next turn
 Run from here
+Delegate
+Cancel Worker
+Continue Worker
 Start Eval
 Cancel Eval
 Retry Step
 ```
 
-The UI must clearly distinguish draft, applied, pending, running, completed, failed, cancelled, and waiting states.
+The UI must clearly distinguish draft, applied, pending, running, completed, failed, cancelled, waiting, and delegated states.
 
 ### Canvas is a projection
 
 Canvas layout has no hidden execution meaning.
 
-Moving, grouping, connecting, resizing, or annotating Canvas Objects must not silently change a running Agent or LongTask.
+Moving, grouping, connecting, resizing, or annotating Canvas Objects must not silently change a running Agent, Worker, or LongTask.
 
 Keep these distinctions clear:
 
@@ -101,6 +106,7 @@ Canvas Object ≠ tldraw Shape
 Canvas ≠ Execution State
 Raw Trace ≠ Derived State
 Edit ≠ Apply
+Provider / Worker ≠ Personal Agent
 ```
 
 Do not turn every raw event into a Canvas Object.
@@ -118,6 +124,7 @@ Conversation
 Session
 Run
 LongTask
+WorkerJob
 ```
 
 A Conversation represents an interaction thread between a user and the Personal Agent.
@@ -126,9 +133,11 @@ A Session represents resumable runtime context.
 
 A Run is one concrete execution.
 
-A LongTask is a durable task that may span many Runs, waits, retries, checkpoints, and external signals.
+A LongTask is a durable task that may span many Runs, waits, retries, checkpoints, external signals, and delegated Worker jobs.
 
-Do not use one identifier to represent all four concepts.
+A WorkerJob is one delegated execution owned by a Provider or Worker backend such as AGY.
+
+Do not use one identifier to represent these concepts.
 
 ### Channel is only transport
 
@@ -163,7 +172,7 @@ user
 conversation
 ```
 
-Tool access must also have explicit authorization boundaries. External users do not inherit the owner's Gmail, Calendar, GitHub write access, files, secrets, or private Memory simply because they can message the Agent.
+Tool and Worker access must also have explicit authorization boundaries. External users do not inherit the owner's Gmail, Calendar, GitHub write access, files, secrets, private Memory, or unrestricted Worker permissions simply because they can message the Agent.
 
 Approval and Secret Screening are part of this boundary.
 
@@ -183,17 +192,54 @@ Skill
 Tool
 Session
 Run
+WorkerJob
 LongTask
 Experiment
 EvalSuite
 EvalRun
 ```
 
-Keep Provider quirks out of these generic product objects.
+Keep Provider and Worker quirks out of these generic product objects.
 
-Do not make the core model inherit Codex or Claude-specific types when a provider-neutral boundary is actually needed by multiple consumers.
+Do not make the core model inherit Codex, Claude, or AGY-specific types when a provider-neutral boundary is actually needed by multiple consumers.
 
-At the same time, do not flatten useful Provider behavior merely to make a clean abstraction. Share only concepts the product truly needs.
+At the same time, do not flatten useful Provider or Worker behavior merely to make a clean abstraction. Share only concepts the product truly needs.
+
+## Worker delegation and AGY
+
+AGY is a specialized Worker candidate, not a second Personal Agent.
+
+The main Agent may delegate bounded work such as research, review, second opinions, or scoped implementation to AGY while retaining ownership of the user Conversation, permissions, final answer, and durable task state.
+
+Keep the generic delegation boundary small. Useful concepts include:
+
+```text
+delegate
+workerJobId
+parentRunId
+parentLongTaskId
+status
+observe
+wait
+result
+cancel
+continue
+restart
+```
+
+Do not expose AGY-specific slash commands or CLI flags as core product semantics. Translate them inside an AGY Adapter, Skill, or Worker integration.
+
+Every delegated Worker job should have a stable identifier and should be traceable to its parent Run or LongTask.
+
+A wait timeout is not automatically a Worker failure. If a Worker keeps running after the caller stops waiting, persist that state and allow later observation or result collection.
+
+Worker result collection must be idempotent where practical. Reconnecting or retrying a result fetch must not duplicate downstream side effects.
+
+Cancellation, continuation, and restart are different operations. Preserve the distinction in state and trace.
+
+If a Worker modifies files or performs external side effects, Glassbox authorization rules still apply. Do not trust an upstream Worker's unrestricted default merely because its own harness allows it.
+
+When AGY is used as a fast second model, keep enough provenance to compare its result with Codex, Claude Code, or the Personal Agent in Eval.
 
 ## Persistence and Turso
 
@@ -210,6 +256,7 @@ messages
 memories
 sessions
 runs
+worker_jobs
 long_tasks
 jobs
 approvals
@@ -229,7 +276,7 @@ Schema migrations and tests must never point at the user's live database.
 
 ## Long-running task semantics
 
-LongTask exists for work that cannot safely depend on one process, request, or model context staying alive.
+LongTask exists for work that cannot safely depend on one process, request, model context, or Worker wait staying alive.
 
 When implementing long tasks, think in terms of durable workflow semantics:
 
@@ -242,6 +289,7 @@ retry policy
 waiting state
 external signal
 child task
+worker job
 cancellation
 continuation
 ```
@@ -250,11 +298,11 @@ A process restart must not require replaying irreversible side effects.
 
 Retries require idempotency or explicit deduplication for state-changing operations.
 
-Waiting for a user, approval, webhook, scheduled time, or external condition must be represented as durable state rather than a sleeping in-memory promise.
+Waiting for a user, approval, webhook, scheduled time, external condition, or Worker result must be represented as durable state rather than a sleeping in-memory promise.
 
 Long histories may compact into checkpoints and continuations. Compaction may reduce active context, but it must not rewrite prior Run evidence.
 
-When a long task resumes, the system should be able to explain what was completed, what remains, what it is waiting for, and why.
+When a long task resumes, the system should be able to explain what was completed, what remains, what Worker jobs are still active, what it is waiting for, and why.
 
 ## Eval and experiment semantics
 
@@ -280,7 +328,7 @@ Each Eval Sample should reference the real Run and Raw Trace that produced it wh
 
 Measurements and judgments are different.
 
-Measurements include token counts, duration, tool calls, file changes, retries, exit codes, and cost.
+Measurements include token counts, duration, tool calls, file changes, retries, Worker jobs, exit codes, and cost.
 
 Judgments include LLM graders, human review, semantic quality, and composite eval decisions.
 
@@ -294,6 +342,8 @@ Differential Eval
 Invariant Eval
 ```
 
+Differential Eval may compare Personal Agent versions, model providers, Coding Agents, or delegated Workers such as AGY when the same task boundary can be applied fairly.
+
 Do not create empty abstractions for Fuzz, Simulation, Chaos, or Formal Verification until a current plan requires them.
 
 Invariant checks are especially important for Personal Agent safety, for example:
@@ -303,6 +353,7 @@ never expose private memory to an unauthorized user
 never use another user's user-scoped memory
 never write outside an allowed workspace
 never send a side-effecting message without required approval
+never let a delegated worker escape the permissions assigned by Glassbox
 ```
 
 ## Upstream-first development
@@ -311,7 +362,7 @@ never send a side-effecting message without required approval
 
 Nothing in `upstream/` is imported at runtime.
 
-Before inventing a Provider, Agent Harness, Channel, Eval, trajectory, persistence, or durable-task mechanism, inspect relevant upstream code first.
+Before inventing a Provider, Agent Harness, Worker delegation protocol, Channel, Eval, trajectory, persistence, or durable-task mechanism, inspect relevant upstream code first.
 
 Current primary references are:
 
@@ -321,6 +372,11 @@ pingdotgg/t3code
 
 HKUDS/OpenHarness
   Agent loop, tools, skills, memory, permissions, channels, QQ
+
+keli-wen/agy-staff
+  AGY worker delegation, personas, background jobs, wait, observe, result, cancel, continue, restart
+  reference commit: 67d3fd8fdc04b57006a829ae376ae7ffdc7ee714
+  license: MIT
 
 joyehuang/trajectory-panel
   trajectory parsing, timeline UI, incremental tail, redaction, Turso sync
@@ -343,6 +399,7 @@ Vendoring rules:
 - Prefer proven mechanisms over rewrites made only to own the code.
 - Do not copy an upstream abstraction blindly when our product boundary is different.
 - Keep vendored reference code isolated from production imports.
+- When copying AGY integration code, keep AGY-specific protocol and command handling inside the AGY integration boundary.
 
 ## Current architecture
 
@@ -368,6 +425,28 @@ User Action
 Glassbox command
     ↓
 Runtime / Provider
+```
+
+The target adds Personal Agent orchestration and Worker delegation without invalidating the existing trace path:
+
+```text
+Channel / Workbench
+        ↓
+Identity + Conversation
+        ↓
+   Personal Agent
+        │
+        ├── Skill / Tool / Provider
+        ├── Worker Delegation
+        │      └── AGY / Codex / Claude Code / others
+        ├── LongTask Engine
+        └── Eval Runner
+        ↓
+       Run
+        ↓
+ Raw Trace + Derived State
+        ↓
+Timeline / Canvas / Inspector
 ```
 
 Keep the current path correct while introducing Personal Agent concepts incrementally.
@@ -407,13 +486,15 @@ Create a new package only when an actual dependency boundary requires it.
 
 Keep Provider-specific code near Provider integration.
 
+Keep Worker-specific code, including AGY integration, near Worker integration.
+
 Keep Channel-specific code near Channel integration.
 
 Keep tldraw-specific code near Canvas projection and interaction.
 
 Keep Eval orchestration separate from ordinary Agent execution, while linking Eval Samples back to Runs.
 
-Keep LongTask orchestration separate from one Provider Turn.
+Keep LongTask orchestration separate from one Provider Turn or Worker Job.
 
 ## Performance
 
@@ -421,7 +502,7 @@ Treat performance regressions as bugs.
 
 Do not project every raw event to Canvas.
 
-Large Sessions, LongTasks, and Eval Runs can produce thousands of events. Avoid broad React rerenders, unbounded DOM growth, huge live payloads, expensive visual effects, and full-history recomputation on every event.
+Large Sessions, LongTasks, Worker Jobs, and Eval Runs can produce thousands of events. Avoid broad React rerenders, unbounded DOM growth, huge live payloads, expensive visual effects, and full-history recomputation on every event.
 
 Prefer incremental reducers, indexed persistence, lazy inspection, and explicit pagination or virtualization when real load requires it.
 
@@ -441,7 +522,7 @@ Stop only processes you started or verified belong to the active development ins
 
 Never use the user's live Glassbox state as writable test state.
 
-Never point tests, migrations, cleanup jobs, evals, fuzzers, chaos tests, or test Agents at the user's real repositories, real Personal Agent database, live channels, or live credentials.
+Never point tests, migrations, cleanup jobs, evals, fuzzers, chaos tests, test Agents, or Worker integrations at the user's real repositories, real Personal Agent database, live channels, or live credentials.
 
 Reading or copying real data for debugging is acceptable when necessary. Write to a safe copy.
 
@@ -451,9 +532,11 @@ Use realistic fixtures when tiny mocks would hide the behavior being tested.
 
 Remote-channel tests should use fake adapters unless the plan explicitly requires a real integration test.
 
+Worker tests should use fake workers unless the plan explicitly requires a live AGY or other Worker integration test.
+
 Eval tests should use disposable datasets and isolated run state.
 
-LongTask recovery tests should deliberately exercise restart, retry, duplicate delivery, waiting, resume, and cancellation paths when those semantics change.
+LongTask recovery tests should deliberately exercise restart, retry, duplicate delivery, waiting, resume, Worker result recovery, and cancellation paths when those semantics change.
 
 ## Verification
 
@@ -466,6 +549,8 @@ Persistence changes should test restart and resume behavior when relevant.
 Channel changes should test normalization, routing, deduplication, and authorization.
 
 Memory changes should test scope isolation.
+
+Worker changes should test delegation, stable job identity, status mapping, timeout behavior, cancellation, continuation, restart, result collection, permission boundaries, and parent Run or LongTask linkage.
 
 LongTask changes should test durable transitions and idempotency.
 
@@ -509,11 +594,11 @@ Use the smallest model that solves the current problem.
 
 Prefer explicit state transitions over inferred magic.
 
-Do not create speculative frameworks for providers, channels, memory, evals, long tasks, or deployment modes that the current plan does not need.
+Do not create speculative frameworks for providers, workers, channels, memory, evals, long tasks, or deployment modes that the current plan does not need.
 
 Reuse mature upstream code and patterns when they solve the problem well.
 
-The UI must not lie. A spinner means work is pending. Success means underlying work completed. Waiting means the system has durable knowledge of what it is waiting for. Resume means execution actually resumed from persisted state.
+The UI must not lie. A spinner means work is pending. Success means underlying work completed. Waiting means the system has durable knowledge of what it is waiting for. Resume means execution actually resumed from persisted state. Delegated means a real Worker job exists and can be inspected.
 
 Avoid `any` when TypeScript can express the boundary. Validate unknown external data when it enters the system.
 
