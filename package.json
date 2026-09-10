@@ -10,6 +10,11 @@
   "engines": {
     "node": ">=22.18.0"
   },
+  "scripts": {
+    "dev:server": "npm run dev --workspace @glassbox/server",
+    "dev:web": "npm run dev --workspace @glassbox/web",
+    "test:server": "vitest run apps/server/src --reporter=basic"
+  },
   "devDependencies": {
     "@playwright/test": "^1.62.1",
     "playwright": "^1.62.1",
