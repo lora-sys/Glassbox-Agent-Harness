@@ -1,84 +1,345 @@
 # Glassbox
 
 <p align="center">
-  <img src="./assets/readme/hero-v1.webp" width="100%" alt="Glassbox keeps plans, diffs, tests, approvals, and results visible on an inspectable agent canvas" />
+  <img src="./assets/readme/hero-v1.webp" width="100%" alt="Glassbox personal agent workbench with inspectable runs, traces, experiments, and long-running tasks" />
 </p>
 
-Glassbox 是一个以画布为核心的 AI Agent 工作台，用来运行、检查和干预本机上的 Agent。
+Glassbox 正在从一个本地 Coding Agent 观察与控制工作台，演进成一个长期存在的 Personal Agent 工作台。
 
-Agent 的工作不该埋在一条不断滚动的聊天记录里。Glassbox 会把计划、动作、文件、Diff、测试、产物、审批和结果变成画布上的对象。你可以检查、移动、分组、批注，也可以过一段时间再回来继续。
+目标很简单：你拥有一个长期存在的 Agent。你在 Glassbox 里管理它、使用它、检查它做过的工作，也可以让其他人通过微信、QQ 等聊天渠道与这个 Agent 交互。
 
-## 为什么要做这个？
+聊天渠道只是入口。Canvas 只是工作台的一种视图。真正的核心是 Agent Runtime、长期状态、权限、长程任务、执行证据和 Eval。
 
-短任务用聊天就够了。任务一长，问题就出来了。
+> 当前仓库还没有完成下面所有目标能力。README 会明确区分“已经实现”和“接下来要构建”的部分。
 
-Agent 开始读文件、改代码、跑工具、生成 Diff、请求审批、留下各种产物。你很快会忘记它到底做了什么，重要结果夹在几十条消息中间，工具调用也会变成噪音。重新打开一次会话，往往要先滚半天聊天记录，再在脑子里把状态拼回来。
+## 产品目标
 
-Glassbox 换了一种做法。
-
-画布就是工作区。Agent 的活动先变成结构化状态，其中真正有用的部分再变成画布上的对象。
-
-原始事件仍然可以查看，但不会默认全部变成节点。
-
-Glassbox 也不打算替代你已经在用的 Agent。Provider Adapter 负责连接现有 Agent Runtime，把它们放进同一个工作区，同时保留各自真正有用的能力。
-
-## Glassbox 不是什么
-
-Glassbox 不是在聊天应用旁边加一块白板。
-
-它也不是那种必须先拖节点、搭流程，Agent 才能开始工作的 Workflow Builder。
-
-它更不是一个要求所有 Provider 都长得一样的新 Agent Runtime。
-
-事情没那么复杂。让 Agent 真正跑起来，把它做过的工作留下来，再给人一个能看、能改、能继续指挥的地方。
-
-## 它怎么工作
-
-Web 客户端通过带类型的 HTTP 和 WebSocket Contract 连接本地 TypeScript Runtime。
-
-用户操作先变成 Command。不同 Provider 的 Adapter 负责连接 Codex、Claude Code、Pi、ACP-compatible Agent 和其他 Runtime，再把各自的原生活动转换成 Glassbox Event。
-
-Session Reducer 根据这些 Event 得到当前 Run State。
-
-Canvas Projector 决定哪些状态值得出现在 tldraw Board 上。
+Glassbox 最终围绕一个长期存在的 Personal Agent 工作：
 
 ```text
-Provider
-  ↓
-Adapter
-  ↓
-Glassbox Event
-  ↓
-Session State
-  ↓
-Canvas Projector
-  ↓
-tldraw Board
+                         Personal Agent
+                              │
+              ┌───────────────┼───────────────┐
+              │               │               │
+            Memory          Skills           Tools
+              │                               │
+              │                         GitHub / Web / MCP
+              │                               │
+              │                         Codex / Claude Code
+              │
+        Long-running Tasks
+              │
+              └───────────────┬───────────────┘
+                              │
+                         Agent Runtime
+                              ▲
+                 ┌────────────┼────────────┐
+                 │            │            │
+             Workbench       微信          QQ
+                 │
+                 ▼
+        Trace / Eval / Experiments
+                 │
+        ┌────────┼────────┐
+        │        │        │
+     Timeline  Canvas   Raw Trace
 ```
 
-画布不是 Agent 执行状态的 Source of Truth。
+这里始终只有一个 Agent。
 
-Board 的布局、分组和用户批注属于工作区。Agent 的执行状态属于 Runtime。刷新浏览器不应该杀掉正在运行的任务。
+微信 Bot、QQ Bot、Workbench 都不是新的 Agent。它们只是不同的入口。不同用户和不同聊天拥有各自的 Conversation 和 User-scoped Memory，但访问的是同一个 Agent 的公开能力和知识。
 
-## 最核心的想法
+Codex、Claude Code 和其他 Coding Agent 也不再是产品中心。它们可以继续作为 Provider，也可以逐步变成 Personal Agent 在需要时调用的专业执行能力。
 
-一次 Agent Run 可能产生几百甚至几千条 Event。
+## 为什么做这个
 
-把每一条都扔到画布上会非常糟糕。
+短任务用聊天就够了。任务一旦变长，问题会迅速出现。
 
-Glassbox 会保留需要检查的原始活动，再把真正有用的状态整理成对象，例如：
+Agent 会读文件、调用工具、修改代码、等待审批、运行几小时、跨天继续、留下大量执行记录。用户需要知道任务现在到哪里、为什么停住、用了什么上下文、做过什么修改、哪些结果可信，以及失败后能不能从原来的状态继续。
 
-- 任务和计划
-- 值得保留的工具活动
-- 文件和 Diff
-- 测试结果
-- 来源
-- 审批
-- 产物
-- 最终结果
-- 用户批注
+Personal Agent 还会多出另外几个问题：
 
-Object Model 会先保持小。只有真实使用证明需要更多类型时再加。
+- 不同聊天渠道里的用户如何映射到同一个 Agent
+- 私人 Memory、公开 Memory 和某个用户自己的 Memory 如何隔离
+- Agent 的长期任务如何暂停、恢复、重试和等待外部事件
+- 一个 Agent、模型或组件改动以后，怎么证明它真的变好了
+- 一次结论如何回到原始 Run、Tool Call、Artifact 和 Trace
+
+Glassbox 要解决的是这些问题，而不是再做一个聊天壳。
+
+## 当前已经实现
+
+当前代码仍然以本地 Coding Agent 工作台为主，已经有这些基础能力：
+
+- Codex 和 Claude Code Provider Adapter
+- Session 和多 Turn 执行
+- HTTP 和 WebSocket Runtime
+- Raw Trace、Replay 和 Derived State
+- Approval 流程
+- Secret Screening
+- Real repo 运行和文件变更检查
+- Editable Task 和 Editable System Instruction
+- Token Usage 统计
+- tldraw Canvas Projection 和 Inspector
+- Playwright E2E
+- 大型 Session 性能验证
+
+这些能力会继续保留，但它们以后服务的是更大的 Personal Agent Runtime。
+
+## 下一阶段的核心模型
+
+我们会优先围绕下面这些对象扩展，而不是继续增加 Canvas Shape 或 Provider 数量。
+
+```text
+Agent
+User
+ChannelIdentity
+Conversation
+Memory
+Skill
+Tool
+Session
+Run
+LongTask
+Experiment
+EvalSuite
+EvalRun
+```
+
+几个必须保持清楚的边界：
+
+```text
+Channel ≠ Agent
+Conversation ≠ Session
+Session ≠ Run
+LongTask ≠ Run
+Event ≠ Canvas Object
+Canvas ≠ Execution State
+Raw Trace ≠ Derived State
+Eval Sample → Run → Raw Trace
+```
+
+## Conversation 和聊天渠道
+
+外部渠道统一进入标准消息模型，再交给 Agent Runtime。
+
+```text
+微信 / QQ / 其他渠道
+        │
+        ▼
+   Channel Adapter
+        │
+        ▼
+Identity + Conversation
+        │
+        ▼
+   Personal Agent
+```
+
+Channel Adapter 只处理渠道协议和消息格式。Agent Runtime 不应该知道 QQ 或微信的具体协议细节。
+
+同一个真实用户以后可以绑定多个 Channel Identity：
+
+```text
+user_123
+├── workbench: account_xxx
+├── wechat: wx_xxx
+└── qq: qq_xxx
+```
+
+群聊、私聊和 Thread 必须有明确的 Session Routing，避免多个用户意外共享同一份对话状态和 Memory。
+
+## Memory 和权限
+
+Memory 不能只靠 Prompt 约束。访问范围必须由 Runtime 和数据层执行。
+
+第一版至少区分：
+
+```text
+private       只有 Owner 和 Agent 的私有执行可以访问
+public        外部用户可以通过 Agent 间接使用
+user          只属于某个外部用户
+conversation  只属于当前 Conversation
+```
+
+Tool 也需要权限 Scope。读取 Owner 的私人日历、邮箱或文件，不能因为外部用户发了一条消息就自动获得权限。
+
+Approval 和 Secret Screening 是这套权限模型的现有基础，会继续保留。
+
+## Turso
+
+Turso 是计划中的长期状态存储之一。
+
+它适合承接 Personal Agent 的结构化状态，例如：
+
+```text
+agents
+users
+channel_identities
+conversations
+messages
+memories
+sessions
+runs
+long_tasks
+jobs
+approvals
+eval_suites
+eval_runs
+eval_samples
+eval_scores
+```
+
+Raw Trace 暂时继续保持独立的 append-only evidence store。Turso 保存业务状态、索引和 Run 元数据，不为了上数据库而重写已经有效的 Trace 机制。
+
+Agent 不应该默认获得 unrestricted SQL 权限。Memory 和业务数据应通过受权限控制的 Tool API 访问。
+
+## 长程任务
+
+长程任务不能依赖一个 HTTP 请求一直活着，也不能只存在进程内存里。
+
+目标语义参考 durable workflow 系统：
+
+```text
+LongTask
+├── stable task id
+├── steps
+├── event history
+├── checkpoint
+├── retry policy
+├── waiting state
+├── external signal
+├── child task
+├── cancellation
+└── continuation
+```
+
+一个任务可以等待几个小时后收到用户回复，再从原来的状态继续。Runtime 重启后也应该根据持久状态恢复，而不是重新执行所有副作用。
+
+长历史需要通过 Checkpoint 和 Continuation 压缩执行上下文，但旧 Trace 和旧 Run 不能被重写。
+
+## Eval 和实验工作台
+
+Eval 会作为 Glassbox 的实验能力，而不是一个独立脚本目录。
+
+用户最终可以用自然语言描述实验，例如：
+
+```text
+测一下当前 Agent 的 GitHub repo 分析能力。
+用 100 条任务。
+比较当前版本、Codex 和 Claude Code。
+每个样本跑 3 次。
+检查任务成功率、工具使用、成本、延迟和隐私 invariant。
+```
+
+Agent 先生成 Eval Draft。只有明确执行 Start 后才真正运行。
+
+```text
+Experiment
+├── EvalSuite
+├── Dataset
+├── Target
+├── Variant
+├── Scorer
+└── EvalRun
+```
+
+第一阶段优先做三类：
+
+- Benchmark：固定任务集验证能力
+- Differential Eval：同一任务集比较不同 Agent、Model 或配置
+- Invariant Eval：检查权限、Memory、Tool 和 Runtime 性质是否始终成立
+
+每一个 Eval Sample 都应该链接到真实 Run 和 Raw Trace。失败样本可以直接进入 Timeline、Canvas 或 Raw Trace 查看证据。
+
+后续可以逐步增加 Fuzz Eval、Simulation、Multi-Agent Eval、Chaos Eval 和 Workflow Verification，但不要提前搭空框架。
+
+## Canvas 的位置
+
+Canvas 保留，但不再定义整个产品。
+
+Glassbox 可以有多种工作视图：
+
+```text
+Conversation
+Project
+Timeline
+Canvas
+Trace
+Experiment
+```
+
+Canvas 适合表达 Plan、Artifact、Diff、Source、Decision、Result 和长期任务状态。它不是 Workflow Builder，也不是 Agent Runtime 的 Source of Truth。
+
+移动、分组、连接或批注 Canvas Object 不应该暗中改变 Agent 执行。真正改变执行的操作必须是明确的 Action，例如 Apply、Steer、Approve、Stop、Resume 或 Start Eval。
+
+## 上游参考策略
+
+成熟项目已经解决好的问题优先复用。`upstream/` 用来保存经过选择的只读参考实现。生产代码不能直接 import `upstream/`。
+
+当前认可的主要参考项目：
+
+| 上游项目 | 主要参考内容 |
+| --- | --- |
+| `pingdotgg/t3code` | Claude Code Provider、权限、Session Resume、Provider Integration |
+| `HKUDS/OpenHarness` | Agent Loop、Tools、Skills、Memory、Permission、Channel Gateway、QQ Channel |
+| `joyehuang/trajectory-panel` | JSONL Trajectory、Timeline、增量 Tail、Redaction、Turso Sync |
+| `UKGovernmentBEIS/inspect_ai` | Eval Task、Dataset、Scorer、Eval Set、Experiment Runner、Agent Evaluation |
+| `temporalio/sdk-typescript` | Durable Long Task、Signal、Retry、Child Task、Cancellation、Continue As New |
+| `tursodatabase/turso` | SQLite-compatible Agent State Storage、Vector、MCP 和数据库能力参考 |
+
+Vendoring 规则：
+
+- 只复制当前问题真正需要的文件，不整仓搬运
+- 每个上游目录记录 Source Repo、Commit、License 和原始路径
+- 复制 MIT 或其他允许复用的代码时保留版权和 License Notice
+- 优先复制经过生产或真实项目验证的机制，不为了“拥有自己的实现”而重写标准组件
+- 上游代码只作为参考，生产依赖必须明确引入并经过当前架构审查
+
+## 当前架构
+
+当前实现仍然是 Provider 驱动的本地 Runtime：
+
+```text
+Provider / Agent Runtime
+        │
+        ▼
+     Raw Trace
+        │
+        ▼
+Normalization / Replay
+        │
+        ▼
+   Derived State
+        │
+        ▼
+ Canvas / Inspector
+```
+
+目标架构在它前面增加 Personal Agent 和 Conversation，在它旁边增加 Long Task 和 Eval：
+
+```text
+Channel / Workbench
+        │
+        ▼
+Identity + Conversation
+        │
+        ▼
+   Personal Agent
+        │
+        ├── Skill / Tool / Provider
+        ├── LongTask Engine
+        └── Eval Runner
+        │
+        ▼
+      Run
+        │
+        ▼
+ Raw Trace + Derived State
+        │
+        ▼
+Timeline / Canvas / Inspector
+```
 
 ## 从源码运行
 
@@ -112,11 +373,7 @@ vp run dev
 
 开发环境统一使用相对路径 `/api` 和 `/ws`。不要把 localhost 或固定开发端口写进客户端代码。
 
-每个 worktree 都应该把可写的开发状态放在自己的、被 gitignore 的 `.glassbox/` 目录里。
-
-不要让开发环境或测试指向真实 Glassbox 安装的数据。
-
-## 项目结构
+## 当前项目结构
 
 ```text
 apps/
@@ -126,117 +383,55 @@ apps/
 packages/
   contracts/
   shared/
-  agent-runtime/
 
-.repos/
-docs/
+upstream/
+.plans/
+e2e/
+template/
 ```
 
-`apps/server` 负责本地 Runtime、HTTP 和 WebSocket Transport、Provider Adapter、Session 生命周期和 Event Normalization。
+`apps/server` 负责当前本地 Runtime、HTTP、WebSocket、Provider Adapter、Session 生命周期、Trace 和 Derived State。
 
-`apps/web` 负责 React 和 Vite+ 应用、tldraw 集成、Board Projection、Inspector、Composer 和用户交互。
+`apps/web` 负责当前 React 应用、tldraw、Canvas Projection、Inspector 和用户交互。
 
-`packages/contracts` 放跨进程共享的 Schema、Command、Event Type 和少量 Helper。不要把 Provider 实现或重 Runtime 逻辑塞进这里。
+`packages/contracts` 放跨边界 Contract。当前仍然很小，不要因为未来规划提前塞满抽象。
 
-`packages/shared` 只放真正共享的小工具。Keep it boring.
+`packages/shared` 只放真正共享的小工具。
 
-`packages/agent-runtime` 只在多个 App 真的需要共享 Session、Run、Capability 或 Normalized Event 逻辑时再使用。不要因为“以后可能会共享”就提前搬进去。
+`upstream/` 保存选择性的成熟开源参考实现。研究后再把适合的机制实现到正式代码里。
 
-`.repos/` 放只读的上游参考项目。可以研究，不要修改，也不要让生产代码直接 import 这里的实现。
+`.plans/` 保存当前阶段的计划、Findings 和 Ticket。
 
-## 我们在意的几条规则
+## 开发原则
 
-Provider 的怪脾气留在 Adapter 里。
-
-tldraw 的特殊逻辑留在 Web 的 Projection 和 Rendering 层。
-
-两边都不要漏进核心 Session Model。
-
-不要把每一条原始 Event 都变成节点。
-
-不要给还不存在的 Provider、Client、Protocol 或部署方式提前造抽象。
-
-UI 不能骗人。Spinner 出现时，底层工作必须真的还没结束。Success 出现时，底层状态必须真的已经完成。假的进度、过期的状态文字、没有回滚路径的乐观状态，都算 Bug。
-
-Canvas 在长时间 Agent Run 期间也要保持顺滑。注意大范围 React Re-render、过多的 Live Shape、一直在刷新的视觉效果、超大的 Diff，以及无限增长的 UI State。
-
-成熟实现已经解决好的问题，优先复用。拥有更多代码不是目标。
+- Runtime 和数据模型优先于视图
+- Channel 只是入口，不要把渠道协议泄漏到 Agent Core
+- Provider 的特殊行为留在 Provider Integration
+- tldraw 的特殊行为留在 Projection 和 Rendering
+- Raw Trace 不重写
+- UI 不能显示假的进度或过期状态
+- 长程任务的副作用必须考虑重试和幂等
+- 私有数据权限由代码和数据层执行，不依赖 Prompt 自觉
+- Eval 的配置、Target、Dataset、Scorer 和结果必须可追溯
+- 成熟实现能直接借就先借，拥有更多代码不是目标
+- 只为真实需求增加抽象
 
 ## 测试
 
-除非你测试的就是 Empty State，否则不要只拿空工作区做测试。
+不要只拿空工作区或极小 Fixture 做测试。
 
-真实 Session、Board、文件和 Agent Run 更容易暴露小 Fixture 看不到的问题。
+真实 Session、Conversation、Run、LongTask、Eval Sample 和 Agent Trace 更容易暴露问题。
 
-测试状态留在 worktree 内。需要真实数据时，先复制或 Snapshot 到 worktree。
-
-不要把开发状态软链接到真实状态。
-
-测试 Agent 只能写测试工作区里的路径。
+测试状态必须写入隔离的 disposable workspace。需要真实数据时先复制或 Snapshot。
 
 > Copy in. Never point in. Never write back.
 
-修改代码后，用最小但足够证明结果的检查。
-
-默认不要跑整个仓库的检查。只跑和本次改动有关的测试、Lint 和 Typecheck。完整 Suite 交给 CI，除非 Maintainer 明确要求本地跑。
-
-异步测试必须等待真实完成信号或状态变化。不要靠随便 `sleep` 几秒让测试通过。
-
-如果改动涉及 Selection、Grouping、Persistence、Restore、Drag-and-drop 或 Inspector，Canvas 测试既要检查底层状态，也要检查真实 UI 行为。
-
-## Pull requests
-
-除非开发者明确要求，否则不要创建 PR。
-
-Commit 标题使用 Conventional Commit，语言直白：
-
-```text
-fix(canvas): restored boards keep node selection
-```
-
-PR Body 保持短。先说问题，再说怎么修。
-
-UI 改动需要 Before 和 After 图片。涉及 Motion、Timing 或 Drag-and-drop 时，需要一个短视频。
-
-一个 PR 只做一件事。如果描述里开始出现 "also" 或 "while here"，拆开。
-
-盯一个已经打开的 PR 时，只处理最后一次 Push 之后新增的 Check 和 Comment。Bot 的发现先回到源码验证，再决定要不要改。真的问题就修，误报就解释清楚。
-
-没新东西就别动。
-
-最新 Commit 全绿以后就停。
-
-## 文档
-
-项目文档放在 `docs/`。
-
-```text
-docs/
-  user/
-  internals/
-  operations/
-```
-
-用户能感知到的行为写进 `docs/user/`。
-
-架构和贡献者说明写进 `docs/internals/`。
-
-运维步骤写进 `docs/operations/`。
-
-共享术语统一放在：
-
-```text
-docs/internals/glossary.md
-```
-
-如果你要修改 Glassbox 本身，先读 `AGENTS.md`。
+修改代码后运行最小但足够证明结果的测试、Lint、Typecheck 或 Browser Verification。异步测试等待真实完成信号，不用任意 `sleep` 掩盖竞态。
 
 ## 当前状态
 
 Glassbox 还很早。
 
-Canvas Model、Provider Adapter、Persistence 规则和交互方式都会在真实使用中继续变化。
+现有 Coding Agent Harness 已经证明 Trace、Provider、Approval、Derived State 和 Canvas 闭环可以工作。下一阶段会把重心转向 Personal Agent Runtime、Conversation、Memory、Turso 持久化、聊天渠道、长程任务和 Eval。
 
-这反而更需要现在把系统保持小。
-
-只做当前问题真的需要的东西。做出来，测一下，留下有效的。不要为一个还不存在的 Glassbox 版本提前把仓库塞满架构。
+不要为了未来版本提前把所有系统一次做完。先完成一个真实闭环，再用真实使用和 Eval 决定下一步。
