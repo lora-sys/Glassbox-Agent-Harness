@@ -1,7 +1,7 @@
 # Glassbox
 
 <p align="center">
-  <img src="./assets/readme/glassbox-hero-lora-visual.svg" width="100%" alt="Glassbox：把每一次执行，沉淀成自己的能力" />
+  <img src="./assets/readme/glassbox-hero-lora-visual.svg" width="100%" alt="Glassbox 个人 Agent 工作台：权限先于智能" />
 </p>
 
 Glassbox 是一个正在演进中的 Personal Agent 工作台。
@@ -15,6 +15,10 @@ Glassbox 是一个正在演进中的 Personal Agent 工作台。
 ## 当前开发阶段
 
 当前唯一 Active Plan：[`Plan 03 — Personal Agent Foundation`](./.plans/03-personal-agent-foundation.md)
+
+<p align="center">
+  <img src="./assets/readme/glassbox-architecture-lora-visual.svg" width="100%" alt="Plan 03 闭环：同一个 Agent，多身份，不越权" />
+</p>
 
 这一阶段只做地基：
 
@@ -37,10 +41,6 @@ Run / Authorization Trace
 > 同一个 Agent 可以同时服务 Owner 和 Visitor。两个人的 Conversation 可以持久恢复。公开资源两个人都能用，Owner 私有资源 Visitor 永远拿不到，并且每一次 Allow、Deny、Approval 都可以在 Trace 里解释。
 
 ## 产品目标
-
-<p align="center">
-  <img src="./assets/readme/glassbox-architecture-lora-visual.svg" width="100%" alt="Glassbox 架构：身份识别、权限控制、Personal Agent、执行、Trace 与学习沉淀" />
-</p>
 
 目标系统只有一个长期存在的 Personal Agent。
 
@@ -485,3 +485,7 @@ Glassbox 还很早，但方向已经收口。
 下一步不是继续扩 Canvas，也不是同时接十个聊天渠道。现在只做一个可证明的 Personal Agent Foundation：**身份明确、权限分明、Conversation 可持久恢复、Turso 保存长期状态、所有授权决策可追溯。**
 
 这层正确以后，再让微信、QQ、Mail、Calendar、Memory、Skill、LongTask、Eval 和 Arena 逐层接进来。
+
+## License
+
+MIT. See [`LICENSE`](./LICENSE).
