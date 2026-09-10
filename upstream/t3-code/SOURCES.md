@@ -1,77 +1,74 @@
-# upstream/t3-code — Vendored Files
+# upstream/t3-code — Vendored reference
 
-**Source project:** T3 Code (pingdotgg/t3code)
-**Repo URL:** https://github.com/pingdotgg/t3code
-**Commit:** `78f462c4` (2026-08-30)
-**License:** See upstream/LICENSE (from the T3 Code project)
-**Why vendored:** Glassbox is adding a Claude Code adapter. These files show the proven patterns for driving Claude Code headlessly via the Agent SDK and CLI, including permission mapping, session resume, and event normalization.
+**Source project:** T3 Code
 
-## What each file is
+**Source repository:** `pingdotgg/t3code`
 
-| File | Lines | Role |
-|---|---|---|
-| `ClaudeAdapter.ts` | 4735 | **Core adapter.** Wraps `@anthropic-ai/claude-agent-sdk` `query()` sessions, implements `CanUseTool` callback for per-request permission decisions, normalizes SDK messages to canonical runtime events, handles session resume via `resume`/`resumeSessionAt`. This is the primary file to read when implementing Glassbox's Claude adapter. |
-| `ClaudeDriver.ts` | 240 | **Provider driver.** Wires adapter, snapshot, and text generation together. Shows how to resolve the Claude binary path, create per-instance configurations, keyed capability probes, and maintenance resolvers. |
-| `ClaudeProvider.ts` | 1021 | **Provider layer.** Defines the Claude model catalog (Fable 5, Opus 5, Opus 4.8, Opus 4.7, Opus 4.6), capability probing, model resolution (`resolveClaudeApiModelId`), effort normalization, and text generation helpers. |
-| `ClaudeTextGeneration.ts` | 368 | **CLI subprocess text generation.** Shows how to spawn `claude -p --output-format json --json-schema ... --dangerously-skip-permissions` for structured output (commit messages, PR titles, branch names). Uses `ChildProcess.make()` with piped stdin. |
-| `ClaudeHome.ts` | 52 | **Config directory isolation.** Shows how to set `CLAUDE_CONFIG_DIR` env var (rather than overriding HOME) to isolate Claude's per-instance configuration. This is the key pattern for scoping Claude to one project context. |
-| `ClaudeExecutable.ts` | 90 | **Binary resolution.** Resolves the `claude` CLI binary path, including Windows npm shim following. The SDK needs an absolute path (no PATH resolution); this file shows how to find it. |
-| `ClaudeSkills.ts` | 155 | **Skill discovery.** Discovers Claude Code skills from the binary's filesystem for the provider capability list. Not directly needed for Glassbox but shows how skills are surfaced. |
+**Reference commit:** `78f462c4`
 
-## Key patterns to copy (proven by T3 Code)
+**License:** MIT
 
-### Per-request permission control (CanUseTool callback)
-```typescript
-// From ClaudeAdapter.ts ~line 4237
-const canUseTool: CanUseTool = (toolName, toolInput, callbackOptions) =>
-  runPromise(canUseToolEffect(toolName, toolInput, callbackOptions));
-```
-The `CanUseTool` callback receives each tool request; returning `{ behavior: "allow" }` or `{ behavior: "deny" }` is the per-request approval mechanism.
+**License file:** `./LICENSE`
 
-### Permission mode mapping
-```typescript
-// From ClaudeAdapter.ts ~line 4268
-const runtimeModeToPermission: Record<string, PermissionMode> = {
-  "auto-accept-edits": "acceptEdits",
-  auto: "auto",
-  "full-access": "bypassPermissions",
-};
-```
+**Why vendored:** Glassbox needed a proven Claude Code integration reference for headless Agent SDK execution, permission mapping, session resume, executable discovery, configuration isolation, and event normalization.
 
-### Session resume state
-```typescript
-// From ClaudeAdapter.ts ~line 683
-interface ClaudeResumeState {
-  readonly threadId?: ThreadId;
-  readonly resume?: string;           // session UUID to resume
-  readonly resumeSessionAt?: string;  // last assistant UUID for re-entry point
-  readonly turnCount?: number;
-}
+## Files
+
+| File | Reference purpose |
+| --- | --- |
+| `ClaudeAdapter.ts` | Agent SDK session lifecycle, per-request tool permission decisions, event normalization, resume |
+| `ClaudeDriver.ts` | Adapter wiring, capability probing, executable and configuration integration |
+| `ClaudeProvider.ts` | Provider capability and model handling |
+| `ClaudeTextGeneration.ts` | Structured subprocess generation patterns |
+| `ClaudeHome.ts` | `CLAUDE_CONFIG_DIR` isolation without replacing the user's HOME |
+| `ClaudeExecutable.ts` | Claude CLI executable discovery |
+| `ClaudeSkills.ts` | Skill discovery patterns |
+
+## Proven patterns worth consulting
+
+### Per-request permission control
+
+T3 Code uses the Claude Agent SDK `CanUseTool` callback so individual tool requests can be allowed or denied at runtime.
+
+Glassbox can borrow that provider-level mechanism, but provider permission is not a replacement for Glassbox authorization.
+
+The effective Glassbox rule remains:
+
+```text
+Principal
+  ↓
+Glassbox Authorization
+  ↓
+Delegated Provider Grant
+  ↓
+Provider-native permission callback
 ```
 
-### Config isolation without keychain breakage
-```typescript
-// From ClaudeHome.ts
-CLAUDE_CONFIG_DIR: resolvedHomePath,  // set in env, NOT overriding HOME
-```
+### Session resume
 
-### Scoping writes to one repo
-```typescript
-// From ClaudeAdapter.ts ~line 4291
-const queryOptions: ClaudeQueryOptions = {
-  cwd: input.cwd,                                    // working directory
-  additionalDirectories: [input.cwd, attachmentsDir], // explicit access grants
-  // No --allowedTools needed — CanUseTool handles per-request decisions
-};
-```
+The adapter preserves native Claude resume state instead of pretending all providers resume identically.
 
-### Add to system prompt after existing instructions
-```typescript
-// Set before query()
-queryOptions.systemPrompt = { type: "preset", preset: "claude_code" };
-// Research input injection: append to the prompt text itself on each turn
-```
+Keep provider-specific resume details inside the provider integration boundary.
 
-## Dependencies to ignore
+### Configuration isolation
 
-T3 Code uses Effect (`effect` npm package), `@anthropic-ai/claude-agent-sdk`, and internal packages (`@t3tools/contracts`, `@t3tools/shared`). Glassbox should only import `@anthropic-ai/claude-agent-sdk` at runtime.
+Use `CLAUDE_CONFIG_DIR` when provider-local configuration needs isolation. Do not replace HOME merely to scope one provider if doing so breaks normal credentials or platform behavior.
+
+### Workspace scoping
+
+Provider filesystem access should be explicit and bounded to the task workspace and specifically granted extra directories.
+
+Plan 03 adds a stricter rule above this: an allowed provider path still cannot exceed the current Principal's Glassbox authorization.
+
+## Vendoring rules
+
+These files are reference material. Production code must not import from `upstream/`.
+
+When copying a substantial implementation into production:
+
+- preserve the relevant MIT copyright and license notice
+- record the source file and reference commit in the implementation or nearby documentation
+- adapt the trust model to Glassbox rather than inheriting upstream defaults
+- copy only the mechanism needed by the current plan
+
+The MIT license text for this vendored source is preserved in `upstream/t3-code/LICENSE`.
