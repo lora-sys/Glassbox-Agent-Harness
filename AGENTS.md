@@ -1,349 +1,522 @@
 # Glassbox
 
-Glassbox is a canvas-native Agent research workbench for running, inspecting, steering, and studying AI agents.
+Glassbox is evolving from a canvas-native coding-agent research workbench into a Personal Agent workbench with inspectable execution, long-running tasks, external chat channels, memory, and evals.
 
-The canvas is the primary workspace. Agent work, artifacts, editable research inputs, and inspection tools stay visible without turning raw execution events into a node graph.
+The current repository still implements the earlier coding-agent workbench. Do not pretend future systems already exist. Preserve working behavior while moving the product toward the newer architecture in small verified slices.
 
-Glassbox connects to existing agents. It should help people understand and improve how those agents work without forcing every provider into the same behavior.
+## Product boundary
 
-## What makes Glassbox special?
+The long-term product has one durable Personal Agent.
 
-### 1. Open at the core
+Workbench, WeChat, QQ, and other chat integrations are entry points to that Agent. They are not separate agents.
 
-Glassbox is built in the open. Keep the code, architecture, product decisions, experiments, and important tradeoffs understandable.
+Codex, Claude Code, OpenHarness, and other runtimes may be connected providers or specialized execution capabilities. They are not the product identity.
 
-Prefer open formats and replaceable components when they make the system simpler.
+Canvas is a useful workspace and inspection view, but it is not the entire product and it is not the source of truth for execution.
 
-Do not add abstraction only to make the architecture look complete.
-
-### 2. Canvas-native
-
-The canvas is the workspace. It is not decoration around a chat page.
-
-Plans, artifacts, files, diffs, tests, sources, annotations, results, and selected research inputs can become persistent Canvas Objects.
-
-Keep normal whiteboard behavior useful. Text, drawing, arrows, images, frames, web references, and annotations are part of the workspace.
-
-Do not turn the product into a node workflow builder.
-
-Spatial relationships do not change execution by themselves.
-
-### 3. Agent-native, not agent-specific
-
-Glassbox connects to existing agents instead of replacing every Agent loop.
-
-Providers may expose different tools, events, approval flows, context behavior, and lifecycle controls. Keep provider-specific behavior close to the provider integration.
-
-Share only the concepts Glassbox actually needs.
-
-Do not flatten useful provider behavior just to produce a cleaner common interface.
-
-### 4. Researchable by default
-
-Glassbox should preserve enough evidence to answer:
-
-- What did the Agent actually receive?
-- What did it do?
-- What changed during the run?
-- Who changed it?
-- Which result came from which configuration?
-
-Prompt, Plan, Context, Skill, Tool Config, Artifact, and other execution-relevant inputs may become editable research objects when the current plan needs them.
-
-Editing must not erase what an active or completed Run actually used.
-
-### 5. Quiet by default
-
-Show the work that matters now.
-
-Keep raw logs, full event streams, metadata, and deep Trace details behind inspection.
-
-Use this order:
+The intended direction is:
 
 ```text
-Work → Inspect → Understand
+Channel / Workbench
+        ↓
+Identity + Conversation
+        ↓
+   Personal Agent
+        ↓
+ Skill / Tool / Provider
+        ↓
+       Run
+        ↓
+ Raw Trace + Derived State
+        ↓
+Timeline / Canvas / Inspector
 ```
 
-Chat is optional UI. Closing Chat must not make the current Run impossible to understand.
-
-### 6. Performance without compromise
-
-An infinite canvas receiving live Agent activity can get slow quickly.
-
-Watch for broad rerenders, too many live shapes, large payloads, heavy DOM nodes, large diffs, noisy logs, expensive visual effects, and state that grows without a limit.
-
-Treat performance regressions as bugs.
-
-Do not turn every raw event into a Canvas Object.
-
-Redline: a session with 1,000 or more trace events and 10 or more turns keeps Canvas interactions (select, pan, zoom, inspector open) responsive on the owner's machine. The number is measured once at phase acceptance with a real or synthetic large session, and the result is recorded. No speculative optimization before the redline actually fails.
-
-## Project owner note
-
-When a requirement is ambiguous, choose the smaller implementation that preserves the product rules in this file.
-
-Do not silently expand the task.
-
-Do not create abstractions for providers, clients, protocols, research models, or product ideas that the current plan does not need.
-
-If the current task conflicts with a rule in this file, stop and ask for approval before breaking the rule.
-
-Product history and future ideas belong in project notes. Current implementation scope belongs in `.plans/`. This file should contain rules that remain useful across plans.
-
-## A small glossary
-
-Use these terms consistently.
-
-- **you** means the coding Agent reading this file and changing Glassbox.
-- **we**, **us**, and **maintainers** mean the people building and maintaining Glassbox.
-- **user** means the person using Glassbox.
-- **agent** means the AI Agent doing work through Glassbox.
-- **provider** means an external Agent runtime or harness that Glassbox connects to.
-- **runtime** means the Glassbox-side process or module that manages provider interaction and Run lifecycle.
-- **project** means the working environment associated with real files, repositories, or another execution target.
-- **session** means durable work that the user can leave and return to.
-- **run** means one concrete Agent execution inside a Session.
-- **raw trace** means the provider-level execution record kept as evidence of what happened.
-- **derived state** means Glassbox's interpretation of provider activity for product behavior.
-- **event** means a normalized record of something that happened during a Run.
-- **canvas** means the interactive 2D workspace.
-- **canvas object** means something shown on the Canvas because it helps the user understand, edit, inspect, or act on the work.
-- **artifact** means a durable output such as a file, diff, document, image, webpage, dataset, or generated design.
-- **revision** means a saved version of an execution-relevant object or Artifact.
-- **provenance** means the information needed to know where a value came from, who changed it, and when it affected execution.
-- **action** means an explicit command that may change Agent execution or Session state.
-- **inspector** means contextual detail UI for a selected object.
-- **chat** means an optional conversation UI. Chat is not the source of truth for Session or Run state.
-
-Keep these distinctions clear:
+Long-running tasks and evals sit beside normal runs:
 
 ```text
-Session ≠ Run
-Event ≠ Canvas Object
-Artifact ≠ Canvas Object
-Canvas Object ≠ tldraw Shape
-Agent ≠ Avatar
-Canvas ≠ Execution State
-Raw Trace ≠ Derived State
-Edit ≠ Apply
+Personal Agent
+├── Conversation
+├── Memory
+├── Skills
+├── Tools
+├── LongTask Engine
+└── Experiment / Eval Runner
 ```
 
-Avoid using `node` as the default name for Canvas Objects. Use it only when the code is actually dealing with a graph node or a library type that uses that term.
+## Core product rules
 
-## The easiest ways to hurt this project
+### Keep execution inspectable
 
-1. **Turning raw activity into node spam.** Raw provider events belong in Trace. Only materialize objects that help the user understand or act on the work.
+Preserve enough evidence to answer:
 
-2. **Giving layout hidden execution meaning.** Moving, grouping, connecting, resizing, or annotating Canvas Objects must not silently change a running Agent.
+- What did the Agent receive?
+- Which user and Conversation caused the Run?
+- Which Memory, Skill, Tool, Provider, or configuration did it use?
+- What actions did it take?
+- What changed?
+- Which approvals were requested or granted?
+- Which result came from which revision and configuration?
+- If this is an eval sample, which Dataset, Variant, Scorer, and Eval Run produced it?
 
-3. **Rewriting history.** Never overwrite Raw Trace or execution-relevant values in a way that makes an old Run appear to have used a newer Prompt, Plan, Context, Tool Config, Skill, or Artifact revision.
+Raw Trace is evidence. Do not rewrite history to match a newer UI or interpretation.
 
-4. **Making the Canvas the source of truth.** tldraw state is a projection of Glassbox objects and UI state. Core Run, Artifact, Plan, Context, and research state must not depend on tldraw shape records.
+Derived State may evolve as Glassbox learns to interpret traces better.
 
-5. **Designing for imaginary future systems.** Do not add abstractions or product systems that the current plan does not need. Keep parked ideas in project notes until a real task requires them.
+### Edit freely, execute explicitly
 
-## Explicit execution semantics
+Draft edits must not silently affect active execution.
 
-Edit freely. Execute explicitly.
-
-Canvas edits do not change Agent execution by themselves.
-
-Only a named Action may change execution. Examples include:
+Only explicit Actions change execution. Examples:
 
 ```text
 Apply
 Steer
 Approve
 Stop
+Resume
 Add to context
 Remove from context
 Use from next turn
 Run from here
+Start Eval
+Cancel Eval
+Retry Step
 ```
 
-The UI must make the difference between a draft edit and an applied change obvious.
+The UI must clearly distinguish draft, applied, pending, running, completed, failed, cancelled, and waiting states.
 
-If an execution-relevant value changes during a Run, preserve enough information to reconstruct what the Run started with and when the new value took effect.
+### Canvas is a projection
 
-## Preserve evidence
+Canvas layout has no hidden execution meaning.
 
-Keep Raw Trace separate from Derived State.
+Moving, grouping, connecting, resizing, or annotating Canvas Objects must not silently change a running Agent or LongTask.
 
-Raw Trace records what happened. Do not rewrite it to match the current UI model.
+Keep these distinctions clear:
 
-Derived State may change as Glassbox learns to interpret provider activity better.
+```text
+Event ≠ Canvas Object
+Artifact ≠ Canvas Object
+Canvas Object ≠ tldraw Shape
+Canvas ≠ Execution State
+Raw Trace ≠ Derived State
+Edit ≠ Apply
+```
 
-A visible claim about a Run should be traceable to evidence when practical.
+Do not turn every raw event into a Canvas Object.
 
-Measurements and judgments are different. Token counts, tool calls, duration, file changes, and exit codes are measurements. Eval scores, LLM judgments, and human review are judgments. Do not merge them into a fake universal score.
+### Conversation is not Session
 
-## Check every affected path
+External messaging introduces a new durable boundary.
 
-Before calling a change done, check the parts that apply.
+Keep these concepts separate:
 
-- **Entry points.** The same Action may appear in the Canvas, Inspector, Chat, context menu, command palette, or keyboard shortcut.
-- **Execution semantics.** Confirm that layout changes stay harmless and explicit Actions are the only path that changes execution.
-- **Provider behavior.** If a feature depends on a provider capability, define what happens when that provider does not support it.
-- **Contracts.** When cross-boundary state changes, check every producer and consumer.
-- **Persistence and resume.** Decide what survives refresh, reconnect, Session reopen, and runtime restart.
-- **Provenance.** Execution-relevant edits must preserve which revision was used, who changed it, and when it took effect.
-- **Canvas projection.** Verify both Glassbox state and visible tldraw behavior when selection, grouping, restore, or custom shapes matter.
-- **Reverse states.** If something can be opened, applied, approved, stopped, pinned, grouped, or attached, define how the user leaves or reverses that state when reversal makes sense.
-- **Docs.** Update the current plan or stable internal docs when behavior or a settled boundary changes.
+```text
+User
+ChannelIdentity
+Conversation
+Session
+Run
+LongTask
+```
 
-## Dev servers
+A Conversation represents an interaction thread between a user and the Personal Agent.
 
-Document only commands that exist in the current repository.
+A Session represents resumable runtime context.
 
-Before running a command, inspect the repository scripts and tool configuration. Do not invent commands, ports, paths, or environment variables because an old note mentioned them.
+A Run is one concrete execution.
 
-Do not hardcode a localhost origin into client code unless the current architecture requires it and the plan says so.
+A LongTask is a durable task that may span many Runs, waits, retries, checkpoints, and external signals.
 
-Stop only processes you started or processes you verified belong to the current development instance.
+Do not use one identifier to represent all four concepts.
 
-## Test data
+### Channel is only transport
 
-Never use the user's live Glassbox state as writable test state.
+Channel-specific behavior stays in Channel Adapter code.
 
-Use repo-local or otherwise disposable test state.
+Normalize inbound messages before they reach the Agent Core. A useful normalized shape contains concepts such as:
 
-Reading or copying real data for debugging is acceptable when needed. Write to a safe copy.
+```text
+channel
+externalUserId
+externalConversationId
+messageId
+text
+attachments
+metadata
+```
 
-Never point tests, migrations, cleanup jobs, or test Agents at the user's real repositories or live Glassbox data.
+The Personal Agent should not contain QQ, WeChat, Telegram, Discord, or Slack protocol logic.
 
-> Copy in. Never point in. Never write back.
+Private chat, group chat, thread, and sender routing must prevent unrelated users from sharing the same Conversation or Memory accidentally.
 
-Use realistic fixtures when empty state or tiny mocks would hide the behavior being tested.
+### Privacy is enforced by code
 
-## Verifying
+Do not rely on a system prompt to protect private data.
 
-Prove the change with the smallest useful check.
+Memory must support explicit scope. The first useful scopes are:
 
-Behavior changes need focused tests for the behavior that changed.
+```text
+private
+public
+user
+conversation
+```
 
-Runtime changes should test runtime behavior. Canvas changes should test the state projection or interaction that changed.
+Tool access must also have explicit authorization boundaries. External users do not inherit the owner's Gmail, Calendar, GitHub write access, files, secrets, or private Memory simply because they can message the Agent.
 
-Async tests should wait on a real completion signal, event, promise, drain, or state transition. Do not make timing-sensitive tests pass with arbitrary sleeps when a real signal exists.
+Approval and Secret Screening are part of this boundary.
 
-Run browser-level verification when the behavior depends on real tldraw interaction, selection, drag and drop, visual state, or browser APIs.
+When a capability can cause an external side effect, define authorization, approval, retry, and audit behavior before exposing it to remote users.
 
-Do not launch unrelated browsers, simulators, external processes, or broad test suites unless the task needs them.
+## Personal Agent model
 
-For tldraw behavior, test both the underlying Glassbox state and the visible Canvas behavior when both matter.
+Do not create speculative abstractions, but when the current plan requires them, prefer these stable product concepts:
 
-## Delivery cadence
+```text
+Agent
+User
+ChannelIdentity
+Conversation
+Memory
+Skill
+Tool
+Session
+Run
+LongTask
+Experiment
+EvalSuite
+EvalRun
+```
 
-These rules govern the build loop itself. They exist because slices were left uncommitted and roadmap entries went unlogged until the owner intervened.
+Keep Provider quirks out of these generic product objects.
 
-Commit directly to main as soon as a slice passes its verification (tests plus browser checks when they apply). Never accumulate more than one verified slice without a commit.
+Do not make the core model inherit Codex or Claude-specific types when a provider-neutral boundary is actually needed by multiple consumers.
 
-Log the slice to the roadmap before starting the next one: update the Notion roadmap DB row when one exists, otherwise append a dated entry to the Delivery page. Keep roadmap writes append-only.
+At the same time, do not flatten useful Provider behavior merely to make a clean abstraction. Share only concepts the product truly needs.
 
-One ticket, one concern. Before dispatching a browser-verification ticket, verify the server layer with curl or direct API calls first. Keep the slice small enough to finish in one session.
+## Persistence and Turso
 
-Run tickets that will take longer than about 15 minutes detached: background process, a progress file the ticket appends to, and periodic polling. Never block on a foreground wait that a timeout will kill.
+Turso is a planned structured persistence layer for Personal Agent state.
 
-## Pull requests
+Candidate durable records include:
 
-Commit straight to main. Open a Pull Request only when the user asks for one.
+```text
+agents
+users
+channel_identities
+conversations
+messages
+memories
+sessions
+runs
+long_tasks
+jobs
+approvals
+eval_suites
+eval_runs
+eval_samples
+eval_scores
+```
 
-Push only when the user asks. Local commits ahead of the remote are an acceptable resting state between slices.
+Do not move Raw Trace into SQL merely because Turso exists. Raw Trace remains append-only evidence unless a concrete plan requires a different storage strategy.
 
-Keep one main concern per PR.
+Use Turso for business state, indexes, ownership, routing, resumability, and queryable metadata.
 
-Use the repository's existing commit and PR conventions. Do not invent a new convention inside one change.
+Do not give the model unrestricted SQL access to core Agent state. Expose narrow tools such as memory search, remember, update, or forget, and enforce scope before data reaches the model.
 
-For user-visible UI changes, include before and after screenshots when practical. Use a short recording when motion, timing, drag and drop, or multi-step interaction is the point of the change.
+Schema migrations and tests must never point at the user's live database.
 
-Treat automated review findings as claims to verify against the source. Fix the issue when the finding is real. Do not change code just to satisfy a bot comment that does not match the code.
+## Long-running task semantics
 
-## How it works
+LongTask exists for work that cannot safely depend on one process, request, or model context staying alive.
 
-The intended product boundary is:
+When implementing long tasks, think in terms of durable workflow semantics:
+
+```text
+stable task id
+steps
+event history
+checkpoint
+retry policy
+waiting state
+external signal
+child task
+cancellation
+continuation
+```
+
+A process restart must not require replaying irreversible side effects.
+
+Retries require idempotency or explicit deduplication for state-changing operations.
+
+Waiting for a user, approval, webhook, scheduled time, or external condition must be represented as durable state rather than a sleeping in-memory promise.
+
+Long histories may compact into checkpoints and continuations. Compaction may reduce active context, but it must not rewrite prior Run evidence.
+
+When a long task resumes, the system should be able to explain what was completed, what remains, what it is waiting for, and why.
+
+## Eval and experiment semantics
+
+Eval is a product feature, not a loose collection of benchmark scripts.
+
+Users should eventually be able to describe an experiment in natural language. The Agent may prepare an Eval Draft, but execution begins only after an explicit Start Eval action.
+
+Keep these concepts separate:
+
+```text
+Experiment
+EvalSuite
+Dataset
+Target
+Variant
+Scorer
+EvalRun
+EvalSample
+Score
+```
+
+Each Eval Sample should reference the real Run and Raw Trace that produced it whenever practical.
+
+Measurements and judgments are different.
+
+Measurements include token counts, duration, tool calls, file changes, retries, exit codes, and cost.
+
+Judgments include LLM graders, human review, semantic quality, and composite eval decisions.
+
+Do not collapse them into a fake universal score.
+
+Initial eval support should prioritize real needs such as:
+
+```text
+Benchmark
+Differential Eval
+Invariant Eval
+```
+
+Do not create empty abstractions for Fuzz, Simulation, Chaos, or Formal Verification until a current plan requires them.
+
+Invariant checks are especially important for Personal Agent safety, for example:
+
+```text
+never expose private memory to an unauthorized user
+never use another user's user-scoped memory
+never write outside an allowed workspace
+never send a side-effecting message without required approval
+```
+
+## Upstream-first development
+
+`upstream/` contains selected reference implementations copied from mature open-source projects.
+
+Nothing in `upstream/` is imported at runtime.
+
+Before inventing a Provider, Agent Harness, Channel, Eval, trajectory, persistence, or durable-task mechanism, inspect relevant upstream code first.
+
+Current primary references are:
+
+```text
+pingdotgg/t3code
+  Provider integration, Claude Code adapter, permissions, resume
+
+HKUDS/OpenHarness
+  Agent loop, tools, skills, memory, permissions, channels, QQ
+
+joyehuang/trajectory-panel
+  trajectory parsing, timeline UI, incremental tail, redaction, Turso sync
+
+UKGovernmentBEIS/inspect_ai
+  eval tasks, datasets, scorers, eval sets, experiment execution
+
+temporalio/sdk-typescript
+  durable workflows, retry, signal, cancellation, child work, continuation
+
+tursodatabase/turso
+  SQLite-compatible structured state, local database capabilities, vector and MCP references
+```
+
+Vendoring rules:
+
+- Copy only files relevant to a real current problem.
+- Each upstream directory must record source repository, commit SHA, license, original path, and why the file was copied.
+- Preserve required copyright and license notices for copied code.
+- Prefer proven mechanisms over rewrites made only to own the code.
+- Do not copy an upstream abstraction blindly when our product boundary is different.
+- Keep vendored reference code isolated from production imports.
+
+## Current architecture
+
+The implementation today is still primarily Provider-driven:
 
 ```text
 Provider / Agent runtime
         ↓
      Raw Trace
         ↓
-Normalization and interpretation
+Normalization and replay
         ↓
    Derived State
         ↓
-  Canvas Objects
-        ↓
- tldraw projection
+ Canvas / Inspector
 ```
 
-Execution changes travel the other way through explicit Actions:
+Execution changes travel through explicit commands:
 
 ```text
-User or Agent Action
-        ↓
- Glassbox command
-        ↓
- Runtime / Provider
+User Action
+    ↓
+Glassbox command
+    ↓
+Runtime / Provider
 ```
 
-Keep these rules true even if the internal implementation changes:
+Keep the current path correct while introducing Personal Agent concepts incrementally.
 
-- Raw Trace and Derived State are separate.
-- Canvas is not the source of truth for execution.
-- tldraw Shapes are a view of Glassbox objects.
-- Provider quirks stay close to the provider integration.
-- Explicit Actions change execution. Layout does not.
-- Chat is optional UI.
-
-Do not document a layer as implemented until it actually exists.
+Do not document a future layer as implemented before code and tests exist.
 
 ## Where code lives
 
-Follow the current repository structure.
+Follow the actual repository structure, not an old design note.
 
-Do not create directories or shared packages only because an old design note proposed them. Follow the structure that actually exists and change it only when the current task needs a new boundary.
+Current top-level structure includes:
 
-`upstream/` holds reference implementations vendored from mature open-source projects. Each subdirectory names its source project and copied version. It is reference material only: nothing imports it at runtime. When a mature solution exists for a provider, harness, or UI problem, check `upstream/` first and copy the proven approach instead of inventing one.
+```text
+apps/
+  server/
+  web/
 
-Keep provider-specific code near the provider integration.
+packages/
+  contracts/
+  shared/
 
-Keep tldraw-specific code near the Canvas projection and interaction code.
+upstream/
+.plans/
+e2e/
+template/
+```
 
-Put cross-boundary contracts in the smallest existing shared location that needs them.
+`apps/server` owns current Runtime, HTTP, WebSocket, Provider integration, Session lifecycle, Trace, screening, and derived state.
 
-Create a new shared package only when more than one real consumer needs the code and keeping it local would create duplication or a dependency problem.
+`apps/web` owns React, tldraw, Canvas projection, Inspector, and current user interaction.
+
+`packages/contracts` is currently small. Put cross-boundary contracts there only when more than one real producer or consumer needs them.
+
+`packages/shared` should stay boring and small.
+
+Create a new package only when an actual dependency boundary requires it.
+
+Keep Provider-specific code near Provider integration.
+
+Keep Channel-specific code near Channel integration.
+
+Keep tldraw-specific code near Canvas projection and interaction.
+
+Keep Eval orchestration separate from ordinary Agent execution, while linking Eval Samples back to Runs.
+
+Keep LongTask orchestration separate from one Provider Turn.
+
+## Performance
+
+Treat performance regressions as bugs.
+
+Do not project every raw event to Canvas.
+
+Large Sessions, LongTasks, and Eval Runs can produce thousands of events. Avoid broad React rerenders, unbounded DOM growth, huge live payloads, expensive visual effects, and full-history recomputation on every event.
+
+Prefer incremental reducers, indexed persistence, lazy inspection, and explicit pagination or virtualization when real load requires it.
+
+Do not optimize imaginary bottlenecks before measurement.
+
+## Dev servers
+
+Document only commands that exist in the current repository.
+
+Before running a command, inspect package scripts and tool configuration.
+
+Do not hardcode localhost origins or development ports in client code unless the current architecture explicitly requires it.
+
+Stop only processes you started or verified belong to the active development instance.
+
+## Test data and safety
+
+Never use the user's live Glassbox state as writable test state.
+
+Never point tests, migrations, cleanup jobs, evals, fuzzers, chaos tests, or test Agents at the user's real repositories, real Personal Agent database, live channels, or live credentials.
+
+Reading or copying real data for debugging is acceptable when necessary. Write to a safe copy.
+
+> Copy in. Never point in. Never write back.
+
+Use realistic fixtures when tiny mocks would hide the behavior being tested.
+
+Remote-channel tests should use fake adapters unless the plan explicitly requires a real integration test.
+
+Eval tests should use disposable datasets and isolated run state.
+
+LongTask recovery tests should deliberately exercise restart, retry, duplicate delivery, waiting, resume, and cancellation paths when those semantics change.
+
+## Verification
+
+Prove changes with the smallest useful check.
+
+Runtime changes should test runtime behavior.
+
+Persistence changes should test restart and resume behavior when relevant.
+
+Channel changes should test normalization, routing, deduplication, and authorization.
+
+Memory changes should test scope isolation.
+
+LongTask changes should test durable transitions and idempotency.
+
+Eval changes should test Dataset selection, Variant assignment, Scoring, result linkage, and resume behavior where applicable.
+
+Canvas changes should test both Glassbox state and visible tldraw behavior when both matter.
+
+Async tests must wait on real completion signals, events, promises, drains, or state transitions. Do not make timing-sensitive tests pass with arbitrary sleeps when a real signal exists.
+
+Run browser verification only when behavior depends on browser APIs or real interaction.
+
+## Delivery cadence
+
+Commit directly to main as soon as a verified slice is complete unless the user asks for a branch or PR workflow.
+
+Do not accumulate unrelated verified slices into one commit.
+
+One ticket should have one main concern.
+
+Keep each slice small enough that its behavior, tests, and rollback boundary are understandable.
+
+Record current implementation scope in `.plans/`. Product history, future ideas, and research notes should not silently expand an active ticket.
+
+If roadmap logging exists for the current plan, update it before starting the next slice.
+
+## Pull requests
+
+Open a Pull Request only when the user asks for one.
+
+Push only when the user asks.
+
+Keep one main concern per PR.
+
+For user-visible UI changes, include before and after screenshots when practical. Use a short recording when motion, timing, drag and drop, or multi-step interaction is the point.
+
+Treat automated review findings as claims to verify against source code. Fix real problems. Do not change correct code merely to satisfy a mistaken bot comment.
 
 ## Taste
 
 Use the smallest model that solves the current problem.
 
-Do not add abstractions for providers, clients, protocols, research objects, or future product modes that do not exist yet.
-
-Reuse mature code when it already solves the problem well. Do not rebuild standard Chat UI, Canvas behavior, streaming helpers, or provider integration code just to own it.
-
 Prefer explicit state transitions over inferred magic.
 
-Keep provider quirks out of generic product state.
+Do not create speculative frameworks for providers, channels, memory, evals, long tasks, or deployment modes that the current plan does not need.
 
-Keep tldraw quirks out of core Agent and research state.
+Reuse mature upstream code and patterns when they solve the problem well.
 
-A tldraw Shape is a view of a Glassbox object, not the object itself.
+The UI must not lie. A spinner means work is pending. Success means underlying work completed. Waiting means the system has durable knowledge of what it is waiting for. Resume means execution actually resumed from persisted state.
 
-The UI must not lie. A spinner means work is pending. Success means the underlying work finished. A draft edit must not look applied. A disconnected Agent must not look active.
+Avoid `any` when TypeScript can express the boundary. Validate unknown external data when it enters the system.
 
-Prefer inferred TypeScript types when the compiler already knows the type. Avoid `any`. Validate unknown external data when it enters the system.
+Comments should explain intent, constraints, provenance, or non-obvious behavior. Do not narrate obvious code.
 
-Comments should explain intent, constraints, or non-obvious behavior. Do not narrate obvious code.
-
-Keep the Canvas responsive during long Runs.
-
-Do not grow the task while fixing it. Record adjacent work instead.
-
-## Additional tips
-
-Use current project tools and upstream patterns before adding a dependency or service.
-
-Do not pull parked product ideas into the current plan because they sound likely.
-
-Research notes, future ideas, rejected alternatives, and open product questions belong outside this file.
-
-If a rule here becomes wrong because the product changed, update the rule. Do not work around it silently.
+If a rule here becomes wrong because the product changed, update the rule instead of working around it silently.
