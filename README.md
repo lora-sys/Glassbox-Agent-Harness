@@ -1,7 +1,7 @@
 # Glassbox
 
 <p align="center">
-  <img src="./assets/readme/glassbox-hero-lora-visual.svg" width="100%" alt="Glassbox 个人 Agent 工作台：权限先于智能" />
+  <img src="./assets/readme/glassbox-hero.webp" width="100%" alt="Glassbox Personal Agent：把每一次对话变成更好的自己" />
 </p>
 
 Glassbox 是一个正在演进中的 Personal Agent 工作台。
@@ -17,7 +17,7 @@ Glassbox 是一个正在演进中的 Personal Agent 工作台。
 当前唯一 Active Plan：[`Plan 03 — Personal Agent Foundation`](./.plans/03-personal-agent-foundation.md)
 
 <p align="center">
-  <img src="./assets/readme/glassbox-architecture-lora-visual.svg" width="100%" alt="Plan 03 闭环：同一个 Agent，多身份，不越权" />
+  <img src="./assets/readme/glassbox-p3-architecture.webp" width="100%" alt="Plan 03：身份、权限、会话、持久化与执行证据闭环" />
 </p>
 
 这一阶段只做地基：
