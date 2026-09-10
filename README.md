@@ -25,7 +25,7 @@ Glassbox 最终围绕一个长期存在的 Personal Agent 工作：
               │                               │
               │                         GitHub / Web / MCP
               │                               │
-              │                         Codex / Claude Code
+              │                  Codex / Claude Code / AGY
               │
         Long-running Tasks
               │
@@ -49,7 +49,9 @@ Glassbox 最终围绕一个长期存在的 Personal Agent 工作：
 
 微信 Bot、QQ Bot、Workbench 都不是新的 Agent。它们只是不同的入口。不同用户和不同聊天拥有各自的 Conversation 和 User-scoped Memory，但访问的是同一个 Agent 的公开能力和知识。
 
-Codex、Claude Code 和其他 Coding Agent 也不再是产品中心。它们可以继续作为 Provider，也可以逐步变成 Personal Agent 在需要时调用的专业执行能力。
+Codex、Claude Code、AGY 和其他执行 Agent 也不再是产品中心。它们可以继续作为 Provider，也可以逐步变成 Personal Agent 在需要时调用的专业执行能力。
+
+AGY 更适合被视为一个快速 Worker。Personal Agent 可以把 Research、Review、Scoped Implementation、Second Opinion 等工作委派给 AGY，再把结果和执行轨迹收回 Glassbox。AGY 的 Job 生命周期可以映射到我们的 Delegated Task 或 LongTask 子任务，但 AGY 特有命令不应该泄漏进核心任务模型。
 
 ## 为什么做这个
 
@@ -86,6 +88,8 @@ Glassbox 要解决的是这些问题，而不是再做一个聊天壳。
 
 这些能力会继续保留，但它们以后服务的是更大的 Personal Agent Runtime。
 
+AGY、微信、QQ、Turso、LongTask Engine 和 Eval Runner 目前属于目标能力，不要把它们写成已经实现。
+
 ## 下一阶段的核心模型
 
 我们会优先围绕下面这些对象扩展，而不是继续增加 Canvas Shape 或 Provider 数量。
@@ -113,6 +117,7 @@ Channel ≠ Agent
 Conversation ≠ Session
 Session ≠ Run
 LongTask ≠ Run
+Provider / Worker ≠ Personal Agent
 Event ≠ Canvas Object
 Canvas ≠ Execution State
 Raw Trace ≠ Derived State
@@ -218,6 +223,8 @@ LongTask
 
 长历史需要通过 Checkpoint 和 Continuation 压缩执行上下文，但旧 Trace 和旧 Run 不能被重写。
 
+外部 Worker 也可以成为 LongTask 的一个 Step 或 Child Task。例如主 Agent 可以把 Research 或 Review 委派给 AGY。后台 Worker 的等待超时不能等同于任务失败，Worker 仍在执行时应该保留可查询状态，并支持显式 Observe、Cancel、Continue 或 Restart。
+
 ## Eval 和实验工作台
 
 Eval 会作为 Glassbox 的实验能力，而不是一个独立脚本目录。
@@ -227,7 +234,7 @@ Eval 会作为 Glassbox 的实验能力，而不是一个独立脚本目录。
 ```text
 测一下当前 Agent 的 GitHub repo 分析能力。
 用 100 条任务。
-比较当前版本、Codex 和 Claude Code。
+比较当前版本、Codex、Claude Code 和 AGY worker。
 每个样本跑 3 次。
 检查任务成功率、工具使用、成本、延迟和隐私 invariant。
 ```
@@ -247,7 +254,7 @@ Experiment
 第一阶段优先做三类：
 
 - Benchmark：固定任务集验证能力
-- Differential Eval：同一任务集比较不同 Agent、Model 或配置
+- Differential Eval：同一任务集比较不同 Agent、Model、Worker 或配置
 - Invariant Eval：检查权限、Memory、Tool 和 Runtime 性质是否始终成立
 
 每一个 Eval Sample 都应该链接到真实 Run 和 Raw Trace。失败样本可以直接进入 Timeline、Canvas 或 Raw Trace 查看证据。
@@ -283,10 +290,13 @@ Canvas 适合表达 Plan、Artifact、Diff、Source、Decision、Result 和长�
 | --- | --- |
 | `pingdotgg/t3code` | Claude Code Provider、权限、Session Resume、Provider Integration |
 | `HKUDS/OpenHarness` | Agent Loop、Tools、Skills、Memory、Permission、Channel Gateway、QQ Channel |
+| `keli-wen/agy-staff` | AGY Worker Delegation、Persona、Background Job、Wait、Observe、Cancel、Continue、Restart |
 | `joyehuang/trajectory-panel` | JSONL Trajectory、Timeline、增量 Tail、Redaction、Turso Sync |
 | `UKGovernmentBEIS/inspect_ai` | Eval Task、Dataset、Scorer、Eval Set、Experiment Runner、Agent Evaluation |
 | `temporalio/sdk-typescript` | Durable Long Task、Signal、Retry、Child Task、Cancellation、Continue As New |
 | `tursodatabase/turso` | SQLite-compatible Agent State Storage、Vector、MCP 和数据库能力参考 |
+
+`agy-staff` 当前参考点固定到 `67d3fd8fdc04b57006a829ae376ae7ffdc7ee714`。它采用 MIT License。优先研究它如何让 Claude Code、Codex 和 Pi 把任务委派给 AGY，以及如何管理长时间后台 Job。AGY 应该通过 Adapter、Skill 或 Worker abstraction 接入，不要成为 Personal Agent Core 的硬依赖。
 
 Vendoring 规则：
 
@@ -316,7 +326,7 @@ Normalization / Replay
  Canvas / Inspector
 ```
 
-目标架构在它前面增加 Personal Agent 和 Conversation，在它旁边增加 Long Task 和 Eval：
+目标架构在它前面增加 Personal Agent 和 Conversation，在它旁边增加 Long Task 和 Eval，并允许主 Agent 委派给专业 Worker：
 
 ```text
 Channel / Workbench
@@ -328,6 +338,8 @@ Identity + Conversation
    Personal Agent
         │
         ├── Skill / Tool / Provider
+        ├── Worker Delegation
+        │      └── AGY / Codex / Claude Code / others
         ├── LongTask Engine
         └── Eval Runner
         │
@@ -406,7 +418,8 @@ template/
 
 - Runtime 和数据模型优先于视图
 - Channel 只是入口，不要把渠道协议泄漏到 Agent Core
-- Provider 的特殊行为留在 Provider Integration
+- Provider 和 Worker 的特殊行为留在各自 Integration 层
+- AGY 等 Worker 通过通用委派边界接入，不把专有命令写进核心状态机
 - tldraw 的特殊行为留在 Projection 和 Rendering
 - Raw Trace 不重写
 - UI 不能显示假的进度或过期状态
@@ -432,6 +445,6 @@ template/
 
 Glassbox 还很早。
 
-现有 Coding Agent Harness 已经证明 Trace、Provider、Approval、Derived State 和 Canvas 闭环可以工作。下一阶段会把重心转向 Personal Agent Runtime、Conversation、Memory、Turso 持久化、聊天渠道、长程任务和 Eval。
+现有 Coding Agent Harness 已经证明 Trace、Provider、Approval、Derived State 和 Canvas 闭环可以工作。下一阶段会把重心转向 Personal Agent Runtime、Conversation、Memory、Turso 持久化、聊天渠道、Worker Delegation、长程任务和 Eval。
 
 不要为了未来版本提前把所有系统一次做完。先完成一个真实闭环，再用真实使用和 Eval 决定下一步。
