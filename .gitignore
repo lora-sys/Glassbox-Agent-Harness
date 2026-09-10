@@ -4,9 +4,18 @@ node_modules/
 .pnp.*
 .npm
 
-# Build outputs
+# Build outputs and tool caches
 dist/
 *.tsbuildinfo
+.vite/
+.cache/
+coverage/
+
+# Test artifacts
+test-results/
+playwright-report/
+blob-report/
+.playwright-mcp/
 
 # Glassbox-specific
 .glassbox/
