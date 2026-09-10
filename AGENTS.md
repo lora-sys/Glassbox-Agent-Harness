@@ -1,149 +1,334 @@
 # Glassbox
 
-Glassbox is evolving from a canvas-native coding-agent research workbench into a Personal Agent workbench with inspectable execution, long-running tasks, external chat channels, memory, evals, and delegated workers.
+Glassbox is evolving from a canvas-native coding-agent research workbench into a Personal Agent workbench with inspectable execution, strict authorization, long-running tasks, external chat channels, memory, skill evolution, assets, evals, and delegated workers.
 
-The current repository still implements the earlier coding-agent workbench. Do not pretend future systems already exist. Preserve working behavior while moving the product toward the newer architecture in small verified slices.
+The current repository still implements the earlier coding-agent workbench. Do not pretend future systems already exist. Preserve working behavior while moving toward the newer architecture in small verified slices.
 
 ## Product boundary
 
 The long-term product has one durable Personal Agent.
 
-Workbench, WeChat, QQ, and other chat integrations are entry points to that Agent. They are not separate agents.
+Workbench, WeChat, QQ, email, and other integrations are entry points. They are not separate agents.
 
-Codex, Claude Code, OpenHarness, AGY, and other runtimes or workers may be connected providers or specialized execution capabilities. They are not the product identity.
+Codex, Claude Code, OpenHarness, AGY, and similar systems are providers, workers, or specialized execution capabilities. They are not the product identity.
 
-Canvas is a useful workspace and inspection view, but it is not the entire product and it is not the source of truth for execution.
+Canvas is a workspace and inspection view. It is not execution state and it is not the whole product.
 
-The intended direction is:
+The target direction is:
 
 ```text
 Channel / Workbench
         ↓
-Identity + Conversation
+Identity Resolution
         ↓
-   Personal Agent
+Authorization
         ↓
- Skill / Tool / Provider / Worker
+Conversation + Personal Agent
+        ↓
+Skill / Tool / Provider / Worker / LongTask / Eval
         ↓
        Run
         ↓
  Raw Trace + Derived State
         ↓
+Experience Mining
+        ↓
+Memory / Skills / Assets / Journal
+        ↓
 Timeline / Canvas / Inspector
 ```
 
-Long-running tasks and evals sit beside normal runs:
+## P0 rule: authorization comes before intelligence
+
+The Personal Agent must not cross permission boundaries.
+
+Do not rely on model behavior, system prompts, UI hiding, or upstream provider permissions to protect private resources.
+
+Authorization is a server-side product invariant.
+
+Every protected operation should be reducible to:
 
 ```text
-Personal Agent
-├── Conversation
-├── Memory
-├── Skills
-├── Tools
-├── Worker Delegation
-├── LongTask Engine
-└── Experiment / Eval Runner
+Principal
+Resource
+Action
+Context
 ```
 
-## Core product rules
+The decision is one of:
 
-### Keep execution inspectable
+```text
+ALLOW
+DENY
+REQUIRES_APPROVAL
+```
+
+Default to `DENY` when no explicit rule grants access.
+
+### Resolve the principal first
+
+Before assembling private context or running a protected Tool, resolve who is acting.
+
+A Principal may represent:
+
+```text
+Owner
+TrustedUser
+Member
+Visitor
+Public
+Worker
+Service
+```
+
+Roles are useful defaults, not the complete authorization model.
+
+A remote channel identifier is not itself a permission grant. Identity binding and resource authorization are separate operations.
+
+Do not let a message from WeChat, QQ, email, web content, or a Worker inherit Owner privileges merely because the Personal Agent has those privileges in another context.
+
+### Authorize before context assembly
+
+Unauthorized data must never be inserted into the model context and then hidden by instruction.
+
+Required order:
+
+```text
+Incoming request
+      ↓
+Resolve Principal
+      ↓
+Authorization Check
+      ↓
+Authorized Context Builder
+      ↓
+Model / Agent Runtime
+```
+
+This applies to:
+
+```text
+Memory
+Assets
+Projects
+Files
+Mail
+Calendar
+Conversation history
+Tool results
+Worker results
+Secrets
+Eval data
+Journal entries
+```
+
+If Bob cannot read the owner's private calendar, the calendar data must not reach the prompt, retrieval result, Tool result, Worker task, or model-visible trace payload for Bob's request.
+
+### Authorize every side effect
+
+Protected Tools must check authorization at execution time, not only when displayed or selected.
+
+Examples:
+
+```text
+read public asset         ALLOW
+search web                ALLOW
+read private calendar     DENY
+send owner email          REQUIRES_APPROVAL
+write production repo     REQUIRES_APPROVAL
+```
+
+A stale UI grant or old Conversation state must not bypass a current authorization decision.
+
+When authorization changes during a LongTask, future Steps use the new grant. Prior evidence remains unchanged.
+
+### No confused deputy
+
+Treat external content as untrusted input.
+
+A public user, inbound email, webpage, document, MCP result, or delegated Worker output must not be able to instruct the Personal Agent to exercise Owner-only authority on its behalf.
+
+The caller's effective authority bounds the operation even when the Agent itself has broader Owner capabilities in another context.
+
+### Delegation can only reduce authority
+
+Workers receive a bounded delegation grant.
+
+```text
+worker_permissions ⊆ delegated_permissions ⊆ caller_permissions
+```
+
+AGY, Codex, Claude Code, or another Worker must not gain access merely because its upstream harness defaults to unrestricted execution.
+
+Do not pass private Memory, secrets, files, Mail, Calendar, or credentials to a Worker unless the delegation grant explicitly allows them for the current task.
+
+A Worker cannot grant itself more permissions.
+
+### Approval is not permission replacement
+
+Authorization and approval are different.
+
+A user without permission cannot become authorized by producing an approval-shaped message.
+
+Use approval only when the Principal already has a policy path that says the Action is allowed after approval.
+
+Preserve who requested the Action, who approved it, what exact Resource and Action were approved, and which Run or LongTask consumed the approval.
+
+### Authorization is evidence
+
+Important decisions should produce auditable records such as:
+
+```text
+AuthorizationDecision
+  principal
+  resource
+  action
+  policy
+  decision
+  reason
+  approvalId
+  conversationId
+  runId
+  timestamp
+```
+
+Do not leak protected Resource contents into a denial log.
+
+Authorization Trace should let the Owner answer:
+
+- Who asked for this?
+- Which resource was targeted?
+- Which action was requested?
+- Why was it allowed, denied, or sent for approval?
+- Which Run or Worker used the grant?
+
+### Resource-level authorization
+
+Do not model the product as only `admin / user / guest`.
+
+Authorization must be able to differ per Resource and Action.
+
+Examples:
+
+```text
+Memory #123
+  owner: lora
+  visibility: private
+
+Asset #456
+  visibility: public
+
+Project #789
+  viewer: alice
+
+Tool github-read
+  allowed: trusted
+
+Tool github-write
+  allowed: owner
+  approval: required
+```
+
+Use relation-based fine-grained authorization ideas from `openfga/openfga` as the main upstream reference. Keep the Glassbox domain model independent so replacing the policy engine remains possible.
+
+## Core product concepts
+
+When a current plan needs them, prefer these distinctions:
+
+```text
+Agent
+User
+Principal
+ChannelIdentity
+Relationship
+Permission
+Conversation
+Memory
+Skill
+Asset
+Tool
+Session
+Run
+WorkerJob
+LongTask
+JournalEntry
+Experiment
+EvalSuite
+EvalRun
+```
+
+Keep these differences explicit:
+
+```text
+Channel ≠ Agent
+Conversation ≠ Session
+Session ≠ Run
+LongTask ≠ Run
+WorkerJob ≠ LongTask
+Provider / Worker ≠ Personal Agent
+Event ≠ Canvas Object
+Asset ≠ Canvas Object
+Canvas ≠ Execution State
+Raw Trace ≠ Derived State
+Edit ≠ Apply
+Permission ≠ Approval
+Identity ≠ Authorization
+```
+
+Do not reuse one identifier for multiple concepts just because the first implementation is local or single-user.
+
+## Inspectable execution
 
 Preserve enough evidence to answer:
 
 - What did the Agent receive?
-- Which user and Conversation caused the Run?
-- Which Memory, Skill, Tool, Provider, Worker, or configuration did it use?
-- What work was delegated and to which Worker?
-- What actions did it take?
+- Which Principal and Conversation caused the Run?
+- Which authorized Memory, Skill, Asset, Tool, Provider, or Worker did it use?
+- What was delegated?
 - What changed?
-- Which approvals were requested or granted?
+- Which permission checks happened?
+- Which approvals were used?
 - Which result came from which revision and configuration?
-- If this is an eval sample, which Dataset, Variant, Scorer, and Eval Run produced it?
+- Which Eval Sample produced a judgment?
 
-Raw Trace is evidence. Do not rewrite history to match a newer UI or interpretation.
+Raw Trace is evidence. Do not rewrite it to match newer UI interpretations.
 
-Derived State may evolve as Glassbox learns to interpret traces better.
+Derived State may evolve.
 
-### Edit freely, execute explicitly
+## Explicit execution semantics
 
-Draft edits must not silently affect active execution.
+Edit freely. Execute explicitly.
 
-Only explicit Actions change execution. Examples:
+Only named Actions change execution or authorization state.
+
+Examples:
 
 ```text
 Apply
 Steer
 Approve
+Grant
+Revoke
 Stop
 Resume
-Add to context
-Remove from context
-Use from next turn
-Run from here
 Delegate
 Cancel Worker
 Continue Worker
 Start Eval
 Cancel Eval
 Retry Step
+Promote Memory
+Promote Skill
+Promote Asset
 ```
 
-The UI must clearly distinguish draft, applied, pending, running, completed, failed, cancelled, waiting, and delegated states.
+Moving a Canvas Object must never grant access, approve a side effect, or alter a running Agent.
 
-### Canvas is a projection
+## Channel rules
 
-Canvas layout has no hidden execution meaning.
+Channel-specific protocol behavior belongs in Channel Adapter code.
 
-Moving, grouping, connecting, resizing, or annotating Canvas Objects must not silently change a running Agent, Worker, or LongTask.
-
-Keep these distinctions clear:
-
-```text
-Event ≠ Canvas Object
-Artifact ≠ Canvas Object
-Canvas Object ≠ tldraw Shape
-Canvas ≠ Execution State
-Raw Trace ≠ Derived State
-Edit ≠ Apply
-Provider / Worker ≠ Personal Agent
-```
-
-Do not turn every raw event into a Canvas Object.
-
-### Conversation is not Session
-
-External messaging introduces a new durable boundary.
-
-Keep these concepts separate:
-
-```text
-User
-ChannelIdentity
-Conversation
-Session
-Run
-LongTask
-WorkerJob
-```
-
-A Conversation represents an interaction thread between a user and the Personal Agent.
-
-A Session represents resumable runtime context.
-
-A Run is one concrete execution.
-
-A LongTask is a durable task that may span many Runs, waits, retries, checkpoints, external signals, and delegated Worker jobs.
-
-A WorkerJob is one delegated execution owned by a Provider or Worker backend such as AGY.
-
-Do not use one identifier to represent these concepts.
-
-### Channel is only transport
-
-Channel-specific behavior stays in Channel Adapter code.
-
-Normalize inbound messages before they reach the Agent Core. A useful normalized shape contains concepts such as:
+Normalize inbound messages before the Agent Core:
 
 ```text
 channel
@@ -155,15 +340,25 @@ attachments
 metadata
 ```
 
-The Personal Agent should not contain QQ, WeChat, Telegram, Discord, or Slack protocol logic.
+Private chat, group chat, thread, and sender routing must isolate unrelated users.
 
-Private chat, group chat, thread, and sender routing must prevent unrelated users from sharing the same Conversation or Memory accidentally.
+ChannelIdentity lookup happens before authorization.
 
-### Privacy is enforced by code
+A new channel binding must not silently merge two users or inherit privileges from an existing identity without an explicit trusted binding flow.
 
-Do not rely on a system prompt to protect private data.
+## Memory rules
 
-Memory must support explicit scope. The first useful scopes are:
+Memory is not raw Conversation history.
+
+Support distinct memory kinds:
+
+```text
+Semantic
+Episodic
+Procedural
+```
+
+Support explicit scopes such as:
 
 ```text
 private
@@ -172,49 +367,220 @@ user
 conversation
 ```
 
-Tool and Worker access must also have explicit authorization boundaries. External users do not inherit the owner's Gmail, Calendar, GitHub write access, files, secrets, private Memory, or unrestricted Worker permissions simply because they can message the Agent.
+Memory scope is an authorization input, not a prompt label.
 
-Approval and Secret Screening are part of this boundary.
-
-When a capability can cause an external side effect, define authorization, approval, retry, and audit behavior before exposing it to remote users.
-
-## Personal Agent model
-
-Do not create speculative abstractions, but when the current plan requires them, prefer these stable product concepts:
+Every durable Memory should preserve provenance when practical:
 
 ```text
-Agent
-User
-ChannelIdentity
-Conversation
-Memory
-Skill
-Tool
-Session
-Run
-WorkerJob
-LongTask
-Experiment
-EvalSuite
-EvalRun
+conversationId
+messageId
+runId
+traceEventId
+source
+confidence
+createdAt
+updatedAt
 ```
 
-Keep Provider and Worker quirks out of these generic product objects.
+### Memory promotion
 
-Do not make the core model inherit Codex, Claude, or AGY-specific types when a provider-neutral boundary is actually needed by multiple consumers.
+Do not persist everything forever.
 
-At the same time, do not flatten useful Provider or Worker behavior merely to make a clean abstraction. Share only concepts the product truly needs.
+Memory Candidates should be scored, consolidated, deduplicated, and checked for contradictions before promotion.
+
+Useful value factors include:
+
+```text
+futureUtility
+goalRelevance
+userRelevance
+reliability
+reuseCount
+successfulReuse
+novelty
+recency
+```
+
+Useful penalties include:
+
+```text
+contradictionRisk
+staleness
+privacyRisk
+duplication
+```
+
+Use `zhibao-dev/Learning-Multi-Factor-Memory` for memory-value and forgetting ideas.
+
+Use `langchain-ai/langmem` for semantic, episodic, procedural memory and hot-path versus background consolidation patterns.
+
+Do not copy a Memory from one Principal's scope into another scope during consolidation without an explicit authorized transition.
+
+## Skill evolution rules
+
+A successful Run is evidence for a Skill Candidate. It is not sufficient for automatic permanent promotion.
+
+The preferred flow is:
+
+```text
+successful Runs
+      ↓
+Skill Candidate
+      ↓
+Deduplicate / Merge
+      ↓
+Extract Preconditions / Procedure / Failure Modes
+      ↓
+Generate Eval Cases
+      ↓
+Verify
+      ↓
+Validated Skill
+```
+
+Use `AMAP-ML/SkillClaw` for session-driven evolution and deduplication ideas.
+
+Use `Zhang-Henry/CoEvoSkills` for generate, verify, refine, candidate, and validated promotion semantics.
+
+Use `MineDojo/Voyager` for reusable skill library and retrieval patterns.
+
+A promoted Skill should preserve source Runs, version history, validation evidence, successful reuse count, and recent failures.
+
+Skill execution is still authorization-bound. A public Skill does not automatically make all underlying Tools public.
+
+## Learning and asset loop
+
+Experience mining may propose Memory, Skill, Asset, or Journal candidates from real work.
+
+```text
+Conversation / Tool / LongTask / Arena / Eval
+        ↓
+      Raw Trace
+        ↓
+ Experience Mining
+        ↓
+Memory Candidate / Skill Candidate / Asset Candidate
+        ↓
+Value + Authorization + Dedup
+        ↓
+Eval / Verification when needed
+        ↓
+Promote
+```
+
+Automatic learning must never widen visibility or capability.
+
+A private source produces a private candidate by default.
+
+Promotion from private to public requires an explicit policy path and, where appropriate, Owner approval.
+
+## Asset rules
+
+An Asset is a durable produced object, not merely a file attachment.
+
+Examples:
+
+```text
+Report
+Research
+Dataset
+Prompt
+Template
+Code
+Image
+Presentation
+Workflow
+EvalSet
+Journal
+MonthlyReview
+Decision
+Playbook
+```
+
+Assets should support ownership, visibility, versioning, lineage, and provenance.
+
+Useful fields include:
+
+```text
+id
+kind
+name
+owner
+visibility
+version
+contentHash
+producedByRun
+derivedFrom
+tags
+metadata
+evalStatus
+createdAt
+updatedAt
+```
+
+Use `dagster-io/dagster` for asset lineage, dependency, version, ownership, and materialization ideas.
+
+Do not assume that an Asset derived from public and private inputs can be public. Derivation must re-evaluate visibility and leakage risk.
+
+## Journal and review rules
+
+The Agent may produce a Daily Journal and periodic reviews as explicit Runs.
+
+Journal is not private chain-of-thought storage.
+
+A Journal Entry is a user-readable reflection artifact based on evidence such as Runs, decisions, failures, open loops, Memory changes, Skill changes, Assets, and Eval results.
+
+Monthly Review can aggregate Daily Journals and system metrics.
+
+Any claim shown in a review should link back to supporting Runs, Eval Samples, Assets, or Trace when practical.
+
+Use `joonspk-research/generative_agents` for reflection patterns and `usememos/memos` for timeline-oriented journal UX ideas.
+
+Journal visibility follows authorization rules. Do not publish private reflection content through public channels by default.
+
+## Mail and Calendar rules
+
+Mail and Calendar are planned native domains, not unrestricted generic MCP access.
+
+Candidate Mail objects:
+
+```text
+MailAccount
+MailThread
+MailMessage
+MailContact
+Draft
+```
+
+Candidate Calendar objects:
+
+```text
+Calendar
+CalendarEvent
+Availability
+Reminder
+Invite
+```
+
+Use `resend/resend-skills` for Resend-based agent inbox patterns, especially webhook verification, sender allowlists, sandboxing, and human approval.
+
+Use `calcom/cal.diy` for scheduling, availability, and conflict-resolution references.
+
+Inbound Mail is untrusted input.
+
+Mail and Calendar are private resources by default.
+
+Remote users need explicit grants for every exposed read or write capability.
 
 ## Worker delegation and AGY
 
 AGY is a specialized Worker candidate, not a second Personal Agent.
 
-The main Agent may delegate bounded work such as research, review, second opinions, or scoped implementation to AGY while retaining ownership of the user Conversation, permissions, final answer, and durable task state.
+The Personal Agent retains ownership of the user Conversation, authorization, durable task state, and final response.
 
-Keep the generic delegation boundary small. Useful concepts include:
+Generic Worker concepts may include:
 
 ```text
-delegate
 workerJobId
 parentRunId
 parentLongTaskId
@@ -227,58 +593,25 @@ continue
 restart
 ```
 
-Do not expose AGY-specific slash commands or CLI flags as core product semantics. Translate them inside an AGY Adapter, Skill, or Worker integration.
+Keep AGY-specific CLI and command semantics inside its integration boundary.
 
-Every delegated Worker job should have a stable identifier and should be traceable to its parent Run or LongTask.
+Every Worker Job must have stable identity and parent linkage.
 
-A wait timeout is not automatically a Worker failure. If a Worker keeps running after the caller stops waiting, persist that state and allow later observation or result collection.
+A wait timeout is not automatically a Worker failure.
 
-Worker result collection must be idempotent where practical. Reconnecting or retrying a result fetch must not duplicate downstream side effects.
+Worker result collection should be idempotent where practical.
 
-Cancellation, continuation, and restart are different operations. Preserve the distinction in state and trace.
+Cancellation, continuation, and restart are different state transitions.
 
-If a Worker modifies files or performs external side effects, Glassbox authorization rules still apply. Do not trust an upstream Worker's unrestricted default merely because its own harness allows it.
+Worker permission enforcement always follows Glassbox rules, even when the Worker itself runs unrestricted by default.
 
-When AGY is used as a fast second model, keep enough provenance to compare its result with Codex, Claude Code, or the Personal Agent in Eval.
+Use `keli-wen/agy-staff` as the primary AGY delegation reference. Current reference commit: `67d3fd8fdc04b57006a829ae376ae7ffdc7ee714`.
 
-## Persistence and Turso
-
-Turso is a planned structured persistence layer for Personal Agent state.
-
-Candidate durable records include:
-
-```text
-agents
-users
-channel_identities
-conversations
-messages
-memories
-sessions
-runs
-worker_jobs
-long_tasks
-jobs
-approvals
-eval_suites
-eval_runs
-eval_samples
-eval_scores
-```
-
-Do not move Raw Trace into SQL merely because Turso exists. Raw Trace remains append-only evidence unless a concrete plan requires a different storage strategy.
-
-Use Turso for business state, indexes, ownership, routing, resumability, and queryable metadata.
-
-Do not give the model unrestricted SQL access to core Agent state. Expose narrow tools such as memory search, remember, update, or forget, and enforce scope before data reaches the model.
-
-Schema migrations and tests must never point at the user's live database.
-
-## Long-running task semantics
+## Long-running task rules
 
 LongTask exists for work that cannot safely depend on one process, request, model context, or Worker wait staying alive.
 
-When implementing long tasks, think in terms of durable workflow semantics:
+Use durable workflow semantics:
 
 ```text
 stable task id
@@ -298,17 +631,17 @@ A process restart must not require replaying irreversible side effects.
 
 Retries require idempotency or explicit deduplication for state-changing operations.
 
-Waiting for a user, approval, webhook, scheduled time, external condition, or Worker result must be represented as durable state rather than a sleeping in-memory promise.
+Waiting for a user, approval, webhook, scheduled time, external condition, or Worker result must be durable state.
 
-Long histories may compact into checkpoints and continuations. Compaction may reduce active context, but it must not rewrite prior Run evidence.
+Compaction can reduce active context but must not rewrite old Run evidence.
 
-When a long task resumes, the system should be able to explain what was completed, what remains, what Worker jobs are still active, what it is waiting for, and why.
+Use `temporalio/sdk-typescript` as the main durable execution reference.
 
-## Eval and experiment semantics
+## Eval and experiment rules
 
-Eval is a product feature, not a loose collection of benchmark scripts.
+Eval is a product feature, not loose benchmark scripts.
 
-Users should eventually be able to describe an experiment in natural language. The Agent may prepare an Eval Draft, but execution begins only after an explicit Start Eval action.
+The Agent may prepare an Eval Draft from natural language, but execution begins only after explicit Start Eval.
 
 Keep these concepts separate:
 
@@ -324,17 +657,9 @@ EvalSample
 Score
 ```
 
-Each Eval Sample should reference the real Run and Raw Trace that produced it whenever practical.
+Each Eval Sample should reference the real Run and Raw Trace that produced it when practical.
 
-Measurements and judgments are different.
-
-Measurements include token counts, duration, tool calls, file changes, retries, Worker jobs, exit codes, and cost.
-
-Judgments include LLM graders, human review, semantic quality, and composite eval decisions.
-
-Do not collapse them into a fake universal score.
-
-Initial eval support should prioritize real needs such as:
+Initial priorities:
 
 ```text
 Benchmark
@@ -342,29 +667,112 @@ Differential Eval
 Invariant Eval
 ```
 
-Differential Eval may compare Personal Agent versions, model providers, Coding Agents, or delegated Workers such as AGY when the same task boundary can be applied fairly.
-
-Do not create empty abstractions for Fuzz, Simulation, Chaos, or Formal Verification until a current plan requires them.
-
-Invariant checks are especially important for Personal Agent safety, for example:
+Permission invariants are P0:
 
 ```text
-never expose private memory to an unauthorized user
+never expose private memory to unauthorized users
 never use another user's user-scoped memory
-never write outside an allowed workspace
-never send a side-effecting message without required approval
-never let a delegated worker escape the permissions assigned by Glassbox
+never expose private assets through public channels
+never execute a tool beyond the caller's grant
+never let a Worker escalate delegated permissions
+never perform approval-required side effects without approval
+never turn untrusted content into Owner authority
 ```
+
+Use `UKGovernmentBEIS/inspect_ai` as the primary eval reference.
+
+Measurements and judgments are different. Do not collapse them into one fake universal score.
+
+## Arena rules
+
+Arena may host multi-agent games, cooperation, adversarial play, and social simulations.
+
+Every Arena Match is still subject to authorization.
+
+An opponent, public user, game environment, or other Agent must not gain access to private Memory, Tools, Mail, Calendar, Assets, or secrets through the game loop.
+
+Use `google-deepmind/open_spiel` for multi-player game environment patterns.
+
+Use `sotopia-lab/sotopia` for language-agent social environments and social evaluation.
+
+Arena Runs may feed Episodic Memory or Skill Candidates, but promotion still requires the normal learning gates.
+
+## Persistence and Turso
+
+Turso is a planned structured persistence layer for Personal Agent business state.
+
+Candidate records include:
+
+```text
+agents
+users
+channel_identities
+relationships
+permissions
+conversations
+messages
+memories
+memory_evidence
+skills
+skill_versions
+assets
+asset_versions
+sessions
+runs
+worker_jobs
+long_tasks
+jobs
+approvals
+journal_entries
+eval_suites
+eval_runs
+eval_samples
+eval_scores
+```
+
+Do not move Raw Trace into SQL merely because Turso exists.
+
+Use Turso for business state, ownership, relationships, authorization data, routing, resumability, indexes, and queryable metadata.
+
+Do not give the model unrestricted SQL access to core state.
+
+Expose narrow Domain Tools and authorize them before access.
+
+Schema migrations and tests must never point to the user's live database.
+
+## Canvas rules
+
+Canvas remains useful but is a projection.
+
+Moving, grouping, connecting, resizing, or annotating objects must not silently change execution or authorization.
+
+Do not turn every raw event into a Canvas Object.
+
+Possible product views include:
+
+```text
+Conversation
+Project
+Timeline
+Canvas
+Trace
+Experiment
+Memory
+Skills
+Assets
+Journal
+Permissions
+```
+
+Keep tldraw-specific behavior in web projection and interaction code.
 
 ## Upstream-first development
 
-`upstream/` contains selected reference implementations copied from mature open-source projects.
+`upstream/` contains selected reference implementations. Nothing there is imported at runtime.
 
-Nothing in `upstream/` is imported at runtime.
+Before inventing a standard mechanism, inspect the relevant upstream first.
 
-Before inventing a Provider, Agent Harness, Worker delegation protocol, Channel, Eval, trajectory, persistence, or durable-task mechanism, inspect relevant upstream code first.
-
-Current primary references are:
+Current primary references:
 
 ```text
 pingdotgg/t3code
@@ -374,90 +782,72 @@ HKUDS/OpenHarness
   Agent loop, tools, skills, memory, permissions, channels, QQ
 
 keli-wen/agy-staff
-  AGY worker delegation, personas, background jobs, wait, observe, result, cancel, continue, restart
-  reference commit: 67d3fd8fdc04b57006a829ae376ae7ffdc7ee714
-  license: MIT
+  AGY delegation and background Worker jobs
 
 joyehuang/trajectory-panel
-  trajectory parsing, timeline UI, incremental tail, redaction, Turso sync
+  trajectory parsing, timeline, incremental tail, redaction, Turso sync
 
 UKGovernmentBEIS/inspect_ai
-  eval tasks, datasets, scorers, eval sets, experiment execution
+  eval tasks, datasets, scorers, experiment execution
 
 temporalio/sdk-typescript
-  durable workflows, retry, signal, cancellation, child work, continuation
+  durable workflows, retry, signal, cancellation, continuation
 
 tursodatabase/turso
-  SQLite-compatible structured state, local database capabilities, vector and MCP references
+  structured agent state and SQLite-compatible persistence
+
+openfga/openfga
+  relation-based fine-grained authorization
+
+zhibao-dev/Learning-Multi-Factor-Memory
+  memory value, forgetting, hygiene
+
+langchain-ai/langmem
+  semantic, episodic, procedural memory and consolidation
+
+AMAP-ML/SkillClaw
+  session-driven skill evolution and deduplication
+
+Zhang-Henry/CoEvoSkills
+  generated skill verification and validated promotion
+
+MineDojo/Voyager
+  reusable skill library and retrieval
+
+joonspk-research/generative_agents
+  importance, memory stream, reflection
+
+usememos/memos
+  journal timeline and selective visibility UX
+
+resend/resend-skills
+  agent email inbox and inbound email security
+
+calcom/cal.diy
+  scheduling and availability
+
+dagster-io/dagster
+  assets, lineage, ownership, dependencies
+
+google-deepmind/open_spiel
+  multi-player game environments
+
+sotopia-lab/sotopia
+  social multi-agent environments
 ```
 
 Vendoring rules:
 
-- Copy only files relevant to a real current problem.
-- Each upstream directory must record source repository, commit SHA, license, original path, and why the file was copied.
-- Preserve required copyright and license notices for copied code.
+- Copy only files relevant to a current problem.
+- Record source repository, commit SHA, license, original path, and reason for each copied file.
+- Preserve required copyright, license, and notice files.
+- Keep vendored code isolated from production imports.
 - Prefer proven mechanisms over rewrites made only to own the code.
-- Do not copy an upstream abstraction blindly when our product boundary is different.
-- Keep vendored reference code isolated from production imports.
-- When copying AGY integration code, keep AGY-specific protocol and command handling inside the AGY integration boundary.
-
-## Current architecture
-
-The implementation today is still primarily Provider-driven:
-
-```text
-Provider / Agent runtime
-        ↓
-     Raw Trace
-        ↓
-Normalization and replay
-        ↓
-   Derived State
-        ↓
- Canvas / Inspector
-```
-
-Execution changes travel through explicit commands:
-
-```text
-User Action
-    ↓
-Glassbox command
-    ↓
-Runtime / Provider
-```
-
-The target adds Personal Agent orchestration and Worker delegation without invalidating the existing trace path:
-
-```text
-Channel / Workbench
-        ↓
-Identity + Conversation
-        ↓
-   Personal Agent
-        │
-        ├── Skill / Tool / Provider
-        ├── Worker Delegation
-        │      └── AGY / Codex / Claude Code / others
-        ├── LongTask Engine
-        └── Eval Runner
-        ↓
-       Run
-        ↓
- Raw Trace + Derived State
-        ↓
-Timeline / Canvas / Inspector
-```
-
-Keep the current path correct while introducing Personal Agent concepts incrementally.
-
-Do not document a future layer as implemented before code and tests exist.
+- Do not copy an upstream trust model blindly. Glassbox authorization rules always win.
 
 ## Where code lives
 
-Follow the actual repository structure, not an old design note.
-
-Current top-level structure includes:
+Follow the actual repository structure.
 
 ```text
 apps/
@@ -474,25 +864,21 @@ e2e/
 template/
 ```
 
+Do not create future packages before a real dependency boundary needs them.
+
 `apps/server` owns current Runtime, HTTP, WebSocket, Provider integration, Session lifecycle, Trace, screening, and derived state.
 
 `apps/web` owns React, tldraw, Canvas projection, Inspector, and current user interaction.
 
-`packages/contracts` is currently small. Put cross-boundary contracts there only when more than one real producer or consumer needs them.
+Keep Provider code near Provider integration.
 
-`packages/shared` should stay boring and small.
+Keep Worker code near Worker integration.
 
-Create a new package only when an actual dependency boundary requires it.
+Keep Channel code near Channel integration.
 
-Keep Provider-specific code near Provider integration.
+Keep authorization checks in server-side domain boundaries that cannot be bypassed by UI or adapters.
 
-Keep Worker-specific code, including AGY integration, near Worker integration.
-
-Keep Channel-specific code near Channel integration.
-
-Keep tldraw-specific code near Canvas projection and interaction.
-
-Keep Eval orchestration separate from ordinary Agent execution, while linking Eval Samples back to Runs.
+Keep Eval orchestration separate from ordinary Run execution while linking Eval Samples back to Runs.
 
 Keep LongTask orchestration separate from one Provider Turn or Worker Job.
 
@@ -500,93 +886,83 @@ Keep LongTask orchestration separate from one Provider Turn or Worker Job.
 
 Treat performance regressions as bugs.
 
-Do not project every raw event to Canvas.
+Large Sessions, LongTasks, Worker Jobs, Eval Runs, journals, and learning histories can produce thousands of events.
 
-Large Sessions, LongTasks, Worker Jobs, and Eval Runs can produce thousands of events. Avoid broad React rerenders, unbounded DOM growth, huge live payloads, expensive visual effects, and full-history recomputation on every event.
+Avoid broad React rerenders, unbounded DOM growth, huge live payloads, expensive visual effects, and full-history recomputation on every event.
 
-Prefer incremental reducers, indexed persistence, lazy inspection, and explicit pagination or virtualization when real load requires it.
-
-Do not optimize imaginary bottlenecks before measurement.
-
-## Dev servers
-
-Document only commands that exist in the current repository.
-
-Before running a command, inspect package scripts and tool configuration.
-
-Do not hardcode localhost origins or development ports in client code unless the current architecture explicitly requires it.
-
-Stop only processes you started or verified belong to the active development instance.
+Prefer incremental reducers, indexed persistence, lazy inspection, pagination, or virtualization when measurements show they are needed.
 
 ## Test data and safety
 
-Never use the user's live Glassbox state as writable test state.
+Never use live user state as writable test state.
 
-Never point tests, migrations, cleanup jobs, evals, fuzzers, chaos tests, test Agents, or Worker integrations at the user's real repositories, real Personal Agent database, live channels, or live credentials.
-
-Reading or copying real data for debugging is acceptable when necessary. Write to a safe copy.
+Never point tests, migrations, cleanup jobs, evals, fuzzers, chaos tests, test Agents, or Worker integrations at real repositories, live Personal Agent databases, live channels, or live credentials.
 
 > Copy in. Never point in. Never write back.
 
-Use realistic fixtures when tiny mocks would hide the behavior being tested.
+Remote-channel tests should normally use fake adapters.
 
-Remote-channel tests should use fake adapters unless the plan explicitly requires a real integration test.
+Worker tests should normally use fake workers.
 
-Worker tests should use fake workers unless the plan explicitly requires a live AGY or other Worker integration test.
-
-Eval tests should use disposable datasets and isolated run state.
-
-LongTask recovery tests should deliberately exercise restart, retry, duplicate delivery, waiting, resume, Worker result recovery, and cancellation paths when those semantics change.
+Eval tests should use disposable datasets.
 
 ## Verification
 
 Prove changes with the smallest useful check.
 
-Runtime changes should test runtime behavior.
+Authorization changes require deny-path tests, not only allow-path tests.
 
-Persistence changes should test restart and resume behavior when relevant.
+At minimum, relevant authorization work should consider:
 
-Channel changes should test normalization, routing, deduplication, and authorization.
+```text
+cross-user reads
+cross-scope memory reads
+private asset access
+channel identity spoofing
+stale permission state
+revocation
+Worker permission escalation
+Prompt Injection requesting Owner-only Tools
+approval bypass
+replayed approvals
+duplicate side effects
+```
 
-Memory changes should test scope isolation.
+Channel changes should test normalization, routing, deduplication, identity binding, and authorization.
 
-Worker changes should test delegation, stable job identity, status mapping, timeout behavior, cancellation, continuation, restart, result collection, permission boundaries, and parent Run or LongTask linkage.
+Memory changes should test scope isolation, promotion provenance, and unauthorized consolidation.
 
-LongTask changes should test durable transitions and idempotency.
+Skill changes should test validation, versioning, and Tool authorization under the Skill.
 
-Eval changes should test Dataset selection, Variant assignment, Scoring, result linkage, and resume behavior where applicable.
+Asset changes should test ownership, lineage, visibility, and derived-asset leakage.
 
-Canvas changes should test both Glassbox state and visible tldraw behavior when both matter.
+Worker changes should test delegated grants and parent linkage.
 
-Async tests must wait on real completion signals, events, promises, drains, or state transitions. Do not make timing-sensitive tests pass with arbitrary sleeps when a real signal exists.
+LongTask changes should test durable transitions, revocation, retries, and idempotency.
 
-Run browser verification only when behavior depends on browser APIs or real interaction.
+Eval changes should test Dataset selection, Variant assignment, Scoring, result linkage, resume, and permission invariants.
+
+Async tests must wait on real completion signals or state transitions. Do not use arbitrary sleeps to hide races.
 
 ## Delivery cadence
 
 Commit directly to main as soon as a verified slice is complete unless the user asks for a branch or PR workflow.
 
-Do not accumulate unrelated verified slices into one commit.
+Do not accumulate unrelated verified slices.
 
 One ticket should have one main concern.
 
-Keep each slice small enough that its behavior, tests, and rollback boundary are understandable.
-
-Record current implementation scope in `.plans/`. Product history, future ideas, and research notes should not silently expand an active ticket.
-
-If roadmap logging exists for the current plan, update it before starting the next slice.
+Record current implementation scope in `.plans/`. Future ideas must not silently expand an active ticket.
 
 ## Pull requests
 
-Open a Pull Request only when the user asks for one.
+Open a Pull Request only when the user asks.
 
 Push only when the user asks.
 
 Keep one main concern per PR.
 
-For user-visible UI changes, include before and after screenshots when practical. Use a short recording when motion, timing, drag and drop, or multi-step interaction is the point.
-
-Treat automated review findings as claims to verify against source code. Fix real problems. Do not change correct code merely to satisfy a mistaken bot comment.
+Treat automated review findings as claims to verify against source code.
 
 ## Taste
 
@@ -594,14 +970,16 @@ Use the smallest model that solves the current problem.
 
 Prefer explicit state transitions over inferred magic.
 
-Do not create speculative frameworks for providers, workers, channels, memory, evals, long tasks, or deployment modes that the current plan does not need.
+Do not build speculative frameworks that the current plan does not need.
 
 Reuse mature upstream code and patterns when they solve the problem well.
 
-The UI must not lie. A spinner means work is pending. Success means underlying work completed. Waiting means the system has durable knowledge of what it is waiting for. Resume means execution actually resumed from persisted state. Delegated means a real Worker job exists and can be inspected.
+The UI must not lie. A visible grant means the server authorization state grants it. A denial means protected data never reached the model. Waiting means durable waiting state exists. Delegated means a real Worker Job exists. Success means the underlying work finished.
 
-Avoid `any` when TypeScript can express the boundary. Validate unknown external data when it enters the system.
+Validate unknown external data when it enters the system.
 
-Comments should explain intent, constraints, provenance, or non-obvious behavior. Do not narrate obvious code.
+Avoid `any` when TypeScript can express the boundary.
+
+Comments should explain intent, trust boundaries, provenance, or non-obvious behavior.
 
 If a rule here becomes wrong because the product changed, update the rule instead of working around it silently.
