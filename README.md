@@ -1,7 +1,7 @@
 # Glassbox
 
 <p align="center">
-  <img src="./assets/readme/hero-v1.webp" width="100%" alt="Glassbox personal agent workbench with inspectable runs, permissions, memory, experiments, and long-running tasks" />
+  <img src="./assets/readme/glassbox-hero-lora-visual.svg" width="100%" alt="Glassbox：把每一次执行，沉淀成自己的能力" />
 </p>
 
 Glassbox 正在从本地 Coding Agent 观察与控制工作台，演进成一个长期存在的 Personal Agent 工作台。
@@ -13,6 +13,10 @@ Channel 只是入口。Canvas 只是工作视图。核心是 Agent Runtime、Ide
 > 当前仓库还没有完成下面所有目标能力。本文明确区分现有能力和目标架构。
 
 ## 产品目标
+
+<p align="center">
+  <img src="./assets/readme/glassbox-architecture-lora-visual.svg" width="100%" alt="Glassbox 架构：身份识别、权限控制、Personal Agent、执行、Trace 与学习沉淀" />
+</p>
 
 ```text
                    Personal Agent
