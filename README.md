@@ -4,13 +4,37 @@
   <img src="./assets/readme/glassbox-hero-lora-visual.svg" width="100%" alt="Glassbox：把每一次执行，沉淀成自己的能力" />
 </p>
 
-Glassbox 正在从本地 Coding Agent 观察与控制工作台，演进成一个长期存在的 Personal Agent 工作台。
+Glassbox 是一个正在演进中的 Personal Agent 工作台。
 
-目标是拥有一个真正长期存在的 Agent。Owner 在 Glassbox 里管理它、使用它、检查它的工作和成长。其他人可以通过微信、QQ 等聊天渠道访问这个 Agent，但只能看到和使用 Owner 明确授权的部分。
+目标是让你拥有一个长期存在的 Agent。你在 Workbench 里管理它、使用它、检查它做过什么、为什么这样做、学到了什么。以后其他人可以通过微信、QQ 等渠道访问这个 Agent，但只能看到和使用你明确授权的部分。
 
-Channel 只是入口。Canvas 只是工作视图。核心是 Agent Runtime、Identity、Authorization、Memory、Skills、Assets、LongTask、Trace 和 Eval。
+**权限是第一原则。** Channel 只是入口，Canvas 只是工作视图。真正的核心是 Agent Runtime、Identity、Authorization、Conversation、Memory、LongTask、Trace、Eval 和持续沉淀的个人资产。
 
-> 当前仓库还没有完成下面所有目标能力。本文明确区分现有能力和目标架构。
+> 当前代码仍然主要是本地 Coding Agent Harness。README 会明确区分已经实现的能力和目标架构，不把未来功能写成现状。
+
+## 当前开发阶段
+
+当前唯一 Active Plan：[`Plan 03 — Personal Agent Foundation`](./.plans/03-personal-agent-foundation.md)
+
+这一阶段只做地基：
+
+```text
+Identity
+  ↓
+Authorization
+  ↓
+Conversation
+  ↓
+Turso persistence
+  ↓
+Run / Authorization Trace
+```
+
+完成 Plan 03 之前，不抢跑真实微信、QQ、Mail、Calendar、Memory 自动沉淀、Skill evolution、AGY、LongTask、Eval 或 Arena。
+
+这一阶段的验收标准很直接：
+
+> 同一个 Agent 可以同时服务 Owner 和 Visitor。两个人的 Conversation 可以持久恢复。公开资源两个人都能用，Owner 私有资源 Visitor 永远拿不到，并且每一次 Allow、Deny、Approval 都可以在 Trace 里解释。
 
 ## 产品目标
 
@@ -18,84 +42,54 @@ Channel 只是入口。Canvas 只是工作视图。核心是 Agent Runtime、Ide
   <img src="./assets/readme/glassbox-architecture-lora-visual.svg" width="100%" alt="Glassbox 架构：身份识别、权限控制、Personal Agent、执行、Trace 与学习沉淀" />
 </p>
 
-```text
-                   Personal Agent
-                         │
-        ┌────────────────┼────────────────┐
-        │                │                │
-     Memory            Skills           Assets
-        │                │                │
-        └────────────────┼────────────────┘
-                         │
-                 Authorization
-                         │
-                 Agent Runtime
-                         │
-        ┌────────────────┼────────────────┐
-        │                │                │
-      Tools          LongTasks         Workers
-        │                                 │
- GitHub / Mail /                    Codex / Claude
- Calendar / MCP                     Code / AGY
-                         │
-             ┌───────────┼───────────┐
-             │           │           │
-         Workbench      微信         QQ
-                         │
-                         ▼
-                Run / Raw Trace
-                         │
-          ┌──────────────┼──────────────┐
-          │              │              │
-       Timeline        Canvas        Experiment
-```
-
-这里始终只有一个 Personal Agent。
-
-微信 Bot、QQ Bot 和 Workbench 都只是不同入口。Codex、Claude Code、AGY 和其他执行 Agent 是 Provider 或 Worker，不是产品身份本身。
-
-## 当前已经实现
-
-当前代码仍然以本地 Coding Agent 工作台为主，已有：
-
-- Codex 和 Claude Code Provider Adapter
-- Session 和多 Turn 执行
-- HTTP 和 WebSocket Runtime
-- Raw Trace、Replay 和 Derived State
-- Approval 流程
-- Secret Screening
-- Real repo 运行和文件变更检查
-- Editable Task 和 Editable System Instruction
-- Token Usage 统计
-- tldraw Canvas Projection 和 Inspector
-- Playwright E2E
-- 大型 Session 性能验证
-
-这些能力会保留，并逐步成为 Personal Agent Runtime 的基础。
-
-AGY、微信、QQ、Turso、LongTask Engine、Learning Loop、Asset Library 和 Eval Runner 目前属于目标能力，不要把它们写成已经实现。
-
-## 权限是第一原则
-
-Personal Agent 对外开放以后，最重要的规则不是模型聪不聪明，而是不能越权。
-
-所有访问都必须先回答一个问题：
+目标系统只有一个长期存在的 Personal Agent。
 
 ```text
-Principal
-  谁在请求
-
-Resource
-  他想访问什么
-
-Action
-  他想做什么
-
-Context
-  当前渠道、会话、任务和授权条件是什么
+Workbench / 微信 / QQ / Email
+             │
+             ▼
+      Identity Resolution
+             │
+             ▼
+        Authorization
+             │
+             ▼
+   Conversation + Personal Agent
+             │
+    ┌────────┼────────┐
+    │        │        │
+  Tools    Workers  LongTask
+    │        │
+    │      AGY / Codex / Claude Code
+    │
+    └────────┼───────────────┐
+             ▼               │
+            Run              │
+             ▼               │
+      Raw Trace / Evidence   │
+             ▼               │
+      Experience Mining ◀────┘
+             ▼
+   Memory / Skills / Assets
+             ▼
+ Journal / Review / Eval
 ```
 
-授权结果只有：
+微信 Bot、QQ Bot、Workbench 都只是入口，不是不同 Agent。
+
+Codex、Claude Code、AGY、OpenHarness 等属于 Provider、Worker 或专业执行能力，也不是产品身份本身。
+
+## 权限是 P0
+
+Personal Agent 对外开放以后，最危险的问题不是答错，而是越权。
+
+所有受保护操作都要先落到：
+
+```text
+Principal × Resource × Action × Context → Decision
+```
+
+Decision 只有：
 
 ```text
 ALLOW
@@ -103,531 +97,235 @@ DENY
 REQUIRES_APPROVAL
 ```
 
-默认是 `DENY`。
+没有明确授权就是 `DENY`。
 
-### 身份和角色
+必须遵守这些规则：
 
-角色只提供默认关系，不直接替代资源授权。
+- 身份识别不等于授权
+- 先授权，再组 Context
+- 未授权数据不能先进入模型，再靠 Prompt 要求模型保密
+- Tool 执行时再次做授权判断
+- 外部消息、邮件、网页、MCP、Worker 输出全部视为不可信输入
+- Worker 权限只能缩小，不能比调用者更大
+- Approval 不能替代 Permission
+- Grant、Revoke、Deny、Approval 都进入可审计 Trace
+- 自动沉淀 Memory、Skill、Asset 不能扩大原始数据的可见范围
 
-第一版可以有：
+目标权限关系参考 `openfga/openfga`，但核心 Domain 保持在 Glassbox 自己的 TypeScript 代码中。
+
+## 当前已经实现
+
+现有仓库已经证明了 Coding Agent 执行和观察闭环：
+
+- Codex Provider Adapter
+- Claude Code Provider Adapter
+- Session 和多 Turn 执行
+- HTTP 和 WebSocket Runtime
+- Raw Trace、Replay 和 Derived State
+- Approval
+- Secret Screening
+- Real repo 运行和文件变化检查
+- Editable Task 和 Editable System Instruction
+- Token Usage
+- tldraw Canvas Projection
+- Inspector
+- Playwright E2E
+- 大 Session 性能验证
+
+这些能力不会推倒重来。它们会逐步成为 Personal Agent Runtime 的执行和观察底座。
+
+目前还没有完成的目标能力包括：
 
 ```text
-Owner / Boss
-Trusted User
-Member
-Visitor
-Public
-Worker
-Service
+Identity / Authorization Domain
+Turso durable state
+Conversation Domain
+Remote Channels
+Memory promotion
+Skill evolution
+Asset Library
+Journal / Monthly Review
+Mail / Calendar
+AGY Worker
+LongTask Engine
+Eval Workbench
+Arena
 ```
 
-Boss 拥有 Agent，但其他角色获得的权限必须是显式授予的子集。
+## 核心对象
 
-例如：
-
-```text
-Bob
-  can read       public assets
-  can use        web search
-  can use        public research skill
-  cannot read    private memory
-  cannot read    personal calendar
-  cannot send    owner email
-  cannot write   owner GitHub
-```
-
-### 权限落到资源
-
-Memory、Asset、Conversation、Project、Calendar、Mail、Tool、Skill、LongTask 和 Worker 都应该能独立授权。
+长期模型会围绕这些概念演进：
 
 ```text
-Memory #123
-  owner: lora
-  visibility: private
-
-Asset #456
-  visibility: public
-
-Project #789
-  viewer: alice
-
-Tool github-read
-  allowed: trusted
-
-Tool github-write
-  allowed: owner
-  approval: required
-```
-
-不能只靠 `admin / user / guest` 三个角色解决所有问题。
-
-### 先授权，再组 Context
-
-未经授权的数据不能先交给模型，再要求模型“不要泄露”。
-
-正确路径：
-
-```text
-Incoming Message
-      │
-      ▼
-Resolve Principal
-      │
-      ▼
-Authorization Check
-      │
-      ▼
-Authorized Context Builder
-      │
-      ▼
-Personal Agent
-```
-
-一个 Visitor 请求 Owner 的私人日历时，Calendar 数据根本不能进入 Prompt 或 Tool Result。
-
-### Tool 和副作用也必须授权
-
-每次 Tool 调用都要根据当前 Principal、Resource、Action 再判断一次。
-
-```text
-read public repo       ALLOW
-search web             ALLOW
-read private calendar  DENY
-send owner email       REQUIRES_APPROVAL
-write production repo  REQUIRES_APPROVAL
-```
-
-外部消息、邮件、网页内容和 Worker 输出都是不可信输入。它们不能通过 Prompt Injection 借用 Personal Agent 的 Owner 权限。
-
-### Worker 不能扩大权限
-
-主 Agent 委派给 Codex、Claude Code、AGY 或其他 Worker 时，只能下发当前任务需要的权限子集。
-
-```text
-Personal Agent permission set
-        │
-        ▼
-Delegation Grant
-        │
-        ▼
-Worker permission set
-```
-
-Worker 权限必须满足：
-
-```text
-worker_permissions ⊆ delegated_permissions ⊆ caller_permissions
-```
-
-上游 Worker 默认允许执行某件事，不代表 Glassbox 允许。
-
-### 授权本身也要进入 Trace
-
-关键授权判断必须可审计：
-
-```text
-AuthorizationDecision
-  principal
-  resource
-  action
-  policy
-  decision
-  reason
-  approvalId
-  timestamp
-```
-
-发生越权尝试时，Owner 应该能从 Trace 看见请求来自谁、系统拦了什么、依据哪条规则。
-
-权限系统主要参考 `openfga/openfga` 的关系式细粒度授权思想，但核心模型保持在 Glassbox 自己的 TypeScript Domain 中。
-
-## Conversation 和聊天渠道
-
-外部渠道统一进入标准消息模型：
-
-```text
-微信 / QQ / 其他渠道
-        │
-        ▼
-   Channel Adapter
-        │
-        ▼
-Identity Resolution
-        │
-        ▼
-Authorization
-        │
-        ▼
+Agent
+User
+Principal
+ChannelIdentity
+Relationship
+Permission
 Conversation
-        │
-        ▼
-Personal Agent
-```
-
-同一个真实用户可以绑定多个 Channel Identity：
-
-```text
-user_123
-├── workbench: account_xxx
-├── wechat: wx_xxx
-└── qq: qq_xxx
-```
-
-群聊、私聊和 Thread 必须有明确路由，避免不同用户共享同一份 Conversation 或 User-scoped Memory。
-
-Channel Identity 不能自动提升权限。绑定身份和授予权限是两件事。
-
-## Memory：只沉淀高价值信息
-
-Glassbox 不应该把所有聊天都永久记住。
-
-Memory 分三类：
-
-```text
-Semantic Memory
-  稳定事实、关系、偏好和知识
-
-Episodic Memory
-  有价值的成功、失败和关键经历
-
-Procedural Memory
-  以后应该如何处理某类问题
-```
-
-Memory 的写入分成即时写入和后台沉淀。后台沉淀更适合做去重、矛盾检查、价值判断和合并。
-
-每条长期 Memory 都应该保留来源：
-
-```text
 Memory
-  content
-  kind
-  scope
-  value
-  confidence
-
-  evidence
-    conversationId
-    messageId
-    runId
-    traceEventId
-
-  lastUsedAt
-  useCount
-  supersedes
-  contradictedBy
-  expiresAt
+Skill
+Asset
+Tool
+Session
+Run
+WorkerJob
+LongTask
+JournalEntry
+Experiment
+EvalSuite
+EvalRun
 ```
 
-### Memory Promotion
-
-Memory Candidate 不应该自动晋升。
-
-可以按多个因素评估价值：
+几个边界必须保持清楚：
 
 ```text
-futureUtility
-goalRelevance
-userRelevance
-reliability
-reuseCount
-successfulReuse
-novelty
-recency
-
-penalties
-  contradictionRisk
-  staleness
-  privacyRisk
-  duplication
+Identity ≠ Authorization
+Permission ≠ Approval
+Channel ≠ Agent
+Conversation ≠ Session
+Session ≠ Run
+LongTask ≠ Run
+WorkerJob ≠ LongTask
+Provider / Worker ≠ Personal Agent
+Raw Trace ≠ Derived State
+Canvas ≠ Execution State
 ```
-
-高价值记忆筛选主要参考 `zhibao-dev/Learning-Multi-Factor-Memory`。Memory 类型、后台 consolidation 和 hot-path/background formation 参考 `langchain-ai/langmem`。
 
 ## Learning and Asset Loop
 
-Glassbox 的差异不应该只是“Agent 会记忆”和“Agent 会写 Skill”。
+Glassbox 不希望把所有聊天记录都塞进 Memory，也不希望模型成功一次就自动生成永久 Skill。
 
-真正要做的是一条可审计的成长链：
+真正的成长链是：
 
 ```text
 Real Work
-  Conversation / Tool / LongTask / Arena / Eval
-        │
-        ▼
-      Raw Trace
-        │
-        ▼
- Experience Mining
-        │
- ┌──────┼──────────────┐
- │      │              │
-Memory Skill          Asset
-Candidate Candidate  Candidate
- │      │              │
- └──────┼──────────────┘
-        │
-Value + Permission + Dedup
-        │
-        ▼
- Eval / Verification
-        │
-        ▼
-     Promote
-        │
- ┌──────┼──────────────┐
- │      │              │
-Memory Skills       Asset Library
+   │
+   ▼
+Raw Trace
+   │
+   ▼
+Experience Mining
+   │
+   ├── Memory Candidate
+   ├── Skill Candidate
+   └── Asset Candidate
+             │
+             ▼
+ Value + Permission + Dedup
+             │
+             ▼
+      Eval / Verification
+             │
+             ▼
+           Promote
+             │
+    ┌────────┼────────┐
+    │        │        │
+ Memory    Skills   Asset Library
 ```
 
-每一次晋升都应该能回到产生它的 Run 和 Trace。
+每一个高价值 Memory、Validated Skill、Asset、Journal 或 Monthly Review 都应该能回到产生它的 Run 和 Trace。
 
-## 自动沉淀 Skill
+## Memory
 
-成功一次不等于 Skill。
+Memory 计划区分：
 
-目标流程：
+```text
+Semantic Memory
+Episodic Memory
+Procedural Memory
+```
+
+并且至少支持：
+
+```text
+private
+public
+user
+conversation
+```
+
+Memory Candidate 会考虑 future utility、goal relevance、reliability、reuse、novelty、staleness、contradiction 和 privacy risk，再决定是否晋升。
+
+主要参考：
+
+- `zhibao-dev/Learning-Multi-Factor-Memory`
+- `langchain-ai/langmem`
+
+## Skill evolution
+
+Skill 的目标流程：
 
 ```text
 Successful Runs
-      │
-      ▼
+      ↓
 Skill Candidate
-      │
-      ▼
+      ↓
 Deduplicate / Merge
-      │
-      ▼
-Extract Preconditions
-Procedure
-Failure Modes
-Examples
-      │
-      ▼
+      ↓
+Extract Procedure + Preconditions + Failure Modes
+      ↓
 Generate Eval Cases
-      │
-      ▼
+      ↓
 Verify
-      │
-      ▼
+      ↓
 Validated Skill
 ```
 
 主要参考：
 
-- `AMAP-ML/SkillClaw`：从真实 Session 自动演化、去重和改进 Skill
-- `Zhang-Henry/CoEvoSkills`：Generate、Verify、Refine，以及 Candidate 和 Validated Skill 分离
-- `MineDojo/Voyager`：成功经验形成 Skill Library，再按任务检索和复用
+- `AMAP-ML/SkillClaw`
+- `Zhang-Henry/CoEvoSkills`
+- `MineDojo/Voyager`
 
-Validated Skill 应该记录版本、来源 Runs、验证集、成功复用次数和最近失败证据。
+## Journal 和周期复盘
 
-## Agent Journal 和周期复盘
+Agent 会有自己的可读 Journal，但 Journal 不是模型私有思维过程。
 
-Agent 应该有自己的可读 Journal，但 Journal 不是模型私有思维过程。
+Daily Journal 和 Monthly Review 都应该是正式 Run 产生的可追溯 Asset，可以下钻到真实 Run、Eval 和 Trace。
 
-Daily Journal 是一个正式 Run 的产物：
+主要参考：
 
-```text
-Today
-  Runs
-  Conversations
-  Decisions
-  Failures
-  Open Loops
-  New Memories
-  Skill Candidates
-  New Assets
-      │
-      ▼
-Daily Reflection Run
-      │
-      ▼
-JournalEntry
-```
+- `joonspk-research/generative_agents`
+- `usememos/memos`
 
-每月再运行一次 Monthly Review：
+## Mail 和 Calendar
 
-```text
-Daily Journals
-+ Memory changes
-+ Skill changes
-+ Asset changes
-+ Eval results
-+ LongTask outcomes
-+ User feedback
-        │
-        ▼
-Monthly Review Run
-        │
-        ▼
-MonthlyReview Asset
-```
+Mail 和 Calendar 计划作为原生 Domain，而不是给模型 unrestricted MCP。
 
-复盘里的指标和结论必须能下钻到 Eval、Run 和 Trace。
+Mail 参考 `resend/resend-skills` 的 Agent inbox、安全 Webhook 和 Approval 模式。
 
-Reflection 思想参考 `joonspk-research/generative_agents`。时间线式 Journal UI 可以参考 `usememos/memos`。
+Calendar 参考 `calcom/cal.diy` 的 Availability、Scheduling 和冲突处理。
 
-## 内置 Mail 和 Calendar
+两者默认都是 Private Resource。
 
-Mail 和 Calendar 应该是 Agent 的原生 Domain，不只是临时 MCP Tool。
+## LongTask
 
-Mail 第一版考虑：
+长任务不能依赖一个 HTTP 请求或者一个进程一直活着。
+
+目标语义包括：
 
 ```text
-MailAccount
-MailThread
-MailMessage
-MailContact
-Draft
+stable task id
+steps
+event history
+checkpoint
+retry
+waiting
+signal
+child task
+worker job
+cancellation
+continuation
 ```
-
-Resend 负责发送、接收和 Webhook。安全实现参考 `resend/resend-skills` 的 Agent Email Inbox，包括 Webhook Verification、Sender Allowlist、Sandbox 和 Human Approval。
-
-Calendar 第一版考虑：
-
-```text
-Calendar
-CalendarEvent
-Availability
-Reminder
-Invite
-```
-
-Google Calendar、Microsoft Calendar、CalDAV 等作为 Adapter。Scheduling、Availability 和冲突处理可以参考 `calcom/cal.diy`。
-
-Mail 和 Calendar 默认属于 Private Resource。对外授权必须显式配置到具体资源和 Action。
-
-## Asset Library
-
-Memory 是“Agent 知道什么”。Skill 是“Agent 会怎么做”。Asset 是“Agent 已经创造了什么”。
-
-Asset 可以包括：
-
-```text
-Report
-Research
-Dataset
-Prompt
-Template
-Code
-Image
-Presentation
-Workflow
-EvalSet
-Journal
-MonthlyReview
-Decision
-Playbook
-```
-
-Asset 应该保留：
-
-```text
-id
-kind
-name
-owner
-visibility
-version
-contentHash
-producedByRun
-derivedFrom[]
-tags
-metadata
-evalStatus
-createdAt
-updatedAt
-```
-
-Asset lineage、依赖、版本、Owner 和 Materialization 思想可以参考 `dagster-io/dagster`。
-
-## Arena 和多人对战
-
-Agent 可以参加多人游戏、协作和对抗环境。每一局都是可追溯 Run，也可以成为 Eval 或 Episodic Memory 的来源。
-
-```text
-Arena Match
-    │
-    ▼
-Game / Social Environment
-    │
-    ▼
-Agents / Workers
-    │
-    ▼
-Trace + Score
-    │
-    ▼
-Eval / Experience Mining
-```
-
-博弈环境参考 `google-deepmind/open_spiel`。语言 Agent 的社交互动和 Social Eval 参考 `sotopia-lab/sotopia`。
-
-Arena 也受权限系统控制。其他用户不能通过游戏让 Agent 调用 Owner 私有 Tool 或读取 Private Memory。
-
-## Turso
-
-Turso 是计划中的结构化长期状态存储。
-
-候选表包括：
-
-```text
-agents
-users
-channel_identities
-relationships
-permissions
-conversations
-messages
-memories
-memory_evidence
-skills
-skill_versions
-assets
-asset_versions
-sessions
-runs
-worker_jobs
-long_tasks
-jobs
-approvals
-journal_entries
-eval_suites
-eval_runs
-eval_samples
-eval_scores
-```
-
-Raw Trace 暂时继续保持独立 append-only evidence store。Turso 保存业务状态、权限、索引和 Run 元数据。
-
-Agent 不应该获得 unrestricted SQL 权限。业务数据通过受权限控制的 Domain Tool 访问。
-
-## 长程任务
-
-长程任务不能依赖一个 HTTP 请求或一个进程一直活着。
-
-```text
-LongTask
-├── stable task id
-├── steps
-├── event history
-├── checkpoint
-├── retry policy
-├── waiting state
-├── external signal
-├── child task
-├── worker job
-├── cancellation
-└── continuation
-```
-
-重启以后根据持久状态恢复，不重复不可逆副作用。长历史可以 Checkpoint 和 Continue，但不能重写旧 Run 和 Raw Trace。
 
 主要参考 `temporalio/sdk-typescript`。
 
 ## Eval 和实验工作台
 
-用户最终可以直接描述实验：
+以后可以直接告诉 Agent：
 
 ```text
 测一下当前 Agent 的 GitHub repo 分析能力。
@@ -637,9 +335,9 @@ LongTask
 检查任务成功率、权限 invariant、成本和延迟。
 ```
 
-Agent 先生成 Eval Draft，只有明确 `Start Eval` 后才运行。
+Agent 先生成 Eval Draft，只有明确 `Start Eval` 才执行。
 
-第一阶段优先：
+第一阶段 Eval 类型：
 
 ```text
 Benchmark
@@ -647,24 +345,24 @@ Differential Eval
 Invariant Eval
 ```
 
-权限 Invariant 是 P0：
+主要参考 `UKGovernmentBEIS/inspect_ai`。
 
-```text
-never expose private memory to unauthorized users
-never use another user's user-scoped memory
-never expose private assets through public channels
-never execute a tool beyond the caller's grant
-never let a worker escalate its delegated permissions
-never perform approval-required side effects without approval
-```
+## Arena
 
-Eval Runner 主要参考 `UKGovernmentBEIS/inspect_ai`。
+以后可以把 Agent 放进多人游戏、协作和社交模拟环境。每局都是可追溯 Run，也可以成为 Eval 或 Episodic Memory 来源。
+
+主要参考：
+
+- `google-deepmind/open_spiel`
+- `sotopia-lab/sotopia`
+
+Arena 同样受 Glassbox Authorization 控制。
 
 ## Canvas 的位置
 
 Canvas 保留，但不再定义整个产品。
 
-Glassbox 可以有：
+可能的工作视图包括：
 
 ```text
 Conversation
@@ -680,157 +378,110 @@ Journal
 Permissions
 ```
 
-Canvas 是投影，不是 Agent 执行状态的 Source of Truth。移动、连接、分组和批注不能暗中改变执行或授权。
+Canvas 是投影。移动、连接、分组、缩放和批注都不能暗中改变 Agent 执行和权限。
 
-## 上游参考策略
+## 上游参考
 
-成熟实现已经解决好的问题优先参考。`upstream/` 保存选择性的只读参考代码，生产代码不能直接 import。
+成熟项目已经解决好的机制优先研究和复用。`upstream/` 保存选择性的只读参考代码，生产代码不能直接 import。
 
-| 上游项目 | 主要参考内容 |
+| 上游 | 主要参考 |
 | --- | --- |
-| `pingdotgg/t3code` | Claude Code Provider、权限、Session Resume |
-| `HKUDS/OpenHarness` | Agent Loop、Tools、Skills、Memory、Channel、QQ |
-| `keli-wen/agy-staff` | AGY Worker Delegation、Background Job、Continue、Restart |
-| `joyehuang/trajectory-panel` | Trajectory、Timeline、Incremental Tail、Redaction、Turso Sync |
+| `pingdotgg/t3code` | Provider、Claude Code、权限、Resume |
+| `HKUDS/OpenHarness` | Agent Loop、Tools、Skills、Memory、Channels、QQ |
+| `keli-wen/agy-staff` | AGY Worker、后台 Job、Continue、Restart |
+| `joyehuang/trajectory-panel` | Trajectory、Timeline、Redaction、Turso Sync |
 | `UKGovernmentBEIS/inspect_ai` | Eval、Dataset、Scorer、Experiment Runner |
-| `temporalio/sdk-typescript` | Durable LongTask、Signal、Retry、Continuation |
-| `tursodatabase/turso` | SQLite-compatible Agent State Storage |
-| `openfga/openfga` | Fine-grained Authorization、Relation-based Access Control |
-| `zhibao-dev/Learning-Multi-Factor-Memory` | Memory Value、Forgetting、Memory Hygiene |
-| `langchain-ai/langmem` | Semantic、Episodic、Procedural Memory、Consolidation |
-| `AMAP-ML/SkillClaw` | 从真实 Session 自动演化、去重和共享 Skill |
-| `Zhang-Henry/CoEvoSkills` | Skill Generate、Verify、Refine、Validated Promotion |
-| `MineDojo/Voyager` | Skill Library、成功经验沉淀、Skill Retrieval |
-| `joonspk-research/generative_agents` | Memory Stream、Importance、Reflection |
-| `usememos/memos` | Journal Timeline、Private/Public Notes |
-| `resend/resend-skills` | Agent Email Inbox、发送接收、安全处理 |
-| `calcom/cal.diy` | Scheduling、Availability、Calendar Integration |
-| `dagster-io/dagster` | Asset、Lineage、Dependency、Version、Materialization |
-| `google-deepmind/open_spiel` | Multi-player Game Environment |
-| `sotopia-lab/sotopia` | Multi-Agent Social Environment、Social Eval |
+| `temporalio/sdk-typescript` | Durable LongTask |
+| `tursodatabase/turso` | Structured Agent State |
+| `openfga/openfga` | Fine-grained Authorization |
+| `zhibao-dev/Learning-Multi-Factor-Memory` | Memory Value、Forgetting、Hygiene |
+| `langchain-ai/langmem` | Memory Types、Consolidation |
+| `AMAP-ML/SkillClaw` | Skill Evolution |
+| `Zhang-Henry/CoEvoSkills` | Skill Verification |
+| `MineDojo/Voyager` | Skill Library |
+| `joonspk-research/generative_agents` | Reflection |
+| `usememos/memos` | Journal UX |
+| `resend/resend-skills` | Agent Email |
+| `calcom/cal.diy` | Calendar / Scheduling |
+| `dagster-io/dagster` | Asset / Lineage |
+| `google-deepmind/open_spiel` | Multi-player Games |
+| `sotopia-lab/sotopia` | Social Multi-Agent Environment |
 
-`agy-staff` 当前参考点固定到 `67d3fd8fdc04b57006a829ae376ae7ffdc7ee714`。
+Vendoring 时必须记录 Source Repo、Commit、License、原始路径和复制原因，并保留上游要求的版权与 License Notice。
 
-Vendoring 时必须记录 Source Repo、Commit、License 和原始路径。只复制当前问题需要的文件。许可证要求必须保留。
-
-## 当前架构和目标架构
-
-当前实现：
-
-```text
-Provider / Agent Runtime
-        ↓
-     Raw Trace
-        ↓
-Normalization / Replay
-        ↓
-   Derived State
-        ↓
- Canvas / Inspector
-```
-
-目标：
-
-```text
-Channel / Workbench
-        │
-        ▼
-Identity Resolution
-        │
-        ▼
-Authorization
-        │
-        ▼
-Conversation + Personal Agent
-        │
- ┌──────┼───────────┬───────────┐
- │      │           │           │
-Tools  Workers    LongTask     Eval
- │      │                       │
- └──────┼───────────────────────┘
-        ▼
-       Run
-        ▼
- Raw Trace + Derived State
-        ▼
-Experience Mining
-        ▼
-Memory / Skills / Assets / Journal
-        ▼
-Timeline / Canvas / Inspector
-```
-
-## 从源码运行
-
-Glassbox 使用 Vite+。
-
-macOS 和 Linux：
-
-```bash
-curl -fsSL https://vite.plus | bash
-vp i
-vp run dev
-```
-
-Windows：
-
-```powershell
-irm https://vite.plus/ps1 | iex
-vp i
-vp run dev
-```
-
-开发环境统一使用相对路径 `/api` 和 `/ws`。不要把固定开发端口写进客户端代码。
-
-## 当前项目结构
+## 仓库结构
 
 ```text
 apps/
-  server/
-  web/
+  server/        当前 Runtime、Provider、Trace、State、WebSocket
+  web/           当前 React + tldraw Workbench
+    e2e/         历史与现行浏览器回归测试
 
 packages/
-  contracts/
-  shared/
+  contracts/     真正跨边界时才放 Contract
+  shared/        小而稳定的共享工具
+
+.plans/
+  03-personal-agent-foundation.md
+  findings/
+
+assets/
+  readme/
 
 upstream/
-.plans/
-e2e/
-template/
+  t3-code/
 ```
 
-当前不存在的 package 不要为了未来规划提前创建。
+不要为了未来架构提前创建空 package。
 
-## 开发原则
+## 开始开发
 
-- Default deny。没有明确授权就是拒绝
-- 先授权再组 Context，未经授权的数据不能进入模型上下文
-- Tool、Worker、Memory、Skill、Asset 和 Channel 都不能绕过 Authorization
-- 外部输入永远不能借 Agent 的 Owner 身份形成权限升级
-- Worker 权限只能缩小，不能比调用者更大
-- 每个关键授权判断进入 Trace
-- Raw Trace 不重写
-- Runtime 和 Domain Model 优先于 UI
-- Channel、Provider、Worker 的专有逻辑留在 Integration 层
-- 长程任务的副作用必须考虑重试、幂等和去重
-- Memory、Skill、Asset 的自动沉淀必须有来源和 Promotion Gate
-- Eval 配置和结果必须可追溯
-- 成熟实现能借就先借，拥有更多代码不是目标
+要求 Node.js `>=22.18.0`。
 
-## 测试
+安装：
 
-测试必须使用隔离数据。
+```bash
+npm install
+```
 
-> Copy in. Never point in. Never write back.
+启动 Runtime：
 
-权限测试至少覆盖拒绝路径、跨用户读取、跨 Scope 读取、Worker 权限升级、Prompt Injection 诱导越权、Approval 绕过和重复副作用。
+```bash
+npm run dev:server
+```
 
-异步测试等待真实完成信号，不用任意 `sleep` 掩盖竞态。
+另一个终端启动 Web：
+
+```bash
+npm run dev:web
+```
+
+运行当前 Server 测试：
+
+```bash
+npm run test:server
+```
+
+现有 `apps/web/e2e/` 中包含一些需要真实 Provider、预置 Session 或历史 Fixture 的回归脚本。不要把全量 E2E 当成每个改动的默认检查。新 Phase 3 测试优先使用 Fake Channel、Fake Tool 和 disposable Turso database。
+
+开发环境的客户端通过相对路径 `/api` 和 `/ws` 访问 Runtime。不要把新的绝对开发路径或机器专属目录写进代码。
+
+## Agent 开工顺序
+
+如果你是进入这个仓库工作的 Coding Agent，按这个顺序读：
+
+1. `AGENTS.md`
+2. `.plans/03-personal-agent-foundation.md`
+3. 当前任务相关的 `.plans/findings/`
+4. 相关 `upstream/` 或上游项目
+5. 当前实现和 focused tests
+
+不要从旧 Git 历史恢复已经删除的 Plan、Ticket、Template 或 debug 文件，除非当前问题确实需要它们。
 
 ## 当前状态
 
-Glassbox 还很早。
+Glassbox 还很早，但方向已经收口。
 
-下一阶段的重点不是继续扩 Canvas，而是把 Personal Agent 的 Identity、Authorization、Conversation、Memory、Turso 持久化和 Learning Loop 打成第一个真实闭环。
+下一步不是继续扩 Canvas，也不是同时接十个聊天渠道。现在只做一个可证明的 Personal Agent Foundation：**身份明确、权限分明、Conversation 可持久恢复、Turso 保存长期状态、所有授权决策可追溯。**
 
-其中 Authorization 是 P0。任何外部 Channel、Mail、Calendar、Worker、Memory 或 Asset 功能，在权限边界没有被代码和测试证明之前都不应该开放给其他用户。
+这层正确以后，再让微信、QQ、Mail、Calendar、Memory、Skill、LongTask、Eval 和 Arena 逐层接进来。
