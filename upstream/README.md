@@ -6,12 +6,13 @@ Nothing in this directory is imported at runtime. Vendor only the smallest sourc
 
 ## Rules
 
-- Check relevant upstream implementations before inventing standard provider, channel, memory, eval, authorization, durable-task, trajectory, skill, or asset infrastructure.
+- Check relevant upstream implementations before inventing standard provider, channel, memory, eval, authorization, durable-task, trajectory, skill, asset, routing, retrieval, or token-budget infrastructure.
 - Each vendored project must include source repository, pinned commit, license, original paths, and the reason each file was copied.
 - Preserve copyright, license, and NOTICE requirements when copying code.
 - Do not vendor an entire repository when a few files are enough.
 - Keep upstream-specific commands and quirks inside the relevant integration boundary.
 - If a project is only an approved reference, do not create an empty directory for it.
+- A precise `SOURCES.md` research note is allowed when it records concrete source paths and adoption constraints even before source files are vendored.
 - Upstream code is evidence and implementation material. Glassbox still owns its product model and security boundary.
 
 ## Currently vendored
@@ -26,6 +27,7 @@ Vendor selectively when a current implementation slice needs them.
 | --- | --- |
 | `HKUDS/OpenHarness` | Agent loop, tools, skills, memory, channel gateway, QQ |
 | `keli-wen/agy-staff` | AGY worker delegation and background job lifecycle |
+| `TokenRhythm/opensquilla` | Context budgets, tool-result budgets, hybrid vector retrieval, model routing, token-efficient projection |
 | `joyehuang/trajectory-panel` | Trajectory parsing, timeline, incremental tail, redaction, Turso sync |
 | `UKGovernmentBEIS/inspect_ai` | Eval tasks, datasets, scorers, eval sets, experiment execution |
 | `temporalio/sdk-typescript` | Durable long tasks, retry, signal, cancellation, child work, continuation |
@@ -45,3 +47,5 @@ Vendor selectively when a current implementation slice needs them.
 | `sotopia-lab/sotopia` | Multi-Agent social environments and social evaluation |
 
 The approved-reference list is a research index, not a dependency list. Do not add a runtime dependency just because a project appears here.
+
+OpenSquilla is specifically a post-foundation efficiency reference. Its routing, retrieval, context compression, and token-budget mechanisms must not become Plan 03 dependencies. Authorization, identity, Conversation isolation, persistence correctness, and auditable evidence come first.
