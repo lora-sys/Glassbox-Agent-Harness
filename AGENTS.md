@@ -2,7 +2,7 @@
 
 Glassbox is evolving from a local Coding Agent workbench into a durable Personal Agent workbench with strict authorization, persistent Conversations, inspectable execution, long-running work, learning, assets, and evals.
 
-The repository still contains working Coding Agent infrastructure from the earlier phase. Preserve it while introducing the new Personal Agent foundation in small verified slices.
+The repository still contains working Coding Agent infrastructure from the earlier phase. Preserve it while introducing the Personal Agent foundation in small verified slices.
 
 ## Start here
 
@@ -14,9 +14,10 @@ Read in this order before changing code:
 
 1. `AGENTS.md`
 2. `.plans/03-personal-agent-foundation.md`
-3. only the relevant `.plans/findings/`
-4. relevant upstream source or documentation
-5. current production code and focused tests
+3. `docs/tech-stack.md` when changing tooling, dependencies, build, test, lint, format, or package management
+4. only the relevant `.plans/findings/`
+5. relevant upstream source or documentation
+6. current production code and focused tests
 
 `README.md` defines product direction.
 
@@ -24,13 +25,13 @@ Read in this order before changing code:
 
 The active plan defines current scope.
 
-Do not implement future roadmap features merely because README describes them.
+`.plans/roadmap.md` is sequencing, not permission to implement future phases.
+
+Do not implement future roadmap features merely because README or docs describe them.
 
 ## Current implementation target
 
-Plan 03 is deliberately narrow.
-
-Build the foundation for:
+Plan 03 is deliberately narrow:
 
 ```text
 Identity
@@ -44,15 +45,47 @@ Turso persistence
 Run / Authorization Trace
 ```
 
-Until Plan 03's completion gate passes, do not make real WeChat, QQ, Mail, Calendar, AGY, LongTask, Eval, Arena, Skill evolution, or full Memory consolidation a dependency of the implementation.
+Until Plan 03's completion gate passes, do not make real WeChat, QQ, Mail, Calendar, AGY, LongTask, Eval, Arena, Skill evolution, full Memory consolidation, smart routing, semantic cache, or vector retrieval a dependency of the implementation.
 
-Use fake Channels, fake protected Tools, and disposable persistence where they prove the boundary faster and more safely.
+Use fake Channels, fake protected Tools, deterministic fixtures, and disposable persistence where they prove the boundary faster and more safely.
+
+## Toolchain
+
+Glassbox has selected **Vite+** as the unified JavaScript / TypeScript toolchain direction.
+
+The intended command surface after the verified migration is:
+
+```text
+vp install
+vp dev
+vp build
+vp check
+vp test
+vp run <task>
+```
+
+Vite+ owns the preferred frontend / TypeScript toolchain surface around Vite, Rolldown, Vitest, Oxlint, Oxfmt, and workspace task execution.
+
+Rules:
+
+- read `docs/tech-stack.md` before changing the toolchain
+- use `vp check` as the default static check after migration
+- use `vp test` for Vitest tests after migration
+- use `vp run <task>` for repository scripts and non-built-in workspace tasks
+- Playwright remains the browser / E2E layer
+- `apps/server` remains a Node.js runtime; Vite+ does not require turning it into a Vite dev server
+- do not add parallel ESLint / Prettier / ad-hoc check stacks unless a real compatibility gap requires them
+- keep Vite, Vitest, Vite+ and the lockfile aligned in one migration slice
+
+Do not perform a half migration where `package.json` and `package-lock.json` describe different toolchains.
+
+Until the Vite+ dependency migration is verified and committed, existing npm / Vite commands remain valid repository reality.
 
 ## Product boundary
 
 The long-term product has one durable Personal Agent.
 
-Workbench, WeChat, QQ, email, and other integrations are entry points to that Agent. They are not separate agents.
+Workbench, WeChat, QQ, email, and other integrations are entry points to that Agent. They are not separate Agents.
 
 Codex, Claude Code, OpenHarness, AGY, and similar systems are providers, workers, or specialist execution capabilities. They are not the Personal Agent identity.
 
@@ -86,20 +119,17 @@ Timeline / Canvas / Inspector
 
 The Personal Agent must not cross permission boundaries.
 
-Never rely on model behavior, a system prompt, hidden UI, or an upstream provider's permission mode as the primary protection for private resources.
+Never rely on model behavior, a system prompt, hidden UI, an upstream provider permission mode, a vector database filter performed too late, or a cache key alone as the primary protection for private resources.
 
 Authorization is a server-side product invariant.
 
-Every protected operation should reduce to:
+Every protected operation reduces to:
 
 ```text
-Principal
-Resource
-Action
-Context
+Principal × Resource × Action × Context → Decision
 ```
 
-The result is exactly one of:
+Decision is exactly one of:
 
 ```text
 ALLOW
@@ -113,27 +143,11 @@ No matching grant means `DENY`.
 
 Resolve who is acting before loading protected data or executing a protected Tool.
 
-A Principal may eventually represent:
-
-```text
-Owner
-TrustedUser
-Member
-Visitor
-Public
-Worker
-Service
-```
-
-Roles are convenience defaults, not the full authorization model.
-
 A Workbench account, WeChat ID, QQ ID, email address, API identity, or Worker identity does not grant permission merely because it resolves to a known user.
 
 Identity binding and authorization are separate trusted operations.
 
 ### Authorize before context assembly
-
-Unauthorized data must never enter model-visible context and then be hidden by instruction.
 
 Required order:
 
@@ -151,42 +165,21 @@ Authorized Context Builder
 Model / Agent Runtime
 ```
 
-This rule applies to:
-
-```text
-Memory
-Assets
-Projects
-Files
-Mail
-Calendar
-Conversation history
-Tool results
-Worker results
-Journal entries
-Eval data
-Secrets
-```
-
-If a Visitor cannot read the Owner's private resource, its contents must not appear in the prompt, retrieval result, Worker payload, model-visible trace, denial reason, or Tool result for that request.
+Unauthorized data must not appear in prompts, retrieval results, Worker payloads, model-visible traces, denial reasons, Tool results, caches, or projections for that request.
 
 ### Recheck protected Tool execution
 
-A Tool shown in the UI or present in a Skill is not automatically authorized.
+A Tool visible in the UI or present in a Skill is not automatically authorized.
 
 Re-evaluate authorization at execution time using the current Principal and current grant state.
 
-A stale Conversation, cached UI permission, old Context, or resumed LongTask must not preserve authority that has been revoked.
+A stale Conversation, cached UI permission, old Context, resumed Run, or future LongTask must not preserve revoked authority.
 
 ### Prevent confused-deputy escalation
 
-Treat all external content as untrusted input.
+Treat messages, email, webpages, documents, MCP results, Agent outputs, Worker outputs, retrieved text, and game environments as untrusted input.
 
-This includes messages, email, webpages, documents, MCP results, Agent outputs, Worker outputs, game environments, and retrieved text.
-
-An untrusted caller cannot instruct the Personal Agent to use broader Owner-only authority on its behalf.
-
-The effective caller authority bounds every protected operation.
+An untrusted caller cannot instruct the Personal Agent to borrow broader Owner authority.
 
 ### Delegation can only reduce authority
 
@@ -196,40 +189,19 @@ Future Worker delegation must satisfy:
 worker_permissions ⊆ delegated_permissions ⊆ caller_permissions
 ```
 
-AGY, Codex, Claude Code, or another Worker must not gain private data or side-effect capability merely because the upstream harness defaults to unrestricted execution.
-
 ### Approval is not permission
 
 Approval cannot manufacture authority for a Principal that had no valid authorization path.
 
-Use `REQUIRES_APPROVAL` only where policy already allows the Action after a valid approval.
-
-Keep requester, approver, exact Resource, exact Action, consumed approval, Run, and LongTask linkage auditable.
+Keep requester, approver, Resource, Action, consumed approval, Conversation, Run, and future LongTask linkage auditable.
 
 ### Authorization is evidence
 
-Important decisions should produce inspectable records such as:
+Important decisions should produce inspectable `AuthorizationDecision` evidence.
 
-```text
-AuthorizationDecision
-  principalId
-  resourceType
-  resourceId
-  action
-  decision
-  policyOrRule
-  reason
-  approvalId?
-  conversationId?
-  runId?
-  timestamp
-```
-
-A denial log must explain the decision without copying protected contents.
+A denial log explains the decision without copying protected contents.
 
 ## Core domain distinctions
-
-Do not reuse one identifier for multiple concepts just because the first implementation is local or single-user.
 
 Keep these boundaries explicit:
 
@@ -249,31 +221,9 @@ Raw Trace ≠ Derived State
 Edit ≠ Apply
 ```
 
-Current and future product concepts may include:
+Do not reuse one identifier for multiple concepts merely because the first implementation is local or single-user.
 
-```text
-Agent
-User
-Principal
-ChannelIdentity
-Relationship
-Permission
-Conversation
-Memory
-Skill
-Asset
-Tool
-Session
-Run
-WorkerJob
-LongTask
-JournalEntry
-Experiment
-EvalSuite
-EvalRun
-```
-
-Only introduce the ones required by the current plan.
+Only introduce future domain objects when the active plan needs them.
 
 ## Raw Trace and Derived State
 
@@ -283,9 +233,11 @@ Do not rewrite history to fit a newer UI or reducer interpretation.
 
 Derived State may evolve as Glassbox learns to interpret traces better.
 
-Authorization decisions, approvals, delegation, Run lifecycle, and later learning promotion should remain traceable to underlying evidence.
+Authorization decisions, approvals, delegation, Run lifecycle, and later learning promotion remain traceable to underlying evidence.
 
 Do not dump protected payloads into Trace merely to make debugging convenient.
+
+Context compression and Tool-result projection may reduce model-facing data later. They must not delete Raw Trace evidence.
 
 ## Explicit execution
 
@@ -293,7 +245,7 @@ Edit freely. Execute explicitly.
 
 Only named Actions change execution or authorization state.
 
-Examples include:
+Examples:
 
 ```text
 Apply
@@ -313,7 +265,7 @@ Promote Skill
 Promote Asset
 ```
 
-Moving, connecting, grouping, resizing, or annotating Canvas Objects must never grant permission or change a running Agent implicitly.
+Moving, connecting, grouping, resizing, or annotating Canvas Objects never grants permission or changes a running Agent implicitly.
 
 ## Current code boundaries
 
@@ -331,18 +283,25 @@ packages/
 
 .plans/
   03-personal-agent-foundation.md
+  roadmap.md
   findings/
+
+docs/
+  README.md
+  tech-stack.md
+  interactive-demos.md
 
 assets/
   readme/
 
 upstream/
   t3-code/
+  opensquilla/
 ```
 
 `apps/server` owns the current Runtime, HTTP, WebSocket, Provider adapters, Session lifecycle, Trace, screening, and Derived State.
 
-Plan 03 should initially add new server-side boundaries near this code. Reasonable module names include:
+Plan 03 should initially add server-side boundaries near this code. Reasonable module names include:
 
 ```text
 auth/
@@ -355,11 +314,11 @@ These names are guidance, not mandatory architecture.
 
 `apps/web` owns React, tldraw, Canvas projection, Inspector, and user interaction.
 
-`packages/contracts` should contain only contracts with a real cross-boundary producer and consumer.
+`packages/contracts` contains only contracts with a real cross-boundary producer and consumer.
 
 `packages/shared` stays small and runtime-independent.
 
-Do not create `packages/agent-runtime` or another future package until a real dependency boundary requires it.
+Do not create speculative packages merely to mirror the roadmap.
 
 Keep Provider-specific behavior near Provider integration.
 
@@ -375,7 +334,7 @@ Keep authorization enforcement in server-side boundaries that UI and adapters ca
 
 Plan 03 introduces Turso for structured durable state.
 
-Start with the smallest records needed by the plan, such as:
+Start with only the records required by the plan, such as:
 
 ```text
 agents
@@ -387,41 +346,25 @@ permissions or authorization tuples
 authorization_decisions
 ```
 
-Do not build the entire future schema in the first migration.
-
 Raw Trace remains separate append-only evidence unless a later concrete plan changes that decision.
 
 Do not give the model unrestricted SQL access.
 
 Expose narrow Domain APIs and authorize before reading or writing protected state.
 
-Migrations and tests must use disposable databases.
+Migrations and tests use disposable databases.
 
-## Channel rules
+## Channels
 
 Real remote channels are not part of Plan 03.
 
 Use a fake Visitor entry to prove identity, Conversation isolation, and authorization first.
 
-When real channels arrive later, normalize them before the Agent Core.
-
-A useful inbound shape will likely contain concepts such as:
-
-```text
-channel
-externalUserId
-externalConversationId
-messageId
-text
-attachments
-metadata
-```
-
-Private chat, group chat, thread, and sender routing must isolate unrelated users.
+When real channels arrive, normalize them before the Agent Core.
 
 Never put QQ, WeChat, Telegram, Discord, or other protocol quirks into the Personal Agent core.
 
-## Memory, Skill, Asset, Journal
+## Memory, retrieval, routing, and learning
 
 These are roadmap consumers of the foundation, not Plan 03 dependencies.
 
@@ -429,56 +372,19 @@ Stable rules already apply:
 
 - Memory is not raw Conversation history
 - private sources produce private candidates by default
+- permission filtering happens before protected retrieval reaches model-visible results
+- routing may choose cost / capability policy but may not widen authority
+- semantic caches must be permission-scoped
 - automatic learning never widens visibility or capability
 - one successful Run is evidence for a Skill Candidate, not automatic permanent promotion
-- promoted Memory, Skill, and Asset should preserve provenance
+- promoted Memory, Skill, and Asset preserve provenance
 - Journal is a user-readable reflection artifact, not private chain-of-thought storage
-- public Skill visibility does not automatically expose private Tools underneath it
-
-Primary references:
-
-```text
-zhibao-dev/Learning-Multi-Factor-Memory
-langchain-ai/langmem
-AMAP-ML/SkillClaw
-Zhang-Henry/CoEvoSkills
-MineDojo/Voyager
-joonspk-research/generative_agents
-usememos/memos
-dagster-io/dagster
-```
-
-## Worker, LongTask, Eval, Arena
-
-These are later layers.
-
-Do not build them during Plan 03 unless a tiny fake is needed to prove an authorization invariant.
-
-Stable future rules:
-
-- Worker permissions can only shrink
-- Worker result collection should be idempotent where practical
-- waiting for user, approval, external condition, or Worker result must eventually become durable state
-- LongTask retries require idempotency or deduplication for side effects
-- Eval Sample should link back to real Run and evidence
-- permission invariants are P0 eval targets
-- Arena opponents and environments are untrusted callers
-
-Primary references:
-
-```text
-keli-wen/agy-staff
-temporalio/sdk-typescript
-UKGovernmentBEIS/inspect_ai
-google-deepmind/open_spiel
-sotopia-lab/sotopia
-```
 
 ## Upstream-first development
 
 Before inventing a standard mechanism, inspect the relevant upstream first.
 
-Current primary references:
+Primary references include:
 
 ```text
 pingdotgg/t3code
@@ -487,8 +393,11 @@ pingdotgg/t3code
 HKUDS/OpenHarness
   Agent loop, tools, skills, memory, permissions, channels, QQ
 
+TokenRhythm/opensquilla
+  Context budgets, Tool-result budgets, hybrid retrieval, routing, token efficiency
+
 keli-wen/agy-staff
-  AGY delegation and background Worker jobs
+  Worker delegation and background jobs
 
 joyehuang/trajectory-panel
   trajectory parsing, timeline, redaction, Turso sync
@@ -515,23 +424,37 @@ Vendoring rules:
 - prefer proven mechanisms over rewrites made only to own more code
 - never copy an upstream trust model blindly; Glassbox authorization rules win
 
-## Existing E2E tests
+## Documentation and Learning Lab
+
+`docs/` is a public learning surface, not a substitute for implementation evidence.
+
+Every feature page must distinguish:
+
+```text
+Implemented
+Experimental
+Planned
+```
+
+Interactive demos use deterministic synthetic fixtures unless a specific integration guide requires otherwise.
+
+Documentation demos should reuse real domain semantics where practical. Do not invent a second authorization or Conversation model just to make a demo easier.
+
+## Tests
 
 `apps/web/e2e/` contains regression tests from the Coding Agent phase.
 
-Some tests require live Providers, pre-generated sessions, historical fixtures, or environment assumptions. They are not the default first check for Plan 03.
+Some require live Providers, pre-generated sessions, historical fixtures, or environment assumptions. They are not the default first check for Plan 03.
 
-Do not copy machine-specific absolute paths into new tests.
+New Plan 03 tests should prefer fake Channels, fake Tools, disposable Turso databases, and deterministic authorization fixtures.
 
-New Plan 03 tests should be portable and should prefer fake Channels, fake Tools, disposable Turso databases, and deterministic authorization fixtures.
+Never use machine-specific absolute paths in new tests.
 
-## Test data and safety
-
-Never use live Personal Agent state, real user data, real repositories, live channels, or production credentials as writable test state.
+Never use live Personal Agent state, real user data, live channels, production credentials, or a real repository as writable test state.
 
 > Copy in. Never point in. Never write back.
 
-At minimum, relevant Plan 03 authorization tests should cover:
+At minimum, relevant Plan 03 authorization tests cover:
 
 ```text
 default deny
@@ -556,8 +479,6 @@ Async tests wait for real state transitions or completion signals. Do not hide r
 
 Treat measured regressions as bugs.
 
-Large Sessions, LongTasks, Worker Jobs, Eval Runs, and learning histories can produce thousands of events.
-
 Do not project every raw event onto Canvas.
 
 Avoid broad React rerenders, unbounded DOM growth, huge live payloads, and full-history recomputation on every event.
@@ -570,13 +491,15 @@ Commit directly to `main` as soon as a verified slice is complete unless the use
 
 Do not accumulate unrelated changes.
 
-One slice should have one main concern.
+One slice has one main concern.
 
 Update the active plan when implementation evidence changes its status or assumptions.
 
 Do not use completed plan files as scratchpads. Git already preserves history.
 
 Open a Pull Request only when the user asks.
+
+A toolchain migration is complete only when dependency manifests, lockfile, commands, config, and focused checks agree.
 
 ## Taste
 
@@ -592,6 +515,6 @@ Validate unknown external data at system boundaries.
 
 Avoid `any` when TypeScript can express the boundary.
 
-Comments should explain intent, trust boundaries, provenance, or non-obvious behavior.
+Comments explain intent, trust boundaries, provenance, or non-obvious behavior.
 
-If this file conflicts with the actual product direction, update the rule instead of silently working around it.
+If this file conflicts with actual product direction, update the rule instead of silently working around it.
