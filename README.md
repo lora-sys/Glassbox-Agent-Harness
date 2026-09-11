@@ -14,6 +14,8 @@ Glassbox 是一个正在演进中的 Personal Agent 工作台。
 
 当前唯一 Active Plan：[`Plan 03 — Personal Agent Foundation`](./.plans/03-personal-agent-foundation.md)
 
+长期阶段顺序记录在 [`.plans/roadmap.md`](./.plans/roadmap.md)。文档站与交互式学习规范记录在 [`docs/`](./docs/README.md)。这些不是当前 P3 的额外实现要求。
+
 ![Plan 03：身份、权限、会话、持久化与执行证据闭环](./assets/readme/glassbox-p3-architecture.png)
 
 这一阶段只做地基：
@@ -30,7 +32,7 @@ Turso persistence
 Run / Authorization Trace
 ```
 
-完成 Plan 03 之前，不抢跑真实微信、QQ、Mail、Calendar、Memory 自动沉淀、Skill evolution、AGY、LongTask、Eval 或 Arena。
+完成 Plan 03 之前，不抢跑真实微信、QQ、Mail、Calendar、Memory 自动沉淀、Skill evolution、AGY、LongTask、Eval、Arena、智能路由或完整向量检索。
 
 这一阶段的验收标准很直接：
 
@@ -138,14 +140,18 @@ Turso durable state
 Conversation Domain
 Remote Channels
 Memory promotion
+Authorized hybrid retrieval
 Skill evolution
 Asset Library
 Journal / Monthly Review
 Mail / Calendar
 AGY Worker
 LongTask Engine
+Efficient Agent Runtime
+Execution Routing
 Eval Workbench
 Arena
+Documentation Learning Site
 ```
 
 ## 核心对象
@@ -245,10 +251,13 @@ conversation
 
 Memory Candidate 会考虑 future utility、goal relevance、reliability、reuse、novelty、staleness、contradiction 和 privacy risk，再决定是否晋升。
 
+Retrieval 以后会在授权范围内组合 lexical search、vector search、source weighting、temporal decay、diversity reranking 和 context budget。权限过滤发生在受保护内容进入模型可见检索结果之前。
+
 主要参考：
 
 - `zhibao-dev/Learning-Multi-Factor-Memory`
 - `langchain-ai/langmem`
+- `TokenRhythm/opensquilla`
 
 ## Skill evolution
 
@@ -319,6 +328,48 @@ continuation
 
 主要参考 `temporalio/sdk-typescript`。
 
+## Efficient Agent Runtime
+
+权限和持久化地基完成以后，Glassbox 还需要一层可测量的运行效率系统。
+
+`TokenRhythm/opensquilla` 是这一层的重要上游参考，重点研究：
+
+```text
+Context Budget Governor
+Tool Result Budget
+Tool Result Projection
+Token Estimation
+Hybrid Retrieval
+Execution Routing
+Thinking-depth selection
+Prompt / Context compression policy
+Duplicate retrieval prevention
+Routing observability
+```
+
+Glassbox 的 Router 最终不应该只返回一个模型名，而应该返回明确的执行策略：
+
+```text
+ExecutionPolicy
+  modelTier
+  provider
+  model
+  thinkingLevel
+  promptPolicy
+  contextBudget
+  retrievalBudget
+  toolBudget
+  workerPolicy
+  ensemblePolicy
+  costCeiling
+```
+
+Router 可以决定怎样更省或更强，不能改变 Principal，也不能扩大授权范围。
+
+Tool Result 可以为模型生成压缩投影，但完整 Raw Trace 和证据不能因此被删除。
+
+这一层必须用 Eval 证明价值，例如比较 Router 开关前后的任务成功率、权限 invariant、Token、Cost 和 Latency，而不是只声称“更省 Token”。具体顺序见 [`.plans/roadmap.md`](./.plans/roadmap.md)，源码索引见 [`upstream/opensquilla/SOURCES.md`](./upstream/opensquilla/SOURCES.md)。
+
 ## Eval 和实验工作台
 
 以后可以直接告诉 Agent：
@@ -376,6 +427,45 @@ Permissions
 
 Canvas 是投影。移动、连接、分组、缩放和批注都不能暗中改变 Agent 执行和权限。
 
+## 文档站与交互式学习
+
+Glassbox 计划有一个独立的公开文档与学习站，目标不是把 README 搬到网页上，而是让别人真正理解关键概念。
+
+每个重要概念尽量按下面的学习路径组织：
+
+```text
+Explain
+→ Visualize
+→ Manipulate
+→ Observe State Transition
+→ Inspect Evidence
+→ Link to Real Implementation
+```
+
+文档页面必须明确标注：
+
+```text
+Implemented
+Experimental
+Planned
+```
+
+第一批交互 Demo 会围绕 P3 的真实概念：
+
+```text
+Owner vs Visitor
+Permission vs Approval
+Authorize Before Context
+Conversation vs Session vs Run
+Raw Trace → Derived State → Canvas
+```
+
+后续再加入 Memory Retrieval Lab、Context Budget Simulator、Tool Result Projection、Execution Routing Lab、Router Eval 和 LongTask State Machine。
+
+公开 Demo 默认使用 synthetic deterministic fixtures，不读取真实 Personal Agent Memory、私人 Conversation、生产凭证或私有 Trace。
+
+完整站点规范见 [`docs/README.md`](./docs/README.md)，交互 Demo 课程表见 [`docs/interactive-demos.md`](./docs/interactive-demos.md)。
+
 ## 上游参考
 
 成熟项目已经解决好的机制优先研究和复用。`upstream/` 保存选择性的只读参考代码，生产代码不能直接 import。
@@ -385,6 +475,7 @@ Canvas 是投影。移动、连接、分组、缩放和批注都不能暗中改�
 | `pingdotgg/t3code` | Provider、Claude Code、权限、Resume |
 | `HKUDS/OpenHarness` | Agent Loop、Tools、Skills、Memory、Channels、QQ |
 | `keli-wen/agy-staff` | AGY Worker、后台 Job、Continue、Restart |
+| `TokenRhythm/opensquilla` | Context Budget、Tool Result Budget、Hybrid Retrieval、Routing、Token-efficient Projection |
 | `joyehuang/trajectory-panel` | Trajectory、Timeline、Redaction、Turso Sync |
 | `UKGovernmentBEIS/inspect_ai` | Eval、Dataset、Scorer、Experiment Runner |
 | `temporalio/sdk-typescript` | Durable LongTask |
@@ -419,16 +510,22 @@ packages/
 
 .plans/
   03-personal-agent-foundation.md
+  roadmap.md
   findings/
+
+docs/
+  README.md
+  interactive-demos.md
 
 assets/
   readme/
 
 upstream/
   t3-code/
+  opensquilla/
 ```
 
-不要为了未来架构提前创建空 package。
+不要为了未来架构提前创建空 package。文档站真正开始实现以前也不提前创建 `apps/docs`。
 
 ## 开始开发
 
@@ -480,7 +577,7 @@ Glassbox 还很早，但方向已经收口。
 
 下一步不是继续扩 Canvas，也不是同时接十个聊天渠道。现在只做一个可证明的 Personal Agent Foundation：**身份明确、权限分明、Conversation 可持久恢复、Turso 保存长期状态、所有授权决策可追溯。**
 
-这层正确以后，再让微信、QQ、Mail、Calendar、Memory、Skill、LongTask、Eval 和 Arena 逐层接进来。
+这层正确以后，再让真实 Channel、Memory、Retrieval、Mail、Calendar、Skill、LongTask、Efficient Runtime、Eval 和 Arena 逐层接进来。文档与交互式学习可以先做信息架构和设计，但不能把计划能力写成已实现。
 
 ## License
 
