@@ -1,6 +1,6 @@
 # Glassbox
 
-![Glassbox Personal Agent：把每一次对话变成更好的自己](./assets/readme/glassbox-hero.jpg)
+![Glassbox Personal Agent：把每一次对话变成更好的自己](./assets/readme/glassbox-hero.png)
 
 Glassbox 是一个正在演进中的 Personal Agent 工作台。
 
@@ -14,7 +14,7 @@ Glassbox 是一个正在演进中的 Personal Agent 工作台。
 
 当前唯一 Active Plan：[`Plan 03 — Personal Agent Foundation`](./.plans/03-personal-agent-foundation.md)
 
-![Plan 03：身份、权限、会话、持久化与执行证据闭环](./assets/readme/glassbox-p3-architecture.jpg)
+![Plan 03：身份、权限、会话、持久化与执行证据闭环](./assets/readme/glassbox-p3-architecture.png)
 
 这一阶段只做地基：
 
