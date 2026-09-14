@@ -52,7 +52,7 @@ ChannelIdentity ≠ User
 Identity ≠ Authorization
 Conversation ≠ Session
 Session ≠ Run
-Provider / Worker ≠ Personal Agent
+Runtime / Provider / Worker ≠ Personal Agent
 ```
 
 ### 3. Researchable by default
@@ -62,7 +62,7 @@ Glassbox should preserve enough evidence to answer:
 - Who was acting?
 - What was that Principal allowed to see or do?
 - What Context actually reached the Agent?
-- Which Tool or Provider executed?
+- Which Tool or Runtime executed?
 - What changed during the Run?
 - Why was an operation allowed, denied, or sent for approval?
 - Which result came from which configuration and evidence?
@@ -71,11 +71,29 @@ Editing, projection, compression, or a newer reducer must not erase what an acti
 
 ### 4. Agent-native, not provider-specific
 
-Glassbox connects to existing Agent runtimes and specialist workers instead of forcing every provider into one behavior.
+Glassbox connects to existing Agent runtimes and specialist workers instead of forcing every runtime into one behavior.
 
-Codex, Claude Code, OpenHarness, AGY, and future systems may expose different tools, lifecycle controls, context behavior, permission modes, and events.
+Pi, Codex, Claude Code, OpenHarness, AGY, and future systems may expose different tools, lifecycle controls, context behavior, permission modes, and events.
 
-Keep provider-specific behavior close to the provider integration.
+Pi is the preferred upstream foundation for the future local Agent runtime path. Lora PI Kit is the maintainer-owned Pi configuration and extension layer. Glassbox remains the product and trust boundary.
+
+Do not turn Glassbox into a Pi wrapper. Do not copy Pi core into Glassbox to create Lora PI Kit.
+
+For Pi customization, use this order before considering a core patch:
+
+```text
+settings / project config
+Pi package
+Skill
+Extension
+SDK / RPC
+upstream contribution
+local core patch
+```
+
+Read `docs/runtime-strategy.md` before changing the runtime boundary, adding Pi integration, moving behavior into Lora PI Kit, or changing the role of Codex and Claude Code.
+
+Keep runtime-specific behavior close to the runtime integration.
 
 Share only the concepts Glassbox actually needs.
 
@@ -122,10 +140,11 @@ Read in this order before changing code:
 
 1. `AGENTS.md`
 2. `.plans/03-personal-agent-foundation.md`
-3. `docs/tech-stack.md` when changing tooling, dependencies, build, test, lint, format, or package management
-4. only the relevant `.plans/findings/`
-5. relevant upstream source or documentation
-6. current production code and focused tests
+3. `docs/runtime-strategy.md` when changing runtime, provider, worker, Pi, Lora PI Kit, execution integration, runtime-level Skills, Extensions, or model execution policy
+4. `docs/tech-stack.md` when changing tooling, dependencies, build, test, lint, format, or package management
+5. only the relevant `.plans/findings/`
+6. relevant upstream source or documentation
+7. current production code and focused tests
 
 `README.md` defines product direction.
 
@@ -147,7 +166,7 @@ Run / Authorization Trace
 
 P3 may use fake Channels, fake protected Tools, deterministic fixtures, and disposable persistence to prove the boundary.
 
-Until P3 passes its completion gate, do not make real WeChat, QQ, Telegram, Discord, Slack, Mail, Calendar, AGY, LongTask, Eval, Arena, Skill evolution, full Memory consolidation, vector retrieval, semantic cache, smart routing, or serverless deployment a dependency of the implementation.
+Until P3 passes its completion gate, do not make real WeChat, QQ, Telegram, Discord, Slack, Mail, Calendar, AGY, LongTask, Eval, Arena, Skill evolution, full Memory consolidation, vector retrieval, semantic cache, smart routing, Pi migration, or serverless deployment a dependency of the implementation.
 
 Product history and future ideas belong in `README.md`, `.plans/roadmap.md`, `docs/`, or research notes. Current implementation scope belongs in the active plan.
 
@@ -163,8 +182,9 @@ Use these terms consistently.
 - **principal** means the effective actor used for an authorization decision.
 - **channel** means an entry point through which a User reaches the Personal Agent, such as Workbench, WeChat, QQ, Telegram, Discord, Slack, email, API access, or a future messaging / integration channel.
 - **channel identity** means a User's external identity inside one Channel, such as a Workbench account, WeChat ID, QQ ID, Telegram ID, Discord ID, Slack identity, email address, API identity, or future Channel identity. One User may have multiple Channel Identities. Trusted identity binding may map them to the same User but never grants additional Permission by itself.
-- **agent** means the durable Personal Agent product identity unless a provider-specific context clearly means an external Agent runtime.
-- **provider** means an external model / Agent runtime integration such as Codex or Claude Code.
+- **agent** means the durable Personal Agent product identity unless a runtime-specific context clearly means an external Agent runtime.
+- **runtime** means an external execution backend or Agent runtime integration such as Pi, Codex, or Claude Code.
+- **provider** means a model-provider or runtime-specific integration detail below the Glassbox product boundary.
 - **worker** means delegated specialist execution such as future AGY-style background work.
 - **resource** means protected data or capability addressed by authorization.
 - **action** means an explicit operation on a Resource or execution state.
@@ -196,7 +216,7 @@ Conversation ≠ Session
 Session ≠ Run
 LongTask ≠ Run
 WorkerJob ≠ LongTask
-Provider / Worker ≠ Personal Agent
+Runtime / Provider / Worker ≠ Personal Agent
 Event ≠ Canvas Object
 Asset ≠ Canvas Object
 Canvas ≠ Execution State
@@ -229,6 +249,8 @@ worker_permissions ⊆ delegated_permissions ⊆ caller_permissions
 8. **Writing to live user state.** Never run tests, migrations, cleanup, fixtures, or test Agents against the user's real Personal Agent state or real writable repositories.
 
 9. **Doing a half toolchain migration.** `package.json`, lockfile, Vite, Vitest, and Vite+ must describe one coherent toolchain after migration.
+
+10. **Forking Pi too early.** Do not maintain a broad Pi fork for behavior that settings, packages, Skills, Extensions, SDK, or RPC can implement. Put owned Pi workflow customization in Lora PI Kit and keep Glassbox product semantics in Glassbox.
 
 ## Explicit execution semantics
 
@@ -287,7 +309,7 @@ Before calling a change done, check the parts that apply.
 - **Conversation / Session / Run.** Preserve the correct lifetime and identity for each.
 - **Persistence.** Decide what survives refresh, reconnect, restart, and database reopen.
 - **Trace.** Verify evidence is useful without leaking protected payloads.
-- **Provider behavior.** Define what happens when a Provider does not support a capability.
+- **Runtime behavior.** Define what happens when a Runtime does not support a capability and keep runtime-specific behavior inside its integration boundary.
 - **Contracts.** When cross-boundary state changes, check every producer and consumer.
 - **Canvas projection.** Check both Glassbox state and visible tldraw behavior where relevant.
 - **Reverse states.** Grant / Revoke, start / stop, apply / edit, approve / consume, and similar paired states need explicit behavior.
@@ -422,7 +444,7 @@ Authorized Context
         ↓
 Personal Agent
         ↓
-Authorized Tool / Provider / Worker
+Authorized Tool / Runtime / Worker
         ↓
 Run
         ↓
@@ -447,3 +469,4 @@ Authorization
 Runtime / Provider / Persistence
         ↓
 Evidence
+```
