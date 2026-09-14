@@ -6,7 +6,7 @@ Nothing in this directory is imported at runtime. Vendor only the smallest sourc
 
 ## Rules
 
-- Check relevant upstream implementations before inventing standard provider, channel, memory, eval, authorization, durable-task, trajectory, skill, asset, routing, retrieval, or token-budget infrastructure.
+- Check relevant upstream implementations before inventing standard runtime, provider, channel, memory, eval, authorization, durable-task, trajectory, skill, asset, routing, retrieval, or token-budget infrastructure.
 - Each vendored project must include source repository, pinned commit, license, original paths, and the reason each file was copied.
 - Preserve copyright, license, and NOTICE requirements when copying code.
 - Do not vendor an entire repository when a few files are enough.
@@ -25,6 +25,7 @@ Vendor selectively when a current implementation slice needs them.
 
 | Project | Primary reference area |
 | --- | --- |
+| `earendil-works/pi` | Preferred local Agent runtime foundation, packages, extensions, skills, SDK, RPC, settings |
 | `HKUDS/OpenHarness` | Agent loop, tools, skills, memory, channel gateway, QQ |
 | `keli-wen/agy-staff` | AGY worker delegation and background job lifecycle |
 | `TokenRhythm/opensquilla` | Context budgets, tool-result budgets, hybrid vector retrieval, model routing, token-efficient projection |
@@ -48,6 +49,8 @@ Vendor selectively when a current implementation slice needs them.
 | `sotopia-lab/sotopia` | Multi-Agent social environments and social evaluation |
 
 The approved-reference list is a research index, not a dependency list. Do not add a runtime dependency just because a project appears here.
+
+Pi is the preferred upstream foundation for the future local Agent runtime path. Glassbox does not become a Pi fork or a Pi wrapper. The owned customization layer is Lora PI Kit, while Glassbox keeps product identity, authorization, Conversation, persistence, and Trace. See `pi/SOURCES.md` and `../docs/runtime-strategy.md`.
 
 OpenSquilla is specifically a post-foundation efficiency reference. Its routing, retrieval, context compression, and token-budget mechanisms must not become Plan 03 dependencies. Authorization, identity, Conversation isolation, persistence correctness, and auditable evidence come first.
 
