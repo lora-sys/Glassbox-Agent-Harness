@@ -8,6 +8,22 @@ The documentation site should help a technically curious user understand Glassbo
 
 The target is not a reference manual with a search box. The target is a concept-learning site with interactive demonstrations.
 
+## Architecture references
+
+The cross-cutting data, storage, observability, analytics, and public read boundary is defined in [`data-observability.md`](./data-observability.md).
+
+That document also fixes the current Web access rule:
+
+```text
+Owner
+  full management and private observability
+
+Public visitor
+  read-only access to explicitly published Trace or Eval projections only
+```
+
+The public documentation site is separate from both the Owner control plane and the public Trace / Eval observer pages.
+
 ## Audience
 
 The site should serve several readers without turning every page into a generic introduction:
@@ -148,6 +164,8 @@ Inspector
 Canvas
 Replay
 Cost and token usage
+Public Trace publication
+Public Eval publication
 ```
 
 ### Eval Lab
@@ -276,6 +294,8 @@ production Trace containing protected payloads
 ```
 
 Use synthetic fixtures specifically designed to show both allowed and denied paths.
+
+Public production observation is a different surface. It may expose only the sanitized publication snapshots defined in [`data-observability.md`](./data-observability.md), and only for Trace or Eval.
 
 ## Search and navigation
 
