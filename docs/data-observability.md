@@ -52,8 +52,14 @@ QQ, email, and other Channel identities do not receive management access.
 | Eval datasets and large Eval logs | Cloudflare R2 |
 | Replay bundles and backups | Cloudflare R2 |
 | Email inbox, sending, receiving and threads | AgentMail |
-| Email events and webhooks | AgentMail to Glassbox server |
+| Email events | AgentMail |
 | DNS, TLS and public ingress | Cloudflare |
+| Private connection from Cloudflare to Glassbox server | Cloudflare Tunnel |
+| Owner admin perimeter access | Cloudflare Access |
+| Infrastructure uptime, logs and error monitoring | Better Stack |
+| Secrets and service credentials | Infisical |
+| Webhook delivery, retry and replay | Hookdeck |
+| Delayed jobs and reliable HTTP task delivery | Upstash QStash |
 
 ## Storage split
 
@@ -81,6 +87,28 @@ Glassbox server
   APIs
   management UI
   public Trace and Eval UI
+```
+
+## Supporting infrastructure
+
+```text
+Cloudflare Tunnel
+  private server ingress
+
+Cloudflare Access
+  owner admin perimeter
+
+Better Stack
+  infrastructure observability
+
+Infisical
+  secrets
+
+Hookdeck
+  webhook reliability
+
+QStash
+  delayed and reliable HTTP task delivery
 ```
 
 ## Public observability
