@@ -28,6 +28,7 @@ Vendor selectively when a current implementation slice needs them.
 | `HKUDS/OpenHarness` | Agent loop, tools, skills, memory, channel gateway, QQ |
 | `keli-wen/agy-staff` | AGY worker delegation and background job lifecycle |
 | `TokenRhythm/opensquilla` | Context budgets, tool-result budgets, hybrid vector retrieval, model routing, token-efficient projection |
+| `Javis603/token-monitor` | Local Coding Runtime discovery, token/cost history, quotas/limits, health checks, session usage, Codex / Claude Code / Pi / Antigravity collectors |
 | `joyehuang/trajectory-panel` | Trajectory parsing, timeline, incremental tail, redaction, Turso sync |
 | `UKGovernmentBEIS/inspect_ai` | Eval tasks, datasets, scorers, eval sets, experiment execution |
 | `temporalio/sdk-typescript` | Durable long tasks, retry, signal, cancellation, child work, continuation |
@@ -49,3 +50,5 @@ Vendor selectively when a current implementation slice needs them.
 The approved-reference list is a research index, not a dependency list. Do not add a runtime dependency just because a project appears here.
 
 OpenSquilla is specifically a post-foundation efficiency reference. Its routing, retrieval, context compression, and token-budget mechanisms must not become Plan 03 dependencies. Authorization, identity, Conversation isolation, persistence correctness, and auditable evidence come first.
+
+Token Monitor is specifically a Runtime observability reference. Its local client discovery, usage/cost history, quota/limit collection, health checks, and Antigravity support should be studied when Glassbox begins the concrete Runtime Monitoring / Antigravity implementation slice. Adding the reference does not make those mechanisms Plan 03 dependencies.
