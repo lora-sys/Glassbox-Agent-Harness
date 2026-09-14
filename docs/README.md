@@ -12,7 +12,25 @@ The target is not a reference manual with a search box. The target is a concept-
 
 The cross-cutting data, storage, observability, analytics, and public read boundary is defined in [`data-observability.md`](./data-observability.md).
 
-That document also fixes the current Web access rule:
+The execution-runtime ownership boundary between Glassbox, Pi, Lora PI Kit, Codex, and Claude Code is defined in [`runtime-strategy.md`](./runtime-strategy.md).
+
+That runtime strategy fixes these boundaries:
+
+```text
+Glassbox
+  product and trust boundary
+
+Pi
+  preferred upstream local Agent runtime foundation
+
+Lora PI Kit
+  maintainer-owned Pi configuration and extension layer
+
+Codex / Claude Code
+  supported alternate runtime adapters
+```
+
+The data and observability architecture also fixes the current Web access rule:
 
 ```text
 Owner
@@ -98,6 +116,7 @@ Conversation
 Session
 Run
 Tool
+Runtime
 Provider
 Worker
 LongTask
@@ -127,7 +146,9 @@ Trace redaction
 ### Runtime
 
 ```text
-Provider adapters
+Glassbox Runtime Boundary
+Pi and Lora PI Kit
+Codex and Claude Code adapters
 Agent loop
 Tool boundary
 Context assembly
@@ -184,7 +205,7 @@ Memory retrieval Eval
 ```text
 Add a Channel
 Add a Tool
-Add a Provider
+Add a Runtime adapter
 Add a Worker
 Add a protected Resource type
 Add a Canvas projection
@@ -194,6 +215,8 @@ Add an Eval
 ### Upstream Notes
 
 Explain which problems Glassbox studies from mature upstream projects and which trust or product assumptions Glassbox intentionally does not copy.
+
+The upstream Pi note should also explain why Glassbox uses a separate Lora PI Kit layer rather than carrying a broad Pi fork.
 
 ## Page anatomy
 
@@ -304,12 +327,13 @@ Search should prioritize concepts and terminology, not only exact page titles.
 Important aliases should resolve to the canonical concept. For example:
 
 ```text
-chat history → Conversation
-permission prompt → Approval
-agent session → distinguish Conversation / Session / Run
-logs → Trace
-RAG → Authorized Retrieval
-model router → Execution Routing
+chat history -> Conversation
+permission prompt -> Approval
+agent session -> distinguish Conversation / Session / Run
+logs -> Trace
+RAG -> Authorized Retrieval
+model router -> Execution Routing
+Pi config -> Lora PI Kit and Runtime Strategy
 ```
 
 The site should make conceptual distinctions easier to discover, not silently collapse them.
@@ -351,11 +375,12 @@ Authorize before Context interactive demo
 Conversation vs Session vs Run
 Trace and AuthorizationDecision
 Canvas is a Projection
+Runtime strategy
 Current status and roadmap
 ```
 
 The acceptance test is simple:
 
-> A new engineer can spend 20 minutes on the site and correctly explain who is acting, what they are allowed to access, what a Conversation is, what a Run is, why Canvas is not execution state, and where evidence comes from.
+> A new engineer can spend 20 minutes on the site and correctly explain who is acting, what they are allowed to access, what a Conversation is, what a Run is, why Canvas is not execution state, where evidence comes from, and why Pi runtime customization lives in Lora PI Kit instead of the Glassbox domain model.
 
 See `.plans/roadmap.md` for sequencing and `docs/interactive-demos.md` for the demo curriculum.
