@@ -4,6 +4,8 @@ Status: CURRENT DIRECTION
 
 This file records the preferred technology stack and toolchain direction for Glassbox. It is not permission to add every listed technology before the active plan needs it.
 
+For the complete cross-cutting data, storage, search, observability, analytics, and public Trace / Eval read model, see [`data-observability.md`](./data-observability.md).
+
 ## Toolchain
 
 Glassbox standardizes on **Vite+** as the primary JavaScript / TypeScript development toolchain.
@@ -82,6 +84,8 @@ Vite+ / Vite / Rolldown
 
 The Workbench is one product surface. Do not let frontend framework choices redefine Agent, Conversation, Run, authorization, or durable state semantics.
 
+The Owner is the only Web administrator. Public Web access is read-only and limited to explicitly published Trace or Eval projections. Public pages never become a second control plane.
+
 ## Testing and code quality
 
 Preferred Vite+ surfaces:
@@ -101,9 +105,37 @@ Do not keep parallel ESLint / Prettier / ad-hoc TypeScript check stacks unless a
 
 Plan 03 introduces Turso / SQLite-compatible structured durable state behind a narrow server-side persistence boundary.
 
+The selected cross-cutting storage model is:
+
+```text
+Turso
+  structured durable state
+  product metadata
+  lexical search
+  vector search
+  analytics indexes and rollups
+
+Cloudflare R2
+  Raw Trace evidence
+  large artifacts
+  attachments
+  archives
+  backups
+
+AgentMail
+  email transport and source objects
+
+Glassbox server
+  runtime execution
+  owner APIs
+  public Trace / Eval APIs
+```
+
 Raw Trace remains independent append-only evidence.
 
 The model does not receive unrestricted SQL access.
+
+The browser does not receive direct Turso, R2, or AgentMail credentials.
 
 ## Agent execution
 
@@ -129,7 +161,9 @@ No toolchain, framework, model router, channel adapter, vector database, or cach
 
 These are post-foundation layers, not Plan 03 dependencies.
 
-Primary future mechanisms include:
+The selected architecture keeps retrieval behind Glassbox-owned authorization boundaries and uses Turso as the default structured, lexical, and vector store.
+
+Primary mechanisms include:
 
 ```text
 authorized hybrid retrieval
@@ -144,6 +178,16 @@ permission-scoped semantic cache
 ```
 
 `TokenRhythm/opensquilla` is a primary upstream reference for these mechanisms.
+
+## Observability and Eval
+
+Product observability is a Glassbox feature, not an external dashboard dependency.
+
+The Owner Web UI must be able to inspect product-relevant durable state, Trace, Eval, token usage, cost, retrieval behavior, authorization decisions, Channel activity, storage state, and system health through Glassbox server APIs.
+
+OpenTelemetry, Langfuse, and Inspect AI are reference models for trace structure, scores, analytics, and Eval log design. They are not required control-plane dependencies.
+
+Public observers may read only sanitized, explicitly published Trace or Eval snapshots.
 
 ## Long work, eval, and learning
 
