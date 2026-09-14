@@ -14,7 +14,7 @@ Glassbox 是一个正在演进中的 Personal Agent 工作台。
 
 当前唯一 Active Plan：[`Plan 03 — Personal Agent Foundation`](./.plans/03-personal-agent-foundation.md)
 
-长期阶段顺序记录在 [`.plans/roadmap.md`](./.plans/roadmap.md)。文档站与交互式学习规范记录在 [`docs/`](./docs/README.md)。这些不是当前 P3 的额外实现要求。
+长期阶段顺序记录在 [`.plans/roadmap.md`](./.plans/roadmap.md)。文档站与交互式学习规范记录在 [`docs/`](./docs/README.md)。Runtime 的长期边界记录在 [`docs/runtime-strategy.md`](./docs/runtime-strategy.md)。这些都不是当前 P3 的额外实现要求。
 
 ![Plan 03：身份、权限、会话、持久化与执行证据闭环](./assets/readme/glassbox-p3-architecture.png)
 
@@ -32,7 +32,7 @@ Turso persistence
 Run / Authorization Trace
 ```
 
-完成 Plan 03 之前，不抢跑真实微信、QQ、Mail、Calendar、Memory 自动沉淀、Skill evolution、AGY、LongTask、Eval、Arena、智能路由或完整向量检索。
+完成 Plan 03 之前，不抢跑真实微信、QQ、Mail、Calendar、Memory 自动沉淀、Skill evolution、AGY、LongTask、Eval、Arena、智能路由、完整向量检索或 Runtime 大迁移。
 
 这一阶段的验收标准很直接：
 
@@ -56,9 +56,10 @@ Workbench / 微信 / QQ / Email
              │
     ┌────────┼────────┐
     │        │        │
-  Tools    Workers  LongTask
+  Tools    Runtime  LongTask
     │        │
-    │      AGY / Codex / Claude Code
+    │      Pi + Lora PI Kit
+    │      Codex / Claude Code / AGY
     │
     └────────┼───────────────┐
              ▼               │
@@ -75,7 +76,7 @@ Workbench / 微信 / QQ / Email
 
 微信 Bot、QQ Bot、Workbench 都只是入口，不是不同 Agent。
 
-Codex、Claude Code、AGY、OpenHarness 等属于 Provider、Worker 或专业执行能力，也不是产品身份本身。
+Pi、Codex、Claude Code、AGY 等属于 Runtime、Provider 或 Worker 能力，也不是产品身份本身。Pi 是未来本地 Agent Runtime 的首选上游底座，Lora PI Kit 是独立维护的 Pi 配置与扩展层。Glassbox 仍然负责产品身份、权限、Conversation、持久化和 Trace。
 
 ## 权限是 P0
 
@@ -138,6 +139,8 @@ REQUIRES_APPROVAL
 Identity / Authorization Domain
 Turso durable state
 Conversation Domain
+Pi Runtime Adapter
+Lora PI Kit integration
 Remote Channels
 Memory promotion
 Authorized hybrid retrieval
@@ -153,6 +156,53 @@ Eval Workbench
 Arena
 Documentation Learning Site
 ```
+
+## Runtime strategy
+
+Runtime 方向已经定下来，但当前还没有迁移实现。
+
+```text
+earendil-works/pi
+      │
+      ▼
+Lora PI Kit
+  extensions
+  skills
+  prompts
+  presets
+  observability hooks
+  bootstrap / doctor
+      │
+      ▼
+Glassbox Runtime Boundary
+      │
+      ▼
+Authorization / Conversation / Run / Trace
+```
+
+边界很明确：
+
+- 上游 Pi 负责 Runtime、Agent Loop、Packages、Extensions、Skills、SDK、RPC 等基础能力。
+- Lora PI Kit 负责我们自己的 Pi 配置、扩展、Prompt、Skill 选择、Preset、监控 Hook 和安装维护工具。
+- `lora-sys/skills` 继续作为可复用 Agent Skills 的来源，不默认复制一份到 Lora PI Kit。
+- Glassbox 负责 Agent 身份、Principal、Authorization、Conversation、持久化、Run 和 Trace。
+- Codex 和 Claude Code 继续保留，作为兼容路径、Fallback、专业执行能力和 Differential Eval 对照。
+
+改 Pi 时遵循这个顺序：
+
+```text
+setting / project config
+→ Pi package
+→ Skill
+→ Extension
+→ SDK / RPC
+→ upstream contribution
+→ 最后才考虑本地 core patch
+```
+
+因此这里不会维护一个大范围 Pi Fork。只有 Extension、SDK、RPC 都无法满足一个已经被测试证明的需求时，才保留小范围 Core Patch。
+
+完整规则见 [`docs/runtime-strategy.md`](./docs/runtime-strategy.md)，Pi 上游源码索引见 [`upstream/pi/SOURCES.md`](./upstream/pi/SOURCES.md)。
 
 ## 核心对象
 
@@ -190,7 +240,7 @@ Conversation ≠ Session
 Session ≠ Run
 LongTask ≠ Run
 WorkerJob ≠ LongTask
-Provider / Worker ≠ Personal Agent
+Runtime / Provider / Worker ≠ Personal Agent
 Raw Trace ≠ Derived State
 Canvas ≠ Execution State
 ```
@@ -285,6 +335,8 @@ Validated Skill
 - `Zhang-Henry/CoEvoSkills`
 - `MineDojo/Voyager`
 
+验证通过且属于通用 Pi 工作流的 Skill，可以进入 `lora-sys/skills` 或由 Lora PI Kit 选择安装。涉及 Glassbox 权限、产品状态或证据语义的逻辑仍然留在 Glassbox。
+
 ## Journal 和周期复盘
 
 Agent 会有自己的可读 Journal，但 Journal 不是模型私有思维过程。
@@ -368,6 +420,8 @@ Router 可以决定怎样更省或更强，不能改变 Principal，也不能扩
 
 Tool Result 可以为模型生成压缩投影，但完整 Raw Trace 和证据不能因此被删除。
 
+属于通用 Pi 工作流的效率机制优先进入 Lora PI Kit。涉及受保护 Context、产品级 Routing Policy、权限范围或证据语义的机制继续由 Glassbox 控制。
+
 这一层必须用 Eval 证明价值，例如比较 Router 开关前后的任务成功率、权限 invariant、Token、Cost 和 Latency，而不是只声称“更省 Token”。具体顺序见 [`.plans/roadmap.md`](./.plans/roadmap.md)，源码索引见 [`upstream/opensquilla/SOURCES.md`](./upstream/opensquilla/SOURCES.md)。
 
 ## Eval 和实验工作台
@@ -377,7 +431,7 @@ Tool Result 可以为模型生成压缩投影，但完整 Raw Trace 和证据不
 ```text
 测一下当前 Agent 的 GitHub repo 分析能力。
 用 100 条任务。
-比较当前版本、Codex、Claude Code 和 AGY。
+比较当前版本、Pi + Lora PI Kit、Codex、Claude Code 和 AGY。
 每个样本跑 3 次。
 检查任务成功率、权限 invariant、成本和延迟。
 ```
@@ -472,10 +526,12 @@ Raw Trace → Derived State → Canvas
 
 | 上游 | 主要参考 |
 | --- | --- |
+| `earendil-works/pi` | 首选本地 Agent Runtime 上游、Packages、Extensions、Skills、SDK、RPC |
 | `pingdotgg/t3code` | Provider、Claude Code、权限、Resume |
 | `HKUDS/OpenHarness` | Agent Loop、Tools、Skills、Memory、Channels、QQ |
 | `keli-wen/agy-staff` | AGY Worker、后台 Job、Continue、Restart |
 | `TokenRhythm/opensquilla` | Context Budget、Tool Result Budget、Hybrid Retrieval、Routing、Token-efficient Projection |
+| `Javis603/token-monitor` | Runtime 发现、Token/Cost、Quota、Health、Pi/Codex/Claude Code/Antigravity 采集 |
 | `joyehuang/trajectory-panel` | Trajectory、Timeline、Redaction、Turso Sync |
 | `UKGovernmentBEIS/inspect_ai` | Eval、Dataset、Scorer、Experiment Runner |
 | `temporalio/sdk-typescript` | Durable LongTask |
@@ -515,17 +571,21 @@ packages/
 
 docs/
   README.md
+  runtime-strategy.md
+  tech-stack.md
   interactive-demos.md
 
 assets/
   readme/
 
 upstream/
+  pi/
   t3-code/
   opensquilla/
+  token-monitor/
 ```
 
-不要为了未来架构提前创建空 package。文档站真正开始实现以前也不提前创建 `apps/docs`。
+不要为了未来架构提前创建空 package，也不要现在创建假的 `lora-pi-kit` 依赖。等第一个真实 Pi integration slice 开始时，再独立建立并验证 Lora PI Kit。文档站真正开始实现以前也不提前创建 `apps/docs`。
 
 ## 开始开发
 
@@ -565,9 +625,10 @@ npm run test:server
 
 1. `AGENTS.md`
 2. `.plans/03-personal-agent-foundation.md`
-3. 当前任务相关的 `.plans/findings/`
-4. 相关 `upstream/` 或上游项目
-5. 当前实现和 focused tests
+3. 改 Runtime 方向时读 `docs/runtime-strategy.md`，改工具链时读 `docs/tech-stack.md`
+4. 当前任务相关的 `.plans/findings/`
+5. 相关 `upstream/` 或上游项目
+6. 当前实现和 focused tests
 
 不要从旧 Git 历史恢复已经删除的 Plan、Ticket、Template 或 debug 文件，除非当前问题确实需要它们。
 
@@ -577,7 +638,7 @@ Glassbox 还很早，但方向已经收口。
 
 下一步不是继续扩 Canvas，也不是同时接十个聊天渠道。现在只做一个可证明的 Personal Agent Foundation：**身份明确、权限分明、Conversation 可持久恢复、Turso 保存长期状态、所有授权决策可追溯。**
 
-这层正确以后，再让真实 Channel、Memory、Retrieval、Mail、Calendar、Skill、LongTask、Efficient Runtime、Eval 和 Arena 逐层接进来。文档与交互式学习可以先做信息架构和设计，但不能把计划能力写成已实现。
+这层正确以后，Runtime 路径优先走 Pi + Lora PI Kit，再让真实 Channel、Memory、Retrieval、Mail、Calendar、Skill、LongTask、Efficient Runtime、Eval 和 Arena 逐层接进来。Codex 和 Claude Code 在新路径被验证前继续保留。文档与交互式学习可以先做信息架构和设计，但不能把计划能力写成已实现。
 
 ## License
 
