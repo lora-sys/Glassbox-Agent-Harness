@@ -6,6 +6,8 @@ This file records the preferred technology stack and toolchain direction for Gla
 
 For the complete cross-cutting data, storage, search, observability, analytics, and public Trace / Eval read model, see [`data-observability.md`](./data-observability.md).
 
+For the execution-runtime ownership boundary between Glassbox, Pi, Lora PI Kit, Codex, and Claude Code, see [`runtime-strategy.md`](./runtime-strategy.md).
+
 ## Toolchain
 
 Glassbox standardizes on **Vite+** as the primary JavaScript / TypeScript development toolchain.
@@ -69,7 +71,7 @@ TypeScript
 ES modules
 ```
 
-`apps/server` remains a Node.js runtime. Vite+ is the repository toolchain; it does not mean the server must become a Vite dev server.
+`apps/server` remains a Node.js runtime. Vite+ is the repository toolchain. It does not mean the server must become a Vite dev server.
 
 Server processes may continue to use a focused runtime such as `tsx` when that is the smallest correct execution path. Run those commands through `vp run` once the migration is complete.
 
@@ -91,10 +93,10 @@ The Owner is the only Web administrator. Public Web access is read-only and limi
 Preferred Vite+ surfaces:
 
 ```text
-vp check   → format + lint + type checks
-vp test    → Vitest
-vp fmt     → Oxfmt
-vp lint    → Oxlint
+vp check   -> format + lint + type checks
+vp test    -> Vitest
+vp fmt     -> Oxfmt
+vp lint    -> Oxlint
 ```
 
 Playwright remains the browser / E2E layer where browser behavior is the thing being tested.
@@ -139,11 +141,29 @@ The browser does not receive direct Turso, R2, or AgentMail credentials.
 
 ## Agent execution
 
-Current execution capabilities include Codex and Claude Code provider integrations from the earlier coding-agent phase.
+Current execution capabilities include Codex and Claude Code adapters from the earlier Coding Agent phase.
 
-Future workers and providers remain behind Glassbox-owned trust boundaries.
+The selected future local runtime direction is:
 
-Provider or worker choice does not define Personal Agent identity.
+```text
+upstream Pi
+    |
+    v
+Lora PI Kit
+    |
+    v
+Glassbox Runtime Boundary
+```
+
+Pi is the preferred upstream runtime foundation. Lora PI Kit is the maintainer-owned configuration and extension layer. Glassbox remains the product and trust boundary.
+
+Lora PI Kit should own reusable Pi packages, extensions, selected Skills, prompts, runtime presets, observability hooks, and bootstrap tooling. It should not own Glassbox authorization, durable Conversation state, product identity, or Raw Trace truth.
+
+Use Pi settings, packages, Skills, Extensions, SDK, and RPC before considering a Pi core patch. A local core patch requires a concrete unsupported need and a compatibility test.
+
+Codex and Claude Code remain valid runtimes for compatibility, fallback, specialist execution, and differential Eval while the Pi path matures.
+
+Do not migrate the current runtime during Plan 03. Preserve existing provider regression coverage until a later runtime integration slice proves Pi plus Lora PI Kit behind a Glassbox-owned adapter.
 
 ## Authorization
 
@@ -152,10 +172,12 @@ Authorization is server-side and default-deny.
 The stable trust model remains:
 
 ```text
-Principal × Resource × Action × Context → Decision
+Principal × Resource × Action × Context -> Decision
 ```
 
-No toolchain, framework, model router, channel adapter, vector database, or cache may bypass this boundary.
+No toolchain, framework, runtime, model router, channel adapter, vector database, cache, Pi Extension, Skill, or runtime profile may bypass this boundary.
+
+Runtime choice happens after the caller and authorized Context are established.
 
 ## Retrieval and efficiency
 
@@ -179,13 +201,15 @@ permission-scoped semantic cache
 
 `TokenRhythm/opensquilla` is a primary upstream reference for these mechanisms.
 
+When a mechanism is generic Pi workflow customization, prefer implementing it in Lora PI Kit. When it changes Glassbox product state, authorization, retrieval visibility, or evidence semantics, keep it in Glassbox.
+
 ## Observability and Eval
 
 Product observability is a Glassbox feature, not an external dashboard dependency.
 
 The Owner Web UI must be able to inspect product-relevant durable state, Trace, Eval, token usage, cost, retrieval behavior, authorization decisions, Channel activity, storage state, and system health through Glassbox server APIs.
 
-OpenTelemetry, Langfuse, and Inspect AI are reference models for trace structure, scores, analytics, and Eval log design. They are not required control-plane dependencies.
+OpenTelemetry, Langfuse, Inspect AI, and Token Monitor are reference models for trace structure, scores, analytics, runtime usage, and Eval log design. They are not required control-plane dependencies.
 
 Public observers may read only sanitized, explicitly published Trace or Eval snapshots.
 
