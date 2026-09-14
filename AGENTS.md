@@ -2,7 +2,7 @@
 
 Glassbox is evolving from a local Coding Agent workbench into a durable Personal Agent workbench with explicit identity, strict authorization, persistent Conversations, inspectable execution, learning, assets, and evals.
 
-The product has one durable Personal Agent. Workbench, WeChat, QQ, email, and future integrations are entry points to that Agent, not separate Agents.
+The product has one durable Personal Agent. Workbench, messaging Channels, email, API access, and future integrations are entry points to that Agent, not separate Agents.
 
 Glassbox should help people use the Agent, understand what it did, and verify why it was allowed to do it.
 
@@ -38,7 +38,9 @@ Approval does not manufacture Permission.
 
 Channel identity is not Agent identity.
 
-Workbench, WeChat, QQ, email, API identities, and future Channels resolve a caller into a User / Principal that reaches the same Personal Agent.
+Workbench, WeChat, QQ, Telegram, Discord, Slack, email, API access, and future Channels resolve a caller into a User / Principal that reaches the same Personal Agent.
+
+A User may be the Agent Owner or another person who is allowed to use the Agent. A User may have multiple Channel Identities. Trusted identity binding may resolve those Channel Identities to the same User, but identity binding never widens that User's permissions.
 
 Conversation is durable product state. Provider Session and Run are execution concepts underneath it.
 
@@ -46,6 +48,7 @@ Keep these boundaries clear:
 
 ```text
 Channel ≠ Agent
+ChannelIdentity ≠ User
 Identity ≠ Authorization
 Conversation ≠ Session
 Session ≠ Run
@@ -144,7 +147,7 @@ Run / Authorization Trace
 
 P3 may use fake Channels, fake protected Tools, deterministic fixtures, and disposable persistence to prove the boundary.
 
-Until P3 passes its completion gate, do not make real WeChat, QQ, Mail, Calendar, AGY, LongTask, Eval, Arena, Skill evolution, full Memory consolidation, vector retrieval, semantic cache, smart routing, or serverless deployment a dependency of the implementation.
+Until P3 passes its completion gate, do not make real WeChat, QQ, Telegram, Discord, Slack, Mail, Calendar, AGY, LongTask, Eval, Arena, Skill evolution, full Memory consolidation, vector retrieval, semantic cache, smart routing, or serverless deployment a dependency of the implementation.
 
 Product history and future ideas belong in `README.md`, `.plans/roadmap.md`, `docs/`, or research notes. Current implementation scope belongs in the active plan.
 
@@ -156,9 +159,10 @@ Use these terms consistently.
 
 - **you** means the coding Agent reading this file and changing Glassbox.
 - **we**, **us**, and **maintainers** mean the people building and maintaining Glassbox.
-- **user** means a person known to Glassbox.
+- **user** means a person who uses the Personal Agent. This includes the Agent Owner and other people the Owner allows to access the Agent through Workbench or a Channel. A User's identity does not itself grant access; effective access is determined through Principal and Authorization.
 - **principal** means the effective actor used for an authorization decision.
-- **channel identity** means an external identity such as Workbench account, WeChat ID, QQ ID, email identity, or future integration identity.
+- **channel** means an entry point through which a User reaches the Personal Agent, such as Workbench, WeChat, QQ, Telegram, Discord, Slack, email, API access, or a future messaging / integration channel.
+- **channel identity** means a User's external identity inside one Channel, such as a Workbench account, WeChat ID, QQ ID, Telegram ID, Discord ID, Slack identity, email address, API identity, or future Channel identity. One User may have multiple Channel Identities. Trusted identity binding may map them to the same User but never grants additional Permission by itself.
 - **agent** means the durable Personal Agent product identity unless a provider-specific context clearly means an external Agent runtime.
 - **provider** means an external model / Agent runtime integration such as Codex or Claude Code.
 - **worker** means delegated specialist execution such as future AGY-style background work.
@@ -182,6 +186,9 @@ Use these terms consistently.
 Keep these distinctions clear:
 
 ```text
+User ≠ Principal
+ChannelIdentity ≠ User
+ChannelIdentity ≠ Permission
 Identity ≠ Authorization
 Permission ≠ Approval
 Channel ≠ Agent
@@ -403,9 +410,11 @@ The long-term trusted path is:
 ```text
 Channel / Workbench
         ↓
+ChannelIdentity
+        ↓
 Identity Resolution
         ↓
-Principal + Conversation
+User → Principal + Conversation
         ↓
 Authorization
         ↓
@@ -438,160 +447,3 @@ Authorization
 Runtime / Provider / Persistence
         ↓
 Evidence
-```
-
-Plan 03 proves only this smaller vertical slice:
-
-```text
-Identity
-→ Authorization
-→ Conversation
-→ Turso persistence
-→ Run / Authorization Trace
-```
-
-Keep these rules true even if the internal implementation changes:
-
-- one durable Personal Agent is shared across Channels
-- identity resolution and authorization are separate
-- unauthorized data is excluded before Context assembly
-- protected Tool calls re-authorize
-- revocation takes effect on the next protected operation
-- Conversation is not Provider Session or Run
-- Raw Trace and Derived State are separate
-- Canvas is not execution state
-- future Worker authority only shrinks
-- routing, retrieval, caching, and token optimization never widen authority
-
-Do not document a layer as implemented until it actually exists.
-
-## Where code lives
-
-Follow the current repository structure.
-
-```text
-apps/
-  server/
-  web/
-    e2e/
-
-packages/
-  contracts/
-  shared/
-
-.plans/
-  03-personal-agent-foundation.md
-  roadmap.md
-  findings/
-
-docs/
-  README.md
-  tech-stack.md
-  interactive-demos.md
-
-assets/
-  readme/
-
-upstream/
-  t3-code/
-  opensquilla/
-```
-
-`apps/server` owns the current Runtime, HTTP, WebSocket, Provider adapters, Session lifecycle, Trace, screening, and new server-side Personal Agent boundaries.
-
-Plan 03 may add focused modules near this code such as:
-
-```text
-auth/
-identity/
-conversation/
-persistence/
-```
-
-These names are guidance, not mandatory architecture.
-
-`apps/web` owns React, tldraw, Workbench interaction, Canvas projection, and Inspector behavior.
-
-`packages/contracts` contains only contracts with a real cross-boundary producer and consumer.
-
-`packages/shared` stays small and runtime-independent.
-
-Keep provider-specific behavior near Provider integration.
-
-Keep Channel protocol behavior near Channel integration.
-
-Keep tldraw-specific behavior near Canvas projection and interaction.
-
-Keep authorization enforcement in server-side boundaries that UI and adapters cannot bypass.
-
-Do not create speculative packages merely to mirror `.plans/roadmap.md`.
-
-## Taste
-
-Use the smallest abstraction that solves the current problem.
-
-Do not add systems the active plan does not need.
-
-Prefer explicit state transitions over inferred magic.
-
-Prefer deny-path correctness over UI polish when working on authorization.
-
-The UI must not lie. A visible Grant means server authorization grants it. A Deny means protected data never reached the model-visible path. Waiting means durable waiting state exists. Delegated means a real Worker Job exists. Success means the underlying work finished.
-
-Reuse mature code when it already solves the problem well.
-
-Before inventing a standard mechanism, inspect relevant upstream work. Important references include:
-
-```text
-pingdotgg/t3code
-  Provider integration, Claude Code permissions, resume
-
-HKUDS/OpenHarness
-  Agent loop, tools, memory, permissions, channels, QQ
-
-TokenRhythm/opensquilla
-  context budgets, Tool-result budgets, hybrid retrieval, routing, token efficiency
-
-openfga/openfga
-  relation-based authorization
-
-tursodatabase/turso
-  structured durable state
-
-joyehuang/trajectory-panel
-  Trace, timeline, redaction, Turso sync
-
-UKGovernmentBEIS/inspect_ai
-  Eval
-
-temporalio/sdk-typescript
-  durable LongTask semantics
-```
-
-Vendored or adapted upstream code records source repository, pinned commit, license, original path, and reason. Preserve copyright, license, NOTICE, and third-party provenance requirements.
-
-Keep provider quirks out of generic product state.
-
-Keep tldraw quirks out of core Agent state.
-
-Prefer inferred TypeScript types when the compiler already knows the type. Avoid `any`. Validate unknown external data at system boundaries.
-
-Comments explain intent, trust boundaries, provenance, or non-obvious behavior. Do not narrate obvious code.
-
-Do not grow the task while fixing it. Record adjacent work instead.
-
-## Additional tips
-
-Use current project tools and upstream patterns before adding a dependency or service.
-
-The documentation site is a Learning Lab as well as reference documentation. Concept pages should distinguish `Implemented`, `Experimental`, and `Planned` rather than presenting roadmap features as current reality.
-
-Interactive demos should use deterministic synthetic data and mirror real domain semantics when those semantics exist. Do not build a second fake authorization model only for docs.
-
-Memory, retrieval, routing, Mail, Calendar, Workers, LongTask, Eval, Skill evolution, Asset Library, Arena, and serverless execution are future consumers of the foundation. Do not pull them into P3 unless a tiny fake is required to prove a P3 invariant.
-
-OpenSquilla is a post-foundation efficiency reference, not a reason to implement routing or vector retrieval during P3.
-
-Research notes, future ideas, rejected alternatives, and open product questions belong outside this file.
-
-If a rule here becomes wrong because the product changed, update the rule. Do not work around it silently.
