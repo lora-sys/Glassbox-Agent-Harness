@@ -19,6 +19,30 @@ Understand the Agent
 
 The first is the runtime product. The second is the documentation and learning experience.
 
+## Cross-cutting runtime direction
+
+Glassbox keeps its product and trust model independent from any single execution runtime.
+
+The preferred future local Agent runtime path is:
+
+```text
+earendil-works/pi
+      |
+      v
+Lora PI Kit
+      |
+      v
+Glassbox Runtime Boundary
+```
+
+Pi is the upstream runtime foundation. Lora PI Kit is the maintainer-owned configuration and extension layer. Glassbox keeps Agent identity, authorization, Conversation, persistence, Run identity, and Trace.
+
+Codex and Claude Code remain supported runtime adapters while this path matures and may remain useful for compatibility, fallback, specialist execution, and differential Eval.
+
+Plan 03 does not migrate the runtime. The first Pi integration slice starts only after the P3 trust boundary is stable and must use a supported Pi boundary such as SDK or RPC before considering a core patch.
+
+See [`../docs/runtime-strategy.md`](../docs/runtime-strategy.md) and [`../upstream/pi/SOURCES.md`](../upstream/pi/SOURCES.md).
+
 ## Sequence
 
 ### P3 — Trusted Personal Agent Foundation
@@ -44,6 +68,8 @@ Likely candidates include Web public access, WeChat, or QQ.
 The Channel must reuse the same Agent identity, Principal resolution, authorization, Conversation, persistence, and Trace boundaries proven in P3.
 
 Do not create a separate Agent implementation per Channel.
+
+Runtime choice remains behind the Glassbox Runtime Boundary. A Channel must not depend on Pi-specific, Codex-specific, or Claude-specific identity or authorization semantics.
 
 ### P5 — Memory and Authorized Retrieval
 
@@ -74,9 +100,13 @@ authorization scope
 
 OpenSquilla is a primary reference for hybrid retrieval mechanics. `zhibao-dev/Learning-Multi-Factor-Memory` and `langchain-ai/langmem` remain primary references for memory value and consolidation.
 
+Retrieval policy that affects protected product data stays in Glassbox. Generic Pi workflow helpers may live in Lora PI Kit only when they cannot widen authorization or bypass Glassbox retrieval boundaries.
+
 ### P6 — Efficient Agent Runtime
 
 Use `TokenRhythm/opensquilla` as the main efficiency-layer reference.
+
+Pi plus Lora PI Kit is the preferred local runtime path for reusable runtime customization. Efficiency mechanisms belong in Lora PI Kit when they are generic Pi workflow behavior. They stay in Glassbox when they affect protected Context, product routing policy, durable state, or evidence semantics.
 
 Target capabilities:
 
@@ -132,6 +162,8 @@ keli-wen/agy-staff
 
 Worker authority can only shrink from caller authority.
 
+A worker runtime may use Pi, Codex, Claude Code, AGY, or another execution backend. Runtime selection does not change the caller's effective Glassbox authority.
+
 ### P8 — Eval, Learning, Assets, and Skill Evolution
 
 Turn real execution evidence into a controlled learning loop:
@@ -145,6 +177,8 @@ Run / Trace
 ```
 
 Primary references include Inspect AI, SkillClaw, CoEvoSkills, Voyager, Dagster, Generative Agents, and memos.
+
+Validated reusable Pi workflow procedures may be published through Lora PI Kit or the existing `lora-sys/skills` repository. Glassbox remains the source of product evidence, permissions, and promotion decisions.
 
 ## Documentation and Learning track
 
