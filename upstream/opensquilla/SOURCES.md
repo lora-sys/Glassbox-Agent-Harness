@@ -8,7 +8,7 @@ Upstream branch at review time: `main`
 
 Primary license: Apache-2.0.
 
-OpenSquilla is an approved reference for Glassbox's later efficiency layer. No production code in Glassbox imports this directory, and none of the mechanisms below are required to complete Plan 03.
+OpenSquilla is an approved reference for Glassbox's later efficiency layer. No production code in Glassbox imports this directory. Its routing, retrieval, semantic cache, and aggressive token-optimization mechanisms are not required for the Plan 03 QQ closed loop.
 
 ## Why it matters
 
@@ -135,16 +135,8 @@ For Glassbox, a future serverless execution layer should keep durable identity, 
 
 ## Current phase boundary
 
-Plan 03 remains:
+Plan 03 now actively delivers the QQ Personal Agent closed loop with Pi SDK, Lora PI Kit, hard authorization gates, Turso Conversation state, NapCat / OneBot, and real QQ acceptance.
 
-```text
-Identity
-→ Authorization
-→ Conversation
-→ Turso persistence
-→ Run / Authorization Trace
-```
+OpenSquilla remains a later reference during this phase. Do not add smart routing, vector retrieval, semantic cache, TokenJuice-style projection, or serverless deployment merely to complete P3 unless the active Plan explicitly changes.
 
-Do not add smart routing, vector retrieval, semantic cache, TokenJuice-style projection, or serverless deployment merely to complete Plan 03.
-
-Those become valuable after the security and persistence boundary is correct.
+The P3 security gates, especially Context Gate, Tool Gate, and Delivery Gate, are authoritative before any later optimization layer is introduced.
