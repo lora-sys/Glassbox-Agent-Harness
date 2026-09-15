@@ -12,7 +12,7 @@ Token Monitor is an approved reference for Glassbox Runtime observability: local
 
 ## Why it matters
 
-Glassbox now treats execution backends as Runtimes rather than a separate model-provider management layer:
+Glassbox treats execution backends as Runtimes:
 
 ```text
 Runtime
@@ -24,13 +24,15 @@ Runtime
 The Web Management UI needs one normalized monitoring surface across the initial Runtime set:
 
 ```text
+Pi
 Codex
 Claude Code
-Pi
 Antigravity
 ```
 
-Token Monitor already solves many of the provider/runtime-specific collection problems that should remain outside Glassbox's product model, including:
+Plan 03 makes Pi the primary Personal Agent runtime path, so Pi usage and health are the first Token Monitor ideas likely to matter in production. Broader quota dashboards and Antigravity support remain later work.
+
+Token Monitor already solves many provider/runtime-specific collection problems that should remain outside Glassbox's product model, including:
 
 - locating local Claude Code / Codex / Pi / Antigravity data roots
 - normalizing client/runtime names
@@ -72,9 +74,9 @@ Different Coding Runtimes persist sessions and usage in different locations and 
 Target Glassbox shape:
 
 ```text
-Codex local data ───────┐
+Pi local data ──────────┐
+Codex local data ───────┤
 Claude Code local data ─┤
-Pi local data ──────────┤
 Antigravity local data ─┤
                         ↓
              runtime/collectors/*
@@ -118,7 +120,7 @@ Unknown / unavailable / null
 
 Do not turn missing data into zero and do not estimate pricing unless Glassbox has an explicit pricing source.
 
-### Antigravity is a first-class Runtime slot
+### Antigravity is a later Runtime slot
 
 Token Monitor has concrete Antigravity handling for local conversation discovery and limit collection. Glassbox should study those mechanisms when implementing the Antigravity adapter.
 
@@ -158,7 +160,7 @@ Reference material belongs here:
 upstream/token-monitor/
 ```
 
-Future Glassbox production code should live in Glassbox-owned runtime boundaries, for example:
+Glassbox production code should live in Glassbox-owned runtime boundaries, for example:
 
 ```text
 apps/server/src/runtime/
@@ -170,7 +172,7 @@ apps/server/src/runtime/
 
 and shared API/domain contracts should live in Glassbox-owned contract packages rather than importing Token Monitor types.
 
-The existing `ProviderAdapter` execution lifecycle should not be overloaded with historical usage scanning or quota polling. Runtime collection is a separate management/observability responsibility.
+The Pi SDK execution lifecycle should not be overloaded with broad historical usage scanning or quota polling. Runtime collection is a separate management/observability responsibility.
 
 ## Vendoring and license rules
 
@@ -189,16 +191,8 @@ Production code must not import directly from `upstream/token-monitor/`.
 
 ## Current phase boundary
 
-Plan 03 remains focused on:
+Plan 03 is now the QQ Personal Agent closed loop and includes Pi SDK execution, Lora PI Kit, hard authorization gates, scope-based Conversation persistence, NapCat / OneBot, and real QQ acceptance.
 
-```text
-Identity
-→ Authorization
-→ Conversation
-→ Turso persistence
-→ Run / Authorization Trace
-```
+P3 may use minimal Pi usage and runtime-health information when it helps Trace or acceptance. It does not require the broader Token Monitor quota dashboard, Antigravity support, cross-runtime historical scanner, or full Runtime observability product.
 
-Adding Token Monitor to `upstream/` does not make Runtime usage collection, quota monitoring, Antigravity support, or broader Runtime observability a Plan 03 dependency.
-
-Use this reference when the concrete Runtime Monitoring / Antigravity implementation slice begins.
+Use this reference narrowly during P3 and expand it only when a concrete monitoring slice requires more.
