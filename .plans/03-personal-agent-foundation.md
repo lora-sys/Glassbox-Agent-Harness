@@ -1,4 +1,4 @@
-# Plan 03 — Personal Agent Foundation
+# Plan 03 — QQ Personal Agent Closed Loop
 
 Status: ACTIVE
 
@@ -6,160 +6,178 @@ This is the only active implementation plan in the repository.
 
 ## Goal
 
-Build the smallest durable foundation for one Personal Agent with explicit identity, server-side authorization, durable Conversation state, Turso persistence, and auditable authorization decisions.
+Ship the first genuinely usable Glassbox Personal Agent closed loop.
+
+Plan 03 ends only when the same durable Personal Agent can be used from real QQ private chat and a real QQ group through NapCat, executes through the Pi SDK with Lora PI Kit loaded, persists Conversation state in Turso, enforces server-side authorization at every protected boundary, and records enough Trace to explain every allow, deny, tool execution, and delivery decision.
 
 The acceptance sentence is:
 
-> The same Agent can serve an Owner and a Visitor, persist their Conversations across restart, expose public resources to both, keep Owner-private resources invisible to the Visitor, and prove every allow or deny decision in Trace.
+> A real Owner and a real Visitor can talk to the same Glassbox Personal Agent through QQ private chat and a test QQ group. Pi SDK executes the Agent with Lora PI Kit resources. Unauthorized data never reaches Pi, protected Tools cannot run without a fresh authorization decision, private results cannot be delivered to an unauthorized audience, Conversations survive restart, duplicate QQ events do not produce duplicate replies, and every decision can be inspected in Trace.
 
 ## The closed loop
 
-Plan 03 is not the full Personal Agent. It proves one security and persistence vertical slice end to end:
-
 ```text
-Owner / Visitor request
+QQ private / group message
         ↓
-Resolve identity
+NapCat
         ↓
-Resolve Principal + Conversation
+OneBot 11 Channel Adapter
         ↓
-Authorization
+Ingress Gate
         ↓
-Load only authorized context
+Identity Resolver
         ↓
-Personal Agent Run
+Conversation Resolver
         ↓
-Protected Tool re-authorization
+Authorization Engine
         ↓
-Result
+Authorized Context Builder
         ↓
-Persist Conversation + authorization state in Turso
+Pi SDK + Lora PI Kit
         ↓
-Write Run + AuthorizationDecision evidence to Trace
+Tool Gate
         ↓
-Restart
+Pi execution
         ↓
-Resume the same Conversations with the same permission boundaries
+Delivery Gate
+        ↓
+NapCat
+        ↓
+QQ reply
+        ↓
+Turso durable state + Raw Trace
 ```
 
-The loop is successful only when all of these are true at the same time:
+Plan 03 is complete only when this path works end to end with both deterministic automated tests and a real QQ acceptance environment.
 
-- Owner and Visitor reach the same Agent identity
-- each Principal gets an isolated Conversation
-- public resources work for both
-- Owner-private resources never enter Visitor-visible model context
-- a Visitor cannot indirectly borrow Owner authority through a Tool or prompt injection
-- protected Tool calls recheck current authorization
-- revocation takes effect without rewriting old evidence
-- Turso survives restart and restores identity, relationships, grants, and Conversations
-- every Allow, Deny, and approval path can be explained from Trace without logging denied private contents
+## Runtime decision
 
-After this works, a real remote Channel becomes an entry-point problem instead of a security-model problem. Memory, retrieval, routing, Mail, Calendar, Workers, LongTask, and Eval can all reuse the same Principal, Authorization, Conversation, persistence, and evidence boundaries.
+Plan 03 uses the Pi SDK directly inside the Glassbox Node.js server.
 
-## What P3 must leave behind
-
-P3 is complete only if it leaves reusable product boundaries, not only a passing test suite.
-
-The phase should stabilize the smallest useful contracts around:
+Primary package:
 
 ```text
-Principal
-Resource reference
-Action
-AuthorizationDecision
-Conversation identity
-Session identity
-Run identity
-Authorized Context
-Protected Tool execution
-Durable structured state
-Trace evidence
+@earendil-works/pi-coding-agent
 ```
 
-These do not need to become a generic framework or a frozen public API. They do need to be explicit enough that P4 can attach a real Channel without inventing a second trust model, and the documentation Learning Lab can demonstrate the same concepts without inventing contradictory fake semantics.
-
-P3 should also leave one deterministic synthetic acceptance fixture that represents the whole closed loop:
+Use Pi public SDK surfaces first:
 
 ```text
-one Agent
-Owner
-Visitor
-one public Resource
-one Owner-private Resource
-one public Tool
-one Owner-only Tool
-Grant / Revoke
-restart
-AuthorizationDecision + Run evidence
+createAgentSession
+createAgentSessionRuntime when session replacement is required
+ModelRuntime
+SessionManager
+DefaultResourceLoader
+Extension API
+customTools
+session events
 ```
 
-The same fixture may be reused by automated tests, local acceptance UI, examples, and later documentation demos. Production data must never be required for this fixture.
+Do not build the first Glassbox Pi integration on RPC.
 
-## Why this phase comes first
+Do not fork Pi for configuration or workflow behavior that can be implemented through settings, Pi packages, Skills, Extensions, custom Tools, ResourceLoader configuration, or the public SDK.
 
-Remote channels, Memory, retrieval, routing, Mail, Calendar, Workers, LongTask, Eval, Journal, Skill evolution, and Asset Library all depend on one thing being correct first: who is acting and what that Principal is allowed to see or do.
-
-Do not build those higher layers before this boundary exists in code and tests.
-
-## Scope
-
-In scope:
-
-- `Agent`
-- `User`
-- `Principal`
-- `ChannelIdentity`
-- `Relationship`
-- `Permission`
-- `AuthorizationDecision`
-- `Conversation`
-- separation of `Conversation`, `Session`, and `Run`
-- server-side default-deny authorization
-- authorized context assembly boundary
-- protected Tool execution boundary
-- Turso-backed durable structured state
-- authorization decisions written to inspectable evidence without leaking protected contents
-- one local Owner path and one fake Visitor path for acceptance
-- one deterministic P3 acceptance fixture reusable by tests and later learning demos
-- focused restart, isolation, denial, revocation, and confused-deputy tests
-- a minimal inspection surface sufficient to see Principal, Conversation, Decision, authorized Context, Tool outcome, and Trace during acceptance
-
-Out of scope for Plan 03:
-
-- real WeChat or QQ integration
-- real Mail or Calendar integration
-- full Memory extraction or consolidation
-- vector or hybrid retrieval
-- semantic cache
-- smart model routing or execution routing
-- Context Budget optimization beyond what is necessary to keep existing Provider flows correct
-- TokenJuice-style Tool-result projection
-- Serverless deployment work
-- Skill evolution
-- Asset Library
-- AGY integration
-- durable LongTask engine
-- Eval workbench
-- Arena
-- multi-Agent product semantics
-- collaborative Canvas features
-- OpenFGA as a required production service
-- building or deploying the full documentation site
-- large UI redesign
-
-These are later consumers of the foundation, not prerequisites for it.
-
-## Required invariants
-
-### Authorization
-
-All protected access is evaluated as:
+The customization order is:
 
 ```text
-Principal × Resource × Action × Context → Decision
+Pi settings / project config
+→ Pi package resources
+→ Skill
+→ Extension
+→ custom Tool
+→ Pi SDK integration
+→ upstream contribution
+→ local Pi core patch only when a tested requirement cannot be implemented through supported public boundaries
 ```
 
-Decision is exactly one of:
+Any local Pi core patch requires a focused compatibility test and a written removal or upstreaming condition.
+
+## Lora PI Kit decision
+
+Lora PI Kit is the owned Pi customization layer. It is not the Glassbox security model and it is not a copy of Pi core.
+
+Create the separate `lora-sys/lora-pi-kit` repository during this plan when P3.1 starts.
+
+The P3 MVP should contain only the resources needed for this closed loop:
+
+```text
+package.json
+extensions/
+  glassbox-policy-bridge.ts
+  trace-hooks.ts
+  usage-hooks.ts
+prompts/
+  base.md
+presets/
+  owner-direct.json
+  visitor-direct.json
+  qq-group.json
+  test.json
+config/
+  settings template
+  model profile template
+scripts/
+  install
+  doctor
+  sync-skills
+compat/
+  tested-pi-version.json
+```
+
+`lora-sys/skills` remains the canonical source for reusable Agent Skills. Lora PI Kit selects or installs Skills. It does not duplicate all Skill source by default.
+
+Upstream projects may provide mechanisms or patterns, but ownership stays explicit:
+
+```text
+Pi runtime customization
+→ Lora PI Kit
+
+QQ transport and OneBot handling
+→ Glassbox QQ Channel
+
+Identity, authorization, Conversation, protected Context, delivery policy, durable state, Trace
+→ Glassbox
+```
+
+## Security model: hard gates, not prompt rules
+
+No security invariant in this plan may depend on a system prompt saying "do not reveal" or "ask before doing".
+
+The model may request an action. It never decides whether that action is authorized.
+
+Every protected decision must have enough structured context to answer:
+
+```text
+Who is acting?
+Where are they acting?
+What are they trying to do?
+How will it be done?
+Which resource is involved?
+Who will receive the result?
+Which Conversation and Run does this belong to?
+```
+
+Conceptual request shape:
+
+```text
+AuthorizationRequest
+  principal
+  location
+    channel
+    scopeType
+    scopeKey
+  action
+  resource
+  execution
+    runtime
+    tool?
+    operation?
+  audience
+  conversationId
+  runId
+```
+
+Authorization returns exactly one of:
 
 ```text
 ALLOW
@@ -169,183 +187,202 @@ REQUIRES_APPROVAL
 
 No matching grant means `DENY`.
 
-### Context safety
+### Gate 1 — Ingress Gate
 
-Unauthorized data is filtered before model context assembly.
+Run before the message reaches Pi.
 
-The forbidden pattern is:
+It determines:
 
 ```text
-load private data → send to model → tell model not to reveal it
+self message or external message
+known or unknown ChannelIdentity
+resolved User and Principal
+private chat or group
+allowed group or blocked group
+group mention / activation state
+duplicate event state
+whether this Principal may invoke the Agent from this location
 ```
 
-The required pattern is:
+P3 default QQ behavior:
 
 ```text
-resolve principal
-→ authorize
-→ load only authorized data
-→ assemble context
-→ execute model or tool
+private chat
+  accepted only for identities allowed by policy
+
+group chat
+  bot responds only when explicitly mentioned or when another explicit activation rule is configured
+
+self messages
+  ignored
+
+duplicate message/event id
+  ignored after the first accepted handling
 ```
 
-### Identity
+An Ingress denial means no Pi session is invoked.
 
-A channel or Workbench identifier resolves identity. It does not grant permission by itself.
+### Gate 2 — Context Gate
 
-Binding two identities together is a trusted operation and must not silently merge permissions.
+Run before `session.prompt(...)` or any equivalent Pi model invocation.
 
-### Delegation
+Unauthorized data must not be loaded into model-visible Context.
 
-Any future Worker boundary must satisfy:
+Forbidden:
 
 ```text
-worker_permissions ⊆ delegated_permissions ⊆ caller_permissions
+load Owner private content
+→ send it to Pi
+→ tell Pi not to reveal it
 ```
 
-Plan 03 does not need a real Worker, but the authorization model must not make this impossible later.
-
-### Approval
-
-Approval cannot manufacture permission. A Principal must already have an authorization path that permits the Action after approval.
-
-### Revocation
-
-Revocation applies to the next protected operation.
-
-A cached UI state, stale Conversation, resumed Provider Session, old model context, or previous approval must not preserve authority after the relevant grant is revoked.
-
-### Evidence
-
-Authorization evidence records the decision and reason, but denial logs must not copy protected resource contents.
-
-### Persistence
-
-Restart must preserve durable Agent, User, identity, relationship, permission, Conversation, and authorization metadata.
-
-Raw Trace remains separate append-only evidence. Do not move all trace payloads into SQL merely because Turso is introduced.
-
-## Suggested domain shape
-
-Do not treat this as frozen schema. Keep it small and adjust when tests reveal a better boundary.
+Required:
 
 ```text
-Agent
-  id
-  ownerUserId
+resolve Principal and Conversation
+→ authorize each protected source
+→ load only allowed source content
+→ build model-visible Context
+→ invoke Pi
+```
 
-User
-  id
-  kind
+A group Conversation does not inherit the Owner's private visibility just because the Owner is the sender.
 
-ChannelIdentity
-  id
-  userId
-  channel
-  externalId
+For P3, visibility scopes should support at least:
 
+```text
+public
+owner-private
+user:<user-id>
+group:<group-id>
+conversation:<conversation-id>
+```
+
+Group Context defaults to public data plus data explicitly visible to that group or Conversation. Owner-private data does not enter group model Context unless an explicit Share action has produced a resource or projection visible to that group.
+
+### Gate 3 — Tool Gate
+
+Every protected Tool call is re-authorized immediately before execution.
+
+Lora PI Kit may use Pi's `tool_call` hook as an enforcement bridge, but the actual decision comes from the Glassbox Authorization Engine.
+
+Conceptual flow:
+
+```text
+Pi requests Tool
+→ glassbox-policy-bridge receives tool_call
+→ build AuthorizationRequest from current Principal, location, resource, action, tool and audience
+→ call Glassbox Authorization Engine
+→ ALLOW: execute
+→ DENY: block
+→ REQUIRES_APPROVAL: create approval path and do not execute until the explicit policy path is satisfied
+```
+
+QQ P3 uses a strict Tool allowlist.
+
+Do not expose unrestricted general shell execution to the QQ Runtime in P3.
+
+In particular, generic `bash` or `powershell` must not become a remote escape hatch around resource authorization. Remote QQ execution should use explicit Tools with explicit resource/action semantics so the Authorization Engine can make a meaningful decision.
+
+Local coding workflows may continue to use broader tooling outside this QQ policy profile.
+
+### Gate 4 — Delivery Gate
+
+Authorization is checked again before a generated result leaves Glassbox for QQ.
+
+"The actor can read this resource" does not imply "the result may be sent to this audience."
+
+Example:
+
+```text
+Owner private chat
+  Owner reads owner-private resource
+  audience = Owner private chat
+  → may be allowed
+
+Owner in QQ group
+  Owner can personally read owner-private resource
+  audience = group:<group-id>
+  → deny delivery unless that data has been explicitly shared to the group
+```
+
+Model output must carry or derive an effective visibility label based on protected sources and Tool results used by the Run.
+
+At minimum, Delivery Gate evaluates:
+
+```text
+source visibility
+current Principal
+Conversation scope
+audience
+explicit Share state
+```
+
+An explicit Share is a named Action. It may require approval, but Approval does not invent access that the policy otherwise forbids.
+
+## Conversation model
+
+The old assumption that every Conversation belongs directly to one `userId` is insufficient for group chat.
+
+Use a scope-based Conversation identity.
+
+Conceptual shape:
+
+```text
 Conversation
   id
   agentId
-  userId
-  channelIdentityId?
+  channel
+  scopeType
+  scopeKey
   createdAt
   updatedAt
+```
 
-Relationship
-  principalId
-  relation
-  resourceType
-  resourceId
+P3 examples:
 
-AuthorizationDecision
+```text
+QQ private chat
+  channel = qq
+  scopeType = direct
+  scopeKey = qq:user:<qq-id>
+
+QQ group
+  channel = qq
+  scopeType = group
+  scopeKey = qq:group:<group-id>
+```
+
+The Conversation may be shared by a group, but every Run records the real acting Principal.
+
+```text
+Run
   id
+  conversationId
   principalId
-  resourceType
-  resourceId
-  action
-  decision
-  reason
-  approvalId?
-  conversationId?
-  runId?
-  createdAt
+  runtime
+  runtimeSessionId?
+  deliveryAudience
+  startedAt
+  endedAt?
 ```
 
-Do not add a generic policy DSL unless the first real rules require it.
-
-## P3 acceptance fixture
-
-Use synthetic, stable identifiers and contents so tests and demonstrations can tell the same story.
-
-A useful minimum fixture is:
+Keep these boundaries explicit:
 
 ```text
-Agent
-  agent:lora
-
-Principals
-  principal:owner
-  principal:visitor
-
-Resources
-  resource:public-profile
-  resource:private-project
-
-Tools
-  tool:public-status
-  tool:owner-private-project-read
+ChannelIdentity ≠ User
+User ≠ Principal
+Conversation ≠ Principal
+Conversation ≠ Pi Session
+Pi Session ≠ Run
+Actor permission ≠ Delivery permission
 ```
 
-Expected behavior:
+## Durable state
 
-```text
-Owner + public-profile       → ALLOW
-Owner + private-project      → ALLOW
-Visitor + public-profile     → ALLOW
-Visitor + private-project    → DENY
-Visitor + owner-only Tool    → DENY
-Grant Visitor private read   → next operation ALLOW
-Revoke that Grant            → next operation DENY
-restart                      → identities, Conversations and current grants remain correct
-```
+Plan 03 uses Turso or SQLite-compatible Turso local state behind a narrow server-side persistence boundary.
 
-The private fixture content must be distinctive enough that a test can prove it never appears in Visitor model context, Tool results, denial messages, or redacted Trace output.
-
-## Implementation slices
-
-### P3.0 — Domain boundary and tests
-
-Create the minimum provider-neutral types and an authorization interface.
-
-Prefer server-side modules before creating a new package. Move a contract into `packages/contracts` only when a real cross-process consumer exists.
-
-Prove:
-
-- Owner and Visitor are distinct Principals
-- resource ownership is explicit
-- default deny works
-- allow and requires-approval are distinct
-
-### P3.1 — Authorization engine
-
-Implement a small internal authorization engine inspired by OpenFGA relation semantics.
-
-Do not deploy OpenFGA as infrastructure yet.
-
-Prove deny paths first:
-
-- Visitor cannot read Owner-private resource
-- Visitor cannot use Owner-only Tool
-- a public resource is readable
-- revocation takes effect on the next protected operation
-- a stale Conversation cannot preserve revoked authority
-
-### P3.2 — Turso persistence
-
-Introduce Turso behind a narrow persistence boundary.
-
-Persist only the structures needed by this plan first:
+Persist only what this closed loop needs first:
 
 ```text
 agents
@@ -355,151 +392,504 @@ conversations
 relationships
 permissions or tuples
 authorization_decisions
+approvals when used
+runs
+message dedupe keys
+runtime session bindings
+resource visibility / share metadata
 ```
 
-Add migrations or schema bootstrap that can run against disposable test databases.
+Raw Trace remains append-only evidence outside the relational product-state model when appropriate.
 
-Never point tests at live user state.
+A restart must not silently merge private and group Conversations or restore stale permissions.
 
-Prove restart and reopen behavior.
+## QQ Channel
 
-### P3.3 — Conversation boundary
+NapCat is the selected QQ protocol-side runtime for P3.
 
-Separate Conversation identity from runtime Session and Run.
+Glassbox owns the OneBot 11 application-side Channel adapter.
 
-Create a local Owner entry and a fake Visitor entry that both reach the same Agent but maintain separate Conversations.
-
-No real chat-channel protocol belongs in this slice.
-
-### P3.4 — Authorized Context and Tool Gate
-
-Introduce two unavoidable server-side boundaries:
+Initial scope:
 
 ```text
-AuthorizedContextBuilder
-AuthorizedToolExecutor
+OneBot 11 message events
+private messages
+group messages
+@ bot activation in groups
+send_private_msg
+send_group_msg
+connection health
+reconnect handling
+message/event deduplication
+self-message loop prevention
 ```
 
-Names may change, but the enforcement points must exist.
+Do not make NapCat storage, WebUI state, or QQ protocol details part of the Glassbox product model.
 
-Prove that private data is never returned to the model-visible context for an unauthorized Principal.
+Do not put QQ transport code into Lora PI Kit.
 
-Add a fake public Tool and fake Owner-only Tool to test confused-deputy behavior without touching real external services.
+Primary references for this slice:
 
-### P3.5 — Trace and vertical acceptance
+```text
+NapNeko/NapCatQQ
+botuniverse/onebot-11
+```
 
-Record authorization decisions and link them to Conversation and Run where available.
+Prefer OneBot-compatible boundaries so the application-side Channel logic does not depend on undocumented NapCat internals.
 
-Build one minimal acceptance flow:
+## Test environments
 
-1. Owner opens the Agent and can read one private and one public fixture resource.
-2. Visitor opens the same Agent and can read only the public fixture resource.
-3. Visitor requests the private resource directly and is denied.
-4. Visitor attempts to induce the Agent or fake Tool to fetch the private resource indirectly and is denied.
-5. Give the Visitor one explicit grant and prove the next request is allowed.
-6. Revoke the grant without replacing the Conversation and prove the next protected operation is denied.
-7. Restart the server or persistence layer.
-8. Both Conversations and current grants remain correct.
-9. Trace explains each decision without leaking the private content.
-10. Existing Codex and Claude Code flows still work.
+Plan 03 requires two test layers.
 
-### P3.6 — Contract stabilization and learning handoff
+### A. Deterministic automated environment
 
-Do not build the documentation site in this slice.
+Must run without real QQ accounts and without consuming paid model quota.
 
-Instead, make the finished P3 mechanism easy to explain and reuse.
+Target shape:
 
-By the end of the phase:
+```text
+Fake OneBot Gateway
+Fake Owner
+Fake Visitor
+Fake Group
+Disposable Turso / SQLite database
+isolated Pi agentDir
+Lora PI Kit test preset
+recording or deterministic fake model/provider
+synthetic protected resources
+Raw Trace capture
+```
 
-- the acceptance fixture has stable synthetic data and expected outcomes
-- the distinction `Conversation ≠ Session ≠ Run` is visible in real identifiers and evidence
-- authorization decisions have an inspectable shape suitable for Trace and a later interactive lesson
-- the model-visible authorized Context can be inspected in tests or a local acceptance surface without exposing denied content
-- Grant and Revoke behavior can be demonstrated without live external services
-- restart behavior can be replayed deterministically
-- any documentation example clearly marks P3 as `Implemented` only after the corresponding completion-gate item is actually true
+Pi must use an isolated test directory instead of the user's normal `~/.pi/agent` state.
 
-This is the handoff to the Documentation / Learning Lab track described in `docs/README.md` and `docs/interactive-demos.md`.
+Suggested generated test root:
 
-## Test matrix
+```text
+.glassbox-test/
+  pi/
+    settings.json
+    models.json
+    skills/
+    extensions/
+    sessions/
+  db/
+    p3-test.db
+  fixtures/
+    users.json
+    groups.json
+    resources.json
+    onebot-events/
+  traces/
+```
 
-At minimum cover:
+This directory is disposable test state and should be ignored when appropriate. Do not commit credentials or real QQ session data.
+
+The SDK integration should accept explicit `agentDir`, model runtime, SessionManager, ResourceLoader, and Tool set so tests can replace real dependencies.
+
+### B. Real QQ acceptance environment
+
+Use dedicated test identities:
+
+```text
+Bot QQ
+Owner QQ
+Visitor QQ
+Test QQ Group
+  Bot
+  Owner
+  Visitor
+```
+
+Use an isolated Glassbox test database and isolated Pi configuration for real acceptance.
+
+The real acceptance environment proves transport and integration behavior that deterministic fixtures cannot prove:
+
+```text
+NapCat login and connection
+OneBot event shape
+private reply
+group @ activation
+group reply
+reconnect
+restart
+real Pi model execution
+real delivery
+```
+
+Real QQ acceptance is not the default unit-test path.
+
+## Canary security fixture
+
+P3 has one distinctive Owner-private test secret, for example:
+
+```text
+PRIVATE_CANARY_7F92A1
+```
+
+Only the Owner-private fixture contains this value.
+
+The automated suite must attempt to exfiltrate it through:
+
+```text
+Visitor private chat
+Visitor group chat
+Owner group chat
+prompt injection
+indirect Tool request
+stale authorization state
+revoked permission
+cross-Conversation reuse
+cross-group reuse
+Delivery Gate bypass attempt
+```
+
+P3 fails if this canary appears in any unauthorized location, including:
+
+```text
+Pi model-visible Context
+unauthorized Tool result
+QQ output
+public or unauthorized Trace projection
+denial text that copies protected contents
+```
+
+## P3 acceptance fixture
+
+Minimum deterministic fixture:
+
+```text
+Agent
+  agent:lora
+
+Users
+  user:owner
+  user:visitor
+
+Channel identities
+  qq:owner
+  qq:visitor
+  qq:bot
+
+Conversations
+  qq:user:owner
+  qq:user:visitor
+  qq:group:test
+
+Resources
+  resource:public-profile
+  resource:owner-private-project
+  resource:group-note
+
+Tools
+  tool:public-status
+  tool:owner-private-project-read
+  tool:group-note-read
+
+Secret
+  PRIVATE_CANARY_7F92A1
+```
+
+Expected minimum behavior:
+
+```text
+Owner private + public-profile             → ALLOW
+Owner private + owner-private-project      → ALLOW and may deliver privately
+Visitor private + public-profile           → ALLOW
+Visitor private + owner-private-project    → DENY
+Visitor + owner-only Tool                  → DENY
+Owner group + owner-private-project        → read may be individually authorized, group delivery remains DENY
+Group + group-note                         → ALLOW when visible to that group
+Grant Visitor explicit private read        → next matching private operation ALLOW
+Revoke the Grant                           → next matching operation DENY
+Duplicate QQ event                         → one Run and one reply only
+Group message without activation           → no Agent Run
+Restart                                    → Conversations and current grants restore correctly
+```
+
+## Implementation slices
+
+### P3.0 — Test harness and contracts
+
+Build the deterministic acceptance fixture first.
+
+Define the minimum provider-neutral contracts for:
+
+```text
+Principal
+Location
+Audience
+ResourceRef
+Action
+AuthorizationRequest
+AuthorizationDecision
+ConversationScope
+Run identity
+Visibility scope
+```
+
+Add the fake OneBot path, disposable database, fake model/runtime injection, Trace capture, and private canary assertion before real QQ work.
+
+P3.0 is complete when the test harness can prove a trivial allow and deny without a real model or QQ account.
+
+### P3.1 — Lora PI Kit MVP
+
+Create `lora-sys/lora-pi-kit`.
+
+Implement only the P3 resources required for the Glassbox integration:
+
+```text
+Pi package manifest
+Glassbox policy bridge Extension
+Trace / usage hooks
+base prompt
+QQ and test presets
+Skill selection / sync
+install and doctor scripts
+Pi compatibility metadata
+```
+
+Use upstream Pi package and Extension mechanisms. Do not fork Pi.
+
+P3.1 is complete when an isolated Pi test environment can load Lora PI Kit and report its expected resources without touching the user's normal Pi environment.
+
+### P3.2 — Pi SDK Runtime
+
+Integrate `@earendil-works/pi-coding-agent` directly into `apps/server` behind a Glassbox-owned runtime adapter.
+
+Requirements:
+
+```text
+create / restore Pi session
+map Conversation to runtime session binding without equating the two concepts
+subscribe to Pi events
+collect output and usage metadata
+abort active execution
+load Lora PI Kit resources
+inject isolated agentDir for tests
+use explicit Tool allowlists per runtime policy
+```
+
+Keep Codex and Claude Code adapters intact for regression and later differential Eval.
+
+P3.2 is complete when deterministic Glassbox tests can run one prompt through Pi SDK and receive normalized Run events.
+
+### P3.3 — Four hard authorization gates
+
+Implement:
+
+```text
+IngressGate
+AuthorizedContextBuilder
+AuthorizedToolExecutor / Pi policy bridge
+DeliveryGate
+```
+
+All four call or derive from the Glassbox Authorization Engine. None may rely on model obedience.
+
+Implement default deny, explicit allow, approval path, revocation, visibility labels, and audience checks.
+
+P3.3 is complete when the canary attack suite fails closed before any QQ integration exists.
+
+### P3.4 — Conversation and Turso durability
+
+Implement scope-based Conversation identity and durable state.
+
+Prove:
+
+```text
+Owner private Conversation isolation
+Visitor private Conversation isolation
+shared group Conversation with per-Run Principal identity
+restart
+reopen
+Grant / Revoke persistence
+runtime session binding restore or safe recreation
+no stale authorization after restart
+```
+
+P3.4 is complete when the deterministic fixture survives process/database reopen.
+
+### P3.5 — NapCat / OneBot QQ Channel
+
+Implement the smallest production Channel adapter.
+
+Handle:
+
+```text
+private message event
+group message event
+@ activation
+self-message filtering
+message/event deduplication
+send private message
+send group message
+connection health and reconnect
+```
+
+Normalize OneBot events into Glassbox Channel inputs before product logic.
+
+P3.5 is complete when Fake OneBot integration tests prove private and group flows and a local NapCat connection can be established in the acceptance environment.
+
+### P3.6 — End-to-end QQ closed loop
+
+Wire the entire path:
+
+```text
+QQ
+→ NapCat
+→ Glassbox Channel
+→ hard gates
+→ Pi SDK + Lora PI Kit
+→ hard gates
+→ QQ
+```
+
+Prove Owner private, Visitor private, Owner group, and Visitor group flows.
+
+P3.6 is complete when the bot can be used conversationally in the dedicated test QQ environment.
+
+### P3.7 — Adversarial, restart, dedupe, and Trace validation
+
+Run the full security and reliability matrix.
+
+At minimum test:
 
 ```text
 default deny
 explicit allow
 requires approval
-cross-user read
-private/public scope
 identity spoof attempt
 identity binding does not grant authority
-revocation
-stale authorization state
+private/public/group isolation
+Owner group exfiltration attempt
+Visitor private exfiltration attempt
+Visitor group exfiltration attempt
+prompt injection
 confused deputy
 protected Tool call
-replayed approval
-duplicate request or retry
+unrestricted shell unavailable in QQ policy
+approval replay
+revocation
+stale Conversation
+stale Pi session
+cross-Conversation contamination
+cross-group contamination
+duplicate OneBot event
+reconnect replay
+self-message loop
 restart and resume
-denial trace redaction
-fixture private-content non-leak assertion
+denial Trace redaction
+Delivery Gate denial
+PRIVATE_CANARY_7F92A1 non-leak
 ```
 
-Use fake resources, fake channels, and fake protected Tools for most tests.
+Each denial records enough metadata to explain the decision without copying the denied private payload.
 
-Only use live Codex or Claude Code where a provider regression specifically needs it.
+### P3.8 — Real QQ completion gate
 
-## Upstream references for this phase
+Perform the real acceptance run with:
 
-Read before implementing:
+```text
+Bot QQ
+Owner QQ
+Visitor QQ
+Test Group
+NapCat
+Glassbox
+Pi SDK
+Lora PI Kit
+isolated Turso state
+real configured model
+```
 
-- `openfga/openfga`: relation-based authorization model and tuple semantics
-- `HKUDS/OpenHarness`: channel identity, session routing, permissions, and agent boundary patterns
-- `tursodatabase/turso`: durable SQLite-compatible state
-- `pingdotgg/t3code`: provider permission handling and session resume patterns
-- existing `.plans/findings/`: current Glassbox Trace, state, provider, and WebSocket evidence
+Record evidence for every completion-gate item.
 
-`TokenRhythm/opensquilla` is an approved post-foundation efficiency reference, not a Plan 03 implementation dependency. Do not add smart routing, vector retrieval, semantic caching, TokenJuice-style projection, or Serverless work to this phase just because OpenSquilla provides useful mechanisms for later phases.
-
-Do not vendor a whole repository to start this plan. Copy only proven code that solves a concrete current slice, with source commit and license preserved.
+Do not mark P3 complete from mocks alone.
 
 ## Code placement guidance
 
-Prefer incremental modules under `apps/server/src/` such as:
+Glassbox production code should stay in Glassbox-owned boundaries, for example:
 
 ```text
-auth/
-identity/
-conversation/
-persistence/
+apps/server/src/
+  auth/
+  identity/
+  conversation/
+  persistence/
+  runtime/pi/
+  channel/qq/
+  delivery/
+  trace/
 ```
 
-These names are guidance, not mandatory architecture.
+Names may change when implementation evidence shows a better boundary.
 
-Do not create `packages/agent-runtime` or another shared package until more than one real runtime consumer requires it.
+Do not put Glassbox authorization policy inside Lora PI Kit.
 
-Keep Codex and Claude-specific behavior in their existing adapter areas.
+Do not put NapCat or OneBot transport inside Lora PI Kit.
 
-Keep Canvas changes minimal during this plan. The acceptance target is runtime correctness, persistence, authorization evidence, and a small truthful inspection surface.
+Do not import production code from `upstream/`.
 
-Do not build a second authorization simulator for the UI or docs. If an acceptance UI needs to display a Decision, it should reflect the real server-side decision or deterministic fixture semantics used by the tests.
+Do not create a broad shared `agent-runtime` package until more than one real consumer needs a stable cross-package contract.
+
+## Upstream references for this phase
+
+Read the narrow source needed for the current slice before inventing standard behavior:
+
+```text
+earendil-works/pi
+  SDK, AgentSession, SessionManager, ResourceLoader, Extensions, custom Tools, package model
+
+NapNeko/NapCatQQ
+  QQ protocol-side runtime and operational behavior
+
+botuniverse/onebot-11
+  event, API, WebSocket, authentication and message semantics
+
+openfga/openfga
+  relation-based authorization concepts
+
+tursodatabase/turso
+  durable SQLite-compatible state
+
+pingdotgg/t3code
+  existing runtime permission and session integration patterns
+
+HKUDS/OpenHarness
+  channel, session and tool boundary patterns
+
+Token Monitor
+  later runtime usage / health collection patterns
+```
+
+OpenSquilla remains a later efficiency reference. Do not pull routing, hybrid retrieval, semantic cache, or broad Context optimization into P3 unless a concrete P3 correctness problem requires a very small mechanism.
 
 ## Completion gate
 
 Plan 03 is complete only when all of these are true:
 
-- default-deny authorization is enforced server-side
-- Owner and Visitor isolation is covered by automated tests
-- unauthorized content is excluded before context assembly
-- protected Tool execution rechecks authorization
-- Conversation is durable and distinct from Session and Run
-- Turso-backed state survives restart in tests
-- authorization decisions are inspectable and do not leak denied contents
-- Grant and Revoke affect the next protected operation correctly
-- the deterministic P3 acceptance fixture proves the closed loop end to end
-- the fixture can support later documentation demos without inventing different authorization semantics
-- existing provider behavior has focused regression coverage
-- no real WeChat, QQ, Mail, Calendar, Memory retrieval, routing, Worker, LongTask, Eval, Serverless, or documentation-site deployment dependency was required to prove the foundation
+- Pi SDK is the working Glassbox runtime path for the P3 QQ flow.
+- Lora PI Kit loads through supported Pi configuration/package/Extension mechanisms without a broad Pi fork.
+- Owner and Visitor resolve to distinct Principals from real QQ identities.
+- private and group Conversations use durable scope-based identity.
+- Ingress Gate runs before Pi invocation.
+- unauthorized protected data is excluded before Pi model Context assembly.
+- every protected Tool call is re-authorized before execution.
+- QQ runtime has an explicit Tool allowlist and no unrestricted remote shell escape hatch.
+- Delivery Gate checks the audience before any protected result is sent.
+- Owner-private data cannot be leaked into a QQ group merely because the Owner asked for it there.
+- Grant and Revoke affect the next protected operation correctly.
+- Turso-backed state survives restart.
+- duplicate/replayed OneBot events do not create duplicate Runs or replies.
+- NapCat reconnect does not silently replay completed work into duplicate replies.
+- Raw Trace and AuthorizationDecision evidence can explain Who, Where, What, How, Resource, Audience, Conversation and Run for protected operations.
+- denial evidence does not copy protected payload contents.
+- `PRIVATE_CANARY_7F92A1` never appears in unauthorized Pi Context, Tool result, QQ delivery, or unauthorized Trace projection.
+- real Owner QQ private chat works.
+- real Visitor QQ private chat works under Visitor permissions.
+- real QQ group activation and reply work.
+- group non-activation does not create an Agent Run.
+- restart preserves the intended Conversation and current authorization state.
+- existing Codex and Claude Code paths retain focused regression coverage and are not deleted merely to finish P3.
 
-When this gate passes, the next runtime plan is `P4 — First real remote Channel` from `.plans/roadmap.md`, unless the roadmap is deliberately changed first.
-
-The Documentation / Learning Lab may then mark the proven P3 concepts as `Implemented` and build the first interactive lessons from the same contracts and deterministic fixture.
+When this gate passes, Glassbox has its first usable Personal Agent product loop. The next product phase is Memory and Authorized Retrieval, not another phase whose only purpose is to make the first remote Channel work.
