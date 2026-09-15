@@ -6,7 +6,7 @@ Nothing in this directory is imported at runtime. Vendor only the smallest sourc
 
 ## Rules
 
-- Check relevant upstream implementations before inventing standard runtime, provider, channel, Agent operations, memory, eval, authorization, durable-task, trajectory, skill, asset, routing, retrieval, or token-budget infrastructure.
+- Check relevant upstream implementations before inventing standard runtime, provider, channel, Agent operations, memory, taste, eval, authorization, durable-task, trajectory, skill, asset, routing, retrieval, or token-budget infrastructure.
 - Each vendored project must include source repository, pinned commit, license, original paths, and the reason each file was copied.
 - Preserve copyright, license, and NOTICE requirements when copying code.
 - Do not vendor an entire repository when a few files are enough.
@@ -30,6 +30,7 @@ Vendor selectively when a current implementation slice needs them.
 | `aorumbayev/herdr-workflows` | Bounded linear Herdr workflow recipes; not durable Glassbox Task truth |
 | `NapNeko/NapCatQQ` | QQ protocol-side runtime and OneBot connectivity for the active P3 Channel |
 | `botuniverse/onebot-11` | OneBot 11 event and API contract for the active P3 QQ Channel |
+| `CommandCodeAI/command-code` | P4 Taste mechanics: learn preferences from accept/reject/edit behavior, project/user scope, continuous preference learning |
 | `HKUDS/OpenHarness` | Agent loop, tools, skills, memory, channel gateway, QQ patterns |
 | `keli-wen/agy-staff` | AGY worker delegation and background job lifecycle |
 | `TokenRhythm/opensquilla` | Later context budgets, tool-result budgets, hybrid retrieval, routing, token-efficient projection |
@@ -61,6 +62,8 @@ Herdr is an active P3 execution dependency for the Agent Operations foundation. 
 `herdr-workflows` may run bounded stage recipes inside Herdr. It does not replace the Glassbox Task state machine or become the source of review/rework truth.
 
 NapCat and OneBot are active P3 references for QQ transport. QQ transport stays in Glassbox and does not move into Lora PI Kit.
+
+Command Code is a P4 research reference for Taste. Glassbox adopts the useful pattern of treating accept, reject, edit, revert, and correction behavior as feedback, but keeps FeedbackEvent, Taste, confidence, scope, authorization, and retrieval as Glassbox-owned durable product state. Command Code is not a dependency. See `command-code/SOURCES.md` and `../docs/memory-taste.md`.
 
 OpenSquilla remains a post-P3 efficiency reference. Its routing, retrieval, semantic cache, context compression, and token-budget mechanisms must not be added merely to complete the QQ and Agent Ops closed loops.
 
