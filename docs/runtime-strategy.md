@@ -2,483 +2,485 @@
 
 Status: CURRENT DIRECTION
 
-This document defines the ownership boundary between Glassbox, Pi, Lora PI Kit, Herdr, and other execution runtimes.
+This document defines the stable ownership boundary between Glassbox, Pi, Lora PI Kit, Herdr, Codex, Claude Code, and future runtimes.
 
-The active Plan 03 implements the first real Pi path, QQ closed loop, and minimal Agent Operations loop. The current implementation source of truth remains `.plans/03-personal-agent-foundation.md`.
+The active implementation order remains `.plans/03-personal-agent-foundation.md`.
 
-For the Herdr-specific Task / Attention / Worker boundary, also read [`agent-operations.md`](./agent-operations.md).
+Read these companion documents for details:
 
-## Decision
+```text
+docs/lora-pi-kit.md
+  Lora PI Kit distribution contents, Skills snapshot, MCP, profiles, install, locks
+
+docs/agent-operations.md
+  Herdr, Task, Attention, TaskAttempt, WorkerBinding, reconciliation
+
+docs/memory-taste.md
+  Rules, Skills, Taste, Feedback, Memory and retrieval ownership
+```
+
+## Core decision
+
+Use this mental model:
+
+```text
+Pi
+  Agent engine
+
+Lora PI Kit
+  Lora's reproducible Pi distribution
+
+Glassbox
+  durable Personal Agent system and product control plane
+
+Herdr
+  live coding-worker execution host
+```
 
 Glassbox remains the product and trust boundary.
 
-Pi is the primary runtime foundation for the active Personal Agent path.
+Pi is the primary runtime engine for the main Personal Agent path.
 
-Lora PI Kit is the owned configuration and extension layer that adapts Pi to the maintainer's workflow.
+Lora PI Kit turns a fresh Pi installation into Lora's configured Pi environment.
 
-Plan 03 embeds Pi through the public SDK inside the Glassbox Node.js server. It does not use RPC as the primary integration path.
+Herdr hosts live coding workers and worktrees. It does not replace Glassbox Task truth.
 
-Herdr is the live Agent Operations execution layer for coding workers. It manages real terminal workspaces, worktrees, panes, and coding-Agent lifecycle facts. It does not replace Glassbox Task truth or authorization.
+Codex and Claude Code remain supported execution backends for compatibility, specialist work, fallback, Herdr workers, and later differential Eval.
 
-Codex and Claude Code remain supported execution runtimes where they provide useful compatibility, specialist behavior, fallback, worker execution, or differential Eval coverage.
+## Main runtime path
 
-The intended direction is:
+Plan 03 embeds Pi through `@earendil-works/pi-coding-agent` in the Glassbox Node.js server.
+
+Conceptual path:
 
 ```text
 QQ / Workbench / future Channels
-        |
-        v
+        ↓
 Glassbox
-  identity
-  authorization
-  conversation
-  task / attention
-  persistence
-  trace
-  delivery policy
-        |
-        +-----------------------------+
-        |                             |
-        v                             v
-Glassbox Runtime Boundary       Agent Operations Boundary
-        |                             |
-        |                             v
-        |                         HerdrBridge
-        |                             |
-        |                             v
-        |                           Herdr
-        |                    workspace / worktree / pane
-        |                    Pi / Codex / Claude workers
-        |
-        +-------------------+-------------------+
-        |                   |                   |
-        v                   v                   v
-Pi SDK + Lora PI Kit     Codex              Claude Code
-primary main-Agent path  adapter             adapter
-        |
-        v
-upstream Pi
+  Identity
+  Authorization
+  Conversation
+  Task / Attention
+  Taste / Memory truth
+  Trace
+        ↓
+PiRuntimeAdapter
+        ↓
+Pi SDK
+        ↓
+Pi session configured with
+Lora PI Kit package + profile
+        ↓
+Pi Agent engine
 ```
 
-Glassbox is not a Pi wrapper. Pi is not the Personal Agent identity.
+Lora PI Kit is not a second runtime and is not the Personal Agent identity.
 
-Herdr is not the Personal Agent identity and is not the durable Task database.
+It is the distribution and runtime customization layer loaded into Pi.
 
 ## Ownership
 
-Glassbox owns product semantics that must stay stable even if execution runtimes or worker hosts change:
+### Glassbox owns
 
 ```text
 Agent identity
-User and Principal
+User / Principal
 Channel identity resolution
 Authorization
-Ingress policy
-Authorized Context
+Ingress / Context / Tool / Delivery policy
 Conversation
-Audience and Delivery policy
-Task
-TaskAttempt
-AttentionItem
+Task / TaskAttempt / AttentionItem
 WorkerBinding
 review / rework / acceptance
+Taste / Memory durable truth
+Audience / Delivery policy
 Durable product state
 Run identity
-Raw Trace and authorization evidence
-Memory and Asset visibility rules
-Workbench and public product APIs
+Raw Trace and product evidence
+Workbench and product APIs
 ```
 
-Lora PI Kit owns reusable Pi customization:
+These semantics must survive changing Pi versions, switching Worker runtimes, or changing the Agent Operations host.
+
+### Lora PI Kit owns
 
 ```text
-Pi extensions
 Pi package manifest
-selected skills
-prompt templates
-runtime presets
-model and thinking profiles
-observability hooks
-notification hooks
-project bootstrap
-compatibility checks
-install, update, and doctor scripts
+bundled pinned Lora Skills snapshot
+Pi Extensions
+Prompt Templates
+runtime profiles
+MCP adapter and registry
+model / thinking defaults
+runtime Tool policy integration
+Glassbox runtime bridges
+Taste / Feedback / Trace hooks
+notifications
+settings / model templates
+install / update / doctor / sync tooling
+Pi + Skills compatibility locks
 ```
 
-Herdr owns live execution facts and process topology:
+For the full boundary, read `docs/lora-pi-kit.md`.
+
+### Upstream Pi owns
+
+```text
+Agent loop
+sessions
+model/provider support
+built-in coding tools
+package system
+Extension API
+Skill loading
+Prompt Templates
+settings
+TUI
+SDK
+RPC
+```
+
+Do not copy Pi core into Lora PI Kit merely to change defaults or workflows.
+
+### Herdr owns live execution facts
 
 ```text
 Herdr session
 workspace
+worktree
 tab
 pane
-worktree
 terminal process
 recognized coding Agent
-Agent lifecycle state
-live pane / Agent output
+working / blocked / done / idle / unknown
+live terminal output
 ```
 
-Upstream Pi owns its runtime, Agent loop, package system, Extension API, tool execution primitives, model support, TUI, SDK, and RPC behavior.
-
-Existing Codex and Claude Code adapters keep runtime-specific protocol behavior close to those integrations.
-
-NapCat and OneBot transport belong to the Glassbox QQ Channel boundary, not Lora PI Kit.
-
-## Runtime and Agent Operations are different boundaries
-
-A runtime executes one Agent session or Run.
-
-Agent Operations coordinates multiple pieces of work and multiple live coding workers.
-
-Do not collapse these concepts:
+Herdr lifecycle state is an execution observation.
 
 ```text
-Pi Session ≠ Conversation
-Run ≠ Task
-Task ≠ Worker
-TaskAttempt ≠ Herdr pane
-Herdr Agent state ≠ Task acceptance state
-Runtime ≠ Agent Operations
+Herdr Agent = done
+≠
+Glassbox Task = DONE
 ```
 
-The main Personal Agent runs through Pi SDK in Glassbox.
+Review / rework / acceptance remain Glassbox product Actions.
 
-A delegated coding Task may run through a Herdr-managed Pi, Codex, Claude Code, or another supported coding Agent.
+## Lora PI Kit is a distribution, not a loose config folder
 
-The worker runtime does not become a second Personal Agent identity.
+The previous description of Lora PI Kit as only a small configuration layer was too weak.
 
-## Lora PI Kit is a separate owned layer
-
-Do not copy Pi source into Glassbox to create Lora PI Kit.
-
-The repository boundary is:
+The intended relationship is:
 
 ```text
 earendil-works/pi
-      |
-      | upstream releases and public APIs
-      v
+      ↓
+Pi package / Extension / Skill public boundaries
+      ↓
 lora-sys/lora-pi-kit
-      |
-      | configured Pi capabilities
-      v
-Glassbox Pi SDK integration
+  Lora Skills snapshot
+  Extensions
+  MCP
+  prompts
+  profiles
+  hooks
+  locks
+      ↓
+Pi CLI / Glassbox / Herdr Pi Worker
 ```
 
-Plan 03 creates `lora-sys/lora-pi-kit` during the P3.1 slice. The first kit is deliberately small and exists only to support the closed loop.
+The same Kit can support multiple roles through profiles:
 
-Pi packages can bundle extensions, skills, prompt templates, and themes. Lora PI Kit should use that package mechanism first. Global or project settings stay in the Pi configuration layer and should be installed or generated by the kit's bootstrap tooling.
+```text
+local-coding
+main-agent
+owner-direct
+qq-group
+herdr-worker
+test
+```
 
-The existing `lora-sys/skills` repository remains the canonical source for reusable Agent Skills. Lora PI Kit may select or install those skills, but should not duplicate their source by default.
+Sharing one Kit does not collapse role identity:
+
+```text
+Glassbox main Personal Agent
+≠
+Herdr delegated Pi Worker
+```
+
+## Skills rule
+
+`lora-sys/skills` is the canonical source repository for Lora Skills.
+
+A released Lora PI Kit bundles a pinned snapshot of the Skills selected for that release.
+
+```text
+lora-sys/skills
+  canonical source
+      ↓
+sync-skills
+      ↓
+Kit skills/
+      ↓
+skills.lock.json
+      ↓
+release
+```
+
+Do not fetch an unpinned `lora-sys/skills@main` during every Pi startup.
+
+Bundling a Skill does not mean injecting it into every task. Profiles and task-level selection narrow the active set.
+
+## MCP rule
+
+Pi core intentionally keeps workflow-specific systems such as MCP outside the required core.
+
+Lora PI Kit may provide MCP through an owned Pi Extension / Package layer.
+
+```text
+Pi
+  ↓
+Lora PI Kit MCP adapter
+  ↓
+MCP Registry
+  ↓
+profile-selected servers
+  ↓
+Tools
+```
+
+Do not start every available MCP integration by default.
+
+An installed MCP Tool is still subject to Glassbox authorization when used through Glassbox.
+
+## Package and settings rule
+
+Use Pi's public package mechanism for distributable resources.
+
+Pi Packages can distribute Extensions, Skills, Prompt Templates, and themes through npm, Git, or local paths.
+
+Settings and package resources remain different concepts.
+
+Lora PI Kit may bootstrap or generate Pi settings and model configuration where needed, but should not invent a second package loader.
 
 ## SDK first, core patch last
 
-Plan 03 integrates through `@earendil-works/pi-coding-agent`.
+Plan 03 uses the Pi SDK as the primary Glassbox embedding boundary.
 
-Use public SDK surfaces such as:
+Prefer supported public surfaces such as:
 
 ```text
 createAgentSession
-createAgentSessionRuntime when replacement is required
+createAgentSessionRuntime when required
 ModelRuntime
 SessionManager
 DefaultResourceLoader
 Extension API
 customTools
 session events
+explicit agentDir
 ```
 
-When Lora PI Kit needs a capability, use this order:
+Customization order:
 
 ```text
-Pi setting or project config
-Pi package resource
-Pi Skill
-Pi Extension
-custom Tool
-Pi SDK integration
-small upstream contribution
-local core patch only when no supported boundary can implement the requirement
+Pi setting / project config
+→ Pi package resource
+→ Skill
+→ Extension
+→ custom Tool
+→ Pi SDK integration
+→ upstream contribution
+→ small local core patch only when a tested requirement cannot use public boundaries
 ```
 
-RPC remains a supported upstream capability but is not the primary Glassbox P3 path.
+RPC remains a valid upstream capability but is not the primary Glassbox P3 path.
 
-A core patch must have a concrete failing requirement and a compatibility test. Do not fork Pi merely to change defaults or add workflow behavior that the package, Extension, Tool, or SDK boundaries already support.
-
-If a core patch becomes necessary, keep it small and record:
+A core patch requires:
 
 ```text
-upstream commit
-patch purpose
-why settings, package, Skill, Extension, Tool, or SDK was insufficient
-test that proves the requirement
-rebase or removal condition
+concrete failing requirement
+compatibility test
+recorded upstream version
+reason public boundaries were insufficient
+removal / upstreaming condition
 ```
 
-## Herdr integration boundary
+## Glassbox runtime instances
 
-Glassbox integrates Herdr through a product-owned `HerdrBridge`.
+Glassbox owns the concrete Pi environments that it launches.
 
-For simple scripts and diagnostics, Herdr CLI wrappers are acceptable.
+The runtime instances should not reuse the user's normal interactive Pi state by default.
 
-For the long-lived product connection, use the local socket API for direct request/response control and lifecycle subscriptions.
-
-Do not parse Herdr's rendered TUI as the primary protocol.
-
-The bridge should expose only the operations Glassbox needs, for example:
+Conceptual isolation:
 
 ```text
-connect / disconnect
-get session snapshot
-subscribe to lifecycle events
-create or open worktree
-start coding Agent
-prompt coding Agent
-wait for Agent state
-read Agent output
-send deliberate Agent keys when required
-cancel through explicit authorized action
+~/.glassbox/pi/main/
+~/.glassbox/pi/workers/<task-or-attempt-id>/
+~/.glassbox/pi/test/
 ```
 
-Herdr state is reconciled into Glassbox projections. It does not directly write Task truth.
+Exact paths are implementation details.
 
-Example:
+The invariant is:
 
 ```text
-Herdr working
-→ WorkerBinding observed state = working
-→ TaskAttempt may be RUNNING
-
-Herdr blocked
-→ AttentionItem(worker_blocked)
-→ Task may become WAITING_INPUT
-
-Herdr done
-→ TaskAttempt execution settled
-→ Task enters REVIEW
-→ not automatic DONE
+same pinned Lora PI Kit distribution
++ role-specific profile
++ isolated session/runtime state where needed
 ```
 
-Review / rework / acceptance remain Glassbox Actions.
+This must work the same way locally and on the target Linux server.
 
-## Herdr bootstrap and reconnect
+## Rules, Taste and Memory
 
-Herdr `session.snapshot` is a one-time state bootstrap. Event subscriptions do not replay all lifecycle events from before the subscription.
+Do not turn runtime configuration into product truth.
 
-To avoid an event gap:
+Glassbox owns durable Rules / Taste / Memory selection and authorization.
+
+Lora PI Kit may receive a small authorized runtime projection and inject it into Pi.
 
 ```text
-open event subscription connection
-→ events.subscribe
-→ wait for acknowledgement
-→ request session.snapshot
-→ reconcile snapshot against durable WorkerBindings and TaskAttempts
-→ process later events continuously
+Glassbox selects
+  Rules
+  relevant Skills
+  task-relevant Taste
+  authorized Memory
+      ↓
+PiRuntimeAdapter
+      ↓
+Lora PI Kit runtime bridge
+      ↓
+Pi Context
 ```
 
-After reconnect, repeat snapshot reconciliation.
+The Kit does not own the canonical Taste or Memory database.
 
-Connection loss is an observation problem. Do not infer Task completion or failure only because Herdr cannot currently be observed.
+See `docs/memory-taste.md`.
 
-## Upstream references are evidence, not product code
+## Agent Operations boundary
 
-The repository `upstream/` directory stays read-only reference material.
-
-Pi belongs there as the primary runtime reference. Herdr, T3 Code, OpenHarness, OpenSquilla, Token Monitor, NapCat, OneBot, AGY, Inspect AI, and other projects remain mechanism references for specific boundaries.
-
-The relationship is:
+Runtime and Agent Operations are different layers.
 
 ```text
-upstream references
-      |
-      | research and selective ports
-      v
-Lora PI Kit or Glassbox-owned boundary
-      |
-      v
-production behavior
+Runtime
+  executes a session / Run
+
+Agent Operations
+  coordinates Tasks and live Workers
 ```
 
-Production code must not import from `upstream/`.
-
-A mechanism that belongs to Pi workflow customization should land in Lora PI Kit.
-
-A mechanism that changes Glassbox identity, authorization, Conversation, Channel behavior, durable state, Task truth, audience policy, or evidence stays in Glassbox.
-
-Herdr-specific protocol behavior stays behind `HerdrBridge`.
-
-## Runtime boundary
-
-Glassbox exposes one product-owned execution contract above concrete runtimes.
-
-The contract normalizes only what Glassbox needs, for example:
+Keep these distinct:
 
 ```text
-start or resume execution
-send authorized user input
-receive normalized events
-request approval
-stop or cancel
-usage metadata
-runtime health
-runtime identity and capabilities
+Pi Session ≠ Conversation
+Run ≠ Task
+Task ≠ Worker
+TaskAttempt ≠ Herdr pane
+Herdr state ≠ Task acceptance
+Runtime ≠ Agent Operations
 ```
 
-Do not force every runtime to pretend it has identical tools, sessions, permissions, or lifecycle behavior.
+A delegated Task may execute through a Herdr-managed Pi, Codex, Claude Code, or another supported Worker.
 
-Runtime-specific behavior remains inside the corresponding adapter.
+The Worker runtime does not become another Personal Agent identity.
 
-## Agent Operations Tool boundary
+Glassbox talks to Herdr through `HerdrBridge`; Herdr protocol details stay behind that boundary.
 
-The main Pi Agent interacts with Task and Herdr operations through Glassbox Tools.
+See `docs/agent-operations.md` for lifecycle and reconciliation rules.
 
-P3 minimum surface includes concepts such as:
-
-```text
-ops_status
-task_list
-task_get
-task_create
-task_delegate
-worker_status
-worker_read
-worker_prompt
-task_accept
-task_rework
-task_cancel
-```
-
-These are protected product Actions.
-
-A QQ caller does not gain raw terminal authority merely because the main Agent can operate Herdr.
-
-Do not expose unrestricted Herdr `pane.send_input`, arbitrary worktree deletion, or unrelated pane reads as generic remote capabilities.
-
-## Security rule
+## Security
 
 Glassbox authorization always wins.
 
-Pi extensions, skills, prompts, runtime settings, Codex configuration, Claude Code configuration, Herdr state, Herdr plugins, workflow recipes, and future workers cannot expand the caller's Glassbox permissions.
-
-Plan 03 uses four unavoidable server-side gates:
+None of these may widen caller authority:
 
 ```text
-Ingress Gate
-Context Gate
-Tool Gate
-Delivery Gate
+Pi profile
+Pi Extension
+Skill
+Prompt
+MCP integration
+Lora PI Kit setting
+Codex configuration
+Claude Code configuration
+Herdr state
+Worker output
 ```
 
-Every protected decision must carry enough structured context to answer:
-
-```text
-Who is acting?
-Where are they acting?
-What are they trying to do?
-How will it be done?
-Which resource is involved?
-Who will receive the result?
-Which Conversation and Run does this belong to?
-```
-
-The trusted order is:
+The main security order remains:
 
 ```text
 receive Channel event
--> resolve Principal and location
--> Ingress Gate
--> resolve Conversation
--> Context Gate
--> build authorized model Context
--> invoke Pi SDK
--> Tool Gate on protected execution or Ops action
--> direct execution or authorized Task delegation
--> produce result with visibility provenance
--> Delivery Gate for target audience
--> deliver
--> record evidence
+→ resolve Principal / location
+→ Ingress authorization
+→ resolve Conversation
+→ authorize and build model Context
+→ invoke runtime
+→ re-authorize protected Tool / Ops execution
+→ produce result with visibility provenance
+→ authorize Delivery audience
+→ deliver
+→ record evidence
 ```
 
-Runtime configuration and Herdr topology never become authorization sources.
+For remote QQ profiles, do not expose unrestricted shell, arbitrary MCP capability, raw Herdr pane input, destructive worktree operations, or unrelated Worker reads merely because the Kit contains those capabilities.
 
-QQ group execution does not inherit Owner-private visibility merely because the Owner sent the message.
-
-Worker output cannot bypass the same visibility and Delivery rules as Tool output.
-
-The delegation invariant remains:
+Delegation must satisfy:
 
 ```text
 worker_permissions ⊆ delegated_permissions ⊆ caller_permissions
 ```
 
-## Current phase
+## Versioning
 
-Plan 03 is `QQ Personal Agent Closed Loop` with a minimal Herdr-backed Agent Operations foundation.
+Do not let production behavior float with upstream `main`.
 
-It deliberately combines the trusted foundation, first real runtime and Channel, and the smallest useful multi-worker control loop:
-
-```text
-Deterministic test environment
--> Lora PI Kit MVP
--> Pi SDK Runtime
--> Identity + four hard authorization gates
--> scope-based Conversation + Turso
--> Herdr Agent Ops Foundation
--> NapCat / OneBot QQ Channel
--> private chat + group chat
--> direct answer or delegated Task
--> worker status + review + rework
--> Trace + restart + dedupe + reconciliation
--> real QQ + Herdr acceptance
-```
-
-Plan 03 uses a strict QQ Tool allowlist. Generic unrestricted shell execution is not exposed through the remote QQ profile.
-
-Codex and Claude Code remain available as compatibility, regression, and worker paths while Pi becomes the primary Personal Agent runtime.
-
-P3 Agent Operations remains deliberately small. Complex DAGs, checkpoints, generalized retry policy, child tasks, and large-scale durable workflow semantics stay in the later LongTask phase.
-
-## Local test to server deployment
-
-P3 is developed locally, but production is expected to run on a server.
-
-Target host shape:
+One tested runtime set should identify:
 
 ```text
-Linux server
-  Glassbox server
-  Pi SDK + Lora PI Kit
-  NapCat
-  Herdr session server
-  coding Agents / worktrees
-  durable state
+Pi version / commit
+Lora PI Kit version / commit
+lora-sys/skills source commit
+selected external package versions
+Glassbox version / commit
 ```
 
-When Glassbox and Herdr are on the same host, keep their integration on the local host control boundary.
-
-A human may attach over SSH. Moshi may be used as a remote Herdr client and operational viewport, but Moshi state is not required for product correctness.
-
-Do not bake developer-machine absolute paths, local GUI state, or Herdr sidebar presentation into product state.
-
-The same contracts must work locally and on the server:
+Upgrade flow:
 
 ```text
-Authorization
-Conversation
-Task
-TaskAttempt
-AttentionItem
-WorkerBinding
-HerdrBridge
-OpsReconciler
-Trace
+update input
+→ build / sync Kit
+→ Kit compatibility tests
+→ Glassbox runtime tests
+→ real acceptance where required
+→ update locks
+→ pin / release
 ```
+
+## Current P3 requirement
+
+P3 does not need every future integration enabled.
+
+It does need the real distribution architecture during P3.1:
+
+```text
+Pi package manifest
+pinned bundled lora-sys/skills snapshot
+main-agent / qq-group / herdr-worker / test profiles
+Glassbox policy bridge
+trace / usage hooks
+minimal MCP adapter boundary
+base prompts
+settings / model templates
+install / doctor / sync-skills
+Pi + Skills compatibility locks
+```
+
+Do not build a throwaway P3 installer that will later be replaced by the actual Kit architecture.
 
 ## Migration rule
 
-Do not perform a blind big-bang rewrite of unrelated runtime code.
+Do not perform a blind big-bang rewrite of existing Codex / Claude Code paths.
 
-Implement the P3 Pi, QQ, and Herdr paths as vertical closed loops, preserve existing useful adapters, and move shared behavior only when the new path proves the required contracts.
-
-P3 acceptance is based on task success, authorization invariants, non-leak canary tests, Conversation restart behavior, Task / worker reconciliation, Trace quality, QQ transport correctness, and delivery correctness.
+Add the Pi + Lora PI Kit path as a vertical slice, preserve useful existing adapters, and move shared behavior only after the new path proves the contracts.

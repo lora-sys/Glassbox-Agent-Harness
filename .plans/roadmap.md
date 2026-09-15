@@ -2,138 +2,127 @@
 
 Status: ROADMAP ONLY
 
-This file records sequencing and product direction. It is not an active implementation plan.
+This file records sequencing and product direction. It is not permission to implement future phases.
 
-The only active implementation plan is `/.plans/03-personal-agent-foundation.md` until its completion gate passes.
+The only active implementation plan is:
+
+```text
+.plans/03-personal-agent-foundation.md
+```
+
+until its completion gate passes.
 
 ## Product thesis
 
-Glassbox is a durable Personal Agent with explicit identity, authorization, persistent state, inspectable execution, learning, evidence, and controlled delegation.
+Glassbox is one durable Personal Agent with explicit identity, authorization, persistent state, inspectable execution, controlled delegation, learned Taste, durable Memory, reusable Skills, and evidence.
 
-The roadmap is organized around usable product loops rather than isolated infrastructure milestones.
+The roadmap is organized around usable product loops, not isolated infrastructure milestones.
 
-The first loop is QQ because it gives Glassbox a real remote Channel, real multi-user identity, real private and group delivery, and a concrete place to prove authorization boundaries.
+## Stable architecture direction
 
-The same first loop now includes a minimal Agent Operations foundation so the user can increasingly talk to one main Agent while that Agent coordinates multiple coding workers through Herdr.
-
-## Runtime direction
-
-Glassbox keeps product identity and trust semantics independent from the concrete execution runtime.
-
-The selected P3 runtime path is:
+Use this model:
 
 ```text
-earendil-works/pi
-      ↓
+Pi
+  Agent engine
+
 Lora PI Kit
-      ↓
-Pi SDK embedded in Glassbox server
-      ↓
-Glassbox Runtime Boundary
+  Lora's reproducible Pi distribution
+
+Glassbox
+  Personal Agent system / product control plane
+
+Herdr
+  live coding-worker execution host
 ```
 
-Pi provides runtime primitives and SDK surfaces.
+### Pi
 
-Lora PI Kit provides owned Pi configuration, Extensions, selected Skills, prompts, presets, observability hooks, bootstrap tooling, and compatibility metadata.
+Pi provides runtime primitives, Packages, Extensions, Skills, Prompt Templates, models/providers, sessions, SDK, RPC, and Agent-loop behavior.
 
-Glassbox keeps:
+### Lora PI Kit
+
+Lora PI Kit is the reusable distribution installed on top of Pi.
+
+It contains or manages:
+
+```text
+pinned Lora Skills snapshot
+Pi Extensions
+Prompt Templates
+runtime profiles
+MCP adapter / registry
+model / thinking defaults
+Glassbox runtime bridges
+Taste / Feedback / Trace hooks
+install / doctor / update / sync tooling
+compatibility locks
+```
+
+`lora-sys/skills` remains the canonical Skill source repository. Kit releases bundle a pinned snapshot for reproducibility.
+
+The same Kit may be used by local Pi, the Glassbox main Agent, and Herdr Pi workers through different profiles.
+
+Detailed design: `docs/lora-pi-kit.md`.
+
+### Glassbox
+
+Glassbox keeps durable product truth:
 
 ```text
 Agent identity
 Principal
 Authorization
 Conversation
-protected Context
-Tool authorization
-Delivery authorization
-Task truth
-Attention Queue
-TaskAttempt / WorkerBinding
-Turso state
+Task / Attention / TaskAttempt / WorkerBinding
+Taste / Memory truth
+Audience / Delivery policy
 Run identity
+Turso product state
 Raw Trace
 ```
 
-Codex and Claude Code remain supported adapters for compatibility, fallback, specialist execution, and later differential Eval. P3 does not delete them.
+### Herdr
 
-Use supported Pi settings, package, Skill, Extension, custom Tool, ResourceLoader, and SDK boundaries before considering any Pi core patch.
-
-## Agent Operations direction
-
-Herdr is the selected execution host and live Agent-operations layer for coding workers.
-
-The intended boundary is:
+Herdr owns live execution topology and coding-Agent lifecycle observation.
 
 ```text
-Main Glassbox Agent
-        ↓
-Attention Queue + Task Registry
-        ↓
-Glassbox Ops Tools
-        ↓
-Herdr Bridge
-        ↓
-Herdr
-  workspace
-  worktree
-  pane
-  Pi / Codex / Claude / other supported coding Agent
-        ↓
-Herdr event stream
-        ↓
-Ops Reconciler
-        ↓
-Glassbox TaskAttempt / WorkerBinding / Trace
+Herdr done
+≠
+Glassbox Task accepted
 ```
 
-Glassbox and Herdr communicate both ways.
-
-Herdr owns live terminal topology and coding-Agent lifecycle facts such as `working`, `blocked`, `done`, and `idle`.
-
-Glassbox owns durable Task state, prioritization, acceptance criteria, review, rework, authorization, and evidence.
-
-These statements are intentionally different:
-
-```text
-Herdr agent = done
-Task = accepted
-```
-
-The first does not imply the second.
-
-`aorumbayev/herdr-workflows` may execute bounded linear stage recipes. It does not become the source of truth for Task state or rework loops.
-
-Local testing and server deployment use the same control model. The target production shape is Glassbox + Pi + NapCat + Herdr on a Linux server, with remote human access over SSH when needed. Moshi may be used as a remote Herdr client, but Moshi client state is not Glassbox product state.
+Glassbox owns review / rework / acceptance.
 
 ## Learning direction
 
-Glassbox separates four concepts that must not collapse into one prompt or one generic memory bucket:
+Do not collapse all persistent behavior into generic Memory.
 
 ```text
 Rules
-  explicit hard constraints
+  hard constraints
 
 Skills
   reusable validated procedures
 
 Taste
-  learned user preferences
+  learned user preference
 
 Memory
-  durable facts, decisions, events, and prior-work knowledge
+  durable facts, decisions, events and prior-work knowledge
 ```
 
-Taste is learned from behavior such as accept, reject, edit, revert, repeated correction, and explicit feedback.
+```text
+Rules ≠ Skills ≠ Taste ≠ Memory
+```
 
-Taste is not a hard Rule, and one observation is not a permanent preference.
+Taste learns from real behavior such as accept, reject, edit, revert, repeated correction, and explicit feedback.
 
-Glassbox owns FeedbackEvent, Taste, confidence, scope, promotion, retrieval, Memory, authorization, and provenance in durable state.
+Glassbox owns Feedback, confidence, scope, promotion, retrieval, Memory, authorization, and provenance.
 
-Lora PI Kit may collect signals and inject selected Taste into Pi, but it does not become the canonical Taste store.
+Lora PI Kit only bridges selected runtime context into Pi and forwards observable signals back to Glassbox.
 
-The same learned Taste should eventually be reusable across Pi, Codex, Claude Code, and future Runtimes.
-
-See `docs/memory-taste.md`.
+Detailed design: `docs/memory-taste.md`.
 
 ## Sequence
 
@@ -141,186 +130,103 @@ See `docs/memory-taste.md`.
 
 Current active plan.
 
-P3 is the first usable Glassbox product loop.
+Goal: first real usable Personal Agent product loop.
 
 ```text
 QQ
-→ NapCat
-→ OneBot 11 Channel Adapter
-→ Ingress Gate
+→ NapCat / OneBot
 → Identity + Conversation
 → Authorization
-→ Authorized Context
-→ Pi SDK + Lora PI Kit
-→ Tool Gate
-→ direct answer or durable Task
+→ Pi SDK + pinned Lora PI Kit profile
+→ direct answer OR durable Task
 → optional Herdr delegation
-→ review / rework / completion
+→ review / rework / accept
 → Delivery Gate
 → QQ reply
 → Turso + Trace
 ```
 
-P3 includes:
+P3 establishes:
 
 ```text
-deterministic test environment
-real QQ acceptance environment
-Lora PI Kit MVP
-Pi SDK Runtime
-server-side hard authorization gates
-scope-based private and group Conversations
-Turso persistence
-NapCat / OneBot QQ Channel
-private chat
-group @ activation
-message dedupe
-reconnect handling
-restart recovery
-adversarial canary tests
-Trace evidence
-
-Attention Queue
-Task Registry
-TaskAttempt
-WorkerBinding
-AgentOpsSnapshot
-HerdrBridge
-Herdr event ingestion
-snapshot reconciliation
+Lora PI Kit distribution MVP
+Pi SDK main runtime
+hard authorization gates
+scope-based Conversation
+Turso durable state
+QQ private / group Channel
+Attention Queue / Task Registry
+TaskAttempt / WorkerBinding
+HerdrBridge / reconciliation
 Ops Tools
-one real delegated coding task
-working / blocked / review / rework / done loop
+real delegated coding Task
+restart / reconnect / dedupe
+real QQ + Herdr acceptance
 ```
 
-P3 completion means a real Owner and Visitor can use the same Personal Agent through QQ without crossing permission or delivery boundaries, while the main Agent can also see its current workload and coordinate at least one real Herdr-backed worker through a complete review/rework cycle.
+P3 does not become the full LongTask engine.
 
-P3 deliberately does not become a full durable workflow engine. Complex dependency DAGs, checkpoints, general retry policy, child tasks, and large-scale worker scheduling remain later work.
-
-See the active plan for the full completion gate.
+See the active Plan for exact slices and the completion gate.
 
 ### P4 — Memory, Taste and Authorized Retrieval
 
-After the first real QQ and Ops loops work, add the learning layer without weakening the P3 trust model.
+Add the personal learning layer after P3 trust and execution boundaries are proven.
 
-P4 begins by learning preference from real user corrections before building broad Memory retrieval.
-
-Stable split:
-
-```text
-Rules ≠ Skills ≠ Taste ≠ Memory
-```
+Order matters: learn Taste from corrections before building broad Memory retrieval.
 
 Target Taste loop:
 
 ```text
 Agent output
-→ user accept / reject / edit / revert / correction
+→ accept / reject / edit / revert / correction
 → FeedbackEvent
 → TasteCandidate
-→ confidence + scope update
+→ confidence + scope
 → promote / demote / retire
-→ task-aware Taste retrieval
+→ task-aware retrieval
 → inject only relevant Taste
-→ next Runtime execution
+→ next execution
 ```
+
+Initial Taste scope:
+
+```text
+global
+project
+```
+
+One edit is evidence, not a permanent preference.
+
+Project Taste must not silently become global Taste.
 
 Target Memory loop:
 
 ```text
 Run / Conversation / Task evidence
 → Memory Candidate
-→ visibility inheritance
-→ value / reliability checks
-→ deduplication / contradiction handling
+→ visibility + reliability checks
+→ dedupe / contradiction handling
 → promotion
 → authorized retrieval
 ```
 
-P4 starts with two Taste scopes:
+Planned P4 slices:
 
 ```text
-global
-  long-lived personal preference
-
-project
-  preference specific to the current project
+P4.0 Feedback Ledger
+P4.1 Taste Candidate + Confidence
+P4.2 Task-aware Taste Retrieval
+P4.3 Semantic Memory
+P4.4 Episodic Memory
+P4.5 Authorized Retrieval
+P4.6 Inspection and Eval
 ```
 
-Project Taste must not silently contaminate global Taste.
+Stable procedural knowledge should normally become a Skill rather than generic Memory.
 
-Every promoted Taste entry must preserve:
+P4 success should measure reduced user correction work, not the number of stored records.
 
-```text
-preference
-category
-scope
-confidence
-supporting evidence
-contradicting evidence
-observation count
-first seen
-last seen
-status
-provenance
-```
-
-One edit is evidence, not a permanent rule.
-
-Only task-relevant Taste should be injected into model Context. Do not send the whole preference profile every turn.
-
-P4 planned slices:
-
-```text
-P4.0 — Feedback Ledger
-  durable accept / reject / edit / revert evidence
-
-P4.1 — Taste Candidate + Confidence
-  global / project scope
-  promotion / demotion
-  contradiction and recency handling
-
-P4.2 — Task-aware Taste Retrieval
-  relevant Top K only
-  runtime injection
-  authorization and scope checks
-
-P4.3 — Semantic Memory
-  durable facts, decisions, relationships, and project knowledge
-
-P4.4 — Episodic Memory
-  meaningful prior Run / Task / Conversation outcomes
-
-P4.5 — Authorized Retrieval
-  authorization first
-  lexical first
-  hybrid/vector when justified
-  source weighting, decay, diversity, context budget
-
-P4.6 — Inspection and Eval
-  evidence, confidence, scope, retrieval reason, and impact
-```
-
-Procedural knowledge that stabilizes into a reusable validated workflow should normally be promoted to a Skill rather than remain generic Memory.
-
-Retrieval should eventually combine:
-
-```text
-authorization scope
-+ lexical retrieval
-+ vector retrieval
-+ source weighting
-+ temporal decay
-+ diversity reranking
-+ reliability / confidence
-+ context budget
-```
-
-Protected Taste and Memory must be filtered before model-visible retrieval results are assembled.
-
-P4 success is measured by reduced correction work, not by how many preferences or memories were stored.
-
-Track at least:
+Useful metrics:
 
 ```text
 Correction Rate
@@ -333,66 +239,54 @@ Taste Retrieval Precision
 Memory Retrieval Precision
 ```
 
-Primary references:
-
-```text
-CommandCodeAI/command-code for Taste product mechanics
-zhibao-dev/Learning-Multi-Factor-Memory
-langchain-ai/langmem
-TokenRhythm/opensquilla for retrieval mechanics
-```
-
-See `docs/memory-taste.md` and `upstream/command-code/SOURCES.md`.
+Primary references include Command Code for Taste mechanics, Learning-Multi-Factor-Memory, LangMem, and OpenSquilla retrieval mechanics.
 
 ### P5 — Efficient Runtime and Observability
 
-Optimize the working Pi and Agent Ops paths only after P3 proves correctness and P4 gives retrieval real data.
+Optimize the proven runtime and retrieval paths.
 
 Target capabilities:
 
 ```text
 Context Budget Governor
-Tool Result Budget
-Tool Result Projection
-Token Estimation
-Execution Routing
-Thinking-depth selection
-Prompt / Context compression policy
-Duplicate retrieval prevention
+Tool Result Budget / Projection
+Token estimation
+Execution routing
+thinking-depth selection
+Context compression policy
+duplicate retrieval prevention
 permission-scoped semantic cache
-Runtime usage / quota / health collection
-Agent Ops usage / health projection
-Routing observability
-Routing Eval
+runtime usage / quota / health
+Agent Ops health / throughput
+routing observability
+routing Eval
 ```
 
-Generic Pi workflow mechanisms belong in Lora PI Kit when they do not affect Glassbox product authorization or protected-data semantics.
+Generic Pi workflow mechanisms belong in Lora PI Kit when they do not change Glassbox authorization, product truth, or evidence semantics.
 
-Glassbox keeps any mechanism that changes protected Context visibility, product routing policy, durable state, Task truth, or evidence semantics.
+Glassbox keeps protected Context selection, product routing policy, Task truth, and evidence.
 
 Primary references:
 
 ```text
 TokenRhythm/opensquilla
 Javis603/token-monitor
-herdrdev/herdr telemetry and lifecycle surfaces
+Herdr lifecycle surfaces
 OpenTelemetry concepts
 ```
 
-Success is measured with quality, authorization invariant violations, token usage, cost, latency, task throughput, blocked time, and review/rework rates. Do not claim efficiency from intuition alone.
-
 ### P6 — Durable Long Work and Workers
 
-Extend the P3 Task / TaskAttempt / WorkerBinding foundation into real durable long-running work.
+Extend the P3 Task foundation into durable long-running work.
 
-Do not replace the P3 Task model merely because a more capable workflow engine is introduced. Migrate or extend the proven contracts.
+Do not replace proven Task / TaskAttempt / WorkerBinding semantics merely because a workflow engine is introduced.
 
 Target semantics:
 
 ```text
 stable task id
 steps
-dependencies / DAG
+dependency DAG
 event history
 checkpoint
 retry policy
@@ -402,8 +296,8 @@ child task
 worker job
 cancellation
 continuation
-lease / heartbeat where needed
-recovery after server restart
+lease / heartbeat
+restart recovery
 ```
 
 Primary references:
@@ -414,21 +308,17 @@ keli-wen/agy-staff
 herdrdev/herdr for live coding-worker execution
 ```
 
-Worker authority must satisfy:
+Delegation must always satisfy:
 
 ```text
 worker_permissions ⊆ delegated_permissions ⊆ caller_permissions
 ```
 
-A Worker may execute through Pi, Codex, Claude Code, AGY, or another backend. Runtime selection never widens authority.
-
-Herdr remains useful for live coding workspaces and interactive worker processes. Durable workflow truth remains Glassbox-owned or lives behind a deliberately selected durable orchestration boundary.
-
 ### P7 — More Channels and Personal Domains
 
-Expand beyond the first QQ loop only after the shared trust, Conversation, Task, and delivery model has proven itself.
+Expand beyond QQ only after the shared trust, Conversation, Task, and Delivery model is proven.
 
-Candidates include:
+Candidates:
 
 ```text
 Web public access
@@ -440,7 +330,7 @@ Email
 Calendar
 ```
 
-New Channels must reuse the same:
+Every new Channel reuses:
 
 ```text
 ChannelIdentity
@@ -448,28 +338,27 @@ Principal
 Conversation scope
 Authorization
 Context Gate
-Tool Gate
+Tool / Ops Gate
 Delivery Gate
-Attention Queue
-Task Registry when work is delegated
+Attention / Task when delegated
 Trace
 ```
 
-Mail and Calendar remain protected product Domains, not unrestricted MCP access.
+Mail and Calendar remain protected product Domains, not unrestricted remote capability.
 
-### P8 — Eval, Learning, Assets, and Skill Evolution
+### P8 — Eval, Learning, Assets and Skill Evolution
 
-Turn real execution evidence into a controlled learning loop:
+Turn real execution evidence into a controlled improvement loop.
 
 ```text
-Run / Task / Trace / Feedback
+Run / Task / Trace
 → Experience Mining
-→ Memory / Taste / Skill / Asset Candidate
+→ Memory / Skill / Asset Candidate
 → Eval / Verification
 → Promotion
 ```
 
-Target capabilities include:
+Target capabilities:
 
 ```text
 Benchmark Eval
@@ -477,8 +366,7 @@ Differential Eval
 Invariant Eval
 Permission Eval
 Routing Eval
-Taste Eval
-Task / worker Eval
+Task / Worker Eval
 Skill generation
 Skill verification
 Asset lineage
@@ -487,17 +375,17 @@ Monthly review
 Arena experiments
 ```
 
-Primary references include Inspect AI, SkillClaw, CoEvoSkills, Voyager, Dagster, Generative Agents, OpenSpiel, Sotopia, memos, and the P4 Taste evidence model.
+Validated reusable Pi procedures may land in `lora-sys/skills` and then flow into a later Lora PI Kit release as a pinned Skill snapshot.
 
-Validated reusable Pi workflow procedures may be published through Lora PI Kit or `lora-sys/skills`. Glassbox remains the source of product evidence, permissions, task acceptance, Taste truth, and promotion decisions.
+Glassbox remains the source of product evidence, authorization, Task acceptance, Taste / Memory truth, and promotion decisions.
 
 ## Documentation and Learning track
 
-The documentation site remains a parallel product track.
+The documentation / learning site remains a parallel product track.
 
-It must never present a planned mechanism as implemented.
+It must never present planned behavior as already implemented.
 
-Every substantial capability page shows one of:
+Every substantial capability page should show one of:
 
 ```text
 Implemented
@@ -507,73 +395,58 @@ Planned
 
 ### D0 — Documentation foundation
 
-Can proceed during P3 without changing runtime scope.
-
-Create information architecture, terminology, diagrams, synthetic fixtures, and demo specifications.
+Maintain architecture truth, terminology, synthetic fixtures, and diagrams during P3.
 
 ### D1 — P3 interactive lessons
 
-After P3 contracts stabilize, publish lessons for:
+After P3 contracts stabilize, teach:
 
 ```text
 Owner vs Visitor
-private vs group Conversation
-Who / Where / What / How / Audience authorization
-Default deny
+Who / Where / What / How / Audience
 Permission vs Approval
 Authorize before Context
-Tool re-authorization
-Delivery Gate
-Conversation vs Pi Session vs Run
-Task vs Run vs TaskAttempt
+Tool / Ops authorization
+Delivery authorization
+Conversation vs Session vs Run
+Task vs TaskAttempt vs Run
 Herdr state vs Task acceptance
-Attention Queue
-Authorization Trace
+Lora PI Kit vs Pi vs Glassbox
 Raw Trace vs Derived State
 ```
 
-Use synthetic deterministic fixtures derived from the real P3 contracts.
+### D2 — Taste / Memory lab
 
-### D2 — Taste, Memory and retrieval lab
-
-After P4 exists, let readers manipulate:
+After P4, let readers inspect and manipulate:
 
 ```text
-feedback signals
+Feedback evidence
 Taste confidence
-supporting vs contradicting observations
-global vs project scope
-Taste retrieval relevance
-visibility scope
-lexical/vector weight
-time decay
-source weighting
-diversity
-result count
-context budget
+scope
+promotion / demotion
+retrieval relevance
+visibility
+time decay / contradiction
+Memory retrieval
 ```
 
-The demo should make the difference between Rule, Skill, Taste, Semantic Memory, and Episodic Memory explicit.
+### D3 — Routing / token economy lab
 
-It must also make it obvious that authorization filtering happens before protected Taste or Memory reaches model-visible Context.
+After P5, compare routing, model tier, thinking depth, Context budget, Tool projection, retrieval budget, and Worker utilization.
 
-### D3 — Routing and token economy lab
+### D4 — LongTask / learning labs
 
-After P5 exists, let readers compare routing, model tier, thinking depth, context budget, tool-result projection, retrieval budget, and worker utilization with reproducible fixtures.
-
-### D4 — LongTask and learning labs
-
-After later runtime phases, add LongTask state-machine, Trace-to-Canvas, Skill promotion, Eval, and broader learning-loop demonstrations.
+After later phases, add LongTask state machines, Skill promotion, Eval, and asset lineage demonstrations.
 
 ## Stable roadmap rules
 
-- Active implementation scope comes from the current Plan file, not from future roadmap sections.
-- Upstream references are research and implementation material, not automatic dependencies.
-- Glassbox authorization always wins over runtime configuration, Pi Extensions, Skills, model output, Channel input, Herdr state, Taste, Memory retrieval, or Worker behavior.
-- Rules, Skills, Taste, and Memory remain separate concepts with separate authority and lifecycle.
-- Taste is preference, not hard permission or product policy.
-- Glassbox Task state is durable product truth. Herdr lifecycle state is an execution observation.
-- A new runtime, Channel, Memory system, Taste learner, cache, Herdr plugin, workflow recipe, or Worker cannot bypass the hard gates proven in P3.
-- `done` from an external runtime or worker never means accepted unless the Glassbox Task state machine records acceptance.
-- Local testing must preserve the same contracts intended for the Linux server deployment. Avoid desktop-only product dependencies.
-- Build one usable vertical loop at a time and preserve focused regression coverage for working behavior.
+- Active implementation scope comes from the current Plan, not future roadmap sections.
+- Pi is an engine; Lora PI Kit is a distribution; Glassbox is the Personal Agent system.
+- `lora-sys/skills` is canonical Skill source; a Kit release uses a pinned snapshot.
+- Package / profile / MCP presence never overrides Glassbox authorization.
+- Glassbox Task state is durable product truth; Herdr state is execution observation.
+- Taste is preference, not authority.
+- A new Runtime, Channel, MCP integration, Memory system, cache, Worker, or plugin cannot bypass the trust boundaries proven in P3.
+- External `done` never means accepted unless Glassbox records acceptance.
+- Local testing must preserve the same contracts intended for Linux server deployment.
+- Build one usable vertical loop at a time and keep focused regression coverage for working behavior.
