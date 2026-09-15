@@ -8,7 +8,7 @@ These specs are not all portable smoke tests yet.
 
 Several historical files were written during Plan 01 and Plan 02 and may assume:
 
-- live Codex or Claude Code
+- live external execution runtimes
 - local credentials
 - a pre-generated session or trace
 - a controlled demo repository

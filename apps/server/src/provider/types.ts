@@ -64,7 +64,7 @@ export interface ProviderAdapter {
     traceCollector?: (method: string, params: Record<string, unknown>) => void
   ): Promise<RunResult>;
 
-  registerOnTurnEnd(fn: (status: string) => void): void;
+  registerOnTurnEnd(fn: (status: string) => void, threadId?: string): void;
 
   on(event: "approval", handler: (ev: ApprovalEvent) => void): void;
   respondToApproval(requestId: number | string, approved: boolean): void;

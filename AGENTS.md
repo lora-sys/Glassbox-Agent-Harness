@@ -70,7 +70,7 @@ Editing, projection, compression, or a newer reducer must not erase what an acti
 
 Glassbox connects to existing Agent runtimes and specialist workers instead of forcing every provider into one behavior.
 
-Codex, Claude Code, OpenHarness, AGY, and future systems may expose different tools, lifecycle controls, context behavior, permission modes, and events.
+Pi, OpenHarness, and future systems may expose different tools, lifecycle controls, context behavior, permission modes, and events.
 
 Keep provider-specific behavior close to the provider integration.
 
@@ -128,6 +128,10 @@ Read in this order before changing code:
 
 `.plans/roadmap.md` records sequencing, not permission to implement future phases.
 
+Update `CONTEXT.md` with current module boundaries, domain decisions, and glossary links as each slice changes; update the active plan and roadmap with verified progress.
+
+WebUI and CLI use the same server-owned configuration and domain APIs; neither client maintains a separate configuration store or bypasses authorization.
+
 Current P3 scope is deliberately narrow:
 
 ```text
@@ -142,9 +146,7 @@ Turso persistence
 Run / Authorization Trace
 ```
 
-P3 may use fake Channels, fake protected Tools, deterministic fixtures, and disposable persistence to prove the boundary.
-
-Until P3 passes its completion gate, do not make real WeChat, QQ, Mail, Calendar, AGY, LongTask, Eval, Arena, Skill evolution, full Memory consolidation, vector retrieval, semantic cache, smart routing, or serverless deployment a dependency of the implementation.
+P3 executes in narrow vertical slices. The first slice delivers a self-use QQ group assistant for the Owner before broader multi-tenant roles. The current QQ phase includes a bounded Run-linked Eval acceptance loop. Real WeChat, Mail, Calendar, durable LongTask orchestration, the full Eval platform, Arena, Skill evolution, full Memory consolidation, vector retrieval, semantic cache, smart routing, and serverless deployment remain deferred.
 
 Product history and future ideas belong in `README.md`, `.plans/roadmap.md`, `docs/`, or research notes. Current implementation scope belongs in the active plan.
 
@@ -160,8 +162,8 @@ Use these terms consistently.
 - **principal** means the effective actor used for an authorization decision.
 - **channel identity** means an external identity such as Workbench account, WeChat ID, QQ ID, email identity, or future integration identity.
 - **agent** means the durable Personal Agent product identity unless a provider-specific context clearly means an external Agent runtime.
-- **provider** means an external model / Agent runtime integration such as Codex or Claude Code.
-- **worker** means delegated specialist execution such as future AGY-style background work.
+- **provider** means an external model / Agent runtime integration such as a PI-compatible protocol adapter.
+- **worker** means delegated specialist execution such as background work.
 - **resource** means protected data or capability addressed by authorization.
 - **action** means an explicit operation on a Resource or execution state.
 - **conversation** means the durable relationship / thread between a Principal and the Personal Agent.
@@ -286,6 +288,18 @@ Before calling a change done, check the parts that apply.
 - **Reverse states.** Grant / Revoke, start / stop, apply / edit, approve / consume, and similar paired states need explicit behavior.
 - **Toolchain.** Keep workspace config, package manifests, lockfile, test runner, lint, and format behavior coherent.
 - **Docs.** Update the active plan or stable docs when a settled boundary changes.
+
+## Platform and environment portability
+
+Windows is the first support and validation target. This does not claim that the current runtime has passed Windows validation. macOS and Linux are portability targets to verify later. Code, fixtures, and scripts must avoid hardcoded developer paths and use standard path resolution and platform-aware child process spawning.
+
+The first milestone delivers an owner-only QQ group assistant for personal use. Broad multi-tenant permission platforms and complex roles are deferred to later slices, but basic security invariants hold from the start: trusted identity binding, owner allowlist, restricted test group ID, caller and group context isolation, strictly blocking private owner data from group chat, allowing explicitly configured private resources only in the verified Owner private conversation, durable conversations, and append-only traces.
+
+Desktop packaging such as Electron or Tauri, mobile clients, and multi-device sync protocols remain pending discussion and are not decided in Plan 03.
+
+Copy suitable existing provider and Agent-loop implementations into Glassbox-owned modules. Never import upstream reference directories or install Pi, OpenHarness, or another whole Agent framework as a shortcut for this source-reuse plan. Preserve licenses, notices, source commits, original paths, and local modifications. Rewrite copied internal package references to owned local modules. Ordinary SDKs, database drivers, ws, and Vite+ remain normal dependencies; do not rewrite those primitives. Incompatible source is adapted from its proven behavior and tests. Glassbox owns authorized context, protected Tool wrappers, identity, conversation routing, and evidence. The core execution is centered around agy-staff with extensible API protocols and model profile configuration. Keep agy-staff. External local execution integrations are not accepted into the active path.
+
+QQ official and NapCat OneBot adapters may coexist. Each connection, caller, group, and message has a namespaced identity. Replies use their ingress connection. Proactive messages require an explicit destination and a persisted delivery outcome. Do not automatically switch adapters to bypass delivery restrictions or retry an unknown outcome. Do not include private data in group context or group-bound Tool results. See `.plans/findings/03-p3.1-qq-gateway-and-provider-decisions.md`.
 
 ## Dev servers
 
@@ -543,8 +557,8 @@ Reuse mature code when it already solves the problem well.
 Before inventing a standard mechanism, inspect relevant upstream work. Important references include:
 
 ```text
-pingdotgg/t3code
-  Provider integration, Claude Code permissions, resume
+earendil-works/pi
+  Model provider protocols, agent loop, streaming parsers, tool calling
 
 HKUDS/OpenHarness
   Agent loop, tools, memory, permissions, channels, QQ
@@ -588,7 +602,7 @@ The documentation site is a Learning Lab as well as reference documentation. Con
 
 Interactive demos should use deterministic synthetic data and mirror real domain semantics when those semantics exist. Do not build a second fake authorization model only for docs.
 
-Memory, retrieval, routing, Mail, Calendar, Workers, LongTask, Eval, Skill evolution, Asset Library, Arena, and serverless execution are future consumers of the foundation. Do not pull them into P3 unless a tiny fake is required to prove a P3 invariant.
+Memory consolidation, retrieval, smart routing, Mail, Calendar, Workers, durable LongTask orchestration, the full Eval platform, Skill evolution, Asset Library, Arena, and serverless execution remain later consumers. The current phase explicitly includes deterministic Eval samples tied to real Runs and Trace evidence, not a general experiment platform.
 
 OpenSquilla is a post-foundation efficiency reference, not a reason to implement routing or vector retrieval during P3.
 

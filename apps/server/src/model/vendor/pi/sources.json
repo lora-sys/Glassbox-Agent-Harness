@@ -1,0 +1,168 @@
+{
+  "repository": "https://github.com/earendil-works/pi",
+  "commit": "71dca871bc80b6bc97be37f0ca3189399d651fff",
+  "license": "MIT",
+  "files": [
+    {
+      "file": "api/anthropic-messages.ts",
+      "source": "packages/ai/src/api/anthropic-messages.ts",
+      "sha256": "8e105cc5b2dd304547ed613b70de4740c4db93cee830dc452c2de945052b12b7",
+      "mode": "adapted",
+      "modification": "Removed Copilot/OAuth client creation and browser credential access. API-key clients only; mark reported usage fields. Marked existing asynchronous parser task intentional; adjusted lint-only type annotations."
+    },
+    {
+      "file": "api/constrained-sampling.ts",
+      "source": "packages/ai/src/api/constrained-sampling.ts",
+      "sha256": "1b869f139e5cd1f09b4ebecb8f7ce9ea44b63e75dc6d6158ac8f5d00f2eaddbb",
+      "mode": "copied",
+      "modification": "None beyond formatting."
+    },
+    {
+      "file": "api/openai-completions.ts",
+      "source": "packages/ai/src/api/openai-completions.ts",
+      "sha256": "5874bf0b121db117bd4eba8fffa750252f5f7617f38306c6eb1f746575896319",
+      "mode": "adapted",
+      "modification": "Removed Copilot client/header path and browser credential access. Mark usage fields actually reported by protocol. Marked existing asynchronous parser task intentional; adjusted lint-only type annotations."
+    },
+    {
+      "file": "api/openai-prompt-cache.ts",
+      "source": "packages/ai/src/api/openai-prompt-cache.ts",
+      "sha256": "78727b9b42d5c5cdc47d17f44d532cdf951cbee3b158cacfb3e640d8f792e8a4",
+      "mode": "copied",
+      "modification": "None beyond formatting."
+    },
+    {
+      "file": "api/openai-responses-shared.ts",
+      "source": "packages/ai/src/api/openai-responses-shared.ts",
+      "sha256": "2562ad7497bfe9cf71533b7584400751746b6a563229a615f6e23848780d2bee",
+      "mode": "adapted",
+      "modification": "Mark usage fields actually reported by protocol. Removed constant-truthiness fallback and converted exhaustive diagnostic value explicitly."
+    },
+    {
+      "file": "api/openai-responses.ts",
+      "source": "packages/ai/src/api/openai-responses.ts",
+      "sha256": "dea6113f21ab782bac450fc32ac8b8c99d8fd14f41cfe4c124fc6091c03910ed",
+      "mode": "adapted",
+      "modification": "Removed Copilot client/header path and browser credential access. Marked existing asynchronous parser task intentional; adjusted lint-only type annotations."
+    },
+    {
+      "file": "api/simple-options.ts",
+      "source": "packages/ai/src/api/simple-options.ts",
+      "sha256": "3a9ab7fa885d3a9c73a1aee8c8bf8bd7d205740edef0f0a5219714fd16e38e57",
+      "mode": "adapted",
+      "modification": "Removed telemetry option propagation."
+    },
+    {
+      "file": "api/transform-messages.ts",
+      "source": "packages/ai/src/api/transform-messages.ts",
+      "sha256": "cf309c00b943bc0a90ccaabb185730a3f27a3c92de6696ada3155b0185904161",
+      "mode": "copied",
+      "modification": "None beyond formatting."
+    },
+    {
+      "file": "models.ts",
+      "source": "packages/ai/src/models.ts",
+      "sha256": "7b4d831c10ad2bf0a24f231cf2a12e84b59d6001337ac33fb18d6d4fc7da1c6c",
+      "mode": "adapted",
+      "modification": "Copied only calculateCost, thinking-level constants, getSupportedThinkingLevels and clampThinkingLevel. No model catalog, credential registry or filesystem discovery."
+    },
+    {
+      "file": "types.ts",
+      "source": "packages/ai/src/types.ts",
+      "sha256": "f2edab10f093a15ba2cdeaaf4fa1634d76ee943e6f62b2f44bdb2d14321834e0",
+      "mode": "adapted",
+      "modification": "Removed unused API imports/options and telemetry; added evidence markers for reported usage fields. Simplified redundant type unions and corrected explicit-environment comments."
+    },
+    {
+      "file": "utils/deferred-tools.ts",
+      "source": "packages/ai/src/utils/deferred-tools.ts",
+      "sha256": "cab1dbf6c0b40a64e2db3079dd3efa23786ad4cdae64abdedc04b1088a301d65",
+      "mode": "copied",
+      "modification": "None beyond formatting."
+    },
+    {
+      "file": "utils/diagnostics.ts",
+      "source": "packages/ai/src/utils/diagnostics.ts",
+      "sha256": "d22b4f96a00f032220ff0cc27458c7a525dcec948bdbd2bbb67b4d7598cb395d",
+      "mode": "copied",
+      "modification": "None beyond formatting."
+    },
+    {
+      "file": "utils/error-body.ts",
+      "source": "packages/ai/src/utils/error-body.ts",
+      "sha256": "7170181ae6926709fe4ab7ac6b5b51c46ffe906868a7aac3c7627cb28ad77c09",
+      "mode": "copied",
+      "modification": "None beyond formatting."
+    },
+    {
+      "file": "utils/estimate.ts",
+      "source": "packages/ai/src/utils/estimate.ts",
+      "sha256": "8334f683185cc11d7e867f30963dfc4b9d89c3db79e852364e89a24cb89b316a",
+      "mode": "copied",
+      "modification": "None beyond formatting."
+    },
+    {
+      "file": "utils/event-stream.ts",
+      "source": "packages/ai/src/utils/event-stream.ts",
+      "sha256": "147084657f76665ff7d6c8dcd6eb0745149e3aaee3e7b9c272b315a1b5679386",
+      "mode": "copied",
+      "modification": "None beyond formatting."
+    },
+    {
+      "file": "utils/hash.ts",
+      "source": "packages/ai/src/utils/hash.ts",
+      "sha256": "2cdfce4af41810d1a92c7f0a55c78637a3173041038aafd85b378be345761ed8",
+      "mode": "copied",
+      "modification": "None beyond formatting."
+    },
+    {
+      "file": "utils/headers.ts",
+      "source": "packages/ai/src/utils/headers.ts",
+      "sha256": "db52ff4621bef3e5a6b6ace56fd0ff09063ae840517c16b1690c60f89f85e106",
+      "mode": "copied",
+      "modification": "None beyond formatting."
+    },
+    {
+      "file": "utils/json-parse.ts",
+      "source": "packages/ai/src/utils/json-parse.ts",
+      "sha256": "828440b19a64773f696ced9461166913ddaddd8479697fbde32d3f298872b153",
+      "mode": "copied",
+      "modification": "None beyond formatting."
+    },
+    {
+      "file": "utils/pi-user-agent.ts",
+      "source": "packages/ai/src/utils/pi-user-agent.ts",
+      "sha256": "c60d2777f4362985b74f7d7cfadf35a47ae2c6f8b5cc0b809efbb4c546579b8e",
+      "mode": "adapted",
+      "modification": "Replaced host fingerprint/upstream identity with Glassbox user agent."
+    },
+    {
+      "file": "utils/provider-env.ts",
+      "source": "packages/ai/src/utils/provider-env.ts",
+      "sha256": "3829251ae0674cef7ca09800cee9f46d4e305770129b72b822ea2f6f85efe675",
+      "mode": "adapted",
+      "modification": "Narrowed getProviderEnvValue to explicit scoped values. Removed process.env and /proc fallback."
+    },
+    {
+      "file": "utils/provider-retry.ts",
+      "source": "packages/ai/src/utils/provider-retry.ts",
+      "sha256": "d0f68cfe9fe6a5d4be778eaefedc0b453021f89026810691dcd1479371dca699",
+      "mode": "copied",
+      "modification": "None beyond formatting."
+    },
+    {
+      "file": "utils/sanitize-unicode.ts",
+      "source": "packages/ai/src/utils/sanitize-unicode.ts",
+      "sha256": "f8ef2c957f9f13a77df45ebf344f1b852dfe8f2e3d164d815127ea7290c12e22",
+      "mode": "copied",
+      "modification": "None beyond formatting."
+    },
+    {
+      "file": "utils/validation.ts",
+      "source": "packages/ai/src/utils/validation.ts",
+      "sha256": "460786b57dead200e411b9afec916a5049c96ebcff4da082096456ac06d44fb7",
+      "mode": "copied",
+      "modification": "None beyond formatting."
+    }
+  ]
+}

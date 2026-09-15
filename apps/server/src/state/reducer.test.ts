@@ -4,15 +4,19 @@
 // Proofs:
 //  1. Reduce transforms raw events into a complete DerivedState.
 //  2. Replaying the same trace twice yields identical state (deterministic).
-//  3. Interactive endpoint: POST /run-test, GET /state/:sessionId.
+//  3. Persisted synthetic traces replay identically after reopening.
 
-import { describe, expect, it } from "vitest";
-import { getGlassboxBase } from "../trace/store.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import { RawTraceStore } from "../trace/store.js";
+import { loadTrace } from "../trace/load.js";
 import { reduce } from "./reducer.js";
 import { replayEntries } from "./replay.js";
 import { initialDerivedState } from "./types.js";
 import type { TraceEntry } from "../trace/store.js";
-import { rmSync, statSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { getTracePath } from "../trace/store.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -292,12 +296,10 @@ describe("reduce", () => {
     expect(state.artifacts).toHaveLength(1);
     expect(state.artifacts[0].itemId).toBe("fc-1");
     expect(state.artifacts[0].changes).toHaveLength(2);
-    expect(state.artifacts[0].changes[0].path).toBe("src/foo.ts");
-    expect(state.artifacts[0].changes[0].kind).toBe("modify");
-    expect(state.artifacts[0].changes[0].diff).toBe("diff content");
-    expect(state.artifacts[0].changes[1].path).toBe("src/bar.ts");
-    expect(state.artifacts[0].changes[1].kind).toBe("add");
-    expect(state.artifacts[0].changes[1].diff).toBeNull();
+    expect(state.artifacts[0].changes).toEqual([
+      { path: "src/foo.ts", kind: "modify", diff: "diff content" },
+      { path: "src/bar.ts", kind: "add", diff: null },
+    ]);
   });
 
   it("preserves currentWork through itemFileChange events", () => {
@@ -344,13 +346,18 @@ describe("reduce", () => {
       turn: { id: "turn-2", status: "inProgress" },
     });
     expect(state.turns).toHaveLength(2);
-    expect((state.turns[1] as any).taskOrInstruction).toBe("");
+    expect(state.turns[1].taskOrInstruction).toBe("");
 
     // item/started for userMessage with new task text → state.task stays "existing task"
     // but the open turn should get backfilled with the userMessage text
+    const userMessage = {
+      type: "userMessage",
+      id: "um-1",
+      content: [{ type: "text", text: "add a test" }],
+    };
     state = reduce(state, {
       _tag: "itemStarted" as const,
-      item: { type: "userMessage", id: "um-1", content: [{ type: "text", text: "add a test" }] },
+      item: userMessage,
       threadId: "th-1",
       turnId: "turn-2",
       startedAtMs: 500,
@@ -439,7 +446,8 @@ describe("reduce", () => {
       threadId: "th-1",
       turnId: "tr-1",
       text: "Here is the full answer text.",
-    } as any);
+      completedAtMs: 500,
+    });
     expect(state.turns).toHaveLength(1);
     expect(state.turns[0].finalAnswer).toBe("Here is the full answer text.");
     expect(state.traceSummary.eventCounts["item/agentMessage/final"]).toBe(1);
@@ -451,7 +459,8 @@ describe("reduce", () => {
       threadId: "th-1",
       turnId: "nonexistent",
       text: "orphan answer",
-    } as any);
+      completedAtMs: 500,
+    });
     expect(state.turns).toHaveLength(0);
     expect(state.traceSummary.eventCounts["item/agentMessage/final"]).toBe(1);
   });
@@ -468,11 +477,19 @@ describe("reduce", () => {
       threadId: "th-1",
       turnId: "tr-1",
       text: "The final answer.",
-    } as any);
+      completedAtMs: 500,
+    });
     state = reduce(state, {
       _tag: "turnCompleted" as const,
       threadId: "th-1",
-      turn: { id: "tr-1", status: "completed", startedAt: 0, completedAt: 1000, durationMs: 1000, error: null },
+      turn: {
+        id: "tr-1",
+        status: "completed",
+        startedAt: 0,
+        completedAt: 1000,
+        durationMs: 1000,
+        error: null,
+      },
     });
     expect(state.turns[0].finalAnswer).toBe("The final answer.");
     expect(state.turns[0].finalResult?.status).toBe("completed");
@@ -485,7 +502,9 @@ describe("reduce", () => {
 
 describe("replayEntries", () => {
   const syntheticTrace: TraceEntry[] = [
-    rawEntry("thread/started", { thread: { id: "th-1", sessionId: "s-1", status: { type: "active" }, cwd: "/tmp" } }),
+    rawEntry("thread/started", {
+      thread: { id: "th-1", sessionId: "s-1", status: { type: "active" }, cwd: "/tmp" },
+    }),
     rawEntry("turn/started", {
       threadId: "th-1",
       turn: { id: "tr-1", status: "inProgress" },
@@ -510,7 +529,13 @@ describe("replayEntries", () => {
       startedAtMs: 200,
     }),
     rawEntry("item/completed", {
-      item: { type: "command_execution", id: "c-1", status: "success", aggregatedOutput: "done", exitCode: 0 },
+      item: {
+        type: "command_execution",
+        id: "c-1",
+        status: "success",
+        aggregatedOutput: "done",
+        exitCode: 0,
+      },
       threadId: "th-1",
       turnId: "tr-1",
       completedAtMs: 2000,
@@ -561,10 +586,7 @@ describe("replayEntries", () => {
   });
 
   it("ignores unrecognized methods but counts them in the summary", () => {
-    const traceWithUnknown = [
-      ...syntheticTrace,
-      rawEntry("unknown/method", { foo: "bar" }),
-    ];
+    const traceWithUnknown = [...syntheticTrace, rawEntry("unknown/method", { foo: "bar" })];
     const state = replayEntries(traceWithUnknown);
     expect(state.traceSummary.totalEvents).toBe(8);
     expect(state.traceSummary.eventCounts["unknown/method"]).toBe(1);
@@ -574,7 +596,9 @@ describe("replayEntries", () => {
 
   it("accumulates tokenUsage across multiple tokenUsageUpdated events", () => {
     const trace = [
-      rawEntry("thread/started", { thread: { id: "th-1", sessionId: "s-1", status: { type: "active" }, cwd: "/tmp" } }),
+      rawEntry("thread/started", {
+        thread: { id: "th-1", sessionId: "s-1", status: { type: "active" }, cwd: "/tmp" },
+      }),
       rawEntry("thread/tokenUsage/updated", {
         threadId: "th-1",
         turnId: "tr-1",
@@ -610,7 +634,9 @@ describe("replayEntries", () => {
 
   it("accumulates costUsd from claude-style tokenUsageUpdated events", () => {
     const trace = [
-      rawEntry("thread/started", { thread: { id: "th-1", sessionId: "s-1", status: { type: "active" }, cwd: "/tmp" } }),
+      rawEntry("thread/started", {
+        thread: { id: "th-1", sessionId: "s-1", status: { type: "active" }, cwd: "/tmp" },
+      }),
       rawEntry("thread/tokenUsage/updated", {
         threadId: "th-1",
         turnId: "tr-1",
@@ -646,7 +672,9 @@ describe("replayEntries", () => {
 
   it("is deterministic with tokenUsageUpdated events in trace", () => {
     const traceWithUsage = [
-      rawEntry("thread/started", { thread: { id: "th-1", sessionId: "s-1", status: { type: "active" }, cwd: "/tmp" } }),
+      rawEntry("thread/started", {
+        thread: { id: "th-1", sessionId: "s-1", status: { type: "active" }, cwd: "/tmp" },
+      }),
       rawEntry("thread/tokenUsage/updated", {
         threadId: "th-1",
         turnId: "tr-1",
@@ -663,7 +691,9 @@ describe("replayEntries", () => {
 
   it("agentMessageFinal sets finalAnswer on the turn record", () => {
     const trace = [
-      rawEntry("thread/started", { thread: { id: "th-1", sessionId: "s-1", status: { type: "active" }, cwd: "/tmp" } }),
+      rawEntry("thread/started", {
+        thread: { id: "th-1", sessionId: "s-1", status: { type: "active" }, cwd: "/tmp" },
+      }),
       rawEntry("turn/started", {
         threadId: "th-1",
         turn: { id: "tr-1", status: "inProgress" },
@@ -683,7 +713,14 @@ describe("replayEntries", () => {
       }),
       rawEntry("turn/completed", {
         threadId: "th-1",
-        turn: { id: "tr-1", status: "completed", startedAt: 0, completedAt: 5000, durationMs: 5000, error: null },
+        turn: {
+          id: "tr-1",
+          status: "completed",
+          startedAt: 0,
+          completedAt: 5000,
+          durationMs: 5000,
+          error: null,
+        },
       }),
     ];
 
@@ -697,17 +734,36 @@ describe("replayEntries", () => {
 
   it("replay is deterministic including agentMessageFinal", () => {
     const trace = [
-      rawEntry("thread/started", { thread: { id: "th-1", sessionId: "s-1", status: { type: "active" }, cwd: "/tmp" } }),
+      rawEntry("thread/started", {
+        thread: { id: "th-1", sessionId: "s-1", status: { type: "active" }, cwd: "/tmp" },
+      }),
       rawEntry("turn/started", {
         threadId: "th-1",
         turn: { id: "tr-1", status: "inProgress" },
         input: [{ type: "text", text: "test" }],
       }),
-      rawEntry("item/agentMessage/delta", { threadId: "th-1", turnId: "tr-1", itemId: "agent-0", delta: "partial" }),
-      rawEntry("item/agentMessage/final", { threadId: "th-1", turnId: "tr-1", text: "full answer", completedAtMs: 3000 }),
+      rawEntry("item/agentMessage/delta", {
+        threadId: "th-1",
+        turnId: "tr-1",
+        itemId: "agent-0",
+        delta: "partial",
+      }),
+      rawEntry("item/agentMessage/final", {
+        threadId: "th-1",
+        turnId: "tr-1",
+        text: "full answer",
+        completedAtMs: 3000,
+      }),
       rawEntry("turn/completed", {
         threadId: "th-1",
-        turn: { id: "tr-1", status: "completed", startedAt: 0, completedAt: 3000, durationMs: 3000, error: null },
+        turn: {
+          id: "tr-1",
+          status: "completed",
+          startedAt: 0,
+          completedAt: 3000,
+          durationMs: 3000,
+          error: null,
+        },
       }),
     ];
     const a = replayEntries(trace);
@@ -718,85 +774,74 @@ describe("replayEntries", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Integration: run the real /run-test endpoint, then verify /state
+// Integration: persisted synthetic traces can be reopened without changing evidence.
 // ---------------------------------------------------------------------------
 
-describe("integration: run-test + /state endpoint", () => {
-  function cleanTraceDir(sessionId: string): void {
-    try {
-      const dir = `${getGlassboxBase()}/sessions/${sessionId}`;
-      rmSync(dir, { recursive: true, force: true });
-    } catch { /** ignore */ }
-  }
+describe("integration: persisted trace replay", () => {
+  let testRoot: string;
 
-  it("POST /run-test produces a trace that GET /state derives from", async () => {
-    // We don't have the codex binary in CI, so skip with a warning.
-    const codexPath = process.env.CODEX_PATH ?? "codex";
-    try {
-      statSync(codexPath);
-    } catch {
-      console.log("[skip] codex binary not found — integration test requires codex app-server");
-      return;
-    }
-
-    const base = `http://localhost:${process.env.PORT ?? 3030}`;
-
-    // 1. Run a test turn
-    const runRes = await fetch(`${base}/run-test`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ prompt: "say hello" }),
-    });
-    expect(runRes.ok).toBe(true);
-    const runBody = await runRes.json() as { sessionId: string };
-    const sessionId = runBody.sessionId;
-
-    try {
-      // 2. Verify /state endpoint returns derived state
-      const stateRes = await fetch(`${base}/state/${sessionId}`);
-      expect(stateRes.ok).toBe(true);
-      const state = await stateRes.json() as Record<string, unknown>;
-
-      expect(state).toHaveProperty("task");
-      expect((state.task as string).length).toBeGreaterThan(0);
-      expect(state).toHaveProperty("traceSummary");
-      expect((state.traceSummary as Record<string, unknown>).totalEvents).toBeGreaterThan(0);
-      expect(state).toHaveProperty("finalResult");
-      expect((state.finalResult as Record<string, unknown>).status); // "completed", "interrupted", etc.
-      expect((state.finalResult as Record<string, unknown>).durationMs);
-    } finally {
-      cleanTraceDir(sessionId);
-    }
+  beforeEach(() => {
+    testRoot = mkdtempSync(path.join(os.tmpdir(), "glassbox-replay-test-"));
+    vi.stubEnv("GLASSBOX_DATA_DIR", testRoot);
   });
 
-  it("replaying the real trace twice yields identical state", async () => {
-    const codexPath = process.env.CODEX_PATH ?? "codex";
-    try {
-      statSync(codexPath);
-    } catch {
-      console.log("[skip] codex binary not found — integration determinism test requires codex app-server");
-      return;
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    const resolved = path.resolve(testRoot);
+    if (
+      path.dirname(resolved) !== path.resolve(os.tmpdir()) ||
+      !path.basename(resolved).startsWith("glassbox-replay-test-")
+    ) {
+      throw new Error("Refusing to remove a directory outside the replay fixture");
     }
+    rmSync(resolved, { recursive: true, force: true });
+  });
 
-    const base = `http://localhost:${process.env.PORT ?? 3030}`;
-
-    const runRes = await fetch(`${base}/run-test`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ prompt: "list files" }),
+  function writeFixture(sessionId: string) {
+    const store = new RawTraceStore();
+    store.append(sessionId, {
+      method: "turn/started",
+      params: {
+        threadId: "fixture-thread",
+        turn: { id: "fixture-turn", status: "inProgress" },
+        input: [{ type: "text", text: "inspect the synthetic fixture" }],
+      },
     });
-    expect(runRes.ok).toBe(true);
-    const runBody = await runRes.json() as { sessionId: string };
-    const sessionId = runBody.sessionId;
+    store.append(sessionId, {
+      method: "item/agentMessage/final",
+      params: {
+        threadId: "fixture-thread",
+        turnId: "fixture-turn",
+        itemId: "fixture-answer",
+        text: "Fixture inspected.",
+      },
+    });
+    store.append(sessionId, {
+      method: "turn/completed",
+      params: {
+        threadId: "fixture-thread",
+        turn: { id: "fixture-turn", status: "completed", durationMs: 125 },
+      },
+    });
+  }
 
-    try {
-      const stateRes = await fetch(`${base}/state/${sessionId}`);
-      expect(stateRes.ok).toBe(true);
-      const derived = await stateRes.json() as Record<string, unknown>;
-      expect(derived).toHaveProperty("task");
-      expect((derived.traceSummary as Record<string, unknown>).totalEvents).toBeGreaterThan(0);
-    } finally {
-      cleanTraceDir(sessionId);
-    }
+  it("restores task, final answer, result and event counts from disk", () => {
+    const sessionId = "persisted-replay-fixture";
+    writeFixture(sessionId);
+    const state = replayEntries(loadTrace(sessionId));
+    expect(state.task).toBe("inspect the synthetic fixture");
+    expect(state.turns[0].finalAnswer).toBe("Fixture inspected.");
+    expect(state.finalResult).toMatchObject({ status: "completed", durationMs: 125 });
+    expect(state.traceSummary.totalEvents).toBe(3);
+  });
+
+  it("replaying the same persisted trace is deterministic and leaves bytes unchanged", () => {
+    const sessionId = "reopened-replay-fixture";
+    writeFixture(sessionId);
+    const original = readFileSync(getTracePath(sessionId));
+    const first = replayEntries(loadTrace(sessionId));
+    const reopened = replayEntries(loadTrace(sessionId));
+    expect(reopened).toEqual(first);
+    expect(readFileSync(getTracePath(sessionId))).toEqual(original);
   });
 });

@@ -4,8 +4,6 @@ Status: CURRENT DIRECTION
 
 This file records the preferred technology stack and toolchain direction for Glassbox. It is not permission to add every listed technology before the active plan needs it.
 
-For the complete cross-cutting data, storage, search, observability, analytics, and public Trace / Eval read model, see [`data-observability.md`](./data-observability.md).
-
 ## Toolchain
 
 Glassbox standardizes on **Vite+** as the primary JavaScript / TypeScript development toolchain.
@@ -57,14 +55,14 @@ AGENTS.md toolchain rules
 CI when CI exists
 ```
 
-Until that verified migration lands, existing npm / Vite scripts remain valid implementation reality even though Vite+ is the selected target toolchain.
+The workspace now uses Vite+ 0.3.1 with Vite 8.2.2 and Vitest 4.1.11. The managed runtime is Node.js 24.21.0 with npm 12.0.2. Installation, focused tests and Web builds have run through Vite+. The complete workspace format and lint gate is still open. The root Vite configuration enables both typeAware and typeCheck. See the [migration guide](https://viteplus.dev/guide/migrate) and [check guide](https://viteplus.dev/guide/check).
 
 When migrating, follow the Vite+ migration path rather than hand-building an imitation of it. Keep Vite / Vitest resolution aligned with the local `vite-plus` toolchain and regenerate the lockfile in the same verified change.
 
 ## Runtime and language
 
 ```text
-Node.js 22+
+Node.js 24.21.0
 TypeScript
 ES modules
 ```
@@ -83,8 +81,6 @@ Vite+ / Vite / Rolldown
 ```
 
 The Workbench is one product surface. Do not let frontend framework choices redefine Agent, Conversation, Run, authorization, or durable state semantics.
-
-The Owner is the only Web administrator. Public Web access is read-only and limited to explicitly published Trace or Eval projections. Public pages never become a second control plane.
 
 ## Testing and code quality
 
@@ -105,41 +101,17 @@ Do not keep parallel ESLint / Prettier / ad-hoc TypeScript check stacks unless a
 
 Plan 03 introduces Turso / SQLite-compatible structured durable state behind a narrow server-side persistence boundary.
 
-The selected cross-cutting storage model is:
-
-```text
-Turso
-  structured durable state
-  product metadata
-  lexical search
-  vector search
-  analytics indexes and rollups
-
-Cloudflare R2
-  Raw Trace evidence
-  large artifacts
-  attachments
-  archives
-  backups
-
-AgentMail
-  email transport and source objects
-
-Glassbox server
-  runtime execution
-  owner APIs
-  public Trace / Eval APIs
-```
+The initial compatibility choice is the local file path of the libSQL client used by trajectory-panel, behind narrow domain APIs. Verify Windows transactions and database reopen before accepting the driver. Turso now also documents separate database, sync, and serverless packages; do not treat those engines and interfaces as interchangeable. Cloud sync is not enabled by this phase.
 
 Raw Trace remains independent append-only evidence.
 
 The model does not receive unrestricted SQL access.
 
-The browser does not receive direct Turso, R2, or AgentMail credentials.
-
 ## Agent execution
 
-Current execution capabilities include Codex and Claude Code provider integrations from the earlier coding-agent phase.
+Current execution capability centers on PI-driven model provider integration with extensible API protocols and multi-model configuration; historical runtime adapters from the earlier coding-agent phase are isolated as evidence-only references.
+
+Selected provider and Agent-loop implementations are copied into Glassbox-owned source modules, preserving provenance and licenses. Do not import upstream checkouts or depend on complete upstream framework packages as a substitute. Standard model SDKs and database drivers remain ordinary dependencies. Channels, model providers and execution adapters have separate capability contracts.
 
 Future workers and providers remain behind Glassbox-owned trust boundaries.
 
@@ -161,9 +133,7 @@ No toolchain, framework, model router, channel adapter, vector database, or cach
 
 These are post-foundation layers, not Plan 03 dependencies.
 
-The selected architecture keeps retrieval behind Glassbox-owned authorization boundaries and uses Turso as the default structured, lexical, and vector store.
-
-Primary mechanisms include:
+Primary future mechanisms include:
 
 ```text
 authorized hybrid retrieval
@@ -179,21 +149,11 @@ permission-scoped semantic cache
 
 `TokenRhythm/opensquilla` is a primary upstream reference for these mechanisms.
 
-## Observability and Eval
-
-Product observability is a Glassbox feature, not an external dashboard dependency.
-
-The Owner Web UI must be able to inspect product-relevant durable state, Trace, Eval, token usage, cost, retrieval behavior, authorization decisions, Channel activity, storage state, and system health through Glassbox server APIs.
-
-OpenTelemetry, Langfuse, and Inspect AI are reference models for trace structure, scores, analytics, and Eval log design. They are not required control-plane dependencies.
-
-Public observers may read only sanitized, explicitly published Trace or Eval snapshots.
-
 ## Long work, eval, and learning
 
-Future layers may use ideas from Temporal, AGY, Inspect AI, SkillClaw, CoEvoSkills, Voyager, Dagster, and other recorded upstream references.
+Future layers may use ideas from Temporal, Inspect AI, SkillClaw, CoEvoSkills, Voyager, Dagster, and other recorded upstream references.
 
-Do not introduce their infrastructure until an active plan needs the concrete boundary.
+The current QQ phase includes bounded deterministic Eval samples linked to Run and Trace, following Inspect AI semantics through the existing test executor. The full Eval platform and learning infrastructure remain deferred.
 
 ## Documentation site
 

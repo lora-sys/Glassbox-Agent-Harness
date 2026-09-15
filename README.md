@@ -32,11 +32,17 @@ Turso persistence
 Run / Authorization Trace
 ```
 
-完成 Plan 03 之前，不抢跑真实微信、QQ、Mail、Calendar、Memory 自动沉淀、Skill evolution、AGY、LongTask、Eval、Arena、智能路由或完整向量检索。
+Plan 03 先做 Windows 上可通过 QQ 群 @ 和本人私聊使用的个人助理，目前尚未实现。先识别本人、限定测试群、隔离个人资料与群聊上下文，再接入 QQ 和执行能力。项目执行主线是 agy-staff。随后让其他用户保存自己的内容，再增加细粒度权限。微信、Mail、Calendar、Memory 自动沉淀、Skill evolution、LongTask、完整 Eval 平台、Arena、智能路由和完整向量检索仍属于后续阶段。本阶段包含与 Run 和 Trace 关联的固定 Eval 验收。
 
-这一阶段的验收标准很直接：
+## 平台与第一阶段落地
 
-> 同一个 Agent 可以同时服务 Owner 和 Visitor。两个人的 Conversation 可以持久恢复。公开资源两个人都能用，Owner 私有资源 Visitor 永远拿不到，并且每一次 Allow、Deny、Approval 都可以在 Trace 里解释。
+Windows 是第一个支持和验证目标，当前运行代码尚未完成验收。macOS 和 Linux 后续分别验证，路径、子进程和数据目录从现在起保持可移植。桌面打包技术、移动端和跨设备同步尚未决定。
+
+第一版计划交付 QQ 群 @、本人私聊、agy-staff 驱动的可配置执行流程、任务状态与取消、完成推送、会话持久化、Trace 检查和固定 Eval 验收。外部模型提供商和本机执行器接入不再开放。OneBot 适配器先验证 NapCat，再验证 SnowLuma；官方 QQ 机器人使用独立适配器，分别记录兼容能力。群与私聊使用不同会话和执行上下文。本人私聊可用明确授权的个人资料，群任务只能读取群可见资料。
+
+统一 WebUI 和 CLI 管理同一套配置、渠道、会话、任务、Trace 和 Eval。两个入口共用服务端配置与领域 API。CLI 命令组织沿用现有管理模式，交互组件可参考 Pi TUI。当前实现进度、模块边界和领域共识记录在 [CONTEXT.md](./CONTEXT.md)。
+
+可兼容的 Pi、trajectory-panel 等实现按需复制到项目目录，保留来源和许可证，不从 upstream 导入运行代码，不安装完整 Agent 框架代替源码复用。不兼容的部分参照上游机制适配，Vite+、官方 SDK 和数据库驱动照常作为基础依赖。复制清单见 [源码复用方案](.plans/findings/03-p3.2-source-reuse-map.md)，阶段产物和验收见 [Plan 03](.plans/03-personal-agent-foundation.md)。
 
 ## 产品目标
 
@@ -58,7 +64,7 @@ Workbench / 微信 / QQ / Email
     │        │        │
   Tools    Workers  LongTask
     │        │
-    │      AGY / Codex / Claude Code
+    │   agy-staff Provider
     │
     └────────┼───────────────┐
              ▼               │
@@ -75,7 +81,7 @@ Workbench / 微信 / QQ / Email
 
 微信 Bot、QQ Bot、Workbench 都只是入口，不是不同 Agent。
 
-Codex、Claude Code、AGY、OpenHarness 等属于 Provider、Worker 或专业执行能力，也不是产品身份本身。
+外部模型与通道属于 Provider、Channel 或执行能力，不是产品身份本身。项目核心执行以 agy-staff 为主，外部模型提供商不再接入执行链。
 
 ## 权限是 P0
 
@@ -113,10 +119,10 @@ REQUIRES_APPROVAL
 
 ## 当前已经实现
 
-现有仓库已经证明了 Coding Agent 执行和观察闭环：
+现有仓库已经证明了执行和观察闭环：
 
-- Codex Provider Adapter
-- Claude Code Provider Adapter
+- agy-staff 模型执行器配置
+- 历史 Coding Agent 探索适配器（保留历史记录，项目后续不再用于新执行路径；agy-staff 为当前执行核心）
 - Session 和多 Turn 执行
 - HTTP 和 WebSocket Runtime
 - Raw Trace、Replay 和 Derived State
@@ -145,7 +151,6 @@ Skill evolution
 Asset Library
 Journal / Monthly Review
 Mail / Calendar
-AGY Worker
 LongTask Engine
 Efficient Agent Runtime
 Execution Routing
@@ -377,14 +382,14 @@ Tool Result 可以为模型生成压缩投影，但完整 Raw Trace 和证据不
 ```text
 测一下当前 Agent 的 GitHub repo 分析能力。
 用 100 条任务。
-比较当前版本、Codex、Claude Code 和 AGY。
+比较当前版本在不同模型配置下的表现。
 每个样本跑 3 次。
 检查任务成功率、权限 invariant、成本和延迟。
 ```
 
 Agent 先生成 Eval Draft，只有明确 `Start Eval` 才执行。
 
-第一阶段 Eval 类型：
+后续完整 Eval 工作台计划支持：
 
 ```text
 Benchmark
@@ -472,9 +477,8 @@ Raw Trace → Derived State → Canvas
 
 | 上游 | 主要参考 |
 | --- | --- |
-| `pingdotgg/t3code` | Provider、Claude Code、权限、Resume |
+| `earendil-works/pi` | TypeScript Model Providers、Agent Loop、流式解析与工具调用 |
 | `HKUDS/OpenHarness` | Agent Loop、Tools、Skills、Memory、Channels、QQ |
-| `keli-wen/agy-staff` | AGY Worker、后台 Job、Continue、Restart |
 | `TokenRhythm/opensquilla` | Context Budget、Tool Result Budget、Hybrid Retrieval、Routing、Token-efficient Projection |
 | `joyehuang/trajectory-panel` | Trajectory、Timeline、Redaction、Turso Sync |
 | `UKGovernmentBEIS/inspect_ai` | Eval、Dataset、Scorer、Experiment Runner |
@@ -573,11 +577,9 @@ npm run test:server
 
 ## 当前状态
 
-Glassbox 还很早，但方向已经收口。
+当前运行代码主要来自 Coding Agent 工作台。QQ、Pi 源码集成、Turso 领域持久化和 Vite+ 迁移尚未完成。
 
-下一步不是继续扩 Canvas，也不是同时接十个聊天渠道。现在只做一个可证明的 Personal Agent Foundation：**身份明确、权限分明、Conversation 可持久恢复、Turso 保存长期状态、所有授权决策可追溯。**
-
-这层正确以后，再让真实 Channel、Memory、Retrieval、Mail、Calendar、Skill、LongTask、Efficient Runtime、Eval 和 Arena 逐层接进来。文档与交互式学习可以先做信息架构和设计，但不能把计划能力写成已实现。
+下一步按 Plan 03 交付 Windows 上的 QQ 群 @与本人私聊闭环，包括执行能力配置、会话隔离、任务控制、结果投递、Trace 与最小 Eval。先用自己的测试群和私聊验收，再开放其他用户和细粒度权限。后续路线图不代表当前已实现。
 
 ## License
 

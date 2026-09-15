@@ -1,17 +1,6 @@
-// apps/server/src/ws/server.test.ts
-// Tests for the WebSocket server module.
-//
-// 1. Functional: broadcastEvent / broadcastDerivedState deliver messages
-//    to subscribers by sessionId (verified via direct ws attach).
-// 2. Unit: itemFileChange populates artifacts, preserves currentWork, and
-//    increments traceSummary in the reducer.
-// 3. WS protocol: invalid action returns an error.
-// 4. Session isolation: broadcasts to one sessionId do not leak to another.
-
 import http from "node:http";
-import { WebSocket, WebSocketServer } from "ws";
-import { afterEach, beforeAll, describe, expect, it } from "vitest";
-
+import { WebSocket, WebSocketServer, type RawData } from "ws";
+import { describe, expect, it } from "vite-plus/test";
 import {
   attachWebSocketServer,
   broadcastEvent,
@@ -21,78 +10,102 @@ import {
 import { initialDerivedState } from "../state/types.js";
 import { reduce } from "../state/reducer.js";
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Spin up a fresh HTTP server with the Glassbox WS handler attached.
- */
 async function spawnWSServer() {
   const httpServer = http.createServer();
-  const wss = attachWebSocketServer(httpServer, async () => {});
-  const port = await new Promise<number>((resolve) => {
-    httpServer.listen(0, () => {
-      resolve((httpServer.address() as { port: number }).port);
+  const wss = attachWebSocketServer(httpServer, () => {});
+  const port = await new Promise<number>((resolve, reject) => {
+    httpServer.once("error", reject);
+    httpServer.listen(0, "127.0.0.1", () => {
+      const address = httpServer.address();
+      if (!address || typeof address === "string") {
+        reject(new Error("Expected a TCP listener"));
+      } else {
+        resolve(address.port);
+      }
     });
   });
-  const ctx = { httpServer, wss, port };
-  return ctx;
+  return { httpServer, wss, port };
 }
 
 async function cleanupServer(ctx: { httpServer: http.Server; wss: WebSocketServer }) {
-  ctx.wss.close();
-  await new Promise<void>((r) => ctx.httpServer.close(() => r()));
+  for (const client of ctx.wss.clients) client.terminate();
+  await new Promise<void>((resolve, reject) =>
+    ctx.wss.close((error) => (error ? reject(error) : resolve())),
+  );
+  await new Promise<void>((resolve, reject) =>
+    ctx.httpServer.close((error) => (error ? reject(error) : resolve())),
+  );
 }
 
-/**
- * Connect a WebSocket client with the message handler registered BEFORE
- * the TCP handshake completes (so the server's synchronous `send("subscribed")`
- * is not silently dropped).
- */
-async function connectWS(port: number, sessionId: string): Promise<WebSocket> {
-  const msgs: unknown[] = [];
-  const ws = new WebSocket(`ws://localhost:${port}/ws?sessionId=${sessionId}`);
-  ws.on("message", (raw) => msgs.push(JSON.parse(raw.toString())));
+function parseMessage(raw: RawData): Record<string, unknown> {
+  const buffer = Array.isArray(raw)
+    ? Buffer.concat(raw)
+    : Buffer.isBuffer(raw)
+      ? raw
+      : Buffer.from(raw);
+  const value: unknown = JSON.parse(buffer.toString("utf8"));
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    Array.isArray(value) ||
+    !("type" in value) ||
+    typeof value.type !== "string"
+  ) {
+    throw new Error("Invalid server push payload");
+  }
+  return value;
+}
 
-  const ack = await new Promise<boolean>((resolve) => {
-    const timer = setTimeout(() => resolve(false), 2000);
-    const interval = setInterval(() => {
-      if (msgs.some((m) => (m as { type: string }).type === "subscribed")) {
-        clearInterval(interval);
-        clearTimeout(timer);
-        resolve(true);
-      }
-    }, 50);
-    // Also check messages that may already have arrived
-    if (msgs.some((m) => (m as { type: string }).type === "subscribed")) {
-      clearInterval(interval);
-      clearTimeout(timer);
-      resolve(true);
+async function connectWS(port: number, sessionId: string) {
+  const messages: Record<string, unknown>[] = [];
+  const listeners = new Set<() => void>();
+  let failure: Error | undefined;
+  const ws = new WebSocket(
+    "ws://127.0.0.1:" + port + "/ws?sessionId=" + encodeURIComponent(sessionId),
+  );
+  ws.on("message", (raw) => {
+    try {
+      messages.push(parseMessage(raw));
+    } catch (error) {
+      failure = error instanceof Error ? error : new Error("Invalid server message");
     }
+    for (const notify of listeners) notify();
+  });
+  ws.on("error", (error) => {
+    failure = error;
+    for (const notify of listeners) notify();
   });
 
-  (ws as unknown as { _msgs: unknown[] })._msgs = msgs;
-  (ws as unknown as { _ack: boolean })._ack = ack;
-  return ws;
+  function waitFor(predicate: (message: Record<string, unknown>) => boolean) {
+    return new Promise<Record<string, unknown>>((resolve, reject) => {
+      function check() {
+        const message = messages.find(predicate);
+        if (!failure && !message) return;
+        clearTimeout(timer);
+        listeners.delete(check);
+        if (failure) reject(failure);
+        else if (message) resolve(message);
+      }
+      const timer = setTimeout(() => {
+        listeners.delete(check);
+        reject(new Error("Timed out waiting for a server push"));
+      }, 2000);
+      listeners.add(check);
+      check();
+    });
+  }
+
+  await waitFor((message) => message.type === "subscribed");
+  return { ws, messages, waitFor };
 }
 
-// ---------------------------------------------------------------------------
-// Functional broadcast tests
-// ---------------------------------------------------------------------------
-
 describe("ws: functional broadcast", () => {
-  it("delivers event, derivedState, and sessionEnded", async () => {
-    const { httpServer, wss, port } = await spawnWSServer();
+  it("delivers event, derivedState, and sessionEnded in order", async () => {
+    const ctx = await spawnWSServer();
     try {
-      const sessionId = "s-" + Math.random().toString(36).slice(2, 8);
-      const ws = await connectWS(port, sessionId);
-      const msgs = (ws as unknown as { _msgs: unknown[] })._msgs;
-      const ack = (ws as unknown as { _ack: boolean })._ack;
-
-      expect(ack).toBe(true);
-
-      // Broadcast three message types
+      const sessionId = "broadcast-fixture";
+      const client = await connectWS(ctx.port, sessionId);
+      const ended = client.waitFor((message) => message.type === "sessionEnded");
       broadcastEvent(sessionId, {
         method: "item/agentMessage/delta",
         params: { itemId: "m-1", delta: "hello world" },
@@ -103,98 +116,56 @@ describe("ws: functional broadcast", () => {
         traceSummary: { totalEvents: 5 },
       });
       broadcastSessionEnded(sessionId);
-
-      await new Promise<void>((resolve) => setTimeout(resolve, 80));
-
-      const types = msgs.map((m) => (m as { type: string }).type);
-      expect(types).toContain("subscribed");
-      expect(types).toContain("event");
-      expect(types).toContain("derivedState");
-      expect(types).toContain("sessionEnded");
-
-      const ev = msgs.find(
-        (m) => (m as { type: string }).type === "event"
-      ) as { event: { method: string } } | undefined;
-      expect(ev?.event.method).toBe("item/agentMessage/delta");
-
-      const ds = msgs.find(
-        (m) => (m as { type: string }).type === "derivedState"
-      ) as { derivedState: { task: string; traceSummary: { totalEvents: number } } } | undefined;
-      expect(ds?.derivedState.task).toBe("say hi");
-      expect(ds?.derivedState.traceSummary.totalEvents).toBe(5);
-
-      ws.close();
+      await ended;
+      expect(client.messages).toMatchObject([
+        { type: "subscribed", sessionId },
+        { type: "event", event: { method: "item/agentMessage/delta" } },
+        {
+          type: "derivedState",
+          derivedState: { task: "say hi", traceSummary: { totalEvents: 5 } },
+        },
+        { type: "sessionEnded", sessionId },
+      ]);
     } finally {
-      await cleanupServer({ httpServer, wss });
+      await cleanupServer(ctx);
     }
-  }, 8000);
+  });
 
   it("returns error for unknown action", async () => {
-    const { httpServer, wss, port } = await spawnWSServer();
+    const ctx = await spawnWSServer();
     try {
-      const ws = await connectWS(port, "s-err");
-      const msgs = (ws as unknown as { _msgs: unknown[] })._msgs;
-      const errors: unknown[] = [];
-
-      setTimeout(() => {
-        // Collect errors that arrive after subscription
-        // We already registered the ws.on("message") handler in connectWS
-      }, 100);
-
-      // Add error listener to existing messages
-      const origHandler = ws.listeners("message")[0];
-      ws.off("message", origHandler);
-      ws.on("message", (raw) => {
-        origHandler(raw);
-        const msg = JSON.parse(raw.toString());
-        if (msg.type === "error") errors.push(msg);
+      const client = await connectWS(ctx.port, "error-fixture");
+      const error = client.waitFor((message) => message.type === "error");
+      client.ws.send(JSON.stringify({ action: "notReal" }));
+      expect(await error).toMatchObject({
+        type: "error",
+        message: "invalid json message",
       });
-
-      ws.send(JSON.stringify({ action: "notReal" }));
-      await new Promise<void>((resolve) => setTimeout(resolve, 100));
-
-      expect(errors.length).toBeGreaterThanOrEqual(1);
-      expect((errors[0] as { message: string }).message).toContain("notReal");
-
-      ws.close();
     } finally {
-      await cleanupServer({ httpServer, wss });
+      await cleanupServer(ctx);
     }
-  }, 4000);
+  });
 
   it("does not broadcast to a different session", async () => {
-    const { httpServer, wss, port } = await spawnWSServer();
+    const ctx = await spawnWSServer();
     try {
-      const sessionId = "s-other-" + Math.random().toString(36).slice(2, 8);
-      const ws = await connectWS(port, sessionId);
-      const msgs = (ws as unknown as { _msgs: unknown[] })._msgs;
-
-      // Clear the subscribed message from msgs to focus on extra broadcasts
-      const filtered = msgs.filter(
-        (m) => (m as { type: string }).type !== "subscribed"
-      );
-
-      // Broadcast to a DIFFERENT session
+      const client = await connectWS(ctx.port, "isolated-fixture");
       broadcastEvent("other-session", { method: "turn/completed" });
       broadcastDerivedState("other-session", { traceSummary: {} });
-
-      await new Promise<void>((resolve) => setTimeout(resolve, 80));
-
-      const extra = msgs.filter(
-        (m) => (m as { type: string }).type !== "subscribed"
-      );
-      expect(extra.length).toBe(0);
-
-      ws.close();
+      // A reply on the same socket is a delivery barrier, avoiding arbitrary sleeps.
+      const barrier = client.waitFor((message) => message.type === "error");
+      client.ws.send(JSON.stringify({ action: "barrier" }));
+      await barrier;
+      expect(
+        client.messages.filter(
+          (message) => message.type !== "subscribed" && message.type !== "error",
+        ),
+      ).toEqual([]);
     } finally {
-      await cleanupServer({ httpServer, wss });
+      await cleanupServer(ctx);
     }
   });
 });
-
-// ---------------------------------------------------------------------------
-// Reducer unit tests: itemFileChange
-// ---------------------------------------------------------------------------
 
 describe("reduce: itemFileChange populates artifacts", () => {
   it("appends one artifact with typed change fields", () => {
@@ -267,8 +238,8 @@ describe("reduce: itemFileChange populates artifacts", () => {
       changes: [{ path: "b.ts", kind: "modify" }],
     });
     expect(state.artifacts).toHaveLength(2);
-    expect(state.artifacts[0].changes[0].path).toBe("a.ts");
-    expect(state.artifacts[1].changes[0].path).toBe("b.ts");
+    expect(state.artifacts[0].changes[0]).toMatchObject({ path: "a.ts" });
+    expect(state.artifacts[1].changes[0]).toMatchObject({ path: "b.ts" });
   });
 
   it("counts item/fileChange in traceSummary", () => {
@@ -313,22 +284,13 @@ describe("reduce: itemFileChange populates artifacts", () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// WS subscription + broadcast round-trip (no adapter needed)
-// ---------------------------------------------------------------------------
-
 describe("ws: subscription + broadcast round-trip", () => {
-  it("receives subscribed ack then live event + derived-state via broadcast", async () => {
-    const { httpServer, wss, port } = await spawnWSServer();
+  it("receives subscribed ack then live events and derived state", async () => {
+    const ctx = await spawnWSServer();
     try {
-      const sessionId = "rt-" + Math.random().toString(36).slice(2, 8);
-      const ws = await connectWS(port, sessionId);
-      const msgs = (ws as unknown as { _msgs: unknown[] })._msgs;
-      const ack = (ws as unknown as { _ack: boolean })._ack;
-
-      expect(ack).toBe(true);
-
-      // Simulate what /run-test does: broadcast each decoded event
+      const sessionId = "round-trip-fixture";
+      const client = await connectWS(ctx.port, sessionId);
+      const ended = client.waitFor((message) => message.type === "sessionEnded");
       broadcastEvent(sessionId, {
         method: "item/agentMessage/delta",
         params: { delta: "hello!", itemId: "msg-1" },
@@ -343,26 +305,22 @@ describe("ws: subscription + broadcast round-trip", () => {
         traceSummary: { totalEvents: 7 },
       });
       broadcastSessionEnded(sessionId);
-
-      await new Promise<void>((resolve) => setTimeout(resolve, 80));
-
-      const types = msgs.map((m) => (m as { type: string }).type);
-      expect(types).toContain("subscribed");
-      expect(types).toContain("event");
-      expect(types).toContain("derivedState");
-      expect(types).toContain("sessionEnded");
-
-      // At least one event should be an agentMessage/delta
-      const deltaMsgs = msgs.filter(
-        (m) =>
-          (m as { type: string }).type === "event" &&
-          (m as { event: { method: string } }).event?.method === "item/agentMessage/delta"
-      );
-      expect(deltaMsgs.length).toBeGreaterThanOrEqual(1);
-
-      ws.close();
+      await ended;
+      expect(client.messages).toMatchObject([
+        { type: "subscribed", sessionId },
+        {
+          type: "event",
+          event: { method: "item/agentMessage/delta", params: { delta: "hello!" } },
+        },
+        { type: "event", event: { method: "turn/completed" } },
+        {
+          type: "derivedState",
+          derivedState: { task: "say hello!", traceSummary: { totalEvents: 7 } },
+        },
+        { type: "sessionEnded", sessionId },
+      ]);
     } finally {
-      await cleanupServer({ httpServer, wss });
+      await cleanupServer(ctx);
     }
-  }, 8000);
+  });
 });

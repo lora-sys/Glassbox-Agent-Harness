@@ -25,6 +25,8 @@ The first is the runtime product. The second is the documentation and learning e
 
 Current active plan.
 
+Implementation started on 2026-09-12. The main server connects shared model and channel configuration, scoped Conversations, Run scheduling, deliveries and incremental Trace. A disposable OneBot integration proves group/DM separation, message deduplication and immediate cancellation replies. The runtime executes via agy-staff, with model profile configuration kept in one place. Chrome verified model configuration and CLI read the same profile. External local execution stacks are removed from active delivery paths. Real QQ acceptance and the complete release remain unverified. See the active plan for slice status and [CONTEXT.md](../CONTEXT.md) for current module boundaries.
+
 ```text
 Identity
 → Authorization
@@ -33,15 +35,15 @@ Identity
 → Run / Authorization Trace
 ```
 
-Goal: prove Owner and Visitor can use the same Agent without crossing permission boundaries.
+First deliver QQ group mentions and Owner private chat on Windows, PI-driven configurable model profiles, durable conversations and delivery, Trace inspection, and bounded Run-linked Eval. Copy suitable upstream implementation into owned source. Then add separate user-owned records and fine-grained permissions. The full Eval platform remains P8. These are planned milestones, not completed capabilities.
 
-### P4 — First real remote Channel
+### P4 — Multi-channel Expansion
 
-Choose one real external entry point only after P3 passes.
+Expand beyond the initial QQ slice to additional remote entry points and broader channel platforms.
 
-Likely candidates include Web public access, WeChat, or QQ.
+Candidates include WeChat and Web public access. QQ official and NapCat coexistence belongs to the later Plan 03 milestone.
 
-The Channel must reuse the same Agent identity, Principal resolution, authorization, Conversation, persistence, and Trace boundaries proven in P3.
+Every Channel reuses the same Agent identity, Principal resolution, authorization, Conversation, persistence, and Trace boundaries established in P3.
 
 Do not create a separate Agent implementation per Channel.
 
@@ -127,7 +129,6 @@ Primary references:
 
 ```text
 temporalio/sdk-typescript
-keli-wen/agy-staff
 ```
 
 Worker authority can only shrink from caller authority.

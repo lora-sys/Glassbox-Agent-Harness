@@ -1,0 +1,13 @@
+# Protected documentation and plans
+.plans/
+docs/
+AGENTS.md
+README.md
+CONTEXT.md
+CLAUDE.md
+
+# Upstream and assets
+upstream/
+.agy-staff/
+assets/
+.visual-fix/
