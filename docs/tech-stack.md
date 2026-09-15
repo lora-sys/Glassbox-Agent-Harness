@@ -2,70 +2,28 @@
 
 Status: CURRENT DIRECTION
 
-This file records the preferred technology stack and toolchain direction for Glassbox. It is not permission to add every listed technology before the active plan needs it.
+This file records the preferred technology stack and implementation boundaries for Glassbox. It is not permission to add every listed technology before the active Plan needs it.
 
-For the complete cross-cutting data, storage, search, observability, analytics, and public Trace / Eval read model, see [`data-observability.md`](./data-observability.md).
-
-For the execution-runtime ownership boundary between Glassbox, Pi, Lora PI Kit, Codex, and Claude Code, see [`runtime-strategy.md`](./runtime-strategy.md).
-
-For the bidirectional Task / Attention / Herdr worker boundary, see [`agent-operations.md`](./agent-operations.md).
-
-The current implementation source of truth is `.plans/03-personal-agent-foundation.md`.
-
-## Toolchain
-
-Glassbox standardizes on **Vite+** as the primary JavaScript / TypeScript development toolchain direction.
-
-Vite+ is the preferred command surface for:
+Read the topic-specific source of truth first:
 
 ```text
-runtime / package-manager environment
-install
-workspace task execution
-dev
-build
-format
-lint
-type check
-test
-staged checks
+docs/runtime-strategy.md
+  runtime ownership
+
+docs/lora-pi-kit.md
+  Lora PI Kit distribution, Skills, MCP, profiles, locks
+
+docs/agent-operations.md
+  Herdr / Task / Worker integration
+
+docs/memory-taste.md
+  Rules / Skills / Taste / Memory
+
+docs/data-observability.md
+  persistence, storage, observability
 ```
 
-The intended developer interface is:
-
-```bash
-vp install
-vp dev
-vp build
-vp check
-vp test
-vp run <task>
-```
-
-Use `vp run` for repository scripts and workspace tasks that are not Vite+ built-ins.
-
-Vite+ currently unifies Vite, Rolldown, Vitest, Oxlint, Oxfmt, tsdown, and Vite Task behind the `vp` toolchain.
-
-### Migration rule
-
-Do not partially migrate the repository.
-
-The Vite+ migration slice must update and verify together:
-
-```text
-package.json
-package-lock.json
-Vite configuration
-Vitest resolution
-workspace commands
-README development instructions
-AGENTS.md toolchain rules
-CI when CI exists
-```
-
-Until that verified migration lands, existing npm / Vite scripts remain valid implementation reality even though Vite+ is the selected target toolchain.
-
-When migrating, follow the Vite+ migration path rather than hand-building an imitation of it. Keep Vite / Vitest resolution aligned with the local `vite-plus` toolchain and regenerate the lockfile in the same verified change.
+The current implementation order comes from `.plans/03-personal-agent-foundation.md`.
 
 ## Runtime and language
 
@@ -75,11 +33,30 @@ TypeScript
 ES modules
 ```
 
-`apps/server` remains a Node.js runtime. Vite+ is the repository toolchain. It does not mean the server must become a Vite dev server.
+`apps/server` remains a Node.js server runtime.
 
-Server processes may continue to use a focused runtime such as `tsx` when that is the smallest correct execution path. Run those commands through `vp run` once the migration is complete.
+The production target is a Linux server. Local development must preserve the same product contracts used on that server.
 
-The production target is a Linux server. Local development must keep the same product contracts that will run there.
+## Repository toolchain
+
+Glassbox has selected Vite+ as the unified JavaScript / TypeScript toolchain direction.
+
+Intended command surface after the verified migration:
+
+```text
+vp install
+vp dev
+vp build
+vp check
+vp test
+vp run <task>
+```
+
+Vite+ is expected to cover Vite / Rolldown, Vitest, Oxlint, Oxfmt, tsdown, and workspace task execution.
+
+Until the migration is actually complete, use the commands that currently exist in the repository. Do not pretend planned commands are already implementation reality.
+
+Do not keep parallel lint / format / type-check stacks without a demonstrated compatibility need.
 
 ## Web application
 
@@ -90,105 +67,25 @@ tldraw
 Vite+ / Vite / Rolldown
 ```
 
-The Workbench is one product surface. Do not let frontend framework choices redefine Agent, Conversation, Task, Run, authorization, or durable state semantics.
+The Workbench is one product surface.
 
-The Owner is the only Web administrator. Public Web access is read-only and limited to explicitly published Trace or Eval projections. Public pages never become a second control plane.
+Frontend choices must not redefine Agent, Conversation, Task, Run, Authorization, Taste, Memory, or durable-state semantics.
 
-## Testing and code quality
+## Main Agent runtime
 
-Preferred Vite+ surfaces:
+Pi is the primary Personal Agent runtime engine.
 
-```text
-vp check   -> format + lint + type checks
-vp test    -> Vitest
-vp fmt     -> Oxfmt
-vp lint    -> Oxlint
-```
-
-Playwright remains the browser / E2E layer where browser behavior is the thing being tested.
-
-Plan 03 requires deterministic QQ / OneBot and Agent Operations test harnesses that do not depend on real QQ accounts, paid model quota, or the user's live Herdr workspaces.
-
-Do not keep parallel ESLint / Prettier / ad-hoc TypeScript check stacks unless a concrete compatibility gap requires them.
-
-## Persistence
-
-Plan 03 introduces Turso / SQLite-compatible structured durable state behind a narrow server-side persistence boundary.
-
-The selected cross-cutting storage model is:
+Glassbox embeds Pi through:
 
 ```text
-Turso
-  structured durable state
-  Agent / User / ChannelIdentity
-  Conversation
-  permissions / relationships
-  authorization decisions
-  approvals
-  Run metadata
-  message dedupe keys
-  runtime session bindings
-  visibility and Share metadata
-  AttentionItem
-  Task
-  TaskAttempt
-  WorkerBinding
-  later lexical / vector search and analytics indexes
-
-Cloudflare R2
-  Raw Trace evidence
-  large artifacts
-  attachments
-  archives
-  backups
-
-AgentMail
-  later email transport and source objects
-
-Glassbox server
-  runtime execution
-  authorization
-  Channel adapters
-  Task / Attention control plane
-  Agent Operations reconciliation
-  owner APIs
-  public Trace / Eval APIs
+@earendil-works/pi-coding-agent
 ```
 
-Raw Trace remains independent append-only evidence.
-
-Herdr workspace, pane, Agent, and plugin state are not the canonical Task database.
-
-The model does not receive unrestricted SQL access.
-
-The browser does not receive direct Turso, R2, or AgentMail credentials.
-
-## Agent execution
-
-Current execution capabilities include Codex and Claude Code adapters from the earlier Coding Agent phase.
-
-Plan 03 makes Pi the primary Personal Agent runtime path:
-
-```text
-upstream Pi
-    |
-    v
-Lora PI Kit
-    |
-    v
-@earendil-works/pi-coding-agent SDK
-    |
-    v
-Glassbox Runtime Boundary
-```
-
-Glassbox embeds Pi through the public SDK inside `apps/server`.
-
-Primary Pi surfaces for P3 include:
+Primary public surfaces include:
 
 ```text
 createAgentSession
-createAgentSessionRuntime when replacement is required
+createAgentSessionRuntime when required
 ModelRuntime
 SessionManager
 DefaultResourceLoader
@@ -198,140 +95,211 @@ session events
 explicit agentDir
 ```
 
-Lora PI Kit owns reusable Pi packages, extensions, selected Skills, prompts, runtime presets, observability hooks, and bootstrap tooling. It does not own Glassbox authorization, durable Conversation state, Task truth, QQ identity, audience policy, product identity, or Raw Trace truth.
-
-The customization order is:
+The runtime path is:
 
 ```text
-Pi settings / project config
--> Pi package
--> Skill
--> Extension
--> custom Tool
--> Pi SDK integration
--> upstream contribution
--> small local Pi core patch only when a tested requirement cannot use public boundaries
+Glassbox PiRuntimeAdapter
+        ↓
+Pi SDK
+        ↓
+Pi session configured with Lora PI Kit
+        ↓
+Pi Agent engine
 ```
 
-RPC remains available upstream but is not the primary Plan 03 integration path.
+RPC remains an upstream capability but is not the primary P3 embedding path.
 
-Codex and Claude Code remain valid runtimes for compatibility, fallback, specialist execution, coding workers, and differential Eval while Pi becomes the primary Personal Agent path.
+Codex and Claude Code remain valid runtimes for compatibility, fallback, specialist execution, Herdr workers, and later differential Eval.
+
+## Lora PI Kit
+
+Lora PI Kit is Lora's reproducible Pi distribution, not just a loose configuration directory.
+
+It should be a real Pi Package using upstream public package mechanisms.
+
+A Kit release contains or manages:
+
+```text
+Pi package manifest
+pinned bundled Lora Skills snapshot
+Extensions
+Prompt Templates
+runtime profiles
+MCP adapter / registry
+model / thinking defaults
+Glassbox bridges
+Taste / Feedback / Trace hooks
+settings / model templates
+install / update / doctor / sync tooling
+compatibility locks
+```
+
+Full design: `docs/lora-pi-kit.md`.
+
+### Pi Package mechanism
+
+Use Pi Packages for distributable runtime resources.
+
+Pi Packages can expose:
+
+```text
+extensions
+skills
+prompt templates
+themes
+```
+
+They can be installed from npm, Git, or local paths and filtered by global/project configuration.
+
+Do not create a second custom package loader unless the Pi public mechanism proves insufficient for a tested requirement.
+
+## Skills
+
+`lora-sys/skills` is the canonical Skill source repository.
+
+A released Lora PI Kit bundles a pinned snapshot of the selected Skills.
+
+```text
+lora-sys/skills
+→ sync-skills
+→ lora-pi-kit/skills
+→ skills.lock.json
+→ release
+```
+
+The snapshot makes one Kit version reproducible across local development, CI, Glassbox, and the Linux server.
+
+Do not fetch an unpinned latest Skill set at runtime.
+
+Bundled does not mean always injected. Profiles and task-level selection narrow the active Skill set.
+
+## MCP
+
+Pi core intentionally keeps MCP outside the required core.
+
+Lora PI Kit may provide MCP through an owned Pi Extension / Package layer.
+
+```text
+Pi
+→ Lora PI Kit MCP adapter
+→ MCP Registry
+→ profile-selected integrations
+→ Tools
+```
+
+Do not start all configured MCP servers for every profile.
+
+The presence of an MCP Tool does not grant Glassbox permission to call it. Protected execution remains behind Glassbox Tool / Ops authorization.
+
+## Profiles
+
+Profiles select the intended Pi environment from the broader Kit capability set.
+
+Initial concepts:
+
+```text
+local-coding
+main-agent
+owner-direct
+qq-group
+herdr-worker
+test
+```
+
+Profiles may control:
+
+```text
+Extensions
+Skills
+MCP integrations
+prompts
+model / thinking defaults
+Tool surface
+notifications
+Glassbox bridge behavior
+trace / usage hooks
+```
+
+Profiles may narrow capability. They may not widen Glassbox authority.
+
+## Pi runtime state
+
+Glassbox should launch isolated Pi runtime instances rather than writing to the user's normal interactive Pi state by default.
+
+Conceptual layout:
+
+```text
+~/.glassbox/pi/main/
+~/.glassbox/pi/workers/<task-or-attempt-id>/
+~/.glassbox/pi/test/
+```
+
+Exact paths are not frozen.
+
+The stable rule is:
+
+```text
+same pinned Kit distribution
++ role-specific profile
++ isolated session/runtime state where needed
+```
 
 ## Agent Operations
 
-Plan 03 uses Herdr as the live execution host for coding workers.
-
-The production boundary is:
+Herdr is the live execution host for coding Workers.
 
 ```text
 Glassbox Main Agent
         ↓
-Attention Queue + Task Registry
+Task Registry + Attention Queue
         ↓
 Glassbox Ops Tools
         ↓
 HerdrBridge
         ↓
-Herdr local socket API
+Herdr
+  workspace / worktree / pane
+  Pi / Codex / Claude worker
         ↓
-workspace / worktree / pane / coding Agent
-        ↓
-Herdr lifecycle events
+Herdr events
         ↓
 OpsReconciler
         ↓
 TaskAttempt + WorkerBinding + Trace
 ```
 
-Glassbox owns:
+Glassbox owns Task truth, review, rework, acceptance, authorization, and durable evidence.
+
+Herdr owns live process topology and observed Worker lifecycle.
 
 ```text
-Task
-TaskAttempt
-AttentionItem
-WorkerBinding
-AgentOpsSnapshot
-priority
-acceptance criteria
-review
-rework
-acceptance
-authorization
+Herdr done
+≠
+Glassbox Task DONE
 ```
 
-Herdr owns live execution facts:
-
-```text
-session
-workspace
-worktree
-tab
-pane
-terminal process
-recognized coding Agent
-working / blocked / done / idle / unknown
-live output
-```
-
-`Herdr agent = done` does not mean `Task = DONE`. Normal completion moves work to `REVIEW`; Glassbox or an authorized reviewer accepts it or requests rework.
-
-For long-lived integration, prefer Herdr's public local socket protocol behind `HerdrBridge`. CLI wrappers are fine for one-shot scripts and diagnostics.
-
-Bootstrap and reconnect use:
-
-```text
-events.subscribe
-→ subscription acknowledgement
-→ session.snapshot
-→ reconcile durable WorkerBindings / TaskAttempts
-→ process later events
-```
-
-After reconnect, snapshot and reconcile again.
-
-`aorumbayev/herdr-workflows` may execute bounded linear stage recipes. It does not own durable Task truth or review/rework loops.
-
-The main Agent receives explicit Ops Tools such as `ops_status`, `task_delegate`, `worker_read`, `worker_prompt`, `task_accept`, and `task_rework`. Do not expose unrestricted raw Herdr terminal control through QQ.
+The detailed synchronization contract lives in `docs/agent-operations.md`.
 
 ## QQ Channel
 
-Plan 03 uses NapCat as the QQ protocol-side runtime and OneBot 11 as the application boundary.
+Plan 03 uses:
 
 ```text
 QQ
--> NapCat
--> OneBot 11
--> Glassbox QQ Channel Adapter
--> Identity / Conversation / Authorization
--> Pi SDK
--> direct answer or authorized Task delegation
--> Glassbox Delivery Gate
--> NapCat
--> QQ
+→ NapCat
+→ OneBot 11
+→ Glassbox QQ Channel Adapter
 ```
 
-QQ transport code belongs in Glassbox, not Lora PI Kit.
+QQ transport stays in Glassbox, not in Lora PI Kit.
 
-Initial P3 scope includes private messages, group messages, explicit group activation such as `@bot`, reply delivery, reconnect, health, message deduplication, and self-message loop prevention.
+Initial P3 scope covers private messages, group messages, explicit activation, reply delivery, reconnect, dedupe, health, and self-loop prevention.
 
 ## Authorization
 
 Authorization is server-side and default-deny.
 
-The stable decision inputs must answer:
-
-```text
-Who
-Where
-What
-How
-Resource
-Audience
-Conversation
-Run
-```
-
-Decision remains:
+Decision:
 
 ```text
 ALLOW
@@ -339,24 +307,18 @@ DENY
 REQUIRES_APPROVAL
 ```
 
-Plan 03 enforces four hard gates:
+Stable protected path:
 
 ```text
 Ingress Gate
 Context Gate
-Tool Gate
+Tool / Ops Gate
 Delivery Gate
 ```
 
-No toolchain, framework, runtime, model router, Channel adapter, Herdr state, Herdr plugin, workflow recipe, vector database, cache, Pi Extension, Skill, or runtime profile may bypass these boundaries.
+No runtime, profile, Skill, Extension, MCP integration, Herdr state, cache, or model output may bypass these gates.
 
-Unauthorized protected content is filtered before Pi model Context is assembled.
-
-Protected Tools and Ops Actions are re-authorized immediately before execution.
-
-Delivery is authorized separately from read access. An Owner being allowed to read a private resource does not make that resource safe to send into a QQ group.
-
-The remote QQ Pi profile uses an explicit Tool allowlist. Generic unrestricted `bash`, `powershell`, raw Herdr pane input, arbitrary worktree deletion, and unrelated worker reads are not exposed as remote escape hatches in P3.
+The remote QQ profile must not expose unrestricted shell, raw Herdr control, unrelated Worker reads, arbitrary destructive workspace operations, or all Kit MCP capabilities by default.
 
 Delegation must satisfy:
 
@@ -364,144 +326,170 @@ Delegation must satisfy:
 worker_permissions ⊆ delegated_permissions ⊆ caller_permissions
 ```
 
-## Test environments
+## Persistence
 
-Plan 03 has deterministic tests plus real integration acceptance.
+Glassbox structured durable state uses Turso / SQLite-compatible storage behind server-owned boundaries.
 
-Deterministic automated tests use:
+Current / planned structured state includes:
 
 ```text
-Fake OneBot gateway
-Fake Owner
-Fake Visitor
-Fake QQ group
-Disposable Turso / SQLite database
+Agent / User / Principal / ChannelIdentity
+Conversation
+permissions / relationships
+authorization decisions
+approvals
+Run metadata
+message dedupe
+runtime session bindings
+visibility / Share metadata
+AttentionItem
+Task
+TaskAttempt
+WorkerBinding
+FeedbackEvent
+TasteCandidate
+TasteEntry
+Memory metadata
+Skill / Asset / Journal metadata
+Eval metadata
+analytics projections
+```
+
+Cloudflare R2 is the target for large objects and Raw Trace evidence where object storage is appropriate.
+
+Herdr is live execution state, not the canonical Task database.
+
+Lora PI Kit is runtime distribution state, not the canonical Taste / Memory / Authorization database.
+
+The model does not receive unrestricted SQL access.
+
+The browser does not receive direct database or object-store credentials.
+
+See `docs/data-observability.md`.
+
+## Rules, Taste and Memory injection
+
+Glassbox selects authorized task-relevant material.
+
+```text
+Rules
+relevant Skills
+task-relevant Taste
+authorized Memory
+```
+
+The Runtime Adapter passes a small projection into the active Pi environment.
+
+Lora PI Kit runtime bridges inject that projection into Pi.
+
+Do not send the entire Taste / Memory store every turn.
+
+See `docs/memory-taste.md`.
+
+## Testing
+
+Preferred repository checks after Vite+ migration:
+
+```text
+vp check
+vp test
+vp build
+```
+
+Playwright remains the browser / E2E layer.
+
+P3 deterministic tests must not require real QQ accounts, paid model quota, the user's normal Pi state, or live Herdr workspaces.
+
+They should use isolated substitutes such as:
+
+```text
+Fake OneBot
+Fake identities
+Disposable Turso / SQLite
 isolated Pi agentDir
-Lora PI Kit test preset
-deterministic or recording model/provider
+Lora PI Kit test profile
+deterministic / recording model
 FakeHerdrBridge
-deterministic Herdr event fixtures
 synthetic protected resources
 Raw Trace capture
 ```
 
-Focused Herdr protocol tests use a dedicated disposable Herdr session and repository/worktree. They must not operate on the user's normal live Herdr workspaces.
-
-Real acceptance uses:
+Kit tests should additionally verify:
 
 ```text
-Bot QQ
-Owner QQ
-Visitor QQ
-Test QQ group
-NapCat
-isolated Glassbox test database
-isolated Pi agentDir
-Lora PI Kit
-Herdr dedicated test session
-one disposable test repo / worktree
-at least one real supported coding Agent
-real model execution
+package loads
+profile resolves
+Skills lock matches bundled snapshot
+Extensions load
+MCP adapter boundary loads without starting unrelated services
+Pi compatibility metadata matches the tested runtime
 ```
 
-Tests must never write to live Personal Agent state, normal `~/.pi/agent`, production Herdr workspaces, real writable user repositories, or production QQ session data.
+Use real Pi / QQ / Herdr / MCP integration only when that real protocol is the behavior under test or the active Plan requires acceptance.
 
-## Local development and server deployment
+## Versioning and upgrades
 
-The intended production host is:
+One tested runtime set should identify:
 
 ```text
-Linux server
-  Glassbox server
-  Pi SDK + Lora PI Kit
-  NapCat
-  Herdr session server
-  coding Agents / worktrees
-  Turso-compatible durable state
+Pi version / commit
+Lora PI Kit version / commit
+lora-sys/skills commit
+selected external integration versions
+Glassbox version / commit
 ```
 
-When Glassbox and Herdr run on the same host, use the local Herdr control boundary.
-
-Human operators may attach over SSH. Moshi may be used as a remote Herdr client and monitoring surface, but Glassbox product correctness must not depend on Moshi, desktop GUI state, or Herdr sidebar presentation.
-
-Do not hardcode developer-machine absolute paths as product semantics. Local testing and server deployment use the same `Task`, `TaskAttempt`, `AttentionItem`, `WorkerBinding`, `HerdrBridge`, authorization, reconciliation, and Trace contracts.
-
-## Retrieval and efficiency
-
-Hybrid retrieval, semantic cache, smart routing, aggressive Context budgets, TokenJuice-style Tool-result projection, and broader runtime optimization remain post-P3 work unless a minimal mechanism is required for the closed loops themselves.
-
-The selected architecture keeps retrieval behind Glassbox-owned authorization boundaries and uses Turso as the default structured, lexical, and vector store.
-
-Primary later mechanisms include:
+Upgrade flow:
 
 ```text
-authorized hybrid retrieval
-vector + lexical search
-context budgets
-tool-result budgets
-tool-result projection
-routing
-thinking-depth selection
-token estimation
-permission-scoped semantic cache
+update dependency / upstream
+→ build / sync Kit
+→ Kit compatibility tests
+→ Glassbox runtime tests
+→ integration acceptance where required
+→ update locks
+→ pin / release
 ```
 
-`TokenRhythm/opensquilla` is a primary upstream reference for these later mechanisms.
+Do not track upstream `main` implicitly in production.
 
-When a mechanism is generic Pi workflow customization, prefer implementing it in Lora PI Kit. When it changes Glassbox product state, authorization, retrieval visibility, Task truth, audience policy, or evidence semantics, keep it in Glassbox.
+## Observability
 
-## Observability and Eval
+Product observability remains a Glassbox feature.
 
-Product observability is a Glassbox feature, not an external dashboard dependency.
-
-P3 must expose enough evidence to inspect:
+Glassbox should be able to inspect:
 
 ```text
 Channel / Principal / location
 Conversation
 Authorization decisions
 model-visible Context metadata
-Tool decisions
-Run and runtime/session identity
-token usage where available
-Delivery decision
-Attention counts
-Task state
-TaskAttempt history
-WorkerBinding
-Herdr observed worker state
+Run / Tool / Delivery state
+runtime / profile / Kit identity
+Pi / model usage
+Task / TaskAttempt / Attention
+WorkerBinding and Herdr observed state
 review / rework / acceptance
-reconciliation state
+Taste / Memory retrieval reasons later
 ```
 
-The main Agent should have a compact `AgentOpsSnapshot` instead of receiving every Task body on every turn.
+External dashboards, Pi TUI, Herdr UI, and Moshi are not the canonical Glassbox observability surface.
 
-OpenTelemetry, Langfuse, Inspect AI, Token Monitor, and Herdr lifecycle surfaces are reference models for trace structure, scores, analytics, runtime usage, and later Eval design. They are not alternative authorization sources.
+## Local development to server
 
-Public observers may read only sanitized, explicitly published Trace or Eval snapshots.
-
-## Long work, eval, and learning
-
-The later LongTask phase extends the P3 Task / TaskAttempt / WorkerBinding foundation with dependency graphs, checkpoints, retry policy, signals, child tasks, continuations, leases, and stronger restart semantics.
-
-Future layers may use ideas from Temporal, AGY, Inspect AI, SkillClaw, CoEvoSkills, Voyager, Dagster, and other recorded upstream references.
-
-Do not introduce their full infrastructure until an active plan needs the concrete boundary.
-
-## Documentation site
-
-The documentation / Learning Lab is a separate product surface.
-
-Do not choose its framework merely because the Workbench uses React. The future docs implementation should optimize for:
+Target host:
 
 ```text
-content quality
-MD / MDX-style authoring
-fast static delivery
-interactive concept demos
-code and contract links
-versionable documentation
-low client-side cost
+Linux server
+  Glassbox server
+  Pi SDK
+  pinned Lora PI Kit
+  NapCat
+  Herdr
+  coding Workers / worktrees
+  durable state
 ```
 
-The docs stack should be selected when the documentation implementation plan starts.
+Do not encode desktop GUI state, machine-specific absolute paths, or Moshi state as product truth.
+
+Local tests and server deployment must use the same product contracts.
