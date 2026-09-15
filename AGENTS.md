@@ -1,16 +1,16 @@
 # Glassbox
 
-Glassbox is evolving from a local Coding Agent workbench into a durable Personal Agent workbench with explicit identity, strict authorization, persistent Conversations, inspectable execution, learning, assets, evals, and controlled multi-worker operations.
+Glassbox is a durable Personal Agent product with explicit identity, strict authorization, persistent Conversations, inspectable execution, durable Tasks, learning, assets, evals, and controlled worker delegation.
 
-The product has one durable Personal Agent. Workbench, messaging Channels, email, API access, and future integrations are entry points to that Agent, not separate Agents.
+The product has one durable Personal Agent. Workbench, QQ, future messaging Channels, email, API access, and other integrations are entry points to that Agent, not separate Agents.
 
-Glassbox should help people use the Agent, understand what it did, verify why it was allowed to do it, and see what delegated work is currently running or waiting.
+This file contains stable repository invariants and navigation rules. Detailed implementation steps belong in the active Plan and `docs/*.md`.
 
 ## What makes Glassbox special?
 
 ### 1. Authorization before intelligence
 
-Permission is a server-side product invariant.
+Authorization is a server-side product invariant.
 
 Every protected operation reduces to:
 
@@ -28,41 +28,31 @@ REQUIRES_APPROVAL
 
 No matching grant means `DENY`.
 
-Unauthorized data must be filtered before model-visible Context is assembled. Never load private data, send it to a model, and rely on a Prompt telling the model not to reveal it.
+Never load protected data into model-visible Context and rely on a Prompt to keep it secret.
 
-Protected Tool execution rechecks current authorization at execution time.
+Security boundaries must be enforced in code. Prompt instructions may guide behavior, but they are never an authorization mechanism.
 
-Approval does not manufacture Permission.
-
-Plan 03 adds explicit hard gates around the QQ and Agent Operations closed loops. Every protected path must be able to answer:
+A protected operation must preserve enough structured context to answer:
 
 ```text
-Who is acting?
-Where are they acting?
-What are they trying to do?
-How will it be done?
-Which Resource is involved?
-Who will receive the result?
-Which Conversation and Run does this belong to?
+Who acted?
+Where did they act?
+What did they try to do?
+How would it be executed?
+Which Resource was involved?
+Who would receive the result?
+Which Conversation, Run, or Task did it belong to?
 ```
 
-Authorization is enforced at Ingress, Context assembly, Tool execution, Agent Ops actions, and Delivery. None of these gates may be replaced by Prompt instructions.
+Read permission and delivery permission are separate decisions.
+
+A Principal being allowed to read data does not imply that the data may be sent to the current audience.
 
 ### 2. One durable Personal Agent
 
-Channel identity is not Agent identity.
+Keep product identity independent from Channel, Runtime, Provider, Worker, and UI state.
 
-Workbench, WeChat, QQ, Telegram, Discord, Slack, email, API access, and future Channels resolve a caller into a User / Principal that reaches the same Personal Agent.
-
-A User may be the Agent Owner or another person who is allowed to use the Agent. A User may have multiple Channel Identities. Trusted identity binding may resolve those Channel Identities to the same User, but identity binding never widens that User's permissions.
-
-Conversation is durable product state. Runtime Session and Run are execution concepts underneath it.
-
-A direct Conversation may be scoped to one user. A group Conversation belongs to the group scope, while each Run still records the real acting Principal.
-
-Task is also durable product state. A coding worker, Herdr pane, worktree, Runtime Session, or Run may execute a TaskAttempt, but none of them is the Task itself.
-
-Keep these boundaries clear:
+These distinctions are stable:
 
 ```text
 Channel ≠ Agent
@@ -73,80 +63,102 @@ Conversation ≠ Session
 Session ≠ Run
 Task ≠ Run
 Task ≠ Worker
-TaskAttempt ≠ Herdr pane
+TaskAttempt ≠ Worker lifecycle state
 Herdr Agent state ≠ Task acceptance
 Actor permission ≠ Delivery permission
 Runtime / Provider / Worker ≠ Personal Agent
 ```
 
+Conversation is durable product state.
+
+Session is runtime execution context.
+
+Run is one concrete execution.
+
+Task is durable product work.
+
+TaskAttempt is one concrete execution or rework attempt for a Task.
+
+Do not collapse these concepts because the current deployment is local, single-user, or uses only one Runtime.
+
 ### 3. Researchable by default
 
-Glassbox should preserve enough evidence to answer:
+Glassbox must preserve enough evidence to reconstruct what happened.
 
-- Who was acting?
-- Where were they acting?
-- What was that Principal allowed to see or do?
-- What Context actually reached the Agent?
-- Which Tool or Runtime executed?
-- Which Task or TaskAttempt was involved?
-- Which Herdr workspace / worktree / pane / worker was bound to that attempt?
-- Which audience was the result intended for?
-- What changed during the Run or Task lifecycle?
-- Why was an operation allowed, denied, sent for approval, blocked at delivery, sent for review, or returned for rework?
-- Which result came from which configuration and evidence?
+Raw Trace is append-only evidence. Derived State is an interpretation of that evidence.
 
-Editing, projection, compression, reconciliation, or a newer reducer must not erase what an active or completed Run or TaskAttempt actually used.
+Do not rewrite historical execution evidence so an old Run or TaskAttempt appears to have used newer state.
+
+Authorization, approvals, delivery decisions, Task assignment, WorkerBinding, review, rework, acceptance, and delegation must remain traceable.
+
+Denied operations should record why they were denied without copying protected payload contents into denial logs.
+
+Measurements and judgments remain distinct.
+
+Examples of measurements:
+
+```text
+tokens
+duration
+tool calls
+file changes
+exit codes
+message ids
+worker state transitions
+```
+
+Examples of judgments:
+
+```text
+review decisions
+eval scores
+LLM judgments
+human review
+```
+
+Do not collapse them into one fake universal score.
 
 ### 4. Agent-native, not provider-specific
 
-Glassbox connects to existing Agent runtimes and specialist workers instead of forcing every runtime into one behavior.
+Glassbox may use Pi, Codex, Claude Code, Herdr-managed coding Agents, and future execution systems.
 
-Pi, Codex, Claude Code, OpenHarness, AGY, Herdr-managed workers, and future systems may expose different tools, lifecycle controls, context behavior, permission modes, and events.
+Glassbox remains the product and trust boundary.
 
-Plan 03 uses the Pi SDK directly inside the Glassbox Node.js server. The primary package is `@earendil-works/pi-coding-agent`.
+Runtime-specific behavior stays close to the corresponding integration.
 
-Lora PI Kit is the maintainer-owned Pi configuration and extension layer. Glassbox remains the product and trust boundary.
+Pi customization belongs in Lora PI Kit when it is reusable Pi workflow behavior.
 
-Herdr is the selected live Agent Operations execution layer for coding workers. Glassbox owns Task truth, Attention, TaskAttempt history, WorkerBinding, authorization, review, rework, and acceptance.
-
-Do not turn Glassbox into a Pi wrapper. Do not copy Pi core into Glassbox to create Lora PI Kit.
-
-Do not turn Herdr workspace or pane state into the Glassbox Task database.
-
-For Pi customization, use this order before considering a core patch:
+Glassbox product semantics stay in Glassbox, including:
 
 ```text
-Pi settings / project config
-Pi package resources
-Skill
-Extension
-custom Tool
-Pi SDK integration
-upstream contribution
-local core patch
+Agent identity
+Principal
+Authorization
+Conversation
+Task truth
+Audience / Delivery policy
+Durable product state
+Run identity
+Raw Trace
 ```
 
-Do not use RPC as the primary Plan 03 Pi integration path.
+Herdr owns live execution facts such as workspaces, worktrees, panes, terminal processes, and observed coding-Agent lifecycle state.
 
-For Herdr, use its public CLI / local socket API and installed protocol schema before reaching into implementation internals. Long-lived event integration belongs behind a Glassbox-owned `HerdrBridge`.
+Herdr does not own Glassbox Task truth or authorization.
 
-Read `docs/runtime-strategy.md` before changing the runtime boundary. Read `docs/agent-operations.md` before changing Herdr integration, Task / Attention / WorkerBinding semantics, Ops Tools, or worker reconciliation.
+Do not turn Glassbox into a Pi wrapper.
 
-Keep runtime-specific and host-specific behavior close to the corresponding integration.
+Do not turn Herdr state into the Glassbox Task database.
 
-Share only the concepts Glassbox actually needs.
-
-Never copy an upstream trust model blindly. Glassbox authorization rules win.
+Do not copy an upstream trust model blindly. Glassbox authorization rules win.
 
 ### 5. Canvas-native, but Canvas is a projection
 
-Canvas remains a powerful workspace and inspection surface. It is not execution state and it is not the whole product.
+Canvas is a workspace and inspection surface, not execution state.
 
-Moving, connecting, grouping, resizing, or annotating Canvas Objects must not silently change Agent execution, Task state, worker state, or authorization.
+Moving, connecting, grouping, resizing, or annotating Canvas Objects must not silently change Agent execution, Task state, Worker state, or authorization.
 
-Do not turn every raw event into a Canvas Object.
-
-Keep normal whiteboard behavior useful, but preserve this boundary:
+Preserve this boundary:
 
 ```text
 Raw Trace
@@ -159,124 +171,91 @@ Raw Trace
 
 Treat measured regressions as bugs.
 
-Watch for broad rerenders, huge live payloads, unbounded event history projections, repeated retrieval, oversized Tool results, unnecessary model Context, duplicated QQ events, repeated model execution, duplicated delivery, unbounded Herdr event ingestion, and repeated worker reconciliation.
+Optimization may reduce cost, latency, Context size, retrieval volume, or Tool output.
 
-Later efficiency work may use context budgets, Tool-result projection, hybrid retrieval, smart routing, semantic cache, model-tier selection, and richer worker scheduling.
+Optimization must never:
 
-Those mechanisms may reduce cost or increase capability. They may never widen authority, hide evidence, or bypass authorization.
+```text
+widen authority
+hide evidence
+bypass authorization
+merge protected scopes
+turn missing data into false certainty
+```
 
 ## Project owner note
 
-When a requirement is ambiguous, choose the smaller implementation that preserves the product rules in this file and completes the active closed loop.
+When a requirement is ambiguous, choose the smaller implementation that preserves the stable rules in this file and follows the active Plan.
 
-Do not silently expand the task.
+Do not silently expand scope from the roadmap.
 
 The only active implementation plan is:
 
-`/.plans/03-personal-agent-foundation.md`
+```text
+.plans/03-personal-agent-foundation.md
+```
 
 Read in this order before changing code:
 
 1. `AGENTS.md`
-2. `.plans/03-personal-agent-foundation.md`
-3. `docs/runtime-strategy.md` when changing runtime, provider, worker, Pi, Lora PI Kit, execution integration, runtime-level Skills, Extensions, custom Tools, or model execution policy
-4. `docs/agent-operations.md` when changing Herdr, Task, TaskAttempt, AttentionItem, WorkerBinding, Ops Tools, worker review/rework, or reconciliation
-5. `docs/tech-stack.md` when changing tooling, dependencies, build, test, lint, format, or package management
-6. only the relevant `.plans/findings/`
-7. relevant upstream source or documentation
-8. current production code and focused tests
+2. the active Plan
+3. the relevant architecture document from the index below
+4. only the relevant `.plans/findings/`
+5. relevant upstream source or documentation
+6. current production code and focused tests
 
-`README.md` defines product direction.
+### Implementation index
 
-`.plans/roadmap.md` records sequencing, not permission to implement future phases.
+| Topic | Source of truth |
+| --- | --- |
+| Current implementation order, slices, completion gate, acceptance matrix | `.plans/03-personal-agent-foundation.md` |
+| Product sequencing after the active Plan | `.plans/roadmap.md` |
+| Pi, Lora PI Kit, Runtime ownership, SDK boundary | `docs/runtime-strategy.md` |
+| Herdr, Task, Attention, TaskAttempt, WorkerBinding, Ops Tools, reconciliation | `docs/agent-operations.md` |
+| Toolchain, dependencies, build, test, local development | `docs/tech-stack.md` |
+| Persistence, storage, observability, monitoring, public/private projections | `docs/data-observability.md` |
+| Documentation and learning-site rules | `docs/README.md` |
+| Approved upstream references and source pins | `upstream/README.md` and each `upstream/*/SOURCES.md` |
 
-Current P3 is one usable Personal Agent loop plus one minimal Agent Operations loop:
+`README.md` describes the product direction. It is not the active implementation checklist.
 
-```text
-QQ private / group message
-        ↓
-NapCat
-        ↓
-OneBot 11 Channel Adapter
-        ↓
-Ingress Gate
-        ↓
-Identity Resolver
-        ↓
-Conversation Resolver
-        ↓
-Authorization Engine
-        ↓
-Authorized Context Builder
-        ↓
-Pi SDK + Lora PI Kit
-        ↓
-Tool Gate
-        ↓
-Direct answer OR Task / Attention
-        ↓
-HerdrBridge when delegated
-        ↓
-Herdr worker lifecycle
-        ↓
-Review / Rework / Accept
-        ↓
-Delivery Gate
-        ↓
-QQ reply
-        ↓
-Turso durable state + Raw Trace
-```
-
-Plan 03 includes the deterministic test harness, Lora PI Kit MVP, direct Pi SDK integration, the four hard authorization gates, scope-based Conversation persistence, NapCat / OneBot QQ private and group chat, message deduplication, restart recovery, Trace, AttentionQueue, TaskRegistry, TaskAttempt, WorkerBinding, AgentOpsSnapshot, HerdrBridge, reconciliation, Ops Tools, and real QQ + Herdr acceptance.
-
-P3 does not include a full durable workflow engine. Complex Task DAGs, generalized retry policy, checkpoints, child tasks, continuations, and large-scale worker scheduling remain later LongTask work.
-
-Until P3 passes its completion gate, do not add real WeChat, Telegram, Discord, Slack, Mail, Calendar, AGY product integration, full LongTask, Eval Workbench, Arena, full Memory consolidation, vector retrieval, semantic cache, smart routing, broad Skill evolution, serverless deployment, or a large UI redesign as implementation dependencies.
-
-Product history and future ideas belong in `README.md`, `.plans/roadmap.md`, `docs/`, or research notes. Current implementation scope belongs in the active plan.
-
-If the current task conflicts with a stable rule in this file, stop and ask before breaking the rule.
+If a current task conflicts with a stable rule in this file, stop before breaking the rule.
 
 ## A small glossary
 
 Use these terms consistently.
 
-- **you** means the coding Agent reading this file and changing Glassbox.
-- **we**, **us**, and **maintainers** mean the people building and maintaining Glassbox.
-- **user** means a person who uses the Personal Agent. This includes the Agent Owner and other people the Owner allows to access the Agent through Workbench or a Channel. A User's identity does not itself grant access; effective access is determined through Principal and Authorization.
-- **principal** means the effective actor used for an authorization decision.
-- **channel** means an entry point through which a User reaches the Personal Agent, such as Workbench, QQ, WeChat, Telegram, Discord, Slack, email, API access, or a future messaging or integration channel.
-- **channel identity** means a User's external identity inside one Channel. One User may have multiple Channel Identities. Trusted identity binding may map them to the same User but never grants additional Permission by itself.
-- **location** means the concrete place where an Action originates, including Channel, scope type, and scope key such as one QQ private chat or one QQ group.
-- **audience** means the destination that can receive an output. Read permission and delivery permission are separate decisions.
-- **agent** means the durable Personal Agent product identity unless a runtime-specific context clearly means an external Agent runtime.
-- **runtime** means an execution backend or Agent runtime integration such as Pi, Codex, or Claude Code.
-- **provider** means a model-provider or runtime-specific integration detail below the Glassbox product boundary.
-- **worker** means delegated specialist execution. In P3, a Herdr-managed coding Agent can be a Worker for one TaskAttempt.
-- **resource** means protected data or capability addressed by authorization.
-- **action** means an explicit operation on a Resource or execution state.
-- **conversation** means durable thread state for an Agent and a scope. A direct QQ Conversation may use `qq:user:<id>`. A group QQ Conversation may use `qq:group:<id>`.
-- **session** means provider or runtime execution context such as a Pi Session. It is not the Conversation.
-- **run** means one concrete Agent execution by one Principal inside one Conversation.
-- **task** means durable product work tracked by Glassbox. It is not a Run, pane, worktree, or external Agent state.
-- **task attempt** means one concrete execution or rework attempt for a Task.
-- **attention item** means something that currently needs main-Agent or human action, such as an unanswered message, blocked worker, approval, review, failure, or operations connection problem.
-- **worker binding** means the mapping from one TaskAttempt to the concrete Herdr execution location and worker identity.
-- **agent ops snapshot** means the compact current projection of task, attention, and worker counts used by the main Agent.
-- **Herdr** means the live Agent Operations host for workspaces, worktrees, panes, terminal processes, and coding-Agent lifecycle facts. Herdr is not Task truth or authorization.
-- **raw trace** means append-only execution evidence.
-- **derived state** means Glassbox's current interpretation of evidence for product behavior.
-- **authorization decision** means inspectable evidence of an `ALLOW`, `DENY`, or `REQUIRES_APPROVAL` result.
-- **approval** means explicit human authorization for a policy path that already permits approval. It is not Permission.
-- **visibility** means the scope in which protected content may be used or delivered, such as `public`, `owner-private`, `user:<id>`, `group:<id>`, or `conversation:<id>`.
-- **memory** means promoted durable knowledge. It is not raw Conversation history.
-- **skill** means a reusable validated procedure or capability description.
-- **asset** means a durable output with provenance, lineage, or version identity.
-- **canvas** means the interactive tldraw workspace and projection surface.
-- **canvas object** means something shown on Canvas because it helps the user understand, inspect, edit, or act on work.
-- **artifact** means a durable output such as a file, diff, document, image, webpage, dataset, or generated design.
-- **inspector** means contextual detail UI for a selected object or execution record.
+- **User**: a person who uses the Personal Agent.
+- **Principal**: the effective actor used for authorization.
+- **Channel**: an entry point into the Personal Agent.
+- **ChannelIdentity**: an external identity inside one Channel.
+- **Location**: where an Action originates, including Channel and scope.
+- **Audience**: who can receive an output.
+- **Agent**: the durable Personal Agent product identity.
+- **Runtime**: an execution backend such as Pi, Codex, or Claude Code.
+- **Provider**: model-provider or Runtime-specific provider detail.
+- **Worker**: delegated specialist execution.
+- **Resource**: protected data or capability addressed by authorization.
+- **Action**: an explicit operation on a Resource or execution state.
+- **Conversation**: durable thread state for an Agent and a scope.
+- **Session**: Runtime execution context.
+- **Run**: one concrete Agent execution.
+- **Task**: durable product work tracked by Glassbox.
+- **TaskAttempt**: one concrete execution or rework attempt for a Task.
+- **AttentionItem**: something that currently needs main-Agent or human action.
+- **WorkerBinding**: the mapping from a TaskAttempt to its concrete Worker execution location.
+- **AgentOpsSnapshot**: a compact projection of current Task, Attention, and Worker state for the main Agent.
+- **Herdr**: the live operations host for workspaces, worktrees, panes, terminal processes, and coding-Agent lifecycle facts.
+- **Raw Trace**: append-only execution evidence.
+- **Derived State**: Glassbox's current interpretation of evidence.
+- **AuthorizationDecision**: inspectable `ALLOW`, `DENY`, or `REQUIRES_APPROVAL` evidence.
+- **Approval**: explicit human authorization for a policy path that already permits approval. Approval is not Permission.
+- **Visibility**: the scope in which protected content may be used or delivered.
+- **Memory**: promoted durable knowledge, not raw Conversation history.
+- **Skill**: a reusable validated procedure or capability description.
+- **Asset**: a durable output with provenance, lineage, or version identity.
+- **Canvas**: the tldraw workspace and projection surface.
+- **Artifact**: a durable output such as a file, diff, document, image, webpage, or dataset.
 
 Keep these distinctions clear:
 
@@ -285,47 +264,38 @@ User ≠ Principal
 ChannelIdentity ≠ User
 ChannelIdentity ≠ Permission
 Identity ≠ Authorization
-Conversation ≠ Principal
+Permission ≠ Approval
 Conversation ≠ Session
 Session ≠ Run
 Task ≠ Run
 Task ≠ Worker
-TaskAttempt ≠ Herdr pane
-Herdr Agent state ≠ Task acceptance
-Actor permission ≠ Delivery permission
-Permission ≠ Approval
-Channel ≠ Agent
+TaskAttempt ≠ Worker lifecycle state
 LongTask ≠ Task
-WorkerJob ≠ LongTask
 Runtime / Provider / Worker ≠ Personal Agent
-Event ≠ Canvas Object
-Asset ≠ Canvas Object
 Canvas ≠ Execution State
 Raw Trace ≠ Derived State
 Edit ≠ Apply
 ```
 
-Do not reuse one identifier for multiple concepts merely because the current implementation is local or single-user.
-
 ## The easiest ways to hurt this project
 
-1. **Authorizing after private data is loaded.** Permission filtering happens before protected Context, retrieval results, Worker payloads, Tool results, caches, or projections reach an unauthorized caller or model.
+1. **Authorizing after protected data is loaded.** Filter protected data before it reaches unauthorized Context, Tool results, Worker payloads, caches, or projections.
 
-2. **Treating Prompt text as a security boundary.** System prompts may guide behavior. They do not replace Ingress, Context, Tool, Agent Ops, or Delivery authorization gates.
+2. **Treating Prompt text as a security boundary.** Security must be enforced in code.
 
-3. **Creating a confused deputy.** QQ messages, external messages, email, webpages, documents, MCP results, Agent outputs, Worker outputs, and retrieved text are untrusted input. They cannot borrow broader Owner authority.
+3. **Creating a confused deputy.** External messages, webpages, documents, Tool results, Worker outputs, and retrieved text are untrusted input and cannot borrow broader Owner authority.
 
-4. **Letting actor permission imply delivery permission.** An Owner may be allowed to read owner-private data in a private context and still be forbidden from sending that data to a QQ group.
+4. **Letting actor permission imply delivery permission.** Reading a Resource does not automatically permit sending it to the current audience.
 
-5. **Letting stale authority survive.** A stale Conversation, cached UI permission, Pi Session, old Context, resumed Run, TaskAttempt, or previous approval must not preserve a revoked grant.
+5. **Letting stale authority survive.** A stale Conversation, Session, Run, TaskAttempt, approval, cache, or Worker state must not preserve revoked authority.
 
-6. **Exposing unrestricted shell or Herdr control through QQ.** P3 QQ execution uses explicit Tool allowlists. Generic `bash`, `powershell`, raw `pane.send_input`, arbitrary worktree removal, and unrelated worker reads must not become remote escape hatches.
+6. **Exposing unrestricted remote execution.** Do not make raw shell, arbitrary Herdr control, unrelated Worker reads, or destructive workspace operations reachable merely because a remote Channel can talk to the main Agent.
 
-7. **Treating Herdr `done` as Task acceptance.** Worker lifecycle is execution evidence. Only a Glassbox review / acceptance Action moves a reviewed Task to DONE.
+7. **Treating Worker `done` as Task acceptance.** Worker lifecycle is evidence. Task completion requires the Glassbox review / acceptance path.
 
-8. **Using Herdr as the Task database.** Workspace labels, pane state, plugin files, and worktree branches are not durable Glassbox Task truth.
+8. **Using Herdr as the Task database.** Workspace names, pane state, plugin state, and worktree branches are not durable Task truth.
 
-9. **Losing task truth during reconnect.** Herdr subscriptions do not replace snapshot reconciliation. A monitoring gap must not silently complete or fail work.
+9. **Losing Task truth during reconnect.** Reconcile live execution state against durable Glassbox state. Do not infer completion from a monitoring gap.
 
 10. **Escalating through delegation.** Delegation must satisfy:
 
@@ -333,25 +303,25 @@ Do not reuse one identifier for multiple concepts merely because the current imp
 worker_permissions ⊆ delegated_permissions ⊆ caller_permissions
 ```
 
-11. **Rewriting evidence.** Never alter Raw Trace, TaskAttempt history, or execution-relevant history so an old Run or attempt appears to have used newer state.
+11. **Rewriting evidence.** Preserve historical Raw Trace and TaskAttempt history.
 
-12. **Making Canvas the source of truth.** tldraw records are a view. Core Agent, Conversation, Permission, Task, Run, Trace, Memory, Skill, and Asset state must not depend on Canvas layout.
+12. **Making Canvas the source of truth.** Canvas remains a projection.
 
-13. **Designing for imaginary future systems.** Do not build roadmap features because they sound inevitable. The active plan decides implementation scope.
+13. **Designing for imaginary future systems.** The active Plan decides implementation scope.
 
-14. **Writing to live user state.** Never run tests, migrations, cleanup, fixtures, or test Agents against the user's real Personal Agent state, normal `~/.pi/agent`, real writable repositories, production QQ state, or production Herdr workspaces.
+14. **Writing tests into live user state.** Automated tests must use isolated, disposable state and must not mutate production QQ, Pi, Herdr, repositories, or Personal Agent data.
 
-15. **Doing a half toolchain migration.** `package.json`, lockfile, Vite, Vitest, and Vite+ must describe one coherent toolchain after migration.
+15. **Doing a half migration.** Toolchain, Runtime, persistence, or protocol migrations must leave one coherent working state.
 
-16. **Forking Pi too early.** Do not maintain a broad Pi fork for behavior that settings, packages, Skills, Extensions, custom Tools, ResourceLoader configuration, or the public SDK can implement.
+16. **Forking Pi too early.** Prefer supported settings, packages, Skills, Extensions, custom Tools, ResourceLoader, SDK surfaces, and upstream contributions before maintaining a local core patch.
 
-17. **Putting QQ transport into Lora PI Kit.** NapCat and OneBot application behavior belong to the Glassbox QQ Channel. Lora PI Kit owns Pi customization, not Channel transport or Glassbox authorization.
+17. **Putting product authority into Lora PI Kit or Herdr.** Glassbox remains the authority for identity, permissions, Task truth, durable product state, and evidence.
 
 ## Explicit execution semantics
 
 Edit freely. Execute explicitly.
 
-Only named Actions may change execution, Task, or authorization state.
+Only named Actions may change execution, Task, authorization, or durable product state.
 
 Examples include:
 
@@ -378,87 +348,56 @@ Promote Skill
 Promote Asset
 ```
 
-Layout changes, notes, grouping, arrows, Canvas movement, QQ text, Herdr focus changes, workspace renames, or model suggestions do not implicitly execute product Actions.
+Layout changes, notes, arrows, Canvas movement, QQ text, Herdr focus changes, workspace renames, and model suggestions do not implicitly execute product Actions.
 
-The UI and Channel behavior must make draft state, applied state, permission state, delivery state, Task state, review state, and running state truthful.
-
-If an execution-relevant value changes during a Run or TaskAttempt, preserve enough information to reconstruct what it started with and when the new value took effect.
+If execution-relevant state changes during a Run or TaskAttempt, preserve enough evidence to reconstruct what it started with and when the change took effect.
 
 ## Preserve evidence
 
 Raw Trace is evidence. Derived State is interpretation.
 
-Do not rewrite Raw Trace to match a newer UI model or reducer.
+Do not rewrite Raw Trace to match a newer UI model, reducer, policy, or schema.
 
-Authorization decisions, approvals, Share actions, delivery decisions, Task assignment, worker binding, worker lifecycle observations, review, rework, acceptance, delegation, Run lifecycle, and later learning promotion must remain traceable to underlying evidence.
+Do not treat a transient terminal screen, Worker status, or current UI state as the only durable record of a result.
 
-A denial record explains why access was denied without copying denied private contents.
-
-Context compression and Tool-result projection may reduce model-facing data later. They do not delete Raw Trace evidence.
-
-Herdr screen output is not by itself the canonical result of a TaskAttempt. Preserve the accepted result reference and relevant evidence separately.
-
-Measurements and judgments are different. Token counts, tool calls, duration, file changes, exit codes, QQ message ids, delivery attempts, reconnect counts, worker state transitions, and task durations are measurements. Review decisions, Eval scores, LLM judgments, and human review are judgments. Do not merge them into a fake universal score.
+Preserve accepted result references and the evidence needed to explain them.
 
 ## Check every affected path
 
-Before calling a change done, check the parts that apply.
+Before calling a change done, check the paths that apply:
 
-- **Identity.** Confirm who the QQ or Workbench caller resolves to and that identity binding does not grant permission by itself.
-- **Ingress.** Check self-message filtering, allowed identities, allowed groups, group activation, duplicate event handling, and whether denial happens before Pi invocation.
-- **Authorization.** Check allow, deny, approval, revoke, Share, stale-state, location, audience, Task, and worker-control paths.
-- **Context.** Verify denied Resource, Task result, or Worker output contents never enter Pi model-visible Context.
-- **Tools.** Protected Tool calls re-authorize immediately before execution. QQ profiles use an explicit Tool allowlist.
-- **Agent Operations.** Check Task truth separately from Herdr state. Verify AttentionItem, TaskAttempt, WorkerBinding, AgentOpsSnapshot, Ops Tools, and review/rework semantics.
-- **Herdr integration.** Use public protocol surfaces. For bootstrap/reconnect, subscribe and wait for acknowledgement before snapshot reconciliation. Do not infer Task completion from connection loss.
-- **Delivery.** Verify generated output can be sent to the actual audience. Actor read permission does not automatically permit group delivery.
-- **Conversation / Session / Run / Task.** Preserve the correct lifetime and identity for each. Group Conversation state must not erase the acting Principal. TaskAttempt history must survive rework.
-- **Persistence.** Decide what survives refresh, reconnect, restart, and database reopen. Restore current grants and Task state without restoring revoked authority or stale worker assumptions.
-- **QQ transport.** Check OneBot event parsing, private and group reply, mention activation, reconnect, dedupe, and self-message loop prevention.
-- **Pi SDK.** Use explicit `agentDir`, ResourceLoader, SessionManager, model runtime, Tool set, and subscriptions where the test or runtime boundary requires them.
-- **Lora PI Kit.** Keep Pi configuration, Extensions, Skills, prompts, presets, hooks, install, doctor, and compatibility metadata there. Do not move Glassbox product authority there.
-- **Trace.** Verify evidence is useful without leaking protected payloads or the private canary.
-- **Runtime behavior.** Define what happens when a Runtime does not support a capability and keep runtime-specific behavior inside its integration boundary.
-- **Contracts.** When cross-boundary state changes, check every producer and consumer.
-- **Canvas projection.** Check both Glassbox state and visible tldraw behavior where relevant.
-- **Reverse states.** Grant / Revoke, share / unshare, start / stop, assign / cancel, review / rework / accept, connect / reconnect, and similar paired states need explicit behavior.
-- **Toolchain.** Keep workspace config, package manifests, lockfile, test runner, lint, and format behavior coherent.
-- **Docs.** Update the active plan or stable docs when a settled boundary changes.
+- **Identity**: who does the caller resolve to?
+- **Authorization**: can this Principal perform this Action on this Resource here?
+- **Context**: did denied content stay out of model-visible Context?
+- **Tools / Ops**: was protected execution re-authorized at execution time?
+- **Delivery**: may this result go to this audience?
+- **Conversation / Session / Run / Task**: are lifetimes and identifiers still distinct?
+- **Persistence**: what survives reconnect, restart, and database reopen?
+- **Task / Worker state**: is durable Task truth separate from observed Worker lifecycle?
+- **Trace**: is the decision explainable without leaking protected payloads?
+- **Runtime / Host integration**: are runtime-specific details contained behind their integration boundary?
+- **Contracts**: did every producer and consumer move together?
+- **Reverse states**: do grant/revoke, share/unshare, start/stop, assign/cancel, review/rework/accept, connect/reconnect have explicit behavior?
+- **Tests**: did the behavior change receive focused coverage?
+- **Docs**: did a settled architecture boundary change? If yes, update the active Plan or relevant `docs/*.md`.
+
+Detailed checklists belong in the active Plan and the topic-specific docs, not in this file.
 
 ## Dev servers
 
-Document and run only commands that exist in the current repository.
+Use only commands and dependencies that actually exist in the repository.
 
-Glassbox has selected **Vite+** as the unified JavaScript / TypeScript toolchain direction. Read `docs/tech-stack.md` before changing it.
-
-The intended command surface after the verified migration is:
+Toolchain and local-development details live in:
 
 ```text
-vp install
-vp dev
-vp build
-vp check
-vp test
-vp run <task>
+docs/tech-stack.md
 ```
 
-Vite+ is expected to unify Vite / Rolldown, Vitest, Oxlint, Oxfmt, and workspace task execution.
+The production target is a Linux server.
 
-Playwright remains the browser / E2E layer.
+Local development must use the same product contracts intended for deployment. Do not make product correctness depend on a desktop GUI, machine-specific path, or Moshi.
 
-`apps/server` remains a Node.js runtime. Pi SDK runs inside that server boundary for Plan 03.
-
-Herdr is a separate local session server / process boundary. Keep its lifecycle independent from the Glassbox web dev server lifecycle unless the active task explicitly owns both.
-
-The production target is a Linux server. Local development must use the same Glassbox Task, WorkerBinding, HerdrBridge, reconciliation, authorization, and Trace contracts intended for that server.
-
-Do not make product correctness depend on a desktop GUI or Moshi. Moshi may later attach remotely over SSH as an operations client.
-
-Until the Vite+ dependency migration is actually verified and committed, inspect the repository scripts and use the commands that exist. Do not pretend planned commands are already repository reality.
-
-Do not introduce a second ESLint / Prettier / ad-hoc TypeScript check stack unless a demonstrated compatibility gap requires it.
-
-Do not hardcode localhost origins into client code. Development clients use relative `/api` and `/ws` boundaries through the dev server.
+Moshi may be used later as a remote human operations client. It is not product state or authority.
 
 Stop only processes you started or processes you verified belong to the current development instance.
 
@@ -466,181 +405,39 @@ Stop only processes you started or processes you verified belong to the current 
 
 Never use live Personal Agent state as writable automated-test state.
 
-Plan 03 has deterministic tests and real integration acceptance.
-
-The deterministic automated environment runs without real QQ accounts and without consuming paid model quota. It uses:
+Use isolated and disposable state for:
 
 ```text
-Fake OneBot Gateway
-Fake Owner
-Fake Visitor
-Fake Group
-Disposable Turso / SQLite database
-isolated Pi agentDir
-Lora PI Kit test preset
-recording or deterministic fake model/provider
-FakeHerdrBridge
-deterministic Herdr event fixtures
-synthetic protected resources
-Raw Trace capture
+Pi configuration and sessions
+Turso / SQLite test databases
+QQ / OneBot fixtures
+Herdr sessions and worktrees
+repositories
+credentials and secrets
+Trace fixtures
 ```
 
-Pi tests must not use the user's normal `~/.pi/agent`. Use explicit isolated configuration and session state.
+Most integration logic should be testable through fakes or deterministic fixtures. Use real external systems only when the protocol or real integration is the behavior under test.
 
-Herdr domain tests should not use the user's normal live workspaces. Use `FakeHerdrBridge` for most tests and a dedicated disposable Herdr session / repository for focused protocol integration.
-
-A disposable local test root may use this shape:
-
-```text
-.glassbox-test/
-  pi/
-    settings.json
-    models.json
-    skills/
-    extensions/
-    sessions/
-  db/
-    p3-test.db
-  fixtures/
-    users.json
-    groups.json
-    resources.json
-    onebot-events/
-    herdr-events/
-  worktrees/
-  traces/
-```
-
-The real acceptance environment uses dedicated test identities and disposable worker state:
-
-```text
-Bot QQ
-Owner QQ
-Visitor QQ
-Test QQ Group
-  Bot
-  Owner
-  Visitor
-Dedicated Herdr test session / workspace
-Disposable test repo / worktree
-At least one real supported coding Agent
-```
-
-Use isolated Glassbox state and isolated Pi configuration for real acceptance. Do not commit QQ credentials, NapCat session data, API keys, production secrets, or Herdr state containing private user work.
-
-For Plan 03, keep one deterministic fixture containing at least:
-
-```text
-one Agent
-Owner
-Visitor
-Bot ChannelIdentity
-Owner ChannelIdentity
-Visitor ChannelIdentity
-one direct Owner Conversation
-one direct Visitor Conversation
-one group Conversation
-one public Resource
-one Owner-private Resource
-one group-visible Resource
-one public Tool
-one Owner-only Tool
-AttentionItems
-Tasks in queued / running / review states
-TaskAttempts
-WorkerBindings
-Grant / Revoke
-restart
-message dedupe
-Herdr reconnect
-AuthorizationDecision + Run + Delivery + Task evidence
-```
-
-The Owner-private fixture contains a distinctive security canary such as:
-
-```text
-PRIVATE_CANARY_7F92A1
-```
-
-That value must never appear in unauthorized Pi Context, unauthorized Tool or Worker results, QQ output, unauthorized Trace projections, or denial messages.
-
-The same fixture may be reused by automated tests, local acceptance UI, examples, and later documentation demos.
-
-Reading or copying real data for debugging is acceptable when required. Write only to a safe copy.
-
-> Copy in. Never point in. Never write back.
-
-Use realistic fixtures when empty state or tiny mocks would hide the behavior being tested.
+The active Plan defines the current acceptance fixture and test matrix.
 
 ## Verifying
 
-Prove the change with the smallest useful check, then run the relevant P3 closed-loop checks before calling a slice complete.
+Prove the change with the smallest useful check, then run the relevant active-Plan checks before calling the slice complete.
 
-Behavior changes need focused tests for the behavior that changed.
+Behavior changes require focused tests for the behavior that changed.
 
-Plan 03 coverage should include the relevant subset of:
+Do not hide races with arbitrary sleeps when a real completion signal or state transition exists.
+
+Use browser-level verification when browser behavior is the thing being tested.
+
+Use real QQ, Herdr, Pi, or other external integrations only when the active Plan requires real integration acceptance.
+
+The exact current verification matrix lives in:
 
 ```text
-default deny
-explicit allow
-requires approval
-cross-user read
-private / public / group visibility
-identity spoof attempt
-identity binding does not grant authority
-revocation
-stale authorization state
-confused deputy
-protected Tool call
-QQ Tool allowlist
-generic shell blocked from QQ
-Ops Tool authorization
-unauthorized worker_read
-unauthorized worker_prompt
-approval replay
-Owner private delivery allowed
-Owner group private delivery denied
-Visitor private exfiltration attempt
-Visitor group exfiltration attempt
-prompt injection exfiltration attempt
-indirect Tool / Worker exfiltration attempt
-private canary non-leak
-message dedupe
-group message without activation
-self-message loop prevention
-NapCat reconnect
-restart and Conversation resume
-runtime session rebinding
-Task state persistence
-Herdr subscription bootstrap
-Herdr snapshot reconciliation
-worker working projection
-worker blocked attention
-worker done → review
-review accept
-review rework
-previous TaskAttempt preserved
-Herdr disconnect / reconnect
-worker replacement / disappearance
-denial Trace redaction
-delivery decision Trace
+.plans/03-personal-agent-foundation.md
 ```
-
-Persistence tests use disposable Turso or SQLite-compatible Turso databases.
-
-Pi SDK tests use isolated `agentDir`, controlled ResourceLoader, controlled SessionManager, explicit Tool sets, and a deterministic or recording model/provider when real model behavior is not the thing being tested.
-
-Agent Operations tests use `FakeHerdrBridge` by default and focused real Herdr integration only when protocol behavior is the thing being tested.
-
-Async tests wait on real completion signals or state transitions. Do not hide races with arbitrary sleeps when a real signal exists.
-
-Run browser-level verification when behavior depends on real tldraw interaction, selection, drag and drop, visual state, or browser APIs.
-
-Real QQ and Herdr acceptance are required for the P3 completion gate, but they are not the default unit-test path.
-
-After the Vite+ migration is complete, `vp check`, `vp test`, and `vp build` become the preferred broad toolchain checks. Before that migration lands, use the repository commands that actually exist.
-
-Do not launch unrelated browsers, providers, external processes, live QQ accounts, or broad live-provider suites unless the task requires them.
 
 ## Pull requests
 
@@ -650,65 +447,45 @@ Commit directly to `main` after a verified slice is complete unless the user req
 
 Keep one main concern per change.
 
-Use existing commit conventions. Do not invent a new convention inside one task.
-
-For user-visible UI, QQ Channel, or Agent Operations changes, include the smallest useful real verification when practical. A short recording is useful when motion, timing, reconnect, group activation, worker state, review/rework, or a multi-step interaction is the point of the change.
+Use existing commit conventions.
 
 Treat automated review findings as claims to verify against the source. Fix real issues; do not change code merely to satisfy an incorrect bot comment.
 
 ## How it works
 
-The Plan 03 trusted path is:
+The stable trusted shape is:
 
 ```text
-QQ / Workbench
-        ↓
-ChannelIdentity
-        ↓
-Ingress Gate
+Channel / Workbench
         ↓
 Identity Resolution
         ↓
-User → Principal + Conversation
+Principal + Conversation
         ↓
 Authorization
         ↓
 Authorized Context
         ↓
-Pi SDK + Lora PI Kit
-        ↓
-Authorized Tool Gate
+Personal Agent Runtime
         ↓
 Direct Run
    OR
-Task + Attention
-        ↓
-Authorized Ops Tool
-        ↓
-HerdrBridge
-        ↓
-Herdr worker / worktree / pane
-        ↓
-OpsReconciler
-        ↓
-TaskAttempt + WorkerBinding
+Authorized Task / Worker Delegation
         ↓
 Review / Rework / Accept
         ↓
-Delivery Gate
+Delivery Authorization
         ↓
-QQ / Workbench result
+Result
         ↓
-Raw Trace + Authorization + Delivery + Task Evidence
+Raw Trace + Product Evidence
         ↓
 Derived State
         ↓
-Memory / Skills / Assets / Journal
-        ↓
-Timeline / Canvas / Inspector
+Memory / Skills / Assets / Journal / Views
 ```
 
-Execution, Task, or authorization changes travel through explicit Actions:
+Execution, Task, authorization, and durable product changes travel through explicit Actions:
 
 ```text
 User / Agent intent
@@ -721,3 +498,5 @@ Runtime / Tool / Agent Ops / Persistence / Delivery
         ↓
 Evidence
 ```
+
+For the current concrete implementation path, read the active Plan and topic-specific docs from the index above.
