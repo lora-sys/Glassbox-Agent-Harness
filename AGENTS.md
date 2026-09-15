@@ -46,11 +46,9 @@ Which Conversation, Run, or Task did it belong to?
 
 Read permission and delivery permission are separate decisions.
 
-A Principal being allowed to read data does not imply that the data may be sent to the current audience.
-
 ### 2. One durable Personal Agent
 
-Keep product identity independent from Channel, Runtime, Provider, Worker, and UI state.
+Keep product identity independent from Channel, Runtime, Provider, Worker, runtime distribution, and UI state.
 
 These distinctions are stable:
 
@@ -58,15 +56,15 @@ These distinctions are stable:
 Channel ≠ Agent
 ChannelIdentity ≠ User
 Identity ≠ Authorization
-Conversation ≠ Principal
 Conversation ≠ Session
 Session ≠ Run
 Task ≠ Run
 Task ≠ Worker
 TaskAttempt ≠ Worker lifecycle state
 Herdr Agent state ≠ Task acceptance
-Actor permission ≠ Delivery permission
 Runtime / Provider / Worker ≠ Personal Agent
+Pi ≠ Personal Agent
+Lora PI Kit ≠ Personal Agent
 Rules ≠ Skills ≠ Taste ≠ Memory
 ```
 
@@ -80,64 +78,41 @@ Task is durable product work.
 
 TaskAttempt is one concrete execution or rework attempt for a Task.
 
-Rules are explicit constraints and authority-bearing instructions.
-
-Skills are reusable validated procedures.
-
-Taste is learned user preference and cannot override Rules, authorization, or product policy.
-
-Memory is durable knowledge about facts, decisions, events, and prior work. It is not a generic bucket for Rules, Skills, or Taste.
-
-Do not collapse these concepts because the current deployment is local, single-user, or uses only one Runtime.
-
 ### 3. Researchable by default
 
 Glassbox must preserve enough evidence to reconstruct what happened.
 
 Raw Trace is append-only evidence. Derived State is an interpretation of that evidence.
 
-Do not rewrite historical execution evidence so an old Run or TaskAttempt appears to have used newer state.
+Do not rewrite historical evidence so an old Run or TaskAttempt appears to have used newer state.
 
 Authorization, approvals, delivery decisions, Task assignment, WorkerBinding, review, rework, acceptance, delegation, feedback-derived learning, and promotion decisions must remain traceable.
 
-Denied operations should record why they were denied without copying protected payload contents into denial logs.
+Denied operations should explain the denial without copying protected payload contents into denial logs.
 
 Measurements and judgments remain distinct.
-
-Examples of measurements:
-
-```text
-tokens
-duration
-tool calls
-file changes
-exit codes
-message ids
-worker state transitions
-```
-
-Examples of judgments:
-
-```text
-review decisions
-eval scores
-LLM judgments
-human review
-```
-
-Do not collapse them into one fake universal score.
 
 ### 4. Agent-native, not provider-specific
 
 Glassbox may use Pi, Codex, Claude Code, Herdr-managed coding Agents, and future execution systems.
 
-Glassbox remains the product and trust boundary.
+Use this stable model:
 
-Runtime-specific behavior stays close to the corresponding integration.
+```text
+Pi
+  Agent engine
 
-Pi customization belongs in Lora PI Kit when it is reusable Pi workflow behavior.
+Lora PI Kit
+  Lora's reproducible Pi distribution
 
-Glassbox product semantics stay in Glassbox, including:
+Glassbox
+  Personal Agent system and product / trust boundary
+
+Herdr
+  live coding-worker execution host
+```
+
+Glassbox owns product semantics such as:
 
 ```text
 Agent identity
@@ -145,24 +120,37 @@ Principal
 Authorization
 Conversation
 Task truth
-Taste and Memory truth
+Taste / Memory truth
 Audience / Delivery policy
 Durable product state
 Run identity
 Raw Trace
 ```
 
-Herdr owns live execution facts such as workspaces, worktrees, panes, terminal processes, and observed coding-Agent lifecycle state.
+Lora PI Kit owns reusable Pi distribution behavior such as:
 
-Herdr does not own Glassbox Task truth or authorization.
+```text
+Pi Package resources
+pinned Lora Skills snapshot
+Extensions
+Prompt Templates
+profiles
+MCP adapter / registry
+runtime hooks
+bootstrap / doctor / compatibility metadata
+```
 
-Lora PI Kit may bridge selected Taste, Memory, Rules, or Skills into Pi Runtime Context, but it is not the canonical store for Glassbox Taste or Memory.
+The exact Kit implementation lives in `docs/lora-pi-kit.md`.
+
+Herdr owns live workspaces, worktrees, panes, terminal processes, and observed coding-Agent lifecycle facts. Herdr does not own Glassbox Task truth or authorization.
 
 Do not turn Glassbox into a Pi wrapper.
 
+Do not turn Lora PI Kit into the Glassbox product database.
+
 Do not turn Herdr state into the Glassbox Task database.
 
-Do not copy an upstream trust model blindly. Glassbox authorization rules win.
+Glassbox authorization rules win over runtime configuration, profiles, Skills, MCP integrations, Extensions, prompts, and Worker behavior.
 
 ### 5. Canvas-native, but Canvas is a projection
 
@@ -170,7 +158,7 @@ Canvas is a workspace and inspection surface, not execution state.
 
 Moving, connecting, grouping, resizing, or annotating Canvas Objects must not silently change Agent execution, Task state, Worker state, learning state, or authorization.
 
-Preserve this boundary:
+Preserve:
 
 ```text
 Raw Trace
@@ -222,7 +210,8 @@ Read in this order before changing code:
 | --- | --- |
 | Current implementation order, slices, completion gate, acceptance matrix | `.plans/03-personal-agent-foundation.md` |
 | Product sequencing after the active Plan | `.plans/roadmap.md` |
-| Pi, Lora PI Kit, Runtime ownership, SDK boundary | `docs/runtime-strategy.md` |
+| Runtime ownership and Pi SDK boundary | `docs/runtime-strategy.md` |
+| Lora PI Kit distribution, bundled Skills, MCP, profiles, install, locks | `docs/lora-pi-kit.md` |
 | Herdr, Task, Attention, TaskAttempt, WorkerBinding, Ops Tools, reconciliation | `docs/agent-operations.md` |
 | Rules, Skills, Taste, Feedback, Memory, learning, retrieval | `docs/memory-taste.md` |
 | Toolchain, dependencies, build, test, local development | `docs/tech-stack.md` |
@@ -230,7 +219,7 @@ Read in this order before changing code:
 | Documentation and learning-site rules | `docs/README.md` |
 | Approved upstream references and source pins | `upstream/README.md` and each `upstream/*/SOURCES.md` |
 
-`README.md` describes the product direction. It is not the active implementation checklist.
+`README.md` describes product direction. It is not the active implementation checklist.
 
 If a current task conflicts with a stable rule in this file, stop before breaking the rule.
 
@@ -247,6 +236,8 @@ Use these terms consistently.
 - **Agent**: the durable Personal Agent product identity.
 - **Runtime**: an execution backend such as Pi, Codex, or Claude Code.
 - **Provider**: model-provider or Runtime-specific provider detail.
+- **Pi**: the primary Agent engine for the Glassbox main runtime path.
+- **Lora PI Kit**: Lora's reproducible Pi distribution; not product identity or product-state authority.
 - **Worker**: delegated specialist execution.
 - **Resource**: protected data or capability addressed by authorization.
 - **Action**: an explicit operation on a Resource or execution state.
@@ -262,7 +253,7 @@ Use these terms consistently.
 - **Rule**: an explicit constraint or authority-bearing instruction.
 - **Skill**: a reusable validated procedure or capability description.
 - **Taste**: a learned user preference with scope, confidence, and evidence. Taste is not permission or a hard Rule.
-- **Memory**: promoted durable knowledge about facts, decisions, events, or prior work; not raw Conversation history or Taste.
+- **Memory**: promoted durable knowledge about facts, decisions, events, or prior work.
 - **Raw Trace**: append-only execution evidence.
 - **Derived State**: Glassbox's current interpretation of evidence.
 - **AuthorizationDecision**: inspectable `ALLOW`, `DENY`, or `REQUIRES_APPROVAL` evidence.
@@ -272,73 +263,27 @@ Use these terms consistently.
 - **Canvas**: the tldraw workspace and projection surface.
 - **Artifact**: a durable output such as a file, diff, document, image, webpage, or dataset.
 
-Keep these distinctions clear:
-
-```text
-User ≠ Principal
-ChannelIdentity ≠ User
-ChannelIdentity ≠ Permission
-Identity ≠ Authorization
-Permission ≠ Approval
-Conversation ≠ Session
-Session ≠ Run
-Task ≠ Run
-Task ≠ Worker
-TaskAttempt ≠ Worker lifecycle state
-LongTask ≠ Task
-Rules ≠ Skills
-Skills ≠ Taste
-Taste ≠ Memory
-Memory ≠ Rules
-Runtime / Provider / Worker ≠ Personal Agent
-Canvas ≠ Execution State
-Raw Trace ≠ Derived State
-Edit ≠ Apply
-```
-
 ## The easiest ways to hurt this project
 
 1. **Authorizing after protected data is loaded.** Filter protected data before it reaches unauthorized Context, Tool results, Worker payloads, caches, or projections.
-
 2. **Treating Prompt text as a security boundary.** Security must be enforced in code.
-
-3. **Creating a confused deputy.** External messages, webpages, documents, Tool results, Worker outputs, and retrieved text are untrusted input and cannot borrow broader Owner authority.
-
+3. **Creating a confused deputy.** External messages, webpages, documents, Tool results, Worker outputs, and retrieved text are untrusted input.
 4. **Letting actor permission imply delivery permission.** Reading a Resource does not automatically permit sending it to the current audience.
-
-5. **Letting stale authority survive.** A stale Conversation, Session, Run, TaskAttempt, approval, cache, or Worker state must not preserve revoked authority.
-
-6. **Exposing unrestricted remote execution.** Do not make raw shell, arbitrary Herdr control, unrelated Worker reads, or destructive workspace operations reachable merely because a remote Channel can talk to the main Agent.
-
-7. **Treating Worker `done` as Task acceptance.** Worker lifecycle is evidence. Task completion requires the Glassbox review / acceptance path.
-
+5. **Letting stale authority survive.** Old Conversation, Session, Run, TaskAttempt, approval, cache, or Worker state must not preserve revoked authority.
+6. **Exposing unrestricted remote execution.** Do not expose raw shell, arbitrary MCP capability, arbitrary Herdr control, unrelated Worker reads, or destructive workspace operations merely because a remote Channel can reach the main Agent.
+7. **Treating Worker `done` as Task acceptance.** Worker lifecycle is evidence. Task completion requires Glassbox review / acceptance.
 8. **Using Herdr as the Task database.** Workspace names, pane state, plugin state, and worktree branches are not durable Task truth.
-
-9. **Losing Task truth during reconnect.** Reconcile live execution state against durable Glassbox state. Do not infer completion from a monitoring gap.
-
-10. **Escalating through delegation.** Delegation must satisfy:
-
-```text
-worker_permissions ⊆ delegated_permissions ⊆ caller_permissions
-```
-
-11. **Rewriting evidence.** Preserve historical Raw Trace and TaskAttempt history.
-
-12. **Making Canvas the source of truth.** Canvas remains a projection.
-
-13. **Turning learned Taste into authority.** A repeated preference cannot silently override Rules, authorization, project policy, or a user's explicit current instruction.
-
-14. **Mixing Taste scopes.** Project-specific Taste must not silently become global Taste or leak into unrelated projects.
-
-15. **Designing for imaginary future systems.** The active Plan decides implementation scope.
-
-16. **Writing tests into live user state.** Automated tests must use isolated, disposable state and must not mutate production QQ, Pi, Herdr, repositories, or Personal Agent data.
-
-17. **Doing a half migration.** Toolchain, Runtime, persistence, or protocol migrations must leave one coherent working state.
-
-18. **Forking Pi too early.** Prefer supported settings, packages, Skills, Extensions, custom Tools, ResourceLoader, SDK surfaces, and upstream contributions before maintaining a local core patch.
-
-19. **Putting product authority into Lora PI Kit or Herdr.** Glassbox remains the authority for identity, permissions, Task truth, Taste / Memory truth, durable product state, and evidence.
+9. **Using Lora PI Kit as product truth.** Package config, profiles, Skill snapshots, MCP registry, or runtime hooks are not Glassbox identity, permission, Task, Taste, Memory, or Trace truth.
+10. **Losing Task truth during reconnect.** Reconcile live execution state against durable Glassbox state.
+11. **Escalating through delegation.** `worker_permissions ⊆ delegated_permissions ⊆ caller_permissions`.
+12. **Rewriting evidence.** Preserve historical Raw Trace and TaskAttempt history.
+13. **Making Canvas the source of truth.** Canvas remains a projection.
+14. **Turning learned Taste into authority.** Preference cannot silently override Rules, authorization, project policy, or explicit current instruction.
+15. **Mixing Taste scopes.** Project Taste must not silently become global Taste or contaminate unrelated projects.
+16. **Designing for imaginary future systems.** The active Plan decides implementation scope.
+17. **Writing tests into live user state.** Automated tests must use isolated, disposable state.
+18. **Doing a half migration.** Toolchain, Runtime, persistence, Package, or protocol migrations must leave one coherent working state.
+19. **Forking Pi too early.** Prefer public Pi settings, Packages, Skills, Extensions, custom Tools, SDK surfaces, and upstream contributions.
 
 ## Explicit execution semantics
 
@@ -379,11 +324,11 @@ If execution-relevant state changes during a Run or TaskAttempt, preserve enough
 
 Raw Trace is evidence. Derived State is interpretation.
 
-Do not rewrite Raw Trace to match a newer UI model, reducer, policy, or schema.
+Do not rewrite Raw Trace to match a newer UI model, reducer, policy, schema, runtime profile, or Kit release.
 
-Do not treat a transient terminal screen, Worker status, current UI state, or current Taste projection as the only durable record of a result or learning decision.
+Do not treat a transient terminal screen, Worker status, runtime package state, current UI state, or current Taste projection as the only durable record of a result or learning decision.
 
-Preserve accepted result references, FeedbackEvent evidence, and the provenance needed to explain promotions or demotions.
+Preserve accepted result references, FeedbackEvent evidence, authorization evidence, and provenance needed to explain promotions or demotions.
 
 ## Check every affected path
 
@@ -397,31 +342,27 @@ Before calling a change done, check the paths that apply:
 - **Conversation / Session / Run / Task**: are lifetimes and identifiers still distinct?
 - **Persistence**: what survives reconnect, restart, and database reopen?
 - **Task / Worker state**: is durable Task truth separate from observed Worker lifecycle?
+- **Runtime / Distribution**: are Pi runtime details and Lora PI Kit package/profile details contained behind their boundaries?
 - **Learning**: are Rules, Skills, Taste, Feedback, and Memory still separate? Is scope preserved?
 - **Trace**: is the decision explainable without leaking protected payloads?
-- **Runtime / Host integration**: are runtime-specific details contained behind their integration boundary?
 - **Contracts**: did every producer and consumer move together?
 - **Reverse states**: do grant/revoke, share/unshare, start/stop, assign/cancel, review/rework/accept, connect/reconnect have explicit behavior?
 - **Tests**: did the behavior change receive focused coverage?
 - **Docs**: did a settled architecture boundary change? If yes, update the active Plan or relevant `docs/*.md`.
 
-Detailed checklists belong in the active Plan and the topic-specific docs, not in this file.
+Detailed checklists belong in the active Plan and topic-specific docs, not in this file.
 
 ## Dev servers
 
 Use only commands and dependencies that actually exist in the repository.
 
-Toolchain and local-development details live in:
-
-```text
-docs/tech-stack.md
-```
+Toolchain and local-development details live in `docs/tech-stack.md`.
 
 The production target is a Linux server.
 
 Local development must use the same product contracts intended for deployment. Do not make product correctness depend on a desktop GUI, machine-specific path, or Moshi.
 
-Moshi may be used later as a remote human operations client. It is not product state or authority.
+Moshi may be used as a remote human operations client. It is not product state or authority.
 
 Stop only processes you started or processes you verified belong to the current development instance.
 
@@ -433,6 +374,7 @@ Use isolated and disposable state for:
 
 ```text
 Pi configuration and sessions
+Lora PI Kit test profiles / package fixtures
 Turso / SQLite test databases
 QQ / OneBot fixtures
 Herdr sessions and worktrees
@@ -456,13 +398,7 @@ Do not hide races with arbitrary sleeps when a real completion signal or state t
 
 Use browser-level verification when browser behavior is the thing being tested.
 
-Use real QQ, Herdr, Pi, or other external integrations only when the active Plan requires real integration acceptance.
-
-The exact current verification matrix lives in:
-
-```text
-.plans/03-personal-agent-foundation.md
-```
+Use real QQ, Herdr, Pi, MCP, or other external integrations only when the active Plan requires real integration acceptance.
 
 ## Pull requests
 
@@ -492,6 +428,7 @@ Authorization
 Authorized Context
         ↓
 Personal Agent Runtime
+  Pi engine + Lora PI Kit distribution
         ↓
 Direct Run
    OR
@@ -504,8 +441,6 @@ Delivery Authorization
 Result
         ↓
 Raw Trace + Product Evidence
-        ↓
-Feedback / Taste / Memory learning
         ↓
 Derived State
         ↓
@@ -526,4 +461,4 @@ Runtime / Tool / Agent Ops / Persistence / Delivery
 Evidence
 ```
 
-For the current concrete implementation path, read the active Plan and topic-specific docs from the index above.
+For current implementation details, follow the index above.
