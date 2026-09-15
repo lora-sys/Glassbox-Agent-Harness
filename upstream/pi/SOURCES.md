@@ -8,13 +8,13 @@ Upstream branch at review time: `main`
 
 License: MIT.
 
-Pi is the primary upstream reference for the future Glassbox local Agent runtime path. Glassbox does not import production code from this directory.
+Pi is the primary runtime reference for the active Glassbox Personal Agent path. Glassbox does not import production code from this directory.
 
 ## Why it matters
 
 Glassbox needs a runtime foundation that can stay small while allowing owned customization outside the core runtime.
 
-Pi already provides the boundaries needed for that direction:
+Pi provides the boundaries needed for the active P3 path:
 
 ```text
 runtime and Agent loop
@@ -28,7 +28,9 @@ SDK
 RPC
 ```
 
-The intended ownership model is:
+Plan 03 chooses the public SDK as the primary integration boundary.
+
+The ownership model is:
 
 ```text
 earendil-works/pi
@@ -37,10 +39,13 @@ earendil-works/pi
 Lora PI Kit
       |
       v
+Pi SDK integration inside Glassbox
+      |
+      v
 Glassbox Runtime Boundary
 ```
 
-Glassbox keeps product identity, authorization, durable Conversation state, persistence, and Trace outside Pi.
+Glassbox keeps product identity, authorization, QQ Channel identity, durable Conversation state, persistence, audience policy, and Trace outside Pi.
 
 ## Source paths to consult
 
@@ -48,14 +53,15 @@ Glassbox keeps product identity, authorization, durable Conversation state, pers
 | --- | --- |
 | `packages/coding-agent/README.md` | CLI modes, package install behavior, SDK entry point, general runtime surface |
 | `packages/coding-agent/docs/packages.md` | Pi package structure, install sources, project scope, resource filtering |
-| `packages/coding-agent/docs/extensions.md` | Extension lifecycle, tools, commands, events, tool-call interception, UI hooks |
+| `packages/coding-agent/docs/extensions.md` | Extension lifecycle, tools, commands, events, tool-call interception, blocking |
 | `packages/coding-agent/docs/skills.md` | Agent Skill discovery and loading |
 | `packages/coding-agent/docs/settings.md` | Global and project configuration, trust behavior, package loading |
-| `packages/coding-agent/docs/sdk.md` | Programmatic embedding boundary for a Glassbox runtime adapter |
-| `packages/coding-agent/docs/rpc.md` | Process boundary for running Pi behind Glassbox without importing internal implementation |
+| `packages/coding-agent/docs/sdk.md` | Primary Glassbox embedding boundary, sessions, ResourceLoader, custom Tools, events |
+| `packages/coding-agent/docs/rpc.md` | Secondary process boundary, not the primary P3 integration |
 | `packages/coding-agent/docs/models.md` | Model and provider configuration |
 | `packages/coding-agent/src/index.ts` | Public coding-agent exports and supported integration surface |
-| `packages/agent/` | Lower-level Agent loop primitives when the public coding-agent boundary is insufficient |
+| `packages/agent/` | Lower-level Agent loop primitives only when the public coding-agent boundary is insufficient |
+| `packages/coding-agent/examples/extensions/permission-gate.ts` | Example of blocking a Tool call before execution |
 
 Read public docs and exports before reaching into internal source modules.
 
@@ -63,19 +69,20 @@ Read public docs and exports before reaching into internal source modules.
 
 Lora PI Kit is not vendored upstream code. It is the maintainer-owned Pi distribution and workflow layer.
 
-Its intended resources include:
+Its P3 MVP includes only what the QQ closed loop needs:
 
 ```text
-extensions/
-skills or selected skill installation
-prompts/
-themes when needed
+package manifest
+extensions
+selected Skill installation
+prompts
 runtime presets
+model/settings templates
 bootstrap and doctor scripts
-compatibility metadata
+Pi compatibility metadata
 ```
 
-Pi packages currently provide a first-class distribution mechanism for extensions, skills, prompt templates, and themes. Use that mechanism rather than copying Pi core into the kit.
+Pi packages provide a first-class distribution mechanism for extensions, skills, prompt templates, and themes. Use that mechanism rather than copying Pi core into the kit.
 
 Project and global settings remain Pi configuration. Lora PI Kit should bootstrap or generate them rather than pretending package resources and settings are the same thing.
 
@@ -83,22 +90,33 @@ The existing `lora-sys/skills` repository remains the canonical source for reusa
 
 ## Glassbox integration boundary
 
-The first production Pi integration should use a supported public boundary such as SDK or RPC.
+Plan 03 embeds Pi through `@earendil-works/pi-coding-agent` inside the Glassbox Node.js server.
 
 Target shape:
 
 ```text
-Glassbox
-  authorization
-  Conversation
-  Run
-  Trace
+QQ / Workbench
       |
       v
-Pi Runtime Adapter
+Glassbox
+  Ingress Gate
+  Identity
+  Conversation
+  Context Gate
+  Authorization
+  Run / Trace
+      |
+      v
+Pi SDK Runtime Adapter
       |
       v
 Pi + Lora PI Kit
+      |
+      v
+Tool Gate
+      |
+      v
+Glassbox Delivery Gate
 ```
 
 Do not make Pi session state the durable Glassbox Conversation model.
@@ -107,7 +125,9 @@ Do not make Pi project trust or extension permissions replace Glassbox authoriza
 
 Do not let an extension widen the current Principal's effective authority.
 
-## Extension first
+The Pi extension layer may enforce Tool-call blocking, but the authorization decision itself comes from Glassbox.
+
+## SDK first
 
 Before changing Pi core, check whether the requirement can be implemented with:
 
@@ -116,13 +136,23 @@ settings
 package configuration
 Skill
 Extension
+custom Tool
 SDK
-RPC
 ```
 
-Only keep a local Pi patch when a concrete requirement cannot be implemented through those supported boundaries. Record the reason and add a compatibility test before adopting the patch.
+RPC remains useful for other integrations but is not the primary Plan 03 path.
+
+Only keep a local Pi patch when a concrete tested requirement cannot be implemented through supported public boundaries. Record the reason and add a compatibility test before adopting the patch.
 
 Prefer contributing a generally useful fix upstream over maintaining a permanent fork.
+
+## P3 Tool rule
+
+The QQ runtime uses an explicit Tool allowlist.
+
+Do not expose unrestricted `bash` or `powershell` through the remote QQ profile. Remote Tools should have explicit resource and action semantics so the Glassbox Authorization Engine can evaluate them before execution.
+
+Pi's `tool_call` blocking mechanism is suitable as an enforcement bridge for P3, but Glassbox remains the policy authority.
 
 ## Other upstream references
 
@@ -132,7 +162,10 @@ Use the narrowest useful source for each problem:
 
 ```text
 Pi
-  runtime foundation and extension model
+  runtime foundation, SDK, package and extension model
+
+NapCat / OneBot
+  QQ transport
 
 T3 Code
   Claude Code protocol and permission integration patterns
@@ -141,10 +174,10 @@ OpenHarness
   channel, tool, skill, and harness patterns
 
 OpenSquilla
-  context, retrieval, routing, and token efficiency
+  later context, retrieval, routing, and token efficiency
 
 Token Monitor
-  local runtime usage, quota, health, and discovery collectors
+  runtime usage, quota, health, and discovery collectors
 
 AGY
   delegated worker and background job behavior
@@ -157,7 +190,7 @@ A useful mechanism may land in Lora PI Kit or in Glassbox. The ownership test is
 
 ```text
 Pi workflow customization -> Lora PI Kit
-Glassbox product semantics or trust boundary -> Glassbox
+Glassbox identity, authorization, Channel, Conversation, audience, durable state or evidence -> Glassbox
 ```
 
 ## Vendoring rule
@@ -177,14 +210,17 @@ Production code must not import directly from `upstream/pi/`.
 
 ## Current phase boundary
 
-Plan 03 remains unchanged:
+Plan 03 actively implements:
 
 ```text
-Identity
--> Authorization
--> Conversation
--> Turso persistence
--> Run and Authorization Trace
+Deterministic test environment
+-> Lora PI Kit MVP
+-> Pi SDK runtime integration
+-> hard authorization gates
+-> scope-based Conversation + Turso
+-> NapCat / OneBot QQ private and group Channel
+-> restart / dedupe / reconnect / Trace
+-> real QQ acceptance
 ```
 
-Adding Pi as the primary runtime reference does not make Pi migration a Plan 03 dependency.
+Pi SDK integration is therefore a Plan 03 dependency. Broad Pi core modification is not.
