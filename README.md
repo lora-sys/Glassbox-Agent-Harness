@@ -4,91 +4,181 @@
 
 Glassbox 是一个正在演进中的 Personal Agent 工作台。
 
-目标是让你拥有一个长期存在的 Agent。你在 Workbench 里管理它、使用它、检查它做过什么、为什么这样做、学到了什么。以后其他人可以通过微信、QQ 等渠道访问这个 Agent，但只能看到和使用你明确授权的部分。
+目标是让你拥有一个长期存在的 Agent。你在 Workbench 或 QQ 里使用它，也可以检查它做过什么、为什么这样做、用了什么权限和数据。其他人可以访问同一个 Agent，但只能看到和使用被明确授权的部分。
 
 **权限是第一原则。** Channel 只是入口，Canvas 只是工作视图。真正的核心是 Agent Runtime、Identity、Authorization、Conversation、Memory、LongTask、Trace、Eval 和持续沉淀的个人资产。
 
-> 当前代码仍然主要是本地 Coding Agent Harness。README 会明确区分已经实现的能力和目标架构，不把未来功能写成现状。
+> 当前仓库正在把已有 Coding Agent Harness 收口成第一个真实可用的 Personal Agent 闭环。README 会区分已经实现的能力和当前正在实现的能力。
 
 ## 当前开发阶段
 
-当前唯一 Active Plan：[`Plan 03 — Personal Agent Foundation`](./.plans/03-personal-agent-foundation.md)
+当前唯一 Active Plan：[`Plan 03 — QQ Personal Agent Closed Loop`](./.plans/03-personal-agent-foundation.md)
 
-长期阶段顺序记录在 [`.plans/roadmap.md`](./.plans/roadmap.md)。文档站与交互式学习规范记录在 [`docs/`](./docs/README.md)。Runtime 的长期边界记录在 [`docs/runtime-strategy.md`](./docs/runtime-strategy.md)。这些都不是当前 P3 的额外实现要求。
+开发顺序以 [`AGENTS.md`](./AGENTS.md) 和当前 P3 Plan 为准。长期阶段顺序记录在 [`.plans/roadmap.md`](./.plans/roadmap.md)。Runtime 边界记录在 [`docs/runtime-strategy.md`](./docs/runtime-strategy.md)。
 
-![Plan 03：身份、权限、会话、持久化与执行证据闭环](./assets/readme/glassbox-p3-architecture.png)
-
-这一阶段只做地基：
+P3 不是只做底层模块。P3 结束时必须得到第一个真实可用闭环：
 
 ```text
-Identity
+测试环境
   ↓
+Lora PI Kit MVP
+  ↓
+Pi SDK Runtime
+  ↓
+Identity + Authorization
+  ↓
+Conversation + Turso
+  ↓
+NapCat / OneBot QQ Channel
+  ↓
+QQ 私聊 + 群聊
+  ↓
+Trace + 重启恢复 + 去重 + 重连
+  ↓
+真实 QQ 验收
+```
+
+P3 的验收目标：
+
+> 真实 Owner 和 Visitor 可以通过 QQ 私聊和测试群使用同一个 Glassbox Personal Agent。底层由 Pi SDK + Lora PI Kit 执行。Ingress、Context、Tool、Delivery 四道服务端硬权限阀门生效。未授权数据不能进入 Pi，受保护 Tool 不能绕过权限执行，私人结果不能发到未授权群聊，Conversation 重启后可恢复，重复 QQ 事件不会重复回复，每一次 Allow、Deny、Tool 和 Delivery 决策都能从 Trace 解释。
+
+## 当前闭环
+
+```text
+QQ 私聊 / 群聊
+       ↓
+     NapCat
+       ↓
+    OneBot 11
+       ↓
+Glassbox QQ Channel
+       ↓
+   Ingress Gate
+       ↓
+Identity Resolution
+       ↓
+Conversation Resolver
+       ↓
+Authorization Engine
+       ↓
+   Context Gate
+       ↓
+Authorized Context
+       ↓
+Pi SDK + Lora PI Kit
+       ↓
+    Tool Gate
+       ↓
+      Run
+       ↓
+  Delivery Gate
+       ↓
+     NapCat
+       ↓
+    QQ 回复
+       ↓
+Turso + Raw Trace
+```
+
+QQ Bot、Workbench 和以后其他 Channel 都只是同一个 Personal Agent 的入口，不是不同 Agent。
+
+Pi、Codex、Claude Code、AGY 等属于 Runtime、Provider 或 Worker 能力，也不是产品身份本身。
+
+## Runtime strategy
+
+Pi 是当前 Personal Agent 主 Runtime 路线，不再只是未来参考。
+
+Glassbox 直接通过 `@earendil-works/pi-coding-agent` SDK 嵌入 Pi：
+
+```text
+earendil-works/pi
+      ↓
+Lora PI Kit
+      ↓
+Pi SDK
+      ↓
+Glassbox Runtime Boundary
+```
+
+Lora PI Kit 单独维护，负责：
+
+```text
+Pi Extensions
+Pi package manifest
+selected Skills
+prompts
+presets
+model / thinking profiles
+trace / usage hooks
+install / doctor / sync scripts
+Pi compatibility metadata
+```
+
+`lora-sys/skills` 继续作为可复用 Agent Skills 的来源。Lora PI Kit 负责选择和安装，不默认复制一套 Skill 源码。
+
+Glassbox 负责：
+
+```text
+Agent identity
+Principal
+Channel identity
 Authorization
-  ↓
 Conversation
-  ↓
-Turso persistence
-  ↓
-Run / Authorization Trace
+Turso state
+Run
+Audience / Delivery policy
+Raw Trace
 ```
 
-完成 Plan 03 之前，不抢跑真实微信、QQ、Mail、Calendar、Memory 自动沉淀、Skill evolution、AGY、LongTask、Eval、Arena、智能路由、完整向量检索或 Runtime 大迁移。
+NapCat 和 OneBot Transport 也属于 Glassbox Channel 层，不放进 Lora PI Kit。
 
-这一阶段的验收标准很直接：
-
-> 同一个 Agent 可以同时服务 Owner 和 Visitor。两个人的 Conversation 可以持久恢复。公开资源两个人都能用，Owner 私有资源 Visitor 永远拿不到，并且每一次 Allow、Deny、Approval 都可以在 Trace 里解释。
-
-## 产品目标
-
-目标系统只有一个长期存在的 Personal Agent。
+改 Pi 时遵循：
 
 ```text
-Workbench / 微信 / QQ / Email
-             │
-             ▼
-      Identity Resolution
-             │
-             ▼
-        Authorization
-             │
-             ▼
-   Conversation + Personal Agent
-             │
-    ┌────────┼────────┐
-    │        │        │
-  Tools    Runtime  LongTask
-    │        │
-    │      Pi + Lora PI Kit
-    │      Codex / Claude Code / AGY
-    │
-    └────────┼───────────────┐
-             ▼               │
-            Run              │
-             ▼               │
-      Raw Trace / Evidence   │
-             ▼               │
-      Experience Mining ◀────┘
-             ▼
-   Memory / Skills / Assets
-             ▼
- Journal / Review / Eval
+settings / project config
+→ Pi package
+→ Skill
+→ Extension
+→ custom Tool
+→ Pi SDK
+→ upstream contribution
+→ 最后才考虑小范围 core patch
 ```
 
-微信 Bot、QQ Bot、Workbench 都只是入口，不是不同 Agent。
+P3 不以 RPC 作为主要 Pi 接入方式。Codex 和 Claude Code 继续保留，作为兼容路径、Fallback、专业执行能力和 Differential Eval 对照。
 
-Pi、Codex、Claude Code、AGY 等属于 Runtime、Provider 或 Worker 能力，也不是产品身份本身。Pi 是未来本地 Agent Runtime 的首选上游底座，Lora PI Kit 是独立维护的 Pi 配置与扩展层。Glassbox 仍然负责产品身份、权限、Conversation、持久化和 Trace。
+完整规则见 [`docs/runtime-strategy.md`](./docs/runtime-strategy.md)，Pi 上游索引见 [`upstream/pi/SOURCES.md`](./upstream/pi/SOURCES.md)。
 
 ## 权限是 P0
 
-Personal Agent 对外开放以后，最危险的问题不是答错，而是越权。
+权限不能靠 Prompt。
 
-所有受保护操作都要先落到：
+每一次受保护操作必须能回答：
 
 ```text
-Principal × Resource × Action × Context → Decision
+Who
+  谁在操作
+
+Where
+  在哪个 Channel、私聊或群聊、哪个 Conversation
+
+What
+  要执行什么 Action
+
+How
+  通过哪个 Runtime、Tool、Operation
+
+Resource
+  涉及哪个受保护资源
+
+Audience
+  结果准备发给谁
+
+Conversation / Run
+  属于哪一次会话和执行
 ```
 
-Decision 只有：
+Authorization 只有：
 
 ```text
 ALLOW
@@ -98,19 +188,168 @@ REQUIRES_APPROVAL
 
 没有明确授权就是 `DENY`。
 
-必须遵守这些规则：
+P3 有四道不可绕过的服务端硬阀门：
 
-- 身份识别不等于授权
-- 先授权，再组 Context
-- 未授权数据不能先进入模型，再靠 Prompt 要求模型保密
-- Tool 执行时再次做授权判断
-- 外部消息、邮件、网页、MCP、Worker 输出全部视为不可信输入
-- Worker 权限只能缩小，不能比调用者更大
-- Approval 不能替代 Permission
-- Grant、Revoke、Deny、Approval 都进入可审计 Trace
-- 自动沉淀 Memory、Skill、Asset 不能扩大原始数据的可见范围
+### Ingress Gate
 
-目标权限关系参考 `openfga/openfga`，但核心 Domain 保持在 Glassbox 自己的 TypeScript 代码中。
+消息进入 Pi 之前检查身份、Channel、群、激活状态、重复事件以及调用 Agent 的权限。
+
+### Context Gate
+
+调用 `session.prompt(...)` 之前过滤受保护数据。未授权内容不能先进入模型，再靠 Prompt 要求模型保密。
+
+### Tool Gate
+
+每个受保护 Tool 在真正执行前重新鉴权。Lora PI Kit 可以使用 Pi `tool_call` hook 做阻断桥接，但 Glassbox Authorization Engine 才是权限源。
+
+QQ Runtime 使用显式 Tool allowlist。P3 不向远程 QQ 开放 unrestricted `bash` 或 `powershell`。
+
+### Delivery Gate
+
+结果离开 Glassbox 发往 QQ 前再次检查 Audience。
+
+```text
+Owner 有权读取私人数据
+≠
+Owner 有权把私人数据发送到整个 QQ 群
+```
+
+群聊默认只允许 `public`、当前 `group`、当前 `conversation` 等明确可见范围。私人内容需要显式 Share 后才能改变可见范围。
+
+## Conversation
+
+私聊和群聊不能继续共用旧的“Conversation 一定属于一个 userId”假设。
+
+P3 使用 scope-based Conversation：
+
+```text
+Conversation
+  id
+  agentId
+  channel
+  scopeType
+  scopeKey
+```
+
+例如：
+
+```text
+QQ 私聊
+  scopeType = direct
+  scopeKey = qq:user:<qq-id>
+
+QQ 群聊
+  scopeType = group
+  scopeKey = qq:group:<group-id>
+```
+
+群 Conversation 可以由多人共享，但每一个 Run 都记录真实 Principal。
+
+```text
+Run
+  id
+  conversationId
+  principalId
+  runtime
+  runtimeSessionId?
+  deliveryAudience
+```
+
+保持这些边界：
+
+```text
+ChannelIdentity ≠ User
+User ≠ Principal
+Conversation ≠ Principal
+Conversation ≠ Pi Session
+Pi Session ≠ Run
+Actor permission ≠ Delivery permission
+```
+
+## 测试环境
+
+P3 需要两套测试环境。
+
+### 自动化环境
+
+不依赖真实 QQ，也不消耗真实模型额度：
+
+```text
+Fake OneBot Gateway
+Fake Owner
+Fake Visitor
+Fake Group
+Disposable Turso / SQLite
+isolated Pi agentDir
+Lora PI Kit test preset
+recording / deterministic fake model
+synthetic protected resources
+Raw Trace capture
+```
+
+测试 Pi 必须使用独立目录，例如：
+
+```text
+.glassbox-test/
+  pi/
+    settings.json
+    models.json
+    skills/
+    extensions/
+    sessions/
+  db/
+    p3-test.db
+  fixtures/
+    users.json
+    groups.json
+    resources.json
+    onebot-events/
+  traces/
+```
+
+不得写入用户正常的 `~/.pi/agent`、真实 Personal Agent 状态、生产 QQ 会话或真实可写仓库。
+
+### 真实 QQ 验收环境
+
+准备：
+
+```text
+Bot QQ
+Owner QQ
+Visitor QQ
+Test QQ Group
+  Bot
+  Owner
+  Visitor
+```
+
+真实验收检查 NapCat 登录、OneBot 事件、私聊、群聊 `@bot`、群回复、重连、重启、真实 Pi 模型执行和最终 Delivery。
+
+## Canary 安全测试
+
+Owner Private Resource 放入唯一测试字符串：
+
+```text
+PRIVATE_CANARY_7F92A1
+```
+
+自动测试主动尝试通过这些路径套取：
+
+```text
+Visitor 私聊
+Visitor 群聊
+Owner 群聊
+Prompt Injection
+Tool 间接读取
+伪造 identity
+stale authorization
+Revoke 后继续访问
+跨 Conversation 复用
+跨群复用
+Delivery Gate 绕过
+```
+
+如果 canary 出现在任何未授权的 Pi Context、Tool Result、QQ 输出、公开 Trace 或 denial 文本里，P3 失败。
 
 ## 当前已经实现
 
@@ -131,154 +370,74 @@ REQUIRES_APPROVAL
 - Playwright E2E
 - 大 Session 性能验证
 
-这些能力不会推倒重来。它们会逐步成为 Personal Agent Runtime 的执行和观察底座。
+这些能力不会推倒重来。当前 P3 会在它们之上接入 Pi SDK、Lora PI Kit、硬权限、Turso Conversation 和 QQ Channel。
 
-目前还没有完成的目标能力包括：
+## P3 当前要完成
 
 ```text
-Identity / Authorization Domain
+Test harness
+Lora PI Kit MVP
+Pi SDK Runtime
+Identity / Authorization
+Ingress / Context / Tool / Delivery Gates
+scope-based Conversation
 Turso durable state
-Conversation Domain
-Pi Runtime Adapter
-Lora PI Kit integration
-Remote Channels
+NapCat / OneBot Channel
+QQ private chat
+QQ group chat
+message dedupe
+restart / reconnect
+Trace
+real QQ acceptance
+```
+
+## 后续能力
+
+P3 完成后再进入：
+
+```text
 Memory promotion
 Authorized hybrid retrieval
+Mail / Calendar
+additional Channels
+AGY Worker
+LongTask Engine
+Efficient Runtime
+Execution Routing
+Eval Workbench
 Skill evolution
 Asset Library
 Journal / Monthly Review
-Mail / Calendar
-AGY Worker
-LongTask Engine
-Efficient Agent Runtime
-Execution Routing
-Eval Workbench
 Arena
-Documentation Learning Site
-```
-
-## Runtime strategy
-
-Runtime 方向已经定下来，但当前还没有迁移实现。
-
-```text
-earendil-works/pi
-      │
-      ▼
-Lora PI Kit
-  extensions
-  skills
-  prompts
-  presets
-  observability hooks
-  bootstrap / doctor
-      │
-      ▼
-Glassbox Runtime Boundary
-      │
-      ▼
-Authorization / Conversation / Run / Trace
-```
-
-边界很明确：
-
-- 上游 Pi 负责 Runtime、Agent Loop、Packages、Extensions、Skills、SDK、RPC 等基础能力。
-- Lora PI Kit 负责我们自己的 Pi 配置、扩展、Prompt、Skill 选择、Preset、监控 Hook 和安装维护工具。
-- `lora-sys/skills` 继续作为可复用 Agent Skills 的来源，不默认复制一份到 Lora PI Kit。
-- Glassbox 负责 Agent 身份、Principal、Authorization、Conversation、持久化、Run 和 Trace。
-- Codex 和 Claude Code 继续保留，作为兼容路径、Fallback、专业执行能力和 Differential Eval 对照。
-
-改 Pi 时遵循这个顺序：
-
-```text
-setting / project config
-→ Pi package
-→ Skill
-→ Extension
-→ SDK / RPC
-→ upstream contribution
-→ 最后才考虑本地 core patch
-```
-
-因此这里不会维护一个大范围 Pi Fork。只有 Extension、SDK、RPC 都无法满足一个已经被测试证明的需求时，才保留小范围 Core Patch。
-
-完整规则见 [`docs/runtime-strategy.md`](./docs/runtime-strategy.md)，Pi 上游源码索引见 [`upstream/pi/SOURCES.md`](./upstream/pi/SOURCES.md)。
-
-## 核心对象
-
-长期模型会围绕这些概念演进：
-
-```text
-Agent
-User
-Principal
-ChannelIdentity
-Relationship
-Permission
-Conversation
-Memory
-Skill
-Asset
-Tool
-Session
-Run
-WorkerJob
-LongTask
-JournalEntry
-Experiment
-EvalSuite
-EvalRun
-```
-
-几个边界必须保持清楚：
-
-```text
-Identity ≠ Authorization
-Permission ≠ Approval
-Channel ≠ Agent
-Conversation ≠ Session
-Session ≠ Run
-LongTask ≠ Run
-WorkerJob ≠ LongTask
-Runtime / Provider / Worker ≠ Personal Agent
-Raw Trace ≠ Derived State
-Canvas ≠ Execution State
+Documentation Learning Site implementation
 ```
 
 ## Learning and Asset Loop
 
-Glassbox 不希望把所有聊天记录都塞进 Memory，也不希望模型成功一次就自动生成永久 Skill。
+Glassbox 不会把所有聊天记录直接塞进 Memory，也不会因为一次成功执行就自动生成永久 Skill。
 
-真正的成长链是：
+目标链路：
 
 ```text
 Real Work
-   │
-   ▼
+   ↓
 Raw Trace
-   │
-   ▼
+   ↓
 Experience Mining
-   │
    ├── Memory Candidate
    ├── Skill Candidate
    └── Asset Candidate
-             │
-             ▼
+             ↓
  Value + Permission + Dedup
-             │
-             ▼
+             ↓
       Eval / Verification
-             │
-             ▼
+             ↓
            Promote
-             │
-    ┌────────┼────────┐
-    │        │        │
- Memory    Skills   Asset Library
+             ↓
+    Memory / Skills / Assets
 ```
 
-每一个高价值 Memory、Validated Skill、Asset、Journal 或 Monthly Review 都应该能回到产生它的 Run 和 Trace。
+每一个高价值 Memory、Validated Skill、Asset、Journal 或 Review 都应该能回到产生它的 Run 和 Trace。
 
 ## Memory
 
@@ -290,18 +449,17 @@ Episodic Memory
 Procedural Memory
 ```
 
-并且至少支持：
+至少支持：
 
 ```text
 private
 public
 user
+group
 conversation
 ```
 
-Memory Candidate 会考虑 future utility、goal relevance、reliability、reuse、novelty、staleness、contradiction 和 privacy risk，再决定是否晋升。
-
-Retrieval 以后会在授权范围内组合 lexical search、vector search、source weighting、temporal decay、diversity reranking 和 context budget。权限过滤发生在受保护内容进入模型可见检索结果之前。
+Retrieval 必须先做 Authorization scope，再检索和排序。不能先检索全部私人内容再让模型自己忽略。
 
 主要参考：
 
@@ -311,7 +469,7 @@ Retrieval 以后会在授权范围内组合 lexical search、vector search、sou
 
 ## Skill evolution
 
-Skill 的目标流程：
+目标流程：
 
 ```text
 Successful Runs
@@ -335,13 +493,13 @@ Validated Skill
 - `Zhang-Henry/CoEvoSkills`
 - `MineDojo/Voyager`
 
-验证通过且属于通用 Pi 工作流的 Skill，可以进入 `lora-sys/skills` 或由 Lora PI Kit 选择安装。涉及 Glassbox 权限、产品状态或证据语义的逻辑仍然留在 Glassbox。
+验证通过且属于通用 Pi 工作流的 Skill，可以进入 `lora-sys/skills` 或由 Lora PI Kit 选择安装。涉及 Glassbox 权限、产品状态或证据语义的逻辑留在 Glassbox。
 
 ## Journal 和周期复盘
 
 Agent 会有自己的可读 Journal，但 Journal 不是模型私有思维过程。
 
-Daily Journal 和 Monthly Review 都应该是正式 Run 产生的可追溯 Asset，可以下钻到真实 Run、Eval 和 Trace。
+Daily Journal 和 Monthly Review 都应该是正式 Run 产生的可追溯 Asset。
 
 主要参考：
 
@@ -350,11 +508,11 @@ Daily Journal 和 Monthly Review 都应该是正式 Run 产生的可追溯 Asset
 
 ## Mail 和 Calendar
 
-Mail 和 Calendar 计划作为原生 Domain，而不是给模型 unrestricted MCP。
+Mail 和 Calendar 后续作为原生 Domain，而不是给模型 unrestricted MCP。
 
-Mail 参考 `resend/resend-skills` 的 Agent inbox、安全 Webhook 和 Approval 模式。
+Mail 参考 `resend/resend-skills`。
 
-Calendar 参考 `calcom/cal.diy` 的 Availability、Scheduling 和冲突处理。
+Calendar 参考 `calcom/cal.diy`。
 
 两者默认都是 Private Resource。
 
@@ -362,7 +520,7 @@ Calendar 参考 `calcom/cal.diy` 的 Availability、Scheduling 和冲突处理�
 
 长任务不能依赖一个 HTTP 请求或者一个进程一直活着。
 
-目标语义包括：
+目标语义：
 
 ```text
 stable task id
@@ -382,9 +540,9 @@ continuation
 
 ## Efficient Agent Runtime
 
-权限和持久化地基完成以后，Glassbox 还需要一层可测量的运行效率系统。
+P3 先完成可用闭环。更复杂的效率层放到后续阶段。
 
-`TokenRhythm/opensquilla` 是这一层的重要上游参考，重点研究：
+`TokenRhythm/opensquilla` 是主要参考，后续研究：
 
 ```text
 Context Budget Governor
@@ -399,44 +557,20 @@ Duplicate retrieval prevention
 Routing observability
 ```
 
-Glassbox 的 Router 最终不应该只返回一个模型名，而应该返回明确的执行策略：
-
-```text
-ExecutionPolicy
-  modelTier
-  provider
-  model
-  thinkingLevel
-  promptPolicy
-  contextBudget
-  retrievalBudget
-  toolBudget
-  workerPolicy
-  ensemblePolicy
-  costCeiling
-```
-
 Router 可以决定怎样更省或更强，不能改变 Principal，也不能扩大授权范围。
 
-Tool Result 可以为模型生成压缩投影，但完整 Raw Trace 和证据不能因此被删除。
-
-属于通用 Pi 工作流的效率机制优先进入 Lora PI Kit。涉及受保护 Context、产品级 Routing Policy、权限范围或证据语义的机制继续由 Glassbox 控制。
-
-这一层必须用 Eval 证明价值，例如比较 Router 开关前后的任务成功率、权限 invariant、Token、Cost 和 Latency，而不是只声称“更省 Token”。具体顺序见 [`.plans/roadmap.md`](./.plans/roadmap.md)，源码索引见 [`upstream/opensquilla/SOURCES.md`](./upstream/opensquilla/SOURCES.md)。
+属于通用 Pi 工作流的效率机制优先进入 Lora PI Kit。涉及受保护 Context、产品级 Routing Policy、权限范围、Audience 或证据语义的机制继续由 Glassbox 控制。
 
 ## Eval 和实验工作台
 
-以后可以直接告诉 Agent：
+以后可以比较：
 
 ```text
-测一下当前 Agent 的 GitHub repo 分析能力。
-用 100 条任务。
-比较当前版本、Pi + Lora PI Kit、Codex、Claude Code 和 AGY。
-每个样本跑 3 次。
-检查任务成功率、权限 invariant、成本和延迟。
+Glassbox + Pi + Lora PI Kit
+Codex
+Claude Code
+AGY
 ```
-
-Agent 先生成 Eval Draft，只有明确 `Start Eval` 才执行。
 
 第一阶段 Eval 类型：
 
@@ -450,42 +584,31 @@ Invariant Eval
 
 ## Arena
 
-以后可以把 Agent 放进多人游戏、协作和社交模拟环境。每局都是可追溯 Run，也可以成为 Eval 或 Episodic Memory 来源。
+后续可以把 Agent 放进多人游戏、协作和社交模拟环境。每局仍然是可追溯 Run，也受 Glassbox Authorization 控制。
 
 主要参考：
 
 - `google-deepmind/open_spiel`
 - `sotopia-lab/sotopia`
 
-Arena 同样受 Glassbox Authorization 控制。
-
 ## Canvas 的位置
 
 Canvas 保留，但不再定义整个产品。
 
-可能的工作视图包括：
-
 ```text
-Conversation
-Project
-Timeline
-Canvas
-Trace
-Experiment
-Memory
-Skills
-Assets
-Journal
-Permissions
+Raw Trace
+→ Derived State
+→ Canvas Objects
+→ tldraw projection
 ```
 
-Canvas 是投影。移动、连接、分组、缩放和批注都不能暗中改变 Agent 执行和权限。
+移动、连接、分组、缩放和批注不能暗中改变 Agent 执行和权限。
 
 ## 文档站与交互式学习
 
-Glassbox 计划有一个独立的公开文档与学习站，目标不是把 README 搬到网页上，而是让别人真正理解关键概念。
+Glassbox 计划有独立的公开文档与学习站。
 
-每个重要概念尽量按下面的学习路径组织：
+每个重要概念尽量按下面路径组织：
 
 ```text
 Explain
@@ -496,7 +619,7 @@ Explain
 → Link to Real Implementation
 ```
 
-文档页面必须明确标注：
+能力必须标记：
 
 ```text
 Implemented
@@ -504,19 +627,18 @@ Experimental
 Planned
 ```
 
-第一批交互 Demo 会围绕 P3 的真实概念：
+P3 完成后，第一批真实概念可以覆盖：
 
 ```text
 Owner vs Visitor
+Private vs Group Audience
 Permission vs Approval
 Authorize Before Context
-Conversation vs Session vs Run
+Tool Gate
+Delivery Gate
+Conversation vs Pi Session vs Run
 Raw Trace → Derived State → Canvas
 ```
-
-后续再加入 Memory Retrieval Lab、Context Budget Simulator、Tool Result Projection、Execution Routing Lab、Router Eval 和 LongTask State Machine。
-
-公开 Demo 默认使用 synthetic deterministic fixtures，不读取真实 Personal Agent Memory、私人 Conversation、生产凭证或私有 Trace。
 
 完整站点规范见 [`docs/README.md`](./docs/README.md)，交互 Demo 课程表见 [`docs/interactive-demos.md`](./docs/interactive-demos.md)。
 
@@ -526,12 +648,14 @@ Raw Trace → Derived State → Canvas
 
 | 上游 | 主要参考 |
 | --- | --- |
-| `earendil-works/pi` | 首选本地 Agent Runtime 上游、Packages、Extensions、Skills、SDK、RPC |
-| `pingdotgg/t3code` | Provider、Claude Code、权限、Resume |
+| `earendil-works/pi` | 主 Agent Runtime、SDK、Packages、Extensions、Skills、Tools |
+| `NapNeko/NapCatQQ` | QQ Runtime、OneBot 接入 |
+| `botuniverse/onebot-11` | OneBot 11 事件和 API Contract |
+| `pingdotgg/t3code` | Claude Code、权限、Resume |
 | `HKUDS/OpenHarness` | Agent Loop、Tools、Skills、Memory、Channels、QQ |
 | `keli-wen/agy-staff` | AGY Worker、后台 Job、Continue、Restart |
-| `TokenRhythm/opensquilla` | Context Budget、Tool Result Budget、Hybrid Retrieval、Routing、Token-efficient Projection |
-| `Javis603/token-monitor` | Runtime 发现、Token/Cost、Quota、Health、Pi/Codex/Claude Code/Antigravity 采集 |
+| `TokenRhythm/opensquilla` | Context Budget、Tool Result Budget、Hybrid Retrieval、Routing |
+| `Javis603/token-monitor` | Runtime 发现、Token/Cost、Quota、Health |
 | `joyehuang/trajectory-panel` | Trajectory、Timeline、Redaction、Turso Sync |
 | `UKGovernmentBEIS/inspect_ai` | Eval、Dataset、Scorer、Experiment Runner |
 | `temporalio/sdk-typescript` | Durable LongTask |
@@ -556,9 +680,9 @@ Vendoring 时必须记录 Source Repo、Commit、License、原始路径和复制
 
 ```text
 apps/
-  server/        当前 Runtime、Provider、Trace、State、WebSocket
-  web/           当前 React + tldraw Workbench
-    e2e/         历史与现行浏览器回归测试
+  server/        Runtime、Channel、Authorization、Trace、State、WebSocket
+  web/           React + tldraw Workbench
+    e2e/         浏览器回归测试
 
 packages/
   contracts/     真正跨边界时才放 Contract
@@ -585,7 +709,7 @@ upstream/
   token-monitor/
 ```
 
-不要为了未来架构提前创建空 package，也不要现在创建假的 `lora-pi-kit` 依赖。等第一个真实 Pi integration slice 开始时，再独立建立并验证 Lora PI Kit。文档站真正开始实现以前也不提前创建 `apps/docs`。
+Lora PI Kit 在 P3.1 开始时创建为独立仓库。不要把 Pi Core 复制进 Glassbox，也不要把 QQ Transport、Authorization 或 Turso 塞进 Lora PI Kit。
 
 ## 开始开发
 
@@ -615,9 +739,9 @@ npm run dev:web
 npm run test:server
 ```
 
-现有 `apps/web/e2e/` 中包含一些需要真实 Provider、预置 Session 或历史 Fixture 的回归脚本。不要把全量 E2E 当成每个改动的默认检查。新 Phase 3 测试优先使用 Fake Channel、Fake Tool 和 disposable Turso database。
+开发时只运行当前任务需要的测试。P3 自动验收优先使用 Fake OneBot、Fake identities、isolated Pi agentDir 和 disposable Turso。
 
-开发环境的客户端通过相对路径 `/api` 和 `/ws` 访问 Runtime。不要把新的绝对开发路径或机器专属目录写进代码。
+开发环境客户端通过相对路径 `/api` 和 `/ws` 访问 Runtime。不要把机器专属路径写进代码。
 
 ## Agent 开工顺序
 
@@ -630,15 +754,28 @@ npm run test:server
 5. 相关 `upstream/` 或上游项目
 6. 当前实现和 focused tests
 
-不要从旧 Git 历史恢复已经删除的 Plan、Ticket、Template 或 debug 文件，除非当前问题确实需要它们。
+不要从旧 Git 历史恢复已经被新 P3 取代的旧 Plan 语义。
 
 ## 当前状态
 
-Glassbox 还很早，但方向已经收口。
+当前唯一目标是完成 P3 的 QQ Personal Agent Closed Loop。
 
-下一步不是继续扩 Canvas，也不是同时接十个聊天渠道。现在只做一个可证明的 Personal Agent Foundation：**身份明确、权限分明、Conversation 可持久恢复、Turso 保存长期状态、所有授权决策可追溯。**
+现在不把“基础模块写完”当成完成。真正完成意味着：
 
-这层正确以后，Runtime 路径优先走 Pi + Lora PI Kit，再让真实 Channel、Memory、Retrieval、Mail、Calendar、Skill、LongTask、Efficient Runtime、Eval 和 Arena 逐层接进来。Codex 和 Claude Code 在新路径被验证前继续保留。文档与交互式学习可以先做信息架构和设计，但不能把计划能力写成已实现。
+```text
+真实 QQ 私聊可用
+真实 QQ 群聊可用
+Pi SDK + Lora PI Kit 真正执行
+Owner / Visitor 身份正确
+四道硬权限阀门生效
+私人数据无法通过群聊泄露
+Conversation 重启恢复
+QQ 重复事件不会重复回复
+NapCat 重连后继续工作
+Trace 可以解释整条执行链
+```
+
+P3 完成后再进入 Memory、Authorized Retrieval、更多 Channel、LongTask、Eval 和效率层。
 
 ## License
 
