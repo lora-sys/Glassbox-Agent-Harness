@@ -8,9 +8,11 @@ For the complete cross-cutting data, storage, search, observability, analytics, 
 
 For the execution-runtime ownership boundary between Glassbox, Pi, Lora PI Kit, Codex, and Claude Code, see [`runtime-strategy.md`](./runtime-strategy.md).
 
+The current implementation source of truth is `.plans/03-personal-agent-foundation.md`.
+
 ## Toolchain
 
-Glassbox standardizes on **Vite+** as the primary JavaScript / TypeScript development toolchain.
+Glassbox standardizes on **Vite+** as the primary JavaScript / TypeScript development toolchain direction.
 
 Vite+ is the preferred command surface for:
 
@@ -101,6 +103,8 @@ vp lint    -> Oxlint
 
 Playwright remains the browser / E2E layer where browser behavior is the thing being tested.
 
+Plan 03 also requires a deterministic QQ / OneBot test harness that does not depend on real QQ accounts or paid model quota.
+
 Do not keep parallel ESLint / Prettier / ad-hoc TypeScript check stacks unless a concrete compatibility gap requires them.
 
 ## Persistence
@@ -112,10 +116,16 @@ The selected cross-cutting storage model is:
 ```text
 Turso
   structured durable state
-  product metadata
-  lexical search
-  vector search
-  analytics indexes and rollups
+  Agent / User / ChannelIdentity
+  Conversation
+  permissions / relationships
+  authorization decisions
+  approvals
+  Run metadata
+  message dedupe keys
+  runtime session bindings
+  visibility and Share metadata
+  later lexical / vector search and analytics indexes
 
 Cloudflare R2
   Raw Trace evidence
@@ -125,10 +135,12 @@ Cloudflare R2
   backups
 
 AgentMail
-  email transport and source objects
+  later email transport and source objects
 
 Glassbox server
   runtime execution
+  authorization
+  Channel adapters
   owner APIs
   public Trace / Eval APIs
 ```
@@ -143,7 +155,7 @@ The browser does not receive direct Turso, R2, or AgentMail credentials.
 
 Current execution capabilities include Codex and Claude Code adapters from the earlier Coding Agent phase.
 
-The selected future local runtime direction is:
+Plan 03 now makes Pi the primary Personal Agent runtime path:
 
 ```text
 upstream Pi
@@ -152,40 +164,153 @@ upstream Pi
 Lora PI Kit
     |
     v
+@earendil-works/pi-coding-agent SDK
+    |
+    v
 Glassbox Runtime Boundary
 ```
 
-Pi is the preferred upstream runtime foundation. Lora PI Kit is the maintainer-owned configuration and extension layer. Glassbox remains the product and trust boundary.
+Glassbox embeds Pi through the public SDK inside `apps/server`.
 
-Lora PI Kit should own reusable Pi packages, extensions, selected Skills, prompts, runtime presets, observability hooks, and bootstrap tooling. It should not own Glassbox authorization, durable Conversation state, product identity, or Raw Trace truth.
+Primary Pi surfaces for P3 include:
 
-Use Pi settings, packages, Skills, Extensions, SDK, and RPC before considering a Pi core patch. A local core patch requires a concrete unsupported need and a compatibility test.
+```text
+createAgentSession
+createAgentSessionRuntime when replacement is required
+ModelRuntime
+SessionManager
+DefaultResourceLoader
+Extension API
+customTools
+session events
+explicit agentDir
+```
 
-Codex and Claude Code remain valid runtimes for compatibility, fallback, specialist execution, and differential Eval while the Pi path matures.
+Lora PI Kit owns reusable Pi packages, extensions, selected Skills, prompts, runtime presets, observability hooks, and bootstrap tooling. It does not own Glassbox authorization, durable Conversation state, QQ identity, audience policy, product identity, or Raw Trace truth.
 
-Do not migrate the current runtime during Plan 03. Preserve existing provider regression coverage until a later runtime integration slice proves Pi plus Lora PI Kit behind a Glassbox-owned adapter.
+The customization order is:
+
+```text
+Pi settings / project config
+-> Pi package
+-> Skill
+-> Extension
+-> custom Tool
+-> Pi SDK integration
+-> upstream contribution
+-> small local Pi core patch only when a tested requirement cannot use public boundaries
+```
+
+RPC remains available upstream but is not the primary Plan 03 integration path.
+
+Codex and Claude Code remain valid runtimes for compatibility, fallback, specialist execution, and differential Eval while Pi becomes the primary Personal Agent path.
+
+## QQ Channel
+
+Plan 03 uses NapCat as the QQ protocol-side runtime and OneBot 11 as the application boundary.
+
+```text
+QQ
+-> NapCat
+-> OneBot 11
+-> Glassbox QQ Channel Adapter
+-> Identity / Conversation / Authorization
+-> Pi SDK
+-> Glassbox Delivery Gate
+-> NapCat
+-> QQ
+```
+
+QQ transport code belongs in Glassbox, not Lora PI Kit.
+
+Initial P3 scope includes private messages, group messages, explicit group activation such as `@bot`, reply delivery, reconnect, health, message deduplication, and self-message loop prevention.
 
 ## Authorization
 
 Authorization is server-side and default-deny.
 
-The stable trust model remains:
+The stable decision inputs must answer:
 
 ```text
-Principal × Resource × Action × Context -> Decision
+Who
+Where
+What
+How
+Resource
+Audience
+Conversation
+Run
 ```
 
-No toolchain, framework, runtime, model router, channel adapter, vector database, cache, Pi Extension, Skill, or runtime profile may bypass this boundary.
+Decision remains:
 
-Runtime choice happens after the caller and authorized Context are established.
+```text
+ALLOW
+DENY
+REQUIRES_APPROVAL
+```
+
+Plan 03 enforces four hard gates:
+
+```text
+Ingress Gate
+Context Gate
+Tool Gate
+Delivery Gate
+```
+
+No toolchain, framework, runtime, model router, Channel adapter, vector database, cache, Pi Extension, Skill, or runtime profile may bypass these boundaries.
+
+Unauthorized protected content is filtered before Pi model Context is assembled.
+
+Protected Tools are re-authorized immediately before execution.
+
+Delivery is authorized separately from read access. An Owner being allowed to read a private resource does not make that resource safe to send into a QQ group.
+
+The remote QQ Pi profile uses an explicit Tool allowlist. Generic unrestricted `bash` or `powershell` is not exposed as a remote escape hatch in P3.
+
+## Test environments
+
+Plan 03 has two test layers.
+
+Deterministic automated tests use:
+
+```text
+Fake OneBot gateway
+Fake Owner
+Fake Visitor
+Fake QQ group
+Disposable Turso / SQLite database
+isolated Pi agentDir
+Lora PI Kit test preset
+deterministic or recording model/provider
+synthetic protected resources
+Raw Trace capture
+```
+
+Real acceptance uses:
+
+```text
+Bot QQ
+Owner QQ
+Visitor QQ
+Test QQ group
+NapCat
+isolated Glassbox test database
+isolated Pi agentDir
+Lora PI Kit
+real model execution
+```
+
+Tests must never write to live Personal Agent state, normal `~/.pi/agent`, real writable repositories, or production QQ session data.
 
 ## Retrieval and efficiency
 
-These are post-foundation layers, not Plan 03 dependencies.
+Hybrid retrieval, semantic cache, smart routing, aggressive Context budgets, TokenJuice-style Tool-result projection, and broader runtime optimization remain post-P3 work unless a minimal mechanism is required for the closed loop itself.
 
 The selected architecture keeps retrieval behind Glassbox-owned authorization boundaries and uses Turso as the default structured, lexical, and vector store.
 
-Primary mechanisms include:
+Primary later mechanisms include:
 
 ```text
 authorized hybrid retrieval
@@ -199,17 +324,17 @@ token estimation
 permission-scoped semantic cache
 ```
 
-`TokenRhythm/opensquilla` is a primary upstream reference for these mechanisms.
+`TokenRhythm/opensquilla` is a primary upstream reference for these later mechanisms.
 
-When a mechanism is generic Pi workflow customization, prefer implementing it in Lora PI Kit. When it changes Glassbox product state, authorization, retrieval visibility, or evidence semantics, keep it in Glassbox.
+When a mechanism is generic Pi workflow customization, prefer implementing it in Lora PI Kit. When it changes Glassbox product state, authorization, retrieval visibility, audience policy, or evidence semantics, keep it in Glassbox.
 
 ## Observability and Eval
 
 Product observability is a Glassbox feature, not an external dashboard dependency.
 
-The Owner Web UI must be able to inspect product-relevant durable state, Trace, Eval, token usage, cost, retrieval behavior, authorization decisions, Channel activity, storage state, and system health through Glassbox server APIs.
+P3 must expose enough evidence to inspect Channel, Principal, location, Conversation, authorization decisions, model-visible Context metadata, Tool decisions, Run, runtime/session identity, token usage where available, and final Delivery decision.
 
-OpenTelemetry, Langfuse, Inspect AI, and Token Monitor are reference models for trace structure, scores, analytics, runtime usage, and Eval log design. They are not required control-plane dependencies.
+OpenTelemetry, Langfuse, Inspect AI, and Token Monitor are reference models for trace structure, scores, analytics, runtime usage, and later Eval design. They are not required control-plane dependencies.
 
 Public observers may read only sanitized, explicitly published Trace or Eval snapshots.
 
