@@ -2,7 +2,9 @@
 
 Status: CURRENT ARCHITECTURE DECISION
 
-This document records which Glassbox responsibility uses which service and where product truth lives. Detailed schema, UI layout, retention, and metric definitions remain implementation concerns.
+This document records where durable product truth lives and which service owns each responsibility.
+
+Detailed schema, UI layout, retention, and metric definitions remain implementation concerns.
 
 ## Access boundary
 
@@ -11,89 +13,144 @@ Owner
   full management access
 
 Authorized Channel Principal
-  only the resources and Actions allowed by Glassbox policy
+  only Resources and Actions allowed by Glassbox policy
 
 Public visitor
   read-only access to explicitly published Trace or Eval
 ```
 
-QQ, email, Moshi, Herdr clients, and other external entry points do not receive management authority merely because they can reach a process or UI.
+QQ, email, Pi, Lora PI Kit, MCP, Herdr, Moshi, and other external entry points do not receive management authority merely because they can reach a process or UI.
 
-## Service map
+## Service / authority map
 
-| Glassbox responsibility | Service / authority |
+| Responsibility | Service / authority |
 | --- | --- |
-| Personal Agent Runtime | Glassbox server + Pi SDK |
-| Pi customization | Lora PI Kit |
-| QQ Bot and Channel handling | Glassbox server + NapCat / OneBot transport |
+| Personal Agent product control plane | Glassbox server |
+| Main Agent engine | Pi through Glassbox Pi SDK adapter |
+| Pi distribution / Skills snapshot / profiles / MCP adapter / runtime hooks | Lora PI Kit |
+| Canonical reusable Lora Skill source | `lora-sys/skills` |
+| QQ transport | Glassbox server + NapCat / OneBot |
 | Agent Operations control plane | Glassbox server |
 | Live coding-worker workspaces / worktrees / panes / Agent lifecycle | Herdr |
-| Task, TaskAttempt, AttentionItem, WorkerBinding truth | Glassbox server + Turso |
-| Herdr state reconciliation | Glassbox server through `HerdrBridge` |
-| Bounded Herdr stage recipe | optional `herdr-workflows`; never canonical Task truth |
-| Scheduler and later durable task execution | Glassbox server; later LongTask boundary when selected |
-| Browser execution | Glassbox server |
-| Owner management Web UI | Glassbox server |
-| Public Trace and Eval Web pages | Glassbox server |
+| Task / TaskAttempt / AttentionItem / WorkerBinding truth | Glassbox server + Turso |
+| Herdr reconciliation | Glassbox server through `HerdrBridge` |
+| Optional bounded Herdr stage recipe | `herdr-workflows`; never canonical Task truth |
+| Structured durable product state | Turso |
+| Raw append-only Trace / large evidence | Cloudflare R2 where appropriate |
 | Owner Web authentication | Better Auth |
-| Structured durable state | Turso |
-| User, Principal, ChannelIdentity, Conversation | Turso |
-| Authorization and permission state | Turso |
-| QQ user and group metadata | Turso |
-| Session and Run metadata | Turso |
-| AttentionItem, Task, TaskAttempt, WorkerBinding | Turso |
-| Herdr observed-state projection and reconciliation metadata | Turso when durability is required; live source remains Herdr |
-| Future LongTask and durable Worker state | Turso or deliberately selected durable orchestration boundary |
-| FeedbackEvent ledger | Turso |
-| TasteCandidate, TasteEntry, confidence, scope, provenance | Turso |
-| Memory metadata and durable Memory | Turso |
-| Rules metadata when represented as product state | Turso or explicit project rule files, depending on authority source |
-| Skill registry metadata | Turso; reusable Skill source remains `lora-sys/skills` where applicable |
-| Full-text search | Turso FTS |
-| Vector embeddings and vector search | Turso Vector |
-| Taste retrieval metadata and statistics | Turso |
-| Memory retrieval metadata and statistics | Turso |
-| Trace index and Trace statistics | Turso |
-| Eval definitions, results and statistics | Turso |
-| Prompt, model, provider and execution metadata | Turso |
-| Journal and Asset metadata | Turso |
-| Token, cost, latency and usage statistics | Turso |
-| Correction, revert, Taste hit, preference-compliance and scope-leakage statistics | Turso-derived product projections |
-| Task throughput, blocked time, review / rework and worker statistics | Turso-derived product projections |
-| Web UI analytics and aggregated product statistics | Turso, queried through Glassbox server APIs |
-| Public Trace and Eval publication metadata | Turso |
-| Raw append-only Trace | Cloudflare R2 |
-| Large model, Tool, or worker outputs when retained as evidence/artifacts | Cloudflare R2 |
-| Large feedback before/after payloads when retained | Cloudflare R2, referenced from Turso FeedbackEvent metadata |
-| Screenshots, HAR, HTML and browser evidence | Cloudflare R2 |
-| QQ and email attachments | Cloudflare R2 |
-| PDFs, images, audio, archives and generated artifacts | Cloudflare R2 |
-| Eval datasets and large Eval logs | Cloudflare R2 |
-| Replay bundles and backups | Cloudflare R2 |
-| Email inbox, sending, receiving and threads | AgentMail |
-| Email events | AgentMail |
-| DNS, TLS and public ingress | Cloudflare |
-| Private connection from Cloudflare to Glassbox server | Cloudflare Tunnel |
-| Owner admin perimeter access | Cloudflare Access |
-| Infrastructure uptime, logs and error monitoring | Better Stack |
-| Secrets and service credentials | Infisical |
-| Webhook delivery, retry and replay | Hookdeck |
-| Delayed jobs and reliable HTTP task delivery | Upstash QStash when a later active plan needs it |
-| Human remote access to server / Herdr | SSH; Moshi may be an optional client |
+| Email transport later | AgentMail |
+| Secrets | Infisical |
+| Public ingress / private tunnel / access perimeter | Cloudflare |
+| Infrastructure uptime / error monitoring | Better Stack |
+| Webhook reliability when used | Hookdeck |
+| Delayed HTTP task delivery when later required | Upstash QStash |
+| Human remote operations access | SSH; Moshi may be an optional client |
 
-## Product truth vs live execution state
+## Turso product state
 
-This distinction is required for the Herdr integration.
+Turso is the default structured durable store for Glassbox product truth.
+
+Current / planned records include:
+
+```text
+Agent
+User / Principal
+ChannelIdentity
+Conversation
+relationships / permissions
+AuthorizationDecision
+Approval
+Run metadata
+message dedupe
+runtime session binding
+visibility / Share metadata
+
+AttentionItem
+Task
+TaskAttempt
+WorkerBinding
+Herdr reconciliation metadata
+
+FeedbackEvent
+TasteCandidate
+TasteEntry
+Taste confidence / scope / provenance
+Memory metadata
+Rules metadata when represented as product state
+Skill registry metadata
+Journal / Asset metadata
+
+Eval definitions / results
+retrieval metadata
+statistics / product projections
+```
+
+The model does not receive unrestricted SQL access.
+
+The browser does not receive direct Turso credentials.
+
+## Runtime distribution identity
+
+Lora PI Kit is runtime distribution state, not product truth.
+
+Glassbox should still record enough runtime identity on Runs / Trace to reproduce behavior.
+
+Useful metadata includes:
+
+```text
+Pi version / commit
+Lora PI Kit version / commit
+active Kit profile
+lora-sys/skills source commit
+skills.lock identity
+selected external package / integration versions when material
+model / provider identity
+```
+
+This metadata may live in Run / runtime configuration records and Trace projections.
+
+Do not store the entire Kit package payload in Turso merely for provenance.
+
+## Product truth vs Pi / Lora PI Kit state
 
 ```text
 Glassbox / Turso
+  Agent identity
+  Principal
+  Authorization
+  Conversation
   Task truth
+  Taste / Memory truth
+  Delivery policy
+  product evidence
+
+Pi
+  runtime session / Agent execution
+
+Lora PI Kit
+  Package resources
+  pinned Skill snapshot
+  profile
+  MCP registry / adapter
+  runtime hooks
+  templates / compatibility locks
+```
+
+Neither Pi Session nor Kit Profile replaces durable Glassbox product state.
+
+The same Kit can be used by several roles without making those roles the same Agent identity.
+
+## Product truth vs Herdr live execution
+
+```text
+Glassbox / Turso
+  Task
   TaskAttempt history
   Attention Queue
   WorkerBinding
   authorization
   review / rework / acceptance
-  Conversation and Run linkage
+  Conversation / Run linkage
 
 Herdr
   live session
@@ -101,12 +158,12 @@ Herdr
   worktree
   pane
   terminal process
-  recognized Agent
+  recognized coding Agent
   working / blocked / done / idle / unknown
   live output
 ```
 
-Herdr lifecycle data is an execution observation.
+Herdr lifecycle state is an execution observation.
 
 ```text
 Herdr agent = done
@@ -114,13 +171,13 @@ Herdr agent = done
 Glassbox Task = DONE
 ```
 
-A `done` worker normally produces a review state. An authorized Glassbox Action records acceptance or rework.
+If Herdr becomes temporarily unreachable, Glassbox records the observation as stale / unknown and reconciles after reconnect.
 
-If Herdr becomes temporarily unreachable, Glassbox records the observation as stale / unknown and reconciles after reconnect. A connection gap does not silently change Task truth.
+A connection gap does not silently change Task truth.
 
-## Learning truth vs Runtime projection
+## Learning truth vs runtime projection
 
-Rules, Skills, Taste, and Memory have different authority and storage semantics.
+Rules, Skills, Taste, and Memory have different authority.
 
 ```text
 Glassbox / Turso
@@ -128,190 +185,160 @@ Glassbox / Turso
   TasteCandidate
   TasteEntry
   confidence
-  global / project scope
-  promotion / demotion state
+  scope
+  promotion / demotion
   Semantic Memory
   Episodic Memory
   retrieval evidence
-  authorization and visibility
-
-Lora PI Kit
-  Pi-specific feedback bridge
-  Taste / Memory request hooks
-  selected Context injection
-  not canonical Taste or Memory truth
+  visibility / authorization
 
 lora-sys/skills
-  reusable validated Skill source where applicable
+  canonical reusable Skill source
+
+Lora PI Kit release
+  pinned bundled Skill snapshot
+  Taste / Feedback / Memory runtime bridges
+
+Pi Context
+  only the selected task-relevant authorized projection
 ```
 
 Taste is preference, not permission.
 
 A single edit is evidence, not a permanent preference.
 
-Runtime-specific observations must map back to Glassbox-owned FeedbackEvent records before they influence durable Taste.
+Large before/after feedback artifacts may live in R2 while Turso stores structured FeedbackEvent metadata and references.
 
-Large before/after artifacts may live in R2, while Turso stores structured feedback metadata and references.
+## Herdr synchronization
 
-## Agent Operations synchronization
+Glassbox maintains long-lived Herdr integration through `HerdrBridge`.
 
-Glassbox maintains a long-lived Herdr connection through `HerdrBridge`.
-
-The bootstrap and reconnect rule is:
+Bootstrap / reconnect:
 
 ```text
 connect event stream
-→ events.subscribe
-→ receive subscription acknowledgement
+→ subscribe
+→ receive acknowledgement
 → session.snapshot
-→ reconcile snapshot against durable WorkerBinding / TaskAttempt state
+→ reconcile against durable WorkerBinding / TaskAttempt state
 → consume later events
 ```
 
-The main Agent receives a compact `AgentOpsSnapshot` instead of all raw Herdr events.
+The main Agent receives a compact `AgentOpsSnapshot`, not all raw Herdr events.
 
 Useful product projections include:
 
 ```text
 messages awaiting response
-open Tasks
-queued Tasks
-running Tasks
-waiting Tasks
+open / queued / running / waiting Tasks
 Tasks awaiting review
 blocked workers
-approvals requiring action
-failed work
+approvals
+failures
 workers working / idle / unknown
 done today
 ```
 
-Raw Herdr event volume is not itself a user-facing metric. Normalize and deduplicate lifecycle transitions before exposing product status.
+Raw event volume is not itself a user-facing metric.
 
 ## Storage split
 
 ```text
 Turso
-  structured product state
-  Task / Attention / WorkerBinding truth
-  Feedback / Taste / Memory truth
+  structured product truth
   searchable metadata
-  FTS
-  vector search
-  statistics and product projections
+  FTS / Vector when later used
+  retrieval records
+  product statistics
 
 R2
-  large objects
-  raw evidence
-  large worker / Tool results
+  Raw Trace
+  large Tool / Worker output
   large feedback payloads
-  attachments
-  artifacts
-  backups
+  screenshots / HAR / HTML
+  attachments / artifacts / archives / backups
+
+Lora PI Kit
+  versioned Pi distribution package
+  not canonical Glassbox product truth
 
 Herdr
   live coding-worker execution state
-  workspaces / worktrees / panes
   not canonical Task truth
 
-Lora PI Kit
-  Pi runtime customization and learning bridge
-  not canonical Taste / Memory truth
-
 AgentMail
-  email transport and mailbox
-
-Glassbox server
-  main Agent execution
-  authorization
-  Task / Agent Ops control
-  Taste / Memory selection
-  Herdr reconciliation
-  APIs
-  management UI
-  public Trace and Eval UI
+  later email transport
 ```
 
-## Supporting infrastructure
+## Product observability
+
+Glassbox server APIs are the canonical product observability surface.
+
+External provider dashboards, Pi TUI, Lora PI Kit package files, Herdr UI, and Moshi are not the authoritative Glassbox observability model.
+
+Owner views may eventually show:
 
 ```text
-Cloudflare Tunnel
-  private server ingress
-
-Cloudflare Access
-  owner admin perimeter
-
-Better Stack
-  infrastructure observability
-
-Infisical
-  secrets
-
-Hookdeck
-  webhook reliability
-
-QStash
-  later delayed and reliable HTTP task delivery when an active plan requires it
-
-SSH / Moshi
-  optional human remote operations access
-  never a product authority source
-```
-
-## Public observability
-
-All product statistics that Glassbox needs to display are exposed through Glassbox server APIs and rendered by the Web UI or an authorized Channel projection.
-
-External provider dashboards, Herdr UI, and Moshi are not the canonical Glassbox observability surface.
-
-The Owner management view may eventually show:
-
-```text
-Channel activity
-Conversation activity
+Channel / Conversation activity
 Authorization decisions
 Run / Tool / Delivery state
+Pi / Kit / profile / model identity
 Token / cost / latency
-Task and TaskAttempt state
+Task / TaskAttempt state
 Attention Queue
-WorkerBinding and Herdr observed state
+WorkerBinding / Herdr observed state
 blocked duration
 review / rework history
-reconciliation / connection health
+reconciliation health
 Feedback events
-Taste candidates and active Taste
-Taste confidence and scope
-correction / revert rates
+Taste candidates / confidence / scope
+Correction / Revert Rate
 Taste retrieval reason
-Memory candidates and promoted Memory
-Memory retrieval evidence
+Memory candidates / retrieval evidence
 ```
 
-The main Agent consumes narrower authorized projections rather than raw databases or all learning records.
+The main Agent receives narrower authorized projections rather than raw databases.
 
-Public visitors only receive read-only Trace or Eval views selected for publication by the Owner. Worker output, private Tasks, private Taste, Memory, feedback payloads, Herdr pane data, and private operational metadata are not public by default.
+Public visitors only receive sanitized, explicitly published Trace or Eval projections.
+
+Private Tasks, Taste, Memory, feedback payloads, Worker output, Herdr pane data, runtime credentials, and private operational metadata are not public by default.
 
 ## Server deployment rule
 
 Local testing and the production Linux server use the same product contracts.
 
-Target production host:
+Target host:
 
 ```text
 Linux server
   Glassbox server
-  Pi SDK + Lora PI Kit
+  Pi SDK
+  pinned Lora PI Kit
   NapCat
-  Herdr session server
-  coding Agents / worktrees
+  Herdr
+  coding Workers / worktrees
   Turso-compatible durable state
 ```
 
-Do not encode local GUI state, Moshi state, developer terminal window identifiers, or machine-specific absolute paths as durable domain truth.
+Do not encode desktop GUI state, Moshi state, developer terminal-window identity, or machine-specific absolute paths as durable domain truth.
+
+## Supporting infrastructure
+
+Potential supporting services remain implementation choices, not product authority:
+
+```text
+Cloudflare Tunnel
+Cloudflare Access
+Better Stack
+Infisical
+Hookdeck
+QStash
+SSH / Moshi
+```
 
 ## Not selected as core dependencies
 
-The current architecture does not require:
+The current architecture does not require these as core product-state dependencies:
 
 ```text
 Supabase
@@ -323,4 +350,4 @@ Elasticsearch
 Meilisearch
 ```
 
-Turso covers the current structured, full-text, vector, feedback, Taste, Memory, and statistics requirements. R2 covers large and raw data. Herdr covers live coding-worker execution and observation, not durable product state. Additional infrastructure should only be introduced when a concrete active-plan requirement cannot be handled by this map.
+Turso covers current structured / search / statistics needs. R2 covers large / raw data. Herdr covers live coding-worker execution. Lora PI Kit covers reproducible Pi distribution. Additional infrastructure should be introduced only for a concrete active-Plan requirement.
