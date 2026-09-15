@@ -4,83 +4,113 @@ Status: ROADMAP ONLY
 
 This file records sequencing and product direction. It is not an active implementation plan.
 
-The only active implementation plan remains `/.plans/03-personal-agent-foundation.md` until its completion gate passes.
+The only active implementation plan is `/.plans/03-personal-agent-foundation.md` until its completion gate passes.
 
 ## Product thesis
 
 Glassbox is a durable Personal Agent with explicit identity, authorization, persistent state, inspectable execution, learning, and evidence.
 
-The long-term product should remain understandable from two perspectives at the same time:
+The roadmap is now organized around usable product loops rather than isolated infrastructure milestones.
 
-```text
-Use the Agent
-Understand the Agent
-```
+The first loop is QQ because it gives Glassbox a real remote Channel, real multi-user identity, real private and group delivery, and a concrete place to prove authorization boundaries.
 
-The first is the runtime product. The second is the documentation and learning experience.
+## Runtime direction
 
-## Cross-cutting runtime direction
+Glassbox keeps product identity and trust semantics independent from the concrete execution runtime.
 
-Glassbox keeps its product and trust model independent from any single execution runtime.
-
-The preferred future local Agent runtime path is:
+The selected P3 runtime path is:
 
 ```text
 earendil-works/pi
-      |
-      v
+      ↓
 Lora PI Kit
-      |
-      v
+      ↓
+Pi SDK embedded in Glassbox server
+      ↓
 Glassbox Runtime Boundary
 ```
 
-Pi is the upstream runtime foundation. Lora PI Kit is the maintainer-owned configuration and extension layer. Glassbox keeps Agent identity, authorization, Conversation, persistence, Run identity, and Trace.
+Pi provides runtime primitives and SDK surfaces.
 
-Codex and Claude Code remain supported runtime adapters while this path matures and may remain useful for compatibility, fallback, specialist execution, and differential Eval.
+Lora PI Kit provides owned Pi configuration, Extensions, selected Skills, prompts, presets, observability hooks, bootstrap tooling, and compatibility metadata.
 
-Plan 03 does not migrate the runtime. The first Pi integration slice starts only after the P3 trust boundary is stable and must use a supported Pi boundary such as SDK or RPC before considering a core patch.
+Glassbox keeps:
 
-See [`../docs/runtime-strategy.md`](../docs/runtime-strategy.md) and [`../upstream/pi/SOURCES.md`](../upstream/pi/SOURCES.md).
+```text
+Agent identity
+Principal
+Authorization
+Conversation
+protected Context
+Tool authorization
+Delivery authorization
+Turso state
+Run identity
+Raw Trace
+```
+
+Codex and Claude Code remain supported adapters for compatibility, fallback, specialist execution, and later differential Eval. P3 does not delete them.
+
+Use supported Pi settings, package, Skill, Extension, custom Tool, ResourceLoader, and SDK boundaries before considering any Pi core patch.
 
 ## Sequence
 
-### P3 — Trusted Personal Agent Foundation
+### P3 — QQ Personal Agent Closed Loop
 
 Current active plan.
 
+P3 is the first usable Glassbox product loop.
+
 ```text
-Identity
+QQ
+→ NapCat
+→ OneBot 11 Channel Adapter
+→ Ingress Gate
+→ Identity + Conversation
 → Authorization
-→ Conversation
-→ Turso persistence
-→ Run / Authorization Trace
+→ Authorized Context
+→ Pi SDK + Lora PI Kit
+→ Tool Gate
+→ Delivery Gate
+→ QQ reply
+→ Turso + Trace
 ```
 
-Goal: prove Owner and Visitor can use the same Agent without crossing permission boundaries.
-
-### P4 — First real remote Channel
-
-Choose one real external entry point only after P3 passes.
-
-Likely candidates include Web public access, WeChat, or QQ.
-
-The Channel must reuse the same Agent identity, Principal resolution, authorization, Conversation, persistence, and Trace boundaries proven in P3.
-
-Do not create a separate Agent implementation per Channel.
-
-Runtime choice remains behind the Glassbox Runtime Boundary. A Channel must not depend on Pi-specific, Codex-specific, or Claude-specific identity or authorization semantics.
-
-### P5 — Memory and Authorized Retrieval
-
-Introduce durable Memory only after authorization and Conversation isolation are real.
-
-Target mechanisms:
+P3 includes:
 
 ```text
-Memory Candidate
-→ permission / visibility inheritance
-→ value and reliability scoring
+deterministic test environment
+real QQ acceptance environment
+Lora PI Kit MVP
+Pi SDK Runtime
+server-side hard authorization gates
+scope-based private and group Conversations
+Turso persistence
+NapCat / OneBot QQ Channel
+private chat
+group @ activation
+message dedupe
+reconnect handling
+restart recovery
+adversarial canary tests
+Trace evidence
+```
+
+P3 completion means a real Owner and Visitor can use the same Personal Agent through QQ private chat and a test group without crossing permission or delivery boundaries.
+
+See the active plan for the full completion gate.
+
+### P4 — Memory and Authorized Retrieval
+
+After the first real QQ loop works, add durable Memory without weakening the P3 trust model.
+
+Target flow:
+
+```text
+Run / Conversation evidence
+→ Memory Candidate
+→ visibility inheritance
+→ value / reliability checks
 → deduplication / contradiction handling
 → promotion
 → authorized retrieval
@@ -98,15 +128,19 @@ authorization scope
 + context budget
 ```
 
-OpenSquilla is a primary reference for hybrid retrieval mechanics. `zhibao-dev/Learning-Multi-Factor-Memory` and `langchain-ai/langmem` remain primary references for memory value and consolidation.
+Protected Memory must be filtered before model-visible retrieval results are assembled.
 
-Retrieval policy that affects protected product data stays in Glassbox. Generic Pi workflow helpers may live in Lora PI Kit only when they cannot widen authorization or bypass Glassbox retrieval boundaries.
+Primary references:
 
-### P6 — Efficient Agent Runtime
+```text
+zhibao-dev/Learning-Multi-Factor-Memory
+langchain-ai/langmem
+TokenRhythm/opensquilla for retrieval mechanics
+```
 
-Use `TokenRhythm/opensquilla` as the main efficiency-layer reference.
+### P5 — Efficient Runtime and Observability
 
-Pi plus Lora PI Kit is the preferred local runtime path for reusable runtime customization. Efficiency mechanisms belong in Lora PI Kit when they are generic Pi workflow behavior. They stay in Glassbox when they affect protected Context, product routing policy, durable state, or evidence semantics.
+Optimize the working Pi path only after P3 proves correctness and P4 gives retrieval real data.
 
 Target capabilities:
 
@@ -117,41 +151,47 @@ Tool Result Projection
 Token Estimation
 Execution Routing
 Thinking-depth selection
-Prompt / context compression policy
+Prompt / Context compression policy
 Duplicate retrieval prevention
-Semantic cache with permission-scoped keys
+permission-scoped semantic cache
+Runtime usage / quota / health collection
 Routing observability
 Routing Eval
 ```
 
-A future routing decision should produce an explicit execution policy rather than only a model name:
+Generic Pi workflow mechanisms belong in Lora PI Kit when they do not affect Glassbox product authorization or protected-data semantics.
+
+Glassbox keeps any mechanism that changes protected Context visibility, product routing policy, durable state, or evidence semantics.
+
+Primary references:
 
 ```text
-ExecutionPolicy
-  modelTier
-  provider
-  model
-  thinkingLevel
-  promptPolicy
-  contextBudget
-  retrievalBudget
-  toolBudget
-  workerPolicy
-  ensemblePolicy
-  costCeiling
+TokenRhythm/opensquilla
+Javis603/token-monitor
+OpenTelemetry concepts
 ```
 
-Authorization always happens before routing-sensitive context assembly.
+Success is measured with quality, authorization invariant violations, token usage, cost, and latency. Do not claim efficiency from intuition alone.
 
-The router may reduce cost or increase capability. It may never widen authority.
+### P6 — Durable Long Work and Workers
 
-Raw Trace remains full evidence even when model-facing context is compressed.
+Introduce durable task semantics and specialist delegation.
 
-Success must be measured with Eval rather than claimed from intuition. Compare at minimum quality, invariant violations, input/output tokens, cost, and latency with routing enabled and disabled.
+Target semantics:
 
-### P7 — Durable Long Work and Workers
-
-Introduce durable LongTask semantics and specialist Worker delegation.
+```text
+stable task id
+steps
+event history
+checkpoint
+retry
+waiting
+signal
+child task
+worker job
+cancellation
+continuation
+```
 
 Primary references:
 
@@ -160,9 +200,44 @@ temporalio/sdk-typescript
 keli-wen/agy-staff
 ```
 
-Worker authority can only shrink from caller authority.
+Worker authority must satisfy:
 
-A worker runtime may use Pi, Codex, Claude Code, AGY, or another execution backend. Runtime selection does not change the caller's effective Glassbox authority.
+```text
+worker_permissions ⊆ delegated_permissions ⊆ caller_permissions
+```
+
+A Worker may execute through Pi, Codex, Claude Code, AGY, or another backend. Runtime selection never widens authority.
+
+### P7 — More Channels and Personal Domains
+
+Expand beyond the first QQ loop only after the shared trust and Conversation model has proven itself.
+
+Candidates include:
+
+```text
+Web public access
+WeChat
+Telegram
+Discord
+Slack
+Email
+Calendar
+```
+
+New Channels must reuse the same:
+
+```text
+ChannelIdentity
+Principal
+Conversation scope
+Authorization
+Context Gate
+Tool Gate
+Delivery Gate
+Trace
+```
+
+Mail and Calendar remain protected product Domains, not unrestricted MCP access.
 
 ### P8 — Eval, Learning, Assets, and Skill Evolution
 
@@ -176,27 +251,33 @@ Run / Trace
 → Promotion
 ```
 
-Primary references include Inspect AI, SkillClaw, CoEvoSkills, Voyager, Dagster, Generative Agents, and memos.
+Target capabilities include:
 
-Validated reusable Pi workflow procedures may be published through Lora PI Kit or the existing `lora-sys/skills` repository. Glassbox remains the source of product evidence, permissions, and promotion decisions.
+```text
+Benchmark Eval
+Differential Eval
+Invariant Eval
+Permission Eval
+Routing Eval
+Skill generation
+Skill verification
+Asset lineage
+Journal
+Monthly review
+Arena experiments
+```
+
+Primary references include Inspect AI, SkillClaw, CoEvoSkills, Voyager, Dagster, Generative Agents, OpenSpiel, Sotopia, and memos.
+
+Validated reusable Pi workflow procedures may be published through Lora PI Kit or `lora-sys/skills`. Glassbox remains the source of product evidence, permissions, and promotion decisions.
 
 ## Documentation and Learning track
 
-The documentation site is a product track, not an afterthought.
+The documentation site remains a parallel product track.
 
-Its goal is to help a new user understand the key ideas behind Glassbox without reading the codebase first.
+It must never present a planned mechanism as implemented.
 
-The site should teach concepts with three layers:
-
-```text
-Explain
-→ Visualize
-→ Let the reader manipulate the mechanism
-```
-
-Documentation work can begin before later runtime phases, but a page must never present a planned mechanism as implemented.
-
-Every substantial feature page should visibly indicate one of:
+Every substantial capability page shows one of:
 
 ```text
 Implemented
@@ -206,84 +287,46 @@ Planned
 
 ### D0 — Documentation foundation
 
-Can start immediately without changing runtime scope.
+Can proceed during P3 without changing runtime scope.
 
-Create the information architecture, terminology, diagrams, deterministic fixtures, and demo specifications.
+Create information architecture, terminology, diagrams, synthetic fixtures, and demo specifications.
 
 ### D1 — P3 interactive lessons
 
-After P3 contracts stabilize, publish interactive demos for:
+After P3 contracts stabilize, publish lessons for:
 
 ```text
-Identity vs Authorization
 Owner vs Visitor
+private vs group Conversation
+Who / Where / What / How / Audience authorization
 Default deny
-Approval vs Permission
+Permission vs Approval
 Authorize before Context
-Conversation vs Session vs Run
+Tool re-authorization
+Delivery Gate
+Conversation vs Pi Session vs Run
 Authorization Trace
 Raw Trace vs Derived State
 ```
 
-These demos should use synthetic data and the same conceptual contracts as production code.
+Use synthetic deterministic fixtures derived from the real P3 contracts.
 
 ### D2 — Memory and retrieval lab
 
-After P5 exists, let readers manipulate:
-
-```text
-visibility scope
-keyword vs vector weight
-time decay
-source weighting
-MMR diversity
-result count
-context budget
-```
-
-The demo must make it obvious that permission filtering happens before protected content enters retrieval results shown to the model.
+After P4 exists, let readers manipulate visibility scope, lexical/vector weight, time decay, source weighting, diversity, result count, and context budget.
 
 ### D3 — Routing and token economy lab
 
-After P6 exists, let readers compare:
+After P5 exists, let readers compare routing, model tier, thinking depth, context budget, tool-result projection, and retrieval budget with reproducible fixtures.
 
-```text
-router off vs on
-small vs large model tier
-thinking depth
-prompt policy
-context budget
-tool-result projection
-retrieval budget
-```
+### D4 — LongTask and learning labs
 
-Show resulting quality, token usage, estimated cost, latency, and selected routing reason using fixed reproducible fixtures first.
+After later runtime phases, add LongTask state-machine, Trace-to-Canvas, Skill promotion, Eval, and learning-loop demonstrations.
 
-### D4 — Trace-to-Canvas and LongTask labs
+## Stable roadmap rules
 
-Later interactive lessons can show:
-
-```text
-Raw Events
-→ Derived State
-→ Canvas Projection
-```
-
-and:
-
-```text
-LongTask
-→ checkpoint
-→ waiting
-→ signal
-→ retry
-→ resume
-```
-
-## Documentation is not authority
-
-Interactive demos explain mechanisms. They do not grant permissions, modify production state, or act as an authorization source.
-
-The documentation site must never require access to real user Memory, private Conversations, credentials, production Trace, or private Tools to demonstrate a concept.
-
-If a future live-demo mode is added, it must go through the same server-side authorization boundary as the product.
+- Active implementation scope comes from the current Plan file, not from future roadmap sections.
+- Upstream references are research and implementation material, not automatic dependencies.
+- Glassbox authorization always wins over runtime configuration, Pi Extensions, Skills, model output, Channel input, or Worker behavior.
+- A new runtime, Channel, Memory system, cache, or Worker cannot bypass the hard gates proven in P3.
+- Build one usable vertical loop at a time and preserve focused regression coverage for working behavior.
