@@ -8,13 +8,17 @@ This is the only active implementation plan in the repository.
 
 Ship the first genuinely usable Glassbox Personal Agent closed loop.
 
-Plan 03 ends only when the same durable Personal Agent can be used from real QQ private chat and a real QQ group through NapCat, executes through the Pi SDK with Lora PI Kit loaded, persists Conversation state in Turso, enforces server-side authorization at every protected boundary, and records enough Trace to explain every allow, deny, tool execution, and delivery decision.
+Plan 03 ends only when the same durable Personal Agent can be used from real QQ private chat and a real QQ group through NapCat, executes through the Pi SDK with Lora PI Kit loaded, persists Conversation state in Turso, enforces server-side authorization at every protected boundary, and can coordinate real coding work through a bidirectional Herdr operations layer.
 
 The acceptance sentence is:
 
-> A real Owner and a real Visitor can talk to the same Glassbox Personal Agent through QQ private chat and a test QQ group. Pi SDK executes the Agent with Lora PI Kit resources. Unauthorized data never reaches Pi, protected Tools cannot run without a fresh authorization decision, private results cannot be delivered to an unauthorized audience, Conversations survive restart, duplicate QQ events do not produce duplicate replies, and every decision can be inspected in Trace.
+> A real Owner and a real Visitor can talk to the same Glassbox Personal Agent through QQ private chat and a test QQ group. Pi SDK executes the Agent with Lora PI Kit resources. Unauthorized data never reaches Pi, protected Tools cannot run without a fresh authorization decision, private results cannot be delivered to an unauthorized audience, Conversations survive restart, duplicate QQ events do not produce duplicate replies, and the main Agent can see, delegate, monitor, review, rework, and complete multiple Herdr-backed tasks without losing task truth when Herdr reconnects.
 
-## The closed loop
+## The closed loops
+
+Plan 03 has two connected loops.
+
+### Personal Agent loop
 
 ```text
 QQ private / group message
@@ -48,7 +52,39 @@ QQ reply
 Turso durable state + Raw Trace
 ```
 
-Plan 03 is complete only when this path works end to end with both deterministic automated tests and a real QQ acceptance environment.
+### Agent Operations loop
+
+```text
+QQ / Workbench request
+        ↓
+Main Agent
+        ↓
+Attention Queue + Task Registry
+        ↓
+Ops Tools
+        ↓
+Herdr Bridge
+        ↓
+Herdr workspace / worktree / pane / coding Agent
+        ↓
+Herdr event stream
+        ↓
+Ops Reconciler
+        ↓
+TaskAttempt + WorkerBinding + AttentionItem
+        ↓
+Main Agent review
+        ↓
+ACCEPT → DONE
+or
+REWORK → next TaskAttempt
+        ↓
+Trace + completion notification
+```
+
+The two loops share the same Principal, Authorization, Conversation, Task, Run, persistence, and evidence boundaries.
+
+Plan 03 is complete only when both loops work with deterministic tests and the required real acceptance environment.
 
 ## Runtime decision
 
@@ -126,7 +162,7 @@ compat/
 
 `lora-sys/skills` remains the canonical source for reusable Agent Skills. Lora PI Kit selects or installs Skills. It does not duplicate all Skill source by default.
 
-Upstream projects may provide mechanisms or patterns, but ownership stays explicit:
+Ownership stays explicit:
 
 ```text
 Pi runtime customization
@@ -135,9 +171,359 @@ Pi runtime customization
 QQ transport and OneBot handling
 → Glassbox QQ Channel
 
-Identity, authorization, Conversation, protected Context, delivery policy, durable state, Trace
+Identity, authorization, Conversation, protected Context, delivery policy, durable state, Task truth, Trace
 → Glassbox
+
+Workspace / worktree / pane / terminal Agent lifecycle
+→ Herdr
 ```
+
+## Agent Operations decision
+
+Herdr is the selected Agent Operations execution layer for P3.
+
+Herdr is not the Personal Agent identity, not the Glassbox Task database, and not the authorization source.
+
+Glassbox and Herdr communicate in both directions.
+
+### Glassbox to Herdr
+
+Glassbox may use the Herdr control surface to:
+
+```text
+inspect the current session
+create or open workspaces and worktrees
+start a supported coding Agent
+send a prompt
+wait for lifecycle state
+read Agent or pane output
+send deliberate follow-up input
+stop or cancel only through an explicit authorized Action
+```
+
+### Herdr to Glassbox
+
+Glassbox subscribes to Herdr lifecycle events and projects them into product state:
+
+```text
+workspace / worktree changes
+pane changes
+Agent started
+Agent working
+Agent blocked
+Agent done
+Agent replaced or disappeared
+connection lost
+connection restored
+```
+
+Herdr facts are execution facts. They are not automatically Glassbox Task decisions.
+
+For example:
+
+```text
+Herdr agent = done
+≠
+Task = DONE
+```
+
+A worker reaching `done` normally moves the TaskAttempt to review. Glassbox or an authorized reviewer decides whether to accept or rework it.
+
+## Ops domain
+
+P3 introduces the smallest durable operations model needed for one main Agent to coordinate multiple pieces of work.
+
+It is deliberately smaller than the future LongTask engine.
+
+### AttentionItem
+
+Represents something that currently needs the main Agent or a human to act.
+
+Minimum kinds:
+
+```text
+unanswered_message
+worker_blocked
+approval_required
+task_review
+task_failed
+delivery_failed
+ops_connection_problem
+```
+
+An AttentionItem must point back to the relevant Conversation, Task, TaskAttempt, Run, WorkerBinding, or delivery record when one exists.
+
+### Task
+
+Task is durable product truth for a piece of work.
+
+Minimum state machine:
+
+```text
+NEW
+→ QUEUED
+→ ASSIGNED
+→ RUNNING
+→ WAITING_INPUT
+→ REVIEW
+  ├─ ACCEPTED → DONE
+  └─ REWORK → RUNNING through a new or resumed TaskAttempt
+
+FAILED
+CANCELED
+```
+
+Do not infer `DONE` only from terminal or Agent lifecycle state.
+
+Task stores at least:
+
+```text
+id
+title
+source
+status
+priority
+createdByPrincipalId
+conversationId?
+acceptanceCriteria?
+createdAt
+updatedAt
+```
+
+### TaskAttempt
+
+One concrete execution or rework attempt.
+
+```text
+id
+taskId
+attemptNumber
+status
+workerBindingId?
+startedAt?
+endedAt?
+resultRef?
+reviewDecision?
+```
+
+Rework does not erase the previous attempt.
+
+### WorkerBinding
+
+Maps Glassbox work to the real Herdr execution location.
+
+```text
+id
+taskId
+taskAttemptId
+herdrSession
+workspaceId
+tabId?
+paneId
+worktreePath?
+branch?
+agentName?
+agentKind
+lastObservedAgentState
+lastObservedAt
+```
+
+A binding is execution metadata. It does not replace Task state.
+
+### AgentOpsSnapshot
+
+A compact projection for the main Agent.
+
+At minimum expose counts such as:
+
+```text
+attention.total
+attention.unansweredMessages
+attention.approvals
+attention.blockedWorkers
+attention.awaitingReview
+attention.failures
+
+tasks.open
+tasks.queued
+tasks.running
+tasks.waiting
+tasks.review
+tasks.doneToday
+
+workers.total
+workers.working
+workers.blocked
+workers.idle
+workers.done
+workers.unknown
+```
+
+Do not inject every Task body into every model turn. Give the main Agent a small operational summary and let it call Ops Tools for detail.
+
+## Herdr Bridge
+
+Production integration should use a Glassbox-owned `HerdrBridge`.
+
+The bridge may use Herdr CLI wrappers for simple one-shot development and diagnostics. The long-lived Glassbox integration uses the local Herdr socket API for direct request/response control and event subscriptions.
+
+Conceptual interface:
+
+```text
+HerdrBridge
+  connect
+  disconnect
+  getSnapshot
+  subscribe
+  createWorktree
+  openWorktree
+  startAgent
+  promptAgent
+  waitAgent
+  readAgent
+  sendAgentKeys when deliberate interaction is required
+  stop or cancel through explicit policy-controlled action
+```
+
+Use Herdr public methods and generated protocol schema. Do not parse the TUI screen as the primary integration protocol.
+
+### Bootstrap and reconciliation
+
+Avoid the event gap between a one-time snapshot and the event subscription.
+
+Required startup / reconnect order:
+
+```text
+open event subscription connection
+→ events.subscribe
+→ wait for subscription acknowledgement
+→ request session.snapshot
+→ reconcile snapshot with durable Glassbox WorkerBindings / TaskAttempts
+→ apply later events continuously
+```
+
+Herdr events do not replay everything that happened before a subscription. After reconnect, snapshot and reconcile again.
+
+`OpsReconciler` is responsible for converting Herdr execution state into product projections.
+
+Examples:
+
+```text
+Herdr working
+→ WorkerBinding state = working
+→ TaskAttempt = RUNNING
+
+Herdr blocked
+→ WorkerBinding state = blocked
+→ Task = WAITING_INPUT when the active attempt truly needs input
+→ create AttentionItem(worker_blocked)
+
+Herdr done
+→ TaskAttempt execution settled
+→ Task = REVIEW
+→ create AttentionItem(task_review)
+
+Herdr connection lost
+→ do not mark active Tasks DONE or FAILED only because monitoring disappeared
+→ mark observation stale / unknown
+→ create ops_connection_problem when useful
+```
+
+## Main Agent Ops Tools
+
+The main Pi Agent interacts with Agent Operations through Glassbox Tools, not by receiving unrestricted Herdr shell access.
+
+P3 minimum Tool surface:
+
+```text
+ops_status
+task_list
+task_get
+task_create
+task_delegate
+worker_status
+worker_read
+worker_prompt
+task_accept
+task_rework
+task_cancel
+```
+
+These Tools must expose explicit resource and action semantics so Glassbox authorization can decide whether the current Principal may use them.
+
+A remote QQ user does not automatically gain the right to:
+
+```text
+read unrelated project panes
+prompt arbitrary coding Agents
+stop someone else's worker
+remove a worktree
+accept privileged work
+inspect private Task results
+```
+
+Herdr control is a protected capability.
+
+## herdr-workflows boundary
+
+`aorumbayev/herdr-workflows` is an approved reference and optional execution helper for short deterministic stage sequences.
+
+Good fit:
+
+```text
+implement
+→ test
+→ review command
+```
+
+Glassbox remains the owner of Task truth, acceptance, rework, prioritization, and the cross-attempt lifecycle.
+
+Do not move this loop into workflow YAML as the source of truth:
+
+```text
+review fails
+→ rework
+→ new attempt
+→ review again
+```
+
+A useful rule is:
+
+```text
+Glassbox owns what must be done and whether it is accepted.
+Herdr owns where and how the live coding Agent is running.
+herdr-workflows may run a bounded stage recipe.
+```
+
+## Local test to server deployment invariant
+
+P3 is developed locally but must not assume the final runtime is a desktop-only process.
+
+Target deployment shape:
+
+```text
+Linux server
+  Glassbox server
+  Pi SDK + Lora PI Kit
+  NapCat
+  Herdr session server
+  coding Agent processes / worktrees
+  Turso-compatible durable state
+```
+
+When Glassbox and Herdr run on the same host, use the local Herdr control boundary. Human remote access may attach over SSH, including through clients such as Moshi, without changing Glassbox product semantics.
+
+Do not store these as product truth:
+
+```text
+local GUI state
+developer terminal window identity
+machine-specific absolute paths that cannot be configured
+Moshi client state
+Herdr sidebar presentation
+```
+
+Local and server deployments must use the same Task, WorkerBinding, Authorization, Trace, and reconciliation contracts.
 
 ## Security model: hard gates, not prompt rules
 
@@ -270,21 +656,20 @@ Conceptual flow:
 
 ```text
 Pi requests Tool
-→ glassbox-policy-bridge receives tool_call
-→ build AuthorizationRequest from current Principal, location, resource, action, tool and audience
+→ build AuthorizationRequest
 → call Glassbox Authorization Engine
 → ALLOW: execute
 → DENY: block
-→ REQUIRES_APPROVAL: create approval path and do not execute until the explicit policy path is satisfied
+→ REQUIRES_APPROVAL: create approval path and do not execute until satisfied
 ```
 
 QQ P3 uses a strict Tool allowlist.
 
 Do not expose unrestricted general shell execution to the QQ Runtime in P3.
 
-In particular, generic `bash` or `powershell` must not become a remote escape hatch around resource authorization. Remote QQ execution should use explicit Tools with explicit resource/action semantics so the Authorization Engine can make a meaningful decision.
+Generic `bash` or `powershell` must not become a remote escape hatch around resource authorization.
 
-Local coding workflows may continue to use broader tooling outside this QQ policy profile.
+Herdr Ops Tools follow the same rule. The main Agent gets explicit operations such as `task_delegate` and `worker_read`, not unrestricted remote terminal authority.
 
 ### Gate 4 — Delivery Gate
 
@@ -306,27 +691,11 @@ Owner in QQ group
   → deny delivery unless that data has been explicitly shared to the group
 ```
 
-Model output must carry or derive an effective visibility label based on protected sources and Tool results used by the Run.
-
-At minimum, Delivery Gate evaluates:
-
-```text
-source visibility
-current Principal
-Conversation scope
-audience
-explicit Share state
-```
-
-An explicit Share is a named Action. It may require approval, but Approval does not invent access that the policy otherwise forbids.
+Model output must carry or derive an effective visibility label based on protected sources, Task results, Worker outputs, and Tool results used by the Run.
 
 ## Conversation model
 
-The old assumption that every Conversation belongs directly to one `userId` is insufficient for group chat.
-
 Use a scope-based Conversation identity.
-
-Conceptual shape:
 
 ```text
 Conversation
@@ -339,33 +708,19 @@ Conversation
   updatedAt
 ```
 
-P3 examples:
+Examples:
 
 ```text
 QQ private chat
-  channel = qq
   scopeType = direct
   scopeKey = qq:user:<qq-id>
 
 QQ group
-  channel = qq
   scopeType = group
   scopeKey = qq:group:<group-id>
 ```
 
 The Conversation may be shared by a group, but every Run records the real acting Principal.
-
-```text
-Run
-  id
-  conversationId
-  principalId
-  runtime
-  runtimeSessionId?
-  deliveryAudience
-  startedAt
-  endedAt?
-```
 
 Keep these boundaries explicit:
 
@@ -375,6 +730,10 @@ User ≠ Principal
 Conversation ≠ Principal
 Conversation ≠ Pi Session
 Pi Session ≠ Run
+Task ≠ Run
+Task ≠ Herdr Agent
+TaskAttempt ≠ Herdr pane
+Herdr state ≠ acceptance decision
 Actor permission ≠ Delivery permission
 ```
 
@@ -382,7 +741,7 @@ Actor permission ≠ Delivery permission
 
 Plan 03 uses Turso or SQLite-compatible Turso local state behind a narrow server-side persistence boundary.
 
-Persist only what this closed loop needs first:
+Persist the structures needed by the closed loops:
 
 ```text
 agents
@@ -397,11 +756,15 @@ runs
 message dedupe keys
 runtime session bindings
 resource visibility / share metadata
+attention_items
+tasks
+task_attempts
+worker_bindings
 ```
 
 Raw Trace remains append-only evidence outside the relational product-state model when appropriate.
 
-A restart must not silently merge private and group Conversations or restore stale permissions.
+A restart must not silently merge private and group Conversations, restore stale permissions, lose accepted Task state, or reinterpret a Herdr monitoring gap as task completion.
 
 ## QQ Channel
 
@@ -428,18 +791,9 @@ Do not make NapCat storage, WebUI state, or QQ protocol details part of the Glas
 
 Do not put QQ transport code into Lora PI Kit.
 
-Primary references for this slice:
-
-```text
-NapNeko/NapCatQQ
-botuniverse/onebot-11
-```
-
-Prefer OneBot-compatible boundaries so the application-side Channel logic does not depend on undocumented NapCat internals.
-
 ## Test environments
 
-Plan 03 requires two test layers.
+Plan 03 requires deterministic tests plus real integration acceptance.
 
 ### A. Deterministic automated environment
 
@@ -456,22 +810,20 @@ Disposable Turso / SQLite database
 isolated Pi agentDir
 Lora PI Kit test preset
 recording or deterministic fake model/provider
+FakeHerdrBridge or deterministic Herdr protocol fixture
 synthetic protected resources
 Raw Trace capture
 ```
 
 Pi must use an isolated test directory instead of the user's normal `~/.pi/agent` state.
 
+Test Herdr orchestration through the `HerdrBridge` contract. Most domain tests use a fake bridge. Add focused integration tests against a real local Herdr session for protocol and reconciliation behavior.
+
 Suggested generated test root:
 
 ```text
 .glassbox-test/
   pi/
-    settings.json
-    models.json
-    skills/
-    extensions/
-    sessions/
   db/
     p3-test.db
   fixtures/
@@ -479,14 +831,14 @@ Suggested generated test root:
     groups.json
     resources.json
     onebot-events/
+    herdr-events/
   traces/
+  worktrees/
 ```
 
-This directory is disposable test state and should be ignored when appropriate. Do not commit credentials or real QQ session data.
+This directory is disposable test state. Do not commit credentials, real QQ session data, or user repositories.
 
-The SDK integration should accept explicit `agentDir`, model runtime, SessionManager, ResourceLoader, and Tool set so tests can replace real dependencies.
-
-### B. Real QQ acceptance environment
+### B. Real QQ and Herdr acceptance environment
 
 Use dedicated test identities:
 
@@ -500,23 +852,26 @@ Test QQ Group
   Visitor
 ```
 
-Use an isolated Glassbox test database and isolated Pi configuration for real acceptance.
+Use a dedicated Herdr test session or workspace group with disposable repositories/worktrees.
 
-The real acceptance environment proves transport and integration behavior that deterministic fixtures cannot prove:
+The real acceptance environment proves:
 
 ```text
 NapCat login and connection
-OneBot event shape
 private reply
 group @ activation
 group reply
-reconnect
-restart
-real Pi model execution
+Pi model execution
+Herdr connection
+session snapshot + event subscription reconciliation
+Task delegation to a coding Agent
+working / blocked / done observation
+review and rework
+restart / reconnect recovery
 real delivery
 ```
 
-Real QQ acceptance is not the default unit-test path.
+Real QQ and Herdr acceptance are not the default unit-test path.
 
 ## Canary security fixture
 
@@ -536,6 +891,8 @@ Visitor group chat
 Owner group chat
 prompt injection
 indirect Tool request
+Herdr worker result
+worker_read from unauthorized Task
 stale authorization state
 revoked permission
 cross-Conversation reuse
@@ -543,15 +900,7 @@ cross-group reuse
 Delivery Gate bypass attempt
 ```
 
-P3 fails if this canary appears in any unauthorized location, including:
-
-```text
-Pi model-visible Context
-unauthorized Tool result
-QQ output
-public or unauthorized Trace projection
-denial text that copies protected contents
-```
+P3 fails if this canary appears in any unauthorized location, including Pi model-visible Context, unauthorized Tool or Worker result, QQ output, public or unauthorized Trace projection, or denial text that copies protected contents.
 
 ## P3 acceptance fixture
 
@@ -584,6 +933,18 @@ Tools
   tool:public-status
   tool:owner-private-project-read
   tool:group-note-read
+  tool:ops-status
+  tool:task-delegate
+  tool:worker-read
+
+Tasks
+  task:queued
+  task:running
+  task:review
+
+Workers
+  worker:working
+  worker:blocked
 
 Secret
   PRIVATE_CANARY_7F92A1
@@ -597,13 +958,20 @@ Owner private + owner-private-project      → ALLOW and may deliver privately
 Visitor private + public-profile           → ALLOW
 Visitor private + owner-private-project    → DENY
 Visitor + owner-only Tool                  → DENY
-Owner group + owner-private-project        → read may be individually authorized, group delivery remains DENY
+Owner group + owner-private-project        → group delivery remains DENY
 Group + group-note                         → ALLOW when visible to that group
 Grant Visitor explicit private read        → next matching private operation ALLOW
 Revoke the Grant                           → next matching operation DENY
 Duplicate QQ event                         → one Run and one reply only
 Group message without activation           → no Agent Run
-Restart                                    → Conversations and current grants restore correctly
+Main Agent ops_status                      → correct task / attention / worker counts
+Delegate Task                              → WorkerBinding points to Herdr execution location
+Herdr blocked                              → AttentionItem created, Task not marked DONE
+Herdr done                                 → Task enters REVIEW, not DONE
+Review reject                              → REWORK with preserved previous attempt
+Review accept                              → Task becomes DONE
+Herdr reconnect                            → subscription + snapshot reconcile without losing Task truth
+Restart                                    → Conversations, grants, Tasks, attempts and bindings restore correctly
 ```
 
 ## Implementation slices
@@ -612,45 +980,19 @@ Restart                                    → Conversations and current grants 
 
 Build the deterministic acceptance fixture first.
 
-Define the minimum provider-neutral contracts for:
+Define the minimum contracts for identity, authorization, Conversation, Task, Attention, WorkerBinding, Run, and visibility.
 
-```text
-Principal
-Location
-Audience
-ResourceRef
-Action
-AuthorizationRequest
-AuthorizationDecision
-ConversationScope
-Run identity
-Visibility scope
-```
+Add Fake OneBot, disposable database, fake model/runtime injection, `FakeHerdrBridge`, Trace capture, and private canary assertion before real QQ or Herdr work.
 
-Add the fake OneBot path, disposable database, fake model/runtime injection, Trace capture, and private canary assertion before real QQ work.
-
-P3.0 is complete when the test harness can prove a trivial allow and deny without a real model or QQ account.
+P3.0 is complete when tests can prove a trivial authorization allow/deny and a trivial Task lifecycle without real external accounts.
 
 ### P3.1 — Lora PI Kit MVP
 
-Create `lora-sys/lora-pi-kit`.
-
-Implement only the P3 resources required for the Glassbox integration:
-
-```text
-Pi package manifest
-Glassbox policy bridge Extension
-Trace / usage hooks
-base prompt
-QQ and test presets
-Skill selection / sync
-install and doctor scripts
-Pi compatibility metadata
-```
+Create `lora-sys/lora-pi-kit` and implement only the resources required for this closed loop.
 
 Use upstream Pi package and Extension mechanisms. Do not fork Pi.
 
-P3.1 is complete when an isolated Pi test environment can load Lora PI Kit and report its expected resources without touching the user's normal Pi environment.
+P3.1 is complete when an isolated Pi test environment loads Lora PI Kit without touching the user's normal Pi environment.
 
 ### P3.2 — Pi SDK Runtime
 
@@ -660,7 +1002,7 @@ Requirements:
 
 ```text
 create / restore Pi session
-map Conversation to runtime session binding without equating the two concepts
+map Conversation to runtime session binding without equating them
 subscribe to Pi events
 collect output and usage metadata
 abort active execution
@@ -671,86 +1013,77 @@ use explicit Tool allowlists per runtime policy
 
 Keep Codex and Claude Code adapters intact for regression and later differential Eval.
 
-P3.2 is complete when deterministic Glassbox tests can run one prompt through Pi SDK and receive normalized Run events.
-
 ### P3.3 — Four hard authorization gates
+
+Implement Ingress, Context, Tool, and Delivery gates.
+
+Implement default deny, explicit allow, approval path, revocation, visibility labels, audience checks, and authorization for Herdr Ops Tools.
+
+P3.3 is complete when the canary attack suite fails closed before live QQ integration exists.
+
+### P3.4 — Conversation and Turso durability
+
+Implement scope-based Conversation identity and durable product state.
+
+Persist Task, AttentionItem, TaskAttempt, and WorkerBinding contracts in addition to the existing P3 identity / authorization state.
+
+Prove restart, reopen, grant/revoke persistence, task-state persistence, and safe runtime-session recreation.
+
+### P3.5 — Herdr Agent Operations Foundation
 
 Implement:
 
 ```text
-IngressGate
-AuthorizedContextBuilder
-AuthorizedToolExecutor / Pi policy bridge
-DeliveryGate
+HerdrBridge
+HerdrEventIngestor
+OpsReconciler
+AttentionQueue
+TaskRegistry
+TaskAttempt
+WorkerBinding
+AgentOpsSnapshot
+Ops Tools
 ```
 
-All four call or derive from the Glassbox Authorization Engine. None may rely on model obedience.
+Use Herdr public socket methods and protocol schema.
 
-Implement default deny, explicit allow, approval path, revocation, visibility labels, and audience checks.
-
-P3.3 is complete when the canary attack suite fails closed before any QQ integration exists.
-
-### P3.4 — Conversation and Turso durability
-
-Implement scope-based Conversation identity and durable state.
-
-Prove:
+Required behaviors:
 
 ```text
-Owner private Conversation isolation
-Visitor private Conversation isolation
-shared group Conversation with per-Run Principal identity
-restart
-reopen
-Grant / Revoke persistence
-runtime session binding restore or safe recreation
-no stale authorization after restart
+subscribe acknowledgement before bootstrap snapshot
+session.snapshot reconciliation
+create/open disposable worktree
+start Pi / Codex / Claude worker when supported by the configured profile
+prompt worker
+wait / read worker
+working / blocked / done projection
+blocked creates attention
+worker done creates review, not automatic task completion
+accept
+rework
+cancel through explicit authorized action
+reconnect reconciliation
 ```
 
-P3.4 is complete when the deterministic fixture survives process/database reopen.
+A bounded `herdr-workflows` recipe may be used for a deterministic stage sequence, but Glassbox owns Task truth and rework loops.
 
-### P3.5 — NapCat / OneBot QQ Channel
+P3.5 is complete when the main Agent can query `ops_status`, delegate one disposable task, observe its lifecycle, review it, request rework, and finish it through the Glassbox Ops contracts.
 
-Implement the smallest production Channel adapter.
+### P3.6 — NapCat / OneBot QQ Channel
 
-Handle:
-
-```text
-private message event
-group message event
-@ activation
-self-message filtering
-message/event deduplication
-send private message
-send group message
-connection health and reconnect
-```
+Implement the smallest production QQ Channel adapter with private messages, group messages, @ activation, dedupe, replies, connection health, reconnect, and self-message filtering.
 
 Normalize OneBot events into Glassbox Channel inputs before product logic.
 
-P3.5 is complete when Fake OneBot integration tests prove private and group flows and a local NapCat connection can be established in the acceptance environment.
+### P3.7 — End-to-end QQ + Ops closed loop
 
-### P3.6 — End-to-end QQ closed loop
+Wire the entire product path.
 
-Wire the entire path:
+Prove that a QQ request can be answered directly or converted into a durable Task, delegated through Herdr, observed by the main Agent, reviewed, and reported back through an authorized delivery path.
 
-```text
-QQ
-→ NapCat
-→ Glassbox Channel
-→ hard gates
-→ Pi SDK + Lora PI Kit
-→ hard gates
-→ QQ
-```
+Do not require every QQ request to become a Task. The main Agent decides whether it can answer synchronously or needs delegated work.
 
-Prove Owner private, Visitor private, Owner group, and Visitor group flows.
-
-P3.6 is complete when the bot can be used conversationally in the dedicated test QQ environment.
-
-### P3.7 — Adversarial, restart, dedupe, and Trace validation
-
-Run the full security and reliability matrix.
+### P3.8 — Adversarial, restart, dedupe, reconciliation, and Trace validation
 
 At minimum test:
 
@@ -758,16 +1091,14 @@ At minimum test:
 default deny
 explicit allow
 requires approval
-identity spoof attempt
-identity binding does not grant authority
+identity spoof
 private/public/group isolation
-Owner group exfiltration attempt
-Visitor private exfiltration attempt
-Visitor group exfiltration attempt
 prompt injection
 confused deputy
 protected Tool call
+Ops Tool authorization
 unrestricted shell unavailable in QQ policy
+unauthorized worker_read
 approval replay
 revocation
 stale Conversation
@@ -777,15 +1108,19 @@ cross-group contamination
 duplicate OneBot event
 reconnect replay
 self-message loop
-restart and resume
+Glassbox restart
+Herdr disconnect / reconnect
+snapshot reconciliation
+worker replacement or disappearance
+blocked attention dedupe
+worker done does not auto-accept Task
+rework preserves previous attempt
 denial Trace redaction
 Delivery Gate denial
 PRIVATE_CANARY_7F92A1 non-leak
 ```
 
-Each denial records enough metadata to explain the decision without copying the denied private payload.
-
-### P3.8 — Real QQ completion gate
+### P3.9 — Real completion gate
 
 Perform the real acceptance run with:
 
@@ -799,6 +1134,9 @@ Glassbox
 Pi SDK
 Lora PI Kit
 isolated Turso state
+Herdr
+one disposable test repository / worktree
+at least one real supported coding Agent in Herdr
 real configured model
 ```
 
@@ -819,6 +1157,11 @@ apps/server/src/
   runtime/pi/
   channel/qq/
   delivery/
+  ops/
+    tasks/
+    attention/
+    herdr/
+    reconcile/
   trace/
 ```
 
@@ -828,9 +1171,9 @@ Do not put Glassbox authorization policy inside Lora PI Kit.
 
 Do not put NapCat or OneBot transport inside Lora PI Kit.
 
-Do not import production code from `upstream/`.
+Do not put durable Task truth inside Herdr plugin state or Herdr workspace metadata.
 
-Do not create a broad shared `agent-runtime` package until more than one real consumer needs a stable cross-package contract.
+Do not import production code from `upstream/`.
 
 ## Upstream references for this phase
 
@@ -839,6 +1182,12 @@ Read the narrow source needed for the current slice before inventing standard be
 ```text
 earendil-works/pi
   SDK, AgentSession, SessionManager, ResourceLoader, Extensions, custom Tools, package model
+
+herdrdev/herdr
+  session snapshot, event subscriptions, workspace/worktree/pane/agent control, lifecycle state, remote persistence
+
+aorumbayev/herdr-workflows
+  bounded linear workflow execution inside Herdr
 
 NapNeko/NapCatQQ
   QQ protocol-side runtime and operational behavior
@@ -858,11 +1207,11 @@ pingdotgg/t3code
 HKUDS/OpenHarness
   channel, session and tool boundary patterns
 
-Token Monitor
+Javis603/token-monitor
   later runtime usage / health collection patterns
 ```
 
-OpenSquilla remains a later efficiency reference. Do not pull routing, hybrid retrieval, semantic cache, or broad Context optimization into P3 unless a concrete P3 correctness problem requires a very small mechanism.
+OpenSquilla remains a later efficiency reference. Do not pull routing, hybrid retrieval, semantic cache, or broad Context optimization into P3 merely because the mechanism exists.
 
 ## Completion gate
 
@@ -879,17 +1228,26 @@ Plan 03 is complete only when all of these are true:
 - Delivery Gate checks the audience before any protected result is sent.
 - Owner-private data cannot be leaked into a QQ group merely because the Owner asked for it there.
 - Grant and Revoke affect the next protected operation correctly.
-- Turso-backed state survives restart.
+- Turso-backed identity, Conversation, Task, TaskAttempt, AttentionItem, and WorkerBinding state survives restart.
+- the main Agent can obtain a compact `AgentOpsSnapshot` with correct message, task, attention, and worker counts.
+- Herdr is connected through a Glassbox-owned bridge rather than becoming product state.
+- Glassbox subscribes to Herdr events and uses `session.snapshot` reconciliation on bootstrap/reconnect.
+- one Task can be delegated to a real Herdr-managed coding Agent.
+- Herdr `blocked` produces actionable attention without losing Task ownership.
+- Herdr `done` moves work to review and does not silently mark the Task accepted.
+- review can accept work or create rework while preserving previous TaskAttempt evidence.
+- unauthorized Principals cannot use Ops Tools to inspect or control unrelated workers.
+- a Herdr disconnect does not falsely complete or fail tasks; reconnect restores an authoritative execution projection.
+- local test and server deployment use the same Ops contracts; no desktop-only state is required for product correctness.
 - duplicate/replayed OneBot events do not create duplicate Runs or replies.
-- NapCat reconnect does not silently replay completed work into duplicate replies.
-- Raw Trace and AuthorizationDecision evidence can explain Who, Where, What, How, Resource, Audience, Conversation and Run for protected operations.
+- Raw Trace and decision evidence can explain protected operations and Task lifecycle transitions.
 - denial evidence does not copy protected payload contents.
-- `PRIVATE_CANARY_7F92A1` never appears in unauthorized Pi Context, Tool result, QQ delivery, or unauthorized Trace projection.
+- `PRIVATE_CANARY_7F92A1` never appears in unauthorized Pi Context, Worker output projection, Tool result, QQ delivery, or unauthorized Trace projection.
 - real Owner QQ private chat works.
 - real Visitor QQ private chat works under Visitor permissions.
 - real QQ group activation and reply work.
 - group non-activation does not create an Agent Run.
-- restart preserves the intended Conversation and current authorization state.
+- restart preserves the intended Conversation, authorization, and task state.
 - existing Codex and Claude Code paths retain focused regression coverage and are not deleted merely to finish P3.
 
-When this gate passes, Glassbox has its first usable Personal Agent product loop. The next product phase is Memory and Authorized Retrieval, not another phase whose only purpose is to make the first remote Channel work.
+When this gate passes, Glassbox has its first usable Personal Agent product loop and a minimal multi-worker operations loop. The later LongTask phase extends durability, dependency graphs, retry policy, checkpoints, and richer worker delegation instead of rebuilding this foundation.
