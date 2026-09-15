@@ -25,11 +25,13 @@ Vendor selectively when a current implementation slice needs them.
 
 | Project | Primary reference area |
 | --- | --- |
-| `earendil-works/pi` | Preferred local Agent runtime foundation, packages, extensions, skills, SDK, RPC, settings |
-| `HKUDS/OpenHarness` | Agent loop, tools, skills, memory, channel gateway, QQ |
+| `earendil-works/pi` | Active primary Agent runtime foundation, SDK, packages, extensions, skills, tools, settings |
+| `NapNeko/NapCatQQ` | QQ protocol-side runtime and OneBot connectivity for the active P3 Channel |
+| `botuniverse/onebot-11` | OneBot 11 event and API contract for the active P3 QQ Channel |
+| `HKUDS/OpenHarness` | Agent loop, tools, skills, memory, channel gateway, QQ patterns |
 | `keli-wen/agy-staff` | AGY worker delegation and background job lifecycle |
-| `TokenRhythm/opensquilla` | Context budgets, tool-result budgets, hybrid vector retrieval, model routing, token-efficient projection |
-| `Javis603/token-monitor` | Local Coding Runtime discovery, token/cost history, quotas/limits, health checks, session usage, Codex / Claude Code / Pi / Antigravity collectors |
+| `TokenRhythm/opensquilla` | Later context budgets, tool-result budgets, hybrid retrieval, routing, token-efficient projection |
+| `Javis603/token-monitor` | Runtime discovery, token/cost history, quotas/limits, health checks, session usage |
 | `joyehuang/trajectory-panel` | Trajectory parsing, timeline, incremental tail, redaction, Turso sync |
 | `UKGovernmentBEIS/inspect_ai` | Eval tasks, datasets, scorers, eval sets, experiment execution |
 | `temporalio/sdk-typescript` | Durable long tasks, retry, signal, cancellation, child work, continuation |
@@ -48,10 +50,12 @@ Vendor selectively when a current implementation slice needs them.
 | `google-deepmind/open_spiel` | Multi-player game environments and game evaluation |
 | `sotopia-lab/sotopia` | Multi-Agent social environments and social evaluation |
 
-The approved-reference list is a research index, not a dependency list. Do not add a runtime dependency just because a project appears here.
+The approved-reference list is a research index, not a dependency list. A project becomes a production dependency only when the active plan explicitly needs it.
 
-Pi is the preferred upstream foundation for the future local Agent runtime path. Glassbox does not become a Pi fork or a Pi wrapper. The owned customization layer is Lora PI Kit, while Glassbox keeps product identity, authorization, Conversation, persistence, and Trace. See `pi/SOURCES.md` and `../docs/runtime-strategy.md`.
+Pi is the active primary runtime foundation for Plan 03. Glassbox embeds it through the public SDK and loads Lora PI Kit resources. Glassbox does not become a Pi fork or a Pi wrapper. Product identity, authorization, QQ Channel identity, Conversation, Turso state, audience policy, and Trace remain Glassbox-owned. See `pi/SOURCES.md` and `../docs/runtime-strategy.md`.
 
-OpenSquilla is specifically a post-foundation efficiency reference. Its routing, retrieval, context compression, and token-budget mechanisms must not become Plan 03 dependencies. Authorization, identity, Conversation isolation, persistence correctness, and auditable evidence come first.
+NapCat and OneBot are active P3 references for QQ transport. QQ transport stays in Glassbox and does not move into Lora PI Kit.
 
-Token Monitor is specifically a Runtime observability reference. Its local client discovery, usage/cost history, quota/limit collection, health checks, and Antigravity support should be studied when Glassbox begins the concrete Runtime Monitoring / Antigravity implementation slice. Adding the reference does not make those mechanisms Plan 03 dependencies.
+OpenSquilla remains a post-P3 efficiency reference. Its routing, retrieval, semantic cache, context compression, and token-budget mechanisms must not be added merely to complete the QQ closed loop.
+
+Token Monitor is a Runtime observability reference. P3 may reuse narrow Pi usage or health patterns when needed for Trace and acceptance, but full quota dashboards, Antigravity support, and broad cross-runtime history collection are not P3 requirements.
