@@ -8,11 +8,13 @@ The only active implementation plan is `/.plans/03-personal-agent-foundation.md`
 
 ## Product thesis
 
-Glassbox is a durable Personal Agent with explicit identity, authorization, persistent state, inspectable execution, learning, and evidence.
+Glassbox is a durable Personal Agent with explicit identity, authorization, persistent state, inspectable execution, learning, evidence, and controlled delegation.
 
-The roadmap is now organized around usable product loops rather than isolated infrastructure milestones.
+The roadmap is organized around usable product loops rather than isolated infrastructure milestones.
 
 The first loop is QQ because it gives Glassbox a real remote Channel, real multi-user identity, real private and group delivery, and a concrete place to prove authorization boundaries.
+
+The same first loop now includes a minimal Agent Operations foundation so the user can increasingly talk to one main Agent while that Agent coordinates multiple coding workers through Herdr.
 
 ## Runtime direction
 
@@ -44,6 +46,9 @@ Conversation
 protected Context
 Tool authorization
 Delivery authorization
+Task truth
+Attention Queue
+TaskAttempt / WorkerBinding
 Turso state
 Run identity
 Raw Trace
@@ -53,9 +58,56 @@ Codex and Claude Code remain supported adapters for compatibility, fallback, spe
 
 Use supported Pi settings, package, Skill, Extension, custom Tool, ResourceLoader, and SDK boundaries before considering any Pi core patch.
 
+## Agent Operations direction
+
+Herdr is the selected execution host and live Agent-operations layer for coding workers.
+
+The intended boundary is:
+
+```text
+Main Glassbox Agent
+        ↓
+Attention Queue + Task Registry
+        ↓
+Glassbox Ops Tools
+        ↓
+Herdr Bridge
+        ↓
+Herdr
+  workspace
+  worktree
+  pane
+  Pi / Codex / Claude / other supported coding Agent
+        ↓
+Herdr event stream
+        ↓
+Ops Reconciler
+        ↓
+Glassbox TaskAttempt / WorkerBinding / Trace
+```
+
+Glassbox and Herdr communicate both ways.
+
+Herdr owns live terminal topology and coding-Agent lifecycle facts such as `working`, `blocked`, `done`, and `idle`.
+
+Glassbox owns durable Task state, prioritization, acceptance criteria, review, rework, authorization, and evidence.
+
+These statements are intentionally different:
+
+```text
+Herdr agent = done
+Task = accepted
+```
+
+The first does not imply the second.
+
+`aorumbayev/herdr-workflows` may execute bounded linear stage recipes. It does not become the source of truth for Task state or rework loops.
+
+Local testing and server deployment use the same control model. The target production shape is Glassbox + Pi + NapCat + Herdr on a Linux server, with remote human access over SSH when needed. Moshi may be used as a remote Herdr client, but Moshi client state is not Glassbox product state.
+
 ## Sequence
 
-### P3 — QQ Personal Agent Closed Loop
+### P3 — QQ Personal Agent + Agent Ops Closed Loop
 
 Current active plan.
 
@@ -71,6 +123,9 @@ QQ
 → Authorized Context
 → Pi SDK + Lora PI Kit
 → Tool Gate
+→ direct answer or durable Task
+→ optional Herdr delegation
+→ review / rework / completion
 → Delivery Gate
 → QQ reply
 → Turso + Trace
@@ -94,20 +149,34 @@ reconnect handling
 restart recovery
 adversarial canary tests
 Trace evidence
+
+Attention Queue
+Task Registry
+TaskAttempt
+WorkerBinding
+AgentOpsSnapshot
+HerdrBridge
+Herdr event ingestion
+snapshot reconciliation
+Ops Tools
+one real delegated coding task
+working / blocked / review / rework / done loop
 ```
 
-P3 completion means a real Owner and Visitor can use the same Personal Agent through QQ private chat and a test group without crossing permission or delivery boundaries.
+P3 completion means a real Owner and Visitor can use the same Personal Agent through QQ without crossing permission or delivery boundaries, while the main Agent can also see its current workload and coordinate at least one real Herdr-backed worker through a complete review/rework cycle.
+
+P3 deliberately does not become a full durable workflow engine. Complex dependency DAGs, checkpoints, general retry policy, child tasks, and large-scale worker scheduling remain later work.
 
 See the active plan for the full completion gate.
 
 ### P4 — Memory and Authorized Retrieval
 
-After the first real QQ loop works, add durable Memory without weakening the P3 trust model.
+After the first real QQ and Ops loops work, add durable Memory without weakening the P3 trust model.
 
 Target flow:
 
 ```text
-Run / Conversation evidence
+Run / Conversation / Task evidence
 → Memory Candidate
 → visibility inheritance
 → value / reliability checks
@@ -140,7 +209,7 @@ TokenRhythm/opensquilla for retrieval mechanics
 
 ### P5 — Efficient Runtime and Observability
 
-Optimize the working Pi path only after P3 proves correctness and P4 gives retrieval real data.
+Optimize the working Pi and Agent Ops paths only after P3 proves correctness and P4 gives retrieval real data.
 
 Target capabilities:
 
@@ -155,42 +224,49 @@ Prompt / Context compression policy
 Duplicate retrieval prevention
 permission-scoped semantic cache
 Runtime usage / quota / health collection
+Agent Ops usage / health projection
 Routing observability
 Routing Eval
 ```
 
 Generic Pi workflow mechanisms belong in Lora PI Kit when they do not affect Glassbox product authorization or protected-data semantics.
 
-Glassbox keeps any mechanism that changes protected Context visibility, product routing policy, durable state, or evidence semantics.
+Glassbox keeps any mechanism that changes protected Context visibility, product routing policy, durable state, Task truth, or evidence semantics.
 
 Primary references:
 
 ```text
 TokenRhythm/opensquilla
 Javis603/token-monitor
+herdrdev/herdr telemetry and lifecycle surfaces
 OpenTelemetry concepts
 ```
 
-Success is measured with quality, authorization invariant violations, token usage, cost, and latency. Do not claim efficiency from intuition alone.
+Success is measured with quality, authorization invariant violations, token usage, cost, latency, task throughput, blocked time, and review/rework rates. Do not claim efficiency from intuition alone.
 
 ### P6 — Durable Long Work and Workers
 
-Introduce durable task semantics and specialist delegation.
+Extend the P3 Task / TaskAttempt / WorkerBinding foundation into real durable long-running work.
+
+Do not replace the P3 Task model merely because a more capable workflow engine is introduced. Migrate or extend the proven contracts.
 
 Target semantics:
 
 ```text
 stable task id
 steps
+dependencies / DAG
 event history
 checkpoint
-retry
+retry policy
 waiting
 signal
 child task
 worker job
 cancellation
 continuation
+lease / heartbeat where needed
+recovery after server restart
 ```
 
 Primary references:
@@ -198,6 +274,7 @@ Primary references:
 ```text
 temporalio/sdk-typescript
 keli-wen/agy-staff
+herdrdev/herdr for live coding-worker execution
 ```
 
 Worker authority must satisfy:
@@ -208,9 +285,11 @@ worker_permissions ⊆ delegated_permissions ⊆ caller_permissions
 
 A Worker may execute through Pi, Codex, Claude Code, AGY, or another backend. Runtime selection never widens authority.
 
+Herdr remains useful for live coding workspaces and interactive worker processes. Durable workflow truth remains Glassbox-owned or lives behind a deliberately selected durable orchestration boundary.
+
 ### P7 — More Channels and Personal Domains
 
-Expand beyond the first QQ loop only after the shared trust and Conversation model has proven itself.
+Expand beyond the first QQ loop only after the shared trust, Conversation, Task, and delivery model has proven itself.
 
 Candidates include:
 
@@ -234,6 +313,8 @@ Authorization
 Context Gate
 Tool Gate
 Delivery Gate
+Attention Queue
+Task Registry when work is delegated
 Trace
 ```
 
@@ -244,7 +325,7 @@ Mail and Calendar remain protected product Domains, not unrestricted MCP access.
 Turn real execution evidence into a controlled learning loop:
 
 ```text
-Run / Trace
+Run / Task / Trace
 → Experience Mining
 → Memory / Skill / Asset Candidate
 → Eval / Verification
@@ -259,6 +340,7 @@ Differential Eval
 Invariant Eval
 Permission Eval
 Routing Eval
+Task / worker Eval
 Skill generation
 Skill verification
 Asset lineage
@@ -269,7 +351,7 @@ Arena experiments
 
 Primary references include Inspect AI, SkillClaw, CoEvoSkills, Voyager, Dagster, Generative Agents, OpenSpiel, Sotopia, and memos.
 
-Validated reusable Pi workflow procedures may be published through Lora PI Kit or `lora-sys/skills`. Glassbox remains the source of product evidence, permissions, and promotion decisions.
+Validated reusable Pi workflow procedures may be published through Lora PI Kit or `lora-sys/skills`. Glassbox remains the source of product evidence, permissions, task acceptance, and promotion decisions.
 
 ## Documentation and Learning track
 
@@ -305,6 +387,9 @@ Authorize before Context
 Tool re-authorization
 Delivery Gate
 Conversation vs Pi Session vs Run
+Task vs Run vs TaskAttempt
+Herdr state vs Task acceptance
+Attention Queue
 Authorization Trace
 Raw Trace vs Derived State
 ```
@@ -317,7 +402,7 @@ After P4 exists, let readers manipulate visibility scope, lexical/vector weight,
 
 ### D3 — Routing and token economy lab
 
-After P5 exists, let readers compare routing, model tier, thinking depth, context budget, tool-result projection, and retrieval budget with reproducible fixtures.
+After P5 exists, let readers compare routing, model tier, thinking depth, context budget, tool-result projection, retrieval budget, and worker utilization with reproducible fixtures.
 
 ### D4 — LongTask and learning labs
 
@@ -327,6 +412,9 @@ After later runtime phases, add LongTask state-machine, Trace-to-Canvas, Skill p
 
 - Active implementation scope comes from the current Plan file, not from future roadmap sections.
 - Upstream references are research and implementation material, not automatic dependencies.
-- Glassbox authorization always wins over runtime configuration, Pi Extensions, Skills, model output, Channel input, or Worker behavior.
-- A new runtime, Channel, Memory system, cache, or Worker cannot bypass the hard gates proven in P3.
+- Glassbox authorization always wins over runtime configuration, Pi Extensions, Skills, model output, Channel input, Herdr state, or Worker behavior.
+- Glassbox Task state is durable product truth. Herdr lifecycle state is an execution observation.
+- A new runtime, Channel, Memory system, cache, Herdr plugin, workflow recipe, or Worker cannot bypass the hard gates proven in P3.
+- `done` from an external runtime or worker never means accepted unless the Glassbox Task state machine records acceptance.
+- Local testing must preserve the same contracts intended for the Linux server deployment. Avoid desktop-only product dependencies.
 - Build one usable vertical loop at a time and preserve focused regression coverage for working behavior.
