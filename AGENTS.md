@@ -1,16 +1,16 @@
 # Glassbox
 
-Glassbox is evolving from a local Coding Agent workbench into a durable Personal Agent workbench with explicit identity, strict authorization, persistent Conversations, inspectable execution, learning, assets, and evals.
+Glassbox is a durable Personal Agent product with explicit identity, strict authorization, persistent Conversations, inspectable execution, durable Tasks, learning, assets, evals, and controlled worker delegation.
 
-The product has one durable Personal Agent. Workbench, WeChat, QQ, email, and future integrations are entry points to that Agent, not separate Agents.
+The product has one durable Personal Agent. Workbench, QQ, future messaging Channels, email, API access, and other integrations are entry points to that Agent, not separate Agents.
 
-Glassbox should help people use the Agent, understand what it did, and verify why it was allowed to do it.
+This file contains stable repository invariants and navigation rules. Detailed implementation steps belong in the active Plan and `docs/*.md`.
 
 ## What makes Glassbox special?
 
 ### 1. Authorization before intelligence
 
-Permission is a server-side product invariant.
+Authorization is a server-side product invariant.
 
 Every protected operation reduces to:
 
@@ -28,65 +28,149 @@ REQUIRES_APPROVAL
 
 No matching grant means `DENY`.
 
-Unauthorized data must be filtered before model-visible Context is assembled. Never load private data, send it to a model, and rely on a Prompt telling the model not to reveal it.
+Never load protected data into model-visible Context and rely on a Prompt to keep it secret.
 
-Protected Tool execution rechecks current authorization at execution time.
+Security boundaries must be enforced in code. Prompt instructions may guide behavior, but they are never an authorization mechanism.
 
-Approval does not manufacture Permission.
+A protected operation must preserve enough structured context to answer:
+
+```text
+Who acted?
+Where did they act?
+What did they try to do?
+How would it be executed?
+Which Resource was involved?
+Who would receive the result?
+Which Conversation, Run, or Task did it belong to?
+```
+
+Read permission and delivery permission are separate decisions.
+
+A Principal being allowed to read data does not imply that the data may be sent to the current audience.
 
 ### 2. One durable Personal Agent
 
-Channel identity is not Agent identity.
+Keep product identity independent from Channel, Runtime, Provider, Worker, and UI state.
 
-Workbench, WeChat, QQ, email, API identities, and future Channels resolve a caller into a User / Principal that reaches the same Personal Agent.
-
-Conversation is durable product state. Provider Session and Run are execution concepts underneath it.
-
-Keep these boundaries clear:
+These distinctions are stable:
 
 ```text
 Channel ≠ Agent
+ChannelIdentity ≠ User
 Identity ≠ Authorization
+Conversation ≠ Principal
 Conversation ≠ Session
 Session ≠ Run
-Provider / Worker ≠ Personal Agent
+Task ≠ Run
+Task ≠ Worker
+TaskAttempt ≠ Worker lifecycle state
+Herdr Agent state ≠ Task acceptance
+Actor permission ≠ Delivery permission
+Runtime / Provider / Worker ≠ Personal Agent
+Rules ≠ Skills ≠ Taste ≠ Memory
 ```
+
+Conversation is durable product state.
+
+Session is runtime execution context.
+
+Run is one concrete execution.
+
+Task is durable product work.
+
+TaskAttempt is one concrete execution or rework attempt for a Task.
+
+Rules are explicit constraints and authority-bearing instructions.
+
+Skills are reusable validated procedures.
+
+Taste is learned user preference and cannot override Rules, authorization, or product policy.
+
+Memory is durable knowledge about facts, decisions, events, and prior work. It is not a generic bucket for Rules, Skills, or Taste.
+
+Do not collapse these concepts because the current deployment is local, single-user, or uses only one Runtime.
 
 ### 3. Researchable by default
 
-Glassbox should preserve enough evidence to answer:
+Glassbox must preserve enough evidence to reconstruct what happened.
 
-- Who was acting?
-- What was that Principal allowed to see or do?
-- What Context actually reached the Agent?
-- Which Tool or Provider executed?
-- What changed during the Run?
-- Why was an operation allowed, denied, or sent for approval?
-- Which result came from which configuration and evidence?
+Raw Trace is append-only evidence. Derived State is an interpretation of that evidence.
 
-Editing, projection, compression, or a newer reducer must not erase what an active or completed Run actually used.
+Do not rewrite historical execution evidence so an old Run or TaskAttempt appears to have used newer state.
+
+Authorization, approvals, delivery decisions, Task assignment, WorkerBinding, review, rework, acceptance, delegation, feedback-derived learning, and promotion decisions must remain traceable.
+
+Denied operations should record why they were denied without copying protected payload contents into denial logs.
+
+Measurements and judgments remain distinct.
+
+Examples of measurements:
+
+```text
+tokens
+duration
+tool calls
+file changes
+exit codes
+message ids
+worker state transitions
+```
+
+Examples of judgments:
+
+```text
+review decisions
+eval scores
+LLM judgments
+human review
+```
+
+Do not collapse them into one fake universal score.
 
 ### 4. Agent-native, not provider-specific
 
-Glassbox connects to existing Agent runtimes and specialist workers instead of forcing every provider into one behavior.
+Glassbox may use Pi, Codex, Claude Code, Herdr-managed coding Agents, and future execution systems.
 
-Pi, OpenHarness, and future systems may expose different tools, lifecycle controls, context behavior, permission modes, and events.
+Glassbox remains the product and trust boundary.
 
-Keep provider-specific behavior close to the provider integration.
+Runtime-specific behavior stays close to the corresponding integration.
 
-Share only the concepts Glassbox actually needs.
+Pi customization belongs in Lora PI Kit when it is reusable Pi workflow behavior.
 
-Never copy an upstream trust model blindly. Glassbox authorization rules win.
+Glassbox product semantics stay in Glassbox, including:
+
+```text
+Agent identity
+Principal
+Authorization
+Conversation
+Task truth
+Taste and Memory truth
+Audience / Delivery policy
+Durable product state
+Run identity
+Raw Trace
+```
+
+Herdr owns live execution facts such as workspaces, worktrees, panes, terminal processes, and observed coding-Agent lifecycle state.
+
+Herdr does not own Glassbox Task truth or authorization.
+
+Lora PI Kit may bridge selected Taste, Memory, Rules, or Skills into Pi Runtime Context, but it is not the canonical store for Glassbox Taste or Memory.
+
+Do not turn Glassbox into a Pi wrapper.
+
+Do not turn Herdr state into the Glassbox Task database.
+
+Do not copy an upstream trust model blindly. Glassbox authorization rules win.
 
 ### 5. Canvas-native, but Canvas is a projection
 
-Canvas remains a powerful workspace and inspection surface. It is not execution state and it is not the whole product.
+Canvas is a workspace and inspection surface, not execution state.
 
-Moving, connecting, grouping, resizing, or annotating Canvas Objects must not silently change Agent execution or authorization.
+Moving, connecting, grouping, resizing, or annotating Canvas Objects must not silently change Agent execution, Task state, Worker state, learning state, or authorization.
 
-Do not turn every raw event into a Canvas Object.
-
-Keep normal whiteboard behavior useful, but preserve this boundary:
+Preserve this boundary:
 
 ```text
 Raw Trace
@@ -99,137 +183,168 @@ Raw Trace
 
 Treat measured regressions as bugs.
 
-Watch for broad rerenders, huge live payloads, unbounded event history projections, repeated retrieval, oversized Tool results, unnecessary model Context, and duplicated work.
+Optimization may reduce cost, latency, Context size, retrieval volume, or Tool output.
 
-Later efficiency work may use context budgets, Tool-result projection, hybrid retrieval, smart routing, semantic cache, and model-tier selection.
+Optimization must never:
 
-Those mechanisms may reduce cost or increase capability. They may never widen authority, hide evidence, or bypass authorization.
+```text
+widen authority
+hide evidence
+bypass authorization
+merge protected scopes
+turn missing data into false certainty
+```
 
 ## Project owner note
 
-When a requirement is ambiguous, choose the smaller implementation that preserves the product rules in this file.
+When a requirement is ambiguous, choose the smaller implementation that preserves the stable rules in this file and follows the active Plan.
 
-Do not silently expand the task.
+Do not silently expand scope from the roadmap.
 
 The only active implementation plan is:
 
-`/.plans/03-personal-agent-foundation.md`
+```text
+.plans/03-personal-agent-foundation.md
+```
 
 Read in this order before changing code:
 
 1. `AGENTS.md`
-2. `.plans/03-personal-agent-foundation.md`
-3. `docs/tech-stack.md` when changing tooling, dependencies, build, test, lint, format, or package management
+2. the active Plan
+3. the relevant architecture document from the index below
 4. only the relevant `.plans/findings/`
 5. relevant upstream source or documentation
 6. current production code and focused tests
 
-`README.md` defines product direction.
+### Implementation index
 
-`.plans/roadmap.md` records sequencing, not permission to implement future phases.
+| Topic | Source of truth |
+| --- | --- |
+| Current implementation order, slices, completion gate, acceptance matrix | `.plans/03-personal-agent-foundation.md` |
+| Product sequencing after the active Plan | `.plans/roadmap.md` |
+| Pi, Lora PI Kit, Runtime ownership, SDK boundary | `docs/runtime-strategy.md` |
+| Herdr, Task, Attention, TaskAttempt, WorkerBinding, Ops Tools, reconciliation | `docs/agent-operations.md` |
+| Rules, Skills, Taste, Feedback, Memory, learning, retrieval | `docs/memory-taste.md` |
+| Toolchain, dependencies, build, test, local development | `docs/tech-stack.md` |
+| Persistence, storage, observability, monitoring, public/private projections | `docs/data-observability.md` |
+| Documentation and learning-site rules | `docs/README.md` |
+| Approved upstream references and source pins | `upstream/README.md` and each `upstream/*/SOURCES.md` |
 
-Update `CONTEXT.md` with current module boundaries, domain decisions, and glossary links as each slice changes; update the active plan and roadmap with verified progress.
+`README.md` describes the product direction. It is not the active implementation checklist.
 
-WebUI and CLI use the same server-owned configuration and domain APIs; neither client maintains a separate configuration store or bypasses authorization.
-
-Current P3 scope is deliberately narrow:
-
-```text
-Identity
-  ↓
-Authorization
-  ↓
-Conversation
-  ↓
-Turso persistence
-  ↓
-Run / Authorization Trace
-```
-
-P3 executes in narrow vertical slices. The first slice delivers a self-use QQ group assistant for the Owner before broader multi-tenant roles. The current QQ phase includes a bounded Run-linked Eval acceptance loop. Real WeChat, Mail, Calendar, durable LongTask orchestration, the full Eval platform, Arena, Skill evolution, full Memory consolidation, vector retrieval, semantic cache, smart routing, and serverless deployment remain deferred.
-
-Product history and future ideas belong in `README.md`, `.plans/roadmap.md`, `docs/`, or research notes. Current implementation scope belongs in the active plan.
-
-If the current task conflicts with a stable rule in this file, stop and ask before breaking the rule.
+If a current task conflicts with a stable rule in this file, stop before breaking the rule.
 
 ## A small glossary
 
 Use these terms consistently.
 
-- **you** means the coding Agent reading this file and changing Glassbox.
-- **we**, **us**, and **maintainers** mean the people building and maintaining Glassbox.
-- **user** means a person known to Glassbox.
-- **principal** means the effective actor used for an authorization decision.
-- **channel identity** means an external identity such as Workbench account, WeChat ID, QQ ID, email identity, or future integration identity.
-- **agent** means the durable Personal Agent product identity unless a provider-specific context clearly means an external Agent runtime.
-- **provider** means an external model / Agent runtime integration such as a PI-compatible protocol adapter.
-- **worker** means delegated specialist execution such as background work.
-- **resource** means protected data or capability addressed by authorization.
-- **action** means an explicit operation on a Resource or execution state.
-- **conversation** means the durable relationship / thread between a Principal and the Personal Agent.
-- **session** means provider or runtime execution context. It is not the Conversation.
-- **run** means one concrete Agent execution.
-- **raw trace** means append-only execution evidence.
-- **derived state** means Glassbox's current interpretation of evidence for product behavior.
-- **authorization decision** means inspectable evidence of an `ALLOW`, `DENY`, or `REQUIRES_APPROVAL` result.
-- **approval** means explicit human authorization for a policy path that already permits approval. It is not Permission.
-- **memory** means promoted durable knowledge. It is not raw Conversation history.
-- **skill** means a reusable validated procedure or capability description.
-- **asset** means a durable output with provenance, lineage, or version identity.
-- **canvas** means the interactive tldraw workspace and projection surface.
-- **canvas object** means something shown on Canvas because it helps the user understand, inspect, edit, or act on work.
-- **artifact** means a durable output such as a file, diff, document, image, webpage, dataset, or generated design.
-- **inspector** means contextual detail UI for a selected object or execution record.
+- **User**: a person who uses the Personal Agent.
+- **Principal**: the effective actor used for authorization.
+- **Channel**: an entry point into the Personal Agent.
+- **ChannelIdentity**: an external identity inside one Channel.
+- **Location**: where an Action originates, including Channel and scope.
+- **Audience**: who can receive an output.
+- **Agent**: the durable Personal Agent product identity.
+- **Runtime**: an execution backend such as Pi, Codex, or Claude Code.
+- **Provider**: model-provider or Runtime-specific provider detail.
+- **Worker**: delegated specialist execution.
+- **Resource**: protected data or capability addressed by authorization.
+- **Action**: an explicit operation on a Resource or execution state.
+- **Conversation**: durable thread state for an Agent and a scope.
+- **Session**: Runtime execution context.
+- **Run**: one concrete Agent execution.
+- **Task**: durable product work tracked by Glassbox.
+- **TaskAttempt**: one concrete execution or rework attempt for a Task.
+- **AttentionItem**: something that currently needs main-Agent or human action.
+- **WorkerBinding**: the mapping from a TaskAttempt to its concrete Worker execution location.
+- **AgentOpsSnapshot**: a compact projection of current Task, Attention, and Worker state for the main Agent.
+- **Herdr**: the live operations host for workspaces, worktrees, panes, terminal processes, and coding-Agent lifecycle facts.
+- **Rule**: an explicit constraint or authority-bearing instruction.
+- **Skill**: a reusable validated procedure or capability description.
+- **Taste**: a learned user preference with scope, confidence, and evidence. Taste is not permission or a hard Rule.
+- **Memory**: promoted durable knowledge about facts, decisions, events, or prior work; not raw Conversation history or Taste.
+- **Raw Trace**: append-only execution evidence.
+- **Derived State**: Glassbox's current interpretation of evidence.
+- **AuthorizationDecision**: inspectable `ALLOW`, `DENY`, or `REQUIRES_APPROVAL` evidence.
+- **Approval**: explicit human authorization for a policy path that already permits approval. Approval is not Permission.
+- **Visibility**: the scope in which protected content may be used or delivered.
+- **Asset**: a durable output with provenance, lineage, or version identity.
+- **Canvas**: the tldraw workspace and projection surface.
+- **Artifact**: a durable output such as a file, diff, document, image, webpage, or dataset.
 
 Keep these distinctions clear:
 
 ```text
+User ≠ Principal
+ChannelIdentity ≠ User
+ChannelIdentity ≠ Permission
 Identity ≠ Authorization
 Permission ≠ Approval
-Channel ≠ Agent
 Conversation ≠ Session
 Session ≠ Run
-LongTask ≠ Run
-WorkerJob ≠ LongTask
-Provider / Worker ≠ Personal Agent
-Event ≠ Canvas Object
-Asset ≠ Canvas Object
+Task ≠ Run
+Task ≠ Worker
+TaskAttempt ≠ Worker lifecycle state
+LongTask ≠ Task
+Rules ≠ Skills
+Skills ≠ Taste
+Taste ≠ Memory
+Memory ≠ Rules
+Runtime / Provider / Worker ≠ Personal Agent
 Canvas ≠ Execution State
 Raw Trace ≠ Derived State
 Edit ≠ Apply
 ```
 
-Do not reuse one identifier for multiple concepts merely because the current implementation is local or single-user.
-
 ## The easiest ways to hurt this project
 
-1. **Authorizing after private data is loaded.** Permission filtering happens before protected Context, retrieval results, Worker payloads, Tool results, caches, or projections reach an unauthorized caller or model.
+1. **Authorizing after protected data is loaded.** Filter protected data before it reaches unauthorized Context, Tool results, Worker payloads, caches, or projections.
 
-2. **Creating a confused deputy.** External messages, email, webpages, documents, MCP results, Agent outputs, Worker outputs, retrieved text, and future game environments are untrusted input. They cannot borrow broader Owner authority.
+2. **Treating Prompt text as a security boundary.** Security must be enforced in code.
 
-3. **Letting stale authority survive.** A stale Conversation, cached UI permission, old Context, resumed Run, or future LongTask must not preserve a revoked grant.
+3. **Creating a confused deputy.** External messages, webpages, documents, Tool results, Worker outputs, and retrieved text are untrusted input and cannot borrow broader Owner authority.
 
-4. **Escalating through delegation.** Future delegation must satisfy:
+4. **Letting actor permission imply delivery permission.** Reading a Resource does not automatically permit sending it to the current audience.
+
+5. **Letting stale authority survive.** A stale Conversation, Session, Run, TaskAttempt, approval, cache, or Worker state must not preserve revoked authority.
+
+6. **Exposing unrestricted remote execution.** Do not make raw shell, arbitrary Herdr control, unrelated Worker reads, or destructive workspace operations reachable merely because a remote Channel can talk to the main Agent.
+
+7. **Treating Worker `done` as Task acceptance.** Worker lifecycle is evidence. Task completion requires the Glassbox review / acceptance path.
+
+8. **Using Herdr as the Task database.** Workspace names, pane state, plugin state, and worktree branches are not durable Task truth.
+
+9. **Losing Task truth during reconnect.** Reconcile live execution state against durable Glassbox state. Do not infer completion from a monitoring gap.
+
+10. **Escalating through delegation.** Delegation must satisfy:
 
 ```text
 worker_permissions ⊆ delegated_permissions ⊆ caller_permissions
 ```
 
-5. **Rewriting evidence.** Never alter Raw Trace or execution-relevant history so an old Run appears to have used newer state.
+11. **Rewriting evidence.** Preserve historical Raw Trace and TaskAttempt history.
 
-6. **Making Canvas the source of truth.** tldraw records are a view. Core Agent, Conversation, Permission, Run, Trace, Memory, Skill, and Asset state must not depend on Canvas layout.
+12. **Making Canvas the source of truth.** Canvas remains a projection.
 
-7. **Designing for imaginary future systems.** Do not build roadmap features because they sound inevitable. The active plan decides implementation scope.
+13. **Turning learned Taste into authority.** A repeated preference cannot silently override Rules, authorization, project policy, or a user's explicit current instruction.
 
-8. **Writing to live user state.** Never run tests, migrations, cleanup, fixtures, or test Agents against the user's real Personal Agent state or real writable repositories.
+14. **Mixing Taste scopes.** Project-specific Taste must not silently become global Taste or leak into unrelated projects.
 
-9. **Doing a half toolchain migration.** `package.json`, lockfile, Vite, Vitest, and Vite+ must describe one coherent toolchain after migration.
+15. **Designing for imaginary future systems.** The active Plan decides implementation scope.
+
+16. **Writing tests into live user state.** Automated tests must use isolated, disposable state and must not mutate production QQ, Pi, Herdr, repositories, or Personal Agent data.
+
+17. **Doing a half migration.** Toolchain, Runtime, persistence, or protocol migrations must leave one coherent working state.
+
+18. **Forking Pi too early.** Prefer supported settings, packages, Skills, Extensions, custom Tools, ResourceLoader, SDK surfaces, and upstream contributions before maintaining a local core patch.
+
+19. **Putting product authority into Lora PI Kit or Herdr.** Glassbox remains the authority for identity, permissions, Task truth, Taste / Memory truth, durable product state, and evidence.
 
 ## Explicit execution semantics
 
 Edit freely. Execute explicitly.
 
-Only named Actions may change execution or authorization state.
+Only named Actions may change execution, Task, authorization, or durable product state.
 
 Examples include:
 
@@ -239,9 +354,14 @@ Steer
 Approve
 Grant
 Revoke
+Share
+Delegate
+Prompt Worker
+Accept Task
+Rework Task
+Cancel Task
 Stop
 Resume
-Delegate
 Cancel Worker
 Continue Worker
 Start Eval
@@ -251,150 +371,98 @@ Promote Skill
 Promote Asset
 ```
 
-Layout changes, notes, grouping, arrows, or Canvas movement do not implicitly execute anything.
+Layout changes, notes, arrows, Canvas movement, QQ text, Herdr focus changes, workspace renames, model suggestions, or one-off user edits do not implicitly execute product Actions or create hard Rules.
 
-The UI must make draft state, applied state, permission state, and running state truthful.
-
-If an execution-relevant value changes during a Run, preserve enough information to reconstruct what the Run started with and when the new value took effect.
+If execution-relevant state changes during a Run or TaskAttempt, preserve enough evidence to reconstruct what it started with and when the change took effect.
 
 ## Preserve evidence
 
 Raw Trace is evidence. Derived State is interpretation.
 
-Do not rewrite Raw Trace to match a newer UI model or reducer.
+Do not rewrite Raw Trace to match a newer UI model, reducer, policy, or schema.
 
-Authorization decisions, approvals, delegation, Run lifecycle, and later learning promotion must remain traceable to underlying evidence.
+Do not treat a transient terminal screen, Worker status, current UI state, or current Taste projection as the only durable record of a result or learning decision.
 
-A denial record explains why access was denied without copying denied private contents.
-
-Context compression and Tool-result projection may reduce model-facing data later. They do not delete Raw Trace evidence.
-
-Measurements and judgments are different. Token counts, tool calls, duration, file changes, and exit codes are measurements. Eval scores, LLM judgments, and human review are judgments. Do not merge them into a fake universal score.
+Preserve accepted result references, FeedbackEvent evidence, and the provenance needed to explain promotions or demotions.
 
 ## Check every affected path
 
-Before calling a change done, check the parts that apply.
+Before calling a change done, check the paths that apply:
 
-- **Identity.** Confirm who the caller resolves to and that identity binding does not grant permission by itself.
-- **Authorization.** Check allow, deny, approval, revoke, and stale-state paths.
-- **Context.** Verify denied Resource contents never enter model-visible Context.
-- **Tools.** Protected Tool calls re-authorize at execution time.
-- **Conversation / Session / Run.** Preserve the correct lifetime and identity for each.
-- **Persistence.** Decide what survives refresh, reconnect, restart, and database reopen.
-- **Trace.** Verify evidence is useful without leaking protected payloads.
-- **Provider behavior.** Define what happens when a Provider does not support a capability.
-- **Contracts.** When cross-boundary state changes, check every producer and consumer.
-- **Canvas projection.** Check both Glassbox state and visible tldraw behavior where relevant.
-- **Reverse states.** Grant / Revoke, start / stop, apply / edit, approve / consume, and similar paired states need explicit behavior.
-- **Toolchain.** Keep workspace config, package manifests, lockfile, test runner, lint, and format behavior coherent.
-- **Docs.** Update the active plan or stable docs when a settled boundary changes.
+- **Identity**: who does the caller resolve to?
+- **Authorization**: can this Principal perform this Action on this Resource here?
+- **Context**: did denied content stay out of model-visible Context?
+- **Tools / Ops**: was protected execution re-authorized at execution time?
+- **Delivery**: may this result go to this audience?
+- **Conversation / Session / Run / Task**: are lifetimes and identifiers still distinct?
+- **Persistence**: what survives reconnect, restart, and database reopen?
+- **Task / Worker state**: is durable Task truth separate from observed Worker lifecycle?
+- **Learning**: are Rules, Skills, Taste, Feedback, and Memory still separate? Is scope preserved?
+- **Trace**: is the decision explainable without leaking protected payloads?
+- **Runtime / Host integration**: are runtime-specific details contained behind their integration boundary?
+- **Contracts**: did every producer and consumer move together?
+- **Reverse states**: do grant/revoke, share/unshare, start/stop, assign/cancel, review/rework/accept, connect/reconnect have explicit behavior?
+- **Tests**: did the behavior change receive focused coverage?
+- **Docs**: did a settled architecture boundary change? If yes, update the active Plan or relevant `docs/*.md`.
 
-## Platform and environment portability
-
-Windows is the first support and validation target. This does not claim that the current runtime has passed Windows validation. macOS and Linux are portability targets to verify later. Code, fixtures, and scripts must avoid hardcoded developer paths and use standard path resolution and platform-aware child process spawning.
-
-The first milestone delivers an owner-only QQ group assistant for personal use. Broad multi-tenant permission platforms and complex roles are deferred to later slices, but basic security invariants hold from the start: trusted identity binding, owner allowlist, restricted test group ID, caller and group context isolation, strictly blocking private owner data from group chat, allowing explicitly configured private resources only in the verified Owner private conversation, durable conversations, and append-only traces.
-
-Desktop packaging such as Electron or Tauri, mobile clients, and multi-device sync protocols remain pending discussion and are not decided in Plan 03.
-
-Copy suitable existing provider and Agent-loop implementations into Glassbox-owned modules. Never import upstream reference directories or install Pi, OpenHarness, or another whole Agent framework as a shortcut for this source-reuse plan. Preserve licenses, notices, source commits, original paths, and local modifications. Rewrite copied internal package references to owned local modules. Ordinary SDKs, database drivers, ws, and Vite+ remain normal dependencies; do not rewrite those primitives. Incompatible source is adapted from its proven behavior and tests. Glassbox owns authorized context, protected Tool wrappers, identity, conversation routing, and evidence. The core execution is centered around agy-staff with extensible API protocols and model profile configuration. Keep agy-staff. External local execution integrations are not accepted into the active path.
-
-QQ official and NapCat OneBot adapters may coexist. Each connection, caller, group, and message has a namespaced identity. Replies use their ingress connection. Proactive messages require an explicit destination and a persisted delivery outcome. Do not automatically switch adapters to bypass delivery restrictions or retry an unknown outcome. Do not include private data in group context or group-bound Tool results. See `.plans/findings/03-p3.1-qq-gateway-and-provider-decisions.md`.
+Detailed checklists belong in the active Plan and the topic-specific docs, not in this file.
 
 ## Dev servers
 
-Document and run only commands that exist in the current repository.
+Use only commands and dependencies that actually exist in the repository.
 
-Glassbox has selected **Vite+** as the unified JavaScript / TypeScript toolchain direction. Read `docs/tech-stack.md` before changing it.
-
-The intended command surface after the verified migration is:
+Toolchain and local-development details live in:
 
 ```text
-vp install
-vp dev
-vp build
-vp check
-vp test
-vp run <task>
+docs/tech-stack.md
 ```
 
-Vite+ is expected to unify Vite / Rolldown, Vitest, Oxlint, Oxfmt, and workspace task execution.
+The production target is a Linux server.
 
-Playwright remains the browser / E2E layer.
+Local development must use the same product contracts intended for deployment. Do not make product correctness depend on a desktop GUI, machine-specific path, or Moshi.
 
-`apps/server` remains a Node.js runtime. Do not turn it into a Vite dev server merely because Vite+ is the toolchain.
-
-Until the Vite+ dependency migration is actually verified and committed, inspect the repository scripts and use the commands that exist. Do not pretend planned commands are already repository reality.
-
-Do not introduce a second ESLint / Prettier / ad-hoc check stack unless a demonstrated compatibility gap requires it.
-
-Do not hardcode localhost origins into client code. Development clients use relative `/api` and `/ws` boundaries through the dev server.
+Moshi may be used later as a remote human operations client. It is not product state or authority.
 
 Stop only processes you started or processes you verified belong to the current development instance.
 
 ## Test data
 
-Never use live Personal Agent state as writable test state.
+Never use live Personal Agent state as writable automated-test state.
 
-Use repo-local, temporary, or otherwise disposable state.
-
-For Plan 03, prefer one deterministic fixture containing:
+Use isolated and disposable state for:
 
 ```text
-one Agent
-Owner
-Visitor
-one public Resource
-one Owner-private Resource
-one public Tool
-one Owner-only Tool
-Grant / Revoke
-restart
-AuthorizationDecision + Run evidence
+Pi configuration and sessions
+Turso / SQLite test databases
+QQ / OneBot fixtures
+Herdr sessions and worktrees
+repositories
+Feedback / Taste / Memory fixtures
+credentials and secrets
+Trace fixtures
 ```
 
-That fixture may be reused by automated tests, local acceptance UI, examples, and later documentation demos.
+Most integration logic should be testable through fakes or deterministic fixtures. Use real external systems only when the protocol or real integration is the behavior under test.
 
-Reading or copying real data for debugging is acceptable when required. Write only to a safe copy.
-
-> Copy in. Never point in. Never write back.
-
-Use realistic fixtures when empty state or tiny mocks would hide the behavior being tested.
+The active Plan defines the current acceptance fixture and test matrix.
 
 ## Verifying
 
-Prove the change with the smallest useful check.
+Prove the change with the smallest useful check, then run the relevant active-Plan checks before calling the slice complete.
 
-Behavior changes need focused tests for the behavior that changed.
+Behavior changes require focused tests for the behavior that changed.
 
-Plan 03 authorization coverage should include the relevant subset of:
+Do not hide races with arbitrary sleeps when a real completion signal or state transition exists.
+
+Use browser-level verification when browser behavior is the thing being tested.
+
+Use real QQ, Herdr, Pi, or other external integrations only when the active Plan requires real integration acceptance.
+
+The exact current verification matrix lives in:
 
 ```text
-default deny
-explicit allow
-requires approval
-cross-user read
-private / public isolation
-identity spoof attempt
-identity binding does not grant authority
-revocation
-stale authorization state
-confused deputy
-protected Tool call
-approval replay
-restart and resume
-denial Trace redaction
+.plans/03-personal-agent-foundation.md
 ```
-
-Persistence tests use disposable Turso databases.
-
-Async tests wait on real completion signals or state transitions. Do not hide races with arbitrary sleeps when a real signal exists.
-
-Run browser-level verification when behavior depends on real tldraw interaction, selection, drag and drop, visual state, or browser APIs.
-
-After the Vite+ migration is complete, `vp check`, `vp test`, and `vp build` become the preferred broad toolchain checks. Before that migration lands, use the repository commands that actually exist.
-
-Do not launch unrelated browsers, providers, external processes, or broad live-provider suites unless the task requires them.
 
 ## Pull requests
 
@@ -404,15 +472,13 @@ Commit directly to `main` after a verified slice is complete unless the user req
 
 Keep one main concern per change.
 
-Use existing commit conventions. Do not invent a new convention inside one task.
-
-For user-visible UI changes, include visual verification when practical. A short recording is useful when motion, timing, drag and drop, or a multi-step interaction is the point of the change.
+Use existing commit conventions.
 
 Treat automated review findings as claims to verify against the source. Fix real issues; do not change code merely to satisfy an incorrect bot comment.
 
 ## How it works
 
-The long-term trusted path is:
+The stable trusted shape is:
 
 ```text
 Channel / Workbench
@@ -425,22 +491,28 @@ Authorization
         ↓
 Authorized Context
         ↓
-Personal Agent
+Personal Agent Runtime
         ↓
-Authorized Tool / Provider / Worker
+Direct Run
+   OR
+Authorized Task / Worker Delegation
         ↓
-Run
+Review / Rework / Accept
         ↓
-Raw Trace + Authorization Evidence
+Delivery Authorization
+        ↓
+Result
+        ↓
+Raw Trace + Product Evidence
+        ↓
+Feedback / Taste / Memory learning
         ↓
 Derived State
         ↓
-Memory / Skills / Assets / Journal
-        ↓
-Timeline / Canvas / Inspector
+Memory / Skills / Assets / Journal / Views
 ```
 
-Execution or authorization changes travel through explicit Actions:
+Execution, Task, authorization, and durable product changes travel through explicit Actions:
 
 ```text
 User / Agent intent
@@ -449,163 +521,9 @@ Named Action
         ↓
 Authorization
         ↓
-Runtime / Provider / Persistence
+Runtime / Tool / Agent Ops / Persistence / Delivery
         ↓
 Evidence
 ```
 
-Plan 03 proves only this smaller vertical slice:
-
-```text
-Identity
-→ Authorization
-→ Conversation
-→ Turso persistence
-→ Run / Authorization Trace
-```
-
-Keep these rules true even if the internal implementation changes:
-
-- one durable Personal Agent is shared across Channels
-- identity resolution and authorization are separate
-- unauthorized data is excluded before Context assembly
-- protected Tool calls re-authorize
-- revocation takes effect on the next protected operation
-- Conversation is not Provider Session or Run
-- Raw Trace and Derived State are separate
-- Canvas is not execution state
-- future Worker authority only shrinks
-- routing, retrieval, caching, and token optimization never widen authority
-
-Do not document a layer as implemented until it actually exists.
-
-## Where code lives
-
-Follow the current repository structure.
-
-```text
-apps/
-  server/
-  web/
-    e2e/
-
-packages/
-  contracts/
-  shared/
-
-.plans/
-  03-personal-agent-foundation.md
-  roadmap.md
-  findings/
-
-docs/
-  README.md
-  tech-stack.md
-  interactive-demos.md
-
-assets/
-  readme/
-
-upstream/
-  t3-code/
-  opensquilla/
-```
-
-`apps/server` owns the current Runtime, HTTP, WebSocket, Provider adapters, Session lifecycle, Trace, screening, and new server-side Personal Agent boundaries.
-
-Plan 03 may add focused modules near this code such as:
-
-```text
-auth/
-identity/
-conversation/
-persistence/
-```
-
-These names are guidance, not mandatory architecture.
-
-`apps/web` owns React, tldraw, Workbench interaction, Canvas projection, and Inspector behavior.
-
-`packages/contracts` contains only contracts with a real cross-boundary producer and consumer.
-
-`packages/shared` stays small and runtime-independent.
-
-Keep provider-specific behavior near Provider integration.
-
-Keep Channel protocol behavior near Channel integration.
-
-Keep tldraw-specific behavior near Canvas projection and interaction.
-
-Keep authorization enforcement in server-side boundaries that UI and adapters cannot bypass.
-
-Do not create speculative packages merely to mirror `.plans/roadmap.md`.
-
-## Taste
-
-Use the smallest abstraction that solves the current problem.
-
-Do not add systems the active plan does not need.
-
-Prefer explicit state transitions over inferred magic.
-
-Prefer deny-path correctness over UI polish when working on authorization.
-
-The UI must not lie. A visible Grant means server authorization grants it. A Deny means protected data never reached the model-visible path. Waiting means durable waiting state exists. Delegated means a real Worker Job exists. Success means the underlying work finished.
-
-Reuse mature code when it already solves the problem well.
-
-Before inventing a standard mechanism, inspect relevant upstream work. Important references include:
-
-```text
-earendil-works/pi
-  Model provider protocols, agent loop, streaming parsers, tool calling
-
-HKUDS/OpenHarness
-  Agent loop, tools, memory, permissions, channels, QQ
-
-TokenRhythm/opensquilla
-  context budgets, Tool-result budgets, hybrid retrieval, routing, token efficiency
-
-openfga/openfga
-  relation-based authorization
-
-tursodatabase/turso
-  structured durable state
-
-joyehuang/trajectory-panel
-  Trace, timeline, redaction, Turso sync
-
-UKGovernmentBEIS/inspect_ai
-  Eval
-
-temporalio/sdk-typescript
-  durable LongTask semantics
-```
-
-Vendored or adapted upstream code records source repository, pinned commit, license, original path, and reason. Preserve copyright, license, NOTICE, and third-party provenance requirements.
-
-Keep provider quirks out of generic product state.
-
-Keep tldraw quirks out of core Agent state.
-
-Prefer inferred TypeScript types when the compiler already knows the type. Avoid `any`. Validate unknown external data at system boundaries.
-
-Comments explain intent, trust boundaries, provenance, or non-obvious behavior. Do not narrate obvious code.
-
-Do not grow the task while fixing it. Record adjacent work instead.
-
-## Additional tips
-
-Use current project tools and upstream patterns before adding a dependency or service.
-
-The documentation site is a Learning Lab as well as reference documentation. Concept pages should distinguish `Implemented`, `Experimental`, and `Planned` rather than presenting roadmap features as current reality.
-
-Interactive demos should use deterministic synthetic data and mirror real domain semantics when those semantics exist. Do not build a second fake authorization model only for docs.
-
-Memory consolidation, retrieval, smart routing, Mail, Calendar, Workers, durable LongTask orchestration, the full Eval platform, Skill evolution, Asset Library, Arena, and serverless execution remain later consumers. The current phase explicitly includes deterministic Eval samples tied to real Runs and Trace evidence, not a general experiment platform.
-
-OpenSquilla is a post-foundation efficiency reference, not a reason to implement routing or vector retrieval during P3.
-
-Research notes, future ideas, rejected alternatives, and open product questions belong outside this file.
-
-If a rule here becomes wrong because the product changed, update the rule. Do not work around it silently.
+For the current concrete implementation path, read the active Plan and topic-specific docs from the index above.
