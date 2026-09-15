@@ -8,7 +8,7 @@ Glassbox 是一个正在演进中的 Personal Agent 工作台。
 
 其他人也可以访问同一个 Agent，但只能看到和使用被明确授权的部分。
 
-**权限是第一原则。** Channel 只是入口，Herdr 是执行现场，Canvas 是工作视图。真正的产品状态由 Glassbox 管理，包括 Identity、Authorization、Conversation、Task、Run、Trace 和后续 Memory、LongTask、Eval。
+**权限是第一原则。** Channel 只是入口，Herdr 是执行现场，Canvas 是工作视图。真正的产品状态由 Glassbox 管理，包括 Identity、Authorization、Conversation、Task、Run、Trace，以及后续的 Rules、Skills、Taste、Memory、LongTask、Eval。
 
 > 当前仓库正在把已有 Coding Agent Harness 收口成第一个真实可用的 Personal Agent + Agent Operations 闭环。README 会区分已经实现的能力和当前正在实现的能力。
 
@@ -16,7 +16,7 @@ Glassbox 是一个正在演进中的 Personal Agent 工作台。
 
 当前唯一 Active Plan：[`Plan 03 — QQ Personal Agent Closed Loop`](./.plans/03-personal-agent-foundation.md)
 
-开发顺序以 [`AGENTS.md`](./AGENTS.md) 和当前 P3 Plan 为准。长期阶段顺序记录在 [`.plans/roadmap.md`](./.plans/roadmap.md)。Runtime 边界记录在 [`docs/runtime-strategy.md`](./docs/runtime-strategy.md)，Herdr / Task / worker 边界记录在 [`docs/agent-operations.md`](./docs/agent-operations.md)。
+开发顺序以 [`AGENTS.md`](./AGENTS.md) 和当前 P3 Plan 为准。长期阶段顺序记录在 [`.plans/roadmap.md`](./.plans/roadmap.md)。Runtime 边界记录在 [`docs/runtime-strategy.md`](./docs/runtime-strategy.md)，Herdr / Task / worker 边界记录在 [`docs/agent-operations.md`](./docs/agent-operations.md)。学习层方向记录在 [`docs/memory-taste.md`](./docs/memory-taste.md)。
 
 P3 结束时要得到两个连在一起的真实闭环。
 
@@ -164,6 +164,7 @@ Authorization
 Conversation
 Task / TaskAttempt / Attention
 WorkerBinding
+Taste / Memory truth
 Turso state
 Run
 Audience / Delivery policy
@@ -584,11 +585,21 @@ real QQ + Herdr acceptance
 
 ## 后续能力
 
-P3 完成后再进入：
+P3 完成后先进入：
 
 ```text
-Memory promotion
-Authorized hybrid retrieval
+Feedback Ledger
+Taste learning
+Taste confidence + global/project scope
+Task-aware Taste retrieval
+Semantic Memory
+Episodic Memory
+Authorized retrieval
+```
+
+再继续：
+
+```text
 Mail / Calendar
 additional Channels
 full Durable LongTask / DAG / checkpoints / retry policy
@@ -603,60 +614,140 @@ Arena
 Documentation Learning Site implementation
 ```
 
+## Rules / Skills / Taste / Memory
+
+Glassbox 不把所有长期信息都叫 Memory。
+
+稳定分层是：
+
+```text
+Rules
+  硬约束、明确要求、权限和项目规则
+
+Skills
+  可复用、可验证的做事流程
+
+Taste
+  从长期行为里学到的个人偏好
+
+Memory
+  关于事实、决策、事件和过去工作的长期知识
+```
+
+保持：
+
+```text
+Rules ≠ Skills ≠ Taste ≠ Memory
+```
+
+Taste 重点观察：
+
+```text
+accept
+reject
+edit
+revert
+反复纠正
+明确正向反馈
+明确负向反馈
+```
+
+一次修改只是一条 Evidence，不能直接成为永久偏好。
+
+Taste 至少有两层 Scope：
+
+```text
+global
+  个人长期偏好
+
+project
+  当前项目特有偏好
+```
+
+每个被晋升的 Taste 都要有 confidence、支持/反向 evidence、时间和 provenance。
+
+当前任务只检索相关 Taste，不把所有偏好塞进模型。
+
+例如 React + TypeScript 任务只需要相关的 React、TypeScript、Frontend Architecture、Testing 偏好，不需要同时注入 Python、CLI、Database 的 Taste。
+
+Taste 的长期真相存在 Glassbox / Turso。
+
+Lora PI Kit 可以负责把相关 Taste 注入 Pi、转发可用 Feedback Signal，但不能成为 Taste 数据库。以后 Codex、Claude Code 等 Runtime 应该复用同一份 Glassbox Taste。
+
+Memory 保留至少两类：
+
+```text
+Semantic Memory
+  事实、决策、关系、长期项目知识
+
+Episodic Memory
+  有意义的历史 Run / Task / Conversation / 失败 / 结果
+```
+
+如果一段 Procedural Knowledge 已经稳定成可复用、可验证的流程，应该晋升成 Skill，而不是继续塞在泛化 Memory 里。
+
+学习闭环：
+
+```text
+Agent 输出
+↓
+用户行为
+↓
+FeedbackEvent
+↓
+TasteCandidate
+↓
+confidence + scope 更新
+↓
+按当前任务检索相关 Taste
+↓
+Runtime Context
+↓
+下一次执行
+```
+
+Memory Retrieval 和 Taste Retrieval 都必须先做 Authorization Scope，再进入模型可见 Context。
+
+P4 不只看“存了多少 Memory”，而要测它有没有减少用户纠正：
+
+```text
+Correction Rate
+Revert Rate
+Taste Hit Rate
+Preference Compliance
+False Preference Rate
+Scope Leakage Rate
+```
+
+完整设计见 [`docs/memory-taste.md`](./docs/memory-taste.md)。Command Code 的 Taste 思路作为参考，见 [`upstream/command-code/SOURCES.md`](./upstream/command-code/SOURCES.md)。
+
 ## Learning and Asset Loop
 
-Glassbox 不会把所有聊天记录直接塞进 Memory，也不会因为一次成功执行就自动生成永久 Skill。
+Glassbox 不会把所有聊天记录直接塞进 Memory，也不会因为一次成功执行就自动生成永久 Skill 或永久 Taste。
 
 目标链路：
 
 ```text
 Real Work
    ↓
-Run / Task / Raw Trace
+Run / Task / Raw Trace / Feedback
    ↓
 Experience Mining
+   ├── Taste Candidate
    ├── Memory Candidate
    ├── Skill Candidate
    └── Asset Candidate
              ↓
- Value + Permission + Dedup
+ Scope + Confidence + Value + Permission + Dedup
              ↓
       Eval / Verification
              ↓
            Promote
              ↓
-    Memory / Skills / Assets
+ Taste / Memory / Skills / Assets
 ```
 
-每一个高价值 Memory、Validated Skill、Asset、Journal 或 Review 都应该能回到产生它的 Run、Task 和 Trace。
-
-## Memory
-
-Memory 计划区分：
-
-```text
-Semantic Memory
-Episodic Memory
-Procedural Memory
-```
-
-至少支持：
-
-```text
-private
-public
-user
-group
-conversation
-```
-
-Retrieval 必须先做 Authorization scope，再检索和排序。不能先检索全部私人内容再让模型自己忽略。
-
-主要参考：
-
-- `zhibao-dev/Learning-Multi-Factor-Memory`
-- `langchain-ai/langmem`
-- `TokenRhythm/opensquilla`
+每一个高价值 Taste、Memory、Validated Skill、Asset、Journal 或 Review 都应该能回到产生它的 Feedback、Run、Task 和 Trace。
 
 ## Skill evolution
 
@@ -752,7 +843,7 @@ Routing observability
 
 Router 可以决定怎样更省或更强，不能改变 Principal，也不能扩大授权范围。
 
-属于通用 Pi 工作流的效率机制优先进入 Lora PI Kit。涉及受保护 Context、Task truth、产品级 Routing Policy、权限范围、Audience 或证据语义的机制继续由 Glassbox 控制。
+属于通用 Pi 工作流的效率机制优先进入 Lora PI Kit。涉及受保护 Context、Task truth、Taste / Memory truth、产品级 Routing Policy、权限范围、Audience 或证据语义的机制继续由 Glassbox 控制。
 
 ## Eval 和实验工作台
 
@@ -772,6 +863,7 @@ AGY
 Benchmark
 Differential Eval
 Invariant Eval
+Taste Eval
 Task / Worker Eval
 ```
 
@@ -839,6 +931,17 @@ Review / Rework
 Raw Trace → Derived State → Canvas
 ```
 
+P4 再加入：
+
+```text
+Rules vs Skills vs Taste vs Memory
+Taste confidence
+Global vs Project scope
+Feedback → Taste Candidate
+Task-aware Taste Retrieval
+Authorized Memory Retrieval
+```
+
 完整站点规范见 [`docs/README.md`](./docs/README.md)，交互 Demo 课程表见 [`docs/interactive-demos.md`](./docs/interactive-demos.md)。
 
 ## 上游参考
@@ -852,6 +955,7 @@ Raw Trace → Derived State → Canvas
 | `aorumbayev/herdr-workflows` | Herdr 内短线性阶段流程，不作为 Task 真相 |
 | `NapNeko/NapCatQQ` | QQ Runtime、OneBot 接入 |
 | `botuniverse/onebot-11` | OneBot 11 事件和 API Contract |
+| `CommandCodeAI/command-code` | Taste：accept/reject/edit 信号、global/project scope、持续偏好学习 |
 | `pingdotgg/t3code` | Claude Code、权限、Resume |
 | `HKUDS/OpenHarness` | Agent Loop、Tools、Skills、Memory、Channels、QQ |
 | `keli-wen/agy-staff` | AGY Worker、后台 Job、Continue、Restart |
@@ -898,7 +1002,9 @@ docs/
   README.md
   runtime-strategy.md
   agent-operations.md
+  memory-taste.md
   tech-stack.md
+  data-observability.md
   interactive-demos.md
 
 assets/
@@ -907,12 +1013,13 @@ assets/
 upstream/
   pi/
   herdr/
+  command-code/
   t3-code/
   opensquilla/
   token-monitor/
 ```
 
-Lora PI Kit 在 P3.1 开始时创建为独立仓库。不要把 Pi Core 复制进 Glassbox，也不要把 QQ Transport、Authorization、Task state 或 Turso 塞进 Lora PI Kit。
+Lora PI Kit 在 P3.1 开始时创建为独立仓库。不要把 Pi Core 复制进 Glassbox，也不要把 QQ Transport、Authorization、Task state、Taste/Memory truth 或 Turso 塞进 Lora PI Kit。
 
 ## 开始开发
 
@@ -954,10 +1061,11 @@ npm run test:server
 2. `.plans/03-personal-agent-foundation.md`
 3. 改 Runtime 方向时读 `docs/runtime-strategy.md`
 4. 改 Task / Herdr / worker / Ops 时读 `docs/agent-operations.md`
-5. 改工具链时读 `docs/tech-stack.md`
-6. 当前任务相关的 `.plans/findings/`
-7. 相关 `upstream/` 或上游项目
-8. 当前实现和 focused tests
+5. 改 Rules / Skills / Taste / Feedback / Memory / Retrieval 时读 `docs/memory-taste.md`
+6. 改工具链时读 `docs/tech-stack.md`
+7. 当前任务相关的 `.plans/findings/`
+8. 相关 `upstream/` 或上游项目
+9. 当前实现和 focused tests
 
 不要从旧 Git 历史恢复已经被新 P3 取代的旧 Plan 语义。
 
@@ -987,7 +1095,7 @@ Glassbox 重启后 Task / TaskAttempt / WorkerBinding 不丢
 Trace 可以解释整条执行链和 Task 生命周期
 ```
 
-P3 完成后再进入 Memory、Authorized Retrieval、更多 Channel、完整 Durable LongTask、Eval 和效率层。
+P3 完成后进入 `P4 — Memory, Taste and Authorized Retrieval`，先建立 Feedback/Taste 学习，再接 Semantic / Episodic Memory 和授权检索。之后再进入更多 Channel、完整 Durable LongTask、Eval 和效率层。
 
 ## License
 
