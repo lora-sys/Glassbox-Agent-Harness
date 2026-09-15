@@ -105,6 +105,36 @@ The first does not imply the second.
 
 Local testing and server deployment use the same control model. The target production shape is Glassbox + Pi + NapCat + Herdr on a Linux server, with remote human access over SSH when needed. Moshi may be used as a remote Herdr client, but Moshi client state is not Glassbox product state.
 
+## Learning direction
+
+Glassbox separates four concepts that must not collapse into one prompt or one generic memory bucket:
+
+```text
+Rules
+  explicit hard constraints
+
+Skills
+  reusable validated procedures
+
+Taste
+  learned user preferences
+
+Memory
+  durable facts, decisions, events, and prior-work knowledge
+```
+
+Taste is learned from behavior such as accept, reject, edit, revert, repeated correction, and explicit feedback.
+
+Taste is not a hard Rule, and one observation is not a permanent preference.
+
+Glassbox owns FeedbackEvent, Taste, confidence, scope, promotion, retrieval, Memory, authorization, and provenance in durable state.
+
+Lora PI Kit may collect signals and inject selected Taste into Pi, but it does not become the canonical Taste store.
+
+The same learned Taste should eventually be reusable across Pi, Codex, Claude Code, and future Runtimes.
+
+See `docs/memory-taste.md`.
+
 ## Sequence
 
 ### P3 — QQ Personal Agent + Agent Ops Closed Loop
@@ -169,11 +199,33 @@ P3 deliberately does not become a full durable workflow engine. Complex dependen
 
 See the active plan for the full completion gate.
 
-### P4 — Memory and Authorized Retrieval
+### P4 — Memory, Taste and Authorized Retrieval
 
-After the first real QQ and Ops loops work, add durable Memory without weakening the P3 trust model.
+After the first real QQ and Ops loops work, add the learning layer without weakening the P3 trust model.
 
-Target flow:
+P4 begins by learning preference from real user corrections before building broad Memory retrieval.
+
+Stable split:
+
+```text
+Rules ≠ Skills ≠ Taste ≠ Memory
+```
+
+Target Taste loop:
+
+```text
+Agent output
+→ user accept / reject / edit / revert / correction
+→ FeedbackEvent
+→ TasteCandidate
+→ confidence + scope update
+→ promote / demote / retire
+→ task-aware Taste retrieval
+→ inject only relevant Taste
+→ next Runtime execution
+```
+
+Target Memory loop:
 
 ```text
 Run / Conversation / Task evidence
@@ -185,6 +237,72 @@ Run / Conversation / Task evidence
 → authorized retrieval
 ```
 
+P4 starts with two Taste scopes:
+
+```text
+global
+  long-lived personal preference
+
+project
+  preference specific to the current project
+```
+
+Project Taste must not silently contaminate global Taste.
+
+Every promoted Taste entry must preserve:
+
+```text
+preference
+category
+scope
+confidence
+supporting evidence
+contradicting evidence
+observation count
+first seen
+last seen
+status
+provenance
+```
+
+One edit is evidence, not a permanent rule.
+
+Only task-relevant Taste should be injected into model Context. Do not send the whole preference profile every turn.
+
+P4 planned slices:
+
+```text
+P4.0 — Feedback Ledger
+  durable accept / reject / edit / revert evidence
+
+P4.1 — Taste Candidate + Confidence
+  global / project scope
+  promotion / demotion
+  contradiction and recency handling
+
+P4.2 — Task-aware Taste Retrieval
+  relevant Top K only
+  runtime injection
+  authorization and scope checks
+
+P4.3 — Semantic Memory
+  durable facts, decisions, relationships, and project knowledge
+
+P4.4 — Episodic Memory
+  meaningful prior Run / Task / Conversation outcomes
+
+P4.5 — Authorized Retrieval
+  authorization first
+  lexical first
+  hybrid/vector when justified
+  source weighting, decay, diversity, context budget
+
+P4.6 — Inspection and Eval
+  evidence, confidence, scope, retrieval reason, and impact
+```
+
+Procedural knowledge that stabilizes into a reusable validated workflow should normally be promoted to a Skill rather than remain generic Memory.
+
 Retrieval should eventually combine:
 
 ```text
@@ -194,18 +312,37 @@ authorization scope
 + source weighting
 + temporal decay
 + diversity reranking
++ reliability / confidence
 + context budget
 ```
 
-Protected Memory must be filtered before model-visible retrieval results are assembled.
+Protected Taste and Memory must be filtered before model-visible retrieval results are assembled.
+
+P4 success is measured by reduced correction work, not by how many preferences or memories were stored.
+
+Track at least:
+
+```text
+Correction Rate
+Revert Rate
+Taste Hit Rate
+Preference Compliance
+False Preference Rate
+Scope Leakage Rate
+Taste Retrieval Precision
+Memory Retrieval Precision
+```
 
 Primary references:
 
 ```text
+CommandCodeAI/command-code for Taste product mechanics
 zhibao-dev/Learning-Multi-Factor-Memory
 langchain-ai/langmem
 TokenRhythm/opensquilla for retrieval mechanics
 ```
+
+See `docs/memory-taste.md` and `upstream/command-code/SOURCES.md`.
 
 ### P5 — Efficient Runtime and Observability
 
@@ -325,9 +462,9 @@ Mail and Calendar remain protected product Domains, not unrestricted MCP access.
 Turn real execution evidence into a controlled learning loop:
 
 ```text
-Run / Task / Trace
+Run / Task / Trace / Feedback
 → Experience Mining
-→ Memory / Skill / Asset Candidate
+→ Memory / Taste / Skill / Asset Candidate
 → Eval / Verification
 → Promotion
 ```
@@ -340,6 +477,7 @@ Differential Eval
 Invariant Eval
 Permission Eval
 Routing Eval
+Taste Eval
 Task / worker Eval
 Skill generation
 Skill verification
@@ -349,9 +487,9 @@ Monthly review
 Arena experiments
 ```
 
-Primary references include Inspect AI, SkillClaw, CoEvoSkills, Voyager, Dagster, Generative Agents, OpenSpiel, Sotopia, and memos.
+Primary references include Inspect AI, SkillClaw, CoEvoSkills, Voyager, Dagster, Generative Agents, OpenSpiel, Sotopia, memos, and the P4 Taste evidence model.
 
-Validated reusable Pi workflow procedures may be published through Lora PI Kit or `lora-sys/skills`. Glassbox remains the source of product evidence, permissions, task acceptance, and promotion decisions.
+Validated reusable Pi workflow procedures may be published through Lora PI Kit or `lora-sys/skills`. Glassbox remains the source of product evidence, permissions, task acceptance, Taste truth, and promotion decisions.
 
 ## Documentation and Learning track
 
@@ -396,9 +534,28 @@ Raw Trace vs Derived State
 
 Use synthetic deterministic fixtures derived from the real P3 contracts.
 
-### D2 — Memory and retrieval lab
+### D2 — Taste, Memory and retrieval lab
 
-After P4 exists, let readers manipulate visibility scope, lexical/vector weight, time decay, source weighting, diversity, result count, and context budget.
+After P4 exists, let readers manipulate:
+
+```text
+feedback signals
+Taste confidence
+supporting vs contradicting observations
+global vs project scope
+Taste retrieval relevance
+visibility scope
+lexical/vector weight
+time decay
+source weighting
+diversity
+result count
+context budget
+```
+
+The demo should make the difference between Rule, Skill, Taste, Semantic Memory, and Episodic Memory explicit.
+
+It must also make it obvious that authorization filtering happens before protected Taste or Memory reaches model-visible Context.
 
 ### D3 — Routing and token economy lab
 
@@ -406,15 +563,17 @@ After P5 exists, let readers compare routing, model tier, thinking depth, contex
 
 ### D4 — LongTask and learning labs
 
-After later runtime phases, add LongTask state-machine, Trace-to-Canvas, Skill promotion, Eval, and learning-loop demonstrations.
+After later runtime phases, add LongTask state-machine, Trace-to-Canvas, Skill promotion, Eval, and broader learning-loop demonstrations.
 
 ## Stable roadmap rules
 
 - Active implementation scope comes from the current Plan file, not from future roadmap sections.
 - Upstream references are research and implementation material, not automatic dependencies.
-- Glassbox authorization always wins over runtime configuration, Pi Extensions, Skills, model output, Channel input, Herdr state, or Worker behavior.
+- Glassbox authorization always wins over runtime configuration, Pi Extensions, Skills, model output, Channel input, Herdr state, Taste, Memory retrieval, or Worker behavior.
+- Rules, Skills, Taste, and Memory remain separate concepts with separate authority and lifecycle.
+- Taste is preference, not hard permission or product policy.
 - Glassbox Task state is durable product truth. Herdr lifecycle state is an execution observation.
-- A new runtime, Channel, Memory system, cache, Herdr plugin, workflow recipe, or Worker cannot bypass the hard gates proven in P3.
+- A new runtime, Channel, Memory system, Taste learner, cache, Herdr plugin, workflow recipe, or Worker cannot bypass the hard gates proven in P3.
 - `done` from an external runtime or worker never means accepted unless the Glassbox Task state machine records acceptance.
 - Local testing must preserve the same contracts intended for the Linux server deployment. Avoid desktop-only product dependencies.
 - Build one usable vertical loop at a time and preserve focused regression coverage for working behavior.
