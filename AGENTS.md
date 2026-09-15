@@ -67,6 +67,7 @@ TaskAttempt ≠ Worker lifecycle state
 Herdr Agent state ≠ Task acceptance
 Actor permission ≠ Delivery permission
 Runtime / Provider / Worker ≠ Personal Agent
+Rules ≠ Skills ≠ Taste ≠ Memory
 ```
 
 Conversation is durable product state.
@@ -79,6 +80,14 @@ Task is durable product work.
 
 TaskAttempt is one concrete execution or rework attempt for a Task.
 
+Rules are explicit constraints and authority-bearing instructions.
+
+Skills are reusable validated procedures.
+
+Taste is learned user preference and cannot override Rules, authorization, or product policy.
+
+Memory is durable knowledge about facts, decisions, events, and prior work. It is not a generic bucket for Rules, Skills, or Taste.
+
 Do not collapse these concepts because the current deployment is local, single-user, or uses only one Runtime.
 
 ### 3. Researchable by default
@@ -89,7 +98,7 @@ Raw Trace is append-only evidence. Derived State is an interpretation of that ev
 
 Do not rewrite historical execution evidence so an old Run or TaskAttempt appears to have used newer state.
 
-Authorization, approvals, delivery decisions, Task assignment, WorkerBinding, review, rework, acceptance, and delegation must remain traceable.
+Authorization, approvals, delivery decisions, Task assignment, WorkerBinding, review, rework, acceptance, delegation, feedback-derived learning, and promotion decisions must remain traceable.
 
 Denied operations should record why they were denied without copying protected payload contents into denial logs.
 
@@ -136,6 +145,7 @@ Principal
 Authorization
 Conversation
 Task truth
+Taste and Memory truth
 Audience / Delivery policy
 Durable product state
 Run identity
@@ -145,6 +155,8 @@ Raw Trace
 Herdr owns live execution facts such as workspaces, worktrees, panes, terminal processes, and observed coding-Agent lifecycle state.
 
 Herdr does not own Glassbox Task truth or authorization.
+
+Lora PI Kit may bridge selected Taste, Memory, Rules, or Skills into Pi Runtime Context, but it is not the canonical store for Glassbox Taste or Memory.
 
 Do not turn Glassbox into a Pi wrapper.
 
@@ -156,7 +168,7 @@ Do not copy an upstream trust model blindly. Glassbox authorization rules win.
 
 Canvas is a workspace and inspection surface, not execution state.
 
-Moving, connecting, grouping, resizing, or annotating Canvas Objects must not silently change Agent execution, Task state, Worker state, or authorization.
+Moving, connecting, grouping, resizing, or annotating Canvas Objects must not silently change Agent execution, Task state, Worker state, learning state, or authorization.
 
 Preserve this boundary:
 
@@ -212,6 +224,7 @@ Read in this order before changing code:
 | Product sequencing after the active Plan | `.plans/roadmap.md` |
 | Pi, Lora PI Kit, Runtime ownership, SDK boundary | `docs/runtime-strategy.md` |
 | Herdr, Task, Attention, TaskAttempt, WorkerBinding, Ops Tools, reconciliation | `docs/agent-operations.md` |
+| Rules, Skills, Taste, Feedback, Memory, learning, retrieval | `docs/memory-taste.md` |
 | Toolchain, dependencies, build, test, local development | `docs/tech-stack.md` |
 | Persistence, storage, observability, monitoring, public/private projections | `docs/data-observability.md` |
 | Documentation and learning-site rules | `docs/README.md` |
@@ -246,13 +259,15 @@ Use these terms consistently.
 - **WorkerBinding**: the mapping from a TaskAttempt to its concrete Worker execution location.
 - **AgentOpsSnapshot**: a compact projection of current Task, Attention, and Worker state for the main Agent.
 - **Herdr**: the live operations host for workspaces, worktrees, panes, terminal processes, and coding-Agent lifecycle facts.
+- **Rule**: an explicit constraint or authority-bearing instruction.
+- **Skill**: a reusable validated procedure or capability description.
+- **Taste**: a learned user preference with scope, confidence, and evidence. Taste is not permission or a hard Rule.
+- **Memory**: promoted durable knowledge about facts, decisions, events, or prior work; not raw Conversation history or Taste.
 - **Raw Trace**: append-only execution evidence.
 - **Derived State**: Glassbox's current interpretation of evidence.
 - **AuthorizationDecision**: inspectable `ALLOW`, `DENY`, or `REQUIRES_APPROVAL` evidence.
 - **Approval**: explicit human authorization for a policy path that already permits approval. Approval is not Permission.
 - **Visibility**: the scope in which protected content may be used or delivered.
-- **Memory**: promoted durable knowledge, not raw Conversation history.
-- **Skill**: a reusable validated procedure or capability description.
 - **Asset**: a durable output with provenance, lineage, or version identity.
 - **Canvas**: the tldraw workspace and projection surface.
 - **Artifact**: a durable output such as a file, diff, document, image, webpage, or dataset.
@@ -271,6 +286,10 @@ Task ≠ Run
 Task ≠ Worker
 TaskAttempt ≠ Worker lifecycle state
 LongTask ≠ Task
+Rules ≠ Skills
+Skills ≠ Taste
+Taste ≠ Memory
+Memory ≠ Rules
 Runtime / Provider / Worker ≠ Personal Agent
 Canvas ≠ Execution State
 Raw Trace ≠ Derived State
@@ -307,15 +326,19 @@ worker_permissions ⊆ delegated_permissions ⊆ caller_permissions
 
 12. **Making Canvas the source of truth.** Canvas remains a projection.
 
-13. **Designing for imaginary future systems.** The active Plan decides implementation scope.
+13. **Turning learned Taste into authority.** A repeated preference cannot silently override Rules, authorization, project policy, or a user's explicit current instruction.
 
-14. **Writing tests into live user state.** Automated tests must use isolated, disposable state and must not mutate production QQ, Pi, Herdr, repositories, or Personal Agent data.
+14. **Mixing Taste scopes.** Project-specific Taste must not silently become global Taste or leak into unrelated projects.
 
-15. **Doing a half migration.** Toolchain, Runtime, persistence, or protocol migrations must leave one coherent working state.
+15. **Designing for imaginary future systems.** The active Plan decides implementation scope.
 
-16. **Forking Pi too early.** Prefer supported settings, packages, Skills, Extensions, custom Tools, ResourceLoader, SDK surfaces, and upstream contributions before maintaining a local core patch.
+16. **Writing tests into live user state.** Automated tests must use isolated, disposable state and must not mutate production QQ, Pi, Herdr, repositories, or Personal Agent data.
 
-17. **Putting product authority into Lora PI Kit or Herdr.** Glassbox remains the authority for identity, permissions, Task truth, durable product state, and evidence.
+17. **Doing a half migration.** Toolchain, Runtime, persistence, or protocol migrations must leave one coherent working state.
+
+18. **Forking Pi too early.** Prefer supported settings, packages, Skills, Extensions, custom Tools, ResourceLoader, SDK surfaces, and upstream contributions before maintaining a local core patch.
+
+19. **Putting product authority into Lora PI Kit or Herdr.** Glassbox remains the authority for identity, permissions, Task truth, Taste / Memory truth, durable product state, and evidence.
 
 ## Explicit execution semantics
 
@@ -348,7 +371,7 @@ Promote Skill
 Promote Asset
 ```
 
-Layout changes, notes, arrows, Canvas movement, QQ text, Herdr focus changes, workspace renames, and model suggestions do not implicitly execute product Actions.
+Layout changes, notes, arrows, Canvas movement, QQ text, Herdr focus changes, workspace renames, model suggestions, or one-off user edits do not implicitly execute product Actions or create hard Rules.
 
 If execution-relevant state changes during a Run or TaskAttempt, preserve enough evidence to reconstruct what it started with and when the change took effect.
 
@@ -358,9 +381,9 @@ Raw Trace is evidence. Derived State is interpretation.
 
 Do not rewrite Raw Trace to match a newer UI model, reducer, policy, or schema.
 
-Do not treat a transient terminal screen, Worker status, or current UI state as the only durable record of a result.
+Do not treat a transient terminal screen, Worker status, current UI state, or current Taste projection as the only durable record of a result or learning decision.
 
-Preserve accepted result references and the evidence needed to explain them.
+Preserve accepted result references, FeedbackEvent evidence, and the provenance needed to explain promotions or demotions.
 
 ## Check every affected path
 
@@ -374,6 +397,7 @@ Before calling a change done, check the paths that apply:
 - **Conversation / Session / Run / Task**: are lifetimes and identifiers still distinct?
 - **Persistence**: what survives reconnect, restart, and database reopen?
 - **Task / Worker state**: is durable Task truth separate from observed Worker lifecycle?
+- **Learning**: are Rules, Skills, Taste, Feedback, and Memory still separate? Is scope preserved?
 - **Trace**: is the decision explainable without leaking protected payloads?
 - **Runtime / Host integration**: are runtime-specific details contained behind their integration boundary?
 - **Contracts**: did every producer and consumer move together?
@@ -413,6 +437,7 @@ Turso / SQLite test databases
 QQ / OneBot fixtures
 Herdr sessions and worktrees
 repositories
+Feedback / Taste / Memory fixtures
 credentials and secrets
 Trace fixtures
 ```
@@ -479,6 +504,8 @@ Delivery Authorization
 Result
         ↓
 Raw Trace + Product Evidence
+        ↓
+Feedback / Taste / Memory learning
         ↓
 Derived State
         ↓
