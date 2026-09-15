@@ -1,79 +1,195 @@
-# Glassbox Documentation Site
+# Glassbox Documentation
 
 Status: DESIGN / CONTENT FOUNDATION
 
-This directory defines the public documentation and learning experience for Glassbox.
+This directory defines the architecture notes and future public learning experience for Glassbox.
 
-The documentation site should help a technically curious user understand Glassbox's key mechanisms without requiring them to read the repository first.
+The documentation should help a technically curious reader understand Glassbox without requiring them to reverse-engineer the repository first.
 
-The target is not a reference manual with a search box. The target is a concept-learning site with interactive demonstrations.
+Do not use this file as an implementation checklist. The active Plan owns implementation order.
 
-## Architecture references
+## Architecture source map
 
-The cross-cutting data, storage, observability, analytics, and public read boundary is defined in [`data-observability.md`](./data-observability.md).
+Use one source of truth per topic.
 
-The execution-runtime ownership boundary between Glassbox, Pi, Lora PI Kit, Codex, Claude Code, and Herdr is defined in [`runtime-strategy.md`](./runtime-strategy.md).
+| Topic | Source of truth |
+| --- | --- |
+| Current implementation order and completion gate | `../.plans/03-personal-agent-foundation.md` |
+| Long-term phase sequence | `../.plans/roadmap.md` |
+| Stable repository invariants | `../AGENTS.md` |
+| Runtime ownership / Pi SDK / runtime roles | `runtime-strategy.md` |
+| Lora PI Kit distribution / Skills snapshot / MCP / profiles / locks | `lora-pi-kit.md` |
+| Herdr / Task / Attention / WorkerBinding / reconciliation | `agent-operations.md` |
+| Rules / Skills / Taste / Feedback / Memory / retrieval | `memory-taste.md` |
+| Toolchain / dependencies / test / deployment | `tech-stack.md` |
+| Persistence / storage / observability / projections | `data-observability.md` |
+| Interactive demo curriculum | `interactive-demos.md` |
+| Upstream research pins | `../upstream/*/SOURCES.md` |
 
-The bidirectional Task / Attention / worker coordination boundary is defined in [`agent-operations.md`](./agent-operations.md).
+Do not duplicate detailed implementation rules across several documents. Link to the owner document instead.
 
-The Rules / Skills / Taste / Feedback / Memory learning boundary is defined in [`memory-taste.md`](./memory-taste.md).
-
-Those documents fix these ownership rules:
+## Stable architecture vocabulary
 
 ```text
-Glassbox
-  product, trust, Conversation, Task, Taste, Memory, review and evidence boundary
-
 Pi
-  primary Personal Agent runtime foundation
+  Agent engine
 
 Lora PI Kit
-  maintainer-owned Pi configuration and extension layer
-  may bridge selected Taste / Memory into Pi
-  not canonical Taste / Memory truth
+  Lora's reproducible Pi distribution
+
+Glassbox
+  Personal Agent product / trust / durable-state system
 
 Herdr
-  live coding-worker execution host and lifecycle observation layer
-
-Codex / Claude Code
-  supported alternate runtimes and worker backends
+  live coding-worker execution host
 ```
 
-The data and observability architecture also fixes the current Web access rule:
+These are different layers.
 
 ```text
-Owner
-  full management and private observability
-
-Public visitor
-  read-only access to explicitly published Trace or Eval projections only
+Pi ≠ Personal Agent
+Lora PI Kit ≠ Personal Agent
+Herdr Worker ≠ Personal Agent
+Herdr state ≠ Task acceptance
+Canvas ≠ Execution State
 ```
 
-The public documentation site is separate from both the Owner control plane and the public Trace / Eval observer pages.
+## Runtime model
+
+Main Agent path:
+
+```text
+Channel / Workbench
+        ↓
+Glassbox
+  Identity
+  Authorization
+  Conversation
+  Task / Attention
+  Taste / Memory truth
+        ↓
+PiRuntimeAdapter
+        ↓
+Pi SDK
+        ↓
+Pi + pinned Lora PI Kit profile
+```
+
+Lora PI Kit is not merely a config folder.
+
+It is a Pi Distribution that may contain:
+
+```text
+pinned Lora Skills snapshot
+Extensions
+Prompt Templates
+profiles
+MCP adapter / registry
+runtime hooks
+Glassbox bridges
+compatibility locks
+install / doctor / update / sync tooling
+```
+
+See `lora-pi-kit.md`.
+
+## Agent Operations model
+
+```text
+Main Agent
+        ↓
+Task Registry + Attention Queue
+        ↓
+Authorized Ops Tools
+        ↓
+HerdrBridge
+        ↓
+Herdr Worker
+        ↓
+working / blocked / done
+        ↓
+OpsReconciler
+        ↓
+TaskAttempt / WorkerBinding
+        ↓
+Review / Rework / Accept
+```
+
+Herdr reports live execution facts.
+
+Glassbox owns Task truth and acceptance.
+
+See `agent-operations.md`.
+
+## Learning model
+
+Do not collapse all persistent behavior into generic Memory.
+
+```text
+Rules
+  hard constraints
+
+Skills
+  reusable validated procedures
+
+Taste
+  learned user preference
+
+Memory
+  durable facts, decisions, events and prior-work knowledge
+```
+
+```text
+Rules ≠ Skills ≠ Taste ≠ Memory
+```
+
+Taste learns from real user behavior such as accept, reject, edit, revert, repeated correction, and explicit feedback.
+
+Taste is preference, not permission or a hard Rule.
+
+See `memory-taste.md`.
+
+## Trust and safety model
+
+Every protected operation must be enforceable without model obedience.
+
+Core principles:
+
+```text
+default deny
+authorize before protected Context
+re-authorize protected Tool / Ops execution
+authorize Delivery audience separately
+revocation affects the next protected operation
+delegation may only reduce authority
+Raw Trace remains evidence
+```
+
+An installed Pi Skill, Extension, MCP integration, profile, or Herdr control surface does not grant a Channel Principal permission to use it.
 
 ## Audience
 
-The site should serve several readers without turning every page into a generic introduction:
+The future documentation / learning site should serve several readers.
 
 ```text
 User
-  wants to understand what the Agent can do and why permissions matter
+  understand what the Agent can do and why permissions matter
 
 Builder
-  wants to understand the runtime model and integrate a Channel, Tool, Worker, Runtime, or Agent Operations host
+  integrate a Channel, Tool, Runtime, Worker, MCP, or Agent Operations host
 
 Contributor
-  wants to understand invariants, architecture, contracts, evidence, and upstream decisions
+  understand invariants, architecture, contracts and evidence
 
 Researcher
-  wants to inspect routing, memory, taste learning, eval, token economy, task coordination, and learning behavior
+  inspect Taste, Memory, routing, Eval, token economy and worker coordination
 ```
 
-Each page should state which audience it is primarily for.
+Pages should state their primary audience where useful.
 
-## Core teaching model
+## Teaching model
 
-Every important concept should follow this progression where appropriate:
+Important concepts should usually follow:
 
 ```text
 1. Explain
@@ -81,14 +197,14 @@ Every important concept should follow this progression where appropriate:
 3. Let the reader change inputs
 4. Show the resulting state transition
 5. Show the evidence
-6. Link to the real contract or implementation when it exists
+6. Link to the real implementation / contract when it exists
 ```
 
-A reader should leave a page knowing what the concept means, why Glassbox needs it, what can go wrong, and where the invariant is enforced.
+Interactive demos should expose a real mechanism, not just animate a diagram.
 
 ## Truthfulness rule
 
-Every capability page must show a visible lifecycle status:
+Every substantial capability page should show one of:
 
 ```text
 Implemented
@@ -96,21 +212,19 @@ Experimental
 Planned
 ```
 
-Do not document future architecture using present-tense claims that imply production support.
+Do not present planned architecture in present tense as if it were production behavior.
 
-When implementation changes, update the documentation status before adding more polish.
-
-## Proposed information architecture
+## Proposed public information architecture
 
 ### Start Here
 
 ```text
 What is Glassbox?
 Why one durable Personal Agent?
+Pi vs Lora PI Kit vs Glassbox
 Why authorization comes before intelligence
 How to read a Run
 How the main Agent tracks work
-How Glassbox learns preference without growing one giant prompt
 Current implementation status
 Roadmap
 ```
@@ -119,10 +233,10 @@ Roadmap
 
 ```text
 Agent
-User and Principal
-Identity Resolution
+User / Principal
+ChannelIdentity
 Authorization
-Permission and Approval
+Permission / Approval
 Conversation
 Session
 Run
@@ -130,149 +244,77 @@ Task
 TaskAttempt
 AttentionItem
 WorkerBinding
-Tool
 Runtime
-Provider
+Lora PI Kit
 Worker
-LongTask
-Rule
-Skill
+Herdr
+Rules
+Skills
 Taste
-FeedbackEvent
 Memory
-Asset
 Trace
 Derived State
-Canvas Projection
+Canvas
 Eval
-```
-
-### Trust and Safety Architecture
-
-```text
-Default deny
-Authorize before Context
-Protected Tool re-authorization
-Agent Ops authorization
-Confused deputy
-Delegation can only reduce authority
-Revocation
-Approval replay protection
-Private / public visibility
-Delivery authorization
-Taste / Memory scope isolation
-Trace redaction
 ```
 
 ### Runtime
 
 ```text
-Glassbox Runtime Boundary
-Pi and Lora PI Kit
-Codex and Claude Code adapters
-Agent loop
-Tool boundary
+Pi engine
+Pi SDK
+Lora PI Kit
+Pi Packages
+Profiles
+Skills snapshot
+MCP adapter
 Context assembly
-Context budgets
-Tool-result budgets
-Routing
-Retries
-Persistence
+Tool boundary
+runtime state isolation
+compatibility locks
 ```
 
 ### Agent Operations
 
 ```text
-Main Agent and workers
 Attention Queue
 Task state machine
 TaskAttempt
 WorkerBinding
 AgentOpsSnapshot
 HerdrBridge
-Herdr working / blocked / done
-Snapshot reconciliation
-Review and rework
-Herdr-workflows boundary
-Local test to server deployment
-Moshi as optional remote operations client
+working / blocked / done
+snapshot reconciliation
+review / rework
+local test → server deployment
+Moshi as optional human client
 ```
 
-The docs must make this distinction explicit:
+### Memory and Taste
 
 ```text
-Herdr Agent state = execution observation
-Glassbox Task state = product truth
-```
-
-### Taste, Memory and Learning
-
-Start with the stable split:
-
-```text
-Rules
-  explicit hard constraints
-
-Skills
-  reusable validated procedures
-
-Taste
-  learned user preferences
-
-Memory
-  durable facts, decisions, events, and prior-work knowledge
-```
-
-The docs must keep these distinctions visible:
-
-```text
-Rules ≠ Skills ≠ Taste ≠ Memory
-```
-
-Teach at least:
-
-```text
-FeedbackEvent
-accept / reject / edit / revert
-TasteCandidate
+Feedback Ledger
+Taste Candidate
 confidence
-supporting vs contradicting evidence
-global vs project scope
-promotion / demotion
+scope
 task-aware Taste retrieval
 Semantic Memory
 Episodic Memory
-Memory candidates
-promotion
-forgetting and staleness
-contradiction handling
 Authorized Retrieval
-Skill evolution
-Asset lineage
-Journal and review
+Skill promotion boundary
 ```
-
-A stable reusable procedure should be taught as a Skill rather than left inside a generic "procedural memory" bucket.
 
 ### Observability
 
 ```text
 Raw Trace
 AuthorizationDecision
-Derived State
-Timeline
-Inspector
-Canvas
-Replay
-Cost and token usage
-Task / worker state
-Attention Queue
-Review / rework evidence
-Feedback evidence
-Taste confidence / scope / retrieval reason
-Memory promotion / retrieval evidence
-Public Trace publication
-Public Eval publication
+Run / Tool / Delivery evidence
+Task lifecycle evidence
+Kit / profile / runtime identity
+Taste retrieval reason
+Memory retrieval reason
+public Trace / Eval projections
 ```
 
 ### Eval Lab
@@ -281,24 +323,11 @@ Public Eval publication
 Benchmark
 Differential Eval
 Invariant Eval
-Routing Eval
 Permission Eval
 Taste Eval
 Memory retrieval Eval
-Task / worker Eval
-```
-
-Taste Eval should measure correction reduction, not only how many preferences exist.
-
-Useful concepts include:
-
-```text
-Correction Rate
-Revert Rate
-Taste Hit Rate
-Preference Compliance
-False Preference Rate
-Scope Leakage Rate
+Routing Eval
+Task / Worker Eval
 ```
 
 ### Build with Glassbox
@@ -307,232 +336,145 @@ Scope Leakage Rate
 Add a Channel
 Add a Tool
 Add a Runtime adapter
-Add a Worker
-Add an Agent Operations adapter
+Add a Lora PI Kit Extension / profile integration
+Add an MCP integration
+Add a Worker / Agent Operations adapter
 Add a protected Resource type
-Add a Feedback signal adapter
-Add a Taste retrieval feature
-Add a Canvas projection
 Add an Eval
 ```
 
-### Upstream Notes
-
-Explain which problems Glassbox studies from mature upstream projects and which trust or product assumptions Glassbox intentionally does not copy.
-
-The upstream Pi note should explain why Glassbox uses a separate Lora PI Kit layer rather than carrying a broad Pi fork.
-
-The Herdr note should explain why Glassbox reuses Herdr for live workspaces, worktrees, panes, and worker lifecycle while retaining Task, acceptance, authorization, and evidence as Glassbox-owned state.
-
-The Command Code note should explain the useful Taste pattern: accept, reject, and edit behavior can become preference-learning signals, while Glassbox still owns confidence, scope, authorization, provenance, and durable Taste truth.
-
-## Page anatomy
-
-A concept page should usually contain:
-
-```text
-Status
-One-sentence definition
-Why it exists
-Minimal model
-Interactive demo or executable example
-Failure mode
-Glassbox invariant
-Evidence produced
-Related concepts
-Implementation links
-Upstream references
-```
-
-Do not force this shape when a page is naturally a short reference page.
-
 ## Visual language
 
-Use the same domain vocabulary as the product.
+Prefer state diagrams, timelines, small tables, event traces, and architecture flows over decorative diagrams.
 
-Prefer state diagrams, timelines, flow diagrams, small tables, and event traces over decorative illustrations.
-
-Diagrams must distinguish:
+Always distinguish:
 
 ```text
 trusted boundary
 untrusted input
-persistent state
+persistent product state
+runtime distribution state
 ephemeral execution
 external execution observation
-learned preference
-hard Rule
 derived projection
 human approval / review
 ```
 
-Canvas screenshots should explain projection behavior rather than implying Canvas is the execution source of truth.
+Do not use a Pi TUI screenshot to imply Pi is the Product State.
 
-Herdr screenshots should explain live execution state rather than implying a pane or workspace is the Task database.
+Do not use a Herdr pane to imply the pane is Task truth.
+
+Do not use Canvas layout to imply Canvas controls execution.
 
 ## Interactive demo principles
 
-Interactive demos are part of the curriculum.
-
-They should be:
+Demos should be:
 
 ```text
 deterministic by default
 fast
 resettable
-mobile-usable
-keyboard-usable
 safe to run locally
 based on synthetic fixtures
-explicit about what is simulated
+explicit about simulated vs real behavior
 ```
-
-A demo should expose a real mechanism, not merely animate a diagram.
 
 Good interactions include:
 
 ```text
 change Principal
 change Resource visibility
-Grant or Revoke permission
-attempt a protected Tool call
-simulate worker working / blocked / done
-accept or rework a Task
+Grant / Revoke
+attempt protected Tool / MCP call
+change Lora PI Kit profile
+show which Skills are active
+simulate Worker working / blocked / done
+Accept / Rework Task
 simulate Herdr reconnect reconciliation
-accept / reject / edit an Agent result
-change Taste evidence and confidence
-switch global vs project Taste scope
-inspect why one Taste was retrieved
-change retrieval weights
-change context budget
-change task difficulty
-inspect generated events
-step through a LongTask state machine
+add positive / negative Taste evidence
+change Taste scope / confidence
+inspect authorized retrieval
 ```
-
-Bad interactions include buttons that only reveal paragraphs or animations with no change in system behavior.
-
-## Relationship to production code
-
-The first version of a demo may use a small deterministic model of the mechanism.
-
-Once a production contract becomes stable, prefer sharing types, schemas, fixtures, or pure functions where this does not create a runtime dependency from production code into the docs site.
-
-Never duplicate a security invariant in client-only demo code and then treat the demo as proof that the product is secure.
-
-Never duplicate a fake Task state machine in docs and present it as proof of Herdr integration correctness.
-
-Never create a client-only Taste simulator and treat it as proof that production scope or authorization is correct.
-
-Production authorization, Task truth, Taste truth, and Memory truth remain server-side.
 
 ## Data safety
 
-Public documentation demos must not require:
+Public docs demos must not require:
 
 ```text
 real Personal Agent state
-real user Taste
-real user Memory
-private FeedbackEvents
 private Conversation history
+real Taste / Memory data
 production credentials
 private repositories
-real Herdr workspaces or worker output
-real Mail or Calendar data
+real Herdr workspaces
+real QQ session data
 production Trace containing protected payloads
 ```
 
-Use synthetic fixtures specifically designed to show both allowed and denied paths.
+Use synthetic fixtures.
 
-Public production observation is a different surface. It may expose only the sanitized publication snapshots defined in [`data-observability.md`](./data-observability.md), and only for Trace or Eval.
+## Search and terminology
 
-## Search and navigation
+Important aliases should lead readers to the canonical distinction.
 
-Search should prioritize concepts and terminology, not only exact page titles.
-
-Important aliases should resolve to the canonical concept. For example:
+Examples:
 
 ```text
-chat history -> Conversation
-permission prompt -> Approval
-agent session -> distinguish Conversation / Session / Run
-job / task -> distinguish Task / TaskAttempt / Run / LongTask
-worker status -> Agent Operations and WorkerBinding
-Herdr done -> Task review, not automatic acceptance
-coding preference -> Taste
-accept / reject / edit learning -> FeedbackEvent and Taste
-procedural memory -> Skill when it is a stable reusable procedure
-facts from prior work -> Semantic Memory
-past task outcome -> Episodic Memory
-logs -> Trace
-RAG -> Authorized Retrieval
-model router -> Execution Routing
-Pi config -> Lora PI Kit and Runtime Strategy
-```
+chat history
+  → Conversation
 
-The site should make conceptual distinctions easier to discover, not silently collapse them.
+agent session
+  → distinguish Conversation / Session / Run
+
+job / task
+  → distinguish Task / TaskAttempt / Run / LongTask
+
+worker status
+  → Agent Operations / WorkerBinding
+
+Herdr done
+  → Task review, not acceptance
+
+Pi config
+  → Lora PI Kit / Pi settings / Runtime Strategy
+
+MCP
+  → Lora PI Kit runtime integration + Glassbox authorization
+
+preference memory
+  → Taste
+
+RAG
+  → Authorized Retrieval
+```
 
 ## Site implementation boundary
 
-Do not create an `apps/docs` package until implementation work actually begins.
+Do not create an `apps/docs` package until implementation work begins.
 
-When the site implementation starts, choose a stack that supports:
+When it starts, prefer a mostly static content system with interactive islands where necessary.
 
-```text
-MDX or equivalent content
-React-quality interactive islands or components
-static generation
-code highlighting
-versionable content
-accessible client-side demos
-fast local authoring
-search
-```
+The documentation site is not a second Glassbox control plane.
 
-Prefer a mostly static documentation site. Interactive demos should hydrate only where needed.
+## First useful publishing milestone
 
-The docs site is not the Personal Agent runtime and should not become a second control plane.
-
-## First publishing milestone
-
-The first useful public version does not need every future concept.
-
-A strong initial release after P3 should include:
+After P3 contracts stabilize, a strong initial public set should cover:
 
 ```text
 What is Glassbox?
-Architecture overview
+Pi vs Lora PI Kit vs Glassbox
 Identity vs Authorization
-Owner vs Visitor interactive demo
-Permission vs Approval interactive demo
-Authorize before Context interactive demo
+Owner vs Visitor
+Permission vs Approval
+Authorize before Context
 Conversation vs Session vs Run
 Task vs TaskAttempt vs Run
 Attention Queue
 Herdr state vs Task acceptance
-Review / rework demo
-Trace and AuthorizationDecision
+Review / Rework
+Trace
 Canvas is a Projection
-Runtime strategy
-Agent Operations strategy
 Current status and roadmap
 ```
 
-After P4 is implemented, add the first learning lab for:
-
-```text
-Rules vs Skills vs Taste vs Memory
-FeedbackEvent
-Taste confidence
-Global vs Project scope
-Task-aware Taste retrieval
-Semantic vs Episodic Memory
-Authorized Retrieval
-```
-
-The P3 publishing acceptance test is:
-
-> A new engineer can spend 20 minutes on the site and correctly explain who is acting, what they are allowed to access, what a Conversation is, what a Run is, what a Task and TaskAttempt are, why Herdr `done` does not mean accepted, why Canvas is not execution state, where evidence comes from, and why Pi runtime customization lives in Lora PI Kit instead of the Glassbox domain model.
-
-See `.plans/roadmap.md` for sequencing and `docs/interactive-demos.md` for the demo curriculum.
+After P4, add Taste / Memory interactive lessons.
