@@ -1,0 +1,110 @@
+/**
+ * @file apps/web/src/management/fixtures/overview.ts
+ */
+import type { OverviewProjection } from '../types';
+
+export const mockOverviewData: OverviewProjection = {
+  summary: {
+    activeConversations: 4,
+    pendingAttentionCount: 3,
+    runningTasksCount: 2,
+    todayTotalTokens: 184500,
+    todayCostUsd: null, // Unknown cost! Cannot be $0.00
+    todayCostStatus: 'unpriced',
+  },
+  attentionQueue: [
+    {
+      id: 'attn-01',
+      type: 'task_review',
+      title: 'task-218 · QQ 权限回归测试已完成',
+      description: 'Herdr worker-04 报告 done；Glassbox 任务待 Owner 验收判定。',
+      severity: 'warn',
+      targetSection: 'ops',
+      targetId: 'task-218',
+      createdAt: '14 分钟前',
+    },
+    {
+      id: 'attn-02',
+      type: 'worker_blocked',
+      title: 'task-221 · NapCat 适配器阻塞',
+      description: '等待群配置确认，已阻塞 12 分钟。',
+      severity: 'bad',
+      targetSection: 'ops',
+      targetId: 'task-221',
+      createdAt: '25 分钟前',
+    },
+    {
+      id: 'attn-03',
+      type: 'requires_approval',
+      title: 'task-224 · 破坏性工作区重置',
+      description: '危险操作需要 Owner 显式批准。',
+      severity: 'warn',
+      targetSection: 'permissions',
+      targetId: 'perm-gate-03',
+      createdAt: '1 小时前',
+    },
+  ],
+  currentRun: {
+    id: 'run_A83',
+    conversationId: 'conv_owner_main',
+    principalId: 'owner_primary',
+    status: 'running',
+    modelId: 'claude-3-5-sonnet',
+    durationMs: 42300,
+    taskAttemptId: 'task-218-att-2',
+    toolsExecutedCount: 7,
+    testsPassed: 42,
+    testsTotal: 42,
+    artifacts: [
+      { name: 'diff.patch', uri: 'r2://artifacts/run_A83/diff.patch', type: 'patch', sizeBytes: 14200 },
+      { name: 'eval-report.json', uri: 'r2://artifacts/run_A83/eval.json', type: 'json', sizeBytes: 3100 },
+    ],
+    tokens: {
+      prompt: 14200,
+      completion: 3100,
+      total: 17300,
+    },
+    costUsd: null,
+    costStatus: 'unknown',
+    startedAt: '2026-09-17T15:10:00Z',
+    traceId: 'trace-run_A83',
+    summary: '正在执行 QQ 权限规则回归测试第 2 次尝试',
+  },
+  piModelUsage: [
+    {
+      modelId: 'claude-3-5-sonnet',
+      modelName: 'Claude 3.5 Sonnet (Default)',
+      callsToday: 142,
+      tokensToday: 124000,
+      costUsd: null,
+      costStatus: 'unpriced',
+      p95LatencyMs: 1420,
+    },
+    {
+      modelId: 'gpt-4o',
+      modelName: 'GPT-4o',
+      callsToday: 38,
+      tokensToday: 42500,
+      costUsd: null,
+      costStatus: 'unknown',
+      p95LatencyMs: 980,
+    },
+    {
+      modelId: 'deepseek-chat',
+      modelName: 'DeepSeek Chat (V3)',
+      callsToday: 16,
+      tokensToday: 18000,
+      costUsd: null,
+      costStatus: 'unpriced',
+      p95LatencyMs: 2100,
+    },
+  ],
+  usageTrend: [
+    { timestamp: '10:00', label: '10:00', tokens: 12000, runs: 8 },
+    { timestamp: '11:00', label: '11:00', tokens: 28000, runs: 16 },
+    { timestamp: '12:00', label: '12:00', tokens: 19000, runs: 12 },
+    { timestamp: '13:00', label: '13:00', tokens: 45000, runs: 28 },
+    { timestamp: '14:00', label: '14:00', tokens: 52000, runs: 34 },
+    { timestamp: '15:00', label: '15:00', tokens: 28500, runs: 19 },
+  ],
+};

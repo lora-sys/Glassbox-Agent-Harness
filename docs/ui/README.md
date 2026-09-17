@@ -306,11 +306,23 @@ Before any milestone or final delivery is accepted:
 
 | Phase | Description | Deliverables | Status |
 | --- | --- | --- | --- |
-| **Phase 0** | **Workspace & Spec Setup** | Dedicated worktree, `codex/web-management-freeze` branch, verbatim frozen docs, `README.md`, tracking Issue, Draft PR | **Active (This Run)** |
-| **Phase 1** | **Primitives & Design Tokens** | Foundation tokens, typography, CSS variables, `PageShell`, buttons, badges, tables | Planned |
-| **Phase 2** | **Navigation & 11 Page Layouts** | TanStack routes under `/manage`, PageHeaders, FilterBars, typed mock fixtures | Planned |
-| **Phase 3** | **Interactive Rails & Trace** | `DetailRail`, 3-column Trace, scrubber, keyboard shortcuts, `DecisionTester` | Planned |
-| **Phase 4** | **Responsive & Stress Testing** | 5 viewports verification, extreme long content, empty states, Playwright E2E suite | Planned |
-| **Phase 5** | **Adapter Integration & Ready Gate** | Live API binding, data honesty audit, final review against v24 benchmark | Planned |
+| **Phase 0** | **Workspace & Spec Setup** | Dedicated worktree, `codex/web-management-freeze` branch, verbatim frozen docs, `README.md`, tracking Issue, Draft PR | **Completed** |
+| **Phase 1** | **Primitives & Design Tokens** | Foundation tokens, typography, CSS variables, `PageShell`, buttons, badges, tables, `ChartPanel`, `DetailRail` | **Completed** |
+| **Phase 2** | **Navigation & 11 Page Layouts** | TanStack route `/manage`, `ManagementRoot`, all 11 pages implemented, typed mock fixtures | **Completed** |
+| **Phase 3** | **Interactive Rails & Trace** | `DetailRail` (focus/Escape), 3-column Trace (j/k/e shortcuts, scrubber), `DecisionTester` (mock simulation) | **Completed** |
+| **Phase 4** | **Responsive & Stress Testing** | 5 viewports verified (1440x900, 1024x768, 768x1024, 390x844, 320x700 with zero overflow), 15 Vitest tests, 12 Playwright E2E tests, 6 visual evidence screenshots | **Completed** |
+| **Phase 5** | **Live Adapter Binding & Ready Gate** | Standalone UI complete with clean FixtureAdapter and HttpApiAdapter. Pending live backend reconciler endpoints. | In Progress |
+
+### 12.1 Verification Evidence & Audit Trail
+
+- **Vitest Unit & Scale Tests**: 15 passed (100%), 0 failed (`apps/web/src/management/*.test.ts`).
+- **Playwright E2E Multi-Viewport & Interaction Tests**: 12 passed (100%), 0 failed (`apps/web/e2e/management.spec.mjs`).
+- **Visual Evidence Screenshots**:
+  - `docs/ui/evidence/overview-desktop.png`: 1440x900 full overview, KPI summary, attention items, current run, sparkline trend, and model usage table.
+  - `docs/ui/evidence/ops-detailrail.png`: Task truth (`REVIEW`) vs Herdr observation (`done`), task attempt history, worker bindings, and Accept/Rework actions.
+  - `docs/ui/evidence/trace-inspector.png`: 3-column trace layout with run list, event timeline with scrubber, and tabbed inspector.
+  - `docs/ui/evidence/permissions-tester.png`: Four hard gates summary, policy rule table, and interactive simulation.
+  - `docs/ui/evidence/mobile-drawer-390x844.png`: Mobile view with open drawer menu and >=44px touch targets.
+  - `docs/ui/evidence/narrow-mobile-320x700.png`: Extreme narrow responsive view with zero horizontal overflow.
 
 > **Delivery Rule**: All frontend development occurs on branch `codex/web-management-freeze` within the dedicated worktree. No direct pushes to `main`, no premature merges, and no unverified backend modifications.

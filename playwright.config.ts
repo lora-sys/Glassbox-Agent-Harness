@@ -9,19 +9,19 @@ export default defineConfig({
   reporter: "list",
   // The Glassbox server runs on 3030, the web dev server on 5173
   use: {
-    baseURL: "http://localhost:5173",
+    baseURL: "http://127.0.0.1:4173",
     trace: "on-first-retry",
   },
   projects: [
     {
       name: "chromium",
-      use: { ...devices["Desktop Chrome"] },
+      use: { ...devices["Desktop Chrome"], channel: "chrome" },
     },
   ],
-  // Expect the servers to already be running (server on 3030, web on 5173)
+  // Start web dev server on port 4173
   webServer: {
-    command: "echo 'assuming servers already running on 3030 and 5173'",
-    port: 5173,
+    command: "npm run dev --workspace @glassbox/web -- --host 127.0.0.1 --port 4173",
+    port: 4173,
     reuseExistingServer: true,
   },
 });
