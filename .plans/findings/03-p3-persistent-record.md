@@ -10,7 +10,7 @@
 | 对象 | 标识 / URL | 备注 |
 | --- | --- | --- |
 | **专属 GitHub Issue** | https://github.com/lora-sys/Glassbox-Agent-Harness/issues/1 | 唯一 P3 跟踪 Issue，覆盖 P3.0 至 P3.8 验收清单 |
-| **长期 Draft PR** | (待推送分支后填入) | 唯一长线 Draft PR，P3.0 至 P3.8 同线完成，不按阶段拆 PR |
+| **长期 Draft PR** | https://github.com/lora-sys/Glassbox-Agent-Harness/pull/4 | 唯一长线 Draft PR，P3.0 至 P3.8 同线完成，不按阶段拆 PR |
 | **开发分支** | `codex/p3-personal-agent-foundation` | 基于 local main HEAD 创建，禁止合入或直接推送 main |
 | **专属 Worktree** | `C:\Users\yanBingZhao\repos\Glassbox-Agent-Harness-p3` | 所有 P3 开发仅在此隔离工作区进行 |
 | **基线提交 (HEAD)** | `161c491` | 当前本地 main HEAD |
