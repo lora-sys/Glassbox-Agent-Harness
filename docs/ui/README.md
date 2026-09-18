@@ -310,19 +310,75 @@ Before any milestone or final delivery is accepted:
 | **Phase 1** | **Primitives & Design Tokens** | Foundation tokens, typography, CSS variables, `PageShell`, buttons, badges, tables, `ChartPanel`, `DetailRail` | **Completed** |
 | **Phase 2** | **Navigation & 11 Page Layouts** | TanStack route `/manage`, `ManagementRoot`, all 11 pages implemented, typed mock fixtures | **Completed** |
 | **Phase 3** | **Interactive Rails & Trace** | `DetailRail` (focus/Escape), 3-column Trace (j/k/e shortcuts, scrubber), `DecisionTester` (mock simulation) | **Completed** |
-| **Phase 4** | **Responsive & Stress Testing** | 5 viewports verified (1440x900, 1024x768, 768x1024, 390x844, 320x700 with zero overflow), 15 Vitest tests, 12 Playwright E2E tests, 6 visual evidence screenshots | **Completed** |
-| **Phase 5** | **Live Adapter Binding & Ready Gate** | Standalone UI complete with clean FixtureAdapter and HttpApiAdapter. Pending live backend reconciler endpoints. | In Progress |
+| **Phase 4** | **Responsive & Stress Testing** | 5 viewports verified (1440x900, 1024x768, 768x1024, 390x844, 320x700 with zero overflow), 35 Vitest tests, Playwright E2E tests, visual evidence screenshots | **Completed** |
+| **Phase 5** | **Correction Slice & Live Adapter Protocol** | Contracts provenance synchronization, real `/manage/*` protocol with Bearer token & WS ticket, fail-closed auth gating, runtime validators, truthful data states, honest simulation labels | **Completed** |
 
-### 12.1 Verification Evidence & Audit Trail
+### 12.1 Contracts Provenance & Domain Alignment
 
-- **Vitest Unit & Scale Tests**: 15 passed (100%), 0 failed (`apps/web/src/management/*.test.ts`).
-- **Playwright E2E Multi-Viewport & Interaction Tests**: 12 passed (100%), 0 failed (`apps/web/e2e/management.spec.mjs`).
-- **Visual Evidence Screenshots**:
-  - `docs/ui/evidence/overview-desktop.png`: 1440x900 full overview, KPI summary, attention items, current run, sparkline trend, and model usage table.
-  - `docs/ui/evidence/ops-detailrail.png`: Task truth (`REVIEW`) vs Herdr observation (`done`), task attempt history, worker bindings, and Accept/Rework actions.
-  - `docs/ui/evidence/trace-inspector.png`: 3-column trace layout with run list, event timeline with scrubber, and tabbed inspector.
-  - `docs/ui/evidence/permissions-tester.png`: Four hard gates summary, policy rule table, and interactive simulation.
-  - `docs/ui/evidence/mobile-drawer-390x844.png`: Mobile view with open drawer menu and >=44px touch targets.
-  - `docs/ui/evidence/narrow-mobile-320x700.png`: Extreme narrow responsive view with zero horizontal overflow.
+- **Provenance**: Synchronized canonical domain contracts from original checkout (`C:/Users/yanBingZhao/repos/Glassbox-Agent-Harness`) at commit `d6012f14b4792f710ad471026366c54a5b3af25d`.
+  - Added files: `packages/contracts/src/channels.ts`, `packages/contracts/src/evals.ts`, `packages/contracts/src/executors.ts`, `packages/contracts/src/management.ts`, with canonical exports in `packages/contracts/src/index.ts`.
+- **Domain Projection Boundary**:
+  - Imported canonical contract types: `ManagementStatus`, `ManagementDoctor`, `PublicModelProfile`, `PublicChannelProfile`, `PublicExecutor`, `WsTicketResponse`.
+  - Mapped canonical types via `mapModelProfileToDesignProjection` and `mapChannelProfileToDesignProjection`.
+  - Renamed absent-domain UI fixtures to explicit `*DesignProjection` types (`TaskDesignProjection`, `ConversationDesignProjection`, `WorkerBindingDesignProjection`, `OverviewDesignProjection`, `PermissionRuleDesignProjection`, etc.) with comprehensive mapping gap documentation in `apps/web/src/management/types/index.ts` to prevent competing domain contracts.
+
+### 12.2 Live `/manage/*` Protocol & Fail-Closed Adapter
+
+- **Real Endpoints**: Removed invented `/api/management` endpoints. The `HttpApiAdapter` connects directly to real server endpoints:
+  - `GET /manage/status`
+  - `GET /manage/doctor`
+  - `GET /manage/models`
+  - `GET /manage/channels`
+  - `GET /manage/executors`
+  - `POST /manage/ws-ticket` (returns `{ ticket: string }` for `/ws?sessionId=<id>&ticket=<ticket>`)
+- **Bearer Token Authentication**:
+  - Bearer token format enforced: 43-character base64url string (`/^[A-Za-z0-9_-]{43}$/u`).
+  - Strict rejection of URL query parameter authentication (`?key=...` or `?token=...`) to prevent credential leakage in browser history, logs, or referrers.
+  - Live mode strictly fails closed if token is missing, malformed, or rejected (401/403) by `/manage/status`.
+  - Design Preview mode is accessible as deterministic public design data.
+- **Fail-Closed Strategy**:
+  - Live mode never silently falls back to mock fixtures. Absent endpoints (`/manage/tasks`, `/manage/conversations`, etc.) reject with explicit errors, triggering honest error states in the UI.
+- **Runtime Payload Validation**:
+  - Added defensive runtime validators in `apps/web/src/management/adapter/validators.ts` for all JSON payloads received from `/manage/*`.
+- **Mode Persistence Across Navigation**:
+  - Data-source mode (`design` vs `live`) is synchronized via TanStack Router search parameters (`?mode=design` or `?mode=live`) and TanStack Query keys, surviving page transitions, back/forward navigation, and page reloads without raw `history.pushState` mutations.
+
+### 12.3 Honest Data States & Explicit Action Wording
+
+- **Unpriced Model Costs**: Unknown or unpriced model profiles render honestly as `未知 (未定价)` or `成本不可用`, never as `$0.00`.
+- **Worker Bindings**: Tasks or attempts without an assigned worker binding render an explicit empty state (`未绑定 Worker`) rather than fabricating fake panes or sessions.
+- **Explicit Simulation Labels**:
+  - Task Accept / Rework / Cancel: labeled with `[设计模拟]` and explicit notification of offline prototype behavior.
+  - Decision Tester: labeled with `[设计模拟]` and simulation provenance.
+  - Model settings and Settings save: labeled with `[设计模拟]` or `[本地设计草稿]`.
+- **Connection & Persistence States**:
+  - WebSocket monitors render `CONNECTED`, `STALE`, or `DISCONNECTED` based on real or simulated telemetry.
+  - Database status explicitly distinguishes `TURSO ONLINE` from unreachable or disabled storage.
+
+### 12.4 Vite+ Evaluation & Migration Blocker
+
+- **Evaluation Result**: Vite+ (`vp check`) was tested for toolchain consolidation.
+- **Blocker**: Running `vp check` reports `This project does not use vite-plus` and immediately flags 146 unrelated files repository-wide (including `AGENTS.md`, `.plans/*`, `upstream/*`, and server sources) with formatting failures. Running `vp check --fix` would perform an unauthorized repo-wide formatting refactor violating Rule 1 (minimal diff) and modifying files outside this worktree's scope.
+- **Resolution**: Kept existing working toolchain commands (`npm run build --workspace @glassbox/web`, `npx vitest`, `npx tsc`). Documented the exact blocker here and removed any claim that Vite+ is already active.
+
+### 12.5 Verification Evidence
+
+- **Contracts TypeScript Compilation**:
+  - Command: `npx tsc --project packages/contracts/tsconfig.json --noEmit`
+  - Result: 0 errors (Exit code 0).
+- **Web App TypeScript Compilation**:
+  - Command: `npx tsc --project apps/web/tsconfig.json --noEmit`
+  - Result: 0 errors (Exit code 0).
+- **Web App Production Build**:
+  - Command: `npm run build --workspace @glassbox/web`
+  - Result: 1027 modules transformed, production assets emitted into `dist/` in 6.99s (Exit code 0).
+- **Vitest Unit & Invariant Test Suite**:
+  - Command: `npx vitest run apps/web/src/management`
+  - Result: 4 test files passed, 35 tests passed (100%), 0 failed in 773ms:
+    - `verification.test.ts` (20/20): Contract provenance, validators, fail-closed auth, URL param rejection, token format, route sync, honest unpriced costs, missing worker bindings, and collaboration invariants.
+    - `adapter.test.ts` (5/5): Fixture vs API adapter segregation, fail-closed behavior, simulation metadata.
+    - `trace.test.ts` (6/6): Timeline ordering, event parsing, large trace handling.
+    - `stress.test.ts` (4/4): 500+ event windowing, memory safety, responsive viewport layout stability.
 
 > **Delivery Rule**: All frontend development occurs on branch `codex/web-management-freeze` within the dedicated worktree. No direct pushes to `main`, no premature merges, and no unverified backend modifications.
+

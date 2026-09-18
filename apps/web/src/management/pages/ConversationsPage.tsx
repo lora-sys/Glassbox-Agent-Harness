@@ -17,7 +17,7 @@ interface ConversationsPageProps {
 }
 
 export const ConversationsPage: React.FC<ConversationsPageProps> = ({ onNavigate }) => {
-  const { data: res, isLoading } = useManagementConversations();
+  const { data: res, isLoading, isError, error } = useManagementConversations();
   const conversations = res?.data || [];
   const [selectedId, setSelectedId] = useState<string | null>(conversations[0]?.id || 'conv_owner_main');
   const [search, setSearch] = useState('');
@@ -30,6 +30,31 @@ export const ConversationsPage: React.FC<ConversationsPageProps> = ({ onNavigate
     const matchesChannel = channelFilter === 'all' || c.channel === channelFilter;
     return matchesSearch && matchesChannel;
   });
+
+  if (isLoading) {
+    return (
+      <div className="pageContainer">
+        <div style={{ padding: 40, textAlign: 'center', color: 'var(--metadata)' }}>
+          加载会话数据中...
+        </div>
+      </div>
+    );
+  }
+
+  if (isError) {
+    return (
+      <div className="pageContainer">
+        <PageHeader
+          title="会话"
+          description="持久化会话清单。在此审查主体身份、渠道绑定、关联的 Run/Task 执行谱系及清洗后的会话投影。"
+          capabilityState="已实现"
+        />
+        <div style={{ padding: 40, textAlign: 'center', color: 'var(--danger)' }} role="alert">
+          <strong>会话数据加载失败</strong>: {error instanceof Error ? error.message : '无法获取会话列表'}
+        </div>
+      </div>
+    );
+  }
 
   const columns: Column<ConversationProjection>[] = [
     {
@@ -155,7 +180,13 @@ export const ConversationsPage: React.FC<ConversationsPageProps> = ({ onNavigate
                   <PairRow label="Token 消耗" value={selectedConv.totalTokens.toLocaleString()} mono />
                   <PairRow
                     label="费用预估"
-                    value={selectedConv.costStatus === 'unpriced' ? '成本不可用' : '—'}
+                    value={
+                      selectedConv.costStatus === 'priced' && selectedConv.costUsd !== null
+                        ? `$${selectedConv.costUsd.toFixed(2)}`
+                        : selectedConv.costStatus === 'unpriced'
+                        ? '成本不可用'
+                        : '未知'
+                    }
                   />
                   <PairRow label="最后活跃时间" value={selectedConv.lastActivityAt} />
                 </DetailSection>

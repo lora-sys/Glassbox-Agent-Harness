@@ -49,7 +49,7 @@ export const OpsPage: React.FC<OpsPageProps> = ({ onNavigate }) => {
         t.id === taskId ? { ...t, state: 'DONE' as TaskState, requiresReview: false, attentionReason: undefined } : t
       )
     );
-    setFeedbackNotice(`已授权接受任务 [${taskId}] 的阶段产物，任务状态流转为 DONE。`);
+    setFeedbackNotice(`[设计模拟] 本地模拟接受任务 [${taskId}] 阶段产物，未连接服务端授权与持久化。`);
   };
 
   // Explicit named actions: Rework Task
@@ -69,7 +69,7 @@ export const OpsPage: React.FC<OpsPageProps> = ({ onNavigate }) => {
         return t;
       })
     );
-    setFeedbackNotice(`已下发返工指令：保留 [${taskId}] 既往历史，创建第 3 次尝试。`);
+    setFeedbackNotice(`[设计模拟] 本地模拟发起返工指令（保留 [${taskId}] 既往历史，本地尝试增加），未连接服务端持久化或 Worker 调度。`);
   };
 
   const columns: Column<TaskProjection>[] = [
@@ -216,7 +216,7 @@ export const OpsPage: React.FC<OpsPageProps> = ({ onNavigate }) => {
                       setTasks((prev) =>
                         prev.map((t) => (t.id === selectedTask.id ? { ...t, state: 'CANCELED' } : t))
                       );
-                      setFeedbackNotice(`已取消任务 [${selectedTask.id}]。`);
+                      setFeedbackNotice(`[设计模拟] 本地模拟取消任务 [${selectedTask.id}]，未向服务端下发真实取消指令。`);
                     }}
                   >
                     取消任务
@@ -279,16 +279,22 @@ export const OpsPage: React.FC<OpsPageProps> = ({ onNavigate }) => {
                   )}
                 </DetailSection>
 
-                {/* Worker Binding */}
-                {selectedTask.attempts[0]?.workerBinding && (
-                  <DetailSection title="Herdr 物理工作区绑定">
-                    <PairRow label="会话" value={selectedTask.attempts[0].workerBinding.herdrSession} />
-                    <PairRow label="工作区" value={selectedTask.attempts[0].workerBinding.workspaceName} />
-                    <PairRow label="终端窗格" value={selectedTask.attempts[0].workerBinding.paneName} mono />
-                    <PairRow label="执行分支" value={selectedTask.attempts[0].workerBinding.branch} mono />
-                    <PairRow label="Worker 属性" value={selectedTask.attempts[0].workerBinding.workerType} />
-                  </DetailSection>
-                )}
+                {/* Worker Binding — Honest missing state if absent */}
+                <DetailSection title="Herdr 物理工作区绑定">
+                  {selectedTask.attempts[0]?.workerBinding ? (
+                    <>
+                      <PairRow label="会话" value={selectedTask.attempts[0].workerBinding.herdrSession} />
+                      <PairRow label="工作区" value={selectedTask.attempts[0].workerBinding.workspaceName} />
+                      <PairRow label="终端窗格" value={selectedTask.attempts[0].workerBinding.paneName} mono />
+                      <PairRow label="执行分支" value={selectedTask.attempts[0].workerBinding.branch} mono />
+                      <PairRow label="Worker 属性" value={selectedTask.attempts[0].workerBinding.workerType} />
+                    </>
+                  ) : (
+                    <span style={{ fontSize: 12, color: 'var(--metadata)' }}>
+                      未绑定物理 Worker (无 WorkerBinding 记录)
+                    </span>
+                  )}
+                </DetailSection>
               </>
             )}
           </DetailRail>

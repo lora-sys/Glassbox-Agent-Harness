@@ -199,10 +199,10 @@ export const PermissionsPage: React.FC<PermissionsPageProps> = () => {
             </DetailSection>
 
             {simResult && (
-              <DetailSection title="模拟裁决结论">
+              <DetailSection title="模拟裁决结论 (客户端离线模拟)">
                 <div style={{ padding: 10, background: 'var(--sidebar)', borderRadius: 'var(--radius-sm)', border: '1px solid var(--line)' }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
-                    <span style={{ fontSize: 11, color: 'var(--metadata)' }}>判定结果</span>
+                    <span style={{ fontSize: 11, color: 'var(--metadata)' }}>判定结果 (模拟推演)</span>
                     <StatusBadge
                       variant={
                         simResult.decision === 'ALLOW'
@@ -220,8 +220,11 @@ export const PermissionsPage: React.FC<PermissionsPageProps> = () => {
                       匹配门禁: <strong>{simResult.matchedRuleId}</strong>
                     </div>
                   )}
-                  <div style={{ fontSize: 11, color: 'var(--body)', lineHeight: 1.4 }}>
+                  <div style={{ fontSize: 11, color: 'var(--body)', lineHeight: 1.4, marginBottom: 8 }}>
                     {simResult.provenance}
+                  </div>
+                  <div style={{ fontSize: 10, color: 'var(--metadata)', borderTop: '1px dashed var(--line)', paddingTop: 6 }}>
+                    [设计模拟] 本结果仅基于前端内置策略矩阵离线推演，不代表服务端实时授权决策，未向服务端持久化任何授权判定记录。
                   </div>
                 </div>
               </DetailSection>

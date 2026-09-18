@@ -3,13 +3,21 @@
  *
  * Root Management Container:
  * - Mounts TanStack QueryClientProvider
- * - Enforces ManagementAuth access guard (Owner-only)
- * - Manages PageShell with synchronized URL navigation, browser back/forward, and deep links
- * - Renders all 11 frozen pages
+ * - Manages data-source mode ('design' | 'live') via TanStack Router search params
+ * - Preserves mode across navigation, browser back/forward, and reload
+ * - Enforces ManagementAuth access guard (fail-closed in live mode)
+ * - Renders all 11 frozen pages with PageShell
  */
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useCallback } from 'react';
+import { useNavigate, useSearch } from '@tanstack/react-router';
 import { QueryClientProvider } from '@tanstack/react-query';
 import { managementQueryClient } from './adapter/queryClient';
+import {
+  ManagementDataProvider,
+  getManagementToken,
+  setManagementToken,
+  type ManagementMode,
+} from './adapter';
 import { ManagementAuth } from './access/ManagementAuth';
 import { PageShell } from './primitives/PageShell';
 
@@ -27,7 +35,7 @@ import { SettingsPage } from './pages/SettingsPage';
 
 import './styles/management.css';
 
-const VALID_PAGES = [
+export const VALID_PAGES = [
   'overview',
   'conversations',
   'ops',
@@ -43,47 +51,89 @@ const VALID_PAGES = [
 
 export type ManagementPageId = (typeof VALID_PAGES)[number];
 
-function getInitialPage(): ManagementPageId {
-  if (typeof window === 'undefined') return 'overview';
-
-  // Support path-based (/manage/ops) or search-based (/manage?page=ops)
-  const path = window.location.pathname.replace(/^\/manage\/?/, '').split('/')[0];
-  if (VALID_PAGES.includes(path as ManagementPageId)) {
-    return path as ManagementPageId;
-  }
-
-  const params = new URLSearchParams(window.location.search);
-  const pageParam = params.get('page');
-  if (pageParam && VALID_PAGES.includes(pageParam as ManagementPageId)) {
-    return pageParam as ManagementPageId;
-  }
-
-  return 'overview';
-}
-
 export const ManagementRoot: React.FC = () => {
-  const [currentPage, setCurrentPage] = useState<ManagementPageId>(getInitialPage());
+  const search = useSearch({ strict: false }) as {
+    page?: ManagementPageId;
+    mode?: ManagementMode;
+    runId?: string;
+  };
+  const navigate = useNavigate();
 
-  // Handle browser back/forward navigation
-  useEffect(() => {
-    const handlePopState = () => {
-      setCurrentPage(getInitialPage());
-    };
-    window.addEventListener('popstate', handlePopState);
-    return () => window.removeEventListener('popstate', handlePopState);
-  }, []);
+  const currentPage: ManagementPageId =
+    search?.page && VALID_PAGES.includes(search.page) ? search.page : 'overview';
+  const mode: ManagementMode = search?.mode === 'live' ? 'live' : 'design';
 
-  const navigateToPage = useCallback((pageId: string) => {
-    if (!VALID_PAGES.includes(pageId as ManagementPageId)) return;
+  const [token, setTokenState] = useState<string | null>(() => getManagementToken());
 
-    setCurrentPage(pageId as ManagementPageId);
+  // TanStack Router navigation preserving search params
+  const navigateToPage = useCallback(
+    (pageId: string) => {
+      if (!VALID_PAGES.includes(pageId as ManagementPageId)) return;
+      navigate({
+        to: '/manage',
+        search: (prev: any) => ({
+          ...prev,
+          page: pageId,
+        }),
+      });
+    },
+    [navigate],
+  );
 
-    // Update URL history for deep-linking and browser back/forward
-    const newPath = `/manage?page=${pageId}`;
-    if (window.location.pathname + window.location.search !== newPath) {
-      window.history.pushState({ page: pageId }, '', newPath);
-    }
-  }, []);
+  const setMode = useCallback(
+    (newMode: ManagementMode) => {
+      navigate({
+        to: '/manage',
+        search: (prev: any) => ({
+          ...prev,
+          mode: newMode,
+        }),
+      });
+    },
+    [navigate],
+  );
+
+  // Authenticate management token with /manage/status
+  const handleTokenSubmit = useCallback(
+    async (newToken: string, persist: boolean) => {
+      try {
+        const res = await fetch('/manage/status', {
+          method: 'GET',
+          headers: {
+            Authorization: `Bearer ${newToken.trim()}`,
+            Accept: 'application/json',
+          },
+        });
+        if (res.status === 401) {
+          return { success: false, status: 401, error: '所有者 Token 鉴权失败 (401 Unauthorized)' };
+        }
+        if (res.status === 403) {
+          return {
+            success: false,
+            status: 403,
+            error: '接口仅允许来自 127.0.0.1 或白名单 Origin 访问 (403 Forbidden)',
+          };
+        }
+        if (!res.ok) {
+          return { success: false, status: res.status, error: `服务端返回错误: ${res.status} ${res.statusText}` };
+        }
+        const json = await res.json();
+        if (json?.status !== 'ready' || json?.service !== 'glassbox') {
+          return { success: false, status: 502, error: '服务端状态异常，非合规 Glassbox 实例' };
+        }
+        setTokenState(newToken.trim());
+        setManagementToken(newToken.trim(), persist);
+        return { success: true };
+      } catch (err) {
+        return {
+          success: false,
+          status: 500,
+          error: err instanceof Error ? err.message : '网络连接超时或无法连接服务端',
+        };
+      }
+    },
+    [],
+  );
 
   const renderCurrentPage = () => {
     switch (currentPage) {
@@ -116,11 +166,31 @@ export const ManagementRoot: React.FC = () => {
 
   return (
     <QueryClientProvider client={managementQueryClient}>
-      <ManagementAuth>
-        <PageShell currentPageId={currentPage} onNavigate={navigateToPage}>
-          {renderCurrentPage()}
-        </PageShell>
-      </ManagementAuth>
+      <ManagementDataProvider
+        mode={mode}
+        setMode={setMode}
+        token={token}
+        setToken={(t) => {
+          setTokenState(t);
+          setManagementToken(t, false);
+        }}
+      >
+        <ManagementAuth
+          mode={mode}
+          token={token}
+          onTokenSubmit={handleTokenSubmit}
+          onSwitchToDesign={() => setMode('design')}
+        >
+          <PageShell
+            currentPageId={currentPage}
+            onNavigate={navigateToPage}
+            mode={mode}
+            onModeChange={setMode}
+          >
+            {renderCurrentPage()}
+          </PageShell>
+        </ManagementAuth>
+      </ManagementDataProvider>
     </QueryClientProvider>
   );
 };

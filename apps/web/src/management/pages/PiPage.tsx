@@ -22,7 +22,7 @@ interface PiPageProps {
 }
 
 export const PiPage: React.FC<PiPageProps> = () => {
-  const { data: res } = useManagementPiModels();
+  const { data: res, isLoading, isError, error } = useManagementPiModels();
   const [models, setModels] = useState<PiModelProjection[]>(res?.data || []);
   const [feedback, setFeedback] = useState<string | null>(null);
 
@@ -32,6 +32,31 @@ export const PiPage: React.FC<PiPageProps> = () => {
 
   const defaultModel = models.find((m) => m.isDefault) || models[0];
 
+  if (isLoading) {
+    return (
+      <div className="pageContainer">
+        <div style={{ padding: 40, textAlign: 'center', color: 'var(--metadata)' }}>
+          加载 PI 模型数据中...
+        </div>
+      </div>
+    );
+  }
+
+  if (isError) {
+    return (
+      <div className="pageContainer">
+        <PageHeader
+          title="PI 执行核心"
+          description="PI 是 Personal Agent 的执行大脑。管理 PI 支持的模型清单、默认执行核心、采样参数及可用会话池。"
+          capabilityState="已实现"
+        />
+        <div style={{ padding: 40, textAlign: 'center', color: 'var(--danger)' }} role="alert">
+          <strong>模型数据加载失败</strong>: {error instanceof Error ? error.message : '无法获取模型列表'}
+        </div>
+      </div>
+    );
+  }
+
   const handleSetDefault = (modelId: string) => {
     setModels((prev) =>
       prev.map((m) => ({
@@ -39,7 +64,7 @@ export const PiPage: React.FC<PiPageProps> = () => {
         isDefault: m.id === modelId,
       }))
     );
-    setFeedback(`已将 [${modelId}] 设为默认 PI 执行核心。`);
+    setFeedback(`[设计模拟] 本地模拟将 [${modelId}] 设为默认 PI 执行核心（本地设计草稿，未持久化至服务端配置）。`);
   };
 
   const columns: Column<PiModelProjection>[] = [

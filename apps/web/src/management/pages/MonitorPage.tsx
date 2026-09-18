@@ -18,11 +18,32 @@ interface MonitorPageProps {
 }
 
 export const MonitorPage: React.FC<MonitorPageProps> = () => {
-  const { data: res } = useManagementMonitor();
+  const { data: res, isLoading, isError, error } = useManagementMonitor();
   const monitor = res?.data?.[0];
 
-  if (!monitor) {
-    return <div className="pageContainer">加载系统遥测数据中...</div>;
+  if (isLoading) {
+    return (
+      <div className="pageContainer">
+        <div style={{ padding: 40, textAlign: 'center', color: 'var(--metadata)' }}>
+          加载系统遥测数据中...
+        </div>
+      </div>
+    );
+  }
+
+  if (isError || !monitor) {
+    return (
+      <div className="pageContainer">
+        <PageHeader
+          title="系统监控 (Monitor & Telemetry)"
+          description="只回答核心问题：系统是否健康、外部观测是否新鲜、协作通道是否畅通、持久化存储是否在线。"
+          capabilityState="已实现"
+        />
+        <div style={{ padding: 40, textAlign: 'center', color: 'var(--danger)' }} role="alert">
+          <strong>遥测数据加载失败</strong>: {error instanceof Error ? error.message : '无法获取系统遥测数据'}
+        </div>
+      </div>
+    );
   }
 
   const chartSeries: ChartSeries[] = [
@@ -42,13 +63,43 @@ export const MonitorPage: React.FC<MonitorPageProps> = () => {
     },
   ];
 
+  const herdrVariant: 'ok' | 'warn' | 'bad' =
+    monitor.herdrBridge.status === 'connected'
+      ? 'ok'
+      : monitor.herdrBridge.status === 'stale'
+      ? 'warn'
+      : 'bad';
+
+  const herdrLabel =
+    monitor.herdrBridge.status === 'connected'
+      ? 'CONNECTED'
+      : monitor.herdrBridge.status === 'stale'
+      ? 'STALE'
+      : 'DISCONNECTED';
+
+  const systemVariant: 'ok' | 'warn' | 'bad' =
+    monitor.systemHealth === 'healthy'
+      ? 'ok'
+      : monitor.systemHealth === 'degraded'
+      ? 'warn'
+      : 'bad';
+
+  const systemLabel =
+    monitor.systemHealth === 'healthy'
+      ? 'HEALTHY'
+      : monitor.systemHealth === 'degraded'
+      ? 'DEGRADED'
+      : 'CRITICAL';
+
+  const tursoOnline = monitor.persistence.tursoStatus === 'healthy';
+
   return (
     <div className="pageContainer">
       <PageHeader
         title="系统监控 (Monitor & Telemetry)"
         description="只回答核心问题：系统是否健康、外部观测是否新鲜、协作通道是否畅通、持久化存储是否在线。"
         capabilityState="已实现"
-        customPill={{ text: 'P3 + Agent Ops', variant: 'ok' }}
+        customPill={{ text: res?.source === 'fixture' ? '设计数据' : '实时接口', variant: 'ok' }}
       />
 
       {/* Subsystem Health Summary */}
@@ -56,8 +107,8 @@ export const MonitorPage: React.FC<MonitorPageProps> = () => {
         items={[
           {
             label: '系统脉搏',
-            value: <StatusBadge variant={monitor.systemHealth === 'healthy' ? 'ok' : 'bad'}>HEALTHY</StatusBadge>,
-            meta: '核心控制面在线',
+            value: <StatusBadge variant={systemVariant}>{systemLabel}</StatusBadge>,
+            meta: monitor.systemHealth === 'healthy' ? '核心控制面在线' : '控制面状态异常',
           },
           {
             label: 'PI 推理引擎',
@@ -67,13 +118,13 @@ export const MonitorPage: React.FC<MonitorPageProps> = () => {
           },
           {
             label: 'HerdrBridge 连接',
-            value: <StatusBadge variant={monitor.herdrBridge.status === 'connected' ? 'ok' : 'bad'}>CONNECTED</StatusBadge>,
+            value: <StatusBadge variant={herdrVariant}>{herdrLabel}</StatusBadge>,
             meta: `${monitor.herdrBridge.activeWorkspaces} 工作区 · ${monitor.herdrBridge.activePanes} 窗格`,
           },
           {
             label: '持久化存储',
-            value: <StatusBadge variant="ok">TURSO + R2</StatusBadge>,
-            meta: '数据库读写正常',
+            value: <StatusBadge variant={tursoOnline ? 'ok' : 'bad'}>{tursoOnline ? 'TURSO ONLINE' : 'TURSO UNREACHABLE'}</StatusBadge>,
+            meta: tursoOnline ? '数据库读写正常' : '数据库连接异常',
           },
         ]}
       />

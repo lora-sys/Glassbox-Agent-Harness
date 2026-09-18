@@ -18,7 +18,7 @@ interface RunsPageProps {
 }
 
 export const RunsPage: React.FC<RunsPageProps> = ({ onNavigate }) => {
-  const { data: res } = useManagementRuns();
+  const { data: res, isLoading, isError, error } = useManagementRuns();
   const runs = res?.data || [];
   const [selectedId, setSelectedId] = useState<string | null>('run_A83');
   const [search, setSearch] = useState('');
@@ -31,6 +31,31 @@ export const RunsPage: React.FC<RunsPageProps> = ({ onNavigate }) => {
     const matchesStatus = statusFilter === 'all' || r.status === statusFilter;
     return matchesSearch && matchesStatus;
   });
+
+  if (isLoading) {
+    return (
+      <div className="pageContainer">
+        <div style={{ padding: 40, textAlign: 'center', color: 'var(--metadata)' }}>
+          加载运行记录数据中...
+        </div>
+      </div>
+    );
+  }
+
+  if (isError) {
+    return (
+      <div className="pageContainer">
+        <PageHeader
+          title="运行记录 (Runs)"
+          description="检索具体 Agent 运行实例。审查执行耗时、工具调用、产生交付物及关联任务绑定。"
+          capabilityState="已实现"
+        />
+        <div style={{ padding: 40, textAlign: 'center', color: 'var(--danger)' }} role="alert">
+          <strong>运行数据加载失败</strong>: {error instanceof Error ? error.message : '无法获取运行记录'}
+        </div>
+      </div>
+    );
+  }
 
   const columns: Column<RunProjection>[] = [
     {

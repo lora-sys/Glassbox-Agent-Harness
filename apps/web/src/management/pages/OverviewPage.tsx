@@ -17,14 +17,29 @@ interface OverviewPageProps {
 }
 
 export const OverviewPage: React.FC<OverviewPageProps> = ({ onNavigate }) => {
-  const { data: res, isLoading } = useManagementOverview();
+  const { data: res, isLoading, isError, error } = useManagementOverview();
   const overview = res?.data;
 
-  if (isLoading || !overview) {
+  if (isLoading) {
     return (
       <div className="pageContainer">
         <div style={{ padding: 40, textAlign: 'center', color: 'var(--metadata)' }}>
           加载概览数据中...
+        </div>
+      </div>
+    );
+  }
+
+  if (isError || !overview) {
+    return (
+      <div className="pageContainer">
+        <PageHeader
+          title="概览"
+          description="直截了当呈现当前 Agent 的关键状态与重要待办。工作台与 PI 引擎保留最关键事实，避免臃肿。"
+          capabilityState="P3 目标"
+        />
+        <div style={{ padding: 40, textAlign: 'center', color: 'var(--danger)' }} role="alert">
+          <strong>概览数据加载失败</strong>: {error instanceof Error ? error.message : '无法获取概览数据'}
         </div>
       </div>
     );
@@ -123,8 +138,16 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({ onNavigate }) => {
           },
           {
             label: '今日 Token',
-            value: `${(overview.summary.todayTotalTokens / 1000).toFixed(1)}k`,
-            meta: '成本不可用 (未配置计价模型)',
+            value:
+              overview.summary.todayTotalTokens > 0
+                ? `${(overview.summary.todayTotalTokens / 1000).toFixed(1)}k`
+                : '0',
+            meta:
+              overview.summary.todayCostStatus === 'priced' && overview.summary.todayCostUsd !== null
+                ? `$${overview.summary.todayCostUsd.toFixed(2)}`
+                : overview.summary.todayCostStatus === 'unpriced'
+                ? '成本不可用 (未配置计价模型)'
+                : '成本未知',
             mono: true,
           },
         ]}

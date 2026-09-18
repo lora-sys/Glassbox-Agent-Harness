@@ -21,11 +21,36 @@ interface ChannelsPageProps {
 }
 
 export const ChannelsPage: React.FC<ChannelsPageProps> = () => {
-  const { data: res } = useManagementChannels();
+  const { data: res, isLoading, isError, error } = useManagementChannels();
   const channels = res?.data || [];
   const [selectedId, setSelectedId] = useState<string | null>('chan_onebot_qq');
 
   const selectedChannel = channels.find((c) => c.id === selectedId);
+
+  if (isLoading) {
+    return (
+      <div className="pageContainer">
+        <div style={{ padding: 40, textAlign: 'center', color: 'var(--metadata)' }}>
+          加载渠道数据中...
+        </div>
+      </div>
+    );
+  }
+
+  if (isError) {
+    return (
+      <div className="pageContainer">
+        <PageHeader
+          title="渠道与集成 (Channels & Integrations)"
+          description="渠道是同一 Personal Agent 的外部触点。审查 NapCat/OneBot 11 QQ 渠道入站策略与投递门禁审计。"
+          capabilityState="已实现"
+        />
+        <div style={{ padding: 40, textAlign: 'center', color: 'var(--danger)' }} role="alert">
+          <strong>渠道数据加载失败</strong>: {error instanceof Error ? error.message : '无法获取渠道列表'}
+        </div>
+      </div>
+    );
+  }
 
   const columns: Column<ChannelProjection>[] = [
     {

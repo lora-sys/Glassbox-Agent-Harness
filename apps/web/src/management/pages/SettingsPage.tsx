@@ -48,13 +48,13 @@ export const SettingsPage: React.FC<SettingsPageProps> = () => {
 
   const handleSave = () => {
     setSettings((prev) => ({ ...prev, isLocalDraftDirty: false }));
-    setFeedback('设置草稿已保存至本地配置。');
+    setFeedback('[本地设计草稿] 设置已保存在浏览器临时会话中，未持久化至服务端配置。');
   };
 
   const handleReset = () => {
     if (res?.data) {
       setSettings({ ...res.data, isLocalDraftDirty: false });
-      setFeedback('已重置回原始设置。');
+      setFeedback('[本地设计草稿] 已重置回初始设计配置，未连接服务端。');
     }
   };
 

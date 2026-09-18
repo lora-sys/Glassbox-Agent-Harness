@@ -18,7 +18,7 @@ interface IdentityPageProps {
 }
 
 export const IdentityPage: React.FC<IdentityPageProps> = ({ onNavigate }) => {
-  const { data: res } = useManagementPrincipals();
+  const { data: res, isLoading, isError, error } = useManagementPrincipals();
   const principals = res?.data || [];
   const [selectedId, setSelectedId] = useState<string | null>('owner_primary');
   const [search, setSearch] = useState('');
@@ -30,6 +30,31 @@ export const IdentityPage: React.FC<IdentityPageProps> = ({ onNavigate }) => {
       p.userDisplayName.toLowerCase().includes(search.toLowerCase()) ||
       p.id.toLowerCase().includes(search.toLowerCase())
   );
+
+  if (isLoading) {
+    return (
+      <div className="pageContainer">
+        <div style={{ padding: 40, textAlign: 'center', color: 'var(--metadata)' }}>
+          加载身份数据中...
+        </div>
+      </div>
+    );
+  }
+
+  if (isError) {
+    return (
+      <div className="pageContainer">
+        <PageHeader
+          title="身份与访问 (Identity & Access)"
+          description="审查多渠道映射链条：ChannelIdentity → User → Principal。确保身份解析与鉴权边界严密无死角。"
+          capabilityState="已实现"
+        />
+        <div style={{ padding: 40, textAlign: 'center', color: 'var(--danger)' }} role="alert">
+          <strong>主体数据加载失败</strong>: {error instanceof Error ? error.message : '无法获取主体列表'}
+        </div>
+      </div>
+    );
+  }
 
   const columns: Column<PrincipalProjection>[] = [
     {

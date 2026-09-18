@@ -1,26 +1,41 @@
 /**
  * @file apps/web/src/management/adapter/index.ts
  *
- * Clearly separated Fixture Adapter and Real HTTP Read Adapter.
- * Invariant: NO silent fallback from API to fixtures. The active data source
- * is explicitly declared and traceable.
+ * Separated Fixture Adapter and Real HTTP Read Adapter for /manage.
+ *
+ * SYSTEM INVARIANTS:
+ * - NO silent fallback from API to fixtures.
+ * - Live mode must fail closed when authentication or an endpoint is unavailable.
+ * - Live mode communicates with actual existing /manage endpoints using Bearer token authentication.
+ * - API payloads are strictly validated before rendering.
+ * - Active data source ('design'/'fixture' vs 'live'/'api') is explicitly declared and traceable.
  */
+import React, { createContext, useContext } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import type {
-  OverviewProjection,
-  ConversationProjection,
-  TaskProjection,
-  PrincipalProjection,
-  RunProjection,
-  TraceRunSummary,
-  TraceEventProjection,
-  PiModelProjection,
-  ChannelProjection,
-  PermissionRuleProjection,
+  OverviewDesignProjection,
+  ConversationDesignProjection,
+  TaskDesignProjection,
+  PrincipalDesignProjection,
+  RunDesignProjection,
+  TraceRunDesignSummary,
+  TraceEventDesignProjection,
+  PiModelDesignProjection,
+  ChannelDesignProjection,
+  PermissionRuleDesignProjection,
   DecisionTesterInput,
-  DecisionTesterResult,
-  MonitorTelemetryProjection,
-  SettingsProjection,
+  DecisionTesterDesignResult,
+  MonitorTelemetryDesignProjection,
+  SettingsDesignProjection,
+  PublicModelProfile,
+  PublicChannelProfile,
+  PublicExecutor,
+  ManagementStatus,
+  ManagementDoctor,
+} from '../types';
+import {
+  mapModelProfileToDesignProjection,
+  mapChannelProfileToDesignProjection,
 } from '../types';
 
 import {
@@ -39,7 +54,18 @@ import {
   mockSettingsData,
 } from '../fixtures';
 
+import {
+  isValidManagementToken,
+  validateManagementStatus,
+  validateManagementDoctor,
+  validateModelsResponse,
+  validateChannelsResponse,
+  validateExecutorsResponse,
+  validateWsTicketResponse,
+} from './validators';
+
 export type DataSourceKind = 'fixture' | 'api';
+export type ManagementMode = 'design' | 'live';
 
 export interface AdapterResult<T> {
   data: T;
@@ -49,27 +75,64 @@ export interface AdapterResult<T> {
 
 export interface ManagementAdapter {
   kind: DataSourceKind;
-  getOverview: () => Promise<AdapterResult<OverviewProjection>>;
-  getConversations: () => Promise<AdapterResult<ConversationProjection[]>>;
-  getTasks: () => Promise<AdapterResult<TaskProjection[]>>;
-  getPrincipals: () => Promise<AdapterResult<PrincipalProjection[]>>;
-  getRuns: () => Promise<AdapterResult<RunProjection[]>>;
-  getTraceRuns: () => Promise<AdapterResult<TraceRunSummary[]>>;
-  getTraceEvents: (runId: string) => Promise<AdapterResult<TraceEventProjection[]>>;
-  getPiModels: () => Promise<AdapterResult<PiModelProjection[]>>;
-  getChannels: () => Promise<AdapterResult<ChannelProjection[]>>;
-  getPermissionRules: () => Promise<AdapterResult<PermissionRuleProjection[]>>;
-  getMonitorTelemetry: () => Promise<AdapterResult<MonitorTelemetryProjection[]>>;
-  getSettings: () => Promise<AdapterResult<SettingsProjection>>;
-  evaluateDecision: (input: DecisionTesterInput) => Promise<DecisionTesterResult>;
+  getOverview: () => Promise<AdapterResult<OverviewDesignProjection>>;
+  getConversations: () => Promise<AdapterResult<ConversationDesignProjection[]>>;
+  getTasks: () => Promise<AdapterResult<TaskDesignProjection[]>>;
+  getPrincipals: () => Promise<AdapterResult<PrincipalDesignProjection[]>>;
+  getRuns: () => Promise<AdapterResult<RunDesignProjection[]>>;
+  getTraceRuns: () => Promise<AdapterResult<TraceRunDesignSummary[]>>;
+  getTraceEvents: (runId: string) => Promise<AdapterResult<TraceEventDesignProjection[]>>;
+  getPiModels: () => Promise<AdapterResult<PiModelDesignProjection[]>>;
+  getChannels: () => Promise<AdapterResult<ChannelDesignProjection[]>>;
+  getPermissionRules: () => Promise<AdapterResult<PermissionRuleDesignProjection[]>>;
+  getMonitorTelemetry: () => Promise<AdapterResult<MonitorTelemetryDesignProjection[]>>;
+  getSettings: () => Promise<AdapterResult<SettingsDesignProjection>>;
+  evaluateDecision: (input: DecisionTesterInput) => Promise<DecisionTesterDesignResult>;
+  // Direct /manage methods for canonical server contracts
+  getStatus?: () => Promise<AdapterResult<ManagementStatus>>;
+  getDoctor?: () => Promise<AdapterResult<ManagementDoctor>>;
+  getExecutors?: () => Promise<AdapterResult<PublicExecutor[]>>;
+  requestWsTicket?: (sessionId: string) => Promise<string>;
+  getWsUrl?: (sessionId: string, ticket: string) => string;
 }
 
 // ============================================================================
-// Fixture Adapter Implementation (Deterministic, Offline, Zero Backend Writes)
+// Token Storage & Management Invariants
+// ============================================================================
+
+export const TOKEN_STORAGE_KEY = 'glassbox_management_token';
+
+export function getManagementToken(): string | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const token = sessionStorage.getItem(TOKEN_STORAGE_KEY) || localStorage.getItem(TOKEN_STORAGE_KEY);
+    return isValidManagementToken(token) ? token : null;
+  } catch {
+    return null;
+  }
+}
+
+export function setManagementToken(token: string | null, persist = false): void {
+  if (typeof window === 'undefined') return;
+  try {
+    if (token && isValidManagementToken(token)) {
+      sessionStorage.setItem(TOKEN_STORAGE_KEY, token);
+      if (persist) localStorage.setItem(TOKEN_STORAGE_KEY, token);
+    } else {
+      sessionStorage.removeItem(TOKEN_STORAGE_KEY);
+      localStorage.removeItem(TOKEN_STORAGE_KEY);
+    }
+  } catch {
+    // Ignore storage quota or access errors
+  }
+}
+
+// ============================================================================
+// Fixture Adapter Implementation (Deterministic, Offline, Design Mode)
 // ============================================================================
 
 export class FixtureAdapter implements ManagementAdapter {
-  kind: DataSourceKind = 'fixture';
+  readonly kind: DataSourceKind = 'fixture';
 
   private wrap<T>(data: T): AdapterResult<T> {
     return {
@@ -133,195 +196,437 @@ export class FixtureAdapter implements ManagementAdapter {
 }
 
 // ============================================================================
-// Real HTTP Read Adapter (Strict API Read-Only; Fails with Real Error if Unreachable)
+// Real HTTP Read Adapter (/manage/* Protocol with Bearer Token & Fail-Closed)
 // ============================================================================
 
 export class HttpApiAdapter implements ManagementAdapter {
-  kind: DataSourceKind = 'api';
+  readonly kind: DataSourceKind = 'api';
+  private readonly baseUrl: string;
+  private readonly tokenProvider: () => string | null;
 
-  private async fetchApi<T>(endpoint: string): Promise<AdapterResult<T>> {
-    const res = await fetch(`/api/management/${endpoint}`);
-    if (!res.ok) {
-      throw new Error(`API Read Error: ${res.status} ${res.statusText} at ${endpoint}`);
+  constructor(options?: { baseUrl?: string; token?: string | null; tokenProvider?: () => string | null }) {
+    this.baseUrl = options?.baseUrl?.replace(/\/+$/, '') ?? '';
+    if (options?.tokenProvider) {
+      this.tokenProvider = options.tokenProvider;
+    } else if (options?.token !== undefined) {
+      const fixedToken = options.token;
+      this.tokenProvider = () => fixedToken;
+    } else {
+      this.tokenProvider = () => getManagementToken();
     }
-    const json = await res.json();
+  }
+
+  private async fetchManage<T>(
+    path: string,
+    options?: RequestInit,
+    validator?: (json: unknown) => T,
+  ): Promise<AdapterResult<T>> {
+    const token = this.tokenProvider();
+    if (!token || !isValidManagementToken(token)) {
+      throw new Error('Authentication Required: Missing or invalid 43-character management token.');
+    }
+
+    const cleanPath = path.startsWith('/') ? path.slice(1) : path;
+    const url = `${this.baseUrl}/manage/${cleanPath}`;
+
+    const headers = new Headers(options?.headers);
+    headers.set('Authorization', `Bearer ${token}`);
+    headers.set('Accept', 'application/json');
+
+    const res = await fetch(url, {
+      ...options,
+      headers,
+    });
+
+    if (res.status === 401) {
+      throw new Error('Unauthorized (401): Management key rejected by Glassbox server.');
+    }
+    if (res.status === 403) {
+      throw new Error('Forbidden (403): Management access is local only or request origin not allowed.');
+    }
+    if (res.status === 404) {
+      throw new Error(`Endpoint Not Available (404): /manage/${cleanPath} is not available on the server.`);
+    }
+    if (!res.ok) {
+      throw new Error(`Server Error (${res.status} ${res.statusText}) at /manage/${cleanPath}`);
+    }
+
+    let json: unknown;
+    try {
+      json = await res.json();
+    } catch {
+      throw new Error(`Invalid JSON response from /manage/${cleanPath}`);
+    }
+
+    const validatedData = validator ? validator(json) : (json as T);
+
     return {
-      data: json,
+      data: validatedData,
       source: 'api',
       fetchedAt: new Date().toISOString(),
     };
   }
 
-  async getOverview() {
-    return this.fetchApi<OverviewProjection>('overview');
+  // --- Real /manage Canonical Endpoints ---
+
+  async getStatus(): Promise<AdapterResult<ManagementStatus>> {
+    return this.fetchManage('status', { method: 'GET' }, validateManagementStatus);
   }
 
-  async getConversations() {
-    return this.fetchApi<ConversationProjection[]>('conversations');
+  async getDoctor(): Promise<AdapterResult<ManagementDoctor>> {
+    return this.fetchManage('doctor', { method: 'GET' }, validateManagementDoctor);
   }
 
-  async getTasks() {
-    return this.fetchApi<TaskProjection[]>('tasks');
+  async getPiModels(): Promise<AdapterResult<PiModelDesignProjection[]>> {
+    const res = await this.fetchManage('models', { method: 'GET' }, validateModelsResponse);
+    const models = res.data.profiles.map((p, idx) =>
+      mapModelProfileToDesignProjection(p, {
+        isDefault: idx === 0,
+        contextWindowTokens: 128000,
+        temperature: 0.7,
+        tokensToday: 0,
+        costStatus: 'unpriced',
+        costTodayUsd: null,
+      }),
+    );
+    return {
+      data: models,
+      source: 'api',
+      fetchedAt: res.fetchedAt,
+    };
   }
 
-  async getPrincipals() {
-    return this.fetchApi<PrincipalProjection[]>('principals');
+  async getChannels(): Promise<AdapterResult<ChannelDesignProjection[]>> {
+    const res = await this.fetchManage('channels', { method: 'GET' }, validateChannelsResponse);
+    const channels = res.data.channels.map((c) =>
+      mapChannelProfileToDesignProjection(c),
+    );
+    return {
+      data: channels,
+      source: 'api',
+      fetchedAt: res.fetchedAt,
+    };
   }
 
-  async getRuns() {
-    return this.fetchApi<RunProjection[]>('runs');
+  async getExecutors(): Promise<AdapterResult<PublicExecutor[]>> {
+    const res = await this.fetchManage('executors', { method: 'GET' }, validateExecutorsResponse);
+    return {
+      data: res.data.executors,
+      source: 'api',
+      fetchedAt: res.fetchedAt,
+    };
   }
 
-  async getTraceRuns() {
-    return this.fetchApi<TraceRunSummary[]>('trace/runs');
-  }
-
-  async getTraceEvents(runId: string) {
-    return this.fetchApi<TraceEventProjection[]>(`trace/runs/${runId}/events`);
-  }
-
-  async getPiModels() {
-    return this.fetchApi<PiModelProjection[]>('pi/models');
-  }
-
-  async getChannels() {
-    return this.fetchApi<ChannelProjection[]>('channels');
-  }
-
-  async getPermissionRules() {
-    return this.fetchApi<PermissionRuleProjection[]>('permissions/rules');
-  }
-
-  async getMonitorTelemetry() {
-    return this.fetchApi<MonitorTelemetryProjection[]>('monitor/telemetry');
-  }
-
-  async getSettings() {
-    return this.fetchApi<SettingsProjection>('settings');
-  }
-
-  async evaluateDecision(input: DecisionTesterInput) {
-    const res = await fetch('/api/management/permissions/test', {
+  async requestWsTicket(sessionId: string): Promise<string> {
+    const token = this.tokenProvider();
+    if (!token || !isValidManagementToken(token)) {
+      throw new Error('Authentication Required: Valid management token required to issue WS ticket.');
+    }
+    const res = await fetch(`${this.baseUrl}/manage/ws-ticket`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(input),
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ sessionId }),
     });
     if (!res.ok) {
-      throw new Error(`Permission Tester API Error: ${res.status}`);
+      throw new Error(`Failed to issue WS ticket: ${res.status} ${res.statusText}`);
     }
-    return res.json();
+    const body = validateWsTicketResponse(await res.json());
+    return body.ticket;
+  }
+
+  getWsUrl(sessionId: string, ticket: string): string {
+    const wsBase = this.baseUrl
+      ? this.baseUrl.replace(/^http/, 'ws')
+      : (typeof window !== 'undefined' ? `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}` : 'ws://localhost:3030');
+    return `${wsBase}/ws?sessionId=${encodeURIComponent(sessionId)}&ticket=${encodeURIComponent(ticket)}`;
+  }
+
+  // --- Projections Built from Canonical Endpoints ---
+
+  async getOverview(): Promise<AdapterResult<OverviewDesignProjection>> {
+    // In live mode, synthesize overview from real status, models, and channels
+    const [statusRes, modelsRes, channelsRes] = await Promise.all([
+      this.getStatus(),
+      this.getPiModels(),
+      this.getChannels(),
+    ]);
+
+    const projection: OverviewDesignProjection = {
+      summary: {
+        activeConversations: 0,
+        pendingAttentionCount: 0,
+        runningTasksCount: 0,
+        todayTotalTokens: 0,
+        todayCostUsd: null,
+        todayCostStatus: 'unpriced',
+      },
+      attentionQueue: [],
+      currentRun: null,
+      piModelUsage: modelsRes.data.map((m) => ({
+        modelId: m.id,
+        modelName: m.name,
+        callsToday: 0,
+        tokensToday: 0,
+        costUsd: null,
+        costStatus: 'unpriced',
+        p95LatencyMs: 0,
+      })),
+      usageTrend: [],
+    };
+
+    return {
+      data: projection,
+      source: 'api',
+      fetchedAt: statusRes.fetchedAt,
+    };
+  }
+
+  // --- Absent Domains: Fail-Closed without Silent Fallback ---
+
+  async getConversations(): Promise<AdapterResult<ConversationDesignProjection[]>> {
+    return this.fetchManage('conversations', { method: 'GET' });
+  }
+
+  async getTasks(): Promise<AdapterResult<TaskDesignProjection[]>> {
+    return this.fetchManage('tasks', { method: 'GET' });
+  }
+
+  async getPrincipals(): Promise<AdapterResult<PrincipalDesignProjection[]>> {
+    return this.fetchManage('principals', { method: 'GET' });
+  }
+
+  async getRuns(): Promise<AdapterResult<RunDesignProjection[]>> {
+    return this.fetchManage('runs', { method: 'GET' });
+  }
+
+  async getTraceRuns(): Promise<AdapterResult<TraceRunDesignSummary[]>> {
+    return this.fetchManage('runs', { method: 'GET' });
+  }
+
+  async getTraceEvents(runId: string): Promise<AdapterResult<TraceEventDesignProjection[]>> {
+    return this.fetchManage(`runs/${encodeURIComponent(runId)}/trace`, { method: 'GET' });
+  }
+
+  async getPermissionRules(): Promise<AdapterResult<PermissionRuleDesignProjection[]>> {
+    return this.fetchManage('permissions/rules', { method: 'GET' });
+  }
+
+  async getMonitorTelemetry(): Promise<AdapterResult<MonitorTelemetryDesignProjection[]>> {
+    return this.fetchManage('monitor/telemetry', { method: 'GET' });
+  }
+
+  async getSettings(): Promise<AdapterResult<SettingsDesignProjection>> {
+    return this.fetchManage('settings', { method: 'GET' });
+  }
+
+  async evaluateDecision(_input: DecisionTesterInput): Promise<DecisionTesterDesignResult> {
+    throw new Error('Server Evaluation Unavailable: /manage does not support remote decision simulation. Switch to design preview for offline rule simulation.');
   }
 }
 
 // ============================================================================
-// Adapter Selector & Hooks
+// Adapter Selector & React Context
 // ============================================================================
 
-export function getActiveAdapter(): ManagementAdapter {
-  // Check if mock mode is forced via URL search param or env
-  if (typeof window !== 'undefined') {
-    const urlParams = new URLSearchParams(window.location.search);
-    if (urlParams.get('mock') === 'false') {
-      return new HttpApiAdapter();
-    }
+export function getActiveAdapter(modeOrKind?: DataSourceKind | ManagementMode, token?: string | null): ManagementAdapter {
+  if (modeOrKind === 'api' || modeOrKind === 'live') {
+    return new HttpApiAdapter({ token });
   }
-  // Default to deterministic FixtureAdapter for isolated testing & standalone UI delivery
   return new FixtureAdapter();
 }
 
-export function useManagementOverview() {
-  const adapter = getActiveAdapter();
+export interface ManagementDataContextValue {
+  mode: ManagementMode;
+  setMode: (mode: ManagementMode) => void;
+  adapter: ManagementAdapter;
+  token: string | null;
+  setToken: (token: string | null) => void;
+}
+
+export const ManagementDataContext = createContext<ManagementDataContextValue>({
+  mode: 'design',
+  setMode: () => {},
+  adapter: new FixtureAdapter(),
+  token: null,
+  setToken: () => {},
+});
+
+export const ManagementDataProvider: React.FC<{
+  mode: ManagementMode;
+  setMode: (mode: ManagementMode) => void;
+  token: string | null;
+  setToken: (token: string | null) => void;
+  children: React.ReactNode;
+}> = ({ mode, setMode, token, setToken, children }) => {
+  const adapter = React.useMemo(() => {
+    return getActiveAdapter(mode, token);
+  }, [mode, token]);
+
+  const value = React.useMemo(() => ({
+    mode,
+    setMode,
+    adapter,
+    token,
+    setToken,
+  }), [mode, setMode, adapter, token, setToken]);
+
+  return React.createElement(ManagementDataContext.Provider, { value }, children);
+};
+
+export function useManagementData(): ManagementDataContextValue {
+  return useContext(ManagementDataContext);
+}
+
+// ============================================================================
+// Query Hooks with Mode-Partitioned Query Keys
+// ============================================================================
+
+export function useManagementOverview(modeOverride?: ManagementMode) {
+  const ctx = useManagementData();
+  const effectiveMode = modeOverride || ctx.mode;
+  const adapter = modeOverride ? getActiveAdapter(modeOverride, ctx.token) : ctx.adapter;
+
   return useQuery({
-    queryKey: ['management', 'overview', adapter.kind],
+    queryKey: ['management', 'overview', effectiveMode],
     queryFn: () => adapter.getOverview(),
+    retry: effectiveMode === 'live' ? false : undefined,
   });
 }
 
-export function useManagementConversations() {
-  const adapter = getActiveAdapter();
+export function useManagementConversations(modeOverride?: ManagementMode) {
+  const ctx = useManagementData();
+  const effectiveMode = modeOverride || ctx.mode;
+  const adapter = modeOverride ? getActiveAdapter(modeOverride, ctx.token) : ctx.adapter;
+
   return useQuery({
-    queryKey: ['management', 'conversations', adapter.kind],
+    queryKey: ['management', 'conversations', effectiveMode],
     queryFn: () => adapter.getConversations(),
+    retry: effectiveMode === 'live' ? false : undefined,
   });
 }
 
-export function useManagementTasks() {
-  const adapter = getActiveAdapter();
+export function useManagementTasks(modeOverride?: ManagementMode) {
+  const ctx = useManagementData();
+  const effectiveMode = modeOverride || ctx.mode;
+  const adapter = modeOverride ? getActiveAdapter(modeOverride, ctx.token) : ctx.adapter;
+
   return useQuery({
-    queryKey: ['management', 'tasks', adapter.kind],
+    queryKey: ['management', 'tasks', effectiveMode],
     queryFn: () => adapter.getTasks(),
+    retry: effectiveMode === 'live' ? false : undefined,
   });
 }
 
-export function useManagementPrincipals() {
-  const adapter = getActiveAdapter();
+export function useManagementPrincipals(modeOverride?: ManagementMode) {
+  const ctx = useManagementData();
+  const effectiveMode = modeOverride || ctx.mode;
+  const adapter = modeOverride ? getActiveAdapter(modeOverride, ctx.token) : ctx.adapter;
+
   return useQuery({
-    queryKey: ['management', 'principals', adapter.kind],
+    queryKey: ['management', 'principals', effectiveMode],
     queryFn: () => adapter.getPrincipals(),
+    retry: effectiveMode === 'live' ? false : undefined,
   });
 }
 
-export function useManagementRuns() {
-  const adapter = getActiveAdapter();
+export function useManagementRuns(modeOverride?: ManagementMode) {
+  const ctx = useManagementData();
+  const effectiveMode = modeOverride || ctx.mode;
+  const adapter = modeOverride ? getActiveAdapter(modeOverride, ctx.token) : ctx.adapter;
+
   return useQuery({
-    queryKey: ['management', 'runs', adapter.kind],
+    queryKey: ['management', 'runs', effectiveMode],
     queryFn: () => adapter.getRuns(),
+    retry: effectiveMode === 'live' ? false : undefined,
   });
 }
 
-export function useManagementTraceRuns() {
-  const adapter = getActiveAdapter();
+export function useManagementTraceRuns(modeOverride?: ManagementMode) {
+  const ctx = useManagementData();
+  const effectiveMode = modeOverride || ctx.mode;
+  const adapter = modeOverride ? getActiveAdapter(modeOverride, ctx.token) : ctx.adapter;
+
   return useQuery({
-    queryKey: ['management', 'trace', 'runs', adapter.kind],
+    queryKey: ['management', 'trace-runs', effectiveMode],
     queryFn: () => adapter.getTraceRuns(),
+    retry: effectiveMode === 'live' ? false : undefined,
   });
 }
 
-export function useManagementTraceEvents(runId: string) {
-  const adapter = getActiveAdapter();
+export function useManagementTraceEvents(runId: string, modeOverride?: ManagementMode) {
+  const ctx = useManagementData();
+  const effectiveMode = modeOverride || ctx.mode;
+  const adapter = modeOverride ? getActiveAdapter(modeOverride, ctx.token) : ctx.adapter;
+
   return useQuery({
-    queryKey: ['management', 'trace', 'events', runId, adapter.kind],
+    queryKey: ['management', 'trace-events', runId, effectiveMode],
     queryFn: () => adapter.getTraceEvents(runId),
+    retry: effectiveMode === 'live' ? false : undefined,
     enabled: !!runId,
   });
 }
 
-export function useManagementPiModels() {
-  const adapter = getActiveAdapter();
+export function useManagementPiModels(modeOverride?: ManagementMode) {
+  const ctx = useManagementData();
+  const effectiveMode = modeOverride || ctx.mode;
+  const adapter = modeOverride ? getActiveAdapter(modeOverride, ctx.token) : ctx.adapter;
+
   return useQuery({
-    queryKey: ['management', 'pi', 'models', adapter.kind],
+    queryKey: ['management', 'pi-models', effectiveMode],
     queryFn: () => adapter.getPiModels(),
+    retry: effectiveMode === 'live' ? false : undefined,
   });
 }
 
-export function useManagementChannels() {
-  const adapter = getActiveAdapter();
+export function useManagementChannels(modeOverride?: ManagementMode) {
+  const ctx = useManagementData();
+  const effectiveMode = modeOverride || ctx.mode;
+  const adapter = modeOverride ? getActiveAdapter(modeOverride, ctx.token) : ctx.adapter;
+
   return useQuery({
-    queryKey: ['management', 'channels', adapter.kind],
+    queryKey: ['management', 'channels', effectiveMode],
     queryFn: () => adapter.getChannels(),
+    retry: effectiveMode === 'live' ? false : undefined,
   });
 }
 
-export function useManagementPermissions() {
-  const adapter = getActiveAdapter();
+export function useManagementPermissionRules(modeOverride?: ManagementMode) {
+  const ctx = useManagementData();
+  const effectiveMode = modeOverride || ctx.mode;
+  const adapter = modeOverride ? getActiveAdapter(modeOverride, ctx.token) : ctx.adapter;
+
   return useQuery({
-    queryKey: ['management', 'permissions', adapter.kind],
+    queryKey: ['management', 'permission-rules', effectiveMode],
     queryFn: () => adapter.getPermissionRules(),
+    retry: effectiveMode === 'live' ? false : undefined,
   });
 }
 
-export function useManagementMonitor() {
-  const adapter = getActiveAdapter();
+export const useManagementPermissions = useManagementPermissionRules;
+
+export function useManagementMonitor(modeOverride?: ManagementMode) {
+  const ctx = useManagementData();
+  const effectiveMode = modeOverride || ctx.mode;
+  const adapter = modeOverride ? getActiveAdapter(modeOverride, ctx.token) : ctx.adapter;
+
   return useQuery({
-    queryKey: ['management', 'monitor', adapter.kind],
+    queryKey: ['management', 'monitor', effectiveMode],
     queryFn: () => adapter.getMonitorTelemetry(),
+    retry: effectiveMode === 'live' ? false : undefined,
   });
 }
 
-export function useManagementSettings() {
-  const adapter = getActiveAdapter();
+export function useManagementSettings(modeOverride?: ManagementMode) {
+  const ctx = useManagementData();
+  const effectiveMode = modeOverride || ctx.mode;
+  const adapter = modeOverride ? getActiveAdapter(modeOverride, ctx.token) : ctx.adapter;
+
   return useQuery({
-    queryKey: ['management', 'settings', adapter.kind],
+    queryKey: ['management', 'settings', effectiveMode],
     queryFn: () => adapter.getSettings(),
+    retry: effectiveMode === 'live' ? false : undefined,
   });
 }

@@ -10,6 +10,8 @@ import { EntityMark } from './EntityMark';
 export interface PageShellProps {
   currentPageId: string;
   onNavigate: (pageId: string) => void;
+  mode?: 'design' | 'live';
+  onModeChange?: (mode: 'design' | 'live') => void;
   children: React.ReactNode;
 }
 
@@ -53,6 +55,8 @@ const NAV_GROUPS: Array<{ label: string; items: NavItemDef[] }> = [
 export const PageShell: React.FC<PageShellProps> = ({
   currentPageId,
   onNavigate,
+  mode = 'design',
+  onModeChange,
   children,
 }) => {
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -182,11 +186,24 @@ export const PageShell: React.FC<PageShellProps> = ({
           </div>
           <div className="topSpacer" />
           <div className="repoMeta">
-            <span>仓库:</span>
-            <code>Glassbox-Agent-Harness</code>
-            <span>分支:</span>
-            <code>main</code>
-            <span className="capabilityBadge warn">P3 当前计划</span>
+            <span>数据源:</span>
+            <span
+              className={`capabilityBadge ${mode === 'live' ? 'ok' : 'neutral'}`}
+              title={mode === 'live' ? '已连接 Glassbox /manage 实时接口' : '当前展示确定性公开设计预览数据，未连接服务端'}
+            >
+              {mode === 'live' ? '实时接口 (/manage)' : '设计数据 (Preview)'}
+            </span>
+            {onModeChange && (
+              <button
+                type="button"
+                className="btn secondary sm"
+                style={{ padding: '2px 8px', fontSize: 11 }}
+                onClick={() => onModeChange(mode === 'live' ? 'design' : 'live')}
+                title={mode === 'live' ? '切换为离线设计数据预览' : '切换为连接 Glassbox 服务端 /manage 实时接口'}
+              >
+                {mode === 'live' ? '切至设计数据' : '切至实时接口'}
+              </button>
+            )}
           </div>
           <button
             type="button"
