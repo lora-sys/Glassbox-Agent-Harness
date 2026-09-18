@@ -1,7 +1,5 @@
 // Domain contracts for Personal Agent Foundation (Plan 03)
 
-export const PRIVATE_CANARY = "PRIVATE_CANARY_7F92A1";
-
 export type PrincipalKind = "owner" | "visitor" | "agent" | "system";
 
 export interface Principal {

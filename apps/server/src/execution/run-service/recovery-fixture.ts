@@ -42,7 +42,7 @@ try {
   if (stage === "write") {
     await store.conversations.createAgent("personal");
     await store.identities.bindOwner("owner", group);
-    for (const action of ["run:create", "run:control", "conversation:read"]) {
+    for (const action of ["run:create", "run:control", "delivery:send", "conversation:read"]) {
       await store.authorization.grant({
         principalId: "owner",
         resourceId: agentResourceId("personal"),

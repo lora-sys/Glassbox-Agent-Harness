@@ -1,14 +1,11 @@
-import {
-  PRIVATE_CANARY,
-  type Audience,
-  type ResourceVisibility,
-} from "@glassbox/contracts";
+import type { Audience, ResourceVisibility } from "@glassbox/contracts";
 
 export interface DeliveryCheckRequest {
   resourceVisibility: ResourceVisibility;
   resourceOwnerId?: string | null;
   audience: Audience;
   callerPrincipalId: string;
+  authorizedRecipientIds?: readonly string[];
 }
 
 export interface DeliveryCheckResult {
@@ -26,58 +23,91 @@ export class DeliveryDeniedError extends Error {
 /**
  * Gate 4: Delivery Authorization
  * Enforces server-side delivery policy.
- * Core invariant: Read permission does NOT imply delivery permission.
- * Private data cannot be delivered to a group audience even if requested by Owner.
+ * Core invariants:
+ * 1. Default deny: No matching grant means DENY.
+ * 2. Empty audience or missing destination scope is strictly rejected.
+ * 3. Read permission does NOT imply delivery permission.
+ * 4. Caller is the actor initiating delivery, not the recipient.
+ * 5. Private data cannot be delivered to a group audience even if requested by Owner.
+ * 6. Private data with empty/null owner is strictly denied.
+ * 7. For private data, ALL audience recipients must be authorized (audience.allowedPrincipals ⊆ authorized).
  */
 export function checkDelivery(request: DeliveryCheckRequest): DeliveryCheckResult {
-  // 1. Private resources cannot be delivered to group audiences
-  if (request.resourceVisibility === "private" && request.audience.kind === "group") {
+  // 1. Caller validation: must be an identified actor
+  if (!request.callerPrincipalId || request.callerPrincipalId.trim() === "") {
     return {
       allowed: false,
-      reason: "private_group_delivery_denied",
+      reason: "caller_required",
     };
   }
 
-  // 2. Private resources can only be delivered to authorized principals
-  if (request.resourceVisibility === "private" && request.resourceOwnerId) {
-    if (!request.audience.allowedPrincipals.includes(request.resourceOwnerId)) {
+  // 2. Audience validation: default deny on empty or invalid audience
+  if (
+    !request.audience ||
+    !request.audience.destinationScopeKey ||
+    !Array.isArray(request.audience.allowedPrincipals) ||
+    request.audience.allowedPrincipals.length === 0
+  ) {
+    return {
+      allowed: false,
+      reason: "empty_audience",
+    };
+  }
+
+  // 3. Visibility validation
+  if (request.resourceVisibility === "private") {
+    // Private resources cannot be delivered to group audiences
+    if (request.audience.kind === "group") {
+      return {
+        allowed: false,
+        reason: "private_group_delivery_denied",
+      };
+    }
+
+    // Private resources must have an identifiable owner
+    if (!request.resourceOwnerId || request.resourceOwnerId.trim() === "") {
+      return {
+        allowed: false,
+        reason: "private_owner_missing",
+      };
+    }
+
+    // ALL recipients in the audience must be authorized for this private resource:
+    // audience.allowedPrincipals ⊆ authorizedPrincipals
+    const authorized = new Set<string>();
+    authorized.add(request.resourceOwnerId);
+    if (request.authorizedRecipientIds) {
+      for (const id of request.authorizedRecipientIds) {
+        if (id) authorized.add(id);
+      }
+    }
+
+    const allAuthorized = request.audience.allowedPrincipals.every((recipient) =>
+      authorized.has(recipient),
+    );
+
+    if (!allAuthorized) {
       return {
         allowed: false,
         reason: "private_audience_mismatch",
       };
     }
+
+    return {
+      allowed: true,
+      reason: "delivery_allowed",
+    };
   }
 
-  // 3. Caller must be an allowed recipient for this audience
-  if (
-    request.audience.allowedPrincipals.length > 0 &&
-    !request.audience.allowedPrincipals.includes(request.callerPrincipalId)
-  ) {
+  if (request.resourceVisibility === "public") {
     return {
-      allowed: false,
-      reason: "caller_not_in_audience",
+      allowed: true,
+      reason: "delivery_allowed",
     };
   }
 
   return {
-    allowed: true,
-    reason: "delivery_allowed",
+    allowed: false,
+    reason: "unsupported_visibility",
   };
-}
-
-/**
- * Security Canary assertion:
- * Verifies that PRIVATE_CANARY never leaks into unauthorized payload text,
- * tool results, or delivery payloads.
- */
-export function assertCanarySafety(
-  payload: string,
-  audience: Audience,
-  isAuthorizedForCanary: boolean,
-): void {
-  if (!isAuthorizedForCanary && payload.includes(PRIVATE_CANARY)) {
-    throw new Error(
-      `SECURITY LEAK: PRIVATE_CANARY leaked to unauthorized audience kind="${audience.kind}" key="${audience.destinationScopeKey}"`,
-    );
-  }
 }

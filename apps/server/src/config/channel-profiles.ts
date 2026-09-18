@@ -57,7 +57,7 @@ function tokenValue(value: unknown): string {
 function executionReference(value: unknown): string {
   if (value === undefined) return "claude-code";
   if (value === "claude-code" || value === "codex") return value;
-  if (typeof value === "string" && /^model:[A-Za-z0-9][A-Za-z0-9_-]{0,79}$/u.test(value))
+  if (typeof value === "string" && /^(?:model|pi):[A-Za-z0-9][A-Za-z0-9_-]{0,79}$/u.test(value))
     return value;
   throw new ChannelConfigurationError("Invalid execution reference");
 }
@@ -69,6 +69,7 @@ function toConfig(channel: StoredChannel): OneBotConnectionConfig {
     endpoint: channel.endpoint,
     botId: channel.botId,
     ownerId: channel.ownerId,
+    visitorIds: channel.visitorIds,
     groupIds: channel.groupIds,
     credentialSlot: channel.credentialSlot,
     allowRemote: false,
@@ -87,6 +88,7 @@ function parseChannel(value: unknown): StoredChannel {
   )
     throw new ChannelConfigurationError("QQ account and group identifiers must be strings");
   const channel: StoredChannel = {
+    visitorIds: input.visitorIds === undefined ? [] : (input.visitorIds as string[]),
     id: identifier(input.id),
     label: text(input.label, "channel label", 120),
     kind: "qq-onebot",
@@ -100,7 +102,12 @@ function parseChannel(value: unknown): StoredChannel {
   };
   try {
     const config = toConfig(channel);
-    return { ...channel, endpoint: config.endpoint, groupIds: [...config.groupIds] };
+    return {
+      ...channel,
+      endpoint: config.endpoint,
+      groupIds: [...config.groupIds],
+      visitorIds: [...config.visitorIds],
+    };
   } catch {
     throw new ChannelConfigurationError("Invalid OneBot address or QQ identifiers");
   }
@@ -216,6 +223,7 @@ export class ChannelProfileStore {
             "endpoint",
             "botId",
             "ownerId",
+            "visitorIds",
             "groupIds",
             "executionRef",
             "token",
@@ -280,6 +288,7 @@ export class ChannelProfileStore {
     return {
       ...profile,
       groupIds: [...profile.groupIds],
+      visitorIds: [...(profile.visitorIds ?? [])],
       tokenConfigured: Object.hasOwn(this.#settings.credentials, credentialSlot),
       connectionState: "disconnected",
     };

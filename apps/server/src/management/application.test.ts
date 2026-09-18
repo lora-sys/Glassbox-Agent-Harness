@@ -94,18 +94,19 @@ async function fixture(execute: (input: ExecutionInput) => Promise<ExecutionResu
     endpoint: `ws://127.0.0.1:${(server.address() as AddressInfo).port}/`,
     botId: "10001",
     ownerId: "10002",
+    visitorIds: ["10004"],
     groupIds: ["10003"],
     token: "fixture-token",
     executionRef: "claude-code",
   });
   await app.connectChannel("fixture");
   const socket = await sockets.take();
-  const send = (id: number, text: string, privateChat = false) =>
+  const send = (id: number, text: string, privateChat = false, senderId = 10002) =>
     socket.send(
       JSON.stringify({
         post_type: "message",
         self_id: 10001,
-        user_id: 10002,
+        user_id: senderId,
         message_id: id,
         message_type: privateChat ? "private" : "group",
         sub_type: privateChat ? "friend" : "normal",
@@ -125,6 +126,28 @@ async function fixture(execute: (input: ExecutionInput) => Promise<ExecutionResu
 }
 
 describe("channel to durable run composition", () => {
+  it("routes a configured Visitor DM through its own identity and reply destination", async () => {
+    const f = await fixture(async (input) => ({
+      status: "succeeded",
+      text: `answer:${input.text}`,
+    }));
+    f.send(1, "visitor-private", true, 10004);
+    const visitor = await f.started.take();
+    const reply = await f.reply("answer:visitor-private");
+    expect(visitor.caller.principalId).toBe("qq-visitor-10004");
+    expect(reply.action).toBe("send_private_msg");
+    expect(reply.params.user_id).toBe(10004);
+    const trace = await f.app.trace.readPage(visitor.run.id);
+    expect(
+      trace.records.some((record) => (record.event as { type: string }).type === "run_finished"),
+    ).toBe(true);
+    expect(await f.app.store.management.runCaller("owner", visitor.run.id)).toBeNull();
+    f.send(2, "owner-private", true);
+    const owner = await f.started.take();
+    await f.reply("answer:owner-private");
+    expect(owner.history).toEqual([]);
+    expect(owner.conversation.id).not.toBe(visitor.conversation.id);
+  });
   it("runs a group mention once, isolates Owner DM history, and indexes actual trace records", async () => {
     const f = await fixture(async (input) => ({
       status: "succeeded",

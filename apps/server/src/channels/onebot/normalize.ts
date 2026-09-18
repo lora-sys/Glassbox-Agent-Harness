@@ -57,7 +57,8 @@ export function normalizeOneBotMessage(
   // This is an ingress allowlist. The domain still resolves binding and checks authorization.
   if (
     qqId(input.self_id) !== config.botId ||
-    senderId !== config.ownerId ||
+    !senderId ||
+    (senderId !== config.ownerId && !config.visitorIds.includes(senderId)) ||
     senderId === config.botId
   )
     return { kind: "ignored" };

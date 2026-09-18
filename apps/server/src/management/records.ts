@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   authorizeConversation,
   authorizeRun,
@@ -22,10 +23,41 @@ function callerFromRow(row: { [key: string]: unknown }): CallerContext {
 export class OwnerManagementRecords {
   constructor(private readonly db: DomainDatabase) {}
 
+  /** Local authenticated incident response only. This withdraws context reuse;
+   * it neither reads protected content nor grants the Owner channel authority. */
+  async excludeUnsafeRunContexts(ownerId: string, runIds: string[]): Promise<void> {
+    await this.db.transaction(async (tx) => {
+      const owner = await tx.execute({
+        sql: "SELECT id FROM principals WHERE id = ? AND kind = 'owner'",
+        args: [ownerId],
+      });
+      if (!owner.rows.length) throw new Error("Owner management authority required");
+      for (const runId of new Set(runIds)) {
+        await tx.execute({
+          sql: `INSERT INTO ops_trace_events(event_id, ts, type, run_id, principal_id, data_json)
+            SELECT ?, ?, 'context.excluded', id, ?, ? FROM runs WHERE id = ?
+            AND NOT EXISTS (SELECT 1 FROM ops_trace_events WHERE run_id = ? AND type = 'context.excluded')`,
+          args: [
+            randomUUID(),
+            new Date().toISOString(),
+            ownerId,
+            JSON.stringify({
+              action: "Exclude Run Context",
+              reason: "unsafe_runtime_context",
+              origin: "local_management",
+            }),
+            runId,
+            runId,
+          ],
+        });
+      }
+    });
+  }
+
   async deliveryRunId(ownerId: string, deliveryId: string): Promise<string | null> {
     return this.db.transaction(async (tx) => {
       const rows = await tx.execute({
-        sql: "SELECT d.run_id FROM deliveries d JOIN runs r ON r.id = d.run_id JOIN conversations c ON c.id = r.conversation_id JOIN principals p ON p.id = c.principal_id WHERE d.id = ? AND p.id = ? AND p.kind = 'owner'",
+        sql: "SELECT d.run_id FROM deliveries d JOIN runs r ON r.id = d.run_id JOIN principals p ON p.id = r.principal_id WHERE d.id = ? AND p.id = ? AND p.kind = 'owner'",
         args: [deliveryId, ownerId],
       });
       return rows.rows[0] ? stringColumn(rows.rows[0], "run_id") : null;
@@ -35,7 +67,7 @@ export class OwnerManagementRecords {
   async runCaller(ownerId: string, runId: string): Promise<CallerContext | null> {
     return this.db.transaction(async (tx) => {
       const rows = await tx.execute({
-        sql: "SELECT c.principal_id, c.scope_json FROM runs r JOIN conversations c ON c.id = r.conversation_id JOIN principals p ON p.id = c.principal_id WHERE r.id = ? AND p.id = ? AND p.kind = 'owner'",
+        sql: "SELECT r.principal_id, r.scope_json FROM runs r JOIN principals p ON p.id = r.principal_id WHERE r.id = ? AND p.id = ? AND p.kind = 'owner'",
         args: [runId, ownerId],
       });
       if (!rows.rows[0]) return null;
@@ -49,7 +81,7 @@ export class OwnerManagementRecords {
     const page = pageParameters(options);
     return this.db.transaction(async (tx) => {
       const rows = await tx.execute({
-        sql: "SELECT r.id, r.created_at, c.principal_id, c.scope_json FROM runs r JOIN conversations c ON c.id = r.conversation_id JOIN principals p ON p.id = c.principal_id WHERE p.id = ? AND p.kind = 'owner' AND (? IS NULL OR c.id = ?) AND (r.created_at, r.id) > (?, ?) ORDER BY r.created_at, r.id LIMIT ?",
+        sql: "SELECT r.id, r.created_at, r.principal_id, r.scope_json FROM runs r JOIN principals p ON p.id = r.principal_id WHERE p.id = ? AND p.kind = 'owner' AND (? IS NULL OR r.conversation_id = ?) AND (r.created_at, r.id) > (?, ?) ORDER BY r.created_at, r.id LIMIT ?",
         args: [
           ownerId,
           options.conversationId ?? null,

@@ -23,6 +23,6 @@ export async function openDomainStore(options: { databasePath: string }) {
 
 export type DomainStore = Awaited<ReturnType<typeof openDomainStore>>;
 export type { CallerContext, TrustedChannelScope } from "../identity/scope.js";
-export { scopeKey } from "../identity/scope.js";
+export { scopeKey, conversationScopeKey, identityKey } from "../identity/scope.js";
 export { agentResourceId } from "../conversation/store.js";
 export { AccessDeniedError } from "../auth/service.js";

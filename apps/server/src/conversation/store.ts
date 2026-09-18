@@ -9,6 +9,7 @@ import {
 } from "../auth/service.js";
 import { resolveIdentity } from "../identity/service.js";
 import {
+  conversationScopeKey,
   requireIdentifier,
   scopeKey,
   type CallerContext,
@@ -32,12 +33,14 @@ export interface ConversationRecord {
   scope: TrustedChannelScope;
   providerKind: string | null;
   providerSessionId: string | null;
+  providerSessionPrincipalId?: string | null;
   createdAt: string;
 }
 export interface RunRecord {
   id: string;
   conversationId: string;
   messageId: string;
+  principalId: string;
   executionRef: string;
   status: RunStatus;
   resultText: string | null;
@@ -78,6 +81,7 @@ export function runRecord(row: Row): RunRecord {
     id: stringColumn(row, "id"),
     conversationId: stringColumn(row, "conversation_id"),
     messageId: stringColumn(row, "message_id"),
+    principalId: stringColumn(row, "principal_id"),
     executionRef: stringColumn(row, "execution_ref"),
     status: stringColumn(row, "status") as RunStatus,
     resultText: optionalString(row, "result_text"),
@@ -94,6 +98,7 @@ function conversationRecord(row: Row, scope: TrustedChannelScope): ConversationR
     scope: { ...scope },
     providerKind: optionalString(row, "provider_kind"),
     providerSessionId: optionalString(row, "provider_session_id"),
+    providerSessionPrincipalId: optionalString(row, "provider_session_principal_id"),
     createdAt: stringColumn(row, "created_at"),
   };
 }
@@ -146,14 +151,59 @@ export async function authorizeConversation(
 ): Promise<AuthorizedResult<{ agentId: string }>> {
   requireIdentifier(conversationId);
   const result = await tx.execute({
-    sql: "SELECT agent_id, principal_id, scope_key FROM conversations WHERE id = ?",
+    sql: "SELECT c.agent_id, c.principal_id, c.scope_key, c.scope_json, r.visibility, r.owner_id FROM conversations c JOIN resources r ON r.id = c.resource_id WHERE c.id = ?",
     args: [conversationId],
   });
   const row = result.rows[0];
+  if (!row) {
+    const denied = await recordDecision(
+      tx,
+      { caller, resourceId: "conversation", action },
+      "DENY",
+      "scope_mismatch",
+    );
+    return { denied };
+  }
+
+  const agentId = stringColumn(row, "agent_id");
+  const visibility = stringColumn(row, "visibility");
+  const ownerId = optionalString(row, "owner_id");
+  const storedScopeKey = stringColumn(row, "scope_key");
+
+  const callerLocationKey = conversationScopeKey(caller.scope);
+  let matchesLocation = storedScopeKey === callerLocationKey;
+  if (!matchesLocation) {
+    const loc = await tx.execute({
+      sql: "SELECT 1 FROM conversation_locations WHERE conversation_id = ? AND location_key = ?",
+      args: [conversationId, callerLocationKey],
+    });
+    if (loc.rows.length > 0) {
+      matchesLocation = true;
+    } else {
+      try {
+        const storedScope = JSON.parse(stringColumn(row, "scope_json"));
+        if (conversationScopeKey(storedScope) === callerLocationKey) {
+          matchesLocation = true;
+        }
+      } catch {
+        // ignore parse errors
+      }
+    }
+  }
+
+  if (!matchesLocation) {
+    const denied = await recordDecision(
+      tx,
+      { caller, resourceId: "conversation", action },
+      "DENY",
+      "scope_mismatch",
+    );
+    return { denied };
+  }
+
   if (
-    !row ||
-    stringColumn(row, "principal_id") !== caller.principalId ||
-    stringColumn(row, "scope_key") !== scopeKey(caller.scope)
+    visibility === "private" &&
+    caller.principalId !== (ownerId ?? stringColumn(row, "principal_id"))
   ) {
     const denied = await recordDecision(
       tx,
@@ -163,7 +213,7 @@ export async function authorizeConversation(
     );
     return { denied };
   }
-  const agentId = stringColumn(row, "agent_id");
+
   const decision = await evaluate(tx, {
     caller,
     resourceId: agentResourceId(agentId),
@@ -182,7 +232,7 @@ export async function authorizeRun(
 ): Promise<AuthorizedResult<{ conversationId: string }>> {
   requireIdentifier(runId);
   const result = await tx.execute({
-    sql: "SELECT conversation_id FROM runs WHERE id = ?",
+    sql: "SELECT conversation_id, principal_id FROM runs WHERE id = ?",
     args: [runId],
   });
   const row = result.rows[0];
@@ -196,8 +246,43 @@ export async function authorizeRun(
       ),
     };
   const conversationId = stringColumn(row, "conversation_id");
+  const runPrincipalId = stringColumn(row, "principal_id");
+
+  if (caller.principalId !== runPrincipalId) {
+    return {
+      denied: await recordDecision(
+        tx,
+        { caller, resourceId: "run", action, runId, conversationId },
+        "DENY",
+        "scope_mismatch",
+      ),
+    };
+  }
+
   const authorization = await authorizeConversation(tx, caller, conversationId, action, runId);
   return "denied" in authorization ? authorization : { value: { conversationId } };
+}
+
+function matchesDestinationLocation(
+  destinationScopeKey: string,
+  targetLocationKey: string,
+): boolean {
+  if (destinationScopeKey === targetLocationKey) return true;
+  try {
+    const parsed = JSON.parse(destinationScopeKey);
+    if (Array.isArray(parsed)) {
+      if (parsed.length >= 5) {
+        const [conn, bot, chatType, chatId, , thread] = parsed;
+        const convKey = JSON.stringify([conn, bot, chatType, chatId, thread ?? null]);
+        if (convKey === targetLocationKey) return true;
+      }
+    } else if (parsed && typeof parsed === "object" && parsed.chatType) {
+      if (conversationScopeKey(parsed) === targetLocationKey) return true;
+    }
+  } catch {
+    // ignore parse errors
+  }
+  return false;
 }
 
 export class ConversationStore {
@@ -229,6 +314,7 @@ export class ConversationStore {
     if (typeof input.text !== "string" || input.text.length > 64_000)
       throw new Error("Message exceeds the accepted text limit");
     const key = scopeKey(input.scope);
+    const convKey = conversationScopeKey(input.scope);
     const outcome = await this.db.transaction<
       AuthorizedResult<{
         conversation: ConversationRecord;
@@ -240,7 +326,7 @@ export class ConversationStore {
       const principalId = await resolveIdentity(tx, input.scope);
       const caller = { principalId: principalId ?? "unbound", scope: input.scope };
       const prior = await tx.execute({
-        sql: "SELECT runs.id, runs.conversation_id FROM runs JOIN messages ON messages.id = runs.message_id WHERE messages.scope_key = ? AND messages.external_id = ?",
+        sql: "SELECT runs.id, runs.conversation_id, runs.principal_id FROM runs JOIN messages ON messages.id = runs.message_id WHERE messages.scope_key = ? AND messages.external_id = ?",
         args: [key, input.messageId],
       });
       if (prior.rows[0]) {
@@ -248,8 +334,8 @@ export class ConversationStore {
         const authorization = await authorizeRun(tx, caller, runId, "conversation:read");
         if ("denied" in authorization) return authorization;
         const rows = await tx.execute({
-          sql: "SELECT * FROM conversations WHERE id = ? AND agent_id = ? AND principal_id = ?",
-          args: [authorization.value.conversationId, input.agentId, caller.principalId],
+          sql: "SELECT * FROM conversations WHERE id = ? AND agent_id = ?",
+          args: [authorization.value.conversationId, input.agentId],
         });
         if (!rows.rows[0])
           return {
@@ -262,6 +348,16 @@ export class ConversationStore {
           };
         const runRows = await tx.execute({ sql: "SELECT * FROM runs WHERE id = ?", args: [runId] });
         const run = runRecord(runRows.rows[0]!);
+        if (run.principalId !== caller.principalId) {
+          return {
+            denied: await recordDecision(
+              tx,
+              { caller, resourceId: "run", action: "run:create" },
+              "DENY",
+              "scope_mismatch",
+            ),
+          };
+        }
         return {
           value: {
             conversation: conversationRecord(rows.rows[0], input.scope),
@@ -278,13 +374,23 @@ export class ConversationStore {
         ...(input.approvalId ? { approvalId: input.approvalId } : {}),
       });
       if (decision.decision !== "ALLOW") return { denied: decision };
-      let conversations = await tx.execute({
-        sql: "SELECT * FROM conversations WHERE agent_id = ? AND scope_key = ?",
-        args: [input.agentId, key],
+      const locRow = await tx.execute({
+        sql: "SELECT conversation_id FROM conversation_locations WHERE agent_id = ? AND location_key = ?",
+        args: [input.agentId, convKey],
       });
+      let conversations = locRow.rows[0]
+        ? await tx.execute({
+            sql: "SELECT * FROM conversations WHERE id = ?",
+            args: [stringColumn(locRow.rows[0], "conversation_id")],
+          })
+        : await tx.execute({
+            sql: "SELECT * FROM conversations WHERE agent_id = ? AND scope_key = ?",
+            args: [input.agentId, convKey],
+          });
       const now = new Date().toISOString();
       if (
         conversations.rows[0] &&
+        input.scope.chatType === "private" &&
         stringColumn(conversations.rows[0], "principal_id") !== caller.principalId
       ) {
         return {
@@ -313,15 +419,24 @@ export class ConversationStore {
             id,
             input.agentId,
             caller.principalId,
-            key,
+            convKey,
             JSON.stringify(input.scope),
             resourceId,
             now,
           ],
         });
+        await tx.execute({
+          sql: "INSERT INTO conversation_locations(agent_id, location_key, conversation_id, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(agent_id, location_key) DO NOTHING",
+          args: [input.agentId, convKey, id, now],
+        });
         conversations = await tx.execute({
           sql: "SELECT * FROM conversations WHERE id = ?",
           args: [id],
+        });
+      } else if (!locRow.rows[0]) {
+        await tx.execute({
+          sql: "INSERT INTO conversation_locations(agent_id, location_key, conversation_id, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(agent_id, location_key) DO NOTHING",
+          args: [input.agentId, convKey, stringColumn(conversations.rows[0], "id"), now],
         });
       }
       const conversationRow = conversations.rows[0];
@@ -334,13 +449,23 @@ export class ConversationStore {
         args: [messageId, conversation.id, key, input.messageId, input.text, now],
       });
       await tx.execute({
-        sql: "INSERT INTO runs(id, conversation_id, message_id, execution_ref, status, created_at, updated_at) VALUES (?, ?, ?, ?, 'queued', ?, ?)",
-        args: [runId, conversation.id, messageId, input.executionRef, now, now],
+        sql: "INSERT INTO runs(id, conversation_id, message_id, principal_id, scope_json, execution_ref, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)",
+        args: [
+          runId,
+          conversation.id,
+          messageId,
+          caller.principalId,
+          JSON.stringify(caller.scope),
+          input.executionRef,
+          now,
+          now,
+        ],
       });
       const run: RunRecord = {
         id: runId,
         conversationId: conversation.id,
         messageId,
+        principalId: caller.principalId,
         executionRef: input.executionRef,
         status: "queued",
         resultText: null,
@@ -379,19 +504,27 @@ export class ConversationStore {
           action: "conversation:read",
         });
         if (decision.decision !== "ALLOW") return { denied: decision };
+        const convKey = conversationScopeKey(caller.scope);
         const rows = await tx.execute({
-          sql: "SELECT * FROM conversations WHERE agent_id = ? AND principal_id = ? AND scope_key = ? AND (created_at, id) > (?, ?) ORDER BY created_at, id LIMIT ?",
-          args: [
-            agentId,
-            caller.principalId,
-            scopeKey(caller.scope),
-            page.afterTime,
-            page.afterId,
-            page.limit + 1,
-          ],
+          sql: `SELECT DISTINCT c.* FROM conversations c
+                LEFT JOIN conversation_locations cl ON cl.conversation_id = c.id
+                WHERE c.agent_id = ? AND (cl.location_key = ? OR c.scope_key = ?)
+                AND (c.created_at, c.id) > (?, ?)
+                ORDER BY c.created_at, c.id LIMIT ?`,
+          args: [agentId, convKey, convKey, page.afterTime, page.afterId, page.limit + 1],
         });
+        const items = [];
+        for (const row of rows.rows) {
+          const auth = await authorizeConversation(
+            tx,
+            caller,
+            stringColumn(row, "id"),
+            "conversation:read",
+          );
+          if (!("denied" in auth)) items.push(row);
+        }
         return {
-          value: makePage(rows.rows, page.limit, (row) => conversationRecord(row, caller.scope)),
+          value: makePage(items, page.limit, (row) => conversationRecord(row, caller.scope)),
         };
       },
     );
@@ -439,8 +572,8 @@ export class ConversationStore {
         );
         if ("denied" in decision) return decision;
         const rows = await tx.execute({
-          sql: "SELECT * FROM runs WHERE conversation_id = ? AND (created_at, id) > (?, ?) ORDER BY created_at, id LIMIT ?",
-          args: [conversationId, page.afterTime, page.afterId, page.limit + 1],
+          sql: "SELECT * FROM runs WHERE conversation_id = ? AND principal_id = ? AND (created_at, id) > (?, ?) ORDER BY created_at, id LIMIT ?",
+          args: [conversationId, caller.principalId, page.afterTime, page.afterId, page.limit + 1],
         });
         return { value: makePage(rows.rows, page.limit, runRecord) };
       }),
@@ -479,6 +612,33 @@ export class ConversationStore {
     );
   }
 
+  /** Explicit incident response. Preserve the original record and append the
+   * exclusion decision; excluded exchanges cannot be reused by any Principal. */
+  async excludeRunFromContext(caller: CallerContext, runId: string): Promise<void> {
+    authorizedValue(
+      await this.db.transaction<AuthorizedResult<void>>(async (tx) => {
+        const authorization = await authorizeRun(tx, caller, runId, "run:control");
+        if ("denied" in authorization) return authorization;
+        const prior = await tx.execute({
+          sql: "SELECT event_id FROM ops_trace_events WHERE run_id = ? AND type = 'context.excluded' LIMIT 1",
+          args: [runId],
+        });
+        if (!prior.rows.length)
+          await tx.execute({
+            sql: "INSERT INTO ops_trace_events(event_id, ts, type, run_id, principal_id, data_json) VALUES (?, ?, 'context.excluded', ?, ?, ?)",
+            args: [
+              randomUUID(),
+              new Date().toISOString(),
+              runId,
+              caller.principalId,
+              JSON.stringify({ action: "Exclude Run Context", reason: "unsafe_runtime_context" }),
+            ],
+          });
+        return { value: undefined };
+      }),
+    );
+  }
+
   /** Load only this Run's input and earlier completed exchanges. Later queued
    * messages cannot become context before their own Run reaches execution. */
   async loadRunInput(caller: CallerContext, runId: string): Promise<RunInputRecord> {
@@ -498,14 +658,87 @@ export class ConversationStore {
         });
         const conversation = conversationRecord(conversations.rows[0]!, caller.scope);
         const earlier = await tx.execute({
-          sql: "SELECT messages.text, runs.result_text FROM runs JOIN messages ON messages.id = runs.message_id WHERE runs.conversation_id = ? AND runs.sequence < ? AND runs.status = 'succeeded' AND runs.result_text IS NOT NULL ORDER BY runs.sequence DESC LIMIT 20",
+          sql: "SELECT runs.id, runs.principal_id, runs.sequence, runs.message_id FROM runs WHERE runs.conversation_id = ? AND runs.sequence < ? AND runs.status = 'succeeded' AND runs.result_text IS NOT NULL AND NOT EXISTS (SELECT 1 FROM ops_trace_events e WHERE e.run_id = runs.id AND e.type = 'context.excluded') ORDER BY runs.sequence DESC LIMIT 20",
           args: [run.conversationId, row.sequence!],
         });
+        const callerLocationKey = conversationScopeKey(caller.scope);
         const exchanges: Array<{ user: string; assistant: string }> = [];
         let remaining = 32_000;
         for (const prior of earlier.rows) {
-          const user = stringColumn(prior, "text");
-          const assistant = stringColumn(prior, "result_text");
+          const priorPrincipalId = stringColumn(prior, "principal_id");
+          const priorRunId = stringColumn(prior, "id");
+          const priorMessageId = stringColumn(prior, "message_id");
+          let user: string;
+          let assistant: string;
+
+          const grantRows = await tx.execute({
+            sql: "SELECT d.grant_id, g.revoked_at FROM authorization_decisions d JOIN grants g ON g.id = d.grant_id WHERE d.run_id = ? AND d.decision = 'ALLOW'",
+            args: [priorRunId],
+          });
+          if (grantRows.rows.length === 0 || grantRows.rows.some((r) => r.revoked_at !== null)) {
+            continue;
+          }
+
+          const sources = await tx.execute({
+            sql: `SELECT DISTINCT resource_id, action FROM authorization_decisions WHERE run_id = ?
+              AND decision = 'ALLOW' AND action IN ('read', 'context:read', 'worker:read', 'worker:status', 'worker:file:read', 'task:read')`,
+            args: [priorRunId],
+          });
+          let permitted = true;
+          for (const source of sources.rows) {
+            const decision = await evaluate(tx, {
+              caller,
+              resourceId: stringColumn(source, "resource_id"),
+              action: stringColumn(source, "action"),
+              conversationId: run.conversationId,
+              runId,
+            });
+            if (decision.decision !== "ALLOW") {
+              permitted = false;
+              break;
+            }
+          }
+          if (!permitted) continue;
+
+          if (priorPrincipalId !== caller.principalId) {
+            const deliveryRows = await tx.execute({
+              sql: "SELECT payload_text, destination_scope_key FROM deliveries WHERE run_id = ? AND status = 'sent' AND payload_kind IN ('text', 'result') ORDER BY created_at DESC",
+              args: [priorRunId],
+            });
+            const matchingDelivery = deliveryRows.rows.find((dRow) =>
+              matchesDestinationLocation(
+                stringColumn(dRow, "destination_scope_key"),
+                callerLocationKey,
+              ),
+            );
+            if (!matchingDelivery) {
+              continue;
+            }
+            assistant = stringColumn(matchingDelivery, "payload_text");
+            const msgRows = await tx.execute({
+              sql: "SELECT text FROM messages WHERE id = ?",
+              args: [priorMessageId],
+            });
+            if (!msgRows.rows[0]) {
+              continue;
+            }
+            user = stringColumn(msgRows.rows[0], "text");
+          } else {
+            const contentRows = await tx.execute({
+              sql: "SELECT runs.result_text, messages.text FROM runs JOIN messages ON messages.id = runs.message_id WHERE runs.id = ?",
+              args: [priorRunId],
+            });
+            if (!contentRows.rows[0]) {
+              continue;
+            }
+            const assistantResult = stringColumn(contentRows.rows[0], "result_text");
+            if (!assistantResult) {
+              continue;
+            }
+            assistant = assistantResult;
+            user = stringColumn(contentRows.rows[0], "text");
+          }
+
           if (user.length + assistant.length > remaining) break;
           remaining -= user.length + assistant.length;
           exchanges.push({ user, assistant });
@@ -514,8 +747,11 @@ export class ConversationStore {
           { role: "user" as const, text: user },
           { role: "assistant" as const, text: assistant },
         ]);
+        const sessionPrincipal = conversation.providerSessionPrincipalId;
         const providerSessionId =
-          conversation.providerKind === run.executionRef ? conversation.providerSessionId : null;
+          conversation.providerKind === run.executionRef && sessionPrincipal === caller.principalId
+            ? conversation.providerSessionId
+            : null;
         return {
           value: {
             run,
@@ -523,6 +759,7 @@ export class ConversationStore {
               ...conversation,
               providerKind: providerSessionId ? run.executionRef : null,
               providerSessionId,
+              providerSessionPrincipalId: providerSessionId ? caller.principalId : null,
             },
             text: stringColumn(row, "input_text"),
             history,
@@ -552,8 +789,8 @@ export class ConversationStore {
         if (used.rows.length)
           throw new Error("Provider Session already belongs to a different Conversation");
         await tx.execute({
-          sql: "UPDATE conversations SET provider_kind = ?, provider_session_id = ? WHERE id = ?",
-          args: [providerKind, providerSessionId, conversationId],
+          sql: "UPDATE conversations SET provider_kind = ?, provider_session_id = ?, provider_session_principal_id = ? WHERE id = ?",
+          args: [providerKind, providerSessionId, caller.principalId, conversationId],
         });
         return { value: undefined };
       }),

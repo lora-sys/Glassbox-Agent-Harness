@@ -28,6 +28,7 @@ export function executionInput(overrides: Partial<ExecutionInput> = {}): Executi
       id: "run",
       conversationId: "conversation",
       messageId: "message",
+      principalId: "owner",
       executionRef: "claude-local",
       status: "running",
       resultText: null,

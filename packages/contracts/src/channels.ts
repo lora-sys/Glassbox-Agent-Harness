@@ -13,6 +13,7 @@ export const CHANNEL_SAFE_ERRORS = {
 export type ChannelSafeError = (typeof CHANNEL_SAFE_ERRORS)[keyof typeof CHANNEL_SAFE_ERRORS];
 
 export interface ChannelSaveInput {
+  visitorIds?: string[];
   id: string;
   label: string;
   kind: "qq-onebot";

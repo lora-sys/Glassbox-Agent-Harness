@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { main } from "./cli/main.js";
 import { CliError } from "./cli/errors.js";
 import { getGlassboxDataDir } from "./platform/paths.js";
-import { serverPort } from "./management/runtime.js";
+import { serverPort } from "./config/server-port.js";
 
 process.exitCode = await main(process.argv.slice(2), {
   resolveConnection: async () => {

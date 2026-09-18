@@ -4,17 +4,13 @@ import { randomBytes } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 import lockfile from "proper-lockfile";
 import { ModelProfileStore } from "../config/model-profiles.js";
+import { loadAgentOperations } from "../config/agent-operations.js";
 import { createManagementAccess, loadManagementToken, ManagementError } from "./access.js";
 import { createManagementHandler } from "./http.js";
 import { ManagementApplication } from "./application.js";
 import type { RunExecutionAdapter } from "../execution/run-service/types.js";
 
-export function serverPort(value = process.env.PORT ?? "3030"): number {
-  if (!/^\d{1,5}$/u.test(value)) throw new Error("PORT must be an integer between 0 and 65535");
-  const port = Number(value);
-  if (port > 65535) throw new Error("PORT must be an integer between 0 and 65535");
-  return port;
-}
+export { serverPort } from "../config/server-port.js";
 
 /** One service owns each data directory. CLI clients never open its settings for writing. */
 export async function openManagementRuntime(options: {
@@ -41,6 +37,7 @@ export async function openManagementRuntime(options: {
       models,
       databasePath: options.databasePath,
       executors: options.executors,
+      ops: await loadAgentOperations(options.dataDirectory, options.databasePath),
     });
     let authorize = createManagementAccess({
       token,

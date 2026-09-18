@@ -4,6 +4,7 @@ export interface OneBotConnectionConfig {
   endpoint: string;
   botId: string;
   ownerId: string;
+  visitorIds: readonly string[];
   groupIds: readonly string[];
   credentialSlot: string;
   allowRemote: boolean;
@@ -54,6 +55,16 @@ export function parseOneBotConfig(value: unknown): OneBotConnectionConfig {
   const groups = config.groupIds.map(qqId);
   if (groups.some((group) => group === undefined))
     throw new OneBotConfigurationError("Invalid allowed group number");
+  const visitorValues = config.visitorIds ?? [];
+  if (!Array.isArray(visitorValues) || visitorValues.length > 64)
+    throw new OneBotConfigurationError("Configure at most 64 Visitor QQ numbers");
+  const visitors = visitorValues.map(qqId);
+  if (
+    visitors.some((visitor) => visitor === undefined) ||
+    visitors.includes(ownerId) ||
+    visitors.includes(botId)
+  )
+    throw new OneBotConfigurationError("Invalid Visitor QQ number");
   if (config.allowRemote !== undefined && typeof config.allowRemote !== "boolean")
     throw new OneBotConfigurationError("Invalid remote connection setting");
   const allowRemote = config.allowRemote === true;
@@ -91,6 +102,7 @@ export function parseOneBotConfig(value: unknown): OneBotConnectionConfig {
     endpoint: endpoint.href,
     botId,
     ownerId,
+    visitorIds: Object.freeze([...new Set(visitors as string[])]),
     groupIds: Object.freeze([...new Set(groups as string[])]),
     credentialSlot: identifier(config.credentialSlot, "credential slot"),
     allowRemote,

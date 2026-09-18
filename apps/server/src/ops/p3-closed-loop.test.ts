@@ -2,16 +2,13 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vite-plus/test";
-import {
-  PRIVATE_CANARY,
-  type Audience,
-} from "@glassbox/contracts";
+import { type Audience } from "@glassbox/contracts";
 import { openDomainStore, type DomainStore } from "../persistence/index.js";
 import { parseOneBotConfig } from "../channels/onebot/config.js";
 import { normalizeOneBotMessage } from "../channels/onebot/normalize.js";
 import { FakeHerdrBridge } from "./fake-herdr-bridge.js";
 import { OpsReconciler } from "./reconciler.js";
-import { assertCanarySafety, checkDelivery } from "../delivery/gate.js";
+import { checkDelivery } from "../delivery/gate.js";
 import {
   CANARY_RESOURCE_ID,
   CANARY_SECRET_VALUE,
@@ -27,6 +24,13 @@ import {
 
 const stores: DomainStore[] = [];
 const tempDirs: string[] = [];
+const PRIVATE_CANARY = CANARY_SECRET_VALUE;
+
+function assertCanarySafety(text: string, audience: Audience, privateReadAllowed: boolean): void {
+  if (text.includes(PRIVATE_CANARY) && (audience.kind !== "private" || !privateReadAllowed)) {
+    throw new Error("SECURITY LEAK: private canary reached an unauthorized audience");
+  }
+}
 
 async function createStore(dbPath = ":memory:"): Promise<DomainStore> {
   const store = await openDomainStore({ databasePath: dbPath });
@@ -55,6 +59,7 @@ describe("P3.0 Test Harness, Contracts, and Minimal Closed Loop", () => {
       endpoint: "ws://127.0.0.1:6700/",
       botId: FIXTURE_BOT_ID,
       ownerId: FIXTURE_OWNER_ID,
+      visitorIds: ["20002"],
       groupIds: [FIXTURE_GROUP_ID],
       credentialSlot: "qq-token",
       allowRemote: false,
@@ -182,17 +187,32 @@ describe("P3.0 Test Harness, Contracts, and Minimal Closed Loop", () => {
     // 4. Delivery gate check:
     const groupAudience: Audience = {
       kind: "group",
-      destinationScopeKey: JSON.stringify([FIXTURE_CONNECTION_ID, FIXTURE_BOT_ID, "group", FIXTURE_GROUP_ID]),
+      destinationScopeKey: JSON.stringify([
+        FIXTURE_CONNECTION_ID,
+        FIXTURE_BOT_ID,
+        "group",
+        FIXTURE_GROUP_ID,
+      ]),
       allowedPrincipals: ["owner", "visitor"],
     };
     const visitorAudience: Audience = {
       kind: "private",
-      destinationScopeKey: JSON.stringify([FIXTURE_CONNECTION_ID, FIXTURE_BOT_ID, "private", "20002"]),
+      destinationScopeKey: JSON.stringify([
+        FIXTURE_CONNECTION_ID,
+        FIXTURE_BOT_ID,
+        "private",
+        "20002",
+      ]),
       allowedPrincipals: ["visitor"],
     };
     const ownerPrivateAudience: Audience = {
       kind: "private",
-      destinationScopeKey: JSON.stringify([FIXTURE_CONNECTION_ID, FIXTURE_BOT_ID, "private", FIXTURE_OWNER_ID]),
+      destinationScopeKey: JSON.stringify([
+        FIXTURE_CONNECTION_ID,
+        FIXTURE_BOT_ID,
+        "private",
+        FIXTURE_OWNER_ID,
+      ]),
       allowedPrincipals: ["owner"],
     };
 
@@ -308,6 +328,8 @@ describe("P3.0 Test Harness, Contracts, and Minimal Closed Loop", () => {
 
     // 5. Review Action: REWORK
     // Reviewer requests rework without losing prior attempt history
+    await store.tasks.updateAttemptStatus(attempt1.id, "review", "Completed initial draft");
+    const priorEvidence = await store.tasks.getAttempt(attempt1.id);
     await reconciler.reworkTask(task.id, "AST visitor is incomplete; add visitor tests");
 
     updatedTask = await store.tasks.getTask(task.id);
@@ -317,7 +339,9 @@ describe("P3.0 Test Harness, Contracts, and Minimal Closed Loop", () => {
     expect(allAttempts).toHaveLength(2);
     expect(allAttempts[0].attemptNumber).toBe(1);
     expect(allAttempts[0].status).toBe("review");
-    expect(allAttempts[0].resultSummary).toContain("Rework requested");
+    expect(allAttempts[0].resultSummary).toBe("Completed initial draft");
+    expect(allAttempts[0].completedAt).toBe(priorEvidence?.completedAt);
+    expect(allAttempts[1].reworkReason).toBe("AST visitor is incomplete; add visitor tests");
     expect(allAttempts[1].attemptNumber).toBe(2);
     expect(allAttempts[1].status).toBe("running");
 

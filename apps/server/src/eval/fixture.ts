@@ -38,6 +38,7 @@ export async function openEvalFixture(
   for (const action of [
     "run:create",
     "run:control",
+    "delivery:send",
     "conversation:read",
     "trace:write",
     "eval:write",

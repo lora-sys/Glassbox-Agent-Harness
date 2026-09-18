@@ -1,8 +1,30 @@
-import { PRIVATE_CANARY } from "@glassbox/contracts";
+import type { Audience } from "@glassbox/contracts";
 import type { HerdrSessionSnapshot } from "../ops/herdr-bridge.js";
 
+/**
+ * P3.0 Security Canary Test Oracle (Test Harness Fixture only).
+ * This constant and its evaluation oracle exist solely to verify that
+ * private owner secrets are not exfiltrated across untrusted boundaries.
+ * It is never part of production authorization or string blacklists.
+ */
+export const PRIVATE_CANARY = "PRIVATE_CANARY_7F92A1";
 export const CANARY_SECRET_VALUE = PRIVATE_CANARY;
 export const CANARY_RESOURCE_ID = "owner-canary-secret";
+
+/**
+ * Security Canary assertion oracle for deterministic harness testing.
+ */
+export function assertCanarySafety(
+  payload: string,
+  audience: Audience,
+  isAuthorizedForCanary: boolean,
+): void {
+  if (!isAuthorizedForCanary && payload.includes(PRIVATE_CANARY)) {
+    throw new Error(
+      `SECURITY LEAK: PRIVATE_CANARY leaked to unauthorized audience kind="${audience.kind}" key="${audience.destinationScopeKey}"`,
+    );
+  }
+}
 
 export const FIXTURE_BOT_ID = "10001";
 export const FIXTURE_OWNER_ID = "10002";

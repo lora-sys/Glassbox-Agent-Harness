@@ -26,7 +26,6 @@ export type {
   ChannelSaveInput,
   PublicChannelProfile,
 } from "./channels.js";
-export { PRIVATE_CANARY } from "./domain.js";
 export type {
   PrincipalKind,
   Principal,

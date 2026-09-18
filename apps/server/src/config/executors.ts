@@ -329,6 +329,7 @@ export class ExecutorConfiguration {
             id,
             conversationId: id,
             messageId: id,
+            principalId: "owner",
             executionRef: "claude-code",
             status: "running",
             resultText: null,

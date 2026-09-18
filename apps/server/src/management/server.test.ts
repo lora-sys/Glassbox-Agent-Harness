@@ -78,6 +78,29 @@ describe("local service integration", () => {
     ).rejects.toMatchObject({ code: "ELOCKED" });
   });
 
+  it("keeps Ops grant and revoke actions behind management authentication", async () => {
+    for (const path of ["/manage/ops/grants", "/manage/ops/grants/example/revoke"]) {
+      expect(
+        (
+          await fetch(`${baseUrl}${path}`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: "{}",
+          })
+        ).status,
+      ).toBe(401);
+    }
+    expect(
+      (
+        await fetch(`${baseUrl}/manage/ops/grants`, {
+          method: "POST",
+          headers: headers(),
+          body: JSON.stringify({ principalId: "owner", actions: ["raw-shell"] }),
+        })
+      ).status,
+    ).toBe(400);
+  });
+
   it("CLI reads the same profiles without exposing credentials", async () => {
     const response = await fetch(`${baseUrl}/manage/models`, {
       method: "POST",

@@ -41,6 +41,18 @@ export function scopeKey(scope: TrustedChannelScope): string {
   ]);
 }
 
+/** Durable conversation location key. In groups, senders share the conversation location. */
+export function conversationScopeKey(scope: TrustedChannelScope): string {
+  validateScope(scope);
+  return JSON.stringify([
+    scope.connectionId,
+    scope.botId,
+    scope.chatType,
+    scope.chatId,
+    scope.threadId ?? null,
+  ]);
+}
+
 export function identityKey(
   scope: Pick<TrustedChannelScope, "connectionId" | "botId" | "senderId">,
 ): string {

@@ -19,7 +19,10 @@ export class FakeHerdrBridge implements HerdrBridge {
   private readonly sessionId: string;
   private readonly workspaces = new Map<string, Map<string, InternalPane>>();
   private readonly subscribers = new Map<string, (event: HerdrEvent) => void>();
-  private readonly stateWaiters = new Map<string, Array<{ state: HerdrAgentLifecycleState; resolve: () => void }>>();
+  private readonly stateWaiters = new Map<
+    string,
+    Array<{ state: HerdrAgentLifecycleState; resolve: () => void }>
+  >();
 
   constructor(sessionId = "fake-herdr-session") {
     this.sessionId = sessionId;
@@ -123,9 +126,11 @@ export class FakeHerdrBridge implements HerdrBridge {
     return { paneId, agentName };
   }
 
-  async promptAgent(params: { paneId: string; prompt: string }): Promise<void> {
+  async promptAgent(params: { paneId: string; agentName?: string; prompt: string }): Promise<void> {
     const pane = this.findPane(params.paneId);
     if (!pane) throw new Error(`Pane not found: ${params.paneId}`);
+    if (params.agentName && params.agentName !== pane.agentName)
+      throw new Error("Herdr agent identity mismatch");
     pane.lastPrompt = params.prompt;
     pane.state = "working";
     this.emit({
@@ -139,16 +144,24 @@ export class FakeHerdrBridge implements HerdrBridge {
     });
   }
 
-  async readAgent(params: { paneId: string }): Promise<{ output: string; state: HerdrAgentLifecycleState }> {
+  async readAgent(params: {
+    paneId: string;
+    agentName?: string;
+  }): Promise<{ output: string; state: HerdrAgentLifecycleState }> {
     const pane = this.findPane(params.paneId);
     if (!pane) throw new Error(`Pane not found: ${params.paneId}`);
+    if (params.agentName && params.agentName !== pane.agentName)
+      throw new Error("Herdr agent identity mismatch");
     return {
       output: pane.outputBuffer.join(""),
       state: pane.state,
     };
   }
 
-  async waitAgent(params: { paneId: string; timeoutMs?: number }): Promise<{ state: HerdrAgentLifecycleState }> {
+  async waitAgent(params: {
+    paneId: string;
+    timeoutMs?: number;
+  }): Promise<{ state: HerdrAgentLifecycleState }> {
     const pane = this.findPane(params.paneId);
     if (!pane) throw new Error(`Pane not found: ${params.paneId}`);
     if (pane.state === "done" || pane.state === "blocked") {
@@ -174,9 +187,11 @@ export class FakeHerdrBridge implements HerdrBridge {
     });
   }
 
-  async stopAgent(params: { paneId: string }): Promise<void> {
+  async stopAgent(params: { paneId: string; agentName?: string }): Promise<void> {
     const pane = this.findPane(params.paneId);
     if (!pane) return;
+    if (params.agentName && params.agentName !== pane.agentName)
+      throw new Error("Herdr agent identity mismatch");
     pane.state = "idle";
     this.emit({
       type: "agent.state",
@@ -230,6 +245,10 @@ export class FakeHerdrBridge implements HerdrBridge {
       text,
       timestamp: new Date().toISOString(),
     });
+  }
+
+  simulateEvent(event: HerdrEvent): void {
+    this.emit(event);
   }
 
   private findPane(paneId: string): InternalPane | undefined {

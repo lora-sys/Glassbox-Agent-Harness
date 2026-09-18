@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
-import type { Row } from "@libsql/client";
-import { authorizedValue, type AuthorizedResult } from "../auth/service.js";
+import type { Row, Transaction } from "@libsql/client";
+import { authorizedValue, evaluate, type AuthorizedResult } from "../auth/service.js";
 import {
   requireIdentifier,
+  validateScope,
   scopeKey,
   type CallerContext,
   type TrustedChannelScope,
@@ -117,6 +118,50 @@ const deliveryTransitions: Record<DeliveryStatus, readonly DeliveryStatus[]> = {
 export class LifecycleStore {
   constructor(private readonly db: DomainDatabase) {}
 
+  private async authorizeDeliverySources(
+    tx: Transaction,
+    caller: CallerContext,
+    runId: string,
+  ): Promise<AuthorizedResult<null>> {
+    // Authorization evidence conservatively records every protected read admitted
+    // to this Run. Model text cannot remove a dependency from this set.
+    const sources = await tx.execute({
+      sql: `SELECT DISTINCT resource_id, action FROM authorization_decisions WHERE run_id = ? AND principal_id = ?
+        AND decision = 'ALLOW' AND action IN ('read', 'context:read', 'worker:read', 'worker:status', 'worker:file:read', 'task:read')`,
+      args: [runId, caller.principalId],
+    });
+    for (const source of sources.rows) {
+      for (const action of [stringColumn(source, "action"), "delivery:send"]) {
+        const decision = await evaluate(tx, {
+          caller,
+          runId,
+          resourceId: stringColumn(source, "resource_id"),
+          action,
+        });
+        if (decision.decision !== "ALLOW") return { denied: decision };
+      }
+    }
+    return { value: null };
+  }
+
+  /** Internal runtime evidence routing, constrained to the persisted Run actor. */
+  async traceCaller(runId: string, principalId?: string): Promise<CallerContext> {
+    return authorizedValue(
+      await this.db.transaction<AuthorizedResult<CallerContext>>(async (tx) => {
+        const rows = await tx.execute({
+          sql: "SELECT scope_json, principal_id FROM runs WHERE id = ? AND (? IS NULL OR principal_id = ?)",
+          args: [runId, principalId ?? null, principalId ?? null],
+        });
+        if (!rows.rows[0]) throw new Error("Runtime trace actor mismatch");
+        const scope = JSON.parse(stringColumn(rows.rows[0], "scope_json")) as TrustedChannelScope;
+        validateScope(scope);
+        const caller = { principalId: stringColumn(rows.rows[0], "principal_id"), scope };
+        const authorization = await authorizeRun(tx, caller, runId, "trace:write");
+        return "denied" in authorization ? authorization : { value: caller };
+      }),
+    );
+  }
+
   /** Supervisor-only queue metadata. No message, result or provider state is read.
    * Use a single server owner; this method is not a channel-facing query API. */
   async listRunRoutes(statuses: readonly RunStatus[], afterSequence = 0): Promise<RunRoute[]> {
@@ -129,7 +174,7 @@ export class LifecycleStore {
       throw new Error("Invalid queue query");
     return this.db.transaction(async (tx) => {
       const rows = await tx.execute({
-        sql: `SELECT runs.id, runs.conversation_id, runs.sequence, conversations.principal_id, conversations.scope_json FROM runs JOIN conversations ON conversations.id = runs.conversation_id WHERE runs.status IN (${statuses.map(() => "?").join(",")}) AND runs.sequence > ? ORDER BY runs.sequence LIMIT 100`,
+        sql: `SELECT runs.id, runs.conversation_id, runs.sequence, runs.principal_id, runs.scope_json FROM runs WHERE runs.status IN (${statuses.map(() => "?").join(",")}) AND runs.sequence > ? ORDER BY runs.sequence LIMIT 100`,
         args: [...statuses, afterSequence],
       });
       return rows.rows.map((row) => {
@@ -209,10 +254,12 @@ export class LifecycleStore {
   ): Promise<DeliveryLease | null> {
     const delivery = authorizedValue(
       await this.db.transaction<AuthorizedResult<DeliveryRecord | null>>(async (tx) => {
-        for (const action of ["conversation:read", "run:create", "run:control"]) {
+        for (const action of ["conversation:read", "run:create", "run:control", "delivery:send"]) {
           const decision = await authorizeRun(tx, caller, runId, action);
           if ("denied" in decision) return decision;
         }
+        const sources = await this.authorizeDeliverySources(tx, caller, runId);
+        if ("denied" in sources) return sources;
         const changed = await tx.execute({
           sql: "UPDATE deliveries SET status = 'sending', updated_at = ? WHERE id = ? AND run_id = ? AND destination_scope_key = ? AND status = 'pending'",
           args: [new Date().toISOString(), deliveryId, runId, scopeKey(caller.scope)],
@@ -354,6 +401,10 @@ export class LifecycleStore {
       await this.db.transaction<AuthorizedResult<string>>(async (tx) => {
         const decision = await authorizeRun(tx, caller, input.runId, "run:control");
         if ("denied" in decision) return decision;
+        const deliveryDecision = await authorizeRun(tx, caller, input.runId, "delivery:send");
+        if ("denied" in deliveryDecision) return deliveryDecision;
+        const sources = await this.authorizeDeliverySources(tx, caller, input.runId);
+        if ("denied" in sources) return sources;
         const id = randomUUID();
         const now = new Date().toISOString();
         await tx.execute({
@@ -400,6 +451,10 @@ export class LifecycleStore {
       await this.db.transaction<AuthorizedResult<void>>(async (tx) => {
         const decision = await authorizeRun(tx, caller, runId, "run:control");
         if ("denied" in decision) return decision;
+        const deliveryDecision = await authorizeRun(tx, caller, runId, "delivery:send");
+        if ("denied" in deliveryDecision) return deliveryDecision;
+        const sources = await this.authorizeDeliverySources(tx, caller, runId);
+        if ("denied" in sources) return sources;
         const result = await tx.execute({
           sql: "UPDATE deliveries SET status = ?, external_id = COALESCE(?, external_id), updated_at = ? WHERE id = ? AND run_id = ? AND destination_scope_key = ? AND status = ?",
           args: [

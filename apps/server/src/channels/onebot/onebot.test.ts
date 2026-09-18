@@ -12,6 +12,7 @@ const base = {
   endpoint: "ws://127.0.0.1:6700/",
   botId: "10001",
   ownerId: "10002",
+  visitorIds: ["10004"],
   groupIds: ["10003"],
   credentialSlot: "qq-token",
   allowRemote: false,
@@ -210,6 +211,25 @@ describe("OneBot normalization", () => {
       message: { scope: { ...groupScope, chatType: "private", chatId: "10002" }, text: "私密内容" },
     });
   });
+  it("routes an allowlisted Visitor DM as a distinct channel identity", () => {
+    expect(
+      normalizeOneBotMessage(
+        inbound({
+          user_id: 10004,
+          message_type: "private",
+          sub_type: "friend",
+          message: "访客问题",
+        }),
+        config,
+      ),
+    ).toMatchObject({
+      kind: "message",
+      message: {
+        scope: { chatType: "private", chatId: "10004", senderId: "10004" },
+        text: "访客问题",
+      },
+    });
+  });
   it("parses CQ @ and preserves escaped CQ text as text", () => {
     expect(
       normalizeOneBotMessage(
@@ -386,6 +406,37 @@ describe("OneBot forward WebSocket", () => {
     expect(
       (await fake.actions.next((action) => action.action === "send_private_msg")).params,
     ).toMatchObject({ user_id: 10002 });
+  });
+  it("replies privately to the Visitor and rejects cross-account private destinations", async () => {
+    const fake = await server();
+    const { adapter } = client(fake.endpoint);
+    await adapter.start();
+    const target = {
+      ...groupScope,
+      chatType: "private" as const,
+      senderId: "10004",
+      chatId: "10004",
+    };
+    expect(
+      await adapter.send({ deliveryId: "visitor-dm", target, text: "Visitor result" }),
+    ).toEqual({ status: "confirmed", messageId: "321" });
+    expect(
+      (await fake.actions.next((action) => action.action === "send_private_msg")).params,
+    ).toMatchObject({ user_id: 10004 });
+    for (const mismatched of [
+      { ...target, chatId: base.ownerId },
+      { ...target, senderId: base.ownerId },
+    ]) {
+      expect(
+        await adapter.send({ deliveryId: "wrong-dm", target: mismatched, text: "secret" }),
+      ).toEqual({ status: "failed", code: "invalid_target" });
+    }
+    expect(fake.history).toHaveLength(2);
+  });
+  it("rejects a Bot configured as a Visitor", () => {
+    expect(() => parseOneBotConfig({ ...base, visitorIds: [base.botId] })).toThrow(
+      "Invalid Visitor",
+    );
   });
   it("correlates concurrent responses by echo even when responses are reversed", async () => {
     const fake = await server({ onAction: (action) => action.action !== "get_login_info" });

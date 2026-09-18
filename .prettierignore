@@ -9,5 +9,6 @@ CLAUDE.md
 # Upstream and assets
 upstream/
 .agy-staff/
+.dispatch/
 assets/
 .visual-fix/

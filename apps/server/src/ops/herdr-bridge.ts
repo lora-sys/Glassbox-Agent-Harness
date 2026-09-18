@@ -36,15 +36,23 @@ export interface HerdrBridge {
   disconnect(): Promise<void>;
   isConnected(): boolean;
   subscribe(onEvent: (event: HerdrEvent) => void): Promise<{ subscriptionId: string }>;
+  unsubscribe(subscriptionId: string): void | Promise<void>;
   getSnapshot(): Promise<HerdrSessionSnapshot>;
   startAgent(params: {
     workspaceId: string;
     agentKind: string;
     worktreePath?: string;
     branch?: string;
-  }): Promise<{ paneId: string; agentName: string }>;
-  promptAgent(params: { paneId: string; prompt: string }): Promise<void>;
-  readAgent(params: { paneId: string }): Promise<{ output: string; state: HerdrAgentLifecycleState }>;
-  waitAgent(params: { paneId: string; timeoutMs?: number }): Promise<{ state: HerdrAgentLifecycleState }>;
-  stopAgent(params: { paneId: string }): Promise<void>;
+    workerContextFile?: string;
+  }): Promise<{ paneId: string; agentName: string; runtimeEvidence?: Record<string, unknown> }>;
+  promptAgent(params: { paneId: string; agentName?: string; prompt: string }): Promise<void>;
+  readAgent(params: {
+    paneId: string;
+    agentName?: string;
+  }): Promise<{ output: string; state: HerdrAgentLifecycleState }>;
+  waitAgent(params: {
+    paneId: string;
+    timeoutMs?: number;
+  }): Promise<{ state: HerdrAgentLifecycleState }>;
+  stopAgent(params: { paneId: string; agentName?: string }): Promise<void>;
 }

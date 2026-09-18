@@ -22,11 +22,22 @@ const input = {
   endpoint: "ws://127.0.0.1:6700/",
   botId: "12345",
   ownerId: "54321",
+  visitorIds: [],
   groupIds: ["77777"],
   executionRef: "claude-code",
 };
 
 describe("server-owned channel profiles", () => {
+  it("persists explicit Visitors and a Pi model reference across reopen", async () => {
+    const { directory, store } = await fixture();
+    await store.save({ ...input, visitorIds: ["54322"], executionRef: "pi:personal" });
+    const reopened = await ChannelProfileStore.open(directory);
+    expect(reopened.resolve(input.id)).toMatchObject({
+      executionRef: "pi:personal",
+      config: { visitorIds: ["54322"] },
+    });
+    expect(() => store.save({ ...input, visitorIds: [input.botId] })).toThrow();
+  });
   it("persists configuration and credentials without exposing secrets or implying a connection", async () => {
     const { directory, store } = await fixture();
     const saved = await store.save({ ...input, token: "fixture-qq-private-token" });

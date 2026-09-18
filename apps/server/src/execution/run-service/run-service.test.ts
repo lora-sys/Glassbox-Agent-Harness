@@ -86,7 +86,7 @@ async function fixture(databasePath = ":memory:") {
   await store.identities.bindOwner("owner", group);
   const grants = new Map<string, string>();
   for (const scope of [group, privateScope, otherGroup]) {
-    for (const action of ["run:create", "run:control", "conversation:read"]) {
+    for (const action of ["run:create", "run:control", "delivery:send", "conversation:read"]) {
       const id = await store.authorization.grant({
         principalId: "owner",
         resourceId: agentResourceId("personal"),

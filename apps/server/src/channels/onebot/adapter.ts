@@ -178,10 +178,11 @@ export class OneBotAdapter {
       !target ||
       target.connectionId !== this.config.connectionId ||
       target.botId !== this.config.botId ||
-      target.senderId !== this.config.ownerId ||
+      (target.senderId !== this.config.ownerId &&
+        !this.config.visitorIds.includes(target.senderId)) ||
       target.threadId !== undefined ||
       (target.chatType === "private"
-        ? target.chatId !== this.config.ownerId
+        ? target.chatId !== target.senderId
         : target.chatType !== "group" || !this.config.groupIds.includes(target.chatId))
     )
       return { status: "failed", code: "invalid_target" };

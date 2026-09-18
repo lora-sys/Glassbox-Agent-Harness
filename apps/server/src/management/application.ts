@@ -15,6 +15,12 @@ import {
   type RunServiceEvent,
 } from "../execution/run-service/index.js";
 import { configuredModelAdapter } from "../execution/model-adapter.js";
+import { PiRunExecutionAdapter, PiSdkRuntimeAdapter } from "../runtime/pi/index.js";
+import { configuredPiModel } from "../runtime/pi/configured-model.js";
+import { createOpsTools, type WorkerTarget } from "../runtime/pi/ops-tools.js";
+import { AuthorizedOpsService, type WorkerPolicy } from "../ops/service.js";
+import { OpsReconciler } from "../ops/reconciler.js";
+import type { HerdrBridge } from "../ops/herdr-bridge.js";
 import {
   openDomainStore,
   agentResourceId,
@@ -26,12 +32,14 @@ import { RunTraceStore } from "../trace/run-store.js";
 import { createRunEvaluator, RunEvalError } from "../eval/index.js";
 import { ManagementError } from "./access.js";
 import { readManagementJson } from "./http.js";
+import { grantOpsPermissions } from "./ops-grants.js";
 
 const OWNER_ID = "owner";
 const AGENT_ID = "personal";
 const ACTIONS = [
   "run:create",
   "run:control",
+  "delivery:send",
   "conversation:read",
   "trace:write",
   "eval:write",
@@ -76,6 +84,7 @@ export class ManagementApplication {
       dataDirectory: string;
       models: ModelProfileStore;
       executors?: ReadonlyMap<string, RunExecutionAdapter>;
+      ops?: { bridge: HerdrBridge; workerTarget: WorkerTarget; workerPolicy?: WorkerPolicy };
     },
     store: DomainStore,
     channels: ChannelProfileStore,
@@ -114,6 +123,7 @@ export class ManagementApplication {
     databasePath?: string;
     models: ModelProfileStore;
     executors?: ReadonlyMap<string, RunExecutionAdapter>;
+    ops?: { bridge: HerdrBridge; workerTarget: WorkerTarget; workerPolicy?: WorkerPolicy };
   }): Promise<ManagementApplication> {
     const channels = await ChannelProfileStore.open(options.dataDirectory);
     const store = await openDomainStore({
@@ -132,6 +142,11 @@ export class ManagementApplication {
         },
       });
       await store.conversations.createAgent(AGENT_ID);
+      if (options.ops) {
+        await options.ops.bridge.connect();
+        application.opsReconciler = new OpsReconciler(store.tasks, options.ops.bridge);
+        await application.opsReconciler.start();
+      }
       // Restore transport before durable queue dispatch. Incoming events wait for that same gate.
       for (const channel of channels.list()) {
         if (channel.autoConnect)
@@ -147,10 +162,51 @@ export class ManagementApplication {
     }
   }
 
+  private readonly piAdapters = new Map<string, PiRunExecutionAdapter>();
+  private opsReconciler?: OpsReconciler;
+
+  private getOrCreateDefaultPiAdapter(profileId: string): PiRunExecutionAdapter {
+    const existing = this.piAdapters.get(profileId);
+    if (existing) return existing;
+    const runtime = new PiSdkRuntimeAdapter({
+      runtimeBaseDir: join(this.options.dataDirectory, "pi"),
+      resolveModel: () => configuredPiModel(this.options.models, profileId),
+      createTools: this.options.ops
+        ? (getContext) =>
+            createOpsTools({
+              store: this.store,
+              service: new AuthorizedOpsService(
+                this.store,
+                this.options.ops!.bridge,
+                this.options.ops!.workerPolicy,
+              ),
+              workerTarget: this.options.ops!.workerTarget,
+              getContext,
+            })
+        : undefined,
+      onEvent: async (event) => {
+        const runId =
+          event.runId ?? (typeof event.data.runId === "string" ? event.data.runId : undefined);
+        if (!runId || !event.principalId) throw new Error("Pi trace identity missing");
+        const caller = await this.store.lifecycle.traceCaller(runId, event.principalId);
+        const cursor = await this.trace.append(runId, event, "pi");
+        await this.store.evidence.advanceTrace(caller, cursor);
+      },
+    });
+    const adapter = new PiRunExecutionAdapter(runtime);
+    this.piAdapters.set(profileId, adapter);
+    return adapter;
+  }
+
   private execution(reference: string): RunExecutionAdapter | undefined {
     const harness = this.options.executors?.get(reference);
     if (harness) return harness;
     if (reference === "claude-code") return this.executors.adapter();
+    if (reference.startsWith("pi:")) {
+      const profileId = reference.slice(3);
+      if (!this.options.models.list().some((profile) => profile.id === profileId)) return undefined;
+      return this.getOrCreateDefaultPiAdapter(profileId);
+    }
     if (!reference.startsWith("model:")) return undefined;
     const profileId = reference.slice(6);
     if (!this.options.models.list().some((profile) => profile.id === profileId)) return undefined;
@@ -201,7 +257,7 @@ export class ManagementApplication {
       return;
     }
     if (!("runId" in event)) return;
-    const caller = await this.store.management.runCaller(OWNER_ID, event.runId);
+    const caller = await this.store.lifecycle.traceCaller(event.runId);
     // Denials and revoked grants remain in the authorization ledger. No withheld output is copied here.
     if (!caller) return;
     const cursor = await this.trace.append(event.runId, event, "glassbox-run");
@@ -310,6 +366,21 @@ export class ManagementApplication {
       if (remember) {
         await this.store.identities.bindOwner(OWNER_ID, identity);
         for (const scope of scopes) await this.grantScope(scope);
+        for (const visitorId of configured.config.visitorIds) {
+          const principalId = `qq-visitor-${visitorId}`;
+          const visitorIdentity = { ...identity, senderId: visitorId };
+          await this.store.identities.createPrincipal(principalId, "visitor");
+          await this.store.identities.bindPrincipal(principalId, visitorIdentity);
+          const visitorScopes: TrustedChannelScope[] = [
+            { ...visitorIdentity, chatType: "private", chatId: visitorId },
+            ...configured.config.groupIds.map((chatId) => ({
+              ...visitorIdentity,
+              chatType: "group" as const,
+              chatId,
+            })),
+          ];
+          for (const scope of visitorScopes) await this.grantScope(scope, principalId);
+        }
         await this.channels.setAutoConnect(id, true);
       }
       connectionAccepted = true;
@@ -331,9 +402,10 @@ export class ManagementApplication {
     }
   }
 
-  private async grantScope(scope: TrustedChannelScope) {
-    const caller: CallerContext = { principalId: OWNER_ID, scope };
+  private async grantScope(scope: TrustedChannelScope, principalId = OWNER_ID) {
+    const caller: CallerContext = { principalId, scope };
     for (const action of ACTIONS) {
+      if (principalId !== OWNER_ID && action === "eval:write") continue;
       const existing = await this.store.authorization.check({
         caller,
         resourceId: agentResourceId(AGENT_ID),
@@ -341,7 +413,7 @@ export class ManagementApplication {
       });
       if (existing.decision !== "ALLOW")
         await this.store.authorization.grant({
-          principalId: OWNER_ID,
+          principalId,
           resourceId: agentResourceId(AGENT_ID),
           action,
           scope,
@@ -379,6 +451,24 @@ export class ManagementApplication {
   async route(request: IncomingMessage): Promise<{ status: number; body: unknown } | undefined> {
     const url = new URL(request.url ?? "/", "http://localhost");
     const path = url.pathname;
+    if (request.method === "POST" && path === "/manage/ops/grants") {
+      const result = await grantOpsPermissions(
+        this.store,
+        this.options.ops?.workerPolicy,
+        await readManagementJson(request),
+      );
+      return { status: 200, body: result };
+    }
+    const revokeOpsGrant = /^\/manage\/ops\/grants\/([a-zA-Z0-9-]{1,80})\/revoke$/u.exec(path);
+    if (request.method === "POST" && revokeOpsGrant) {
+      await this.store.authorization.revoke(revokeOpsGrant[1]!);
+      await this.store.tasks.recordTrace({
+        type: "authorization.revoked",
+        principalId: OWNER_ID,
+        data: { grantId: revokeOpsGrant[1], authority: "local-management" },
+      });
+      return { status: 200, body: { revoked: true } };
+    }
     const options = {
       ...(url.searchParams.has("cursor") ? { cursor: url.searchParams.get("cursor")! } : {}),
       limit: 30,
@@ -481,6 +571,10 @@ export class ManagementApplication {
     await Promise.allSettled([...this.connections.values()].map((adapter) => adapter.stop()));
     this.connections.clear();
     await this.runs.stop({ abortRunning: true, wait: true });
+    for (const adapter of this.piAdapters.values()) await adapter.cleanup();
+    this.piAdapters.clear();
+    await this.opsReconciler?.stop();
+    await this.options.ops?.bridge.disconnect();
     await this.store.close();
   }
 }
