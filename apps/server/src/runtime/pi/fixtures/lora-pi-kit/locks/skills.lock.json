@@ -1,0 +1,28 @@
+{
+  "sourceCommit": "0000000000000000000000000000000000000001",
+  "includedSkills": ["github-gem-seeker", "unslop"],
+  "skills": {
+    "github-gem-seeker": {
+      "name": "github-gem-seeker",
+      "description": "Find established open-source solutions.",
+      "files": [
+        {
+          "path": "skills/github-gem-seeker/SKILL.md",
+          "sha256": "af9920655c4d43ae83037bdd72392d89ee1938e5859e5f3e13ba4066116ae202",
+          "bytes": 124
+        }
+      ]
+    },
+    "unslop": {
+      "name": "unslop",
+      "description": "Produce direct plain writing.",
+      "files": [
+        {
+          "path": "skills/unslop/SKILL.md",
+          "sha256": "63d47d4621cd137bde7b704048ac5ea83fc95101e27cd8c7abd0c8b3962204c8",
+          "bytes": 95
+        }
+      ]
+    }
+  }
+}
