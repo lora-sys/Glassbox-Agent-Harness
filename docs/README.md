@@ -24,6 +24,7 @@ Use one source of truth per topic.
 | Toolchain / dependencies / test / deployment | `tech-stack.md` |
 | Persistence / storage / observability / projections | `data-observability.md` |
 | Interactive demo curriculum | `interactive-demos.md` |
+| Web Management UI 设计规范 / UI Primitives / 验收标准 | `ui-design.md` |
 | Upstream research pins | `../upstream/*/SOURCES.md` |
 
 Do not duplicate detailed implementation rules across several documents. Link to the owner document instead.
