@@ -4,28 +4,28 @@ This directory contains the active implementation plan and durable technical fin
 
 ## Active plan
 
-`03-personal-agent-foundation.md` is the only active plan.
+`03-plus-owner-group-utility.md` is the active fast-follow plan after the completed P3 foundation.
 
-Its goal is to establish the first durable Personal Agent foundation:
+Its goal is intentionally small:
 
 ```text
-Identity
+P3 trust + QQ + Pi foundation
   ↓
-Authorization
+per-Run Tool surface
   ↓
-Conversation
+Owner private control
   ↓
-Turso persistence
-  ↓
-Run / Authorization Trace
+one test-group learning check-in loop
 ```
 
-Authorization is P0. Plan 03 starts with QQ group mentions and Owner private chat, including a bounded Run-linked Eval acceptance loop. Do not start real WeChat, Mail, Calendar, Memory consolidation, Skill evolution, LongTask, the full Eval platform, or Arena before Plan 03's completion gate is satisfied.
+P3+ does not implement Memory, Taste, cross-group learning, generic Tool generation, automatic reminders, or weekly reports.
+
+Plan 03 remains the completed foundation and historical acceptance contract.
 
 ## Read order for implementation
 
 1. `../AGENTS.md`
-2. `03-personal-agent-foundation.md`
+2. `03-plus-owner-group-utility.md`
 3. only the relevant files under `findings/`
 4. the relevant upstream source or documentation
 5. current production code and focused tests
@@ -33,6 +33,8 @@ Authorization is P0. Plan 03 starts with QQ group mentions and Owner private cha
 `README.md` defines product direction. `AGENTS.md` defines stable engineering and safety rules. The active plan defines the current scope.
 
 ## Historical phases
+
+Plan 03 is the completed QQ Personal Agent and Agent Operations foundation. Its detailed acceptance contract remains in `03-personal-agent-foundation.md`.
 
 Plan 01 and Plan 02 were completed phases of the earlier canvas-first coding-agent workbench. They and their completed Ticket files were removed from the active tree. Their full history remains in Git.
 
