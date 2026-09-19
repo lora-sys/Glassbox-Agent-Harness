@@ -431,7 +431,7 @@ export const PiPage: React.FC<PiPageProps> = () => {
       />
 
       {/* PI Engine & Lora PI Kit Architectural Panels (DESIGN.md §20 + frozen v24 composition: P3 目标) */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: 12 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 320px), 1fr))', gap: 12 }}>
         <div
           style={{
             padding: 14,
@@ -730,7 +730,7 @@ export const PiPage: React.FC<PiPageProps> = () => {
             执行核心降级与熔断状态遥测暂不可用 (P3 目标：需要 PI 运行时健康上报)
           </div>
         ) : (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 10, marginTop: 8 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 280px), 1fr))', gap: 10, marginTop: 8 }}>
           <div style={{ padding: 10, background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 'var(--radius-sm)' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between' }}>
               <strong>暂态超时自动熔断</strong>

@@ -298,7 +298,7 @@ export const ChannelsPage: React.FC<ChannelsPageProps> = ({ onNavigate }) => {
       {/* Catalog Cards */}
       <div
         data-testid="channel-catalog-cards"
-        style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 12 }}
+        style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 240px), 1fr))', gap: 12 }}
       >
         <div
           style={{
@@ -531,7 +531,7 @@ export const ChannelsPage: React.FC<ChannelsPageProps> = ({ onNavigate }) => {
             QQ 门禁场景裁决结果接口暂不可用 (P3 目标：需要实时入站/投递门禁决策上报)
           </div>
         ) : (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 10, marginTop: 8 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 280px), 1fr))', gap: 10, marginTop: 8 }}>
           <div style={{ padding: 10, background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 'var(--radius-sm)' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between' }}>
               <strong>1. Owner direct</strong>

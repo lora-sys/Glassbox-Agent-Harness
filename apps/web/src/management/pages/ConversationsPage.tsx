@@ -271,9 +271,13 @@ export const ConversationsPage: React.FC<ConversationsPageProps> = ({
                 </DetailSection>
 
                 <DetailSection title="资源计量与真值">
+                  <PairRow label="统计时间范围" value="未知（接口未上报）" />
                   <PairRow label="执行运行数" value={`${selectedConv.runsCount} 次`} />
                   <PairRow label="派生任务数" value={`${selectedConv.tasksCount} 项`} />
                   <PairRow label="Token 消耗" value={selectedConv.totalTokens.toLocaleString()} mono />
+                  <PairRow label="Input Token" value="未知（接口未上报）" />
+                  <PairRow label="Cache Read" value="未知（接口未上报）" />
+                  <PairRow label="工具调用" value="未知（接口未上报）" />
                   {!(
                     settings?.unknownPricingDisplay === 'hide_cost' &&
                     (selectedConv.costStatus !== 'priced' || selectedConv.costUsd === null)
@@ -289,6 +293,7 @@ export const ConversationsPage: React.FC<ConversationsPageProps> = ({
                       }
                     />
                   )}
+                  <PairRow label="24h Cost" value="未知（接口未提供时间分桶）" />
                   <PairRow label="最后活跃时间" value={selectedConv.lastActivityAt} />
                 </DetailSection>
 

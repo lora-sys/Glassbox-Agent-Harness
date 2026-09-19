@@ -58,7 +58,7 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({ onNavigate }) => {
       id: 'runs',
       name: '执行调用频次',
       pattern: 'dashed',
-      color: 'var(--brand)',
+      color: 'var(--secondary)',
       data: overview.usageTrend.map((t) => t.runs),
       plotScale: 1000,
     },
@@ -192,7 +192,7 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({ onNavigate }) => {
       />
 
       {/* Needs Attention & Current Run Panels */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: 16 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 320px), 1fr))', gap: 16 }}>
         {/* Needs Attention Panel */}
         <div style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 'var(--radius-md)', padding: 16 }}>
           <SectionHeader title="重要关注" subtitle="只列出确实需要 Owner 介入决策的待办项" />
@@ -270,6 +270,21 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({ onNavigate }) => {
               <div className="pairRow">
                 <span>关联任务</span>
                 <span className="mono">{overview.currentRun.taskAttemptId || '—'}</span>
+              </div>
+              <div className="pairRow">
+                <span>最近事件</span>
+                <span className="mono">未知（接口未上报）</span>
+              </div>
+              <div className="pairRow">
+                <span>Token / Cost</span>
+                <span className="mono">
+                  {overview.currentRun.tokens.total.toLocaleString()} /{' '}
+                  {overview.currentRun.costStatus === 'priced' && overview.currentRun.costUsd !== null
+                    ? `$${overview.currentRun.costUsd.toFixed(2)}`
+                    : overview.currentRun.costStatus === 'unpriced'
+                      ? '成本不可用'
+                      : '未知'}
+                </span>
               </div>
             </div>
             <div style={{ marginTop: 14 }}>

@@ -119,6 +119,16 @@ export const RunsPage: React.FC<RunsPageProps> = ({
       render: (r) => <span className="mono" style={{ fontSize: 12 }}>{r.modelId}</span>,
     },
     {
+      key: 'principal',
+      header: 'Principal',
+      render: (r) => <span className="mono" style={{ fontSize: 11 }}>{r.principalId}</span>,
+    },
+    {
+      key: 'attempt',
+      header: 'Task / Attempt',
+      render: (r) => <span className="mono" style={{ fontSize: 11 }}>{r.taskAttemptId || '无'}</span>,
+    },
+    {
       key: 'duration',
       header: '耗时',
       render: (r) => <span className="mono">{(r.durationMs / 1000).toFixed(1)}s</span>,
@@ -132,6 +142,20 @@ export const RunsPage: React.FC<RunsPageProps> = ({
       key: 'tokens',
       header: 'Tokens',
       render: (r) => <span className="mono">{r.tokens.total.toLocaleString()}</span>,
+    },
+    {
+      key: 'files',
+      header: '文件',
+      render: () => <span className="mono">未知</span>,
+    },
+    {
+      key: 'tests',
+      header: '测试',
+      render: (r) => (
+        <span className="mono">
+          {r.testsPassed != null && r.testsTotal != null ? `${r.testsPassed}/${r.testsTotal}` : '未知'}
+        </span>
+      ),
     },
   ];
 
@@ -259,6 +283,9 @@ export const RunsPage: React.FC<RunsPageProps> = ({
                       <PairRow label="所属会话" value={selectedRun.conversationId} mono />
                       <PairRow label="执行主体" value={selectedRun.principalId} mono />
                       <PairRow label="执行模型" value={selectedRun.modelId} />
+                      <PairRow label="PI Session" value="未知（接口未上报）" />
+                      <PairRow label="Thinking" value="未知（接口未上报）" />
+                      <PairRow label="WorkerBinding" value="未知（Run 接口未上报）" />
                       <PairRow label="耗时" value={`${(selectedRun.durationMs / 1000).toFixed(1)}s`} mono />
                       <PairRow label="关联任务尝试" value={selectedRun.taskAttemptId || '—'} mono />
                     </DetailSection>
@@ -266,6 +293,8 @@ export const RunsPage: React.FC<RunsPageProps> = ({
                     <DetailSection title="Token 计量与计费">
                       <PairRow label="提示词 Token" value={selectedRun.tokens.prompt.toLocaleString()} mono />
                       <PairRow label="补全 Token" value={selectedRun.tokens.completion.toLocaleString()} mono />
+                      <PairRow label="Cache Read" value="未知（接口未上报）" />
+                      <PairRow label="Reasoning Token" value="未知（接口未上报）" />
                       <PairRow label="总计 Token" value={selectedRun.tokens.total.toLocaleString()} mono />
                       {!shouldHideCost && (
                         <PairRow
@@ -308,6 +337,17 @@ export const RunsPage: React.FC<RunsPageProps> = ({
 
                 {detailTab === 'files' && (
                   <DetailSection title={`交付物与测试验证 (${selectedRun.artifacts.length})`}>
+                    <PairRow label="Files changed" value="未知（接口未上报）" />
+                    <PairRow label="Artifacts" value={`${selectedRun.artifacts.length} 项`} />
+                    <PairRow label="Diff 统计" value="未知（接口未上报）" />
+                    <PairRow
+                      label="测试结果"
+                      value={selectedRun.testsPassed != null && selectedRun.testsTotal != null
+                        ? `${selectedRun.testsPassed} / ${selectedRun.testsTotal} 通过`
+                        : '未知（接口未上报）'}
+                    />
+                    <PairRow label="测试套件" value="未知（接口未上报）" />
+                    <PairRow label="Canary" value="未知（接口未上报）" />
                     {selectedRun.artifacts.map((art, idx) => (
                       <div
                         key={idx}

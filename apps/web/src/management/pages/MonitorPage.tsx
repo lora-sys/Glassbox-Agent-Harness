@@ -65,7 +65,7 @@ export const MonitorPage: React.FC<MonitorPageProps> = () => {
       id: 'p95',
       name: 'P95 长尾延迟 (ms)',
       pattern: 'dashed',
-      color: 'var(--danger)',
+      color: 'var(--secondary)',
       data: monitor.latencyTrend.map((t) => t.p95),
     },
   ];
@@ -241,7 +241,7 @@ export const MonitorPage: React.FC<MonitorPageProps> = () => {
           {
             label: 'HerdrBridge 连接',
             value: <StatusBadge variant={herdrVariant}>{herdrLabel}</StatusBadge>,
-            meta: `${monitor.herdrBridge.activeWorkspaces} 工作区 · ${monitor.herdrBridge.activePanes} 窗格`,
+            meta: `${monitor.herdrBridge.status === 'connected' ? '当前' : '最近观测'}：${monitor.herdrBridge.activeWorkspaces} 工作区 · ${monitor.herdrBridge.activePanes} 窗格`,
           },
           {
             label: '持久化存储',
@@ -254,6 +254,25 @@ export const MonitorPage: React.FC<MonitorPageProps> = () => {
           },
         ]}
       />
+
+      <div>
+        <SectionHeader
+          title="观测新鲜度 (Observation Freshness)"
+          subtitle="缺少服务端字段时保持未知，不把外部观测改写为产品真值"
+          capabilityState={isLive ? 'P3 目标' : '设计数据'}
+        />
+        <SummaryBar
+          items={[
+            { label: 'Last snapshot', value: '未知', meta: '接口未上报快照时间' },
+            { label: 'Last reconcile', value: '未知', meta: '接口未上报协调时间' },
+            { label: 'Unknown workers', value: '未知', meta: '接口未上报未知 Worker 数' },
+            { label: 'Stale bindings', value: '未知', meta: '接口未上报过期绑定数' },
+            { label: 'Stale threshold', value: '未知', meta: '接口未上报判定阈值' },
+            { label: 'Last lifecycle', value: '未知', meta: '接口未上报最近成功生命周期事件' },
+            { label: 'Connection state', value: herdrLabel, meta: `最近心跳：${monitor.herdrBridge.lastHeartbeat || '未知'}` },
+          ]}
+        />
+      </div>
 
       {/* 1. Service Health Table */}
       <div>
@@ -322,7 +341,7 @@ export const MonitorPage: React.FC<MonitorPageProps> = () => {
           <div
             style={{
               display: 'grid',
-              gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
+              gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 200px), 1fr))',
               gap: 12,
               marginTop: 8,
             }}
@@ -348,8 +367,26 @@ export const MonitorPage: React.FC<MonitorPageProps> = () => {
             </div>
             <div className="summaryItem">
               <span className="summaryItemLabel">HerdrBridge 事实新鲜度</span>
-              <strong style={{ fontSize: 16, color: 'var(--warn)' }}>STALE (45s)</strong>
-              <span className="summaryItemMeta">心跳轻微滞后，处于降级容忍期</span>
+              <strong
+                style={{
+                  fontSize: 16,
+                  color:
+                    monitor.herdrBridge.status === 'connected'
+                      ? 'var(--success)'
+                      : monitor.herdrBridge.status === 'stale'
+                        ? 'var(--brand)'
+                        : 'var(--danger)',
+                }}
+              >
+                {herdrLabel} ({monitor.herdrBridge.lastHeartbeat || '未知'})
+              </strong>
+              <span className="summaryItemMeta">
+                {monitor.herdrBridge.status === 'connected'
+                  ? '最近心跳由观测接口上报'
+                  : monitor.herdrBridge.status === 'stale'
+                    ? '外部观测已过期，不替代 Glassbox 产品真值'
+                    : '外部执行宿主当前断开连接'}
+              </span>
             </div>
           </div>
         )}
@@ -397,7 +434,7 @@ export const MonitorPage: React.FC<MonitorPageProps> = () => {
         <div
           style={{
             display: 'grid',
-            gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
+            gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 280px), 1fr))',
             gap: 10,
             marginTop: 8,
           }}

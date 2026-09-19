@@ -341,6 +341,30 @@ export const OpsPage: React.FC<OpsPageProps> = ({
                     })()}
                     <button
                       type="button"
+                      className="btn secondary sm"
+                      disabled={isLive}
+                      title={isLive ? 'worker_read 服务端执行接口暂不可用 (P3 目标)' : undefined}
+                      onClick={() => {
+                        if (isLive) return;
+                        setFeedbackNotice(`[设计模拟] worker_read 仅读取任务 [${selectedTask.id}] 当前绑定的 Worker 观测，不修改 Task 真值。`);
+                      }}
+                    >
+                      读取 Worker 状态 (worker_read)
+                    </button>
+                    <button
+                      type="button"
+                      className="btn secondary sm"
+                      disabled={isLive}
+                      title={isLive ? 'worker_prompt 服务端执行接口暂不可用 (P3 目标)' : undefined}
+                      onClick={() => {
+                        if (isLive) return;
+                        setFeedbackNotice(`[设计模拟] worker_prompt 已进入本地预览，不会向任务 [${selectedTask.id}] 的 Worker 发送真实指令。`);
+                      }}
+                    >
+                      Prompt Worker (worker_prompt)
+                    </button>
+                    <button
+                      type="button"
                       className="btn danger sm"
                       disabled={isLive}
                       title={isLive ? '任务取消接口暂不可用 (P3 目标)' : undefined}
@@ -525,7 +549,7 @@ export const OpsPage: React.FC<OpsPageProps> = ({
           <div
             style={{
               display: 'grid',
-              gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+              gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 220px), 1fr))',
               gap: 12,
               marginTop: 12,
             }}

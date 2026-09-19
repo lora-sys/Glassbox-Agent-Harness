@@ -120,7 +120,13 @@ export const ChartPanel: React.FC<ChartPanelProps> = ({
           <div key={s.id} className="chartLegendItem">
             <span
               className={`chartLegendLine ${s.pattern}`}
-              style={{ backgroundColor: s.pattern === 'solid' ? s.color : undefined }}
+              style={
+                s.pattern === 'solid'
+                  ? { backgroundColor: s.color }
+                  : {
+                      background: `repeating-linear-gradient(90deg, ${s.color} 0 ${s.pattern === 'dashed' ? 4 : 2}px, transparent ${s.pattern === 'dashed' ? 4 : 2}px ${s.pattern === 'dashed' ? 8 : 5}px)`,
+                    }
+              }
             />
             <span>{s.name} ({s.pattern})</span>
           </div>

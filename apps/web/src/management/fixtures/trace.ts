@@ -77,7 +77,7 @@ export function generateTraceEvents(count: number, runId: string): TraceEventPro
     const type = EVENT_TYPES[(i - 1) % EVENT_TYPES.length];
     const seq = i;
     const timeOffsetMs = i * 200;
-    const date = new Date(Date.now() - (count - i) * 500);
+    const date = new Date(Date.UTC(2026, 8, 17, 15, 10, 0) - (count - i) * 500);
     const timeStr = date.toTimeString().split(' ')[0] + '.' + String(date.getMilliseconds()).padStart(3, '0');
 
     let summary = `Event #${seq} (${type})`;
@@ -156,6 +156,17 @@ export function generateTraceEvents(count: number, runId: string): TraceEventPro
         payload = { errorCode: 'ERR_TIMEOUT_RETRY', retriesLeft: 2 };
         break;
     }
+
+    payload = {
+      ...payload,
+      method: `trace.${type}`,
+      kind: type,
+      conversationId: runId === 'run_A79' ? 'conv_qq_private_owner' : 'conv_owner_main',
+      taskId: runId === 'run_A83' ? 'task-218' : null,
+      principal: authDetail?.principal ?? 'owner_primary',
+      provenance: 'design_fixture:normalized_raw_trace',
+      screeningState: 'SCREENED',
+    };
 
     const isLargePayload = seq === 1 && (runId === 'run_A83' || runId === 'run_A70');
     const rawTraceData = isLargePayload

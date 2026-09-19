@@ -472,6 +472,10 @@ export interface DecisionTesterInput {
   action: string;
   channel: string;
   location: string;
+  executionMethod?: string;
+  audience?: string;
+  conversationId?: string;
+  runId?: string;
 }
 
 export interface DecisionTesterDesignResult {

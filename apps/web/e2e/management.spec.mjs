@@ -395,7 +395,7 @@ test.describe('Web Management Frozen Specification E2E Suite', () => {
     // Search within 500 events: reduce visible count
     const traceSearch = page.locator('.timelineScrubber input[type="search"]');
     await traceSearch.fill('authorization');
-    const scrubberMatch = (await page.locator('.timelineScrubber').textContent()).match(/(\d+) \/ 500/);
+    const scrubberMatch = (await page.locator('.timelineCount').textContent()).match(/(\d+) \/ 500/);
     expect(scrubberMatch).not.toBeNull();
     const authFilteredCount = parseInt(scrubberMatch[1], 10);
     // The generator cycles 14 event types, so 500 events yield exactly 36 'authorization' events.
@@ -407,7 +407,7 @@ test.describe('Web Management Frozen Specification E2E Suite', () => {
     const typeSelect = page.locator('.timelineScrubber select.filterSelect');
     await traceSearch.fill('');
     await typeSelect.selectOption('tool');
-    const toolMatch = (await page.locator('.timelineScrubber').textContent()).match(/(\d+) \/ 500/);
+    const toolMatch = (await page.locator('.timelineCount').textContent()).match(/(\d+) \/ 500/);
     expect(toolMatch).not.toBeNull();
     const toolFilteredCount = parseInt(toolMatch[1], 10);
     expect(toolFilteredCount).toBe(36);
@@ -419,7 +419,7 @@ test.describe('Web Management Frozen Specification E2E Suite', () => {
     await expect(secondFilteredItem).toHaveClass(/active/);
     const selectedSeqText = await secondFilteredItem.locator('.mono').first().textContent();
     const selectedSeqNum = selectedSeqText.replace('#', '').trim();
-    await expect(page.locator('.inspectorContent')).toContainText(`Event #${selectedSeqNum}`);
+    await expect(page.locator('.inspectorContent')).toContainText(`#${selectedSeqNum}`);
 
     // Reset filters
     await typeSelect.selectOption('all');
@@ -444,30 +444,38 @@ test.describe('Web Management Frozen Specification E2E Suite', () => {
     await page.locator('.traceRunItem:has-text("run_A83")').click();
     await page.locator('.timelineEventItem').first().click();
 
-    // Payload tab
-    await page.locator('button[role="tab"]:has-text("有效载荷")').click();
-    await expect(page.locator('.inspectorContent')).toContainText('Event #1');
+    // Frozen Inspector contract: Summary / Usage / Raw
+    await page.getByRole('tab', { name: '摘要' }).click();
+    await expect(page.locator('.inspectorContent')).toContainText('Conversation');
+    await expect(page.locator('.inspectorContent')).toContainText('Run');
+    await expect(page.locator('.inspectorContent')).toContainText('Principal');
 
-    // Auth tab
-    await page.locator('button[role="tab"]:has-text("鉴权决策")').click();
-    await expect(page.locator('.inspectorContent')).toBeVisible();
-
-    // Timing tab
-    await page.locator('button[role="tab"]:has-text("时序参数")').click();
-    await expect(page.locator('.inspectorContent')).toContainText('所属运行: run_A83');
+    await page.getByRole('tab', { name: '用量' }).click();
+    await expect(page.locator('.inspectorContent')).toContainText('Total Token');
+    await expect(page.locator('.inspectorContent')).toContainText('成本不可用');
 
     // Large Raw Trace tab: verify raw append-only evidence and multiline buffer display
-    await page.locator('button[role="tab"]:has-text("原始 Raw Trace")').click();
-    await expect(page.locator('.inspectorContent')).toContainText('// 按需装载不可变追加证据 (Raw Trace)');
+    await page.getByRole('tab', { name: '原始' }).click();
+    await expect(page.locator('.inspectorContent')).toContainText('// 按需装载的不可变追加原始证据 (Raw Trace)');
     await expect(page.locator('.inspectorContent')).toContainText('large_raw_trace_payload');
     await expect(page.locator('.inspectorContent')).toContainText('raw_append_only_event_log');
     await expect(page.locator('.inspectorContent')).toContainText('terminalOutputBuffer');
     const inspectorText = (await page.locator('.inspectorContent').textContent()) || '';
     expect(inspectorText.length).toBeGreaterThanOrEqual(16384);
 
-    // Reset back to payload tab to test 'e' keyboard shortcut toggle
-    await page.locator('button[role="tab"]:has-text("有效载荷")').click();
-    await expect(page.locator('.inspectorContent')).toContainText('Event #1');
+    await page.getByRole('tab', { name: '摘要' }).click();
+
+    // Real scrubber, jump-latest, copy and export controls are present and operable.
+    const eventScrubber = page.getByRole('slider', { name: '追踪事件 Scrubber' });
+    await eventScrubber.fill('500');
+    await expect(page.locator('.timelineEventItem.active')).toContainText('#500');
+    await page.getByRole('button', { name: '跳到最新' }).click();
+    await expect(page.locator('.timelineEventItem.active')).toContainText('#500');
+    await expect(page.getByRole('button', { name: '复制 JSON' })).toBeEnabled();
+    const downloadPromise = page.waitForEvent('download');
+    await page.getByRole('button', { name: '导出筛选 JSON' }).click();
+    const download = await downloadPromise;
+    expect(download.suggestedFilename()).toBe('run_A83-screened-events.json');
 
     // Keyboard Navigation: j, k, e, /
     const firstEvent = page.locator('.timelineEventItem').first();
@@ -483,13 +491,15 @@ test.describe('Web Management Frozen Specification E2E Suite', () => {
     await page.keyboard.press('k');
     await expect(firstEvent).toHaveClass(/active/);
 
-    // Press 'e' -> toggles active tab to raw
+    // Press 'e' -> expands the selected event inline
     await page.keyboard.press('e');
-    await expect(page.locator('.inspectorContent')).toContainText('Raw Trace');
+    await expect(firstEvent).toHaveAttribute('aria-expanded', 'true');
+    await expect(firstEvent.locator('.timelineEventExpanded')).toBeVisible();
 
-    // Press 'e' again -> toggles back to payload
+    // Press 'e' again -> collapses the selected event
     await page.keyboard.press('e');
-    await expect(page.locator('.inspectorContent')).not.toContainText('// 按需装载不可变追加证据');
+    await expect(firstEvent).toHaveAttribute('aria-expanded', 'false');
+    await expect(firstEvent.locator('.timelineEventExpanded')).toHaveCount(0);
 
     // Press '/' -> focuses search input
     await page.keyboard.press('/');
@@ -504,10 +514,10 @@ test.describe('Web Management Frozen Specification E2E Suite', () => {
     await expect(page.locator('h1')).toContainText('权限控制面');
 
     // Verify Four Hard Gates display
-    await expect(page.locator('.summaryItem:has-text("硬门禁 1 · 默认拒绝")')).toBeVisible();
-    await expect(page.locator('.summaryItem:has-text("硬门禁 2 · 破坏性操作")')).toBeVisible();
-    await expect(page.locator('.summaryItem:has-text("硬门禁 3 · 投递边界隔离")')).toBeVisible();
-    await expect(page.locator('.summaryItem:has-text("硬门禁 4 · 代码强制边界")')).toBeVisible();
+    await expect(page.locator('.summaryItem:has-text("Ingress Gate")')).toBeVisible();
+    await expect(page.locator('.summaryItem:has-text("Context Gate")')).toBeVisible();
+    await expect(page.locator('.summaryItem:has-text("Tool / Ops Gate")')).toBeVisible();
+    await expect(page.locator('.summaryItem:has-text("Delivery Gate")')).toBeVisible();
 
     const evalBtn = page.locator('button:has-text("执行裁决模拟计算")');
     await expect(evalBtn).toBeVisible();
@@ -713,7 +723,7 @@ test.describe('Web Management Frozen Specification E2E Suite', () => {
     }) => {
       await page.setViewportSize({ width: vp.width, height: vp.height });
 
-      const testPages = ['overview', 'ops', 'runs', 'trace', 'permissions', 'monitor', 'channels', 'settings'];
+      const testPages = PAGES.map((item) => item.id);
       for (const pageId of testPages) {
         await page.goto(`/manage?page=${pageId}`);
         await page.waitForLoadState('domcontentloaded');
@@ -732,6 +742,46 @@ test.describe('Web Management Frozen Specification E2E Suite', () => {
           hasHorizontalScroll,
           `Horizontal page overflow detected on page "${pageId}" at ${vp.width}x${vp.height}`,
         ).toBe(false);
+
+        const unreachable = await page.evaluate(() => {
+          const viewport = document.querySelector('.mainViewport');
+          const root = document.querySelector('.pageContainer');
+          if (!(viewport instanceof HTMLElement) || !(root instanceof HTMLElement)) return null;
+          const viewportRect = viewport.getBoundingClientRect();
+          const visible = (el) => {
+            const style = getComputedStyle(el);
+            const rect = el.getBoundingClientRect();
+            return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+          };
+          const hasReachableScrollAncestor = (el) => {
+            let current = el.parentElement;
+            while (current && current !== viewport) {
+              const style = getComputedStyle(current);
+              if ((style.overflowX === 'auto' || style.overflowX === 'scroll') && current.scrollWidth > current.clientWidth + 1) {
+                return true;
+              }
+              current = current.parentElement;
+            }
+            return false;
+          };
+          for (const el of root.querySelectorAll('*')) {
+            if (!(el instanceof HTMLElement) || !visible(el)) continue;
+            const rect = el.getBoundingClientRect();
+            if ((rect.right > viewportRect.right + 1 || rect.left < viewportRect.left - 1) && !hasReachableScrollAncestor(el)) {
+              return {
+                tag: el.tagName,
+                className: el.className,
+                text: (el.textContent || '').trim().slice(0, 80),
+                left: Math.round(rect.left),
+                right: Math.round(rect.right),
+                viewportLeft: Math.round(viewportRect.left),
+                viewportRight: Math.round(viewportRect.right),
+              };
+            }
+          }
+          return null;
+        });
+        expect(unreachable, `Unreachable clipped content on ${pageId} at ${vp.width}x${vp.height}: ${JSON.stringify(unreachable)}`).toBeNull();
       }
     });
   }
@@ -750,8 +800,9 @@ test.describe('Web Management Frozen Specification E2E Suite', () => {
     // 2. Subsystem warnings, stale state, and long error messages (>100 chars)
     await page.goto('/manage?page=monitor');
     await expect(page.locator('h1')).toContainText('系统监控');
-    await expect(page.locator('.summaryBar')).toContainText('HEALTHY');
-    await expect(page.locator('.summaryBar')).toContainText('STALE');
+    const subsystemSummary = page.locator('.summaryBar').first();
+    await expect(subsystemSummary).toContainText('HEALTHY');
+    await expect(subsystemSummary).toContainText('STALE');
     const alertsPanel = page.locator('div:has(> h3:has-text("观测告警与审计事件"))');
     const alertMessage = alertsPanel.locator('span:has-text("DeepSeek Chat (V3)")').first();
     await expect(alertMessage).toContainText(
@@ -823,20 +874,33 @@ test.describe('Web Management Frozen Specification E2E Suite', () => {
     // 1. Overview (1440x900)
     await page.setViewportSize({ width: 1440, height: 900 });
     await page.goto('/manage?page=overview');
+    await page.addStyleTag({ content: 'html, body, #root, .managementApp, .mainViewport { height: auto !important; min-height: 100% !important; overflow: visible !important; }' });
     await page.screenshot({ path: 'docs/ui/evidence/overview-desktop.png', fullPage: true });
 
     // 2. Ops with DetailRail (1440x900)
     await page.goto('/manage?page=ops');
     await page.locator('tr:has-text("task-218")').first().click();
-    await page.screenshot({ path: 'docs/ui/evidence/ops-detailrail.png', fullPage: true });
+    await expect(page.locator('.detailRail')).toBeVisible();
+    await page.waitForTimeout(150);
+    await page.locator('.mainViewport').evaluate((element) => {
+      element.scrollTop = 0;
+    });
+    await page.screenshot({ path: 'docs/ui/evidence/ops-detailrail.png' });
 
     // 3. Trace 3-column (1440x900)
     await page.goto('/manage?page=trace');
-    await page.screenshot({ path: 'docs/ui/evidence/trace-inspector.png', fullPage: true });
+    await expect(page.getByRole('slider', { name: '追踪事件 Scrubber' })).toBeVisible();
+    await expect(page.getByRole('tab', { name: '摘要' })).toHaveAttribute('aria-selected', 'true');
+    await page.screenshot({ path: 'docs/ui/evidence/trace-inspector.png' });
 
     // 4. Permissions with Decision Tester (1440x900)
     await page.goto('/manage?page=permissions');
     await page.locator('button:has-text("执行裁决模拟计算")').click();
+    await expect(page.locator('.detailRail')).toContainText('REQUIRES_APPROVAL');
+    await page.addStyleTag({
+      content:
+        'html, body, #root, .managementApp, .mainViewport { height: auto !important; min-height: 100% !important; overflow: visible !important; } .detailRail { position: static !important; max-height: none !important; }',
+    });
     await page.screenshot({ path: 'docs/ui/evidence/permissions-tester.png', fullPage: true });
 
     // 5. Mobile Drawer (390x844)
@@ -854,7 +918,8 @@ test.describe('Web Management Frozen Specification E2E Suite', () => {
 
     // 6. Narrow Mobile (320x700)
     await page.setViewportSize({ width: 320, height: 700 });
-    await page.goto('/manage?page=overview');
+    await page.goto('/manage?page=conversations');
+    await expect(page.locator('.tableContainer')).toBeVisible();
     await page.screenshot({ path: 'docs/ui/evidence/narrow-mobile-320x700.png' });
   });
 
@@ -2155,9 +2220,11 @@ test.describe('Web Management Frozen Specification E2E Suite', () => {
     const timelineItem = page.locator('.timelineEventItem:has-text("Execute cargo check in workspace")');
     await expect(timelineItem).toBeVisible();
 
-    // Inspector shows the mocked payload
+    // Raw Inspector shows the screened mocked payload on demand
     const inspector = page.locator('.traceInspector');
     await expect(inspector).toBeVisible();
+    await inspector.getByRole('tab', { name: '原始' }).click();
+    await expect(inspector).toContainText('原始证据未由接口上报');
     await expect(inspector).toContainText('cargo_check');
     await expect(inspector).toContainText('exitCode');
   });
@@ -2429,13 +2496,13 @@ test.describe('Web Management Frozen Specification E2E Suite', () => {
     await page.keyboard.press('Home');
     await expect(page.locator('.timelineEventItem.active')).toContainText('#1');
 
-    // 7. e toggles raw trace tab
+    // 7. e expands and collapses the selected timeline event
     await page.keyboard.press('e');
-    const rawTab = page.getByRole('tab', { name: '原始 Raw Trace' });
-    await expect(rawTab).toHaveAttribute('aria-selected', 'true');
+    await expect(page.locator('.timelineEventItem.active')).toHaveAttribute('aria-expanded', 'true');
+    await expect(page.locator('.timelineEventItem.active .timelineEventExpanded')).toBeVisible();
     await page.keyboard.press('e');
-    const payloadTab = page.getByRole('tab', { name: '有效载荷' });
-    await expect(payloadTab).toHaveAttribute('aria-selected', 'true');
+    await expect(page.locator('.timelineEventItem.active')).toHaveAttribute('aria-expanded', 'false');
+    await expect(page.locator('.timelineEventItem.active .timelineEventExpanded')).toHaveCount(0);
 
     // 8. / focuses the search input
     await page.keyboard.press('/');
@@ -2786,6 +2853,8 @@ test.describe('Web Management Frozen Specification E2E Suite', () => {
     await expect(page.locator('.timelineEventItem.active')).toContainText('Tool execution in run_custom_beta');
     const inspector = page.locator('.traceInspector');
     await expect(inspector).toContainText('run_custom_beta');
+    await inspector.getByRole('tab', { name: '原始' }).click();
+    await expect(inspector).toContainText('原始证据未由接口上报');
     await expect(inspector).toContainText('executed');
 
     // Deep link directly to valid runId
@@ -3257,7 +3326,8 @@ test.describe('Web Management Frozen Specification E2E Suite', () => {
       await expect(inspectorContent).toBeVisible();
       const inspectorText = await inspectorContent.innerText();
       expect(inspectorText.length).toBeGreaterThan(0);
-      expect(inspectorText).toContain('Event #');
+      expect(inspectorText).toContain('事件');
+      expect(inspectorText).toContain('#1');
     }
 
     // At 1440x900: verify all three panels have positive, horizontally in-bounds rectangles and remain side by side

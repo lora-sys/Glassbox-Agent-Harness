@@ -43,6 +43,10 @@ export const PermissionsPage: React.FC<PermissionsPageProps> = ({
   const [testerResource, setTesterResource] = useState('workspace:clean_reset');
   const [testerAction, setTesterAction] = useState('execute');
   const [testerChannel, setTesterChannel] = useState('web');
+  const [testerExecutionMethod, setTesterExecutionMethod] = useState('tool:workspace');
+  const [testerAudience, setTesterAudience] = useState('owner_primary');
+  const [testerConversation, setTesterConversation] = useState('conv_owner_main');
+  const [testerRun, setTesterRun] = useState('run_A83');
   const [simResult, setSimResult] = useState<DecisionTesterResult | null>(null);
   const [isTesterOpen, setIsTesterOpen] = useState(true);
 
@@ -59,6 +63,10 @@ export const PermissionsPage: React.FC<PermissionsPageProps> = ({
       action: testerAction,
       channel: testerChannel,
       location: 'local:workbench',
+      executionMethod: testerExecutionMethod,
+      audience: testerAudience,
+      conversationId: testerConversation,
+      runId: testerRun,
     });
     setSimResult(result);
   };
@@ -146,26 +154,26 @@ export const PermissionsPage: React.FC<PermissionsPageProps> = ({
       )}
 
       {/* Four Hard Gates Display */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 12 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 240px), 1fr))', gap: 12 }}>
         <div className="summaryItem">
-          <span className="summaryItemLabel">硬门禁 1 · 默认拒绝</span>
-          <strong style={{ fontSize: 14, color: 'var(--danger)' }}>DENY</strong>
-          <span className="summaryItemMeta">无匹配 Grant 统一拒绝，防止误授权</span>
+          <span className="summaryItemLabel">Ingress Gate · 入口门禁</span>
+          <strong style={{ fontSize: 14, color: 'var(--ink)' }}>BEFORE PI</strong>
+          <span className="summaryItemMeta">解析 ChannelIdentity、Principal、Location、群激活、自消息与重复 ID</span>
         </div>
         <div className="summaryItem">
-          <span className="summaryItemLabel">硬门禁 2 · 破坏性操作</span>
-          <strong style={{ fontSize: 14, color: 'var(--brand)' }}>REQUIRES_APPROVAL</strong>
-          <span className="summaryItemMeta">删除工作区或重置分支必须经 Owner 显式批准</span>
+          <span className="summaryItemLabel">Context Gate · 上下文门禁</span>
+          <strong style={{ fontSize: 14, color: 'var(--danger)' }}>AUTHORIZE FIRST</strong>
+          <span className="summaryItemMeta">先授权来源，再装载进入模型可见上下文</span>
         </div>
         <div className="summaryItem">
-          <span className="summaryItemLabel">硬门禁 3 · 投递边界隔离</span>
-          <strong style={{ fontSize: 14, color: 'var(--ink)' }}>STRICT DELIVERY</strong>
-          <span className="summaryItemMeta">主体具备读取权限不代表允许投递至外部群聊</span>
+          <span className="summaryItemLabel">Tool / Ops Gate · 执行门禁</span>
+          <strong style={{ fontSize: 14, color: 'var(--brand)' }}>REAUTHORIZE</strong>
+          <span className="summaryItemMeta">执行 Tool、Ops、worker 与 Task 动作前重新鉴权</span>
         </div>
         <div className="summaryItem">
-          <span className="summaryItemLabel">硬门禁 4 · 代码强制边界</span>
-          <strong style={{ fontSize: 14, color: 'var(--success)' }}>CODE ENFORCED</strong>
-          <span className="summaryItemMeta">安全边界必须在代码中硬性判定，严禁依赖 Prompt</span>
+          <span className="summaryItemLabel">Delivery Gate · 投递门禁</span>
+          <strong style={{ fontSize: 14, color: 'var(--ink)' }}>SCREEN AUDIENCE</strong>
+          <span className="summaryItemMeta">actor_can_read 不代表 audience_can_receive</span>
         </div>
       </div>
 
@@ -372,6 +380,22 @@ export const PermissionsPage: React.FC<PermissionsPageProps> = ({
                     <option value="onebot_qq_private">QQ 私聊</option>
                   </select>
                 </div>
+                <div>
+                  <label htmlFor="test-execution" style={{ fontSize: 11, color: 'var(--metadata)', display: 'block' }}>执行方式 (How)</label>
+                  <input id="test-execution" type="text" className="filterInput" style={{ width: '100%' }} value={testerExecutionMethod} onChange={(e) => setTesterExecutionMethod(e.target.value)} />
+                </div>
+                <div>
+                  <label htmlFor="test-audience" style={{ fontSize: 11, color: 'var(--metadata)', display: 'block' }}>接收对象 (Audience)</label>
+                  <input id="test-audience" type="text" className="filterInput" style={{ width: '100%' }} value={testerAudience} onChange={(e) => setTesterAudience(e.target.value)} />
+                </div>
+                <div>
+                  <label htmlFor="test-conversation" style={{ fontSize: 11, color: 'var(--metadata)', display: 'block' }}>会话 (Conversation)</label>
+                  <input id="test-conversation" type="text" className="filterInput" style={{ width: '100%' }} value={testerConversation} onChange={(e) => setTesterConversation(e.target.value)} />
+                </div>
+                <div>
+                  <label htmlFor="test-run" style={{ fontSize: 11, color: 'var(--metadata)', display: 'block' }}>运行 (Run)</label>
+                  <input id="test-run" type="text" className="filterInput" style={{ width: '100%' }} value={testerRun} onChange={(e) => setTesterRun(e.target.value)} />
+                </div>
               </div>
             </DetailSection>
 
@@ -399,6 +423,10 @@ export const PermissionsPage: React.FC<PermissionsPageProps> = ({
                   )}
                   <div style={{ fontSize: 11, color: 'var(--body)', lineHeight: 1.4, marginBottom: 8 }}>
                     {simResult.provenance}
+                  </div>
+                  <div className="mono" style={{ fontSize: 10, color: 'var(--metadata)', lineHeight: 1.5, marginBottom: 8 }}>
+                    How: {testerExecutionMethod || '未知'} · Audience: {testerAudience || '未知'}<br />
+                    Conversation: {testerConversation || '未知'} · Run: {testerRun || '未知'}
                   </div>
                   <div style={{ fontSize: 10, color: 'var(--metadata)', borderTop: '1px dashed var(--line)', paddingTop: 6 }}>
                     [设计模拟] 本结果仅基于前端内置策略矩阵离线推演，不代表服务端实时授权决策，未向服务端持久化任何授权判定记录。
@@ -492,26 +520,26 @@ export const PermissionsPage: React.FC<PermissionsPageProps> = ({
           title="硬门禁参考与溯源依据 (Gate Reference & Provenance)"
           subtitle="系统硬编码防线与代码层安全边界，不依赖模型提示词或软性指令"
         />
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 12, marginTop: 12 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 280px), 1fr))', gap: 12, marginTop: 12 }}>
           <div style={{ padding: 12, background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 'var(--radius-sm)' }}>
-            <div style={{ fontSize: 11, color: 'var(--metadata)', fontWeight: 600 }}>Hard Gate 1</div>
-            <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink)', margin: '4px 0' }}>默认拒绝 (Deny by Default)</div>
-            <div style={{ fontSize: 11, color: 'var(--secondary)' }}>无显式 Grant 声明的任何访问一律拦截为 DENY。</div>
+            <div style={{ fontSize: 11, color: 'var(--metadata)', fontWeight: 600 }}>Ingress Gate</div>
+            <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink)', margin: '4px 0' }}>入口身份与位置校验</div>
+            <div style={{ fontSize: 11, color: 'var(--secondary)' }}>在 PI 调用前检查 ChannelIdentity、Principal、Location、群激活、自消息和重复 ID。</div>
           </div>
           <div style={{ padding: 12, background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 'var(--radius-sm)' }}>
-            <div style={{ fontSize: 11, color: 'var(--metadata)', fontWeight: 600 }}>Hard Gate 2</div>
-            <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink)', margin: '4px 0' }}>破坏性操作门禁 (Destructive Gate)</div>
-            <div style={{ fontSize: 11, color: 'var(--secondary)' }}>工作区重置、文件删除、破坏性脚本执行强制 REQUIRES_APPROVAL。</div>
+            <div style={{ fontSize: 11, color: 'var(--metadata)', fontWeight: 600 }}>Context Gate</div>
+            <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink)', margin: '4px 0' }}>授权后装载上下文</div>
+            <div style={{ fontSize: 11, color: 'var(--secondary)' }}>先授权数据来源，再把内容装入模型可见 Context。拒绝的数据不得先行装载。</div>
           </div>
           <div style={{ padding: 12, background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 'var(--radius-sm)' }}>
-            <div style={{ fontSize: 11, color: 'var(--metadata)', fontWeight: 600 }}>Hard Gate 3</div>
-            <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink)', margin: '4px 0' }}>投递边界隔离 (Delivery Screening)</div>
-            <div style={{ fontSize: 11, color: 'var(--secondary)' }}>严禁将包含私有上下文、Token、内部路径的产物投递至未授权渠道。</div>
+            <div style={{ fontSize: 11, color: 'var(--metadata)', fontWeight: 600 }}>Tool / Ops Gate</div>
+            <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink)', margin: '4px 0' }}>受保护执行前重新鉴权</div>
+            <div style={{ fontSize: 11, color: 'var(--secondary)' }}>覆盖 Tools、Ops、worker_read、worker_prompt、task_delegate、task_accept、task_rework 和 task_cancel。</div>
           </div>
           <div style={{ padding: 12, background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 'var(--radius-sm)' }}>
-            <div style={{ fontSize: 11, color: 'var(--metadata)', fontWeight: 600 }}>Hard Gate 4</div>
-            <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink)', margin: '4px 0' }}>委派不越权 (Delegation Invariant)</div>
-            <div style={{ fontSize: 11, color: 'var(--secondary)' }}>受托 Worker 权限集合必须严格为 Caller 权限的子集 (worker ⊆ caller)。</div>
+            <div style={{ fontSize: 11, color: 'var(--metadata)', fontWeight: 600 }}>Delivery Gate</div>
+            <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink)', margin: '4px 0' }}>按 Audience 再做投递授权</div>
+            <div style={{ fontSize: 11, color: 'var(--secondary)' }}>读取资源的权限不自动允许向当前 Audience 投递结果。</div>
           </div>
         </div>
       </div>

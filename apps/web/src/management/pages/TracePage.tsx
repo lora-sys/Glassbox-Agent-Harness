@@ -85,9 +85,11 @@ export const TracePage: React.FC<TracePageProps> = ({
   const events = eventsRes?.data || [];
 
   const [selectedEventSeq, setSelectedEventSeq] = useState<number>(1);
-  const [activeTab, setActiveTab] = useState<'payload' | 'auth' | 'timing' | 'raw'>('payload');
+  const [activeTab, setActiveTab] = useState<'summary' | 'usage' | 'raw'>('summary');
   const [search, setSearch] = useState('');
   const [typeFilter, setTypeFilter] = useState('all');
+  const [expandedEventSeq, setExpandedEventSeq] = useState<number | null>(null);
+  const [copyFeedback, setCopyFeedback] = useState<string>('');
 
   const searchInputRef = useRef<HTMLInputElement>(null);
   const timelineListRef = useRef<HTMLDivElement>(null);
@@ -99,16 +101,25 @@ export const TracePage: React.FC<TracePageProps> = ({
     }
   }, [activeRunId, events.length]);
 
-  const filteredEvents = events.filter((e) => {
-    const matchesSearch =
-      e.summary.toLowerCase().includes(search.toLowerCase()) ||
-      e.type.toLowerCase().includes(search.toLowerCase());
-    const matchesType = typeFilter === 'all' || e.type === typeFilter;
-    return matchesSearch && matchesType;
-  });
+  const filteredEvents = useMemo(() => {
+    const normalizedSearch = search.toLowerCase();
+    return events.filter((event) => {
+      const matchesSearch =
+        event.summary.toLowerCase().includes(normalizedSearch) ||
+        event.type.toLowerCase().includes(normalizedSearch);
+      const matchesType = typeFilter === 'all' || event.type === typeFilter;
+      return matchesSearch && matchesType;
+    });
+  }, [events, search, typeFilter]);
 
   const selectedEvent =
-    events.find((e) => e.sequence === selectedEventSeq) || filteredEvents[0] || null;
+    filteredEvents.find((e) => e.sequence === selectedEventSeq) || filteredEvents[0] || null;
+
+  useEffect(() => {
+    if (filteredEvents.length > 0 && !filteredEvents.some((event) => event.sequence === selectedEventSeq)) {
+      setSelectedEventSeq(filteredEvents[0].sequence);
+    }
+  }, [filteredEvents, selectedEventSeq]);
 
   // Scroll active event into the nearest visible part of .timelineList respecting prefers-reduced-motion
   useEffect(() => {
@@ -163,7 +174,9 @@ export const TracePage: React.FC<TracePageProps> = ({
         }
       } else if (e.key === 'e') {
         e.preventDefault();
-        setActiveTab((prev) => (prev === 'raw' ? 'payload' : 'raw'));
+        if (selectedEvent) {
+          setExpandedEventSeq((prev) => (prev === selectedEvent.sequence ? null : selectedEvent.sequence));
+        }
       } else if (e.key === '/') {
         e.preventDefault();
         searchInputRef.current?.focus();
@@ -172,7 +185,47 @@ export const TracePage: React.FC<TracePageProps> = ({
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [filteredEvents, selectedEventSeq, settings?.enableTraceKeyboardShortcuts]);
+  }, [filteredEvents, selectedEvent, selectedEventSeq, settings?.enableTraceKeyboardShortcuts]);
+
+  const selectedIndex = selectedEvent
+    ? filteredEvents.findIndex((event) => event.sequence === selectedEvent.sequence)
+    : -1;
+
+  const getScreenedEvent = (event: TraceEventProjection) => ({
+    id: event.id,
+    runId: event.runId,
+    sequence: event.sequence,
+    timestamp: event.timestamp,
+    type: event.type,
+    summary: event.summary,
+    durationMs: event.durationMs ?? null,
+    authorization: event.authorization ?? null,
+    payload: event.payload,
+  });
+
+  const copySelectedJson = async () => {
+    if (!selectedEvent) return;
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(getScreenedEvent(selectedEvent), null, 2));
+      setCopyFeedback('已复制筛选后的事件 JSON');
+    } catch {
+      setCopyFeedback('复制失败');
+    }
+  };
+
+  const exportScreenedJson = () => {
+    const blob = new Blob(
+      [JSON.stringify(filteredEvents.map(getScreenedEvent), null, 2)],
+      { type: 'application/json' },
+    );
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `${activeRunId || 'trace'}-screened-events.json`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+    setCopyFeedback(`已导出 ${filteredEvents.length} 条筛选事件`);
+  };
 
   const handleSelectRun = (runId: string) => {
     setLocalRunId(runId);
@@ -305,7 +358,7 @@ export const TracePage: React.FC<TracePageProps> = ({
         <div className="traceTimeline" role="region" aria-label="Event Timeline Container">
           {/* Scrubber & Filter Controls */}
           <div className="timelineScrubber">
-            <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 8 }}>
+            <div style={{ flex: '1 1 320px', display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', minWidth: 0 }}>
               <input
                 ref={searchInputRef}
                 type="search"
@@ -329,17 +382,43 @@ export const TracePage: React.FC<TracePageProps> = ({
                 <option value="user">用户 (user)</option>
                 <option value="assistant">回答 (assistant)</option>
                 <option value="error">异常 (error)</option>
+                <option value="system">系统 (system)</option>
+                <option value="context">上下文 (context)</option>
+                <option value="memory">记忆 (memory)</option>
+                <option value="skill">技能 (skill)</option>
+                <option value="thinking">思考 (thinking)</option>
+                <option value="file">文件 (file)</option>
+                <option value="test">测试 (test)</option>
+                <option value="delivery">投递 (delivery)</option>
               </select>
             </div>
-            <div
-              style={{
-                fontSize: 11,
-                color: 'var(--metadata)',
-                fontFamily: 'var(--font-mono)',
-              }}
-            >
-              {filteredEvents.length} / {events.length}
+            <div className="timelineActions">
+              <label className="timelineRangeLabel" htmlFor="trace-event-scrubber">
+                事件 {selectedIndex >= 0 ? selectedIndex + 1 : 0} / {filteredEvents.length}
+              </label>
+              <input
+                id="trace-event-scrubber"
+                className="eventScrubber"
+                type="range"
+                min={1}
+                max={Math.max(filteredEvents.length, 1)}
+                value={Math.max(selectedIndex + 1, 1)}
+                disabled={filteredEvents.length === 0}
+                onChange={(event) => {
+                  const next = filteredEvents[Number(event.target.value) - 1];
+                  if (next) setSelectedEventSeq(next.sequence);
+                }}
+                aria-label="追踪事件 Scrubber"
+              />
+              <span className="timelineCount">{filteredEvents.length} / {events.length}</span>
+              <button type="button" className="btn secondary sm" onClick={() => {
+                const latest = filteredEvents[filteredEvents.length - 1];
+                if (latest) setSelectedEventSeq(latest.sequence);
+              }} disabled={filteredEvents.length === 0}>跳到最新</button>
+              <button type="button" className="btn secondary sm" onClick={copySelectedJson} disabled={!selectedEvent}>复制 JSON</button>
+              <button type="button" className="btn secondary sm" onClick={exportScreenedJson} disabled={filteredEvents.length === 0}>导出筛选 JSON</button>
             </div>
+            {copyFeedback && <div className="timelineFeedback" role="status">{copyFeedback}</div>}
           </div>
 
           {/* Timeline Event List */}
@@ -364,6 +443,7 @@ export const TracePage: React.FC<TracePageProps> = ({
                   tabIndex={0}
                   role="option"
                   aria-selected={isSelected}
+                  aria-expanded={expandedEventSeq === ev.sequence}
                   aria-label={`事件 #${ev.sequence} ${ev.type}`}
                   onKeyDown={(e) => {
                     if (e.key === 'Enter' || e.key === ' ') {
@@ -397,6 +477,11 @@ export const TracePage: React.FC<TracePageProps> = ({
                   <span className="mono" style={{ fontSize: 10, color: 'var(--metadata)' }}>
                     {ev.timestamp}
                   </span>
+                  {expandedEventSeq === ev.sequence && (
+                    <pre className="timelineEventExpanded">
+                      {JSON.stringify(getScreenedEvent(ev).payload, null, 2)}
+                    </pre>
+                  )}
                 </div>
               );
             })}
@@ -412,10 +497,9 @@ export const TracePage: React.FC<TracePageProps> = ({
         <div className="traceInspector" role="region" aria-label="Event Detail Inspector">
           <Tabs
             tabs={[
-              { id: 'payload', label: '有效载荷' },
-              { id: 'auth', label: '鉴权决策' },
-              { id: 'timing', label: '时序参数' },
-              { id: 'raw', label: '原始 Raw Trace' },
+              { id: 'summary', label: '摘要' },
+              { id: 'usage', label: '用量' },
+              { id: 'raw', label: '原始' },
             ]}
             activeId={activeTab}
             onChange={(id) => setActiveTab(id as any)}
@@ -424,62 +508,41 @@ export const TracePage: React.FC<TracePageProps> = ({
           <div className="inspectorContent">
             {selectedEvent ? (
               <>
-                {activeTab === 'payload' && (
-                  <div>
-                    <div style={{ color: 'var(--brand)', marginBottom: 6, fontWeight: 600 }}>
-                      Event #{selectedEvent.sequence} · {selectedEvent.type}
-                    </div>
-                    {JSON.stringify(selectedEvent.payload, null, 2)}
+                {activeTab === 'summary' && (
+                  <div className="traceSummaryGrid">
+                    <div><span>事件</span><strong>#{selectedEvent.sequence} · {selectedEvent.type}</strong></div>
+                    <div><span>Method</span><strong>{typeof selectedEvent.payload.method === 'string' ? selectedEvent.payload.method : '未知'}</strong></div>
+                    <div><span>Kind</span><strong>{selectedEvent.type}</strong></div>
+                    <div><span>说明</span><strong>{selectedEvent.summary}</strong></div>
+                    <div><span>Conversation</span><strong>{activeRun?.conversationId || '未知'}</strong></div>
+                    <div><span>Task</span><strong>{typeof selectedEvent.payload.taskId === 'string' ? selectedEvent.payload.taskId : '未知'}</strong></div>
+                    <div><span>Run</span><strong>{selectedEvent.runId}</strong></div>
+                    <div><span>Principal</span><strong>{selectedEvent.authorization?.principal || (typeof selectedEvent.payload.principal === 'string' ? selectedEvent.payload.principal : '未知')}</strong></div>
+                    <div><span>Provenance</span><strong>{typeof selectedEvent.payload.provenance === 'string' ? selectedEvent.payload.provenance : '未知'}</strong></div>
+                    <div><span>Screening</span><strong>{typeof selectedEvent.payload.screeningState === 'string' ? selectedEvent.payload.screeningState : '未知'}</strong></div>
+                    <div><span>时间</span><strong>{selectedEvent.timestamp}</strong></div>
+                    <div><span>耗时</span><strong>{selectedEvent.durationMs != null ? `${selectedEvent.durationMs} ms` : '未知'}</strong></div>
                   </div>
                 )}
 
-                {activeTab === 'auth' && (
-                  <div>
-                    {selectedEvent.authorization ? (
-                      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                        <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                          <span>裁决结果</span>
-                          <StatusBadge
-                            variant={
-                              selectedEvent.authorization.decision === 'ALLOW' ? 'ok' : 'bad'
-                            }
-                          >
-                            {selectedEvent.authorization.decision}
-                          </StatusBadge>
-                        </div>
-                        <div>主体: {selectedEvent.authorization.principal}</div>
-                        <div>资源: {selectedEvent.authorization.resource}</div>
-                        <div>操作: {selectedEvent.authorization.action}</div>
-                        <div>地点: {selectedEvent.authorization.location}</div>
-                        <div style={{ color: 'var(--metadata)', marginTop: 4 }}>
-                          依据: {selectedEvent.authorization.reason}
-                        </div>
-                      </div>
-                    ) : (
-                      <div style={{ color: 'var(--metadata)' }}>
-                        该事件无独立鉴权裁决记录。
-                      </div>
-                    )}
-                  </div>
-                )}
-
-                {activeTab === 'timing' && (
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                    <div>序列号: #{selectedEvent.sequence}</div>
-                    <div>记录时间: {selectedEvent.timestamp}</div>
-                    <div>
-                      执行耗时: {selectedEvent.durationMs ? `${selectedEvent.durationMs} ms` : '—'}
-                    </div>
-                    <div>所属运行: {selectedEvent.runId}</div>
+                {activeTab === 'usage' && (
+                  <div className="traceSummaryGrid">
+                    <div><span>Input Token</span><strong>{typeof selectedEvent.payload.inputTokens === 'number' ? selectedEvent.payload.inputTokens.toLocaleString() : '未知'}</strong></div>
+                    <div><span>Output Token</span><strong>{typeof selectedEvent.payload.outputTokens === 'number' ? selectedEvent.payload.outputTokens.toLocaleString() : '未知'}</strong></div>
+                    <div><span>Cache Read</span><strong>{typeof selectedEvent.payload.cacheReadTokens === 'number' ? selectedEvent.payload.cacheReadTokens.toLocaleString() : '未知'}</strong></div>
+                    <div><span>Total Token</span><strong>{typeof selectedEvent.payload.totalTokens === 'number' ? selectedEvent.payload.totalTokens.toLocaleString() : '未知'}</strong></div>
+                    <div><span>Cost</span><strong>{typeof selectedEvent.payload.costUsd === 'number' ? `$${selectedEvent.payload.costUsd.toFixed(4)}` : '成本不可用'}</strong></div>
                   </div>
                 )}
 
                 {activeTab === 'raw' && (
                   <div>
                     <div style={{ color: 'var(--metadata)', marginBottom: 6 }}>
-                      // 按需装载不可变追加证据 (Raw Trace)
+                      {selectedEvent.rawTraceExcerpt
+                        ? '// 按需装载的不可变追加原始证据 (Raw Trace)'
+                        : '// 原始证据未由接口上报；以下为已筛选的 Timeline 事件载荷'}
                     </div>
-                    {selectedEvent.rawTraceExcerpt || '// 无原始证据片段'}
+                    {selectedEvent.rawTraceExcerpt || JSON.stringify(selectedEvent.payload, null, 2)}
                   </div>
                 )}
               </>

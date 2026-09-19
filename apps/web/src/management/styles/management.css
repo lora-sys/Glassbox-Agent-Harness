@@ -816,6 +816,34 @@
   gap: 12px;
 }
 
+.timelineActions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.timelineRangeLabel,
+.timelineCount,
+.timelineFeedback {
+  font-size: 11px;
+  color: var(--metadata);
+  font-family: var(--font-mono);
+}
+
+.eventScrubber {
+  width: 120px;
+  min-width: 80px;
+  accent-color: var(--focus);
+}
+
+.timelineFeedback {
+  flex-basis: 100%;
+  text-align: right;
+}
+
 .timelineList {
   flex: 1;
   overflow-y: auto;
@@ -835,6 +863,49 @@
   background: var(--surface);
   font-size: 12px;
   cursor: pointer;
+  flex-wrap: wrap;
+  content-visibility: auto;
+  contain-intrinsic-size: 42px;
+}
+
+.timelineEventExpanded {
+  flex-basis: 100%;
+  width: 100%;
+  margin: 2px 0 0 34px;
+  padding: 8px;
+  overflow: auto;
+  border-top: 1px dashed var(--line);
+  color: var(--secondary);
+  font: 11px/1.45 var(--font-mono);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.traceSummaryGrid {
+  display: grid;
+  gap: 8px;
+  white-space: normal;
+  word-break: normal;
+}
+
+.traceSummaryGrid > div {
+  display: grid;
+  grid-template-columns: minmax(88px, 0.38fr) minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--line);
+}
+
+.traceSummaryGrid span {
+  color: var(--metadata);
+}
+
+.traceSummaryGrid strong {
+  min-width: 0;
+  color: var(--ink);
+  font-weight: 500;
+  overflow-wrap: anywhere;
 }
 
 .timelineEventItem:hover {
@@ -958,7 +1029,7 @@
 }
 
 .chartLegendLine.dotted {
-  background: repeating-linear-gradient(90deg, var(--brand) 0 2px, transparent 2px 5px);
+  background: repeating-linear-gradient(90deg, var(--ink) 0 2px, transparent 2px 5px);
 }
 
 /* ==========================================================================
@@ -968,6 +1039,17 @@
 @media (max-width: 1024px) {
   .masterDetailLayout {
     flex-direction: column;
+    align-items: stretch;
+    min-width: 0;
+  }
+  .masterContent {
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+  }
+  .tableContainer {
+    width: 100%;
+    max-width: 100%;
   }
   .detailRail {
     width: 100%;
@@ -1015,6 +1097,23 @@
   }
   .pageContainer {
     padding: 16px;
+    min-width: 0;
+    max-width: 100%;
+  }
+  .timelineScrubber {
+    flex-wrap: wrap;
+    min-width: 0;
+  }
+  .timelineScrubber > * {
+    min-width: 0;
+    max-width: 100%;
+  }
+  .timelineActions {
+    justify-content: flex-start;
+    width: 100%;
+  }
+  .eventScrubber {
+    flex: 1 1 140px;
   }
   input,
   select,
@@ -1065,6 +1164,34 @@
     flex-direction: column !important;
     align-items: flex-start !important;
     gap: 8px !important;
+    min-width: 0;
+    max-width: 100%;
+  }
+  .settingsField > * {
+    min-width: 0;
+    max-width: 100%;
+  }
+  .settingsField > div:last-child {
+    width: 100%;
+  }
+  .settingsField > div:last-child > div {
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+    flex-wrap: wrap;
+  }
+  .settingsField > div:last-child > select {
+    width: 100%;
+  }
+  .settingsField > div:last-child select,
+  .settingsField > div:last-child input,
+  .settingsField > div:last-child output {
+    min-width: 0;
+    max-width: 100%;
+  }
+  .settingsField > div:last-child span {
+    white-space: normal !important;
+    overflow-wrap: anywhere;
   }
 }
 
