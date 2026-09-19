@@ -2,7 +2,7 @@
 // Focused test for the Effect Schema decode path.
 // Uses real event payloads captured from the T2.2 /run-test spike.
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "vite-plus/test";
 import { decodeEvent } from "./decode.js";
 
 // ---------------------------------------------------------------------------

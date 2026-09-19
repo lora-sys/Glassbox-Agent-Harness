@@ -1,10 +1,8 @@
 // apps/server/src/codex/adapter.ts
 // Spawns `codex app-server`, communicates via JSON-RPC 2.0 over stdio.
 
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import type { CodexEvent } from "./schema.js";
-import { decodeEvent } from "./decode.js";
 import type {
   ApprovalEvent,
   RunTestSummary,
@@ -23,118 +21,80 @@ import type {
   SessionOpts,
   TurnOpts,
 } from "../provider/types.js";
+import { gitLsFiles, gitDiffForScan, type FileSnapshot } from "../platform/git.js";
+import { resolveCodexExecutable } from "../platform/executable.js";
 
 const REQUEST_TIMEOUT_MS = 30_000;
+
+/** Optional owned transport boundary. Existing Workbench callers retain their launch configuration. */
+export interface CodexTransportOptions {
+  env?: NodeJS.ProcessEnv;
+  cwd?: string;
+  launchArgs?: readonly string[];
+  requireShellFree?: boolean;
+  quiet?: boolean;
+  maxFrameBytes?: number;
+  onNotification?: (method: string, params: unknown) => void;
+  onServerRequest?: (method: string, params: unknown) => Promise<unknown>;
+  onExit?: () => void;
+  onProtocolError?: () => void;
+}
 
 // ---------------------------------------------------------------------------
 // Workspace git-diff scanning helpers (S8 artifact detection fallback)
 // ---------------------------------------------------------------------------
-
-interface FileSnapshot {
-  [filePath: string]: string;
-}
 
 interface LifecycleHooks {
   beforeSnapshot: FileSnapshot | null;
   afterHooks: Array<(scan: { changes: { path: string; kind: string; diff?: string }[] }) => void>;
 }
 
-function gitLsFiles(cwd: string): FileSnapshot | null {
-  try {
-    const { execSync } = require("node:child_process");
-    const out = execSync("git ls-files -s", { cwd, encoding: "utf-8", timeout: 5000 }).trim();
-    if (!out) return null;
-    const snap: FileSnapshot = {};
-    for (const line of out.split("\n")) {
-      // Format: <mode> <sha1> <stage>\t<path>
-      const tab = line.indexOf("\t");
-      if (tab < 0) continue;
-      const sha = line.slice(4, 45);
-      const path = line.slice(tab + 1);
-      snap[path] = sha;
-    }
-    return snap;
-  } catch {
-    return null;
-  }
-}
-
-function gitDiffForScan(cwd: string, snapshot: FileSnapshot): { path: string; kind: string; diff?: string }[] {
-  try {
-    const { execSync } = require("node:child_process");
-    const changes: { path: string; kind: string; diff?: string }[] = [];
-
-    // name-status: list changed files with short status codes
-    const statOut = execSync("git diff --name-status", { cwd, encoding: "utf-8", timeout: 5000 }).trim();
-    if (statOut) {
-      for (const line of statOut.split("\n")) {
-        const parts = line.split("\t");
-        const status = parts[0] ?? "M";
-        const path = parts[1] ?? "";
-        const kind = status === "A" ? "add" : status === "D" ? "delete" : status === "R" ? "rename" : "modify";
-        // Full diff for the file (cap at 2KB)
-        try {
-          const diffOut = execSync("git diff -- " + path.replace(/"/g, '\\"'), { cwd, encoding: "utf-8", timeout: 5000 }).trim();
-          changes.push({ path, kind, diff: diffOut.slice(0, 2048) });
-        } catch {
-          changes.push({ path, kind });
-        }
-      }
-    } else {
-      // Fallback: compare against stored snapshot
-      const current = gitLsFiles(cwd);
-      if (current) {
-        for (const [path, oldSha] of Object.entries(snapshot)) {
-          const newSha = current[path];
-          if (oldSha !== newSha) {
-            changes.push({ path, kind: "modify" });
-          }
-        }
-        for (const path of Object.keys(current)) {
-          if (!(path in snapshot)) {
-            changes.push({ path, kind: "add" });
-          }
-        }
-      }
-    }
-    return changes;
-  } catch {
-    return [];
-  }
-}
-
 /**
  * Run a single lifecycle hook asynchronously (fire-and-forget).
  */
-function runHookAsync(hook: (scan: { changes: { path: string; kind: string; diff?: string }[] }) => void, scan: { changes: { path: string; kind: string; diff?: string }[] }) {
-  try { hook(scan); } catch { /* ignore hook errors */ }
+function runHookAsync(
+  hook: (scan: { changes: { path: string; kind: string; diff?: string }[] }) => void,
+  scan: { changes: { path: string; kind: string; diff?: string }[] },
+) {
+  try {
+    hook(scan);
+  } catch {
+    /* ignore hook errors */
+  }
 }
 
 export class CodexAdapter extends EventEmitter implements ProviderAdapter {
   pid: number;
+  private spawnError: Error | null = null;
 
   private child: ReturnType<typeof spawn> | null = null;
-  private pendingRequests = new Map<number | string, {
-    resolve: (v: unknown) => void;
-    reject: (e: Error) => void;
-    timer: ReturnType<typeof setTimeout>;
-  }>();
+  private pendingRequests = new Map<
+    number | string,
+    {
+      resolve: (v: unknown) => void;
+      reject: (e: Error) => void;
+      timer: ReturnType<typeof setTimeout>;
+    }
+  >();
   private nextReqId = 1;
   private stdoutAccum = "";
   private closed = false;
 
   // Event collection state (set by collectTurnEvents, cleared when done)
-  private _collectHandler: ((method: string, params: unknown) => void) | null = null;
+  private collectors = new Set<(method: string, params: unknown) => void>();
   private _decodeFailCount = 0;
 
   // Subscribers notified when a turn ends (turn/completed received).
-  private _turnEndSubscribers: Array<(status: string) => void> = [];
+  private _turnEndSubscribers: Array<{ fn: (status: string) => void; threadId?: string }> = [];
 
   // Pending approval requests indexed by their server-assigned request id.
-  private _pendingApprovals = new Map<number | string, {
-    method: string;
-    params: Record<string, unknown>;
-  }>();
+  private _pendingApprovals = new Map<
+    number | string,
+    {
+      method: string;
+      params: Record<string, unknown>;
+    }
+  >();
 
   // Per-turn workspace lifecycle hooks (S8: git diff scanning for artifacts)
   private _lifecycleLatch: LifecycleHooks = {
@@ -143,12 +103,11 @@ export class CodexAdapter extends EventEmitter implements ProviderAdapter {
   };
 
   // Effect-backed event decoder (optional: may be null in minimal builds).
-  private _decodeEnabled = false;
 
   /** Enable or disable the Effect Schema decode gate. Default: false.
    *  Codex-internal debug only — not part of ProviderAdapter. */
   setDecodeEnabled(enabled: boolean): void {
-    this._decodeEnabled = enabled;
+    void enabled;
   }
 
   /** Number of decode failures observed since the last reset.
@@ -158,16 +117,20 @@ export class CodexAdapter extends EventEmitter implements ProviderAdapter {
   }
 
   /** Register a callback that fires when the next turn/completed event is received. */
-  registerOnTurnEnd(fn: (status: string) => void): void {
-    this._turnEndSubscribers.push(fn);
+  registerOnTurnEnd(fn: (status: string) => void, threadId?: string): void {
+    this._turnEndSubscribers.push({ fn, threadId });
   }
 
   /** Fire and clear all turn-end subscribers (called from the event handler). */
-  private _fireTurnEnd(status: string): void {
-    const subs = [...this._turnEndSubscribers];
-    this._turnEndSubscribers.length = 0;
-    for (const fn of subs) {
-      try { fn(status); } catch { /* ignore subscriber errors */ }
+  private _fireTurnEnd(status: string, threadId: string): void {
+    const subs = this._turnEndSubscribers.filter((entry) => !entry.threadId || entry.threadId === threadId);
+    this._turnEndSubscribers = this._turnEndSubscribers.filter((entry) => entry.threadId && entry.threadId !== threadId);
+    for (const { fn } of subs) {
+      try {
+        fn(status);
+      } catch {
+        /* ignore subscriber errors */
+      }
     }
   }
 
@@ -175,11 +138,11 @@ export class CodexAdapter extends EventEmitter implements ProviderAdapter {
 
   /** Register a callback to fire after the next turn, with workspace diff results. */
   addLifecycleHook(
-    fn: (scan: { changes: { path: string; kind: string; diff?: string }[] }) => void
+    fn: (scan: { changes: { path: string; kind: string; diff?: string }[] }) => void,
   ): () => void {
     this._lifecycleLatch.afterHooks.push(fn);
     return () => {
-      this._lifecycleLatch.afterHooks = this._lifecycleLatch.afterHooks.filter(h => h !== fn);
+      this._lifecycleLatch.afterHooks = this._lifecycleLatch.afterHooks.filter((h) => h !== fn);
     };
   }
 
@@ -214,7 +177,10 @@ export class CodexAdapter extends EventEmitter implements ProviderAdapter {
     return null;
   }
 
-  constructor(private codexPath = "codex") {
+  constructor(
+    private codexPath = process.env.CODEX_BINARY_PATH ?? "codex",
+    private readonly transport: CodexTransportOptions = {},
+  ) {
     super();
     this.pid = 0;
   }
@@ -222,26 +188,77 @@ export class CodexAdapter extends EventEmitter implements ProviderAdapter {
   // ---- Lifecycle ----
 
   start(): void {
-    this.child = spawn(this.codexPath, ["app-server"], {
-      stdio: ["pipe", "pipe", "pipe"],
+    if (this.child) return;
+    this.closed = false;
+    this.spawnError = null;
+
+    const resolved = resolveCodexExecutable({
+      binaryPath: this.codexPath,
+      env: this.transport.env,
     });
+    if (!resolved || (this.transport.requireShellFree && resolved.shell)) {
+      this.spawnError = new Error(
+        `Codex executable not found at "${this.codexPath}". Ensure codex is installed and in PATH, or set CODEX_BINARY_PATH.`,
+      );
+      this.closed = true;
+      throw this.spawnError;
+    }
+
+    try {
+      this.child = spawn(
+        resolved.command,
+        [...resolved.args, ...(this.transport.launchArgs ?? [])],
+        {
+          stdio: ["pipe", "pipe", "pipe"],
+          shell: resolved.shell,
+          windowsHide: true,
+          env: this.transport.env,
+          cwd: this.transport.cwd,
+        },
+      );
+    } catch (err) {
+      this.spawnError = err instanceof Error ? err : new Error(String(err));
+      this.closed = true;
+      throw this.spawnError;
+    }
 
     this.pid = this.child.pid ?? 0;
-
-    this.child.stderr?.on("data", (data: Buffer) => {
-      console.error(`[codex:${this.pid} stderr] ${data.toString().trimEnd()}`);
+    this.child.stdin?.on("error", () => {
+      this.rejectAllPending(new Error("Codex input stream closed"));
     });
 
-    this.child.on("error", (err) => this.rejectAllPending(err));
+    this.child.stderr?.on("data", (data: Buffer) => {
+      if (!this.transport.quiet)
+        console.error(`[codex:${this.pid} stderr] ${data.toString().trimEnd()}`);
+    });
+
+    this.child.on("error", (err) => {
+      this.spawnError = err;
+      this.rejectAllPending(err);
+      if (!this.child?.pid) this.transport.onExit?.();
+    });
 
     this.child.on("exit", () => {
-      this.rejectAllPending(new Error("codex app-server process exited"));
-      this.closed = true;
+      if (!this.closed) {
+        this.rejectAllPending(new Error("codex app-server process exited"));
+        this.closed = true;
+      }
+      this.transport.onExit?.();
     });
 
     const decoder = new TextDecoder();
     this.child.stdout?.on("data", (raw: Buffer) => {
       this.stdoutAccum += decoder.decode(raw, { stream: true });
+      if (
+        Buffer.byteLength(this.stdoutAccum, "utf8") >
+        (this.transport.maxFrameBytes ?? 4 * 1024 * 1024)
+      ) {
+        this.stdoutAccum = "";
+        this.rejectAllPending(new Error("Codex protocol frame limit exceeded"));
+        this.transport.onProtocolError?.();
+        this.child?.kill("SIGTERM");
+        return;
+      }
       const lines = this.stdoutAccum.split("\n");
       this.stdoutAccum = lines.pop() ?? "";
       for (const line of lines) {
@@ -250,7 +267,8 @@ export class CodexAdapter extends EventEmitter implements ProviderAdapter {
         try {
           this.dispatchMessage(JSON.parse(trimmed) as JsonRpcMessage);
         } catch {
-          console.error(`[codex:${this.pid}] non-json stdout: ${trimmed.slice(0, 120)}`);
+          if (!this.transport.quiet) console.error(`[codex:${this.pid}] non-json stdout`);
+          this.transport.onProtocolError?.();
         }
       }
     });
@@ -259,18 +277,89 @@ export class CodexAdapter extends EventEmitter implements ProviderAdapter {
   stop(): void {
     if (this.closed) return;
     this.closed = true;
-    this._collectHandler = null;
-    try {
-      process.kill(this.pid, "SIGTERM");
-    } catch {
-      // already gone
+    this.collectors.clear();
+    this._turnEndSubscribers = [];
+    this.rejectAllPending(new Error("codex adapter stopped"));
+    if (this.child) {
+      const pidToKill = this.pid;
+      try {
+        this.child.removeAllListeners();
+        if (process.platform === "win32" && pidToKill > 0) {
+          try {
+            execFileSync("taskkill.exe", ["/pid", String(pidToKill), "/T", "/F"], {
+              stdio: "ignore",
+              windowsHide: true,
+            });
+          } catch {
+            this.child.kill("SIGTERM");
+          }
+        } else {
+          this.child.kill("SIGTERM");
+        }
+      } catch {
+        // already gone
+      }
+      this.child = null;
     }
+    this.pid = 0;
+  }
+
+  /** Wait for real child exit. Abort acknowledgement and a sent signal are not exit evidence. */
+  async shutdownAndWait(timeoutMs = 3000): Promise<boolean> {
+    const child = this.child;
+    if (!child) return true;
+    this.closed = true;
+    this.rejectAllPending(new Error("Codex transport shutdown"));
+    if (child.exitCode !== null || child.signalCode || (!child.pid && this.spawnError)) return true;
+    const ended = new Promise<boolean>((resolve) => {
+      child.once("exit", () => resolve(true));
+      child.once("error", () => {
+        if (!child.pid) resolve(true);
+      });
+    });
+    const wait = async () => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          ended,
+          new Promise<false>((resolve) => {
+            timer = setTimeout(() => resolve(false), timeoutMs);
+          }),
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+    child.stdin?.end();
+    if (await wait()) return true;
+    child.kill("SIGTERM");
+    if (await wait()) return true;
+    if (process.platform === "win32" && child.pid) {
+      try {
+        execFileSync("taskkill.exe", ["/pid", String(child.pid), "/T", "/F"], {
+          stdio: "ignore",
+          windowsHide: true,
+          timeout: timeoutMs,
+        });
+      } catch {
+        child.kill("SIGKILL");
+      }
+    } else child.kill("SIGKILL");
+    return wait();
+  }
+
+  /** Harness integrations share this transport instead of maintaining a second JSON-RPC client. */
+  requestProtocol(method: string, params: unknown): Promise<unknown> {
+    return this.sendRequest(method, params);
   }
 
   // ---- ProviderAdapter surface ----
 
   /** Initialize connection. Must be called once before other methods. */
   async initialize(): Promise<ServerInfo> {
+    if (this.spawnError) {
+      throw new Error(`Codex process failed to start: ${this.spawnError.message}`);
+    }
     const result = await this.sendRequest("initialize", {
       protocolVersion: "2025-06-18",
       capabilities: { experimentalApi: true },
@@ -284,10 +373,12 @@ export class CodexAdapter extends EventEmitter implements ProviderAdapter {
   /** Start a session (Codex: thread). Returns the provider-assigned session object. */
   async startSession(clientSessionId: string, opts: SessionOpts = {}): Promise<Session> {
     const result = await this.sendRequest("thread/start", {
-      threadId: clientSessionId,             // wire-level name
+      threadId: clientSessionId, // wire-level name
       cwd: opts.cwd ?? null,
       sandbox: (opts as Record<string, unknown> & { sandbox?: string }).sandbox ?? "read-only",
-      approvalPolicy: (opts as Record<string, unknown> & { approvalPolicy?: string }).approvalPolicy ?? "on-request",
+      approvalPolicy:
+        (opts as Record<string, unknown> & { approvalPolicy?: string }).approvalPolicy ??
+        "on-request",
     });
     return { id: (result as { thread: Thread }).thread.id };
   }
@@ -310,7 +401,7 @@ export class CodexAdapter extends EventEmitter implements ProviderAdapter {
 
   /** Interrupt a running turn. */
   async interruptTurn(sessionId: string, turnId: string): Promise<void> {
-    await this.sendRequest("turn/interrupt", { threadId: sessionId, turn: turnId });
+    await this.sendRequest("turn/interrupt", { threadId: sessionId, turnId });
   }
 
   /** Collect all events from a turn until turn/completed or timeout. */
@@ -318,168 +409,75 @@ export class CodexAdapter extends EventEmitter implements ProviderAdapter {
     sessionId: string,
     turnId: string,
     timeoutMs: number,
-    traceCollector?: (method: string, params: Record<string, unknown>) => void
+    traceCollector?: (method: string, params: Record<string, unknown>) => void,
   ): Promise<RunResult> {
     const counts: Record<string, number> = {};
     const approvals: ApprovalEvent[] = [];
     let agentMessageDeltas = 0;
-    let completed: { status: TurnStatus; durationMs: number | null; error?: string } | null = null;
-    let turnStartedAt: number | null = null;
-
-    const donePromise = new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, timeoutMs);
-
+    let turnStatus: TurnStatus = "inProgress";
+    let turnDurationMs: number | null = null;
+    let error: string | undefined;
+    await new Promise<void>((resolve) => {
+      const finish = () => {
+        clearTimeout(timer);
+        this.collectors.delete(handler);
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        error = "OBSERVATION_TIMED_OUT";
+        // Preserve the evidence sink until a real terminal event or transport stop.
+        resolve();
+      }, timeoutMs);
       const handler = (method: string, params: unknown) => {
-        // Feed raw event metadata to the trace collector before any processing.
-        const rawParams: Record<string, unknown> =
-          typeof params === "object" && params !== null
-            ? (params as Record<string, unknown>)
-            : {};
-        traceCollector?.(method, rawParams);
-
-        counts[method] = (counts[method] || 0) + 1;
-
-        // Capture startedAt from the turn/started event for synthetic completion
-        if (method === "turn/started" && turnStartedAt === null) {
-          const p = rawParams as { turn?: { startedAt?: number } };
-          if (p.turn?.startedAt) turnStartedAt = p.turn.startedAt;
-        }
-
-        // Try to decode the notification through the Effect Schema pipeline.
-        let decoded: unknown = null;
-        if (this._decodeEnabled) {
-          try {
-            decodeEvent({ method, params }).then(r => { decoded = r; }).catch(() => {});
-          } catch {
-            this._decodeFailCount++;
-          }
-        }
-
-        // --- Success path: typed dispatch ----------------------------------
-        if (decoded !== null) {
-          const ev = decoded as CodexEvent;
-          switch (ev._tag) {
-            case "turnCompleted": {
-              completed = {
-                status: ev.turn.status as TurnStatus,
-                durationMs: ev.turn.durationMs,
-                error: ev.turn.error ? JSON.stringify(ev.turn.error) : undefined,
-              };
-              this._fireTurnEnd(ev.turn.status as string);
-              clearTimeout(timer);
-              resolve();
-              break;
-            }
-            case "agentMessageDelta": {
-              agentMessageDeltas++;
-              break;
-            }
-            case "requestApproval": {
-              const approvalEv: ApprovalEvent = {
-                type: "approval",
-                method,
-                threadId: ev.threadId,
-                turnId: ev.turnId,
-                itemId: ev.itemId,
-                startedAtMs: ev.startedAtMs,
-                reason: (ev.reason as string | null | undefined) ?? null,
-                grantRoot: (ev.grantRoot as string | null | undefined) ?? null,
-                action: "pending",
-              };
-              approvals.push(approvalEv);
-              this.emit("approval", approvalEv);
-              break;
-            }
-            default:
-              break;
-          }
-          return;
-        }
-
-        // --- Fallback path: raw-cast extraction (preserves T2.2 behaviour)-
-        if (method === "turn/completed") {
-          const turn = (params as { turn: Turn }).turn;
-          completed = {
-            status: turn.status,
-            durationMs: turn.durationMs,
-            error: turn.error ? JSON.stringify(turn.error) : undefined,
-          };
-          traceCollector?.(method, typeof params === "object" && params !== null
-            ? (params as Record<string, unknown>)
-            : {});
-          this._fireTurnEnd(turn.status);
-          clearTimeout(timer);
-          resolve();
-        } else if (method === "item/agentMessage/delta") {
-          agentMessageDeltas++;
-        } else if (method === "turn/diff/updated") {
-          traceCollector?.(method, typeof params === "object" && params !== null
-            ? (params as Record<string, unknown>)
-            : {});
-        } else if (method.endsWith("/requestApproval")) {
-          const p = params as Record<string, unknown>;
-          const pThreadId = p.threadId as string;
+        if (!params || typeof params !== "object") return;
+        const raw = params as Record<string, unknown>;
+        const turn =
+          raw.turn && typeof raw.turn === "object"
+            ? (raw.turn as Record<string, unknown>)
+            : undefined;
+        const eventTurnId = raw.turnId ?? turn?.id;
+        if (raw.threadId !== sessionId || eventTurnId !== turnId) return;
+        counts[method] = (counts[method] ?? 0) + 1;
+        traceCollector?.(method, raw);
+        if (method === "item/agentMessage/delta") agentMessageDeltas++;
+        if (method.endsWith("/requestApproval")) {
           const ev: ApprovalEvent = {
             type: "approval",
             method,
-            threadId: pThreadId,
-            turnId: p.turnId as string,
-            itemId: p.itemId as string,
-            startedAtMs: p.startedAtMs as number,
-            reason: (p.reason as string | null) ?? null,
-            grantRoot: (p.grantRoot as string | null) ?? null,
+            threadId: sessionId,
+            turnId,
+            itemId: typeof raw.itemId === "string" ? raw.itemId : "",
+            startedAtMs: Date.now(),
+            reason: null,
+            grantRoot: null,
             action: "pending",
           };
           approvals.push(ev);
           this.emit("approval", ev);
         }
+        if (
+          method === "turn/completed" &&
+          turn &&
+          ["completed", "failed", "interrupted"].includes(String(turn.status))
+        ) {
+          turnStatus = turn.status as TurnStatus;
+          turnDurationMs = typeof turn.durationMs === "number" ? turn.durationMs : null;
+          if (turn.error) error = "PROVIDER_FAILED";
+          finish();
+        }
       };
-
-      this._collectHandler = handler;
+      this.collectors.add(handler);
     });
-
-    await donePromise;
-    this._collectHandler = null;
-
-    // If turn/completed never arrived (the Codex CLI may omit it), synthesize
-    // one so the reducer can flush pending diffs into artifacts and finalize
-    // the turn record. This only fires on timeout, not on real completion.
-    if (!completed && turnStartedAt !== null) {
-      const nowSec = Math.floor(Date.now() / 1000);
-      const syntheticParams: Record<string, unknown> = {
-        threadId: sessionId,    // map neutral name back to wire-level
-        turn: {
-          id: turnId,
-          status: "completed",
-          startedAt: turnStartedAt,
-          completedAt: nowSec,
-          durationMs: nowSec - turnStartedAt,
-          error: null,
-        },
-      };
-      traceCollector?.("turn/completed", syntheticParams);
-    }
-
-    if (!completed) {
-      completed = {
-        status: "completed" as TurnStatus,
-        durationMs: null,
-        error: undefined,
-      };
-    }
-
-    const turnResult: RunResult = {
-      sessionId,     // was threadId — ProviderAdapter neutral name
+    return {
+      sessionId,
       turnId,
-      eventCounts: counts,
-      turnStatus: (completed?.status as TurnStatus | undefined) ?? "failed",
-      turnDurationMs: completed?.durationMs ?? null,
-      approvals,
+      eventCounts: { ...counts },
+      turnStatus,
+      turnDurationMs,
+      approvals: [...approvals],
       agentMessageDeltas,
-      error: completed?.error,
+      ...(error ? { error } : {}),
     };
-
-    return turnResult;
   }
 
   // ---- Internal helpers (not on ProviderAdapter) ----
@@ -490,26 +488,59 @@ export class CodexAdapter extends EventEmitter implements ProviderAdapter {
     input: UserInput[],
     timeoutMs: number,
     traceCollector?: (method: string, params: Record<string, unknown>) => void,
-    opts: { sandboxPolicy?: SandboxPolicy; cwd?: string } = {}
+    opts: { sandboxPolicy?: SandboxPolicy; cwd?: string } = {},
   ): Promise<RunTestSummary> {
     const params: Record<string, unknown> = { threadId, input };
     if (opts.sandboxPolicy) params.sandboxPolicy = opts.sandboxPolicy;
     if (opts.cwd) params.cwd = opts.cwd;
 
-    const summary = await this.collectTurnEvents(threadId, "", timeoutMs, traceCollector);
-    const result = await this.sendRequest("turn/start", params);
-    const turn = (result as { turn: Turn }).turn;
-    return { ...summary, turnId: turn.id, threadId };
+    const buffered: Array<[string, unknown]> = [];
+    let overflow = false;
+    const buffer = (method: string, value: unknown) => {
+      if (!value || typeof value !== "object" || (value as Record<string, unknown>).threadId !== threadId) return;
+      if (buffered.length >= 128 || Buffer.byteLength(JSON.stringify(value)) > 128 * 1024) overflow = true;
+      else buffered.push([method, value]);
+    };
+    this.collectors.add(buffer);
+    try {
+      const result = await this.sendRequest("turn/start", params);
+      const turn = (result as { turn: Turn }).turn;
+      if (overflow) throw new Error("Codex initial event buffer exceeded");
+      this.collectors.delete(buffer);
+      const collecting = this.collectTurnEvents(threadId, turn.id, timeoutMs, traceCollector);
+      for (const [method, value] of buffered) {
+        for (const collector of this.collectors) collector(method, value);
+      }
+      const summary = await collecting;
+      return { ...summary, turnId: turn.id, threadId };
+    } finally {
+      this.collectors.delete(buffer);
+    }
   }
 
   // ---- Protocol internals ----
 
   private sendNotification(method: string): void {
-    const msg = { jsonrpc: "2.0", method } as const;
-    this.child?.stdin?.write(JSON.stringify(msg) + "\n");
+    if (this.closed || !this.child?.stdin || this.child.stdin.destroyed) return;
+    try {
+      const msg = { jsonrpc: "2.0", method } as const;
+      this.child.stdin.write(JSON.stringify(msg) + "\n");
+    } catch {
+      // ignore write error for notifications
+    }
   }
 
   private async sendRequest(method: string, params: unknown): Promise<unknown> {
+    if (this.spawnError) {
+      return Promise.reject(new Error(`Codex process error: ${this.spawnError.message}`));
+    }
+    if (this.closed) {
+      return Promise.reject(new Error("codex adapter is closed"));
+    }
+    if (!this.child || !this.child.stdin || this.child.stdin.destroyed) {
+      return Promise.reject(new Error("codex child process stdin is not available"));
+    }
+
     const id = this.nextReqId++;
     const msg: JsonRpcRequest = { jsonrpc: "2.0", id, method, params };
     return new Promise((resolve, reject) => {
@@ -519,12 +550,23 @@ export class CodexAdapter extends EventEmitter implements ProviderAdapter {
       }, REQUEST_TIMEOUT_MS);
 
       this.pendingRequests.set(id, { resolve, reject, timer });
-      this.child?.stdin?.write(JSON.stringify(msg) + "\n");
+      try {
+        this.child!.stdin!.write(JSON.stringify(msg) + "\n");
+      } catch (err) {
+        clearTimeout(timer);
+        this.pendingRequests.delete(id);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
     });
   }
 
   private sendResponse(requestId: number | string, result: unknown): void {
-    this.child?.stdin?.write(JSON.stringify({ jsonrpc: "2.0", id: requestId, result }) + "\n");
+    if (this.closed || !this.child?.stdin || this.child.stdin.destroyed) return;
+    try {
+      this.child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: requestId, result }) + "\n");
+    } catch {
+      // ignore write error for responses
+    }
   }
 
   private dispatchMessage(msg: JsonRpcMessage): void {
@@ -565,21 +607,26 @@ export class CodexAdapter extends EventEmitter implements ProviderAdapter {
     }
   }
 
-  private handleServerRequest(
-    id: number | string,
-    method: string,
-    params: unknown
-  ): void {
+  private handleServerRequest(id: number | string, method: string, params: unknown): void {
+    if (this.transport.onServerRequest) {
+      void this.transport.onServerRequest(method, params).then(
+        (result) => this.sendResponse(id, result),
+        () => {
+          this.transport.onProtocolError?.();
+          // An unknown request never receives a permissive generic acknowledgement.
+          this.child?.stdin?.write(
+            JSON.stringify({ id, error: { code: -32601, message: "Request denied" } }) + "\n",
+          );
+        },
+      );
+      return;
+    }
     // Approval requests: do NOT auto-approve. Store the request id so the
     // /decide endpoint can respond later when the user makes a choice.
     if (method.endsWith("requestApproval")) {
-      if (this._collectHandler) {
-        this._collectHandler(method, params);
-      }
+      for (const collector of this.collectors) collector(method, params);
       const rawParams: Record<string, unknown> =
-        typeof params === "object" && params !== null
-          ? (params as Record<string, unknown>)
-          : {};
+        typeof params === "object" && params !== null ? (params as Record<string, unknown>) : {};
       this._pendingApprovals.set(id, { method, params: rawParams });
       return;
     }
@@ -589,10 +636,16 @@ export class CodexAdapter extends EventEmitter implements ProviderAdapter {
   }
 
   private emitNotification(method: string, params: unknown): void {
-    // Forward to any active event collector
-    if (this._collectHandler) {
-      this._collectHandler(method, params);
+    if (method === "turn/completed" && params && typeof params === "object") {
+      const value = params as Record<string, unknown>;
+      const turn = value.turn && typeof value.turn === "object" ? value.turn as Record<string, unknown> : undefined;
+      if (typeof value.threadId === "string" && ["completed", "interrupted", "failed"].includes(String(turn?.status))) {
+        this._fireTurnEnd(String(turn!.status), value.threadId);
+      }
     }
+    // Forward to any active event collector
+    this.transport.onNotification?.(method, params);
+    for (const collector of this.collectors) collector(method, params);
   }
 
   private rejectAllPending(err: Error): void {

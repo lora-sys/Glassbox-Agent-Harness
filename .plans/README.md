@@ -20,7 +20,7 @@ Turso persistence
 Run / Authorization Trace
 ```
 
-Authorization is P0. Do not start real WeChat, QQ, Mail, Calendar, Memory consolidation, Skill evolution, LongTask, Eval, Arena, or AGY integration before Plan 03's completion gate is satisfied.
+Authorization is P0. Plan 03 starts with QQ group mentions and Owner private chat, including a bounded Run-linked Eval acceptance loop. Do not start real WeChat, Mail, Calendar, Memory consolidation, Skill evolution, LongTask, the full Eval platform, or Arena before Plan 03's completion gate is satisfied.
 
 ## Read order for implementation
 

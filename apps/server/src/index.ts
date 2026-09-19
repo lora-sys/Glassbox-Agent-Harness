@@ -1,7 +1,12 @@
 // apps/server — Glassbox runtime HTTP shell with Codex and Claude Code adapter endpoints.
 import http from "node:http";
-import { mkdirSync, writeFileSync, statSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
+import { pathToFileURL } from "node:url";
+import { join } from "node:path";
+import { openManagementRuntime, serverPort } from "./management/runtime.js";
+import { ManagementError } from "./management/access.js";
+import { resolveExecutablePath } from "./platform/executable.js";
 
 import { createAdapter } from "./provider/index.js";
 import type { ProviderAdapter } from "./provider/types.js";
@@ -22,26 +27,21 @@ import {
   broadcastApproval,
 } from "./ws/server.js";
 
-const PORT = Number.parseInt(process.env.PORT ?? "3030", 10);
-function isGlassboxRepoPath(p: string): boolean {
-  // Reject paths inside the Glassbox repo itself
-  return p === "/data/lora/repos/Glassbox-Agent-Harness" || p.endsWith("/Glassbox-Agent-Harness");
-}
+import { getDefaultWorkspace, validateRepoPath, getGlassboxDataDir } from "./platform/paths.js";
 
-function validateRepoPath(p: string): { ok: true } | { ok: false; error: string } {
-  if (!p || typeof p !== "string") return { ok: false, error: "repo path required" };
-  if (p === "~/.glassbox" || p.startsWith("~/.glassbox/")) return { ok: false, error: "~/.glassbox is reserved" };
-  if (isGlassboxRepoPath(p)) return { ok: false, error: "Glassbox repo path is not allowed: " + p };
-  try {
-    const s = statSync(p);
-    if (!s.isDirectory()) return { ok: false, error: "not a directory: " + p };
-  } catch {
-    return { ok: false, error: "path does not exist: " + p };
-  }
-  return { ok: true };
-}
+let management: Awaited<ReturnType<typeof openManagementRuntime>> | undefined;
 
-function recordSessionConfig(_sessionId: string, traceCollector: (method: string, params: Record<string, unknown>) => void, config: { provider: string; permissionMode?: string; approvalPolicy?: string; sandboxPolicy?: string; repoPath: string }) {
+function recordSessionConfig(
+  _sessionId: string,
+  traceCollector: (method: string, params: Record<string, unknown>) => void,
+  config: {
+    provider: string;
+    permissionMode?: string;
+    approvalPolicy?: string;
+    sandboxPolicy?: string;
+    repoPath: string;
+  },
+) {
   traceCollector("session.config", {
     kind: "session.config",
     provider: config.provider,
@@ -57,11 +57,9 @@ function recordSessionConfig(_sessionId: string, traceCollector: (method: string
 // Repo-path defaults per provider
 // ---------------------------------------------------------------------------
 
-const DEFAULT_WORKSPACE_CODEX = "/tmp/glassbox-t2.2";
-const DEFAULT_WORKSPACE_CLAUDE = "/tmp/glassbox-claude";
-
-// Backward-compat: WORKSPACE aliases the default codex workspace.
-const WORKSPACE = DEFAULT_WORKSPACE_CODEX;
+const DEFAULT_WORKSPACE_CODEX = getDefaultWorkspace("codex");
+const DEFAULT_WORKSPACE_CLAUDE = getDefaultWorkspace("claude-code");
+const DEFAULT_WORKSPACE_DEMO = getDefaultWorkspace("demo");
 
 function defaultWorkspaceFor(provider: string): string {
   return provider === "claude-code" ? DEFAULT_WORKSPACE_CLAUDE : DEFAULT_WORKSPACE_CODEX;
@@ -104,9 +102,9 @@ function sessionStartOpts(opts: SessionRunOptions): Record<string, unknown> {
     "read-only": "read-only",
     "workspace-write": "workspace-write",
     "danger-full-access": "danger-full-access",
-    "readOnly": "read-only",
-    "workspaceWrite": "workspace-write",
-    "dangerFullAccess": "danger-full-access",
+    readOnly: "read-only",
+    workspaceWrite: "workspace-write",
+    dangerFullAccess: "danger-full-access",
   };
   const wireResult = sandboxWireMap[opts.sandboxType] || opts.sandboxType;
   return {
@@ -129,6 +127,7 @@ function turnStartOpts(opts: SessionRunOptions, _workspace: string): Record<stri
   const sandboxType = sandboxWireMap[opts.sandboxType] || opts.sandboxType;
   return {
     sandboxPolicy: { type: sandboxType, networkAccess: false },
+    approvalPolicy: opts.approvalPolicy,
   };
 }
 
@@ -151,40 +150,113 @@ export function multiply(a, b) {
 }
 `;
 
-mkdirSync(WORKSPACE, { recursive: true });
-
-const adapter = createAdapter("codex");
-const claudeAdapter = createAdapter("claude-code");
-adapter.start();
-claudeAdapter.start();
-let adapterReady = false;
 const traceStore = new RawTraceStore();
 
 // Session → provider adapter map (created when session starts, cleaned up on end)
 const sessionAdapters = new Map<string, ProviderAdapter>();
 
-function getSessionAdapter(sessionId: string): ProviderAdapter {
-  return sessionAdapters.get(sessionId) || adapter;
+interface ProviderSlot {
+  adapter: ProviderAdapter;
+  ready: boolean;
+  initPromise: Promise<ProviderAdapter> | null;
 }
 
-async function ensureInitialized(): Promise<void> {
-  if (adapterReady) return;
-  await adapter.initialize();
-  await claudeAdapter.initialize();
-  adapterReady = true;
+const providerSlots = new Map<string, ProviderSlot>();
+
+export async function getOrInitAdapter(
+  provider: "codex" | "claude-code",
+): Promise<ProviderAdapter> {
+  let slot = providerSlots.get(provider);
+  if (!slot) {
+    const adapter = createAdapter(provider);
+    slot = { adapter, ready: false, initPromise: null };
+    providerSlots.set(provider, slot);
+  }
+
+  if (slot.ready) {
+    return slot.adapter;
+  }
+
+  if (slot.initPromise) {
+    return slot.initPromise;
+  }
+
+  const initializingSlot = slot;
+  slot.initPromise = Promise.resolve().then(async () => {
+    try {
+      initializingSlot.adapter.start();
+      await initializingSlot.adapter.initialize();
+      initializingSlot.ready = true;
+      return initializingSlot.adapter;
+    } catch (err) {
+      try {
+        initializingSlot.adapter.stop();
+      } catch {
+        /* Preserve the initialization error. */
+      }
+      providerSlots.delete(provider);
+      const providerName = provider === "claude-code" ? "Claude Code" : "Codex";
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `Failed to initialize ${providerName} provider: ${errorMsg}. ` +
+          `Ensure the executable is installed and available in PATH, or choose another configured provider.`,
+      );
+    } finally {
+      initializingSlot.initPromise = null;
+    }
+  });
+
+  return slot.initPromise;
+}
+
+export async function ensureInitialized(
+  provider: "codex" | "claude-code" = "claude-code",
+): Promise<ProviderAdapter> {
+  return getOrInitAdapter(provider);
+}
+
+function getSessionAdapter(sessionId: string): ProviderAdapter {
+  const adapter = sessionAdapters.get(sessionId);
+  if (!adapter) throw new Error("The session has no active provider");
+  return adapter;
 }
 
 function parseBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    let chunks: Buffer[] = [];
+    let bytes = 0;
+    let settled = false;
+    const fail = (message: string) => {
+      if (settled) return;
+      settled = true;
+      chunks = [];
+      reject(new ManagementError("INVALID_REQUEST", message));
+    };
+    req.on("data", (chunk: Buffer) => {
+      if (settled) return;
+      bytes += chunk.length;
+      if (bytes > 1024 * 1024) fail("Request body exceeds 1 MiB");
+      else chunks.push(chunk);
+    });
     req.on("end", () => {
+      if (settled) return;
       const raw = Buffer.concat(chunks).toString("utf-8");
       if (!raw) return resolve({});
-      try { resolve(JSON.parse(raw)); }
-      catch { reject(new Error("invalid json body")); }
+      try {
+        const value: unknown = JSON.parse(raw);
+        if (!value || typeof value !== "object" || Array.isArray(value)) {
+          fail("Expected a JSON object");
+          return;
+        }
+        settled = true;
+        chunks = [];
+        resolve(value as Record<string, unknown>);
+      } catch {
+        fail("Invalid JSON body");
+      }
     });
-    req.on("error", reject);
+    req.once("error", () => fail("Request could not be read"));
+    req.once("aborted", () => fail("Request was interrupted"));
   });
 }
 
@@ -201,6 +273,8 @@ interface SessionRecord {
   provider: string;
   /** Workspace path for this session (used for git diff scanning). */
   workspace: string;
+  /** Effective startup policy is reused for every subsequent explicit action. */
+  runOptions: Readonly<SessionRunOptions>;
   /** Active turn UUID, or null when no turn is in progress. */
   activeTurnId: string | null;
   /** Ordered list of every turn UUID for this session. */
@@ -226,7 +300,7 @@ async function startNewTurn(
   session: SessionRecord,
   instruction: string,
   workspace: string,
-  traceCollector: (method: string, params: Record<string, unknown>) => void
+  traceCollector: (method: string, params: Record<string, unknown>) => void,
 ): Promise<{
   turnId: string;
   eventCounts: Record<string, number>;
@@ -248,23 +322,18 @@ async function startNewTurn(
   // The adapter emits turn/started as soon as the provider receives the
   // request, so starting first then attaching the handler still captures
   // that marker while avoiding a 30s timeout if no prior turn is in flight.
-  const turn = await getSessionAdapter(session.threadId).startTurn(session.threadId, [
-    { type: "text", text: instruction },
-  ], {
-    sandboxPolicy: {
-      type: "workspaceWrite",
-      writableRoots: [workspace],
-      networkAccess: false,
-    },
-    cwd: workspace,
-  });
+  const turn = await getSessionAdapter(session.threadId).startTurn(
+    session.threadId,
+    [{ type: "text", text: instruction }],
+    { ...turnStartOpts(session.runOptions, workspace), cwd: workspace },
+  );
+  session.activeTurnId = turn.id;
 
   // Now attach the event collector for the new turn.
   const evCounts: Record<string, number> = {} as Record<string, number>;
   let capturedTurnId = turn.id;
   // Use separate fields to avoid TS narrowing completed to never after
   // assignment inside the wrappedCollector closure.
-  let turnCompletedStatus: string | undefined;
   let turnCompletedDuration: number | null | undefined;
 
   const wrappedCollector = (method: string, params: Record<string, unknown>) => {
@@ -276,26 +345,18 @@ async function startNewTurn(
     if (method === "turn/completed" || method === "turn/interrupted") {
       const turnData = (params as { turn?: { status?: string; durationMs?: number | null } }).turn;
       if (turnData) {
-        turnCompletedStatus = turnData.status || method.replace("turn/", "");
         turnCompletedDuration = turnData.durationMs ?? null;
       }
     }
   };
 
-  // Register the collection handler. pushTurnCompleted ensures the promise
-  // resolves exactly once when turn/completed or turn/interrupted arrives.
-  // Fall back to a 45 s timeout: the Codex CLI may omit turn/completed,
-  // and the unbounded wait below would prevent action.steer/action.send
-  // from ever being recorded in the trace.
-  const turnEndPromise = new Promise<void>((resolve) => {
-    getSessionAdapter(session.threadId).registerOnTurnEnd((_status: string) => resolve());
-  });
-
-  await getSessionAdapter(session.threadId).collectTurnEvents(session.threadId, turn.id, 30_000, wrappedCollector);
-  await Promise.race([
-    turnEndPromise,
-    new Promise<void>((resolve) => setTimeout(resolve, 45_000)),
-  ]);
+  const collected = await getSessionAdapter(session.threadId).collectTurnEvents(
+    session.threadId,
+    turn.id,
+    30_000,
+    wrappedCollector,
+  );
+  if (session.activeTurnId === turn.id) session.activeTurnId = null;
 
   // S8: Post-turn workspace scan — detects file changes codex omitted from events
   const scanResult = getSessionAdapter(session.threadId).scanAndFireHooks(workspace);
@@ -310,20 +371,17 @@ async function startNewTurn(
   }
 
   const finalTurnId = capturedTurnId || turn.id;
-  session.activeTurnId = finalTurnId;
   session.turnIds.push(finalTurnId);
 
   // Derive turn status from the collected event counts
-  const turnStatus =
-    evCounts["turn/completed"] > 0 ? "completed" :
-    evCounts["turn/interrupted"] > 0 ? "interrupted" :
-    turnCompletedStatus || "completed";
+  const turnStatus = collected.turnStatus;
 
   return {
     turnId: finalTurnId,
     eventCounts: evCounts,
     turnStatus,
-    turnDurationMs: turnCompletedDuration ?? null,
+    turnDurationMs: collected.turnDurationMs ?? turnCompletedDuration ?? null,
+    ...(collected.error ? { error: collected.error } : {}),
   };
 }
 
@@ -340,7 +398,9 @@ function makeTraceCollector(sessionId: string, provenance = defaultProvenance) {
       try {
         const replayResult = replayTrace(sessionId);
         broadcastDerivedState(sessionId, replayResult.state as unknown as Record<string, unknown>);
-      } catch { /* best-effort */ }
+      } catch {
+        /* best-effort */
+      }
     }
   };
 }
@@ -349,82 +409,113 @@ function makeTraceCollector(sessionId: string, provenance = defaultProvenance) {
 // When codex requests approval, we surface it to the UI and record it
 // as a pending decision in the session. The /decide endpoint consumes
 // these pending approvals.
-function registerApprovalHandler(sessionId: string, _onDecide: (itemId: string, approved: boolean) => void) {
-  getSessionAdapter(sessionId).on("approval", (ev: { itemId: string; turnId: string; threadId: string; reason: string | null; grantRoot: string | null; startedAtMs: number }) => {
-    const session = sessions.get(sessionId);
-    if (session) {
-      session.pendingApprovals.push({
-        itemId: ev.itemId,
-        turnId: ev.turnId,
+function registerApprovalHandler(
+  sessionId: string,
+  _onDecide: (itemId: string, approved: boolean) => void,
+) {
+  getSessionAdapter(sessionId).on(
+    "approval",
+    (ev: {
+      itemId: string;
+      turnId: string;
+      threadId: string;
+      reason: string | null;
+      grantRoot: string | null;
+      startedAtMs: number;
+    }) => {
+      const session = sessions.get(sessionId);
+      if (session) {
+        session.pendingApprovals.push({
+          itemId: ev.itemId,
+          turnId: ev.turnId,
+          threadId: ev.threadId,
+          reason: ev.reason,
+          grantRoot: ev.grantRoot,
+          startedAtMs: ev.startedAtMs,
+        });
+      }
+      // Broadcast the approval request to WS subscribers
+      broadcastApproval(sessionId, {
         threadId: ev.threadId,
+        turnId: ev.turnId,
+        itemId: ev.itemId,
+        startedAtMs: ev.startedAtMs,
         reason: ev.reason,
         grantRoot: ev.grantRoot,
-        startedAtMs: ev.startedAtMs,
       });
-    }
-    // Broadcast the approval request to WS subscribers
-    broadcastApproval(sessionId, {
-      threadId: ev.threadId,
-      turnId: ev.turnId,
-      itemId: ev.itemId,
-      startedAtMs: ev.startedAtMs,
-      reason: ev.reason,
-      grantRoot: ev.grantRoot,
-    });
-  });
+    },
+  );
 }
 
 // ---------------------------------------------------------------------------
 // HTTP server
 // ---------------------------------------------------------------------------
 
-const server = http.createServer(async (req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-
-  if (req.method === "OPTIONS") {
-    res.writeHead(204);
-    res.end();
-    return;
-  }
+async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse) {
+  if (!management) throw new ManagementError("NOT_READY", "The service is starting", 503);
+  if (await management.handle(req, res)) return;
+  // The retained Workbench is an Owner management client, including legacy Trace routes.
+  management.authorize(req);
+  res.setHeader("cache-control", "no-store");
 
   // ---- Health check ----
   if (req.method === "GET" && req.url === "/") {
     res.writeHead(200, { "content-type": "application/json" });
-    const recent = sessions.size > 0
-      ? Array.from(sessions.entries()).slice(-3).map(([sid, rec]) => ({
-          sessionId: sid,
-          threadId: rec.threadId,
-          activeTurnId: rec.activeTurnId,
-          turnCount: rec.turnIds.length,
-        }))
-      : null;
-    res.end(JSON.stringify({
-      service: "glassbox-server",
-      status: "ok",
-      contractsVersion,
-      sharedVersion,
-      adapterReady,
-      sessionCount: sessions.size,
-      recentSessions: recent,
-    }));
+    const recent =
+      sessions.size > 0
+        ? Array.from(sessions.entries())
+            .slice(-3)
+            .map(([sid, rec]) => ({
+              sessionId: sid,
+              threadId: rec.threadId,
+              activeTurnId: rec.activeTurnId,
+              turnCount: rec.turnIds.length,
+            }))
+        : null;
+    const anyAdapterReady = Array.from(providerSlots.values()).some((s) => s.ready);
+    res.end(
+      JSON.stringify({
+        service: "glassbox-server",
+        status: "ok",
+        contractsVersion,
+        sharedVersion,
+        adapterReady: anyAdapterReady,
+        sessionCount: sessions.size,
+        recentSessions: recent,
+      }),
+    );
     return;
   }
 
-  // ---- POST /run-test (first turn of a new session) ----
+  // ---- POST /run-test or /run-claude (first turn of a new session) ----
   // Returns sessionId immediately so the caller can interact (e.g. click Stop)
   // while the turn is active. Event collection and derived-state broadcast
   // happen in the background.
-  if (req.method === "POST" && req.url === "/run-test") {
+  if (req.method === "POST" && (req.url === "/run-test" || req.url === "/run-claude")) {
     try {
-      await ensureInitialized();
-
       const body = await parseBody(req);
       const sessionId = randomUUID();
-      const provider = (typeof body.provider === "string" && ["codex", "claude-code"].includes(body.provider))
-        ? body.provider
-        : "codex";
+      const provider =
+        req.url === "/run-claude"
+          ? "claude-code"
+          : typeof body.provider === "string" && ["codex", "claude-code"].includes(body.provider)
+            ? body.provider
+            : "claude-code";
+
+      let sessionAdapter: ProviderAdapter;
+      try {
+        sessionAdapter = await getOrInitAdapter(provider as "codex" | "claude-code");
+      } catch (initErr) {
+        res.writeHead(503, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            error: initErr instanceof Error ? initErr.message : String(initErr),
+          }),
+        );
+        return;
+      }
+      sessionAdapters.set(sessionId, sessionAdapter);
+
       const clientThreadId =
         typeof body.threadId === "string"
           ? body.threadId
@@ -433,16 +524,15 @@ const server = http.createServer(async (req, res) => {
 
       // --- P2.4: provider-aware options with server-side guardrails ---
       const defaultWs = defaultWorkspaceFor(provider);
-      const workspace = typeof body.repoPath === "string" ? body.repoPath : defaultWs;
-      const approvalPolicy = typeof body.approvalPolicy === "string"
-        ? body.approvalPolicy
-        : defaultApprovalPolicy(provider);
-      const sandboxPolicyType = typeof body.sandboxPolicy === "string"
-        ? body.sandboxPolicy
-        : "read-only";
-      const permissionMode = typeof body.permissionMode === "string"
-        ? body.permissionMode
-        : defaultPermissionMode();
+      let workspace = typeof body.repoPath === "string" ? body.repoPath : defaultWs;
+      const approvalPolicy =
+        typeof body.approvalPolicy === "string"
+          ? body.approvalPolicy
+          : defaultApprovalPolicy(provider);
+      const sandboxPolicyType =
+        typeof body.sandboxPolicy === "string" ? body.sandboxPolicy : "read-only";
+      const permissionMode =
+        typeof body.permissionMode === "string" ? body.permissionMode : defaultPermissionMode();
 
       // Validate custom repo paths — guardrails server-side, never trust client
       if (workspace !== defaultWs) {
@@ -452,11 +542,10 @@ const server = http.createServer(async (req, res) => {
           res.end(JSON.stringify({ error: pathCheck.error }));
           return;
         }
+        workspace = pathCheck.realPath;
       }
-      // --- end P2.4 ---
-
-      const sessionAdapter = provider === "claude-code" ? claudeAdapter : adapter;
-      const traceProvenance = provider === "claude-code" ? TRACE_PROVENANCE_CLAUDECODE : TRACE_PROVENANCE;
+      const traceProvenance =
+        provider === "claude-code" ? TRACE_PROVENANCE_CLAUDECODE : TRACE_PROVENANCE;
       const traceCollector = makeTraceCollector(sessionId, traceProvenance);
       const runOpts: SessionRunOptions = {
         provider,
@@ -481,15 +570,18 @@ const server = http.createServer(async (req, res) => {
 
       sessionAdapter.snapshotWorkspace(workspace);
 
-      const turn = await sessionAdapter.startTurn(thread.id, [
-        { type: "text", text: prompt },
-      ], turnStartOpts(runOpts, workspace));
+      const turn = await sessionAdapter.startTurn(
+        thread.id,
+        [{ type: "text", text: prompt }],
+        turnStartOpts(runOpts, workspace),
+      );
 
       sessions.set(sessionId, {
         threadId: thread.id,
         clientThreadId,
         provider,
         workspace,
+        runOptions: Object.freeze({ ...runOpts }),
         activeTurnId: turn.id,
         turnIds: [turn.id],
         pendingApprovals: [],
@@ -501,15 +593,18 @@ const server = http.createServer(async (req, res) => {
 
       // Return immediately so the caller can interact while turn is active
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({
-        sessionId,
-        threadId: thread.id,
-        turnId: turn.id,
-        status: "running",
-      }));
+      res.end(
+        JSON.stringify({
+          sessionId,
+          threadId: thread.id,
+          turnId: turn.id,
+          status: "running",
+        }),
+      );
 
       // P6.4: Collect the event stream for up to 30 s in the background
-      sessionAdapter.collectTurnEvents(thread.id, turn.id, 30_000, traceCollector)
+      sessionAdapter
+        .collectTurnEvents(thread.id, turn.id, 30_000, traceCollector)
         .then(() => {
           // S8: post-turn workspace scan for file changes omitted from events
           try {
@@ -520,12 +615,21 @@ const server = http.createServer(async (req, res) => {
                 method: "item/fileChange",
                 params: { itemId: fileItemId, turnId: turn.id, changes: scanResult.changes },
               });
-              traceCollector("item/fileChange", { itemId: fileItemId, turnId: turn.id, changes: scanResult.changes });
+              traceCollector("item/fileChange", {
+                itemId: fileItemId,
+                turnId: turn.id,
+                changes: scanResult.changes,
+              });
             }
-          } catch { /* best-effort */ }
+          } catch {
+            /* best-effort */
+          }
 
           const replayResult = replayTrace(sessionId);
-          broadcastDerivedState(sessionId, replayResult.state as unknown as Record<string, unknown>);
+          broadcastDerivedState(
+            sessionId,
+            replayResult.state as unknown as Record<string, unknown>,
+          );
           broadcastSessionEnded(sessionId);
           // Clear active turn once it ends
           const s = sessions.get(sessionId);
@@ -536,23 +640,47 @@ const server = http.createServer(async (req, res) => {
         });
     } catch (err) {
       res.writeHead(500, { "content-type": "application/json" });
-      res.end(JSON.stringify({
-        error: String(err instanceof Error ? err.message : err),
-      }));
+      res.end(
+        JSON.stringify({
+          error: String(err instanceof Error ? err.message : err),
+        }),
+      );
     }
     return;
   }
   // Returns immediately with sessionId; event collection runs in background.
   if (req.method === "POST" && req.url === "/run-stream") {
     try {
-      await ensureInitialized();
-
       const body = await parseBody(req);
-      console.error("[e2e-log] body=" + JSON.stringify({provider:body.provider,sandboxPolicy:body.sandboxPolicy,permissionMode:body.permissionMode,approvalPolicy:body.approvalPolicy}));
+      console.error(
+        "[e2e-log] body=" +
+          JSON.stringify({
+            provider: body.provider,
+            sandboxPolicy: body.sandboxPolicy,
+            permissionMode: body.permissionMode,
+            approvalPolicy: body.approvalPolicy,
+          }),
+      );
       const sessionId = randomUUID();
-      const provider = (typeof body.provider === "string" && ["codex", "claude-code"].includes(body.provider))
-        ? body.provider
-        : "codex";
+      const provider =
+        typeof body.provider === "string" && ["codex", "claude-code"].includes(body.provider)
+          ? body.provider
+          : "claude-code";
+
+      let sessionAdapter: ProviderAdapter;
+      try {
+        sessionAdapter = await getOrInitAdapter(provider as "codex" | "claude-code");
+      } catch (initErr) {
+        res.writeHead(503, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            error: initErr instanceof Error ? initErr.message : String(initErr),
+          }),
+        );
+        return;
+      }
+      sessionAdapters.set(sessionId, sessionAdapter);
+
       const clientThreadId =
         typeof body.threadId === "string"
           ? body.threadId
@@ -561,16 +689,15 @@ const server = http.createServer(async (req, res) => {
 
       // --- P2.4: provider-aware options with server-side guardrails ---
       const defaultWs = defaultWorkspaceFor(provider);
-      const workspace = typeof body.repoPath === "string" ? body.repoPath : defaultWs;
-      const approvalPolicy = typeof body.approvalPolicy === "string"
-        ? body.approvalPolicy
-        : defaultApprovalPolicy(provider);
-      const sandboxPolicyType = typeof body.sandboxPolicy === "string"
-        ? body.sandboxPolicy
-        : "read-only";
-      const permissionMode = typeof body.permissionMode === "string"
-        ? body.permissionMode
-        : defaultPermissionMode();
+      let workspace = typeof body.repoPath === "string" ? body.repoPath : defaultWs;
+      const approvalPolicy =
+        typeof body.approvalPolicy === "string"
+          ? body.approvalPolicy
+          : defaultApprovalPolicy(provider);
+      const sandboxPolicyType =
+        typeof body.sandboxPolicy === "string" ? body.sandboxPolicy : "read-only";
+      const permissionMode =
+        typeof body.permissionMode === "string" ? body.permissionMode : defaultPermissionMode();
 
       if (workspace !== defaultWs) {
         const pathCheck = validateRepoPath(workspace);
@@ -579,11 +706,12 @@ const server = http.createServer(async (req, res) => {
           res.end(JSON.stringify({ error: pathCheck.error }));
           return;
         }
+        workspace = pathCheck.realPath;
       }
       // --- end P2.4 ---
 
-      const sessionAdapter = provider === "claude-code" ? claudeAdapter : adapter;
-      const traceProvenance = provider === "claude-code" ? TRACE_PROVENANCE_CLAUDECODE : TRACE_PROVENANCE;
+      const traceProvenance =
+        provider === "claude-code" ? TRACE_PROVENANCE_CLAUDECODE : TRACE_PROVENANCE;
       const traceCollector = makeTraceCollector(sessionId, traceProvenance);
       const runOpts: SessionRunOptions = {
         provider,
@@ -606,15 +734,18 @@ const server = http.createServer(async (req, res) => {
 
       sessionAdapter.snapshotWorkspace(workspace);
 
-      const turn = await sessionAdapter.startTurn(thread.id, [
-        { type: "text", text: prompt },
-      ], turnStartOpts(runOpts, workspace));
+      const turn = await sessionAdapter.startTurn(
+        thread.id,
+        [{ type: "text", text: prompt }],
+        turnStartOpts(runOpts, workspace),
+      );
 
       sessions.set(sessionId, {
         threadId: thread.id,
         clientThreadId,
         provider,
         workspace,
+        runOptions: Object.freeze({ ...runOpts }),
         activeTurnId: turn.id,
         turnIds: [turn.id],
         pendingApprovals: [],
@@ -625,14 +756,17 @@ const server = http.createServer(async (req, res) => {
       });
 
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({
-        sessionId,
-        threadId: thread.id,
-        turnId: turn.id,
-        status: "running",
-      }));
+      res.end(
+        JSON.stringify({
+          sessionId,
+          threadId: thread.id,
+          turnId: turn.id,
+          status: "running",
+        }),
+      );
 
-      sessionAdapter.collectTurnEvents(thread.id, turn.id, 30_000, traceCollector)
+      sessionAdapter
+        .collectTurnEvents(thread.id, turn.id, 30_000, traceCollector)
         .then(() => {
           // S8: post-turn workspace scan for file changes omitted from events
           try {
@@ -643,12 +777,21 @@ const server = http.createServer(async (req, res) => {
                 method: "item/fileChange",
                 params: { itemId: fileItemId, turnId: turn.id, changes: scanResult.changes },
               });
-              traceCollector("item/fileChange", { itemId: fileItemId, turnId: turn.id, changes: scanResult.changes });
+              traceCollector("item/fileChange", {
+                itemId: fileItemId,
+                turnId: turn.id,
+                changes: scanResult.changes,
+              });
             }
-          } catch { /* best-effort */ }
+          } catch {
+            /* best-effort */
+          }
 
           const replayResult = replayTrace(sessionId);
-          broadcastDerivedState(sessionId, replayResult.state as unknown as Record<string, unknown>);
+          broadcastDerivedState(
+            sessionId,
+            replayResult.state as unknown as Record<string, unknown>,
+          );
           broadcastSessionEnded(sessionId);
           const s = sessions.get(sessionId);
           if (s) s.activeTurnId = null;
@@ -657,11 +800,16 @@ const server = http.createServer(async (req, res) => {
           console.error(`[run-stream background] session ${sessionId} failed:`, err);
         });
     } catch (err) {
-      console.error("[e2e-error] /run-stream FAILED:", err instanceof Error ? err.message : String(err));
+      console.error(
+        "[e2e-error] /run-stream FAILED:",
+        err instanceof Error ? err.message : String(err),
+      );
       res.writeHead(500, { "content-type": "application/json" });
-      res.end(JSON.stringify({
-        error: String(err instanceof Error ? err.message : err),
-      }));
+      res.end(
+        JSON.stringify({
+          error: String(err instanceof Error ? err.message : err),
+        }),
+      );
     }
     return;
   }
@@ -732,17 +880,25 @@ const server = http.createServer(async (req, res) => {
       broadcastDerivedState(sessionId, replayResult.state as unknown as Record<string, unknown>);
 
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({
-        ok: true,
-        paused: !alreadyIdle,
-        sessionId,
-        derivedState: replayResult.state,
-      }, null, 2));
+      res.end(
+        JSON.stringify(
+          {
+            ok: true,
+            paused: !alreadyIdle,
+            sessionId,
+            derivedState: replayResult.state,
+          },
+          null,
+          2,
+        ),
+      );
     } catch (err) {
       res.writeHead(500, { "content-type": "application/json" });
-      res.end(JSON.stringify({
-        error: String(err instanceof Error ? err.message : err),
-      }));
+      res.end(
+        JSON.stringify({
+          error: String(err instanceof Error ? err.message : err),
+        }),
+      );
     }
     return;
   }
@@ -812,17 +968,25 @@ const server = http.createServer(async (req, res) => {
       broadcastDerivedState(sessionId, replayResult.state as unknown as Record<string, unknown>);
 
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({
-        ok: true,
-        stopped: !alreadyStopped,
-        sessionId,
-        derivedState: replayResult.state,
-      }, null, 2));
+      res.end(
+        JSON.stringify(
+          {
+            ok: true,
+            stopped: !alreadyStopped,
+            sessionId,
+            derivedState: replayResult.state,
+          },
+          null,
+          2,
+        ),
+      );
     } catch (err) {
       res.writeHead(500, { "content-type": "application/json" });
-      res.end(JSON.stringify({
-        error: String(err instanceof Error ? err.message : err),
-      }));
+      res.end(
+        JSON.stringify({
+          error: String(err instanceof Error ? err.message : err),
+        }),
+      );
     }
     return;
   }
@@ -830,8 +994,6 @@ const server = http.createServer(async (req, res) => {
   // ---- POST /steer — steering instruction for an existing session ----
   if (req.method === "POST" && req.url === "/steer") {
     try {
-      await ensureInitialized();
-
       const body = await parseBody(req);
       const sessionId = typeof body.sessionId === "string" ? body.sessionId : "";
       const instruction = typeof body.instruction === "string" ? body.instruction : "";
@@ -888,7 +1050,12 @@ const server = http.createServer(async (req, res) => {
 
       // Start the new turn on the same thread
       // @ts-ignore — TS inference bug: inferred type conflates with steerRecord.params
-      const turnSummary = (await startNewTurn(session, instruction, session.workspace, traceCollector)) as any;
+      const turnSummary = (await startNewTurn(
+        session,
+        instruction,
+        session.workspace,
+        traceCollector,
+      )) as any;
 
       // Now that startNewTurn has returned, we know the actual turnId.
       // Patch the steer record with turnId so the reducer can backfill
@@ -904,19 +1071,27 @@ const server = http.createServer(async (req, res) => {
       broadcastDerivedState(sessionId, replayResult.state as unknown as Record<string, unknown>);
 
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({
-        ok: true,
-        sessionId,
-        derivedState: replayResult.state,
-        turnId: turnSummary.turnId,
-        turnStatus: turnSummary.turnStatus,
-        turnDurationMs: turnSummary.turnDurationMs,
-      }, null, 2));
+      res.end(
+        JSON.stringify(
+          {
+            ok: true,
+            sessionId,
+            derivedState: replayResult.state,
+            turnId: turnSummary.turnId,
+            turnStatus: turnSummary.turnStatus,
+            turnDurationMs: turnSummary.turnDurationMs,
+          },
+          null,
+          2,
+        ),
+      );
     } catch (err) {
       res.writeHead(500, { "content-type": "application/json" });
-      res.end(JSON.stringify({
-        error: String(err instanceof Error ? err.message : err),
-      }));
+      res.end(
+        JSON.stringify({
+          error: String(err instanceof Error ? err.message : err),
+        }),
+      );
     }
     return;
   }
@@ -924,8 +1099,6 @@ const server = http.createServer(async (req, res) => {
   // ---- POST /send-task — edit task and start new turn on same thread ----
   if (req.method === "POST" && req.url === "/send-task") {
     try {
-      await ensureInitialized();
-
       const body = await parseBody(req);
       const sessionId = typeof body.sessionId === "string" ? body.sessionId : "";
       const task = typeof body.task === "string" ? body.task : "";
@@ -967,7 +1140,12 @@ const server = http.createServer(async (req, res) => {
       }
 
       // Start the new turn on the same thread with the edited task text
-      const _sendTurnSummary = await startNewTurn(session, editedTask, session.workspace, traceCollector) as any;
+      const _sendTurnSummary = (await startNewTurn(
+        session,
+        editedTask,
+        session.workspace,
+        traceCollector,
+      )) as any;
       const sendTurnSummary = _sendTurnSummary;
 
       // Record action.send AFTER the turn's provider events are in the trace
@@ -991,19 +1169,27 @@ const server = http.createServer(async (req, res) => {
       broadcastDerivedState(sessionId, replayResult.state as unknown as Record<string, unknown>);
 
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({
-        ok: true,
-        sessionId,
-        derivedState: replayResult.state,
-        turnId: sendTurnSummary.turnId,
-        turnStatus: sendTurnSummary.turnStatus,
-        turnDurationMs: sendTurnSummary.turnDurationMs,
-      }, null, 2));
+      res.end(
+        JSON.stringify(
+          {
+            ok: true,
+            sessionId,
+            derivedState: replayResult.state,
+            turnId: sendTurnSummary.turnId,
+            turnStatus: sendTurnSummary.turnStatus,
+            turnDurationMs: sendTurnSummary.turnDurationMs,
+          },
+          null,
+          2,
+        ),
+      );
     } catch (err) {
       res.writeHead(500, { "content-type": "application/json" });
-      res.end(JSON.stringify({
-        error: String(err instanceof Error ? err.message : err),
-      }));
+      res.end(
+        JSON.stringify({
+          error: String(err instanceof Error ? err.message : err),
+        }),
+      );
     }
     return;
   }
@@ -1011,8 +1197,6 @@ const server = http.createServer(async (req, res) => {
   // ---- POST /edit-input — edit a research input and start new turn on same thread ---- //
   if (req.method === "POST" && req.url === "/edit-input") {
     try {
-      await ensureInitialized();
-
       const body = await parseBody(req);
       const sessionId = typeof body.sessionId === "string" ? body.sessionId : "";
       const inputKind = typeof body.inputKind === "string" ? body.inputKind : "";
@@ -1034,7 +1218,9 @@ const server = http.createServer(async (req, res) => {
       // Codex does not support editing system instructions yet.
       if (session.provider === "codex") {
         res.writeHead(400, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: "input not supported for this provider yet: " + inputKind }));
+        res.end(
+          JSON.stringify({ error: "input not supported for this provider yet: " + inputKind }),
+        );
         return;
       }
 
@@ -1070,7 +1256,12 @@ const server = http.createServer(async (req, res) => {
       }
 
       // Start the new turn on the same thread
-      const editTurnSummary = await startNewTurn(session, "say ready", session.workspace, traceCollector);
+      const editTurnSummary = await startNewTurn(
+        session,
+        "say ready",
+        session.workspace,
+        traceCollector,
+      );
 
       // Record action.editInput AFTER the turn's provider events are in the trace
       const editRecord = {
@@ -1093,49 +1284,68 @@ const server = http.createServer(async (req, res) => {
       broadcastDerivedState(sessionId, replayResult.state as unknown as Record<string, unknown>);
 
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({
-        ok: true,
-        sessionId,
-        derivedState: replayResult.state,
-        turnId: editTurnSummary.turnId,
-        turnStatus: editTurnSummary.turnStatus,
-        turnDurationMs: editTurnSummary.turnDurationMs,
-      }, null, 2));
+      res.end(
+        JSON.stringify(
+          {
+            ok: true,
+            sessionId,
+            derivedState: replayResult.state,
+            turnId: editTurnSummary.turnId,
+            turnStatus: editTurnSummary.turnStatus,
+            turnDurationMs: editTurnSummary.turnDurationMs,
+          },
+          null,
+          2,
+        ),
+      );
     } catch (err) {
       res.writeHead(500, { "content-type": "application/json" });
-      res.end(JSON.stringify({
-        error: String(err instanceof Error ? err.message : err),
-      }));
+      res.end(
+        JSON.stringify({
+          error: String(err instanceof Error ? err.message : err),
+        }),
+      );
     }
     return;
   }
   if (req.method === "POST" && req.url === "/run-demo") {
     try {
-      await ensureInitialized();
-
       const body = await parseBody(req);
       const sessionId = randomUUID();
       const clientThreadId =
         typeof body.threadId === "string"
           ? body.threadId
           : `demo-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      const prompt = typeof body.prompt === "string" ? body.prompt : "update utils.js so the tests pass";
+      const prompt =
+        typeof body.prompt === "string" ? body.prompt : "update utils.js so the tests pass";
 
       // --- P2.4: provider-aware options with server-side guardrails ---
-      const provider = (typeof body.provider === "string" && ["codex", "claude-code"].includes(body.provider))
-        ? body.provider
-        : "codex";
-      const defaultWs = "/tmp/glassbox-demo-repo";
-      const workspace = typeof body.repoPath === "string" ? body.repoPath : defaultWs;
-      const approvalPolicy = typeof body.approvalPolicy === "string"
-        ? body.approvalPolicy
-        : "on-request";
-      const sandboxPolicyType = typeof body.sandboxPolicy === "string"
-        ? body.sandboxPolicy
-        : "workspace-write";
-      const permissionMode = typeof body.permissionMode === "string"
-        ? body.permissionMode
-        : "auto";
+      const provider =
+        typeof body.provider === "string" && ["codex", "claude-code"].includes(body.provider)
+          ? body.provider
+          : "codex";
+
+      let sessionAdapter: ProviderAdapter;
+      try {
+        sessionAdapter = await getOrInitAdapter(provider as "codex" | "claude-code");
+      } catch (initErr) {
+        res.writeHead(503, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            error: initErr instanceof Error ? initErr.message : String(initErr),
+          }),
+        );
+        return;
+      }
+      sessionAdapters.set(sessionId, sessionAdapter);
+
+      const defaultWs = DEFAULT_WORKSPACE_DEMO;
+      let workspace = typeof body.repoPath === "string" ? body.repoPath : defaultWs;
+      const approvalPolicy =
+        typeof body.approvalPolicy === "string" ? body.approvalPolicy : "on-request";
+      const sandboxPolicyType =
+        typeof body.sandboxPolicy === "string" ? body.sandboxPolicy : "workspace-write";
+      const permissionMode = typeof body.permissionMode === "string" ? body.permissionMode : "auto";
 
       // Validate custom repo paths
       if (workspace !== defaultWs) {
@@ -1145,11 +1355,12 @@ const server = http.createServer(async (req, res) => {
           res.end(JSON.stringify({ error: pathCheck.error }));
           return;
         }
+        workspace = pathCheck.realPath;
       }
       // --- end P2.4 ---
 
-      const sessionAdapter = provider === "claude-code" ? claudeAdapter : adapter;
-      const traceProvenance = provider === "claude-code" ? TRACE_PROVENANCE_CLAUDECODE : TRACE_PROVENANCE;
+      const traceProvenance =
+        provider === "claude-code" ? TRACE_PROVENANCE_CLAUDECODE : TRACE_PROVENANCE;
       const traceCollector = makeTraceCollector(sessionId, traceProvenance);
 
       const runOpts: SessionRunOptions = {
@@ -1174,19 +1385,23 @@ const server = http.createServer(async (req, res) => {
 
       // Reset the demo fixture so every run starts from the same broken
       // state (a previous run may have already fixed the file in place).
-      writeFileSync(`${workspace}/utils.js`, BROKEN_UTILS_JS);
+      writeFileSync(join(workspace, "utils.js"), BROKEN_UTILS_JS);
+      sessionAdapters.set(thread.id, sessionAdapter);
 
       sessionAdapter.snapshotWorkspace(workspace);
 
-      const turn = await sessionAdapter.startTurn(thread.id, [
-        { type: "text", text: prompt },
-      ], turnStartOpts(runOpts, workspace));
+      const turn = await sessionAdapter.startTurn(
+        thread.id,
+        [{ type: "text", text: prompt }],
+        turnStartOpts(runOpts, workspace),
+      );
 
       sessions.set(sessionId, {
         threadId: thread.id,
         clientThreadId,
         provider,
         workspace,
+        runOptions: Object.freeze({ ...runOpts }),
         activeTurnId: turn.id,
         turnIds: [turn.id],
         pendingApprovals: [],
@@ -1197,15 +1412,18 @@ const server = http.createServer(async (req, res) => {
       });
 
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({
-        sessionId,
-        threadId: thread.id,
-        turnId: turn.id,
-        workspace,
-        status: "running",
-      }));
+      res.end(
+        JSON.stringify({
+          sessionId,
+          threadId: thread.id,
+          turnId: turn.id,
+          workspace,
+          status: "running",
+        }),
+      );
 
-      sessionAdapter.collectTurnEvents(thread.id, turn.id, 30_000, traceCollector)
+      sessionAdapter
+        .collectTurnEvents(thread.id, turn.id, 30_000, traceCollector)
         .then(() => {
           // S8: post-turn workspace scan for file changes omitted from events
           try {
@@ -1216,12 +1434,21 @@ const server = http.createServer(async (req, res) => {
                 method: "item/fileChange",
                 params: { itemId: fileItemId, turnId: turn.id, changes: scanResult.changes },
               });
-              traceCollector("item/fileChange", { itemId: fileItemId, turnId: turn.id, changes: scanResult.changes });
+              traceCollector("item/fileChange", {
+                itemId: fileItemId,
+                turnId: turn.id,
+                changes: scanResult.changes,
+              });
             }
-          } catch { /* best-effort */ }
+          } catch {
+            /* best-effort */
+          }
 
           const replayResult = replayTrace(sessionId);
-          broadcastDerivedState(sessionId, replayResult.state as unknown as Record<string, unknown>);
+          broadcastDerivedState(
+            sessionId,
+            replayResult.state as unknown as Record<string, unknown>,
+          );
           broadcastSessionEnded(sessionId);
           const s = sessions.get(sessionId);
           if (s) s.activeTurnId = null;
@@ -1231,9 +1458,11 @@ const server = http.createServer(async (req, res) => {
         });
     } catch (err) {
       res.writeHead(500, { "content-type": "application/json" });
-      res.end(JSON.stringify({
-        error: String(err instanceof Error ? err.message : err),
-      }));
+      res.end(
+        JSON.stringify({
+          error: String(err instanceof Error ? err.message : err),
+        }),
+      );
     }
     return;
   }
@@ -1261,9 +1490,7 @@ const server = http.createServer(async (req, res) => {
 
       // Remove from pending approvals
       const beforeCount = session.pendingApprovals.length;
-      session.pendingApprovals = session.pendingApprovals.filter(
-        (a) => a.itemId !== itemId
-      );
+      session.pendingApprovals = session.pendingApprovals.filter((a) => a.itemId !== itemId);
 
       // Find the adapter requestId for this itemId and respond
       const requestId = getSessionAdapter(session.threadId).findApprovalRequestId(itemId);
@@ -1291,18 +1518,26 @@ const server = http.createServer(async (req, res) => {
       broadcastDerivedState(sessionId, replayResult.state as unknown as Record<string, unknown>);
 
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({
-        ok: true,
-        sessionId,
-        approved,
-        removedPending: beforeCount - session.pendingApprovals.length,
-        derivedState: replayResult.state,
-      }, null, 2));
+      res.end(
+        JSON.stringify(
+          {
+            ok: true,
+            sessionId,
+            approved,
+            removedPending: beforeCount - session.pendingApprovals.length,
+            derivedState: replayResult.state,
+          },
+          null,
+          2,
+        ),
+      );
     } catch (err) {
       res.writeHead(500, { "content-type": "application/json" });
-      res.end(JSON.stringify({
-        error: String(err instanceof Error ? err.message : err),
-      }));
+      res.end(
+        JSON.stringify({
+          error: String(err instanceof Error ? err.message : err),
+        }),
+      );
     }
     return;
   }
@@ -1337,7 +1572,9 @@ const server = http.createServer(async (req, res) => {
         const safeState = screenValue(result.state) as Record<string, unknown>;
         const safeReplay = { ...result, state: safeState };
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ sessionId, derivedState: safeState, replay: safeReplay }, null, 2));
+        res.end(
+          JSON.stringify({ sessionId, derivedState: safeState, replay: safeReplay }, null, 2),
+        );
       } catch {
         res.writeHead(404, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: `no trace for session: ${sessionId}` }));
@@ -1350,14 +1587,26 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "POST" && req.url === "/interrupt") {
     try {
       let body: Record<string, unknown> = {};
-      try { body = await parseBody(req); } catch { /* body optional */ }
+      try {
+        body = await parseBody(req);
+      } catch {
+        /* body optional */
+      }
 
       // support either {sessionId} or {threadId, turnId}
-      const sessionId = typeof body.sessionId === "string" ? body.sessionId as string : "";
+      const sessionId = typeof body.sessionId === "string" ? (body.sessionId as string) : "";
       const threadId =
-        typeof body.threadId === "string" ? body.threadId : (sessionId ? sessions.get(sessionId)?.threadId : undefined);
+        typeof body.threadId === "string"
+          ? body.threadId
+          : sessionId
+            ? sessions.get(sessionId)?.threadId
+            : undefined;
       const turnId =
-        typeof body.turnId === "string" ? body.turnId : (sessionId ? sessions.get(sessionId)?.activeTurnId : undefined);
+        typeof body.turnId === "string"
+          ? body.turnId
+          : sessionId
+            ? sessions.get(sessionId)?.activeTurnId
+            : undefined;
 
       if (!threadId || !turnId) {
         res.writeHead(400, { "content-type": "application/json" });
@@ -1394,61 +1643,212 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ ok: true, threadId, turnId }));
     } catch (err) {
       res.writeHead(500, { "content-type": "application/json" });
-      res.end(JSON.stringify({
-        error: String(err instanceof Error ? err.message : err),
-      }));
+      res.end(
+        JSON.stringify({
+          error: String(err instanceof Error ? err.message : err),
+        }),
+      );
     }
     return;
   }
 
   res.writeHead(404, { "content-type": "application/json" });
   res.end(JSON.stringify({ error: "not found" }));
+}
+
+const server = http.createServer((req, res) => {
+  void handleRequest(req, res).catch((error: unknown) => {
+    req.resume();
+    if (res.headersSent) {
+      res.destroy();
+      return;
+    }
+    const status = error instanceof ManagementError ? error.status : 500;
+    const code = error instanceof ManagementError ? error.code : "INTERNAL_ERROR";
+    res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store" });
+    res.end(
+      JSON.stringify({
+        error: {
+          code,
+          message: status === 401 ? "A management key is required" : "Request could not complete",
+        },
+      }),
+    );
+  });
 });
+server.requestTimeout = 30_000;
+server.headersTimeout = 10_000;
 
 // ---- Mount WebSocket server ----
 
-attachWebSocketServer(server, async (_sessionId: string) => {
-  // S6 explicit execution: no auto-interrupt on WS subscribe.
-  // /pause, /stop, and /steer endpoints handle execution changes explicitly.
-  // WS subscription is read-only: receives live events and derived state only.
-}, (sessionId: string) => {
-  // Catch-up for approvals that fired before the client subscribed.
-  const session = sessions.get(sessionId);
-  if (!session) return [];
-  return session.pendingApprovals.map((a) => ({
-    type: "approval" as const,
-    threadId: a.threadId,
-    turnId: a.turnId,
-    itemId: a.itemId,
-    startedAtMs: a.startedAtMs,
-    reason: a.reason,
-    grantRoot: a.grantRoot,
-  }));
-});
+function mountSockets() {
+  return attachWebSocketServer(
+    server,
+    (_sessionId: string) => {
+      // S6 explicit execution: no auto-interrupt on WS subscribe.
+      // /pause, /stop, and /steer endpoints handle execution changes explicitly.
+      // WS subscription is read-only: receives live events and derived state only.
+    },
+    (sessionId: string) => {
+      // Catch-up for approvals that fired before the client subscribed.
+      const session = sessions.get(sessionId);
+      if (!session) return [];
+      return session.pendingApprovals.map((a) => ({
+        type: "approval" as const,
+        threadId: a.threadId,
+        turnId: a.turnId,
+        itemId: a.itemId,
+        startedAtMs: a.startedAtMs,
+        reason: a.reason,
+        grantRoot: a.grantRoot,
+      }));
+    },
+    (request) => {
+      if (!management) throw new Error("Service is not ready");
+      management.authorizeSocket(request);
+    },
+  );
+}
 
-server.listen(PORT, () => {
-  console.log(`glassbox-server listening on http://localhost:${PORT}`);
-  console.log(`  WebSocket:          ws://localhost:${PORT}/ws?sessionId=<id>`);
-  console.log(`  POST /run-test:     generate sessionId, run read-only turn`);
-  console.log(`  POST /run-stream:   same + live WS events for sessionId`);
-  console.log(`  POST /run-demo:     run task against demo workspace with workspaceWrite`);
-  console.log(`  POST /pause:        interrupt active turn (prepares for /steer)`);
-  console.log(`  POST /stop:         interrupt active turn by sessionId`);
-  console.log(`  POST /steer:        steering instruction for existing session`);
-  console.log(`  POST /send-task:    edit task and start new turn on same thread`);
-  console.log(`  POST /decide:       approve/decline file-change request for session`);
-  console.log(`  GET  /trace/:id:    raw trace entries`);
-  console.log(`  GET  /state/:id:    derived state replay`);
-  console.log(`  POST /run-claude:   first turn via Claude Code adapter (provider: claude-code)`);
-});
+let sockets: ReturnType<typeof mountSockets> | undefined;
+let starting: Promise<{ baseUrl: string; credentialFile: string }> | undefined;
+let shutdown: Promise<void> | undefined;
 
-process.on("SIGINT", () => {
-  adapter.stop();
-  claudeAdapter.stop();
-  process.exit(0);
-});
-process.on("SIGTERM", () => {
-  adapter.stop();
-  claudeAdapter.stop();
-  process.exit(0);
-});
+export function startServer(
+  options: { port?: number; quiet?: boolean; databasePath?: string } = {},
+) {
+  if (starting) return starting;
+  starting = (async () => {
+    const port = options.port ?? serverPort();
+    if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("Invalid port");
+    const dataDirectory = getGlassboxDataDir();
+    const hosts = [`127.0.0.1:${port}`, `localhost:${port}`];
+    const origins = hosts.map((host) => `http://${host}`);
+    origins.push("http://localhost:5173", "http://127.0.0.1:5173");
+    management = await openManagementRuntime({
+      dataDirectory,
+      databasePath: options.databasePath,
+      hosts,
+      origins,
+      status: () => ({
+        service: "glassbox",
+        version: "0.0.0",
+        status: "ready",
+        platform: process.platform,
+        defaultExecution: "claude-code",
+        capabilities: {
+          modelConfiguration: true,
+          channels: true,
+          conversations: true,
+          runs: true,
+          trace: true,
+          eval: true,
+        },
+      }),
+      doctor: () => ({
+        checks: ["claude", "codex"].map((command) => {
+          try {
+            const detected = resolveExecutablePath(command);
+            return {
+              id: command,
+              label: command === "claude" ? "Claude Code" : "Codex",
+              status: detected ? "detected" : "missing",
+              message: detected
+                ? "Executable detected. Login and execution have not been tested."
+                : "Executable was not found.",
+            };
+          } catch {
+            return {
+              id: command,
+              label: command,
+              status: "error",
+              message: "Executable discovery failed.",
+            };
+          }
+        }),
+      }),
+    });
+    try {
+      for (const workspace of [
+        DEFAULT_WORKSPACE_CODEX,
+        DEFAULT_WORKSPACE_CLAUDE,
+        DEFAULT_WORKSPACE_DEMO,
+      ])
+        mkdirSync(workspace, { recursive: true });
+      sockets = mountSockets();
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(port, "127.0.0.1", () => {
+          server.off("error", reject);
+          resolve();
+        });
+      });
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Server did not bind");
+      management.setBoundPort(address.port);
+      const result = {
+        baseUrl: `http://127.0.0.1:${address.port}`,
+        credentialFile: join(dataDirectory, "management-token"),
+      };
+      process.once("SIGINT", onSignal);
+      process.once("SIGTERM", onSignal);
+      if (!options.quiet) console.log(JSON.stringify(result));
+      return result;
+    } catch (error) {
+      await stopServer();
+      throw error;
+    }
+  })().catch((error: unknown) => {
+    starting = undefined;
+    throw error;
+  });
+  return starting;
+}
+
+function stopAllAdapters(): void {
+  for (const slot of providerSlots.values()) {
+    try {
+      slot.adapter.stop();
+    } catch {}
+  }
+  providerSlots.clear();
+}
+
+function onSignal() {
+  void stopServer().catch(() => {
+    process.exitCode = 1;
+  });
+}
+
+export function stopServer(): Promise<void> {
+  if (shutdown) return shutdown;
+  shutdown = (async () => {
+    process.off("SIGINT", onSignal);
+    process.off("SIGTERM", onSignal);
+    stopAllAdapters();
+    sessionAdapters.clear();
+    sessions.clear();
+    if (sockets) {
+      for (const client of sockets.clients) client.terminate();
+      sockets.close();
+      sockets = undefined;
+    }
+    if (server.listening) {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+    await management?.close();
+    management = undefined;
+    starting = undefined;
+  })().finally(() => {
+    shutdown = undefined;
+  });
+  return shutdown;
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  void startServer().catch(() => {
+    console.error("Glassbox could not start. Check the port and data directory ownership.");
+    process.exitCode = 1;
+  });
+}

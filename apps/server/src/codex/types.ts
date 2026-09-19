@@ -49,7 +49,13 @@ export type UserInput = {
 /** Sandbox policy for thread/turn start. */
 export type SandboxPolicy =
   | { type: "readOnly"; networkAccess: boolean }
-  | { type: "workspaceWrite"; writableRoots: string[]; networkAccess: boolean; excludeTmpdirEnvVar: boolean; excludeSlashTmp: boolean }
+  | {
+      type: "workspaceWrite";
+      writableRoots: string[];
+      networkAccess: boolean;
+      excludeTmpdirEnvVar: boolean;
+      excludeSlashTmp: boolean;
+    }
   | { type: "dangerFullAccess" };
 
 /** Discriminated union of thread items from the event stream. */
@@ -84,8 +90,8 @@ export type ThreadItem =
       server: string;
       tool: string;
       status: string;
-      result: unknown | null;
-      error: unknown | null;
+      result: unknown;
+      error: unknown;
     }
   | {
       type: "reasoning";

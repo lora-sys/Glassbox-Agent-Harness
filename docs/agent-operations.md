@@ -110,6 +110,8 @@ Glassbox review REWORK
 → create or resume another attempt
 ```
 
+Pi's native Herdr integration reports `working`, `idle`, and `blocked`. For a Pi attempt, an `idle` observation can enter REVIEW only after Glassbox has persisted a `working` observation for that same attempt and the previous observed state is `working`. An initial idle pane is not evidence of completed work. Raw Trace retains the reported `idle` state. This mapping never accepts a Task or marks it DONE.
+
 ## Core domain
 
 ### AttentionItem
@@ -280,6 +282,16 @@ Every Tool is a protected Glassbox Action.
 Authorization evaluates the current Principal, location, Task or worker Resource, requested operation, and result audience.
 
 Remote users do not inherit Owner operations merely because the main Agent can control Herdr.
+
+### Pi Worker file tools
+
+The current remote Pi Worker launch disables built-in tools and enables only `worker_list_files`, `worker_read_file`, and `worker_write_file` through a Glassbox Extension. The server creates an immutable per-attempt context outside the Worker directory. It contains the caller, TaskAttempt, authorized directory, workspace Resource, and the file Actions allowed when delegation began. The model cannot choose these values.
+
+Each operation checks the current Glassbox grant and active TaskAttempt before touching a file. A later grant cannot expand an existing attempt's delegated Action set. Revocation and Task termination prevent subsequent access. Reads and writes use relative paths inside the configured directory. Symlinks, hardlinks, private runtime directories, service state, and traversal paths are rejected. Tool evidence records the Action, Resource, decision ID, attempt, and outcome without copying file contents or denied input into Raw Trace.
+
+These tools do not execute generated code. The current acceptance uses an independent host test run before Accept. A future process-execution tool must have its own enforceable permissions; restoring built-in bash would bypass this boundary. The per-attempt Extension reads the same local durable database as Glassbox, so this configuration requires Glassbox and Herdr on the same host.
+
+Each Worker starts in a new focused Herdr tab. This gives Pi a usable terminal size and keeps attempts in separate panes. Repeated horizontal splitting can reduce terminal width until Pi cannot render. Tab focus is a launch detail and does not change Task authority or acceptance.
 
 ## herdr-workflows
 

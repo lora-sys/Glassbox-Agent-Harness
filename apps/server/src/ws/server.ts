@@ -2,7 +2,7 @@
 // WebSocket layer for live event streaming and client control.
 
 import { WebSocketServer, WebSocket } from "ws";
-import type { Server } from "node:http";
+import type { IncomingMessage, Server } from "node:http";
 
 import { screenValue } from "../screening/index.js";
 
@@ -54,7 +54,12 @@ export interface ApprovalPushPayload {
   grantRoot: string | null;
 }
 
-export type ServerPush = LiveEventPayload | DerivedStatePayload | ErrorPayload | SessionEndedPayload | ApprovalPushPayload;
+export type ServerPush =
+  | LiveEventPayload
+  | DerivedStatePayload
+  | ErrorPayload
+  | SessionEndedPayload
+  | ApprovalPushPayload;
 
 // ---------------------------------------------------------------------------
 // Internal subscriber tracking
@@ -81,7 +86,10 @@ export function broadcastEvent(sessionId: string, event: Record<string, unknown>
 
   // Screen event params for secrets without mutating the caller's object
   const safeEvent = JSON.parse(JSON.stringify(event)) as Record<string, unknown>;
-  const payload: LiveEventPayload = { type: "event", event: screenValue(safeEvent) as Record<string, unknown> };
+  const payload: LiveEventPayload = {
+    type: "event",
+    event: screenValue(safeEvent) as Record<string, unknown>,
+  };
   const data = JSON.stringify(payload);
 
   for (const sub of room) {
@@ -101,7 +109,10 @@ export function broadcastDerivedState(sessionId: string, state: Record<string, u
 
   // Screen derived state for secrets without mutating the caller's object
   const safeState = JSON.parse(JSON.stringify(state)) as Record<string, unknown>;
-  const payload: DerivedStatePayload = { type: "derivedState", derivedState: screenValue(safeState) as Record<string, unknown> };
+  const payload: DerivedStatePayload = {
+    type: "derivedState",
+    derivedState: screenValue(safeState) as Record<string, unknown>,
+  };
   const data = JSON.stringify(payload);
 
   for (const sub of room) {
@@ -158,9 +169,22 @@ export function broadcastSessionEnded(sessionId: string): void {
 export function attachWebSocketServer(
   httpServer: Server,
   onInterrupt: (sessionId: string) => Promise<void> | void,
-  onSubscribe?: (sessionId: string) => ApprovalPushPayload[]
+  onSubscribe?: (sessionId: string) => ApprovalPushPayload[],
+  authorizeUpgrade?: (request: IncomingMessage) => void,
 ): WebSocketServer {
-  const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
+  const wss = new WebSocketServer({
+    server: httpServer,
+    path: "/ws",
+    maxPayload: 65536,
+    verifyClient: (info: { req: IncomingMessage }) => {
+      try {
+        authorizeUpgrade?.(info.req);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+  });
 
   wss.on("connection", (ws, req) => {
     // Read sessionId from handshake query string (?sessionId=...) so the
@@ -169,12 +193,36 @@ export function attachWebSocketServer(
     const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
     const sessionId = url.searchParams.get("sessionId") ?? "";
 
-      void handleSubscribe(ws, sessionId, onSubscribe);
+    void handleSubscribe(ws, sessionId, onSubscribe);
 
     ws.on("message", (raw) => {
       try {
-        const msg = JSON.parse(raw.toString()) as ClientMessage;
-        handleMessage(ws, msg, onInterrupt, onSubscribe);
+        const bytes = Array.isArray(raw)
+          ? Buffer.concat(raw)
+          : raw instanceof ArrayBuffer
+            ? Buffer.from(raw)
+            : raw;
+        const msg: unknown = JSON.parse(bytes.toString("utf8"));
+        if (
+          !msg ||
+          typeof msg !== "object" ||
+          !("action" in msg) ||
+          !("sessionId" in msg) ||
+          typeof msg.sessionId !== "string" ||
+          !/^[a-zA-Z0-9_-]{1,128}$/u.test(msg.sessionId) ||
+          (msg.action !== "subscribe" && msg.action !== "interrupt")
+        )
+          throw new Error("Invalid message");
+        if (authorizeUpgrade && msg.sessionId !== sessionId) {
+          sendError(ws, "session access denied");
+          return;
+        }
+        void handleMessage(
+          ws,
+          { action: msg.action, sessionId: msg.sessionId },
+          onInterrupt,
+          onSubscribe,
+        ).catch(() => sendError(ws, "request failed"));
       } catch {
         sendError(ws, "invalid json message");
       }
@@ -184,7 +232,7 @@ export function attachWebSocketServer(
       // Remove this subscriber from all session rooms
       for (const [sid, room] of subscribers) {
         room.forEach((sub) => {
-          if (sub.ws === ws || sub.ws === ws) {
+          if (sub.ws === ws) {
             room.delete(sub);
           }
         });
@@ -205,7 +253,7 @@ export function attachWebSocketServer(
 async function handleSubscribe(
   ws: WebSocket,
   sessionId: string,
-  onSubscribe?: (sessionId: string) => ApprovalPushPayload[]
+  onSubscribe?: (sessionId: string) => ApprovalPushPayload[],
 ): Promise<void> {
   if (!sessionId) {
     sendError(ws, "missing sessionId in query or subscribe message");
@@ -236,7 +284,7 @@ async function handleMessage(
   ws: WebSocket,
   msg: ClientMessage,
   onInterrupt: (sessionId: string) => Promise<void> | void,
-  onSubscribe?: (sessionId: string) => ApprovalPushPayload[]
+  onSubscribe?: (sessionId: string) => ApprovalPushPayload[],
 ): Promise<void> {
   if (msg.action === "interrupt") {
     try {

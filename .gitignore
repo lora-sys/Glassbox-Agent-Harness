@@ -19,9 +19,10 @@ blob-report/
 
 # Glassbox-specific
 .glassbox/
+.dispatch/
 
-# Claude Code local settings
-.claude/
+# Upstream reference checkouts
+upstream/repos/
 
 # Editor / OS
 .DS_Store

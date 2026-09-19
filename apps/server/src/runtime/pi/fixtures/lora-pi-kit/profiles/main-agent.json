@@ -1,0 +1,14 @@
+{
+  "name": "main-agent",
+  "description": "Main Glassbox Personal Agent remote profile",
+  "promptTemplate": "base",
+  "thinkingLevel": "none",
+  "enabledExtensions": [],
+  "enabledSkills": [],
+  "enabledMcpServers": [],
+  "activeTools": [],
+  "runtimeIsolation": {
+    "defaultAgentDirSubpath": "pi/main-agent",
+    "isolateSessionState": true
+  }
+}
