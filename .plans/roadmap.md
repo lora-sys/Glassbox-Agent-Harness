@@ -4,13 +4,13 @@ Status: ROADMAP ONLY
 
 This file records sequencing and product direction. It is not permission to implement future phases.
 
-The only active implementation plan is:
+The completed P3 foundation is followed by one deliberately small active fast-follow:
 
 ```text
-.plans/03-personal-agent-foundation.md
+.plans/03-plus-owner-group-utility.md
 ```
 
-until its completion gate passes.
+P4 remains the first Memory / Taste phase.
 
 ## Product thesis
 
@@ -128,7 +128,7 @@ Detailed design: `docs/memory-taste.md`.
 
 ### P3 — QQ Personal Agent + Agent Ops Closed Loop
 
-Current active plan.
+Completed foundation.
 
 Goal: first real usable Personal Agent product loop.
 
@@ -166,11 +166,51 @@ real QQ + Herdr acceptance
 
 P3 does not become the full LongTask engine.
 
-See the active Plan for exact slices and the completion gate.
+See the completed Plan 03 for its exact slices and completion gate.
+
+### P3+ — Owner Control + Test Group Utility
+
+Immediate fast-follow on the completed P3 foundation.
+
+Goal: create visible value in the one real test group without implementing Memory.
+
+The active Plan is:
+
+```text
+.plans/03-plus-owner-group-utility.md
+```
+
+P3+ adds only:
+
+```text
+per-Run Tool schema filtering
+minimal Owner private control
+per-group model / capability configuration
+one fixed daily learning-assignment capability
+explicit member check-in
+durable progress query
+```
+
+P3+ explicitly does not add:
+
+```text
+Taste
+Semantic / Episodic Memory
+cross-group learning
+automatic reminders
+weekly reports
+generic Group Tool Registry
+Tool generation
+multi-group Owner dashboard
+```
+
+The learning-assignment records are structured product state, not Memory.
+
+Detailed architecture: `docs/owner-group-operations.md`.
 
 ### P4 — Memory, Taste and Authorized Retrieval
 
-Add the personal learning layer after P3 trust and execution boundaries are proven.
+Add the personal learning layer after the P3 trust boundary and the bounded P3+ utility slice are proven. P4 is the first phase that creates Taste or durable Memory.
 
 Order matters: learn Taste from corrections before building broad Memory retrieval.
 
