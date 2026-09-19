@@ -11,11 +11,18 @@
 //   5. Evidence integrity: raw trace entries are screened at the surfacing
 //      layer, not at the trace store (tested via screenValue on replay)
 
-import { describe, expect, it, afterEach } from "vitest";
+import { describe, expect, it, beforeEach, afterEach, vi } from "vite-plus/test";
 
 import { screenText, screenValue } from "./index.js";
-import { getTracePath, RawTraceStore, TRACE_PROVENANCE, TRACE_PROVENANCE_CLAUDECODE } from "../trace/store.js";
-import { mkdirSync, writeFileSync, readFileSync, unlinkSync, rmSync } from "node:fs";
+import {
+  getTracePath,
+  RawTraceStore,
+  TRACE_PROVENANCE,
+  TRACE_PROVENANCE_CLAUDECODE,
+} from "../trace/store.js";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 // ---------------------------------------------------------------------------
 // Fixture constants — clearly fake, clearly labeled
@@ -29,9 +36,14 @@ const AWS_FAKE = "AKIA" + "A".repeat(16) + " is AWS";
 // Fixture tokens are runtime-constructed so the file never contains a literal
 // matching GitHub push protection patterns (the push was rejected once for this).
 // Runtime values still match the screening regexes; all samples are invalid tokens.
-const SLACK_FAKE = "token: xoxp-" + ["123456789012", "123456789012", "123456789012", "a1b2c3d4e5f6a7b8c9d0e1f2"].join("-");
-const JWT_FAKE =
-  ["eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9", "eyJzdWIiOiIxMjM0NTY3ODkwIn0", "dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"].join(".");
+const SLACK_FAKE =
+  "token: xoxp-" +
+  ["123456789012", "123456789012", "123456789012", "a1b2c3d4e5f6a7b8c9d0e1f2"].join("-");
+const JWT_FAKE = [
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+  "eyJzdWIiOiIxMjM0NTY3ODkwIn0",
+  "dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
+].join(".");
 const BEARER_FAKE = "Authorization: Bearer abcdef1234567890abcdef1234567890abcdef1234";
 const ENV_SECRET_FAKE =
   "api_key=sk-test-FAKEKEY1234567890abcdef and password=hunter2-general-kitten-access-token";
@@ -289,7 +301,7 @@ describe("evidence integrity + surfacing redaction", () => {
 
   it("raw trace entry text still contains the secret (evidence intact)", () => {
     const rawEvent = FAKE_TRACE_ENTRIES[0].event;
-    const params = rawEvent.params as Record<string, string>;
+    const params = rawEvent.params;
     // The raw API responses haven't been screened yet...
     expect(params.apiKey).toBe(OPENAI_FAKE);
     expect(params.body).toContain(BEARER_FAKE);
@@ -402,15 +414,23 @@ describe("screenText: edge cases", () => {
 
 describe("evidence integrity: raw trace file on disk", () => {
   const SESSION = "screening-evidence-test";
+  let testRoot: string;
+
+  beforeEach(() => {
+    testRoot = mkdtempSync(path.join(os.tmpdir(), "glassbox-screening-test-"));
+    vi.stubEnv("GLASSBOX_DATA_DIR", testRoot);
+  });
 
   afterEach(() => {
-    // Clean up the trace file after each test
-    try {
-      const path = getTracePath(SESSION);
-      unlinkSync(path);
-      const dir = path.replace(/\/[^/]+$/, "");
-      rmSync(dir, { recursive: true, force: true });
-    } catch { /* already gone */ }
+    vi.unstubAllEnvs();
+    const resolved = path.resolve(testRoot);
+    if (
+      path.dirname(resolved) !== path.resolve(os.tmpdir()) ||
+      !path.basename(resolved).startsWith("glassbox-screening-test-")
+    ) {
+      throw new Error("Refusing to remove a directory outside the screening fixture");
+    }
+    rmSync(resolved, { recursive: true, force: true });
   });
 
   it("RawTraceStore append keeps secrets verbatim; API response redacts", () => {
@@ -534,7 +554,9 @@ describe("per-provider screening coverage", () => {
     };
 
     // Both go through the same screening path
-    expect(screenValue(codexState).task).toBe("fix the bug"); // no secrets
-    expect(screenValue(claudeState).task).toContain("[REDACTED:openai-key]");
+    expect(screenValue(codexState)).toMatchObject({ task: "fix the bug" });
+    expect(screenValue(claudeState)).toMatchObject({
+      task: expect.stringContaining("[REDACTED:openai-key]"),
+    });
   });
 });

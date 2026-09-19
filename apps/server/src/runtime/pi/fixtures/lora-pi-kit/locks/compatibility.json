@@ -1,0 +1,5 @@
+{
+  "kitVersion": "0.1.0",
+  "pinnedPiVersion": "0.85.1",
+  "testedPiVersions": ["0.85.1"]
+}

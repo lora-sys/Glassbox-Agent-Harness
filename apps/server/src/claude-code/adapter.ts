@@ -13,7 +13,14 @@
 //   cwd from session opts + permission mode + canUseTool. No OS sandbox
 //   in Phase 2. See AGENTS.md for the guarantee gap.
 
-import { query, type PermissionResult, type PermissionMode, type CanUseTool } from "@anthropic-ai/claude-agent-sdk";
+import {
+  query,
+  type Query,
+  type Options,
+  type PermissionResult,
+  type PermissionMode,
+  type CanUseTool,
+} from "@anthropic-ai/claude-agent-sdk";
 import type {
   ProviderAdapter,
   Session,
@@ -31,20 +38,24 @@ import type { ServerInfo, Turn, UserInput, ApprovalEvent } from "../codex/types.
 // ---------------------------------------------------------------------------
 
 import { mkdirSync, appendFileSync, readFileSync } from "node:fs";
+import path from "node:path";
+import { getTracePath } from "../trace/store.js";
+import { getDefaultWorkspace } from "../platform/paths.js";
+import { resolveClaudeExecutable } from "../platform/executable.js";
+import { gitLsFiles, gitDiffForScan, type FileSnapshot } from "../platform/git.js";
 
 function ensureTraceDir(sessionId: string): void {
-  const base = `/data/lora/repos/Glassbox-Agent-Harness/.glassbox/sessions/${sessionId}`;
-  mkdirSync(base, { recursive: true });
+  const dir = path.dirname(getTracePath(sessionId));
+  mkdirSync(dir, { recursive: true });
 }
 
 function nextSeq(sessionId: string): number {
   try {
-    const content = readFileSync(
-      `/data/lora/repos/Glassbox-Agent-Harness/.glassbox/sessions/${sessionId}/trace.jsonl`,
-      "utf-8"
-    );
+    const content = readFileSync(getTracePath(sessionId), "utf-8");
     return content.split("\n").filter((l) => l.trim()).length + 1;
-  } catch { return 1; }
+  } catch {
+    return 1;
+  }
 }
 
 function writeTraceDirect(sessionId: string, event: unknown, provenance: string): void {
@@ -52,11 +63,7 @@ function writeTraceDirect(sessionId: string, event: unknown, provenance: string)
   const seq = nextSeq(sessionId);
   const ts = new Date().toISOString();
   const line = JSON.stringify({ seq, ts, event, provenance }) + "\n";
-  appendFileSync(
-    `/data/lora/repos/Glassbox-Agent-Harness/.glassbox/sessions/${sessionId}/trace.jsonl`,
-    line,
-    "utf-8"
-  );
+  appendFileSync(getTracePath(sessionId), line, "utf-8");
 }
 
 // ---------------------------------------------------------------------------
@@ -85,7 +92,7 @@ interface SessionState {
   pendingApprovals: Map<string, PendingApproval>;
   pendingPrompt: string | null;
   cwd: string;
-  permissionMode: string;
+  permissionMode: PermissionMode;
   appendSystemPrompt: string;
 }
 
@@ -93,6 +100,10 @@ interface TurnState {
   turnId: string;
   startedAt: number;
   aborted: boolean;
+  finished: boolean;
+  abortController: AbortController;
+  query?: Query;
+  collection?: Promise<RunResult>;
   traceEmitted?: boolean;
 }
 
@@ -115,7 +126,7 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
     afterHooks: [],
   };
 
-  constructor() {
+  constructor(private claudePath = process.env.CLAUDE_BINARY_PATH ?? "claude") {
     this._info = {
       userAgent: "claude-code-cli",
       codexHome: "n/a",
@@ -129,17 +140,41 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
   // -------------------------------------------------------------------------
 
   async initialize(): Promise<ServerInfo> {
+    const resolvedExe = resolveClaudeExecutable({ binaryPath: this.claudePath });
+    if (!resolvedExe) {
+      throw new Error(
+        `Claude Code executable not found at "${this.claudePath}". ` +
+          `Ensure @anthropic-ai/claude-code or claude is installed and available in PATH, or set CLAUDE_BINARY_PATH.`,
+      );
+    }
     return this._info;
   }
 
   start(): void {
-    // No persistent process: query() spawns per-session.
+    const resolvedExe = resolveClaudeExecutable({ binaryPath: this.claudePath });
+    if (!resolvedExe) {
+      throw new Error(
+        `Claude Code executable not found at "${this.claudePath}". ` +
+          `Ensure @anthropic-ai/claude-code or claude is installed and available in PATH, or set CLAUDE_BINARY_PATH.`,
+      );
+    }
   }
 
   stop(): void {
+    let closeError: unknown;
+    for (const session of this.sessions.values()) {
+      if (session.turn && !session.turn.finished) {
+        try {
+          this.abortTurn(session, session.turn);
+        } catch (error) {
+          closeError ??= error;
+        }
+      }
+    }
     this.sessions.clear();
     this.turnEndSubscribers = [];
     this.approvalHandlers = [];
+    if (closeError) throw closeError;
   }
 
   // -------------------------------------------------------------------------
@@ -153,9 +188,10 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
       lastAssistantUuid: undefined,
       pendingApprovals: new Map(),
       pendingPrompt: null,
-      cwd: typeof _opts.cwd === "string" ? _opts.cwd : "/tmp",
-      permissionMode: typeof _opts.permissionMode === "string" ? _opts.permissionMode : "default",
-      appendSystemPrompt: typeof _opts.appendSystemPrompt === "string" ? _opts.appendSystemPrompt : "",
+      cwd: typeof _opts.cwd === "string" ? _opts.cwd : getDefaultWorkspace("claude-code"),
+      permissionMode: permissionMode(_opts.permissionMode ?? "default"),
+      appendSystemPrompt:
+        typeof _opts.appendSystemPrompt === "string" ? _opts.appendSystemPrompt : "",
     });
     return { id: clientSessionId };
   }
@@ -164,11 +200,14 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
   // Turns
   // -------------------------------------------------------------------------
 
-  async startTurn(
-    sessionId: string,
-    input: UserInput[],
-    _opts: TurnOpts = {}
-  ): Promise<Turn> {
+  async startTurn(sessionId: string, input: UserInput[], _opts: TurnOpts = {}): Promise<Turn> {
+    const state = this.sessions.get(sessionId);
+    if (!state) throw new Error("No Claude session");
+    if (
+      _opts.permissionMode !== undefined &&
+      permissionMode(_opts.permissionMode) !== state.permissionMode
+    )
+      throw new Error("Claude permission mode cannot change within a session");
     const text = input.map((u) => (u.type === "text" ? u.text : "")).join("");
     const turn = this.ensureTurn(sessionId);
 
@@ -187,64 +226,88 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
     };
   }
 
-  async interruptTurn(sessionId: string, _turnId: string): Promise<void> {
+  async interruptTurn(sessionId: string, turnId: string): Promise<void> {
     const s = this.sessions.get(sessionId);
-    if (s?.turn) {
-      s.turn.aborted = true;
-    }
+    if (!s?.turn || s.turn.turnId !== turnId) throw new Error("No matching Claude turn");
+    const turn = s.turn;
+    if (turn.finished) return;
+    this.abortTurn(s, turn);
+    // Abort receipt alone does not mean the SDK iterator and its tools stopped.
+    await turn.collection;
   }
 
   // -------------------------------------------------------------------------
   // Event collection
   // -------------------------------------------------------------------------
 
-  async collectTurnEvents(
+  collectTurnEvents(
+    sessionId: string,
+    turnId: string,
+    timeoutMs: number,
+    traceCollector?: (method: string, params: Record<string, unknown>) => void,
+  ): Promise<RunResult> {
+    const turn = this.ensureTurn(sessionId, turnId);
+    turn.collection ??= this.collectTurn(sessionId, turnId, timeoutMs, traceCollector);
+    return turn.collection;
+  }
+
+  private async collectTurn(
     sessionId: string,
     turnId: string,
     _timeoutMs: number,
-    traceCollector?: (method: string, params: Record<string, unknown>) => void
+    traceCollector?: (method: string, params: Record<string, unknown>) => void,
   ): Promise<RunResult> {
     const state = this.sessions.get(sessionId);
     if (!state) {
-      return this.makeResult(sessionId, turnId, { status: "failed", durationMs: 0, error: "no session" });
+      return this.makeResult(sessionId, turnId, {
+        status: "failed",
+        durationMs: 0,
+        error: "no session",
+      });
     }
 
     const turn = this.ensureTurn(sessionId, turnId);
     const cwd = state.cwd;
-    const mode: PermissionMode = state.permissionMode as PermissionMode;
+    const mode = state.permissionMode;
 
     const approvals: ApprovalEvent[] = [];
     let agentMessageCount = 0;
     const counts: Record<string, number> = {};
-    let completed:
-      | { status: "completed" | "interrupted" | "failed"; durationMs: number; error?: string }
-      | null = null;
+    let completed: {
+      status: "completed" | "interrupted" | "failed";
+      durationMs: number;
+      error?: string;
+    } | null = null;
     // Track last assistant text block for the final-answer event (claude-code-
     // specific: codex deltas are incremental tokens, so this event is not
     // emitted for codex).
     let lastAssistantText = "";
 
     const canUseTool: CanUseTool = this.buildCanUseTool(approvals, turn, sessionId);
+    const resolvedExe = resolveClaudeExecutable({ binaryPath: this.claudePath });
 
-    const q = query({
-      prompt: state.pendingPrompt ?? "say ready",
-      options: {
-        cwd,
-        permissionMode: mode,
-        canUseTool,
-        tools: { type: "preset" as const, preset: "claude_code" as const },
-        systemPrompt: {
-          type: "preset" as const,
-          preset: "claude_code" as const,
-          append: state.appendSystemPrompt,
-        },
-      } as Parameters<typeof query>[0]["options"],
-    } as unknown as Parameters<typeof query>[0]);
+    const queryOptions: Options = {
+      cwd,
+      abortController: turn.abortController,
+      permissionMode: mode,
+      canUseTool,
+      tools: { type: "preset" as const, preset: "claude_code" as const },
+      systemPrompt: {
+        type: "preset" as const,
+        preset: "claude_code" as const,
+        append: state.appendSystemPrompt,
+      },
+    };
+    if (resolvedExe) {
+      queryOptions.pathToClaudeCodeExecutable = resolvedExe;
+    }
 
     try {
+      if (!turn.aborted)
+        turn.query = query({ prompt: state.pendingPrompt ?? "say ready", options: queryOptions });
       let threadStartedEmitted = false;
-
-      for await (const msg of q) {
+      const messages = turn.query ?? [];
+      for await (const msg of messages) {
         const m = msg as Record<string, unknown>;
         counts[m.type as string] = (counts[m.type as string] || 0) + 1;
 
@@ -266,7 +329,13 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
                 threadStartedEmitted = true;
                 const tsThread = { sessionId, threadId: sessionId, ts: Date.now() };
                 traceCollector("thread/started", tsThread);
-                try { writeTraceDirect(sessionId, { method: "thread/started", params: tsThread }, "claude-code-cli"); } catch {}
+                try {
+                  writeTraceDirect(
+                    sessionId,
+                    { method: "thread/started", params: tsThread },
+                    "claude-code-cli",
+                  );
+                } catch {}
               }
             }
             break;
@@ -283,11 +352,20 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
               const tsTurn = {
                 threadId: sessionId,
                 turn: { id: turn.turnId },
-                input: typeof state.pendingPrompt === "string" ? [{ type: "text", text: state.pendingPrompt }] : [],
+                input:
+                  typeof state.pendingPrompt === "string"
+                    ? [{ type: "text", text: state.pendingPrompt }]
+                    : [],
                 startedAtMs: turn.startedAt,
               };
               traceCollector("turn/started", tsTurn);
-              try { writeTraceDirect(sessionId, { method: "turn/started", params: tsTurn }, "claude-code-cli"); } catch {}
+              try {
+                writeTraceDirect(
+                  sessionId,
+                  { method: "turn/started", params: tsTurn },
+                  "claude-code-cli",
+                );
+              } catch {}
             }
             const message = msg as { message?: { content?: Array<Record<string, unknown>> } };
             if (message.message?.content) {
@@ -295,7 +373,12 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
               for (const block of message.message.content as Array<Record<string, unknown>>) {
                 if (block.type === "tool_use" && traceCollector) {
                   traceCollector("item/started", {
-                    item: { type: "tool", id: block.id as string, name: block.name as string, input: block.input },
+                    item: {
+                      type: "tool",
+                      id: block.id as string,
+                      name: block.name as string,
+                      input: block.input,
+                    },
                     threadId: sessionId,
                     turnId: turn.turnId,
                     startedAtMs: Date.now(),
@@ -328,7 +411,10 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
                       type: "tool",
                       id: block.tool_use_id as string,
                       status: isError ? "failed" : "completed",
-                      aggregatedOutput: typeof block.content === "string" ? block.content : JSON.stringify(block.content),
+                      aggregatedOutput:
+                        typeof block.content === "string"
+                          ? block.content
+                          : JSON.stringify(block.content),
                     },
                     threadId: sessionId,
                     turnId: turn.turnId,
@@ -353,18 +439,28 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
                 output_tokens?: number;
                 cache_read_input_tokens?: number;
               };
-              modelUsage?: Record<string, { inputTokens?: number; outputTokens?: number; costUSD?: number }>;
+              modelUsage?: Record<
+                string,
+                { inputTokens?: number; outputTokens?: number; costUSD?: number }
+              >;
             };
             const isError = rmsg.subtype === "error_during_execution" || rmsg.is_error;
-            const durationMs = (typeof rmsg.duration_ms === "number" ? rmsg.duration_ms : Date.now() - turn.startedAt) as number;
+            const durationMs = (
+              typeof rmsg.duration_ms === "number" ? rmsg.duration_ms : Date.now() - turn.startedAt
+            ) as number;
 
             if (turn.aborted) {
               completed = { status: "interrupted", durationMs };
             } else if (isError) {
               const err = Array.isArray(rmsg.errors)
-                ? rmsg.errors.find((e: string) => !e.startsWith("[ede_diagnostic]")) ?? rmsg.result
+                ? (rmsg.errors.find((e: string) => !e.startsWith("[ede_diagnostic]")) ??
+                  rmsg.result)
                 : rmsg.result;
-              completed = { status: "failed", durationMs, error: typeof err === "string" ? err : String(err) };
+              completed = {
+                status: "failed",
+                durationMs,
+                error: typeof err === "string" ? err : String(err),
+              };
             } else {
               completed = { status: "completed", durationMs };
             }
@@ -382,18 +478,6 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
                 });
               }
 
-              traceCollector("turn/completed", {
-                threadId: sessionId,
-                turn: {
-                  id: turn.turnId,
-                  status: completed!.status,
-                  startedAt: Math.floor(turn.startedAt / 1000),
-                  completedAt: Math.floor(Date.now() / 1000),
-                  durationMs: completed!.durationMs,
-                  error: completed!.error ?? null,
-                },
-              });
-
               // (The final-answer event is emitted above, before turn/completed,
               // so the reducer can attach it to the still-open turn.)
 
@@ -402,7 +486,9 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
               // to single-turn usage.
               const usage = rmsg.usage ?? {};
               const modelEntries = rmsg.modelUsage ? Object.values(rmsg.modelUsage) : [];
-              let aggInput = 0, aggOutput = 0, aggCost = 0;
+              let aggInput = 0,
+                aggOutput = 0,
+                aggCost = 0;
               for (const m of modelEntries) {
                 aggInput += m.inputTokens ?? 0;
                 aggOutput += m.outputTokens ?? 0;
@@ -427,8 +513,6 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
                 });
               }
             }
-            this.turnEndSubscribers.forEach((fn) => fn(completed!.status));
-            this.turnEndSubscribers = [];
             break;
           }
 
@@ -446,32 +530,37 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
         durationMs,
         error: msg,
       };
-      if (!completed) return this.makeResult(sessionId, turn.turnId, { status: "failed", durationMs, error: msg }, counts, approvals, agentMessageCount);
-
-      if (traceCollector) {
-        traceCollector("turn/completed", {
-          threadId: sessionId,
-          turn: {
-            id: turn.turnId,
-            status: completed!.status,
-            startedAt: Math.floor(turn.startedAt / 1000),
-            completedAt: Math.floor(Date.now() / 1000),
-            durationMs: completed!.durationMs,
-            error: completed!.error ?? null,
-          },
-        });
-      }
-      this.turnEndSubscribers.forEach((fn) => fn(completed!.status));
-      this.turnEndSubscribers = [];
     } finally {
-      // Clean up pending approval timers.
+      // Query.close is the SDK's process termination boundary. A result message
+      // is not published as terminal until iteration and this cleanup finish.
+      turn.query?.close();
       for (const [, pa] of state.pendingApprovals) {
+        pa.resolve?.(false);
         clearTimeout(pa.timer);
       }
       state.pendingApprovals.clear();
     }
 
-    return this.makeResult(sessionId, turn.turnId, completed ?? { status: "failed", durationMs: 0 }, counts, approvals, agentMessageCount);
+    completed ??= {
+      status: turn.aborted ? "interrupted" : "failed",
+      durationMs: Date.now() - turn.startedAt,
+      ...(turn.aborted ? {} : { error: "Claude query ended without a result" }),
+    };
+    turn.finished = true;
+    traceCollector?.("turn/completed", {
+      threadId: sessionId,
+      turn: {
+        id: turn.turnId,
+        status: completed.status,
+        startedAt: Math.floor(turn.startedAt / 1000),
+        completedAt: Math.floor(Date.now() / 1000),
+        durationMs: completed.durationMs,
+        error: completed.error ?? null,
+      },
+    });
+    const subscribers = this.turnEndSubscribers.splice(0);
+    for (const subscriber of subscribers) subscriber(completed.status);
+    return this.makeResult(sessionId, turn.turnId, completed, counts, approvals, agentMessageCount);
   }
 
   // -------------------------------------------------------------------------
@@ -481,15 +570,21 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
   private buildCanUseTool(
     turnApprovals: ApprovalEvent[],
     turn: TurnState & { turnId: string },
-    sessionId: string
+    sessionId: string,
   ): CanUseTool {
-    return async (_toolName: string, _input: Record<string, unknown>, options: {
-      signal: AbortSignal;
-      toolUseID: string;
-      title?: string;
-      decisionReason?: string;
-    }): Promise<PermissionResult | null> => {
+    return async (
+      _toolName: string,
+      _input: Record<string, unknown>,
+      options: {
+        signal: AbortSignal;
+        toolUseID: string;
+        title?: string;
+        decisionReason?: string;
+      },
+    ): Promise<PermissionResult | null> => {
       const toolUseId = options.toolUseID;
+      if (turn.aborted || options.signal.aborted)
+        return { behavior: "deny", message: "turn interrupted" };
 
       const approvalEvent: ApprovalEvent = {
         type: "approval",
@@ -510,27 +605,32 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
         return { behavior: "deny", message: "no session" };
       }
 
-      const pending: PendingApproval = {
-        itemId: toolUseId,
-        toolName: _toolName,
-        resolve: null,
-        timer: setTimeout(() => {
-          if (pending.resolve) pending.resolve(false); // fail-closed
-          pending.resolve = null;
-          approvalEvent.action = "declined";
-        }, 120_000),
-      };
-
-      state.pendingApprovals.set(toolUseId, pending);
-      this.approvalHandlers.forEach((fn) => fn(approvalEvent));
-
       return new Promise<PermissionResult | null>((resolve) => {
-        pending.resolve = (approved: boolean) => {
-          clearTimeout(pending.timer);
-          state.pendingApprovals.delete(toolUseId);
-          approvalEvent.action = approved ? "pending" : "declined";
-          resolve(approved ? { behavior: "allow", updatedPermissions: [] } : { behavior: "deny", message: "denied by user" });
+        const onAbort = () => pending.resolve?.(false);
+        const pending: PendingApproval = {
+          itemId: toolUseId,
+          toolName: _toolName,
+          resolve: null,
+          timer: setTimeout(() => pending.resolve?.(false), 120_000),
         };
+        pending.resolve = (approved: boolean) => {
+          pending.resolve = null;
+          clearTimeout(pending.timer);
+          options.signal.removeEventListener("abort", onAbort);
+          turn.abortController.signal.removeEventListener("abort", onAbort);
+          state.pendingApprovals.delete(toolUseId);
+          approved = approved && !turn.aborted && !options.signal.aborted;
+          approvalEvent.action = approved ? "pending" : "declined";
+          resolve(
+            approved
+              ? { behavior: "allow", updatedPermissions: [] }
+              : { behavior: "deny", message: "denied by user" },
+          );
+        };
+        state.pendingApprovals.set(toolUseId, pending);
+        options.signal.addEventListener("abort", onAbort, { once: true });
+        turn.abortController.signal.addEventListener("abort", onAbort, { once: true });
+        this.approvalHandlers.forEach((fn) => fn(approvalEvent));
       });
     };
   }
@@ -590,7 +690,11 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
     const hooks = [...this._lifecycleLatch.afterHooks];
     this._lifecycleLatch = { beforeSnapshot: null, afterHooks: [] };
     for (const hook of hooks) {
-      try { hook({ changes }); } catch { /* ignore hook errors */ }
+      try {
+        hook({ changes });
+      } catch {
+        /* ignore hook errors */
+      }
     }
     return { changes };
   }
@@ -623,91 +727,46 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
   // Turn/session state helpers
   // -------------------------------------------------------------------------
 
-  private ensureTurn(sessionId: string, _turnId?: string): TurnState & { turnId: string } {
-    let s = this.sessions.get(sessionId);
-    if (!s) {
-      const tid = crypto.randomUUID();
-      this.sessions.set(sessionId, {
-        sdkSessionId: sessionId,
-        resumeSessionId: undefined,
-        lastAssistantUuid: undefined,
-        pendingApprovals: new Map(),
-        pendingPrompt: null,
-        cwd: "/tmp",
-        permissionMode: "default",
-        appendSystemPrompt: "",
-        turn: { turnId: tid, startedAt: Date.now(), aborted: false },
-      });
-      return (this.sessions.get(sessionId) as SessionState & { turn: TurnState }).turn;
+  private ensureTurn(sessionId: string, turnId?: string): TurnState {
+    const s = this.sessions.get(sessionId);
+    if (!s) throw new Error("No Claude session");
+    if (turnId !== undefined) {
+      if (!s.turn || s.turn.turnId !== turnId) throw new Error("No matching Claude turn");
+      return s.turn;
     }
-    // Always create a fresh turn entry so subsequent startTurn calls get a
-    // unique turnId. This ensures the trace records a turn/started per turn,
-    // which the reducer needs to build the per-turn entries correctly.
-    const tid = crypto.randomUUID();
-    s.turn = { turnId: tid, startedAt: Date.now(), aborted: false };
+    if (s.turn && !s.turn.finished) throw new Error("A Claude turn is already active");
+    s.turn = {
+      turnId: crypto.randomUUID(),
+      startedAt: Date.now(),
+      aborted: false,
+      finished: false,
+      abortController: new AbortController(),
+    };
     return s.turn;
   }
-}
 
-// ---------------------------------------------------------------------------
-// Git diff scanning helpers (S8 artifact detection fallback)
-// Mirrors CodexAdapter.ts exactly.
-// ---------------------------------------------------------------------------
-
-interface FileSnapshot {
-  [filePath: string]: string;
-}
-
-function gitLsFiles(cwd: string): FileSnapshot | null {
-  try {
-    const { execSync } = require("node:child_process");
-    const out = execSync("git ls-files -s", { cwd, encoding: "utf-8", timeout: 5000 }).trim();
-    if (!out) return null;
-    const snap: FileSnapshot = {};
-    for (const line of out.split("\n")) {
-      const tab = line.indexOf("\t");
-      if (tab < 0) continue;
-      const sha = line.slice(4, 45);
-      const path = line.slice(tab + 1);
-      snap[path] = sha;
-    }
-    return snap;
-  } catch {
-    return null;
+  private abortTurn(session: SessionState, turn: TurnState): void {
+    turn.aborted = true;
+    turn.abortController.abort();
+    for (const pending of session.pendingApprovals.values()) pending.resolve?.(false);
+    // Follows t3code at 4a4c6dd2adc350a68ba18bb28b24b5a7e4660dab,
+    // apps/server/src/provider/Layers/ClaudeAdapter.ts, stopSessionInternal.
+    // MIT, Copyright (c) 2026 T3 Tools Inc. The SDK close API stops background
+    // tools as well; an interrupt receipt alone does not establish that fact.
+    turn.query?.close();
   }
 }
 
-function gitDiffForScan(cwd: string, snapshot: FileSnapshot): { path: string; kind: string; diff?: string }[] {
-  try {
-    const { execSync } = require("node:child_process");
-    const changes: { path: string; kind: string; diff?: string }[] = [];
-    const statOut = execSync("git diff --name-status", { cwd, encoding: "utf-8", timeout: 5000 }).trim();
-    if (statOut) {
-      for (const line of statOut.split("\n")) {
-        const parts = line.split("\t");
-        const status = parts[0] ?? "M";
-        const path = parts[1] ?? "";
-        const kind = status === "A" ? "add" : status === "D" ? "delete" : status === "R" ? "rename" : "modify";
-        try {
-          const diffOut = execSync("git diff -- " + path.replace(/"/g, '\\"'), { cwd, encoding: "utf-8", timeout: 5000 }).trim();
-          changes.push({ path, kind, diff: diffOut.slice(0, 2048) });
-        } catch {
-          changes.push({ path, kind });
-        }
-      }
-    } else {
-      const current = gitLsFiles(cwd);
-      if (current) {
-        for (const [p, oldSha] of Object.entries(snapshot)) {
-          if (oldSha !== current[p]) changes.push({ path: p, kind: "modify" });
-        }
-        for (const p of Object.keys(current)) {
-          if (!(p in snapshot)) changes.push({ path: p, kind: "add" });
-        }
-      }
-    }
-    return changes;
-  } catch {
-    return [];
+function permissionMode(value: unknown): PermissionMode {
+  switch (value) {
+    case "default":
+    case "acceptEdits":
+    case "bypassPermissions":
+    case "plan":
+    case "dontAsk":
+    case "auto":
+      return value;
+    default:
+      throw new Error("Invalid Claude permission mode");
   }
 }

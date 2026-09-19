@@ -56,6 +56,19 @@ Vite+ is expected to cover Vite / Rolldown, Vitest, Oxlint, Oxfmt, tsdown, and w
 
 Until the migration is actually complete, use the commands that currently exist in the repository. Do not pretend planned commands are already implementation reality.
 
+The configured local Personal Agent environment has one service command surface:
+
+    npm run agent:up
+    npm run agent:status
+    npm run agent:logs
+    npm run agent:down
+
+agent:up reads optional Herdr, NapCat and Glassbox launch settings from
+<GLASSBOX_DATA_DIR>/service-launch.json. Use docs/service-launch.example.json as the shape. Keep credentials in the existing protected Channel and model stores.
+For NapCat restart login, append the Bot QQ number to the launcher arguments after the QQ executable and injection library. The service file accepts only the documented non-secret environment keys.
+
+The service manager launches fixed executables without a shell. It records process identity in the data directory and verifies it before shutdown. Named Herdr sessions use Herdr's public session status and stop commands.
+
 Do not keep parallel lint / format / type-check stacks without a demonstrated compatibility need.
 
 ## Web application

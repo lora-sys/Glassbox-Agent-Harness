@@ -595,6 +595,16 @@ Do not postpone the package / profile / lock architecture and later replace a te
 
 The P3 MVP may leave many optional Skills and MCP integrations disabled until they have a real use case.
 
+## P3 installation and runtime verification
+
+Kit 0.1.1 uses Pi's public Package API to install selected profile resources into an explicit isolated agentDir. Its profile launcher disables ambient resource discovery. SDK hosts use the same profile resource options and bind Pi Extensions before execution, then emit the shutdown event before disposing a session.
+
+Controlled upgrades activate an explicitly supplied, doctor-verified local Kit checkout. Skills synchronization reads immutable blobs from the reviewed canonical Git commit. It does not relabel local Skill edits as an upstream snapshot. The distribution preserves locked Skill bytes across checkout line-ending settings.
+
+MCP starts only from an explicitly configured, per-session Extension factory. The profile and registry must both select a server. Glassbox-hosted execution still requires product authorization on each Tool call. Glassbox's main runtime exposes its own registered protected Tools and does not enable standalone MCP discovery.
+
+Host verification covers a fresh test-profile installation, the selected bundled Skill, a real local stdio MCP call through the actual Pi SDK, independent session policy, revocation, controlled upgrade behavior, packed-artifact doctor checks, and SDK loading of the packed test/main-agent/qq-group profiles. Verified host metadata currently lists Windows only.
+
 ## What does not belong here
 
 Do not move these into Lora PI Kit:

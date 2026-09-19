@@ -1,10 +1,4 @@
-import type {
-  ServerInfo,
-  Turn,
-  TurnStatus,
-  UserInput,
-  ApprovalEvent,
-} from "../codex/types.js";
+import type { ServerInfo, Turn, TurnStatus, UserInput, ApprovalEvent } from "../codex/types.js";
 
 /** A session as returned by the provider (Codex: "thread"). */
 export interface Session {
@@ -61,10 +55,10 @@ export interface ProviderAdapter {
     sessionId: string,
     turnId: string,
     timeoutMs: number,
-    traceCollector?: (method: string, params: Record<string, unknown>) => void
+    traceCollector?: (method: string, params: Record<string, unknown>) => void,
   ): Promise<RunResult>;
 
-  registerOnTurnEnd(fn: (status: string) => void): void;
+  registerOnTurnEnd(fn: (status: string) => void, threadId?: string): void;
 
   on(event: "approval", handler: (ev: ApprovalEvent) => void): void;
   respondToApproval(requestId: number | string, approved: boolean): void;

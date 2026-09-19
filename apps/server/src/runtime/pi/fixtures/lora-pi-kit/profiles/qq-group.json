@@ -1,0 +1,14 @@
+{
+  "name": "qq-group",
+  "description": "QQ group remote profile",
+  "promptTemplate": "base",
+  "thinkingLevel": "none",
+  "enabledExtensions": [],
+  "enabledSkills": [],
+  "enabledMcpServers": [],
+  "activeTools": [],
+  "runtimeIsolation": {
+    "defaultAgentDirSubpath": "pi/qq-group",
+    "isolateSessionState": true
+  }
+}

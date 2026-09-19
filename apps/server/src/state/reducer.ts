@@ -16,10 +16,11 @@ import type { DerivedState, TurnRecord } from "./types.js";
 function userInputText(input: unknown): string | null {
   if (!Array.isArray(input)) return null;
   const parts = input
-    .filter((u): u is { type: string; text: string } =>
-      typeof u === "object" && u !== null && u.type === "text" && typeof u.text === "string"
+    .filter(
+      (u): u is { type: string; text: string } =>
+        typeof u === "object" && u !== null && u.type === "text" && typeof u.text === "string",
     )
-    .map(u => u.text)
+    .map((u) => u.text)
     .filter(Boolean);
   return parts.length > 0 ? parts.join(" ") : null;
 }
@@ -61,7 +62,14 @@ export function reduce(state: DerivedState, event: CodexEvent): DerivedState {
     // -----------------------------------------------------------------------
     case "threadStarted": {
       counts["thread/started"] = (counts["thread/started"] ?? 0) + 1;
-      return { ...state, traceSummary: { ...state.traceSummary, eventCounts: counts, totalEvents: state.traceSummary.totalEvents + 1 } };
+      return {
+        ...state,
+        traceSummary: {
+          ...state.traceSummary,
+          eventCounts: counts,
+          totalEvents: state.traceSummary.totalEvents + 1,
+        },
+      };
     }
 
     // -----------------------------------------------------------------------
@@ -100,7 +108,11 @@ export function reduce(state: DerivedState, event: CodexEvent): DerivedState {
         testResult: null,
         artifacts: state.artifacts,
         _pendingDiffs: state._pendingDiffs,
-        traceSummary: { ...state.traceSummary, eventCounts: counts, totalEvents: state.traceSummary.totalEvents + 1 },
+        traceSummary: {
+          ...state.traceSummary,
+          eventCounts: counts,
+          totalEvents: state.traceSummary.totalEvents + 1,
+        },
       };
     }
 
@@ -135,7 +147,11 @@ export function reduce(state: DerivedState, event: CodexEvent): DerivedState {
             phase: item.phase ?? null,
             startedAtMs: event.startedAtMs,
           },
-          traceSummary: { ...state.traceSummary, eventCounts: counts, totalEvents: state.traceSummary.totalEvents + 1 },
+          traceSummary: {
+            ...state.traceSummary,
+            eventCounts: counts,
+            totalEvents: state.traceSummary.totalEvents + 1,
+          },
         };
       }
       return {
@@ -148,7 +164,11 @@ export function reduce(state: DerivedState, event: CodexEvent): DerivedState {
           phase: item.phase ?? null,
           startedAtMs: event.startedAtMs,
         },
-        traceSummary: { ...state.traceSummary, eventCounts: counts, totalEvents: state.traceSummary.totalEvents + 1 },
+        traceSummary: {
+          ...state.traceSummary,
+          eventCounts: counts,
+          totalEvents: state.traceSummary.totalEvents + 1,
+        },
       };
     }
 
@@ -166,13 +186,20 @@ export function reduce(state: DerivedState, event: CodexEvent): DerivedState {
       const turns = [...state.turns];
       const openIdx = findOpenTurnIndex(turns);
       if (openIdx >= 0) {
-        turns[openIdx] = { ...turns[openIdx], agentMessageText: turns[openIdx].agentMessageText + event.delta };
+        turns[openIdx] = {
+          ...turns[openIdx],
+          agentMessageText: turns[openIdx].agentMessageText + event.delta,
+        };
       }
       return {
         ...state,
         currentWork,
         turns,
-        traceSummary: { ...state.traceSummary, eventCounts: counts, totalEvents: state.traceSummary.totalEvents + 1 },
+        traceSummary: {
+          ...state.traceSummary,
+          eventCounts: counts,
+          totalEvents: state.traceSummary.totalEvents + 1,
+        },
       };
     }
 
@@ -192,7 +219,11 @@ export function reduce(state: DerivedState, event: CodexEvent): DerivedState {
             aggregatedOutput: event.item.aggregatedOutput ?? null,
             durationMs: event.item.durationMs ?? null,
           },
-          traceSummary: { ...state.traceSummary, eventCounts: counts, totalEvents: state.traceSummary.totalEvents + 1 },
+          traceSummary: {
+            ...state.traceSummary,
+            eventCounts: counts,
+            totalEvents: state.traceSummary.totalEvents + 1,
+          },
         };
         if (state.currentWork?.itemId === event.item.id) {
           return { ...newState, currentWork: null };
@@ -205,7 +236,11 @@ export function reduce(state: DerivedState, event: CodexEvent): DerivedState {
       return {
         ...state,
         currentWork,
-        traceSummary: { ...state.traceSummary, eventCounts: counts, totalEvents: state.traceSummary.totalEvents + 1 },
+        traceSummary: {
+          ...state.traceSummary,
+          eventCounts: counts,
+          totalEvents: state.traceSummary.totalEvents + 1,
+        },
       };
     }
 
@@ -219,7 +254,7 @@ export function reduce(state: DerivedState, event: CodexEvent): DerivedState {
         kind: (c as { kind: string }).kind,
         diff: (c as { diff?: string }).diff ?? null,
       }));
-      const artifact: typeof state.artifacts[number] = {
+      const artifact: (typeof state.artifacts)[number] = {
         itemId: event.itemId,
         changes,
         status: "changed",
@@ -227,7 +262,11 @@ export function reduce(state: DerivedState, event: CodexEvent): DerivedState {
       return {
         ...state,
         artifacts: [...state.artifacts, artifact],
-        traceSummary: { ...state.traceSummary, eventCounts: counts, totalEvents: state.traceSummary.totalEvents + 1 },
+        traceSummary: {
+          ...state.traceSummary,
+          eventCounts: counts,
+          totalEvents: state.traceSummary.totalEvents + 1,
+        },
       };
     }
 
@@ -245,23 +284,40 @@ export function reduce(state: DerivedState, event: CodexEvent): DerivedState {
       while ((m = diffRe.exec(rawDiff)) !== null) {
         const aPath = m[1];
         const bPath = m[2];
-        if (aPath === "/dev/null") { files.push({ path: bPath, kind: "add" }); continue; }
-        if (bPath === "/dev/null") { files.push({ path: aPath, kind: "delete" }); continue; }
+        if (aPath === "/dev/null") {
+          files.push({ path: bPath, kind: "add" });
+          continue;
+        }
+        if (bPath === "/dev/null") {
+          files.push({ path: aPath, kind: "delete" });
+          continue;
+        }
         files.push({ path: bPath, kind: aPath !== bPath ? "rename" : "modify" });
       }
       // Deduplicate: if the same path appears multiple times (e.g. renames), keep first
       const seen = new Set<string>();
-      const unique = files.filter((f) => { if (seen.has(f.path)) return false; seen.add(f.path); return true; });
+      const unique = files.filter((f) => {
+        if (seen.has(f.path)) return false;
+        seen.add(f.path);
+        return true;
+      });
 
       // Skip buffering if the diff belongs to an already-closed turn.
       // Late-arriving diffs after turn/completed are silently dropped;
       // the turn/flush logic in turnStarted and turnCompleted already handled
       // the final diff for that turn.
       const diffTurnId = (event as unknown as { turnId?: string }).turnId || "";
-      if (diffTurnId && state.turns.some(t => t.turnId === diffTurnId && t.finalResult !== null)) {
+      if (
+        diffTurnId &&
+        state.turns.some((t) => t.turnId === diffTurnId && t.finalResult !== null)
+      ) {
         return {
           ...state,
-          traceSummary: { ...state.traceSummary, eventCounts: counts, totalEvents: state.traceSummary.totalEvents + 1 },
+          traceSummary: {
+            ...state.traceSummary,
+            eventCounts: counts,
+            totalEvents: state.traceSummary.totalEvents + 1,
+          },
         };
       }
 
@@ -281,7 +337,11 @@ export function reduce(state: DerivedState, event: CodexEvent): DerivedState {
       return {
         ...state,
         _pendingDiffs: [...deduped, diffEntry],
-        traceSummary: { ...state.traceSummary, eventCounts: counts, totalEvents: state.traceSummary.totalEvents + 1 },
+        traceSummary: {
+          ...state.traceSummary,
+          eventCounts: counts,
+          totalEvents: state.traceSummary.totalEvents + 1,
+        },
       } as DerivedState;
     }
 
@@ -296,7 +356,12 @@ export function reduce(state: DerivedState, event: CodexEvent): DerivedState {
         startedAt: turn.startedAt,
         completedAt: turn.completedAt,
         durationMs: turn.durationMs,
-        error: typeof turn.error === "string" ? turn.error : (turn.error ? JSON.stringify(turn.error) : null),
+        error:
+          typeof turn.error === "string"
+            ? turn.error
+            : turn.error
+              ? JSON.stringify(turn.error)
+              : null,
       };
 
       // Finalize the open turn entry with finalResult
@@ -326,9 +391,15 @@ export function reduce(state: DerivedState, event: CodexEvent): DerivedState {
         // prior turn/completed with items). If this turn/completed did carry
         // items, merge them in; otherwise keep the existing text.
         const existing = turns[openIdx];
-        const itemTexts = (turn.items ?? [])
-          .filter((i: any) => i?.text)
-          .map((i: any) => i.text)
+        const itemTexts = ("items" in turn && Array.isArray(turn.items) ? turn.items : [])
+          .filter(
+            (item: unknown): item is { text: string } =>
+              typeof item === "object" &&
+              item !== null &&
+              "text" in item &&
+              typeof item.text === "string",
+          )
+          .map((item) => item.text)
           .join(" ");
         turns[openIdx] = {
           ...existing,
@@ -373,7 +444,11 @@ export function reduce(state: DerivedState, event: CodexEvent): DerivedState {
       return {
         ...state,
         turns,
-        traceSummary: { ...state.traceSummary, eventCounts: counts, totalEvents: state.traceSummary.totalEvents + 1 },
+        traceSummary: {
+          ...state.traceSummary,
+          eventCounts: counts,
+          totalEvents: state.traceSummary.totalEvents + 1,
+        },
       };
     }
 
@@ -410,7 +485,14 @@ export function reduce(state: DerivedState, event: CodexEvent): DerivedState {
       const methodKey =
         event._tag === "requestApproval" ? "item/requestApproval" : "other/requestApproval";
       counts[methodKey] = (counts[methodKey] ?? 0) + 1;
-      return { ...state, traceSummary: { ...state.traceSummary, eventCounts: counts, totalEvents: state.traceSummary.totalEvents + 1 } };
+      return {
+        ...state,
+        traceSummary: {
+          ...state.traceSummary,
+          eventCounts: counts,
+          totalEvents: state.traceSummary.totalEvents + 1,
+        },
+      };
     }
 
     // -----------------------------------------------------------------------
@@ -420,7 +502,14 @@ export function reduce(state: DerivedState, event: CodexEvent): DerivedState {
       counts["action.pause"] = (counts["action.pause"] ?? 0) + 1;
       // action.pause: already captured in turns array via turn/completed with
       // status "interrupted". The turn record exists; no backfill needed.
-      return { ...state, traceSummary: { ...state.traceSummary, eventCounts: counts, totalEvents: state.traceSummary.totalEvents + 1 } };
+      return {
+        ...state,
+        traceSummary: {
+          ...state.traceSummary,
+          eventCounts: counts,
+          totalEvents: state.traceSummary.totalEvents + 1,
+        },
+      };
     }
     case "actionSteer": {
       counts["action.steer"] = (counts["action.steer"] ?? 0) + 1;
@@ -431,31 +520,50 @@ export function reduce(state: DerivedState, event: CodexEvent): DerivedState {
       const steerTurnId = (event as unknown as { turnId?: string }).turnId;
       const instruction = (event as unknown as { instruction?: string }).instruction || "";
       if (steerTurnId) {
-        const turns = state.turns.map(t =>
+        const turns = state.turns.map((t) =>
           t.turnId === steerTurnId && !t.taskOrInstruction
             ? { ...t, taskOrInstruction: instruction }
-            : t
+            : t,
         );
-        return { ...state, turns, traceSummary: { ...state.traceSummary, eventCounts: counts, totalEvents: state.traceSummary.totalEvents + 1 } };
+        return {
+          ...state,
+          turns,
+          traceSummary: {
+            ...state.traceSummary,
+            eventCounts: counts,
+            totalEvents: state.traceSummary.totalEvents + 1,
+          },
+        };
       }
-      return { ...state, traceSummary: { ...state.traceSummary, eventCounts: counts, totalEvents: state.traceSummary.totalEvents + 1 } };
+      return {
+        ...state,
+        traceSummary: {
+          ...state.traceSummary,
+          eventCounts: counts,
+          totalEvents: state.traceSummary.totalEvents + 1,
+        },
+      };
     }
     case "actionSend": {
       counts["action.send"] = (counts["action.send"] ?? 0) + 1;
       const sendTurnId = (event as unknown as { turnId?: string }).turnId;
       const newTaskText = (event as unknown as { task?: string }).task || state.task;
       const turns = sendTurnId
-        ? state.turns.map(t =>
+        ? state.turns.map((t) =>
             t.turnId === sendTurnId && !t.taskOrInstruction
               ? { ...t, taskOrInstruction: newTaskText }
-              : t
+              : t,
           )
         : state.turns;
       return {
         ...state,
         task: newTaskText,
         turns,
-        traceSummary: { ...state.traceSummary, eventCounts: counts, totalEvents: state.traceSummary.totalEvents + 1 },
+        traceSummary: {
+          ...state.traceSummary,
+          eventCounts: counts,
+          totalEvents: state.traceSummary.totalEvents + 1,
+        },
       };
     }
     case "actionEditInput": {
@@ -466,20 +574,31 @@ export function reduce(state: DerivedState, event: CodexEvent): DerivedState {
         const value = (ep.value as string) || "";
         const editTurnId = (ep.turnId as string) || "";
         const turns = editTurnId
-          ? state.turns.map(t =>
+          ? state.turns.map((t) =>
               t.turnId === editTurnId && !t.taskOrInstruction
                 ? { ...t, taskOrInstruction: "[system]: " + value }
-                : t
+                : t,
             )
           : state.turns;
         return {
           ...state,
           systemInstruction: value,
           turns,
-          traceSummary: { ...state.traceSummary, eventCounts: counts, totalEvents: state.traceSummary.totalEvents + 1 },
+          traceSummary: {
+            ...state.traceSummary,
+            eventCounts: counts,
+            totalEvents: state.traceSummary.totalEvents + 1,
+          },
         };
       }
-      return { ...state, traceSummary: { ...state.traceSummary, eventCounts: counts, totalEvents: state.traceSummary.totalEvents + 1 } };
+      return {
+        ...state,
+        traceSummary: {
+          ...state.traceSummary,
+          eventCounts: counts,
+          totalEvents: state.traceSummary.totalEvents + 1,
+        },
+      };
     }
 
     // -----------------------------------------------------------------------
@@ -488,7 +607,14 @@ export function reduce(state: DerivedState, event: CodexEvent): DerivedState {
     default: {
       const tag = (event as { _tag: string })._tag;
       counts["unknown/" + tag] = (counts["unknown/" + tag] ?? 0) + 1;
-      return { ...state, traceSummary: { ...state.traceSummary, eventCounts: counts, totalEvents: state.traceSummary.totalEvents + 1 } };
+      return {
+        ...state,
+        traceSummary: {
+          ...state.traceSummary,
+          eventCounts: counts,
+          totalEvents: state.traceSummary.totalEvents + 1,
+        },
+      };
     }
   }
 }

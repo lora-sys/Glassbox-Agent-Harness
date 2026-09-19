@@ -19,9 +19,7 @@ import { METHOD_TAG, TAG_SCHEMA } from "./schema.js";
  * @throws {Schema.SchemaError} if params fail structural validation (typed failure)
  * @throws {Error} if the method is not recognized
  */
-export async function decodeEvent(
-  raw: unknown
-): Promise<CodexEvent> {
+export async function decodeEvent(raw: unknown): Promise<CodexEvent> {
   // Phase 1: validate the envelope shape
   const envelopeSchema = Schema.Struct({
     method: Schema.String,
@@ -36,13 +34,13 @@ export async function decodeEvent(
       const tag = METHOD_TAG.get(method);
       if (!tag) {
         return Effect.fail(
-          new Error(`Unrecognized notification method: "${method}"`) as Schema.SchemaError
+          new Error(`Unrecognized notification method: "${method}"`) as Schema.SchemaError,
         );
       }
       const eventSchema = TAG_SCHEMA.get(tag);
       if (!eventSchema) {
         return Effect.fail(
-          new Error(`No schema registered for event tag: "${tag}"`) as Schema.SchemaError
+          new Error(`No schema registered for event tag: "${tag}"`) as Schema.SchemaError,
         );
       }
 
@@ -51,8 +49,8 @@ export async function decodeEvent(
       // dispatches on _tag without hand-written augmentation.
       const taggedInput = { ...(params as object), _tag: tag };
       return Schema.decodeUnknownEffect(eventSchema as Schema.Schema<unknown>)(
-        taggedInput
+        taggedInput,
       ) as Effect.Effect<CodexEvent>;
-    })
+    }),
   );
 }
