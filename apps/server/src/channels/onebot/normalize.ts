@@ -55,10 +55,13 @@ export function normalizeOneBotMessage(
   if (!input || input.post_type !== "message") return { kind: "ignored" };
   const senderId = qqId(input.user_id);
   // This is an ingress allowlist. The domain still resolves binding and checks authorization.
+  const isOwner =
+    senderId === config.ownerId ||
+    (config.coOwnerId !== undefined && senderId === config.coOwnerId);
   if (
     qqId(input.self_id) !== config.botId ||
     !senderId ||
-    (senderId !== config.ownerId && !config.visitorIds.includes(senderId)) ||
+    (!isOwner && !config.visitorIds.includes(senderId)) ||
     senderId === config.botId
   )
     return { kind: "ignored" };

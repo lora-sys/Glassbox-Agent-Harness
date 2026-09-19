@@ -10,7 +10,6 @@ function persistedText(value: unknown): string {
 export const schema = [
   `CREATE TABLE agents (id TEXT PRIMARY KEY, created_at TEXT NOT NULL)`,
   `CREATE TABLE principals (id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('owner','visitor')), created_at TEXT NOT NULL)`,
-  `CREATE UNIQUE INDEX one_owner ON principals(kind) WHERE kind = 'owner'`,
   `CREATE TABLE channel_identities (identity_key TEXT PRIMARY KEY, principal_id TEXT NOT NULL REFERENCES principals(id), created_at TEXT NOT NULL)`,
   `CREATE TABLE resources (id TEXT PRIMARY KEY, kind TEXT NOT NULL, visibility TEXT NOT NULL CHECK(visibility IN ('public','private')), owner_id TEXT REFERENCES principals(id))`,
   `CREATE TABLE grants (id TEXT PRIMARY KEY, principal_id TEXT NOT NULL REFERENCES principals(id), resource_id TEXT NOT NULL REFERENCES resources(id), action TEXT NOT NULL, scope_key TEXT NOT NULL, effect TEXT NOT NULL CHECK(effect IN ('allow','approval')), revoked_at TEXT, created_at TEXT NOT NULL)`,
@@ -122,3 +121,6 @@ export async function applySchemaV4Migration(tx: Transaction): Promise<void> {
     });
   }
 }
+
+export const schemaV6Migration = ["DROP INDEX IF EXISTS one_owner"];
+

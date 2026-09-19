@@ -522,24 +522,37 @@ export class ManagementApplication {
   private async provisionConfiguredAccess(
     configured: ReturnType<ChannelProfileStore["resolve"]>,
   ): Promise<void> {
-    const identity = {
-      connectionId: configured.config.connectionId,
-      botId: configured.config.botId,
-      senderId: configured.config.ownerId,
-    };
-    const scopes: TrustedChannelScope[] = [
-      { ...identity, chatType: "private", chatId: configured.config.ownerId },
-      ...configured.config.groupIds.map((groupId) => ({
-        ...identity,
-        chatType: "group" as const,
-        chatId: groupId,
-      })),
+    const ownerIds = [
+      configured.config.ownerId,
+      ...(configured.config.coOwnerId ? [configured.config.coOwnerId] : []),
     ];
-    await this.store.identities.bindOwner(OWNER_ID, identity);
-    for (const scope of scopes) await this.grantScope(scope);
+
+    for (const [index, ownerId] of ownerIds.entries()) {
+      const principalId = index === 0 ? OWNER_ID : `owner-${ownerId}`;
+      const identity = {
+        connectionId: configured.config.connectionId,
+        botId: configured.config.botId,
+        senderId: ownerId,
+      };
+      const scopes: TrustedChannelScope[] = [
+        { ...identity, chatType: "private", chatId: ownerId },
+        ...configured.config.groupIds.map((groupId) => ({
+          ...identity,
+          chatType: "group" as const,
+          chatId: groupId,
+        })),
+      ];
+      await this.store.identities.bindOwner(principalId, identity);
+      for (const scope of scopes) await this.grantScope(scope, principalId);
+    }
+
     for (const visitorId of configured.config.visitorIds) {
       const principalId = `qq-visitor-${visitorId}`;
-      const visitorIdentity = { ...identity, senderId: visitorId };
+      const visitorIdentity = {
+        connectionId: configured.config.connectionId,
+        botId: configured.config.botId,
+        senderId: visitorId,
+      };
       await this.store.identities.createPrincipal(principalId, "visitor");
       await this.store.identities.bindPrincipal(principalId, visitorIdentity);
       const visitorScopes: TrustedChannelScope[] = [
@@ -555,9 +568,10 @@ export class ManagementApplication {
   }
 
   private async grantScope(scope: TrustedChannelScope, principalId = OWNER_ID) {
+    const isOwner = principalId === OWNER_ID || principalId.startsWith("owner-");
     const caller: CallerContext = { principalId, scope };
     for (const action of ACTIONS) {
-      if (principalId !== OWNER_ID && action === "eval:write") continue;
+      if (!isOwner && action === "eval:write") continue;
       const existing = await this.store.authorization.check({
         caller,
         resourceId: agentResourceId(AGENT_ID),
@@ -599,12 +613,12 @@ export class ManagementApplication {
       scope,
       effect: "allow",
     });
-    if (principalId === OWNER_ID && scope.chatType === "private") {
+    if (isOwner && scope.chatType === "private") {
       await this.store.authorization.registerResource({
         id: OWNER_CONTROL_RESOURCE,
         kind: "owner-control",
         visibility: "private",
-        ownerId: OWNER_ID,
+        ownerId: principalId,
         ifAbsent: true,
       });
       await this.store.authorization.grant({
@@ -620,7 +634,7 @@ export class ManagementApplication {
           id: resourceId,
           kind: "tool-definition",
           visibility: "private",
-          ownerId: OWNER_ID,
+          ownerId: principalId,
           ifAbsent: true,
         });
         await this.store.authorization.grant({
@@ -640,7 +654,8 @@ export class ManagementApplication {
   ): Promise<{ groupId: string; enabled: boolean; enabledSkills: string[]; version: number }> {
     return this.serialize(async () => {
       const caller = context.caller;
-      if (caller.principalId !== OWNER_ID || caller.scope.chatType !== "private")
+      const isOwner = caller.principalId === OWNER_ID || caller.principalId.startsWith("owner-");
+      if (!isOwner || caller.scope.chatType !== "private")
         throw new Error("owner_private_required");
       const connection = this.connections.get(caller.scope.connectionId);
       if (!connection) throw new Error("channel_not_connected");
@@ -648,7 +663,11 @@ export class ManagementApplication {
       if (input.enabled && !(await connection.hasGroup(input.groupId)))
         throw new Error("bot_not_in_group");
 
-      const groupScopes = [configured.config.ownerId, ...configured.config.visitorIds].map(
+      const ownerIds = [
+        configured.config.ownerId,
+        ...(configured.config.coOwnerId ? [configured.config.coOwnerId] : []),
+      ];
+      const groupScopes = [...ownerIds, ...configured.config.visitorIds].map(
         (senderId) => ({
           connectionId: configured.config.connectionId,
           botId: configured.config.botId,
@@ -659,10 +678,9 @@ export class ManagementApplication {
       );
       if (!input.enabled) {
         for (const scope of groupScopes) {
-          const principalId =
-            scope.senderId === configured.config.ownerId
-              ? OWNER_ID
-              : `qq-visitor-${scope.senderId}`;
+          const principalId = ownerIds.includes(scope.senderId)
+            ? (scope.senderId === configured.config.ownerId ? OWNER_ID : `owner-${scope.senderId}`)
+            : `qq-visitor-${scope.senderId}`;
           for (const resourceId of [
             agentResourceId(AGENT_ID),
             SKILL_CATALOG_RESOURCE,
@@ -678,10 +696,9 @@ export class ManagementApplication {
       );
       if (input.enabled) {
         for (const scope of groupScopes) {
-          const principalId =
-            scope.senderId === configured.config.ownerId
-              ? OWNER_ID
-              : `qq-visitor-${scope.senderId}`;
+          const principalId = ownerIds.includes(scope.senderId)
+            ? (scope.senderId === configured.config.ownerId ? OWNER_ID : `owner-${scope.senderId}`)
+            : `qq-visitor-${scope.senderId}`;
           await this.grantScope(scope, principalId);
         }
       }
@@ -719,7 +736,8 @@ export class ManagementApplication {
     input: OwnerGroupAdminInput,
   ): Promise<unknown> {
     const caller = context.caller;
-    if (caller.principalId !== OWNER_ID || caller.scope.chatType !== "private")
+    const isOwner = caller.principalId === OWNER_ID || caller.principalId.startsWith("owner-");
+    if (!isOwner || caller.scope.chatType !== "private")
       throw new Error("owner_private_required");
     if (input.action === "set_access") return this.setGroupAccess(context, input);
     if (input.action === "set_skill") return this.setGroupSkill(context, input);
@@ -744,7 +762,8 @@ export class ManagementApplication {
   ): Promise<unknown> {
     return this.serialize(async () => {
       const caller = context.caller;
-      if (caller.principalId !== OWNER_ID || caller.scope.chatType !== "private")
+      const isOwner = caller.principalId === OWNER_ID || caller.principalId.startsWith("owner-");
+      if (!isOwner || caller.scope.chatType !== "private")
         throw new Error("owner_private_required");
       const configured = this.channels.resolve(caller.scope.connectionId);
       if (!configured.config.groupIds.includes(input.groupId)) throw new Error("group_not_enabled");

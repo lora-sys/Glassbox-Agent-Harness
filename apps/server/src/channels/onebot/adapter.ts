@@ -200,12 +200,14 @@ export class OneBotAdapter {
     replyTo?: string;
   }): Promise<OneBotDeliveryResult> {
     const target = input.target;
+    if (!target) return { status: "failed", code: "invalid_target" };
+    const isOwnerTarget =
+      target.senderId === this.config.ownerId ||
+      (this.config.coOwnerId !== undefined && target.senderId === this.config.coOwnerId);
     if (
-      !target ||
       target.connectionId !== this.config.connectionId ||
       target.botId !== this.config.botId ||
-      (target.senderId !== this.config.ownerId &&
-        !this.config.visitorIds.includes(target.senderId)) ||
+      (!isOwnerTarget && !this.config.visitorIds.includes(target.senderId)) ||
       target.threadId !== undefined ||
       (target.chatType === "private"
         ? target.chatId !== target.senderId
