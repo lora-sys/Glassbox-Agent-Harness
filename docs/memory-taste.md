@@ -4,7 +4,9 @@ Status: CURRENT DIRECTION / P4 PLANNED
 
 This document defines the ownership and learning boundary between Rules, Skills, Taste, Feedback, and durable Memory.
 
-The active implementation source of truth remains `.plans/03-personal-agent-foundation.md`. P4 begins only after the P3 completion gate passes.
+The current fast-follow source of truth is `.plans/03-plus-owner-group-utility.md`. P4 remains the first implementation phase for Taste and Memory.
+
+P3+ may persist group assignments, participant progress, completion evidence, schedules, and runtime configuration. Those records are structured product state, not Memory. They must not be described as Semantic Memory, Episodic Memory, or Taste merely because they are durable.
 
 ## Decision
 
