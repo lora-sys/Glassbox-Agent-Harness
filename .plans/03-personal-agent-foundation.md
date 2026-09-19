@@ -1,8 +1,10 @@
 # Plan 03 — QQ Personal Agent Closed Loop
 
-Status: ACTIVE
+Status: COMPLETED
 
-This is the only active implementation plan in the repository.
+Completed foundation for the current P3+ plan.
+
+This file remains the historical implementation and acceptance contract for the QQ Personal Agent and Agent Operations foundation. Dated findings under `.plans/findings/` remain historical evidence and may describe earlier incomplete checkpoints.
 
 Detailed architecture lives in `docs/*.md`. This Plan owns implementation order, slice boundaries, and the completion gate.
 
