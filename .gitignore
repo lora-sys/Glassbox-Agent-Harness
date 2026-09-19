@@ -21,6 +21,7 @@ blob-report/
 .glassbox/
 .dispatch/
 .visual-fix/
+.agy-staff/
 
 # Upstream reference checkouts
 upstream/repos/
