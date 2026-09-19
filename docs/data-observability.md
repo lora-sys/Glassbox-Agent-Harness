@@ -44,6 +44,9 @@ QQ, email, Pi, Lora PI Kit, MCP, Herdr, Moshi, and other external entry points d
 | Infrastructure uptime / error monitoring | Better Stack |
 | Webhook reliability when used | Hookdeck |
 | Delayed HTTP task delivery when later required | Upstash QStash |
+| Group schedule truth | Glassbox server + Turso |
+| Group assignment / progress / reminder / report truth | Glassbox server + Turso |
+| Group Tool registry and bindings | Glassbox server + Turso metadata; executable implementation stays in reviewed runtime code / Kit resources |
 | Human remote operations access | SSH; Moshi may be an optional client |
 
 ## Turso product state
@@ -65,6 +68,19 @@ message dedupe
 runtime session binding
 visibility / Share metadata
 
+GroupPolicy
+ToolDefinition metadata
+ToolVersion metadata
+GroupToolBinding
+ScheduleDefinition
+ScheduleOccurrence
+GroupAssignment
+AssignmentParticipant
+CompletionEvidence
+ReminderPolicy
+ReminderEvent
+ReportSnapshot
+
 AttentionItem
 Task
 TaskAttempt
@@ -76,6 +92,7 @@ TasteCandidate
 TasteEntry
 Taste confidence / scope / provenance
 Memory metadata
+OwnerInsight metadata
 Rules metadata when represented as product state
 Skill registry metadata
 Journal / Asset metadata
@@ -208,6 +225,32 @@ Taste is preference, not permission.
 A single edit is evidence, not a permanent preference.
 
 Large before/after feedback artifacts may live in R2 while Turso stores structured FeedbackEvent metadata and references.
+
+## Group operations state
+
+Group scheduling and assignment delivery follow the same durable-state rule as other Glassbox product behavior.
+
+```text
+Turso
+  schedule definition
+  occurrence identity
+  assignment state
+  participant progress
+  reminder history
+  report inputs
+  Tool binding state
+
+scheduler transport
+  wakes Glassbox and asks it to process due work
+```
+
+For the first single-group pilot, an in-process scheduler is acceptable if schedule and occurrence identities are durable and idempotent.
+
+A later QStash or similar timer transport may replace the wake-up mechanism without becoming schedule truth.
+
+Tool executable code should not be stored as arbitrary chat-generated blobs and loaded directly into production. Turso may store Tool metadata, version references, configuration, permission manifests, and group bindings. Reviewed code or Kit resources own executable implementation.
+
+See `docs/owner-group-operations.md`.
 
 ## Herdr synchronization
 
