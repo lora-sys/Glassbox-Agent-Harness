@@ -46,6 +46,8 @@ describe("PiSdkRuntimeAdapter", () => {
     directories.push(runtimeBaseDir);
     const events: string[] = [];
     let authorizedTools: unknown;
+    let authorizedSkills: unknown;
+    let skillPolicy: unknown;
     let listener: ((event: AgentSessionEvent) => void) | undefined;
     const fakeSession = {
       sessionId: "pi-session-1",
@@ -80,10 +82,18 @@ describe("PiSdkRuntimeAdapter", () => {
     const adapter = new PiSdkRuntimeAdapter({
       kitPath: fileURLToPath(new URL("./fixtures/lora-pi-kit", import.meta.url)),
       runtimeBaseDir,
-      resolveToolNames: async () => ["owner_group_set_access"],
+      resolveToolNames: async () => ["owner_group_admin", "skill_read"],
+      resolveSkillNames: async () => ({
+        names: [],
+        policy: { source: "group-profile", configVersion: 3 },
+      }),
       onEvent: (event) => {
         events.push(event.type);
-        if (event.type === "session_start") authorizedTools = event.data.authorizedTools;
+        if (event.type === "session_start") {
+          authorizedTools = event.data.authorizedTools;
+          authorizedSkills = event.data.authorizedSkills;
+          skillPolicy = event.data.skillPolicy;
+        }
       },
       createSession: async ({ profile, agentDir }) => {
         expect(profile.name).toBe("test");
@@ -115,7 +125,9 @@ describe("PiSdkRuntimeAdapter", () => {
     expect(binding.conversationId).toBe(conversation.id);
     expect(binding.runtimeSessionId).not.toBe(conversation.id);
     expect(result).toMatchObject({ status: "completed", text: "hello from pi" });
-    expect(authorizedTools).toEqual(["owner_group_set_access"]);
+    expect(authorizedTools).toEqual(["owner_group_admin", "skill_read"]);
+    expect(authorizedSkills).toEqual([]);
+    expect(skillPolicy).toEqual({ source: "group-profile", configVersion: 3 });
     expect(events).toEqual([
       "session_start",
       "turn_start",

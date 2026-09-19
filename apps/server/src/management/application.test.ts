@@ -215,7 +215,7 @@ describe("channel to durable run composition", () => {
       (
         await app.store.authorization.check({
           caller: { principalId: "owner", scope: ownerScope },
-          resourceId: "tool:owner_group_set_access",
+          resourceId: "tool:owner_group_admin",
           action: "tool:discover",
         })
       ).decision,
@@ -348,7 +348,27 @@ describe("channel to durable run composition", () => {
       setGroupAccess(
         context: { caller: ExecutionInput["caller"]; conversationId: string; runId: string },
         input: { groupId: string; enabled: boolean },
-      ): Promise<{ groupId: string; enabled: boolean }>;
+      ): Promise<{
+        groupId: string;
+        enabled: boolean;
+        enabledSkills: string[];
+        version: number;
+      }>;
+      setGroupSkill(
+        context: { caller: ExecutionInput["caller"]; conversationId: string; runId: string },
+        input: {
+          action: "set_skill";
+          groupId: string;
+          skillName: string;
+          enabled: boolean;
+        },
+      ): Promise<{
+        groupId: string;
+        skillName: string;
+        enabled: boolean;
+        enabledSkills: string[];
+        version: number;
+      }>;
     };
     const context = {
       caller: ownerRun.caller,
@@ -357,8 +377,31 @@ describe("channel to durable run composition", () => {
     };
     await expect(
       application.setGroupAccess(context, { groupId: "10005", enabled: true }),
-    ).resolves.toEqual({ groupId: "10005", enabled: true });
+    ).resolves.toEqual({
+      groupId: "10005",
+      enabled: true,
+      enabledSkills: ["unslop"],
+      version: 0,
+    });
     expect(f.app.listChannels()[0]?.groupIds).toContain("10005");
+    await expect(
+      application.setGroupSkill(context, {
+        action: "set_skill",
+        groupId: "10005",
+        skillName: "github-gem-seeker",
+        enabled: true,
+      }),
+    ).resolves.toMatchObject({
+      groupId: "10005",
+      skillName: "github-gem-seeker",
+      enabled: true,
+      enabledSkills: ["github-gem-seeker", "unslop"],
+      version: 1,
+    });
+    expect(f.app.groupRuntime.get("fixture", "10005")).toMatchObject({
+      enabledSkills: ["github-gem-seeker", "unslop"],
+      version: 1,
+    });
 
     f.send(2, "new-group", false, 10004, 10005);
     const newGroupRun = await f.started.take();

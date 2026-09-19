@@ -32,6 +32,8 @@ interface ActiveSession {
   binding: PiSessionBinding;
   runtimeEvidence: Record<string, unknown>;
   authorizedToolNames: readonly string[];
+  authorizedSkillNames: readonly string[];
+  skillPolicy: Record<string, unknown>;
 }
 
 export interface PiSdkRuntimeOptions {
@@ -43,6 +45,10 @@ export interface PiSdkRuntimeOptions {
   resolveModel?: () => Promise<{ model: Model<any>; modelRuntime: ModelRuntime }>;
   customTools?: ToolDefinition[];
   createTools?: (getContext: () => PiRunContext | undefined) => ToolDefinition[];
+  resolveSkillNames?: (
+    context: PiRunContext,
+    profile: ResolvedKitProfile,
+  ) => Promise<{ names: readonly string[]; policy?: Record<string, unknown> }>;
   resolveToolNames?: (context: PiRunContext) => Promise<readonly string[]>;
   onEvent?: (event: PiNormalizedEvent) => void | Promise<void>;
   createSession?: (params: {
@@ -200,7 +206,17 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
 
     const profile = this.loader.loadProfile(profileName);
     const config = this.loader.buildRuntimeConfig(profileName, this.options.runtimeBaseDir);
-    const runtimeEvidence = this.loader.runtimeEvidence(profileName);
+    const resolvedSkills =
+      context && this.options.resolveSkillNames
+        ? await this.options.resolveSkillNames(context, profile)
+        : { names: profile.enabledSkills, policy: { source: "kit-profile" } };
+    const authorizedSkillNames = [...new Set(resolvedSkills.names)];
+    if (context) {
+      context.authorizedSkillNames = authorizedSkillNames;
+      context.skillPolicy = structuredClone(resolvedSkills.policy ?? { source: "kit-profile" });
+    }
+    const effectiveProfile = { ...profile, enabledSkills: authorizedSkillNames };
+    const runtimeEvidence = this.loader.runtimeEvidence(profileName, authorizedSkillNames);
     const authorizedToolNames =
       context && this.options.resolveToolNames
         ? [...new Set(await this.options.resolveToolNames(context))]
@@ -211,11 +227,16 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
     const session = this.options.createSession
       ? await this.options.createSession({
           conversation,
-          profile,
+          profile: effectiveProfile,
           agentDir: config.agentDir,
           sessionDir,
         })
-      : await this.createRealSession(profile, config.agentDir, sessionDir, authorizedToolNames);
+      : await this.createRealSession(
+          effectiveProfile,
+          config.agentDir,
+          sessionDir,
+          authorizedToolNames,
+        );
     const now = new Date().toISOString();
     const binding: PiSessionBinding = {
       conversationId: conversation.id,
@@ -230,6 +251,8 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
       binding,
       runtimeEvidence,
       authorizedToolNames: authorizedToolNames ?? [],
+      authorizedSkillNames,
+      skillPolicy: structuredClone(resolvedSkills.policy ?? { source: "kit-profile" }),
     });
     return { ...binding };
   }
@@ -245,7 +268,7 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
     const settingsManager = SettingsManager.inMemory();
     if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/u.test(profile.promptTemplate))
       throw new Error("Invalid Kit prompt template");
-    const basePrompt = `${this.loader.modelPrompt(profile.name).trim()}\n\nReply in concise plain text suitable for QQ. Do not reveal host paths, internal service addresses, configuration names, or internal identifiers.`;
+    const basePrompt = `${this.loader.modelPrompt(profile.name, profile.enabledSkills).trim()}\n\nReply in concise plain text suitable for QQ. Do not reveal host paths, internal service addresses, configuration names, or internal identifiers.`;
     let runtimeSessionId: string | undefined;
     const promptForRun = () => {
       const requiredToolName = runtimeSessionId
@@ -366,6 +389,8 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
           conversationId: run.conversationId,
           runtime: active.runtimeEvidence,
           authorizedTools: active.authorizedToolNames,
+          authorizedSkills: active.authorizedSkillNames,
+          skillPolicy: active.skillPolicy,
         };
       }
       if (normalized && this.options.onEvent) {

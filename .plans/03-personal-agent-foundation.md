@@ -164,7 +164,8 @@ Pi + Skills compatibility locks
 
 `lora-sys/skills` remains the canonical Skill source repository.
 
-A Lora PI Kit release bundles a pinned Skill snapshot for reproducibility.
+A Lora PI Kit release bundles all structurally valid owned Skills at one pinned
+`lora-sys/skills` commit for reproducibility.
 
 ```text
 canonical source
@@ -176,7 +177,9 @@ one Kit release
 
 Bundled does not mean every Skill is active on every task.
 
-Profiles and task-level selection narrow the runtime set.
+Profiles narrow the runtime set. Glassbox may narrow it again with a durable authorized
+location policy. QQ groups keep a strict group allowlist and a separate per-group Skill
+whitelist.
 
 Lora PI Kit may provide MCP through a Pi Extension / Package layer because MCP is runtime integration behavior. It must not expose every configured MCP server on every profile.
 
@@ -870,6 +873,9 @@ Plan 03 is complete only when all are true:
 - unauthorized protected data stays out of model-visible Context.
 - protected Tool / Ops execution re-authorizes immediately before execution.
 - remote profiles expose a narrow Tool / MCP surface.
+- Pi sees only Skill names and descriptions selected for the current Run and reads locked
+  Skill files through an execution-time authorization check.
+- an Owner-private action can inspect and change a permitted group's Skill whitelist.
 - unrestricted remote shell is unavailable.
 - Delivery checks the real audience.
 - Owner-private data cannot leak into a group merely because the Owner asked for it.
@@ -902,6 +908,9 @@ Plan 03 is complete only when all are true:
 - non-activated group messages do not create Agent Runs.
 - duplicate / replayed OneBot events do not create duplicate replies.
 - NapCat reconnect does not replay completed work into duplicate output.
+- long QQ results use bounded merged-forward nodes and preserve the full authorized result.
+- the service launcher uses a stable data directory outside temporary worktrees and keeps
+  verified running processes when called again.
 
 ### Evidence / security
 

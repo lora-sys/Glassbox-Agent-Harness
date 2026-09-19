@@ -64,7 +64,11 @@ The configured local Personal Agent environment has one service command surface:
     npm run agent:down
 
 agent:up reads optional Herdr, NapCat and Glassbox launch settings from
-<GLASSBOX_DATA_DIR>/service-launch.json. Use docs/service-launch.example.json as the shape. Keep credentials in the existing protected Channel and model stores.
+<GLASSBOX_DATA_DIR>/service-launch.json. Without that environment variable, it uses
+~/.glassbox so the durable database, process registry and launch settings do not depend
+on a temporary worktree. Use docs/service-launch.example.json as the shape. Keep
+credentials in the existing protected Channel and model stores. agent:up is idempotent.
+It keeps verified running processes and starts only missing services.
 For NapCat restart login, append the Bot QQ number to the launcher arguments after the QQ executable and injection library. The service file accepts only the documented non-secret environment keys.
 
 The service manager launches fixed executables without a shell. It records process identity in the data directory and verifies it before shutdown. Named Herdr sessions use Herdr's public session status and stop commands.
@@ -170,7 +174,8 @@ Do not create a second custom package loader unless the Pi public mechanism prov
 
 `lora-sys/skills` is the canonical Skill source repository.
 
-A released Lora PI Kit bundles a pinned snapshot of the selected Skills.
+A released Lora PI Kit bundles every structurally valid owned Skill found at the pinned
+`lora-sys/skills` commit. Invalid Skill packages remain excluded with a reason in the lock.
 
 ```text
 lora-sys/skills
@@ -184,7 +189,10 @@ The snapshot makes one Kit version reproducible across local development, CI, Gl
 
 Do not fetch an unpinned latest Skill set at runtime.
 
-Bundled does not mean always injected. Profiles and task-level selection narrow the active Skill set.
+Bundled does not mean always injected. Profiles narrow the active Skill set. Glassbox may
+narrow it again for one authorized location. QQ groups use a durable per-group whitelist.
+Pi receives only the selected Skill names and descriptions. It reads locked Skill files on
+demand through an authorized Tool.
 
 ## MCP
 
