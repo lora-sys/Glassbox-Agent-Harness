@@ -123,11 +123,11 @@ Glassbox owns Task truth and acceptance.
 
 See `agent-operations.md`.
 
-## Owner and test-group utility
+## Owner control and future group operations
 
-P3+ adds a narrow Owner private control surface, per-Run Tool schema filtering, and one fixed learning-checkin loop for the real test group.
+P3+ adds only a narrow Owner private control surface and per-Run Tool schema filtering against the current real test group.
 
-Persisted assignment and progress records are product state, not Memory.
+Learning assignments, scheduling, reminders, reports, group-specific Tool creation, and multi-group operations are planned for the later P9 group-programs phase.
 
 See `owner-group-operations.md`.
 
