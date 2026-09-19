@@ -541,17 +541,83 @@ TokenRhythm/opensquilla
 
 `upstream/` 是研究和选择性参考区，生产代码不能直接 import。
 
-## 开始开发
+## 双人协同与双 Owner 架构
 
-要求 Node.js `>=22.18.0`。
+本项目支持两人协作开发与对等测试。
 
-当前仓库真实命令优先于未来计划中的 Toolchain 命令。
+### 1. 权限等同与隔离机制
+* **身份对等**：主 Owner（`OWNER_QQ`）与协同 Owner（`CO_OWNER_QQ`）均映射为最高特权的主体（`kind = 'owner'`），在群聊与系统中拥有完整的操作、派工、审批与管理权限。
+* **私聊绝对隔离**：两人的私聊会话具有独立的 `scopeKey`（含各自的 QQ 号），在数据库 `conversations` 表中物理独立，私有资产和私聊上下文互不相通。
+* **工作空间防碰撞**：向 Herdr 派发编码任务（Task）时，每个 TaskAttempt 的 `worker_bindings` 均分配独立的隔离分支（如 `herdr/task-<principalId>-<taskId>`）和独立 worktree 工作目录，两人派发的编码任务互不踩踏。
 
-进入仓库工作的 Coding Agent 先读：
+---
+
+## 快速上手与本地开发
+
+### 1. 软件环境要求
+* **Node.js**：`>= 22.18.0`（推荐 `24.x`）
+* **包管理器**：`npm`
+* **NapCat / OneBot**：已就绪的 QQ 机器人（用于收发消息）
+* **Herdr**（可选）：用于本地 Worker 调度的执行宿主
+* **Lora PI Kit**：同级目录存放 `lora-pi-kit`
+
+### 2. 初始化步骤
+1. **安装依赖**：
+   ```bash
+   npm install
+   ```
+2. **环境配置**：
+   从模板复制并填写配置文件：
+   ```bash
+   cp .env.example .env
+   ```
+   根据你的测试环境填入 `BOT_QQ`、`OWNER_QQ`、`CO_OWNER_QQ`、`TEST_GROUP_ID`、`NAPCAT_WS_URL` 与模型 API Key。
+
+3. **运行自检测试**：
+   ```bash
+   npm run test:server
+   ```
+
+4. **进程管理命令**：
+   ```bash
+   # 启动核心服务（Glassbox + NapCat + Herdr）
+   npm run agent:up
+
+   # 查看服务状态与健康度
+   npm run agent:status
+
+   # 查看实时运行日志
+   npm run agent:logs
+
+   # 停止服务
+   npm run agent:down
+   ```
+
+---
+
+## 给合作开发者（及其 Coding Agent）的快速接入指南
+
+克隆本仓库后，第二位开发者可直接将以下 Prompt 复制给其使用的 **Codex / Claude Code / Agent**，由 Agent 自动化完成环境搭建与验证：
+
+````markdown
+你现在是协助进行 Glassbox-Agent-Harness 项目开发的工程师 Agent。
+请严格阅读根目录的 `AGENTS.md`、`README.md` 和 `.plans/03-personal-agent-foundation.md`，并执行以下初始化与自检：
+
+1. 依赖与类型检查：运行 `npm install` 安装所有 workspace 依赖，并执行 `npm run check`。
+2. 配置文件就绪：检查根目录是否存在 `.env`。若无则从 `.env.example` 复制一份，并提示我补齐双 Owner QQ、测试群号、NapCat WebSocket 地址与模型 API Key。
+3. 权限与隔离测试：运行 `npm run test:server` 确保鉴权、会话隔离与底层持久化测试全部通过。
+4. 汇报状态：测试通过后，向我汇报环境就绪状态，并说明如何通过 `npm run agent:up` 启动完整服务。
+````
+
+---
+
+## 开发规范与进入顺序
+
+进入仓库工作的 Coding Agent 必须按此顺序阅读：
 
 ```text
 AGENTS.md
-→ Active Plan
+→ Active Plan (.plans/03-personal-agent-foundation.md)
 → 当前任务对应 docs/*.md
 → relevant upstream notes
 → production code + focused tests
