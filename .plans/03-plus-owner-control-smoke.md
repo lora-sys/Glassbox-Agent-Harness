@@ -1,6 +1,6 @@
 # P3+ closeout
 
-Status: ACTIVE
+Status: COMPLETE (2026-09-19)
 
 This slice finishes the current long-lived P3 Draft PR. It uses the existing P3 Issue, worktree, branch and PR.
 
@@ -165,3 +165,13 @@ Taste, scheduled group work, Tool generation, new Channels or frontend work. It 
 group Skill policy because the real QQ runtime needs it for least-privilege Skill loading.
 
 Those items remain outside the P3 closeout. After this gate passes, the roadmap continues at P4.
+
+## Completion evidence
+
+- `npm run agent:up` kept verified Herdr and NapCat processes and restarted only the missing Glassbox process. QQ reused the existing login.
+- Owner-private QQ calls successfully inspected the real group policy and enabled `github-gem-seeker`.
+- The following Visitor group Run shared the group Conversation, loaded only `github-gem-seeker` and `unslop`, discovered only `skill_read`, and completed an authorized Skill read.
+- QQ deliveries contained plain text. The durable Run retained the original model output as execution evidence.
+- A forced private-network reply was withheld with no Delivery row. Its blocking event contains only a reason code, byte count and digest, and the Run is excluded from future Context.
+- The real Herdr Pi task history contains REVIEW, Rework, a second TaskAttempt, another REVIEW and explicit Accept. A later restart reconciled the live Herdr snapshot and resolved the recovered connection alert.
+- The backend suite passes 649 tests with 1 skipped external fixture. Server type checking and the changed-file checks pass. The repository-wide formatter still reports 23 existing frontend files owned by the separate frontend worktree.

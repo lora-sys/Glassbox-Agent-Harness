@@ -1,6 +1,6 @@
 # Plan 03 — QQ Personal Agent Closed Loop
 
-Status: ACTIVE
+Status: COMPLETE (2026-09-19)
 
 This is the only active implementation plan in the repository.
 
@@ -920,3 +920,14 @@ Plan 03 is complete only when all are true:
 - existing Codex and Claude Code paths retain focused regression coverage.
 
 When this gate passes, Glassbox has its first usable Personal Agent product loop plus the minimal multi-worker operations foundation. P4 then begins the Feedback → Taste → Memory → Authorized Retrieval layer instead of rebuilding P3.
+
+## Completion evidence
+
+- The deterministic backend suite passes 649 tests with 1 explicitly skipped external fixture.
+- Real Owner private chat, Visitor private chat and shared group chat use distinct Principals and durable Conversations.
+- Real Pi Runs load the pinned Lora PI Kit. A group Run loaded only its two authorized Skills and read one Skill through an execution-time authorization check.
+- A real Owner-private Tool inspected and changed the test group's durable Skill whitelist.
+- A real Pi Worker delegated through Herdr reached REVIEW, created a new TaskAttempt after Rework, returned to REVIEW and reached DONE only after Accept.
+- Glassbox restart and Herdr snapshot reconciliation retained durable state and resolved the recovered session alert without rewriting Task history.
+- A forced private-network response created no QQ Delivery, produced digest-only blocking evidence and was excluded from later Context.
+- Duplicate ingress, restart, authorization, audience isolation, canary, long merged-forward delivery and reconciliation paths have deterministic coverage. Real QQ delivery, restart and merged-forward transport were also exercised against the dedicated acceptance environment.
