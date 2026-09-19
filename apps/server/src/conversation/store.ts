@@ -378,7 +378,7 @@ export class ConversationStore {
         sql: "SELECT conversation_id FROM conversation_locations WHERE agent_id = ? AND location_key = ?",
         args: [input.agentId, convKey],
       });
-      let conversations = locRow.rows[0]
+      const conversations = locRow.rows[0]
         ? await tx.execute({
             sql: "SELECT * FROM conversations WHERE id = ?",
             args: [stringColumn(locRow.rows[0], "conversation_id")],
@@ -387,24 +387,33 @@ export class ConversationStore {
             sql: "SELECT * FROM conversations WHERE agent_id = ? AND scope_key = ?",
             args: [input.agentId, convKey],
           });
+      let conversationRow: Row | undefined = conversations.rows[0];
+      let remapPrivateLocation = false;
       const now = new Date().toISOString();
       if (
-        conversations.rows[0] &&
+        conversationRow &&
         input.scope.chatType === "private" &&
-        stringColumn(conversations.rows[0], "principal_id") !== caller.principalId
+        stringColumn(conversationRow, "principal_id") !== caller.principalId
       ) {
-        return {
-          denied: await recordDecision(
-            tx,
-            { caller, resourceId: "conversation", action: "run:create" },
-            "DENY",
-            "scope_mismatch",
-          ),
-        };
+        const principalConversations = await tx.execute({
+          sql: "SELECT * FROM conversations WHERE agent_id = ? AND principal_id = ? ORDER BY created_at DESC, id DESC",
+          args: [input.agentId, caller.principalId],
+        });
+        conversationRow = principalConversations.rows.find((row) => {
+          try {
+            return conversationScopeKey(JSON.parse(stringColumn(row, "scope_json"))) === convKey;
+          } catch {
+            return false;
+          }
+        });
+        remapPrivateLocation = true;
       }
-      if (!conversations.rows[0]) {
+      if (!conversationRow) {
         const id = randomUUID();
         const resourceId = `conversation:${id}`;
+        const persistedScopeKey = remapPrivateLocation
+          ? JSON.stringify([convKey, caller.principalId])
+          : convKey;
         await tx.execute({
           sql: "INSERT INTO resources(id, kind, visibility, owner_id) VALUES (?, 'conversation', ?, ?)",
           args: [
@@ -419,27 +428,34 @@ export class ConversationStore {
             id,
             input.agentId,
             caller.principalId,
-            convKey,
+            persistedScopeKey,
             JSON.stringify(input.scope),
             resourceId,
             now,
           ],
         });
         await tx.execute({
-          sql: "INSERT INTO conversation_locations(agent_id, location_key, conversation_id, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(agent_id, location_key) DO NOTHING",
+          sql: `INSERT INTO conversation_locations(agent_id, location_key, conversation_id, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(agent_id, location_key) DO UPDATE SET conversation_id = excluded.conversation_id`,
           args: [input.agentId, convKey, id, now],
         });
-        conversations = await tx.execute({
+        const created = await tx.execute({
           sql: "SELECT * FROM conversations WHERE id = ?",
           args: [id],
+        });
+        conversationRow = created.rows[0];
+      } else if (remapPrivateLocation) {
+        await tx.execute({
+          sql: "UPDATE conversation_locations SET conversation_id = ? WHERE agent_id = ? AND location_key = ?",
+          args: [stringColumn(conversationRow, "id"), input.agentId, convKey],
         });
       } else if (!locRow.rows[0]) {
         await tx.execute({
           sql: "INSERT INTO conversation_locations(agent_id, location_key, conversation_id, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(agent_id, location_key) DO NOTHING",
-          args: [input.agentId, convKey, stringColumn(conversations.rows[0], "id"), now],
+          args: [input.agentId, convKey, stringColumn(conversationRow, "id"), now],
         });
       }
-      const conversationRow = conversations.rows[0];
       if (!conversationRow) throw new Error("Conversation persistence failed");
       const conversation = conversationRecord(conversationRow, input.scope);
       const messageId = randomUUID();

@@ -56,7 +56,7 @@ export const CLI_HELP = `Glassbox 本机管理
   协议: ${protocols.join(", ")}
 
 渠道 JSON 字段:
-  id、label、kind、endpoint、botId、ownerId、groupIds、executionRef、token
+  id、label、kind、endpoint、botId、ownerId、coOwnerId、groupIds、executionRef、token
   kind 为 qq-onebot。QQ 号和群号使用字符串。endpoint 使用本机 ws 或 wss 地址。
   executionRef 为 claude-code、codex 或 model:<模型配置 ID>。
   token 字段省略时保留原值，null 删除原值，字符串替换原值。

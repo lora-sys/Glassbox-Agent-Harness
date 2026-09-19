@@ -16,7 +16,12 @@ import {
   type RunServiceEvent,
 } from "../execution/run-service/index.js";
 import { configuredModelAdapter } from "../execution/model-adapter.js";
-import { KitLoader, PiRunExecutionAdapter, PiSdkRuntimeAdapter } from "../runtime/pi/index.js";
+import {
+  KitLoader,
+  piProfileName,
+  PiRunExecutionAdapter,
+  PiSdkRuntimeAdapter,
+} from "../runtime/pi/index.js";
 import { configuredPiModel } from "../runtime/pi/configured-model.js";
 import { createOpsTools, OPS_TOOL_NAMES, type WorkerTarget } from "../runtime/pi/ops-tools.js";
 import {
@@ -257,6 +262,12 @@ export class ManagementApplication {
       resolveSkillNames: async (context, profile) => {
         if (!context.caller) return { names: [], policy: { source: "no-caller" } };
         if (context.caller.scope.chatType === "group") {
+          if (await this.store.identities.isOwner(context.caller.principalId)) {
+            return {
+              names: profile.enabledSkills,
+              policy: { source: "owner-profile", profile: profile.name },
+            };
+          }
           const configured = this.groupRuntime.get(
             context.caller.scope.connectionId,
             context.caller.scope.chatId,
@@ -276,9 +287,10 @@ export class ManagementApplication {
       },
       resolveToolNames: async (context) => {
         if (!context.caller || !context.conversationId || !context.runId) return [];
+        const isOwner = await this.store.identities.isOwner(context.caller.principalId);
         const candidates = [
           ...(context.authorizedSkillNames?.length ? [SKILL_READ_TOOL] : []),
-          ...(context.caller.principalId === OWNER_ID && context.caller.scope.chatType === "private"
+          ...(isOwner && context.caller.scope.chatType === "private"
             ? [...(this.options.ops ? OPS_TOOL_NAMES : []), OWNER_GROUP_ADMIN_TOOL]
             : []),
         ];
@@ -304,7 +316,14 @@ export class ManagementApplication {
         await this.store.evidence.advanceTrace(caller, cursor);
       },
     });
-    const adapter = new PiRunExecutionAdapter(runtime);
+    const adapter = new PiRunExecutionAdapter(runtime, {
+      isOwner: (input) => this.store.identities.isOwner(input.caller.principalId),
+      resolveProfileName: async (input) =>
+        piProfileName(
+          input.caller.scope.chatType,
+          await this.store.identities.isOwner(input.caller.principalId),
+        ),
+    });
     this.piAdapters.set(profileId, adapter);
     return adapter;
   }
@@ -568,7 +587,7 @@ export class ManagementApplication {
   }
 
   private async grantScope(scope: TrustedChannelScope, principalId = OWNER_ID) {
-    const isOwner = principalId === OWNER_ID || principalId.startsWith("owner-");
+    const isOwner = await this.store.identities.isOwner(principalId);
     const caller: CallerContext = { principalId, scope };
     for (const action of ACTIONS) {
       if (!isOwner && action === "eval:write") continue;
@@ -618,7 +637,7 @@ export class ManagementApplication {
         id: OWNER_CONTROL_RESOURCE,
         kind: "owner-control",
         visibility: "private",
-        ownerId: principalId,
+        ownerId: OWNER_ID,
         ifAbsent: true,
       });
       await this.store.authorization.grant({
@@ -634,7 +653,7 @@ export class ManagementApplication {
           id: resourceId,
           kind: "tool-definition",
           visibility: "private",
-          ownerId: principalId,
+          ownerId: OWNER_ID,
           ifAbsent: true,
         });
         await this.store.authorization.grant({
@@ -654,7 +673,7 @@ export class ManagementApplication {
   ): Promise<{ groupId: string; enabled: boolean; enabledSkills: string[]; version: number }> {
     return this.serialize(async () => {
       const caller = context.caller;
-      const isOwner = caller.principalId === OWNER_ID || caller.principalId.startsWith("owner-");
+      const isOwner = await this.store.identities.isOwner(caller.principalId);
       if (!isOwner || caller.scope.chatType !== "private")
         throw new Error("owner_private_required");
       const connection = this.connections.get(caller.scope.connectionId);
@@ -667,19 +686,19 @@ export class ManagementApplication {
         configured.config.ownerId,
         ...(configured.config.coOwnerId ? [configured.config.coOwnerId] : []),
       ];
-      const groupScopes = [...ownerIds, ...configured.config.visitorIds].map(
-        (senderId) => ({
-          connectionId: configured.config.connectionId,
-          botId: configured.config.botId,
-          chatType: "group" as const,
-          chatId: input.groupId,
-          senderId,
-        }),
-      );
+      const groupScopes = [...ownerIds, ...configured.config.visitorIds].map((senderId) => ({
+        connectionId: configured.config.connectionId,
+        botId: configured.config.botId,
+        chatType: "group" as const,
+        chatId: input.groupId,
+        senderId,
+      }));
       if (!input.enabled) {
         for (const scope of groupScopes) {
           const principalId = ownerIds.includes(scope.senderId)
-            ? (scope.senderId === configured.config.ownerId ? OWNER_ID : `owner-${scope.senderId}`)
+            ? scope.senderId === configured.config.ownerId
+              ? OWNER_ID
+              : `owner-${scope.senderId}`
             : `qq-visitor-${scope.senderId}`;
           for (const resourceId of [
             agentResourceId(AGENT_ID),
@@ -697,7 +716,9 @@ export class ManagementApplication {
       if (input.enabled) {
         for (const scope of groupScopes) {
           const principalId = ownerIds.includes(scope.senderId)
-            ? (scope.senderId === configured.config.ownerId ? OWNER_ID : `owner-${scope.senderId}`)
+            ? scope.senderId === configured.config.ownerId
+              ? OWNER_ID
+              : `owner-${scope.senderId}`
             : `qq-visitor-${scope.senderId}`;
           await this.grantScope(scope, principalId);
         }
@@ -736,9 +757,8 @@ export class ManagementApplication {
     input: OwnerGroupAdminInput,
   ): Promise<unknown> {
     const caller = context.caller;
-    const isOwner = caller.principalId === OWNER_ID || caller.principalId.startsWith("owner-");
-    if (!isOwner || caller.scope.chatType !== "private")
-      throw new Error("owner_private_required");
+    const isOwner = await this.store.identities.isOwner(caller.principalId);
+    if (!isOwner || caller.scope.chatType !== "private") throw new Error("owner_private_required");
     if (input.action === "set_access") return this.setGroupAccess(context, input);
     if (input.action === "set_skill") return this.setGroupSkill(context, input);
     const configured = this.channels.resolve(caller.scope.connectionId);
@@ -762,7 +782,7 @@ export class ManagementApplication {
   ): Promise<unknown> {
     return this.serialize(async () => {
       const caller = context.caller;
-      const isOwner = caller.principalId === OWNER_ID || caller.principalId.startsWith("owner-");
+      const isOwner = await this.store.identities.isOwner(caller.principalId);
       if (!isOwner || caller.scope.chatType !== "private")
         throw new Error("owner_private_required");
       const configured = this.channels.resolve(caller.scope.connectionId);
@@ -809,7 +829,10 @@ export class ManagementApplication {
   ): Promise<boolean> {
     const available = new Set(this.kitLoader.availableSkills().map((skill) => skill.name));
     if (!available.has(skillName)) return false;
-    if (context.caller.scope.chatType === "private")
+    if (
+      context.caller.scope.chatType === "private" ||
+      (await this.store.identities.isOwner(context.caller.principalId))
+    )
       return this.kitLoader.loadProfile("main-agent").enabledSkills.includes(skillName);
     const configured = this.channels.resolve(context.caller.scope.connectionId);
     if (!configured.config.groupIds.includes(context.caller.scope.chatId)) return false;

@@ -122,9 +122,15 @@ describe("local domain foundation", () => {
     const accepted = await receive(store, "allowed");
     expect(accepted.run.status).toBe("queued");
     expect(accepted.caller.principalId).toBe("owner");
-    await expect(
-      store.identities.bindOwner("another-owner", { ...group, senderId: "someone-else" }),
-    ).rejects.toThrow();
+    const secondOwnerScope = { ...group, senderId: "someone-else" };
+    await store.identities.bindOwner("another-owner", secondOwnerScope);
+    expect(await store.identities.resolve(secondOwnerScope)).toEqual({
+      principalId: "another-owner",
+      scope: secondOwnerScope,
+    });
+    await expect(receive(store, "second-owner-bound", secondOwnerScope)).rejects.toMatchObject({
+      decision: { reason: "no_grant" },
+    });
   });
 
   it("checks private data before loading and rechecks current grants and identity", async () => {
@@ -328,7 +334,7 @@ describe("local domain foundation", () => {
     ).toEqual([groupRun.conversation.id]);
   });
 
-  it("rejects stale bindings and does not transfer old conversations when an identity is rebound", async () => {
+  it("rotates private conversations without transferring history when an identity is rebound", async () => {
     const store = await fixture();
     const first = await receive(store, "first", privateScope);
     await store.identities.bindPrincipal("visitor", privateScope);
@@ -337,12 +343,16 @@ describe("local domain foundation", () => {
     });
     const reboundCaller = { principalId: "visitor", scope: privateScope };
     await allowAgent(store, reboundCaller);
-    await expect(receive(store, "second", privateScope)).rejects.toMatchObject({
-      decision: { reason: "scope_mismatch" },
-    });
+    const second = await receive(store, "second", privateScope);
+    expect(second.conversation.id).not.toBe(first.conversation.id);
+    expect(second.conversation.principalId).toBe("visitor");
     await expect(store.conversations.getRun(reboundCaller, first.run.id)).rejects.toBeInstanceOf(
       AccessDeniedError,
     );
+    await expect(store.conversations.getRun(ownerPrivate, second.run.id)).rejects.toBeInstanceOf(
+      AccessDeniedError,
+    );
+    expect((await store.conversations.getRun(reboundCaller, second.run.id)).id).toBe(second.run.id);
   });
 
   it("serializes a conversation and reports cancellation only after explicit confirmation", async () => {

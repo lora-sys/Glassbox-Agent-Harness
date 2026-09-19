@@ -219,6 +219,11 @@ Herdr delegated Pi Worker
 
 Remote profiles must expose a narrower Tool / MCP surface than normal local coding where necessary.
 
+An Owner acting in an authorized QQ group uses the main-agent Skill profile. Non-Owner group
+messages use the qq-group profile and the group's strict Skill whitelist. The group remains the
+delivery audience, and Owner read permission never implies permission to deliver protected data to
+that audience.
+
 ## Runtime state isolation
 
 Glassbox-launched Pi instances should not write into the user's normal interactive Pi state by default.

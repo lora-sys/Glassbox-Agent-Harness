@@ -1,26 +1,30 @@
 import { describe, expect, it, vi } from "vite-plus/test";
-import { PiRunExecutionAdapter } from "./run-adapter.js";
+import type { ExecutionInput } from "../../execution/run-service/types.js";
+import { piProfileName, PiRunExecutionAdapter } from "./run-adapter.js";
 import type { PiRunResult, PiRuntimeAdapter } from "./types.js";
 
 function fixture(results: PiRunResult[]) {
   const run = vi.fn(async (..._args: Parameters<PiRuntimeAdapter["run"]>) => results.shift()!);
   const disposeSession = vi.fn(async () => {});
-  const runtime: PiRuntimeAdapter = {
-    initialize: async () => {},
-    createOrRestoreSession: async () => ({
+  const createOrRestoreSession = vi.fn(
+    async (..._args: Parameters<PiRuntimeAdapter["createOrRestoreSession"]>) => ({
       conversationId: "conversation-1",
       runtimeSessionId: "session-1",
-      profileName: "main-agent",
+      profileName: "main-agent" as const,
       agentDir: "agent",
       createdAt: new Date(0).toISOString(),
       lastActiveAt: new Date(0).toISOString(),
     }),
+  );
+  const runtime: PiRuntimeAdapter = {
+    initialize: async () => {},
+    createOrRestoreSession,
     run,
     abort: async () => {},
     disposeSession,
     cleanup: async () => {},
   };
-  const input = {
+  const input: ExecutionInput = {
     caller: {
       principalId: "owner",
       scope: {
@@ -42,7 +46,6 @@ function fixture(results: PiRunResult[]) {
         chatId: "owner",
         senderId: "owner",
       },
-      resourceId: "conversation:conversation-1",
       providerKind: null,
       providerSessionId: null,
       providerSessionPrincipalId: null,
@@ -50,17 +53,9 @@ function fixture(results: PiRunResult[]) {
     },
     run: {
       id: "run-1",
-      sequence: 1,
       conversationId: "conversation-1",
       messageId: "message-1",
       principalId: "owner",
-      scope: {
-        connectionId: "qq",
-        botId: "bot",
-        chatType: "private" as const,
-        chatId: "owner",
-        senderId: "owner",
-      },
       executionRef: "pi",
       status: "running" as const,
       resultText: null,
@@ -72,10 +67,61 @@ function fixture(results: PiRunResult[]) {
     providerSessionId: null,
     signal: new AbortController().signal,
   };
-  return { executor: new PiRunExecutionAdapter(runtime), input, run, disposeSession };
+  return {
+    executor: new PiRunExecutionAdapter(runtime),
+    runtime,
+    input,
+    run,
+    disposeSession,
+    createOrRestoreSession,
+  };
 }
 
 describe("Pi required Tool execution", () => {
+  it("keeps non-Owner group runs on the restricted group profile", () => {
+    expect(piProfileName("group", false)).toBe("qq-group");
+    expect(piProfileName("group", true)).toBe("main-agent");
+    expect(piProfileName("private", false)).toBe("main-agent");
+  });
+
+  it("selects the main Agent profile for an Owner in a group through the trusted role resolver", async () => {
+    const f = fixture([{ status: "completed", text: "ok", toolCalls: [] }]);
+    f.input.caller.scope.chatType = "group";
+    f.input.caller.scope.chatId = "1126022432";
+    f.input.conversation.scope.chatType = "group";
+    f.input.conversation.scope.chatId = "1126022432";
+    const executor = new PiRunExecutionAdapter(f.runtime, {
+      isOwner: async () => true,
+      resolveProfileName: async () => "main-agent",
+    });
+
+    await executor.execute(f.input);
+
+    expect(f.createOrRestoreSession.mock.calls[0]?.[1]).toBe("main-agent");
+  });
+
+  it("recognizes a secondary Owner when requiring a private management Tool call", async () => {
+    const f = fixture([
+      {
+        status: "completed",
+        text: "当前启用两个技能。",
+        toolCalls: [
+          {
+            name: "owner_group_admin",
+            input: { action: "get", groupId: "1126022432" },
+            failed: false,
+          },
+        ],
+      },
+    ]);
+    f.input.caller.principalId = "owner-secondary";
+    f.input.text = "查看群 1126022432 当前有哪些技能";
+    const executor = new PiRunExecutionAdapter(f.runtime, { isOwner: async () => true });
+
+    await expect(executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe("owner_group_admin");
+  });
+
   it("retries once and accepts only a successful required Tool result", async () => {
     const f = fixture([
       { status: "completed", text: "已执行", toolCalls: [] },

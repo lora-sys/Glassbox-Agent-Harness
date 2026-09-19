@@ -285,7 +285,12 @@ owner-direct
   Owner private-channel runtime projection when a separate profile is useful
 
 qq-group
-  remote group profile with a narrow Tool surface
+  remote group profile with a narrow Tool surface for non-Owner Principals
+
+Owner messages in an authorized QQ group use the main-agent profile and its enabled Skills. The
+group remains the delivery audience, so Glassbox still checks protected reads and delivery before
+sending a result. Non-Owner messages continue to use the qq-group profile and the group's strict
+Skill whitelist.
 
 herdr-worker
   delegated coding Worker profile

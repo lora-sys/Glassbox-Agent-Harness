@@ -15,9 +15,20 @@ interface RequiredToolCall {
   skillName?: string;
 }
 
-function requiredToolCall(input: ExecutionInput): RequiredToolCall | undefined {
-  if (input.caller.principalId !== "owner" || input.caller.scope.chatType !== "private")
-    return undefined;
+export interface PiRunExecutionAdapterOptions {
+  isOwner?: (input: ExecutionInput) => Promise<boolean>;
+  resolveProfileName?: (input: ExecutionInput) => Promise<PiRuntimeProfileName>;
+}
+
+export function piProfileName(
+  chatType: ExecutionInput["caller"]["scope"]["chatType"],
+  isOwner: boolean,
+): PiRuntimeProfileName {
+  return chatType === "group" && !isOwner ? "qq-group" : "main-agent";
+}
+
+function requiredToolCall(input: ExecutionInput, isOwner: boolean): RequiredToolCall | undefined {
+  if (!isOwner || input.caller.scope.chatType !== "private") return undefined;
   const text = input.text;
   if (/不要|别|无需/u.test(text)) return undefined;
   const groupMatch = /(?:群\s*([1-9]\d{4,15})|([1-9]\d{4,15})\s*群)/u.exec(text);
@@ -54,13 +65,22 @@ function recreatedPrompt(input: ExecutionInput): string {
 export class PiRunExecutionAdapter implements RunExecutionAdapter {
   readonly supportsGroup = true;
 
-  constructor(private readonly runtime: PiRuntimeAdapter) {}
+  constructor(
+    private readonly runtime: PiRuntimeAdapter,
+    private readonly options: PiRunExecutionAdapterOptions = {},
+  ) {}
 
   async execute(input: ExecutionInput): Promise<ExecutionResult> {
     await this.runtime.initialize();
-    const profile: PiRuntimeProfileName =
-      input.caller.scope.chatType === "group" ? "qq-group" : "main-agent";
-    const required = requiredToolCall(input);
+    const isOwner = this.options.isOwner
+      ? await this.options.isOwner(input)
+      : input.caller.principalId === "owner";
+    const profile: PiRuntimeProfileName = this.options.resolveProfileName
+      ? await this.options.resolveProfileName(input)
+      : input.caller.scope.chatType === "group"
+        ? "qq-group"
+        : "main-agent";
+    const required = requiredToolCall(input, isOwner);
     const context = {
       caller: input.caller,
       conversationId: input.conversation.id,

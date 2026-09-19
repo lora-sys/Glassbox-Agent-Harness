@@ -23,6 +23,17 @@ export async function resolveIdentity(
 export class IdentityService {
   constructor(private readonly db: DomainDatabase) {}
 
+  async isOwner(principalId: string): Promise<boolean> {
+    requireIdentifier(principalId);
+    return this.db.transaction(async (tx) => {
+      const result = await tx.execute({
+        sql: "SELECT 1 FROM principals WHERE id = ? AND kind = 'owner'",
+        args: [principalId],
+      });
+      return result.rows.length === 1;
+    });
+  }
+
   /** Management-only operations. The HTTP boundary must authenticate management
    * before exposing these methods; incoming channel text must never reach them. */
   async createPrincipal(id: string, kind: "owner" | "visitor"): Promise<void> {

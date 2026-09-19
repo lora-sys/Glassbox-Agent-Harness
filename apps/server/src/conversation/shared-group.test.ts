@@ -958,9 +958,9 @@ describe("shared group conversation and durable actor routing", () => {
     const fkViolations = await rawCheck.execute("PRAGMA foreign_key_check");
     expect(fkViolations.rows).toHaveLength(0);
 
-    // 10. Verify user_version is 5
+    // 10. Verify all current migrations completed.
     const ver = await rawCheck.execute("PRAGMA user_version");
-    expect(Number(ver.rows[0]?.user_version)).toBe(5);
+    expect(Number(ver.rows[0]?.user_version)).toBe(6);
 
     rawCheck.close();
   });

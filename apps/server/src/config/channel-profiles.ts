@@ -231,6 +231,7 @@ export class ChannelProfileStore {
             "endpoint",
             "botId",
             "ownerId",
+            "coOwnerId",
             "visitorIds",
             "groupIds",
             "executionRef",

@@ -182,6 +182,20 @@ describe("Dual Owner support", () => {
     expect(scopeKey(scope1)).not.toBe(scopeKey(scope2));
   });
 
+  it("does not infer Owner authority from a principal identifier prefix", async () => {
+    const db = await DomainDatabase.open(":memory:");
+    const identities = new IdentityService(db);
+    await identities.createPrincipal("owner-impostor", "visitor");
+    expect(await identities.isOwner("owner-impostor")).toBe(false);
+    await identities.bindOwner("actual-owner", {
+      connectionId: "test-conn",
+      botId: "10001",
+      senderId: "10002",
+    });
+    expect(await identities.isOwner("actual-owner")).toBe(true);
+    await db.close();
+  });
+
   it("verifies live production configuration with real QQ numbers", () => {
     const liveConfig = parseOneBotConfig({
       connectionId: "p3-qq",
@@ -308,4 +322,3 @@ describe("Dual Owner support", () => {
     expect(unknownGroup.kind).toBe("ignored");
   });
 });
-

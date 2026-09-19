@@ -28,6 +28,15 @@ const input = {
 };
 
 describe("server-owned channel profiles", () => {
+  it("persists a Co-Owner through the public save contract", async () => {
+    const { directory, store } = await fixture();
+    const saved = await store.save({ ...input, coOwnerId: "54322" });
+    expect(saved.coOwnerId).toBe("54322");
+    const reopened = await ChannelProfileStore.open(directory);
+    expect(reopened.resolve(input.id).config.coOwnerId).toBe("54322");
+    expect(reopened.list()[0]?.coOwnerId).toBe("54322");
+  });
+
   it("persists explicit Visitors and a Pi model reference across reopen", async () => {
     const { directory, store } = await fixture();
     await store.save({ ...input, visitorIds: ["54322"], executionRef: "pi:personal" });
