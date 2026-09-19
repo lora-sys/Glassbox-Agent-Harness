@@ -73,7 +73,7 @@ function buildBoardObjects(
 		// the second column (see answerTemplates below) — never truncated.
 		if (t.finalAnswer) {
 			const answerId = "shape:answer-" + (t.turnId || ("ans" + i));
-			shapes.push({ kind: "turn-answer", id: answerId, text: "Answer:\n" + t.finalAnswer, meta: { objectType: "turnAnswer", itemId: t.turnId, turnIndex: i } });
+			shapes.push({ kind: "turn-answer", id: answerId, text: "Answer:\n" + t.finalAnswer, meta: { objectType: "turnFinalAnswer", itemId: t.turnId, turnIndex: i } });
 		}
 	}
 
