@@ -1,44 +1,59 @@
-# Owner and Group Operations
+# Owner Control and Future Group Operations
 
-Status: P3+ ACTIVE / LATER CAPABILITIES PLANNED
+Status: P3+ OWNER CONTROL ACTIVE / P9 GROUP FEATURES PLANNED
 
-This document owns the architecture for Owner private control and group-specific product behavior.
-
-The active implementation slice is intentionally narrow. It does not require Memory.
-
-## Core model
-
-Glassbox still has one durable Personal Agent.
-
-A QQ group is a scoped operating environment for that Agent.
+This document owns two related but differently timed areas:
 
 ~~~text
-Personal Agent
-  Owner private projection
-  test-group projection
-  future group projections
+now
+  minimal Owner private control
+  per-Run Tool surface isolation
+
+later
+  group programs
+  reminders / reports
+  group-specific capability creation
+  multi-group operations
 ~~~
 
-Group-specific behavior does not create a second Agent identity.
+The active implementation source is `.plans/03-plus-owner-control-smoke.md`.
+
+## Current P3+ scope
+
+P3+ is only a smoke slice on top of completed P3.
+
+It proves:
+
+~~~text
+Owner private control
+test-group runtime inspection
+model override for future Runs
+enable / disable one existing safe capability
+recent Run / Trace inspection
+model-visible Tool schema filtering
+~~~
+
+It does not add any new learning, scheduling, assignment, reminder, reporting, or Tool-generation subsystem.
 
 ## Owner private control
 
 The Owner private projection may receive protected management Actions that normal group participants never see.
 
-The first P3+ surface is limited to:
+Initial conceptual Actions:
 
 ~~~text
-read runtime status
-read test-group configuration
-change the model used by future test-group Runs
-enable or disable the fixed learning-checkin capability
-inspect recent Run or failure state
-inspect learning-assignment progress
+owner_status
+owner_group_get
+owner_group_set_model
+owner_group_set_tool_enabled
+owner_run_inspect
 ~~~
 
-Every mutation remains a Glassbox Action.
+Do not implement one unrestricted free-form command Tool.
 
-Owner identity is resolved by existing P3 identity and authorization code.
+Each mutation uses typed input, explicit Resource and Action, server-side authorization, and Trace evidence.
+
+Owner identity comes from existing P3 identity resolution and authorization.
 
 A prompt cannot grant Owner authority.
 
@@ -46,11 +61,11 @@ A prompt cannot grant Owner authority.
 
 Tool definitions are model-visible Context.
 
-Glassbox must therefore decide the Tool surface before Pi receives the Run.
+Glassbox must therefore decide the Tool surface before Pi receives a Run.
 
 ~~~text
 Kit profile
-→ scope bindings
+→ scope configuration
 → Principal authorization
 → RunCapabilitySet
 → model-visible Tool definitions
@@ -62,9 +77,9 @@ The existing Tool Gate still runs again immediately before execution.
 
 Schema filtering reduces exposure. It does not replace execution authorization.
 
-## Runtime configuration
+## GroupRuntimeConfig
 
-P3+ adds a small durable group runtime configuration.
+P3+ may persist a small runtime configuration for the current real test group.
 
 Conceptual shape:
 
@@ -78,29 +93,58 @@ GroupRuntimeConfig
   updatedAt
 ~~~
 
-Changing the model changes future Runs only.
+Changing the model affects future Runs only.
 
 Historical Run metadata is not rewritten.
 
-The first implementation only needs the current real test group.
+The first capability toggle should use one capability that already exists in the completed P3 runtime.
 
-## Fixed learning-checkin capability
+Do not invent a new group feature merely to test the toggle.
 
-The first group feature is built-in reviewed code.
-
-Do not generate executable code from chat for this feature.
-
-The feature owns:
+## P3+ smoke loop
 
 ~~~text
-one daily schedule
-one daily assignment
-explicit participant check-in
-durable participant progress
-Owner private progress query
+Owner private
+  inspect test-group runtime
+
+Owner private
+  change model
+
+Owner private
+  disable one existing safe Tool
+
+test group
+  trigger normal Run
+  verify selected model
+  verify disabled Tool schema absent
+  verify Owner Tool schema absent
+
+Owner private
+  re-enable Tool
+  inspect recent Run / Trace
 ~~~
 
-Human assignments are separate from Agent Operations Tasks.
+After this works, stop expanding P3+ and return to P4.
+
+## P9 group programs and custom capabilities
+
+The following features are intentionally late in the roadmap.
+
+They are useful, but they should not interrupt P4 through P8.
+
+### Scheduled group programs
+
+A future group program may support:
+
+~~~text
+GroupAssignment
+AssignmentParticipant
+CompletionEvidence
+ScheduleDefinition
+ScheduleOccurrence
+~~~
+
+Human group assignments remain separate from Agent Operations Tasks.
 
 ~~~text
 Task
@@ -110,88 +154,17 @@ GroupAssignment
   human participant work
 ~~~
 
-Do not reuse TaskAttempt or WorkerBinding for human completion.
+A first learning-program implementation may later support daily assignment posting and explicit participant check-in.
 
-## Scheduling
+Schedule truth belongs in Glassbox durable state.
 
-For the one-group P3+ slice, an in-process scheduler is sufficient.
+Timer transport is not product truth.
 
-Glassbox persists:
+Each occurrence requires a deterministic idempotency key so restart or retries do not duplicate a post.
 
-~~~text
-ScheduleDefinition
-ScheduleOccurrence
-~~~
+### Reminder policy and weekly reports
 
-Each occurrence has a durable idempotency key.
-
-Restart, reconnect, or duplicate timer ticks must not produce a second publication for the same occurrence.
-
-The scheduler transport is not product truth.
-
-## Assignment state
-
-Minimum records:
-
-~~~text
-GroupAssignment
-AssignmentParticipant
-CompletionEvidence
-~~~
-
-Minimum participant states:
-
-~~~text
-ASSIGNED
-SUBMITTED
-ACCEPTED
-OVERDUE
-~~~
-
-The first version may use an explicit configured participant set for the test group.
-
-Completion must have evidence.
-
-General chat activity is not automatically completion.
-
-## This is not Memory
-
-The following records are product state:
-
-~~~text
-GroupRuntimeConfig
-ScheduleDefinition
-ScheduleOccurrence
-GroupAssignment
-AssignmentParticipant
-CompletionEvidence
-~~~
-
-Persisting them in Turso does not make them Memory.
-
-P3+ does not create:
-
-~~~text
-MemoryCandidate
-Semantic Memory
-Episodic Memory
-TasteCandidate
-TasteEntry
-~~~
-
-P4 may later select useful assignment, Conversation, Run, and Task evidence as input to the Memory promotion pipeline.
-
-Nothing in P3+ should inject all stored assignment history into model Context.
-
-## Deferred group operations
-
-The following design is preserved as a later Group Operations track.
-
-It is not part of the P3+ completion gate and does not block P4.
-
-### G1 — Reminder policy and weekly reports
-
-Automatic reminders require explicit policy rather than ad-hoc model behavior.
+Automatic reminders require explicit policy.
 
 Conceptual controls:
 
@@ -211,19 +184,15 @@ Reminder flow:
 
 ~~~text
 find overdue participant
-→ verify assignment is active
-→ verify participant is incomplete
-→ verify cooldown and maximum count
+→ verify assignment active
+→ verify participant incomplete
+→ verify cooldown
 → authorize delivery
 → send reminder
 → persist ReminderEvent
 ~~~
 
-Every reminder needs an idempotency key.
-
-A retry must not mention the same participant repeatedly.
-
-Weekly reports are durable projections over assignment evidence.
+Weekly reports should be structured projections over assignment evidence.
 
 Useful fields may include:
 
@@ -237,16 +206,13 @@ overdue
 excused
 completion rate
 streak when defined
-recent improvement
 attention needed
 delivery failures
 ~~~
 
-The natural-language report is a presentation layer.
+Natural-language summary is presentation. Structured state remains truth.
 
-The structured assignment evidence remains product truth.
-
-### G2 — Group Tool Registry
+### Group Tool Registry
 
 Glassbox may later own a versioned registry for reusable group capabilities.
 
@@ -276,17 +242,15 @@ GroupToolBinding
 
 A ToolDefinition may be reused across groups.
 
-A GroupToolBinding decides whether one group may use it and with which configuration.
+A GroupToolBinding selects whether one group may use it and with which configuration.
 
-Do not duplicate executable code per group when a parameterized binding is enough.
+### Progressive Tool discovery
 
-### G3 — Progressive Tool discovery
+Most Runs should receive a small direct Tool surface.
 
-Most Runs should continue to receive a small direct Tool surface.
+If a later group has many authorized capabilities, Glassbox may add progressive discovery.
 
-When a group later has many authorized capabilities, Glassbox may add progressive discovery.
-
-A discovery Tool may return only authorized metadata such as:
+A discovery Tool may reveal only authorized metadata:
 
 ~~~text
 tool id
@@ -296,19 +260,17 @@ input summary
 risk class
 ~~~
 
-It must not return Owner-only or unrelated-group capability metadata.
+It must not reveal Owner-only or unrelated-group capability metadata.
 
-A generic broker such as tool_invoke may be considered when schema secrecy is more important than model-side structured arguments.
+A generic broker may be considered only when real Tool volume justifies it.
 
-The server must still validate the stored real schema and re-authorize execution.
+The server still validates the stored schema and re-authorizes execution.
 
-Do not add a broker until real Tool volume justifies it.
-
-### G4 — Template-driven capability creation
+### Template-driven capability creation
 
 The Main Agent may later help the Owner create group-specific capability bindings.
 
-Use the smallest mechanism that satisfies the need:
+Use this order:
 
 ~~~text
 configuration
@@ -317,9 +279,7 @@ configuration
 → new executable Tool code
 ~~~
 
-Configuration is preferred when only safe parameters change.
-
-Fixed templates are preferred for common group workflows such as:
+Fixed templates are suitable for common group workflows such as:
 
 ~~~text
 learning check-in
@@ -331,13 +291,9 @@ weekly scorecard
 simple approval flow
 ~~~
 
-A template should have a fixed permission manifest and validated configuration schema.
+Executable Tool code is only for genuinely new integration or side-effect requirements.
 
-Use a Skill when the new behavior is mainly a reusable procedure and does not require new server authority.
-
-Only create executable Tool code when a capability needs a new integration, new side effect, or new protected Action.
-
-The controlled development path is:
+Controlled development path:
 
 ~~~text
 Owner request
@@ -350,11 +306,11 @@ Owner request
 → versioned activation
 ~~~
 
-Do not load arbitrary chat-generated JavaScript into the production process.
+Do not load arbitrary chat-generated JavaScript into production.
 
-### G5 — Multi-group Owner snapshot
+### Multi-group Owner snapshot
 
-After more than one real group exists, the Owner private Main Agent may retrieve a compact operational projection such as:
+After more than one real group exists, the Owner private Main Agent may retrieve a compact projection:
 
 ~~~text
 OwnerGroupOpsSnapshot
@@ -371,21 +327,11 @@ OwnerGroupOpsSnapshot
 
 Do not inject every group's full history into every Owner Run.
 
-Use a compact summary and protected detail Tools.
+Use a compact summary plus protected detail Tools.
 
-## Deferred learning
+## Memory-dependent group learning
 
-Cross-group learning requires P4 Memory foundations.
-
-After P4 exists, group-derived evidence may enter this path:
-
-~~~text
-group evidence
-→ Memory Candidate
-→ scope + visibility + reliability
-→ group-scoped Memory
-→ authorized Owner retrieval
-~~~
+This section depends on P4 Memory being implemented first.
 
 Default rule:
 
@@ -401,7 +347,7 @@ group A evidence
 → group B Context
 ~~~
 
-The Owner private Main Agent may later query several authorized group namespaces for Owner use.
+The Owner private Main Agent may later retrieve across authorized group namespaces.
 
 Cross-group synthesis should create an Owner-private derived insight with provenance:
 
@@ -414,22 +360,11 @@ OwnerInsight
   visibility = owner_private
 ~~~
 
-A later explicit promotion may turn repeated evidence into:
+Repeated evidence may later become a Skill candidate, Rule candidate, system-learning candidate, or product-improvement proposal through explicit promotion.
 
-~~~text
-Skill candidate
-Rule candidate
-system-learning candidate
-product improvement proposal
-~~~
+## Main Agent improvement loop
 
-Source group Memory remains unchanged.
-
-## Deferred Main Agent improvement loop
-
-The Owner Main Agent may later use real execution evidence to improve Glassbox.
-
-A safe path is:
+Late-stage system improvement may use real execution evidence.
 
 ~~~text
 observe repeated failure or need
@@ -446,69 +381,15 @@ Low-risk configuration changes may use explicit Owner Actions.
 
 Authorization, secrets, production schema changes, arbitrary shell authority, and self-modification of Owner policy require stronger review.
 
-## First P3+ user loop
+## Stable boundaries
 
 ~~~text
-Owner private:
-  set test group model
-  enable learning-checkin
-
-scheduled occurrence:
-  publish today's learning assignment
-
-group member:
-  submit explicit check-in
-
-Glassbox:
-  persist CompletionEvidence
-  update AssignmentParticipant
-
-Owner private:
-  ask who has completed today
-
-Glassbox:
-  return authorized progress projection
+Owner control ≠ unrestricted shell
+RunCapabilitySet ≠ authorization policy
+Tool availability ≠ Tool permission
+Tool schema presence = model-visible Context exposure
+GroupAssignment ≠ Agent Operations Task
+structured product state ≠ Memory
+Owner cross-group retrieval ≠ group-to-group sharing
+generated proposal ≠ activated capability
 ~~~
-
-This loop is enough to prove the direction before reminders, reports, Memory, or Tool generation are built.
-
-
-## Later multi-group evolution
-
-After the one-group P3+ loop works and later Group Operations slices are justified:
-
-~~~text
-add second real group
-→ prove group configuration isolation
-→ prove Tool binding isolation
-→ prove schedule isolation
-→ prove report isolation
-→ add P4 group Memory
-→ prove Owner cross-group retrieval
-→ add controlled capability creation
-~~~
-
-Scale follows real use.
-
-## Later data ownership
-
-When the later Group Operations track is implemented, Glassbox and Turso may own structured metadata such as:
-
-~~~text
-GroupPolicy
-ToolDefinition metadata
-ToolVersion metadata
-GroupToolBinding
-RunCapabilitySet metadata when persisted
-ReminderPolicy
-ReminderEvent
-ReportSnapshot
-OwnerGroupOpsSnapshot projection inputs
-OwnerInsight after P4
-~~~
-
-Large artifacts may use R2 with durable references in Turso.
-
-Lora PI Kit may package executable Tool implementations, Skills, prompts, and runtime adapters.
-
-The Kit does not own group authorization, assignment truth, or Memory truth.
