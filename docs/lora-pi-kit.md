@@ -303,6 +303,29 @@ Profiles do not define Glassbox authorization.
 
 A profile may narrow runtime capability. It may not widen the current Principal's Glassbox authority.
 
+## Per-run Tool surface
+
+The Kit may contain more capabilities than one Run is allowed to expose.
+
+For Glassbox execution, Tool selection should narrow in this order:
+
+```text
+Kit capability set
+→ active profile
+→ group or scope bindings
+→ Principal authorization
+→ RunCapabilitySet
+→ model-visible Tool definitions
+```
+
+Tool definitions and schemas are model-visible Context. Do not attach Owner-only, unrelated-group, or otherwise unauthorized Tool schemas and rely only on call-time denial.
+
+Glassbox builds the effective Tool surface. Lora PI Kit loads the selected runtime resources.
+
+Protected Tool execution still re-authorizes immediately before the side effect. Schema filtering does not replace the Tool Gate.
+
+Group-specific Tool creation, progressive discovery, and safe template rules are defined in `docs/owner-group-operations.md`.
+
 ## Main Agent and Worker use the same distribution
 
 The same Lora PI Kit may be used in different roles.
