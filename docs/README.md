@@ -20,6 +20,7 @@ Use one source of truth per topic.
 | Runtime ownership / Pi SDK / runtime roles | `runtime-strategy.md` |
 | Lora PI Kit distribution / Skills snapshot / MCP / profiles / locks | `lora-pi-kit.md` |
 | Herdr / Task / Attention / WorkerBinding / reconciliation | `agent-operations.md` |
+| Owner control / group assignments / group Tool bindings / schedules | `owner-group-operations.md` |
 | Rules / Skills / Taste / Feedback / Memory / retrieval | `memory-taste.md` |
 | Toolchain / dependencies / test / deployment | `tech-stack.md` |
 | Persistence / storage / observability / projections | `data-observability.md` |
@@ -120,6 +121,30 @@ Herdr reports live execution facts.
 Glassbox owns Task truth and acceptance.
 
 See `agent-operations.md`.
+
+## Owner and group operations model
+
+After P3, the first fast follow uses the same Personal Agent and trust boundaries for one real test group.
+
+```text
+Owner private Main Agent
+        ↓
+protected group control Actions
+        ↓
+GroupPolicy
+Group Tool bindings
+Schedules
+GroupAssignments
+Progress
+Reminders
+Reports
+```
+
+Tool schemas are model-visible Context. Glassbox must build a per-run Tool surface after Principal, Location, Conversation, group policy, and authorization are known.
+
+Human GroupAssignments remain separate from Agent Operations Tasks.
+
+See `owner-group-operations.md`.
 
 ## Learning model
 
