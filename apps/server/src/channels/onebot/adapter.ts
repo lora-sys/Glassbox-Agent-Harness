@@ -49,6 +49,17 @@ interface PendingRequest {
   socket: WebSocket;
 }
 
+const QQ_DIRECT_TEXT_LIMIT = 3_500;
+const QQ_FORWARD_NODE_LIMIT = 1_800;
+
+function splitForwardText(text: string): string[] {
+  const characters = Array.from(text);
+  const chunks: string[] = [];
+  for (let offset = 0; offset < characters.length; offset += QQ_FORWARD_NODE_LIMIT)
+    chunks.push(characters.slice(offset, offset + QQ_FORWARD_NODE_LIMIT).join(""));
+  return chunks;
+}
+
 export class OneBotConnectionError extends Error {
   constructor(readonly code: NonNullable<OneBotState["reason"]> | "stopped") {
     super(`OneBot connection ${code}`);
@@ -208,13 +219,40 @@ export class OneBotAdapter {
       input.deliveryId.length > 128 ||
       typeof input.text !== "string" ||
       !input.text.trim() ||
-      input.text.length > 16_000 ||
+      input.text.length > 64_000 ||
       (input.replyTo !== undefined && replyTo === undefined)
     )
       return { status: "failed", code: "invalid_message" };
     const socket = this.#socket;
     if (this.#state.status !== "ready" || !socket)
       return { status: "failed", code: "not_connected" };
+    if (Array.from(input.text).length > QQ_DIRECT_TEXT_LIMIT) {
+      const messages = splitForwardText(input.text).map((text) => ({
+        type: "node",
+        data: {
+          user_id: Number(this.config.botId),
+          nickname: this.config.label.slice(0, 64),
+          content: [{ type: "text", data: { text } }],
+        },
+      }));
+      const result = await this.#request(
+        socket,
+        target.chatType === "private" ? "send_private_forward_msg" : "send_group_forward_msg",
+        {
+          ...(target.chatType === "private"
+            ? { user_id: Number(target.chatId) }
+            : { group_id: Number(target.chatId) }),
+          messages,
+        },
+      );
+      if (result.status !== "ok") return result;
+      const sentId = messageId(object(result.data)?.message_id);
+      const resourceId = object(result.data)?.res_id;
+      if (sentId !== undefined) return { status: "confirmed", messageId: `forward:${sentId}` };
+      return typeof resourceId === "string" && resourceId.length > 0 && resourceId.length <= 384
+        ? { status: "confirmed", messageId: `forward-res:${resourceId}` }
+        : { status: "unknown", code: "invalid_response" };
+    }
     const message = [
       ...(replyTo === undefined ? [] : [{ type: "reply", data: { id: replyTo } }]),
       { type: "text", data: { text: input.text } },

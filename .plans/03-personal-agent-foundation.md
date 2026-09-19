@@ -1,6 +1,6 @@
 # Plan 03 — QQ Personal Agent Closed Loop
 
-Status: ACTIVE
+Status: COMPLETE (2026-09-19)
 
 This is the only active implementation plan in the repository.
 
@@ -164,7 +164,8 @@ Pi + Skills compatibility locks
 
 `lora-sys/skills` remains the canonical Skill source repository.
 
-A Lora PI Kit release bundles a pinned Skill snapshot for reproducibility.
+A Lora PI Kit release bundles all structurally valid owned Skills at one pinned
+`lora-sys/skills` commit for reproducibility.
 
 ```text
 canonical source
@@ -176,7 +177,9 @@ one Kit release
 
 Bundled does not mean every Skill is active on every task.
 
-Profiles and task-level selection narrow the runtime set.
+Profiles narrow the runtime set. Glassbox may narrow it again with a durable authorized
+location policy. QQ groups keep a strict group allowlist and a separate per-group Skill
+whitelist.
 
 Lora PI Kit may provide MCP through a Pi Extension / Package layer because MCP is runtime integration behavior. It must not expose every configured MCP server on every profile.
 
@@ -870,6 +873,9 @@ Plan 03 is complete only when all are true:
 - unauthorized protected data stays out of model-visible Context.
 - protected Tool / Ops execution re-authorizes immediately before execution.
 - remote profiles expose a narrow Tool / MCP surface.
+- Pi sees only Skill names and descriptions selected for the current Run and reads locked
+  Skill files through an execution-time authorization check.
+- an Owner-private action can inspect and change a permitted group's Skill whitelist.
 - unrestricted remote shell is unavailable.
 - Delivery checks the real audience.
 - Owner-private data cannot leak into a group merely because the Owner asked for it.
@@ -902,6 +908,9 @@ Plan 03 is complete only when all are true:
 - non-activated group messages do not create Agent Runs.
 - duplicate / replayed OneBot events do not create duplicate replies.
 - NapCat reconnect does not replay completed work into duplicate output.
+- long QQ results use bounded merged-forward nodes and preserve the full authorized result.
+- the service launcher uses a stable data directory outside temporary worktrees and keeps
+  verified running processes when called again.
 
 ### Evidence / security
 
@@ -911,3 +920,14 @@ Plan 03 is complete only when all are true:
 - existing Codex and Claude Code paths retain focused regression coverage.
 
 When this gate passes, Glassbox has its first usable Personal Agent product loop plus the minimal multi-worker operations foundation. P4 then begins the Feedback → Taste → Memory → Authorized Retrieval layer instead of rebuilding P3.
+
+## Completion evidence
+
+- The deterministic backend suite passes 649 tests with 1 explicitly skipped external fixture.
+- Real Owner private chat, Visitor private chat and shared group chat use distinct Principals and durable Conversations.
+- Real Pi Runs load the pinned Lora PI Kit. A group Run loaded only its two authorized Skills and read one Skill through an execution-time authorization check.
+- A real Owner-private Tool inspected and changed the test group's durable Skill whitelist.
+- A real Pi Worker delegated through Herdr reached REVIEW, created a new TaskAttempt after Rework, returned to REVIEW and reached DONE only after Accept.
+- Glassbox restart and Herdr snapshot reconciliation retained durable state and resolved the recovered session alert without rewriting Task history.
+- A forced private-network response created no QQ Delivery, produced digest-only blocking evidence and was excluded from later Context.
+- Duplicate ingress, restart, authorization, audience isolation, canary, long merged-forward delivery and reconciliation paths have deterministic coverage. Real QQ delivery, restart and merged-forward transport were also exercised against the dedicated acceptance environment.

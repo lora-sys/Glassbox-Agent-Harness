@@ -84,8 +84,8 @@ describe("Pi required Tool execution", () => {
         text: "群权限已启用。",
         toolCalls: [
           {
-            name: "owner_group_set_access",
-            input: { groupId: "1126022432", enabled: true },
+            name: "owner_group_admin",
+            input: { action: "set_access", groupId: "1126022432", enabled: true },
             result: { groupId: "1126022432", enabled: true },
             failed: false,
           },
@@ -97,7 +97,15 @@ describe("Pi required Tool execution", () => {
       text: "群权限已启用。",
     });
     expect(f.run).toHaveBeenCalledTimes(2);
-    expect(f.run.mock.calls[1]?.[2]).toContain("owner_group_set_access");
+    expect(f.run.mock.calls[1]?.[2]).toContain("owner_group_admin");
+    expect(f.run.mock.calls[1]?.[2]).toContain(
+      '{"action":"set_access","groupId":"1126022432","enabled":true}',
+    );
+    expect(f.run.mock.calls[1]?.[3]?.requiredToolInput).toEqual({
+      action: "set_access",
+      groupId: "1126022432",
+      enabled: true,
+    });
     expect(f.disposeSession).toHaveBeenCalledOnce();
   });
 
@@ -112,6 +120,53 @@ describe("Pi required Tool execution", () => {
     });
     expect(f.run).toHaveBeenCalledTimes(2);
     expect(f.disposeSession).toHaveBeenCalledOnce();
+  });
+
+  it("rejects a successful call whose group operation does not match the request", async () => {
+    const wrongCall = {
+      status: "completed" as const,
+      text: "已执行",
+      toolCalls: [
+        {
+          name: "owner_group_admin",
+          input: {
+            action: "set_skill",
+            groupId: "1126022432",
+            skillName: "unslop",
+            enabled: true,
+          },
+          failed: false,
+        },
+      ],
+    };
+    const f = fixture([wrongCall, wrongCall]);
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "failed",
+      text: "请求的操作未执行，请稍后重试。",
+    });
+    expect(f.run).toHaveBeenCalledTimes(2);
+  });
+
+  it("requires a real read call for a question about the current group Skill policy", async () => {
+    const f = fixture([
+      {
+        status: "completed",
+        text: "当前启用 unslop。",
+        toolCalls: [
+          {
+            name: "owner_group_admin",
+            input: { action: "get", groupId: "1126022432" },
+            failed: false,
+          },
+        ],
+      },
+    ]);
+    f.input.text = "群 1126022432 当前有哪些技能？";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "succeeded",
+      text: "当前启用 unslop。",
+    });
+    expect(f.run).toHaveBeenCalledOnce();
   });
 
   it("does not turn a question about group access into a required action", async () => {

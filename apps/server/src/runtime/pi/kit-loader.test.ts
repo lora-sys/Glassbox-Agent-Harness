@@ -39,18 +39,23 @@ it("records selected resource fingerprints and rejects a modified locked Skill",
   profile.enabledSkills = ["fixture"];
   await writeFile(profilePath, JSON.stringify(profile));
   await mkdir(join(directory, "skills/fixture"), { recursive: true });
-  const content = "Fixture Skill";
+  const content =
+    "---\nname: fixture\ndescription: A test Skill body marker.\n---\n\nPRIVATE_SKILL_BODY";
   await writeFile(join(directory, "skills/fixture/SKILL.md"), content);
   await writeFile(
     join(directory, "locks/skills.lock.json"),
     JSON.stringify({
       sourceCommit: "1".repeat(40),
+      includedSkills: ["fixture"],
       skills: {
         fixture: {
+          name: "fixture",
+          description: "A test Skill body marker.",
           files: [
             {
               path: "skills/fixture/SKILL.md",
               sha256: createHash("sha256").update(content).digest("hex"),
+              bytes: Buffer.byteLength(content),
             },
           ],
         },
@@ -60,8 +65,17 @@ it("records selected resource fingerprints and rejects a modified locked Skill",
   expect(loader.runtimeEvidence("test")).toMatchObject({
     profileName: "test",
     skillsCommit: "1".repeat(40),
-    fingerprints: { "skills/fixture/SKILL.md": expect.stringMatching(/^[a-f0-9]{64}$/u) },
+    enabledSkills: ["fixture"],
+    skillFingerprints: { fixture: expect.stringMatching(/^[a-f0-9]{64}$/u) },
   });
+  const prompt = loader.modelPrompt("test");
+  expect(prompt).toContain("fixture: A test Skill body marker.");
+  expect(prompt).toContain("skill_read");
+  expect(prompt).not.toContain("PRIVATE_SKILL_BODY");
+  expect(loader.readSkillFile("fixture")).toContain("PRIVATE_SKILL_BODY");
+  expect(() => loader.readSkillFile("fixture", "../private.txt")).toThrow(
+    "Invalid Skill file path",
+  );
   await writeFile(join(directory, "skills/fixture/SKILL.md"), "Changed content");
   expect(() => loader.runtimeEvidence("test")).toThrow("differs from its lock");
 });

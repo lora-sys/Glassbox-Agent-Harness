@@ -32,6 +32,8 @@ interface ActiveSession {
   binding: PiSessionBinding;
   runtimeEvidence: Record<string, unknown>;
   authorizedToolNames: readonly string[];
+  authorizedSkillNames: readonly string[];
+  skillPolicy: Record<string, unknown>;
 }
 
 export interface PiSdkRuntimeOptions {
@@ -43,6 +45,10 @@ export interface PiSdkRuntimeOptions {
   resolveModel?: () => Promise<{ model: Model<any>; modelRuntime: ModelRuntime }>;
   customTools?: ToolDefinition[];
   createTools?: (getContext: () => PiRunContext | undefined) => ToolDefinition[];
+  resolveSkillNames?: (
+    context: PiRunContext,
+    profile: ResolvedKitProfile,
+  ) => Promise<{ names: readonly string[]; policy?: Record<string, unknown> }>;
   resolveToolNames?: (context: PiRunContext) => Promise<readonly string[]>;
   onEvent?: (event: PiNormalizedEvent) => void | Promise<void>;
   createSession?: (params: {
@@ -64,6 +70,38 @@ function textFromContent(content: unknown): string {
     .filter((part) => part.type === "text" && typeof part.text === "string")
     .map((part) => part.text)
     .join("");
+}
+
+function safeToolInput(toolName: string, args: unknown): Record<string, unknown> | undefined {
+  if (toolName !== "owner_group_admin" || !args || typeof args !== "object") return undefined;
+  const input = args as Record<string, unknown>;
+  return {
+    ...(typeof input.action === "string" && /^[a-z_]{1,32}$/u.test(input.action)
+      ? { action: input.action }
+      : {}),
+    ...(typeof input.groupId === "string" && /^[1-9]\d{0,15}$/u.test(input.groupId)
+      ? { groupId: input.groupId }
+      : {}),
+    ...(typeof input.skillName === "string" && /^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(input.skillName)
+      ? { skillName: input.skillName }
+      : {}),
+    ...(typeof input.enabled === "boolean" ? { enabled: input.enabled } : {}),
+  };
+}
+
+function safeToolFailureCode(result: unknown): string {
+  let text = "";
+  try {
+    const serialized = JSON.stringify(result);
+    text = typeof serialized === "string" ? serialized : "";
+  } catch {
+    return "tool_execution_failed";
+  }
+  if (text.includes("context_missing")) return "context_missing";
+  if (text.includes("Permission denied")) return "authorization_denied";
+  if (text.includes("protected_tool_failed")) return "protected_tool_failed";
+  if (/validation|schema|required|invalid|argument/iu.test(text)) return "input_validation_failed";
+  return "tool_execution_failed";
 }
 
 function normalizeEvent(
@@ -121,7 +159,8 @@ function normalizeEvent(
             : {}),
         },
       };
-    case "tool_execution_start":
+    case "tool_execution_start": {
+      const input = safeToolInput(event.toolName, event.args);
       return {
         type: "tool_call",
         sessionId,
@@ -129,8 +168,15 @@ function normalizeEvent(
         runId,
         principalId,
         toolCallId: event.toolCallId,
-        data: { runId, principalId, toolCallId: event.toolCallId, name: event.toolName },
+        data: {
+          runId,
+          principalId,
+          toolCallId: event.toolCallId,
+          name: event.toolName,
+          ...(input ? { input } : {}),
+        },
       };
+    }
     case "tool_execution_end":
       return {
         type: "tool_result",
@@ -145,6 +191,7 @@ function normalizeEvent(
           toolCallId: event.toolCallId,
           name: event.toolName,
           isError: event.isError,
+          ...(event.isError ? { failureCode: safeToolFailureCode(event.result) } : {}),
         },
       };
     case "message_update": {
@@ -200,7 +247,17 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
 
     const profile = this.loader.loadProfile(profileName);
     const config = this.loader.buildRuntimeConfig(profileName, this.options.runtimeBaseDir);
-    const runtimeEvidence = this.loader.runtimeEvidence(profileName);
+    const resolvedSkills =
+      context && this.options.resolveSkillNames
+        ? await this.options.resolveSkillNames(context, profile)
+        : { names: profile.enabledSkills, policy: { source: "kit-profile" } };
+    const authorizedSkillNames = [...new Set(resolvedSkills.names)];
+    if (context) {
+      context.authorizedSkillNames = authorizedSkillNames;
+      context.skillPolicy = structuredClone(resolvedSkills.policy ?? { source: "kit-profile" });
+    }
+    const effectiveProfile = { ...profile, enabledSkills: authorizedSkillNames };
+    const runtimeEvidence = this.loader.runtimeEvidence(profileName, authorizedSkillNames);
     const authorizedToolNames =
       context && this.options.resolveToolNames
         ? [...new Set(await this.options.resolveToolNames(context))]
@@ -211,11 +268,16 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
     const session = this.options.createSession
       ? await this.options.createSession({
           conversation,
-          profile,
+          profile: effectiveProfile,
           agentDir: config.agentDir,
           sessionDir,
         })
-      : await this.createRealSession(profile, config.agentDir, sessionDir, authorizedToolNames);
+      : await this.createRealSession(
+          effectiveProfile,
+          config.agentDir,
+          sessionDir,
+          authorizedToolNames,
+        );
     const now = new Date().toISOString();
     const binding: PiSessionBinding = {
       conversationId: conversation.id,
@@ -230,6 +292,8 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
       binding,
       runtimeEvidence,
       authorizedToolNames: authorizedToolNames ?? [],
+      authorizedSkillNames,
+      skillPolicy: structuredClone(resolvedSkills.policy ?? { source: "kit-profile" }),
     });
     return { ...binding };
   }
@@ -245,14 +309,16 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
     const settingsManager = SettingsManager.inMemory();
     if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/u.test(profile.promptTemplate))
       throw new Error("Invalid Kit prompt template");
-    const basePrompt = `${this.loader.modelPrompt(profile.name).trim()}\n\nReply in concise plain text suitable for QQ. Do not reveal host paths, internal service addresses, configuration names, or internal identifiers.`;
+    const basePrompt = `${this.loader.modelPrompt(profile.name, profile.enabledSkills).trim()}\n\nReply in concise plain text suitable for QQ. Do not reveal host paths, internal service addresses, configuration names, or internal identifiers.`;
     let runtimeSessionId: string | undefined;
     const promptForRun = () => {
-      const requiredToolName = runtimeSessionId
-        ? this.runContexts.get(runtimeSessionId)?.requiredToolName
-        : undefined;
+      const runContext = runtimeSessionId ? this.runContexts.get(runtimeSessionId) : undefined;
+      const requiredToolName = runContext?.requiredToolName;
+      const exactInput = runContext?.requiredToolInput
+        ? ` with exactly this JSON input: ${JSON.stringify(runContext.requiredToolInput)}`
+        : "";
       return requiredToolName
-        ? `${basePrompt}\n\nThe current Owner request requires the available ${requiredToolName} tool. Call it before reporting the action as completed. Do not ask for a second confirmation and never claim execution without a successful tool result.`
+        ? `${basePrompt}\n\nThe current Owner request requires the available ${requiredToolName} tool. Call it before reporting the action as completed${exactInput}. Do not ask for a second confirmation and never claim execution without a successful tool result.`
         : basePrompt;
     };
     // Standalone Kit MCP factories are configured separately. Glassbox exposes
@@ -366,6 +432,8 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
           conversationId: run.conversationId,
           runtime: active.runtimeEvidence,
           authorizedTools: active.authorizedToolNames,
+          authorizedSkills: active.authorizedSkillNames,
+          skillPolicy: active.skillPolicy,
         };
       }
       if (normalized && this.options.onEvent) {

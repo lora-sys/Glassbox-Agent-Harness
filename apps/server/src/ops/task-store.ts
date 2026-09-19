@@ -1165,6 +1165,16 @@ export class TaskStore {
     });
   }
 
+  async resolveGlobalAttentionByKind(kind: AttentionKind): Promise<void> {
+    const now = new Date().toISOString();
+    await this.db.transaction(async (tx) => {
+      await tx.execute({
+        sql: "UPDATE attention_items SET resolved_at = ? WHERE kind = ? AND task_id IS NULL AND task_attempt_id IS NULL AND resolved_at IS NULL",
+        args: [now, kind],
+      });
+    });
+  }
+
   async listAttentionItems(onlyUnresolved = true): Promise<AttentionItem[]> {
     return this.db.transaction(async (tx) => {
       const sql = onlyUnresolved

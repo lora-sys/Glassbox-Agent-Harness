@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import type { PiRuntimeProfileName, PiRuntimeConfig } from "./types.js";
 
 export const PINNED_KIT_REPO = "https://github.com/lora-sys/lora-pi-kit";
-export const PINNED_KIT_COMMIT = "870a025775f28e314eeef974aa09511802f3e3d2";
+export const PINNED_KIT_COMMIT = "d71e9d841e80b3370f043490e0f9f610ae487b79";
 export const PINNED_PI_VERSION = "0.85.1";
 
 export interface ResolvedKitProfile {
@@ -21,6 +21,18 @@ export interface ResolvedKitProfile {
     isolateSessionState: boolean;
     disposable?: boolean;
   };
+}
+
+interface SkillLockEntry {
+  path: string;
+  sha256: string;
+  bytes: number;
+}
+
+interface SkillLock {
+  sourceCommit: string;
+  includedSkills: string[];
+  skills: Record<string, { name: string; description: string; files: SkillLockEntry[] }>;
 }
 
 export class KitLoader {
@@ -44,9 +56,70 @@ export class KitLoader {
     return this.kitPath;
   }
 
-  /** Only locked, selected distribution content belongs in model context. */
-  public modelPrompt(profileName: PiRuntimeProfileName): string {
-    this.runtimeEvidence(profileName);
+  private skillLock(): SkillLock {
+    const value = JSON.parse(
+      fs.readFileSync(path.join(this.kitPath, "locks/skills.lock.json"), "utf8"),
+    ) as SkillLock;
+    if (
+      typeof value.sourceCommit !== "string" ||
+      !/^[a-f0-9]{40}$/u.test(value.sourceCommit) ||
+      !Array.isArray(value.includedSkills) ||
+      value.includedSkills.length > 256 ||
+      !value.skills ||
+      typeof value.skills !== "object"
+    )
+      throw new Error("Invalid Kit Skills lock");
+    const included = value.includedSkills;
+    if (
+      included.some(
+        (name) => typeof name !== "string" || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(name),
+      ) ||
+      new Set(included).size !== included.length
+    )
+      throw new Error("Invalid Kit Skills lock");
+    for (const name of included) {
+      const skill = value.skills[name];
+      if (
+        !skill ||
+        skill.name !== name ||
+        typeof skill.description !== "string" ||
+        !skill.description.trim() ||
+        !Array.isArray(skill.files) ||
+        skill.files.length === 0 ||
+        skill.files.some(
+          (file) =>
+            typeof file.path !== "string" ||
+            !file.path.startsWith(`skills/${name}/`) ||
+            !/^[a-f0-9]{64}$/u.test(file.sha256) ||
+            !Number.isSafeInteger(file.bytes) ||
+            file.bytes < 0 ||
+            file.bytes > 16 * 1024 * 1024,
+        )
+      )
+        throw new Error("Invalid Kit Skills lock");
+    }
+    return value;
+  }
+
+  public availableSkills(): Array<{ name: string; description: string }> {
+    const lock = this.skillLock();
+    return lock.includedSkills.map((name) => {
+      const skill = lock.skills[name];
+      if (
+        !skill ||
+        skill.name !== name ||
+        typeof skill.description !== "string" ||
+        !skill.description.trim()
+      )
+        throw new Error("Invalid locked Skill metadata");
+      return { name, description: skill.description };
+    });
+  }
+
+  /** Only names and descriptions enter the base prompt. Locked files are read on demand. */
+  public modelPrompt(profileName: PiRuntimeProfileName, enabledSkills?: readonly string[]): string {
+    const selected = enabledSkills ?? this.loadProfile(profileName).enabledSkills;
+    this.runtimeEvidence(profileName, selected);
     const profile = this.loadProfile(profileName);
     const read = (relative: string) => {
       const resolved = path.resolve(this.kitPath, relative);
@@ -60,13 +133,47 @@ export class KitLoader {
     };
     const prompt = read(`prompts/${profile.promptTemplate}.md`);
     if (!prompt) throw new Error("Kit base prompt is empty");
+    if (selected.length === 0) return `${prompt}\n\nNo Skills are available for this Run.`;
+    const catalog = new Map(this.availableSkills().map((skill) => [skill.name, skill.description]));
     return [
       prompt,
-      ...profile.enabledSkills.map((name) => {
-        if (!/^[a-zA-Z0-9_-]+$/u.test(name)) throw new Error("Invalid Kit Skill name");
-        return `Selected Skill: ${name}\n${read(`skills/${name}/SKILL.md`)}`;
-      }),
+      [
+        "Available Skills for this Run:",
+        ...selected.map((name) => {
+          const description = catalog.get(name);
+          if (!description) throw new Error("Kit Skill is not locked");
+          return `- ${name}: ${description}`;
+        }),
+        "Call skill_read before following a Skill. Only request files needed for the current task.",
+      ].join("\n"),
     ].join("\n\n");
+  }
+
+  public readSkillFile(skillName: string, relativePath = "SKILL.md"): string {
+    if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(skillName)) throw new Error("Invalid Skill name");
+    const normalized = relativePath.replace(/\\/gu, "/");
+    if (
+      !normalized ||
+      normalized.length > 256 ||
+      normalized.startsWith("/") ||
+      normalized.split("/").some((part) => !part || part === "." || part === "..")
+    )
+      throw new Error("Invalid Skill file path");
+    const lock = this.skillLock();
+    const entryPath = `skills/${skillName}/${normalized}`;
+    const entry = lock.skills[skillName]?.files.find((file) => file.path === entryPath);
+    if (!entry) throw new Error("Skill file is not locked");
+    const resolved = path.resolve(this.kitPath, entryPath);
+    const within = path.relative(path.join(this.kitPath, "skills", skillName), resolved);
+    if (!within || within.startsWith("..") || path.isAbsolute(within))
+      throw new Error("Skill file escapes locked directory");
+    const content = fs.readFileSync(resolved);
+    if (content.length !== entry.bytes) throw new Error("Kit Skill size differs from its lock");
+    if (content.length > 128 * 1024 || content.includes(0))
+      throw new Error("Skill file is not readable text");
+    const hash = createHash("sha256").update(content).digest("hex");
+    if (hash !== entry.sha256) throw new Error("Kit Skill content differs from its lock");
+    return content.toString("utf8");
   }
 
   public verifyCompatibility(runtimeVersion = PINNED_PI_VERSION): {
@@ -130,8 +237,12 @@ export class KitLoader {
     return resolved;
   }
 
-  public runtimeEvidence(profileName: PiRuntimeProfileName): Record<string, unknown> {
+  public runtimeEvidence(
+    profileName: PiRuntimeProfileName,
+    enabledSkills?: readonly string[],
+  ): Record<string, unknown> {
     const profile = this.loadProfile(profileName);
+    const selectedSkills = [...new Set(enabledSkills ?? profile.enabledSkills)];
     const files = [
       "locks/compatibility.json",
       "locks/pi.lock.json",
@@ -141,16 +252,12 @@ export class KitLoader {
     ];
     const fingerprints: Record<string, string> = {};
     let skillsCommit: string | undefined;
-    const expectedHashes = new Map<string, string>();
-    if (profile.enabledSkills.length > 0) {
-      const lock = JSON.parse(
-        fs.readFileSync(path.join(this.kitPath, "locks/skills.lock.json"), "utf8"),
-      );
-      if (typeof lock.sourceCommit !== "string" || !/^[a-f0-9]{40}$/u.test(lock.sourceCommit))
-        throw new Error("Kit Skills source pin missing");
+    const skillFingerprints: Record<string, string> = {};
+    if (selectedSkills.length > 0) {
+      const lock = this.skillLock();
       skillsCommit = lock.sourceCommit;
       files.push("locks/skills.lock.json");
-      for (const skill of profile.enabledSkills) {
+      for (const skill of selectedSkills) {
         const entries = lock.skills?.[skill]?.files;
         if (!Array.isArray(entries) || entries.length === 0)
           throw new Error("Kit Skill is not locked");
@@ -164,9 +271,20 @@ export class KitLoader {
             !/^[a-f0-9]{64}$/u.test(entry.sha256)
           )
             throw new Error("Invalid Kit Skill lock");
-          files.push(entry.path);
-          expectedHashes.set(entry.path, entry.sha256);
+          const resolved = path.resolve(this.kitPath, entry.path);
+          const relative = path.relative(this.kitPath, resolved);
+          if (relative.startsWith("..") || path.isAbsolute(relative))
+            throw new Error("Kit resource escapes package");
+          const actual = createHash("sha256").update(fs.readFileSync(resolved)).digest("hex");
+          if (actual !== entry.sha256) throw new Error("Kit Skill content differs from its lock");
         }
+        skillFingerprints[skill] = createHash("sha256")
+          .update(
+            entries
+              .map((entry: { path: string; sha256: string }) => `${entry.path}:${entry.sha256}`)
+              .join("\n"),
+          )
+          .digest("hex");
       }
     }
     for (const file of files) {
@@ -175,14 +293,14 @@ export class KitLoader {
       if (relative.startsWith("..") || path.isAbsolute(relative))
         throw new Error("Kit resource escapes package");
       fingerprints[file] = createHash("sha256").update(fs.readFileSync(resolved)).digest("hex");
-      if (expectedHashes.has(file) && expectedHashes.get(file) !== fingerprints[file])
-        throw new Error("Kit Skill content differs from its lock");
     }
     return {
       profileName,
       piVersion: PINNED_PI_VERSION,
       configuredKitCommit: PINNED_KIT_COMMIT,
       skillsCommit,
+      enabledSkills: selectedSkills,
+      skillFingerprints,
       fingerprints,
     };
   }

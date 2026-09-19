@@ -109,6 +109,9 @@ export class OpsReconciler {
       const matches = pane && (!binding.agentName || pane.agentName === binding.agentName);
       await this.store.observeWorker(binding, matches ? pane.state : "unknown");
     }
+    // A complete snapshot closes a previous session-level monitoring gap. Keep
+    // task-scoped dispatch failures until their Task is handled explicitly.
+    await this.store.resolveGlobalAttentionByKind("ops_connection_problem");
   }
 
   async handleEvent(event: HerdrEvent): Promise<void> {

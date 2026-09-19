@@ -2,6 +2,7 @@ import { join } from "node:path";
 import type { IncomingMessage } from "node:http";
 import { CHANNEL_SAFE_ERRORS, type PublicChannelProfile } from "@glassbox/contracts";
 import { ChannelProfileStore, ChannelConfigurationError } from "../config/channel-profiles.js";
+import { GroupRuntimeStore } from "../config/group-runtime.js";
 import type { ModelProfileStore } from "../config/model-profiles.js";
 import { ExecutorConfiguration, ExecutorBusyError } from "../config/executors.js";
 import {
@@ -15,14 +16,21 @@ import {
   type RunServiceEvent,
 } from "../execution/run-service/index.js";
 import { configuredModelAdapter } from "../execution/model-adapter.js";
-import { PiRunExecutionAdapter, PiSdkRuntimeAdapter } from "../runtime/pi/index.js";
+import { KitLoader, PiRunExecutionAdapter, PiSdkRuntimeAdapter } from "../runtime/pi/index.js";
 import { configuredPiModel } from "../runtime/pi/configured-model.js";
 import { createOpsTools, OPS_TOOL_NAMES, type WorkerTarget } from "../runtime/pi/ops-tools.js";
 import {
   createOwnerTools,
+  type OwnerGroupAdminInput,
   OWNER_CONTROL_RESOURCE,
-  OWNER_GROUP_ACCESS_TOOL,
+  OWNER_GROUP_ADMIN_TOOL,
 } from "../runtime/pi/owner-tools.js";
+import {
+  createSkillTools,
+  SKILL_CATALOG_RESOURCE,
+  SKILL_READ_ACTION,
+  SKILL_READ_TOOL,
+} from "../runtime/pi/skill-tools.js";
 import type { ProtectedToolContext } from "../runtime/pi/protected-tools.js";
 import { AuthorizedOpsService, type WorkerPolicy } from "../ops/service.js";
 import { OpsReconciler } from "../ops/reconciler.js";
@@ -72,12 +80,14 @@ function idFromInput(input: unknown): string {
 export class ManagementApplication {
   readonly store: DomainStore;
   readonly channels: ChannelProfileStore;
+  readonly groupRuntime: GroupRuntimeStore;
   readonly runs: RunService;
   readonly trace: RunTraceStore;
   readonly evaluator: ReturnType<typeof createRunEvaluator>;
   executors!: ExecutorConfiguration;
   private readonly connections = new Map<string, OneBotAdapter>();
   private readonly deliveryPolicy: ReturnType<typeof createQqDeliveryPolicy>;
+  private readonly kitLoader: KitLoader;
   private readonly states = new Map<
     string,
     Pick<PublicChannelProfile, "connectionState" | "lastError">
@@ -103,9 +113,12 @@ export class ManagementApplication {
     },
     store: DomainStore,
     channels: ChannelProfileStore,
+    groupRuntime: GroupRuntimeStore,
   ) {
     this.store = store;
     this.channels = channels;
+    this.groupRuntime = groupRuntime;
+    this.kitLoader = new KitLoader();
     this.deliveryPolicy = createQqDeliveryPolicy({
       forbiddenValues: () => [
         ...hostDeliveryForbiddenValues({
@@ -169,10 +182,11 @@ export class ManagementApplication {
     };
   }): Promise<ManagementApplication> {
     const channels = await ChannelProfileStore.open(options.dataDirectory);
+    const groupRuntime = await GroupRuntimeStore.open(options.dataDirectory);
     const store = await openDomainStore({
       databasePath: options.databasePath ?? join(options.dataDirectory, "glassbox.db"),
     });
-    const application = new ManagementApplication(options, store, channels);
+    const application = new ManagementApplication(options, store, channels, groupRuntime);
     try {
       application.executors = await ExecutorConfiguration.open({
         dataDirectory: options.dataDirectory,
@@ -212,6 +226,7 @@ export class ManagementApplication {
     const existing = this.piAdapters.get(profileId);
     if (existing) return existing;
     const runtime = new PiSdkRuntimeAdapter({
+      kitPath: this.kitLoader.getKitPath(),
       runtimeBaseDir: join(this.options.dataDirectory, "pi"),
       resolveModel: () => configuredPiModel(this.options.models, profileId),
       createTools: (getContext) => [
@@ -230,18 +245,43 @@ export class ManagementApplication {
         ...createOwnerTools({
           store: this.store,
           getContext,
-          setGroupAccess: (context, input) => this.setGroupAccess(context, input),
+          manageGroup: (context, input) => this.manageGroup(context, input),
+        }),
+        ...createSkillTools({
+          store: this.store,
+          loader: this.kitLoader,
+          getContext,
+          isSkillAuthorized: (context, skillName) => this.isSkillAuthorized(context, skillName),
         }),
       ],
+      resolveSkillNames: async (context, profile) => {
+        if (!context.caller) return { names: [], policy: { source: "no-caller" } };
+        if (context.caller.scope.chatType === "group") {
+          const configured = this.groupRuntime.get(
+            context.caller.scope.connectionId,
+            context.caller.scope.chatId,
+            this.kitLoader.loadProfile("qq-group").enabledSkills,
+          );
+          const available = new Set(this.kitLoader.availableSkills().map((skill) => skill.name));
+          return {
+            names: configured.enabledSkills.filter((name) => available.has(name)),
+            policy: {
+              source: "group-whitelist",
+              groupId: configured.groupId,
+              configVersion: configured.version,
+            },
+          };
+        }
+        return { names: profile.enabledSkills, policy: { source: "kit-profile" } };
+      },
       resolveToolNames: async (context) => {
-        if (
-          !context.caller ||
-          !context.conversationId ||
-          !context.runId ||
-          context.caller.scope.chatType !== "private"
-        )
-          return [];
-        const candidates = [...(this.options.ops ? OPS_TOOL_NAMES : []), OWNER_GROUP_ACCESS_TOOL];
+        if (!context.caller || !context.conversationId || !context.runId) return [];
+        const candidates = [
+          ...(context.authorizedSkillNames?.length ? [SKILL_READ_TOOL] : []),
+          ...(context.caller.principalId === OWNER_ID && context.caller.scope.chatType === "private"
+            ? [...(this.options.ops ? OPS_TOOL_NAMES : []), OWNER_GROUP_ADMIN_TOOL]
+            : []),
+        ];
         const selected: string[] = [];
         for (const name of candidates) {
           const decision = await this.store.authorization.check({
@@ -532,6 +572,33 @@ export class ManagementApplication {
           effect: "allow",
         });
     }
+    await this.store.authorization.registerResource({
+      id: SKILL_CATALOG_RESOURCE,
+      kind: "skill-catalog",
+      visibility: "public",
+      ifAbsent: true,
+    });
+    await this.store.authorization.grant({
+      principalId,
+      resourceId: SKILL_CATALOG_RESOURCE,
+      action: SKILL_READ_ACTION,
+      scope,
+      effect: "allow",
+    });
+    const skillToolResource = toolResourceId(SKILL_READ_TOOL);
+    await this.store.authorization.registerResource({
+      id: skillToolResource,
+      kind: "tool-definition",
+      visibility: "public",
+      ifAbsent: true,
+    });
+    await this.store.authorization.grant({
+      principalId,
+      resourceId: skillToolResource,
+      action: TOOL_DISCOVERY_ACTION,
+      scope,
+      effect: "allow",
+    });
     if (principalId === OWNER_ID && scope.chatType === "private") {
       await this.store.authorization.registerResource({
         id: OWNER_CONTROL_RESOURCE,
@@ -547,7 +614,7 @@ export class ManagementApplication {
         scope,
         effect: "allow",
       });
-      for (const name of [...(this.options.ops ? OPS_TOOL_NAMES : []), OWNER_GROUP_ACCESS_TOOL]) {
+      for (const name of [...(this.options.ops ? OPS_TOOL_NAMES : []), OWNER_GROUP_ADMIN_TOOL]) {
         const resourceId = toolResourceId(name);
         await this.store.authorization.registerResource({
           id: resourceId,
@@ -570,7 +637,7 @@ export class ManagementApplication {
   private async setGroupAccess(
     context: ProtectedToolContext,
     input: { groupId: string; enabled: boolean },
-  ): Promise<{ groupId: string; enabled: boolean }> {
+  ): Promise<{ groupId: string; enabled: boolean; enabledSkills: string[]; version: number }> {
     return this.serialize(async () => {
       const caller = context.caller;
       if (caller.principalId !== OWNER_ID || caller.scope.chatType !== "private")
@@ -596,11 +663,12 @@ export class ManagementApplication {
             scope.senderId === configured.config.ownerId
               ? OWNER_ID
               : `qq-visitor-${scope.senderId}`;
-          await this.store.authorization.revokeScope({
-            principalId,
-            resourceId: agentResourceId(AGENT_ID),
-            scope,
-          });
+          for (const resourceId of [
+            agentResourceId(AGENT_ID),
+            SKILL_CATALOG_RESOURCE,
+            toolResourceId(SKILL_READ_TOOL),
+          ])
+            await this.store.authorization.revokeScope({ principalId, resourceId, scope });
         }
       }
       const profile = await this.channels.setGroupEnabled(
@@ -632,8 +700,107 @@ export class ManagementApplication {
       );
       await this.store.evidence.advanceTrace(caller, cursor);
       this.runs.refresh();
-      return { groupId: input.groupId, enabled: input.enabled };
+      const runtime = this.groupRuntime.get(
+        caller.scope.connectionId,
+        input.groupId,
+        this.kitLoader.loadProfile("qq-group").enabledSkills,
+      );
+      return {
+        groupId: input.groupId,
+        enabled: input.enabled,
+        enabledSkills: runtime.enabledSkills,
+        version: runtime.version,
+      };
     });
+  }
+
+  private async manageGroup(
+    context: ProtectedToolContext,
+    input: OwnerGroupAdminInput,
+  ): Promise<unknown> {
+    const caller = context.caller;
+    if (caller.principalId !== OWNER_ID || caller.scope.chatType !== "private")
+      throw new Error("owner_private_required");
+    if (input.action === "set_access") return this.setGroupAccess(context, input);
+    if (input.action === "set_skill") return this.setGroupSkill(context, input);
+    const configured = this.channels.resolve(caller.scope.connectionId);
+    const runtime = this.groupRuntime.get(
+      caller.scope.connectionId,
+      input.groupId,
+      this.kitLoader.loadProfile("qq-group").enabledSkills,
+    );
+    return {
+      groupId: input.groupId,
+      enabled: configured.config.groupIds.includes(input.groupId),
+      enabledSkills: runtime.enabledSkills,
+      availableSkills: this.kitLoader.availableSkills().map((skill) => skill.name),
+      version: runtime.version,
+    };
+  }
+
+  private async setGroupSkill(
+    context: ProtectedToolContext,
+    input: Extract<OwnerGroupAdminInput, { action: "set_skill" }>,
+  ): Promise<unknown> {
+    return this.serialize(async () => {
+      const caller = context.caller;
+      if (caller.principalId !== OWNER_ID || caller.scope.chatType !== "private")
+        throw new Error("owner_private_required");
+      const configured = this.channels.resolve(caller.scope.connectionId);
+      if (!configured.config.groupIds.includes(input.groupId)) throw new Error("group_not_enabled");
+      const availableSkills = this.kitLoader.availableSkills().map((skill) => skill.name);
+      const profile = await this.groupRuntime.setSkillEnabled({
+        connectionId: caller.scope.connectionId,
+        groupId: input.groupId,
+        skillName: input.skillName,
+        enabled: input.enabled,
+        availableSkills,
+        defaultSkills: this.kitLoader.loadProfile("qq-group").enabledSkills,
+        principalId: caller.principalId,
+      });
+      const cursor = await this.trace.append(
+        context.runId,
+        {
+          type: "group_skill_changed",
+          runId: context.runId,
+          principalId: caller.principalId,
+          connectionId: caller.scope.connectionId,
+          groupId: input.groupId,
+          skillName: input.skillName,
+          enabled: input.enabled,
+          configVersion: profile.version,
+          enabledSkills: profile.enabledSkills,
+        },
+        "glassbox-owner-control",
+      );
+      await this.store.evidence.advanceTrace(caller, cursor);
+      return {
+        groupId: input.groupId,
+        skillName: input.skillName,
+        enabled: input.enabled,
+        enabledSkills: profile.enabledSkills,
+        version: profile.version,
+      };
+    });
+  }
+
+  private async isSkillAuthorized(
+    context: ProtectedToolContext,
+    skillName: string,
+  ): Promise<boolean> {
+    const available = new Set(this.kitLoader.availableSkills().map((skill) => skill.name));
+    if (!available.has(skillName)) return false;
+    if (context.caller.scope.chatType === "private")
+      return this.kitLoader.loadProfile("main-agent").enabledSkills.includes(skillName);
+    const configured = this.channels.resolve(context.caller.scope.connectionId);
+    if (!configured.config.groupIds.includes(context.caller.scope.chatId)) return false;
+    return this.groupRuntime
+      .get(
+        context.caller.scope.connectionId,
+        context.caller.scope.chatId,
+        this.kitLoader.loadProfile("qq-group").enabledSkills,
+      )
+      .enabledSkills.includes(skillName);
   }
 
   disconnectChannel(id: string): Promise<PublicChannelProfile> {

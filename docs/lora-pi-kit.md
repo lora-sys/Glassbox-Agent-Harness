@@ -147,7 +147,9 @@ Names may move when implementation starts. The ownership and release semantics b
 
 `lora-sys/skills` remains the canonical source repository for Lora Skills.
 
-Lora PI Kit releases bundle a pinned snapshot of the Skills selected for that release.
+Lora PI Kit releases bundle every structurally valid owned Skill found at the pinned
+`lora-sys/skills` commit. A rejected Skill remains outside the bundle and appears in the
+lock with its source path and rejection reason.
 
 ```text
 lora-sys/skills
@@ -180,13 +182,15 @@ Do not fetch `lora-sys/skills@main` dynamically every time Pi starts.
 
 A Kit version must produce the same Skill payload on a laptop, test environment, and Linux server.
 
-`skills.lock.json` should record at least:
+`skills.lock.json` records:
 
 ```text
 source repository
 source commit
 included Skill names
 optional per-Skill version / license metadata when needed
+per-file byte count and SHA-256 digest
+excluded Skill source paths and reasons
 ```
 
 ### Bundled does not mean always loaded
@@ -195,14 +199,20 @@ The release may contain many Skills.
 
 That does not mean every Skill should be injected into every task.
 
-Profiles, task selection, and Pi resource filtering determine what is active.
+Profiles and Glassbox policy determine what is active.
 
 ```text
 Kit contains capability set
 → profile narrows default active set
-→ task/runtime may narrow further
-→ Pi loads only relevant Skills
+→ Glassbox narrows it for the authorized location
+→ Pi sees names and descriptions only
+→ skill_read loads locked files on demand
 ```
+
+The main-Agent profile selects the full validated catalog. The QQ-group profile supplies a
+small default. Each allowed QQ group has a durable whitelist overlay controlled through an
+Owner-private action. A Skill that is bundled but absent from the current Run whitelist is
+not shown to Pi and cannot be read through the Skill Tool.
 
 ## MCP
 

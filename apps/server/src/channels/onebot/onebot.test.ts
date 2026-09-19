@@ -407,6 +407,39 @@ describe("OneBot forward WebSocket", () => {
       (await fake.actions.next((action) => action.action === "send_private_msg")).params,
     ).toMatchObject({ user_id: 10002 });
   });
+  it("delivers a long result as one bounded merged-forward message without truncation", async () => {
+    const fake = await server();
+    const { adapter } = client(fake.endpoint);
+    await adapter.start();
+    const text = "调研结果。".repeat(1_200);
+    expect(await adapter.send({ deliveryId: "long-result", target: groupScope, text })).toEqual({
+      status: "confirmed",
+      messageId: "forward:321",
+    });
+    const sent = await fake.actions.next((action) => action.action === "send_group_forward_msg");
+    expect(sent.params.group_id).toBe(10003);
+    const nodes = sent.params.messages as Array<{
+      type: string;
+      data: { user_id: number; nickname: string; content: Array<{ data: { text?: string } }> };
+    }>;
+    expect(nodes.length).toBeGreaterThan(1);
+    expect(nodes.every((node) => node.type === "node" && node.data.user_id === 10001)).toBe(true);
+    expect(
+      nodes
+        .flatMap((node) => node.data.content)
+        .map((part) => part.data.text ?? "")
+        .join(""),
+    ).toBe(text);
+    const privateTarget = { ...groupScope, chatType: "private" as const, chatId: base.ownerId };
+    expect(
+      await adapter.send({ deliveryId: "long-private-result", target: privateTarget, text }),
+    ).toEqual({ status: "confirmed", messageId: "forward:321" });
+    const privateSent = await fake.actions.next(
+      (action) => action.action === "send_private_forward_msg",
+    );
+    expect(privateSent.params.user_id).toBe(10002);
+    expect(privateSent.params).not.toHaveProperty("group_id");
+  });
   it("replies privately to the Visitor and rejects cross-account private destinations", async () => {
     const fake = await server();
     const { adapter } = client(fake.endpoint);
