@@ -328,6 +328,22 @@ send a final authorized response
 
 Do not force every user message to become a durable Task.
 
+## Human group assignments are separate
+
+A human learning or check-in assignment for group participants is not an Agent Operations Task.
+
+```text
+Task
+  work performed by the Personal Agent or delegated Worker
+
+GroupAssignment
+  work assigned to human group participants
+```
+
+Do not reuse TaskAttempt or WorkerBinding to track human completion.
+
+The planned group assignment, reminder, schedule, and report model is defined in `docs/owner-group-operations.md`.
+
 ## Deployment invariant
 
 Development happens locally, but the production target is a server.
