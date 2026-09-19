@@ -4,7 +4,7 @@ This directory contains the active implementation plan and durable technical fin
 
 ## Active plan
 
-`03-plus-owner-group-utility.md` is the active fast-follow plan after the completed P3 foundation.
+`03-plus-owner-control-smoke.md` is the active fast-follow plan after the completed P3 foundation.
 
 Its goal is intentionally small:
 
@@ -15,17 +15,17 @@ per-Run Tool surface
   ↓
 Owner private control
   ↓
-one test-group learning check-in loop
+one real test-group smoke check
 ```
 
-P3+ does not implement Memory, Taste, cross-group learning, generic Tool generation, automatic reminders, or weekly reports.
+P3+ adds no learning assignment, scheduler, Memory, Taste, reminder, report, Tool Registry, or Tool generation work. After the smoke gate passes, implementation returns to P4.
 
 Plan 03 remains the completed foundation and historical acceptance contract.
 
 ## Read order for implementation
 
 1. `../AGENTS.md`
-2. `03-plus-owner-group-utility.md`
+2. `03-plus-owner-control-smoke.md`
 3. only the relevant files under `findings/`
 4. the relevant upstream source or documentation
 5. current production code and focused tests
