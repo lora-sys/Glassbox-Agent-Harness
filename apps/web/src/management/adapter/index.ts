@@ -62,6 +62,14 @@ import {
   validateChannelsResponse,
   validateExecutorsResponse,
   validateWsTicketResponse,
+  validateConversationsResponse,
+  validateTasksResponse,
+  validatePrincipalsResponse,
+  validateRunsResponse,
+  validateTraceEventsResponse,
+  validatePermissionRulesResponse,
+  validateMonitorTelemetryResponse,
+  validateSettingsResponse,
 } from './validators';
 
 export type DataSourceKind = 'fixture' | 'api';
@@ -117,7 +125,11 @@ export function setManagementToken(token: string | null, persist = false): void 
   try {
     if (token && isValidManagementToken(token)) {
       sessionStorage.setItem(TOKEN_STORAGE_KEY, token);
-      if (persist) localStorage.setItem(TOKEN_STORAGE_KEY, token);
+      if (persist) {
+        localStorage.setItem(TOKEN_STORAGE_KEY, token);
+      } else {
+        localStorage.removeItem(TOKEN_STORAGE_KEY);
+      }
     } else {
       sessionStorage.removeItem(TOKEN_STORAGE_KEY);
       localStorage.removeItem(TOKEN_STORAGE_KEY);
@@ -125,6 +137,10 @@ export function setManagementToken(token: string | null, persist = false): void 
   } catch {
     // Ignore storage quota or access errors
   }
+}
+
+export function clearManagementToken(): void {
+  setManagementToken(null);
 }
 
 // ============================================================================
@@ -279,15 +295,8 @@ export class HttpApiAdapter implements ManagementAdapter {
 
   async getPiModels(): Promise<AdapterResult<PiModelDesignProjection[]>> {
     const res = await this.fetchManage('models', { method: 'GET' }, validateModelsResponse);
-    const models = res.data.profiles.map((p, idx) =>
-      mapModelProfileToDesignProjection(p, {
-        isDefault: idx === 0,
-        contextWindowTokens: 128000,
-        temperature: 0.7,
-        tokensToday: 0,
-        costStatus: 'unpriced',
-        costTodayUsd: null,
-      }),
+    const models = res.data.profiles.map((p) =>
+      mapModelProfileToDesignProjection(p),
     );
     return {
       data: models,
@@ -347,32 +356,32 @@ export class HttpApiAdapter implements ManagementAdapter {
   // --- Projections Built from Canonical Endpoints ---
 
   async getOverview(): Promise<AdapterResult<OverviewDesignProjection>> {
-    // In live mode, synthesize overview from real status, models, and channels
-    const [statusRes, modelsRes, channelsRes] = await Promise.all([
+    // In live mode, synthesize overview from real status and models
+    const [statusRes, modelsRes] = await Promise.all([
       this.getStatus(),
       this.getPiModels(),
-      this.getChannels(),
     ]);
 
     const projection: OverviewDesignProjection = {
       summary: {
-        activeConversations: 0,
-        pendingAttentionCount: 0,
-        runningTasksCount: 0,
-        todayTotalTokens: 0,
+        runs24h: null,
+        activeConversations: null,
+        pendingAttentionCount: null,
+        runningTasksCount: null,
+        todayTotalTokens: null,
         todayCostUsd: null,
-        todayCostStatus: 'unpriced',
+        todayCostStatus: 'unknown',
       },
       attentionQueue: [],
       currentRun: null,
       piModelUsage: modelsRes.data.map((m) => ({
         modelId: m.id,
         modelName: m.name,
-        callsToday: 0,
-        tokensToday: 0,
+        callsToday: null,
+        tokensToday: null,
         costUsd: null,
-        costStatus: 'unpriced',
-        p95LatencyMs: 0,
+        costStatus: 'unknown',
+        p95LatencyMs: null,
       })),
       usageTrend: [],
     };
@@ -387,39 +396,53 @@ export class HttpApiAdapter implements ManagementAdapter {
   // --- Absent Domains: Fail-Closed without Silent Fallback ---
 
   async getConversations(): Promise<AdapterResult<ConversationDesignProjection[]>> {
-    return this.fetchManage('conversations', { method: 'GET' });
+    return this.fetchManage('conversations', { method: 'GET' }, validateConversationsResponse);
   }
 
   async getTasks(): Promise<AdapterResult<TaskDesignProjection[]>> {
-    return this.fetchManage('tasks', { method: 'GET' });
+    return this.fetchManage('tasks', { method: 'GET' }, validateTasksResponse);
   }
 
   async getPrincipals(): Promise<AdapterResult<PrincipalDesignProjection[]>> {
-    return this.fetchManage('principals', { method: 'GET' });
+    return this.fetchManage('principals', { method: 'GET' }, validatePrincipalsResponse);
   }
 
   async getRuns(): Promise<AdapterResult<RunDesignProjection[]>> {
-    return this.fetchManage('runs', { method: 'GET' });
+    return this.fetchManage('runs', { method: 'GET' }, validateRunsResponse);
   }
 
   async getTraceRuns(): Promise<AdapterResult<TraceRunDesignSummary[]>> {
-    return this.fetchManage('runs', { method: 'GET' });
+    const runsRes = await this.getRuns();
+    const summaries: TraceRunDesignSummary[] = runsRes.data.map((r) => ({
+      runId: r.id,
+      conversationId: r.conversationId,
+      model: r.modelId,
+      eventCount: null,
+      status: r.status,
+      durationMs: r.durationMs,
+      timestamp: r.startedAt,
+    }));
+    return {
+      data: summaries,
+      source: 'api',
+      fetchedAt: runsRes.fetchedAt,
+    };
   }
 
   async getTraceEvents(runId: string): Promise<AdapterResult<TraceEventDesignProjection[]>> {
-    return this.fetchManage(`runs/${encodeURIComponent(runId)}/trace`, { method: 'GET' });
+    return this.fetchManage(`runs/${encodeURIComponent(runId)}/trace`, { method: 'GET' }, validateTraceEventsResponse);
   }
 
   async getPermissionRules(): Promise<AdapterResult<PermissionRuleDesignProjection[]>> {
-    return this.fetchManage('permissions/rules', { method: 'GET' });
+    return this.fetchManage('permissions/rules', { method: 'GET' }, validatePermissionRulesResponse);
   }
 
   async getMonitorTelemetry(): Promise<AdapterResult<MonitorTelemetryDesignProjection[]>> {
-    return this.fetchManage('monitor/telemetry', { method: 'GET' });
+    return this.fetchManage('monitor/telemetry', { method: 'GET' }, validateMonitorTelemetryResponse);
   }
 
   async getSettings(): Promise<AdapterResult<SettingsDesignProjection>> {
-    return this.fetchManage('settings', { method: 'GET' });
+    return this.fetchManage('settings', { method: 'GET' }, validateSettingsResponse);
   }
 
   async evaluateDecision(_input: DecisionTesterInput): Promise<DecisionTesterDesignResult> {
@@ -481,16 +504,26 @@ export function useManagementData(): ManagementDataContextValue {
 }
 
 // ============================================================================
-// Query Hooks with Mode-Partitioned Query Keys
+// Query Hooks with Mode- and Auth-Partitioned Query Keys
 // ============================================================================
+
+function getAuthScope(token: string | null, mode: ManagementMode): string {
+  if (mode !== 'live' || !token) return 'public';
+  let hash = 0;
+  for (let i = 0; i < token.length; i++) {
+    hash = ((hash << 5) - hash + token.charCodeAt(i)) | 0;
+  }
+  return `scope_${Math.abs(hash)}`;
+}
 
 export function useManagementOverview(modeOverride?: ManagementMode) {
   const ctx = useManagementData();
   const effectiveMode = modeOverride || ctx.mode;
   const adapter = modeOverride ? getActiveAdapter(modeOverride, ctx.token) : ctx.adapter;
+  const authScope = getAuthScope(ctx.token, effectiveMode);
 
   return useQuery({
-    queryKey: ['management', 'overview', effectiveMode],
+    queryKey: ['management', 'overview', effectiveMode, authScope],
     queryFn: () => adapter.getOverview(),
     retry: effectiveMode === 'live' ? false : undefined,
   });
@@ -500,9 +533,10 @@ export function useManagementConversations(modeOverride?: ManagementMode) {
   const ctx = useManagementData();
   const effectiveMode = modeOverride || ctx.mode;
   const adapter = modeOverride ? getActiveAdapter(modeOverride, ctx.token) : ctx.adapter;
+  const authScope = getAuthScope(ctx.token, effectiveMode);
 
   return useQuery({
-    queryKey: ['management', 'conversations', effectiveMode],
+    queryKey: ['management', 'conversations', effectiveMode, authScope],
     queryFn: () => adapter.getConversations(),
     retry: effectiveMode === 'live' ? false : undefined,
   });
@@ -512,9 +546,10 @@ export function useManagementTasks(modeOverride?: ManagementMode) {
   const ctx = useManagementData();
   const effectiveMode = modeOverride || ctx.mode;
   const adapter = modeOverride ? getActiveAdapter(modeOverride, ctx.token) : ctx.adapter;
+  const authScope = getAuthScope(ctx.token, effectiveMode);
 
   return useQuery({
-    queryKey: ['management', 'tasks', effectiveMode],
+    queryKey: ['management', 'tasks', effectiveMode, authScope],
     queryFn: () => adapter.getTasks(),
     retry: effectiveMode === 'live' ? false : undefined,
   });
@@ -524,9 +559,10 @@ export function useManagementPrincipals(modeOverride?: ManagementMode) {
   const ctx = useManagementData();
   const effectiveMode = modeOverride || ctx.mode;
   const adapter = modeOverride ? getActiveAdapter(modeOverride, ctx.token) : ctx.adapter;
+  const authScope = getAuthScope(ctx.token, effectiveMode);
 
   return useQuery({
-    queryKey: ['management', 'principals', effectiveMode],
+    queryKey: ['management', 'principals', effectiveMode, authScope],
     queryFn: () => adapter.getPrincipals(),
     retry: effectiveMode === 'live' ? false : undefined,
   });
@@ -536,9 +572,10 @@ export function useManagementRuns(modeOverride?: ManagementMode) {
   const ctx = useManagementData();
   const effectiveMode = modeOverride || ctx.mode;
   const adapter = modeOverride ? getActiveAdapter(modeOverride, ctx.token) : ctx.adapter;
+  const authScope = getAuthScope(ctx.token, effectiveMode);
 
   return useQuery({
-    queryKey: ['management', 'runs', effectiveMode],
+    queryKey: ['management', 'runs', effectiveMode, authScope],
     queryFn: () => adapter.getRuns(),
     retry: effectiveMode === 'live' ? false : undefined,
   });
@@ -548,9 +585,10 @@ export function useManagementTraceRuns(modeOverride?: ManagementMode) {
   const ctx = useManagementData();
   const effectiveMode = modeOverride || ctx.mode;
   const adapter = modeOverride ? getActiveAdapter(modeOverride, ctx.token) : ctx.adapter;
+  const authScope = getAuthScope(ctx.token, effectiveMode);
 
   return useQuery({
-    queryKey: ['management', 'trace-runs', effectiveMode],
+    queryKey: ['management', 'trace-runs', effectiveMode, authScope],
     queryFn: () => adapter.getTraceRuns(),
     retry: effectiveMode === 'live' ? false : undefined,
   });
@@ -560,9 +598,10 @@ export function useManagementTraceEvents(runId: string, modeOverride?: Managemen
   const ctx = useManagementData();
   const effectiveMode = modeOverride || ctx.mode;
   const adapter = modeOverride ? getActiveAdapter(modeOverride, ctx.token) : ctx.adapter;
+  const authScope = getAuthScope(ctx.token, effectiveMode);
 
   return useQuery({
-    queryKey: ['management', 'trace-events', runId, effectiveMode],
+    queryKey: ['management', 'trace-events', runId, effectiveMode, authScope],
     queryFn: () => adapter.getTraceEvents(runId),
     retry: effectiveMode === 'live' ? false : undefined,
     enabled: !!runId,
@@ -573,9 +612,10 @@ export function useManagementPiModels(modeOverride?: ManagementMode) {
   const ctx = useManagementData();
   const effectiveMode = modeOverride || ctx.mode;
   const adapter = modeOverride ? getActiveAdapter(modeOverride, ctx.token) : ctx.adapter;
+  const authScope = getAuthScope(ctx.token, effectiveMode);
 
   return useQuery({
-    queryKey: ['management', 'pi-models', effectiveMode],
+    queryKey: ['management', 'pi-models', effectiveMode, authScope],
     queryFn: () => adapter.getPiModels(),
     retry: effectiveMode === 'live' ? false : undefined,
   });
@@ -585,9 +625,10 @@ export function useManagementChannels(modeOverride?: ManagementMode) {
   const ctx = useManagementData();
   const effectiveMode = modeOverride || ctx.mode;
   const adapter = modeOverride ? getActiveAdapter(modeOverride, ctx.token) : ctx.adapter;
+  const authScope = getAuthScope(ctx.token, effectiveMode);
 
   return useQuery({
-    queryKey: ['management', 'channels', effectiveMode],
+    queryKey: ['management', 'channels', effectiveMode, authScope],
     queryFn: () => adapter.getChannels(),
     retry: effectiveMode === 'live' ? false : undefined,
   });
@@ -597,9 +638,10 @@ export function useManagementPermissionRules(modeOverride?: ManagementMode) {
   const ctx = useManagementData();
   const effectiveMode = modeOverride || ctx.mode;
   const adapter = modeOverride ? getActiveAdapter(modeOverride, ctx.token) : ctx.adapter;
+  const authScope = getAuthScope(ctx.token, effectiveMode);
 
   return useQuery({
-    queryKey: ['management', 'permission-rules', effectiveMode],
+    queryKey: ['management', 'permission-rules', effectiveMode, authScope],
     queryFn: () => adapter.getPermissionRules(),
     retry: effectiveMode === 'live' ? false : undefined,
   });
@@ -611,9 +653,10 @@ export function useManagementMonitor(modeOverride?: ManagementMode) {
   const ctx = useManagementData();
   const effectiveMode = modeOverride || ctx.mode;
   const adapter = modeOverride ? getActiveAdapter(modeOverride, ctx.token) : ctx.adapter;
+  const authScope = getAuthScope(ctx.token, effectiveMode);
 
   return useQuery({
-    queryKey: ['management', 'monitor', effectiveMode],
+    queryKey: ['management', 'monitor', effectiveMode, authScope],
     queryFn: () => adapter.getMonitorTelemetry(),
     retry: effectiveMode === 'live' ? false : undefined,
   });
@@ -623,10 +666,24 @@ export function useManagementSettings(modeOverride?: ManagementMode) {
   const ctx = useManagementData();
   const effectiveMode = modeOverride || ctx.mode;
   const adapter = modeOverride ? getActiveAdapter(modeOverride, ctx.token) : ctx.adapter;
+  const authScope = getAuthScope(ctx.token, effectiveMode);
 
   return useQuery({
-    queryKey: ['management', 'settings', effectiveMode],
+    queryKey: ['management', 'settings', effectiveMode, authScope],
     queryFn: () => adapter.getSettings(),
     retry: effectiveMode === 'live' ? false : undefined,
   });
 }
+
+export {
+  SETTINGS_STORAGE_KEY,
+  DEFAULT_PREFERENCES,
+  validateSettingsDraft,
+  loadSettingsDraft,
+  saveSettingsDraft,
+  resetSettingsDraft,
+  PreferencesContext,
+  PreferencesProvider,
+  usePreferences,
+  type PreferencesContextValue,
+} from './preferences';

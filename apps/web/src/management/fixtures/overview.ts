@@ -5,6 +5,7 @@ import type { OverviewProjection } from '../types';
 
 export const mockOverviewData: OverviewProjection = {
   summary: {
+    runs24h: 196,
     activeConversations: 4,
     pendingAttentionCount: 3,
     runningTasksCount: 2,

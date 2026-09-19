@@ -8,24 +8,80 @@
  * - Keyboard shortcuts: 'j' (next), 'k' (prev), 'e' (expand/collapse), '/' (search)
  * - Raw Trace vs Timeline strict separation
  */
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { PageHeader } from '../primitives/PageHeader';
 import { StatusBadge } from '../primitives/StatusBadge';
-import { EntityMark } from '../primitives/EntityMark';
 import { Tabs } from '../primitives/Tabs';
-import { useManagementTraceRuns, useManagementTraceEvents } from '../adapter';
+import {
+  useManagementTraceRuns,
+  useManagementTraceEvents,
+  usePreferences,
+  useManagementData,
+} from '../adapter';
 import type { TraceEventProjection } from '../types';
 
 interface TracePageProps {
-  onNavigate: (pageId: string) => void;
+  onNavigate: (pageId: string, extra?: Record<string, unknown>) => void;
+  selectedRunId?: string;
+  onSelectRunId?: (runId?: string) => void;
 }
 
-export const TracePage: React.FC<TracePageProps> = () => {
-  const { data: runsRes } = useManagementTraceRuns();
-  const runs = runsRes?.data || [];
-  const [selectedRunId, setSelectedRunId] = useState<string>('run_A83');
+export function isTraceKeyboardShortcutsGuarded(
+  e: { ctrlKey?: boolean; metaKey?: boolean; altKey?: boolean },
+  activeEl: { tagName?: string; isContentEditable?: boolean } | null = null,
+): boolean {
+  if (e.ctrlKey || e.metaKey || e.altKey) return true;
+  if (
+    activeEl &&
+    (['INPUT', 'TEXTAREA', 'SELECT'].includes(activeEl.tagName || '') ||
+      Boolean(activeEl.isContentEditable))
+  ) {
+    return true;
+  }
+  return false;
+}
 
-  const { data: eventsRes, isLoading: isEventsLoading } = useManagementTraceEvents(selectedRunId);
+export const TracePage: React.FC<TracePageProps> = ({
+  selectedRunId,
+  onSelectRunId,
+}) => {
+  const { mode } = useManagementData();
+  const {
+    data: runsRes,
+    isLoading: isRunsLoading,
+    isError: isRunsError,
+    error: runsError,
+  } = useManagementTraceRuns();
+  const { settings } = usePreferences();
+  const isLive = mode === 'live' || runsRes?.source === 'api';
+  const runs = runsRes?.data || [];
+
+  const [localRunId, setLocalRunId] = useState<string | undefined>(selectedRunId);
+
+  useEffect(() => {
+    setLocalRunId(selectedRunId);
+  }, [selectedRunId]);
+
+  const effectiveRunId = selectedRunId !== undefined ? selectedRunId : localRunId;
+
+  // Derive active run safely:
+  // - If effectiveRunId is provided: ONLY select it if it exists in runs. Never select a wrong/unrelated entity on invalid id!
+  // - If no effectiveRunId is provided: default to first available run if any.
+  const activeRun = useMemo(() => {
+    if (effectiveRunId !== undefined && effectiveRunId !== '') {
+      return runs.find((r) => r.runId === effectiveRunId) ?? null;
+    }
+    return runs.length > 0 ? runs[0] : null;
+  }, [runs, effectiveRunId]);
+
+  const activeRunId = activeRun?.runId || '';
+
+  const {
+    data: eventsRes,
+    isLoading: isEventsLoading,
+    isError: isEventsError,
+    error: eventsError,
+  } = useManagementTraceEvents(activeRunId);
   const events = eventsRes?.data || [];
 
   const [selectedEventSeq, setSelectedEventSeq] = useState<number>(1);
@@ -41,35 +97,69 @@ export const TracePage: React.FC<TracePageProps> = () => {
     if (events.length > 0) {
       setSelectedEventSeq(events[0].sequence);
     }
-  }, [selectedRunId, events.length]);
+  }, [activeRunId, events.length]);
 
   const filteredEvents = events.filter((e) => {
-    const matchesSearch = e.summary.toLowerCase().includes(search.toLowerCase()) || e.type.toLowerCase().includes(search.toLowerCase());
+    const matchesSearch =
+      e.summary.toLowerCase().includes(search.toLowerCase()) ||
+      e.type.toLowerCase().includes(search.toLowerCase());
     const matchesType = typeFilter === 'all' || e.type === typeFilter;
     return matchesSearch && matchesType;
   });
 
-  const selectedEvent = events.find((e) => e.sequence === selectedEventSeq) || filteredEvents[0] || null;
+  const selectedEvent =
+    events.find((e) => e.sequence === selectedEventSeq) || filteredEvents[0] || null;
 
-  // Keyboard navigation: j, k, e, /
+  // Scroll active event into the nearest visible part of .timelineList respecting prefers-reduced-motion
+  useEffect(() => {
+    if (!timelineListRef.current) return;
+    const activeEl = timelineListRef.current.querySelector(
+      '.timelineEventItem.active'
+    ) as HTMLElement | null;
+    if (activeEl) {
+      const prefersReducedMotion =
+        typeof window !== 'undefined' &&
+        window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      activeEl.scrollIntoView({
+        block: 'nearest',
+        behavior: prefersReducedMotion ? 'auto' : 'smooth',
+      });
+    }
+  }, [selectedEventSeq]);
+
+  // Keyboard navigation: j/k, arrows, Home/End, e, / (disabled when settings.enableTraceKeyboardShortcuts is false)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Don't trigger shortcuts if focus is inside an input/textarea
-      if (['INPUT', 'TEXTAREA', 'SELECT'].includes((document.activeElement as HTMLElement)?.tagName)) {
+      if (!settings?.enableTraceKeyboardShortcuts) {
         return;
       }
 
-      if (e.key === 'j') {
+      // Guard modifiers and focused form elements
+      if (isTraceKeyboardShortcutsGuarded(e, document.activeElement as HTMLElement | null)) {
+        return;
+      }
+
+      if (e.key === 'j' || e.key === 'ArrowDown') {
         e.preventDefault();
         const currentIndex = filteredEvents.findIndex((ev) => ev.sequence === selectedEventSeq);
         if (currentIndex < filteredEvents.length - 1) {
           setSelectedEventSeq(filteredEvents[currentIndex + 1].sequence);
         }
-      } else if (e.key === 'k') {
+      } else if (e.key === 'k' || e.key === 'ArrowUp') {
         e.preventDefault();
         const currentIndex = filteredEvents.findIndex((ev) => ev.sequence === selectedEventSeq);
         if (currentIndex > 0) {
           setSelectedEventSeq(filteredEvents[currentIndex - 1].sequence);
+        }
+      } else if (e.key === 'Home') {
+        if (filteredEvents.length > 0) {
+          e.preventDefault();
+          setSelectedEventSeq(filteredEvents[0].sequence);
+        }
+      } else if (e.key === 'End') {
+        if (filteredEvents.length > 0) {
+          e.preventDefault();
+          setSelectedEventSeq(filteredEvents[filteredEvents.length - 1].sequence);
         }
       } else if (e.key === 'e') {
         e.preventDefault();
@@ -82,7 +172,54 @@ export const TracePage: React.FC<TracePageProps> = () => {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [filteredEvents, selectedEventSeq]);
+  }, [filteredEvents, selectedEventSeq, settings?.enableTraceKeyboardShortcuts]);
+
+  const handleSelectRun = (runId: string) => {
+    setLocalRunId(runId);
+    onSelectRunId?.(runId);
+  };
+
+  if (isRunsLoading) {
+    return (
+      <div className="pageContainer">
+        <div style={{ padding: 40, textAlign: 'center', color: 'var(--metadata)' }}>
+          加载执行追踪数据中...
+        </div>
+      </div>
+    );
+  }
+
+  if (isRunsError) {
+    return (
+      <div className="pageContainer">
+        <PageHeader
+          title="追踪 (Trace)"
+          description="三栏全量执行证据审查。支持时间轴 Scrubber、键盘导航 (j/k 切换, e 展开, / 搜索) 与原始 Raw Trace 按需惰性装载。"
+          capabilityState="P3 目标"
+          customPill={{ text: isLive ? '实时接口' : '设计数据', variant: isLive ? 'ok' : 'neutral' }}
+        />
+        <div style={{ padding: 40, textAlign: 'center', color: 'var(--danger)' }} role="alert">
+          <strong>追踪数据加载失败</strong>: {runsError instanceof Error ? runsError.message : '无法获取执行追踪数据'}
+        </div>
+      </div>
+    );
+  }
+
+  if (runs.length === 0) {
+    return (
+      <div className="pageContainer">
+        <PageHeader
+          title="追踪 (Trace)"
+          description="三栏全量执行证据审查。支持时间轴 Scrubber、键盘导航 (j/k 切换, e 展开, / 搜索) 与原始 Raw Trace 按需惰性装载。"
+          capabilityState="已实现"
+          customPill={{ text: isLive ? '实时接口' : '设计数据', variant: isLive ? 'ok' : 'neutral' }}
+        />
+        <div style={{ padding: 40, textAlign: 'center', color: 'var(--metadata)' }}>
+          暂无执行追踪记录 (No Trace Runs Available)
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="pageContainer">
@@ -90,36 +227,70 @@ export const TracePage: React.FC<TracePageProps> = () => {
         title="追踪 (Trace)"
         description="三栏全量执行证据审查。支持时间轴 Scrubber、键盘导航 (j/k 切换, e 展开, / 搜索) 与原始 Raw Trace 按需惰性装载。"
         capabilityState="已实现"
+        customPill={{ text: isLive ? '实时接口' : '设计数据', variant: isLive ? 'ok' : 'neutral' }}
       />
 
       {/* 3-Column Trace Layout */}
       <div className="traceLayout">
         {/* Column 1: Run List */}
-        <div className="traceRunList" role="region" aria-label="Runs Selection List">
-          <div style={{ padding: '10px 12px', borderBottom: '1px solid var(--line)', background: 'var(--sidebar)' }}>
-            <h4 style={{ fontSize: 11, fontWeight: 600, color: 'var(--metadata)', textTransform: 'uppercase', margin: 0 }}>
+        <div className="traceRunList" role="listbox" aria-label="Runs Selection List">
+          <div
+            style={{
+              padding: '10px 12px',
+              borderBottom: '1px solid var(--line)',
+              background: 'var(--sidebar)',
+            }}
+          >
+            <h4
+              style={{
+                fontSize: 11,
+                fontWeight: 600,
+                color: 'var(--metadata)',
+                textTransform: 'uppercase',
+                margin: 0,
+              }}
+            >
               执行记录 ({runs.length})
             </h4>
           </div>
           {runs.map((run) => {
-            const isSelected = run.runId === selectedRunId;
+            const isSelected = run.runId === activeRunId;
             return (
               <div
                 key={run.runId}
                 className={`traceRunItem ${isSelected ? 'active' : ''}`}
-                onClick={() => setSelectedRunId(run.runId)}
+                onClick={() => handleSelectRun(run.runId)}
                 tabIndex={0}
+                role="option"
+                aria-selected={isSelected}
+                aria-label={`选择运行 ${run.runId}`}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' || e.key === ' ') {
                     e.preventDefault();
-                    setSelectedRunId(run.runId);
+                    handleSelectRun(run.runId);
                   }
                 }}
               >
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <strong className="mono" style={{ fontSize: 12 }}>{run.runId}</strong>
-                  <StatusBadge variant={run.status === 'completed' ? 'ok' : run.status === 'running' ? 'teal' : 'bad'}>
-                    {run.eventCount} 事件
+                <div
+                  style={{
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                  }}
+                >
+                  <strong className="mono" style={{ fontSize: 12 }}>
+                    {run.runId}
+                  </strong>
+                  <StatusBadge
+                    variant={
+                      run.status === 'completed'
+                        ? 'ok'
+                        : run.status === 'running'
+                        ? 'teal'
+                        : 'bad'
+                    }
+                  >
+                    {run.eventCount != null ? `${run.eventCount} 事件` : '未知'}
                   </StatusBadge>
                 </div>
                 <div style={{ fontSize: 11, color: 'var(--secondary)' }}>
@@ -131,7 +302,7 @@ export const TracePage: React.FC<TracePageProps> = () => {
         </div>
 
         {/* Column 2: Timeline Stream & Scrubber */}
-        <div className="traceTimeline" role="region" aria-label="Event Timeline Stream">
+        <div className="traceTimeline" role="region" aria-label="Event Timeline Container">
           {/* Scrubber & Filter Controls */}
           <div className="timelineScrubber">
             <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -160,16 +331,27 @@ export const TracePage: React.FC<TracePageProps> = () => {
                 <option value="error">异常 (error)</option>
               </select>
             </div>
-            <div style={{ fontSize: 11, color: 'var(--metadata)', fontFamily: 'var(--font-mono)' }}>
+            <div
+              style={{
+                fontSize: 11,
+                color: 'var(--metadata)',
+                fontFamily: 'var(--font-mono)',
+              }}
+            >
               {filteredEvents.length} / {events.length}
             </div>
           </div>
 
           {/* Timeline Event List */}
-          <div ref={timelineListRef} className="timelineList">
+          <div ref={timelineListRef} className="timelineList" role="listbox" aria-label="Event Timeline Stream">
             {isEventsLoading && (
               <div style={{ padding: 20, textAlign: 'center', color: 'var(--metadata)' }}>
                 加载事件流中...
+              </div>
+            )}
+            {isEventsError && (
+              <div style={{ padding: 20, textAlign: 'center', color: 'var(--danger)' }} role="alert">
+                <strong>事件流加载失败</strong>: {eventsError instanceof Error ? eventsError.message : '无法获取事件流数据'}
               </div>
             )}
             {filteredEvents.map((ev) => {
@@ -180,6 +362,9 @@ export const TracePage: React.FC<TracePageProps> = () => {
                   className={`timelineEventItem ${isSelected ? 'active' : ''}`}
                   onClick={() => setSelectedEventSeq(ev.sequence)}
                   tabIndex={0}
+                  role="option"
+                  aria-selected={isSelected}
+                  aria-label={`事件 #${ev.sequence} ${ev.type}`}
                   onKeyDown={(e) => {
                     if (e.key === 'Enter' || e.key === ' ') {
                       e.preventDefault();
@@ -187,7 +372,10 @@ export const TracePage: React.FC<TracePageProps> = () => {
                     }
                   }}
                 >
-                  <span className="mono" style={{ fontSize: 10, color: 'var(--metadata)', minWidth: 24 }}>
+                  <span
+                    className="mono"
+                    style={{ fontSize: 10, color: 'var(--metadata)', minWidth: 24 }}
+                  >
                     #{ev.sequence}
                   </span>
                   <StatusBadge
@@ -203,16 +391,18 @@ export const TracePage: React.FC<TracePageProps> = () => {
                   >
                     {ev.type}
                   </StatusBadge>
-                  <span style={{ flex: 1, fontSize: 12, color: 'var(--ink)' }}>{ev.summary}</span>
+                  <span style={{ flex: 1, fontSize: 12, color: 'var(--ink)' }}>
+                    {ev.summary}
+                  </span>
                   <span className="mono" style={{ fontSize: 10, color: 'var(--metadata)' }}>
                     {ev.timestamp}
                   </span>
                 </div>
               );
             })}
-            {filteredEvents.length === 0 && !isEventsLoading && (
+            {filteredEvents.length === 0 && !isEventsLoading && !isEventsError && (
               <div style={{ padding: 24, textAlign: 'center', color: 'var(--metadata)' }}>
-                无匹配追踪事件
+                {!activeRun ? (effectiveRunId ? `未找到指定的运行记录 [${effectiveRunId}]` : '暂未选择任何运行记录') : '无匹配追踪事件'}
               </div>
             )}
           </div>
@@ -249,7 +439,11 @@ export const TracePage: React.FC<TracePageProps> = () => {
                       <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                         <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                           <span>裁决结果</span>
-                          <StatusBadge variant={selectedEvent.authorization.decision === 'ALLOW' ? 'ok' : 'bad'}>
+                          <StatusBadge
+                            variant={
+                              selectedEvent.authorization.decision === 'ALLOW' ? 'ok' : 'bad'
+                            }
+                          >
                             {selectedEvent.authorization.decision}
                           </StatusBadge>
                         </div>
@@ -262,7 +456,9 @@ export const TracePage: React.FC<TracePageProps> = () => {
                         </div>
                       </div>
                     ) : (
-                      <div style={{ color: 'var(--metadata)' }}>该事件无独立鉴权裁决记录。</div>
+                      <div style={{ color: 'var(--metadata)' }}>
+                        该事件无独立鉴权裁决记录。
+                      </div>
                     )}
                   </div>
                 )}
@@ -271,7 +467,9 @@ export const TracePage: React.FC<TracePageProps> = () => {
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                     <div>序列号: #{selectedEvent.sequence}</div>
                     <div>记录时间: {selectedEvent.timestamp}</div>
-                    <div>执行耗时: {selectedEvent.durationMs ? `${selectedEvent.durationMs} ms` : '—'}</div>
+                    <div>
+                      执行耗时: {selectedEvent.durationMs ? `${selectedEvent.durationMs} ms` : '—'}
+                    </div>
                     <div>所属运行: {selectedEvent.runId}</div>
                   </div>
                 )}

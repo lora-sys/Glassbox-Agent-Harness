@@ -8,44 +8,57 @@
  * - Data honesty: no fake zero pricing
  */
 import { describe, it, expect } from 'vitest';
-import type { TaskProjection, RunProjection, CapabilityState } from './types';
+import {
+  validateTasksResponse,
+  validateRunsResponse,
+  validateChannelsResponse,
+  validateManagementStatus,
+} from './adapter/validators';
+import { mockTasksData } from './fixtures';
+import type { CapabilityState } from './types';
 
 describe('Stress & Edge Case Verifications', () => {
-  it('handles extremely long Chinese titles and deep resource paths safely', () => {
-    const longTitle = '【高危紧急操作】针对外部群聊 NapCat OneBot 11 适配器与 Herdr 工作区进行跨工作区分支同步与持久化状态归档回滚测试';
-    const longPath = 'r2://artifacts/workspace/sub_project/deep/nested/directory/structure/task-attempt-9921/patches/diff_very_long_file_name_specifying_exact_commit_hash_161c491.patch';
-    const longId = 'run_A83_99182390182390182390182390182390182390182390182390182390';
+  it('validates production tasks with extremely long Chinese titles and deep resource paths safely', () => {
+    // Test that production mockTasksData contains real extreme edge cases and validates strictly
+    const validated = validateTasksResponse({ tasks: mockTasksData });
+    expect(validated.length).toBeGreaterThan(0);
 
-    expect(longTitle.length).toBeGreaterThan(50);
-    expect(longPath.length).toBeGreaterThan(100);
-    expect(longId.length).toBeGreaterThan(40);
-  });
+    // Find the task with long title in production fixture
+    const longTitleTask = validated.find((t) => t.title.length > 40);
+    expect(longTitleTask).toBeDefined();
+    expect(longTitleTask?.id.length).toBeGreaterThan(40);
+    expect(longTitleTask?.title).toContain('长期会话上下文持久化与 Turso 数据库跨架构平滑迁移验证基准测试执行计划');
 
-  it('verifies that empty data states are explicitly representable without crashes', () => {
-    const emptyTasks: TaskProjection[] = [];
-    expect(emptyTasks.length).toBe(0);
-
-    const emptyRun: RunProjection = {
-      id: 'run_empty_test',
-      conversationId: 'conv_empty',
-      principalId: 'owner_primary',
-      status: 'completed',
-      modelId: 'claude-3-5-sonnet',
-      durationMs: 0,
-      toolsExecutedCount: 0,
-      artifacts: [],
-      tokens: { prompt: 0, completion: 0, total: 0 },
-      costUsd: null,
-      costStatus: 'unpriced',
-      startedAt: '2026-09-17T15:00:00Z',
-      traceId: 'trace-empty',
-      summary: 'Empty run without tool executions or artifacts',
+    // Custom extreme stress payload with long strings through production validator
+    const extremeTask = {
+      ...mockTasksData[0],
+      id: 'task-stress-' + 'x'.repeat(100),
+      title: '【高危紧急操作】针对外部群聊 NapCat OneBot 11 适配器与 Herdr 工作区进行跨工作区分支同步与持久化状态归档回滚测试'.repeat(3),
+      attempts: [
+        {
+          ...mockTasksData[0].attempts[0],
+          attemptNo: 99,
+          artifactUri: 'r2://artifacts/workspace/sub_project/deep/nested/directory/structure/task-attempt-9921/patches/' + 'a'.repeat(120) + '.patch',
+        },
+      ],
     };
 
-    expect(emptyRun.artifacts).toHaveLength(0);
-    expect(emptyRun.toolsExecutedCount).toBe(0);
-    expect(emptyRun.costUsd).toBeNull();
-    expect(emptyRun.costStatus).toBe('unpriced');
+    const parsed = validateTasksResponse({ tasks: [extremeTask] });
+    expect(parsed[0].id).toBe(extremeTask.id);
+    expect(parsed[0].title).toBe(extremeTask.title);
+    expect(parsed[0].attempts[0].artifactUri).toBe(extremeTask.attempts[0].artifactUri);
+  });
+
+  it('verifies that empty data states are explicitly representable without crashes in production validators', () => {
+    // Production validator accepts empty collections without crashing
+    const emptyTasks = validateTasksResponse({ tasks: [] });
+    expect(emptyTasks).toHaveLength(0);
+
+    const emptyRuns = validateRunsResponse({ runs: [] });
+    expect(emptyRuns).toHaveLength(0);
+
+    const emptyChannels = validateChannelsResponse({ channels: [] });
+    expect(emptyChannels.channels).toHaveLength(0);
   });
 
   it('prohibits inconsistent visible vocabulary in capability states', () => {
@@ -53,15 +66,48 @@ describe('Stress & Edge Case Verifications', () => {
     const invalidTerms = ['fixture', 'experimental', 'planned', 'target', 'future'];
 
     for (const term of invalidTerms) {
-      expect(allowedStates).not.toContain(term);
+      expect(allowedStates).not.toContain(term as any);
     }
   });
 
-  it('validates disconnected and stale observation state modeling', () => {
-    const staleHerdrState = 'stale';
-    const disconnectedState = 'disconnected';
+  it('validates disconnected and stale observation state modeling in production status/channel validators', () => {
+    // Test production status validator with ready status
+    const readyStatus = validateManagementStatus({
+      service: 'glassbox',
+      version: '0.8.4',
+      status: 'ready',
+      platform: 'linux',
+      defaultExecution: 'pi',
+      capabilities: { modelConfiguration: true, channels: true },
+    });
+    expect(readyStatus.status).toBe('ready');
 
-    expect(staleHerdrState).toBe('stale');
-    expect(disconnectedState).toBe('disconnected');
+    // Test production channels validator with disconnected state
+    const disconnectedChannels = validateChannelsResponse({
+      channels: [
+        {
+          id: 'chan_qq_disconnected',
+          label: 'QQ Disconnected Channel',
+          kind: 'qq-onebot',
+          endpoint: 'ws://127.0.0.1:5009',
+          botId: 'bot-disc',
+          ownerId: 'owner-disc',
+          groupIds: [],
+          tokenConfigured: false,
+          autoConnect: false,
+          connectionState: 'disconnected',
+        },
+      ],
+    });
+    expect(disconnectedChannels.channels[0].connectionState).toBe('disconnected');
+
+    // Test stale observation state in task
+    const staleTask = {
+      ...mockTasksData[0],
+      herdrState: 'stale' as const,
+      herdrObservationMeta: 'Herdr 心跳超时 180s',
+    };
+    const parsedTasks = validateTasksResponse({ tasks: [staleTask] });
+    expect(parsedTasks[0].herdrState).toBe('stale');
   });
 });

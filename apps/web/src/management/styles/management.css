@@ -27,15 +27,15 @@
   --metadata: #737373;
   --disabled: #999999;
 
-  /* Semantic Color Families */
-  --brand: #b45309;
+  /* Semantic Color Families (foreground tokens darkened to meet WCAG AA >= 4.5:1 contrast against subtle backgrounds) */
+  --brand: #92400e;
   --brand-subtle: #fef3c7;
-  --success: #16a34a;
+  --success: #15803d;
   --success-subtle: #dcfce7;
-  --danger: #dc2626;
+  --danger: #991b1b;
   --danger-subtle: #fee2e2;
   --focus: #2563eb;
-  --teal: #0d9488;
+  --teal: #115e59;
   --teal-subtle: #ccfbf1;
   --neutral-bg: #f3f4f6;
 
@@ -211,6 +211,7 @@
   position: sticky;
   top: 0;
   z-index: 30;
+  flex-shrink: 0;
 }
 
 .breadcrumb {
@@ -891,6 +892,32 @@
 }
 
 /* ==========================================================================
+   Command Palette
+   ========================================================================== */
+.cmdPaletteItem {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  text-align: left;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--ink);
+  transition: background-color 0.1s ease, color 0.1s ease;
+}
+
+.cmdPaletteItem:hover,
+.cmdPaletteItem.active,
+.cmdPaletteItem[aria-selected="true"] {
+  background-color: var(--sidebar);
+  color: var(--brand);
+}
+
+/* ==========================================================================
    ChartPanel (Accessible lines + tabular fallback)
    ========================================================================== */
 .chartPanel {
@@ -949,7 +976,14 @@
     max-height: none;
   }
   .traceLayout {
-    grid-template-columns: 200px 1fr 280px;
+    display: flex;
+    flex-direction: column;
+    height: auto;
+  }
+  .traceRunList,
+  .traceTimeline,
+  .traceInspector {
+    height: 320px;
   }
 }
 
@@ -959,6 +993,15 @@
   }
   .mobileMenuBtn {
     display: flex;
+    min-width: 44px;
+    min-height: 44px;
+  }
+  .drawerCloseBtn {
+    min-width: 44px;
+    min-height: 44px;
+  }
+  .mobileDrawer .navItem {
+    min-height: 44px;
   }
   .traceLayout {
     display: flex;
@@ -973,6 +1016,56 @@
   .pageContainer {
     padding: 16px;
   }
+  input,
+  select,
+  textarea,
+  .filterInput,
+  .filterSelect,
+  .search,
+  .cmdInput {
+    font-size: 16px !important; /* Prevent iOS Safari auto-zoom */
+  }
+}
+
+@media (max-width: 640px) {
+  .topbar {
+    height: auto;
+    min-height: 52px;
+    padding: 6px 12px;
+    flex-wrap: wrap;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+  .repoMeta {
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .topSpacer {
+    display: none;
+  }
+  .breadcrumb {
+    flex: 1 1 140px;
+    min-width: 0;
+    max-width: none;
+  }
+  .breadcrumb span {
+    flex-shrink: 0;
+    white-space: nowrap;
+  }
+  .breadcrumb b {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+  }
+  .sourceLabel {
+    display: none;
+  }
+  .settingsField {
+    flex-direction: column !important;
+    align-items: flex-start !important;
+    gap: 8px !important;
+  }
 }
 
 @media (max-width: 390px) {
@@ -986,4 +1079,46 @@
   .summaryBar {
     grid-template-columns: 1fr;
   }
+}
+
+/* Command Palette Focus Visible */
+.cmdPaletteItem:focus-visible {
+  outline: 2px solid var(--blue, #2563eb);
+  outline-offset: 1px;
+  background: var(--sidebar);
+}
+
+/* Color-Blind Accessibility Mode */
+.managementApp[data-colorblind="true"] .capabilityBadge.ok {
+  border: 2px solid var(--success);
+  font-weight: 600;
+}
+
+.managementApp[data-colorblind="true"] .capabilityBadge.warn {
+  border: 2px dashed var(--brand);
+  font-weight: 600;
+}
+
+.managementApp[data-colorblind="true"] .capabilityBadge.bad {
+  border: 2px double var(--danger);
+  font-weight: 600;
+}
+
+.managementApp[data-colorblind="true"] .capabilityBadge.teal {
+  border: 2px dotted var(--teal);
+  font-weight: 600;
+}
+
+.managementApp[data-colorblind="true"] .capabilityBadge.neutral {
+  border: 2px solid var(--line-strong);
+  font-weight: 600;
+}
+
+.managementApp[data-colorblind="true"] .chartLine {
+  stroke-width: 3px;
+}
+
+.managementApp[data-colorblind="true"] .chartPoint {
+  r: 5px;
+  stroke-width: 2px;
 }

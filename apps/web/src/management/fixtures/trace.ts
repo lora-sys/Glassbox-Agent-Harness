@@ -157,6 +157,57 @@ export function generateTraceEvents(count: number, runId: string): TraceEventPro
         break;
     }
 
+    const isLargePayload = seq === 1 && (runId === 'run_A83' || runId === 'run_A70');
+    const rawTraceData = isLargePayload
+      ? {
+          timestamp: timeStr,
+          seq,
+          type,
+          level: 'INFO',
+          runId,
+          payloadKind: 'large_raw_trace_payload',
+          evidenceSource: 'raw_append_only_event_log',
+          details: payload,
+          terminalOutputBuffer: [
+            '2026-09-17T15:10:00.120Z [glassbox:runtime] Bootstrap Pi Engine with Lora PI Kit profile (p3-closed-loop)',
+            '2026-09-17T15:10:00.142Z [glassbox:auth] Ingress gate passed for principal: owner_primary on channel: web',
+            '2026-09-17T15:10:00.180Z [glassbox:context] Loading conversation history: conv_owner_main (4 turns, 12KB)',
+            '2026-09-17T15:10:00.220Z [glassbox:pi] Invoking @earendil-works/pi-coding-agent with model claude-3-5-sonnet',
+            '2026-09-17T15:10:00.350Z [pi:tool] Gate check: Principal(owner_primary) x Resource(workspace:git) x Action(status)',
+            '2026-09-17T15:10:00.355Z [pi:auth] ALLOW: Matched policy grant:system:full_control',
+            '2026-09-17T15:10:00.410Z [pi:worker] Spawning Herdr worker worker-04 in worktree codex/fix-auth-cache-v2',
+            '2026-09-17T15:10:01.000Z [herdr:stream] $ vitest run apps/web/src/management/verification.test.ts',
+            '2026-09-17T15:10:03.450Z [herdr:stream] ✓ 20 tests passed (353ms)',
+            '2026-09-17T15:10:04.100Z [herdr:lifecycle] worker-04 reached status done; pane settled',
+            '2026-09-17T15:10:04.150Z [glassbox:reconciler] OpsReconciler: worker done != Task DONE; moving Task task-218 to REVIEW',
+            '2026-09-17T15:10:04.200Z [glassbox:delivery] Delivery Gate: Reply requires Owner review. Zero secrets leaked.',
+            ...Array.from({ length: 120 }, (_, idx) => {
+              const step = String(idx + 1).padStart(3, '0');
+              const ms = String((idx * 37) % 1000).padStart(3, '0');
+              return `2026-09-17T15:10:0${Math.floor(idx / 25)}.${ms}Z [glassbox:audit:trace-stream] seq=${step} ` +
+                `Principal(owner_primary) Resource(workspace:file://apps/web/src/management/fixtures/trace.ts) ` +
+                `Action(verify_chunk_${step}) Decision(ALLOW) Context(conversation:conv_owner_main, run:${runId}, attempt:2, checksum:sha256_${step}abc987def) ` +
+                `Status(INSPECTABLE_EVIDENCE_RECORDED)`;
+            }),
+          ].join('\n'),
+          environmentDump: {
+            NODE_ENV: 'production',
+            PI_PROFILE: 'p3-closed-loop',
+            HERDR_SESSION: 'default',
+            WORKSPACE_PATH: 'C:/Users/yanBingZhao/repos/Glassbox-Web-Management',
+            TURSO_DB_STATUS: 'connected',
+          },
+        }
+      : {
+          timestamp: timeStr,
+          seq,
+          type,
+          level: 'INFO',
+          runId,
+          details: payload,
+          stackTrace: type === 'error' ? 'Error: Mock retryable failure\n  at Reconciler.check (reconcile.ts:142)' : undefined,
+        };
+
     events.push({
       id: `${runId}-ev-${seq}`,
       runId,
@@ -167,19 +218,7 @@ export function generateTraceEvents(count: number, runId: string): TraceEventPro
       durationMs: timeOffsetMs % 150,
       authorization: authDetail,
       payload,
-      rawTraceExcerpt: JSON.stringify(
-        {
-          timestamp: timeStr,
-          seq,
-          type,
-          level: 'INFO',
-          runId,
-          details: payload,
-          stackTrace: type === 'error' ? 'Error: Mock retryable failure\n  at Reconciler.check (reconcile.ts:142)' : undefined,
-        },
-        null,
-        2
-      ),
+      rawTraceExcerpt: JSON.stringify(rawTraceData, null, 2),
     });
   }
 

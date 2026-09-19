@@ -3,27 +3,83 @@
  * Page 4: 身份与访问 (Identity & Access)
  */
 import React, { useState } from 'react';
-import { PageHeader } from '../primitives/PageHeader';
+import { PageHeader, SectionHeader } from '../primitives/PageHeader';
+import { SummaryBar } from '../primitives/SummaryBar';
 import { FilterBar } from '../primitives/FilterBar';
 import { DataTable, type Column } from '../primitives/DataTable';
 import { MasterDetail } from '../primitives/Tabs';
 import { DetailRail, DetailSection, PairRow } from '../primitives/DetailRail';
 import { StatusBadge } from '../primitives/StatusBadge';
 import { EntityMark } from '../primitives/EntityMark';
-import { useManagementPrincipals } from '../adapter';
-import type { PrincipalProjection } from '../types';
+import { useManagementPrincipals, useManagementData } from '../adapter';
+import type { PrincipalProjection, ResourceRelationshipProjection } from '../types';
+
+const mockResourceRelationships: ResourceRelationshipProjection[] = [
+  {
+    id: 'rel-1',
+    resource: 'workspace://glassbox-main',
+    ownerPrincipal: 'owner_primary',
+    relation: 'owner',
+    provenance: '系统初始化配置，根所有权不可撤销',
+  },
+  {
+    id: 'rel-2',
+    resource: 'r2://artifacts/task-218/*',
+    ownerPrincipal: 'worker_herdr_04',
+    relation: 'delegate',
+    provenance: '派生自 Task task-218 执行委托，仅在运行期间生效',
+  },
+  {
+    id: 'rel-3',
+    resource: 'conversation://conv_qq_group_test',
+    ownerPrincipal: 'visitor_guest_99',
+    relation: 'reader',
+    provenance: 'QQ 8839210 群公开交互记录，脱敏后只读',
+  },
+];
 
 interface IdentityPageProps {
-  onNavigate: (pageId: string) => void;
+  onNavigate: (pageId: string, extraSearch?: Record<string, unknown>) => void;
+  selectedId?: string;
+  onSelectId?: (id: string | null) => void;
 }
 
-export const IdentityPage: React.FC<IdentityPageProps> = ({ onNavigate }) => {
+export const IdentityPage: React.FC<IdentityPageProps> = ({
+  onNavigate,
+  selectedId: propSelectedId,
+  onSelectId,
+}) => {
   const { data: res, isLoading, isError, error } = useManagementPrincipals();
+  const { mode } = useManagementData();
+  const isLive = mode === 'live' || res?.source === 'api';
   const principals = res?.data || [];
-  const [selectedId, setSelectedId] = useState<string | null>('owner_primary');
+  const [localSelectedId, setLocalSelectedId] = useState<string | null>(
+    propSelectedId !== undefined ? propSelectedId : 'owner_primary'
+  );
   const [search, setSearch] = useState('');
 
-  const selectedPrincipal = principals.find((p) => p.id === selectedId);
+  React.useEffect(() => {
+    if (propSelectedId !== undefined) {
+      setLocalSelectedId(propSelectedId);
+    }
+  }, [propSelectedId]);
+
+  const effectiveId = propSelectedId !== undefined ? propSelectedId : localSelectedId;
+
+  // Safe selection: if an ID is provided, ONLY match if found; otherwise null.
+  const selectedPrincipal = React.useMemo(() => {
+    if (propSelectedId !== undefined) {
+      if (!propSelectedId) return null;
+      return principals.find((p) => p.id === propSelectedId) ?? null;
+    }
+    if (!effectiveId) return null;
+    return principals.find((p) => p.id === effectiveId) ?? null;
+  }, [principals, propSelectedId, effectiveId]);
+
+  const handleSelectPrincipal = (id: string | null) => {
+    setLocalSelectedId(id);
+    onSelectId?.(id);
+  };
 
   const filtered = principals.filter(
     (p) =>
@@ -108,7 +164,64 @@ export const IdentityPage: React.FC<IdentityPageProps> = ({ onNavigate }) => {
         title="身份与访问 (Identity & Access)"
         description="审查多渠道映射链条：ChannelIdentity → User → Principal。确保身份解析与鉴权边界严密无死角。"
         capabilityState="已实现"
+        customPill={{ text: isLive ? '实时接口' : '设计数据', variant: isLive ? 'ok' : 'neutral' }}
       />
+
+      {/* Summary Bar */}
+      <SummaryBar
+        items={[
+          {
+            label: '认证主体数',
+            value: principals.length,
+            meta: '有效 Principal',
+          },
+          {
+            label: '渠道映射数',
+            value: principals.reduce((sum, p) => sum + p.channelIdentities.length, 0),
+            meta: 'ChannelIdentity 映射',
+          },
+          {
+            label: '活动授权数',
+            value: principals.reduce((sum, p) => sum + p.activeGrants.length, 0),
+            meta: '显式 Grant 集合',
+          },
+          {
+            label: '委派边界',
+            value: '严格受限',
+            meta: 'worker ⊆ caller',
+          },
+        ]}
+      />
+
+      {/* Identity Resolution Chain */}
+      <div
+        style={{
+          background: 'var(--surface)',
+          border: '1px solid var(--line)',
+          borderRadius: 'var(--radius-md)',
+          padding: '12px 16px',
+        }}
+      >
+        <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--ink)', marginBottom: 8 }}>
+          三层身份解析链条 (Identity Resolution Chain)
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 12, flexWrap: 'wrap' }}>
+          <div style={{ padding: '6px 12px', background: 'var(--sidebar)', border: '1px solid var(--line)', borderRadius: 'var(--radius-sm)' }}>
+            <strong>1. ChannelIdentity</strong>
+            <div style={{ fontSize: 10, color: 'var(--metadata)' }}>外部渠道来源标识 (QQ/Web)</div>
+          </div>
+          <span style={{ color: 'var(--metadata)' }}>➔</span>
+          <div style={{ padding: '6px 12px', background: 'var(--sidebar)', border: '1px solid var(--line)', borderRadius: 'var(--radius-sm)' }}>
+            <strong>2. User</strong>
+            <div style={{ fontSize: 10, color: 'var(--metadata)' }}>Glassbox 归属用户档案</div>
+          </div>
+          <span style={{ color: 'var(--metadata)' }}>➔</span>
+          <div style={{ padding: '6px 12px', background: 'var(--sidebar)', border: '1px solid var(--line)', borderRadius: 'var(--radius-sm)' }}>
+            <strong>3. Principal</strong>
+            <div style={{ fontSize: 10, color: 'var(--metadata)' }}>有效鉴权主体 (执行策略判定)</div>
+          </div>
+        </div>
+      </div>
 
       <FilterBar
         searchValue={search}
@@ -123,8 +236,8 @@ export const IdentityPage: React.FC<IdentityPageProps> = ({ onNavigate }) => {
             data={filtered}
             columns={columns}
             keyExtractor={(p) => p.id}
-            selectedId={selectedId || undefined}
-            onRowClick={(p) => setSelectedId(p.id)}
+            selectedId={selectedPrincipal?.id}
+            onRowClick={(p) => handleSelectPrincipal(p.id)}
           />
         }
         detail={
@@ -132,7 +245,18 @@ export const IdentityPage: React.FC<IdentityPageProps> = ({ onNavigate }) => {
             isOpen={!!selectedPrincipal}
             title={selectedPrincipal?.userDisplayName || '主体详情'}
             subtitle={selectedPrincipal?.id}
-            onClose={() => setSelectedId(null)}
+            onClose={() => handleSelectPrincipal(null)}
+            actions={
+              selectedPrincipal ? (
+                <button
+                  type="button"
+                  className="btn primary sm"
+                  onClick={() => onNavigate('permissions', { testPrincipal: selectedPrincipal.id })}
+                >
+                  以此主体测试 (模拟)
+                </button>
+              ) : null
+            }
           >
             {selectedPrincipal && (
               <>
@@ -192,6 +316,63 @@ export const IdentityPage: React.FC<IdentityPageProps> = ({ onNavigate }) => {
           </DetailRail>
         }
       />
+
+      {/* Resource Relationships Provenance Section */}
+      <div style={{ marginTop: 24 }}>
+        <SectionHeader
+          title="资源所有权与委派关系 (Resource Relationships)"
+          subtitle="严格审查资源所属主体与其授权来源，确保委派历史可追溯"
+          capabilityState={isLive ? 'P3 目标' : '设计数据'}
+        />
+        {isLive ? (
+          <div
+            style={{
+              padding: 24,
+              background: 'var(--surface)',
+              border: '1px solid var(--line)',
+              borderRadius: 'var(--radius-sm)',
+              textAlign: 'center',
+              color: 'var(--metadata)',
+              marginTop: 12,
+              fontSize: 12,
+            }}
+          >
+            资源所有权追溯接口暂不可用 (P3 目标：需要细粒度资源注册表)
+          </div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 12 }}>
+            {mockResourceRelationships.map((rel) => (
+              <div
+                key={rel.id}
+                style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  padding: '10px 14px',
+                  background: 'var(--surface)',
+                  border: '1px solid var(--line)',
+                  borderRadius: 'var(--radius-sm)',
+                }}
+              >
+                <div>
+                  <div style={{ fontWeight: 600, fontSize: 13, color: 'var(--ink)' }}>
+                    <span className="mono">{rel.resource}</span>
+                  </div>
+                  <div style={{ fontSize: 11, color: 'var(--metadata)', marginTop: 2 }}>
+                    归属主体: <span className="mono">{rel.ownerPrincipal}</span> · 溯源说明: {rel.provenance}
+                  </div>
+                </div>
+                <StatusBadge
+                  variant={rel.relation === 'owner' ? 'ok' : rel.relation === 'delegate' ? 'teal' : 'neutral'}
+                  className="sm"
+                >
+                  {rel.relation === 'owner' ? '所有者 (Owner)' : rel.relation === 'delegate' ? '受托委派 (Delegate)' : '只读 (Reader)'}
+                </StatusBadge>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   );
 };

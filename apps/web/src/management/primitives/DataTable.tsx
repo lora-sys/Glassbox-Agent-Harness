@@ -60,6 +60,7 @@ export function DataTable<T>({
                 className={`${onRowClick ? 'clickable' : ''} ${isSelected ? 'selected' : ''}`}
                 onClick={() => onRowClick && onRowClick(item)}
                 tabIndex={onRowClick ? 0 : undefined}
+                aria-selected={onRowClick ? isSelected : undefined}
                 onKeyDown={(e) => {
                   if (onRowClick && (e.key === 'Enter' || e.key === ' ')) {
                     e.preventDefault();

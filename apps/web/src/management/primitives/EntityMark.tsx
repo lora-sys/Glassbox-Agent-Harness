@@ -3,7 +3,7 @@
  */
 import React from 'react';
 
-export type EntityKind = 'task' | 'run' | 'pi' | 'channel' | 'principal' | 'attention' | 'permission';
+export type EntityKind = 'task' | 'run' | 'pi' | 'channel' | 'principal' | 'attention' | 'permission' | 'worker';
 
 interface EntityMarkProps {
   kind: EntityKind;
@@ -61,6 +61,10 @@ export const EntityMark: React.FC<EntityMarkProps> = ({
     case 'permission':
       bg = '#7c3aed';
       label = 'P';
+      break;
+    case 'worker':
+      bg = '#0891b2';
+      label = 'W';
       break;
   }
 

@@ -19,7 +19,7 @@ export const mockConversationsData: ConversationProjection[] = [
     costUsd: null,
     costStatus: 'unpriced',
     lastActivityAt: '2 分钟前',
-    sanitizedSnippet: 'Owner: 批准开始执行 Web 管理端 Design Freeze v2 验收...',
+    sanitizedSnippet: 'Owner: 批准开始执行 Web 管理端 Design Freeze v2 验收... [REDACTED_REPO_PATH]',
     recentMessages: [
       { id: 'm1', sender: 'Owner', role: 'user', text: '开始执行 Web 管理端设计冻结 v2 验收流程。', timestamp: '15:10:02' },
       { id: 'm2', sender: 'Glassbox Agent', role: 'assistant', text: '正在验证 11 个核心页面契约与五个目标视口约束。', timestamp: '15:10:05' },
@@ -81,7 +81,7 @@ export const mockConversationsData: ConversationProjection[] = [
     costUsd: null,
     costStatus: 'unpriced',
     lastActivityAt: '35 分钟前',
-    sanitizedSnippet: 'HerdrBridge: 报告 42 项 Vitest 单元与集成用例已全数通过。',
+    sanitizedSnippet: 'HerdrBridge: 报告 42 项 Vitest 单元与集成用例已全数通过 [REDACTED]。',
     recentMessages: [
       { id: 'm6', sender: 'HerdrBridge', role: 'system', text: 'Worker completed execution in pane-3.', timestamp: '14:38:10' },
     ],

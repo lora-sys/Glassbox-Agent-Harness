@@ -2,9 +2,10 @@
  * @file apps/web/src/management/ManagementRoot.tsx
  *
  * Root Management Container:
- * - Mounts TanStack QueryClientProvider
+ * - Mounts TanStack QueryClientProvider and PreferencesProvider
  * - Manages data-source mode ('design' | 'live') via TanStack Router search params
  * - Preserves mode across navigation, browser back/forward, and reload
+ * - Manages URL-backed runId for deep linking across Runs and Trace
  * - Enforces ManagementAuth access guard (fail-closed in live mode)
  * - Renders all 11 frozen pages with PageShell
  */
@@ -14,8 +15,10 @@ import { QueryClientProvider } from '@tanstack/react-query';
 import { managementQueryClient } from './adapter/queryClient';
 import {
   ManagementDataProvider,
+  PreferencesProvider,
   getManagementToken,
   setManagementToken,
+  clearManagementToken,
   type ManagementMode,
 } from './adapter';
 import { ManagementAuth } from './access/ManagementAuth';
@@ -56,6 +59,8 @@ export const ManagementRoot: React.FC = () => {
     page?: ManagementPageId;
     mode?: ManagementMode;
     runId?: string;
+    testPrincipal?: string;
+    selectedId?: string;
   };
   const navigate = useNavigate();
 
@@ -65,16 +70,82 @@ export const ManagementRoot: React.FC = () => {
 
   const [token, setTokenState] = useState<string | null>(() => getManagementToken());
 
+  const prevTokenRef = React.useRef(token);
+  const prevModeRef = React.useRef(mode);
+
+  // Evict cached live queries on token rotation without clearing active design queries
+  React.useEffect(() => {
+    if (prevTokenRef.current !== token) {
+      prevTokenRef.current = token;
+      managementQueryClient.removeQueries({
+        predicate: (query) => query.queryKey.includes('live') || query.queryKey[2] === 'live',
+      });
+    }
+    prevModeRef.current = mode;
+  }, [token, mode]);
+
   // TanStack Router navigation preserving search params
   const navigateToPage = useCallback(
-    (pageId: string) => {
+    (pageId: string, extraSearch?: Record<string, unknown>) => {
       if (!VALID_PAGES.includes(pageId as ManagementPageId)) return;
       navigate({
         to: '/manage',
-        search: (prev: any) => ({
-          ...prev,
-          page: pageId,
-        }),
+        search: (prev: any) => {
+          const next: Record<string, unknown> = {
+            ...prev,
+            page: pageId,
+          };
+          if (extraSearch) {
+            Object.assign(next, extraSearch);
+          }
+          // Clean up page-specific params when leaving relevant pages
+          if (pageId !== 'permissions' && !extraSearch?.testPrincipal) {
+            delete next.testPrincipal;
+          }
+          if (pageId !== 'runs' && pageId !== 'trace' && !extraSearch?.runId) {
+            delete next.runId;
+          }
+          if (pageId !== prev?.page && !extraSearch?.selectedId) {
+            delete next.selectedId;
+          }
+          return next;
+        },
+      });
+    },
+    [navigate],
+  );
+
+  const setRunId = useCallback(
+    (runId: string | undefined) => {
+      navigate({
+        to: '/manage',
+        search: (prev: any) => {
+          const next = { ...prev };
+          if (runId) {
+            next.runId = runId;
+          } else {
+            delete next.runId;
+          }
+          return next;
+        },
+      });
+    },
+    [navigate],
+  );
+
+  const setSelectedId = useCallback(
+    (id: string | null | undefined) => {
+      navigate({
+        to: '/manage',
+        search: (prev: any) => {
+          const next = { ...prev };
+          if (id) {
+            next.selectedId = id;
+          } else {
+            delete next.selectedId;
+          }
+          return next;
+        },
       });
     },
     [navigate],
@@ -135,26 +206,68 @@ export const ManagementRoot: React.FC = () => {
     [],
   );
 
+  const handleDisconnect = useCallback(() => {
+    clearManagementToken();
+    setTokenState(null);
+    managementQueryClient.clear();
+  }, []);
+
   const renderCurrentPage = () => {
     switch (currentPage) {
       case 'overview':
         return <OverviewPage onNavigate={navigateToPage} />;
       case 'conversations':
-        return <ConversationsPage onNavigate={navigateToPage} />;
+        return (
+          <ConversationsPage
+            onNavigate={navigateToPage}
+            selectedId={search?.selectedId}
+            onSelectId={setSelectedId}
+          />
+        );
       case 'ops':
-        return <OpsPage onNavigate={navigateToPage} />;
+        return (
+          <OpsPage
+            onNavigate={navigateToPage}
+            selectedId={search?.selectedId}
+            onSelectId={setSelectedId}
+          />
+        );
       case 'identity':
-        return <IdentityPage onNavigate={navigateToPage} />;
+        return (
+          <IdentityPage
+            onNavigate={navigateToPage}
+            selectedId={search?.selectedId}
+            onSelectId={setSelectedId}
+          />
+        );
       case 'runs':
-        return <RunsPage onNavigate={navigateToPage} />;
+        return (
+          <RunsPage
+            onNavigate={navigateToPage}
+            selectedRunId={search?.runId}
+            onSelectRunId={setRunId}
+          />
+        );
       case 'trace':
-        return <TracePage onNavigate={navigateToPage} />;
+        return (
+          <TracePage
+            onNavigate={navigateToPage}
+            selectedRunId={search?.runId}
+            onSelectRunId={setRunId}
+          />
+        );
       case 'pi':
         return <PiPage onNavigate={navigateToPage} />;
       case 'channels':
         return <ChannelsPage onNavigate={navigateToPage} />;
       case 'permissions':
-        return <PermissionsPage onNavigate={navigateToPage} />;
+        return (
+          <PermissionsPage
+            onNavigate={navigateToPage}
+            selectedId={search?.selectedId}
+            testPrincipal={search?.testPrincipal}
+          />
+        );
       case 'monitor':
         return <MonitorPage onNavigate={navigateToPage} />;
       case 'settings':
@@ -166,31 +279,34 @@ export const ManagementRoot: React.FC = () => {
 
   return (
     <QueryClientProvider client={managementQueryClient}>
-      <ManagementDataProvider
-        mode={mode}
-        setMode={setMode}
-        token={token}
-        setToken={(t) => {
-          setTokenState(t);
-          setManagementToken(t, false);
-        }}
-      >
-        <ManagementAuth
+      <PreferencesProvider>
+        <ManagementDataProvider
           mode={mode}
+          setMode={setMode}
           token={token}
-          onTokenSubmit={handleTokenSubmit}
-          onSwitchToDesign={() => setMode('design')}
+          setToken={(t) => {
+            setTokenState(t);
+            setManagementToken(t, false);
+          }}
         >
-          <PageShell
-            currentPageId={currentPage}
-            onNavigate={navigateToPage}
+          <ManagementAuth
             mode={mode}
-            onModeChange={setMode}
+            token={token}
+            onTokenSubmit={handleTokenSubmit}
+            onSwitchToDesign={() => setMode('design')}
           >
-            {renderCurrentPage()}
-          </PageShell>
-        </ManagementAuth>
-      </ManagementDataProvider>
+            <PageShell
+              currentPageId={currentPage}
+              onNavigate={navigateToPage}
+              mode={mode}
+              onModeChange={setMode}
+              onDisconnect={handleDisconnect}
+            >
+              {renderCurrentPage()}
+            </PageShell>
+          </ManagementAuth>
+        </ManagementDataProvider>
+      </PreferencesProvider>
     </QueryClientProvider>
   );
 };

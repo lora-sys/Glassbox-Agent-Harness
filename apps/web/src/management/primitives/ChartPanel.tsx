@@ -14,6 +14,36 @@ export interface ChartSeries {
   pattern: 'solid' | 'dashed' | 'dotted';
   color: string;
   data: number[];
+  plotScale?: number;
+}
+
+export function getChartPointCoordinates(
+  val: number,
+  idx: number,
+  length: number,
+  maxVal: number,
+  usableWidth: number,
+  usableHeight: number,
+  paddingX: number,
+  paddingY: number,
+  height: number,
+): { x: number; y: number } {
+  const x = length <= 1 ? paddingX + usableWidth / 2 : paddingX + (idx / (length - 1)) * usableWidth;
+  const safeMax = maxVal > 0 ? maxVal : 1;
+  const y = height - paddingY - (val / safeMax) * usableHeight;
+  return { x, y };
+}
+
+export function getStrokeDasharray(pattern: 'solid' | 'dashed' | 'dotted'): string | undefined {
+  switch (pattern) {
+    case 'dashed':
+      return '6,4';
+    case 'dotted':
+      return '2,4';
+    case 'solid':
+    default:
+      return undefined;
+  }
 }
 
 interface ChartPanelProps {
@@ -36,9 +66,9 @@ export const ChartPanel: React.FC<ChartPanelProps> = ({
   const [showTableFallback, setShowTableFallback] = useState(false);
   const [hoverIndex, setHoverIndex] = useState<number | null>(null);
 
-  // Compute maximum value for scaling
-  const allValues = series.flatMap((s) => s.data);
-  const maxVal = Math.max(...allValues, 1);
+  // Compute maximum value for scaling across plot values (never mutating raw data)
+  const allPlotValues = series.flatMap((s) => s.data.map((val) => val * (s.plotScale ?? 1)));
+  const maxVal = Math.max(...allPlotValues, 1);
 
   // Generate SVG path for a series
   const width = 600;
@@ -47,27 +77,25 @@ export const ChartPanel: React.FC<ChartPanelProps> = ({
   const usableWidth = width - paddingX * 2;
   const usableHeight = height - paddingY * 2;
 
-  const getPoints = (data: number[]) => {
-    if (data.length <= 1) return '';
-    return data
+  const getPoints = (s: ChartSeries) => {
+    if (s.data.length <= 1) return '';
+    const scale = s.plotScale ?? 1;
+    return s.data
       .map((val, idx) => {
-        const x = paddingX + (idx / (data.length - 1)) * usableWidth;
-        const y = height - paddingY - (val / maxVal) * usableHeight;
+        const { x, y } = getChartPointCoordinates(
+          val * scale,
+          idx,
+          s.data.length,
+          maxVal,
+          usableWidth,
+          usableHeight,
+          paddingX,
+          paddingY,
+          height,
+        );
         return `${x.toFixed(1)},${y.toFixed(1)}`;
       })
       .join(' ');
-  };
-
-  const getStrokeDasharray = (pattern: 'solid' | 'dashed' | 'dotted') => {
-    switch (pattern) {
-      case 'dashed':
-        return '6,4';
-      case 'dotted':
-        return '2,4';
-      case 'solid':
-      default:
-        return undefined;
-    }
   };
 
   return (
@@ -138,22 +166,34 @@ export const ChartPanel: React.FC<ChartPanelProps> = ({
             {series.map((s) => (
               <polyline
                 key={s.id}
+                className="chartLine"
                 fill="none"
                 stroke={s.color}
                 strokeWidth="2"
                 strokeDasharray={getStrokeDasharray(s.pattern)}
-                points={getPoints(s.data)}
+                points={getPoints(s)}
               />
             ))}
 
             {/* Data points */}
-            {series.map((s) =>
-              s.data.map((val, idx) => {
-                const x = paddingX + (idx / (s.data.length - 1)) * usableWidth;
-                const y = height - paddingY - (val / maxVal) * usableHeight;
+            {series.map((s) => {
+              const scale = s.plotScale ?? 1;
+              return s.data.map((val, idx) => {
+                const { x, y } = getChartPointCoordinates(
+                  val * scale,
+                  idx,
+                  s.data.length,
+                  maxVal,
+                  usableWidth,
+                  usableHeight,
+                  paddingX,
+                  paddingY,
+                  height,
+                );
                 return (
                   <circle
                     key={`${s.id}-${idx}`}
+                    className="chartPoint"
                     cx={x}
                     cy={y}
                     r={hoverIndex === idx ? 5 : 3}
@@ -165,12 +205,14 @@ export const ChartPanel: React.FC<ChartPanelProps> = ({
                     onMouseLeave={() => setHoverIndex(null)}
                   />
                 );
-              })
-            )}
+              });
+            })}
           </svg>
 
           {hoverIndex !== null && categories[hoverIndex] && (
             <div
+              className="chartTooltip"
+              role="tooltip"
               style={{
                 position: 'absolute',
                 top: 8,

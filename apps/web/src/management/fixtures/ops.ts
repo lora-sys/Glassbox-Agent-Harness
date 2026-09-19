@@ -5,7 +5,34 @@
  * Herdr worker 'done' ≠ Glassbox Task 'DONE'.
  * When worker finishes, Task enters REVIEW state, requiring explicit human Accept / Rework.
  */
-import type { TaskProjection } from '../types';
+import type { TaskProjection, LiveWorkerProjection } from '../types';
+
+export const mockLiveWorkersData: LiveWorkerProjection[] = [
+  {
+    id: 'worker-01',
+    herdrSession: 'default',
+    workspaceName: 'glassbox-adapter',
+    paneName: 'pane-1',
+    state: 'blocked',
+    lastHeartbeat: '25 秒前',
+  },
+  {
+    id: 'worker-04',
+    herdrSession: 'default',
+    workspaceName: 'glassbox',
+    paneName: 'pane-3',
+    state: 'done',
+    lastHeartbeat: '14 分钟前',
+  },
+  {
+    id: 'worker-07',
+    herdrSession: 'secondary',
+    workspaceName: 'glassbox-evals',
+    paneName: 'pane-2',
+    state: 'working',
+    lastHeartbeat: '5 秒前',
+  },
+];
 
 export const mockTasksData: TaskProjection[] = [
   {
@@ -107,8 +134,8 @@ export const mockTasksData: TaskProjection[] = [
     attempts: [],
   },
   {
-    id: 'task-215',
-    title: '长期会话上下文持久化与 Turso 迁移基准测试',
+    id: 'task-215-long-identifier-for-resilience-testing-against-truncation-and-overflow',
+    title: '长期会话上下文持久化与 Turso 数据库跨架构平滑迁移验证基准测试执行计划（第四阶段全量边界覆盖）',
     state: 'DONE',
     priority: 'normal',
     creatorPrincipal: 'owner_primary',
@@ -133,7 +160,8 @@ export const mockTasksData: TaskProjection[] = [
           lastObservedAt: '2026-09-17T13:45:00Z',
         },
         testResults: { passed: 100, total: 100 },
-        artifactUri: 'r2://artifacts/task-215/benchmark-report.json',
+        artifactUri:
+          'r2://artifacts/glassbox/workspaces/storage/runs/task-215/benchmark-long-execution-report-with-verified-provenance-data.json',
         durationMs: 105000,
         settledAt: '2026-09-17T13:45:00Z',
       },

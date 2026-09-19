@@ -20,6 +20,29 @@ interface ManagementAuthProps {
   children: React.ReactNode;
 }
 
+export type TokenVerificationAction =
+  | 'skip_already_verified'
+  | 'skip_in_flight'
+  | 'verify'
+  | 'reset_invalid';
+
+export function determineTokenVerificationAction(
+  token: string | null,
+  verifiedToken: string | null,
+  inFlightToken: string | null,
+): TokenVerificationAction {
+  if (!token || !isValidManagementToken(token)) {
+    return 'reset_invalid';
+  }
+  if (token === verifiedToken) {
+    return 'skip_already_verified';
+  }
+  if (token === inFlightToken) {
+    return 'skip_in_flight';
+  }
+  return 'verify';
+}
+
 export const ManagementAuth: React.FC<ManagementAuthProps> = ({
   mode,
   token,
@@ -33,46 +56,75 @@ export const ManagementAuth: React.FC<ManagementAuthProps> = ({
   const [authError, setAuthError] = useState<{ message: string; status?: number } | null>(null);
   const [isLiveAuthorized, setIsLiveAuthorized] = useState<boolean>(false);
 
+  const verifiedTokenRef = React.useRef<string | null>(null);
+  const inFlightTokenRef = React.useRef<string | null>(null);
+
   // When switching modes or when token changes, re-evaluate authorization
-  const verifyCurrentToken = useCallback(async (tokenToVerify: string) => {
-    setIsVerifying(true);
-    setAuthError(null);
-    try {
-      const res = await onTokenSubmit(tokenToVerify, persistToken);
-      if (res.success) {
-        setIsLiveAuthorized(true);
-        setAuthError(null);
-      } else {
+  const verifyCurrentToken = useCallback(
+    async (tokenToVerify: string, shouldPersist: boolean) => {
+      inFlightTokenRef.current = tokenToVerify;
+      setIsVerifying(true);
+      setIsLiveAuthorized(false);
+      setAuthError(null);
+      try {
+        const res = await onTokenSubmit(tokenToVerify, shouldPersist);
+        if (res.success) {
+          verifiedTokenRef.current = tokenToVerify;
+          setIsLiveAuthorized(true);
+          setAuthError(null);
+        } else {
+          verifiedTokenRef.current = null;
+          setIsLiveAuthorized(false);
+          setAuthError({
+            message: res.error || '管理凭据校验失败',
+            status: res.status || 401,
+          });
+        }
+      } catch (err) {
+        verifiedTokenRef.current = null;
         setIsLiveAuthorized(false);
         setAuthError({
-          message: res.error || '管理凭据校验失败',
-          status: res.status || 401,
+          message: err instanceof Error ? err.message : '无法连接 Glassbox 服务端',
+          status: 500,
         });
+      } finally {
+        inFlightTokenRef.current = null;
+        setIsVerifying(false);
       }
-    } catch (err) {
-      setIsLiveAuthorized(false);
-      setAuthError({
-        message: err instanceof Error ? err.message : '无法连接 Glassbox 服务端',
-        status: 500,
-      });
-    } finally {
-      setIsVerifying(false);
-    }
-  }, [onTokenSubmit, persistToken]);
+    },
+    [onTokenSubmit],
+  );
 
   useEffect(() => {
     if (mode === 'live') {
-      if (token && isValidManagementToken(token)) {
-        verifyCurrentToken(token);
+      const action = determineTokenVerificationAction(
+        token,
+        verifiedTokenRef.current,
+        inFlightTokenRef.current,
+      );
+      if (action === 'skip_already_verified') {
+        setIsLiveAuthorized(true);
+        return;
+      }
+      if (action === 'skip_in_flight') {
+        return;
+      }
+      if (action === 'verify') {
+        setIsLiveAuthorized(false);
+        verifyCurrentToken(token!, persistToken);
       } else {
+        verifiedTokenRef.current = null;
+        inFlightTokenRef.current = null;
         setIsLiveAuthorized(false);
       }
     } else {
       // Design mode is public presentation preview; no live secrets exposed
+      verifiedTokenRef.current = null;
+      inFlightTokenRef.current = null;
       setIsLiveAuthorized(false);
       setAuthError(null);
     }
-  }, [mode, token, verifyCurrentToken]);
+  }, [mode, token, verifyCurrentToken, persistToken]);
 
   // --------------------------------------------------------------------------
   // Mode 1: Design Preview Mode (Deterministic Fixtures, Clearly Labeled)
@@ -85,12 +137,7 @@ export const ManagementAuth: React.FC<ManagementAuthProps> = ({
   // Mode 2: Live Server Mode — Enforce Real Token Authentication & Fail-Closed
   // --------------------------------------------------------------------------
 
-  // If live mode is verified and authorized, render live content
-  if (isLiveAuthorized) {
-    return <>{children}</>;
-  }
-
-  // Live Mode: Verification in progress
+  // Live Mode: Verification in progress — fail closed immediately while verifying
   if (isVerifying) {
     return (
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', background: 'var(--canvas)' }}>
@@ -104,6 +151,11 @@ export const ManagementAuth: React.FC<ManagementAuthProps> = ({
         </div>
       </div>
     );
+  }
+
+  // If live mode is verified and authorized, render live content
+  if (isLiveAuthorized) {
+    return <>{children}</>;
   }
 
   // Live Mode: Auth Rejected / Denied / Server Error
@@ -199,7 +251,7 @@ export const ManagementAuth: React.FC<ManagementAuthProps> = ({
       });
       return;
     }
-    verifyCurrentToken(cleanToken);
+    verifyCurrentToken(cleanToken, persistToken);
   };
 
   return (
@@ -278,7 +330,7 @@ export const ManagementAuth: React.FC<ManagementAuthProps> = ({
               checked={persistToken}
               onChange={(e) => setPersistToken(e.target.checked)}
             />
-            <label htmlFor="persist-token">在当前浏览器会话中记住此凭据</label>
+            <label htmlFor="persist-token">持久化保存在当前浏览器本地 (LocalStorage) — 取消勾选仅保存在当前会话 (SessionStorage)</label>
           </div>
 
           <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>

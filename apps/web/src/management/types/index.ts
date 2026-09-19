@@ -138,10 +138,11 @@ export type AttentionItemProjection = AttentionItemDesignProjection;
 /** 1. Overview Page Data Projection (Aggregated KPI Rollup) */
 export interface OverviewDesignProjection {
   summary: {
-    activeConversations: number;
-    pendingAttentionCount: number;
-    runningTasksCount: number;
-    todayTotalTokens: number;
+    runs24h?: number | null;
+    activeConversations: number | null;
+    pendingAttentionCount: number | null;
+    runningTasksCount: number | null;
+    todayTotalTokens: number | null;
     todayCostUsd: number | null;
     todayCostStatus: CostStatus;
   };
@@ -150,11 +151,11 @@ export interface OverviewDesignProjection {
   piModelUsage: Array<{
     modelId: string;
     modelName: string;
-    callsToday: number;
-    tokensToday: number;
+    callsToday?: number | null;
+    tokensToday?: number | null;
     costUsd: number | null;
     costStatus: CostStatus;
-    p95LatencyMs: number;
+    p95LatencyMs?: number | null;
   }>;
   usageTrend: Array<{
     timestamp: string;
@@ -339,7 +340,7 @@ export interface TraceRunDesignSummary {
   runId: string;
   conversationId: string;
   model: string;
-  eventCount: number;
+  eventCount: number | null;
   status: 'completed' | 'running' | 'failed' | 'canceled';
   durationMs: number;
   timestamp: string;
@@ -355,15 +356,17 @@ export interface PiModelDesignProjection {
   baseUrl?: string;
   model?: string;
   credentialConfigured?: boolean;
-  isDefault: boolean;
-  contextWindowTokens: number;
-  temperature: number;
+  isDefault?: boolean | null;
+  contextWindowTokens?: number | null;
+  temperature?: number | null;
   capabilityState: CapabilityState;
-  tokensToday: number;
+  tokensToday?: number | null;
   costTodayUsd: number | null;
   costStatus: CostStatus;
-  lastError?: string;
-  activeSessionsCount: number;
+  quota?: string | null;
+  quotaStatus?: 'available' | 'unknown' | 'unreported';
+  lastError?: string | null;
+  activeSessionsCount?: number | null;
 }
 export type PiModelProjection = PiModelDesignProjection;
 
@@ -380,14 +383,16 @@ export function mapModelProfileToDesignProjection(
     baseUrl: profile.baseUrl,
     model: profile.model,
     credentialConfigured: profile.credentialConfigured,
-    isDefault: overrides?.isDefault ?? false,
-    contextWindowTokens: overrides?.contextWindowTokens ?? 128000,
-    temperature: overrides?.temperature ?? 0.7,
+    isDefault: overrides?.isDefault ?? null,
+    contextWindowTokens: overrides?.contextWindowTokens ?? null,
+    temperature: overrides?.temperature ?? null,
     capabilityState: profile.credentialConfigured ? '已实现' : 'P3 目标',
-    tokensToday: overrides?.tokensToday ?? 0,
+    tokensToday: overrides?.tokensToday ?? null,
     costTodayUsd: overrides?.costTodayUsd ?? null,
     costStatus: overrides?.costStatus ?? 'unpriced',
-    activeSessionsCount: overrides?.activeSessionsCount ?? 0,
+    quota: overrides?.quota ?? null,
+    quotaStatus: overrides?.quotaStatus ?? 'unreported',
+    activeSessionsCount: overrides?.activeSessionsCount ?? null,
     ...overrides,
   };
 }
@@ -402,9 +407,9 @@ export interface ChannelDesignProjection {
   targetAgent: string;
   ingressPolicy: string;
   deliveryPolicy: string;
-  totalEventsProcessed: number;
-  blockedDeliveriesCount: number;
-  lastEventAt: string;
+  totalEventsProcessed?: number | null;
+  blockedDeliveriesCount?: number | null;
+  lastEventAt?: string | null;
   autoConnect?: boolean;
   tokenConfigured?: boolean;
   recentAuditLogs: Array<{
@@ -441,9 +446,9 @@ export function mapChannelProfileToDesignProjection(
     targetAgent: overrides?.targetAgent ?? 'Glassbox Personal Agent (Main)',
     ingressPolicy: overrides?.ingressPolicy ?? 'Strict Group Allowlist + Owner Direct',
     deliveryPolicy: overrides?.deliveryPolicy ?? 'Private Canary Screening + Delivery Gate',
-    totalEventsProcessed: overrides?.totalEventsProcessed ?? 0,
-    blockedDeliveriesCount: overrides?.blockedDeliveriesCount ?? 0,
-    lastEventAt: overrides?.lastEventAt ?? '—',
+    totalEventsProcessed: overrides?.totalEventsProcessed ?? null,
+    blockedDeliveriesCount: overrides?.blockedDeliveriesCount ?? null,
+    lastEventAt: overrides?.lastEventAt ?? null,
     recentAuditLogs: overrides?.recentAuditLogs ?? [],
     ...overrides,
   };
@@ -521,3 +526,111 @@ export interface SettingsDesignProjection {
   isLocalDraftDirty: boolean;
 }
 export type SettingsProjection = SettingsDesignProjection;
+
+// ============================================================================
+// 4. Auxiliary Section Projections for Completed Page Compositions
+// ============================================================================
+
+/** Live Herdr Worker for Task Collaboration (Ops) page */
+export interface LiveWorkerProjection {
+  id: string;
+  herdrSession: string;
+  workspaceName: string;
+  paneName: string;
+  state: HerdrWorkerState;
+  lastHeartbeat: string;
+}
+
+/** Resource Relationships for Identity & Access page */
+export interface ResourceRelationshipProjection {
+  id: string;
+  resource: string;
+  ownerPrincipal: string;
+  relation: 'owner' | 'reader' | 'delegate';
+  provenance: string;
+}
+
+/** Approval Queue Item for Permissions page */
+export interface ApprovalQueueProjection {
+  id: string;
+  resource: string;
+  principal: string;
+  action: string;
+  reason: string;
+  requestedAt: string;
+  status: 'pending' | 'approved' | 'rejected';
+}
+
+/** Subsystem Service Health for Monitor page */
+export interface ServiceHealthProjection {
+  id: string;
+  name: string;
+  status: 'healthy' | 'slow' | 'stale' | 'down' | 'unreachable';
+  latencyMs?: number | string;
+  errorRate: string;
+  lastSuccess: string;
+  lastError?: string;
+  notes: string;
+}
+
+/** Storage Tier Information for Monitor page */
+export interface StorageProjection {
+  id: string;
+  tier: string;
+  engine: string;
+  usage: string;
+  retention: string;
+  contents: string;
+  role: string;
+}
+
+/** PI Configuration Profile for PI page */
+export interface PiProfileProjection {
+  id: string;
+  name: string;
+  description: string;
+  preset: string;
+  toolsCount: number;
+  extensionsLoaded: number;
+}
+
+/** PI Session Health for PI page */
+export interface PiSessionHealthProjection {
+  sessionId: string;
+  modelId: string;
+  channel: string;
+  status: 'active' | 'idle' | 'closed';
+  lastActivity: string;
+}
+
+/** Channel Contract for Channels page */
+export interface ChannelContractProjection {
+  id: string;
+  channel: string;
+  kind: string;
+  ingressRule: string;
+  deliveryGate: string;
+  activation: string;
+  state: string;
+}
+
+/** Identity Mapping for Channels page */
+export interface ChannelIdentityMappingProjection {
+  id: string;
+  channel: string;
+  externalIdentity: string;
+  mappedPrincipal: string;
+  verified: boolean;
+  boundAt: string;
+}
+
+/** Channel Activity Log for Channels page */
+export interface ChannelActivityProjection {
+  id: string;
+  channel: string;
+  direction: 'ingress' | 'delivery';
+  identity: string;
+  action: string;
+  decision: AuthorizationDecision;
+  timestamp: string;
+}

@@ -15,6 +15,8 @@ export interface ManageSearch {
   page?: ManagementPageId;
   mode?: 'design' | 'live';
   runId?: string;
+  testPrincipal?: string;
+  selectedId?: string;
 }
 
 export const Route = createRoute({
@@ -25,8 +27,10 @@ export const Route = createRoute({
       ? (search.page as ManagementPageId)
       : 'overview';
     const mode = search.mode === 'live' ? 'live' : 'design';
-    const runId = typeof search.runId === 'string' ? search.runId : undefined;
-    return { page, mode, runId };
+    const runId = typeof search.runId === 'string' && search.runId ? search.runId : undefined;
+    const testPrincipal = typeof search.testPrincipal === 'string' && search.testPrincipal ? search.testPrincipal : undefined;
+    const selectedId = typeof search.selectedId === 'string' && search.selectedId ? search.selectedId : undefined;
+    return { page, mode, runId, testPrincipal, selectedId };
   },
   component: ManagementRoot,
 });

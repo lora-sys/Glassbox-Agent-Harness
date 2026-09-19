@@ -6,7 +6,28 @@
  * - Four Hard Gates
  * - Interactive Decision Tester simulation
  */
-import type { PermissionRuleProjection, DecisionTesterInput, DecisionTesterResult } from '../types';
+import type { PermissionRuleProjection, DecisionTesterInput, DecisionTesterResult, ApprovalQueueProjection } from '../types';
+
+export const mockApprovalQueueData: ApprovalQueueProjection[] = [
+  {
+    id: 'appr-001',
+    resource: 'workspace:clean_reset',
+    principal: 'owner_primary',
+    action: 'execute',
+    reason: '触发破坏性工作区重置门禁 (Hard Gate 2)',
+    requestedAt: '10 分钟前',
+    status: 'pending',
+  },
+  {
+    id: 'appr-002',
+    resource: 'channel:qq_group:admin_broadcast',
+    principal: 'visitor_guest_99',
+    action: 'deliver_audit_summary',
+    reason: '访客申请向群广播审计摘要，受投递门禁保护',
+    requestedAt: '35 分钟前',
+    status: 'rejected',
+  },
+];
 
 export const mockPermissionRules: PermissionRuleProjection[] = [
   {

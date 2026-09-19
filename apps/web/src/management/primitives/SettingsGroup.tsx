@@ -17,6 +17,7 @@ export const SettingsField: React.FC<SettingsFieldProps> = ({
   children,
 }) => (
   <div
+    className="settingsField"
     style={{
       display: 'flex',
       justifyContent: 'space-between',
