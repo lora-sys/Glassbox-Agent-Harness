@@ -181,4 +181,131 @@ describe("Dual Owner support", () => {
     expect(conv2.conversation.principalId).toBe("owner-secondary");
     expect(scopeKey(scope1)).not.toBe(scopeKey(scope2));
   });
+
+  it("verifies live production configuration with real QQ numbers", () => {
+    const liveConfig = parseOneBotConfig({
+      connectionId: "p3-qq",
+      label: "P3 QQ acceptance",
+      endpoint: "ws://127.0.0.1:6700/",
+      botId: "3394947361",
+      ownerId: "3526039967",
+      coOwnerId: "3067670134",
+      visitorIds: ["3654774349"],
+      groupIds: ["1126022432"],
+      credentialSlot: "channel-cbfc5efd-9513-4ba0-ae0d-93cf918a9774",
+    });
+
+    expect(liveConfig.botId).toBe("3394947361");
+    expect(liveConfig.ownerId).toBe("3526039967");
+    expect(liveConfig.coOwnerId).toBe("3067670134");
+    expect(liveConfig.visitorIds).toEqual(["3654774349"]);
+    expect(liveConfig.groupIds).toEqual(["1126022432"]);
+
+    // Owner 1 (3526039967) private message
+    const o1Private = normalizeOneBotMessage(
+      {
+        post_type: "message",
+        message_type: "private",
+        sub_type: "friend",
+        self_id: 3394947361,
+        user_id: 3526039967,
+        message_id: 201,
+        message: "hello from owner 1 private",
+      },
+      liveConfig,
+    );
+    expect(o1Private.kind).toBe("message");
+
+    // Owner 2 (3067670134) private message
+    const o2Private = normalizeOneBotMessage(
+      {
+        post_type: "message",
+        message_type: "private",
+        sub_type: "friend",
+        self_id: 3394947361,
+        user_id: 3067670134,
+        message_id: 202,
+        message: "hello from owner 2 private",
+      },
+      liveConfig,
+    );
+    expect(o2Private.kind).toBe("message");
+
+    // Owner 1 (3526039967) group message
+    const o1Group = normalizeOneBotMessage(
+      {
+        post_type: "message",
+        message_type: "group",
+        sub_type: "normal",
+        self_id: 3394947361,
+        user_id: 3526039967,
+        group_id: 1126022432,
+        message_id: 203,
+        message: [
+          { type: "at", data: { qq: "3394947361" } },
+          { type: "text", data: { text: "owner 1 in group" } },
+        ],
+      },
+      liveConfig,
+    );
+    expect(o1Group.kind).toBe("message");
+
+    // Owner 2 (3067670134) group message
+    const o2Group = normalizeOneBotMessage(
+      {
+        post_type: "message",
+        message_type: "group",
+        sub_type: "normal",
+        self_id: 3394947361,
+        user_id: 3067670134,
+        group_id: 1126022432,
+        message_id: 204,
+        message: [
+          { type: "at", data: { qq: "3394947361" } },
+          { type: "text", data: { text: "owner 2 in group" } },
+        ],
+      },
+      liveConfig,
+    );
+    expect(o2Group.kind).toBe("message");
+
+    // Visitor (3654774349) group message
+    const visitorGroup = normalizeOneBotMessage(
+      {
+        post_type: "message",
+        message_type: "group",
+        sub_type: "normal",
+        self_id: 3394947361,
+        user_id: 3654774349,
+        group_id: 1126022432,
+        message_id: 205,
+        message: [
+          { type: "at", data: { qq: "3394947361" } },
+          { type: "text", data: { text: "visitor in group" } },
+        ],
+      },
+      liveConfig,
+    );
+    expect(visitorGroup.kind).toBe("message");
+
+    // Unknown QQ ignored
+    const unknownGroup = normalizeOneBotMessage(
+      {
+        post_type: "message",
+        message_type: "group",
+        sub_type: "normal",
+        self_id: 3394947361,
+        user_id: 99999999,
+        group_id: 1126022432,
+        message_id: 206,
+        message: [
+          { type: "at", data: { qq: "3394947361" } },
+          { type: "text", data: { text: "stranger" } },
+        ],
+      },
+      liveConfig,
+    );
+    expect(unknownGroup.kind).toBe("ignored");
+  });
 });
+

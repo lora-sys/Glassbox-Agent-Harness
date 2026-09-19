@@ -20,6 +20,7 @@ export interface ChannelSaveInput {
   endpoint: string;
   botId: string;
   ownerId: string;
+  coOwnerId?: string;
   groupIds: string[];
   executionRef: string;
   /** Omitted preserves the token, null clears it, a string replaces it. */

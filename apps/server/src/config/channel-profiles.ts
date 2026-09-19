@@ -69,6 +69,7 @@ function toConfig(channel: StoredChannel): OneBotConnectionConfig {
     endpoint: channel.endpoint,
     botId: channel.botId,
     ownerId: channel.ownerId,
+    ...(channel.coOwnerId !== undefined ? { coOwnerId: channel.coOwnerId } : {}),
     visitorIds: channel.visitorIds,
     groupIds: channel.groupIds,
     credentialSlot: channel.credentialSlot,
@@ -83,6 +84,7 @@ function parseChannel(value: unknown): StoredChannel {
   if (
     typeof input.botId !== "string" ||
     typeof input.ownerId !== "string" ||
+    (input.coOwnerId !== undefined && typeof input.coOwnerId !== "string") ||
     !Array.isArray(input.groupIds) ||
     input.groupIds.some((id) => typeof id !== "string")
   )
@@ -95,6 +97,7 @@ function parseChannel(value: unknown): StoredChannel {
     endpoint: text(input.endpoint, "OneBot address", 2048),
     botId: input.botId,
     ownerId: input.ownerId,
+    ...(typeof input.coOwnerId === "string" ? { coOwnerId: input.coOwnerId } : {}),
     groupIds: [...input.groupIds] as string[],
     executionRef: executionReference(input.executionRef),
     credentialSlot: identifier(input.credentialSlot),
