@@ -367,6 +367,44 @@ Procedural knowledge that stabilizes into a reusable validated workflow should n
 
 Raw Conversation history is not automatically Memory.
 
+### Memory scope
+
+Memory must keep the scope and visibility of its evidence unless an explicit authorized action changes them.
+
+Initial useful namespaces include:
+
+```text
+owner_private
+project
+group
+```
+
+A group-derived Memory stays in that group's namespace by default.
+
+```text
+group A evidence
+→ group A Memory
+```
+
+It must not silently become group B Context.
+
+The Owner private Main Agent may retrieve across several authorized group namespaces for Owner use. Cross-group synthesis should create a derived Owner-only insight with source provenance instead of rewriting source group Memory.
+
+Conceptual shape:
+
+```text
+OwnerInsight
+  statement
+  sourceScopes
+  sourceRefs
+  confidence
+  visibility = owner_private
+```
+
+A later explicit promotion may turn repeated cross-group evidence into a Skill candidate, Rule candidate, system-learning candidate, or product improvement proposal.
+
+Group assignment outcomes may become Memory evidence after P4 exists. The assignment database itself remains operational product state.
+
 ## Memory promotion
 
 A Memory candidate should consider at least:
@@ -460,13 +498,14 @@ P4.2 — Task-aware Taste Retrieval
   scope and authorization checks
 
 P4.3 — Semantic Memory
-  facts and durable project knowledge
+  facts, durable project knowledge, and group-scoped knowledge
 
 P4.4 — Episodic Memory
-  meaningful prior Run / Task / Conversation outcomes
+  meaningful prior Run / Task / Conversation / group-assignment outcomes
 
 P4.5 — Authorized Retrieval
   lexical first, hybrid/vector when justified
+  Owner-private cross-group retrieval without group-to-group leakage
 
 P4.6 — Inspection and Eval
   inspect evidence, confidence, scope, retrieval reason, and impact
