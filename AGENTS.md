@@ -30,6 +30,8 @@ No matching grant means `DENY`.
 
 Never load protected data into model-visible Context and rely on a Prompt to keep it secret.
 
+Tool definitions and Tool schemas are model-visible Context. Build the effective Tool surface after Principal, Location, Conversation, scope configuration, and authorization are known. Do not attach an unauthorized capability definition and rely only on call-time denial.
+
 Security boundaries must be enforced in code. Prompt instructions may guide behavior, but they are never an authorization mechanism.
 
 A protected operation must preserve enough structured context to answer:
@@ -61,6 +63,8 @@ Session ≠ Run
 Task ≠ Run
 Task ≠ Worker
 TaskAttempt ≠ Worker lifecycle state
+GroupAssignment ≠ Task
+structured product state ≠ Memory
 Herdr Agent state ≠ Task acceptance
 Runtime / Provider / Worker ≠ Personal Agent
 Pi ≠ Personal Agent
@@ -189,11 +193,13 @@ When a requirement is ambiguous, choose the smaller implementation that preserve
 
 Do not silently expand scope from the roadmap.
 
-The only active implementation plan is:
+The active implementation plan is:
 
 ```text
-.plans/03-personal-agent-foundation.md
+.plans/03-plus-owner-group-utility.md
 ```
+
+Plan 03 is the completed foundation.
 
 Read in this order before changing code:
 
@@ -208,11 +214,13 @@ Read in this order before changing code:
 
 | Topic | Source of truth |
 | --- | --- |
-| Current implementation order, slices, completion gate, acceptance matrix | `.plans/03-personal-agent-foundation.md` |
+| Current P3+ implementation order and completion gate | `.plans/03-plus-owner-group-utility.md` |
+| Completed P3 foundation and acceptance contract | `.plans/03-personal-agent-foundation.md` |
 | Product sequencing after the active Plan | `.plans/roadmap.md` |
 | Runtime ownership and Pi SDK boundary | `docs/runtime-strategy.md` |
 | Lora PI Kit distribution, bundled Skills, MCP, profiles, install, locks | `docs/lora-pi-kit.md` |
 | Herdr, Task, Attention, TaskAttempt, WorkerBinding, Ops Tools, reconciliation | `docs/agent-operations.md` |
+| Owner private control, per-Run Tool surface, group assignments and group utility | `docs/owner-group-operations.md` |
 | Rules, Skills, Taste, Feedback, Memory, learning, retrieval | `docs/memory-taste.md` |
 | Toolchain, dependencies, build, test, local development | `docs/tech-stack.md` |
 | Persistence, storage, observability, monitoring, public/private projections | `docs/data-observability.md` |
@@ -246,6 +254,8 @@ Use these terms consistently.
 - **Run**: one concrete Agent execution.
 - **Task**: durable product work tracked by Glassbox.
 - **TaskAttempt**: one concrete execution or rework attempt for a Task.
+- **GroupAssignment**: durable human work assigned inside a group scope. It is not an Agent Operations Task and is not Memory.
+- **RunCapabilitySet**: the server-selected model-visible capability projection for one Run. It narrows capability exposure but is not an authorization source.
 - **AttentionItem**: something that currently needs main-Agent or human action.
 - **WorkerBinding**: the mapping from a TaskAttempt to its concrete Worker execution location.
 - **AgentOpsSnapshot**: a compact projection of current Task, Attention, and Worker state for the main Agent.
