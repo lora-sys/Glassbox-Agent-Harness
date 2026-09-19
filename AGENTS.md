@@ -30,6 +30,8 @@ No matching grant means `DENY`.
 
 Never load protected data into model-visible Context and rely on a Prompt to keep it secret.
 
+Tool definitions and Tool schemas are model-visible Context. Build the effective Tool surface after Principal, Location, Conversation, and policy are known. Do not expose a capability definition to a Principal that is not authorized to receive it and rely only on call-time denial.
+
 Security boundaries must be enforced in code. Prompt instructions may guide behavior, but they are never an authorization mechanism.
 
 A protected operation must preserve enough structured context to answer:
@@ -61,6 +63,8 @@ Session ≠ Run
 Task ≠ Run
 Task ≠ Worker
 TaskAttempt ≠ Worker lifecycle state
+Group ≠ Agent
+GroupAssignment ≠ Task
 Herdr Agent state ≠ Task acceptance
 Runtime / Provider / Worker ≠ Personal Agent
 Pi ≠ Personal Agent
@@ -213,6 +217,7 @@ Read in this order before changing code:
 | Runtime ownership and Pi SDK boundary | `docs/runtime-strategy.md` |
 | Lora PI Kit distribution, bundled Skills, MCP, profiles, install, locks | `docs/lora-pi-kit.md` |
 | Herdr, Task, Attention, TaskAttempt, WorkerBinding, Ops Tools, reconciliation | `docs/agent-operations.md` |
+| Owner control, group assignments, schedules, group Tool bindings, per-run capability surface | `docs/owner-group-operations.md` |
 | Rules, Skills, Taste, Feedback, Memory, learning, retrieval | `docs/memory-taste.md` |
 | Toolchain, dependencies, build, test, local development | `docs/tech-stack.md` |
 | Persistence, storage, observability, monitoring, public/private projections | `docs/data-observability.md` |
@@ -246,6 +251,9 @@ Use these terms consistently.
 - **Run**: one concrete Agent execution.
 - **Task**: durable product work tracked by Glassbox.
 - **TaskAttempt**: one concrete execution or rework attempt for a Task.
+- **GroupAssignment**: durable human-oriented work assigned to participants in a group scope. It is not an Agent Operations Task.
+- **ToolDefinition**: a versioned capability definition and permission manifest that may be bound to scopes and selected into a Run.
+- **RunCapabilitySet**: the server-selected capability projection for one Run after profile, scope, and authorization narrowing. It is not authorization policy.
 - **AttentionItem**: something that currently needs main-Agent or human action.
 - **WorkerBinding**: the mapping from a TaskAttempt to its concrete Worker execution location.
 - **AgentOpsSnapshot**: a compact projection of current Task, Attention, and Worker state for the main Agent.
