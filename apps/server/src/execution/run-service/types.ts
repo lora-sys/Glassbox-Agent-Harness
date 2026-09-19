@@ -56,6 +56,14 @@ export type RunServiceEvent =
       status: DeliveryRecord["status"];
     }
   | {
+      type: "delivery_blocked";
+      runId: string;
+      conversationId: string;
+      reasons: string[];
+      candidateSha256: string;
+      candidateBytes: number;
+    }
+  | {
       type: "recovered";
       interruptedRunIds: string[];
       unknownRunIds: string[];
@@ -69,6 +77,12 @@ export interface RunServiceOptions {
   concurrency?: number;
   deliveryTimeoutMs?: number;
   onEvent?: (event: RunServiceEvent) => void | Promise<void>;
+  prepareDelivery?: (candidate: string) => Promise<{
+    allowed: boolean;
+    text?: string;
+    reasons: string[];
+    candidateSha256: string;
+  }>;
   /** Fixed diagnostic codes only; provider errors and protected payloads are excluded. */
   onError?: (error: {
     code: "dispatch_failed" | "delivery_failed" | "evidence_failed";

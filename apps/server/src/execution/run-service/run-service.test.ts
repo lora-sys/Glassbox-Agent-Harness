@@ -108,7 +108,11 @@ function service(
   store: DomainStore,
   adapter: RunExecutionAdapter,
   transport: RunTransport = { send: async () => ({ status: "sent" }) },
-  options: { concurrency?: number; deliveryTimeoutMs?: number } = {},
+  options: {
+    concurrency?: number;
+    deliveryTimeoutMs?: number;
+    prepareDelivery?: ConstructorParameters<typeof RunService>[0]["prepareDelivery"];
+  } = {},
 ) {
   const events: RunServiceEvent[] = [];
   const errors: unknown[] = [];
@@ -234,7 +238,7 @@ describe("durable Run scheduling", () => {
     }
   });
 
-  it("deduplicates simultaneous incoming messages and immutable acknowledgement/result sends", async () => {
+  it("deduplicates simultaneous incoming messages and sends only the immutable result", async () => {
     const { store } = await fixture();
     const execute = vi.fn(async (): Promise<ExecutionResult> => ({
       status: "succeeded",
@@ -249,13 +253,10 @@ describe("durable Run scheduling", () => {
     await instance.drain();
     expect(new Set(accepted.map((entry) => entry.run.id)).size).toBe(1);
     expect(execute).toHaveBeenCalledTimes(1);
-    expect(send).toHaveBeenCalledTimes(2);
-    expect((await store.lifecycle.listDeliveries(owner(), accepted[0]!.run.id)).items).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ payloadKind: "ack", status: "sent" }),
-        expect.objectContaining({ payloadKind: "result", payloadText: "done", status: "sent" }),
-      ]),
-    );
+    expect(send).toHaveBeenCalledTimes(1);
+    expect((await store.lifecycle.listDeliveries(owner(), accepted[0]!.run.id)).items).toEqual([
+      expect.objectContaining({ payloadKind: "result", payloadText: "done", status: "sent" }),
+    ]);
   });
 
   it("rechecks queued authorization and requires explicit refresh after a policy change", async () => {
@@ -303,7 +304,7 @@ describe("durable Run scheduling", () => {
       status: "succeeded",
       resultText: null,
     });
-    expect(send).toHaveBeenCalledTimes(1);
+    expect(send).not.toHaveBeenCalled();
     expect(JSON.stringify(events)).not.toContain("WITHHELD-FIXTURE-98");
     expect(events).toContainEqual(
       expect.objectContaining({ type: "run_finished", outputWithheld: true }),
@@ -312,6 +313,53 @@ describe("durable Run scheduling", () => {
       (await store.conversations.getConversation(owner(), accepted.conversation.id))
         .providerSessionId,
     ).toBeNull();
+  });
+
+  it("blocks an unsafe candidate, records only its digest, and excludes it from later context", async () => {
+    const { store } = await fixture();
+    const send = vi.fn(async (): Promise<{ status: "sent" }> => ({ status: "sent" }));
+    const execute = vi
+      .fn<RunExecutionAdapter["execute"]>()
+      .mockResolvedValueOnce({ status: "succeeded", text: "C:\\Users\\owner\\secret" })
+      .mockResolvedValueOnce({ status: "succeeded", text: "safe" });
+    const { instance, events } = service(
+      store,
+      { supportsGroup: true, execute },
+      { send },
+      {
+        prepareDelivery: async (candidate) =>
+          candidate === "safe"
+            ? { allowed: true, text: candidate, reasons: [], candidateSha256: "safe-digest" }
+            : {
+                allowed: false,
+                reasons: ["windows-absolute-path"],
+                candidateSha256: "blocked-digest",
+              },
+      },
+    );
+    await instance.start();
+    const blocked = await instance.receive(input("blocked-output"));
+    await instance.drain();
+    expect(send).not.toHaveBeenCalled();
+    expect((await store.lifecycle.listDeliveries(owner(), blocked.run.id)).items).toEqual([]);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "delivery_blocked",
+        reasons: ["windows-absolute-path"],
+        candidateSha256: "blocked-digest",
+      }),
+    );
+    expect(JSON.stringify(events)).not.toContain("C:\\Users\\owner\\secret");
+    const duplicate = await instance.receive(input("blocked-output"));
+    await instance.drain();
+    expect(duplicate.duplicate).toBe(true);
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(events.filter((event) => event.type === "delivery_blocked")).toHaveLength(1);
+
+    const next = await instance.receive(input("after-block"));
+    await instance.drain();
+    expect(execute.mock.calls[1]?.[0].history).toEqual([]);
+    expect((await instance.getRun(owner(), next.run.id)).status).toBe("succeeded");
   });
 
   it("keeps cancelling until the executor confirms its outcome", async () => {

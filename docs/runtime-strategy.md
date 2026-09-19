@@ -253,6 +253,19 @@ Do not start every available MCP integration by default.
 
 An installed MCP Tool is still subject to Glassbox authorization when used through Glassbox.
 
+Glassbox selects the Tool schema list for each Run before it creates the Pi session. A Tool requires an explicit discovery grant for the current Principal and location before Pi receives its name, description or parameters. The Tool re-authorizes its concrete Resource and Action again when Pi calls it.
+
+    Run caller and location
+    → Tool discovery authorization
+    → selected Pi Tool schemas
+    → Pi Tool call
+    → execution authorization
+    → Tool result
+
+Profiles and package configuration may narrow this list. They cannot add a Tool that Glassbox did not authorize.
+
+For the explicit Owner group-access command, Glassbox also verifies that Pi produced a successful matching Tool result before it accepts an execution claim. It permits one corrective Pi turn in the same Run. If the Tool still does not execute, the Run fails with a safe result and product state stays unchanged.
+
 ## Package and settings rule
 
 Use Pi's public package mechanism for distributable resources.

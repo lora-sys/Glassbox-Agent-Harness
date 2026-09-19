@@ -186,6 +186,11 @@ export class ModelProfileStore {
     };
   }
 
+  /** Server-only delivery screening input. Never serialize these values or include them in Trace. */
+  protectedValues(): string[] {
+    return Object.values(this.#settings.credentials);
+  }
+
   /** Omitted apiKey preserves the current key. null explicitly removes it. */
   save(input: unknown): Promise<PublicModelProfile> {
     const value = record(input);

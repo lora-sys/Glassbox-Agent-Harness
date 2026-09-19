@@ -31,9 +31,9 @@ const service = new RunService({
     },
   }),
   transport: {
-    send: async ({ delivery }) => {
+    send: async () => {
       sends++;
-      return delivery.payloadKind === "ack" ? { status: "sent" } : { status: "unknown" };
+      return { status: "unknown" };
     },
   },
 });
@@ -66,7 +66,7 @@ try {
     assert.ok(delivery);
     assert.equal(delivery.status, "unknown");
     await assert.rejects(() => service.retryDelivery(caller, accepted.run.id, delivery.id));
-    assert.equal(sends, 2);
+    assert.equal(sends, 1);
     assert.equal(executions, 1);
     process.stdout.write(JSON.stringify({ runId: accepted.run.id, deliveryId: delivery.id }));
   } else {

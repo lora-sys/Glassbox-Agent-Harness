@@ -1,11 +1,13 @@
 import { once } from "node:events";
 import { mkdtemp, rm } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
+import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import { ModelProfileStore } from "../config/model-profiles.js";
+import { ChannelProfileStore } from "../config/channel-profiles.js";
 import type { ExecutionInput, ExecutionResult } from "../execution/run-service/types.js";
 import { ManagementApplication } from "./application.js";
 
@@ -61,7 +63,12 @@ async function fixture(execute: (input: ExecutionInput) => Promise<ExecutionResu
           echo: action.echo,
           status: "ok",
           retcode: 0,
-          data: action.action === "get_login_info" ? { user_id: 10001 } : { message_id: 20001 },
+          data:
+            action.action === "get_login_info"
+              ? { user_id: 10001 }
+              : action.action === "get_group_info"
+                ? { group_id: action.params.group_id }
+                : { message_id: 20001 },
         }),
       );
     });
@@ -101,7 +108,7 @@ async function fixture(execute: (input: ExecutionInput) => Promise<ExecutionResu
   });
   await app.connectChannel("fixture");
   const socket = await sockets.take();
-  const send = (id: number, text: string, privateChat = false, senderId = 10002) =>
+  const send = (id: number, text: string, privateChat = false, senderId = 10002, groupId = 10003) =>
     socket.send(
       JSON.stringify({
         post_type: "message",
@@ -110,7 +117,7 @@ async function fixture(execute: (input: ExecutionInput) => Promise<ExecutionResu
         message_id: id,
         message_type: privateChat ? "private" : "group",
         sub_type: privateChat ? "friend" : "normal",
-        group_id: 10003,
+        group_id: groupId,
         anonymous: null,
         message: [
           ...(privateChat ? [] : [{ type: "at", data: { qq: "10001" } }]),
@@ -126,6 +133,95 @@ async function fixture(execute: (input: ExecutionInput) => Promise<ExecutionResu
 }
 
 describe("channel to durable run composition", () => {
+  it("keeps an auto-connect channel retrying when OneBot becomes ready after server startup", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "glassbox-late-onebot-"));
+    cleanup.push(() => rm(directory, { recursive: true, force: true }));
+    const reservation = createNetServer();
+    await new Promise<void>((resolve, reject) => {
+      reservation.once("error", reject);
+      reservation.listen(0, "127.0.0.1", resolve);
+    });
+    const port = (reservation.address() as AddressInfo).port;
+    await new Promise<void>((resolve) => reservation.close(() => resolve()));
+
+    const channels = await ChannelProfileStore.open(directory);
+    await channels.save({
+      id: "late",
+      label: "Late OneBot",
+      kind: "qq-onebot",
+      endpoint: `ws://127.0.0.1:${port}/`,
+      botId: "10001",
+      ownerId: "10002",
+      visitorIds: [],
+      groupIds: [],
+      token: "late-token",
+      executionRef: "claude-code",
+    });
+    await channels.setAutoConnect("late", true);
+    const models = await ModelProfileStore.open(directory);
+    const app = await ManagementApplication.open({
+      dataDirectory: directory,
+      databasePath: ":memory:",
+      models,
+      executors: new Map([
+        [
+          "claude-code",
+          { supportsGroup: true, execute: async () => ({ status: "succeeded", text: "unused" }) },
+        ],
+      ]),
+    });
+    cleanup.push(() => app.close());
+    expect(app.listChannels()[0]?.connectionState).toBe("connecting");
+
+    const peer = new WebSocketServer({ host: "127.0.0.1", port });
+    cleanup.push(
+      () =>
+        new Promise<void>((resolve) => {
+          for (const socket of peer.clients) socket.terminate();
+          peer.close(() => resolve());
+        }),
+    );
+    peer.on("connection", (socket) => {
+      socket.on("message", (raw) => {
+        const bytes = Array.isArray(raw)
+          ? Buffer.concat(raw)
+          : raw instanceof ArrayBuffer
+            ? Buffer.from(raw)
+            : raw;
+        const request = JSON.parse(bytes.toString("utf8")) as { echo: string };
+        socket.send(
+          JSON.stringify({
+            echo: request.echo,
+            status: "ok",
+            retcode: 0,
+            data: { user_id: 10001 },
+          }),
+        );
+      });
+    });
+    await once(peer, "listening");
+    await expect
+      .poll(() => app.listChannels()[0]?.connectionState, { timeout: 5_000 })
+      .toBe("connected");
+    const ownerScope = {
+      connectionId: "late",
+      botId: "10001",
+      chatType: "private" as const,
+      chatId: "10002",
+      senderId: "10002",
+    };
+    expect(await app.store.identities.resolve(ownerScope)).toMatchObject({ principalId: "owner" });
+    expect(
+      (
+        await app.store.authorization.check({
+          caller: { principalId: "owner", scope: ownerScope },
+          resourceId: "tool:owner_group_set_access",
+          action: "tool:discover",
+        })
+      ).decision,
+    ).toBe("ALLOW");
+  });
+
   it("routes a configured Visitor DM through its own identity and reply destination", async () => {
     const f = await fixture(async (input) => ({
       status: "succeeded",
@@ -216,5 +312,66 @@ describe("channel to durable run composition", () => {
       connectionState: "disconnected",
       autoConnect: false,
     });
+  });
+
+  it("blocks a configured channel credential from QQ delivery without copying it into Trace", async () => {
+    const f = await fixture(async () => ({ status: "succeeded", text: "fixture-token" }));
+    f.send(1, "credential-output", true);
+    const input = await f.started.take();
+    await f.app.runs.waitForRun(input.caller, input.run.id);
+    await f.app.runs.drain();
+    expect((await f.app.store.lifecycle.listDeliveries(input.caller, input.run.id)).items).toEqual(
+      [],
+    );
+    const trace = await f.app.trace.readPage(input.run.id);
+    expect(JSON.stringify(trace)).not.toContain("fixture-token");
+    expect(
+      trace.records.some((record) => {
+        const event = record.event as { type?: string; reasons?: string[] };
+        return (
+          event.type === "delivery_blocked" &&
+          event.reasons?.some((reason) => reason.startsWith("protected:")) === true
+        );
+      }),
+    ).toBe(true);
+  });
+
+  it("lets only an Owner-private action enable and revoke a new group for registered identities", async () => {
+    const f = await fixture(async (input) => ({
+      status: "succeeded",
+      text: `answer:${input.text}`,
+    }));
+    f.send(1, "owner-control", true);
+    const ownerRun = await f.started.take();
+    await f.reply("answer:owner-control");
+    const application = f.app as unknown as {
+      setGroupAccess(
+        context: { caller: ExecutionInput["caller"]; conversationId: string; runId: string },
+        input: { groupId: string; enabled: boolean },
+      ): Promise<{ groupId: string; enabled: boolean }>;
+    };
+    const context = {
+      caller: ownerRun.caller,
+      conversationId: ownerRun.conversation.id,
+      runId: ownerRun.run.id,
+    };
+    await expect(
+      application.setGroupAccess(context, { groupId: "10005", enabled: true }),
+    ).resolves.toEqual({ groupId: "10005", enabled: true });
+    expect(f.app.listChannels()[0]?.groupIds).toContain("10005");
+
+    f.send(2, "new-group", false, 10004, 10005);
+    const newGroupRun = await f.started.take();
+    await f.reply("answer:new-group");
+    expect(newGroupRun.caller.principalId).toBe("qq-visitor-10004");
+    expect(newGroupRun.caller.scope.chatId).toBe("10005");
+
+    await application.setGroupAccess(context, { groupId: "10005", enabled: false });
+    expect(f.app.listChannels()[0]?.groupIds).not.toContain("10005");
+    f.send(3, "revoked-group", false, 10004, 10005);
+    f.send(4, "queue-barrier", true);
+    await f.started.take((input) => input.text === "queue-barrier");
+    await f.reply("answer:queue-barrier");
+    expect(f.calls.some((call) => call.text === "revoked-group")).toBe(false);
   });
 });

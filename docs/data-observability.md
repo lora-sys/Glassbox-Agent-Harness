@@ -303,6 +303,10 @@ Public visitors only receive sanitized, explicitly published Trace or Eval proje
 
 Private Tasks, Taste, Memory, feedback payloads, Worker output, Herdr pane data, runtime credentials, and private operational metadata are not public by default.
 
+QQ result delivery applies a content gate before it creates a Delivery. The gate checks the raw model candidate, renders QQ plain text, and checks the rendered text again. A blocked candidate creates no Delivery and is excluded from later model Context.
+
+The append-only delivery_blocked event stores reason codes, candidate byte count and a SHA-256 digest. It does not store the blocked candidate in that event. The original protected Run result remains subject to its existing database and authorization boundary.
+
 ## Server deployment rule
 
 Local testing and the production Linux server use the same product contracts.

@@ -12,6 +12,20 @@ export interface WorkerTarget {
   branch?: string;
 }
 
+export const OPS_TOOL_NAMES = Object.freeze([
+  "ops_status",
+  "task_list",
+  "task_get",
+  "task_create",
+  "worker_status",
+  "task_delegate",
+  "worker_read",
+  "worker_prompt",
+  "task_accept",
+  "task_rework",
+  "task_cancel",
+] as const);
+
 /** The model never supplies routing, Principal, filesystem paths or worker kind. */
 export function createOpsTools(options: {
   store: DomainStore;

@@ -81,7 +81,6 @@ export class RunService {
     // Re-read by authenticated scope; caller-supplied input text and snapshots are never executed.
     const caller = structuredClone(accepted.caller);
     const run = await this.options.store.conversations.getRun(caller, accepted.run.id);
-    await this.ensureAck(caller, run);
     if (!accepted.duplicate)
       await this.emit({ type: "run_queued", runId: run.id, conversationId: run.conversationId });
     if (terminal.has(run.status)) this.publishInBackground(caller, run);
@@ -306,8 +305,6 @@ export class RunService {
     try {
       run = await this.getRun(caller, runId);
       if (run.status !== "queued") return;
-      const ackId = await this.ensureAck(caller, run);
-      await this.sendPending(caller, run.id, ackId);
       if (!this.started || active.controller.signal.aborted) return;
       active.lease = await this.options.store.lifecycle.claimQueuedRun(caller, run.id);
     } catch (error) {
@@ -387,28 +384,37 @@ export class RunService {
     await this.publishTerminal(caller, finished.run);
   }
 
-  private ensureAck(caller: CallerContext, run: RunRecord): Promise<string> {
-    return this.options.store.lifecycle.createDelivery(caller, {
-      runId: run.id,
-      dedupKey: "ack",
-      destination: caller.scope,
-      payloadText: `已接收任务 ${run.id}`,
-      payloadKind: "ack",
-    });
-  }
-
   private async publishTerminal(caller: CallerContext, record: RunRecord): Promise<void> {
     // Re-read through authorization before loading the persisted result for transport.
     const run = await this.getRun(caller, record.id);
     if (!terminal.has(run.status)) return;
     const existing = await this.options.store.lifecycle.findDelivery(caller, run.id, "result");
     if (!existing) {
-      const payloadText = run.resultText ?? `任务 ${run.id} 状态为 ${run.status}。`;
+      const candidate = run.resultText ?? `任务处理未完成，状态为 ${run.status}。`;
+      const prepared = this.options.prepareDelivery
+        ? await this.options.prepareDelivery(candidate)
+        : { allowed: true, text: candidate, reasons: [], candidateSha256: "not-recorded" };
+      if (!prepared.allowed || !prepared.text) {
+        const newlyBlocked = await this.options.store.conversations.excludeRunFromContext(
+          caller,
+          run.id,
+        );
+        if (!newlyBlocked) return;
+        await this.emit({
+          type: "delivery_blocked",
+          runId: run.id,
+          conversationId: run.conversationId,
+          reasons: [...prepared.reasons],
+          candidateSha256: prepared.candidateSha256,
+          candidateBytes: Buffer.byteLength(candidate, "utf8"),
+        });
+        return;
+      }
       await this.options.store.lifecycle.createDelivery(caller, {
         runId: run.id,
         dedupKey: "result",
         destination: caller.scope,
-        payloadText,
+        payloadText: prepared.text,
         payloadKind: "result",
       });
     }

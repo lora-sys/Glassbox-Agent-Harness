@@ -210,6 +210,11 @@ export class ChannelProfileStore {
     };
   }
 
+  /** Server-only delivery screening input. Never serialize these values or include them in Trace. */
+  protectedValues(): string[] {
+    return Object.values(this.#settings.credentials);
+  }
+
   /** Saving configuration does not connect. Runtime owners must reject edits while a connection is active. */
   save(input: unknown): Promise<PublicChannelProfile> {
     const value = record(input);
@@ -271,6 +276,25 @@ export class ChannelProfileStore {
       const current = this.#find(id);
       const channels = this.#settings.channels.map((channel) =>
         channel.id === current.id ? { ...channel, autoConnect: value } : channel,
+      );
+      await this.#persist(channels, this.#settings.credentials);
+      return this.#public(this.#find(id));
+    });
+  }
+
+  setGroupEnabled(id: string, groupId: string, enabled: boolean): Promise<PublicChannelProfile> {
+    if (!/^[1-9]\d{0,15}$/u.test(groupId) || !Number.isSafeInteger(Number(groupId)))
+      throw new ChannelConfigurationError("Invalid QQ group number");
+    if (typeof enabled !== "boolean")
+      throw new ChannelConfigurationError("Invalid group access setting");
+    return this.#enqueue(async () => {
+      const current = this.#find(id);
+      const groups = new Set(current.groupIds);
+      if (enabled) groups.add(groupId);
+      else groups.delete(groupId);
+      const updated = parseChannel({ ...current, groupIds: [...groups] });
+      const channels = this.#settings.channels.map((channel) =>
+        channel.id === current.id ? updated : channel,
       );
       await this.#persist(channels, this.#settings.credentials);
       return this.#public(this.#find(id));

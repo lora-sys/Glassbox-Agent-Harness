@@ -53,6 +53,7 @@ export interface PiRunResult {
     name: string;
     input: Record<string, unknown>;
     result?: unknown;
+    failed?: boolean;
     blocked?: boolean;
     reason?: string;
   }>;
@@ -70,6 +71,7 @@ export interface PiRunContext {
   caller?: CallerContext;
   conversationId?: string;
   runId?: string;
+  requiredToolName?: string;
 }
 
 export interface PiRuntimeAdapter {
@@ -77,6 +79,7 @@ export interface PiRuntimeAdapter {
   createOrRestoreSession(
     conversation: Conversation,
     profile: PiRuntimeProfileName,
+    context?: PiRunContext,
   ): Promise<PiSessionBinding>;
   run(
     binding: PiSessionBinding,

@@ -29,12 +29,14 @@ describe("model configuration", () => {
     await store.save({ ...profile, apiKey: "test-secret-123" });
     expect(JSON.stringify(store.list())).not.toContain("test-secret-123");
     expect(store.list()[0]).not.toHaveProperty("credentialSlot");
+    expect(store.protectedValues()).toEqual(["test-secret-123"]);
     const reopened = await ModelProfileStore.open(directory);
     expect(reopened.resolve("local").apiKey).toBe("test-secret-123");
     await reopened.save({ ...profile, label: "Renamed" });
     expect(reopened.resolve("local").apiKey).toBe("test-secret-123");
     await reopened.save({ ...profile, apiKey: null });
     expect(reopened.resolve("local").apiKey).toBeUndefined();
+    expect(reopened.protectedValues()).toEqual([]);
     expect(await readFile(join(directory, "models.json"), "utf8")).not.toContain("test-secret-123");
   });
 

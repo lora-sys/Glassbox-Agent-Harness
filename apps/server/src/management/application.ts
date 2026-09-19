@@ -17,7 +17,13 @@ import {
 import { configuredModelAdapter } from "../execution/model-adapter.js";
 import { PiRunExecutionAdapter, PiSdkRuntimeAdapter } from "../runtime/pi/index.js";
 import { configuredPiModel } from "../runtime/pi/configured-model.js";
-import { createOpsTools, type WorkerTarget } from "../runtime/pi/ops-tools.js";
+import { createOpsTools, OPS_TOOL_NAMES, type WorkerTarget } from "../runtime/pi/ops-tools.js";
+import {
+  createOwnerTools,
+  OWNER_CONTROL_RESOURCE,
+  OWNER_GROUP_ACCESS_TOOL,
+} from "../runtime/pi/owner-tools.js";
+import type { ProtectedToolContext } from "../runtime/pi/protected-tools.js";
 import { AuthorizedOpsService, type WorkerPolicy } from "../ops/service.js";
 import { OpsReconciler } from "../ops/reconciler.js";
 import type { HerdrBridge } from "../ops/herdr-bridge.js";
@@ -33,6 +39,7 @@ import { createRunEvaluator, RunEvalError } from "../eval/index.js";
 import { ManagementError } from "./access.js";
 import { readManagementJson } from "./http.js";
 import { grantOpsPermissions } from "./ops-grants.js";
+import { createQqDeliveryPolicy, hostDeliveryForbiddenValues } from "../delivery/content-policy.js";
 
 const OWNER_ID = "owner";
 const AGENT_ID = "personal";
@@ -44,6 +51,8 @@ const ACTIONS = [
   "trace:write",
   "eval:write",
 ] as const;
+const TOOL_DISCOVERY_ACTION = "tool:discover";
+const toolResourceId = (name: string) => `tool:${name}`;
 
 function idFromInput(input: unknown): string {
   if (
@@ -68,6 +77,7 @@ export class ManagementApplication {
   readonly evaluator: ReturnType<typeof createRunEvaluator>;
   executors!: ExecutorConfiguration;
   private readonly connections = new Map<string, OneBotAdapter>();
+  private readonly deliveryPolicy: ReturnType<typeof createQqDeliveryPolicy>;
   private readonly states = new Map<
     string,
     Pick<PublicChannelProfile, "connectionState" | "lastError">
@@ -84,13 +94,40 @@ export class ManagementApplication {
       dataDirectory: string;
       models: ModelProfileStore;
       executors?: ReadonlyMap<string, RunExecutionAdapter>;
-      ops?: { bridge: HerdrBridge; workerTarget: WorkerTarget; workerPolicy?: WorkerPolicy };
+      ops?: {
+        bridge: HerdrBridge;
+        workerTarget: WorkerTarget;
+        workerPolicy?: WorkerPolicy;
+        protectedValues?: readonly string[];
+      };
     },
     store: DomainStore,
     channels: ChannelProfileStore,
   ) {
     this.store = store;
     this.channels = channels;
+    this.deliveryPolicy = createQqDeliveryPolicy({
+      forbiddenValues: () => [
+        ...hostDeliveryForbiddenValues({
+          dataDirectory: options.dataDirectory,
+          kitPath: process.env.LORA_PI_KIT_PATH,
+          cwd: process.cwd(),
+          modelValues: [
+            ...options.models.list().flatMap((profile) => [profile.id, profile.baseUrl]),
+            ...(options.ops
+              ? [
+                  ...(options.ops.protectedValues ?? []),
+                  options.ops.workerTarget.workspaceId,
+                  options.ops.workerTarget.agentKind,
+                  options.ops.workerTarget.worktreePath,
+                  options.ops.workerTarget.branch,
+                ].filter((value): value is string => typeof value === "string")
+              : []),
+          ],
+        }),
+      ],
+      protectedValues: () => [...options.models.protectedValues(), ...channels.protectedValues()],
+    });
     this.trace = new RunTraceStore({
       dataDirectory: options.dataDirectory,
       maxEventBytes: 128 * 1024,
@@ -115,6 +152,7 @@ export class ManagementApplication {
         },
       },
       onEvent: (event) => this.recordEvent(event),
+      prepareDelivery: async (candidate) => this.deliveryPolicy.prepare(candidate),
     });
   }
 
@@ -123,7 +161,12 @@ export class ManagementApplication {
     databasePath?: string;
     models: ModelProfileStore;
     executors?: ReadonlyMap<string, RunExecutionAdapter>;
-    ops?: { bridge: HerdrBridge; workerTarget: WorkerTarget; workerPolicy?: WorkerPolicy };
+    ops?: {
+      bridge: HerdrBridge;
+      workerTarget: WorkerTarget;
+      workerPolicy?: WorkerPolicy;
+      protectedValues?: readonly string[];
+    };
   }): Promise<ManagementApplication> {
     const channels = await ChannelProfileStore.open(options.dataDirectory);
     const store = await openDomainStore({
@@ -171,9 +214,9 @@ export class ManagementApplication {
     const runtime = new PiSdkRuntimeAdapter({
       runtimeBaseDir: join(this.options.dataDirectory, "pi"),
       resolveModel: () => configuredPiModel(this.options.models, profileId),
-      createTools: this.options.ops
-        ? (getContext) =>
-            createOpsTools({
+      createTools: (getContext) => [
+        ...(this.options.ops
+          ? createOpsTools({
               store: this.store,
               service: new AuthorizedOpsService(
                 this.store,
@@ -183,7 +226,35 @@ export class ManagementApplication {
               workerTarget: this.options.ops!.workerTarget,
               getContext,
             })
-        : undefined,
+          : []),
+        ...createOwnerTools({
+          store: this.store,
+          getContext,
+          setGroupAccess: (context, input) => this.setGroupAccess(context, input),
+        }),
+      ],
+      resolveToolNames: async (context) => {
+        if (
+          !context.caller ||
+          !context.conversationId ||
+          !context.runId ||
+          context.caller.scope.chatType !== "private"
+        )
+          return [];
+        const candidates = [...(this.options.ops ? OPS_TOOL_NAMES : []), OWNER_GROUP_ACCESS_TOOL];
+        const selected: string[] = [];
+        for (const name of candidates) {
+          const decision = await this.store.authorization.check({
+            caller: context.caller,
+            resourceId: toolResourceId(name),
+            action: TOOL_DISCOVERY_ACTION,
+            conversationId: context.conversationId,
+            runId: context.runId,
+          });
+          if (decision.decision === "ALLOW") selected.push(name);
+        }
+        return selected;
+      },
       onEvent: async (event) => {
         const runId =
           event.runId ?? (typeof event.data.runId === "string" ? event.data.runId : undefined);
@@ -311,14 +382,49 @@ export class ManagementApplication {
     }
     this.states.set(id, { connectionState: "connecting" });
     let connectionAccepted = false;
+    let connectionReleased = false;
     let releaseConnection!: () => void;
     const connectionReady = new Promise<void>((resolve) => {
       releaseConnection = resolve;
     });
+    const acceptConnection = () => {
+      connectionAccepted = true;
+      if (!connectionReleased) {
+        connectionReleased = true;
+        releaseConnection();
+      }
+      this.runs.refresh();
+    };
+    let provisionPromise: Promise<void> | undefined;
+    const provisionConfiguredAccess = () => {
+      provisionPromise ??= remember
+        ? this.provisionConfiguredAccess(configured)
+        : this.serialize(() => this.provisionConfiguredAccess(configured));
+      return provisionPromise;
+    };
     const adapter = new OneBotAdapter({
       config: configured.config,
       token: configured.token,
-      onState: (state) => this.updateChannelState(id, state),
+      onState: (state) => {
+        this.updateChannelState(id, state);
+        if (!remember && state.status === "ready") {
+          void provisionConfiguredAccess()
+            .then(acceptConnection)
+            .catch(() => {
+              this.states.set(id, {
+                connectionState: "error",
+                lastError: CHANNEL_SAFE_ERRORS.connection,
+              });
+              connectionAccepted = false;
+              if (!connectionReleased) {
+                connectionReleased = true;
+                releaseConnection();
+              }
+              void adapter.stop().catch(() => undefined);
+              if (this.connections.get(id) === adapter) this.connections.delete(id);
+            });
+        }
+      },
       onIncoming: async (message, signal) => {
         await this.ingressReady;
         await connectionReady;
@@ -349,46 +455,17 @@ export class ManagementApplication {
     this.connections.set(id, adapter);
     try {
       await adapter.start();
-      const identity = {
-        connectionId: id,
-        botId: configured.config.botId,
-        senderId: configured.config.ownerId,
-      };
-      const scopes: TrustedChannelScope[] = [
-        { ...identity, chatType: "private", chatId: configured.config.ownerId },
-        ...configured.config.groupIds.map((groupId) => ({
-          ...identity,
-          chatType: "group" as const,
-          chatId: groupId,
-        })),
-      ];
-      // The explicit local Connect action authorizes these configured Owner entry points only.
-      if (remember) {
-        await this.store.identities.bindOwner(OWNER_ID, identity);
-        for (const scope of scopes) await this.grantScope(scope);
-        for (const visitorId of configured.config.visitorIds) {
-          const principalId = `qq-visitor-${visitorId}`;
-          const visitorIdentity = { ...identity, senderId: visitorId };
-          await this.store.identities.createPrincipal(principalId, "visitor");
-          await this.store.identities.bindPrincipal(principalId, visitorIdentity);
-          const visitorScopes: TrustedChannelScope[] = [
-            { ...visitorIdentity, chatType: "private", chatId: visitorId },
-            ...configured.config.groupIds.map((chatId) => ({
-              ...visitorIdentity,
-              chatType: "group" as const,
-              chatId,
-            })),
-          ];
-          for (const scope of visitorScopes) await this.grantScope(scope, principalId);
-        }
-        await this.channels.setAutoConnect(id, true);
-      }
-      connectionAccepted = true;
-      releaseConnection();
-      this.runs.refresh();
+      if (remember || configured.autoConnect) await provisionConfiguredAccess();
+      if (remember) await this.channels.setAutoConnect(id, true);
+      acceptConnection();
       return this.publicChannel(id);
     } catch (error) {
-      releaseConnection();
+      if (!remember && configured.autoConnect && adapter.state.status === "reconnecting")
+        return this.publicChannel(id);
+      if (!connectionReleased) {
+        connectionReleased = true;
+        releaseConnection();
+      }
       await adapter.stop();
       this.connections.delete(id);
       const key =
@@ -399,6 +476,41 @@ export class ManagementApplication {
             : "connection";
       this.states.set(id, { connectionState: "error", lastError: CHANNEL_SAFE_ERRORS[key] });
       throw new ManagementError("CONNECTION_FAILED", CHANNEL_SAFE_ERRORS[key], 503);
+    }
+  }
+
+  private async provisionConfiguredAccess(
+    configured: ReturnType<ChannelProfileStore["resolve"]>,
+  ): Promise<void> {
+    const identity = {
+      connectionId: configured.config.connectionId,
+      botId: configured.config.botId,
+      senderId: configured.config.ownerId,
+    };
+    const scopes: TrustedChannelScope[] = [
+      { ...identity, chatType: "private", chatId: configured.config.ownerId },
+      ...configured.config.groupIds.map((groupId) => ({
+        ...identity,
+        chatType: "group" as const,
+        chatId: groupId,
+      })),
+    ];
+    await this.store.identities.bindOwner(OWNER_ID, identity);
+    for (const scope of scopes) await this.grantScope(scope);
+    for (const visitorId of configured.config.visitorIds) {
+      const principalId = `qq-visitor-${visitorId}`;
+      const visitorIdentity = { ...identity, senderId: visitorId };
+      await this.store.identities.createPrincipal(principalId, "visitor");
+      await this.store.identities.bindPrincipal(principalId, visitorIdentity);
+      const visitorScopes: TrustedChannelScope[] = [
+        { ...visitorIdentity, chatType: "private", chatId: visitorId },
+        ...configured.config.groupIds.map((chatId) => ({
+          ...visitorIdentity,
+          chatType: "group" as const,
+          chatId,
+        })),
+      ];
+      for (const scope of visitorScopes) await this.grantScope(scope, principalId);
     }
   }
 
@@ -420,6 +532,108 @@ export class ManagementApplication {
           effect: "allow",
         });
     }
+    if (principalId === OWNER_ID && scope.chatType === "private") {
+      await this.store.authorization.registerResource({
+        id: OWNER_CONTROL_RESOURCE,
+        kind: "owner-control",
+        visibility: "private",
+        ownerId: OWNER_ID,
+        ifAbsent: true,
+      });
+      await this.store.authorization.grant({
+        principalId,
+        resourceId: OWNER_CONTROL_RESOURCE,
+        action: "group:manage",
+        scope,
+        effect: "allow",
+      });
+      for (const name of [...(this.options.ops ? OPS_TOOL_NAMES : []), OWNER_GROUP_ACCESS_TOOL]) {
+        const resourceId = toolResourceId(name);
+        await this.store.authorization.registerResource({
+          id: resourceId,
+          kind: "tool-definition",
+          visibility: "private",
+          ownerId: OWNER_ID,
+          ifAbsent: true,
+        });
+        await this.store.authorization.grant({
+          principalId,
+          resourceId,
+          action: TOOL_DISCOVERY_ACTION,
+          scope,
+          effect: "allow",
+        });
+      }
+    }
+  }
+
+  private async setGroupAccess(
+    context: ProtectedToolContext,
+    input: { groupId: string; enabled: boolean },
+  ): Promise<{ groupId: string; enabled: boolean }> {
+    return this.serialize(async () => {
+      const caller = context.caller;
+      if (caller.principalId !== OWNER_ID || caller.scope.chatType !== "private")
+        throw new Error("owner_private_required");
+      const connection = this.connections.get(caller.scope.connectionId);
+      if (!connection) throw new Error("channel_not_connected");
+      const configured = this.channels.resolve(caller.scope.connectionId);
+      if (input.enabled && !(await connection.hasGroup(input.groupId)))
+        throw new Error("bot_not_in_group");
+
+      const groupScopes = [configured.config.ownerId, ...configured.config.visitorIds].map(
+        (senderId) => ({
+          connectionId: configured.config.connectionId,
+          botId: configured.config.botId,
+          chatType: "group" as const,
+          chatId: input.groupId,
+          senderId,
+        }),
+      );
+      if (!input.enabled) {
+        for (const scope of groupScopes) {
+          const principalId =
+            scope.senderId === configured.config.ownerId
+              ? OWNER_ID
+              : `qq-visitor-${scope.senderId}`;
+          await this.store.authorization.revokeScope({
+            principalId,
+            resourceId: agentResourceId(AGENT_ID),
+            scope,
+          });
+        }
+      }
+      const profile = await this.channels.setGroupEnabled(
+        caller.scope.connectionId,
+        input.groupId,
+        input.enabled,
+      );
+      if (input.enabled) {
+        for (const scope of groupScopes) {
+          const principalId =
+            scope.senderId === configured.config.ownerId
+              ? OWNER_ID
+              : `qq-visitor-${scope.senderId}`;
+          await this.grantScope(scope, principalId);
+        }
+      }
+      connection.setAllowedGroups(profile.groupIds);
+      const cursor = await this.trace.append(
+        context.runId,
+        {
+          type: "group_access_changed",
+          runId: context.runId,
+          principalId: caller.principalId,
+          connectionId: caller.scope.connectionId,
+          groupId: input.groupId,
+          enabled: input.enabled,
+        },
+        "glassbox-owner-control",
+      );
+      await this.store.evidence.advanceTrace(caller, cursor);
+      this.runs.refresh();
+      return { groupId: input.groupId, enabled: input.enabled };
+    });
   }
 
   disconnectChannel(id: string): Promise<PublicChannelProfile> {

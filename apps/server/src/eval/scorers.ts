@@ -4,13 +4,12 @@ import type { RunRecord } from "../conversation/store.js";
 import type { DeliveryRecord, DeliveryStatus } from "../conversation/lifecycle.js";
 import type { TraceEntry } from "../trace/store.js";
 
-export const RUN_INTEGRITY_SCORER_VERSION = "run-integrity-v1.1";
+export const RUN_INTEGRITY_SCORER_VERSION = "run-integrity-v1.2";
 
 export const CHECK_TARGETS: Record<RunEvalCheck, string> = {
   run_terminal: "The stored Run has a known terminal outcome.",
   trace_index: "Every event in the indexed Trace prefix is readable in sequence.",
   terminal_event: "One trusted run_finished event agrees with the stored Run.",
-  ack_delivery: "The ingress acknowledgement has a confirmed delivery to the caller scope.",
   result_delivery: "The result has a confirmed delivery to the caller scope.",
   result_delivery_event: "Trusted Trace evidence agrees with the result delivery outcome.",
 };
@@ -95,7 +94,7 @@ function score(
 }
 
 function deliveryScore(
-  id: "ack_delivery" | "result_delivery",
+  id: "result_delivery",
   delivery: DeliveryRecord | null,
   expectedScope: string,
 ): RunEvalScore {
@@ -111,7 +110,6 @@ export function scoreRun(input: {
   run: RunRecord;
   trace: TraceObservation;
   indexedEvents: number;
-  ack: DeliveryRecord | null;
   result: DeliveryRecord | null;
   expectedScope: string;
 }): RunEvalScore[] {
@@ -165,7 +163,6 @@ export function scoreRun(input: {
       ),
     );
   }
-  scores.push(deliveryScore("ack_delivery", input.ack, input.expectedScope));
   scores.push(deliveryScore("result_delivery", result, input.expectedScope));
   const deliveryEvent = trace.resultDelivery;
   if (!deliveryEvent || !result) {

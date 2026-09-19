@@ -48,6 +48,7 @@ describe("server-owned channel profiles", () => {
       connectionState: "disconnected",
     });
     expect(JSON.stringify(store.list())).not.toContain("fixture-qq-private-token");
+    expect(store.protectedValues()).toEqual(["fixture-qq-private-token"]);
     expect(saved).not.toHaveProperty("credentialSlot");
     expect(saved).not.toHaveProperty("token");
     const reopened = await ChannelProfileStore.open(directory);
@@ -79,6 +80,7 @@ describe("server-owned channel profiles", () => {
     await store.save({ ...input, token: null });
     expect((await ChannelProfileStore.open(directory)).resolve(input.id).token).toBeUndefined();
     expect(store.list()[0]?.tokenConfigured).toBe(false);
+    expect(store.protectedValues()).toEqual([]);
     expect(await readFile(join(directory, "channels.json"), "utf8")).not.toContain(
       "replacement-token",
     );
@@ -141,6 +143,20 @@ describe("server-owned channel profiles", () => {
     expect(await readFile(join(directory, "channels.json"), "utf8")).not.toContain(
       "connectionState",
     );
+  });
+
+  it("persists group access changes across a store reopen", async () => {
+    const { directory, store } = await fixture();
+    await store.save(input);
+    await store.setGroupEnabled(input.id, "88888", true);
+    expect((await ChannelProfileStore.open(directory)).resolve(input.id).config.groupIds).toEqual([
+      "77777",
+      "88888",
+    ]);
+    await store.setGroupEnabled(input.id, "77777", false);
+    expect((await ChannelProfileStore.open(directory)).resolve(input.id).config.groupIds).toEqual([
+      "88888",
+    ]);
   });
 
   it.each([

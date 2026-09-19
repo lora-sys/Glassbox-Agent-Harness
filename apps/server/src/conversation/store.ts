@@ -614,27 +614,27 @@ export class ConversationStore {
 
   /** Explicit incident response. Preserve the original record and append the
    * exclusion decision; excluded exchanges cannot be reused by any Principal. */
-  async excludeRunFromContext(caller: CallerContext, runId: string): Promise<void> {
-    authorizedValue(
-      await this.db.transaction<AuthorizedResult<void>>(async (tx) => {
+  async excludeRunFromContext(caller: CallerContext, runId: string): Promise<boolean> {
+    return authorizedValue(
+      await this.db.transaction<AuthorizedResult<boolean>>(async (tx) => {
         const authorization = await authorizeRun(tx, caller, runId, "run:control");
         if ("denied" in authorization) return authorization;
         const prior = await tx.execute({
           sql: "SELECT event_id FROM ops_trace_events WHERE run_id = ? AND type = 'context.excluded' LIMIT 1",
           args: [runId],
         });
-        if (!prior.rows.length)
-          await tx.execute({
-            sql: "INSERT INTO ops_trace_events(event_id, ts, type, run_id, principal_id, data_json) VALUES (?, ?, 'context.excluded', ?, ?, ?)",
-            args: [
-              randomUUID(),
-              new Date().toISOString(),
-              runId,
-              caller.principalId,
-              JSON.stringify({ action: "Exclude Run Context", reason: "unsafe_runtime_context" }),
-            ],
-          });
-        return { value: undefined };
+        if (prior.rows.length) return { value: false };
+        await tx.execute({
+          sql: "INSERT INTO ops_trace_events(event_id, ts, type, run_id, principal_id, data_json) VALUES (?, ?, 'context.excluded', ?, ?, ?)",
+          args: [
+            randomUUID(),
+            new Date().toISOString(),
+            runId,
+            caller.principalId,
+            JSON.stringify({ action: "Exclude Run Context", reason: "unsafe_runtime_context" }),
+          ],
+        });
+        return { value: true };
       }),
     );
   }
@@ -700,44 +700,33 @@ export class ConversationStore {
           }
           if (!permitted) continue;
 
-          if (priorPrincipalId !== caller.principalId) {
-            const deliveryRows = await tx.execute({
-              sql: "SELECT payload_text, destination_scope_key FROM deliveries WHERE run_id = ? AND status = 'sent' AND payload_kind IN ('text', 'result') ORDER BY created_at DESC",
+          const deliveryRows = await tx.execute({
+            sql: "SELECT payload_text, destination_scope_key FROM deliveries WHERE run_id = ? AND status = 'sent' AND payload_kind IN ('text', 'result') ORDER BY created_at DESC",
+            args: [priorRunId],
+          });
+          const matchingDelivery = deliveryRows.rows.find((dRow) =>
+            matchesDestinationLocation(
+              stringColumn(dRow, "destination_scope_key"),
+              callerLocationKey,
+            ),
+          );
+          if (matchingDelivery) assistant = stringColumn(matchingDelivery, "payload_text");
+          else if (priorPrincipalId === caller.principalId) {
+            const resultRows = await tx.execute({
+              sql: "SELECT result_text FROM runs WHERE id = ?",
               args: [priorRunId],
             });
-            const matchingDelivery = deliveryRows.rows.find((dRow) =>
-              matchesDestinationLocation(
-                stringColumn(dRow, "destination_scope_key"),
-                callerLocationKey,
-              ),
-            );
-            if (!matchingDelivery) {
-              continue;
-            }
-            assistant = stringColumn(matchingDelivery, "payload_text");
-            const msgRows = await tx.execute({
-              sql: "SELECT text FROM messages WHERE id = ?",
-              args: [priorMessageId],
-            });
-            if (!msgRows.rows[0]) {
-              continue;
-            }
-            user = stringColumn(msgRows.rows[0], "text");
-          } else {
-            const contentRows = await tx.execute({
-              sql: "SELECT runs.result_text, messages.text FROM runs JOIN messages ON messages.id = runs.message_id WHERE runs.id = ?",
-              args: [priorRunId],
-            });
-            if (!contentRows.rows[0]) {
-              continue;
-            }
-            const assistantResult = stringColumn(contentRows.rows[0], "result_text");
-            if (!assistantResult) {
-              continue;
-            }
-            assistant = assistantResult;
-            user = stringColumn(contentRows.rows[0], "text");
-          }
+            if (!resultRows.rows[0]) continue;
+            const result = resultRows.rows[0].result_text;
+            if (typeof result !== "string" || !result) continue;
+            assistant = result;
+          } else continue;
+          const msgRows = await tx.execute({
+            sql: "SELECT text FROM messages WHERE id = ?",
+            args: [priorMessageId],
+          });
+          if (!msgRows.rows[0]) continue;
+          user = stringColumn(msgRows.rows[0], "text");
 
           if (user.length + assistant.length > remaining) break;
           remaining -= user.length + assistant.length;

@@ -73,7 +73,7 @@ export interface OneBotAdapterOptions {
 
 /** One authenticated combined forward WebSocket. Persistence and execution live above this adapter. */
 export class OneBotAdapter {
-  readonly config: OneBotConnectionConfig;
+  config: OneBotConnectionConfig;
   readonly capabilities = Object.freeze({
     groupMention: true,
     ownerPrivateChat: true,
@@ -126,6 +126,21 @@ export class OneBotAdapter {
 
   get state(): OneBotState {
     return { ...this.#state };
+  }
+
+  setAllowedGroups(groupIds: readonly string[]): void {
+    this.config = parseOneBotConfig({ ...this.config, groupIds: [...groupIds] });
+  }
+
+  async hasGroup(groupId: string): Promise<boolean> {
+    const parsed = parseOneBotConfig({ ...this.config, groupIds: [groupId] });
+    const socket = this.#socket;
+    if (this.#state.status !== "ready" || !socket) throw new OneBotConnectionError("disconnected");
+    const result = await this.#request(socket, "get_group_info", {
+      group_id: Number(parsed.groupIds[0]),
+      no_cache: true,
+    });
+    return result.status === "ok" && qqId(object(result.data)?.group_id) === groupId;
   }
 
   async start(): Promise<void> {

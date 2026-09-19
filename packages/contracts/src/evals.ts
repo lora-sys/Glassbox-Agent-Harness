@@ -5,7 +5,6 @@ export type RunEvalCheck =
   | "run_terminal"
   | "trace_index"
   | "terminal_event"
-  | "ack_delivery"
   | "result_delivery"
   | "result_delivery_event";
 

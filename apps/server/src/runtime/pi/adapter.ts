@@ -31,6 +31,7 @@ interface ActiveSession {
     Partial<Pick<AgentSession, "extensionRunner">>;
   binding: PiSessionBinding;
   runtimeEvidence: Record<string, unknown>;
+  authorizedToolNames: readonly string[];
 }
 
 export interface PiSdkRuntimeOptions {
@@ -42,6 +43,7 @@ export interface PiSdkRuntimeOptions {
   resolveModel?: () => Promise<{ model: Model<any>; modelRuntime: ModelRuntime }>;
   customTools?: ToolDefinition[];
   createTools?: (getContext: () => PiRunContext | undefined) => ToolDefinition[];
+  resolveToolNames?: (context: PiRunContext) => Promise<readonly string[]>;
   onEvent?: (event: PiNormalizedEvent) => void | Promise<void>;
   createSession?: (params: {
     conversation: Conversation;
@@ -192,12 +194,17 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
   async createOrRestoreSession(
     conversation: Conversation,
     profileName: PiRuntimeProfileName,
+    context?: PiRunContext,
   ): Promise<PiSessionBinding> {
     if (!this.initialized) throw new Error("Pi runtime is not initialized");
 
     const profile = this.loader.loadProfile(profileName);
     const config = this.loader.buildRuntimeConfig(profileName, this.options.runtimeBaseDir);
     const runtimeEvidence = this.loader.runtimeEvidence(profileName);
+    const authorizedToolNames =
+      context && this.options.resolveToolNames
+        ? [...new Set(await this.options.resolveToolNames(context))]
+        : undefined;
     await mkdir(config.agentDir, { recursive: true });
     const sessionDir = path.join(config.agentDir, "sessions", conversation.id);
     await mkdir(sessionDir, { recursive: true });
@@ -208,7 +215,7 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
           agentDir: config.agentDir,
           sessionDir,
         })
-      : await this.createRealSession(profile, config.agentDir, sessionDir);
+      : await this.createRealSession(profile, config.agentDir, sessionDir, authorizedToolNames);
     const now = new Date().toISOString();
     const binding: PiSessionBinding = {
       conversationId: conversation.id,
@@ -218,7 +225,12 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
       createdAt: now,
       lastActiveAt: now,
     };
-    this.sessions.set(session.sessionId, { session, binding, runtimeEvidence });
+    this.sessions.set(session.sessionId, {
+      session,
+      binding,
+      runtimeEvidence,
+      authorizedToolNames: authorizedToolNames ?? [],
+    });
     return { ...binding };
   }
 
@@ -226,13 +238,23 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
     profile: ResolvedKitProfile,
     agentDir: string,
     sessionDir: string,
+    authorizedToolNames?: readonly string[],
   ): Promise<ActiveSession["session"]> {
     const kitPath = this.loader.getKitPath();
     const cwd = this.options.cwd ?? process.cwd();
     const settingsManager = SettingsManager.inMemory();
     if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/u.test(profile.promptTemplate))
       throw new Error("Invalid Kit prompt template");
-    const basePrompt = this.loader.modelPrompt(profile.name);
+    const basePrompt = `${this.loader.modelPrompt(profile.name).trim()}\n\nReply in concise plain text suitable for QQ. Do not reveal host paths, internal service addresses, configuration names, or internal identifiers.`;
+    let runtimeSessionId: string | undefined;
+    const promptForRun = () => {
+      const requiredToolName = runtimeSessionId
+        ? this.runContexts.get(runtimeSessionId)?.requiredToolName
+        : undefined;
+      return requiredToolName
+        ? `${basePrompt}\n\nThe current Owner request requires the available ${requiredToolName} tool. Call it before reporting the action as completed. Do not ask for a second confirmation and never claim execution without a successful tool result.`
+        : basePrompt;
+    };
     // Standalone Kit MCP factories are configured separately. Glassbox exposes
     // only explicitly registered product-authorized Tools, never ambient servers.
     if (
@@ -252,7 +274,7 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
       // assembled prompt through the public event before the provider sees it.
       extensionFactories: [
         (pi) => {
-          pi.on("before_agent_start", () => ({ systemPrompt: basePrompt }));
+          pi.on("before_agent_start", () => ({ systemPrompt: promptForRun() }));
         },
       ],
       additionalSkillPaths: [path.join(kitPath, "skills")],
@@ -273,14 +295,17 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
       throw new Error("Kit extension loading failed");
     void sessionDir;
     const sessionManager = SessionManager.inMemory(cwd);
-    let runtimeSessionId: string | undefined;
     const customTools =
       this.options.createTools?.(() =>
         runtimeSessionId ? this.runContexts.get(runtimeSessionId) : undefined,
       ) ??
       this.options.customTools ??
       [];
-    const customToolNames = customTools.map((tool) => tool.name);
+    const selectedNames = authorizedToolNames ? new Set(authorizedToolNames) : undefined;
+    const selectedTools = selectedNames
+      ? customTools.filter((tool) => selectedNames.has(tool.name))
+      : customTools;
+    const customToolNames = selectedTools.map((tool) => tool.name);
     const tools = Array.from(new Set(customToolNames));
     const configured = await this.options.resolveModel?.();
     const created = await createAgentSession({
@@ -294,7 +319,7 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
       noTools: "all",
       tools,
       excludeTools: ["read", "bash", "edit", "write", "grep", "find", "ls", "powershell"],
-      customTools,
+      customTools: selectedTools,
       thinkingLevel: profile.thinkingLevel === "none" ? "minimal" : profile.thinkingLevel,
     });
     runtimeSessionId = created.session.sessionId;
@@ -340,6 +365,7 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
           ...normalized.data,
           conversationId: run.conversationId,
           runtime: active.runtimeEvidence,
+          authorizedTools: active.authorizedToolNames,
         };
       }
       if (normalized && this.options.onEvent) {
@@ -359,8 +385,11 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
       } else if (event.type === "tool_execution_end") {
         const call = [...toolCalls]
           .reverse()
-          .find((candidate) => candidate.name === event.toolName && candidate.result === undefined);
-        if (call) call.result = event.result;
+          .find((candidate) => candidate.name === event.toolName && candidate.failed === undefined);
+        if (call) {
+          call.result = event.result;
+          call.failed = event.isError;
+        }
       }
     });
     try {

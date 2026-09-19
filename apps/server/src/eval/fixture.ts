@@ -68,9 +68,8 @@ export async function openEvalFixture(
     transport: {
       send: async ({ delivery }) => {
         sends++;
-        return delivery.payloadKind === "ack"
-          ? { status: "sent" }
-          : (options.delivery ?? { status: "sent" });
+        void delivery;
+        return options.delivery ?? { status: "sent" };
       },
     },
     onEvent: async (event) => {

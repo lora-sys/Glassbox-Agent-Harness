@@ -226,15 +226,19 @@ it("runs delegate, review, rework and accept through actual Pi SDK Ops tools", a
 }, 20_000);
 
 it.each(
-  [true, false].flatMap((granted) =>
+  [
+    { discovered: true, granted: true },
+    { discovered: true, granted: false },
+    { discovered: false, granted: true },
+  ].flatMap((permissions) =>
     (process.env.GLASSBOX_TEST_KIT_PATH ? ["local", "mcp"] : ["local"]).map((transport) => ({
-      granted,
+      ...permissions,
       transport,
     })),
   ),
 )(
-  "enforces granted=$granted through an actual Pi SDK $transport tool call",
-  async ({ granted, transport }) => {
+  "enforces discovered=$discovered granted=$granted through an actual Pi SDK $transport tool call",
+  async ({ discovered, granted, transport }) => {
     const directory = await mkdtemp(join(tmpdir(), "glassbox-sdk-tool-"));
     const store = await openDomainStore({ databasePath: ":memory:" });
     const caller = {
@@ -294,7 +298,9 @@ it.each(
       ],
       streamSimple(model, context) {
         calls++;
-        expect(context.tools?.map((tool) => tool.name)).toEqual(["protected_read"]);
+        expect(context.tools?.map((tool) => tool.name) ?? []).toEqual(
+          discovered ? ["protected_read"] : [],
+        );
         if (calls > 1) {
           const result = context.messages.find((message) => message.role === "toolResult");
           expect(result).toBeDefined();
@@ -303,8 +309,9 @@ it.each(
         }
         const message: AssistantMessage = {
           role: "assistant",
-          content:
-            calls === 1
+          content: !discovered
+            ? [{ type: "text", text: "No authorized tool" }]
+            : calls === 1
               ? [{ type: "toolCall", id: "read-1", name: "protected_read", arguments: {} }]
               : [{ type: "text", text: "Checked" }],
           api: model.api,
@@ -318,7 +325,7 @@ it.each(
             totalTokens: 2,
             cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
           },
-          stopReason: calls === 1 ? "toolUse" : "stop",
+          stopReason: discovered && calls === 1 ? "toolUse" : "stop",
           timestamp: Date.now(),
         };
         const stream = createAssistantMessageEventStream();
@@ -366,6 +373,7 @@ it.each(
           },
         }),
       ],
+      resolveToolNames: async () => (discovered ? ["protected_read"] : []),
     });
     try {
       await store.identities.bindOwner("owner", caller.scope);
@@ -415,6 +423,7 @@ it.each(
           createdAt: new Date().toISOString(),
         },
         "main-agent",
+        { caller, runId: accepted.run.id, conversationId: accepted.conversation.id },
       );
       const result = await adapter.run(
         binding,
@@ -422,9 +431,12 @@ it.each(
         "Read fixture",
         { caller, runId: accepted.run.id, conversationId: accepted.conversation.id },
       );
-      expect(result).toMatchObject({ status: "completed", text: "Checked" });
-      expect(calls).toBe(2);
-      expect(executions).toBe(granted ? 1 : 0);
+      expect(result).toMatchObject({
+        status: "completed",
+        text: discovered ? "Checked" : "No authorized tool",
+      });
+      expect(calls).toBe(discovered ? 2 : 1);
+      expect(executions).toBe(discovered && granted ? 1 : 0);
     } finally {
       await adapter.cleanup();
       await mcp?.stop();

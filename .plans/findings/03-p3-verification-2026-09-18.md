@@ -4,13 +4,13 @@ P3 implementation and the dedicated Windows acceptance environment completed the
 
 ## Deterministic validation
 
-- `npm run test:server` passed 620 tests. The one skipped test is the opt-in real Herdr socket test.
+- `npm run test:server` passed 641 tests. The one skipped test is the opt-in real Herdr socket test.
 - The real Herdr socket test passed separately against the named `glassbox-p3` session.
 - The security and reliability selection passed 62 tests across OneBot, shared Conversation isolation, Pi protected Tools and authorized Ops.
 - The server TypeScript check passed.
 - The non-frontend scope check passed formatting for 186 files and passed lint plus type analysis for 183 files with no warnings or errors.
 - Windows parallel execution can make two integration fixtures exceed Vitest defaults. The repository test configuration now uses 30 second test and hook limits. The complete suite passes with that bound.
-- A final parallel rerun exposed a 300 millisecond process-exit margin in the Claude harness fixture. The fixture now allows one second for the actual Windows child-exit signal before cleanup, and the complete 620-test suite passes.
+- A final parallel rerun exposed a 300 millisecond process-exit margin in the Claude harness fixture. The fixture now allows one second for the actual Windows child-exit signal before cleanup, and the complete 641-test suite passes.
 - Root `npm run check` now reports only 23 formatting files under `apps/web`. P3 did not rewrite the separate frontend worktree to clear that independent baseline.
 
 ## Lora PI Kit
@@ -38,7 +38,22 @@ Owner private Run `e1e47769-d5b0-47e9-9ddf-c1c72dda5755` created Task `c1b9c21a-
 - Local validation after Rework passed all 10 tests.
 - The Task returned to `REVIEW`.
 - Owner then used explicit Accept. Trace event `task.accepted` was recorded and the Task entered `DONE`.
-- Each QQ Run recorded sent ack and result deliveries to the original private audience.
+- Each accepted terminal QQ Run recorded one result delivery to the original private audience. P3+ removed the user-visible acknowledgement delivery and its internal Run identifier.
+
+## P3+ Owner control and delivery closeout
+
+- `npm run agent:up` started the named Herdr session, NapCat and Glassbox as detached local services. `agent:status`, `agent:logs` and `agent:down` use the same local state file and verify process identity before shutdown.
+- Glassbox restored QQ after NapCat became ready later than the server. It restored configured identity and authorization before accepting ingress.
+- Owner private Run `fcade8ff-fa13-4093-936e-58de1c3993bc` called Pi Tool `owner_group_set_access` and disabled group `1126022432`. Glassbox revoked all active Owner and Visitor grants for that group before removing it from the Channel profile.
+- A later real group mention created no Run and no Delivery while the group was disabled.
+- A first enable attempt exposed a provider behavior defect. Pi claimed the action was complete without a Tool call. Glassbox preserved that Run as evidence and marked it excluded from later Context.
+- The repaired execution-integrity gate requires a successful matching Tool result for an explicit Owner group-access command. It permits one corrective Pi turn in the same Run, then fails closed.
+- Real Owner private Run `5989cc51-39c6-4644-9065-887006e6cf5e` used that corrective turn, called `owner_group_set_access`, verified the Bot was in the group through OneBot and enabled the group.
+- Owner group Run `7a68793d-1484-4799-8c05-11400e58bf24` and Visitor group Run `bd1bccc4-e2b9-41c3-a3ee-bf8e72c9e2bc` resolved to distinct Principals and the same durable group Conversation `7ffec5a3-0467-4700-a9d6-92b0fc233c79`.
+- Both group Runs used Pi's `qq-group` profile and received an empty Tool schema list. Owner-private Tool schemas did not enter group Context.
+- QQ result delivery rendered Markdown as readable plain text. The Owner-control Runs and both final group Runs each produced one result delivery and no acknowledgement delivery.
+- The delivery gate blocks secrets, configured credentials, Windows drive and UNC paths, private POSIX paths, private URLs, internal domains and UUIDs. A blocked candidate creates no Delivery, appends digest-only evidence and cannot enter later Context.
+- The real application composition test forced a stored Channel credential into a result candidate. The gate created no Delivery and the credential did not enter Trace.
 
 ## Restart and reconciliation
 
@@ -49,7 +64,9 @@ Owner private Run `e1e47769-d5b0-47e9-9ddf-c1c72dda5755` created Task `c1b9c21a-
 - Task truth stayed `DONE` during the disconnect.
 - The restarted Herdr snapshot retained panes `w2:p2` and `w2:p3`.
 - The real SocketHerdrBridge connected to the restarted server, read its snapshot and established a protocol 22 event subscription.
-- After the final branch reconstruction, Owner message `P3 重连验收` created Run `b1cd8843-9ae2-44b1-bd2d-148b16195471`. It reused the durable Owner private Conversation, ran the `main-agent` profile through Pi 0.85.1 and Kit commit `870a025775f28e314eeef974aa09511802f3e3d2`, and recorded sent ack and result deliveries.
+- After the final P3+ restart, the Channel reconnected with group `1126022432` still enabled. The final Owner and Visitor group Runs each remained singletons with one Delivery, so reconnect created no replay side effect.
+- Task `c1b9c21a-79b3-4d2e-823a-86501b8ca799` remained `DONE` with both TaskAttempts. The false execution claim remained excluded from Context.
+- The real SocketHerdrBridge again connected to the restarted named session, read its snapshot and established an event subscription.
 
 ## Real authorization and delivery checks
 

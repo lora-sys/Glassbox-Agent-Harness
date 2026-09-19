@@ -276,6 +276,22 @@ export class AuthorizationService {
     });
   }
 
+  async revokeScope(input: {
+    principalId: string;
+    resourceId: string;
+    scope: TrustedChannelScope;
+  }): Promise<void> {
+    requireIdentifier(input.principalId);
+    requireIdentifier(input.resourceId);
+    const key = scopeKey(input.scope);
+    await this.db.transaction(async (tx) => {
+      await tx.execute({
+        sql: "UPDATE grants SET revoked_at = ? WHERE principal_id = ? AND resource_id = ? AND scope_key = ? AND revoked_at IS NULL",
+        args: [new Date().toISOString(), input.principalId, input.resourceId, key],
+      });
+    });
+  }
+
   /** Management-only approval for an existing eligible policy path. The caller
    * must verify the human approver before invoking this method. */
   async approve(input: {

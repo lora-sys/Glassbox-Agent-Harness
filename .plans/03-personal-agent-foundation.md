@@ -786,6 +786,13 @@ Run the real dedicated environment and preserve evidence for the completion chec
 
 Mocks alone cannot complete P3.
 
+### P3+ — Closeout after real use
+
+Complete the production fixes and Owner control test in
+.plans/03-plus-owner-control-smoke.md before this Draft PR leaves Draft state.
+
+P3+ keeps the same Issue, worktree, branch and Draft PR. It does not start P4 work.
+
 ## Code placement guidance
 
 Glassbox product code stays in Glassbox-owned boundaries, for example:

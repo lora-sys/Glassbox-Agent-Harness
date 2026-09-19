@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "herdr": {
+    "executable": "C:\\absolute\\path\\to\\herdr.exe",
+    "args": ["--session", "glassbox-p3", "server"],
+    "cwd": "C:\\absolute\\path\\to\\worker-root"
+  },
+  "napcat": {
+    "executable": "C:\\absolute\\path\\to\\NapCatWinBootMain.exe",
+    "args": [
+      "C:\\absolute\\path\\to\\QQ.exe",
+      "C:\\absolute\\path\\to\\NapCatWinBootHook.dll",
+      "123456789"
+    ],
+    "cwd": "C:\\absolute\\path\\to\\napcat",
+    "env": {
+      "NAPCAT_WORKDIR": "C:\\absolute\\path\\to\\napcat",
+      "NAPCAT_PATCH_PACKAGE": "C:\\absolute\\path\\to\\napcat\\qqnt.json",
+      "NAPCAT_LOAD_PATH": "C:\\absolute\\path\\to\\napcat\\loadNapCat.js",
+      "NAPCAT_INJECT_PATH": "C:\\absolute\\path\\to\\napcat\\NapCatWinBootHook.dll",
+      "NAPCAT_LAUNCHER_PATH": "C:\\absolute\\path\\to\\napcat\\NapCatWinBootMain.exe",
+      "NAPCAT_MAIN_PATH": "C:\\absolute\\path\\to\\napcat\\napcat.mjs",
+      "NAPCAT_DISABLE_MULTI_PROCESS": "1"
+    }
+  },
+  "glassbox": {
+    "env": {
+      "PORT": "3030",
+      "LORA_PI_KIT_PATH": "C:\\absolute\\path\\to\\lora-pi-kit"
+    }
+  }
+}

@@ -39,6 +39,13 @@ export async function loadAgentOperations(
   }
   if (!(await stat(value.worktreePath as string)).isDirectory())
     throw new Error("Worker worktree directory is unavailable");
+  const protectedValues = [
+    value.socketPath as string,
+    value.sessionId as string,
+    value.workspaceId as string,
+    value.agentKind as string,
+    value.worktreePath as string,
+  ];
   let workerLaunch;
   if (value.agentKind === "pi" && value.pi === undefined)
     throw new Error("Pi Worker requires a configured Kit launch policy");
@@ -63,11 +70,18 @@ export async function loadAgentOperations(
         throw new Error("Worker directory contains trusted runtime state");
     }
     const configured = pi as { kitPath: string; agentDir: string; provider: string; model: string };
+    protectedValues.push(
+      configured.kitPath,
+      configured.agentDir,
+      configured.provider,
+      configured.model,
+    );
     await piWorkerLaunch(configured);
     // Revalidate locks and capture current resource fingerprints for each attempt.
     workerLaunch = () => piWorkerLaunch(configured);
   }
   return {
+    protectedValues,
     workerPolicy: workerLaunch
       ? {
           databasePath,

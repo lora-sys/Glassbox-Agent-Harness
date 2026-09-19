@@ -125,14 +125,12 @@ export function createRunEvaluator(options: {
       const run = await store.conversations.getRun(observer, runId);
       const indexed = await store.evidence.getTrace(observer, runId);
       if (!indexed) throw new RunEvalError("EVAL_TRACE_NOT_INDEXED");
-      const ack = await store.lifecycle.findDelivery(observer, runId, "ack");
       const result = await store.lifecycle.findDelivery(observer, runId, "result");
       const observation = await inspect(observer, run, indexed, result?.id);
       const scores = scoreRun({
         run,
         trace: observation,
         indexedEvents: indexed.eventCount,
-        ack,
         result,
         expectedScope: scopeKey(observer.scope),
       });

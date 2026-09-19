@@ -11,6 +11,10 @@
   "scripts": {
     "glassbox": "tsx apps/server/src/cli.ts",
     "dev:server": "vp run -F @glassbox/server dev",
+    "agent:up": "tsx scripts/agent-service.mts up",
+    "agent:status": "tsx scripts/agent-service.mts status",
+    "agent:logs": "tsx scripts/agent-service.mts logs",
+    "agent:down": "tsx scripts/agent-service.mts down",
     "dev:web": "vp dev",
     "test:server": "vp test",
     "build:web": "vp build",

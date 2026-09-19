@@ -54,7 +54,7 @@ describe("Run-linked integrity Eval", () => {
       run: { id: runId, executionRef: "fake-fixture" },
       sample: { id: result.sampleId, input: { runId }, target: "run-integrity-v1" },
     });
-    expect(result.assessment?.scores).toHaveLength(6);
+    expect(result.assessment?.scores).toHaveLength(5);
     expect(result.assessment?.scores.every((score) => score.value === "pass")).toBe(true);
     expect(result.assessment?.trace).toEqual(
       await current.store.evidence.getTrace(evalOwner, runId),
@@ -78,7 +78,7 @@ describe("Run-linked integrity Eval", () => {
     expect(new Set([...first.items, ...second.items].map((item) => item.id))).toEqual(
       new Set([result.id, repeated.id]),
     );
-    expect(current.counts()).toEqual({ executions: 1, sends: 2 });
+    expect(current.counts()).toEqual({ executions: 1, sends: 1 });
     expect(await readFile(current.trace.getTracePath(runId))).toEqual(before);
   });
 
@@ -93,7 +93,7 @@ describe("Run-linked integrity Eval", () => {
       expect(
         result.assessment?.scores.find((score) => score.id === "result_delivery"),
       ).toMatchObject({ value: status === "failed" ? "fail" : "unknown", observed: status });
-      expect(current.counts()).toEqual({ executions: 1, sends: 2 });
+      expect(current.counts()).toEqual({ executions: 1, sends: 1 });
     },
   );
 
