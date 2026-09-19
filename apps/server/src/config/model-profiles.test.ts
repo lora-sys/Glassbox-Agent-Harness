@@ -11,7 +11,9 @@ async function fixture() {
   return { directory, store: await ModelProfileStore.open(directory) };
 }
 afterEach(async () => {
-  await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
+  await Promise.all(
+    directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })),
+  );
 });
 const profile = {
   id: "local",
@@ -38,14 +40,18 @@ describe("model configuration", () => {
 
   it("does not lose unrelated concurrent profile saves", async () => {
     const { directory, store } = await fixture();
-    await Promise.all(Array.from({ length: 12 }, (_, index) => store.save({ ...profile, id: `model${index}` })));
+    await Promise.all(
+      Array.from({ length: 12 }, (_, index) => store.save({ ...profile, id: `model${index}` })),
+    );
     expect((await ModelProfileStore.open(directory)).list()).toHaveLength(12);
   });
 
   it("requires an explicit credential choice when changing the destination", async () => {
     const { store } = await fixture();
     await store.save({ ...profile, apiKey: "private-key" });
-    await expect(store.save({ ...profile, baseUrl: "https://another.example/v1" })).rejects.toThrow("requires replacing or removing");
+    await expect(store.save({ ...profile, baseUrl: "https://another.example/v1" })).rejects.toThrow(
+      "requires replacing or removing",
+    );
     expect(store.resolve("local").profile.baseUrl).toBe(profile.baseUrl);
     await store.save({ ...profile, baseUrl: "https://another.example/v1", apiKey: null });
     expect(store.resolve("local").apiKey).toBeUndefined();
@@ -60,14 +66,22 @@ describe("model configuration", () => {
 
   it("preserves credentials still referenced by another profile and prunes replaced slots", async () => {
     const { directory } = await fixture();
-    await writeFile(join(directory, "models.json"), JSON.stringify({
-      version: 1,
-      profiles: [
-        { ...profile, id: "first", credentialSlot: "shared" },
-        { ...profile, id: "second", credentialSlot: "shared" },
-      ],
-      credentials: { shared: "shared-key", ...Object.fromEntries(Array.from({ length: 99 }, (_, index) => [`orphan${index}`, "old-secret"])) },
-    }));
+    await writeFile(
+      join(directory, "models.json"),
+      JSON.stringify({
+        version: 1,
+        profiles: [
+          { ...profile, id: "first", credentialSlot: "shared" },
+          { ...profile, id: "second", credentialSlot: "shared" },
+        ],
+        credentials: {
+          shared: "shared-key",
+          ...Object.fromEntries(
+            Array.from({ length: 99 }, (_, index) => [`orphan${index}`, "old-secret"]),
+          ),
+        },
+      }),
+    );
     const store = await ModelProfileStore.open(directory);
     await store.save({ ...profile, id: "first", apiKey: null });
     expect((await ModelProfileStore.open(directory)).resolve("second").apiKey).toBe("shared-key");
@@ -81,10 +95,18 @@ describe("model configuration", () => {
 
   it("rejects embedded URL secrets and untrusted credential slots without echoing input", async () => {
     const { store } = await fixture();
-    expect(() => store.save({ ...profile, baseUrl: "https://secret:password@example.com/v1" })).toThrow("API address cannot contain");
-    expect(() => store.save({ ...profile, baseUrl: "https://example.com?key=secret" })).toThrow("API address cannot contain");
-    expect(() => store.save({ ...profile, credentialSlot: "someone-else" })).toThrow("Unknown model profile field");
-    expect(() => store.save({ ...profile, baseUrl: "http://example.com/v1" })).toThrow("requires HTTPS");
+    expect(() =>
+      store.save({ ...profile, baseUrl: "https://secret:password@example.com/v1" }),
+    ).toThrow("API address cannot contain");
+    expect(() => store.save({ ...profile, baseUrl: "https://example.com?key=secret" })).toThrow(
+      "API address cannot contain",
+    );
+    expect(() => store.save({ ...profile, credentialSlot: "someone-else" })).toThrow(
+      "Unknown model profile field",
+    );
+    expect(() => store.save({ ...profile, baseUrl: "http://example.com/v1" })).toThrow(
+      "requires HTTPS",
+    );
     expect(store.list()).toEqual([]);
   });
 
@@ -93,7 +115,9 @@ describe("model configuration", () => {
     const path = join(directory, "models.json");
     const corrupted = '{"credentials":{"test":"test-private-value';
     await writeFile(path, corrupted);
-    await expect(ModelProfileStore.open(directory)).rejects.toThrow("Cannot read model configuration");
+    await expect(ModelProfileStore.open(directory)).rejects.toThrow(
+      "Cannot read model configuration",
+    );
     expect(await readFile(path, "utf8")).toBe(corrupted);
   });
 });

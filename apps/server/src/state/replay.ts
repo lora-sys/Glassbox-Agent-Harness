@@ -57,8 +57,7 @@ function rawToCodexEvent(entry: TraceEntry): CodexEvent | null {
   // Claude Code adapter prefixes inner SDK events with "sdk:" (e.g.
   // "sdk:assistant", "sdk:system"). Strip that prefix before lookup so the
   // same map works for both providers without adding duplicate entries.
-  const baseMethod = event.method.startsWith("sdk:")
-    ? event.method.slice(4) : event.method;
+  const baseMethod = event.method.startsWith("sdk:") ? event.method.slice(4) : event.method;
   const tag = METHOD_TO_TAG[baseMethod];
   if (!tag) return null;
 
@@ -69,9 +68,10 @@ function rawToCodexEvent(entry: TraceEntry): CodexEvent | null {
   const p = event.params;
   const inferredTurnId =
     typeof (p as Record<string, unknown>).turnId === "string"
-      ? (p as Record<string, unknown>).turnId as string
-      : typeof ((p as Record<string, unknown>).turn as Record<string, unknown> | undefined)?.id === "string"
-        ? ((p as Record<string, unknown>).turn as Record<string, unknown>).id as string
+      ? ((p as Record<string, unknown>).turnId as string)
+      : typeof ((p as Record<string, unknown>).turn as Record<string, unknown> | undefined)?.id ===
+          "string"
+        ? (((p as Record<string, unknown>).turn as Record<string, unknown>).id as string)
         : "";
 
   const reconstructed: Record<string, unknown> = { _tag: tag as CodexEvent["_tag"], ...p };

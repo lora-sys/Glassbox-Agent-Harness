@@ -28,7 +28,7 @@ const PATTERNS: Pattern[] = [
   },
   {
     name: "bearer-token",
-    regex: /(?:Bearer|Authorization)\s+[a-zA-Z0-9_\-\.]{16,}/,
+    regex: /(?:Bearer|Authorization)\s+[a-zA-Z0-9_.-]{16,}/,
     redact: (m) => {
       const spaceIdx = m.search(/\s/);
       return `${m.slice(0, spaceIdx + 1)}...[REDACTED:bearer-token]`;
@@ -73,7 +73,8 @@ const PATTERNS: Pattern[] = [
     name: "env-secret",
     // Env-style KEY=VALUE (case-insensitive key names, ≥16-char value).
     // The 'i' flag enables case-insensitive matching.
-    regex: /(?:API_KEY|TOKEN|SECRET|PASSWORD|PRIVATE_KEY|AUTH_TOKEN|ACCESS_KEY|CREDENTIAL)\s*[=:]\s*["']?[a-zA-Z0-9_\-]{16,}/gi,
+    regex:
+      /(?:API_KEY|TOKEN|SECRET|PASSWORD|PRIVATE_KEY|AUTH_TOKEN|ACCESS_KEY|CREDENTIAL)\s*[=:]\s*["']?[a-zA-Z0-9_-]{16,}/gi,
     redact: (m) => {
       const sep = m.search(/[=:]/);
       return `${m.slice(0, sep + 1)}...[REDACTED:env-secret]`;

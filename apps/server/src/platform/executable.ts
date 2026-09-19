@@ -100,7 +100,7 @@ export function defaultIsFile(filePath: string): boolean {
 export function defaultIsExecutableFile(
   filePath: string,
   platform: NodeJS.Platform = process.platform,
-  windowsPathExtensions?: ReadonlyArray<string>
+  windowsPathExtensions?: ReadonlyArray<string>,
 ): boolean {
   try {
     const s = fs.statSync(filePath);
@@ -142,7 +142,7 @@ export function escapeWindowsShellArg(arg: string): string {
  */
 export function sanitizeShellModeArgsForPlatform(
   args: ReadonlyArray<string>,
-  platform: NodeJS.Platform = process.platform
+  platform: NodeJS.Platform = process.platform,
 ): Array<string> {
   return platform === "win32" ? args.map(escapeWindowsShellArg) : [...args];
 }
@@ -150,7 +150,9 @@ export function sanitizeShellModeArgsForPlatform(
 /**
  * Parses PATHEXT on Windows, returning an array of upper-cased extensions including the leading dot.
  */
-export function resolveWindowsPathExtensions(env: NodeJS.ProcessEnv = process.env): ReadonlyArray<string> {
+export function resolveWindowsPathExtensions(
+  env: NodeJS.ProcessEnv = process.env,
+): ReadonlyArray<string> {
   const rawValue = env.PATHEXT;
   const fallback = [".COM", ".EXE", ".BAT", ".CMD"];
   if (!rawValue) return fallback;
@@ -167,7 +169,9 @@ export function resolveWindowsPathExtensions(env: NodeJS.ProcessEnv = process.en
 /**
  * Resolves standard global CLI directories on Windows where npm, pnpm, volta, scoop, or bun install CLIs.
  */
-export function resolveKnownWindowsCliDirs(env: NodeJS.ProcessEnv = process.env): ReadonlyArray<string> {
+export function resolveKnownWindowsCliDirs(
+  env: NodeJS.ProcessEnv = process.env,
+): ReadonlyArray<string> {
   const appData = env.APPDATA?.trim();
   const localAppData = env.LOCALAPPDATA?.trim();
   const userProfile = env.USERPROFILE?.trim();
@@ -197,7 +201,7 @@ export function resolveKnownWindowsCliDirs(env: NodeJS.ProcessEnv = process.env)
 export function resolveCommandCandidates(
   command: string,
   platform: NodeJS.Platform = process.platform,
-  windowsPathExtensions: ReadonlyArray<string> = resolveWindowsPathExtensions()
+  windowsPathExtensions: ReadonlyArray<string> = resolveWindowsPathExtensions(),
 ): ReadonlyArray<string> {
   if (platform !== "win32") return [command];
   const extension = path.win32.extname(command);
@@ -210,7 +214,7 @@ export function resolveCommandCandidates(
         command,
         `${commandWithoutExtension}${normalizedExtension}`,
         `${commandWithoutExtension}${normalizedExtension.toLowerCase()}`,
-      ])
+      ]),
     );
   }
 
@@ -233,7 +237,7 @@ export interface ExecutableResolutionOptions {
  */
 export function resolveExecutablePath(
   command: string,
-  options: ExecutableResolutionOptions = {}
+  options: ExecutableResolutionOptions = {},
 ): string | undefined {
   const platform = options.platform ?? process.platform;
   const env = options.env ?? process.env;
@@ -242,7 +246,8 @@ export function resolveExecutablePath(
   const p = platform === "win32" ? win32Path : posixPath;
 
   const windowsPathExtensions = platform === "win32" ? resolveWindowsPathExtensions(env) : [];
-  const isFile = options.isFile ?? ((f: string) => defaultIsExecutableFile(f, platform, windowsPathExtensions));
+  const isFile =
+    options.isFile ?? ((f: string) => defaultIsExecutableFile(f, platform, windowsPathExtensions));
 
   const candidates = resolveCommandCandidates(command, platform, windowsPathExtensions);
 
@@ -300,9 +305,7 @@ export interface ClaudeResolutionOptions extends ExecutableResolutionOptions {
  * spawn launcher scripts directly (`spawn EINVAL` on Node >= 20.12).
  * On other platforms the configured value is returned.
  */
-export function resolveClaudeExecutable(
-  options: ClaudeResolutionOptions = {}
-): string | undefined {
+export function resolveClaudeExecutable(options: ClaudeResolutionOptions = {}): string | undefined {
   const platform = options.platform ?? process.platform;
   const env = options.env ?? process.env;
   const hasExplicit = Boolean(options.binaryPath || env.CLAUDE_BINARY_PATH);
@@ -368,7 +371,7 @@ export interface CodexResolutionOptions extends ExecutableResolutionOptions {
  * When resolved to a native binary (.exe or POSIX executable), no shell is used.
  */
 export function resolveCodexExecutable(
-  options: CodexResolutionOptions = {}
+  options: CodexResolutionOptions = {},
 ): ResolvedSpawnCommand | undefined {
   const platform = options.platform ?? process.platform;
   const env = options.env ?? process.env;
@@ -449,7 +452,7 @@ export function resolveCodexExecutable(
 export function resolveSpawnCommand(
   command: string,
   args: ReadonlyArray<string>,
-  options: { platform?: NodeJS.Platform; env?: NodeJS.ProcessEnv } = {}
+  options: { platform?: NodeJS.Platform; env?: NodeJS.ProcessEnv } = {},
 ): ResolvedSpawnCommand {
   const platform = options.platform ?? process.platform;
   if (platform !== "win32") {

@@ -12,3 +12,7 @@ upstream/
 .dispatch/
 assets/
 .visual-fix/
+
+# Source-pinned vendor snapshots
+apps/server/src/model/vendor/
+apps/server/src/execution/model-agent/vendor/

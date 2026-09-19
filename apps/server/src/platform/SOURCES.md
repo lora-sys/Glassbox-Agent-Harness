@@ -1,16 +1,19 @@
 # Upstream Source Reuse: Platform Runtime
 
 ## Upstream Repository
+
 - Repository: `pingdotgg/t3code` (`https://github.com/pingdotgg/t3code`)
 - Pinned commit SHA: `4a4c6dd2adc350a68ba18bb28b24b5a7e4660dab`
 - Upstream license: MIT (see `LICENSE` in this directory)
 
 ## Upstream Files
+
 - `packages/shared/src/shell.ts`
 - `apps/server/src/provider/Drivers/ClaudeExecutable.ts`
 - `apps/server/src/provider/Drivers/ClaudeHome.ts`
 
 ## Local Glassbox Adaptations
+
 - **`apps/server/src/platform/executable.ts`**:
   - Direct implementation of `escapeWindowsShellArg` and `sanitizeShellModeArgsForPlatform` for cmd-safe argv quoting without shell command string interpolation.
   - Portable candidate generation with `%PATH%` and `%PATHEXT%` resolution.

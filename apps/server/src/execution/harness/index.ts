@@ -1,6 +1,10 @@
 export { createClaudeHarnessAdapter, executableSha256 } from "./claude.js";
 export { createCodexHarnessAdapter } from "./codex.js";
-export type { CodexHarnessOptions, CodexHarnessAdapter, CodexProtectedTool } from "./codex-types.js";
+export type {
+  CodexHarnessOptions,
+  CodexHarnessAdapter,
+  CodexProtectedTool,
+} from "./codex-types.js";
 export type {
   ClaudeHarnessOptions,
   HarnessAdapter,

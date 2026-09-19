@@ -32,20 +32,20 @@ export const ThreadStartedParams = Schema.Struct({
     cwd: Schema.String,
   }),
 });
-export type ThreadStartedParams = Schema.Schema.Type<
-  typeof ThreadStartedParams
->;
+export type ThreadStartedParams = Schema.Schema.Type<typeof ThreadStartedParams>;
 
 /** turn/started notification params */
 export const TurnStartedParams = Schema.Struct({
   _tag: Schema.Literal("turnStarted"),
   threadId: Schema.String,
-  input: Schema.optional(Schema.Array(
-    Schema.Struct({
-      type: Schema.String,
-      text: Schema.optional(Schema.String),
-    })
-  )),
+  input: Schema.optional(
+    Schema.Array(
+      Schema.Struct({
+        type: Schema.String,
+        text: Schema.optional(Schema.String),
+      }),
+    ),
+  ),
   turn: Schema.Struct({
     id: Schema.String,
     status: Schema.String,
@@ -76,9 +76,7 @@ export const AgentMessageDeltaParams = Schema.Struct({
   itemId: Schema.String,
   delta: Schema.String,
 });
-export type AgentMessageDeltaParams = Schema.Schema.Type<
-  typeof AgentMessageDeltaParams
->;
+export type AgentMessageDeltaParams = Schema.Schema.Type<typeof AgentMessageDeltaParams>;
 
 /** item/agentMessage/final notification params (claude-code-only: emitted on
  *  result event with the last assistant text block of the turn). */
@@ -89,9 +87,7 @@ export const AgentMessageFinalParams = Schema.Struct({
   text: Schema.String,
   completedAtMs: Schema.Number,
 });
-export type AgentMessageFinalParams = Schema.Schema.Type<
-  typeof AgentMessageFinalParams
->;
+export type AgentMessageFinalParams = Schema.Schema.Type<typeof AgentMessageFinalParams>;
 
 /** item/completed notification params */
 export const ItemCompletedParams = Schema.Struct({
@@ -136,12 +132,10 @@ export const ItemFileChangeParams = Schema.Struct({
       path: Schema.String,
       kind: Schema.String,
       diff: Schema.optional(Schema.String),
-    })
+    }),
   ),
 });
-export type ItemFileChangeParams = Schema.Schema.Type<
-  typeof ItemFileChangeParams
->;
+export type ItemFileChangeParams = Schema.Schema.Type<typeof ItemFileChangeParams>;
 
 /** turn/diff/updated — notification of a filesystem diff during a turn */
 export const TurnDiffUpdatedParams = Schema.Struct({
@@ -150,9 +144,7 @@ export const TurnDiffUpdatedParams = Schema.Struct({
   turnId: Schema.String,
   diff: Schema.String,
 });
-export type TurnDiffUpdatedParams = Schema.Schema.Type<
-  typeof TurnDiffUpdatedParams
->;
+export type TurnDiffUpdatedParams = Schema.Schema.Type<typeof TurnDiffUpdatedParams>;
 
 /** item/{fileChange,commandExecution}/requestApproval notification params */
 export const RequestApprovalParams = Schema.Struct({
@@ -164,9 +156,7 @@ export const RequestApprovalParams = Schema.Struct({
   reason: Schema.Union([Schema.String, Schema.Null]),
   grantRoot: Schema.Union([Schema.String, Schema.Null]),
 });
-export type RequestApprovalParams = Schema.Schema.Type<
-  typeof RequestApprovalParams
->;
+export type RequestApprovalParams = Schema.Schema.Type<typeof RequestApprovalParams>;
 
 /** Glassbox action.send record (appended to trace after new turn starts with edited task) */
 export const ActionSendParams = Schema.Struct({
@@ -179,9 +169,7 @@ export const ActionSendParams = Schema.Struct({
   task: Schema.String,
   ts: Schema.String,
 });
-export type ActionSendParams = Schema.Schema.Type<
-  typeof ActionSendParams
->;
+export type ActionSendParams = Schema.Schema.Type<typeof ActionSendParams>;
 
 /** Glassbox action.pause record (appended to trace after turn/interrupt) */
 export const ActionPauseParams = Schema.Struct({
@@ -194,9 +182,7 @@ export const ActionPauseParams = Schema.Struct({
   turnStatus: Schema.String,
   ts: Schema.String,
 });
-export type ActionPauseParams = Schema.Schema.Type<
-  typeof ActionPauseParams
->;
+export type ActionPauseParams = Schema.Schema.Type<typeof ActionPauseParams>;
 
 /** thread/tokenUsage/updated notification params (Codex usage event) */
 export const TokenUsageUpdatedParams = Schema.Struct({
@@ -224,9 +210,7 @@ export const TokenUsageUpdatedParams = Schema.Struct({
   }),
   costUsd: Schema.optional(Schema.Number),
 });
-export type TokenUsageUpdatedParams = Schema.Schema.Type<
-  typeof TokenUsageUpdatedParams
->;
+export type TokenUsageUpdatedParams = Schema.Schema.Type<typeof TokenUsageUpdatedParams>;
 
 /** Glassbox action.steer record (appended to trace after new turn starts) */
 export const ActionSteerParams = Schema.Struct({
@@ -239,9 +223,7 @@ export const ActionSteerParams = Schema.Struct({
   instruction: Schema.String,
   ts: Schema.String,
 });
-export type ActionSteerParams = Schema.Schema.Type<
-  typeof ActionSteerParams
->;
+export type ActionSteerParams = Schema.Schema.Type<typeof ActionSteerParams>;
 
 /** Glassbox action.editInput record (appended to trace after editing a research input) */
 export const ActionEditInputParams = Schema.Struct({
@@ -255,9 +237,7 @@ export const ActionEditInputParams = Schema.Struct({
   value: Schema.String,
   ts: Schema.String,
 });
-export type ActionEditInputParams = Schema.Schema.Type<
-  typeof ActionEditInputParams
->;
+export type ActionEditInputParams = Schema.Schema.Type<typeof ActionEditInputParams>;
 
 // ---------------------------------------------------------------------------
 // Full event union

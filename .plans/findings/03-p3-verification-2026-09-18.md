@@ -8,10 +8,10 @@ P3 implementation and the dedicated Windows acceptance environment completed the
 - The real Herdr socket test passed separately against the named `glassbox-p3` session.
 - The security and reliability selection passed 62 tests across OneBot, shared Conversation isolation, Pi protected Tools and authorized Ops.
 - The server TypeScript check passed.
-- Changed server and contracts files passed strict lint and formatting.
+- The non-frontend scope check passed formatting for 186 files and passed lint plus type analysis for 183 files with no warnings or errors.
 - Windows parallel execution can make two integration fixtures exceed Vitest defaults. The repository test configuration now uses 30 second test and hook limits. The complete suite passes with that bound.
 - A final parallel rerun exposed a 300 millisecond process-exit margin in the Claude harness fixture. The fixture now allows one second for the actual Windows child-exit signal before cleanup, and the complete 620-test suite passes.
-- Root `npm run check` still reports 236 unrelated baseline formatting files in legacy and frontend paths. P3 did not rewrite the separate frontend worktree to clear that baseline.
+- Root `npm run check` now reports only 23 formatting files under `apps/web`. P3 did not rewrite the separate frontend worktree to clear that independent baseline.
 
 ## Lora PI Kit
 

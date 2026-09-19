@@ -235,11 +235,24 @@ describe("installed Codex Owner Run boundary", () => {
     const item = await fixture("tool");
     const controller = new AbortController();
     let release: (value: string) => void = () => {};
-    const adapter = createCodexHarnessAdapter({ ...item.config, protectedTools: [{
-      name: "write_note", description: "Write a note.", inputSchema: { type: "object" },
-      parseArguments: value => value, authorize: async () => true,
-      execute: async () => { controller.abort(); return new Promise<string>(resolve => { release = resolve; }); },
-    }] });
+    const adapter = createCodexHarnessAdapter({
+      ...item.config,
+      protectedTools: [
+        {
+          name: "write_note",
+          description: "Write a note.",
+          inputSchema: { type: "object" },
+          parseArguments: (value) => value,
+          authorize: async () => true,
+          execute: async () => {
+            controller.abort();
+            return new Promise<string>((resolve) => {
+              release = resolve;
+            });
+          },
+        },
+      ],
+    });
     const result = await adapter.execute(executionInput({ signal: controller.signal }));
     expect(result).toEqual({ status: "unknown", usage: null, code: "EXIT_UNCONFIRMED" });
     expect((await adapter.execute(executionInput())).code).toBe("INVALID_INPUT");

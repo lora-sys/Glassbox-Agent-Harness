@@ -128,7 +128,10 @@ describe("Platform Paths and Repo Validation", () => {
     }
 
     // 7. Reserved ~/.glassbox
-    expect(validateRepoPath("~/.glassbox")).toEqual({ ok: false, error: "~/.glassbox is reserved" });
+    expect(validateRepoPath("~/.glassbox")).toEqual({
+      ok: false,
+      error: "~/.glassbox is reserved",
+    });
 
     // 8. Legitimate temporary directory outside repo returns canonical realPath
     const validTemp = fs.mkdtempSync(path.join(os.tmpdir(), "glassbox-valid-test-"));
@@ -162,12 +165,18 @@ describe("Platform Paths and Repo Validation", () => {
       expect(res.ok).toBe(true);
       if (res.ok) {
         // realPath must point to canonical targetDir
-        const canonicalTarget = fs.realpathSync.native ? fs.realpathSync.native(targetDir) : fs.realpathSync(targetDir);
+        const canonicalTarget = fs.realpathSync.native
+          ? fs.realpathSync.native(targetDir)
+          : fs.realpathSync(targetDir);
         expect(res.realPath.toLowerCase()).toBe(canonicalTarget.toLowerCase());
       }
     } finally {
-      try { fs.rmSync(linkDir, { recursive: true, force: true }); } catch {}
-      try { fs.rmSync(tempRoot, { recursive: true, force: true }); } catch {}
+      try {
+        fs.rmSync(linkDir, { recursive: true, force: true });
+      } catch {}
+      try {
+        fs.rmSync(tempRoot, { recursive: true, force: true });
+      } catch {}
     }
   });
 });
@@ -227,14 +236,11 @@ describe("Safe Argv and Launcher Resolution", () => {
     // dump.js writes remaining arguments to JSON file
     fs.writeFileSync(
       dumpScript,
-      `const fs = require('fs'); fs.writeFileSync(process.argv[2], JSON.stringify(process.argv.slice(3)));`
+      `const fs = require('fs'); fs.writeFileSync(process.argv[2], JSON.stringify(process.argv.slice(3)));`,
     );
 
     // launcher.cmd executes node dump.js %*
-    fs.writeFileSync(
-      cmdLauncher,
-      `@"${process.execPath}" "%~dp0dump.js" %*\n`
-    );
+    fs.writeFileSync(cmdLauncher, `@"${process.execPath}" "%~dp0dump.js" %*\n`);
 
     try {
       const testArgs = [outFile, "arg with spaces", 'quote"test"', "meta&^%chars"];
@@ -311,7 +317,7 @@ describe("Safe Argv and Launcher Resolution", () => {
       process.arch === "arm64" ? "codex-win32-arm64" : "codex-win32-x64",
       "vendor",
       process.arch === "arm64" ? "aarch64-pc-windows-msvc" : "x86_64-pc-windows-msvc",
-      "bin"
+      "bin",
     );
     const vendorExe = path.join(vendorDir, "codex.exe");
     const jsDir = path.join(tempDir, "node_modules", "@openai", "codex", "bin");
@@ -366,12 +372,16 @@ describe("Safe Argv and Launcher Resolution", () => {
     if (!resolved) return; // Not installed on this host, skip execution
 
     // Run --version instead of app-server to verify local binary resolution
-    const versionOutput = execFileSync(resolved.command, [resolved.args[0] === "app-server" ? "--version" : resolved.args[0], "--version"], {
-      encoding: "utf-8",
-      timeout: 5000,
-      shell: resolved.shell,
-      windowsHide: true,
-    }).trim();
+    const versionOutput = execFileSync(
+      resolved.command,
+      [resolved.args[0] === "app-server" ? "--version" : resolved.args[0], "--version"],
+      {
+        encoding: "utf-8",
+        timeout: 5000,
+        shell: resolved.shell,
+        windowsHide: true,
+      },
+    ).trim();
 
     expect(versionOutput.length).toBeGreaterThan(0);
   });
@@ -413,10 +423,7 @@ describe("Child Process Lifecycle & Shutdown Cleanup", () => {
     const dummyServerJs = path.join(tempDir, "dummy-server.js");
 
     // Dummy server that reads stdin and never exits until killed
-    fs.writeFileSync(
-      dummyServerJs,
-      `process.stdin.resume(); setInterval(() => {}, 1000);`
-    );
+    fs.writeFileSync(dummyServerJs, `process.stdin.resume(); setInterval(() => {}, 1000);`);
 
     const adapter = new CodexAdapter(dummyServerJs);
     adapter.start();

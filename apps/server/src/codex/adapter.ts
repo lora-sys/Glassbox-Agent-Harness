@@ -123,8 +123,12 @@ export class CodexAdapter extends EventEmitter implements ProviderAdapter {
 
   /** Fire and clear all turn-end subscribers (called from the event handler). */
   private _fireTurnEnd(status: string, threadId: string): void {
-    const subs = this._turnEndSubscribers.filter((entry) => !entry.threadId || entry.threadId === threadId);
-    this._turnEndSubscribers = this._turnEndSubscribers.filter((entry) => entry.threadId && entry.threadId !== threadId);
+    const subs = this._turnEndSubscribers.filter(
+      (entry) => !entry.threadId || entry.threadId === threadId,
+    );
+    this._turnEndSubscribers = this._turnEndSubscribers.filter(
+      (entry) => entry.threadId && entry.threadId !== threadId,
+    );
     for (const { fn } of subs) {
       try {
         fn(status);
@@ -497,8 +501,14 @@ export class CodexAdapter extends EventEmitter implements ProviderAdapter {
     const buffered: Array<[string, unknown]> = [];
     let overflow = false;
     const buffer = (method: string, value: unknown) => {
-      if (!value || typeof value !== "object" || (value as Record<string, unknown>).threadId !== threadId) return;
-      if (buffered.length >= 128 || Buffer.byteLength(JSON.stringify(value)) > 128 * 1024) overflow = true;
+      if (
+        !value ||
+        typeof value !== "object" ||
+        (value as Record<string, unknown>).threadId !== threadId
+      )
+        return;
+      if (buffered.length >= 128 || Buffer.byteLength(JSON.stringify(value)) > 128 * 1024)
+        overflow = true;
       else buffered.push([method, value]);
     };
     this.collectors.add(buffer);
@@ -638,8 +648,14 @@ export class CodexAdapter extends EventEmitter implements ProviderAdapter {
   private emitNotification(method: string, params: unknown): void {
     if (method === "turn/completed" && params && typeof params === "object") {
       const value = params as Record<string, unknown>;
-      const turn = value.turn && typeof value.turn === "object" ? value.turn as Record<string, unknown> : undefined;
-      if (typeof value.threadId === "string" && ["completed", "interrupted", "failed"].includes(String(turn?.status))) {
+      const turn =
+        value.turn && typeof value.turn === "object"
+          ? (value.turn as Record<string, unknown>)
+          : undefined;
+      if (
+        typeof value.threadId === "string" &&
+        ["completed", "interrupted", "failed"].includes(String(turn?.status))
+      ) {
         this._fireTurnEnd(String(turn!.status), value.threadId);
       }
     }

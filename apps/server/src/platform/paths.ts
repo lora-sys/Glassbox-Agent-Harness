@@ -74,8 +74,10 @@ export function getDefaultWorkspace(provider: string): string {
  * Respects Windows case-insensitivity and path normalization.
  */
 export function isPathInsideOrEqual(parent: string, candidate: string): boolean {
-  const p = process.platform === "win32" ? path.resolve(parent).toLowerCase() : path.resolve(parent);
-  const c = process.platform === "win32" ? path.resolve(candidate).toLowerCase() : path.resolve(candidate);
+  const p =
+    process.platform === "win32" ? path.resolve(parent).toLowerCase() : path.resolve(parent);
+  const c =
+    process.platform === "win32" ? path.resolve(candidate).toLowerCase() : path.resolve(candidate);
   if (p === c) return true;
   const rel = path.relative(p, c);
   if (path.isAbsolute(rel)) return false;
@@ -85,9 +87,7 @@ export function isPathInsideOrEqual(parent: string, candidate: string): boolean 
   return true;
 }
 
-export type RepoValidationResult =
-  | { ok: true; realPath: string }
-  | { ok: false; error: string };
+export type RepoValidationResult = { ok: true; realPath: string } | { ok: false; error: string };
 
 /**
  * Validates a client-provided repository workspace path.
@@ -177,7 +177,9 @@ export function validateRepoPath(targetPath: string): RepoValidationResult {
   const homeGlassbox = path.join(os.homedir(), ".glassbox");
   let realHomeGlassbox: string;
   try {
-    realHomeGlassbox = realpathSync.native ? realpathSync.native(homeGlassbox) : realpathSync(homeGlassbox);
+    realHomeGlassbox = realpathSync.native
+      ? realpathSync.native(homeGlassbox)
+      : realpathSync(homeGlassbox);
   } catch {
     realHomeGlassbox = path.resolve(homeGlassbox);
   }

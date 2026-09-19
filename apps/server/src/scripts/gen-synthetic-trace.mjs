@@ -23,12 +23,25 @@ const ITEMS_PER_TURN = 15;
 const BASE_TS = Date.now() - TURNS * 125_000;
 
 const FILES = [
-  "src/utils/helpers.ts", "src/utils/parser.ts", "src/utils/validator.ts",
-  "src/core/engine.ts", "src/core/processor.ts", "src/core/analyzer.ts",
-  "src/api/routes.ts", "src/api/middleware.ts", "src/api/handlers.ts",
-  "src/models/user.ts", "src/models/session.ts", "src/models/config.ts",
-  "tests/unit/utils.test.ts", "tests/unit/core.test.ts", "tests/unit/api.test.ts",
-  "tests/e2e/flow.test.ts", "docs/api.md", "docs/setup.md", "README.md",
+  "src/utils/helpers.ts",
+  "src/utils/parser.ts",
+  "src/utils/validator.ts",
+  "src/core/engine.ts",
+  "src/core/processor.ts",
+  "src/core/analyzer.ts",
+  "src/api/routes.ts",
+  "src/api/middleware.ts",
+  "src/api/handlers.ts",
+  "src/models/user.ts",
+  "src/models/session.ts",
+  "src/models/config.ts",
+  "tests/unit/utils.test.ts",
+  "tests/unit/core.test.ts",
+  "tests/unit/api.test.ts",
+  "tests/e2e/flow.test.ts",
+  "docs/api.md",
+  "docs/setup.md",
+  "README.md",
 ];
 
 const TASKS = [
@@ -49,7 +62,9 @@ const TASKS = [
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 function hex(len) {
-  return Math.random().toString(16).slice(2, 2 + len);
+  return Math.random()
+    .toString(16)
+    .slice(2, 2 + len);
 }
 
 function uuid(prefix) {
@@ -79,29 +94,38 @@ function generate(sessionId) {
   let seq = 1;
 
   // session.config
-  lines.push(entry(seq++, {
-    method: "session.config",
-    params: {
-      kind: "session.config",
-      provider: "codex",
-      permissionMode: "default",
-      approvalPolicy: "on-request",
-      sandboxPolicy: "read-only",
-      repoPath: "/tmp/glassbox-perf-test",
-      ts: t(0),
-    },
-  }));
+  lines.push(
+    entry(seq++, {
+      method: "session.config",
+      params: {
+        kind: "session.config",
+        provider: "codex",
+        permissionMode: "default",
+        approvalPolicy: "on-request",
+        sandboxPolicy: "read-only",
+        repoPath: "/tmp/glassbox-perf-test",
+        ts: t(0),
+      },
+    }),
+  );
 
   const threadId = uuid("thread-");
 
   // thread/started
-  lines.push(entry(seq++, {
-    method: "thread/started",
-    params: {
-      _tag: "threadStarted",
-      thread: { id: threadId, sessionId, status: { type: "active" }, cwd: "/tmp/glassbox-perf-test" },
-    },
-  }));
+  lines.push(
+    entry(seq++, {
+      method: "thread/started",
+      params: {
+        _tag: "threadStarted",
+        thread: {
+          id: threadId,
+          sessionId,
+          status: { type: "active" },
+          cwd: "/tmp/glassbox-perf-test",
+        },
+      },
+    }),
+  );
 
   for (let turn = 0; turn < TURNS; turn++) {
     const t0 = 5_000 + turn * 125_000;
@@ -109,36 +133,49 @@ function generate(sessionId) {
     const task = TASKS[turn % TASKS.length];
 
     // turn/started
-    lines.push(entry(seq++, {
-      method: "turn/started",
-      params: {
-        _tag: "turnStarted",
-        threadId,
-        input: [{ type: "text", text: task }],
-        turn: { id: turnId, status: "inProgress" },
-      },
-    }));
+    lines.push(
+      entry(seq++, {
+        method: "turn/started",
+        params: {
+          _tag: "turnStarted",
+          threadId,
+          input: [{ type: "text", text: task }],
+          turn: { id: turnId, status: "inProgress" },
+        },
+      }),
+    );
 
     // One userMessage item per turn
     const userItemId = uuid("item-");
-    lines.push(entry(seq++, {
-      method: "item/started",
-      params: {
-        _tag: "itemStarted",
-        item: { type: "userMessage", id: userItemId, content: [{ type: "text", text: task }] },
-        threadId, turnId,
-        startedAtMs: BASE_TS + t0 + 200,
-      },
-    }));
-    lines.push(entry(seq++, {
-      method: "item/completed",
-      params: {
-        _tag: "itemCompleted",
-        item: { type: "userMessage", id: userItemId, status: "completed", content: [{ type: "text", text: task }] },
-        threadId, turnId,
-        completedAtMs: BASE_TS + t0 + 400,
-      },
-    }));
+    lines.push(
+      entry(seq++, {
+        method: "item/started",
+        params: {
+          _tag: "itemStarted",
+          item: { type: "userMessage", id: userItemId, content: [{ type: "text", text: task }] },
+          threadId,
+          turnId,
+          startedAtMs: BASE_TS + t0 + 200,
+        },
+      }),
+    );
+    lines.push(
+      entry(seq++, {
+        method: "item/completed",
+        params: {
+          _tag: "itemCompleted",
+          item: {
+            type: "userMessage",
+            id: userItemId,
+            status: "completed",
+            content: [{ type: "text", text: task }],
+          },
+          threadId,
+          turnId,
+          completedAtMs: BASE_TS + t0 + 400,
+        },
+      }),
+    );
 
     // Work items per turn
     for (let i = 0; i < ITEMS_PER_TURN; i++) {
@@ -148,24 +185,29 @@ function generate(sessionId) {
       const itemType = isCmd ? "commandExecution" : "agentMessage";
       const phase = "running";
 
-      lines.push(entry(seq++, {
-        method: "item/started",
-        params: {
-          _tag: "itemStarted",
-          item: { type: itemType, id: itemId, phase, text: task },
-          threadId, turnId,
-          startedAtMs: BASE_TS + itemStart,
-        },
-      }));
+      lines.push(
+        entry(seq++, {
+          method: "item/started",
+          params: {
+            _tag: "itemStarted",
+            item: { type: itemType, id: itemId, phase, text: task },
+            threadId,
+            turnId,
+            startedAtMs: BASE_TS + itemStart,
+          },
+        }),
+      );
 
       // Agent message deltas
       if (itemType === "agentMessage") {
         const frags = fragsFor(task, turn, i);
         for (const f of frags) {
-          lines.push(entry(seq++, {
-            method: "item/agentMessage/delta",
-            params: { _tag: "agentMessageDelta", threadId, turnId, itemId, delta: f },
-          }));
+          lines.push(
+            entry(seq++, {
+              method: "item/agentMessage/delta",
+              params: { _tag: "agentMessageDelta", threadId, turnId, itemId, delta: f },
+            }),
+          );
         }
       }
 
@@ -174,36 +216,55 @@ function generate(sessionId) {
         for (let fc = 0; fc < 3; fc++) {
           const filePath = FILES[(turn * ITEMS_PER_TURN + i + fc) % FILES.length];
           const kind = ["write", "modify", "add"][fc % 3];
-          lines.push(entry(seq++, {
-            method: "item/fileChange",
-            params: {
-              _tag: "itemFileChange",
-              threadId, turnId, itemId,
-              changes: [{
-                path: filePath, kind,
-                diff: "--- a/" + filePath + "\n+++ b/" + filePath + "\n@@ -1,3 +1,4 @@\n line1\n+added by turn " + turnId.slice(0, 8) + "\n",
-              }],
-            },
-          }));
+          lines.push(
+            entry(seq++, {
+              method: "item/fileChange",
+              params: {
+                _tag: "itemFileChange",
+                threadId,
+                turnId,
+                itemId,
+                changes: [
+                  {
+                    path: filePath,
+                    kind,
+                    diff:
+                      "--- a/" +
+                      filePath +
+                      "\n+++ b/" +
+                      filePath +
+                      "\n@@ -1,3 +1,4 @@\n line1\n+added by turn " +
+                      turnId.slice(0, 8) +
+                      "\n",
+                  },
+                ],
+              },
+            }),
+          );
         }
       }
 
       // item/completed
       const status = i === ITEMS_PER_TURN - 1 ? "completed" : "completed";
-      lines.push(entry(seq++, {
-        method: "item/completed",
-        params: {
-          _tag: "itemCompleted",
-          item: {
-            type: itemType, id: itemId, status,
-            aggregatedOutput: isCmd ? "exit 0\n" : null,
-            exitCode: isCmd ? 0 : undefined,
-            durationMs: 14_000,
+      lines.push(
+        entry(seq++, {
+          method: "item/completed",
+          params: {
+            _tag: "itemCompleted",
+            item: {
+              type: itemType,
+              id: itemId,
+              status,
+              aggregatedOutput: isCmd ? "exit 0\n" : null,
+              exitCode: isCmd ? 0 : undefined,
+              durationMs: 14_000,
+            },
+            threadId,
+            turnId,
+            completedAtMs: BASE_TS + itemStart + 15_000,
           },
-          threadId, turnId,
-          completedAtMs: BASE_TS + itemStart + 15_000,
-        },
-      }));
+        }),
+      );
     }
 
     // turn/diff/updated
@@ -224,26 +285,31 @@ function generate(sessionId) {
       diffParts.push("");
     }
     const diffText = diffParts.join("\n");
-    lines.push(entry(seq++, {
-      method: "turn/diff/updated",
-      params: { _tag: "turnDiffUpdated", threadId, turnId, diff: diffText },
-    }));
+    lines.push(
+      entry(seq++, {
+        method: "turn/diff/updated",
+        params: { _tag: "turnDiffUpdated", threadId, turnId, diff: diffText },
+      }),
+    );
 
     // turn/completed
-    lines.push(entry(seq++, {
-      method: "turn/completed",
-      params: {
-        _tag: "turnCompleted",
-        threadId,
-        turn: {
-          id: turnId, status: "completed",
-          startedAt: BASE_TS + t0,
-          completedAt: BASE_TS + t0 + 100_000,
-          durationMs: 100_000 + turn * 500,
-          error: null,
+    lines.push(
+      entry(seq++, {
+        method: "turn/completed",
+        params: {
+          _tag: "turnCompleted",
+          threadId,
+          turn: {
+            id: turnId,
+            status: "completed",
+            startedAt: BASE_TS + t0,
+            completedAt: BASE_TS + t0 + 100_000,
+            durationMs: 100_000 + turn * 500,
+            error: null,
+          },
         },
-      },
-    }));
+      }),
+    );
   }
 
   // Write file
@@ -259,17 +325,35 @@ function generate(sessionId) {
   return { sessionId, eventCount, path };
 }
 
-function fragsFor(task, turnIdx, itemIdx) {
+function fragsFor(task, turnIdx, _itemIdx) {
   const words = [
-    "Analyzing", task.slice(0, 30), "...",
-    "Found", (3 + turnIdx % 5), "files",
-    "to", "modify.", "Creating",
-    "new", "interfaces", "and",
-    "migrating", "implementations.", "Running",
-    "test", "suite", "to",
-    "verify", "changes.", "All",
-    String(30 + turnIdx * 3), "tests", "pass.",
-    "Committing", "changes", "now.",
+    "Analyzing",
+    task.slice(0, 30),
+    "...",
+    "Found",
+    3 + (turnIdx % 5),
+    "files",
+    "to",
+    "modify.",
+    "Creating",
+    "new",
+    "interfaces",
+    "and",
+    "migrating",
+    "implementations.",
+    "Running",
+    "test",
+    "suite",
+    "to",
+    "verify",
+    "changes.",
+    "All",
+    String(30 + turnIdx * 3),
+    "tests",
+    "pass.",
+    "Committing",
+    "changes",
+    "now.",
   ];
   const frags = [];
   const chunkSize = 3;

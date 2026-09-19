@@ -124,9 +124,7 @@ describe("Effect Schema decode adoption gate", () => {
       const ev = await decodeEvent(THREAD_STARTED_NOTIFY);
       expect((ev as any)._tag).toBe("threadStarted");
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      expect((ev as any).thread.id).toBe(
-        "01a0479e-2bfa-7920-8a73-6625612015cd"
-      );
+      expect((ev as any).thread.id).toBe("01a0479e-2bfa-7920-8a73-6625612015cd");
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       expect((ev as any).thread.status.type).toBe("idle");
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -148,16 +146,12 @@ describe("Effect Schema decode adoption gate", () => {
       expect((ev as any)._tag).toBe("turnStarted");
       expect((ev as any).turn.id).toBe("01a0479e-3441-76d1-a248-8f86924c5221");
       expect((ev as any).turn.status).toBe("inProgress");
-      expect((ev as any).threadId).toBe(
-        "01a0479e-2bfa-7920-8a73-6625612015cd"
-      );
+      expect((ev as any).threadId).toBe("01a0479e-2bfa-7920-8a73-6625612015cd");
     });
 
     it("throws on an unknown method string", async () => {
       const bad = { method: "turn/does-not-exist", params: {} };
-      await expect(decodeEvent(bad)).rejects.toThrow(
-        "Unrecognized notification method"
-      );
+      await expect(decodeEvent(bad)).rejects.toThrow("Unrecognized notification method");
     });
   });
 
@@ -176,9 +170,7 @@ describe("Effect Schema decode adoption gate", () => {
       const ev = await decodeEvent(AGENT_MSG_DELTA_NOTIFY);
       expect((ev as any)._tag).toBe("agentMessageDelta");
       expect((ev as any).delta).toBe("```");
-      expect((ev as any).itemId).toBe(
-        "msg_02c59516fbe0b657016a914f774fcc87d08f6b523d44751a4f"
-      );
+      expect((ev as any).itemId).toBe("msg_02c59516fbe0b657016a914f774fcc87d08f6b523d44751a4f");
     });
   });
 
@@ -215,9 +207,7 @@ describe("Effect Schema decode adoption gate", () => {
     it("decodes a real fileChange/requestApproval notification", async () => {
       const ev = await decodeEvent(FILE_CHANGE_APPROVAL);
       expect((ev as any)._tag).toBe("requestApproval");
-      expect((ev as any).itemId).toBe(
-        "exec-42fd6e1f-f56c-4e60-ba60-13f5b48fe575"
-      );
+      expect((ev as any).itemId).toBe("exec-42fd6e1f-f56c-4e60-ba60-13f5b48fe575");
       expect((ev as any).reason).toBe("command failed; retry without sandbox?");
       expect((ev as any).grantRoot).toBeNull();
     });

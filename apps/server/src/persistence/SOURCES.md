@@ -2,10 +2,10 @@
 
 The SQL statement arrays, transactional batch writes, conflict handling, per-session indexes, and explicit row-to-domain mapping are adapted from the following MIT sources. Glassbox uses its own domain schema and local configuration.
 
-| Repository | Commit | Original path | Local use |
-| --- | --- | --- | --- |
+| Repository                 | Commit                                   | Original path    | Local use                                                                                                       |
+| -------------------------- | ---------------------------------------- | ---------------- | --------------------------------------------------------------------------------------------------------------- |
 | joyehuang/trajectory-panel | ef3ac78f48523d0902e71bca896eae28e2324fe6 | daemon/lib/db.js | schema.ts, database.ts, evidence.ts and conversation writes adapt schema arrays, batch transactions and upserts |
-| joyehuang/trajectory-panel | ef3ac78f48523d0902e71bca896eae28e2324fe6 | api/_lib/db.js | Explicit typed row mapping in evidence.ts and conversation/store.ts |
+| joyehuang/trajectory-panel | ef3ac78f48523d0902e71bca896eae28e2324fe6 | api/_lib/db.js   | Explicit typed row mapping in evidence.ts and conversation/store.ts                                             |
 
 The original MIT license is preserved in LICENSE.trajectory-panel. The upstream package declares @libsql/client ^0.17.4. Glassbox imports only the normal database driver, never the reference checkout.
 
