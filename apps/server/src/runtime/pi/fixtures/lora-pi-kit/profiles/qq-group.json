@@ -4,7 +4,7 @@
   "promptTemplate": "base",
   "thinkingLevel": "none",
   "enabledExtensions": [],
-  "enabledSkills": [],
+  "enabledSkills": ["unslop"],
   "enabledMcpServers": [],
   "activeTools": [],
   "runtimeIsolation": {

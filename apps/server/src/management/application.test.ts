@@ -4,6 +4,7 @@ import type { AddressInfo } from "node:net";
 import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { WebSocketServer, type WebSocket } from "ws";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import { ModelProfileStore } from "../config/model-profiles.js";
@@ -78,6 +79,7 @@ async function fixture(execute: (input: ExecutionInput) => Promise<ExecutionResu
   const app = await ManagementApplication.open({
     dataDirectory: directory,
     databasePath: ":memory:",
+    kitPath: fileURLToPath(new URL("../runtime/pi/fixtures/lora-pi-kit", import.meta.url)),
     models,
     executors: new Map([
       [

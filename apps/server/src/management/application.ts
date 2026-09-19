@@ -102,6 +102,7 @@ export class ManagementApplication {
   private constructor(
     private readonly options: {
       dataDirectory: string;
+      kitPath?: string;
       models: ModelProfileStore;
       executors?: ReadonlyMap<string, RunExecutionAdapter>;
       ops?: {
@@ -118,7 +119,7 @@ export class ManagementApplication {
     this.store = store;
     this.channels = channels;
     this.groupRuntime = groupRuntime;
-    this.kitLoader = new KitLoader();
+    this.kitLoader = new KitLoader(options.kitPath);
     this.deliveryPolicy = createQqDeliveryPolicy({
       forbiddenValues: () => [
         ...hostDeliveryForbiddenValues({
@@ -172,6 +173,7 @@ export class ManagementApplication {
   static async open(options: {
     dataDirectory: string;
     databasePath?: string;
+    kitPath?: string;
     models: ModelProfileStore;
     executors?: ReadonlyMap<string, RunExecutionAdapter>;
     ops?: {
