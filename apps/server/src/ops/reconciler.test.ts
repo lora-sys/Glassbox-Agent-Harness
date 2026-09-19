@@ -42,6 +42,35 @@ afterEach(async () => {
 });
 
 describe("OpsReconciler safety", () => {
+  it("resolves a recovered session alert after snapshot reconciliation without hiding task failures", async () => {
+    const store = await storeAt();
+    const bridge = new FakeHerdrBridge("session-1");
+    const reconciler = new OpsReconciler(store.tasks, bridge);
+    const task = await store.tasks.createTask({
+      title: "dispatch failure",
+      creatorPrincipalId: "owner",
+    });
+    const global = await store.tasks.createAttentionItem({
+      kind: "ops_connection_problem",
+      summary: "Herdr session disconnected",
+    });
+    const taskScoped = await store.tasks.createAttentionItem({
+      kind: "ops_connection_problem",
+      summary: "Worker dispatch failed",
+      taskId: task.id,
+    });
+    try {
+      await reconciler.start();
+      expect(await store.tasks.listAttentionItems()).toEqual([
+        expect.objectContaining({ id: taskScoped.id, taskId: task.id }),
+      ]);
+      const all = await store.tasks.listAttentionItems(false);
+      expect(all.find((item) => item.id === global.id)?.resolvedAt).not.toBeNull();
+    } finally {
+      await reconciler.stop();
+    }
+  });
+
   it("recovers Pi completion across disconnect only for the bound agent instance", async () => {
     const store = await storeAt();
     const bridge = new FakeHerdrBridge("session-1");
