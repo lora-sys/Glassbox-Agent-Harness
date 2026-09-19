@@ -10,6 +10,7 @@ P3 implementation and the dedicated Windows acceptance environment completed the
 - The server TypeScript check passed.
 - Changed server and contracts files passed strict lint and formatting.
 - Windows parallel execution can make two integration fixtures exceed Vitest defaults. The repository test configuration now uses 30 second test and hook limits. The complete suite passes with that bound.
+- A final parallel rerun exposed a 300 millisecond process-exit margin in the Claude harness fixture. The fixture now allows one second for the actual Windows child-exit signal before cleanup, and the complete 620-test suite passes.
 - Root `npm run check` still reports 236 unrelated baseline formatting files in legacy and frontend paths. P3 did not rewrite the separate frontend worktree to clear that baseline.
 
 ## Lora PI Kit
@@ -48,6 +49,7 @@ Owner private Run `e1e47769-d5b0-47e9-9ddf-c1c72dda5755` created Task `c1b9c21a-
 - Task truth stayed `DONE` during the disconnect.
 - The restarted Herdr snapshot retained panes `w2:p2` and `w2:p3`.
 - The real SocketHerdrBridge connected to the restarted server, read its snapshot and established a protocol 22 event subscription.
+- After the final branch reconstruction, Owner message `P3 重连验收` created Run `b1cd8843-9ae2-44b1-bd2d-148b16195471`. It reused the durable Owner private Conversation, ran the `main-agent` profile through Pi 0.85.1 and Kit commit `870a025775f28e314eeef974aa09511802f3e3d2`, and recorded sent ack and result deliveries.
 
 ## Real authorization and delivery checks
 
