@@ -41,7 +41,7 @@ The production target is a Linux server. Local development must preserve the sam
 
 Glassbox has selected Vite+ as the unified JavaScript / TypeScript toolchain direction.
 
-Intended command surface after the verified migration:
+The repository command surface is:
 
 ```text
 vp install
@@ -54,14 +54,12 @@ vp run <task>
 
 Vite+ is expected to cover Vite / Rolldown, Vitest, Oxlint, Oxfmt, tsdown, and workspace task execution.
 
-Until the migration is actually complete, use the commands that currently exist in the repository. Do not pretend planned commands are already implementation reality.
-
 The configured local Personal Agent environment has one service command surface:
 
-    npm run agent:up
-    npm run agent:status
-    npm run agent:logs
-    npm run agent:down
+    vp run agent:up
+    vp run agent:status
+    vp run agent:logs
+    vp run agent:down
 
 agent:up reads optional Herdr, NapCat and Glassbox launch settings from
 <GLASSBOX_DATA_DIR>/service-launch.json. Without that environment variable, it uses
@@ -409,13 +407,22 @@ See `docs/memory-taste.md`.
 
 ## Testing
 
-Preferred repository checks after Vite+ migration:
+Required repository checks:
 
 ```text
-vp check
-vp test
-vp build
+vp run verify:commit
+vp run test:unit
+vp run test:e2e
+vp run test:regression
 ```
+
+`vp run verify:commit` is the required pre-commit gate. Vite+ installs the repository-owned
+`.vite-hooks/pre-commit` dispatcher during `vp install`. The gate checks staged formatting,
+core lint and types, all deterministic unit tests, the P3 end-to-end suite, focused
+regressions, and the web build. It also rejects deleted tests and newly disabled tests.
+
+The `packageManager` field records the package-manager backend used by `vp install`. It does
+not change the repository command surface. Developers use `vp` directly.
 
 Playwright remains the browser / E2E layer.
 

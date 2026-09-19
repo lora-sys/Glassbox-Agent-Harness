@@ -394,6 +394,15 @@ Prove the change with the smallest useful check, then run the relevant active-Pl
 
 Behavior changes require focused tests for the behavior that changed.
 
+Before every commit, stage the intended files and run `vp run verify:commit`. Do not use
+`--no-verify`. The gate checks staged formatting, core lint and types, the full unit suite,
+the deterministic P3 end-to-end suite, focused regressions, and the web build.
+
+Do not weaken existing tests to make an implementation pass. Do not remove test cases,
+relax assertions, change fixtures to hide a regression, or add `skip`, `only`, or `todo`.
+When an intentional Contract change requires a test update, keep the implementation and
+test change together and explain the Contract change during review.
+
 Do not hide races with arbitrary sleeps when a real completion signal or state transition exists.
 
 Use browser-level verification when browser behavior is the thing being tested.
