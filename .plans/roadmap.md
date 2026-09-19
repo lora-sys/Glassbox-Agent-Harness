@@ -168,6 +168,138 @@ P3 does not become the full LongTask engine.
 
 See the active Plan for exact slices and the completion gate.
 
+### Post-P3 Fast Follow — Owner Control + Group Task Pilot
+
+This fast follow starts only after the P3 completion gate passes. It does not add new P3 completion requirements.
+
+Goal: make the Personal Agent visibly useful in the real test group before broad Memory work begins.
+
+The first pilot should use the existing Owner identity, QQ group Conversation, Authorization, Pi runtime, Delivery Gate, Turso state, Trace, and narrow runtime profiles established by P3.
+
+Priority order:
+
+```text
+F0 Per-Run Capability and Tool Surface
+F1 Owner Direct Control Surface
+F2 Group Assignment and Check-In Pilot
+F3 Group Tool Registry and Safe Templates
+F4 Owner Group Snapshot and Reports
+```
+
+#### F0 — Per-Run Capability and Tool Surface
+
+Build the effective Tool surface after Principal, Location, Conversation, group policy, and authorization are resolved.
+
+```text
+available capabilities
+→ profile narrowing
+→ group bindings
+→ Principal authorization
+→ Run capability set
+→ attach only selected Tool definitions
+→ Pi Run
+→ re-authorize again at Tool execution
+```
+
+Unauthorized Owner, other-group, MCP, and Ops schemas must not enter model-visible Context.
+
+The group runtime may know that a capability class exists only when that metadata itself is authorized. It must not receive a hidden Tool schema merely because the server could later deny execution.
+
+#### F1 — Owner Direct Control Surface
+
+Give the Owner private-channel projection a protected control surface for:
+
+```text
+group status
+runtime status
+model and profile selection
+temporary overrides
+Tool binding management
+schedule management
+Trace and failure inspection
+group assignment management
+```
+
+Do not build one unrestricted string-based god Tool. Keep Actions explicit, authorized, traced, and reversible where practical.
+
+#### F2 — Group Assignment and Check-In Pilot
+
+Add a human-oriented group work model that is separate from Agent Operations Task.
+
+```text
+GroupAssignment
+AssignmentParticipant
+CompletionEvidence
+ProgressEvent
+ReminderPolicy
+ScheduleDefinition
+ReportSnapshot
+```
+
+A first real loop should support:
+
+```text
+Owner creates recurring learning assignment
+→ Glassbox posts it on schedule
+→ members check in or submit evidence
+→ Glassbox records progress
+→ overdue members may receive policy-controlled reminders
+→ Owner can inspect current progress
+→ weekly report summarizes completed, incomplete, overdue, and progress
+```
+
+Use durable schedule and occurrence identities so restart or retry does not duplicate a post, reminder, or report.
+
+For the first test group, an in-process scheduler backed by Turso state is acceptable. A later delivery service such as QStash may replace the timer transport without becoming schedule truth.
+
+#### F3 — Group Tool Registry and Safe Templates
+
+Support group-specific capabilities without loading arbitrary code from group chat.
+
+Use this order:
+
+```text
+configuration
+→ fixed Tool template
+→ Skill
+→ generated code only when a real new executable capability is required
+```
+
+The main Agent may help create a group capability, but activation stays a Glassbox product Action.
+
+Initial Tool creation should prefer parameterized templates with known implementation and permission manifests. New executable Tool code should go through the normal developer path:
+
+```text
+request
+→ draft
+→ tests
+→ permission review
+→ Owner approval
+→ versioned activation
+```
+
+A group member must never be able to create or activate an Owner capability through prompt injection.
+
+#### F4 — Owner Group Snapshot and Reports
+
+Add a compact Owner-only projection across configured groups:
+
+```text
+group health
+active schedules
+assignment progress
+recent failures
+enabled Tool bindings
+delivery failures
+attention needed
+```
+
+This is operational state, not broad cross-group Memory.
+
+The fast follow is complete when one real test group can run a scheduled learning assignment, record member progress, issue a controlled reminder, produce a weekly report, and let the Owner inspect or change the group's active capabilities without exposing Owner or unrelated group Tool schemas.
+
+Detailed design: `docs/owner-group-operations.md`.
+
 ### P4 — Memory, Taste and Authorized Retrieval
 
 Add the personal learning layer after P3 trust and execution boundaries are proven.
@@ -202,13 +334,18 @@ Project Taste must not silently become global Taste.
 Target Memory loop:
 
 ```text
-Run / Conversation / Task evidence
+Run / Conversation / Task / Group Assignment evidence
 → Memory Candidate
-→ visibility + reliability checks
+→ explicit scope and visibility
+→ reliability checks
 → dedupe / contradiction handling
 → promotion
 → authorized retrieval
 ```
+
+Group-derived Memory remains group-scoped by default. The Owner private Main Agent may retrieve across authorized group scopes, but one group's Memory must not silently become another group's Context.
+
+Cross-group synthesis should create an Owner-only derived insight with provenance. Promotion into a broader reusable Skill, Rule, or system-learning record requires an explicit later action.
 
 Planned P4 slices:
 
@@ -216,9 +353,9 @@ Planned P4 slices:
 P4.0 Feedback Ledger
 P4.1 Taste Candidate + Confidence
 P4.2 Task-aware Taste Retrieval
-P4.3 Semantic Memory
-P4.4 Episodic Memory
-P4.5 Authorized Retrieval
+P4.3 Semantic Memory with group namespace support
+P4.4 Episodic Memory for Runs, Tasks, Conversations and group outcomes
+P4.5 Authorized Retrieval including Owner cross-group retrieval
 P4.6 Inspection and Eval
 ```
 
