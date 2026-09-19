@@ -72,6 +72,38 @@ function textFromContent(content: unknown): string {
     .join("");
 }
 
+function safeToolInput(toolName: string, args: unknown): Record<string, unknown> | undefined {
+  if (toolName !== "owner_group_admin" || !args || typeof args !== "object") return undefined;
+  const input = args as Record<string, unknown>;
+  return {
+    ...(typeof input.action === "string" && /^[a-z_]{1,32}$/u.test(input.action)
+      ? { action: input.action }
+      : {}),
+    ...(typeof input.groupId === "string" && /^[1-9]\d{0,15}$/u.test(input.groupId)
+      ? { groupId: input.groupId }
+      : {}),
+    ...(typeof input.skillName === "string" && /^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(input.skillName)
+      ? { skillName: input.skillName }
+      : {}),
+    ...(typeof input.enabled === "boolean" ? { enabled: input.enabled } : {}),
+  };
+}
+
+function safeToolFailureCode(result: unknown): string {
+  let text = "";
+  try {
+    const serialized = JSON.stringify(result);
+    text = typeof serialized === "string" ? serialized : "";
+  } catch {
+    return "tool_execution_failed";
+  }
+  if (text.includes("context_missing")) return "context_missing";
+  if (text.includes("Permission denied")) return "authorization_denied";
+  if (text.includes("protected_tool_failed")) return "protected_tool_failed";
+  if (/validation|schema|required|invalid|argument/iu.test(text)) return "input_validation_failed";
+  return "tool_execution_failed";
+}
+
 function normalizeEvent(
   sessionId: string,
   event: AgentSessionEvent,
@@ -127,7 +159,8 @@ function normalizeEvent(
             : {}),
         },
       };
-    case "tool_execution_start":
+    case "tool_execution_start": {
+      const input = safeToolInput(event.toolName, event.args);
       return {
         type: "tool_call",
         sessionId,
@@ -135,8 +168,15 @@ function normalizeEvent(
         runId,
         principalId,
         toolCallId: event.toolCallId,
-        data: { runId, principalId, toolCallId: event.toolCallId, name: event.toolName },
+        data: {
+          runId,
+          principalId,
+          toolCallId: event.toolCallId,
+          name: event.toolName,
+          ...(input ? { input } : {}),
+        },
       };
+    }
     case "tool_execution_end":
       return {
         type: "tool_result",
@@ -151,6 +191,7 @@ function normalizeEvent(
           toolCallId: event.toolCallId,
           name: event.toolName,
           isError: event.isError,
+          ...(event.isError ? { failureCode: safeToolFailureCode(event.result) } : {}),
         },
       };
     case "message_update": {
@@ -271,11 +312,13 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
     const basePrompt = `${this.loader.modelPrompt(profile.name, profile.enabledSkills).trim()}\n\nReply in concise plain text suitable for QQ. Do not reveal host paths, internal service addresses, configuration names, or internal identifiers.`;
     let runtimeSessionId: string | undefined;
     const promptForRun = () => {
-      const requiredToolName = runtimeSessionId
-        ? this.runContexts.get(runtimeSessionId)?.requiredToolName
-        : undefined;
+      const runContext = runtimeSessionId ? this.runContexts.get(runtimeSessionId) : undefined;
+      const requiredToolName = runContext?.requiredToolName;
+      const exactInput = runContext?.requiredToolInput
+        ? ` with exactly this JSON input: ${JSON.stringify(runContext.requiredToolInput)}`
+        : "";
       return requiredToolName
-        ? `${basePrompt}\n\nThe current Owner request requires the available ${requiredToolName} tool. Call it before reporting the action as completed. Do not ask for a second confirmation and never claim execution without a successful tool result.`
+        ? `${basePrompt}\n\nThe current Owner request requires the available ${requiredToolName} tool. Call it before reporting the action as completed${exactInput}. Do not ask for a second confirmation and never claim execution without a successful tool result.`
         : basePrompt;
     };
     // Standalone Kit MCP factories are configured separately. Glassbox exposes

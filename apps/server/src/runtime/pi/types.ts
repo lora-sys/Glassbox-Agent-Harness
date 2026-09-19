@@ -72,6 +72,7 @@ export interface PiRunContext {
   conversationId?: string;
   runId?: string;
   requiredToolName?: string;
+  requiredToolInput?: Record<string, unknown>;
   authorizedSkillNames?: readonly string[];
   skillPolicy?: Record<string, unknown>;
 }

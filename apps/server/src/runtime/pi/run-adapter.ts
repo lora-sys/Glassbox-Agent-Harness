@@ -66,6 +66,14 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       conversationId: input.conversation.id,
       runId: input.run.id,
       requiredToolName: required?.name,
+      requiredToolInput: required
+        ? {
+            action: required.action,
+            groupId: required.groupId,
+            ...(required.enabled === undefined ? {} : { enabled: required.enabled }),
+            ...(required.skillName === undefined ? {} : { skillName: required.skillName }),
+          }
+        : undefined,
     };
     const binding = await this.runtime.createOrRestoreSession(
       {
@@ -116,7 +124,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         result = await this.runtime.run(
           binding,
           { ...input.run, principalId: input.caller.principalId },
-          `The required action has not executed. Call ${requiredName} now with the parameters from the current user request. Do not ask for confirmation and do not report success without the tool result.`,
+          `The required action has not executed. Call ${requiredName} now with exactly this JSON input: ${JSON.stringify(context.requiredToolInput)}. Do not ask for confirmation and do not report success without the tool result.`,
           context,
         );
       }

@@ -98,6 +98,14 @@ describe("Pi required Tool execution", () => {
     });
     expect(f.run).toHaveBeenCalledTimes(2);
     expect(f.run.mock.calls[1]?.[2]).toContain("owner_group_admin");
+    expect(f.run.mock.calls[1]?.[2]).toContain(
+      '{"action":"set_access","groupId":"1126022432","enabled":true}',
+    );
+    expect(f.run.mock.calls[1]?.[3]?.requiredToolInput).toEqual({
+      action: "set_access",
+      groupId: "1126022432",
+      enabled: true,
+    });
     expect(f.disposeSession).toHaveBeenCalledOnce();
   });
 

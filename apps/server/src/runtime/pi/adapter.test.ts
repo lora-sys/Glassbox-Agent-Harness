@@ -48,6 +48,8 @@ describe("PiSdkRuntimeAdapter", () => {
     let authorizedTools: unknown;
     let authorizedSkills: unknown;
     let skillPolicy: unknown;
+    let safeToolCall: unknown;
+    let safeToolResult: unknown;
     let listener: ((event: AgentSessionEvent) => void) | undefined;
     const fakeSession = {
       sessionId: "pi-session-1",
@@ -72,6 +74,23 @@ describe("PiSdkRuntimeAdapter", () => {
           message: {} as never,
           assistantMessageEvent: { type: "text_delta", delta: "hello from pi" } as never,
         });
+        listener?.({
+          type: "tool_execution_start",
+          toolCallId: "admin-1",
+          toolName: "owner_group_admin",
+          args: {
+            action: "get",
+            groupId: "1126022432",
+            ignored: "must-not-enter-trace",
+          },
+        } as never);
+        listener?.({
+          type: "tool_execution_end",
+          toolCallId: "admin-1",
+          toolName: "owner_group_admin",
+          result: { content: [{ type: "text", text: "Schema validation failed" }] },
+          isError: true,
+        } as never);
         listener?.({ type: "turn_end", message: {} as never, toolResults: [] });
         listener?.({ type: "agent_end", messages: [], willRetry: false });
       },
@@ -94,6 +113,8 @@ describe("PiSdkRuntimeAdapter", () => {
           authorizedSkills = event.data.authorizedSkills;
           skillPolicy = event.data.skillPolicy;
         }
+        if (event.type === "tool_call") safeToolCall = event.data;
+        if (event.type === "tool_result") safeToolResult = event.data;
       },
       createSession: async ({ profile, agentDir }) => {
         expect(profile.name).toBe("test");
@@ -128,10 +149,22 @@ describe("PiSdkRuntimeAdapter", () => {
     expect(authorizedTools).toEqual(["owner_group_admin", "skill_read"]);
     expect(authorizedSkills).toEqual([]);
     expect(skillPolicy).toEqual({ source: "group-profile", configVersion: 3 });
+    expect(safeToolCall).toMatchObject({
+      name: "owner_group_admin",
+      input: { action: "get", groupId: "1126022432" },
+    });
+    expect(JSON.stringify(safeToolCall)).not.toContain("must-not-enter-trace");
+    expect(safeToolResult).toMatchObject({
+      name: "owner_group_admin",
+      isError: true,
+      failureCode: "input_validation_failed",
+    });
     expect(events).toEqual([
       "session_start",
       "turn_start",
       "message_chunk",
+      "tool_call",
+      "tool_result",
       "turn_end",
       "session_end",
     ]);
