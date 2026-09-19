@@ -281,6 +281,33 @@ Memory Retrieval Precision
 
 Primary references include Command Code for Taste mechanics, Learning-Multi-Factor-Memory, LangMem, and OpenSquilla retrieval mechanics.
 
+### Group Operations expansion track
+
+This is a planned product track, not the active P3+ gate.
+
+It may advance in bounded slices when real group use justifies them and does not need to block P4.
+
+~~~text
+G1 reminders + weekly reports
+G2 Group Tool Registry
+G3 progressive Tool discovery
+G4 template-driven group capability creation
+G5 multi-group Owner snapshot
+~~~
+
+After P4 Memory exists, the track may additionally add:
+
+~~~text
+group-scoped Memory
+Owner-authorized cross-group retrieval
+Owner-private derived insights
+system-improvement proposals with provenance
+~~~
+
+Controlled executable Tool development remains behind tests, permission manifests, versioning, and Owner review where required.
+
+Detailed architecture: `docs/owner-group-operations.md`.
+
 ### P5 — Efficient Runtime and Observability
 
 Optimize the proven runtime and retrieval paths.
