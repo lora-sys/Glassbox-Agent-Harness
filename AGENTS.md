@@ -63,7 +63,6 @@ Session ≠ Run
 Task ≠ Run
 Task ≠ Worker
 TaskAttempt ≠ Worker lifecycle state
-GroupAssignment ≠ Task
 structured product state ≠ Memory
 Herdr Agent state ≠ Task acceptance
 Runtime / Provider / Worker ≠ Personal Agent
@@ -196,7 +195,7 @@ Do not silently expand scope from the roadmap.
 The active implementation plan is:
 
 ```text
-.plans/03-plus-owner-group-utility.md
+.plans/03-plus-owner-control-smoke.md
 ```
 
 Plan 03 is the completed foundation.
@@ -214,13 +213,13 @@ Read in this order before changing code:
 
 | Topic | Source of truth |
 | --- | --- |
-| Current P3+ implementation order and completion gate | `.plans/03-plus-owner-group-utility.md` |
+| Current P3+ implementation order and completion gate | `.plans/03-plus-owner-control-smoke.md` |
 | Completed P3 foundation and acceptance contract | `.plans/03-personal-agent-foundation.md` |
 | Product sequencing after the active Plan | `.plans/roadmap.md` |
 | Runtime ownership and Pi SDK boundary | `docs/runtime-strategy.md` |
 | Lora PI Kit distribution, bundled Skills, MCP, profiles, install, locks | `docs/lora-pi-kit.md` |
 | Herdr, Task, Attention, TaskAttempt, WorkerBinding, Ops Tools, reconciliation | `docs/agent-operations.md` |
-| Owner private control, per-Run Tool surface, group assignments and group utility | `docs/owner-group-operations.md` |
+| Owner private control, per-Run Tool surface, future group programs and custom capabilities | `docs/owner-group-operations.md` |
 | Rules, Skills, Taste, Feedback, Memory, learning, retrieval | `docs/memory-taste.md` |
 | Toolchain, dependencies, build, test, local development | `docs/tech-stack.md` |
 | Persistence, storage, observability, monitoring, public/private projections | `docs/data-observability.md` |
@@ -254,7 +253,6 @@ Use these terms consistently.
 - **Run**: one concrete Agent execution.
 - **Task**: durable product work tracked by Glassbox.
 - **TaskAttempt**: one concrete execution or rework attempt for a Task.
-- **GroupAssignment**: durable human work assigned inside a group scope. It is not an Agent Operations Task and is not Memory.
 - **RunCapabilitySet**: the server-selected model-visible capability projection for one Run. It narrows capability exposure but is not an authorization source.
 - **AttentionItem**: something that currently needs main-Agent or human action.
 - **WorkerBinding**: the mapping from a TaskAttempt to its concrete Worker execution location.
