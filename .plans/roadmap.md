@@ -7,7 +7,7 @@ This file records sequencing and product direction. It is not permission to impl
 The completed P3 foundation is followed by one deliberately small active fast-follow:
 
 ```text
-.plans/03-plus-owner-group-utility.md
+.plans/03-plus-owner-control-smoke.md
 ```
 
 P4 remains the first Memory / Taste phase.
@@ -168,16 +168,16 @@ P3 does not become the full LongTask engine.
 
 See the completed Plan 03 for its exact slices and completion gate.
 
-### P3+ — Owner Control + Test Group Utility
+### P3+ — Owner Control Smoke Slice
 
-Immediate fast-follow on the completed P3 foundation.
+Immediate, bounded fast-follow on the completed P3 foundation.
 
-Goal: create visible value in the one real test group without implementing Memory.
+Goal: prove Owner-only control and model-visible Tool isolation against the current real test group, then stop and continue the existing roadmap.
 
 The active Plan is:
 
 ```text
-.plans/03-plus-owner-group-utility.md
+.plans/03-plus-owner-control-smoke.md
 ```
 
 P3+ adds only:
@@ -185,32 +185,29 @@ P3+ adds only:
 ```text
 per-Run Tool schema filtering
 minimal Owner private control
-per-group model / capability configuration
-one fixed daily learning-assignment capability
-explicit member check-in
-durable progress query
+test-group model override
+enable / disable one existing safe capability
+recent Run / Trace inspection
+one real smoke acceptance
 ```
 
-P3+ explicitly does not add:
+P3+ does not add any new group program or learning subsystem.
 
 ```text
-Taste
-Semantic / Episodic Memory
-cross-group learning
-automatic reminders
-weekly reports
-generic Group Tool Registry
-Tool generation
-multi-group Owner dashboard
+no learning assignment
+no scheduler
+no reminder
+no weekly report
+no Group Tool Registry
+no Tool generation
+no Memory or Taste
 ```
-
-The learning-assignment records are structured product state, not Memory.
 
 Detailed architecture: `docs/owner-group-operations.md`.
 
 ### P4 — Memory, Taste and Authorized Retrieval
 
-Add the personal learning layer after the P3 trust boundary and the bounded P3+ utility slice are proven. P4 is the first phase that creates Taste or durable Memory.
+Add the personal learning layer after the P3 trust boundary and the tiny P3+ smoke slice are proven. P4 is the first phase that creates Taste or durable Memory.
 
 Order matters: learn Taste from corrections before building broad Memory retrieval.
 
@@ -280,33 +277,6 @@ Memory Retrieval Precision
 ```
 
 Primary references include Command Code for Taste mechanics, Learning-Multi-Factor-Memory, LangMem, and OpenSquilla retrieval mechanics.
-
-### Group Operations expansion track
-
-This is a planned product track, not the active P3+ gate.
-
-It may advance in bounded slices when real group use justifies them and does not need to block P4.
-
-~~~text
-G1 reminders + weekly reports
-G2 Group Tool Registry
-G3 progressive Tool discovery
-G4 template-driven group capability creation
-G5 multi-group Owner snapshot
-~~~
-
-After P4 Memory exists, the track may additionally add:
-
-~~~text
-group-scoped Memory
-Owner-authorized cross-group retrieval
-Owner-private derived insights
-system-improvement proposals with provenance
-~~~
-
-Controlled executable Tool development remains behind tests, permission manifests, versioning, and Owner review where required.
-
-Detailed architecture: `docs/owner-group-operations.md`.
 
 ### P5 — Efficient Runtime and Observability
 
@@ -445,6 +415,49 @@ Arena experiments
 Validated reusable Pi procedures may land in `lora-sys/skills` and then flow into a later Lora PI Kit release as a pinned Skill snapshot.
 
 Glassbox remains the source of product evidence, authorization, Task acceptance, Taste / Memory truth, and promotion decisions.
+
+### P9 — Group Programs and Custom Capabilities
+
+This is the late-stage group-specific product track.
+
+It is intentionally after the core Memory, runtime, long-work, channel, and Eval / learning phases so the earlier roadmap stays focused.
+
+Target capabilities:
+
+```text
+scheduled group learning assignments
+participant progress
+automatic reminder policy
+weekly reports
+streaks / scoring when useful
+Group Tool Registry
+progressive Tool discovery
+template-driven group capability creation
+multi-group Owner snapshot
+controlled new Tool development
+```
+
+After P4 Memory exists, P9 may also use:
+
+```text
+group-scoped Memory
+Owner-authorized cross-group retrieval
+Owner-private derived insights
+system-improvement proposals with provenance
+```
+
+The capability creation order should remain:
+
+```text
+configuration
+→ fixed template
+→ Skill
+→ new executable Tool code
+```
+
+Generated executable capability requires tests, a permission manifest, versioned activation, and Owner review where appropriate.
+
+Detailed architecture: `docs/owner-group-operations.md`.
 
 ## Documentation and Learning track
 
