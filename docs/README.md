@@ -14,14 +14,14 @@ Use one source of truth per topic.
 
 | Topic | Source of truth |
 | --- | --- |
-| Current implementation order and completion gate | `../.plans/03-plus-owner-group-utility.md` |
+| Current implementation order and completion gate | `../.plans/03-plus-owner-control-smoke.md` |
 | Completed P3 foundation | `../.plans/03-personal-agent-foundation.md` |
 | Long-term phase sequence | `../.plans/roadmap.md` |
 | Stable repository invariants | `../AGENTS.md` |
 | Runtime ownership / Pi SDK / runtime roles | `runtime-strategy.md` |
 | Lora PI Kit distribution / Skills snapshot / MCP / profiles / locks | `lora-pi-kit.md` |
 | Herdr / Task / Attention / WorkerBinding / reconciliation | `agent-operations.md` |
-| Owner control / per-Run Tool surface / group assignments | `owner-group-operations.md` |
+| Owner control / per-Run Tool surface / future group programs | `owner-group-operations.md` |
 | Rules / Skills / Taste / Feedback / Memory / retrieval | `memory-taste.md` |
 | Toolchain / dependencies / test / deployment | `tech-stack.md` |
 | Persistence / storage / observability / projections | `data-observability.md` |
