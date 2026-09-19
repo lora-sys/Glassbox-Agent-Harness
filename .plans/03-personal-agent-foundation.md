@@ -282,6 +282,10 @@ Denied Ingress means no Pi Run.
 
 Unauthorized protected data must not enter model-visible Context.
 
+Tool definitions, Tool schemas, MCP Tool schemas, and Ops Tool metadata are also model-visible Context when attached to a Run. Resolve the effective Tool surface only after Principal, Location, Conversation, and policy are known. A Principal must not receive definitions for capabilities it is not allowed to invoke.
+
+Do not attach a global Tool catalog and rely only on call-time denial.
+
 Forbidden:
 
 ```text
@@ -303,6 +307,8 @@ resolve Principal / Conversation
 ### Gate 3 — Tool / Ops
 
 Every protected Tool or Agent Ops Action re-authorizes immediately before execution.
+
+Call-time authorization is the second check. The first check is Tool-surface construction before model invocation. Only the Tool definitions authorized for the current Run may be attached to the model-visible surface.
 
 The existence of a Tool, Skill, Extension, MCP integration, Pi profile, or Herdr control surface does not grant permission to use it.
 
@@ -677,7 +683,7 @@ Completion:
 
 Implement Ingress, Context, Tool / Ops, and Delivery authorization.
 
-Prove default deny, explicit allow, approval path, revocation, audience checks, and protected Ops Tools.
+Prove default deny, explicit allow, approval path, revocation, audience checks, protected Ops Tools, and model-visible Tool schema filtering.
 
 Completion:
 
@@ -861,6 +867,7 @@ Plan 03 is complete only when all are true:
 - real Owner and Visitor QQ identities resolve to distinct Principals.
 - Ingress authorization runs before Pi.
 - unauthorized protected data stays out of model-visible Context.
+- unauthorized Tool, MCP, and Ops definitions stay out of the model-visible Tool surface.
 - protected Tool / Ops execution re-authorizes immediately before execution.
 - remote profiles expose a narrow Tool / MCP surface.
 - unrestricted remote shell is unavailable.
