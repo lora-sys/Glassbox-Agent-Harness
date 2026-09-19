@@ -20,6 +20,7 @@ blob-report/
 # Glassbox-specific
 .glassbox/
 .dispatch/
+.visual-fix/
 
 # Upstream reference checkouts
 upstream/repos/
