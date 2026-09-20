@@ -12,6 +12,7 @@
     "prepare": "vp hooks enable",
     "glassbox": "tsx apps/server/src/cli.ts",
     "dev:server": "vp run -F @glassbox/server dev",
+    "start": "tsx scripts/agent-service.mts up",
     "agent:up": "tsx scripts/agent-service.mts up",
     "agent:status": "tsx scripts/agent-service.mts status",
     "agent:logs": "tsx scripts/agent-service.mts logs",
