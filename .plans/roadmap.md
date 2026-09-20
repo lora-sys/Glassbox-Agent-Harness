@@ -168,24 +168,52 @@ P3 does not become the full LongTask engine.
 
 See the active Plan for exact slices and the completion gate.
 
-### P4 — Memory, Taste and Authorized Retrieval
+### P4 — Memory / Taste and Authorized Retrieval
 
-Add the personal learning layer after P3 trust and execution boundaries are proven.
+P4 is intentionally split into two parallel streams after P3.
 
-Order matters: learn Taste from corrections before building broad Memory retrieval.
+```text
+P4A — Memory and Taste Durable Learning Truth
+P4B — Authorized Retrieval and QQ History Search
+```
+
+The split is by ownership, not by UI.
+
+```text
+P4A
+  write side
+  decides what becomes durable learning truth
+
+P4B
+  read side
+  decides what the current Principal may retrieve
+  searches only inside that authorized source set
+```
+
+Each stream has one active Plan, one Issue, and later one PR:
+
+```text
+.plans/04a-memory-taste.md
+  Issue #9
+
+.plans/04b-authorized-retrieval-history.md
+  Issue #10
+```
+
+#### P4A — Memory and Taste Durable Learning Truth
+
+Goal: create durable, inspectable personal learning state without allowing transient model inference to become truth.
 
 Target Taste loop:
 
 ```text
 Agent output
-→ accept / reject / edit / revert / correction
+→ accept / reject / edit / revert / explicit feedback
 → FeedbackEvent
 → TasteCandidate
 → confidence + scope
 → promote / demote / retire
-→ task-aware retrieval
-→ inject only relevant Taste
-→ next execution
+→ durable Taste truth
 ```
 
 Initial Taste scope:
@@ -202,29 +230,112 @@ Project Taste must not silently become global Taste.
 Target Memory loop:
 
 ```text
+explicit Owner fact / decision
+or
 Run / Conversation / Task evidence
-→ Memory Candidate
-→ visibility + reliability checks
-→ dedupe / contradiction handling
-→ promotion
-→ authorized retrieval
+→ MemoryCandidate when inference is required
+→ reliability + visibility + provenance checks
+→ promote / supersede / retire
+→ Semantic or Episodic Memory
 ```
 
-Planned P4 slices:
+P4A owns:
 
 ```text
-P4.0 Feedback Ledger
-P4.1 Taste Candidate + Confidence
-P4.2 Task-aware Taste Retrieval
-P4.3 Semantic Memory
-P4.4 Episodic Memory
-P4.5 Authorized Retrieval
-P4.6 Inspection and Eval
+FeedbackEvent
+TasteCandidate
+TasteEntry
+confidence
+scope
+MemoryCandidate
+Semantic Memory
+Episodic Memory
+promotion / demotion
+supersession / retirement
+Owner inspection / administration
 ```
+
+P4A does not own history search, ranking, Top K, or Runtime Context injection.
 
 Stable procedural knowledge should normally become a Skill rather than generic Memory.
 
-P4 success should measure reduced user correction work, not the number of stored records.
+#### P4B — Authorized Retrieval and QQ History Search
+
+Goal: make history, Memory and Taste useful without weakening the P3 trust boundary.
+
+Required order:
+
+```text
+resolve Principal
+→ resolve authorized source set
+→ retrieve only inside that set
+→ rank
+→ bound results
+→ assemble Runtime Context
+→ Delivery Gate
+```
+
+P4B adds two real QQ history capabilities:
+
+```text
+current group
+→ search current group history
+
+Owner private
+→ search only groups currently granted to that Owner
+```
+
+Use an explicit protected Action:
+
+```text
+history:read
+```
+
+Bot membership or ordinary Conversation access must not silently imply bulk history permission.
+
+Complete Channel history is separate from existing Run input messages:
+
+```text
+messages
+  Agent Run input
+
+channel_messages
+  durable Channel history / retrieval source
+```
+
+P4B should prove the real NapCat `get_group_msg_history` path first, then add a durable channel archive / lexical index for repeated search.
+
+Initial retrieval should be lexical. Vector or hybrid retrieval is justified only by an eval that shows lexical retrieval is insufficient.
+
+P4B consumes P4A through a small stable retrieval-facing projection. It must be able to develop against deterministic fixtures before P4A merges.
+
+#### Shared P4 contract
+
+P4A may expose records conceptually shaped as:
+
+```text
+id
+kind
+text or summary
+scope
+resourceId
+visibility
+sourceRefs
+occurredAt?
+createdAt
+status
+confidence?
+```
+
+P4B owns authorization-first querying, ranking and Context projection.
+
+P4B must not mutate P4A learning confidence or promotion state.
+
+P4A must not implement retrieval ranking or bypass P4B authorization.
+
+#### P4 success
+
+Measure whether the Agent needs less correction and retrieves the right protected information.
 
 Useful metrics:
 
@@ -237,9 +348,11 @@ False Preference Rate
 Scope Leakage Rate
 Taste Retrieval Precision
 Memory Retrieval Precision
+History Retrieval Precision
+Unauthorized Candidate Count
 ```
 
-Primary references include Command Code for Taste mechanics, Learning-Multi-Factor-Memory, LangMem, and OpenSquilla retrieval mechanics.
+P4 completion requires both P4A and P4B completion gates to pass. A large Memory table or a large search index is not success by itself.
 
 ### P5 — Efficient Runtime and Observability
 
