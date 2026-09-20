@@ -6,504 +6,556 @@ Tracking Issue: #10
 
 This plan is one of two intentionally parallel P4 implementation streams.
 
-The sibling plan is:
+Sibling:
 
-\`\`\`text
+```text
 .plans/04a-memory-taste.md
-\`\`\`
+```
 
-One Issue owns this plan and one later PR must stay inside this plan's boundary.
+One Issue owns this plan and one later PR must stay inside this boundary.
 
 ## Goal
 
-Build the durable read side of Glassbox history and learning.
-
-P4B decides what the current Principal may search, searches only inside that authorized source set, returns compact cited results, and injects only task-relevant authorized material into Runtime Context.
-
-It also adds the first real QQ history-search tools:
-
-\`\`\`text
-current group history search
-Owner-private authorized cross-group history search
-\`\`\`
+Build the read side of Glassbox history and learning by porting mature retrieval contracts and algorithms.
 
 Acceptance sentence:
 
-> The Agent can search the current QQ group's history, and an Owner in private chat can search only the groups currently granted to that Owner. Unauthorized groups never enter the candidate set, results preserve source and timestamp, Memory and Taste can be retrieved through the same authorization-first boundary, and cross-group content cannot be delivered into a group merely because the requesting Owner can read it.
+> The Agent can search the current QQ group's history, and an Owner in private chat can search only groups currently granted to that Owner. Unauthorized sources never enter the retrieval candidate set. Memory / Taste uses an MGP-compatible Recall / SearchResult contract, ranking uses an OpenSquilla-derived Retrieval Engine, source and timestamp remain inspectable, and Delivery authorization remains separate from read authorization.
 
-## Ownership
+## Upstream-first rule
 
-P4B owns:
+Implementation order:
 
-\`\`\`text
-authorized source-set resolution
-QQ group-history retrieval
-current-group search Tool
-Owner-private cross-group search Tool
-channel-message archive / index when needed
-lexical retrieval
-Memory retrieval
-Taste retrieval
-ranking
-Top K projection
-retrieval reason / source metadata
-Runtime Context projection
-retrieval Trace / Eval
-\`\`\`
+```text
+MGP
+  Recall / SearchResult contract
 
-P4B does not own:
+OpenSquilla
+  Retrieval Engine
 
-\`\`\`text
-FeedbackEvent creation
-Taste confidence updates
-Taste promotion / demotion
-Memory promotion
-Memory mutation
-learning truth
-\`\`\`
+OpenHarness
+  lexical fallback / relevance selection
 
-## Security invariant
+NapCat / OneBot
+  raw QQ history
 
-Always:
+Glassbox
+  Principal / history:read / dual Owner scope / archive / Delivery
+```
 
-\`\`\`text
-resolve Principal
-→ resolve allowed Resource set
-→ query only inside that set
-→ rank
-→ apply result limit
-→ assemble model-visible Context
-\`\`\`
+Do not invent a new generic ranking pipeline or SearchResult abstraction while these upstreams fit.
 
-Forbidden:
+## Primary upstream source map
 
-\`\`\`text
-search all groups / memories
-→ send candidates to model
-→ ask model to ignore unauthorized rows
-\`\`\`
+### MGP
 
-Read authorization and Delivery authorization remain separate.
+Pinned:
 
-## What can be reused now
+```text
+HKUDS/MGP
+54ce6c00e3d0aa731ecbe17e74407cbbb5a96f10
+```
 
-Current Glassbox already has:
+Repository note:
 
-\`\`\`text
-Principal and dual-Owner identity
-Resource / Grant / AuthorizationDecision
-Conversation scope
-conversation_locations
-messages
-runs
-Delivery Gate
-protected Tool wrapper
-Owner-private Tool discovery pattern
-OneBot combined WebSocket adapter
-generic internal OneBot RPC request path
-Turso / SQLite-compatible DomainDatabase
-\`\`\`
+```text
+upstream/mgp/SOURCES.md
+```
 
-Relevant code:
+Port:
 
-\`\`\`text
+```text
+schemas/recall-intent.schema.json
+schemas/search-memory.request.schema.json
+schemas/search-memory.response.schema.json
+schemas/search-result-item.schema.json
+schemas/retrieval-mode.schema.json
+schemas/return-mode.schema.json
+schemas/score-kind.schema.json
+schemas/redaction-info.schema.json
+schemas/policy-context.schema.json
+spec/search-results.md
+reference/gateway/semantics.py
+compliance/search/test_search_results.py
+compliance/access/test_access_control.py
+```
+
+Preserve:
+
+```text
+score
+score_kind
+backend_origin
+retrieval_mode
+return_mode
+redaction_info
+consumable_text
+matched_terms
+explanation
+```
+
+For non-Memory sources such as QQ group messages, use a thin Glassbox source wrapper with the same retrieval metadata. Do not pretend a ChannelMessage is canonical Memory.
+
+### OpenSquilla
+
+Use:
+
+```text
+upstream/opensquilla/SOURCES.md
+```
+
+Port Retrieval Engine behavior from:
+
+```text
+src/opensquilla/memory/retrieval.py
+src/opensquilla/memory/store.py
+src/opensquilla/memory/types.py
+
+tests/test_memory_store_keyword_fallback.py
+tests/test_memory_search_defaults.py
+tests/test_memory_vector_normalization.py
+tests/test_memory_retention.py
+tests/live/test_search_retrieval_live.py
+```
+
+Preserve the pipeline:
+
+```text
+store.search
+→ over-fetch candidates
+→ optional temporal decay
+→ source filtering
+→ source weighting
+→ optional MMR
+→ final Top K
+```
+
+P4B first configuration:
+
+```text
+vector_weight = 0
+text_weight = 1
+```
+
+This makes the first implementation lexical while keeping the mature hybrid-capable architecture.
+
+Do not invent a lexical-only API that must later be replaced.
+
+### OpenHarness search
+
+Pinned:
+
+```text
+HKUDS/OpenHarness
+9b2efd795c6aa09f88b0c257d269a9e518da6ae7
+```
+
+Use as fallback:
+
+```text
+src/openharness/memory/search.py
+src/openharness/memory/relevance.py
+src/openharness/memory/usage.py
+```
+
+Preserve ASCII and Han token handling, metadata/body matching, usage / recency signals, max results, duplicate suppression and freshness behavior.
+
+If FTS5 is unavailable in the exact Turso path, port this fallback rather than inventing another one.
+
+### NapCat / OneBot
+
+Use the current authenticated OneBot connection.
+
+```text
+apps/server/src/channels/onebot/adapter.ts
+```
+
+Add a narrow typed call for:
+
+```text
+get_group_msg_history
+```
+
+Do not add a second QQ SDK and do not expose generic RPC to the model.
+
+## Glassbox ownership
+
+Glassbox owns:
+
+```text
+Principal
+Resource
+Grant
+AuthorizationDecision
+history:read
+current trusted group scope
+per-Owner authorized group set
+Conversation / Run linkage
+Audience / Delivery
+Turso channel archive
+Raw Trace
+```
+
+Current code to reuse:
+
+```text
 apps/server/src/auth/service.ts
 apps/server/src/conversation/store.ts
 apps/server/src/persistence/schema.ts
 apps/server/src/channels/onebot/adapter.ts
 apps/server/src/runtime/pi/protected-tools.ts
 apps/server/src/runtime/pi/owner-tools.ts
-\`\`\`
+```
 
-Important current limitation:
+## Security invariant
 
-\`\`\`text
+Always:
+
+```text
+resolve Principal
+→ resolve authorized source set
+→ load / search only inside that set
+→ rank
+→ bound results
+→ Runtime Context
+→ Delivery Gate
+```
+
+Forbidden:
+
+```text
+load all groups / Memory
+→ rank
+→ filter unauthorized results later
+```
+
+## Current persistence boundary
+
+Keep:
+
+```text
 messages
-  = messages accepted into Glassbox Runs
+  Agent Run inputs
 
-messages
-  ≠ complete QQ group history
-\`\`\`
-
-P3 intentionally does not create Runs for every ordinary non-activated group message. Do not reinterpret the current \`messages\` table as a complete channel archive.
-
-## Confirmed external capability
-
-NapCat currently exposes:
-
-\`\`\`text
-get_group_msg_history
-\`\`\`
-
-and marks the go-cqhttp-compatible group-history API as available.
-
-Official references:
-
-\`\`\`text
-https://napneko.github.io/onebot/api
-https://napneko.github.io/develop/api
-https://napcat.apifox.cn/
-\`\`\`
-
-The OneBot message model includes message ID, group ID, sender and event time. That is enough to normalize history results into Glassbox source records.
-
-Reuse the existing authenticated OneBot connection. Do not add a second QQ SDK merely for history.
-
-## Source model
-
-P4B searches several source kinds behind one authorization-first interface:
-
-\`\`\`text
-group_message
-semantic_memory
-episodic_memory
-taste
-\`\`\`
-
-Conceptual result shape:
-
-\`\`\`text
-sourceKind
-sourceId
-resourceId
-text or snippet
-occurredAt
-sender?
-groupId?
-scope?
-confidence?
-reason
-\`\`\`
-
-Every result must remain attributable to its real source.
-
-## QQ history design
-
-### Current-group search
-
-Expose a protected Tool conceptually named:
-
-\`\`\`text
-group_history_search
-\`\`\`
-
-The model may provide:
-
-\`\`\`text
-query
-after?
-before?
-limit?
-\`\`\`
-
-The model must not choose an arbitrary group ID.
-
-Glassbox derives the target group from the current trusted Run scope and authorizes history read before any protected history is loaded.
-
-### Owner cross-group search
-
-Expose a separate Owner-private Tool conceptually named:
-
-\`\`\`text
-owner_history_search
-\`\`\`
-
-The model may provide:
-
-\`\`\`text
-query
-group filters?
-after?
-before?
-limit?
-\`\`\`
-
-Any requested group filter must be intersected with the Owner's current authorized group set.
-
-Define "Owner's groups" as:
-
-\`\`\`text
-groups for which this Principal currently has history:read
-\`\`\`
-
-Do not define it as:
-
-\`\`\`text
-all groups the Bot joined
-all enabled groups
-all groups assigned to another Owner
-\`\`\`
-
-With two Owners, their searchable group sets may overlap without becoming identical.
-
-### New Action
-
-Introduce an explicit protected read Action:
-
-\`\`\`text
-history:read
-\`\`\`
-
-Do not assume ordinary \`conversation:read\` automatically grants bulk history scanning.
-
-## Live history and durable archive
-
-P4B should land in two steps.
-
-### Step 1 — real NapCat history path
-
-Use \`get_group_msg_history\` through the existing OneBot adapter to prove real group-history access and normalization.
-
-This provides immediate product value and real-protocol acceptance.
-
-### Step 2 — Glassbox channel archive
-
-Add a separate durable table, conceptually:
-
-\`\`\`text
 channel_messages
-\`\`\`
+  complete configured Channel history / retrieval source
+```
 
-Do not reuse \`messages\`.
+Do not turn ordinary QQ history into fake Runs.
 
-The new table represents Channel facts, including messages that never created an Agent Run.
+## history:read
 
-Minimum direction:
+Bulk history scanning gets an explicit protected Action:
 
-\`\`\`text
+```text
+history:read
+```
+
+`conversation:read` does not imply this Action.
+
+"Owner's groups" means:
+
+```text
+group Resources where the current Principal currently has history:read
+```
+
+Bot membership and another Owner's access do not grant it.
+
+## QQ history tools
+
+### Current group
+
+Conceptual Tool:
+
+```text
+group_history_search
+```
+
+Model input:
+
+```text
+query
+after?
+before?
+limit?
+```
+
+No arbitrary group ID.
+
+Glassbox derives the group from the trusted Run scope.
+
+### Owner cross-group
+
+Conceptual Tool:
+
+```text
+owner_history_search
+```
+
+Only discoverable in authorized Owner-private Runs.
+
+Requested group filters are always intersected with the current Principal's `history:read` set before content is loaded.
+
+## Channel archive
+
+First prove the real NapCat history path.
+
+Then add durable:
+
+```text
+channel_messages
+```
+
+Minimum source metadata:
+
+```text
 id
 channel
 connectionId
 groupId
 externalMessageId
 senderId
-text / normalized searchable text
+normalizedText
 occurredAt
 ingestedAt
-resourceId or group resource linkage
+group Resource linkage
 dedupe key
-\`\`\`
+```
 
-Archive only configured / authorized group sources needed by the product. Do not silently turn every reachable QQ group into a permanent Glassbox archive.
+Only configured / authorized sources are archived.
 
-## Search engine direction
+Bot membership alone does not imply archive permission.
 
-Start with lexical retrieval.
+## Retrieval Engine
 
-SQLite FTS5 is a proven full-text-search mechanism with BM25 and snippet support:
+Use an OpenSquilla-style retriever from the start.
 
-\`\`\`text
-https://www.sqlite.org/fts5.html
-\`\`\`
+Initial path:
 
-Do not assume production support without a capability test against the exact Glassbox database path.
+```text
+authorized source set
+→ lexical / FTS store.search
+→ over-fetch
+→ source filter
+→ optional temporal decay
+→ optional source weighting
+→ optional MMR
+→ Top K
+→ MGP-compatible result
+```
 
-The first implementation slice must prove one of:
+Defaults stay simple:
 
-\`\`\`text
-FTS5 works in the current Turso / SQLite-compatible environment
-\`\`\`
+```text
+vector_weight = 0
+text_weight = 1
+MMR off until duplicate-heavy cases justify it
+source weights neutral unless evidence justifies otherwise
+```
 
-or:
+Evergreen explicit facts should not receive blind temporal decay.
 
-\`\`\`text
-use a bounded deterministic lexical fallback
-\`\`\`
+Apply decay by source semantics using the mature upstream mechanism.
 
-Do not make Turso's newer native FTS or any external vector database a P4B dependency.
+## FTS capability
 
-Vector / hybrid retrieval may be added only if lexical retrieval fails an explicit eval.
+Test FTS5 against the exact Glassbox database path.
 
-## Taste and Memory retrieval
+```text
+FTS5 available
+→ use behind OpenSquilla-style store
 
-P4A owns the records.
+FTS5 unavailable
+→ port OpenHarness bounded lexical fallback
+```
 
-P4B consumes only the stable retrieval-facing projection.
+Do not introduce Elasticsearch, a new SaaS search service, or an external vector database for P4B.
 
-Normal path:
+## Memory / Taste retrieval
 
-\`\`\`text
-current task
-→ authorized Principal / project / group source set
-→ lexical candidates
-→ relevance + confidence + recency where applicable
-→ small Top K
-→ Runtime Context
-\`\`\`
+P4A supplies canonical active Memory plus Glassbox scope / Resource mapping.
 
-Do not inject the entire Taste or Memory store every turn.
+P4B uses:
 
-Taste retrieval must preserve global / project scope.
+```text
+RecallIntent
+→ authorized source set
+→ OpenSquilla-style retriever
+→ MGP-style SearchResult
+→ bounded selected Context
+```
 
-Memory retrieval must preserve source visibility and provenance.
+P4B must not depend on P4A private table layout.
 
-## Context and delivery
+Project Taste only enters the matching project source set.
 
-P4B is not a generic P5 Context Budget Governor.
+## Context and Delivery
 
-P4B only needs bounded retrieval controls such as:
+P4B is not the P5 Context Budget Governor.
 
-\`\`\`text
-result count
+Use mature retrieval controls only:
+
+```text
+limit
 time range
-snippet length
 per-source cap
+snippet
 Top K
-detail-on-demand
-\`\`\`
+already-surfaced suppression
+detail on demand
+```
 
-Cross-group search should normally be callable only from Owner private Runs.
+Read permission never implies Delivery permission.
 
-If future policy allows a cross-group read from another audience, Delivery Gate must still separately authorize what can be sent to that audience.
+Cross-group retrieval acceptance stays Owner-private.
 
 ## Implementation route
 
-### P4B.0 — Contracts and authorization
+### P4B.0 — Port MGP retrieval contracts
 
-Define:
+Port RecallIntent, Search request / response metadata, RetrievalMode, ReturnMode, ScoreKind and RedactionInfo.
 
-\`\`\`text
-history:read
-retrieval source record
-retrieval result
-source-set resolver
-result provenance
-\`\`\`
+Add MGP compliance-inspired fixtures.
 
-Add deterministic dual-Owner fixtures with overlapping group grants.
+### P4B.1 — Port OpenSquilla retriever skeleton
 
-### P4B.1 — OneBot group-history bridge
+Port the `MemoryRetriever` structure with `vector_weight = 0`, `text_weight = 1`.
 
-Extend the existing OneBot adapter with a narrow typed history method using the existing authenticated RPC path.
+### P4B.2 — Glassbox source-set authorization
+
+Implement `history:read`, per-Owner group sets and revocation using existing Glassbox authorization.
+
+### P4B.3 — OneBot history bridge
+
+Add typed real history access to the existing OneBot adapter.
 
 Normalize message ID, sender, group, text and timestamp.
 
-Do not expose raw generic RPC to Pi.
+### P4B.4 — Current-group Tool
 
-### P4B.2 — Current-group Tool
+Current group can search only itself.
 
-Implement \`group_history_search\` or equivalent.
+### P4B.5 — Owner cross-group Tool
 
-Prove the model cannot select another group.
+Owner private can search only currently authorized groups.
 
-### P4B.3 — Owner cross-group Tool
+### P4B.6 — Channel archive and search store
 
-Implement \`owner_history_search\` or equivalent.
+Persist configured history separately from Runs.
 
-Visible only to authorized Owner-private Runs.
+Use FTS5 if proven. Otherwise port OpenHarness fallback.
 
-Resolve the allowed group set server-side before querying.
+### P4B.7 — Memory / Taste source adapter
 
-### P4B.4 — Channel archive and lexical index
+Map P4A canonical Memory into the shared retriever without a second Memory search implementation.
 
-Persist configured group history separately from Run input messages.
+### P4B.8 — Runtime projection and evidence
 
-Add dedupe, restart safety and lexical search.
+Record safe provenance:
 
-Prove FTS capability before depending on it.
-
-### P4B.5 — Memory and Taste retrieval
-
-Consume P4A retrieval-facing records.
-
-Apply authorization before query and return only relevant Top K.
-
-P4B must be able to develop against deterministic fixtures before P4A merges.
-
-### P4B.6 — Runtime projection and evidence
-
-Inject only selected authorized snippets / records.
-
-Record:
-
-\`\`\`text
+```text
 source kind
 source ID
-resource ID
-retrieval reason
-rank / score when meaningful
-Run linkage
-authorization decision linkage
-\`\`\`
+Resource
+retrieval mode
+score / rank
+safe matched terms
+Run
+AuthorizationDecision
+```
 
-Avoid copying unnecessary protected payload into denial evidence.
+Denied evidence does not copy protected payload.
 
-### P4B.7 — Eval and real acceptance
+### P4B.9 — Real acceptance
 
-Measure at least:
+Prove:
 
-\`\`\`text
-retrieval precision
-scope leakage rate
-unauthorized candidate count
-current-group hit quality
-cross-group hit quality
-Taste retrieval precision
-Memory retrieval precision
-\`\`\`
+```text
+real get_group_msg_history
+current-group real hit
+Owner-private cross-group hit across two authorized groups
+zero candidates from unauthorized group
+revocation affects next search
+cross-group result delivered only to Owner private
+```
 
 ## Tests
 
-Deterministic tests must cover at least:
+Bring behavior-compatible upstream tests.
 
-\`\`\`text
-current group can search itself
-current-group Tool cannot select another group
-Owner A searches only Owner A authorized groups
-Owner B searches only Owner B authorized groups
-shared group can appear for both when both are granted
-revocation affects the next search
-Bot membership does not imply history permission
-unauthorized group content never enters model-visible Context
-search result carries source and time
-channel_messages does not create fake Runs
-dedupe survives restart
-Memory / Taste source scope is preserved
-cross-group result cannot bypass Delivery Gate
-Owner-private Tool is undiscoverable to Visitor / group Runs
-\`\`\`
+Primary sources:
 
-Real acceptance must prove:
+```text
+MGP
+  compliance/search/test_search_results.py
+  compliance/access/test_access_control.py
 
-\`\`\`text
-NapCat real get_group_msg_history path works
-current test group returns real historical messages
-Owner-private query can find a term across at least two authorized test groups
-a deliberately unauthorized test group contributes zero candidates
-revoking one group removes it from the next cross-group query
-result delivery stays private for cross-group acceptance
-\`\`\`
+OpenSquilla
+  tests/test_memory_store_keyword_fallback.py
+  tests/test_memory_search_defaults.py
+  tests/test_memory_vector_normalization.py
+  tests/test_memory_retention.py
+  tests/live/test_search_retrieval_live.py
+
+OpenHarness
+  memory search / relevance behavior
+```
+
+Glassbox-specific tests:
+
+```text
+current group cannot choose another group
+Owner A / Owner B source sets remain distinct
+shared authorized group works for both
+revocation affects next query
+Bot membership does not imply history:read
+unauthorized text never enters the retriever
+channel_messages does not create a Run
+archive dedupe survives restart
+Owner cross-group Tool is hidden from Visitor / group Run
+Delivery Gate blocks wrong audience
+```
 
 ## Completion gate
 
 P4B is complete only when:
 
-- current-group history search works through a protected Tool;
-- Owner-private cross-group search uses the current per-Owner authorized group set;
-- \`history:read\` is explicit and default-deny;
-- complete Channel history is not confused with Run input \`messages\`;
-- a durable archive / index exists where required for useful repeated search;
-- Memory and Taste retrieval consume P4A through a stable contract;
-- authorization occurs before protected candidates are loaded;
-- only bounded relevant results reach Runtime Context;
-- every result preserves source and time metadata;
-- Delivery Gate still controls the final audience;
-- deterministic dual-Owner, revocation, restart and leakage tests pass;
-- real NapCat history acceptance passes.
+```text
+MGP-derived Recall / SearchResult contract is in use
+OpenSquilla-derived Retrieval Engine is in use
+OpenHarness-derived fallback exists if needed
+real NapCat history source works
+history:read is default-deny
+per-Owner source set is enforced before load
+channel history is separate from Run messages
+Runtime receives bounded selected Context
+Delivery remains a separate authorization decision
+dual Owner / revoke / restart / non-leak tests pass
+```
+
+## PR provenance requirement
+
+Every substantially ported mechanism records:
+
+```text
+upstream repository
+pinned commit
+original source path
+license
+ported behavior / tests
+Glassbox-specific changes
+```
 
 ## Non-goals
 
-Do not add in this Issue:
-
-\`\`\`text
+```text
 Memory promotion
-Taste learning
-Taste confidence mutation
-generic model-controlled memory writes
-vector database dependency
+Taste learning / confidence mutation
+generic Memory writes
+external vector database
 generic Context compression
-P5 routing / token governor
+P5 Context governor / routing
 new Channels
 LongTask
 frontend search UI
-\`\`\`
+```
