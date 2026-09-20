@@ -2,7 +2,7 @@
 
 Status: COMPLETE (2026-09-19)
 
-This is the only active implementation plan in the repository.
+This plan is complete and retained as the P3 foundation. Active implementation has moved to the parallel P4A and P4B plans.
 
 Detailed architecture lives in `docs/*.md`. This Plan owns implementation order, slice boundaries, and the completion gate.
 
