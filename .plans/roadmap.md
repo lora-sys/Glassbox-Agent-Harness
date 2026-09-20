@@ -4,13 +4,14 @@ Status: ROADMAP ONLY
 
 This file records sequencing and product direction. It is not permission to implement future phases.
 
-The only active implementation plan is:
+P3 is complete. The active implementation plans are the intentionally parallel P4 streams:
 
 ```text
-.plans/03-personal-agent-foundation.md
+.plans/04a-memory-taste.md
+.plans/04b-authorized-retrieval-history.md
 ```
 
-until its completion gate passes.
+Each stream has separate ownership, a tracking Issue, and a later PR.
 
 ## Product thesis
 
@@ -128,7 +129,7 @@ Detailed design: `docs/memory-taste.md`.
 
 ### P3 — QQ Personal Agent + Agent Ops Closed Loop
 
-Current active plan.
+Completed on 2026-09-19.
 
 Goal: first real usable Personal Agent product loop.
 
@@ -553,7 +554,7 @@ After later phases, add LongTask state machines, Skill promotion, Eval, and asse
 
 ## Stable roadmap rules
 
-- Active implementation scope comes from the current Plan, not future roadmap sections.
+- Active implementation scope comes from the owned active Plan and tracking Issue, not future roadmap sections.
 - Pi is an engine; Lora PI Kit is a distribution; Glassbox is the Personal Agent system.
 - `lora-sys/skills` is canonical Skill source; a Kit release uses a pinned snapshot.
 - Package / profile / MCP presence never overrides Glassbox authorization.
