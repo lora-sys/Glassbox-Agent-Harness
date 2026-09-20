@@ -1,10 +1,10 @@
 # Glassbox Memory and Taste
 
-Status: CURRENT DIRECTION / P4 PLANNED
+Status: CURRENT DIRECTION / P4A ACTIVE / P4B CONSUMER
 
 This document defines the ownership and learning boundary between Rules, Skills, Taste, Feedback, and durable Memory.
 
-The active implementation source of truth remains `.plans/03-personal-agent-foundation.md`. P4 begins only after the P3 completion gate passes.
+P3 is complete. Memory and Taste implementation now belongs to `.plans/04a-memory-taste.md` and Issue #9. Authorized retrieval and QQ history search belong to `.plans/04b-authorized-retrieval-history.md` and Issue #10.
 
 ## Decision
 
@@ -441,38 +441,49 @@ or Codex / Claude / future Runtime
 
 Do not create a separate Taste truth inside every Runtime.
 
-## P4 implementation order
+## P4 split ownership
 
-Planned slices:
+P4 is now two intentionally parallel streams.
+
+### P4A — Memory and Taste
+
+P4A owns the learning write side:
 
 ```text
-P4.0 — Feedback Ledger
-  capture durable accept / reject / edit / revert evidence
-
-P4.1 — Taste Candidate + Confidence
-  global / project scope
-  promotion / demotion
-  contradiction handling
-
-P4.2 — Task-aware Taste Retrieval
-  relevant Top K only
-  runtime injection
-  scope and authorization checks
-
-P4.3 — Semantic Memory
-  facts and durable project knowledge
-
-P4.4 — Episodic Memory
-  meaningful prior Run / Task / Conversation outcomes
-
-P4.5 — Authorized Retrieval
-  lexical first, hybrid/vector when justified
-
-P4.6 — Inspection and Eval
-  inspect evidence, confidence, scope, retrieval reason, and impact
+Feedback Ledger
+Taste Candidate + Confidence
+global / project scope
+promotion / demotion / retirement
+Semantic Memory
+Episodic Memory
+Owner inspection / administration
 ```
 
-Taste comes before broad Memory retrieval because it can deliver user value with a smaller mechanism and can be evaluated directly through correction behavior.
+P4A decides what becomes durable truth and preserves evidence for that decision.
+
+Model or extractor inference may create a Candidate. It must not directly create active durable Memory or Taste.
+
+### P4B — Authorized Retrieval and QQ History
+
+P4B owns the read side:
+
+```text
+authorized source-set resolution
+QQ group-history retrieval
+Owner-private authorized cross-group search
+Memory retrieval
+Taste retrieval
+ranking
+Top K
+Runtime Context projection
+retrieval evidence
+```
+
+P4B must authorize before protected candidates are loaded.
+
+P4A exposes a stable retrieval-facing projection. P4B consumes that projection without mutating P4A confidence or promotion state.
+
+Taste still comes before broad Memory retrieval as a learning mechanism, but P4A and P4B can be implemented in parallel because P4B develops against deterministic retrieval fixtures until the P4A projection is available.
 
 ## Eval
 
