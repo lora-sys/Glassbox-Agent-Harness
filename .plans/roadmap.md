@@ -258,6 +258,25 @@ Owner inspection / administration
 
 P4A does not own history search, ranking, Top K, or Runtime Context injection.
 
+P4A implementation is upstream-first:
+
+```text
+HKUDS/MGP
+  Memory / Candidate / Evidence / lifecycle contract
+
+langchain-ai/langmem
+  semantic / episodic extraction and consolidation
+
+HKUDS/OpenHarness
+  Memory dedupe / TTL / supersedes / freshness hygiene
+
+zhibao-dev/Learning-Multi-Factor-Memory
+  retention value / forgetting mechanism
+
+CommandCodeAI/command-code
+  Taste behavior signals and project / user scope
+```
+
 Stable procedural knowledge should normally become a Skill rather than generic Memory.
 
 #### P4B — Authorized Retrieval and QQ History Search
@@ -304,33 +323,65 @@ channel_messages
   durable Channel history / retrieval source
 ```
 
-P4B should prove the real NapCat `get_group_msg_history` path first, then add a durable channel archive / lexical index for repeated search.
+P4B should prove the real NapCat `get_group_msg_history` path first, then add a durable channel archive / search store for repeated search.
 
-Initial retrieval should be lexical. Vector or hybrid retrieval is justified only by an eval that shows lexical retrieval is insufficient.
+P4B implementation is upstream-first:
 
-P4B consumes P4A through a small stable retrieval-facing projection. It must be able to develop against deterministic fixtures before P4A merges.
+```text
+HKUDS/MGP
+  RecallIntent / SearchResult contract
+
+TokenRhythm/opensquilla
+  Retrieval Engine, FTS / hybrid interface, decay, source weighting, MMR
+
+HKUDS/OpenHarness
+  bounded lexical fallback when FTS is unavailable
+
+NapCat / OneBot
+  QQ history source
+```
+
+The first production configuration uses the OpenSquilla-derived retriever with:
+
+```text
+vector_weight = 0
+text_weight = 1
+```
+
+This keeps the first path lexical without designing a throwaway lexical-only API.
+
+P4B consumes P4A through the MGP-derived canonical Memory contract. It must be able to develop against deterministic fixtures before P4A merges.
 
 #### Shared P4 contract
 
-P4A may expose records conceptually shaped as:
+Do not invent a Glassbox-only Memory / Retrieval protocol when the mature upstream contract fits.
+
+P4A ports MGP-style:
 
 ```text
-id
-kind
-text or summary
-scope
-resourceId
-visibility
-sourceRefs
-occurredAt?
-createdAt
-status
-confidence?
+MemoryObject
+MemoryCandidate
+MemoryEvidence
+MemoryMergeHint
+lifecycle semantics
 ```
 
-P4B owns authorization-first querying, ranking and Context projection.
+P4B ports MGP-style:
 
-P4B must not mutate P4A learning confidence or promotion state.
+```text
+RecallIntent
+Search request / response
+SearchResult metadata
+RetrievalMode
+ReturnMode
+RedactionInfo
+```
+
+For non-Memory sources such as QQ group messages, Glassbox keeps the real ChannelMessage provenance and reuses the same retrieval metadata instead of pretending the message is canonical Memory.
+
+P4B owns authorization-first querying and OpenSquilla-derived ranking / Context projection.
+
+P4B must not mutate P4A confidence or promotion state.
 
 P4A must not implement retrieval ranking or bypass P4B authorization.
 
