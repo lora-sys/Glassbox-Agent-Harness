@@ -95,6 +95,7 @@ Vendor selectively when a current implementation slice needs them.
 | `aorumbayev/herdr-workflows` | Bounded linear Herdr workflow recipes; not durable Glassbox Task truth |
 | `NapNeko/NapCatQQ` | QQ protocol-side runtime and OneBot connectivity for the active P3 Channel |
 | `botuniverse/onebot-11` | OneBot 11 event and API contract for the active P3 QQ Channel |
+| `HKUDS/MGP` | P4 governed Memory contract: MemoryObject / Candidate / Evidence / lifecycle / recall / search-result schemas and compliance tests |
 | `CommandCodeAI/command-code` | P4 Taste mechanics: learn preferences from accept/reject/edit behavior, project/user scope, continuous preference learning |
 | `keli-wen/agy-staff` | AGY worker delegation and background job lifecycle |
 | `TokenRhythm/opensquilla` | Later context budgets, tool-result budgets, hybrid retrieval, routing, token-efficient projection |
@@ -128,6 +129,8 @@ Herdr is an active P3 execution dependency for the Agent Operations foundation. 
 `herdr-workflows` may run bounded stage recipes inside Herdr. It does not replace the Glassbox Task state machine or become the source of review/rework truth.
 
 NapCat and OneBot are active P3 references for QQ transport. QQ transport stays in Glassbox and does not move into Lora PI Kit.
+
+MGP is the primary P4 contract reference for governed Memory objects, candidates, evidence, lifecycle operations, recall intent and normalized search results. Port its schemas, reference semantics and compliance behavior into Glassbox TypeScript where useful; do not introduce its Python gateway or policy engine as a second product authority. See `mgp/SOURCES.md`.
 
 Command Code is a P4 research reference for Taste. Glassbox adopts the useful pattern of treating accept, reject, edit, revert, and correction behavior as feedback, but keeps FeedbackEvent, Taste, confidence, scope, authorization, and retrieval as Glassbox-owned durable product state. Command Code is not a dependency. See `command-code/SOURCES.md` and `../docs/memory-taste.md`.
 
