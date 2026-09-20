@@ -80,6 +80,9 @@ async function fixture(
   const sockets = new Inbox<WebSocket>();
   const calls: ExecutionInput[] = [];
   const started = new Inbox<ExecutionInput>();
+  // How many `get_group_info` reads the peer has actually been asked for. Counted rather than
+  // inferred from the reply, so a test can prove a projection issued *no* provider call.
+  let groupInfoRequests = 0;
   const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
   cleanup.push(async () => {
     for (const socket of server.clients) socket.terminate();
@@ -98,6 +101,7 @@ async function fixture(
           : raw;
       const action = JSON.parse(bytes.toString("utf8")) as Action;
       actions.put(action);
+      if (action.action === "get_group_info") groupInfoRequests += 1;
       // A rejected `get_group_info` is the peer's own failure reply: `status: "failed"` with a
       // non-zero `retcode`, which the adapter maps to a provider error rather than to data.
       const groupInfoFailed = action.action === "get_group_info" && groupInfoFails;
@@ -191,7 +195,17 @@ async function fixture(
   const setGroupInfoFails = (value: boolean) => {
     groupInfoFails = value;
   };
-  return { app, calls, started, send, reply, actions, reopen, setGroupInfoFails };
+  return {
+    app,
+    calls,
+    started,
+    send,
+    reply,
+    actions,
+    reopen,
+    setGroupInfoFails,
+    groupInfoRequests: () => groupInfoRequests,
+  };
 }
 
 describe("channel to durable run composition", () => {
@@ -576,7 +590,17 @@ interface ManagedGroupProjection {
     name: string | null;
     /** The live provider reachability, or `null` when it was not observed. */
     reachable: boolean | null;
-    access: { grantedCategories: QqCapabilityCategory[]; historyRead: boolean };
+    /**
+     * `true` when the provider proved the Bot is in this exact group; `null` when it did not.
+     * Never `false`: this read path cannot prove absence of membership.
+     */
+    botMembership: boolean | null;
+    access: {
+      /** The acting Owner's own assignment of this group. Always `true` in the inventory. */
+      assigned: boolean;
+      grantedCategories: QqCapabilityCategory[];
+      historyRead: boolean;
+    };
     categories: Record<string, boolean>;
     memorySources: Record<string, boolean>;
     skills: { enabledSkills: string[]; version: number };
@@ -613,6 +637,10 @@ const admin = (app: ManagementApplication) =>
     setGroupHistory(
       context: OwnerContext,
       input: { groupId: string; enabled: boolean },
+    ): Promise<unknown>;
+    setGroupCategory(
+      context: OwnerContext,
+      input: { groupId: string; category: QqCapabilityCategory; enabled: boolean },
     ): Promise<unknown>;
     setGroupSkill(
       context: OwnerContext,
@@ -827,18 +855,27 @@ describe("per-Owner managed group assignment", () => {
     expect(await groupIds(application, b)).toEqual([GROUP, OTHER_GROUP]);
 
     const group = inventory.groups[0]!;
-    // Every required fact is present: the live observation, durable policy, this Owner's own
-    // access, and the durable Skill whitelist with its version.
+    // Every required fact is present: the live observation (name, reachability and Bot
+    // membership), durable policy, this Owner's own access and assignment, and the durable
+    // Skill whitelist with its version.
     expect(group.name).toBe("Fixture Group");
     expect(group.reachable).toBe(true);
+    expect(group.botMembership).toBe(true);
     expect(group.version).toBe(1);
     expect(group.categories).toEqual(DEFAULT_OWNER_GROUP_POLICY.categories);
     expect(group.memorySources).toEqual(DEFAULT_OWNER_GROUP_POLICY.memorySources);
+    expect(group.access.assigned).toBe(true);
     expect(group.access.grantedCategories).toEqual(
       DEFAULT_OWNER_GROUP_CATEGORIES.filter((category) => groupActions([category]).length > 0),
     );
     expect(group.access.historyRead).toBe(true);
     expect(group.skills).toEqual({ enabledSkills: ["unslop"], version: 0 });
+
+    // Owner B's own projection states Owner B's own assignment, never Owner A's: the group
+    // they share is `assigned` for both, and the group only B manages appears only for B.
+    const otherOwner = await application.projectManagedGroups(b);
+    expect(otherOwner.groups.map((entry) => entry.groupId)).toEqual([GROUP, OTHER_GROUP]);
+    expect(otherOwner.groups.every((entry) => entry.access.assigned)).toBe(true);
   });
 
   it("keeps the durable inventory and reports live facts unknown when the provider cannot answer", async () => {
@@ -851,12 +888,16 @@ describe("per-Owner managed group assignment", () => {
     expect(disconnected.groupId).toBe(GROUP);
     expect(disconnected.name).toBeNull();
     expect(disconnected.reachable).toBeNull();
+    // Unobserved membership is unknown, never a claim that the Bot is not in the group.
+    expect(disconnected.botMembership).toBeNull();
     expect(disconnected.version).toBe(1);
     expect(disconnected.categories).toEqual(DEFAULT_OWNER_GROUP_POLICY.categories);
+    expect(disconnected.access.assigned).toBe(true);
     expect(disconnected.access.grantedCategories).toContain("group.read");
 
-    // A connected provider that rejects `get_group_info` is the same "unknown", and it does not
-    // fail the whole projection or erase the durable facts for the group.
+    // A connected provider that rejects `get_group_info` is the same "unknown" — including for
+    // membership, since a rejection is not proof of non-membership — and it does not fail the
+    // whole projection or erase the durable facts for the group.
     const failing = await owners();
     await failing.application.setGroupAccess(failing.a, { groupId: GROUP, enabled: true });
     // Only now does the peer begin rejecting `get_group_info`: the durable assignment is already
@@ -864,9 +905,16 @@ describe("per-Owner managed group assignment", () => {
     failing.f.setGroupInfoFails(true);
     const errored = (await failing.application.projectManagedGroups(failing.a)).groups;
     expect(errored).toHaveLength(1);
-    expect(errored[0]).toMatchObject({ groupId: GROUP, name: null, reachable: null });
+    expect(errored[0]).toMatchObject({
+      groupId: GROUP,
+      name: null,
+      reachable: null,
+      botMembership: null,
+    });
+    expect(errored[0]!.access).toMatchObject({ assigned: true, historyRead: true });
     expect(errored[0]!.skills).toEqual({ enabledSkills: ["unslop"], version: 0 });
-    expect(errored[0]!.access.historyRead).toBe(true);
+    // The peer was asked and answered; the answer simply was not evidence.
+    expect(failing.f.groupInfoRequests()).toBeGreaterThan(0);
   });
 
   it("applies a history revoke to the very next inventory projection", async () => {
@@ -887,6 +935,82 @@ describe("per-Owner managed group assignment", () => {
     expect(after.access.historyRead).toBe(false);
     // The assignment itself is untouched: only the one category changed.
     expect(after.groupId).toBe(GROUP);
+  });
+
+  it("records the projection's per-group decisions against the current Conversation and Run", async () => {
+    const { f, application, a } = await owners({ groupName: "Fixture Group" });
+    await application.setGroupAccess(a, { groupId: GROUP, enabled: true });
+
+    await application.projectManagedGroups(a);
+
+    // The projection re-authorizes every protected group fact through the real decision path,
+    // so the durable evidence names this Principal, this concrete group Resource and this Run.
+    const records = (await f.app.store.evidence.listDecisions(a.caller, "personal", { limit: 100 }))
+      .items;
+    const decided = records.filter(
+      (record) => record.resourceId === `group:${GROUP}` && record.runId === a.runId,
+    );
+
+    // Every group-scoped Action the registry declares was decided for this group in this Run:
+    // the whole read bundle and every mutation category, not just the ones that are granted.
+    expect(new Set(decided.map((record) => record.action))).toEqual(
+      new Set([
+        ...groupActions(DEFAULT_OWNER_GROUP_CATEGORIES),
+        ...groupActions(MUTATION_CATEGORIES),
+      ]),
+    );
+    // Each decision is linked to the Run that asked, so the evidence can be reconstructed.
+    for (const record of decided) expect(record.conversationId).toBe(a.conversationId);
+
+    const decisionFor = (action: string) => decided.find((record) => record.action === action);
+    // The evidence agrees with the projection: the read bundle is ALLOW, no mutation is.
+    expect(decisionFor("group:read")?.decision).toBe("ALLOW");
+    expect(decisionFor("history:read")?.decision).toBe("ALLOW");
+    expect(decisionFor("group:moderate")?.decision).toBe("DENY");
+  });
+
+  it("denies the group and reads no provider fact once the read grant is revoked", async () => {
+    const { f, application, a } = await owners({ groupName: "Fixture Group" });
+    await application.setGroupAccess(a, { groupId: GROUP, enabled: true });
+    // A connected peer that answers: the only reason a projection can report nothing live is
+    // that the projection decided not to ask.
+    expect((await application.projectManagedGroups(a)).groups[0]?.name).toBe("Fixture Group");
+
+    const before = f.groupInfoRequests();
+    // Revoke the one category whose Action gates the live read. The Owner's own `group:manage`
+    // assignment — and therefore the inventory entry — stays in place.
+    await application.setGroupCategory(a, {
+      groupId: GROUP,
+      category: "group.read",
+      enabled: false,
+    });
+
+    const inventory = await application.projectManagedGroups(a);
+    // The group is still this Owner's managed group, and says so...
+    expect(inventory.groups.map((group) => group.groupId)).toEqual([GROUP]);
+    const group = inventory.groups[0]!;
+    expect(group.access.assigned).toBe(true);
+    // ...but `group:read` is no longer granted, so no live fact is claimed and the peer is
+    // never asked — a denied group causes no provider read at all.
+    expect(group.access.grantedCategories).not.toContain("group.read");
+    expect(group.name).toBeNull();
+    expect(group.reachable).toBeNull();
+    expect(group.botMembership).toBeNull();
+    expect(f.groupInfoRequests()).toBe(before);
+
+    // The denial is durable evidence carrying this Run, not a silently missing observation.
+    // Both projections decided `group:read` for this Run — the first allowed it, the second
+    // denied it — so the revoke is visible as a new denial rather than as absent evidence.
+    const records = (await f.app.store.evidence.listDecisions(a.caller, "personal", { limit: 100 }))
+      .items;
+    const groupRead = records.filter(
+      (record) =>
+        record.resourceId === `group:${GROUP}` &&
+        record.action === "group:read" &&
+        record.runId === a.runId,
+    );
+    expect(groupRead.map((record) => record.decision).sort()).toEqual(["ALLOW", "DENY"]);
+    for (const record of groupRead) expect(record.conversationId).toBe(a.conversationId);
   });
 
   it("keeps the durable Skill whitelist and its version in the projection across a restart", async () => {

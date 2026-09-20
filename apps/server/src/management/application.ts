@@ -102,6 +102,16 @@ const ACTIONS = [
 const TOOL_DISCOVERY_ACTION = "tool:discover";
 const toolResourceId = (name: string) => `tool:${name}`;
 
+/**
+ * The two group-scoped Actions the managed-group projection reasons about by name.
+ *
+ * `categoryActions` derives them from the registry, so these are not a second source of truth:
+ * they exist because the projection needs the `history:read` and `group:read` decisions
+ * individually — one reported as the access fact, one gating the live provider read.
+ */
+const HISTORY_READ_ACTION = "history:read";
+const GROUP_READ_ACTION = "group:read";
+
 /** Provider page size for one `get_group_msg_history` call. */
 const HISTORY_SYNC_PAGE_SIZE = 100;
 /** Upper bound on pages walked per sync, so one search cannot scan unbounded history. */
@@ -166,6 +176,8 @@ interface ManagedGroupFacts {
   grantedCategories: QqCapabilityCategory[];
   /** The execution-time `history:read` decision for this Principal and group. */
   historyRead: boolean;
+  /** The execution-time `group:read` decision, which gates the live provider observation. */
+  groupRead: boolean;
   /** The durable group runtime whitelist, read from the store rather than the live session. */
   skills: { enabledSkills: string[]; version: number };
 }
@@ -1582,6 +1594,13 @@ export class ManagementApplication {
    * `group:manage` assignment — never the connection-wide transport list and never every
    * group the bot has joined. Every protected fact is re-authorized here, so the Owner role
    * alone is never a bypass.
+   *
+   * Each fact is the real `authorization.check` decision for this Principal, this concrete
+   * `group:<id>` Resource and this Run — the same call the capability and history Tools make,
+   * recording the same `authorization_decisions` evidence, with the current Conversation and
+   * Run attached. `hasActiveGrant` is deliberately not used: it answers the management
+   * reverse-state question ("does anyone still hold this assignment") and bypasses identity
+   * and visibility evaluation, so a grant it finds is not an authorization decision.
    */
   private async managedGroupFacts(context: ProtectedToolContext): Promise<ManagedGroupFacts[]> {
     const caller = context.caller;
@@ -1594,6 +1613,25 @@ export class ManagementApplication {
     const facts: ManagedGroupFacts[] = [];
     for (const groupId of groupIds) {
       const resourceId = groupResourceId(groupId);
+      // One decision per distinct Action, reused across the categories of this single
+      // projection so a category and `historyRead` cannot disagree about the same Action.
+      // The map dies with the call: nothing is cached across projections or Runs, so a
+      // revoke, a new Conversation or a new Run is always re-evaluated.
+      const decisions = new Map<string, boolean>();
+      const allowed = async (action: string): Promise<boolean> => {
+        const known = decisions.get(action);
+        if (known !== undefined) return known;
+        const decision = await this.store.authorization.check({
+          caller,
+          resourceId,
+          action,
+          conversationId: context.conversationId,
+          runId: context.runId,
+        });
+        const granted = decision.decision === "ALLOW";
+        decisions.set(action, granted);
+        return granted;
+      };
       // A category counts as granted only when every group-scoped Action it confers is
       // currently ALLOW for this Principal in this scope. A partially-revoked category is
       // therefore reported as not granted rather than as half-usable.
@@ -1602,16 +1640,7 @@ export class ManagementApplication {
         const actions = this.categoryActions(category);
         if (actions.length === 0) continue;
         let granted = true;
-        for (const action of actions) {
-          granted =
-            granted &&
-            (await this.store.authorization.hasActiveGrant({
-              principalId: caller.principalId,
-              resourceId,
-              action,
-              scope: caller.scope,
-            }));
-        }
+        for (const action of actions) granted = granted && (await allowed(action));
         if (granted) grantedCategories.push(category);
       }
       const runtime = this.groupRuntime.get(connectionId, groupId, defaultSkills);
@@ -1620,9 +1649,10 @@ export class ManagementApplication {
         policy: policies.get(groupId)?.policy ?? DEFAULT_GROUP_CAPABILITY_POLICY,
         version: policies.get(groupId)?.version ?? 0,
         grantedCategories,
-        // `group.history`'s only group-scoped Action is `history:read`, so this is the same
-        // live authorization decision the history Tools make — not a cached policy flag.
-        historyRead: grantedCategories.includes("group.history"),
+        // The `history:read` decision itself — the same Action the history Tools check — not
+        // a flag inferred from the category that happens to contain it.
+        historyRead: await allowed(HISTORY_READ_ACTION),
+        groupRead: await allowed(GROUP_READ_ACTION),
         skills: { enabledSkills: [...runtime.enabledSkills], version: runtime.version },
       });
     }
@@ -1637,18 +1667,25 @@ export class ManagementApplication {
    * or a success — Glassbox never claims an observation it did not make. Only the existing
    * authenticated OneBot connection is used, through the narrow typed `getGroupInfo` read
    * path: no raw RPC and no second QQ client.
+   *
+   * `botMembership` is `true` only on a typed success for the exact group: a provider that
+   * answered about this group is proof the bot is in it. Every failure stays `null`, including
+   * an explicit rejection, because this read path cannot distinguish "not a member" from a
+   * rate limit, a timeout or a transient provider error — reporting `false` for any of those
+   * would be an unproven claim. The field is typed `boolean | null` so a future unambiguous
+   * not-a-member signal can use `false` without changing the shape.
    */
   private async observeGroup(
     connection: OneBotAdapter | undefined,
     groupId: string,
-  ): Promise<{ name: string | null; reachable: boolean | null }> {
-    if (!connection) return { name: null, reachable: null };
+  ): Promise<{ name: string | null; reachable: boolean | null; botMembership: boolean | null }> {
+    if (!connection) return { name: null, reachable: null, botMembership: null };
     try {
       const result = await connection.getGroupInfo({ groupId });
-      if (result.status !== "ok") return { name: null, reachable: null };
-      return { name: result.name, reachable: true };
+      if (result.status !== "ok") return { name: null, reachable: null, botMembership: null };
+      return { name: result.name, reachable: true, botMembership: true };
     } catch {
-      return { name: null, reachable: null };
+      return { name: null, reachable: null, botMembership: null };
     }
   }
 
@@ -1657,25 +1694,35 @@ export class ManagementApplication {
    *
    * Durable policy truth — categories, memory sources, the Skill whitelist and its version,
    * and the Principal's own access — always appears. Only the live provider observation of a
-   * group's name and reachability can be missing, and a provider failure for one group never
-   * erases the rest of the inventory or fails the whole projection.
+   * group's name, reachability and Bot membership can be missing, and a provider failure for
+   * one group never erases the rest of the inventory or fails the whole projection.
    *
-   * Live metadata is read only for a group whose `group.read` Action this Principal currently
-   * holds, so a protected group fact is re-authorized before any provider call.
+   * Live metadata is read only after the current `group:read` decision for this Principal and
+   * group is ALLOW, so a protected group fact is re-authorized before any provider call and a
+   * denied group never causes one.
    */
   private async projectManagedGroups(context: ProtectedToolContext): Promise<unknown> {
     const connection = this.connections.get(context.caller.scope.connectionId);
     const facts = await this.managedGroupFacts(context);
     const groups = [];
     for (const fact of facts) {
-      const observation = fact.grantedCategories.includes("group.read")
+      const observation = fact.groupRead
         ? await this.observeGroup(connection, fact.groupId)
-        : { name: null, reachable: null };
+        : { name: null, reachable: null, botMembership: null };
       groups.push({
         groupId: fact.groupId,
         name: observation.name,
         reachable: observation.reachable,
-        access: { grantedCategories: fact.grantedCategories, historyRead: fact.historyRead },
+        botMembership: observation.botMembership,
+        access: {
+          // The inventory *is* this Principal's own assignment — that is what
+          // `resolveAssignedGroupIds` selected — so the entry states it explicitly rather
+          // than leaving the reader to infer it from presence. It is never derived from Bot
+          // membership or from another Owner's assignment.
+          assigned: true,
+          grantedCategories: fact.grantedCategories,
+          historyRead: fact.historyRead,
+        },
         categories: fact.policy.categories,
         memorySources: fact.policy.memorySources,
         skills: fact.skills,
@@ -1691,9 +1738,10 @@ export class ManagementApplication {
    * The candidate set is the allowlisted Glassbox registry — never raw NapCat actions — and
    * every entry must clear four independent gates before it can appear: Tool discovery for
    * this Run, the capability's own protected Action on its Resource, the Owner's durable
-   * policy, and the Principal's live grant. A disabled category, a revoked grant, another
-   * Owner's group and a server-only or deferred action all contribute nothing, and matching
-   * runs only over what survived, so a query can never reveal a capability the caller lacks.
+   * policy, and the Principal's live authorization decision. A disabled category, a revoked
+   * grant, another Owner's group and a server-only or deferred action all contribute nothing,
+   * and matching runs only over what survived, so a query can never reveal a capability the
+   * caller lacks.
    */
   private async searchCapabilities(
     context: ProtectedToolContext,
