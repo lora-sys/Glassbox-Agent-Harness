@@ -144,12 +144,10 @@ export const QQ_CAPABILITIES: readonly QqCapability[] = [
     risk: "write",
     action: "group:files:write",
     resource: "group",
+    // Deliberately no `upload_group_file`: its `file` parameter is a local server path, and
+    // P4B has no Asset or file Resource to authorize it against. See
+    // `SERVER_ONLY_NAPCAT_ACTIONS` and `upstream/napcat/SOURCES.md`.
     operations: [
-      group(
-        "upload_group_file",
-        ["group_id", "file", "name", "folder_id"],
-        ["group_id", "file", "name"],
-      ),
       group("delete_group_file", ["group_id", "file_id"], ["group_id", "file_id"]),
       group("create_group_file_folder", ["group_id", "name"], ["group_id", "name"]),
     ],
@@ -205,12 +203,21 @@ export const QQ_CAPABILITIES: readonly QqCapability[] = [
 ];
 
 /**
- * Provider primitives that stay server-only in P4. These are never allowlisted, never
+ * Provider actions that stay server-only in P4. These are never allowlisted, never
  * mapped to a Tool, and never reachable from model-visible Context.
  *
  * Raw send actions are listed here for the same reason: Glassbox Delivery must remain
  * the only outbound message path. Service-restart and cache-maintenance actions are here
  * because they change the runtime itself rather than QQ data.
+ *
+ * `upload_group_file` is here for a different reason and is deliberately *deferred* rather
+ * than forbidden: it is a real group file mutation, but its `file` parameter is a local
+ * server filesystem path. Glassbox has no Asset or file Resource authorization and no
+ * approved upload staging boundary, so a remote Owner message naming a path would be an
+ * authorization gap. It becomes allowlistable only once an Asset-mediated upload path
+ * exists; until then the model is never told it can upload. Its sibling group file
+ * mutations (`delete_group_file`, `create_group_file_folder`) take only group-scoped ids
+ * and stay allowlisted.
  *
  * Every name is the provider's real OneBot action string at the pinned commit. The
  * credential action is `get_csrf_token` (not `get_csrf`) and the rkey pair is
@@ -234,6 +241,7 @@ export const SERVER_ONLY_NAPCAT_ACTIONS: readonly string[] = [
   "send_msg",
   "send_group_forward_msg",
   "send_private_forward_msg",
+  "upload_group_file",
 ];
 
 /** The only provider actions Glassbox may issue on behalf of a capability Tool. */
@@ -359,6 +367,11 @@ export interface NapCatProviderSchema {
  * what makes "unsupported parameter" detectable without the checkout present: Glassbox may
  * forward a parameter only when the provider declares it. A `returned` of `[]` means the
  * provider returns an opaque, non-object schema (a named schema, `Type.Any`, or `Type.Null`).
+ *
+ * Keyed by *allowlisted* action: this map and `QQ_ALLOWED_NAPCAT_ACTIONS` always have the
+ * same keys, which is what lets the verifier compare a digest derived from the allowlist
+ * against the pinned record. A server-only action such as `upload_group_file` is therefore
+ * absent here rather than recorded and ignored.
  */
 export const NAPCAT_PROVIDER_SCHEMAS: Readonly<Record<string, NapCatProviderSchema>> =
   Object.freeze({
@@ -402,10 +415,6 @@ export const NAPCAT_PROVIDER_SCHEMAS: Readonly<Record<string, NapCatProviderSche
       returned: ["files", "folders"],
     },
     get_group_file_url: { payload: ["group_id", "file_id"], returned: ["url"] },
-    upload_group_file: {
-      payload: ["group_id", "file", "name", "folder", "folder_id", "upload_file"],
-      returned: ["file_id"],
-    },
     delete_group_file: { payload: ["group_id", "file_id"], returned: [] },
     create_group_file_folder: {
       payload: ["group_id", "folder_name", "name"],
@@ -512,7 +521,6 @@ export const NAPCAT_CONTRACT_SNAPSHOT: NapCatContractSnapshot = Object.freeze({
     "packages/napcat-onebot/action/go-cqhttp/GetGroupMsgHistory.ts",
     "packages/napcat-onebot/action/go-cqhttp/GetGroupRootFiles.ts",
     "packages/napcat-onebot/action/go-cqhttp/GetGroupFilesByFolder.ts",
-    "packages/napcat-onebot/action/go-cqhttp/UploadGroupFile.ts",
     "packages/napcat-onebot/action/go-cqhttp/DeleteGroupFile.ts",
     "packages/napcat-onebot/action/go-cqhttp/CreateGroupFileFolder.ts",
     "packages/napcat-onebot/action/file/GetGroupFileUrl.ts",

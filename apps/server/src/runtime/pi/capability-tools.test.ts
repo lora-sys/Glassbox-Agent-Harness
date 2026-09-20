@@ -575,3 +575,138 @@ it("binds the boolean a flag-shaped mutation asked for", async () => {
     await store.close();
   }
 });
+
+it("refuses a mutation that adds a provider parameter the message never named", async () => {
+  const { store, accepted } = await fixture();
+  try {
+    await enableCategory(store, "group.moderate");
+    await grantGroupAction(store, "group:moderate");
+    const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
+    // The message named the member and nothing about rejoin. `set_group_kick` declares an
+    // optional `reject_add_request`, so the model must not be able to supply it silently:
+    // the parameter set is compared exactly, not as a subset.
+    const created = tools(store, accepted, calls, {
+      name: "qq_group_moderation",
+      input: {
+        groupId: "100",
+        operation: "set_group_kick",
+        params: { user_id: 10004 },
+      },
+    });
+    const moderation = toolByName(created, "qq_group_moderation");
+    await expect(
+      call(moderation, {
+        groupId: "100",
+        operation: "set_group_kick",
+        params: { user_id: 10004, reject_add_request: true },
+      }),
+    ).rejects.toThrow("mutation_not_requested");
+    expect(calls).toEqual([]);
+    // The exact parameter set the message named still executes.
+    await call(moderation, {
+      groupId: "100",
+      operation: "set_group_kick",
+      params: { user_id: 10004 },
+    });
+    expect(calls).toEqual([
+      { action: "set_group_kick", params: { user_id: 10004, group_id: 100 } },
+    ]);
+  } finally {
+    await store.close();
+  }
+});
+
+it("binds a rejoin flag the message named and refuses one it did not", async () => {
+  const { store, accepted } = await fixture();
+  try {
+    await enableCategory(store, "group.moderate");
+    await grantGroupAction(store, "group:moderate");
+    const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
+    const created = tools(store, accepted, calls, {
+      name: "qq_group_moderation",
+      input: {
+        groupId: "100",
+        operation: "set_group_kick",
+        params: { user_id: 10004, reject_add_request: true },
+      },
+    });
+    const moderation = toolByName(created, "qq_group_moderation");
+    // Dropping the named flag and flipping it are both different requests.
+    await expect(
+      call(moderation, {
+        groupId: "100",
+        operation: "set_group_kick",
+        params: { user_id: 10004 },
+      }),
+    ).rejects.toThrow("mutation_not_requested");
+    await expect(
+      call(moderation, {
+        groupId: "100",
+        operation: "set_group_kick",
+        params: { user_id: 10004, reject_add_request: false },
+      }),
+    ).rejects.toThrow("mutation_not_requested");
+    expect(calls).toEqual([]);
+    await call(moderation, {
+      groupId: "100",
+      operation: "set_group_kick",
+      params: { user_id: 10004, reject_add_request: true },
+    });
+    expect(calls).toEqual([
+      {
+        action: "set_group_kick",
+        params: { user_id: 10004, reject_add_request: true, group_id: 100 },
+      },
+    ]);
+  } finally {
+    await store.close();
+  }
+});
+
+it("keeps numeric-string equivalence and strict booleans in the exact comparison", async () => {
+  const { store, accepted } = await fixture();
+  try {
+    await enableCategory(store, "group.moderate");
+    await grantGroupAction(store, "group:moderate");
+    const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
+    // A provider parameter is the same parameter whether the model writes `10004` or
+    // `"10004"`, so exactness must not turn that into a mismatch.
+    const created = tools(store, accepted, calls, {
+      name: "qq_group_moderation",
+      input: {
+        groupId: "100",
+        operation: "set_group_kick",
+        params: { user_id: 10004 },
+      },
+    });
+    const moderation = toolByName(created, "qq_group_moderation");
+    await call(moderation, {
+      groupId: "100",
+      operation: "set_group_kick",
+      params: { user_id: "10004" },
+    });
+    expect(calls).toEqual([
+      { action: "set_group_kick", params: { user_id: "10004", group_id: 100 } },
+    ]);
+
+    // A flag is a flag: the string `"true"` is not the `true` the message named.
+    const flagged = tools(store, accepted, calls, {
+      name: "qq_group_moderation",
+      input: {
+        groupId: "100",
+        operation: "set_group_whole_ban",
+        params: { enable: true },
+      },
+    });
+    await expect(
+      call(toolByName(flagged, "qq_group_moderation"), {
+        groupId: "100",
+        operation: "set_group_whole_ban",
+        params: { enable: "true" },
+      }),
+    ).rejects.toThrow("mutation_not_requested");
+    expect(calls).toHaveLength(1);
+  } finally {
+    await store.close();
+  }
+});

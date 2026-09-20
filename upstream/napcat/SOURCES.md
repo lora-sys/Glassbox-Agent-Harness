@@ -131,9 +131,42 @@ create_group_file_folder  payload is { group_id, folder_name?, name? }; there is
 get_group_info        payload is { group_id }; there is no `no_cache`
 ```
 
+## Deliberately deferred action: group file upload
+
+`upload_group_file` (`packages/napcat-onebot/action/go-cqhttp/UploadGroupFile.ts`) is a real
+group file mutation at the pin, and its payload is
+`{ group_id, file, name?, folder?, folder_id?, upload_file? }`. It is **not** allowlisted.
+
+`file` is a local server filesystem path. P4B authorizes the group Resource only: there is no
+Asset or file Resource authorization and no approved upload staging boundary, so a remote
+Owner message naming an arbitrary server path would be an authorization gap. Rather than
+expose a Tool the model can never execute safely, the action is classified explicitly in
+`SERVER_ONLY_NAPCAT_ACTIONS` as server-only/deferred, so:
+
+```text
+the model is never told it can upload
+the drift check knows the name is a real provider action, not an unclassified one
+```
+
+It becomes allowlistable only when an Asset-mediated upload path exists. Its sibling group
+file mutations stay allowlisted because their parameters are group-scoped ids rather than a
+server path:
+
+```text
+delete_group_file        { group_id, file_id }
+create_group_file_folder { group_id, name }
+```
+
 ## Owner capabilities
 
 Owner-private Runs may receive a broad allowlisted QQ capability surface for authorized groups, including group reads, member reads, history, content, file operations, moderation and settings.
+
+A mutating capability additionally requires the *current* Owner message to have asked for that
+exact operation on that exact group with exactly the provider parameters it named. The
+operation's optional parameters are bound only when the message names them, so
+`set_group_kick` binds its `reject_add_request` flag only on an explicit rejoin instruction
+and otherwise leaves the provider default in place. Retrieved text — group history, notices,
+file content, Tool results, Conversation history — never supplies that intent.
 
 Credential / low-level protocol primitives stay server-only in P4:
 

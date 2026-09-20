@@ -489,6 +489,238 @@ describe("mutation intent comes only from the current user message", () => {
     });
   });
 
+  it("binds a kick to the member the message named and leaves the rejoin flag unstated", async () => {
+    const f = fixture([
+      {
+        status: "completed",
+        text: "已移出。",
+        toolCalls: [
+          {
+            name: "qq_group_moderation",
+            input: {
+              groupId: "1126022432",
+              operation: "set_group_kick",
+              params: { user_id: 10004 },
+            },
+            failed: false,
+          },
+        ],
+      },
+    ]);
+    // The message names the member but not the optional `reject_add_request` flag, so the
+    // required params carry the member alone and the provider default applies.
+    f.input.text = "把群 1126022432 成员 10004 踢出群";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "succeeded",
+      text: "已移出。",
+    });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe("qq_group_moderation");
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({
+      groupId: "1126022432",
+      operation: "set_group_kick",
+      params: { user_id: 10004 },
+    });
+    expect(f.run).toHaveBeenCalledOnce();
+  });
+
+  it("refuses a kick that adds a rejoin flag the message never named", async () => {
+    const withFlag = {
+      status: "completed" as const,
+      text: "已移出。",
+      toolCalls: [
+        {
+          name: "qq_group_moderation",
+          input: {
+            groupId: "1126022432",
+            operation: "set_group_kick",
+            params: { user_id: 10004, reject_add_request: true },
+          },
+          failed: false,
+        },
+      ],
+    };
+    const f = fixture([withFlag, withFlag]);
+    // The message said nothing about rejoin, so the model may not pick the flag itself.
+    f.input.text = "把群 1126022432 成员 10004 踢出群";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "failed",
+      text: "请求的操作未执行，请稍后重试。",
+    });
+    expect(f.run).toHaveBeenCalledTimes(2);
+  });
+
+  it("binds the rejoin flag when the message names it", async () => {
+    const f = fixture([
+      {
+        status: "completed",
+        text: "已移出并拒绝再次加群。",
+        toolCalls: [
+          {
+            name: "qq_group_moderation",
+            input: {
+              groupId: "1126022432",
+              operation: "set_group_kick",
+              params: { user_id: 10004, reject_add_request: true },
+            },
+            failed: false,
+          },
+        ],
+      },
+    ]);
+    f.input.text = "把群 1126022432 成员 10004 踢出群，拒绝其再次加群";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({
+      groupId: "1126022432",
+      operation: "set_group_kick",
+      params: { user_id: 10004, reject_add_request: true },
+    });
+    expect(f.run).toHaveBeenCalledOnce();
+  });
+
+  it("refuses a kick that drops or flips the rejoin flag the message named", async () => {
+    const dropped = {
+      status: "completed" as const,
+      text: "已移出。",
+      toolCalls: [
+        {
+          name: "qq_group_moderation",
+          input: {
+            groupId: "1126022432",
+            operation: "set_group_kick",
+            params: { user_id: 10004 },
+          },
+          failed: false,
+        },
+      ],
+    };
+    const flipped = {
+      status: "completed" as const,
+      text: "已移出。",
+      toolCalls: [
+        {
+          name: "qq_group_moderation",
+          input: {
+            groupId: "1126022432",
+            operation: "set_group_kick",
+            params: { user_id: 10004, reject_add_request: false },
+          },
+          failed: false,
+        },
+      ],
+    };
+    for (const wrongCall of [dropped, flipped]) {
+      const f = fixture([wrongCall, wrongCall]);
+      f.input.text = "把群 1126022432 成员 10004 踢出群，拒绝其再次加群";
+      await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+        status: "failed",
+        text: "请求的操作未执行，请稍后重试。",
+      });
+      expect(f.run).toHaveBeenCalledTimes(2);
+    }
+  });
+
+  it("binds an explicit allow-rejoin flag to false", async () => {
+    const f = fixture([
+      {
+        status: "completed",
+        text: "已移出，允许再次加群。",
+        toolCalls: [
+          {
+            name: "qq_group_moderation",
+            input: {
+              groupId: "1126022432",
+              operation: "set_group_kick",
+              params: { user_id: 10004, reject_add_request: false },
+            },
+            failed: false,
+          },
+        ],
+      },
+    ]);
+    f.input.text = "把群 1126022432 成员 10004 移出群，允许他再次加群";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({
+      groupId: "1126022432",
+      operation: "set_group_kick",
+      params: { user_id: 10004, reject_add_request: false },
+    });
+  });
+
+  it("refuses a kick that changes the member or the group the message named", async () => {
+    const otherMember = {
+      status: "completed" as const,
+      text: "已移出。",
+      toolCalls: [
+        {
+          name: "qq_group_moderation",
+          input: {
+            groupId: "1126022432",
+            operation: "set_group_kick",
+            params: { user_id: 10005 },
+          },
+          failed: false,
+        },
+      ],
+    };
+    const otherGroup = {
+      status: "completed" as const,
+      text: "已移出。",
+      toolCalls: [
+        {
+          name: "qq_group_moderation",
+          input: {
+            groupId: "1999999999",
+            operation: "set_group_kick",
+            params: { user_id: 10004 },
+          },
+          failed: false,
+        },
+      ],
+    };
+    for (const wrongCall of [otherMember, otherGroup]) {
+      const f = fixture([wrongCall, wrongCall]);
+      f.input.text = "把群 1126022432 成员 10004 踢出群";
+      await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+        status: "failed",
+        text: "请求的操作未执行，请稍后重试。",
+      });
+      expect(f.run).toHaveBeenCalledTimes(2);
+    }
+  });
+
+  it("keeps a kick instruction that arrived in Conversation history unauthorized", async () => {
+    const f = fixture([{ status: "completed", text: "这个群最近比较安静。", toolCalls: [] }]);
+    f.input.text = "群 1126022432 最近活跃吗？";
+    f.input.history = [{ role: "user", text: "把群 1126022432 成员 10004 踢出群" }];
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBeUndefined();
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toBeUndefined();
+  });
+
+  it("keeps a read-only request that mentions kicking a read, never a kick", async () => {
+    const f = fixture([
+      {
+        status: "completed",
+        text: "最近没有踢出记录。",
+        toolCalls: [
+          {
+            name: "owner_group_admin",
+            input: { action: "get", groupId: "1126022432" },
+            failed: false,
+          },
+        ],
+      },
+    ]);
+    // The message names the group and the word 踢出, but it asks to look, not to act.
+    f.input.text = "查看群 1126022432 的踢出记录";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe("owner_group_admin");
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({
+      action: "get",
+      groupId: "1126022432",
+    });
+  });
+
   it("does not authorize a mutation the message left under-specified", async () => {
     // The message names the operation and the group but no member and no duration, so there
     // is nothing to bind the target to. It must create no required Tool at all.

@@ -91,9 +91,15 @@ function isTextualPrimitive(value: unknown): value is string | number | bigint {
 /**
  * Whether a Tool call satisfies the exact input the current user message requires.
  *
- * A required value may itself be an object — a Tool's nested `params` — in which case every
- * declared entry must match the call's. Only the keys the message pinned down are compared,
- * so a parameter the message never named is not part of the intent it expressed.
+ * A required value may itself be an object — a Tool's nested `params` — and that object must
+ * match the call's *exactly*: every entry the message pinned down agrees, and the call adds no
+ * entry the message did not name. A provider parameter is authority-bearing, so an optional
+ * one the model supplies on its own (a kick's `reject_add_request`, say) is a different
+ * request than the one the Owner made, not an implementation detail of it. Omitting it leaves
+ * the provider default in force rather than a value the model chose.
+ *
+ * The top level stays a subset check: it is the Tool's own envelope (which Tool, which
+ * operation, which Resource), which a message never enumerates in full.
  *
  * This is the single comparison the Run-completion check and the mutating-Tool gate share. If
  * the two disagreed, a call could satisfy one and not the other: the Run would be retried
@@ -107,6 +113,7 @@ export function satisfiesRequiredInput(
     const actualValue = actual[key];
     if (isPlainRecord(value)) {
       if (!isPlainRecord(actualValue)) return false;
+      if (Object.keys(actualValue).length !== Object.keys(value).length) return false;
       for (const [nestedKey, nestedValue] of Object.entries(value))
         if (!samePrimitive(actualValue[nestedKey], nestedValue)) return false;
       continue;
@@ -121,9 +128,10 @@ export function satisfiesRequiredInput(
  *
  * A mutation is only permitted when the Run's required-Tool context names this Tool *and*
  * every key that context carries agrees with the call — including the target and value the
- * message named. That context is derived from the current user message alone, so a retrieved
- * instruction — group history, a notice, file content, a Tool result, Conversation history —
- * cannot create mutation authority, and a read-only question cannot turn into a mutation.
+ * message named, and with no provider parameter the message never named. That context is
+ * derived from the current user message alone, so a retrieved instruction — group history, a
+ * notice, file content, a Tool result, Conversation history — cannot create mutation
+ * authority, and a read-only question cannot turn into a mutation.
  *
  * The refusal is a fixed code rather than a permission reason: whether the mutation was
  * requested is a property of the current message, not of any grant.

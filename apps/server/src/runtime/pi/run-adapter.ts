@@ -34,7 +34,7 @@ function namedGroupId(text: string): string | undefined {
  */
 function namedMemberId(text: string): number | undefined {
   const match =
-    /(?:成员|群员|用户|把|将|给|对)\s*(\d{5,15})|(\d{5,15})\s*(?:禁言|闭嘴|踢出|踢掉|踢人|移出群|名片|管理员)/u.exec(
+    /(?:成员|群员|用户|把|将|给|对|踢出|踢掉|踢人|踢了|移出群)\s*(\d{5,15})|(\d{5,15})\s*(?:禁言|闭嘴|踢出|踢掉|踢人|移出群|名片|管理员)/u.exec(
       text,
     );
   const value = match?.[1] ?? match?.[2];
@@ -74,6 +74,24 @@ function namedFlag(text: string): boolean | undefined {
 }
 
 /**
+ * The rejoin flag a kick message names, if it names one.
+ *
+ * `set_group_kick`'s `reject_add_request` is optional at the provider, so the message must say
+ * which value it wants: a kick that blocks rejoin and one that allows it are different
+ * requests. A message that names neither yields `undefined`, and the caller then binds the
+ * member alone — leaving the flag unset so the provider default applies, rather than letting
+ * the model choose a value the Owner never asked for.
+ *
+ * `不拒绝` is tested before `拒绝` and `不允许` before `允许`, since each contains the other.
+ */
+function namedRejectAddRequest(text: string): boolean | undefined {
+  if (/不拒绝/u.test(text)) return false;
+  if (/拒绝|不允许|拉黑/u.test(text)) return true;
+  if (/允许/u.test(text)) return false;
+  return undefined;
+}
+
+/**
  * Mutating QQ domain operations an Owner-private message can request, with the words that
  * name them and the provider parameters the message must pin down.
  *
@@ -88,9 +106,11 @@ function namedFlag(text: string): boolean | undefined {
  * member A for 60 seconds cannot authorize muting member B for another duration.
  *
  * An operation is listed only when the message can pin down both its target and its value.
- * `set_group_kick` (whose `reject_add_request` flag the message never names) and
- * `upload_group_file` (whose source path no chat message carries) are deliberately absent:
- * with no derivable target there is nothing to bind, so those mutations stay unauthorized.
+ * `set_group_kick` qualifies: the member comes from the message, and its optional
+ * `reject_add_request` flag is bound only when the message names it, so an unstated flag
+ * stays at the provider default instead of a value the model chose. `upload_group_file` is
+ * not listed — and is no longer on the capability surface at all, because its `file`
+ * parameter is a local server path with no Asset-mediated upload boundary to authorize it.
  *
  * Order matters — a more specific phrase must precede a broader one that contains it
  * (`全员禁言` before `禁言`, `群名片` before `群名`).
@@ -123,6 +143,21 @@ export const MUTATION_REQUESTS: readonly {
       const duration = namedDuration(text);
       if (user_id === undefined || duration === undefined) return undefined;
       return { user_id, duration };
+    },
+  },
+  {
+    tool: "qq_group_moderation",
+    operation: "set_group_kick",
+    words: /踢出|踢掉|踢人|踢了|移出群/iu,
+    params: (text): RequiredMutationParams => {
+      const user_id = namedMemberId(text);
+      if (user_id === undefined) return undefined;
+      // The flag is bound only when the message names it. When it does not, the required
+      // params carry the member alone, so a call that adds the flag is a different request
+      // and the provider default stands.
+      const reject = namedRejectAddRequest(text);
+      if (reject === undefined) return { user_id };
+      return { user_id, reject_add_request: reject };
     },
   },
   {

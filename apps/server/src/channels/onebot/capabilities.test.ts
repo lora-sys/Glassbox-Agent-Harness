@@ -104,6 +104,23 @@ describe("QQ capability registry", () => {
     expect(qqCapability("qq_groups")!.operations[0]!.params).toEqual(["group_id"]);
   });
 
+  it("keeps group file upload off the model surface until an Asset upload path exists", () => {
+    // `upload_group_file` takes a local server filesystem path. P4B authorizes the group
+    // Resource only, with no Asset or file Resource and no approved upload staging boundary,
+    // so a remote Owner message naming a path would be an authorization gap. The action is
+    // classified as server-only/deferred rather than silently dropped, so the drift check
+    // knows it is a real provider action Glassbox deliberately withholds.
+    expect(SERVER_ONLY_NAPCAT_ACTIONS).toContain("upload_group_file");
+    expect(isAllowedNapCatAction("upload_group_file")).toBe(false);
+    const fileOps = qqCapability("qq_group_file_ops")!;
+    expect(fileOps.operations.map((op) => op.action)).not.toContain("upload_group_file");
+    // The group file mutations whose parameters are group-scoped ids remain allowlisted.
+    expect(fileOps.operations.map((op) => op.action).sort()).toEqual([
+      "create_group_file_folder",
+      "delete_group_file",
+    ]);
+  });
+
   it("derives the allowlist from the registry with no overlap with server-only actions", () => {
     const fromRegistry = new Set(
       QQ_CAPABILITIES.flatMap((capability) =>
@@ -152,6 +169,11 @@ describe("QQ capability registry", () => {
   it("fails the drift check when the pinned provider contract no longer matches", () => {
     const pinned = [...NAPCAT_CONTRACT_SNAPSHOT.allowlistedActions];
     expect(checkNapCatContract(pinned)).toEqual({ ok: true });
+
+    // A deliberately deferred provider action is classified, so observing it is not drift.
+    // It stays off the allowlist, which is what keeps it unreachable from the model.
+    expect(checkNapCatContract([...pinned, "upload_group_file"])).toEqual({ ok: true });
+    expect(isAllowedNapCatAction("upload_group_file")).toBe(false);
 
     // A provider release that renames or drops a snapshotted action is drift.
     const missing = pinned.filter((action) => action !== "get_group_member_list");

@@ -18,9 +18,13 @@
  *  - Policy (the Owner's intent) and grants (authority) are both required. Enabling a
  *    category for a group never creates a grant, and a grant never enables a category.
  *  - A mutating capability additionally requires the current user message to have asked for
- *    that exact operation on that exact group, so retrieved text cannot become authority.
+ *    that exact operation on that exact group with exactly the parameters it named, so
+ *    retrieved text cannot become authority and the model cannot add an optional provider
+ *    parameter the message left unstated.
  *  - Only operations declared on the capability are reachable, so credential, packet,
- *    transport, restart and raw-send primitives have no path to the model.
+ *    transport, restart and raw-send primitives have no path to the model — nor does an
+ *    operation whose parameters have no authorization boundary, such as `upload_group_file`,
+ *    whose `file` is a local server path.
  */
 
 import { Type } from "typebox";
@@ -214,10 +218,11 @@ export function createCapabilityTools(options: {
           throw new ToolInputError("capability_category_disabled");
 
         // A mutating capability additionally requires that the *current user message* asked
-        // for this exact operation on this exact group, with the target and value it named.
-        // Retrieved text cannot supply that. The compared parameters are the model-supplied
-        // provider parameters — the server-derived `group_id` is not one of them, so the
-        // message never has to (and cannot) restate the group the Run already bound.
+        // for this exact operation on this exact group, with exactly the provider parameters
+        // it named — an optional flag the message left unstated cannot be supplied by the
+        // model. Retrieved text cannot supply that either. The compared parameters are the
+        // model-supplied provider parameters — the server-derived `group_id` is not one of
+        // them, so the message never has to (and cannot) restate the group the Run bound.
         if (capability.risk !== "read")
           requireMutationIntent(context, capability.tool, {
             groupId: groupId!,
