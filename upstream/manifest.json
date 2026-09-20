@@ -11,6 +11,17 @@
     "phase": "P3 QQ Gateway"
   },
   {
+    "repo": "HKUDS/MGP",
+    "url": "https://github.com/HKUDS/MGP.git",
+    "directory": "upstream/repos/MGP",
+    "head_sha": "54ce6c00e3d0aa731ecbe17e74407cbbb5a96f10",
+    "license_file": "upstream/repos/MGP/LICENSE",
+    "license_id": "MIT",
+    "license_status": "file_verified",
+    "purpose": "Governed Memory contracts, candidates, evidence, lifecycle, recall and search-result schemas",
+    "phase": "P4 Memory and Retrieval"
+  },
+  {
     "repo": "openfga/openfga",
     "url": "https://github.com/openfga/openfga.git",
     "directory": "upstream/repos/openfga",
