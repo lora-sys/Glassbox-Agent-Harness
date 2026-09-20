@@ -28,7 +28,12 @@ import {
   resolveAssignedGroupIds,
   resolveAuthorizedHistorySources,
 } from "../../retrieval/source-resolver.js";
-import { createProtectedTool, type ProtectedToolContext } from "./protected-tools.js";
+import {
+  createProtectedTool,
+  ToolInputError,
+  type ProtectedToolContext,
+} from "./protected-tools.js";
+import type { QqCapabilityCategory } from "../../channels/onebot/capabilities.js";
 import type { PiRunContext } from "./types.js";
 
 export const GROUP_HISTORY_SEARCH_TOOL = "group_history_search";
@@ -109,12 +114,20 @@ export interface HistoryRetrievalEvidence {
   }>;
 }
 
-/** Scope decides which history Tool exists. The model never chooses its own surface. */
+/**
+ * Scope decides which history Tool exists. The model never chooses its own surface.
+ *
+ * A group Run sees the current-group Tool only while the group's own policy still enables
+ * `group.history`. Discovery is a superset of authority, so the grant can stay in place and
+ * the Owner's policy change takes effect on the very next Run without a re-grant.
+ */
 export function availableHistoryToolNames(input: {
   isOwner: boolean;
   chatType: "group" | "private";
+  enabledCategories: readonly QqCapabilityCategory[];
 }): string[] {
-  if (input.chatType === "group") return [GROUP_HISTORY_SEARCH_TOOL];
+  if (input.chatType === "group")
+    return input.enabledCategories.includes("group.history") ? [GROUP_HISTORY_SEARCH_TOOL] : [];
   if (input.isOwner) return [OWNER_HISTORY_SEARCH_TOOL];
   return [];
 }
@@ -156,6 +169,15 @@ export function createHistoryTools(options: {
    * text is never fetched for a group the caller may not read.
    */
   syncGroup?: (groupId: string, context: ProtectedToolContext) => Promise<void>;
+  /**
+   * Durable Owner intent for one group's history class. Not an authorization decision.
+   *
+   * Discovery already narrows the Tool surface, but the surface is computed once per Run:
+   * a policy change between the Run starting and this Tool executing must still refuse, and
+   * a Run that started while history was enabled must not keep the ability to read after it
+   * was disabled.
+   */
+  isHistoryEnabled: (connectionId: string, groupId: string) => Promise<boolean>;
   /** Appends the safe retrieval evidence for one search to durable Trace. */
   recordEvidence?: (
     evidence: HistoryRetrievalEvidence,
@@ -283,7 +305,18 @@ export function createHistoryTools(options: {
         : SCOPE_MISMATCH_RESOURCE,
     authService: options.store.authorization,
     getContext,
-    execute: (params, context) => search(validatedParams(params), context),
+    execute: async (params, context) => {
+      const scope = context.caller.scope;
+      // A non-group scope never reaches here: the Resource gate above denies it first. This
+      // re-reads the Owner's policy at execution time, so a Run that started while history
+      // was enabled cannot read after the Owner disabled it.
+      if (
+        scope.chatType === "group" &&
+        !(await options.isHistoryEnabled(scope.connectionId, scope.chatId))
+      )
+        throw new ToolInputError("history_category_disabled");
+      return search(validatedParams(params), context);
+    },
   });
 
   const ownerTool = createProtectedTool<OwnerHistoryInput, HistorySearchDetails>({

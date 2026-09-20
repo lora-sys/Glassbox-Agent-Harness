@@ -730,3 +730,192 @@ describe("per-Owner managed group assignment", () => {
       expect((await decision(b, action)).decision).toBe("DENY");
   });
 });
+
+/**
+ * The group-Run surface as the real application computes and builds it.
+ *
+ * These tests drive `ManagementApplication` itself rather than the pure helpers, so they
+ * prove the provisioning grants, the discovery candidate list and a real protected Tool call
+ * all agree — which is the product path a helper-only test cannot cover.
+ */
+const groupRun = (app: ManagementApplication) =>
+  app as unknown as {
+    setGroupAccess(
+      context: OwnerContext,
+      input: { groupId: string; enabled: boolean },
+    ): Promise<unknown>;
+    setGroupCategory(
+      context: OwnerContext,
+      input: { groupId: string; category: QqCapabilityCategory; enabled: boolean },
+    ): Promise<unknown>;
+    setGroupHistory(
+      context: OwnerContext,
+      input: { groupId: string; enabled: boolean },
+    ): Promise<unknown>;
+    resolveRunToolNames(context: OwnerContext): Promise<string[]>;
+    createRuntimeTools(getContext: () => OwnerContext | undefined): Array<{
+      name: string;
+      execute(id: string, params: unknown, signal?: AbortSignal): Promise<{ details?: unknown }>;
+    }>;
+  };
+
+/** The read-only capability Tools a configured group Run may use, and the ones it never may. */
+const GROUP_RUN_READ_TOOLS = [
+  "group_history_search",
+  "qq_groups",
+  "qq_group_members",
+  "qq_group_history",
+  "qq_group_content",
+  "qq_group_files",
+] as const;
+const GROUP_RUN_FORBIDDEN_TOOLS = [
+  "qq_group_moderation",
+  "qq_group_settings",
+  "qq_group_file_ops",
+  "qq_capability_search",
+  "qq_account_status",
+] as const;
+
+describe("configured group Run capability authority", () => {
+  const CO_OWNER = "10006";
+  /** The group's numeric provider id, and the canonical string id Glassbox resources use. */
+  const GROUP_ID = 10005;
+  const GROUP = String(GROUP_ID);
+
+  /**
+   * Enables a group for the primary Owner and then runs a real group message in it, so the
+   * caller scope under test is the one the transport produced rather than one the test made up.
+   */
+  async function configuredGroup() {
+    const f = await fixture(
+      async (input) => ({ status: "succeeded", text: `answer:${input.text}` }),
+      { coOwnerId: CO_OWNER },
+    );
+    f.send(1, "owner-a", true, 10002);
+    const ownerA = await f.started.take();
+    await f.reply("answer:owner-a");
+    const a: OwnerContext = {
+      caller: ownerA.caller,
+      conversationId: ownerA.conversation.id,
+      runId: ownerA.run.id,
+    };
+    const application = groupRun(f.app);
+    await application.setGroupAccess(a, { groupId: GROUP, enabled: true });
+    f.send(2, "group-run", false, 10002, GROUP_ID);
+    const run = await f.started.take();
+    await f.reply("answer:group-run");
+    const context: OwnerContext = {
+      caller: run.caller,
+      conversationId: run.conversation.id,
+      runId: run.run.id,
+    };
+    expect(context.caller.scope).toMatchObject({ chatType: "group", chatId: GROUP });
+    return { f, a, application, context };
+  }
+
+  it("discovers only the read-only capabilities for a group Run and calls one for real", async () => {
+    const { application, context } = await configuredGroup();
+
+    const names = await application.resolveRunToolNames(context);
+    expect([...names].sort()).toEqual([...GROUP_RUN_READ_TOOLS].sort());
+    for (const name of GROUP_RUN_FORBIDDEN_TOOLS) expect(names).not.toContain(name);
+
+    // The discovered Tool is not just discoverable: a real call reaches the OneBot peer and
+    // returns the group the Run is bound to, with `group_id` derived server-side.
+    const tools = application.createRuntimeTools(() => context);
+    const groups = tools.find((tool) => tool.name === "qq_groups");
+    if (!groups) throw new Error("missing qq_groups");
+    const result = await groups.execute("call", { operation: "get_group_info" });
+    expect(result.details).toMatchObject({ status: "ok", data: { group_id: Number(GROUP) } });
+  });
+
+  it("denies a group Run mutation even if the Tool is called directly", async () => {
+    const { application, context } = await configuredGroup();
+    const tools = application.createRuntimeTools(() => context);
+    const moderation = tools.find((tool) => tool.name === "qq_group_moderation");
+    if (!moderation) throw new Error("missing qq_group_moderation");
+
+    // The mutating Tool is never part of the group Run's discovered surface...
+    expect(await application.resolveRunToolNames(context)).not.toContain("qq_group_moderation");
+    // ...and calling it anyway is denied on the group Resource, not merely hidden.
+    await expect(
+      moderation.execute("call", {
+        operation: "set_group_whole_ban",
+        params: { enable: true },
+      }),
+    ).rejects.toThrow("Permission denied: no_grant");
+  });
+
+  it("hides and refuses group history on the next Run after the Owner disables it", async () => {
+    const { application, a, context } = await configuredGroup();
+    expect(await application.resolveRunToolNames(context)).toContain("group_history_search");
+    // A Run that starts while history is enabled still holds the Tool.
+    const tools = application.createRuntimeTools(() => context);
+
+    await application.setGroupHistory(a, { groupId: GROUP, enabled: false });
+
+    // The next Run's surface no longer offers either history Tool.
+    const after = await application.resolveRunToolNames(context);
+    expect(after).not.toContain("group_history_search");
+    expect(after).not.toContain("qq_group_history");
+
+    // The earlier Run cannot keep reading: the grant is untouched, so the refusal is the
+    // Owner's policy rather than a missing authority.
+    const historyTool = tools.find((tool) => tool.name === "group_history_search");
+    if (!historyTool) throw new Error("missing group_history_search");
+    await expect(historyTool.execute("call", { query: "anything" })).rejects.toThrow(
+      "history_category_disabled",
+    );
+    const domainHistory = tools.find((tool) => tool.name === "qq_group_history");
+    if (!domainHistory) throw new Error("missing qq_group_history");
+    await expect(
+      domainHistory.execute("call", { operation: "get_group_msg_history" }),
+    ).rejects.toThrow("capability_category_disabled");
+  });
+
+  it("keeps set_history and set_capability(group.history) coherent for the group Run", async () => {
+    const { application, a, context } = await configuredGroup();
+    const surfaces = async () => application.resolveRunToolNames(context);
+    expect(await surfaces()).toContain("group_history_search");
+
+    // Disabling through the capability entry point alone is enough to hide both Tools.
+    await application.setGroupCategory(a, {
+      groupId: GROUP,
+      category: "group.history",
+      enabled: false,
+    });
+    expect(await surfaces()).not.toContain("group_history_search");
+    expect(await surfaces()).not.toContain("qq_group_history");
+
+    // Re-enabling through the history entry point restores the same surface.
+    await application.setGroupHistory(a, { groupId: GROUP, enabled: true });
+    expect(await surfaces()).toContain("group_history_search");
+    expect(await surfaces()).toContain("qq_group_history");
+
+    // And the two entry points agree in the other direction too.
+    await application.setGroupCategory(a, {
+      groupId: GROUP,
+      category: "group.history",
+      enabled: false,
+    });
+    expect(await surfaces()).not.toContain("group_history_search");
+    await application.setGroupCategory(a, {
+      groupId: GROUP,
+      category: "group.history",
+      enabled: true,
+    });
+    expect(await surfaces()).toContain("group_history_search");
+  });
+
+  it("revokes the group Run's capability discovery with the last Owner's assignment", async () => {
+    const { application, a, context } = await configuredGroup();
+    expect(await application.resolveRunToolNames(context)).toContain("qq_groups");
+
+    await application.setGroupAccess(a, { groupId: GROUP, enabled: false });
+
+    // The group-scope grants go with the last assignment, so nothing is discoverable even
+    // though the durable policy row is still there.
+    expect(await application.resolveRunToolNames(context)).not.toContain("qq_groups");
+    expect(await application.resolveRunToolNames(context)).not.toContain("group_history_search");
+  });
+});

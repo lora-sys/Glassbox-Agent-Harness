@@ -50,7 +50,10 @@ import {
 import {
   availableCapabilityToolNames,
   createCapabilityTools,
+  GROUP_RUN_CAPABILITY_CATEGORIES,
 } from "../runtime/pi/capability-tools.js";
+import type { PiRunContext } from "../runtime/pi/types.js";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import {
   DEFAULT_GROUP_CAPABILITY_POLICY,
   enabledCategories,
@@ -314,62 +317,7 @@ export class ManagementApplication {
       kitPath: this.kitLoader.getKitPath(),
       runtimeBaseDir: join(this.options.dataDirectory, "pi"),
       resolveModel: () => configuredPiModel(this.options.models, profileId),
-      createTools: (getContext) => [
-        ...(this.options.ops
-          ? createOpsTools({
-              store: this.store,
-              service: new AuthorizedOpsService(
-                this.store,
-                this.options.ops!.bridge,
-                this.options.ops!.workerPolicy,
-              ),
-              workerTarget: this.options.ops!.workerTarget,
-              getContext,
-            })
-          : []),
-        ...createOwnerTools({
-          store: this.store,
-          getContext,
-          manageGroup: (context, input) => this.manageGroup(context, input),
-        }),
-        ...createSkillTools({
-          store: this.store,
-          loader: this.kitLoader,
-          getContext,
-          isSkillAuthorized: (context, skillName) => this.isSkillAuthorized(context, skillName),
-        }),
-        ...createHistoryTools({
-          store: this.store,
-          archive: this.archive,
-          getContext,
-          syncGroup: async (groupId, context) => {
-            await this.syncGroupHistory(context.caller.scope.connectionId, groupId);
-          },
-          // Safe retrieval evidence: Run, Resource, source kind and id, mode, score, rank and
-          // matched terms — never a snippet or protected message text.
-          recordEvidence: async (evidence, context) => {
-            const cursor = await this.trace.append(context.runId, evidence, "glassbox-retrieval");
-            await this.store.evidence.advanceTrace(context.caller, cursor);
-          },
-        }),
-        ...createCapabilityTools({
-          store: this.store,
-          getContext,
-          // Owner intent, read fresh on every call so a policy change applies at once.
-          isCategoryEnabled: async (connectionId, groupId, category) =>
-            isCategoryEnabled(
-              (await this.store.capabilities.read(connectionId, groupId))?.policy ??
-                DEFAULT_GROUP_CAPABILITY_POLICY,
-              category,
-            ),
-          invoke: async ({ action, params, context }) => {
-            const connection = this.connections.get(context.caller.scope.connectionId);
-            if (!connection) throw new Error("channel_not_connected");
-            return connection.invokeCapability({ action, params });
-          },
-          project: ({ context }) => this.projectManagedGroups(context),
-        }),
-      ],
+      createTools: (getContext) => this.createRuntimeTools(getContext),
       resolveSkillNames: async (context, profile) => {
         if (!context.caller)
           return { names: [], modelVisibleNames: [], policy: { source: "no-caller" } };
@@ -407,50 +355,7 @@ export class ManagementApplication {
             : { source: "kit-profile" },
         };
       },
-      resolveToolNames: async (context) => {
-        if (!context.caller || !context.conversationId || !context.runId) return [];
-        const isOwner = await this.store.identities.isOwner(context.caller.principalId);
-        const scope = context.caller.scope;
-        // The capability surface follows current policy, never a cached bundle: a group Run
-        // sees only what its own group's policy enables, and an Owner-private Run sees the
-        // union over the groups the current Principal is assigned to. Discovery is granted
-        // as a superset, so a policy change applies on the very next Run with no re-grant.
-        const capabilityCategories =
-          scope.chatType === "group"
-            ? enabledCategories(
-                (await this.store.capabilities.read(scope.connectionId, scope.chatId))?.policy,
-              )
-            : isOwner
-              ? await this.assignedCategories(context.caller)
-              : [];
-        const candidates = [
-          ...(context.authorizedSkillNames?.length ? [SKILL_READ_TOOL] : []),
-          ...(isOwner && scope.chatType === "private"
-            ? [...(this.options.ops ? OPS_TOOL_NAMES : []), OWNER_GROUP_ADMIN_TOOL]
-            : []),
-          ...availableHistoryToolNames({
-            isOwner,
-            chatType: scope.chatType,
-          }),
-          ...availableCapabilityToolNames({
-            isOwner,
-            chatType: scope.chatType,
-            enabledCategories: capabilityCategories,
-          }),
-        ];
-        const selected: string[] = [];
-        for (const name of candidates) {
-          const decision = await this.store.authorization.check({
-            caller: context.caller,
-            resourceId: toolResourceId(name),
-            action: TOOL_DISCOVERY_ACTION,
-            conversationId: context.conversationId,
-            runId: context.runId,
-          });
-          if (decision.decision === "ALLOW") selected.push(name);
-        }
-        return selected;
-      },
+      resolveToolNames: (context) => this.resolveRunToolNames(context),
       onEvent: async (event) => {
         const runId =
           event.runId ?? (typeof event.data.runId === "string" ? event.data.runId : undefined);
@@ -470,6 +375,143 @@ export class ManagementApplication {
     });
     this.piAdapters.set(profileId, adapter);
     return adapter;
+  }
+
+  /**
+   * The Runtime Tools every Pi Run receives.
+   *
+   * Extracted from the adapter wiring so a test can build the real Tool surface through the
+   * real application instead of re-deriving it, which is the only way a discovery/execution
+   * test proves the product path rather than the helper.
+   */
+  private createRuntimeTools(getContext: () => PiRunContext | undefined): ToolDefinition[] {
+    return [
+      ...(this.options.ops
+        ? createOpsTools({
+            store: this.store,
+            service: new AuthorizedOpsService(
+              this.store,
+              this.options.ops!.bridge,
+              this.options.ops!.workerPolicy,
+            ),
+            workerTarget: this.options.ops!.workerTarget,
+            getContext,
+          })
+        : []),
+      ...createOwnerTools({
+        store: this.store,
+        getContext,
+        manageGroup: (context, input) => this.manageGroup(context, input),
+      }),
+      ...createSkillTools({
+        store: this.store,
+        loader: this.kitLoader,
+        getContext,
+        isSkillAuthorized: (context, skillName) => this.isSkillAuthorized(context, skillName),
+      }),
+      ...createHistoryTools({
+        store: this.store,
+        archive: this.archive,
+        getContext,
+        isHistoryEnabled: (connectionId, groupId) => this.isHistoryEnabled(connectionId, groupId),
+        syncGroup: async (groupId, context) => {
+          await this.syncGroupHistory(context.caller.scope.connectionId, groupId);
+        },
+        // Safe retrieval evidence: Run, Resource, source kind and id, mode, score, rank and
+        // matched terms — never a snippet or protected message text.
+        recordEvidence: async (evidence, context) => {
+          const cursor = await this.trace.append(context.runId, evidence, "glassbox-retrieval");
+          await this.store.evidence.advanceTrace(context.caller, cursor);
+        },
+      }),
+      ...createCapabilityTools({
+        store: this.store,
+        getContext,
+        // Owner intent, read fresh on every call so a policy change applies at once.
+        isCategoryEnabled: (connectionId, groupId, category) =>
+          this.isCategoryEnabled(connectionId, groupId, category),
+        invoke: async ({ action, params, context }) => {
+          const connection = this.connections.get(context.caller.scope.connectionId);
+          if (!connection) throw new Error("channel_not_connected");
+          return connection.invokeCapability({ action, params });
+        },
+        project: ({ context }) => this.projectManagedGroups(context),
+      }),
+    ];
+  }
+
+  /** One group's durable Owner intent for a capability class. Not an authorization decision. */
+  private async isCategoryEnabled(
+    connectionId: string,
+    groupId: string,
+    category: QqCapabilityCategory,
+  ): Promise<boolean> {
+    return isCategoryEnabled(
+      (await this.store.capabilities.read(connectionId, groupId))?.policy ??
+        DEFAULT_GROUP_CAPABILITY_POLICY,
+      category,
+    );
+  }
+
+  /**
+   * One group's durable Owner intent for history.
+   *
+   * History is a capability category, so this is the same policy read the capability Tools
+   * use. Reading it fresh is what makes `set_history` and `set_capability(group.history)`
+   * agree: both move the same flag, and the next Run and the next execution both see it.
+   */
+  private async isHistoryEnabled(connectionId: string, groupId: string): Promise<boolean> {
+    return this.isCategoryEnabled(connectionId, groupId, "group.history");
+  }
+
+  /**
+   * The Tool names one Run may discover, after each name's discovery grant is checked.
+   *
+   * The capability surface follows current policy, never a cached bundle: a group Run sees
+   * only what its own group's policy enables, and an Owner-private Run sees the union over
+   * the groups the current Principal is assigned to. Discovery is granted as a superset, so
+   * a policy change applies on the very next Run with no re-grant.
+   */
+  private async resolveRunToolNames(context: PiRunContext): Promise<string[]> {
+    if (!context.caller || !context.conversationId || !context.runId) return [];
+    const isOwner = await this.store.identities.isOwner(context.caller.principalId);
+    const scope = context.caller.scope;
+    const capabilityCategories =
+      scope.chatType === "group"
+        ? enabledCategories(
+            (await this.store.capabilities.read(scope.connectionId, scope.chatId))?.policy,
+          )
+        : isOwner
+          ? await this.assignedCategories(context.caller)
+          : [];
+    const candidates = [
+      ...(context.authorizedSkillNames?.length ? [SKILL_READ_TOOL] : []),
+      ...(isOwner && scope.chatType === "private"
+        ? [...(this.options.ops ? OPS_TOOL_NAMES : []), OWNER_GROUP_ADMIN_TOOL]
+        : []),
+      ...availableHistoryToolNames({
+        isOwner,
+        chatType: scope.chatType,
+        enabledCategories: capabilityCategories,
+      }),
+      ...availableCapabilityToolNames({
+        isOwner,
+        chatType: scope.chatType,
+        enabledCategories: capabilityCategories,
+      }),
+    ];
+    const selected: string[] = [];
+    for (const name of candidates) {
+      const decision = await this.store.authorization.check({
+        caller: context.caller,
+        resourceId: toolResourceId(name),
+        action: TOOL_DISCOVERY_ACTION,
+        conversationId: context.conversationId,
+        runId: context.runId,
+      });
+      if (decision.decision === "ALLOW") selected.push(name);
+    }
+    return selected;
   }
 
   private execution(reference: string): RunExecutionAdapter | undefined {
@@ -776,34 +818,45 @@ export class ManagementApplication {
       scope,
       effect: "allow",
     });
-    // A group is a protected history Resource. Bot membership never creates this row:
-    // it exists only for a group Glassbox has configured, and reading it still needs
-    // an explicit history:read grant.
+    // A group is a protected Resource. Bot membership never creates this row: it exists only
+    // for a group Glassbox has configured, and reading it still needs an explicit grant.
     if (scope.chatType === "group") {
+      const groupResource = groupResourceId(scope.chatId);
       await this.store.authorization.registerResource({
-        id: groupResourceId(scope.chatId),
+        id: groupResource,
         kind: "qq_group",
         visibility: "public",
         ifAbsent: true,
       });
-      // A Run inside a configured group may read that same group's history. This is
-      // not implied by bot membership: the grant exists only for a group Glassbox has
-      // configured, and it is scoped to that one group.
-      const existingHistory = await this.store.authorization.check({
-        caller,
-        resourceId: groupResourceId(scope.chatId),
-        action: "history:read",
-      });
-      if (existingHistory.decision !== "ALLOW")
-        await this.store.authorization.grant({
-          principalId,
-          resourceId: groupResourceId(scope.chatId),
-          action: "history:read",
-          scope,
-          effect: "allow",
+      // A Run inside a configured group may read that same group. This is not implied by bot
+      // membership: the grant exists only for a group Glassbox has configured, it is scoped to
+      // that one group, and it covers only the read-only categories. The Run's candidate list
+      // narrows them to the Owner's current policy, and every call is re-authorized.
+      for (const action of this.groupRunReadActions()) {
+        const existing = await this.store.authorization.check({
+          caller,
+          resourceId: groupResource,
+          action,
         });
+        if (existing.decision !== "ALLOW")
+          await this.store.authorization.grant({
+            principalId,
+            resourceId: groupResource,
+            action,
+            scope,
+            effect: "allow",
+          });
+      }
+      // Discovery is a superset of authority, exactly as for the Owner-private scope: the
+      // Run's candidate list narrows it to policy, so a category change applies on the next
+      // Run with no re-grant and a revoked category cannot survive as stale discovery.
+      await this.grantCapabilityDiscovery({ principalId, scope });
     }
-    for (const name of availableHistoryToolNames({ isOwner, chatType: scope.chatType })) {
+    for (const name of availableHistoryToolNames({
+      isOwner,
+      chatType: scope.chatType,
+      enabledCategories: [...QQ_CAPABILITY_CATEGORIES],
+    })) {
       const resourceId = toolResourceId(name);
       await this.store.authorization.registerResource({
         id: resourceId,
@@ -898,6 +951,12 @@ export class ManagementApplication {
    * Resource is still checked at call time. Granting it once per scope means a policy change
    * takes effect on the next Run without a re-grant, and a revoked category cannot survive
    * as stale discovery because the candidate list never includes it.
+   *
+   * The Tool definition is registered `public` for every scope because one Tool name serves
+   * both the Owner-private and the group surface, and authorization denies a *private*
+   * resource in a group context outright — a private registration would make the group Run's
+   * discovery impossible. Visibility is metadata, not authority: the group Run still needs
+   * its own `tool:discover` grant, which is what this method writes.
    */
   private async grantCapabilityDiscovery(input: {
     principalId: string;
@@ -914,8 +973,7 @@ export class ManagementApplication {
       await this.store.authorization.registerResource({
         id: resourceId,
         kind: "tool-definition",
-        visibility: input.scope.chatType === "group" ? "public" : "private",
-        ...(input.scope.chatType === "group" ? {} : { ownerId: OWNER_ID }),
+        visibility: "public",
         ifAbsent: true,
       });
       const existing = await this.store.authorization.check({
@@ -1096,9 +1154,53 @@ export class ManagementApplication {
       agentResourceId(AGENT_ID),
       SKILL_CATALOG_RESOURCE,
       toolResourceId(SKILL_READ_TOOL),
+      // The group Run's Tool discovery is granted as a superset for the same reason the
+      // Owner-private one is, so it is revoked here for the same reason: leaving it behind
+      // would let a re-configured group rediscover a surface it no longer has authority for.
+      ...this.groupRunToolNames().map((name) => toolResourceId(name)),
       groupResource,
     ])
       await this.store.authorization.revokeScope({ principalId, resourceId, scope });
+  }
+
+  /**
+   * The read-only protected Actions a Run inside a configured group may perform on that group.
+   *
+   * Derived from the same category registry the Tools are, so the grant and the Tool surface
+   * cannot drift. Mutation categories are absent from `GROUP_RUN_CAPABILITY_CATEGORIES`, so a
+   * group Run can never acquire one through this path.
+   */
+  private groupRunReadActions(): string[] {
+    return [
+      ...new Set(
+        GROUP_RUN_CAPABILITY_CATEGORIES.flatMap((category) => this.categoryActions(category)),
+      ),
+    ];
+  }
+
+  /**
+   * The capability and history Tools a configured group scope may discover.
+   *
+   * A superset of what any policy enables, matching `grantCapabilityDiscovery`: the Run's
+   * candidate list narrows it to current policy and each call is still re-authorized. It is
+   * computed from the same registries the candidate list uses, so a Tool cannot be
+   * discoverable-but-ungranted or granted-but-undiscoverable.
+   */
+  private groupRunToolNames(): string[] {
+    return [
+      ...new Set([
+        ...availableHistoryToolNames({
+          isOwner: false,
+          chatType: "group",
+          enabledCategories: [...QQ_CAPABILITY_CATEGORIES],
+        }),
+        ...availableCapabilityToolNames({
+          isOwner: false,
+          chatType: "group",
+          enabledCategories: [...QQ_CAPABILITY_CATEGORIES],
+        }),
+      ]),
+    ];
   }
 
   /** Every Owner whose assignment currently covers this group. */

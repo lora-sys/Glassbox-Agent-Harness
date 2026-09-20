@@ -63,14 +63,67 @@ export interface ProtectedToolOptions<
   redactSensitive?: (params: TParams) => Record<string, unknown>;
 }
 
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Whether one primitive the message required and the primitive the call carries are the same.
+ *
+ * A provider parameter is the same parameter whether the model sends `10004` or `"10004"`, so
+ * numbers and numeric strings compare equal. Booleans compare strictly: a string can never
+ * stand in for a flag, because `"false"` is not the `false` the Owner asked for.
+ */
+function samePrimitive(actual: unknown, required: unknown): boolean {
+  if (typeof actual === "boolean" || typeof required === "boolean") return actual === required;
+  if (actual === null || required === null || actual === undefined || required === undefined)
+    return actual === required;
+  if (typeof actual === "object" || typeof required === "object") return false;
+  if (!isTextualPrimitive(actual) || !isTextualPrimitive(required)) return actual === required;
+  return String(actual) === String(required);
+}
+
+/** The primitives a provider parameter may name itself as: a number and its text are one value. */
+function isTextualPrimitive(value: unknown): value is string | number | bigint {
+  return typeof value === "string" || typeof value === "number" || typeof value === "bigint";
+}
+
+/**
+ * Whether a Tool call satisfies the exact input the current user message requires.
+ *
+ * A required value may itself be an object — a Tool's nested `params` — in which case every
+ * declared entry must match the call's. Only the keys the message pinned down are compared,
+ * so a parameter the message never named is not part of the intent it expressed.
+ *
+ * This is the single comparison the Run-completion check and the mutating-Tool gate share. If
+ * the two disagreed, a call could satisfy one and not the other: the Run would be retried
+ * against a gate it cannot pass, or accepted while the Tool itself refuses.
+ */
+export function satisfiesRequiredInput(
+  required: Readonly<Record<string, unknown>>,
+  actual: Readonly<Record<string, unknown>>,
+): boolean {
+  for (const [key, value] of Object.entries(required)) {
+    const actualValue = actual[key];
+    if (isPlainRecord(value)) {
+      if (!isPlainRecord(actualValue)) return false;
+      for (const [nestedKey, nestedValue] of Object.entries(value))
+        if (!samePrimitive(actualValue[nestedKey], nestedValue)) return false;
+      continue;
+    }
+    if (!samePrimitive(actualValue, value)) return false;
+  }
+  return true;
+}
+
 /**
  * Refuses a mutating call the current user message did not ask for.
  *
  * A mutation is only permitted when the Run's required-Tool context names this Tool *and*
- * every key that context carries agrees with the call. That context is derived from the
- * current user message alone, so a retrieved instruction — group history, a notice, file
- * content, a Tool result, Conversation history — cannot create mutation authority, and a
- * read-only question cannot turn into a mutation.
+ * every key that context carries agrees with the call — including the target and value the
+ * message named. That context is derived from the current user message alone, so a retrieved
+ * instruction — group history, a notice, file content, a Tool result, Conversation history —
+ * cannot create mutation authority, and a read-only question cannot turn into a mutation.
  *
  * The refusal is a fixed code rather than a permission reason: whether the mutation was
  * requested is a property of the current message, not of any grant.
@@ -82,10 +135,8 @@ export function requireMutationIntent(
 ): void {
   if (context.requiredToolName !== name) throw new ToolInputError("mutation_not_requested");
   const required = context.requiredToolInput;
-  if (!required) throw new ToolInputError("mutation_not_requested");
-  for (const [key, value] of Object.entries(required)) {
-    if (actual[key] !== value) throw new ToolInputError("mutation_not_requested");
-  }
+  if (!required || !satisfiesRequiredInput(required, actual))
+    throw new ToolInputError("mutation_not_requested");
 }
 
 export function createProtectedTool<

@@ -462,7 +462,11 @@ it("executes an explicit Owner mutation only for the group the message named", a
     const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
     const created = tools(store, accepted, calls, {
       name: "qq_group_moderation",
-      input: { groupId: "100", operation: "set_group_ban" },
+      input: {
+        groupId: "100",
+        operation: "set_group_ban",
+        params: { user_id: 10004, duration: 60 },
+      },
     });
     const moderation = toolByName(created, "qq_group_moderation");
     // Another group is refused: the message named group 100 only.
@@ -484,6 +488,89 @@ it("executes an explicit Owner mutation only for the group the message named", a
       { action: "set_group_ban", params: { user_id: 10004, duration: 60, group_id: 100 } },
     ]);
     expect(result.details).toMatchObject({ action: "set_group_ban" });
+  } finally {
+    await store.close();
+  }
+});
+
+it("refuses a mutation that changes the member or duration the message named", async () => {
+  const { store, accepted } = await fixture();
+  try {
+    await enableCategory(store, "group.moderate");
+    await grantGroupAction(store, "group:moderate");
+    const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
+    // The current message named member 10004 for 60 seconds. Muting a different member, or
+    // the same member for a different duration, is a different mutation.
+    const created = tools(store, accepted, calls, {
+      name: "qq_group_moderation",
+      input: {
+        groupId: "100",
+        operation: "set_group_ban",
+        params: { user_id: 10004, duration: 60 },
+      },
+    });
+    const moderation = toolByName(created, "qq_group_moderation");
+    await expect(
+      call(moderation, {
+        groupId: "100",
+        operation: "set_group_ban",
+        params: { user_id: 10005, duration: 60 },
+      }),
+    ).rejects.toThrow("mutation_not_requested");
+    await expect(
+      call(moderation, {
+        groupId: "100",
+        operation: "set_group_ban",
+        params: { user_id: 10004, duration: 3600 },
+      }),
+    ).rejects.toThrow("mutation_not_requested");
+    expect(calls).toEqual([]);
+    // The exact mutation the message named still executes.
+    await call(moderation, {
+      groupId: "100",
+      operation: "set_group_ban",
+      params: { user_id: 10004, duration: 60 },
+    });
+    expect(calls).toEqual([
+      { action: "set_group_ban", params: { user_id: 10004, duration: 60, group_id: 100 } },
+    ]);
+  } finally {
+    await store.close();
+  }
+});
+
+it("binds the boolean a flag-shaped mutation asked for", async () => {
+  const { store, accepted } = await fixture();
+  try {
+    await enableCategory(store, "group.moderate");
+    await grantGroupAction(store, "group:moderate");
+    const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
+    // The message asked to open whole-group mute, so a call that closes it is refused.
+    const created = tools(store, accepted, calls, {
+      name: "qq_group_moderation",
+      input: {
+        groupId: "100",
+        operation: "set_group_whole_ban",
+        params: { enable: true },
+      },
+    });
+    const moderation = toolByName(created, "qq_group_moderation");
+    await expect(
+      call(moderation, {
+        groupId: "100",
+        operation: "set_group_whole_ban",
+        params: { enable: false },
+      }),
+    ).rejects.toThrow("mutation_not_requested");
+    expect(calls).toEqual([]);
+    await call(moderation, {
+      groupId: "100",
+      operation: "set_group_whole_ban",
+      params: { enable: true },
+    });
+    expect(calls).toEqual([
+      { action: "set_group_whole_ban", params: { enable: true, group_id: 100 } },
+    ]);
   } finally {
     await store.close();
   }

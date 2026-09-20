@@ -7,6 +7,7 @@ import type {
 import { scopeKey } from "../../identity/scope.js";
 import type { QqCapabilityCategory } from "../../channels/onebot/capabilities.js";
 import type { PiRuntimeAdapter, PiRuntimeProfileName } from "./types.js";
+import { satisfiesRequiredInput } from "./protected-tools.js";
 import { OWNER_GROUP_ADMIN_TOOL } from "./owner-tools.js";
 
 interface RequiredToolCall {
@@ -15,17 +16,81 @@ interface RequiredToolCall {
   input: Record<string, unknown>;
 }
 
+/** The provider parameters the current message pins down, or `undefined` when it pins none. */
+type RequiredMutationParams = Record<string, string | number | boolean> | undefined;
+
+/** The group id the current message names, if it names one. */
+function namedGroupId(text: string): string | undefined {
+  const match = /(?:群\s*([1-9]\d{4,15})|([1-9]\d{4,15})\s*群)/u.exec(text);
+  return match?.[1] ?? match?.[2];
+}
+
+/**
+ * The member the current message names.
+ *
+ * A bare number is not enough: a duration, a page count or a file id can look like a QQ id,
+ * so the number must be attached to a member-indicating word. A message that only says
+ * "禁言" names no member, and that is a refusal rather than a guess.
+ */
+function namedMemberId(text: string): number | undefined {
+  const match =
+    /(?:成员|群员|用户|把|将|给|对)\s*(\d{5,15})|(\d{5,15})\s*(?:禁言|闭嘴|踢出|踢掉|踢人|移出群|名片|管理员)/u.exec(
+      text,
+    );
+  const value = match?.[1] ?? match?.[2];
+  return value === undefined ? undefined : Number(value);
+}
+
+/** The mute duration the message names, converted to the seconds the provider expects. */
+function namedDuration(text: string): number | undefined {
+  const match = /(\d{1,9})\s*(秒|分钟|分|小时|时|天)/u.exec(text);
+  if (!match) return undefined;
+  const unit = match[2];
+  const scale =
+    unit === "秒" ? 1 : unit === "天" ? 86_400 : unit === "分钟" || unit === "分" ? 60 : 3_600;
+  return Number(match[1]) * scale;
+}
+
+/** The free text a message names after a "change it to" verb, with quotes and padding removed. */
+function namedText(text: string): string | undefined {
+  const match =
+    /(?:改成|改为|设置为|设为|换成|叫作|叫做|重命名为)\s*["'“”「」『』]?([^"'“”「」『』\s]+)/u.exec(
+      text,
+    );
+  return match?.[1];
+}
+
+/** The identifier a message names right after a file operation word. */
+function namedAfter(text: string, words: RegExp): string | undefined {
+  const match = new RegExp(`(?:${words.source})\\s*["'“”]?([^"'“”\\s]+)`, "u").exec(text);
+  return match?.[1];
+}
+
+/** The boolean a message names for a flag-shaped mutation. */
+function namedFlag(text: string): boolean | undefined {
+  if (/关闭|停用|禁用|取消|撤销|解除/u.test(text)) return false;
+  if (/开启|启用|打开|恢复|设为/u.test(text)) return true;
+  return undefined;
+}
+
 /**
  * Mutating QQ domain operations an Owner-private message can request, with the words that
- * name them.
+ * name them and the provider parameters the message must pin down.
  *
  * This map is the only way a mutating capability Tool becomes callable: without a match
  * there is no required-Tool context, and the Tool refuses. It is read from the *current*
  * user message alone, so an instruction embedded in retrieved group history, a notice, file
  * content, a Tool result or Conversation history can never authorize a mutation.
  *
- * The required input names only parameters the Tool itself declares (`groupId`, `operation`),
- * so the exact call the message asks for is also a call the Tool can actually accept.
+ * The required input names only parameters the Tool itself declares (`groupId`, `operation`,
+ * `params`), so the exact call the message asks for is also a call the Tool can accept. The
+ * `params` entries are the target and value the message named: a message asking to mute
+ * member A for 60 seconds cannot authorize muting member B for another duration.
+ *
+ * An operation is listed only when the message can pin down both its target and its value.
+ * `set_group_kick` (whose `reject_add_request` flag the message never names) and
+ * `upload_group_file` (whose source path no chat message carries) are deliberately absent:
+ * with no derivable target there is nothing to bind, so those mutations stay unauthorized.
  *
  * Order matters — a more specific phrase must precede a broader one that contains it
  * (`全员禁言` before `禁言`, `群名片` before `群名`).
@@ -34,51 +99,80 @@ export const MUTATION_REQUESTS: readonly {
   tool: string;
   operation: string;
   words: RegExp;
+  /**
+   * The provider parameters this message pins down, or `undefined` when it pins too few to
+   * identify the target and value. `undefined` is a refusal, never a fallback.
+   */
+  params: (text: string) => RequiredMutationParams;
 }[] = Object.freeze([
   {
     tool: "qq_group_moderation",
     operation: "set_group_whole_ban",
     words: /全员禁言|全体禁言/iu,
+    params: (text) => {
+      const enable = namedFlag(text);
+      return enable === undefined ? undefined : { enable };
+    },
   },
   {
     tool: "qq_group_moderation",
     operation: "set_group_ban",
     words: /禁言|闭嘴/iu,
-  },
-  {
-    tool: "qq_group_moderation",
-    operation: "set_group_kick",
-    words: /踢出|踢掉|踢人|踢了|移出群/iu,
+    params: (text) => {
+      const user_id = namedMemberId(text);
+      const duration = namedDuration(text);
+      if (user_id === undefined || duration === undefined) return undefined;
+      return { user_id, duration };
+    },
   },
   {
     tool: "qq_group_settings",
     operation: "set_group_card",
     words: /群名片|名片/iu,
+    params: (text) => {
+      const user_id = namedMemberId(text);
+      const card = namedText(text);
+      if (user_id === undefined || card === undefined) return undefined;
+      return { user_id, card };
+    },
   },
   {
     tool: "qq_group_settings",
     operation: "set_group_name",
     words: /群名称|群名|改名/iu,
+    params: (text) => {
+      const group_name = namedText(text);
+      return group_name === undefined ? undefined : { group_name };
+    },
   },
   {
     tool: "qq_group_settings",
     operation: "set_group_admin",
     words: /管理员/iu,
+    params: (text) => {
+      const user_id = namedMemberId(text);
+      const enable = namedFlag(text);
+      if (user_id === undefined || enable === undefined) return undefined;
+      return { user_id, enable };
+    },
   },
   {
     tool: "qq_group_file_ops",
     operation: "create_group_file_folder",
     words: /新建文件夹|建文件夹|创建文件夹/iu,
+    params: (text) => {
+      const name = namedAfter(text, /新建文件夹|建文件夹|创建文件夹/iu);
+      return name === undefined ? undefined : { name };
+    },
   },
   {
     tool: "qq_group_file_ops",
     operation: "delete_group_file",
     words: /删除文件|删文件/iu,
-  },
-  {
-    tool: "qq_group_file_ops",
-    operation: "upload_group_file",
-    words: /上传文件|发文件/iu,
+    params: (text) => {
+      const file_id = namedAfter(text, /删除文件|删文件/iu);
+      return file_id === undefined ? undefined : { file_id };
+    },
   },
 ]);
 
@@ -121,22 +215,27 @@ function requiredToolCall(input: ExecutionInput, isOwner: boolean): RequiredTool
   if (!isOwner || input.caller.scope.chatType !== "private") return undefined;
   const text = input.text;
   if (/不要|别|无需/u.test(text)) return undefined;
-  const groupMatch = /(?:群\s*([1-9]\d{4,15})|([1-9]\d{4,15})\s*群)/u.exec(text);
-  const groupId = groupMatch?.[1] ?? groupMatch?.[2];
+  const groupId = namedGroupId(text);
   if (!groupId) return undefined;
   if (/如何|怎么|能否|是否|可以吗/u.test(text)) return undefined;
   if (/查看|查询|列出|当前|有哪些|状态/u.test(text))
     return { name: OWNER_GROUP_ADMIN_TOOL, input: { action: "get", groupId } };
 
   // A mutating QQ domain operation is named by the current message, together with the group
-  // it targets. The exact operation is part of the required input, so the call cannot
-  // substitute a different operation of the same Tool.
+  // it targets and the target and value it selects. The exact operation and every provider
+  // parameter the message pins down are part of the required input, so the call cannot
+  // substitute a different operation, a different member, a different duration or a different
+  // value. A message that names the operation but not enough to identify its target yields no
+  // required-Tool context at all, and the mutation stays unauthorized.
   const mutation = MUTATION_REQUESTS.find((entry) => entry.words.test(text));
-  if (mutation)
+  if (mutation) {
+    const params = mutation.params(text);
+    if (params === undefined) return undefined;
     return {
       name: mutation.tool,
-      input: { groupId, operation: mutation.operation },
+      input: { groupId, operation: mutation.operation, params },
     };
+  }
 
   const disabled = /关闭|停用|禁用|取消|移除/u.test(text);
   const changeRequested = disabled || /启用|开启|打开|允许|恢复|加入/u.test(text);
@@ -261,13 +360,16 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         context,
       );
       const requiredName = context.requiredToolName;
+      // The same comparison the mutating-Tool gate uses: a call counts as having carried out
+      // the required action only when every key the message pinned down agrees with it. Using
+      // a looser check here would accept a Run whose Tool call the gate had refused.
       const completedRequiredTool = () =>
         required === undefined ||
         result.toolCalls.some(
           (call) =>
             call.name === required.name &&
             call.failed === false &&
-            Object.entries(required.input).every(([key, value]) => call.input[key] === value),
+            satisfiesRequiredInput(required.input, call.input),
         );
       if (result.status === "completed" && !completedRequiredTool() && !input.signal.aborted) {
         result = await this.runtime.run(

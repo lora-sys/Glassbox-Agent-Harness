@@ -146,6 +146,9 @@ const authorizeHistory = (
     effect: "allow",
   });
 
+/** The Owner's durable policy for the group's history class, as the app reads it per call. */
+const historyEnabled = async () => true;
+
 async function accept(
   store: Store,
   scope: typeof group100 | typeof ownerPrivate | typeof coOwnerPrivate,
@@ -197,6 +200,7 @@ it("restricts the current-group tool to the group the Run is in", async () => {
     const tools = createHistoryTools({
       store,
       archive,
+      isHistoryEnabled: historyEnabled,
       getContext: () => ({
         caller: { principalId: "owner", scope: group100 },
         runId: accepted.run.id,
@@ -223,6 +227,7 @@ it("defaults to DENY for the current group without a history:read grant", async 
     const tools = createHistoryTools({
       store,
       archive,
+      isHistoryEnabled: historyEnabled,
       getContext: () => ({
         caller: { principalId: "owner", scope: group100 },
         runId: accepted.run.id,
@@ -250,6 +255,7 @@ it("searches several authorized groups in one Owner-private call", async () => {
     const tools = createHistoryTools({
       store,
       archive,
+      isHistoryEnabled: historyEnabled,
       getContext: () => ({
         caller: { principalId: "owner", scope: ownerPrivate },
         runId: accepted.run.id,
@@ -290,6 +296,7 @@ it("intersects requested filters with the authorized set before loading text", a
     const tools = createHistoryTools({
       store,
       archive,
+      isHistoryEnabled: historyEnabled,
       getContext: () => ({
         caller: { principalId: "owner", scope: ownerPrivate },
         runId: accepted.run.id,
@@ -323,6 +330,7 @@ it("fetches nothing and returns no candidate for an unauthorized group", async (
     const tools = createHistoryTools({
       store,
       archive,
+      isHistoryEnabled: historyEnabled,
       getContext: () => ({
         caller: { principalId: "owner", scope: ownerPrivate },
         runId: accepted.run.id,
@@ -358,6 +366,7 @@ it("stops searching a group once its grant is revoked", async () => {
     const tools = createHistoryTools({
       store,
       archive,
+      isHistoryEnabled: historyEnabled,
       getContext: () => ({
         caller: { principalId: "owner", scope: ownerPrivate },
         runId: accepted.run.id,
@@ -395,6 +404,7 @@ it("keeps one Owner's assigned group set out of another Owner's search", async (
     const tools = createHistoryTools({
       store,
       archive,
+      isHistoryEnabled: historyEnabled,
       getContext: () => ({
         caller: { principalId: "owner-co", scope: coOwnerPrivate },
         runId: accepted.run.id,
@@ -424,6 +434,7 @@ it("records safe retrieval evidence without protected message text", async () =>
     const tools = createHistoryTools({
       store,
       archive,
+      isHistoryEnabled: historyEnabled,
       getContext: () => ({
         caller: { principalId: "owner", scope: ownerPrivate },
         runId: accepted.run.id,
@@ -461,17 +472,104 @@ it("records safe retrieval evidence without protected message text", async () =>
 });
 
 it("keeps the Owner cross-group tool out of the group surface", async () => {
-  // Tool exposure is decided by scope, not by the model. A group Run only ever sees
-  // the current-group tool; only Owner-private sees the cross-group tool.
-  expect(availableHistoryToolNames({ isOwner: true, chatType: "group" })).toEqual([
-    GROUP_HISTORY_SEARCH_TOOL,
-  ]);
-  expect(availableHistoryToolNames({ isOwner: false, chatType: "group" })).toEqual([
-    GROUP_HISTORY_SEARCH_TOOL,
-  ]);
-  expect(availableHistoryToolNames({ isOwner: true, chatType: "private" })).toEqual([
-    OWNER_HISTORY_SEARCH_TOOL,
-  ]);
-  expect(availableHistoryToolNames({ isOwner: false, chatType: "private" })).toEqual([]);
+  // Tool exposure is decided by scope and the group's own policy, not by the model. A group
+  // Run only ever sees the current-group tool, and only while its policy enables history.
+  expect(
+    availableHistoryToolNames({
+      isOwner: true,
+      chatType: "group",
+      enabledCategories: ["group.history"],
+    }),
+  ).toEqual([GROUP_HISTORY_SEARCH_TOOL]);
+  expect(
+    availableHistoryToolNames({
+      isOwner: false,
+      chatType: "group",
+      enabledCategories: ["group.history", "group.members"],
+    }),
+  ).toEqual([GROUP_HISTORY_SEARCH_TOOL]);
+  // The group's own policy decides: history disabled means no group history Tool, even
+  // though the scope's discovery grant is unchanged.
+  expect(
+    availableHistoryToolNames({
+      isOwner: true,
+      chatType: "group",
+      enabledCategories: ["group.members", "group.read"],
+    }),
+  ).toEqual([]);
+  expect(
+    availableHistoryToolNames({ isOwner: true, chatType: "private", enabledCategories: [] }),
+  ).toEqual([OWNER_HISTORY_SEARCH_TOOL]);
+  expect(
+    availableHistoryToolNames({ isOwner: false, chatType: "private", enabledCategories: [] }),
+  ).toEqual([]);
   expect(OWNER_HISTORY_SEARCH_TOOL).not.toBe(GROUP_HISTORY_SEARCH_TOOL);
+});
+
+it("refuses the current-group tool when the Owner disabled history", async () => {
+  const { store, archive } = await fixture();
+  try {
+    // The grant is deliberately left in place — only the Owner's policy changed — so this
+    // proves the refusal comes from policy rather than from a missing authority.
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: groupResourceId("100"),
+      action: "history:read",
+      scope: group100,
+      effect: "allow",
+    });
+    const accepted = await accept(store, group100);
+    const tools = createHistoryTools({
+      store,
+      archive,
+      isHistoryEnabled: async () => false,
+      getContext: () => ({
+        caller: { principalId: "owner", scope: group100 },
+        runId: accepted.run.id,
+        conversationId: accepted.conversation.id,
+      }),
+    });
+
+    await expect(
+      call(toolByName(tools, GROUP_HISTORY_SEARCH_TOOL), { query: "deploy" }),
+    ).rejects.toThrow("history_category_disabled");
+  } finally {
+    await store.close();
+  }
+});
+
+it("re-reads the Owner's policy so a Run cannot read after history is disabled", async () => {
+  const { store, archive } = await fixture();
+  try {
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: groupResourceId("100"),
+      action: "history:read",
+      scope: group100,
+      effect: "allow",
+    });
+    const accepted = await accept(store, group100);
+    let enabled = true;
+    const tools = createHistoryTools({
+      store,
+      archive,
+      isHistoryEnabled: async () => enabled,
+      getContext: () => ({
+        caller: { principalId: "owner", scope: group100 },
+        runId: accepted.run.id,
+        conversationId: accepted.conversation.id,
+      }),
+    });
+    const tool = toolByName(tools, GROUP_HISTORY_SEARCH_TOOL);
+
+    const before = await call(tool, { query: "deploy rollback" });
+    expect((before.details as { groups: string[] }).groups).toEqual(["100"]);
+
+    enabled = false;
+    await expect(call(tool, { query: "deploy rollback" })).rejects.toThrow(
+      "history_category_disabled",
+    );
+  } finally {
+    await store.close();
+  }
 });

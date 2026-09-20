@@ -214,13 +214,15 @@ export function createCapabilityTools(options: {
           throw new ToolInputError("capability_category_disabled");
 
         // A mutating capability additionally requires that the *current user message* asked
-        // for this exact operation on this exact group. Retrieved text cannot supply that.
-        // The required keys are the Tool's own parameters, so the exact call the message
-        // asks for is a call this Tool can accept.
+        // for this exact operation on this exact group, with the target and value it named.
+        // Retrieved text cannot supply that. The compared parameters are the model-supplied
+        // provider parameters — the server-derived `group_id` is not one of them, so the
+        // message never has to (and cannot) restate the group the Run already bound.
         if (capability.risk !== "read")
           requireMutationIntent(context, capability.tool, {
             groupId: groupId!,
             operation: action,
+            params: supplied,
           });
 
         return options.invoke({ capability, action, params: providerParams, context });

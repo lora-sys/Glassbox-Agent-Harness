@@ -300,11 +300,13 @@ describe("mutation intent comes only from the current user message", () => {
       text: "已禁言。",
     });
     // The required input names only the Tool's own parameters, so the exact call the message
-    // asks for is a call the Tool can accept and the run is not failed closed.
+    // asks for is a call the Tool can accept and the run is not failed closed. It also names
+    // the member and the duration the message selected, so a call cannot mute someone else.
     expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe("qq_group_moderation");
     expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({
       groupId: "1126022432",
       operation: "set_group_ban",
+      params: { user_id: 10004, duration: 60 },
     });
     expect(f.run).toHaveBeenCalledOnce();
   });
@@ -333,6 +335,192 @@ describe("mutation intent comes only from the current user message", () => {
     expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({
       groupId: "1126022432",
       operation: "set_group_card",
+      params: { user_id: 10004, card: "回归测试" },
     });
+  });
+
+  it("refuses a mute that changes the member or the duration the message named", async () => {
+    // The message names member 10004 for 60 seconds. Muting 10005, or 10004 for a different
+    // duration, is a different mutation and must not be satisfied by this intent.
+    const otherMember = {
+      status: "completed" as const,
+      text: "已禁言。",
+      toolCalls: [
+        {
+          name: "qq_group_moderation",
+          input: {
+            groupId: "1126022432",
+            operation: "set_group_ban",
+            params: { user_id: 10005, duration: 60 },
+          },
+          failed: false,
+        },
+      ],
+    };
+    const otherDuration = {
+      status: "completed" as const,
+      text: "已禁言。",
+      toolCalls: [
+        {
+          name: "qq_group_moderation",
+          input: {
+            groupId: "1126022432",
+            operation: "set_group_ban",
+            params: { user_id: 10004, duration: 3600 },
+          },
+          failed: false,
+        },
+      ],
+    };
+    for (const wrongCall of [otherMember, otherDuration]) {
+      const f = fixture([wrongCall, wrongCall]);
+      f.input.text = "把群 1126022432 的成员 10004 禁言 60 秒";
+      await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+        status: "failed",
+        text: "请求的操作未执行，请稍后重试。",
+      });
+      expect(f.run).toHaveBeenCalledTimes(2);
+    }
+  });
+
+  it("refuses a rename that changes the name the message named", async () => {
+    const wrongName = {
+      status: "completed" as const,
+      text: "群名已更新。",
+      toolCalls: [
+        {
+          name: "qq_group_settings",
+          input: {
+            groupId: "1126022432",
+            operation: "set_group_name",
+            params: { group_name: "别的名字" },
+          },
+          failed: false,
+        },
+      ],
+    };
+    const f = fixture([wrongName, wrongName]);
+    f.input.text = "把群 1126022432 的群名改成 回归测试群";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "failed",
+      text: "请求的操作未执行，请稍后重试。",
+    });
+    expect(f.run).toHaveBeenCalledTimes(2);
+  });
+
+  it("accepts the rename the message named and records the exact new name", async () => {
+    const f = fixture([
+      {
+        status: "completed",
+        text: "群名已更新。",
+        toolCalls: [
+          {
+            name: "qq_group_settings",
+            input: {
+              groupId: "1126022432",
+              operation: "set_group_name",
+              params: { group_name: "回归测试群" },
+            },
+            failed: false,
+          },
+        ],
+      },
+    ]);
+    f.input.text = "把群 1126022432 的群名改成 回归测试群";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({
+      groupId: "1126022432",
+      operation: "set_group_name",
+      params: { group_name: "回归测试群" },
+    });
+  });
+
+  it("binds the boolean a whole-group mute asked for", async () => {
+    const disabled = {
+      status: "completed" as const,
+      text: "已关闭全员禁言。",
+      toolCalls: [
+        {
+          name: "qq_group_moderation",
+          input: {
+            groupId: "1126022432",
+            operation: "set_group_whole_ban",
+            params: { enable: false },
+          },
+          failed: false,
+        },
+      ],
+    };
+    const f = fixture([disabled, disabled]);
+    // The message asks to *open* whole-group mute; a call that closes it is a different
+    // mutation and must not be authorized by this intent.
+    f.input.text = "开启群 1126022432 的全员禁言";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "failed",
+      text: "请求的操作未执行，请稍后重试。",
+    });
+    expect(f.run).toHaveBeenCalledTimes(2);
+
+    const enabled = fixture([
+      {
+        status: "completed",
+        text: "已开启全员禁言。",
+        toolCalls: [
+          {
+            name: "qq_group_moderation",
+            input: {
+              groupId: "1126022432",
+              operation: "set_group_whole_ban",
+              params: { enable: true },
+            },
+            failed: false,
+          },
+        ],
+      },
+    ]);
+    enabled.input.text = "开启群 1126022432 的全员禁言";
+    await expect(enabled.executor.execute(enabled.input)).resolves.toMatchObject({
+      status: "succeeded",
+    });
+    expect(enabled.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({
+      groupId: "1126022432",
+      operation: "set_group_whole_ban",
+      params: { enable: true },
+    });
+  });
+
+  it("does not authorize a mutation the message left under-specified", async () => {
+    // The message names the operation and the group but no member and no duration, so there
+    // is nothing to bind the target to. It must create no required Tool at all.
+    const f = fixture([{ status: "completed", text: "需要指定成员和时长。", toolCalls: [] }]);
+    f.input.text = "把群 1126022432 里的成员禁言一下";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBeUndefined();
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toBeUndefined();
+  });
+
+  it("refuses a capability mutation on a different group than the message named", async () => {
+    const wrongGroup = {
+      status: "completed" as const,
+      text: "已禁言。",
+      toolCalls: [
+        {
+          name: "qq_group_moderation",
+          input: {
+            groupId: "1999999999",
+            operation: "set_group_ban",
+            params: { user_id: 10004, duration: 60 },
+          },
+          failed: false,
+        },
+      ],
+    };
+    const f = fixture([wrongGroup, wrongGroup]);
+    f.input.text = "把群 1126022432 的成员 10004 禁言 60 秒";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "failed",
+      text: "请求的操作未执行，请稍后重试。",
+    });
+    expect(f.run).toHaveBeenCalledTimes(2);
   });
 });
