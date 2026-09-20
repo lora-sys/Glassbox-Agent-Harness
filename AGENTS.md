@@ -189,11 +189,14 @@ When a requirement is ambiguous, choose the smaller implementation that preserve
 
 Do not silently expand scope from the roadmap.
 
-The only active implementation plan is:
+The active implementation plans are the intentionally parallel P4 streams:
 
 ```text
-.plans/03-personal-agent-foundation.md
+.plans/04a-memory-taste.md
+.plans/04b-authorized-retrieval-history.md
 ```
+
+P3 is complete. P4A and P4B have separate ownership, Issues and later PRs. Work inside the plan you own and do not silently absorb the sibling stream.
 
 Read in this order before changing code:
 
@@ -208,7 +211,9 @@ Read in this order before changing code:
 
 | Topic | Source of truth |
 | --- | --- |
-| Current implementation order, slices, completion gate, acceptance matrix | `.plans/03-personal-agent-foundation.md` |
+| P4A Memory / Taste implementation order and completion gate | `.plans/04a-memory-taste.md` and Issue #9 |
+| P4B retrieval / QQ history implementation order and completion gate | `.plans/04b-authorized-retrieval-history.md` and Issue #10 |
+| Completed P3 trust / QQ / Agent Ops foundation | `.plans/03-personal-agent-foundation.md` |
 | Product sequencing after the active Plan | `.plans/roadmap.md` |
 | Runtime ownership and Pi SDK boundary | `docs/runtime-strategy.md` |
 | Lora PI Kit distribution, bundled Skills, MCP, profiles, install, locks | `docs/lora-pi-kit.md` |
