@@ -167,7 +167,7 @@ real QQ + Herdr acceptance
 
 P3 does not become the full LongTask engine.
 
-See the active Plan for exact slices and the completion gate.
+See the retained P3 Plan for its exact slices and completion gate.
 
 ### P4 — Memory / Taste and Authorized Retrieval
 
