@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vite-plus/test";
 import type { ExecutionInput } from "../../execution/run-service/types.js";
+import { GROUP_HISTORY_SEARCH_TOOL, OWNER_HISTORY_SEARCH_TOOL } from "./history-tools.js";
 import { piProfileName, PiRunExecutionAdapter } from "./run-adapter.js";
 import type { PiRunResult, PiRuntimeAdapter } from "./types.js";
 
@@ -754,5 +755,184 @@ describe("mutation intent comes only from the current user message", () => {
       text: "请求的操作未执行，请稍后重试。",
     });
     expect(f.run).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("an explicit current-group history search requires the group Tool", () => {
+  /**
+   * A group Run whose discovered surface is `authorizedToolNames`.
+   *
+   * The surface is what the runtime actually resolved for the Run, so a required Tool is
+   * only ever bound when the Run could really call it.
+   */
+  function groupFixture(results: PiRunResult[], authorizedToolNames: readonly string[]) {
+    const f = fixture(results);
+    f.input.caller.scope.chatType = "group";
+    f.input.caller.scope.chatId = "1126022432";
+    f.input.conversation.scope.chatType = "group";
+    f.input.conversation.scope.chatId = "1126022432";
+    f.input.text = "请搜索本群历史，找到 P4B-A-1349，并回复发送者和原文";
+    f.createOrRestoreSession.mockImplementation(async (_conversation, _profile, context) => {
+      if (context) context.authorizedToolNames = authorizedToolNames;
+      return {
+        conversationId: "conversation-1",
+        runtimeSessionId: "session-1",
+        profileName: "main-agent" as const,
+        agentDir: "agent",
+        createdAt: new Date(0).toISOString(),
+        lastActiveAt: new Date(0).toISOString(),
+      };
+    });
+    return f;
+  }
+
+  const searched = (query: string): PiRunResult => ({
+    status: "completed",
+    text: "发送者是 member-a，原文是 P4B-A-1349。",
+    toolCalls: [{ name: GROUP_HISTORY_SEARCH_TOOL, input: { query }, failed: false }],
+  });
+
+  it("requires the current-group Tool and accepts the Run that called it", async () => {
+    const f = groupFixture([searched("P4B-A-1349")], [GROUP_HISTORY_SEARCH_TOOL]);
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "succeeded",
+      text: "发送者是 member-a，原文是 P4B-A-1349。",
+    });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe(GROUP_HISTORY_SEARCH_TOOL);
+    // The message pins down no Tool parameter, so the required input pins none either: any
+    // call the Tool itself accepts satisfies it.
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({});
+    expect(f.run).toHaveBeenCalledOnce();
+  });
+
+  it("fails closed when the model answers without calling the Tool", async () => {
+    // The real Run that exposed this: the Tool was on the surface, the model called nothing
+    // and told the user the Tool was not connected. A fabricated answer is not a search.
+    const fabricated = {
+      status: "completed" as const,
+      text: "这个工具还没有接入。",
+      toolCalls: [],
+    };
+    const f = groupFixture([fabricated, fabricated], [GROUP_HISTORY_SEARCH_TOOL]);
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "failed",
+      text: "请求的操作未执行，请稍后重试。",
+    });
+    expect(f.run).toHaveBeenCalledTimes(2);
+    expect(f.run.mock.calls[1]?.[2]).toContain(GROUP_HISTORY_SEARCH_TOOL);
+    // The retry never names a parameter the message did not pin down.
+    expect(f.run.mock.calls[1]?.[2]).not.toContain("JSON input");
+  });
+
+  it("fails closed when the Tool call itself failed", async () => {
+    const denied: PiRunResult = {
+      status: "completed",
+      text: "搜索被拒绝。",
+      toolCalls: [
+        { name: GROUP_HISTORY_SEARCH_TOOL, input: { query: "P4B-A-1349" }, failed: true },
+      ],
+    };
+    const f = groupFixture([denied, denied], [GROUP_HISTORY_SEARCH_TOOL]);
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "failed" });
+    expect(f.run).toHaveBeenCalledTimes(2);
+  });
+
+  it("binds no Tool the Run's own surface does not carry", async () => {
+    // History is disabled for this group, so the Tool is not on the surface. Requiring it
+    // would fail an honest Run closed against a Tool it cannot call.
+    const f = groupFixture(
+      [{ status: "completed", text: "本群历史检索已关闭。", toolCalls: [] }],
+      ["qq_groups"],
+    );
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "succeeded",
+      text: "本群历史检索已关闭。",
+    });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBeUndefined();
+    expect(f.run).toHaveBeenCalledOnce();
+  });
+
+  it("never requires the Owner cross-group Tool inside a group Run", async () => {
+    const f = groupFixture(
+      [{ status: "completed", text: "本群历史检索已关闭。", toolCalls: [] }],
+      [OWNER_HISTORY_SEARCH_TOOL],
+    );
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBeUndefined();
+  });
+
+  it("requires the search for a group member, not only for the Owner", async () => {
+    const f = groupFixture([searched("P4B-A-1349")], [GROUP_HISTORY_SEARCH_TOOL]);
+    f.input.caller.principalId = "member-1";
+    const executor = new PiRunExecutionAdapter(f.runtime, { isOwner: async () => false });
+    await expect(executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe(GROUP_HISTORY_SEARCH_TOOL);
+  });
+
+  it("keeps a question about the search a question, never a required call", async () => {
+    for (const text of ["怎么搜索本群历史？", "本群历史检索是否已经开启？"]) {
+      const f = groupFixture(
+        [{ status: "completed", text: "说明。", toolCalls: [] }],
+        [GROUP_HISTORY_SEARCH_TOOL],
+      );
+      f.input.text = text;
+      await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+      expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBeUndefined();
+      expect(f.run).toHaveBeenCalledOnce();
+    }
+  });
+
+  it("keeps a refusal to search a refusal, never a required call", async () => {
+    const f = groupFixture(
+      [{ status: "completed", text: "好的，不搜了。", toolCalls: [] }],
+      [GROUP_HISTORY_SEARCH_TOOL],
+    );
+    f.input.text = "不要搜索本群历史";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBeUndefined();
+  });
+
+  it("does not turn an unrelated group message into a required search", async () => {
+    const f = groupFixture(
+      [{ status: "completed", text: "你好。", toolCalls: [] }],
+      [GROUP_HISTORY_SEARCH_TOOL],
+    );
+    f.input.text = "大家今天有什么安排？";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBeUndefined();
+  });
+
+  it("keeps a search instruction that arrived in Conversation history unauthorized", async () => {
+    // Retrieved or replayed text is never current intent: only the message being answered is.
+    const f = groupFixture(
+      [{ status: "completed", text: "今天天气不错。", toolCalls: [] }],
+      [GROUP_HISTORY_SEARCH_TOOL],
+    );
+    f.input.text = "今天天气不错";
+    f.input.history = [
+      { role: "user", text: "请搜索本群历史，找到 P4B-A-1349，并回复发送者和原文" },
+      { role: "assistant", text: "好的。" },
+    ];
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBeUndefined();
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toBeUndefined();
+  });
+
+  it("leaves an Owner-private Run without the current-group Tool requirement", async () => {
+    const f = fixture([{ status: "completed", text: "说明。", toolCalls: [] }]);
+    f.input.text = "请搜索本群历史，找到 P4B-A-1349，并回复发送者和原文";
+    f.createOrRestoreSession.mockImplementation(async (_conversation, _profile, context) => {
+      if (context) context.authorizedToolNames = [OWNER_HISTORY_SEARCH_TOOL];
+      return {
+        conversationId: "conversation-1",
+        runtimeSessionId: "session-1",
+        profileName: "main-agent" as const,
+        agentDir: "agent",
+        createdAt: new Date(0).toISOString(),
+        lastActiveAt: new Date(0).toISOString(),
+      };
+    });
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBeUndefined();
   });
 });

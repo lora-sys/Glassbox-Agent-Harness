@@ -1,4 +1,5 @@
 import { expect, it, vi } from "vite-plus/test";
+import { createQqDeliveryPolicy } from "../../delivery/content-policy.js";
 import { openDomainStore } from "../../persistence/index.js";
 import { ChannelArchiveStore } from "../../retrieval/channel-archive.js";
 import { groupResourceId } from "../../retrieval/source-resolver.js";
@@ -569,6 +570,241 @@ it("re-reads the Owner's policy so a Run cannot read after history is disabled",
     await expect(call(tool, { query: "deploy rollback" })).rejects.toThrow(
       "history_category_disabled",
     );
+  } finally {
+    await store.close();
+  }
+});
+
+const UUID_PATTERN =
+  /\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/iu;
+
+/** The text the model actually receives, which is what a Tool result is judged on. */
+async function callModelVisible(
+  tool: { execute: (...args: never[]) => unknown },
+  params: Record<string, unknown>,
+): Promise<{ text: string; details: unknown }> {
+  const result = (await (
+    tool.execute as unknown as (
+      id: string,
+      p: unknown,
+      s?: AbortSignal,
+      u?: unknown,
+      c?: unknown,
+    ) => Promise<{ content: Array<{ type: string; text: string }>; details?: unknown }>
+  )("call", params, undefined, undefined, {} as never)) as {
+    content: Array<{ type: string; text: string }>;
+    details?: unknown;
+  };
+  return {
+    text: result.content.map((part) => part.text).join(""),
+    details: result.details,
+  };
+}
+
+/** One group Run that may read its own group's history. */
+async function groupRunTools(
+  store: Store,
+  archive: Awaited<ReturnType<typeof fixture>>["archive"],
+) {
+  await store.authorization.grant({
+    principalId: "owner",
+    resourceId: groupResourceId("100"),
+    action: "history:read",
+    scope: group100,
+    effect: "allow",
+  });
+  const accepted = await accept(store, group100);
+  return createHistoryTools({
+    store,
+    archive,
+    isHistoryEnabled: historyEnabled,
+    getContext: () => ({
+      caller: { principalId: "owner", scope: group100 },
+      runId: accepted.run.id,
+      conversationId: accepted.conversation.id,
+    }),
+  });
+}
+
+it("gives the model the authorized sender and the original text of a hit", async () => {
+  const { store, archive } = await fixture();
+  try {
+    const tools = await groupRunTools(store, archive);
+    const { text } = await callModelVisible(toolByName(tools, GROUP_HISTORY_SEARCH_TOOL), {
+      query: "deploy rollback",
+    });
+    const view = JSON.parse(text) as {
+      groups: string[];
+      results: Array<{ groupId: string; sender?: string; text: string; rank: number }>;
+    };
+    // The real request asked for 发送者和原文; both must be answerable from the Tool result.
+    expect(view.results).toHaveLength(1);
+    expect(view.results[0]).toMatchObject({ groupId: "100", sender: "member-a", rank: 1 });
+    expect(view.results[0]?.text).toContain("plan alpha");
+    expect(view.groups).toEqual(["100"]);
+  } finally {
+    await store.close();
+  }
+});
+
+it("keeps internal identifiers out of the model-visible retrieval result", async () => {
+  const { store, archive } = await fixture();
+  try {
+    const records = await archive.searchMessages({ allowedGroupIds: ["100"] });
+    const archiveRecordId = records[0]!.id;
+    const tools = await groupRunTools(store, archive);
+    const { text, details } = await callModelVisible(toolByName(tools, GROUP_HISTORY_SEARCH_TOOL), {
+      query: "deploy rollback",
+    });
+
+    // The archive record id and the Run id are implementation identifiers: the model has no
+    // use for them, and a model that copies one into an answer produces output the Delivery
+    // Gate must refuse. Neither may reach model-visible text.
+    expect(text).not.toContain(archiveRecordId);
+    expect(text).not.toMatch(UUID_PATTERN);
+    expect(text).not.toContain("resourceId");
+    expect(text).not.toContain("group:");
+    expect(text).not.toContain("runId");
+    // The structured detail keeps the identifiers for logs and UI; it is not model-visible.
+    expect(JSON.stringify(details)).toContain(archiveRecordId);
+  } finally {
+    await store.close();
+  }
+});
+
+it("produces a result the QQ Delivery Gate accepts, where the raw detail is refused", async () => {
+  const { store, archive } = await fixture();
+  try {
+    const tools = await groupRunTools(store, archive);
+    const { text, details } = await callModelVisible(toolByName(tools, GROUP_HISTORY_SEARCH_TOOL), {
+      query: "deploy rollback",
+    });
+    const policy = createQqDeliveryPolicy();
+    const view = JSON.parse(text) as {
+      results: Array<{ sender?: string; text: string }>;
+    };
+    const hit = view.results[0]!;
+    const answer = `这条消息的发送者是 ${hit.sender}，原文是「${hit.text}」。`;
+
+    expect(policy.prepare(answer)).toMatchObject({ allowed: true, reasons: [] });
+    // The same answer built from the unprojected detail is exactly what the real Run hit:
+    // the internal record id trips the gate.
+    const fromDetail = `消息 ID 是 ${(details as { items: Array<{ id: string }> }).items[0]!.id}。`;
+    expect(policy.prepare(fromDetail)).toMatchObject({
+      allowed: false,
+      reasons: ["internal-uuid"],
+    });
+  } finally {
+    await store.close();
+  }
+});
+
+it("never carries another group's sender into the current group's result", async () => {
+  const { store, archive } = await fixture();
+  try {
+    const tools = await groupRunTools(store, archive);
+    const { text } = await callModelVisible(toolByName(tools, GROUP_HISTORY_SEARCH_TOOL), {
+      query: "deploy rollback",
+    });
+    // Group 200 holds a matching message from member-b, and the caller even holds a grant for
+    // it. A group Run reads its own group only.
+    expect(text).not.toContain("member-b");
+    expect(text).not.toContain("plan beta");
+    expect(text).not.toContain("200");
+  } finally {
+    await store.close();
+  }
+});
+
+it("drops the hit and its sender once the group's grant is revoked", async () => {
+  const { store, archive } = await fixture();
+  try {
+    const tools = await groupRunTools(store, archive);
+    const tool = toolByName(tools, GROUP_HISTORY_SEARCH_TOOL);
+    const before = await callModelVisible(tool, { query: "deploy rollback" });
+    expect(before.text).toContain("member-a");
+
+    await store.authorization.revokeScope({
+      principalId: "owner",
+      resourceId: groupResourceId("100"),
+      scope: group100,
+    });
+    await expect(call(tool, { query: "deploy rollback" })).rejects.toThrow(
+      "Permission denied: no_grant",
+    );
+  } finally {
+    await store.close();
+  }
+});
+
+it("records no evidence for a denied search", async () => {
+  const { store, archive } = await fixture();
+  try {
+    const accepted = await accept(store, group100);
+    const evidence = vi.fn(async (_value: HistoryRetrievalEvidence) => {});
+    const tools = createHistoryTools({
+      store,
+      archive,
+      isHistoryEnabled: historyEnabled,
+      recordEvidence: evidence,
+      getContext: () => ({
+        caller: { principalId: "owner", scope: group100 },
+        runId: accepted.run.id,
+        conversationId: accepted.conversation.id,
+      }),
+    });
+
+    await expect(
+      call(toolByName(tools, GROUP_HISTORY_SEARCH_TOOL), { query: "deploy rollback" }),
+    ).rejects.toThrow("Permission denied: no_grant");
+    expect(evidence).not.toHaveBeenCalled();
+  } finally {
+    await store.close();
+  }
+});
+
+it("withholds the sender of an item whose content is withheld", async () => {
+  const { store } = await fixture();
+  try {
+    // A source that withholds content must not disclose who said it either: provenance
+    // follows the content it belongs to.
+    const withheld = {
+      searchCandidates: async () => [
+        {
+          id: "record-1",
+          sourceId: "100",
+          sourceKind: "channel_message",
+          text: "SECRET BODY",
+          timestamp: "2026-09-20T10:00:00Z",
+          returnMode: "metadata_only" as const,
+          metadata: { senderId: "member-a" },
+        },
+      ],
+    };
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: groupResourceId("100"),
+      action: "history:read",
+      scope: group100,
+      effect: "allow",
+    });
+    const accepted = await accept(store, group100);
+    const tools = createHistoryTools({
+      store,
+      archive: withheld as unknown as ChannelArchiveStore,
+      isHistoryEnabled: historyEnabled,
+      getContext: () => ({
+        caller: { principalId: "owner", scope: group100 },
+        runId: accepted.run.id,
+        conversationId: accepted.conversation.id,
+      }),
+    });
+
+    const { text } = await callModelVisible(toolByName(tools, GROUP_HISTORY_SEARCH_TOOL), {
+      query: "secret",
+    });
+    expect(text).not.toContain("SECRET BODY");
+    expect(text).not.toContain("member-a");
   } finally {
     await store.close();
   }

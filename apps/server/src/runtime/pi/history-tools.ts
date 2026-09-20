@@ -71,8 +71,17 @@ interface OwnerHistoryInput extends GroupHistoryInput {
 }
 
 export interface HistorySearchItem extends BoundedContextItem {
+  /** The group the hit came from. Derived from the source id, never model input. */
+  groupId: string;
   /** The group Resource this item came from. Derived from the source id, never model input. */
   resourceId: string;
+  /**
+   * The authorized sender identity of the archived message.
+   *
+   * Absent for an item whose content was withheld: provenance follows the content it belongs
+   * to, so a policy that hides what was said does not disclose who said it.
+   */
+  senderId?: string;
 }
 
 export interface HistorySearchDetails {
@@ -112,6 +121,50 @@ export interface HistoryRetrievalEvidence {
     matchedTerms: string[];
     returnMode: ReturnMode;
   }>;
+}
+
+/**
+ * The model-visible projection of one history search.
+ *
+ * This — not `HistorySearchDetails` — is what the model receives. It carries exactly what an
+ * answer needs: which authorized group a hit came from, who sent it, when, the bounded text
+ * and the matched terms. It carries no Run id, no archive record id and no Glassbox Resource
+ * id. Those are implementation identifiers the model has no use for, and a model that copies
+ * one into an answer produces output the Delivery Gate must refuse — which is what happened
+ * on the real Run that motivated this projection.
+ */
+export interface HistorySearchResultView {
+  /** The authorized groups actually searched. */
+  groups: string[];
+  query: string;
+  results: Array<{
+    rank: number;
+    groupId: string;
+    /** The sender's Channel identity, when the item's content was disclosed. */
+    sender?: string;
+    occurredAt?: string;
+    text: string;
+    matchedTerms: string[];
+  }>;
+  considered: number;
+  truncated: boolean;
+}
+
+export function projectHistorySearch(details: HistorySearchDetails): HistorySearchResultView {
+  return {
+    groups: details.groups,
+    query: details.query,
+    results: details.items.map((item) => ({
+      rank: item.rank,
+      groupId: item.groupId,
+      ...(item.senderId === undefined ? {} : { sender: item.senderId }),
+      ...(item.occurredAt === undefined ? {} : { occurredAt: item.occurredAt }),
+      text: item.snippet,
+      matchedTerms: item.matchedTerms,
+    })),
+    considered: details.considered,
+    truncated: details.truncated,
+  };
 }
 
 /**
@@ -242,10 +295,22 @@ export function createHistoryTools(options: {
         })
       : [];
     const bounded = selectBoundedContext(results, { topK: params.limit });
-    const items: HistorySearchItem[] = bounded.items.map((item) => ({
-      ...item,
-      resourceId: groupResourceId(item.sourceId),
-    }));
+    // Bounding drops items, so the sender is joined back by record id rather than by position.
+    const senders = new Map(
+      results.map((result) => [result.memory.id, result.memory.metadata?.senderId]),
+    );
+    const items: HistorySearchItem[] = bounded.items.map((item) => {
+      const senderId = senders.get(item.id);
+      return {
+        ...item,
+        groupId: item.sourceId,
+        resourceId: groupResourceId(item.sourceId),
+        // A withheld item discloses neither its text nor who sent it.
+        ...(typeof senderId === "string" && item.returnMode !== "metadata_only"
+          ? { senderId }
+          : {}),
+      };
+    });
     const details: HistorySearchDetails = {
       groups: searched,
       query: params.query,
@@ -287,7 +352,7 @@ export function createHistoryTools(options: {
     name: GROUP_HISTORY_SEARCH_TOOL,
     label: "搜索本群历史",
     description:
-      "Search the history of the QQ group this conversation is currently in. It cannot search any other group. Use it when the user refers to something said earlier in this group.",
+      "Search the history of the QQ group this conversation is currently in. It cannot search any other group. Use it whenever the user asks about something said earlier in this group. Each result names the sender and carries the message text, time and group — answer from those fields instead of asking the user for them.",
     parameters: Type.Object(
       {
         query: Type.String({ minLength: 1, maxLength: 2_000 }),
@@ -305,6 +370,7 @@ export function createHistoryTools(options: {
         : SCOPE_MISMATCH_RESOURCE,
     authService: options.store.authorization,
     getContext,
+    projectResult: (result) => JSON.stringify(projectHistorySearch(result)),
     execute: async (params, context) => {
       const scope = context.caller.scope;
       // A non-group scope never reaches here: the Resource gate above denies it first. This
@@ -323,7 +389,7 @@ export function createHistoryTools(options: {
     name: OWNER_HISTORY_SEARCH_TOOL,
     label: "搜索已授权群历史",
     description:
-      "Owner-only: search history across the QQ groups currently assigned and authorized for this Owner. Optionally name groupIds to narrow the search; omit them to search every authorized group. It can never read a group that has not been granted.",
+      "Owner-only: search history across the QQ groups currently assigned and authorized for this Owner. Optionally name groupIds to narrow the search; omit them to search every authorized group. It can never read a group that has not been granted. Each result names its group and sender and carries the message text — answer from those fields instead of asking the user for them.",
     parameters: Type.Object(
       {
         groupIds: Type.Optional(
@@ -348,6 +414,7 @@ export function createHistoryTools(options: {
         : SCOPE_MISMATCH_RESOURCE,
     authService: options.store.authorization,
     getContext,
+    projectResult: (result) => JSON.stringify(projectHistorySearch(result)),
     execute: (params, context) =>
       search(validatedParams(params), context, validatedGroupFilters(params.groupIds)),
   });

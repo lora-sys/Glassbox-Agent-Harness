@@ -6,8 +6,9 @@ import type {
 } from "../../execution/run-service/types.js";
 import { scopeKey } from "../../identity/scope.js";
 import type { QqCapabilityCategory } from "../../channels/onebot/capabilities.js";
-import type { PiRuntimeAdapter, PiRuntimeProfileName } from "./types.js";
-import { satisfiesRequiredInput } from "./protected-tools.js";
+import type { PiRunContext, PiRuntimeAdapter, PiRuntimeProfileName } from "./types.js";
+import { GROUP_HISTORY_SEARCH_TOOL } from "./history-tools.js";
+import { requiredInputClause, satisfiesRequiredInput } from "./protected-tools.js";
 import { OWNER_GROUP_ADMIN_TOOL } from "./owner-tools.js";
 
 interface RequiredToolCall {
@@ -234,6 +235,43 @@ const SOURCE_CLASS_WORDS: readonly { sourceClass: QqSourceClass; words: RegExp }
   { sourceClass: "file", words: /文件/iu },
 ];
 
+/**
+ * The words that ask to search the history of the group the Run is already in.
+ *
+ * The verb and its object must be adjacent: a message that merely contains 搜索 and 历史 in
+ * different clauses ("搜索一下这个文件，群历史里可能有") is not a history-search request. The
+ * object must name a group's history, so a message about searching anything else — a member,
+ * a file, an order — never binds the Tool.
+ */
+const GROUP_HISTORY_REQUEST =
+  /(?:搜索|搜|查找|查|检索|查询|翻)\s*(?:一下|一翻|一遍)?\s*(?:本群|群里|群内|该群|此群|当前群|群)\s*(?:的)?\s*(?:历史|聊天记录|消息记录|群聊记录|聊天历史|历史消息)/iu;
+
+/**
+ * The negations that turn a request into a refusal.
+ *
+ * The words are unambiguous ones: 别 is deliberately absent because it is also part of
+ * ordinary words such as 特别, and reading those as a refusal would silently drop a request
+ * the user actually made.
+ */
+const GROUP_HISTORY_REFUSAL = /(?:不要|不用|无需|不需要|请勿|不许|停止|别再|别去|别帮我)\s*$/u;
+
+/**
+ * Whether the current group message explicitly asks to search this group's history.
+ *
+ * Read from the current user message alone. Retrieved group history, a notice, file content,
+ * a Tool result or an earlier Conversation turn can describe a search without ever being one,
+ * so none of them can require a Tool call.
+ */
+function groupHistorySearchRequested(text: string): boolean {
+  const match = GROUP_HISTORY_REQUEST.exec(text);
+  if (!match) return false;
+  // A negation in the clause immediately before the request makes it a refusal.
+  if (GROUP_HISTORY_REFUSAL.test(text.slice(0, match.index))) return false;
+  // A question about how to search, or whether searching is possible, is not a request to search.
+  if (/如何|怎么|能否|是否|可以吗/u.test(text)) return false;
+  return true;
+}
+
 export interface PiRunExecutionAdapterOptions {
   isOwner?: (input: ExecutionInput) => Promise<boolean>;
   resolveProfileName?: (input: ExecutionInput) => Promise<PiRuntimeProfileName>;
@@ -246,8 +284,30 @@ export function piProfileName(
   return chatType === "group" && !isOwner ? "qq-group" : "main-agent";
 }
 
-function requiredToolCall(input: ExecutionInput, isOwner: boolean): RequiredToolCall | undefined {
-  if (!isOwner || input.caller.scope.chatType !== "private") return undefined;
+/**
+ * The Tool the current message requires, or `undefined` when it requires none.
+ *
+ * A group Run can only ever reach the current-group history Tool, and only while its own
+ * discovered surface carries it. Requiring a Tool the surface does not offer would fail an
+ * honest Run closed against a Tool the model was never given, so the requirement follows the
+ * surface the runtime resolved rather than the message alone. Requiring is never granting:
+ * the Tool still re-authorizes its own Resource at execution time.
+ */
+function requiredToolCall(
+  input: ExecutionInput,
+  isOwner: boolean,
+  authorizedToolNames: readonly string[] | undefined,
+): RequiredToolCall | undefined {
+  if (input.caller.scope.chatType === "group") {
+    if (!authorizedToolNames?.includes(GROUP_HISTORY_SEARCH_TOOL)) return undefined;
+    if (!groupHistorySearchRequested(input.text)) return undefined;
+    // The message names no parameter of its own: the query is the model's to compose, and the
+    // group comes from the Run's trusted scope. The requirement is the call, not its arguments.
+    return { name: GROUP_HISTORY_SEARCH_TOOL, input: {} };
+  }
+  // Everything below is the Owner-private surface. A management Tool is never required
+  // outside a private Owner Run, whatever else a message may name.
+  if (input.caller.scope.chatType !== "private" || !isOwner) return undefined;
   const text = input.text;
   if (/不要|别|无需/u.test(text)) return undefined;
   const groupId = namedGroupId(text);
@@ -353,13 +413,14 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       : input.caller.scope.chatType === "group"
         ? "qq-group"
         : "main-agent";
-    const required = requiredToolCall(input, isOwner);
-    const context = {
+    // The required Tool is decided *after* the session is created, because the runtime
+    // resolves the Run's discovered Tool surface while creating it. Deciding before would
+    // have to guess that surface, and a guess that disagreed with it would either require a
+    // Tool the model was never offered or silently drop a requirement the Run could meet.
+    const context: PiRunContext = {
       caller: input.caller,
       conversationId: input.conversation.id,
       runId: input.run.id,
-      requiredToolName: required?.name,
-      requiredToolInput: required?.input,
     };
     const binding = await this.runtime.createOrRestoreSession(
       {
@@ -379,6 +440,11 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       profile,
       context,
     );
+    const required = requiredToolCall(input, isOwner, context.authorizedToolNames);
+    if (required !== undefined) {
+      context.requiredToolName = required.name;
+      context.requiredToolInput = required.input;
+    }
     const abort = () => {
       void this.runtime.abort(binding.runtimeSessionId);
     };
@@ -410,7 +476,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         result = await this.runtime.run(
           binding,
           { ...input.run, principalId: input.caller.principalId },
-          `The required action has not executed. Call ${requiredName} now with exactly this JSON input: ${JSON.stringify(context.requiredToolInput)}. Do not ask for confirmation and do not report success without the tool result.`,
+          `The required action has not executed. Call ${requiredName} now${requiredInputClause(context.requiredToolInput)}. Do not ask for confirmation and do not report success without the tool result.`,
           context,
         );
       }

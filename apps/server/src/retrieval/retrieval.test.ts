@@ -96,6 +96,8 @@ describe("P4B MGP-compatible contracts and SearchResultItem", () => {
     expect(result.return_mode).toBe("metadata_only");
     expect(result.consumable_text).not.toContain("secret-token-kiwi-42");
     expect(result.consumable_text).toContain("metadata only");
+    // The placeholder is model-visible, so it names no internal identifier either.
+    expect(result.consumable_text).not.toContain("cand-restricted");
     expect(result.matched_terms).toEqual([]);
     expect(result.explanation).toBe("Result metadata only due to policy.");
   });

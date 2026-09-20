@@ -61,6 +61,14 @@ export interface ProtectedToolOptions<
     signal?: AbortSignal,
   ) => Promise<TResult>;
   redactSensitive?: (params: TParams) => Record<string, unknown>;
+  /**
+   * Builds the text the model receives, when the raw result must not be shown verbatim.
+   *
+   * Pi separates the two: `content` is the model-visible result and `details` is structured
+   * data for logs and UI. A Tool whose result carries implementation identifiers supplies a
+   * projection so those stay out of model-visible Context while the detail keeps them.
+   */
+  projectResult?: (result: TResult) => string;
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
@@ -121,6 +129,19 @@ export function satisfiesRequiredInput(
     if (!samePrimitive(actualValue, value)) return false;
   }
   return true;
+}
+
+/**
+ * The exact-input clause of a required-Tool instruction.
+ *
+ * A required Tool that pins down no parameter — a search whose query the message does not
+ * dictate — contributes no clause at all. Naming the empty object would tell the model to
+ * send `{}`, which the Tool's own schema rejects.
+ */
+export function requiredInputClause(input: Record<string, unknown> | undefined): string {
+  return input && Object.keys(input).length > 0
+    ? ` with exactly this JSON input: ${JSON.stringify(input)}`
+    : "";
 }
 
 /**
@@ -203,7 +224,11 @@ export function createProtectedTool<
           content: [
             {
               type: "text",
-              text: typeof result === "string" ? result : JSON.stringify(result),
+              text: options.projectResult
+                ? options.projectResult(result)
+                : typeof result === "string"
+                  ? result
+                  : JSON.stringify(result),
             },
           ],
           details: result,

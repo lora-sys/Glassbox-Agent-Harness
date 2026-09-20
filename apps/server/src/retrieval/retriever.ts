@@ -237,8 +237,11 @@ export class MemoryRetriever {
       const returnMode: ReturnMode = s.candidate.returnMode ?? "raw";
       const isMetadataOnly = returnMode === "metadata_only";
 
+      // The placeholder names no identifier: `consumable_text` is model-visible, and a
+      // withheld item's internal record id is exactly the kind of implementation identifier
+      // a Delivery Gate refuses when a model copies it into an answer.
       const consumableText = isMetadataOnly
-        ? `[Result metadata only due to policy: ${s.candidate.id}]`
+        ? "[Result metadata only due to policy]"
         : s.candidate.text;
 
       const matchedTerms = isMetadataOnly ? [] : s.matchedTerms;

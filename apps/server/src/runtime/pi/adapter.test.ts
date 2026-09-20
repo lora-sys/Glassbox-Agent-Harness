@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vite-plus/test";
 import type { AgentRun, Conversation } from "@glassbox/contracts";
 import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import { PiSdkRuntimeAdapter } from "./adapter.js";
+import type { PiRunContext } from "./types.js";
 
 const directories: string[] = [];
 
@@ -128,7 +129,7 @@ describe("PiSdkRuntimeAdapter", () => {
     });
 
     await adapter.initialize();
-    const context = {
+    const context: PiRunContext = {
       runId: run.id,
       conversationId: conversation.id,
       caller: {
@@ -149,6 +150,9 @@ describe("PiSdkRuntimeAdapter", () => {
     expect(binding.runtimeSessionId).not.toBe(conversation.id);
     expect(result).toMatchObject({ status: "completed", text: "hello from pi" });
     expect(authorizedTools).toEqual(["owner_group_admin", "skill_read"]);
+    // The resolved surface is handed back on the Run context too: the execution adapter binds
+    // a required Tool only when this Run could really call it.
+    expect(context.authorizedToolNames).toEqual(["owner_group_admin", "skill_read"]);
     expect(authorizedSkills).toEqual([]);
     expect(modelVisibleSkills).toEqual([]);
     expect(skillPolicy).toEqual({ source: "group-profile", configVersion: 3 });

@@ -24,6 +24,8 @@ import {
   DEFAULT_OWNER_GROUP_POLICY,
   ManagementApplication,
 } from "./application.js";
+import { PiRunExecutionAdapter } from "../runtime/pi/run-adapter.js";
+import type { PiRuntimeAdapter } from "../runtime/pi/types.js";
 
 class Inbox<T> {
   private items: T[] = [];
@@ -1265,7 +1267,7 @@ describe("configured group Run capability authority", () => {
       runId: run.run.id,
     };
     expect(context.caller.scope).toMatchObject({ chatType: "group", chatId: GROUP });
-    return { f, a, application, context };
+    return { f, a, application, context, groupInput: run };
   }
 
   it("discovers only the read-only capabilities for a group Run and calls one for real", async () => {
@@ -1372,5 +1374,74 @@ describe("configured group Run capability authority", () => {
     // though the durable policy row is still there.
     expect(await application.resolveRunToolNames(context)).not.toContain("qq_groups");
     expect(await application.resolveRunToolNames(context)).not.toContain("group_history_search");
+  });
+
+  /**
+   * The real execution adapter over a runtime that resolves the real Run surface.
+   *
+   * This is the production wiring: the runtime writes the Tool names it discovered onto the
+   * Run context, and the execution adapter decides the required Tool from that context. A
+   * test that stubbed either half would not catch the two disagreeing.
+   */
+  function piGroupRun(
+    application: ReturnType<typeof groupRun>,
+    input: ExecutionInput,
+  ): (text: string) => Promise<string | undefined> {
+    const seen: Array<string | undefined> = [];
+    const runtime: PiRuntimeAdapter = {
+      initialize: async () => {},
+      createOrRestoreSession: async (_conversation, _profile, context) => {
+        if (context)
+          context.authorizedToolNames = await application.resolveRunToolNames(
+            context as unknown as OwnerContext,
+          );
+        return {
+          conversationId: input.conversation.id,
+          runtimeSessionId: "session-1",
+          profileName: "main-agent",
+          agentDir: "agent",
+          createdAt: new Date(0).toISOString(),
+          lastActiveAt: new Date(0).toISOString(),
+        };
+      },
+      run: async (_binding, _run, _prompt, context) => {
+        seen.push(context?.requiredToolName);
+        return { status: "completed", text: "ok", toolCalls: [] };
+      },
+      abort: async () => {},
+      cleanup: async () => {},
+    };
+    const executor = new PiRunExecutionAdapter(runtime, { isOwner: async () => false });
+    return async (text: string) => {
+      await executor.execute({ ...input, text });
+      return seen.at(-1);
+    };
+  }
+
+  it("requires the group history Tool exactly while the real surface offers it", async () => {
+    const { application, a, groupInput } = await configuredGroup();
+    const requiredFor = piGroupRun(application, groupInput);
+    const ask = "请搜索本群历史，找到 P4B-A-1349，并回复发送者和原文";
+
+    expect(await requiredFor(ask)).toBe("group_history_search");
+
+    await application.setGroupHistory(a, { groupId: GROUP, enabled: false });
+    // The Tool is off the surface now, so nothing is required: an honest Run is never failed
+    // closed against a Tool it was never offered.
+    expect(await requiredFor(ask)).toBeUndefined();
+  });
+
+  it("never requires a cross-group Tool for a group Run", async () => {
+    const { application, groupInput } = await configuredGroup();
+    const requiredFor = piGroupRun(application, groupInput);
+    expect(await requiredFor("请搜索本群历史，找到 P4B-A-1349")).toBe("group_history_search");
+    // The Owner cross-group Tool is not on a group Run's surface at all.
+    expect(
+      await application.resolveRunToolNames({
+        caller: groupInput.caller,
+        conversationId: groupInput.conversation.id,
+        runId: groupInput.run.id,
+      }),
+    ).not.toContain("owner_history_search");
   });
 });
