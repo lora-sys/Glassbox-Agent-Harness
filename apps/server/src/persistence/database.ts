@@ -9,6 +9,7 @@ import {
   applySchemaV4Migration,
   schemaV5Migration,
   schemaV6Migration,
+  schemaV7Migration,
 } from "./schema.js";
 
 export function localDatabaseUrl(databasePath: string): string {
@@ -54,10 +55,10 @@ export class DomainDatabase {
         const version = Number(
           (await tx.execute("PRAGMA user_version")).rows[0]?.user_version ?? 0,
         );
-        if (version > 6) throw new Error("Unsupported database schema version");
+        if (version > 7) throw new Error("Unsupported database schema version");
         if (version === 0) {
           await tx.batch(schema);
-          await tx.execute("PRAGMA user_version = 6");
+          await tx.execute("PRAGMA user_version = 7");
         } else {
           if (version < 2) {
             await tx.batch(schemaV2Migration);
@@ -70,7 +71,8 @@ export class DomainDatabase {
           }
           if (version < 5) await tx.batch(schemaV5Migration);
           if (version < 6) await tx.batch(schemaV6Migration);
-          await tx.execute("PRAGMA user_version = 6");
+          if (version < 7) await tx.batch(schemaV7Migration);
+          await tx.execute("PRAGMA user_version = 7");
         }
       });
       return db;

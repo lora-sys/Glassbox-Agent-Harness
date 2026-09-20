@@ -960,7 +960,7 @@ describe("shared group conversation and durable actor routing", () => {
 
     // 10. Verify all current migrations completed.
     const ver = await rawCheck.execute("PRAGMA user_version");
-    expect(Number(ver.rows[0]?.user_version)).toBe(6);
+    expect(Number(ver.rows[0]?.user_version)).toBe(7);
 
     rawCheck.close();
   });

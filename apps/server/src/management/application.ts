@@ -37,6 +37,16 @@ import {
   SKILL_READ_TOOL,
 } from "../runtime/pi/skill-tools.js";
 import type { ProtectedToolContext } from "../runtime/pi/protected-tools.js";
+import {
+  createOwnerMemoryTools,
+  OWNER_MEMORY_ADMIN_TOOL,
+} from "../runtime/pi/owner-memory-tools.js";
+import {
+  MEMORY_GOVERN_ACTION,
+  MEMORY_READ_ACTION,
+  MEMORY_WRITE_ACTION,
+  OWNER_MEMORY_RESOURCE,
+} from "../learning/store.js";
 import { AuthorizedOpsService, type WorkerPolicy } from "../ops/service.js";
 import { OpsReconciler } from "../ops/reconciler.js";
 import type { HerdrBridge } from "../ops/herdr-bridge.js";
@@ -254,6 +264,7 @@ export class ManagementApplication {
           getContext,
           manageGroup: (context, input) => this.manageGroup(context, input),
         }),
+        ...createOwnerMemoryTools({ store: this.store, getContext }),
         ...createSkillTools({
           store: this.store,
           loader: this.kitLoader,
@@ -304,7 +315,11 @@ export class ManagementApplication {
         const candidates = [
           ...(context.authorizedSkillNames?.length ? [SKILL_READ_TOOL] : []),
           ...(isOwner && context.caller.scope.chatType === "private"
-            ? [...(this.options.ops ? OPS_TOOL_NAMES : []), OWNER_GROUP_ADMIN_TOOL]
+            ? [
+                ...(this.options.ops ? OPS_TOOL_NAMES : []),
+                OWNER_GROUP_ADMIN_TOOL,
+                OWNER_MEMORY_ADMIN_TOOL,
+              ]
             : []),
         ];
         const selected: string[] = [];
@@ -660,7 +675,27 @@ export class ManagementApplication {
         scope,
         effect: "allow",
       });
-      for (const name of [...(this.options.ops ? OPS_TOOL_NAMES : []), OWNER_GROUP_ADMIN_TOOL]) {
+      await this.store.authorization.registerResource({
+        id: OWNER_MEMORY_RESOURCE,
+        kind: "owner-memory",
+        visibility: "private",
+        ownerId: OWNER_ID,
+        ifAbsent: true,
+      });
+      for (const action of [MEMORY_READ_ACTION, MEMORY_WRITE_ACTION, MEMORY_GOVERN_ACTION]) {
+        await this.store.authorization.grant({
+          principalId,
+          resourceId: OWNER_MEMORY_RESOURCE,
+          action,
+          scope,
+          effect: "allow",
+        });
+      }
+      for (const name of [
+        ...(this.options.ops ? OPS_TOOL_NAMES : []),
+        OWNER_GROUP_ADMIN_TOOL,
+        OWNER_MEMORY_ADMIN_TOOL,
+      ]) {
         const resourceId = toolResourceId(name);
         await this.store.authorization.registerResource({
           id: resourceId,
