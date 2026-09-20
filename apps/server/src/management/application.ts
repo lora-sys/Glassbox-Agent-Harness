@@ -161,6 +161,18 @@ export const DEFAULT_OWNER_GROUP_POLICY: GroupCapabilityPolicy = (() => {
 const GROUP_ASSIGN_ACTION = "group:manage";
 
 /**
+ * The Action that permits a result derived from one Resource to reach the current audience.
+ *
+ * It is granted on a *group* Resource, in one exact scope, and it is deliberately separate
+ * from every read Action: `authorizeDeliverySources` re-checks each protected read a Run
+ * admitted against this Action on the same Resource, in the Run's own scope, immediately
+ * before transport. Read authority therefore never becomes delivery authority, and the
+ * reverse states stay explicit. An unassigned group, a sibling Owner, another audience and
+ * a Visitor private chat hold no such grant.
+ */
+const DELIVERY_SEND_ACTION = "delivery:send";
+
+/**
  * One managed group's durable facts, before any live provider observation.
  *
  * Shared by the managed-group inventory and the capability search so the two cannot disagree
@@ -787,6 +799,17 @@ export class ManagementApplication {
       ];
       await this.store.identities.bindOwner(principalId, identity);
       for (const scope of scopes) await this.grantScope(scope, principalId);
+      // An assignment persisted before the explicit delivery grant existed must not require the
+      // Owner to remove and re-add the group. The set is read from this Owner's own active
+      // `group:manage` grants, so the backfill restores exactly the assignments that already
+      // exist. It can never manufacture one, and a group this Owner never assigned stays
+      // without authority however often the Channel reconnects.
+      const privateScope = scopes[0]!;
+      for (const groupId of await resolveAssignedGroupIds(this.store, {
+        principalId,
+        scope: privateScope,
+      }))
+        await this.grantGroupDelivery({ principalId, scope: privateScope, groupId });
     }
 
     for (const visitorId of configured.config.visitorIds) {
@@ -885,6 +908,11 @@ export class ManagementApplication {
             effect: "allow",
           });
       }
+      // Answering back into this group is its own decision, granted separately from reading it.
+      // The Run's own group scope is the audience it already owns, so this is the one delivery
+      // authority a group Run can hold. It is granted only because Glassbox configured
+      // this group. Bot membership alone registers nothing and grants nothing.
+      await this.grantGroupDelivery({ principalId, scope, groupId: scope.chatId });
       // Discovery is a superset of authority, exactly as for the Owner-private scope: the
       // Run's candidate list narrows it to policy, so a category change applies on the next
       // Run with no re-grant and a revoked category cannot survive as stale discovery.
@@ -982,6 +1010,47 @@ export class ManagementApplication {
           });
       }
     }
+  }
+
+  /**
+   * The one explicit delivery authority Glassbox writes for a group Resource.
+   *
+   * It says exactly: a result derived from *this* group's protected content may be delivered
+   * to *this* Principal in *this* scope. Every narrowing the Delivery Gate needs is carried by
+   * that sentence. The Resource is named, the Principal is named and the audience is the
+   * scope the grant lives in. Nothing has to be inferred from a read Action, a role, a
+   * connection-wide group list or bot membership.
+   *
+   * Idempotent, and it never creates an assignment: the caller decides *which* Resource and
+   * *which* scope, and both callers derive that from state that already exists, a configured
+   * group scope, or this Owner's own persisted `group:manage` assignment.
+   */
+  private async grantGroupDelivery(input: {
+    principalId: string;
+    scope: TrustedChannelScope;
+    groupId: string;
+  }): Promise<void> {
+    const resourceId = groupResourceId(input.groupId);
+    await this.store.authorization.registerResource({
+      id: resourceId,
+      kind: "qq_group",
+      visibility: "public",
+      ifAbsent: true,
+    });
+    const caller: CallerContext = { principalId: input.principalId, scope: input.scope };
+    const existing = await this.store.authorization.check({
+      caller,
+      resourceId,
+      action: DELIVERY_SEND_ACTION,
+    });
+    if (existing.decision !== "ALLOW")
+      await this.store.authorization.grant({
+        principalId: input.principalId,
+        resourceId,
+        action: DELIVERY_SEND_ACTION,
+        scope: input.scope,
+        effect: "allow",
+      });
   }
 
   /**
@@ -1096,6 +1165,16 @@ export class ManagementApplication {
           groupId: input.groupId,
           actions: this.bundleActions(),
           enabled: true,
+        });
+        // Assignment also carries delivery: this Owner's private chat may receive a result
+        // derived from this assigned group. It travels with the assignment rather than with a
+        // category, so disabling one category cannot leave a cross-group answer unanswerable
+        // while its sibling categories stay enabled. The disable branch below uses one
+        // `revokeScope` on this Resource in this scope and removes it with everything else.
+        await this.grantGroupDelivery({
+          principalId: actingOwner.principalId,
+          scope: actingOwner.scope,
+          groupId: input.groupId,
         });
         // A Run inside the group needs its own group-scope grants, for the Owner and for
         // every Visitor the transport serves. These are group scope, not Owner assignment.

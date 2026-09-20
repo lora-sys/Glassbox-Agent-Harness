@@ -63,6 +63,23 @@ export type RunServiceEvent =
       candidateSha256: string;
       candidateBytes: number;
     }
+  /**
+   * A delivery authorization refused the Run's answer.
+   *
+   * Distinct from `delivery_blocked`, which is the content policy refusing a candidate that
+   * authorization had already permitted. This carries the decision and its reason and nothing
+   * else: no payload, no snippet, no protected text. The exact Resource and Action the decision
+   * was made on stay in the authorization ledger, joined to this Run.
+   */
+  | {
+      type: "delivery_denied";
+      runId: string;
+      conversationId: string;
+      /** The authorization decision value, e.g. `DENY`. */
+      decision: string;
+      /** The decision reason, e.g. `no_grant`. */
+      reason: string;
+    }
   | {
       type: "recovered";
       interruptedRunIds: string[];

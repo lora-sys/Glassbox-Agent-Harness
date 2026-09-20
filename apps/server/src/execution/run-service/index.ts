@@ -410,13 +410,35 @@ export class RunService {
         });
         return;
       }
-      await this.options.store.lifecycle.createDelivery(caller, {
-        runId: run.id,
-        dedupKey: "result",
-        destination: caller.scope,
-        payloadText: prepared.text,
-        payloadKind: "result",
-      });
+      try {
+        await this.options.store.lifecycle.createDelivery(caller, {
+          runId: run.id,
+          dedupKey: "result",
+          destination: caller.scope,
+          payloadText: prepared.text,
+          payloadKind: "result",
+        });
+      } catch (error) {
+        // A delivery authorization refusal is a blocked outcome, not a transport failure: the
+        // answer never left the process, so no send is attempted and nothing is retried. Trace
+        // records that fact and the decision that caused it, never the payload the Run was
+        // trying to send. The exact Resource and Action remain in the authorization ledger,
+        // joined to this Run and Conversation.
+        if (!(error instanceof AccessDeniedError)) throw error;
+        const newlyDenied = await this.options.store.conversations.excludeRunFromContext(
+          caller,
+          run.id,
+        );
+        if (!newlyDenied) return;
+        await this.emit({
+          type: "delivery_denied",
+          runId: run.id,
+          conversationId: run.conversationId,
+          decision: error.decision.decision,
+          reason: error.decision.reason,
+        });
+        return;
+      }
     }
     let cursor: string | undefined;
     do {
