@@ -559,3 +559,48 @@ new Channels
 LongTask
 frontend search UI
 ```
+
+
+## Shared QQ Capability Registry
+
+P4B also owns the shared QQ Capability Registry used by Owner-private QQ tools and by P4A source adapters.
+
+NapCat remains the implementation of QQ actions. Glassbox adds only category, risk, authorization and Resource mapping.
+
+Target Owner-private domain Tool surface is approximately 8 to 12 stable Tools, such as:
+
+```text
+qq_capability_search
+qq_groups
+qq_group_members
+qq_group_history
+qq_group_content
+qq_group_files
+qq_group_moderation
+qq_group_settings
+qq_message_ops
+qq_account_status
+```
+
+The registry maps allowlisted NapCat actions into these domain Tools.
+
+Extend existing `owner_group_admin` with durable capability policy so an Owner can enable or disable categories for a managed group. Example categories:
+
+```text
+group.read
+group.members
+group.history
+group.content
+group.files.read
+group.files.write
+group.moderate
+group.settings
+message.manage
+memory.source
+```
+
+Owner-private is the broadest remote product surface, but protected operations still re-authorize the concrete Resource immediately before execution.
+
+Credential, raw packet and raw transport primitives remain server-only. Raw message send actions remain behind Glassbox Delivery.
+
+See `upstream/napcat/SOURCES.md`.
