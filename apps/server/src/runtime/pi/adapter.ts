@@ -105,6 +105,7 @@ function safeToolFailureCode(result: unknown): string {
   }
   if (text.includes("context_missing")) return "context_missing";
   if (text.includes("Permission denied")) return "authorization_denied";
+  if (text.includes("capability_category_disabled")) return "capability_category_disabled";
   if (text.includes("protected_tool_failed")) return "protected_tool_failed";
   if (/validation|schema|required|invalid|argument/iu.test(text)) return "input_validation_failed";
   return "tool_execution_failed";

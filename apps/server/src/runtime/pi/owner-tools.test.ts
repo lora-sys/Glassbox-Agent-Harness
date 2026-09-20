@@ -86,3 +86,139 @@ it("exposes a provider-compatible group admin schema and validates each action",
     await store.close();
   }
 });
+
+/** Fixture that reaches the mutation path, optionally holding the Owner grant. */
+async function mutationFixture(grantOwnerControl: boolean) {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  const caller = {
+    principalId: "owner",
+    scope: {
+      connectionId: "qq",
+      botId: "bot",
+      chatType: "private" as const,
+      chatId: "owner",
+      senderId: "owner",
+    },
+  };
+  await store.identities.bindOwner("owner", caller.scope);
+  await store.conversations.createAgent("personal");
+  await store.authorization.grant({
+    principalId: "owner",
+    resourceId: "agent:personal",
+    action: "run:create",
+    scope: caller.scope,
+    effect: "allow",
+  });
+  const accepted = await store.conversations.acceptIncoming({
+    agentId: "personal",
+    scope: caller.scope,
+    messageId: "message",
+    text: "配置群能力",
+    executionRef: "pi:test",
+  });
+  await store.authorization.registerResource({
+    id: OWNER_CONTROL_RESOURCE,
+    kind: "owner-control",
+    visibility: "private",
+    ownerId: "owner",
+  });
+  if (grantOwnerControl)
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: OWNER_CONTROL_RESOURCE,
+      action: "group:manage",
+      scope: caller.scope,
+      effect: "allow",
+    });
+  const manageGroup = vi.fn(async (_context, input) => input);
+  const [tool] = createOwnerTools({
+    store,
+    getContext: () => ({
+      caller,
+      runId: accepted.run.id,
+      conversationId: accepted.conversation.id,
+    }),
+    manageGroup,
+  });
+  return { store, tool: tool!, manageGroup };
+}
+
+it("accepts each explicit Owner capability mutation and parses it before mutation", async () => {
+  const { store, tool, manageGroup } = await mutationFixture(true);
+  try {
+    const calls: Array<[string, unknown]> = [
+      [
+        "set_capability",
+        {
+          action: "set_capability",
+          groupId: "1126022432",
+          category: "group.members",
+          enabled: true,
+        },
+      ],
+      ["set_history", { action: "set_history", groupId: "1126022432", enabled: true }],
+      [
+        "set_memory_source",
+        {
+          action: "set_memory_source",
+          groupId: "1126022432",
+          sourceClass: "notice",
+          enabled: true,
+        },
+      ],
+    ];
+    for (const [id, params] of calls)
+      await tool.execute(id, params, undefined, undefined, {} as never);
+    expect(manageGroup.mock.calls.map((call) => call[1])).toEqual(
+      calls.map(([, params]) => params),
+    );
+  } finally {
+    await store.close();
+  }
+});
+
+it("refuses a capability mutation naming an unimplemented category or source class", async () => {
+  const { store, tool, manageGroup } = await mutationFixture(true);
+  try {
+    for (const params of [
+      { action: "set_capability", groupId: "1126022432", category: "group.sudo", enabled: true },
+      {
+        action: "set_memory_source",
+        groupId: "1126022432",
+        sourceClass: "everything",
+        enabled: true,
+      },
+      { action: "set_capability", groupId: "1126022432", category: "group.members" },
+    ])
+      await expect(tool.execute("bad", params, undefined, undefined, {} as never)).rejects.toThrow(
+        "protected_tool_failed",
+      );
+    // Nothing reached durable state: an unimplemented name can never widen the surface.
+    expect(manageGroup).not.toHaveBeenCalled();
+  } finally {
+    await store.close();
+  }
+});
+
+it("denies a capability mutation when the caller holds no Owner-control grant", async () => {
+  const { store, tool, manageGroup } = await mutationFixture(false);
+  try {
+    await expect(
+      tool.execute(
+        "denied",
+        {
+          action: "set_capability",
+          groupId: "1126022432",
+          category: "group.moderate",
+          enabled: true,
+        },
+        undefined,
+        undefined,
+        {} as never,
+      ),
+    ).rejects.toThrow("Permission denied: no_grant");
+    expect(manageGroup).not.toHaveBeenCalled();
+  } finally {
+    await store.close();
+  }
+});

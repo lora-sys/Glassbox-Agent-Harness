@@ -292,6 +292,47 @@ export class AuthorizationService {
     });
   }
 
+  /**
+   * Revoke one Action on one Resource for one Principal in one scope.
+   *
+   * A Resource can carry several independent Actions — for example several capability
+   * categories on the same QQ group. Disabling one must not silently revoke its siblings,
+   * so the reverse of `grant` exists per Action and not only per Resource.
+   */
+  async revokeScopeAction(input: {
+    principalId: string;
+    resourceId: string;
+    action: string;
+    scope: TrustedChannelScope;
+  }): Promise<void> {
+    requireIdentifier(input.principalId);
+    requireIdentifier(input.resourceId);
+    const key = scopeKey(input.scope);
+    await this.db.transaction(async (tx) => {
+      await tx.execute({
+        sql: "UPDATE grants SET revoked_at = ? WHERE principal_id = ? AND resource_id = ? AND action = ? AND scope_key = ? AND revoked_at IS NULL",
+        args: [new Date().toISOString(), input.principalId, input.resourceId, input.action, key],
+      });
+    });
+  }
+
+  /**
+   * Revoke every active grant on one Resource, across principals and scopes.
+   *
+   * Used when a protected source stops being a managed source (for example a QQ group
+   * is disabled). Every principal loses access on the next decision; no cached or
+   * long-lived grant survives.
+   */
+  async revokeResource(resourceId: string): Promise<void> {
+    requireIdentifier(resourceId);
+    await this.db.transaction(async (tx) => {
+      await tx.execute({
+        sql: "UPDATE grants SET revoked_at = ? WHERE resource_id = ? AND revoked_at IS NULL",
+        args: [new Date().toISOString(), resourceId],
+      });
+    });
+  }
+
   /** Management-only approval for an existing eligible policy path. The caller
    * must verify the human approver before invoking this method. */
   async approve(input: {

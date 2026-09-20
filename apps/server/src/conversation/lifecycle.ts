@@ -127,7 +127,7 @@ export class LifecycleStore {
     // to this Run. Model text cannot remove a dependency from this set.
     const sources = await tx.execute({
       sql: `SELECT DISTINCT resource_id, action FROM authorization_decisions WHERE run_id = ? AND principal_id = ?
-        AND decision = 'ALLOW' AND action IN ('read', 'context:read', 'worker:read', 'worker:status', 'worker:file:read', 'task:read')`,
+        AND decision = 'ALLOW' AND action IN ('read', 'context:read', 'history:read', 'worker:read', 'worker:status', 'worker:file:read', 'task:read')`,
       args: [runId, caller.principalId],
     });
     for (const source of sources.rows) {

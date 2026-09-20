@@ -1,0 +1,172 @@
+/**
+ * Runtime Tools for the QQ Capability Registry.
+ *
+ * Glassbox never hands the model a QQ runtime. Each Tool here is a fixed, allowlisted
+ * projection over NapCat's public OneBot action contract: the model names a Tool and an
+ * operation inside it, and Glassbox decides the Resource, the protected Action, the
+ * provider target and the parameter set.
+ *
+ * Security properties enforced here:
+ *  - The Tool surface is scope-gated: a capability Tool exists only in an Owner-private Run,
+ *    and a group-scoped Tool appears only when the Owner has enabled its category for at
+ *    least one managed group. Discovery is never authority, so every call is re-authorized.
+ *  - The group is named once, at the top level, and Glassbox derives both the authorization
+ *    Resource and the provider `group_id` from that single value. A model-supplied `group_id`
+ *    inside the provider params is refused rather than silently overwritten.
+ *  - Policy (the Owner's intent) and grants (authority) are both required. Enabling a
+ *    category for a group never creates a grant, and a grant never enables a category.
+ *  - Only operations declared on the capability are reachable, so credential, packet,
+ *    transport, restart and raw-send primitives have no path to the model.
+ */
+
+import { Type } from "typebox";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { DomainStore } from "../../persistence/index.js";
+import { agentResourceId } from "../../persistence/index.js";
+import type { QqCapability, QqCapabilityCategory } from "../../channels/onebot/capabilities.js";
+import { QQ_CAPABILITIES, resolveQqOperation } from "../../channels/onebot/capabilities.js";
+import { groupResourceId } from "../../retrieval/source-resolver.js";
+import {
+  createProtectedTool,
+  ToolInputError,
+  type ProtectedToolContext,
+} from "./protected-tools.js";
+import type { PiRunContext } from "./types.js";
+
+/** Sentinel Resource for a call outside the intended scope. Never registered, so it denies. */
+export const UNRESOLVED_CAPABILITY_RESOURCE = "qq:capability:unresolved";
+
+const GROUP_ID_PATTERN = /^[1-9]\d{0,15}$/u;
+
+export type QqProviderParams = Record<string, string | number | boolean>;
+
+export interface CapabilityToolInput extends Record<string, unknown> {
+  groupId?: string;
+  operation?: string;
+  params?: QqProviderParams;
+}
+
+export interface CapabilityInvocation {
+  capability: QqCapability;
+  /** The allowlisted provider action, already checked against this capability. */
+  action: string;
+  /** The exact parameter set Glassbox will forward. Never taken verbatim from the model. */
+  params: QqProviderParams;
+  context: ProtectedToolContext;
+}
+
+/**
+ * The capability Tools a Run may see. The model never chooses its own surface.
+ *
+ * Account-scoped capabilities describe the Agent's own connection and are always
+ * available to the Owner. Group-scoped capabilities stay hidden until the Owner has
+ * enabled that category somewhere, so the surface tracks the Owner's stated intent.
+ */
+export function availableCapabilityToolNames(input: {
+  isOwner: boolean;
+  chatType: "group" | "private";
+  enabledCategories: readonly QqCapabilityCategory[];
+}): string[] {
+  if (!input.isOwner || input.chatType !== "private") return [];
+  const enabled = new Set(input.enabledCategories);
+  return QQ_CAPABILITIES.filter(
+    (capability) => capability.resource === "account" || enabled.has(capability.category),
+  ).map((capability) => capability.tool);
+}
+
+function validatedProviderParams(value: unknown): QqProviderParams {
+  if (value === undefined) return {};
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    throw new ToolInputError("invalid_capability_params");
+  return value as QqProviderParams;
+}
+
+export function createCapabilityTools(options: {
+  store: DomainStore;
+  getContext: () => PiRunContext | undefined;
+  /** Durable Owner intent for one group's capability class. Not an authorization decision. */
+  isCategoryEnabled: (
+    connectionId: string,
+    groupId: string,
+    category: QqCapabilityCategory,
+  ) => Promise<boolean>;
+  /** Executes one validated allowlisted provider action. The only outbound provider path. */
+  invoke: (input: CapabilityInvocation) => Promise<unknown>;
+  /** Builds the managed-group projection without touching the provider. */
+  project: (input: { capability: QqCapability; context: ProtectedToolContext }) => Promise<unknown>;
+}): ToolDefinition[] {
+  const getContext = (): ProtectedToolContext | undefined => {
+    const value = options.getContext();
+    return value?.caller && value.conversationId && value.runId
+      ? { caller: value.caller, conversationId: value.conversationId, runId: value.runId }
+      : undefined;
+  };
+
+  return QQ_CAPABILITIES.map((capability) =>
+    createProtectedTool<CapabilityToolInput>({
+      name: capability.tool,
+      label: capability.tool,
+      description: capability.description,
+      parameters: Type.Object(
+        {
+          groupId: Type.Optional(Type.String({ pattern: "^[1-9]\\d{0,15}$" })),
+          operation: Type.Optional(Type.String({ maxLength: 64 })),
+          params: Type.Optional(
+            Type.Record(
+              Type.String({ maxLength: 64 }),
+              Type.Union([Type.String({ maxLength: 2_048 }), Type.Number(), Type.Boolean()]),
+            ),
+          ),
+        },
+        { additionalProperties: false },
+      ),
+      action: capability.action,
+      // The Resource is derived, never accepted: the model cannot name a group the Run's
+      // scope or the Owner's policy does not cover.
+      resourceId: (params, context) => {
+        if (capability.resource === "account") return agentResourceId("personal");
+        if (context.caller.scope.chatType !== "private") return UNRESOLVED_CAPABILITY_RESOURCE;
+        return typeof params.groupId === "string" && GROUP_ID_PATTERN.test(params.groupId)
+          ? groupResourceId(params.groupId)
+          : UNRESOLVED_CAPABILITY_RESOURCE;
+      },
+      authService: options.store.authorization,
+      getContext,
+      execute: async (params, context) => {
+        if (capability.operations.length === 0) return options.project({ capability, context });
+
+        const supplied = validatedProviderParams(params.params);
+        let providerParams: QqProviderParams = supplied;
+        let groupId: string | undefined;
+        if (capability.resource === "group") {
+          if (typeof params.groupId !== "string" || !GROUP_ID_PATTERN.test(params.groupId))
+            throw new ToolInputError("invalid_capability_group");
+          // The group is named exactly once, at the top level. Accepting it here as well
+          // would let a caller authorize one group and target another.
+          if ("group_id" in supplied) throw new ToolInputError("invalid_capability_params");
+          groupId = params.groupId;
+          providerParams = { ...supplied, group_id: Number(groupId) };
+        }
+
+        const action = params.operation;
+        if (typeof action !== "string" || !capability.operations.some((op) => op.action === action))
+          throw new ToolInputError("invalid_capability_operation");
+        if (!resolveQqOperation(capability, action, providerParams))
+          throw new ToolInputError("invalid_capability_params");
+
+        // Owner intent is a second, independent gate: the grant alone is not enough.
+        if (
+          capability.resource === "group" &&
+          !(await options.isCategoryEnabled(
+            context.caller.scope.connectionId,
+            groupId!,
+            capability.category,
+          ))
+        )
+          throw new ToolInputError("capability_category_disabled");
+
+        return options.invoke({ capability, action, params: providerParams, context });
+      },
+    }),
+  );
+}

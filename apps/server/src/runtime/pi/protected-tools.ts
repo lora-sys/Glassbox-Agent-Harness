@@ -9,6 +9,25 @@ export interface ProtectedToolContext {
   runId: string;
 }
 
+/**
+ * A refusal whose message is a fixed Glassbox-authored code rather than model input.
+ *
+ * Execution failures collapse into one opaque code so no provider detail or parameter
+ * value can leak. Input refusals are the deliberate exception: a model can only correct a
+ * malformed call if it learns which rule it broke, and a caller that cannot tell "you named
+ * an operation I do not have" from "the provider broke" will simply retry the same call.
+ *
+ * The constructor accepts only a bare code, so model-supplied text can never reach the
+ * message even if a future caller tries to interpolate one.
+ */
+export class ToolInputError extends Error {
+  constructor(code: string) {
+    if (!/^[a-z][a-z0-9_]{0,63}$/u.test(code)) throw new Error("invalid_tool_input_error_code");
+    super(code);
+    this.name = "ToolInputError";
+  }
+}
+
 export interface ProtectedToolOptions<
   TParams extends Record<string, unknown> = Record<string, unknown>,
   TResult = unknown,
@@ -18,7 +37,12 @@ export interface ProtectedToolOptions<
   description: string;
   parameters: TSchema;
   action: string;
-  resourceId: string | ((params: TParams) => string);
+  /**
+   * The Resource this Action protects. A function may derive it from the call params
+   * and/or the Run context, so a tool can bind to the current Channel scope (for
+   * example the group the Run is in) without letting the model choose the Resource.
+   */
+  resourceId: string | ((params: TParams, context: ProtectedToolContext) => string);
   authService: AuthorizationService;
   getContext: () => ProtectedToolContext | undefined;
   execute: (
@@ -55,7 +79,7 @@ export function createProtectedTool<
       const typedParams = (params ?? {}) as TParams;
       const resourceId =
         typeof options.resourceId === "function"
-          ? options.resourceId(typedParams)
+          ? options.resourceId(typedParams, context)
           : options.resourceId;
 
       // Gate 3 — Re-authorize immediately before executing side effect!
@@ -97,6 +121,7 @@ export function createProtectedTool<
         ) {
           throw new Error("Operation cancelled");
         }
+        if (error instanceof ToolInputError) throw error;
         throw new Error("protected_tool_failed");
       }
     },

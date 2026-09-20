@@ -9,6 +9,31 @@ import {
   type OneBotConnectionConfig,
 } from "./config.ts";
 import { normalizeOneBotMessage, type OneBotIncomingMessage } from "./normalize.ts";
+import { normalizeOneBotHistoryRecord, type OneBotHistoryMessage } from "./history.ts";
+import { GROUP_SCOPED_NAPCAT_ACTIONS, isAllowedNapCatAction } from "./capabilities.ts";
+
+const GROUP_SCOPED_ACTIONS = new Set(GROUP_SCOPED_NAPCAT_ACTIONS);
+
+export type OneBotHistoryResult =
+  | { status: "ok"; messages: OneBotHistoryMessage[] }
+  | {
+      status: "failed";
+      code: "invalid_group" | "not_connected" | "request_limit" | "api_rejected";
+      retcode?: number;
+    }
+  | {
+      status: "unknown";
+      code: "timeout" | "disconnected" | "send_error" | "invalid_response" | "async_response";
+    };
+
+export type OneBotCapabilityResult =
+  | { status: "ok"; data: unknown }
+  | { status: "rejected"; code: "action_not_allowlisted" | "group_not_configured" }
+  | { status: "failed"; code: "not_connected" | "request_limit" | "api_rejected"; retcode?: number }
+  | {
+      status: "unknown";
+      code: "timeout" | "disconnected" | "send_error" | "invalid_response" | "async_response";
+    };
 
 export interface OneBotState {
   status: "stopped" | "connecting" | "verifying" | "ready" | "reconnecting" | "faulted";
@@ -43,6 +68,22 @@ type RpcResult =
   | { status: "ok"; data: unknown }
   | Exclude<OneBotDeliveryResult, { status: "confirmed" }>;
 
+/**
+ * Maps an RPC failure onto the history result shape. `invalid_target` / `invalid_message`
+ * are delivery-specific and cannot occur for a read, so they surface as an unreadable
+ * provider response rather than being passed through.
+ */
+function toHistoryFailure(result: Exclude<RpcResult, { status: "ok" }>): OneBotHistoryResult {
+  if (result.status === "unknown") return result;
+  if (result.code === "invalid_target" || result.code === "invalid_message")
+    return { status: "unknown", code: "invalid_response" };
+  return {
+    status: "failed",
+    code: result.code,
+    ...(result.retcode !== undefined ? { retcode: result.retcode } : {}),
+  };
+}
+
 interface PendingRequest {
   resolve: (result: RpcResult) => void;
   timeout: ReturnType<typeof setTimeout>;
@@ -51,6 +92,7 @@ interface PendingRequest {
 
 const QQ_DIRECT_TEXT_LIMIT = 3_500;
 const QQ_FORWARD_NODE_LIMIT = 1_800;
+const ONE_BOT_HISTORY_PAGE_LIMIT = 100;
 
 function splitForwardText(text: string): string[] {
   const characters = Array.from(text);
@@ -152,6 +194,91 @@ export class OneBotAdapter {
       no_cache: true,
     });
     return result.status === "ok" && qqId(object(result.data)?.group_id) === groupId;
+  }
+
+  /**
+   * Reads real group history through the existing authenticated OneBot connection.
+   *
+   * `groupId` must be in the configured strict allowlist: this bridge can never be used
+   * to read an arbitrary group. NapCat remains the runtime; Glassbox only normalizes the
+   * page and never returns raw provider payloads.
+   */
+  async getGroupHistory(input: {
+    groupId: string;
+    count?: number;
+    cursor?: string;
+  }): Promise<OneBotHistoryResult> {
+    const parsed = parseOneBotConfig({ ...this.config, groupIds: [input.groupId] });
+    const groupId = parsed.groupIds[0];
+    // Reject before any RPC when the group is not configured.
+    if (groupId !== input.groupId || !this.config.groupIds.includes(input.groupId))
+      return { status: "failed", code: "invalid_group" };
+    const socket = this.#socket;
+    if (this.#state.status !== "ready" || !socket)
+      return { status: "failed", code: "not_connected" };
+    const count = Math.max(
+      1,
+      Math.min(input.count ?? ONE_BOT_HISTORY_PAGE_LIMIT, ONE_BOT_HISTORY_PAGE_LIMIT),
+    );
+    const cursor = input.cursor === undefined ? undefined : messageId(input.cursor);
+    if (input.cursor !== undefined && cursor === undefined)
+      return { status: "failed", code: "invalid_group" };
+    const result = await this.#request(socket, "get_group_msg_history", {
+      group_id: Number(groupId),
+      count,
+      ...(cursor !== undefined ? { message_seq: Number(cursor) } : {}),
+    });
+    if (result.status !== "ok") return toHistoryFailure(result);
+    const raw = object(result.data)?.messages;
+    if (!Array.isArray(raw)) return { status: "unknown", code: "invalid_response" };
+    const messages: OneBotHistoryMessage[] = [];
+    for (const record of raw) {
+      const normalized = normalizeOneBotHistoryRecord(record, groupId, this.config.botId);
+      if (normalized) messages.push(normalized);
+    }
+    messages.sort((a, b) =>
+      a.occurredAt < b.occurredAt ? 1 : a.occurredAt > b.occurredAt ? -1 : 0,
+    );
+    return { status: "ok", messages };
+  }
+
+  /**
+   * The only outbound provider path a capability Tool may reach.
+   *
+   * This is deliberately not a generic RPC bridge. The action must be in the registry's
+   * allowlist, and a group-scoped action must name a group in the configured allowlist.
+   * Credential, packet, transport, restart and raw-send primitives are absent from that
+   * allowlist, so they are unreachable from model-visible Context even by name.
+   */
+  async invokeCapability(input: {
+    action: string;
+    params: Record<string, string | number | boolean>;
+  }): Promise<OneBotCapabilityResult> {
+    if (!isAllowedNapCatAction(input.action))
+      return { status: "rejected", code: "action_not_allowlisted" };
+    const params = { ...input.params };
+    if ("group_id" in params) {
+      const groupId = String(params.group_id);
+      if (!this.config.groupIds.includes(groupId))
+        return { status: "rejected", code: "group_not_configured" };
+    } else if (GROUP_SCOPED_ACTIONS.has(input.action)) {
+      // A group action that names no group would otherwise run against the runtime's
+      // default target, which Glassbox never chose.
+      return { status: "rejected", code: "group_not_configured" };
+    }
+    const socket = this.#socket;
+    if (this.#state.status !== "ready" || !socket)
+      return { status: "failed", code: "not_connected" };
+    const result = await this.#request(socket, input.action, params);
+    if (result.status === "ok") return { status: "ok", data: result.data };
+    if (result.status === "unknown") return result;
+    if (result.code === "invalid_target" || result.code === "invalid_message")
+      return { status: "unknown", code: "invalid_response" };
+    return {
+      status: "failed",
+      code: result.code,
+      ...(result.retcode !== undefined ? { retcode: result.retcode } : {}),
+    };
   }
 
   async start(): Promise<void> {
