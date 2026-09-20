@@ -23,7 +23,7 @@ docs/data-observability.md
   persistence, storage, observability
 ```
 
-The current implementation order comes from `.plans/03-personal-agent-foundation.md`.
+The current implementation order comes from the intentionally parallel `.plans/04a-memory-taste.md` and `.plans/04b-authorized-retrieval-history.md`. P3 is complete and remains the trust / QQ / Agent Ops foundation.
 
 ## Runtime and language
 
