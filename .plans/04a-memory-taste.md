@@ -536,3 +536,25 @@ Skill generation
 full Eval platform
 frontend management UI
 ```
+
+
+## Shared QQ source boundary
+
+P4A may consume QQ data as Memory evidence, but it does not own NapCat integration.
+
+P4B provides an authorized QQ source interface over a shared QQ Capability Registry. P4A develops against deterministic fixtures until that source adapter is available.
+
+Eligible P4A source classes include:
+
+```text
+group history
+group notices
+group essence
+group metadata
+group file metadata
+group album metadata when explicitly requested
+```
+
+Owner-private configuration may enable or disable selected source classes per managed group.
+
+Source enablement permits candidate generation only. It never auto-promotes a source item into canonical Memory.
