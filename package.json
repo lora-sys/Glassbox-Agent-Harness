@@ -38,11 +38,14 @@
     "vite-plus": "^0.3.1"
   },
   "overrides": {
-    "vite": "npm:@voidzero-dev/vite-plus-core@^0.3.1",
+    "@glassbox/web": {
+      "vite": "npm:@voidzero-dev/vite-plus-core@0.3.1"
+    },
+    "vite": "npm:@voidzero-dev/vite-plus-core@0.3.1",
     "vitest": "4.1.11"
   },
   "engines": {
-    "node": "24.21.0"
+    "node": ">=24.12.0"
   },
   "packageManager": "npm@12.0.2"
 }
