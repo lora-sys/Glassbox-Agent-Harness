@@ -1,15 +1,20 @@
 import { describe, expect, it } from "vite-plus/test";
 import {
+  NAPCAT_ALLOWLISTED_CONTRACTS,
   NAPCAT_CONTRACT_SNAPSHOT,
+  NAPCAT_PROVIDER_SCHEMAS,
   QQ_ALLOWED_NAPCAT_ACTIONS,
   QQ_CAPABILITIES,
   QQ_CAPABILITY_CATEGORIES,
   SERVER_ONLY_NAPCAT_ACTIONS,
   checkNapCatContract,
   isAllowedNapCatAction,
+  napCatContractDigest,
+  napCatProviderSchemaDigest,
   qqCapabilitiesForCategory,
   qqCapability,
   resolveQqOperation,
+  unsupportedNapCatContract,
 } from "./capabilities.ts";
 
 describe("QQ capability registry", () => {
@@ -21,7 +26,8 @@ describe("QQ capability registry", () => {
     for (const capability of QQ_CAPABILITIES) {
       expect(QQ_CAPABILITY_CATEGORIES).toContain(capability.category);
       for (const operation of capability.operations) {
-        expect(operation.action).toMatch(/^[a-z][a-z0-9_]*$/u);
+        // NapCat's own action names may carry a leading underscore (`_get_group_notice`).
+        expect(operation.action).toMatch(/^_?[a-z][a-z0-9_]*$/u);
         // A required parameter must also be declared, and a group-scoped capability must
         // carry group_id so the authorization Resource and the provider target agree.
         for (const required of operation.required) expect(operation.params).toContain(required);
@@ -34,21 +40,27 @@ describe("QQ capability registry", () => {
     expect(withProviderActions.length).toBeGreaterThanOrEqual(8);
   });
 
-  it("keeps credential, packet, transport and raw-send primitives server-only", () => {
-    // The provider surface these belong to must never reach a model-visible Tool.
+  it("keeps credential, packet, transport, restart and raw-send primitives server-only", () => {
+    // Real provider action names at the pinned commit: `get_csrf_token` (not `get_csrf`),
+    // `nc_get_rkey` (not `get_rkey_ex`), and `get_rkey_server`. `call_action` is not a
+    // NapCat action at all, so listing it would be dead weight rather than protection.
     const forbidden = [
       "get_credentials",
       "get_cookies",
-      "get_csrf",
+      "get_csrf_token",
       "get_clientkey",
       "get_rkey",
-      "get_rkey_ex",
+      "nc_get_rkey",
+      "get_rkey_server",
       "send_packet",
       "bot_exit",
+      "set_restart",
+      "clean_cache",
       "send_group_msg",
       "send_private_msg",
       "send_msg",
-      "call_action",
+      "send_group_forward_msg",
+      "send_private_forward_msg",
     ];
     for (const action of forbidden) {
       expect(SERVER_ONLY_NAPCAT_ACTIONS).toContain(action);
@@ -59,6 +71,37 @@ describe("QQ capability registry", () => {
         expect(forbidden).not.toContain(operation.action);
       }
     }
+  });
+
+  it("names the provider's real actions for notices, essence and group files", () => {
+    // Verified against the pinned checkout: the notice reader is `_get_group_notice`
+    // (GoCQHTTP_GetGroupNotice). A wrong name would be refused by NapCat at runtime
+    // rather than by Glassbox at authorization time.
+    const content = qqCapability("qq_group_content")!;
+    expect(content.operations.map((op) => op.action).sort()).toEqual([
+      "_get_group_notice",
+      "get_essence_msg_list",
+    ]);
+    expect(content.operations.map((op) => op.action)).not.toContain("get_group_notice");
+
+    const files = qqCapability("qq_group_files")!;
+    // `busid` does not exist in the provider's `get_group_file_url` payload schema.
+    expect(files.operations.find((op) => op.action === "get_group_file_url")?.params).toEqual([
+      "group_id",
+      "file_id",
+    ]);
+
+    const fileOps = qqCapability("qq_group_file_ops")!;
+    expect(fileOps.operations.find((op) => op.action === "delete_group_file")?.params).toEqual([
+      "group_id",
+      "file_id",
+    ]);
+    // `parent_id` does not exist in the provider's `create_group_file_folder` payload schema.
+    expect(
+      fileOps.operations.find((op) => op.action === "create_group_file_folder")?.params,
+    ).toEqual(["group_id", "name"]);
+    // `get_group_info` declares only `group_id`; `no_cache` is not a provider parameter.
+    expect(qqCapability("qq_groups")!.operations[0]!.params).toEqual(["group_id"]);
   });
 
   it("derives the allowlist from the registry with no overlap with server-only actions", () => {
@@ -127,9 +170,66 @@ describe("QQ capability registry", () => {
 
   it("records the pinned upstream provenance for the provider contract", () => {
     expect(NAPCAT_CONTRACT_SNAPSHOT.provider).toBe("NapNeko/NapCatQQ");
-    expect(NAPCAT_CONTRACT_SNAPSHOT.license).toMatch(/Limited Redistribution/u);
-    expect(NAPCAT_CONTRACT_SNAPSHOT.sourcePath).toContain("napcat-onebot/action");
+    expect(NAPCAT_CONTRACT_SNAPSHOT.license).toBe("Limited Redistribution License for NapCat");
+    expect(NAPCAT_CONTRACT_SNAPSHOT.commit).toBe("109d0c1dff755875f3b79795e99cee6115289fbb");
     expect(NAPCAT_CONTRACT_SNAPSHOT.version).toMatch(/^\d+\.\d+\.\d+$/u);
     expect(NAPCAT_CONTRACT_SNAPSHOT.allowlistedActions.length).toBeGreaterThan(0);
+    // The recorded source paths must be the real upstream locations, not a placeholder.
+    expect(NAPCAT_CONTRACT_SNAPSHOT.sourcePaths).toContain(
+      "packages/napcat-onebot/action/router.ts",
+    );
+    for (const path of NAPCAT_CONTRACT_SNAPSHOT.sourcePaths) {
+      expect(path).toMatch(/^packages\/napcat-onebot\/action\/.+\.ts$/u);
+    }
+    // No NapCat source is vendored: the snapshot records provenance and digests only.
+    expect(NAPCAT_CONTRACT_SNAPSHOT.contractDigest).toMatch(/^[0-9a-f]{64}$/u);
+    expect(NAPCAT_CONTRACT_SNAPSHOT.providerSchemaDigest).toMatch(/^[0-9a-f]{64}$/u);
+  });
+
+  it("computes a deterministic contract digest that changes with the allowlist", () => {
+    expect(napCatContractDigest()).toBe(NAPCAT_CONTRACT_SNAPSHOT.contractDigest);
+    expect(napCatContractDigest(NAPCAT_ALLOWLISTED_CONTRACTS)).toBe(
+      NAPCAT_CONTRACT_SNAPSHOT.contractDigest,
+    );
+    // Reordering the inputs must not change the digest; a changed parameter must.
+    const reversed = [...NAPCAT_ALLOWLISTED_CONTRACTS].reverse();
+    expect(napCatContractDigest(reversed)).toBe(NAPCAT_CONTRACT_SNAPSHOT.contractDigest);
+    const widened = NAPCAT_ALLOWLISTED_CONTRACTS.map((contract) =>
+      contract.action === "get_group_info"
+        ? { ...contract, params: [...contract.params, "no_cache"] }
+        : contract,
+    );
+    expect(napCatContractDigest(widened)).not.toBe(NAPCAT_CONTRACT_SNAPSHOT.contractDigest);
+  });
+
+  it("computes a deterministic provider-schema digest that changes with the record", () => {
+    expect(napCatProviderSchemaDigest()).toBe(NAPCAT_CONTRACT_SNAPSHOT.providerSchemaDigest);
+    const changed = {
+      ...NAPCAT_PROVIDER_SCHEMAS,
+      get_group_info: { payload: ["group_id", "no_cache"], returned: [] },
+    };
+    expect(napCatProviderSchemaDigest(changed)).not.toBe(
+      NAPCAT_CONTRACT_SNAPSHOT.providerSchemaDigest,
+    );
+  });
+
+  it("fails closed when an allowlisted action or parameter is unsupported by the provider", () => {
+    // Every allowlisted parameter is one the provider's payload schema actually declares.
+    expect(unsupportedNapCatContract()).toEqual([]);
+
+    // An allowlisted action the provider never declares is unsupported.
+    expect(
+      unsupportedNapCatContract({
+        ...NAPCAT_PROVIDER_SCHEMAS,
+        get_group_info: undefined as never,
+      }),
+    ).toContain("get_group_info:unknown_action");
+
+    // An allowlisted parameter the provider never accepts is unsupported.
+    const narrowed = {
+      ...NAPCAT_PROVIDER_SCHEMAS,
+      get_group_file_url: { payload: ["group_id"], returned: [] },
+    };
+    expect(unsupportedNapCatContract(narrowed)).toContain("get_group_file_url:file_id");
   });
 });

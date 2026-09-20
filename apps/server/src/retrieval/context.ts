@@ -14,7 +14,7 @@
  *     - spec/search-results.md (consumable_text is the only model-visible field)
  */
 
-import type { SearchResultItem } from "@glassbox/contracts";
+import type { ReturnMode, SearchResultItem } from "@glassbox/contracts";
 
 export interface BoundedContextOptions {
   /** Maximum number of items kept after capping. */
@@ -33,6 +33,15 @@ export interface BoundedContextItem {
   snippet: string;
   score: number;
   occurredAt?: string;
+  /** 1-based position in the bounded result. Evidence of rank, never authority. */
+  rank: number;
+  /**
+   * The lexical terms that matched, as the retriever reported them. Empty for a
+   * metadata-only result, so a bounded Context can never re-expose withheld content.
+   */
+  matchedTerms: string[];
+  /** The MGP return mode the retriever applied to this item. */
+  returnMode: ReturnMode;
 }
 
 export interface BoundedContext {
@@ -60,6 +69,10 @@ function itemSourceId(item: SearchResultItem<unknown>): string {
 function itemTimestamp(item: SearchResultItem<unknown>): string | undefined {
   const memory = item.memory as { timestamp?: unknown } | null | undefined;
   return typeof memory?.timestamp === "string" ? memory.timestamp : undefined;
+}
+
+function itemMatchedTerms(item: SearchResultItem<unknown>): string[] {
+  return Array.isArray(item.matched_terms) ? [...item.matched_terms] : [];
 }
 
 /**
@@ -109,6 +122,9 @@ export function selectBoundedContext(
       snippet,
       score: result.score,
       occurredAt: itemTimestamp(result),
+      rank: items.length + 1,
+      matchedTerms: itemMatchedTerms(result),
+      returnMode: result.return_mode,
     });
     perSourceCounts.set(sourceId, used + 1);
   }

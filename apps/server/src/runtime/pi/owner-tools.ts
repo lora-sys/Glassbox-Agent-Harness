@@ -7,7 +7,11 @@ import {
   QQ_CAPABILITY_CATEGORIES,
   type QqCapabilityCategory,
 } from "../../channels/onebot/capabilities.js";
-import { createProtectedTool, type ProtectedToolContext } from "./protected-tools.js";
+import {
+  createProtectedTool,
+  requireMutationIntent,
+  type ProtectedToolContext,
+} from "./protected-tools.js";
 import type { PiRunContext } from "./types.js";
 
 export const OWNER_GROUP_ADMIN_TOOL = "owner_group_admin";
@@ -98,7 +102,17 @@ export function createOwnerTools(options: {
   const getContext = (): ProtectedToolContext | undefined => {
     const value = options.getContext();
     return value?.caller && value.conversationId && value.runId
-      ? { caller: value.caller, conversationId: value.conversationId, runId: value.runId }
+      ? {
+          caller: value.caller,
+          conversationId: value.conversationId,
+          runId: value.runId,
+          ...(value.requiredToolName === undefined
+            ? {}
+            : { requiredToolName: value.requiredToolName }),
+          ...(value.requiredToolInput === undefined
+            ? {}
+            : { requiredToolInput: value.requiredToolInput }),
+        }
       : undefined;
   };
   return [
@@ -142,7 +156,21 @@ export function createOwnerTools(options: {
       resourceId: OWNER_CONTROL_RESOURCE,
       authService: options.store.authorization,
       getContext,
-      execute: (params, context) => options.manageGroup(context, validatedInput(params)),
+      execute: (params, context) => {
+        const input = validatedInput(params);
+        // Reading the inventory is safe at any time. A mutation additionally needs the
+        // current user message to have asked for exactly this change to exactly this group.
+        if (input.action !== "get")
+          requireMutationIntent(context, OWNER_GROUP_ADMIN_TOOL, {
+            action: input.action,
+            groupId: input.groupId,
+            enabled: "enabled" in input ? input.enabled : undefined,
+            skillName: "skillName" in input ? input.skillName : undefined,
+            category: "category" in input ? input.category : undefined,
+            sourceClass: "sourceClass" in input ? input.sourceClass : undefined,
+          });
+        return options.manageGroup(context, input);
+      },
     }),
   ];
 }

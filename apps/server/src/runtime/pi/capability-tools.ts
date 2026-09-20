@@ -7,14 +7,18 @@
  * provider target and the parameter set.
  *
  * Security properties enforced here:
- *  - The Tool surface is scope-gated: a capability Tool exists only in an Owner-private Run,
- *    and a group-scoped Tool appears only when the Owner has enabled its category for at
- *    least one managed group. Discovery is never authority, so every call is re-authorized.
+ *  - The Tool surface is scope-gated: a group Run sees only the read-only capabilities its
+ *    own group's policy enables, an Owner-private Run additionally sees the mutating
+ *    categories the Owner enabled, and a Visitor-private Run sees none. Discovery is never
+ *    authority, so every call is re-authorized.
  *  - The group is named once, at the top level, and Glassbox derives both the authorization
- *    Resource and the provider `group_id` from that single value. A model-supplied `group_id`
- *    inside the provider params is refused rather than silently overwritten.
+ *    Resource and the provider `group_id` from that single value. A group Run is bound to
+ *    its own group and refuses a model-supplied one; a model-supplied `group_id` inside the
+ *    provider params is refused rather than silently overwritten.
  *  - Policy (the Owner's intent) and grants (authority) are both required. Enabling a
  *    category for a group never creates a grant, and a grant never enables a category.
+ *  - A mutating capability additionally requires the current user message to have asked for
+ *    that exact operation on that exact group, so retrieved text cannot become authority.
  *  - Only operations declared on the capability are reachable, so credential, packet,
  *    transport, restart and raw-send primitives have no path to the model.
  */
@@ -28,6 +32,7 @@ import { QQ_CAPABILITIES, resolveQqOperation } from "../../channels/onebot/capab
 import { groupResourceId } from "../../retrieval/source-resolver.js";
 import {
   createProtectedTool,
+  requireMutationIntent,
   ToolInputError,
   type ProtectedToolContext,
 } from "./protected-tools.js";
@@ -35,6 +40,21 @@ import type { PiRunContext } from "./types.js";
 
 /** Sentinel Resource for a call outside the intended scope. Never registered, so it denies. */
 export const UNRESOLVED_CAPABILITY_RESOURCE = "qq:capability:unresolved";
+
+/**
+ * The capability categories a Run *inside* a group may use.
+ *
+ * These are the read-only classes the group's own policy can expose. Mutating categories
+ * (`group.files.write`, `group.moderate`, `group.settings`, `message.manage`) stay
+ * Owner-private: a group Run can look at its group but never change it.
+ */
+export const GROUP_RUN_CAPABILITY_CATEGORIES: readonly QqCapabilityCategory[] = Object.freeze([
+  "group.read",
+  "group.members",
+  "group.history",
+  "group.content",
+  "group.files.read",
+]);
 
 const GROUP_ID_PATTERN = /^[1-9]\d{0,15}$/u;
 
@@ -58,17 +78,25 @@ export interface CapabilityInvocation {
 /**
  * The capability Tools a Run may see. The model never chooses its own surface.
  *
- * Account-scoped capabilities describe the Agent's own connection and are always
- * available to the Owner. Group-scoped capabilities stay hidden until the Owner has
- * enabled that category somewhere, so the surface tracks the Owner's stated intent.
+ * A group Run sees only the read-only capabilities its own group's policy enables, so
+ * disabling a category hides the Tool on the next Run. Account-scoped capabilities describe
+ * the Agent's own connection and are always available to the Owner. An Owner-private Run
+ * additionally sees every mutating category the Owner enabled somewhere.
  */
 export function availableCapabilityToolNames(input: {
   isOwner: boolean;
   chatType: "group" | "private";
   enabledCategories: readonly QqCapabilityCategory[];
 }): string[] {
-  if (!input.isOwner || input.chatType !== "private") return [];
   const enabled = new Set(input.enabledCategories);
+  if (input.chatType === "group")
+    return QQ_CAPABILITIES.filter(
+      (capability) =>
+        capability.resource === "group" &&
+        GROUP_RUN_CAPABILITY_CATEGORIES.includes(capability.category) &&
+        enabled.has(capability.category),
+    ).map((capability) => capability.tool);
+  if (!input.isOwner) return [];
   return QQ_CAPABILITIES.filter(
     (capability) => capability.resource === "account" || enabled.has(capability.category),
   ).map((capability) => capability.tool);
@@ -98,7 +126,17 @@ export function createCapabilityTools(options: {
   const getContext = (): ProtectedToolContext | undefined => {
     const value = options.getContext();
     return value?.caller && value.conversationId && value.runId
-      ? { caller: value.caller, conversationId: value.conversationId, runId: value.runId }
+      ? {
+          caller: value.caller,
+          conversationId: value.conversationId,
+          runId: value.runId,
+          ...(value.requiredToolName === undefined
+            ? {}
+            : { requiredToolName: value.requiredToolName }),
+          ...(value.requiredToolInput === undefined
+            ? {}
+            : { requiredToolInput: value.requiredToolInput }),
+        }
       : undefined;
   };
 
@@ -121,10 +159,12 @@ export function createCapabilityTools(options: {
         { additionalProperties: false },
       ),
       action: capability.action,
-      // The Resource is derived, never accepted: the model cannot name a group the Run's
-      // scope or the Owner's policy does not cover.
+      // The Resource is derived, never accepted: a group Run is bound to its own group, and
+      // an Owner-private Run may name only a group its policy covers.
       resourceId: (params, context) => {
         if (capability.resource === "account") return agentResourceId("personal");
+        if (context.caller.scope.chatType === "group")
+          return groupResourceId(context.caller.scope.chatId);
         if (context.caller.scope.chatType !== "private") return UNRESOLVED_CAPABILITY_RESOURCE;
         return typeof params.groupId === "string" && GROUP_ID_PATTERN.test(params.groupId)
           ? groupResourceId(params.groupId)
@@ -139,12 +179,20 @@ export function createCapabilityTools(options: {
         let providerParams: QqProviderParams = supplied;
         let groupId: string | undefined;
         if (capability.resource === "group") {
-          if (typeof params.groupId !== "string" || !GROUP_ID_PATTERN.test(params.groupId))
-            throw new ToolInputError("invalid_capability_group");
+          const scope = context.caller.scope;
+          if (scope.chatType === "group") {
+            // A group Run targets its own group. Naming another one is refused rather than
+            // silently overwritten, so a call can never authorize one group and reach another.
+            if (params.groupId !== undefined) throw new ToolInputError("invalid_capability_group");
+            groupId = scope.chatId;
+          } else {
+            if (typeof params.groupId !== "string" || !GROUP_ID_PATTERN.test(params.groupId))
+              throw new ToolInputError("invalid_capability_group");
+            groupId = params.groupId;
+          }
           // The group is named exactly once, at the top level. Accepting it here as well
           // would let a caller authorize one group and target another.
           if ("group_id" in supplied) throw new ToolInputError("invalid_capability_params");
-          groupId = params.groupId;
           providerParams = { ...supplied, group_id: Number(groupId) };
         }
 
@@ -164,6 +212,16 @@ export function createCapabilityTools(options: {
           ))
         )
           throw new ToolInputError("capability_category_disabled");
+
+        // A mutating capability additionally requires that the *current user message* asked
+        // for this exact operation on this exact group. Retrieved text cannot supply that.
+        // The required keys are the Tool's own parameters, so the exact call the message
+        // asks for is a call this Tool can accept.
+        if (capability.risk !== "read")
+          requireMutationIntent(context, capability.tool, {
+            groupId: groupId!,
+            operation: action,
+          });
 
         return options.invoke({ capability, action, params: providerParams, context });
       },

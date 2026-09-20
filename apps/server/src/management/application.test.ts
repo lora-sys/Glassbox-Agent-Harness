@@ -9,8 +9,20 @@ import { WebSocketServer, type WebSocket } from "ws";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import { ModelProfileStore } from "../config/model-profiles.js";
 import { ChannelProfileStore } from "../config/channel-profiles.js";
-import type { ExecutionInput, ExecutionResult } from "../execution/run-service/types.js";
-import { ManagementApplication } from "./application.js";
+import type {
+  ExecutionInput,
+  ExecutionResult,
+  RunExecutionAdapter,
+} from "../execution/run-service/types.js";
+import {
+  qqCapabilitiesForCategory,
+  type QqCapabilityCategory,
+} from "../channels/onebot/capabilities.js";
+import {
+  DEFAULT_OWNER_GROUP_CATEGORIES,
+  DEFAULT_OWNER_GROUP_POLICY,
+  ManagementApplication,
+} from "./application.js";
 
 class Inbox<T> {
   private items: T[] = [];
@@ -29,7 +41,12 @@ class Inbox<T> {
 interface Action {
   action: string;
   echo: string;
-  params: { group_id?: number; user_id?: number; message?: Array<{ data: { text: string } }> };
+  params: {
+    group_id?: number;
+    user_id?: number;
+    message_seq?: number;
+    message?: Array<{ data: { text: string } }>;
+  };
 }
 const cleanup: Array<() => Promise<unknown>> = [];
 afterEach(async () => {
@@ -37,9 +54,25 @@ afterEach(async () => {
   cleanup.length = 0;
 });
 
-async function fixture(execute: (input: ExecutionInput) => Promise<ExecutionResult>) {
+/** libSQL can retain Windows file handles until the test process exits. */
+const removeDirectory = (directory: string) =>
+  rm(directory, { recursive: true, force: true }).catch((error: NodeJS.ErrnoException) => {
+    if (process.platform !== "win32" || error.code !== "EBUSY") throw error;
+  });
+
+async function fixture(
+  execute: (input: ExecutionInput) => Promise<ExecutionResult>,
+  options: {
+    /** Deterministic `get_group_msg_history` responder, paged by the requested `message_seq`. */
+    history?: (params: { group_id?: number; message_seq?: number }) => Record<string, unknown>[];
+    /** Second Owner identity, resolved to its own `owner-<id>` Principal. */
+    coOwnerId?: string;
+    /** File-backed database so a test can close and reopen the same durable state. */
+    persistentDatabase?: boolean;
+  } = {},
+) {
   const directory = await mkdtemp(join(tmpdir(), "glassbox-channel-loop-"));
-  cleanup.push(() => rm(directory, { recursive: true, force: true }));
+  cleanup.push(() => removeDirectory(directory));
   const actions = new Inbox<Action>();
   const sockets = new Inbox<WebSocket>();
   const calls: ExecutionInput[] = [];
@@ -69,33 +102,43 @@ async function fixture(execute: (input: ExecutionInput) => Promise<ExecutionResu
               ? { user_id: 10001 }
               : action.action === "get_group_info"
                 ? { group_id: action.params.group_id }
-                : { message_id: 20001 },
+                : action.action === "get_group_msg_history"
+                  ? { messages: options.history?.(action.params) ?? [] }
+                  : { message_id: 20001 },
         }),
       );
     });
   });
   await once(server, "listening");
   const models = await ModelProfileStore.open(directory);
-  const app = await ManagementApplication.open({
-    dataDirectory: directory,
-    databasePath: ":memory:",
-    kitPath: fileURLToPath(new URL("../runtime/pi/fixtures/lora-pi-kit", import.meta.url)),
-    models,
-    executors: new Map([
-      [
-        "claude-code",
-        {
-          supportsGroup: true,
-          execute: async (input) => {
-            calls.push(input);
-            started.put(input);
-            return execute(input);
-          },
+  const executors = new Map<string, RunExecutionAdapter>([
+    [
+      "claude-code",
+      {
+        supportsGroup: true,
+        execute: async (input) => {
+          calls.push(input);
+          started.put(input);
+          return execute(input);
         },
-      ],
-    ]),
-  });
+      },
+    ],
+  ]);
+  const open = () =>
+    ManagementApplication.open({
+      dataDirectory: directory,
+      databasePath: options.persistentDatabase ? join(directory, "glassbox.db") : ":memory:",
+      kitPath: fileURLToPath(new URL("../runtime/pi/fixtures/lora-pi-kit", import.meta.url)),
+      models,
+      executors,
+    });
+  let app = await open();
   cleanup.push(() => app.close());
+  const reopen = async () => {
+    await app.close();
+    app = await open();
+    return app;
+  };
   await app.saveChannel({
     id: "fixture",
     label: "Disposable QQ fixture",
@@ -103,6 +146,7 @@ async function fixture(execute: (input: ExecutionInput) => Promise<ExecutionResu
     endpoint: `ws://127.0.0.1:${(server.address() as AddressInfo).port}/`,
     botId: "10001",
     ownerId: "10002",
+    ...(options.coOwnerId !== undefined ? { coOwnerId: options.coOwnerId } : {}),
     visitorIds: ["10004"],
     groupIds: ["10003"],
     token: "fixture-token",
@@ -131,13 +175,13 @@ async function fixture(execute: (input: ExecutionInput) => Promise<ExecutionResu
     actions.take(
       (action) => action.params.message?.some((part) => part.data.text === text) === true,
     );
-  return { app, calls, started, send, reply, actions };
+  return { app, calls, started, send, reply, actions, reopen };
 }
 
 describe("channel to durable run composition", () => {
   it("keeps an auto-connect channel retrying when OneBot becomes ready after server startup", async () => {
     const directory = await mkdtemp(join(tmpdir(), "glassbox-late-onebot-"));
-    cleanup.push(() => rm(directory, { recursive: true, force: true }));
+    cleanup.push(() => removeDirectory(directory));
     const reservation = createNetServer();
     await new Promise<void>((resolve, reject) => {
       reservation.once("error", reject);
@@ -418,5 +462,271 @@ describe("channel to durable run composition", () => {
     await f.started.take((input) => input.text === "queue-barrier");
     await f.reply("answer:queue-barrier");
     expect(f.calls.some((call) => call.text === "revoked-group")).toBe(false);
+  });
+});
+
+describe("bounded authorized history synchronization", () => {
+  const PAGE = 3;
+  const TOTAL = 12;
+  const message = (seq: number) => ({
+    message_id: seq,
+    message_seq: seq,
+    real_id: seq,
+    time: 1_758_000_000 + seq,
+    user_id: 10004,
+    group_id: 10003,
+    message_type: "group",
+    sender: { user_id: 10004, nickname: "Visitor" },
+    message: [{ type: "text", data: { text: `msg-${seq}` } }],
+  });
+  /** Pages backwards from the requested sequence, three records at a time. */
+  const paged =
+    (total = TOTAL) =>
+    (params: { message_seq?: number }) => {
+      const top = params.message_seq ?? total + 1;
+      const records: Record<string, unknown>[] = [];
+      for (let seq = top - 1; seq > 0 && records.length < PAGE; seq -= 1)
+        records.push(message(seq));
+      return records;
+    };
+  const sync = (app: ManagementApplication) =>
+    app as unknown as {
+      syncGroupHistory(
+        connectionId: string,
+        groupId: string,
+        options?: { maxPages?: number; since?: string },
+      ): Promise<void>;
+    };
+  const storedIds = async (app: ManagementApplication) =>
+    (await app.archive.searchMessages({ allowedGroupIds: ["10003"], limit: 50 }))
+      .map((row) => row.externalMessageId)
+      .sort();
+
+  it("walks older pages up to the configured bound instead of only the newest page", async () => {
+    const f = await fixture(async () => ({ status: "succeeded", text: "ok" }), {
+      history: paged(),
+    });
+    await sync(f.app).syncGroupHistory("fixture", "10003", { maxPages: 2 });
+    expect(await storedIds(f.app)).toEqual(["10", "11", "12", "7", "8", "9"]);
+  });
+
+  it("reaches older authorized history beyond the first page", async () => {
+    const f = await fixture(async () => ({ status: "succeeded", text: "ok" }), {
+      history: paged(),
+    });
+    await sync(f.app).syncGroupHistory("fixture", "10003", { maxPages: 10 });
+    expect(await storedIds(f.app)).toHaveLength(TOTAL);
+    expect(await storedIds(f.app)).toContain("1");
+  });
+
+  it("dedupes a repeated sync and stops without looping on a cursor that cannot advance", async () => {
+    const f = await fixture(async () => ({ status: "succeeded", text: "ok" }), {
+      history: paged(),
+    });
+    await sync(f.app).syncGroupHistory("fixture", "10003", { maxPages: 10 });
+    await sync(f.app).syncGroupHistory("fixture", "10003", { maxPages: 10 });
+    expect(await storedIds(f.app)).toHaveLength(TOTAL);
+
+    // A provider that keeps returning the same cursor must not be walked forever.
+    const stuck = await fixture(async () => ({ status: "succeeded", text: "ok" }), {
+      history: () => [message(5), message(5)],
+    });
+    await sync(stuck.app).syncGroupHistory("fixture", "10003", { maxPages: 10 });
+    expect(await storedIds(stuck.app)).toEqual(["5"]);
+  });
+
+  it("stops at the requested time bound", async () => {
+    const f = await fixture(async () => ({ status: "succeeded", text: "ok" }), {
+      history: paged(),
+    });
+    await sync(f.app).syncGroupHistory("fixture", "10003", {
+      maxPages: 10,
+      since: new Date((1_758_000_000 + 9) * 1000).toISOString(),
+    });
+    expect(await storedIds(f.app)).toEqual(["10", "11", "12", "9"]);
+  });
+});
+
+type OwnerContext = {
+  caller: ExecutionInput["caller"];
+  conversationId: string;
+  runId: string;
+};
+interface ManagedGroupProjection {
+  connectionId: string;
+  groups: Array<{
+    groupId: string;
+    categories: Record<string, boolean>;
+    memorySources: Record<string, boolean>;
+    version: number;
+  }>;
+}
+
+/**
+ * The Owner-private management surface as the Owner Tools call it.
+ *
+ * The Tools themselves are covered by `owner-tools.test.ts`; these tests drive the durable
+ * per-Owner behavior through the real `ManagementApplication` path.
+ */
+const admin = (app: ManagementApplication) =>
+  app as unknown as {
+    setGroupAccess(
+      context: OwnerContext,
+      input: { groupId: string; enabled: boolean },
+    ): Promise<{ groupId: string; enabled: boolean; enabledSkills: string[]; version: number }>;
+    projectManagedGroups(context: OwnerContext): Promise<ManagedGroupProjection>;
+  };
+
+/** The mutation categories the fixed default bundle must never enable. */
+const MUTATION_CATEGORIES: readonly QqCapabilityCategory[] = [
+  "group.files.write",
+  "group.moderate",
+  "group.settings",
+  "message.manage",
+];
+
+/** The group-scoped Actions a set of categories confers on a group Resource. */
+const groupActions = (categories: readonly QqCapabilityCategory[]): string[] => [
+  ...new Set(
+    categories.flatMap((category) =>
+      qqCapabilitiesForCategory(category)
+        .filter((capability) => capability.resource === "group")
+        .map((capability) => capability.action),
+    ),
+  ),
+];
+
+describe("per-Owner managed group assignment", () => {
+  const CO_OWNER = "10006";
+  const GROUP = "10005";
+  const OTHER_GROUP = "10007";
+
+  /** Opens a fixture with a second Owner and returns one Owner-private context per Owner. */
+  async function owners(persistentDatabase = false) {
+    const f = await fixture(
+      async (input) => ({ status: "succeeded", text: `answer:${input.text}` }),
+      { coOwnerId: CO_OWNER, persistentDatabase },
+    );
+    f.send(1, "owner-a", true, 10002);
+    const ownerA = await f.started.take();
+    await f.reply("answer:owner-a");
+    f.send(2, "owner-b", true, Number(CO_OWNER));
+    const ownerB = await f.started.take();
+    await f.reply("answer:owner-b");
+    return {
+      f,
+      application: admin(f.app),
+      a: { caller: ownerA.caller, conversationId: ownerA.conversation.id, runId: ownerA.run.id },
+      b: { caller: ownerB.caller, conversationId: ownerB.conversation.id, runId: ownerB.run.id },
+    };
+  }
+
+  const groupIds = async (
+    application: ReturnType<typeof admin>,
+    context: OwnerContext,
+  ): Promise<string[]> =>
+    (await application.projectManagedGroups(context)).groups.map((group) => group.groupId);
+
+  it("assigns a managed group independently for each Owner", async () => {
+    const { application, a, b } = await owners();
+    expect(a.caller.principalId).toBe("owner");
+    expect(b.caller.principalId).toBe(`owner-${CO_OWNER}`);
+
+    await application.setGroupAccess(a, { groupId: GROUP, enabled: true });
+
+    // Owner A's assignment is Owner A's alone: Owner B manages nothing yet.
+    expect(await groupIds(application, a)).toEqual([GROUP]);
+    expect(await groupIds(application, b)).toEqual([]);
+
+    // Owner B may independently enable the very same group.
+    await application.setGroupAccess(b, { groupId: GROUP, enabled: true });
+    expect(await groupIds(application, a)).toEqual([GROUP]);
+    expect(await groupIds(application, b)).toEqual([GROUP]);
+  });
+
+  it("keeps a sibling Owner's assignment and the transport group when one Owner revokes", async () => {
+    const { f, application, a, b } = await owners();
+    await application.setGroupAccess(a, { groupId: GROUP, enabled: true });
+    await application.setGroupAccess(b, { groupId: GROUP, enabled: true });
+
+    const history = (context: OwnerContext) =>
+      f.app.store.authorization.check({
+        caller: context.caller,
+        resourceId: `group:${GROUP}`,
+        action: "history:read",
+      });
+
+    await application.setGroupAccess(a, { groupId: GROUP, enabled: false });
+
+    // Owner A is unassigned; Owner B keeps their own assignment and its authority.
+    expect(await groupIds(application, a)).toEqual([]);
+    expect(await groupIds(application, b)).toEqual([GROUP]);
+    expect((await history(b)).decision).toBe("ALLOW");
+    // The connection-wide transport group stays enabled while an Owner remains assigned.
+    expect(f.app.listChannels()[0]?.groupIds).toContain(GROUP);
+
+    // The last assigned Owner's revocation tears the shared group down.
+    await application.setGroupAccess(b, { groupId: GROUP, enabled: false });
+    expect(f.app.listChannels()[0]?.groupIds).not.toContain(GROUP);
+    expect((await history(b)).decision).toBe("DENY");
+    expect((await history(a)).decision).toBe("DENY");
+  });
+
+  it("persists each Owner's assignment and the fixed policy across a restart", async () => {
+    const { f, application, a, b } = await owners(true);
+    await application.setGroupAccess(a, { groupId: GROUP, enabled: true });
+    await application.setGroupAccess(b, { groupId: OTHER_GROUP, enabled: true });
+
+    const restartedApp = await f.reopen();
+    const restarted = admin(restartedApp);
+
+    expect(await groupIds(restarted, a)).toEqual([GROUP]);
+    expect(await groupIds(restarted, b)).toEqual([OTHER_GROUP]);
+    expect((await restarted.projectManagedGroups(a)).groups[0]?.categories).toEqual(
+      DEFAULT_OWNER_GROUP_POLICY.categories,
+    );
+    expect(restartedApp.listChannels()[0]?.groupIds).toEqual(
+      expect.arrayContaining([GROUP, OTHER_GROUP]),
+    );
+  });
+
+  it("persists the fixed default bundle and never enables a mutation category", async () => {
+    const { f, application, a, b } = await owners();
+    await application.setGroupAccess(a, { groupId: GROUP, enabled: true });
+
+    const stored = await f.app.store.capabilities.read("fixture", GROUP);
+    expect(stored?.policy).toEqual(DEFAULT_OWNER_GROUP_POLICY);
+    expect(stored?.version).toBe(1);
+    for (const category of DEFAULT_OWNER_GROUP_CATEGORIES)
+      expect(stored?.policy.categories[category]).toBe(true);
+    for (const category of MUTATION_CATEGORIES)
+      expect(stored?.policy.categories[category]).toBeUndefined();
+
+    // Owner A holds exactly the bundle's group Actions on the group Resource.
+    const decision = (context: OwnerContext, action: string) =>
+      f.app.store.authorization.check({
+        caller: context.caller,
+        resourceId: `group:${GROUP}`,
+        action,
+      });
+    for (const action of groupActions(DEFAULT_OWNER_GROUP_CATEGORIES))
+      expect((await decision(a, action)).decision).toBe("ALLOW");
+    // `group.history` carries `history:read`, which is what the cross-group search needs.
+    expect((await decision(a, "history:read")).decision).toBe("ALLOW");
+    // No mutation Action is granted, so a moderation attempt cannot pass authorization.
+    for (const action of groupActions(MUTATION_CATEGORIES))
+      expect((await decision(a, action)).decision).toBe("DENY");
+
+    // A second Owner joining the same group grants themselves independently and never
+    // rewrites the policy the first Owner persisted.
+    await application.setGroupAccess(b, { groupId: GROUP, enabled: true });
+    const afterJoin = await f.app.store.capabilities.read("fixture", GROUP);
+    expect(afterJoin?.policy).toEqual(DEFAULT_OWNER_GROUP_POLICY);
+    expect(afterJoin?.version).toBe(1);
+    expect(afterJoin?.updatedByPrincipalId).toBe("owner");
+    for (const action of groupActions(DEFAULT_OWNER_GROUP_CATEGORIES))
+      expect((await decision(b, action)).decision).toBe("ALLOW");
+    for (const action of groupActions(MUTATION_CATEGORIES))
+      expect((await decision(b, action)).decision).toBe("DENY");
   });
 });

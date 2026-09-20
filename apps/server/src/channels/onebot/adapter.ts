@@ -9,13 +9,26 @@ import {
   type OneBotConnectionConfig,
 } from "./config.ts";
 import { normalizeOneBotMessage, type OneBotIncomingMessage } from "./normalize.ts";
-import { normalizeOneBotHistoryRecord, type OneBotHistoryMessage } from "./history.ts";
+import {
+  historySequence,
+  normalizeOneBotHistoryRecord,
+  type OneBotHistoryMessage,
+} from "./history.ts";
 import { GROUP_SCOPED_NAPCAT_ACTIONS, isAllowedNapCatAction } from "./capabilities.ts";
 
 const GROUP_SCOPED_ACTIONS = new Set(GROUP_SCOPED_NAPCAT_ACTIONS);
 
 export type OneBotHistoryResult =
-  | { status: "ok"; messages: OneBotHistoryMessage[] }
+  | {
+      status: "ok";
+      messages: OneBotHistoryMessage[];
+      /**
+       * The provider sequence to pass back as `message_seq` to read the next older page.
+       * Absent when the page carried no usable sequence, which is the caller's signal that
+       * paging cannot advance and the walk must stop rather than repeat this page.
+       */
+      nextCursor?: string;
+    }
   | {
       status: "failed";
       code: "invalid_group" | "not_connected" | "request_limit" | "api_rejected";
@@ -191,7 +204,6 @@ export class OneBotAdapter {
     if (this.#state.status !== "ready" || !socket) throw new OneBotConnectionError("disconnected");
     const result = await this.#request(socket, "get_group_info", {
       group_id: Number(parsed.groupIds[0]),
-      no_cache: true,
     });
     return result.status === "ok" && qqId(object(result.data)?.group_id) === groupId;
   }
@@ -232,14 +244,25 @@ export class OneBotAdapter {
     const raw = object(result.data)?.messages;
     if (!Array.isArray(raw)) return { status: "unknown", code: "invalid_response" };
     const messages: OneBotHistoryMessage[] = [];
+    let oldestSequence: number | undefined;
     for (const record of raw) {
+      const sequence = historySequence(record);
+      if (sequence !== undefined && (oldestSequence === undefined || sequence < oldestSequence))
+        oldestSequence = sequence;
       const normalized = normalizeOneBotHistoryRecord(record, groupId, this.config.botId);
       if (normalized) messages.push(normalized);
     }
     messages.sort((a, b) =>
       a.occurredAt < b.occurredAt ? 1 : a.occurredAt > b.occurredAt ? -1 : 0,
     );
-    return { status: "ok", messages };
+    // The oldest sequence on this page is the cursor for the next older page. Deriving it
+    // from the raw records (not the normalized messages) means an attachment-only page
+    // still advances instead of stalling the walk.
+    return {
+      status: "ok",
+      messages,
+      ...(oldestSequence === undefined ? {} : { nextCursor: String(oldestSequence) }),
+    };
   }
 
   /**

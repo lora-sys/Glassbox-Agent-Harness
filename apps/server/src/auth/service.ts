@@ -368,6 +368,34 @@ export class AuthorizationService {
     });
   }
 
+  /**
+   * True when an active (unrevoked) grant exists for this exact Principal, Resource,
+   * Action and scope.
+   *
+   * The reverse-state checks need to know whether *anyone* still holds an assignment
+   * before tearing shared state down — for example whether a group still has an assigned
+   * Owner after one Owner revokes. Reading the grant directly avoids treating a `check`
+   * denial (which may be a visibility rule rather than a missing grant) as absence.
+   */
+  async hasActiveGrant(input: {
+    principalId: string;
+    resourceId: string;
+    action: string;
+    scope: TrustedChannelScope;
+  }): Promise<boolean> {
+    requireIdentifier(input.principalId);
+    requireIdentifier(input.resourceId);
+    requireIdentifier(input.action);
+    const key = scopeKey(input.scope);
+    return this.db.transaction(async (tx) => {
+      const rows = await tx.execute({
+        sql: "SELECT id FROM grants WHERE principal_id = ? AND resource_id = ? AND action = ? AND scope_key = ? AND effect = 'allow' AND revoked_at IS NULL LIMIT 1",
+        args: [input.principalId, input.resourceId, input.action, key],
+      });
+      return rows.rows.length > 0;
+    });
+  }
+
   check(request: AuthorizationRequest): Promise<AuthorizationDecision> {
     return this.db.transaction((tx) => evaluate(tx, request));
   }

@@ -7,6 +7,16 @@ export interface ProtectedToolContext {
   caller: CallerContext;
   conversationId: string;
   runId: string;
+  /**
+   * The Tool the *current user message* requires, when it requires one.
+   *
+   * Derived only from `input.text`, never from Conversation history, retrieved history text,
+   * notices, file content or an earlier Tool result. A mutating Tool reads it to prove the
+   * mutation was asked for, so retrieved text can never become mutation authority.
+   */
+  requiredToolName?: string;
+  /** The exact input the current user message requires of that Tool. */
+  requiredToolInput?: Record<string, unknown>;
 }
 
 /**
@@ -51,6 +61,31 @@ export interface ProtectedToolOptions<
     signal?: AbortSignal,
   ) => Promise<TResult>;
   redactSensitive?: (params: TParams) => Record<string, unknown>;
+}
+
+/**
+ * Refuses a mutating call the current user message did not ask for.
+ *
+ * A mutation is only permitted when the Run's required-Tool context names this Tool *and*
+ * every key that context carries agrees with the call. That context is derived from the
+ * current user message alone, so a retrieved instruction — group history, a notice, file
+ * content, a Tool result, Conversation history — cannot create mutation authority, and a
+ * read-only question cannot turn into a mutation.
+ *
+ * The refusal is a fixed code rather than a permission reason: whether the mutation was
+ * requested is a property of the current message, not of any grant.
+ */
+export function requireMutationIntent(
+  context: ProtectedToolContext,
+  name: string,
+  actual: Readonly<Record<string, unknown>>,
+): void {
+  if (context.requiredToolName !== name) throw new ToolInputError("mutation_not_requested");
+  const required = context.requiredToolInput;
+  if (!required) throw new ToolInputError("mutation_not_requested");
+  for (const [key, value] of Object.entries(required)) {
+    if (actual[key] !== value) throw new ToolInputError("mutation_not_requested");
+  }
 }
 
 export function createProtectedTool<

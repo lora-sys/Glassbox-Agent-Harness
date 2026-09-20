@@ -4,6 +4,7 @@ import { WebSocketServer, type WebSocket } from "ws";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import { OneBotAdapter, type OneBotAdapterOptions } from "./adapter.ts";
 import { parseOneBotConfig } from "./config.ts";
+import { historySequence } from "./history.ts";
 
 const base = {
   connectionId: "napcat-test",
@@ -181,6 +182,54 @@ describe("OneBot typed group history bridge", () => {
     expect(result.messages.map((m) => m.messageId)).toEqual(["501"]);
   });
 
+  it("derives a nextCursor from the oldest provider sequence so a walk can page backwards", async () => {
+    const fixture = await server([
+      historyRecord({ message_id: 501, message_seq: 501 }),
+      historyRecord({ message_id: 480, message_seq: 480 }),
+      historyRecord({ message_id: 495, message_seq: 495 }),
+    ]);
+    const adapter = client(fixture.endpoint);
+    await adapter.start();
+
+    const result = await adapter.getGroupHistory({ groupId: "10003", count: 100 });
+    expect(result.status).toBe("ok");
+    if (result.status !== "ok") return;
+    // The oldest sequence on the page is what reads the next older page.
+    expect(result.nextCursor).toBe("480");
+
+    const next = await adapter.getGroupHistory({ groupId: "10003", cursor: "480" });
+    expect(next.status).toBe("ok");
+    const requests = fixture.actions.filter((a) => a.action === "get_group_msg_history");
+    expect(requests.at(-1)?.params).toMatchObject({ group_id: 10003, message_seq: 480 });
+  });
+
+  it("omits nextCursor when the page carries no provider sequence", async () => {
+    const fixture = await server([historyRecord()]);
+    const adapter = client(fixture.endpoint);
+    await adapter.start();
+
+    const result = await adapter.getGroupHistory({ groupId: "10003" });
+    expect(result.status).toBe("ok");
+    if (result.status !== "ok") return;
+    // No sequence means paging cannot advance; the caller must stop rather than repeat.
+    expect(result.nextCursor).toBeUndefined();
+  });
+
+  it("advances the cursor from raw records even when a page normalizes to no text", async () => {
+    const fixture = await server([
+      historyRecord({ message_id: 502, message_seq: 502, message: [{ type: "image", data: {} }] }),
+      historyRecord({ message_id: 480, message_seq: 480, message: [{ type: "image", data: {} }] }),
+    ]);
+    const adapter = client(fixture.endpoint);
+    await adapter.start();
+
+    const result = await adapter.getGroupHistory({ groupId: "10003" });
+    expect(result.status).toBe("ok");
+    if (result.status !== "ok") return;
+    expect(result.messages).toEqual([]);
+    expect(result.nextCursor).toBe("480");
+  });
+
   it("reports an unknown result when the runtime rejects the action", async () => {
     const wss = new WebSocketServer({
       host: "127.0.0.1",
@@ -217,5 +266,22 @@ describe("OneBot typed group history bridge", () => {
 
     const result = await adapter.getGroupHistory({ groupId: "10003" });
     expect(result).toEqual({ status: "failed", code: "api_rejected", retcode: 1404 });
+  });
+});
+
+describe("OneBot history paging sequence", () => {
+  it("reads the provider sequence, tolerating a string encoding", () => {
+    expect(historySequence({ message_seq: 501 })).toBe(501);
+    expect(historySequence({ real_seq: "480" })).toBe(480);
+    expect(historySequence({ message_seq: 495, real_seq: 480 })).toBe(495);
+  });
+
+  it("refuses a missing, non-positive or unsafe sequence", () => {
+    expect(historySequence({})).toBeUndefined();
+    expect(historySequence({ message_seq: 0 })).toBeUndefined();
+    expect(historySequence({ message_seq: -1 })).toBeUndefined();
+    expect(historySequence({ message_seq: 1.5 })).toBeUndefined();
+    expect(historySequence({ message_seq: "abc" })).toBeUndefined();
+    expect(historySequence(null)).toBeUndefined();
   });
 });

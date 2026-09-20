@@ -9,6 +9,8 @@
  * copied. See `upstream/napcat/SOURCES.md`.
  */
 
+import { createHash } from "node:crypto";
+
 export const QQ_CAPABILITY_CATEGORIES = [
   "group.read",
   "group.members",
@@ -85,7 +87,7 @@ export const QQ_CAPABILITIES: readonly QqCapability[] = [
     resource: "group",
     // Deliberately no `get_group_list`: the Owner's groups are the managed allowlist,
     // never every group the bot happens to have joined.
-    operations: [group("get_group_info", ["group_id", "no_cache"])],
+    operations: [group("get_group_info", ["group_id"])],
     description: "Read one managed QQ group's provider metadata.",
   },
   {
@@ -115,8 +117,10 @@ export const QQ_CAPABILITIES: readonly QqCapability[] = [
     risk: "read",
     action: "group:content:read",
     resource: "group",
+    // The provider's notice reader is `_get_group_notice` (GoCQHTTP_GetGroupNotice), not
+    // `get_group_notice`; a wrong name would be refused by NapCat rather than by Glassbox.
     operations: [
-      group("get_group_notice", ["group_id"]),
+      group("_get_group_notice", ["group_id"]),
       group("get_essence_msg_list", ["group_id"]),
     ],
     description: "Read a managed group's notices and essence messages.",
@@ -130,7 +134,7 @@ export const QQ_CAPABILITIES: readonly QqCapability[] = [
     operations: [
       group("get_group_root_files", ["group_id"]),
       group("get_group_files_by_folder", ["group_id", "folder_id"], ["group_id", "folder_id"]),
-      group("get_group_file_url", ["group_id", "file_id", "busid"], ["group_id", "file_id"]),
+      group("get_group_file_url", ["group_id", "file_id"], ["group_id", "file_id"]),
     ],
     description: "List a managed group's files and folders, or resolve a file download URL.",
   },
@@ -146,8 +150,8 @@ export const QQ_CAPABILITIES: readonly QqCapability[] = [
         ["group_id", "file", "name", "folder_id"],
         ["group_id", "file", "name"],
       ),
-      group("delete_group_file", ["group_id", "file_id", "busid"], ["group_id", "file_id"]),
-      group("create_group_file_folder", ["group_id", "name", "parent_id"], ["group_id", "name"]),
+      group("delete_group_file", ["group_id", "file_id"], ["group_id", "file_id"]),
+      group("create_group_file_folder", ["group_id", "name"], ["group_id", "name"]),
     ],
     description: "Change a managed group's files or folders.",
   },
@@ -205,18 +209,26 @@ export const QQ_CAPABILITIES: readonly QqCapability[] = [
  * mapped to a Tool, and never reachable from model-visible Context.
  *
  * Raw send actions are listed here for the same reason: Glassbox Delivery must remain
- * the only outbound message path.
+ * the only outbound message path. Service-restart and cache-maintenance actions are here
+ * because they change the runtime itself rather than QQ data.
+ *
+ * Every name is the provider's real OneBot action string at the pinned commit. The
+ * credential action is `get_csrf_token` (not `get_csrf`) and the rkey pair is
+ * `get_rkey` / `nc_get_rkey`; a wrong name here would silently fail to classify the real
+ * action, so `checkNapCatContract` reports it as unclassified drift instead.
  */
 export const SERVER_ONLY_NAPCAT_ACTIONS: readonly string[] = [
   "get_credentials",
   "get_cookies",
-  "get_csrf",
+  "get_csrf_token",
   "get_clientkey",
   "get_rkey",
-  "get_rkey_ex",
+  "nc_get_rkey",
+  "get_rkey_server",
   "send_packet",
   "bot_exit",
-  "call_action",
+  "set_restart",
+  "clean_cache",
   "send_group_msg",
   "send_private_msg",
   "send_msg",
@@ -283,29 +295,236 @@ export function resolveQqOperation(
   return operation;
 }
 
+/** One allowlisted provider action plus the exact parameter names Glassbox may forward. */
+export interface NapCatActionContract {
+  action: string;
+  params: readonly string[];
+  required: readonly string[];
+}
+
+/**
+ * The allowlisted provider contract, in canonical order.
+ *
+ * This is the reference the drift check and the pinned snapshot digest are computed from.
+ * It is derived from the registry so a capability edit cannot leave the snapshot stale.
+ */
+export const NAPCAT_ALLOWLISTED_CONTRACTS: readonly NapCatActionContract[] = Object.freeze(
+  QQ_CAPABILITIES.flatMap((capability) =>
+    capability.operations.map((operation) => ({
+      action: operation.action,
+      params: [...operation.params],
+      required: [...operation.required],
+    })),
+  )
+    .filter(
+      (contract, index, all) =>
+        all.findIndex((candidate) => candidate.action === contract.action) === index,
+    )
+    .sort((a, b) => (a.action < b.action ? -1 : a.action > b.action ? 1 : 0)),
+);
+
+/**
+ * Deterministic digest of the allowlisted provider contract.
+ *
+ * Two contract sets produce the same digest only when every action, its parameter
+ * allowlist and its required set are identical. A provider upgrade that adds, renames or
+ * re-shapes an action therefore changes the digest, which the drift check surfaces
+ * instead of silently widening Glassbox authority.
+ */
+export function napCatContractDigest(
+  contracts: readonly NapCatActionContract[] = NAPCAT_ALLOWLISTED_CONTRACTS,
+): string {
+  const canonical = contracts
+    .map((contract) => [
+      contract.action,
+      [...contract.params].sort(),
+      [...contract.required].sort(),
+    ])
+    .sort((a, b) => (String(a[0]) < String(b[0]) ? -1 : 1));
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+}
+
+/** What the provider declares for one action: its payload parameters and return-schema keys. */
+export interface NapCatProviderSchema {
+  /** Payload parameter names the provider declares. Glassbox may only forward a subset. */
+  payload: readonly string[];
+  /** Top-level keys of the declared return schema; empty when the provider returns an opaque schema. */
+  returned: readonly string[];
+}
+
+/**
+ * Provider-declared payload and return schemas at the pinned commit, keyed by action name.
+ *
+ * Read from each action's `payloadSchema` / `returnSchema` in the pinned checkout. This is
+ * what makes "unsupported parameter" detectable without the checkout present: Glassbox may
+ * forward a parameter only when the provider declares it. A `returned` of `[]` means the
+ * provider returns an opaque, non-object schema (a named schema, `Type.Any`, or `Type.Null`).
+ */
+export const NAPCAT_PROVIDER_SCHEMAS: Readonly<Record<string, NapCatProviderSchema>> =
+  Object.freeze({
+    get_group_info: { payload: ["group_id"], returned: [] },
+    get_group_member_list: { payload: ["group_id", "no_cache"], returned: [] },
+    get_group_member_info: { payload: ["group_id", "user_id", "no_cache"], returned: [] },
+    get_group_msg_history: {
+      payload: [
+        "group_id",
+        "message_seq",
+        "count",
+        "reverse_order",
+        "disable_get_url",
+        "parse_mult_msg",
+        "quick_reply",
+        "reverseOrder",
+      ],
+      returned: ["messages"],
+    },
+    _get_group_notice: {
+      payload: ["group_id"],
+      returned: ["sender_id", "publish_time", "notice_id", "message", "settings", "read_num"],
+    },
+    get_essence_msg_list: {
+      payload: ["group_id"],
+      returned: [
+        "msg_seq",
+        "msg_random",
+        "sender_id",
+        "sender_nick",
+        "operator_id",
+        "operator_nick",
+        "message_id",
+        "operator_time",
+        "content",
+      ],
+    },
+    get_group_root_files: { payload: ["group_id", "file_count"], returned: ["files", "folders"] },
+    get_group_files_by_folder: {
+      payload: ["group_id", "folder_id", "folder", "file_count"],
+      returned: ["files", "folders"],
+    },
+    get_group_file_url: { payload: ["group_id", "file_id"], returned: ["url"] },
+    upload_group_file: {
+      payload: ["group_id", "file", "name", "folder", "folder_id", "upload_file"],
+      returned: ["file_id"],
+    },
+    delete_group_file: { payload: ["group_id", "file_id"], returned: [] },
+    create_group_file_folder: {
+      payload: ["group_id", "folder_name", "name"],
+      returned: ["result", "groupItem"],
+    },
+    set_group_ban: { payload: ["group_id", "user_id", "duration"], returned: [] },
+    set_group_kick: { payload: ["group_id", "user_id", "reject_add_request"], returned: [] },
+    set_group_whole_ban: { payload: ["group_id", "enable"], returned: [] },
+    set_group_name: { payload: ["group_id", "group_name"], returned: [] },
+    set_group_card: { payload: ["group_id", "user_id", "card"], returned: [] },
+    set_group_admin: { payload: ["group_id", "user_id", "enable"], returned: [] },
+    get_login_info: { payload: [], returned: [] },
+    get_version_info: { payload: [], returned: ["app_name", "protocol_version", "app_version"] },
+    get_status: { payload: [], returned: ["online", "good", "stat"] },
+  });
+
+/** Deterministic digest of the recorded provider payload and return schemas. */
+export function napCatProviderSchemaDigest(
+  schemas: Readonly<Record<string, NapCatProviderSchema>> = NAPCAT_PROVIDER_SCHEMAS,
+): string {
+  const canonical = Object.keys(schemas)
+    .sort()
+    .map((action) => [
+      action,
+      [...schemas[action].payload].sort(),
+      [...schemas[action].returned].sort(),
+    ]);
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+}
+
+/**
+ * Allowlist entries that the provider does not actually support.
+ *
+ * Two shapes: an allowlisted action the provider never declares, and an allowlisted
+ * parameter the provider's payload schema never accepts. Both mean Glassbox would issue a
+ * request the provider cannot honour, so the verifier fails closed on a non-empty result.
+ */
+export function unsupportedNapCatContract(
+  schemas: Readonly<Record<string, NapCatProviderSchema>> = NAPCAT_PROVIDER_SCHEMAS,
+): readonly string[] {
+  const violations: string[] = [];
+  for (const contract of NAPCAT_ALLOWLISTED_CONTRACTS) {
+    const provider = schemas[contract.action];
+    if (!provider) {
+      violations.push(`${contract.action}:unknown_action`);
+      continue;
+    }
+    const declared = new Set(provider.payload);
+    for (const param of contract.params) {
+      if (!declared.has(param)) violations.push(`${contract.action}:${param}`);
+    }
+  }
+  return violations;
+}
+
 export interface NapCatContractSnapshot {
   provider: string;
   contract: string;
-  /** Glassbox capability-contract snapshot revision. */
+  /** Pinned provider commit this contract was read from. */
+  commit: string;
+  /** Provider package version at that commit. */
   version: string;
   license: string;
-  sourcePath: string;
+  /** Original upstream paths the contract was read from. No provider source is vendored. */
+  sourcePaths: readonly string[];
+  /** Digest of the Glassbox allowlisted provider contract. */
+  contractDigest: string;
+  /** Provider-declared payload and return schemas at the pinned commit. */
+  providerSchemas: Readonly<Record<string, NapCatProviderSchema>>;
+  /** Digest of `providerSchemas`. */
+  providerSchemaDigest: string;
   allowlistedActions: readonly string[];
+  serverOnlyActions: readonly string[];
 }
 
 /**
  * Pinned view of the NapCat public action contract that Glassbox allowlists.
  *
- * The provider release is pinned during real-device verification; until then this
- * snapshot is the reference the drift check compares against.
+ * Verified against the pinned checkout rather than assumed. `scripts/verify-napcat-contract.mts`
+ * re-derives every action name and parameter allowlist from that checkout and fails closed
+ * when the snapshot and the provider disagree.
  */
 export const NAPCAT_CONTRACT_SNAPSHOT: NapCatContractSnapshot = Object.freeze({
   provider: "NapNeko/NapCatQQ",
   contract: "onebot11",
-  version: "1.0.0",
-  license: "Limited Redistribution License",
-  sourcePath: "packages/napcat-onebot/action/index.ts",
+  commit: "109d0c1dff755875f3b79795e99cee6115289fbb",
+  version: "0.0.1",
+  license: "Limited Redistribution License for NapCat",
+  sourcePaths: Object.freeze([
+    "packages/napcat-onebot/action/router.ts",
+    "packages/napcat-onebot/action/OneBotAction.ts",
+    "packages/napcat-onebot/action/schemas.ts",
+    "packages/napcat-onebot/action/group/GetGroupInfo.ts",
+    "packages/napcat-onebot/action/group/GetGroupMemberList.ts",
+    "packages/napcat-onebot/action/group/GetGroupMemberInfo.ts",
+    "packages/napcat-onebot/action/group/GetGroupNotice.ts",
+    "packages/napcat-onebot/action/group/GetGroupEssence.ts",
+    "packages/napcat-onebot/action/group/SetGroupBan.ts",
+    "packages/napcat-onebot/action/group/SetGroupKick.ts",
+    "packages/napcat-onebot/action/group/SetGroupWholeBan.ts",
+    "packages/napcat-onebot/action/group/SetGroupName.ts",
+    "packages/napcat-onebot/action/group/SetGroupCard.ts",
+    "packages/napcat-onebot/action/group/SetGroupAdmin.ts",
+    "packages/napcat-onebot/action/go-cqhttp/GetGroupMsgHistory.ts",
+    "packages/napcat-onebot/action/go-cqhttp/GetGroupRootFiles.ts",
+    "packages/napcat-onebot/action/go-cqhttp/GetGroupFilesByFolder.ts",
+    "packages/napcat-onebot/action/go-cqhttp/UploadGroupFile.ts",
+    "packages/napcat-onebot/action/go-cqhttp/DeleteGroupFile.ts",
+    "packages/napcat-onebot/action/go-cqhttp/CreateGroupFileFolder.ts",
+    "packages/napcat-onebot/action/file/GetGroupFileUrl.ts",
+    "packages/napcat-onebot/action/system/GetLoginInfo.ts",
+    "packages/napcat-onebot/action/system/GetVersionInfo.ts",
+    "packages/napcat-onebot/action/system/GetStatus.ts",
+  ]),
+  contractDigest: napCatContractDigest(),
+  providerSchemas: NAPCAT_PROVIDER_SCHEMAS,
+  providerSchemaDigest: napCatProviderSchemaDigest(),
   allowlistedActions: QQ_ALLOWED_NAPCAT_ACTIONS,
+  serverOnlyActions: Object.freeze([...SERVER_ONLY_NAPCAT_ACTIONS]),
 });
 
 export type NapCatContractDrift =
@@ -323,7 +542,7 @@ export function checkNapCatContract(observed: readonly string[]): NapCatContract
   const present = new Set(observed);
   const known = new Set<string>([
     ...NAPCAT_CONTRACT_SNAPSHOT.allowlistedActions,
-    ...SERVER_ONLY_NAPCAT_ACTIONS,
+    ...NAPCAT_CONTRACT_SNAPSHOT.serverOnlyActions,
   ]);
   const missing = NAPCAT_CONTRACT_SNAPSHOT.allowlistedActions.filter(
     (action) => !present.has(action),

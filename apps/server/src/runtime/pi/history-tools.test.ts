@@ -1,9 +1,15 @@
-import { expect, it } from "vite-plus/test";
+import { expect, it, vi } from "vite-plus/test";
 import { openDomainStore } from "../../persistence/index.js";
 import { ChannelArchiveStore } from "../../retrieval/channel-archive.js";
 import { groupResourceId } from "../../retrieval/source-resolver.js";
 import { createHistoryTools, availableHistoryToolNames } from "./history-tools.js";
-import { GROUP_HISTORY_SEARCH_TOOL, OWNER_HISTORY_SEARCH_TOOL } from "./history-tools.js";
+import {
+  GROUP_HISTORY_SEARCH_TOOL,
+  OWNER_HISTORY_ACTION,
+  OWNER_HISTORY_RESOURCE,
+  OWNER_HISTORY_SEARCH_TOOL,
+  type HistoryRetrievalEvidence,
+} from "./history-tools.js";
 
 const connectionId = "qq";
 const botId = "bot";
@@ -29,6 +35,14 @@ const ownerPrivate = {
   chatId: "owner",
   senderId: "owner",
 };
+/** A second Owner principal on the same connection, with its own private scope. */
+const coOwnerPrivate = {
+  connectionId,
+  botId,
+  chatType: "private" as const,
+  chatId: "co-owner",
+  senderId: "co-owner",
+};
 
 async function fixture() {
   const store = await openDomainStore({ databasePath: ":memory:" });
@@ -36,15 +50,17 @@ async function fixture() {
   await store.identities.bindOwner("owner", ownerPrivate);
   await store.identities.bindPrincipal("owner", group100);
   await store.identities.bindPrincipal("owner", group200);
+  await store.identities.createPrincipal("owner-co", "owner");
+  await store.identities.bindPrincipal("owner-co", coOwnerPrivate);
   await store.authorization.registerResource({
     id: "agent:personal",
     kind: "agent",
     visibility: "public",
     ifAbsent: true,
   });
-  for (const scope of [ownerPrivate, group100, group200]) {
+  for (const scope of [ownerPrivate, group100, group200, coOwnerPrivate]) {
     await store.authorization.grant({
-      principalId: "owner",
+      principalId: scope === coOwnerPrivate ? "owner-co" : "owner",
       resourceId: "agent:personal",
       action: "run:create",
       scope,
@@ -59,6 +75,22 @@ async function fixture() {
       ifAbsent: true,
     });
   }
+  // The Owner cross-group Tool is gated on the Owner's own search capability.
+  await store.authorization.registerResource({
+    id: OWNER_HISTORY_RESOURCE,
+    kind: "owner-history",
+    visibility: "private",
+    ownerId: "owner",
+    ifAbsent: true,
+  });
+  for (const principalId of ["owner", "owner-co"])
+    await store.authorization.grant({
+      principalId,
+      resourceId: OWNER_HISTORY_RESOURCE,
+      action: OWNER_HISTORY_ACTION,
+      scope: principalId === "owner" ? ownerPrivate : coOwnerPrivate,
+      effect: "allow",
+    });
   const archive = new ChannelArchiveStore(store.db);
   await archive.ingest({
     channel: "qq",
@@ -81,9 +113,43 @@ async function fixture() {
   return { store, archive };
 }
 
+type Store = Awaited<ReturnType<typeof fixture>>["store"];
+type PrivateScope = typeof ownerPrivate | typeof coOwnerPrivate;
+
+/** Records one Principal's assignment of one managed group. Assignment is not authority. */
+const assign = (
+  store: Store,
+  groupId: string,
+  scope: PrivateScope = ownerPrivate,
+  principalId = "owner",
+) =>
+  store.authorization.grant({
+    principalId,
+    resourceId: groupResourceId(groupId),
+    action: "group:manage",
+    scope,
+    effect: "allow",
+  });
+
+/** Grants the authority to read one group's history from a private scope. */
+const authorizeHistory = (
+  store: Store,
+  groupId: string,
+  scope: PrivateScope = ownerPrivate,
+  principalId = "owner",
+) =>
+  store.authorization.grant({
+    principalId,
+    resourceId: groupResourceId(groupId),
+    action: "history:read",
+    scope,
+    effect: "allow",
+  });
+
 async function accept(
-  store: Awaited<ReturnType<typeof openDomainStore>>,
-  scope: typeof group100 | typeof ownerPrivate,
+  store: Store,
+  scope: typeof group100 | typeof ownerPrivate | typeof coOwnerPrivate,
+  principalId = "owner",
 ) {
   const accepted = await store.conversations.acceptIncoming({
     agentId: "personal",
@@ -92,6 +158,7 @@ async function accept(
     text: "search history",
     executionRef: "pi:test",
   });
+  void principalId;
   return accepted;
 }
 
@@ -140,8 +207,8 @@ it("restricts the current-group tool to the group the Run is in", async () => {
     const result = await call(toolByName(tools, GROUP_HISTORY_SEARCH_TOOL), {
       query: "deploy rollback",
     });
-    const details = result.details as { groupId: string; items: Array<{ sourceId: string }> };
-    expect(details.groupId).toBe("100");
+    const details = result.details as { groups: string[]; items: Array<{ sourceId: string }> };
+    expect(details.groups).toEqual(["100"]);
     expect(details.items.every((item) => item.sourceId === "100")).toBe(true);
     expect(details.items).toHaveLength(1);
   } finally {
@@ -171,16 +238,122 @@ it("defaults to DENY for the current group without a history:read grant", async 
   }
 });
 
-it("lets an Owner-private Run search a named authorized group but not an unauthorized one", async () => {
+it("searches several authorized groups in one Owner-private call", async () => {
   const { store, archive } = await fixture();
   try {
-    await store.authorization.grant({
-      principalId: "owner",
-      resourceId: groupResourceId("200"),
-      action: "history:read",
-      scope: ownerPrivate,
-      effect: "allow",
+    for (const gid of ["100", "200"]) {
+      await assign(store, gid);
+      await authorizeHistory(store, gid);
+    }
+    const accepted = await accept(store, ownerPrivate);
+    const synced: string[] = [];
+    const tools = createHistoryTools({
+      store,
+      archive,
+      getContext: () => ({
+        caller: { principalId: "owner", scope: ownerPrivate },
+        runId: accepted.run.id,
+        conversationId: accepted.conversation.id,
+      }),
+      syncGroup: async (groupId) => {
+        synced.push(groupId);
+      },
     });
+
+    const result = await call(toolByName(tools, OWNER_HISTORY_SEARCH_TOOL), {
+      query: "deploy rollback",
+    });
+    const details = result.details as {
+      groups: string[];
+      items: Array<{ sourceId: string; resourceId: string; rank: number; matchedTerms: string[] }>;
+    };
+    expect(details.groups).toEqual(["100", "200"]);
+    expect(details.items.map((item) => item.sourceId).sort()).toEqual(["100", "200"]);
+    expect(details.items.map((item) => item.resourceId).sort()).toEqual(["group:100", "group:200"]);
+    expect(details.items.map((item) => item.rank).sort((a, b) => a - b)).toEqual([1, 2]);
+    expect(details.items.every((item) => item.matchedTerms.includes("deploy"))).toBe(true);
+    expect(synced.sort()).toEqual(["100", "200"]);
+  } finally {
+    await store.close();
+  }
+});
+
+it("intersects requested filters with the authorized set before loading text", async () => {
+  const { store, archive } = await fixture();
+  try {
+    for (const gid of ["100", "200"]) {
+      await assign(store, gid);
+      await authorizeHistory(store, gid);
+    }
+    const accepted = await accept(store, ownerPrivate);
+    const synced: string[] = [];
+    const tools = createHistoryTools({
+      store,
+      archive,
+      getContext: () => ({
+        caller: { principalId: "owner", scope: ownerPrivate },
+        runId: accepted.run.id,
+        conversationId: accepted.conversation.id,
+      }),
+      syncGroup: async (groupId) => {
+        synced.push(groupId);
+      },
+    });
+
+    const result = await call(toolByName(tools, OWNER_HISTORY_SEARCH_TOOL), {
+      groupIds: ["100"],
+      query: "deploy rollback",
+    });
+    const details = result.details as { groups: string[]; items: Array<{ sourceId: string }> };
+    expect(details.groups).toEqual(["100"]);
+    expect(details.items.map((item) => item.sourceId)).toEqual(["100"]);
+    expect(synced).toEqual(["100"]);
+  } finally {
+    await store.close();
+  }
+});
+
+it("fetches nothing and returns no candidate for an unauthorized group", async () => {
+  const { store, archive } = await fixture();
+  try {
+    await assign(store, "100");
+    await authorizeHistory(store, "100");
+    const accepted = await accept(store, ownerPrivate);
+    const synced: string[] = [];
+    const tools = createHistoryTools({
+      store,
+      archive,
+      getContext: () => ({
+        caller: { principalId: "owner", scope: ownerPrivate },
+        runId: accepted.run.id,
+        conversationId: accepted.conversation.id,
+      }),
+      syncGroup: async (groupId) => {
+        synced.push(groupId);
+      },
+    });
+
+    // Group 200 is neither assigned nor granted: zero fetch, zero candidates, no throw.
+    const result = await call(toolByName(tools, OWNER_HISTORY_SEARCH_TOOL), {
+      groupIds: ["200"],
+      query: "deploy rollback",
+    });
+    const details = result.details as { groups: string[]; items: unknown[] };
+    expect(details.groups).toEqual([]);
+    expect(details.items).toEqual([]);
+    expect(synced).toEqual([]);
+  } finally {
+    await store.close();
+  }
+});
+
+it("stops searching a group once its grant is revoked", async () => {
+  const { store, archive } = await fixture();
+  try {
+    for (const gid of ["100", "200"]) {
+      await assign(store, gid);
+      await authorizeHistory(store, gid);
+    }
     const accepted = await accept(store, ownerPrivate);
     const tools = createHistoryTools({
       store,
@@ -193,14 +366,95 @@ it("lets an Owner-private Run search a named authorized group but not an unautho
     });
     const ownerTool = toolByName(tools, OWNER_HISTORY_SEARCH_TOOL);
 
-    const allowed = await call(ownerTool, { groupId: "200", query: "deploy rollback" });
-    const details = allowed.details as { items: Array<{ sourceId: string }> };
-    expect(details.items.map((item) => item.sourceId)).toEqual(["200"]);
+    const before = await call(ownerTool, { query: "deploy rollback" });
+    expect((before.details as { groups: string[] }).groups).toEqual(["100", "200"]);
 
-    // Group 100 was never granted: the Owner role itself does not bypass the Resource grant.
-    await expect(call(ownerTool, { groupId: "100", query: "deploy" })).rejects.toThrow(
-      "Permission denied: no_grant",
-    );
+    await store.authorization.revokeScope({
+      principalId: "owner",
+      resourceId: groupResourceId("200"),
+      scope: ownerPrivate,
+    });
+    const after = await call(ownerTool, { query: "deploy rollback" });
+    const details = after.details as { groups: string[]; items: Array<{ sourceId: string }> };
+    expect(details.groups).toEqual(["100"]);
+    expect(details.items.every((item) => item.sourceId === "100")).toBe(true);
+  } finally {
+    await store.close();
+  }
+});
+
+it("keeps one Owner's assigned group set out of another Owner's search", async () => {
+  const { store, archive } = await fixture();
+  try {
+    await assign(store, "100", ownerPrivate, "owner");
+    await authorizeHistory(store, "100", ownerPrivate, "owner");
+    await assign(store, "200", coOwnerPrivate, "owner-co");
+    await authorizeHistory(store, "200", coOwnerPrivate, "owner-co");
+    const accepted = await accept(store, coOwnerPrivate);
+
+    const tools = createHistoryTools({
+      store,
+      archive,
+      getContext: () => ({
+        caller: { principalId: "owner-co", scope: coOwnerPrivate },
+        runId: accepted.run.id,
+        conversationId: accepted.conversation.id,
+      }),
+    });
+    const result = await call(toolByName(tools, OWNER_HISTORY_SEARCH_TOOL), {
+      query: "deploy rollback",
+    });
+    const details = result.details as { groups: string[]; items: Array<{ sourceId: string }> };
+    expect(details.groups).toEqual(["200"]);
+    expect(details.items.map((item) => item.sourceId)).toEqual(["200"]);
+  } finally {
+    await store.close();
+  }
+});
+
+it("records safe retrieval evidence without protected message text", async () => {
+  const { store, archive } = await fixture();
+  try {
+    for (const gid of ["100", "200"]) {
+      await assign(store, gid);
+      await authorizeHistory(store, gid);
+    }
+    const accepted = await accept(store, ownerPrivate);
+    const evidence = vi.fn(async (_value: HistoryRetrievalEvidence) => {});
+    const tools = createHistoryTools({
+      store,
+      archive,
+      getContext: () => ({
+        caller: { principalId: "owner", scope: ownerPrivate },
+        runId: accepted.run.id,
+        conversationId: accepted.conversation.id,
+      }),
+      recordEvidence: evidence,
+    });
+
+    await call(toolByName(tools, OWNER_HISTORY_SEARCH_TOOL), { query: "deploy rollback" });
+    expect(evidence).toHaveBeenCalledTimes(1);
+    const value = evidence.mock.calls[0]![0];
+    expect(value).toMatchObject({
+      type: "history_retrieval",
+      runId: accepted.run.id,
+      principalId: "owner",
+      conversationId: accepted.conversation.id,
+      sourceKind: "channel_message",
+      retrievalMode: "lexical",
+    });
+    expect(value.resources.sort()).toEqual(["group:100", "group:200"]);
+    expect(value.items).toHaveLength(2);
+    for (const item of value.items) {
+      expect(item.resourceId.startsWith("group:")).toBe(true);
+      expect(item.rank).toBeGreaterThan(0);
+      expect(item.score).toBeGreaterThan(0);
+      expect(item.matchedTerms).toContain("deploy");
+      expect(item.returnMode).toBe("raw");
+    }
+    // Evidence carries identifiers, scores and terms — never the message text itself.
+    expect(JSON.stringify(value)).not.toContain("plan alpha");
+    expect(JSON.stringify(value)).not.toContain("plan beta");
   } finally {
     await store.close();
   }

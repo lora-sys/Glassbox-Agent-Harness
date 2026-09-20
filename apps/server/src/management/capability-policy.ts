@@ -67,6 +67,17 @@ export function enabledCategoriesFor(
   return [...enabled];
 }
 
+/** The categories one group's own policy enables. Binds a group Run to that group's policy. */
+export function enabledCategories(
+  policy: GroupCapabilityPolicy | undefined,
+): QqCapabilityCategory[] {
+  const enabled: QqCapabilityCategory[] = [];
+  for (const [category, on] of Object.entries(policy?.categories ?? {})) {
+    if (on) enabled.push(category as QqCapabilityCategory);
+  }
+  return enabled;
+}
+
 /** Rejects a policy that names a category or source class Glassbox does not implement.
  * A provider upgrade or a typo can never silently widen the Tool or source surface. */
 function validatedPolicy(input: unknown): GroupCapabilityPolicy {

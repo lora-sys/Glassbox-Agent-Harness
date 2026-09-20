@@ -41,6 +41,21 @@ function historyText(segments: unknown, botId: string): string | undefined {
   return text || undefined;
 }
 
+/**
+ * The provider's own ordering key for paging backwards through `get_group_msg_history`.
+ *
+ * NapCat accepts it back as `message_seq`, so a caller walks older pages by passing the
+ * smallest sequence it has already seen. A record without one cannot advance a cursor,
+ * which is what stops a sync from re-reading the same page forever.
+ */
+export function historySequence(record: unknown): number | undefined {
+  const input = object(record);
+  if (!input) return undefined;
+  const value = input.message_seq ?? input.real_seq;
+  const parsed = typeof value === "number" ? value : Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
 function secondsToIso(value: unknown): string | undefined {
   const seconds = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(seconds) || seconds <= 0) return undefined;

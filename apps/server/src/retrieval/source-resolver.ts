@@ -11,6 +11,45 @@ export function groupResourceId(groupId: string): string {
 }
 
 /**
+ * Resolves the group IDs the caller is *assigned* to as a managed group.
+ *
+ * Assignment is the `group:manage` grant on a group Resource in the caller's own private
+ * scope. It is per Principal: one Owner enabling a group never assigns another Owner, and
+ * one Owner revoking never removes another Owner's assignment. It is read back from the
+ * grants table rather than from the connection-wide configured list, so a Principal's
+ * managed inventory is exactly what that Principal assigned.
+ *
+ * Assignment is not authority. Reading a group's history still needs its own
+ * `history:read` grant; see `resolveAuthorizedHistorySources`.
+ */
+export async function resolveAssignedGroupIds(
+  store: DomainStore,
+  caller: CallerContext,
+): Promise<string[]> {
+  if (caller.scope.chatType !== "private") return [];
+  const key = scopeKey(caller.scope);
+  return store.db.transaction(async (tx) => {
+    const res = await tx.execute({
+      sql: `SELECT resource_id FROM grants
+            WHERE principal_id = ?
+              AND action = 'group:manage'
+              AND scope_key = ?
+              AND effect = 'allow'
+              AND revoked_at IS NULL`,
+      args: [caller.principalId, key],
+    });
+    const groupIds: string[] = [];
+    for (const row of res.rows) {
+      const resourceId = stringColumn(row, "resource_id");
+      if (resourceId.startsWith("group:")) groupIds.push(resourceId.slice(6));
+    }
+    // Deterministic order: the resolved set is recorded as evidence, so the same grants
+    // must always produce the same sequence.
+    return groupIds.sort();
+  });
+}
+
+/**
  * Resolves the list of group IDs where the caller currently has an active `history:read` grant.
  *
  * Security invariants:
@@ -70,7 +109,7 @@ export async function resolveAuthorizedHistorySources(
         groupIds.push(resourceId.slice(6));
       }
     }
-    return groupIds;
+    return groupIds.sort();
   });
 
   if (requestedGroupIds && requestedGroupIds.length > 0) {
