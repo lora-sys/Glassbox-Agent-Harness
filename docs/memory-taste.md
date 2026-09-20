@@ -109,6 +109,47 @@ expose runtime hooks needed for observation
 
 Lora PI Kit is not the canonical Taste database.
 
+## P4 upstream implementation map
+
+P4 follows the repository upstream-first rule.
+
+```text
+MGP
+  canonical Memory / Candidate / Evidence / lifecycle / Recall contracts
+
+LangMem
+  semantic / episodic extraction and consolidation behavior
+
+OpenHarness Memory
+  signature / dedupe / TTL / supersedes / freshness hygiene
+
+Learning-Multi-Factor-Memory
+  interpretable retention value and forgetting mechanism
+
+Command Code
+  Taste behavior signals and user / project preference concept
+
+OpenSquilla
+  retrieval pipeline, FTS / hybrid interface, temporal decay and MMR
+
+NapCat / OneBot
+  QQ history source
+```
+
+Glassbox keeps Principal, Authorization, Project / Resource scope, Conversation / Run / Task linkage, Turso truth, Audience / Delivery and Trace.
+
+Do not design a second generic Memory or Retrieval protocol when the upstream contract fits.
+
+See:
+
+```text
+upstream/mgp/SOURCES.md
+upstream/command-code/SOURCES.md
+upstream/opensquilla/SOURCES.md
+upstream/openharness/SOURCES.md
+```
+
+
 The same Glassbox Taste should later be usable by Pi, Codex, Claude Code, or another Runtime without duplicating preference truth per Runtime.
 
 `lora-sys/skills` remains the canonical source for reusable Agent Skills. Lora PI Kit may install or load selected Skills.
@@ -242,62 +283,45 @@ Feedback may contain sensitive code, text, or artifact references. It inherits n
 
 One edit must not become a permanent preference.
 
-The loop is:
+Use the MGP candidate / evidence / merge model instead of inventing another candidate lifecycle.
 
 ```text
 FeedbackEvent
-→ pattern extraction
-→ TasteCandidate
-→ repeated supporting / contradicting evidence
-→ confidence update
-→ promote, keep candidate, demote, or retire
+→ MGP-style Memory / Taste Candidate
+→ evidence
+→ reinforce / correction / dedupe / manual review as applicable
+→ promote only through the Glassbox governed path
 ```
 
-A useful first policy may look like:
+Do not freeze arbitrary numeric confidence thresholds in architecture documentation.
+
+The first implementation should use the smallest explainable evidence policy needed to prove:
 
 ```text
-confidence < 0.40
-  evidence only / weak candidate
+single edit
+  evidence only
 
-0.40 - 0.70
-  candidate
+repeated support
+  can strengthen a candidate
 
-0.70 - 0.90
-  active Taste
+contradicting correction
+  can weaken, replace or retire a candidate
 
->= 0.90
-  strong Taste
+explicit current user instruction
+  wins over learned Taste
 ```
 
-These thresholds are implementation defaults, not product laws. P4 tests may change them.
+If implementation needs a confidence formula not provided by the approved upstream mechanisms, record that gap in the P4A PR before adding one.
 
 ## Confidence
 
-Confidence is not raw observation count.
+Confidence remains evidence-backed metadata, not authority.
 
-At minimum consider:
+Use MGP evidence / candidate semantics and Command Code's behavior signals as the base.
 
-```text
-supporting evidence
-contradicting evidence
-recency
-consistency
-signal strength
-scope consistency
-```
+Do not mutate a hard Rule because confidence changed.
 
-Recent repeated corrections should be able to lower confidence in an old preference.
-
-Explicit user statements such as:
-
-```text
-"以后都这样写"
-"以后不要这样做"
-```
-
-are stronger signals than one incidental edit, but still preserve evidence and scope.
-
-Do not mutate a hard Rule because Taste confidence changed.
+P4A owns confidence evidence and promotion state. P4B may use confidence as one retrieval signal but must not mutate it.
 
 ## Task-aware Taste retrieval
 
@@ -306,12 +330,10 @@ Do not inject the whole Taste profile into every request.
 The normal path is:
 
 ```text
-current task
-→ derive task / language / framework / domain hints
-→ resolve authorized user + project scope
-→ retrieve relevant Taste candidates
-→ rank by relevance × confidence × recency
-→ choose a small Top K
+current task / MGP-style RecallIntent
+→ resolve authorized Principal + project source set
+→ OpenSquilla-derived retrieval
+→ bounded Top K
 → inject only selected Taste into Runtime Context
 ```
 
@@ -406,17 +428,18 @@ retrieve private + public candidates globally
 → ask model to ignore unauthorized content
 ```
 
-Later hybrid retrieval may combine:
+Retrieval implementation should port the OpenSquilla `MemoryRetriever` architecture rather than inventing a new ranking pipeline.
+
+P4B starts with:
 
 ```text
-lexical search
-vector search
-source weighting
-temporal decay
-diversity reranking
-confidence / reliability
-context budget
+vector_weight = 0
+text_weight = 1
 ```
+
+so the first production path is lexical / FTS while keeping the same interface for later hybrid retrieval.
+
+When FTS is unavailable in the exact Glassbox database path, port the bounded OpenHarness Memory search fallback.
 
 ## Runtime integration
 
@@ -481,7 +504,7 @@ retrieval evidence
 
 P4B must authorize before protected candidates are loaded.
 
-P4A exposes a stable retrieval-facing projection. P4B consumes that projection without mutating P4A confidence or promotion state.
+P4A exposes canonical MGP-derived Memory objects plus Glassbox Resource / scope mapping. P4B consumes them through MGP-style Recall / SearchResult contracts without mutating P4A confidence or promotion state.
 
 Taste still comes before broad Memory retrieval as a learning mechanism, but P4A and P4B can be implemented in parallel because P4B develops against deterministic retrieval fixtures until the P4A projection is available.
 
