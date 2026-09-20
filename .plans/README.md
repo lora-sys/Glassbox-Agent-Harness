@@ -46,15 +46,26 @@ For P4A also read:
 
 ```text
 ../docs/memory-taste.md
+../upstream/mgp/SOURCES.md
 ../upstream/command-code/SOURCES.md
+../upstream/openharness/SOURCES.md
+
+Issue #9 contains the exact LangMem, OpenHarness and
+Learning-Multi-Factor-Memory source paths to port.
 ```
 
-For P4B also read the existing P3 trust and Channel implementation before changing retrieval:
+For P4B also read:
 
 ```text
+../upstream/mgp/SOURCES.md
+../upstream/opensquilla/SOURCES.md
+../upstream/openharness/SOURCES.md
+
 ../apps/server/src/auth/
 ../apps/server/src/conversation/
 ../apps/server/src/channels/onebot/
+
+Issue #10 contains the exact retrieval source paths and tests to port.
 ```
 
 `README.md` defines product direction. `AGENTS.md` defines stable engineering and safety rules. The owned active plan and its Issue define the implementation scope.
