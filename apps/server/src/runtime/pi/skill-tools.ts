@@ -26,7 +26,7 @@ export function createSkillTools(options: {
       name: SKILL_READ_TOOL,
       label: "Read authorized Skill",
       description:
-        "Read one locked file from a Skill listed for this Run. Load SKILL.md first, then request only referenced files needed for the current task.",
+        "Read one locked file from an authorized Skill when the skill name is explicitly known and required for the current task. Load SKILL.md first, then request only referenced files needed for the current task.",
       parameters: Type.Object(
         {
           skillName: Type.String({ pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$" }),
@@ -41,7 +41,7 @@ export function createSkillTools(options: {
       execute: async (params, context) => {
         const runContext = options.getContext();
         if (!runContext?.authorizedSkillNames?.includes(params.skillName))
-          throw new Error("skill_not_visible_for_run");
+          throw new Error("skill_not_authorized_for_run");
         if (!(await options.isSkillAuthorized(context, params.skillName)))
           throw new Error("skill_authority_changed");
         return {

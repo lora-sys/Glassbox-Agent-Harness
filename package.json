@@ -15,6 +15,7 @@
     "agent:up": "tsx scripts/agent-service.mts up",
     "agent:status": "tsx scripts/agent-service.mts status",
     "agent:logs": "tsx scripts/agent-service.mts logs",
+    "agent:inspect": "tsx scripts/inspect-latest-run.mts",
     "agent:down": "tsx scripts/agent-service.mts down",
     "dev:web": "vp dev",
     "test:unit": "vp test run --allowOnly=false --maxWorkers=4",

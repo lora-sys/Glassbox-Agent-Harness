@@ -102,6 +102,15 @@ it("re-authorizes locked Skill reads against the Run snapshot and current group 
     ).resolves.toMatchObject({
       details: { skillName: "fixture", path: "SKILL.md", content: skill },
     });
+    await expect(
+      read.execute(
+        "unauthorized",
+        { skillName: "unauthorized-skill" },
+        undefined,
+        undefined,
+        {} as never,
+      ),
+    ).rejects.toThrow("protected_tool_failed");
     liveAuthorized = false;
     await expect(
       read.execute("changed", { skillName: "fixture" }, undefined, undefined, {} as never),

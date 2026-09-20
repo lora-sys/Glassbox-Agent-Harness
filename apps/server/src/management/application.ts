@@ -262,11 +262,14 @@ export class ManagementApplication {
         }),
       ],
       resolveSkillNames: async (context, profile) => {
-        if (!context.caller) return { names: [], policy: { source: "no-caller" } };
+        if (!context.caller)
+          return { names: [], modelVisibleNames: [], policy: { source: "no-caller" } };
+        const isOwner = await this.store.identities.isOwner(context.caller.principalId);
         if (context.caller.scope.chatType === "group") {
-          if (await this.store.identities.isOwner(context.caller.principalId)) {
+          if (isOwner) {
             return {
               names: profile.enabledSkills,
+              modelVisibleNames: [],
               policy: { source: "owner-profile", profile: profile.name },
             };
           }
@@ -276,8 +279,10 @@ export class ManagementApplication {
             this.kitLoader.loadProfile("qq-group").enabledSkills,
           );
           const available = new Set(this.kitLoader.availableSkills().map((skill) => skill.name));
+          const filtered = configured.enabledSkills.filter((name) => available.has(name));
           return {
-            names: configured.enabledSkills.filter((name) => available.has(name)),
+            names: filtered,
+            modelVisibleNames: filtered,
             policy: {
               source: "group-whitelist",
               groupId: configured.groupId,
@@ -285,7 +290,13 @@ export class ManagementApplication {
             },
           };
         }
-        return { names: profile.enabledSkills, policy: { source: "kit-profile" } };
+        return {
+          names: profile.enabledSkills,
+          modelVisibleNames: profile.name === "main-agent" ? [] : profile.enabledSkills,
+          policy: isOwner
+            ? { source: "owner-profile", profile: profile.name }
+            : { source: "kit-profile" },
+        };
       },
       resolveToolNames: async (context) => {
         if (!context.caller || !context.conversationId || !context.runId) return [];

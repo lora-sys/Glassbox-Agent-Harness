@@ -33,6 +33,7 @@ interface ActiveSession {
   runtimeEvidence: Record<string, unknown>;
   authorizedToolNames: readonly string[];
   authorizedSkillNames: readonly string[];
+  modelVisibleSkillNames: readonly string[];
   skillPolicy: Record<string, unknown>;
 }
 
@@ -48,7 +49,11 @@ export interface PiSdkRuntimeOptions {
   resolveSkillNames?: (
     context: PiRunContext,
     profile: ResolvedKitProfile,
-  ) => Promise<{ names: readonly string[]; policy?: Record<string, unknown> }>;
+  ) => Promise<{
+    names: readonly string[];
+    modelVisibleNames?: readonly string[];
+    policy?: Record<string, unknown>;
+  }>;
   resolveToolNames?: (context: PiRunContext) => Promise<readonly string[]>;
   onEvent?: (event: PiNormalizedEvent) => void | Promise<void>;
   createSession?: (params: {
@@ -56,6 +61,7 @@ export interface PiSdkRuntimeOptions {
     profile: ResolvedKitProfile;
     agentDir: string;
     sessionDir: string;
+    modelVisibleSkillNames?: readonly string[];
   }) => Promise<ActiveSession["session"]>;
 }
 
@@ -250,10 +256,21 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
     const resolvedSkills =
       context && this.options.resolveSkillNames
         ? await this.options.resolveSkillNames(context, profile)
-        : { names: profile.enabledSkills, policy: { source: "kit-profile" } };
+        : {
+            names: profile.enabledSkills,
+            modelVisibleNames: profileName === "main-agent" ? [] : profile.enabledSkills,
+            policy: { source: "kit-profile" },
+          };
     const authorizedSkillNames = [...new Set(resolvedSkills.names)];
+    const modelVisibleSkillNames = [
+      ...new Set(
+        resolvedSkills.modelVisibleNames ??
+          (profileName === "main-agent" ? [] : authorizedSkillNames),
+      ),
+    ];
     if (context) {
       context.authorizedSkillNames = authorizedSkillNames;
+      context.modelVisibleSkillNames = modelVisibleSkillNames;
       context.skillPolicy = structuredClone(resolvedSkills.policy ?? { source: "kit-profile" });
     }
     const effectiveProfile = { ...profile, enabledSkills: authorizedSkillNames };
@@ -271,12 +288,14 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
           profile: effectiveProfile,
           agentDir: config.agentDir,
           sessionDir,
+          modelVisibleSkillNames,
         })
       : await this.createRealSession(
           effectiveProfile,
           config.agentDir,
           sessionDir,
           authorizedToolNames,
+          modelVisibleSkillNames,
         );
     const now = new Date().toISOString();
     const binding: PiSessionBinding = {
@@ -293,6 +312,7 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
       runtimeEvidence,
       authorizedToolNames: authorizedToolNames ?? [],
       authorizedSkillNames,
+      modelVisibleSkillNames,
       skillPolicy: structuredClone(resolvedSkills.policy ?? { source: "kit-profile" }),
     });
     return { ...binding };
@@ -303,13 +323,14 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
     agentDir: string,
     sessionDir: string,
     authorizedToolNames?: readonly string[],
+    modelVisibleSkillNames?: readonly string[],
   ): Promise<ActiveSession["session"]> {
     const kitPath = this.loader.getKitPath();
     const cwd = this.options.cwd ?? process.cwd();
     const settingsManager = SettingsManager.inMemory();
     if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/u.test(profile.promptTemplate))
       throw new Error("Invalid Kit prompt template");
-    const basePrompt = `${this.loader.modelPrompt(profile.name, profile.enabledSkills).trim()}\n\nReply in concise plain text suitable for QQ. Do not reveal host paths, internal service addresses, configuration names, or internal identifiers.`;
+    const basePrompt = `${this.loader.modelPrompt(profile.name, modelVisibleSkillNames ?? []).trim()}\n\nReply in concise plain text suitable for QQ. Do not reveal host paths, internal service addresses, configuration names, or internal identifiers.`;
     let runtimeSessionId: string | undefined;
     const promptForRun = () => {
       const runContext = runtimeSessionId ? this.runContexts.get(runtimeSessionId) : undefined;
@@ -433,6 +454,7 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
           runtime: active.runtimeEvidence,
           authorizedTools: active.authorizedToolNames,
           authorizedSkills: active.authorizedSkillNames,
+          modelVisibleSkills: active.modelVisibleSkillNames,
           skillPolicy: active.skillPolicy,
         };
       }

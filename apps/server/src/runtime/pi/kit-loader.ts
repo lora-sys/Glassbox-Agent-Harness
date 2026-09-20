@@ -117,8 +117,13 @@ export class KitLoader {
   }
 
   /** Only names and descriptions enter the base prompt. Locked files are read on demand. */
-  public modelPrompt(profileName: PiRuntimeProfileName, enabledSkills?: readonly string[]): string {
-    const selected = enabledSkills ?? this.loadProfile(profileName).enabledSkills;
+  public modelPrompt(
+    profileName: PiRuntimeProfileName,
+    modelVisibleSkills?: readonly string[],
+  ): string {
+    const selected =
+      modelVisibleSkills ??
+      (profileName === "main-agent" ? [] : this.loadProfile(profileName).enabledSkills);
     this.runtimeEvidence(profileName, selected);
     const profile = this.loadProfile(profileName);
     const read = (relative: string) => {
@@ -133,7 +138,7 @@ export class KitLoader {
     };
     const prompt = read(`prompts/${profile.promptTemplate}.md`);
     if (!prompt) throw new Error("Kit base prompt is empty");
-    if (selected.length === 0) return `${prompt}\n\nNo Skills are available for this Run.`;
+    if (selected.length === 0) return prompt;
     const catalog = new Map(this.availableSkills().map((skill) => [skill.name, skill.description]));
     return [
       prompt,
@@ -144,7 +149,7 @@ export class KitLoader {
           if (!description) throw new Error("Kit Skill is not locked");
           return `- ${name}: ${description}`;
         }),
-        "Call skill_read before following a Skill. Only request files needed for the current task.",
+        "Skills are optional procedures. Use skill_read only when a listed Skill clearly applies to the current request. Only request files needed for the current task.",
       ].join("\n"),
     ].join("\n\n");
   }

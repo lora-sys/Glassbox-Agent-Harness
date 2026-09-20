@@ -71,7 +71,14 @@ it("records selected resource fingerprints and rejects a modified locked Skill",
   const prompt = loader.modelPrompt("test");
   expect(prompt).toContain("fixture: A test Skill body marker.");
   expect(prompt).toContain("skill_read");
+  expect(prompt).not.toContain("Call skill_read before following a Skill");
+  expect(prompt).toContain(
+    "Skills are optional procedures. Use skill_read only when a listed Skill clearly applies to the current request.",
+  );
   expect(prompt).not.toContain("PRIVATE_SKILL_BODY");
+  const emptyPrompt = loader.modelPrompt("test", []);
+  expect(emptyPrompt).not.toContain("Available Skills for this Run");
+  expect(emptyPrompt).not.toContain("No Skills are available for this Run");
   expect(loader.readSkillFile("fixture")).toContain("PRIVATE_SKILL_BODY");
   expect(() => loader.readSkillFile("fixture", "../private.txt")).toThrow(
     "Invalid Skill file path",

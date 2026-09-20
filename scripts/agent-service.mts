@@ -3,7 +3,7 @@ import { closeSync, openSync } from "node:fs";
 import { mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
@@ -215,7 +215,14 @@ function alive(pid: number): boolean {
 }
 
 function commandHasArgs(commandLine: string, args: readonly string[]): boolean {
-  return args.every((arg) => commandLine.includes(arg));
+  const normalizedCmd = commandLine.replace(/\\/gu, "/").toLowerCase();
+  return args.every((arg) => {
+    const normalizedArg = arg.replace(/\\/gu, "/").toLowerCase();
+    const relativeArg = isAbsolute(arg)
+      ? relative(repoRoot, arg).replace(/\\/gu, "/").toLowerCase()
+      : normalizedArg;
+    return normalizedCmd.includes(normalizedArg) || normalizedCmd.includes(relativeArg);
+  });
 }
 
 function herdrSessionName(entry: ProcessState): string | undefined {
@@ -260,10 +267,14 @@ async function verified(entry: ProcessState): Promise<boolean> {
       ExecutablePath?: string;
       CommandLine?: string;
     };
-    return (
+    const sameExecutable =
       typeof processInfo.ExecutablePath === "string" &&
-      resolve(processInfo.ExecutablePath).toLowerCase() ===
-        resolve(entry.executable).toLowerCase() &&
+      (resolve(processInfo.ExecutablePath).toLowerCase() ===
+        resolve(entry.executable).toLowerCase() ||
+        (entry.executable.toLowerCase().endsWith("node.exe") &&
+          processInfo.ExecutablePath.toLowerCase().endsWith("node.exe")));
+    return (
+      sameExecutable &&
       typeof processInfo.CommandLine === "string" &&
       commandHasArgs(processInfo.CommandLine, entry.args)
     );

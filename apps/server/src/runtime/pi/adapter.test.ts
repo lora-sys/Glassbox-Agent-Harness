@@ -47,6 +47,7 @@ describe("PiSdkRuntimeAdapter", () => {
     const events: string[] = [];
     let authorizedTools: unknown;
     let authorizedSkills: unknown;
+    let modelVisibleSkills: unknown;
     let skillPolicy: unknown;
     let safeToolCall: unknown;
     let safeToolResult: unknown;
@@ -111,6 +112,7 @@ describe("PiSdkRuntimeAdapter", () => {
         if (event.type === "session_start") {
           authorizedTools = event.data.authorizedTools;
           authorizedSkills = event.data.authorizedSkills;
+          modelVisibleSkills = event.data.modelVisibleSkills;
           skillPolicy = event.data.skillPolicy;
         }
         if (event.type === "tool_call") safeToolCall = event.data;
@@ -148,6 +150,7 @@ describe("PiSdkRuntimeAdapter", () => {
     expect(result).toMatchObject({ status: "completed", text: "hello from pi" });
     expect(authorizedTools).toEqual(["owner_group_admin", "skill_read"]);
     expect(authorizedSkills).toEqual([]);
+    expect(modelVisibleSkills).toEqual([]);
     expect(skillPolicy).toEqual({ source: "group-profile", configVersion: 3 });
     expect(safeToolCall).toMatchObject({
       name: "owner_group_admin",
@@ -402,6 +405,104 @@ describe("PiSdkRuntimeAdapter", () => {
     });
     expect(receivedPrompts[2]?.prompt).not.toContain("secret credentials");
     expect(disposedSessions).toContain("pi-session-3");
+
+    await adapter.cleanup();
+  });
+
+  it("separates authorizedSkills from modelVisibleSkills across main-agent and qq-group profiles", async () => {
+    const runtimeBaseDir = await mkdtemp(join(tmpdir(), "glassbox-pi-runtime-"));
+    directories.push(runtimeBaseDir);
+    const sessionStartEvents: Array<Record<string, unknown>> = [];
+    const passedModelVisible: Array<readonly string[] | undefined> = [];
+
+    const adapter = new PiSdkRuntimeAdapter({
+      kitPath: fileURLToPath(new URL("./fixtures/lora-pi-kit", import.meta.url)),
+      runtimeBaseDir,
+      onEvent: (event) => {
+        if (event.type === "session_start") {
+          sessionStartEvents.push(event.data);
+        }
+      },
+      createSession: async ({ modelVisibleSkillNames }) => {
+        passedModelVisible.push(modelVisibleSkillNames);
+        return {
+          sessionId: `session-${passedModelVisible.length}`,
+          messages: [],
+          subscribe: (cb: (e: AgentSessionEvent) => void) => {
+            cb({ type: "agent_start" });
+            cb({ type: "turn_end", message: {} as never, toolResults: [] });
+            cb({ type: "agent_end", messages: [], willRetry: false });
+            return () => {};
+          },
+          async prompt() {},
+          async abort() {},
+          dispose() {},
+        } as never;
+      },
+    });
+
+    await adapter.initialize();
+
+    // 1. main-agent
+    const mainContext = {
+      runId: "run-main",
+      conversationId: "conv-main",
+      caller: {
+        principalId: "owner",
+        scope: {
+          connectionId: "qq",
+          botId: "bot",
+          chatType: "private" as const,
+          chatId: "owner",
+          senderId: "owner",
+        },
+      },
+    };
+    const mainBinding = await adapter.createOrRestoreSession(
+      { ...conversation, id: "conv-main" },
+      "main-agent",
+      mainContext,
+    );
+    await adapter.run(
+      mainBinding,
+      { ...run, id: "run-main", conversationId: "conv-main" },
+      "hello",
+      mainContext,
+    );
+
+    expect(passedModelVisible[0]).toEqual([]);
+    expect(sessionStartEvents[0]?.modelVisibleSkills).toEqual([]);
+
+    // 2. qq-group with group whitelist
+    const groupContext = {
+      runId: "run-group",
+      conversationId: "conv-group",
+      caller: {
+        principalId: "visitor",
+        scope: {
+          connectionId: "qq",
+          botId: "bot",
+          chatType: "group" as const,
+          chatId: "group-1",
+          senderId: "visitor",
+        },
+      },
+    };
+    const groupBinding = await adapter.createOrRestoreSession(
+      { ...conversation, id: "conv-group", principalId: "visitor" },
+      "qq-group",
+      groupContext,
+    );
+    await adapter.run(
+      groupBinding,
+      { ...run, id: "run-group", conversationId: "conv-group", principalId: "visitor" },
+      "hello",
+      groupContext,
+    );
+
+    expect(passedModelVisible[1]).toEqual(["unslop"]);
+    expect(sessionStartEvents[1]?.authorizedSkills).toEqual(["unslop"]);
+    expect(sessionStartEvents[1]?.modelVisibleSkills).toEqual(["unslop"]);
 
     await adapter.cleanup();
   });

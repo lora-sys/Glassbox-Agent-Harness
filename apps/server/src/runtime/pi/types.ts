@@ -74,6 +74,7 @@ export interface PiRunContext {
   requiredToolName?: string;
   requiredToolInput?: Record<string, unknown>;
   authorizedSkillNames?: readonly string[];
+  modelVisibleSkillNames?: readonly string[];
   skillPolicy?: Record<string, unknown>;
 }
 
