@@ -77,7 +77,7 @@ export const QQ_CAPABILITIES: readonly QqCapability[] = [
     resource: "account",
     operations: [],
     description:
-      "Search the Glassbox QQ capability registry: the Owner's managed groups and which categories and Tools each one enables.",
+      "Search the Glassbox QQ capability registry for Tools this caller may use, with the managed groups each one applies to.",
   },
   {
     tool: "qq_groups",
@@ -88,7 +88,8 @@ export const QQ_CAPABILITIES: readonly QqCapability[] = [
     // Deliberately no `get_group_list`: the Owner's groups are the managed allowlist,
     // never every group the bot happens to have joined.
     operations: [group("get_group_info", ["group_id"])],
-    description: "Read one managed QQ group's provider metadata.",
+    description:
+      "List the QQ groups this Owner manages with their capability state, or read one managed group's provider metadata.",
   },
   {
     tool: "qq_group_members",

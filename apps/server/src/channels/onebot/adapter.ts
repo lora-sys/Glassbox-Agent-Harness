@@ -18,6 +18,24 @@ import { GROUP_SCOPED_NAPCAT_ACTIONS, isAllowedNapCatAction } from "./capabiliti
 
 const GROUP_SCOPED_ACTIONS = new Set(GROUP_SCOPED_NAPCAT_ACTIONS);
 
+/**
+ * The failure half of every narrow provider read, shared by history and group info.
+ *
+ * `failed` is a refusal or a provider-side rejection; `unknown` is a read whose outcome was
+ * never observed. The distinction is what lets a caller report "unavailable" instead of
+ * inventing a value: neither variant is evidence about the group's data.
+ */
+export type OneBotReadFailure =
+  | {
+      status: "failed";
+      code: "invalid_group" | "not_connected" | "request_limit" | "api_rejected";
+      retcode?: number;
+    }
+  | {
+      status: "unknown";
+      code: "timeout" | "disconnected" | "send_error" | "invalid_response" | "async_response";
+    };
+
 export type OneBotHistoryResult =
   | {
       status: "ok";
@@ -29,15 +47,16 @@ export type OneBotHistoryResult =
        */
       nextCursor?: string;
     }
+  | OneBotReadFailure;
+
+export type OneBotGroupInfoResult =
   | {
-      status: "failed";
-      code: "invalid_group" | "not_connected" | "request_limit" | "api_rejected";
-      retcode?: number;
+      status: "ok";
+      groupId: string;
+      /** The provider-reported group name, or `null` when it reported no usable one. */
+      name: string | null;
     }
-  | {
-      status: "unknown";
-      code: "timeout" | "disconnected" | "send_error" | "invalid_response" | "async_response";
-    };
+  | OneBotReadFailure;
 
 export type OneBotCapabilityResult =
   | { status: "ok"; data: unknown }
@@ -82,11 +101,11 @@ type RpcResult =
   | Exclude<OneBotDeliveryResult, { status: "confirmed" }>;
 
 /**
- * Maps an RPC failure onto the history result shape. `invalid_target` / `invalid_message`
- * are delivery-specific and cannot occur for a read, so they surface as an unreadable
- * provider response rather than being passed through.
+ * Maps an RPC failure onto the read result shape. `invalid_target` / `invalid_message` are
+ * delivery-specific and cannot occur for a read, so they surface as an unreadable provider
+ * response rather than being passed through.
  */
-function toHistoryFailure(result: Exclude<RpcResult, { status: "ok" }>): OneBotHistoryResult {
+function toReadFailure(result: Exclude<RpcResult, { status: "ok" }>): OneBotReadFailure {
   if (result.status === "unknown") return result;
   if (result.code === "invalid_target" || result.code === "invalid_message")
     return { status: "unknown", code: "invalid_response" };
@@ -240,7 +259,7 @@ export class OneBotAdapter {
       count,
       ...(cursor !== undefined ? { message_seq: Number(cursor) } : {}),
     });
-    if (result.status !== "ok") return toHistoryFailure(result);
+    if (result.status !== "ok") return toReadFailure(result);
     const raw = object(result.data)?.messages;
     if (!Array.isArray(raw)) return { status: "unknown", code: "invalid_response" };
     const messages: OneBotHistoryMessage[] = [];
@@ -263,6 +282,34 @@ export class OneBotAdapter {
       messages,
       ...(oldestSequence === undefined ? {} : { nextCursor: String(oldestSequence) }),
     };
+  }
+
+  /**
+   * Reads one managed group's live metadata through the existing authenticated connection.
+   *
+   * This is the only provider read the Owner inventory performs, and it is deliberately narrow:
+   * `groupId` must be in the configured strict allowlist, so the bridge can never be used to
+   * probe a group Glassbox did not configure. The response is reduced to the one fact Glassbox
+   * does not own — the group's name — and a provider that reports no usable name yields `null`
+   * rather than an empty string. A provider that answered for this group is by construction
+   * able to reach it, which is what the caller records as reachability.
+   */
+  async getGroupInfo(input: { groupId: string }): Promise<OneBotGroupInfoResult> {
+    const parsed = parseOneBotConfig({ ...this.config, groupIds: [input.groupId] });
+    const groupId = parsed.groupIds[0];
+    if (groupId !== input.groupId || !this.config.groupIds.includes(input.groupId))
+      return { status: "failed", code: "invalid_group" };
+    const socket = this.#socket;
+    if (this.#state.status !== "ready" || !socket)
+      return { status: "failed", code: "not_connected" };
+    const result = await this.#request(socket, "get_group_info", { group_id: Number(groupId) });
+    if (result.status !== "ok") return toReadFailure(result);
+    const data = object(result.data);
+    // A reply about a different group is not evidence about this one.
+    if (!data || qqId(data.group_id) !== groupId)
+      return { status: "unknown", code: "invalid_response" };
+    const name = typeof data.group_name === "string" ? data.group_name.trim() : "";
+    return { status: "ok", groupId, name: name === "" ? null : name };
   }
 
   /**

@@ -49,6 +49,15 @@ async function fixture() {
       });
     }
   }
+  // The managed-group listing is an Owner-private Action on the Agent Resource, exactly as
+  // the production bootstrap grants it.
+  await store.authorization.grant({
+    principalId: "owner",
+    resourceId: agentResourceId("personal"),
+    action: "group:read",
+    scope: ownerPrivateScope,
+    effect: "allow",
+  });
   const accepted = await store.conversations.acceptIncoming({
     agentId: "personal",
     scope: ownerPrivateScope,
@@ -121,7 +130,12 @@ function tools(
       calls.push({ action: input.action, params: input.params });
       return { ok: true, action: input.action };
     },
-    project: async () => ({ groups: [{ groupId: "100" }] }),
+    search: async (input) => ({
+      query: input.query ?? null,
+      groups: input.groupIds ?? [],
+      capabilities: [],
+    }),
+    projectManagedGroups: async () => ({ groups: [{ groupId: "100" }] }),
   });
 }
 
@@ -234,7 +248,8 @@ it("binds a group Run to its own group and refuses a model-supplied one", async 
         calls.push({ action: input.action, params: input.params });
         return { ok: true, action: input.action };
       },
-      project: async () => ({ groups: [] }),
+      search: async () => ({ capabilities: [] }),
+      projectManagedGroups: async () => ({ groups: [] }),
     });
     const members = toolByName(created, "qq_group_members");
     // Naming a group inside a group Run is refused rather than silently overwritten.
@@ -393,14 +408,112 @@ it("re-authorizes at execution time so a revocation between discovery and call d
   }
 });
 
-it("serves the managed-group projection without a provider call", async () => {
+it("serves the Owner's managed-group listing without a provider call", async () => {
   const { store, accepted } = await fixture();
   try {
     const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
     const created = tools(store, accepted, calls);
-    const result = await call(toolByName(created, "qq_capability_search"), {});
+    const result = await call(toolByName(created, "qq_groups"), {});
     expect(result.details).toEqual({ groups: [{ groupId: "100" }] });
     expect(calls).toEqual([]);
+  } finally {
+    await store.close();
+  }
+});
+
+it("refuses the managed-group listing inside a group Run", async () => {
+  const { store, accepted } = await fixture();
+  try {
+    // The group scope reads its own group, never the Owner's managed set: the listing
+    // resolves to a sentinel Resource that was never registered.
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: groupResourceId("100"),
+      action: "group:read",
+      scope: ownerGroupScope,
+      effect: "allow",
+    });
+    const created = createCapabilityTools({
+      store,
+      getContext: () => ({
+        caller: { principalId: "owner", scope: ownerGroupScope },
+        runId: accepted.run.id,
+        conversationId: accepted.conversation.id,
+      }),
+      isCategoryEnabled: async () => true,
+      invoke: async () => ({ ok: true }),
+      search: async () => ({ capabilities: [] }),
+      projectManagedGroups: async () => ({ groups: [{ groupId: "100" }] }),
+    });
+    const groups = toolByName(created, "qq_groups");
+    await expect(call(groups, {})).rejects.toThrow("Permission denied: resource_missing");
+    // The very same Tool still reads the group the Run is in.
+    const result = await call(groups, { operation: "get_group_info" });
+    expect(result.details).toMatchObject({ ok: true });
+  } finally {
+    await store.close();
+  }
+});
+
+it("hands the registry search its bounded query and managed-group filter", async () => {
+  const { store, accepted } = await fixture();
+  try {
+    const seen: Array<{ query: string | undefined; groupIds: readonly string[] | undefined }> = [];
+    const created = createCapabilityTools({
+      store,
+      getContext: () => ({
+        caller: ownerPrivate,
+        runId: accepted.run.id,
+        conversationId: accepted.conversation.id,
+      }),
+      isCategoryEnabled: async () => true,
+      invoke: async () => ({ ok: true }),
+      search: async (input) => {
+        seen.push({ query: input.query, groupIds: input.groupIds });
+        return { capabilities: [] };
+      },
+      projectManagedGroups: async () => ({ groups: [] }),
+    });
+    const search = toolByName(created, "qq_capability_search");
+    // The query is trimmed and the group filter de-duplicated before it is handed on.
+    await call(search, { query: "  history  ", groupIds: ["100", "100"] });
+    expect(seen).toEqual([{ query: "history", groupIds: ["100"] }]);
+    // A blank query is "no filter" rather than an error.
+    await call(search, { query: "   " });
+    expect(seen[1]).toEqual({ query: undefined, groupIds: undefined });
+    // A query beyond the bound is refused rather than truncated, and a malformed or empty
+    // group filter is refused rather than silently widened.
+    await expect(call(search, { query: "x".repeat(201) })).rejects.toThrow(
+      "invalid_capability_query",
+    );
+    await expect(call(search, { groupIds: [] })).rejects.toThrow("invalid_capability_group_filter");
+    await expect(call(search, { groupIds: ["not-a-group"] })).rejects.toThrow(
+      "invalid_capability_group_filter",
+    );
+    expect(seen).toHaveLength(2);
+  } finally {
+    await store.close();
+  }
+});
+
+it("refuses the registry search outside an Owner-private Run", async () => {
+  const { store, accepted } = await fixture();
+  try {
+    const created = createCapabilityTools({
+      store,
+      getContext: () => ({
+        caller: { principalId: "owner", scope: ownerGroupScope },
+        runId: accepted.run.id,
+        conversationId: accepted.conversation.id,
+      }),
+      isCategoryEnabled: async () => true,
+      invoke: async () => ({ ok: true }),
+      search: async () => ({ capabilities: [] }),
+      projectManagedGroups: async () => ({ groups: [] }),
+    });
+    await expect(call(toolByName(created, "qq_capability_search"), {})).rejects.toThrow(
+      "Permission denied: resource_missing",
+    );
   } finally {
     await store.close();
   }

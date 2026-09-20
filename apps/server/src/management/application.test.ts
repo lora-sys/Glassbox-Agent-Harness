@@ -15,6 +15,7 @@ import type {
   RunExecutionAdapter,
 } from "../execution/run-service/types.js";
 import {
+  QQ_CAPABILITY_CATEGORIES,
   qqCapabilitiesForCategory,
   type QqCapabilityCategory,
 } from "../channels/onebot/capabilities.js";
@@ -65,6 +66,8 @@ async function fixture(
   options: {
     /** Deterministic `get_group_msg_history` responder, paged by the requested `message_seq`. */
     history?: (params: { group_id?: number; message_seq?: number }) => Record<string, unknown>[];
+    /** The `group_name` the peer reports for `get_group_info`; absent means "unreported". */
+    groupName?: string;
     /** Second Owner identity, resolved to its own `owner-<id>` Principal. */
     coOwnerId?: string;
     /** File-backed database so a test can close and reopen the same durable state. */
@@ -82,6 +85,9 @@ async function fixture(
     for (const socket of server.clients) socket.terminate();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   });
+  // Flippable at runtime: enabling a managed group asks the peer for its metadata, so a test
+  // that wants a *later* observation to fail must first let the earlier one succeed.
+  let groupInfoFails = false;
   server.on("connection", (socket) => {
     sockets.put(socket);
     socket.on("message", (raw) => {
@@ -92,16 +98,23 @@ async function fixture(
           : raw;
       const action = JSON.parse(bytes.toString("utf8")) as Action;
       actions.put(action);
+      // A rejected `get_group_info` is the peer's own failure reply: `status: "failed"` with a
+      // non-zero `retcode`, which the adapter maps to a provider error rather than to data.
+      const groupInfoFailed = action.action === "get_group_info" && groupInfoFails;
       socket.send(
         JSON.stringify({
           echo: action.echo,
-          status: "ok",
-          retcode: 0,
-          data:
-            action.action === "get_login_info"
+          status: groupInfoFailed ? "failed" : "ok",
+          retcode: groupInfoFailed ? 100 : 0,
+          data: groupInfoFailed
+            ? null
+            : action.action === "get_login_info"
               ? { user_id: 10001 }
               : action.action === "get_group_info"
-                ? { group_id: action.params.group_id }
+                ? {
+                    group_id: action.params.group_id,
+                    ...(options.groupName === undefined ? {} : { group_name: options.groupName }),
+                  }
                 : action.action === "get_group_msg_history"
                   ? { messages: options.history?.(action.params) ?? [] }
                   : { message_id: 20001 },
@@ -175,7 +188,10 @@ async function fixture(
     actions.take(
       (action) => action.params.message?.some((part) => part.data.text === text) === true,
     );
-  return { app, calls, started, send, reply, actions, reopen };
+  const setGroupInfoFails = (value: boolean) => {
+    groupInfoFails = value;
+  };
+  return { app, calls, started, send, reply, actions, reopen, setGroupInfoFails };
 }
 
 describe("channel to durable run composition", () => {
@@ -556,10 +572,30 @@ interface ManagedGroupProjection {
   connectionId: string;
   groups: Array<{
     groupId: string;
+    /** The live provider name, or `null` when it was not observed. */
+    name: string | null;
+    /** The live provider reachability, or `null` when it was not observed. */
+    reachable: boolean | null;
+    access: { grantedCategories: QqCapabilityCategory[]; historyRead: boolean };
     categories: Record<string, boolean>;
     memorySources: Record<string, boolean>;
+    skills: { enabledSkills: string[]; version: number };
     version: number;
   }>;
+}
+
+/** One entry of the registry search, as `qq_capability_search` returns it. */
+interface CapabilitySearchEntry {
+  tool: string;
+  description: string;
+  category: QqCapabilityCategory;
+  readOnly: boolean;
+  groupIds: string[];
+}
+interface CapabilitySearchResult {
+  query: string | null;
+  groups: string[];
+  capabilities: CapabilitySearchEntry[];
 }
 
 /**
@@ -574,7 +610,20 @@ const admin = (app: ManagementApplication) =>
       context: OwnerContext,
       input: { groupId: string; enabled: boolean },
     ): Promise<{ groupId: string; enabled: boolean; enabledSkills: string[]; version: number }>;
+    setGroupHistory(
+      context: OwnerContext,
+      input: { groupId: string; enabled: boolean },
+    ): Promise<unknown>;
+    setGroupSkill(
+      context: OwnerContext,
+      input: { groupId: string; skillName: string; enabled: boolean },
+    ): Promise<unknown>;
     projectManagedGroups(context: OwnerContext): Promise<ManagedGroupProjection>;
+    resolveRunToolNames(context: OwnerContext): Promise<string[]>;
+    createRuntimeTools(getContext: () => OwnerContext | undefined): Array<{
+      name: string;
+      execute(id: string, params: unknown, signal?: AbortSignal): Promise<{ details?: unknown }>;
+    }>;
   };
 
 /** The mutation categories the fixed default bundle must never enable. */
@@ -602,10 +651,16 @@ describe("per-Owner managed group assignment", () => {
   const OTHER_GROUP = "10007";
 
   /** Opens a fixture with a second Owner and returns one Owner-private context per Owner. */
-  async function owners(persistentDatabase = false) {
+  async function owners(options: { persistentDatabase?: boolean; groupName?: string } = {}) {
     const f = await fixture(
       async (input) => ({ status: "succeeded", text: `answer:${input.text}` }),
-      { coOwnerId: CO_OWNER, persistentDatabase },
+      {
+        coOwnerId: CO_OWNER,
+        ...(options.persistentDatabase === undefined
+          ? {}
+          : { persistentDatabase: options.persistentDatabase }),
+        ...(options.groupName === undefined ? {} : { groupName: options.groupName }),
+      },
     );
     f.send(1, "owner-a", true, 10002);
     const ownerA = await f.started.take();
@@ -673,7 +728,7 @@ describe("per-Owner managed group assignment", () => {
   });
 
   it("persists each Owner's assignment and the fixed policy across a restart", async () => {
-    const { f, application, a, b } = await owners(true);
+    const { f, application, a, b } = await owners({ persistentDatabase: true });
     await application.setGroupAccess(a, { groupId: GROUP, enabled: true });
     await application.setGroupAccess(b, { groupId: OTHER_GROUP, enabled: true });
 
@@ -728,6 +783,282 @@ describe("per-Owner managed group assignment", () => {
       expect((await decision(b, action)).decision).toBe("ALLOW");
     for (const action of groupActions(MUTATION_CATEGORIES))
       expect((await decision(b, action)).decision).toBe("DENY");
+  });
+
+  /**
+   * The managed-group inventory and the registry search are the two Owner-private read
+   * surfaces over the same durable per-Owner assignment, so they are exercised together.
+   */
+  const searchTool = (application: ReturnType<typeof admin>, context: OwnerContext) => {
+    const tool = application
+      .createRuntimeTools(() => context)
+      .find((candidate) => candidate.name === "qq_capability_search");
+    if (!tool) throw new Error("missing qq_capability_search");
+    return tool;
+  };
+  const capabilitySearch = async (
+    application: ReturnType<typeof admin>,
+    context: OwnerContext,
+    params: Record<string, unknown> = {},
+  ): Promise<CapabilitySearchResult> =>
+    (await searchTool(application, context).execute("call", params))
+      .details as CapabilitySearchResult;
+
+  /** The group-scoped registry Tools the fixed default bundle makes usable in a group. */
+  const DEFAULT_GROUP_TOOLS = [
+    "qq_groups",
+    "qq_group_members",
+    "qq_group_history",
+    "qq_group_content",
+    "qq_group_files",
+  ];
+
+  it("projects each Owner's own managed inventory with every required field", async () => {
+    const { application, a, b } = await owners({ groupName: "Fixture Group" });
+    await application.setGroupAccess(a, { groupId: GROUP, enabled: true });
+    await application.setGroupAccess(b, { groupId: OTHER_GROUP, enabled: true });
+    // The same group managed by both Owners is shared, and each Owner sees it independently.
+    await application.setGroupAccess(b, { groupId: GROUP, enabled: true });
+
+    const inventory = await application.projectManagedGroups(a);
+    expect(inventory.connectionId).toBe("fixture");
+    // Owner A sees exactly the group they manage, never Owner B's other group.
+    expect(inventory.groups.map((group) => group.groupId)).toEqual([GROUP]);
+    expect(await groupIds(application, b)).toEqual([GROUP, OTHER_GROUP]);
+
+    const group = inventory.groups[0]!;
+    // Every required fact is present: the live observation, durable policy, this Owner's own
+    // access, and the durable Skill whitelist with its version.
+    expect(group.name).toBe("Fixture Group");
+    expect(group.reachable).toBe(true);
+    expect(group.version).toBe(1);
+    expect(group.categories).toEqual(DEFAULT_OWNER_GROUP_POLICY.categories);
+    expect(group.memorySources).toEqual(DEFAULT_OWNER_GROUP_POLICY.memorySources);
+    expect(group.access.grantedCategories).toEqual(
+      DEFAULT_OWNER_GROUP_CATEGORIES.filter((category) => groupActions([category]).length > 0),
+    );
+    expect(group.access.historyRead).toBe(true);
+    expect(group.skills).toEqual({ enabledSkills: ["unslop"], version: 0 });
+  });
+
+  it("keeps the durable inventory and reports live facts unknown when the provider cannot answer", async () => {
+    // A disconnected provider: the durable group and its policy survive, but nothing live is
+    // claimed — not `false`, and not an empty name.
+    const offline = await owners();
+    await offline.application.setGroupAccess(offline.a, { groupId: GROUP, enabled: true });
+    await offline.f.app.disconnectChannel("fixture");
+    const disconnected = (await offline.application.projectManagedGroups(offline.a)).groups[0]!;
+    expect(disconnected.groupId).toBe(GROUP);
+    expect(disconnected.name).toBeNull();
+    expect(disconnected.reachable).toBeNull();
+    expect(disconnected.version).toBe(1);
+    expect(disconnected.categories).toEqual(DEFAULT_OWNER_GROUP_POLICY.categories);
+    expect(disconnected.access.grantedCategories).toContain("group.read");
+
+    // A connected provider that rejects `get_group_info` is the same "unknown", and it does not
+    // fail the whole projection or erase the durable facts for the group.
+    const failing = await owners();
+    await failing.application.setGroupAccess(failing.a, { groupId: GROUP, enabled: true });
+    // Only now does the peer begin rejecting `get_group_info`: the durable assignment is already
+    // in place, so the failure can affect the live observation alone.
+    failing.f.setGroupInfoFails(true);
+    const errored = (await failing.application.projectManagedGroups(failing.a)).groups;
+    expect(errored).toHaveLength(1);
+    expect(errored[0]).toMatchObject({ groupId: GROUP, name: null, reachable: null });
+    expect(errored[0]!.skills).toEqual({ enabledSkills: ["unslop"], version: 0 });
+    expect(errored[0]!.access.historyRead).toBe(true);
+  });
+
+  it("applies a history revoke to the very next inventory projection", async () => {
+    const { application, a } = await owners({ groupName: "Fixture Group" });
+    await application.setGroupAccess(a, { groupId: GROUP, enabled: true });
+    const before = (await application.projectManagedGroups(a)).groups[0]!;
+    expect(before.categories["group.history"]).toBe(true);
+    expect(before.access.grantedCategories).toContain("group.history");
+    expect(before.access.historyRead).toBe(true);
+
+    await application.setGroupHistory(a, { groupId: GROUP, enabled: false });
+
+    // Both the durable policy and the live authorization decision change, and the next
+    // projection reads them fresh rather than from a cached bundle.
+    const after = (await application.projectManagedGroups(a)).groups[0]!;
+    expect(after.categories["group.history"]).toBe(false);
+    expect(after.access.grantedCategories).not.toContain("group.history");
+    expect(after.access.historyRead).toBe(false);
+    // The assignment itself is untouched: only the one category changed.
+    expect(after.groupId).toBe(GROUP);
+  });
+
+  it("keeps the durable Skill whitelist and its version in the projection across a restart", async () => {
+    const { f, application, a } = await owners({ persistentDatabase: true });
+    await application.setGroupAccess(a, { groupId: GROUP, enabled: true });
+    await application.setGroupSkill(a, {
+      groupId: GROUP,
+      skillName: "github-gem-seeker",
+      enabled: true,
+    });
+
+    const before = (await application.projectManagedGroups(a)).groups[0]!;
+    expect([...before.skills.enabledSkills].sort()).toEqual(["github-gem-seeker", "unslop"]);
+    expect(before.skills.version).toBe(1);
+
+    // The whitelist is read from the durable group runtime, so it survives a reopen rather
+    // than depending on any live Pi session.
+    const restarted = admin(await f.reopen());
+    const after = (await restarted.projectManagedGroups(a)).groups[0]!;
+    expect(after.skills).toEqual(before.skills);
+    expect(after.groupId).toBe(GROUP);
+    expect(after.version).toBe(before.version);
+  });
+
+  it("returns only matching, policy-enabled and authorized entries with their groups", async () => {
+    const { application, a } = await owners();
+    await application.setGroupAccess(a, { groupId: GROUP, enabled: true });
+
+    // No query is the whole authorized set: the account-scoped entries plus every group-scoped
+    // entry the default bundle enables in the one managed group.
+    const all = await capabilitySearch(application, a);
+    expect(all.query).toBeNull();
+    expect(all.groups).toEqual([GROUP]);
+    expect(all.capabilities.map((entry) => entry.tool).sort()).toEqual(
+      ["qq_account_status", "qq_capability_search", ...DEFAULT_GROUP_TOOLS].sort(),
+    );
+    for (const entry of all.capabilities) {
+      // Every record carries the required stable metadata.
+      expect(typeof entry.tool).toBe("string");
+      expect(entry.description.length).toBeGreaterThan(0);
+      expect(QQ_CAPABILITY_CATEGORIES).toContain(entry.category);
+      expect(typeof entry.readOnly).toBe("boolean");
+      // A group-scoped entry says where it is usable; an account entry is not group-bound.
+      expect(entry.groupIds).toEqual(DEFAULT_GROUP_TOOLS.includes(entry.tool) ? [GROUP] : []);
+    }
+    expect(all.capabilities.find((entry) => entry.tool === "qq_group_history")?.readOnly).toBe(
+      true,
+    );
+
+    // A query matches on the registry metadata and returns only what matched.
+    const history = await capabilitySearch(application, a, { query: "history" });
+    expect(history.query).toBe("history");
+    expect(history.capabilities).toEqual([
+      {
+        tool: "qq_group_history",
+        description: "Read a managed group's live message history page.",
+        category: "group.history",
+        readOnly: true,
+        groupIds: [GROUP],
+      },
+    ]);
+
+    // The group filter narrows the caller's own assignment; it never widens it.
+    const elsewhere = await capabilitySearch(application, a, {
+      query: "history",
+      groupIds: [OTHER_GROUP],
+    });
+    expect(elsewhere.groups).toEqual([]);
+    expect(elsewhere.capabilities).toEqual([]);
+  });
+
+  it("contributes no result for a disabled category, another Owner's group or a revoked grant", async () => {
+    const { application, a, b } = await owners();
+    await application.setGroupAccess(a, { groupId: GROUP, enabled: true });
+    await application.setGroupAccess(b, { groupId: OTHER_GROUP, enabled: true });
+    expect(
+      (await capabilitySearch(application, a, { query: "history" })).capabilities,
+    ).toHaveLength(1);
+
+    // A disabled category removes its entry even though the registry still declares it.
+    await application.setGroupHistory(a, { groupId: GROUP, enabled: false });
+    expect((await capabilitySearch(application, a, { query: "history" })).capabilities).toEqual([]);
+    await application.setGroupHistory(a, { groupId: GROUP, enabled: true });
+
+    // Another Owner's group is outside this Owner's assignment: naming it as a filter yields no
+    // group at all, and a query only that group's entries could satisfy returns nothing.
+    const foreign = await capabilitySearch(application, a, {
+      query: "history",
+      groupIds: [OTHER_GROUP],
+    });
+    expect(foreign.groups).toEqual([]);
+    expect(foreign.capabilities).toEqual([]);
+
+    // Revoking the assignment revokes every group-scoped entry: only the Agent's own
+    // account-scoped capabilities remain.
+    await application.setGroupAccess(a, { groupId: GROUP, enabled: false });
+    const revoked = await capabilitySearch(application, a);
+    expect(revoked.groups).toEqual([]);
+    expect(revoked.capabilities.map((entry) => entry.tool).sort()).toEqual([
+      "qq_account_status",
+      "qq_capability_search",
+    ]);
+  });
+
+  it("never surfaces a server-only, deferred or raw provider primitive", async () => {
+    const { application, a } = await owners();
+    await application.setGroupAccess(a, { groupId: GROUP, enabled: true });
+    const tools = (await capabilitySearch(application, a)).capabilities.map((entry) => entry.tool);
+
+    for (const forbidden of [
+      "upload_group_file",
+      "send_group_msg",
+      "send_private_msg",
+      "get_csrf_token",
+      "get_cookies",
+      "get_rkey",
+      "send_packet",
+      "bot_exit",
+      "set_restart",
+      "clean_cache",
+    ]) {
+      expect(tools).not.toContain(forbidden);
+      // Nor can a query reach one: the search surface is the Glassbox registry, not the
+      // provider's action namespace.
+      expect((await capabilitySearch(application, a, { query: forbidden })).capabilities).toEqual(
+        [],
+      );
+    }
+
+    // `upload_group_file` is a real group file mutation, but its `file` parameter is a local
+    // server path, so even the group-files Tool may not issue it.
+    expect(tools).toContain("qq_group_files");
+    expect(tools).not.toContain("qq_group_file_ops");
+  });
+
+  it("never discovers the registry search outside an Owner-private Run", async () => {
+    const { f, application, a } = await owners();
+    await application.setGroupAccess(a, { groupId: GROUP, enabled: true });
+    // The Owner-private Run is the only scope that discovers it.
+    expect(await application.resolveRunToolNames(a)).toContain("qq_capability_search");
+
+    // A group Run in the Owner's own managed group does not...
+    f.send(2, "group-run", false, 10002, Number(GROUP));
+    const groupRunStarted = await f.started.take();
+    await f.reply("answer:group-run");
+    const inGroup: OwnerContext = {
+      caller: groupRunStarted.caller,
+      conversationId: groupRunStarted.conversation.id,
+      runId: groupRunStarted.run.id,
+    };
+    expect(inGroup.caller.scope).toMatchObject({ chatType: "group", chatId: GROUP });
+    expect(await application.resolveRunToolNames(inGroup)).not.toContain("qq_capability_search");
+    // ...and a direct call is denied on a Resource that was never registered, rather than
+    // merely hidden from the surface.
+    await expect(searchTool(application, inGroup).execute("call", {})).rejects.toThrow(
+      "Permission denied: resource_missing",
+    );
+
+    // A Visitor-private Run holds no capability surface at all.
+    f.send(3, "visitor-private", true, 10004);
+    const visitorStarted = await f.started.take();
+    await f.reply("answer:visitor-private");
+    const visitor: OwnerContext = {
+      caller: visitorStarted.caller,
+      conversationId: visitorStarted.conversation.id,
+      runId: visitorStarted.run.id,
+    };
+    expect(visitor.caller.principalId).toBe("qq-visitor-10004");
+    expect(await application.resolveRunToolNames(visitor)).not.toContain("qq_capability_search");
+    await expect(searchTool(application, visitor).execute("call", {})).rejects.toThrow(
+      "Permission denied: no_grant",
+    );
   });
 });
 
