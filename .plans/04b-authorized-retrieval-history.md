@@ -2,6 +2,8 @@
 
 Status: ACTIVE PARALLEL P4 STREAM
 
+Tracking Issue: #10
+
 This plan is one of two intentionally parallel P4 implementation streams.
 
 The sibling plan is:
