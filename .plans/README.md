@@ -1,46 +1,75 @@
 # Plans
 
-This directory contains the active implementation plan and durable technical findings.
+This directory contains the active implementation plans and durable technical findings.
 
-## Active plan
+## Active plans
 
-`03-personal-agent-foundation.md` is the only active plan.
+P3 completed on 2026-09-19.
 
-Its goal is to establish the first durable Personal Agent foundation:
+P4 is intentionally split into two parallel implementation streams:
 
 ```text
-Identity
-  ↓
-Authorization
-  ↓
-Conversation
-  ↓
-Turso persistence
-  ↓
-Run / Authorization Trace
+04a-memory-taste.md
+  Issue #9
+  Memory / Taste durable learning truth
+
+04b-authorized-retrieval-history.md
+  Issue #10
+  Authorized retrieval / QQ history search
 ```
 
-Authorization is P0. Plan 03 starts with QQ group mentions and Owner private chat, including a bounded Run-linked Eval acceptance loop. Do not start real WeChat, Mail, Calendar, Memory consolidation, Skill evolution, LongTask, the full Eval platform, or Arena before Plan 03's completion gate is satisfied.
+This is an intentional exception to the normal one-active-plan rule. The two streams have separate ownership and should land through separate PRs.
 
-## Read order for implementation
+Shared boundary:
+
+```text
+P4A
+  writes and manages durable Memory / Taste truth
+
+P4B
+  reads authorized history / Memory / Taste
+  ranks and projects retrieval results
+```
+
+Neither stream may silently absorb the sibling stream.
+
+## Read order for P4 implementation
 
 1. `../AGENTS.md`
-2. `03-personal-agent-foundation.md`
-3. only the relevant files under `findings/`
-4. the relevant upstream source or documentation
-5. current production code and focused tests
+2. the owned P4A or P4B plan
+3. the matching GitHub Issue
+4. only the relevant files under `findings/`
+5. the relevant upstream source or official documentation
+6. current production code and focused tests
 
-`README.md` defines product direction. `AGENTS.md` defines stable engineering and safety rules. The active plan defines the current scope.
+For P4A also read:
+
+```text
+../docs/memory-taste.md
+../upstream/command-code/SOURCES.md
+```
+
+For P4B also read the existing P3 trust and Channel implementation before changing retrieval:
+
+```text
+../apps/server/src/auth/
+../apps/server/src/conversation/
+../apps/server/src/channels/onebot/
+```
+
+`README.md` defines product direction. `AGENTS.md` defines stable engineering and safety rules. The owned active plan and its Issue define the implementation scope.
 
 ## Historical phases
 
-Plan 01 and Plan 02 were completed phases of the earlier canvas-first coding-agent workbench. They and their completed Ticket files were removed from the active tree. Their full history remains in Git.
+Plan 01 and Plan 02 were completed phases of the earlier canvas-first coding-agent workbench. Their history remains in Git.
 
-Do not restore old plans merely to preserve history.
+Plan 03 established the first usable QQ Personal Agent and Agent Operations closed loop. It is retained because P4 depends on its trust, Conversation, persistence, Tool and Delivery contracts.
+
+`03-plus-owner-control-smoke.md` records the completed P3 closeout.
 
 ## Keep here
 
-- one active numbered plan unless parallel work is explicitly intentional
+- active numbered plans
 - reusable technical findings
 - provider and protocol spikes with evidence
 - performance measurements worth comparing later
@@ -52,7 +81,7 @@ Do not restore old plans merely to preserve history.
 - commit chores
 - generated logs
 - test output
-- debugging breadcrumbs that are already represented by code or tests
+- debugging breadcrumbs already represented by code or tests
 - copied roadmap status that is no longer current
 
-`findings/` is intentionally retained as historical technical evidence. A finding is not permission to expand the current plan.
+`findings/` is intentionally retained as historical technical evidence. A finding is not permission to expand the owned active plan.
