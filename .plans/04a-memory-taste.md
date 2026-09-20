@@ -6,68 +6,235 @@ Tracking Issue: #9
 
 This plan is one of two intentionally parallel P4 implementation streams.
 
-The sibling plan is:
+Sibling:
 
-\`\`\`text
+```text
 .plans/04b-authorized-retrieval-history.md
-\`\`\`
+```
 
-One Issue owns this plan and one later PR must stay inside this plan's boundary.
+One Issue owns this plan and one later PR must stay inside this boundary.
 
 ## Goal
 
-Build the durable write side of Glassbox learning.
-
-P4A decides what becomes long-lived knowledge or preference, preserves why it exists, and lets the Owner inspect and control it.
-
-P4A does not implement group-history search, retrieval ranking, Top K selection, or Runtime Context injection.
+Build the durable write side of Glassbox learning by porting mature upstream mechanisms instead of designing a new Memory system.
 
 Acceptance sentence:
 
-> An Owner can explicitly create, inspect, update, retire, and revoke durable project knowledge across restart. Real feedback can create scoped Taste candidates with evidence and confidence, but one edit cannot silently become a permanent preference, project Taste cannot leak into global Taste, and no model-generated inference can become active durable truth without an explicit promotion path.
+> An Owner can explicitly create, inspect, update, expire, revoke, and govern durable project knowledge across restart. Conversation and feedback evidence can produce candidates through mature upstream contracts and consolidation behavior, but one edit cannot silently become permanent Taste, project Taste cannot become global Taste, and model inference cannot bypass the candidate / promotion boundary. Every protected mutation is authorized by Glassbox and remains traceable.
 
-## Ownership
+## Upstream-first rule
 
-P4A owns:
+Implementation order:
 
-\`\`\`text
-FeedbackEvent
-TasteCandidate
-TasteEntry
-Taste confidence
-supporting / contradicting evidence
-global / project Taste scope
-MemoryCandidate
-Semantic Memory
-Episodic Memory
-provenance
-reliability
-promotion
-demotion
-supersession
-retirement
-Owner inspection / administration
-learning evidence
-\`\`\`
+```text
+MGP
+  Memory / Candidate / Evidence / lifecycle contracts
 
-P4A does not own:
+LangMem
+  conversation → structured Memory extraction / consolidation
 
-\`\`\`text
-QQ group-history transport
-cross-group search
-lexical / vector search
-retrieval ranking
-Top K
-Context budget
-Runtime Context injection
-Delivery of retrieved content
-\`\`\`
+OpenHarness Memory
+  signature / dedupe / TTL / disabled / supersedes / freshness
 
-## Stable distinction
+Learning-Multi-Factor-Memory
+  value / retention / forgetting mechanism
 
-\`\`\`text
+Command Code
+  Taste behavior signals and user/project scope
+
+Glassbox
+  Principal / Authorization / Project / Turso / Trace only
+```
+
+Do not invent a standard Memory mechanism until the listed upstreams have been checked.
+
+Any new generic mechanism must record why the relevant upstream cannot be used.
+
+## Primary upstream source map
+
+### MGP
+
+Pinned:
+
+```text
+HKUDS/MGP
+54ce6c00e3d0aa731ecbe17e74407cbbb5a96f10
+```
+
+Repository note:
+
+```text
+upstream/mgp/SOURCES.md
+```
+
+Port first:
+
+```text
+schemas/memory-object.schema.json
+schemas/memory-candidate.schema.json
+schemas/memory-evidence.schema.json
+schemas/memory-merge-hint.schema.json
+schemas/audit-event.schema.json
+spec/runtime-write-candidate.md
+reference/gateway/semantics.py
+compliance/dedupe/test_dedupe_upsert.py
+compliance/lifecycle/
+```
+
+Preserve candidate kinds, evidence, merge hints, lifecycle distinctions, lineage and audit semantics.
+
+Do not introduce MGP's Python gateway or policy engine as a second Glassbox control plane.
+
+### LangMem
+
+Pinned:
+
+```text
+langchain-ai/langmem
+9d033b47d9ce53e37e92c92241b0496c0278932e
+```
+
+Port behavior from:
+
+```text
+src/langmem/knowledge/extraction.py
+create_memory_manager
+create_memory_store_manager
+docs/docs/guides/extract_semantic_memories.md
+docs/docs/guides/extract_episodic_memories.md
+docs/docs/background_quickstart.md
+docs/docs/guides/delayed_processing.md
+```
+
+Preserve:
+
+```text
+messages + existing Memory
+→ extraction / enrichment
+→ create / update / removal decision
+→ persistence
+```
+
+Do not add LangGraph as a second Runtime.
+
+### OpenHarness Memory
+
+Pinned:
+
+```text
+HKUDS/OpenHarness
+9b2efd795c6aa09f88b0c257d269a9e518da6ae7
+```
+
+Port behavior from:
+
+```text
+src/openharness/memory/schema.py
+src/openharness/memory/manager.py
+src/openharness/memory/scan.py
+src/openharness/memory/usage.py
+tests/test_memory/
+```
+
+Preserve normalized signature, dedupe, stable ID, TTL, disabled state, supersedes, timestamps, freshness and atomic mutation behavior.
+
+Use Turso rather than copying OpenHarness file storage.
+
+### Learning-Multi-Factor-Memory
+
+Pinned:
+
+```text
+zhibao-dev/Learning-Multi-Factor-Memory
+2d51bdf279cd837eed7d582bad2bde58caa74c61
+```
+
+Mechanism reference:
+
+```text
+borge/memory/value.py
+borge/memory/forgetting.py
+borge/memory/retrieval.py
+borge/memory/consolidation.py
+tests/test_memory_value.py
+tests/test_forgetting_value.py
+tests/test_retrieval_value.py
+tests/test_consolidation_factors.py
+```
+
+Use interpretable factors such as reliability, goal relevance, task utility, usage and recency for retention decisions.
+
+The repository currently has only MIT metadata in pyproject rather than a verified LICENSE file. Until license terms are confirmed, reuse mechanism / formulas / test ideas, not large verbatim source slices.
+
+Automatic destructive forgetting stays off in P4A. Raw Trace and source evidence are not deleted by Memory retention.
+
+### Command Code
+
+Use:
+
+```text
+upstream/command-code/SOURCES.md
+```
+
+Adopt Taste signals:
+
+```text
+accept
+reject
+edit
+revert
+explicit correction
+global / user preference
+project preference
+```
+
+It is a research reference, not a code-vendoring source.
+
+## Glassbox ownership
+
+Glassbox continues to own:
+
+```text
+Agent
+Principal
+Project
+Resource
+Grant
+AuthorizationDecision
+Conversation
+Run
+Task / TaskAttempt
+Audience / Delivery
+Turso durable state
+Raw Trace
+```
+
+Relevant current code:
+
+```text
+apps/server/src/persistence/schema.ts
+apps/server/src/persistence/database.ts
+apps/server/src/conversation/store.ts
+apps/server/src/auth/service.ts
+apps/server/src/runtime/pi/protected-tools.ts
+apps/server/src/runtime/pi/owner-tools.ts
+```
+
+Reuse the existing Owner Tool pattern:
+
+```text
+discover authorization
+→ protected Tool
+→ execution-time authorization
+→ durable mutation
+→ evidence
+```
+
+## Stable concept boundary
+
+```text
 Rules
-  explicit authority-bearing constraints
+  explicit authority
 
 Skills
   reusable validated procedures
@@ -76,345 +243,296 @@ Taste
   learned preference
 
 Memory
-  promoted durable facts, decisions, events and prior-work knowledge
-\`\`\`
+  governed durable facts, decisions and events
+```
 
-\`\`\`text
+```text
 Rules ≠ Skills ≠ Taste ≠ Memory
-\`\`\`
+```
 
 Taste never grants authority.
 
-A stable repeatable procedure should normally become a Skill rather than generic Memory.
-
 Raw Conversation history is not automatically Memory.
 
-## What can be reused now
+Stable procedural knowledge should normally become a Skill candidate.
 
-Current Glassbox already provides the important trust and persistence base:
+## Canonical Memory contract
 
-\`\`\`text
-Principal
-Resource
-Grant
-AuthorizationDecision
-Conversation
-Run
-Task / TaskAttempt
-messages
-Raw Trace / ops_trace_events
-Turso / SQLite-compatible DomainDatabase
-protected Pi Tool wrapper
-Owner-private Tool visibility pattern
-\`\`\`
+Do not design a second candidate / Memory schema.
 
-Relevant code:
+Base the TypeScript domain contract on MGP:
 
-\`\`\`text
-apps/server/src/persistence/schema.ts
-apps/server/src/persistence/database.ts
-apps/server/src/conversation/store.ts
-apps/server/src/auth/service.ts
-apps/server/src/runtime/pi/protected-tools.ts
-apps/server/src/runtime/pi/owner-tools.ts
-\`\`\`
+```text
+MemoryObject
+MemoryCandidate
+MemoryEvidence
+MemoryMergeHint
+Lifecycle actions
+Audit / lineage
+```
 
-The existing \`owner_group_admin\` Tool is the pattern to reuse for an Owner-only learning administration Tool. Tool visibility and execution authorization remain separate.
+P4A initially needs canonical types corresponding to:
 
-The repository already pins Command Code only as a mechanism reference:
-
-\`\`\`text
-upstream/command-code/SOURCES.md
-\`\`\`
-
-Do not vendor or depend on Command Code. Glassbox owns the learning data model and promotion policy.
-
-## Data model direction
-
-The exact schema may change during implementation, but every promoted record must preserve enough information to explain why it exists.
-
-### FeedbackEvent
-
-Minimum direction:
-
-\`\`\`text
-id
-principalId
-projectId?
-conversationId?
-runId?
-taskId?
-artifactRef?
-signalType
-beforeRef?
-afterRef?
-categoryHints?
-visibility
-createdAt
-\`\`\`
-
-Minimum signals:
-
-\`\`\`text
-accept
-reject
-edit
-revert
-explicit_positive
-explicit_negative
-\`\`\`
-
-Repeated correction is derived from evidence. It is not a magical single signal.
-
-### TasteCandidate / TasteEntry
-
-Minimum direction:
-
-\`\`\`text
-id
+```text
 preference
-category
-scope
-confidence
-supportingEvidence
-contradictingEvidence
-observations
-firstSeen
-lastSeen
-status
-sourceRefs
-\`\`\`
+semantic_fact
+episodic_event
+relationship
+```
 
-P4A supports only:
+MGP scope does not exactly equal Glassbox Taste `global / project`.
 
-\`\`\`text
-global
-project
-\`\`\`
-
-Do not add repository, path, language, framework, team, or task-class scope without a tested need.
-
-### MemoryCandidate / Memory
-
-At minimum keep two promoted classes:
-
-\`\`\`text
-Semantic Memory
-  durable facts, decisions, relationships and project knowledge
-
-Episodic Memory
-  meaningful prior Runs, Tasks, Conversations, outcomes, failures and lessons
-\`\`\`
-
-Useful lifecycle fields include:
-
-\`\`\`text
-sourceRefs
-reliability
-visibility
-status
-createdAt
-updatedAt
-expiresAt?
-supersedes?
-retiredAt?
-\`\`\`
-
-Expiration is optional. Long-lived facts and decisions should support supersession and retirement rather than forced arbitrary expiry.
+Keep Glassbox product scope through an explicit mapping / extension rather than changing product semantics.
 
 ## Write authority
 
-Do not expose a generic model-controlled \`write_memory(anything)\` path.
-
-Allowed directions:
-
-\`\`\`text
+```text
 explicit Owner Action
-  → may create or change durable truth after authorization
+  → may create / update governed durable truth after authorization
 
 deterministic product event
-  → may append FeedbackEvent evidence
+  → may append evidence
 
 model / extractor inference
-  → may create Candidate only
-  → cannot directly create active Memory or active Taste
-\`\`\`
+  → Candidate only
+  → cannot directly create active canonical Memory / Taste
+```
 
-The model cannot convert its own guess into durable truth.
+No unrestricted model-controlled `write_memory(anything)`.
+
+## Taste
+
+Taste uses Command Code signals but MGP-style Candidate / Evidence / merge behavior.
+
+```text
+single edit
+→ evidence / candidate
+≠ active Taste
+
+repeated support
+→ reinforce evidence
+
+contradiction
+→ correction evidence
+→ lower confidence or replace / retire when justified
+```
+
+Do not invent a complex confidence model.
+
+Use the smallest explainable evidence policy needed. If an exact algorithm beyond upstream behavior is required, document the gap before implementing it.
+
+Initial scope remains:
+
+```text
+global
+project
+```
+
+## Semantic and Episodic Memory
+
+Classification and consolidation follow LangMem behavior.
+
+```text
+Conversation / Run / Task evidence
+→ relevant existing Memory
+→ extraction / enrichment
+→ MGP Candidate
+→ dedupe / merge / reinforce / correction
+→ canonical Semantic or Episodic Memory
+```
+
+Do not promote every message.
+
+Prefer source references over copying large protected payloads.
+
+## Lifecycle and hygiene
+
+Use MGP lifecycle semantics plus OpenHarness hygiene.
+
+P4A must support:
+
+```text
+normalized signature
+dedupe
+reinforce
+correction
+supersedes
+optional TTL
+expire
+revoke
+disabled / inactive projection
+freshness
+source provenance
+```
+
+Do not create an unrelated custom state machine for delete / expire / revoke / retire.
+
+## Retention
+
+Do not use an arbitrary fixed expiry policy.
+
+Use the Multi-Factor Memory value approach for non-destructive retention decisions.
+
+Initial factors may include:
+
+```text
+reliability
+goal relevance
+task utility
+usage
+recency
+```
+
+Automated physical deletion is out of scope.
 
 ## Implementation route
 
-### P4A.0 — Contracts and isolated fixtures
+### P4A.0 — Port MGP contracts
 
-Define durable types, migrations and disposable test fixtures for:
+Port the required MGP schemas and semantics into TypeScript domain types and Turso persistence.
 
-\`\`\`text
-FeedbackEvent
-TasteCandidate
-TasteEntry
-MemoryCandidate
-SemanticMemory
-EpisodicMemory
-source references
-scope
-status
-\`\`\`
+Add MGP compliance-inspired fixtures.
 
-Prove restart / reopen before runtime integration.
+### P4A.1 — Candidate and evidence ingestion
 
-### P4A.1 — Feedback Ledger
+Normalize Owner statements, FeedbackEvent, Run / Task evidence and extractor output into MGP-style Candidate + Evidence.
 
-Persist explicit and deterministic feedback evidence.
+### P4A.2 — Port LangMem consolidation
 
-Require:
+Implement behavior-compatible semantic / episodic extraction using existing Memory in the update decision.
 
-\`\`\`text
-source linkage
-Principal
-scope
-visibility
-timestamp
-append-only evidence semantics
-\`\`\`
+### P4A.3 — Port OpenHarness hygiene
 
-Do not update Taste directly from a transient event.
+Implement signature, dedupe, TTL, disabled state, supersedes, freshness and usage metadata on Turso.
 
-### P4A.2 — Taste candidate and confidence
+### P4A.4 — Taste loop
 
-Implement candidate creation and confidence updates.
+Map Command Code-style feedback signals into MGP-style candidate / evidence handling while preserving global / project isolation.
 
-At minimum consider:
+### P4A.5 — Retention value
 
-\`\`\`text
-supporting evidence
-contradicting evidence
-recency
-signal strength
-scope consistency
-\`\`\`
+Add the interpretable Multi-Factor Memory retention factors without destructive auto-prune.
 
-One edit remains evidence only.
+### P4A.6 — Owner governance
 
-Explicit current user instruction remains stronger than learned Taste.
+Expose narrow Owner-private lifecycle Actions based on MGP semantics:
 
-### P4A.3 — Promotion, demotion and scope isolation
-
-Support:
-
-\`\`\`text
-candidate
-active
-retired
-\`\`\`
-
-and explicit promotion / demotion behavior.
-
-Prove project Taste cannot silently become global Taste.
-
-### P4A.4 — Semantic Memory
-
-Support explicit durable facts and decisions with provenance, reliability, visibility, supersession and retirement.
-
-### P4A.5 — Episodic Memory
-
-Promote meaningful prior execution evidence without treating every message as Memory.
-
-Store references to durable evidence where possible instead of duplicating large protected payloads.
-
-### P4A.6 — Owner inspection and administration
-
-Add a narrow Owner-private protected surface, conceptually:
-
-\`\`\`text
-memory_admin
-
+```text
 list
 get
-add_explicit
+write explicit
 update
-retire
-delete or revoke where policy permits
-review_candidate
+expire
+revoke
+review candidate
 promote
-reject_candidate
-\`\`\`
+reject candidate
+```
 
-The exact Tool name is not frozen.
+Every mutation re-authorizes at execution time.
 
-Every mutation re-authorizes immediately before execution and records evidence.
+### P4A.7 — Real acceptance
 
-## Shared contract with P4B
+Prove:
 
-P4A must expose retrieval-facing records without implementing retrieval policy.
+```text
+explicit project fact
+→ Candidate / Memory
+→ restart
+→ inspect
+→ update / revoke
+→ next inspection reflects change
 
-Conceptual projection:
+single edit
+→ candidate evidence
+→ not active Taste
+```
 
-\`\`\`text
-id
-kind
-text or summary
-scope
-resourceId
-visibility
-sourceRefs
-occurredAt?
-createdAt
-status
-confidence?
-\`\`\`
+## P4B boundary
 
-P4B may query this projection only inside an already authorized source set.
+P4A exports canonical active Memory plus Glassbox resource / scope mapping.
 
-P4B owns ranking and Context selection.
+P4A does not define retrieval ranking or a custom SearchResult.
+
+P4B uses the MGP Recall / SearchResult contract.
 
 ## Tests
 
-Deterministic tests must cover at least:
+Bring behavior-compatible upstream cases with the port.
 
-\`\`\`text
-explicit Memory survives restart
-update / supersede / retire survives restart
-one edit does not create active Taste
-repeated supporting evidence raises confidence
-contradicting evidence can lower confidence
-project Taste never becomes global implicitly
-Visitor cannot inspect Owner-private learning state
-model inference produces Candidate only
-revoked / retired entries are not returned as active truth
-provenance links remain inspectable
-Owner mutation records authorization evidence
-test state is isolated from live state
-\`\`\`
+Primary sources:
+
+```text
+MGP
+  compliance/dedupe/
+  compliance/lifecycle/
+  compliance/schema/
+
+OpenHarness
+  tests/test_memory/
+
+Learning-Multi-Factor-Memory
+  tests/test_memory_value.py
+  tests/test_forgetting_value.py
+  tests/test_consolidation_factors.py
+
+LangMem
+  semantic / episodic extraction examples
+  store-manager create / update / removal behavior
+```
+
+Glassbox-specific coverage:
+
+```text
+Visitor cannot inspect Owner-private Memory
+group Run cannot discover Owner governance Tool
+revocation affects the next protected operation
+project Taste cannot become global
+model inference cannot directly create active Memory
+restart preserves lifecycle / provenance
+```
 
 ## Completion gate
 
 P4A is complete only when:
 
-- durable Memory and Taste truth lives in Glassbox / Turso-compatible state;
-- feedback evidence exists before learned preference promotion;
-- one edit cannot become permanent Taste;
-- project and global Taste are isolated;
-- Semantic and Episodic Memory are distinct;
-- model inference cannot directly create active durable truth;
-- Owner can inspect and manage learning state through a protected surface;
-- restart preserves active, candidate, retired and provenance state;
-- P4B can consume the stable retrieval-facing projection without depending on P4A internals;
-- focused authorization, persistence and learning tests pass.
+```text
+MGP-derived contract is canonical
+LangMem-style consolidation works
+OpenHarness-style hygiene works
+Taste remains evidence-driven
+Semantic / Episodic Memory remain distinct
+lifecycle survives restart
+Owner can inspect and govern Memory
+Glassbox Authorization wraps protected mutation
+P4B consumes the canonical contract without P4A internals
+```
+
+## PR provenance requirement
+
+Every substantially ported mechanism records:
+
+```text
+upstream repository
+pinned commit
+original source path
+license
+ported behavior / tests
+Glassbox-specific changes
+```
 
 ## Non-goals
 
-Do not add in this Issue:
-
-\`\`\`text
+```text
 QQ history search
 Owner cross-group search
-vector database
+retrieval ranking
+external vector database
 generic Context compression
-Context Budget Governor
-token routing
+P5 routing / token governor
 new Channels
 LongTask
 Skill generation
 full Eval platform
 frontend management UI
-\`\`\`
+```
