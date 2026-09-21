@@ -21,8 +21,14 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { ReturnMode } from "@glassbox/contracts";
 import type { DomainStore } from "../../persistence/index.js";
 import type { ChannelArchiveStore } from "../../retrieval/channel-archive.js";
-import { selectBoundedContext, type BoundedContextItem } from "../../retrieval/context.js";
-import { MemoryRetriever } from "../../retrieval/retriever.js";
+import {
+  DEFAULT_PER_SOURCE_CAP,
+  selectBoundedContext,
+  type BoundedContext,
+  type BoundedContextItem,
+  type TruncationReason,
+} from "../../retrieval/context.js";
+import { MemoryRetriever, type RetrievalCoverage } from "../../retrieval/retriever.js";
 import {
   groupResourceId,
   resolveAssignedGroupIds,
@@ -98,6 +104,115 @@ export interface HistorySearchDetails {
   considered: number;
   truncated: boolean;
   resultStatus: "matches_found" | "no_matches_in_searched_window";
+  coverage: HistorySearchCoverage;
+}
+
+/**
+ * How much of the searched window this call actually saw.
+ *
+ * A retrieval result is not a census. The requested limit, the candidate ceiling and the
+ * cross-group per-source cap each cut candidates, and each produces the same empty tail as
+ * a genuinely exhausted window. Reporting which bound applied is what lets an answer say
+ * "no match in what I looked at" instead of "this never happened".
+ */
+export interface HistorySearchCoverage {
+  /** The limit the caller asked for. */
+  requestedLimit: number;
+  /** Hits that reached the model. */
+  returned: number;
+  /** Candidates the archive produced before any bound. */
+  considered: number;
+  /** True when at least one candidate was dropped by a bound rather than by authorization. */
+  truncated: boolean;
+  /** Why candidates were dropped, deduplicated. Empty when none were. */
+  truncationReasons: TruncationReason[];
+  /** The per-source cap this search applied; `null` when the search targeted one group. */
+  perSourceCap: number | null;
+  /**
+   * `complete` — every candidate the archive held was returned.
+   * `partial` — a bound cut candidates, so more may exist.
+   * `unknown` — no group was searched, so nothing about the world was learned.
+   */
+  coverage: "complete" | "partial" | "unknown";
+  /** Authorized groups this search actually read. */
+  groupsSearched: number;
+  /** Per-group coverage, ordered by group id so the evidence is comparable across Runs. */
+  sourceCoverage: Array<{
+    groupId: string;
+    returned: number;
+    considered: number;
+    capped: boolean;
+  }>;
+  /** When the search ran. Distinct from when the matched messages were sent. */
+  observedAt: string;
+  /**
+   * What to do next to see more. Present only while the window is not exhausted.
+   *
+   * Deliberately not a time cursor: the retriever ranks by score, so "older than the oldest
+   * hit" would skip newer matches that simply ranked lower. Raising the limit reaches the
+   * candidate set this search already saw; searching a capped group alone removes the cap.
+   */
+  continuation?: {
+    /** A limit that reaches every candidate this search considered. */
+    suggestedLimit?: number;
+    /** Groups whose hits were capped by the cross-group per-source cap. */
+    cappedGroups?: string[];
+  };
+}
+
+/** The cross-group per-source cap, restated here so the coverage can report it. */
+const CROSS_GROUP_PER_SOURCE_CAP = DEFAULT_PER_SOURCE_CAP;
+
+/**
+ * Assembles the one coverage record from both bounds that can cut a result.
+ *
+ * The retriever bounds how much it fetches and keeps; the bounded Context bounds what it
+ * keeps per source. Neither alone describes the window, so the reported reasons are the
+ * union and `coverage` is `complete` only when neither dropped anything.
+ */
+function historyCoverage(input: {
+  retrieval: RetrievalCoverage;
+  bounded: BoundedContext;
+  groupsSearched: number;
+  observedAt: string;
+}): HistorySearchCoverage {
+  const reasons = new Set<TruncationReason>(input.bounded.truncationReasons);
+  if (input.retrieval.droppedByLimit > 0) reasons.add("top_k_reached");
+  if (input.retrieval.candidateCapReached) reasons.add("candidate_ceiling_reached");
+
+  const cappedGroups = input.bounded.sources
+    .filter((source) => source.capped)
+    .map((source) => source.sourceId)
+    .sort();
+  const truncated = reasons.size > 0;
+  const continuation: HistorySearchCoverage["continuation"] = {};
+  if (input.retrieval.droppedByLimit > 0)
+    continuation.suggestedLimit = Math.min(
+      Math.max(input.retrieval.considered, input.retrieval.requestedLimit + 1),
+      MAX_LIMIT,
+    );
+  if (cappedGroups.length > 0) continuation.cappedGroups = cappedGroups;
+
+  return {
+    requestedLimit: input.retrieval.requestedLimit,
+    returned: input.retrieval.returned,
+    considered: input.retrieval.considered,
+    truncated,
+    truncationReasons: [...reasons],
+    perSourceCap: input.bounded.bounds.perSourceCap,
+    coverage: input.groupsSearched === 0 ? "unknown" : truncated ? "partial" : "complete",
+    groupsSearched: input.groupsSearched,
+    sourceCoverage: [...input.bounded.sources]
+      .map((source) => ({
+        groupId: source.sourceId,
+        returned: source.returned,
+        considered: source.considered,
+        capped: source.capped,
+      }))
+      .sort((left, right) => left.groupId.localeCompare(right.groupId)),
+    observedAt: input.observedAt,
+    ...(Object.keys(continuation).length === 0 ? {} : { continuation }),
+  };
 }
 
 /**
@@ -117,6 +232,11 @@ export interface HistoryRetrievalEvidence {
   retrievalMode: "lexical";
   considered: number;
   truncated: boolean;
+  /**
+   * How much of the window this search saw, so Trace can answer "was this answer partial?"
+   * without the model's own answer being the only record of it.
+   */
+  coverage: HistorySearchCoverage;
   items: Array<{
     resourceId: string;
     sourceId: string;
@@ -154,6 +274,7 @@ export interface HistorySearchResultView {
   considered: number;
   truncated: boolean;
   resultStatus: "matches_found" | "no_matches_in_searched_window";
+  coverage: HistorySearchCoverage;
   guidance: string;
 }
 
@@ -173,11 +294,28 @@ export function projectHistorySearch(details: HistorySearchDetails): HistorySear
     considered: details.considered,
     truncated: details.truncated,
     resultStatus: details.resultStatus,
-    guidance:
-      details.resultStatus === "matches_found"
-        ? "Answer only from these matches."
-        : "No match was found in the searched window. This does not prove the event never happened.",
+    coverage: details.coverage,
+    guidance: historyGuidance(details),
   };
+}
+
+/**
+ * What the model is told about the window it just searched.
+ *
+ * A short answer and an exhausted window read the same in a bare result list, and the
+ * difference decides whether the Agent may say "this never happened". The guidance names
+ * which case this is, so the negative reading is never the model's to assume.
+ */
+function historyGuidance(details: HistorySearchDetails): string {
+  if (details.coverage.coverage === "unknown")
+    return "No group was searched, so nothing about the world was learned. This is not a negative result.";
+  if (details.resultStatus === "matches_found") {
+    if (details.coverage.coverage === "complete") return "Answer only from these matches.";
+    return "Answer only from these matches. The searched window was not exhausted, so more matches may exist.";
+  }
+  if (details.coverage.coverage === "complete")
+    return "No match was found and the searched window was exhausted. This does not prove the event never happened outside it.";
+  return "No match was found in the part of the window that was searched. This does not prove the event never happened.";
 }
 
 /**
@@ -323,19 +461,26 @@ export function createHistoryTools(options: {
       : undefined;
     if (params.mentionsMe && !botId) throw new ToolInputError("bot_identity_unavailable");
     const retriever = new MemoryRetriever({ store: options.archive });
-    const results = searched.length
-      ? await retriever.search(params.query ?? "", {
-          allowedSourceIds: searched,
-          limit: params.limit,
-          since: params.since,
-          until: params.until,
-          metadataFilters: {
-            ...(params.sender ? { sender: params.sender } : {}),
-            ...(botId ? { mentionedUserId: botId } : {}),
-          },
-        })
-      : [];
-    const bounded = selectBoundedContext(results, { topK: params.limit });
+    // `searchDetailed` returns an empty result without querying the store when nothing is
+    // authorized, so an unauthorized search still reports zero candidates honestly.
+    const retrieval = await retriever.searchDetailed(params.query ?? "", {
+      allowedSourceIds: searched,
+      limit: params.limit,
+      since: params.since,
+      until: params.until,
+      metadataFilters: {
+        ...(params.sender ? { sender: params.sender } : {}),
+        ...(botId ? { mentionedUserId: botId } : {}),
+      },
+    });
+    const results = retrieval.results;
+    // The per-source cap exists to stop one busy group filling a cross-group answer. A search
+    // that already targets one group has nothing to diversify against, so capping it only
+    // answers a smaller question than the Run asked: `limit: 8` returned 3.
+    const bounded = selectBoundedContext(results, {
+      topK: params.limit,
+      perSourceCap: searched.length > 1 ? CROSS_GROUP_PER_SOURCE_CAP : null,
+    });
     // Bounding drops items, so the sender is joined back by record id rather than by position.
     const senders = new Map(
       results.map((result) => [
@@ -361,6 +506,12 @@ export function createHistoryTools(options: {
           : {}),
       };
     });
+    const coverage = historyCoverage({
+      retrieval: retrieval.coverage,
+      bounded,
+      groupsSearched: searched.length,
+      observedAt: new Date().toISOString(),
+    });
     const details: HistorySearchDetails = {
       groups: searched,
       query: params.query ?? "",
@@ -371,6 +522,7 @@ export function createHistoryTools(options: {
       considered: bounded.considered,
       truncated: bounded.truncated,
       resultStatus: items.length > 0 ? "matches_found" : "no_matches_in_searched_window",
+      coverage,
     };
     await options.recordEvidence?.(
       {
@@ -385,6 +537,7 @@ export function createHistoryTools(options: {
         retrievalMode: "lexical",
         considered: bounded.considered,
         truncated: bounded.truncated,
+        coverage,
         items: items.map((item) => ({
           resourceId: item.resourceId,
           sourceId: item.sourceId,

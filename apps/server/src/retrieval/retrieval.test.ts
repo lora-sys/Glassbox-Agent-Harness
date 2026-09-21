@@ -137,6 +137,101 @@ describe("P4B MGP-compatible contracts and SearchResultItem", () => {
   });
 });
 
+describe("P4B retrieval coverage", () => {
+  const candidates = (count: number, sourceId = "group-1"): RetrievalCandidate[] =>
+    Array.from({ length: count }, (_, index) => ({
+      id: `cand-${sourceId}-${index}`,
+      sourceId,
+      sourceKind: "channel_message",
+      text: `alpha message ${index}`,
+      timestamp: "2026-09-20T10:00:00Z",
+    }));
+
+  it("reports how many candidates it considered, not only how many it returned", async () => {
+    const store = new MockCandidateStore(candidates(30));
+    const retriever = new MemoryRetriever({ store });
+
+    const detailed = await retriever.searchDetailed("alpha", {
+      allowedSourceIds: ["group-1"],
+      limit: 4,
+    });
+
+    expect(detailed.results).toHaveLength(4);
+    expect(detailed.coverage).toEqual({
+      requestedLimit: 4,
+      returned: 4,
+      considered: 30,
+      overFetchLimit: 40,
+      candidateCapReached: false,
+      droppedByLimit: 26,
+      droppedByFilter: 0,
+    });
+  });
+
+  it("reports when the candidate ceiling was reached so a caller cannot claim exhaustion", async () => {
+    const store = new MockCandidateStore(candidates(40));
+    const retriever = new MemoryRetriever({ store });
+
+    const detailed = await retriever.searchDetailed("alpha", {
+      allowedSourceIds: ["group-1"],
+      limit: 4,
+    });
+
+    expect(detailed.coverage.considered).toBe(40);
+    expect(detailed.coverage.overFetchLimit).toBe(40);
+    expect(detailed.coverage.candidateCapReached).toBe(true);
+    expect(detailed.coverage.droppedByLimit).toBe(36);
+  });
+
+  it("separates candidates dropped by a filter from candidates dropped by the limit", async () => {
+    const store = new MockCandidateStore([
+      ...candidates(3),
+      {
+        id: "dup",
+        sourceId: "group-1",
+        sourceKind: "channel_message",
+        text: "alpha message 0",
+        timestamp: "2026-09-20T10:00:00Z",
+      },
+    ]);
+    const retriever = new MemoryRetriever({ store });
+
+    const detailed = await retriever.searchDetailed("alpha", {
+      allowedSourceIds: ["group-1"],
+      limit: 2,
+    });
+
+    expect(detailed.results).toHaveLength(2);
+    expect(detailed.coverage.droppedByFilter).toBe(1);
+    expect(detailed.coverage.droppedByLimit).toBe(1);
+  });
+
+  it("keeps search() reporting the same results as searchDetailed()", async () => {
+    const store = new MockCandidateStore(candidates(6));
+    const retriever = new MemoryRetriever({ store });
+
+    const results = await retriever.search("alpha", { allowedSourceIds: ["group-1"], limit: 3 });
+    const detailed = await retriever.searchDetailed("alpha", {
+      allowedSourceIds: ["group-1"],
+      limit: 3,
+    });
+
+    expect(results.map((r) => r.memory.id)).toEqual(detailed.results.map((r) => r.memory.id));
+  });
+
+  it("reports an empty coverage for an unauthorized source set without querying the store", async () => {
+    const store = new MockCandidateStore(candidates(3));
+    const retriever = new MemoryRetriever({ store });
+
+    const detailed = await retriever.searchDetailed("alpha", { allowedSourceIds: [] });
+
+    expect(detailed.results).toEqual([]);
+    expect(detailed.coverage.considered).toBe(0);
+    expect(detailed.coverage.candidateCapReached).toBe(false);
+    expect(store.searchedSourceIds).toEqual([]);
+  });
+});
+
 describe("P4B OpenSquilla-shaped MemoryRetriever & OpenHarness Fallback", () => {
   it("enforces lexical defaults: vector_weight = 0 and text_weight = 1", () => {
     const store = new MockCandidateStore();

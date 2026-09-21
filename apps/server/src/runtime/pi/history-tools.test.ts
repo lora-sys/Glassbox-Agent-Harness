@@ -474,6 +474,253 @@ it("records safe retrieval evidence without protected message text", async () =>
   }
 });
 
+it("returns every match a single-group search asked for, not a per-source-capped three", async () => {
+  const { store, archive } = await fixture();
+  try {
+    for (let index = 0; index < 7; index++) {
+      await archive.ingest({
+        channel: "qq",
+        connectionId,
+        groupId: "100",
+        externalMessageId: `g100-extra-${index}`,
+        senderId: "member-a",
+        normalizedText: `deploy rollback step ${index}`,
+        occurredAt: `2026-09-20T12:0${index}:00Z`,
+      });
+    }
+    const tools = await groupRunTools(store, archive);
+    const { text } = await callModelVisible(toolByName(tools, GROUP_HISTORY_SEARCH_TOOL), {
+      query: "deploy rollback",
+      limit: 8,
+    });
+    const view = JSON.parse(text) as {
+      results: unknown[];
+      coverage: {
+        returned: number;
+        considered: number;
+        requestedLimit: number;
+        truncated: boolean;
+        coverage: string;
+      };
+    };
+
+    // The fixture holds eight matching messages in one group. A per-source cap meant for
+    // cross-group diversity used to cut this to three and report a bare `truncated: true`,
+    // which answers a smaller question than the one the Run asked.
+    expect(view.results).toHaveLength(8);
+    expect(view.coverage).toMatchObject({
+      returned: 8,
+      considered: 8,
+      requestedLimit: 8,
+      truncated: false,
+      coverage: "complete",
+    });
+  } finally {
+    await store.close();
+  }
+});
+
+it("keeps the per-source cap across groups and names it in the coverage", async () => {
+  const { store, archive } = await fixture();
+  try {
+    for (let index = 0; index < 5; index++) {
+      await archive.ingest({
+        channel: "qq",
+        connectionId,
+        groupId: "100",
+        externalMessageId: `g100-multi-${index}`,
+        senderId: "member-a",
+        normalizedText: `deploy rollback step ${index}`,
+        occurredAt: `2026-09-20T12:0${index}:00Z`,
+      });
+    }
+    for (const gid of ["100", "200"]) {
+      await assign(store, gid);
+      await authorizeHistory(store, gid);
+    }
+    const accepted = await accept(store, ownerPrivate);
+    const tools = createHistoryTools({
+      store,
+      archive,
+      isHistoryEnabled: historyEnabled,
+      getContext: () => ({
+        caller: { principalId: "owner", scope: ownerPrivate },
+        runId: accepted.run.id,
+        conversationId: accepted.conversation.id,
+      }),
+    });
+    const { text } = await callModelVisible(toolByName(tools, OWNER_HISTORY_SEARCH_TOOL), {
+      query: "deploy rollback",
+      limit: 8,
+    });
+    const view = JSON.parse(text) as {
+      coverage: {
+        considered: number;
+        perSourceCap: number | null;
+        truncated: boolean;
+        truncationReasons: string[];
+        coverage: string;
+        sourceCoverage: Array<{
+          groupId: string;
+          returned: number;
+          considered: number;
+          capped: boolean;
+        }>;
+        continuation?: { cappedGroups?: string[] };
+      };
+    };
+
+    // A cross-group answer still diversifies, and now says that it did and why.
+    expect(view.coverage).toMatchObject({
+      considered: 7,
+      perSourceCap: 3,
+      truncated: true,
+      truncationReasons: ["per_source_cap_reached"],
+      coverage: "partial",
+      continuation: { cappedGroups: ["100"] },
+    });
+    expect(view.coverage.sourceCoverage).toEqual([
+      { groupId: "100", returned: 3, considered: 6, capped: true },
+      { groupId: "200", returned: 1, considered: 1, capped: false },
+    ]);
+  } finally {
+    await store.close();
+  }
+});
+
+it("says the window is unknown rather than empty when no group was searched", async () => {
+  const { store, archive } = await fixture();
+  try {
+    const accepted = await accept(store, ownerPrivate);
+    const tools = createHistoryTools({
+      store,
+      archive,
+      isHistoryEnabled: historyEnabled,
+      getContext: () => ({
+        caller: { principalId: "owner", scope: ownerPrivate },
+        runId: accepted.run.id,
+        conversationId: accepted.conversation.id,
+      }),
+    });
+    const { text } = await callModelVisible(toolByName(tools, OWNER_HISTORY_SEARCH_TOOL), {
+      query: "deploy rollback",
+    });
+    const view = JSON.parse(text) as {
+      groups: string[];
+      resultStatus: string;
+      coverage: { coverage: string; considered: number; groupsSearched: number };
+    };
+
+    // Zero authorized groups is not an exhausted window: nothing was looked at, so nothing
+    // about the world was learned.
+    expect(view.groups).toEqual([]);
+    expect(view.resultStatus).toBe("no_matches_in_searched_window");
+    expect(view.coverage).toMatchObject({
+      coverage: "unknown",
+      considered: 0,
+      groupsSearched: 0,
+    });
+  } finally {
+    await store.close();
+  }
+});
+
+it("offers a continuation that actually reaches the matches it left out", async () => {
+  const { store, archive } = await fixture();
+  try {
+    for (let index = 0; index < 7; index++) {
+      await archive.ingest({
+        channel: "qq",
+        connectionId,
+        groupId: "100",
+        externalMessageId: `g100-page-${index}`,
+        senderId: "member-a",
+        normalizedText: `deploy rollback step ${index}`,
+        occurredAt: `2026-09-20T12:0${index}:00Z`,
+      });
+    }
+    const tools = await groupRunTools(store, archive);
+    const tool = toolByName(tools, GROUP_HISTORY_SEARCH_TOOL);
+    const first = JSON.parse(
+      (await callModelVisible(tool, { query: "deploy rollback", limit: 3 })).text,
+    ) as {
+      results: unknown[];
+      coverage: {
+        coverage: string;
+        considered: number;
+        returned: number;
+        truncationReasons: string[];
+        continuation?: { suggestedLimit?: number };
+      };
+    };
+
+    // Three hits were asked for and eight existed. A time cursor would be a lie here: the
+    // retriever ranks by score, so "older than the oldest hit" can skip newer matches. The
+    // honest continuation is the limit that reaches the candidate set the search already saw.
+    expect(first.results).toHaveLength(3);
+    expect(first.coverage).toMatchObject({
+      coverage: "partial",
+      considered: 8,
+      returned: 3,
+      truncationReasons: ["top_k_reached"],
+      continuation: { suggestedLimit: 8 },
+    });
+
+    const second = JSON.parse(
+      (
+        await callModelVisible(tool, {
+          query: "deploy rollback",
+          limit: first.coverage.continuation!.suggestedLimit!,
+        })
+      ).text,
+    ) as { results: unknown[]; coverage: { coverage: string; truncated: boolean } };
+    expect(second.results).toHaveLength(8);
+    expect(second.coverage).toMatchObject({ coverage: "complete", truncated: false });
+  } finally {
+    await store.close();
+  }
+});
+
+it("records the coverage it reported in the retrieval evidence", async () => {
+  const { store, archive } = await fixture();
+  try {
+    const accepted = await accept(store, group100);
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: groupResourceId("100"),
+      action: "history:read",
+      scope: group100,
+      effect: "allow",
+    });
+    const evidence = vi.fn(async (_value: HistoryRetrievalEvidence) => {});
+    const tools = createHistoryTools({
+      store,
+      archive,
+      isHistoryEnabled: historyEnabled,
+      recordEvidence: evidence,
+      getContext: () => ({
+        caller: { principalId: "owner", scope: group100 },
+        runId: accepted.run.id,
+        conversationId: accepted.conversation.id,
+      }),
+    });
+
+    await call(toolByName(tools, GROUP_HISTORY_SEARCH_TOOL), { query: "deploy rollback" });
+    const value = evidence.mock.calls[0]![0];
+    // Trace must be able to answer "did this Run see the whole window?" without the model's
+    // answer being the only record of it.
+    expect(value.coverage).toMatchObject({
+      returned: 1,
+      considered: 1,
+      requestedLimit: 8,
+      coverage: "complete",
+    });
+    expect(value.coverage.observedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/u);
+  } finally {
+    await store.close();
+  }
+});
+
 it("keeps the Owner cross-group tool out of the group surface", async () => {
   // Tool exposure is decided by scope and the group's own policy, not by the model. A group
   // Run only ever sees the current-group tool, and only while its policy enables history.
