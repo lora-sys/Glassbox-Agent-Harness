@@ -152,6 +152,7 @@ export interface HistorySearchResultView {
     matchedTerms: string[];
   }>;
   considered: number;
+  returned: number;
   truncated: boolean;
   resultStatus: "matches_found" | "no_matches_in_searched_window";
   guidance: string;
@@ -171,12 +172,15 @@ export function projectHistorySearch(details: HistorySearchDetails): HistorySear
       matchedTerms: item.matchedTerms,
     })),
     considered: details.considered,
+    returned: details.items.length,
     truncated: details.truncated,
     resultStatus: details.resultStatus,
     guidance:
-      details.resultStatus === "matches_found"
-        ? "Answer only from these matches."
-        : "No match was found in the searched window. This does not prove the event never happened.",
+      details.resultStatus === "matches_found" && details.truncated
+        ? "Partial results only. Do not claim a complete list, total count, earliest or latest message, or infer omitted messages. Say the result is incomplete and run a narrower or higher-limit search before answering a completeness question."
+        : details.resultStatus === "matches_found"
+          ? "Answer only from these matches. Do not infer messages that are not present."
+          : "No match was found in the searched window. This does not prove the event never happened.",
   };
 }
 
@@ -323,10 +327,14 @@ export function createHistoryTools(options: {
       : undefined;
     if (params.mentionsMe && !botId) throw new ToolInputError("bot_identity_unavailable");
     const retriever = new MemoryRetriever({ store: options.archive });
+    // Ask for one extra hit so the projection can truthfully report that a limit truncated the
+    // result. The retriever otherwise returns exactly `limit` items with no indication that more
+    // matched. The extra item never reaches model-visible Context.
+    const retrievalLimit = Math.min(MAX_LIMIT + 1, (params.limit ?? DEFAULT_LIMIT) + 1);
     const results = searched.length
       ? await retriever.search(params.query ?? "", {
           allowedSourceIds: searched,
-          limit: params.limit,
+          limit: retrievalLimit,
           since: params.since,
           until: params.until,
           metadataFilters: {
@@ -335,7 +343,12 @@ export function createHistoryTools(options: {
           },
         })
       : [];
-    const bounded = selectBoundedContext(results, { topK: params.limit });
+    // Source diversity is useful across several groups. Inside one group it used to cap every
+    // result at three messages, even when the caller requested more.
+    const bounded = selectBoundedContext(results, {
+      topK: params.limit,
+      ...(searched.length === 1 ? { perSourceCap: params.limit } : {}),
+    });
     // Bounding drops items, so the sender is joined back by record id rather than by position.
     const senders = new Map(
       results.map((result) => [
@@ -403,7 +416,7 @@ export function createHistoryTools(options: {
     name: GROUP_HISTORY_SEARCH_TOOL,
     label: "搜索本群历史",
     description:
-      "Search the current QQ group's authorized history. Filters cover message text, sender QQ or group nickname, whether the sender mentioned this bot, and ISO 8601 time bounds. Use sender for who spoke and mentionsMe for who @mentioned the bot. A no_matches_in_searched_window result is not proof that an event never happened.",
+      "Search the current QQ group's authorized history. Filters cover message text, sender QQ or group nickname, whether the sender mentioned this bot, and ISO 8601 time bounds. Use sender for who spoke and mentionsMe for who @mentioned the bot. For requests about all messages, omissions, totals, or the earliest or latest message, use a sufficient limit and narrow filters. When truncated is true, the result is partial and must not be described as complete. A no_matches_in_searched_window result is not proof that an event never happened.",
     parameters: Type.Object(
       {
         query: Type.Optional(Type.String({ maxLength: 2_000 })),
@@ -442,7 +455,7 @@ export function createHistoryTools(options: {
     name: OWNER_HISTORY_SEARCH_TOOL,
     label: "搜索已授权群历史",
     description:
-      "Owner-only search across assigned and authorized QQ groups. Filters cover message text, sender QQ or group nickname, whether the sender mentioned this bot, group ids, and ISO 8601 time bounds. A no_matches_in_searched_window result is not proof that an event never happened.",
+      "Owner-only search across assigned and authorized QQ groups. Filters cover message text, sender QQ or group nickname, whether the sender mentioned this bot, group ids, and ISO 8601 time bounds. Use sender for who spoke. For requests about all messages, omissions, totals, or the earliest or latest message, use a sufficient limit and narrow filters. When truncated is true, the result is partial and must not be described as complete. A no_matches_in_searched_window result is not proof that an event never happened.",
     parameters: Type.Object(
       {
         groupIds: Type.Optional(

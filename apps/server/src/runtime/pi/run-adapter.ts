@@ -387,6 +387,40 @@ function groupHistorySearchRequested(text: string): boolean {
 }
 
 /**
+ * Whether the current message continues an immediately preceding group-history investigation.
+ *
+ * Unlike a mutation, a read-only search may use recent Conversation state to resolve words such
+ * as "他" and "刚才". Conversation history never supplies the request by itself: the current
+ * message must independently ask to retry, verify completeness, or inspect a referenced person's
+ * messages. This keeps an old search instruction from turning unrelated chat into a Tool call.
+ */
+function groupHistorySearchFollowUpRequested(input: ExecutionInput): boolean {
+  const text = input.text.trim();
+  if (!text || /(?:不要|不用|无需|不需要|请勿|不许|停止|别再|别去|别帮我)/u.test(text))
+    return false;
+
+  const recentHistory = input.history.slice(-6);
+  const followsHistoryInvestigation = recentHistory.some(
+    (turn) =>
+      (turn.role === "user" && groupHistorySearchRequested(turn.text)) ||
+      /群历史|聊天记录|消息记录|历史消息|检索结果|查到|查到了|发言记录|发言时间线/u.test(turn.text),
+  );
+  if (!followsHistoryInvestigation) return false;
+
+  const asksToRetryOrVerify =
+    /漏|遗漏|不全|完整|全部|所有|继续.{0,12}(?:查|搜|检索|核对)|重新.{0,12}(?:查|搜|检索|核对)|再.{0,12}(?:查|搜|检索|核对)|没(?:有)?[^。！？\n]{0,12}(?:查|搜|检索)|根本没[^。！？\n]{0,12}(?:查|搜|检索)/u.test(
+      text,
+    );
+  const personOrTimeReference =
+    /这个人|那个人|此人|他|她|他们|对方|刚才|前面|之前|最新|最近|上次|[1-9]\d{4,15}/u;
+  const messageActivity = /说|问|发|发言|消息|记录|检索|查|搜|回复|提到/u;
+  const asksAboutReferencedMessages =
+    personOrTimeReference.test(text) && messageActivity.test(text);
+
+  return asksToRetryOrVerify || asksAboutReferencedMessages;
+}
+
+/**
  * Whether the current Owner-private message explicitly asks to search one or more groups.
  *
  * This check runs before the management-query check. A search request often asks to "list"
@@ -438,7 +472,8 @@ function requiredToolCall(
 ): RequiredToolCall | undefined {
   if (input.caller.scope.chatType === "group") {
     if (!authorizedToolNames?.includes(GROUP_HISTORY_SEARCH_TOOL)) return undefined;
-    if (!groupHistorySearchRequested(input.text)) return undefined;
+    if (!groupHistorySearchRequested(input.text) && !groupHistorySearchFollowUpRequested(input))
+      return undefined;
     // The message names no parameter of its own: the query is the model's to compose, and the
     // group comes from the Run's trusted scope. The requirement is the call, not its arguments.
     return { name: GROUP_HISTORY_SEARCH_TOOL, input: {} };

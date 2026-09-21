@@ -1053,6 +1053,40 @@ describe("an explicit current-group history search requires the group Tool", () 
     expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toBeUndefined();
   });
 
+  it("requires a fresh search for referential and completeness follow-ups", async () => {
+    for (const text of [
+      "最新他问你的问题",
+      "是不是漏了很多？",
+      "这个人呢，Brian，你刚才的检索为什么不提到他",
+      "你查一下这个人，2498701175",
+    ]) {
+      const f = groupFixture([searched("Brian")], [GROUP_HISTORY_SEARCH_TOOL]);
+      f.input.text = text;
+      f.input.history = [
+        { role: "user", text: "检索一下群历史，你可以看到什么？整理一下关系" },
+        { role: "assistant", text: "我查到了部分群历史，先列出当前检索结果。" },
+      ];
+
+      await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+      expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe(GROUP_HISTORY_SEARCH_TOOL);
+      expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({});
+      expect(f.run).toHaveBeenCalledOnce();
+    }
+  });
+
+  it("does not treat a standalone referential question as a history search", async () => {
+    const f = groupFixture(
+      [{ status: "completed", text: "我不知道你指的是谁。", toolCalls: [] }],
+      [GROUP_HISTORY_SEARCH_TOOL],
+    );
+    f.input.text = "他最新问了什么？";
+    f.input.history = [{ role: "assistant", text: "我们刚才在讨论部署安排。" }];
+
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBeUndefined();
+    expect(f.run).toHaveBeenCalledOnce();
+  });
+
   it("leaves an Owner-private Run without the current-group Tool requirement", async () => {
     const f = fixture([{ status: "completed", text: "说明。", toolCalls: [] }]);
     f.input.text = "请搜索本群历史，找到 P4B-A-1349，并回复发送者和原文";

@@ -679,6 +679,44 @@ it("supports general sender and mention filters without keyword patches", async 
   }
 });
 
+it("returns the requested number from one group and reports a real result limit", async () => {
+  const { store, archive } = await fixture();
+  try {
+    for (let index = 2; index <= 6; index++) {
+      await archive.ingest({
+        channel: "qq",
+        connectionId,
+        groupId: "100",
+        externalMessageId: `g100-${index}`,
+        senderId: "member-a",
+        senderName: "Ripped",
+        normalizedText: `distinct group message ${index}`,
+        occurredAt: `2026-09-20T10:0${index}:00Z`,
+      });
+    }
+
+    const tools = await groupRunTools(store, archive);
+    const { text } = await callModelVisible(toolByName(tools, GROUP_HISTORY_SEARCH_TOOL), {
+      sender: "member-a",
+      limit: 5,
+    });
+    const view = JSON.parse(text) as {
+      considered: number;
+      returned: number;
+      truncated: boolean;
+      guidance: string;
+      results: unknown[];
+    };
+
+    expect(view.results).toHaveLength(5);
+    expect(view).toMatchObject({ considered: 6, returned: 5, truncated: true });
+    expect(view.guidance).toContain("Partial results only");
+    expect(view.guidance).toContain("Do not claim a complete list");
+  } finally {
+    await store.close();
+  }
+});
+
 it("labels an empty result as window-limited rather than proving absence", async () => {
   const { store, archive } = await fixture();
   try {
