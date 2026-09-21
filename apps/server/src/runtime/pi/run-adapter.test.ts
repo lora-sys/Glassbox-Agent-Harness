@@ -340,6 +340,34 @@ describe("mutation intent comes only from the current user message", () => {
     });
   });
 
+  it("binds an explicit request to clear a group card to the empty provider value", async () => {
+    const f = fixture([
+      {
+        status: "completed",
+        text: "名片已清空。",
+        toolCalls: [
+          {
+            name: "qq_group_settings",
+            input: {
+              groupId: "1126022432",
+              operation: "set_group_card",
+              params: { user_id: 10004, card: "" },
+            },
+            failed: false,
+          },
+        ],
+      },
+    ]);
+    f.input.text = "清空群 1126022432 成员 10004 的群名片";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe("qq_group_settings");
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({
+      groupId: "1126022432",
+      operation: "set_group_card",
+      params: { user_id: 10004, card: "" },
+    });
+  });
+
   it("refuses a mute that changes the member or the duration the message named", async () => {
     // The message names member 10004 for 60 seconds. Muting 10005, or 10004 for a different
     // duration, is a different mutation and must not be satisfied by this intent.

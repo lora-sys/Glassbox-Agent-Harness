@@ -61,6 +61,14 @@ function namedText(text: string): string | undefined {
   return match?.[1];
 }
 
+/** The group-card value the Owner names, including an explicit request to clear it. */
+function namedGroupCard(text: string): string | undefined {
+  if (/(?:清空|清除|删除|移除|取消)/u.test(text) && /(?:群名片|名片)/u.test(text)) {
+    return "";
+  }
+  return namedText(text);
+}
+
 /** The identifier a message names right after a file operation word. */
 function namedAfter(text: string, words: RegExp): string | undefined {
   const match = new RegExp(`(?:${words.source})\\s*["'“”]?([^"'“”\\s]+)`, "u").exec(text);
@@ -167,7 +175,7 @@ export const MUTATION_REQUESTS: readonly {
     words: /群名片|名片/iu,
     params: (text) => {
       const user_id = namedMemberId(text);
-      const card = namedText(text);
+      const card = namedGroupCard(text);
       if (user_id === undefined || card === undefined) return undefined;
       return { user_id, card };
     },
