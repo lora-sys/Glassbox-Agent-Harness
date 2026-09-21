@@ -90,9 +90,37 @@ function ownerMemoryCommand(text: string): RequiredToolCall | undefined {
       input: { action: changed[1], id: changed[2], statement: changed[3] },
     };
   const governed = /^\/memory (promote|reject|expire|revoke|retire) (\S+)$/u.exec(command);
-  return governed
-    ? { name: OWNER_MEMORY_ADMIN_TOOL, input: { action: governed[1], id: governed[2] } }
-    : undefined;
+  if (governed)
+    return { name: OWNER_MEMORY_ADMIN_TOOL, input: { action: governed[1], id: governed[2] } };
+
+  const naturalSource =
+    /(?:提取|导入|创建|生成).*(?:候选|candidate)|(?:候选|candidate).*(?:提取|导入|创建|生成)/iu.test(
+      command,
+    );
+  if (!naturalSource) return undefined;
+  const groupId = namedGroupId(command);
+  const scopeMatch = /\b(global|project:[A-Za-z0-9][A-Za-z0-9_-]{0,127})\b/u.exec(command);
+  const scope = scopeMatch ? scopeInput(scopeMatch[1]!) : undefined;
+  if (!groupId || !scope) return undefined;
+  const sourceClass = /(?:历史|history|消息)/iu.test(command)
+    ? "history"
+    : /(?:公告|notice)/iu.test(command)
+      ? "notice"
+      : /(?:精华|essence)/iu.test(command)
+        ? "essence"
+        : undefined;
+  if (!sourceClass) return undefined;
+  const quotedQuery = /[“"]([^”"]{1,256})[”"]/u.exec(command)?.[1]?.trim();
+  return {
+    name: OWNER_MEMORY_ADMIN_TOOL,
+    input: {
+      action: "source",
+      ...scope,
+      groupId,
+      sourceClass,
+      ...(quotedQuery ? { query: quotedQuery } : {}),
+    },
+  };
 }
 
 /** The provider parameters the current message pins down, or `undefined` when it pins none. */

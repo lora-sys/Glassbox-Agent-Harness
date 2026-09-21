@@ -147,6 +147,17 @@ describe("Pi required Tool execution", () => {
           sourceClass: "history",
         },
       },
+      {
+        text: "从群 1126022432 最近的消息中，只提取“蓝莓灯塔-5731”和“周三 20:40”，作为 project:glassbox 的 semantic_fact 候选，不要直接生效。",
+        input: {
+          action: "source",
+          scopeType: "project",
+          projectId: "glassbox",
+          groupId: "1126022432",
+          sourceClass: "history",
+          query: "蓝莓灯塔-5731",
+        },
+      },
     ] as const;
 
     for (const item of cases) {
