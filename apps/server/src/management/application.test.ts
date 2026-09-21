@@ -25,7 +25,7 @@ import {
   ManagementApplication,
 } from "./application.js";
 import { PiRunExecutionAdapter } from "../runtime/pi/run-adapter.js";
-import type { ToolExclusionReason } from "../runtime/pi/tool-plane.js";
+import type { ToolDescriptor, ToolExclusionReason } from "../runtime/pi/tool-plane.js";
 import { TOOL_DESCRIPTORS } from "../runtime/pi/tool-plane.js";
 import type { PiRuntimeAdapter } from "../runtime/pi/types.js";
 import {
@@ -715,6 +715,7 @@ const admin = (app: ManagementApplication) =>
     resolveRunToolNames(context: OwnerContext): Promise<string[]>;
     resolveRunToolCandidates(
       context: OwnerContext,
+      registered?: readonly ToolDescriptor[],
     ): Promise<{ name: string; exclusion: ToolExclusionReason | null }[]>;
     createRuntimeTools(getContext: () => OwnerContext | undefined): Array<{
       name: string;
@@ -1278,6 +1279,7 @@ const groupRun = (app: ManagementApplication) =>
     resolveRunToolNames(context: OwnerContext): Promise<string[]>;
     resolveRunToolCandidates(
       context: OwnerContext,
+      registered?: readonly ToolDescriptor[],
     ): Promise<{ name: string; exclusion: ToolExclusionReason | null }[]>;
     createRuntimeTools(getContext: () => OwnerContext | undefined): Array<{
       name: string;
@@ -1378,6 +1380,33 @@ describe("configured group Run capability authority", () => {
     expect(candidates.filter((entry) => entry.exclusion === "unclassified")).toEqual([]);
     expect(candidates.length).toBe(TOOL_DESCRIPTORS.length);
     expect(new Set(candidates.map((entry) => entry.name)).size).toBe(TOOL_DESCRIPTORS.length);
+  });
+
+  it("withholds a registered Tool that no discovery rule classified", async () => {
+    const { application, context } = await configuredGroup();
+
+    // The registry is the universe of Tools that *exist*. Discovery is a separate decision about
+    // which of them a Run may see. A Tool in the first and in no rule of the second is the
+    // wiring bug §9/§10 exist to catch: the real table happens to have every Tool wired, so no
+    // Run over it can reproduce the gap. Injecting one descriptor is what makes the guard
+    // testable — delete the `unclassified` branch and this Tool is offered to the model.
+    const unwired = {
+      ...TOOL_DESCRIPTORS[0]!,
+      name: "qq_never_wired",
+    };
+    const candidates = await application.resolveRunToolCandidates(context, [
+      ...TOOL_DESCRIPTORS,
+      unwired,
+    ]);
+
+    const found = candidates.find((entry) => entry.name === unwired.name);
+    expect(found?.exclusion).toBe("unclassified");
+    expect(
+      candidates.filter((entry) => entry.exclusion === null).map((entry) => entry.name),
+    ).toEqual(expect.not.arrayContaining([unwired.name]));
+    // It is still classified — the answer to "why is this off the surface" must name it rather
+    // than let it vanish from the report, which is the other half of the same bug.
+    expect(candidates.length).toBe(TOOL_DESCRIPTORS.length + 1);
   });
 
   it("discovers only the read-only capabilities for a group Run and calls one for real", async () => {

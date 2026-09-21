@@ -4,6 +4,8 @@ import {
   probeReadCapabilities,
   safeResultShape,
   type CapabilityProbeObservation,
+  type ProbeDecision,
+  type ReadAcceptancePath,
 } from "./capability-probe.js";
 import { QQ_CAPABILITIES, isAllowedNapCatAction } from "./capabilities.js";
 import type { OneBotCapabilityResult } from "./adapter.js";
@@ -18,11 +20,14 @@ function ok(data: unknown): OneBotCapabilityResult {
 async function probe(
   answer: (action: string) => Promise<OneBotCapabilityResult> | OneBotCapabilityResult,
   listing: () => Promise<unknown> = async () => [{ groupId: GROUP, managed: true }],
+  decide: (path: ReadAcceptancePath, groupId: string | null) => Promise<ProbeDecision> = async () =>
+    "allowed",
 ) {
   const recorded: CapabilityProbeObservation[] = [];
   const actions: string[] = [];
   const report = await probeReadCapabilities({
     groupId: GROUP,
+    decide,
     invoke: async ({ action }) => {
       actions.push(action);
       return answer(action);
@@ -72,6 +77,23 @@ describe("the read paths this acceptance covers", () => {
     for (const path of READ_ACCEPTANCE_PATHS) {
       const capability = QQ_CAPABILITIES.find((entry) => entry.tool === path.tool);
       expect(capability!.risk, path.tool).toBe("read");
+    }
+  });
+
+  it("carries the Action, Resource and category the registry declares for the path", () => {
+    // The authorization question is asked from these fields, so a path that carried facts the
+    // registry does not declare would ask about an operation the Tool never performs — and an
+    // acceptance is only evidence if it measures the path a Run would really take.
+    for (const path of READ_ACCEPTANCE_PATHS) {
+      const capability = QQ_CAPABILITIES.find((entry) => entry.tool === path.tool);
+      expect(capability, path.tool).toBeDefined();
+      expect(path.action, path.tool).toBe(capability!.action);
+      expect(path.resource, path.tool).toBe(capability!.resource);
+      expect(path.category, path.tool).toBe(capability!.category);
+      // The provider-free managed listing is the only path that reaches no provider.
+      expect(path.listing, `${path.tool}.${path.operation ?? "listing"}`).toBe(
+        path.operation === null,
+      );
     }
   });
 });
@@ -245,5 +267,83 @@ describe("running the acceptance", () => {
     // A local projection failure is not a provider failure, and the report must not say it is.
     expect(report.summary.providerFailed).toBe(0);
     expect(report.complete).toBe(true);
+  });
+});
+
+describe("authorizing a path before calling it", () => {
+  it("asks about the group a path targets, and about none for the listing", async () => {
+    const asked: Array<string | null> = [];
+    await probe(
+      () => ok({}),
+      undefined,
+      async (_path, groupId) => {
+        asked.push(groupId);
+        return "allowed";
+      },
+    );
+    // The listing names no group, so there is no group Resource to authorize it on; every other
+    // path targets the group the operator named.
+    expect(asked).toEqual(
+      READ_ACCEPTANCE_PATHS.map((path) => (path.operation === null ? null : GROUP)),
+    );
+  });
+
+  it("records a denied path as denied and never calls it", async () => {
+    const { report, recorded, actions } = await probe(
+      () => ok({}),
+      undefined,
+      async (path) => (path.tool === "qq_group_members" ? "denied" : "allowed"),
+    );
+
+    const members = report.observations.find((entry) => entry.tool === "qq_group_members")!;
+    expect(members.outcome).toBe("denied");
+    // A refusal produced no result, so there is no shape to describe — a shape here would have
+    // to come from a call that never happened.
+    expect(members.resultShape).toBeNull();
+    // The refusal is what stops the call: the provider must never have seen this path.
+    expect(actions).not.toContain("get_group_member_list");
+    expect(report.summary.denied).toBe(1);
+    // A refused path was never measured, so the acceptance did not prove the bridge works.
+    expect(report.complete).toBe(false);
+    // It is still recorded: "which paths are permitted" is the report's business, and a denial
+    // that left no evidence would be indistinguishable from a path nobody probed.
+    expect(recorded).toHaveLength(READ_ACCEPTANCE_PATHS.length);
+    expect(recorded.filter((entry) => entry.outcome === "denied")).toHaveLength(1);
+  });
+
+  it("refuses the provider-free listing without running its projection", async () => {
+    let projections = 0;
+    const { report } = await probe(
+      () => ok({}),
+      async () => {
+        projections += 1;
+        return [{ groupId: GROUP, managed: true }];
+      },
+      async (path) => (path.listing ? "denied" : "allowed"),
+    );
+
+    const listing = report.observations.find((entry) => entry.operation === null)!;
+    expect(listing.outcome).toBe("denied");
+    expect(projections).toBe(0);
+    // A refusal is neither a provider failure nor a local one, and the counts must not
+    // double-count it: `localFailed` is for a projection that ran and broke.
+    expect(report.summary.denied).toBe(1);
+    expect(report.summary.localFailed).toBe(0);
+    // The provider verdict is untouched by a provider-free path either way.
+    expect(report.summary.providerBackedSucceeded).toBe(6);
+    expect(report.complete).toBe(true);
+  });
+
+  it("keeps probing after a denial, so one refusal does not hide the rest", async () => {
+    const { report, actions } = await probe(
+      () => ok({}),
+      undefined,
+      async (path) => (path.tool === "qq_groups" && !path.listing ? "denied" : "allowed"),
+    );
+
+    expect(actions).toHaveLength(5);
+    expect(actions).not.toContain("get_group_info");
+    expect(report.summary.providerBackedSucceeded).toBe(5);
+    expect(report.complete).toBe(false);
   });
 });

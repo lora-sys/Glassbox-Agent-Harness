@@ -50,6 +50,7 @@ import {
 } from "../runtime/pi/history-tools.js";
 import {
   availableCapabilityToolNames,
+  capabilityResourceId,
   capabilityToolEligibility,
   createCapabilityTools,
   GROUP_RUN_CAPABILITY_CATEGORIES,
@@ -58,6 +59,7 @@ import { resolveSkillVisibility } from "../runtime/pi/skill-visibility.js";
 import { requireProviderSuccess } from "../runtime/pi/provider-outcome.js";
 import {
   TOOL_DESCRIPTORS,
+  type ToolDescriptor,
   type ToolExclusionReason,
   type ToolSurfaceCandidate,
 } from "../runtime/pi/tool-plane.js";
@@ -106,13 +108,21 @@ import { createQqDeliveryPolicy, hostDeliveryForbiddenValues } from "../delivery
 const OWNER_ID = "owner";
 const AGENT_ID = "personal";
 /**
- * The Conversation and Run a management-initiated capability probe records its decisions under.
+ * A context an authorization decision can be made in that is not necessarily a Run.
  *
- * A probe is not a Run, and reusing a Run's identity would make authorization evidence claim a
- * context that never existed. This names what it is, so a reader of the decision can tell a
- * management probe from an Agent execution.
+ * `conversationId` and `runId` are optional because `authorization_decisions` records them as
+ * real references to real rows. A management-initiated operation — the capability acceptance —
+ * belongs to no Conversation and no Run, and it must say so by leaving them absent rather than
+ * inventing identifiers: a placeholder string would make the evidence claim a Conversation and
+ * a Run that never existed, which is exactly the kind of unproven claim the acceptance exists
+ * to rule out. A `ProtectedToolContext` satisfies this, so a Tool call is unaffected and still
+ * records the Run it really ran in.
  */
-const MANAGEMENT_PROBE_CONTEXT = "management:capability-probe";
+type AuthorizationContext = {
+  caller: CallerContext;
+  conversationId?: string;
+  runId?: string;
+};
 const ACTIONS = [
   "run:create",
   "run:control",
@@ -563,10 +573,18 @@ export class ManagementApplication {
    * only what its own group's policy enables, and an Owner-private Run sees the union over
    * the groups the current Principal is assigned to. Discovery is granted as a superset, so
    * a policy change applies on the very next Run with no re-grant.
+   *
+   * `registered` is the universe to classify. It defaults to the real registry and is a
+   * parameter so a test can classify a registry that contains a Tool no rule knows — which is
+   * the wiring bug the `unclassified` guard exists for, and which no Run over the real table
+   * can reproduce while every real Tool happens to be wired.
    */
-  async resolveRunToolCandidates(context: PiRunContext): Promise<ToolSurfaceCandidate[]> {
+  async resolveRunToolCandidates(
+    context: PiRunContext,
+    registered: readonly ToolDescriptor[] = TOOL_DESCRIPTORS,
+  ): Promise<ToolSurfaceCandidate[]> {
     if (!context.caller || !context.conversationId || !context.runId)
-      return TOOL_DESCRIPTORS.map((descriptor) => ({
+      return registered.map((descriptor) => ({
         name: descriptor.name,
         exclusion: "no_caller_context" as const,
       }));
@@ -581,38 +599,66 @@ export class ManagementApplication {
           ? await this.assignedCategories(context.caller)
           : [];
 
+    // Eligibility is *absence of an exclusion*, so a bare `scopeGates.get(name) ?? reason`
+    // cannot tell "this rule found it eligible" from "no rule ever looked at it" — both are
+    // a missing key. `classified` records the first, so the second is detectable and fails
+    // closed. Without it the `unclassified` reason below is unreachable, and a Tool wired
+    // into the registry but into no rule would be offered to every scope that holds a
+    // discovery grant.
+    const classified = new Set<string>();
     const scopeGates = new Map<string, ToolExclusionReason>();
-    for (const entry of historyToolEligibility({
-      isOwner,
-      chatType: scope.chatType,
-      enabledCategories: capabilityCategories,
-    }))
-      if (entry.exclusion !== null) scopeGates.set(entry.name, entry.exclusion);
-    for (const entry of capabilityToolEligibility({
-      isOwner,
-      chatType: scope.chatType,
-      enabledCategories: capabilityCategories,
-    }))
-      if (entry.exclusion !== null) scopeGates.set(entry.name, entry.exclusion);
+    const classify = (
+      entries: readonly { name: string; exclusion: ToolExclusionReason | null }[],
+    ) => {
+      for (const entry of entries) {
+        classified.add(entry.name);
+        if (entry.exclusion !== null) scopeGates.set(entry.name, entry.exclusion);
+      }
+    };
+    classify(
+      historyToolEligibility({
+        isOwner,
+        chatType: scope.chatType,
+        enabledCategories: capabilityCategories,
+      }),
+    );
+    classify(
+      capabilityToolEligibility({
+        isOwner,
+        chatType: scope.chatType,
+        enabledCategories: capabilityCategories,
+      }),
+    );
 
     // The Agent Ops and Owner-control surface is Owner-private. A group Run reaches neither,
     // however the Owner's own grants look, so this is a scope boundary rather than a policy.
     const ownerPrivate = isOwner && scope.chatType === "private";
-    for (const name of OPS_TOOL_NAMES)
+    for (const name of OPS_TOOL_NAMES) {
+      classified.add(name);
       if (!(ownerPrivate && this.options.ops)) scopeGates.set(name, "scope_not_permitted");
+    }
+    classified.add(OWNER_GROUP_ADMIN_TOOL);
     if (!ownerPrivate) scopeGates.set(OWNER_GROUP_ADMIN_TOOL, "scope_not_permitted");
+    classified.add(SKILL_READ_TOOL);
     if (!context.authorizedSkillNames?.length) scopeGates.set(SKILL_READ_TOOL, "policy_disabled");
 
     const candidates: ToolSurfaceCandidate[] = [];
-    for (const descriptor of TOOL_DESCRIPTORS) {
+    for (const descriptor of registered) {
       if (descriptor.origin === "pi_builtin") {
+        // A Pi built-in is classified by its origin, and excluded on the same evidence the
+        // real session uses: the host never offers it to a Glassbox Run.
+        classified.add(descriptor.name);
         candidates.push({ name: descriptor.name, exclusion: "disabled_by_host" });
         continue;
       }
-      // A registered Tool with no gate is a wiring bug. Naming it `unclassified` keeps it
-      // out of the model's surface and makes the gap visible instead of silently offering it.
-      const gate = scopeGates.get(descriptor.name) ?? "unclassified";
-      if (gate !== "unclassified") {
+      // A registered Tool no rule classified is a wiring bug. Withholding it keeps it out of
+      // the model's surface and makes the gap visible instead of silently offering it.
+      if (!classified.has(descriptor.name)) {
+        candidates.push({ name: descriptor.name, exclusion: "unclassified" });
+        continue;
+      }
+      const gate = scopeGates.get(descriptor.name);
+      if (gate !== undefined) {
         candidates.push({ name: descriptor.name, exclusion: gate });
         continue;
       }
@@ -1789,11 +1835,12 @@ export class ManagementApplication {
    * Each fact is the real `authorization.check` decision for this Principal, this concrete
    * `group:<id>` Resource and this Run — the same call the capability and history Tools make,
    * recording the same `authorization_decisions` evidence, with the current Conversation and
-   * Run attached. `hasActiveGrant` is deliberately not used: it answers the management
-   * reverse-state question ("does anyone still hold this assignment") and bypasses identity
-   * and visibility evaluation, so a grant it finds is not an authorization decision.
+   * Run attached when the caller has them. `hasActiveGrant` is deliberately not used: it
+   * answers the management reverse-state question ("does anyone still hold this assignment")
+   * and bypasses identity and visibility evaluation, so a grant it finds is not an
+   * authorization decision.
    */
-  private async managedGroupFacts(context: ProtectedToolContext): Promise<ManagedGroupFacts[]> {
+  private async managedGroupFacts(context: AuthorizationContext): Promise<ManagedGroupFacts[]> {
     const caller = context.caller;
     const connectionId = caller.scope.connectionId;
     const groupIds = await resolveAssignedGroupIds(this.store, caller);
@@ -1892,7 +1939,7 @@ export class ManagementApplication {
    * group is ALLOW, so a protected group fact is re-authorized before any provider call and a
    * denied group never causes one.
    */
-  private async projectManagedGroups(context: ProtectedToolContext): Promise<unknown> {
+  private async projectManagedGroups(context: AuthorizationContext): Promise<unknown> {
     const connection = this.connections.get(context.caller.scope.connectionId);
     const facts = await this.managedGroupFacts(context);
     const groups = [];
@@ -1930,10 +1977,14 @@ export class ManagementApplication {
    * not known to work against the bridge in front of it, and a Run must not report the first
    * as the second. This is the fresh, time-stamped observation that answers the difference.
    *
-   * Two things keep it honest. The provider call goes through `invokeCapability` — the same
+   * Three things keep it honest. The provider call goes through `invokeCapability` — the same
    * allowlisted outbound path a capability Tool uses, including the group binding — so the
-   * acceptance can only prove calls Glassbox would really make. And each observation is
-   * appended to the Trace as it is made, so the evidence survives the probe failing partway
+   * acceptance can only prove calls Glassbox would really make. Every path is authorized first,
+   * against the same Resource the Tool would derive and under the same Owner policy, so the
+   * acceptance is a measurement *inside* the authorization boundary rather than a way around
+   * it: a group the Owner has not assigned reports `denied` and calls nothing, and a report can
+   * therefore never show a bridge working for a read no Run could perform. And each observation
+   * is appended to the Trace as it is made, so the evidence survives the probe failing partway
    * rather than depending on the caller reporting back.
    *
    * The provider's raw result is classified here rather than thrown through
@@ -1957,14 +2008,43 @@ export class ManagementApplication {
 
     const owner = this.ownerPrivateScopes(configured)[0];
     if (!owner) throw new ManagementError("INVALID_REQUEST", "The channel has no owner");
-    const context: ProtectedToolContext = {
+    // The acceptance runs as the Owner, in the Owner's scope, and in no Run: the decisions it
+    // records carry no Conversation and no Run because it has neither. That is what lets a
+    // reader tell an acceptance apart from an Agent execution in `authorization_decisions`,
+    // and it is why the decision row can be written at all — those columns reference real
+    // `conversations` and `runs` rows, so a placeholder name would either fail the reference
+    // or, worse, be a decision claiming a context that never existed.
+    const context: AuthorizationContext = {
       caller: { principalId: owner.principalId, scope: owner.scope },
-      conversationId: MANAGEMENT_PROBE_CONTEXT,
-      runId: MANAGEMENT_PROBE_CONTEXT,
     };
 
     return probeReadCapabilities({
       groupId,
+      // Acceptance asks the same question a Run's Tool call is re-authorized with, on the same
+      // Resource derivation and under the same Owner policy, and records the answer instead of
+      // assuming it. Being configured for a group is a transport fact, not authority: a group
+      // the Owner has not assigned has no grants, so every path against it is denied here
+      // exactly as it would be for a Run — which is what makes a `complete` acceptance evidence
+      // that the bridge works on a group Glassbox would really read.
+      decide: async (path, target) => {
+        const decision = await this.store.authorization.check({
+          caller: context.caller,
+          resourceId: capabilityResourceId({
+            resource: path.resource,
+            scope: context.caller.scope,
+            groupId: target ?? undefined,
+            listing: path.listing,
+          }),
+          action: path.action,
+        });
+        if (decision.decision !== "ALLOW") return "denied";
+        // Owner intent is a second, independent gate: the grant alone is not enough. The
+        // managed listing names no group, so it has no per-group policy to consult.
+        if (path.listing) return "allowed";
+        return (await this.isCategoryEnabled(channelId, groupId, path.category))
+          ? "allowed"
+          : "denied";
+      },
       invoke: (input) => connection.invokeCapability(input),
       projectManagedGroups: () => this.projectManagedGroups(context),
       record: async (observation: CapabilityProbeObservation) => {

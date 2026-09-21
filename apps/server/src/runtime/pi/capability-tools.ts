@@ -39,7 +39,11 @@ import { Type } from "typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { DomainStore } from "../../persistence/index.js";
 import { agentResourceId } from "../../persistence/index.js";
-import type { QqCapability, QqCapabilityCategory } from "../../channels/onebot/capabilities.js";
+import type {
+  QqCapability,
+  QqCapabilityCategory,
+  QqCapabilityResource,
+} from "../../channels/onebot/capabilities.js";
 import { QQ_CAPABILITIES, resolveQqOperation } from "../../channels/onebot/capabilities.js";
 import { groupResourceId } from "../../retrieval/source-resolver.js";
 import {
@@ -171,6 +175,39 @@ function validatedProviderParams(value: unknown): QqProviderParams {
   if (typeof value !== "object" || value === null || Array.isArray(value))
     throw new ToolInputError("invalid_capability_params");
   return value as QqProviderParams;
+}
+
+/**
+ * The protected Resource one capability call is authorized against.
+ *
+ * The Resource is derived, never accepted: a group Run is bound to its own group, an
+ * Owner-private caller may name only a group it holds a grant for, and a scope that is neither
+ * resolves to a sentinel no grant can exist for, so it denies.
+ *
+ * This is the single derivation for every path that reaches a capability — the Tools a Run
+ * calls and the read acceptance that proves those same paths work — so an acceptance can never
+ * authorize one Resource while the Tool a Run would call authorizes another. `listing` marks
+ * `qq_groups`' provider-free managed inventory, which names no group and is the Owner's own
+ * view, so it lives on the Agent Resource rather than on a group.
+ */
+export function capabilityResourceId(input: {
+  /** The capability's Resource class: `account` is the Agent itself, `group` is one group. */
+  resource: QqCapabilityResource;
+  scope: { chatType: string; chatId: string };
+  /** The group the call targets, when the caller named one. */
+  groupId?: string | undefined;
+  /** True only for `qq_groups`' managed listing. */
+  listing?: boolean;
+}): string {
+  const { scope } = input;
+  if (input.resource === "account") return agentResourceId("personal");
+  if (scope.chatType === "group")
+    return input.listing === true ? UNRESOLVED_CAPABILITY_RESOURCE : groupResourceId(scope.chatId);
+  if (scope.chatType !== "private") return UNRESOLVED_CAPABILITY_RESOURCE;
+  if (input.listing === true) return agentResourceId("personal");
+  return typeof input.groupId === "string" && GROUP_ID_PATTERN.test(input.groupId)
+    ? groupResourceId(input.groupId)
+    : UNRESOLVED_CAPABILITY_RESOURCE;
 }
 
 /** A blank query is "no filter", not an error; an over-long one is refused rather than cut. */
@@ -383,15 +420,12 @@ function createProviderCapabilityTool(
     action: capability.action,
     // The Resource is derived, never accepted: a group Run is bound to its own group, and
     // an Owner-private Run may name only a group its policy covers.
-    resourceId: (params, context) => {
-      if (capability.resource === "account") return agentResourceId("personal");
-      if (context.caller.scope.chatType === "group")
-        return groupResourceId(context.caller.scope.chatId);
-      if (context.caller.scope.chatType !== "private") return UNRESOLVED_CAPABILITY_RESOURCE;
-      return typeof params.groupId === "string" && GROUP_ID_PATTERN.test(params.groupId)
-        ? groupResourceId(params.groupId)
-        : UNRESOLVED_CAPABILITY_RESOURCE;
-    },
+    resourceId: (params, context) =>
+      capabilityResourceId({
+        resource: capability.resource,
+        scope: context.caller.scope,
+        groupId: typeof params.groupId === "string" ? params.groupId : undefined,
+      }),
     authService: store.authorization,
     getContext,
     execute: (params, context) => executeProviderCall(capability, params, context, options),
@@ -412,19 +446,16 @@ function createGroupInventoryTool(
     description: options.capability.description,
     parameters: providerToolParameters(options.capability, true),
     action: options.capability.action,
-    resourceId: (params, context) => {
-      const scope = context.caller.scope;
-      const listing = params.operation === undefined;
-      if (scope.chatType === "group")
-        return listing ? UNRESOLVED_CAPABILITY_RESOURCE : groupResourceId(scope.chatId);
-      if (scope.chatType !== "private") return UNRESOLVED_CAPABILITY_RESOURCE;
-      // The listing is authorized on the Agent Resource, which is what makes it the Owner's
-      // own managed-group view rather than a read of one concrete group.
-      if (listing) return agentResourceId("personal");
-      return typeof params.groupId === "string" && GROUP_ID_PATTERN.test(params.groupId)
-        ? groupResourceId(params.groupId)
-        : UNRESOLVED_CAPABILITY_RESOURCE;
-    },
+    resourceId: (params, context) =>
+      capabilityResourceId({
+        resource: options.capability.resource,
+        scope: context.caller.scope,
+        groupId: typeof params.groupId === "string" ? params.groupId : undefined,
+        // `qq_groups`' managed listing is the Owner's own inventory and is authorized on the
+        // Agent Resource, which is what makes it a view of the managed set rather than a read
+        // of one concrete group.
+        listing: params.operation === undefined,
+      }),
     authService: options.authService,
     getContext: options.getContext,
     execute: (params, context) => {

@@ -7,13 +7,20 @@
  * module runs the five read domains the issue names through the same allowlisted provider
  * path the capability Tools use, and records what actually came back.
  *
- * Three properties make the record trustworthy:
+ * Four properties make the record trustworthy:
  *
  *  - The paths are derived from the registry, not restated. A path whose operation is not a
  *    real operation of a read-only capability throws at load, so a registry change cannot
  *    leave a stale path behind. The allowlist itself is enforced where it always is — the
  *    adapter refuses a non-allowlisted action — and `capability-probe.test.ts` asserts that
  *    every path here is on it, so acceptance can never prove something a model could not call.
+ *  - Every path is authorized before it is called. Acceptance is not a way around the product's
+ *    authorization: a path is probed only when the same Principal × Resource × Action × Context
+ *    decision a Run's Tool call gets comes back ALLOW, and a denied path is recorded as
+ *    `denied` with no call made. The question is injected (`decide`), not answered here,
+ *    because the answer is the product's and a second implementation of it would be the very
+ *    defect this module exists to catch. A path that could be probed while no Run could call it
+ *    would prove the opposite of what acceptance is for.
  *  - Nothing but structure is recorded. `safeResultShape` describes a result's field names and
  *    counts and never a value, so acceptance evidence can be read, shared and kept without
  *    copying a member's nickname, a notice or a message into the Trace.
@@ -27,6 +34,7 @@
  */
 
 import type { OneBotCapabilityResult } from "./adapter.js";
+import type { QqCapability, QqCapabilityCategory, QqCapabilityResource } from "./capabilities.js";
 import { QQ_CAPABILITIES } from "./capabilities.js";
 import { providerOutcome } from "../../runtime/pi/provider-outcome.js";
 import type { ToolExecutionOutcome } from "../../runtime/pi/tool-plane.js";
@@ -37,6 +45,10 @@ export const ACCEPTANCE_PROVIDER = "qq-napcat";
 /**
  * One read path the acceptance calls.
  *
+ * The registry facts are carried rather than re-derived at the call site so the authorization
+ * question asked about a path is the one the registry declares for it: the same Action, on the
+ * same class of Resource, under the same policy category the Tool itself would use.
+ *
  * `operation: null` is the one path that reaches no provider: `qq_groups`' managed listing,
  * which is a projection over the Owner's own inventory. It is in the list because §7 asks for
  * it, and marked apart because its success is not evidence about the bridge.
@@ -45,19 +57,67 @@ export interface ReadAcceptancePath {
   tool: string;
   /** The allowlisted provider action, or `null` when the path reaches no provider. */
   operation: string | null;
+  /** The protected Action this path is authorized against. */
+  action: string;
+  /** The class of Resource the path is authorized against. */
+  resource: QqCapabilityResource;
+  /** The Owner policy category that must be enabled for a group-scoped path. */
+  category: QqCapabilityCategory;
+  /** True only for the provider-free managed listing. */
+  listing: boolean;
   /** What this path proves, in the registry's own words. */
   description: string;
 }
 
-function describePath(tool: string, operation: string): ReadAcceptancePath {
+/**
+ * The registry facts for one Tool, or a load-time failure.
+ *
+ * A path that is not a real allowlisted read of a real read-only capability is a wiring bug:
+ * the acceptance would be calling something Glassbox never exposes, or something that changes a
+ * group. Both are worse than a missing check, so this fails at load. Every path below is built
+ * through here, including the provider-free one, so no entry can carry facts the registry does
+ * not declare.
+ */
+function registryFacts(tool: string): { capability: QqCapability; description: string } {
   const capability = QQ_CAPABILITIES.find((entry) => entry.tool === tool);
-  const allowed = capability?.operations.find((entry) => entry.action === operation);
-  // A path that is not a real allowlisted read of a real read-only capability is a wiring bug:
-  // the acceptance would be calling something Glassbox never exposes, or something that
-  // changes a group. Both are worse than a missing check, so this fails at load.
-  if (!capability || !allowed || capability.risk !== "read")
-    throw new Error(`acceptance path is not an allowlisted read: ${tool}.${operation}`);
-  return { tool, operation, description: capability.description };
+  if (!capability || capability.risk !== "read")
+    throw new Error(`acceptance path is not an allowlisted read: ${tool}`);
+  return { capability, description: capability.description };
+}
+
+function describePath(tool: string, operation: string): ReadAcceptancePath {
+  const { capability, description } = registryFacts(tool);
+  const allowed = capability.operations.find((entry) => entry.action === operation);
+  if (!allowed) throw new Error(`acceptance path is not an allowlisted read: ${tool}.${operation}`);
+  return {
+    tool,
+    operation,
+    action: capability.action,
+    resource: capability.resource,
+    category: capability.category,
+    listing: false,
+    description,
+  };
+}
+
+/**
+ * The provider-free managed listing, described by the same rules as every other path.
+ *
+ * Its own words rather than the capability's, because it is not a provider read of one group:
+ * a report that described it as "read group metadata" would invite exactly the mistake
+ * `providerBacked: false` exists to prevent.
+ */
+function describeListing(tool: string): ReadAcceptancePath {
+  const { capability } = registryFacts(tool);
+  return {
+    tool,
+    operation: null,
+    action: capability.action,
+    resource: capability.resource,
+    category: capability.category,
+    listing: true,
+    description: "The Owner's managed-group inventory.",
+  };
 }
 
 /**
@@ -68,7 +128,7 @@ function describePath(tool: string, operation: string): ReadAcceptancePath {
  * report reads from the local view outward to the bridge.
  */
 export const READ_ACCEPTANCE_PATHS: readonly ReadAcceptancePath[] = Object.freeze([
-  { tool: "qq_groups", operation: null, description: "The Owner's managed-group inventory." },
+  describeListing("qq_groups"),
   describePath("qq_groups", "get_group_info"),
   describePath("qq_group_members", "get_group_member_list"),
   describePath("qq_group_history", "get_group_msg_history"),
@@ -76,6 +136,16 @@ export const READ_ACCEPTANCE_PATHS: readonly ReadAcceptancePath[] = Object.freez
   describePath("qq_group_content", "get_essence_msg_list"),
   describePath("qq_group_files", "get_group_root_files"),
 ]);
+
+/**
+ * The one authorization question asked before each path.
+ *
+ * `groupId` is the group the path targets, or `null` for the provider-free listing, which names
+ * no group. Anything but `allowed` is `denied`: the acceptance has no vocabulary of its own for
+ * "the product said no", and inventing one would put it out of step with the outcome a Run
+ * records about the same call.
+ */
+export type ProbeDecision = "allowed" | "denied";
 
 /** How many field names one shape may carry, so a wide result cannot fill the record. */
 const MAX_SHAPE_FIELDS = 32;
@@ -169,9 +239,10 @@ export interface CapabilityProbeSummary {
   providerBackedSucceeded: number;
   providerFailed: number;
   providerUnavailable: number;
+  /** Paths the product refused. A denied path is never called, so it proves nothing. */
   denied: number;
   unknown: number;
-  /** Provider-free paths that did not return. Not a statement about the bridge. */
+  /** Provider-free paths that genuinely failed. A refused one is counted in `denied`, not here. */
   localFailed: number;
 }
 
@@ -186,12 +257,23 @@ export interface CapabilityProbeReport {
    *
    * The provider-free listing cannot make this true or false: an acceptance that could be
    * satisfied by a projection over Glassbox's own state would prove nothing about the bridge.
+   * A denied path makes it false too — a path that was refused was never called, so it is not
+   * evidence that the bridge works, and an acceptance over a group no Run could read is not a
+   * successful acceptance.
    */
   complete: boolean;
 }
 
 export interface CapabilityProbeInput {
   groupId: string;
+  /**
+   * The authorization question for one path, asked before the path is called.
+   *
+   * Injected because the answer belongs to the product, not to the acceptance: it is the same
+   * decision a Run's Tool call is re-authorized with, plus the Owner's durable per-group policy.
+   * Answering it here would be a second authorization implementation.
+   */
+  decide: (path: ReadAcceptancePath, groupId: string | null) => Promise<ProbeDecision>;
   /** The one outbound provider path: the same allowlisted call the capability Tools make. */
   invoke: (input: {
     action: string;
@@ -218,7 +300,7 @@ function summarize(observations: readonly CapabilityProbeObservation[]): Capabil
     denied: count("denied"),
     unknown: count("unknown"),
     localFailed: observations.filter(
-      (entry) => !entry.providerBacked && entry.outcome !== "success",
+      (entry) => !entry.providerBacked && entry.outcome !== "success" && entry.outcome !== "denied",
     ).length,
   };
 }
@@ -230,6 +312,12 @@ function summarize(observations: readonly CapabilityProbeObservation[]): Capabil
  * a report that stopped at the first failure could not tell "the bridge is down" from "one
  * operation is refused". Each observation is recorded as it is made, so evidence exists even
  * if the process dies mid-probe.
+ *
+ * A denial does not stop it either, and is recorded for the same reason: an acceptance that
+ * ended at the first refusal could not say which paths the product permits, and "everything
+ * after the first denial" is not a fact worth withholding. What a denial never does is call
+ * the path — `decide` is asked first, and a `denied` path reaches neither the provider nor the
+ * managed-group projection.
  */
 export async function probeReadCapabilities(
   input: CapabilityProbeInput,
@@ -239,15 +327,21 @@ export async function probeReadCapabilities(
 
   for (const path of READ_ACCEPTANCE_PATHS) {
     const observedAt = now().toISOString();
+    const groupId = path.operation === null ? null : input.groupId;
     const base = {
       tool: path.tool,
       operation: path.operation,
-      groupId: path.operation === null ? null : input.groupId,
+      groupId,
       providerBacked: path.operation !== null,
       observedAt,
     };
+    const decision = await input.decide(path, groupId);
     let observation: CapabilityProbeObservation;
-    if (path.operation === null) {
+    if (decision !== "allowed") {
+      // Refused before the call, so there is nothing to describe: a shape here would have to
+      // come from a result that does not exist.
+      observation = { ...base, outcome: "denied", resultShape: null };
+    } else if (path.operation === null) {
       observation = await localObservation(base, input);
     } else {
       const result = await input
