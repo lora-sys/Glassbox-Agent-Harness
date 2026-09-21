@@ -59,12 +59,16 @@ it("exposes Owner-only governed Memory operations and rechecks revoked write aut
       if (action === MEMORY_GOVERN_ACTION) governGrant = grantId;
     }
     let currentRunId = accepted.run.id;
+    let requiredToolInput: Record<string, unknown> | undefined;
     const [tool] = createOwnerMemoryTools({
       store,
       getContext: () => ({
         caller,
         runId: currentRunId,
         conversationId: accepted.conversation.id,
+        ...(requiredToolInput
+          ? { requiredToolName: OWNER_MEMORY_ADMIN_TOOL, requiredToolInput }
+          : {}),
       }),
     });
     expect(tool?.name).toBe(OWNER_MEMORY_ADMIN_TOOL);
@@ -117,6 +121,41 @@ it("exposes Owner-only governed Memory operations and rechecks revoked write aut
     expect(promoted.details).not.toHaveProperty("evidence");
     expect(promoted.details).not.toHaveProperty("evidenceRefs");
     expect(promoted.details).not.toHaveProperty("assertedBy");
+    const correctedStatement = "The Owner said the deployment target is “Linux production”.";
+    const update = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: caller.scope,
+      messageId: "update-with-typographic-quotes",
+      text: `/memory update ${memoryId} ${correctedStatement}`,
+      executionRef: "pi:test",
+    });
+    currentRunId = update.run.id;
+    requiredToolInput = { action: "update", id: memoryId, statement: correctedStatement };
+    await expect(
+      tool!.execute(
+        "wrong-action",
+        { action: "revoke", id: memoryId },
+        undefined,
+        undefined,
+        {} as never,
+      ),
+    ).rejects.toThrow("mutation_not_requested");
+    const updated = await tool!.execute(
+      "normalized-provider-input",
+      {
+        action: "update",
+        id: memoryId,
+        statement: 'The Owner said the deployment target is "Linux production".',
+      },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    expect(updated.details).toMatchObject({
+      content: { statement: correctedStatement },
+      lifecycleState: "active",
+    });
+    requiredToolInput = undefined;
     const repeatedPromotion = await store.conversations.acceptIncoming({
       agentId: "personal",
       scope: caller.scope,

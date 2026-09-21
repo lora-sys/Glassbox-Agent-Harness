@@ -21,7 +21,11 @@ import {
   sourceClassAuthority,
 } from "../../retrieval/qq-source-reader.js";
 import { groupResourceId } from "../../retrieval/source-resolver.js";
-import { createProtectedTool, type ProtectedToolContext } from "./protected-tools.js";
+import {
+  createProtectedTool,
+  ToolInputError,
+  type ProtectedToolContext,
+} from "./protected-tools.js";
 import type { PiRunContext } from "./types.js";
 
 export const OWNER_MEMORY_ADMIN_TOOL = "owner_memory_admin";
@@ -58,6 +62,17 @@ type OwnerMemoryToolInput = Record<string, unknown> & {
   since?: string;
   until?: string;
 };
+
+function currentRequestInput(
+  context: ProtectedToolContext,
+  input: OwnerMemoryToolInput,
+): OwnerMemoryToolInput {
+  if (context.requiredToolName !== OWNER_MEMORY_ADMIN_TOOL || !context.requiredToolInput)
+    return input;
+  const required = context.requiredToolInput as OwnerMemoryToolInput;
+  if (required.action !== input.action) throw new ToolInputError("mutation_not_requested");
+  return required;
+}
 
 function scopeFrom(input: OwnerMemoryToolInput): GlassboxMemoryScope {
   if (input.scopeType === "project" && typeof input.projectId === "string")
@@ -514,7 +529,8 @@ export function createOwnerMemoryTools(options: {
       resourceId: OWNER_MEMORY_RESOURCE,
       authService: options.store.authorization,
       getContext,
-      execute: (params, context) => executeMemoryAction(options.store, context, params),
+      execute: (params, context) =>
+        executeMemoryAction(options.store, context, currentRequestInput(context, params)),
     }),
   ];
 }
