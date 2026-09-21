@@ -59,7 +59,9 @@ const MAX_GROUP_FILTERS = 50;
 const GROUP_ID_PATTERN = /^[1-9]\d{0,15}$/u;
 
 interface GroupHistoryInput extends Record<string, unknown> {
-  query: string;
+  query?: string;
+  sender?: string;
+  mentionsMe?: boolean;
   limit?: number;
   since?: string;
   until?: string;
@@ -82,6 +84,7 @@ export interface HistorySearchItem extends BoundedContextItem {
    * to, so a policy that hides what was said does not disclose who said it.
    */
   senderId?: string;
+  senderName?: string;
 }
 
 export interface HistorySearchDetails {
@@ -94,6 +97,7 @@ export interface HistorySearchDetails {
   items: HistorySearchItem[];
   considered: number;
   truncated: boolean;
+  resultStatus: "matches_found" | "no_matches_in_searched_window";
 }
 
 /**
@@ -142,12 +146,15 @@ export interface HistorySearchResultView {
     groupId: string;
     /** The sender's Channel identity, when the item's content was disclosed. */
     sender?: string;
+    senderName?: string;
     occurredAt?: string;
     text: string;
     matchedTerms: string[];
   }>;
   considered: number;
   truncated: boolean;
+  resultStatus: "matches_found" | "no_matches_in_searched_window";
+  guidance: string;
 }
 
 export function projectHistorySearch(details: HistorySearchDetails): HistorySearchResultView {
@@ -158,12 +165,18 @@ export function projectHistorySearch(details: HistorySearchDetails): HistorySear
       rank: item.rank,
       groupId: item.groupId,
       ...(item.senderId === undefined ? {} : { sender: item.senderId }),
+      ...(item.senderName === undefined ? {} : { senderName: item.senderName }),
       ...(item.occurredAt === undefined ? {} : { occurredAt: item.occurredAt }),
       text: item.snippet,
       matchedTerms: item.matchedTerms,
     })),
     considered: details.considered,
     truncated: details.truncated,
+    resultStatus: details.resultStatus,
+    guidance:
+      details.resultStatus === "matches_found"
+        ? "Answer only from these matches."
+        : "No match was found in the searched window. This does not prove the event never happened.",
   };
 }
 
@@ -186,9 +199,16 @@ export function availableHistoryToolNames(input: {
 }
 
 function validatedParams(input: GroupHistoryInput): GroupHistoryInput {
-  const query = input.query;
-  if (typeof query !== "string" || !query.trim() || query.length > 2_000)
-    throw new Error("invalid_history_query");
+  const query = input.query === undefined ? "" : input.query;
+  if (typeof query !== "string" || query.length > 2_000) throw new Error("invalid_history_query");
+  const sender = input.sender?.trim();
+  if (
+    input.sender !== undefined &&
+    (typeof input.sender !== "string" || !sender || sender.length > 256)
+  )
+    throw new Error("invalid_history_sender");
+  if (input.mentionsMe !== undefined && typeof input.mentionsMe !== "boolean")
+    throw new Error("invalid_history_mentions_me");
   const limit = input.limit === undefined ? DEFAULT_LIMIT : input.limit;
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_LIMIT)
     throw new Error("invalid_history_limit");
@@ -198,7 +218,18 @@ function validatedParams(input: GroupHistoryInput): GroupHistoryInput {
       throw new Error("invalid_history_time_bound");
     return value;
   };
-  return { query: query.trim(), limit, since: bound(input.since), until: bound(input.until) };
+  const since = bound(input.since);
+  const until = bound(input.until);
+  if (!query.trim() && !sender && input.mentionsMe !== true && !since && !until)
+    throw new Error("history_filter_required");
+  return {
+    query: query.trim(),
+    ...(sender ? { sender } : {}),
+    ...(input.mentionsMe === true ? { mentionsMe: true } : {}),
+    limit,
+    since,
+    until,
+  };
 }
 
 function validatedGroupFilters(value: unknown): string[] | undefined {
@@ -222,6 +253,8 @@ export function createHistoryTools(options: {
    * text is never fetched for a group the caller may not read.
    */
   syncGroup?: (groupId: string, context: ProtectedToolContext) => Promise<void>;
+  /** Resolves the bot Channel identity used by the structured `mentionsMe` filter. */
+  botIdForConnection?: (connectionId: string) => string | undefined;
   /**
    * Durable Owner intent for one group's history class. Not an authorization decision.
    *
@@ -285,41 +318,59 @@ export function createHistoryTools(options: {
 
     for (const groupId of searched) await options.syncGroup?.(groupId, context);
 
+    const botId = params.mentionsMe
+      ? options.botIdForConnection?.(caller.scope.connectionId)
+      : undefined;
+    if (params.mentionsMe && !botId) throw new ToolInputError("bot_identity_unavailable");
     const retriever = new MemoryRetriever({ store: options.archive });
     const results = searched.length
-      ? await retriever.search(params.query, {
+      ? await retriever.search(params.query ?? "", {
           allowedSourceIds: searched,
           limit: params.limit,
           since: params.since,
           until: params.until,
+          metadataFilters: {
+            ...(params.sender ? { sender: params.sender } : {}),
+            ...(botId ? { mentionedUserId: botId } : {}),
+          },
         })
       : [];
     const bounded = selectBoundedContext(results, { topK: params.limit });
     // Bounding drops items, so the sender is joined back by record id rather than by position.
     const senders = new Map(
-      results.map((result) => [result.memory.id, result.memory.metadata?.senderId]),
+      results.map((result) => [
+        result.memory.id,
+        {
+          id: result.memory.metadata?.senderId,
+          name: result.memory.metadata?.senderName,
+        },
+      ]),
     );
     const items: HistorySearchItem[] = bounded.items.map((item) => {
-      const senderId = senders.get(item.id);
+      const sender = senders.get(item.id);
       return {
         ...item,
         groupId: item.sourceId,
         resourceId: groupResourceId(item.sourceId),
         // A withheld item discloses neither its text nor who sent it.
-        ...(typeof senderId === "string" && item.returnMode !== "metadata_only"
-          ? { senderId }
+        ...(typeof sender?.id === "string" && item.returnMode !== "metadata_only"
+          ? { senderId: sender.id }
+          : {}),
+        ...(typeof sender?.name === "string" && item.returnMode !== "metadata_only"
+          ? { senderName: sender.name }
           : {}),
       };
     });
     const details: HistorySearchDetails = {
       groups: searched,
-      query: params.query,
+      query: params.query ?? "",
       sourceKind: "channel_message",
       retrievalMode: "lexical",
       runId: context.runId,
       items,
       considered: bounded.considered,
       truncated: bounded.truncated,
+      resultStatus: items.length > 0 ? "matches_found" : "no_matches_in_searched_window",
     };
     await options.recordEvidence?.(
       {
@@ -327,7 +378,7 @@ export function createHistoryTools(options: {
         runId: context.runId,
         principalId: caller.principalId,
         conversationId: context.conversationId,
-        query: params.query,
+        query: params.query ?? "",
         groups: searched,
         resources: searched.map(groupResourceId),
         sourceKind: "channel_message",
@@ -352,10 +403,12 @@ export function createHistoryTools(options: {
     name: GROUP_HISTORY_SEARCH_TOOL,
     label: "搜索本群历史",
     description:
-      "Search the history of the QQ group this conversation is currently in. It cannot search any other group. Use it whenever the user asks about something said earlier in this group. Each result names the sender and carries the message text, time and group — answer from those fields instead of asking the user for them.",
+      "Search the current QQ group's authorized history. Filters cover message text, sender QQ or group nickname, whether the sender mentioned this bot, and ISO 8601 time bounds. Use sender for who spoke and mentionsMe for who @mentioned the bot. A no_matches_in_searched_window result is not proof that an event never happened.",
     parameters: Type.Object(
       {
-        query: Type.String({ minLength: 1, maxLength: 2_000 }),
+        query: Type.Optional(Type.String({ maxLength: 2_000 })),
+        sender: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
+        mentionsMe: Type.Optional(Type.Boolean()),
         limit: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_LIMIT })),
         since: Type.Optional(Type.String()),
         until: Type.Optional(Type.String()),
@@ -389,7 +442,7 @@ export function createHistoryTools(options: {
     name: OWNER_HISTORY_SEARCH_TOOL,
     label: "搜索已授权群历史",
     description:
-      "Owner-only: search history across the QQ groups currently assigned and authorized for this Owner. Optionally name groupIds to narrow the search; omit them to search every authorized group. It can never read a group that has not been granted. Each result names its group and sender and carries the message text — answer from those fields instead of asking the user for them.",
+      "Owner-only search across assigned and authorized QQ groups. Filters cover message text, sender QQ or group nickname, whether the sender mentioned this bot, group ids, and ISO 8601 time bounds. A no_matches_in_searched_window result is not proof that an event never happened.",
     parameters: Type.Object(
       {
         groupIds: Type.Optional(
@@ -398,7 +451,9 @@ export function createHistoryTools(options: {
             maxItems: MAX_GROUP_FILTERS,
           }),
         ),
-        query: Type.String({ minLength: 1, maxLength: 2_000 }),
+        query: Type.Optional(Type.String({ maxLength: 2_000 })),
+        sender: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
+        mentionsMe: Type.Optional(Type.Boolean()),
         limit: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_LIMIT })),
         since: Type.Optional(Type.String()),
         until: Type.Optional(Type.String()),

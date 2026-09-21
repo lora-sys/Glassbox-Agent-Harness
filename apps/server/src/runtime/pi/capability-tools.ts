@@ -222,20 +222,43 @@ function createCapabilitySearchTool(options: {
  */
 export const GROUP_INVENTORY_TOOL = "qq_groups";
 
-/** The envelope every provider-facing capability Tool shares. */
-const PROVIDER_TOOL_PARAMETERS = Type.Object(
-  {
-    groupId: Type.Optional(Type.String({ pattern: "^[1-9]\\d{0,15}$" })),
-    operation: Type.Optional(Type.String({ maxLength: 64 })),
-    params: Type.Optional(
-      Type.Record(
-        Type.String({ maxLength: 64 }),
-        Type.Union([Type.String({ maxLength: 2_048 }), Type.Number(), Type.Boolean()]),
+function providerToolParameters(capability: QqCapability, allowListing = false) {
+  const operation = Type.String({
+    maxLength: 64,
+    enum: capability.operations.map((item) => item.action),
+    description: `Allowed operation: ${capability.operations.map((item) => item.action).join(", ")}`,
+  });
+  return Type.Object(
+    {
+      groupId: Type.Optional(
+        Type.String({
+          pattern: "^[1-9]\\d{0,15}$",
+          description: "Required only in Owner private chat. Omit inside a group.",
+        }),
       ),
-    ),
-  },
-  { additionalProperties: false },
-);
+      operation: allowListing ? Type.Optional(operation) : operation,
+      params: Type.Optional(
+        Type.Record(
+          Type.String({ maxLength: 64 }),
+          Type.Union([Type.String({ maxLength: 2_048 }), Type.Number(), Type.Boolean()]),
+          { description: "Provider parameters only. Never include group_id here." },
+        ),
+      ),
+    },
+    { additionalProperties: false },
+  );
+}
+
+function providerToolDescription(capability: QqCapability): string {
+  const operations = capability.operations
+    .map((operation) => {
+      const modelParams = operation.params.filter((name) => name !== "group_id");
+      const required = operation.required.filter((name) => name !== "group_id");
+      return `${operation.action}: params may contain ${modelParams.join(", ") || "nothing"}; required ${required.join(", ") || "nothing"}`;
+    })
+    .join(". ");
+  return `${capability.description} Set operation to one listed action. Put provider arguments in params. In a group omit groupId. In Owner private chat provide groupId. ${operations}.`;
+}
 
 interface ProviderCallOptions {
   /** Durable Owner intent for one group's capability class. Not an authorization decision. */
@@ -324,8 +347,8 @@ function createProviderCapabilityTool(
   return createProtectedTool<CapabilityToolInput>({
     name: capability.tool,
     label: capability.tool,
-    description: capability.description,
-    parameters: PROVIDER_TOOL_PARAMETERS,
+    description: providerToolDescription(capability),
+    parameters: providerToolParameters(capability),
     action: capability.action,
     // The Resource is derived, never accepted: a group Run is bound to its own group, and
     // an Owner-private Run may name only a group its policy covers.
@@ -356,7 +379,7 @@ function createGroupInventoryTool(
     name: options.capability.tool,
     label: options.capability.tool,
     description: options.capability.description,
-    parameters: PROVIDER_TOOL_PARAMETERS,
+    parameters: providerToolParameters(options.capability, true),
     action: options.capability.action,
     resourceId: (params, context) => {
       const scope = context.caller.scope;

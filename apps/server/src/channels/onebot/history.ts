@@ -15,15 +15,26 @@ export interface OneBotHistoryMessage {
   messageId: string;
   groupId: string;
   senderId: string;
+  senderName?: string;
+  mentionTargetIds: string[];
   text: string;
   occurredAt: string;
 }
 
-/** Extract plain text the same way ingress does: text segments plus non-bot @ mentions. */
-function historyText(segments: unknown, botId: string): string | undefined {
-  if (typeof segments === "string") return segments.trim() || undefined;
+interface HistoryContent {
+  text: string;
+  mentionTargetIds: string[];
+}
+
+/** Extract readable text and preserve structured mention targets for retrieval filters. */
+function historyContent(segments: unknown): HistoryContent | undefined {
+  if (typeof segments === "string") {
+    const text = segments.trim();
+    return text ? { text, mentionTargetIds: [] } : undefined;
+  }
   if (!Array.isArray(segments) || segments.length > 256) return undefined;
   const texts: string[] = [];
+  const mentionTargetIds = new Set<string>();
   for (const segment of segments) {
     const part = object(segment);
     const data = object(part?.data);
@@ -33,12 +44,22 @@ function historyText(segments: unknown, botId: string): string | undefined {
       texts.push(data.text);
     } else if (part.type === "at") {
       const target = qqId(data.qq);
-      if (target && target !== botId) texts.push(`@${target}`);
-      else if (data.qq === "all") texts.push("@all");
+      if (target) {
+        mentionTargetIds.add(target);
+        texts.push(`@${target}`);
+      } else if (data.qq === "all") texts.push("@all");
     }
   }
   const text = texts.join("").trim();
-  return text || undefined;
+  return text ? { text, mentionTargetIds: [...mentionTargetIds] } : undefined;
+}
+
+function senderName(record: Record<string, unknown>): string | undefined {
+  const sender = object(record.sender);
+  const value = sender?.card || sender?.nickname;
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim();
+  return normalized && normalized.length <= 256 ? normalized : undefined;
 }
 
 /**
@@ -69,7 +90,7 @@ function secondsToIso(value: unknown): string | undefined {
 export function normalizeOneBotHistoryRecord(
   record: unknown,
   groupId: string,
-  botId: string,
+  _botId: string,
 ): OneBotHistoryMessage | undefined {
   const input = object(record);
   if (!input) return undefined;
@@ -81,7 +102,16 @@ export function normalizeOneBotHistoryRecord(
   const senderId = qqId(input.user_id ?? object(input.sender)?.user_id);
   const occurredAt = secondsToIso(input.time);
   if (id === undefined || !senderId || !occurredAt) return undefined;
-  const text = historyText(input.message ?? input.raw_message, botId);
-  if (!text || text.length > 16_000) return undefined;
-  return { messageId: id, groupId, senderId, text, occurredAt };
+  const content = historyContent(input.message ?? input.raw_message);
+  if (!content || content.text.length > 16_000) return undefined;
+  const name = senderName(input);
+  return {
+    messageId: id,
+    groupId,
+    senderId,
+    ...(name === undefined ? {} : { senderName: name }),
+    mentionTargetIds: content.mentionTargetIds,
+    text: content.text,
+    occurredAt,
+  };
 }

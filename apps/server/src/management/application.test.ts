@@ -533,14 +533,23 @@ describe("channel to durable run composition", () => {
       version: 1,
     });
 
-    f.send(2, "new-group", false, 10004, 10005);
+    f.send(2, "new-group", false, 10099, 10005);
     const newGroupRun = await f.started.take();
     await f.reply("answer:new-group");
-    expect(newGroupRun.caller.principalId).toBe("qq-visitor-10004");
+    expect(newGroupRun.caller.principalId).toBe("qq-visitor-10099");
     expect(newGroupRun.caller.scope.chatId).toBe("10005");
 
     await application.setGroupAccess(context, { groupId: "10005", enabled: false });
     expect(f.app.listChannels()[0]?.groupIds).not.toContain("10005");
+    expect(
+      (
+        await f.app.store.authorization.check({
+          caller: newGroupRun.caller,
+          resourceId: "agent:personal",
+          action: "run:create",
+        })
+      ).decision,
+    ).toBe("DENY");
     f.send(3, "revoked-group", false, 10004, 10005);
     f.send(4, "queue-barrier", true);
     await f.started.take((input) => input.text === "queue-barrier");

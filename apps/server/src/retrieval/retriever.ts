@@ -56,6 +56,7 @@ export interface RetrievalCandidateStore {
     limit?: number;
     since?: string;
     until?: string;
+    metadataFilters?: Readonly<Record<string, string>>;
   }): Promise<RetrievalCandidate[]>;
 }
 
@@ -65,6 +66,7 @@ export interface MemorySearchOpts {
   since?: string;
   until?: string;
   minScore?: number;
+  metadataFilters?: Readonly<Record<string, string>>;
 }
 
 export interface MemoryRetrieverOptions {
@@ -127,6 +129,7 @@ export class MemoryRetriever {
       limit: overFetchLimit,
       since: opts.since,
       until: opts.until,
+      metadataFilters: opts.metadataFilters,
     });
 
     if (candidates.length === 0) {

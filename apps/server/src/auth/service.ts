@@ -333,6 +333,35 @@ export class AuthorizationService {
     });
   }
 
+  /** Revoke every active grant issued inside one Channel location, across all senders. */
+  async revokeLocationScopes(input: {
+    connectionId: string;
+    botId: string;
+    chatType: "private" | "group";
+    chatId: string;
+  }): Promise<void> {
+    for (const value of [input.connectionId, input.botId, input.chatId]) requireIdentifier(value);
+    if (input.chatType !== "private" && input.chatType !== "group")
+      throw new Error("Invalid channel scope");
+    await this.db.transaction(async (tx) => {
+      await tx.execute({
+        sql: `UPDATE grants SET revoked_at = ?
+              WHERE revoked_at IS NULL
+                AND json_extract(scope_key, '$[0]') = ?
+                AND json_extract(scope_key, '$[1]') = ?
+                AND json_extract(scope_key, '$[2]') = ?
+                AND json_extract(scope_key, '$[3]') = ?`,
+        args: [
+          new Date().toISOString(),
+          input.connectionId,
+          input.botId,
+          input.chatType,
+          input.chatId,
+        ],
+      });
+    });
+  }
+
   /** Management-only approval for an existing eligible policy path. The caller
    * must verify the human approver before invoking this method. */
   async approve(input: {

@@ -451,4 +451,48 @@ describe("P4B channel archive authorization and lexical search", () => {
     });
     expect(relaxed.map((h) => h.externalMessageId)).toEqual(["relaxed-1"]);
   });
+
+  it("searches structured sender and mention metadata and enriches deduplicated rows", async () => {
+    const store = await setupStore();
+    const archive = new ChannelArchiveStore(store.db);
+    const base = {
+      channel: "qq",
+      connectionId,
+      groupId: "100",
+      externalMessageId: "structured-1",
+      senderId: "3251349264",
+      normalizedText: "你是干啥的",
+      occurredAt: "2026-09-20T05:16:04Z",
+    };
+    const id = await archive.ingest(base);
+
+    await archive.ingest({
+      ...base,
+      senderName: "Ripped",
+      mentionTargetIds: ["3889000000"],
+    });
+
+    const byNickname = await archive.searchMessages({
+      allowedGroupIds: ["100"],
+      query: "Ripped",
+    });
+    const bySender = await archive.searchMessages({
+      allowedGroupIds: ["100"],
+      senderQuery: "Ripped",
+    });
+    const byMention = await archive.searchMessages({
+      allowedGroupIds: ["100"],
+      mentionedUserId: "3889000000",
+    });
+
+    for (const result of [byNickname, bySender, byMention]) {
+      expect(result).toHaveLength(1);
+      expect(result[0]).toMatchObject({
+        id,
+        senderId: "3251349264",
+        senderName: "Ripped",
+        mentionTargetIds: ["3889000000"],
+      });
+    }
+  });
 });

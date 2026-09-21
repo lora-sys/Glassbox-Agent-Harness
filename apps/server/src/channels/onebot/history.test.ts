@@ -126,6 +126,8 @@ describe("OneBot typed group history bridge", () => {
           messageId: "501",
           groupId: "10003",
           senderId: "10004",
+          senderName: "Visitor",
+          mentionTargetIds: [],
           text: "deploy 回滚",
           occurredAt: new Date(1_758_000_000 * 1000).toISOString(),
         },
@@ -136,6 +138,30 @@ describe("OneBot typed group history bridge", () => {
     expect(request?.params).toMatchObject({ group_id: 10003, count: 20 });
     // The bridge never forwards a raw message_seq unless a cursor was supplied.
     expect(request?.params).not.toHaveProperty("message_seq");
+  });
+
+  it("preserves sender names and every structured mention target", async () => {
+    const fixture = await server([
+      historyRecord({
+        sender: { user_id: 10004, nickname: "Fallback", card: "Ripped" },
+        message: [
+          { type: "at", data: { qq: "10001" } },
+          { type: "text", data: { text: " 你是干啥的 " } },
+          { type: "at", data: { qq: "10009" } },
+        ],
+      }),
+    ]);
+    const adapter = client(fixture.endpoint);
+    await adapter.start();
+
+    const result = await adapter.getGroupHistory({ groupId: "10003" });
+    expect(result.status).toBe("ok");
+    if (result.status !== "ok") return;
+    expect(result.messages[0]).toMatchObject({
+      senderName: "Ripped",
+      mentionTargetIds: ["10001", "10009"],
+      text: "@10001 你是干啥的 @10009",
+    });
   });
 
   it("refuses a group outside the configured allowlist without any RPC", async () => {

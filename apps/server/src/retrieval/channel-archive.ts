@@ -31,6 +31,8 @@ export interface IngestChannelMessageInput {
   groupId: string;
   externalMessageId: string;
   senderId: string;
+  senderName?: string;
+  mentionTargetIds?: readonly string[];
   normalizedText: string;
   occurredAt: string;
   resourceId?: string;
@@ -45,6 +47,8 @@ export interface ChannelMessageRecord {
   groupId: string;
   externalMessageId: string;
   senderId: string;
+  senderName: string | null;
+  mentionTargetIds: string[];
   normalizedText: string;
   sourceClass: string;
   occurredAt: string;
@@ -58,6 +62,8 @@ export interface ChannelMessageSearchParams {
   /** Restricts the candidate pool to these source classes before anything is loaded. */
   sourceClasses?: readonly string[];
   query?: string;
+  senderQuery?: string;
+  mentionedUserId?: string;
   since?: string;
   until?: string;
   limit?: number;
@@ -96,12 +102,41 @@ export class ChannelArchiveStore implements RetrievalCandidateStore {
 
     return this.db.transaction(async (tx) => {
       const existing = await tx.execute({
-        sql: "SELECT id FROM channel_messages WHERE dedup_key = ?",
+        sql: `SELECT id, sender_name, mention_target_ids_json
+              FROM channel_messages WHERE dedup_key = ?`,
         args: [dedupKey],
       });
 
       if (existing.rows[0]) {
-        return stringColumn(existing.rows[0], "id");
+        const row = existing.rows[0];
+        const id = stringColumn(row, "id");
+        const existingName = typeof row.sender_name === "string" ? row.sender_name : undefined;
+        const senderName = input.senderName ?? existingName;
+        const mentionTargetIds =
+          input.mentionTargetIds === undefined
+            ? parsedMentionTargets(row)
+            : normalizedMentionTargets(input.mentionTargetIds);
+        const enriched = { ...input, senderName, mentionTargetIds };
+        await tx.execute({
+          sql: `UPDATE channel_messages
+                SET sender_id = ?, sender_name = ?, mention_target_ids_json = ?,
+                    normalized_text = ?, occurred_at = ?
+                WHERE id = ?`,
+          args: [
+            input.senderId,
+            senderName ?? null,
+            JSON.stringify(mentionTargetIds),
+            input.normalizedText,
+            input.occurredAt,
+            id,
+          ],
+        });
+        await tx.execute({ sql: "DELETE FROM channel_messages_fts WHERE id = ?", args: [id] });
+        await tx.execute({
+          sql: "INSERT INTO channel_messages_fts (segment, id, group_id) VALUES (?, ?, ?)",
+          args: [searchableSegment(enriched), id, input.groupId],
+        });
+        return id;
       }
 
       const id = randomUUID();
@@ -110,9 +145,9 @@ export class ChannelArchiveStore implements RetrievalCandidateStore {
       await tx.execute({
         sql: `INSERT INTO channel_messages (
                 id, channel, connection_id, group_id, external_message_id,
-                sender_id, normalized_text, source_class, occurred_at, ingested_at,
-                resource_id, dedup_key
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                sender_id, sender_name, mention_target_ids_json, normalized_text,
+                source_class, occurred_at, ingested_at, resource_id, dedup_key
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         args: [
           id,
           input.channel,
@@ -120,6 +155,8 @@ export class ChannelArchiveStore implements RetrievalCandidateStore {
           input.groupId,
           input.externalMessageId,
           input.senderId,
+          input.senderName ?? null,
+          JSON.stringify(normalizedMentionTargets(input.mentionTargetIds)),
           input.normalizedText,
           input.sourceClass ?? "history",
           input.occurredAt,
@@ -131,7 +168,7 @@ export class ChannelArchiveStore implements RetrievalCandidateStore {
 
       await tx.execute({
         sql: "INSERT INTO channel_messages_fts (segment, id, group_id) VALUES (?, ?, ?)",
-        args: [segmentForFts(input.normalizedText), id, input.groupId],
+        args: [searchableSegment(input), id, input.groupId],
       });
 
       return id;
@@ -163,6 +200,16 @@ export class ChannelArchiveStore implements RetrievalCandidateStore {
     if (params.until) {
       conditions.push("m.occurred_at <= ?");
       baseArgs.push(params.until);
+    }
+    if (params.senderQuery?.trim()) {
+      conditions.push("(m.sender_id = ? OR lower(m.sender_name) = lower(?))");
+      baseArgs.push(params.senderQuery.trim(), params.senderQuery.trim());
+    }
+    if (params.mentionedUserId?.trim()) {
+      conditions.push(
+        "EXISTS (SELECT 1 FROM json_each(m.mention_target_ids_json) WHERE json_each.value = ?)",
+      );
+      baseArgs.push(params.mentionedUserId.trim());
     }
     const where = conditions.join(" AND ");
 
@@ -216,6 +263,7 @@ export class ChannelArchiveStore implements RetrievalCandidateStore {
     limit?: number;
     since?: string;
     until?: string;
+    metadataFilters?: Readonly<Record<string, string>>;
   }): Promise<RetrievalCandidate[]> {
     const records = await this.searchMessages({
       allowedGroupIds: params.allowedSourceIds,
@@ -223,6 +271,8 @@ export class ChannelArchiveStore implements RetrievalCandidateStore {
       query: params.query,
       since: params.since,
       until: params.until,
+      senderQuery: params.metadataFilters?.sender,
+      mentionedUserId: params.metadataFilters?.mentionedUserId,
       limit: params.limit,
     });
 
@@ -239,6 +289,8 @@ export class ChannelArchiveStore implements RetrievalCandidateStore {
         connectionId: rec.connectionId,
         externalMessageId: rec.externalMessageId,
         senderId: rec.senderId,
+        ...(rec.senderName === null ? {} : { senderName: rec.senderName }),
+        mentionTargetIds: rec.mentionTargetIds,
         sourceClass: rec.sourceClass,
         resourceId: rec.resourceId,
       },
@@ -247,8 +299,47 @@ export class ChannelArchiveStore implements RetrievalCandidateStore {
 }
 
 const COLUMNS = `m.id, m.channel, m.connection_id, m.group_id, m.external_message_id,
-                  m.sender_id, m.normalized_text, m.source_class, m.occurred_at, m.ingested_at,
+                  m.sender_id, m.sender_name, m.mention_target_ids_json, m.normalized_text,
+                  m.source_class, m.occurred_at, m.ingested_at,
                   m.resource_id, m.dedup_key`;
+
+function normalizedMentionTargets(value: readonly string[] | undefined): string[] {
+  return [
+    ...new Set(
+      (value ?? [])
+        .filter((item): item is string => typeof item === "string")
+        .map((item) => item.trim())
+        .filter((item) => item !== "" && item.length <= 128),
+    ),
+  ];
+}
+
+function searchableSegment(input: IngestChannelMessageInput): string {
+  return segmentForFts(
+    [
+      input.normalizedText,
+      input.senderId,
+      input.senderName,
+      ...normalizedMentionTargets(input.mentionTargetIds),
+    ]
+      .filter((value): value is string => typeof value === "string" && value.trim() !== "")
+      .join(" "),
+  );
+}
+
+function parsedMentionTargets(row: Row): string[] {
+  const raw = stringColumn(row, "mention_target_ids_json");
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed)
+      ? normalizedMentionTargets(
+          parsed.filter((value): value is string => typeof value === "string"),
+        )
+      : [];
+  } catch {
+    return [];
+  }
+}
 
 function channelMessageRow(row: Row): ChannelMessageRecord {
   return {
@@ -258,6 +349,8 @@ function channelMessageRow(row: Row): ChannelMessageRecord {
     groupId: stringColumn(row, "group_id"),
     externalMessageId: stringColumn(row, "external_message_id"),
     senderId: stringColumn(row, "sender_id"),
+    senderName: typeof row.sender_name === "string" ? row.sender_name : null,
+    mentionTargetIds: parsedMentionTargets(row),
     normalizedText: stringColumn(row, "normalized_text"),
     sourceClass: stringColumn(row, "source_class"),
     occurredAt: stringColumn(row, "occurred_at"),

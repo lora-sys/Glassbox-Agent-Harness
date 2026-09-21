@@ -99,6 +99,8 @@ async function fixture() {
     groupId: "100",
     externalMessageId: "g100-1",
     senderId: "member-a",
+    senderName: "Ripped",
+    mentionTargetIds: [botId],
     normalizedText: "deploy rollback plan alpha",
     occurredAt: "2026-09-20T10:00:00Z",
   });
@@ -618,6 +620,7 @@ async function groupRunTools(
     store,
     archive,
     isHistoryEnabled: historyEnabled,
+    botIdForConnection: () => botId,
     getContext: () => ({
       caller: { principalId: "owner", scope: group100 },
       runId: accepted.run.id,
@@ -642,6 +645,52 @@ it("gives the model the authorized sender and the original text of a hit", async
     expect(view.results[0]).toMatchObject({ groupId: "100", sender: "member-a", rank: 1 });
     expect(view.results[0]?.text).toContain("plan alpha");
     expect(view.groups).toEqual(["100"]);
+  } finally {
+    await store.close();
+  }
+});
+
+it("supports general sender and mention filters without keyword patches", async () => {
+  const { store, archive } = await fixture();
+  try {
+    const tools = await groupRunTools(store, archive);
+    const tool = toolByName(tools, GROUP_HISTORY_SEARCH_TOOL);
+
+    const byNickname = await callModelVisible(tool, { query: "Ripped" });
+    const nicknameView = JSON.parse(byNickname.text) as {
+      resultStatus: string;
+      results: Array<{ senderName?: string; text: string }>;
+    };
+    expect(nicknameView).toMatchObject({ resultStatus: "matches_found" });
+    expect(nicknameView.results[0]).toMatchObject({
+      senderName: "Ripped",
+      text: "deploy rollback plan alpha",
+    });
+
+    const byMention = await callModelVisible(tool, { mentionsMe: true });
+    const mentionView = JSON.parse(byMention.text) as {
+      resultStatus: string;
+      results: Array<{ senderName?: string }>;
+    };
+    expect(mentionView).toMatchObject({ resultStatus: "matches_found" });
+    expect(mentionView.results[0]).toMatchObject({ senderName: "Ripped" });
+  } finally {
+    await store.close();
+  }
+});
+
+it("labels an empty result as window-limited rather than proving absence", async () => {
+  const { store, archive } = await fixture();
+  try {
+    const tools = await groupRunTools(store, archive);
+    const { text } = await callModelVisible(toolByName(tools, GROUP_HISTORY_SEARCH_TOOL), {
+      query: "definitely-missing",
+    });
+    expect(JSON.parse(text)).toMatchObject({
+      resultStatus: "no_matches_in_searched_window",
+      guidance: expect.stringContaining("does not prove"),
+      results: [],
+    });
   } finally {
     await store.close();
   }

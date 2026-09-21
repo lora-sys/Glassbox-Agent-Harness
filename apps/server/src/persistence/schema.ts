@@ -22,6 +22,11 @@ export const schemaV7Statements = [
 
 export const schemaV7Migration = [...schemaV7Statements];
 
+export const schemaV8Migration = [
+  `ALTER TABLE channel_messages ADD COLUMN sender_name TEXT`,
+  `ALTER TABLE channel_messages ADD COLUMN mention_target_ids_json TEXT NOT NULL DEFAULT '[]'`,
+];
+
 // SQL batch/index pattern adapted from trajectory-panel. See SOURCES.md.
 export const schema = [
   `CREATE TABLE agents (id TEXT PRIMARY KEY, created_at TEXT NOT NULL)`,
@@ -57,6 +62,7 @@ export const schema = [
   `CREATE INDEX conversation_locations_conv ON conversation_locations(conversation_id)`,
   `ALTER TABLE tasks ADD COLUMN origin_scope_key TEXT`,
   ...schemaV7Statements,
+  ...schemaV8Migration,
 ];
 
 export const schemaV5Migration = ["ALTER TABLE tasks ADD COLUMN origin_scope_key TEXT"];

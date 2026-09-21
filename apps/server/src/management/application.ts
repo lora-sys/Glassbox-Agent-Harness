@@ -466,6 +466,7 @@ export class ManagementApplication {
         syncGroup: async (groupId, context) => {
           await this.syncGroupHistory(context.caller.scope.connectionId, groupId);
         },
+        botIdForConnection: (connectionId) => this.channels.resolve(connectionId).config.botId,
         // Safe retrieval evidence: Run, Resource, source kind and id, mode, score, rank and
         // matched terms — never a snippet or protected message text.
         recordEvidence: async (evidence, context) => {
@@ -724,8 +725,11 @@ export class ManagementApplication {
         await this.ingressReady;
         await connectionReady;
         if (!this.accepting || !connectionAccepted || signal.aborted) return;
-        if (message.scope.chatType === "group")
-          await this.provisionAddressedGroupMember(configured, message.scope);
+        if (message.scope.chatType === "group") {
+          // Group assignments can change while the socket stays connected. Resolve the
+          // current profile instead of preserving the connect-time allowlist in this closure.
+          await this.provisionAddressedGroupMember(this.channels.resolve(id), message.scope);
+        }
         const control = /^\/(status|cancel)\s+([a-zA-Z0-9-]{1,80})\s*$/u.exec(message.text);
         if (control) {
           const caller = await this.store.identities.resolve(message.scope);
@@ -1225,8 +1229,14 @@ export class ManagementApplication {
         lastAssignedOwner = (await this.assignedOwners(configured, input.groupId)).length === 0;
         if (lastAssignedOwner) {
           await this.store.authorization.revokeResource(groupResource);
-          for (const scope of groupScopes)
-            await this.revokeGroupScopeAuthority(configured, groupResource, scope);
+          // Dynamic group members are not part of the static profile. Revoke the whole
+          // Channel location so no sender-specific Agent or Tool grant survives disable.
+          await this.store.authorization.revokeLocationScopes({
+            connectionId: configured.config.connectionId,
+            botId: configured.config.botId,
+            chatType: "group",
+            chatId: input.groupId,
+          });
         }
       }
 
@@ -1436,6 +1446,8 @@ export class ManagementApplication {
           groupId,
           externalMessageId: message.messageId,
           senderId: message.senderId,
+          senderName: message.senderName,
+          mentionTargetIds: message.mentionTargetIds,
           normalizedText: message.text,
           occurredAt: message.occurredAt,
         });
