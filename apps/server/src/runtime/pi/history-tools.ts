@@ -109,12 +109,57 @@ export interface HistorySearchDetails {
 }
 
 /**
+ * Why a walk of one group's real history ended where it did.
+ *
+ * The archive answers a search out of what it has already stored, and what it has stored is
+ * whatever previous walks managed to pull. So a search has two windows, not one: the
+ * candidates the archive held, and the history the archive itself had been filled with. A
+ * walk that stopped at `page_bound_reached` leaves the second one open, and an answer that
+ * reads only the first will call a group empty that was never read to its end.
+ */
+export type HistorySyncStop =
+  /** The provider had no older page to give, so the walk saw the source from its newest end back. */
+  | "end_of_source"
+  /** The walk reached the `since` it was given; older history was deliberately not fetched. */
+  | "since_bound_reached"
+  /** The walk hit its own page bound with more history still available. */
+  | "page_bound_reached"
+  /** The provider kept returning the same cursor, so paging could not advance. */
+  | "cursor_stuck"
+  /** The connection for this group is not registered, so nothing could be read. */
+  | "provider_unavailable"
+  /** The provider rejected the read. */
+  | "provider_failed"
+  /** The provider's answer could not be interpreted, so the walk's reach is unknown. */
+  | "provider_unknown";
+
+/**
+ * What one group's history walk reached, reported by the sync that performed it.
+ *
+ * `stop` alone would be ambiguous without the count: `end_of_source` after one page means the
+ * group is small, while the same stop after five means the walk read as far as it was allowed
+ * and found the end. Both are recorded so a reader can tell a complete walk from a truncated
+ * one that happened to stop on the same reason.
+ */
+export interface HistorySyncOutcome {
+  /** Pages of real history this walk read. */
+  pagesWalked: number;
+  /** Why it stopped. */
+  stop: HistorySyncStop;
+}
+
+/**
  * How much of the searched window this call actually saw.
  *
  * A retrieval result is not a census. The requested limit, the candidate ceiling and the
  * cross-group per-source cap each cut candidates, and each produces the same empty tail as
  * a genuinely exhausted window. Reporting which bound applied is what lets an answer say
  * "no match in what I looked at" instead of "this never happened".
+ *
+ * The archive is not a census either. It holds what previous walks pulled from the provider,
+ * so a search can read every candidate it has and still not have looked at the group. The
+ * per-source `sync` and the aggregate `sourceLimits` report that second window, and
+ * `coverage` is `complete` only when both are exhausted.
  */
 export interface HistorySearchCoverage {
   /** The limit the caller asked for. */
@@ -152,19 +197,35 @@ export interface HistorySearchCoverage {
    */
   droppedByExactTerm: number;
   /**
-   * `complete` — every candidate the archive held was returned.
-   * `partial` — a bound cut candidates, so more may exist.
+   * `complete` — every candidate the archive held was returned, out of a source the walk had
+   * read to its end.
+   * `partial` — a bound cut candidates, or the source itself was not read to its end, so more
+   * may exist.
    * `unknown` — no group was searched, so nothing about the world was learned.
    */
   coverage: "complete" | "partial" | "unknown";
   /** Authorized groups this search actually read. */
   groupsSearched: number;
+  /**
+   * The source bounds that stopped a walk short of the end of its group, deduplicated.
+   *
+   * Empty when every searched group's walk reached the end of its source. `sync_unreported`
+   * stands for a group whose walk reported nothing — a surface that wires no sync, or one that
+   * returned no outcome — which is silence about the source rather than the end of it.
+   *
+   * Kept separate from `truncationReasons`: that list is about candidates this search read and
+   * dropped, and folding the source window into it would say a search dropped something it
+   * never fetched.
+   */
+  sourceLimits: Array<HistorySyncStop | "sync_unreported">;
   /** Per-group coverage, ordered by group id so the evidence is comparable across Runs. */
   sourceCoverage: Array<{
     groupId: string;
     returned: number;
     considered: number;
     capped: boolean;
+    /** How far this group's history walk reached, or `unreported` when it said nothing. */
+    sync: HistorySyncOutcome | "unreported";
   }>;
   /** When the search ran. Distinct from when the matched messages were sent. */
   observedAt: string;
@@ -187,16 +248,24 @@ export interface HistorySearchCoverage {
 const CROSS_GROUP_PER_SOURCE_CAP = DEFAULT_PER_SOURCE_CAP;
 
 /**
- * Assembles the one coverage record from both bounds that can cut a result.
+ * Assembles the one coverage record from every bound that can cut a result.
  *
  * The retriever bounds how much it fetches and keeps; the bounded Context bounds what it
- * keeps per source. Neither alone describes the window, so the reported reasons are the
- * union and `coverage` is `complete` only when neither dropped anything.
+ * keeps per source; and the source walk bounds how much of the group the archive holds at
+ * all. None alone describes the window, so the reported reasons are the union of the first
+ * two and `coverage` is `complete` only when neither dropped anything and every source was
+ * read to its end.
+ *
+ * The per-source list is built from the groups that were searched, not from the groups that
+ * returned candidates. A group that produced nothing is exactly the case a negative answer
+ * turns on, so it has to appear in the evidence with its own walk outcome rather than be
+ * absent from it.
  */
 function historyCoverage(input: {
   retrieval: RetrievalCoverage;
   bounded: BoundedContext;
-  groupsSearched: number;
+  searchedGroupIds: readonly string[];
+  syncs: ReadonlyMap<string, HistorySyncOutcome>;
   observedAt: string;
 }): HistorySearchCoverage {
   const reasons = new Set<TruncationReason>(input.bounded.truncationReasons);
@@ -216,6 +285,31 @@ function historyCoverage(input: {
     );
   if (cappedGroups.length > 0) continuation.cappedGroups = cappedGroups;
 
+  const boundedBySource = new Map(input.bounded.sources.map((source) => [source.sourceId, source]));
+  const sourceCoverage: HistorySearchCoverage["sourceCoverage"] = input.searchedGroupIds
+    .map((groupId) => {
+      const source = boundedBySource.get(groupId);
+      return {
+        groupId,
+        returned: source?.returned ?? 0,
+        considered: source?.considered ?? 0,
+        capped: source?.capped ?? false,
+        sync: input.syncs.get(groupId) ?? ("unreported" as const),
+      };
+    })
+    .sort((left, right) => left.groupId.localeCompare(right.groupId));
+  // `end_of_source` is the one stop that leaves nothing open, so it is not a limit. Every
+  // other stop — including a walk that reported nothing at all — is.
+  const sourceLimits = [
+    ...new Set(
+      sourceCoverage.map((source) =>
+        source.sync === "unreported" ? ("sync_unreported" as const) : source.sync.stop,
+      ),
+    ),
+  ]
+    .filter((stop) => stop !== "end_of_source")
+    .sort();
+
   return {
     requestedLimit: input.retrieval.requestedLimit,
     returned: input.retrieval.returned,
@@ -225,16 +319,15 @@ function historyCoverage(input: {
     perSourceCap: input.bounded.bounds.perSourceCap,
     exactTerms: [...input.retrieval.exactTerms],
     droppedByExactTerm: input.retrieval.droppedByExactTerm,
-    coverage: input.groupsSearched === 0 ? "unknown" : truncated ? "partial" : "complete",
-    groupsSearched: input.groupsSearched,
-    sourceCoverage: [...input.bounded.sources]
-      .map((source) => ({
-        groupId: source.sourceId,
-        returned: source.returned,
-        considered: source.considered,
-        capped: source.capped,
-      }))
-      .sort((left, right) => left.groupId.localeCompare(right.groupId)),
+    coverage:
+      input.searchedGroupIds.length === 0
+        ? "unknown"
+        : truncated || sourceLimits.length > 0
+          ? "partial"
+          : "complete",
+    groupsSearched: input.searchedGroupIds.length,
+    sourceLimits,
+    sourceCoverage,
     observedAt: input.observedAt,
     ...(Object.keys(continuation).length === 0 ? {} : { continuation }),
   };
@@ -336,16 +429,26 @@ export function projectHistorySearch(details: HistorySearchDetails): HistorySear
  * match can still compose a sender, a time and an original text for it. The guidance says
  * which way the result came out, so "found" and "not found" are both observations rather
  * than something the model decided.
+ *
+ * The partial case names *which* window is short, because the two lead to different next
+ * steps: a cut candidate set can be reached by raising the limit, while a source the walk
+ * never finished cannot be reached at all from here. `coverage.sourceLimits` carries the
+ * reason in structured form for Trace; the sentence says only which window it applies to.
  */
 function historyGuidance(details: HistorySearchDetails): string {
   const { coverage } = details;
   const terms = coverage.exactTerms.map((term) => `"${term}"`).join(", ");
   if (coverage.coverage === "unknown")
     return "No group was searched, so nothing about the world was learned. This is not a negative result.";
+  const sourceOpen = coverage.sourceLimits.length > 0;
   const window =
     coverage.coverage === "complete"
       ? " The searched window was exhausted, which does not prove the event never happened outside it."
-      : " Only part of the window was searched, which does not prove the event never happened.";
+      : coverage.truncated && sourceOpen
+        ? " Only part of the window was searched, and the source itself was not read to its end, which does not prove the event never happened."
+        : coverage.truncated
+          ? " Only part of the window was searched, which does not prove the event never happened."
+          : " Only part of the source was searched, which does not prove the event never happened.";
   if (details.resultStatus === "matches_found") {
     const exact =
       terms === ""
@@ -467,8 +570,15 @@ export function createHistoryTools(options: {
    * Pulls recent real history for an already-authorized group into the archive.
    * Only ever invoked after the `history:read` gate has returned ALLOW, so protected
    * text is never fetched for a group the caller may not read.
+   *
+   * It returns how far it got, because the archive is not the group: a walk that stopped at
+   * its page bound leaves history the search cannot see, and a search that reported the
+   * window as exhausted anyway would let an answer say the message is not there.
    */
-  syncGroup?: (groupId: string, context: ProtectedToolContext) => Promise<void>;
+  syncGroup?: (
+    groupId: string,
+    context: ProtectedToolContext,
+  ) => Promise<HistorySyncOutcome | undefined>;
   /** Resolves the bot Channel identity used by the structured `mentionsMe` filter. */
   botIdForConnection?: (connectionId: string) => string | undefined;
   /**
@@ -532,7 +642,13 @@ export function createHistoryTools(options: {
       if (decision.decision === "ALLOW") searched.push(groupId);
     }
 
-    for (const groupId of searched) await options.syncGroup?.(groupId, context);
+    // The walk's own report is collected per group, so a cross-group answer can say which
+    // source is short rather than only that one of them is.
+    const syncs = new Map<string, HistorySyncOutcome>();
+    for (const groupId of searched) {
+      const outcome = await options.syncGroup?.(groupId, context);
+      if (outcome) syncs.set(groupId, outcome);
+    }
 
     const botId = params.mentionsMe
       ? options.botIdForConnection?.(caller.scope.connectionId)
@@ -587,7 +703,8 @@ export function createHistoryTools(options: {
     const coverage = historyCoverage({
       retrieval: retrieval.coverage,
       bounded,
-      groupsSearched: searched.length,
+      searchedGroupIds: searched,
+      syncs,
       observedAt: new Date().toISOString(),
     });
     const details: HistorySearchDetails = {

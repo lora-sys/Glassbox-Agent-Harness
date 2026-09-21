@@ -47,6 +47,7 @@ import {
   historyToolEligibility,
   OWNER_HISTORY_ACTION,
   OWNER_HISTORY_RESOURCE,
+  type HistorySyncOutcome,
 } from "../runtime/pi/history-tools.js";
 import {
   availableCapabilityToolNames,
@@ -501,9 +502,10 @@ export class ManagementApplication {
         archive: this.archive,
         getContext,
         isHistoryEnabled: (connectionId, groupId) => this.isHistoryEnabled(connectionId, groupId),
-        syncGroup: async (groupId, context) => {
-          await this.syncGroupHistory(context.caller.scope.connectionId, groupId);
-        },
+        // The walk's outcome is passed straight through: it is what the search reports as its
+        // source coverage, and only `end_of_source` lets an answer say the group was read.
+        syncGroup: (groupId, context) =>
+          this.syncGroupHistory(context.caller.scope.connectionId, groupId),
         botIdForConnection: (connectionId) => this.channels.resolve(connectionId).config.botId,
         // Safe retrieval evidence: Run, Resource, source kind and id, mode, score, rank and
         // matched terms — never a snippet or protected message text.
@@ -1531,24 +1533,40 @@ export class ManagementApplication {
    * never loop forever. Ingest is deduped by (channel, connection, group, external message
    * id) and by message id within one walk, so repeated syncs are idempotent and never
    * create Runs.
+   *
+   * It returns why it stopped, because the caller reports that as the search's source
+   * coverage. Only `end_of_source` means the archive now holds this group back to its
+   * beginning; every other stop leaves history the search cannot see, and a caller that
+   * could not tell those apart would report the window as exhausted either way.
    */
   private async syncGroupHistory(
     connectionId: string,
     groupId: string,
     options: { maxPages?: number; since?: string; until?: string } = {},
-  ): Promise<void> {
+  ): Promise<HistorySyncOutcome> {
     const connection = this.connections.get(connectionId);
-    if (!connection) return;
+    if (!connection) return { pagesWalked: 0, stop: "provider_unavailable" };
     const maxPages = Math.max(1, Math.min(options.maxPages ?? HISTORY_SYNC_MAX_PAGES, 20));
     const seen = new Set<string>();
     let cursor: string | undefined;
+    let pagesWalked = 0;
     for (let page = 0; page < maxPages; page += 1) {
       const result = await connection.getGroupHistory({
         groupId,
         cursor,
         count: HISTORY_SYNC_PAGE_SIZE,
       });
-      if (result.status !== "ok") break;
+      if (result.status !== "ok")
+        return {
+          pagesWalked,
+          stop:
+            result.status === "unknown"
+              ? "provider_unknown"
+              : result.code === "not_connected"
+                ? "provider_unavailable"
+                : "provider_failed",
+        };
+      pagesWalked += 1;
       let reachedBound = false;
       for (const message of result.messages) {
         if (options.since && message.occurredAt < options.since) {
@@ -1570,11 +1588,25 @@ export class ManagementApplication {
           occurredAt: message.occurredAt,
         });
       }
+      // The bound is checked before the cursor, because it is the reason the walk stopped:
+      // a page that reached `since` and also carried a next cursor was still stopped by the
+      // caller's bound, and reporting it as the end of the source would overstate the walk.
       const next = result.nextCursor;
-      if (next === undefined || next === cursor) break;
+      // No usable sequence to continue from. The adapter omits the cursor both for a page
+      // that carried nothing and for a page that carried records it could not sequence, and
+      // only the first of those is the provider saying it has nothing older. Calling the
+      // second one the end of the source is how a walk that stalled would let a search
+      // report the group as fully read.
+      if (next === undefined)
+        return {
+          pagesWalked,
+          stop: result.messages.length === 0 ? "end_of_source" : "provider_unknown",
+        };
+      if (next === cursor) return { pagesWalked, stop: "cursor_stuck" };
       cursor = next;
-      if (reachedBound) break;
+      if (reachedBound) return { pagesWalked, stop: "since_bound_reached" };
     }
+    return { pagesWalked, stop: "page_bound_reached" };
   }
 
   private async manageGroup(

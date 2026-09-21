@@ -25,6 +25,7 @@ import {
   ManagementApplication,
 } from "./application.js";
 import { PiRunExecutionAdapter } from "../runtime/pi/run-adapter.js";
+import type { HistorySyncOutcome } from "../runtime/pi/history-tools.js";
 import type { ToolDescriptor, ToolExclusionReason } from "../runtime/pi/tool-plane.js";
 import { TOOL_DESCRIPTORS } from "../runtime/pi/tool-plane.js";
 import type { PiRuntimeAdapter } from "../runtime/pi/types.js";
@@ -590,7 +591,7 @@ describe("bounded authorized history synchronization", () => {
         connectionId: string,
         groupId: string,
         options?: { maxPages?: number; since?: string },
-      ): Promise<void>;
+      ): Promise<HistorySyncOutcome>;
     };
   const storedIds = async (app: ManagementApplication) =>
     (await app.archive.searchMessages({ allowedGroupIds: ["10003"], limit: 50 }))
@@ -639,6 +640,88 @@ describe("bounded authorized history synchronization", () => {
       since: new Date((1_758_000_000 + 9) * 1000).toISOString(),
     });
     expect(await storedIds(f.app)).toEqual(["10", "11", "12", "9"]);
+  });
+
+  it("reports how much of the source the walk reached", async () => {
+    const f = await fixture(async () => ({ status: "succeeded", text: "ok" }), {
+      history: paged(),
+    });
+
+    // Twelve records at three per page. Two pages is the bound, so older history exists that
+    // this sync never read. Reporting that walk as an exhausted source is what let a search
+    // call a partial window "the whole history" and answer a question the messages it never
+    // reached were the answer to.
+    expect(await sync(f.app).syncGroupHistory("fixture", "10003", { maxPages: 2 })).toEqual({
+      pagesWalked: 2,
+      stop: "page_bound_reached",
+    });
+
+    // More pages than the fixture holds, so the walk ends because the provider said there is
+    // no older page. This is the one case in which the archive really is the source.
+    expect(await sync(f.app).syncGroupHistory("fixture", "10003", { maxPages: 10 })).toEqual({
+      pagesWalked: 5,
+      stop: "end_of_source",
+    });
+  });
+
+  it("names the bound a walk stopped on instead of calling it the end of the source", async () => {
+    const f = await fixture(async () => ({ status: "succeeded", text: "ok" }), {
+      history: paged(),
+    });
+    // The caller asked for everything from sequence 9 onwards, and the walk passed that bound.
+    // The archived window is the whole range the question is about, which is a different
+    // statement from "the group has no older history" — and the one that is true here.
+    expect(
+      await sync(f.app).syncGroupHistory("fixture", "10003", {
+        maxPages: 10,
+        since: new Date((1_758_000_000 + 9) * 1000).toISOString(),
+      }),
+    ).toEqual({ pagesWalked: 2, stop: "since_bound_reached" });
+
+    // A provider that keeps returning the same cursor has not said there is no older page,
+    // so what follows it stays unknown rather than becoming the end of the source.
+    const stuck = await fixture(async () => ({ status: "succeeded", text: "ok" }), {
+      history: () => [message(5), message(5)],
+    });
+    expect(await sync(stuck.app).syncGroupHistory("fixture", "10003", { maxPages: 10 })).toEqual({
+      pagesWalked: 2,
+      stop: "cursor_stuck",
+    });
+  });
+
+  it("does not call a page it cannot page past the end of the source", async () => {
+    // Records the provider sent without a usable sequence: the walk can read them and cannot
+    // continue from them. That is not the provider saying it has nothing older, so what
+    // follows stays unknown instead of becoming the end of the source.
+    const unsequenced = () => [
+      {
+        message_id: 7,
+        real_id: 7,
+        time: 1_758_000_000 + 7,
+        user_id: 10004,
+        group_id: 10003,
+        message_type: "group",
+        sender: { user_id: 10004, nickname: "Visitor" },
+        message: [{ type: "text", data: { text: "msg-7" } }],
+      },
+    ];
+    const f = await fixture(async () => ({ status: "succeeded", text: "ok" }), {
+      history: unsequenced,
+    });
+    expect(await sync(f.app).syncGroupHistory("fixture", "10003", { maxPages: 10 })).toEqual({
+      pagesWalked: 1,
+      stop: "provider_unknown",
+    });
+
+    // And the caller's own bound does not get to name this page either: the provider is the
+    // one that left the walk's reach unknown, and a stop that reads as the caller's choice
+    // would hide a stalled walk behind a deliberate one.
+    expect(
+      await sync(f.app).syncGroupHistory("fixture", "10003", {
+        maxPages: 10,
+        since: new Date((1_758_000_000 + 10) * 1000).toISOString(),
+      }),
+    ).toEqual({ pagesWalked: 1, stop: "provider_unknown" });
   });
 });
 

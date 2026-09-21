@@ -10,6 +10,7 @@ import {
   OWNER_HISTORY_RESOURCE,
   OWNER_HISTORY_SEARCH_TOOL,
   type HistoryRetrievalEvidence,
+  type HistorySyncOutcome,
 } from "./history-tools.js";
 
 const connectionId = "qq";
@@ -543,6 +544,7 @@ it("keeps the per-source cap across groups and names it in the coverage", async 
       store,
       archive,
       isHistoryEnabled: historyEnabled,
+      syncGroup: sourceExhausted,
       getContext: () => ({
         caller: { principalId: "owner", scope: ownerPrivate },
         runId: accepted.run.id,
@@ -560,11 +562,13 @@ it("keeps the per-source cap across groups and names it in the coverage", async 
         truncated: boolean;
         truncationReasons: string[];
         coverage: string;
+        sourceLimits: string[];
         sourceCoverage: Array<{
           groupId: string;
           returned: number;
           considered: number;
           capped: boolean;
+          sync: HistorySyncOutcome | "unreported";
         }>;
         continuation?: { cappedGroups?: string[] };
       };
@@ -577,11 +581,26 @@ it("keeps the per-source cap across groups and names it in the coverage", async 
       truncated: true,
       truncationReasons: ["per_source_cap_reached"],
       coverage: "partial",
+      // Both walks reached the end of their source, so the only thing this search did not
+      // see is the candidate the cap cut — the source window is not the reason here.
+      sourceLimits: [],
       continuation: { cappedGroups: ["100"] },
     });
     expect(view.coverage.sourceCoverage).toEqual([
-      { groupId: "100", returned: 3, considered: 6, capped: true },
-      { groupId: "200", returned: 1, considered: 1, capped: false },
+      {
+        groupId: "100",
+        returned: 3,
+        considered: 6,
+        capped: true,
+        sync: { pagesWalked: 1, stop: "end_of_source" },
+      },
+      {
+        groupId: "200",
+        returned: 1,
+        considered: 1,
+        capped: false,
+        sync: { pagesWalked: 1, stop: "end_of_source" },
+      },
     ]);
   } finally {
     await store.close();
@@ -620,6 +639,88 @@ it("says the window is unknown rather than empty when no group was searched", as
       considered: 0,
       groupsSearched: 0,
     });
+  } finally {
+    await store.close();
+  }
+});
+
+it("says only part of the source was searched when the walk stopped short of its end", async () => {
+  const { store, archive } = await fixture();
+  try {
+    const tools = await groupRunTools(store, archive, async () => ({
+      pagesWalked: 5,
+      stop: "page_bound_reached",
+    }));
+    const { text } = await callModelVisible(toolByName(tools, GROUP_HISTORY_SEARCH_TOOL), {
+      query: "deploy rollback",
+    });
+    const view = JSON.parse(text) as {
+      results: unknown[];
+      coverage: { coverage: string; truncated: boolean; sourceLimits: string[] };
+      guidance: string;
+    };
+
+    // The archive answered completely — nothing was cut — but the archive had itself only
+    // been read up to the sync's page bound. A group whose history continues past that bound
+    // is a group this search never looked at, so "no match" here is a statement about the
+    // part that was read and nothing more. This is the window that a bare `truncated: false`
+    // used to hide: the search read everything it had, from a source it had not finished.
+    expect(view.results).toHaveLength(1);
+    expect(view.coverage.truncated).toBe(false);
+    expect(view.coverage).toMatchObject({
+      coverage: "partial",
+      sourceLimits: ["page_bound_reached"],
+    });
+    expect(view.guidance).toContain("Only part of the source was searched");
+    expect(view.guidance).toContain("does not prove");
+  } finally {
+    await store.close();
+  }
+});
+
+it("does not claim the source was exhausted when no walk reported on it", async () => {
+  const { store, archive } = await fixture();
+  try {
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: groupResourceId("100"),
+      action: "history:read",
+      scope: group100,
+      effect: "allow",
+    });
+    const accepted = await accept(store, group100);
+    // A surface that wires no sync at all, or one whose sync returns nothing, has not told
+    // this search how much of the source it holds. Silence is not the end of the source.
+    const tools = createHistoryTools({
+      store,
+      archive,
+      isHistoryEnabled: historyEnabled,
+      getContext: () => ({
+        caller: { principalId: "owner", scope: group100 },
+        runId: accepted.run.id,
+        conversationId: accepted.conversation.id,
+      }),
+    });
+    const { text } = await callModelVisible(toolByName(tools, GROUP_HISTORY_SEARCH_TOOL), {
+      query: "deploy rollback",
+    });
+    const view = JSON.parse(text) as {
+      coverage: {
+        coverage: string;
+        truncated: boolean;
+        sourceLimits: string[];
+        sourceCoverage: Array<{ groupId: string; sync: HistorySyncOutcome | "unreported" }>;
+      };
+      guidance: string;
+    };
+
+    expect(view.coverage.truncated).toBe(false);
+    expect(view.coverage).toMatchObject({
+      coverage: "partial",
+      sourceLimits: ["sync_unreported"],
+      sourceCoverage: [{ groupId: "100", sync: "unreported" }],
+    });
+    expect(view.guidance).toContain("Only part of the source was searched");
   } finally {
     await store.close();
   }
@@ -698,6 +799,7 @@ it("records the coverage it reported in the retrieval evidence", async () => {
       archive,
       isHistoryEnabled: historyEnabled,
       recordEvidence: evidence,
+      syncGroup: sourceExhausted,
       getContext: () => ({
         caller: { principalId: "owner", scope: group100 },
         runId: accepted.run.id,
@@ -850,10 +952,21 @@ async function callModelVisible(
   };
 }
 
-/** One group Run that may read its own group's history. */
+/**
+ * One group Run that may read its own group's history.
+ *
+ * The sync reports a walk that reached the end of the source, because that is what production
+ * wires: the Tool's own coverage now depends on how much of the source the walk reached, so a
+ * fixture that stayed silent would report every search as partial for a reason the test is not
+ * about. `syncGroup` overrides it for the tests that are about the source window.
+ */
 async function groupRunTools(
   store: Store,
   archive: Awaited<ReturnType<typeof fixture>>["archive"],
+  syncGroup: (groupId: string) => Promise<HistorySyncOutcome | undefined> = async () => ({
+    pagesWalked: 1,
+    stop: "end_of_source",
+  }),
 ) {
   await store.authorization.grant({
     principalId: "owner",
@@ -868,6 +981,7 @@ async function groupRunTools(
     archive,
     isHistoryEnabled: historyEnabled,
     botIdForConnection: () => botId,
+    syncGroup,
     getContext: () => ({
       caller: { principalId: "owner", scope: group100 },
       runId: accepted.run.id,
@@ -875,6 +989,12 @@ async function groupRunTools(
     }),
   });
 }
+
+/** The sync a fully-read source reports, for the tests whose subject is something else. */
+const sourceExhausted = async (): Promise<HistorySyncOutcome> => ({
+  pagesWalked: 1,
+  stop: "end_of_source",
+});
 
 it("gives the model the authorized sender and the original text of a hit", async () => {
   const { store, archive } = await fixture();
@@ -1272,6 +1392,7 @@ it("records the exact terms it required in the retrieval evidence", async () => 
       store,
       archive,
       isHistoryEnabled: historyEnabled,
+      syncGroup: sourceExhausted,
       getContext: () => ({
         caller: { principalId: "owner", scope: group100 },
         runId: accepted.run.id,
