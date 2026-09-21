@@ -6,6 +6,7 @@ import type {
   MemorySubject,
   MemoryType,
 } from "./contracts.js";
+import { createLearningId } from "./ids.js";
 
 export interface AuthorizedMemorySourceItem {
   channel: "qq";
@@ -59,7 +60,7 @@ export function candidateFromAuthorizedSource(input: {
   statement: string;
 }): Omit<MemoryCandidate, "createdAt" | "status"> {
   return {
-    candidateId: randomUUID(),
+    candidateId: createLearningId("candidate"),
     candidateKind: "derived",
     subject: input.subject,
     scope: input.scope,

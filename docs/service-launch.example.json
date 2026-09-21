@@ -10,6 +10,7 @@
     "args": [
       "C:\\absolute\\path\\to\\QQ.exe",
       "C:\\absolute\\path\\to\\NapCatWinBootHook.dll",
+      "-q",
       "123456789"
     ],
     "cwd": "C:\\absolute\\path\\to\\napcat",
@@ -20,7 +21,8 @@
       "NAPCAT_INJECT_PATH": "C:\\absolute\\path\\to\\napcat\\NapCatWinBootHook.dll",
       "NAPCAT_LAUNCHER_PATH": "C:\\absolute\\path\\to\\napcat\\NapCatWinBootMain.exe",
       "NAPCAT_MAIN_PATH": "C:\\absolute\\path\\to\\napcat\\napcat.mjs",
-      "NAPCAT_DISABLE_MULTI_PROCESS": "1"
+      "NAPCAT_DISABLE_MULTI_PROCESS": "1",
+      "NAPCAT_QUICK_ACCOUNT": "123456789"
     }
   },
   "glassbox": {

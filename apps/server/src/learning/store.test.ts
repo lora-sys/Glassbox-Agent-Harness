@@ -139,6 +139,10 @@ describe("P4A durable learning truth", () => {
       retentionFactors: { reliability: 1, goalRelevance: 0.8, taskUtility: 0.7 },
     });
     expect(written.lifecycleState).toBe("active");
+    expect(written.memoryId).toMatch(/^memory_[0-9a-f]{32}$/u);
+    expect((await store.learning.listCandidates(context))[0]?.candidateId).toMatch(
+      /^candidate_[0-9a-f]{32}$/u,
+    );
     expect(written.evidence[0]?.kind).toBe("user_confirmation");
 
     await store.close();

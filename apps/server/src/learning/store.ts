@@ -19,6 +19,7 @@ import type {
   RetentionFactors,
 } from "./contracts.js";
 import { candidateKinds, feedbackSignals, memoryTypes, mergeStrategies } from "./contracts.js";
+import { createLearningId } from "./ids.js";
 import { normalizedRetentionFactors, retentionValue } from "./retention.js";
 
 export const OWNER_MEMORY_RESOURCE = "owner-memory";
@@ -325,7 +326,7 @@ export class LearningStore {
     validateCandidate(input);
     const candidate: MemoryCandidate = {
       ...structuredClone(input),
-      candidateId: input.candidateId ?? randomUUID(),
+      candidateId: input.candidateId ?? createLearningId("candidate"),
       statement: input.statement.trim(),
       status: "pending",
       createdAt: new Date().toISOString(),
@@ -496,7 +497,7 @@ export class LearningStore {
       ...factors,
     });
     return {
-      memoryId: randomUUID(),
+      memoryId: createLearningId("memory"),
       subject: candidate.subject,
       scope: candidate.scope,
       type: candidate.proposedType,

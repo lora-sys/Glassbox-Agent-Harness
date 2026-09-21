@@ -87,8 +87,15 @@ it("exposes Owner-only governed Memory operations and rechecks revoked write aut
       status: "pending",
       scope: { type: "project", projectId: "glassbox" },
     });
+    expect(proposed.details).not.toHaveProperty("source");
+    expect(proposed.details).toMatchObject({
+      sourceEvidence: [{ kind: "system_inference", trustLevel: "low" }],
+    });
+    expect(proposed.details).not.toHaveProperty("sourceEvidence.0.evidenceId");
+    expect(proposed.details).not.toHaveProperty("sourceEvidence.0.ref");
     expect(await store.learning.listMemories({ caller })).toHaveLength(0);
     const candidateId = (proposed.details as { candidateId: string }).candidateId;
+    expect(candidateId).toMatch(/^candidate_[0-9a-f]{32}$/u);
     const confirmation = await store.conversations.acceptIncoming({
       agentId: "personal",
       scope: caller.scope,
@@ -106,6 +113,10 @@ it("exposes Owner-only governed Memory operations and rechecks revoked write aut
     );
     expect(promoted.details).toMatchObject({ lifecycleState: "active" });
     const memoryId = (promoted.details as { memoryId: string }).memoryId;
+    expect(memoryId).toMatch(/^memory_[0-9a-f]{32}$/u);
+    expect(promoted.details).not.toHaveProperty("evidence");
+    expect(promoted.details).not.toHaveProperty("evidenceRefs");
+    expect(promoted.details).not.toHaveProperty("assertedBy");
     const proposedReplacement = await tool!.execute(
       "model-supersede",
       {

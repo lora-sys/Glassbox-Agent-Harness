@@ -5,6 +5,7 @@ import { QQ_SOURCE_CLASSES, type QqSourceClass } from "@glassbox/contracts";
 import type { FeedbackSignal, GlassboxMemoryScope, MemoryType } from "../../learning/contracts.js";
 import { feedbackSignals } from "../../learning/contracts.js";
 import { MemoryConsolidator } from "../../learning/consolidation.js";
+import { internalLearningId, publicLearningId } from "../../learning/ids.js";
 import { candidateFromAuthorizedSource } from "../../learning/source.js";
 import {
   MEMORY_GOVERN_ACTION,
@@ -117,7 +118,42 @@ function authorizationAction(input: OwnerMemoryToolInput): string {
   return MEMORY_GOVERN_ACTION;
 }
 
-async function executeMemoryAction(
+const hiddenLearningFields = new Set([
+  "id",
+  "evidenceId",
+  "ref",
+  "source",
+  "evidence",
+  "evidenceRefs",
+  "derivedFrom",
+  "extensions",
+  "signature",
+  "supersedes",
+  "assertedBy",
+  "principalId",
+  "conversationId",
+  "runId",
+  "taskId",
+  "artifactRef",
+]);
+
+function ownerVisibleLearningResult(value: unknown, key?: string): unknown {
+  if (typeof value === "string") {
+    if (key === "memoryId" || key === "promotedMemoryId" || key === "ifMatchMemoryId")
+      return publicLearningId("memory", value);
+    if (key === "candidateId") return publicLearningId("candidate", value);
+    return value;
+  }
+  if (Array.isArray(value)) return value.map((item) => ownerVisibleLearningResult(item));
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([field]) => !hiddenLearningFields.has(field))
+      .map(([field, item]) => [field, ownerVisibleLearningResult(item, field)]),
+  );
+}
+
+async function executeMemoryActionRaw(
   store: DomainStore,
   context: ProtectedToolContext,
   input: OwnerMemoryToolInput,
@@ -137,7 +173,7 @@ async function executeMemoryAction(
         includeInactive: input.includeInactive === true,
       });
     case "get":
-      return learning.getMemory(operationContext, requiredId(input));
+      return learning.getMemory(operationContext, internalLearningId("memory", requiredId(input)));
     case "list_candidates":
       return learning.listCandidates(operationContext);
     case "write":
@@ -185,11 +221,15 @@ async function executeMemoryAction(
         throw new Error("owner_confirmation_required");
       if ((await ownerCommand(store, context)) !== commandFor(input))
         throw new Error("owner_confirmation_required");
-      return learning.updateMemory(operationContext, requiredId(input), {
-        ...(typeof input.statement === "string" ? { statement: input.statement } : {}),
-        ...(input.confidence === undefined ? {} : { confidence: input.confidence }),
-        ...(input.ttlSeconds === undefined ? {} : { ttlSeconds: input.ttlSeconds }),
-      });
+      return learning.updateMemory(
+        operationContext,
+        internalLearningId("memory", requiredId(input)),
+        {
+          ...(typeof input.statement === "string" ? { statement: input.statement } : {}),
+          ...(input.confidence === undefined ? {} : { confidence: input.confidence }),
+          ...(input.ttlSeconds === undefined ? {} : { ttlSeconds: input.ttlSeconds }),
+        },
+      );
     case "expire":
     case "revoke":
     case "retire":
@@ -197,13 +237,16 @@ async function executeMemoryAction(
         throw new Error("owner_confirmation_required");
       return learning.setLifecycle(
         operationContext,
-        requiredId(input),
+        internalLearningId("memory", requiredId(input)),
         input.action === "expire" ? "expired" : input.action === "revoke" ? "revoked" : "retired",
       );
     case "supersede":
       if (typeof input.statement !== "string") throw new Error("memory_write_fields_required");
       {
-        const existing = await learning.getMemory(operationContext, requiredId(input));
+        const existing = await learning.getMemory(
+          operationContext,
+          internalLearningId("memory", requiredId(input)),
+        );
         if (!existing || existing.lifecycleState !== "active") throw new Error("memory_not_active");
         if (input.type !== undefined && input.type !== existing.type)
           throw new Error("memory_type_mismatch");
@@ -238,23 +281,33 @@ async function executeMemoryAction(
             mergeHint: { strategy: "manual_review_required", ifMatchMemoryId: existing.memoryId },
             extensions: { "glassbox:model_inference": true },
           });
-        return learning.supersedeMemory(operationContext, requiredId(input), {
-          subject: { kind: "user", id: context.caller.principalId },
-          scope: existing.scope,
-          type: existing.type,
-          statement: input.statement,
-          ...(input.confidence === undefined ? {} : { confidence: input.confidence }),
-          ...(input.ttlSeconds === undefined ? {} : { ttlSeconds: input.ttlSeconds }),
-        });
+        return learning.supersedeMemory(
+          operationContext,
+          internalLearningId("memory", requiredId(input)),
+          {
+            subject: { kind: "user", id: context.caller.principalId },
+            scope: existing.scope,
+            type: existing.type,
+            statement: input.statement,
+            ...(input.confidence === undefined ? {} : { confidence: input.confidence }),
+            ...(input.ttlSeconds === undefined ? {} : { ttlSeconds: input.ttlSeconds }),
+          },
+        );
       }
     case "promote":
       if ((await ownerCommand(store, context)) !== commandFor(input))
         throw new Error("owner_confirmation_required");
-      return learning.promoteCandidate(operationContext, requiredId(input));
+      return learning.promoteCandidate(
+        operationContext,
+        internalLearningId("candidate", requiredId(input)),
+      );
     case "reject":
       if ((await ownerCommand(store, context)) !== commandFor(input))
         throw new Error("owner_confirmation_required");
-      return learning.rejectCandidate(operationContext, requiredId(input));
+      return learning.rejectCandidate(
+        operationContext,
+        internalLearningId("candidate", requiredId(input)),
+      );
     case "feedback": {
       if (!input.signalType || !feedbackSignals.includes(input.signalType) || !input.statement)
         throw new Error("invalid_feedback_input");
@@ -279,14 +332,15 @@ async function executeMemoryAction(
       const message = await ownerCommand(store, context);
       const consolidator = new MemoryConsolidator(learning, {
         async extract({ existing }) {
-          if (input.id && !existing.some((memory) => memory.memoryId === input.id))
+          const existingMemoryId = input.id ? internalLearningId("memory", input.id) : undefined;
+          if (existingMemoryId && !existing.some((memory) => memory.memoryId === existingMemoryId))
             throw new Error("memory_scope_mismatch");
           return [
             {
               action: input.id ? "update" : "create",
               type: input.type as "semantic_fact" | "episodic_event",
               statement: input.statement!,
-              ...(input.id ? { existingMemoryId: input.id } : {}),
+              ...(existingMemoryId ? { existingMemoryId } : {}),
             },
           ];
         },
@@ -352,6 +406,14 @@ async function executeMemoryAction(
       return candidates;
     }
   }
+}
+
+async function executeMemoryAction(
+  store: DomainStore,
+  context: ProtectedToolContext,
+  input: OwnerMemoryToolInput,
+): Promise<unknown> {
+  return ownerVisibleLearningResult(await executeMemoryActionRaw(store, context, input));
 }
 
 export function createOwnerMemoryTools(options: {
