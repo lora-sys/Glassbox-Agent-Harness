@@ -761,6 +761,7 @@ export class LearningStore {
       ).rows[0];
       if (!row) throw new Error("candidate_not_found");
       const candidate = candidateFromRow(row);
+      if (candidate.status !== "pending") throw new Error("candidate_not_pending");
       const promoted = await this.promoteInTransaction(
         tx,
         candidate,

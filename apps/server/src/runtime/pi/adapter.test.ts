@@ -5,7 +5,14 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import type { AgentRun, Conversation } from "@glassbox/contracts";
 import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
-import { PiSdkRuntimeAdapter } from "./adapter.js";
+import { glassboxSystemPrompt, PiSdkRuntimeAdapter } from "./adapter.js";
+
+it("does not treat a context-hidden tool as an unimplemented product capability", () => {
+  const prompt = glassboxSystemPrompt("Base prompt");
+  expect(prompt).toContain("A tool missing from the current Run does not mean");
+  expect(prompt).toContain("unavailable in the current context");
+  expect(prompt).toContain("Never invent an unimplemented status");
+});
 import type { PiRunContext } from "./types.js";
 
 const directories: string[] = [];

@@ -321,6 +321,10 @@ describe("P4A durable learning truth", () => {
     expect(promoted.scope).toEqual({ type: "project", projectId: "glassbox" });
     expect(promoted.confirmedByUser).toBe(true);
     expect(promoted.evidence.some((item) => item.kind === "user_confirmation")).toBe(true);
+    await expect(
+      store.learning.promoteCandidate(context, first.candidate.candidateId),
+    ).rejects.toThrow("candidate_not_pending");
+    expect(await store.learning.listMemories(context)).toEqual([promoted]);
     expect(await store.learning.listMemories(context, { scope: { type: "global" } })).toEqual([]);
   });
 
