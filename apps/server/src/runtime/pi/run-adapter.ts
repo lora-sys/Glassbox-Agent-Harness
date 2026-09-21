@@ -12,14 +12,13 @@ import { requiredInputClause, satisfiesRequiredInput } from "./protected-tools.j
 import { OWNER_GROUP_ADMIN_TOOL } from "./owner-tools.js";
 import {
   asksLiveQqFact,
-  capabilityQuestionAsked,
   groupHistorySearchRequested,
   namedGroupId,
   ownerHistorySearchRequested,
+  requestClauses,
   requiredEvidenceFor,
   resolveEvidence,
   unobservedEvidence,
-  withoutRefusedClauses,
   type EvidenceResolution,
   type RequiredEvidence,
 } from "./required-evidence.js";
@@ -329,15 +328,16 @@ function requiredToolCall(input: ExecutionInput, isOwner: boolean): RequiredTool
   // Everything below is the Owner-private surface. A management Tool is never required
   // outside a private Owner Run, whatever else a message may name.
   if (input.caller.scope.chatType !== "private" || !isOwner) return undefined;
-  // Read from the message with its refused clauses removed: a refusal drops the request it
-  // refuses, and nothing else the message asks for. A negation somewhere in the message is not a
-  // refusal of it — `别太久` is an instruction about a mute, not a refusal to mute — so reading
-  // the whole message for one dropped requirements the Owner had actually made.
-  const text = withoutRefusedClauses(input.text);
+  // Read from the requests that ask for something: one that refuses a request, or that asks how
+  // something is done or whether it can be, drops the request it speaks for and nothing else the
+  // message asks for. A negation somewhere in the message is not a refusal of it — `别太久` is an
+  // instruction about a mute, not a refusal to mute — and `可以吗` appended to an instruction asks
+  // whether it may be done rather than taking it back. Reading the whole message for either
+  // dropped requirements the Owner had actually made.
+  const text = requestClauses(input.text);
   if (ownerHistorySearchRequested(text)) return { name: OWNER_HISTORY_SEARCH_TOOL, input: {} };
   const groupId = namedGroupId(text);
   if (!groupId) return undefined;
-  if (capabilityQuestionAsked(text)) return undefined;
   // A question about what a group *contains* is answered by live QQ evidence, not by reading
   // the group's Glassbox configuration. Requiring both would make the Run fail closed on a
   // Tool that cannot answer the question it was asked.

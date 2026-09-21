@@ -68,7 +68,7 @@ export function namedGroupId(text: string): string | undefined {
  * The words that ask to search the history of the group the Run is already in.
  *
  * The verb and its object must be adjacent: a message that merely contains 搜索 and 历史 in
- * different clauses ("搜索一下这个文件，群历史里可能有") is not a history-search request. The
+ * different requests ("搜索一下这个文件，群历史里可能有") is not a history-search request. The
  * object must name a group's history, so a message about searching anything else — a member,
  * a file, an order — never binds the Tool.
  */
@@ -102,31 +102,86 @@ const REQUEST_VERBS = "搜索|查找|查看|查询|检索|列出|列表|显示|�
  */
 const REFUSED_REQUEST = new RegExp(`(?:${REFUSAL_WORDS})\\s*(?:再)?\\s*(?:${REQUEST_VERBS})`, "u");
 
-/** A clause of a message: the run of text between its punctuation. */
-const CLAUSE = /[^，,、；;。！？!?\n]+/gu;
+/** The run of text between a message's punctuation. */
+const PUNCTUATION_SPAN = /[^，,、；;。！？!?\n]+/gu;
 
 /**
- * The message with every clause that refuses a request removed.
+ * The connectives that join two requests inside one punctuation span.
  *
- * A refusal refuses its own clause, so removing that clause leaves the rest of what the message
- * asks and a message that refuses one read while asking another still requires the one it asked
- * for. The removal is the only change: a message with no governing negation is returned
- * untouched, so nothing else about how a requirement is read moves with this rule.
+ * `把群名称改成 Lora 群并告诉我有哪些成员` is one span and two requests: an instruction and a
+ * question. Judging it as one unit let the instruction's verb speak for the question, so the
+ * question required nothing and the Run could answer it from the Conversation.
+ *
+ * The refusal path deliberately does not split on these. `不要查看群成员并查看群文件` can be read
+ * as refusing both, and reading it as refusing one would have the Run read something the user
+ * refused — worse than requiring nothing at all.
  */
-export function withoutRefusedClauses(text: string): string {
+const REQUEST_JOINER = /\s*(?:并|然后|另外|顺便|同时|还有)\s*/u;
+
+/**
+ * The requests a message makes, in order.
+ *
+ * Punctuation is one way a message separates two requests and a connective is another, so both
+ * are boundaries. Every gate below judges one of these, so a gate that says what one request is
+ * not cannot speak for another request beside it.
+ */
+function requests(text: string): readonly string[] {
+  return (text.match(PUNCTUATION_SPAN) ?? [text])
+    .flatMap((span) => span.split(REQUEST_JOINER))
+    .filter((request) => request !== "");
+}
+
+/**
+ * The message with every span that refuses a request removed.
+ *
+ * A refusal refuses its own span, so removing that span leaves the rest of what the message asks
+ * and a message that refuses one read while asking another still requires the one it asked for.
+ * The removal is the only change: a message with no governing negation is returned untouched, so
+ * nothing else about how a requirement is read moves with this rule.
+ *
+ * The span is the punctuation-delimited one rather than the single request, so a refusal covers
+ * every request joined to it.
+ */
+function withoutRefusedClauses(text: string): string {
   if (!REFUSED_REQUEST.test(text)) return text;
-  return (text.match(CLAUSE) ?? []).filter((clause) => !REFUSED_REQUEST.test(clause)).join(" ");
+  return (text.match(PUNCTUATION_SPAN) ?? [])
+    .filter((span) => !REFUSED_REQUEST.test(span))
+    .join(" ");
+}
+
+/** The requests a message makes that ask for something, in order. */
+function askingRequests(rawText: string): readonly string[] {
+  const kept = withoutRefusedClauses(rawText);
+  if (!CAPABILITY_QUESTION.test(kept)) return requests(kept);
+  return requests(kept).filter((request) => !CAPABILITY_QUESTION.test(request));
+}
+
+/**
+ * The message reduced to the requests that ask for something, joined in order.
+ *
+ * Two kinds of request ask for nothing: one that refuses a request, and one that asks how
+ * something is done or whether it can be done. Each speaks only for itself, and reading either
+ * as a property of the whole message let one request delete another's requirement —
+ * `把成员 10004 禁言 60 秒，另外本群有哪些成员` both changes the group and asks what it
+ * contains, and `怎么查看群成员？另外群文件有哪些` asks a question and gives a request. The
+ * first half then had no requirement, so the Run could answer it from the Conversation; the
+ * second had none either, so a Run could be required to answer the half that asked nothing.
+ *
+ * Nothing else about how a requirement is read moves with this rule: the requests that remain are
+ * kept in their order and their words, and a message with no such request keeps every word it
+ * had.
+ */
+export function requestClauses(rawText: string): string {
+  return askingRequests(rawText).join("，");
 }
 
 /**
  * Whether the current group message explicitly asks to search this group's history.
  */
 export function groupHistorySearchRequested(rawText: string): boolean {
-  const text = withoutRefusedClauses(rawText);
-  if (!GROUP_HISTORY_REQUEST.test(text)) return false;
-  // A question about how to search, or whether searching is possible, is not a request to search.
-  if (CAPABILITY_QUESTION.test(text)) return false;
-  return true;
+  // Read from the requests that ask for something, so a question about how to search does not
+  // delete a search request made beside it.
+  return GROUP_HISTORY_REQUEST.test(requestClauses(rawText));
 }
 
 /**
@@ -135,21 +190,22 @@ export function groupHistorySearchRequested(rawText: string): boolean {
  * This check runs before the management-query check. A search request often asks to "list"
  * the matched sender and text, or says to reply in the "current" private chat. Those words
  * describe the requested answer and audience. They do not turn the request into a group-policy
- * query. A request about the history setting or its status remains a management query.
+ * query. A request about the history setting or its status remains a management query — and
+ * that is a property of the request that asks it, not of the message, so a request that asks to
+ * search beside one that asks about the setting is still a search request.
  */
 export function ownerHistorySearchRequested(rawText: string): boolean {
-  const text = withoutRefusedClauses(rawText);
-  if (CAPABILITY_QUESTION.test(text)) return false;
-  if (/(?:历史|聊天记录|消息记录)[^。！？\n]{0,16}(?:状态|配置|开关|是否启用|是否开启)/u.test(text))
-    return false;
+  const asking = askingRequests(rawText)
+    .filter((request) => !POLICY_QUESTION.test(request))
+    .join("，");
   if (
     !/(?:已授权|管理的|多个\s*群|两个\s*群|所有\s*群|各个\s*群|群\s*[1-9]\d{4,15}|[1-9]\d{4,15}\s*群)/u.test(
-      text,
+      asking,
     )
   )
     return false;
   return /(?:搜索|搜|查找|查|检索|查询)[^。！？\n]{0,120}(?:群\s*(?:的)?\s*(?:历史|聊天记录|消息记录|群聊记录|聊天历史|历史消息)|已授权[^。！？\n]{0,40}(?:历史|聊天记录|消息记录))/u.test(
-    text,
+    asking,
   );
 }
 
@@ -180,11 +236,6 @@ const MUTATION_VERB =
  * answer. A question that really is about possibility names possibility: 能否, 能不能, 可否.
  */
 const CAPABILITY_QUESTION = /如何|怎么|能否|能不能|可否|可以吗/u;
-
-/** Whether the message asks how something is done, or whether it can be done. */
-export function capabilityQuestionAsked(text: string): boolean {
-  return CAPABILITY_QUESTION.test(text);
-}
 
 interface LiveDomain {
   readonly domain: RequiredEvidenceDomain;
@@ -299,14 +350,14 @@ export interface RequiredEvidenceInput {
  * nothing. `authorizedToolNames` is the runtime's answer to "could this Run observe it"; the
  * caller resolves that against the requirement instead of letting it suppress the requirement.
  *
- * A clause that refuses a request contributes no requirement, and a clause that does not refuse
- * one contributes whatever it asks for. A negation is read as a refusal only when it governs a
+ * A request that refuses one contributes no requirement, and a request that does not refuse one
+ * contributes whatever it asks for. A negation is read as a refusal only when it governs a
  * request's own verb, so an instruction *about* a request — `不要漏掉管理员` — is not one.
  */
 export function requiredEvidenceFor(input: RequiredEvidenceInput): RequiredEvidence[] {
-  // Read from the message with its refused clauses removed, so a refusal drops the request it
-  // refuses and nothing else the message asks for.
-  const text = withoutRefusedClauses(input.text);
+  // Read from the requests that ask for something, so a refusal or a possibility question drops
+  // the request it speaks for and nothing else the message asks for.
+  const text = requestClauses(input.text);
   const required: RequiredEvidence[] = [];
   const group = namedGroupId(text);
 
@@ -364,19 +415,36 @@ function searchCoversDomain(domain: RequiredEvidenceDomain, historySearched: boo
   return historySearched && domain === "group_history_page";
 }
 
+/**
+ * The domains the message asks about, read request by request.
+ *
+ * Each gate below says what *one request* is not: not a possibility question, not an instruction
+ * to change something, not a question about a setting. Applying them to the whole message made
+ * each of them a statement about every request in it, so one request could both delete another
+ * request's requirement — `把成员 10004 禁言 60 秒，另外本群有哪些成员` changes the group and
+ * asks what it contains — and add one the message never made, since an instruction's own nouns
+ * (`群名称`) were read as a question about the group's profile.
+ *
+ * The read verb is read from the message rather than the request: a request that names a domain
+ * and leans on the previous one's verb — `本群成员有哪些？群文件呢` — is still asking for that
+ * domain.
+ */
 function liveDomainsRequested(
   text: string,
   scope: "current-group" | "named-group",
 ): readonly LiveDomain[] {
-  // A question about how to do something, or whether it is possible, asks for no result.
-  if (CAPABILITY_QUESTION.test(text)) return [];
-  // A message that changes state is answered by the mutation gate.
-  if (MUTATION_VERB.test(text)) return [];
-  // A question about a setting is Glassbox product state, not the provider's live state.
-  if (POLICY_QUESTION.test(text)) return [];
+  const asking = requests(text).filter(
+    (request) =>
+      !CAPABILITY_QUESTION.test(request) &&
+      !MUTATION_VERB.test(request) &&
+      !POLICY_QUESTION.test(request),
+  );
+  if (asking.length === 0) return [];
   if (!READ_VERB.test(text)) return [];
   return LIVE_DOMAINS.filter(
-    (domain) => domain.nouns.test(text) && (scope === "named-group" || domain.currentGroup),
+    (domain) =>
+      (scope === "named-group" || domain.currentGroup) &&
+      asking.some((request) => domain.nouns.test(request)),
   );
 }
 

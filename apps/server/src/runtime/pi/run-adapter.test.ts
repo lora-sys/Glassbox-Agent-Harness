@@ -793,6 +793,39 @@ describe("mutation intent comes only from the current user message", () => {
     });
   });
 
+  it("still binds the mutation when a separate clause asks whether it may be done", async () => {
+    // `可以吗` asks whether the thing may be done. That is a question about the instruction, not
+    // a withdrawal of it, and it speaks only for its own clause. Reading it as a property of the
+    // message dropped the required Tool, so a politely worded instruction bound none — and the
+    // mutation gate then refused the very call the message asked for, which fails the Owner's
+    // request closed while reading as if the Agent had declined it.
+    const f = fixture([
+      {
+        status: "completed",
+        text: "已禁言。",
+        toolCalls: [
+          {
+            name: "qq_group_moderation",
+            input: {
+              groupId: "1126022432",
+              operation: "set_group_ban",
+              params: { user_id: 10004, duration: 60 },
+            },
+            failed: false,
+          },
+        ],
+      },
+    ]);
+    f.input.text = "把群 1126022432 的成员 10004 禁言 60 秒，可以吗";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe("qq_group_moderation");
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({
+      groupId: "1126022432",
+      operation: "set_group_ban",
+      params: { user_id: 10004, duration: 60 },
+    });
+  });
+
   it("refuses a capability mutation on a different group than the message named", async () => {
     const wrongGroup = {
       status: "completed" as const,

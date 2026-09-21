@@ -146,6 +146,60 @@ describe("required evidence stays narrow", () => {
     expect(domains(inGroup("群成员功能是否启用"))).toEqual([]);
   });
 
+  it("still requires the fact a message asks for while another request instructs", () => {
+    // A request that changes state speaks for itself. Reading its mutation verb as a property of
+    // the message deleted the requirement the other request made, so the Run was free to answer
+    // the question from the Conversation — the one state the evidence check exists to prevent.
+    // It also read the instruction's own nouns as a request: 群名称 is not a question about the
+    // group's profile.
+    expect(domains(inGroup("把成员 10004 禁言 60 秒，另外本群有哪些成员"))).toEqual([
+      "group_members",
+    ]);
+    expect(domains(inGroup("把群名称改成 Lora 群，然后告诉我群文件有哪些"))).toEqual([
+      "group_files",
+    ]);
+    // The same two requests joined by a connective instead of by punctuation. A message that
+    // reads the same way either way has to require the same thing.
+    expect(domains(inGroup("把群名称改成 Lora 群并告诉我有哪些成员"))).toEqual(["group_members"]);
+    expect(domains(inGroup("把成员 10004 踢出群顺便看看群文件"))).toEqual(["group_files"]);
+  });
+
+  it("still requires the fact a message asks for while another request asks how", () => {
+    // A possibility question asks for no result, and it speaks only for itself. A message that
+    // asks how to read something and, beside it, asks for the read is asking.
+    expect(domains(inGroup("怎么查看群成员？另外群文件有哪些"))).toEqual(["group_files"]);
+    expect(domains(inGroup("能否查看群成员？顺便看看群公告"))).toEqual(["group_content"]);
+    expect(domains(inGroup("怎么查看群成员并看看群文件"))).toEqual(["group_files"]);
+  });
+
+  it("still reads a search request in a request joined to a question", () => {
+    // The question asks for no result and the search beside it does. Joined by a connective
+    // rather than by punctuation, the question still speaks only for itself.
+    expect(domains(inGroup("怎么查看群成员并搜索本群历史找 P4B-A-1349"))).toEqual([
+      "group_history_search",
+    ]);
+  });
+
+  it("keeps a refusal over every request it joins", () => {
+    // The one asymmetry: a refusal keeps the whole punctuation-delimited span it appears in,
+    // because `不要查看群成员并查看群文件` can be read as refusing both. Reading it as refusing one
+    // would have the Run read something the user refused, which is worse than requiring nothing.
+    expect(domains(inGroup("不要查看群成员并查看群文件"))).toEqual([]);
+  });
+
+  it("still requires the fact a message asks for while another request asks about a setting", () => {
+    expect(domains(inGroup("本群历史检索是否已经开启？另外群文件有哪些"))).toEqual(["group_files"]);
+  });
+
+  it("still reads a search request that sits beside a question about how to search", () => {
+    expect(domains(inGroup("怎么搜索本群历史？另外请搜索本群历史，找到 P4B-A-1349"))).toEqual([
+      "group_history_search",
+    ]);
+    expect(domains(ownerPrivate("怎么搜索历史？另外搜索已授权群的历史，找 P4B-A-1349"))).toEqual([
+      "owner_history_search",
+    ]);
+  });
+
   it("requires nothing for a question about the group's Glassbox policy", () => {
     // The setting that governs retrieval is Glassbox product state, read through the Owner
     // management Tool. A live history page cannot answer it.
@@ -201,6 +255,19 @@ describe("required evidence stays narrow", () => {
 describe("required evidence on the Owner-private surface", () => {
   it("binds the group the message names to a live member read", () => {
     expect(requiredEvidenceFor(ownerPrivate("查看群 1126022432 有哪些成员"))).toEqual([
+      {
+        domain: "group_members",
+        tool: "qq_group_members",
+        input: { groupId: "1126022432", operation: "get_group_member_list" },
+      },
+    ]);
+  });
+
+  it("binds the group the message names after dropping a request it refuses", () => {
+    // The refusal drops its own request and the group binding in the request beside it survives.
+    expect(
+      requiredEvidenceFor(ownerPrivate("不要查看群成员，查看群 1126022432 有哪些成员")),
+    ).toEqual([
       {
         domain: "group_members",
         tool: "qq_group_members",
