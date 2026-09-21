@@ -724,6 +724,8 @@ export class ManagementApplication {
         await this.ingressReady;
         await connectionReady;
         if (!this.accepting || !connectionAccepted || signal.aborted) return;
+        if (message.scope.chatType === "group")
+          await this.provisionAddressedGroupMember(configured, message.scope);
         const control = /^\/(status|cancel)\s+([a-zA-Z0-9-]{1,80})\s*$/u.exec(message.text);
         if (control) {
           const caller = await this.store.identities.resolve(message.scope);
@@ -831,6 +833,32 @@ export class ManagementApplication {
       ];
       for (const scope of visitorScopes) await this.grantScope(scope, principalId);
     }
+  }
+
+  /**
+   * Gives one explicitly addressed member of an enabled group only that group's Visitor
+   * authority. Normalization has already required a real @ mention and an allowed group.
+   * Private chat remains restricted to configured identities, and no Owner control grant is
+   * created here.
+   */
+  private async provisionAddressedGroupMember(
+    configured: ReturnType<ChannelProfileStore["resolve"]>,
+    scope: TrustedChannelScope,
+  ): Promise<void> {
+    if (scope.chatType !== "group" || !configured.config.groupIds.includes(scope.chatId)) return;
+    let caller = await this.store.identities.resolve(scope);
+    if (!caller) {
+      const principalId = `qq-visitor-${scope.senderId}`;
+      await this.store.identities.createPrincipal(principalId, "visitor");
+      await this.store.identities.bindPrincipal(principalId, scope);
+      caller = { principalId, scope };
+    }
+    const current = await this.store.authorization.check({
+      caller,
+      resourceId: agentResourceId(AGENT_ID),
+      action: "run:create",
+    });
+    if (current.decision !== "ALLOW") await this.grantScope(scope, caller.principalId);
   }
 
   private async grantScope(scope: TrustedChannelScope, principalId = OWNER_ID) {

@@ -327,6 +327,53 @@ describe("channel to durable run composition", () => {
     expect(owner.history).toEqual([]);
     expect(owner.conversation.id).not.toBe(visitor.conversation.id);
   });
+  it("provisions an addressed group member as a group-scoped Visitor", async () => {
+    const f = await fixture(
+      async (input) => ({
+        status: "succeeded",
+        text: `answer:${input.text}`,
+      }),
+      { persistentDatabase: true },
+    );
+    f.send(1, "new-member", false, 10099);
+    await expect.poll(() => f.calls.length, { timeout: 5_000 }).toBe(1);
+    const visitor = await f.started.take();
+    const completed = await f.app.runs.waitForRun(visitor.caller, visitor.run.id);
+    expect(completed.status).toBe("succeeded");
+    const reply = await f.reply("answer:new-member");
+
+    expect(visitor.caller).toMatchObject({
+      principalId: "qq-visitor-10099",
+      scope: { chatType: "group", chatId: "10003", senderId: "10099" },
+    });
+    expect(reply.action).toBe("send_group_msg");
+    expect(String(reply.params.group_id)).toBe("10003");
+    expect(
+      (
+        await f.app.store.authorization.check({
+          caller: visitor.caller,
+          resourceId: "tool:owner_group_admin",
+          action: "tool:discover",
+        })
+      ).decision,
+    ).toBe("DENY");
+
+    f.send(2, "private-must-stay-closed", true, 10099);
+    await expect.poll(() => f.calls.length).toBe(1);
+
+    const restarted = await f.reopen();
+    const resolved = await restarted.store.identities.resolve(visitor.caller.scope);
+    expect(resolved?.principalId).toBe("qq-visitor-10099");
+    expect(
+      (
+        await restarted.store.authorization.check({
+          caller: visitor.caller,
+          resourceId: "agent:personal",
+          action: "run:create",
+        })
+      ).decision,
+    ).toBe("ALLOW");
+  });
   it("runs a group mention once, isolates Owner DM history, and indexes actual trace records", async () => {
     const f = await fixture(async (input) => ({
       status: "succeeded",

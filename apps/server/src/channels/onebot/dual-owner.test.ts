@@ -302,7 +302,8 @@ describe("Dual Owner support", () => {
     );
     expect(visitorGroup.kind).toBe("message");
 
-    // Unknown QQ ignored
+    // Any real member may explicitly address the bot in an enabled group. The application
+    // resolves this sender to a group-scoped Visitor before authorization.
     const unknownGroup = normalizeOneBotMessage(
       {
         post_type: "message",
@@ -319,6 +320,12 @@ describe("Dual Owner support", () => {
       },
       liveConfig,
     );
-    expect(unknownGroup.kind).toBe("ignored");
+    expect(unknownGroup).toMatchObject({
+      kind: "message",
+      message: {
+        scope: { chatType: "group", chatId: "1126022432", senderId: "99999999" },
+        text: "stranger",
+      },
+    });
   });
 });

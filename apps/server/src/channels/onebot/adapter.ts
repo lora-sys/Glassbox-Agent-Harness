@@ -401,13 +401,14 @@ export class OneBotAdapter {
     const isOwnerTarget =
       target.senderId === this.config.ownerId ||
       (this.config.coOwnerId !== undefined && target.senderId === this.config.coOwnerId);
+    const isConfiguredPrivateTarget =
+      isOwnerTarget || this.config.visitorIds.includes(target.senderId);
     if (
       target.connectionId !== this.config.connectionId ||
       target.botId !== this.config.botId ||
-      (!isOwnerTarget && !this.config.visitorIds.includes(target.senderId)) ||
       target.threadId !== undefined ||
       (target.chatType === "private"
-        ? target.chatId !== target.senderId
+        ? target.chatId !== target.senderId || !isConfiguredPrivateTarget
         : target.chatType !== "group" || !this.config.groupIds.includes(target.chatId))
     )
       return { status: "failed", code: "invalid_target" };
