@@ -1519,8 +1519,9 @@ describe("configured group Run capability authority", () => {
    * The real execution adapter over a runtime that resolves the real Run surface.
    *
    * This is the production wiring: the runtime writes the Tool names it discovered onto the
-   * Run context, and the execution adapter decides the required Tool from that context. A
-   * test that stubbed either half would not catch the two disagreeing.
+   * Run context, and the execution adapter decides the required Tool from the current message
+   * while reading that surface to decide whether the Run can satisfy it. A test that stubbed
+   * either half would not catch the two disagreeing.
    */
   function piGroupRun(
     application: ReturnType<typeof groupRun>,
@@ -1557,17 +1558,23 @@ describe("configured group Run capability authority", () => {
     };
   }
 
-  it("requires the group history Tool exactly while the real surface offers it", async () => {
-    const { application, a, groupInput } = await configuredGroup();
+  it("requires the group history Tool whether or not the real surface offers it", async () => {
+    const { application, a, context, groupInput } = await configuredGroup();
     const requiredFor = piGroupRun(application, groupInput);
     const ask = "请搜索本群历史，找到 P4B-A-1349，并回复发送者和原文";
 
+    expect(await application.resolveRunToolNames(context)).toContain("group_history_search");
     expect(await requiredFor(ask)).toBe("group_history_search");
 
     await application.setGroupHistory(a, { groupId: GROUP, enabled: false });
-    // The Tool is off the surface now, so nothing is required: an honest Run is never failed
-    // closed against a Tool it was never offered.
-    expect(await requiredFor(ask)).toBeUndefined();
+
+    // The Tool is off the surface now, and the requirement is not. The Run cannot satisfy it,
+    // so the adapter fails closed below the model instead of letting it answer a search that
+    // never ran — "本群历史检索已关闭" is exactly the composed answer this check exists to catch.
+    // A requirement that left with the Tool would make the group's own setting the only thing
+    // between the user and a fabricated result.
+    expect(await application.resolveRunToolNames(context)).not.toContain("group_history_search");
+    expect(await requiredFor(ask)).toBe("group_history_search");
   });
 
   it("never requires a cross-group Tool for a group Run", async () => {

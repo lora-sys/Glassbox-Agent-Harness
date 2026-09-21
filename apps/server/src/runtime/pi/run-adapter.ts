@@ -308,19 +308,17 @@ export function piProfileName(
 /**
  * The Tool the current message requires, or `undefined` when it requires none.
  *
- * A group Run can only ever reach the current-group history Tool, and only while its own
- * discovered surface carries it. Requiring a Tool the surface does not offer would fail an
- * honest Run closed against a Tool the model was never given, so the requirement follows the
- * surface the runtime resolved rather than the message alone. Requiring is never granting:
- * the Tool still re-authorizes its own Resource at execution time.
+ * Read from the message alone: the chat type the caller acted in, whether they are the Owner,
+ * and the text. The Run's resolved Tool surface is deliberately not an input. A requirement
+ * that disappeared with the Tool would leave a Run whose surface withheld it free to answer
+ * with a fluent claim about an action it never performed, and that is the state in which a
+ * fabricated answer is hardest to detect — a surface that failed to resolve would drop every
+ * requirement at once. What the surface decides is *satisfiability*: a Run that cannot call
+ * the required Tool fails closed below rather than reporting success. Requiring is never
+ * granting: the Tool still re-authorizes its own Resource at execution time.
  */
-function requiredToolCall(
-  input: ExecutionInput,
-  isOwner: boolean,
-  authorizedToolNames: readonly string[] | undefined,
-): RequiredToolCall | undefined {
+function requiredToolCall(input: ExecutionInput, isOwner: boolean): RequiredToolCall | undefined {
   if (input.caller.scope.chatType === "group") {
-    if (!authorizedToolNames?.includes(GROUP_HISTORY_SEARCH_TOOL)) return undefined;
     if (!groupHistorySearchRequested(input.text)) return undefined;
     // The message names no parameter of its own: the query is the model's to compose, and the
     // group comes from the Run's trusted scope. The requirement is the call, not its arguments.
@@ -331,8 +329,7 @@ function requiredToolCall(
   if (input.caller.scope.chatType !== "private" || !isOwner) return undefined;
   const text = input.text;
   if (/不要|别|无需/u.test(text)) return undefined;
-  if (authorizedToolNames?.includes(OWNER_HISTORY_SEARCH_TOOL) && ownerHistorySearchRequested(text))
-    return { name: OWNER_HISTORY_SEARCH_TOOL, input: {} };
+  if (ownerHistorySearchRequested(text)) return { name: OWNER_HISTORY_SEARCH_TOOL, input: {} };
   const groupId = namedGroupId(text);
   if (!groupId) return undefined;
   if (/如何|怎么|能否|是否|可以吗/u.test(text)) return undefined;
@@ -439,10 +436,10 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       : input.caller.scope.chatType === "group"
         ? "qq-group"
         : "main-agent";
-    // The required Tool is decided *after* the session is created, because the runtime
-    // resolves the Run's discovered Tool surface while creating it. Deciding before would
-    // have to guess that surface, and a guess that disagreed with it would either require a
-    // Tool the model was never offered or silently drop a requirement the Run could meet.
+    // The requirements are written onto the context after the session exists, because the
+    // context is what the runtime carries into the Run. They are decided from the message and
+    // the caller's scope, so the order the session is created in cannot change them: the
+    // surface the runtime resolves alongside it decides only whether the Run can satisfy them.
     const context: PiRunContext = {
       caller: input.caller,
       conversationId: input.conversation.id,
@@ -466,19 +463,19 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       profile,
       context,
     );
-    const required = requiredToolCall(input, isOwner, context.authorizedToolNames);
+    const required = requiredToolCall(input, isOwner);
     if (required !== undefined) {
       context.requiredToolName = required.name;
       context.requiredToolInput = required.input;
     }
     // §2 — the factual domains the current message cannot be answered without observing. Read
-    // from the message and the surface the Run actually got, so a requirement is only ever
-    // bound to a Tool the model was really offered.
+    // from the message alone: the surface the Run got decides whether the requirement can be
+    // met, never whether it exists, so a Run whose surface withholds the Tool fails closed
+    // rather than answering a live question it had no way to observe.
     const evidence = requiredEvidenceFor({
       text: input.text,
       chatType: input.caller.scope.chatType === "group" ? "group" : "private",
       isOwner,
-      authorizedToolNames: context.authorizedToolNames,
     });
     if (evidence.length > 0) context.requiredEvidence = evidence;
     await this.recordEvidence({

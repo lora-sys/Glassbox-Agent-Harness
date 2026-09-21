@@ -402,8 +402,11 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
       const runContext = runtimeSessionId ? this.runContexts.get(runtimeSessionId) : undefined;
       const requiredToolName = runContext?.requiredToolName;
       const exactInput = requiredInputClause(runContext?.requiredToolInput);
+      // The requirement is read from the current message, not from the Tool surface this Run
+      // resolved, so this sentence never claims the Tool is on the surface: a Run that cannot
+      // call it fails closed below the model instead of answering on its behalf.
       const required = requiredToolName
-        ? `${basePrompt}\n\nThe current request requires the available ${requiredToolName} tool. Call it before reporting the action as completed${exactInput}. Do not ask for a second confirmation and never claim execution without a successful tool result.`
+        ? `${basePrompt}\n\nThe current request requires the ${requiredToolName} tool. Call it before reporting the action as completed${exactInput}. Do not ask for a second confirmation and never claim execution without a successful tool result.`
         : basePrompt;
       // The Tool the Runtime requires for a factual answer. This sentence guides the model; it
       // is not the requirement. A Run that answers without the call fails closed below the

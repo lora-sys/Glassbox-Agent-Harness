@@ -9,28 +9,12 @@ import {
   type RequiredEvidenceInput,
 } from "./required-evidence.js";
 
-/** Every read-only QQ Tool the group surface carries, so a surface never hides a domain. */
-const GROUP_SURFACE = [
-  GROUP_HISTORY_SEARCH_TOOL,
-  "qq_groups",
-  "qq_group_members",
-  "qq_group_history",
-  "qq_group_content",
-  "qq_group_files",
-] as const;
-
-/** The Owner-private surface, which additionally carries the cross-group search Tool. */
-const OWNER_SURFACE = [...GROUP_SURFACE, OWNER_HISTORY_SEARCH_TOOL, "qq_account_status"] as const;
-
-function inGroup(text: string, surface: readonly string[] = GROUP_SURFACE): RequiredEvidenceInput {
-  return { text, chatType: "group", isOwner: false, authorizedToolNames: surface };
+function inGroup(text: string): RequiredEvidenceInput {
+  return { text, chatType: "group", isOwner: false };
 }
 
-function ownerPrivate(
-  text: string,
-  surface: readonly string[] = OWNER_SURFACE,
-): RequiredEvidenceInput {
-  return { text, chatType: "private", isOwner: true, authorizedToolNames: surface };
+function ownerPrivate(text: string): RequiredEvidenceInput {
+  return { text, chatType: "private", isOwner: true };
 }
 
 /** The domain names required for a message, in the order the policy reports them. */
@@ -141,21 +125,38 @@ describe("required evidence stays narrow", () => {
     expect(requiredEvidenceFor(inGroup("群成员功能是否启用"))).toEqual([]);
   });
 
-  it("requires nothing when the Run's own surface does not carry the Tool", () => {
-    // History is disabled for this group. Requiring the Tool would fail an honest Run closed
-    // against a call it cannot make.
-    expect(requiredEvidenceFor(inGroup("群文件有哪些？", ["qq_groups"]))).toEqual([]);
+  it("requires the domain whether or not the Run's surface carries the Tool", () => {
+    // The requirement is a property of the message, not of the surface. A Run that cannot
+    // observe the fact is exactly the Run most likely to state it anyway, so a requirement that
+    // disappeared with the Tool would weaken the evidence check precisely where the Run can
+    // observe least — and a surface that failed to resolve would require nothing at all. The
+    // caller resolves the surface against the requirement; it cannot suppress it.
+    expect(domains(inGroup("群文件有哪些？"))).toEqual(["group_files"]);
+    expect(domains(ownerPrivate("查看群 1126022432 有哪些成员"))).toEqual(["group_members"]);
+    // Nothing about the requirement is derived from a Tool list, so there is no input that
+    // could withhold one.
+    expect(Object.keys(inGroup("群文件有哪些？")).sort()).toEqual(["chatType", "isOwner", "text"]);
   });
 
-  it("requires nothing when the Run's surface is unknown", () => {
+  it("never also requires the live history page for an explicit history search", () => {
+    // "搜索本群历史" names 历史, the page domain's own noun. A page is one group's recent
+    // messages and cannot answer a search across its history, so requiring both would fail a
+    // Run closed against a read the message never asked for.
+    expect(domains(inGroup("请搜索本群历史，找到 P4B-A-1349，并列出原文"))).toEqual([
+      "group_history_search",
+    ]);
     expect(
-      requiredEvidenceFor({
-        text: "群文件有哪些？",
-        chatType: "group",
-        isOwner: false,
-        authorizedToolNames: undefined,
-      }),
-    ).toEqual([]);
+      domains(
+        ownerPrivate(
+          "同时搜索我已授权的两个群历史。群 1126022432 查 P4B-A-1349。列出群号、发送者和原文，只回复到当前私聊。",
+        ),
+      ),
+    ).toEqual(["owner_history_search"]);
+  });
+
+  it("still requires the page read when the message asks for one without a search", () => {
+    // The control for the rule above: the exclusion is the search, not the word 历史.
+    expect(domains(inGroup("这个群最近的历史消息有哪些？"))).toEqual(["group_history_page"]);
   });
 
   it("requires nothing for a group member who is not the Owner", () => {
@@ -164,7 +165,6 @@ describe("required evidence stays narrow", () => {
         text: "查看群 1126022432 有哪些成员",
         chatType: "private",
         isOwner: false,
-        authorizedToolNames: OWNER_SURFACE,
       }),
     ).toEqual([]);
   });

@@ -3,17 +3,21 @@
  *
  * A model can always produce a fluent sentence about a QQ group. This module is the runtime's
  * answer to "did it observe that, or did it compose it?", reduced to a decision made from the
- * *current user message* plus the Tool surface the Run actually resolved.
+ * *current user message* alone.
  *
  * Three rules keep the policy narrow rather than a blanket "call a Tool for everything":
  *
  *  - A domain is required only when the message asks for that domain's live facts. The words
  *    are the domain's own nouns, and they must sit with a read verb, so an unrelated message
  *    that happens to mention 文件 is not a file request.
- *  - A domain is required only when the Run's own surface carries the Tool. Requiring a Tool
- *    the model was never offered would fail an honest Run closed against a call it could not
- *    make, which is a different defect from the one this fixes. Requiring is never granting:
- *    the Tool still re-authorizes its Resource at execution time.
+ *  - The requirement is a property of the *message*, never of the Run's Tool surface. A Run
+ *    whose surface withholds the Tool cannot observe the fact, and that is the case in which a
+ *    fabricated answer is most likely and least detectable: gating the requirement on the
+ *    surface would make the evidence check weakest exactly where the Run can observe least, and
+ *    a surface that failed to resolve would silently require nothing at all. What the surface
+ *    decides is satisfiability, not the requirement — so a Run that cannot observe fails closed
+ *    instead of asserting. Requiring is never granting: the Tool still re-authorizes its
+ *    Resource at execution time.
  *  - Nothing here authorizes anything. A requirement is a condition on the Run's *answer*.
  *
  * The intent is read from `input.text` alone — never from Conversation history, retrieved
@@ -236,8 +240,6 @@ export interface RequiredEvidenceInput {
   readonly text: string;
   readonly chatType: "private" | "group";
   readonly isOwner: boolean;
-  /** The Tool names this Run's surface really carries, or `undefined` when unknown. */
-  readonly authorizedToolNames: readonly string[] | undefined;
 }
 
 /**
@@ -245,36 +247,44 @@ export interface RequiredEvidenceInput {
  *
  * Returns every domain the message asks for, so a message that asks about members *and*
  * notices requires both rather than whichever the check happened to reach first.
+ *
+ * The Run's Tool surface is deliberately not an input. A requirement that disappeared with the
+ * Tool would let a Run answer a live question precisely when it had no way to observe it, and
+ * would make a surface that failed to resolve indistinguishable from a message that asked
+ * nothing. `authorizedToolNames` is the runtime's answer to "could this Run observe it"; the
+ * caller resolves that against the requirement instead of letting it suppress the requirement.
  */
 export function requiredEvidenceFor(input: RequiredEvidenceInput): RequiredEvidence[] {
   const text = input.text;
   if (REFUSAL.test(text)) return [];
   const required: RequiredEvidence[] = [];
-  const carried = (tool: string) => input.authorizedToolNames?.includes(tool) === true;
   const group = namedGroupId(text);
 
   if (input.chatType === "group") {
     // A group Run is bound to its own group, so a domain the message asks about needs no
     // group id: the Run's trusted scope supplies it and the model never names one.
-    if (carried(GROUP_HISTORY_SEARCH_TOOL) && groupHistorySearchRequested(text))
+    const searched = groupHistorySearchRequested(text);
+    if (searched)
       required.push({ domain: "group_history_search", tool: GROUP_HISTORY_SEARCH_TOOL, input: {} });
-    for (const domain of liveDomainsRequested(text, "current-group"))
-      if (carried(domain.tool))
-        required.push({
-          domain: domain.domain,
-          tool: domain.tool,
-          input: domain.operation === undefined ? {} : { operation: domain.operation },
-        });
+    for (const domain of liveDomainsRequested(text, "current-group")) {
+      if (searchCoversDomain(domain.domain, searched)) continue;
+      required.push({
+        domain: domain.domain,
+        tool: domain.tool,
+        input: domain.operation === undefined ? {} : { operation: domain.operation },
+      });
+    }
     return required;
   }
 
   // Everything below is the Owner-private surface. A cross-group search is answered by its own
   // Tool, which addresses groups the message names rather than the Run's scope.
   if (!input.isOwner) return [];
-  if (carried(OWNER_HISTORY_SEARCH_TOOL) && ownerHistorySearchRequested(text))
+  const searched = ownerHistorySearchRequested(text);
+  if (searched)
     required.push({ domain: "owner_history_search", tool: OWNER_HISTORY_SEARCH_TOOL, input: {} });
   for (const domain of liveDomainsRequested(text, "named-group")) {
-    if (!carried(domain.tool)) continue;
+    if (searchCoversDomain(domain.domain, searched)) continue;
     // A group-scoped domain cannot be required without the group it applies to. The message
     // named none, so there is nothing to bind and the requirement is a refusal, not a guess.
     if (domain.currentGroup && group === undefined) continue;
@@ -288,6 +298,20 @@ export function requiredEvidenceFor(input: RequiredEvidenceInput): RequiredEvide
     });
   }
   return required;
+}
+
+/**
+ * Whether an explicit history search already covers a domain.
+ *
+ * "搜索本群历史，找到 P4B-A-1349" names 历史, which is also the live history *page* domain's own
+ * noun. A page is one group's recent messages and cannot answer a search across its history, and
+ * the words that make the Owner form a search — "列出" the matched sender and text, reply to the
+ * "current" chat — describe the answer the user wants rather than asking for a page. Requiring
+ * both would fail a Run closed against a read the message never asked for, which is its own way
+ * of not answering the question.
+ */
+function searchCoversDomain(domain: RequiredEvidenceDomain, historySearched: boolean): boolean {
+  return historySearched && domain === "group_history_page";
 }
 
 function liveDomainsRequested(

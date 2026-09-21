@@ -97,18 +97,18 @@ export interface PiRunContext {
   /**
    * The Tool names this Run actually discovered, as the runtime resolved them.
    *
-   * Written by the runtime once per session so a required Tool is only ever bound to a Tool
-   * the Run could really call. A requirement the surface cannot satisfy would fail an honest
-   * Run closed against a Tool that was never offered to the model.
+   * Written by the runtime once per session and used to build the model-visible Tool set. It
+   * is not an input to any requirement: what a message requires is read from the message, and
+   * the surface decides only whether the Run can satisfy it.
    */
   authorizedToolNames?: readonly string[];
   /**
    * The factual domains the current user message requires evidence from.
    *
-   * Resolved once per Run from the message and the surface, then carried on the context so
-   * the completion check and the Tool plane read the same list. An empty array means the
-   * message requires no evidence; `undefined` means no policy was resolved at all, which the
-   * completion check treats as nothing required rather than as a blanket requirement.
+   * Resolved once per Run from the message, then carried on the context so the completion
+   * check and the Tool plane read the same list. An empty array means the message requires no
+   * evidence; `undefined` means no policy was resolved at all, which the completion check
+   * treats as nothing required rather than as a blanket requirement.
    */
   requiredEvidence?: readonly RequiredEvidence[];
 }
