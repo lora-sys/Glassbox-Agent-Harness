@@ -15,7 +15,11 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { KitLoader, type ResolvedKitProfile } from "./kit-loader.js";
 import { requiredInputClause } from "./protected-tools.js";
-import { GLASSBOX_HOST_EXCLUDED_PI_TOOLS, describeToolSurface } from "./tool-plane.js";
+import {
+  GLASSBOX_HOST_EXCLUDED_PI_TOOLS,
+  describeToolSurface,
+  toolOutcomeFromFailure,
+} from "./tool-plane.js";
 import type { EffectiveToolSurface, ToolSurfaceCandidate } from "./tool-plane.js";
 import { kitProfileSkillVisibility } from "./skill-visibility.js";
 import type {
@@ -136,6 +140,16 @@ function safeToolFailureCode(result: unknown): string {
   if (text.includes("context_missing")) return "context_missing";
   if (text.includes("Permission denied")) return "authorization_denied";
   if (text.includes("capability_category_disabled")) return "capability_category_disabled";
+  // A provider refusal is its own fact: "the bridge is not connected" and "the request was
+  // rejected" are not the same as "the Tool broke", and a Run that cannot tell them apart
+  // cannot say honestly what it knows.
+  for (const code of [
+    "provider_unavailable",
+    "provider_denied",
+    "provider_failed",
+    "provider_unknown",
+  ])
+    if (text.includes(code)) return code;
   if (text.includes("protected_tool_failed")) return "protected_tool_failed";
   if (/validation|schema|required|invalid|argument/iu.test(text)) return "input_validation_failed";
   return "tool_execution_failed";
@@ -388,9 +402,18 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
       const runContext = runtimeSessionId ? this.runContexts.get(runtimeSessionId) : undefined;
       const requiredToolName = runContext?.requiredToolName;
       const exactInput = requiredInputClause(runContext?.requiredToolInput);
-      return requiredToolName
+      const required = requiredToolName
         ? `${basePrompt}\n\nThe current request requires the available ${requiredToolName} tool. Call it before reporting the action as completed${exactInput}. Do not ask for a second confirmation and never claim execution without a successful tool result.`
         : basePrompt;
+      // The Tool the Runtime requires for a factual answer. This sentence guides the model; it
+      // is not the requirement. A Run that answers without the call fails closed below the
+      // model either way, so this only decides whether the Run can still answer honestly.
+      const evidenceTools = [
+        ...new Set((runContext?.requiredEvidence ?? []).map((evidence) => evidence.tool)),
+      ];
+      return evidenceTools.length === 0
+        ? required
+        : `${required}\n\nThe current request asks for facts that only QQ can report. Call ${evidenceTools.join(" and ")} and answer from its result. If the call does not succeed, say the information could not be confirmed. Never answer from what the request itself says, from earlier Conversation, or from what you expect the tool to return.`;
     };
     // Standalone Kit MCP factories are configured separately. Glassbox exposes
     // only explicitly registered product-authorized Tools, never ambient servers.
@@ -524,14 +547,28 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
         const update = event.assistantMessageEvent as { type?: string; delta?: string };
         if (update.type === "text_delta" && typeof update.delta === "string") text += update.delta;
       } else if (event.type === "tool_execution_start") {
-        toolCalls.push({ name: event.toolName, input: event.args as Record<string, unknown> });
+        toolCalls.push({
+          name: event.toolName,
+          input: event.args as Record<string, unknown>,
+          toolCallId: event.toolCallId,
+        });
       } else if (event.type === "tool_execution_end") {
+        // Match on the runtime's own call id when it gives one: a Run may call the same Tool
+        // more than once, and a result attributed to the wrong call would credit evidence to
+        // a call that never produced it.
         const call = [...toolCalls]
           .reverse()
-          .find((candidate) => candidate.name === event.toolName && candidate.failed === undefined);
+          .find((candidate) =>
+            candidate.toolCallId === undefined
+              ? candidate.name === event.toolName && candidate.failed === undefined
+              : candidate.toolCallId === event.toolCallId && candidate.failed === undefined,
+          );
         if (call) {
           call.result = event.result;
           call.failed = event.isError;
+          call.outcome = event.isError
+            ? toolOutcomeFromFailure(safeToolFailureCode(event.result))
+            : "success";
         }
       }
     });

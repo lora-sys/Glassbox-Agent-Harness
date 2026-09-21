@@ -55,6 +55,7 @@ import {
   GROUP_RUN_CAPABILITY_CATEGORIES,
 } from "../runtime/pi/capability-tools.js";
 import { resolveSkillVisibility } from "../runtime/pi/skill-visibility.js";
+import { requireProviderSuccess } from "../runtime/pi/provider-outcome.js";
 import {
   TOOL_DESCRIPTORS,
   type ToolExclusionReason,
@@ -428,6 +429,13 @@ export class ManagementApplication {
           input.caller.scope.chatType,
           await this.store.identities.isOwner(input.caller.principalId),
         ),
+      // What the Runtime required a Run to observe, and how the Run answered it. Safe evidence:
+      // domains, Tool names and outcomes, never provider text or protected content.
+      onEvidence: async (record) => {
+        const caller = await this.store.lifecycle.traceCaller(record.runId, record.principalId);
+        const cursor = await this.trace.append(record.runId, record, "glassbox-tool-evidence");
+        await this.store.evidence.advanceTrace(caller, cursor);
+      },
     });
     this.piAdapters.set(profileId, adapter);
     return adapter;
@@ -490,7 +498,11 @@ export class ManagementApplication {
         invoke: async ({ action, params, context }) => {
           const connection = this.connections.get(context.caller.scope.connectionId);
           if (!connection) throw new Error("channel_not_connected");
-          return connection.invokeCapability({ action, params });
+          // The one outbound provider path. A provider result that is not `ok` fails the Tool
+          // call here rather than travelling back as a successful result carrying a failure
+          // envelope, which a model could describe as data and an evidence check could count
+          // as an answer.
+          return requireProviderSuccess(await connection.invokeCapability({ action, params }));
         },
         search: (input) => this.searchCapabilities(input.context, input),
         projectManagedGroups: (context) => this.projectManagedGroups(context),

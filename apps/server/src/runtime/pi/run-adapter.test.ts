@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vite-plus/test";
 import type { ExecutionInput } from "../../execution/run-service/types.js";
 import { GROUP_HISTORY_SEARCH_TOOL, OWNER_HISTORY_SEARCH_TOOL } from "./history-tools.js";
 import { piProfileName, PiRunExecutionAdapter } from "./run-adapter.js";
+import type { RunEvidenceRecord } from "./run-adapter.js";
 import type { PiRunResult, PiRuntimeAdapter } from "./types.js";
 
 function fixture(results: PiRunResult[]) {
@@ -1046,6 +1047,245 @@ describe("an explicit Owner-private cross-group history search requires the Owne
     expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({
       action: "get",
       groupId: "1126022432",
+    });
+  });
+});
+
+describe("a factual answer requires the observation it depends on", () => {
+  /** The read-only QQ Tools the group surface carries in these Runs. */
+  const GROUP_SURFACE = [
+    "qq_groups",
+    "qq_group_members",
+    "qq_group_history",
+    "qq_group_content",
+    "qq_group_files",
+  ] as const;
+
+  function memberFixture(
+    results: PiRunResult[],
+    options: { onEvidence?: (record: RunEvidenceRecord) => void | Promise<void> } = {},
+  ) {
+    const f = fixture(results);
+    f.input.caller.scope.chatType = "group";
+    f.input.caller.scope.chatId = "1126022432";
+    f.input.conversation.scope.chatType = "group";
+    f.input.conversation.scope.chatId = "1126022432";
+    f.input.text = "这个群有哪些成员？";
+    f.createOrRestoreSession.mockImplementation(async (_conversation, _profile, context) => {
+      if (context) context.authorizedToolNames = GROUP_SURFACE;
+      return {
+        conversationId: "conversation-1",
+        runtimeSessionId: "session-1",
+        profileName: "main-agent" as const,
+        agentDir: "agent",
+        createdAt: new Date(0).toISOString(),
+        lastActiveAt: new Date(0).toISOString(),
+      };
+    });
+    return { ...f, executor: new PiRunExecutionAdapter(f.runtime, options) };
+  }
+
+  const members = (overrides: Record<string, unknown> = {}): PiRunResult => ({
+    status: "completed",
+    text: "本群有 3 位成员。",
+    toolCalls: [
+      {
+        name: "qq_group_members",
+        input: { operation: "get_group_member_list", params: {} },
+        failed: false,
+        toolCallId: "call-1",
+        outcome: "success",
+        ...overrides,
+      },
+    ],
+  });
+
+  it("requires the member read and accepts the Run that made it", async () => {
+    const f = memberFixture([members()]);
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "succeeded",
+      text: "本群有 3 位成员。",
+    });
+    expect(f.run).toHaveBeenCalledOnce();
+    expect(f.run.mock.calls[0]?.[3]?.requiredEvidence).toEqual([
+      {
+        domain: "group_members",
+        tool: "qq_group_members",
+        input: { operation: "get_group_member_list" },
+      },
+    ]);
+    // Requiring evidence is not requiring a mutation: the mutating-Tool gate must stay off, or
+    // a read-only Tool would refuse its own call.
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBeUndefined();
+  });
+
+  it("fails closed when the model answers without observing the group", async () => {
+    // The observed failure: the model composes a fluent member list it never fetched.
+    const fabricated = {
+      status: "completed" as const,
+      text: "本群有 42 位成员，其中包含 member-a。",
+      toolCalls: [],
+    };
+    const f = memberFixture([fabricated, fabricated]);
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "failed",
+      text: "未能从 QQ 获取该信息，因此无法确认。",
+    });
+    expect(f.run).toHaveBeenCalledTimes(2);
+    expect(f.run.mock.calls[1]?.[2]).toContain("qq_group_members");
+  });
+
+  it("fails closed when the Tool call itself failed", async () => {
+    // A provider failure is not an observation, so the Run may not answer from it.
+    const unavailable: PiRunResult = {
+      status: "completed",
+      text: "本群有 3 位成员。",
+      toolCalls: [
+        {
+          name: "qq_group_members",
+          input: { operation: "get_group_member_list" },
+          failed: true,
+          outcome: "provider_unavailable",
+          toolCallId: "call-1",
+        },
+      ],
+    };
+    const f = memberFixture([unavailable, unavailable]);
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "failed",
+      text: "未能从 QQ 获取该信息，因此无法确认。",
+    });
+    expect(f.run).toHaveBeenCalledTimes(2);
+  });
+
+  it("requires every domain the message asked about", async () => {
+    const f = memberFixture([
+      { ...members(), text: "本群有 3 位成员，公告见下。" },
+      { ...members(), text: "本群有 3 位成员，公告见下。" },
+    ]);
+    f.input.text = "这个群有哪些成员和群公告？";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "failed",
+      text: "未能从 QQ 获取该信息，因此无法确认。",
+    });
+    expect(f.run.mock.calls[1]?.[2]).toContain("qq_group_content");
+  });
+
+  it("never forgets a domain the first attempt observed", async () => {
+    // The first Run observed the members; the second observed the notice. Both are evidence,
+    // and reading only the latest result would discard the first.
+    const firstRun: PiRunResult = {
+      ...members(),
+      text: "本群有 3 位成员。",
+    };
+    const secondRun: PiRunResult = {
+      status: "completed",
+      text: "本群有 3 位成员，公告见下。",
+      toolCalls: [
+        {
+          name: "qq_group_content",
+          input: { operation: "_get_group_notice", params: {} },
+          failed: false,
+          toolCallId: "call-2",
+          outcome: "success",
+        },
+      ],
+    };
+    const f = memberFixture([firstRun, secondRun]);
+    f.input.text = "这个群有哪些成员和群公告？";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "succeeded",
+      text: "本群有 3 位成员，公告见下。",
+    });
+    expect(f.run).toHaveBeenCalledTimes(2);
+  });
+
+  it("requires nothing when the Run's surface cannot answer the question", async () => {
+    // The Tool is not on this Run's surface, so no observation is possible and the Run is not
+    // failed against a call it could never make.
+    const f = memberFixture([{ status: "completed", text: "本群有 3 位成员。", toolCalls: [] }]);
+    f.createOrRestoreSession.mockImplementation(async (_conversation, _profile, context) => {
+      if (context) context.authorizedToolNames = ["qq_groups"];
+      return {
+        conversationId: "conversation-1",
+        runtimeSessionId: "session-1",
+        profileName: "main-agent" as const,
+        agentDir: "agent",
+        createdAt: new Date(0).toISOString(),
+        lastActiveAt: new Date(0).toISOString(),
+      };
+    });
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(f.run.mock.calls[0]?.[3]?.requiredEvidence).toBeUndefined();
+  });
+
+  it("records what it required and how the Run answered, for the Trace", async () => {
+    const records: unknown[] = [];
+    const f = memberFixture([members()], {
+      onEvidence: (record) => {
+        records.push(record);
+      },
+    });
+    await f.executor.execute(f.input);
+
+    expect(records).toEqual([
+      {
+        type: "tool_evidence",
+        runId: "run-1",
+        principalId: "owner",
+        conversationId: "conversation-1",
+        phase: "required",
+        required: [
+          {
+            domain: "group_members",
+            tool: "qq_group_members",
+            input: { operation: "get_group_member_list" },
+          },
+        ],
+      },
+      {
+        type: "tool_evidence",
+        runId: "run-1",
+        principalId: "owner",
+        conversationId: "conversation-1",
+        phase: "resolved",
+        resolutions: [
+          {
+            domain: "group_members",
+            tool: "qq_group_members",
+            toolCallId: "call-1",
+            outcome: "success",
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("records the honest outcome when the Run never observed the domain", async () => {
+    const records: { phase?: string; resolutions?: unknown }[] = [];
+    const fabricated = { status: "completed" as const, text: "本群有 42 位成员。", toolCalls: [] };
+    const f = memberFixture([fabricated, fabricated], {
+      onEvidence: (record) => {
+        records.push(record as { phase?: string; resolutions?: unknown });
+      },
+    });
+    await f.executor.execute(f.input);
+
+    expect(records.map((record) => record.phase)).toEqual(["required", "resolved"]);
+    expect(records[1]?.resolutions).toEqual([
+      { domain: "group_members", tool: "qq_group_members", outcome: "not_called" },
+    ]);
+  });
+
+  it("does not let a broken evidence recorder change the Run's answer", async () => {
+    const f = memberFixture([members()], {
+      onEvidence: () => {
+        throw new Error("trace unavailable");
+      },
+    });
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "succeeded",
+      text: "本群有 3 位成员。",
     });
   });
 });

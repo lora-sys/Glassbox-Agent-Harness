@@ -703,6 +703,33 @@ export type ToolExecutionOutcome =
   | "unknown";
 
 /**
+ * The outcome a recorded failure code stands for.
+ *
+ * The Trace carries a fixed code rather than an outcome because the code is what a reader
+ * greps for; this is the same fact in the vocabulary the Runtime branches on. An unrecognized
+ * code is `unknown`, never `success`: a code this build does not understand is not evidence
+ * that the call worked.
+ */
+export function toolOutcomeFromFailure(code: string): ToolExecutionOutcome {
+  switch (code) {
+    case "authorization_denied":
+    case "capability_category_disabled":
+    case "context_missing":
+    case "provider_denied":
+      return "denied";
+    case "input_validation_failed":
+      return "invalid_input";
+    case "provider_unavailable":
+      return "provider_unavailable";
+    case "protected_tool_failed":
+    case "provider_failed":
+      return "provider_failed";
+    default:
+      return "unknown";
+  }
+}
+
+/**
  * What is actually known about one Tool right now.
  *
  * The ladder is ordered and every rung is earned. In particular `succeeded` is reachable

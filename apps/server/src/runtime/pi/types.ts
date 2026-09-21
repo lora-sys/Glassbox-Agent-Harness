@@ -56,6 +56,22 @@ export interface PiRunResult {
     failed?: boolean;
     blocked?: boolean;
     reason?: string;
+    /**
+     * The runtime's identifier for this call, when the runtime supplied one.
+     *
+     * A required-evidence check and the Trace both need to name the *call* rather than the
+     * Tool: one Run may call the same Tool twice, and only one of those calls answered the
+     * question. Without the id the evidence cannot be pointed back at the exact call.
+     */
+    toolCallId?: string;
+    /**
+     * What actually happened, in the shared Tool-plane vocabulary.
+     *
+     * `failed` alone is not enough to decide whether a call answered anything: a refusal, a
+     * malformed call and an unavailable provider are all failures, and only one of them is a
+     * fact about the world that a Run may report.
+     */
+    outcome?: ToolExecutionOutcome;
   }>;
   usage?: {
     inputTokens?: number;
@@ -66,6 +82,8 @@ export interface PiRunResult {
 }
 
 import type { CallerContext } from "../../identity/scope.js";
+import type { ToolExecutionOutcome } from "./tool-plane.js";
+import type { RequiredEvidence } from "./required-evidence.js";
 
 export interface PiRunContext {
   caller?: CallerContext;
@@ -84,6 +102,15 @@ export interface PiRunContext {
    * Run closed against a Tool that was never offered to the model.
    */
   authorizedToolNames?: readonly string[];
+  /**
+   * The factual domains the current user message requires evidence from.
+   *
+   * Resolved once per Run from the message and the surface, then carried on the context so
+   * the completion check and the Tool plane read the same list. An empty array means the
+   * message requires no evidence; `undefined` means no policy was resolved at all, which the
+   * completion check treats as nothing required rather than as a blanket requirement.
+   */
+  requiredEvidence?: readonly RequiredEvidence[];
 }
 
 export interface PiRuntimeAdapter {

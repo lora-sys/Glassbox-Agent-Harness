@@ -609,3 +609,143 @@ describe("PiSdkRuntimeAdapter", () => {
     await adapter.cleanup();
   });
 });
+
+describe("PiSdkRuntimeAdapter provider outcomes", () => {
+  /**
+   * A Run whose session emits the tool calls it is given, so the recorded Run result is the
+   * only thing under test.
+   */
+  async function runWithCalls(
+    calls: Array<{
+      toolCallId: string;
+      toolName: string;
+      args: Record<string, unknown>;
+      result: unknown;
+      isError: boolean;
+    }>,
+  ) {
+    const runtimeBaseDir = await mkdtemp(join(tmpdir(), "glassbox-pi-runtime-"));
+    directories.push(runtimeBaseDir);
+    // The adapter reads calls from its own event stream, so the fake session subscribes the
+    // listener the adapter installs and replays the calls through it.
+    const adapter = new PiSdkRuntimeAdapter({
+      kitPath: fileURLToPath(new URL("./fixtures/lora-pi-kit", import.meta.url)),
+      runtimeBaseDir,
+      resolveToolNames: async () => [...new Set(calls.map((call) => call.toolName))],
+      resolveSkillNames: async () => ({ names: [] }),
+      createSession: async () =>
+        ({
+          sessionId: "pi-session-outcomes",
+          messages: [
+            { role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" },
+          ],
+          subscribe(callback: (event: AgentSessionEvent) => void) {
+            for (const call of calls)
+              callback({
+                type: "tool_execution_start",
+                toolCallId: call.toolCallId,
+                toolName: call.toolName,
+                args: call.args,
+              } as never);
+            for (const call of calls)
+              callback({
+                type: "tool_execution_end",
+                toolCallId: call.toolCallId,
+                toolName: call.toolName,
+                result: call.result,
+                isError: call.isError,
+              } as never);
+            return () => {};
+          },
+          async prompt() {},
+          async abort() {},
+          dispose() {},
+        }) as never,
+    });
+
+    await adapter.initialize();
+    const context: PiRunContext = { runId: run.id, conversationId: conversation.id };
+    const binding = await adapter.createOrRestoreSession(conversation, "test", context);
+    const result = await adapter.run(binding, run, "hello", context);
+    await adapter.cleanup();
+    return result;
+  }
+
+  it("records a successful call with its id and outcome", async () => {
+    const result = await runWithCalls([
+      {
+        toolCallId: "call-1",
+        toolName: "qq_group_members",
+        args: { operation: "get_group_member_list" },
+        result: { content: [{ type: "text", text: '{"members":[]}' }] },
+        isError: false,
+      },
+    ]);
+    expect(result.toolCalls).toEqual([
+      {
+        name: "qq_group_members",
+        input: { operation: "get_group_member_list" },
+        toolCallId: "call-1",
+        result: { content: [{ type: "text", text: '{"members":[]}' }] },
+        failed: false,
+        outcome: "success",
+      },
+    ]);
+  });
+
+  it("records a provider failure as the failure it is, not as a broken Tool", async () => {
+    // The bridge being down is a fact about the world. Collapsing it into the generic failure
+    // would erase the distinction a Run has to report.
+    const result = await runWithCalls([
+      {
+        toolCallId: "call-1",
+        toolName: "qq_group_members",
+        args: { operation: "get_group_member_list" },
+        result: { content: [{ type: "text", text: "provider_unavailable" }] },
+        isError: true,
+      },
+    ]);
+    expect(result.toolCalls[0]).toMatchObject({
+      failed: true,
+      outcome: "provider_unavailable",
+    });
+  });
+
+  it("classifies a provider refusal as denied", async () => {
+    const result = await runWithCalls([
+      {
+        toolCallId: "call-1",
+        toolName: "qq_groups",
+        args: { operation: "get_group_info" },
+        result: { content: [{ type: "text", text: "provider_denied" }] },
+        isError: true,
+      },
+    ]);
+    expect(result.toolCalls[0]).toMatchObject({ failed: true, outcome: "denied" });
+  });
+
+  it("attaches each result to the call that produced it", async () => {
+    // One Run may call the same Tool twice, and a result credited to the wrong call would
+    // count as evidence for a call that never produced it.
+    const result = await runWithCalls([
+      {
+        toolCallId: "call-1",
+        toolName: "qq_group_members",
+        args: { operation: "get_group_member_list", params: { group_id: "1" } },
+        result: { content: [{ type: "text", text: "provider_failed" }] },
+        isError: true,
+      },
+      {
+        toolCallId: "call-2",
+        toolName: "qq_group_members",
+        args: { operation: "get_group_member_list", params: { group_id: "2" } },
+        result: { content: [{ type: "text", text: "[]" }] },
+        isError: false,
+      },
+    ]);
+    expect(result.toolCalls).toMatchObject([
+      { toolCallId: "call-1", failed: true, outcome: "provider_failed" },
+      { toolCallId: "call-2", failed: false, outcome: "success" },
+    ]);
+  });
+});

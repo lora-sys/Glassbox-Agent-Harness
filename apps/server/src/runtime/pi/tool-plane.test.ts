@@ -15,6 +15,7 @@ import {
   describeToolSurface,
   toolDescriptor,
   toolOperationalState,
+  toolOutcomeFromFailure,
 } from "./tool-plane.js";
 
 describe("P5 tool plane origins", () => {
@@ -444,5 +445,36 @@ describe("P5 Tool operational state", () => {
 
   it("does not let a denied authorization masquerade as readiness", () => {
     expect(toolOperationalState({ ...registered, authorization: "denied" })).toBe("registered");
+  });
+});
+
+describe("P5 Tool execution outcomes", () => {
+  it("classifies a refusal as denied, whichever rule refused", () => {
+    // Glassbox authorization, an Owner-disabled capability class, a missing Run context and a
+    // provider allowlist refusal all mean the same thing to a Run: nothing was observed.
+    for (const code of [
+      "authorization_denied",
+      "capability_category_disabled",
+      "context_missing",
+      "provider_denied",
+    ])
+      expect(toolOutcomeFromFailure(code)).toBe("denied");
+  });
+
+  it("separates a malformed call from a failure the caller cannot correct", () => {
+    expect(toolOutcomeFromFailure("input_validation_failed")).toBe("invalid_input");
+  });
+
+  it("separates an unavailable provider from a failed request", () => {
+    expect(toolOutcomeFromFailure("provider_unavailable")).toBe("provider_unavailable");
+    expect(toolOutcomeFromFailure("provider_failed")).toBe("provider_failed");
+    expect(toolOutcomeFromFailure("protected_tool_failed")).toBe("provider_failed");
+  });
+
+  it("never reads an unrecognized code as success", () => {
+    // A code this build does not understand is not evidence that the call worked.
+    expect(toolOutcomeFromFailure("tool_execution_failed")).toBe("unknown");
+    expect(toolOutcomeFromFailure("")).toBe("unknown");
+    expect(toolOutcomeFromFailure("something_new")).toBe("unknown");
   });
 });
