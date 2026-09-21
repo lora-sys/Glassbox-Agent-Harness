@@ -12,6 +12,10 @@
  * that exact string or you did not find it. Partial overlap is not weak evidence of it, it is
  * a different term. So a query that carries one is answered by containment, not by tokens.
  *
+ * Both sides of that comparison read a value through the same rule. A message carrying the
+ * query's own text must be a match for it, and it is not one if naming a value and recognizing
+ * it disagree about where the value ends.
+ *
  * The rule is deliberately narrow. Widening it to any alphanumeric run would turn ordinary
  * searches — `iOS18`, `v2`, a year — into containment searches and answer "not found" for
  * messages that really are about the question. Narrowing it to the one shape that caused the
@@ -24,8 +28,8 @@ const IDENTIFIER_RUN = /[A-Za-z0-9][A-Za-z0-9._-]*/gu;
 /** A separator between identifier segments, or a trailing one a sentence added. */
 const SEPARATOR = /[._-]/u;
 
-/** Characters that continue an identifier, so a match inside one is not a match. */
-const IDENTIFIER_CHARACTER = /[a-z0-9._-]/u;
+/** The separators a run ends with, which the sentence contributed rather than the value. */
+const TRAILING_SEPARATORS = /[._-]+$/u;
 
 /**
  * Below this, a run is a label rather than an identifier: `v2`, `a1`, `第1`.
@@ -52,6 +56,24 @@ function isIdentifierTerm(run: string): boolean {
 }
 
 /**
+ * The value one identifier run names: lowercased, without the separators the sentence added.
+ *
+ * Both sides of the search read a run through this one function. Naming a value and recognizing
+ * it have to be the same rule, or a message carrying the query's own text is not a match for it:
+ * the query side dropped a trailing separator as the sentence's, while the candidate side asked
+ * for a non-identifier character after the term, so `见 P4B-A-1349.` named `p4b-a-1349` and a
+ * message ending with exactly that text was dropped as a different value. The search then
+ * answered "not found" for a message that is really there — the wrong answer the containment
+ * rule exists to prevent, arriving from the other direction.
+ *
+ * A separator ends the value only when nothing but separators follow it: `P4B-A-1349.` is the
+ * identifier and a full stop, while `P4B-A-1349.2` is one longer value.
+ */
+function identifierValue(run: string): string {
+  return run.replace(TRAILING_SEPARATORS, "").toLowerCase();
+}
+
+/**
  * The arbitrary-value terms a query carries, lowercased and deduplicated in query order.
  *
  * Empty for a prose query, which is the signal that the search needs no containment rule.
@@ -59,40 +81,26 @@ function isIdentifierTerm(run: string): boolean {
 export function exactTerms(query: string): string[] {
   const terms: string[] = [];
   for (const match of query.matchAll(IDENTIFIER_RUN)) {
-    // A sentence's own punctuation is not part of the value it names.
-    const run = match[0].replace(/[._-]+$/u, "");
-    if (!isIdentifierTerm(run)) continue;
-    const term = run.toLowerCase();
+    const term = identifierValue(match[0]);
+    if (!isIdentifierTerm(term)) continue;
     if (!terms.includes(term)) terms.push(term);
   }
   return terms;
 }
 
-/** Whether `text` carries one occurrence of `term` that is not part of a longer identifier. */
-function carriesTerm(text: string, term: string): boolean {
-  let from = 0;
-  for (;;) {
-    const at = text.indexOf(term, from);
-    if (at === -1) return false;
-    const before = at === 0 ? undefined : text[at - 1];
-    const after = text[at + term.length];
-    const bounded = (character: string | undefined) =>
-      character === undefined || !IDENTIFIER_CHARACTER.test(character);
-    if (bounded(before) && bounded(after)) return true;
-    from = at + 1;
-  }
-}
-
 /**
  * Whether a candidate's own text carries every identifier the query named.
  *
- * A candidate that fails this was never a match, so dropping it is not truncation and does
- * not make the search partial. `text` is the content the model is shown: an identifier that
- * appears only in a field the answer cannot disclose would leave the model reading a hit
- * that does not contain the thing it was asked about.
+ * Read with the same boundary rule that named the terms, so a candidate carrying one of them is
+ * recognized however the sentence around it is punctuated. A candidate that fails this carries a
+ * different value, so dropping it is not truncation and does not make the search partial. `text`
+ * is the content the model is shown: an identifier that appears only in a field the answer
+ * cannot disclose would leave the model reading a hit that does not contain the thing it was
+ * asked about.
  */
 export function carriesEveryExactTerm(text: string, terms: readonly string[]): boolean {
   if (terms.length === 0) return true;
-  const haystack = text.toLowerCase();
-  return terms.every((term) => carriesTerm(haystack, term));
+  const carried = new Set<string>();
+  for (const match of text.matchAll(IDENTIFIER_RUN)) carried.add(identifierValue(match[0]));
+  return terms.every((term) => carried.has(term));
 }

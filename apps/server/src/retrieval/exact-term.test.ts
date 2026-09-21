@@ -76,7 +76,51 @@ describe("whether a candidate carries the identifiers", () => {
     expect(carriesEveryExactTerm("p4b-a-1349 已修复", ["p4b-a-1349"])).toBe(true);
   });
 
+  it("matches an identifier the message ends with the sentence's own punctuation", () => {
+    // The query side already reads a trailing separator as the sentence's rather than the
+    // value's. The candidate side has to read it the same way: a message that ends the
+    // identifier with a full stop carries the identifier, and dropping it answers "not found"
+    // for a message that is really there — the same class of wrong answer the containment rule
+    // exists to prevent, from the other direction.
+    expect(carriesEveryExactTerm("编号：P4B-A-1349.", ["p4b-a-1349"])).toBe(true);
+    expect(carriesEveryExactTerm("订单 order_123. 已处理", ["order_123"])).toBe(true);
+    expect(carriesEveryExactTerm("P4B-A-1349_", ["p4b-a-1349"])).toBe(true);
+  });
+
+  it("still rejects a longer identifier that continues past the separator", () => {
+    // A trailing separator is the sentence's only when the value ends there. `P4B-A-1349.2` is
+    // a different value, and accepting it would credit another record's sender, time and text
+    // to the identifier that was asked about.
+    expect(carriesEveryExactTerm("P4B-A-1349.2 的发送者", ["p4b-a-1349"])).toBe(false);
+    expect(carriesEveryExactTerm("order_123-2 已处理", ["order_123"])).toBe(false);
+  });
+
   it("carries nothing when the query named no identifier", () => {
     expect(carriesEveryExactTerm("deploy rollback", [])).toBe(true);
+  });
+});
+
+describe("the two sides of a containment search", () => {
+  it("read one boundary rule, so a query matches the text it literally is", () => {
+    // The property that makes containment trustworthy, stated without naming a mechanism: a
+    // message carrying the query's own text must be found. It held for `P4B-A-1349` and broke
+    // for every shape where the value ends the sentence, because the query side stripped the
+    // separator and the candidate side counted it as part of the value. Stating it this way
+    // fails on that whole class rather than on the one punctuation mark that was noticed.
+    for (const text of [
+      "P4B-A-1349",
+      "见 P4B-A-1349.",
+      "编号：P4B-A-1349.",
+      "P4B-A-1349_",
+      "订单 order_123. 已处理",
+      "order_123_",
+      "v1.2.3.",
+      "1234567890.",
+      "P4B-A-1349 和 order_123 都在",
+    ]) {
+      const terms = exactTerms(text);
+      expect(terms, text).not.toEqual([]);
+      expect(carriesEveryExactTerm(text, terms), text).toBe(true);
+    }
   });
 });

@@ -306,6 +306,24 @@ describe("P4B exact identifier retrieval", () => {
     expect(detailed.coverage.candidateCapReached).toBe(false);
   });
 
+  it("returns the message that carries the identifier, however the sentence ends it", async () => {
+    // A message that writes the identifier and then a full stop carries the identifier. The
+    // search dropped it while the two sides disagreed about where the value ends — the same
+    // wrong answer as the incident, "no such message" for a message that is really there.
+    const store = new MockCandidateStore([
+      { ...exact, id: "cand-period", text: "P4B-A-1349. 已经合并到 main 了" },
+      { ...exact, id: "cand-longer", text: "P4B-A-1349.2 是另一条记录" },
+    ]);
+    const retriever = new MemoryRetriever({ store });
+
+    const detailed = await retriever.searchDetailed("P4B-A-1349", {
+      allowedSourceIds: ["group-1"],
+    });
+
+    expect(detailed.results.map((result) => result.memory.id)).toEqual(["cand-period"]);
+    expect(detailed.coverage.droppedByExactTerm).toBe(1);
+  });
+
   it("requires every identifier a query names", async () => {
     const store = new MockCandidateStore([
       { ...exact, id: "only-one", text: "P4B-A-1349 单独出现" },
