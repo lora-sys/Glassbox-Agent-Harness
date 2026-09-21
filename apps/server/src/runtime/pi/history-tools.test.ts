@@ -1105,3 +1105,194 @@ it("withholds the sender of an item whose content is withheld", async () => {
     await store.close();
   }
 });
+
+/**
+ * The exact identifier the regression fixture searches for.
+ *
+ * Deliberately not a real production message: the deterministic suite owns its own canary,
+ * and the real acceptance run uses a temporary one in a dedicated test group.
+ */
+const EXACT_IDENTIFIER = "P4B-A-1349";
+
+/** Messages that share a token with the identifier without carrying it. */
+async function ingestNearMisses(
+  archive: Awaited<ReturnType<typeof fixture>>["archive"],
+): Promise<void> {
+  await archive.ingest({
+    channel: "qq",
+    connectionId,
+    groupId: "100",
+    externalMessageId: "g100-near-1",
+    senderId: "member-c",
+    senderName: "Near",
+    normalizedText: "编号 1349 已经修好了",
+    occurredAt: "2026-09-21T09:00:00Z",
+  });
+  await archive.ingest({
+    channel: "qq",
+    connectionId,
+    groupId: "100",
+    externalMessageId: "g100-near-2",
+    senderId: "member-d",
+    senderName: "AlsoNear",
+    normalizedText: "P4B 这个流还没开始",
+    occurredAt: "2026-09-21T09:30:00Z",
+  });
+}
+
+it("answers an exact identifier from the message that carries it and nothing else", async () => {
+  const { store, archive } = await fixture();
+  try {
+    await ingestNearMisses(archive);
+    await archive.ingest({
+      channel: "qq",
+      connectionId,
+      groupId: "100",
+      externalMessageId: "g100-exact",
+      senderId: "member-e",
+      senderName: "Carrier",
+      normalizedText: `已合并 ${EXACT_IDENTIFIER} 到 main`,
+      occurredAt: "2026-09-18T09:00:00Z",
+    });
+    const tools = await groupRunTools(store, archive);
+    const { text } = await callModelVisible(toolByName(tools, GROUP_HISTORY_SEARCH_TOOL), {
+      query: EXACT_IDENTIFIER,
+    });
+    const view = JSON.parse(text) as {
+      results: Array<{ sender?: string; occurredAt?: string; text: string; groupId: string }>;
+      resultStatus: string;
+      coverage: { exactTerms: string[]; droppedByExactTerm: number; coverage: string };
+    };
+
+    // Sender, time and original text come only from the record the Tool returned. The
+    // near misses are absent even though they outrank nothing here — they simply are not
+    // messages about this identifier.
+    expect(view.resultStatus).toBe("matches_found");
+    expect(view.results).toHaveLength(1);
+    expect(view.results[0]).toMatchObject({
+      groupId: "100",
+      sender: "member-e",
+      occurredAt: "2026-09-18T09:00:00Z",
+      text: `已合并 ${EXACT_IDENTIFIER} 到 main`,
+    });
+    expect(view.coverage.exactTerms).toEqual([EXACT_IDENTIFIER.toLowerCase()]);
+    expect(view.coverage.droppedByExactTerm).toBe(2);
+    expect(view.coverage.coverage).toBe("complete");
+  } finally {
+    await store.close();
+  }
+});
+
+it("never lets a near miss stand in for an identifier the history does not contain", async () => {
+  const { store, archive } = await fixture();
+  try {
+    await ingestNearMisses(archive);
+    const tools = await groupRunTools(store, archive);
+    const { text } = await callModelVisible(toolByName(tools, GROUP_HISTORY_SEARCH_TOOL), {
+      query: EXACT_IDENTIFIER,
+    });
+    const view = JSON.parse(text) as {
+      results: unknown[];
+      resultStatus: string;
+      guidance: string;
+      coverage: { exactTerms: string[]; droppedByExactTerm: number };
+    };
+
+    // The incident's mechanism, closed at the Tool result: the model is handed neither a
+    // near miss nor any field of one, so the identifier cannot be answered from the query
+    // string plus a plausible-looking record.
+    expect(view.results).toEqual([]);
+    expect(view.resultStatus).toBe("no_matches_in_searched_window");
+    // The evidence spells the term in one case so two queries that differ only in case
+    // produce identical records; the guidance still names the identifier that was asked for.
+    expect(view.guidance.toLowerCase()).toContain(EXACT_IDENTIFIER.toLowerCase());
+    expect(view.guidance).toContain("verbatim");
+    expect(view.coverage.droppedByExactTerm).toBe(2);
+    expect(text).not.toContain("1349 已经修好了");
+    expect(text).not.toContain("member-c");
+    expect(text).not.toContain("Near");
+  } finally {
+    await store.close();
+  }
+});
+
+it("says why a short result is short instead of leaving it to be inferred", async () => {
+  const { store, archive } = await fixture();
+  try {
+    await ingestNearMisses(archive);
+    const tools = await groupRunTools(store, archive);
+    const { text } = await callModelVisible(toolByName(tools, GROUP_HISTORY_SEARCH_TOOL), {
+      query: EXACT_IDENTIFIER,
+    });
+    const view = JSON.parse(text) as {
+      considered: number;
+      truncated: boolean;
+      coverage: {
+        considered: number;
+        returned: number;
+        droppedByExactTerm: number;
+        truncationReasons: string[];
+        coverage: string;
+        groupsSearched: number;
+      };
+    };
+
+    // `considered` counts what was read; the reason the answer is short is named rather
+    // than left as a gap. Nothing was cut, so the window still reads `complete` — calling
+    // this truncation would invite "search again" for a question that was answered.
+    expect(view.considered).toBe(2);
+    expect(view.coverage).toMatchObject({
+      considered: 2,
+      returned: 0,
+      droppedByExactTerm: 2,
+      truncationReasons: [],
+      coverage: "complete",
+      groupsSearched: 1,
+    });
+    expect(view.truncated).toBe(false);
+  } finally {
+    await store.close();
+  }
+});
+
+it("records the exact terms it required in the retrieval evidence", async () => {
+  const { store, archive } = await fixture();
+  try {
+    await ingestNearMisses(archive);
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: groupResourceId("100"),
+      action: "history:read",
+      scope: group100,
+      effect: "allow",
+    });
+    const accepted = await accept(store, group100);
+    const evidence: HistoryRetrievalEvidence[] = [];
+    const tools = createHistoryTools({
+      store,
+      archive,
+      isHistoryEnabled: historyEnabled,
+      getContext: () => ({
+        caller: { principalId: "owner", scope: group100 },
+        runId: accepted.run.id,
+        conversationId: accepted.conversation.id,
+      }),
+      recordEvidence: async (value) => {
+        evidence.push(value);
+      },
+    });
+
+    await call(toolByName(tools, GROUP_HISTORY_SEARCH_TOOL), { query: EXACT_IDENTIFIER });
+
+    // Trace must be able to answer "why did this search return nothing" without the model's
+    // own answer being the only record of it.
+    expect(evidence).toHaveLength(1);
+    expect(evidence[0]!.coverage).toMatchObject({
+      exactTerms: [EXACT_IDENTIFIER.toLowerCase()],
+      droppedByExactTerm: 2,
+      coverage: "complete",
+    });
+  } finally {
+    await store.close();
+  }
+});

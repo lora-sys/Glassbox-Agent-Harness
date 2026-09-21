@@ -165,6 +165,8 @@ describe("P4B retrieval coverage", () => {
       candidateCapReached: false,
       droppedByLimit: 26,
       droppedByFilter: 0,
+      exactTerms: [],
+      droppedByExactTerm: 0,
     });
   });
 
@@ -229,6 +231,106 @@ describe("P4B retrieval coverage", () => {
     expect(detailed.coverage.considered).toBe(0);
     expect(detailed.coverage.candidateCapReached).toBe(false);
     expect(store.searchedSourceIds).toEqual([]);
+  });
+});
+
+describe("P4B exact identifier retrieval", () => {
+  /** The archive's own near-misses: messages that share a token with the identifier. */
+  const nearMisses: RetrievalCandidate[] = [
+    {
+      id: "cand-1349",
+      sourceId: "group-1",
+      sourceKind: "channel_message",
+      text: "编号 1349 已经修好了",
+      timestamp: "2026-09-19T10:00:00Z",
+    },
+    {
+      id: "cand-p4b",
+      sourceId: "group-1",
+      sourceKind: "channel_message",
+      text: "P4B 这个流还没开始",
+      timestamp: "2026-09-19T11:00:00Z",
+    },
+  ];
+
+  const exact: RetrievalCandidate = {
+    id: "cand-exact",
+    sourceId: "group-1",
+    sourceKind: "channel_message",
+    text: "P4B-A-1349 已经合并到 main 了",
+    timestamp: "2026-09-18T09:00:00Z",
+  };
+
+  it("keeps an exact matching message retrievable", async () => {
+    const store = new MockCandidateStore([...nearMisses, exact]);
+    const retriever = new MemoryRetriever({ store });
+
+    const detailed = await retriever.searchDetailed("P4B-A-1349", {
+      allowedSourceIds: ["group-1"],
+    });
+
+    expect(detailed.results.map((result) => result.memory.id)).toEqual(["cand-exact"]);
+    expect(detailed.coverage.exactTerms).toEqual(["p4b-a-1349"]);
+    expect(detailed.coverage.droppedByExactTerm).toBe(2);
+  });
+
+  it("never hands the model a message that merely shares a fragment of the identifier", async () => {
+    // The incident: the identifier tokenizes to `p4b`, `a`, `1349`, so a message mentioning
+    // only `1349` scored as a hit and reached the model as a match for `P4B-A-1349`.
+    const store = new MockCandidateStore(nearMisses);
+    const retriever = new MemoryRetriever({ store });
+
+    const detailed = await retriever.searchDetailed("P4B-A-1349", {
+      allowedSourceIds: ["group-1"],
+    });
+
+    expect(detailed.results).toEqual([]);
+    expect(detailed.coverage.returned).toBe(0);
+    expect(detailed.coverage.considered).toBe(2);
+    expect(JSON.stringify(detailed.results)).not.toContain("1349 已经修好了");
+  });
+
+  it("counts a near miss as a filter, not as truncation, so the window still reads complete", async () => {
+    const store = new MockCandidateStore(nearMisses);
+    const retriever = new MemoryRetriever({ store });
+
+    const detailed = await retriever.searchDetailed("P4B-A-1349", {
+      allowedSourceIds: ["group-1"],
+    });
+
+    // Nothing was cut: every candidate the archive held was read and judged. Reporting this
+    // as truncation would invite the opposite error — "the window was not exhausted, so try
+    // again" — for a question that was answered.
+    expect(detailed.coverage.droppedByFilter).toBe(0);
+    expect(detailed.coverage.droppedByLimit).toBe(0);
+    expect(detailed.coverage.candidateCapReached).toBe(false);
+  });
+
+  it("requires every identifier a query names", async () => {
+    const store = new MockCandidateStore([
+      { ...exact, id: "only-one", text: "P4B-A-1349 单独出现" },
+      { ...exact, id: "both", text: "P4B-A-1349 与 order_123 都在这条消息里" },
+    ]);
+    const retriever = new MemoryRetriever({ store });
+
+    const detailed = await retriever.searchDetailed("P4B-A-1349 和 order_123", {
+      allowedSourceIds: ["group-1"],
+    });
+
+    expect(detailed.results.map((result) => result.memory.id)).toEqual(["both"]);
+  });
+
+  it("leaves a prose query on the token path", async () => {
+    const store = new MockCandidateStore(nearMisses);
+    const retriever = new MemoryRetriever({ store });
+
+    const detailed = await retriever.searchDetailed("1349 修好了吗", {
+      allowedSourceIds: ["group-1"],
+    });
+
+    expect(detailed.coverage.exactTerms).toEqual([]);
+    expect(detailed.coverage.droppedByExactTerm).toBe(0);
+    expect(detailed.results).toHaveLength(2);
   });
 });
 

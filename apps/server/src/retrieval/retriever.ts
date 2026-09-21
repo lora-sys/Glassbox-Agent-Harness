@@ -36,6 +36,7 @@ import type {
   RedactionInfo,
 } from "@glassbox/contracts";
 import { jaccardSimilarity, tokenizeText } from "./tokenizer.js";
+import { carriesEveryExactTerm, exactTerms } from "./exact-term.js";
 
 export interface RetrievalCandidate {
   id: string;
@@ -95,6 +96,22 @@ export interface RetrievalCoverage {
   droppedByLimit: number;
   /** Candidates dropped by duplicate suppression or a time bound before scoring. */
   droppedByFilter: number;
+  /**
+   * The arbitrary-value terms this query required verbatim. Empty for a prose query.
+   *
+   * Recorded rather than inferred so a caller reading a short result can tell which rule
+   * produced it without re-deriving the query's shape.
+   */
+  exactTerms: string[];
+  /**
+   * Candidates the store returned that did not carry every exact term.
+   *
+   * Counted apart from `droppedByFilter` because the two answer different questions: that
+   * one is "the same thing again", this one is "a different thing". Neither is truncation —
+   * these candidates were read and judged, not cut — so `candidateCapReached` and the
+   * caller's own bounds remain the only reasons a window can be called partial.
+   */
+  droppedByExactTerm: number;
 }
 
 export interface DetailedSearch {
@@ -158,6 +175,10 @@ export class MemoryRetriever {
   async searchDetailed(query: string, opts: MemorySearchOpts): Promise<DetailedSearch> {
     const limit = opts.limit ?? 10;
     const overFetchLimit = Math.min(200, limit * 10);
+    // An identifier query is answered by containment rather than by tokens. `P4B-A-1349`
+    // tokenizes to `p4b`, `a`, `1349`, so a message mentioning only `1349` scores as a hit
+    // and reaches the model looking exactly like the message that carries the identifier.
+    const requiredTerms = exactTerms(query);
     const empty: RetrievalCoverage = {
       requestedLimit: limit,
       returned: 0,
@@ -166,6 +187,8 @@ export class MemoryRetriever {
       candidateCapReached: false,
       droppedByLimit: 0,
       droppedByFilter: 0,
+      exactTerms: requiredTerms,
+      droppedByExactTerm: 0,
     };
 
     // Security invariant: source filtering before candidate loading.
@@ -207,6 +230,14 @@ export class MemoryRetriever {
     const scored: ScoredCandidate[] = [];
 
     for (const candidate of candidates) {
+      // The query named an identifier, so only a candidate that carries it verbatim is a
+      // match at all. This runs before scoring and before duplicate suppression: a near miss
+      // is not a low-scoring hit, it is a different term, and no score can make it one.
+      if (!carriesEveryExactTerm(candidate.text, requiredTerms)) {
+        coverage.droppedByExactTerm++;
+        continue;
+      }
+
       // Duplicate suppression
       if (this.dedupeDuplicates) {
         const normalized = candidate.text.trim().toLowerCase();

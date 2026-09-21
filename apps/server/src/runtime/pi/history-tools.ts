@@ -121,7 +121,14 @@ export interface HistorySearchCoverage {
   requestedLimit: number;
   /** Hits that reached the model. */
   returned: number;
-  /** Candidates the archive produced before any bound. */
+  /**
+   * Candidates the archive produced for this search, before any filter or bound.
+   *
+   * This is what the search actually considered, so it is the number a reader compares
+   * against `returned`. The per-source `considered` below is the bound's own view — how many
+   * of these reached it — and the difference between the two is exactly the candidates the
+   * filters named: `droppedByExactTerm`, and the retriever's own filter count.
+   */
   considered: number;
   /** True when at least one candidate was dropped by a bound rather than by authorization. */
   truncated: boolean;
@@ -129,6 +136,21 @@ export interface HistorySearchCoverage {
   truncationReasons: TruncationReason[];
   /** The per-source cap this search applied; `null` when the search targeted one group. */
   perSourceCap: number | null;
+  /**
+   * The arbitrary-value terms this query required verbatim. Empty for a prose query.
+   *
+   * Present so a caller can see that the search was a containment search, and so a short
+   * result can be explained without re-deriving the query's shape.
+   */
+  exactTerms: string[];
+  /**
+   * Candidates the archive returned that did not carry every exact term.
+   *
+   * These were read and judged, not cut, so this is not a truncation reason: the window is
+   * still `complete`. It is the answer to "the search considered more than it returned —
+   * why", which is the question a bare `considered`/`returned` gap leaves open.
+   */
+  droppedByExactTerm: number;
   /**
    * `complete` — every candidate the archive held was returned.
    * `partial` — a bound cut candidates, so more may exist.
@@ -201,6 +223,8 @@ function historyCoverage(input: {
     truncated,
     truncationReasons: [...reasons],
     perSourceCap: input.bounded.bounds.perSourceCap,
+    exactTerms: [...input.retrieval.exactTerms],
+    droppedByExactTerm: input.retrieval.droppedByExactTerm,
     coverage: input.groupsSearched === 0 ? "unknown" : truncated ? "partial" : "complete",
     groupsSearched: input.groupsSearched,
     sourceCoverage: [...input.bounded.sources]
@@ -306,17 +330,38 @@ export function projectHistorySearch(details: HistorySearchDetails): HistorySear
  * A short answer and an exhausted window read the same in a bare result list, and the
  * difference decides whether the Agent may say "this never happened". The guidance names
  * which case this is, so the negative reading is never the model's to assume.
+ *
+ * A query that named an identifier gets one more sentence, because the failure mode there
+ * is different: the identifier is already in the Conversation, so a model that is handed no
+ * match can still compose a sender, a time and an original text for it. The guidance says
+ * which way the result came out, so "found" and "not found" are both observations rather
+ * than something the model decided.
  */
 function historyGuidance(details: HistorySearchDetails): string {
-  if (details.coverage.coverage === "unknown")
+  const { coverage } = details;
+  const terms = coverage.exactTerms.map((term) => `"${term}"`).join(", ");
+  if (coverage.coverage === "unknown")
     return "No group was searched, so nothing about the world was learned. This is not a negative result.";
+  const window =
+    coverage.coverage === "complete"
+      ? " The searched window was exhausted, which does not prove the event never happened outside it."
+      : " Only part of the window was searched, which does not prove the event never happened.";
   if (details.resultStatus === "matches_found") {
-    if (details.coverage.coverage === "complete") return "Answer only from these matches.";
-    return "Answer only from these matches. The searched window was not exhausted, so more matches may exist.";
+    const exact =
+      terms === ""
+        ? ""
+        : ` Every listed match contains ${terms} verbatim; the sender, the time and the original text come only from those matches.`;
+    return `Answer only from these matches.${exact}${window}`;
   }
-  if (details.coverage.coverage === "complete")
-    return "No match was found and the searched window was exhausted. This does not prove the event never happened outside it.";
-  return "No match was found in the part of the window that was searched. This does not prove the event never happened.";
+  const negative =
+    terms === ""
+      ? "No match was found and"
+      : `No message in the searched window contains ${terms} verbatim, and`;
+  const fabrication =
+    terms === ""
+      ? ""
+      : " Do not report the identifier as found, and do not supply a sender, a time or an original text for it.";
+  return `${negative}${window}${fabrication}`;
 }
 
 /**
@@ -552,7 +597,7 @@ export function createHistoryTools(options: {
       retrievalMode: "lexical",
       runId: context.runId,
       items,
-      considered: bounded.considered,
+      considered: retrieval.coverage.considered,
       truncated: bounded.truncated,
       resultStatus: items.length > 0 ? "matches_found" : "no_matches_in_searched_window",
       coverage,
@@ -568,7 +613,7 @@ export function createHistoryTools(options: {
         resources: searched.map(groupResourceId),
         sourceKind: "channel_message",
         retrievalMode: "lexical",
-        considered: bounded.considered,
+        considered: retrieval.coverage.considered,
         truncated: bounded.truncated,
         coverage,
         items: items.map((item) => ({
@@ -589,7 +634,7 @@ export function createHistoryTools(options: {
     name: GROUP_HISTORY_SEARCH_TOOL,
     label: "搜索本群历史",
     description:
-      "Search the current QQ group's authorized history. Filters cover message text, sender QQ or group nickname, whether the sender mentioned this bot, and ISO 8601 time bounds. Use sender for who spoke and mentionsMe for who @mentioned the bot. A no_matches_in_searched_window result is not proof that an event never happened.",
+      "Search the current QQ group's authorized history. Filters cover message text, sender QQ or group nickname, whether the sender mentioned this bot, and ISO 8601 time bounds. Use sender for who spoke and mentionsMe for who @mentioned the bot. A query naming an exact identifier is matched verbatim, so a message that merely shares part of it is not a match. A no_matches_in_searched_window result is not proof that an event never happened.",
     parameters: Type.Object(
       {
         query: Type.Optional(Type.String({ maxLength: 2_000 })),
@@ -628,7 +673,7 @@ export function createHistoryTools(options: {
     name: OWNER_HISTORY_SEARCH_TOOL,
     label: "搜索已授权群历史",
     description:
-      "Owner-only search across assigned and authorized QQ groups. Filters cover message text, sender QQ or group nickname, whether the sender mentioned this bot, group ids, and ISO 8601 time bounds. A no_matches_in_searched_window result is not proof that an event never happened.",
+      "Owner-only search across assigned and authorized QQ groups. Filters cover message text, sender QQ or group nickname, whether the sender mentioned this bot, group ids, and ISO 8601 time bounds. A query naming an exact identifier is matched verbatim, so a message that merely shares part of it is not a match. A no_matches_in_searched_window result is not proof that an event never happened.",
     parameters: Type.Object(
       {
         groupIds: Type.Optional(
