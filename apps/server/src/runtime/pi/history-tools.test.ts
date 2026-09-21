@@ -607,6 +607,147 @@ it("keeps the per-source cap across groups and names it in the coverage", async 
   }
 });
 
+it("reports the hits that reached the model, not the candidates the retriever kept", async () => {
+  // `returned` and the per-source `returned` answer the same question, so they have to be the
+  // same number. The retriever's own count is taken before the bounded Context runs: it kept
+  // seven candidates and the per-source cap left four. A coverage record that reported seven
+  // described a result list the model never received, and the sum of the per-source returns —
+  // which is the same fact — contradicted it in the same object.
+  const { store, archive } = await fixture();
+  try {
+    for (let index = 0; index < 5; index++) {
+      await archive.ingest({
+        channel: "qq",
+        connectionId,
+        groupId: "100",
+        externalMessageId: `g100-reach-${index}`,
+        senderId: "member-a",
+        normalizedText: `deploy rollback step ${index}`,
+        occurredAt: `2026-09-20T12:0${index}:00Z`,
+      });
+    }
+    for (const gid of ["100", "200"]) {
+      await assign(store, gid);
+      await authorizeHistory(store, gid);
+    }
+    const accepted = await accept(store, ownerPrivate);
+    const tools = createHistoryTools({
+      store,
+      archive,
+      isHistoryEnabled: historyEnabled,
+      syncGroup: sourceExhausted,
+      getContext: () => ({
+        caller: { principalId: "owner", scope: ownerPrivate },
+        runId: accepted.run.id,
+        conversationId: accepted.conversation.id,
+      }),
+    });
+    const { text } = await callModelVisible(toolByName(tools, OWNER_HISTORY_SEARCH_TOOL), {
+      query: "deploy rollback",
+      limit: 8,
+    });
+    const view = JSON.parse(text) as {
+      results: unknown[];
+      coverage: {
+        returned: number;
+        considered: number;
+        sourceCoverage: Array<{ returned: number }>;
+      };
+    };
+
+    expect(view.results).toHaveLength(4);
+    expect(view.coverage.considered).toBe(7);
+    expect(view.coverage.returned).toBe(view.results.length);
+    expect(view.coverage.sourceCoverage.reduce((sum, source) => sum + source.returned, 0)).toBe(
+      view.coverage.returned,
+    );
+  } finally {
+    await store.close();
+  }
+});
+
+it("reads the window's truncation the same way in every field that reports it", async () => {
+  // `truncated` and `coverage.truncated` describe one window, so they cannot disagree. The
+  // top-level flag counted only what the bounded Context dropped, while the coverage counted
+  // every bound including the limit the retriever applied. A search that asked for three of
+  // eight matches therefore reported `truncated: false` beside `truncationReasons:
+  // ["top_k_reached"]`, and a reader taking the flag alone would read a cut window as an
+  // exhausted one.
+  const { store, archive } = await fixture();
+  try {
+    for (let index = 0; index < 7; index++) {
+      await archive.ingest({
+        channel: "qq",
+        connectionId,
+        groupId: "100",
+        externalMessageId: `g100-agree-${index}`,
+        senderId: "member-a",
+        normalizedText: `deploy rollback step ${index}`,
+        occurredAt: `2026-09-20T12:0${index}:00Z`,
+      });
+    }
+    const tools = await groupRunTools(store, archive);
+    const { text } = await callModelVisible(toolByName(tools, GROUP_HISTORY_SEARCH_TOOL), {
+      query: "deploy rollback",
+      limit: 3,
+    });
+    const view = JSON.parse(text) as {
+      truncated: boolean;
+      coverage: { truncated: boolean; truncationReasons: string[] };
+    };
+
+    expect(view.coverage.truncationReasons).toEqual(["top_k_reached"]);
+    expect(view.coverage.truncated).toBe(true);
+    expect(view.truncated).toBe(view.coverage.truncated);
+  } finally {
+    await store.close();
+  }
+});
+
+it("never offers a continuation that reaches no more than the search already did", async () => {
+  // The suggested limit is what the reader raises the bound to. When the candidate set is
+  // larger than the Tool's own maximum no larger limit exists, and the field said to raise the
+  // limit to the limit that had just been used: a next step that changes nothing, reading as
+  // though more of the window were reachable from here.
+  const { store, archive } = await fixture();
+  try {
+    for (let index = 0; index < 60; index++) {
+      await archive.ingest({
+        channel: "qq",
+        connectionId,
+        groupId: "100",
+        externalMessageId: `g100-max-${index}`,
+        senderId: "member-a",
+        // A term the fixture's own messages do not carry, so the candidate set is exactly the
+        // messages this test ingested.
+        normalizedText: `zoetrope marker ${index}`,
+        occurredAt: `2026-09-20T12:${String(index).padStart(2, "0")}:00Z`,
+      });
+    }
+    const tools = await groupRunTools(store, archive);
+    const { text } = await callModelVisible(toolByName(tools, GROUP_HISTORY_SEARCH_TOOL), {
+      query: "zoetrope",
+      limit: 50,
+    });
+    const view = JSON.parse(text) as {
+      results: unknown[];
+      coverage: {
+        requestedLimit: number;
+        considered: number;
+        truncationReasons: string[];
+        continuation?: { suggestedLimit?: number };
+      };
+    };
+
+    expect(view.results).toHaveLength(50);
+    expect(view.coverage.considered).toBe(60);
+    expect(view.coverage.truncationReasons).toEqual(["top_k_reached"]);
+    expect(view.coverage.continuation?.suggestedLimit).toBeUndefined();
+  } finally {
+    await store.close();
+  }
+});
+
 it("says the window is unknown rather than empty when no group was searched", async () => {
   const { store, archive } = await fixture();
   try {
@@ -818,6 +959,61 @@ it("records the coverage it reported in the retrieval evidence", async () => {
       coverage: "complete",
     });
     expect(value.coverage.observedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/u);
+  } finally {
+    await store.close();
+  }
+});
+
+it("restates the coverage in the evidence rather than recording the window a second way", async () => {
+  // `considered` and `truncated` sit beside `coverage` in the same Trace record, so they are the
+  // same fact stated twice. A narrower reading of `truncated` — only what the bounded Context
+  // dropped — put `false` beside a coverage naming a cut, and Trace then held two answers to one
+  // question about whether the window was read, leaving the model's own answer to decide which
+  // one is believed.
+  const { store, archive } = await fixture();
+  try {
+    for (let index = 0; index < 7; index++) {
+      await archive.ingest({
+        channel: "qq",
+        connectionId,
+        groupId: "100",
+        externalMessageId: `g100-evidence-${index}`,
+        senderId: "member-a",
+        // A term the fixture's own messages do not carry, so the candidate set is exactly the
+        // messages this test ingested.
+        normalizedText: `zoetrope evidence ${index}`,
+        occurredAt: `2026-09-20T12:0${index}:00Z`,
+      });
+    }
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: groupResourceId("100"),
+      action: "history:read",
+      scope: group100,
+      effect: "allow",
+    });
+    const accepted = await accept(store, group100);
+    const evidence = vi.fn(async (_value: HistoryRetrievalEvidence) => {});
+    const tools = createHistoryTools({
+      store,
+      archive,
+      isHistoryEnabled: historyEnabled,
+      recordEvidence: evidence,
+      syncGroup: sourceExhausted,
+      getContext: () => ({
+        caller: { principalId: "owner", scope: group100 },
+        runId: accepted.run.id,
+        conversationId: accepted.conversation.id,
+      }),
+    });
+
+    await call(toolByName(tools, GROUP_HISTORY_SEARCH_TOOL), { query: "zoetrope", limit: 3 });
+    const value = evidence.mock.calls[0]![0];
+
+    expect(value.coverage.truncationReasons).toEqual(["top_k_reached"]);
+    expect(value.coverage.truncated).toBe(true);
+    expect(value.truncated).toBe(value.coverage.truncated);
+    expect(value.considered).toBe(value.coverage.considered);
   } finally {
     await store.close();
   }

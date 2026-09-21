@@ -102,7 +102,17 @@ export interface HistorySearchDetails {
   retrievalMode: "lexical";
   runId: string;
   items: HistorySearchItem[];
+  /** Restates `coverage.considered`, so the window's size is readable without the nested record. */
   considered: number;
+  /**
+   * Restates `coverage.truncated`: a bound cut this search's window.
+   *
+   * The two are the same fact, so they cannot disagree. A narrower reading — only what the
+   * bounded Context dropped — would leave this flag false beside a `truncationReasons` list
+   * naming a cut, and a reader taking the flag alone would read a cut window as an exhausted
+   * one. The coverage record is the wider of the two, so restating it never claims a window was
+   * more complete than it was.
+   */
   truncated: boolean;
   resultStatus: "matches_found" | "no_matches_in_searched_window";
   coverage: HistorySearchCoverage;
@@ -164,15 +174,23 @@ export interface HistorySyncOutcome {
 export interface HistorySearchCoverage {
   /** The limit the caller asked for. */
   requestedLimit: number;
-  /** Hits that reached the model. */
+  /**
+   * Hits that reached the model: the length of the result list this call returned.
+   *
+   * Counted after every bound, so it is also the sum of the per-source `returned` below. The
+   * two report one fact, which is why they cannot disagree — a reader who adds up the per-source
+   * counts and compares them with this one is checking the same number twice. The retriever's
+   * own count is taken before the bounds run and is what `considered` records.
+   */
   returned: number;
   /**
    * Candidates the archive produced for this search, before any filter or bound.
    *
    * This is what the search actually considered, so it is the number a reader compares
    * against `returned`. The per-source `considered` below is the bound's own view — how many
-   * of these reached it — and the difference between the two is exactly the candidates the
-   * filters named: `droppedByExactTerm`, and the retriever's own filter count.
+   * of these reached it — and the difference between the two is exactly what the filters and
+   * the limit named: `droppedByExactTerm`, the retriever's own filter count, and
+   * `droppedByLimit`.
    */
   considered: number;
   /** True when at least one candidate was dropped by a bound rather than by authorization. */
@@ -237,7 +255,14 @@ export interface HistorySearchCoverage {
    * candidate set this search already saw; searching a capped group alone removes the cap.
    */
   continuation?: {
-    /** A limit that reaches every candidate this search considered. */
+    /**
+     * A larger limit that reaches candidates this search cut.
+     *
+     * Present exactly when a larger limit exists. The Tool's own maximum is the largest limit
+     * there is, so a search that already asked for it has nothing left to raise, and the field
+     * is absent rather than naming the limit the search had just applied — a next step that
+     * changes nothing while reading as though more were reachable.
+     */
     suggestedLimit?: number;
     /** Groups whose hits were capped by the cross-group per-source cap. */
     cappedGroups?: string[];
@@ -278,11 +303,15 @@ function historyCoverage(input: {
     .sort();
   const truncated = reasons.size > 0;
   const continuation: HistorySearchCoverage["continuation"] = {};
-  if (input.retrieval.droppedByLimit > 0)
-    continuation.suggestedLimit = Math.min(
-      Math.max(input.retrieval.considered, input.retrieval.requestedLimit + 1),
-      MAX_LIMIT,
-    );
+  // A limit that reaches nothing more than the one already used is not a next step. When the
+  // candidate set is larger than the Tool's maximum, no larger limit exists, so the field is
+  // absent rather than naming the limit the search had just applied.
+  const suggestedLimit = Math.min(
+    Math.max(input.retrieval.considered, input.retrieval.requestedLimit + 1),
+    MAX_LIMIT,
+  );
+  if (input.retrieval.droppedByLimit > 0 && suggestedLimit > input.retrieval.requestedLimit)
+    continuation.suggestedLimit = suggestedLimit;
   if (cappedGroups.length > 0) continuation.cappedGroups = cappedGroups;
 
   const boundedBySource = new Map(input.bounded.sources.map((source) => [source.sourceId, source]));
@@ -312,7 +341,7 @@ function historyCoverage(input: {
 
   return {
     requestedLimit: input.retrieval.requestedLimit,
-    returned: input.retrieval.returned,
+    returned: input.bounded.items.length,
     considered: input.retrieval.considered,
     truncated,
     truncationReasons: [...reasons],
@@ -348,7 +377,9 @@ export interface HistoryRetrievalEvidence {
   resources: string[];
   sourceKind: "channel_message";
   retrievalMode: "lexical";
+  /** Restates `coverage.considered`, so the window's size is readable without the nested record. */
   considered: number;
+  /** Restates `coverage.truncated`, so the same fact is not recorded two ways. */
   truncated: boolean;
   /**
    * How much of the window this search saw, so Trace can answer "was this answer partial?"
@@ -714,8 +745,8 @@ export function createHistoryTools(options: {
       retrievalMode: "lexical",
       runId: context.runId,
       items,
-      considered: retrieval.coverage.considered,
-      truncated: bounded.truncated,
+      considered: coverage.considered,
+      truncated: coverage.truncated,
       resultStatus: items.length > 0 ? "matches_found" : "no_matches_in_searched_window",
       coverage,
     };
@@ -730,8 +761,8 @@ export function createHistoryTools(options: {
         resources: searched.map(groupResourceId),
         sourceKind: "channel_message",
         retrievalMode: "lexical",
-        considered: retrieval.coverage.considered,
-        truncated: bounded.truncated,
+        considered: coverage.considered,
+        truncated: coverage.truncated,
         coverage,
         items: items.map((item) => ({
           resourceId: item.resourceId,
