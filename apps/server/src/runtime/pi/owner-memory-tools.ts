@@ -297,17 +297,35 @@ async function executeMemoryActionRaw(
     case "promote":
       if ((await ownerCommand(store, context)) !== commandFor(input))
         throw new Error("owner_confirmation_required");
-      return learning.promoteCandidate(
-        operationContext,
-        internalLearningId("candidate", requiredId(input)),
-      );
+      {
+        const candidateId = internalLearningId("candidate", requiredId(input));
+        const candidate = await learning.getCandidate(operationContext, candidateId);
+        if (!candidate) throw new Error("candidate_not_found");
+        if (candidate.status !== "pending")
+          return {
+            executed: false,
+            reason: "candidate_not_pending",
+            candidateId: candidate.candidateId,
+            status: candidate.status,
+          };
+        return learning.promoteCandidate(operationContext, candidateId);
+      }
     case "reject":
       if ((await ownerCommand(store, context)) !== commandFor(input))
         throw new Error("owner_confirmation_required");
-      return learning.rejectCandidate(
-        operationContext,
-        internalLearningId("candidate", requiredId(input)),
-      );
+      {
+        const candidateId = internalLearningId("candidate", requiredId(input));
+        const candidate = await learning.getCandidate(operationContext, candidateId);
+        if (!candidate) throw new Error("candidate_not_found");
+        if (candidate.status !== "pending")
+          return {
+            executed: false,
+            reason: "candidate_not_pending",
+            candidateId: candidate.candidateId,
+            status: candidate.status,
+          };
+        return learning.rejectCandidate(operationContext, candidateId);
+      }
     case "feedback": {
       if (!input.signalType || !feedbackSignals.includes(input.signalType) || !input.statement)
         throw new Error("invalid_feedback_input");

@@ -117,6 +117,27 @@ it("exposes Owner-only governed Memory operations and rechecks revoked write aut
     expect(promoted.details).not.toHaveProperty("evidence");
     expect(promoted.details).not.toHaveProperty("evidenceRefs");
     expect(promoted.details).not.toHaveProperty("assertedBy");
+    const repeatedPromotion = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: caller.scope,
+      messageId: "repeated-promotion",
+      text: `/memory promote ${candidateId}`,
+      executionRef: "pi:test",
+    });
+    currentRunId = repeatedPromotion.run.id;
+    const notPromotedAgain = await tool!.execute(
+      "repeated-promotion",
+      { action: "promote", id: candidateId },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    expect(notPromotedAgain.details).toEqual({
+      executed: false,
+      reason: "candidate_not_pending",
+      candidateId,
+      status: "promoted",
+    });
     const proposedReplacement = await tool!.execute(
       "model-supersede",
       {
