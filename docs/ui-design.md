@@ -189,7 +189,7 @@ PI
 **顶部全局栏（Topbar）元素**：
 - 面包屑（Breadcrumb）：清晰反映当前功能区与页面位置。
 - 仓库与分支指示：`lora-sys/Glassbox-Agent-Harness` · `main`。
-- 当前架构阶段标识：如 `P3 阶段`。
+- 当前架构阶段标识：如 `P4A / P4B 阶段`。
 - 全局快捷指令：`⌘K` 呼出 Command Palette。
 - 右侧主动作：`打开对话`（引导至主要对话通道，**严禁放置突出的 “New Run” 按钮**）。
 

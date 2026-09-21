@@ -1,6 +1,6 @@
 # Lora PI Kit
 
-Status: CURRENT DIRECTION / P3 ACTIVE
+Status: CURRENT DIRECTION / P4 ACTIVE
 
 This document is the source of truth for what `lora-sys/lora-pi-kit` is, what it contains, how it is installed, and how it relates to Pi, Glassbox, Herdr, and `lora-sys/skills`.
 
