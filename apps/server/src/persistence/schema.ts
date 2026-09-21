@@ -6,6 +6,27 @@ function persistedText(value: unknown): string {
   return value;
 }
 
+// P4B: separate durable Channel history / retrieval source. Not Agent Run input.
+// channel_messages stays durable truth; channel_messages_fts is a derived lexical
+// projection. The FTS5 index DDL and the unicode61 tokenizer choice are ported from
+// TokenRhythm/opensquilla src/opensquilla/memory/store.py (Apache-2.0, pinned commit
+// 75a7085960ee57bc7a17acde5ce08071af4e7632). group_capability_policies is the durable
+// Owner-configured per-group capability policy.
+export const schemaV7Statements = [
+  `CREATE TABLE IF NOT EXISTS channel_messages (id TEXT PRIMARY KEY, channel TEXT NOT NULL, connection_id TEXT NOT NULL, group_id TEXT NOT NULL, external_message_id TEXT NOT NULL, sender_id TEXT NOT NULL, normalized_text TEXT NOT NULL, source_class TEXT NOT NULL DEFAULT 'history', occurred_at TEXT NOT NULL, ingested_at TEXT NOT NULL, resource_id TEXT NOT NULL REFERENCES resources(id), dedup_key TEXT NOT NULL UNIQUE)`,
+  `CREATE INDEX IF NOT EXISTS channel_messages_group_time ON channel_messages(group_id, source_class, occurred_at)`,
+  `CREATE INDEX IF NOT EXISTS channel_messages_resource ON channel_messages(resource_id)`,
+  `CREATE VIRTUAL TABLE IF NOT EXISTS channel_messages_fts USING fts5(segment, id UNINDEXED, group_id UNINDEXED, tokenize='unicode61')`,
+  `CREATE TABLE IF NOT EXISTS group_capability_policies (connection_id TEXT NOT NULL, group_id TEXT NOT NULL, policy_json TEXT NOT NULL, version INTEGER NOT NULL CHECK(version >= 1), updated_by_principal_id TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (connection_id, group_id))`,
+];
+
+export const schemaV7Migration = [...schemaV7Statements];
+
+export const schemaV8Migration = [
+  `ALTER TABLE channel_messages ADD COLUMN sender_name TEXT`,
+  `ALTER TABLE channel_messages ADD COLUMN mention_target_ids_json TEXT NOT NULL DEFAULT '[]'`,
+];
+
 // SQL batch/index pattern adapted from trajectory-panel. See SOURCES.md.
 export const schema = [
   `CREATE TABLE agents (id TEXT PRIMARY KEY, created_at TEXT NOT NULL)`,
@@ -40,6 +61,8 @@ export const schema = [
   `CREATE TABLE conversation_locations (agent_id TEXT NOT NULL REFERENCES agents(id), location_key TEXT NOT NULL, conversation_id TEXT NOT NULL REFERENCES conversations(id), created_at TEXT NOT NULL, PRIMARY KEY (agent_id, location_key))`,
   `CREATE INDEX conversation_locations_conv ON conversation_locations(conversation_id)`,
   `ALTER TABLE tasks ADD COLUMN origin_scope_key TEXT`,
+  ...schemaV7Statements,
+  ...schemaV8Migration,
 ];
 
 export const schemaV5Migration = ["ALTER TABLE tasks ADD COLUMN origin_scope_key TEXT"];
@@ -123,4 +146,3 @@ export async function applySchemaV4Migration(tx: Transaction): Promise<void> {
 }
 
 export const schemaV6Migration = ["DROP INDEX IF EXISTS one_owner"];
-

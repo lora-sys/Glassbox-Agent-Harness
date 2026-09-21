@@ -292,6 +292,76 @@ export class AuthorizationService {
     });
   }
 
+  /**
+   * Revoke one Action on one Resource for one Principal in one scope.
+   *
+   * A Resource can carry several independent Actions — for example several capability
+   * categories on the same QQ group. Disabling one must not silently revoke its siblings,
+   * so the reverse of `grant` exists per Action and not only per Resource.
+   */
+  async revokeScopeAction(input: {
+    principalId: string;
+    resourceId: string;
+    action: string;
+    scope: TrustedChannelScope;
+  }): Promise<void> {
+    requireIdentifier(input.principalId);
+    requireIdentifier(input.resourceId);
+    const key = scopeKey(input.scope);
+    await this.db.transaction(async (tx) => {
+      await tx.execute({
+        sql: "UPDATE grants SET revoked_at = ? WHERE principal_id = ? AND resource_id = ? AND action = ? AND scope_key = ? AND revoked_at IS NULL",
+        args: [new Date().toISOString(), input.principalId, input.resourceId, input.action, key],
+      });
+    });
+  }
+
+  /**
+   * Revoke every active grant on one Resource, across principals and scopes.
+   *
+   * Used when a protected source stops being a managed source (for example a QQ group
+   * is disabled). Every principal loses access on the next decision; no cached or
+   * long-lived grant survives.
+   */
+  async revokeResource(resourceId: string): Promise<void> {
+    requireIdentifier(resourceId);
+    await this.db.transaction(async (tx) => {
+      await tx.execute({
+        sql: "UPDATE grants SET revoked_at = ? WHERE resource_id = ? AND revoked_at IS NULL",
+        args: [new Date().toISOString(), resourceId],
+      });
+    });
+  }
+
+  /** Revoke every active grant issued inside one Channel location, across all senders. */
+  async revokeLocationScopes(input: {
+    connectionId: string;
+    botId: string;
+    chatType: "private" | "group";
+    chatId: string;
+  }): Promise<void> {
+    for (const value of [input.connectionId, input.botId, input.chatId]) requireIdentifier(value);
+    if (input.chatType !== "private" && input.chatType !== "group")
+      throw new Error("Invalid channel scope");
+    await this.db.transaction(async (tx) => {
+      await tx.execute({
+        sql: `UPDATE grants SET revoked_at = ?
+              WHERE revoked_at IS NULL
+                AND json_extract(scope_key, '$[0]') = ?
+                AND json_extract(scope_key, '$[1]') = ?
+                AND json_extract(scope_key, '$[2]') = ?
+                AND json_extract(scope_key, '$[3]') = ?`,
+        args: [
+          new Date().toISOString(),
+          input.connectionId,
+          input.botId,
+          input.chatType,
+          input.chatId,
+        ],
+      });
+    });
+  }
+
   /** Management-only approval for an existing eligible policy path. The caller
    * must verify the human approver before invoking this method. */
   async approve(input: {
@@ -324,6 +394,34 @@ export class AuthorizationService {
         ],
       });
       return id;
+    });
+  }
+
+  /**
+   * True when an active (unrevoked) grant exists for this exact Principal, Resource,
+   * Action and scope.
+   *
+   * The reverse-state checks need to know whether *anyone* still holds an assignment
+   * before tearing shared state down — for example whether a group still has an assigned
+   * Owner after one Owner revokes. Reading the grant directly avoids treating a `check`
+   * denial (which may be a visibility rule rather than a missing grant) as absence.
+   */
+  async hasActiveGrant(input: {
+    principalId: string;
+    resourceId: string;
+    action: string;
+    scope: TrustedChannelScope;
+  }): Promise<boolean> {
+    requireIdentifier(input.principalId);
+    requireIdentifier(input.resourceId);
+    requireIdentifier(input.action);
+    const key = scopeKey(input.scope);
+    return this.db.transaction(async (tx) => {
+      const rows = await tx.execute({
+        sql: "SELECT id FROM grants WHERE principal_id = ? AND resource_id = ? AND action = ? AND scope_key = ? AND effect = 'allow' AND revoked_at IS NULL LIMIT 1",
+        args: [input.principalId, input.resourceId, input.action, key],
+      });
+      return rows.rows.length > 0;
     });
   }
 

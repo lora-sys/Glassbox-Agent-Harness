@@ -27,7 +27,7 @@ Glassbox
   Personal Agent product / trust / durable-state boundary
 ```
 
-The active P3 path embeds Pi through the public SDK and loads Lora PI Kit resources / profile into the Pi environment.
+The main runtime path established in P3 embeds Pi through the public SDK and loads Lora PI Kit resources / profile into the Pi environment.
 
 ## Why Pi fits
 

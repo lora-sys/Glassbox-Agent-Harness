@@ -5,17 +5,20 @@ import { IdentityService } from "../identity/service.js";
 import { DomainDatabase } from "./database.js";
 import { EvidenceStore } from "./evidence.js";
 import { OwnerManagementRecords } from "../management/records.js";
+import { CapabilityPolicyStore } from "../management/capability-policy.js";
 import { TaskStore } from "../ops/task-store.js";
 
 export async function openDomainStore(options: { databasePath: string }) {
   const db = await DomainDatabase.open(options.databasePath);
   return {
+    db,
     identities: new IdentityService(db),
     authorization: new AuthorizationService(db),
     conversations: new ConversationStore(db),
     lifecycle: new LifecycleStore(db),
     evidence: new EvidenceStore(db),
     management: new OwnerManagementRecords(db),
+    capabilities: new CapabilityPolicyStore(db),
     tasks: new TaskStore(db),
     close: () => db.close(),
   };

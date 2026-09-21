@@ -388,29 +388,72 @@ describe("Safe Argv and Launcher Resolution", () => {
 });
 
 describe("Disposable Git Scanning Safe Argv Execution", () => {
+  /**
+   * Runs `fn` with the inherited git environment removed.
+   *
+   * This suite also runs from inside a linked worktree's pre-commit hook, where git exports
+   * `GIT_DIR` (and `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_CONFIG_PARAMETERS`, …) into every
+   * child process. Inherited, those redirect the disposable repository below at the *shared*
+   * git directory instead of its own. `gitLsFiles`/`gitDiffForScan` read `process.env`
+   * themselves, so the whole body runs under this environment, not just the setup commands.
+   *
+   * `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` point at an empty file rather than the null
+   * device: git rejects `\\.\nul` as a config path on Windows.
+   */
+  function withIsolatedGitEnv<T>(emptyConfig: string, fn: () => T): T {
+    const saved = new Map<string, string | undefined>();
+    for (const name of Object.keys(process.env)) {
+      if (!name.startsWith("GIT_")) continue;
+      saved.set(name, process.env[name]);
+      delete process.env[name];
+    }
+    process.env.GIT_CONFIG_GLOBAL = emptyConfig;
+    process.env.GIT_CONFIG_SYSTEM = emptyConfig;
+    process.env.GIT_CONFIG_NOSYSTEM = "1";
+    try {
+      return fn();
+    } finally {
+      delete process.env.GIT_CONFIG_GLOBAL;
+      delete process.env.GIT_CONFIG_SYSTEM;
+      delete process.env.GIT_CONFIG_NOSYSTEM;
+      for (const [name, value] of saved) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  }
+
+  function disposableGit(cwd: string, args: readonly string[]): void {
+    execFileSync("git", args, { cwd, encoding: "utf-8", stdio: "pipe" });
+  }
+
   it("scans git files in a disposable repository without touching real workspace", () => {
     const tempGit = fs.mkdtempSync(path.join(os.tmpdir(), "gb-disposable-git-"));
+    const emptyConfig = path.join(tempGit, "empty.gitconfig");
     try {
-      execFileSync("git", ["init"], { cwd: tempGit, encoding: "utf-8" });
-      execFileSync("git", ["config", "user.name", "TestUser"], { cwd: tempGit });
-      execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: tempGit });
+      withIsolatedGitEnv(emptyConfig, () => {
+        fs.writeFileSync(emptyConfig, "");
+        disposableGit(tempGit, ["init"]);
+        disposableGit(tempGit, ["config", "user.name", "TestUser"]);
+        disposableGit(tempGit, ["config", "user.email", "test@example.com"]);
 
-      const testFile = path.join(tempGit, "sample.txt");
-      fs.writeFileSync(testFile, "hello\n");
-      execFileSync("git", ["add", "sample.txt"], { cwd: tempGit });
-      execFileSync("git", ["commit", "-m", "initial commit"], { cwd: tempGit });
+        const testFile = path.join(tempGit, "sample.txt");
+        fs.writeFileSync(testFile, "hello\n");
+        disposableGit(tempGit, ["add", "sample.txt"]);
+        disposableGit(tempGit, ["commit", "-m", "initial commit"]);
 
-      // 1. gitLsFiles returns clean file snapshot
-      const snapshot = gitLsFiles(tempGit);
-      expect(snapshot).not.toBeNull();
-      expect(snapshot?.["sample.txt"]).toBeDefined();
+        // 1. gitLsFiles returns clean file snapshot
+        const snapshot = gitLsFiles(tempGit);
+        expect(snapshot).not.toBeNull();
+        expect(snapshot?.["sample.txt"]).toBeDefined();
 
-      // 2. Modify file and verify gitDiffForScan
-      fs.writeFileSync(testFile, "hello modified\n");
-      const changes = gitDiffForScan(tempGit, snapshot!);
-      expect(changes.length).toBe(1);
-      expect(changes[0]?.path).toBe("sample.txt");
-      expect(changes[0]?.kind).toBe("modify");
+        // 2. Modify file and verify gitDiffForScan
+        fs.writeFileSync(testFile, "hello modified\n");
+        const changes = gitDiffForScan(tempGit, snapshot!);
+        expect(changes.length).toBe(1);
+        expect(changes[0]?.path).toBe("sample.txt");
+        expect(changes[0]?.kind).toBe("modify");
+      });
     } finally {
       fs.rmSync(tempGit, { recursive: true, force: true });
     }

@@ -54,3 +54,19 @@ export type {
   AttentionItem,
   AgentOpsSnapshot,
 } from "./domain.js";
+export type {
+  ScoreKind,
+  RetrievalMode,
+  ReturnMode,
+  RedactionInfo,
+  IntentType,
+  TimeScope,
+  RecallIntent,
+  SearchResultItem,
+  SearchMemoryRequest,
+  SearchMemoryResponse,
+  QqSourceClass,
+  QqSourceCandidate,
+  AuthorizedQqSourceReader,
+} from "./retrieval.js";
+export { QQ_SOURCE_CLASSES } from "./retrieval.js";

@@ -14,6 +14,7 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { KitLoader, type ResolvedKitProfile } from "./kit-loader.js";
+import { requiredInputClause } from "./protected-tools.js";
 import type {
   PiNormalizedEvent,
   PiRunContext,
@@ -105,6 +106,7 @@ function safeToolFailureCode(result: unknown): string {
   }
   if (text.includes("context_missing")) return "context_missing";
   if (text.includes("Permission denied")) return "authorization_denied";
+  if (text.includes("capability_category_disabled")) return "capability_category_disabled";
   if (text.includes("protected_tool_failed")) return "protected_tool_failed";
   if (/validation|schema|required|invalid|argument/iu.test(text)) return "input_validation_failed";
   return "tool_execution_failed";
@@ -279,6 +281,10 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
       context && this.options.resolveToolNames
         ? [...new Set(await this.options.resolveToolNames(context))]
         : undefined;
+    // Hand the resolved surface back on the Run context. The execution adapter binds a
+    // required Tool only when the surface carries it, so discovery and the requirement can
+    // never disagree about which Tools this Run has.
+    if (context) context.authorizedToolNames = authorizedToolNames ?? [];
     await mkdir(config.agentDir, { recursive: true });
     const sessionDir = path.join(config.agentDir, "sessions", conversation.id);
     await mkdir(sessionDir, { recursive: true });
@@ -335,11 +341,9 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
     const promptForRun = () => {
       const runContext = runtimeSessionId ? this.runContexts.get(runtimeSessionId) : undefined;
       const requiredToolName = runContext?.requiredToolName;
-      const exactInput = runContext?.requiredToolInput
-        ? ` with exactly this JSON input: ${JSON.stringify(runContext.requiredToolInput)}`
-        : "";
+      const exactInput = requiredInputClause(runContext?.requiredToolInput);
       return requiredToolName
-        ? `${basePrompt}\n\nThe current Owner request requires the available ${requiredToolName} tool. Call it before reporting the action as completed${exactInput}. Do not ask for a second confirmation and never claim execution without a successful tool result.`
+        ? `${basePrompt}\n\nThe current request requires the available ${requiredToolName} tool. Call it before reporting the action as completed${exactInput}. Do not ask for a second confirmation and never claim execution without a successful tool result.`
         : basePrompt;
     };
     // Standalone Kit MCP factories are configured separately. Glassbox exposes

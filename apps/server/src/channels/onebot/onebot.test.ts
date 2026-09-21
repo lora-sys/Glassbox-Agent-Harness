@@ -183,7 +183,6 @@ describe("OneBot normalization", () => {
         { type: "text", data: { text: "please run" } },
       ],
     },
-    { user_id: 10099 },
     { user_id: 10001 },
     { self_id: 20001 },
     { group_id: 90000 },
@@ -194,6 +193,26 @@ describe("OneBot normalization", () => {
     { message_type: "private", sub_type: "other" },
   ])("ignores disallowed ingress %j", (override) => {
     expect(normalizeOneBotMessage(inbound(override), config)).toEqual({ kind: "ignored" });
+  });
+  it("accepts an addressed member of a configured group without making private chat public", () => {
+    expect(normalizeOneBotMessage(inbound({ user_id: 10099 }), config)).toMatchObject({
+      kind: "message",
+      message: {
+        scope: { chatType: "group", chatId: "10003", senderId: "10099" },
+        text: "检查任务",
+      },
+    });
+    expect(
+      normalizeOneBotMessage(
+        inbound({
+          user_id: 10099,
+          message_type: "private",
+          sub_type: "friend",
+          message: "private must stay closed",
+        }),
+        config,
+      ),
+    ).toEqual({ kind: "ignored" });
   });
   it("routes an Owner friend DM independently of an untrusted group field", () => {
     expect(
@@ -377,7 +396,6 @@ describe("OneBot forward WebSocket", () => {
     for (const changed of [
       { connectionId: "other" },
       { botId: "other" },
-      { senderId: "other" },
       { chatId: "other" },
       { threadId: "private" },
       { chatType: "private" as const },
@@ -391,6 +409,22 @@ describe("OneBot forward WebSocket", () => {
       ).toEqual({ status: "failed", code: "invalid_target" });
     }
     expect(fake.history).toHaveLength(1);
+  });
+  it("sends a group reply for an addressed member without opening that member's DM", async () => {
+    const fake = await server();
+    const { adapter } = client(fake.endpoint);
+    await adapter.start();
+    const memberScope = { ...groupScope, senderId: "10099" };
+    expect(
+      await adapter.send({ deliveryId: "member-group", target: memberScope, text: "群回复" }),
+    ).toEqual({ status: "confirmed", messageId: "321" });
+    expect(
+      await adapter.send({
+        deliveryId: "member-private",
+        target: { ...memberScope, chatType: "private", chatId: "10099" },
+        text: "不可私聊",
+      }),
+    ).toEqual({ status: "failed", code: "invalid_target" });
   });
   it("sends an Owner DM only through the configured private destination", async () => {
     const fake = await server();
