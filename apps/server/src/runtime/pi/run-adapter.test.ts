@@ -936,3 +936,88 @@ describe("an explicit current-group history search requires the group Tool", () 
     expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBeUndefined();
   });
 });
+
+describe("an explicit Owner-private cross-group history search requires the Owner Tool", () => {
+  function ownerFixture(results: PiRunResult[]) {
+    const f = fixture(results);
+    f.input.text =
+      "同时搜索我已授权的两个群历史。群 1126022432 查 P4B-A-1349，群 1121579672 查 P4B-B-1349。列出群号、发送者和原文，只回复到当前私聊。";
+    f.createOrRestoreSession.mockImplementation(async (_conversation, _profile, context) => {
+      if (context) context.authorizedToolNames = [OWNER_HISTORY_SEARCH_TOOL, "owner_group_admin"];
+      return {
+        conversationId: "conversation-1",
+        runtimeSessionId: "session-1",
+        profileName: "main-agent" as const,
+        agentDir: "agent",
+        createdAt: new Date(0).toISOString(),
+        lastActiveAt: new Date(0).toISOString(),
+      };
+    });
+    return f;
+  }
+
+  it("does not mistake answer or audience words for a group-policy query", async () => {
+    const f = ownerFixture([
+      {
+        status: "completed",
+        text: "两个群的发送者和原文如下。",
+        toolCalls: [
+          {
+            name: OWNER_HISTORY_SEARCH_TOOL,
+            input: { groupIds: ["1126022432"], query: "P4B-A-1349" },
+            failed: false,
+          },
+          {
+            name: OWNER_HISTORY_SEARCH_TOOL,
+            input: { groupIds: ["1121579672"], query: "P4B-B-1349" },
+            failed: false,
+          },
+        ],
+      },
+    ]);
+
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "succeeded",
+      text: "两个群的发送者和原文如下。",
+    });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe(OWNER_HISTORY_SEARCH_TOOL);
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({});
+    expect(f.run).toHaveBeenCalledOnce();
+  });
+
+  it("fails closed when the model answers a cross-group search without the Tool", async () => {
+    const fabricated = { status: "completed" as const, text: "没有找到。", toolCalls: [] };
+    const f = ownerFixture([fabricated, fabricated]);
+
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "failed",
+      text: "请求的操作未执行，请稍后重试。",
+    });
+    expect(f.run).toHaveBeenCalledTimes(2);
+    expect(f.run.mock.calls[1]?.[2]).toContain(OWNER_HISTORY_SEARCH_TOOL);
+  });
+
+  it("keeps a private history-policy status request on owner_group_admin", async () => {
+    const f = ownerFixture([
+      {
+        status: "completed",
+        text: "历史状态已列出。",
+        toolCalls: [
+          {
+            name: "owner_group_admin",
+            input: { action: "get", groupId: "1126022432" },
+            failed: false,
+          },
+        ],
+      },
+    ]);
+    f.input.text = "查询群 1126022432 的历史配置状态";
+
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe("owner_group_admin");
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({
+      action: "get",
+      groupId: "1126022432",
+    });
+  });
+});

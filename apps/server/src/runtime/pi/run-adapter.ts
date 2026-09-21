@@ -7,7 +7,7 @@ import type {
 import { scopeKey } from "../../identity/scope.js";
 import type { QqCapabilityCategory } from "../../channels/onebot/capabilities.js";
 import type { PiRunContext, PiRuntimeAdapter, PiRuntimeProfileName } from "./types.js";
-import { GROUP_HISTORY_SEARCH_TOOL } from "./history-tools.js";
+import { GROUP_HISTORY_SEARCH_TOOL, OWNER_HISTORY_SEARCH_TOOL } from "./history-tools.js";
 import { requiredInputClause, satisfiesRequiredInput } from "./protected-tools.js";
 import { OWNER_GROUP_ADMIN_TOOL } from "./owner-tools.js";
 
@@ -272,6 +272,30 @@ function groupHistorySearchRequested(text: string): boolean {
   return true;
 }
 
+/**
+ * Whether the current Owner-private message explicitly asks to search one or more groups.
+ *
+ * This check runs before the management-query check. A search request often asks to "list"
+ * the matched sender and text, or says to reply in the "current" private chat. Those words
+ * describe the requested answer and audience. They do not turn the request into a group-policy
+ * query. A request about the history setting or its status remains a management query.
+ */
+function ownerHistorySearchRequested(text: string): boolean {
+  if (/不要|不用|无需|不需要|请勿|不许|停止|别再|别去|别帮我/u.test(text)) return false;
+  if (/如何|怎么|能否|是否|可以吗/u.test(text)) return false;
+  if (/(?:历史|聊天记录|消息记录)[^。！？\n]{0,16}(?:状态|配置|开关|是否启用|是否开启)/u.test(text))
+    return false;
+  if (
+    !/(?:已授权|管理的|多个\s*群|两个\s*群|所有\s*群|各个\s*群|群\s*[1-9]\d{4,15}|[1-9]\d{4,15}\s*群)/u.test(
+      text,
+    )
+  )
+    return false;
+  return /(?:搜索|搜|查找|查|检索|查询)[^。！？\n]{0,120}(?:群\s*(?:的)?\s*(?:历史|聊天记录|消息记录|群聊记录|聊天历史|历史消息)|已授权[^。！？\n]{0,40}(?:历史|聊天记录|消息记录))/u.test(
+    text,
+  );
+}
+
 export interface PiRunExecutionAdapterOptions {
   isOwner?: (input: ExecutionInput) => Promise<boolean>;
   resolveProfileName?: (input: ExecutionInput) => Promise<PiRuntimeProfileName>;
@@ -310,6 +334,8 @@ function requiredToolCall(
   if (input.caller.scope.chatType !== "private" || !isOwner) return undefined;
   const text = input.text;
   if (/不要|别|无需/u.test(text)) return undefined;
+  if (authorizedToolNames?.includes(OWNER_HISTORY_SEARCH_TOOL) && ownerHistorySearchRequested(text))
+    return { name: OWNER_HISTORY_SEARCH_TOOL, input: {} };
   const groupId = namedGroupId(text);
   if (!groupId) return undefined;
   if (/如何|怎么|能否|是否|可以吗/u.test(text)) return undefined;
