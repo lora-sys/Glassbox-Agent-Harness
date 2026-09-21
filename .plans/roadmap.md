@@ -408,37 +408,128 @@ P4 completion requires both P4A and P4B completion gates to pass. A large Memory
 
 ### P5 — Efficient Runtime and Observability
 
-Optimize the proven runtime and retrieval paths.
+P5 is the next intentionally parallel phase after P4 completes.
 
-Target capabilities:
+~~~text
+P5A — Context Budgeting and Runtime Efficiency
+P5B — Routing and Runtime Observability
+~~~
 
-```text
-Context Budget Governor
+The split is by ownership so two developers can work concurrently without building competing runtime layers.
+
+#### P5A — Context Budgeting and Runtime Efficiency
+
+Goal: bound what reaches the model after authorization while preserving full evidence.
+
+P5A owns:
+
+~~~text
+TokenEstimate
+ContextDemandEstimate
+ContextBudgetGovernor
 Tool Result Budget / Projection
-Token estimation
-Execution routing
-thinking-depth selection
+per-turn Tool/retrieval admission
 Context compression policy
-duplicate retrieval prevention
-permission-scoped semantic cache
-runtime usage / quota / health
+authorization-scoped projection/cache proof
+efficiency evidence
+~~~
+
+Primary reference: TokenRhythm/opensquilla context_budget.py, result_budget.py, token_estimation.py and TokenJuice projection behavior.
+
+P5A must not route models, collect quotas, define RuntimeHealth or own routing Eval.
+
+The older roadmap phrase “permission-scoped semantic cache” is narrowed: P5A first proves authority-scoped deterministic projection/retrieval reuse and revocation behavior. Generic model-answer semantic caching is disabled/deferred unless a separate proof exists.
+
+Plan / Issue:
+
+~~~text
+.plans/05a-context-budgeting-runtime-efficiency.md
+Issue #13
+~~~
+
+#### P5B — Routing and Runtime Observability
+
+Goal: make model/thinking selection, runtime usage/limits/health, Agent Ops health/throughput and routing quality inspectable.
+
+P5B owns:
+
+~~~text
+RoutingDecision
+ModelCapacity
+execution routing
+thinking-depth selection
+RuntimeUsage / RuntimeLimits / RuntimeHealth
 Agent Ops health / throughput
-routing observability
+routing evidence
 routing Eval
-```
-
-Generic Pi workflow mechanisms belong in Lora PI Kit when they do not change Glassbox authorization, product truth, or evidence semantics.
-
-Glassbox keeps protected Context selection, product routing policy, Task truth, and evidence.
+optional sanitized OpenTelemetry projection
+~~~
 
 Primary references:
 
-```text
-TokenRhythm/opensquilla
-Javis603/token-monitor
-Herdr lifecycle surfaces
+~~~text
+TokenRhythm/opensquilla routing + decision observability
+Javis603/token-monitor usage / limits / health
+Herdr public lifecycle / snapshot / event semantics
 OpenTelemetry concepts
-```
+existing Glassbox Eval
+~~~
+
+P5B starts with a no-behavior-change routing seam and deterministic policy gates. The full OpenSquilla ML/ensemble stack is not a baseline requirement.
+
+Plan / Issue:
+
+~~~text
+.plans/05b-routing-runtime-observability.md
+Issue #14
+~~~
+
+#### Shared P5 contract
+
+~~~text
+already-authorized request / P4 sources
+        ↓
+P5A ContextDemandEstimate
+        ↓
+P5B RoutingDecision + ModelCapacity
+        ↓
+P5A ContextBudgetSnapshot + bounded projection
+        ↓
+Pi execution
+        ↓
+P5B actual RuntimeUsage / Health / Eval
+~~~
+
+Routing may not widen authority. Budgeting may not become authorization. Compression/cache may not erase Raw Trace. Herdr live state may not become Task acceptance. Missing usage/quota/health remains unknown, not zero.
+
+Both implementation branches start from the same post-P4 main baseline. Each stream develops against deterministic sibling fixtures and keeps core logic in separate leaf modules; shared Pi/management/schema integration is serialized after rebasing.
+
+#### P5 success
+
+Measure optimization without confusing lower cost with correctness:
+
+~~~text
+P5A
+  model-facing input before/after
+  Tool projection reduction
+  duplicate retrievals prevented
+  overflow frequency
+  unsafe cache hit count = 0
+  revocation leakage count = 0
+
+P5B
+  routing decision coverage
+  fallback trace coverage
+  decision-vs-actual runtime consistency
+  actual-vs-estimate honesty
+  unknown-as-zero violations = 0
+  unsafe route authority changes = 0
+  Runtime/Ops health freshness
+  routing Eval invariant pass rate
+~~~
+
+P5 is complete only when both P5A and P5B completion gates pass and the P3/P4 trust, retrieval and Delivery regressions remain green.
+
 
 ### P6 — Durable Long Work and Workers
 
