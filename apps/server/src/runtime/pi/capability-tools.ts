@@ -48,6 +48,7 @@ import {
   ToolInputError,
   type ProtectedToolContext,
 } from "./protected-tools.js";
+import type { ToolExclusionReason } from "./tool-plane.js";
 import type { PiRunContext } from "./types.js";
 
 /** Sentinel Resource for a call outside the intended scope. Never registered, so it denies. */
@@ -116,23 +117,53 @@ export interface CapabilityInvocation {
  * the Agent's own connection and are always available to the Owner. An Owner-private Run
  * additionally sees every mutating category the Owner enabled somewhere.
  */
+/**
+ * Every registered capability Tool, each with why it is or is not eligible for this scope.
+ *
+ * `availableCapabilityToolNames` is a projection of this, never a second implementation: the
+ * names a Run may call and the surface a Run records must not be able to disagree.
+ *
+ * The reason distinguishes a scope boundary from an Owner policy choice. They look identical
+ * in a name list and are completely different to an Owner reading why a Tool was missing.
+ */
+export function capabilityToolEligibility(input: {
+  isOwner: boolean;
+  chatType: "group" | "private";
+  enabledCategories: readonly QqCapabilityCategory[];
+}): { name: string; exclusion: ToolExclusionReason | null }[] {
+  const enabled = new Set(input.enabledCategories);
+  return QQ_CAPABILITIES.map((capability) => {
+    if (input.chatType === "group") {
+      // A group Run is confined to read-only group capabilities. Account-scoped Tools and
+      // the mutating categories are a scope boundary, not something the group can enable.
+      if (capability.resource !== "group")
+        return { name: capability.tool, exclusion: "scope_not_permitted" as const };
+      if (!GROUP_RUN_CAPABILITY_CATEGORIES.includes(capability.category))
+        return { name: capability.tool, exclusion: "scope_not_permitted" as const };
+      return {
+        name: capability.tool,
+        exclusion: enabled.has(capability.category) ? null : ("policy_disabled" as const),
+      };
+    }
+    // A Visitor-private Run reaches no QQ capability at all.
+    if (!input.isOwner) return { name: capability.tool, exclusion: "scope_not_permitted" as const };
+    // Account status is the Owner's own provider state and is always readable by the Owner.
+    if (capability.resource === "account") return { name: capability.tool, exclusion: null };
+    return {
+      name: capability.tool,
+      exclusion: enabled.has(capability.category) ? null : ("policy_disabled" as const),
+    };
+  });
+}
+
 export function availableCapabilityToolNames(input: {
   isOwner: boolean;
   chatType: "group" | "private";
   enabledCategories: readonly QqCapabilityCategory[];
 }): string[] {
-  const enabled = new Set(input.enabledCategories);
-  if (input.chatType === "group")
-    return QQ_CAPABILITIES.filter(
-      (capability) =>
-        capability.resource === "group" &&
-        GROUP_RUN_CAPABILITY_CATEGORIES.includes(capability.category) &&
-        enabled.has(capability.category),
-    ).map((capability) => capability.tool);
-  if (!input.isOwner) return [];
-  return QQ_CAPABILITIES.filter(
-    (capability) => capability.resource === "account" || enabled.has(capability.category),
-  ).map((capability) => capability.tool);
+  return capabilityToolEligibility(input)
+    .filter((entry) => entry.exclusion === null)
+    .map((entry) => entry.name);
 }
 
 function validatedProviderParams(value: unknown): QqProviderParams {

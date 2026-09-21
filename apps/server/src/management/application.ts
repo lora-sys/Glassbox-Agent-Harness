@@ -44,14 +44,22 @@ import type { ProtectedToolContext } from "../runtime/pi/protected-tools.js";
 import {
   availableHistoryToolNames,
   createHistoryTools,
+  historyToolEligibility,
   OWNER_HISTORY_ACTION,
   OWNER_HISTORY_RESOURCE,
 } from "../runtime/pi/history-tools.js";
 import {
   availableCapabilityToolNames,
+  capabilityToolEligibility,
   createCapabilityTools,
   GROUP_RUN_CAPABILITY_CATEGORIES,
 } from "../runtime/pi/capability-tools.js";
+import { resolveSkillVisibility } from "../runtime/pi/skill-visibility.js";
+import {
+  TOOL_DESCRIPTORS,
+  type ToolExclusionReason,
+  type ToolSurfaceCandidate,
+} from "../runtime/pi/tool-plane.js";
 import type { PiRunContext } from "../runtime/pi/types.js";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import {
@@ -369,42 +377,41 @@ export class ManagementApplication {
       createTools: (getContext) => this.createRuntimeTools(getContext),
       resolveSkillNames: async (context, profile) => {
         if (!context.caller)
-          return { names: [], modelVisibleNames: [], policy: { source: "no-caller" } };
-        const isOwner = await this.store.identities.isOwner(context.caller.principalId);
-        if (context.caller.scope.chatType === "group") {
-          if (isOwner) {
-            return {
-              names: profile.enabledSkills,
-              modelVisibleNames: [],
-              policy: { source: "owner-profile", profile: profile.name },
-            };
-          }
-          const configured = this.groupRuntime.get(
-            context.caller.scope.connectionId,
-            context.caller.scope.chatId,
-            this.kitLoader.loadProfile("qq-group").enabledSkills,
-          );
-          const available = new Set(this.kitLoader.availableSkills().map((skill) => skill.name));
-          const filtered = configured.enabledSkills.filter((name) => available.has(name));
-          return {
-            names: filtered,
-            modelVisibleNames: filtered,
-            policy: {
-              source: "group-whitelist",
-              groupId: configured.groupId,
-              configVersion: configured.version,
-            },
-          };
-        }
-        return {
-          names: profile.enabledSkills,
-          modelVisibleNames: profile.name === "main-agent" ? [] : profile.enabledSkills,
-          policy: isOwner
-            ? { source: "owner-profile", profile: profile.name }
-            : { source: "kit-profile" },
-        };
+          return resolveSkillVisibility({
+            caller: null,
+            isOwner: false,
+            profile,
+            group: null,
+            availableSkills: [],
+          });
+        const caller = context.caller;
+        const isOwner = await this.store.identities.isOwner(caller.principalId);
+        // The group's configuration is read only when the group is the audience that decides
+        // it. An Owner-private Run has no group whitelist to consult.
+        const group =
+          caller.scope.chatType === "group" && !isOwner
+            ? this.groupRuntime.get(
+                caller.scope.connectionId,
+                caller.scope.chatId,
+                this.kitLoader.loadProfile("qq-group").enabledSkills,
+              )
+            : null;
+        return resolveSkillVisibility({
+          caller,
+          isOwner,
+          profile,
+          group: group
+            ? {
+                groupId: group.groupId,
+                configVersion: group.version,
+                enabledSkills: group.enabledSkills,
+              }
+            : null,
+          availableSkills: this.kitLoader.availableSkills().map((skill) => skill.name),
+        });
       },
       resolveToolNames: (context) => this.resolveRunToolNames(context),
+      resolveToolCandidates: (context) => this.resolveRunToolCandidates(context),
       onEvent: async (event) => {
         const runId =
           event.runId ?? (typeof event.data.runId === "string" ? event.data.runId : undefined);
@@ -516,15 +523,28 @@ export class ManagementApplication {
   }
 
   /**
-   * The Tool names one Run may discover, after each name's discovery grant is checked.
+   * Every registered Tool, classified for this Run's scope, policy and grants.
+   *
+   * This is the one implementation of Tool discovery; `resolveRunToolNames` is its
+   * projection. Splitting them would let the names a Run may call and the surface a Run
+   * records disagree, which is the drift Issue #16 exists to remove.
+   *
+   * The classification runs over the whole registered universe so an exclusion is always
+   * explainable, but the `tool:discover` authorization check is issued only for names that
+   * survive the scope and policy gates. Checking Tools a scope was never eligible for would
+   * add authorization evidence for operations that were never on the table.
    *
    * The capability surface follows current policy, never a cached bundle: a group Run sees
    * only what its own group's policy enables, and an Owner-private Run sees the union over
    * the groups the current Principal is assigned to. Discovery is granted as a superset, so
    * a policy change applies on the very next Run with no re-grant.
    */
-  private async resolveRunToolNames(context: PiRunContext): Promise<string[]> {
-    if (!context.caller || !context.conversationId || !context.runId) return [];
+  async resolveRunToolCandidates(context: PiRunContext): Promise<ToolSurfaceCandidate[]> {
+    if (!context.caller || !context.conversationId || !context.runId)
+      return TOOL_DESCRIPTORS.map((descriptor) => ({
+        name: descriptor.name,
+        exclusion: "no_caller_context" as const,
+      }));
     const isOwner = await this.store.identities.isOwner(context.caller.principalId);
     const scope = context.caller.scope;
     const capabilityCategories =
@@ -535,34 +555,61 @@ export class ManagementApplication {
         : isOwner
           ? await this.assignedCategories(context.caller)
           : [];
-    const candidates = [
-      ...(context.authorizedSkillNames?.length ? [SKILL_READ_TOOL] : []),
-      ...(isOwner && scope.chatType === "private"
-        ? [...(this.options.ops ? OPS_TOOL_NAMES : []), OWNER_GROUP_ADMIN_TOOL]
-        : []),
-      ...availableHistoryToolNames({
-        isOwner,
-        chatType: scope.chatType,
-        enabledCategories: capabilityCategories,
-      }),
-      ...availableCapabilityToolNames({
-        isOwner,
-        chatType: scope.chatType,
-        enabledCategories: capabilityCategories,
-      }),
-    ];
-    const selected: string[] = [];
-    for (const name of candidates) {
+
+    const scopeGates = new Map<string, ToolExclusionReason>();
+    for (const entry of historyToolEligibility({
+      isOwner,
+      chatType: scope.chatType,
+      enabledCategories: capabilityCategories,
+    }))
+      if (entry.exclusion !== null) scopeGates.set(entry.name, entry.exclusion);
+    for (const entry of capabilityToolEligibility({
+      isOwner,
+      chatType: scope.chatType,
+      enabledCategories: capabilityCategories,
+    }))
+      if (entry.exclusion !== null) scopeGates.set(entry.name, entry.exclusion);
+
+    // The Agent Ops and Owner-control surface is Owner-private. A group Run reaches neither,
+    // however the Owner's own grants look, so this is a scope boundary rather than a policy.
+    const ownerPrivate = isOwner && scope.chatType === "private";
+    for (const name of OPS_TOOL_NAMES)
+      if (!(ownerPrivate && this.options.ops)) scopeGates.set(name, "scope_not_permitted");
+    if (!ownerPrivate) scopeGates.set(OWNER_GROUP_ADMIN_TOOL, "scope_not_permitted");
+    if (!context.authorizedSkillNames?.length) scopeGates.set(SKILL_READ_TOOL, "policy_disabled");
+
+    const candidates: ToolSurfaceCandidate[] = [];
+    for (const descriptor of TOOL_DESCRIPTORS) {
+      if (descriptor.origin === "pi_builtin") {
+        candidates.push({ name: descriptor.name, exclusion: "disabled_by_host" });
+        continue;
+      }
+      // A registered Tool with no gate is a wiring bug. Naming it `unclassified` keeps it
+      // out of the model's surface and makes the gap visible instead of silently offering it.
+      const gate = scopeGates.get(descriptor.name) ?? "unclassified";
+      if (gate !== "unclassified") {
+        candidates.push({ name: descriptor.name, exclusion: gate });
+        continue;
+      }
       const decision = await this.store.authorization.check({
         caller: context.caller,
-        resourceId: toolResourceId(name),
+        resourceId: toolResourceId(descriptor.name),
         action: TOOL_DISCOVERY_ACTION,
         conversationId: context.conversationId,
         runId: context.runId,
       });
-      if (decision.decision === "ALLOW") selected.push(name);
+      candidates.push({
+        name: descriptor.name,
+        exclusion: decision.decision === "ALLOW" ? null : "discovery_denied",
+      });
     }
-    return selected;
+    return candidates;
+  }
+
+  private async resolveRunToolNames(context: PiRunContext): Promise<string[]> {
+    return (await this.resolveRunToolCandidates(context))
+      .filter((candidate) => candidate.exclusion === null)
+      .map((candidate) => candidate.name);
   }
 
   private execution(reference: string): RunExecutionAdapter | undefined {

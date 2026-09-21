@@ -25,6 +25,8 @@ import {
   ManagementApplication,
 } from "./application.js";
 import { PiRunExecutionAdapter } from "../runtime/pi/run-adapter.js";
+import type { ToolExclusionReason } from "../runtime/pi/tool-plane.js";
+import { TOOL_DESCRIPTORS } from "../runtime/pi/tool-plane.js";
 import type { PiRuntimeAdapter } from "../runtime/pi/types.js";
 import {
   AccessDeniedError,
@@ -711,6 +713,9 @@ const admin = (app: ManagementApplication) =>
     ): Promise<unknown>;
     projectManagedGroups(context: OwnerContext): Promise<ManagedGroupProjection>;
     resolveRunToolNames(context: OwnerContext): Promise<string[]>;
+    resolveRunToolCandidates(
+      context: OwnerContext,
+    ): Promise<{ name: string; exclusion: ToolExclusionReason | null }[]>;
     createRuntimeTools(getContext: () => OwnerContext | undefined): Array<{
       name: string;
       execute(id: string, params: unknown, signal?: AbortSignal): Promise<{ details?: unknown }>;
@@ -1271,6 +1276,9 @@ const groupRun = (app: ManagementApplication) =>
       input: { groupId: string; enabled: boolean },
     ): Promise<unknown>;
     resolveRunToolNames(context: OwnerContext): Promise<string[]>;
+    resolveRunToolCandidates(
+      context: OwnerContext,
+    ): Promise<{ name: string; exclusion: ToolExclusionReason | null }[]>;
     createRuntimeTools(getContext: () => OwnerContext | undefined): Array<{
       name: string;
       execute(id: string, params: unknown, signal?: AbortSignal): Promise<{ details?: unknown }>;
@@ -1330,6 +1338,47 @@ describe("configured group Run capability authority", () => {
     expect(context.caller.scope).toMatchObject({ chatType: "group", chatId: GROUP });
     return { f, a, application, context, groupInput: run };
   }
+
+  it("names why each Tool is off a group Run's surface instead of only that it is", async () => {
+    const { application, context } = await configuredGroup();
+
+    const candidates = await application.resolveRunToolCandidates(context);
+    const reason = (name: string) => candidates.find((entry) => entry.name === name)?.exclusion;
+
+    // A group Run cannot reach the mutating categories at all: that is a scope boundary, not
+    // an Owner policy choice, and the surface has to say which one it was.
+    expect(reason("qq_group_moderation")).toBe("scope_not_permitted");
+    expect(reason("qq_account_status")).toBe("scope_not_permitted");
+    // `qq_capability_search` is Owner-private, so a group Run is out of scope for it.
+    expect(reason("qq_capability_search")).toBe("scope_not_permitted");
+    // The Agent Ops and Owner-control surface is Owner-private too.
+    expect(reason("owner_group_admin")).toBe("scope_not_permitted");
+    expect(reason("ops_status")).toBe("scope_not_permitted");
+    // The Kit profile's host Tools were removed by the host, and that is named as such.
+    expect(reason("read")).toBe("disabled_by_host");
+    expect(reason("bash")).toBe("disabled_by_host");
+    // The eligible read-only Tools are the selected set, and agree with the name projection.
+    const selected = candidates
+      .filter((entry) => entry.exclusion === null)
+      .map((entry) => entry.name);
+    expect([...selected].sort()).toEqual([...GROUP_RUN_READ_TOOLS].sort());
+    expect([...(await application.resolveRunToolNames(context))].sort()).toEqual(
+      [...selected].sort(),
+    );
+  });
+
+  it("classifies every registered Tool, so a Tool with unwired discovery cannot slip through", async () => {
+    const { application, context } = await configuredGroup();
+
+    const candidates = await application.resolveRunToolCandidates(context);
+    // `unclassified` means Glassbox registers a Tool that no discovery rule reached. It is
+    // never a legitimate outcome: it is a Tool that would either be offered by accident or
+    // silently vanish. Asserting it never appears is what makes adding a Tool without wiring
+    // its discovery fail here rather than in production.
+    expect(candidates.filter((entry) => entry.exclusion === "unclassified")).toEqual([]);
+    expect(candidates.length).toBe(TOOL_DESCRIPTORS.length);
+    expect(new Set(candidates.map((entry) => entry.name)).size).toBe(TOOL_DESCRIPTORS.length);
+  });
 
   it("discovers only the read-only capabilities for a group Run and calls one for real", async () => {
     const { application, context } = await configuredGroup();

@@ -40,6 +40,7 @@ import {
   type ProtectedToolContext,
 } from "./protected-tools.js";
 import type { QqCapabilityCategory } from "../../channels/onebot/capabilities.js";
+import type { ToolExclusionReason } from "./tool-plane.js";
 import type { PiRunContext } from "./types.js";
 
 export const GROUP_HISTORY_SEARCH_TOOL = "group_history_search";
@@ -325,15 +326,47 @@ function historyGuidance(details: HistorySearchDetails): string {
  * `group.history`. Discovery is a superset of authority, so the grant can stay in place and
  * the Owner's policy change takes effect on the very next Run without a re-grant.
  */
+/**
+ * Both history Tools, each with why it is or is not eligible for this scope.
+ *
+ * `availableHistoryToolNames` is a projection of this, never a second implementation: a Run
+ * that reads only the eligible names and a Run that records the whole surface must never
+ * disagree about which Tool a scope may reach.
+ */
+export function historyToolEligibility(input: {
+  isOwner: boolean;
+  chatType: "group" | "private";
+  enabledCategories: readonly QqCapabilityCategory[];
+}): { name: string; exclusion: ToolExclusionReason | null }[] {
+  if (input.chatType === "group")
+    return [
+      {
+        name: GROUP_HISTORY_SEARCH_TOOL,
+        exclusion: input.enabledCategories.includes("group.history") ? null : "policy_disabled",
+      },
+      // An Owner in a group searches that group's history; the Owner-private corpus is a
+      // different Resource and is not reachable from a group scope at all.
+      { name: OWNER_HISTORY_SEARCH_TOOL, exclusion: "scope_not_permitted" },
+    ];
+  if (input.isOwner)
+    return [
+      { name: OWNER_HISTORY_SEARCH_TOOL, exclusion: null },
+      { name: GROUP_HISTORY_SEARCH_TOOL, exclusion: "scope_not_permitted" },
+    ];
+  return [
+    { name: OWNER_HISTORY_SEARCH_TOOL, exclusion: "scope_not_permitted" },
+    { name: GROUP_HISTORY_SEARCH_TOOL, exclusion: "scope_not_permitted" },
+  ];
+}
+
 export function availableHistoryToolNames(input: {
   isOwner: boolean;
   chatType: "group" | "private";
   enabledCategories: readonly QqCapabilityCategory[];
 }): string[] {
-  if (input.chatType === "group")
-    return input.enabledCategories.includes("group.history") ? [GROUP_HISTORY_SEARCH_TOOL] : [];
-  if (input.isOwner) return [OWNER_HISTORY_SEARCH_TOOL];
-  return [];
+  return historyToolEligibility(input)
+    .filter((entry) => entry.exclusion === null)
+    .map((entry) => entry.name);
 }
 
 function validatedParams(input: GroupHistoryInput): GroupHistoryInput {

@@ -178,6 +178,104 @@ describe("PiSdkRuntimeAdapter", () => {
     await adapter.cleanup();
   });
 
+  it("records the classified Tool surface as Run evidence so a Run can explain its own Tools", async () => {
+    const runtimeBaseDir = await mkdtemp(join(tmpdir(), "glassbox-pi-runtime-"));
+    directories.push(runtimeBaseDir);
+    let surface: unknown;
+    const fakeSession = {
+      sessionId: "pi-session-surface",
+      messages: [
+        { role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" },
+      ],
+      subscribe(callback: (event: AgentSessionEvent) => void) {
+        listener = callback;
+        return () => {
+          listener = undefined;
+        };
+      },
+      async prompt() {
+        listener?.({ type: "agent_start" });
+        listener?.({ type: "agent_end", messages: [], willRetry: false });
+      },
+      async abort() {},
+      dispose() {},
+    };
+    let listener: ((event: AgentSessionEvent) => void) | undefined;
+    let activeTools: unknown;
+
+    const adapter = new PiSdkRuntimeAdapter({
+      kitPath: fileURLToPath(new URL("./fixtures/lora-pi-kit", import.meta.url)),
+      runtimeBaseDir,
+      // The classified discovery path. `resolveToolNames` is deliberately absent, so a surface
+      // that only existed for fakes would leave this undefined and fail here.
+      resolveToolCandidates: async () => [
+        { name: "qq_group_history", exclusion: null },
+        { name: "group_history_search", exclusion: null },
+        { name: "owner_group_admin", exclusion: "scope_not_permitted" },
+        { name: "read", exclusion: "disabled_by_host" },
+      ],
+      resolveSkillNames: async () => ({ names: [] }),
+      onEvent: (event) => {
+        if (event.type === "session_start") surface = event.data.toolSurface;
+      },
+      createSession: async ({ profile }) => {
+        expect(profile.activeTools).toEqual([]);
+        activeTools = profile.activeTools;
+        return fakeSession as never;
+      },
+    });
+
+    await adapter.initialize();
+    const context: PiRunContext = {
+      runId: run.id,
+      conversationId: conversation.id,
+      caller: {
+        principalId: "owner",
+        scope: {
+          connectionId: "qq",
+          botId: "bot",
+          chatType: "private" as const,
+          chatId: "owner",
+          senderId: "owner",
+        },
+      },
+    };
+    const binding = await adapter.createOrRestoreSession(conversation, "test", context);
+    await adapter.run(binding, run, "say hello", context);
+
+    expect(activeTools).toEqual([]);
+    expect(context.authorizedToolNames).toEqual(["qq_group_history", "group_history_search"]);
+    expect(surface).toMatchObject({
+      profileName: "test",
+      profileTools: [],
+      selected: [
+        // The provider's own answer about a group's history.
+        {
+          name: "qq_group_history",
+          origin: "glassbox_domain",
+          grounding: "direct_observation",
+        },
+        // Glassbox's own search over that history. Same subject, different evidence class:
+        // this one supports a claim about what the search covered, not about the group.
+        {
+          name: "group_history_search",
+          origin: "glassbox_domain",
+          grounding: "derived_retrieval",
+        },
+      ],
+      excluded: [
+        { name: "owner_group_admin", reason: "scope_not_permitted" },
+        { name: "read", reason: "disabled_by_host" },
+      ],
+      disabledByHost: [],
+    });
+    // The profile digest is real, so the recorded surface can be read against the exact
+    // profile declaration it ran under rather than against whatever the Kit holds today.
+    const version = (surface as { profileVersion: string }).profileVersion;
+    expect(version).toMatch(/^[a-f0-9]{64}$/u);
+    await adapter.cleanup();
+  });
+
   it("enforces isolated Pi sessions across Owner and Visitor in the same Conversation, creating fresh sessions without caching", async () => {
     const runtimeBaseDir = await mkdtemp(join(tmpdir(), "glassbox-pi-runtime-"));
     directories.push(runtimeBaseDir);

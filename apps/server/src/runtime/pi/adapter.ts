@@ -15,6 +15,9 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { KitLoader, type ResolvedKitProfile } from "./kit-loader.js";
 import { requiredInputClause } from "./protected-tools.js";
+import { GLASSBOX_HOST_EXCLUDED_PI_TOOLS, describeToolSurface } from "./tool-plane.js";
+import type { EffectiveToolSurface, ToolSurfaceCandidate } from "./tool-plane.js";
+import { kitProfileSkillVisibility } from "./skill-visibility.js";
 import type {
   PiNormalizedEvent,
   PiRunContext,
@@ -33,6 +36,8 @@ interface ActiveSession {
   binding: PiSessionBinding;
   runtimeEvidence: Record<string, unknown>;
   authorizedToolNames: readonly string[];
+  /** The classified surface, when discovery could report one. Recorded as Run evidence. */
+  toolSurface?: EffectiveToolSurface;
   authorizedSkillNames: readonly string[];
   modelVisibleSkillNames: readonly string[];
   skillPolicy: Record<string, unknown>;
@@ -56,6 +61,14 @@ export interface PiSdkRuntimeOptions {
     policy?: Record<string, unknown>;
   }>;
   resolveToolNames?: (context: PiRunContext) => Promise<readonly string[]>;
+  /**
+   * The same discovery, classified.
+   *
+   * Preferred over `resolveToolNames` when present: a caller that supplies this gets the
+   * effective surface recorded as Run evidence, so a Run can explain which Tools were
+   * excluded and why. `resolveToolNames` remains for fakes that only need the active names.
+   */
+  resolveToolCandidates?: (context: PiRunContext) => Promise<readonly ToolSurfaceCandidate[]>;
   onEvent?: (event: PiNormalizedEvent) => void | Promise<void>;
   createSession?: (params: {
     conversation: Conversation;
@@ -64,6 +77,22 @@ export interface PiSdkRuntimeOptions {
     sessionDir: string;
     modelVisibleSkillNames?: readonly string[];
   }) => Promise<ActiveSession["session"]>;
+}
+
+/**
+ * The content digest of the Kit profile a surface was computed against.
+ *
+ * Read out of the runtime evidence the Kit loader already fingerprints, rather than hashed
+ * again here: two digests of the same file could disagree, and the one on the evidence is the
+ * one a reader will compare against.
+ */
+function profileFingerprint(evidence: Record<string, unknown>, profileName: string): string {
+  const fingerprints = evidence.fingerprints;
+  if (fingerprints && typeof fingerprints === "object") {
+    const value = (fingerprints as Record<string, unknown>)[`profiles/${profileName}.json`];
+    if (typeof value === "string") return value;
+  }
+  return "unknown";
 }
 
 function textFromContent(content: unknown): string {
@@ -258,17 +287,13 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
     const resolvedSkills =
       context && this.options.resolveSkillNames
         ? await this.options.resolveSkillNames(context, profile)
-        : {
-            names: profile.enabledSkills,
-            modelVisibleNames: profileName === "main-agent" ? [] : profile.enabledSkills,
-            policy: { source: "kit-profile" },
-          };
+        : // No resolver means no channel policy was resolved, so the Kit profile speaks for
+          // itself. It is never reached for a Run that has a Principal: the application always
+          // supplies a resolver, and a Run without one denies through `no-caller`.
+          kitProfileSkillVisibility(profile);
     const authorizedSkillNames = [...new Set(resolvedSkills.names)];
     const modelVisibleSkillNames = [
-      ...new Set(
-        resolvedSkills.modelVisibleNames ??
-          (profileName === "main-agent" ? [] : authorizedSkillNames),
-      ),
+      ...new Set(resolvedSkills.modelVisibleNames ?? authorizedSkillNames),
     ];
     if (context) {
       context.authorizedSkillNames = authorizedSkillNames;
@@ -277,10 +302,30 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
     }
     const effectiveProfile = { ...profile, enabledSkills: authorizedSkillNames };
     const runtimeEvidence = this.loader.runtimeEvidence(profileName, authorizedSkillNames);
-    const authorizedToolNames =
-      context && this.options.resolveToolNames
+    const candidates =
+      context && this.options.resolveToolCandidates
+        ? await this.options.resolveToolCandidates(context)
+        : undefined;
+    const authorizedToolNames = candidates
+      ? candidates
+          .filter((candidate) => candidate.exclusion === null)
+          .map((candidate) => candidate.name)
+      : context && this.options.resolveToolNames
         ? [...new Set(await this.options.resolveToolNames(context))]
         : undefined;
+    // The effective surface is built here, where the Kit profile and the discovery result
+    // meet. It is evidence about this Run, so it is recorded rather than recomputed later
+    // from newer state.
+    const toolSurface = candidates
+      ? describeToolSurface({
+          profileName,
+          profileActiveTools: profile.activeTools,
+          candidates,
+          // The digest of the profile file that produced this surface, so an old Run's
+          // evidence can be read against the declaration it actually ran under.
+          profileVersion: profileFingerprint(runtimeEvidence, profileName),
+        })
+      : undefined;
     // Hand the resolved surface back on the Run context. The execution adapter binds a
     // required Tool only when the surface carries it, so discovery and the requirement can
     // never disagree about which Tools this Run has.
@@ -317,6 +362,7 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
       binding,
       runtimeEvidence,
       authorizedToolNames: authorizedToolNames ?? [],
+      toolSurface,
       authorizedSkillNames,
       modelVisibleSkillNames,
       skillPolicy: structuredClone(resolvedSkills.policy ?? { source: "kit-profile" }),
@@ -409,7 +455,7 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
       modelRuntime: configured?.modelRuntime ?? this.options.modelRuntime,
       noTools: "all",
       tools,
-      excludeTools: ["read", "bash", "edit", "write", "grep", "find", "ls", "powershell"],
+      excludeTools: [...GLASSBOX_HOST_EXCLUDED_PI_TOOLS],
       customTools: selectedTools,
       thinkingLevel: profile.thinkingLevel === "none" ? "minimal" : profile.thinkingLevel,
     });
@@ -457,6 +503,9 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
           conversationId: run.conversationId,
           runtime: active.runtimeEvidence,
           authorizedTools: active.authorizedToolNames,
+          // The classified surface, when discovery reported one. Absent for a fake that only
+          // supplies names, and never fabricated here — a missing surface is a fact too.
+          ...(active.toolSurface ? { toolSurface: active.toolSurface } : {}),
           authorizedSkills: active.authorizedSkillNames,
           modelVisibleSkills: active.modelVisibleSkillNames,
           skillPolicy: active.skillPolicy,
