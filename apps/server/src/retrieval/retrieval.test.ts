@@ -324,6 +324,25 @@ describe("P4B exact identifier retrieval", () => {
     expect(detailed.coverage.droppedByExactTerm).toBe(1);
   });
 
+  it("returns the message that carries the identifier, however the input method typed it", async () => {
+    // The same value typed on a Chinese input method is the same identifier. Reading the
+    // full-width digits as an end to the run named the truncated prefix `p4b-a`, which matched
+    // the near miss and dropped the message that really carries the identifier — one wrong
+    // answer in each direction from a single query.
+    const store = new MockCandidateStore([
+      { ...exact, id: "cand-near-miss", text: "P4B-A 这个流还没开始" },
+      { ...exact, id: "cand-real", text: "已合并 P4B-A-1349 到 main" },
+    ]);
+    const retriever = new MemoryRetriever({ store });
+
+    const detailed = await retriever.searchDetailed("P4B-A-１３４９", {
+      allowedSourceIds: ["group-1"],
+    });
+
+    expect(detailed.results.map((result) => result.memory.id)).toEqual(["cand-real"]);
+    expect(detailed.coverage.droppedByExactTerm).toBe(1);
+  });
+
   it("requires every identifier a query names", async () => {
     const store = new MockCandidateStore([
       { ...exact, id: "only-one", text: "P4B-A-1349 单独出现" },

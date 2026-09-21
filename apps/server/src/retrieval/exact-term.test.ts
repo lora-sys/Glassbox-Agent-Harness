@@ -30,6 +30,30 @@ describe("the identifiers a query carries", () => {
     expect(exactTerms("1234567890")).toEqual(["1234567890"]);
   });
 
+  it("names the identifier whatever width the input method emitted it in", () => {
+    // Full-width digits and letters are the same value typed on a Chinese input method, and a
+    // non-ASCII character inside the run splits it there. `P4B-A-１３４９` named the truncated
+    // prefix `p4b-a`, which both answered with a near-miss message and dropped the message that
+    // really carries the identifier; `Ｐ4B-A-1349` named `4b-a-1349` and matched nothing.
+    expect(exactTerms("P4B-A-１３４９")).toEqual(["p4b-a-1349"]);
+    expect(exactTerms("Ｐ4B-A-1349")).toEqual(["p4b-a-1349"]);
+    expect(exactTerms("订单 ｏｒｄｅｒ＿１２３ 已处理")).toEqual(["order_123"]);
+  });
+
+  it("reads the value the same way on both sides, whatever width each side used", () => {
+    // The width is a property of how the text was typed, not of the value, so a query typed
+    // full-width and a message typed half-width name the same identifier and must match.
+    expect(carriesEveryExactTerm("已合并 P4B-A-1349 到 main", exactTerms("P4B-A-１３４９"))).toBe(
+      true,
+    );
+    expect(carriesEveryExactTerm("已合并 Ｐ4B-A-1349 到 main", exactTerms("P4B-A-1349"))).toBe(
+      true,
+    );
+    expect(carriesEveryExactTerm("已合并 P4B-A-1349 到 main", exactTerms("Ｐ4B-A-1349"))).toBe(
+      true,
+    );
+  });
+
   it("leaves prose queries alone", () => {
     // A rule that fired on ordinary text would turn every search into a containment search
     // and answer "not found" for messages that really are about the question.
@@ -45,6 +69,23 @@ describe("the identifiers a query carries", () => {
       "a1",
     ])
       expect(exactTerms(query), query).toEqual([]);
+  });
+
+  it("leaves a date and a range alone, because they describe a day rather than a value", () => {
+    // A digit-only segmented run is descriptive: `2026-09-18`, `10-20` and `9月18日` all name
+    // the same day, so requiring one spelling verbatim answers "not found" for messages that
+    // really are about the question. The query asks about a day, not about a string.
+    for (const query of [
+      "2026-09-18 那天谁说了什么",
+      "10-20 号的记录",
+      "2026/09/18 的记录",
+      "2026-09-18",
+    ])
+      expect(exactTerms(query), query).toEqual([]);
+    // A value with a letter in it is arbitrary by construction and stays a containment term,
+    // including one that is mostly digits: `v1.2.3` is a release, not a description of a day.
+    expect(exactTerms("v1.2.3 的更新")).toEqual(["v1.2.3"]);
+    expect(exactTerms("P4B-A-1349 合并了吗")).toEqual(["p4b-a-1349"]);
   });
 });
 
@@ -117,6 +158,10 @@ describe("the two sides of a containment search", () => {
       "v1.2.3.",
       "1234567890.",
       "P4B-A-1349 和 order_123 都在",
+      "P4B-A-１３４９",
+      "Ｐ4B-A-1349",
+      "见 Ｐ4B-A-1349。",
+      "订单 ｏｒｄｅｒ＿１２３ 已处理",
     ]) {
       const terms = exactTerms(text);
       expect(terms, text).not.toEqual([]);

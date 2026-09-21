@@ -14,16 +14,42 @@
  *
  * Both sides of that comparison read a value through the same rule. A message carrying the
  * query's own text must be a match for it, and it is not one if naming a value and recognizing
- * it disagree about where the value ends.
+ * it disagree about where the value ends or about the width it was typed in.
  *
  * The rule is deliberately narrow. Widening it to any alphanumeric run would turn ordinary
  * searches — `iOS18`, `v2`, a year — into containment searches and answer "not found" for
  * messages that really are about the question. Narrowing it to the one shape that caused the
  * incident would leave the rest of the class in place.
+ *
+ * Narrow also means a value has to be arbitrary rather than descriptive. `2026-09-18` names a
+ * day, and every spelling of that day is the same day, so it is prose; `v1.2.3` names a release
+ * and is not. The letter is what separates them, and it is why a digit-only segmented run is
+ * left to the ordinary token search.
  */
 
 /** A run of identifier characters. The leading character is never a separator. */
 const IDENTIFIER_RUN = /[A-Za-z0-9][A-Za-z0-9._-]*/gu;
+
+/** The full-width forms of the ASCII identifier characters, and the ideographic space. */
+const FULL_WIDTH = /[！-～　]/gu;
+
+/** The offset between a full-width ASCII character and the ASCII character it stands for. */
+const FULL_WIDTH_OFFSET = 0xfee0;
+
+/**
+ * The text with full-width characters folded to their ASCII form.
+ *
+ * Width is a property of how a value was typed, not of the value. A Chinese input method emits
+ * `Ｐ4B-A-１３４９` for the identifier `P4B-A-1349`, and the fold has to happen before the run is
+ * read, because a full-width character inside the run ends it there: the query named `4b-a-1349`
+ * and the message carrying the identifier was not a match for it. Reading both sides through
+ * this one fold means the width a side used cannot decide whether a value was found.
+ */
+function folded(text: string): string {
+  return text.replace(FULL_WIDTH, (character) =>
+    character === "　" ? " " : String.fromCharCode(character.charCodeAt(0) - FULL_WIDTH_OFFSET),
+  );
+}
 
 /** A separator between identifier segments, or a trailing one a sentence added. */
 const SEPARATOR = /[._-]/u;
@@ -50,8 +76,12 @@ const MIN_BARE_DIGIT_RUN = 6;
 function isIdentifierTerm(run: string): boolean {
   if (run.length < MIN_IDENTIFIER_LENGTH) return false;
   if (!/\d/u.test(run)) return false;
-  // Segmented values are arbitrary by construction: `P4B-A-1349`, `v1.2.3`, `order_123`.
-  if (SEPARATOR.test(run)) return true;
+  // A segmented value is arbitrary only when it carries a letter: `P4B-A-1349`, `v1.2.3`,
+  // `order_123`. A digit-only segmented run is a date or a range — `2026-09-18`, `10-20` —
+  // which describes a day rather than naming a value, and every spelling of that day is the
+  // same day. Requiring one spelling verbatim would answer "not found" for messages that really
+  // are about the question, which is what the narrow rule exists to prevent.
+  if (SEPARATOR.test(run)) return /[A-Za-z]/u.test(run);
   return /^\d+$/u.test(run) && run.length >= MIN_BARE_DIGIT_RUN;
 }
 
@@ -80,7 +110,7 @@ function identifierValue(run: string): string {
  */
 export function exactTerms(query: string): string[] {
   const terms: string[] = [];
-  for (const match of query.matchAll(IDENTIFIER_RUN)) {
+  for (const match of folded(query).matchAll(IDENTIFIER_RUN)) {
     const term = identifierValue(match[0]);
     if (!isIdentifierTerm(term)) continue;
     if (!terms.includes(term)) terms.push(term);
@@ -101,6 +131,6 @@ export function exactTerms(query: string): string[] {
 export function carriesEveryExactTerm(text: string, terms: readonly string[]): boolean {
   if (terms.length === 0) return true;
   const carried = new Set<string>();
-  for (const match of text.matchAll(IDENTIFIER_RUN)) carried.add(identifierValue(match[0]));
+  for (const match of folded(text).matchAll(IDENTIFIER_RUN)) carried.add(identifierValue(match[0]));
   return terms.every((term) => carried.has(term));
 }
