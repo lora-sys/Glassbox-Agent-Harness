@@ -548,33 +548,44 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         phase: "resolved",
         resolutions: finalResolutions,
       });
-      if (result.status !== "aborted") {
-        // A Run that never executed the action it was asked for reports that, in fixed text.
-        // It does not get to answer from Conversation, from the user's own message, or from
-        // what it believes a Tool would have returned.
-        if (requiredName !== undefined && !completedRequiredTool())
-          return {
-            status: "failed",
-            text: "请求的操作未执行，请稍后重试。",
-            providerSessionId: binding.runtimeSessionId,
-          };
-        // The same rule for a factual answer: without a successful observation of every domain
-        // the question depends on, the Run says it could not confirm rather than composing an
-        // answer that reads like one.
-        if (unobservedEvidence(finalResolutions).length > 0)
-          return {
-            status: "failed",
-            text: "未能从 QQ 获取该信息，因此无法确认。",
-            providerSessionId: binding.runtimeSessionId,
-          };
+      // A Run that never executed the action it was asked for, or never observed the facts it
+      // was asked about, cannot stand behind its own text — it does not get to answer from
+      // Conversation, from the user's own message, or from what it believes a Tool would have
+      // returned. That holds whatever terminal status the Run reached. A cancelled Run is not a
+      // claim of success, but its text still reaches the audience: the run service delivers
+      // what the Run reported and falls back to a fixed line only when it reported nothing, so
+      // skipping the aborted path would deliver the one answer this check exists to withhold
+      // whenever the user happened to press Stop. A cancelled Run that cannot back its text
+      // reports none, and that fixed line states the outcome instead.
+      const missingTool = requiredName !== undefined && !completedRequiredTool();
+      const missingEvidence = unobservedEvidence(finalResolutions).length > 0;
+      if (result.status === "aborted") {
+        return missingTool || missingEvidence
+          ? { status: "cancelled", providerSessionId: binding.runtimeSessionId }
+          : {
+              status: "cancelled",
+              text: result.text,
+              providerSessionId: binding.runtimeSessionId,
+            };
       }
+      // The Run reached a terminal status of its own, so an unbacked answer is a failure rather
+      // than a cancellation, and the fixed text names which requirement went unmet.
+      if (missingTool)
+        return {
+          status: "failed",
+          text: "请求的操作未执行，请稍后重试。",
+          providerSessionId: binding.runtimeSessionId,
+        };
+      if (missingEvidence)
+        return {
+          status: "failed",
+          text: "未能从 QQ 获取该信息，因此无法确认。",
+          providerSessionId: binding.runtimeSessionId,
+        };
       return {
-        status:
-          result.status === "completed"
-            ? "succeeded"
-            : result.status === "aborted"
-              ? "cancelled"
-              : "failed",
+        // The aborted case returned above, so a Run that reached here either completed or
+        // errored; anything else the runtime reports is a failure, never a success.
+        status: result.status === "completed" ? "succeeded" : "failed",
         text: result.text,
         providerSessionId: binding.runtimeSessionId,
       };

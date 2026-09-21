@@ -902,6 +902,22 @@ describe("an explicit current-group history search requires the group Tool", () 
     expect(f.run.mock.calls[0]?.[3]?.requiredToolName).not.toBe(OWNER_HISTORY_SEARCH_TOOL);
   });
 
+  it("reports no text for a cancelled Run that never ran the search", async () => {
+    // A cancelled Run's text still reaches the audience: the run service delivers whatever the
+    // Run reported and falls back to a fixed line only when it reported nothing. So the guard
+    // cannot skip the aborted path — that would deliver the one answer it exists to withhold
+    // whenever the user happened to press Stop.
+    const f = groupFixture(
+      [{ status: "aborted", text: "发送者是 member-a，原文是 P4B-A-1349。", toolCalls: [] }],
+      [GROUP_HISTORY_SEARCH_TOOL],
+    );
+    await expect(f.executor.execute(f.input)).resolves.toEqual({
+      status: "cancelled",
+      providerSessionId: "session-1",
+    });
+    expect(f.run).toHaveBeenCalledOnce();
+  });
+
   it("requires the search for a group member, not only for the Owner", async () => {
     const f = groupFixture([searched("P4B-A-1349")], [GROUP_HISTORY_SEARCH_TOOL]);
     f.input.caller.principalId = "member-1";
@@ -1186,6 +1202,28 @@ describe("a factual answer requires the observation it depends on", () => {
       text: "未能从 QQ 获取该信息，因此无法确认。",
     });
     expect(f.run).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports no text for a cancelled Run that never observed the group", async () => {
+    const f = memberFixture([
+      { status: "aborted", text: "本群有 42 位成员，其中包含 member-a。", toolCalls: [] },
+    ]);
+    await expect(f.executor.execute(f.input)).resolves.toEqual({
+      status: "cancelled",
+      providerSessionId: "session-1",
+    });
+    expect(f.run).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the text of a cancelled Run that observed what it reported", async () => {
+    // The control: a cancelled Run is not a claim of success, and stopping one must not throw
+    // away an answer the Run really did observe.
+    const f = memberFixture([{ ...members(), status: "aborted" }]);
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "cancelled",
+      text: "本群有 3 位成员。",
+    });
+    expect(f.run).toHaveBeenCalledOnce();
   });
 
   it("requires every domain the message asked about", async () => {
