@@ -8,6 +8,8 @@ import { MemoryConsolidator } from "../../learning/consolidation.js";
 import { candidateFromAuthorizedSource } from "../../learning/source.js";
 import {
   MEMORY_GOVERN_ACTION,
+  MEMORY_READ_ACTION,
+  MEMORY_WRITE_ACTION,
   OWNER_MEMORY_RESOURCE,
   type LearningStore,
 } from "../../learning/store.js";
@@ -50,6 +52,10 @@ type OwnerMemoryToolInput = Record<string, unknown> & {
   signalType?: FeedbackSignal;
   groupId?: string;
   sourceClass?: QqSourceClass;
+  query?: string;
+  limit?: number;
+  since?: string;
+  until?: string;
 };
 
 function scopeFrom(input: OwnerMemoryToolInput): GlassboxMemoryScope {
@@ -102,6 +108,13 @@ function modelEvidence(runId: string) {
 function requiredId(input: OwnerMemoryToolInput): string {
   if (typeof input.id !== "string" || !input.id) throw new Error("memory_id_required");
   return input.id;
+}
+
+function authorizationAction(input: OwnerMemoryToolInput): string {
+  if (["list", "get", "list_candidates"].includes(input.action)) return MEMORY_READ_ACTION;
+  if (["write", "update", "feedback", "extract", "source"].includes(input.action))
+    return MEMORY_WRITE_ACTION;
+  return MEMORY_GOVERN_ACTION;
 }
 
 async function executeMemoryAction(
@@ -188,12 +201,12 @@ async function executeMemoryAction(
         input.action === "expire" ? "expired" : input.action === "revoke" ? "revoked" : "retired",
       );
     case "supersede":
-      if (typeof input.statement !== "string" || typeof input.type !== "string")
-        throw new Error("memory_write_fields_required");
+      if (typeof input.statement !== "string") throw new Error("memory_write_fields_required");
       {
         const existing = await learning.getMemory(operationContext, requiredId(input));
         if (!existing || existing.lifecycleState !== "active") throw new Error("memory_not_active");
-        if (input.type !== existing.type) throw new Error("memory_type_mismatch");
+        if (input.type !== undefined && input.type !== existing.type)
+          throw new Error("memory_type_mismatch");
         if (
           input.scopeType !== undefined &&
           JSON.stringify(scopeFrom(input)) !== JSON.stringify(existing.scope)
@@ -216,7 +229,7 @@ async function executeMemoryAction(
             candidateKind: "correction",
             subject: existing.subject,
             scope: existing.scope,
-            proposedType: input.type,
+            proposedType: existing.type,
             statement: input.statement,
             content: { statement: input.statement },
             source: { kind: "system", ref: `run:${context.runId}` },
@@ -228,7 +241,7 @@ async function executeMemoryAction(
         return learning.supersedeMemory(operationContext, requiredId(input), {
           subject: { kind: "user", id: context.caller.principalId },
           scope: existing.scope,
-          type: input.type,
+          type: existing.type,
           statement: input.statement,
           ...(input.confidence === undefined ? {} : { confidence: input.confidence }),
           ...(input.ttlSeconds === undefined ? {} : { ttlSeconds: input.ttlSeconds }),
@@ -302,7 +315,10 @@ async function executeMemoryAction(
         connectionId: context.caller.scope.connectionId,
         groupId: input.groupId,
         sourceClass: input.sourceClass,
-        limit: 10,
+        ...(input.query === undefined ? {} : { query: input.query }),
+        limit: input.limit ?? 10,
+        ...(input.since === undefined ? {} : { since: input.since }),
+        ...(input.until === undefined ? {} : { until: input.until }),
       });
       const scope = scopeFrom(input);
       const category = input.sourceClass === "metadata" ? "group_info" : input.sourceClass;
@@ -345,7 +361,17 @@ export function createOwnerMemoryTools(options: {
   const getContext = (): ProtectedToolContext | undefined => {
     const value = options.getContext();
     return value?.caller && value.conversationId && value.runId
-      ? { caller: value.caller, conversationId: value.conversationId, runId: value.runId }
+      ? {
+          caller: value.caller,
+          conversationId: value.conversationId,
+          runId: value.runId,
+          ...(value.requiredToolName === undefined
+            ? {}
+            : { requiredToolName: value.requiredToolName }),
+          ...(value.requiredToolInput === undefined
+            ? {}
+            : { requiredToolInput: value.requiredToolInput }),
+        }
       : undefined;
   };
   return [
@@ -353,7 +379,7 @@ export function createOwnerMemoryTools(options: {
       name: OWNER_MEMORY_ADMIN_TOOL,
       label: "Owner Memory 管理",
       description:
-        "Owner-private Memory administration. Model-originated write and supersede calls only create reviewable candidates. Active changes require the Owner's exact /memory command in the current message.",
+        "Owner-private Memory administration. Read with /memory list [all|global|project:id], /memory get <id>, or /memory candidates. Import an authorized QQ source as pending candidates with /memory source <global|project:id> <groupId> <history|notice|essence|metadata|file|album>. Model-originated write and supersede calls create pending candidates only. Active changes require the exact current-message commands /memory write <global|project:id> <type> <statement>, /memory update <id> <statement>, /memory supersede <id> <statement>, or /memory <promote|reject|expire|revoke|retire> <id>.",
       parameters: Type.Object(
         {
           action: Type.Unsafe<OwnerMemoryToolInput["action"]>({
@@ -397,10 +423,14 @@ export function createOwnerMemoryTools(options: {
           sourceClass: Type.Optional(
             Type.Unsafe<QqSourceClass>({ type: "string", enum: [...QQ_SOURCE_CLASSES] }),
           ),
+          query: Type.Optional(Type.String({ minLength: 1, maxLength: 1000 })),
+          limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+          since: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
+          until: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
         },
         { additionalProperties: false },
       ),
-      action: MEMORY_GOVERN_ACTION,
+      action: authorizationAction,
       resourceId: OWNER_MEMORY_RESOURCE,
       authService: options.store.authorization,
       getContext,

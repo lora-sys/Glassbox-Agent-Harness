@@ -689,6 +689,32 @@ export class LearningStore {
           strategy: candidate.candidateKind === "correction" ? "replace" : "dedupe",
         }
       : candidate.mergeHint;
+    const extractorRetire = candidate.extensions["glassbox:extractor_action"] === "retire";
+    const tasteRetire =
+      candidate.extensions["glassbox:taste"] === true && candidate.candidateKind === "correction";
+    if (extractorRetire || tasteRetire) {
+      if ((extractorRetire && !matchId) || !existingRow) throw new Error("memory_not_active");
+      const existing = memoryFromRow(existingRow);
+      if (
+        json(existing.subject) !== json(incoming.subject) ||
+        json(existing.scope) !== json(incoming.scope) ||
+        existing.type !== incoming.type
+      )
+        throw new Error("memory_match_scope_mismatch");
+      const retired: CanonicalMemory = {
+        ...existing,
+        lifecycleState: "retired",
+        freshness: "stale",
+        disabledAt: now,
+        updatedAt: now,
+      };
+      await this.persistMemory(tx, retired);
+      await tx.execute({
+        sql: "UPDATE memory_candidates SET status = 'promoted', reviewed_at = ?, promoted_memory_id = ?, merge_hint_json = ? WHERE id = ? AND status = 'pending'",
+        args: [now, retired.memoryId, json(resolvedHint), candidate.candidateId],
+      });
+      return retired;
+    }
     if (existingRow) {
       const existing = memoryFromRow(existingRow);
       if (

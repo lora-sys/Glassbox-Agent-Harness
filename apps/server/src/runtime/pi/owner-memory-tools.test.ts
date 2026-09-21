@@ -46,6 +46,7 @@ it("exposes Owner-only governed Memory operations and rechecks revoked write aut
       ownerId: "owner",
     });
     let writeGrant = "";
+    let governGrant = "";
     for (const action of [MEMORY_READ_ACTION, MEMORY_WRITE_ACTION, MEMORY_GOVERN_ACTION]) {
       const grantId = await store.authorization.grant({
         principalId: "owner",
@@ -55,6 +56,7 @@ it("exposes Owner-only governed Memory operations and rechecks revoked write aut
         effect: "allow",
       });
       if (action === MEMORY_WRITE_ACTION) writeGrant = grantId;
+      if (action === MEMORY_GOVERN_ACTION) governGrant = grantId;
     }
     let currentRunId = accepted.run.id;
     const [tool] = createOwnerMemoryTools({
@@ -109,7 +111,6 @@ it("exposes Owner-only governed Memory operations and rechecks revoked write aut
       {
         action: "supersede",
         id: memoryId,
-        type: "semantic_fact",
         statement: "A corrected target.",
       },
       undefined,
@@ -279,6 +280,16 @@ it("exposes Owner-only governed Memory operations and rechecks revoked write aut
     );
     expect(explicit.details).toMatchObject({ lifecycleState: "active", scope: { type: "global" } });
 
+    await store.authorization.revoke(governGrant);
+    const readableAfterGovernRevoke = await tool!.execute(
+      "list-after-govern-revoke",
+      { action: "list" },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    expect(readableAfterGovernRevoke.details).toHaveLength(2);
+
     await store.authorization.revoke(writeGrant);
     await expect(
       tool!.execute(
@@ -293,7 +304,7 @@ it("exposes Owner-only governed Memory operations and rechecks revoked write aut
         undefined,
         {} as never,
       ),
-    ).rejects.toThrow("protected_tool_failed");
+    ).rejects.toThrow("Permission denied");
     expect(await store.learning.listMemories({ caller })).toHaveLength(2);
   } finally {
     await store.close();

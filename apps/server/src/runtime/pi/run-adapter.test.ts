@@ -123,6 +123,58 @@ describe("Pi required Tool execution", () => {
     });
   });
 
+  it("binds explicit Memory inspection and supersession commands without guessed fields", async () => {
+    const cases = [
+      {
+        text: "/memory list project:glassbox",
+        input: { action: "list", scopeType: "project", projectId: "glassbox" },
+      },
+      {
+        text: "/memory get memory-1",
+        input: { action: "get", id: "memory-1" },
+      },
+      {
+        text: "/memory supersede memory-1 The corrected fact.",
+        input: { action: "supersede", id: "memory-1", statement: "The corrected fact." },
+      },
+      {
+        text: "/memory source project:glassbox 1121579672 history",
+        input: {
+          action: "source",
+          scopeType: "project",
+          projectId: "glassbox",
+          groupId: "1121579672",
+          sourceClass: "history",
+        },
+      },
+    ] as const;
+
+    for (const item of cases) {
+      const f = fixture([
+        {
+          status: "completed",
+          text: "Done.",
+          toolCalls: [{ name: OWNER_MEMORY_ADMIN_TOOL, input: item.input, failed: false }],
+        },
+      ]);
+      f.input.text = item.text;
+      f.createOrRestoreSession.mockImplementation(async (_conversation, _profile, context) => {
+        if (context) context.authorizedToolNames = [OWNER_MEMORY_ADMIN_TOOL];
+        return {
+          conversationId: "conversation-1",
+          runtimeSessionId: "session-1",
+          profileName: "main-agent" as const,
+          agentDir: "agent",
+          createdAt: new Date(0).toISOString(),
+          lastActiveAt: new Date(0).toISOString(),
+        };
+      });
+
+      await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+      expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual(item.input);
+    }
+  });
+
   it("keeps non-Owner group runs on the restricted group profile", () => {
     expect(piProfileName("group", false)).toBe("qq-group");
     expect(piProfileName("group", true)).toBe("main-agent");

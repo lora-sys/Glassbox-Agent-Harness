@@ -320,6 +320,42 @@ describe("P4A durable learning truth", () => {
     expect(await store.learning.listMemories(context, { scope: { type: "global" } })).toEqual([]);
   });
 
+  it("retires an active scoped Taste entry only after its correction candidate is promoted", async () => {
+    const { store } = await fixture();
+    const active = await store.learning.writeExplicit(context, {
+      subject: { kind: "user", id: "owner" },
+      scope: { type: "project", projectId: "glassbox" },
+      type: "preference",
+      statement: "Prefer named exports.",
+    });
+    const correction = await store.learning.recordFeedback(context, {
+      signalType: "reject",
+      scope: active.scope,
+      statement: "Prefer named exports.",
+      category: "typescript.exports",
+    });
+
+    expect(correction.candidate).toMatchObject({
+      candidateKind: "correction",
+      status: "pending",
+    });
+    expect((await store.learning.getMemory(context, active.memoryId))?.lifecycleState).toBe(
+      "active",
+    );
+
+    const retired = await store.learning.promoteCandidate(
+      context,
+      correction.candidate.candidateId,
+    );
+
+    expect(retired).toMatchObject({
+      memoryId: active.memoryId,
+      lifecycleState: "retired",
+      confirmedByUser: true,
+    });
+    expect(await store.learning.listMemories(context, { scope: active.scope })).toEqual([]);
+  });
+
   it("turns extractor decisions into candidates while existing Memory participates in consolidation", async () => {
     const { store } = await fixture();
     await store.learning.writeExplicit(context, {
@@ -354,6 +390,46 @@ describe("P4A durable learning truth", () => {
       mergeHint: { strategy: "manual_review_required" },
     });
     expect(await store.learning.listMemories(context)).toHaveLength(1);
+  });
+
+  it("retires matched Memory when the Owner promotes an extractor retire decision", async () => {
+    const { store } = await fixture();
+    const existing = await store.learning.writeExplicit(context, {
+      subject: { kind: "user", id: "owner" },
+      scope: { type: "project", projectId: "glassbox" },
+      type: "semantic_fact",
+      statement: "This fact is no longer valid.",
+    });
+    const consolidator = new MemoryConsolidator(store.learning, {
+      async extract() {
+        return [
+          {
+            action: "retire" as const,
+            type: "semantic_fact" as const,
+            statement: "This fact is no longer valid.",
+            existingMemoryId: existing.memoryId,
+          },
+        ];
+      },
+    });
+    const [candidate] = await consolidator.consolidate({
+      context,
+      subject: existing.subject,
+      scope: existing.scope,
+      messages: [{ role: "user", text: "Retire the old fact.", ref: "message:retire" }],
+    });
+
+    const retired = await store.learning.promoteCandidate(context, candidate!.candidateId);
+
+    expect(retired).toMatchObject({
+      memoryId: existing.memoryId,
+      lifecycleState: "retired",
+    });
+    expect(await store.learning.listMemories(context)).toEqual([]);
+    expect(await store.learning.getCandidate(context, candidate!.candidateId)).toMatchObject({
+      status: "promoted",
+      promotedMemoryId: existing.memoryId,
+    });
   });
 
   it("treats QQ prompt injection as untrusted evidence with inspectable provenance", async () => {

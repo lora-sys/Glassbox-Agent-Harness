@@ -39,6 +39,38 @@ function ownerMemoryCommand(text: string): RequiredToolCall | undefined {
       input: { action: "write", ...scope, type: write[2], statement: write[3] },
     };
   }
+  const list = /^\/memory list(?: (all|global|project:[A-Za-z0-9][A-Za-z0-9_-]{0,127}))?$/u.exec(
+    command,
+  );
+  if (list) {
+    const scope = list[1] === undefined || list[1] === "all" ? undefined : scopeInput(list[1]);
+    if (list[1] !== undefined && list[1] !== "all" && !scope) return undefined;
+    return {
+      name: OWNER_MEMORY_ADMIN_TOOL,
+      input: { action: "list", ...scope },
+    };
+  }
+  const get = /^\/memory get (\S+)$/u.exec(command);
+  if (get) return { name: OWNER_MEMORY_ADMIN_TOOL, input: { action: "get", id: get[1] } };
+  if (command === "/memory candidates")
+    return { name: OWNER_MEMORY_ADMIN_TOOL, input: { action: "list_candidates" } };
+  const source =
+    /^\/memory source (\S+) ([1-9]\d{0,15}) (history|notice|essence|metadata|file|album)$/u.exec(
+      command,
+    );
+  if (source) {
+    const scope = scopeInput(source[1]!);
+    if (!scope) return undefined;
+    return {
+      name: OWNER_MEMORY_ADMIN_TOOL,
+      input: {
+        action: "source",
+        ...scope,
+        groupId: source[2],
+        sourceClass: source[3],
+      },
+    };
+  }
   const feedback =
     /^\/memory feedback (\S+) (accept|reject|edit|revert|explicit_positive|explicit_negative) (.+)$/u.exec(
       command,
