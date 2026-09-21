@@ -118,6 +118,34 @@ describe("required evidence stays narrow", () => {
     expect(requiredEvidenceFor(inGroup("不用查群文件了"))).toEqual([]);
   });
 
+  it("still requires the fact when a negation is not what the message refuses", () => {
+    // A negation somewhere in the message is not a refusal of it. `不要漏掉管理员` asks for the
+    // list and adds an instruction about the list, and `停止维护的那些也算` narrows which files
+    // count. Testing the whole message for the word deleted every requirement it made, which is
+    // the one state where the Run may answer with nothing observed.
+    expect(domains(inGroup("本群成员有哪些？不要漏掉管理员"))).toEqual(["group_members"]);
+    expect(domains(inGroup("查一下群公告不要漏掉置顶的"))).toEqual(["group_content"]);
+    expect(domains(inGroup("群文件有哪些，停止维护的那些也算"))).toEqual(["group_files"]);
+  });
+
+  it("requires the fact a yes-or-no question asks about", () => {
+    // `是否` asks whether a fact holds, which is a question about the world and is answered by
+    // observing it. Reading it as a question about whether something is possible required no
+    // observation at all, so a Run could answer 是 or 否 with nothing behind the answer.
+    expect(domains(inGroup("本群成员是否有 10004"))).toEqual(["group_members"]);
+    expect(domains(ownerPrivate("群 1126022432 的成员是否包含 10004"))).toEqual(["group_members"]);
+    expect(domains(inGroup("本群文件是否有新的"))).toEqual(["group_files"]);
+  });
+
+  it("still reads a question about a setting as a question about a setting", () => {
+    // The other half of the rule above: `是否` asks about the world only when the world is what
+    // it names. Whether the retrieval setting is on is Glassbox product state, and a live history
+    // page cannot answer it, so requiring one would fail the Run closed against a read the
+    // message never asked for.
+    expect(domains(inGroup("本群历史检索是否已经开启？"))).toEqual([]);
+    expect(domains(inGroup("群成员功能是否启用"))).toEqual([]);
+  });
+
   it("requires nothing for a question about the group's Glassbox policy", () => {
     // The setting that governs retrieval is Glassbox product state, read through the Owner
     // management Tool. A live history page cannot answer it.

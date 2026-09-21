@@ -12,12 +12,14 @@ import { requiredInputClause, satisfiesRequiredInput } from "./protected-tools.j
 import { OWNER_GROUP_ADMIN_TOOL } from "./owner-tools.js";
 import {
   asksLiveQqFact,
+  capabilityQuestionAsked,
   groupHistorySearchRequested,
   namedGroupId,
   ownerHistorySearchRequested,
   requiredEvidenceFor,
   resolveEvidence,
   unobservedEvidence,
+  withoutRefusedClauses,
   type EvidenceResolution,
   type RequiredEvidence,
 } from "./required-evidence.js";
@@ -327,12 +329,15 @@ function requiredToolCall(input: ExecutionInput, isOwner: boolean): RequiredTool
   // Everything below is the Owner-private surface. A management Tool is never required
   // outside a private Owner Run, whatever else a message may name.
   if (input.caller.scope.chatType !== "private" || !isOwner) return undefined;
-  const text = input.text;
-  if (/不要|别|无需/u.test(text)) return undefined;
+  // Read from the message with its refused clauses removed: a refusal drops the request it
+  // refuses, and nothing else the message asks for. A negation somewhere in the message is not a
+  // refusal of it — `别太久` is an instruction about a mute, not a refusal to mute — so reading
+  // the whole message for one dropped requirements the Owner had actually made.
+  const text = withoutRefusedClauses(input.text);
   if (ownerHistorySearchRequested(text)) return { name: OWNER_HISTORY_SEARCH_TOOL, input: {} };
   const groupId = namedGroupId(text);
   if (!groupId) return undefined;
-  if (/如何|怎么|能否|是否|可以吗/u.test(text)) return undefined;
+  if (capabilityQuestionAsked(text)) return undefined;
   // A question about what a group *contains* is answered by live QQ evidence, not by reading
   // the group's Glassbox configuration. Requiring both would make the Run fail closed on a
   // Tool that cannot answer the question it was asked.

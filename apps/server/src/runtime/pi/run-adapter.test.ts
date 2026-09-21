@@ -761,6 +761,38 @@ describe("mutation intent comes only from the current user message", () => {
     expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toBeUndefined();
   });
 
+  it("still binds the mutation when the message adds an instruction the words contain", async () => {
+    // A negation refuses a request only when it governs one. `别太久` is the Owner telling the
+    // Agent not to overdo the duration, not a refusal to mute; reading the whole message for the
+    // word dropped the required Tool, so the message asked for a mute and the Run was free to
+    // report one it never performed.
+    const f = fixture([
+      {
+        status: "completed",
+        text: "已禁言。",
+        toolCalls: [
+          {
+            name: "qq_group_moderation",
+            input: {
+              groupId: "1126022432",
+              operation: "set_group_ban",
+              params: { user_id: 10004, duration: 60 },
+            },
+            failed: false,
+          },
+        ],
+      },
+    ]);
+    f.input.text = "把群 1126022432 的成员 10004 禁言 60 秒，别太久";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe("qq_group_moderation");
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({
+      groupId: "1126022432",
+      operation: "set_group_ban",
+      params: { user_id: 10004, duration: 60 },
+    });
+  });
+
   it("refuses a capability mutation on a different group than the message named", async () => {
     const wrongGroup = {
       status: "completed" as const,

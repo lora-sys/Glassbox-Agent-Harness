@@ -76,24 +76,56 @@ const GROUP_HISTORY_REQUEST =
   /(?:搜索|搜|查找|查|检索|查询|翻)\s*(?:一下|一翻|一遍)?\s*(?:本群|群里|群内|该群|此群|当前群|群)\s*(?:的)?\s*(?:历史|聊天记录|消息记录|群聊记录|聊天历史|历史消息)/iu;
 
 /**
- * The negations that turn a request into a refusal.
+ * The negations that can refuse a request, and the verbs that make one.
  *
- * The words are unambiguous ones: 别 is deliberately absent because it is also part of
- * ordinary words such as 特别, and reading those as a refusal would silently drop a request
- * the user actually made.
+ * 别 is deliberately absent from the negations because it is also part of ordinary words such
+ * as 特别, and reading those as a refusal would silently drop a request the user actually made.
+ * 别再, 别去 and 别帮我 are unambiguous and stay.
  */
-const GROUP_HISTORY_REFUSAL = /(?:不要|不用|无需|不需要|请勿|不许|停止|别再|别去|别帮我)\s*$/u;
+const REFUSAL_WORDS = "不要|不用|无需|不需要|请勿|不许|停止|别再|别去|别帮我";
+
+/**
+ * The verbs that ask to be told, shown or handed something. Longest first, so a negation before
+ * 查看 is read as governing 查看 rather than the 查 that 查看 starts with.
+ */
+const REQUEST_VERBS = "搜索|查找|查看|查询|检索|列出|列表|显示|告诉|搜|翻|查|看|读";
+
+/**
+ * A negation that governs a request: the request's own verb follows it.
+ *
+ * This is the whole of what makes a message a refusal. A negation somewhere in a message is not
+ * a refusal of it — `不要漏掉管理员` asks for the list and adds an instruction about the list,
+ * and `停止维护的那些也算` narrows which files count. Testing the whole message for a negation
+ * word read both as refusals and deleted every requirement the message made, which is the one
+ * state in which a Run may answer with nothing observed: the failure the evidence check exists
+ * to prevent, arriving through the check itself.
+ */
+const REFUSED_REQUEST = new RegExp(`(?:${REFUSAL_WORDS})\\s*(?:再)?\\s*(?:${REQUEST_VERBS})`, "u");
+
+/** A clause of a message: the run of text between its punctuation. */
+const CLAUSE = /[^，,、；;。！？!?\n]+/gu;
+
+/**
+ * The message with every clause that refuses a request removed.
+ *
+ * A refusal refuses its own clause, so removing that clause leaves the rest of what the message
+ * asks and a message that refuses one read while asking another still requires the one it asked
+ * for. The removal is the only change: a message with no governing negation is returned
+ * untouched, so nothing else about how a requirement is read moves with this rule.
+ */
+export function withoutRefusedClauses(text: string): string {
+  if (!REFUSED_REQUEST.test(text)) return text;
+  return (text.match(CLAUSE) ?? []).filter((clause) => !REFUSED_REQUEST.test(clause)).join(" ");
+}
 
 /**
  * Whether the current group message explicitly asks to search this group's history.
  */
-export function groupHistorySearchRequested(text: string): boolean {
-  const match = GROUP_HISTORY_REQUEST.exec(text);
-  if (!match) return false;
-  // A negation in the clause immediately before the request makes it a refusal.
-  if (GROUP_HISTORY_REFUSAL.test(text.slice(0, match.index))) return false;
+export function groupHistorySearchRequested(rawText: string): boolean {
+  const text = withoutRefusedClauses(rawText);
+  if (!GROUP_HISTORY_REQUEST.test(text)) return false;
   // A question about how to search, or whether searching is possible, is not a request to search.
-  if (/如何|怎么|能否|是否|可以吗/u.test(text)) return false;
+  if (CAPABILITY_QUESTION.test(text)) return false;
   return true;
 }
 
@@ -105,9 +137,9 @@ export function groupHistorySearchRequested(text: string): boolean {
  * describe the requested answer and audience. They do not turn the request into a group-policy
  * query. A request about the history setting or its status remains a management query.
  */
-export function ownerHistorySearchRequested(text: string): boolean {
-  if (/不要|不用|无需|不需要|请勿|不许|停止|别再|别去|别帮我/u.test(text)) return false;
-  if (/如何|怎么|能否|是否|可以吗/u.test(text)) return false;
+export function ownerHistorySearchRequested(rawText: string): boolean {
+  const text = withoutRefusedClauses(rawText);
+  if (CAPABILITY_QUESTION.test(text)) return false;
   if (/(?:历史|聊天记录|消息记录)[^。！？\n]{0,16}(?:状态|配置|开关|是否启用|是否开启)/u.test(text))
     return false;
   if (
@@ -139,10 +171,20 @@ const READ_VERB =
 const MUTATION_VERB =
   /(?:禁言|闭嘴|踢出|踢掉|踢人|踢了|移出群|改成|改为|设置为|设为|换成|新建文件夹|建文件夹|创建文件夹|删除文件|删文件|上传文件|同意入群|拒绝入群)/u;
 
-/** A question about whether or how something is possible is not a request for its result. */
-const CAPABILITY_QUESTION = /如何|怎么|能否|是否|可以吗/u;
+/**
+ * A question about whether or how something is *possible* is not a request for its result.
+ *
+ * 是否 is deliberately absent. It asks whether a fact holds, which is a question about the world
+ * and is answered by observing it; reading it as a possibility question required no observation
+ * at all, so a Run could answer 是 or 否 with the evidence check satisfied and nothing behind the
+ * answer. A question that really is about possibility names possibility: 能否, 能不能, 可否.
+ */
+const CAPABILITY_QUESTION = /如何|怎么|能否|能不能|可否|可以吗/u;
 
-const REFUSAL = /不要|不用|无需|不需要|请勿|不许|停止|别再|别去|别帮我/u;
+/** Whether the message asks how something is done, or whether it can be done. */
+export function capabilityQuestionAsked(text: string): boolean {
+  return CAPABILITY_QUESTION.test(text);
+}
 
 interface LiveDomain {
   readonly domain: RequiredEvidenceDomain;
@@ -232,9 +274,12 @@ const LIVE_DOMAINS: readonly LiveDomain[] = Object.freeze([
  * "查询群 1126022432 的历史配置状态" names 历史, but the question is about the setting that
  * governs retrieval, which is Glassbox product state read through `owner_group_admin`. Reading
  * it as a request for a live history page would require a provider call that cannot answer it.
+ *
+ * 是否 belongs here rather than with the possibility questions. "本群历史检索是否已经开启" asks
+ * whether a setting is on, and an adverb between 是否 and the verb does not change what it asks.
  */
 const POLICY_QUESTION =
-  /(?:历史|聊天记录|消息记录|成员|文件)[^。！？\n]{0,16}(?:状态|配置|开关|是否启用|是否开启|是否允许)/u;
+  /(?:历史|聊天记录|消息记录|成员|文件)[^。！？\n]{0,16}(?:状态|配置|开关|是否\s*(?:已经|已)?\s*(?:启用|开启|允许))/u;
 
 export interface RequiredEvidenceInput {
   readonly text: string;
@@ -253,10 +298,15 @@ export interface RequiredEvidenceInput {
  * would make a surface that failed to resolve indistinguishable from a message that asked
  * nothing. `authorizedToolNames` is the runtime's answer to "could this Run observe it"; the
  * caller resolves that against the requirement instead of letting it suppress the requirement.
+ *
+ * A clause that refuses a request contributes no requirement, and a clause that does not refuse
+ * one contributes whatever it asks for. A negation is read as a refusal only when it governs a
+ * request's own verb, so an instruction *about* a request — `不要漏掉管理员` — is not one.
  */
 export function requiredEvidenceFor(input: RequiredEvidenceInput): RequiredEvidence[] {
-  const text = input.text;
-  if (REFUSAL.test(text)) return [];
+  // Read from the message with its refused clauses removed, so a refusal drops the request it
+  // refuses and nothing else the message asks for.
+  const text = withoutRefusedClauses(input.text);
   const required: RequiredEvidence[] = [];
   const group = namedGroupId(text);
 
