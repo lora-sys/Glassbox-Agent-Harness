@@ -1,5 +1,24 @@
 # Glassbox Memory and Taste
 
+## P4A Owner confirmation boundary
+
+The Owner-private `owner_memory_admin` Tool reads the current persisted Run input before
+changing canonical Memory. A model-suggested `write` or `supersede` creates a pending
+candidate; it cannot use a prompt description as confirmation. The Owner can inspect
+the candidate and send `/memory promote <candidate-id>` in a later message. Exact
+`/memory reject <candidate-id>` and `/memory expire|revoke|retire <memory-id>` commands
+govern lifecycle. An explicit write uses
+`/memory write global|project:<project-id> <memory-type> <statement>`; an explicit
+correction uses `/memory supersede <memory-id> <statement>` and inherits the original
+scope and type. `/memory feedback global|project:<project-id> <signal> <statement>`
+records a feedback event and a scoped candidate, never immediate Taste.
+
+Conversation extraction and enabled, authorized QQ source reads are available through
+the Owner-private Tool's `extract` and `source` actions. Both create candidates only;
+the source content remains untrusted evidence with group, message, sender, Run and
+authorization provenance. This is a deterministic product path, not proof of a live
+QQ/NapCat acceptance run.
+
 Status: CURRENT DIRECTION / P4A ACTIVE / P4B CONSUMER
 
 This document defines the ownership and learning boundary between Rules, Skills, Taste, Feedback, and durable Memory.

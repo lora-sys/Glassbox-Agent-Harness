@@ -274,9 +274,11 @@ group_history_search
 Model input:
 
 ```text
-query
-after?
-before?
+query?
+sender?
+mentionsMe?
+since?
+until?
 limit?
 ```
 
@@ -315,6 +317,8 @@ connectionId
 groupId
 externalMessageId
 senderId
+senderName
+mentionTargetIds
 normalizedText
 occurredAt
 ingestedAt
@@ -325,6 +329,14 @@ dedupe key
 Only configured / authorized sources are archived.
 
 Bot membership alone does not imply archive permission.
+
+The lexical index covers message text, sender identity, sender display name and mention targets.
+Structured filters remain separate from free-text matching so punctuation-only requests such as
+"who mentioned me" do not degrade into an unrelated recent-message listing. A deduplicated sync
+may enrich an existing row and rebuild its derived index when provider metadata becomes available.
+
+An empty result means no match was found inside the authorized, synchronized search window. It is
+not evidence that the event never happened. Model-visible Tool results state this distinction.
 
 ## Retrieval Engine
 

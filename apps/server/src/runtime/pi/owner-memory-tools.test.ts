@@ -6,6 +6,8 @@ import {
   OWNER_MEMORY_RESOURCE,
 } from "../../learning/store.js";
 import { openDomainStore } from "../../persistence/index.js";
+import { ChannelArchiveStore } from "../../retrieval/channel-archive.js";
+import { groupResourceId } from "../../retrieval/source-resolver.js";
 import { createOwnerMemoryTools, OWNER_MEMORY_ADMIN_TOOL } from "./owner-memory-tools.js";
 
 it("exposes Owner-only governed Memory operations and rechecks revoked write authority", async () => {
@@ -54,17 +56,18 @@ it("exposes Owner-only governed Memory operations and rechecks revoked write aut
       });
       if (action === MEMORY_WRITE_ACTION) writeGrant = grantId;
     }
+    let currentRunId = accepted.run.id;
     const [tool] = createOwnerMemoryTools({
       store,
       getContext: () => ({
         caller,
-        runId: accepted.run.id,
+        runId: currentRunId,
         conversationId: accepted.conversation.id,
       }),
     });
     expect(tool?.name).toBe(OWNER_MEMORY_ADMIN_TOOL);
     expect(tool?.parameters).toMatchObject({ type: "object", required: ["action"] });
-    const written = await tool!.execute(
+    const proposed = await tool!.execute(
       "write",
       {
         action: "write",
@@ -77,11 +80,75 @@ it("exposes Owner-only governed Memory operations and rechecks revoked write aut
       undefined,
       {} as never,
     );
-    expect(written.details).toMatchObject({
-      type: "semantic_fact",
-      lifecycleState: "active",
+    expect(proposed.details).toMatchObject({
+      proposedType: "semantic_fact",
+      status: "pending",
       scope: { type: "project", projectId: "glassbox" },
     });
+    expect(await store.learning.listMemories({ caller })).toHaveLength(0);
+    const candidateId = (proposed.details as { candidateId: string }).candidateId;
+    const confirmation = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: caller.scope,
+      messageId: "confirmation",
+      text: `/memory promote ${candidateId}`,
+      executionRef: "pi:test",
+    });
+    currentRunId = confirmation.run.id;
+    const promoted = await tool!.execute(
+      "promote",
+      { action: "promote", id: candidateId },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    expect(promoted.details).toMatchObject({ lifecycleState: "active" });
+    const memoryId = (promoted.details as { memoryId: string }).memoryId;
+    const proposedReplacement = await tool!.execute(
+      "model-supersede",
+      {
+        action: "supersede",
+        id: memoryId,
+        type: "semantic_fact",
+        statement: "A corrected target.",
+      },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    expect(proposedReplacement.details).toMatchObject({
+      status: "pending",
+      scope: { type: "project", projectId: "glassbox" },
+      mergeHint: { ifMatchMemoryId: memoryId },
+    });
+    await expect(
+      tool!.execute(
+        "unconfirmed-promotion",
+        {
+          action: "promote",
+          id: (proposedReplacement.details as { candidateId: string }).candidateId,
+        },
+        undefined,
+        undefined,
+        {} as never,
+      ),
+    ).rejects.toThrow("protected_tool_failed");
+    expect((await store.learning.getMemory({ caller }, memoryId))?.lifecycleState).toBe("active");
+    await expect(
+      tool!.execute(
+        "cross-scope",
+        {
+          action: "supersede",
+          id: memoryId,
+          type: "semantic_fact",
+          statement: "Wrong scope",
+          scopeType: "global",
+        },
+        undefined,
+        undefined,
+        {} as never,
+      ),
+    ).rejects.toThrow("protected_tool_failed");
     const listed = await tool!.execute(
       "list",
       { action: "list", scopeType: "project", projectId: "glassbox" },
@@ -90,18 +157,144 @@ it("exposes Owner-only governed Memory operations and rechecks revoked write aut
       {} as never,
     );
     expect(listed.details).toHaveLength(1);
+    const all = await tool!.execute("all", { action: "list" }, undefined, undefined, {} as never);
+    expect(all.details).toHaveLength(1);
+
+    const feedbackRun = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: caller.scope,
+      messageId: "feedback",
+      text: "/memory feedback project:glassbox edit Prefer named exports.",
+      executionRef: "pi:test",
+    });
+    currentRunId = feedbackRun.run.id;
+    const feedback = await tool!.execute(
+      "feedback",
+      {
+        action: "feedback",
+        signalType: "edit",
+        scopeType: "project",
+        projectId: "glassbox",
+        statement: "Prefer named exports.",
+      },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    expect(feedback.details).toMatchObject({ candidate: { status: "pending" } });
+
+    const extracted = await tool!.execute(
+      "extract",
+      {
+        action: "extract",
+        type: "episodic_event",
+        scopeType: "project",
+        projectId: "glassbox",
+        statement: "An acceptance run completed.",
+      },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    expect(extracted.details).toMatchObject([
+      { status: "pending", proposedType: "episodic_event" },
+    ]);
+
+    await store.authorization.registerResource({
+      id: groupResourceId("100"),
+      kind: "qq_group",
+      visibility: "public",
+    });
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: groupResourceId("100"),
+      action: "history:read",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    await store.capabilities.write({
+      connectionId: "qq",
+      groupId: "100",
+      principalId: "owner",
+      policy: { categories: {}, memorySources: { history: true } },
+    });
+    const archive = new ChannelArchiveStore(store.db);
+    await archive.ingest({
+      channel: "qq",
+      connectionId: "qq",
+      groupId: "100",
+      externalMessageId: "external-1",
+      senderId: "member-1",
+      normalizedText: "Source fact.",
+      occurredAt: "2026-09-20T10:00:00Z",
+    });
+    const source = await tool!.execute(
+      "source",
+      {
+        action: "source",
+        groupId: "100",
+        sourceClass: "history",
+        scopeType: "project",
+        projectId: "glassbox",
+      },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    expect(source.details).toMatchObject([
+      {
+        status: "pending",
+        sourceEvidence: [
+          {
+            metadata: {
+              externalMessageId: "external-1",
+              senderId: "member-1",
+              untrustedInput: true,
+            },
+          },
+        ],
+      },
+    ]);
+    expect(await store.learning.listMemories({ caller })).toHaveLength(1);
+
+    const explicitRun = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: caller.scope,
+      messageId: "explicit-write",
+      text: "/memory write global semantic_fact The Owner confirmed this fact.",
+      executionRef: "pi:test",
+    });
+    currentRunId = explicitRun.run.id;
+    const explicit = await tool!.execute(
+      "explicit-write",
+      {
+        action: "write",
+        scopeType: "global",
+        type: "semantic_fact",
+        statement: "The Owner confirmed this fact.",
+      },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    expect(explicit.details).toMatchObject({ lifecycleState: "active", scope: { type: "global" } });
 
     await store.authorization.revoke(writeGrant);
     await expect(
       tool!.execute(
         "revoked-write",
-        { action: "write", type: "semantic_fact", statement: "Must not persist." },
+        {
+          action: "write",
+          type: "semantic_fact",
+          statement: "Must not persist.",
+          scopeType: "global",
+        },
         undefined,
         undefined,
         {} as never,
       ),
     ).rejects.toThrow("protected_tool_failed");
-    expect(await store.learning.listMemories({ caller })).toHaveLength(1);
+    expect(await store.learning.listMemories({ caller })).toHaveLength(2);
   } finally {
     await store.close();
   }

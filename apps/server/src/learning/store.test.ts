@@ -6,7 +6,7 @@ import { createClient } from "@libsql/client";
 import type { CallerContext, DomainStore, TrustedChannelScope } from "../persistence/index.js";
 import { openDomainStore } from "../persistence/index.js";
 import { localDatabaseUrl } from "../persistence/database.js";
-import { schema } from "../persistence/schema.js";
+import { baseSchema, schemaV7Statements, schemaV8Migration } from "../persistence/schema.js";
 import { MemoryConsolidator } from "./consolidation.js";
 import { candidateFromAuthorizedSource } from "./source.js";
 import {
@@ -86,11 +86,43 @@ describe("P4A durable learning truth", () => {
     directories.push(directory);
     const databasePath = join(directory, "glassbox.db");
     const legacy = createClient({ url: localDatabaseUrl(databasePath) });
-    await legacy.batch(schema.slice(0, 32));
+    await legacy.batch(baseSchema);
     await legacy.execute("PRAGMA user_version = 6");
     legacy.close();
     const { store } = await fixture(databasePath);
     expect(await store.learning.listCandidates(context)).toEqual([]);
+  });
+
+  it("migrates a live P4B schema-v8 database without losing channel history", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "glassbox-learning-v8-"));
+    directories.push(directory);
+    const databasePath = join(directory, "glassbox.db");
+    const legacy = createClient({ url: localDatabaseUrl(databasePath) });
+    await legacy.batch([...baseSchema, ...schemaV7Statements, ...schemaV8Migration]);
+    await legacy.execute({
+      sql: "INSERT INTO group_capability_policies(connection_id, group_id, policy_json, version, updated_by_principal_id, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+      args: [
+        "qq",
+        "100",
+        JSON.stringify({ categories: {}, memorySources: { history: true } }),
+        1,
+        "owner",
+        "2026-09-20T00:00:00Z",
+      ],
+    });
+    await legacy.execute("PRAGMA user_version = 8");
+    legacy.close();
+    const { store } = await fixture(databasePath);
+    expect(await store.learning.listCandidates(context)).toEqual([]);
+    const db = createClient({ url: localDatabaseUrl(databasePath) });
+    expect((await db.execute("PRAGMA user_version")).rows[0]?.user_version).toBe(9);
+    expect((await db.execute("PRAGMA table_info(channel_messages)")).rows.length).toBeGreaterThan(
+      0,
+    );
+    expect(
+      (await db.execute("SELECT group_id FROM group_capability_policies")).rows[0]?.group_id,
+    ).toBe("100");
+    db.close();
   });
 
   it("persists explicit project Memory across restart and preserves lifecycle and evidence", async () => {
@@ -150,6 +182,64 @@ describe("P4A durable learning truth", () => {
     });
     expect(second.memoryId).toBe(first.memoryId);
     expect(second.evidence.length).toBeGreaterThan(first.evidence.length);
+  });
+
+  it("materializes TTL expiry before a repeated assertion creates fresh active truth", async () => {
+    const { store } = await fixture();
+    const input = {
+      subject: { kind: "user" as const, id: "owner" },
+      scope: { type: "global" as const },
+      type: "semantic_fact" as const,
+      statement: "A short-lived fact.",
+    };
+    const expired = await store.learning.writeExplicit(context, { ...input, ttlSeconds: 0 });
+    const renewed = await store.learning.writeExplicit(context, { ...input, ttlSeconds: 3600 });
+    expect(renewed.memoryId).not.toBe(expired.memoryId);
+    expect(renewed.lifecycleState).toBe("active");
+    expect(renewed.supersedes).toContain(expired.memoryId);
+    expect((await store.learning.getMemory(context, expired.memoryId))?.lifecycleState).toBe(
+      "expired",
+    );
+    expect(await store.learning.listMemories(context)).toHaveLength(1);
+  });
+
+  it("promotes a reviewed correction by retiring its matched predecessor atomically", async () => {
+    const { store } = await fixture();
+    const original = await store.learning.writeExplicit(context, {
+      subject: { kind: "user", id: "owner" },
+      scope: { type: "project", projectId: "glassbox" },
+      type: "semantic_fact",
+      statement: "Original fact.",
+    });
+    const candidate = await store.learning.createCandidate(context, {
+      candidateKind: "correction",
+      subject: original.subject,
+      scope: original.scope,
+      proposedType: original.type,
+      statement: "Corrected fact.",
+      content: { statement: "Corrected fact." },
+      source: { kind: "chat", ref: "run:correction" },
+      sourceEvidence: [
+        {
+          evidenceId: "correction-evidence",
+          kind: "chat_message",
+          ref: "run:correction",
+          capturedAt: new Date().toISOString(),
+          trustLevel: "low",
+        },
+      ],
+      mergeHint: { strategy: "manual_review_required", ifMatchMemoryId: original.memoryId },
+      extensions: {},
+    });
+    const replacement = await store.learning.promoteCandidate(context, candidate.candidateId);
+    expect(replacement.memoryId).not.toBe(original.memoryId);
+    expect(replacement.supersedes).toContain(original.memoryId);
+    expect((await store.learning.getMemory(context, original.memoryId))?.lifecycleState).toBe(
+      "retired",
+    );
+    expect(
+      (await store.learning.getCandidate(context, candidate.candidateId))?.mergeHint.strategy,
+    ).toBe("replace");
   });
 
   it("rejects a conflicting update without deleting either canonical Memory", async () => {
@@ -225,6 +315,8 @@ describe("P4A durable learning truth", () => {
     expect(reinforced.candidate.sourceEvidence).toHaveLength(2);
     const promoted = await store.learning.promoteCandidate(context, first.candidate.candidateId);
     expect(promoted.scope).toEqual({ type: "project", projectId: "glassbox" });
+    expect(promoted.confirmedByUser).toBe(true);
+    expect(promoted.evidence.some((item) => item.kind === "user_confirmation")).toBe(true);
     expect(await store.learning.listMemories(context, { scope: { type: "global" } })).toEqual([]);
   });
 

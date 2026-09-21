@@ -101,7 +101,7 @@ pane.list / get / read / send input / wait for output
 agent.list / get / read / prompt / wait / start / focus
 ```
 
-Do not depend on every method at once. Implement the smallest `HerdrBridge` required by the active P3 slice.
+Do not depend on every method at once. Keep the `HerdrBridge` bounded to the completed P3 Agent Operations contract unless an active Plan requires more.
 
 ## Product-state rule
 

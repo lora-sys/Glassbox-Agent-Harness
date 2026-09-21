@@ -91,10 +91,10 @@ Vendor selectively when a current implementation slice needs them.
 | --- | --- |
 | `earendil-works/pi` | Active primary Agent runtime foundation, SDK, Packages, Extensions, Skills, Tools, settings |
 | `HKUDS/OpenHarness` | Default general harness reference: Tool inventory, MCP, Skills, Hooks, profiles, Channels, Agent-loop UX, tests |
-| `herdrdev/herdr` | Active P3 Agent Operations layer: persistent workspaces, worktrees, panes, coding-Agent lifecycle, socket API, event subscriptions, snapshot reconciliation |
+| `herdrdev/herdr` | Agent Operations foundation completed in P3: persistent workspaces, worktrees, panes, coding-Agent lifecycle, socket API, event subscriptions, snapshot reconciliation |
 | `aorumbayev/herdr-workflows` | Bounded linear Herdr workflow recipes; not durable Glassbox Task truth |
-| `NapNeko/NapCatQQ` | QQ protocol-side runtime and OneBot connectivity for the active P3 Channel |
-| `botuniverse/onebot-11` | OneBot 11 event and API contract for the active P3 QQ Channel |
+| `NapNeko/NapCatQQ` | QQ protocol-side runtime and OneBot connectivity established in P3 and extended in P4 |
+| `botuniverse/onebot-11` | OneBot 11 event and API contract for the QQ Channel established in P3 and extended in P4 |
 | `HKUDS/MGP` | P4 governed Memory contract: MemoryObject / Candidate / Evidence / lifecycle / recall / search-result schemas and compliance tests |
 | `CommandCodeAI/command-code` | P4 Taste mechanics: learn preferences from accept/reject/edit behavior, project/user scope, continuous preference learning |
 | `keli-wen/agy-staff` | AGY worker delegation and background job lifecycle |
@@ -124,11 +124,11 @@ Pi is the active primary runtime foundation for Plan 03. Glassbox embeds it thro
 
 OpenHarness is the default general capability reference after Pi. Pi-native capability wins when equivalent functionality already exists. Otherwise, Lora PI Kit should prefer a focused OpenHarness-derived port over a fresh design for standard harness features such as MCP, LSP, capability discovery, Web Tools, Hooks, profiles, and Skill UX. OpenHarness product-state ownership does not override Glassbox / Herdr boundaries. See `openharness/SOURCES.md`.
 
-Herdr is an active P3 execution dependency for the Agent Operations foundation. Glassbox integrates it through a product-owned `HerdrBridge`; Herdr workspace / pane / Agent state remains an execution observation, while Glassbox owns `Task`, `TaskAttempt`, `AttentionItem`, `WorkerBinding`, review, rework, authorization, and acceptance. See `herdr/SOURCES.md` and `../docs/agent-operations.md`.
+Herdr is the execution dependency for the Agent Operations foundation completed in P3. Glassbox integrates it through a product-owned `HerdrBridge`; Herdr workspace / pane / Agent state remains an execution observation, while Glassbox owns `Task`, `TaskAttempt`, `AttentionItem`, `WorkerBinding`, review, rework, authorization, and acceptance. See `herdr/SOURCES.md` and `../docs/agent-operations.md`.
 
 `herdr-workflows` may run bounded stage recipes inside Herdr. It does not replace the Glassbox Task state machine or become the source of review/rework truth.
 
-NapCat and OneBot are active P3 references for QQ transport. QQ transport stays in Glassbox and does not move into Lora PI Kit.
+NapCat and OneBot remain the QQ transport references established in P3 and extended by P4. QQ transport stays in Glassbox and does not move into Lora PI Kit.
 
 MGP is the primary P4 contract reference for governed Memory objects, candidates, evidence, lifecycle operations, recall intent and normalized search results. Port its schemas, reference semantics and compliance behavior into Glassbox TypeScript where useful; do not introduce its Python gateway or policy engine as a second product authority. See `mgp/SOURCES.md`.
 

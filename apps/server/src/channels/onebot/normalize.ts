@@ -54,19 +54,20 @@ export function normalizeOneBotMessage(
   const input = object(event);
   if (!input || input.post_type !== "message") return { kind: "ignored" };
   const senderId = qqId(input.user_id);
-  // This is an ingress allowlist. The domain still resolves binding and checks authorization.
+  const type = input.message_type;
+  if (type !== "private" && type !== "group") return { kind: "ignored" };
+  // Private chat stays allowlisted. A configured group accepts any real member only after the
+  // explicit @ check below; the application then provisions authority for that exact group.
   const isOwner =
     senderId === config.ownerId ||
     (config.coOwnerId !== undefined && senderId === config.coOwnerId);
   if (
     qqId(input.self_id) !== config.botId ||
     !senderId ||
-    (!isOwner && !config.visitorIds.includes(senderId)) ||
+    (type === "private" && !isOwner && !config.visitorIds.includes(senderId)) ||
     senderId === config.botId
   )
     return { kind: "ignored" };
-  const type = input.message_type;
-  if (type !== "private" && type !== "group") return { kind: "ignored" };
   if (type === "private" && input.sub_type !== "friend") return { kind: "ignored" };
   if (type === "group" && (input.sub_type !== "normal" || input.anonymous != null))
     return { kind: "ignored" };

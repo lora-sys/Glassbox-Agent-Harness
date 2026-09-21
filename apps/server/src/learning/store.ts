@@ -647,28 +647,73 @@ export class LearningStore {
     let incoming = this.canonicalFromCandidate(candidate, actor, factors);
     const matchId = candidate.mergeHint.ifMatchMemoryId;
     let existingRow: Row | undefined;
+    const now = new Date().toISOString();
+    // TTL is projected on read, but the active index is persisted. Materialize expiry
+    // before signature lookup so a renewed assertion cannot be absorbed by old truth.
+    const expiredRows = (
+      await tx.execute({
+        sql: "SELECT * FROM memories WHERE signature = ? AND lifecycle_state = 'active' AND expires_at IS NOT NULL AND expires_at <= ?",
+        args: [incoming.signature, now],
+      })
+    ).rows;
+    for (const expiredRow of expiredRows) {
+      const expired = memoryFromRow(expiredRow);
+      await this.persistMemory(tx, {
+        ...expired,
+        lifecycleState: "expired",
+        freshness: "expired",
+        disabledAt: now,
+        updatedAt: now,
+      });
+      incoming.supersedes.push(expired.memoryId);
+    }
     if (matchId) {
       existingRow = (
         await tx.execute({
-          sql: "SELECT * FROM memories WHERE id = ? AND lifecycle_state = 'active'",
-          args: [matchId],
+          sql: "SELECT * FROM memories WHERE id = ? AND lifecycle_state = 'active' AND (expires_at IS NULL OR expires_at > ?)",
+          args: [matchId, now],
         })
       ).rows[0];
     } else {
       existingRow = (
         await tx.execute({
-          sql: "SELECT * FROM memories WHERE signature = ? AND lifecycle_state = 'active' LIMIT 1",
-          args: [incoming.signature],
+          sql: "SELECT * FROM memories WHERE signature = ? AND lifecycle_state = 'active' AND (expires_at IS NULL OR expires_at > ?) LIMIT 1",
+          args: [incoming.signature, now],
         })
       ).rows[0];
     }
-    if (existingRow)
-      incoming = this.mergeCandidate(memoryFromRow(existingRow), incoming, candidate.mergeHint);
+    const manualReview = candidate.mergeHint.strategy === "manual_review_required";
+    const resolvedHint: MemoryMergeHint = manualReview
+      ? {
+          ...candidate.mergeHint,
+          strategy: candidate.candidateKind === "correction" ? "replace" : "dedupe",
+        }
+      : candidate.mergeHint;
+    if (existingRow) {
+      const existing = memoryFromRow(existingRow);
+      if (
+        json(existing.subject) !== json(incoming.subject) ||
+        json(existing.scope) !== json(incoming.scope) ||
+        existing.type !== incoming.type
+      )
+        throw new Error("memory_match_scope_mismatch");
+      if (manualReview && candidate.candidateKind === "correction") {
+        await this.persistMemory(tx, {
+          ...existing,
+          lifecycleState: "retired",
+          freshness: "stale",
+          disabledAt: now,
+          updatedAt: now,
+        });
+        incoming.supersedes = [existing.memoryId, ...existing.supersedes, ...incoming.supersedes];
+      } else {
+        incoming = this.mergeCandidate(existing, incoming, resolvedHint);
+      }
+    }
     await this.persistMemory(tx, incoming);
-    const now = new Date().toISOString();
     await tx.execute({
-      sql: "UPDATE memory_candidates SET status = 'promoted', reviewed_at = ?, promoted_memory_id = ? WHERE id = ? AND status = 'pending'",
-      args: [now, incoming.memoryId, candidate.candidateId],
+      sql: "UPDATE memory_candidates SET status = 'promoted', reviewed_at = ?, promoted_memory_id = ?, merge_hint_json = ? WHERE id = ? AND status = 'pending'",
+      args: [now, incoming.memoryId, json(resolvedHint), candidate.candidateId],
     });
     return incoming;
   }
@@ -689,13 +734,37 @@ export class LearningStore {
       ).rows[0];
       if (!row) throw new Error("candidate_not_found");
       const candidate = candidateFromRow(row);
-      const memory = await this.promoteInTransaction(
+      const promoted = await this.promoteInTransaction(
         tx,
         candidate,
         { kind: "user", id: context.caller.principalId },
         factors,
       );
-      await this.audit(tx, context, decisionId, "promote", memory.memoryId, [candidateId]);
+      const confirmation: MemoryEvidence = {
+        evidenceId: randomUUID(),
+        kind: "user_confirmation",
+        ref: context.runId ? `run:${context.runId}` : `owner-promotion:${candidateId}`,
+        capturedAt: new Date().toISOString(),
+        trustLevel: "high",
+      };
+      const evidence = mergeUnique(
+        promoted.evidence,
+        [confirmation],
+        (item) => `${item.kind}:${item.ref}`,
+      );
+      const memory: CanonicalMemory = {
+        ...promoted,
+        assertionMode: "confirmed",
+        confirmedByUser: true,
+        evidence,
+        evidenceRefs: evidence.map((item) => item.ref),
+        updatedAt: new Date().toISOString(),
+      };
+      await this.persistMemory(tx, memory);
+      await this.audit(tx, context, decisionId, "promote", memory.memoryId, [
+        candidateId,
+        confirmation.ref,
+      ]);
       return memory;
     });
   }
@@ -858,6 +927,12 @@ export class LearningStore {
       ).rows[0];
       if (!row) throw new Error("memory_not_active");
       const existing = memoryFromRow(row);
+      if (
+        json(existing.subject) !== json(input.subject) ||
+        json(existing.scope) !== json(input.scope) ||
+        existing.type !== input.type
+      )
+        throw new Error("memory_scope_mismatch");
       const evidence = input.evidence ?? [
         {
           evidenceId: randomUUID(),

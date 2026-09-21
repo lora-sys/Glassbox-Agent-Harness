@@ -1,12 +1,23 @@
+import { randomUUID } from "node:crypto";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import type { GlassboxMemoryScope, MemoryType } from "../../learning/contracts.js";
+import { QQ_SOURCE_CLASSES, type QqSourceClass } from "@glassbox/contracts";
+import type { FeedbackSignal, GlassboxMemoryScope, MemoryType } from "../../learning/contracts.js";
+import { feedbackSignals } from "../../learning/contracts.js";
+import { MemoryConsolidator } from "../../learning/consolidation.js";
+import { candidateFromAuthorizedSource } from "../../learning/source.js";
 import {
   MEMORY_GOVERN_ACTION,
   OWNER_MEMORY_RESOURCE,
   type LearningStore,
 } from "../../learning/store.js";
 import type { DomainStore } from "../../persistence/index.js";
+import { stringColumn } from "../../persistence/database.js";
+import {
+  AuthorizedQQSourceReader,
+  sourceClassAuthority,
+} from "../../retrieval/qq-source-reader.js";
+import { groupResourceId } from "../../retrieval/source-resolver.js";
 import { createProtectedTool, type ProtectedToolContext } from "./protected-tools.js";
 import type { PiRunContext } from "./types.js";
 
@@ -24,7 +35,10 @@ type OwnerMemoryToolInput = Record<string, unknown> & {
     | "retire"
     | "supersede"
     | "promote"
-    | "reject";
+    | "reject"
+    | "feedback"
+    | "extract"
+    | "source";
   id?: string;
   type?: MemoryType;
   statement?: string;
@@ -33,13 +47,56 @@ type OwnerMemoryToolInput = Record<string, unknown> & {
   confidence?: number;
   ttlSeconds?: number;
   includeInactive?: boolean;
+  signalType?: FeedbackSignal;
+  groupId?: string;
+  sourceClass?: QqSourceClass;
 };
 
 function scopeFrom(input: OwnerMemoryToolInput): GlassboxMemoryScope {
   if (input.scopeType === "project" && typeof input.projectId === "string")
     return { type: "project", projectId: input.projectId };
-  if (input.scopeType === "global" || input.scopeType === undefined) return { type: "global" };
+  if (input.scopeType === "global" && input.projectId === undefined) return { type: "global" };
   throw new Error("invalid_memory_scope");
+}
+
+/** An Owner command comes from the current persisted input message, never model arguments. */
+async function ownerCommand(store: DomainStore, context: ProtectedToolContext): Promise<string> {
+  const row = await store.db.transaction(
+    async (tx) =>
+      (
+        await tx.execute({
+          sql: "SELECT messages.text FROM runs JOIN messages ON messages.id = runs.message_id WHERE runs.id = ? AND runs.principal_id = ? AND runs.conversation_id = ?",
+          args: [context.runId, context.caller.principalId, context.conversationId],
+        })
+      ).rows[0],
+  );
+  return row ? stringColumn(row, "text").trim() : "";
+}
+
+function commandFor(input: OwnerMemoryToolInput, scope?: GlassboxMemoryScope): string {
+  if (input.action === "write" && scope && input.type && input.statement)
+    return `/memory write ${scope.type === "global" ? "global" : `project:${scope.projectId}`} ${input.type} ${input.statement.trim()}`;
+  if (input.action === "supersede" && input.id && input.statement)
+    return `/memory supersede ${input.id} ${input.statement.trim()}`;
+  if (input.action === "update" && input.id && input.statement)
+    return `/memory update ${input.id} ${input.statement.trim()}`;
+  if (input.action === "feedback" && scope && input.signalType && input.statement)
+    return `/memory feedback ${scope.type === "global" ? "global" : `project:${scope.projectId}`} ${input.signalType} ${input.statement.trim()}`;
+  if (["promote", "reject", "expire", "revoke", "retire"].includes(input.action) && input.id)
+    return `/memory ${input.action} ${input.id}`;
+  return "";
+}
+
+function modelEvidence(runId: string) {
+  return [
+    {
+      evidenceId: randomUUID(),
+      kind: "system_inference" as const,
+      ref: `run:${runId}`,
+      capturedAt: new Date().toISOString(),
+      trustLevel: "low" as const,
+    },
+  ];
 }
 
 function requiredId(input: OwnerMemoryToolInput): string {
@@ -48,10 +105,11 @@ function requiredId(input: OwnerMemoryToolInput): string {
 }
 
 async function executeMemoryAction(
-  learning: LearningStore,
+  store: DomainStore,
   context: ProtectedToolContext,
   input: OwnerMemoryToolInput,
 ): Promise<unknown> {
+  const learning: LearningStore = store.learning;
   const operationContext = {
     caller: context.caller,
     conversationId: context.conversationId,
@@ -60,7 +118,9 @@ async function executeMemoryAction(
   switch (input.action) {
     case "list":
       return learning.listMemories(operationContext, {
-        scope: scopeFrom(input),
+        ...(input.scopeType === undefined && input.projectId === undefined
+          ? {}
+          : { scope: scopeFrom(input) }),
         includeInactive: input.includeInactive === true,
       });
     case "get":
@@ -70,15 +130,48 @@ async function executeMemoryAction(
     case "write":
       if (typeof input.statement !== "string" || typeof input.type !== "string")
         throw new Error("memory_write_fields_required");
-      return learning.writeExplicit(operationContext, {
-        subject: { kind: "user", id: context.caller.principalId },
-        scope: scopeFrom(input),
-        type: input.type,
-        statement: input.statement,
-        ...(input.confidence === undefined ? {} : { confidence: input.confidence }),
-        ...(input.ttlSeconds === undefined ? {} : { ttlSeconds: input.ttlSeconds }),
-      });
+      {
+        const scope = scopeFrom(input);
+        const command = await ownerCommand(store, context);
+        if (
+          command.startsWith("/memory write ") &&
+          (command !== commandFor(input, scope) ||
+            input.confidence !== undefined ||
+            input.ttlSeconds !== undefined)
+        )
+          throw new Error("owner_confirmation_required");
+        const explicit =
+          input.confidence === undefined &&
+          input.ttlSeconds === undefined &&
+          command === commandFor(input, scope);
+        if (!explicit)
+          return learning.createCandidate(operationContext, {
+            candidateKind: "derived",
+            subject: { kind: "user", id: context.caller.principalId },
+            scope,
+            proposedType: input.type,
+            statement: input.statement,
+            content: { statement: input.statement },
+            source: { kind: "system", ref: `run:${context.runId}` },
+            sourceEvidence: modelEvidence(context.runId),
+            confidence: input.confidence ?? 0.5,
+            mergeHint: { strategy: "manual_review_required" },
+            extensions: { "glassbox:model_inference": true },
+          });
+        return learning.writeExplicit(operationContext, {
+          subject: { kind: "user", id: context.caller.principalId },
+          scope,
+          type: input.type,
+          statement: input.statement,
+          ...(input.confidence === undefined ? {} : { confidence: input.confidence }),
+          ...(input.ttlSeconds === undefined ? {} : { ttlSeconds: input.ttlSeconds }),
+        });
+      }
     case "update":
+      if (input.confidence !== undefined || input.ttlSeconds !== undefined)
+        throw new Error("owner_confirmation_required");
+      if ((await ownerCommand(store, context)) !== commandFor(input))
+        throw new Error("owner_confirmation_required");
       return learning.updateMemory(operationContext, requiredId(input), {
         ...(typeof input.statement === "string" ? { statement: input.statement } : {}),
         ...(input.confidence === undefined ? {} : { confidence: input.confidence }),
@@ -87,6 +180,8 @@ async function executeMemoryAction(
     case "expire":
     case "revoke":
     case "retire":
+      if ((await ownerCommand(store, context)) !== commandFor(input))
+        throw new Error("owner_confirmation_required");
       return learning.setLifecycle(
         operationContext,
         requiredId(input),
@@ -95,18 +190,151 @@ async function executeMemoryAction(
     case "supersede":
       if (typeof input.statement !== "string" || typeof input.type !== "string")
         throw new Error("memory_write_fields_required");
-      return learning.supersedeMemory(operationContext, requiredId(input), {
-        subject: { kind: "user", id: context.caller.principalId },
-        scope: scopeFrom(input),
-        type: input.type,
-        statement: input.statement,
-        ...(input.confidence === undefined ? {} : { confidence: input.confidence }),
-        ...(input.ttlSeconds === undefined ? {} : { ttlSeconds: input.ttlSeconds }),
-      });
+      {
+        const existing = await learning.getMemory(operationContext, requiredId(input));
+        if (!existing || existing.lifecycleState !== "active") throw new Error("memory_not_active");
+        if (input.type !== existing.type) throw new Error("memory_type_mismatch");
+        if (
+          input.scopeType !== undefined &&
+          JSON.stringify(scopeFrom(input)) !== JSON.stringify(existing.scope)
+        )
+          throw new Error("memory_scope_mismatch");
+        const command = await ownerCommand(store, context);
+        if (
+          command.startsWith("/memory supersede ") &&
+          (command !== commandFor(input) ||
+            input.confidence !== undefined ||
+            input.ttlSeconds !== undefined)
+        )
+          throw new Error("owner_confirmation_required");
+        if (
+          input.confidence !== undefined ||
+          input.ttlSeconds !== undefined ||
+          command !== commandFor(input)
+        )
+          return learning.createCandidate(operationContext, {
+            candidateKind: "correction",
+            subject: existing.subject,
+            scope: existing.scope,
+            proposedType: input.type,
+            statement: input.statement,
+            content: { statement: input.statement },
+            source: { kind: "system", ref: `run:${context.runId}` },
+            sourceEvidence: modelEvidence(context.runId),
+            confidence: input.confidence ?? 0.5,
+            mergeHint: { strategy: "manual_review_required", ifMatchMemoryId: existing.memoryId },
+            extensions: { "glassbox:model_inference": true },
+          });
+        return learning.supersedeMemory(operationContext, requiredId(input), {
+          subject: { kind: "user", id: context.caller.principalId },
+          scope: existing.scope,
+          type: input.type,
+          statement: input.statement,
+          ...(input.confidence === undefined ? {} : { confidence: input.confidence }),
+          ...(input.ttlSeconds === undefined ? {} : { ttlSeconds: input.ttlSeconds }),
+        });
+      }
     case "promote":
+      if ((await ownerCommand(store, context)) !== commandFor(input))
+        throw new Error("owner_confirmation_required");
       return learning.promoteCandidate(operationContext, requiredId(input));
     case "reject":
+      if ((await ownerCommand(store, context)) !== commandFor(input))
+        throw new Error("owner_confirmation_required");
       return learning.rejectCandidate(operationContext, requiredId(input));
+    case "feedback": {
+      if (!input.signalType || !feedbackSignals.includes(input.signalType) || !input.statement)
+        throw new Error("invalid_feedback_input");
+      const scope = scopeFrom(input);
+      if ((await ownerCommand(store, context)) !== commandFor(input, scope))
+        throw new Error("owner_confirmation_required");
+      return learning.recordFeedback(operationContext, {
+        signalType: input.signalType,
+        scope,
+        statement: input.statement,
+        conversationId: context.conversationId,
+        runId: context.runId,
+      });
+    }
+    case "extract": {
+      if (
+        !input.statement ||
+        !input.type ||
+        !["semantic_fact", "episodic_event"].includes(input.type)
+      )
+        throw new Error("invalid_extraction_input");
+      const message = await ownerCommand(store, context);
+      const consolidator = new MemoryConsolidator(learning, {
+        async extract({ existing }) {
+          if (input.id && !existing.some((memory) => memory.memoryId === input.id))
+            throw new Error("memory_scope_mismatch");
+          return [
+            {
+              action: input.id ? "update" : "create",
+              type: input.type as "semantic_fact" | "episodic_event",
+              statement: input.statement!,
+              ...(input.id ? { existingMemoryId: input.id } : {}),
+            },
+          ];
+        },
+      });
+      return consolidator.consolidate({
+        context: operationContext,
+        subject: { kind: "user", id: context.caller.principalId },
+        scope: scopeFrom(input),
+        messages: [{ role: "user", text: message, ref: `run:${context.runId}` }],
+      });
+    }
+    case "source": {
+      if (!input.groupId || !input.sourceClass || !QQ_SOURCE_CLASSES.includes(input.sourceClass))
+        throw new Error("invalid_memory_source_input");
+      const resourceId = groupResourceId(input.groupId);
+      const decision = await store.authorization.check({
+        caller: context.caller,
+        resourceId,
+        action: sourceClassAuthority(input.sourceClass).action,
+        conversationId: context.conversationId,
+        runId: context.runId,
+      });
+      if (decision.decision !== "ALLOW") throw new Error("memory_source_denied");
+      const reader = new AuthorizedQQSourceReader({ store, caller: context.caller });
+      const items = await reader.readCandidates({
+        connectionId: context.caller.scope.connectionId,
+        groupId: input.groupId,
+        sourceClass: input.sourceClass,
+        limit: 10,
+      });
+      const scope = scopeFrom(input);
+      const category = input.sourceClass === "metadata" ? "group_info" : input.sourceClass;
+      const candidates = [];
+      for (const item of items) {
+        candidates.push(
+          await learning.createCandidate(
+            operationContext,
+            candidateFromAuthorizedSource({
+              item: {
+                channel: "qq",
+                groupResourceId: resourceId,
+                groupId: input.groupId,
+                category,
+                sourceReadRunId: context.runId,
+                authorizationDecisionId: decision.id,
+                occurredAt: item.occurredAt,
+                stableRef: `qq:${item.id}`,
+                snippet: item.text,
+                ...(item.externalMessageId ? { externalMessageId: item.externalMessageId } : {}),
+                ...(item.senderId ? { senderId: item.senderId } : {}),
+              },
+              subject: { kind: "user", id: context.caller.principalId },
+              scope,
+              type: "semantic_fact",
+              statement: item.text.slice(0, 8000),
+            }),
+          ),
+        );
+      }
+      return candidates;
+    }
   }
 }
 
@@ -125,7 +353,7 @@ export function createOwnerMemoryTools(options: {
       name: OWNER_MEMORY_ADMIN_TOOL,
       label: "Owner Memory 管理",
       description:
-        "Owner-private governed Memory and Taste administration. Inferred content must be listed as a candidate and explicitly promoted; use write only for an explicit Owner statement.",
+        "Owner-private Memory administration. Model-originated write and supersede calls only create reviewable candidates. Active changes require the Owner's exact /memory command in the current message.",
       parameters: Type.Object(
         {
           action: Type.Unsafe<OwnerMemoryToolInput["action"]>({
@@ -142,6 +370,9 @@ export function createOwnerMemoryTools(options: {
               "supersede",
               "promote",
               "reject",
+              "feedback",
+              "extract",
+              "source",
             ],
           }),
           id: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })),
@@ -159,6 +390,13 @@ export function createOwnerMemoryTools(options: {
           confidence: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
           ttlSeconds: Type.Optional(Type.Integer({ minimum: 0 })),
           includeInactive: Type.Optional(Type.Boolean()),
+          signalType: Type.Optional(
+            Type.Unsafe<FeedbackSignal>({ type: "string", enum: [...feedbackSignals] }),
+          ),
+          groupId: Type.Optional(Type.String({ pattern: "^[1-9]\\d{0,15}$" })),
+          sourceClass: Type.Optional(
+            Type.Unsafe<QqSourceClass>({ type: "string", enum: [...QQ_SOURCE_CLASSES] }),
+          ),
         },
         { additionalProperties: false },
       ),
@@ -166,7 +404,7 @@ export function createOwnerMemoryTools(options: {
       resourceId: OWNER_MEMORY_RESOURCE,
       authService: options.store.authorization,
       getContext,
-      execute: (params, context) => executeMemoryAction(options.store.learning, context, params),
+      execute: (params, context) => executeMemoryAction(options.store, context, params),
     }),
   ];
 }

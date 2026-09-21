@@ -127,14 +127,23 @@ export class LifecycleStore {
     // to this Run. Model text cannot remove a dependency from this set.
     const sources = await tx.execute({
       sql: `SELECT DISTINCT resource_id, action FROM authorization_decisions WHERE run_id = ? AND principal_id = ?
-        AND decision = 'ALLOW' AND action IN ('read', 'context:read', 'worker:read', 'worker:status', 'worker:file:read', 'task:read')`,
+        AND decision = 'ALLOW' AND action IN ('read', 'context:read', 'history:read', 'worker:read', 'worker:status', 'worker:file:read', 'task:read')`,
       args: [runId, caller.principalId],
     });
+    // Every delivery decision is evidence about one Run in one Conversation, so the delivery
+    // recheck names both. A denial then explains which Run tried to send which Resource's
+    // derived content, without copying the payload it was carrying.
+    const runs = await tx.execute({
+      sql: "SELECT conversation_id FROM runs WHERE id = ? AND principal_id = ?",
+      args: [runId, caller.principalId],
+    });
+    const conversationId = runs.rows[0] ? stringColumn(runs.rows[0], "conversation_id") : undefined;
     for (const source of sources.rows) {
       for (const action of [stringColumn(source, "action"), "delivery:send"]) {
         const decision = await evaluate(tx, {
           caller,
           runId,
+          ...(conversationId === undefined ? {} : { conversationId }),
           resourceId: stringColumn(source, "resource_id"),
           action,
         });

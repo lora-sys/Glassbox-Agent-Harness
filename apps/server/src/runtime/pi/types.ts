@@ -76,6 +76,14 @@ export interface PiRunContext {
   authorizedSkillNames?: readonly string[];
   modelVisibleSkillNames?: readonly string[];
   skillPolicy?: Record<string, unknown>;
+  /**
+   * The Tool names this Run actually discovered, as the runtime resolved them.
+   *
+   * Written by the runtime once per session so a required Tool is only ever bound to a Tool
+   * the Run could really call. A requirement the surface cannot satisfy would fail an honest
+   * Run closed against a Tool that was never offered to the model.
+   */
+  authorizedToolNames?: readonly string[];
 }
 
 export interface PiRuntimeAdapter {

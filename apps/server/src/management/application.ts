@@ -1,6 +1,10 @@
 import { join } from "node:path";
 import type { IncomingMessage } from "node:http";
-import { CHANNEL_SAFE_ERRORS, type PublicChannelProfile } from "@glassbox/contracts";
+import {
+  CHANNEL_SAFE_ERRORS,
+  type PublicChannelProfile,
+  type QqSourceClass,
+} from "@glassbox/contracts";
 import { ChannelProfileStore, ChannelConfigurationError } from "../config/channel-profiles.js";
 import { GroupRuntimeStore } from "../config/group-runtime.js";
 import type { ModelProfileStore } from "../config/model-profiles.js";
@@ -47,6 +51,37 @@ import {
   MEMORY_WRITE_ACTION,
   OWNER_MEMORY_RESOURCE,
 } from "../learning/store.js";
+import {
+  availableHistoryToolNames,
+  createHistoryTools,
+  OWNER_HISTORY_ACTION,
+  OWNER_HISTORY_RESOURCE,
+} from "../runtime/pi/history-tools.js";
+import {
+  availableCapabilityToolNames,
+  createCapabilityTools,
+  GROUP_RUN_CAPABILITY_CATEGORIES,
+} from "../runtime/pi/capability-tools.js";
+import type { PiRunContext } from "../runtime/pi/types.js";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import {
+  DEFAULT_GROUP_CAPABILITY_POLICY,
+  enabledCategories,
+  isCategoryEnabled,
+  type GroupCapabilityPolicy,
+} from "./capability-policy.js";
+import {
+  QQ_CAPABILITIES,
+  QQ_CAPABILITY_CATEGORIES,
+  qqCapabilitiesForCategory,
+  type QqCapabilityCategory,
+} from "../channels/onebot/capabilities.js";
+import {
+  matchCapabilityEntries,
+  type CapabilitySearchEntry,
+} from "../channels/onebot/capability-search.js";
+import { ChannelArchiveStore } from "../retrieval/channel-archive.js";
+import { groupResourceId, resolveAssignedGroupIds } from "../retrieval/source-resolver.js";
 import { AuthorizedOpsService, type WorkerPolicy } from "../ops/service.js";
 import { OpsReconciler } from "../ops/reconciler.js";
 import type { HerdrBridge } from "../ops/herdr-bridge.js";
@@ -77,6 +112,98 @@ const ACTIONS = [
 const TOOL_DISCOVERY_ACTION = "tool:discover";
 const toolResourceId = (name: string) => `tool:${name}`;
 
+/**
+ * The two group-scoped Actions the managed-group projection reasons about by name.
+ *
+ * `categoryActions` derives them from the registry, so these are not a second source of truth:
+ * they exist because the projection needs the `history:read` and `group:read` decisions
+ * individually — one reported as the access fact, one gating the live provider read.
+ */
+const HISTORY_READ_ACTION = "history:read";
+const GROUP_READ_ACTION = "group:read";
+
+/** Provider page size for one `get_group_msg_history` call. */
+const HISTORY_SYNC_PAGE_SIZE = 100;
+/** Upper bound on pages walked per sync, so one search cannot scan unbounded history. */
+const HISTORY_SYNC_MAX_PAGES = 5;
+
+/**
+ * The fixed capability bundle an Owner's first `set_access enabled` persists for a group.
+ *
+ * These are the read-only P4 capabilities the acceptance path needs — group metadata,
+ * members, live history, notices/essence, file reads and the memory source class. Mutation
+ * categories (`group.files.write`, `group.moderate`, `group.settings`, `message.manage`)
+ * are deliberately absent: they stay an explicit later Owner decision.
+ */
+export const DEFAULT_OWNER_GROUP_CATEGORIES: readonly QqCapabilityCategory[] = Object.freeze([
+  "group.read",
+  "group.members",
+  "group.history",
+  "group.content",
+  "group.files.read",
+  "memory.source",
+]);
+
+/**
+ * The memory source classes the default bundle enables.
+ *
+ * Every name here has a real capability behind it; `album` is absent because the registry
+ * declares no album operation, and enabling it would write a dead grant.
+ */
+export const DEFAULT_OWNER_GROUP_SOURCES: readonly QqSourceClass[] = Object.freeze([
+  "history",
+  "notice",
+  "essence",
+  "metadata",
+  "file",
+]);
+
+/** The durable policy one Owner's first `set_access enabled` persists for a group. */
+export const DEFAULT_OWNER_GROUP_POLICY: GroupCapabilityPolicy = (() => {
+  const categories: Partial<Record<QqCapabilityCategory, boolean>> = {};
+  for (const category of DEFAULT_OWNER_GROUP_CATEGORIES) categories[category] = true;
+  const memorySources: Partial<Record<QqSourceClass, boolean>> = {};
+  for (const sourceClass of DEFAULT_OWNER_GROUP_SOURCES) memorySources[sourceClass] = true;
+  return { categories, memorySources };
+})();
+
+/** The Action that records one Owner's assignment of one managed group. */
+const GROUP_ASSIGN_ACTION = "group:manage";
+
+/**
+ * The Action that permits a result derived from one Resource to reach the current audience.
+ *
+ * It is granted on a *group* Resource, in one exact scope, and it is deliberately separate
+ * from every read Action: `authorizeDeliverySources` re-checks each protected read a Run
+ * admitted against this Action on the same Resource, in the Run's own scope, immediately
+ * before transport. Read authority therefore never becomes delivery authority, and the
+ * reverse states stay explicit. An unassigned group, a sibling Owner, another audience and
+ * a Visitor private chat hold no such grant.
+ */
+const DELIVERY_SEND_ACTION = "delivery:send";
+
+/**
+ * One managed group's durable facts, before any live provider observation.
+ *
+ * Shared by the managed-group inventory and the capability search so the two cannot disagree
+ * about which groups exist, what each one's policy says, or what the Principal may do.
+ */
+interface ManagedGroupFacts {
+  groupId: string;
+  /** The durable Owner intent for this group's capability classes. */
+  policy: GroupCapabilityPolicy;
+  /** The durable policy version. */
+  version: number;
+  /** The categories whose group-scoped Action is currently ALLOW for this Principal. */
+  grantedCategories: QqCapabilityCategory[];
+  /** The execution-time `history:read` decision for this Principal and group. */
+  historyRead: boolean;
+  /** The execution-time `group:read` decision, which gates the live provider observation. */
+  groupRead: boolean;
+  /** The durable group runtime whitelist, read from the store rather than the live session. */
+  skills: { enabledSkills: string[]; version: number };
+}
+
 function idFromInput(input: unknown): string {
   if (
     !input ||
@@ -99,6 +226,8 @@ export class ManagementApplication {
   readonly runs: RunService;
   readonly trace: RunTraceStore;
   readonly evaluator: ReturnType<typeof createRunEvaluator>;
+  /** Durable Channel history, separate from Run inputs. */
+  readonly archive: ChannelArchiveStore;
   executors!: ExecutorConfiguration;
   private readonly connections = new Map<string, OneBotAdapter>();
   private readonly deliveryPolicy: ReturnType<typeof createQqDeliveryPolicy>;
@@ -134,6 +263,7 @@ export class ManagementApplication {
     this.store = store;
     this.channels = channels;
     this.groupRuntime = groupRuntime;
+    this.archive = new ChannelArchiveStore(store.db);
     this.kitLoader = new KitLoader(options.kitPath);
     this.deliveryPolicy = createQqDeliveryPolicy({
       forbiddenValues: () => [
@@ -246,32 +376,7 @@ export class ManagementApplication {
       kitPath: this.kitLoader.getKitPath(),
       runtimeBaseDir: join(this.options.dataDirectory, "pi"),
       resolveModel: () => configuredPiModel(this.options.models, profileId),
-      createTools: (getContext) => [
-        ...(this.options.ops
-          ? createOpsTools({
-              store: this.store,
-              service: new AuthorizedOpsService(
-                this.store,
-                this.options.ops!.bridge,
-                this.options.ops!.workerPolicy,
-              ),
-              workerTarget: this.options.ops!.workerTarget,
-              getContext,
-            })
-          : []),
-        ...createOwnerTools({
-          store: this.store,
-          getContext,
-          manageGroup: (context, input) => this.manageGroup(context, input),
-        }),
-        ...createOwnerMemoryTools({ store: this.store, getContext }),
-        ...createSkillTools({
-          store: this.store,
-          loader: this.kitLoader,
-          getContext,
-          isSkillAuthorized: (context, skillName) => this.isSkillAuthorized(context, skillName),
-        }),
-      ],
+      createTools: (getContext) => this.createRuntimeTools(getContext),
       resolveSkillNames: async (context, profile) => {
         if (!context.caller)
           return { names: [], modelVisibleNames: [], policy: { source: "no-caller" } };
@@ -309,32 +414,7 @@ export class ManagementApplication {
             : { source: "kit-profile" },
         };
       },
-      resolveToolNames: async (context) => {
-        if (!context.caller || !context.conversationId || !context.runId) return [];
-        const isOwner = await this.store.identities.isOwner(context.caller.principalId);
-        const candidates = [
-          ...(context.authorizedSkillNames?.length ? [SKILL_READ_TOOL] : []),
-          ...(isOwner && context.caller.scope.chatType === "private"
-            ? [
-                ...(this.options.ops ? OPS_TOOL_NAMES : []),
-                OWNER_GROUP_ADMIN_TOOL,
-                OWNER_MEMORY_ADMIN_TOOL,
-              ]
-            : []),
-        ];
-        const selected: string[] = [];
-        for (const name of candidates) {
-          const decision = await this.store.authorization.check({
-            caller: context.caller,
-            resourceId: toolResourceId(name),
-            action: TOOL_DISCOVERY_ACTION,
-            conversationId: context.conversationId,
-            runId: context.runId,
-          });
-          if (decision.decision === "ALLOW") selected.push(name);
-        }
-        return selected;
-      },
+      resolveToolNames: (context) => this.resolveRunToolNames(context),
       onEvent: async (event) => {
         const runId =
           event.runId ?? (typeof event.data.runId === "string" ? event.data.runId : undefined);
@@ -354,6 +434,150 @@ export class ManagementApplication {
     });
     this.piAdapters.set(profileId, adapter);
     return adapter;
+  }
+
+  /**
+   * The Runtime Tools every Pi Run receives.
+   *
+   * Extracted from the adapter wiring so a test can build the real Tool surface through the
+   * real application instead of re-deriving it, which is the only way a discovery/execution
+   * test proves the product path rather than the helper.
+   */
+  private createRuntimeTools(getContext: () => PiRunContext | undefined): ToolDefinition[] {
+    return [
+      ...(this.options.ops
+        ? createOpsTools({
+            store: this.store,
+            service: new AuthorizedOpsService(
+              this.store,
+              this.options.ops!.bridge,
+              this.options.ops!.workerPolicy,
+            ),
+            workerTarget: this.options.ops!.workerTarget,
+            getContext,
+          })
+        : []),
+      ...createOwnerTools({
+        store: this.store,
+        getContext,
+        manageGroup: (context, input) => this.manageGroup(context, input),
+      }),
+      ...createOwnerMemoryTools({ store: this.store, getContext }),
+      ...createSkillTools({
+        store: this.store,
+        loader: this.kitLoader,
+        getContext,
+        isSkillAuthorized: (context, skillName) => this.isSkillAuthorized(context, skillName),
+      }),
+      ...createHistoryTools({
+        store: this.store,
+        archive: this.archive,
+        getContext,
+        isHistoryEnabled: (connectionId, groupId) => this.isHistoryEnabled(connectionId, groupId),
+        syncGroup: async (groupId, context) => {
+          await this.syncGroupHistory(context.caller.scope.connectionId, groupId);
+        },
+        botIdForConnection: (connectionId) => this.channels.resolve(connectionId).config.botId,
+        // Safe retrieval evidence: Run, Resource, source kind and id, mode, score, rank and
+        // matched terms — never a snippet or protected message text.
+        recordEvidence: async (evidence, context) => {
+          const cursor = await this.trace.append(context.runId, evidence, "glassbox-retrieval");
+          await this.store.evidence.advanceTrace(context.caller, cursor);
+        },
+      }),
+      ...createCapabilityTools({
+        store: this.store,
+        getContext,
+        // Owner intent, read fresh on every call so a policy change applies at once.
+        isCategoryEnabled: (connectionId, groupId, category) =>
+          this.isCategoryEnabled(connectionId, groupId, category),
+        invoke: async ({ action, params, context }) => {
+          const connection = this.connections.get(context.caller.scope.connectionId);
+          if (!connection) throw new Error("channel_not_connected");
+          return connection.invokeCapability({ action, params });
+        },
+        search: (input) => this.searchCapabilities(input.context, input),
+        projectManagedGroups: (context) => this.projectManagedGroups(context),
+      }),
+    ];
+  }
+
+  /** One group's durable Owner intent for a capability class. Not an authorization decision. */
+  private async isCategoryEnabled(
+    connectionId: string,
+    groupId: string,
+    category: QqCapabilityCategory,
+  ): Promise<boolean> {
+    return isCategoryEnabled(
+      (await this.store.capabilities.read(connectionId, groupId))?.policy ??
+        DEFAULT_GROUP_CAPABILITY_POLICY,
+      category,
+    );
+  }
+
+  /**
+   * One group's durable Owner intent for history.
+   *
+   * History is a capability category, so this is the same policy read the capability Tools
+   * use. Reading it fresh is what makes `set_history` and `set_capability(group.history)`
+   * agree: both move the same flag, and the next Run and the next execution both see it.
+   */
+  private async isHistoryEnabled(connectionId: string, groupId: string): Promise<boolean> {
+    return this.isCategoryEnabled(connectionId, groupId, "group.history");
+  }
+
+  /**
+   * The Tool names one Run may discover, after each name's discovery grant is checked.
+   *
+   * The capability surface follows current policy, never a cached bundle: a group Run sees
+   * only what its own group's policy enables, and an Owner-private Run sees the union over
+   * the groups the current Principal is assigned to. Discovery is granted as a superset, so
+   * a policy change applies on the very next Run with no re-grant.
+   */
+  private async resolveRunToolNames(context: PiRunContext): Promise<string[]> {
+    if (!context.caller || !context.conversationId || !context.runId) return [];
+    const isOwner = await this.store.identities.isOwner(context.caller.principalId);
+    const scope = context.caller.scope;
+    const capabilityCategories =
+      scope.chatType === "group"
+        ? enabledCategories(
+            (await this.store.capabilities.read(scope.connectionId, scope.chatId))?.policy,
+          )
+        : isOwner
+          ? await this.assignedCategories(context.caller)
+          : [];
+    const candidates = [
+      ...(context.authorizedSkillNames?.length ? [SKILL_READ_TOOL] : []),
+      ...(isOwner && scope.chatType === "private"
+        ? [
+            ...(this.options.ops ? OPS_TOOL_NAMES : []),
+            OWNER_GROUP_ADMIN_TOOL,
+            OWNER_MEMORY_ADMIN_TOOL,
+          ]
+        : []),
+      ...availableHistoryToolNames({
+        isOwner,
+        chatType: scope.chatType,
+        enabledCategories: capabilityCategories,
+      }),
+      ...availableCapabilityToolNames({
+        isOwner,
+        chatType: scope.chatType,
+        enabledCategories: capabilityCategories,
+      }),
+    ];
+    const selected: string[] = [];
+    for (const name of candidates) {
+      const decision = await this.store.authorization.check({
+        caller: context.caller,
+        resourceId: toolResourceId(name),
+        action: TOOL_DISCOVERY_ACTION,
+        conversationId: context.conversationId,
+        runId: context.runId,
+      });
+      if (decision.decision === "ALLOW") selected.push(name);
+    }
+    return selected;
   }
 
   private execution(reference: string): RunExecutionAdapter | undefined {
@@ -516,6 +740,11 @@ export class ManagementApplication {
         await this.ingressReady;
         await connectionReady;
         if (!this.accepting || !connectionAccepted || signal.aborted) return;
+        if (message.scope.chatType === "group") {
+          // Group assignments can change while the socket stays connected. Resolve the
+          // current profile instead of preserving the connect-time allowlist in this closure.
+          await this.provisionAddressedGroupMember(this.channels.resolve(id), message.scope);
+        }
         const control = /^\/(status|cancel)\s+([a-zA-Z0-9-]{1,80})\s*$/u.exec(message.text);
         if (control) {
           const caller = await this.store.identities.resolve(message.scope);
@@ -591,6 +820,17 @@ export class ManagementApplication {
       ];
       await this.store.identities.bindOwner(principalId, identity);
       for (const scope of scopes) await this.grantScope(scope, principalId);
+      // An assignment persisted before the explicit delivery grant existed must not require the
+      // Owner to remove and re-add the group. The set is read from this Owner's own active
+      // `group:manage` grants, so the backfill restores exactly the assignments that already
+      // exist. It can never manufacture one, and a group this Owner never assigned stays
+      // without authority however often the Channel reconnects.
+      const privateScope = scopes[0]!;
+      for (const groupId of await resolveAssignedGroupIds(this.store, {
+        principalId,
+        scope: privateScope,
+      }))
+        await this.grantGroupDelivery({ principalId, scope: privateScope, groupId });
     }
 
     for (const visitorId of configured.config.visitorIds) {
@@ -612,6 +852,32 @@ export class ManagementApplication {
       ];
       for (const scope of visitorScopes) await this.grantScope(scope, principalId);
     }
+  }
+
+  /**
+   * Gives one explicitly addressed member of an enabled group only that group's Visitor
+   * authority. Normalization has already required a real @ mention and an allowed group.
+   * Private chat remains restricted to configured identities, and no Owner control grant is
+   * created here.
+   */
+  private async provisionAddressedGroupMember(
+    configured: ReturnType<ChannelProfileStore["resolve"]>,
+    scope: TrustedChannelScope,
+  ): Promise<void> {
+    if (scope.chatType !== "group" || !configured.config.groupIds.includes(scope.chatId)) return;
+    let caller = await this.store.identities.resolve(scope);
+    if (!caller) {
+      const principalId = `qq-visitor-${scope.senderId}`;
+      await this.store.identities.createPrincipal(principalId, "visitor");
+      await this.store.identities.bindPrincipal(principalId, scope);
+      caller = { principalId, scope };
+    }
+    const current = await this.store.authorization.check({
+      caller,
+      resourceId: agentResourceId(AGENT_ID),
+      action: "run:create",
+    });
+    if (current.decision !== "ALLOW") await this.grantScope(scope, caller.principalId);
   }
 
   private async grantScope(scope: TrustedChannelScope, principalId = OWNER_ID) {
@@ -660,6 +926,66 @@ export class ManagementApplication {
       scope,
       effect: "allow",
     });
+    // A group is a protected Resource. Bot membership never creates this row: it exists only
+    // for a group Glassbox has configured, and reading it still needs an explicit grant.
+    if (scope.chatType === "group") {
+      const groupResource = groupResourceId(scope.chatId);
+      await this.store.authorization.registerResource({
+        id: groupResource,
+        kind: "qq_group",
+        visibility: "public",
+        ifAbsent: true,
+      });
+      // A Run inside a configured group may read that same group. This is not implied by bot
+      // membership: the grant exists only for a group Glassbox has configured, it is scoped to
+      // that one group, and it covers only the read-only categories. The Run's candidate list
+      // narrows them to the Owner's current policy, and every call is re-authorized.
+      for (const action of this.groupRunReadActions()) {
+        const existing = await this.store.authorization.check({
+          caller,
+          resourceId: groupResource,
+          action,
+        });
+        if (existing.decision !== "ALLOW")
+          await this.store.authorization.grant({
+            principalId,
+            resourceId: groupResource,
+            action,
+            scope,
+            effect: "allow",
+          });
+      }
+      // Answering back into this group is its own decision, granted separately from reading it.
+      // The Run's own group scope is the audience it already owns, so this is the one delivery
+      // authority a group Run can hold. It is granted only because Glassbox configured
+      // this group. Bot membership alone registers nothing and grants nothing.
+      await this.grantGroupDelivery({ principalId, scope, groupId: scope.chatId });
+      // Discovery is a superset of authority, exactly as for the Owner-private scope: the
+      // Run's candidate list narrows it to policy, so a category change applies on the next
+      // Run with no re-grant and a revoked category cannot survive as stale discovery.
+      await this.grantCapabilityDiscovery({ principalId, scope });
+    }
+    for (const name of availableHistoryToolNames({
+      isOwner,
+      chatType: scope.chatType,
+      enabledCategories: [...QQ_CAPABILITY_CATEGORIES],
+    })) {
+      const resourceId = toolResourceId(name);
+      await this.store.authorization.registerResource({
+        id: resourceId,
+        kind: "tool-definition",
+        visibility: scope.chatType === "group" ? "public" : "private",
+        ...(scope.chatType === "group" ? {} : { ownerId: OWNER_ID }),
+        ifAbsent: true,
+      });
+      await this.store.authorization.grant({
+        principalId,
+        resourceId,
+        action: TOOL_DISCOVERY_ACTION,
+        scope,
+        effect: "allow",
+      });
+    }
     if (isOwner && scope.chatType === "private") {
       await this.store.authorization.registerResource({
         id: OWNER_CONTROL_RESOURCE,
@@ -712,9 +1038,146 @@ export class ManagementApplication {
           effect: "allow",
         });
       }
+      await this.grantCapabilityDiscovery({ principalId, scope });
+      // The Owner cross-group history Tool spans several group Resources, so it is gated on
+      // this Owner-private search capability. Each concrete group Resource is still
+      // re-authorized inside the Tool and the decision recorded with the Run.
+      await this.store.authorization.registerResource({
+        id: OWNER_HISTORY_RESOURCE,
+        kind: "owner-history",
+        visibility: "private",
+        ownerId: OWNER_ID,
+        ifAbsent: true,
+      });
+      await this.store.authorization.grant({
+        principalId,
+        resourceId: OWNER_HISTORY_RESOURCE,
+        action: OWNER_HISTORY_ACTION,
+        scope,
+        effect: "allow",
+      });
+      // Reading the managed-group inventory, searching the capability registry and reading
+      // the bot's own status are protected Actions on the Agent, not free metadata. The
+      // inventory is the `group:read` Action on the Agent Resource — the same Action that
+      // reads one group, applied to the Agent's own managed set — so an Owner may enumerate
+      // exactly the groups they manage and no others.
+      for (const action of ["group:read", "qq:capability:read", "account:status:read"]) {
+        const existing = await this.store.authorization.check({
+          caller,
+          resourceId: agentResourceId(AGENT_ID),
+          action,
+        });
+        if (existing.decision !== "ALLOW")
+          await this.store.authorization.grant({
+            principalId,
+            resourceId: agentResourceId(AGENT_ID),
+            action,
+            scope,
+            effect: "allow",
+          });
+      }
     }
   }
 
+  /**
+   * The one explicit delivery authority Glassbox writes for a group Resource.
+   *
+   * It says exactly: a result derived from *this* group's protected content may be delivered
+   * to *this* Principal in *this* scope. Every narrowing the Delivery Gate needs is carried by
+   * that sentence. The Resource is named, the Principal is named and the audience is the
+   * scope the grant lives in. Nothing has to be inferred from a read Action, a role, a
+   * connection-wide group list or bot membership.
+   *
+   * Idempotent, and it never creates an assignment: the caller decides *which* Resource and
+   * *which* scope, and both callers derive that from state that already exists, a configured
+   * group scope, or this Owner's own persisted `group:manage` assignment.
+   */
+  private async grantGroupDelivery(input: {
+    principalId: string;
+    scope: TrustedChannelScope;
+    groupId: string;
+  }): Promise<void> {
+    const resourceId = groupResourceId(input.groupId);
+    await this.store.authorization.registerResource({
+      id: resourceId,
+      kind: "qq_group",
+      visibility: "public",
+      ifAbsent: true,
+    });
+    const caller: CallerContext = { principalId: input.principalId, scope: input.scope };
+    const existing = await this.store.authorization.check({
+      caller,
+      resourceId,
+      action: DELIVERY_SEND_ACTION,
+    });
+    if (existing.decision !== "ALLOW")
+      await this.store.authorization.grant({
+        principalId: input.principalId,
+        resourceId,
+        action: DELIVERY_SEND_ACTION,
+        scope: input.scope,
+        effect: "allow",
+      });
+  }
+
+  /**
+   * Registers and grants Tool discovery for the capability surface a scope could ever use.
+   *
+   * Discovery is not authority, and it is deliberately a superset: the Run's candidate list
+   * narrows it to current policy, and the category's protected Action on the concrete group
+   * Resource is still checked at call time. Granting it once per scope means a policy change
+   * takes effect on the next Run without a re-grant, and a revoked category cannot survive
+   * as stale discovery because the candidate list never includes it.
+   *
+   * The Tool definition is registered `public` for every scope because one Tool name serves
+   * both the Owner-private and the group surface, and authorization denies a *private*
+   * resource in a group context outright — a private registration would make the group Run's
+   * discovery impossible. Visibility is metadata, not authority: the group Run still needs
+   * its own `tool:discover` grant, which is what this method writes.
+   */
+  private async grantCapabilityDiscovery(input: {
+    principalId: string;
+    scope: TrustedChannelScope;
+  }): Promise<void> {
+    const isOwner = await this.store.identities.isOwner(input.principalId);
+    const names = availableCapabilityToolNames({
+      isOwner,
+      chatType: input.scope.chatType,
+      enabledCategories: [...QQ_CAPABILITY_CATEGORIES],
+    });
+    for (const name of names) {
+      const resourceId = toolResourceId(name);
+      await this.store.authorization.registerResource({
+        id: resourceId,
+        kind: "tool-definition",
+        visibility: "public",
+        ifAbsent: true,
+      });
+      const existing = await this.store.authorization.check({
+        caller: { principalId: input.principalId, scope: input.scope },
+        resourceId,
+        action: TOOL_DISCOVERY_ACTION,
+      });
+      if (existing.decision !== "ALLOW")
+        await this.store.authorization.grant({
+          principalId: input.principalId,
+          resourceId,
+          action: TOOL_DISCOVERY_ACTION,
+          scope: input.scope,
+          effect: "allow",
+        });
+    }
+  }
+
+  /**
+   * One Owner's explicit decision to manage, or stop managing, one QQ group.
+   *
+   * Assignment is per Owner and authorization-backed: it is the `group:manage` grant on the
+   * group Resource in the acting Owner's own private scope. Enabling never grants a sibling
+   * Owner, and revoking never removes a sibling Owner's independent assignment or grants.
+   * The connection-wide transport group stays enabled while any Owner remains assigned, and
+   * only its last Owner's revocation tears the group-scope grants down.
+   */
   private async setGroupAccess(
     context: ProtectedToolContext,
     input: { groupId: string; enabled: boolean },
@@ -730,61 +1193,104 @@ export class ManagementApplication {
       if (input.enabled && !(await connection.hasGroup(input.groupId)))
         throw new Error("bot_not_in_group");
 
-      const ownerIds = [
-        configured.config.ownerId,
-        ...(configured.config.coOwnerId ? [configured.config.coOwnerId] : []),
-      ];
-      const groupScopes = [...ownerIds, ...configured.config.visitorIds].map((senderId) => ({
-        connectionId: configured.config.connectionId,
-        botId: configured.config.botId,
-        chatType: "group" as const,
-        chatId: input.groupId,
-        senderId,
-      }));
-      if (!input.enabled) {
-        for (const scope of groupScopes) {
-          const principalId = ownerIds.includes(scope.senderId)
-            ? scope.senderId === configured.config.ownerId
-              ? OWNER_ID
-              : `owner-${scope.senderId}`
-            : `qq-visitor-${scope.senderId}`;
-          for (const resourceId of [
-            agentResourceId(AGENT_ID),
-            SKILL_CATALOG_RESOURCE,
-            toolResourceId(SKILL_READ_TOOL),
-          ])
-            await this.store.authorization.revokeScope({ principalId, resourceId, scope });
-        }
-      }
-      const profile = await this.channels.setGroupEnabled(
-        caller.scope.connectionId,
-        input.groupId,
-        input.enabled,
-      );
+      const groupResource = groupResourceId(input.groupId);
+      const actingOwner = { principalId: caller.principalId, scope: caller.scope };
+      const groupScopes = this.groupScopes(configured, input.groupId);
+      // True only once no Owner is left assigned. Enabling always touches the transport; a
+      // disable touches it only when the acting Owner was the group's last one.
+      let lastAssignedOwner = false;
+
       if (input.enabled) {
-        for (const scope of groupScopes) {
-          const principalId = ownerIds.includes(scope.senderId)
-            ? scope.senderId === configured.config.ownerId
-              ? OWNER_ID
-              : `owner-${scope.senderId}`
-            : `qq-visitor-${scope.senderId}`;
-          await this.grantScope(scope, principalId);
+        await this.store.authorization.registerResource({
+          id: groupResource,
+          kind: "qq_group",
+          visibility: "public",
+          ifAbsent: true,
+        });
+        // Assignment records only the acting Owner's claim on this group.
+        await this.store.authorization.grant({
+          principalId: actingOwner.principalId,
+          resourceId: groupResource,
+          action: GROUP_ASSIGN_ACTION,
+          scope: actingOwner.scope,
+          effect: "allow",
+        });
+        // The fixed P4 bundle is persisted once for the group and never overwritten, so a
+        // second Owner joining later keeps their own view of the policy the first one set.
+        if (!(await this.store.capabilities.read(configured.config.connectionId, input.groupId)))
+          await this.store.capabilities.write({
+            connectionId: configured.config.connectionId,
+            groupId: input.groupId,
+            principalId: actingOwner.principalId,
+            policy: DEFAULT_OWNER_GROUP_POLICY,
+          });
+        // Grant the bundle's category Actions on this group Resource for the acting Owner's
+        // private scope only. `group.history` carries `history:read`, so the acting Owner's
+        // cross-group search gains this group in the same step.
+        await this.applyCategoryAuthority({
+          context,
+          groupId: input.groupId,
+          actions: this.bundleActions(),
+          enabled: true,
+        });
+        // Assignment also carries delivery: this Owner's private chat may receive a result
+        // derived from this assigned group. It travels with the assignment rather than with a
+        // category, so disabling one category cannot leave a cross-group answer unanswerable
+        // while its sibling categories stay enabled. The disable branch below uses one
+        // `revokeScope` on this Resource in this scope and removes it with everything else.
+        await this.grantGroupDelivery({
+          principalId: actingOwner.principalId,
+          scope: actingOwner.scope,
+          groupId: input.groupId,
+        });
+        // A Run inside the group needs its own group-scope grants, for the Owner and for
+        // every Visitor the transport serves. These are group scope, not Owner assignment.
+        for (const scope of groupScopes)
+          await this.grantScope(scope, this.principalForScope(configured, scope));
+      } else {
+        // Revoke exactly the acting Owner's assignment, bundle and history grant.
+        await this.store.authorization.revokeScope({
+          principalId: actingOwner.principalId,
+          resourceId: groupResource,
+          scope: actingOwner.scope,
+        });
+        const actingGroupScope = groupScopes.find(
+          (scope) => scope.senderId === caller.scope.senderId,
+        );
+        if (actingGroupScope)
+          await this.revokeGroupScopeAuthority(configured, groupResource, actingGroupScope);
+        // Only the last assigned Owner's revocation removes the connection-wide group and
+        // its group-scope grants. A sibling Owner's assignment keeps the group alive.
+        lastAssignedOwner = (await this.assignedOwners(configured, input.groupId)).length === 0;
+        if (lastAssignedOwner) {
+          await this.store.authorization.revokeResource(groupResource);
+          // Dynamic group members are not part of the static profile. Revoke the whole
+          // Channel location so no sender-specific Agent or Tool grant survives disable.
+          await this.store.authorization.revokeLocationScopes({
+            connectionId: configured.config.connectionId,
+            botId: configured.config.botId,
+            chatType: "group",
+            chatId: input.groupId,
+          });
         }
       }
-      connection.setAllowedGroups(profile.groupIds);
-      const cursor = await this.trace.append(
-        context.runId,
-        {
-          type: "group_access_changed",
-          runId: context.runId,
-          principalId: caller.principalId,
-          connectionId: caller.scope.connectionId,
-          groupId: input.groupId,
-          enabled: input.enabled,
-        },
-        "glassbox-owner-control",
-      );
-      await this.store.evidence.advanceTrace(caller, cursor);
+
+      // The transport group stays enabled while any Owner remains assigned: a sibling
+      // Owner's assignment is what keeps the bot in the group, not the acting Owner's.
+      if (input.enabled || lastAssignedOwner) {
+        const profile = await this.channels.setGroupEnabled(
+          caller.scope.connectionId,
+          input.groupId,
+          input.enabled,
+        );
+        connection.setAllowedGroups(profile.groupIds);
+      }
+      await this.recordOwnerControl(context, {
+        type: "group_access_changed",
+        connectionId: caller.scope.connectionId,
+        groupId: input.groupId,
+        enabled: input.enabled,
+      });
       this.runs.refresh();
       const runtime = this.groupRuntime.get(
         caller.scope.connectionId,
@@ -800,6 +1306,194 @@ export class ManagementApplication {
     });
   }
 
+  /** The group-scope identities a transport-enabled group serves: every Owner and Visitor. */
+  private groupScopes(
+    configured: ReturnType<ChannelProfileStore["resolve"]>,
+    groupId: string,
+  ): TrustedChannelScope[] {
+    const senderIds = [
+      configured.config.ownerId,
+      ...(configured.config.coOwnerId ? [configured.config.coOwnerId] : []),
+      ...configured.config.visitorIds,
+    ];
+    return senderIds.map((senderId) => ({
+      connectionId: configured.config.connectionId,
+      botId: configured.config.botId,
+      chatType: "group" as const,
+      chatId: groupId,
+      senderId,
+    }));
+  }
+
+  /** The Principal one group-scope identity resolves to. */
+  private principalForScope(
+    configured: ReturnType<ChannelProfileStore["resolve"]>,
+    scope: TrustedChannelScope,
+  ): string {
+    if (scope.senderId === configured.config.ownerId) return OWNER_ID;
+    if (configured.config.coOwnerId && scope.senderId === configured.config.coOwnerId)
+      return `owner-${configured.config.coOwnerId}`;
+    return `qq-visitor-${scope.senderId}`;
+  }
+
+  /** Revokes one identity's group-scope grants for one group, leaving other groups alone. */
+  private async revokeGroupScopeAuthority(
+    configured: ReturnType<ChannelProfileStore["resolve"]>,
+    groupResource: string,
+    scope: TrustedChannelScope,
+  ): Promise<void> {
+    const principalId = this.principalForScope(configured, scope);
+    for (const resourceId of [
+      agentResourceId(AGENT_ID),
+      SKILL_CATALOG_RESOURCE,
+      toolResourceId(SKILL_READ_TOOL),
+      // The group Run's Tool discovery is granted as a superset for the same reason the
+      // Owner-private one is, so it is revoked here for the same reason: leaving it behind
+      // would let a re-configured group rediscover a surface it no longer has authority for.
+      ...this.groupRunToolNames().map((name) => toolResourceId(name)),
+      groupResource,
+    ])
+      await this.store.authorization.revokeScope({ principalId, resourceId, scope });
+  }
+
+  /**
+   * The read-only protected Actions a Run inside a configured group may perform on that group.
+   *
+   * Derived from the same category registry the Tools are, so the grant and the Tool surface
+   * cannot drift. Mutation categories are absent from `GROUP_RUN_CAPABILITY_CATEGORIES`, so a
+   * group Run can never acquire one through this path.
+   */
+  private groupRunReadActions(): string[] {
+    return [
+      ...new Set(
+        GROUP_RUN_CAPABILITY_CATEGORIES.flatMap((category) => this.categoryActions(category)),
+      ),
+    ];
+  }
+
+  /**
+   * The capability and history Tools a configured group scope may discover.
+   *
+   * A superset of what any policy enables, matching `grantCapabilityDiscovery`: the Run's
+   * candidate list narrows it to current policy and each call is still re-authorized. It is
+   * computed from the same registries the candidate list uses, so a Tool cannot be
+   * discoverable-but-ungranted or granted-but-undiscoverable.
+   */
+  private groupRunToolNames(): string[] {
+    return [
+      ...new Set([
+        ...availableHistoryToolNames({
+          isOwner: false,
+          chatType: "group",
+          enabledCategories: [...QQ_CAPABILITY_CATEGORIES],
+        }),
+        ...availableCapabilityToolNames({
+          isOwner: false,
+          chatType: "group",
+          enabledCategories: [...QQ_CAPABILITY_CATEGORIES],
+        }),
+      ]),
+    ];
+  }
+
+  /** Every Owner whose assignment currently covers this group. */
+  private async assignedOwners(
+    configured: ReturnType<ChannelProfileStore["resolve"]>,
+    groupId: string,
+  ): Promise<string[]> {
+    const assigned: string[] = [];
+    for (const owner of this.ownerPrivateScopes(configured)) {
+      if (
+        await this.store.authorization.hasActiveGrant({
+          principalId: owner.principalId,
+          resourceId: groupResourceId(groupId),
+          action: GROUP_ASSIGN_ACTION,
+          scope: owner.scope,
+        })
+      )
+        assigned.push(owner.principalId);
+    }
+    return assigned;
+  }
+
+  /** The protected Actions the fixed P4 bundle confers on a group Resource. */
+  private bundleActions(): string[] {
+    return [
+      ...new Set(
+        DEFAULT_OWNER_GROUP_CATEGORIES.flatMap((category) => this.categoryActions(category)),
+      ),
+    ];
+  }
+
+  /** Every capability category enabled for a group the current Principal is assigned to. */
+  private async assignedCategories(caller: CallerContext): Promise<QqCapabilityCategory[]> {
+    const assigned = new Set(await resolveAssignedGroupIds(this.store, caller));
+    if (assigned.size === 0) return [];
+    const enabled = new Set<QqCapabilityCategory>();
+    for (const stored of await this.store.capabilities.list(caller.scope.connectionId)) {
+      if (!assigned.has(stored.groupId)) continue;
+      for (const category of enabledCategories(stored.policy)) enabled.add(category);
+    }
+    return [...enabled];
+  }
+
+  /**
+   * Pulls real group history through the existing authenticated OneBot connection into
+   * the durable archive. Only called for a group whose `history:read` decision was ALLOW.
+   *
+   * Older history is reachable: the walk follows the provider's `nextCursor` backwards for
+   * up to `maxPages` pages, so a single recent page is never the only thing archived. It
+   * stops on a failed/empty page, on a cursor that cannot advance (no provider sequence, or
+   * the same cursor twice), on a page older than `since`, and on the page bound — so it can
+   * never loop forever. Ingest is deduped by (channel, connection, group, external message
+   * id) and by message id within one walk, so repeated syncs are idempotent and never
+   * create Runs.
+   */
+  private async syncGroupHistory(
+    connectionId: string,
+    groupId: string,
+    options: { maxPages?: number; since?: string; until?: string } = {},
+  ): Promise<void> {
+    const connection = this.connections.get(connectionId);
+    if (!connection) return;
+    const maxPages = Math.max(1, Math.min(options.maxPages ?? HISTORY_SYNC_MAX_PAGES, 20));
+    const seen = new Set<string>();
+    let cursor: string | undefined;
+    for (let page = 0; page < maxPages; page += 1) {
+      const result = await connection.getGroupHistory({
+        groupId,
+        cursor,
+        count: HISTORY_SYNC_PAGE_SIZE,
+      });
+      if (result.status !== "ok") break;
+      let reachedBound = false;
+      for (const message of result.messages) {
+        if (options.since && message.occurredAt < options.since) {
+          reachedBound = true;
+          continue;
+        }
+        if (options.until && message.occurredAt > options.until) continue;
+        if (seen.has(message.messageId)) continue;
+        seen.add(message.messageId);
+        await this.archive.ingest({
+          channel: "qq-onebot",
+          connectionId,
+          groupId,
+          externalMessageId: message.messageId,
+          senderId: message.senderId,
+          senderName: message.senderName,
+          mentionTargetIds: message.mentionTargetIds,
+          normalizedText: message.text,
+          occurredAt: message.occurredAt,
+        });
+      }
+      const next = result.nextCursor;
+      if (next === undefined || next === cursor) break;
+      cursor = next;
+      if (reachedBound) break;
+    }
+  }
+
   private async manageGroup(
     context: ProtectedToolContext,
     input: OwnerGroupAdminInput,
@@ -809,18 +1503,463 @@ export class ManagementApplication {
     if (!isOwner || caller.scope.chatType !== "private") throw new Error("owner_private_required");
     if (input.action === "set_access") return this.setGroupAccess(context, input);
     if (input.action === "set_skill") return this.setGroupSkill(context, input);
-    const configured = this.channels.resolve(caller.scope.connectionId);
+    if (input.action === "set_capability") return this.setGroupCategory(context, input);
+    if (input.action === "set_memory_source") return this.setGroupMemorySource(context, input);
+    if (input.action === "set_history") return this.setGroupHistory(context, input);
     const runtime = this.groupRuntime.get(
       caller.scope.connectionId,
       input.groupId,
       this.kitLoader.loadProfile("qq-group").enabledSkills,
     );
+    const stored = await this.store.capabilities.read(caller.scope.connectionId, input.groupId);
+    // The managed inventory is the current Principal's own assignment, never the
+    // connection-wide transport list and never every group the bot happens to have joined.
+    const managedGroups = await resolveAssignedGroupIds(this.store, caller);
     return {
       groupId: input.groupId,
-      enabled: configured.config.groupIds.includes(input.groupId),
+      enabled: managedGroups.includes(input.groupId),
       enabledSkills: runtime.enabledSkills,
       availableSkills: this.kitLoader.availableSkills().map((skill) => skill.name),
       version: runtime.version,
+      managedGroups,
+      categories: stored?.policy.categories ?? {},
+      memorySources: stored?.policy.memorySources ?? {},
+      capabilityVersion: stored?.version ?? 0,
+    };
+  }
+
+  /** The protected Actions one capability category confers on a group Resource. */
+  private categoryActions(category: QqCapabilityCategory): string[] {
+    return [
+      ...new Set(
+        qqCapabilitiesForCategory(category)
+          // Account-scoped capabilities describe the Agent's own connection; granting their
+          // Action on a group Resource would be a dead grant, so the bundle never writes one.
+          .filter((capability) => capability.resource === "group")
+          .map((capability) => capability.action),
+      ),
+    ];
+  }
+
+  /** Owner-private scopes for a connection. Capability Tools exist only there. */
+  private ownerPrivateScopes(
+    configured: ReturnType<ChannelProfileStore["resolve"]>,
+  ): Array<{ principalId: string; scope: TrustedChannelScope }> {
+    const ownerIds = [
+      configured.config.ownerId,
+      ...(configured.config.coOwnerId ? [configured.config.coOwnerId] : []),
+    ];
+    return ownerIds.map((ownerId, index) => ({
+      principalId: index === 0 ? OWNER_ID : `owner-${ownerId}`,
+      scope: {
+        connectionId: configured.config.connectionId,
+        botId: configured.config.botId,
+        chatType: "private" as const,
+        chatId: ownerId,
+        senderId: ownerId,
+      },
+    }));
+  }
+
+  /**
+   * Moves the grant that backs one Owner capability decision.
+   *
+   * Only the acting Owner's private scope moves: a sibling Owner's grants on the same group
+   * Resource are untouched, so one Owner's decision never silently changes another's.
+   * Enabling grants exactly the category's Actions; disabling revokes exactly those Actions,
+   * so a sibling category on the same Resource keeps its grant.
+   */
+  private async applyCategoryAuthority(input: {
+    context: ProtectedToolContext;
+    groupId: string;
+    actions: readonly string[];
+    enabled: boolean;
+  }): Promise<void> {
+    const resourceId = groupResourceId(input.groupId);
+    const principalId = input.context.caller.principalId;
+    const scope = input.context.caller.scope;
+    for (const action of input.actions) {
+      if (input.enabled) {
+        const existing = await this.store.authorization.check({
+          caller: input.context.caller,
+          resourceId,
+          action,
+        });
+        if (existing.decision !== "ALLOW")
+          await this.store.authorization.grant({
+            principalId,
+            resourceId,
+            action,
+            scope,
+            effect: "allow",
+          });
+      } else {
+        await this.store.authorization.revokeScopeAction({
+          principalId,
+          resourceId,
+          action,
+          scope,
+        });
+      }
+    }
+  }
+
+  private async requireManagedGroup(
+    context: ProtectedToolContext,
+    groupId: string,
+  ): Promise<ReturnType<ChannelProfileStore["resolve"]>> {
+    const caller = context.caller;
+    const isOwner = await this.store.identities.isOwner(caller.principalId);
+    if (!isOwner || caller.scope.chatType !== "private") throw new Error("owner_private_required");
+    const configured = this.channels.resolve(caller.scope.connectionId);
+    // A group is managed for this Owner only while this Owner's own assignment is active.
+    if (
+      !(await this.store.authorization.hasActiveGrant({
+        principalId: caller.principalId,
+        resourceId: groupResourceId(groupId),
+        action: GROUP_ASSIGN_ACTION,
+        scope: caller.scope,
+      }))
+    )
+      throw new Error("group_not_enabled");
+    return configured;
+  }
+
+  private async recordOwnerControl(
+    context: ProtectedToolContext,
+    event: Record<string, unknown>,
+  ): Promise<void> {
+    const cursor = await this.trace.append(
+      context.runId,
+      { ...event, runId: context.runId, principalId: context.caller.principalId },
+      "glassbox-owner-control",
+    );
+    await this.store.evidence.advanceTrace(context.caller, cursor);
+  }
+
+  private async setGroupCategory(
+    context: ProtectedToolContext,
+    input: { groupId: string; category: QqCapabilityCategory; enabled: boolean },
+  ): Promise<unknown> {
+    return this.serialize(async () => {
+      await this.requireManagedGroup(context, input.groupId);
+      const { version } = await this.store.capabilities.setCategory({
+        connectionId: context.caller.scope.connectionId,
+        groupId: input.groupId,
+        principalId: context.caller.principalId,
+        category: input.category,
+        enabled: input.enabled,
+      });
+      await this.applyCategoryAuthority({
+        context,
+        groupId: input.groupId,
+        actions: this.categoryActions(input.category),
+        enabled: input.enabled,
+      });
+      await this.recordOwnerControl(context, {
+        type: "group_capability_changed",
+        connectionId: context.caller.scope.connectionId,
+        groupId: input.groupId,
+        category: input.category,
+        enabled: input.enabled,
+        policyVersion: version,
+      });
+      return { groupId: input.groupId, category: input.category, enabled: input.enabled, version };
+    });
+  }
+
+  private async setGroupMemorySource(
+    context: ProtectedToolContext,
+    input: { groupId: string; sourceClass: QqSourceClass; enabled: boolean },
+  ): Promise<unknown> {
+    return this.serialize(async () => {
+      await this.requireManagedGroup(context, input.groupId);
+      const { version } = await this.store.capabilities.setMemorySource({
+        connectionId: context.caller.scope.connectionId,
+        groupId: input.groupId,
+        principalId: context.caller.principalId,
+        sourceClass: input.sourceClass,
+        enabled: input.enabled,
+      });
+      await this.recordOwnerControl(context, {
+        type: "group_memory_source_changed",
+        connectionId: context.caller.scope.connectionId,
+        groupId: input.groupId,
+        sourceClass: input.sourceClass,
+        enabled: input.enabled,
+        policyVersion: version,
+      });
+      return {
+        groupId: input.groupId,
+        sourceClass: input.sourceClass,
+        enabled: input.enabled,
+        version,
+      };
+    });
+  }
+
+  /**
+   * One Owner-facing decision for "may this group's history be searched".
+   *
+   * History spans two separate mechanisms — the `group.history` capability category that
+   * exposes the Tool, and the `history` memory source class the P4A reader may draw on —
+   * so this action moves both together and keeps their grants in step.
+   */
+  private async setGroupHistory(
+    context: ProtectedToolContext,
+    input: { groupId: string; enabled: boolean },
+  ): Promise<unknown> {
+    return this.serialize(async () => {
+      await this.requireManagedGroup(context, input.groupId);
+      const common = {
+        connectionId: context.caller.scope.connectionId,
+        groupId: input.groupId,
+        principalId: context.caller.principalId,
+        enabled: input.enabled,
+      };
+      await this.store.capabilities.setCategory({ ...common, category: "group.history" });
+      const { version } = await this.store.capabilities.setMemorySource({
+        ...common,
+        sourceClass: "history",
+      });
+      await this.applyCategoryAuthority({
+        context,
+        groupId: input.groupId,
+        actions: this.categoryActions("group.history"),
+        enabled: input.enabled,
+      });
+      await this.recordOwnerControl(context, {
+        type: "group_history_changed",
+        connectionId: context.caller.scope.connectionId,
+        groupId: input.groupId,
+        enabled: input.enabled,
+        policyVersion: version,
+      });
+      return { groupId: input.groupId, enabled: input.enabled, version };
+    });
+  }
+
+  /**
+   * The durable facts for every group the current Principal is assigned to.
+   *
+   * This is the one projection both the managed-group inventory and the capability search
+   * read, so the two cannot disagree about which groups exist, what each one's policy says,
+   * or what this Principal is actually authorized to do. The set is the Principal's own
+   * `group:manage` assignment — never the connection-wide transport list and never every
+   * group the bot has joined. Every protected fact is re-authorized here, so the Owner role
+   * alone is never a bypass.
+   *
+   * Each fact is the real `authorization.check` decision for this Principal, this concrete
+   * `group:<id>` Resource and this Run — the same call the capability and history Tools make,
+   * recording the same `authorization_decisions` evidence, with the current Conversation and
+   * Run attached. `hasActiveGrant` is deliberately not used: it answers the management
+   * reverse-state question ("does anyone still hold this assignment") and bypasses identity
+   * and visibility evaluation, so a grant it finds is not an authorization decision.
+   */
+  private async managedGroupFacts(context: ProtectedToolContext): Promise<ManagedGroupFacts[]> {
+    const caller = context.caller;
+    const connectionId = caller.scope.connectionId;
+    const groupIds = await resolveAssignedGroupIds(this.store, caller);
+    const policies = new Map(
+      (await this.store.capabilities.list(connectionId)).map((entry) => [entry.groupId, entry]),
+    );
+    const defaultSkills = this.kitLoader.loadProfile("qq-group").enabledSkills;
+    const facts: ManagedGroupFacts[] = [];
+    for (const groupId of groupIds) {
+      const resourceId = groupResourceId(groupId);
+      // One decision per distinct Action, reused across the categories of this single
+      // projection so a category and `historyRead` cannot disagree about the same Action.
+      // The map dies with the call: nothing is cached across projections or Runs, so a
+      // revoke, a new Conversation or a new Run is always re-evaluated.
+      const decisions = new Map<string, boolean>();
+      const allowed = async (action: string): Promise<boolean> => {
+        const known = decisions.get(action);
+        if (known !== undefined) return known;
+        const decision = await this.store.authorization.check({
+          caller,
+          resourceId,
+          action,
+          conversationId: context.conversationId,
+          runId: context.runId,
+        });
+        const granted = decision.decision === "ALLOW";
+        decisions.set(action, granted);
+        return granted;
+      };
+      // A category counts as granted only when every group-scoped Action it confers is
+      // currently ALLOW for this Principal in this scope. A partially-revoked category is
+      // therefore reported as not granted rather than as half-usable.
+      const grantedCategories: QqCapabilityCategory[] = [];
+      for (const category of QQ_CAPABILITY_CATEGORIES) {
+        const actions = this.categoryActions(category);
+        if (actions.length === 0) continue;
+        let granted = true;
+        for (const action of actions) granted = granted && (await allowed(action));
+        if (granted) grantedCategories.push(category);
+      }
+      const runtime = this.groupRuntime.get(connectionId, groupId, defaultSkills);
+      facts.push({
+        groupId,
+        policy: policies.get(groupId)?.policy ?? DEFAULT_GROUP_CAPABILITY_POLICY,
+        version: policies.get(groupId)?.version ?? 0,
+        grantedCategories,
+        // The `history:read` decision itself — the same Action the history Tools check — not
+        // a flag inferred from the category that happens to contain it.
+        historyRead: await allowed(HISTORY_READ_ACTION),
+        groupRead: await allowed(GROUP_READ_ACTION),
+        skills: { enabledSkills: [...runtime.enabledSkills], version: runtime.version },
+      });
+    }
+    return facts;
+  }
+
+  /**
+   * One group's live provider observation, or explicit `null`s when it could not be observed.
+   *
+   * A disconnected provider, a provider error, a reply about a different group and an
+   * unreported name all collapse to the same "unknown" rather than to `false`, an empty name
+   * or a success — Glassbox never claims an observation it did not make. Only the existing
+   * authenticated OneBot connection is used, through the narrow typed `getGroupInfo` read
+   * path: no raw RPC and no second QQ client.
+   *
+   * `botMembership` is `true` only on a typed success for the exact group: a provider that
+   * answered about this group is proof the bot is in it. Every failure stays `null`, including
+   * an explicit rejection, because this read path cannot distinguish "not a member" from a
+   * rate limit, a timeout or a transient provider error — reporting `false` for any of those
+   * would be an unproven claim. The field is typed `boolean | null` so a future unambiguous
+   * not-a-member signal can use `false` without changing the shape.
+   */
+  private async observeGroup(
+    connection: OneBotAdapter | undefined,
+    groupId: string,
+  ): Promise<{ name: string | null; reachable: boolean | null; botMembership: boolean | null }> {
+    if (!connection) return { name: null, reachable: null, botMembership: null };
+    try {
+      const result = await connection.getGroupInfo({ groupId });
+      if (result.status !== "ok") return { name: null, reachable: null, botMembership: null };
+      return { name: result.name, reachable: true, botMembership: true };
+    } catch {
+      return { name: null, reachable: null, botMembership: null };
+    }
+  }
+
+  /**
+   * The current Principal's managed-group inventory.
+   *
+   * Durable policy truth — categories, memory sources, the Skill whitelist and its version,
+   * and the Principal's own access — always appears. Only the live provider observation of a
+   * group's name, reachability and Bot membership can be missing, and a provider failure for
+   * one group never erases the rest of the inventory or fails the whole projection.
+   *
+   * Live metadata is read only after the current `group:read` decision for this Principal and
+   * group is ALLOW, so a protected group fact is re-authorized before any provider call and a
+   * denied group never causes one.
+   */
+  private async projectManagedGroups(context: ProtectedToolContext): Promise<unknown> {
+    const connection = this.connections.get(context.caller.scope.connectionId);
+    const facts = await this.managedGroupFacts(context);
+    const groups = [];
+    for (const fact of facts) {
+      const observation = fact.groupRead
+        ? await this.observeGroup(connection, fact.groupId)
+        : { name: null, reachable: null, botMembership: null };
+      groups.push({
+        groupId: fact.groupId,
+        name: observation.name,
+        reachable: observation.reachable,
+        botMembership: observation.botMembership,
+        access: {
+          // The inventory *is* this Principal's own assignment — that is what
+          // `resolveAssignedGroupIds` selected — so the entry states it explicitly rather
+          // than leaving the reader to infer it from presence. It is never derived from Bot
+          // membership or from another Owner's assignment.
+          assigned: true,
+          grantedCategories: fact.grantedCategories,
+          historyRead: fact.historyRead,
+        },
+        categories: fact.policy.categories,
+        memorySources: fact.policy.memorySources,
+        skills: fact.skills,
+        version: fact.version,
+      });
+    }
+    return { connectionId: context.caller.scope.connectionId, groups };
+  }
+
+  /**
+   * The capability search the Owner-private `qq_capability_search` Tool runs.
+   *
+   * The candidate set is the allowlisted Glassbox registry — never raw NapCat actions — and
+   * every entry must clear four independent gates before it can appear: Tool discovery for
+   * this Run, the capability's own protected Action on its Resource, the Owner's durable
+   * policy, and the Principal's live authorization decision. A disabled category, a revoked
+   * grant, another Owner's group and a server-only or deferred action all contribute nothing,
+   * and matching runs only over what survived, so a query can never reveal a capability the
+   * caller lacks.
+   */
+  private async searchCapabilities(
+    context: ProtectedToolContext,
+    input: { query: string | undefined; groupIds: readonly string[] | undefined },
+  ): Promise<unknown> {
+    const caller = context.caller;
+    const facts = await this.managedGroupFacts(context);
+    const requested = input.groupIds ? new Set(input.groupIds) : undefined;
+    // A requested filter narrows the caller's own assignment; it never widens it.
+    const considered = requested ? facts.filter((fact) => requested.has(fact.groupId)) : facts;
+
+    const entries: CapabilitySearchEntry[] = [];
+    for (const capability of QQ_CAPABILITIES) {
+      // Discovery is re-checked per Run rather than trusted from the Tool surface.
+      const discovery = await this.store.authorization.check({
+        caller,
+        resourceId: toolResourceId(capability.tool),
+        action: TOOL_DISCOVERY_ACTION,
+        conversationId: context.conversationId,
+        runId: context.runId,
+      });
+      if (discovery.decision !== "ALLOW") continue;
+
+      if (capability.resource === "account") {
+        const decision = await this.store.authorization.check({
+          caller,
+          resourceId: agentResourceId(AGENT_ID),
+          action: capability.action,
+          conversationId: context.conversationId,
+          runId: context.runId,
+        });
+        if (decision.decision !== "ALLOW") continue;
+        entries.push({
+          tool: capability.tool,
+          description: capability.description,
+          category: capability.category,
+          readOnly: capability.risk === "read",
+          // An Agent-scoped entry is not group-bound, so it carries no group association.
+          groupIds: [],
+        });
+        continue;
+      }
+
+      // A group-scoped entry is usable only where the Owner's policy enables its category
+      // *and* this Principal holds that category's live grant.
+      const usableIn = considered.filter(
+        (fact) =>
+          isCategoryEnabled(fact.policy, capability.category) &&
+          fact.grantedCategories.includes(capability.category),
+      );
+      if (usableIn.length === 0) continue;
+      entries.push({
+        tool: capability.tool,
+        description: capability.description,
+        category: capability.category,
+        readOnly: capability.risk === "read",
+        groupIds: usableIn.map((fact) => fact.groupId),
+      });
+    }
+
+    return {
+      query: input.query ?? null,
+      groups: considered.map((fact) => fact.groupId),
+      capabilities: matchCapabilityEntries(entries, input.query),
     };
   }
 
@@ -830,11 +1969,7 @@ export class ManagementApplication {
   ): Promise<unknown> {
     return this.serialize(async () => {
       const caller = context.caller;
-      const isOwner = await this.store.identities.isOwner(caller.principalId);
-      if (!isOwner || caller.scope.chatType !== "private")
-        throw new Error("owner_private_required");
-      const configured = this.channels.resolve(caller.scope.connectionId);
-      if (!configured.config.groupIds.includes(input.groupId)) throw new Error("group_not_enabled");
+      await this.requireManagedGroup(context, input.groupId);
       const availableSkills = this.kitLoader.availableSkills().map((skill) => skill.name);
       const profile = await this.groupRuntime.setSkillEnabled({
         connectionId: caller.scope.connectionId,
