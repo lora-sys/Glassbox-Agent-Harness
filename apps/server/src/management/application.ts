@@ -79,6 +79,11 @@ import {
   matchCapabilityEntries,
   type CapabilitySearchEntry,
 } from "../channels/onebot/capability-search.js";
+import {
+  probeReadCapabilities,
+  type CapabilityProbeObservation,
+  type CapabilityProbeReport,
+} from "../channels/onebot/capability-probe.js";
 import { ChannelArchiveStore } from "../retrieval/channel-archive.js";
 import { groupResourceId, resolveAssignedGroupIds } from "../retrieval/source-resolver.js";
 import { AuthorizedOpsService, type WorkerPolicy } from "../ops/service.js";
@@ -100,6 +105,14 @@ import { createQqDeliveryPolicy, hostDeliveryForbiddenValues } from "../delivery
 
 const OWNER_ID = "owner";
 const AGENT_ID = "personal";
+/**
+ * The Conversation and Run a management-initiated capability probe records its decisions under.
+ *
+ * A probe is not a Run, and reusing a Run's identity would make authorization evidence claim a
+ * context that never existed. This names what it is, so a reader of the decision can tell a
+ * management probe from an Agent execution.
+ */
+const MANAGEMENT_PROBE_CONTEXT = "management:capability-probe";
 const ACTIONS = [
   "run:create",
   "run:control",
@@ -1911,6 +1924,60 @@ export class ManagementApplication {
   }
 
   /**
+   * The read-only QQ acceptance: really calling each provider-backed read path once.
+   *
+   * A capability that is registered, allowlisted and covered by deterministic tests is still
+   * not known to work against the bridge in front of it, and a Run must not report the first
+   * as the second. This is the fresh, time-stamped observation that answers the difference.
+   *
+   * Two things keep it honest. The provider call goes through `invokeCapability` — the same
+   * allowlisted outbound path a capability Tool uses, including the group binding — so the
+   * acceptance can only prove calls Glassbox would really make. And each observation is
+   * appended to the Trace as it is made, so the evidence survives the probe failing partway
+   * rather than depending on the caller reporting back.
+   *
+   * The provider's raw result is classified here rather than thrown through
+   * `requireProviderSuccess`: an acceptance has to record *which* way a call failed, and a
+   * thrown failure would collapse every one of them into the same opaque code.
+   *
+   * The one provider-free path (`qq_groups`' managed listing) is probed too, because the
+   * issue asks for it — under a management context, since this probe is not a Run and must not
+   * borrow a Run's identity. Its success is recorded with `providerBacked: false` and never
+   * counted as provider health.
+   */
+  async probeCapabilities(channelId: string, groupId: string): Promise<CapabilityProbeReport> {
+    const configured = this.channels.resolve(channelId);
+    // The target is the dedicated acceptance group the operator named, and it must be one this
+    // Channel is configured for. A group Glassbox does not manage is refused here rather than
+    // discovered by the provider.
+    if (!configured.config.groupIds.includes(groupId))
+      throw new ManagementError("INVALID_REQUEST", "The group is not configured for this channel");
+    const connection = this.connections.get(channelId);
+    if (!connection) throw new ManagementError("NOT_FOUND", "The channel is not connected", 404);
+
+    const owner = this.ownerPrivateScopes(configured)[0];
+    if (!owner) throw new ManagementError("INVALID_REQUEST", "The channel has no owner");
+    const context: ProtectedToolContext = {
+      caller: { principalId: owner.principalId, scope: owner.scope },
+      conversationId: MANAGEMENT_PROBE_CONTEXT,
+      runId: MANAGEMENT_PROBE_CONTEXT,
+    };
+
+    return probeReadCapabilities({
+      groupId,
+      invoke: (input) => connection.invokeCapability(input),
+      projectManagedGroups: () => this.projectManagedGroups(context),
+      record: async (observation: CapabilityProbeObservation) => {
+        await this.store.tasks.recordTrace({
+          type: "capability.probed",
+          principalId: owner.principalId,
+          data: { connectionId: channelId, ...observation },
+        });
+      },
+    });
+  }
+
+  /**
    * The capability search the Owner-private `qq_capability_search` Tool runs.
    *
    * The candidate set is the allowlisted Glassbox registry — never raw NapCat actions — and
@@ -2129,6 +2196,15 @@ export class ManagementApplication {
               ? await this.connectChannel(channelAction[1]!)
               : await this.disconnectChannel(channelAction[1]!),
         });
+      if (request.method === "POST" && path === "/manage/capabilities/probe") {
+        const input = await readManagementJson(request);
+        const value = (input ?? {}) as Record<string, unknown>;
+        if (typeof value.channelId !== "string" || typeof value.groupId !== "string")
+          throw new ManagementError("INVALID_REQUEST", "A channel and a group are required");
+        return ok({
+          probe: await this.probeCapabilities(value.channelId, value.groupId),
+        });
+      }
       if (request.method === "GET" && path === "/manage/conversations")
         return ok(await this.store.management.listConversations(OWNER_ID, options));
       if (request.method === "GET" && path === "/manage/runs") {

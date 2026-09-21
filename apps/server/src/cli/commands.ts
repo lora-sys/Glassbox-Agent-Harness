@@ -39,6 +39,8 @@ export const CLI_HELP = `Glassbox 本机管理
   channels save               从标准输入读取并保存渠道 JSON
   channels connect <id>       连接指定渠道，并保存重启后自动连接的设置
   channels disconnect <id>    断开指定渠道，并关闭自动连接
+  capabilities probe <渠道> <群号>
+                              真实调用该群的只读 QQ 能力并记录结果，不会修改群
   conversations list         列出持久会话，可用 --cursor 翻页
   runs list                   列出任务，可用 --cursor 翻页
   runs show <id>               查看任务
@@ -73,9 +75,13 @@ runs retry <id> 保留兼容入口，当前服务尚未接通重试。
 成功提交取消或 Eval 请求不代表底层执行已经结束，以返回状态为准。
 `;
 
-function identifier(value: string | undefined, kind: "run" | "channel"): string {
+function identifier(value: string | undefined, kind: "run" | "channel" | "group"): string {
   const pattern =
-    kind === "channel" ? /^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$/u : /^[A-Za-z0-9][A-Za-z0-9-]{0,159}$/u;
+    kind === "channel"
+      ? /^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$/u
+      : kind === "group"
+        ? /^[1-9]\d{0,15}$/u
+        : /^[A-Za-z0-9][A-Za-z0-9-]{0,159}$/u;
   if (!value || !pattern.test(value)) throw new CliError("INVALID_ARGUMENTS");
   return value;
 }
@@ -225,6 +231,19 @@ export function parseCommand(args: readonly string[]): ParsedCommand {
         ...(values["clear-api-key"] ? { apiKey: null } : {}),
       };
       return request("POST", "/manage/models", body, values["api-key-stdin"] ? "api-key" : "none");
+    }
+    if (
+      positionals[0] === "capabilities" &&
+      positionals[1] === "probe" &&
+      positionals.length === 4
+    ) {
+      only();
+      return request("POST", "/manage/capabilities/probe", {
+        channelId: identifier(positionals[2], "channel"),
+        // The dedicated acceptance group, named explicitly. There is no default: a probe that
+        // picked a group for the operator could call one that was never meant to be touched.
+        groupId: identifier(positionals[3], "group"),
+      });
     }
     if (
       positionals.length === 3 &&
