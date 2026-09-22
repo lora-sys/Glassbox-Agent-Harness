@@ -32,6 +32,16 @@ it("checks the actual Pi version and rejects runtime paths outside the isolated 
   expect(() => loader.resolveAgentDir(profile, directory)).toThrow("escapes isolated root");
 });
 
+it("lists every Kit profile so profile-selection drift fails before a Run", async () => {
+  const { directory, loader } = await fixture();
+  await writeFile(
+    join(directory, "profiles/brand-new.json"),
+    JSON.stringify({ name: "brand-new" }),
+  );
+
+  expect(loader.profileNames()).toEqual(["brand-new", "main-agent", "qq-group", "test"]);
+});
+
 it("records selected resource fingerprints and rejects a modified locked Skill", async () => {
   const { directory, loader } = await fixture();
   const profilePath = join(directory, "profiles/test.json");

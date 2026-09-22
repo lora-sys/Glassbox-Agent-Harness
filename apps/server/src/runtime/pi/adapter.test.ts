@@ -15,6 +15,22 @@ afterEach(async () => {
     await rm(directory, { recursive: true, force: true });
 });
 
+it("fails initialization when the Kit adds a profile without a selection decision", async () => {
+  const kitPath = fileURLToPath(new URL("./fixtures/lora-pi-kit", import.meta.url));
+  const directory = await mkdtemp(join(tmpdir(), "glassbox-kit-profile-drift-"));
+  directories.push(directory);
+  const { cp, mkdir, writeFile } = await import("node:fs/promises");
+  await cp(kitPath, directory, { recursive: true });
+  await mkdir(join(directory, "profiles"), { recursive: true });
+  await writeFile(
+    join(directory, "profiles/brand-new.json"),
+    JSON.stringify({ name: "brand-new" }),
+  );
+
+  const adapter = new PiSdkRuntimeAdapter({ kitPath: directory });
+  await expect(adapter.initialize()).rejects.toThrow(/brand-new/u);
+});
+
 const conversation: Conversation = {
   id: "conversation-1",
   agentId: "personal",

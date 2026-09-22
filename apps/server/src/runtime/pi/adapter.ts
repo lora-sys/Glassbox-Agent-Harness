@@ -17,6 +17,7 @@ import { KitLoader, type ResolvedKitProfile } from "./kit-loader.js";
 import { requiredInputClause } from "./protected-tools.js";
 import {
   GLASSBOX_HOST_EXCLUDED_PI_TOOLS,
+  assertProfileSelectionComplete,
   describeToolSurface,
   toolOutcomeFromFailure,
 } from "./tool-plane.js";
@@ -286,6 +287,7 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
     if (!compatibility.compatible) {
       throw new Error(`Incompatible Lora PI Kit: ${JSON.stringify(compatibility.details)}`);
     }
+    assertProfileSelectionComplete(this.loader.profileNames());
     this.initialized = true;
   }
 
