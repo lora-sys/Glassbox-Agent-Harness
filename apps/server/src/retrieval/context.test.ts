@@ -64,6 +64,18 @@ describe("P4B bounded Context selection", () => {
     expect(bounded.items[0]?.snippet.endsWith("…")).toBe(true);
   });
 
+  it("keeps a requested exact term inside the model-visible snippet", () => {
+    const identifier = "P4B-A-1349";
+    const text = `${"prefix ".repeat(60)}${identifier} after the identifier`;
+    const bounded = selectBoundedContext([result("a", "100", text)], {
+      snippetChars: 40,
+      preserveTerms: [identifier],
+    });
+
+    expect(bounded.items[0]?.snippet).toContain(identifier);
+    expect(bounded.items[0]?.snippet.length).toBeLessThanOrEqual(42); // 40 chars + edge ellipses
+  });
+
   it("keeps every item a single-source search asked for instead of starving it", () => {
     const results = Array.from({ length: 8 }, (_, index) =>
       result(`m${index}`, "100", `message ${index}`),

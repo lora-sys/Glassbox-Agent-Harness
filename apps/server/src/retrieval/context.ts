@@ -32,6 +32,8 @@ export interface BoundedContextOptions {
   snippetChars?: number;
   /** Ids already shown to the model; suppressed from the selected Context. */
   alreadySurfaced?: readonly string[];
+  /** Exact terms that must remain in the model-visible snippet when possible. */
+  preserveTerms?: readonly string[];
 }
 
 export interface BoundedContextItem {
@@ -124,6 +126,24 @@ function itemMatchedTerms(item: SearchResultItem<unknown>): string[] {
   return Array.isArray(item.matched_terms) ? [...item.matched_terms] : [];
 }
 
+function boundedSnippet(
+  text: string,
+  snippetChars: number,
+  preserveTerms: readonly string[],
+): string {
+  if (text.length <= snippetChars) return text;
+  const term = preserveTerms.find((candidate) => {
+    const index = text.toLocaleLowerCase().indexOf(candidate.toLocaleLowerCase());
+    return index >= 0 && candidate.length <= snippetChars;
+  });
+  if (term === undefined) return `${text.slice(0, snippetChars)}…`;
+  const index = text.toLocaleLowerCase().indexOf(term.toLocaleLowerCase());
+  const before = Math.min(index, Math.floor((snippetChars - term.length) / 2));
+  const start = Math.max(0, Math.min(index - before, text.length - snippetChars));
+  const body = text.slice(start, start + snippetChars);
+  return `${start > 0 ? "…" : ""}${body}${start + snippetChars < text.length ? "…" : ""}`;
+}
+
 /**
  * Bounds an already-authorized result set for model-visible Context.
  *
@@ -144,6 +164,7 @@ export function selectBoundedContext(
     options.perSourceCap === undefined ? DEFAULT_PER_SOURCE_CAP : options.perSourceCap;
   const snippetChars = options.snippetChars ?? DEFAULT_SNIPPET_CHARS;
   const surfaced = new Set(options.alreadySurfaced ?? []);
+  const preserveTerms = options.preserveTerms ?? [];
 
   const perSourceCounts = new Map<string, number>();
   const coverage = new Map<string, BoundedSourceCoverage>();
@@ -186,7 +207,7 @@ export function selectBoundedContext(
     }
 
     const text = result.consumable_text;
-    const snippet = text.length > snippetChars ? `${text.slice(0, snippetChars)}…` : text;
+    const snippet = boundedSnippet(text, snippetChars, preserveTerms);
 
     items.push({
       id,

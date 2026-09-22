@@ -1499,6 +1499,34 @@ it("answers an exact identifier from the message that carries it and nothing els
   }
 });
 
+it("keeps an exact identifier in the model-visible text even when it appears after the snippet head", async () => {
+  const { store, archive } = await fixture();
+  try {
+    const prefix = "前置信息".repeat(80);
+    await archive.ingest({
+      channel: "qq",
+      connectionId,
+      groupId: "100",
+      externalMessageId: "g100-late-exact",
+      senderId: "member-e",
+      senderName: "Carrier",
+      normalizedText: `${prefix} ${EXACT_IDENTIFIER} 到这里才出现`,
+      occurredAt: "2026-09-18T09:00:00Z",
+    });
+    const tools = await groupRunTools(store, archive);
+    const { text } = await callModelVisible(toolByName(tools, GROUP_HISTORY_SEARCH_TOOL), {
+      query: EXACT_IDENTIFIER,
+    });
+    const view = JSON.parse(text) as { results: Array<{ text: string }> };
+
+    expect(view.results).toHaveLength(1);
+    expect(view.results[0]?.text).toContain(EXACT_IDENTIFIER);
+    expect(view.results[0]?.text.length).toBeLessThanOrEqual(242);
+  } finally {
+    await store.close();
+  }
+});
+
 it("never lets a near miss stand in for an identifier the history does not contain", async () => {
   const { store, archive } = await fixture();
   try {

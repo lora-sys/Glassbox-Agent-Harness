@@ -705,6 +705,7 @@ export function createHistoryTools(options: {
     const bounded = selectBoundedContext(results, {
       topK: params.limit,
       perSourceCap: searched.length > 1 ? CROSS_GROUP_PER_SOURCE_CAP : null,
+      preserveTerms: retrieval.coverage.exactTerms,
     });
     // Bounding drops items, so the sender is joined back by record id rather than by position.
     const senders = new Map(
