@@ -506,7 +506,11 @@ member or unknown → qq_group_member
 The observation belongs to the exact Run scope. It is not stored as a Principal role or as a
 Glassbox-maintained administrator membership. A queued Run may retain the observation as evidence
 across restart, but every native-role mutation re-reads the current role with
-`get_group_member_info` and `no_cache=true` before the provider mutation.
+`get_group_member_info` and `no_cache=true` before the provider mutation. If NapCat explicitly
+rejects that profile-detail call because its packet support does not match the installed QQ build,
+the adapter may fall back to a current `get_group_member_list` read. The fallback must require one
+exact group and sender match, keep only the normalized role, and fail closed on empty, duplicate,
+mismatched, or malformed records.
 
 The first bounded surface is:
 

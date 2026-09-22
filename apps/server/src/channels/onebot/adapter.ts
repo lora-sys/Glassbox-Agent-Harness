@@ -352,16 +352,42 @@ export class OneBotAdapter {
       user_id: Number(userId),
       no_cache: true,
     });
-    if (result.status !== "ok") return toReadFailure(result);
-    const data = object(result.data);
-    if (
-      !data ||
-      qqId(data.group_id) !== groupId ||
-      qqId(data.user_id) !== userId ||
-      (data.role !== "owner" && data.role !== "admin" && data.role !== "member")
-    )
+    if (result.status === "ok") {
+      const data = object(result.data);
+      if (
+        !data ||
+        qqId(data.group_id) !== groupId ||
+        qqId(data.user_id) !== userId ||
+        (data.role !== "owner" && data.role !== "admin" && data.role !== "member")
+      )
+        return { status: "unknown", code: "invalid_response" };
+      return { status: "ok", groupId, userId, role: normalizeQqNativeGroupRole(data.role) };
+    }
+
+    const primaryFailure = toReadFailure(result);
+    if (primaryFailure.status !== "failed" || primaryFailure.code !== "api_rejected")
+      return primaryFailure;
+
+    // NapCat can reject get_group_member_info when its profile-detail packet implementation
+    // does not match the installed QQ build. Its group-member-list path is independent and
+    // still reports the QQ-native role. Keep this fallback inside the adapter, require one
+    // exact group/user match, and discard every other profile field.
+    const fallback = await this.#request(socket, "get_group_member_list", {
+      group_id: Number(groupId),
+    });
+    if (fallback.status !== "ok") return toReadFailure(fallback);
+    if (!Array.isArray(fallback.data)) return { status: "unknown", code: "invalid_response" };
+    const matches = fallback.data.filter((entry) => {
+      const member = object(entry);
+      return (
+        member !== undefined && qqId(member.group_id) === groupId && qqId(member.user_id) === userId
+      );
+    });
+    if (matches.length !== 1) return { status: "unknown", code: "invalid_response" };
+    const member = object(matches[0]);
+    if (!member || (member.role !== "owner" && member.role !== "admin" && member.role !== "member"))
       return { status: "unknown", code: "invalid_response" };
-    return { status: "ok", groupId, userId, role: normalizeQqNativeGroupRole(data.role) };
+    return { status: "ok", groupId, userId, role: normalizeQqNativeGroupRole(member.role) };
   }
 
   /**

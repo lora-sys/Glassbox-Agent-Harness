@@ -505,6 +505,97 @@ describe("OneBot forward WebSocket", () => {
     ).resolves.toEqual({ status: "failed", code: "invalid_group" });
     expect(fake.history.filter((item) => item.action === "get_group_member_info")).toHaveLength(1);
   });
+  it("falls back to one exact member-list role when NapCat rejects profile detail", async () => {
+    const fake = await server({
+      onAction(action, socket) {
+        if (action.action === "get_group_member_info") {
+          socket.send(
+            JSON.stringify({
+              status: "failed",
+              retcode: 1200,
+              data: null,
+              message: "provider detail failure must not leave the adapter",
+              echo: action.echo,
+            }),
+          );
+          return true;
+        }
+        if (action.action !== "get_group_member_list") return false;
+        socket.send(
+          JSON.stringify({
+            status: "ok",
+            retcode: 0,
+            data: [
+              {
+                group_id: 10003,
+                user_id: 10098,
+                role: "owner",
+                nickname: "unrelated profile",
+              },
+              {
+                group_id: 10003,
+                user_id: 10099,
+                role: "admin",
+                nickname: "must not leave adapter",
+              },
+            ],
+            echo: action.echo,
+          }),
+        );
+        return true;
+      },
+    });
+    const { adapter } = client(fake.endpoint);
+    await adapter.start();
+    await expect(
+      adapter.getGroupMemberRole({ groupId: "10003", userId: "10099" }),
+    ).resolves.toEqual({
+      status: "ok",
+      groupId: "10003",
+      userId: "10099",
+      role: "qq_group_admin",
+    });
+    expect(
+      (await fake.actions.next((item) => item.action === "get_group_member_list")).params,
+    ).toEqual({ group_id: 10003 });
+  });
+  it("fails closed when the member-list fallback cannot prove one exact role", async () => {
+    let members: unknown[] = [];
+    const fake = await server({
+      onAction(action, socket) {
+        if (action.action === "get_group_member_info") {
+          socket.send(
+            JSON.stringify({
+              status: "failed",
+              retcode: 1200,
+              data: null,
+              echo: action.echo,
+            }),
+          );
+          return true;
+        }
+        if (action.action !== "get_group_member_list") return false;
+        socket.send(JSON.stringify({ status: "ok", retcode: 0, data: members, echo: action.echo }));
+        return true;
+      },
+    });
+    const { adapter } = client(fake.endpoint);
+    await adapter.start();
+    for (const unsafe of [
+      [],
+      [{ group_id: 10004, user_id: 10099, role: "admin" }],
+      [{ group_id: 10003, user_id: 10099, role: "moderator" }],
+      [
+        { group_id: 10003, user_id: 10099, role: "admin" },
+        { group_id: 10003, user_id: 10099, role: "member" },
+      ],
+    ]) {
+      members = unsafe;
+      await expect(
+        adapter.getGroupMemberRole({ groupId: "10003", userId: "10099" }),
+      ).resolves.toEqual({ status: "unknown", code: "invalid_response" });
+    }
+  });
   it("sends an Owner DM only through the configured private destination", async () => {
     const fake = await server();
     const { adapter } = client(fake.endpoint);
