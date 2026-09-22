@@ -10,7 +10,7 @@ import {
 } from "./config.ts";
 import { normalizeOneBotMessage, type OneBotIncomingMessage } from "./normalize.ts";
 import {
-  historySequence,
+  historyCursor,
   normalizeOneBotHistoryRecord,
   type OneBotHistoryMessage,
 } from "./history.ts";
@@ -41,8 +41,8 @@ export type OneBotHistoryResult =
       status: "ok";
       messages: OneBotHistoryMessage[];
       /**
-       * The provider sequence to pass back as `message_seq` to read the next older page.
-       * Absent when the page carried no usable sequence, which is the caller's signal that
+       * The provider short message id to pass back as `message_seq` to read the next older page.
+       * Absent when the page carried no usable cursor, which is the caller's signal that
        * paging cannot advance and the walk must stop rather than repeat this page.
        */
       nextCursor?: string;
@@ -257,30 +257,32 @@ export class OneBotAdapter {
     const result = await this.#request(socket, "get_group_msg_history", {
       group_id: Number(groupId),
       count,
-      ...(cursor !== undefined ? { message_seq: Number(cursor) } : {}),
+      ...(cursor !== undefined ? { message_seq: Number(cursor), reverse_order: true } : {}),
     });
     if (result.status !== "ok") return toReadFailure(result);
     const raw = object(result.data)?.messages;
     if (!Array.isArray(raw)) return { status: "unknown", code: "invalid_response" };
     const messages: OneBotHistoryMessage[] = [];
-    let oldestSequence: number | undefined;
+    let oldestCursor: { id: string; occurredAt: string } | undefined;
     for (const record of raw) {
-      const sequence = historySequence(record);
-      if (sequence !== undefined && (oldestSequence === undefined || sequence < oldestSequence))
-        oldestSequence = sequence;
+      const candidate = historyCursor(record);
+      if (
+        candidate !== undefined &&
+        (oldestCursor === undefined || candidate.occurredAt < oldestCursor.occurredAt)
+      )
+        oldestCursor = candidate;
       const normalized = normalizeOneBotHistoryRecord(record, groupId, this.config.botId);
       if (normalized) messages.push(normalized);
     }
     messages.sort((a, b) =>
       a.occurredAt < b.occurredAt ? 1 : a.occurredAt > b.occurredAt ? -1 : 0,
     );
-    // The oldest sequence on this page is the cursor for the next older page. Deriving it
-    // from the raw records (not the normalized messages) means an attachment-only page
-    // still advances instead of stalling the walk.
+    // The oldest record on this page is the cursor for the next older page. Deriving it from
+    // raw records means an attachment-only page still advances instead of stalling the walk.
     return {
       status: "ok",
       messages,
-      ...(oldestSequence === undefined ? {} : { nextCursor: String(oldestSequence) }),
+      ...(oldestCursor === undefined ? {} : { nextCursor: oldestCursor.id }),
     };
   }
 

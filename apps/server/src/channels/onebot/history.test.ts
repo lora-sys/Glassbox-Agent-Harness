@@ -4,7 +4,7 @@ import { WebSocketServer, type WebSocket } from "ws";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import { OneBotAdapter, type OneBotAdapterOptions } from "./adapter.ts";
 import { parseOneBotConfig } from "./config.ts";
-import { historySequence } from "./history.ts";
+import { historyCursor } from "./history.ts";
 
 const base = {
   connectionId: "napcat-test",
@@ -88,6 +88,7 @@ async function server(history: Record<string, unknown>[] = []) {
 function historyRecord(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     message_id: 501,
+    message_seq: 501,
     real_id: 501,
     time: 1_758_000_000,
     user_id: 10004,
@@ -132,6 +133,7 @@ describe("OneBot typed group history bridge", () => {
           occurredAt: new Date(1_758_000_000 * 1000).toISOString(),
         },
       ],
+      nextCursor: "501",
     });
 
     const request = fixture.actions.find((a) => a.action === "get_group_msg_history");
@@ -188,7 +190,11 @@ describe("OneBot typed group history bridge", () => {
     const result = await adapter.getGroupHistory({ groupId: "10003", cursor: "501", count: 9999 });
     expect(result.status).toBe("ok");
     const request = fixture.actions.find((a) => a.action === "get_group_msg_history");
-    expect(request?.params).toMatchObject({ group_id: 10003, message_seq: 501 });
+    expect(request?.params).toMatchObject({
+      group_id: 10003,
+      message_seq: 501,
+      reverse_order: true,
+    });
     expect(Number(request?.params.count)).toBeLessThanOrEqual(100);
   });
 
@@ -208,11 +214,11 @@ describe("OneBot typed group history bridge", () => {
     expect(result.messages.map((m) => m.messageId)).toEqual(["501"]);
   });
 
-  it("derives a nextCursor from the oldest provider sequence so a walk can page backwards", async () => {
+  it("derives nextCursor from the chronologically oldest short message id", async () => {
     const fixture = await server([
-      historyRecord({ message_id: 501, message_seq: 501 }),
-      historyRecord({ message_id: 480, message_seq: 480 }),
-      historyRecord({ message_id: 495, message_seq: 495 }),
+      historyRecord({ message_id: 901, message_seq: 901, real_seq: 501, time: 1_758_000_003 }),
+      historyRecord({ message_id: 777, message_seq: 777, real_seq: 480, time: 1_758_000_001 }),
+      historyRecord({ message_id: 103, message_seq: 103, real_seq: 495, time: 1_758_000_002 }),
     ]);
     const adapter = client(fixture.endpoint);
     await adapter.start();
@@ -220,31 +226,45 @@ describe("OneBot typed group history bridge", () => {
     const result = await adapter.getGroupHistory({ groupId: "10003", count: 100 });
     expect(result.status).toBe("ok");
     if (result.status !== "ok") return;
-    // The oldest sequence on the page is what reads the next older page.
-    expect(result.nextCursor).toBe("480");
+    // Short message ids are not ordered. The oldest timestamp selects id 777 even though
+    // id 103 is numerically smaller and real_seq carries a different QQ sequence.
+    expect(result.nextCursor).toBe("777");
 
-    const next = await adapter.getGroupHistory({ groupId: "10003", cursor: "480" });
+    const next = await adapter.getGroupHistory({ groupId: "10003", cursor: "777" });
     expect(next.status).toBe("ok");
     const requests = fixture.actions.filter((a) => a.action === "get_group_msg_history");
-    expect(requests.at(-1)?.params).toMatchObject({ group_id: 10003, message_seq: 480 });
+    expect(requests.at(-1)?.params).toMatchObject({
+      group_id: 10003,
+      message_seq: 777,
+      reverse_order: true,
+    });
   });
 
   it("omits nextCursor when the page carries no provider sequence", async () => {
-    const fixture = await server([historyRecord()]);
+    const fixture = await server([historyRecord({ message_seq: undefined })]);
     const adapter = client(fixture.endpoint);
     await adapter.start();
 
     const result = await adapter.getGroupHistory({ groupId: "10003" });
     expect(result.status).toBe("ok");
     if (result.status !== "ok") return;
-    // No sequence means paging cannot advance; the caller must stop rather than repeat.
+    // Without the provider sequence Glassbox cannot prove the short id is a usable history
+    // cursor, so paging stops rather than guessing from the message id alone.
     expect(result.nextCursor).toBeUndefined();
   });
 
   it("advances the cursor from raw records even when a page normalizes to no text", async () => {
     const fixture = await server([
-      historyRecord({ message_id: 502, message_seq: 502, message: [{ type: "image", data: {} }] }),
-      historyRecord({ message_id: 480, message_seq: 480, message: [{ type: "image", data: {} }] }),
+      historyRecord({
+        message_id: 502,
+        time: 1_758_000_002,
+        message: [{ type: "image", data: {} }],
+      }),
+      historyRecord({
+        message_id: 480,
+        time: 1_758_000_001,
+        message: [{ type: "image", data: {} }],
+      }),
     ]);
     const adapter = client(fixture.endpoint);
     await adapter.start();
@@ -295,19 +315,36 @@ describe("OneBot typed group history bridge", () => {
   });
 });
 
-describe("OneBot history paging sequence", () => {
-  it("reads the provider sequence, tolerating a string encoding", () => {
-    expect(historySequence({ message_seq: 501 })).toBe(501);
-    expect(historySequence({ real_seq: "480" })).toBe(480);
-    expect(historySequence({ message_seq: 495, real_seq: 480 })).toBe(495);
+describe("OneBot history paging cursor", () => {
+  it("reads a short message id paired with the provider timestamp", () => {
+    const occurredAt = new Date(1_758_000_000 * 1000).toISOString();
+    expect(historyCursor({ message_id: 501, message_seq: 501, time: 1_758_000_000 })).toEqual({
+      id: "501",
+      occurredAt,
+    });
+    expect(historyCursor({ message_seq: "480", time: 1_758_000_000 })).toEqual({
+      id: "480",
+      occurredAt,
+    });
+    expect(
+      historyCursor({ message_id: 495, message_seq: 111, real_seq: 480, time: 1_758_000_000 }),
+    ).toEqual({ id: "495", occurredAt });
   });
 
-  it("refuses a missing, non-positive or unsafe sequence", () => {
-    expect(historySequence({})).toBeUndefined();
-    expect(historySequence({ message_seq: 0 })).toBeUndefined();
-    expect(historySequence({ message_seq: -1 })).toBeUndefined();
-    expect(historySequence({ message_seq: 1.5 })).toBeUndefined();
-    expect(historySequence({ message_seq: "abc" })).toBeUndefined();
-    expect(historySequence(null)).toBeUndefined();
+  it("refuses a cursor with a missing or invalid id or timestamp", () => {
+    expect(historyCursor({})).toBeUndefined();
+    expect(historyCursor({ message_id: 0, message_seq: 0, time: 1_758_000_000 })).toBeUndefined();
+    expect(historyCursor({ message_id: -1, message_seq: -1, time: 1_758_000_000 })).toEqual({
+      id: "-1",
+      occurredAt: new Date(1_758_000_000 * 1000).toISOString(),
+    });
+    expect(
+      historyCursor({ message_id: 1.5, message_seq: 1.5, time: 1_758_000_000 }),
+    ).toBeUndefined();
+    expect(
+      historyCursor({ message_id: "abc", message_seq: "abc", time: 1_758_000_000 }),
+    ).toBeUndefined();
+    expect(historyCursor({ message_id: 501, message_seq: 501 })).toBeUndefined();
+    expect(historyCursor(null)).toBeUndefined();
   });
 });

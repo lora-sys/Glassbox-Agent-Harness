@@ -1477,6 +1477,7 @@ it("answers an exact identifier from the message that carries it and nothing els
     const view = JSON.parse(text) as {
       results: Array<{ sender?: string; occurredAt?: string; text: string; groupId: string }>;
       resultStatus: string;
+      guidance: string;
       coverage: { exactTerms: string[]; droppedByExactTerm: number; coverage: string };
     };
 
@@ -1494,6 +1495,8 @@ it("answers an exact identifier from the message that carries it and nothing els
     expect(view.coverage.exactTerms).toEqual([EXACT_IDENTIFIER.toLowerCase()]);
     expect(view.coverage.droppedByExactTerm).toBe(2);
     expect(view.coverage.coverage).toBe("complete");
+    expect(view.guidance).toContain("only the fields the user requested");
+    expect(view.guidance).toContain("do not narrate Tool names");
   } finally {
     await store.close();
   }

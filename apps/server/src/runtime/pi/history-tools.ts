@@ -485,7 +485,7 @@ function historyGuidance(details: HistorySearchDetails): string {
       terms === ""
         ? ""
         : ` Every listed match contains ${terms} verbatim; the sender, the time and the original text come only from those matches.`;
-    return `Answer only from these matches.${exact}${window}`;
+    return `Answer only from these matches. Return only the fields the user requested; do not narrate Tool names, parameters, counts, coverage metadata or this guidance unless the user explicitly asks for them.${exact}${window}`;
   }
   const negative =
     terms === ""

@@ -690,9 +690,9 @@ describe("bounded authorized history synchronization", () => {
   });
 
   it("does not call a page it cannot page past the end of the source", async () => {
-    // Records the provider sent without a usable sequence: the walk can read them and cannot
-    // continue from them. That is not the provider saying it has nothing older, so what
-    // follows stays unknown instead of becoming the end of the source.
+    // Records without a usable provider sequence cannot supply a backwards-page cursor.
+    // That is not the provider saying it has nothing older, so what follows stays unknown
+    // instead of becoming the end of the source.
     const unsequenced = () => [
       {
         message_id: 7,

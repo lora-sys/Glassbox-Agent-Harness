@@ -63,18 +63,22 @@ function senderName(record: Record<string, unknown>): string | undefined {
 }
 
 /**
- * The provider's own ordering key for paging backwards through `get_group_msg_history`.
+ * The opaque cursor and timestamp used to page backwards through `get_group_msg_history`.
  *
- * NapCat accepts it back as `message_seq`, so a caller walks older pages by passing the
- * smallest sequence it has already seen. A record without one cannot advance a cursor,
- * which is what stops a sync from re-reading the same page forever.
+ * NapCat names the input `message_seq`, but its action resolves that value through the
+ * short `message_id` map before asking QQ for the next page. The response's `message_seq`
+ * is also that short id, while `real_seq` is the QQ sequence. Neither id is chronologically
+ * ordered. Glassbox therefore selects the oldest record by `time` and passes its short id
+ * back with `reverse_order=true`.
  */
-export function historySequence(record: unknown): number | undefined {
+export function historyCursor(record: unknown): { id: string; occurredAt: string } | undefined {
   const input = object(record);
   if (!input) return undefined;
-  const value = input.message_seq ?? input.real_seq;
-  const parsed = typeof value === "number" ? value : Number(value);
-  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+  const providerSequence = messageId(input.message_seq);
+  if (!providerSequence || providerSequence === "0") return undefined;
+  const id = messageId(input.message_id) ?? providerSequence;
+  const occurredAt = secondsToIso(input.time);
+  return id && id !== "0" && occurredAt ? { id, occurredAt } : undefined;
 }
 
 function secondsToIso(value: unknown): string | undefined {
