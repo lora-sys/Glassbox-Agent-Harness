@@ -111,6 +111,8 @@ export class AuthorizedQQSourceReader implements AuthorizedQqSourceReader {
       sourceClass: input.sourceClass,
       text: record.normalizedText,
       occurredAt: record.occurredAt,
+      externalMessageId: record.externalMessageId,
+      senderId: record.senderId,
       returnMode: "raw" as const,
     }));
   }

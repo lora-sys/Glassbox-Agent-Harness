@@ -85,6 +85,10 @@ export interface HistorySearchItem extends BoundedContextItem {
    */
   senderId?: string;
   senderName?: string;
+  /** Whether the archived message mentioned the Bot serving this connection. */
+  mentionedMe?: boolean;
+  /** Model-safe text with a structured mention of this connection's Bot rendered generically. */
+  modelText?: string;
 }
 
 export interface HistorySearchDetails {
@@ -94,6 +98,8 @@ export interface HistorySearchDetails {
   sourceKind: "channel_message";
   retrievalMode: "lexical";
   runId: string;
+  /** The Bot Channel identity for this connection, used only in the model-safe projection. */
+  currentBotId?: string;
   items: HistorySearchItem[];
   considered: number;
   truncated: boolean;
@@ -140,6 +146,8 @@ export interface HistoryRetrievalEvidence {
 export interface HistorySearchResultView {
   /** The authorized groups actually searched. */
   groups: string[];
+  /** Stable identity mapping for normalized @current_bot mentions in result text. */
+  currentBot?: { id: string; mentionLabel: "@current_bot" };
   query: string;
   results: Array<{
     rank: number;
@@ -147,11 +155,13 @@ export interface HistorySearchResultView {
     /** The sender's Channel identity, when the item's content was disclosed. */
     sender?: string;
     senderName?: string;
+    mentionedMe?: boolean;
     occurredAt?: string;
     text: string;
     matchedTerms: string[];
   }>;
   considered: number;
+  returned: number;
   truncated: boolean;
   resultStatus: "matches_found" | "no_matches_in_searched_window";
   guidance: string;
@@ -160,23 +170,30 @@ export interface HistorySearchResultView {
 export function projectHistorySearch(details: HistorySearchDetails): HistorySearchResultView {
   return {
     groups: details.groups,
+    ...(details.currentBotId
+      ? { currentBot: { id: details.currentBotId, mentionLabel: "@current_bot" as const } }
+      : {}),
     query: details.query,
     results: details.items.map((item) => ({
       rank: item.rank,
       groupId: item.groupId,
       ...(item.senderId === undefined ? {} : { sender: item.senderId }),
       ...(item.senderName === undefined ? {} : { senderName: item.senderName }),
+      ...(item.mentionedMe === undefined ? {} : { mentionedMe: item.mentionedMe }),
       ...(item.occurredAt === undefined ? {} : { occurredAt: item.occurredAt }),
-      text: item.snippet,
+      text: item.modelText ?? item.snippet,
       matchedTerms: item.matchedTerms,
     })),
     considered: details.considered,
+    returned: details.items.length,
     truncated: details.truncated,
     resultStatus: details.resultStatus,
     guidance:
-      details.resultStatus === "matches_found"
-        ? "Answer only from these matches."
-        : "No match was found in the searched window. This does not prove the event never happened.",
+      details.resultStatus === "matches_found" && details.truncated
+        ? "Partial results only. Do not claim a complete list, total count, earliest or latest message, or infer omitted messages. Say the result is incomplete and run a narrower or higher-limit search before answering a completeness question."
+        : details.resultStatus === "matches_found"
+          ? "Answer only from these matches. Do not infer messages that are not present."
+          : "No match was found in the searched window. This does not prove the event never happened.",
   };
 }
 
@@ -318,24 +335,31 @@ export function createHistoryTools(options: {
 
     for (const groupId of searched) await options.syncGroup?.(groupId, context);
 
-    const botId = params.mentionsMe
-      ? options.botIdForConnection?.(caller.scope.connectionId)
-      : undefined;
+    const botId = options.botIdForConnection?.(caller.scope.connectionId);
     if (params.mentionsMe && !botId) throw new ToolInputError("bot_identity_unavailable");
     const retriever = new MemoryRetriever({ store: options.archive });
+    // Ask for one extra hit so the projection can truthfully report that a limit truncated the
+    // result. The retriever otherwise returns exactly `limit` items with no indication that more
+    // matched. The extra item never reaches model-visible Context.
+    const retrievalLimit = Math.min(MAX_LIMIT + 1, (params.limit ?? DEFAULT_LIMIT) + 1);
     const results = searched.length
       ? await retriever.search(params.query ?? "", {
           allowedSourceIds: searched,
-          limit: params.limit,
+          limit: retrievalLimit,
           since: params.since,
           until: params.until,
           metadataFilters: {
             ...(params.sender ? { sender: params.sender } : {}),
-            ...(botId ? { mentionedUserId: botId } : {}),
+            ...(params.mentionsMe && botId ? { mentionedUserId: botId } : {}),
           },
         })
       : [];
-    const bounded = selectBoundedContext(results, { topK: params.limit });
+    // Source diversity is useful across several groups. Inside one group it used to cap every
+    // result at three messages, even when the caller requested more.
+    const bounded = selectBoundedContext(results, {
+      topK: params.limit,
+      ...(searched.length === 1 ? { perSourceCap: params.limit } : {}),
+    });
     // Bounding drops items, so the sender is joined back by record id rather than by position.
     const senders = new Map(
       results.map((result) => [
@@ -343,11 +367,16 @@ export function createHistoryTools(options: {
         {
           id: result.memory.metadata?.senderId,
           name: result.memory.metadata?.senderName,
+          mentionTargetIds: result.memory.metadata?.mentionTargetIds,
         },
       ]),
     );
     const items: HistorySearchItem[] = bounded.items.map((item) => {
       const sender = senders.get(item.id);
+      const mentionTargetIds = Array.isArray(sender?.mentionTargetIds)
+        ? sender.mentionTargetIds.filter((value): value is string => typeof value === "string")
+        : [];
+      const mentionedMe = botId ? mentionTargetIds.includes(botId) : undefined;
       return {
         ...item,
         groupId: item.sourceId,
@@ -359,6 +388,14 @@ export function createHistoryTools(options: {
         ...(typeof sender?.name === "string" && item.returnMode !== "metadata_only"
           ? { senderName: sender.name }
           : {}),
+        ...(mentionedMe !== undefined && item.returnMode !== "metadata_only"
+          ? {
+              mentionedMe,
+              ...(mentionedMe
+                ? { modelText: item.snippet.split(`@${botId}`).join("@current_bot") }
+                : {}),
+            }
+          : {}),
       };
     });
     const details: HistorySearchDetails = {
@@ -367,6 +404,7 @@ export function createHistoryTools(options: {
       sourceKind: "channel_message",
       retrievalMode: "lexical",
       runId: context.runId,
+      ...(botId ? { currentBotId: botId } : {}),
       items,
       considered: bounded.considered,
       truncated: bounded.truncated,
@@ -403,7 +441,7 @@ export function createHistoryTools(options: {
     name: GROUP_HISTORY_SEARCH_TOOL,
     label: "搜索本群历史",
     description:
-      "Search the current QQ group's authorized history. Filters cover message text, sender QQ or group nickname, whether the sender mentioned this bot, and ISO 8601 time bounds. Use sender for who spoke and mentionsMe for who @mentioned the bot. A no_matches_in_searched_window result is not proof that an event never happened.",
+      "Search the current QQ group's authorized history. Filters cover message text, sender QQ or group nickname, whether the sender mentioned this bot, and ISO 8601 time bounds. Use sender for who spoke and mentionsMe for who @mentioned the bot. The currentBot object is the authoritative identity mapping: currentBot.mentionLabel and currentBot.id are the same Bot identity. Each result's mentionedMe field is the authoritative answer to whether that message @mentioned the current bot. In result text, @current_bot always means currentBot.id. Never describe these as different accounts. Do not infer identity from any other numeric id. For requests about all messages, omissions, totals, or the earliest or latest message, use a sufficient limit and narrow filters. When truncated is true, the result is partial and must not be described as complete. A no_matches_in_searched_window result is not proof that an event never happened.",
     parameters: Type.Object(
       {
         query: Type.Optional(Type.String({ maxLength: 2_000 })),
@@ -442,7 +480,7 @@ export function createHistoryTools(options: {
     name: OWNER_HISTORY_SEARCH_TOOL,
     label: "搜索已授权群历史",
     description:
-      "Owner-only search across assigned and authorized QQ groups. Filters cover message text, sender QQ or group nickname, whether the sender mentioned this bot, group ids, and ISO 8601 time bounds. A no_matches_in_searched_window result is not proof that an event never happened.",
+      "Owner-only search across assigned and authorized QQ groups. Filters cover message text, sender QQ or group nickname, whether the sender mentioned this bot, group ids, and ISO 8601 time bounds. Use sender for who spoke. For requests about all messages, omissions, totals, or the earliest or latest message, use a sufficient limit and narrow filters. When truncated is true, the result is partial and must not be described as complete. A no_matches_in_searched_window result is not proof that an event never happened.",
     parameters: Type.Object(
       {
         groupIds: Type.Optional(

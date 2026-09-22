@@ -101,7 +101,7 @@ async function fixture() {
     senderId: "member-a",
     senderName: "Ripped",
     mentionTargetIds: [botId],
-    normalizedText: "deploy rollback plan alpha",
+    normalizedText: "@bot deploy rollback plan alpha",
     occurredAt: "2026-09-20T10:00:00Z",
   });
   await archive.ingest({
@@ -629,7 +629,7 @@ async function groupRunTools(
   });
 }
 
-it("gives the model the authorized sender and the original text of a hit", async () => {
+it("gives the model the authorized sender and bot-safe text of a hit", async () => {
   const { store, archive } = await fixture();
   try {
     const tools = await groupRunTools(store, archive);
@@ -638,12 +638,25 @@ it("gives the model the authorized sender and the original text of a hit", async
     });
     const view = JSON.parse(text) as {
       groups: string[];
-      results: Array<{ groupId: string; sender?: string; text: string; rank: number }>;
+      currentBot?: { id: string; mentionLabel: string };
+      results: Array<{
+        groupId: string;
+        sender?: string;
+        mentionedMe?: boolean;
+        text: string;
+        rank: number;
+      }>;
     };
-    // The real request asked for 发送者和原文; both must be answerable from the Tool result.
+    // Preserve the message content while replacing the current Bot's numeric id with a stable label.
     expect(view.results).toHaveLength(1);
-    expect(view.results[0]).toMatchObject({ groupId: "100", sender: "member-a", rank: 1 });
-    expect(view.results[0]?.text).toContain("plan alpha");
+    expect(view.results[0]).toMatchObject({
+      groupId: "100",
+      sender: "member-a",
+      mentionedMe: true,
+      rank: 1,
+    });
+    expect(view.results[0]?.text).toBe("@current_bot deploy rollback plan alpha");
+    expect(view.currentBot).toEqual({ id: botId, mentionLabel: "@current_bot" });
     expect(view.groups).toEqual(["100"]);
   } finally {
     await store.close();
@@ -664,7 +677,7 @@ it("supports general sender and mention filters without keyword patches", async 
     expect(nicknameView).toMatchObject({ resultStatus: "matches_found" });
     expect(nicknameView.results[0]).toMatchObject({
       senderName: "Ripped",
-      text: "deploy rollback plan alpha",
+      text: "@current_bot deploy rollback plan alpha",
     });
 
     const byMention = await callModelVisible(tool, { mentionsMe: true });
@@ -674,6 +687,44 @@ it("supports general sender and mention filters without keyword patches", async 
     };
     expect(mentionView).toMatchObject({ resultStatus: "matches_found" });
     expect(mentionView.results[0]).toMatchObject({ senderName: "Ripped" });
+  } finally {
+    await store.close();
+  }
+});
+
+it("returns the requested number from one group and reports a real result limit", async () => {
+  const { store, archive } = await fixture();
+  try {
+    for (let index = 2; index <= 6; index++) {
+      await archive.ingest({
+        channel: "qq",
+        connectionId,
+        groupId: "100",
+        externalMessageId: `g100-${index}`,
+        senderId: "member-a",
+        senderName: "Ripped",
+        normalizedText: `distinct group message ${index}`,
+        occurredAt: `2026-09-20T10:0${index}:00Z`,
+      });
+    }
+
+    const tools = await groupRunTools(store, archive);
+    const { text } = await callModelVisible(toolByName(tools, GROUP_HISTORY_SEARCH_TOOL), {
+      sender: "member-a",
+      limit: 5,
+    });
+    const view = JSON.parse(text) as {
+      considered: number;
+      returned: number;
+      truncated: boolean;
+      guidance: string;
+      results: unknown[];
+    };
+
+    expect(view.results).toHaveLength(5);
+    expect(view).toMatchObject({ considered: 6, returned: 5, truncated: true });
+    expect(view.guidance).toContain("Partial results only");
+    expect(view.guidance).toContain("Do not claim a complete list");
   } finally {
     await store.close();
   }

@@ -70,3 +70,14 @@ export type {
   AuthorizedQqSourceReader,
 } from "./retrieval.js";
 export { QQ_SOURCE_CLASSES } from "./retrieval.js";
+export { lifecycleStates, memoryTypes } from "./memory.js";
+export type {
+  CanonicalMemory,
+  GlassboxMemoryScope,
+  MemoryEvidence,
+  MemoryLifecycleState,
+  MemorySource,
+  MemorySubject,
+  MemoryType,
+  RetentionFactors,
+} from "./memory.js";

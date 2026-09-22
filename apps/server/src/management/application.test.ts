@@ -767,6 +767,24 @@ describe("per-Owner managed group assignment", () => {
     };
   }
 
+  it("wires candidate extraction into the real Owner-private runtime Tool surface", async () => {
+    const { f, application, a } = await owners();
+    expect(await application.resolveRunToolNames(a)).toContain("owner_memory_admin");
+    const tool = application
+      .createRuntimeTools(() => a)
+      .find((entry) => entry.name === "owner_memory_admin");
+    if (!tool) throw new Error("missing owner_memory_admin");
+    const result = await tool.execute("extract", {
+      action: "extract",
+      type: "episodic_event",
+      scopeType: "project",
+      projectId: "glassbox",
+      statement: "An Owner-private test run occurred.",
+    });
+    expect(result.details).toMatchObject([{ status: "pending" }]);
+    expect(await f.app.store.learning.listMemories({ caller: a.caller })).toEqual([]);
+  });
+
   const groupIds = async (
     application: ReturnType<typeof admin>,
     context: OwnerContext,

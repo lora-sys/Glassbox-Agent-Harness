@@ -29,6 +29,7 @@ const serviceEnvironmentKeys = new Set([
   "NAPCAT_MAIN_PATH",
   "NAPCAT_PATCH_PACKAGE",
   "NAPCAT_LAUNCHER_PATH",
+  "NAPCAT_QUICK_ACCOUNT",
 ]);
 
 type ProcessName = "herdr" | "napcat" | "glassbox";
@@ -330,8 +331,9 @@ async function waitFor(
   entry: ProcessState,
   probe: () => Promise<boolean>,
   description: string,
+  timeoutMs = 20_000,
 ): Promise<void> {
-  const deadline = Date.now() + 20_000;
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (!(await verified(entry))) throw new Error(`${entry.name} exited before ${description}`);
     if (await probe()) return;
@@ -432,6 +434,7 @@ async function up(): Promise<void> {
           entry,
           () => endpointAvailable({ host: "127.0.0.1", port: Number(portText) }),
           "ready for connections",
+          60_000,
         );
       }
     }
