@@ -1,84 +1,93 @@
 # Issue 17 live QQ acceptance, 2026-09-22
 
-This record covers the real QQ attempt for Issue 17. It is evidence from one host and one dated
-attempt, not a replacement for the completion gate in `.plans/04b-authorized-retrieval-history.md`.
+This record covers the real QQ acceptance for Issue 17. It is dated host evidence, not a
+replacement for the completion gate in `.plans/04b-authorized-retrieval-history.md`.
 
 ## Test topology
 
-- Glassbox branch: `codex/issue-17-native-group-role`, stacked on
-  `feature/16-tool-plane-grounding` while PR 18 remains open.
-- Live-only integration checkout: Issue 17 plus current `origin/main`, so the existing Memory
-  acceptance state remained available during QQ testing.
+- Delivery branch: `codex/issue-17-native-group-role`, stacked on PR 18 branch
+  `feature/16-tool-plane-grounding`.
+- Live integration checkout: Issue 17 plus current `main`, using the existing P4 test state.
 - OneBot connection: `p3-qq`.
 - Bot QQ: `3394947361`.
 - Dedicated test group: `1126022432`.
 - Glassbox Owner QQ: `3526039967`.
 - Test member QQ: `3654774349`.
+- Second ordinary test member QQ: `3067670134`.
 
-The service reused the existing QQ quick-login state. This attempt did not generate a QR code or
-ask the Owner to scan again.
+The system QQ installation remains unchanged. The live runtime uses an isolated extraction of
+Tencent-signed QQ 9.9.33 build 52230 with NapCat 4.18.28. The installer SHA-256 matched the
+published WinGet manifest and its Authenticode signature was valid. A complete account-data
+backup was taken before the runtime change.
 
-## Verified before live mutation
+## Runtime and provider verification
 
-- Herdr, NapCat, and Glassbox were running.
-- Glassbox listened on `127.0.0.1:3030`.
-- NapCat listened on `127.0.0.1:6700` and had an established authenticated Glassbox socket.
-- NapCat reported both configured groups in `get_group_list`.
-- The dedicated group reported four members.
-- Before the attempted role change, the Bot was a native QQ `member`, not an administrator.
-- The dedicated group policy did not enable `group.moderate`.
-- No new Owner private command entered Glassbox during the observation window, so the policy did
-  not change.
+- NapCat started with its native packet backend and reported a successful native packet hook.
+- NapCat listened on `127.0.0.1:6700`.
+- Glassbox listened on `127.0.0.1:3030` and held an authenticated established socket to NapCat.
+- Login completed once after the runtime change. Subsequent work reused that live session and did
+  not refresh the QR code.
+- Fresh `get_group_member_info(no_cache=true)` calls succeeded with `retcode=0` for both configured
+  groups.
+- In the dedicated group, the provider reported the Glassbox Owner as `owner`, the Bot as `admin`,
+  and both test accounts as `member`.
+- The Issue 16 read-only capability probe completed at `2026-09-22T07:15:07.589Z`. All six
+  provider-backed calls succeeded: group metadata, member list, one history page, notices, essence,
+  and root group files. The provider-free managed-group projection also succeeded. The probe stored
+  only safe result shapes and counts.
 
-The repository gate passed after the Issue 17 implementation and the provider-failure regression:
+These observations replace the earlier failed attempt against unsupported QQ 9.9.36 build 53489.
+That attempt remains useful evidence for fail-closed behavior, but it is no longer the current
+provider state.
 
-- core check: 239 files;
-- unit tests: 73 files passed, 1 skipped; 1093 tests passed, 1 skipped;
-- deterministic end-to-end: 58 tests passed;
+## Policy and negative-path evidence
+
+The Glassbox Owner enabled `group.moderate` for the dedicated group through the Owner-private Tool
+path. The durable policy changed from version 1 to version 2 and records `owner` as the actor.
+
+A later moderation request was accidentally sent in the separate real-person test group
+`1121579672`. That group's policy did not enable `group.moderate`. Run
+`f095bb1a-8461-4dd3-8ef1-307d9d6f8ccb` recorded the sender as the QQ group owner, excluded
+`qq_group_moderation` with `policy_disabled`, and did not mute the named member. This proves the
+policy gate remains independent of native QQ role. It does not replace the dedicated-group
+ordinary-member acceptance.
+
+## Repository verification
+
+After rebasing Issue 17 onto the completed PR 18 merge commit, the repository gate passed:
+
+- core check: 250 files;
+- unit tests: 76 files passed, 1 skipped; 1120 tests passed, 1 skipped;
+- deterministic end-to-end: 59 tests passed;
 - regression: 101 tests passed;
 - Web build: passed.
 
-## Provider incompatibility found
+The focused native-role suite also passed 208 tests across the OneBot adapter, management
+application, capability Tools, Run adapter, and shared-group lifecycle.
 
-NapCat 4.18.28 logged that its packet backend does not support the installed QQ
-`9.9.36-53489-x64`. Its official v4.18.28 release recommends QQ 9.9.26 build 44343.
+## Remaining live acceptance
 
-Fresh `get_group_member_info` calls with `no_cache=true` returned `retcode=1200` for the Bot in
-both configured groups. Repeating the read after a Glassbox-only restart produced the same result.
-Glassbox therefore reports provider failure and blocks the mutation. It does not turn this into a
-caller authorization denial.
+The following real QQ steps still require messages or role changes from the named test accounts:
 
-`get_group_member_list` is not an authorization fallback. Inspection of the bundled NapCat 4.18.28
-implementation showed that when a member cache already exists, the action can return that cache
-before its requested refresh finishes. A stale administrator record would violate Issue 17's
-execution-time re-verification rule. The adapter therefore continues to require the narrow fresh
-member read and fails closed when it is unavailable.
-
-## Acceptance state
-
-The deterministic suite covers the Issue 17 role, scope, policy, intent, restart, demotion,
-provider-failure, and Owner-private `set_group_admin` cases. Real QQ acceptance is not complete.
-The following live items remain:
-
-1. Run with a NapCat-compatible QQ build without discarding the existing quick-login state when
-   possible.
-2. Confirm `get_group_member_info(no_cache=true)` returns the exact group, user, and role.
-3. Make the Bot an administrator in the dedicated group through the QQ client.
-4. Enable `group.moderate` through the Glassbox Owner private control path.
-5. Confirm an ordinary member does not discover moderation Tools.
-6. Promote the test member to QQ administrator and confirm the next addressed group Run discovers
-   only the configured current-group moderation surface.
-7. Execute one reversible 60-second mute against the dedicated test member and inspect the Trace.
-8. Remove the caller's QQ administrator role outside Glassbox and confirm the next mutation is
-   denied before the provider action by fresh role verification.
-9. Restore the caller's QQ administrator role and confirm the next Run regains the bounded surface.
-10. Exercise Owner-private `set_group_admin` with exact group, user, and enable values in both
-    directions, then confirm those changes affect the next group Run without creating local role
-    truth.
-11. Separately confirm insufficient Bot authority is reported as provider failure.
-12. Restore the dedicated group policy, Bot role, caller role, and mute state to their pre-test
+1. Run the exact-identifier history request in the dedicated group and verify successful Tool
+   evidence rather than model narration.
+2. Have an ordinary member address the Bot with an exact moderation request and confirm the Tool is
+   absent and no provider mutation occurs.
+3. Enable `group.settings` for the dedicated group through the Owner-private control path.
+4. Use Owner-private `set_group_admin` with the exact group, member, and `enable=true` values. If the
+   Bot's current QQ admin role cannot perform that provider action, record provider failure
+   separately from caller authorization and temporarily give the Bot the required QQ authority.
+5. Confirm the promoted member's next group Run receives only the configured current-group
+   moderation surface.
+6. Execute one reversible 60-second mute against the second ordinary test member and inspect the
+   role-verification, authorization, provider, and Tool evidence.
+7. Remove the caller's native admin role outside Glassbox and confirm the next mutation is refused
+   before a provider mutation.
+8. Restore the native admin role and confirm the next Run regains the bounded surface.
+9. Use Owner-private `set_group_admin` with `enable=false`, then confirm the member's next Run loses
+   the moderation surface.
+10. Restore the dedicated group policy, Bot role, caller role, and mute state to their pre-test
     values.
 
-Do not downgrade QQ, restart NapCat, or trigger a new login merely to finish this checklist without
-the Owner's explicit approval. Those operations may invalidate the cached login and cause another
-QR scan, which this acceptance attempt intentionally avoided.
+Do not refresh the QR code while the authenticated OneBot connection remains healthy. A QR image is
+not login evidence; the established authenticated socket and successful provider calls are.
