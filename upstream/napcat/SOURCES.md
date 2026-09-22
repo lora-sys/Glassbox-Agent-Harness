@@ -138,7 +138,7 @@ create_group_file_folder  payload is { group_id, folder_name?, name? }; there is
 get_group_info        payload is { group_id }; there is no `no_cache`
 get_group_member_info payload is { group_id, user_id, no_cache? }; role is owner, admin or member
 
-NapCat 4.18.28 may return retcode 1200 for `get_group_member_info` when the installed QQ build is newer than its profile-detail packet support. `get_group_member_list` remains the bounded compatibility path. Glassbox uses it only after that explicit rejection, filters for one exact group and user, and keeps only `role`.
+NapCat 4.18.28 may return retcode 1200 for `get_group_member_info` when the installed QQ build is newer than its profile-detail packet support. Its official v4.18.28 release recommends QQ 9.9.26 build 44343, while the live acceptance host currently has QQ 9.9.36 build 53489. Glassbox treats that rejection as provider unavailable. It does not use `get_group_member_list` as an authorization fallback because NapCat can return its existing member cache before the requested asynchronous refresh completes.
 ```
 
 ## QQ-native group roles
