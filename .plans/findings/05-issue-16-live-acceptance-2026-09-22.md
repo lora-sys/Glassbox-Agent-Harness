@@ -95,6 +95,34 @@ cannot be promoted to complete coverage. The Glassbox system prompt now also req
 follow an explicitly requested response shape and forbids unrequested Tool diagnostics for a
 positive match. Partial-coverage limits remain mandatory for absence or completeness claims.
 
+## Complete-coverage Run and prompt-only failure
+
+Run `69da35ca-e0f6-434f-9931-deedbe8513b6` proved that the paging correction worked. The real
+provider walk read four pages and stopped at `end_of_source`. The resulting coverage was
+`complete`, with no `cursor_stuck`, no source limit, and no retrieval truncation. Required evidence
+and the concrete `group_history_search` call both resolved successfully.
+
+The delivered response still violated the user's explicit field contract. It included result
+counts, coverage state, internal guidance, and additional assertions after the user requested only
+sender, time, and original text. It also called one message unique even though the Tool returned
+multiple messages containing the identifier. This Run disproved the prompt-only correction: a
+system instruction can guide response shape, but it cannot enforce it.
+
+Commit `e3a3f4c` moves that narrow contract below the model:
+
+- a single segmented identifier in an explicit current-group history search is bound into the
+  required Tool input, so a call for a different query cannot satisfy the Run;
+- when the current message explicitly requests only supported exact-history fields, the final text
+  is projected from the successful Tool's structured details rather than model-authored prose;
+- the projection emits only the requested group, sender, time, and original-text fields;
+- if the Tool result cannot prove any requested field, the Run fails closed instead of falling back
+  to the model's answer;
+- the retry path collapses the exact required call and its generic evidence requirement into one
+  call, so the model is not told to run the same search twice.
+
+Coverage, counts, and source-stop evidence remain present in the Tool result and Raw Trace. The
+physical reply projection limits only delivery for the user's explicit narrow field contract.
+
 ## Repository verification
 
 The first correction's focused history, management, and Tool-result suites passed 98 tests. Its
@@ -106,13 +134,21 @@ complete commit gate then passed:
 - regression: 93 tests passed;
 - Web build: passed.
 
+The physical reply correction's complete commit gate also passed:
+
+- core check: 249 files;
+- unit tests: 76 files passed, 1 skipped; 1105 tests passed, 1 skipped;
+- deterministic end-to-end: 55 tests passed;
+- regression: 93 tests passed;
+- Web build: passed.
+
 ## Remaining confirmation
 
-After the follow-up correction is deployed through the stacked Issue 17 checkout, one final QQ Run must
-repeat the exact-identifier request and confirm both of these observable results:
+The physical correction is deployed through the stacked Issue 17 checkout. One final QQ Run must
+repeat the exact-identifier request and confirm both observable results together:
 
 1. source coverage no longer stops at `cursor_stuck`;
 2. the delivered answer contains only the requested sender, time, and original text.
 
-Until that Run is recorded, the code and deterministic gate are complete, but the exact-identifier
-live acceptance remains open.
+Until that Run is recorded, the deterministic gate, real read-only provider probe, and complete
+source walk are proven, but the physical delivery projection remains awaiting real QQ confirmation.
