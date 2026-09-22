@@ -87,6 +87,8 @@ export interface HistorySearchItem extends BoundedContextItem {
   senderName?: string;
   /** Whether the archived message mentioned the Bot serving this connection. */
   mentionedMe?: boolean;
+  /** Model-safe text with a structured mention of this connection's Bot rendered generically. */
+  modelText?: string;
 }
 
 export interface HistorySearchDetails {
@@ -172,7 +174,7 @@ export function projectHistorySearch(details: HistorySearchDetails): HistorySear
       ...(item.senderName === undefined ? {} : { senderName: item.senderName }),
       ...(item.mentionedMe === undefined ? {} : { mentionedMe: item.mentionedMe }),
       ...(item.occurredAt === undefined ? {} : { occurredAt: item.occurredAt }),
-      text: item.snippet,
+      text: item.modelText ?? item.snippet,
       matchedTerms: item.matchedTerms,
     })),
     considered: details.considered,
@@ -367,6 +369,7 @@ export function createHistoryTools(options: {
       const mentionTargetIds = Array.isArray(sender?.mentionTargetIds)
         ? sender.mentionTargetIds.filter((value): value is string => typeof value === "string")
         : [];
+      const mentionedMe = botId ? mentionTargetIds.includes(botId) : undefined;
       return {
         ...item,
         groupId: item.sourceId,
@@ -378,8 +381,13 @@ export function createHistoryTools(options: {
         ...(typeof sender?.name === "string" && item.returnMode !== "metadata_only"
           ? { senderName: sender.name }
           : {}),
-        ...(botId && item.returnMode !== "metadata_only"
-          ? { mentionedMe: mentionTargetIds.includes(botId) }
+        ...(mentionedMe !== undefined && item.returnMode !== "metadata_only"
+          ? {
+              mentionedMe,
+              ...(mentionedMe
+                ? { modelText: item.snippet.split(`@${botId}`).join("@current_bot") }
+                : {}),
+            }
           : {}),
       };
     });
@@ -425,7 +433,7 @@ export function createHistoryTools(options: {
     name: GROUP_HISTORY_SEARCH_TOOL,
     label: "搜索本群历史",
     description:
-      "Search the current QQ group's authorized history. Filters cover message text, sender QQ or group nickname, whether the sender mentioned this bot, and ISO 8601 time bounds. Use sender for who spoke and mentionsMe for who @mentioned the bot. Each result's mentionedMe field is the authoritative answer to whether that message @mentioned the current bot; do not infer this from a numeric id in message text. For requests about all messages, omissions, totals, or the earliest or latest message, use a sufficient limit and narrow filters. When truncated is true, the result is partial and must not be described as complete. A no_matches_in_searched_window result is not proof that an event never happened.",
+      "Search the current QQ group's authorized history. Filters cover message text, sender QQ or group nickname, whether the sender mentioned this bot, and ISO 8601 time bounds. Use sender for who spoke and mentionsMe for who @mentioned the bot. Each result's mentionedMe field is the authoritative answer to whether that message @mentioned the current bot. In result text, @current_bot always means this bot. Do not infer identity from any other numeric id or describe @current_bot as another account. For requests about all messages, omissions, totals, or the earliest or latest message, use a sufficient limit and narrow filters. When truncated is true, the result is partial and must not be described as complete. A no_matches_in_searched_window result is not proof that an event never happened.",
     parameters: Type.Object(
       {
         query: Type.Optional(Type.String({ maxLength: 2_000 })),
