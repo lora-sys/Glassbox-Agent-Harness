@@ -88,6 +88,8 @@ async function fixture(
     memberRole?: () => "owner" | "admin" | "member";
     /** One provider mutation to reject after caller authorization has passed. */
     failAction?: string;
+    /** Applies provider-side state changes before the fake peer answers an action. */
+    onAction?: (action: Action) => void;
   } = {},
 ) {
   const directory = await mkdtemp(join(tmpdir(), "glassbox-channel-loop-"));
@@ -119,6 +121,7 @@ async function fixture(
       const action = JSON.parse(bytes.toString("utf8")) as Action;
       actionLog.push(action);
       actions.put(action);
+      options.onAction?.(action);
       if (action.action === "get_group_info") groupInfoRequests += 1;
       // A rejected `get_group_info` is the peer's own failure reply: `status: "failed"` with a
       // non-zero `retcode`, which the adapter maps to a provider error rather than to data.
@@ -1506,10 +1509,16 @@ describe("configured group Run capability authority", () => {
     role: "owner" | "admin" | "member" = "member",
     memberRole: () => "owner" | "admin" | "member" = () => role,
     failAction?: string,
+    onAction?: (action: Action) => void,
   ) {
     const f = await fixture(
       async (input) => ({ status: "succeeded", text: `answer:${input.text}` }),
-      { coOwnerId: CO_OWNER, memberRole, ...(failAction === undefined ? {} : { failAction }) },
+      {
+        coOwnerId: CO_OWNER,
+        memberRole,
+        ...(failAction === undefined ? {} : { failAction }),
+        ...(onAction === undefined ? {} : { onAction }),
+      },
     );
     f.send(1, "owner-a", true, 10002);
     const ownerA = await f.started.take();
@@ -1736,6 +1745,104 @@ describe("configured group Run capability authority", () => {
       expect.objectContaining({
         observedRole: "qq_group_admin",
         verifiedRole: "qq_group_member",
+        verificationStatus: "verified",
+      }),
+    );
+  });
+
+  it("fails a provider-acknowledged admin mutation whose fresh role did not change", async () => {
+    const { application, a, f } = await configuredGroup();
+    await application.setGroupCategory(a, {
+      groupId: GROUP,
+      category: "group.settings",
+      enabled: true,
+    });
+    const context = Object.assign(a, {
+      requiredToolName: "qq_group_settings",
+      requiredToolInput: {
+        groupId: GROUP,
+        operation: "set_group_admin",
+        params: { user_id: 10004, enable: true },
+      },
+    });
+    const settings = application
+      .createRuntimeTools(() => context)
+      .find((tool) => tool.name === "qq_group_settings");
+    if (!settings) throw new Error("missing qq_group_settings");
+
+    await expect(
+      settings.execute("call", {
+        groupId: GROUP,
+        operation: "set_group_admin",
+        params: { user_id: 10004, enable: true },
+      }),
+    ).rejects.toThrow("provider_postcondition_failed");
+    expect(f.actionLog.map((action) => action.action)).toContain("set_group_admin");
+    expect(f.actionLog).toContainEqual(
+      expect.objectContaining({
+        action: "get_group_member_info",
+        params: expect.objectContaining({
+          group_id: GROUP_ID,
+          user_id: 10004,
+          no_cache: true,
+        }),
+      }),
+    );
+    const trace = await f.app.trace.readPage(context.runId);
+    expect(trace.records.map((record) => record.event)).toContainEqual(
+      expect.objectContaining({
+        type: "provider_mutation_verification",
+        requestedOperation: "set_group_admin",
+        targetUserId: "10004",
+        expectedRole: "qq_group_admin",
+        observedRole: "qq_group_member",
+        verificationStatus: "mismatch",
+      }),
+    );
+  });
+
+  it("accepts set_group_admin only after a fresh provider read proves the new role", async () => {
+    let currentRole: "admin" | "member" = "member";
+    const { application, a, f } = await configuredGroup(
+      "member",
+      () => currentRole,
+      undefined,
+      (action) => {
+        const params = action.params as Record<string, unknown>;
+        if (action.action === "set_group_admin" && params.enable === true) currentRole = "admin";
+      },
+    );
+    await application.setGroupCategory(a, {
+      groupId: GROUP,
+      category: "group.settings",
+      enabled: true,
+    });
+    const context = Object.assign(a, {
+      requiredToolName: "qq_group_settings",
+      requiredToolInput: {
+        groupId: GROUP,
+        operation: "set_group_admin",
+        params: { user_id: 10004, enable: true },
+      },
+    });
+    const settings = application
+      .createRuntimeTools(() => context)
+      .find((tool) => tool.name === "qq_group_settings");
+    if (!settings) throw new Error("missing qq_group_settings");
+
+    await expect(
+      settings.execute("call", {
+        groupId: GROUP,
+        operation: "set_group_admin",
+        params: { user_id: 10004, enable: true },
+      }),
+    ).resolves.toMatchObject({ details: { status: "ok" } });
+    const trace = await f.app.trace.readPage(context.runId);
+    expect(trace.records.map((record) => record.event)).toContainEqual(
+      expect.objectContaining({
+        type: "provider_mutation_verification",
+        expectedRole: "qq_group_admin",
+        observedRole: "qq_group_admin",
         verificationStatus: "verified",
       }),
     );

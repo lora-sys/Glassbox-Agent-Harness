@@ -40,6 +40,14 @@ These observations replace the earlier failed attempt against unsupported QQ 9.9
 That attempt remains useful evidence for fail-closed behavior, but it is no longer the current
 provider state.
 
+## Exact-history dependency confirmation
+
+Run `99ea6e67-b704-41cb-8159-bbb45c99bd4d` completed the dependent Issue 16 history acceptance in
+the same live topology. It required and successfully called `group_history_search`, walked the
+provider through four pages to `end_of_source`, and delivered exactly one bare `P4B-A-1349` record
+with only sender, time, and original text. Delivery reached `sent`. The detailed retrieval evidence
+is recorded in `.plans/findings/05-issue-16-live-acceptance-2026-09-22.md`.
+
 ## Policy and negative-path evidence
 
 The Glassbox Owner enabled `group.moderate` for the dedicated group through the Owner-private Tool
@@ -52,13 +60,62 @@ A later moderation request was accidentally sent in the separate real-person tes
 policy gate remains independent of native QQ role. It does not replace the dedicated-group
 ordinary-member acceptance.
 
+## Native group-owner mutation and cleanup
+
+Run `dee64c81-f5a7-46a4-a7cf-913b49aec993` was created when the Glassbox Owner account
+`3526039967`, which is also the native QQ group owner, sent the exact request to mute member
+`3067670134` for 60 seconds in the dedicated group. This message was intended for the ordinary
+member negative-path test but came from the Owner account, so it is positive group-owner evidence
+instead.
+
+The Run bound `qq_group_moderation`, `set_group_ban`, the trusted current group, target member, and
+60-second duration. Its Trace recorded the ingress role as `qq_group_owner`, then performed a fresh
+provider check before mutation. The verified role remained `qq_group_owner`, the authorization
+decision was `ALLOW`, the Tool result succeeded, the Run finished as `succeeded`, and delivery
+reached `sent`.
+
+The accidental test mute was immediately reversed through the authenticated OneBot connection. A
+fresh `get_group_member_info(no_cache=true)` read returned `retcode=0`, role `member`, and
+`shut_up_timestamp=0` for `3067670134`. The test therefore left no mute state behind.
+
+## Ordinary-member refusal
+
+Run `a4482a22-77a5-4f67-90e8-5971f5c739fe` was created by ordinary member `3654774349` with the
+same exact 60-second mute request. Its ingress evidence recorded Principal
+`qq-visitor-3654774349`, Resource `group:1126022432`, and role `qq_group_member` from the OneBot
+message sender.
+
+Both session snapshots excluded `qq_group_moderation` with `scope_not_permitted`. The selected Tool
+surface contained only the configured read capabilities, history search, and Skill reading. No
+moderation Tool call or native-role verification occurred. The model attempted an unrelated
+`qq_group_members` call with invalid input, which failed as `input_validation_failed`; it did not
+change the authorization result or produce a provider mutation. Glassbox finished the Run as
+`failed` and delivered the bounded failure response.
+
+A fresh provider read after delivery returned role `member` and `shut_up_timestamp=0` for target
+`3067670134`. This proves that the ordinary member did not gain the mutation Tool and no mute was
+performed.
+
+## Owner-private capability enablement
+
+Run `d9bb6456-07ba-431e-954b-77c23edfda6a` enabled `group.settings` for the dedicated group through
+the Owner-private `owner_group_admin` path. Required evidence bound action `set_capability`, group
+`1126022432`, category `group.settings`, and `enabled=true`. The Tool succeeded, policy version
+advanced to 3, the Run finished as `succeeded`, and delivery reached `sent`.
+
+The live Trace exposed a separate observability defect: the safe `owner_group_admin` Tool-call
+projection retained action, group, and enabled state but omitted the allowlisted capability
+category. The durable policy and required-evidence record remained correct. The safe projection
+must be corrected before final delivery so Raw Trace records the exact non-secret category that was
+executed.
+
 ## Repository verification
 
-After rebasing Issue 17 onto the completed PR 18 merge commit, the repository gate passed:
+After rebasing Issue 17 onto the latest PR 18 branch, the repository gate passed:
 
 - core check: 250 files;
-- unit tests: 76 files passed, 1 skipped; 1120 tests passed, 1 skipped;
-- deterministic end-to-end: 59 tests passed;
+- unit tests: 76 files passed, 1 skipped; 1128 tests passed, 1 skipped;
+- deterministic end-to-end: 60 tests passed;
 - regression: 101 tests passed;
 - Web build: passed.
 
@@ -69,24 +126,19 @@ application, capability Tools, Run adapter, and shared-group lifecycle.
 
 The following real QQ steps still require messages or role changes from the named test accounts:
 
-1. Run the exact-identifier history request in the dedicated group and verify successful Tool
-   evidence rather than model narration.
-2. Have an ordinary member address the Bot with an exact moderation request and confirm the Tool is
-   absent and no provider mutation occurs.
-3. Enable `group.settings` for the dedicated group through the Owner-private control path.
-4. Use Owner-private `set_group_admin` with the exact group, member, and `enable=true` values. If the
+1. Use Owner-private `set_group_admin` with the exact group, member, and `enable=true` values. If the
    Bot's current QQ admin role cannot perform that provider action, record provider failure
    separately from caller authorization and temporarily give the Bot the required QQ authority.
-5. Confirm the promoted member's next group Run receives only the configured current-group
+2. Confirm the promoted member's next group Run receives only the configured current-group
    moderation surface.
-6. Execute one reversible 60-second mute against the second ordinary test member and inspect the
+3. Execute one reversible 60-second mute against the second ordinary test member and inspect the
    role-verification, authorization, provider, and Tool evidence.
-7. Remove the caller's native admin role outside Glassbox and confirm the next mutation is refused
+4. Remove the caller's native admin role outside Glassbox and confirm the next mutation is refused
    before a provider mutation.
-8. Restore the native admin role and confirm the next Run regains the bounded surface.
-9. Use Owner-private `set_group_admin` with `enable=false`, then confirm the member's next Run loses
+5. Restore the native admin role and confirm the next Run regains the bounded surface.
+6. Use Owner-private `set_group_admin` with `enable=false`, then confirm the member's next Run loses
    the moderation surface.
-10. Restore the dedicated group policy, Bot role, caller role, and mute state to their pre-test
+7. Restore the dedicated group policy, Bot role, caller role, and mute state to their pre-test
     values.
 
 Do not refresh the QR code while the authenticated OneBot connection remains healthy. A QR image is

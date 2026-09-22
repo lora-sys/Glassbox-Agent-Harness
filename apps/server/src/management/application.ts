@@ -522,7 +522,60 @@ export class ManagementApplication {
         invoke: async ({ action, params, context }) => {
           const connection = this.connections.get(context.caller.scope.connectionId);
           if (!connection) throw new Error("channel_not_connected");
-          return requireProviderSuccess(await connection.invokeCapability({ action, params }));
+          const providerResult = requireProviderSuccess(
+            await connection.invokeCapability({ action, params }),
+          );
+          // NapCat can acknowledge `set_group_admin` even when QQ keeps the member's old role.
+          // The mutation is not successful until a fresh provider read proves the requested
+          // postcondition. This check is below the model and uses the same authenticated
+          // connection, so a provider no-op cannot become a successful Tool result or reply.
+          if (
+            action === "set_group_admin" &&
+            (typeof params.group_id === "number" || typeof params.group_id === "string") &&
+            (typeof params.user_id === "number" || typeof params.user_id === "string") &&
+            typeof params.enable === "boolean"
+          ) {
+            const groupId = String(params.group_id);
+            const userId = String(params.user_id);
+            const expectedRole = params.enable ? "qq_group_admin" : "qq_group_member";
+            const observed = await connection.getGroupMemberRole({ groupId, userId });
+            const verified = observed.status === "ok" && observed.role === expectedRole;
+            const cursor = await this.trace.append(
+              context.runId,
+              {
+                type: "provider_mutation_verification",
+                runId: context.runId,
+                conversationId: context.conversationId,
+                principalId: context.caller.principalId,
+                resourceId: groupResourceId(groupId),
+                requestedTool: "qq_group_settings",
+                requestedOperation: action,
+                targetUserId: userId,
+                expectedRole,
+                observedRole: observed.status === "ok" ? observed.role : null,
+                verificationStatus:
+                  observed.status === "ok"
+                    ? verified
+                      ? "verified"
+                      : "mismatch"
+                    : observed.status === "unknown"
+                      ? "unknown"
+                      : observed.code === "not_connected"
+                        ? "unavailable"
+                        : "failed",
+              },
+              "glassbox-provider-postcondition",
+            );
+            await this.store.evidence.advanceTrace(context.caller, cursor);
+            if (!verified) {
+              if (observed.status === "failed" && observed.code === "not_connected")
+                throw new ProviderCallError("provider_unavailable", "provider_unavailable");
+              if (observed.status === "unknown")
+                throw new ProviderCallError("unknown", "provider_unknown");
+              throw new ProviderCallError("provider_failed", "provider_postcondition_failed");
+            }
+          }
+          return providerResult;
         },
         verifyNativeGroupRole: async ({ context, groupId, capability, operation }) => {
           const connection = this.connections.get(context.caller.scope.connectionId);
