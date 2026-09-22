@@ -1809,7 +1809,8 @@ describe("configured group Run capability authority", () => {
       undefined,
       (action) => {
         const params = action.params as Record<string, unknown>;
-        if (action.action === "set_group_admin" && params.enable === true) currentRole = "admin";
+        if (action.action === "set_group_admin" && typeof params.enable === "boolean")
+          currentRole = params.enable ? "admin" : "member";
       },
     );
     await application.setGroupCategory(a, {
@@ -1837,12 +1838,32 @@ describe("configured group Run capability authority", () => {
         params: { user_id: 10004, enable: true },
       }),
     ).resolves.toMatchObject({ details: { status: "ok" } });
+    context.requiredToolInput = {
+      groupId: GROUP,
+      operation: "set_group_admin",
+      params: { user_id: 10004, enable: false },
+    };
+    await expect(
+      settings.execute("call", {
+        groupId: GROUP,
+        operation: "set_group_admin",
+        params: { user_id: 10004, enable: false },
+      }),
+    ).resolves.toMatchObject({ details: { status: "ok" } });
     const trace = await f.app.trace.readPage(context.runId);
     expect(trace.records.map((record) => record.event)).toContainEqual(
       expect.objectContaining({
         type: "provider_mutation_verification",
         expectedRole: "qq_group_admin",
         observedRole: "qq_group_admin",
+        verificationStatus: "verified",
+      }),
+    );
+    expect(trace.records.map((record) => record.event)).toContainEqual(
+      expect.objectContaining({
+        type: "provider_mutation_verification",
+        expectedRole: "qq_group_member",
+        observedRole: "qq_group_member",
         verificationStatus: "verified",
       }),
     );
