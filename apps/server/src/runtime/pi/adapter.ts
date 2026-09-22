@@ -1,6 +1,6 @@
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
-import type { AgentRun, Conversation } from "@glassbox/contracts";
+import { QQ_SOURCE_CLASSES, type AgentRun, type Conversation } from "@glassbox/contracts";
 import type { Model } from "@earendil-works/pi-ai";
 import {
   createAgentSession,
@@ -14,6 +14,7 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { KitLoader, type ResolvedKitProfile } from "./kit-loader.js";
+import { QQ_CAPABILITY_CATEGORIES } from "../../channels/onebot/capabilities.js";
 import { requiredInputClause } from "./protected-tools.js";
 import {
   GLASSBOX_HOST_EXCLUDED_PI_TOOLS,
@@ -117,9 +118,20 @@ export function glassboxSystemPrompt(modelPrompt: string): string {
   return `${modelPrompt.trim()}\n\nReply in concise plain text suitable for QQ. Follow the response shape and fields the user explicitly requested. Unless the user asks for diagnostics, do not narrate Tool names, Tool parameters, result counts, coverage metadata, internal guidance, or reasoning. Preserve partial-coverage limits when making absence or completeness claims, but do not add unrequested diagnostic sections to a positive match. Do not reveal host paths, internal service addresses, configuration names, or internal identifiers.\n\nTool availability is scoped to the current caller, location, and authorization. A tool missing from the current Run does not mean the product capability is unimplemented. State that the capability is unavailable in the current context. Never invent an unimplemented status, future rollout, or replacement API.`;
 }
 
+const SAFE_OWNER_GROUP_CATEGORIES = new Set<string>(QQ_CAPABILITY_CATEGORIES);
+const SAFE_OWNER_GROUP_SOURCE_CLASSES = new Set<string>(QQ_SOURCE_CLASSES);
+
 function safeToolInput(toolName: string, args: unknown): Record<string, unknown> | undefined {
   if (toolName !== "owner_group_admin" || !args || typeof args !== "object") return undefined;
   const input = args as Record<string, unknown>;
+  const category =
+    typeof input.category === "string" && SAFE_OWNER_GROUP_CATEGORIES.has(input.category)
+      ? input.category
+      : undefined;
+  const sourceClass =
+    typeof input.sourceClass === "string" && SAFE_OWNER_GROUP_SOURCE_CLASSES.has(input.sourceClass)
+      ? input.sourceClass
+      : undefined;
   return {
     ...(typeof input.action === "string" && /^[a-z_]{1,32}$/u.test(input.action)
       ? { action: input.action }
@@ -130,6 +142,8 @@ function safeToolInput(toolName: string, args: unknown): Record<string, unknown>
     ...(typeof input.skillName === "string" && /^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(input.skillName)
       ? { skillName: input.skillName }
       : {}),
+    ...(category === undefined ? {} : { category }),
+    ...(sourceClass === undefined ? {} : { sourceClass }),
     ...(typeof input.enabled === "boolean" ? { enabled: input.enabled } : {}),
   };
 }

@@ -107,8 +107,11 @@ describe("PiSdkRuntimeAdapter", () => {
           toolCallId: "admin-1",
           toolName: "owner_group_admin",
           args: {
-            action: "get",
+            action: "set_capability",
             groupId: "1126022432",
+            category: "group.settings",
+            sourceClass: "history",
+            enabled: true,
             ignored: "must-not-enter-trace",
           },
         } as never);
@@ -184,7 +187,13 @@ describe("PiSdkRuntimeAdapter", () => {
     expect(skillPolicy).toEqual({ source: "group-profile", configVersion: 3 });
     expect(safeToolCall).toMatchObject({
       name: "owner_group_admin",
-      input: { action: "get", groupId: "1126022432" },
+      input: {
+        action: "set_capability",
+        groupId: "1126022432",
+        category: "group.settings",
+        sourceClass: "history",
+        enabled: true,
+      },
     });
     expect(JSON.stringify(safeToolCall)).not.toContain("must-not-enter-trace");
     expect(safeToolResult).toMatchObject({
