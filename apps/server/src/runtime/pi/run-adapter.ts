@@ -5,9 +5,15 @@ import type {
   ExecutionResult,
 } from "../../execution/run-service/types.js";
 import { scopeKey } from "../../identity/scope.js";
+import { exactTerms } from "../../retrieval/exact-term.js";
 import type { QqCapabilityCategory } from "../../channels/onebot/capabilities.js";
 import type { PiRunContext, PiRuntimeAdapter, PiRuntimeProfileName } from "./types.js";
-import { GROUP_HISTORY_SEARCH_TOOL, OWNER_HISTORY_SEARCH_TOOL } from "./history-tools.js";
+import {
+  GROUP_HISTORY_SEARCH_TOOL,
+  OWNER_HISTORY_SEARCH_TOOL,
+  projectStrictHistoryReply,
+  strictHistoryReplySpec,
+} from "./history-tools.js";
 import { requiredInputClause, satisfiesRequiredInput } from "./protected-tools.js";
 import { OWNER_GROUP_ADMIN_TOOL } from "./owner-tools.js";
 import { OWNER_MEMORY_ADMIN_TOOL } from "./owner-memory-tools.js";
@@ -457,9 +463,16 @@ function requiredToolCall(
   if (input.caller.scope.chatType === "group") {
     if (!groupHistorySearchRequested(input.text) && !groupHistorySearchFollowUpRequested(input))
       return undefined;
-    // The message names no parameter of its own: the query is the model's to compose, and the
-    // group comes from the Run's trusted scope. The requirement is the call, not its arguments.
-    return { name: GROUP_HISTORY_SEARCH_TOOL, input: {} };
+    // A single segmented identifier is a literal query, not prose for the model to reinterpret.
+    // Bind it into the required input so a call for a different value cannot satisfy this Run.
+    // Bare digit runs are excluded because they can name a sender rather than message text.
+    const identifiers = exactTerms(requestClauses(input.text)).filter((term) =>
+      /[a-z]/iu.test(term),
+    );
+    return {
+      name: GROUP_HISTORY_SEARCH_TOOL,
+      input: identifiers.length === 1 ? { query: identifiers[0] } : {},
+    };
   }
   // Everything below is the Owner-private surface. A management Tool is never required
   // outside a private Owner Run, whatever else a message may name.
@@ -668,16 +681,29 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         );
       // §2/§3 — every domain the message asked about, not the first one the check reached. A
       // message that asks about members *and* notices is not answered by observing one of them.
-      const missingRequirements = () => [
-        ...(completedRequiredTool() || required === undefined
-          ? []
-          : [{ name: required.name, input: required.input }]),
-        ...resolveEvidence(evidence, observedCalls).flatMap((resolution, index) =>
-          resolution.outcome === "success"
-            ? []
-            : [{ name: evidence[index]!.tool, input: evidence[index]!.input }],
-        ),
-      ];
+      const missingRequirements = () => {
+        const requiredCall =
+          completedRequiredTool() || required === undefined
+            ? undefined
+            : { name: required.name, input: required.input };
+        const evidenceCalls = resolveEvidence(evidence, observedCalls).flatMap(
+          (resolution, index) => {
+            if (resolution.outcome === "success") return [];
+            const candidate = { name: evidence[index]!.tool, input: evidence[index]!.input };
+            // One exact required call also satisfies a generic evidence requirement for the same
+            // Tool. Asking for both produced a retry that told the model to run the same search
+            // twice, once with the bound identifier and once without it.
+            if (
+              requiredCall &&
+              candidate.name === requiredCall.name &&
+              satisfiesRequiredInput(candidate.input, requiredCall.input)
+            )
+              return [];
+            return [candidate];
+          },
+        );
+        return [...(requiredCall ? [requiredCall] : []), ...evidenceCalls];
+      };
       const missing = missingRequirements();
       if (result.status === "completed" && missing.length > 0 && !input.signal.aborted) {
         result = await this.runtime.run(
@@ -735,6 +761,31 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
           text: "未能从 QQ 获取该信息，因此无法确认。",
           providerSessionId: binding.runtimeSessionId,
         };
+      const strictReply = strictHistoryReplySpec(input.text);
+      if (
+        strictReply &&
+        result.status === "completed" &&
+        (requiredName === GROUP_HISTORY_SEARCH_TOOL || requiredName === OWNER_HISTORY_SEARCH_TOOL)
+      ) {
+        const successfulCall = [...observedCalls]
+          .reverse()
+          .find(
+            (call) =>
+              call.name === requiredName &&
+              call.failed === false &&
+              satisfiesRequiredInput(context.requiredToolInput ?? {}, call.input),
+          );
+        const projected = successfulCall
+          ? projectStrictHistoryReply(strictReply, successfulCall.result)
+          : undefined;
+        if (!projected)
+          return {
+            status: "failed",
+            text: "未能从 QQ 获取完整的请求字段，因此无法确认。",
+            providerSessionId: binding.runtimeSessionId,
+          };
+        result = { ...result, text: projected };
+      }
       return {
         // The aborted case returned above, so a Run that reached here either completed or
         // errored; anything else the runtime reports is a failure, never a success.

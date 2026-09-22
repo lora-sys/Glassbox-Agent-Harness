@@ -28,6 +28,7 @@ import {
   type BoundedContextItem,
   type TruncationReason,
 } from "../../retrieval/context.js";
+import { carriesEveryExactTerm, exactTerms } from "../../retrieval/exact-term.js";
 import { MemoryRetriever, type RetrievalCoverage } from "../../retrieval/retriever.js";
 import {
   groupResourceId,
@@ -446,6 +447,114 @@ export function projectHistorySearch(details: HistorySearchDetails): HistorySear
     coverage: details.coverage,
     guidance: historyGuidance(details),
   };
+}
+
+export type StrictHistoryReplyField = "group" | "sender" | "time" | "text";
+
+export interface StrictHistoryReplySpec {
+  fields: StrictHistoryReplyField[];
+  exactTerms: string[];
+}
+
+/**
+ * Recognizes the narrow response contract that needs a physical output boundary.
+ *
+ * This is deliberately not a general natural-language claim verifier. It only applies when the
+ * current message both names an exact identifier and explicitly says that the answer must contain
+ * only a supported set of history fields. All other answers remain the model's responsibility.
+ */
+export function strictHistoryReplySpec(text: string): StrictHistoryReplySpec | undefined {
+  const compact = text.replace(/\s+/gu, "");
+  if (!/(?:只|仅)(?:根据实际工具结果)?(?:回复|返回|列出|给出)/u.test(compact)) return undefined;
+
+  const terms = exactTerms(text).filter((term) => /[a-z]/iu.test(term));
+  if (terms.length !== 1) return undefined;
+
+  const fields: StrictHistoryReplyField[] = [];
+  if (/群号|群\s*ID|group\s*(?:id)?/iu.test(text)) fields.push("group");
+  if (/发送者|发件人|谁发|sender/iu.test(text)) fields.push("sender");
+  if (/发送时间|时间|timestamp|time/iu.test(text)) fields.push("time");
+  if (/原文|正文|消息内容|original\s*text|\btext\b/iu.test(text)) fields.push("text");
+  if (fields.length === 0) return undefined;
+  return { fields, exactTerms: terms };
+}
+
+function historyDetailsFromToolResult(result: unknown): HistorySearchDetails | undefined {
+  if (!result || typeof result !== "object" || Array.isArray(result)) return undefined;
+  const envelope = result as Record<string, unknown>;
+  const candidate =
+    envelope.details && typeof envelope.details === "object" && !Array.isArray(envelope.details)
+      ? (envelope.details as Record<string, unknown>)
+      : envelope;
+  if (
+    typeof candidate.query !== "string" ||
+    !Array.isArray(candidate.items) ||
+    (candidate.resultStatus !== "matches_found" &&
+      candidate.resultStatus !== "no_matches_in_searched_window") ||
+    !candidate.coverage ||
+    typeof candidate.coverage !== "object" ||
+    Array.isArray(candidate.coverage)
+  )
+    return undefined;
+  for (const item of candidate.items) {
+    if (
+      !item ||
+      typeof item !== "object" ||
+      Array.isArray(item) ||
+      typeof (item as Record<string, unknown>).snippet !== "string" ||
+      typeof (item as Record<string, unknown>).groupId !== "string"
+    )
+      return undefined;
+  }
+  return candidate as unknown as HistorySearchDetails;
+}
+
+/**
+ * Builds a strict reply from successful Tool details, never from model-authored prose.
+ *
+ * Returning `undefined` means the Tool result cannot prove every requested field. The execution
+ * adapter treats that as a failed evidence projection rather than falling back to model text.
+ */
+export function projectStrictHistoryReply(
+  spec: StrictHistoryReplySpec,
+  toolResult: unknown,
+): string | undefined {
+  const details = historyDetailsFromToolResult(toolResult);
+  if (!details) return undefined;
+  const queryTerms = exactTerms(details.query).filter((term) => /[a-z]/iu.test(term));
+  if (
+    queryTerms.length !== spec.exactTerms.length ||
+    queryTerms.some((term, index) => term !== spec.exactTerms[index])
+  )
+    return undefined;
+
+  if (details.resultStatus === "no_matches_in_searched_window") {
+    if (details.items.length > 0) return undefined;
+    return details.coverage.coverage === "complete"
+      ? "没有找到符合条件的消息。"
+      : "在本次检索到的范围内没有找到符合条件的消息。";
+  }
+  if (details.items.length === 0) return undefined;
+
+  const blocks: string[] = [];
+  for (const item of details.items) {
+    if (!carriesEveryExactTerm(item.snippet, spec.exactTerms)) return undefined;
+    const lines: string[] = [];
+    for (const field of spec.fields) {
+      if (field === "group") lines.push(`群号：${item.groupId}`);
+      if (field === "sender") {
+        if (!item.senderId) return undefined;
+        lines.push(`发送者：${item.senderId}${item.senderName ? `（${item.senderName}）` : ""}`);
+      }
+      if (field === "time") {
+        if (!item.occurredAt) return undefined;
+        lines.push(`时间：${item.occurredAt}`);
+      }
+      if (field === "text") lines.push(`原文：${item.snippet}`);
+    }
+    blocks.push(lines.join("\n"));
+  }
+  return blocks.join("\n\n");
 }
 
 /**

@@ -1005,7 +1005,9 @@ describe("an explicit current-group history search requires the group Tool", () 
   const searched = (query: string): PiRunResult => ({
     status: "completed",
     text: "发送者是 member-a，原文是 P4B-A-1349。",
-    toolCalls: [{ name: GROUP_HISTORY_SEARCH_TOOL, input: { query }, failed: false }],
+    toolCalls: [
+      { name: GROUP_HISTORY_SEARCH_TOOL, input: { query: query.toLowerCase() }, failed: false },
+    ],
   });
 
   it("requires the current-group Tool and accepts the Run that called it", async () => {
@@ -1015,10 +1017,93 @@ describe("an explicit current-group history search requires the group Tool", () 
       text: "发送者是 member-a，原文是 P4B-A-1349。",
     });
     expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe(GROUP_HISTORY_SEARCH_TOOL);
-    // The message pins down no Tool parameter, so the required input pins none either: any
-    // call the Tool itself accepts satisfies it.
-    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({});
+    // The identifier is literal input. A call for a different query cannot satisfy the Run.
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({ query: "p4b-a-1349" });
     expect(f.run).toHaveBeenCalledOnce();
+  });
+
+  it("replaces a verbose model answer with the exact fields projected from Tool evidence", async () => {
+    const f = groupFixture(
+      [
+        {
+          status: "completed",
+          text: "真调结果：considered=23，coverage=complete。",
+          toolCalls: [
+            {
+              name: GROUP_HISTORY_SEARCH_TOOL,
+              input: { query: "p4b-a-1349", limit: 50 },
+              failed: false,
+              result: {
+                content: [{ type: "text", text: "model-visible result" }],
+                details: {
+                  query: "p4b-a-1349",
+                  resultStatus: "matches_found",
+                  coverage: { coverage: "complete" },
+                  items: [
+                    {
+                      groupId: "1126022432",
+                      senderId: "3526039967",
+                      senderName: "lora",
+                      occurredAt: "2026-09-20T13:48:07.000Z",
+                      snippet: "P4B-A-1349",
+                    },
+                  ],
+                },
+              },
+            },
+          ],
+        },
+      ],
+      [GROUP_HISTORY_SEARCH_TOOL],
+    );
+    f.input.text =
+      "请搜索本群历史，精确查找 P4B-A-1349，并只根据实际工具结果回复发送者、时间和原文。";
+
+    await expect(f.executor.execute(f.input)).resolves.toEqual({
+      status: "succeeded",
+      text: "发送者：3526039967（lora）\n时间：2026-09-20T13:48:07.000Z\n原文：P4B-A-1349",
+      providerSessionId: "session-1",
+    });
+  });
+
+  it("fails closed when a strict reply lacks Tool-backed requested fields", async () => {
+    const f = groupFixture(
+      [
+        {
+          status: "completed",
+          text: "我猜发送时间是昨天。",
+          toolCalls: [
+            {
+              name: GROUP_HISTORY_SEARCH_TOOL,
+              input: { query: "p4b-a-1349" },
+              failed: false,
+              result: {
+                details: {
+                  query: "p4b-a-1349",
+                  resultStatus: "matches_found",
+                  coverage: { coverage: "complete" },
+                  items: [
+                    {
+                      groupId: "1126022432",
+                      senderId: "3526039967",
+                      snippet: "P4B-A-1349",
+                    },
+                  ],
+                },
+              },
+            },
+          ],
+        },
+      ],
+      [GROUP_HISTORY_SEARCH_TOOL],
+    );
+    f.input.text =
+      "请搜索本群历史，精确查找 P4B-A-1349，并只根据实际工具结果回复发送者、时间和原文。";
+
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "failed",
+      text: "未能从 QQ 获取完整的请求字段，因此无法确认。",
+    });
   });
 
   it("fails closed when the model answers without calling the Tool", async () => {
@@ -1036,8 +1121,10 @@ describe("an explicit current-group history search requires the group Tool", () 
     });
     expect(f.run).toHaveBeenCalledTimes(2);
     expect(f.run.mock.calls[1]?.[2]).toContain(GROUP_HISTORY_SEARCH_TOOL);
-    // The retry never names a parameter the message did not pin down.
-    expect(f.run.mock.calls[1]?.[2]).not.toContain("JSON input");
+    expect(f.run.mock.calls[1]?.[2]).toContain(
+      'with exactly this JSON input: {"query":"p4b-a-1349"}',
+    );
+    expect(f.run.mock.calls[1]?.[2].match(/group_history_search/gu)).toHaveLength(1);
   });
 
   it("fails closed when the Tool call itself failed", async () => {

@@ -3,7 +3,12 @@ import { createQqDeliveryPolicy } from "../../delivery/content-policy.js";
 import { openDomainStore } from "../../persistence/index.js";
 import { ChannelArchiveStore } from "../../retrieval/channel-archive.js";
 import { groupResourceId } from "../../retrieval/source-resolver.js";
-import { createHistoryTools, availableHistoryToolNames } from "./history-tools.js";
+import {
+  createHistoryTools,
+  availableHistoryToolNames,
+  projectStrictHistoryReply,
+  strictHistoryReplySpec,
+} from "./history-tools.js";
 import {
   GROUP_HISTORY_SEARCH_TOOL,
   OWNER_HISTORY_ACTION,
@@ -1429,6 +1434,63 @@ it("withholds the sender of an item whose content is withheld", async () => {
  * and the real acceptance run uses a temporary one in a dedicated test group.
  */
 const EXACT_IDENTIFIER = "P4B-A-1349";
+
+it("physically projects an exact-field reply from Tool details instead of model prose", () => {
+  const spec = strictHistoryReplySpec(
+    `请搜索本群历史，精确查找 ${EXACT_IDENTIFIER}，并只根据实际工具结果回复发送者、时间和原文。`,
+  );
+  expect(spec).toEqual({
+    fields: ["sender", "time", "text"],
+    exactTerms: [EXACT_IDENTIFIER.toLowerCase()],
+  });
+
+  const text = projectStrictHistoryReply(spec!, {
+    content: [{ type: "text", text: "model-visible projection" }],
+    details: {
+      query: EXACT_IDENTIFIER.toLowerCase(),
+      resultStatus: "matches_found",
+      coverage: { coverage: "complete" },
+      items: [
+        {
+          groupId: "100",
+          senderId: "member-e",
+          senderName: "Carrier",
+          occurredAt: "2026-09-18T09:00:00Z",
+          snippet: `已合并 ${EXACT_IDENTIFIER} 到 main`,
+        },
+      ],
+    },
+  });
+
+  expect(text).toBe(
+    `发送者：member-e（Carrier）\n时间：2026-09-18T09:00:00Z\n原文：已合并 ${EXACT_IDENTIFIER} 到 main`,
+  );
+  expect(text).not.toContain("coverage");
+  expect(text).not.toContain("model-visible projection");
+});
+
+it("fails the strict projection when the Tool result cannot prove a requested field", () => {
+  const spec = strictHistoryReplySpec(
+    `只回复 ${EXACT_IDENTIFIER} 的发送者、时间和原文，并搜索本群历史。`,
+  );
+  expect(spec).toBeDefined();
+  expect(
+    projectStrictHistoryReply(spec!, {
+      details: {
+        query: EXACT_IDENTIFIER,
+        resultStatus: "matches_found",
+        coverage: { coverage: "complete" },
+        items: [
+          {
+            groupId: "100",
+            senderId: "member-e",
+            snippet: EXACT_IDENTIFIER,
+          },
+        ],
+      },
+    }),
+  ).toBeUndefined();
+});
 
 /** Messages that share a token with the identifier without carrying it. */
 async function ingestNearMisses(
