@@ -47,7 +47,8 @@ export interface ProtectedToolOptions<
   label?: string;
   description: string;
   parameters: TSchema;
-  action: string;
+  /** The authorization action may depend on the validated operation selected by the call. */
+  action: string | ((params: TParams, context: ProtectedToolContext) => string);
   /**
    * The Resource this Action protects. A function may derive it from the call params
    * and/or the Run context, so a tool can bind to the current Channel scope (for
@@ -197,12 +198,16 @@ export function createProtectedTool<
         typeof options.resourceId === "function"
           ? options.resourceId(typedParams, context)
           : options.resourceId;
+      const action =
+        typeof options.action === "function"
+          ? options.action(typedParams, context)
+          : options.action;
 
       // Gate 3 — Re-authorize immediately before executing side effect!
       const decision = await options.authService.check({
         caller: context.caller,
         resourceId,
-        action: options.action,
+        action,
         conversationId: context.conversationId,
         runId: context.runId,
       });

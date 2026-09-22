@@ -10,6 +10,7 @@ import type { PiRunContext, PiRuntimeAdapter, PiRuntimeProfileName } from "./typ
 import { GROUP_HISTORY_SEARCH_TOOL, OWNER_HISTORY_SEARCH_TOOL } from "./history-tools.js";
 import { requiredInputClause, satisfiesRequiredInput } from "./protected-tools.js";
 import { OWNER_GROUP_ADMIN_TOOL } from "./owner-tools.js";
+import { OWNER_MEMORY_ADMIN_TOOL } from "./owner-memory-tools.js";
 import {
   asksLiveQqFact,
   groupHistorySearchRequested,
@@ -27,6 +28,111 @@ interface RequiredToolCall {
   name: string;
   /** The exact input the current user message requires; every key must match the call. */
   input: Record<string, unknown>;
+}
+
+/** Parse only the current Owner message; historical or retrieved text is never mutation intent. */
+function ownerMemoryCommand(text: string): RequiredToolCall | undefined {
+  const command = text.trim();
+  const scopeInput = (value: string): Record<string, string> | undefined => {
+    if (value === "global") return { scopeType: "global" };
+    if (/^project:[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(value))
+      return { scopeType: "project", projectId: value.slice(8) };
+    return undefined;
+  };
+  const write =
+    /^\/memory write (\S+) (preference|semantic_fact|episodic_event|relationship) (.+)$/u.exec(
+      command,
+    );
+  if (write) {
+    const scope = scopeInput(write[1]!);
+    if (!scope) return undefined;
+    return {
+      name: OWNER_MEMORY_ADMIN_TOOL,
+      input: { action: "write", ...scope, type: write[2], statement: write[3] },
+    };
+  }
+  const list = /^\/memory list(?: (all|global|project:[A-Za-z0-9][A-Za-z0-9_-]{0,127}))?$/u.exec(
+    command,
+  );
+  if (list) {
+    const scope = list[1] === undefined || list[1] === "all" ? undefined : scopeInput(list[1]);
+    if (list[1] !== undefined && list[1] !== "all" && !scope) return undefined;
+    return {
+      name: OWNER_MEMORY_ADMIN_TOOL,
+      input: { action: "list", ...scope },
+    };
+  }
+  const get = /^\/memory get (\S+)$/u.exec(command);
+  if (get) return { name: OWNER_MEMORY_ADMIN_TOOL, input: { action: "get", id: get[1] } };
+  if (command === "/memory candidates")
+    return { name: OWNER_MEMORY_ADMIN_TOOL, input: { action: "list_candidates" } };
+  const source =
+    /^\/memory source (\S+) ([1-9]\d{0,15}) (history|notice|essence|metadata|file|album)$/u.exec(
+      command,
+    );
+  if (source) {
+    const scope = scopeInput(source[1]!);
+    if (!scope) return undefined;
+    return {
+      name: OWNER_MEMORY_ADMIN_TOOL,
+      input: {
+        action: "source",
+        ...scope,
+        groupId: source[2],
+        sourceClass: source[3],
+      },
+    };
+  }
+  const feedback =
+    /^\/memory feedback (\S+) (accept|reject|edit|revert|explicit_positive|explicit_negative) (.+)$/u.exec(
+      command,
+    );
+  if (feedback) {
+    const scope = scopeInput(feedback[1]!);
+    if (!scope) return undefined;
+    return {
+      name: OWNER_MEMORY_ADMIN_TOOL,
+      input: { action: "feedback", ...scope, signalType: feedback[2], statement: feedback[3] },
+    };
+  }
+  const changed = /^\/memory (update|supersede) (\S+) (.+)$/u.exec(command);
+  if (changed)
+    return {
+      name: OWNER_MEMORY_ADMIN_TOOL,
+      input: { action: changed[1], id: changed[2], statement: changed[3] },
+    };
+  const governed = /^\/memory (promote|reject|expire|revoke|retire) (\S+)$/u.exec(command);
+  if (governed)
+    return { name: OWNER_MEMORY_ADMIN_TOOL, input: { action: governed[1], id: governed[2] } };
+
+  const naturalSource =
+    /(?:提取|导入|创建|生成).*(?:候选|candidate)|(?:候选|candidate).*(?:提取|导入|创建|生成)/iu.test(
+      command,
+    );
+  if (!naturalSource) return undefined;
+  const groupId = namedGroupId(command);
+  const scopeMatch = /\b(global|project:[A-Za-z0-9][A-Za-z0-9_-]{0,127})\b/u.exec(command);
+  const scope = scopeMatch ? scopeInput(scopeMatch[1]!) : undefined;
+  if (!groupId || !scope) return undefined;
+  const sourceClass = /(?:历史|history|消息)/iu.test(command)
+    ? "history"
+    : /(?:公告|notice)/iu.test(command)
+      ? "notice"
+      : /(?:精华|essence)/iu.test(command)
+        ? "essence"
+        : undefined;
+  if (!sourceClass) return undefined;
+  const quotedQuery = /[“"]([^”"]{1,256})[”"]/u.exec(command)?.[1]?.trim();
+  return {
+    name: OWNER_MEMORY_ADMIN_TOOL,
+    input: {
+      action: "source",
+      ...scope,
+      groupId,
+      sourceClass,
+      ...(quotedQuery ? { query: quotedQuery } : {}),
+    },
+  };
 }
 
 /** The provider parameters the current message pins down, or `undefined` when it pins none. */
@@ -299,6 +405,31 @@ export type RunEvidenceRecord =
       resolutions: readonly EvidenceResolution[];
     };
 
+function groupHistorySearchFollowUpRequested(input: ExecutionInput): boolean {
+  const text = input.text.trim();
+  if (!text || /(?:不要|不用|无需|不需要|请勿|不许|停止|别再|别去|别帮我)/u.test(text))
+    return false;
+  const recentHistory = input.history.slice(-6);
+  if (
+    !recentHistory.some(
+      (turn) =>
+        (turn.role === "user" && groupHistorySearchRequested(turn.text)) ||
+        /群历史|聊天记录|消息记录|历史消息|检索结果|查到|查到了|发言记录|发言时间线/u.test(
+          turn.text,
+        ),
+    )
+  )
+    return false;
+  const asksToRetryOrVerify =
+    /漏|遗漏|不全|完整|全部|所有|继续.{0,12}(?:查|搜|检索|核对)|重新.{0,12}(?:查|搜|检索|核对)|再.{0,12}(?:查|搜|检索|核对)/u.test(
+      text,
+    );
+  const personOrTimeReference =
+    /这个人|那个人|此人|他|她|他们|对方|刚才|前面|之前|最新|最近|上次|[1-9]\d{4,15}/u;
+  const messageActivity = /说|问|发|发言|消息|记录|检索|查|搜|回复|提到/u;
+  return asksToRetryOrVerify || (personOrTimeReference.test(text) && messageActivity.test(text));
+}
+
 export function piProfileName(
   chatType: ExecutionInput["caller"]["scope"]["chatType"],
   isOwner: boolean,
@@ -318,9 +449,14 @@ export function piProfileName(
  * the required Tool fails closed below rather than reporting success. Requiring is never
  * granting: the Tool still re-authorizes its own Resource at execution time.
  */
-function requiredToolCall(input: ExecutionInput, isOwner: boolean): RequiredToolCall | undefined {
+function requiredToolCall(
+  input: ExecutionInput,
+  isOwner: boolean,
+  authorizedToolNames?: readonly string[],
+): RequiredToolCall | undefined {
   if (input.caller.scope.chatType === "group") {
-    if (!groupHistorySearchRequested(input.text)) return undefined;
+    if (!groupHistorySearchRequested(input.text) && !groupHistorySearchFollowUpRequested(input))
+      return undefined;
     // The message names no parameter of its own: the query is the model's to compose, and the
     // group comes from the Run's trusted scope. The requirement is the call, not its arguments.
     return { name: GROUP_HISTORY_SEARCH_TOOL, input: {} };
@@ -328,14 +464,19 @@ function requiredToolCall(input: ExecutionInput, isOwner: boolean): RequiredTool
   // Everything below is the Owner-private surface. A management Tool is never required
   // outside a private Owner Run, whatever else a message may name.
   if (input.caller.scope.chatType !== "private" || !isOwner) return undefined;
-  // Read from the requests that ask for something: one that refuses a request, or that asks how
-  // something is done or whether it can be, drops the request it speaks for and nothing else the
-  // message asks for. A negation somewhere in the message is not a refusal of it — `别太久` is an
-  // instruction about a mute, not a refusal to mute — and `可以吗` appended to an instruction asks
-  // whether it may be done rather than taking it back. Reading the whole message for either
-  // dropped requirements the Owner had actually made.
-  const text = requestClauses(input.text);
-  if (ownerHistorySearchRequested(text)) return { name: OWNER_HISTORY_SEARCH_TOOL, input: {} };
+  const rawText = input.text;
+  if (authorizedToolNames?.includes(OWNER_MEMORY_ADMIN_TOOL)) {
+    const memory = ownerMemoryCommand(rawText);
+    if (memory) return memory;
+  }
+  const text = requestClauses(rawText);
+  if (
+    /不要查看|不用查看|无需查看|不需要查看|请勿查看|不许查看|停止查看|别再查看|别去查看|别帮我查看/u.test(
+      rawText,
+    )
+  )
+    return undefined;
+  if (ownerHistorySearchRequested(rawText)) return { name: OWNER_HISTORY_SEARCH_TOOL, input: {} };
   const groupId = namedGroupId(text);
   if (!groupId) return undefined;
   // A question about what a group *contains* is answered by live QQ evidence, not by reading
@@ -468,7 +609,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       profile,
       context,
     );
-    const required = requiredToolCall(input, isOwner);
+    const required = requiredToolCall(input, isOwner, context.authorizedToolNames);
     if (required !== undefined) {
       context.requiredToolName = required.name;
       context.requiredToolInput = required.input;

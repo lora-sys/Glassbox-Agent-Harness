@@ -131,6 +131,9 @@ export interface QqSourceCandidate {
   sourceClass: QqSourceClass;
   text: string;
   occurredAt: string;
+  /** Stable source provenance retained when the candidate becomes Memory evidence. */
+  externalMessageId?: string;
+  senderId?: string;
   returnMode: ReturnMode;
 }
 

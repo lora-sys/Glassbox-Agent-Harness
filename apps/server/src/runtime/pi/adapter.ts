@@ -113,6 +113,10 @@ function textFromContent(content: unknown): string {
     .join("");
 }
 
+export function glassboxSystemPrompt(modelPrompt: string): string {
+  return `${modelPrompt.trim()}\n\nReply in concise plain text suitable for QQ. Do not reveal host paths, internal service addresses, configuration names, or internal identifiers.\n\nTool availability is scoped to the current caller, location, and authorization. A tool missing from the current Run does not mean the product capability is unimplemented. State that the capability is unavailable in the current context. Never invent an unimplemented status, future rollout, or replacement API.`;
+}
+
 function safeToolInput(toolName: string, args: unknown): Record<string, unknown> | undefined {
   if (toolName !== "owner_group_admin" || !args || typeof args !== "object") return undefined;
   const input = args as Record<string, unknown>;
@@ -398,7 +402,9 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
     const settingsManager = SettingsManager.inMemory();
     if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/u.test(profile.promptTemplate))
       throw new Error("Invalid Kit prompt template");
-    const basePrompt = `${this.loader.modelPrompt(profile.name, modelVisibleSkillNames ?? []).trim()}\n\nReply in concise plain text suitable for QQ. Do not reveal host paths, internal service addresses, configuration names, or internal identifiers.`;
+    const basePrompt = glassboxSystemPrompt(
+      this.loader.modelPrompt(profile.name, modelVisibleSkillNames ?? []),
+    );
     let runtimeSessionId: string | undefined;
     const promptForRun = () => {
       const runContext = runtimeSessionId ? this.runContexts.get(runtimeSessionId) : undefined;

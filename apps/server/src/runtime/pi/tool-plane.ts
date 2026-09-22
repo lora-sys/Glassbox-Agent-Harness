@@ -33,9 +33,16 @@
 import { createHash } from "node:crypto";
 import { QQ_CAPABILITIES, type QqCapabilityRisk } from "../../channels/onebot/capabilities.js";
 import { GROUP_HISTORY_SEARCH_TOOL, OWNER_HISTORY_SEARCH_TOOL } from "./history-tools.js";
+import { OWNER_MEMORY_ADMIN_TOOL } from "./owner-memory-tools.js";
 import { OWNER_GROUP_ADMIN_TOOL } from "./owner-tools.js";
 import { OPS_TOOL_NAMES } from "./ops-tools.js";
 import { SKILL_READ_TOOL } from "./skill-tools.js";
+import {
+  MEMORY_GOVERN_ACTION,
+  MEMORY_READ_ACTION,
+  MEMORY_WRITE_ACTION,
+  OWNER_MEMORY_RESOURCE,
+} from "../../learning/store.js";
 import type { PiRuntimeProfileName } from "./types.js";
 
 /** Where a capability comes from. Provenance only — never authority. */
@@ -92,7 +99,7 @@ export type ToolGroundingClass =
  * enough to see that a Tool reaches the same Resource family its Action belongs to.
  */
 export interface ToolAuthorizationBinding {
-  action: string;
+  action: string | readonly string[];
   resource: string;
 }
 
@@ -334,6 +341,22 @@ const DOMAIN_TOOL_DESCRIPTORS: readonly ToolDescriptor[] = Object.freeze([
     availability: "none",
     resultProjection: "projected",
     grounding: "direct_observation",
+    budgetClass: "core",
+  },
+  {
+    name: OWNER_MEMORY_ADMIN_TOOL,
+    origin: "glassbox_domain",
+    schemaVersion: "owner-memory-admin-v1",
+    riskClass: "write",
+    provider: "glassbox-learning",
+    discovery: "owner_private",
+    authorization: {
+      action: [MEMORY_READ_ACTION, MEMORY_WRITE_ACTION, MEMORY_GOVERN_ACTION],
+      resource: OWNER_MEMORY_RESOURCE,
+    },
+    availability: "none",
+    resultProjection: "projected",
+    grounding: "local_computation",
     budgetClass: "core",
   },
   {

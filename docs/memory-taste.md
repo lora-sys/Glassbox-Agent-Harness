@@ -1,5 +1,30 @@
 # Glassbox Memory and Taste
 
+## P4A Owner confirmation boundary
+
+The Owner-private `owner_memory_admin` Tool reads the current persisted Run input before
+changing canonical Memory. A model-suggested `write` or `supersede` creates a pending
+candidate; it cannot use a prompt description as confirmation. The Owner can inspect
+the candidate and send `/memory promote <candidate-id>` in a later message. Exact
+`/memory reject <candidate-id>` and `/memory expire|revoke|retire <memory-id>` commands
+govern lifecycle. An explicit write uses
+`/memory write global|project:<project-id> <memory-type> <statement>`; an explicit
+correction uses `/memory supersede <memory-id> <statement>` and inherits the original
+scope and type. `/memory feedback global|project:<project-id> <signal> <statement>`
+records a feedback event and a scoped candidate, never immediate Taste.
+
+Inspection uses `/memory list [all|global|project:<project-id>]`, `/memory get <memory-id>`
+and `/memory candidates`. An authorized QQ source can be imported through
+`/memory source global|project:<project-id> <group-id> <source-class>`. Source class is one
+of `history`, `notice`, `essence`, `metadata`, `file` or `album`. The Tool contract also
+supports bounded query, limit, since and until fields for time-bounded source reads.
+
+Conversation extraction and enabled, authorized QQ source reads are available through
+the Owner-private Tool's `extract` and `source` actions. Both create candidates only;
+the source content remains untrusted evidence with group, message, sender, Run and
+authorization provenance. This is a deterministic product path, not proof of a live
+QQ/NapCat acceptance run.
+
 Status: CURRENT DIRECTION / P4A ACTIVE / P4B CONSUMER
 
 This document defines the ownership and learning boundary between Rules, Skills, Taste, Feedback, and durable Memory.
@@ -505,6 +530,8 @@ retrieval evidence
 P4B must authorize before protected candidates are loaded.
 
 P4A exposes canonical MGP-derived Memory objects plus Glassbox Resource / scope mapping. P4B consumes them through MGP-style Recall / SearchResult contracts without mutating P4A confidence or promotion state.
+The shared `@glassbox/contracts` package exports this canonical Memory, scope, lifecycle,
+evidence and retention boundary. P4B does not import the P4A store implementation.
 
 Taste still comes before broad Memory retrieval as a learning mechanism, but P4A and P4B can be implemented in parallel because P4B develops against deterministic retrieval fixtures until the P4A projection is available.
 

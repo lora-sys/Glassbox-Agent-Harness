@@ -42,12 +42,22 @@ import {
 } from "../runtime/pi/skill-tools.js";
 import type { ProtectedToolContext } from "../runtime/pi/protected-tools.js";
 import {
+  createOwnerMemoryTools,
+  OWNER_MEMORY_ADMIN_TOOL,
+} from "../runtime/pi/owner-memory-tools.js";
+import {
+  MEMORY_GOVERN_ACTION,
+  MEMORY_READ_ACTION,
+  MEMORY_WRITE_ACTION,
+  OWNER_MEMORY_RESOURCE,
+} from "../learning/store.js";
+import {
   availableHistoryToolNames,
   createHistoryTools,
   historyToolEligibility,
+  type HistorySyncOutcome,
   OWNER_HISTORY_ACTION,
   OWNER_HISTORY_RESOURCE,
-  type HistorySyncOutcome,
 } from "../runtime/pi/history-tools.js";
 import {
   availableCapabilityToolNames,
@@ -58,12 +68,6 @@ import {
 } from "../runtime/pi/capability-tools.js";
 import { resolveSkillVisibility } from "../runtime/pi/skill-visibility.js";
 import { requireProviderSuccess } from "../runtime/pi/provider-outcome.js";
-import {
-  TOOL_DESCRIPTORS,
-  type ToolDescriptor,
-  type ToolExclusionReason,
-  type ToolSurfaceCandidate,
-} from "../runtime/pi/tool-plane.js";
 import type { PiRunContext } from "../runtime/pi/types.js";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import {
@@ -105,20 +109,15 @@ import { ManagementError } from "./access.js";
 import { readManagementJson } from "./http.js";
 import { grantOpsPermissions } from "./ops-grants.js";
 import { createQqDeliveryPolicy, hostDeliveryForbiddenValues } from "../delivery/content-policy.js";
+import {
+  TOOL_DESCRIPTORS,
+  type ToolDescriptor,
+  type ToolSurfaceCandidate,
+  type ToolExclusionReason,
+} from "../runtime/pi/tool-plane.js";
 
 const OWNER_ID = "owner";
 const AGENT_ID = "personal";
-/**
- * A context an authorization decision can be made in that is not necessarily a Run.
- *
- * `conversationId` and `runId` are optional because `authorization_decisions` records them as
- * real references to real rows. A management-initiated operation — the capability acceptance —
- * belongs to no Conversation and no Run, and it must say so by leaving them absent rather than
- * inventing identifiers: a placeholder string would make the evidence claim a Conversation and
- * a Run that never existed, which is exactly the kind of unproven claim the acceptance exists
- * to rule out. A `ProtectedToolContext` satisfies this, so a Tool call is unaffected and still
- * records the Run it really ran in.
- */
 type AuthorizationContext = {
   caller: CallerContext;
   conversationId?: string;
@@ -411,8 +410,6 @@ export class ManagementApplication {
           });
         const caller = context.caller;
         const isOwner = await this.store.identities.isOwner(caller.principalId);
-        // The group's configuration is read only when the group is the audience that decides
-        // it. An Owner-private Run has no group whitelist to consult.
         const group =
           caller.scope.chatType === "group" && !isOwner
             ? this.groupRuntime.get(
@@ -453,8 +450,6 @@ export class ManagementApplication {
           input.caller.scope.chatType,
           await this.store.identities.isOwner(input.caller.principalId),
         ),
-      // What the Runtime required a Run to observe, and how the Run answered it. Safe evidence:
-      // domains, Tool names and outcomes, never provider text or protected content.
       onEvidence: async (record) => {
         const caller = await this.store.lifecycle.traceCaller(record.runId, record.principalId);
         const cursor = await this.trace.append(record.runId, record, "glassbox-tool-evidence");
@@ -491,6 +486,7 @@ export class ManagementApplication {
         getContext,
         manageGroup: (context, input) => this.manageGroup(context, input),
       }),
+      ...createOwnerMemoryTools({ store: this.store, getContext }),
       ...createSkillTools({
         store: this.store,
         loader: this.kitLoader,
@@ -502,8 +498,6 @@ export class ManagementApplication {
         archive: this.archive,
         getContext,
         isHistoryEnabled: (connectionId, groupId) => this.isHistoryEnabled(connectionId, groupId),
-        // The walk's outcome is passed straight through: it is what the search reports as its
-        // source coverage, and only `end_of_source` lets an answer say the group was read.
         syncGroup: (groupId, context) =>
           this.syncGroupHistory(context.caller.scope.connectionId, groupId),
         botIdForConnection: (connectionId) => this.channels.resolve(connectionId).config.botId,
@@ -523,10 +517,6 @@ export class ManagementApplication {
         invoke: async ({ action, params, context }) => {
           const connection = this.connections.get(context.caller.scope.connectionId);
           if (!connection) throw new Error("channel_not_connected");
-          // The one outbound provider path. A provider result that is not `ok` fails the Tool
-          // call here rather than travelling back as a successful result carrying a failure
-          // envelope, which a model could describe as data and an evidence check could count
-          // as an answer.
           return requireProviderSuccess(await connection.invokeCapability({ action, params }));
         },
         search: (input) => this.searchCapabilities(input.context, input),
@@ -641,6 +631,8 @@ export class ManagementApplication {
     }
     classified.add(OWNER_GROUP_ADMIN_TOOL);
     if (!ownerPrivate) scopeGates.set(OWNER_GROUP_ADMIN_TOOL, "scope_not_permitted");
+    classified.add(OWNER_MEMORY_ADMIN_TOOL);
+    if (!ownerPrivate) scopeGates.set(OWNER_MEMORY_ADMIN_TOOL, "scope_not_permitted");
     classified.add(SKILL_READ_TOOL);
     if (!context.authorizedSkillNames?.length) scopeGates.set(SKILL_READ_TOOL, "policy_disabled");
 
@@ -679,7 +671,7 @@ export class ManagementApplication {
     return candidates;
   }
 
-  private async resolveRunToolNames(context: PiRunContext): Promise<string[]> {
+  async resolveRunToolNames(context: PiRunContext): Promise<string[]> {
     return (await this.resolveRunToolCandidates(context))
       .filter((candidate) => candidate.exclusion === null)
       .map((candidate) => candidate.name);
@@ -1106,7 +1098,27 @@ export class ManagementApplication {
         scope,
         effect: "allow",
       });
-      for (const name of [...(this.options.ops ? OPS_TOOL_NAMES : []), OWNER_GROUP_ADMIN_TOOL]) {
+      await this.store.authorization.registerResource({
+        id: OWNER_MEMORY_RESOURCE,
+        kind: "owner-memory",
+        visibility: "private",
+        ownerId: OWNER_ID,
+        ifAbsent: true,
+      });
+      for (const action of [MEMORY_READ_ACTION, MEMORY_WRITE_ACTION, MEMORY_GOVERN_ACTION]) {
+        await this.store.authorization.grant({
+          principalId,
+          resourceId: OWNER_MEMORY_RESOURCE,
+          action,
+          scope,
+          effect: "allow",
+        });
+      }
+      for (const name of [
+        ...(this.options.ops ? OPS_TOOL_NAMES : []),
+        OWNER_GROUP_ADMIN_TOOL,
+        OWNER_MEMORY_ADMIN_TOOL,
+      ]) {
         const resourceId = toolResourceId(name);
         await this.store.authorization.registerResource({
           id: resourceId,
@@ -1533,11 +1545,6 @@ export class ManagementApplication {
    * never loop forever. Ingest is deduped by (channel, connection, group, external message
    * id) and by message id within one walk, so repeated syncs are idempotent and never
    * create Runs.
-   *
-   * It returns why it stopped, because the caller reports that as the search's source
-   * coverage. Only `end_of_source` means the archive now holds this group back to its
-   * beginning; every other stop leaves history the search cannot see, and a caller that
-   * could not tell those apart would report the window as exhausted either way.
    */
   private async syncGroupHistory(
     connectionId: string,
@@ -1588,15 +1595,7 @@ export class ManagementApplication {
           occurredAt: message.occurredAt,
         });
       }
-      // The bound is checked before the cursor, because it is the reason the walk stopped:
-      // a page that reached `since` and also carried a next cursor was still stopped by the
-      // caller's bound, and reporting it as the end of the source would overstate the walk.
       const next = result.nextCursor;
-      // No usable sequence to continue from. The adapter omits the cursor both for a page
-      // that carried nothing and for a page that carried records it could not sequence, and
-      // only the first of those is the provider saying it has nothing older. Calling the
-      // second one the end of the source is how a walk that stalled would let a search
-      // report the group as fully read.
       if (next === undefined)
         return {
           pagesWalked,
@@ -1867,10 +1866,9 @@ export class ManagementApplication {
    * Each fact is the real `authorization.check` decision for this Principal, this concrete
    * `group:<id>` Resource and this Run — the same call the capability and history Tools make,
    * recording the same `authorization_decisions` evidence, with the current Conversation and
-   * Run attached when the caller has them. `hasActiveGrant` is deliberately not used: it
-   * answers the management reverse-state question ("does anyone still hold this assignment")
-   * and bypasses identity and visibility evaluation, so a grant it finds is not an
-   * authorization decision.
+   * Run attached. `hasActiveGrant` is deliberately not used: it answers the management
+   * reverse-state question ("does anyone still hold this assignment") and bypasses identity
+   * and visibility evaluation, so a grant it finds is not an authorization decision.
    */
   private async managedGroupFacts(context: AuthorizationContext): Promise<ManagedGroupFacts[]> {
     const caller = context.caller;
@@ -2002,37 +2000,8 @@ export class ManagementApplication {
     return { connectionId: context.caller.scope.connectionId, groups };
   }
 
-  /**
-   * The read-only QQ acceptance: really calling each provider-backed read path once.
-   *
-   * A capability that is registered, allowlisted and covered by deterministic tests is still
-   * not known to work against the bridge in front of it, and a Run must not report the first
-   * as the second. This is the fresh, time-stamped observation that answers the difference.
-   *
-   * Three things keep it honest. The provider call goes through `invokeCapability` — the same
-   * allowlisted outbound path a capability Tool uses, including the group binding — so the
-   * acceptance can only prove calls Glassbox would really make. Every path is authorized first,
-   * against the same Resource the Tool would derive and under the same Owner policy, so the
-   * acceptance is a measurement *inside* the authorization boundary rather than a way around
-   * it: a group the Owner has not assigned reports `denied` and calls nothing, and a report can
-   * therefore never show a bridge working for a read no Run could perform. And each observation
-   * is appended to the Trace as it is made, so the evidence survives the probe failing partway
-   * rather than depending on the caller reporting back.
-   *
-   * The provider's raw result is classified here rather than thrown through
-   * `requireProviderSuccess`: an acceptance has to record *which* way a call failed, and a
-   * thrown failure would collapse every one of them into the same opaque code.
-   *
-   * The one provider-free path (`qq_groups`' managed listing) is probed too, because the
-   * issue asks for it — under a management context, since this probe is not a Run and must not
-   * borrow a Run's identity. Its success is recorded with `providerBacked: false` and never
-   * counted as provider health.
-   */
   async probeCapabilities(channelId: string, groupId: string): Promise<CapabilityProbeReport> {
     const configured = this.channels.resolve(channelId);
-    // The target is the dedicated acceptance group the operator named, and it must be one this
-    // Channel is configured for. A group Glassbox does not manage is refused here rather than
-    // discovered by the provider.
     if (!configured.config.groupIds.includes(groupId))
       throw new ManagementError("INVALID_REQUEST", "The group is not configured for this channel");
     const connection = this.connections.get(channelId);
@@ -2040,24 +2009,12 @@ export class ManagementApplication {
 
     const owner = this.ownerPrivateScopes(configured)[0];
     if (!owner) throw new ManagementError("INVALID_REQUEST", "The channel has no owner");
-    // The acceptance runs as the Owner, in the Owner's scope, and in no Run: the decisions it
-    // records carry no Conversation and no Run because it has neither. That is what lets a
-    // reader tell an acceptance apart from an Agent execution in `authorization_decisions`,
-    // and it is why the decision row can be written at all — those columns reference real
-    // `conversations` and `runs` rows, so a placeholder name would either fail the reference
-    // or, worse, be a decision claiming a context that never existed.
     const context: AuthorizationContext = {
       caller: { principalId: owner.principalId, scope: owner.scope },
     };
 
     return probeReadCapabilities({
       groupId,
-      // Acceptance asks the same question a Run's Tool call is re-authorized with, on the same
-      // Resource derivation and under the same Owner policy, and records the answer instead of
-      // assuming it. Being configured for a group is a transport fact, not authority: a group
-      // the Owner has not assigned has no grants, so every path against it is denied here
-      // exactly as it would be for a Run — which is what makes a `complete` acceptance evidence
-      // that the bridge works on a group Glassbox would really read.
       decide: async (path, target) => {
         const decision = await this.store.authorization.check({
           caller: context.caller,
@@ -2070,8 +2027,6 @@ export class ManagementApplication {
           action: path.action,
         });
         if (decision.decision !== "ALLOW") return "denied";
-        // Owner intent is a second, independent gate: the grant alone is not enough. The
-        // managed listing names no group, so it has no per-group policy to consult.
         if (path.listing) return "allowed";
         return (await this.isCategoryEnabled(channelId, groupId, path.category))
           ? "allowed"

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vite-plus/test";
 import type { ExecutionInput } from "../../execution/run-service/types.js";
 import { GROUP_HISTORY_SEARCH_TOOL, OWNER_HISTORY_SEARCH_TOOL } from "./history-tools.js";
+import { OWNER_MEMORY_ADMIN_TOOL } from "./owner-memory-tools.js";
 import { piProfileName, PiRunExecutionAdapter } from "./run-adapter.js";
 import type { RunEvidenceRecord } from "./run-adapter.js";
 import type { PiRunResult, PiRuntimeAdapter } from "./types.js";
@@ -80,6 +81,112 @@ function fixture(results: PiRunResult[]) {
 }
 
 describe("Pi required Tool execution", () => {
+  it("binds an explicit Owner Memory command to the current Run's exact Tool input", async () => {
+    const f = fixture([
+      {
+        status: "completed",
+        text: "Recorded.",
+        toolCalls: [
+          {
+            name: OWNER_MEMORY_ADMIN_TOOL,
+            input: {
+              action: "write",
+              scopeType: "project",
+              projectId: "glassbox",
+              type: "semantic_fact",
+              statement: "The deployment target is Linux.",
+            },
+            failed: false,
+          },
+        ],
+      },
+    ]);
+    f.input.text = "/memory write project:glassbox semantic_fact The deployment target is Linux.";
+    f.createOrRestoreSession.mockImplementation(async (_conversation, _profile, context) => {
+      if (context) context.authorizedToolNames = [OWNER_MEMORY_ADMIN_TOOL];
+      return {
+        conversationId: "conversation-1",
+        runtimeSessionId: "session-1",
+        profileName: "main-agent" as const,
+        agentDir: "agent",
+        createdAt: new Date(0).toISOString(),
+        lastActiveAt: new Date(0).toISOString(),
+      };
+    });
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe(OWNER_MEMORY_ADMIN_TOOL);
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({
+      action: "write",
+      scopeType: "project",
+      projectId: "glassbox",
+      type: "semantic_fact",
+      statement: "The deployment target is Linux.",
+    });
+  });
+
+  it("binds explicit Memory inspection and supersession commands without guessed fields", async () => {
+    const cases = [
+      {
+        text: "/memory list project:glassbox",
+        input: { action: "list", scopeType: "project", projectId: "glassbox" },
+      },
+      {
+        text: "/memory get memory-1",
+        input: { action: "get", id: "memory-1" },
+      },
+      {
+        text: "/memory supersede memory-1 The corrected fact.",
+        input: { action: "supersede", id: "memory-1", statement: "The corrected fact." },
+      },
+      {
+        text: "/memory source project:glassbox 1121579672 history",
+        input: {
+          action: "source",
+          scopeType: "project",
+          projectId: "glassbox",
+          groupId: "1121579672",
+          sourceClass: "history",
+        },
+      },
+      {
+        text: "从群 1126022432 最近的消息中，只提取“蓝莓灯塔-5731”和“周三 20:40”，作为 project:glassbox 的 semantic_fact 候选，不要直接生效。",
+        input: {
+          action: "source",
+          scopeType: "project",
+          projectId: "glassbox",
+          groupId: "1126022432",
+          sourceClass: "history",
+          query: "蓝莓灯塔-5731",
+        },
+      },
+    ] as const;
+
+    for (const item of cases) {
+      const f = fixture([
+        {
+          status: "completed",
+          text: "Done.",
+          toolCalls: [{ name: OWNER_MEMORY_ADMIN_TOOL, input: item.input, failed: false }],
+        },
+      ]);
+      f.input.text = item.text;
+      f.createOrRestoreSession.mockImplementation(async (_conversation, _profile, context) => {
+        if (context) context.authorizedToolNames = [OWNER_MEMORY_ADMIN_TOOL];
+        return {
+          conversationId: "conversation-1",
+          runtimeSessionId: "session-1",
+          profileName: "main-agent" as const,
+          agentDir: "agent",
+          createdAt: new Date(0).toISOString(),
+          lastActiveAt: new Date(0).toISOString(),
+        };
+      });
+
+      await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+      expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual(item.input);
+    }
+  });
+
   it("keeps non-Owner group runs on the restricted group profile", () => {
     expect(piProfileName("group", false)).toBe("qq-group");
     expect(piProfileName("group", true)).toBe("main-agent");
@@ -1053,6 +1160,40 @@ describe("an explicit current-group history search requires the group Tool", () 
     await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
     expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBeUndefined();
     expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toBeUndefined();
+  });
+
+  it("requires a fresh search for referential and completeness follow-ups", async () => {
+    for (const text of [
+      "最新他问你的问题",
+      "是不是漏了很多？",
+      "这个人呢，Brian，你刚才的检索为什么不提到他",
+      "你查一下这个人，2498701175",
+    ]) {
+      const f = groupFixture([searched("Brian")], [GROUP_HISTORY_SEARCH_TOOL]);
+      f.input.text = text;
+      f.input.history = [
+        { role: "user", text: "检索一下群历史，你可以看到什么？整理一下关系" },
+        { role: "assistant", text: "我查到了部分群历史，先列出当前检索结果。" },
+      ];
+
+      await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+      expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe(GROUP_HISTORY_SEARCH_TOOL);
+      expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({});
+      expect(f.run).toHaveBeenCalledOnce();
+    }
+  });
+
+  it("does not treat a standalone referential question as a history search", async () => {
+    const f = groupFixture(
+      [{ status: "completed", text: "我不知道你指的是谁。", toolCalls: [] }],
+      [GROUP_HISTORY_SEARCH_TOOL],
+    );
+    f.input.text = "他最新问了什么？";
+    f.input.history = [{ role: "assistant", text: "我们刚才在讨论部署安排。" }];
+
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBeUndefined();
+    expect(f.run).toHaveBeenCalledOnce();
   });
 
   it("leaves an Owner-private Run without the current-group Tool requirement", async () => {

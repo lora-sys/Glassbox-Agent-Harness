@@ -44,6 +44,7 @@ describe("P5 tool plane origins", () => {
   it("registers the non-QQ Glassbox domain Tools the Run path can really offer", () => {
     for (const name of [
       "owner_group_admin",
+      "owner_memory_admin",
       "skill_read",
       "group_history_search",
       "owner_history_search",
@@ -56,6 +57,13 @@ describe("P5 tool plane origins", () => {
       expect(descriptor?.origin).toBe("glassbox_domain");
       expect(descriptor?.authorization?.action).toBeTruthy();
     }
+  });
+
+  it("describes every authorization action of the multiplexed Owner memory Tool", () => {
+    expect(toolDescriptor("owner_memory_admin")?.authorization).toEqual({
+      action: ["memory:read", "memory:write", "memory:govern"],
+      resource: "owner-memory",
+    });
   });
 
   it("describes Pi built-ins as host-only so no policy can mistake them for product Tools", () => {
