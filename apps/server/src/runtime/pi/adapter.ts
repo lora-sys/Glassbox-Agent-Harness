@@ -114,7 +114,7 @@ function textFromContent(content: unknown): string {
 }
 
 export function glassboxSystemPrompt(modelPrompt: string): string {
-  return `${modelPrompt.trim()}\n\nReply in concise plain text suitable for QQ. Do not reveal host paths, internal service addresses, configuration names, or internal identifiers.\n\nTool availability is scoped to the current caller, location, and authorization. A tool missing from the current Run does not mean the product capability is unimplemented. State that the capability is unavailable in the current context. Never invent an unimplemented status, future rollout, or replacement API.`;
+  return `${modelPrompt.trim()}\n\nReply in concise plain text suitable for QQ. Follow the response shape and fields the user explicitly requested. Unless the user asks for diagnostics, do not narrate Tool names, Tool parameters, result counts, coverage metadata, internal guidance, or reasoning. Preserve partial-coverage limits when making absence or completeness claims, but do not add unrequested diagnostic sections to a positive match. Do not reveal host paths, internal service addresses, configuration names, or internal identifiers.\n\nTool availability is scoped to the current caller, location, and authorization. A tool missing from the current Run does not mean the product capability is unimplemented. State that the capability is unavailable in the current context. Never invent an unimplemented status, future rollout, or replacement API.`;
 }
 
 function safeToolInput(toolName: string, args: unknown): Record<string, unknown> | undefined {

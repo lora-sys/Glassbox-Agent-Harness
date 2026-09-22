@@ -631,6 +631,23 @@ describe("bounded authorized history synchronization", () => {
     expect(await storedIds(stuck.app)).toEqual(["5"]);
   });
 
+  it("treats NapCat's inclusive cursor-only page as the end of the source", async () => {
+    const inclusive = (params: { message_seq?: number }) => {
+      if (params.message_seq === undefined) return [message(3), message(2)];
+      if (params.message_seq === 2) return [message(2), message(1)];
+      return [message(1)];
+    };
+    const f = await fixture(async () => ({ status: "succeeded", text: "ok" }), {
+      history: inclusive,
+    });
+
+    expect(await sync(f.app).syncGroupHistory("fixture", "10003", { maxPages: 10 })).toEqual({
+      pagesWalked: 3,
+      stop: "end_of_source",
+    });
+    expect(await storedIds(f.app)).toEqual(["1", "2", "3"]);
+  });
+
   it("stops at the requested time bound", async () => {
     const f = await fixture(async () => ({ status: "succeeded", text: "ok" }), {
       history: paged(),

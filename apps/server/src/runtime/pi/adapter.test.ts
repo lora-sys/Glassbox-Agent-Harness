@@ -12,6 +12,9 @@ it("does not treat a context-hidden tool as an unimplemented product capability"
   expect(prompt).toContain("A tool missing from the current Run does not mean");
   expect(prompt).toContain("unavailable in the current context");
   expect(prompt).toContain("Never invent an unimplemented status");
+  expect(prompt).toContain("Follow the response shape and fields the user explicitly requested");
+  expect(prompt).toContain("do not narrate Tool names");
+  expect(prompt).toContain("do not add unrequested diagnostic sections");
 });
 import type { PiRunContext } from "./types.js";
 

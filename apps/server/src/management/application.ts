@@ -1575,6 +1575,7 @@ export class ManagementApplication {
         };
       pagesWalked += 1;
       let reachedBound = false;
+      let newMessages = 0;
       for (const message of result.messages) {
         if (options.since && message.occurredAt < options.since) {
           reachedBound = true;
@@ -1583,6 +1584,7 @@ export class ManagementApplication {
         if (options.until && message.occurredAt > options.until) continue;
         if (seen.has(message.messageId)) continue;
         seen.add(message.messageId);
+        newMessages += 1;
         await this.archive.ingest({
           channel: "qq-onebot",
           connectionId,
@@ -1601,7 +1603,14 @@ export class ManagementApplication {
           pagesWalked,
           stop: result.messages.length === 0 ? "end_of_source" : "provider_unknown",
         };
-      if (next === cursor) return { pagesWalked, stop: "cursor_stuck" };
+      if (next === cursor)
+        return {
+          pagesWalked,
+          // NapCat's reverse history page includes the cursor record itself. A one-record
+          // page containing only the already-seen cursor is its end-of-source signal. A
+          // larger repeated page is still a stalled provider and must remain partial.
+          stop: newMessages === 0 && result.messages.length <= 1 ? "end_of_source" : "cursor_stuck",
+        };
       cursor = next;
       if (reachedBound) return { pagesWalked, stop: "since_bound_reached" };
     }

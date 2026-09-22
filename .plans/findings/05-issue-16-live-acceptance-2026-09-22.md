@@ -74,10 +74,31 @@ message in a 100-message page, the reverse request returned 98 older messages, t
 and no newer message. The same request without the reverse flag reproduced the forward-page
 behavior.
 
+## First corrected live Run and second finding
+
+Run `f4648845-5552-4c39-a4be-4a2e4f13d881` used the corrected reverse walk. It advanced through
+four provider pages instead of repeating the second page. A direct provider walk reconstructed the
+four pages:
+
+- page 1: 100 records, 100 new;
+- page 2: 99 records, 98 new plus the inclusive cursor;
+- page 3: 49 records, 48 new plus the inclusive cursor;
+- page 4: the inclusive cursor alone, with no new or older record.
+
+The source was exhausted, but Glassbox classified the final cursor-only page as `cursor_stuck`.
+The same Run returned the real identifier hit and successful Tool evidence, but the model still
+narrated Tool counts and coverage metadata despite the requested three-field response.
+
+The follow-up correction treats only a one-record, already-seen inclusive cursor page as
+`end_of_source`. A larger repeated page remains `cursor_stuck`, so a provider that actually stalls
+cannot be promoted to complete coverage. The Glassbox system prompt now also requires the model to
+follow an explicitly requested response shape and forbids unrequested Tool diagnostics for a
+positive match. Partial-coverage limits remain mandatory for absence or completeness claims.
+
 ## Repository verification
 
-The focused history, management, and Tool-result suites passed 98 tests. The complete commit gate
-then passed:
+The first correction's focused history, management, and Tool-result suites passed 98 tests. Its
+complete commit gate then passed:
 
 - core check: 249 files;
 - unit tests: 76 files passed, 1 skipped; 1100 tests passed, 1 skipped;
@@ -87,7 +108,7 @@ then passed:
 
 ## Remaining confirmation
 
-The corrected branch is deployed through the stacked Issue 17 checkout. One final QQ Run must
+After the follow-up correction is deployed through the stacked Issue 17 checkout, one final QQ Run must
 repeat the exact-identifier request and confirm both of these observable results:
 
 1. source coverage no longer stops at `cursor_stuck`;
