@@ -638,6 +638,7 @@ it("gives the model the authorized sender and bot-safe text of a hit", async () 
     });
     const view = JSON.parse(text) as {
       groups: string[];
+      currentBot?: { id: string; mentionLabel: string };
       results: Array<{
         groupId: string;
         sender?: string;
@@ -655,6 +656,7 @@ it("gives the model the authorized sender and bot-safe text of a hit", async () 
       rank: 1,
     });
     expect(view.results[0]?.text).toBe("@current_bot deploy rollback plan alpha");
+    expect(view.currentBot).toEqual({ id: botId, mentionLabel: "@current_bot" });
     expect(view.groups).toEqual(["100"]);
   } finally {
     await store.close();

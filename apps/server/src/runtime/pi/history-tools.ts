@@ -98,6 +98,8 @@ export interface HistorySearchDetails {
   sourceKind: "channel_message";
   retrievalMode: "lexical";
   runId: string;
+  /** The Bot Channel identity for this connection, used only in the model-safe projection. */
+  currentBotId?: string;
   items: HistorySearchItem[];
   considered: number;
   truncated: boolean;
@@ -144,6 +146,8 @@ export interface HistoryRetrievalEvidence {
 export interface HistorySearchResultView {
   /** The authorized groups actually searched. */
   groups: string[];
+  /** Stable identity mapping for normalized @current_bot mentions in result text. */
+  currentBot?: { id: string; mentionLabel: "@current_bot" };
   query: string;
   results: Array<{
     rank: number;
@@ -166,6 +170,9 @@ export interface HistorySearchResultView {
 export function projectHistorySearch(details: HistorySearchDetails): HistorySearchResultView {
   return {
     groups: details.groups,
+    ...(details.currentBotId
+      ? { currentBot: { id: details.currentBotId, mentionLabel: "@current_bot" as const } }
+      : {}),
     query: details.query,
     results: details.items.map((item) => ({
       rank: item.rank,
@@ -397,6 +404,7 @@ export function createHistoryTools(options: {
       sourceKind: "channel_message",
       retrievalMode: "lexical",
       runId: context.runId,
+      ...(botId ? { currentBotId: botId } : {}),
       items,
       considered: bounded.considered,
       truncated: bounded.truncated,
@@ -433,7 +441,7 @@ export function createHistoryTools(options: {
     name: GROUP_HISTORY_SEARCH_TOOL,
     label: "搜索本群历史",
     description:
-      "Search the current QQ group's authorized history. Filters cover message text, sender QQ or group nickname, whether the sender mentioned this bot, and ISO 8601 time bounds. Use sender for who spoke and mentionsMe for who @mentioned the bot. Each result's mentionedMe field is the authoritative answer to whether that message @mentioned the current bot. In result text, @current_bot always means this bot. Do not infer identity from any other numeric id or describe @current_bot as another account. For requests about all messages, omissions, totals, or the earliest or latest message, use a sufficient limit and narrow filters. When truncated is true, the result is partial and must not be described as complete. A no_matches_in_searched_window result is not proof that an event never happened.",
+      "Search the current QQ group's authorized history. Filters cover message text, sender QQ or group nickname, whether the sender mentioned this bot, and ISO 8601 time bounds. Use sender for who spoke and mentionsMe for who @mentioned the bot. The currentBot object is the authoritative identity mapping: currentBot.mentionLabel and currentBot.id are the same Bot identity. Each result's mentionedMe field is the authoritative answer to whether that message @mentioned the current bot. In result text, @current_bot always means currentBot.id. Never describe these as different accounts. Do not infer identity from any other numeric id. For requests about all messages, omissions, totals, or the earliest or latest message, use a sufficient limit and narrow filters. When truncated is true, the result is partial and must not be described as complete. A no_matches_in_searched_window result is not proof that an event never happened.",
     parameters: Type.Object(
       {
         query: Type.Optional(Type.String({ maxLength: 2_000 })),
