@@ -638,11 +638,22 @@ it("gives the model the authorized sender and the original text of a hit", async
     });
     const view = JSON.parse(text) as {
       groups: string[];
-      results: Array<{ groupId: string; sender?: string; text: string; rank: number }>;
+      results: Array<{
+        groupId: string;
+        sender?: string;
+        mentionedMe?: boolean;
+        text: string;
+        rank: number;
+      }>;
     };
     // The real request asked for 发送者和原文; both must be answerable from the Tool result.
     expect(view.results).toHaveLength(1);
-    expect(view.results[0]).toMatchObject({ groupId: "100", sender: "member-a", rank: 1 });
+    expect(view.results[0]).toMatchObject({
+      groupId: "100",
+      sender: "member-a",
+      mentionedMe: true,
+      rank: 1,
+    });
     expect(view.results[0]?.text).toContain("plan alpha");
     expect(view.groups).toEqual(["100"]);
   } finally {

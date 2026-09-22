@@ -85,6 +85,8 @@ export interface HistorySearchItem extends BoundedContextItem {
    */
   senderId?: string;
   senderName?: string;
+  /** Whether the archived message mentioned the Bot serving this connection. */
+  mentionedMe?: boolean;
 }
 
 export interface HistorySearchDetails {
@@ -147,6 +149,7 @@ export interface HistorySearchResultView {
     /** The sender's Channel identity, when the item's content was disclosed. */
     sender?: string;
     senderName?: string;
+    mentionedMe?: boolean;
     occurredAt?: string;
     text: string;
     matchedTerms: string[];
@@ -167,6 +170,7 @@ export function projectHistorySearch(details: HistorySearchDetails): HistorySear
       groupId: item.groupId,
       ...(item.senderId === undefined ? {} : { sender: item.senderId }),
       ...(item.senderName === undefined ? {} : { senderName: item.senderName }),
+      ...(item.mentionedMe === undefined ? {} : { mentionedMe: item.mentionedMe }),
       ...(item.occurredAt === undefined ? {} : { occurredAt: item.occurredAt }),
       text: item.snippet,
       matchedTerms: item.matchedTerms,
@@ -322,9 +326,7 @@ export function createHistoryTools(options: {
 
     for (const groupId of searched) await options.syncGroup?.(groupId, context);
 
-    const botId = params.mentionsMe
-      ? options.botIdForConnection?.(caller.scope.connectionId)
-      : undefined;
+    const botId = options.botIdForConnection?.(caller.scope.connectionId);
     if (params.mentionsMe && !botId) throw new ToolInputError("bot_identity_unavailable");
     const retriever = new MemoryRetriever({ store: options.archive });
     // Ask for one extra hit so the projection can truthfully report that a limit truncated the
@@ -339,7 +341,7 @@ export function createHistoryTools(options: {
           until: params.until,
           metadataFilters: {
             ...(params.sender ? { sender: params.sender } : {}),
-            ...(botId ? { mentionedUserId: botId } : {}),
+            ...(params.mentionsMe && botId ? { mentionedUserId: botId } : {}),
           },
         })
       : [];
@@ -356,11 +358,15 @@ export function createHistoryTools(options: {
         {
           id: result.memory.metadata?.senderId,
           name: result.memory.metadata?.senderName,
+          mentionTargetIds: result.memory.metadata?.mentionTargetIds,
         },
       ]),
     );
     const items: HistorySearchItem[] = bounded.items.map((item) => {
       const sender = senders.get(item.id);
+      const mentionTargetIds = Array.isArray(sender?.mentionTargetIds)
+        ? sender.mentionTargetIds.filter((value): value is string => typeof value === "string")
+        : [];
       return {
         ...item,
         groupId: item.sourceId,
@@ -371,6 +377,9 @@ export function createHistoryTools(options: {
           : {}),
         ...(typeof sender?.name === "string" && item.returnMode !== "metadata_only"
           ? { senderName: sender.name }
+          : {}),
+        ...(botId && item.returnMode !== "metadata_only"
+          ? { mentionedMe: mentionTargetIds.includes(botId) }
           : {}),
       };
     });
@@ -416,7 +425,7 @@ export function createHistoryTools(options: {
     name: GROUP_HISTORY_SEARCH_TOOL,
     label: "搜索本群历史",
     description:
-      "Search the current QQ group's authorized history. Filters cover message text, sender QQ or group nickname, whether the sender mentioned this bot, and ISO 8601 time bounds. Use sender for who spoke and mentionsMe for who @mentioned the bot. For requests about all messages, omissions, totals, or the earliest or latest message, use a sufficient limit and narrow filters. When truncated is true, the result is partial and must not be described as complete. A no_matches_in_searched_window result is not proof that an event never happened.",
+      "Search the current QQ group's authorized history. Filters cover message text, sender QQ or group nickname, whether the sender mentioned this bot, and ISO 8601 time bounds. Use sender for who spoke and mentionsMe for who @mentioned the bot. Each result's mentionedMe field is the authoritative answer to whether that message @mentioned the current bot; do not infer this from a numeric id in message text. For requests about all messages, omissions, totals, or the earliest or latest message, use a sufficient limit and narrow filters. When truncated is true, the result is partial and must not be described as complete. A no_matches_in_searched_window result is not proof that an event never happened.",
     parameters: Type.Object(
       {
         query: Type.Optional(Type.String({ maxLength: 2_000 })),
