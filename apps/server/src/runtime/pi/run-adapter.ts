@@ -320,10 +320,28 @@ export function piProfileName(
  */
 function requiredToolCall(input: ExecutionInput, isOwner: boolean): RequiredToolCall | undefined {
   if (input.caller.scope.chatType === "group") {
-    if (!groupHistorySearchRequested(input.text)) return undefined;
-    // The message names no parameter of its own: the query is the model's to compose, and the
-    // group comes from the Run's trusted scope. The requirement is the call, not its arguments.
-    return { name: GROUP_HISTORY_SEARCH_TOOL, input: {} };
+    if (groupHistorySearchRequested(input.text)) {
+      // The message names no parameter of its own: the query is the model's to compose, and the
+      // group comes from the Run's trusted scope. The requirement is the call, not its arguments.
+      return { name: GROUP_HISTORY_SEARCH_TOOL, input: {} };
+    }
+    const text = requestClauses(input.text);
+    const mutation = MUTATION_REQUESTS.find((entry) => entry.words.test(text));
+    if (!mutation) return undefined;
+    const params = mutation.params(text);
+    if (params === undefined) return undefined;
+    // Group-native roles get only the explicit local subset. `set_group_admin` and file writes
+    // remain Glassbox Owner-private even when the current QQ sender is a group owner.
+    if (mutation.operation === "set_group_admin" || mutation.tool === "qq_group_file_ops")
+      return undefined;
+    return {
+      name: mutation.tool === "qq_group_settings" ? "qq_group_local_settings" : mutation.tool,
+      input: {
+        groupId: input.caller.scope.chatId,
+        operation: mutation.operation,
+        params,
+      },
+    };
   }
   // Everything below is the Owner-private surface. A management Tool is never required
   // outside a private Owner Run, whatever else a message may name.
@@ -523,7 +541,12 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
           (call) =>
             call.name === required.name &&
             call.failed === false &&
-            satisfiesRequiredInput(required.input, call.input),
+            satisfiesRequiredInput(
+              required.input,
+              input.caller.scope.chatType === "group"
+                ? { ...call.input, groupId: input.caller.scope.chatId }
+                : call.input,
+            ),
         );
       // §2/§3 — every domain the message asked about, not the first one the check reached. A
       // message that asks about members *and* notices is not answered by observing one of them.

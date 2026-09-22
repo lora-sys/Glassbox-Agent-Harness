@@ -1,5 +1,6 @@
 import type { TrustedChannelScope } from "../../identity/scope.js";
 import { messageId, object, qqId, type OneBotConnectionConfig } from "./config.ts";
+import { normalizeQqNativeGroupRole } from "./group-role.js";
 
 /** Adapted from OpenHarness bus events and gateway routing. See SOURCES.md. */
 export interface OneBotIncomingMessage {
@@ -110,6 +111,7 @@ export function normalizeOneBotMessage(
   const text = texts.join("").trim();
   if (!text) return { kind: "ignored" };
   if (text.length > 16_000) return { kind: "rejected", code: "invalid_message", messageId: id };
+  const sender = object(input.sender);
   return {
     kind: "message",
     message: {
@@ -120,6 +122,15 @@ export function normalizeOneBotMessage(
         chatType: type,
         chatId,
         senderId,
+        ...(type === "group"
+          ? {
+              nativeGroupRole: {
+                role: normalizeQqNativeGroupRole(sender?.role),
+                source: "onebot_message_sender" as const,
+                observedAt: now.toISOString(),
+              },
+            }
+          : {}),
       },
       messageId: id,
       text,

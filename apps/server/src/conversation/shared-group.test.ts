@@ -623,7 +623,14 @@ describe("shared group conversation and durable actor routing", () => {
 
     const ownerRes = await store.conversations.acceptIncoming({
       agentId: "personal",
-      scope: ownerGroup.scope,
+      scope: {
+        ...ownerGroup.scope,
+        nativeGroupRole: {
+          role: "qq_group_admin",
+          source: "onebot_message_sender",
+          observedAt: "2026-09-22T01:02:03.000Z",
+        },
+      },
       messageId: "persist-owner",
       text: "owner run",
       executionRef: "executor-main",
@@ -655,6 +662,13 @@ describe("shared group conversation and durable actor routing", () => {
 
     expect(ownerRoute!.caller.principalId).toBe("owner");
     expect(ownerRoute!.caller.scope.senderId).toBe("owner-qq");
+    // Restart preserves what this Run observed so its Trace stays reconstructable. This is not
+    // reusable role truth: any protected mutation still runs the live provider verification.
+    expect(ownerRoute!.caller.scope.nativeGroupRole).toEqual({
+      role: "qq_group_admin",
+      source: "onebot_message_sender",
+      observedAt: "2026-09-22T01:02:03.000Z",
+    });
 
     expect(visitorRoute!.caller.principalId).toBe("visitor");
     expect(visitorRoute!.caller.scope.senderId).toBe("visitor-qq");

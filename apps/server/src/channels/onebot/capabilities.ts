@@ -10,6 +10,7 @@
  */
 
 import { createHash } from "node:crypto";
+import type { QqNativeGroupRole } from "./group-role.js";
 
 export const QQ_CAPABILITY_CATEGORIES = [
   "group.read",
@@ -54,6 +55,10 @@ export interface QqCapability {
   /** Provider actions this capability may issue. Empty for a registry-only Tool. */
   operations: readonly QqOperation[];
   description: string;
+  /** QQ-native group roles that may receive this Tool inside the current group. */
+  nativeGroupRoles?: readonly QqNativeGroupRole[];
+  /** False for a group-local projection that would duplicate or weaken an Owner Tool. */
+  ownerPrivate?: boolean;
 }
 
 const group = (
@@ -174,6 +179,21 @@ export const QQ_CAPABILITIES: readonly QqCapability[] = [
       group("set_group_whole_ban", ["group_id", "enable"], ["group_id", "enable"]),
     ],
     description: "Moderate a managed group: mute, kick or set whole-group mute.",
+    nativeGroupRoles: ["qq_group_admin", "qq_group_owner"],
+  },
+  {
+    tool: "qq_group_local_settings",
+    category: "group.settings",
+    risk: "write",
+    action: "group:settings:local",
+    resource: "group",
+    operations: [
+      group("set_group_name", ["group_id", "group_name"], ["group_id", "group_name"]),
+      group("set_group_card", ["group_id", "user_id", "card"], ["group_id", "user_id"]),
+    ],
+    description: "Change the current group's name or one member's card as its QQ group owner.",
+    nativeGroupRoles: ["qq_group_owner"],
+    ownerPrivate: false,
   },
   {
     tool: "qq_group_settings",
