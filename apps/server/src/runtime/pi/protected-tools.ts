@@ -39,6 +39,14 @@ export class ToolInputError extends Error {
   }
 }
 
+/** A fixed-code execution-time authorization refusal outside the durable grant service. */
+export class ToolAuthorizationError extends Error {
+  constructor(code: "native_group_role_denied" | "native_group_role_unverified") {
+    super(code);
+    this.name = "ToolAuthorizationError";
+  }
+}
+
 export interface ProtectedToolOptions<
   TParams extends Record<string, unknown> = Record<string, unknown>,
   TResult = unknown,
@@ -246,7 +254,7 @@ export function createProtectedTool<
         ) {
           throw new Error("Operation cancelled");
         }
-        if (error instanceof ToolInputError) throw error;
+        if (error instanceof ToolInputError || error instanceof ToolAuthorizationError) throw error;
         // A provider refusal is a fact about the world, not a broken Tool. Collapsing it into
         // the generic failure would erase the difference between "the bridge is down" and
         // "the Tool threw", which is exactly what a Run has to be able to report.

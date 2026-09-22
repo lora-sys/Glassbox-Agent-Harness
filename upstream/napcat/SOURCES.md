@@ -136,7 +136,33 @@ get_group_file_url    payload is { group_id, file_id }; there is no `busid`
 delete_group_file     payload is { group_id, file_id }; there is no `busid`
 create_group_file_folder  payload is { group_id, folder_name?, name? }; there is no `parent_id`
 get_group_info        payload is { group_id }; there is no `no_cache`
+get_group_member_info payload is { group_id, user_id, no_cache? }; role is owner, admin or member
 ```
+
+## QQ-native group roles
+
+Glassbox observes `sender.role` on an authenticated group message only to project that Run's
+candidate surface. It does not create a local administrator table. Before a group mutation that
+depends on the observed role, the OneBot adapter calls:
+
+```text
+get_group_member_info
+  group_id = trusted current group
+  user_id = trusted current sender
+  no_cache = true
+```
+
+The adapter checks the response group and user and returns only the normalized role. A current
+`member` result denies the native-role mutation before its provider action. A failed or missing
+provider response is an unavailable or failed verification, not proof that the caller is a
+member. Bot authority is separate: a verified caller role may pass while the later moderation
+action still fails because the Bot lacks QQ permission.
+
+The group-local role surface is deliberately smaller than the Glassbox Owner surface.
+`qq_group_moderation` is available to QQ admins and group owners when policy enables it.
+`qq_group_local_settings` is available only to QQ group owners and contains `set_group_name` and
+`set_group_card`. `set_group_admin` remains in the separate Glassbox Owner-private
+`qq_group_settings` Tool.
 
 ## Deliberately deferred action: group file upload
 

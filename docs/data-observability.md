@@ -21,6 +21,12 @@ Public visitor
 
 QQ, email, Pi, Lora PI Kit, MCP, Herdr, Moshi, and other external entry points do not receive management authority merely because they can reach a process or UI.
 
+QQ-native group roles are provider observations scoped to one message sender and one group
+Resource. `qq_group_admin` and `qq_group_owner` are not Principal kinds and are not stored as
+durable Glassbox role truth. The Run keeps its ingress observation for reconstruction. A
+protected mutation re-verifies the role through the current authenticated OneBot connection, so
+a restart or old Run record cannot preserve revoked QQ authority.
+
 ## Service / authority map
 
 | Responsibility | Service / authority |
@@ -61,6 +67,7 @@ relationships / permissions
 AuthorizationDecision
 Approval
 Run metadata
+Run-scoped external role observation and verification evidence
 message dedupe
 runtime session binding
 visibility / Share metadata
@@ -86,6 +93,11 @@ statistics / product projections
 ```
 
 The model does not receive unrestricted SQL access.
+
+Raw QQ member profiles do not enter model-visible Context or durable role state. Native-role
+Trace events contain only Principal, group Resource, sender id, normalized observed and verified
+roles, role source, verification status, requested Tool and operation, Run, Conversation, and a
+safe authorization status. Provider response bodies and error text are excluded.
 
 The browser does not receive direct Turso credentials.
 

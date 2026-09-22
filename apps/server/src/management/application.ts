@@ -67,7 +67,7 @@ import {
   GROUP_RUN_CAPABILITY_CATEGORIES,
 } from "../runtime/pi/capability-tools.js";
 import { resolveSkillVisibility } from "../runtime/pi/skill-visibility.js";
-import { requireProviderSuccess } from "../runtime/pi/provider-outcome.js";
+import { ProviderCallError, requireProviderSuccess } from "../runtime/pi/provider-outcome.js";
 import type { PiRunContext } from "../runtime/pi/types.js";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import {
@@ -524,6 +524,51 @@ export class ManagementApplication {
           if (!connection) throw new Error("channel_not_connected");
           return requireProviderSuccess(await connection.invokeCapability({ action, params }));
         },
+        verifyNativeGroupRole: async ({ context, groupId, capability, operation }) => {
+          const connection = this.connections.get(context.caller.scope.connectionId);
+          const result = connection
+            ? await connection.getGroupMemberRole({
+                groupId,
+                userId: context.caller.scope.senderId,
+              })
+            : ({ status: "failed", code: "not_connected" } as const);
+          const verificationStatus =
+            result.status === "ok"
+              ? "verified"
+              : result.status === "unknown"
+                ? "unknown"
+                : result.code === "not_connected"
+                  ? "unavailable"
+                  : "failed";
+          const cursor = await this.trace.append(
+            context.runId,
+            {
+              type: "native_group_role_verification",
+              runId: context.runId,
+              conversationId: context.conversationId,
+              principalId: context.caller.principalId,
+              resourceId: groupResourceId(groupId),
+              groupId,
+              senderId: context.caller.scope.senderId,
+              observedRole: context.caller.scope.nativeGroupRole?.role ?? "qq_group_member",
+              roleSource:
+                context.caller.scope.nativeGroupRole?.source ?? "missing_defaults_to_member",
+              verifiedRole: result.status === "ok" ? result.role : null,
+              verificationStatus,
+              requestedTool: capability.tool,
+              requestedOperation: operation,
+              authorizationDecision: "ALLOW",
+            },
+            "glassbox-qq-role",
+          );
+          await this.store.evidence.advanceTrace(context.caller, cursor);
+          if (result.status === "ok") return result.role;
+          if (result.status === "failed" && result.code === "not_connected")
+            throw new ProviderCallError("provider_unavailable", "provider_unavailable");
+          if (result.status === "unknown")
+            throw new ProviderCallError("unknown", "provider_unknown");
+          throw new ProviderCallError("provider_failed", "provider_failed");
+        },
         search: (input) => this.searchCapabilities(input.context, input),
         projectManagedGroups: (context) => this.projectManagedGroups(context),
       }),
@@ -624,6 +669,7 @@ export class ManagementApplication {
         isOwner,
         chatType: scope.chatType,
         enabledCategories: capabilityCategories,
+        nativeGroupRole: scope.nativeGroupRole?.role,
       }),
     );
 
@@ -861,13 +907,33 @@ export class ManagementApplication {
           });
           return;
         }
-        await this.runs.receive({
+        const accepted = await this.store.conversations.acceptIncoming({
           agentId: AGENT_ID,
           scope: message.scope,
           messageId: message.messageId,
           text: message.text,
           executionRef: configured.executionRef,
         });
+        if (!accepted.duplicate && message.scope.nativeGroupRole) {
+          const cursor = await this.trace.append(
+            accepted.run.id,
+            {
+              type: "native_group_role_observed",
+              runId: accepted.run.id,
+              conversationId: accepted.conversation.id,
+              principalId: accepted.caller.principalId,
+              resourceId: groupResourceId(message.scope.chatId),
+              groupId: message.scope.chatId,
+              senderId: message.scope.senderId,
+              observedRole: message.scope.nativeGroupRole.role,
+              roleSource: message.scope.nativeGroupRole.source,
+              observedAt: message.scope.nativeGroupRole.observedAt,
+            },
+            "glassbox-qq-role",
+          );
+          await this.store.evidence.advanceTrace(accepted.caller, cursor);
+        }
+        await this.runs.enqueueAccepted(accepted);
       },
     });
     this.connections.set(id, adapter);
@@ -1038,11 +1104,11 @@ export class ManagementApplication {
         visibility: "public",
         ifAbsent: true,
       });
-      // A Run inside a configured group may read that same group. This is not implied by bot
-      // membership: the grant exists only for a group Glassbox has configured, it is scoped to
-      // that one group, and it covers only the read-only categories. The Run's candidate list
-      // narrows them to the Owner's current policy, and every call is re-authorized.
-      for (const action of this.groupRunReadActions()) {
+      // A Run inside a configured group may address that same group. This is not implied by bot
+      // membership: the grant exists only for a group Glassbox has configured and is scoped to
+      // that one group. The candidate list narrows it by current policy and the message's
+      // observed native role. Mutations also require live role verification and re-authorization.
+      for (const action of this.groupRunActions()) {
         const existing = await this.store.authorization.check({
           caller,
           resourceId: groupResource,
@@ -1246,6 +1312,7 @@ export class ManagementApplication {
       isOwner,
       chatType: input.scope.chatType,
       enabledCategories: [...QQ_CAPABILITY_CATEGORIES],
+      ...(input.scope.chatType === "group" ? { nativeGroupRole: "qq_group_owner" as const } : {}),
     });
     for (const name of names) {
       const resourceId = toolResourceId(name);
@@ -1459,16 +1526,21 @@ export class ManagementApplication {
   }
 
   /**
-   * The read-only protected Actions a Run inside a configured group may perform on that group.
+   * The protected Actions a Run inside a configured group can ever request on that group.
    *
    * Derived from the same category registry the Tools are, so the grant and the Tool surface
-   * cannot drift. Mutation categories are absent from `GROUP_RUN_CAPABILITY_CATEGORIES`, so a
-   * group Run can never acquire one through this path.
+   * cannot drift. The durable grant is a superset, not native-role truth. Candidate discovery
+   * and execution-time provider verification keep ordinary members read-only.
    */
-  private groupRunReadActions(): string[] {
+  private groupRunActions(): string[] {
     return [
       ...new Set(
-        GROUP_RUN_CAPABILITY_CATEGORIES.flatMap((category) => this.categoryActions(category)),
+        QQ_CAPABILITIES.filter(
+          (capability) =>
+            capability.resource === "group" &&
+            (GROUP_RUN_CAPABILITY_CATEGORIES.includes(capability.category) ||
+              capability.nativeGroupRoles !== undefined),
+        ).map((capability) => capability.action),
       ),
     ];
   }
@@ -1493,6 +1565,7 @@ export class ManagementApplication {
           isOwner: false,
           chatType: "group",
           enabledCategories: [...QQ_CAPABILITY_CATEGORIES],
+          nativeGroupRole: "qq_group_owner",
         }),
       ]),
     ];
@@ -1663,7 +1736,9 @@ export class ManagementApplication {
         qqCapabilitiesForCategory(category)
           // Account-scoped capabilities describe the Agent's own connection; granting their
           // Action on a group Resource would be a dead grant, so the bundle never writes one.
-          .filter((capability) => capability.resource === "group")
+          .filter(
+            (capability) => capability.resource === "group" && capability.ownerPrivate !== false,
+          )
           .map((capability) => capability.action),
       ),
     ];

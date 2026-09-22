@@ -461,17 +461,34 @@ function requiredToolCall(
   authorizedToolNames?: readonly string[],
 ): RequiredToolCall | undefined {
   if (input.caller.scope.chatType === "group") {
-    if (!groupHistorySearchRequested(input.text) && !groupHistorySearchFollowUpRequested(input))
+    if (groupHistorySearchRequested(input.text) || groupHistorySearchFollowUpRequested(input)) {
+      // A single segmented identifier is a literal query, not prose for the model to reinterpret.
+      // Bind it into the required input so a call for a different value cannot satisfy this Run.
+      // Bare digit runs are excluded because they can name a sender rather than message text.
+      const identifiers = exactTerms(requestClauses(input.text)).filter((term) =>
+        /[a-z]/iu.test(term),
+      );
+      return {
+        name: GROUP_HISTORY_SEARCH_TOOL,
+        input: identifiers.length === 1 ? { query: identifiers[0] } : {},
+      };
+    }
+    const text = requestClauses(input.text);
+    const mutation = MUTATION_REQUESTS.find((entry) => entry.words.test(text));
+    if (!mutation) return undefined;
+    const params = mutation.params(text);
+    if (params === undefined) return undefined;
+    // Group-native roles get only the explicit local subset. `set_group_admin` and file writes
+    // remain Glassbox Owner-private even when the current QQ sender is a group owner.
+    if (mutation.operation === "set_group_admin" || mutation.tool === "qq_group_file_ops")
       return undefined;
-    // A single segmented identifier is a literal query, not prose for the model to reinterpret.
-    // Bind it into the required input so a call for a different value cannot satisfy this Run.
-    // Bare digit runs are excluded because they can name a sender rather than message text.
-    const identifiers = exactTerms(requestClauses(input.text)).filter((term) =>
-      /[a-z]/iu.test(term),
-    );
     return {
-      name: GROUP_HISTORY_SEARCH_TOOL,
-      input: identifiers.length === 1 ? { query: identifiers[0] } : {},
+      name: mutation.tool === "qq_group_settings" ? "qq_group_local_settings" : mutation.tool,
+      input: {
+        groupId: input.caller.scope.chatId,
+        operation: mutation.operation,
+        params,
+      },
     };
   }
   // Everything below is the Owner-private surface. A management Tool is never required
@@ -677,7 +694,12 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
           (call) =>
             call.name === required.name &&
             call.failed === false &&
-            satisfiesRequiredInput(required.input, call.input),
+            satisfiesRequiredInput(
+              required.input,
+              input.caller.scope.chatType === "group"
+                ? { ...call.input, groupId: input.caller.scope.chatId }
+                : call.input,
+            ),
         );
       // §2/§3 — every domain the message asked about, not the first one the check reached. A
       // message that asks about members *and* notices is not answered by observing one of them.

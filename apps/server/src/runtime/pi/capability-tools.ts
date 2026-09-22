@@ -7,10 +7,10 @@
  * provider target and the parameter set.
  *
  * Security properties enforced here:
- *  - The Tool surface is scope-gated: a group Run sees only the read-only capabilities its
- *    own group's policy enables, an Owner-private Run additionally sees the mutating
- *    categories the Owner enabled, and a Visitor-private Run sees none. Discovery is never
- *    authority, so every call is re-authorized.
+ *  - The Tool surface is scope-gated: an ordinary group member sees only read capabilities,
+ *    a QQ admin or group owner may see a fixed current-group mutation subset, an Owner-private
+ *    Run sees its managed-group surface, and a Visitor-private Run sees none. Discovery is
+ *    never authority, so every call is re-authorized.
  *  - The group is named once, at the top level, and Glassbox derives both the authorization
  *    Resource and the provider `group_id` from that single value. A group Run is bound to
  *    its own group and refuses a model-supplied one; a model-supplied `group_id` inside the
@@ -45,10 +45,12 @@ import type {
   QqCapabilityResource,
 } from "../../channels/onebot/capabilities.js";
 import { QQ_CAPABILITIES, resolveQqOperation } from "../../channels/onebot/capabilities.js";
+import type { QqNativeGroupRole } from "../../channels/onebot/group-role.js";
 import { groupResourceId } from "../../retrieval/source-resolver.js";
 import {
   createProtectedTool,
   requireMutationIntent,
+  ToolAuthorizationError,
   ToolInputError,
   type ProtectedToolContext,
 } from "./protected-tools.js";
@@ -75,9 +77,9 @@ const CAPABILITY_GROUP_FILTER_MAX = 32;
 /**
  * The capability categories a Run *inside* a group may use.
  *
- * These are the read-only classes the group's own policy can expose. Mutating categories
- * (`group.files.write`, `group.moderate`, `group.settings`, `message.manage`) stay
- * Owner-private: a group Run can look at its group but never change it.
+ * These are the classes every group member may use when policy enables them. Native QQ roles
+ * do not widen this list. Their fixed mutation subset is declared per capability and requires
+ * a fresh provider role verification before execution.
  */
 export const GROUP_RUN_CAPABILITY_CATEGORIES: readonly QqCapabilityCategory[] = Object.freeze([
   "group.read",
@@ -116,10 +118,10 @@ export interface CapabilityInvocation {
 /**
  * The capability Tools a Run may see. The model never chooses its own surface.
  *
- * A group Run sees only the read-only capabilities its own group's policy enables, so
- * disabling a category hides the Tool on the next Run. Account-scoped capabilities describe
- * the Agent's own connection and are always available to the Owner. An Owner-private Run
- * additionally sees every mutating category the Owner enabled somewhere.
+ * A group Run sees its policy-enabled read capabilities and, when the trusted ingress
+ * observation qualifies, its fixed native-role subset. Disabling a category hides the Tool
+ * on the next Run. Account-scoped capabilities describe the Agent's own connection and are
+ * always available to the Glassbox Owner in private chat.
  */
 /**
  * Every registered capability Tool, each with why it is or is not eligible for this scope.
@@ -134,15 +136,20 @@ export function capabilityToolEligibility(input: {
   isOwner: boolean;
   chatType: "group" | "private";
   enabledCategories: readonly QqCapabilityCategory[];
+  nativeGroupRole?: QqNativeGroupRole;
 }): { name: string; exclusion: ToolExclusionReason | null }[] {
   const enabled = new Set(input.enabledCategories);
   return QQ_CAPABILITIES.map((capability) => {
     if (input.chatType === "group") {
-      // A group Run is confined to read-only group capabilities. Account-scoped Tools and
-      // the mutating categories are a scope boundary, not something the group can enable.
+      // A group Run is confined to its group. Read Tools remain available to members. A
+      // mutation is considered only when this message carried an allowed QQ-native role.
       if (capability.resource !== "group")
         return { name: capability.tool, exclusion: "scope_not_permitted" as const };
-      if (!GROUP_RUN_CAPABILITY_CATEGORIES.includes(capability.category))
+      const readOnly = GROUP_RUN_CAPABILITY_CATEGORIES.includes(capability.category);
+      const nativeRoleAllowed =
+        input.nativeGroupRole !== undefined &&
+        capability.nativeGroupRoles?.includes(input.nativeGroupRole) === true;
+      if (!readOnly && !nativeRoleAllowed)
         return { name: capability.tool, exclusion: "scope_not_permitted" as const };
       return {
         name: capability.tool,
@@ -151,6 +158,8 @@ export function capabilityToolEligibility(input: {
     }
     // A Visitor-private Run reaches no QQ capability at all.
     if (!input.isOwner) return { name: capability.tool, exclusion: "scope_not_permitted" as const };
+    if (capability.ownerPrivate === false)
+      return { name: capability.tool, exclusion: "scope_not_permitted" as const };
     // Account status is the Owner's own provider state and is always readable by the Owner.
     if (capability.resource === "account") return { name: capability.tool, exclusion: null };
     return {
@@ -164,6 +173,7 @@ export function availableCapabilityToolNames(input: {
   isOwner: boolean;
   chatType: "group" | "private";
   enabledCategories: readonly QqCapabilityCategory[];
+  nativeGroupRole?: QqNativeGroupRole;
 }): string[] {
   return capabilityToolEligibility(input)
     .filter((entry) => entry.exclusion === null)
@@ -337,6 +347,13 @@ interface ProviderCallOptions {
   ) => Promise<boolean>;
   /** Executes one validated allowlisted provider action. The only outbound provider path. */
   invoke: (input: CapabilityInvocation) => Promise<unknown>;
+  /** Re-reads the caller's role from QQ immediately before one native-role mutation. */
+  verifyNativeGroupRole?: (input: {
+    context: ProtectedToolContext;
+    groupId: string;
+    capability: QqCapability;
+    operation: string;
+  }) => Promise<QqNativeGroupRole>;
 }
 
 /**
@@ -402,6 +419,22 @@ async function executeProviderCall(
       operation: action,
       params: supplied,
     });
+
+  if (context.caller.scope.chatType === "group" && capability.risk !== "read") {
+    const observed = context.caller.scope.nativeGroupRole?.role ?? "qq_group_member";
+    if (!capability.nativeGroupRoles?.includes(observed))
+      throw new ToolAuthorizationError("native_group_role_denied");
+    if (!options.verifyNativeGroupRole)
+      throw new ToolAuthorizationError("native_group_role_unverified");
+    const verified = await options.verifyNativeGroupRole({
+      context,
+      groupId: groupId!,
+      capability,
+      operation: action,
+    });
+    if (!capability.nativeGroupRoles.includes(verified))
+      throw new ToolAuthorizationError("native_group_role_denied");
+  }
 
   return options.invoke({ capability, action, params: providerParams, context });
 }
@@ -521,6 +554,7 @@ export function createCapabilityTools(
         getContext,
         isCategoryEnabled: options.isCategoryEnabled,
         invoke: options.invoke,
+        verifyNativeGroupRole: options.verifyNativeGroupRole,
         projectManagedGroups: options.projectManagedGroups,
       });
     return createProviderCapabilityTool(capability, options.store, getContext, options);

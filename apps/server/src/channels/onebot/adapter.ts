@@ -15,6 +15,7 @@ import {
   type OneBotHistoryMessage,
 } from "./history.ts";
 import { GROUP_SCOPED_NAPCAT_ACTIONS, isAllowedNapCatAction } from "./capabilities.ts";
+import { normalizeQqNativeGroupRole, type QqNativeGroupRole } from "./group-role.js";
 
 const GROUP_SCOPED_ACTIONS = new Set(GROUP_SCOPED_NAPCAT_ACTIONS);
 
@@ -55,6 +56,15 @@ export type OneBotGroupInfoResult =
       groupId: string;
       /** The provider-reported group name, or `null` when it reported no usable one. */
       name: string | null;
+    }
+  | OneBotReadFailure;
+
+export type OneBotGroupMemberRoleResult =
+  | {
+      status: "ok";
+      groupId: string;
+      userId: string;
+      role: QqNativeGroupRole;
     }
   | OneBotReadFailure;
 
@@ -312,6 +322,46 @@ export class OneBotAdapter {
       return { status: "unknown", code: "invalid_response" };
     const name = typeof data.group_name === "string" ? data.group_name.trim() : "";
     return { status: "ok", groupId, name: name === "" ? null : name };
+  }
+
+  /**
+   * Re-reads one member's current QQ-native role immediately before a protected mutation.
+   *
+   * The target group must be configured, the authenticated socket must be ready, and the
+   * response must identify the same group and member. Only the normalized role leaves the
+   * adapter. Profile fields and the raw provider payload never enter model-visible Context.
+   */
+  async getGroupMemberRole(input: {
+    groupId: string;
+    userId: string;
+  }): Promise<OneBotGroupMemberRoleResult> {
+    const parsed = parseOneBotConfig({ ...this.config, groupIds: [input.groupId] });
+    const groupId = parsed.groupIds[0];
+    const userId = qqId(input.userId);
+    if (
+      groupId !== input.groupId ||
+      !this.config.groupIds.includes(input.groupId) ||
+      userId !== input.userId
+    )
+      return { status: "failed", code: "invalid_group" };
+    const socket = this.#socket;
+    if (this.#state.status !== "ready" || !socket)
+      return { status: "failed", code: "not_connected" };
+    const result = await this.#request(socket, "get_group_member_info", {
+      group_id: Number(groupId),
+      user_id: Number(userId),
+      no_cache: true,
+    });
+    if (result.status !== "ok") return toReadFailure(result);
+    const data = object(result.data);
+    if (
+      !data ||
+      qqId(data.group_id) !== groupId ||
+      qqId(data.user_id) !== userId ||
+      (data.role !== "owner" && data.role !== "admin" && data.role !== "member")
+    )
+      return { status: "unknown", code: "invalid_response" };
+    return { status: "ok", groupId, userId, role: normalizeQqNativeGroupRole(data.role) };
   }
 
   /**

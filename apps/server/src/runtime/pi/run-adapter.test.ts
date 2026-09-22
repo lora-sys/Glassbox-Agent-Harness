@@ -1200,6 +1200,73 @@ describe("an explicit current-group history search requires the group Tool", () 
     expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe(GROUP_HISTORY_SEARCH_TOOL);
   });
 
+  it("binds an explicit current-group moderation request to its exact target and value", async () => {
+    const result: PiRunResult = {
+      status: "completed",
+      text: "已禁言。",
+      toolCalls: [
+        {
+          name: "qq_group_moderation",
+          input: {
+            operation: "set_group_ban",
+            params: { user_id: 10004, duration: 60 },
+          },
+          failed: false,
+        },
+      ],
+    };
+    const f = groupFixture([result, result], ["qq_group_moderation"]);
+    f.input.text = "把成员 10004 禁言 60 秒";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe("qq_group_moderation");
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({
+      groupId: "1126022432",
+      operation: "set_group_ban",
+      params: { user_id: 10004, duration: 60 },
+    });
+  });
+
+  it("maps local group-owner settings to the reduced Tool and never binds set_group_admin", async () => {
+    const changed: PiRunResult = {
+      status: "completed",
+      text: "已改名。",
+      toolCalls: [
+        {
+          name: "qq_group_local_settings",
+          input: { operation: "set_group_name", params: { group_name: "新群名" } },
+          failed: false,
+        },
+      ],
+    };
+    const f = groupFixture([changed, changed], ["qq_group_local_settings"]);
+    f.input.text = "把本群群名改成新群名";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe("qq_group_local_settings");
+
+    const forbidden = groupFixture(
+      [{ status: "completed", text: "不能执行。", toolCalls: [] }],
+      ["qq_group_local_settings"],
+    );
+    forbidden.input.text = "把成员 10004 设置为管理员";
+    await expect(forbidden.executor.execute(forbidden.input)).resolves.toMatchObject({
+      status: "succeeded",
+    });
+    expect(forbidden.run.mock.calls[0]?.[3]?.requiredToolName).toBeUndefined();
+  });
+
+  it("keeps a moderation question read-only", async () => {
+    const f = groupFixture(
+      [
+        { status: "completed", text: "管理员可以禁言。", toolCalls: [] },
+        { status: "completed", text: "管理员可以禁言。", toolCalls: [] },
+      ],
+      ["qq_group_moderation"],
+    );
+    f.input.text = "管理员可以把成员 10004 禁言 60 秒吗？";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBeUndefined();
+  });
+
   it("keeps a question about the search a question, never a required call", async () => {
     for (const text of ["怎么搜索本群历史？", "本群历史检索是否已经开启？"]) {
       const f = groupFixture(

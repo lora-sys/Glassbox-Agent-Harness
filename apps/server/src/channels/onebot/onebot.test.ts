@@ -214,6 +214,34 @@ describe("OneBot normalization", () => {
       ),
     ).toEqual({ kind: "ignored" });
   });
+  it.each([
+    ["owner", "qq_group_owner"],
+    ["admin", "qq_group_admin"],
+    ["member", "qq_group_member"],
+    ["administrator", "qq_group_member"],
+    [undefined, "qq_group_member"],
+  ])("keeps the trusted QQ sender role %s as %s for this Run", (providerRole, role) => {
+    const result = normalizeOneBotMessage(
+      inbound({ sender: providerRole === undefined ? {} : { role: providerRole } }),
+      config,
+      new Date("2026-09-22T01:02:03.000Z"),
+    );
+    expect(result).toMatchObject({
+      kind: "message",
+      message: {
+        scope: {
+          chatType: "group",
+          chatId: "10003",
+          senderId: "10002",
+          nativeGroupRole: {
+            role,
+            source: "onebot_message_sender",
+            observedAt: "2026-09-22T01:02:03.000Z",
+          },
+        },
+      },
+    });
+  });
   it("routes an Owner friend DM independently of an untrusted group field", () => {
     expect(
       normalizeOneBotMessage(
@@ -316,7 +344,14 @@ describe("OneBot forward WebSocket", () => {
     expect(fake.history[0]).toMatchObject({ action: "get_login_info", params: {} });
     const socket = await fake.connections.next();
     socket.send(JSON.stringify(inbound()));
-    expect((await incoming.next()).scope).toEqual(groupScope);
+    expect((await incoming.next()).scope).toEqual({
+      ...groupScope,
+      nativeGroupRole: {
+        role: "qq_group_member",
+        source: "onebot_message_sender",
+        observedAt: expect.any(String),
+      },
+    });
     socket.send(
       JSON.stringify(
         inbound({
@@ -367,7 +402,14 @@ describe("OneBot forward WebSocket", () => {
     });
     const { adapter, incoming } = client(fake.endpoint);
     await adapter.start();
-    expect((await incoming.next()).scope).toEqual(groupScope);
+    expect((await incoming.next()).scope).toEqual({
+      ...groupScope,
+      nativeGroupRole: {
+        role: "qq_group_member",
+        source: "onebot_message_sender",
+        observedAt: expect.any(String),
+      },
+    });
   });
   it("confirms a platform message ID and keeps text CQ literals inert", async () => {
     const fake = await server();
@@ -425,6 +467,43 @@ describe("OneBot forward WebSocket", () => {
         text: "不可私聊",
       }),
     ).toEqual({ status: "failed", code: "invalid_target" });
+  });
+  it("re-verifies one configured member role without exposing the raw profile", async () => {
+    const fake = await server({
+      onAction(action, socket) {
+        if (action.action !== "get_group_member_info") return false;
+        socket.send(
+          JSON.stringify({
+            status: "ok",
+            retcode: 0,
+            data: {
+              group_id: action.params.group_id,
+              user_id: action.params.user_id,
+              role: "admin",
+              nickname: "must not leave adapter",
+            },
+            echo: action.echo,
+          }),
+        );
+        return true;
+      },
+    });
+    const { adapter } = client(fake.endpoint);
+    await adapter.start();
+    await expect(
+      adapter.getGroupMemberRole({ groupId: "10003", userId: "10099" }),
+    ).resolves.toEqual({
+      status: "ok",
+      groupId: "10003",
+      userId: "10099",
+      role: "qq_group_admin",
+    });
+    const action = await fake.actions.next((item) => item.action === "get_group_member_info");
+    expect(action.params).toEqual({ group_id: 10003, user_id: 10099, no_cache: true });
+    await expect(
+      adapter.getGroupMemberRole({ groupId: "90000", userId: "10099" }),
+    ).resolves.toEqual({ status: "failed", code: "invalid_group" });
+    expect(fake.history.filter((item) => item.action === "get_group_member_info")).toHaveLength(1);
   });
   it("sends an Owner DM only through the configured private destination", async () => {
     const fake = await server();

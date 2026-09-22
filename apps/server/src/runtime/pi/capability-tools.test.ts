@@ -3,6 +3,7 @@ import { agentResourceId, openDomainStore } from "../../persistence/index.js";
 import type { CallerContext, TrustedChannelScope } from "../../persistence/index.js";
 import { groupResourceId } from "../../retrieval/source-resolver.js";
 import { availableCapabilityToolNames, createCapabilityTools } from "./capability-tools.js";
+import { ProviderCallError } from "./provider-outcome.js";
 
 const connectionId = "qq";
 const botId = "bot";
@@ -139,6 +140,64 @@ function tools(
   });
 }
 
+function nativeGroupScope(role: "qq_group_owner" | "qq_group_admin" | "qq_group_member") {
+  return {
+    ...ownerGroupScope,
+    nativeGroupRole: {
+      role,
+      source: "onebot_message_sender" as const,
+      observedAt: "2026-09-22T01:02:03.000Z",
+    },
+  };
+}
+
+async function grantNativeGroupAction(store: Store, scope: TrustedChannelScope, action: string) {
+  await store.authorization.grant({
+    principalId: "owner",
+    resourceId: groupResourceId(scope.chatId),
+    action,
+    scope,
+    effect: "allow",
+  });
+}
+
+function nativeGroupTools(
+  store: Store,
+  accepted: { run: { id: string }; conversation: { id: string } },
+  input: {
+    scope: TrustedChannelScope;
+    required: { name: string; input: Record<string, unknown> };
+    verifiedRole?: "qq_group_owner" | "qq_group_admin" | "qq_group_member";
+    verificationError?: Error;
+  },
+  calls: Array<{ action: string; params: Record<string, unknown> }>,
+) {
+  return createCapabilityTools({
+    store,
+    getContext: () => ({
+      caller: { principalId: "owner", scope: input.scope },
+      runId: accepted.run.id,
+      conversationId: accepted.conversation.id,
+      requiredToolName: input.required.name,
+      requiredToolInput: input.required.input,
+    }),
+    isCategoryEnabled: async (conn, groupId, category) => {
+      const stored = await store.capabilities.read(conn, groupId);
+      return stored?.policy.categories[category] === true;
+    },
+    verifyNativeGroupRole: async () => {
+      if (input.verificationError) throw input.verificationError;
+      return input.verifiedRole ?? "qq_group_member";
+    },
+    invoke: async ({ action, params }) => {
+      calls.push({ action, params });
+      return { ok: true, action };
+    },
+    search: async () => ({ capabilities: [] }),
+    projectManagedGroups: async () => ({ groups: [] }),
+  });
+}
+
 function toolByName(created: ReturnType<typeof tools>, name: string) {
   const tool = created.find((candidate) => candidate.name === name);
   if (!tool) throw new Error(`missing tool ${name}`);
@@ -181,7 +240,7 @@ it("exposes the capability surface only to an Owner-private Run", async () => {
       enabledCategories: enabled,
     }),
   ).not.toContain("qq_group_moderation");
-  // A group Run sees only the read-only capabilities its own group's policy enables.
+  // With no privileged native role, a group Run sees only policy-enabled reads.
   expect(
     availableCapabilityToolNames({ isOwner: true, chatType: "group", enabledCategories: enabled }),
   ).toEqual(["qq_groups", "qq_group_members"]);
@@ -194,7 +253,7 @@ it("exposes the capability surface only to an Owner-private Run", async () => {
   ).toEqual([]);
 });
 
-it("hides a group Run's read-only Tool once its category is disabled, and never exposes mutation", () => {
+it("hides disabled group reads and keeps an ordinary member's Run free of mutation Tools", () => {
   // A disabled category is absent from the surface on the next Run.
   expect(
     availableCapabilityToolNames({
@@ -219,6 +278,191 @@ it("hides a group Run's read-only Tool once its category is disabled, and never 
       enabledCategories: ["group.read", "group.moderate"],
     }),
   ).toEqual([]);
+});
+
+it("projects native QQ roles only onto the current group's configured mutation subset", () => {
+  const enabled = ["group.read", "group.moderate", "group.settings", "message.manage"] as const;
+  const member = availableCapabilityToolNames({
+    isOwner: false,
+    chatType: "group",
+    enabledCategories: enabled,
+    nativeGroupRole: "qq_group_member",
+  });
+  const admin = availableCapabilityToolNames({
+    isOwner: false,
+    chatType: "group",
+    enabledCategories: enabled,
+    nativeGroupRole: "qq_group_admin",
+  });
+  const owner = availableCapabilityToolNames({
+    isOwner: false,
+    chatType: "group",
+    enabledCategories: enabled,
+    nativeGroupRole: "qq_group_owner",
+  });
+  expect(member).toEqual(["qq_groups"]);
+  expect(admin).toEqual(["qq_groups", "qq_group_moderation"]);
+  expect(owner).toEqual(["qq_groups", "qq_group_moderation", "qq_group_local_settings"]);
+  expect(admin).not.toContain("qq_group_settings");
+  expect(owner).not.toContain("qq_group_settings");
+  expect(admin).not.toContain("qq_capability_search");
+  expect(
+    availableCapabilityToolNames({
+      isOwner: false,
+      chatType: "group",
+      enabledCategories: ["group.read"],
+      nativeGroupRole: "qq_group_admin",
+    }),
+  ).toEqual(["qq_groups"]);
+  // The same Principal can carry a fresh role observation in group A and ordinary membership
+  // in group B. The role is scope data, not a Principal-wide promotion.
+  expect(
+    availableCapabilityToolNames({
+      isOwner: false,
+      chatType: "group",
+      enabledCategories: enabled,
+      nativeGroupRole: "qq_group_member",
+    }),
+  ).not.toContain("qq_group_moderation");
+});
+
+it("executes exact current-group moderation only after fresh native-role verification", async () => {
+  const { store, accepted } = await fixture();
+  try {
+    const scope = nativeGroupScope("qq_group_admin");
+    await enableCategory(store, "group.moderate");
+    await grantNativeGroupAction(store, scope, "group:moderate");
+    const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
+    const required = {
+      name: "qq_group_moderation",
+      input: {
+        groupId: "100",
+        operation: "set_group_ban",
+        params: { user_id: 10004, duration: 60 },
+      },
+    };
+    const created = nativeGroupTools(
+      store,
+      accepted,
+      { scope, required, verifiedRole: "qq_group_admin" },
+      calls,
+    );
+    await call(toolByName(created, required.name), {
+      operation: "set_group_ban",
+      params: { user_id: 10004, duration: 60 },
+    });
+    expect(calls).toEqual([
+      {
+        action: "set_group_ban",
+        params: { group_id: 100, user_id: 10004, duration: 60 },
+      },
+    ]);
+  } finally {
+    await store.close();
+  }
+});
+
+it("denies a demoted admin before provider mutation and keeps provider outage distinct", async () => {
+  const { store, accepted } = await fixture();
+  try {
+    const scope = nativeGroupScope("qq_group_admin");
+    await enableCategory(store, "group.moderate");
+    await grantNativeGroupAction(store, scope, "group:moderate");
+    const required = {
+      name: "qq_group_moderation",
+      input: {
+        groupId: "100",
+        operation: "set_group_whole_ban",
+        params: { enable: true },
+      },
+    };
+    const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
+    const demoted = nativeGroupTools(
+      store,
+      accepted,
+      { scope, required, verifiedRole: "qq_group_member" },
+      calls,
+    );
+    await expect(
+      call(toolByName(demoted, required.name), {
+        operation: "set_group_whole_ban",
+        params: { enable: true },
+      }),
+    ).rejects.toThrow("native_group_role_denied");
+    expect(calls).toEqual([]);
+
+    const unavailable = nativeGroupTools(
+      store,
+      accepted,
+      {
+        scope,
+        required,
+        verificationError: new ProviderCallError("provider_unavailable", "provider_unavailable"),
+      },
+      calls,
+    );
+    await expect(
+      call(toolByName(unavailable, required.name), {
+        operation: "set_group_whole_ban",
+        params: { enable: true },
+      }),
+    ).rejects.toBeInstanceOf(ProviderCallError);
+    expect(calls).toEqual([]);
+  } finally {
+    await store.close();
+  }
+});
+
+it("keeps local settings group-owner-only and set_group_admin Owner-private", async () => {
+  const { store, accepted } = await fixture();
+  try {
+    await enableCategory(store, "group.settings");
+    const adminScope = nativeGroupScope("qq_group_admin");
+    const ownerScope = nativeGroupScope("qq_group_owner");
+    await grantNativeGroupAction(store, adminScope, "group:settings:local");
+    const required = {
+      name: "qq_group_local_settings",
+      input: {
+        groupId: "100",
+        operation: "set_group_name",
+        params: { group_name: "新群名" },
+      },
+    };
+    const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
+    const admin = nativeGroupTools(
+      store,
+      accepted,
+      { scope: adminScope, required, verifiedRole: "qq_group_admin" },
+      calls,
+    );
+    await expect(
+      call(toolByName(admin, required.name), {
+        operation: "set_group_name",
+        params: { group_name: "新群名" },
+      }),
+    ).rejects.toThrow("native_group_role_denied");
+    const owner = nativeGroupTools(
+      store,
+      accepted,
+      { scope: ownerScope, required, verifiedRole: "qq_group_owner" },
+      calls,
+    );
+    await call(toolByName(owner, required.name), {
+      operation: "set_group_name",
+      params: { group_name: "新群名" },
+    });
+    expect(calls).toHaveLength(1);
+    expect(
+      availableCapabilityToolNames({
+        isOwner: false,
+        chatType: "group",
+        enabledCategories: ["group.settings"],
+        nativeGroupRole: "qq_group_owner",
+      }),
+    ).not.toContain("qq_group_settings");
+  } finally {
+    await store.close();
+  }
 });
 
 it("binds a group Run to its own group and refuses a model-supplied one", async () => {

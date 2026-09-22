@@ -235,7 +235,8 @@ const MUTATION_VERB =
  * at all, so a Run could answer 是 or 否 with the evidence check satisfied and nothing behind the
  * answer. A question that really is about possibility names possibility: 能否, 能不能, 可否.
  */
-const CAPABILITY_QUESTION = /如何|怎么|能否|能不能|可否|可以吗/u;
+const CAPABILITY_QUESTION =
+  /如何|怎么|能否|能不能|可否|可以吗|(?:谁|我|管理员|群主|成员|机器人|你)[^。！？\n]{0,80}可以[^。！？\n]{0,80}吗/u;
 
 interface LiveDomain {
   readonly domain: RequiredEvidenceDomain;
