@@ -527,19 +527,26 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         );
       // §2/§3 — every domain the message asked about, not the first one the check reached. A
       // message that asks about members *and* notices is not answered by observing one of them.
-      const missingTools = () =>
-        [
-          ...(completedRequiredTool() ? [] : [requiredName ?? ""]),
-          ...unobservedEvidence(resolveEvidence(evidence, observedCalls)).map(
-            (resolution) => resolution.tool,
-          ),
-        ].filter((name) => name.length > 0);
-      const missing = missingTools();
+      const missingRequirements = () => [
+        ...(completedRequiredTool() || required === undefined
+          ? []
+          : [{ name: required.name, input: required.input }]),
+        ...resolveEvidence(evidence, observedCalls).flatMap((resolution, index) =>
+          resolution.outcome === "success"
+            ? []
+            : [{ name: evidence[index]!.tool, input: evidence[index]!.input }],
+        ),
+      ];
+      const missing = missingRequirements();
       if (result.status === "completed" && missing.length > 0 && !input.signal.aborted) {
         result = await this.runtime.run(
           binding,
           { ...input.run, principalId: input.caller.principalId },
-          `The required action has not executed. Call ${[...new Set(missing)].join(" and ")} now${requiredInputClause(context.requiredToolInput)}. Do not ask for confirmation and do not report success without the tool result.`,
+          `The required action has not executed. Call ${missing
+            .map(({ name, input: requiredInput }) => `${name}${requiredInputClause(requiredInput)}`)
+            .join(
+              " and ",
+            )} now. Do not ask for confirmation and do not report success without the tool result.`,
           context,
         );
         observedCalls.push(...result.toolCalls);

@@ -826,6 +826,21 @@ describe("mutation intent comes only from the current user message", () => {
     });
   });
 
+  it("gives each required Tool the input that answers it, not one Tool's input for all", async () => {
+    // A message can require a mutation and a read at once, and each pins a different input. One
+    // input clause for the whole list read as governing both, so the model was told to call the
+    // member read with the moderation's operation and parameters — an input its own schema
+    // rejects, leaving the Run to fail closed on a Tool it was told to call wrongly.
+    const fabricated = { status: "completed" as const, text: "已禁言，成员如下。", toolCalls: [] };
+    const f = fixture([fabricated, fabricated]);
+    f.input.text = "把群 1126022432 的成员 10004 禁言 60 秒，另外查看群 1126022432 有哪些成员";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "failed" });
+    expect(f.run).toHaveBeenCalledTimes(2);
+    const prompt = f.run.mock.calls[1]?.[2] ?? "";
+    expect(prompt).toContain('"operation":"set_group_ban"');
+    expect(prompt).toContain('"operation":"get_group_member_list"');
+  });
+
   it("refuses a capability mutation on a different group than the message named", async () => {
     const wrongGroup = {
       status: "completed" as const,
@@ -1302,6 +1317,28 @@ describe("a factual answer requires the observation it depends on", () => {
       text: "未能从 QQ 获取该信息，因此无法确认。",
     });
     expect(f.run.mock.calls[1]?.[2]).toContain("qq_group_content");
+  });
+
+  it("names every operation a shared Tool has to be called with", async () => {
+    // 群公告 and 精华消息 are two domains answered by one Tool and told apart only by the
+    // operation. Naming the Tool once told the model to call it with nothing saying which
+    // operation, so it could answer half the message and be told again that it had not — in the
+    // same words, however many times it tried.
+    const fabricated = {
+      status: "completed" as const,
+      text: "公告见下，精华消息见下。",
+      toolCalls: [],
+    };
+    const f = memberFixture([fabricated, fabricated]);
+    f.input.text = "群里有哪些精华消息和群公告？";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "failed",
+      text: "未能从 QQ 获取该信息，因此无法确认。",
+    });
+    expect(f.run).toHaveBeenCalledTimes(2);
+    const prompt = f.run.mock.calls[1]?.[2] ?? "";
+    expect(prompt).toContain("_get_group_notice");
+    expect(prompt).toContain("get_essence_msg_list");
   });
 
   it("never forgets a domain the first attempt observed", async () => {
