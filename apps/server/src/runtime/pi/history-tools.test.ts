@@ -1442,6 +1442,7 @@ it("physically projects an exact-field reply from Tool details instead of model 
   expect(spec).toEqual({
     fields: ["sender", "time", "text"],
     exactTerms: [EXACT_IDENTIFIER.toLowerCase()],
+    exactText: true,
   });
 
   const text = projectStrictHistoryReply(spec!, {
@@ -1456,17 +1457,47 @@ it("physically projects an exact-field reply from Tool details instead of model 
           senderId: "member-e",
           senderName: "Carrier",
           occurredAt: "2026-09-18T09:00:00Z",
-          snippet: `已合并 ${EXACT_IDENTIFIER} 到 main`,
+          snippet: EXACT_IDENTIFIER,
         },
       ],
     },
   });
 
   expect(text).toBe(
-    `发送者：member-e（Carrier）\n时间：2026-09-18T09:00:00Z\n原文：已合并 ${EXACT_IDENTIFIER} 到 main`,
+    `发送者：member-e（Carrier）\n时间：2026-09-18T09:00:00Z\n原文：${EXACT_IDENTIFIER}`,
   );
   expect(text).not.toContain("coverage");
   expect(text).not.toContain("model-visible projection");
+});
+
+it("filters identifier commentary out of an exact-text reply", () => {
+  const spec = strictHistoryReplySpec(
+    `请搜索本群历史，精确查找 ${EXACT_IDENTIFIER}，并只回复发送者、时间和原文。`,
+  );
+  const text = projectStrictHistoryReply(spec!, {
+    details: {
+      query: EXACT_IDENTIFIER,
+      resultStatus: "matches_found",
+      coverage: { coverage: "complete" },
+      items: [
+        {
+          groupId: "100",
+          senderId: "bot",
+          occurredAt: "2026-09-18T09:01:00Z",
+          snippet: `已找到 ${EXACT_IDENTIFIER}`,
+        },
+        {
+          groupId: "100",
+          senderId: "member-e",
+          occurredAt: "2026-09-18T09:00:00Z",
+          snippet: EXACT_IDENTIFIER,
+        },
+      ],
+    },
+  });
+
+  expect(text).toBe(`发送者：member-e\n时间：2026-09-18T09:00:00Z\n原文：${EXACT_IDENTIFIER}`);
+  expect(text).not.toContain("已找到");
 });
 
 it("fails the strict projection when the Tool result cannot prove a requested field", () => {

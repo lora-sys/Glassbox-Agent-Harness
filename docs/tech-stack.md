@@ -67,7 +67,13 @@ agent:up reads optional Herdr, NapCat and Glassbox launch settings from
 on a temporary worktree. Use docs/service-launch.example.json as the shape. Keep
 credentials in the existing protected Channel and model stores. agent:up is idempotent.
 It keeps verified running processes and starts only missing services.
-For NapCat restart login, append the Bot QQ number to the launcher arguments after the QQ executable and injection library. The service file accepts only the documented non-secret environment keys.
+For NapCat restart login, append the Bot QQ number to the launcher arguments after the QQ executable and injection library. Pin the first NapCat argument to the tested QQ executable. Do not point it at an auto-updated system QQ installation: an unsupported QQ build can leave OneBot listening while the account is offline. Keep the NapCat work directory, injection library and environment paths from one tested installation together.
+
+The Glassbox launch environment must include `LORA_PI_KIT_PATH` whenever a configured Channel uses a `pi:*` execution reference. Starting only the HTTP server without that path can accept a message but fail before Pi creates the Run session. Use `vp run agent:up` for normal recovery instead of manually launching the three processes with partial environment variables.
+
+If NapCat reports that its saved quick-login state has expired, keep the one `agent:up` process running and complete login through the local NapCat WebUI. Do not restart it repeatedly to refresh QR images. A successful login starts the configured OneBot endpoint, and the auto-connect Channel then reconnects without restarting Glassbox.
+
+The service file accepts only the documented non-secret environment keys.
 
 The service manager launches fixed executables without a shell. It records process identity in the data directory and verifies it before shutdown. Named Herdr sessions use Herdr's public session status and stop commands.
 

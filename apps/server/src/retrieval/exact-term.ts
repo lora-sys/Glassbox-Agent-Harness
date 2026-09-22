@@ -134,3 +134,8 @@ export function carriesEveryExactTerm(text: string, terms: readonly string[]): b
   for (const match of folded(text).matchAll(IDENTIFIER_RUN)) carried.add(identifierValue(match[0]));
   return terms.every((term) => carried.has(term));
 }
+
+/** Whether the whole message, apart from surrounding whitespace and character width, is one term. */
+export function isBareExactTerm(text: string, term: string): boolean {
+  return folded(text).trim().toLowerCase() === term;
+}

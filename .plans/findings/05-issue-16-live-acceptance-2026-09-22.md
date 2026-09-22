@@ -123,6 +123,43 @@ Commit `e3a3f4c` moves that narrow contract below the model:
 Coverage, counts, and source-stop evidence remain present in the Tool result and Raw Trace. The
 physical reply projection limits only delivery for the user's explicit narrow field contract.
 
+## Runtime recovery findings
+
+The next live confirmation first exposed two local service recovery problems rather than an Issue
+16 retrieval failure.
+
+The saved NapCat launch configuration pointed at the auto-updated system QQ 9.9.36 build 53489.
+NapCat 4.18.28 reported that architecture as unsupported, and the QQ account later became offline
+while the local OneBot socket still existed. The acceptance runtime was restored with the tested
+isolated QQ 9.9.33 build 52230. The local launch configuration now pins that executable instead of
+the system installation.
+
+After login recovery, Run `706697fc-686c-4fe9-a011-4715650d9ec7` finished as `unknown` before any
+Pi or Tool event. The manually started Glassbox process had `GLASSBOX_DATA_DIR` but omitted
+`LORA_PI_KIT_PATH`, so the service accepted the QQ message but could not create the Pi session.
+The service was restarted with the complete configured environment. The development documentation
+now directs normal recovery through `vp run agent:up`, requires the Pi Kit path for `pi:*`
+executions, and requires a tested isolated QQ executable for NapCat.
+
+## Exact-text projection finding and correction
+
+Run `df7da3c5-276f-4ead-8f6f-6d7938d5ec5d` proved that the physical field projection executed. It
+removed model-authored diagnostics and emitted only sender, time, and original text. It still
+projected every history message that contained `P4B-A-1349`, including old bot replies and search
+requests. The first projected record was therefore a bot message rather than the bare canary
+message.
+
+The cause was a contract mismatch. Retrieval correctly uses identifier containment to avoid token
+near-matches, while the user's phrase `精确查找` required the whole message text to equal the
+identifier. The delivery projector reused the containment rule and had no exact-text mode.
+
+The staged correction keeps retrieval broad enough to find every evidence-bearing match, then
+applies an exact-text filter only for an explicit strict reply request that says `精确查找`,
+`精确匹配`, `完全匹配`, or the corresponding English exact-match phrase. Case, full-width
+characters, and surrounding whitespace do not change the identifier. Commentary before or after
+the identifier does. If no exact-text record remains, the projector returns the bounded negative
+form allowed by the Tool coverage instead of falling back to model prose.
+
 ## Repository verification
 
 The first correction's focused history, management, and Tool-result suites passed 98 tests. Its
@@ -142,13 +179,33 @@ The physical reply correction's complete commit gate also passed:
 - regression: 93 tests passed;
 - Web build: passed.
 
-## Remaining confirmation
+The exact-text projection correction's complete commit gate passed on the stacked Issue 17 branch:
 
-The physical correction is deployed through the stacked Issue 17 checkout. One final QQ Run must
-repeat the exact-identifier request and confirm both observable results together:
+- core check: 250 files;
+- unit tests: 76 files passed, 1 skipped; 1128 tests passed, 1 skipped;
+- deterministic end-to-end: 60 tests passed;
+- regression: 101 tests passed;
+- Web build: passed.
 
-1. source coverage no longer stops at `cursor_stuck`;
-2. the delivered answer contains only the requested sender, time, and original text.
+## Final live confirmation
 
-Until that Run is recorded, the deterministic gate, real read-only provider probe, and complete
-source walk are proven, but the physical delivery projection remains awaiting real QQ confirmation.
+Run `99ea6e67-b704-41cb-8159-bbb45c99bd4d` completed the final real QQ confirmation. The Owner
+asked the Agent to search the current group for `P4B-A-1349` exactly and return only sender, time,
+and original text. The Run recorded the required `group_history_search` input with query
+`p4b-a-1349`, completed the real provider walk through four pages, and observed
+`stop="end_of_source"`. The complete search returned 24 containment matches without a source
+limit. Both concrete Tool calls succeeded, the required Tool evidence resolved successfully, the
+Run finished as `succeeded`, and delivery reached `sent`.
+
+The physical projector removed the 23 containment-only search requests, reports, and bot replies.
+The delivered text contained exactly one record and only the requested fields:
+
+```text
+发送者：3526039967（lora）
+时间：2026-09-20T13:48:07.000Z
+原文：P4B-A-1349
+```
+
+This confirms the complete Issue 16 live path: authenticated QQ delivery, required Tool use, real
+history paging to the provider boundary, exact-message filtering below the model, bounded field
+projection, successful Run completion, and successful delivery.

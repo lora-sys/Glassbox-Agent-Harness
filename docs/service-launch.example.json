@@ -8,7 +8,7 @@
   "napcat": {
     "executable": "C:\\absolute\\path\\to\\NapCatWinBootMain.exe",
     "args": [
-      "C:\\absolute\\path\\to\\QQ.exe",
+      "C:\\absolute\\path\\to\\tested-isolated-qq\\Files\\QQ.exe",
       "C:\\absolute\\path\\to\\NapCatWinBootHook.dll",
       "-q",
       "123456789"

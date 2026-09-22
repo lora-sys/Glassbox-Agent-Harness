@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { carriesEveryExactTerm, exactTerms } from "./exact-term.js";
+import { carriesEveryExactTerm, exactTerms, isBareExactTerm } from "./exact-term.js";
 
 describe("the identifiers a query carries", () => {
   it("names the identifier a bare query is", () => {
@@ -138,6 +138,18 @@ describe("whether a candidate carries the identifiers", () => {
 
   it("carries nothing when the query named no identifier", () => {
     expect(carriesEveryExactTerm("deploy rollback", [])).toBe(true);
+  });
+});
+
+describe("whether the whole message is the identifier", () => {
+  it("accepts case, width and surrounding whitespace differences", () => {
+    expect(isBareExactTerm("  P4B-A-1349\n", "p4b-a-1349")).toBe(true);
+    expect(isBareExactTerm("Ｐ４Ｂ－Ａ－１３４９", "p4b-a-1349")).toBe(true);
+  });
+
+  it("rejects commentary that merely contains the identifier", () => {
+    expect(isBareExactTerm("已找到 P4B-A-1349", "p4b-a-1349")).toBe(false);
+    expect(isBareExactTerm("P4B-A-1349 已合并", "p4b-a-1349")).toBe(false);
   });
 });
 

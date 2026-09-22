@@ -28,7 +28,7 @@ import {
   type BoundedContextItem,
   type TruncationReason,
 } from "../../retrieval/context.js";
-import { carriesEveryExactTerm, exactTerms } from "../../retrieval/exact-term.js";
+import { carriesEveryExactTerm, exactTerms, isBareExactTerm } from "../../retrieval/exact-term.js";
 import { MemoryRetriever, type RetrievalCoverage } from "../../retrieval/retriever.js";
 import {
   groupResourceId,
@@ -454,6 +454,7 @@ export type StrictHistoryReplyField = "group" | "sender" | "time" | "text";
 export interface StrictHistoryReplySpec {
   fields: StrictHistoryReplyField[];
   exactTerms: string[];
+  exactText: boolean;
 }
 
 /**
@@ -476,7 +477,8 @@ export function strictHistoryReplySpec(text: string): StrictHistoryReplySpec | u
   if (/发送时间|时间|timestamp|time/iu.test(text)) fields.push("time");
   if (/原文|正文|消息内容|original\s*text|\btext\b/iu.test(text)) fields.push("text");
   if (fields.length === 0) return undefined;
-  return { fields, exactTerms: terms };
+  const exactText = /(?:精确查找|精确匹配|完全匹配|exact(?:\s+text)?\s+match)/iu.test(text);
+  return { fields, exactTerms: terms, exactText };
 }
 
 function historyDetailsFromToolResult(result: unknown): HistorySearchDetails | undefined {
@@ -534,10 +536,20 @@ export function projectStrictHistoryReply(
       ? "没有找到符合条件的消息。"
       : "在本次检索到的范围内没有找到符合条件的消息。";
   }
-  if (details.items.length === 0) return undefined;
+  const items = spec.exactText
+    ? details.items.filter(
+        (item) =>
+          spec.exactTerms.length === 1 && isBareExactTerm(item.snippet, spec.exactTerms[0]!),
+      )
+    : details.items;
+  if (items.length === 0) {
+    return details.coverage.coverage === "complete"
+      ? "没有找到符合条件的消息。"
+      : "在本次检索到的范围内没有找到符合条件的消息。";
+  }
 
   const blocks: string[] = [];
-  for (const item of details.items) {
+  for (const item of items) {
     if (!carriesEveryExactTerm(item.snippet, spec.exactTerms)) return undefined;
     const lines: string[] = [];
     for (const field of spec.fields) {
