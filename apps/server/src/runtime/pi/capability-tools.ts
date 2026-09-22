@@ -48,6 +48,7 @@ import { QQ_CAPABILITIES, resolveQqOperation } from "../../channels/onebot/capab
 import type { QqNativeGroupRole } from "../../channels/onebot/group-role.js";
 import { groupResourceId } from "../../retrieval/source-resolver.js";
 import {
+  consumeMutationIntent,
   createProtectedTool,
   requireMutationIntent,
   ToolAuthorizationError,
@@ -435,6 +436,13 @@ async function executeProviderCall(
     if (!capability.nativeGroupRoles.includes(verified))
       throw new ToolAuthorizationError("native_group_role_denied");
   }
+
+  if (capability.risk !== "read")
+    consumeMutationIntent(context, capability.tool, {
+      groupId: groupId!,
+      operation: action,
+      params: supplied,
+    });
 
   return options.invoke({ capability, action, params: providerParams, context });
 }

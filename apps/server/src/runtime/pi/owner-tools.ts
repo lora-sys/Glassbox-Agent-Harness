@@ -8,8 +8,8 @@ import {
   type QqCapabilityCategory,
 } from "../../channels/onebot/capabilities.js";
 import {
+  consumeMutationIntent,
   createProtectedTool,
-  requireMutationIntent,
   type ProtectedToolContext,
 } from "./protected-tools.js";
 import type { PiRunContext } from "./types.js";
@@ -161,7 +161,7 @@ export function createOwnerTools(options: {
         // Reading the inventory is safe at any time. A mutation additionally needs the
         // current user message to have asked for exactly this change to exactly this group.
         if (input.action !== "get")
-          requireMutationIntent(context, OWNER_GROUP_ADMIN_TOOL, {
+          consumeMutationIntent(context, OWNER_GROUP_ADMIN_TOOL, {
             action: input.action,
             groupId: input.groupId,
             enabled: "enabled" in input ? input.enabled : undefined,

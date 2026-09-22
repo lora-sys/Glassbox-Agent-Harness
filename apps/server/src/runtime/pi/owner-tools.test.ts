@@ -225,6 +225,30 @@ it("refuses a mutation the current user message did not ask for", async () => {
   }
 });
 
+it("attempts one requested Owner mutation at most once in a Run", async () => {
+  const { store, tool, manageGroup, require: requireMutation } = await mutationFixture(true);
+  try {
+    const capability = {
+      action: "set_capability" as const,
+      groupId: "1126022432",
+      category: "group.moderate",
+      enabled: true,
+    };
+    requireMutation("owner_group_admin", capability);
+    manageGroup.mockRejectedValueOnce(new Error("write_failed"));
+
+    await expect(
+      tool.execute("first", capability, undefined, undefined, {} as never),
+    ).rejects.toThrow("protected_tool_failed");
+    await expect(
+      tool.execute("retry", capability, undefined, undefined, {} as never),
+    ).rejects.toThrow("mutation_already_attempted");
+    expect(manageGroup).toHaveBeenCalledTimes(1);
+  } finally {
+    await store.close();
+  }
+});
+
 it("reads the inventory without a required-Tool context", async () => {
   const { store, tool, manageGroup } = await mutationFixture(true);
   try {

@@ -178,6 +178,34 @@ export function requireMutationIntent(
     throw new ToolInputError("mutation_not_requested");
 }
 
+/**
+ * The exact mutation request objects already used by this process.
+ *
+ * `requiredToolInput` is created once for a Run and every Tool context keeps that same object
+ * reference. A WeakSet therefore gives the Run one mutation attempt without adding mutable
+ * authority to persisted input or retaining completed Runs. The check and add are synchronous,
+ * so two concurrent calls cannot both cross the boundary before the provider is invoked.
+ */
+const consumedMutationIntents = new WeakSet<Readonly<Record<string, unknown>>>();
+
+/**
+ * Consumes the current Run's exact mutation request immediately before its side effect.
+ *
+ * Provider success is deliberately irrelevant. Once Glassbox has attempted the requested
+ * mutation, a model retry in the same Run is refused. A new user message creates a new Run and
+ * a new request object, so an explicit retry by the user remains possible.
+ */
+export function consumeMutationIntent(
+  context: ProtectedToolContext,
+  name: string,
+  actual: Readonly<Record<string, unknown>>,
+): void {
+  requireMutationIntent(context, name, actual);
+  const required = context.requiredToolInput!;
+  if (consumedMutationIntents.has(required)) throw new ToolInputError("mutation_already_attempted");
+  consumedMutationIntents.add(required);
+}
+
 export function createProtectedTool<
   TParams extends Record<string, unknown> = Record<string, unknown>,
   TResult = unknown,

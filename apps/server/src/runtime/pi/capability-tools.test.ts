@@ -451,6 +451,14 @@ it("keeps local settings group-owner-only and set_group_admin Owner-private", as
       operation: "set_group_name",
       params: { group_name: "新群名" },
     });
+    await expect(
+      call(toolByName(owner, required.name), {
+        operation: "set_group_name",
+        params: { group_name: "新群名" },
+      }),
+    ).rejects.toThrow("mutation_already_attempted");
+    // The earlier role denial did not consume the request. The successful provider attempt did,
+    // so a model retry in this Run never reaches the provider a second time.
     expect(calls).toHaveLength(1);
     expect(
       availableCapabilityToolNames({

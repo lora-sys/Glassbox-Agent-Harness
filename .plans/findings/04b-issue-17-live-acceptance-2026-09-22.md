@@ -105,18 +105,44 @@ advanced to 3, the Run finished as `succeeded`, and delivery reached `sent`.
 
 The live Trace exposed a separate observability defect: the safe `owner_group_admin` Tool-call
 projection retained action, group, and enabled state but omitted the allowlisted capability
-category. The durable policy and required-evidence record remained correct. The safe projection
-must be corrected before final delivery so Raw Trace records the exact non-secret category that was
-executed.
+category. The durable policy and required-evidence record remained correct. PR 18 now preserves
+the bounded `category`, `skillName`, and `sourceClass` fields in that projection and covers them in
+the regression suite.
+
+## Provider acknowledgement and single-attempt enforcement
+
+Run `0dc83720-50aa-4404-b2a3-18260cf8d683` sent the exact Owner-private `set_group_admin` request for
+member `3654774349`. NapCat acknowledged the action, but two fresh
+`get_group_member_info(no_cache=true)` reads still reported `member`. The earlier implementation
+treated the acknowledgement as success even though the requested role had not changed.
+
+Glassbox now verifies the member role after every `set_group_admin` provider acknowledgement. It
+records `provider_mutation_verification` with the expected and observed bounded roles, and returns
+`provider_postcondition_failed` when they differ. The focused suite covers promotion, removal, and
+provider no-op behavior.
+
+Run `571c9852-9ef9-4f6b-8c9b-e9eca0a1ed90` repeated the exact live request after that correction.
+Both fresh checks still observed `qq_group_member`, so the Tool failed and the delivered response
+stated that the operation was not executed. The Trace then showed the model retrying the same
+mutation once within the same Run. Both provider attempts were no-ops, but a repeated write attempt
+is unsafe even when the provider does nothing.
+
+The QQ mutation boundary now consumes the current Run's exact mutation request immediately before
+the first provider or durable-policy attempt. Any later Tool call using the same request fails with
+`mutation_already_attempted` before another side effect. Native-role and authorization refusals do
+not consume the request because no mutation attempt has occurred. A new user message creates a new
+Run and may explicitly retry. Focused tests cover provider-call deduplication, a failed durable
+mutation followed by a model retry, and a pre-mutation role denial followed by one permitted
+attempt.
 
 ## Repository verification
 
 After rebasing Issue 17 onto the latest PR 18 branch, the repository gate passed:
 
 - core check: 250 files;
-- unit tests: 76 files passed, 1 skipped; 1128 tests passed, 1 skipped;
-- deterministic end-to-end: 60 tests passed;
-- regression: 101 tests passed;
+- unit tests: 76 files passed, 1 skipped; 1131 tests passed, 1 skipped;
+- deterministic end-to-end: 62 tests passed;
+- regression: 102 tests passed;
 - Web build: passed.
 
 The focused native-role suite also passed 208 tests across the OneBot adapter, management
