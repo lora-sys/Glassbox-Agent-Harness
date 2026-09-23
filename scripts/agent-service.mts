@@ -2,14 +2,14 @@ import { execFile as execFileCallback, spawn } from "node:child_process";
 import { closeSync, openSync } from "node:fs";
 import { mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import net from "node:net";
-import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { getServiceDataDir } from "../apps/server/src/platform/paths.js";
 
 const execFile = promisify(execFileCallback);
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
-const dataDirectory = resolve(process.env.GLASSBOX_DATA_DIR ?? join(homedir(), ".glassbox"));
+const dataDirectory = getServiceDataDir();
 const statePath = join(dataDirectory, "service-processes.json");
 const priorStatePath = `${statePath}.previous`;
 const configPath = join(dataDirectory, "service-launch.json");

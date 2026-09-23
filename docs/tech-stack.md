@@ -80,6 +80,20 @@ The service file accepts only the documented non-secret environment keys.
 
 The service manager launches fixed executables without a shell. It records process identity in the data directory and verifies it before shutdown. Named Herdr sessions use Herdr's public session status and stop commands.
 
+The `glassbox` CLI and `agent:up` use the same service data directory. By default both use
+`~/.glassbox` and port 3030. Set `GLASSBOX_DATA_DIR` and `PORT` to the same values as the
+service when using a custom launch configuration. For the default Windows service configuration:
+
+```powershell
+$env:GLASSBOX_DATA_DIR = Join-Path $env:USERPROFILE '.glassbox'
+$env:PORT = '3030'
+npm run glassbox -- capabilities probe p3-qq 1126022432 --json
+```
+
+When running `dev:server` directly, the server uses the repository's `.glassbox` directory unless
+`GLASSBOX_DATA_DIR` is set. Set the same `GLASSBOX_DATA_DIR` and `PORT` in the CLI shell to target
+that development server. The CLI does not create, rotate, or copy management credentials.
+
 Do not keep parallel lint / format / type-check stacks without a demonstrated compatibility need.
 
 ## Web application

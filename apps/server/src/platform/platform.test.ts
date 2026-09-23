@@ -9,6 +9,7 @@ import { execFileSync, spawn } from "node:child_process";
 import {
   getRepoRoot,
   getGlassboxDataDir,
+  getServiceDataDir,
   getDefaultWorkspace,
   validateRepoPath,
   isPathInsideOrEqual,
@@ -35,6 +36,20 @@ describe("Platform Paths and Repo Validation", () => {
   it("resolves Glassbox application data directory under repo root by default", () => {
     const dataDir = getGlassboxDataDir();
     expect(dataDir).toBe(path.join(getRepoRoot(), ".glassbox"));
+  });
+
+  it("uses the managed service data directory by default and honors its override", () => {
+    const original = process.env.GLASSBOX_DATA_DIR;
+    try {
+      delete process.env.GLASSBOX_DATA_DIR;
+      expect(getServiceDataDir()).toBe(path.join(os.homedir(), ".glassbox"));
+
+      process.env.GLASSBOX_DATA_DIR = path.join(os.tmpdir(), "glassbox-service-data");
+      expect(getServiceDataDir()).toBe(path.resolve(os.tmpdir(), "glassbox-service-data"));
+    } finally {
+      if (original === undefined) delete process.env.GLASSBOX_DATA_DIR;
+      else process.env.GLASSBOX_DATA_DIR = original;
+    }
   });
 
   it("provides portable default workspaces using os.tmpdir() and restores env", () => {
