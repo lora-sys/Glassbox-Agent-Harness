@@ -112,6 +112,7 @@ import {
   projectToolPlaneDiagnostics,
   TOOL_PLANE_DIAGNOSTIC_RECORD_CAP,
 } from "./tool-plane-diagnostics.js";
+import { GROUP_ROLE_AUDIT_RECORD_CAP, projectGroupRoleAudit } from "./group-role-audit.js";
 import { grantOpsPermissions } from "./ops-grants.js";
 import { createQqDeliveryPolicy, hostDeliveryForbiddenValues } from "../delivery/content-policy.js";
 import {
@@ -2354,6 +2355,61 @@ export class ManagementApplication {
     return caller;
   }
 
+  private async requireManagedRoleAuditGroup(channelId: string, groupId: string) {
+    let configured: ReturnType<ChannelProfileStore["resolve"]>;
+    try {
+      configured = this.channels.resolve(channelId);
+    } catch {
+      throw new ManagementError("NOT_FOUND", "The requested record was not found.", 404);
+    }
+    if (!configured.config.groupIds.includes(groupId))
+      throw new ManagementError("NOT_FOUND", "The requested record was not found.", 404);
+    const owner = this.ownerPrivateScopes(configured).find(
+      ({ principalId }) => principalId === OWNER_ID,
+    );
+    if (!owner) throw new ManagementError("NOT_FOUND", "The requested record was not found.", 404);
+    const decision = await this.store.authorization.check({
+      caller: { principalId: owner.principalId, scope: owner.scope },
+      resourceId: groupResourceId(groupId),
+      action: GROUP_ASSIGN_ACTION,
+    });
+    if (decision.decision !== "ALLOW")
+      throw new ManagementError("NOT_FOUND", "The requested record was not found.", 404);
+    return { configured, owner };
+  }
+
+  private async groupRoleAudit(channelId: string, groupId: string) {
+    const { configured } = await this.requireManagedRoleAuditGroup(channelId, groupId);
+    const latest = await this.store.management.latestManagedGroupRuns(OWNER_ID, {
+      connectionId: configured.config.connectionId,
+      botId: configured.config.botId,
+      groupId,
+    });
+    if (latest.length === 0) return { audits: [] };
+    const audits = [];
+    for (const run of latest) {
+      const trace = await this.trace.readPage(run.runId, {
+        limit: GROUP_ROLE_AUDIT_RECORD_CAP,
+        redactSecrets: true,
+      });
+      audits.push(
+        projectGroupRoleAudit({
+          runId: run.runId,
+          groupId,
+          createdAt: run.createdAt,
+          principalKind: run.principalKind,
+          records: trace.records,
+          complete: trace.nextCursor === null,
+        }),
+      );
+    }
+
+    // The group assignment may have been revoked while the Raw Trace file was being read.
+    // Re-authorize before returning even the bounded metadata projection.
+    await this.requireManagedRoleAuditGroup(channelId, groupId);
+    return { audits };
+  }
+
   async route(request: IncomingMessage): Promise<{ status: number; body: unknown } | undefined> {
     const url = new URL(request.url ?? "/", "http://localhost");
     const path = url.pathname;
@@ -2413,6 +2469,21 @@ export class ManagementApplication {
         return ok({
           probe: await this.probeCapabilities(value.channelId, value.groupId),
         });
+      }
+      if (request.method === "GET" && path === "/manage/group-role-audit") {
+        const channelId = url.searchParams.get("channelId");
+        const groupId = url.searchParams.get("groupId");
+        if (
+          !channelId ||
+          !/^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$/u.test(channelId) ||
+          !groupId ||
+          !/^[1-9]\d{0,15}$/u.test(groupId)
+        )
+          throw new ManagementError(
+            "INVALID_REQUEST",
+            "A channel and a numeric group are required",
+          );
+        return ok(await this.groupRoleAudit(channelId, groupId));
       }
       if (request.method === "GET" && path === "/manage/conversations")
         return ok(await this.store.management.listConversations(OWNER_ID, options));

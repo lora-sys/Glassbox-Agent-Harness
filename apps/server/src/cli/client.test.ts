@@ -26,6 +26,35 @@ describe("local management HTTP client", () => {
     ).rejects.toMatchObject({ code: "INVALID_ARGUMENTS" });
     expect(fetch).not.toHaveBeenCalled();
   });
+  it("accepts only the explicit group-role audit query", async () => {
+    const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValue(jsonResponse({ audit: null }));
+    await createManagementClient(connection, { fetch }).request({
+      method: "GET",
+      path: "/manage/group-role-audit",
+      query: { channelId: "p3-qq", groupId: "1126022432" },
+    });
+    expect(fetch).toHaveBeenCalledWith(
+      "http://127.0.0.1:8741/manage/group-role-audit?channelId=p3-qq&groupId=1126022432",
+      expect.objectContaining({ method: "GET" }),
+    );
+  });
+
+  it.each([
+    { channelId: "p3-qq", groupId: "1126022432", principalId: "visitor" },
+    { channelId: "p3-qq", groupId: "0" },
+    { channelId: "p3-qq", groupId: "1126022432&token=secret" },
+    { channelId: "../private", groupId: "1126022432" },
+  ])("rejects malformed group-role audit queries", async (query) => {
+    const fetch = vi.fn<typeof globalThis.fetch>();
+    await expect(
+      createManagementClient(connection, { fetch }).request({
+        method: "GET",
+        path: "/manage/group-role-audit",
+        query,
+      } as ManagementRequest),
+    ).rejects.toMatchObject({ code: "INVALID_ARGUMENTS" });
+    expect(fetch).not.toHaveBeenCalled();
+  });
   it("uses the configured origin, bearer token, and redirect rejection", async () => {
     const fetch = vi
       .fn<typeof globalThis.fetch>()

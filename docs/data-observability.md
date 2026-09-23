@@ -27,6 +27,16 @@ durable Glassbox role truth. The Run keeps its ingress observation for reconstru
 protected mutation re-verifies the role through the current authenticated OneBot connection, so
 a restart or old Run record cannot preserve revoked QQ authority.
 
+The local Owner may inspect `trace group-role-audit <channel-id> <group-id>` for one currently
+managed group. The endpoint reports the newest Owner Run and newest Visitor Run separately. It requires the current
+Owner `group:manage` grant and an exact match to
+the configured Channel connection, bot, and group. It returns only normalized role observations,
+principal kind, role-verification status, allowlisted role Tool selection and outcome metadata, and bounded Trace
+completeness. It never returns message text, Tool arguments or results, provider error text,
+member identifiers, or Conversation scope. The ordinary Run and Trace endpoints keep their
+same-Principal `conversation:read` boundary; this audit view does not grant access to Visitor
+Conversation content. Losing the group grant before the response is sent denies the audit result.
+
 ## Service / authority map
 
 | Responsibility | Service / authority |

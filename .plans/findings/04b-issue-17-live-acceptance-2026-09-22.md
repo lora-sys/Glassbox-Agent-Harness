@@ -229,3 +229,39 @@ caller discovery, successful admin-scoped moderation, role revocation and restor
 successful `set_group_admin` postcondition remain unverified. They require a native QQ admin test
 account to send the group request and, for the `set_group_admin` success path, a provider action
 that changes the target's actual role. Do not substitute group-owner transfer for those checks.
+
+## Payload-free Owner role audit view
+
+An Owner-local `trace group-role-audit <channel-id> <group-id>` command and
+`GET /manage/group-role-audit` route inspect the newest Owner Run and Visitor Run separately in a managed group without
+relaxing the ordinary same-Principal `conversation:read` rule. The route requires a current
+Owner `group:manage` grant, matches the configured connection and Bot, and returns only the
+principal kind, normalized role, verification, allowlisted Tool-surface, outcome, and bounded
+Trace-completeness metadata.
+It excludes message bodies, Tool arguments/results, provider error text, member identifiers, and
+Conversation scope. The route rechecks the group grant after reading Trace evidence. It passed
+180 focused tests, 1162 unit tests, 69 deterministic end-to-end tests, 103 regression tests,
+core lint/type checks, formatting, and the Web build. Static isolated review found no actionable
+issue.
+
+## Payload-free live role audit, 2026-09-23
+
+After loading the audit route into the running Glassbox process, the managed-group view returned
+separate latest Owner and Visitor projections. The Owner Run showed an ingress QQ admin role, a
+fresh verified QQ admin role, `ALLOW` for `qq_group_moderation` / `set_group_ban`, a successful
+Tool outcome, a succeeded Run, and sent delivery. The Trace page was complete at 19 of 200
+records. This confirms that this Owner Run passed the role and authorization gates and the
+provider call returned success. It does not establish the result for a Visitor Principal or an
+independent provider postcondition.
+
+The latest Visitor Run in the group is older. It showed `qq_group_member`, all three group-role
+Tools excluded, no role verification, and no Tool calls. The reply was delivered even though the
+Run status was failed. This is evidence for the ordinary-member read-only boundary, not evidence
+for the current admin test account.
+
+Still missing from real acceptance are a QQ admin who is not the Glassbox Owner receiving and
+using the bounded surface, external role revoke and restore affecting the next mutation, the
+Owner-private `set_group_admin` enable/disable paths with a named disposable test member, and a
+real Bot-provider permission failure distinct from caller denial. No group-owner transfer was
+attempted. Do not perform admin assignment or other QQ mutation without an exact test member and
+an explicit user-approved action.

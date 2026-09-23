@@ -205,7 +205,7 @@ async function fixture(
     privateChat = false,
     senderId = 10002,
     groupId = 10003,
-    role: "owner" | "admin" | "member" = "member",
+    role: "owner" | "admin" | "member" | null = "member",
   ) =>
     socket.send(
       JSON.stringify({
@@ -217,7 +217,7 @@ async function fixture(
         sub_type: privateChat ? "friend" : "normal",
         group_id: groupId,
         anonymous: null,
-        sender: { role },
+        sender: role === null ? {} : { role },
         message: [
           ...(privateChat ? [] : [{ type: "at", data: { qq: "10001" } }]),
           { type: "text", data: { text } },
@@ -285,6 +285,229 @@ describe("channel to durable run composition", () => {
         url: `/manage/runs/${foreignOwnerRun.run.id}/tool-plane`,
       } as never),
     ).rejects.toMatchObject({ code: "NOT_FOUND" });
+  });
+
+  it("shows a payload-free role audit only for Visitor Runs in a group assigned to the Owner", async () => {
+    const f = await fixture(async () => ({ status: "succeeded", text: "visitor reply" }));
+    await expect(
+      f.app.route({
+        method: "GET",
+        url: "/manage/group-role-audit?channelId=fixture&groupId=10003",
+      } as never),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    const ownerScope: TrustedChannelScope = {
+      connectionId: "fixture",
+      botId: "10001",
+      chatType: "private",
+      chatId: "10002",
+      senderId: "10002",
+    };
+    await f.app.store.authorization.grant({
+      principalId: "owner",
+      resourceId: "group:10003",
+      action: "group:manage",
+      scope: ownerScope,
+      effect: "allow",
+    });
+
+    f.send(1, "禁言成员 10005 10秒", false, 10004, 10003, "admin");
+    const visitorRun = await f.started.take();
+    await f.app.runs.waitForRun(visitorRun.caller, visitorRun.run.id);
+    await f.reply("visitor reply");
+
+    const canary = "never-return-this-message-or-provider-payload";
+    const events = [
+      {
+        type: "session_start",
+        data: {
+          toolSurface: {
+            selected: [{ name: "qq_group_moderation", providerReadiness: "ready" }],
+            excluded: [{ name: "qq_group_settings", reason: "scope_not_permitted" }],
+          },
+        },
+      },
+      { type: "message_chunk", data: { text: canary } },
+      {
+        type: "tool_call",
+        data: {
+          toolCallId: "call-audit-1",
+          name: "qq_group_moderation",
+          arguments: { user_id: 10005, duration: 10, raw: canary },
+        },
+      },
+      {
+        type: "native_group_role_verification",
+        resourceId: "group:10003",
+        groupId: "10003",
+        senderId: "10004",
+        observedRole: "qq_group_admin",
+        verifiedRole: "qq_group_admin",
+        verificationStatus: "verified",
+        requestedTool: "qq_group_moderation",
+        requestedOperation: "set_group_ban",
+        authorizationDecision: "ALLOW",
+      },
+      {
+        type: "tool_result",
+        data: {
+          toolCallId: "call-audit-1",
+          name: "qq_group_moderation",
+          isError: false,
+          result: canary,
+          providerError: canary,
+        },
+      },
+    ];
+    for (const event of events)
+      await f.app.trace.append(visitorRun.run.id, event, "test-audit-fixture");
+
+    await expect(
+      f.app.route({
+        method: "GET",
+        url: "/manage/group-role-audit?channelId=fixture&groupId=10006",
+      } as never),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+
+    const result = await f.app.route({
+      method: "GET",
+      url: "/manage/group-role-audit?channelId=fixture&groupId=10003",
+    } as never);
+    expect(result?.status).toBe(200);
+    expect(result?.body).toMatchObject({
+      audits: [
+        {
+          runId: visitorRun.run.id,
+          groupId: "10003",
+          principalKind: "visitor",
+          ingress: { role: "qq_group_admin", source: "onebot_message_sender" },
+          verification: {
+            observedRole: "qq_group_admin",
+            verifiedRole: "qq_group_admin",
+            status: "verified",
+            tool: "qq_group_moderation",
+            operation: "set_group_ban",
+            authorizationDecision: "ALLOW",
+          },
+          toolCalls: [{ name: "qq_group_moderation", outcome: "success" }],
+        },
+      ],
+    });
+    expect(JSON.stringify(result?.body)).not.toContain(canary);
+    expect(JSON.stringify(result?.body)).not.toContain("10004");
+    expect(JSON.stringify(result?.body)).not.toContain("10005");
+  });
+
+  it("rechecks Owner group assignment after reading a Visitor Run Trace", async () => {
+    const f = await fixture(async () => ({ status: "succeeded", text: "visitor reply" }));
+    const ownerScope: TrustedChannelScope = {
+      connectionId: "fixture",
+      botId: "10001",
+      chatType: "private",
+      chatId: "10002",
+      senderId: "10002",
+    };
+    await f.app.store.authorization.grant({
+      principalId: "owner",
+      resourceId: "group:10003",
+      action: "group:manage",
+      scope: ownerScope,
+      effect: "allow",
+    });
+    f.send(1, "只读测试", false, 10004, 10003, "member");
+    const visitorRun = await f.started.take();
+    await f.app.runs.waitForRun(visitorRun.caller, visitorRun.run.id);
+    await f.reply("visitor reply");
+
+    const trace = f.app.trace;
+    const readPage = trace.readPage.bind(trace);
+    trace.readPage = async <T = unknown>(
+      runId: string,
+      options?: Parameters<typeof trace.readPage>[1],
+    ) => {
+      const page = await readPage<T>(runId, options);
+      await f.app.store.authorization.revokeScopeAction({
+        principalId: "owner",
+        resourceId: "group:10003",
+        action: "group:manage",
+        scope: ownerScope,
+      });
+      return page;
+    };
+
+    await expect(
+      f.app.route({
+        method: "GET",
+        url: "/manage/group-role-audit?channelId=fixture&groupId=10003",
+      } as never),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+  });
+
+  it("treats an unreported sender role as an ordinary member in the audit", async () => {
+    const f = await fixture(async () => ({ status: "succeeded", text: "visitor reply" }));
+    const ownerScope: TrustedChannelScope = {
+      connectionId: "fixture",
+      botId: "10001",
+      chatType: "private",
+      chatId: "10002",
+      senderId: "10002",
+    };
+    await f.app.store.authorization.grant({
+      principalId: "owner",
+      resourceId: "group:10003",
+      action: "group:manage",
+      scope: ownerScope,
+      effect: "allow",
+    });
+    f.send(1, "只读验收", false, 10004, 10003, null);
+    const visitorRun = await f.started.take();
+    await f.app.runs.waitForRun(visitorRun.caller, visitorRun.run.id);
+    await f.reply("visitor reply");
+
+    const result = await f.app.route({
+      method: "GET",
+      url: "/manage/group-role-audit?channelId=fixture&groupId=10003",
+    } as never);
+    expect(result?.body).toMatchObject({
+      audits: [
+        {
+          runId: visitorRun.run.id,
+          ingress: { role: "qq_group_member", source: "onebot_message_sender" },
+          verification: null,
+          toolCalls: [],
+        },
+      ],
+    });
+  });
+
+  it("returns the newest Owner group Run in the Owner audit slot", async () => {
+    const f = await fixture(async () => ({ status: "succeeded", text: "private audit canary" }));
+    const ownerScope: TrustedChannelScope = {
+      connectionId: "fixture",
+      botId: "10001",
+      chatType: "private",
+      chatId: "10002",
+      senderId: "10002",
+    };
+    await f.app.store.authorization.grant({
+      principalId: "owner",
+      resourceId: "group:10003",
+      action: "group:manage",
+      scope: ownerScope,
+      effect: "allow",
+    });
+    f.send(1, "私有审计 canary", false, 10002, 10003);
+    const ownerRun = await f.started.take();
+    await f.app.runs.waitForRun(ownerRun.caller, ownerRun.run.id);
+    await f.reply("private audit canary");
+
+    const result = await f.app.route({
+      method: "GET",
+      url: "/manage/group-role-audit?channelId=fixture&groupId=10003",
+    } as never);
+    expect(result?.body).toMatchObject({
+      audits: [{ runId: ownerRun.run.id, principalKind: "owner" }],
+    });
+    expect(JSON.stringify(result?.body)).not.toContain("private audit canary");
   });
 
   it("keeps an auto-connect channel retrying when OneBot becomes ready after server startup", async () => {
