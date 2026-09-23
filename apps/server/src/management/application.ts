@@ -5,10 +5,10 @@ import {
   type PublicChannelProfile,
   type QqSourceClass,
 } from "@glassbox/contracts";
-import { ChannelProfileStore, ChannelConfigurationError } from "../config/channel-profiles.js";
+import { ChannelProfileStore } from "../config/channel-profiles.js";
 import { GroupRuntimeStore } from "../config/group-runtime.js";
 import type { ModelProfileStore } from "../config/model-profiles.js";
-import { ExecutorConfiguration, ExecutorBusyError } from "../config/executors.js";
+import { ExecutorConfiguration } from "../config/executors.js";
 import {
   OneBotAdapter,
   OneBotConnectionError,
@@ -97,24 +97,18 @@ import { groupResourceId, resolveAssignedGroupIds } from "../retrieval/source-re
 import { AuthorizedOpsService, type WorkerPolicy } from "../ops/service.js";
 import { OpsReconciler } from "../ops/reconciler.js";
 import type { HerdrBridge } from "../ops/herdr-bridge.js";
+import { openDomainStore, type DomainStore } from "../application/domain-store.js";
 import {
-  openDomainStore,
   agentResourceId,
-  type DomainStore,
   type TrustedChannelScope,
   type CallerContext,
 } from "../persistence/index.js";
 import { RunTraceStore } from "../trace/run-store.js";
-import type { TraceEntry } from "../trace/store.js";
-import { createRunEvaluator, RunEvalError } from "../eval/index.js";
+import { createRunEvaluator } from "../eval/index.js";
 import { ManagementError } from "./access.js";
-import { readManagementJson } from "./http.js";
-import {
-  projectToolPlaneDiagnostics,
-  TOOL_PLANE_DIAGNOSTIC_RECORD_CAP,
-} from "./tool-plane-diagnostics.js";
 import { GROUP_ROLE_AUDIT_RECORD_CAP, projectGroupRoleAudit } from "./group-role-audit.js";
 import { grantOpsPermissions } from "./ops-grants.js";
+import { routeManagementRequest } from "./routes.js";
 import { createQqDeliveryPolicy, hostDeliveryForbiddenValues } from "../delivery/content-policy.js";
 import {
   TOOL_DESCRIPTORS,
@@ -2492,174 +2486,22 @@ export class ManagementApplication {
   }
 
   async route(request: IncomingMessage): Promise<{ status: number; body: unknown } | undefined> {
-    const url = new URL(request.url ?? "/", "http://localhost");
-    const path = url.pathname;
-    if (request.method === "POST" && path === "/manage/ops/grants") {
-      const result = await grantOpsPermissions(
-        this.store,
-        this.options.ops?.workerPolicy,
-        await readManagementJson(request),
-      );
-      return { status: 200, body: result };
-    }
-    const revokeOpsGrant = /^\/manage\/ops\/grants\/([a-zA-Z0-9-]{1,80})\/revoke$/u.exec(path);
-    if (request.method === "POST" && revokeOpsGrant) {
-      await this.store.authorization.revoke(revokeOpsGrant[1]!);
-      await this.store.tasks.recordTrace({
-        type: "authorization.revoked",
-        principalId: OWNER_ID,
-        data: { grantId: revokeOpsGrant[1], authority: "local-management" },
-      });
-      return { status: 200, body: { revoked: true } };
-    }
-    const options = {
-      ...(url.searchParams.has("cursor") ? { cursor: url.searchParams.get("cursor")! } : {}),
-      limit: 30,
-    };
-    const ok = (body: unknown) => ({ status: 200, body });
-    try {
-      if (path === "/manage/executors") {
-        if (request.method === "GET") return ok({ executors: await this.executors.list() });
-        if (request.method === "POST")
-          return ok({ executor: await this.executors.save(await readManagementJson(request)) });
-      }
-      if (request.method === "POST" && path === "/manage/executors/claude-code/check") {
-        await readManagementJson(request);
-        return ok({ executor: await this.executors.check() });
-      }
-      if (path === "/manage/channels") {
-        if (request.method === "GET") return ok({ channels: this.listChannels() });
-        if (request.method === "POST")
-          return ok({ channel: await this.saveChannel(await readManagementJson(request)) });
-      }
-      const channelAction = /^\/manage\/channels\/([A-Za-z0-9_-]+)\/(connect|disconnect)$/u.exec(
-        path,
-      );
-      if (request.method === "POST" && channelAction)
-        return ok({
-          channel:
-            channelAction[2] === "connect"
-              ? await this.connectChannel(channelAction[1]!)
-              : await this.disconnectChannel(channelAction[1]!),
-        });
-      if (request.method === "POST" && path === "/manage/capabilities/probe") {
-        const input = await readManagementJson(request);
-        const value = (input ?? {}) as Record<string, unknown>;
-        if (typeof value.channelId !== "string" || typeof value.groupId !== "string")
-          throw new ManagementError("INVALID_REQUEST", "A channel and a group are required");
-        return ok({
-          probe: await this.probeCapabilities(value.channelId, value.groupId),
-        });
-      }
-      if (request.method === "GET" && path === "/manage/group-role-audit") {
-        const channelId = url.searchParams.get("channelId");
-        const groupId = url.searchParams.get("groupId");
-        if (
-          !channelId ||
-          !/^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$/u.test(channelId) ||
-          !groupId ||
-          !/^[1-9]\d{0,15}$/u.test(groupId)
-        )
-          throw new ManagementError(
-            "INVALID_REQUEST",
-            "A channel and a numeric group are required",
-          );
-        return ok(await this.groupRoleAudit(channelId, groupId));
-      }
-      if (request.method === "GET" && path === "/manage/conversations")
-        return ok(await this.store.management.listConversations(OWNER_ID, options));
-      if (request.method === "GET" && path === "/manage/runs") {
-        const conversationId = url.searchParams.get("conversationId");
-        if (conversationId && !/^[A-Za-z0-9-]{1,80}$/u.test(conversationId))
-          throw new ManagementError("INVALID_REQUEST", "Invalid conversation identifier");
-        return ok(
-          await this.store.management.listRuns(OWNER_ID, {
-            ...options,
-            ...(conversationId ? { conversationId } : {}),
-          }),
-        );
-      }
-      const runAction =
-        /^\/manage\/runs\/([A-Za-z0-9-]+)(?:\/(cancel|trace|tool-plane|deliveries|evals))?$/u.exec(
-          path,
-        );
-      if (runAction) {
-        const runId = runAction[1]!;
-        const caller = await this.runCaller(runId);
-        if (request.method === "POST" && runAction[2] === "evals") {
-          const input = await readManagementJson(request);
-          if (
-            !input ||
-            typeof input !== "object" ||
-            !("suiteId" in input) ||
-            typeof input.suiteId !== "string"
-          )
-            throw new ManagementError("INVALID_REQUEST", "An Eval suite is required");
-          return ok({ evaluation: await this.evaluator.evaluate(caller, runId, input.suiteId) });
-        }
-        if (request.method === "GET" && runAction[2] === "evals")
-          return ok(await this.evaluator.list(caller, runId, options));
-        if (request.method === "POST" && runAction[2] === "cancel")
-          return ok({ run: await this.runs.cancel(caller, runId) });
-        if (request.method === "GET" && runAction[2] === "deliveries")
-          return ok(await this.store.lifecycle.listDeliveries(caller, runId, options));
-        if (request.method === "GET" && runAction[2] === "trace") {
-          const indexed = await this.store.evidence.getTrace(caller, runId);
-          if (!indexed) return ok({ records: [], nextCursor: null, indexed: null });
-          const { records, nextCursor } = await this.trace.readPage(runId, {
-            ...options,
-            redactSecrets: true,
-          });
-          // Recheck after file I/O before returning a protected projection.
-          await this.store.conversations.getRun(caller, runId);
-          return ok({ records, nextCursor, indexed });
-        }
-        if (request.method === "GET" && runAction[2] === "tool-plane") {
-          const indexed = await this.store.evidence.getTrace(caller, runId);
-          const records: TraceEntry<unknown>[] = [];
-          let cursor: string | undefined;
-          let nextCursor: string | null = null;
-          if (indexed) {
-            do {
-              const page = await this.trace.readPage(runId, {
-                ...(cursor ? { cursor } : {}),
-                limit: 50,
-                redactSecrets: true,
-              });
-              records.push(...page.records);
-              nextCursor = page.nextCursor;
-              cursor = page.nextCursor ?? undefined;
-            } while (nextCursor && records.length < TOOL_PLANE_DIAGNOSTIC_RECORD_CAP);
-          }
-          // The projection contains metadata only. Recheck after file I/O so a revoked or
-          // otherwise unavailable Owner Run never receives a stale trace view.
-          await this.store.conversations.getRun(caller, runId);
-          return ok(
-            projectToolPlaneDiagnostics({
-              runId,
-              records,
-              complete:
-                indexed !== null && nextCursor === null && records.length === indexed.eventCount,
-            }),
-          );
-        }
-        if (request.method === "GET" && !runAction[2])
-          return ok({ run: await this.store.conversations.getRun(caller, runId) });
-      }
-      return undefined;
-    } catch (error) {
-      if (error instanceof RunEvalError)
-        throw new ManagementError(
-          error.code,
-          error.message,
-          error.code === "EVAL_SUITE_NOT_FOUND" ? 400 : 409,
-        );
-      if (error instanceof ExecutorBusyError)
-        throw new ManagementError("EXECUTOR_BUSY", error.message, 409);
-      if (error instanceof ChannelConfigurationError)
-        throw new ManagementError("INVALID_CONFIGURATION", CHANNEL_SAFE_ERRORS.configuration);
-      throw error;
-    }
+    return routeManagementRequest(request, {
+      store: this.store,
+      grantOpsPermissions: (input) =>
+        grantOpsPermissions(this.store, this.options.ops?.workerPolicy, input),
+      executors: this.executors,
+      listChannels: () => this.listChannels(),
+      saveChannel: (input) => this.saveChannel(input),
+      connectChannel: (id) => this.connectChannel(id),
+      disconnectChannel: (id) => this.disconnectChannel(id),
+      probeCapabilities: (channelId, groupId) => this.probeCapabilities(channelId, groupId),
+      groupRoleAudit: (channelId, groupId) => this.groupRoleAudit(channelId, groupId),
+      runCaller: (runId) => this.runCaller(runId),
+      runs: this.runs,
+      trace: this.trace,
+      evaluator: this.evaluator,
+    });
   }
 
   async close() {
