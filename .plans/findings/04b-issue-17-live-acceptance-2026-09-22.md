@@ -202,3 +202,30 @@ provider postcondition failure remains in Raw Trace. This historical Run still r
 because Raw Trace is immutable and already records the second error as `tool_execution_failed`.
 The classifier now preserves `mutation_already_attempted` and maps it to the non-success `denied`
 outcome for new Runs. A new real duplicate-attempt Run is required to verify that end to end.
+
+## Follow-up read-only acceptance, 2026-09-23
+
+The PR 19 service remained connected to the existing `p3-qq` NapCat session. No QR refresh,
+login, group-role change, mute, or other group mutation was performed.
+
+The authenticated `capabilities probe` was run against both configured groups:
+
+| Group | Observed at | Paths | Provider-backed | Provider successes | Provider failures / unavailable / unknown |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `1126022432` | `2026-09-23T06:30:52.166Z` | 7 | 6 | 6 | 0 / 0 / 0 |
+| `1121579672` | `2026-09-23T06:31:05.306Z` | 7 | 6 | 6 | 0 / 0 / 0 |
+
+Each probe covered managed-group projection, group metadata, member-list read, group history,
+notices, essence messages, and root group files. Provider results were recorded as safe shapes
+and counts only. The group-content result arrays were empty at the time of the probe; this does
+not imply that no such content has ever existed. These probes confirm the current read-only
+provider paths in both scopes. They do not prove native-admin discovery or mutation behavior.
+
+The focused authorization and execution regression set was rerun on the PR 19 checkout:
+8 files passed, 211 tests passed. The service process was confirmed to run from that checkout.
+
+The user explicitly declined group-owner transfer testing. It was not attempted. Real QQ admin
+caller discovery, successful admin-scoped moderation, role revocation and restoration, and a
+successful `set_group_admin` postcondition remain unverified. They require a native QQ admin test
+account to send the group request and, for the `set_group_admin` success path, a provider action
+that changes the target's actual role. Do not substitute group-owner transfer for those checks.
