@@ -851,6 +851,56 @@ describe("durable result delivery and recovery", () => {
     await expect(instance.recover()).rejects.toThrow("Cannot recover active execution");
   });
 
+  it("does not reuse a persisted native admin role when starting with queued work", async () => {
+    const { store } = await fixture();
+    const observedAdminScope: TrustedChannelScope = {
+      ...group,
+      nativeGroupRole: {
+        role: "qq_group_admin",
+        source: "onebot_message_sender",
+        observedAt: "2026-09-23T01:02:03.000Z",
+      },
+    };
+    const recovered = await store.conversations.acceptIncoming(
+      input("queued-admin-before-restart", "queued admin request", observedAdminScope),
+    );
+
+    const executionScopes: Array<TrustedChannelScope["nativeGroupRole"]> = [];
+    const { instance } = service(store, {
+      supportsGroup: true,
+      execute: async (request) => {
+        executionScopes.push(request.caller.scope.nativeGroupRole);
+        return { status: "succeeded", text: "resumed" };
+      },
+    });
+
+    await instance.start();
+    await instance.drain();
+
+    expect(executionScopes).toEqual([undefined]);
+    const persistedRoute = await store.lifecycle.listRunRoutes(["succeeded"]);
+    expect(
+      persistedRoute.find((route) => route.runId === recovered.run.id)?.caller.scope
+        .nativeGroupRole,
+    ).toEqual(observedAdminScope.nativeGroupRole);
+
+    const currentMemberScope: TrustedChannelScope = {
+      ...group,
+      nativeGroupRole: {
+        role: "qq_group_member",
+        source: "onebot_message_sender",
+        observedAt: "2026-09-23T01:03:03.000Z",
+      },
+    };
+    await instance.receive(
+      input("fresh-member-after-restart", "member request", currentMemberScope),
+    );
+    await instance.drain();
+
+    expect(executionScopes).toEqual([undefined, currentMemberScope.nativeGroupRole]);
+    await instance.stop({ wait: true });
+  });
+
   it("publishes an already persisted pending result without rebuilding its payload", async () => {
     const { store } = await fixture();
     const accepted = await store.conversations.acceptIncoming(input("pending-original"));

@@ -33,6 +33,7 @@ export class RunService {
   private readonly deliveryTimeoutMs: number;
   private readonly active = new Map<string, ActiveRun>();
   private readonly blocked = new Set<string>();
+  private readonly recoveredNativeRoleRunIds = new Set<string>();
   private readonly publications = new Set<Promise<void>>();
   private readonly waiters = new Map<string, Set<RunWaiter>>();
   private pumping: Promise<void> | undefined;
@@ -56,6 +57,7 @@ export class RunService {
     if (this.started || this.active.size || this.pumping)
       throw new Error("Run service already started");
     if (options.recover) await this.recover();
+    await this.captureQueuedNativeRoleRuns();
     this.started = true;
     await this.restorePublications();
     this.kick();
@@ -67,6 +69,28 @@ export class RunService {
     const recovered = await this.options.store.lifecycle.recover();
     await this.emit({ type: "recovered", ...recovered });
     return recovered;
+  }
+
+  /** A queued Run keeps its ingress role as historical evidence, but a process
+   * restart is a trust boundary. Do not use that old observation to rediscover
+   * native-role Tools when resuming work; a new QQ message must supply a fresh
+   * observation. Protected execution still performs its own live role check. */
+  private async captureQueuedNativeRoleRuns(): Promise<void> {
+    let cursor = 0;
+    while (true) {
+      const routes = await this.options.store.lifecycle.listRunRoutes(["queued"], cursor);
+      for (const route of routes) {
+        cursor = route.sequence;
+        if (
+          route.caller.scope.chatType === "group" &&
+          route.caller.scope.nativeGroupRole &&
+          route.caller.scope.nativeGroupRole.role !== "qq_group_member"
+        ) {
+          this.recoveredNativeRoleRunIds.add(route.runId);
+        }
+      }
+      if (routes.length < 100) return;
+    }
   }
 
   async receive(input: IncomingMessage): Promise<AcceptedIncoming> {
@@ -285,7 +309,17 @@ export class RunService {
   }
 
   private launch(route: RunRoute): void {
-    const active: ActiveRun = { route, controller: new AbortController(), task: Promise.resolve() };
+    let executionRoute = route;
+    if (this.recoveredNativeRoleRunIds.delete(route.runId)) {
+      const scope = { ...route.caller.scope };
+      delete scope.nativeGroupRole;
+      executionRoute = { ...route, caller: { ...route.caller, scope } };
+    }
+    const active: ActiveRun = {
+      route: executionRoute,
+      controller: new AbortController(),
+      task: Promise.resolve(),
+    };
     this.active.set(route.conversationId, active);
     active.task = Promise.resolve()
       .then(() => this.execute(active))

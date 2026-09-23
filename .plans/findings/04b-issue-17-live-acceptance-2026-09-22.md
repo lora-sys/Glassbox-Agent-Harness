@@ -265,3 +265,18 @@ Owner-private `set_group_admin` enable/disable paths with a named disposable tes
 real Bot-provider permission failure distinct from caller denial. No group-owner transfer was
 attempted. Do not perform admin assignment or other QQ mutation without an exact test member and
 an explicit user-approved action.
+
+## Restarted queued Run role boundary
+
+Code review found that a queued group Run could survive restart with its immutable ingress role
+observation. Before this correction, the Run dispatcher also passed that old observation into
+candidate Tool discovery, so an admin Tool could reappear after restart even though execution
+would still perform fresh QQ role verification before any mutation.
+
+The dispatcher now keeps the stored Run scope and Raw Trace unchanged, but omits a persisted
+non-member role observation from the execution caller for queued group Runs present at any service
+start, including `start()` without recovery mode. Only a new OneBot message can supply a fresh role
+observation. A focused regression verifies that the resumed execution receives no stale role, the
+stored Run retains the original observation for historical reconstruction, and a later member
+message carries its current member observation.
+This closes the stale candidate-surface window; real QQ acceptance remains outstanding.
