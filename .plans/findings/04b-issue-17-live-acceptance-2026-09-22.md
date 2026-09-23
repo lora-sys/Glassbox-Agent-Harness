@@ -198,6 +198,7 @@ After PR 19 was rebased onto the Owner Tool-plane diagnostic route, a live authe
 Run `51804c1d-1b2d-4455-9a73-b23e6ab1f0d0` returned a complete bounded surface with 24 selected
 Tools and 11 exclusions. The latest `qq_group_settings` call was reported as `unknown`: the
 existing safe failure-code classifier did not recognize `mutation_already_attempted`. The earlier
-provider postcondition failure remains in Raw Trace. The classifier now preserves this fixed code
-and maps it to the non-success `denied` outcome, so the next diagnostic read can distinguish the
-blocked duplicate from an unclassified failure without exposing Tool text.
+provider postcondition failure remains in Raw Trace. This historical Run still reports `unknown`,
+because Raw Trace is immutable and already records the second error as `tool_execution_failed`.
+The classifier now preserves `mutation_already_attempted` and maps it to the non-success `denied`
+outcome for new Runs. A new real duplicate-attempt Run is required to verify that end to end.

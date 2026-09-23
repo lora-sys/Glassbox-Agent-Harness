@@ -14,7 +14,10 @@ function trace(type: string, data: Record<string, unknown>, seq: number): TraceE
   };
 }
 
-const surfaceEvent = (providerReadiness: "ready" | "unavailable" | "unknown" = "unknown") =>
+const surfaceEvent = (
+  providerReadiness: "ready" | "unavailable" | "unknown" = "unknown",
+  toolName = "qq_groups",
+) =>
   trace(
     "session_start",
     {
@@ -22,7 +25,7 @@ const surfaceEvent = (providerReadiness: "ready" | "unavailable" | "unknown" = "
       toolSurface: {
         profileName: "qq-group",
         generatedAt: "2026-09-23T00:00:00.000Z",
-        selected: [{ name: "qq_groups", provider: "qq-napcat", providerReadiness }],
+        selected: [{ name: toolName, provider: "qq-napcat", providerReadiness }],
         excluded: [
           {
             name: "owner_group_admin",
@@ -120,6 +123,28 @@ describe("Owner Tool-plane diagnostic projection", () => {
     });
     expect(JSON.stringify(report)).not.toContain("private-input");
     expect(JSON.stringify(report)).not.toContain("private-result");
+  });
+
+  it("projects a recognized duplicate-mutation refusal as denied", () => {
+    const report = projectToolPlaneDiagnostics({
+      runId: "run-a",
+      records: [
+        surfaceEvent("ready", "qq_group_settings"),
+        trace("tool_call", { name: "qq_group_settings", toolCallId: "call-duplicate" }, 2),
+        trace(
+          "tool_result",
+          {
+            name: "qq_group_settings",
+            toolCallId: "call-duplicate",
+            isError: true,
+            failureCode: "mutation_already_attempted",
+          },
+          3,
+        ),
+      ],
+      complete: true,
+    });
+    expect(report.surface.tools[0]?.lastExecution).toMatchObject({ outcome: "denied" });
   });
 
   it("caps the trace slice and marks a no-call result unknown when later evidence may be truncated", () => {
