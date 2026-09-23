@@ -166,6 +166,37 @@ describe("QQ capability registry", () => {
     ).toBeDefined();
   });
 
+  it("rejects QQ operation parameters with the wrong value type", () => {
+    const moderation = qqCapability("qq_group_moderation")!;
+    expect(
+      resolveQqOperation(moderation, "set_group_ban", {
+        group_id: 100,
+        user_id: "10004",
+        duration: 60,
+      }),
+    ).toBeDefined();
+    expect(
+      resolveQqOperation(moderation, "set_group_ban", {
+        group_id: 100,
+        user_id: 10004,
+        duration: "sixty",
+      }),
+    ).toBeUndefined();
+    expect(
+      resolveQqOperation(moderation, "set_group_ban", {
+        group_id: 100,
+        user_id: true,
+        duration: 60,
+      }),
+    ).toBeUndefined();
+    expect(
+      resolveQqOperation(moderation, "set_group_whole_ban", {
+        group_id: 100,
+        enable: "true",
+      }),
+    ).toBeUndefined();
+  });
+
   it("fails the drift check when the pinned provider contract no longer matches", () => {
     const pinned = [...NAPCAT_CONTRACT_SNAPSHOT.allowlistedActions];
     expect(checkNapCatContract(pinned)).toEqual({ ok: true });

@@ -859,13 +859,16 @@ describe("mutation intent comes only from the current user message", () => {
   });
 
   it("does not authorize a mutation the message left under-specified", async () => {
-    // The message names the operation and the group but no member and no duration, so there
-    // is nothing to bind the target to. It must create no required Tool at all.
+    // The explicit request is incomplete, so no model turn may invent the missing values or
+    // claim that the mutation happened.
     const f = fixture([{ status: "completed", text: "需要指定成员和时长。", toolCalls: [] }]);
     f.input.text = "把群 1126022432 里的成员禁言一下";
-    await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
-    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBeUndefined();
-    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toBeUndefined();
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "failed",
+      text: expect.stringMatching(/未执行/u),
+    });
+    expect(f.run).not.toHaveBeenCalled();
+    expect(f.createOrRestoreSession).not.toHaveBeenCalled();
   });
 
   it("still binds the mutation when the message adds an instruction the words contain", async () => {
@@ -1127,6 +1130,31 @@ describe("an explicit current-group history search requires the group Tool", () 
     expect(f.run.mock.calls[1]?.[2].match(/group_history_search/gu)).toHaveLength(1);
   });
 
+  it("requires the Tool for a sender-filtered search even when the marker has no matches", async () => {
+    const fabricated = {
+      status: "completed" as const,
+      text: "未查到，搜索窗口已完整。",
+      toolCalls: [],
+    };
+    const f = groupFixture([fabricated, fabricated], [GROUP_HISTORY_SEARCH_TOOL]);
+    f.input.text =
+      "请搜索发送者 QQ 3067670134 发的群历史，查找包含 P4-NOMATCH-86731 的消息。若没有命中，请明确说未查到，不要推测。";
+
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "failed",
+      text: "请求的操作未执行，请稍后重试。",
+    });
+    expect(f.run).toHaveBeenCalledTimes(2);
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe(GROUP_HISTORY_SEARCH_TOOL);
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({
+      query: "p4-nomatch-86731",
+      sender: "3067670134",
+    });
+    expect(f.run.mock.calls[1]?.[2]).toContain(
+      'with exactly this JSON input: {"query":"p4-nomatch-86731","sender":"3067670134"}',
+    );
+  });
+
   it("fails closed when the Tool call itself failed", async () => {
     const denied: PiRunResult = {
       status: "completed",
@@ -1226,6 +1254,45 @@ describe("an explicit current-group history search requires the group Tool", () 
     });
   });
 
+  it("withholds an incomplete group mutation before the model can claim success", async () => {
+    const f = groupFixture(
+      [
+        {
+          status: "completed",
+          text: "成员 3654774349 已禁言 10 秒。",
+          toolCalls: [],
+        },
+      ],
+      ["qq_group_moderation"],
+    );
+    f.input.text = "禁言测试成员3654774349";
+    const evidence: RunEvidenceRecord[] = [];
+    const executor = new PiRunExecutionAdapter(f.runtime, {
+      onEvidence: (record) => {
+        evidence.push(record);
+      },
+    });
+
+    await expect(executor.execute(f.input)).resolves.toMatchObject({
+      status: "failed",
+      text: expect.stringMatching(/未执行/u),
+    });
+    expect(f.run).not.toHaveBeenCalled();
+    expect(f.createOrRestoreSession).not.toHaveBeenCalled();
+    expect(evidence).toEqual([
+      {
+        type: "tool_evidence",
+        runId: "run-1",
+        conversationId: "conversation-1",
+        principalId: "owner",
+        phase: "required",
+        required: [],
+        blockedMutation: { operation: "set_group_ban", reason: "incomplete_parameters" },
+      },
+    ]);
+    expect(JSON.stringify(evidence)).not.toContain("3654774349");
+  });
+
   it("maps local group-owner settings to the reduced Tool and never binds set_group_admin", async () => {
     const changed: PiRunResult = {
       status: "completed",
@@ -1249,9 +1316,11 @@ describe("an explicit current-group history search requires the group Tool", () 
     );
     forbidden.input.text = "把成员 10004 设置为管理员";
     await expect(forbidden.executor.execute(forbidden.input)).resolves.toMatchObject({
-      status: "succeeded",
+      status: "failed",
+      text: expect.stringMatching(/未执行/u),
     });
-    expect(forbidden.run.mock.calls[0]?.[3]?.requiredToolName).toBeUndefined();
+    expect(forbidden.run).not.toHaveBeenCalled();
+    expect(forbidden.createOrRestoreSession).not.toHaveBeenCalled();
   });
 
   it("keeps a moderation question read-only", async () => {

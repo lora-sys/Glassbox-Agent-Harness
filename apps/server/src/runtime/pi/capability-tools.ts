@@ -44,9 +44,14 @@ import type {
   QqCapabilityCategory,
   QqCapabilityResource,
 } from "../../channels/onebot/capabilities.js";
-import { QQ_CAPABILITIES, resolveQqOperation } from "../../channels/onebot/capabilities.js";
+import {
+  QQ_CAPABILITIES,
+  qqOperationParameterKind,
+  resolveQqOperation,
+} from "../../channels/onebot/capabilities.js";
 import type { QqNativeGroupRole } from "../../channels/onebot/group-role.js";
 import { groupResourceId } from "../../retrieval/source-resolver.js";
+import { ProviderCallError } from "./provider-outcome.js";
 import {
   consumeMutationIntent,
   createProtectedTool,
@@ -302,30 +307,70 @@ function createCapabilitySearchTool(options: {
 export const GROUP_INVENTORY_TOOL = "qq_groups";
 
 function providerToolParameters(capability: QqCapability, allowListing = false) {
-  const operation = Type.String({
-    maxLength: 64,
-    enum: capability.operations.map((item) => item.action),
-    description: `Allowed operation: ${capability.operations.map((item) => item.action).join(", ")}`,
-  });
-  return Type.Object(
-    {
-      groupId: Type.Optional(
-        Type.String({
-          pattern: "^[1-9]\\d{0,15}$",
-          description: "Required only in Owner private chat. Omit inside a group.",
-        }),
-      ),
-      operation: allowListing ? Type.Optional(operation) : operation,
-      params: Type.Optional(
-        Type.Record(
-          Type.String({ maxLength: 64 }),
-          Type.Union([Type.String({ maxLength: 2_048 }), Type.Number(), Type.Boolean()]),
-          { description: "Provider parameters only. Never include group_id here." },
-        ),
-      ),
-    },
-    { additionalProperties: false },
+  const groupId = Type.Optional(
+    Type.String({
+      pattern: "^[1-9]\\d{0,15}$",
+      description: "Required only in Owner private chat. Omit inside a group.",
+    }),
   );
+  const variants = capability.operations.map((operation) => {
+    const modelParams = operation.params.filter((name) => name !== "group_id");
+    const requiredParams = new Set(operation.required.filter((name) => name !== "group_id"));
+    const params = Object.fromEntries(
+      modelParams.map((name) => [
+        name,
+        requiredParams.has(name)
+          ? providerParameterSchema(name)
+          : Type.Optional(providerParameterSchema(name)),
+      ]),
+    );
+    return Type.Object(
+      {
+        groupId,
+        operation: Type.Literal(operation.action),
+        ...(modelParams.length === 0
+          ? { params: Type.Optional(Type.Object({}, { additionalProperties: false })) }
+          : {
+              params:
+                requiredParams.size > 0
+                  ? Type.Object(params, { additionalProperties: false })
+                  : Type.Optional(Type.Object(params, { additionalProperties: false })),
+            }),
+      },
+      { additionalProperties: false },
+    );
+  });
+  if (allowListing)
+    return Type.Union([Type.Object({ groupId }, { additionalProperties: false }), ...variants]);
+  return variants.length === 1 ? variants[0]! : Type.Union(variants);
+}
+
+function providerParameterSchema(name: string) {
+  switch (qqOperationParameterKind(name)) {
+    case "boolean":
+      return Type.Boolean();
+    case "count":
+      return Type.Number({ minimum: 1, multipleOf: 1 });
+    case "duration":
+      return Type.Number({ minimum: 0, multipleOf: 1 });
+    case "message_sequence":
+      return Type.Union([
+        Type.String({ pattern: "^\\d{1,128}$" }),
+        Type.Number({ minimum: 0, multipleOf: 1 }),
+      ]);
+    case "qq_id":
+      return Type.Union([
+        Type.String({ pattern: "^[1-9]\\d{0,15}$" }),
+        Type.Number({ minimum: 1, multipleOf: 1 }),
+      ]);
+    case "opaque_id":
+      return Type.Union([
+        Type.String({ minLength: 1, maxLength: 2_048 }),
+        Type.Number({ minimum: 0, multipleOf: 1 }),
+      ]);
+    case "text":
+      return Type.String({ maxLength: 2_048 });
+  }
 }
 
 function providerToolDescription(capability: QqCapability): string {
@@ -337,6 +382,19 @@ function providerToolDescription(capability: QqCapability): string {
     })
     .join(". ");
   return `${capability.description} Set operation to one listed action. Put provider arguments in params. In a group omit groupId. In Owner private chat provide groupId. ${operations}.`;
+}
+
+function safeQqId(value: unknown): string | undefined {
+  if (typeof value !== "string" && typeof value !== "number") return undefined;
+  if (typeof value === "number" && !Number.isSafeInteger(value)) return undefined;
+  if (typeof value === "string" && !/^\d+$/u.test(value)) return undefined;
+  const numeric = Number(value);
+  if (!Number.isSafeInteger(numeric) || numeric <= 0) return undefined;
+  return String(numeric);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 interface ProviderCallOptions {
@@ -447,7 +505,47 @@ async function executeProviderCall(
       params: supplied,
     });
 
-  return options.invoke({ capability, action, params: providerParams, context });
+  const result = await options.invoke({ capability, action, params: providerParams, context });
+  if (capability.tool === "qq_group_members" && action === "get_group_member_list") {
+    // The request is authorized to read group membership, but that does not make every
+    // provider profile field necessary or safe to expose to a group audience. Keep the
+    // model-visible result at the aggregate level. Fail closed on unexpected provider
+    // shapes so a future protocol change cannot fall back to raw member records.
+    if (
+      !Array.isArray(result) ||
+      result.some((member) => !isRecord(member) || !safeQqId(member.user_id))
+    )
+      throw new ProviderCallError("provider_failed", "invalid_response");
+    const memberIds = result.map((member) =>
+      safeQqId((member as Record<string, unknown>).user_id)!,
+    );
+    if (new Set(memberIds).size !== memberIds.length)
+      throw new ProviderCallError("provider_failed", "invalid_response");
+    return { memberCount: result.length };
+  }
+  if (capability.tool === "qq_group_members" && action === "get_group_member_info") {
+    // The model requests one member, but only the verified native role is needed by the
+    // authorization surface. Match both identities before disclosing even that projection.
+    const expectedGroupId = safeQqId(providerParams.group_id);
+    const expectedUserId = safeQqId(providerParams.user_id);
+    if (
+      !expectedGroupId ||
+      !expectedUserId ||
+      !isRecord(result) ||
+      safeQqId(result.group_id) !== expectedGroupId ||
+      safeQqId(result.user_id) !== expectedUserId ||
+      (result.role !== "owner" && result.role !== "admin" && result.role !== "member")
+    )
+      throw new ProviderCallError("provider_failed", "invalid_response");
+    const role =
+      result.role === "owner"
+        ? "qq_group_owner"
+        : result.role === "admin"
+          ? "qq_group_admin"
+          : "qq_group_member";
+    return { role };
+  }
+  return result;
 }
 
 function createProviderCapabilityTool(

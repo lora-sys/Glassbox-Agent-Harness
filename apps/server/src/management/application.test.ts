@@ -246,6 +246,45 @@ async function fixture(
 }
 
 describe("channel to durable run composition", () => {
+  it("returns zeroed ingress diagnostics when a managed group has no Runs yet", async () => {
+    const f = await fixture(async () => ({ status: "succeeded", text: "unused" }));
+    const ownerScope: TrustedChannelScope = {
+      connectionId: "fixture",
+      botId: "10001",
+      chatType: "private",
+      chatId: "10002",
+      senderId: "10002",
+    };
+    await f.app.store.authorization.grant({
+      principalId: "owner",
+      resourceId: "group:10003",
+      action: "group:manage",
+      scope: ownerScope,
+      effect: "allow",
+    });
+
+    const result = await f.app.route({
+      method: "GET",
+      url: "/manage/group-role-audit?channelId=fixture&groupId=10003",
+    } as never);
+
+    expect(result?.status).toBe(200);
+    expect(result?.body).toMatchObject({
+      audits: [],
+      ingressDiagnostics: {
+        serviceStartedAt: expect.any(String),
+        lastObservedAt: null,
+        normalized: 0,
+        ignoredNotAddressed: 0,
+        ignoredEmptyMessage: 0,
+        rejectedInvalidMessage: 0,
+        rejectedUnsupportedMessage: 0,
+        rejectedOverflow: 0,
+        acceptanceFailed: 0,
+      },
+    });
+  });
+
   it("exposes Tool-plane diagnostics only for the current Owner's Run", async () => {
     const f = await fixture(async () => ({ status: "succeeded", text: "private answer" }), {
       coOwnerId: "10005",
@@ -374,6 +413,15 @@ describe("channel to durable run composition", () => {
     } as never);
     expect(result?.status).toBe(200);
     expect(result?.body).toMatchObject({
+      ingressDiagnostics: {
+        normalized: 1,
+        ignoredNotAddressed: 0,
+        ignoredEmptyMessage: 0,
+        rejectedInvalidMessage: 0,
+        rejectedUnsupportedMessage: 0,
+        rejectedOverflow: 0,
+        acceptanceFailed: 0,
+      },
       audits: [
         {
           runId: visitorRun.run.id,

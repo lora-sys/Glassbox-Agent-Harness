@@ -2,7 +2,12 @@ import { once } from "node:events";
 import type { AddressInfo } from "node:net";
 import { WebSocketServer, type WebSocket } from "ws";
 import { afterEach, describe, expect, it } from "vite-plus/test";
-import { OneBotAdapter, type OneBotAdapterOptions, type OneBotState } from "./adapter.ts";
+import {
+  OneBotAdapter,
+  type OneBotAdapterOptions,
+  type OneBotIngressDiagnostic,
+  type OneBotState,
+} from "./adapter.ts";
 import { parseOneBotConfig } from "./config.ts";
 import { normalizeOneBotMessage, type OneBotIncomingMessage } from "./normalize.ts";
 
@@ -138,6 +143,7 @@ function client(endpoint: string, options: Partial<OneBotAdapterOptions> = {}) {
   const incoming = new Queue<OneBotIncomingMessage>();
   const states = new Queue<OneBotState>();
   const errors = new Queue<Parameters<NonNullable<OneBotAdapterOptions["onIngressError"]>>[0]>();
+  const diagnostics = new Queue<OneBotIngressDiagnostic>();
   const adapter = new OneBotAdapter({
     config: parseOneBotConfig({ ...base, endpoint }),
     token: "explicit-test-token",
@@ -152,10 +158,13 @@ function client(endpoint: string, options: Partial<OneBotAdapterOptions> = {}) {
     onIngressError: (error) => {
       errors.push(error);
     },
+    onIngressDiagnostic: (diagnostic) => {
+      diagnostics.push(diagnostic);
+    },
     ...options,
   });
   cleanup.push(() => adapter.stop());
-  return { adapter, incoming, states, errors };
+  return { adapter, incoming, states, errors, diagnostics };
 }
 
 describe("OneBot normalization", () => {
@@ -192,7 +201,19 @@ describe("OneBot normalization", () => {
     { message_type: "private", sub_type: "group" },
     { message_type: "private", sub_type: "other" },
   ])("ignores disallowed ingress %j", (override) => {
-    expect(normalizeOneBotMessage(inbound(override), config)).toEqual({ kind: "ignored" });
+    expect(normalizeOneBotMessage(inbound(override), config)).toMatchObject({ kind: "ignored" });
+  });
+  it("classifies a configured group message without retaining message or member data", () => {
+    const result = normalizeOneBotMessage(
+      inbound({ message: [{ type: "text", data: { text: "private-message-canary" } }] }),
+      config,
+    );
+    expect(result).toEqual({
+      kind: "ignored",
+      diagnostic: { groupId: "10003", reason: "not_addressed" },
+    });
+    expect(JSON.stringify(result)).not.toContain("private-message-canary");
+    expect(JSON.stringify(result)).not.toContain("10002");
   });
   it("accepts an addressed member of a configured group without making private chat public", () => {
     expect(normalizeOneBotMessage(inbound({ user_id: 10099 }), config)).toMatchObject({
@@ -286,7 +307,10 @@ describe("OneBot normalization", () => {
     ).toMatchObject({ kind: "message", message: { text: "检查 [内容] &" } });
     expect(
       normalizeOneBotMessage(inbound({ message: "&#91;CQ:at,qq=10001&#93; please run" }), config),
-    ).toEqual({ kind: "ignored" });
+    ).toEqual({
+      kind: "ignored",
+      diagnostic: { groupId: "10003", reason: "not_addressed" },
+    });
   });
   it("does not fetch quoted messages and rejects media or oversized input", () => {
     expect(
@@ -740,9 +764,36 @@ describe("OneBot forward WebSocket", () => {
     const socket = await fake.connections.next();
     socket.send(JSON.stringify(inbound()));
     socket.send(JSON.stringify(inbound()));
-    expect(await errors.next()).toEqual({ code: "acceptance_failed", messageId: "-7" });
-    expect(await errors.next()).toEqual({ code: "acceptance_failed", messageId: "-7" });
+    expect(await errors.next()).toEqual({
+      code: "acceptance_failed",
+      messageId: "-7",
+      groupId: "10003",
+    });
+    expect(await errors.next()).toEqual({
+      code: "acceptance_failed",
+      messageId: "-7",
+      groupId: "10003",
+    });
     expect(received).toEqual(["-7", "-7"]);
+  });
+  it("reports only fixed metadata when a configured-group message is ignored", async () => {
+    const fake = await server();
+    const { adapter, diagnostics } = client(fake.endpoint);
+    await adapter.start();
+    const socket = await fake.connections.next();
+    socket.send(
+      JSON.stringify(
+        inbound({ message: [{ type: "text", data: { text: "private-message-canary" } }] }),
+      ),
+    );
+    const diagnostic = await diagnostics.next();
+    expect(diagnostic).toEqual({
+      groupId: "10003",
+      stage: "ignored",
+      reason: "not_addressed",
+    });
+    expect(JSON.stringify(diagnostic)).not.toContain("private-message-canary");
+    expect(JSON.stringify(diagnostic)).not.toContain("10002");
   });
   it("closes malformed frames and stop settles an in-flight delivery", async () => {
     const fake = await server({ onAction: (action) => action.action !== "get_login_info" });
@@ -790,7 +841,11 @@ describe("OneBot forward WebSocket", () => {
     socket.send(JSON.stringify(inbound()));
     await started;
     socket.send(JSON.stringify(inbound({ message_id: 8 })));
-    expect(await errors.next()).toEqual({ code: "ingress_overflow", messageId: "8" });
+    expect(await errors.next()).toEqual({
+      code: "ingress_overflow",
+      messageId: "8",
+      groupId: "10003",
+    });
     await adapter.stop();
     expect(acceptanceAborted).toBe(true);
   });

@@ -12,6 +12,7 @@ import { ExecutorConfiguration, ExecutorBusyError } from "../config/executors.js
 import {
   OneBotAdapter,
   OneBotConnectionError,
+  type OneBotIngressDiagnostic,
   type OneBotState,
 } from "../channels/onebot/index.js";
 import {
@@ -124,6 +125,18 @@ import {
 
 const OWNER_ID = "owner";
 const AGENT_ID = "personal";
+interface GroupIngressDiagnosticCounts {
+  serviceStartedAt: string;
+  lastObservedAt: string | null;
+  normalized: number;
+  ignoredNotAddressed: number;
+  ignoredEmptyMessage: number;
+  rejectedInvalidMessage: number;
+  rejectedUnsupportedMessage: number;
+  rejectedOverflow: number;
+  acceptanceFailed: number;
+}
+
 type AuthorizationContext = {
   caller: CallerContext;
   conversationId?: string;
@@ -264,6 +277,8 @@ export class ManagementApplication {
     string,
     Pick<PublicChannelProfile, "connectionState" | "lastError">
   >();
+  private readonly ingressStartedAt = new Date().toISOString();
+  private readonly groupIngressDiagnostics = new Map<string, GroupIngressDiagnosticCounts>();
   private operations: Promise<unknown> = Promise.resolve();
   private accepting = false;
   private releaseIngress!: () => void;
@@ -940,6 +955,8 @@ export class ManagementApplication {
             });
         }
       },
+      onIngressError: (error) => this.recordGroupIngressError(id, error),
+      onIngressDiagnostic: (diagnostic) => this.recordGroupIngressDiagnostic(id, diagnostic),
       onIncoming: async (message, signal) => {
         await this.ingressReady;
         await connectionReady;
@@ -2385,7 +2402,6 @@ export class ManagementApplication {
       botId: configured.config.botId,
       groupId,
     });
-    if (latest.length === 0) return { audits: [] };
     const audits = [];
     for (const run of latest) {
       const trace = await this.trace.readPage(run.runId, {
@@ -2407,7 +2423,72 @@ export class ManagementApplication {
     // The group assignment may have been revoked while the Raw Trace file was being read.
     // Re-authorize before returning even the bounded metadata projection.
     await this.requireManagedRoleAuditGroup(channelId, groupId);
-    return { audits };
+    return { audits, ingressDiagnostics: this.groupIngressDiagnosticsFor(channelId, groupId) };
+  }
+
+  private groupIngressDiagnosticKey(channelId: string, groupId: string): string {
+    return `${channelId}:${groupId}`;
+  }
+
+  private groupIngressDiagnosticsFor(
+    channelId: string,
+    groupId: string,
+  ): GroupIngressDiagnosticCounts {
+    return (
+      this.groupIngressDiagnostics.get(this.groupIngressDiagnosticKey(channelId, groupId)) ?? {
+        serviceStartedAt: this.ingressStartedAt,
+        lastObservedAt: null,
+        normalized: 0,
+        ignoredNotAddressed: 0,
+        ignoredEmptyMessage: 0,
+        rejectedInvalidMessage: 0,
+        rejectedUnsupportedMessage: 0,
+        rejectedOverflow: 0,
+        acceptanceFailed: 0,
+      }
+    );
+  }
+
+  private recordGroupIngressDiagnostic(
+    channelId: string,
+    diagnostic: OneBotIngressDiagnostic,
+  ): void {
+    if (!this.channels.resolve(channelId).config.groupIds.includes(diagnostic.groupId)) return;
+    const key = this.groupIngressDiagnosticKey(channelId, diagnostic.groupId);
+    const current = this.groupIngressDiagnosticsFor(channelId, diagnostic.groupId);
+    const next = { ...current, lastObservedAt: new Date().toISOString() };
+    const field =
+      diagnostic.stage === "normalized"
+        ? "normalized"
+        : diagnostic.reason === "not_addressed"
+          ? "ignoredNotAddressed"
+          : "ignoredEmptyMessage";
+    next[field] = Math.min(1_000_000, next[field] + 1);
+    this.groupIngressDiagnostics.set(key, next);
+  }
+
+  private recordGroupIngressError(
+    channelId: string,
+    error: {
+      code: "invalid_message" | "unsupported_message" | "acceptance_failed" | "ingress_overflow";
+      groupId?: string;
+    },
+  ): void {
+    if (!error.groupId || !this.channels.resolve(channelId).config.groupIds.includes(error.groupId))
+      return;
+    const key = this.groupIngressDiagnosticKey(channelId, error.groupId);
+    const current = this.groupIngressDiagnosticsFor(channelId, error.groupId);
+    const next = { ...current, lastObservedAt: new Date().toISOString() };
+    const field =
+      error.code === "invalid_message"
+        ? "rejectedInvalidMessage"
+        : error.code === "unsupported_message"
+          ? "rejectedUnsupportedMessage"
+          : error.code === "ingress_overflow"
+            ? "rejectedOverflow"
+            : "acceptanceFailed";
+    next[field] = Math.min(1_000_000, next[field] + 1);
+    this.groupIngressDiagnostics.set(key, next);
   }
 
   async route(request: IncomingMessage): Promise<{ status: number; body: unknown } | undefined> {

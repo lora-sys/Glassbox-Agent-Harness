@@ -280,3 +280,189 @@ observation. A focused regression verifies that the resumed execution receives n
 stored Run retains the original observation for historical reconstruction, and a later member
 message carries its current member observation.
 This closes the stale candidate-surface window; real QQ acceptance remains outstanding.
+
+## Post-restart QQ read-only probe, 2026-09-23
+
+After restarting only the Glassbox process on the PR 19 worktree, `agent:status` reported Herdr,
+NapCat, and Glassbox running. Their PIDs were 45524, 48832, and 46216 respectively. Ports 6700 and
+3030 were listening. The NapCat process was not restarted, so no QR or re-login was needed.
+
+The dedicated test-group probe at `2026-09-23T10:00:55.970Z` completed all seven observations.
+Six QQ-provider reads succeeded for group metadata, member list, history, notices, essence messages,
+and root files. There were no provider failures, unavailable results, denials, or unknown outcomes.
+Notice and essence results were valid empty arrays. This confirms the read-only bridge after the
+Glassbox restart; it does not prove Visitor admin discovery or mutation behavior.
+
+## Payload-free group ingress diagnostics, 2026-09-23
+
+During the next requested Visitor-admin test, the role audit still showed no Run newer than the
+existing 16:33 Owner Run. The current NapCat log for the dedicated test group also had no later
+group event. The WebSocket `connected` state therefore did not prove that QQ had delivered the
+test message to Glassbox. The application had not connected `OneBotAdapter.onIngressError`, and
+normal group messages without a recognized Bot mention were silently ignored by normalization.
+
+The adapter now emits only configured group ID, a fixed ingress stage, and a fixed reason code.
+The Owner-authorized group role audit adds in-memory counters since the current Glassbox process
+started for normalized group events, missing Bot mentions, empty messages, malformed or unsupported
+messages, queue overflow, and acceptance failures. It stores no message text, sender ID, or message
+ID, and the counters reset on service restart. A focused adapter test verifies the missing-mention
+diagnostic contains none of those payload fields. Focused OneBot and management tests passed 111
+cases, and core lint/type checks passed across 254 files.
+
+This does not establish why the prior test message was absent. A new Run or diagnostic delta is
+still required to complete real Visitor-admin acceptance. No group-owner transfer or group
+mutation was attempted.
+
+## Owner QQ group-owner read-only question, 2026-09-23
+
+The next group @ produced Owner Run `1ade2f47-c52b-4364-8118-2d0a574ba32e` at
+`2026-09-23T10:21:30.847Z`. Its Trace was complete at 184 records and delivery succeeded. The
+ingress principal was the Glassbox Owner, and the QQ-native role was `qq_group_owner`. The selected
+current-group surface included moderation and local settings; `qq_group_settings` remained
+excluded. There were no `tool_call` or `tool_result` records, so the read-only request did not
+execute a mutation.
+
+The generated answer nevertheless described prior moderation as tested. This Run contains no
+evidence for that claim, so it is not counted as a test of any QQ capability or the non-Owner admin
+path. Historical Runs must be checked separately before counting claims about earlier actions.
+
+## Owner QQ group metadata read, 2026-09-23
+
+Run `253cbb8a-26f7-4998-9d58-74f6cb396a03` tested a read-only request for the current group's
+name and member count. The OneBot ingress identified the sender as the native group owner. The
+Runtime authorized the read surfaces, but Trace recorded the required `qq_group_members` call as
+`not_called`; there were no Tool-call or Tool-result records. The Run therefore failed closed.
+Its stored result was `未能从 QQ 获取该信息，因此无法确认。`, and delivery reached `sent`.
+
+The model's streamed Trace text claimed that it had called `qq_groups` and
+`qq_group_members`, and included a group name, despite there being no corresponding provider-call
+evidence. The Run service delivered only the terminal failure result after the evidence check, not
+that unsupported streamed text. This is a negative live result for successful metadata retrieval,
+and positive evidence that unsupported model text was withheld from final delivery. It does not
+count as a successful provider-backed read or as non-Owner admin acceptance.
+
+A follow-up review found the audit route returned early when a managed group had no Runs, omitting
+the ingress counters. The route now returns an empty audit list with zeroed diagnostics, and a
+focused management regression passed. This change does not alter QQ execution or require a service
+restart.
+
+## Owner QQ group metadata and member-list read, 2026-09-23
+
+Run `5b3f3354-7788-4407-bc14-957f2e0f3d8c` was an Owner message in the dedicated group. Trace
+recorded successful `qq_groups` and `qq_group_members` Tool calls, with successful Tool results.
+The required `qq_group_members/get_group_member_list` evidence resolved as `success`; the Run
+finished as `succeeded`, and delivery reached `sent`. The Run made no mutation Tool calls. The
+provider result showed a non-Owner QQ admin in the group, but this Owner-sent Run does not verify
+that account's bounded Tool surface. That still requires a message from the non-Owner admin.
+
+## Native admin confirmation and member-result minimization, 2026-09-23
+
+Run `c0592618-72ba-4c4d-92a5-f4fc2cb62b96` completed at `2026-09-23T11:01:45.037Z`. The
+group-role audit recorded native ingress role `qq_group_admin`, selected `qq_group_moderation`,
+excluded both settings surfaces, recorded no management Tool calls, and reported successful Run
+and delivery. The sender is also a configured Glassbox Owner identity, so the Owner Principal
+classification is expected and does not invalidate this role-surface test. Group Tool eligibility
+uses the current QQ-native role and group policy; a Glassbox Owner Principal does not bypass the
+group-role surface. This Run proves that a QQ admin receives the bounded current-group moderation
+surface, but it did not execute a mutation.
+
+The earlier successful member-list read returned profile fields beyond the requested group name
+and member count, and the Run delivered that overbroad response to the group. Authorization to
+read membership did not minimize the result or constrain the audience-facing fields. The
+`qq_group_members/get_group_member_list` boundary now projects valid provider arrays to
+`{ memberCount }` before the result reaches either model-visible Tool content or Trace details.
+Every entry must contain a valid, unique QQ identity. The sibling
+`qq_group_members/get_group_member_info` operation validates the returned group ID, member ID,
+and native role, then returns only the normalized role. Both operations fail closed on malformed
+or mismatched provider responses. The focused `capability-tools.test.ts` suite has regressions for
+redaction in both Tool projections, invalid list entries, duplicate identities, empty lists, and
+mismatched or malformed member-info responses. No live member-list or member-info read was
+repeated after this finding.
+
+This is a source-read minimization boundary, not a claim that the provider adapter never receives
+raw profile data. The adapter receives the OneBot result internally; the capability Tool removes
+profile fields before model-visible content and Trace details.
+
+The current Channel configuration has distinct primary Owner and co-owner identities. The
+co-owner resolves to a separate Owner Principal with its own scopes and grants. A later Run
+`40c552b1-7d6a-41b6-a4a1-c310576fd5fa`, received after restarting only Glassbox to load the local
+projection fix, was again classified as an Owner Principal and observed as `qq_group_owner` in
+the QQ group. It exposed the Owner moderation and local-settings surfaces, called no Tools, and
+was delivered successfully. The audit intentionally does not identify which configured Owner
+sent it. This confirms the Owner path, not the non-Owner QQ-admin acceptance. NapCat remained
+running, and the OneBot Channel reconnected without a QR login.
+
+## Incomplete moderation request and Tool schema gap, 2026-09-23
+
+Run `47f77e7f-3c95-4287-85e0-c5cfa2baba91` came from a QQ-native group admin. The message named a
+member but did not specify a mute duration. Trace had no Tool calls, yet the model replied that it
+had muted the member for 10 seconds. A payload-free SQL check confirmed the incoming request had
+no duration. No QQ mutation occurred; the success claim and duration were fabricated.
+
+The failure had two causes. The model-facing Tool schema used an unrestricted string/number/boolean
+record for every operation, rather than declaring operation-specific required parameters. The
+Run requirement parser also treated a recognized mutation with missing parameters as no mutation
+intent, allowing ordinary model output instead of refusing the incomplete action.
+
+The capability schema now exposes one strict variant per provider operation. Each variant lists
+only that operation's parameters, marks the provider-required values required, disallows extra
+keys, and keeps `group_id` server-bound. The Run adapter now blocks explicit but incomplete
+mutations before creating a runtime session or invoking the model. It records only the operation
+and a fixed reason code, without the target ID. Explicit group requests for operations not
+permitted in group chat also fail before model execution. Capability execution still performs its
+own input, authorization, mutation-intent, and fresh native-role checks.
+
+Regressions cover the incomplete mute path, the forbidden group-admin path, safe evidence without
+the target ID, exact required fields for mute/kick/whole-group-mute schemas, invalid runtime value
+types, and the existing read-only moderation question. The full server suite passed 1,174 tests
+with one existing environment-conditional skip. Server lint and types passed across 241 files, and
+formatting passed for all six changed code and test files. This fixes the reproduced false-success
+path; it does not yet count as real successful moderation acceptance. Retest after loading the
+validated code, with an explicit target and duration, and inspect the resulting Trace for a
+successful Tool call and provider result.
+
+Glassbox is now running the validated worktree on port 3030 as PID 3144. Herdr PID 45524 and
+NapCat PID 48832 remained running through the restart. The QQ read-only capability probe completed
+all six provider-backed paths after Glassbox restarted; no login QR was generated. The earlier
+managed-start attempt exited before readiness, and one retry started the service successfully.
+
+## Successful complete mute request, 2026-09-23
+
+Run `2a3091e8-0f75-4373-8733-0bf53ab73626` received the complete 60-second request. The required
+Tool evidence bound `set_group_ban` to the requested member and duration. The QQ-native group owner
+was freshly verified, authorization was `ALLOW`, and the moderation Tool call completed with
+`isError: false`. The Run succeeded and delivery reached `sent`; the final Run result matched the
+requested duration. No other Tool ran in this Run.
+
+This is real acceptance of the validated schema, parameter binding, authorization, role recheck,
+provider call, and truthful delivery for the QQ group-owner path. It does not close acceptance for
+a non-Owner QQ admin: ingress identifies this sender as `qq_group_owner`. The Trace intentionally
+does not retain the raw provider result payload, so this evidence proves a successful OneBot Tool
+result rather than independently exposing the member's transient mute state.
+
+## Sender-filtered no-hit search did not require retrieval, 2026-09-23
+
+Live Run `fb0c662e-6c2c-4012-9ba7-bda8c6f0f150` asked for a sender-filtered search of a marker
+that had no matches. It returned `未查到` and claimed complete coverage, but Trace had no
+`group_history_search` call or `history_retrieval` event. The required evidence list was empty, so
+the answer was unsupported.
+
+The request used the natural order `搜索发送者 QQ <id> 发的群历史`. The intent recognizer only
+accepted a search verb immediately followed by the group noun, so the sender filter hid the
+history-search intent. The recognizer now accepts an explicit sender-qualified history request,
+and the runtime binds both its single literal query and sender QQ id into the required Tool input.
+If the model does not call that Tool with the bound input, the Run fails closed. Regression tests
+cover the exact request shape, fail-closed behavior when no Tool call occurs, and a nearby
+speculative mention that must not trigger a search.
+
+Validation on the live integration worktree: 1,177 unit tests passed with one existing skip,
+70 deterministic E2E tests passed, and core lint/types passed across 254 files. The focused runtime
+tests also passed 111 cases. Glassbox restarted as PID 37540 to load the fix; NapCat PID 48832 and
+Herdr PID 45524 remained running.
+
+The post-restart live rerun is Run `d2aa3406-cef3-4e69-b407-2b3d20b378a9`. Required Tool evidence
+bound `query=p4-nomatch-86731` and `sender=3067670134`. Trace records one successful
+`group_history_search` call (`isError=false`) against group `1126022432`. Retrieval considered and
+returned zero items, was not truncated, and reported `coverage=complete` after five pages reached
+`end_of_source`. The Run succeeded, delivered `未查到`, and stated the search-window boundary.
+NapCat stayed at PID 48832; no QR was generated. This accepts the sender-filtered no-hit path.

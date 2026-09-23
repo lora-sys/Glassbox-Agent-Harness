@@ -14,8 +14,13 @@ export interface OneBotIncomingMessage {
 
 export type NormalizeResult =
   | { kind: "message"; message: OneBotIncomingMessage }
-  | { kind: "ignored" }
-  | { kind: "rejected"; code: "invalid_message" | "unsupported_message"; messageId?: string };
+  | { kind: "ignored"; diagnostic?: { groupId: string; reason: "not_addressed" | "empty_message" } }
+  | {
+      kind: "rejected";
+      code: "invalid_message" | "unsupported_message";
+      messageId?: string;
+      groupId?: string;
+    };
 
 function unescapeCq(value: string): string {
   return value
@@ -57,6 +62,7 @@ export function normalizeOneBotMessage(
   const senderId = qqId(input.user_id);
   const type = input.message_type;
   if (type !== "private" && type !== "group") return { kind: "ignored" };
+  const groupId = type === "group" ? qqId(input.group_id) : undefined;
   // Private chat stays allowlisted. A configured group accepts any real member only after the
   // explicit @ check below; the application then provisions authority for that exact group.
   const isOwner =
@@ -76,12 +82,23 @@ export function normalizeOneBotMessage(
   if (!chatId || (type === "group" && !config.groupIds.includes(chatId)))
     return { kind: "ignored" };
   const id = messageId(input.message_id);
-  if (id === undefined) return { kind: "rejected", code: "invalid_message" };
+  if (id === undefined)
+    return { kind: "rejected", code: "invalid_message", ...(groupId ? { groupId } : {}) };
   if (typeof input.message === "string" && input.message.length > 16_000)
-    return { kind: "rejected", code: "invalid_message", messageId: id };
+    return {
+      kind: "rejected",
+      code: "invalid_message",
+      messageId: id,
+      ...(groupId ? { groupId } : {}),
+    };
   const segments = typeof input.message === "string" ? cqSegments(input.message) : input.message;
   if (!Array.isArray(segments) || segments.length > 256)
-    return { kind: "rejected", code: "invalid_message", messageId: id };
+    return {
+      kind: "rejected",
+      code: "invalid_message",
+      messageId: id,
+      ...(groupId ? { groupId } : {}),
+    };
   const texts: string[] = [];
   let addressed = false;
   let replyTo: string | undefined;
@@ -89,28 +106,70 @@ export function normalizeOneBotMessage(
   for (const segment of segments) {
     const part = object(segment);
     const data = object(part?.data);
-    if (!part || !data) return { kind: "rejected", code: "invalid_message", messageId: id };
+    if (!part || !data)
+      return {
+        kind: "rejected",
+        code: "invalid_message",
+        messageId: id,
+        ...(groupId ? { groupId } : {}),
+      };
     if (part.type === "text") {
       if (typeof data.text !== "string")
-        return { kind: "rejected", code: "invalid_message", messageId: id };
+        return {
+          kind: "rejected",
+          code: "invalid_message",
+          messageId: id,
+          ...(groupId ? { groupId } : {}),
+        };
       texts.push(data.text);
     } else if (part.type === "at") {
       const target = qqId(data.qq);
       if (target === config.botId) addressed = true;
       else if (target || data.qq === "all") texts.push(`@${target ?? "all"}`);
-      else return { kind: "rejected", code: "invalid_message", messageId: id };
+      else
+        return {
+          kind: "rejected",
+          code: "invalid_message",
+          messageId: id,
+          ...(groupId ? { groupId } : {}),
+        };
     } else if (part.type === "reply") {
       const replyId = messageId(data.id);
       if (replyId === undefined || replyTo !== undefined)
-        return { kind: "rejected", code: "invalid_message", messageId: id };
+        return {
+          kind: "rejected",
+          code: "invalid_message",
+          messageId: id,
+          ...(groupId ? { groupId } : {}),
+        };
       replyTo = replyId;
     } else unsupported = true;
   }
-  if (type === "group" && !addressed) return { kind: "ignored" };
-  if (unsupported) return { kind: "rejected", code: "unsupported_message", messageId: id };
+  if (type === "group" && !addressed)
+    return {
+      kind: "ignored",
+      ...(groupId ? { diagnostic: { groupId, reason: "not_addressed" as const } } : {}),
+    };
+  if (unsupported)
+    return {
+      kind: "rejected",
+      code: "unsupported_message",
+      messageId: id,
+      ...(groupId ? { groupId } : {}),
+    };
   const text = texts.join("").trim();
-  if (!text) return { kind: "ignored" };
-  if (text.length > 16_000) return { kind: "rejected", code: "invalid_message", messageId: id };
+  if (!text)
+    return {
+      kind: "ignored",
+      ...(groupId ? { diagnostic: { groupId, reason: "empty_message" as const } } : {}),
+    };
+  if (text.length > 16_000)
+    return {
+      kind: "rejected",
+      code: "invalid_message",
+      messageId: id,
+      ...(groupId ? { groupId } : {}),
+    };
   const sender = object(input.sender);
   return {
     kind: "message",

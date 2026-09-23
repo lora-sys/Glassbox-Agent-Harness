@@ -89,6 +89,13 @@ export interface OneBotState {
     | "ingress_overflow";
 }
 
+/** Payload-free group ingress status for a bounded, Owner-authorized diagnostic projection. */
+export interface OneBotIngressDiagnostic {
+  groupId: string;
+  stage: "normalized" | "ignored";
+  reason?: "not_addressed" | "empty_message";
+}
+
 export type OneBotDeliveryResult =
   | { status: "confirmed"; messageId: string }
   | {
@@ -160,7 +167,10 @@ export interface OneBotAdapterOptions {
   onIngressError?: (error: {
     code: "invalid_message" | "unsupported_message" | "acceptance_failed" | "ingress_overflow";
     messageId?: string;
+    groupId?: string;
   }) => void;
+  /** Receives only a configured group id and fixed status codes, never message or member data. */
+  onIngressDiagnostic?: (diagnostic: OneBotIngressDiagnostic) => void;
   requestTimeoutMs?: number;
   reconnectDelayMs?: number;
   maxPendingIncoming?: number;
@@ -543,6 +553,15 @@ export class OneBotAdapter {
     }
   }
 
+  #ingressDiagnostic(diagnostic: OneBotIngressDiagnostic): void {
+    if (!this.config.groupIds.includes(diagnostic.groupId)) return;
+    try {
+      this.#options.onIngressDiagnostic?.(diagnostic);
+    } catch {
+      /* Diagnostics cannot affect message acceptance. */
+    }
+  }
+
   #connect(): Promise<void> {
     const generation = ++this.#generation;
     this.#beforeVerification = [];
@@ -737,15 +756,30 @@ export class OneBotAdapter {
       this.#ingressError({
         code: normalized.code,
         ...(normalized.messageId !== undefined && { messageId: normalized.messageId }),
+        ...(normalized.groupId !== undefined && { groupId: normalized.groupId }),
       });
       return;
     }
-    if (normalized.kind !== "message") return;
+    if (normalized.kind === "ignored") {
+      if (normalized.diagnostic)
+        this.#ingressDiagnostic({
+          groupId: normalized.diagnostic.groupId,
+          stage: "ignored",
+          reason: normalized.diagnostic.reason,
+        });
+      return;
+    }
     if (this.#state.status === "verifying") {
       if (this.#beforeVerification.length < this.#incomingLimit)
         this.#beforeVerification.push(normalized.message);
       else {
-        this.#ingressError({ code: "ingress_overflow", messageId: normalized.message.messageId });
+        this.#ingressError({
+          code: "ingress_overflow",
+          messageId: normalized.message.messageId,
+          ...(normalized.message.scope.chatType === "group"
+            ? { groupId: normalized.message.scope.chatId }
+            : {}),
+        });
         socket.terminate();
       }
       return;
@@ -754,8 +788,14 @@ export class OneBotAdapter {
   }
 
   #enqueue(message: OneBotIncomingMessage, socket: WebSocket, generation: number): void {
+    if (message.scope.chatType === "group")
+      this.#ingressDiagnostic({ groupId: message.scope.chatId, stage: "normalized" });
     if (this.#incomingCount >= this.#incomingLimit) {
-      this.#ingressError({ code: "ingress_overflow", messageId: message.messageId });
+      this.#ingressError({
+        code: "ingress_overflow",
+        messageId: message.messageId,
+        ...(message.scope.chatType === "group" ? { groupId: message.scope.chatId } : {}),
+      });
       this.#setState({ status: "reconnecting", reason: "ingress_overflow" });
       socket.terminate();
       return;
@@ -771,6 +811,7 @@ export class OneBotAdapter {
           this.#ingressError({
             code: "acceptance_failed",
             messageId: message.messageId,
+            ...(message.scope.chatType === "group" ? { groupId: message.scope.chatId } : {}),
           });
         }
       })
