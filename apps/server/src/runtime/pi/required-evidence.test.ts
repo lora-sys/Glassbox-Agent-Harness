@@ -21,6 +21,28 @@ function ownerPrivate(text: string): RequiredEvidenceInput {
 const domains = (input: RequiredEvidenceInput) =>
   requiredEvidenceFor(input).map((evidence) => evidence.domain);
 
+describe("required web evidence", () => {
+  it("requires a successful search for an explicit web research request", () => {
+    expect(requiredEvidenceFor(ownerPrivate("请搜索网上最新的 Playwright CLI 资料"))).toEqual([
+      { domain: "web_search", tool: "web_search", input: {} },
+    ]);
+  });
+
+  it("binds an explicitly requested page read to its URL", () => {
+    expect(requiredEvidenceFor(inGroup("请读取 https://example.com/docs 并总结"))).toEqual([
+      { domain: "web_fetch", tool: "web_fetch", input: { url: "https://example.com/docs" } },
+    ]);
+  });
+
+  it("requires a search for a current public price", () => {
+    expect(domains(ownerPrivate("查一下当前官网价格"))).toEqual(["web_search"]);
+  });
+
+  it("does not mistake group history search for web search", () => {
+    expect(domains(inGroup("搜索本群历史，找最新的消息"))).not.toContain("web_search");
+  });
+});
+
 describe("required evidence for a live QQ fact", () => {
   it("requires the member list for a question about members", () => {
     expect(requiredEvidenceFor(inGroup("这个群有哪些成员？"))).toEqual([

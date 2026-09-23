@@ -4,6 +4,12 @@ import {
   type QqCapabilityCategory,
 } from "../channels/onebot/capabilities.js";
 import { DomainDatabase, stringColumn } from "../persistence/database.js";
+import {
+  DEFAULT_WEB_CAPABILITY_POLICY,
+  isWebCapabilityEnabled,
+  WEB_CAPABILITIES,
+  type WebCapability,
+} from "./web-capability-policy.js";
 
 /**
  * Durable Owner-configured capability policy for one managed QQ group.
@@ -15,16 +21,22 @@ import { DomainDatabase, stringColumn } from "../persistence/database.js";
 export interface GroupCapabilityPolicy {
   categories: Partial<Record<QqCapabilityCategory, boolean>>;
   memorySources: Partial<Record<QqSourceClass, boolean>>;
+  /** Optional for callers constructing policies from the pre-web schema. */
+  webCapabilities?: Partial<Record<WebCapability, boolean>>;
 }
 
 /** Nothing is enabled until the Owner enables it. */
 export const DEFAULT_GROUP_CAPABILITY_POLICY: GroupCapabilityPolicy = {
   categories: {},
   memorySources: {},
+  webCapabilities: DEFAULT_WEB_CAPABILITY_POLICY,
 };
 
 const CATEGORIES = new Set<string>(QQ_CAPABILITY_CATEGORIES);
 const SOURCE_CLASSES = new Set<string>(QQ_SOURCE_CLASSES);
+const WEB_CAPABILITY_SET = new Set<string>(WEB_CAPABILITIES);
+
+export { isWebCapabilityEnabled };
 
 export function isCategoryEnabled(
   policy: GroupCapabilityPolicy,
@@ -84,6 +96,7 @@ function validatedPolicy(input: unknown): GroupCapabilityPolicy {
   const record = (input ?? {}) as {
     categories?: Record<string, unknown>;
     memorySources?: Record<string, unknown>;
+    webCapabilities?: Record<string, unknown>;
   };
   const categories: Partial<Record<QqCapabilityCategory, boolean>> = {};
   for (const [category, enabled] of Object.entries(record.categories ?? {})) {
@@ -97,7 +110,13 @@ function validatedPolicy(input: unknown): GroupCapabilityPolicy {
     if (typeof enabled !== "boolean") throw new Error("invalid_memory_source_class");
     memorySources[sourceClass as QqSourceClass] = enabled;
   }
-  return { categories, memorySources };
+  const webCapabilities: Partial<Record<WebCapability, boolean>> = {};
+  for (const [capability, enabled] of Object.entries(record.webCapabilities ?? {})) {
+    if (!WEB_CAPABILITY_SET.has(capability)) throw new Error("invalid_web_capability");
+    if (typeof enabled !== "boolean") throw new Error("invalid_web_capability");
+    webCapabilities[capability as WebCapability] = enabled;
+  }
+  return { categories, memorySources, webCapabilities };
 }
 
 function requireIdentifier(value: unknown, message: string): string {
@@ -164,6 +183,7 @@ export class CapabilityPolicyStore {
     return this.applyChange(input, (target) => {
       target.categories = policy.categories;
       target.memorySources = policy.memorySources;
+      target.webCapabilities = policy.webCapabilities ?? {};
     });
   }
 
@@ -199,6 +219,23 @@ export class CapabilityPolicyStore {
     });
   }
 
+  /** Enables or disables one web or browser capability for a group. */
+  async setWebCapability(input: {
+    connectionId: string;
+    groupId: string;
+    principalId: string;
+    capability: WebCapability;
+    enabled: boolean;
+  }): Promise<{ version: number }> {
+    if (!WEB_CAPABILITY_SET.has(input.capability)) throw new Error("invalid_web_capability");
+    return this.applyChange(input, (target) => {
+      target.webCapabilities = {
+        ...target.webCapabilities,
+        [input.capability]: input.enabled,
+      };
+    });
+  }
+
   private async applyChange(
     input: { connectionId: string; groupId: string; principalId: string },
     change: (policy: GroupCapabilityPolicy) => void,
@@ -214,7 +251,7 @@ export class CapabilityPolicyStore {
       const row = current.rows[0];
       const policy = row
         ? validatedPolicy(JSON.parse(stringColumn(row, "policy_json")))
-        : { categories: {}, memorySources: {} };
+        : { categories: {}, memorySources: {}, webCapabilities: {} };
       change(policy);
       const version = row ? Number(row.version) + 1 : 1;
       await tx.execute({

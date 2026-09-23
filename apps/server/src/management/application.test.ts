@@ -848,6 +848,14 @@ const admin = (app: ManagementApplication) =>
       context: OwnerContext,
       input: { groupId: string; category: QqCapabilityCategory; enabled: boolean },
     ): Promise<unknown>;
+    setGroupWebCapability(
+      context: OwnerContext,
+      input: {
+        groupId: string;
+        category: "web.search" | "web.fetch" | "browser.read" | "browser.interact";
+        enabled: boolean;
+      },
+    ): Promise<unknown>;
     setGroupSkill(
       context: OwnerContext,
       input: { groupId: string; skillName: string; enabled: boolean },
@@ -1431,6 +1439,14 @@ const groupRun = (app: ManagementApplication) =>
       context: OwnerContext,
       input: { groupId: string; category: QqCapabilityCategory; enabled: boolean },
     ): Promise<unknown>;
+    setGroupWebCapability(
+      context: OwnerContext,
+      input: {
+        groupId: string;
+        category: "web.search" | "web.fetch" | "browser.read" | "browser.interact";
+        enabled: boolean;
+      },
+    ): Promise<unknown>;
     setGroupHistory(
       context: OwnerContext,
       input: { groupId: string; enabled: boolean },
@@ -1499,6 +1515,37 @@ describe("configured group Run capability authority", () => {
     expect(context.caller.scope).toMatchObject({ chatType: "group", chatId: GROUP });
     return { f, a, application, context, groupInput: run };
   }
+
+  it("keeps group web discovery off until the Owner enables that capability", async () => {
+    const { application, a, context } = await configuredGroup();
+    expect(await application.resolveRunToolNames(context)).not.toContain("web_search");
+    expect(await application.resolveRunToolNames(context)).not.toContain("web_fetch");
+    await application.setGroupWebCapability(a, {
+      groupId: GROUP,
+      category: "web.search",
+      enabled: true,
+    });
+    expect(await application.resolveRunToolNames(context)).toContain("web_search");
+    expect(await application.resolveRunToolNames(context)).not.toContain("web_fetch");
+    await application.setGroupWebCapability(a, {
+      groupId: GROUP,
+      category: "web.search",
+      enabled: false,
+    });
+    expect(await application.resolveRunToolNames(context)).not.toContain("web_search");
+    await application.setGroupWebCapability(a, {
+      groupId: GROUP,
+      category: "browser.read",
+      enabled: true,
+    });
+    expect(await application.resolveRunToolNames(context)).toContain("playwright_cli");
+    const browser = application
+      .createRuntimeTools(() => context)
+      .find((tool) => tool.name === "playwright_cli");
+    await expect(
+      browser?.execute("denied-interaction", { action: "click", ref: "e1" }),
+    ).rejects.toThrow("capability_category_disabled");
+  });
 
   it("names why each Tool is off a group Run's surface instead of only that it is", async () => {
     const { application, context } = await configuredGroup();

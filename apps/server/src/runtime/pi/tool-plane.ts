@@ -37,6 +37,8 @@ import { OWNER_MEMORY_ADMIN_TOOL } from "./owner-memory-tools.js";
 import { OWNER_GROUP_ADMIN_TOOL } from "./owner-tools.js";
 import { OPS_TOOL_NAMES } from "./ops-tools.js";
 import { SKILL_READ_TOOL } from "./skill-tools.js";
+import { WEB_FETCH_TOOL, WEB_SEARCH_TOOL } from "./web-tools.js";
+import { PLAYWRIGHT_CLI_TOOL } from "./browser-tools.js";
 import {
   MEMORY_GOVERN_ACTION,
   MEMORY_READ_ACTION,
@@ -313,6 +315,45 @@ const OPS_TOOL_DESCRIPTORS: readonly ToolDescriptor[] = Object.freeze(
 );
 
 const DOMAIN_TOOL_DESCRIPTORS: readonly ToolDescriptor[] = Object.freeze([
+  {
+    name: PLAYWRIGHT_CLI_TOOL,
+    origin: "glassbox_domain",
+    schemaVersion: "playwright-cli-v1",
+    riskClass: "moderate",
+    provider: "isolated-playwright-cli",
+    discovery: "group_policy",
+    authorization: { action: ["browser:read", "browser:interact"], resource: "web-public" },
+    availability: "provider_probe",
+    resultProjection: "projected",
+    grounding: "direct_observation",
+    budgetClass: "integration",
+  },
+  {
+    name: WEB_SEARCH_TOOL,
+    origin: "glassbox_domain",
+    schemaVersion: "web-search-v1",
+    riskClass: "read",
+    provider: "exa-mcp",
+    discovery: "group_policy",
+    authorization: { action: "web:search", resource: "web-public" },
+    availability: "provider_probe",
+    resultProjection: "projected",
+    grounding: "derived_retrieval",
+    budgetClass: "integration",
+  },
+  {
+    name: WEB_FETCH_TOOL,
+    origin: "glassbox_domain",
+    schemaVersion: "web-fetch-v1",
+    riskClass: "read",
+    provider: "exa-mcp",
+    discovery: "group_policy",
+    authorization: { action: "web:fetch", resource: "web-public" },
+    availability: "provider_probe",
+    resultProjection: "projected",
+    grounding: "derived_retrieval",
+    budgetClass: "integration",
+  },
   {
     name: GROUP_HISTORY_SEARCH_TOOL,
     origin: "glassbox_domain",

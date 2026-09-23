@@ -1,0 +1,13 @@
+{
+  "name": "glassbox-browser-sandbox",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@playwright/cli": "0.1.21",
+    "ipaddr.js": "2.5.0",
+    "playwright": "1.64.0-alpha-1789764292000"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12"
+  }
+}

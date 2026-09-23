@@ -26,6 +26,7 @@
  */
 
 import { GROUP_HISTORY_SEARCH_TOOL, OWNER_HISTORY_SEARCH_TOOL } from "./history-tools.js";
+import { WEB_FETCH_TOOL, WEB_SEARCH_TOOL } from "./web-tools.js";
 import { satisfiesRequiredInput } from "./protected-tools.js";
 import type { ToolExecutionOutcome } from "./tool-plane.js";
 
@@ -37,6 +38,8 @@ import type { ToolExecutionOutcome } from "./tool-plane.js";
  * the fact the evidence has to explain.
  */
 export type RequiredEvidenceDomain =
+  | "web_search"
+  | "web_fetch"
   | "group_history_search"
   | "owner_history_search"
   | "group_metadata"
@@ -360,6 +363,22 @@ export function requiredEvidenceFor(input: RequiredEvidenceInput): RequiredEvide
   const text = requestClauses(input.text);
   const required: RequiredEvidence[] = [];
   const group = namedGroupId(text);
+  const explicitUrl = /https?:\/\/[^\s，,。！？!?]+/iu.exec(text)?.[0];
+  if (explicitUrl && /(?:打开|读取|抓取|查看|总结|摘要|read|fetch|open|summarize)/iu.test(text))
+    required.push({ domain: "web_fetch", tool: WEB_FETCH_TOOL, input: { url: explicitUrl } });
+  else if (
+    ((/(?:搜索|搜一下|查找|检索|查询|上网查|web search|search the web|look up)/iu.test(text) &&
+      /(?:网页|网站|互联网|网上|网络|资料|新闻|来源|web|online|internet|latest|current|最近|最新)/iu.test(
+        text,
+      )) ||
+      /(?:今天|现在|当前|最新|近期|today|latest|current)\s*[^，,。！？!?]{0,60}(?:发布|版本|价格|新闻|官网|release|version|price|announc)/iu.test(
+        text,
+      )) &&
+    !groupHistorySearchRequested(text) &&
+    !ownerHistorySearchRequested(text) &&
+    !asksLiveQqFact(text)
+  )
+    required.push({ domain: "web_search", tool: WEB_SEARCH_TOOL, input: {} });
 
   if (input.chatType === "group") {
     // A group Run is bound to its own group, so a domain the message asks about needs no
@@ -380,7 +399,7 @@ export function requiredEvidenceFor(input: RequiredEvidenceInput): RequiredEvide
 
   // Everything below is the Owner-private surface. A cross-group search is answered by its own
   // Tool, which addresses groups the message names rather than the Run's scope.
-  if (!input.isOwner) return [];
+  if (!input.isOwner) return required;
   const searched = ownerHistorySearchRequested(text);
   if (searched)
     required.push({ domain: "owner_history_search", tool: OWNER_HISTORY_SEARCH_TOOL, input: {} });

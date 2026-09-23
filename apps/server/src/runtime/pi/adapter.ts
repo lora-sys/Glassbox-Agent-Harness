@@ -58,6 +58,8 @@ export interface PiSdkRuntimeOptions {
   resolveModel?: () => Promise<{ model: Model<any>; modelRuntime: ModelRuntime }>;
   customTools?: ToolDefinition[];
   createTools?: (getContext: () => PiRunContext | undefined) => ToolDefinition[];
+  /** Release Run-scoped external resources before the execution context is discarded. */
+  onRunEnd?: (context: PiRunContext) => Promise<void>;
   resolveSkillNames?: (
     context: PiRunContext,
     profile: ResolvedKitProfile,
@@ -641,8 +643,12 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
       };
     } finally {
       unsubscribe();
-      this.runContexts.delete(binding.runtimeSessionId);
       await eventQueue;
+      try {
+        if (context) await this.options.onRunEnd?.(context);
+      } finally {
+        this.runContexts.delete(binding.runtimeSessionId);
+      }
     }
   }
 

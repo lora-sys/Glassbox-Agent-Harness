@@ -28,6 +28,21 @@ import {
 } from "../runtime/pi/index.js";
 import { configuredPiModel } from "../runtime/pi/configured-model.js";
 import { createOpsTools, OPS_TOOL_NAMES, type WorkerTarget } from "../runtime/pi/ops-tools.js";
+import { createBrowserTools, PLAYWRIGHT_CLI_TOOL } from "../runtime/pi/browser-tools.js";
+import {
+  createWebTools,
+  WEB_ACTIONS,
+  WEB_FETCH_TOOL,
+  WEB_RESOURCE,
+  WEB_SEARCH_TOOL,
+} from "../runtime/pi/web-tools.js";
+import { WebService } from "../web/web-service.js";
+import { GuardedBrowserFallback } from "../web/browser-fallback.js";
+import {
+  isWebCapabilityEnabled,
+  WEB_CAPABILITIES,
+  type WebCapability,
+} from "./web-capability-policy.js";
 import {
   createOwnerTools,
   type OwnerGroupAdminInput,
@@ -191,7 +206,7 @@ export const DEFAULT_OWNER_GROUP_POLICY: GroupCapabilityPolicy = (() => {
   for (const category of DEFAULT_OWNER_GROUP_CATEGORIES) categories[category] = true;
   const memorySources: Partial<Record<QqSourceClass, boolean>> = {};
   for (const sourceClass of DEFAULT_OWNER_GROUP_SOURCES) memorySources[sourceClass] = true;
-  return { categories, memorySources };
+  return { categories, memorySources, webCapabilities: {} };
 })();
 
 /** The Action that records one Owner's assignment of one managed group. */
@@ -257,6 +272,7 @@ export class ManagementApplication {
   readonly archive: ChannelArchiveStore;
   executors!: ExecutorConfiguration;
   private readonly connections = new Map<string, OneBotAdapter>();
+  private readonly browserCleanups = new Map<string, () => Promise<void>>();
   private readonly deliveryPolicy: ReturnType<typeof createQqDeliveryPolicy>;
   private readonly kitLoader: KitLoader;
   private readonly states = new Map<
@@ -404,6 +420,12 @@ export class ManagementApplication {
       runtimeBaseDir: join(this.options.dataDirectory, "pi"),
       resolveModel: () => configuredPiModel(this.options.models, profileId),
       createTools: (getContext) => this.createRuntimeTools(getContext),
+      onRunEnd: async (context) => {
+        if (!context.runId) return;
+        const cleanup = this.browserCleanups.get(context.runId);
+        this.browserCleanups.delete(context.runId);
+        await cleanup?.();
+      },
       resolveSkillNames: async (context, profile) => {
         if (!context.caller)
           return resolveSkillVisibility({
@@ -473,7 +495,64 @@ export class ManagementApplication {
    * test proves the product path rather than the helper.
    */
   private createRuntimeTools(getContext: () => PiRunContext | undefined): ToolDefinition[] {
+    const browserFallback = new GuardedBrowserFallback({
+      binding: () => {
+        const context = getContext();
+        return context?.caller && context.runId && context.conversationId
+          ? {
+              principalId: context.caller.principalId,
+              runId: context.runId,
+              conversationId: context.conversationId,
+            }
+          : undefined;
+      },
+      authorizeRead: async (binding) => {
+        const context = getContext();
+        if (
+          !context?.caller ||
+          context.runId !== binding.runId ||
+          context.conversationId !== binding.conversationId ||
+          context.caller.principalId !== binding.principalId
+        )
+          return false;
+        const protectedContext = {
+          caller: context.caller,
+          runId: binding.runId,
+          conversationId: binding.conversationId,
+        };
+        if (!(await this.isWebEnabled(protectedContext, "browser.read"))) return false;
+        const decision = await this.store.authorization.check({
+          caller: context.caller,
+          resourceId: WEB_RESOURCE,
+          action: WEB_ACTIONS["browser.read"],
+          runId: binding.runId,
+          conversationId: binding.conversationId,
+        });
+        return decision.decision === "ALLOW";
+      },
+    });
     return [
+      ...createWebTools({
+        store: this.store,
+        getContext,
+        service: new WebService({ browserFallback }),
+        isEnabled: (context, capability) => this.isWebEnabled(context, capability),
+        recordEvidence: async (evidence, context) => {
+          const cursor = await this.trace.append(context.runId, evidence, "glassbox-web");
+          await this.store.evidence.advanceTrace(context.caller, cursor);
+        },
+      }),
+      ...createBrowserTools({
+        store: this.store,
+        getContext,
+        isEnabled: (context, capability) => this.isWebEnabled(context, capability),
+        onActivated: (context, cleanup) => this.browserCleanups.set(context.runId, cleanup),
+        onClosed: (runId) => this.browserCleanups.delete(runId),
+        recordEvidence: async (evidence, context) => {
+          const cursor = await this.trace.append(context.runId, evidence, "glassbox-browser");
+          await this.store.evidence.advanceTrace(context.caller, cursor);
+        },
+      }),
       ...(this.options.ops
         ? createOpsTools({
             store: this.store,
@@ -554,6 +633,18 @@ export class ManagementApplication {
     return this.isCategoryEnabled(connectionId, groupId, "group.history");
   }
 
+  private async isWebEnabled(
+    context: ProtectedToolContext,
+    capability: WebCapability,
+  ): Promise<boolean> {
+    const scope = context.caller.scope;
+    if (scope.chatType === "private")
+      return this.store.identities.isOwner(context.caller.principalId);
+    if (scope.chatType !== "group") return false;
+    const stored = await this.store.capabilities.read(scope.connectionId, scope.chatId);
+    return isWebCapabilityEnabled(stored?.policy.webCapabilities, capability);
+  }
+
   /**
    * Every registered Tool, classified for this Run's scope, policy and grants.
    *
@@ -626,6 +717,30 @@ export class ManagementApplication {
         enabledCategories: capabilityCategories,
       }),
     );
+    for (const [name, capability] of [
+      [WEB_SEARCH_TOOL, "web.search"],
+      [WEB_FETCH_TOOL, "web.fetch"],
+    ] as const) {
+      classified.add(name);
+      if (
+        !(await this.isWebEnabled(
+          { caller: context.caller, conversationId: context.conversationId, runId: context.runId },
+          capability,
+        ))
+      )
+        scopeGates.set(name, "policy_disabled");
+    }
+    classified.add(PLAYWRIGHT_CLI_TOOL);
+    const webContext = {
+      caller: context.caller,
+      conversationId: context.conversationId,
+      runId: context.runId,
+    };
+    if (
+      !(await this.isWebEnabled(webContext, "browser.read")) &&
+      !(await this.isWebEnabled(webContext, "browser.interact"))
+    )
+      scopeGates.set(PLAYWRIGHT_CLI_TOOL, "policy_disabled");
 
     // The Agent Ops and Owner-control surface is Owner-private. A group Run reaches neither,
     // however the Owner's own grants look, so this is a scope boundary rather than a policy.
@@ -1028,6 +1143,39 @@ export class ManagementApplication {
       scope,
       effect: "allow",
     });
+    if (isOwner || scope.chatType === "group") {
+      await this.store.authorization.registerResource({
+        id: WEB_RESOURCE,
+        kind: "web-public",
+        visibility: "public",
+        ifAbsent: true,
+      });
+      for (const capability of WEB_CAPABILITIES) {
+        await this.store.authorization.grant({
+          principalId,
+          resourceId: WEB_RESOURCE,
+          action: WEB_ACTIONS[capability],
+          scope,
+          effect: "allow",
+        });
+      }
+      for (const name of [WEB_SEARCH_TOOL, WEB_FETCH_TOOL, PLAYWRIGHT_CLI_TOOL]) {
+        const resourceId = toolResourceId(name);
+        await this.store.authorization.registerResource({
+          id: resourceId,
+          kind: "tool-definition",
+          visibility: "public",
+          ifAbsent: true,
+        });
+        await this.store.authorization.grant({
+          principalId,
+          resourceId,
+          action: TOOL_DISCOVERY_ACTION,
+          scope,
+          effect: "allow",
+        });
+      }
+    }
     // A group is a protected Resource. Bot membership never creates this row: it exists only
     // for a group Glassbox has configured, and reading it still needs an explicit grant.
     if (scope.chatType === "group") {
@@ -1449,6 +1597,7 @@ export class ManagementApplication {
       agentResourceId(AGENT_ID),
       SKILL_CATALOG_RESOURCE,
       toolResourceId(SKILL_READ_TOOL),
+      WEB_RESOURCE,
       // The group Run's Tool discovery is granted as a superset for the same reason the
       // Owner-private one is, so it is revoked here for the same reason: leaving it behind
       // would let a re-configured group rediscover a surface it no longer has authority for.
@@ -1494,6 +1643,9 @@ export class ManagementApplication {
           chatType: "group",
           enabledCategories: [...QQ_CAPABILITY_CATEGORIES],
         }),
+        WEB_SEARCH_TOOL,
+        WEB_FETCH_TOOL,
+        PLAYWRIGHT_CLI_TOOL,
       ]),
     ];
   }
@@ -1631,7 +1783,16 @@ export class ManagementApplication {
     if (!isOwner || caller.scope.chatType !== "private") throw new Error("owner_private_required");
     if (input.action === "set_access") return this.setGroupAccess(context, input);
     if (input.action === "set_skill") return this.setGroupSkill(context, input);
-    if (input.action === "set_capability") return this.setGroupCategory(context, input);
+    if (input.action === "set_capability")
+      return WEB_CAPABILITIES.includes(input.category as WebCapability)
+        ? this.setGroupWebCapability(
+            context,
+            input as { groupId: string; category: WebCapability; enabled: boolean },
+          )
+        : this.setGroupCategory(
+            context,
+            input as { groupId: string; category: QqCapabilityCategory; enabled: boolean },
+          );
     if (input.action === "set_memory_source") return this.setGroupMemorySource(context, input);
     if (input.action === "set_history") return this.setGroupHistory(context, input);
     const runtime = this.groupRuntime.get(
@@ -1651,6 +1812,7 @@ export class ManagementApplication {
       version: runtime.version,
       managedGroups,
       categories: stored?.policy.categories ?? {},
+      webCapabilities: stored?.policy.webCapabilities ?? {},
       memorySources: stored?.policy.memorySources ?? {},
       capabilityVersion: stored?.version ?? 0,
     };
@@ -1789,6 +1951,31 @@ export class ManagementApplication {
         connectionId: context.caller.scope.connectionId,
         groupId: input.groupId,
         category: input.category,
+        enabled: input.enabled,
+        policyVersion: version,
+      });
+      return { groupId: input.groupId, category: input.category, enabled: input.enabled, version };
+    });
+  }
+
+  private async setGroupWebCapability(
+    context: ProtectedToolContext,
+    input: { groupId: string; category: WebCapability; enabled: boolean },
+  ): Promise<unknown> {
+    return this.serialize(async () => {
+      await this.requireManagedGroup(context, input.groupId);
+      const { version } = await this.store.capabilities.setWebCapability({
+        connectionId: context.caller.scope.connectionId,
+        groupId: input.groupId,
+        principalId: context.caller.principalId,
+        capability: input.category,
+        enabled: input.enabled,
+      });
+      await this.recordOwnerControl(context, {
+        type: "group_web_capability_changed",
+        connectionId: context.caller.scope.connectionId,
+        groupId: input.groupId,
+        capability: input.category,
         enabled: input.enabled,
         policyVersion: version,
       });
@@ -2006,6 +2193,7 @@ export class ManagementApplication {
           historyRead: fact.historyRead,
         },
         categories: fact.policy.categories,
+        webCapabilities: fact.policy.webCapabilities ?? {},
         memorySources: fact.policy.memorySources,
         skills: fact.skills,
         version: fact.version,
