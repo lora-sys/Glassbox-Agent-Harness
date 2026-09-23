@@ -782,6 +782,7 @@ export function toolOutcomeFromFailure(code: string): ToolExecutionOutcome {
     case "authorization_denied":
     case "capability_category_disabled":
     case "context_missing":
+    case "mutation_already_attempted":
     case "provider_denied":
       return "denied";
     case "input_validation_failed":

@@ -61,8 +61,10 @@ The configured local Personal Agent environment has one service command surface:
     npm run agent:logs
     npm run agent:down
 
-On Windows, do not start the long-running service with `vp run agent:up`. Vite+ terminates its
-detached service child when the task exits. The npm scripts invoke the service manager directly.
+Use the `npm` commands or invoke `node --import tsx scripts/agent-service.mts <command>`
+directly. On Windows, do not use `vp run agent:up` for the long-lived service manager. Vite+
+cleans detached descendants when its task exits, so the npm scripts or direct Node invocation
+must launch the service process.
 
 agent:up reads optional Herdr, NapCat and Glassbox launch settings from
 <GLASSBOX_DATA_DIR>/service-launch.json. Without that environment variable, it uses
@@ -78,7 +80,9 @@ If NapCat reports that its saved quick-login state has expired, keep the one `ag
 
 The service file accepts only the documented non-secret environment keys.
 
-The service manager launches fixed executables without a shell. It records process identity in the data directory and verifies it before shutdown. Named Herdr sessions use Herdr's public session status and stop commands.
+The service manager launches fixed executables without a shell. It records process identity in the
+data directory and verifies it before shutdown. Named Herdr sessions use Herdr's public session
+status and stop commands.
 
 The `glassbox` CLI and `agent:up` use the same service data directory. By default both use
 `~/.glassbox` and port 3030. Set `GLASSBOX_DATA_DIR` and `PORT` to the same values as the

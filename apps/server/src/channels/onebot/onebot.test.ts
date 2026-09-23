@@ -2,7 +2,12 @@ import { once } from "node:events";
 import type { AddressInfo } from "node:net";
 import { WebSocketServer, type WebSocket } from "ws";
 import { afterEach, describe, expect, it } from "vite-plus/test";
-import { OneBotAdapter, type OneBotAdapterOptions, type OneBotState } from "./adapter.ts";
+import {
+  OneBotAdapter,
+  type OneBotAdapterOptions,
+  type OneBotIngressDiagnostic,
+  type OneBotState,
+} from "./adapter.ts";
 import { parseOneBotConfig } from "./config.ts";
 import { normalizeOneBotMessage, type OneBotIncomingMessage } from "./normalize.ts";
 
@@ -138,6 +143,7 @@ function client(endpoint: string, options: Partial<OneBotAdapterOptions> = {}) {
   const incoming = new Queue<OneBotIncomingMessage>();
   const states = new Queue<OneBotState>();
   const errors = new Queue<Parameters<NonNullable<OneBotAdapterOptions["onIngressError"]>>[0]>();
+  const diagnostics = new Queue<OneBotIngressDiagnostic>();
   const adapter = new OneBotAdapter({
     config: parseOneBotConfig({ ...base, endpoint }),
     token: "explicit-test-token",
@@ -152,10 +158,13 @@ function client(endpoint: string, options: Partial<OneBotAdapterOptions> = {}) {
     onIngressError: (error) => {
       errors.push(error);
     },
+    onIngressDiagnostic: (diagnostic) => {
+      diagnostics.push(diagnostic);
+    },
     ...options,
   });
   cleanup.push(() => adapter.stop());
-  return { adapter, incoming, states, errors };
+  return { adapter, incoming, states, errors, diagnostics };
 }
 
 describe("OneBot normalization", () => {
@@ -192,7 +201,19 @@ describe("OneBot normalization", () => {
     { message_type: "private", sub_type: "group" },
     { message_type: "private", sub_type: "other" },
   ])("ignores disallowed ingress %j", (override) => {
-    expect(normalizeOneBotMessage(inbound(override), config)).toEqual({ kind: "ignored" });
+    expect(normalizeOneBotMessage(inbound(override), config)).toMatchObject({ kind: "ignored" });
+  });
+  it("classifies a configured group message without retaining message or member data", () => {
+    const result = normalizeOneBotMessage(
+      inbound({ message: [{ type: "text", data: { text: "private-message-canary" } }] }),
+      config,
+    );
+    expect(result).toEqual({
+      kind: "ignored",
+      diagnostic: { groupId: "10003", reason: "not_addressed" },
+    });
+    expect(JSON.stringify(result)).not.toContain("private-message-canary");
+    expect(JSON.stringify(result)).not.toContain("10002");
   });
   it("accepts an addressed member of a configured group without making private chat public", () => {
     expect(normalizeOneBotMessage(inbound({ user_id: 10099 }), config)).toMatchObject({
@@ -213,6 +234,34 @@ describe("OneBot normalization", () => {
         config,
       ),
     ).toEqual({ kind: "ignored" });
+  });
+  it.each([
+    ["owner", "qq_group_owner"],
+    ["admin", "qq_group_admin"],
+    ["member", "qq_group_member"],
+    ["administrator", "qq_group_member"],
+    [undefined, "qq_group_member"],
+  ])("keeps the trusted QQ sender role %s as %s for this Run", (providerRole, role) => {
+    const result = normalizeOneBotMessage(
+      inbound({ sender: providerRole === undefined ? {} : { role: providerRole } }),
+      config,
+      new Date("2026-09-22T01:02:03.000Z"),
+    );
+    expect(result).toMatchObject({
+      kind: "message",
+      message: {
+        scope: {
+          chatType: "group",
+          chatId: "10003",
+          senderId: "10002",
+          nativeGroupRole: {
+            role,
+            source: "onebot_message_sender",
+            observedAt: "2026-09-22T01:02:03.000Z",
+          },
+        },
+      },
+    });
   });
   it("routes an Owner friend DM independently of an untrusted group field", () => {
     expect(
@@ -258,7 +307,10 @@ describe("OneBot normalization", () => {
     ).toMatchObject({ kind: "message", message: { text: "检查 [内容] &" } });
     expect(
       normalizeOneBotMessage(inbound({ message: "&#91;CQ:at,qq=10001&#93; please run" }), config),
-    ).toEqual({ kind: "ignored" });
+    ).toEqual({
+      kind: "ignored",
+      diagnostic: { groupId: "10003", reason: "not_addressed" },
+    });
   });
   it("does not fetch quoted messages and rejects media or oversized input", () => {
     expect(
@@ -316,7 +368,14 @@ describe("OneBot forward WebSocket", () => {
     expect(fake.history[0]).toMatchObject({ action: "get_login_info", params: {} });
     const socket = await fake.connections.next();
     socket.send(JSON.stringify(inbound()));
-    expect((await incoming.next()).scope).toEqual(groupScope);
+    expect((await incoming.next()).scope).toEqual({
+      ...groupScope,
+      nativeGroupRole: {
+        role: "qq_group_member",
+        source: "onebot_message_sender",
+        observedAt: expect.any(String),
+      },
+    });
     socket.send(
       JSON.stringify(
         inbound({
@@ -367,7 +426,14 @@ describe("OneBot forward WebSocket", () => {
     });
     const { adapter, incoming } = client(fake.endpoint);
     await adapter.start();
-    expect((await incoming.next()).scope).toEqual(groupScope);
+    expect((await incoming.next()).scope).toEqual({
+      ...groupScope,
+      nativeGroupRole: {
+        role: "qq_group_member",
+        source: "onebot_message_sender",
+        observedAt: expect.any(String),
+      },
+    });
   });
   it("confirms a platform message ID and keeps text CQ literals inert", async () => {
     const fake = await server();
@@ -425,6 +491,92 @@ describe("OneBot forward WebSocket", () => {
         text: "不可私聊",
       }),
     ).toEqual({ status: "failed", code: "invalid_target" });
+  });
+  it("re-verifies one configured member role without exposing the raw profile", async () => {
+    const fake = await server({
+      onAction(action, socket) {
+        if (action.action !== "get_group_member_info") return false;
+        socket.send(
+          JSON.stringify({
+            status: "ok",
+            retcode: 0,
+            data: {
+              group_id: action.params.group_id,
+              user_id: action.params.user_id,
+              role: "admin",
+              nickname: "must not leave adapter",
+            },
+            echo: action.echo,
+          }),
+        );
+        return true;
+      },
+    });
+    const { adapter } = client(fake.endpoint);
+    await adapter.start();
+    await expect(
+      adapter.getGroupMemberRole({ groupId: "10003", userId: "10099" }),
+    ).resolves.toEqual({
+      status: "ok",
+      groupId: "10003",
+      userId: "10099",
+      role: "qq_group_admin",
+    });
+    const action = await fake.actions.next((item) => item.action === "get_group_member_info");
+    expect(action.params).toEqual({ group_id: 10003, user_id: 10099, no_cache: true });
+    await expect(
+      adapter.getGroupMemberRole({ groupId: "90000", userId: "10099" }),
+    ).resolves.toEqual({ status: "failed", code: "invalid_group" });
+    expect(fake.history.filter((item) => item.action === "get_group_member_info")).toHaveLength(1);
+  });
+  it("fails closed without a member-list fallback when fresh role detail is rejected", async () => {
+    const fake = await server({
+      onAction(action, socket) {
+        if (action.action !== "get_group_member_info") return false;
+        socket.send(
+          JSON.stringify({
+            status: "failed",
+            retcode: 1200,
+            data: null,
+            message: "provider detail failure must not leave the adapter",
+            echo: action.echo,
+          }),
+        );
+        return true;
+      },
+    });
+    const { adapter } = client(fake.endpoint);
+    await adapter.start();
+    await expect(
+      adapter.getGroupMemberRole({ groupId: "10003", userId: "10099" }),
+    ).resolves.toEqual({
+      status: "failed",
+      code: "api_rejected",
+      retcode: 1200,
+    });
+    expect(fake.history.some((item) => item.action === "get_group_member_list")).toBe(false);
+  });
+  it("rejects mismatched fresh role evidence without consulting the member cache", async () => {
+    const fake = await server({
+      onAction(action, socket) {
+        if (action.action !== "get_group_member_info") return false;
+        socket.send(
+          JSON.stringify({
+            status: "ok",
+            retcode: 0,
+            data: { group_id: 10004, user_id: 10099, role: "admin" },
+            echo: action.echo,
+          }),
+        );
+        return true;
+      },
+    });
+    const { adapter } = client(fake.endpoint);
+    await adapter.start();
+    await expect(
+      adapter.getGroupMemberRole({ groupId: "10003", userId: "10099" }),
+    ).resolves.toEqual({ status: "unknown", code: "invalid_response" });
+    expect(fake.history.some((item) => item.action === "get_group_member_list")).toBe(false);
   });
   it("sends an Owner DM only through the configured private destination", async () => {
     const fake = await server();
@@ -612,9 +764,36 @@ describe("OneBot forward WebSocket", () => {
     const socket = await fake.connections.next();
     socket.send(JSON.stringify(inbound()));
     socket.send(JSON.stringify(inbound()));
-    expect(await errors.next()).toEqual({ code: "acceptance_failed", messageId: "-7" });
-    expect(await errors.next()).toEqual({ code: "acceptance_failed", messageId: "-7" });
+    expect(await errors.next()).toEqual({
+      code: "acceptance_failed",
+      messageId: "-7",
+      groupId: "10003",
+    });
+    expect(await errors.next()).toEqual({
+      code: "acceptance_failed",
+      messageId: "-7",
+      groupId: "10003",
+    });
     expect(received).toEqual(["-7", "-7"]);
+  });
+  it("reports only fixed metadata when a configured-group message is ignored", async () => {
+    const fake = await server();
+    const { adapter, diagnostics } = client(fake.endpoint);
+    await adapter.start();
+    const socket = await fake.connections.next();
+    socket.send(
+      JSON.stringify(
+        inbound({ message: [{ type: "text", data: { text: "private-message-canary" } }] }),
+      ),
+    );
+    const diagnostic = await diagnostics.next();
+    expect(diagnostic).toEqual({
+      groupId: "10003",
+      stage: "ignored",
+      reason: "not_addressed",
+    });
+    expect(JSON.stringify(diagnostic)).not.toContain("private-message-canary");
+    expect(JSON.stringify(diagnostic)).not.toContain("10002");
   });
   it("closes malformed frames and stop settles an in-flight delivery", async () => {
     const fake = await server({ onAction: (action) => action.action !== "get_login_info" });
@@ -662,7 +841,11 @@ describe("OneBot forward WebSocket", () => {
     socket.send(JSON.stringify(inbound()));
     await started;
     socket.send(JSON.stringify(inbound({ message_id: 8 })));
-    expect(await errors.next()).toEqual({ code: "ingress_overflow", messageId: "8" });
+    expect(await errors.next()).toEqual({
+      code: "ingress_overflow",
+      messageId: "8",
+      groupId: "10003",
+    });
     await adapter.stop();
     expect(acceptanceAborted).toBe(true);
   });

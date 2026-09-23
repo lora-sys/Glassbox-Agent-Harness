@@ -125,7 +125,11 @@ describe("PiSdkRuntimeAdapter", () => {
           type: "tool_execution_end",
           toolCallId: "admin-1",
           toolName: "owner_group_admin",
-          result: { content: [{ type: "text", text: "Schema validation failed" }] },
+          result: {
+            content: [
+              { type: "text", text: "Schema validation failed: mutation_already_attempted" },
+            ],
+          },
           isError: true,
         } as never);
         listener?.({ type: "turn_end", message: {} as never, toolResults: [] });
@@ -205,7 +209,7 @@ describe("PiSdkRuntimeAdapter", () => {
     expect(safeToolResult).toMatchObject({
       name: "owner_group_admin",
       isError: true,
-      failureCode: "input_validation_failed",
+      failureCode: "mutation_already_attempted",
     });
     expect(events).toEqual([
       "session_start",

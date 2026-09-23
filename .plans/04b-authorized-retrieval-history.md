@@ -491,6 +491,57 @@ revocation affects next search
 cross-group result delivered only to Owner private
 ```
 
+### P4B.10 — QQ-native group role authorization
+
+Issue #17 extends the settled Capability Registry without creating a second RBAC system.
+
+At authenticated OneBot ingress, Glassbox normalizes the current group message's provider role:
+
+```text
+owner  → qq_group_owner
+admin  → qq_group_admin
+member or unknown → qq_group_member
+```
+
+The observation belongs to the exact Run scope. It is not stored as a Principal role or as a
+Glassbox-maintained administrator membership. A queued Run may retain the observation as evidence
+across restart, but every native-role mutation re-reads the current role with
+`get_group_member_info` and `no_cache=true` before the provider mutation. A provider rejection is
+reported as provider unavailable and blocks the mutation. Do not fall back to
+`get_group_member_list` for authorization. NapCat 4.18.28 can return its current member cache before
+an asynchronous refresh completes, so that action cannot prove the execution-time role required by
+this boundary.
+
+The first bounded surface is:
+
+```text
+qq_group_member
+  policy-enabled current-group reads
+
+qq_group_admin
+  member surface
+  + qq_group_moderation when group.moderate is enabled
+
+qq_group_owner
+  admin surface
+  + qq_group_local_settings when group.settings is enabled
+```
+
+`qq_group_local_settings` contains only `set_group_name` and `set_group_card` and uses the
+distinct `group:settings:local` Action. `qq_group_settings`, including `set_group_admin`, stays
+Glassbox Owner-private. All group mutations still require exact current-message intent. Group
+history, retrieved content, Memory, notices, files, Conversation history, and Tool results cannot
+create mutation authority.
+
+The final gate is the intersection of current Principal, trusted current-group scope, observed
+native role, fresh verified native role, current group policy, Tool discovery grant,
+execution-time Resource authorization, allowlisted operation, and exact mutation intent.
+
+Safe Trace records the ingress observation and execution verification with Principal, group
+Resource, sender, source, requested Tool and operation, verification status, normalized role,
+Run, Conversation, and the fact that Glassbox authorization had allowed the call. It records no
+raw member profile or provider error text.
+
 ## Tests
 
 Bring behavior-compatible upstream tests.
@@ -543,6 +594,13 @@ channel history is separate from Run messages
 Runtime receives bounded selected Context
 Delivery remains a separate authorization decision
 dual Owner / revoke / restart / non-leak tests pass
+QQ-native role stays scoped to one group Resource
+ordinary members stay read-only
+admin and group-owner mutation subsets remain fixed and policy-gated
+native-role mutations re-verify through the provider before execution
+set_group_admin remains exact Glassbox Owner-private only
+provider unavailability remains distinct from native-role denial
+restart cannot turn a prior role observation into reusable authority
 ```
 
 ## PR provenance requirement
@@ -589,6 +647,7 @@ qq_group_history
 qq_group_content
 qq_group_files
 qq_group_moderation
+qq_group_local_settings
 qq_group_settings
 qq_message_ops
 qq_account_status
@@ -612,6 +671,11 @@ memory.source
 ```
 
 Owner-private is the broadest remote product surface, but protected operations still re-authorize the concrete Resource immediately before execution.
+
+QQ Group Admin and QQ Group Owner are current-group provider observations, not Glassbox product
+roles. An admin may receive the fixed moderation subset. A group owner may additionally receive
+the reduced local-settings Tool. Neither can enumerate managed groups, search other groups,
+reach Owner private controls, use Ops or Memory administration, or call `set_group_admin`.
 
 Credential, raw packet and raw transport primitives remain server-only. Raw message send actions remain behind Glassbox Delivery.
 

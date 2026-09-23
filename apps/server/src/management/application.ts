@@ -12,6 +12,7 @@ import { ExecutorConfiguration, ExecutorBusyError } from "../config/executors.js
 import {
   OneBotAdapter,
   OneBotConnectionError,
+  type OneBotIngressDiagnostic,
   type OneBotState,
 } from "../channels/onebot/index.js";
 import {
@@ -67,7 +68,7 @@ import {
   GROUP_RUN_CAPABILITY_CATEGORIES,
 } from "../runtime/pi/capability-tools.js";
 import { resolveSkillVisibility } from "../runtime/pi/skill-visibility.js";
-import { requireProviderSuccess } from "../runtime/pi/provider-outcome.js";
+import { ProviderCallError, requireProviderSuccess } from "../runtime/pi/provider-outcome.js";
 import type { PiRunContext } from "../runtime/pi/types.js";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import {
@@ -112,6 +113,7 @@ import {
   projectToolPlaneDiagnostics,
   TOOL_PLANE_DIAGNOSTIC_RECORD_CAP,
 } from "./tool-plane-diagnostics.js";
+import { GROUP_ROLE_AUDIT_RECORD_CAP, projectGroupRoleAudit } from "./group-role-audit.js";
 import { grantOpsPermissions } from "./ops-grants.js";
 import { createQqDeliveryPolicy, hostDeliveryForbiddenValues } from "../delivery/content-policy.js";
 import {
@@ -123,6 +125,18 @@ import {
 
 const OWNER_ID = "owner";
 const AGENT_ID = "personal";
+interface GroupIngressDiagnosticCounts {
+  serviceStartedAt: string;
+  lastObservedAt: string | null;
+  normalized: number;
+  ignoredNotAddressed: number;
+  ignoredEmptyMessage: number;
+  rejectedInvalidMessage: number;
+  rejectedUnsupportedMessage: number;
+  rejectedOverflow: number;
+  acceptanceFailed: number;
+}
+
 type AuthorizationContext = {
   caller: CallerContext;
   conversationId?: string;
@@ -263,6 +277,8 @@ export class ManagementApplication {
     string,
     Pick<PublicChannelProfile, "connectionState" | "lastError">
   >();
+  private readonly ingressStartedAt = new Date().toISOString();
+  private readonly groupIngressDiagnostics = new Map<string, GroupIngressDiagnosticCounts>();
   private operations: Promise<unknown> = Promise.resolve();
   private accepting = false;
   private releaseIngress!: () => void;
@@ -522,7 +538,107 @@ export class ManagementApplication {
         invoke: async ({ action, params, context }) => {
           const connection = this.connections.get(context.caller.scope.connectionId);
           if (!connection) throw new Error("channel_not_connected");
-          return requireProviderSuccess(await connection.invokeCapability({ action, params }));
+          const providerResult = requireProviderSuccess(
+            await connection.invokeCapability({ action, params }),
+          );
+          // NapCat can acknowledge `set_group_admin` even when QQ keeps the member's old role.
+          // The mutation is not successful until a fresh provider read proves the requested
+          // postcondition. This check is below the model and uses the same authenticated
+          // connection, so a provider no-op cannot become a successful Tool result or reply.
+          if (
+            action === "set_group_admin" &&
+            (typeof params.group_id === "number" || typeof params.group_id === "string") &&
+            (typeof params.user_id === "number" || typeof params.user_id === "string") &&
+            typeof params.enable === "boolean"
+          ) {
+            const groupId = String(params.group_id);
+            const userId = String(params.user_id);
+            const expectedRole = params.enable ? "qq_group_admin" : "qq_group_member";
+            const observed = await connection.getGroupMemberRole({ groupId, userId });
+            const verified = observed.status === "ok" && observed.role === expectedRole;
+            const cursor = await this.trace.append(
+              context.runId,
+              {
+                type: "provider_mutation_verification",
+                runId: context.runId,
+                conversationId: context.conversationId,
+                principalId: context.caller.principalId,
+                resourceId: groupResourceId(groupId),
+                requestedTool: "qq_group_settings",
+                requestedOperation: action,
+                targetUserId: userId,
+                expectedRole,
+                observedRole: observed.status === "ok" ? observed.role : null,
+                verificationStatus:
+                  observed.status === "ok"
+                    ? verified
+                      ? "verified"
+                      : "mismatch"
+                    : observed.status === "unknown"
+                      ? "unknown"
+                      : observed.code === "not_connected"
+                        ? "unavailable"
+                        : "failed",
+              },
+              "glassbox-provider-postcondition",
+            );
+            await this.store.evidence.advanceTrace(context.caller, cursor);
+            if (!verified) {
+              if (observed.status === "failed" && observed.code === "not_connected")
+                throw new ProviderCallError("provider_unavailable", "provider_unavailable");
+              if (observed.status === "unknown")
+                throw new ProviderCallError("unknown", "provider_unknown");
+              throw new ProviderCallError("provider_failed", "provider_postcondition_failed");
+            }
+          }
+          return providerResult;
+        },
+        verifyNativeGroupRole: async ({ context, groupId, capability, operation }) => {
+          const connection = this.connections.get(context.caller.scope.connectionId);
+          const result = connection
+            ? await connection.getGroupMemberRole({
+                groupId,
+                userId: context.caller.scope.senderId,
+              })
+            : ({ status: "failed", code: "not_connected" } as const);
+          const verificationStatus =
+            result.status === "ok"
+              ? capability.nativeGroupRoles?.includes(result.role)
+                ? "verified"
+                : "mismatch"
+              : result.status === "unknown"
+                ? "unknown"
+                : result.code === "not_connected"
+                  ? "unavailable"
+                  : "failed";
+          const cursor = await this.trace.append(
+            context.runId,
+            {
+              type: "native_group_role_verification",
+              runId: context.runId,
+              conversationId: context.conversationId,
+              principalId: context.caller.principalId,
+              resourceId: groupResourceId(groupId),
+              groupId,
+              senderId: context.caller.scope.senderId,
+              observedRole: context.caller.scope.nativeGroupRole?.role ?? "qq_group_member",
+              roleSource:
+                context.caller.scope.nativeGroupRole?.source ?? "missing_defaults_to_member",
+              verifiedRole: result.status === "ok" ? result.role : null,
+              verificationStatus,
+              requestedTool: capability.tool,
+              requestedOperation: operation,
+              authorizationDecision: verificationStatus === "verified" ? "ALLOW" : "DENY",
+            },
+            "glassbox-qq-role",
+          );
+          await this.store.evidence.advanceTrace(context.caller, cursor);
+          if (result.status === "ok") return result.role;
+          if (result.status === "failed" && result.code === "not_connected")
+            throw new ProviderCallError("provider_unavailable", "provider_unavailable");
+          if (result.status === "unknown")
+            throw new ProviderCallError("unknown", "provider_unknown");
+          throw new ProviderCallError("provider_failed", "provider_failed");
         },
         search: (input) => this.searchCapabilities(input.context, input),
         projectManagedGroups: (context) => this.projectManagedGroups(context),
@@ -624,6 +740,7 @@ export class ManagementApplication {
         isOwner,
         chatType: scope.chatType,
         enabledCategories: capabilityCategories,
+        nativeGroupRole: scope.nativeGroupRole?.role,
       }),
     );
 
@@ -838,6 +955,8 @@ export class ManagementApplication {
             });
         }
       },
+      onIngressError: (error) => this.recordGroupIngressError(id, error),
+      onIngressDiagnostic: (diagnostic) => this.recordGroupIngressDiagnostic(id, diagnostic),
       onIncoming: async (message, signal) => {
         await this.ingressReady;
         await connectionReady;
@@ -861,13 +980,33 @@ export class ManagementApplication {
           });
           return;
         }
-        await this.runs.receive({
+        const accepted = await this.store.conversations.acceptIncoming({
           agentId: AGENT_ID,
           scope: message.scope,
           messageId: message.messageId,
           text: message.text,
           executionRef: configured.executionRef,
         });
+        if (!accepted.duplicate && message.scope.nativeGroupRole) {
+          const cursor = await this.trace.append(
+            accepted.run.id,
+            {
+              type: "native_group_role_observed",
+              runId: accepted.run.id,
+              conversationId: accepted.conversation.id,
+              principalId: accepted.caller.principalId,
+              resourceId: groupResourceId(message.scope.chatId),
+              groupId: message.scope.chatId,
+              senderId: message.scope.senderId,
+              observedRole: message.scope.nativeGroupRole.role,
+              roleSource: message.scope.nativeGroupRole.source,
+              observedAt: message.scope.nativeGroupRole.observedAt,
+            },
+            "glassbox-qq-role",
+          );
+          await this.store.evidence.advanceTrace(accepted.caller, cursor);
+        }
+        await this.runs.enqueueAccepted(accepted);
       },
     });
     this.connections.set(id, adapter);
@@ -1038,11 +1177,11 @@ export class ManagementApplication {
         visibility: "public",
         ifAbsent: true,
       });
-      // A Run inside a configured group may read that same group. This is not implied by bot
-      // membership: the grant exists only for a group Glassbox has configured, it is scoped to
-      // that one group, and it covers only the read-only categories. The Run's candidate list
-      // narrows them to the Owner's current policy, and every call is re-authorized.
-      for (const action of this.groupRunReadActions()) {
+      // A Run inside a configured group may address that same group. This is not implied by bot
+      // membership: the grant exists only for a group Glassbox has configured and is scoped to
+      // that one group. The candidate list narrows it by current policy and the message's
+      // observed native role. Mutations also require live role verification and re-authorization.
+      for (const action of this.groupRunActions()) {
         const existing = await this.store.authorization.check({
           caller,
           resourceId: groupResource,
@@ -1246,6 +1385,7 @@ export class ManagementApplication {
       isOwner,
       chatType: input.scope.chatType,
       enabledCategories: [...QQ_CAPABILITY_CATEGORIES],
+      ...(input.scope.chatType === "group" ? { nativeGroupRole: "qq_group_owner" as const } : {}),
     });
     for (const name of names) {
       const resourceId = toolResourceId(name);
@@ -1365,9 +1505,10 @@ export class ManagementApplication {
         // its group-scope grants. A sibling Owner's assignment keeps the group alive.
         lastAssignedOwner = (await this.assignedOwners(configured, input.groupId)).length === 0;
         if (lastAssignedOwner) {
-          await this.store.authorization.revokeResource(groupResource);
-          // Dynamic group members are not part of the static profile. Revoke the whole
-          // Channel location so no sender-specific Agent or Tool grant survives disable.
+          // The Resource name is shared across connections. Revoke this connection's
+          // location, not the whole Resource, or a second connection's grant is lost.
+          // Dynamic group members are not part of the static profile, so this also removes
+          // sender-specific Agent and Tool grants left by the disabled location.
           await this.store.authorization.revokeLocationScopes({
             connectionId: configured.config.connectionId,
             botId: configured.config.botId,
@@ -1459,16 +1600,21 @@ export class ManagementApplication {
   }
 
   /**
-   * The read-only protected Actions a Run inside a configured group may perform on that group.
+   * The protected Actions a Run inside a configured group can ever request on that group.
    *
    * Derived from the same category registry the Tools are, so the grant and the Tool surface
-   * cannot drift. Mutation categories are absent from `GROUP_RUN_CAPABILITY_CATEGORIES`, so a
-   * group Run can never acquire one through this path.
+   * cannot drift. The durable grant is a superset, not native-role truth. Candidate discovery
+   * and execution-time provider verification keep ordinary members read-only.
    */
-  private groupRunReadActions(): string[] {
+  private groupRunActions(): string[] {
     return [
       ...new Set(
-        GROUP_RUN_CAPABILITY_CATEGORIES.flatMap((category) => this.categoryActions(category)),
+        QQ_CAPABILITIES.filter(
+          (capability) =>
+            capability.resource === "group" &&
+            (GROUP_RUN_CAPABILITY_CATEGORIES.includes(capability.category) ||
+              capability.nativeGroupRoles !== undefined),
+        ).map((capability) => capability.action),
       ),
     ];
   }
@@ -1493,6 +1639,7 @@ export class ManagementApplication {
           isOwner: false,
           chatType: "group",
           enabledCategories: [...QQ_CAPABILITY_CATEGORIES],
+          nativeGroupRole: "qq_group_owner",
         }),
       ]),
     ];
@@ -1634,6 +1781,7 @@ export class ManagementApplication {
     if (input.action === "set_capability") return this.setGroupCategory(context, input);
     if (input.action === "set_memory_source") return this.setGroupMemorySource(context, input);
     if (input.action === "set_history") return this.setGroupHistory(context, input);
+    await this.requireManagedGroup(context, input.groupId);
     const runtime = this.groupRuntime.get(
       caller.scope.connectionId,
       input.groupId,
@@ -1663,7 +1811,9 @@ export class ManagementApplication {
         qqCapabilitiesForCategory(category)
           // Account-scoped capabilities describe the Agent's own connection; granting their
           // Action on a group Resource would be a dead grant, so the bundle never writes one.
-          .filter((capability) => capability.resource === "group")
+          .filter(
+            (capability) => capability.resource === "group" && capability.ownerPrivate !== false,
+          )
           .map((capability) => capability.action),
       ),
     ];
@@ -1845,11 +1995,7 @@ export class ManagementApplication {
         principalId: context.caller.principalId,
         enabled: input.enabled,
       };
-      await this.store.capabilities.setCategory({ ...common, category: "group.history" });
-      const { version } = await this.store.capabilities.setMemorySource({
-        ...common,
-        sourceClass: "history",
-      });
+      const { version } = await this.store.capabilities.setHistory(common);
       await this.applyCategoryAuthority({
         context,
         groupId: input.groupId,
@@ -2226,6 +2372,125 @@ export class ManagementApplication {
     return caller;
   }
 
+  private async requireManagedRoleAuditGroup(channelId: string, groupId: string) {
+    let configured: ReturnType<ChannelProfileStore["resolve"]>;
+    try {
+      configured = this.channels.resolve(channelId);
+    } catch {
+      throw new ManagementError("NOT_FOUND", "The requested record was not found.", 404);
+    }
+    if (!configured.config.groupIds.includes(groupId))
+      throw new ManagementError("NOT_FOUND", "The requested record was not found.", 404);
+    const owner = this.ownerPrivateScopes(configured).find(
+      ({ principalId }) => principalId === OWNER_ID,
+    );
+    if (!owner) throw new ManagementError("NOT_FOUND", "The requested record was not found.", 404);
+    const decision = await this.store.authorization.check({
+      caller: { principalId: owner.principalId, scope: owner.scope },
+      resourceId: groupResourceId(groupId),
+      action: GROUP_ASSIGN_ACTION,
+    });
+    if (decision.decision !== "ALLOW")
+      throw new ManagementError("NOT_FOUND", "The requested record was not found.", 404);
+    return { configured, owner };
+  }
+
+  private async groupRoleAudit(channelId: string, groupId: string) {
+    const { configured } = await this.requireManagedRoleAuditGroup(channelId, groupId);
+    const latest = await this.store.management.latestManagedGroupRuns(OWNER_ID, {
+      connectionId: configured.config.connectionId,
+      botId: configured.config.botId,
+      groupId,
+    });
+    const audits = [];
+    for (const run of latest) {
+      const trace = await this.trace.readPage(run.runId, {
+        limit: GROUP_ROLE_AUDIT_RECORD_CAP,
+        redactSecrets: true,
+      });
+      audits.push(
+        projectGroupRoleAudit({
+          runId: run.runId,
+          groupId,
+          createdAt: run.createdAt,
+          principalKind: run.principalKind,
+          records: trace.records,
+          complete: trace.nextCursor === null,
+        }),
+      );
+    }
+
+    // The group assignment may have been revoked while the Raw Trace file was being read.
+    // Re-authorize before returning even the bounded metadata projection.
+    await this.requireManagedRoleAuditGroup(channelId, groupId);
+    return { audits, ingressDiagnostics: this.groupIngressDiagnosticsFor(channelId, groupId) };
+  }
+
+  private groupIngressDiagnosticKey(channelId: string, groupId: string): string {
+    return `${channelId}:${groupId}`;
+  }
+
+  private groupIngressDiagnosticsFor(
+    channelId: string,
+    groupId: string,
+  ): GroupIngressDiagnosticCounts {
+    return (
+      this.groupIngressDiagnostics.get(this.groupIngressDiagnosticKey(channelId, groupId)) ?? {
+        serviceStartedAt: this.ingressStartedAt,
+        lastObservedAt: null,
+        normalized: 0,
+        ignoredNotAddressed: 0,
+        ignoredEmptyMessage: 0,
+        rejectedInvalidMessage: 0,
+        rejectedUnsupportedMessage: 0,
+        rejectedOverflow: 0,
+        acceptanceFailed: 0,
+      }
+    );
+  }
+
+  private recordGroupIngressDiagnostic(
+    channelId: string,
+    diagnostic: OneBotIngressDiagnostic,
+  ): void {
+    if (!this.channels.resolve(channelId).config.groupIds.includes(diagnostic.groupId)) return;
+    const key = this.groupIngressDiagnosticKey(channelId, diagnostic.groupId);
+    const current = this.groupIngressDiagnosticsFor(channelId, diagnostic.groupId);
+    const next = { ...current, lastObservedAt: new Date().toISOString() };
+    const field =
+      diagnostic.stage === "normalized"
+        ? "normalized"
+        : diagnostic.reason === "not_addressed"
+          ? "ignoredNotAddressed"
+          : "ignoredEmptyMessage";
+    next[field] = Math.min(1_000_000, next[field] + 1);
+    this.groupIngressDiagnostics.set(key, next);
+  }
+
+  private recordGroupIngressError(
+    channelId: string,
+    error: {
+      code: "invalid_message" | "unsupported_message" | "acceptance_failed" | "ingress_overflow";
+      groupId?: string;
+    },
+  ): void {
+    if (!error.groupId || !this.channels.resolve(channelId).config.groupIds.includes(error.groupId))
+      return;
+    const key = this.groupIngressDiagnosticKey(channelId, error.groupId);
+    const current = this.groupIngressDiagnosticsFor(channelId, error.groupId);
+    const next = { ...current, lastObservedAt: new Date().toISOString() };
+    const field =
+      error.code === "invalid_message"
+        ? "rejectedInvalidMessage"
+        : error.code === "unsupported_message"
+          ? "rejectedUnsupportedMessage"
+          : error.code === "ingress_overflow"
+            ? "rejectedOverflow"
+            : "acceptanceFailed";
+    next[field] = Math.min(1_000_000, next[field] + 1);
+    this.groupIngressDiagnostics.set(key, next);
+  }
+
   async route(request: IncomingMessage): Promise<{ status: number; body: unknown } | undefined> {
     const url = new URL(request.url ?? "/", "http://localhost");
     const path = url.pathname;
@@ -2285,6 +2550,21 @@ export class ManagementApplication {
         return ok({
           probe: await this.probeCapabilities(value.channelId, value.groupId),
         });
+      }
+      if (request.method === "GET" && path === "/manage/group-role-audit") {
+        const channelId = url.searchParams.get("channelId");
+        const groupId = url.searchParams.get("groupId");
+        if (
+          !channelId ||
+          !/^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$/u.test(channelId) ||
+          !groupId ||
+          !/^[1-9]\d{0,15}$/u.test(groupId)
+        )
+          throw new ManagementError(
+            "INVALID_REQUEST",
+            "A channel and a numeric group are required",
+          );
+        return ok(await this.groupRoleAudit(channelId, groupId));
       }
       if (request.method === "GET" && path === "/manage/conversations")
         return ok(await this.store.management.listConversations(OWNER_ID, options));

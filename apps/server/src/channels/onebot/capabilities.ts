@@ -10,6 +10,7 @@
  */
 
 import { createHash } from "node:crypto";
+import type { QqNativeGroupRole } from "./group-role.js";
 
 export const QQ_CAPABILITY_CATEGORIES = [
   "group.read",
@@ -54,6 +55,10 @@ export interface QqCapability {
   /** Provider actions this capability may issue. Empty for a registry-only Tool. */
   operations: readonly QqOperation[];
   description: string;
+  /** QQ-native group roles that may receive this Tool inside the current group. */
+  nativeGroupRoles?: readonly QqNativeGroupRole[];
+  /** False for a group-local projection that would duplicate or weaken an Owner Tool. */
+  ownerPrivate?: boolean;
 }
 
 const group = (
@@ -101,7 +106,7 @@ export const QQ_CAPABILITIES: readonly QqCapability[] = [
       group("get_group_member_list", ["group_id"]),
       group("get_group_member_info", ["group_id", "user_id", "no_cache"], ["group_id", "user_id"]),
     ],
-    description: "Read a managed group's member list or one member's profile.",
+    description: "Read the member count of a managed group or one member's verified QQ role.",
   },
   {
     tool: "qq_group_history",
@@ -174,6 +179,21 @@ export const QQ_CAPABILITIES: readonly QqCapability[] = [
       group("set_group_whole_ban", ["group_id", "enable"], ["group_id", "enable"]),
     ],
     description: "Moderate a managed group: mute, kick or set whole-group mute.",
+    nativeGroupRoles: ["qq_group_admin", "qq_group_owner"],
+  },
+  {
+    tool: "qq_group_local_settings",
+    category: "group.settings",
+    risk: "write",
+    action: "group:settings:local",
+    resource: "group",
+    operations: [
+      group("set_group_name", ["group_id", "group_name"], ["group_id", "group_name"]),
+      group("set_group_card", ["group_id", "user_id", "card"], ["group_id", "user_id"]),
+    ],
+    description: "Change the current group's name or one member's card as its QQ group owner.",
+    nativeGroupRoles: ["qq_group_owner"],
+    ownerPrivate: false,
   },
   {
     tool: "qq_group_settings",
@@ -294,14 +314,70 @@ export function resolveQqOperation(
   const allowed = new Set(operation.params);
   for (const key of Object.keys(params)) {
     if (!allowed.has(key)) return undefined;
-    const value = params[key];
-    if (typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean")
-      return undefined;
+    if (!validQqOperationParameter(key, params[key])) return undefined;
   }
   for (const key of operation.required) {
     if (params[key] === undefined) return undefined;
   }
   return operation;
+}
+
+/**
+ * One source for the model-facing parameter schema and the server-side provider boundary.
+ * Tool schemas guide generation; this validator is what prevents malformed values reaching
+ * NapCat when a model or direct Tool caller ignores that schema.
+ */
+export function qqOperationParameterKind(
+  name: string,
+): "boolean" | "count" | "duration" | "message_sequence" | "qq_id" | "opaque_id" | "text" {
+  switch (name) {
+    case "enable":
+    case "no_cache":
+    case "reject_add_request":
+      return "boolean";
+    case "count":
+      return "count";
+    case "duration":
+      return "duration";
+    case "message_seq":
+      return "message_sequence";
+    case "group_id":
+    case "user_id":
+      return "qq_id";
+    case "folder_id":
+    case "file_id":
+      return "opaque_id";
+    default:
+      return "text";
+  }
+}
+
+function validQqOperationParameter(name: string, value: unknown): boolean {
+  switch (qqOperationParameterKind(name)) {
+    case "boolean":
+      return typeof value === "boolean";
+    case "count":
+      return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+    case "duration":
+      return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+    case "message_sequence":
+      return (
+        (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) ||
+        (typeof value === "string" && /^\d{1,128}$/u.test(value))
+      );
+    case "qq_id":
+      return (
+        (typeof value === "number" && Number.isSafeInteger(value) && value > 0) ||
+        (typeof value === "string" && /^[1-9]\d{0,15}$/u.test(value))
+      );
+    case "opaque_id":
+      return (
+        (typeof value === "string" && value.length > 0 && value.length <= 2_048) ||
+        (typeof value === "number" && Number.isSafeInteger(value) && value >= 0)
+      );
+    case "text":
+      return typeof value === "string" && value.length <= 2_048;
+  }
 }
 
 /** One allowlisted provider action plus the exact parameter names Glassbox may forward. */

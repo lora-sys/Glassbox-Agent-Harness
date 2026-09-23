@@ -18,10 +18,69 @@ function callerFromRow(row: { [key: string]: unknown }): CallerContext {
 }
 
 /** Only the authenticated local management controller receives this reader.
- * It selects Owner-owned routing metadata, then rechecks the exact stored scope
- * before loading contents. Channel message fields cannot choose this authority. */
+ * Group audit routing metadata is bounded by the configured connection, Bot, group, and
+ * current Owner grant before the application loads Trace evidence. */
 export class OwnerManagementRecords {
   constructor(private readonly db: DomainDatabase) {}
+
+  /**
+   * Finds the newest Owner or Visitor Run in an exact configured group, whether
+   * or not it contains a QQ-native role observation.
+   * The caller must authorize the Owner against that configured group's `group:manage`
+   * Resource before reading its Raw Trace. This returns routing metadata only.
+   */
+  async latestManagedGroupRuns(
+    ownerId: string,
+    input: { connectionId: string; botId: string; groupId: string },
+  ): Promise<Array<{ runId: string; createdAt: string; principalKind: "owner" | "visitor" }>> {
+    return this.db.transaction(async (tx) => {
+      const owner = await tx.execute({
+        sql: "SELECT id FROM principals WHERE id = ? AND kind = 'owner'",
+        args: [ownerId],
+      });
+      if (!owner.rows.length) return [];
+      const latest: Array<{
+        runId: string;
+        createdAt: string;
+        principalKind: "owner" | "visitor";
+      }> = [];
+      for (const principalKind of ["owner", "visitor"] as const) {
+        const rows = await tx.execute({
+          sql: `SELECT r.id, r.created_at, r.scope_json
+            FROM runs r JOIN principals p ON p.id = r.principal_id
+            WHERE p.kind = ?
+              AND json_extract(r.scope_json, '$.connectionId') = ?
+              AND json_extract(r.scope_json, '$.botId') = ?
+              AND json_extract(r.scope_json, '$.chatType') = 'group'
+              AND json_extract(r.scope_json, '$.chatId') = ?
+            ORDER BY r.created_at DESC, r.id DESC LIMIT 20`,
+          args: [principalKind, input.connectionId, input.botId, input.groupId],
+        });
+        for (const row of rows.rows) {
+          try {
+            const scope = JSON.parse(stringColumn(row, "scope_json")) as TrustedChannelScope;
+            validateScope(scope);
+            if (
+              scope.chatType !== "group" ||
+              scope.connectionId !== input.connectionId ||
+              scope.botId !== input.botId ||
+              scope.chatId !== input.groupId
+            )
+              continue;
+            latest.push({
+              runId: stringColumn(row, "id"),
+              createdAt: stringColumn(row, "created_at"),
+              principalKind,
+            });
+            break;
+          } catch {
+            // Invalid persisted scope is not eligible for a protected audit projection.
+          }
+        }
+      }
+      return latest;
+    });
+  }
 
   /** Local authenticated incident response only. This withdraws context reuse;
    * it neither reads protected content nor grants the Owner channel authority. */

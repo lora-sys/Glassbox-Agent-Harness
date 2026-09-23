@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="#-开源协议"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License" /></a>
-  <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/Node.js-%3E%3D22.0.0-green.svg" alt="Node.js" /></a>
+  <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/Node.js-%3E%3D24.12.0-green.svg" alt="Node.js" /></a>
   <a href="https://vite.dev/"><img src="https://img.shields.io/badge/Toolchain-Vite%2B-purple.svg" alt="Vite+" /></a>
   <a href="./.plans/03-personal-agent-foundation.md"><img src="https://img.shields.io/badge/Stage-Plan%2003%20Done-success.svg" alt="Stage" /></a>
 </p>
@@ -292,100 +292,74 @@ Ingress Gate → Context Gate → Tool / Ops Gate → Delivery Gate
 ## ⚡ 快速上手与本地开发
 
 ### 1. 软件环境要求
-- **Node.js**：`>= 22.18.0`（推荐 `24.x`）
+- **Node.js**：`>= 24.12.0`
+- **npm**：`12.0.2`，见根目录 `package.json`
 - **统一工具链**：Vite+，命令入口为 `vp`
-- **NapCat / OneBot**：已就绪的 QQ 机器人（用于收发消息）
-- **Herdr**（可选）：用于本地 Worker 调度的执行宿主
-- **Lora PI Kit**：同级目录存放 `lora-pi-kit`
+- **NapCat / OneBot**：真实 QQ 收发验收时需要
+- **Herdr**：配置 coding Worker 时需要
+- **Lora PI Kit**：配置使用 `pi:*` Runtime 的 Channel 时需要
 
 ### 2. 初始化步骤
 
 ```bash
-# 1. 安装依赖
+# 1. 安装仓库依赖
 vp install
 
-# 2. 从模板复制并填写配置文件
-cp .env.example .env
-# 编辑 .env 填入你的测试参数（BOT_QQ、OWNER_QQ、CO_OWNER_QQ、TEST_GROUP_ID、NAPCAT_WS_URL、模型 API Key 等）
+# 2. 根据需要配置服务启动项
+# 默认读取 %USERPROFILE%\.glassbox\service-launch.json
+# 配置格式见 docs/service-launch.example.json
 
-# 3. 运行全量自检测试门禁
+# 3. 运行提交门禁
 vp run verify:commit
 ```
+
+不要把 QQ、NapCat 或模型凭据写入 `.env`、启动命令或版本库。Channel 和模型凭据应通过 Glassbox 管理界面或 CLI 保存。详细配置说明见 [本地服务启动](./docs/tech-stack.md#repository-toolchain)。
 
 ### 3. 服务进程管理
 
 ```bash
-# 启动三大服务（Herdr + NapCat + Glassbox）
-vp run agent:up
+# 启动和管理本地服务
+npm run agent:up
 
 # 查看服务状态与健康度
-vp run agent:status
+npm run agent:status
 
 # 查看实时运行日志
-vp run agent:logs
+npm run agent:logs
 
 # 停止服务
-vp run agent:down
+npm run agent:down
 ```
+
+启动器总是配置并启动 Glassbox；只有 `service-launch.json` 中配置了 NapCat 或 Herdr 时才会启动它们。Windows 下不要用 `vp run agent:up` 管理长驻服务。Vite+ 任务结束时会清理脱离的子进程。NapCat 登录恢复、服务边界和安全停止行为见 [工具链与本地开发](./docs/tech-stack.md#repository-toolchain)。
 
 ---
 
 ## 🚀 给合作开发者（及其 Coding Agent）的快速接入指南
 
-克隆本仓库后，第二位开发者可直接将以下 Prompt 复制给其使用的 **Codex / Claude Code / AI Agent**，由 Agent 全自动拉取依赖、配置环境、生成配置骨架并启动三服务：
+新环境可以克隆仓库并安装依赖。已有工作树必须先检查分支和本地改动。服务启动不会自动拉取代码、切换分支或写入凭据：
 
-````markdown
-你现在是负责将 Glassbox Personal Agent 系统在当前电脑上完整初始化并跑起来的自动化工程师 Agent。
+新环境：
 
-请一步一步自动执行以下初始化流程，直至项目完全就绪：
+```bash
+git clone https://github.com/lora-sys/Glassbox-Agent-Harness.git
+cd Glassbox-Agent-Harness
+vp install
+vp run verify:commit
+```
 
-### 阶段一：代码仓库与关联子模块拉取
-1. 检查当前工作目录：
-   - 如果当前不在 `Glassbox-Agent-Harness` 仓库中，请执行：
-     `git clone https://github.com/lora-sys/Glassbox-Agent-Harness.git`
-     并进入 `Glassbox-Agent-Harness` 目录，确保处于 `main` 分支。
-2. 检查关联核心仓库 `lora-pi-kit`：
-   - 检查同级目录是否存在 `lora-pi-kit`。若不存在，请克隆：
-     `git clone https://github.com/lora-sys/lora-pi-kit.git ../lora-pi-kit`
-   - 记录其绝对路径，后续作为 `LORA_PI_KIT_PATH` 使用。
+已有工作树更新时，先确认工作区干净、分支正确，再执行 fast-forward 更新：
 
-### 阶段二：工具链与依赖安装
-1. 检查 Node.js 版本（必须 >= 22.0.0，推荐 24.x）。
-2. 本项目统一使用 Vite+ (`vp`) 作为工具链规范：
-   - 检查是否已安装 `vp`；若未安装，可使用 `npm install` 安装所有 workspace 依赖。
-   - 确保可以使用 `vp` 或 `npm run` 执行命令。
+```bash
+git status --short --branch
+git fetch origin
+# 仅在工作区干净且当前分支目标正确时执行
+git pull --ff-only
+vp install
+vp run verify:commit
+```
 
-### 阶段三：外部运行组件就绪检查（NapCat 与 Herdr）
-1. 检查 OneBot 11（NapCat）服务：
-   - 确认本机是否配置并运行了 NapCat（默认 WebSocket 地址为 `ws://127.0.0.1:6700/`）。
-2. 检查 Herdr 运行宿主：
-   - 检查本机是否存在 `herdr` 可执行文件。若未安装，提示用户从 Herdr 官方 Release 下载并放置在相应路径。
-
-### 阶段四：全自动生成配置骨架
-1. 检查项目根目录的 `.env`：
-   - 若不存在，从 `.env.example` 复制生成 `.env`。
-   - 自动将其中的 `GLASSBOX_DATA_DIR` 填为当前用户主目录下的 `.glassbox`（例如 Windows 下的 `C:\Users\<当前用户>\.glassbox`）。
-   - 自动将 `LORA_PI_KIT_PATH` 填为阶段一中 `lora-pi-kit` 的真实绝对路径。
-2. 在 `$GLASSBOX_DATA_DIR`（即 `~/.glassbox`）中初始化运行时配置骨架：
-   - 检查并创建 `channels.json`、`models.json`、`agent-operations.json`、`service-launch.json`。
-   - 将各个配置中的路径占位符自动替换为当前电脑的实际绝对路径。
-3. 停下来向用户索要私下提供的核心敏感凭证，并协助写入 `.env` 和 `channels.json`：
-   - `BOT_QQ`（机器人 QQ）
-   - `OWNER_QQ`（主 Owner QQ）
-   - `CO_OWNER_QQ`（协同 Owner QQ）
-   - `TEST_GROUP_ID`（测试群号）
-   - `NAPCAT_ACCESS_TOKEN`（OneBot 鉴权 Token）
-   - `MINIMAX_API_KEY`（模型 API 密钥）
-
-### 阶段五：自检测试与全服务启动
-1. 运行代码与类型检查：`vp check`
-2. 运行服务端测试：`vp run test:server`，确保所有核心单元测试（包括双 Owner 独立会话与权限测试）100% PASS。
-3. 凭证补齐后，执行三服务拉起：
-   - 启动命令：`vp run agent:up`（自动拉起 Herdr、NapCat 和 Glassbox 主服务）
-   - 检查状态：`vp run agent:status`
-   - 查看日志：`vp run agent:logs`
-4. 向用户汇报各服务的 PID、监听端口及连接状态，确认系统已整体跑起来。
-````
+本地服务配置见 [`docs/service-launch.example.json`](./docs/service-launch.example.json)。在 Windows 上用 `npm run agent:up`、`npm run agent:status`、`npm run agent:logs` 和 `npm run agent:down` 管理服务。启动器不会更新 Git 工作树、切换分支、安装依赖或写入 Channel 凭据。
 
 ---
 

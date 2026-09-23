@@ -91,6 +91,14 @@ describe("required evidence for a live QQ fact", () => {
     ]);
   });
 
+  it("requires the history Tool when an explicit sender filter comes before the history noun", () => {
+    expect(
+      requiredEvidenceFor(
+        inGroup("请搜索发送者 QQ 3067670134 发的群历史，查找包含 P4-NOMATCH-86731 的消息。"),
+      ),
+    ).toEqual([{ domain: "group_history_search", tool: GROUP_HISTORY_SEARCH_TOOL, input: {} }]);
+  });
+
   it("never requires a group-scoped domain for a group Run's account status", () => {
     // The Run is bound to its own group, and account status is not a group-scoped read: the
     // current-group scope cannot address it.
@@ -99,6 +107,10 @@ describe("required evidence for a live QQ fact", () => {
 });
 
 describe("required evidence stays narrow", () => {
+  it("does not treat a speculative mention of group history as a search request", () => {
+    expect(domains(inGroup("搜索一下这个文件，群历史里可能有 P4-NOMATCH-86731"))).toEqual([]);
+  });
+
   it("requires nothing when the message only mentions a domain without asking", () => {
     expect(requiredEvidenceFor(inGroup("这个群的成员真多"))).toEqual([]);
   });

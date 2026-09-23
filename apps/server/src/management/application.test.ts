@@ -26,6 +26,7 @@ import {
 } from "./application.js";
 import { PiRunExecutionAdapter } from "../runtime/pi/run-adapter.js";
 import type { HistorySyncOutcome } from "../runtime/pi/history-tools.js";
+import { ProviderCallError } from "../runtime/pi/provider-outcome.js";
 import type { ToolDescriptor, ToolExclusionReason } from "../runtime/pi/tool-plane.js";
 import { TOOL_DESCRIPTORS } from "../runtime/pi/tool-plane.js";
 import type { PiRuntimeAdapter } from "../runtime/pi/types.js";
@@ -56,6 +57,7 @@ interface Action {
     group_id?: number;
     user_id?: number;
     message_seq?: number;
+    no_cache?: boolean;
     message?: Array<{ data: { text: string } }>;
   };
 }
@@ -82,11 +84,18 @@ async function fixture(
     coOwnerId?: string;
     /** File-backed database so a test can close and reopen the same durable state. */
     persistentDatabase?: boolean;
+    /** Current provider role returned by the execution-time member lookup. */
+    memberRole?: () => "owner" | "admin" | "member";
+    /** One provider mutation to reject after caller authorization has passed. */
+    failAction?: string;
+    /** Applies provider-side state changes before the fake peer answers an action. */
+    onAction?: (action: Action) => void;
   } = {},
 ) {
   const directory = await mkdtemp(join(tmpdir(), "glassbox-channel-loop-"));
   cleanup.push(() => removeDirectory(directory));
   const actions = new Inbox<Action>();
+  const actionLog: Action[] = [];
   const sockets = new Inbox<WebSocket>();
   const calls: ExecutionInput[] = [];
   const started = new Inbox<ExecutionInput>();
@@ -110,17 +119,20 @@ async function fixture(
           ? Buffer.from(raw)
           : raw;
       const action = JSON.parse(bytes.toString("utf8")) as Action;
+      actionLog.push(action);
       actions.put(action);
+      options.onAction?.(action);
       if (action.action === "get_group_info") groupInfoRequests += 1;
       // A rejected `get_group_info` is the peer's own failure reply: `status: "failed"` with a
       // non-zero `retcode`, which the adapter maps to a provider error rather than to data.
       const groupInfoFailed = action.action === "get_group_info" && groupInfoFails;
+      const actionFailed = groupInfoFailed || action.action === options.failAction;
       socket.send(
         JSON.stringify({
           echo: action.echo,
-          status: groupInfoFailed ? "failed" : "ok",
-          retcode: groupInfoFailed ? 100 : 0,
-          data: groupInfoFailed
+          status: actionFailed ? "failed" : "ok",
+          retcode: actionFailed ? 100 : 0,
+          data: actionFailed
             ? null
             : action.action === "get_login_info"
               ? { user_id: 10001 }
@@ -129,9 +141,15 @@ async function fixture(
                     group_id: action.params.group_id,
                     ...(options.groupName === undefined ? {} : { group_name: options.groupName }),
                   }
-                : action.action === "get_group_msg_history"
-                  ? { messages: options.history?.(action.params) ?? [] }
-                  : { message_id: 20001 },
+                : action.action === "get_group_member_info"
+                  ? {
+                      group_id: action.params.group_id,
+                      user_id: action.params.user_id,
+                      role: options.memberRole?.() ?? "member",
+                    }
+                  : action.action === "get_group_msg_history"
+                    ? { messages: options.history?.(action.params) ?? [] }
+                    : { message_id: 20001 },
         }),
       );
     });
@@ -181,7 +199,14 @@ async function fixture(
   });
   await app.connectChannel("fixture");
   const socket = await sockets.take();
-  const send = (id: number, text: string, privateChat = false, senderId = 10002, groupId = 10003) =>
+  const send = (
+    id: number,
+    text: string,
+    privateChat = false,
+    senderId = 10002,
+    groupId = 10003,
+    role: "owner" | "admin" | "member" | null = "member",
+  ) =>
     socket.send(
       JSON.stringify({
         post_type: "message",
@@ -192,6 +217,7 @@ async function fixture(
         sub_type: privateChat ? "friend" : "normal",
         group_id: groupId,
         anonymous: null,
+        sender: role === null ? {} : { role },
         message: [
           ...(privateChat ? [] : [{ type: "at", data: { qq: "10001" } }]),
           { type: "text", data: { text } },
@@ -212,6 +238,7 @@ async function fixture(
     send,
     reply,
     actions,
+    actionLog,
     reopen,
     setGroupInfoFails,
     groupInfoRequests: () => groupInfoRequests,
@@ -219,6 +246,45 @@ async function fixture(
 }
 
 describe("channel to durable run composition", () => {
+  it("returns zeroed ingress diagnostics when a managed group has no Runs yet", async () => {
+    const f = await fixture(async () => ({ status: "succeeded", text: "unused" }));
+    const ownerScope: TrustedChannelScope = {
+      connectionId: "fixture",
+      botId: "10001",
+      chatType: "private",
+      chatId: "10002",
+      senderId: "10002",
+    };
+    await f.app.store.authorization.grant({
+      principalId: "owner",
+      resourceId: "group:10003",
+      action: "group:manage",
+      scope: ownerScope,
+      effect: "allow",
+    });
+
+    const result = await f.app.route({
+      method: "GET",
+      url: "/manage/group-role-audit?channelId=fixture&groupId=10003",
+    } as never);
+
+    expect(result?.status).toBe(200);
+    expect(result?.body).toMatchObject({
+      audits: [],
+      ingressDiagnostics: {
+        serviceStartedAt: expect.any(String),
+        lastObservedAt: null,
+        normalized: 0,
+        ignoredNotAddressed: 0,
+        ignoredEmptyMessage: 0,
+        rejectedInvalidMessage: 0,
+        rejectedUnsupportedMessage: 0,
+        rejectedOverflow: 0,
+        acceptanceFailed: 0,
+      },
+    });
+  });
+
   it("exposes Tool-plane diagnostics only for the current Owner's Run", async () => {
     const f = await fixture(async () => ({ status: "succeeded", text: "private answer" }), {
       coOwnerId: "10005",
@@ -258,6 +324,238 @@ describe("channel to durable run composition", () => {
         url: `/manage/runs/${foreignOwnerRun.run.id}/tool-plane`,
       } as never),
     ).rejects.toMatchObject({ code: "NOT_FOUND" });
+  });
+
+  it("shows a payload-free role audit only for Visitor Runs in a group assigned to the Owner", async () => {
+    const f = await fixture(async () => ({ status: "succeeded", text: "visitor reply" }));
+    await expect(
+      f.app.route({
+        method: "GET",
+        url: "/manage/group-role-audit?channelId=fixture&groupId=10003",
+      } as never),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    const ownerScope: TrustedChannelScope = {
+      connectionId: "fixture",
+      botId: "10001",
+      chatType: "private",
+      chatId: "10002",
+      senderId: "10002",
+    };
+    await f.app.store.authorization.grant({
+      principalId: "owner",
+      resourceId: "group:10003",
+      action: "group:manage",
+      scope: ownerScope,
+      effect: "allow",
+    });
+
+    f.send(1, "禁言成员 10005 10秒", false, 10004, 10003, "admin");
+    const visitorRun = await f.started.take();
+    await f.app.runs.waitForRun(visitorRun.caller, visitorRun.run.id);
+    await f.reply("visitor reply");
+
+    const canary = "never-return-this-message-or-provider-payload";
+    const events = [
+      {
+        type: "session_start",
+        data: {
+          toolSurface: {
+            selected: [{ name: "qq_group_moderation", providerReadiness: "ready" }],
+            excluded: [{ name: "qq_group_settings", reason: "scope_not_permitted" }],
+          },
+        },
+      },
+      { type: "message_chunk", data: { text: canary } },
+      {
+        type: "tool_call",
+        data: {
+          toolCallId: "call-audit-1",
+          name: "qq_group_moderation",
+          arguments: { user_id: 10005, duration: 10, raw: canary },
+        },
+      },
+      {
+        type: "native_group_role_verification",
+        resourceId: "group:10003",
+        groupId: "10003",
+        senderId: "10004",
+        observedRole: "qq_group_admin",
+        verifiedRole: "qq_group_admin",
+        verificationStatus: "verified",
+        requestedTool: "qq_group_moderation",
+        requestedOperation: "set_group_ban",
+        authorizationDecision: "ALLOW",
+      },
+      {
+        type: "tool_result",
+        data: {
+          toolCallId: "call-audit-1",
+          name: "qq_group_moderation",
+          isError: false,
+          result: canary,
+          providerError: canary,
+        },
+      },
+    ];
+    for (const event of events)
+      await f.app.trace.append(visitorRun.run.id, event, "test-audit-fixture");
+
+    await expect(
+      f.app.route({
+        method: "GET",
+        url: "/manage/group-role-audit?channelId=fixture&groupId=10006",
+      } as never),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+
+    const result = await f.app.route({
+      method: "GET",
+      url: "/manage/group-role-audit?channelId=fixture&groupId=10003",
+    } as never);
+    expect(result?.status).toBe(200);
+    expect(result?.body).toMatchObject({
+      ingressDiagnostics: {
+        normalized: 1,
+        ignoredNotAddressed: 0,
+        ignoredEmptyMessage: 0,
+        rejectedInvalidMessage: 0,
+        rejectedUnsupportedMessage: 0,
+        rejectedOverflow: 0,
+        acceptanceFailed: 0,
+      },
+      audits: [
+        {
+          runId: visitorRun.run.id,
+          groupId: "10003",
+          principalKind: "visitor",
+          ingress: { role: "qq_group_admin", source: "onebot_message_sender" },
+          verification: {
+            observedRole: "qq_group_admin",
+            verifiedRole: "qq_group_admin",
+            status: "verified",
+            tool: "qq_group_moderation",
+            operation: "set_group_ban",
+            authorizationDecision: "ALLOW",
+          },
+          toolCalls: [{ name: "qq_group_moderation", outcome: "success" }],
+        },
+      ],
+    });
+    expect(JSON.stringify(result?.body)).not.toContain(canary);
+    expect(JSON.stringify(result?.body)).not.toContain("10004");
+    expect(JSON.stringify(result?.body)).not.toContain("10005");
+  });
+
+  it("rechecks Owner group assignment after reading a Visitor Run Trace", async () => {
+    const f = await fixture(async () => ({ status: "succeeded", text: "visitor reply" }));
+    const ownerScope: TrustedChannelScope = {
+      connectionId: "fixture",
+      botId: "10001",
+      chatType: "private",
+      chatId: "10002",
+      senderId: "10002",
+    };
+    await f.app.store.authorization.grant({
+      principalId: "owner",
+      resourceId: "group:10003",
+      action: "group:manage",
+      scope: ownerScope,
+      effect: "allow",
+    });
+    f.send(1, "只读测试", false, 10004, 10003, "member");
+    const visitorRun = await f.started.take();
+    await f.app.runs.waitForRun(visitorRun.caller, visitorRun.run.id);
+    await f.reply("visitor reply");
+
+    const trace = f.app.trace;
+    const readPage = trace.readPage.bind(trace);
+    trace.readPage = async <T = unknown>(
+      runId: string,
+      options?: Parameters<typeof trace.readPage>[1],
+    ) => {
+      const page = await readPage<T>(runId, options);
+      await f.app.store.authorization.revokeScopeAction({
+        principalId: "owner",
+        resourceId: "group:10003",
+        action: "group:manage",
+        scope: ownerScope,
+      });
+      return page;
+    };
+
+    await expect(
+      f.app.route({
+        method: "GET",
+        url: "/manage/group-role-audit?channelId=fixture&groupId=10003",
+      } as never),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+  });
+
+  it("treats an unreported sender role as an ordinary member in the audit", async () => {
+    const f = await fixture(async () => ({ status: "succeeded", text: "visitor reply" }));
+    const ownerScope: TrustedChannelScope = {
+      connectionId: "fixture",
+      botId: "10001",
+      chatType: "private",
+      chatId: "10002",
+      senderId: "10002",
+    };
+    await f.app.store.authorization.grant({
+      principalId: "owner",
+      resourceId: "group:10003",
+      action: "group:manage",
+      scope: ownerScope,
+      effect: "allow",
+    });
+    f.send(1, "只读验收", false, 10004, 10003, null);
+    const visitorRun = await f.started.take();
+    await f.app.runs.waitForRun(visitorRun.caller, visitorRun.run.id);
+    await f.reply("visitor reply");
+
+    const result = await f.app.route({
+      method: "GET",
+      url: "/manage/group-role-audit?channelId=fixture&groupId=10003",
+    } as never);
+    expect(result?.body).toMatchObject({
+      audits: [
+        {
+          runId: visitorRun.run.id,
+          ingress: { role: "qq_group_member", source: "onebot_message_sender" },
+          verification: null,
+          toolCalls: [],
+        },
+      ],
+    });
+  });
+
+  it("returns the newest Owner group Run in the Owner audit slot", async () => {
+    const f = await fixture(async () => ({ status: "succeeded", text: "private audit canary" }));
+    const ownerScope: TrustedChannelScope = {
+      connectionId: "fixture",
+      botId: "10001",
+      chatType: "private",
+      chatId: "10002",
+      senderId: "10002",
+    };
+    await f.app.store.authorization.grant({
+      principalId: "owner",
+      resourceId: "group:10003",
+      action: "group:manage",
+      scope: ownerScope,
+      effect: "allow",
+    });
+    f.send(1, "私有审计 canary", false, 10002, 10003);
+    const ownerRun = await f.started.take();
+    await f.app.runs.waitForRun(ownerRun.caller, ownerRun.run.id);
+    await f.reply("private audit canary");
+
+    const result = await f.app.route({
+      method: "GET",
+      url: "/manage/group-role-audit?channelId=fixture&groupId=10003",
+    } as never);
+    expect(result?.body).toMatchObject({
+      audits: [{ runId: ownerRun.run.id, principalKind: "owner" }],
+    });
+    expect(JSON.stringify(result?.body)).not.toContain("private audit canary");
   });
 
   it("keeps an auto-connect channel retrying when OneBot becomes ready after server startup", async () => {
@@ -852,6 +1150,7 @@ const admin = (app: ManagementApplication) =>
       context: OwnerContext,
       input: { groupId: string; skillName: string; enabled: boolean },
     ): Promise<unknown>;
+    manageGroup(context: OwnerContext, input: { action: "get"; groupId: string }): Promise<unknown>;
     projectManagedGroups(context: OwnerContext): Promise<ManagedGroupProjection>;
     resolveRunToolNames(context: OwnerContext): Promise<string[]>;
     resolveRunToolCandidates(
@@ -877,7 +1176,9 @@ const groupActions = (categories: readonly QqCapabilityCategory[]): string[] => 
   ...new Set(
     categories.flatMap((category) =>
       qqCapabilitiesForCategory(category)
-        .filter((capability) => capability.resource === "group")
+        .filter(
+          (capability) => capability.resource === "group" && capability.ownerPrivate !== false,
+        )
         .map((capability) => capability.action),
     ),
   ),
@@ -955,6 +1256,19 @@ describe("per-Owner managed group assignment", () => {
     expect(await groupIds(application, b)).toEqual([GROUP]);
   });
 
+  it("does not expose a group's stored settings after this Owner is unassigned", async () => {
+    const { application, a, b } = await owners();
+    await application.setGroupAccess(a, { groupId: GROUP, enabled: true });
+    await application.setGroupHistory(a, { groupId: GROUP, enabled: true });
+    await expect(application.manageGroup(b, { action: "get", groupId: GROUP })).rejects.toThrow(
+      "group_not_enabled",
+    );
+    await application.setGroupAccess(a, { groupId: GROUP, enabled: false });
+    await expect(application.manageGroup(a, { action: "get", groupId: GROUP })).rejects.toThrow(
+      "group_not_enabled",
+    );
+  });
+
   it("keeps a sibling Owner's assignment and the transport group when one Owner revokes", async () => {
     const { f, application, a, b } = await owners();
     await application.setGroupAccess(a, { groupId: GROUP, enabled: true });
@@ -981,6 +1295,30 @@ describe("per-Owner managed group assignment", () => {
     expect(f.app.listChannels()[0]?.groupIds).not.toContain(GROUP);
     expect((await history(b)).decision).toBe("DENY");
     expect((await history(a)).decision).toBe("DENY");
+  });
+
+  it("does not revoke another connection's grant for the same group number", async () => {
+    const { f, application, a } = await owners();
+    await application.setGroupAccess(a, { groupId: GROUP, enabled: true });
+    const otherScope = { ...a.caller.scope, connectionId: "another-qq-connection" };
+    await f.app.store.authorization.grant({
+      principalId: a.caller.principalId,
+      resourceId: `group:${GROUP}`,
+      action: "group:read",
+      scope: otherScope,
+      effect: "allow",
+    });
+
+    await application.setGroupAccess(a, { groupId: GROUP, enabled: false });
+
+    expect(
+      await f.app.store.authorization.hasActiveGrant({
+        principalId: a.caller.principalId,
+        resourceId: `group:${GROUP}`,
+        action: "group:read",
+        scope: otherScope,
+      }),
+    ).toBe(true);
   });
 
   it("persists each Owner's assignment and the fixed policy across a restart", async () => {
@@ -1457,6 +1795,7 @@ const GROUP_RUN_READ_TOOLS = [
 ] as const;
 const GROUP_RUN_FORBIDDEN_TOOLS = [
   "qq_group_moderation",
+  "qq_group_local_settings",
   "qq_group_settings",
   "qq_group_file_ops",
   "qq_capability_search",
@@ -1468,15 +1807,27 @@ describe("configured group Run capability authority", () => {
   /** The group's numeric provider id, and the canonical string id Glassbox resources use. */
   const GROUP_ID = 10005;
   const GROUP = String(GROUP_ID);
+  const OTHER_GROUP_ID = 10007;
+  const OTHER_GROUP = String(OTHER_GROUP_ID);
 
   /**
    * Enables a group for the primary Owner and then runs a real group message in it, so the
    * caller scope under test is the one the transport produced rather than one the test made up.
    */
-  async function configuredGroup() {
+  async function configuredGroup(
+    role: "owner" | "admin" | "member" = "member",
+    memberRole: () => "owner" | "admin" | "member" = () => role,
+    failAction?: string,
+    onAction?: (action: Action) => void,
+  ) {
     const f = await fixture(
       async (input) => ({ status: "succeeded", text: `answer:${input.text}` }),
-      { coOwnerId: CO_OWNER },
+      {
+        coOwnerId: CO_OWNER,
+        memberRole,
+        ...(failAction === undefined ? {} : { failAction }),
+        ...(onAction === undefined ? {} : { onAction }),
+      },
     );
     f.send(1, "owner-a", true, 10002);
     const ownerA = await f.started.take();
@@ -1488,7 +1839,7 @@ describe("configured group Run capability authority", () => {
     };
     const application = groupRun(f.app);
     await application.setGroupAccess(a, { groupId: GROUP, enabled: true });
-    f.send(2, "group-run", false, 10002, GROUP_ID);
+    f.send(2, "group-run", false, 10002, GROUP_ID, role);
     const run = await f.started.take();
     await f.reply("answer:group-run");
     const context: OwnerContext = {
@@ -1568,7 +1919,7 @@ describe("configured group Run capability authority", () => {
     expect(candidates.length).toBe(TOOL_DESCRIPTORS.length + 1);
   });
 
-  it("discovers only the read-only capabilities for a group Run and calls one for real", async () => {
+  it("discovers only reads for an ordinary group member and calls one for real", async () => {
     const { application, context } = await configuredGroup();
 
     const names = await application.resolveRunToolNames(context);
@@ -1584,6 +1935,342 @@ describe("configured group Run capability authority", () => {
     expect(result.details).toMatchObject({ status: "ok", data: { group_id: Number(GROUP) } });
   });
 
+  it("gives a QQ admin only current-group moderation and re-verifies before execution", async () => {
+    const { application, a, context, f } = await configuredGroup("admin");
+    await application.setGroupCategory(a, {
+      groupId: GROUP,
+      category: "group.moderate",
+      enabled: true,
+    });
+    expect(context.caller.scope.nativeGroupRole?.role).toBe("qq_group_admin");
+    expect(
+      (await application.resolveRunToolCandidates(context)).find(
+        (entry) => entry.name === "qq_group_moderation",
+      )?.exclusion,
+    ).toBeNull();
+    const names = await application.resolveRunToolNames(context);
+    expect(names).toContain("qq_group_moderation");
+    expect(names).not.toContain("qq_group_local_settings");
+    expect(names).not.toContain("qq_group_settings");
+    expect(names).not.toContain("owner_group_admin");
+    const runtimeContext = Object.assign(context, {
+      requiredToolName: "qq_group_moderation",
+      requiredToolInput: {
+        groupId: GROUP,
+        operation: "set_group_ban",
+        params: { user_id: 10004, duration: 60 },
+      },
+    });
+    const moderation = application
+      .createRuntimeTools(() => runtimeContext)
+      .find((tool) => tool.name === "qq_group_moderation");
+    if (!moderation) throw new Error("missing qq_group_moderation");
+    await expect(
+      moderation.execute("call", {
+        operation: "set_group_ban",
+        params: { user_id: 10004, duration: 60 },
+      }),
+    ).resolves.toMatchObject({ details: { status: "ok" } });
+    const trace = await f.app.trace.readPage(context.runId);
+    expect(
+      trace.records
+        .map((record) => record.event)
+        .filter((event) => {
+          const value = event as { type?: string };
+          return value.type === "native_group_role_observed";
+        }),
+    ).toEqual([
+      expect.objectContaining({
+        principalId: context.caller.principalId,
+        resourceId: `group:${GROUP}`,
+        groupId: GROUP,
+        senderId: "10002",
+        observedRole: "qq_group_admin",
+        roleSource: "onebot_message_sender",
+      }),
+    ]);
+    expect(
+      trace.records
+        .map((record) => record.event)
+        .filter((event) => {
+          const value = event as { type?: string };
+          return value.type === "native_group_role_verification";
+        }),
+    ).toEqual([
+      expect.objectContaining({
+        observedRole: "qq_group_admin",
+        verifiedRole: "qq_group_admin",
+        verificationStatus: "verified",
+        requestedTool: "qq_group_moderation",
+        requestedOperation: "set_group_ban",
+        authorizationDecision: "ALLOW",
+      }),
+    ]);
+  });
+
+  it("denies a mutation before provider action when QQ demotes the observed admin", async () => {
+    let currentRole: "admin" | "member" = "admin";
+    const { application, a, context, f } = await configuredGroup("admin", () => currentRole);
+    await application.setGroupCategory(a, {
+      groupId: GROUP,
+      category: "group.moderate",
+      enabled: true,
+    });
+    const runtimeContext = Object.assign(context, {
+      requiredToolName: "qq_group_moderation",
+      requiredToolInput: {
+        groupId: GROUP,
+        operation: "set_group_whole_ban",
+        params: { enable: true },
+      },
+    });
+    const moderation = application
+      .createRuntimeTools(() => runtimeContext)
+      .find((tool) => tool.name === "qq_group_moderation");
+    if (!moderation) throw new Error("missing qq_group_moderation");
+    currentRole = "member";
+    await expect(
+      moderation.execute("call", {
+        operation: "set_group_whole_ban",
+        params: { enable: true },
+      }),
+    ).rejects.toThrow("native_group_role_denied");
+    const verified = await f.actions.take((action) => action.action === "get_group_member_info");
+    expect(verified.params).toMatchObject({
+      group_id: GROUP_ID,
+      user_id: 10002,
+      no_cache: true,
+    });
+    expect(f.actionLog.some((action) => action.action === "set_group_whole_ban")).toBe(false);
+    const trace = await f.app.trace.readPage(context.runId);
+    expect(
+      trace.records
+        .map((record) => record.event)
+        .filter((event) => {
+          const value = event as { type?: string };
+          return value.type === "native_group_role_verification";
+        }),
+    ).toContainEqual(
+      expect.objectContaining({
+        observedRole: "qq_group_admin",
+        verifiedRole: "qq_group_member",
+        verificationStatus: "mismatch",
+        authorizationDecision: "DENY",
+      }),
+    );
+  });
+
+  it("fails a provider-acknowledged admin mutation whose fresh role did not change", async () => {
+    const { application, a, f } = await configuredGroup();
+    await application.setGroupCategory(a, {
+      groupId: GROUP,
+      category: "group.settings",
+      enabled: true,
+    });
+    const context = Object.assign(a, {
+      requiredToolName: "qq_group_settings",
+      requiredToolInput: {
+        groupId: GROUP,
+        operation: "set_group_admin",
+        params: { user_id: 10004, enable: true },
+      },
+    });
+    const settings = application
+      .createRuntimeTools(() => context)
+      .find((tool) => tool.name === "qq_group_settings");
+    if (!settings) throw new Error("missing qq_group_settings");
+
+    await expect(
+      settings.execute("call", {
+        groupId: GROUP,
+        operation: "set_group_admin",
+        params: { user_id: 10004, enable: true },
+      }),
+    ).rejects.toThrow("provider_postcondition_failed");
+    expect(f.actionLog.map((action) => action.action)).toContain("set_group_admin");
+    expect(f.actionLog).toContainEqual(
+      expect.objectContaining({
+        action: "get_group_member_info",
+        params: expect.objectContaining({
+          group_id: GROUP_ID,
+          user_id: 10004,
+          no_cache: true,
+        }),
+      }),
+    );
+    const trace = await f.app.trace.readPage(context.runId);
+    expect(trace.records.map((record) => record.event)).toContainEqual(
+      expect.objectContaining({
+        type: "provider_mutation_verification",
+        requestedOperation: "set_group_admin",
+        targetUserId: "10004",
+        expectedRole: "qq_group_admin",
+        observedRole: "qq_group_member",
+        verificationStatus: "mismatch",
+      }),
+    );
+  });
+
+  it("accepts set_group_admin only after a fresh provider read proves the new role", async () => {
+    let currentRole: "admin" | "member" = "member";
+    const { application, a, f } = await configuredGroup(
+      "member",
+      () => currentRole,
+      undefined,
+      (action) => {
+        const params = action.params as Record<string, unknown>;
+        if (action.action === "set_group_admin" && typeof params.enable === "boolean")
+          currentRole = params.enable ? "admin" : "member";
+      },
+    );
+    await application.setGroupCategory(a, {
+      groupId: GROUP,
+      category: "group.settings",
+      enabled: true,
+    });
+    const context = Object.assign(a, {
+      requiredToolName: "qq_group_settings",
+      requiredToolInput: {
+        groupId: GROUP,
+        operation: "set_group_admin",
+        params: { user_id: 10004, enable: true },
+      },
+    });
+    const settings = application
+      .createRuntimeTools(() => context)
+      .find((tool) => tool.name === "qq_group_settings");
+    if (!settings) throw new Error("missing qq_group_settings");
+
+    await expect(
+      settings.execute("call", {
+        groupId: GROUP,
+        operation: "set_group_admin",
+        params: { user_id: 10004, enable: true },
+      }),
+    ).resolves.toMatchObject({ details: { status: "ok" } });
+    context.requiredToolInput = {
+      groupId: GROUP,
+      operation: "set_group_admin",
+      params: { user_id: 10004, enable: false },
+    };
+    await expect(
+      settings.execute("call", {
+        groupId: GROUP,
+        operation: "set_group_admin",
+        params: { user_id: 10004, enable: false },
+      }),
+    ).resolves.toMatchObject({ details: { status: "ok" } });
+    const trace = await f.app.trace.readPage(context.runId);
+    expect(trace.records.map((record) => record.event)).toContainEqual(
+      expect.objectContaining({
+        type: "provider_mutation_verification",
+        expectedRole: "qq_group_admin",
+        observedRole: "qq_group_admin",
+        verificationStatus: "verified",
+      }),
+    );
+    expect(trace.records.map((record) => record.event)).toContainEqual(
+      expect.objectContaining({
+        type: "provider_mutation_verification",
+        expectedRole: "qq_group_member",
+        observedRole: "qq_group_member",
+        verificationStatus: "verified",
+      }),
+    );
+  });
+
+  it("uses each new message's role observation without promoting the Principal", async () => {
+    const { application, a, context, f } = await configuredGroup("admin");
+    await application.setGroupCategory(a, {
+      groupId: GROUP,
+      category: "group.moderate",
+      enabled: true,
+    });
+    expect(await application.resolveRunToolNames(context)).toContain("qq_group_moderation");
+
+    f.send(3, "next-run", false, 10002, GROUP_ID, "member");
+    const next = await f.started.take();
+    await f.reply("answer:next-run");
+    const nextContext: OwnerContext = {
+      caller: next.caller,
+      conversationId: next.conversation.id,
+      runId: next.run.id,
+    };
+    expect(nextContext.caller.principalId).toBe(context.caller.principalId);
+    expect(nextContext.caller.scope.nativeGroupRole?.role).toBe("qq_group_member");
+    expect(await application.resolveRunToolNames(nextContext)).not.toContain("qq_group_moderation");
+  });
+
+  it("scopes one Principal's QQ role independently in two managed groups", async () => {
+    const { application, a, f } = await configuredGroup();
+    for (const groupId of [GROUP, OTHER_GROUP]) {
+      await application.setGroupAccess(a, { groupId, enabled: true });
+      await application.setGroupCategory(a, {
+        groupId,
+        category: "group.moderate",
+        enabled: true,
+      });
+    }
+
+    f.send(3, "group-a", false, 10004, GROUP_ID, "admin");
+    const groupA = await f.started.take();
+    await f.reply("answer:group-a");
+    f.send(4, "group-b", false, 10004, OTHER_GROUP_ID, "member");
+    const groupB = await f.started.take();
+    await f.reply("answer:group-b");
+    const contextA: OwnerContext = {
+      caller: groupA.caller,
+      conversationId: groupA.conversation.id,
+      runId: groupA.run.id,
+    };
+    const contextB: OwnerContext = {
+      caller: groupB.caller,
+      conversationId: groupB.conversation.id,
+      runId: groupB.run.id,
+    };
+    expect(contextA.caller.principalId).toBe(contextB.caller.principalId);
+    expect(contextA.caller.scope.chatId).toBe(GROUP);
+    expect(contextB.caller.scope.chatId).toBe(OTHER_GROUP);
+    expect(await application.resolveRunToolNames(contextA)).toContain("qq_group_moderation");
+    expect(await application.resolveRunToolNames(contextB)).not.toContain("qq_group_moderation");
+  });
+
+  it("reports Bot authority loss as provider failure after caller authorization passes", async () => {
+    const { application, a, context, f } = await configuredGroup(
+      "admin",
+      () => "admin",
+      "set_group_whole_ban",
+    );
+    await application.setGroupCategory(a, {
+      groupId: GROUP,
+      category: "group.moderate",
+      enabled: true,
+    });
+    const runtimeContext = Object.assign(context, {
+      requiredToolName: "qq_group_moderation",
+      requiredToolInput: {
+        groupId: GROUP,
+        operation: "set_group_whole_ban",
+        params: { enable: true },
+      },
+    });
+    const moderation = application
+      .createRuntimeTools(() => runtimeContext)
+      .find((tool) => tool.name === "qq_group_moderation");
+    if (!moderation) throw new Error("missing qq_group_moderation");
+    const failure = await moderation
+      .execute("call", { operation: "set_group_whole_ban", params: { enable: true } })
+      .then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+    expect(failure).toBeInstanceOf(ProviderCallError);
+    expect((failure as ProviderCallError).outcome).toBe("provider_failed");
+    expect(f.actionLog.map((action) => action.action)).toEqual(
+      expect.arrayContaining(["get_group_member_info", "set_group_whole_ban"]),
+    );
+  });
+
   it("denies a group Run mutation even if the Tool is called directly", async () => {
     const { application, context } = await configuredGroup();
     const tools = application.createRuntimeTools(() => context);
@@ -1592,13 +2279,14 @@ describe("configured group Run capability authority", () => {
 
     // The mutating Tool is never part of the group Run's discovered surface...
     expect(await application.resolveRunToolNames(context)).not.toContain("qq_group_moderation");
-    // ...and calling it anyway is denied on the group Resource, not merely hidden.
+    // Calling it anyway still fails. The group has a scoped action grant so a future verified
+    // admin can use it, but current policy remains an independent gate and is disabled here.
     await expect(
       moderation.execute("call", {
         operation: "set_group_whole_ban",
         params: { enable: true },
       }),
-    ).rejects.toThrow("Permission denied: no_grant");
+    ).rejects.toThrow("capability_category_disabled");
   });
 
   it("hides and refuses group history on the next Run after the Owner disables it", async () => {
