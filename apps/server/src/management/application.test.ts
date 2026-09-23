@@ -879,6 +879,7 @@ const admin = (app: ManagementApplication) =>
       context: OwnerContext,
       input: { groupId: string; skillName: string; enabled: boolean },
     ): Promise<unknown>;
+    manageGroup(context: OwnerContext, input: { action: "get"; groupId: string }): Promise<unknown>;
     projectManagedGroups(context: OwnerContext): Promise<ManagedGroupProjection>;
     resolveRunToolNames(context: OwnerContext): Promise<string[]>;
     resolveRunToolCandidates(
@@ -984,6 +985,19 @@ describe("per-Owner managed group assignment", () => {
     expect(await groupIds(application, b)).toEqual([GROUP]);
   });
 
+  it("does not expose a group's stored settings after this Owner is unassigned", async () => {
+    const { application, a, b } = await owners();
+    await application.setGroupAccess(a, { groupId: GROUP, enabled: true });
+    await application.setGroupHistory(a, { groupId: GROUP, enabled: true });
+    await expect(application.manageGroup(b, { action: "get", groupId: GROUP })).rejects.toThrow(
+      "group_not_enabled",
+    );
+    await application.setGroupAccess(a, { groupId: GROUP, enabled: false });
+    await expect(application.manageGroup(a, { action: "get", groupId: GROUP })).rejects.toThrow(
+      "group_not_enabled",
+    );
+  });
+
   it("keeps a sibling Owner's assignment and the transport group when one Owner revokes", async () => {
     const { f, application, a, b } = await owners();
     await application.setGroupAccess(a, { groupId: GROUP, enabled: true });
@@ -1010,6 +1024,30 @@ describe("per-Owner managed group assignment", () => {
     expect(f.app.listChannels()[0]?.groupIds).not.toContain(GROUP);
     expect((await history(b)).decision).toBe("DENY");
     expect((await history(a)).decision).toBe("DENY");
+  });
+
+  it("does not revoke another connection's grant for the same group number", async () => {
+    const { f, application, a } = await owners();
+    await application.setGroupAccess(a, { groupId: GROUP, enabled: true });
+    const otherScope = { ...a.caller.scope, connectionId: "another-qq-connection" };
+    await f.app.store.authorization.grant({
+      principalId: a.caller.principalId,
+      resourceId: `group:${GROUP}`,
+      action: "group:read",
+      scope: otherScope,
+      effect: "allow",
+    });
+
+    await application.setGroupAccess(a, { groupId: GROUP, enabled: false });
+
+    expect(
+      await f.app.store.authorization.hasActiveGrant({
+        principalId: a.caller.principalId,
+        resourceId: `group:${GROUP}`,
+        action: "group:read",
+        scope: otherScope,
+      }),
+    ).toBe(true);
   });
 
   it("persists each Owner's assignment and the fixed policy across a restart", async () => {
@@ -1745,7 +1783,8 @@ describe("configured group Run capability authority", () => {
       expect.objectContaining({
         observedRole: "qq_group_admin",
         verifiedRole: "qq_group_member",
-        verificationStatus: "verified",
+        verificationStatus: "mismatch",
+        authorizationDecision: "DENY",
       }),
     );
   });

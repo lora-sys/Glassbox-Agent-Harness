@@ -388,7 +388,10 @@ async function executeProviderCall(
     // The group is named exactly once, at the top level. Accepting it here as well
     // would let a caller authorize one group and target another.
     if ("group_id" in supplied) throw new ToolInputError("invalid_capability_params");
-    providerParams = { ...supplied, group_id: Number(groupId) };
+    const providerGroupId = Number(groupId);
+    if (!Number.isSafeInteger(providerGroupId))
+      throw new ToolInputError("invalid_capability_group");
+    providerParams = { ...supplied, group_id: providerGroupId };
   }
 
   const action = params.operation;

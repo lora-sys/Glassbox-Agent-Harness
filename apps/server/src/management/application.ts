@@ -587,7 +587,9 @@ export class ManagementApplication {
             : ({ status: "failed", code: "not_connected" } as const);
           const verificationStatus =
             result.status === "ok"
-              ? "verified"
+              ? capability.nativeGroupRoles?.includes(result.role)
+                ? "verified"
+                : "mismatch"
               : result.status === "unknown"
                 ? "unknown"
                 : result.code === "not_connected"
@@ -610,7 +612,7 @@ export class ManagementApplication {
               verificationStatus,
               requestedTool: capability.tool,
               requestedOperation: operation,
-              authorizationDecision: "ALLOW",
+              authorizationDecision: verificationStatus === "verified" ? "ALLOW" : "DENY",
             },
             "glassbox-qq-role",
           );
@@ -1485,9 +1487,10 @@ export class ManagementApplication {
         // its group-scope grants. A sibling Owner's assignment keeps the group alive.
         lastAssignedOwner = (await this.assignedOwners(configured, input.groupId)).length === 0;
         if (lastAssignedOwner) {
-          await this.store.authorization.revokeResource(groupResource);
-          // Dynamic group members are not part of the static profile. Revoke the whole
-          // Channel location so no sender-specific Agent or Tool grant survives disable.
+          // The Resource name is shared across connections. Revoke this connection's
+          // location, not the whole Resource, or a second connection's grant is lost.
+          // Dynamic group members are not part of the static profile, so this also removes
+          // sender-specific Agent and Tool grants left by the disabled location.
           await this.store.authorization.revokeLocationScopes({
             connectionId: configured.config.connectionId,
             botId: configured.config.botId,
@@ -1760,6 +1763,7 @@ export class ManagementApplication {
     if (input.action === "set_capability") return this.setGroupCategory(context, input);
     if (input.action === "set_memory_source") return this.setGroupMemorySource(context, input);
     if (input.action === "set_history") return this.setGroupHistory(context, input);
+    await this.requireManagedGroup(context, input.groupId);
     const runtime = this.groupRuntime.get(
       caller.scope.connectionId,
       input.groupId,
@@ -1973,11 +1977,7 @@ export class ManagementApplication {
         principalId: context.caller.principalId,
         enabled: input.enabled,
       };
-      await this.store.capabilities.setCategory({ ...common, category: "group.history" });
-      const { version } = await this.store.capabilities.setMemorySource({
-        ...common,
-        sourceClass: "history",
-      });
+      const { version } = await this.store.capabilities.setHistory(common);
       await this.applyCategoryAuthority({
         context,
         groupId: input.groupId,

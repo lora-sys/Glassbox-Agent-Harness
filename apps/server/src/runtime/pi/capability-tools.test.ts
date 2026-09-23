@@ -517,6 +517,23 @@ it("binds a group Run to its own group and refuses a model-supplied one", async 
   }
 });
 
+it("refuses a group id that cannot be represented exactly in provider parameters", async () => {
+  const { store, accepted } = await fixture();
+  try {
+    const groupId = "9007199254740993";
+    await enableCategory(store, "group.members", groupId);
+    await grantGroupAction(store, "group:members:read", groupId);
+    const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
+    const members = toolByName(tools(store, accepted, calls), "qq_group_members");
+    await expect(call(members, { groupId, operation: "get_group_member_list" })).rejects.toThrow(
+      "invalid_capability_group",
+    );
+    expect(calls).toEqual([]);
+  } finally {
+    await store.close();
+  }
+});
+
 it("defaults to DENY without an explicit grant on the group Resource", async () => {
   const { store, accepted } = await fixture();
   try {

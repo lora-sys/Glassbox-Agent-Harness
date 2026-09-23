@@ -199,6 +199,19 @@ export class CapabilityPolicyStore {
     });
   }
 
+  /** Change both history gates in one policy transaction and one version step. */
+  async setHistory(input: {
+    connectionId: string;
+    groupId: string;
+    principalId: string;
+    enabled: boolean;
+  }): Promise<{ version: number }> {
+    return this.applyChange(input, (target) => {
+      target.categories = { ...target.categories, "group.history": input.enabled };
+      target.memorySources = { ...target.memorySources, history: input.enabled };
+    });
+  }
+
   private async applyChange(
     input: { connectionId: string; groupId: string; principalId: string },
     change: (policy: GroupCapabilityPolicy) => void,

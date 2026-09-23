@@ -319,9 +319,9 @@ export class AuthorizationService {
   /**
    * Revoke every active grant on one Resource, across principals and scopes.
    *
-   * Used when a protected source stops being a managed source (for example a QQ group
-   * is disabled). Every principal loses access on the next decision; no cached or
-   * long-lived grant survives.
+   * Use only when a Resource is retired in every scope. A QQ group number can be managed
+   * through more than one connection, so disabling one connection must instead revoke
+   * that connection's location scopes.
    */
   async revokeResource(resourceId: string): Promise<void> {
     requireIdentifier(resourceId);

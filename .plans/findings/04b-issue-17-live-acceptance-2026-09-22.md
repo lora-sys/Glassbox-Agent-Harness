@@ -135,6 +135,28 @@ Run and may explicitly retry. Focused tests cover provider-call deduplication, a
 mutation followed by a model retry, and a pre-mutation role denial followed by one permitted
 attempt.
 
+Live Run `51804c1d-1b2d-4455-9a73-b23e6ab1f0d0` exercised this correction after the fixed
+service started. The model called `qq_group_settings` twice for one exact Owner-private request.
+Only the first call produced `provider_mutation_verification`; its fresh read observed
+`qq_group_member` instead of the requested `qq_group_admin`. The second Tool call failed before a
+second provider mutation or verification. The Run ended `failed` and delivery reached `sent`.
+This proves the single-attempt gate on a real QQ path while keeping the provider's no-op result
+visible as failure. It does not prove successful admin promotion.
+
+## Final authorization review before live retry
+
+An independent source review found additional boundaries that deterministic happy paths did not
+cover. The current branch now refuses model-added top-level mutation fields not bound by the
+current message. Owner configuration reads require that Owner's active managed-group assignment.
+The provider bridge rejects a group number that JavaScript cannot represent exactly as an integer.
+Disabling the last assignment revokes grants only for that connection's location, leaving a
+different connection's grants for the same group number intact. Fresh native-role verification
+records `DENY` when the role mismatches or the provider cannot verify it. The history capability
+and memory-source policy now change in one database transaction and one policy-version step.
+
+These are code and deterministic-test results, not new real QQ acceptance. The remaining real
+steps below still apply.
+
 ## Repository verification
 
 After rebasing Issue 17 onto the latest PR 18 branch, the repository gate passed:

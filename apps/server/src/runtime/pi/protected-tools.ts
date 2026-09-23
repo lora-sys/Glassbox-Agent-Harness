@@ -119,9 +119,9 @@ function isTextualPrimitive(value: unknown): value is string | number | bigint {
  * The top level stays a subset check: it is the Tool's own envelope (which Tool, which
  * operation, which Resource), which a message never enumerates in full.
  *
- * This is the single comparison the Run-completion check and the mutating-Tool gate share. If
- * the two disagreed, a call could satisfy one and not the other: the Run would be retried
- * against a gate it cannot pass, or accepted while the Tool itself refuses.
+ * Run completion uses this comparison after a Tool reports success. Mutating Tools also
+ * reject additional top-level authority-bearing fields before execution, so a refused call
+ * cannot be counted as completed.
  */
 export function satisfiesRequiredInput(
   required: Readonly<Record<string, unknown>>,
@@ -139,6 +139,17 @@ export function satisfiesRequiredInput(
     if (!samePrimitive(actualValue, value)) return false;
   }
   return true;
+}
+
+/** Mutations may not add a target or switch that the current message did not bind. */
+function satisfiesRequiredMutationInput(
+  required: Readonly<Record<string, unknown>>,
+  actual: Readonly<Record<string, unknown>>,
+): boolean {
+  return (
+    satisfiesRequiredInput(required, actual) &&
+    Object.entries(actual).every(([key, value]) => value === undefined || key in required)
+  );
 }
 
 /**
@@ -174,7 +185,7 @@ export function requireMutationIntent(
 ): void {
   if (context.requiredToolName !== name) throw new ToolInputError("mutation_not_requested");
   const required = context.requiredToolInput;
-  if (!required || !satisfiesRequiredInput(required, actual))
+  if (!required || !satisfiesRequiredMutationInput(required, actual))
     throw new ToolInputError("mutation_not_requested");
 }
 
