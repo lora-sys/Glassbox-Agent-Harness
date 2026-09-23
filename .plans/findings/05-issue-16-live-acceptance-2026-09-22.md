@@ -237,3 +237,21 @@ successful end-to-end exact search above remains its separate evidence.
 For local startup, `docs/tech-stack.md` now uses `npm run agent:up/status/logs/down`. On Windows,
 `vp run agent:up` cleans up its detached service child after the Vite+ task exits. Isolated
 verification confirmed the npm commands leave the service running until `down` stops it.
+
+## CLI and managed service data-directory alignment, 2026-09-23
+
+The first direct CLI probe from the Issue 17 worktree returned `AUTH_REQUIRED` because the CLI
+looked under that worktree's `.glassbox`, while `agent:up` stores its management token under the
+user profile's `.glassbox`. The service launcher and CLI now share `getServiceDataDir()`. The
+existing application default remains worktree-local for a directly started development server.
+
+With both `GLASSBOX_DATA_DIR` and `PORT` unset, the CLI then probed both configured QQ groups:
+
+| Group | Observed at | Paths | Provider-backed successes | Failures / unavailable / unknown |
+| --- | --- | ---: | ---: | ---: |
+| `1126022432` | `2026-09-23T07:16:02.814Z` | 7 | 6 / 6 | 0 / 0 / 0 |
+| `1121579672` | `2026-09-23T07:22:18.126Z` | 7 | 6 / 6 | 0 / 0 / 0 |
+
+Each probe also succeeded on the local managed-group projection. `agent:status` confirmed the
+same Glassbox, NapCat and Herdr process IDs before and after the probes. These checks performed
+no QQ role change, moderation action, login or service restart.
