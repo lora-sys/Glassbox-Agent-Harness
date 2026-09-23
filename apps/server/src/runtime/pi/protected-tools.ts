@@ -2,6 +2,7 @@ import type { AgentToolResult, ToolDefinition } from "@earendil-works/pi-coding-
 import type { TSchema } from "typebox";
 import type { CallerContext } from "../../identity/scope.js";
 import type { AuthorizationService } from "../../auth/service.js";
+import { ProviderCallError } from "./provider-outcome.js";
 
 export interface ProtectedToolContext {
   caller: CallerContext;
@@ -246,6 +247,10 @@ export function createProtectedTool<
           throw new Error("Operation cancelled");
         }
         if (error instanceof ToolInputError) throw error;
+        // A provider refusal is a fact about the world, not a broken Tool. Collapsing it into
+        // the generic failure would erase the difference between "the bridge is down" and
+        // "the Tool threw", which is exactly what a Run has to be able to report.
+        if (error instanceof ProviderCallError) throw error;
         throw new Error("protected_tool_failed");
       }
     },

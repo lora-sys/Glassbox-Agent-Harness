@@ -47,7 +47,12 @@ describe("local service integration", () => {
 
   it("starts without a provider and protects both management and retained Workbench", async () => {
     expect(factory.calls).toBe(0);
-    for (const path of ["/manage/status", "/", "/trace/fixture"]) {
+    for (const path of [
+      "/manage/status",
+      "/manage/runs/fixture/tool-plane",
+      "/",
+      "/trace/fixture",
+    ]) {
       expect((await fetch(`${baseUrl}${path}`)).status).toBe(401);
     }
     const response = await fetch(`${baseUrl}/manage/status`, { headers: headers() });

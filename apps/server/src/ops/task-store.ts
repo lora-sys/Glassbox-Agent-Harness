@@ -36,6 +36,7 @@ export type TaskTraceEventType =
   | "authorization.checked"
   | "authorization.granted"
   | "authorization.revoked"
+  | "capability.probed"
   | "runtime.turn";
 
 export interface TaskTraceEvent {

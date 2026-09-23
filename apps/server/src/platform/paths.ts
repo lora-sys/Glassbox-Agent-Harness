@@ -50,6 +50,17 @@ export function getGlassboxDataDir(): string {
 }
 
 /**
+ * Directory used by the long-running local service manager and its CLI client.
+ * The service manager defaults to the user profile so service state survives worktree changes.
+ */
+export function getServiceDataDir(): string {
+  if (process.env.GLASSBOX_DATA_DIR) {
+    return path.resolve(process.env.GLASSBOX_DATA_DIR);
+  }
+  return path.join(os.homedir(), ".glassbox");
+}
+
+/**
  * Returns a portable default workspace path for the given provider.
  * Uses the OS temp directory instead of hardcoded POSIX /tmp or Linux paths.
  */

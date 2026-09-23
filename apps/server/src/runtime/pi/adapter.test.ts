@@ -3,8 +3,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vite-plus/test";
+import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import type { AgentRun, Conversation } from "@glassbox/contracts";
-import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import type {
+  AgentSessionEvent,
+  ModelRuntime,
+  ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import { glassboxSystemPrompt, PiSdkRuntimeAdapter } from "./adapter.js";
 
 it("does not treat a context-hidden tool as an unimplemented product capability", () => {
@@ -12,6 +18,9 @@ it("does not treat a context-hidden tool as an unimplemented product capability"
   expect(prompt).toContain("A tool missing from the current Run does not mean");
   expect(prompt).toContain("unavailable in the current context");
   expect(prompt).toContain("Never invent an unimplemented status");
+  expect(prompt).toContain("Follow the response shape and fields the user explicitly requested");
+  expect(prompt).toContain("do not narrate Tool names");
+  expect(prompt).toContain("do not add unrequested diagnostic sections");
 });
 import type { PiRunContext } from "./types.js";
 
@@ -20,6 +29,22 @@ const directories: string[] = [];
 afterEach(async () => {
   for (const directory of directories.splice(0))
     await rm(directory, { recursive: true, force: true });
+});
+
+it("fails initialization when the Kit adds a profile without a selection decision", async () => {
+  const kitPath = fileURLToPath(new URL("./fixtures/lora-pi-kit", import.meta.url));
+  const directory = await mkdtemp(join(tmpdir(), "glassbox-kit-profile-drift-"));
+  directories.push(directory);
+  const { cp, mkdir, writeFile } = await import("node:fs/promises");
+  await cp(kitPath, directory, { recursive: true });
+  await mkdir(join(directory, "profiles"), { recursive: true });
+  await writeFile(
+    join(directory, "profiles/brand-new.json"),
+    JSON.stringify({ name: "brand-new" }),
+  );
+
+  const adapter = new PiSdkRuntimeAdapter({ kitPath: directory });
+  await expect(adapter.initialize()).rejects.toThrow(/brand-new/u);
 });
 
 const conversation: Conversation = {
@@ -88,8 +113,11 @@ describe("PiSdkRuntimeAdapter", () => {
           toolCallId: "admin-1",
           toolName: "owner_group_admin",
           args: {
-            action: "get",
+            action: "set_capability",
             groupId: "1126022432",
+            category: "group.settings",
+            sourceClass: "history",
+            enabled: true,
             ignored: "must-not-enter-trace",
           },
         } as never);
@@ -165,7 +193,13 @@ describe("PiSdkRuntimeAdapter", () => {
     expect(skillPolicy).toEqual({ source: "group-profile", configVersion: 3 });
     expect(safeToolCall).toMatchObject({
       name: "owner_group_admin",
-      input: { action: "get", groupId: "1126022432" },
+      input: {
+        action: "set_capability",
+        groupId: "1126022432",
+        category: "group.settings",
+        sourceClass: "history",
+        enabled: true,
+      },
     });
     expect(JSON.stringify(safeToolCall)).not.toContain("must-not-enter-trace");
     expect(safeToolResult).toMatchObject({
@@ -182,6 +216,212 @@ describe("PiSdkRuntimeAdapter", () => {
       "turn_end",
       "session_end",
     ]);
+    await adapter.cleanup();
+  });
+
+  it("records the classified Tool surface as Run evidence so a Run can explain its own Tools", async () => {
+    const runtimeBaseDir = await mkdtemp(join(tmpdir(), "glassbox-pi-runtime-"));
+    directories.push(runtimeBaseDir);
+    let surface: unknown;
+    const fakeSession = {
+      sessionId: "pi-session-surface",
+      messages: [
+        { role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" },
+      ],
+      subscribe(callback: (event: AgentSessionEvent) => void) {
+        listener = callback;
+        return () => {
+          listener = undefined;
+        };
+      },
+      async prompt() {
+        listener?.({ type: "agent_start" });
+        listener?.({ type: "agent_end", messages: [], willRetry: false });
+      },
+      async abort() {},
+      dispose() {},
+    };
+    let listener: ((event: AgentSessionEvent) => void) | undefined;
+    let activeTools: unknown;
+
+    const adapter = new PiSdkRuntimeAdapter({
+      kitPath: fileURLToPath(new URL("./fixtures/lora-pi-kit", import.meta.url)),
+      runtimeBaseDir,
+      // The classified discovery path. `resolveToolNames` is deliberately absent, so a surface
+      // that only existed for fakes would leave this undefined and fail here.
+      resolveToolCandidates: async () => [
+        { name: "qq_group_history", exclusion: null },
+        { name: "group_history_search", exclusion: null },
+        { name: "owner_group_admin", exclusion: "scope_not_permitted" },
+        { name: "read", exclusion: "disabled_by_host" },
+      ],
+      resolveSkillNames: async () => ({ names: [] }),
+      onEvent: (event) => {
+        if (event.type === "session_start") surface = event.data.toolSurface;
+      },
+      createSession: async ({ profile }) => {
+        expect(profile.activeTools).toEqual([]);
+        activeTools = profile.activeTools;
+        return fakeSession as never;
+      },
+    });
+
+    await adapter.initialize();
+    const context: PiRunContext = {
+      runId: run.id,
+      conversationId: conversation.id,
+      caller: {
+        principalId: "owner",
+        scope: {
+          connectionId: "qq",
+          botId: "bot",
+          chatType: "private" as const,
+          chatId: "owner",
+          senderId: "owner",
+        },
+      },
+    };
+    const binding = await adapter.createOrRestoreSession(conversation, "test", context);
+    await adapter.run(binding, run, "say hello", context);
+
+    expect(activeTools).toEqual([]);
+    expect(context.authorizedToolNames).toEqual(["qq_group_history", "group_history_search"]);
+    expect(surface).toMatchObject({
+      profileName: "test",
+      profileTools: [],
+      selected: [
+        // The provider's own answer about a group's history.
+        {
+          name: "qq_group_history",
+          origin: "glassbox_domain",
+          grounding: "direct_observation",
+        },
+        // Glassbox's own search over that history. Same subject, different evidence class:
+        // this one supports a claim about what the search covered, not about the group.
+        {
+          name: "group_history_search",
+          origin: "glassbox_domain",
+          grounding: "derived_retrieval",
+        },
+      ],
+      excluded: [
+        { name: "owner_group_admin", reason: "scope_not_permitted" },
+        { name: "read", reason: "disabled_by_host" },
+      ],
+      disabledByHost: [],
+    });
+    // The profile digest is real, so the recorded surface can be read against the exact
+    // profile declaration it ran under rather than against whatever the Kit holds today.
+    const version = (surface as { profileVersion: string }).profileVersion;
+    expect(version).toMatch(/^[a-f0-9]{64}$/u);
+    await adapter.cleanup();
+  });
+
+  it("sends exactly the selected Effective Tool Surface schemas to the Pi model context", async () => {
+    const runtimeBaseDir = await mkdtemp(join(tmpdir(), "glassbox-pi-runtime-provider-context-"));
+    directories.push(runtimeBaseDir);
+    let capturedContext: { tools?: readonly { name: string }[] } | undefined;
+    let surface:
+      | {
+          selected: readonly { name: string }[];
+          excluded: readonly { name: string; reason: string }[];
+        }
+      | undefined;
+
+    const model = {
+      id: "fixture-model",
+      name: "Fixture model",
+      api: "openai-completions",
+      provider: "fixture-provider",
+      baseUrl: "http://fixture.invalid",
+      reasoning: false,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 8_192,
+      maxTokens: 256,
+    } as never;
+
+    const modelRuntime = {
+      hasConfiguredAuth: () => true,
+      checkAuth: async () => undefined,
+      isUsingOAuth: () => false,
+      streamSimple: (_model: unknown, context: { tools?: readonly { name: string }[] }) => {
+        capturedContext = context;
+        const stream = createAssistantMessageEventStream();
+        const message = {
+          role: "assistant",
+          content: [{ type: "text", text: "fixture response" }],
+          api: "openai-completions",
+          provider: "fixture-provider",
+          model: "fixture-model",
+          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 },
+          stopReason: "stop",
+          timestamp: Date.now(),
+        } as never;
+        queueMicrotask(() => {
+          stream.push({ type: "start", partial: message });
+          stream.push({ type: "done", reason: "stop", message });
+        });
+        return stream;
+      },
+    } as unknown as ModelRuntime;
+
+    const tool = (name: string): ToolDefinition => ({
+      name,
+      label: name,
+      description: `Fixture ${name}`,
+      parameters: Type.Object({}),
+      execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
+    });
+
+    const adapter = new PiSdkRuntimeAdapter({
+      kitPath: fileURLToPath(new URL("./fixtures/lora-pi-kit", import.meta.url)),
+      runtimeBaseDir,
+      model,
+      modelRuntime,
+      customTools: [tool("qq_group_history"), tool("owner_group_admin"), tool("read")],
+      resolveToolCandidates: async () => [
+        { name: "qq_group_history", exclusion: null },
+        { name: "owner_group_admin", exclusion: "scope_not_permitted" },
+        { name: "read", exclusion: "disabled_by_host" },
+      ],
+      resolveSkillNames: async () => ({ names: [] }),
+      onEvent: (event) => {
+        if (event.type === "session_start") surface = event.data.toolSurface as typeof surface;
+      },
+    });
+
+    await adapter.initialize();
+    const context: PiRunContext = {
+      runId: run.id,
+      conversationId: conversation.id,
+      caller: {
+        principalId: "owner",
+        scope: {
+          connectionId: "qq",
+          botId: "bot",
+          chatType: "private" as const,
+          chatId: "owner",
+          senderId: "owner",
+        },
+      },
+    };
+    const binding = await adapter.createOrRestoreSession(conversation, "test", context);
+    await adapter.run(binding, run, "say hello", context);
+
+    expect(surface).toBeDefined();
+    expect(capturedContext?.tools?.map((entry) => entry.name)).toEqual(
+      surface?.selected.map((entry) => entry.name),
+    );
+    expect(capturedContext?.tools?.map((entry) => entry.name)).not.toContain("owner_group_admin");
+    expect(capturedContext?.tools?.map((entry) => entry.name)).not.toContain("read");
+    expect(surface?.excluded).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "owner_group_admin", reason: "scope_not_permitted" }),
+        expect.objectContaining({ name: "read", reason: "disabled_by_host" }),
+      ]),
+    );
+
     await adapter.cleanup();
   });
 
@@ -516,5 +756,145 @@ describe("PiSdkRuntimeAdapter", () => {
     expect(sessionStartEvents[1]?.modelVisibleSkills).toEqual(["unslop"]);
 
     await adapter.cleanup();
+  });
+});
+
+describe("PiSdkRuntimeAdapter provider outcomes", () => {
+  /**
+   * A Run whose session emits the tool calls it is given, so the recorded Run result is the
+   * only thing under test.
+   */
+  async function runWithCalls(
+    calls: Array<{
+      toolCallId: string;
+      toolName: string;
+      args: Record<string, unknown>;
+      result: unknown;
+      isError: boolean;
+    }>,
+  ) {
+    const runtimeBaseDir = await mkdtemp(join(tmpdir(), "glassbox-pi-runtime-"));
+    directories.push(runtimeBaseDir);
+    // The adapter reads calls from its own event stream, so the fake session subscribes the
+    // listener the adapter installs and replays the calls through it.
+    const adapter = new PiSdkRuntimeAdapter({
+      kitPath: fileURLToPath(new URL("./fixtures/lora-pi-kit", import.meta.url)),
+      runtimeBaseDir,
+      resolveToolNames: async () => [...new Set(calls.map((call) => call.toolName))],
+      resolveSkillNames: async () => ({ names: [] }),
+      createSession: async () =>
+        ({
+          sessionId: "pi-session-outcomes",
+          messages: [
+            { role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" },
+          ],
+          subscribe(callback: (event: AgentSessionEvent) => void) {
+            for (const call of calls)
+              callback({
+                type: "tool_execution_start",
+                toolCallId: call.toolCallId,
+                toolName: call.toolName,
+                args: call.args,
+              } as never);
+            for (const call of calls)
+              callback({
+                type: "tool_execution_end",
+                toolCallId: call.toolCallId,
+                toolName: call.toolName,
+                result: call.result,
+                isError: call.isError,
+              } as never);
+            return () => {};
+          },
+          async prompt() {},
+          async abort() {},
+          dispose() {},
+        }) as never,
+    });
+
+    await adapter.initialize();
+    const context: PiRunContext = { runId: run.id, conversationId: conversation.id };
+    const binding = await adapter.createOrRestoreSession(conversation, "test", context);
+    const result = await adapter.run(binding, run, "hello", context);
+    await adapter.cleanup();
+    return result;
+  }
+
+  it("records a successful call with its id and outcome", async () => {
+    const result = await runWithCalls([
+      {
+        toolCallId: "call-1",
+        toolName: "qq_group_members",
+        args: { operation: "get_group_member_list" },
+        result: { content: [{ type: "text", text: '{"members":[]}' }] },
+        isError: false,
+      },
+    ]);
+    expect(result.toolCalls).toEqual([
+      {
+        name: "qq_group_members",
+        input: { operation: "get_group_member_list" },
+        toolCallId: "call-1",
+        result: { content: [{ type: "text", text: '{"members":[]}' }] },
+        failed: false,
+        outcome: "success",
+      },
+    ]);
+  });
+
+  it("records a provider failure as the failure it is, not as a broken Tool", async () => {
+    // The bridge being down is a fact about the world. Collapsing it into the generic failure
+    // would erase the distinction a Run has to report.
+    const result = await runWithCalls([
+      {
+        toolCallId: "call-1",
+        toolName: "qq_group_members",
+        args: { operation: "get_group_member_list" },
+        result: { content: [{ type: "text", text: "provider_unavailable" }] },
+        isError: true,
+      },
+    ]);
+    expect(result.toolCalls[0]).toMatchObject({
+      failed: true,
+      outcome: "provider_unavailable",
+    });
+  });
+
+  it("classifies a provider refusal as denied", async () => {
+    const result = await runWithCalls([
+      {
+        toolCallId: "call-1",
+        toolName: "qq_groups",
+        args: { operation: "get_group_info" },
+        result: { content: [{ type: "text", text: "provider_denied" }] },
+        isError: true,
+      },
+    ]);
+    expect(result.toolCalls[0]).toMatchObject({ failed: true, outcome: "denied" });
+  });
+
+  it("attaches each result to the call that produced it", async () => {
+    // One Run may call the same Tool twice, and a result credited to the wrong call would
+    // count as evidence for a call that never produced it.
+    const result = await runWithCalls([
+      {
+        toolCallId: "call-1",
+        toolName: "qq_group_members",
+        args: { operation: "get_group_member_list", params: { group_id: "1" } },
+        result: { content: [{ type: "text", text: "provider_failed" }] },
+        isError: true,
+      },
+      {
+        toolCallId: "call-2",
+        toolName: "qq_group_members",
+        args: { operation: "get_group_member_list", params: { group_id: "2" } },
+        result: { content: [{ type: "text", text: "[]" }] },
+        isError: false,
+      },
+    ]);
+    expect(result.toolCalls).toMatchObject([
+      { toolCallId: "call-1", failed: true, outcome: "provider_failed" },
+      { toolCallId: "call-2", failed: false, outcome: "success" },
+    ]);
   });
 });

@@ -118,6 +118,13 @@ through the current OneBot connection.
 
 Group history remains a protected source and is authorized before retrieval.
 
+The pinned `GetGroupMsgHistory` action treats `message_seq` as an opaque short message id.
+It resolves that id through `MessageUnique` before calling QQ. Response `message_seq` values
+are short ids too, so they are not chronological counters. To walk older pages, select the
+chronologically oldest response record by `time`, pass its `message_id` back as `message_seq`,
+and set `reverse_order=true`. Without the reverse flag, NapCat reads forward and can repeat the
+same page. Glassbox keeps the cursor opaque and stops if the provider still cannot advance.
+
 ## Action names verified against the pin
 
 Names Glassbox allowlists that differ from the naive guess:

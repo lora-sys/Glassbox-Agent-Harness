@@ -54,14 +54,20 @@ import {
 import {
   availableHistoryToolNames,
   createHistoryTools,
+  historyToolEligibility,
+  type HistorySyncOutcome,
   OWNER_HISTORY_ACTION,
   OWNER_HISTORY_RESOURCE,
 } from "../runtime/pi/history-tools.js";
 import {
   availableCapabilityToolNames,
+  capabilityResourceId,
+  capabilityToolEligibility,
   createCapabilityTools,
   GROUP_RUN_CAPABILITY_CATEGORIES,
 } from "../runtime/pi/capability-tools.js";
+import { resolveSkillVisibility } from "../runtime/pi/skill-visibility.js";
+import { requireProviderSuccess } from "../runtime/pi/provider-outcome.js";
 import type { PiRunContext } from "../runtime/pi/types.js";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import {
@@ -80,6 +86,11 @@ import {
   matchCapabilityEntries,
   type CapabilitySearchEntry,
 } from "../channels/onebot/capability-search.js";
+import {
+  probeReadCapabilities,
+  type CapabilityProbeObservation,
+  type CapabilityProbeReport,
+} from "../channels/onebot/capability-probe.js";
 import { ChannelArchiveStore } from "../retrieval/channel-archive.js";
 import { groupResourceId, resolveAssignedGroupIds } from "../retrieval/source-resolver.js";
 import { AuthorizedOpsService, type WorkerPolicy } from "../ops/service.js";
@@ -93,14 +104,30 @@ import {
   type CallerContext,
 } from "../persistence/index.js";
 import { RunTraceStore } from "../trace/run-store.js";
+import type { TraceEntry } from "../trace/store.js";
 import { createRunEvaluator, RunEvalError } from "../eval/index.js";
 import { ManagementError } from "./access.js";
 import { readManagementJson } from "./http.js";
+import {
+  projectToolPlaneDiagnostics,
+  TOOL_PLANE_DIAGNOSTIC_RECORD_CAP,
+} from "./tool-plane-diagnostics.js";
 import { grantOpsPermissions } from "./ops-grants.js";
 import { createQqDeliveryPolicy, hostDeliveryForbiddenValues } from "../delivery/content-policy.js";
+import {
+  TOOL_DESCRIPTORS,
+  type ToolDescriptor,
+  type ToolSurfaceCandidate,
+  type ToolExclusionReason,
+} from "../runtime/pi/tool-plane.js";
 
 const OWNER_ID = "owner";
 const AGENT_ID = "personal";
+type AuthorizationContext = {
+  caller: CallerContext;
+  conversationId?: string;
+  runId?: string;
+};
 const ACTIONS = [
   "run:create",
   "run:control",
@@ -379,42 +406,39 @@ export class ManagementApplication {
       createTools: (getContext) => this.createRuntimeTools(getContext),
       resolveSkillNames: async (context, profile) => {
         if (!context.caller)
-          return { names: [], modelVisibleNames: [], policy: { source: "no-caller" } };
-        const isOwner = await this.store.identities.isOwner(context.caller.principalId);
-        if (context.caller.scope.chatType === "group") {
-          if (isOwner) {
-            return {
-              names: profile.enabledSkills,
-              modelVisibleNames: [],
-              policy: { source: "owner-profile", profile: profile.name },
-            };
-          }
-          const configured = this.groupRuntime.get(
-            context.caller.scope.connectionId,
-            context.caller.scope.chatId,
-            this.kitLoader.loadProfile("qq-group").enabledSkills,
-          );
-          const available = new Set(this.kitLoader.availableSkills().map((skill) => skill.name));
-          const filtered = configured.enabledSkills.filter((name) => available.has(name));
-          return {
-            names: filtered,
-            modelVisibleNames: filtered,
-            policy: {
-              source: "group-whitelist",
-              groupId: configured.groupId,
-              configVersion: configured.version,
-            },
-          };
-        }
-        return {
-          names: profile.enabledSkills,
-          modelVisibleNames: profile.name === "main-agent" ? [] : profile.enabledSkills,
-          policy: isOwner
-            ? { source: "owner-profile", profile: profile.name }
-            : { source: "kit-profile" },
-        };
+          return resolveSkillVisibility({
+            caller: null,
+            isOwner: false,
+            profile,
+            group: null,
+            availableSkills: [],
+          });
+        const caller = context.caller;
+        const isOwner = await this.store.identities.isOwner(caller.principalId);
+        const group =
+          caller.scope.chatType === "group" && !isOwner
+            ? this.groupRuntime.get(
+                caller.scope.connectionId,
+                caller.scope.chatId,
+                this.kitLoader.loadProfile("qq-group").enabledSkills,
+              )
+            : null;
+        return resolveSkillVisibility({
+          caller,
+          isOwner,
+          profile,
+          group: group
+            ? {
+                groupId: group.groupId,
+                configVersion: group.version,
+                enabledSkills: group.enabledSkills,
+              }
+            : null,
+          availableSkills: this.kitLoader.availableSkills().map((skill) => skill.name),
+        });
       },
       resolveToolNames: (context) => this.resolveRunToolNames(context),
+      resolveToolCandidates: (context) => this.resolveRunToolCandidates(context),
       onEvent: async (event) => {
         const runId =
           event.runId ?? (typeof event.data.runId === "string" ? event.data.runId : undefined);
@@ -431,6 +455,11 @@ export class ManagementApplication {
           input.caller.scope.chatType,
           await this.store.identities.isOwner(input.caller.principalId),
         ),
+      onEvidence: async (record) => {
+        const caller = await this.store.lifecycle.traceCaller(record.runId, record.principalId);
+        const cursor = await this.trace.append(record.runId, record, "glassbox-tool-evidence");
+        await this.store.evidence.advanceTrace(caller, cursor);
+      },
     });
     this.piAdapters.set(profileId, adapter);
     return adapter;
@@ -474,9 +503,8 @@ export class ManagementApplication {
         archive: this.archive,
         getContext,
         isHistoryEnabled: (connectionId, groupId) => this.isHistoryEnabled(connectionId, groupId),
-        syncGroup: async (groupId, context) => {
-          await this.syncGroupHistory(context.caller.scope.connectionId, groupId);
-        },
+        syncGroup: (groupId, context) =>
+          this.syncGroupHistory(context.caller.scope.connectionId, groupId),
         botIdForConnection: (connectionId) => this.channels.resolve(connectionId).config.botId,
         // Safe retrieval evidence: Run, Resource, source kind and id, mode, score, rank and
         // matched terms — never a snippet or protected message text.
@@ -494,7 +522,7 @@ export class ManagementApplication {
         invoke: async ({ action, params, context }) => {
           const connection = this.connections.get(context.caller.scope.connectionId);
           if (!connection) throw new Error("channel_not_connected");
-          return connection.invokeCapability({ action, params });
+          return requireProviderSuccess(await connection.invokeCapability({ action, params }));
         },
         search: (input) => this.searchCapabilities(input.context, input),
         projectManagedGroups: (context) => this.projectManagedGroups(context),
@@ -527,15 +555,36 @@ export class ManagementApplication {
   }
 
   /**
-   * The Tool names one Run may discover, after each name's discovery grant is checked.
+   * Every registered Tool, classified for this Run's scope, policy and grants.
+   *
+   * This is the one implementation of Tool discovery; `resolveRunToolNames` is its
+   * projection. Splitting them would let the names a Run may call and the surface a Run
+   * records disagree, which is the drift Issue #16 exists to remove.
+   *
+   * The classification runs over the whole registered universe so an exclusion is always
+   * explainable, but the `tool:discover` authorization check is issued only for names that
+   * survive the scope and policy gates. Checking Tools a scope was never eligible for would
+   * add authorization evidence for operations that were never on the table.
    *
    * The capability surface follows current policy, never a cached bundle: a group Run sees
    * only what its own group's policy enables, and an Owner-private Run sees the union over
    * the groups the current Principal is assigned to. Discovery is granted as a superset, so
    * a policy change applies on the very next Run with no re-grant.
+   *
+   * `registered` is the universe to classify. It defaults to the real registry and is a
+   * parameter so a test can classify a registry that contains a Tool no rule knows — which is
+   * the wiring bug the `unclassified` guard exists for, and which no Run over the real table
+   * can reproduce while every real Tool happens to be wired.
    */
-  private async resolveRunToolNames(context: PiRunContext): Promise<string[]> {
-    if (!context.caller || !context.conversationId || !context.runId) return [];
+  async resolveRunToolCandidates(
+    context: PiRunContext,
+    registered: readonly ToolDescriptor[] = TOOL_DESCRIPTORS,
+  ): Promise<ToolSurfaceCandidate[]> {
+    if (!context.caller || !context.conversationId || !context.runId)
+      return registered.map((descriptor) => ({
+        name: descriptor.name,
+        exclusion: "no_caller_context" as const,
+      }));
     const isOwner = await this.store.identities.isOwner(context.caller.principalId);
     const scope = context.caller.scope;
     const capabilityCategories =
@@ -546,38 +595,91 @@ export class ManagementApplication {
         : isOwner
           ? await this.assignedCategories(context.caller)
           : [];
-    const candidates = [
-      ...(context.authorizedSkillNames?.length ? [SKILL_READ_TOOL] : []),
-      ...(isOwner && scope.chatType === "private"
-        ? [
-            ...(this.options.ops ? OPS_TOOL_NAMES : []),
-            OWNER_GROUP_ADMIN_TOOL,
-            OWNER_MEMORY_ADMIN_TOOL,
-          ]
-        : []),
-      ...availableHistoryToolNames({
+
+    // Eligibility is *absence of an exclusion*, so a bare `scopeGates.get(name) ?? reason`
+    // cannot tell "this rule found it eligible" from "no rule ever looked at it" — both are
+    // a missing key. `classified` records the first, so the second is detectable and fails
+    // closed. Without it the `unclassified` reason below is unreachable, and a Tool wired
+    // into the registry but into no rule would be offered to every scope that holds a
+    // discovery grant.
+    const classified = new Set<string>();
+    const scopeGates = new Map<string, ToolExclusionReason>();
+    const classify = (
+      entries: readonly { name: string; exclusion: ToolExclusionReason | null }[],
+    ) => {
+      for (const entry of entries) {
+        classified.add(entry.name);
+        if (entry.exclusion !== null) scopeGates.set(entry.name, entry.exclusion);
+      }
+    };
+    classify(
+      historyToolEligibility({
         isOwner,
         chatType: scope.chatType,
         enabledCategories: capabilityCategories,
       }),
-      ...availableCapabilityToolNames({
+    );
+    classify(
+      capabilityToolEligibility({
         isOwner,
         chatType: scope.chatType,
         enabledCategories: capabilityCategories,
       }),
-    ];
-    const selected: string[] = [];
-    for (const name of candidates) {
+    );
+
+    // The Agent Ops and Owner-control surface is Owner-private. A group Run reaches neither,
+    // however the Owner's own grants look, so this is a scope boundary rather than a policy.
+    const ownerPrivate = isOwner && scope.chatType === "private";
+    for (const name of OPS_TOOL_NAMES) {
+      classified.add(name);
+      if (!(ownerPrivate && this.options.ops)) scopeGates.set(name, "scope_not_permitted");
+    }
+    classified.add(OWNER_GROUP_ADMIN_TOOL);
+    if (!ownerPrivate) scopeGates.set(OWNER_GROUP_ADMIN_TOOL, "scope_not_permitted");
+    classified.add(OWNER_MEMORY_ADMIN_TOOL);
+    if (!ownerPrivate) scopeGates.set(OWNER_MEMORY_ADMIN_TOOL, "scope_not_permitted");
+    classified.add(SKILL_READ_TOOL);
+    if (!context.authorizedSkillNames?.length) scopeGates.set(SKILL_READ_TOOL, "policy_disabled");
+
+    const candidates: ToolSurfaceCandidate[] = [];
+    for (const descriptor of registered) {
+      if (descriptor.origin === "pi_builtin") {
+        // A Pi built-in is classified by its origin, and excluded on the same evidence the
+        // real session uses: the host never offers it to a Glassbox Run.
+        classified.add(descriptor.name);
+        candidates.push({ name: descriptor.name, exclusion: "disabled_by_host" });
+        continue;
+      }
+      // A registered Tool no rule classified is a wiring bug. Withholding it keeps it out of
+      // the model's surface and makes the gap visible instead of silently offering it.
+      if (!classified.has(descriptor.name)) {
+        candidates.push({ name: descriptor.name, exclusion: "unclassified" });
+        continue;
+      }
+      const gate = scopeGates.get(descriptor.name);
+      if (gate !== undefined) {
+        candidates.push({ name: descriptor.name, exclusion: gate });
+        continue;
+      }
       const decision = await this.store.authorization.check({
         caller: context.caller,
-        resourceId: toolResourceId(name),
+        resourceId: toolResourceId(descriptor.name),
         action: TOOL_DISCOVERY_ACTION,
         conversationId: context.conversationId,
         runId: context.runId,
       });
-      if (decision.decision === "ALLOW") selected.push(name);
+      candidates.push({
+        name: descriptor.name,
+        exclusion: decision.decision === "ALLOW" ? null : "discovery_denied",
+      });
     }
-    return selected;
+    return candidates;
+  }
+
+  async resolveRunToolNames(context: PiRunContext): Promise<string[]> {
+    return (await this.resolveRunToolCandidates(context))
+      .filter((candidate) => candidate.exclusion === null)
+      .map((candidate) => candidate.name);
   }
 
   private execution(reference: string): RunExecutionAdapter | undefined {
@@ -1453,20 +1555,32 @@ export class ManagementApplication {
     connectionId: string,
     groupId: string,
     options: { maxPages?: number; since?: string; until?: string } = {},
-  ): Promise<void> {
+  ): Promise<HistorySyncOutcome> {
     const connection = this.connections.get(connectionId);
-    if (!connection) return;
+    if (!connection) return { pagesWalked: 0, stop: "provider_unavailable" };
     const maxPages = Math.max(1, Math.min(options.maxPages ?? HISTORY_SYNC_MAX_PAGES, 20));
     const seen = new Set<string>();
     let cursor: string | undefined;
+    let pagesWalked = 0;
     for (let page = 0; page < maxPages; page += 1) {
       const result = await connection.getGroupHistory({
         groupId,
         cursor,
         count: HISTORY_SYNC_PAGE_SIZE,
       });
-      if (result.status !== "ok") break;
+      if (result.status !== "ok")
+        return {
+          pagesWalked,
+          stop:
+            result.status === "unknown"
+              ? "provider_unknown"
+              : result.code === "not_connected"
+                ? "provider_unavailable"
+                : "provider_failed",
+        };
+      pagesWalked += 1;
       let reachedBound = false;
+      let newMessages = 0;
       for (const message of result.messages) {
         if (options.since && message.occurredAt < options.since) {
           reachedBound = true;
@@ -1475,6 +1589,7 @@ export class ManagementApplication {
         if (options.until && message.occurredAt > options.until) continue;
         if (seen.has(message.messageId)) continue;
         seen.add(message.messageId);
+        newMessages += 1;
         await this.archive.ingest({
           channel: "qq-onebot",
           connectionId,
@@ -1488,10 +1603,23 @@ export class ManagementApplication {
         });
       }
       const next = result.nextCursor;
-      if (next === undefined || next === cursor) break;
+      if (next === undefined)
+        return {
+          pagesWalked,
+          stop: result.messages.length === 0 ? "end_of_source" : "provider_unknown",
+        };
+      if (next === cursor)
+        return {
+          pagesWalked,
+          // NapCat's reverse history page includes the cursor record itself. A one-record
+          // page containing only the already-seen cursor is its end-of-source signal. A
+          // larger repeated page is still a stalled provider and must remain partial.
+          stop: newMessages === 0 && result.messages.length <= 1 ? "end_of_source" : "cursor_stuck",
+        };
       cursor = next;
-      if (reachedBound) break;
+      if (reachedBound) return { pagesWalked, stop: "since_bound_reached" };
     }
+    return { pagesWalked, stop: "page_bound_reached" };
   }
 
   private async manageGroup(
@@ -1756,7 +1884,7 @@ export class ManagementApplication {
    * reverse-state question ("does anyone still hold this assignment") and bypasses identity
    * and visibility evaluation, so a grant it finds is not an authorization decision.
    */
-  private async managedGroupFacts(context: ProtectedToolContext): Promise<ManagedGroupFacts[]> {
+  private async managedGroupFacts(context: AuthorizationContext): Promise<ManagedGroupFacts[]> {
     const caller = context.caller;
     const connectionId = caller.scope.connectionId;
     const groupIds = await resolveAssignedGroupIds(this.store, caller);
@@ -1855,7 +1983,7 @@ export class ManagementApplication {
    * group is ALLOW, so a protected group fact is re-authorized before any provider call and a
    * denied group never causes one.
    */
-  private async projectManagedGroups(context: ProtectedToolContext): Promise<unknown> {
+  private async projectManagedGroups(context: AuthorizationContext): Promise<unknown> {
     const connection = this.connections.get(context.caller.scope.connectionId);
     const facts = await this.managedGroupFacts(context);
     const groups = [];
@@ -1884,6 +2012,50 @@ export class ManagementApplication {
       });
     }
     return { connectionId: context.caller.scope.connectionId, groups };
+  }
+
+  async probeCapabilities(channelId: string, groupId: string): Promise<CapabilityProbeReport> {
+    const configured = this.channels.resolve(channelId);
+    if (!configured.config.groupIds.includes(groupId))
+      throw new ManagementError("INVALID_REQUEST", "The group is not configured for this channel");
+    const connection = this.connections.get(channelId);
+    if (!connection) throw new ManagementError("NOT_FOUND", "The channel is not connected", 404);
+
+    const owner = this.ownerPrivateScopes(configured)[0];
+    if (!owner) throw new ManagementError("INVALID_REQUEST", "The channel has no owner");
+    const context: AuthorizationContext = {
+      caller: { principalId: owner.principalId, scope: owner.scope },
+    };
+
+    return probeReadCapabilities({
+      groupId,
+      decide: async (path, target) => {
+        const decision = await this.store.authorization.check({
+          caller: context.caller,
+          resourceId: capabilityResourceId({
+            resource: path.resource,
+            scope: context.caller.scope,
+            groupId: target ?? undefined,
+            listing: path.listing,
+          }),
+          action: path.action,
+        });
+        if (decision.decision !== "ALLOW") return "denied";
+        if (path.listing) return "allowed";
+        return (await this.isCategoryEnabled(channelId, groupId, path.category))
+          ? "allowed"
+          : "denied";
+      },
+      invoke: (input) => connection.invokeCapability(input),
+      projectManagedGroups: () => this.projectManagedGroups(context),
+      record: async (observation: CapabilityProbeObservation) => {
+        await this.store.tasks.recordTrace({
+          type: "capability.probed",
+          principalId: owner.principalId,
+          data: { connectionId: channelId, ...observation },
+        });
+      },
+    });
   }
 
   /**
@@ -2105,6 +2277,15 @@ export class ManagementApplication {
               ? await this.connectChannel(channelAction[1]!)
               : await this.disconnectChannel(channelAction[1]!),
         });
+      if (request.method === "POST" && path === "/manage/capabilities/probe") {
+        const input = await readManagementJson(request);
+        const value = (input ?? {}) as Record<string, unknown>;
+        if (typeof value.channelId !== "string" || typeof value.groupId !== "string")
+          throw new ManagementError("INVALID_REQUEST", "A channel and a group are required");
+        return ok({
+          probe: await this.probeCapabilities(value.channelId, value.groupId),
+        });
+      }
       if (request.method === "GET" && path === "/manage/conversations")
         return ok(await this.store.management.listConversations(OWNER_ID, options));
       if (request.method === "GET" && path === "/manage/runs") {
@@ -2119,7 +2300,9 @@ export class ManagementApplication {
         );
       }
       const runAction =
-        /^\/manage\/runs\/([A-Za-z0-9-]+)(?:\/(cancel|trace|deliveries|evals))?$/u.exec(path);
+        /^\/manage\/runs\/([A-Za-z0-9-]+)(?:\/(cancel|trace|tool-plane|deliveries|evals))?$/u.exec(
+          path,
+        );
       if (runAction) {
         const runId = runAction[1]!;
         const caller = await this.runCaller(runId);
@@ -2150,6 +2333,35 @@ export class ManagementApplication {
           // Recheck after file I/O before returning a protected projection.
           await this.store.conversations.getRun(caller, runId);
           return ok({ records, nextCursor, indexed });
+        }
+        if (request.method === "GET" && runAction[2] === "tool-plane") {
+          const indexed = await this.store.evidence.getTrace(caller, runId);
+          const records: TraceEntry<unknown>[] = [];
+          let cursor: string | undefined;
+          let nextCursor: string | null = null;
+          if (indexed) {
+            do {
+              const page = await this.trace.readPage(runId, {
+                ...(cursor ? { cursor } : {}),
+                limit: 50,
+                redactSecrets: true,
+              });
+              records.push(...page.records);
+              nextCursor = page.nextCursor;
+              cursor = page.nextCursor ?? undefined;
+            } while (nextCursor && records.length < TOOL_PLANE_DIAGNOSTIC_RECORD_CAP);
+          }
+          // The projection contains metadata only. Recheck after file I/O so a revoked or
+          // otherwise unavailable Owner Run never receives a stale trace view.
+          await this.store.conversations.getRun(caller, runId);
+          return ok(
+            projectToolPlaneDiagnostics({
+              runId,
+              records,
+              complete:
+                indexed !== null && nextCursor === null && records.length === indexed.eventCount,
+            }),
+          );
         }
         if (request.method === "GET" && !runAction[2])
           return ok({ run: await this.store.conversations.getRun(caller, runId) });

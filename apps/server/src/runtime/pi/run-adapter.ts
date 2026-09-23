@@ -5,12 +5,30 @@ import type {
   ExecutionResult,
 } from "../../execution/run-service/types.js";
 import { scopeKey } from "../../identity/scope.js";
+import { exactTerms } from "../../retrieval/exact-term.js";
 import type { QqCapabilityCategory } from "../../channels/onebot/capabilities.js";
 import type { PiRunContext, PiRuntimeAdapter, PiRuntimeProfileName } from "./types.js";
-import { GROUP_HISTORY_SEARCH_TOOL, OWNER_HISTORY_SEARCH_TOOL } from "./history-tools.js";
+import {
+  GROUP_HISTORY_SEARCH_TOOL,
+  OWNER_HISTORY_SEARCH_TOOL,
+  projectStrictHistoryReply,
+  strictHistoryReplySpec,
+} from "./history-tools.js";
 import { requiredInputClause, satisfiesRequiredInput } from "./protected-tools.js";
 import { OWNER_GROUP_ADMIN_TOOL } from "./owner-tools.js";
 import { OWNER_MEMORY_ADMIN_TOOL } from "./owner-memory-tools.js";
+import {
+  asksLiveQqFact,
+  groupHistorySearchRequested,
+  namedGroupId,
+  ownerHistorySearchRequested,
+  requestClauses,
+  requiredEvidenceFor,
+  resolveEvidence,
+  unobservedEvidence,
+  type EvidenceResolution,
+  type RequiredEvidence,
+} from "./required-evidence.js";
 
 interface RequiredToolCall {
   name: string;
@@ -125,12 +143,6 @@ function ownerMemoryCommand(text: string): RequiredToolCall | undefined {
 
 /** The provider parameters the current message pins down, or `undefined` when it pins none. */
 type RequiredMutationParams = Record<string, string | number | boolean> | undefined;
-
-/** The group id the current message names, if it names one. */
-function namedGroupId(text: string): string | undefined {
-  const match = /(?:群\s*([1-9]\d{4,15})|([1-9]\d{4,15})\s*群)/u.exec(text);
-  return match?.[1] ?? match?.[2];
-}
 
 /**
  * The member the current message names.
@@ -357,96 +369,71 @@ const SOURCE_CLASS_WORDS: readonly { sourceClass: QqSourceClass; words: RegExp }
  * object must name a group's history, so a message about searching anything else — a member,
  * a file, an order — never binds the Tool.
  */
-const GROUP_HISTORY_REQUEST =
-  /(?:搜索|搜|查找|查|检索|查询|翻)\s*(?:一下|一翻|一遍)?\s*(?:本群|群里|群内|该群|此群|当前群|群)\s*(?:的)?\s*(?:历史|聊天记录|消息记录|群聊记录|聊天历史|历史消息)/iu;
-
-/**
- * The negations that turn a request into a refusal.
- *
- * The words are unambiguous ones: 别 is deliberately absent because it is also part of
- * ordinary words such as 特别, and reading those as a refusal would silently drop a request
- * the user actually made.
- */
-const GROUP_HISTORY_REFUSAL = /(?:不要|不用|无需|不需要|请勿|不许|停止|别再|别去|别帮我)\s*$/u;
-
-/**
- * Whether the current group message explicitly asks to search this group's history.
- *
- * Read from the current user message alone. Retrieved group history, a notice, file content,
- * a Tool result or an earlier Conversation turn can describe a search without ever being one,
- * so none of them can require a Tool call.
- */
-function groupHistorySearchRequested(text: string): boolean {
-  const match = GROUP_HISTORY_REQUEST.exec(text);
-  if (!match) return false;
-  // A negation in the clause immediately before the request makes it a refusal.
-  if (GROUP_HISTORY_REFUSAL.test(text.slice(0, match.index))) return false;
-  // A question about how to search, or whether searching is possible, is not a request to search.
-  if (/如何|怎么|能否|是否|可以吗/u.test(text)) return false;
-  return true;
+export interface PiRunExecutionAdapterOptions {
+  isOwner?: (input: ExecutionInput) => Promise<boolean>;
+  resolveProfileName?: (input: ExecutionInput) => Promise<PiRuntimeProfileName>;
+  /**
+   * Records the Run's Tool-evidence decision, and how the Run answered it.
+   *
+   * Called once when the requirement is resolved and once when the Run reaches a terminal
+   * state, so an inspector can see both what the Runtime required and what the Run actually
+   * observed. The Run's own outcome never depends on whether the record could be written.
+   */
+  onEvidence?: (record: RunEvidenceRecord) => void | Promise<void>;
 }
 
 /**
- * Whether the current message continues an immediately preceding group-history investigation.
+ * What the Runtime decided a Run had to observe, and what it observed.
  *
- * Unlike a mutation, a read-only search may use recent Conversation state to resolve words such
- * as "他" and "刚才". Conversation history never supplies the request by itself: the current
- * message must independently ask to retry, verify completeness, or inspect a referenced person's
- * messages. This keeps an old search instruction from turning unrelated chat into a Tool call.
+ * The Tool call events already carry the call itself; this carries the *decision* the call is
+ * judged against, which is the part no reader could reconstruct from the calls alone. It is
+ * safe evidence: Tool names, domains and outcomes, never provider text or protected content.
  */
+export type RunEvidenceRecord =
+  | {
+      type: "tool_evidence";
+      runId: string;
+      principalId: string;
+      conversationId: string;
+      phase: "required";
+      /** The factual domains the current user message requires evidence from. */
+      required: readonly RequiredEvidence[];
+      /** The mutating Tool the message requires, when it requires one. */
+      requiredToolName?: string;
+      requiredToolInput?: Record<string, unknown>;
+    }
+  | {
+      type: "tool_evidence";
+      runId: string;
+      principalId: string;
+      conversationId: string;
+      phase: "resolved";
+      resolutions: readonly EvidenceResolution[];
+    };
+
 function groupHistorySearchFollowUpRequested(input: ExecutionInput): boolean {
   const text = input.text.trim();
   if (!text || /(?:不要|不用|无需|不需要|请勿|不许|停止|别再|别去|别帮我)/u.test(text))
     return false;
-
   const recentHistory = input.history.slice(-6);
-  const followsHistoryInvestigation = recentHistory.some(
-    (turn) =>
-      (turn.role === "user" && groupHistorySearchRequested(turn.text)) ||
-      /群历史|聊天记录|消息记录|历史消息|检索结果|查到|查到了|发言记录|发言时间线/u.test(turn.text),
-  );
-  if (!followsHistoryInvestigation) return false;
-
+  if (
+    !recentHistory.some(
+      (turn) =>
+        (turn.role === "user" && groupHistorySearchRequested(turn.text)) ||
+        /群历史|聊天记录|消息记录|历史消息|检索结果|查到|查到了|发言记录|发言时间线/u.test(
+          turn.text,
+        ),
+    )
+  )
+    return false;
   const asksToRetryOrVerify =
-    /漏|遗漏|不全|完整|全部|所有|继续.{0,12}(?:查|搜|检索|核对)|重新.{0,12}(?:查|搜|检索|核对)|再.{0,12}(?:查|搜|检索|核对)|没(?:有)?[^。！？\n]{0,12}(?:查|搜|检索)|根本没[^。！？\n]{0,12}(?:查|搜|检索)/u.test(
+    /漏|遗漏|不全|完整|全部|所有|继续.{0,12}(?:查|搜|检索|核对)|重新.{0,12}(?:查|搜|检索|核对)|再.{0,12}(?:查|搜|检索|核对)/u.test(
       text,
     );
   const personOrTimeReference =
     /这个人|那个人|此人|他|她|他们|对方|刚才|前面|之前|最新|最近|上次|[1-9]\d{4,15}/u;
   const messageActivity = /说|问|发|发言|消息|记录|检索|查|搜|回复|提到/u;
-  const asksAboutReferencedMessages =
-    personOrTimeReference.test(text) && messageActivity.test(text);
-
-  return asksToRetryOrVerify || asksAboutReferencedMessages;
-}
-
-/**
- * Whether the current Owner-private message explicitly asks to search one or more groups.
- *
- * This check runs before the management-query check. A search request often asks to "list"
- * the matched sender and text, or says to reply in the "current" private chat. Those words
- * describe the requested answer and audience. They do not turn the request into a group-policy
- * query. A request about the history setting or its status remains a management query.
- */
-function ownerHistorySearchRequested(text: string): boolean {
-  if (/不要|不用|无需|不需要|请勿|不许|停止|别再|别去|别帮我/u.test(text)) return false;
-  if (/如何|怎么|能否|是否|可以吗/u.test(text)) return false;
-  if (/(?:历史|聊天记录|消息记录)[^。！？\n]{0,16}(?:状态|配置|开关|是否启用|是否开启)/u.test(text))
-    return false;
-  if (
-    !/(?:已授权|管理的|多个\s*群|两个\s*群|所有\s*群|各个\s*群|群\s*[1-9]\d{4,15}|[1-9]\d{4,15}\s*群)/u.test(
-      text,
-    )
-  )
-    return false;
-  return /(?:搜索|搜|查找|查|检索|查询)[^。！？\n]{0,120}(?:群\s*(?:的)?\s*(?:历史|聊天记录|消息记录|群聊记录|聊天历史|历史消息)|已授权[^。！？\n]{0,40}(?:历史|聊天记录|消息记录))/u.test(
-    text,
-  );
-}
-
-export interface PiRunExecutionAdapterOptions {
-  isOwner?: (input: ExecutionInput) => Promise<boolean>;
-  resolveProfileName?: (input: ExecutionInput) => Promise<PiRuntimeProfileName>;
+  return asksToRetryOrVerify || (personOrTimeReference.test(text) && messageActivity.test(text));
 }
 
 export function piProfileName(
@@ -459,40 +446,56 @@ export function piProfileName(
 /**
  * The Tool the current message requires, or `undefined` when it requires none.
  *
- * A group Run can only ever reach the current-group history Tool, and only while its own
- * discovered surface carries it. Requiring a Tool the surface does not offer would fail an
- * honest Run closed against a Tool the model was never given, so the requirement follows the
- * surface the runtime resolved rather than the message alone. Requiring is never granting:
- * the Tool still re-authorizes its own Resource at execution time.
+ * Read from the message alone: the chat type the caller acted in, whether they are the Owner,
+ * and the text. The Run's resolved Tool surface is deliberately not an input. A requirement
+ * that disappeared with the Tool would leave a Run whose surface withheld it free to answer
+ * with a fluent claim about an action it never performed, and that is the state in which a
+ * fabricated answer is hardest to detect — a surface that failed to resolve would drop every
+ * requirement at once. What the surface decides is *satisfiability*: a Run that cannot call
+ * the required Tool fails closed below rather than reporting success. Requiring is never
+ * granting: the Tool still re-authorizes its own Resource at execution time.
  */
 function requiredToolCall(
   input: ExecutionInput,
   isOwner: boolean,
-  authorizedToolNames: readonly string[] | undefined,
+  authorizedToolNames?: readonly string[],
 ): RequiredToolCall | undefined {
   if (input.caller.scope.chatType === "group") {
-    if (!authorizedToolNames?.includes(GROUP_HISTORY_SEARCH_TOOL)) return undefined;
     if (!groupHistorySearchRequested(input.text) && !groupHistorySearchFollowUpRequested(input))
       return undefined;
-    // The message names no parameter of its own: the query is the model's to compose, and the
-    // group comes from the Run's trusted scope. The requirement is the call, not its arguments.
-    return { name: GROUP_HISTORY_SEARCH_TOOL, input: {} };
+    // A single segmented identifier is a literal query, not prose for the model to reinterpret.
+    // Bind it into the required input so a call for a different value cannot satisfy this Run.
+    // Bare digit runs are excluded because they can name a sender rather than message text.
+    const identifiers = exactTerms(requestClauses(input.text)).filter((term) =>
+      /[a-z]/iu.test(term),
+    );
+    return {
+      name: GROUP_HISTORY_SEARCH_TOOL,
+      input: identifiers.length === 1 ? { query: identifiers[0] } : {},
+    };
   }
   // Everything below is the Owner-private surface. A management Tool is never required
   // outside a private Owner Run, whatever else a message may name.
   if (input.caller.scope.chatType !== "private" || !isOwner) return undefined;
-  const text = input.text;
+  const rawText = input.text;
   if (authorizedToolNames?.includes(OWNER_MEMORY_ADMIN_TOOL)) {
-    const memory = ownerMemoryCommand(text);
+    const memory = ownerMemoryCommand(rawText);
     if (memory) return memory;
   }
-  if (/不要|别|无需/u.test(text)) return undefined;
-  if (authorizedToolNames?.includes(OWNER_HISTORY_SEARCH_TOOL) && ownerHistorySearchRequested(text))
-    return { name: OWNER_HISTORY_SEARCH_TOOL, input: {} };
+  const text = requestClauses(rawText);
+  if (
+    /不要查看|不用查看|无需查看|不需要查看|请勿查看|不许查看|停止查看|别再查看|别去查看|别帮我查看/u.test(
+      rawText,
+    )
+  )
+    return undefined;
+  if (ownerHistorySearchRequested(rawText)) return { name: OWNER_HISTORY_SEARCH_TOOL, input: {} };
   const groupId = namedGroupId(text);
   if (!groupId) return undefined;
-  if (/如何|怎么|能否|是否|可以吗/u.test(text)) return undefined;
-  if (/查看|查询|列出|当前|有哪些|状态/u.test(text))
+  // A question about what a group *contains* is answered by live QQ evidence, not by reading
+  // the group's Glassbox configuration. Requiring both would make the Run fail closed on a
+  // Tool that cannot answer the question it was asked.
+  if (!asksLiveQqFact(text) && /查看|查询|列出|当前|有哪些|状态/u.test(text))
     return { name: OWNER_GROUP_ADMIN_TOOL, input: { action: "get", groupId } };
 
   // A mutating QQ domain operation is named by the current message, together with the group
@@ -592,10 +595,10 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       : input.caller.scope.chatType === "group"
         ? "qq-group"
         : "main-agent";
-    // The required Tool is decided *after* the session is created, because the runtime
-    // resolves the Run's discovered Tool surface while creating it. Deciding before would
-    // have to guess that surface, and a guess that disagreed with it would either require a
-    // Tool the model was never offered or silently drop a requirement the Run could meet.
+    // The requirements are written onto the context after the session exists, because the
+    // context is what the runtime carries into the Run. They are decided from the message and
+    // the caller's scope, so the order the session is created in cannot change them: the
+    // surface the runtime resolves alongside it decides only whether the Run can satisfy them.
     const context: PiRunContext = {
       caller: input.caller,
       conversationId: input.conversation.id,
@@ -624,6 +627,27 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       context.requiredToolName = required.name;
       context.requiredToolInput = required.input;
     }
+    // §2 — the factual domains the current message cannot be answered without observing. Read
+    // from the message alone: the surface the Run got decides whether the requirement can be
+    // met, never whether it exists, so a Run whose surface withholds the Tool fails closed
+    // rather than answering a live question it had no way to observe.
+    const evidence = requiredEvidenceFor({
+      text: input.text,
+      chatType: input.caller.scope.chatType === "group" ? "group" : "private",
+      isOwner,
+    });
+    if (evidence.length > 0) context.requiredEvidence = evidence;
+    await this.recordEvidence({
+      type: "tool_evidence",
+      runId: input.run.id,
+      conversationId: input.conversation.id,
+      principalId: input.caller.principalId,
+      phase: "required",
+      required: evidence,
+      ...(required === undefined
+        ? {}
+        : { requiredToolName: required.name, requiredToolInput: required.input }),
+    });
     const abort = () => {
       void this.runtime.abort(binding.runtimeSessionId);
     };
@@ -640,45 +664,149 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         context,
       );
       const requiredName = context.requiredToolName;
+      // Calls accumulate across the retry: a domain observed before the retry stays observed,
+      // and a mutation that already ran is not re-judged as having never happened. Reading only
+      // the latest result would let a successful first call be forgotten by a second one.
+      const observedCalls = [...result.toolCalls];
       // The same comparison the mutating-Tool gate uses: a call counts as having carried out
       // the required action only when every key the message pinned down agrees with it. Using
       // a looser check here would accept a Run whose Tool call the gate had refused.
       const completedRequiredTool = () =>
         required === undefined ||
-        result.toolCalls.some(
+        observedCalls.some(
           (call) =>
             call.name === required.name &&
             call.failed === false &&
             satisfiesRequiredInput(required.input, call.input),
         );
-      if (result.status === "completed" && !completedRequiredTool() && !input.signal.aborted) {
+      // §2/§3 — every domain the message asked about, not the first one the check reached. A
+      // message that asks about members *and* notices is not answered by observing one of them.
+      const missingRequirements = () => {
+        const requiredCall =
+          completedRequiredTool() || required === undefined
+            ? undefined
+            : { name: required.name, input: required.input };
+        const evidenceCalls = resolveEvidence(evidence, observedCalls).flatMap(
+          (resolution, index) => {
+            if (resolution.outcome === "success") return [];
+            const candidate = { name: evidence[index]!.tool, input: evidence[index]!.input };
+            // One exact required call also satisfies a generic evidence requirement for the same
+            // Tool. Asking for both produced a retry that told the model to run the same search
+            // twice, once with the bound identifier and once without it.
+            if (
+              requiredCall &&
+              candidate.name === requiredCall.name &&
+              satisfiesRequiredInput(candidate.input, requiredCall.input)
+            )
+              return [];
+            return [candidate];
+          },
+        );
+        return [...(requiredCall ? [requiredCall] : []), ...evidenceCalls];
+      };
+      const missing = missingRequirements();
+      if (result.status === "completed" && missing.length > 0 && !input.signal.aborted) {
         result = await this.runtime.run(
           binding,
           { ...input.run, principalId: input.caller.principalId },
-          `The required action has not executed. Call ${requiredName} now${requiredInputClause(context.requiredToolInput)}. Do not ask for confirmation and do not report success without the tool result.`,
+          `The required action has not executed. Call ${missing
+            .map(({ name, input: requiredInput }) => `${name}${requiredInputClause(requiredInput)}`)
+            .join(
+              " and ",
+            )} now. Do not ask for confirmation and do not report success without the tool result.`,
           context,
         );
+        observedCalls.push(...result.toolCalls);
       }
-      if (requiredName !== undefined && result.status !== "aborted" && !completedRequiredTool()) {
+      const finalResolutions = resolveEvidence(evidence, observedCalls);
+      await this.recordEvidence({
+        type: "tool_evidence",
+        runId: input.run.id,
+        conversationId: input.conversation.id,
+        principalId: input.caller.principalId,
+        phase: "resolved",
+        resolutions: finalResolutions,
+      });
+      // A Run that never executed the action it was asked for, or never observed the facts it
+      // was asked about, cannot stand behind its own text — it does not get to answer from
+      // Conversation, from the user's own message, or from what it believes a Tool would have
+      // returned. That holds whatever terminal status the Run reached. A cancelled Run is not a
+      // claim of success, but its text still reaches the audience: the run service delivers
+      // what the Run reported and falls back to a fixed line only when it reported nothing, so
+      // skipping the aborted path would deliver the one answer this check exists to withhold
+      // whenever the user happened to press Stop. A cancelled Run that cannot back its text
+      // reports none, and that fixed line states the outcome instead.
+      const missingTool = requiredName !== undefined && !completedRequiredTool();
+      const missingEvidence = unobservedEvidence(finalResolutions).length > 0;
+      if (result.status === "aborted") {
+        return missingTool || missingEvidence
+          ? { status: "cancelled", providerSessionId: binding.runtimeSessionId }
+          : {
+              status: "cancelled",
+              text: result.text,
+              providerSessionId: binding.runtimeSessionId,
+            };
+      }
+      // The Run reached a terminal status of its own, so an unbacked answer is a failure rather
+      // than a cancellation, and the fixed text names which requirement went unmet.
+      if (missingTool)
         return {
           status: "failed",
           text: "请求的操作未执行，请稍后重试。",
           providerSessionId: binding.runtimeSessionId,
         };
+      if (missingEvidence)
+        return {
+          status: "failed",
+          text: "未能从 QQ 获取该信息，因此无法确认。",
+          providerSessionId: binding.runtimeSessionId,
+        };
+      const strictReply = strictHistoryReplySpec(input.text);
+      if (
+        strictReply &&
+        result.status === "completed" &&
+        (requiredName === GROUP_HISTORY_SEARCH_TOOL || requiredName === OWNER_HISTORY_SEARCH_TOOL)
+      ) {
+        const successfulCall = [...observedCalls]
+          .reverse()
+          .find(
+            (call) =>
+              call.name === requiredName &&
+              call.failed === false &&
+              satisfiesRequiredInput(context.requiredToolInput ?? {}, call.input),
+          );
+        const projected = successfulCall
+          ? projectStrictHistoryReply(strictReply, successfulCall.result)
+          : undefined;
+        if (!projected)
+          return {
+            status: "failed",
+            text: "未能从 QQ 获取完整的请求字段，因此无法确认。",
+            providerSessionId: binding.runtimeSessionId,
+          };
+        result = { ...result, text: projected };
       }
       return {
-        status:
-          result.status === "completed"
-            ? "succeeded"
-            : result.status === "aborted"
-              ? "cancelled"
-              : "failed",
+        // The aborted case returned above, so a Run that reached here either completed or
+        // errored; anything else the runtime reports is a failure, never a success.
+        status: result.status === "completed" ? "succeeded" : "failed",
         text: result.text,
         providerSessionId: binding.runtimeSessionId,
       };
     } finally {
       input.signal.removeEventListener("abort", abort);
       await this.runtime.disposeSession?.(binding.runtimeSessionId);
+    }
+  }
+
+  /** Evidence recording is the caller's to fail; a Run's outcome must not depend on it. */
+  private async recordEvidence(record: RunEvidenceRecord): Promise<void> {
+    if (!this.options.onEvidence) return;
+    try {
+      await this.options.onEvidence(record);
+    } catch {
+      // Swallowed deliberately: losing an evidence record is a defect in the recorder, not a
+      // reason to turn an honest answer into a failure.
     }
   }
 

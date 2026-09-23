@@ -25,6 +25,9 @@ import {
   ManagementApplication,
 } from "./application.js";
 import { PiRunExecutionAdapter } from "../runtime/pi/run-adapter.js";
+import type { HistorySyncOutcome } from "../runtime/pi/history-tools.js";
+import type { ToolDescriptor, ToolExclusionReason } from "../runtime/pi/tool-plane.js";
+import { TOOL_DESCRIPTORS } from "../runtime/pi/tool-plane.js";
 import type { PiRuntimeAdapter } from "../runtime/pi/types.js";
 import {
   AccessDeniedError,
@@ -216,6 +219,47 @@ async function fixture(
 }
 
 describe("channel to durable run composition", () => {
+  it("exposes Tool-plane diagnostics only for the current Owner's Run", async () => {
+    const f = await fixture(async () => ({ status: "succeeded", text: "private answer" }), {
+      coOwnerId: "10005",
+    });
+    f.send(1, "owner-private", true);
+    const ownerRun = await f.started.take();
+    await f.app.runs.waitForRun(ownerRun.caller, ownerRun.run.id);
+
+    const ownerResult = await f.app.route({
+      method: "GET",
+      url: `/manage/runs/${ownerRun.run.id}/tool-plane`,
+    } as never);
+    expect(ownerResult?.status).toBe(200);
+    expect(ownerResult?.body).toMatchObject({
+      runId: ownerRun.run.id,
+      trace: { complete: true },
+      surface: { observed: false, selectedCount: 0, tools: [] },
+    });
+    expect(JSON.stringify(ownerResult?.body)).not.toContain("private answer");
+
+    f.send(2, "visitor-private", true, 10004);
+    const visitorRun = await f.started.take();
+    await f.app.runs.waitForRun(visitorRun.caller, visitorRun.run.id);
+    await expect(
+      f.app.route({
+        method: "GET",
+        url: `/manage/runs/${visitorRun.run.id}/tool-plane`,
+      } as never),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+
+    f.send(3, "another-owner-private", true, 10005);
+    const foreignOwnerRun = await f.started.take();
+    await f.app.runs.waitForRun(foreignOwnerRun.caller, foreignOwnerRun.run.id);
+    await expect(
+      f.app.route({
+        method: "GET",
+        url: `/manage/runs/${foreignOwnerRun.run.id}/tool-plane`,
+      } as never),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+  });
+
   it("keeps an auto-connect channel retrying when OneBot becomes ready after server startup", async () => {
     const directory = await mkdtemp(join(tmpdir(), "glassbox-late-onebot-"));
     cleanup.push(() => removeDirectory(directory));
@@ -588,7 +632,7 @@ describe("bounded authorized history synchronization", () => {
         connectionId: string,
         groupId: string,
         options?: { maxPages?: number; since?: string },
-      ): Promise<void>;
+      ): Promise<HistorySyncOutcome>;
     };
   const storedIds = async (app: ManagementApplication) =>
     (await app.archive.searchMessages({ allowedGroupIds: ["10003"], limit: 50 }))
@@ -628,6 +672,23 @@ describe("bounded authorized history synchronization", () => {
     expect(await storedIds(stuck.app)).toEqual(["5"]);
   });
 
+  it("treats NapCat's inclusive cursor-only page as the end of the source", async () => {
+    const inclusive = (params: { message_seq?: number }) => {
+      if (params.message_seq === undefined) return [message(3), message(2)];
+      if (params.message_seq === 2) return [message(2), message(1)];
+      return [message(1)];
+    };
+    const f = await fixture(async () => ({ status: "succeeded", text: "ok" }), {
+      history: inclusive,
+    });
+
+    expect(await sync(f.app).syncGroupHistory("fixture", "10003", { maxPages: 10 })).toEqual({
+      pagesWalked: 3,
+      stop: "end_of_source",
+    });
+    expect(await storedIds(f.app)).toEqual(["1", "2", "3"]);
+  });
+
   it("stops at the requested time bound", async () => {
     const f = await fixture(async () => ({ status: "succeeded", text: "ok" }), {
       history: paged(),
@@ -637,6 +698,88 @@ describe("bounded authorized history synchronization", () => {
       since: new Date((1_758_000_000 + 9) * 1000).toISOString(),
     });
     expect(await storedIds(f.app)).toEqual(["10", "11", "12", "9"]);
+  });
+
+  it("reports how much of the source the walk reached", async () => {
+    const f = await fixture(async () => ({ status: "succeeded", text: "ok" }), {
+      history: paged(),
+    });
+
+    // Twelve records at three per page. Two pages is the bound, so older history exists that
+    // this sync never read. Reporting that walk as an exhausted source is what let a search
+    // call a partial window "the whole history" and answer a question the messages it never
+    // reached were the answer to.
+    expect(await sync(f.app).syncGroupHistory("fixture", "10003", { maxPages: 2 })).toEqual({
+      pagesWalked: 2,
+      stop: "page_bound_reached",
+    });
+
+    // More pages than the fixture holds, so the walk ends because the provider said there is
+    // no older page. This is the one case in which the archive really is the source.
+    expect(await sync(f.app).syncGroupHistory("fixture", "10003", { maxPages: 10 })).toEqual({
+      pagesWalked: 5,
+      stop: "end_of_source",
+    });
+  });
+
+  it("names the bound a walk stopped on instead of calling it the end of the source", async () => {
+    const f = await fixture(async () => ({ status: "succeeded", text: "ok" }), {
+      history: paged(),
+    });
+    // The caller asked for everything from sequence 9 onwards, and the walk passed that bound.
+    // The archived window is the whole range the question is about, which is a different
+    // statement from "the group has no older history" — and the one that is true here.
+    expect(
+      await sync(f.app).syncGroupHistory("fixture", "10003", {
+        maxPages: 10,
+        since: new Date((1_758_000_000 + 9) * 1000).toISOString(),
+      }),
+    ).toEqual({ pagesWalked: 2, stop: "since_bound_reached" });
+
+    // A provider that keeps returning the same cursor has not said there is no older page,
+    // so what follows it stays unknown rather than becoming the end of the source.
+    const stuck = await fixture(async () => ({ status: "succeeded", text: "ok" }), {
+      history: () => [message(5), message(5)],
+    });
+    expect(await sync(stuck.app).syncGroupHistory("fixture", "10003", { maxPages: 10 })).toEqual({
+      pagesWalked: 2,
+      stop: "cursor_stuck",
+    });
+  });
+
+  it("does not call a page it cannot page past the end of the source", async () => {
+    // Records without a usable provider sequence cannot supply a backwards-page cursor.
+    // That is not the provider saying it has nothing older, so what follows stays unknown
+    // instead of becoming the end of the source.
+    const unsequenced = () => [
+      {
+        message_id: 7,
+        real_id: 7,
+        time: 1_758_000_000 + 7,
+        user_id: 10004,
+        group_id: 10003,
+        message_type: "group",
+        sender: { user_id: 10004, nickname: "Visitor" },
+        message: [{ type: "text", data: { text: "msg-7" } }],
+      },
+    ];
+    const f = await fixture(async () => ({ status: "succeeded", text: "ok" }), {
+      history: unsequenced,
+    });
+    expect(await sync(f.app).syncGroupHistory("fixture", "10003", { maxPages: 10 })).toEqual({
+      pagesWalked: 1,
+      stop: "provider_unknown",
+    });
+
+    // And the caller's own bound does not get to name this page either: the provider is the
+    // one that left the walk's reach unknown, and a stop that reads as the caller's choice
+    // would hide a stalled walk behind a deliberate one.
+    expect(
+      await sync(f.app).syncGroupHistory("fixture", "10003", {
+        maxPages: 10,
+        since: new Date((1_758_000_000 + 10) * 1000).toISOString(),
+      }),
+    ).toEqual({ pagesWalked: 1, stop: "provider_unknown" });
   });
 });
 
@@ -711,6 +854,10 @@ const admin = (app: ManagementApplication) =>
     ): Promise<unknown>;
     projectManagedGroups(context: OwnerContext): Promise<ManagedGroupProjection>;
     resolveRunToolNames(context: OwnerContext): Promise<string[]>;
+    resolveRunToolCandidates(
+      context: OwnerContext,
+      registered?: readonly ToolDescriptor[],
+    ): Promise<{ name: string; exclusion: ToolExclusionReason | null }[]>;
     createRuntimeTools(getContext: () => OwnerContext | undefined): Array<{
       name: string;
       execute(id: string, params: unknown, signal?: AbortSignal): Promise<{ details?: unknown }>;
@@ -1289,6 +1436,10 @@ const groupRun = (app: ManagementApplication) =>
       input: { groupId: string; enabled: boolean },
     ): Promise<unknown>;
     resolveRunToolNames(context: OwnerContext): Promise<string[]>;
+    resolveRunToolCandidates(
+      context: OwnerContext,
+      registered?: readonly ToolDescriptor[],
+    ): Promise<{ name: string; exclusion: ToolExclusionReason | null }[]>;
     createRuntimeTools(getContext: () => OwnerContext | undefined): Array<{
       name: string;
       execute(id: string, params: unknown, signal?: AbortSignal): Promise<{ details?: unknown }>;
@@ -1348,6 +1499,74 @@ describe("configured group Run capability authority", () => {
     expect(context.caller.scope).toMatchObject({ chatType: "group", chatId: GROUP });
     return { f, a, application, context, groupInput: run };
   }
+
+  it("names why each Tool is off a group Run's surface instead of only that it is", async () => {
+    const { application, context } = await configuredGroup();
+
+    const candidates = await application.resolveRunToolCandidates(context);
+    const reason = (name: string) => candidates.find((entry) => entry.name === name)?.exclusion;
+
+    // A group Run cannot reach the mutating categories at all: that is a scope boundary, not
+    // an Owner policy choice, and the surface has to say which one it was.
+    expect(reason("qq_group_moderation")).toBe("scope_not_permitted");
+    expect(reason("qq_account_status")).toBe("scope_not_permitted");
+    // `qq_capability_search` is Owner-private, so a group Run is out of scope for it.
+    expect(reason("qq_capability_search")).toBe("scope_not_permitted");
+    // The Agent Ops and Owner-control surface is Owner-private too.
+    expect(reason("owner_group_admin")).toBe("scope_not_permitted");
+    expect(reason("ops_status")).toBe("scope_not_permitted");
+    // The Kit profile's host Tools were removed by the host, and that is named as such.
+    expect(reason("read")).toBe("disabled_by_host");
+    expect(reason("bash")).toBe("disabled_by_host");
+    // The eligible read-only Tools are the selected set, and agree with the name projection.
+    const selected = candidates
+      .filter((entry) => entry.exclusion === null)
+      .map((entry) => entry.name);
+    expect([...selected].sort()).toEqual([...GROUP_RUN_READ_TOOLS].sort());
+    expect([...(await application.resolveRunToolNames(context))].sort()).toEqual(
+      [...selected].sort(),
+    );
+  });
+
+  it("classifies every registered Tool, so a Tool with unwired discovery cannot slip through", async () => {
+    const { application, context } = await configuredGroup();
+
+    const candidates = await application.resolveRunToolCandidates(context);
+    // `unclassified` means Glassbox registers a Tool that no discovery rule reached. It is
+    // never a legitimate outcome: it is a Tool that would either be offered by accident or
+    // silently vanish. Asserting it never appears is what makes adding a Tool without wiring
+    // its discovery fail here rather than in production.
+    expect(candidates.filter((entry) => entry.exclusion === "unclassified")).toEqual([]);
+    expect(candidates.length).toBe(TOOL_DESCRIPTORS.length);
+    expect(new Set(candidates.map((entry) => entry.name)).size).toBe(TOOL_DESCRIPTORS.length);
+  });
+
+  it("withholds a registered Tool that no discovery rule classified", async () => {
+    const { application, context } = await configuredGroup();
+
+    // The registry is the universe of Tools that *exist*. Discovery is a separate decision about
+    // which of them a Run may see. A Tool in the first and in no rule of the second is the
+    // wiring bug §9/§10 exist to catch: the real table happens to have every Tool wired, so no
+    // Run over it can reproduce the gap. Injecting one descriptor is what makes the guard
+    // testable — delete the `unclassified` branch and this Tool is offered to the model.
+    const unwired = {
+      ...TOOL_DESCRIPTORS[0]!,
+      name: "qq_never_wired",
+    };
+    const candidates = await application.resolveRunToolCandidates(context, [
+      ...TOOL_DESCRIPTORS,
+      unwired,
+    ]);
+
+    const found = candidates.find((entry) => entry.name === unwired.name);
+    expect(found?.exclusion).toBe("unclassified");
+    expect(
+      candidates.filter((entry) => entry.exclusion === null).map((entry) => entry.name),
+    ).toEqual(expect.not.arrayContaining([unwired.name]));
+    // It is still classified — the answer to "why is this off the surface" must name it rather
+    // than let it vanish from the report, which is the other half of the same bug.
+    expect(candidates.length).toBe(TOOL_DESCRIPTORS.length + 1);
+  });
 
   it("discovers only the read-only capabilities for a group Run and calls one for real", async () => {
     const { application, context } = await configuredGroup();
@@ -1459,8 +1678,9 @@ describe("configured group Run capability authority", () => {
    * The real execution adapter over a runtime that resolves the real Run surface.
    *
    * This is the production wiring: the runtime writes the Tool names it discovered onto the
-   * Run context, and the execution adapter decides the required Tool from that context. A
-   * test that stubbed either half would not catch the two disagreeing.
+   * Run context, and the execution adapter decides the required Tool from the current message
+   * while reading that surface to decide whether the Run can satisfy it. A test that stubbed
+   * either half would not catch the two disagreeing.
    */
   function piGroupRun(
     application: ReturnType<typeof groupRun>,
@@ -1497,17 +1717,23 @@ describe("configured group Run capability authority", () => {
     };
   }
 
-  it("requires the group history Tool exactly while the real surface offers it", async () => {
-    const { application, a, groupInput } = await configuredGroup();
+  it("requires the group history Tool whether or not the real surface offers it", async () => {
+    const { application, a, context, groupInput } = await configuredGroup();
     const requiredFor = piGroupRun(application, groupInput);
     const ask = "请搜索本群历史，找到 P4B-A-1349，并回复发送者和原文";
 
+    expect(await application.resolveRunToolNames(context)).toContain("group_history_search");
     expect(await requiredFor(ask)).toBe("group_history_search");
 
     await application.setGroupHistory(a, { groupId: GROUP, enabled: false });
-    // The Tool is off the surface now, so nothing is required: an honest Run is never failed
-    // closed against a Tool it was never offered.
-    expect(await requiredFor(ask)).toBeUndefined();
+
+    // The Tool is off the surface now, and the requirement is not. The Run cannot satisfy it,
+    // so the adapter fails closed below the model instead of letting it answer a search that
+    // never ran — "本群历史检索已关闭" is exactly the composed answer this check exists to catch.
+    // A requirement that left with the Tool would make the group's own setting the only thing
+    // between the user and a fabricated result.
+    expect(await application.resolveRunToolNames(context)).not.toContain("group_history_search");
+    expect(await requiredFor(ask)).toBe("group_history_search");
   });
 
   it("never requires a cross-group Tool for a group Run", async () => {

@@ -131,6 +131,33 @@ describe("unified CLI commands", () => {
     );
   });
 
+  it("probes one explicitly named acceptance group", async () => {
+    const dependencies = fixture({ probe: { groupId: "1126022432", complete: true } });
+    expect(
+      await runCli(["capabilities", "probe", "p3-qq", "1126022432", "--json"], dependencies),
+    ).toBe(0);
+    expect(dependencies.clientOptions.fetch).toHaveBeenCalledWith(
+      "http://localhost:8741/manage/capabilities/probe",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ channelId: "p3-qq", groupId: "1126022432" }),
+      }),
+    );
+  });
+
+  it.each([
+    // A probe that guessed its target could call a group nobody meant to touch, so there is
+    // no default group and a non-numeric one never reaches the server.
+    [["capabilities", "probe", "p3-qq"]],
+    [["capabilities", "probe", "p3-qq", "not-a-group"]],
+    [["capabilities", "probe", "p3-qq", "0"]],
+    [["capabilities", "probe", "p3-qq", "1126022432", "extra"]],
+  ] as const)("refuses an incomplete probe request for %s", async (args) => {
+    const dependencies = fixture();
+    expect(await runCli([...args], dependencies)).toBe(2);
+    expect(dependencies.clientOptions.fetch).not.toHaveBeenCalled();
+  });
+
   it.each([
     [["conversations", "list"], "/manage/conversations"],
     [["runs", "list"], "/manage/runs"],

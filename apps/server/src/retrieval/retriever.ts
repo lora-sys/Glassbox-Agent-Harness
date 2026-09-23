@@ -36,6 +36,7 @@ import type {
   RedactionInfo,
 } from "@glassbox/contracts";
 import { jaccardSimilarity, tokenizeText } from "./tokenizer.js";
+import { carriesEveryExactTerm, exactTerms } from "./exact-term.js";
 
 export interface RetrievalCandidate {
   id: string;
@@ -67,6 +68,55 @@ export interface MemorySearchOpts {
   until?: string;
   minScore?: number;
   metadataFilters?: Readonly<Record<string, string>>;
+}
+
+/**
+ * What one search actually looked at.
+ *
+ * A caller that only sees the returned items cannot tell a short answer from an exhausted
+ * one: `limit` bounds the result, and the store's own ceiling bounds the candidates, and
+ * both silently produce the same empty tail. Reporting both is what lets a caller say
+ * "no match in what I searched" instead of claiming nothing exists.
+ */
+export interface RetrievalCoverage {
+  /** The limit the caller asked for. */
+  requestedLimit: number;
+  /** Items returned after every filter and the limit. */
+  returned: number;
+  /** Candidates the store produced. */
+  considered: number;
+  /** The candidate ceiling this search asked the store for. */
+  overFetchLimit: number;
+  /**
+   * True when the store returned exactly the ceiling, so more candidates may exist unread.
+   * A caller must not treat a no-match result as exhaustive while this is true.
+   */
+  candidateCapReached: boolean;
+  /** Scored candidates that survived every filter but were cut by the requested limit. */
+  droppedByLimit: number;
+  /** Candidates dropped by duplicate suppression or a time bound before scoring. */
+  droppedByFilter: number;
+  /**
+   * The arbitrary-value terms this query required verbatim. Empty for a prose query.
+   *
+   * Recorded rather than inferred so a caller reading a short result can tell which rule
+   * produced it without re-deriving the query's shape.
+   */
+  exactTerms: string[];
+  /**
+   * Candidates the store returned that did not carry every exact term.
+   *
+   * Counted apart from `droppedByFilter` because the two answer different questions: that
+   * one is "the same thing again", this one is "a different thing". Neither is truncation —
+   * these candidates were read and judged, not cut — so `candidateCapReached` and the
+   * caller's own bounds remain the only reasons a window can be called partial.
+   */
+  droppedByExactTerm: number;
+}
+
+export interface DetailedSearch {
+  results: SearchResultItem<RetrievalCandidate>[];
+  coverage: RetrievalCoverage;
 }
 
 export interface MemoryRetrieverOptions {
@@ -113,14 +163,39 @@ export class MemoryRetriever {
     query: string,
     opts: MemorySearchOpts,
   ): Promise<SearchResultItem<RetrievalCandidate>[]> {
+    return (await this.searchDetailed(query, opts)).results;
+  }
+
+  /**
+   * The same search as `search`, plus what it actually looked at.
+   *
+   * `search` is a projection of this, never a second implementation: a caller that reads
+   * coverage and a caller that does not must never disagree about which items matched.
+   */
+  async searchDetailed(query: string, opts: MemorySearchOpts): Promise<DetailedSearch> {
+    const limit = opts.limit ?? 10;
+    const overFetchLimit = Math.min(200, limit * 10);
+    // An identifier query is answered by containment rather than by tokens. `P4B-A-1349`
+    // tokenizes to `p4b`, `a`, `1349`, so a message mentioning only `1349` scores as a hit
+    // and reaches the model looking exactly like the message that carries the identifier.
+    const requiredTerms = exactTerms(query);
+    const empty: RetrievalCoverage = {
+      requestedLimit: limit,
+      returned: 0,
+      considered: 0,
+      overFetchLimit,
+      candidateCapReached: false,
+      droppedByLimit: 0,
+      droppedByFilter: 0,
+      exactTerms: requiredTerms,
+      droppedByExactTerm: 0,
+    };
+
     // Security invariant: source filtering before candidate loading.
     // If no sources are authorized, return empty immediately without querying store.
     if (!opts.allowedSourceIds || opts.allowedSourceIds.length === 0) {
-      return [];
+      return { results: [], coverage: empty };
     }
-
-    const limit = opts.limit ?? 10;
-    const overFetchLimit = Math.min(200, limit * 10);
 
     // Over-fetch candidates inside authorized source set only
     const candidates = await this.store.searchCandidates({
@@ -132,8 +207,14 @@ export class MemoryRetriever {
       metadataFilters: opts.metadataFilters,
     });
 
+    const coverage: RetrievalCoverage = {
+      ...empty,
+      considered: candidates.length,
+      candidateCapReached: candidates.length >= overFetchLimit,
+    };
+
     if (candidates.length === 0) {
-      return [];
+      return { results: [], coverage };
     }
 
     const queryTokens = tokenizeText(query);
@@ -149,18 +230,33 @@ export class MemoryRetriever {
     const scored: ScoredCandidate[] = [];
 
     for (const candidate of candidates) {
+      // The query named an identifier, so only a candidate that carries it verbatim is a
+      // match at all. This runs before scoring and before duplicate suppression: a near miss
+      // is not a low-scoring hit, it is a different term, and no score can make it one.
+      if (!carriesEveryExactTerm(candidate.text, requiredTerms)) {
+        coverage.droppedByExactTerm++;
+        continue;
+      }
+
       // Duplicate suppression
       if (this.dedupeDuplicates) {
         const normalized = candidate.text.trim().toLowerCase();
         if (seenTexts.has(normalized)) {
+          coverage.droppedByFilter++;
           continue;
         }
         seenTexts.add(normalized);
       }
 
       // Time bounds check
-      if (opts.since && candidate.timestamp < opts.since) continue;
-      if (opts.until && candidate.timestamp > opts.until) continue;
+      if (opts.since && candidate.timestamp < opts.since) {
+        coverage.droppedByFilter++;
+        continue;
+      }
+      if (opts.until && candidate.timestamp > opts.until) {
+        coverage.droppedByFilter++;
+        continue;
+      }
 
       // Lexical scoring (metadata 2x, body 1x)
       const bodyTokens = tokenizeText(candidate.text);
@@ -212,6 +308,7 @@ export class MemoryRetriever {
       score *= weight;
 
       if (opts.minScore !== undefined && score < opts.minScore) {
+        coverage.droppedByFilter++;
         continue;
       }
 
@@ -219,7 +316,7 @@ export class MemoryRetriever {
     }
 
     if (scored.length === 0) {
-      return [];
+      return { results: [], coverage };
     }
 
     // MMR diversity reranking or score sorting
@@ -232,11 +329,14 @@ export class MemoryRetriever {
       selected = scored.slice(0, limit);
     }
 
+    coverage.returned = selected.length;
+    coverage.droppedByLimit = scored.length - selected.length;
+
     // Normalize max score if positive
     const maxScore = Math.max(...selected.map((s) => s.score), 1.0);
 
     // Format into MGP-compatible SearchResultItem
-    return selected.map((s) => {
+    const results = selected.map((s) => {
       const returnMode: ReturnMode = s.candidate.returnMode ?? "raw";
       const isMetadataOnly = returnMode === "metadata_only";
 
@@ -276,6 +376,8 @@ export class MemoryRetriever {
         explanation,
       };
     });
+
+    return { results, coverage };
   }
 
   /**

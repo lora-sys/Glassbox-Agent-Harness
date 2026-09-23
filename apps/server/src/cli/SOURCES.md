@@ -24,7 +24,7 @@ The CLI calls the same local management API as WebUI. It does not own another co
 
 ## Local integration
 
-`runCli(args, dependencies)` returns an exit code without terminating the host process. `main(args, dependencies)` adds Node standard streams and bounded stdin reading. The application entrypoint supplies `resolveConnection` and `startServer`. The resolver reads the server-owned `management-token` file and the configured management origin. It must not create a token, read model credentials, or maintain another settings file.
+`runCli(args, dependencies)` returns an exit code without terminating the host process. `main(args, dependencies)` adds Node standard streams and bounded stdin reading. The application entrypoint supplies `resolveConnection` and `startServer`. The resolver reads the server-owned `management-token` file from `getServiceDataDir()` and targets the loopback `PORT`. It must not create a token, read model credentials, or maintain another settings file. The service manager and CLI share the same default data directory. See [the local service instructions](../../../docs/tech-stack.md#repository-toolchain).
 
 `resolveConnection` returns `baseUrl` and `token`. `startServer` returns public startup status after the server is ready. An unwired starter or unavailable endpoint produces `NOT_AVAILABLE`. The caller sets `process.exitCode` to the returned value. A foreground server keeps its ordinary server handles active.
 

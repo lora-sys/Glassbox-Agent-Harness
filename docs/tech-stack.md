@@ -56,10 +56,13 @@ Vite+ is expected to cover Vite / Rolldown, Vitest, Oxlint, Oxfmt, tsdown, and w
 
 The configured local Personal Agent environment has one service command surface:
 
-    vp run agent:up
-    vp run agent:status
-    vp run agent:logs
-    vp run agent:down
+    npm run agent:up
+    npm run agent:status
+    npm run agent:logs
+    npm run agent:down
+
+On Windows, do not start the long-running service with `vp run agent:up`. Vite+ terminates its
+detached service child when the task exits. The npm scripts invoke the service manager directly.
 
 agent:up reads optional Herdr, NapCat and Glassbox launch settings from
 <GLASSBOX_DATA_DIR>/service-launch.json. Without that environment variable, it uses
@@ -67,9 +70,29 @@ agent:up reads optional Herdr, NapCat and Glassbox launch settings from
 on a temporary worktree. Use docs/service-launch.example.json as the shape. Keep
 credentials in the existing protected Channel and model stores. agent:up is idempotent.
 It keeps verified running processes and starts only missing services.
-For NapCat restart login, append the Bot QQ number to the launcher arguments after the QQ executable and injection library. The service file accepts only the documented non-secret environment keys.
+For NapCat restart login, append the Bot QQ number to the launcher arguments after the QQ executable and injection library. Pin the first NapCat argument to the tested QQ executable. Do not point it at an auto-updated system QQ installation: an unsupported QQ build can leave OneBot listening while the account is offline. Keep the NapCat work directory, injection library and environment paths from one tested installation together.
+
+The Glassbox launch environment must include `LORA_PI_KIT_PATH` whenever a configured Channel uses a `pi:*` execution reference. Starting only the HTTP server without that path can accept a message but fail before Pi creates the Run session. Use `npm run agent:up` for normal recovery instead of manually launching the three processes with partial environment variables.
+
+If NapCat reports that its saved quick-login state has expired, keep the one `agent:up` process running and complete login through the local NapCat WebUI. Do not restart it repeatedly to refresh QR images. A successful login starts the configured OneBot endpoint, and the auto-connect Channel then reconnects without restarting Glassbox.
+
+The service file accepts only the documented non-secret environment keys.
 
 The service manager launches fixed executables without a shell. It records process identity in the data directory and verifies it before shutdown. Named Herdr sessions use Herdr's public session status and stop commands.
+
+The `glassbox` CLI and `agent:up` use the same service data directory. By default both use
+`~/.glassbox` and port 3030. Set `GLASSBOX_DATA_DIR` and `PORT` to the same values as the
+service when using a custom launch configuration. For the default Windows service configuration:
+
+```powershell
+$env:GLASSBOX_DATA_DIR = Join-Path $env:USERPROFILE '.glassbox'
+$env:PORT = '3030'
+npm run glassbox -- capabilities probe p3-qq 1126022432 --json
+```
+
+When running `dev:server` directly, the server uses the repository's `.glassbox` directory unless
+`GLASSBOX_DATA_DIR` is set. Set the same `GLASSBOX_DATA_DIR` and `PORT` in the CLI shell to target
+that development server. The CLI does not create, rotate, or copy management credentials.
 
 Do not keep parallel lint / format / type-check stacks without a demonstrated compatibility need.
 

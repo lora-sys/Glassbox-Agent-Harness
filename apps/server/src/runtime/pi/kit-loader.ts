@@ -217,6 +217,14 @@ export class KitLoader {
     };
   }
 
+  public profileNames(): string[] {
+    return fs
+      .readdirSync(path.join(this.kitPath, "profiles"), { withFileTypes: true })
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+      .map((entry) => entry.name.slice(0, -".json".length))
+      .sort();
+  }
+
   public loadProfile(name: PiRuntimeProfileName): ResolvedKitProfile {
     const profilePath = path.join(this.kitPath, "profiles", `${name}.json`);
     if (!fs.existsSync(profilePath)) {
