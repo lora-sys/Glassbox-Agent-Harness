@@ -1,9 +1,16 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
+import { Type } from "typebox";
+import type { AuthorizationService } from "../../auth/service.js";
 import { QQ_CAPABILITIES } from "../../channels/onebot/capabilities.js";
 import { FakeHerdrBridge } from "../../ops/fake-herdr-bridge.js";
 import { AuthorizedOpsService } from "../../ops/service.js";
 import { openDomainStore } from "../../persistence/index.js";
+import { RunTraceStore } from "../../trace/run-store.js";
 import { createOpsTools } from "./ops-tools.js";
+import { createProtectedTool } from "./protected-tools.js";
 import {
   GLASSBOX_HOST_EXCLUDED_PI_TOOLS,
   PI_BUILTIN_TOOLS,
@@ -11,12 +18,30 @@ import {
   TOOL_DESCRIPTORS,
   TOOL_SURFACE_POLICY_VERSION,
   assertProfileSelectionComplete,
+  composeToolDescriptorCatalog,
   describeToolDrift,
   describeToolSurface,
+  type ToolDescriptor,
   toolDescriptor,
   toolOperationalState,
   toolOutcomeFromFailure,
 } from "./tool-plane.js";
+
+const FUTURE_MCP_FIXTURE: ToolDescriptor = {
+  name: "fixture_mcp_lookup",
+  origin: "mcp",
+  schemaVersion: "fixture-mcp-lookup-v1",
+  riskClass: "read",
+  provider: "fixture-mcp",
+  discovery: "owner_private",
+  authorization: { action: "fixture:read", resource: "fixture-record" },
+  availability: "connection_state",
+  resultProjection: "projected",
+  grounding: "integration",
+  budgetClass: "integration",
+};
+
+const FUTURE_MCP_CATALOG = composeToolDescriptorCatalog([FUTURE_MCP_FIXTURE]);
 
 describe("P5 tool plane origins", () => {
   it("gives every registered Glassbox domain Tool a descriptor with a real provider", () => {
@@ -200,6 +225,242 @@ describe("P5 tool plane origins", () => {
       }
     } finally {
       await store.close();
+    }
+  });
+});
+
+describe("P5 future-origin Tool contract", () => {
+  it("carries one non-QQ MCP Tool through descriptor, discovery, authorization and evidence", async () => {
+    const descriptor = toolDescriptor(FUTURE_MCP_FIXTURE.name, FUTURE_MCP_CATALOG);
+    expect(descriptor).toEqual(FUTURE_MCP_FIXTURE);
+    expect(descriptor?.origin).toBe("mcp");
+    expect(descriptor?.authorization).toEqual({
+      action: "fixture:read",
+      resource: "fixture-record",
+    });
+
+    const drift = describeToolDrift({
+      profileName: "main-agent",
+      profileActiveTools: [FUTURE_MCP_FIXTURE.name],
+      descriptors: FUTURE_MCP_CATALOG,
+    });
+    expect(drift.compatible).toBe(true);
+    expect(drift.unknownTools).toEqual([]);
+
+    const surface = describeToolSurface({
+      profileName: "main-agent",
+      profileActiveTools: [],
+      candidates: [{ name: FUTURE_MCP_FIXTURE.name, exclusion: null }],
+      descriptors: FUTURE_MCP_CATALOG,
+      providerReadiness: { [FUTURE_MCP_FIXTURE.name]: "ready" },
+      generatedAt: "2026-09-23T00:00:00.000Z",
+    });
+    expect(surface.selected).toEqual([
+      expect.objectContaining({
+        name: FUTURE_MCP_FIXTURE.name,
+        origin: "mcp",
+        provider: "fixture-mcp",
+        schemaVersion: "fixture-mcp-lookup-v1",
+        providerReadiness: "ready",
+      }),
+    ]);
+    expect(surface.undescribed).toEqual([]);
+
+    if (!descriptor) throw new Error("future-origin fixture descriptor was not registered");
+    const fixtureAction = descriptor.authorization?.action;
+    if (typeof fixtureAction !== "string") throw new Error("fixture action binding is invalid");
+    const discovered = surface.selected.some((entry) => entry.name === descriptor.name);
+    expect(discovered).toBe(true);
+
+    const caller = {
+      principalId: "owner",
+      scope: {
+        connectionId: "fixture-mcp",
+        botId: "fixture-bot",
+        chatType: "private" as const,
+        chatId: "owner",
+        senderId: "owner",
+      },
+    };
+    const traceDirectory = await mkdtemp(join(tmpdir(), "glassbox-tool-plane-mcp-"));
+    const store = await openDomainStore({ databasePath: ":memory:" });
+    const trace = new RunTraceStore(traceDirectory);
+    try {
+      await store.identities.bindOwner(caller.principalId, caller.scope);
+      await store.conversations.createAgent("personal");
+      for (const action of ["run:create", "conversation:read", "trace:write"])
+        await store.authorization.grant({
+          principalId: caller.principalId,
+          resourceId: "agent:personal",
+          action,
+          scope: caller.scope,
+          effect: "allow",
+        });
+      const accepted = await store.conversations.acceptIncoming({
+        agentId: "personal",
+        scope: caller.scope,
+        messageId: "fixture-message",
+        text: "run the fixture MCP lookup",
+        executionRef: "fixture-mcp-test",
+      });
+      const targetResourceId = "fixture-record-1";
+      await store.authorization.registerResource({
+        id: targetResourceId,
+        kind: descriptor.authorization?.resource ?? "fixture-record",
+        visibility: "public",
+      });
+
+      const decisions: Awaited<ReturnType<typeof store.authorization.check>>[] = [];
+      const authorizationRequests: Parameters<typeof store.authorization.check>[0][] = [];
+      const recordingAuthorization = new Proxy(store.authorization, {
+        get(target, property, receiver) {
+          if (property === "check")
+            return async (request: Parameters<typeof target.check>[0]) => {
+              authorizationRequests.push(request);
+              const decision = await target.check(request);
+              decisions.push(decision);
+              return decision;
+            };
+          const value = Reflect.get(target, property, receiver);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      }) as AuthorizationService;
+      const protectedContext = {
+        caller,
+        conversationId: accepted.conversation.id,
+        runId: accepted.run.id,
+      };
+      let executions = 0;
+      let executionEvidence: Awaited<ReturnType<RunTraceStore["append"]>> | undefined;
+      const fixtureTool = createProtectedTool<
+        { query: string },
+        { status: "ok"; records: { id: string; query: string }[] }
+      >({
+        name: descriptor.name,
+        description: "Read one bounded record from the deterministic MCP fixture.",
+        parameters: Type.Object(
+          { query: Type.String({ minLength: 1 }) },
+          { additionalProperties: false },
+        ),
+        action: fixtureAction,
+        resourceId: targetResourceId,
+        authService: recordingAuthorization,
+        getContext: () => protectedContext,
+        execute: async (params) => {
+          executions++;
+          const authorization = decisions.at(-1);
+          if (!authorization || authorization.decision !== "ALLOW")
+            throw new Error("fixture authorization evidence missing");
+          const result = {
+            status: "ok" as const,
+            records: [{ id: targetResourceId, query: params.query }],
+          };
+          executionEvidence = await trace.append(
+            accepted.run.id,
+            {
+              type: "tool_execution",
+              tool: descriptor.name,
+              outcome: "success",
+              authorizationDecisionId: authorization.id,
+              resultShape: "bounded_records",
+              recordCount: result.records.length,
+            },
+            "fixture-mcp",
+          );
+          await store.evidence.advanceTrace(caller, executionEvidence);
+          return result;
+        },
+      });
+      const invoke = (params: Record<string, unknown>) =>
+        fixtureTool.execute("call", params, undefined, undefined, {} as never);
+
+      await expect(invoke({ query: "denied" })).rejects.toThrow("Permission denied: no_grant");
+      expect(executions).toBe(0);
+      expect(decisions.at(-1)).toMatchObject({
+        decision: "DENY",
+        reason: "no_grant",
+      });
+      expect(authorizationRequests.at(-1)).toMatchObject({
+        resourceId: targetResourceId,
+        action: fixtureAction,
+      });
+
+      await store.authorization.grant({
+        principalId: caller.principalId,
+        resourceId: targetResourceId,
+        action: fixtureAction,
+        scope: caller.scope,
+        effect: "allow",
+      });
+      const response = await invoke({ query: "allowed" });
+      const authorization = decisions.at(-1);
+      expect(authorization).toMatchObject({
+        decision: "ALLOW",
+        reason: "explicit_grant",
+      });
+      expect(authorization?.id).toMatch(/^[0-9a-f-]{36}$/u);
+      expect(authorizationRequests.at(-1)).toMatchObject({
+        resourceId: targetResourceId,
+        action: fixtureAction,
+      });
+      expect(executions).toBe(1);
+      expect(response).toMatchObject({
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              status: "ok",
+              records: [{ id: targetResourceId, query: "allowed" }],
+            }),
+          },
+        ],
+        details: {
+          status: "ok",
+          records: [{ id: targetResourceId, query: "allowed" }],
+        },
+      });
+      expect(executionEvidence).toBeDefined();
+      expect(executionEvidence).toMatchObject({
+        runId: accepted.run.id,
+        traceRef: accepted.run.id,
+        eventCount: 1,
+      });
+      const evidence = executionEvidence!;
+      expect(response.details).toEqual({
+        status: "ok",
+        records: [{ id: targetResourceId, query: "allowed" }],
+      });
+      const rawTrace = await trace.readPage(accepted.run.id);
+      expect(rawTrace.records).toHaveLength(1);
+      expect(rawTrace.records[0]).toMatchObject({
+        seq: 1,
+        event: {
+          type: "tool_execution",
+          tool: descriptor.name,
+          outcome: "success",
+          authorizationDecisionId: authorization?.id,
+          resultShape: "bounded_records",
+        },
+        provenance: "fixture-mcp",
+      });
+      expect(await store.evidence.getTrace(caller, accepted.run.id)).toEqual(evidence);
+
+      const recordedEvent = rawTrace.records[0]?.event as { outcome?: string };
+      const operationalObservation = {
+        registered: true,
+        discoverable: discovered,
+        authorization: "allowed" as const,
+        provider: "ready" as const,
+        lastExecution: {
+          outcome:
+            recordedEvent.outcome === "success" ? ("success" as const) : ("unknown" as const),
+          at: rawTrace.records[0]?.ts ?? "unknown",
+        },
+      };
+      expect(toolOperationalState(operationalObservation)).toBe("succeeded");
+    } finally {
+      await store.close();
+      await rm(traceDirectory, { recursive: true, force: true });
     }
   });
 });
@@ -412,6 +673,23 @@ describe("P5 Tool operational state", () => {
     expect(toolOperationalState(registered)).toBe("provider_ready");
   });
 
+  it("distinguishes discovery from live authorization before provider readiness", () => {
+    expect(
+      toolOperationalState({
+        ...registered,
+        authorization: "unknown",
+        provider: "unknown",
+      }),
+    ).toBe("discoverable");
+    expect(
+      toolOperationalState({
+        ...registered,
+        authorization: "allowed",
+        provider: "unknown",
+      }),
+    ).toBe("authorized");
+  });
+
   it("reports provider readiness without claiming the Tool has ever run", () => {
     const state = toolOperationalState(registered);
     expect(state).not.toBe("succeeded");
@@ -448,11 +726,17 @@ describe("P5 Tool operational state", () => {
         authorization: "allowed",
         provider: "unknown",
       }),
-    ).toBe("unknown");
+    ).toBe("authorized");
   });
 
   it("does not let a denied authorization masquerade as readiness", () => {
-    expect(toolOperationalState({ ...registered, authorization: "denied" })).toBe("registered");
+    const denied = { ...registered, authorization: "denied" as const };
+    // `discoverable` here only means the Run surface exposed the candidate. The separate
+    // authorization field remains denied, so this state cannot be used as an executable Tool.
+    expect(denied.authorization).toBe("denied");
+    expect(toolOperationalState(denied)).toBe("discoverable");
+    expect(toolOperationalState(denied)).not.toBe("authorized");
+    expect(toolOperationalState(denied)).not.toBe("provider_ready");
   });
 });
 

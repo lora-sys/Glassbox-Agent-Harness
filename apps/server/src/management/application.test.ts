@@ -219,6 +219,47 @@ async function fixture(
 }
 
 describe("channel to durable run composition", () => {
+  it("exposes Tool-plane diagnostics only for the current Owner's Run", async () => {
+    const f = await fixture(async () => ({ status: "succeeded", text: "private answer" }), {
+      coOwnerId: "10005",
+    });
+    f.send(1, "owner-private", true);
+    const ownerRun = await f.started.take();
+    await f.app.runs.waitForRun(ownerRun.caller, ownerRun.run.id);
+
+    const ownerResult = await f.app.route({
+      method: "GET",
+      url: `/manage/runs/${ownerRun.run.id}/tool-plane`,
+    } as never);
+    expect(ownerResult?.status).toBe(200);
+    expect(ownerResult?.body).toMatchObject({
+      runId: ownerRun.run.id,
+      trace: { complete: true },
+      surface: { observed: false, selectedCount: 0, tools: [] },
+    });
+    expect(JSON.stringify(ownerResult?.body)).not.toContain("private answer");
+
+    f.send(2, "visitor-private", true, 10004);
+    const visitorRun = await f.started.take();
+    await f.app.runs.waitForRun(visitorRun.caller, visitorRun.run.id);
+    await expect(
+      f.app.route({
+        method: "GET",
+        url: `/manage/runs/${visitorRun.run.id}/tool-plane`,
+      } as never),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+
+    f.send(3, "another-owner-private", true, 10005);
+    const foreignOwnerRun = await f.started.take();
+    await f.app.runs.waitForRun(foreignOwnerRun.caller, foreignOwnerRun.run.id);
+    await expect(
+      f.app.route({
+        method: "GET",
+        url: `/manage/runs/${foreignOwnerRun.run.id}/tool-plane`,
+      } as never),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+  });
+
   it("keeps an auto-connect channel retrying when OneBot becomes ready after server startup", async () => {
     const directory = await mkdtemp(join(tmpdir(), "glassbox-late-onebot-"));
     cleanup.push(() => removeDirectory(directory));

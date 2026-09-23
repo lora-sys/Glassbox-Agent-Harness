@@ -138,7 +138,7 @@ After login recovery, Run `706697fc-686c-4fe9-a011-4715650d9ec7` finished as `un
 Pi or Tool event. The manually started Glassbox process had `GLASSBOX_DATA_DIR` but omitted
 `LORA_PI_KIT_PATH`, so the service accepted the QQ message but could not create the Pi session.
 The service was restarted with the complete configured environment. The development documentation
-now directs normal recovery through `vp run agent:up`, requires the Pi Kit path for `pi:*`
+now directs normal recovery through `npm run agent:up`, requires the Pi Kit path for `pi:*`
 executions, and requires a tested isolated QQ executable for NapCat.
 
 ## Exact-text projection finding and correction
@@ -209,3 +209,31 @@ The delivered text contained exactly one record and only the requested fields:
 This confirms the complete Issue 16 live path: authenticated QQ delivery, required Tool use, real
 history paging to the provider boundary, exact-message filtering below the model, bounded field
 projection, successful Run completion, and successful delivery.
+
+## Fresh read-only capability probe
+
+On 2026-09-23, the service was started with `npm run agent:up`. Glassbox reported ready, the
+configured channel `p3-qq` connected to NapCat, and its Bot ID matched `3394947361`. The explicit
+read-only probe targeted only dedicated test group `1126022432` at `2026-09-23T05:05:59Z`.
+
+All six provider-backed calls succeeded. The managed listing also succeeded without claiming a
+provider read:
+
+| Tool | Operation | Outcome | Safe result shape | Raw Trace seq |
+| --- | --- | --- | --- | --- |
+| `qq_groups` | managed listing | success, not provider-backed | object: `connectionId`, `groups` | 106 |
+| `qq_groups` | `get_group_info` | success | object with six metadata fields | 107 |
+| `qq_group_members` | `get_group_member_list` | success | array, 4 members | 108 |
+| `qq_group_history` | `get_group_msg_history` | success | object: `messages` | 109 |
+| `qq_group_content` | `_get_group_notice` | success, empty | array, 0 items | 110 |
+| `qq_group_content` | `get_essence_msg_list` | success, empty | array, 0 items | 111 |
+| `qq_group_files` | `get_group_root_files` | success | object: `files`, `folders` | 112 |
+
+The events are persisted as `capability.probed` in the Glassbox task Trace with Principal,
+timestamp, target group, provider outcome, and result shape. They do not include message text or
+member profiles. This probe does not cover an exact-identifier `group_history_search` Run; the
+successful end-to-end exact search above remains its separate evidence.
+
+For local startup, `docs/tech-stack.md` now uses `npm run agent:up/status/logs/down`. On Windows,
+`vp run agent:up` cleans up its detached service child after the Vite+ task exits. Isolated
+verification confirmed the npm commands leave the service running until `down` stops it.

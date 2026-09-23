@@ -3,8 +3,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vite-plus/test";
+import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import type { AgentRun, Conversation } from "@glassbox/contracts";
-import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import type {
+  AgentSessionEvent,
+  ModelRuntime,
+  ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import { glassboxSystemPrompt, PiSdkRuntimeAdapter } from "./adapter.js";
 
 it("does not treat a context-hidden tool as an unimplemented product capability", () => {
@@ -308,6 +314,114 @@ describe("PiSdkRuntimeAdapter", () => {
     // profile declaration it ran under rather than against whatever the Kit holds today.
     const version = (surface as { profileVersion: string }).profileVersion;
     expect(version).toMatch(/^[a-f0-9]{64}$/u);
+    await adapter.cleanup();
+  });
+
+  it("sends exactly the selected Effective Tool Surface schemas to the Pi model context", async () => {
+    const runtimeBaseDir = await mkdtemp(join(tmpdir(), "glassbox-pi-runtime-provider-context-"));
+    directories.push(runtimeBaseDir);
+    let capturedContext: { tools?: readonly { name: string }[] } | undefined;
+    let surface:
+      | {
+          selected: readonly { name: string }[];
+          excluded: readonly { name: string; reason: string }[];
+        }
+      | undefined;
+
+    const model = {
+      id: "fixture-model",
+      name: "Fixture model",
+      api: "openai-completions",
+      provider: "fixture-provider",
+      baseUrl: "http://fixture.invalid",
+      reasoning: false,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 8_192,
+      maxTokens: 256,
+    } as never;
+
+    const modelRuntime = {
+      hasConfiguredAuth: () => true,
+      checkAuth: async () => undefined,
+      isUsingOAuth: () => false,
+      streamSimple: (_model: unknown, context: { tools?: readonly { name: string }[] }) => {
+        capturedContext = context;
+        const stream = createAssistantMessageEventStream();
+        const message = {
+          role: "assistant",
+          content: [{ type: "text", text: "fixture response" }],
+          api: "openai-completions",
+          provider: "fixture-provider",
+          model: "fixture-model",
+          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 },
+          stopReason: "stop",
+          timestamp: Date.now(),
+        } as never;
+        queueMicrotask(() => {
+          stream.push({ type: "start", partial: message });
+          stream.push({ type: "done", reason: "stop", message });
+        });
+        return stream;
+      },
+    } as unknown as ModelRuntime;
+
+    const tool = (name: string): ToolDefinition => ({
+      name,
+      label: name,
+      description: `Fixture ${name}`,
+      parameters: Type.Object({}),
+      execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
+    });
+
+    const adapter = new PiSdkRuntimeAdapter({
+      kitPath: fileURLToPath(new URL("./fixtures/lora-pi-kit", import.meta.url)),
+      runtimeBaseDir,
+      model,
+      modelRuntime,
+      customTools: [tool("qq_group_history"), tool("owner_group_admin"), tool("read")],
+      resolveToolCandidates: async () => [
+        { name: "qq_group_history", exclusion: null },
+        { name: "owner_group_admin", exclusion: "scope_not_permitted" },
+        { name: "read", exclusion: "disabled_by_host" },
+      ],
+      resolveSkillNames: async () => ({ names: [] }),
+      onEvent: (event) => {
+        if (event.type === "session_start") surface = event.data.toolSurface as typeof surface;
+      },
+    });
+
+    await adapter.initialize();
+    const context: PiRunContext = {
+      runId: run.id,
+      conversationId: conversation.id,
+      caller: {
+        principalId: "owner",
+        scope: {
+          connectionId: "qq",
+          botId: "bot",
+          chatType: "private" as const,
+          chatId: "owner",
+          senderId: "owner",
+        },
+      },
+    };
+    const binding = await adapter.createOrRestoreSession(conversation, "test", context);
+    await adapter.run(binding, run, "say hello", context);
+
+    expect(surface).toBeDefined();
+    expect(capturedContext?.tools?.map((entry) => entry.name)).toEqual(
+      surface?.selected.map((entry) => entry.name),
+    );
+    expect(capturedContext?.tools?.map((entry) => entry.name)).not.toContain("owner_group_admin");
+    expect(capturedContext?.tools?.map((entry) => entry.name)).not.toContain("read");
+    expect(surface?.excluded).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "owner_group_admin", reason: "scope_not_permitted" }),
+        expect.objectContaining({ name: "read", reason: "disabled_by_host" }),
+      ]),
+    );
+
     await adapter.cleanup();
   });
 

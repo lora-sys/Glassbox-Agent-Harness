@@ -104,9 +104,14 @@ import {
   type CallerContext,
 } from "../persistence/index.js";
 import { RunTraceStore } from "../trace/run-store.js";
+import type { TraceEntry } from "../trace/store.js";
 import { createRunEvaluator, RunEvalError } from "../eval/index.js";
 import { ManagementError } from "./access.js";
 import { readManagementJson } from "./http.js";
+import {
+  projectToolPlaneDiagnostics,
+  TOOL_PLANE_DIAGNOSTIC_RECORD_CAP,
+} from "./tool-plane-diagnostics.js";
 import { grantOpsPermissions } from "./ops-grants.js";
 import { createQqDeliveryPolicy, hostDeliveryForbiddenValues } from "../delivery/content-policy.js";
 import {
@@ -2295,7 +2300,9 @@ export class ManagementApplication {
         );
       }
       const runAction =
-        /^\/manage\/runs\/([A-Za-z0-9-]+)(?:\/(cancel|trace|deliveries|evals))?$/u.exec(path);
+        /^\/manage\/runs\/([A-Za-z0-9-]+)(?:\/(cancel|trace|tool-plane|deliveries|evals))?$/u.exec(
+          path,
+        );
       if (runAction) {
         const runId = runAction[1]!;
         const caller = await this.runCaller(runId);
@@ -2326,6 +2333,35 @@ export class ManagementApplication {
           // Recheck after file I/O before returning a protected projection.
           await this.store.conversations.getRun(caller, runId);
           return ok({ records, nextCursor, indexed });
+        }
+        if (request.method === "GET" && runAction[2] === "tool-plane") {
+          const indexed = await this.store.evidence.getTrace(caller, runId);
+          const records: TraceEntry<unknown>[] = [];
+          let cursor: string | undefined;
+          let nextCursor: string | null = null;
+          if (indexed) {
+            do {
+              const page = await this.trace.readPage(runId, {
+                ...(cursor ? { cursor } : {}),
+                limit: 50,
+                redactSecrets: true,
+              });
+              records.push(...page.records);
+              nextCursor = page.nextCursor;
+              cursor = page.nextCursor ?? undefined;
+            } while (nextCursor && records.length < TOOL_PLANE_DIAGNOSTIC_RECORD_CAP);
+          }
+          // The projection contains metadata only. Recheck after file I/O so a revoked or
+          // otherwise unavailable Owner Run never receives a stale trace view.
+          await this.store.conversations.getRun(caller, runId);
+          return ok(
+            projectToolPlaneDiagnostics({
+              runId,
+              records,
+              complete:
+                indexed !== null && nextCursor === null && records.length === indexed.eventCount,
+            }),
+          );
         }
         if (request.method === "GET" && !runAction[2])
           return ok({ run: await this.store.conversations.getRun(caller, runId) });

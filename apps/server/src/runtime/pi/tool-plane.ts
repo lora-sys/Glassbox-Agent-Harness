@@ -122,6 +122,16 @@ export interface ToolDescriptor {
 }
 
 /**
+ * The descriptor catalog a caller resolves against for one Tool-plane composition.
+ *
+ * The built-in catalog is the server's current product surface. Kit Extensions, MCP
+ * integrations and delegated Worker hosts may append descriptors to the same catalog after
+ * their own registration and authorization checks. Keeping the catalog explicit prevents a
+ * future origin from needing a parallel discovery or evidence path.
+ */
+export type ToolDescriptorCatalog = readonly ToolDescriptor[];
+
+/**
  * The Pi built-ins the Glassbox host refuses to activate in any Run.
  *
  * This list is the safety boundary that keeps a remote QQ Principal from inheriting host
@@ -421,9 +431,38 @@ export const TOOL_DESCRIPTORS: readonly ToolDescriptor[] = Object.freeze([
 
 const DESCRIPTORS_BY_NAME = new Map(TOOL_DESCRIPTORS.map((entry) => [entry.name, entry]));
 
+/**
+ * Composes registered future-origin descriptors with the server catalog.
+ *
+ * A duplicate name is ambiguous: two providers must never silently compete for one Tool
+ * schema or one evidence stream. The registration boundary therefore rejects duplicates
+ * before discovery can expose either one.
+ */
+export function composeToolDescriptorCatalog(
+  extensions: ToolDescriptorCatalog,
+): ToolDescriptorCatalog {
+  const entries = [...TOOL_DESCRIPTORS, ...extensions];
+  const names = new Set<string>();
+  for (const entry of entries) {
+    if (names.has(entry.name)) throw new Error(`Duplicate Tool descriptor: ${entry.name}`);
+    names.add(entry.name);
+  }
+  return Object.freeze(entries);
+}
+
+function descriptorMap(
+  catalog: ToolDescriptorCatalog = TOOL_DESCRIPTORS,
+): ReadonlyMap<string, ToolDescriptor> {
+  if (catalog === TOOL_DESCRIPTORS) return DESCRIPTORS_BY_NAME;
+  return new Map(catalog.map((entry) => [entry.name, entry]));
+}
+
 /** The descriptor for one Tool name, or `undefined` when Glassbox does not describe it. */
-export function toolDescriptor(name: string): ToolDescriptor | undefined {
-  return DESCRIPTORS_BY_NAME.get(name);
+export function toolDescriptor(
+  name: string,
+  catalog: ToolDescriptorCatalog = TOOL_DESCRIPTORS,
+): ToolDescriptor | undefined {
+  return descriptorMap(catalog).get(name);
 }
 
 /* ------------------------------------------------------------------ *
@@ -457,12 +496,14 @@ export interface ToolDriftReport {
 export function describeToolDrift(input: {
   profileName: PiRuntimeProfileName;
   profileActiveTools: readonly string[];
+  descriptors?: ToolDescriptorCatalog;
 }): ToolDriftReport {
+  const descriptors = descriptorMap(input.descriptors);
   const disabledByHost: string[] = [];
   const unknownTools: string[] = [];
   for (const name of input.profileActiveTools) {
     if (PI_BUILTIN_TOOLS.includes(name)) disabledByHost.push(name);
-    else if (!DESCRIPTORS_BY_NAME.has(name)) unknownTools.push(name);
+    else if (!descriptors.has(name)) unknownTools.push(name);
   }
   return {
     profileName: input.profileName,
@@ -650,14 +691,17 @@ export function describeToolSurface(input: {
   profileName: PiRuntimeProfileName;
   profileActiveTools: readonly string[];
   candidates: readonly ToolSurfaceCandidate[];
+  descriptors?: ToolDescriptorCatalog;
   profileVersion?: string;
   policyVersion?: string;
   providerReadiness?: Readonly<Record<string, "ready" | "unavailable" | "unknown">>;
   generatedAt?: string;
 }): EffectiveToolSurface {
+  const descriptors = descriptorMap(input.descriptors);
   const drift = describeToolDrift({
     profileName: input.profileName,
     profileActiveTools: input.profileActiveTools,
+    descriptors: input.descriptors,
   });
   const selected: ToolSurfaceEntry[] = [];
   const excluded: ExcludedToolSurfaceEntry[] = [];
@@ -667,7 +711,7 @@ export function describeToolSurface(input: {
     input.providerReadiness?.[name] ?? "unknown";
 
   for (const candidate of input.candidates) {
-    const descriptor = DESCRIPTORS_BY_NAME.get(candidate.name);
+    const descriptor = descriptors.get(candidate.name);
     if (!descriptor) {
       undescribed.push(candidate.name);
       continue;
@@ -682,7 +726,7 @@ export function describeToolSurface(input: {
   // considered it, because the profile is where a reader would otherwise believe it exists.
   for (const name of drift.disabledByHost) {
     if (seen.has(name)) continue;
-    const descriptor = DESCRIPTORS_BY_NAME.get(name);
+    const descriptor = descriptors.get(name);
     if (!descriptor) continue;
     seen.add(name);
     excluded.push({
@@ -783,8 +827,9 @@ export interface ToolOperationalObservation {
  * The strongest state the current evidence supports.
  *
  * A last execution, when there is one, wins: it is the only direct observation. Without one,
- * the answer walks the ladder down from `provider_ready`, and stops at `registered` whenever
- * authorization was denied — a denied Tool is not a ready Tool, however healthy its provider.
+ * the answer walks the ladder from registration through discovery and live authorization to
+ * provider readiness. A discovered Tool whose live gate is not allowed is still discoverable,
+ * but it is never treated as authorized or ready.
  */
 export function toolOperationalState(
   observation: ToolOperationalObservation,
@@ -796,7 +841,7 @@ export function toolOperationalState(
       case "success":
         return "succeeded";
       case "denied":
-        return "registered";
+        return observation.discoverable ? "discoverable" : "registered";
       case "invalid_input":
       case "provider_failed":
         return "failed";
@@ -811,8 +856,8 @@ export function toolOperationalState(
     }
   }
   if (!observation.discoverable) return "registered";
-  if (observation.authorization !== "allowed") return "registered";
+  if (observation.authorization !== "allowed") return "discoverable";
   if (observation.provider === "unavailable") return "unavailable";
-  if (observation.provider === "unknown") return "unknown";
+  if (observation.provider === "unknown") return "authorized";
   return "provider_ready";
 }

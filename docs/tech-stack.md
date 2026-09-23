@@ -56,10 +56,13 @@ Vite+ is expected to cover Vite / Rolldown, Vitest, Oxlint, Oxfmt, tsdown, and w
 
 The configured local Personal Agent environment has one service command surface:
 
-    vp run agent:up
-    vp run agent:status
-    vp run agent:logs
-    vp run agent:down
+    npm run agent:up
+    npm run agent:status
+    npm run agent:logs
+    npm run agent:down
+
+On Windows, do not start the long-running service with `vp run agent:up`. Vite+ terminates its
+detached service child when the task exits. The npm scripts invoke the service manager directly.
 
 agent:up reads optional Herdr, NapCat and Glassbox launch settings from
 <GLASSBOX_DATA_DIR>/service-launch.json. Without that environment variable, it uses
@@ -69,7 +72,7 @@ credentials in the existing protected Channel and model stores. agent:up is idem
 It keeps verified running processes and starts only missing services.
 For NapCat restart login, append the Bot QQ number to the launcher arguments after the QQ executable and injection library. Pin the first NapCat argument to the tested QQ executable. Do not point it at an auto-updated system QQ installation: an unsupported QQ build can leave OneBot listening while the account is offline. Keep the NapCat work directory, injection library and environment paths from one tested installation together.
 
-The Glassbox launch environment must include `LORA_PI_KIT_PATH` whenever a configured Channel uses a `pi:*` execution reference. Starting only the HTTP server without that path can accept a message but fail before Pi creates the Run session. Use `vp run agent:up` for normal recovery instead of manually launching the three processes with partial environment variables.
+The Glassbox launch environment must include `LORA_PI_KIT_PATH` whenever a configured Channel uses a `pi:*` execution reference. Starting only the HTTP server without that path can accept a message but fail before Pi creates the Run session. Use `npm run agent:up` for normal recovery instead of manually launching the three processes with partial environment variables.
 
 If NapCat reports that its saved quick-login state has expired, keep the one `agent:up` process running and complete login through the local NapCat WebUI. Do not restart it repeatedly to refresh QR images. A successful login starts the configured OneBot endpoint, and the auto-connect Channel then reconnects without restarting Glassbox.
 
