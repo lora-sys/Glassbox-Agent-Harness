@@ -157,6 +157,7 @@ function safeToolFailureCode(result: unknown): string {
     return "tool_execution_failed";
   }
   if (text.includes("context_missing")) return "context_missing";
+  if (text.includes("mutation_already_attempted")) return "mutation_already_attempted";
   if (text.includes("Permission denied")) return "authorization_denied";
   if (text.includes("native_group_role_denied") || text.includes("native_group_role_unverified"))
     return "authorization_denied";

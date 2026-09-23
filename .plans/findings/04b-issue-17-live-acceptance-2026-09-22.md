@@ -191,3 +191,13 @@ The following real QQ steps still require messages or role changes from the name
 
 Do not refresh the QR code while the authenticated OneBot connection remains healthy. A QR image is
 not login evidence; the established authenticated socket and successful provider calls are.
+
+## Tool-plane diagnosis of the duplicate attempt
+
+After PR 19 was rebased onto the Owner Tool-plane diagnostic route, a live authenticated read of
+Run `51804c1d-1b2d-4455-9a73-b23e6ab1f0d0` returned a complete bounded surface with 24 selected
+Tools and 11 exclusions. The latest `qq_group_settings` call was reported as `unknown`: the
+existing safe failure-code classifier did not recognize `mutation_already_attempted`. The earlier
+provider postcondition failure remains in Raw Trace. The classifier now preserves this fixed code
+and maps it to the non-success `denied` outcome, so the next diagnostic read can distinguish the
+blocked duplicate from an unclassified failure without exposing Tool text.

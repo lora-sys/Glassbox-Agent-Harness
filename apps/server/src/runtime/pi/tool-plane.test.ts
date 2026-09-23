@@ -748,6 +748,7 @@ describe("P5 Tool execution outcomes", () => {
       "authorization_denied",
       "capability_category_disabled",
       "context_missing",
+      "mutation_already_attempted",
       "provider_denied",
     ])
       expect(toolOutcomeFromFailure(code)).toBe("denied");
