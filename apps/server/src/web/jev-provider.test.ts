@@ -43,6 +43,43 @@ describe("Jev provider", () => {
     });
   });
 
+  it("reads validated answers from the System One success envelope", async () => {
+    const provider = new JevProvider({
+      apiKey: "test",
+      fetcher: vi.fn(async () =>
+        response(200, {
+          code: 0,
+          message: "success",
+          data: {
+            result: {
+              answers: { query: { type: "choice", choice: "q1" } },
+              usage: { totalTokens: 12 },
+              elapsedMs: 34,
+            },
+            creditsUsed: 1,
+          },
+        }),
+      ),
+    });
+    expect(await provider.chooseQuery("query", ["one", "two"])).toEqual({
+      status: "ready",
+      value: 1,
+    });
+  });
+
+  it.each([
+    { code: 1, data: { result: { answers: { query: { type: "choice", choice: "q0" } } } } },
+    { code: 0, data: { result: { answers: [] } } },
+    { code: 0, data: { result: {} } },
+    { code: 0, answers: { query: { type: "choice", choice: "q0" } } },
+  ])("rejects a failed or malformed System One envelope", async (body) => {
+    const provider = new JevProvider({
+      apiKey: "test",
+      fetcher: vi.fn(async () => response(200, body)),
+    });
+    expect(await provider.chooseQuery("query", ["one", "two"])).toEqual({ status: "failed" });
+  });
+
   it("scores candidate relevance in one batched call and bounds question count", async () => {
     const fetcher = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(typeof init?.body === "string" ? init.body : "{}") as {

@@ -169,6 +169,20 @@ function isInTimeRange(
   );
 }
 
+function isFreshnessQuery(query: string): boolean {
+  return /\b(?:latest|newest|recent|current)\b|最新|近期|最近|本月|今年/iu.test(query);
+}
+
+function recentMonthVariant(query: string, now: Date, monthsAgo: number): string {
+  const month = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - monthsAgo, 1));
+  const year = month.getUTCFullYear();
+  const number = month.getUTCMonth() + 1;
+  const suffix = /[\u3400-\u9fff]/u.test(query)
+    ? `${year}年${number}月`
+    : `${new Intl.DateTimeFormat("en-US", { month: "long", timeZone: "UTC" }).format(month)} ${year}`;
+  return `${query} ${suffix}`;
+}
+
 export function canonicalWebUrl(url: URL): string {
   const canonical = new URL(url.href);
   canonical.hash = "";
@@ -218,6 +232,14 @@ export class WebService {
     const planned = await this.planner.plan(query);
     const variants = [...new Set(planned.queryVariants.filter(Boolean))].slice(0, 3);
     if (!variants.includes(query)) variants.unshift(query);
+    const now = this.now();
+    if (isFreshnessQuery(query) && planned.mode === "fast") {
+      // A current-month query supplies newer candidates that a broad provider query can miss.
+      // Keep provider relevance order: publication dates are often absent, including on real
+      // recent official articles, so sorting unknown dates last would hide those candidates.
+      variants.splice(0, variants.length, recentMonthVariant(query, now, 0), query);
+      variants.push(recentMonthVariant(query, now, 1));
+    }
     const boundedVariants = variants.slice(0, 3);
     const providerResults = await Promise.allSettled(
       boundedVariants.map((variant) => this.provider.search({ query: variant, maxResults: limit })),
@@ -273,7 +295,7 @@ export class WebService {
       );
     const seen = new Map<string, WebSearchResultItem>();
     let discarded = 0;
-    const nowMs = this.now().getTime();
+    const nowMs = now.getTime();
     for (const candidate of candidates) {
       try {
         const url = await this.publicUrl(candidate.url);
@@ -313,6 +335,27 @@ export class WebService {
       }
     }
     let ordered = [...seen.values()];
+    if (isFreshnessQuery(query) && planned.mode === "fast") {
+      // Use the broad query to rank source domains, then preserve the current-month
+      // candidate order inside each domain. Exa often omits dates on recent articles.
+      const base = providerResults[boundedVariants.indexOf(query)];
+      const domainRank = new Map<string, number>();
+      if (base?.status === "fulfilled" && base.value.status === "ready") {
+        for (const candidate of base.value.results) {
+          try {
+            const domain = new URL(candidate.url ?? "").hostname.toLowerCase();
+            if (!domainRank.has(domain)) domainRank.set(domain, domainRank.size);
+          } catch {
+            // Ignore an invalid domain ranking hint.
+          }
+        }
+      }
+      ordered.sort(
+        (a, b) =>
+          (domainRank.get(a.domain) ?? Number.MAX_SAFE_INTEGER) -
+            (domainRank.get(b.domain) ?? Number.MAX_SAFE_INTEGER) || a.rank - b.rank,
+      );
+    }
     if (planned.mode === "complex" && ordered.length > 1) {
       const scores = await this.planner.rerank(query, ordered).catch(() => []);
       const byUrl = new Map(scores.map((score) => [score.url, score.relevanceScore]));

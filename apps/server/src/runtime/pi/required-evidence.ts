@@ -47,7 +47,10 @@ export type RequiredEvidenceDomain =
   | "group_history_page"
   | "group_content"
   | "group_files"
-  | "account_status";
+  | "account_status"
+  | "browser_open"
+  | "browser_title"
+  | "browser_screenshot";
 
 export interface RequiredEvidence {
   readonly domain: RequiredEvidenceDomain;
@@ -375,7 +378,29 @@ export function requiredEvidenceFor(input: RequiredEvidenceInput): RequiredEvide
   const required: RequiredEvidence[] = [];
   const group = namedGroupId(text);
   const explicitUrl = /https?:\/\/[^\s，,。！？!?]+/iu.exec(text)?.[0];
-  if (explicitUrl && /(?:打开|读取|抓取|查看|总结|摘要|read|fetch|open|summarize)/iu.test(text))
+  const explicitBrowser = /(?:浏览器|\bbrowser\b)/iu.test(text);
+  if (explicitBrowser && explicitUrl && /(?:打开|访问|open|navigate)/iu.test(text)) {
+    required.push({
+      domain: "browser_open",
+      tool: "browser",
+      input: { action: "open", url: explicitUrl },
+    });
+    if (/(?:页面标题|网页标题|标题|page title)/iu.test(text))
+      required.push({
+        domain: "browser_title",
+        tool: "browser",
+        input: { action: "get", kind: "title" },
+      });
+    if (/(?:截图|截一张图|截屏|screenshot|screen shot)/iu.test(text))
+      required.push({
+        domain: "browser_screenshot",
+        tool: "browser",
+        input: { action: "screenshot" },
+      });
+  } else if (
+    explicitUrl &&
+    /(?:打开|读取|抓取|查看|总结|摘要|read|fetch|open|summarize)/iu.test(text)
+  )
     required.push({ domain: "web_fetch", tool: WEB_FETCH_TOOL, input: { url: explicitUrl } });
   else if (
     ((/(?:搜索|搜一下|查找|检索|查询|上网查|web search|search the web|look up)/iu.test(text) &&
@@ -388,8 +413,17 @@ export function requiredEvidenceFor(input: RequiredEvidenceInput): RequiredEvide
     !groupHistorySearchRequested(text) &&
     !ownerHistorySearchRequested(text) &&
     !asksLiveQqFact(text)
-  )
+  ) {
     required.push({ domain: "web_search", tool: WEB_SEARCH_TOOL, input: {} });
+    // Search snippets are candidate evidence. When the caller explicitly asks to verify an
+    // official source, a successful search alone cannot support "I checked the official page".
+    if (
+      /(?:核对|验证|查证|确认|verify|check)[^。！？!?\n]{0,80}(?:官网|官方|来源|source|official)|(?:官网|官方|来源|source|official)[^。！？!?\n]{0,80}(?:核对|验证|查证|确认|verify|check)/iu.test(
+        text,
+      )
+    )
+      required.push({ domain: "web_fetch", tool: WEB_FETCH_TOOL, input: {} });
+  }
 
   if (input.chatType === "group") {
     // A group Run is bound to its own group, so a domain the message asks about needs no
@@ -501,6 +535,7 @@ export interface ObservedToolCall {
   readonly failed?: boolean;
   readonly toolCallId?: string;
   readonly outcome?: ToolExecutionOutcome;
+  readonly result?: unknown;
 }
 
 /**
@@ -527,11 +562,36 @@ export interface EvidenceResolution {
  * answered a different question is not evidence for this one.
  */
 function callObserved(evidence: RequiredEvidence, call: ObservedToolCall): boolean {
-  return (
+  const matches =
     call.name === evidence.tool &&
     call.failed === false &&
-    satisfiesRequiredInput(evidence.input, call.input)
-  );
+    satisfiesRequiredInput(evidence.input, call.input);
+  if (!matches) return false;
+  return evidence.domain !== "browser_screenshot" || hasArtifactId(call.result);
+}
+
+/** A screenshot is evidence only when the browser Tool returned its durable Artifact id. */
+function hasArtifactId(value: unknown, depth = 0): boolean {
+  if (depth > 5 || value === null || value === undefined) return false;
+  if (typeof value === "string") {
+    try {
+      return hasArtifactId(JSON.parse(value) as unknown, depth + 1);
+    } catch {
+      return false;
+    }
+  }
+  if (Array.isArray(value)) return value.some((item) => hasArtifactId(item, depth + 1));
+  if (typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+  const artifact = record.artifact;
+  if (
+    artifact !== null &&
+    typeof artifact === "object" &&
+    typeof (artifact as Record<string, unknown>).id === "string" &&
+    (artifact as Record<string, unknown>).id !== ""
+  )
+    return true;
+  return Object.values(record).some((item) => hasArtifactId(item, depth + 1));
 }
 
 /**

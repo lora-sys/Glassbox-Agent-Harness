@@ -84,3 +84,50 @@ it("delivers a persisted screenshot only to the Run's original, currently author
     f.app.readBrowserArtifactById("123e4567-e89b-42d3-a456-426614174000"),
   ).rejects.toMatchObject({ code: "NOT_FOUND", status: 404 });
 });
+
+it("delivers a same-Run screenshot reference and PNG to the original private QQ chat", async () => {
+  let complete!: (value: { status: "succeeded"; text: string }) => void;
+  const result = new Promise<{ status: "succeeded"; text: string }>((resolve) => {
+    complete = resolve;
+  });
+  const f = await fixture(async () => result);
+  f.send(773, "take screenshot", true);
+  const started = await f.started.take();
+  const directory = await mkdtemp(join(tmpdir(), "glassbox-artifact-send-"));
+  directories.push(directory);
+  const artifacts = await BrowserArtifactStore.open(directory);
+  (f.app as unknown as { browserArtifacts: BrowserArtifactStore }).browserArtifacts = artifacts;
+  const pngBase64 =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADUlEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+  const artifact = await artifacts.write(
+    {
+      runId: started.run.id,
+      conversationId: started.conversation.id,
+      principalId: started.caller.principalId,
+      workspaceId: `web-${started.run.id}`,
+      policyVersion: "workspace-sandbox-v1",
+    },
+    pngBase64,
+    1024,
+  );
+  complete({ status: "succeeded", text: `截图 Artifact：${artifact.id}` });
+  await f.app.runs.waitForRun(started.caller, started.run.id);
+  await f.app.runs.drain();
+
+  const deliveries = (await f.app.store.lifecycle.listDeliveries(started.caller, started.run.id))
+    .items;
+  expect(deliveries.map((delivery) => [delivery.payloadKind, delivery.status])).toEqual([
+    ["result", "sent"],
+    ["browser_artifact", "sent"],
+  ]);
+  const sends = f.actionLog.filter((action) => action.action === "send_private_msg");
+  expect(sends).toHaveLength(2);
+  expect(sends[0]?.params.message).toContainEqual({
+    type: "text",
+    data: { text: `截图 Artifact：${artifact.id}` },
+  });
+  expect(sends[1]?.params.message).toContainEqual({
+    type: "image",
+    data: { file: `base64://${pngBase64}` },
+  });
+});

@@ -128,7 +128,12 @@ export class JevProvider implements JevProviderClient {
       if (text === undefined) return { status: "failed" };
       if (text.length > MAX_BODY_CHARS) return { status: "failed" };
       const payload = asRecord(JSON.parse(text));
-      const answers = asRecord(payload?.answers);
+      const answers =
+        payload && "code" in payload
+          ? payload.code === 0
+            ? asRecord(asRecord(asRecord(payload.data)?.result)?.answers)
+            : undefined
+          : asRecord(payload?.answers);
       if (!answers) return { status: "failed" };
       const value = parse(answers);
       return value === undefined ? { status: "failed" } : { status: "ready", value };

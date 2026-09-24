@@ -69,6 +69,83 @@ describe("Web service", () => {
     expect(result.results[0]).not.toHaveProperty("confidence");
   });
 
+  it("searches recent months without letting a newer unrelated domain outrank relevance", async () => {
+    const search = vi.fn(async ({ query }: { query: string; maxResults: number }) => ({
+      status: "ready" as const,
+      results: query.includes("September 2026")
+        ? [
+            {
+              url: "https://unrelated.example/news",
+              title: "Unrelated September news",
+              publishedDate: "2026-09-22T09:00:00.000Z",
+            },
+            {
+              url: "https://vercel.com/blog/september-update",
+              title: "September update",
+              publishedDate: "2026-09-18T09:00:00.000Z",
+            },
+          ]
+        : [
+            {
+              url: "https://vercel.com/blog/july-update",
+              title: "July update",
+              publishedDate: "2026-07-15T09:00:00.000Z",
+            },
+            {
+              url: "https://vercel.com/blog/june-update",
+              title: "June update",
+              publishedDate: "2026-06-15T09:00:00.000Z",
+            },
+          ],
+    }));
+    const exa: WebProvider = {
+      search,
+      contents: vi.fn(async () => ({ status: "ready" as const, results: [] })),
+    };
+    const planner: WebPlanner = {
+      plan: async () => ({ mode: "fast", queryVariants: [], jevUsed: false }),
+      rerank: async () => [],
+    };
+
+    const result = await new WebService({
+      provider: exa,
+      planner,
+      resolveHost: publicResolver,
+      now,
+    }).search("run-1", { query: "find the latest Vercel blog posts", maxResults: 2 });
+
+    expect(result.plan.queryVariants).toEqual([
+      "find the latest Vercel blog posts September 2026",
+      "find the latest Vercel blog posts",
+      "find the latest Vercel blog posts August 2026",
+    ]);
+    expect(result.results.map(({ title }) => title)).toEqual(["September update", "July update"]);
+    expect(result.results.map(({ domain }) => domain)).toEqual(["vercel.com", "vercel.com"]);
+    expect(search).toHaveBeenCalledTimes(3);
+  });
+
+  it("uses Chinese calendar words for a Chinese freshness request", async () => {
+    const search = vi.fn(async () => ({ status: "ready" as const, results: [] }));
+    const planner: WebPlanner = {
+      plan: async () => ({ mode: "fast", queryVariants: [], jevUsed: false }),
+      rerank: async () => [],
+    };
+    const result = await new WebService({
+      provider: {
+        search,
+        contents: vi.fn(async () => ({ status: "ready" as const, results: [] })),
+      },
+      planner,
+      resolveHost: publicResolver,
+      now,
+    }).search("run-1", { query: "vercel 最新的博客" });
+    expect(result.plan.queryVariants).toEqual([
+      "vercel 最新的博客 2026年9月",
+      "vercel 最新的博客",
+      "vercel 最新的博客 2026年8月",
+    ]);
+  });
+
   it("applies domain and publication time filters to provider results", async () => {
     const exa = provider([
       { url: "https://example.com/a", title: "Root", publishedDate: "2026-09-01T00:00:00.000Z" },

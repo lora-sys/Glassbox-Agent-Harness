@@ -134,7 +134,12 @@ import { ManagementError } from "./access.js";
 import { GROUP_ROLE_AUDIT_RECORD_CAP, projectGroupRoleAudit } from "./group-role-audit.js";
 import { grantOpsPermissions } from "./ops-grants.js";
 import { routeManagementRequest } from "./routes.js";
-import { createQqDeliveryPolicy, hostDeliveryForbiddenValues } from "../delivery/content-policy.js";
+import {
+  createQqDeliveryPolicy,
+  DELIVERY_UUID,
+  hostDeliveryForbiddenValues,
+} from "../delivery/content-policy.js";
+import { scopeKey } from "../identity/scope.js";
 import { WorkspaceRegistry } from "../workspace/registry.js";
 import { WorkspaceWriteOccupancy } from "../workspace/write-occupancy.js";
 import { GLASSBOX_HOST_EXCLUDED_PI_TOOLS } from "../runtime/pi/tool-plane.js";
@@ -386,6 +391,36 @@ export class ManagementApplication {
           if (signal.aborted) return { status: "failed" };
           const connection = this.connections.get(destination.connectionId);
           if (!connection) return { status: "failed" };
+          if (delivery.payloadKind === "browser_artifact") {
+            try {
+              if (!this.browserArtifacts) return { status: "failed" };
+              const binding = await this.browserArtifacts.binding(delivery.payloadText);
+              if (binding.runId !== delivery.runId) return { status: "failed" };
+              const caller = await this.store.lifecycle.traceCaller(
+                binding.runId,
+                binding.principalId,
+              );
+              if (scopeKey(caller.scope) !== scopeKey(destination)) return { status: "failed" };
+              const artifact = await this.readBrowserArtifact({
+                id: delivery.payloadText,
+                binding,
+                caller,
+              });
+              if (artifact.sizeBytes > 2 * 1024 * 1024 || signal.aborted)
+                return { status: "failed" };
+              const sent = await connection.send({
+                deliveryId: delivery.id,
+                target: destination,
+                text: "浏览器截图",
+                image: { pngBase64: artifact.data.toString("base64") },
+              });
+              return sent.status === "confirmed"
+                ? { status: "sent", externalId: sent.messageId }
+                : { status: sent.status };
+            } catch {
+              return { status: "failed" };
+            }
+          }
           const result = await connection.send({
             deliveryId: delivery.id,
             target: destination,
@@ -397,7 +432,31 @@ export class ManagementApplication {
         },
       },
       onEvent: (event) => this.recordEvent(event),
-      prepareDelivery: async (candidate) => this.deliveryPolicy.prepare(candidate),
+      prepareDelivery: async (candidate, { caller, run }) => {
+        const ids = [
+          ...new Set(
+            [...candidate.matchAll(DELIVERY_UUID)].map((match) => match[0]!.toLowerCase()),
+          ),
+        ];
+        const allowed: string[] = [];
+        for (const id of ids.slice(0, 3)) {
+          try {
+            if (!this.browserArtifacts) break;
+            const binding = await this.browserArtifacts.binding(id);
+            if (
+              binding.runId !== run.id ||
+              binding.conversationId !== run.conversationId ||
+              binding.principalId !== caller.principalId
+            )
+              continue;
+            const artifact = await this.readBrowserArtifact({ id, binding, caller });
+            if (artifact.sizeBytes <= 2 * 1024 * 1024) allowed.push(id);
+          } catch {
+            // An unverified UUID stays blocked by the delivery content policy.
+          }
+        }
+        return this.deliveryPolicy.prepare(candidate, allowed);
+      },
     });
   }
 

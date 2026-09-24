@@ -92,7 +92,7 @@ export function createWebTools(options: {
   const search = createProtectedTool<WebSearchInput, WebSearchResult>({
     name: WEB_SEARCH_TOOL,
     description:
-      "Search current public web sources. Results include URLs, timestamps and bounded highlights. Use web_fetch for a deeper read.",
+      "Search a bounded set of current public web sources. Results are candidates, not a complete index. For latest/recent questions, compare publication dates and verify the newest candidate at an authoritative source; do not claim no newer item exists from search results alone. Use web_fetch for a deeper read.",
     parameters: Type.Object(
       {
         query: Type.String({ minLength: 1, maxLength: 500 }),
@@ -155,7 +155,7 @@ export function createWebTools(options: {
   const fetch = createProtectedTool<WebFetchInput, WebFetchResult>({
     name: WEB_FETCH_TOOL,
     description:
-      "Read one public web URL in more depth after search or when the user supplied a URL.",
+      "Read one public web URL in more depth after search or when the user supplied a URL. A truncated page is incomplete evidence: do not infer that its visible items are the newest or that no newer items exist.",
     parameters: Type.Object(
       {
         url: Type.String({ minLength: 1, maxLength: 2_048 }),

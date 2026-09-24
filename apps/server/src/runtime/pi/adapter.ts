@@ -16,6 +16,7 @@ import {
 import { KitLoader, type ResolvedKitProfile } from "./kit-loader.js";
 import { QQ_CAPABILITY_CATEGORIES } from "../../channels/onebot/capabilities.js";
 import { requiredInputClause } from "./protected-tools.js";
+import type { RequiredEvidence } from "./required-evidence.js";
 import {
   GLASSBOX_HOST_EXCLUDED_PI_TOOLS,
   assertProfileSelectionComplete,
@@ -50,12 +51,24 @@ interface ActiveSession {
   sandboxToolSession?: SandboxToolSession;
   sandboxWorkspaceId?: string;
   sandboxPrincipalId?: string;
+  lastRunContext?: PiRunContext;
 }
 
 /** A Run-scoped, already-authorized set of Pi tools backed by an isolated executor. */
 export interface SandboxToolSession {
   tools: ToolDefinition[];
   close(): Promise<void>;
+}
+
+export function requiredEvidencePromptClause(evidence: readonly RequiredEvidence[]): string {
+  if (evidence.length === 0) return "";
+  const calls = evidence
+    .map((item) => `${item.tool}(${JSON.stringify(item.input)})`)
+    .join(", then ");
+  const browserNote = evidence.some((item) => item.tool === "browser")
+    ? " A private Owner browser request does not require changing group capabilities."
+    : "";
+  return `\n\nThe current request requires live Tool observations. Call ${calls} in order before reporting the requested facts or Artifact. Use successful Tool results as evidence. If a call fails, state what could not be confirmed and do not invent a result.${browserNote}`;
 }
 
 export interface PiSdkRuntimeOptions {
@@ -490,15 +503,8 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
       const required = requiredToolName
         ? `${basePrompt}\n\nThe current request requires the ${requiredToolName} tool. Call it before reporting the action as completed${exactInput}. Do not ask for a second confirmation and never claim execution without a successful tool result.`
         : basePrompt;
-      // The Tool the Runtime requires for a factual answer. This sentence guides the model; it
-      // is not the requirement. A Run that answers without the call fails closed below the
-      // model either way, so this only decides whether the Run can still answer honestly.
-      const evidenceTools = [
-        ...new Set((runContext?.requiredEvidence ?? []).map((evidence) => evidence.tool)),
-      ];
-      return evidenceTools.length === 0
-        ? required
-        : `${required}\n\nThe current request asks for facts that only QQ can report. Call ${evidenceTools.join(" and ")} and answer from its result. If the call does not succeed, say the information could not be confirmed. Never answer from what the request itself says, from earlier Conversation, or from what you expect the tool to return.`;
+      // This guides Tool choice. The evidence gate below the model remains authoritative.
+      return `${required}${requiredEvidencePromptClause(runContext?.requiredEvidence ?? [])}`;
     };
     // Standalone Kit MCP factories are configured separately. Glassbox exposes
     // only explicitly registered product-authorized Tools, never ambient servers.
@@ -607,6 +613,7 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
     }
     if (context) {
       this.runContexts.set(binding.runtimeSessionId, context);
+      active.lastRunContext = context;
     }
     const toolCalls: PiRunResult["toolCalls"] = [];
     let text = "";
@@ -712,11 +719,7 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
     } finally {
       unsubscribe();
       await eventQueue;
-      try {
-        if (context) await this.options.onRunEnd?.(context);
-      } finally {
-        this.runContexts.delete(binding.runtimeSessionId);
-      }
+      this.runContexts.delete(binding.runtimeSessionId);
     }
   }
 
@@ -739,6 +742,8 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
     const active = this.sessions.get(runtimeSessionId);
     if (active) {
       try {
+        const context = active.lastRunContext;
+        if (context) await this.options.onRunEnd?.(context);
         await active.session.extensionRunner?.emit({ type: "session_shutdown", reason: "quit" });
       } finally {
         try {

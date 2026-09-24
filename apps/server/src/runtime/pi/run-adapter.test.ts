@@ -81,6 +81,49 @@ function fixture(results: PiRunResult[]) {
 }
 
 describe("Pi required Tool execution", () => {
+  it("names a missing browser screenshot without blaming QQ", async () => {
+    const noTools = { status: "completed" as const, text: "截图已完成。", toolCalls: [] };
+    const f = fixture([noTools, noTools]);
+    f.input.text = "用 browser 打开 https://nodejs.org/en/download 并截一张图";
+
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "failed",
+      text: "浏览器操作未完成，无法确认页面或提供截图。",
+    });
+  });
+
+  it("retries browser navigation, title, and screenshot one action at a time", async () => {
+    const call = (input: Record<string, unknown>, result?: unknown): PiRunResult => ({
+      status: "completed",
+      text: "Browser observation completed.",
+      toolCalls: [{ name: "browser", input, failed: false, result, outcome: "success" }],
+    });
+    const f = fixture([
+      { status: "completed", text: "I have a screenshot.", toolCalls: [] },
+      call({ action: "open", url: "https://nodejs.org/en/download" }),
+      call({ action: "get", kind: "title" }),
+      call({ action: "screenshot" }, { artifact: { id: "artifact-1" } }),
+    ]);
+    f.input.text = "用 browser 打开 https://nodejs.org/en/download，读取标题并截图";
+
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(f.run).toHaveBeenCalledTimes(4);
+    expect(f.run.mock.calls[1]?.[2]).toContain('"action":"open"');
+    expect(f.run.mock.calls[2]?.[2]).toContain('"kind":"title"');
+    expect(f.run.mock.calls[3]?.[2]).toContain('"action":"screenshot"');
+  });
+
+  it("names a missing web search without blaming QQ", async () => {
+    const noTools = { status: "completed" as const, text: "我查到了。", toolCalls: [] };
+    const f = fixture([noTools, noTools]);
+    f.input.text = "搜索 Node.js 官方当前 LTS 版本";
+
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "failed",
+      text: "网页检索或读取未完成，因此无法确认。",
+    });
+  });
+
   it("binds an explicit Owner Memory command to the current Run's exact Tool input", async () => {
     const f = fixture([
       {
@@ -262,6 +305,115 @@ describe("Pi required Tool execution", () => {
       enabled: true,
     });
     expect(f.disposeSession).toHaveBeenCalledOnce();
+  });
+
+  it("requires separate successful mutations for each named web capability", async () => {
+    const f = fixture([
+      {
+        status: "completed",
+        text: "搜索已启用。",
+        toolCalls: [
+          {
+            name: "owner_group_admin",
+            input: {
+              action: "set_capability",
+              groupId: "1126022432",
+              category: "web.search",
+              enabled: true,
+            },
+            failed: false,
+          },
+        ],
+      },
+      {
+        status: "completed",
+        text: "抓取已启用。",
+        toolCalls: [
+          {
+            name: "owner_group_admin",
+            input: {
+              action: "set_capability",
+              groupId: "1126022432",
+              category: "web.fetch",
+              enabled: true,
+            },
+            failed: false,
+          },
+        ],
+      },
+    ]);
+    f.input.text = "为测试群 1126022432 启用 web.search 和 web.fetch";
+
+    const output = await f.executor.execute(f.input);
+    expect(output).toMatchObject({
+      status: "succeeded",
+      text: "抓取已启用。",
+    });
+    expect(f.run).toHaveBeenCalledTimes(2);
+    expect(f.run.mock.calls[0]?.[2]).toBe(f.input.text);
+    expect(f.run.mock.calls[1]?.[2]).toContain('"category":"web.fetch"');
+    expect(f.run.mock.calls[1]?.[3]?.requiredToolInput).toEqual({
+      action: "set_capability",
+      groupId: "1126022432",
+      category: "web.fetch",
+      enabled: true,
+    });
+  });
+
+  it("fails closed when one named web capability mutation fails", async () => {
+    const f = fixture([
+      {
+        status: "completed",
+        text: "两个权限都已启用。",
+        toolCalls: [
+          {
+            name: "owner_group_admin",
+            input: {
+              action: "set_capability",
+              groupId: "1126022432",
+              category: "web.search",
+              enabled: true,
+            },
+            failed: false,
+          },
+        ],
+      },
+      {
+        status: "completed",
+        text: "抓取也已启用。",
+        toolCalls: [
+          {
+            name: "owner_group_admin",
+            input: {
+              action: "set_capability",
+              groupId: "1126022432",
+              category: "web.fetch",
+              enabled: true,
+            },
+            failed: true,
+          },
+        ],
+      },
+    ]);
+    f.input.text = "为测试群 1126022432 启用 web.search 和 web.fetch";
+
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "failed",
+      text: "请求的操作未执行，请稍后重试。",
+    });
+    expect(f.run).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    "为群 1126022432 启用 web.search，同时关闭 web.fetch",
+    "不要启用群 1126022432 的 web.search",
+  ])("does not authorize an ambiguous or negated web mutation: %s", async (text) => {
+    const f = fixture([{ status: "completed", text: "没有修改权限。", toolCalls: [] }]);
+    f.input.text = text;
+
+    await f.executor.execute(f.input);
+    expect(f.run).toHaveBeenCalledOnce();
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toBeUndefined();
   });
 
   it("fails closed when the model claims execution without a successful Tool result", async () => {
@@ -1607,6 +1759,44 @@ describe("a factual answer requires the observation it depends on", () => {
     // Requiring evidence is not requiring a mutation: the mutating-Tool gate must stay off, or
     // a read-only Tool would refuse its own call.
     expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBeUndefined();
+  });
+
+  it("reads an official page after searching when the caller asked to verify it", async () => {
+    const f = memberFixture([
+      {
+        status: "completed",
+        text: "Found an official result.",
+        toolCalls: [
+          {
+            name: "web_search",
+            input: { query: "Vercel blog latest" },
+            failed: false,
+            toolCallId: "search-1",
+            outcome: "success",
+          },
+        ],
+      },
+      {
+        status: "completed",
+        text: "Verified the official page.",
+        toolCalls: [
+          {
+            name: "web_fetch",
+            input: { url: "https://vercel.com/blog/article" },
+            failed: false,
+            toolCallId: "fetch-1",
+            outcome: "success",
+          },
+        ],
+      },
+    ]);
+    f.input.text = "搜索 Vercel 官方博客最近的文章，核对官网来源和发布日期";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "succeeded",
+      text: "Verified the official page.",
+    });
+    expect(f.run).toHaveBeenCalledTimes(2);
+    expect(f.run.mock.calls[1]?.[2]).toContain("web_fetch");
   });
 
   it("fails closed when the model answers without observing the group", async () => {

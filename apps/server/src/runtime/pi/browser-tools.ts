@@ -79,10 +79,27 @@ export interface BrowserToolEvidence {
   runId: string;
   conversationId: string;
   principalId: string;
-  browserSessionId: string;
+  browserSessionId?: string;
   action: ActionName;
   targetOrigin?: string;
-  status: "succeeded";
+  status: "succeeded" | "failed";
+  failurePhase?:
+    | "validation"
+    | "capability_check"
+    | "backend_check"
+    | "session_binding"
+    | "browser_execution"
+    | "trace_recording";
+  failureCategory?:
+    | "input_rejected"
+    | "capability_disabled"
+    | "capability_check_failed"
+    | "backend_unavailable"
+    | "binding_failed"
+    | "target_rejected"
+    | "browser_denied"
+    | "browser_failed"
+    | "trace_recording_failed";
   artifactId?: string;
   truncated: boolean;
   observedAt: string;
@@ -305,16 +322,25 @@ export function createBrowserTools(options: {
     authService: options.store.authorization,
     getContext,
     execute: async (params, context) => {
-      const action = toAction(params);
-      const capability = capabilityFor(params.action);
-      if (!(await options.isEnabled(context, capability)))
-        throw new ProviderCallError("denied", "capability_category_disabled");
-      if (!options.bridge)
-        throw new ProviderCallError("provider_unavailable", "browser_backend_unavailable");
-      const target = await options.binding(context);
-      const browserSessionId = options.sessions.session(target).cliSession;
-      options.onActivated(context, () => options.bridge!.cleanup(target));
+      let phase: NonNullable<BrowserToolEvidence["failurePhase"]> = "validation";
+      let action: BrowserAction | undefined;
+      let capability: WebCapability | undefined;
+      let target: BrowserSessionBinding | undefined;
+      let browserSessionId: string | undefined;
       try {
+        action = toAction(params);
+        capability = capabilityFor(params.action);
+        phase = "capability_check";
+        if (!(await options.isEnabled(context, capability)))
+          throw new ProviderCallError("denied", "capability_category_disabled");
+        phase = "backend_check";
+        if (!options.bridge)
+          throw new ProviderCallError("provider_unavailable", "browser_backend_unavailable");
+        phase = "session_binding";
+        target = await options.binding(context);
+        browserSessionId = options.sessions.session(target).cliSession;
+        options.onActivated(context, () => options.bridge!.cleanup(target!));
+        phase = "browser_execution";
         const result = await options.bridge.execute(target, action);
         if (params.action === "close") options.onClosed(context.runId);
         const observedAt = new Date().toISOString();
@@ -330,6 +356,7 @@ export function createBrowserTools(options: {
           ...(result.artifact ? { artifact: result.artifact } : {}),
         };
         const targetOrigin = params.url ? new URL(params.url).origin : undefined;
+        phase = "trace_recording";
         await options.recordEvidence?.(
           {
             type: "browser",
@@ -349,6 +376,29 @@ export function createBrowserTools(options: {
         );
         return response;
       } catch (error) {
+        const failureCategory = failureCategoryFor(error, phase);
+        const failurePhase = phase;
+        try {
+          await options.recordEvidence?.(
+            {
+              type: "browser",
+              backend: "agent-browser",
+              runId: context.runId,
+              conversationId: context.conversationId,
+              principalId: context.caller.principalId,
+              ...(browserSessionId ? { browserSessionId } : {}),
+              action: params.action,
+              status: "failed",
+              failurePhase,
+              failureCategory,
+              truncated: false,
+              observedAt: new Date().toISOString(),
+            },
+            context,
+          );
+        } catch {
+          // Evidence sink errors never replace the fixed, privacy-safe Tool failure.
+        }
         if (error instanceof WebTargetError) throw new ToolInputError(error.code);
         if (
           error instanceof Error &&
@@ -364,4 +414,20 @@ export function createBrowserTools(options: {
     projectResult: (result) => JSON.stringify(result),
   });
   return [tool];
+}
+
+function failureCategoryFor(
+  error: unknown,
+  phase: NonNullable<BrowserToolEvidence["failurePhase"]>,
+): NonNullable<BrowserToolEvidence["failureCategory"]> {
+  if (phase === "validation") return "input_rejected";
+  if (phase === "capability_check")
+    return error instanceof ProviderCallError ? "capability_disabled" : "capability_check_failed";
+  if (phase === "backend_check") return "backend_unavailable";
+  if (phase === "session_binding") return "binding_failed";
+  if (phase === "trace_recording") return "trace_recording_failed";
+  if (error instanceof WebTargetError) return "target_rejected";
+  if (error instanceof Error && error.message === "browser_denied") return "browser_denied";
+  if (error instanceof ToolInputError) return "input_rejected";
+  return "browser_failed";
 }
