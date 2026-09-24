@@ -848,6 +848,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       if (!projection.result.ok)
         return {
           status: "failed",
+          failureCode: "pre_provider_context_overflow",
           text: "当前请求超过已配置模型的上下文容量，未发送给模型。",
           providerSessionId: binding.runtimeSessionId,
         };

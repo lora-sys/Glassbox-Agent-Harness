@@ -937,7 +937,10 @@ export class ManagementApplication {
             allowUnknownCapacity: false,
           },
         };
-        const decision = selectRoute(routingInput);
+        let decision = selectRoute(routingInput);
+        const initiallyUnavailable = decision.candidates.some(
+          (candidate) => candidate.reason === "health_unavailable",
+        );
         const caller = await this.store.lifecycle.traceCaller(
           input.run.id,
           input.caller.principalId,
@@ -970,9 +973,9 @@ export class ManagementApplication {
           const actualTokens = this.runtimeUsageByRun.get(input.run.id)?.totalTokens.value ?? null;
           this.runtimeUsageByRun.delete(input.run.id);
           this.runtimeModelByRun.delete(input.run.id);
-          const unavailableModelEncountered = decision.candidates.some(
-            (candidate) => candidate.reason === "health_unavailable",
-          );
+          const unavailableModelEncountered =
+            initiallyUnavailable ||
+            decision.candidates.some((candidate) => candidate.reason === "health_unavailable");
           const evidenceCursor = await this.trace.append(
             input.run.id,
             {
@@ -1018,12 +1021,73 @@ export class ManagementApplication {
           return { status: "failed" };
         }
         let succeeded = false;
+        let actualExecutionRef = decision.executionRef;
         try {
-          const result = await selected.execute(input);
+          let result = await selected.execute(input);
+          if (
+            result.failureCode === "pre_provider_context_overflow" &&
+            routingInput.options.enabled
+          ) {
+            const firstCapacity = candidates.find(
+              (candidate) => candidate.executionRef === actualExecutionRef,
+            );
+            const firstUsable =
+              (firstCapacity?.limits.contextWindowTokens ?? 0) -
+              (firstCapacity?.limits.maxOutputTokens ?? 0);
+            const larger = ordered.filter(
+              (profile) =>
+                profile.id !== decision.selectedProfileId &&
+                profile.contextWindowTokens !== undefined &&
+                profile.maxOutputTokens !== undefined &&
+                profile.contextWindowTokens - profile.maxOutputTokens > firstUsable,
+            );
+            const upgradeInput = {
+              ...routingInput,
+              options: {
+                ...routingInput.options,
+                allowedProfileIds: larger.map((profile) => profile.id),
+                routeOrder: larger.map((profile) => profile.id),
+                defaultExecutionRef: "",
+              },
+            };
+            const upgrade = selectRoute(upgradeInput);
+            const alternative =
+              upgrade.executionRef === null
+                ? undefined
+                : this.directExecution(upgrade.executionRef);
+            if (
+              upgrade.executionRef !== null &&
+              alternative &&
+              (input.caller.scope.chatType !== "group" || alternative.supportsGroup)
+            ) {
+              const upgradeCursor = await this.trace.append(
+                input.run.id,
+                {
+                  type: "routing_decision",
+                  runId: input.run.id,
+                  conversationId: input.conversation.id,
+                  principalId: input.caller.principalId,
+                  policyVersion: "p5b-route-v1",
+                  trigger: "pre_provider_context_overflow",
+                  previousExecutionRef: actualExecutionRef,
+                  demand: {
+                    estimatedMaterialTokens: demandTokens,
+                    estimateSource: "unicode_conservative",
+                  },
+                  ...toRoutingEvidence(upgradeInput, upgrade),
+                },
+                "glassbox-routing",
+              );
+              await this.store.evidence.advanceTrace(caller, upgradeCursor);
+              decision = upgrade;
+              actualExecutionRef = upgrade.executionRef;
+              result = await alternative.execute(input);
+            }
+          }
           succeeded = result.status === "succeeded";
           return result;
         } finally {
-          await appendRoutingEval(decision.executionRef, succeeded);
+          await appendRoutingEval(actualExecutionRef, succeeded);
         }
       },
     };

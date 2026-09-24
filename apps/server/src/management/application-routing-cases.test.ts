@@ -85,6 +85,7 @@ async function executePrivateRun(
   });
   await application.runs.enqueueAccepted(accepted);
   const run = await application.runs.waitForRun(accepted.caller, accepted.run.id);
+  await application.runs.drain();
   const page = await application.trace.readPage(run.id, { limit: 100 });
   const indexed = await application.store.evidence.getTrace(accepted.caller, run.id);
   return {
@@ -276,5 +277,44 @@ describe("Management model routing wrapper", () => {
     expect(
       scored.assessment?.scores.find((score) => score.id === "unavailable_fallback")?.value,
     ).toBe("pass");
+  });
+
+  it("upgrades only a pre-provider capacity overflow to a larger eligible profile", async () => {
+    const urls: string[] = [];
+    stubModelFetch(urls);
+    const f = await fixture(async () => ({ status: "failed" }));
+    await configureModelRoute(f.app, [
+      {
+        id: "origin",
+        routingEnabled: true,
+        routePriority: 0,
+        contextWindowTokens: 10_000,
+        maxOutputTokens: 8_192,
+      },
+      {
+        id: "alternate",
+        allowRouting: true,
+        routePriority: 1,
+        capabilityRank: 1,
+        contextWindowTokens: 32_768,
+        maxOutputTokens: 4_096,
+      },
+    ]);
+    const result = await executePrivateRun(f.app, "routing-capacity-upgrade", "x".repeat(2_000));
+    expect(result.run.status).toBe("succeeded");
+    expect(urls).toHaveLength(1);
+    expect(urls[0]).toContain("/alternate/v1/");
+    expect(result.events.filter((event) => event.type === "routing_decision")).toMatchObject([
+      { executionRef: "model:origin" },
+      {
+        trigger: "pre_provider_context_overflow",
+        previousExecutionRef: "model:origin",
+        executionRef: "model:alternate",
+      },
+    ]);
+    expect(result.events.find((event) => event.type === "routing_eval_evidence")).toMatchObject({
+      decisionExecutionRef: "model:alternate",
+      actualExecutionRef: "model:alternate",
+    });
   });
 });

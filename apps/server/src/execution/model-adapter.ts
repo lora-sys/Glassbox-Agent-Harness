@@ -69,7 +69,8 @@ export function configuredModelAdapter(options: {
         omittedExchanges: projection.ok ? projection.projection.omittedExchangeIds.length : 0,
         overflow: projection.ok ? null : projection.overflow.kind,
       });
-      if (!projection.ok) return { status: "failed" as const };
+      if (!projection.ok)
+        return { status: "failed" as const, failureCode: "pre_provider_context_overflow" as const };
       const admitted = new Set(projection.projection.includedExchangeIds);
       const boundedHistory = input.history.filter((_entry, index) =>
         admitted.has(String(index - (index % 2))),

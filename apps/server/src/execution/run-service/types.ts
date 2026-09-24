@@ -24,6 +24,8 @@ export interface ExecutionResult {
   status: "succeeded" | "failed" | "cancelled" | "interrupted" | "unknown";
   text?: string;
   providerSessionId?: string;
+  /** The selected model was rejected before any provider request or Tool call. */
+  failureCode?: "pre_provider_context_overflow";
 }
 
 export interface RunExecutionAdapter {
