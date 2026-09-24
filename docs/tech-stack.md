@@ -23,12 +23,12 @@ docs/data-observability.md
   persistence, storage, observability
 ```
 
-The current implementation order comes from the intentionally parallel `.plans/04a-memory-taste.md` and `.plans/04b-authorized-retrieval-history.md`. P3 is complete and remains the trust / QQ / Agent Ops foundation.
+P3, P4A, and P4B are complete. Before the next product phase, the repository engineering work follows `.plans/phase-transition-repository-refactor.md` and Issue #21. This plan does not implement P5 product behavior.
 
 ## Runtime and language
 
 ```text
-Node.js 22+
+Node.js 24.12.0+
 TypeScript
 ES modules
 ```
@@ -438,15 +438,25 @@ Required repository checks:
 
 ```text
 vp run verify:commit
+vp run verify:full
 vp run test:unit
 vp run test:e2e
 vp run test:regression
 ```
 
 `vp run verify:commit` is the required pre-commit gate. Vite+ installs the repository-owned
-`.vite-hooks/pre-commit` dispatcher during `vp install`. The gate checks staged formatting,
-core lint and types, all deterministic unit tests, the P3 end-to-end suite, focused
-regressions, and the web build. It also rejects deleted tests and newly disabled tests.
+`.vite-hooks/pre-commit` dispatcher during `vp install`. The gate checks staged files and test
+integrity, then uses Vitest's changed dependency graph for ordinary changes. Shared contracts,
+authorization, persistence, runtime setup, test/build configuration, validation scripts,
+deletions, renames, and unknown areas run the full unit suite. Test deletion, disabled tests,
+and reduced test declaration counts are rejected.
+
+`vp run verify:full` is the full acceptance gate. It runs core lint and types, validation-selector
+tests, the deterministic unit suite once, and the web build. `test:e2e` and `test:regression`
+remain targeted commands for their listed cases. Their test files are included in `test:unit`,
+so the full gate does not run those suites a second time. The commit gate reports changed paths,
+test scope, and fallback reasons. Successful results are reused only for an identical recorded
+input fingerprint; uncertain inputs always run tests.
 
 The `packageManager` field records the package-manager backend used by `vp install`. It does
 not change the repository command surface. Developers use `vp` directly.

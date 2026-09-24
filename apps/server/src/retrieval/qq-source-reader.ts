@@ -6,10 +6,9 @@ import {
 } from "@glassbox/contracts";
 import type { QqCapabilityCategory } from "../channels/onebot/capabilities.js";
 import type { CallerContext } from "../identity/scope.js";
-import type { DomainStore } from "../persistence/index.js";
 import { ChannelArchiveStore } from "./channel-archive.js";
-import { isMemorySourceEnabled } from "../management/capability-policy.js";
 import { groupResourceId } from "./source-resolver.js";
+import type { RetrievalStorePort } from "./ports.js";
 
 /**
  * Authorized QQ source reader.
@@ -57,7 +56,7 @@ export class AuthorizedQQSourceReader implements AuthorizedQqSourceReader {
 
   constructor(
     private readonly options: {
-      store: DomainStore;
+      store: RetrievalStorePort;
       caller: CallerContext;
       archive?: ChannelArchiveStore;
     },
@@ -73,7 +72,9 @@ export class AuthorizedQQSourceReader implements AuthorizedQqSourceReader {
     if (!stored) return [];
     const enabled: QqSourceClass[] = [];
     for (const sourceClass of QQ_SOURCE_CLASSES) {
-      if (!isMemorySourceEnabled(stored.policy, sourceClass)) continue;
+      // The policy projection is owned by Management; Retrieval consumes only this
+      // source-class flag and does not depend on Management's policy implementation.
+      if (stored.policy.memorySources?.[sourceClass] !== true) continue;
       // Re-authorize now. Policy enablement is never a substitute for the grant, and no
       // earlier decision is reused.
       const decision = await this.options.store.authorization.check({

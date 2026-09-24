@@ -189,14 +189,13 @@ When a requirement is ambiguous, choose the smaller implementation that preserve
 
 Do not silently expand scope from the roadmap.
 
-The active implementation plans are the intentionally parallel P4 streams:
+P4A and P4B are complete. The active implementation plan before the next product phase is:
 
 ```text
-.plans/04a-memory-taste.md
-.plans/04b-authorized-retrieval-history.md
+.plans/phase-transition-repository-refactor.md
 ```
 
-P3 is complete. P4A and P4B have separate ownership, Issues and later PRs. Work inside the plan you own and do not silently absorb the sibling stream.
+Tracking Issue: #21. This plan covers server modularization, test structure, validation speed, hooks, and related documentation. It does not authorize P5 product features or frontend changes. Keep the P4 plans as completed records.
 
 Read in this order before changing code:
 
@@ -211,8 +210,9 @@ Read in this order before changing code:
 
 | Topic | Source of truth |
 | --- | --- |
-| P4A Memory / Taste implementation order and completion gate | `.plans/04a-memory-taste.md` and Issue #9 |
-| P4B retrieval / QQ history implementation order and completion gate | `.plans/04b-authorized-retrieval-history.md` and Issue #10 |
+| Repository modularization and validation workflow before the next product phase | `.plans/phase-transition-repository-refactor.md` and Issue #21 |
+| Completed P4A Memory / Taste implementation and acceptance record | `.plans/04a-memory-taste.md` and Issue #9 |
+| Completed P4B retrieval / QQ history implementation and acceptance record | `.plans/04b-authorized-retrieval-history.md` and Issue #10 |
 | Completed P3 trust / QQ / Agent Ops foundation | `.plans/03-personal-agent-foundation.md` |
 | Product sequencing after the active Plan | `.plans/roadmap.md` |
 | Runtime ownership and Pi SDK boundary | `docs/runtime-strategy.md` |
@@ -400,8 +400,15 @@ Prove the change with the smallest useful check, then run the relevant active-Pl
 Behavior changes require focused tests for the behavior that changed.
 
 Before every commit, stage the intended files and run `vp run verify:commit`. Do not use
-`--no-verify`. The gate checks staged formatting, core lint and types, the full unit suite,
-the deterministic P3 end-to-end suite, focused regressions, and the web build.
+`--no-verify`. The gate checks staged code and tests, runs the selector and integrity checks,
+then uses Vitest's changed dependency graph for ordinary changes. Changes to shared contracts,
+authorization, persistence, runtime setup, test configuration, scripts, deletions, renames, or
+unknown areas fall back to the full unit suite. It reports the changed paths and selected scope.
+
+Before opening a Pull Request, run `vp run verify:full`. This runs core lint and types, the
+selector tests, the full deterministic unit suite once, and the web build. The E2E and
+regression commands remain available for focused runs; their files are already part of the
+unit suite and are not repeated by the full gate.
 
 Do not weaken existing tests to make an implementation pass. Do not remove test cases,
 relax assertions, change fixtures to hide a regression, or add `skip`, `only`, or `todo`.

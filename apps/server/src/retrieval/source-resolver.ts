@@ -1,7 +1,7 @@
 import type { CallerContext } from "../identity/scope.js";
 import { scopeKey } from "../identity/scope.js";
-import type { DomainStore } from "../persistence/index.js";
 import { stringColumn } from "../persistence/database.js";
+import type { RetrievalStorePort } from "./ports.js";
 
 /**
  * Derives the canonical resource ID for a QQ group.
@@ -23,7 +23,7 @@ export function groupResourceId(groupId: string): string {
  * `history:read` grant; see `resolveAuthorizedHistorySources`.
  */
 export async function resolveAssignedGroupIds(
-  store: DomainStore,
+  store: RetrievalStorePort,
   caller: CallerContext,
 ): Promise<string[]> {
   if (caller.scope.chatType !== "private") return [];
@@ -59,7 +59,7 @@ export async function resolveAssignedGroupIds(
  * - Unauthorized sources NEVER enter the candidate set.
  */
 export async function resolveAuthorizedHistorySources(
-  store: DomainStore,
+  store: RetrievalStorePort,
   caller: CallerContext,
   requestedGroupIds?: readonly string[],
 ): Promise<string[]> {
