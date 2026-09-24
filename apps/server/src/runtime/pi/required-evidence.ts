@@ -355,6 +355,13 @@ export interface RequiredEvidenceInput {
   readonly isOwner: boolean;
 }
 
+export function officialSourceVerificationRequested(rawText: string): boolean {
+  const text = requestClauses(rawText);
+  return /(?:核对|验证|查证|确认|verify|check)[^。！？!?\n]{0,80}(?:官网|官方|来源|source|official)|(?:官网|官方|来源|source|official)[^。！？!?\n]{0,80}(?:核对|验证|查证|确认|verify|check)/iu.test(
+    text,
+  );
+}
+
 /**
  * The evidence the current message requires before the Run may state a factual answer.
  *
@@ -417,11 +424,7 @@ export function requiredEvidenceFor(input: RequiredEvidenceInput): RequiredEvide
     required.push({ domain: "web_search", tool: WEB_SEARCH_TOOL, input: {} });
     // Search snippets are candidate evidence. When the caller explicitly asks to verify an
     // official source, a successful search alone cannot support "I checked the official page".
-    if (
-      /(?:核对|验证|查证|确认|verify|check)[^。！？!?\n]{0,80}(?:官网|官方|来源|source|official)|(?:官网|官方|来源|source|official)[^。！？!?\n]{0,80}(?:核对|验证|查证|确认|verify|check)/iu.test(
-        text,
-      )
-    )
+    if (officialSourceVerificationRequested(text))
       required.push({ domain: "web_fetch", tool: WEB_FETCH_TOOL, input: {} });
   }
 

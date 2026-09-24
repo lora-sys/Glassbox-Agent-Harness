@@ -23,6 +23,7 @@ import {
   groupHistorySearchRequested,
   groupHistorySearchSender,
   namedGroupId,
+  officialSourceVerificationRequested,
   ownerHistorySearchRequested,
   requestClauses,
   requiredEvidenceFor,
@@ -31,6 +32,7 @@ import {
   type EvidenceResolution,
   type RequiredEvidence,
 } from "./required-evidence.js";
+import { safeWebEvidenceReply, webAnswerEvidenceFailure } from "./web-answer-evidence.js";
 
 interface RequiredToolCall {
   name: string;
@@ -418,6 +420,14 @@ export type RunEvidenceRecord =
       conversationId: string;
       phase: "resolved";
       resolutions: readonly EvidenceResolution[];
+    }
+  | {
+      type: "web_answer_evidence";
+      runId: string;
+      principalId: string;
+      conversationId: string;
+      status: "accepted" | "withheld";
+      reason?: "source_not_read" | "unqualified_latest_claim";
     };
 
 function groupHistorySearchFollowUpRequested(input: ExecutionInput): boolean {
@@ -948,6 +958,27 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
               : "未能从 QQ 获取该信息，因此无法确认。",
           providerSessionId: binding.runtimeSessionId,
         };
+      if (result.status === "completed" && officialSourceVerificationRequested(input.text)) {
+        const failure = webAnswerEvidenceFailure({
+          request: input.text,
+          answer: result.text,
+          toolCalls: observedCalls,
+        });
+        await this.recordEvidence({
+          type: "web_answer_evidence",
+          runId: input.run.id,
+          principalId: input.caller.principalId,
+          conversationId: input.conversation.id,
+          status: failure ? "withheld" : "accepted",
+          ...(failure ? { reason: failure.reason } : {}),
+        });
+        if (failure)
+          return {
+            status: "failed",
+            text: safeWebEvidenceReply(failure),
+            providerSessionId: binding.runtimeSessionId,
+          };
+      }
       const strictReply = strictHistoryReplySpec(input.text);
       if (
         strictReply &&

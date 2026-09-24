@@ -1799,6 +1799,48 @@ describe("a factual answer requires the observation it depends on", () => {
     expect(f.run.mock.calls[1]?.[2]).toContain("web_fetch");
   });
 
+  it("withholds links and freshness claims that the Run did not verify", async () => {
+    const evidence: RunEvidenceRecord[] = [];
+    const f = fixture([
+      {
+        status: "completed",
+        text: "Vercel 官方博客最新文章是 https://vercel.com/blog/checked 和 https://vercel.com/blog/unread。无法证明绝对最新。",
+        toolCalls: [
+          {
+            name: "web_search",
+            input: { query: "Vercel latest blog" },
+            failed: false,
+            outcome: "success",
+          },
+          {
+            name: "web_fetch",
+            input: { url: "https://vercel.com/blog/checked" },
+            failed: false,
+            outcome: "success",
+          },
+        ],
+      },
+    ]);
+    f.input.text = "搜索 Vercel 官方博客最近的文章，核对官网来源和发布日期并附链接";
+    f.executor = new PiRunExecutionAdapter(f.runtime, {
+      onEvidence: (record) => {
+        evidence.push(record);
+      },
+    });
+
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "failed",
+      text: "回答中有页面没有直接读取，因此不能确认其内容。以下是本次已直接读取的页面：\nhttps://vercel.com/blog/checked",
+    });
+    expect(evidence).toContainEqual(
+      expect.objectContaining({
+        type: "web_answer_evidence",
+        status: "withheld",
+        reason: "source_not_read",
+      }),
+    );
+  });
+
   it("fails closed when the model answers without observing the group", async () => {
     // The observed failure: the model composes a fluent member list it never fetched.
     const fabricated = {
