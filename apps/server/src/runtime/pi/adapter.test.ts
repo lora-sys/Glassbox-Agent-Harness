@@ -427,6 +427,26 @@ describe("PiSdkRuntimeAdapter", () => {
     );
 
     await adapter.cleanup();
+
+    const isolated = new PiSdkRuntimeAdapter({
+      kitPath: fileURLToPath(new URL("./fixtures/lora-pi-kit", import.meta.url)),
+      runtimeBaseDir,
+      model,
+      modelRuntime,
+      resolveToolCandidates: async () => [{ name: "read", exclusion: null }],
+      resolveSkillNames: async () => ({ names: [] }),
+      openSandboxToolSession: async () => ({
+        tools: [{ ...tool("read"), description: "Isolated read fixture" }],
+        close: async () => {},
+      }),
+    });
+    await isolated.initialize();
+    const isolatedBinding = await isolated.createOrRestoreSession(conversation, "test", context);
+    await isolated.run(isolatedBinding, run, "say hello", context);
+    expect(capturedContext?.tools?.find((entry) => entry.name === "read")).toEqual(
+      expect.objectContaining({ description: "Isolated read fixture" }),
+    );
+    await isolated.cleanup();
   });
 
   it("enforces isolated Pi sessions across Owner and Visitor in the same Conversation, creating fresh sessions without caching", async () => {

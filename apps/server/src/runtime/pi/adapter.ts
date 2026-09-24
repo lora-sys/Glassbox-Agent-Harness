@@ -47,6 +47,15 @@ interface ActiveSession {
   authorizedSkillNames: readonly string[];
   modelVisibleSkillNames: readonly string[];
   skillPolicy: Record<string, unknown>;
+  sandboxToolSession?: SandboxToolSession;
+  sandboxWorkspaceId?: string;
+  sandboxPrincipalId?: string;
+}
+
+/** A Run-scoped, already-authorized set of Pi tools backed by an isolated executor. */
+export interface SandboxToolSession {
+  tools: ToolDefinition[];
+  close(): Promise<void>;
 }
 
 export interface PiSdkRuntimeOptions {
@@ -58,6 +67,10 @@ export interface PiSdkRuntimeOptions {
   resolveModel?: () => Promise<{ model: Model<any>; modelRuntime: ModelRuntime }>;
   customTools?: ToolDefinition[];
   createTools?: (getContext: () => PiRunContext | undefined) => ToolDefinition[];
+  openSandboxToolSession?: (input: {
+    context: PiRunContext;
+    selectedNames: readonly string[];
+  }) => Promise<SandboxToolSession>;
   resolveSkillNames?: (
     context: PiRunContext,
     profile: ResolvedKitProfile,
@@ -358,6 +371,15 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
           profileName,
           profileActiveTools: profile.activeTools,
           candidates,
+          providerReadiness: Object.fromEntries(
+            candidates
+              .filter(
+                (candidate) =>
+                  candidate.exclusion === null &&
+                  GLASSBOX_HOST_EXCLUDED_PI_TOOLS.includes(candidate.name),
+              )
+              .map((candidate) => [candidate.name, "ready" as const]),
+          ),
           // The digest of the profile file that produced this surface, so an old Run's
           // evidence can be read against the declaration it actually ran under.
           profileVersion: profileFingerprint(runtimeEvidence, profileName),
@@ -370,21 +392,38 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
     await mkdir(config.agentDir, { recursive: true });
     const sessionDir = path.join(config.agentDir, "sessions", conversation.id);
     await mkdir(sessionDir, { recursive: true });
-    const session = this.options.createSession
-      ? await this.options.createSession({
-          conversation,
-          profile: effectiveProfile,
-          agentDir: config.agentDir,
-          sessionDir,
-          modelVisibleSkillNames,
-        })
-      : await this.createRealSession(
-          effectiveProfile,
-          config.agentDir,
-          sessionDir,
-          authorizedToolNames,
-          modelVisibleSkillNames,
-        );
+    const sandboxToolSession =
+      context &&
+      !this.options.createSession &&
+      this.options.openSandboxToolSession &&
+      authorizedToolNames?.some((name) => GLASSBOX_HOST_EXCLUDED_PI_TOOLS.includes(name))
+        ? await this.options.openSandboxToolSession({
+            context,
+            selectedNames: authorizedToolNames,
+          })
+        : undefined;
+    let session: ActiveSession["session"];
+    try {
+      session = this.options.createSession
+        ? await this.options.createSession({
+            conversation,
+            profile: effectiveProfile,
+            agentDir: config.agentDir,
+            sessionDir,
+            modelVisibleSkillNames,
+          })
+        : await this.createRealSession(
+            effectiveProfile,
+            config.agentDir,
+            sessionDir,
+            authorizedToolNames,
+            modelVisibleSkillNames,
+            sandboxToolSession?.tools,
+          );
+    } catch (error) {
+      await sandboxToolSession?.close();
+      throw error;
+    }
     const now = new Date().toISOString();
     const binding: PiSessionBinding = {
       conversationId: conversation.id,
@@ -403,6 +442,9 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
       authorizedSkillNames,
       modelVisibleSkillNames,
       skillPolicy: structuredClone(resolvedSkills.policy ?? { source: "kit-profile" }),
+      sandboxToolSession,
+      sandboxWorkspaceId: sandboxToolSession ? context?.workspaceId : undefined,
+      sandboxPrincipalId: sandboxToolSession ? context?.caller?.principalId : undefined,
     });
     return { ...binding };
   }
@@ -413,6 +455,7 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
     sessionDir: string,
     authorizedToolNames?: readonly string[],
     modelVisibleSkillNames?: readonly string[],
+    sandboxTools: readonly ToolDefinition[] = [],
   ): Promise<ActiveSession["session"]> {
     const kitPath = this.loader.getKitPath();
     const cwd = this.options.cwd ?? process.cwd();
@@ -491,8 +534,19 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
       [];
     const selectedNames = authorizedToolNames ? new Set(authorizedToolNames) : undefined;
     const selectedTools = selectedNames
-      ? customTools.filter((tool) => selectedNames.has(tool.name))
-      : customTools;
+      ? [...customTools, ...sandboxTools].filter((tool) => selectedNames.has(tool.name))
+      : [...customTools, ...sandboxTools];
+    const selectedPiTools = (authorizedToolNames ?? []).filter((name) =>
+      GLASSBOX_HOST_EXCLUDED_PI_TOOLS.includes(name),
+    );
+    for (const name of selectedPiTools)
+      if (!sandboxTools.some((tool) => tool.name === name))
+        throw new Error(`Isolated Pi tool unavailable: ${name}`);
+    if (new Set(selectedTools.map((tool) => tool.name)).size !== selectedTools.length)
+      throw new Error("Duplicate Pi tool registration");
+    for (const tool of sandboxTools)
+      if (!GLASSBOX_HOST_EXCLUDED_PI_TOOLS.includes(tool.name))
+        throw new Error("Sandbox registered an unexpected Pi tool");
     const customToolNames = selectedTools.map((tool) => tool.name);
     const tools = Array.from(new Set(customToolNames));
     const configured = await this.options.resolveModel?.();
@@ -506,7 +560,6 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
       modelRuntime: configured?.modelRuntime ?? this.options.modelRuntime,
       noTools: "all",
       tools,
-      excludeTools: [...GLASSBOX_HOST_EXCLUDED_PI_TOOLS],
       customTools: selectedTools,
       thinkingLevel: profile.thinkingLevel === "none" ? "minimal" : profile.thinkingLevel,
     });
@@ -654,15 +707,29 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
     if (active) await active.session.abort();
   }
 
+  async disposeWorkspaceSessions(principalId: string, workspaceId: string): Promise<void> {
+    const matches = [...this.sessions.entries()]
+      .filter(
+        ([, active]) =>
+          active.sandboxPrincipalId === principalId && active.sandboxWorkspaceId === workspaceId,
+      )
+      .map(([id]) => id);
+    for (const id of matches) await this.disposeSession(id);
+  }
+
   async disposeSession(runtimeSessionId: string): Promise<void> {
     const active = this.sessions.get(runtimeSessionId);
     if (active) {
       try {
         await active.session.extensionRunner?.emit({ type: "session_shutdown", reason: "quit" });
       } finally {
-        active.session.dispose();
-        this.sessions.delete(runtimeSessionId);
-        this.runContexts.delete(runtimeSessionId);
+        try {
+          await active.sandboxToolSession?.close();
+        } finally {
+          active.session.dispose();
+          this.sessions.delete(runtimeSessionId);
+          this.runContexts.delete(runtimeSessionId);
+        }
       }
     }
   }

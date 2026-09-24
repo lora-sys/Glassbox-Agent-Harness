@@ -1,0 +1,75 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, expect, it } from "vite-plus/test";
+import { createApplicationFixtureScope } from "./application-test-helpers.js";
+
+const { fixture, afterEachCleanup } = createApplicationFixtureScope();
+const directories: string[] = [];
+afterEach(async () => {
+  await afterEachCleanup();
+  for (const directory of directories.splice(0))
+    await rm(directory, { recursive: true, force: true });
+});
+
+it("keeps two Owner workspaces separate and revokes only the shared grant", async () => {
+  const f = await fixture(async (input) => ({ status: "succeeded", text: input.text }), {
+    coOwnerId: "10006",
+  });
+  const owner = (await f.app.listWorkspaces("owner")) as Array<{ id: string; selected: boolean }>;
+  const coOwner = (await f.app.listWorkspaces("owner-10006")) as Array<{
+    id: string;
+    selected: boolean;
+  }>;
+  expect(owner).toHaveLength(1);
+  expect(coOwner).toHaveLength(1);
+  expect(owner[0]?.id).not.toBe(coOwner[0]?.id);
+  expect(owner[0]?.selected).toBe(true);
+  expect(coOwner[0]?.selected).toBe(true);
+
+  const sharedPath = await mkdtemp(join(tmpdir(), "glassbox-shared-project-"));
+  directories.push(sharedPath);
+  const registered = await f.app.registerWorkspace({
+    path: sharedPath,
+    label: "Shared fixture",
+    ownerPrincipalId: "owner",
+  });
+  const sharedId = registered.id;
+  await f.app.grantWorkspace({
+    workspaceId: sharedId,
+    principalId: "owner-10006",
+    access: "write",
+  });
+  await f.app.selectWorkspace({ workspaceId: sharedId, principalId: "owner-10006" });
+  expect(
+    (await f.app.listWorkspaces("owner-10006")).find((workspace) => workspace.id === sharedId)
+      ?.selected,
+  ).toBe(true);
+
+  await f.app.revokeWorkspace({ workspaceId: sharedId, principalId: "owner-10006" });
+  expect(
+    (await f.app.listWorkspaces("owner-10006")).some((workspace) => workspace.id === sharedId),
+  ).toBe(false);
+  expect((await f.app.listWorkspaces("owner")).some((workspace) => workspace.id === sharedId)).toBe(
+    true,
+  );
+  const coOwnerCaller = {
+    principalId: "owner-10006",
+    scope: {
+      connectionId: "fixture",
+      botId: "10001",
+      chatType: "private" as const,
+      chatId: "10006",
+      senderId: "10006",
+    },
+  };
+  expect(
+    (
+      await f.app.store.authorization.check({
+        caller: coOwnerCaller,
+        resourceId: `workspace:${sharedId}`,
+        action: "workspace:write",
+      })
+    ).decision,
+  ).toBe("DENY");
+});

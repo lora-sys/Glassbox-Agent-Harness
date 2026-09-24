@@ -89,6 +89,8 @@ export interface PiRunContext {
   caller?: CallerContext;
   conversationId?: string;
   runId?: string;
+  /** Server-resolved workspace for the current Owner Run, never a model-supplied host path. */
+  workspaceId?: string;
   requiredToolName?: string;
   requiredToolInput?: Record<string, unknown>;
   authorizedSkillNames?: readonly string[];
@@ -128,6 +130,7 @@ export interface PiRuntimeAdapter {
   ): Promise<PiRunResult>;
   abort(runtimeSessionId: string): Promise<void>;
   disposeSession?(runtimeSessionId: string): Promise<void>;
+  disposeWorkspaceSessions?(principalId: string, workspaceId: string): Promise<void>;
   getRunContext?(runtimeSessionId: string): PiRunContext | undefined;
   cleanup(): Promise<void>;
 }

@@ -1,5 +1,8 @@
 # Lora PI Kit
 
+The current Owner Pi native tool sandbox, its release lock, and its remaining
+acceptance work are recorded in [Owner Pi sandbox](owner-pi-sandbox.md).
+
 Status: CURRENT DIRECTION / P4 ACTIVE
 
 This document is the source of truth for what `lora-sys/lora-pi-kit` is, what it contains, how it is installed, and how it relates to Pi, Glassbox, Herdr, and `lora-sys/skills`.

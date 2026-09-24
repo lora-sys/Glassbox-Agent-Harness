@@ -896,4 +896,8 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
   async cleanup(): Promise<void> {
     return this.runtime.cleanup();
   }
+
+  async disposeWorkspaceSessions(principalId: string, workspaceId: string): Promise<void> {
+    await this.runtime.disposeWorkspaceSessions?.(principalId, workspaceId);
+  }
 }

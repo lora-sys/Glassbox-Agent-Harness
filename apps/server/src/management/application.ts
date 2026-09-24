@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 import {
   CHANNEL_SAFE_ERRORS,
@@ -110,6 +111,11 @@ import { GROUP_ROLE_AUDIT_RECORD_CAP, projectGroupRoleAudit } from "./group-role
 import { grantOpsPermissions } from "./ops-grants.js";
 import { routeManagementRequest } from "./routes.js";
 import { createQqDeliveryPolicy, hostDeliveryForbiddenValues } from "../delivery/content-policy.js";
+import { WorkspaceRegistry } from "../workspace/registry.js";
+import { WorkspaceWriteOccupancy } from "../workspace/write-occupancy.js";
+import { GLASSBOX_HOST_EXCLUDED_PI_TOOLS } from "../runtime/pi/tool-plane.js";
+import { loadKitSandbox } from "../runtime/pi/sandbox-kit.js";
+import { createIsolatedPiTools } from "../runtime/pi/sandbox-pi-tools.js";
 import {
   TOOL_DESCRIPTORS,
   type ToolDescriptor,
@@ -263,6 +269,10 @@ export class ManagementApplication {
   readonly evaluator: ReturnType<typeof createRunEvaluator>;
   /** Durable Channel history, separate from Run inputs. */
   readonly archive: ChannelArchiveStore;
+  workspaces!: WorkspaceRegistry;
+  readonly workspaceWrites = new WorkspaceWriteOccupancy();
+  private sandboxRuntime: Awaited<ReturnType<typeof loadKitSandbox>> = null;
+  private sandboxFailure: string | null = null;
   executors!: ExecutorConfiguration;
   private readonly connections = new Map<string, OneBotAdapter>();
   private readonly deliveryPolicy: ReturnType<typeof createQqDeliveryPolicy>;
@@ -372,6 +382,15 @@ export class ManagementApplication {
     });
     const application = new ManagementApplication(options, store, channels, groupRuntime);
     try {
+      application.workspaces = await WorkspaceRegistry.open({
+        dataRoot: options.dataDirectory,
+        forbiddenRoots: [application.kitLoader.getKitPath()],
+      });
+      try {
+        application.sandboxRuntime = await loadKitSandbox(application.kitLoader.getKitPath());
+      } catch (error) {
+        application.sandboxFailure = error instanceof Error ? error.message : String(error);
+      }
       application.executors = await ExecutorConfiguration.open({
         dataDirectory: options.dataDirectory,
         models: options.models,
@@ -405,6 +424,150 @@ export class ManagementApplication {
 
   private readonly piAdapters = new Map<string, PiRunExecutionAdapter>();
   private opsReconciler?: OpsReconciler;
+
+  sandboxStatus(): {
+    ready: boolean;
+    provider: "docker" | null;
+    availableTools: string[];
+    reason: string | null;
+  } {
+    return {
+      ready: this.sandboxRuntime !== null,
+      provider: this.sandboxRuntime ? "docker" : null,
+      availableTools: [...(this.sandboxRuntime?.availableTools ?? [])],
+      reason: this.sandboxFailure,
+    };
+  }
+
+  private workspacePrivateScopes(principalId: string): TrustedChannelScope[] {
+    const scopes: TrustedChannelScope[] = [];
+    for (const channel of this.channels.list()) {
+      const config = this.channels.resolve(channel.id).config;
+      const senderId =
+        principalId === OWNER_ID
+          ? config.ownerId
+          : config.coOwnerId && principalId === `owner-${config.coOwnerId}`
+            ? config.coOwnerId
+            : null;
+      if (senderId)
+        scopes.push({
+          connectionId: config.connectionId,
+          botId: config.botId,
+          chatType: "private",
+          chatId: senderId,
+          senderId,
+        });
+    }
+    return scopes;
+  }
+
+  private async requireOwnerPrincipal(principalId: string): Promise<void> {
+    if (!(await this.store.identities.isOwner(principalId)))
+      throw new ManagementError("FORBIDDEN", "Owner principal is required", 403);
+  }
+
+  private async grantWorkspaceScope(
+    principalId: string,
+    scope: TrustedChannelScope,
+    workspaceId: string,
+  ): Promise<void> {
+    const workspace = await this.workspaces.resolveAuthorized(principalId, workspaceId, "read");
+    const resourceId = `workspace:${workspace.id}`;
+    await this.store.authorization.registerResource({
+      id: resourceId,
+      kind: "workspace",
+      visibility: "private",
+      ownerId: workspace.ownerPrincipalId,
+      ifAbsent: true,
+    });
+    for (const action of [
+      "workspace:read",
+      ...(workspace.grants[principalId] === "write" ? ["workspace:write"] : []),
+    ])
+      await this.store.authorization.grant({
+        principalId,
+        resourceId,
+        action,
+        scope,
+        effect: "allow",
+      });
+  }
+
+  async listWorkspaces(principalId: string) {
+    await this.requireOwnerPrincipal(principalId);
+    return this.workspaces.listForPrincipal(principalId);
+  }
+
+  async registerWorkspace(input: unknown) {
+    const value = input as Record<string, unknown>;
+    if (
+      !value ||
+      typeof value.path !== "string" ||
+      typeof value.label !== "string" ||
+      typeof value.ownerPrincipalId !== "string"
+    )
+      throw new ManagementError("INVALID_REQUEST", "Workspace path, label and Owner are required");
+    await this.requireOwnerPrincipal(value.ownerPrincipalId);
+    const workspace = await this.workspaces.registerExistingTrusted({
+      path: value.path,
+      label: value.label,
+      ownerPrincipalId: value.ownerPrincipalId,
+    });
+    for (const scope of this.workspacePrivateScopes(value.ownerPrincipalId))
+      await this.grantWorkspaceScope(value.ownerPrincipalId, scope, workspace.id);
+    return { id: workspace.id, label: workspace.label, kind: workspace.kind };
+  }
+
+  async grantWorkspace(input: unknown) {
+    const value = input as Record<string, unknown>;
+    if (
+      !value ||
+      typeof value.workspaceId !== "string" ||
+      typeof value.principalId !== "string" ||
+      (value.access !== "read" && value.access !== "write")
+    )
+      throw new ManagementError("INVALID_REQUEST", "Workspace ID, Owner and access are required");
+    await this.requireOwnerPrincipal(value.principalId);
+    await this.workspaces.grantTrusted(value.workspaceId, value.principalId, value.access);
+    for (const scope of this.workspacePrivateScopes(value.principalId)) {
+      if (value.access === "read")
+        await this.store.authorization.revokeScopeAction({
+          principalId: value.principalId,
+          resourceId: `workspace:${value.workspaceId}`,
+          action: "workspace:write",
+          scope,
+        });
+      await this.grantWorkspaceScope(value.principalId, scope, value.workspaceId);
+    }
+    return { granted: true };
+  }
+
+  async revokeWorkspace(input: unknown) {
+    const value = input as Record<string, unknown>;
+    if (!value || typeof value.workspaceId !== "string" || typeof value.principalId !== "string")
+      throw new ManagementError("INVALID_REQUEST", "Workspace ID and Owner are required");
+    await this.requireOwnerPrincipal(value.principalId);
+    await this.workspaces.revokeTrusted(value.workspaceId, value.principalId);
+    // Revoke the product grant in every configured private scope and stop old tool sessions.
+    for (const scope of this.workspacePrivateScopes(value.principalId))
+      await this.store.authorization.revokeScope({
+        principalId: value.principalId,
+        resourceId: `workspace:${value.workspaceId}`,
+        scope,
+      });
+    for (const adapter of this.piAdapters.values())
+      await adapter.disposeWorkspaceSessions(value.principalId, value.workspaceId);
+    return { revoked: true };
+  }
+
+  async selectWorkspace(input: unknown) {
+    const value = input as Record<string, unknown>;
+    if (!value || typeof value.workspaceId !== "string" || typeof value.principalId !== "string")
+      throw new ManagementError("INVALID_REQUEST", "Workspace ID and Owner are required");
+    await this.requireOwnerPrincipal(value.principalId);
+    await this.workspaces.select(value.principalId, value.workspaceId);
+    return { selected: value.workspaceId };
+  }
 
   private getOrCreateDefaultPiAdapter(profileId: string): PiRunExecutionAdapter {
     const existing = this.piAdapters.get(profileId);
@@ -449,6 +612,79 @@ export class ManagementApplication {
       },
       resolveToolNames: (context) => this.resolveRunToolNames(context),
       resolveToolCandidates: (context) => this.resolveRunToolCandidates(context),
+      openSandboxToolSession: async ({ context, selectedNames }) => {
+        const caller = context.caller;
+        if (!caller || !context.runId || !context.conversationId || !context.workspaceId)
+          throw new Error("Sandbox Run binding missing");
+        if (!this.sandboxRuntime) throw new Error("Sandbox backend unavailable");
+        const writable = selectedNames.some((name) =>
+          ["write", "edit", "bash", "powershell"].includes(name),
+        );
+        const workspace = await this.workspaces.resolveAuthorized(
+          caller.principalId,
+          context.workspaceId,
+          writable ? "write" : "read",
+        );
+        const decision = await this.store.authorization.check({
+          caller,
+          resourceId: `workspace:${workspace.id}`,
+          action: writable ? "workspace:write" : "workspace:read",
+          conversationId: context.conversationId,
+          runId: context.runId,
+        });
+        if (decision.decision !== "ALLOW")
+          throw new Error("Sandbox workspace authorization denied");
+        const sessionId = randomUUID();
+        const lease = writable
+          ? this.workspaceWrites.acquire({
+              workspaceId: workspace.id,
+              principalId: caller.principalId,
+              executionId: context.runId,
+              sandboxSessionId: sessionId,
+              policyVersion: "workspace-sandbox-v1",
+            })
+          : null;
+        let session;
+        try {
+          session = await this.sandboxRuntime.executor.openSession({
+            sessionId,
+            workspacePath: workspace.canonicalPath,
+            writable,
+            policyVersion: "workspace-sandbox-v1",
+            network: "none",
+          });
+        } catch (error) {
+          if (lease) this.workspaceWrites.quarantine(lease);
+          throw error;
+        }
+        const tools = createIsolatedPiTools({
+          session,
+          workspaceId: workspace.id,
+          registry: this.workspaces,
+          store: this.store,
+          getContext: () => context,
+          onEvidence: async (record) => {
+            const cursor = await this.trace.append(
+              context.runId!,
+              {
+                ...record,
+                sandboxProvider: "docker",
+                sandboxImage: this.sandboxRuntime?.image,
+                policyVersion: "workspace-sandbox-v1",
+              },
+              "glassbox-sandbox-tool",
+            );
+            await this.store.evidence.advanceTrace(caller, cursor);
+          },
+        });
+        return {
+          tools,
+          close: () =>
+            lease
+              ? this.workspaceWrites.closeAndRelease(lease, () => session.close())
+              : session.close(),
+        };
+      },
       onEvent: async (event) => {
         const runId =
           event.runId ?? (typeof event.data.runId === "string" ? event.data.runId : undefined);
@@ -741,6 +977,10 @@ export class ManagementApplication {
     // The Agent Ops and Owner-control surface is Owner-private. A group Run reaches neither,
     // however the Owner's own grants look, so this is a scope boundary rather than a policy.
     const ownerPrivate = isOwner && scope.chatType === "private";
+    const selectedWorkspace = ownerPrivate
+      ? await this.workspaces.resolveSelected(context.caller.principalId).catch(() => null)
+      : null;
+    if (selectedWorkspace) context.workspaceId = selectedWorkspace.id;
     for (const name of OPS_TOOL_NAMES) {
       classified.add(name);
       if (!(ownerPrivate && this.options.ops)) scopeGates.set(name, "scope_not_permitted");
@@ -755,11 +995,33 @@ export class ManagementApplication {
     const candidates: ToolSurfaceCandidate[] = [];
     for (const descriptor of registered) {
       if (descriptor.origin === "pi_builtin") {
-        // A Pi built-in is classified by its origin, and excluded on the same evidence the
-        // real session uses: the host never offers it to a Glassbox Run.
         classified.add(descriptor.name);
-        candidates.push({ name: descriptor.name, exclusion: "disabled_by_host" });
-        continue;
+        if (!ownerPrivate) scopeGates.set(descriptor.name, "scope_not_permitted");
+        else if (!this.sandboxRuntime?.availableTools.has(descriptor.name))
+          scopeGates.set(descriptor.name, "backend_unavailable");
+        else if (!selectedWorkspace) scopeGates.set(descriptor.name, "policy_disabled");
+        else {
+          const access = ["write", "edit", "bash", "powershell"].includes(descriptor.name)
+            ? "write"
+            : "read";
+          const allowed = await this.workspaces
+            .resolveAuthorized(context.caller.principalId, selectedWorkspace.id, access)
+            .then(
+              () => true,
+              () => false,
+            );
+          if (!allowed) scopeGates.set(descriptor.name, "policy_disabled");
+          else {
+            const decision = await this.store.authorization.check({
+              caller: context.caller,
+              resourceId: `workspace:${selectedWorkspace.id}`,
+              action: access === "write" ? "workspace:write" : "workspace:read",
+              conversationId: context.conversationId,
+              runId: context.runId,
+            });
+            if (decision.decision !== "ALLOW") scopeGates.set(descriptor.name, "discovery_denied");
+          }
+        }
       }
       // A registered Tool no rule classified is a wiring bug. Withholding it keeps it out of
       // the model's surface and makes the gap visible instead of silently offering it.
@@ -913,6 +1175,7 @@ export class ManagementApplication {
     });
     const acceptConnection = () => {
       connectionAccepted = true;
+      if (adapter.state.status === "ready") this.states.set(id, { connectionState: "connected" });
       if (!connectionReleased) {
         connectionReleased = true;
         releaseConnection();
@@ -930,7 +1193,9 @@ export class ManagementApplication {
       config: configured.config,
       token: configured.token,
       onState: (state) => {
-        this.updateChannelState(id, state);
+        if (state.status === "ready" && !connectionAccepted)
+          this.states.set(id, { connectionState: "connecting" });
+        else this.updateChannelState(id, state);
         if (!remember && state.status === "ready") {
           void provisionConfiguredAccess()
             .then(acceptConnection)
@@ -1222,6 +1487,45 @@ export class ManagementApplication {
       });
     }
     if (isOwner && scope.chatType === "private") {
+      const defaultWorkspace = await this.workspaces.ensureDefault(principalId);
+      const workspaceResource = `workspace:${defaultWorkspace.id}`;
+      await this.store.authorization.registerResource({
+        id: workspaceResource,
+        kind: "workspace",
+        visibility: "private",
+        ownerId: principalId,
+        ifAbsent: true,
+      });
+      for (const action of ["workspace:read", "workspace:write"]) {
+        await this.store.authorization.grant({
+          principalId,
+          resourceId: workspaceResource,
+          action,
+          scope,
+          effect: "allow",
+        });
+      }
+      for (const workspace of await this.workspaces.listForPrincipal(principalId)) {
+        if (workspace.id !== defaultWorkspace.id)
+          await this.grantWorkspaceScope(principalId, scope, workspace.id);
+      }
+      for (const name of GLASSBOX_HOST_EXCLUDED_PI_TOOLS) {
+        const resourceId = toolResourceId(name);
+        await this.store.authorization.registerResource({
+          id: resourceId,
+          kind: "tool-definition",
+          visibility: "private",
+          ownerId: OWNER_ID,
+          ifAbsent: true,
+        });
+        await this.store.authorization.grant({
+          principalId,
+          resourceId,
+          action: TOOL_DISCOVERY_ACTION,
+          scope,
+          effect: "allow",
+        });
+      }
       await this.store.authorization.registerResource({
         id: OWNER_CONTROL_RESOURCE,
         kind: "owner-control",
@@ -2488,6 +2792,12 @@ export class ManagementApplication {
   async route(request: IncomingMessage): Promise<{ status: number; body: unknown } | undefined> {
     return routeManagementRequest(request, {
       store: this.store,
+      sandboxStatus: () => this.sandboxStatus(),
+      listWorkspaces: (principalId) => this.listWorkspaces(principalId),
+      registerWorkspace: (input) => this.registerWorkspace(input),
+      grantWorkspace: (input) => this.grantWorkspace(input),
+      revokeWorkspace: (input) => this.revokeWorkspace(input),
+      selectWorkspace: (input) => this.selectWorkspace(input),
       grantOpsPermissions: (input) =>
         grantOpsPermissions(this.store, this.options.ops?.workerPolicy, input),
       executors: this.executors,
@@ -2513,6 +2823,7 @@ export class ManagementApplication {
     await this.runs.stop({ abortRunning: true, wait: true });
     for (const adapter of this.piAdapters.values()) await adapter.cleanup();
     this.piAdapters.clear();
+    await this.sandboxRuntime?.executor.close();
     await this.opsReconciler?.stop();
     await this.options.ops?.bridge.disconnect();
     await this.store.close();
