@@ -18,9 +18,21 @@ export function configuredModelAdapter(options: {
     supportsGroup: true,
     async execute(input) {
       const resolved = options.profiles.resolve(options.profileId);
+      const contextWindowTokens = resolved.profile.contextWindowTokens;
+      const maxOutputTokens = resolved.profile.maxOutputTokens;
+      if (
+        contextWindowTokens === undefined ||
+        maxOutputTokens === undefined ||
+        maxOutputTokens >= contextWindowTokens
+      ) {
+        await options.onEvent?.(input.run.id, {
+          type: "model_capacity",
+          state: "unknown",
+          reasonCode: "capacity_unknown",
+        });
+        return { status: "failed" as const, failureCode: "model_capacity_unknown" as const };
+      }
       const provider = createModelProvider(resolved);
-      const contextWindowTokens = resolved.profile.contextWindowTokens ?? 32_768;
-      const maxOutputTokens = resolved.profile.maxOutputTokens ?? 4_096;
       const exchanges = [];
       for (let index = 0; index < input.history.length; index += 2) {
         const first = input.history[index];
@@ -57,6 +69,7 @@ export function configuredModelAdapter(options: {
         {
           contextWindowTokens,
           outputReserveTokens: maxOutputTokens,
+          thinkingReserveTokens: 0,
           safetyMarginTokens: 512,
         },
       );
@@ -64,6 +77,8 @@ export function configuredModelAdapter(options: {
         type: "context_budget",
         policyVersion: "p5a-context-v1",
         capacityTokens: contextWindowTokens,
+        outputReserveTokens: maxOutputTokens,
+        thinkingReserveTokens: 0,
         inputBudgetTokens: Math.max(0, contextWindowTokens - maxOutputTokens - 512),
         estimatedTokens: projection.ok ? projection.projection.projectedTokens : 0,
         omittedExchanges: projection.ok ? projection.projection.omittedExchangeIds.length : 0,

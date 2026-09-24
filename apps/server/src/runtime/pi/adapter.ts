@@ -164,18 +164,28 @@ function estimateStructuredTokens(value: unknown): number {
   return Math.min(Number.MAX_SAFE_INTEGER, Math.ceil(tokens));
 }
 
-function capacityFromModel(model: Model<any> | undefined): EfficiencyModelCapacity | undefined {
+export function capacityFromModel(
+  model: Model<any> | undefined,
+  thinkingEnabled: boolean,
+): EfficiencyModelCapacity | undefined {
   if (
     !model ||
     !Number.isSafeInteger(model.contextWindow) ||
     !Number.isSafeInteger(model.maxTokens) ||
     model.contextWindow <= 0 ||
-    model.maxTokens < 0
+    model.maxTokens <= 0
   )
     return undefined;
+  const outputReserveTokens = Math.min(model.maxTokens, model.contextWindow);
+  // Pi exposes a combined maximum output ceiling, but not a provider-independent reasoning
+  // token allocation. Reserve half of that ceiling for hidden reasoning when enabled, and
+  // keep the two budgets visible separately without increasing Pi's actual maxTokens.
+  const thinkingReserveTokens =
+    model.reasoning === true && thinkingEnabled ? Math.ceil(outputReserveTokens / 2) : 0;
   return {
     contextWindowTokens: model.contextWindow,
-    outputReserveTokens: Math.min(model.maxTokens, model.contextWindow),
+    outputReserveTokens: outputReserveTokens - thinkingReserveTokens,
+    thinkingReserveTokens,
     safetyMarginTokens: 0,
   };
 }
@@ -666,7 +676,11 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
       modelVisibleSkillNames,
       skillPolicy: structuredClone(resolvedSkills.policy ?? { source: "kit-profile" }),
       modelCapacity:
-        this.modelCapacities.get(session.sessionId) ?? capacityFromModel(session.model),
+        this.modelCapacities.get(session.sessionId) ??
+        capacityFromModel(
+          session.model,
+          (this.thinkingLevels.get(session.sessionId) ?? "none") !== "none",
+        ),
       staticContextEstimate: this.staticContextEstimates.get(session.sessionId),
       thinkingLevel: this.thinkingLevels.get(session.sessionId) ?? null,
       resultProjectionEvidence: new Map(),
@@ -792,6 +806,7 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
               estimateSource: "unicode_conservative",
               capacityTokens: capacity.contextWindowTokens,
               outputReserveTokens: capacity.outputReserveTokens,
+              thinkingReserveTokens: capacity.thinkingReserveTokens,
               inputBudgetTokens: projection.projection.budgetTokens,
               projectedTokens: projection.projection.projectedTokens,
               omittedExchangeCount: omitted,
@@ -991,6 +1006,7 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
             const maxInputTokens =
               capacity.contextWindowTokens -
               capacity.outputReserveTokens -
+              capacity.thinkingReserveTokens -
               capacity.safetyMarginTokens;
             if (payloadTokens > maxInputTokens) {
               active.contextBudgetEvidence = {
@@ -999,6 +1015,9 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
                 estimateSource: "unicode_conservative",
                 providerPayloadTokens: payloadTokens,
                 inputBudgetTokens: maxInputTokens,
+                outputReserveTokens: capacity.outputReserveTokens,
+                thinkingReserveTokens: capacity.thinkingReserveTokens,
+                safetyMarginTokens: capacity.safetyMarginTokens,
                 overflow: "provider_payload_exceeds_capacity",
               };
               active.pendingBudgetFailure =
@@ -1069,17 +1088,21 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
     });
     runtimeSessionId = created.session.sessionId;
     const actualModel = created.session.model ?? configuredModel;
-    this.modelCapacities.set(runtimeSessionId, capacityFromModel(actualModel));
+    const actualThinkingLevel =
+      actualModel?.reasoning === true
+        ? profile.thinkingLevel === "none"
+          ? "minimal"
+          : profile.thinkingLevel
+        : null;
+    this.modelCapacities.set(
+      runtimeSessionId,
+      capacityFromModel(actualModel, actualThinkingLevel !== null),
+    );
     this.staticContextEstimates.set(runtimeSessionId, {
       systemTokens: systemPromptTokens,
       toolSchemaTokens,
     });
-    this.thinkingLevels.set(
-      runtimeSessionId,
-      actualModel?.reasoning === true && profile.thinkingLevel !== "none"
-        ? profile.thinkingLevel
-        : null,
-    );
+    this.thinkingLevels.set(runtimeSessionId, actualThinkingLevel);
     await created.session.bindExtensions({});
     created.session.setActiveToolsByName(customToolNames);
     return created.session;
@@ -1152,6 +1175,7 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
             ? {
                 contextWindowTokens: active.modelCapacity.contextWindowTokens,
                 outputReserveTokens: active.modelCapacity.outputReserveTokens,
+                thinkingReserveTokens: active.modelCapacity.thinkingReserveTokens,
                 safetyMarginTokens: active.modelCapacity.safetyMarginTokens,
               }
             : null,

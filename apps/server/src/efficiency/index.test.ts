@@ -44,7 +44,12 @@ describe("P5A efficiency leaf contracts", () => {
           { id: "new", userTokens: 10, assistantTokens: 10 },
         ],
       },
-      { contextWindowTokens: 75, outputReserveTokens: 10, safetyMarginTokens: 5 },
+      {
+        contextWindowTokens: 75,
+        outputReserveTokens: 10,
+        thinkingReserveTokens: 0,
+        safetyMarginTokens: 5,
+      },
     );
     expect(result).toEqual({
       ok: true,
@@ -75,7 +80,12 @@ describe("P5A efficiency leaf contracts", () => {
           requiredFloorTokens: 0,
           exchanges: [],
         },
-        { contextWindowTokens: 30, outputReserveTokens: 5, safetyMarginTokens: 5 },
+        {
+          contextWindowTokens: 30,
+          outputReserveTokens: 5,
+          thinkingReserveTokens: 0,
+          safetyMarginTokens: 5,
+        },
       ),
     ).toEqual({
       ok: false,
@@ -98,7 +108,12 @@ describe("P5A efficiency leaf contracts", () => {
           requiredFloorTokens: 0,
           exchanges: [{ id: "required", userTokens: 8, assistantTokens: 8, required: true }],
         },
-        { contextWindowTokens: 15, outputReserveTokens: 5, safetyMarginTokens: 5 },
+        {
+          contextWindowTokens: 15,
+          outputReserveTokens: 5,
+          thinkingReserveTokens: 0,
+          safetyMarginTokens: 5,
+        },
       ),
     ).toEqual({
       ok: false,
@@ -128,7 +143,12 @@ describe("P5A efficiency leaf contracts", () => {
             { id: "optional-new", userTokens: 4, assistantTokens: 4 },
           ],
         },
-        { contextWindowTokens: 13, outputReserveTokens: 5, safetyMarginTokens: 0 },
+        {
+          contextWindowTokens: 13,
+          outputReserveTokens: 5,
+          thinkingReserveTokens: 0,
+          safetyMarginTokens: 0,
+        },
       ),
     ).toMatchObject({
       ok: true,

@@ -7,6 +7,40 @@ import { configuredModelAdapter } from "./model-adapter.js";
 import type { ModelAgentEvent } from "./model-agent/index.js";
 import type { ExecutionInput } from "./run-service/types.js";
 
+it("fails closed before model construction when configured capacity is unknown", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "glassbox-model-unknown-capacity-"));
+  try {
+    const profiles = await ModelProfileStore.open(directory);
+    await profiles.save({
+      id: "unknown",
+      label: "Unknown capacity",
+      protocol: "openai-completions",
+      model: "fixture",
+      baseUrl: "http://127.0.0.1:1/v1",
+    });
+    const events: ModelAgentEvent[] = [];
+    const result = await configuredModelAdapter({
+      profiles,
+      profileId: "unknown",
+      onEvent: (_runId, event) => {
+        events.push(event);
+      },
+    }).execute({
+      text: "do not send",
+      history: [],
+      run: { id: "run-unknown-capacity" },
+      signal: new AbortController().signal,
+    } as unknown as ExecutionInput);
+
+    expect(result).toEqual({ status: "failed", failureCode: "model_capacity_unknown" });
+    expect(events).toEqual([
+      { type: "model_capacity", state: "unknown", reasonCode: "capacity_unknown" },
+    ]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 it("fails before a provider call when the authorized current message exceeds model capacity", async () => {
   const directory = await mkdtemp(join(tmpdir(), "glassbox-model-budget-"));
   try {

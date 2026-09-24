@@ -1,9 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { TrustedChannelScope } from "../identity/scope.js";
 import type { ModelProfileStore } from "../config/model-profiles.js";
 import { textResponse } from "../model/testing/streams.js";
 import { createApplicationFixtureScope } from "./application-test-helpers.js";
 import type { ManagementApplication } from "./application.js";
+import { OWNER_MODEL_ADMIN_TOOL } from "../runtime/pi/owner-model-tools.js";
+import { piModelProfileId } from "../runtime/pi/model-catalog.js";
 
 const { fixture, afterEachCleanup } = createApplicationFixtureScope();
 afterEach(async () => {
@@ -39,8 +44,9 @@ async function configureModelRoute(
     routingAvailable?: boolean;
     routePriority?: number;
     capabilityRank?: number;
-    contextWindowTokens: number;
-    maxOutputTokens: number;
+    contextWindowTokens?: number;
+    maxOutputTokens?: number;
+    supportsTools?: boolean;
   }[],
 ) {
   const models = modelStore(application);
@@ -75,13 +81,14 @@ async function executePrivateRun(
   application: Awaited<ReturnType<typeof fixture>>["app"],
   messageId: string,
   text: string,
+  executionRef = "model:origin",
 ) {
   const accepted = await application.store.conversations.acceptIncoming({
     agentId: "personal",
     scope: privateOwnerScope,
     messageId,
     text,
-    executionRef: "model:origin",
+    executionRef,
   });
   await application.runs.enqueueAccepted(accepted);
   const run = await application.runs.waitForRun(accepted.caller, accepted.run.id);
@@ -97,6 +104,271 @@ async function executePrivateRun(
 }
 
 describe("Management model routing wrapper", () => {
+  it("switches to a Pi-configured model and runs the next QQ execution through Pi", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "glassbox-pi-route-"));
+    try {
+      const secret = "pi-router-fixture-secret";
+      await writeFile(
+        join(directory, "models.json"),
+        JSON.stringify({
+          providers: {
+            fixture: {
+              name: "Fixture Provider",
+              api: "openai-completions",
+              baseUrl: "http://127.0.0.1:9898/pi-fixture/v1",
+              apiKey: secret,
+              models: [
+                {
+                  id: "default-model",
+                  name: "Default Pi Model",
+                  contextWindow: 65_536,
+                  maxTokens: 8_192,
+                  input: ["text"],
+                },
+                {
+                  id: "alternate-model",
+                  name: "Alternate Pi Model",
+                  contextWindow: 131_072,
+                  maxTokens: 16_384,
+                  input: ["text"],
+                },
+              ],
+            },
+          },
+        }),
+        "utf8",
+      );
+      const urls: string[] = [];
+      stubModelFetch(urls);
+      const f = await fixture(async () => ({ status: "failed" }), {
+        piAgentDirectory: directory,
+      });
+      const defaultProfileId = piModelProfileId("fixture", "default-model");
+      const alternateProfileId = piModelProfileId("fixture", "alternate-model");
+      const current = f.app.channels.resolve("fixture");
+      await f.app.disconnectChannel("fixture");
+      await f.app.saveChannel({
+        id: "fixture",
+        label: current.config.label,
+        kind: "qq-onebot",
+        endpoint: current.config.endpoint,
+        botId: current.config.botId,
+        ownerId: current.config.ownerId,
+        visitorIds: [...current.config.visitorIds],
+        groupIds: [...current.config.groupIds],
+        token: current.token,
+        executionRef: `pi:${defaultProfileId}`,
+      });
+      await f.app.connectChannel("fixture");
+
+      const accepted = await f.app.store.conversations.acceptIncoming({
+        agentId: "personal",
+        scope: privateOwnerScope,
+        messageId: "switch-to-pi-native-model",
+        text: "Bob，切换到 Fixture Provider / Alternate Pi Model 模型",
+        executionRef: `pi:${defaultProfileId}`,
+      });
+      const toolContext = {
+        caller: accepted.caller,
+        conversationId: accepted.conversation.id,
+        runId: accepted.run.id,
+        requiredToolName: OWNER_MODEL_ADMIN_TOOL,
+        requiredToolInput: { action: "select", profileId: alternateProfileId },
+      };
+      const app = f.app as unknown as {
+        createRuntimeTools(getContext: () => typeof toolContext): Array<{
+          name: string;
+          execute(id: string, params: unknown): Promise<{ details?: unknown }>;
+        }>;
+      };
+      const modelTool = app
+        .createRuntimeTools(() => toolContext)
+        .find((tool) => tool.name === OWNER_MODEL_ADMIN_TOOL);
+      if (!modelTool) throw new Error("missing Owner model Tool");
+      const inventory = await modelTool.execute("list", { action: "list" });
+      expect(JSON.stringify(inventory.details)).toContain("Alternate Pi Model");
+      expect(JSON.stringify(inventory.details)).toContain("131072");
+      expect(JSON.stringify(inventory.details)).not.toContain(secret);
+      await modelTool.execute("select", {
+        action: "select",
+        profileId: alternateProfileId,
+      });
+      expect(f.app.channels.resolve("fixture").modelOverrideProfileId).toBe(alternateProfileId);
+
+      const switched = await executePrivateRun(
+        f.app,
+        "run-pi-native-alternate",
+        "private fixture request",
+        `pi:${alternateProfileId}`,
+      );
+      expect(switched.run.status).toBe("succeeded");
+      expect(switched.run.executionRef).toBe(`pi:${alternateProfileId}`);
+      expect(urls).toContain("http://127.0.0.1:9898/pi-fixture/v1/chat/completions");
+      expect(switched.events.find((event) => event.type === "routing_decision")).toMatchObject({
+        selectedProfileId: alternateProfileId,
+      });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("pins later Runs to the Owner-selected profile while keeping route evidence", async () => {
+    const urls: string[] = [];
+    stubModelFetch(urls);
+    const f = await fixture(async () => ({ status: "failed" }));
+    await configureModelRoute(f.app, [
+      {
+        id: "origin",
+        routingEnabled: true,
+        allowRouting: true,
+        contextWindowTokens: 32_768,
+        maxOutputTokens: 4_096,
+      },
+      {
+        id: "alternate",
+        contextWindowTokens: 65_536,
+        maxOutputTokens: 8_192,
+        supportsTools: true,
+      },
+    ]);
+    await f.app.channels.setModelOverride("fixture", "alternate");
+
+    const result = await executePrivateRun(
+      f.app,
+      "manual-model-override",
+      "private fixture request",
+      "model:alternate",
+    );
+    const decision = result.events.find((event) => event.type === "routing_decision");
+    const evaluation = result.events.find((event) => event.type === "routing_eval_evidence");
+
+    expect(result.run.status).toBe("succeeded");
+    expect(urls.length).toBeGreaterThan(0);
+    expect(
+      urls.every((url) => url.includes("/alternate/v1/")),
+      JSON.stringify(urls),
+    ).toBe(true);
+    expect(decision).toMatchObject({
+      selectedProfileId: "alternate",
+      executionRef: "model:alternate",
+      reason: "selected",
+    });
+    expect(evaluation).toMatchObject({
+      decisionExecutionRef: "model:alternate",
+      actualExecutionRef: "model:alternate",
+    });
+  });
+
+  it("switches the QQ model through the Owner Tool and persists it for subsequent Runs", async () => {
+    const urls: string[] = [];
+    stubModelFetch(urls);
+    const f = await fixture(async () => ({ status: "failed" }));
+    await configureModelRoute(f.app, [
+      {
+        id: "origin",
+        routingEnabled: false,
+        contextWindowTokens: 32_768,
+        maxOutputTokens: 4_096,
+        supportsTools: true,
+      },
+      {
+        id: "alternate",
+        contextWindowTokens: 65_536,
+        maxOutputTokens: 8_192,
+        supportsTools: true,
+      },
+    ]);
+    const accepted = await f.app.store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: privateOwnerScope,
+      messageId: "switch-model-tool",
+      text: "Bob，切换到 fixture-alternate 模型",
+      executionRef: "model:origin",
+    });
+    const toolContext = {
+      caller: accepted.caller,
+      conversationId: accepted.conversation.id,
+      runId: accepted.run.id,
+      requiredToolName: OWNER_MODEL_ADMIN_TOOL,
+      requiredToolInput: { action: "select", profileId: "alternate" },
+    };
+    const appTools = (
+      f.app as unknown as {
+        createRuntimeTools(getContext: () => typeof toolContext): Array<{
+          name: string;
+          execute(id: string, params: unknown): Promise<{ details?: unknown }>;
+        }>;
+      }
+    ).createRuntimeTools(() => toolContext);
+    const modelTool = appTools.find((tool) => tool.name === OWNER_MODEL_ADMIN_TOOL);
+    expect(await f.app.resolveRunToolNames(toolContext)).toContain(OWNER_MODEL_ADMIN_TOOL);
+    if (!modelTool) throw new Error("missing Owner model Tool");
+    const inventory = await modelTool.execute("list-models", { action: "list" });
+    expect(JSON.stringify(inventory.details)).toContain("fixture-alternate");
+    expect(JSON.stringify(inventory.details)).not.toContain("9898");
+    await modelTool.execute("select-alternate", {
+      action: "select",
+      profileId: "alternate",
+    });
+    expect(f.app.channels.resolve("fixture").modelOverrideProfileId).toBe("alternate");
+    urls.length = 0;
+
+    const switchedRun = await executePrivateRun(
+      f.app,
+      "after-model-switch",
+      "private fixture request",
+      "model:alternate",
+    );
+    expect(switchedRun.run.status).toBe("succeeded");
+    expect(switchedRun.run.executionRef).toBe("model:alternate");
+    expect(urls.length).toBeGreaterThan(0);
+    expect(urls.at(-1)).toContain("/alternate/v1/");
+    expect(switchedRun.events.find((event) => event.type === "routing_decision")).toMatchObject({
+      selectedProfileId: "alternate",
+      executionRef: "model:alternate",
+    });
+
+    const trace = await f.app.trace.readPage(accepted.run.id, { limit: 100 });
+    expect(trace.records.map((record) => record.event)).toContainEqual(
+      expect.objectContaining({
+        type: "model_route_override",
+        profileId: "alternate",
+        appliesTo: "later_owner_private_runs_on_this_qq_connection",
+      }),
+    );
+  });
+
+  it("fails closed when a manually selected model has unknown context capacity", async () => {
+    const urls: string[] = [];
+    stubModelFetch(urls);
+    const f = await fixture(async () => ({ status: "failed" }));
+    await configureModelRoute(f.app, [
+      {
+        id: "origin",
+        contextWindowTokens: 32_768,
+        maxOutputTokens: 4_096,
+      },
+      { id: "uncertain", supportsTools: true },
+    ]);
+    await f.app.channels.setModelOverride("fixture", "uncertain");
+
+    const result = await executePrivateRun(
+      f.app,
+      "manual-model-unknown-capacity",
+      "private fixture request",
+      "model:uncertain",
+    );
+
+    expect(result.run.status).toBe("failed");
+    expect(urls).toEqual([]);
+    expect(result.events.find((event) => event.type === "routing_decision")).toMatchObject({
+      selectedProfileId: null,
+      executionRef: null,
+      reason: "no_route",
+      candidates: [{ profileId: "uncertain", eligible: false, reason: "context_unknown" }],
+    });
+  });
+
   it("keeps the default execution when routing is disabled and persists scoped evidence", async () => {
     const urls: string[] = [];
     stubModelFetch(urls);

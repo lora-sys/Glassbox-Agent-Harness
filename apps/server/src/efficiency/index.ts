@@ -94,8 +94,10 @@ export interface ContextExchangeEstimate {
 
 export interface ModelCapacity {
   contextWindowTokens: number;
-  /** Space withheld for the model response. */
+  /** Space withheld for the user-facing model response. */
   outputReserveTokens: number;
+  /** Space withheld for hidden reasoning when the selected model enables it. */
+  thinkingReserveTokens: number;
   /** Additional safety margin for provider-specific serialization. */
   safetyMarginTokens: number;
 }
@@ -129,6 +131,7 @@ export function projectContextBudget(
   if (
     !isNonNegativeInteger(capacity.contextWindowTokens) ||
     !isNonNegativeInteger(capacity.outputReserveTokens) ||
+    !isNonNegativeInteger(capacity.thinkingReserveTokens) ||
     !isNonNegativeInteger(capacity.safetyMarginTokens) ||
     capacity.contextWindowTokens === 0
   )
@@ -155,7 +158,10 @@ export function projectContextBudget(
 
   const budgetTokens = Math.max(
     0,
-    capacity.contextWindowTokens - capacity.outputReserveTokens - capacity.safetyMarginTokens,
+    capacity.contextWindowTokens -
+      capacity.outputReserveTokens -
+      capacity.thinkingReserveTokens -
+      capacity.safetyMarginTokens,
   );
   const fixedFloorTokens =
     demand.systemTokens +

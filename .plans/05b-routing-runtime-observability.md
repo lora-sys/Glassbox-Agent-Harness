@@ -593,7 +593,9 @@ Required cases:
 - simple low-demand request stays on safe default/low route where policy permits;
 - long-context demand never selects a model that cannot fit;
 - trusted high-risk/capability floor is respected;
-- explicit route/model override is respected when configured/allowed;
+- an Owner can switch to an exact configured model by private QQ message, and later Runs stay on that selection while still enforcing capability and context floors;
+- ambiguous, unconfigured, unavailable, or metadata-incomplete model selections fail closed;
+- model switching changes no Tool, Resource, Principal, or Delivery authority;
 - selected model unavailable → traceable safe fallback;
 - quota unknown does not act like unlimited or exhausted;
 - model change does not change Tools/Resources;
@@ -675,6 +677,8 @@ Herdr events_lost
 Task REVIEW vs Herdr done
 rework throughput
 Visitor/group management denial
+Owner-private natural-language model selection, reset to channel default, ambiguity and authorization denial
+persisted model override and exact-route evidence after restart
 route authorization-surface equality
 routing evidence vs actual runtime
 Eval replay from stored evidence

@@ -3,6 +3,7 @@ import type { IncomingMessage } from "node:http";
 import {
   CHANNEL_SAFE_ERRORS,
   type PublicChannelProfile,
+  type PublicModelProfile,
   type QqSourceClass,
 } from "@glassbox/contracts";
 import { ChannelProfileStore } from "../config/channel-profiles.js";
@@ -35,6 +36,7 @@ import {
 import {
   KitLoader,
   MUTATION_REQUESTS,
+  PiModelCatalog,
   piProfileName,
   PiRunExecutionAdapter,
   PiSdkRuntimeAdapter,
@@ -47,6 +49,7 @@ import {
   OWNER_CONTROL_RESOURCE,
   OWNER_GROUP_ADMIN_TOOL,
 } from "../runtime/pi/owner-tools.js";
+import { createOwnerModelTools, OWNER_MODEL_ADMIN_TOOL } from "../runtime/pi/owner-model-tools.js";
 import {
   createSkillTools,
   SKILL_CATALOG_RESOURCE,
@@ -368,6 +371,7 @@ export class ManagementApplication {
     dataDirectory: string;
     databasePath?: string;
     kitPath?: string;
+    piAgentDirectory?: string | null;
     models: ModelProfileStore;
     executors?: ReadonlyMap<string, RunExecutionAdapter>;
     ops?: {
@@ -384,6 +388,8 @@ export class ManagementApplication {
     });
     const application = new ManagementApplication(options, store, channels, groupRuntime);
     try {
+      if (options.piAgentDirectory)
+        application.piModelCatalog = await PiModelCatalog.open(options.piAgentDirectory);
       application.executors = await ExecutorConfiguration.open({
         dataDirectory: options.dataDirectory,
         models: options.models,
@@ -418,7 +424,15 @@ export class ManagementApplication {
   private readonly piAdapters = new Map<string, PiRunExecutionAdapter>();
   private readonly runtimeUsageByRun = new Map<string, NormalizedPiTurnUsage>();
   private readonly runtimeModelByRun = new Map<string, { provider: string; model: string }>();
+  private piModelCatalog?: PiModelCatalog;
   private opsReconciler?: OpsReconciler;
+
+  private selectableModelProfiles(includePi = true): PublicModelProfile[] {
+    return [
+      ...this.options.models.list(),
+      ...(includePi ? (this.piModelCatalog?.list() ?? []) : []),
+    ];
+  }
 
   private getOrCreateDefaultPiAdapter(profileId: string): PiRunExecutionAdapter {
     const existing = this.piAdapters.get(profileId);
@@ -426,7 +440,7 @@ export class ManagementApplication {
     const runtime = new PiSdkRuntimeAdapter({
       kitPath: this.kitLoader.getKitPath(),
       runtimeBaseDir: join(this.options.dataDirectory, "pi"),
-      resolveModel: () => configuredPiModel(this.options.models, profileId),
+      resolveModel: () => configuredPiModel(this.options.models, profileId, this.piModelCatalog),
       createTools: (getContext) => this.createRuntimeTools(getContext),
       resolveSkillNames: async (context, profile) => {
         if (!context.caller)
@@ -511,6 +525,7 @@ export class ManagementApplication {
     });
     const adapter = new PiRunExecutionAdapter(runtime, {
       isOwner: (input) => this.store.identities.isOwner(input.caller.principalId),
+      listModelProfiles: () => this.selectableModelProfiles(),
       resolveProfileName: async (input) =>
         piProfileName(
           input.caller.scope.chatType,
@@ -556,6 +571,54 @@ export class ManagementApplication {
         store: this.store,
         getContext,
         manageGroup: (context, input) => this.manageGroup(context, input),
+      }),
+      ...createOwnerModelTools({
+        store: this.store,
+        getContext,
+        listModels: () => this.selectableModelProfiles(),
+        currentModel: (context) => {
+          const channel = this.channels.resolve(context.caller.scope.connectionId);
+          return (
+            channel.modelOverrideProfileId ??
+            /^(?:pi|model):([A-Za-z0-9][A-Za-z0-9_-]{0,79})$/u.exec(channel.executionRef)?.[1]
+          );
+        },
+        selectModel: async (context, profileId) => {
+          const channel = this.channels.resolve(context.caller.scope.connectionId);
+          if (!/^(?:pi|model):/u.test(channel.executionRef))
+            throw new ManagementError(
+              "INVALID_CONFIGURATION",
+              "This Channel has no model route",
+              409,
+            );
+          await this.channels.setModelOverride(context.caller.scope.connectionId, profileId);
+        },
+        recordSelection: async (context, profileId) => {
+          const profile =
+            profileId === null
+              ? undefined
+              : this.selectableModelProfiles().find((entry) => entry.id === profileId);
+          const cursor = await this.trace.append(
+            context.runId,
+            {
+              type: "model_route_override",
+              schema: "glassbox.model-route-override.v1",
+              runId: context.runId,
+              conversationId: context.conversationId,
+              principalId: context.caller.principalId,
+              connectionId: context.caller.scope.connectionId,
+              profileId,
+              model: profile?.model ?? null,
+              providerId: profile?.providerId ?? null,
+              appliesTo:
+                profileId === null
+                  ? "later_owner_private_runs_use_channel_default"
+                  : "later_owner_private_runs_on_this_qq_connection",
+            },
+            "glassbox-model-selection",
+          );
+          await this.store.evidence.advanceTrace(context.caller, cursor);
+        },
       }),
       ...createOwnerMemoryTools({ store: this.store, getContext }),
       ...createSkillTools({
@@ -803,6 +866,8 @@ export class ManagementApplication {
     }
     classified.add(OWNER_GROUP_ADMIN_TOOL);
     if (!ownerPrivate) scopeGates.set(OWNER_GROUP_ADMIN_TOOL, "scope_not_permitted");
+    classified.add(OWNER_MODEL_ADMIN_TOOL);
+    if (!ownerPrivate) scopeGates.set(OWNER_MODEL_ADMIN_TOOL, "scope_not_permitted");
     classified.add(OWNER_MEMORY_ADMIN_TOOL);
     if (!ownerPrivate) scopeGates.set(OWNER_MEMORY_ADMIN_TOOL, "scope_not_permitted");
     classified.add(SKILL_READ_TOOL);
@@ -862,9 +927,14 @@ export class ManagementApplication {
       supportsGroup: direct.supportsGroup,
       execute: async (input: ExecutionInput) => {
         const profileId = reference.slice(kind.length + 1);
-        const configured = this.options.models.list();
+        const configured = this.selectableModelProfiles(kind === "pi");
         const origin = configured.find((profile) => profile.id === profileId);
         if (!origin) return { status: "failed" };
+        const channelSelection = this.channels.resolve(input.caller.scope.connectionId);
+        const explicitOverride =
+          input.caller.scope.chatType === "private" &&
+          (await this.store.identities.isOwner(input.caller.principalId)) &&
+          channelSelection.modelOverrideProfileId === profileId;
         const demandTokens =
           estimateUnicodeTokens(input.text) +
           input.history.reduce((sum, message) => sum + estimateUnicodeTokens(message.text) + 8, 0);
@@ -902,7 +972,11 @@ export class ManagementApplication {
           },
         }));
         const ordered = configured
-          .filter((profile) => profile.id === profileId || profile.allowRouting === true)
+          .filter((profile) =>
+            explicitOverride
+              ? profile.id === profileId
+              : profile.id === profileId || profile.allowRouting === true,
+          )
           .sort(
             (a, b) =>
               (a.routePriority ?? 1000) - (b.routePriority ?? 1000) || a.id.localeCompare(b.id),
@@ -928,7 +1002,7 @@ export class ManagementApplication {
           },
           candidates,
           options: {
-            enabled: origin.routingEnabled === true,
+            enabled: explicitOverride || origin.routingEnabled === true,
             allowedProfileIds: ordered.map((profile) => profile.id),
             routeOrder: ordered.map((profile) => profile.id),
             defaultExecutionRef: reference,
@@ -1099,7 +1173,8 @@ export class ManagementApplication {
     if (reference === "claude-code") return this.executors.adapter();
     if (reference.startsWith("pi:")) {
       const profileId = reference.slice(3);
-      if (!this.options.models.list().some((profile) => profile.id === profileId)) return undefined;
+      if (!this.selectableModelProfiles().some((profile) => profile.id === profileId))
+        return undefined;
       return this.getOrCreateDefaultPiAdapter(profileId);
     }
     if (!reference.startsWith("model:")) return undefined;
@@ -1308,12 +1383,21 @@ export class ManagementApplication {
           });
           return;
         }
+        const channelSelection = this.channels.resolve(id);
+        const executionKind = /^(pi|model):/u.exec(configured.executionRef)?.[1];
+        const ownerPrivate =
+          message.scope.chatType === "private" &&
+          message.scope.senderId === configured.config.ownerId;
+        const runExecutionRef =
+          ownerPrivate && channelSelection.modelOverrideProfileId && executionKind
+            ? `${executionKind}:${channelSelection.modelOverrideProfileId}`
+            : configured.executionRef;
         const accepted = await this.store.conversations.acceptIncoming({
           agentId: AGENT_ID,
           scope: message.scope,
           messageId: message.messageId,
           text: message.text,
-          executionRef: configured.executionRef,
+          executionRef: runExecutionRef,
         });
         if (!accepted.duplicate && message.scope.nativeGroupRole) {
           const cursor = await this.trace.append(
@@ -1570,6 +1654,15 @@ export class ManagementApplication {
         scope,
         effect: "allow",
       });
+      for (const action of ["model:read", "model:switch"]) {
+        await this.store.authorization.grant({
+          principalId,
+          resourceId: OWNER_CONTROL_RESOURCE,
+          action,
+          scope,
+          effect: "allow",
+        });
+      }
       await this.store.authorization.registerResource({
         id: OWNER_MEMORY_RESOURCE,
         kind: "owner-memory",
@@ -1589,6 +1682,7 @@ export class ManagementApplication {
       for (const name of [
         ...(this.options.ops ? OPS_TOOL_NAMES : []),
         OWNER_GROUP_ADMIN_TOOL,
+        OWNER_MODEL_ADMIN_TOOL,
         OWNER_MEMORY_ADMIN_TOOL,
       ]) {
         const resourceId = toolResourceId(name);

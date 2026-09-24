@@ -11,7 +11,27 @@ import type {
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { glassboxSystemPrompt, PiSdkRuntimeAdapter } from "./adapter.js";
+import { capacityFromModel, glassboxSystemPrompt, PiSdkRuntimeAdapter } from "./adapter.js";
+
+it("reserves reasoning and user-facing output separately for a reasoning model", () => {
+  const model = {
+    contextWindow: 8_192,
+    maxTokens: 4_096,
+    reasoning: true,
+  } as never;
+  expect(capacityFromModel(model, true)).toEqual({
+    contextWindowTokens: 8_192,
+    outputReserveTokens: 2_048,
+    thinkingReserveTokens: 2_048,
+    safetyMarginTokens: 0,
+  });
+  expect(capacityFromModel(model, false)).toEqual({
+    contextWindowTokens: 8_192,
+    outputReserveTokens: 4_096,
+    thinkingReserveTokens: 0,
+    safetyMarginTokens: 0,
+  });
+});
 
 it("does not treat a context-hidden tool as an unimplemented product capability", () => {
   const prompt = glassboxSystemPrompt("Base prompt");
@@ -660,6 +680,7 @@ describe("PiSdkRuntimeAdapter", () => {
     expect(adapter.getModelCapacity(binding.runtimeSessionId)).toEqual({
       contextWindowTokens: 8_192,
       outputReserveTokens: 256,
+      thinkingReserveTokens: 0,
       safetyMarginTokens: 0,
     });
     expect(adapter.getStaticContextEstimate(binding.runtimeSessionId)).toMatchObject({
@@ -766,12 +787,36 @@ describe("PiSdkRuntimeAdapter", () => {
     const adapter = new PiSdkRuntimeAdapter({
       kitPath: fileURLToPath(new URL("./fixtures/lora-pi-kit", import.meta.url)),
       runtimeBaseDir,
+      model: {
+        id: "fixture-model",
+        name: "Fixture model",
+        api: "openai-completions",
+        provider: "fixture-provider",
+        baseUrl: "http://fixture.invalid",
+        reasoning: false,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 32_768,
+        maxTokens: 4_096,
+      } as never,
       createSession: async () => {
         sessionCount++;
         const sId = `pi-session-${sessionCount}`;
         let listener: ((event: AgentSessionEvent) => void) | undefined;
         return {
           sessionId: sId,
+          model: {
+            id: "fixture-model",
+            name: "Fixture model",
+            api: "openai-completions",
+            provider: "fixture-provider",
+            baseUrl: "http://fixture.invalid",
+            reasoning: false,
+            input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 32_768,
+            maxTokens: 4_096,
+          } as never,
           messages: [
             {
               role: "assistant",

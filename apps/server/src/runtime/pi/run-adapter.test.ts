@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vite-plus/test";
 import type { ExecutionInput } from "../../execution/run-service/types.js";
 import { GROUP_HISTORY_SEARCH_TOOL, OWNER_HISTORY_SEARCH_TOOL } from "./history-tools.js";
 import { OWNER_MEMORY_ADMIN_TOOL } from "./owner-memory-tools.js";
+import { OWNER_MODEL_ADMIN_TOOL } from "./owner-model-tools.js";
 import { piProfileName, PiRunExecutionAdapter } from "./run-adapter.js";
 import type { RunEvidenceRecord } from "./run-adapter.js";
 import type { PiRunResult, PiRuntimeAdapter } from "./types.js";
@@ -22,6 +23,12 @@ function fixture(results: PiRunResult[]) {
   const runtime: PiRuntimeAdapter = {
     initialize: async () => {},
     createOrRestoreSession,
+    getModelCapacity: () => ({
+      contextWindowTokens: 32_768,
+      outputReserveTokens: 4_096,
+      thinkingReserveTokens: 0,
+      safetyMarginTokens: 512,
+    }),
     run,
     abort: async () => {},
     disposeSession,
@@ -81,6 +88,141 @@ function fixture(results: PiRunResult[]) {
 }
 
 describe("Pi required Tool execution", () => {
+  it("binds an Owner-private natural language model switch to one configured profile", async () => {
+    const f = fixture([
+      {
+        status: "completed",
+        text: "已切换，后续消息使用 MiniMax M3。",
+        toolCalls: [
+          {
+            name: OWNER_MODEL_ADMIN_TOOL,
+            input: { action: "select", profileId: "minimax-m3" },
+            failed: false,
+          },
+        ],
+      },
+    ]);
+    f.input.text = "Bob，切换到 MiniMax M3 模型";
+    f.createOrRestoreSession.mockImplementation(async (_conversation, _profile, context) => {
+      if (context) context.authorizedToolNames = [OWNER_MODEL_ADMIN_TOOL];
+      return {
+        conversationId: "conversation-1",
+        runtimeSessionId: "session-1",
+        profileName: "main-agent" as const,
+        agentDir: "agent",
+        createdAt: new Date(0).toISOString(),
+        lastActiveAt: new Date(0).toISOString(),
+      };
+    });
+    const executor = new PiRunExecutionAdapter(f.runtime, {
+      listModelProfiles: () => [
+        {
+          id: "minimax-m3",
+          label: "MiniMax M3",
+          model: "MiniMax-M3",
+          protocol: "anthropic-messages",
+          baseUrl: "https://models.example.invalid",
+          credentialConfigured: true,
+        },
+        {
+          id: "other",
+          label: "Other",
+          model: "other-model",
+          protocol: "openai-completions",
+          baseUrl: "https://other.example.invalid",
+          credentialConfigured: true,
+        },
+      ],
+    });
+
+    await expect(executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe(OWNER_MODEL_ADMIN_TOOL);
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({
+      action: "select",
+      profileId: "minimax-m3",
+    });
+  });
+
+  it("denies model switching outside the private Owner conversation", async () => {
+    const f = fixture([{ status: "completed", text: "这不是私聊模型切换。", toolCalls: [] }]);
+    f.input.text = "切换到 MiniMax M3";
+    f.input.caller.scope.chatType = "group";
+    f.input.conversation.scope.chatType = "group";
+    const executor = new PiRunExecutionAdapter(f.runtime, {
+      listModelProfiles: () => [
+        {
+          id: "minimax-m3",
+          label: "MiniMax M3",
+          model: "MiniMax-M3",
+          protocol: "anthropic-messages",
+          baseUrl: "https://models.example.invalid",
+          credentialConfigured: true,
+        },
+      ],
+    });
+
+    await expect(executor.execute(f.input)).resolves.toMatchObject({ status: "failed" });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBeUndefined();
+    expect(f.run).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when an Owner names no unique configured model", async () => {
+    const f = fixture([{ status: "completed", text: "不能切换", toolCalls: [] }]);
+    f.input.text = "切换到未配置的模型";
+    const executor = new PiRunExecutionAdapter(f.runtime, {
+      listModelProfiles: () => [
+        {
+          id: "one",
+          label: "One",
+          model: "model-one",
+          protocol: "openai-completions",
+          baseUrl: "https://models.example.invalid",
+          credentialConfigured: true,
+        },
+      ],
+    });
+
+    await expect(executor.execute(f.input)).resolves.toMatchObject({ status: "failed" });
+    expect(f.run).not.toHaveBeenCalled();
+  });
+
+  it("fails before the Pi provider when selected model capacity is unknown", async () => {
+    const f = fixture([{ status: "completed", text: "must not run", toolCalls: [] }]);
+    f.runtime.getModelCapacity = () => undefined;
+
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "failed",
+      failureCode: "model_capacity_unknown",
+    });
+    expect(f.run).not.toHaveBeenCalled();
+  });
+
+  it("binds the Owner request to restore the configured default model", async () => {
+    const f = fixture([
+      {
+        status: "completed",
+        text: "已恢复默认模型。",
+        toolCalls: [{ name: OWNER_MODEL_ADMIN_TOOL, input: { action: "clear" }, failed: false }],
+      },
+    ]);
+    f.input.text = "恢复默认模型";
+    f.createOrRestoreSession.mockImplementation(async (_conversation, _profile, context) => {
+      if (context) context.authorizedToolNames = [OWNER_MODEL_ADMIN_TOOL];
+      return {
+        conversationId: "conversation-1",
+        runtimeSessionId: "session-1",
+        profileName: "main-agent" as const,
+        agentDir: "agent",
+        createdAt: new Date(0).toISOString(),
+        lastActiveAt: new Date(0).toISOString(),
+      };
+    });
+
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe(OWNER_MODEL_ADMIN_TOOL);
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({ action: "clear" });
+  });
+
   it("binds an explicit Owner Memory command to the current Run's exact Tool input", async () => {
     const f = fixture([
       {

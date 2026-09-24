@@ -122,7 +122,11 @@ function parseProfile(value: unknown): ModelProfile {
   };
   const contextWindowTokens = optionalInteger("contextWindowTokens", 1024, 2_000_000);
   const maxOutputTokens = optionalInteger("maxOutputTokens", 1, 200_000);
-  if ((maxOutputTokens ?? 4096) >= (contextWindowTokens ?? 32768))
+  if (
+    maxOutputTokens !== undefined &&
+    contextWindowTokens !== undefined &&
+    maxOutputTokens >= contextWindowTokens
+  )
     throw new ConfigurationError("Output reserve must be smaller than context window");
   return {
     id: profileId(input.id),

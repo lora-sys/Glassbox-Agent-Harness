@@ -9,7 +9,9 @@ export type ModelProtocol = (typeof MODEL_PROTOCOLS)[number];
 export interface PublicModelProfile {
   id: string;
   label: string;
-  protocol: ModelProtocol;
+  /** Pi provider identity for profiles projected from Pi's own ModelRuntime. */
+  providerId?: string;
+  protocol: ModelProtocol | "google-generative-ai";
   baseUrl: string;
   model: string;
   credentialConfigured: boolean;

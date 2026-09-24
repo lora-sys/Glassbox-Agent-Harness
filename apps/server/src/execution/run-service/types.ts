@@ -25,7 +25,7 @@ export interface ExecutionResult {
   text?: string;
   providerSessionId?: string;
   /** The selected model was rejected before any provider request or Tool call. */
-  failureCode?: "pre_provider_context_overflow";
+  failureCode?: "pre_provider_context_overflow" | "model_capacity_unknown";
 }
 
 export interface RunExecutionAdapter {

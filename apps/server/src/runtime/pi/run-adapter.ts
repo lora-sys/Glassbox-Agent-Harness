@@ -1,4 +1,4 @@
-import type { QqSourceClass } from "@glassbox/contracts";
+import type { PublicModelProfile, QqSourceClass } from "@glassbox/contracts";
 import type {
   RunExecutionAdapter,
   ExecutionInput,
@@ -23,6 +23,7 @@ import {
 import { requiredInputClause, satisfiesRequiredInput } from "./protected-tools.js";
 import { OWNER_GROUP_ADMIN_TOOL } from "./owner-tools.js";
 import { OWNER_MEMORY_ADMIN_TOOL } from "./owner-memory-tools.js";
+import { OWNER_MODEL_ADMIN_TOOL } from "./owner-model-tools.js";
 import {
   asksLiveQqFact,
   groupHistorySearchRequested,
@@ -378,6 +379,7 @@ const SOURCE_CLASS_WORDS: readonly { sourceClass: QqSourceClass; words: RegExp }
  */
 export interface PiRunExecutionAdapterOptions {
   isOwner?: (input: ExecutionInput) => Promise<boolean>;
+  listModelProfiles?: () => readonly PublicModelProfile[];
   resolveProfileName?: (input: ExecutionInput) => Promise<PiRuntimeProfileName>;
   /**
    * Records the Run's Tool-evidence decision, and how the Run answered it.
@@ -410,12 +412,21 @@ export type RunEvidenceRecord =
       demandTokens: number;
       contextWindowTokens: number;
       outputReserveTokens: number;
+      thinkingReserveTokens: number;
       projectedTokens: number | null;
       includedExchangeCount: number;
       omittedExchangeCount: number;
       sourceScanTruncated: boolean;
       omittedBySourceBoundCount: number;
       overflowCode?: string;
+    }
+  | {
+      type: "model_capacity";
+      runId: string;
+      principalId: string;
+      conversationId: string;
+      state: "unknown";
+      reasonCode: "capacity_unknown";
     }
   | {
       type: "tool_evidence";
@@ -431,7 +442,7 @@ export type RunEvidenceRecord =
       /** Safe rejection metadata for an explicit mutation that cannot be bound to exact inputs. */
       blockedMutation?: {
         operation: string;
-        reason: "incomplete_parameters" | "not_permitted_in_group";
+        reason: "incomplete_parameters" | "not_permitted_in_group" | "not_permitted";
       };
     }
   | {
@@ -491,6 +502,7 @@ function requiredToolCall(
   input: ExecutionInput,
   isOwner: boolean,
   authorizedToolNames?: readonly string[],
+  modelProfiles: readonly PublicModelProfile[] = [],
 ): RequiredToolCall | undefined {
   if (input.caller.scope.chatType === "group") {
     if (groupHistorySearchRequested(input.text) || groupHistorySearchFollowUpRequested(input)) {
@@ -531,6 +543,10 @@ function requiredToolCall(
   // outside a private Owner Run, whatever else a message may name.
   if (input.caller.scope.chatType !== "private" || !isOwner) return undefined;
   const rawText = input.text;
+  if (authorizedToolNames?.includes(OWNER_MODEL_ADMIN_TOOL)) {
+    const model = ownerModelCommand(rawText, modelProfiles);
+    if (model) return model;
+  }
   if (authorizedToolNames?.includes(OWNER_MEMORY_ADMIN_TOOL)) {
     const memory = ownerMemoryCommand(rawText);
     if (memory) return memory;
@@ -624,7 +640,14 @@ function requiredToolCall(
 
 interface BlockedMutation {
   operation: string;
-  reason: "incomplete_parameters" | "not_permitted_in_group";
+  reason: "incomplete_parameters" | "not_permitted_in_group" | "not_permitted";
+}
+
+function explicitModelSelectionCommand(text: string): boolean {
+  const command = text.trim().replace(/^(?:Bob|Glassbox|玻璃盒)[，,\s]+/iu, "");
+  return /^(?:请|帮我)?\s*(?:(?:切换(?:模型)?(?:到|成|为)?|换(?:到|成)|switch to)\s*.*|使用\s+.+)$/iu.test(
+    command,
+  );
 }
 
 /**
@@ -634,7 +657,15 @@ interface BlockedMutation {
 function blockedMutationRequest(
   input: ExecutionInput,
   isOwner: boolean,
+  modelProfiles: readonly PublicModelProfile[] = [],
 ): BlockedMutation | undefined {
+  if (explicitModelSelectionCommand(input.text)) {
+    if (input.caller.scope.chatType === "group")
+      return { operation: "model:switch", reason: "not_permitted_in_group" };
+    if (!isOwner) return { operation: "model:switch", reason: "not_permitted" };
+    if (!ownerModelCommand(input.text, modelProfiles))
+      return { operation: "model:switch", reason: "incomplete_parameters" };
+  }
   const text = requestClauses(input.text).trim();
   if (!text) return undefined;
   const command =
@@ -659,6 +690,7 @@ export function projectRunHistory(
   capacity: {
     contextWindowTokens: number;
     outputReserveTokens: number;
+    thinkingReserveTokens: number;
     safetyMarginTokens: number;
   },
   staticEstimate: { systemTokens: number; toolSchemaTokens: number },
@@ -714,6 +746,34 @@ function recreatedPrompt(input: ExecutionInput, included: Set<string>): string {
   return `Authorized Conversation history:\n${history}\n\nCurrent user message:\n${input.text}`;
 }
 
+function ownerModelCommand(
+  text: string,
+  profiles: readonly PublicModelProfile[],
+): RequiredToolCall | undefined {
+  const command = text.trim().replace(/^(?:Bob|Glassbox|玻璃盒)[，,\s]+/iu, "");
+  if (/^(?:当前模型|现在是什么模型|当前用的模型|\/model current)$/iu.test(command))
+    return { name: OWNER_MODEL_ADMIN_TOOL, input: { action: "current" } };
+  if (/^(?:恢复默认模型|切回默认模型|使用默认模型|\/model default)$/iu.test(command))
+    return { name: OWNER_MODEL_ADMIN_TOOL, input: { action: "clear" } };
+  if (/^(?:有哪些模型|列出模型|可切换模型|\/model list)$/iu.test(command))
+    return { name: OWNER_MODEL_ADMIN_TOOL, input: { action: "list" } };
+  const requested =
+    /^(?:请|帮我)?\s*(?:切换(?:模型)?(?:到|成|为)|换(?:到|成)|使用|switch to)\s*["'“「]?(.+?)["'”」]?\s*$/iu
+      .exec(command)?.[1]
+      ?.replace(/\s*模型$/u, "")
+      .trim();
+  if (!requested) return undefined;
+  const normalized = (value: string) => value.trim().toLocaleLowerCase();
+  const matches = profiles.filter((profile) =>
+    [profile.id, profile.label, profile.model].some(
+      (alias) => normalized(alias) === normalized(requested),
+    ),
+  );
+  const ids = [...new Set(matches.map((profile) => profile.id))];
+  if (ids.length !== 1) return undefined;
+  return { name: OWNER_MODEL_ADMIN_TOOL, input: { action: "select", profileId: ids[0] } };
+}
+
 export class PiRunExecutionAdapter implements RunExecutionAdapter {
   readonly supportsGroup = true;
 
@@ -726,7 +786,8 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
     const isOwner = this.options.isOwner
       ? await this.options.isOwner(input)
       : input.caller.principalId === "owner";
-    const blockedMutation = blockedMutationRequest(input, isOwner);
+    const modelProfiles = this.options.listModelProfiles?.() ?? [];
+    const blockedMutation = blockedMutationRequest(input, isOwner, modelProfiles);
     if (blockedMutation) {
       await this.recordEvidence({
         type: "tool_evidence",
@@ -742,7 +803,9 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         text:
           blockedMutation.reason === "not_permitted_in_group"
             ? "该操作未在群聊中开放，未执行。"
-            : "请求的操作未执行，请补齐必要参数后重试。",
+            : blockedMutation.reason === "not_permitted"
+              ? "该操作未授权，未执行。"
+              : "请求的操作未执行，请补齐必要参数后重试。",
       };
     }
     await this.runtime.initialize();
@@ -778,7 +841,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       profile,
       context,
     );
-    const required = requiredToolCall(input, isOwner, context.authorizedToolNames);
+    const required = requiredToolCall(input, isOwner, context.authorizedToolNames, modelProfiles);
     if (required !== undefined) {
       context.requiredToolName = required.name;
       context.requiredToolInput = required.input;
@@ -804,6 +867,23 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         ? {}
         : { requiredToolName: required.name, requiredToolInput: required.input }),
     });
+    if (explicitModelSelectionCommand(input.text) && isOwner && required === undefined) {
+      await this.recordEvidence({
+        type: "tool_evidence",
+        runId: input.run.id,
+        conversationId: input.conversation.id,
+        principalId: input.caller.principalId,
+        phase: "required",
+        required: [],
+        blockedMutation: { operation: "model:switch", reason: "not_permitted" },
+      });
+      await this.runtime.disposeSession?.(binding.runtimeSessionId);
+      return {
+        status: "failed",
+        text: "模型切换工具当前不可用，未执行。",
+        providerSessionId: binding.runtimeSessionId,
+      };
+    }
     const abort = () => {
       void this.runtime.abort(binding.runtimeSessionId);
     };
@@ -813,11 +893,23 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         await this.runtime.abort(binding.runtimeSessionId);
         return { status: "cancelled", providerSessionId: binding.runtimeSessionId };
       }
-      const capacity = this.runtime.getModelCapacity?.(binding.runtimeSessionId) ?? {
-        contextWindowTokens: 32_768,
-        outputReserveTokens: 4_096,
-        safetyMarginTokens: 512,
-      };
+      const capacity = this.runtime.getModelCapacity?.(binding.runtimeSessionId);
+      if (!capacity) {
+        await this.options.onEvidence?.({
+          type: "model_capacity",
+          runId: input.run.id,
+          principalId: input.caller.principalId,
+          conversationId: input.conversation.id,
+          state: "unknown",
+          reasonCode: "capacity_unknown",
+        });
+        await this.runtime.disposeSession?.(binding.runtimeSessionId);
+        return {
+          status: "failed",
+          failureCode: "model_capacity_unknown",
+          providerSessionId: binding.runtimeSessionId,
+        };
+      }
       const staticEstimate = this.runtime.getStaticContextEstimate?.(binding.runtimeSessionId) ?? {
         systemTokens: 4_096,
         toolSchemaTokens: 0,
@@ -833,6 +925,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         demandTokens: projection.demand.estimatedMaterialTokens,
         contextWindowTokens: capacity.contextWindowTokens,
         outputReserveTokens: capacity.outputReserveTokens,
+        thinkingReserveTokens: capacity.thinkingReserveTokens,
         projectedTokens: projection.result.ok ? projection.result.projection.projectedTokens : null,
         includedExchangeCount: projection.result.ok
           ? projection.result.projection.includedExchangeIds.length

@@ -47,6 +47,24 @@ describe("server-owned channel profiles", () => {
     });
     expect(() => store.save({ ...input, visitorIds: [input.botId] })).toThrow();
   });
+
+  it("persists an Owner-selected model override across server reopen", async () => {
+    const { directory, store } = await fixture();
+    await store.save({ ...input, executionRef: "pi:default" });
+    await store.setModelOverride(input.id, "alternate-model");
+    expect(store.resolve(input.id).modelOverrideProfileId).toBe("alternate-model");
+    const reopened = await ChannelProfileStore.open(directory);
+    expect(reopened.resolve(input.id)).toMatchObject({
+      executionRef: "pi:default",
+      modelOverrideProfileId: "alternate-model",
+    });
+    expect(() => reopened.setModelOverride(input.id, "../secret")).toThrow();
+    await reopened.setModelOverride(input.id, null);
+    expect(
+      (await ChannelProfileStore.open(directory).then((next) => next.resolve(input.id)))
+        .modelOverrideProfileId,
+    ).toBeUndefined();
+  });
   it("persists configuration and credentials without exposing secrets or implying a connection", async () => {
     const { directory, store } = await fixture();
     const saved = await store.save({ ...input, token: "fixture-qq-private-token" });

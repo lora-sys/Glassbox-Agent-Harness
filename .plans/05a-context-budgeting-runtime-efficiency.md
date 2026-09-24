@@ -165,6 +165,31 @@ Delivery policy
 
 ## Stable invariants
 
+### Pi model capacity source
+
+The QQ Pi path reads the configured model list and credentials through Pi `ModelRuntime` at the
+Pi agent configuration directory. Glassbox projects only model identity, provider identity,
+declared context capacity, output capacity and supported input/tool facts. It never copies Pi
+credentials into Glassbox model profiles or Raw Trace.
+
+Built-in Pi model capacities come from Pi's model catalog. A custom provider model is routable
+only when its Pi configuration declares both `contextWindow` and `maxTokens`. Pi's placeholder
+defaults are not accepted as evidence of capacity. A missing or invalid capacity blocks that
+route before a provider request.
+
+### Thinking reserve
+
+The Pi model's `maxTokens` is the combined output ceiling. When reasoning is enabled for the
+selected model, the request budget splits that ceiling evenly between a thinking reserve and a
+user-facing output reserve. The final assembled-request check subtracts both reserves and the
+safety margin from the context window.
+
+### Protected context cache status
+
+P5A ships without cross-Run protected-context cache reuse. Each new Run rebuilds its authorized
+history from current grants. The conversation revocation regression test proves a projection
+available before revocation is absent from the next Run after revocation.
+
 ### Authorization before optimization
 
 All protected source authorization remains P3/P4 behavior.

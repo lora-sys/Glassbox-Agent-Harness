@@ -4,6 +4,7 @@ import { projectRunHistory } from "./run-adapter.js";
 const capacity = {
   contextWindowTokens: 12_000,
   outputReserveTokens: 2_000,
+  thinkingReserveTokens: 0,
   safetyMarginTokens: 500,
 };
 const staticEstimate = { systemTokens: 1_000, toolSchemaTokens: 500 };

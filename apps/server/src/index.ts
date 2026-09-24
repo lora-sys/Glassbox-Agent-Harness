@@ -1715,7 +1715,12 @@ let starting: Promise<{ baseUrl: string; credentialFile: string }> | undefined;
 let shutdown: Promise<void> | undefined;
 
 export function startServer(
-  options: { port?: number; quiet?: boolean; databasePath?: string } = {},
+  options: {
+    port?: number;
+    quiet?: boolean;
+    databasePath?: string;
+    piAgentDirectory?: string | null;
+  } = {},
 ) {
   if (starting) return starting;
   starting = (async () => {
@@ -1728,6 +1733,7 @@ export function startServer(
     management = await openManagementRuntime({
       dataDirectory,
       databasePath: options.databasePath,
+      piAgentDirectory: options.piAgentDirectory,
       hosts,
       origins,
       status: () => ({
