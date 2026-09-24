@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Usage } from "@earendil-works/pi-ai";
 import {
+  aggregateRuntimeUsage,
   normalizePiTurnEndUsage,
   normalizeRuntimeHealth,
   normalizeRuntimeLimits,
@@ -93,6 +94,30 @@ describe("runtime telemetry normalization", () => {
     expect(normalizePiTurnEndUsage({ usage: piUsage() }).throughput).toEqual({
       tokensPerSecond: null,
       sampleDurationMs: null,
+      source: "unknown",
+    });
+  });
+
+  it("aggregates every model turn in a Run and keeps incomplete totals unknown", () => {
+    const first = normalizePiTurnEndUsage({
+      usage: piUsage({ input: 100, output: 40, totalTokens: 140 }),
+      providerReported: { input: true, output: true, totalTokens: true },
+    });
+    const second = normalizePiTurnEndUsage({
+      usage: piUsage({ input: 60, output: 20, totalTokens: 80 }),
+      providerReported: { input: true, output: true, totalTokens: true },
+    });
+    expect(aggregateRuntimeUsage(first, second)).toMatchObject({
+      inputTokens: { value: 160, source: "reported" },
+      outputTokens: { value: 60, source: "reported" },
+      totalTokens: { value: 220, source: "reported" },
+      cost: { total: null, source: null },
+      throughput: { tokensPerSecond: null, source: "unknown" },
+    });
+
+    const incomplete = normalizePiTurnEndUsage({ usage: { output: 12 } });
+    expect(aggregateRuntimeUsage(first, incomplete).totalTokens).toEqual({
+      value: null,
       source: "unknown",
     });
   });

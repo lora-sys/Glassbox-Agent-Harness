@@ -30,6 +30,7 @@ import {
   type ModelCapacity as RouteModelCapacity,
 } from "../routing/index.js";
 import {
+  aggregateRuntimeUsage,
   normalizePiTurnEndUsage,
   type NormalizedPiTurnUsage,
 } from "../routing/runtime-telemetry.js";
@@ -508,7 +509,10 @@ export class ManagementApplication {
               totalTokens: typeof usage.totalTokens === "number" ? usage.totalTokens : undefined,
             },
           });
-          this.runtimeUsageByRun.set(runId, normalized);
+          this.runtimeUsageByRun.set(
+            runId,
+            aggregateRuntimeUsage(this.runtimeUsageByRun.get(runId), normalized),
+          );
           const usageCursor = await this.trace.append(
             runId,
             {
@@ -1209,7 +1213,10 @@ export class ManagementApplication {
               totalTokens: event.usage.totalSource === "reported",
             },
           });
-          this.runtimeUsageByRun.set(runId, normalized);
+          this.runtimeUsageByRun.set(
+            runId,
+            aggregateRuntimeUsage(this.runtimeUsageByRun.get(runId), normalized),
+          );
           const usageCursor = await this.trace.append(
             runId,
             {

@@ -44,6 +44,74 @@ export interface CostEvidence {
   total: number;
 }
 
+/** A Run may contain several Pi turns around Tool calls. Keep its known usage cumulative. */
+export function aggregateRuntimeUsage(
+  previous: NormalizedPiTurnUsage | undefined,
+  next: NormalizedPiTurnUsage,
+): NormalizedPiTurnUsage {
+  if (!previous) return next;
+  const addMeasurement = (left: UsageMeasurement, right: UsageMeasurement): UsageMeasurement => {
+    if (left.value === null || right.value === null) return { value: null, source: "unknown" };
+    const source =
+      left.source === "reported" && right.source === "reported"
+        ? "reported"
+        : left.source === "sdk_normalized" && right.source === "sdk_normalized"
+          ? "sdk_normalized"
+          : "derived";
+    return { value: left.value + right.value, source };
+  };
+  const costSourcesMatch =
+    previous.cost.source === next.cost.source && previous.cost.source !== null;
+  const cost = costSourcesMatch
+    ? {
+        input:
+          previous.cost.input === null || next.cost.input === null
+            ? null
+            : previous.cost.input + next.cost.input,
+        output:
+          previous.cost.output === null || next.cost.output === null
+            ? null
+            : previous.cost.output + next.cost.output,
+        cacheRead:
+          previous.cost.cacheRead === null || next.cost.cacheRead === null
+            ? null
+            : previous.cost.cacheRead + next.cost.cacheRead,
+        cacheWrite:
+          previous.cost.cacheWrite === null || next.cost.cacheWrite === null
+            ? null
+            : previous.cost.cacheWrite + next.cost.cacheWrite,
+        total:
+          previous.cost.total === null || next.cost.total === null
+            ? null
+            : previous.cost.total + next.cost.total,
+        source: previous.cost.source,
+      }
+    : { input: null, output: null, cacheRead: null, cacheWrite: null, total: null, source: null };
+  const totalTokens = addMeasurement(previous.totalTokens, next.totalTokens);
+  const durationKnown =
+    previous.throughput.sampleDurationMs !== null && next.throughput.sampleDurationMs !== null;
+  const duration = durationKnown
+    ? previous.throughput.sampleDurationMs! + next.throughput.sampleDurationMs!
+    : null;
+  return {
+    inputTokens: addMeasurement(previous.inputTokens, next.inputTokens),
+    outputTokens: addMeasurement(previous.outputTokens, next.outputTokens),
+    cacheReadTokens: addMeasurement(previous.cacheReadTokens, next.cacheReadTokens),
+    cacheWriteTokens: addMeasurement(previous.cacheWriteTokens, next.cacheWriteTokens),
+    reasoningTokens: addMeasurement(previous.reasoningTokens, next.reasoningTokens),
+    totalTokens,
+    cost,
+    throughput:
+      duration !== null && totalTokens.value !== null && duration > 0
+        ? {
+            tokensPerSecond: (totalTokens.value * 1_000) / duration,
+            sampleDurationMs: duration,
+            source: "observed",
+          }
+        : { tokensPerSecond: null, sampleDurationMs: null, source: "unknown" },
+  };
+}
+
 function validNonNegative(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
