@@ -14,7 +14,32 @@ export interface ModelProfile {
   baseUrl: string;
   model: string;
   credentialSlot: string | null;
+  contextWindowTokens?: number;
+  maxOutputTokens?: number;
+  routingEnabled?: boolean;
+  allowRouting?: boolean;
+  routingAvailable?: boolean;
+  routePriority?: number;
+  capabilityRank?: number;
+  supportsTools?: boolean;
+  supportsThinking?: boolean;
+  supportsVision?: boolean;
 }
+
+export type PublicConfiguredModelProfile = PublicModelProfile &
+  Pick<
+    ModelProfile,
+    | "contextWindowTokens"
+    | "maxOutputTokens"
+    | "routingEnabled"
+    | "allowRouting"
+    | "routingAvailable"
+    | "routePriority"
+    | "capabilityRank"
+    | "supportsTools"
+    | "supportsThinking"
+    | "supportsVision"
+  >;
 
 interface Settings {
   version: 1;
@@ -82,6 +107,23 @@ function parseProfile(value: unknown): ModelProfile {
   if (!MODEL_PROTOCOLS.some((candidate) => candidate === protocol)) {
     throw new ConfigurationError("Unsupported model protocol");
   }
+  const optionalInteger = (name: string, min: number, max: number): number | undefined => {
+    const field = input[name];
+    if (field === undefined) return undefined;
+    if (!Number.isSafeInteger(field) || (field as number) < min || (field as number) > max)
+      throw new ConfigurationError(`Invalid ${name}`);
+    return field as number;
+  };
+  const optionalBoolean = (name: string): boolean | undefined => {
+    const field = input[name];
+    if (field === undefined) return undefined;
+    if (typeof field !== "boolean") throw new ConfigurationError(`Invalid ${name}`);
+    return field;
+  };
+  const contextWindowTokens = optionalInteger("contextWindowTokens", 1024, 2_000_000);
+  const maxOutputTokens = optionalInteger("maxOutputTokens", 1, 200_000);
+  if ((maxOutputTokens ?? 4096) >= (contextWindowTokens ?? 32768))
+    throw new ConfigurationError("Output reserve must be smaller than context window");
   return {
     id: profileId(input.id),
     label: boundedText(input.label, "profile label", 120),
@@ -89,6 +131,31 @@ function parseProfile(value: unknown): ModelProfile {
     baseUrl: endpoint(input.baseUrl),
     model: boundedText(input.model, "model", 256),
     credentialSlot: input.credentialSlot == null ? null : profileId(input.credentialSlot, 96),
+    ...(contextWindowTokens === undefined ? {} : { contextWindowTokens }),
+    ...(maxOutputTokens === undefined ? {} : { maxOutputTokens }),
+    ...Object.fromEntries(
+      [
+        "routingEnabled",
+        "allowRouting",
+        "routingAvailable",
+        "supportsTools",
+        "supportsThinking",
+        "supportsVision",
+      ]
+        .map((name) => [name, optionalBoolean(name)] as const)
+        .filter(([, field]) => field !== undefined),
+    ),
+    ...Object.fromEntries(
+      [
+        ["routePriority", 0, 1000],
+        ["capabilityRank", 0, 10],
+      ]
+        .map(
+          ([name, min, max]) =>
+            [name, optionalInteger(name as string, min as number, max as number)] as const,
+        )
+        .filter(([, field]) => field !== undefined),
+    ),
   };
 }
 
@@ -166,7 +233,7 @@ export class ModelProfileStore {
     return new ModelProfileStore(path, settings);
   }
 
-  list(): PublicModelProfile[] {
+  list(): PublicConfiguredModelProfile[] {
     return this.#settings.profiles.map(({ credentialSlot, ...profile }) => ({
       ...profile,
       credentialConfigured:
@@ -196,18 +263,57 @@ export class ModelProfileStore {
     const value = record(input);
     if (
       Object.keys(value).some(
-        (key) => !["id", "label", "protocol", "baseUrl", "model", "apiKey"].includes(key),
+        (key) =>
+          ![
+            "id",
+            "label",
+            "protocol",
+            "baseUrl",
+            "model",
+            "apiKey",
+            "contextWindowTokens",
+            "maxOutputTokens",
+            "routingEnabled",
+            "allowRouting",
+            "routingAvailable",
+            "routePriority",
+            "capabilityRank",
+            "supportsTools",
+            "supportsThinking",
+            "supportsVision",
+          ].includes(key),
       )
     ) {
       throw new ConfigurationError("Unknown model profile field");
     }
-    const profile = parseProfile(value);
+    let profile = parseProfile(value);
     const apiKey =
       value.apiKey === undefined || value.apiKey === null
         ? value.apiKey
         : boundedText(value.apiKey, "credential", 16384);
     return this.#enqueue(async () => {
       const current = this.#settings.profiles.find((candidate) => candidate.id === profile.id);
+      if (current) {
+        const priorOptional = Object.fromEntries(
+          [
+            "contextWindowTokens",
+            "maxOutputTokens",
+            "routingEnabled",
+            "allowRouting",
+            "routingAvailable",
+            "routePriority",
+            "capabilityRank",
+            "supportsTools",
+            "supportsThinking",
+            "supportsVision",
+          ]
+            .filter(
+              (key) => value[key] === undefined && current[key as keyof ModelProfile] !== undefined,
+            )
+            .map((key) => [key, current[key as keyof ModelProfile]]),
+        );
+        profile = parseProfile({ ...priorOptional, ...profile });
+      }
       if (!current && this.#settings.profiles.length >= 100)
         throw new ConfigurationError("Too many model profiles");
       if (

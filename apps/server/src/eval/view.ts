@@ -6,8 +6,17 @@ import {
   type RunEvalScore,
   type RunEvalView,
 } from "@glassbox/contracts";
+import {
+  ROUTING_SAFETY_SCORER_VERSION,
+  ROUTING_SAFETY_SUITE,
+  type RoutingEvalAssessment,
+  type RoutingEvalCheck,
+  type RoutingEvalScore,
+  type RoutingEvalView,
+} from "../../../../packages/contracts/src/evals.js";
 import type { EvalResult } from "../persistence/evidence.js";
 import { CHECK_TARGETS, RUN_INTEGRITY_SCORER_VERSION, verdict } from "./scorers.js";
+import { ROUTING_CHECK_TARGETS, routingVerdict } from "./routing-scorers.js";
 
 function record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -93,6 +102,100 @@ export function evalView(stored: EvalResult): RunEvalView {
   const validated =
     stored.scorerVersion === RUN_INTEGRITY_SCORER_VERSION &&
     assessment(parsed) &&
+    parsed.sample.id === stored.sampleId &&
+    parsed.sample.input.runId === stored.runId &&
+    parsed.run.id === stored.runId &&
+    parsed.trace.runId === stored.runId &&
+    parsed.trace.traceRef === stored.traceRef &&
+    parsed.trace.eventCount === stored.traceEnd &&
+    stored.traceStart === 0 &&
+    (parsed.verdict === "pass") === stored.passed &&
+    parsed.scores.every(
+      (item) => item.traceSequence === null || item.traceSequence <= stored.traceEnd,
+    )
+      ? parsed
+      : null;
+  return {
+    ...stored,
+    inputTokens: stored.inputTokens ?? null,
+    outputTokens: stored.outputTokens ?? null,
+    durationMs: stored.durationMs ?? null,
+    assessment: validated,
+  };
+}
+
+function routingCheckId(value: unknown): value is RoutingEvalCheck {
+  return typeof value === "string" && Object.hasOwn(ROUTING_CHECK_TARGETS, value);
+}
+
+function routingScore(value: unknown): value is RoutingEvalScore {
+  return (
+    record(value) &&
+    routingCheckId(value.id) &&
+    valueIsVerdict(value.value) &&
+    value.expected === ROUTING_CHECK_TARGETS[value.id] &&
+    text(value.observed) &&
+    text(value.reason) &&
+    (value.traceSequence === null || (count(value.traceSequence) && value.traceSequence > 0))
+  );
+}
+
+function routingAssessment(value: unknown): value is RoutingEvalAssessment {
+  if (
+    !record(value) ||
+    value.suiteId !== ROUTING_SAFETY_SUITE ||
+    value.source !== "stored-run-evidence" ||
+    value.acceptance !== "not-assessed" ||
+    !valueIsVerdict(value.verdict)
+  )
+    return false;
+  const sample = value.sample;
+  const run = value.run;
+  const trace = value.trace;
+  return (
+    record(sample) &&
+    text(sample.id) &&
+    sample.target === ROUTING_SAFETY_SUITE &&
+    record(sample.input) &&
+    text(sample.input.runId) &&
+    record(run) &&
+    text(run.id) &&
+    text(run.conversationId) &&
+    text(run.executionRef) &&
+    typeof run.status === "string" &&
+    [
+      "queued",
+      "running",
+      "cancelling",
+      "succeeded",
+      "failed",
+      "cancelled",
+      "interrupted",
+      "unknown",
+    ].includes(run.status) &&
+    record(trace) &&
+    text(trace.runId) &&
+    text(trace.traceRef) &&
+    count(trace.byteOffset) &&
+    count(trace.eventCount) &&
+    Array.isArray(value.scores) &&
+    value.scores.length === Object.keys(ROUTING_CHECK_TARGETS).length &&
+    value.scores.every(routingScore) &&
+    new Set(value.scores.map((item) => item.id)).size === value.scores.length &&
+    routingVerdict(value.scores) === value.verdict
+  );
+}
+
+export function routingEvalView(stored: EvalResult): RoutingEvalView {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stored.observed);
+  } catch {
+    parsed = null;
+  }
+  const validated =
+    stored.scorerVersion === ROUTING_SAFETY_SCORER_VERSION &&
+    routingAssessment(parsed) &&
     parsed.sample.id === stored.sampleId &&
     parsed.sample.input.runId === stored.runId &&
     parsed.run.id === stored.runId &&

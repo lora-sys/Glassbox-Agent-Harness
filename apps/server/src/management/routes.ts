@@ -43,6 +43,7 @@ export interface ManagementRouteDependencies {
   runs: Pick<RunService, "cancel">;
   trace: Pick<RunTraceStore, "readPage">;
   evaluator: ReturnType<typeof createRunEvaluator>;
+  opsHealth?: (runId: string) => Promise<unknown>;
 }
 
 /** Dispatch the management routes owned by ManagementApplication. */
@@ -72,6 +73,12 @@ export async function routeManagementRequest(
   };
   const ok = (body: unknown) => ({ status: 200, body });
   try {
+    if (request.method === "GET" && path === "/manage/ops/health" && dependencies.opsHealth) {
+      const runId = url.searchParams.get("runId");
+      if (!runId || !/^[A-Za-z0-9-]{1,80}$/u.test(runId))
+        throw new ManagementError("INVALID_REQUEST", "A Run identifier is required");
+      return ok({ health: await dependencies.opsHealth(runId) });
+    }
     if (path === "/manage/executors") {
       if (request.method === "GET") return ok({ executors: await dependencies.executors.list() });
       if (request.method === "POST")

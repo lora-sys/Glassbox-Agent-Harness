@@ -13,6 +13,18 @@ export interface PublicModelProfile {
   baseUrl: string;
   model: string;
   credentialConfigured: boolean;
+  /** Operator-declared request capacity. This is not a measured provider quota. */
+  contextWindowTokens?: number;
+  maxOutputTokens?: number;
+  /** Routing is opt-in on both the current profile and each candidate. */
+  routingEnabled?: boolean;
+  allowRouting?: boolean;
+  routingAvailable?: boolean;
+  routePriority?: number;
+  capabilityRank?: number;
+  supportsTools?: boolean;
+  supportsThinking?: boolean;
+  supportsVision?: boolean;
 }
 
 export interface ManagementFailure {

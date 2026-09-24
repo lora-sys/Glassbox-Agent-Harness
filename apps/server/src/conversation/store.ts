@@ -68,6 +68,11 @@ export interface RunInputRecord {
   conversation: ConversationRecord;
   text: string;
   history: Array<{ role: "user" | "assistant"; text: string }>;
+  /** One Run id per complete user/assistant exchange in history. */
+  historyRunIds?: string[];
+  /** A bounded source scan or load bound was reached after authorization checks. */
+  historyScanTruncated?: boolean;
+  historyOmittedRunIds?: string[];
   providerSessionId: string | null;
 }
 
@@ -674,13 +679,15 @@ export class ConversationStore {
         });
         const conversation = conversationRecord(conversations.rows[0]!, caller.scope);
         const earlier = await tx.execute({
-          sql: "SELECT runs.id, runs.principal_id, runs.sequence, runs.message_id FROM runs WHERE runs.conversation_id = ? AND runs.sequence < ? AND runs.status = 'succeeded' AND runs.result_text IS NOT NULL AND NOT EXISTS (SELECT 1 FROM ops_trace_events e WHERE e.run_id = runs.id AND e.type = 'context.excluded') ORDER BY runs.sequence DESC LIMIT 20",
+          sql: "SELECT runs.id, runs.principal_id, runs.sequence, runs.message_id FROM runs WHERE runs.conversation_id = ? AND runs.sequence < ? AND runs.status = 'succeeded' AND runs.result_text IS NOT NULL AND NOT EXISTS (SELECT 1 FROM ops_trace_events e WHERE e.run_id = runs.id AND e.type = 'context.excluded') ORDER BY runs.sequence DESC LIMIT 257",
           args: [run.conversationId, row.sequence!],
         });
         const callerLocationKey = conversationScopeKey(caller.scope);
-        const exchanges: Array<{ user: string; assistant: string }> = [];
-        let remaining = 32_000;
-        for (const prior of earlier.rows) {
+        const exchanges: Array<{ runId: string; user: string; assistant: string }> = [];
+        const omittedRunIds: string[] = [];
+        let loadedChars = 0;
+        let historyScanTruncated = earlier.rows.length > 256;
+        for (const prior of earlier.rows.slice(0, 256)) {
           const priorPrincipalId = stringColumn(prior, "principal_id");
           const priorRunId = stringColumn(prior, "id");
           const priorMessageId = stringColumn(prior, "message_id");
@@ -744,11 +751,16 @@ export class ConversationStore {
           if (!msgRows.rows[0]) continue;
           user = stringColumn(msgRows.rows[0], "text");
 
-          if (user.length + assistant.length > remaining) break;
-          remaining -= user.length + assistant.length;
-          exchanges.push({ user, assistant });
+          if (loadedChars + user.length + assistant.length > 1_000_000) {
+            omittedRunIds.push(priorRunId);
+            historyScanTruncated = true;
+            continue;
+          }
+          loadedChars += user.length + assistant.length;
+          exchanges.push({ runId: priorRunId, user, assistant });
         }
-        const history = exchanges.reverse().flatMap(({ user, assistant }) => [
+        exchanges.reverse();
+        const history = exchanges.flatMap(({ user, assistant }) => [
           { role: "user" as const, text: user },
           { role: "assistant" as const, text: assistant },
         ]);
@@ -768,6 +780,9 @@ export class ConversationStore {
             },
             text: stringColumn(row, "input_text"),
             history,
+            historyRunIds: exchanges.map((exchange) => exchange.runId),
+            historyScanTruncated,
+            historyOmittedRunIds: omittedRunIds,
             providerSessionId,
           },
         };

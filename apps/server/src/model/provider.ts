@@ -21,6 +21,9 @@ export interface ModelProfile {
   baseUrl: string;
   model: string;
   credentialSlot: string | null;
+  contextWindowTokens?: number;
+  maxOutputTokens?: number;
+  supportsThinking?: boolean;
 }
 
 export interface ModelUsage {
@@ -173,12 +176,12 @@ export function createModelProvider(options: {
     api: profile.protocol,
     provider: profile.protocol === "anthropic-messages" ? "anthropic" : "openai",
     baseUrl: profile.baseUrl,
-    reasoning: false,
+    reasoning: profile.supportsThinking === true,
     input: ["text"],
     cost: { ...EMPTY_COST },
     // Request budgets, not claims about an unregistered model's measured capacity.
-    contextWindow: 32_768,
-    maxTokens: 4_096,
+    contextWindow: profile.contextWindowTokens ?? 32_768,
+    maxTokens: profile.maxOutputTokens ?? 4_096,
   };
   const streamForAgent: ModelProvider["streamForAgent"] = (
     _requestedModel,

@@ -11,6 +11,9 @@ export interface ExecutionInput {
   run: RunRecord;
   text: string;
   history: Array<{ role: "user" | "assistant"; text: string }>;
+  historyRunIds?: string[];
+  historyScanTruncated?: boolean;
+  historyOmittedRunIds?: string[];
   /** Only present when saved for this exact execution configuration and Conversation. */
   providerSessionId: string | null;
   signal: AbortSignal;

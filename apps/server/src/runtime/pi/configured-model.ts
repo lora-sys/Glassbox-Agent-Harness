@@ -21,11 +21,11 @@ export async function configuredPiModel(profiles: ModelProfileStore, profileId: 
       {
         id: profile.model,
         name: profile.label,
-        reasoning: false,
+        reasoning: profile.supportsThinking === true,
         input: ["text"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 32768,
-        maxTokens: 4096,
+        contextWindow: profile.contextWindowTokens ?? 32768,
+        maxTokens: profile.maxOutputTokens ?? 4096,
       },
     ],
   });

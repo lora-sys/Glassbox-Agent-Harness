@@ -5,6 +5,12 @@ import type {
   ExecutionResult,
 } from "../../execution/run-service/types.js";
 import { scopeKey } from "../../identity/scope.js";
+import {
+  estimateUnicodeTokens,
+  projectContextBudget,
+  type ContextDemandEstimate,
+  type ContextProjectionResult,
+} from "../../efficiency/index.js";
 import { exactTerms } from "../../retrieval/exact-term.js";
 import type { QqCapabilityCategory } from "../../channels/onebot/capabilities.js";
 import type { PiRunContext, PiRuntimeAdapter, PiRuntimeProfileName } from "./types.js";
@@ -381,6 +387,9 @@ export interface PiRunExecutionAdapterOptions {
    * observed. The Run's own outcome never depends on whether the record could be written.
    */
   onEvidence?: (record: RunEvidenceRecord) => void | Promise<void>;
+  onBudgetEvidence?: (
+    record: Extract<RunEvidenceRecord, { type: "context_budget" }>,
+  ) => void | Promise<void>;
 }
 
 /**
@@ -391,6 +400,23 @@ export interface PiRunExecutionAdapterOptions {
  * safe evidence: Tool names, domains and outcomes, never provider text or protected content.
  */
 export type RunEvidenceRecord =
+  | {
+      type: "context_budget";
+      runId: string;
+      principalId: string;
+      conversationId: string;
+      policyVersion: "p5a-context-v1";
+      estimateSource: "unicode_conservative";
+      demandTokens: number;
+      contextWindowTokens: number;
+      outputReserveTokens: number;
+      projectedTokens: number | null;
+      includedExchangeCount: number;
+      omittedExchangeCount: number;
+      sourceScanTruncated: boolean;
+      omittedBySourceBoundCount: number;
+      overflowCode?: string;
+    }
   | {
       type: "tool_evidence";
       runId: string;
@@ -628,11 +654,63 @@ function blockedMutationRequest(
   return undefined;
 }
 
-function recreatedPrompt(input: ExecutionInput): string {
-  if (input.history.length === 0) return input.text;
+export function projectRunHistory(
+  input: Pick<ExecutionInput, "text" | "history" | "historyRunIds">,
+  capacity: {
+    contextWindowTokens: number;
+    outputReserveTokens: number;
+    safetyMarginTokens: number;
+  },
+  staticEstimate: { systemTokens: number; toolSchemaTokens: number },
+): { result: ContextProjectionResult; demand: ContextDemandEstimate; included: Set<string> } {
+  const exchanges = Array.from({ length: Math.floor(input.history.length / 2) }, (_, index) => {
+    const user = input.history[index * 2];
+    const assistant = input.history[index * 2 + 1];
+    return {
+      id: input.historyRunIds?.[index] ?? `exchange-${index}`,
+      userTokens: estimateUnicodeTokens(user?.text ?? "") + 8,
+      assistantTokens: estimateUnicodeTokens(assistant?.text ?? "") + 8,
+    };
+  });
+  const currentMessageTokens = estimateUnicodeTokens(input.text);
+  const demand: ContextDemandEstimate = {
+    estimatedMaterialTokens:
+      staticEstimate.systemTokens +
+      staticEstimate.toolSchemaTokens +
+      currentMessageTokens +
+      exchanges.reduce((sum, exchange) => sum + exchange.userTokens + exchange.assistantTokens, 0),
+    estimateSource: "unicode_conservative",
+    hasLargeAuthorizedContext:
+      exchanges.length > 20 ||
+      exchanges.some((exchange) => exchange.userTokens + exchange.assistantTokens > 4096),
+    requiredOutputClass: "standard",
+    hasToolOrRetrieval: staticEstimate.toolSchemaTokens > 0,
+    hasAttachmentsOrArtifacts: false,
+    trustedPolicyFlags: [],
+    systemTokens: staticEstimate.systemTokens,
+    currentMessageTokens,
+    toolSchemaTokens: staticEstimate.toolSchemaTokens,
+    requiredFloorTokens: 256,
+    exchanges,
+  };
+  const result = projectContextBudget(demand, capacity);
+  return {
+    result,
+    demand,
+    included: new Set(result.ok ? result.projection.includedExchangeIds : []),
+  };
+}
+
+function recreatedPrompt(input: ExecutionInput, included: Set<string>): string {
   const history = input.history
+    .filter((_, index) =>
+      included.has(
+        input.historyRunIds?.[Math.floor(index / 2)] ?? `exchange-${Math.floor(index / 2)}`,
+      ),
+    )
     .map((message) => `${message.role === "user" ? "User" : "Assistant"}: ${message.text}`)
     .join("\n");
+  if (!history) return input.text;
   return `Authorized Conversation history:\n${history}\n\nCurrent user message:\n${input.text}`;
 }
 
@@ -735,10 +813,48 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         await this.runtime.abort(binding.runtimeSessionId);
         return { status: "cancelled", providerSessionId: binding.runtimeSessionId };
       }
+      const capacity = this.runtime.getModelCapacity?.(binding.runtimeSessionId) ?? {
+        contextWindowTokens: 32_768,
+        outputReserveTokens: 4_096,
+        safetyMarginTokens: 512,
+      };
+      const staticEstimate = this.runtime.getStaticContextEstimate?.(binding.runtimeSessionId) ?? {
+        systemTokens: 4_096,
+        toolSchemaTokens: 0,
+      };
+      const projection = projectRunHistory(input, capacity, staticEstimate);
+      const budgetEvidence: Extract<RunEvidenceRecord, { type: "context_budget" }> = {
+        type: "context_budget",
+        runId: input.run.id,
+        principalId: input.caller.principalId,
+        conversationId: input.conversation.id,
+        policyVersion: "p5a-context-v1",
+        estimateSource: "unicode_conservative",
+        demandTokens: projection.demand.estimatedMaterialTokens,
+        contextWindowTokens: capacity.contextWindowTokens,
+        outputReserveTokens: capacity.outputReserveTokens,
+        projectedTokens: projection.result.ok ? projection.result.projection.projectedTokens : null,
+        includedExchangeCount: projection.result.ok
+          ? projection.result.projection.includedExchangeIds.length
+          : 0,
+        omittedExchangeCount: projection.result.ok
+          ? projection.result.projection.omittedExchangeIds.length
+          : projection.demand.exchanges.length,
+        sourceScanTruncated: input.historyScanTruncated ?? false,
+        omittedBySourceBoundCount: input.historyOmittedRunIds?.length ?? 0,
+        ...(!projection.result.ok ? { overflowCode: projection.result.overflow.kind } : {}),
+      };
+      if (this.options.onBudgetEvidence) await this.options.onBudgetEvidence(budgetEvidence);
+      if (!projection.result.ok)
+        return {
+          status: "failed",
+          text: "当前请求超过已配置模型的上下文容量，未发送给模型。",
+          providerSessionId: binding.runtimeSessionId,
+        };
       let result = await this.runtime.run(
         binding,
         { ...input.run, principalId: input.caller.principalId },
-        recreatedPrompt(input),
+        recreatedPrompt(input, projection.included),
         context,
       );
       const requiredName = context.requiredToolName;

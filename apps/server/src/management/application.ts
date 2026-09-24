@@ -17,12 +17,24 @@ import {
 } from "../channels/onebot/index.js";
 import {
   RunService,
+  type ExecutionInput,
   type RunExecutionAdapter,
   type RunServiceEvent,
 } from "../execution/run-service/index.js";
 import { configuredModelAdapter } from "../execution/model-adapter.js";
+import { estimateUnicodeTokens } from "../efficiency/index.js";
+import {
+  selectRoute,
+  toRoutingEvidence,
+  type ModelCapacity as RouteModelCapacity,
+} from "../routing/index.js";
+import {
+  normalizePiTurnEndUsage,
+  type NormalizedPiTurnUsage,
+} from "../routing/runtime-telemetry.js";
 import {
   KitLoader,
+  MUTATION_REQUESTS,
   piProfileName,
   PiRunExecutionAdapter,
   PiSdkRuntimeAdapter,
@@ -404,6 +416,8 @@ export class ManagementApplication {
   }
 
   private readonly piAdapters = new Map<string, PiRunExecutionAdapter>();
+  private readonly runtimeUsageByRun = new Map<string, NormalizedPiTurnUsage>();
+  private readonly runtimeModelByRun = new Map<string, { provider: string; model: string }>();
   private opsReconciler?: OpsReconciler;
 
   private getOrCreateDefaultPiAdapter(profileId: string): PiRunExecutionAdapter {
@@ -456,6 +470,43 @@ export class ManagementApplication {
         const caller = await this.store.lifecycle.traceCaller(runId, event.principalId);
         const cursor = await this.trace.append(runId, event, "pi");
         await this.store.evidence.advanceTrace(caller, cursor);
+        if (event.type === "turn_end") {
+          if (typeof event.data.provider === "string" && typeof event.data.model === "string")
+            this.runtimeModelByRun.set(runId, {
+              provider: event.data.provider,
+              model: event.data.model,
+            });
+          const source = event.data.usage;
+          const usage =
+            source && typeof source === "object" && !Array.isArray(source)
+              ? (source as Record<string, unknown>)
+              : {};
+          const normalized = normalizePiTurnEndUsage({
+            usage: {
+              input: typeof usage.inputTokens === "number" ? usage.inputTokens : undefined,
+              output: typeof usage.outputTokens === "number" ? usage.outputTokens : undefined,
+              cacheRead:
+                typeof usage.cacheReadTokens === "number" ? usage.cacheReadTokens : undefined,
+              cacheWrite:
+                typeof usage.cacheWriteTokens === "number" ? usage.cacheWriteTokens : undefined,
+              reasoning:
+                typeof usage.reasoningTokens === "number" ? usage.reasoningTokens : undefined,
+              totalTokens: typeof usage.totalTokens === "number" ? usage.totalTokens : undefined,
+            },
+          });
+          this.runtimeUsageByRun.set(runId, normalized);
+          const usageCursor = await this.trace.append(
+            runId,
+            {
+              type: "runtime_usage",
+              runId,
+              schema: "glassbox.runtime-usage.v1",
+              usage: normalized,
+            },
+            "glassbox-runtime-telemetry",
+          );
+          await this.store.evidence.advanceTrace(caller, usageCursor);
+        }
       },
     });
     const adapter = new PiRunExecutionAdapter(runtime, {
@@ -468,6 +519,11 @@ export class ManagementApplication {
       onEvidence: async (record) => {
         const caller = await this.store.lifecycle.traceCaller(record.runId, record.principalId);
         const cursor = await this.trace.append(record.runId, record, "glassbox-tool-evidence");
+        await this.store.evidence.advanceTrace(caller, cursor);
+      },
+      onBudgetEvidence: async (record) => {
+        const caller = await this.store.lifecycle.traceCaller(record.runId, record.principalId);
+        const cursor = await this.trace.append(record.runId, record, "glassbox-context-budget");
         await this.store.evidence.advanceTrace(caller, cursor);
       },
     });
@@ -794,6 +850,186 @@ export class ManagementApplication {
   }
 
   private execution(reference: string): RunExecutionAdapter | undefined {
+    const direct = this.directExecution(reference);
+    if (!direct || this.options.executors?.has(reference)) return direct;
+    const kind = reference.startsWith("pi:")
+      ? "pi"
+      : reference.startsWith("model:")
+        ? "model"
+        : null;
+    if (!kind) return direct;
+    return {
+      supportsGroup: direct.supportsGroup,
+      execute: async (input: ExecutionInput) => {
+        const profileId = reference.slice(kind.length + 1);
+        const configured = this.options.models.list();
+        const origin = configured.find((profile) => profile.id === profileId);
+        if (!origin) return { status: "failed" };
+        const demandTokens =
+          estimateUnicodeTokens(input.text) +
+          input.history.reduce((sum, message) => sum + estimateUnicodeTokens(message.text) + 8, 0);
+        const candidates: RouteModelCapacity[] = configured.map((profile) => ({
+          profileId: profile.id,
+          executionRef: `${kind}:${profile.id}`,
+          configured: true,
+          capabilities: [
+            "text",
+            ...(kind === "pi" && profile.supportsTools === true ? ["tools" as const] : []),
+            ...(profile.supportsVision === true ? ["vision" as const] : []),
+            ...(profile.supportsThinking === true ? ["thinking" as const] : []),
+          ],
+          capabilityRank: profile.capabilityRank ?? null,
+          supportsThinking: profile.supportsThinking ?? null,
+          usage: {
+            inputTokens: null,
+            outputTokens: null,
+            concurrentRuns: null,
+            requestsPerMinute: null,
+            tokensPerMinute: null,
+          },
+          limits: {
+            contextWindowTokens: profile.contextWindowTokens ?? null,
+            maxOutputTokens: profile.maxOutputTokens ?? null,
+            maxConcurrentRuns: null,
+            requestsPerMinute: null,
+            tokensPerMinute: null,
+          },
+          health: {
+            state: profile.routingAvailable === false ? "unavailable" : "unknown",
+            checkedAt: null,
+            latencyMs: null,
+            reasonCode: profile.routingAvailable === false ? "operator_disabled" : null,
+          },
+        }));
+        const ordered = configured
+          .filter((profile) => profile.id === profileId || profile.allowRouting === true)
+          .sort(
+            (a, b) =>
+              (a.routePriority ?? 1000) - (b.routePriority ?? 1000) || a.id.localeCompare(b.id),
+          );
+        const routingInput = {
+          task: {
+            risk:
+              kind === "pi" &&
+              MUTATION_REQUESTS.some(
+                (request) =>
+                  request.words.test(input.text) && request.params(input.text) !== undefined,
+              )
+                ? ("high" as const)
+                : ("medium" as const),
+            requiredCapabilities:
+              kind === "pi" ? (["text", "tools"] as const) : (["text"] as const),
+            requiredContextTokens: Math.max(
+              estimateUnicodeTokens(input.text) + 6144,
+              Math.min(demandTokens, 32768),
+            ),
+            requiredOutputTokens: 4096,
+            thinking: "disabled" as const,
+          },
+          candidates,
+          options: {
+            enabled: origin.routingEnabled === true,
+            allowedProfileIds: ordered.map((profile) => profile.id),
+            routeOrder: ordered.map((profile) => profile.id),
+            defaultExecutionRef: reference,
+            capabilityFloorByRisk: { low: 0, medium: 0, high: 2 },
+            allowUnknownHealth: true,
+            allowUnknownCapacity: false,
+          },
+        };
+        const decision = selectRoute(routingInput);
+        const caller = await this.store.lifecycle.traceCaller(
+          input.run.id,
+          input.caller.principalId,
+        );
+        const cursor = await this.trace.append(
+          input.run.id,
+          {
+            type: "routing_decision",
+            runId: input.run.id,
+            conversationId: input.conversation.id,
+            principalId: input.caller.principalId,
+            policyVersion: "p5b-route-v1",
+            demand: {
+              estimatedMaterialTokens: demandTokens,
+              estimateSource: "unicode_conservative",
+            },
+            ...toRoutingEvidence(routingInput, decision),
+          },
+          "glassbox-routing",
+        );
+        await this.store.evidence.advanceTrace(caller, cursor);
+        const appendRoutingEval = async (actualExecutionRef: string | null, succeeded = false) => {
+          const selectedProfile = candidates.find(
+            (candidate) => candidate.executionRef === decision.executionRef,
+          );
+          const selectedConfig = configured.find(
+            (profile) => profile.id === decision.selectedProfileId,
+          );
+          const actualModel = this.runtimeModelByRun.get(input.run.id);
+          const actualTokens = this.runtimeUsageByRun.get(input.run.id)?.totalTokens.value ?? null;
+          this.runtimeUsageByRun.delete(input.run.id);
+          this.runtimeModelByRun.delete(input.run.id);
+          const unavailableModelEncountered = decision.candidates.some(
+            (candidate) => candidate.reason === "health_unavailable",
+          );
+          const evidenceCursor = await this.trace.append(
+            input.run.id,
+            {
+              type: "routing_eval_evidence",
+              schema: "glassbox.routing-eval-evidence.v1",
+              capabilityFloor: routingInput.options.capabilityFloorByRisk[routingInput.task.risk],
+              selectedCapabilityRank: selectedProfile?.capabilityRank ?? null,
+              unavailableModelEncountered,
+              fallbackSelected: unavailableModelEncountered && decision.executionRef !== null,
+              fallbackAvailable: unavailableModelEncountered && succeeded,
+              decisionExecutionRef: decision.executionRef,
+              actualExecutionRef,
+              decisionProvider: selectedConfig
+                ? kind === "pi"
+                  ? `glassbox-${selectedConfig.id}`
+                  : selectedConfig.id
+                : null,
+              decisionModel: selectedConfig?.model ?? null,
+              actualProvider: actualModel?.provider ?? null,
+              actualModel: actualModel?.model ?? null,
+              usage: {
+                actualTokens,
+                estimatedTokens: demandTokens,
+                reportedTokens: actualTokens,
+                reportedSource: actualTokens === null ? "unknown" : "actual",
+              },
+              quota: { sourceAvailable: false, availability: "unknown" },
+            },
+            "glassbox-run",
+          );
+          await this.store.evidence.advanceTrace(caller, evidenceCursor);
+        };
+        if (decision.executionRef === null) {
+          await appendRoutingEval(null);
+          return { status: "failed" };
+        }
+        const selected =
+          decision.executionRef === reference
+            ? direct
+            : this.directExecution(decision.executionRef);
+        if (!selected || (input.caller.scope.chatType === "group" && !selected.supportsGroup)) {
+          await appendRoutingEval(null);
+          return { status: "failed" };
+        }
+        let succeeded = false;
+        try {
+          const result = await selected.execute(input);
+          succeeded = result.status === "succeeded";
+          return result;
+        } finally {
+          await appendRoutingEval(decision.executionRef, succeeded);
+        }
+      },
+    };
+  }
+
+  private directExecution(reference: string): RunExecutionAdapter | undefined {
     const harness = this.options.executors?.get(reference);
     if (harness) return harness;
     if (reference === "claude-code") return this.executors.adapter();
@@ -813,6 +1049,40 @@ export class ManagementApplication {
         if (!caller) return;
         const cursor = await this.trace.append(runId, event, "glassbox-model");
         await this.store.evidence.advanceTrace(caller, cursor);
+        if (event.type === "model_identity")
+          this.runtimeModelByRun.set(runId, { provider: event.provider, model: event.model });
+        if (event.type === "usage") {
+          const normalized = normalizePiTurnEndUsage({
+            usage: {
+              input: event.usage.input ?? undefined,
+              output: event.usage.output ?? undefined,
+              cacheRead: event.usage.cacheRead ?? undefined,
+              cacheWrite: event.usage.cacheWrite ?? undefined,
+              reasoning: event.usage.reasoning ?? undefined,
+              totalTokens: event.usage.totalTokens ?? undefined,
+            },
+            providerReported: {
+              input: event.usage.input !== null,
+              output: event.usage.output !== null,
+              cacheRead: event.usage.cacheRead !== null,
+              cacheWrite: event.usage.cacheWrite !== null,
+              reasoning: event.usage.reasoning !== null,
+              totalTokens: event.usage.totalSource === "reported",
+            },
+          });
+          this.runtimeUsageByRun.set(runId, normalized);
+          const usageCursor = await this.trace.append(
+            runId,
+            {
+              type: "runtime_usage",
+              runId,
+              schema: "glassbox.runtime-usage.v1",
+              usage: normalized,
+            },
+            "glassbox-runtime-telemetry",
+          );
+          await this.store.evidence.advanceTrace(caller, usageCursor);
+        }
       },
     });
   }
@@ -2501,7 +2771,35 @@ export class ManagementApplication {
       runs: this.runs,
       trace: this.trace,
       evaluator: this.evaluator,
+      ...(this.options.ops ? { opsHealth: (runId: string) => this.opsHealth(runId) } : {}),
     });
+  }
+
+  private async opsHealth(runId: string) {
+    if (!this.options.ops) throw new ManagementError("NOT_FOUND", "Ops is not configured", 404);
+    const caller = await this.runCaller(runId);
+    const now = new Date();
+    const service = new AuthorizedOpsService(
+      this.store,
+      this.options.ops.bridge,
+      this.options.ops.workerPolicy,
+    );
+    return service.health(
+      caller,
+      {
+        now: now.toISOString(),
+        windowStart: new Date(now.getTime() - 24 * 60 * 60 * 1_000).toISOString(),
+        herdr: {
+          ...(this.opsReconciler?.healthObservation() ?? {
+            bridgeState: "unknown" as const,
+            eventsLost: false,
+            lastSuccessfulReconciliationAt: null,
+          }),
+          observations: [],
+        },
+      },
+      { runId },
+    );
   }
 
   async close() {

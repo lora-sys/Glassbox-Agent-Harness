@@ -108,6 +108,35 @@ afterEach(async () => {
 });
 
 describe("shared group conversation and durable actor routing", () => {
+  it("loads more than forty short authorized exchanges without a fixed twenty-run cutoff", async () => {
+    const store = await setupStore();
+    const runIds: string[] = [];
+    for (let index = 0; index < 42; index++) {
+      const accepted = await store.conversations.acceptIncoming({
+        agentId: "personal",
+        scope: ownerPrivate.scope,
+        messageId: `budget-history-${index}`,
+        text: `Question ${index}`,
+        executionRef: "pi:test",
+      });
+      runIds.push(accepted.run.id);
+      const lease = await store.lifecycle.claimQueuedRun(ownerPrivate, accepted.run.id);
+      await lease.settle("succeeded", `Answer ${index}`);
+    }
+    const next = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: ownerPrivate.scope,
+      messageId: "budget-history-next",
+      text: "What did we discuss?",
+      executionRef: "pi:test",
+    });
+    const input = await store.conversations.loadRunInput(ownerPrivate, next.run.id);
+    expect(input.history).toHaveLength(84);
+    expect(input.history[0]).toEqual({ role: "user", text: "Question 0" });
+    expect(input.historyRunIds).toEqual(runIds);
+    expect(input.historyScanTruncated).toBe(false);
+  });
+
   it("excludes unsafe exchanges from future context without rewriting results, including after reopen", async () => {
     const directory = await mkdtemp(join(tmpdir(), "glassbox-context-exclusion-"));
     tempDirectories.push(directory);

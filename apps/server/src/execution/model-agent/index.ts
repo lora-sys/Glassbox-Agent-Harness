@@ -19,6 +19,16 @@ export interface AuthorizedModelTool {
 }
 
 export type ModelAgentEvent =
+  | { type: "model_identity"; provider: string; model: string }
+  | {
+      type: "context_budget";
+      policyVersion: string;
+      capacityTokens: number;
+      inputBudgetTokens: number;
+      estimatedTokens: number;
+      omittedExchanges: number;
+      overflow: string | null;
+    }
   | { type: "started" }
   | { type: "turn_started"; turn: number }
   | { type: "text_delta"; text: string }
