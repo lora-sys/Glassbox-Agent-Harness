@@ -430,17 +430,22 @@ const PI_BUILTIN_DESCRIPTORS: readonly ToolDescriptor[] = Object.freeze(
   PI_BUILTIN_TOOLS.map((name): ToolDescriptor => ({
     name,
     origin: "pi_builtin",
-    schemaVersion: `pi-builtin-${name}-v1`,
-    riskClass: "host",
-    provider: "pi",
-    discovery: "host_only",
-    // A host built-in has no Glassbox Action. Leaving this null is what stops it from
-    // looking like a product capability that a grant could switch on.
-    authorization: null,
-    availability: "none",
+    schemaVersion: `pi-isolated-${name}-v1`,
+    riskClass: ["write", "edit", "bash", "powershell"].includes(name) ? "write" : "read",
+    provider: "lora-pi-kit-docker",
+    discovery: "owner_private",
+    authorization: {
+      action: ["write", "edit", "bash", "powershell"].includes(name)
+        ? "workspace:write"
+        : "workspace:read",
+      resource: "workspace",
+    },
+    availability: "provider_probe",
     resultProjection: "verbatim",
     grounding: "host_resource",
-    budgetClass: "host",
+    budgetClass: ["write", "edit", "bash", "powershell"].includes(name)
+      ? "domain_write"
+      : "domain_read",
   })),
 );
 
@@ -538,12 +543,14 @@ export function describeToolDrift(input: {
   profileName: PiRuntimeProfileName;
   profileActiveTools: readonly string[];
   descriptors?: ToolDescriptorCatalog;
+  isolatedPiTools?: readonly string[];
 }): ToolDriftReport {
   const descriptors = descriptorMap(input.descriptors);
   const disabledByHost: string[] = [];
   const unknownTools: string[] = [];
   for (const name of input.profileActiveTools) {
-    if (PI_BUILTIN_TOOLS.includes(name)) disabledByHost.push(name);
+    if (PI_BUILTIN_TOOLS.includes(name) && !input.isolatedPiTools?.includes(name))
+      disabledByHost.push(name);
     else if (!descriptors.has(name)) unknownTools.push(name);
   }
   return {
@@ -633,6 +640,7 @@ export function profileSelection(name: PiRuntimeProfileName): ProfileSelectionDe
  */
 export type ToolExclusionReason =
   | "disabled_by_host"
+  | "backend_unavailable"
   | "scope_not_permitted"
   | "policy_disabled"
   | "discovery_denied"
@@ -743,6 +751,11 @@ export function describeToolSurface(input: {
     profileName: input.profileName,
     profileActiveTools: input.profileActiveTools,
     descriptors: input.descriptors,
+    isolatedPiTools: input.candidates
+      .filter(
+        (candidate) => candidate.exclusion === null && PI_BUILTIN_TOOLS.includes(candidate.name),
+      )
+      .map((candidate) => candidate.name),
   });
   const selected: ToolSurfaceEntry[] = [];
   const excluded: ExcludedToolSurfaceEntry[] = [];

@@ -74,7 +74,10 @@ export async function piWorkerLaunch(input: {
       "--extension",
       herdrExtension,
       ...profile.enabledExtensions
-        .filter((name) => name !== "mcp/tool-adapter")
+        // Glassbox's existing Worker path has its own authorized file tools. The
+        // Kit sandbox extension requires a trusted workspace lease and must not
+        // be loaded by this path until Herdr shares that lease with the main Agent.
+        .filter((name) => name !== "mcp/tool-adapter" && name !== "core/sandbox-tools")
         .flatMap((name) => ["--extension", join(input.kitPath, "extensions", `${name}.ts`)]),
       ...profile.enabledSkills.flatMap((name) => ["--skill", join(input.kitPath, "skills", name)]),
       "--extension",

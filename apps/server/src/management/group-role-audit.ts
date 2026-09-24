@@ -16,6 +16,7 @@ const VERIFICATION_SET = new Set(["verified", "mismatch", "unknown", "unavailabl
 const AUTHORIZATION_SET = new Set(["ALLOW", "DENY", "REQUIRES_APPROVAL"]);
 const SURFACE_REASONS = new Set([
   "disabled_by_host",
+  "backend_unavailable",
   "scope_not_permitted",
   "policy_disabled",
   "discovery_denied",

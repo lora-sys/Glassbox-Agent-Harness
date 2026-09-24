@@ -17,7 +17,10 @@ const binding: BrowserSessionBinding = {
 const publicResolver = async () => ["93.184.215.14"];
 
 function setup(
-  options: { allow?: boolean; result?: (args: readonly string[]) => BrowserExecutorResult } = {},
+  options: {
+    allow?: boolean;
+    result?: (args: readonly string[]) => BrowserExecutorResult | undefined;
+  } = {},
 ) {
   const calls: string[][] = [];
   const openedBindings: Array<{ binding: BrowserSessionBinding; sessionId: string }> = [];
@@ -297,6 +300,27 @@ describe("agent-browser 0.38.1 bridge", () => {
     expect(state.cancelCount).toBe(1);
     expect(state.closeCount).toBe(1);
     expect(state.calls.some((args) => args[3] === "snapshot")).toBe(false);
+  });
+
+  it("withholds a completed browser result when permission is revoked during the call", async () => {
+    const state = setup({
+      result: (args) => {
+        if (args[3] !== "snapshot") return undefined;
+        state.authorize.mockResolvedValue(false);
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({ success: true, data: { text: "private result" } }),
+          stderr: "",
+        };
+      },
+    });
+    await state.bridge.execute(binding, { type: "open", url: "https://example.com/" });
+
+    await expect(state.bridge.execute(binding, { type: "snapshot" })).rejects.toThrow(
+      "browser_denied",
+    );
+    expect(state.cancelCount).toBe(1);
+    expect(state.closeCount).toBe(1);
   });
 
   it("returns screenshot artifacts by reference without exposing executor host paths", async () => {

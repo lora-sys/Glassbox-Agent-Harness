@@ -359,9 +359,13 @@ export class BrowserBridge {
       if (command.navigation || command.mutation || command.tabChange) this.invalidateRefs(live);
       const args = ["--json", "--session", session.cliSession, ...command.args];
       try {
+        if (!(await this.options.authorize(binding, command.capability, action.type)))
+          throw new Error("browser_denied");
         if (action.type !== "open" && action.type !== "close")
           await this.assertCurrentUrlSafe(live);
         const result = await live.execution.execute(args, this.limits());
+        if (!(await this.options.authorize(binding, command.capability, action.type)))
+          throw new Error("browser_denied");
         if (result.exitCode !== 0) throw new Error("browser_cli_failed");
         const parsed = parseJsonResult(result.stdout);
         if (!parsed.success) throw new Error(`browser_cli_${parsed.code ?? "failed"}`);

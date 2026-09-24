@@ -17,6 +17,7 @@ import type { WebFetchResult, WebSearchResult, WebResultStatus } from "../../web
 export const WEB_SEARCH_TOOL = "web_search";
 export const WEB_FETCH_TOOL = "web_fetch";
 export const WEB_RESOURCE = "web:public";
+export const BROWSER_ARTIFACT_DELIVER_ACTION = "browser:deliver";
 export const WEB_ACTIONS: Readonly<Record<WebCapability, string>> = {
   "web.search": "web:search",
   "web.fetch": "web:fetch",
