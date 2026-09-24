@@ -13,9 +13,11 @@ change a workspace grant. The selected workspace ID is stored by Principal.
 For each Run, Glassbox checks both the workspace registry and the product
 authorization decision before offering a Pi tool. It repeats both checks before
 each call. A write capable Run takes the workspace write occupancy before it
-opens a sandbox session. The occupancy is released only after Kit confirms that
+opens a sandbox session. The occupancy is stored under the service data directory
+and shared across server processes. It is released only after Kit confirms that
 Docker removed the session container. An unconfirmed stop quarantines the
-workspace for further writes in that server process.
+workspace. On restart, Glassbox keeps old leases quarantined until Kit confirms
+the corresponding container has stopped.
 
 Glassbox supplies Kit with the authorized canonical workspace path. Kit mounts
 that directory into a Docker container and runs Pi's `read`, `grep`, `find`,
@@ -47,11 +49,11 @@ configuration roots. Default workspaces cannot be shared.
 
 ## Remaining acceptance for issue 23
 
-The current occupancy is shared by the main Agent's isolated tool sessions in
-one Glassbox server process. Herdr Worker launch still uses its existing task
-workspace and authorization path. It has not been bound to the same product
-workspace ID and occupancy. Process restart recovery for an uncertain Docker
-session also needs a durable stop proof before another writer is admitted.
+The durable occupancy is used by the main Agent's isolated tool sessions.
+Herdr Worker launch still uses its existing task workspace and authorization
+path. It has not been bound to the same product workspace ID and occupancy.
+The existing Worker file tools remain active; Glassbox does not load Kit's new
+sandbox extension on that path until the trusted workspace lease is joined.
 
 Kit's local and Herdr profiles register isolated Pi tools, but a controlled
 network policy and the real browser path from issue 20 remain to be integrated.

@@ -20,6 +20,7 @@ export interface KitSandboxExecutor {
     policyVersion: string;
     network: "none";
   }): Promise<IsolatedPiSession>;
+  ensureSessionStopped(sessionId: string): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -69,6 +70,8 @@ export async function loadKitSandbox(kitPath: string): Promise<{
   if (typeof module.createDockerSandboxExecutor !== "function")
     throw new Error("Pinned Kit has no sandbox executor");
   const executor = module.createDockerSandboxExecutor({ image });
+  if (typeof executor.ensureSessionStopped !== "function")
+    throw new Error("Pinned Kit cannot verify stopped sandbox sessions");
   try {
     const probe = await executor.doctor();
     if (probe.ready !== true || probe.provider !== "docker")

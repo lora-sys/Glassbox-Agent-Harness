@@ -270,7 +270,7 @@ export class ManagementApplication {
   /** Durable Channel history, separate from Run inputs. */
   readonly archive: ChannelArchiveStore;
   workspaces!: WorkspaceRegistry;
-  readonly workspaceWrites = new WorkspaceWriteOccupancy();
+  readonly workspaceWrites: WorkspaceWriteOccupancy;
   private sandboxRuntime: Awaited<ReturnType<typeof loadKitSandbox>> = null;
   private sandboxFailure: string | null = null;
   executors!: ExecutorConfiguration;
@@ -312,6 +312,7 @@ export class ManagementApplication {
     this.groupRuntime = groupRuntime;
     this.archive = new ChannelArchiveStore(store.db);
     this.kitLoader = new KitLoader(options.kitPath);
+    this.workspaceWrites = new WorkspaceWriteOccupancy(options.dataDirectory);
     this.deliveryPolicy = createQqDeliveryPolicy({
       forbiddenValues: () => [
         ...hostDeliveryForbiddenValues({
@@ -388,6 +389,22 @@ export class ManagementApplication {
       });
       try {
         application.sandboxRuntime = await loadKitSandbox(application.kitLoader.getKitPath());
+        if (application.sandboxRuntime) {
+          for (const { lease, state } of application.workspaceWrites.listUnresolved()) {
+            if (state !== "quarantined" || lease.policyVersion !== "workspace-sandbox-v1") continue;
+            try {
+              await application.workspaceWrites.releaseQuarantined(
+                lease,
+                async ({ sandboxSessionId }) => {
+                  await application.sandboxRuntime!.executor.ensureSessionStopped(sandboxSessionId);
+                  return true;
+                },
+              );
+            } catch (error) {
+              application.sandboxFailure = `An old sandbox stop could not be verified: ${error instanceof Error ? error.message : String(error)}`;
+            }
+          }
+        }
       } catch (error) {
         application.sandboxFailure = error instanceof Error ? error.message : String(error);
       }
@@ -539,6 +556,9 @@ export class ManagementApplication {
         });
       await this.grantWorkspaceScope(value.principalId, scope, value.workspaceId);
     }
+    if (value.access === "read")
+      for (const adapter of this.piAdapters.values())
+        await adapter.disposeWorkspaceSessions(value.principalId, value.workspaceId);
     return { granted: true };
   }
 
@@ -1004,22 +1024,27 @@ export class ManagementApplication {
           const access = ["write", "edit", "bash", "powershell"].includes(descriptor.name)
             ? "write"
             : "read";
-          const allowed = await this.workspaces
-            .resolveAuthorized(context.caller.principalId, selectedWorkspace.id, access)
-            .then(
-              () => true,
-              () => false,
-            );
-          if (!allowed) scopeGates.set(descriptor.name, "policy_disabled");
-          else {
-            const decision = await this.store.authorization.check({
-              caller: context.caller,
-              resourceId: `workspace:${selectedWorkspace.id}`,
-              action: access === "write" ? "workspace:write" : "workspace:read",
-              conversationId: context.conversationId,
-              runId: context.runId,
-            });
-            if (decision.decision !== "ALLOW") scopeGates.set(descriptor.name, "discovery_denied");
+          if (access === "write" && this.workspaceWrites.status(selectedWorkspace.id) !== "free") {
+            scopeGates.set(descriptor.name, "policy_disabled");
+          } else {
+            const allowed = await this.workspaces
+              .resolveAuthorized(context.caller.principalId, selectedWorkspace.id, access)
+              .then(
+                () => true,
+                () => false,
+              );
+            if (!allowed) scopeGates.set(descriptor.name, "policy_disabled");
+            else {
+              const decision = await this.store.authorization.check({
+                caller: context.caller,
+                resourceId: `workspace:${selectedWorkspace.id}`,
+                action: access === "write" ? "workspace:write" : "workspace:read",
+                conversationId: context.conversationId,
+                runId: context.runId,
+              });
+              if (decision.decision !== "ALLOW")
+                scopeGates.set(descriptor.name, "discovery_denied");
+            }
           }
         }
       }

@@ -108,6 +108,7 @@ export function createIsolatedPiTools(input: {
           return { content: result.content, details: result.details };
         } catch (error) {
           const uncertain =
+            WRITE_TOOLS.has(definition.name) ||
             executionCompleted ||
             signal?.aborted ||
             /uncertain|exited|timeout|closed|cancelled/iu.test(
