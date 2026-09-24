@@ -55,8 +55,9 @@ function resultText(result: McpResult): string {
     .slice(0, 100_000);
 }
 
-function failureStatus(text: string): "quota_exhausted" | "failed" {
-  return /rate limit|quota|too many requests|429/iu.test(text) ? "quota_exhausted" : "failed";
+function failureStatus(text: string): "rate_limited" | "quota_exhausted" | "failed" {
+  if (/quota|credits? (?:exhausted|depleted)|402/iu.test(text)) return "quota_exhausted";
+  return /rate limit|too many requests|429/iu.test(text) ? "rate_limited" : "failed";
 }
 
 /** The hosted MCP formats search results as Title, URL, Published, Author, Highlights blocks. */
@@ -66,6 +67,7 @@ export function parseExaMcpSearch(text: string): ExaRawResult[] {
     const title = /^Title:\s*(.*)$/imu.exec(block)?.[1]?.trim();
     const url = /^URL:\s*(https?:\/\/\S+)$/imu.exec(block)?.[1]?.trim();
     const publishedDate = /^Published:\s*(.*)$/imu.exec(block)?.[1]?.trim();
+    const author = /^Author:\s*(.*)$/imu.exec(block)?.[1]?.trim();
     const highlights = block
       .split(/\nHighlights:\s*\n/iu)[1]
       ?.trim()
@@ -75,7 +77,8 @@ export function parseExaMcpSearch(text: string): ExaRawResult[] {
     results.push({
       title: title && title !== "N/A" ? title : url,
       url,
-      ...(publishedDate && publishedDate !== "N/A" ? { publishedDate } : {}),
+      ...(publishedDate ? { publishedDate: publishedDate === "N/A" ? null : publishedDate } : {}),
+      ...(author ? { author: author === "N/A" ? null : author } : {}),
       ...(highlights ? { highlights } : {}),
     });
   }

@@ -9,7 +9,8 @@ const MAX_PROVIDER_BODY_CHARS = 1_000_000;
 export interface ExaRawResult {
   title?: string;
   url?: string;
-  publishedDate?: string;
+  publishedDate?: string | null;
+  author?: string | null;
   highlights?: string[];
   text?: string;
   score?: number;
@@ -41,7 +42,10 @@ function readResults(value: unknown): readonly ExaRawResult[] | undefined {
       {
         ...(typeof row.title === "string" ? { title: row.title } : {}),
         url: row.url,
-        ...(typeof row.publishedDate === "string" ? { publishedDate: row.publishedDate } : {}),
+        ...(typeof row.publishedDate === "string" || row.publishedDate === null
+          ? { publishedDate: row.publishedDate }
+          : {}),
+        ...(typeof row.author === "string" || row.author === null ? { author: row.author } : {}),
         ...(Array.isArray(row.highlights)
           ? {
               highlights: row.highlights.filter(
@@ -76,8 +80,8 @@ export class ExaProvider {
       });
       if (response.status === 401 || response.status === 403)
         return { status: "auth_missing", results: [] };
-      if (response.status === 402 || response.status === 429)
-        return { status: "quota_exhausted", results: [] };
+      if (response.status === 402) return { status: "quota_exhausted", results: [] };
+      if (response.status === 429) return { status: "rate_limited", results: [] };
       if (!response.ok) return { status: "failed", results: [] };
       const text = await response.text();
       if (text.length > MAX_PROVIDER_BODY_CHARS) return { status: "failed", results: [] };

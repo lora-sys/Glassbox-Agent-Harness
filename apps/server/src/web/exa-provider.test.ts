@@ -21,7 +21,7 @@ describe("Exa provider", () => {
   it.each([
     [401, "auth_missing"],
     [402, "quota_exhausted"],
-    [429, "quota_exhausted"],
+    [429, "rate_limited"],
     [500, "failed"],
   ] as const)("maps HTTP %i to %s", async (status, expected) => {
     const provider = new ExaProvider({

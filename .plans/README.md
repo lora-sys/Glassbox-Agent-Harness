@@ -6,7 +6,17 @@ This directory contains the active implementation plans and durable technical fi
 
 P3 completed on 2026-09-19.
 
-P4 is intentionally split into two parallel implementation streams:
+P4A and P4B are complete. Before starting the next product phase, Issue #21 owns this repository refactor:
+
+```text
+phase-transition-repository-refactor.md
+  Issue #21
+  Server modularization, test structure, and validation workflow
+```
+
+The P4 plans remain as completed architecture and acceptance records. This refactor does not implement P5 product behavior.
+
+## Completed P4 plans
 
 ```text
 04a-memory-taste.md
@@ -18,57 +28,15 @@ P4 is intentionally split into two parallel implementation streams:
   Authorized retrieval / QQ history search
 ```
 
-This is an intentional exception to the normal one-active-plan rule. The two streams have separate ownership and should land through separate PRs.
-
-Shared boundary:
-
-```text
-P4A
-  writes and manages durable Memory / Taste truth
-
-P4B
-  reads authorized history / Memory / Taste
-  ranks and projects retrieval results
-```
-
-Neither stream may silently absorb the sibling stream.
-
-## Read order for P4 implementation
+## Read order for repository refactoring
 
 1. `../AGENTS.md`
-2. the owned P4A or P4B plan
-3. the matching GitHub Issue
+2. `phase-transition-repository-refactor.md`
+3. Issue #21
 4. only the relevant files under `findings/`
-5. the relevant upstream source or official documentation
-6. current production code and focused tests
+5. current production code and focused tests
 
-For P4A also read:
-
-```text
-../docs/memory-taste.md
-../upstream/mgp/SOURCES.md
-../upstream/command-code/SOURCES.md
-../upstream/openharness/SOURCES.md
-
-Issue #9 contains the exact LangMem, OpenHarness and
-Learning-Multi-Factor-Memory source paths to port.
-```
-
-For P4B also read:
-
-```text
-../upstream/mgp/SOURCES.md
-../upstream/opensquilla/SOURCES.md
-../upstream/openharness/SOURCES.md
-
-../apps/server/src/auth/
-../apps/server/src/conversation/
-../apps/server/src/channels/onebot/
-
-Issue #10 contains the exact retrieval source paths and tests to port.
-```
-
-`README.md` defines product direction. `AGENTS.md` defines stable engineering and safety rules. The owned active plan and its Issue define the implementation scope.
+`README.md` defines product direction. `AGENTS.md` defines stable engineering and safety rules. The active plan and its Issue define the implementation scope.
 
 ## Historical phases
 

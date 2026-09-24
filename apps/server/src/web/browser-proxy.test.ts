@@ -1,222 +1,225 @@
-import { once } from "node:events";
-import { Duplex } from "node:stream";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { BrowserProxy, type BrowserProxyOptions } from "./browser-proxy.js";
-import type { ResolveWebHost } from "./network-guard.js";
+import { describe, expect, it, vi } from "vitest";
+import { BrowserBridge, type BrowserAuthorizer } from "./browser-bridge.js";
+import type {
+  BrowserExecutionSession,
+  BrowserExecutorLimits,
+  BrowserExecutorPort,
+  BrowserExecutorResult,
+} from "./browser-executor-port.js";
+import type { BrowserSessionBinding } from "./browser-session.js";
 
-const { lookupMock } = vi.hoisted(() => ({ lookupMock: vi.fn() }));
-vi.mock("node:dns/promises", () => ({ lookup: lookupMock }));
+const binding: BrowserSessionBinding = {
+  runId: "run-1",
+  principalId: "owner-1",
+  conversationId: "conversation-1",
+  workspaceId: "workspace-1",
+  policyVersion: "policy-7",
+};
+const resolvePublicHost = async () => ["93.184.215.14"];
 
-class FakeUpstream extends Duplex {
-  written = "";
-
-  constructor() {
-    super();
-  }
-
-  _read(): void {}
-
-  _write(chunk: Buffer, _encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
-    const value = chunk.toString("latin1");
-    this.written += value;
-    if (value.includes("\r\n\r\n")) {
-      this.push("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
-    } else if (value === "ping") {
-      this.push("pong");
-    }
-    callback();
-  }
-}
-
-const publicResolver: ResolveWebHost = async () => ["93.184.215.14"];
-const proxies: BrowserProxy[] = [];
-
-afterEach(async () => {
-  await Promise.all(proxies.splice(0).map((proxy) => proxy.close()));
-});
-
-async function makeProxy(
-  options: Partial<Omit<BrowserProxyOptions, "listenHost" | "advertisedHost">> = {},
+function setup(
+  options: {
+    allow?: boolean;
+    result?: (args: readonly string[]) => BrowserExecutorResult | undefined;
+  } = {},
 ) {
-  const proxy = new BrowserProxy({
-    listenHost: "127.0.0.1",
-    advertisedHost: "127.0.0.1",
-    resolveHost: publicResolver,
-    ...options,
+  const calls: Array<{ args: string[]; limits: BrowserExecutorLimits }> = [];
+  const opens: Array<{ binding: BrowserSessionBinding; sessionId: string }> = [];
+  const authorize = vi.fn<BrowserAuthorizer>(async () => options.allow ?? true);
+  let cancelCount = 0;
+  let closeCount = 0;
+  const execution: BrowserExecutionSession = {
+    execute: vi.fn(async (args, limits) => {
+      calls.push({ args: [...args], limits });
+      const result = options.result?.(args);
+      if (result) return result;
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          success: true,
+          data: args[3] === "get" && args[4] === "url" ? "https://example.com/" : { ok: true },
+        }),
+        stderr: "",
+      };
+    }),
+    cancel: vi.fn(async () => {
+      cancelCount++;
+    }),
+    close: vi.fn(async () => {
+      closeCount++;
+    }),
+  };
+  const executor: BrowserExecutorPort = {
+    open: vi.fn(async (sessionBinding, sessionId) => {
+      opens.push({ binding: sessionBinding, sessionId });
+      return execution;
+    }),
+  };
+  const bridge = new BrowserBridge({
+    authorize,
+    executor,
+    resolveHost: resolvePublicHost,
+    timeoutMs: 7000,
+    maxOutputChars: 1200,
+    maxArtifactBytes: 4096,
   });
-  const endpoint = await proxy.start();
-  proxies.push(proxy);
-  return { proxy, endpoint, port: Number(new URL(endpoint).port) };
+  return {
+    bridge,
+    calls,
+    opens,
+    authorize,
+    executor,
+    execution,
+    get cancelCount() {
+      return cancelCount;
+    },
+    get closeCount() {
+      return closeCount;
+    },
+  };
 }
 
-async function sendProxyRequest(port: number, request: string): Promise<string> {
-  const { connect } = await import("node:net");
-  const client = connect(port, "127.0.0.1");
-  await once(client, "connect");
-  client.write(request);
-  const [data] = await once(client, "data");
-  client.destroy();
-  return (data as Buffer).toString("latin1");
-}
+describe("BrowserExecutorPort boundary", () => {
+  it("opens a generated executor session bound to the complete caller scope", async () => {
+    const state = setup();
+    await state.bridge.execute(binding, { type: "open", url: "https://example.com/" });
 
-describe("browser network proxy", () => {
-  it("requires an explicit wildcard opt-in and advertises the isolated network alias", async () => {
-    const denied = new BrowserProxy({ listenHost: "0.0.0.0", advertisedHost: "proxy" });
-    await expect(denied.start()).rejects.toThrow("browser_proxy_bind_address_required");
-    const proxy = new BrowserProxy({
-      listenHost: "0.0.0.0",
-      advertisedHost: "proxy",
-      allowWildcardListen: true,
-      resolveHost: publicResolver,
+    expect(state.opens).toHaveLength(1);
+    expect(state.opens[0]).toMatchObject({
+      binding,
+      sessionId: expect.stringMatching(/^gb-[a-f0-9]{24}$/u),
     });
-    await proxy.start();
-    proxies.push(proxy);
-    expect(new URL(await proxy.start()).hostname).toBe("proxy");
+    expect(state.opens[0]?.sessionId).not.toContain(binding.runId);
   });
 
-  it.each([
-    ["http://127.0.0.1/private", "browser_proxy_scheme_denied"],
-    ["file:///etc/passwd", "browser_proxy_scheme_denied"],
-    ["http://example.com:8080/", "browser_proxy_port_denied"],
-    ["http://user:secret@example.com/", "browser_proxy_credentials_denied"],
-  ])("rejects unsupported absolute target %s", async (target) => {
-    let connects = 0;
-    const { port } = await makeProxy({
-      connectTo: () => {
-        connects++;
-        return new FakeUpstream();
-      },
+  it("passes only structured CLI arguments and explicit resource limits to the executor", async () => {
+    const state = setup();
+    await state.bridge.execute(binding, { type: "open", url: "https://example.com/" });
+    await state.bridge.execute(binding, { type: "snapshot" });
+
+    expect(state.calls[0]).toMatchObject({
+      args: ["--json", "--session", state.opens[0]?.sessionId, "open", "https://example.com/"],
+      limits: { timeoutMs: 7000, maxOutputChars: 1200, maxArtifactBytes: 4096 },
     });
-    const response = await sendProxyRequest(
-      port,
-      `GET ${target} HTTP/1.1\r\nHost: example.com\r\n\r\n`,
-    );
-    expect(response).toContain("403 Forbidden");
-    expect(connects).toBe(0);
+    expect(state.calls[3]?.args).toEqual([
+      "--json",
+      "--session",
+      state.opens[0]?.sessionId,
+      "snapshot",
+    ]);
+    expect(state.calls[3]?.limits).toEqual(state.calls[0]?.limits);
   });
 
-  it("rejects every private DNS answer before opening an upstream connection", async () => {
-    let connects = 0;
-    const { port } = await makeProxy({
-      resolveHost: async () => ["93.184.215.14", "10.0.0.5"],
-      connectTo: () => {
-        connects++;
-        return new FakeUpstream();
-      },
-    });
-    const response = await sendProxyRequest(
-      port,
-      "GET http://example.com/private HTTP/1.1\r\nHost: example.com\r\n\r\n",
+  it("isolates executor sessions by Run, Principal, and purpose", async () => {
+    const state = setup();
+    await state.bridge.execute(binding, { type: "open", url: "https://example.com/" });
+    await state.bridge.execute(
+      { ...binding, runId: "run-2" },
+      { type: "open", url: "https://example.com/" },
     );
-    expect(response).toContain("403 Forbidden");
-    expect(connects).toBe(0);
+    await state.bridge.execute(
+      { ...binding, purpose: "fallback" },
+      { type: "open", url: "https://example.com/" },
+    );
+    await state.bridge.execute(
+      { ...binding, principalId: "owner-2" },
+      { type: "open", url: "https://example.com/" },
+    );
+
+    expect(new Set(state.opens.map(({ sessionId }) => sessionId)).size).toBe(4);
+    expect(
+      state.opens.map(({ binding: opened }) => [
+        opened.runId,
+        opened.principalId,
+        opened.purpose ?? "tool",
+      ]),
+    ).toEqual([
+      ["run-1", "owner-1", "tool"],
+      ["run-2", "owner-1", "tool"],
+      ["run-1", "owner-1", "fallback"],
+      ["run-1", "owner-2", "tool"],
+    ]);
   });
 
-  it("connects HTTP to a checked DNS address and rewrites absolute-form requests", async () => {
-    const dialed: Array<[string, number]> = [];
-    let upstream: FakeUpstream | undefined;
-    const { port } = await makeProxy({
-      connectTo: (address, targetPort) => {
-        dialed.push([address, targetPort]);
-        upstream = new FakeUpstream();
-        queueMicrotask(() => upstream?.emit("connect"));
-        return upstream;
-      },
-    });
-    const response = await sendProxyRequest(
-      port,
-      "GET http://example.com/article?q=1 HTTP/1.1\r\nHost: attacker.invalid\r\nProxy-Authorization: secret\r\n\r\n",
+  it("does not reuse an executor session after the bound policy version changes", async () => {
+    const state = setup();
+    await state.bridge.execute(binding, { type: "open", url: "https://example.com/" });
+    await state.bridge.execute(
+      { ...binding, policyVersion: "policy-8" },
+      { type: "open", url: "https://example.com/" },
     );
-    expect(response).toContain("200 OK");
-    expect(dialed).toEqual([["93.184.215.14", 80]]);
-    expect(upstream?.written).toContain("GET /article?q=1 HTTP/1.1");
-    expect(upstream?.written).toContain("Host: example.com");
-    expect(upstream?.written).not.toContain("Proxy-Authorization");
+
+    expect(state.opens).toHaveLength(2);
+    expect(state.opens[0]?.sessionId).not.toBe(state.opens[1]?.sessionId);
+    expect(state.opens.map(({ binding: opened }) => opened.policyVersion)).toEqual([
+      "policy-7",
+      "policy-8",
+    ]);
   });
 
-  it("checks CONNECT host and port and pins its socket to a verified IP", async () => {
-    const dialed: Array<[string, number]> = [];
-    const { port } = await makeProxy({
-      connectTo: (address, targetPort) => {
-        dialed.push([address, targetPort]);
-        const upstream = new FakeUpstream();
-        queueMicrotask(() => upstream.emit("connect"));
-        return upstream;
-      },
-    });
-    const response = await sendProxyRequest(
-      port,
-      "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
-    );
-    expect(response).toContain("200 Connection Established");
-    expect(dialed).toEqual([["93.184.215.14", 443]]);
+  it("does not acquire executor resources when authorization denies the operation", async () => {
+    const state = setup({ allow: false });
+    await expect(
+      state.bridge.execute(binding, { type: "open", url: "https://example.com/" }),
+    ).rejects.toThrow("browser_denied");
+
+    expect(state.opens).toHaveLength(0);
+    expect(state.calls).toHaveLength(0);
   });
 
-  it.each([
-    "127.0.0.1:443",
-    "example.com:22",
-    "example.com:65536",
-    "example.com:80",
-    "example.com:80x",
-  ])("rejects unsafe CONNECT target %s", async (target) => {
-    let connects = 0;
-    const { port } = await makeProxy({
-      connectTo: () => {
-        connects++;
-        return new FakeUpstream();
-      },
+  it("rejects executor artifacts over the configured byte limit", async () => {
+    const state = setup({
+      result: (args) =>
+        args[3] === "screenshot"
+          ? {
+              exitCode: 0,
+              stdout: JSON.stringify({ success: true, data: { captured: true } }),
+              stderr: "",
+              artifact: { id: "artifact-1", mimeType: "image/png", sizeBytes: 4097 },
+            }
+          : undefined,
     });
-    const response = await sendProxyRequest(
-      port,
-      `CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\n\r\n`,
+    await state.bridge.execute(binding, { type: "open", url: "https://example.com/" });
+
+    await expect(state.bridge.execute(binding, { type: "screenshot" })).rejects.toThrow(
+      "browser_artifact_invalid",
     );
-    expect(response).toContain("403 Forbidden");
-    expect(connects).toBe(0);
+    await state.bridge.cleanup(binding);
+    expect(state.closeCount).toBe(1);
   });
 
-  it("does not resolve the destination again when dialing an IP literal", async () => {
-    let resolveCalls = 0;
-    const dialed: string[] = [];
-    const { port } = await makeProxy({
-      resolveHost: async () => {
-        resolveCalls++;
-        return ["93.184.215.14"];
-      },
-      connectTo: (address) => {
-        dialed.push(address);
-        const upstream = new FakeUpstream();
-        queueMicrotask(() => upstream.emit("connect"));
-        return upstream;
-      },
-    });
-    const response = await sendProxyRequest(
-      port,
-      "CONNECT 93.184.215.14:443 HTTP/1.1\r\nHost: 93.184.215.14:443\r\n\r\n",
-    );
-    expect(response).toContain("200 Connection Established");
-    expect(resolveCalls).toBe(0);
-    expect(dialed).toEqual(["93.184.215.14"]);
+  it("closes the execution session on explicit close and cancels it on run cleanup", async () => {
+    const explicit = setup();
+    await explicit.bridge.execute(binding, { type: "open", url: "https://example.com/" });
+    await explicit.bridge.execute(binding, { type: "close" });
+    expect(explicit.closeCount).toBe(1);
+    expect(explicit.cancelCount).toBe(0);
+
+    const cleanup = setup();
+    await cleanup.bridge.execute(binding, { type: "open", url: "https://example.com/" });
+    await cleanup.bridge.cleanup(binding);
+    expect(cleanup.cancelCount).toBe(1);
+    expect(cleanup.closeCount).toBe(1);
   });
 
-  it("uses the system resolver once and dials the validated DNS literal", async () => {
-    lookupMock.mockResolvedValue([{ address: "93.184.215.14", family: 4 }]);
-    const dialed: string[] = [];
-    const { port } = await makeProxy({
-      resolveHost: undefined,
-      connectTo: (address) => {
-        dialed.push(address);
-        const upstream = new FakeUpstream();
-        queueMicrotask(() => upstream.emit("connect"));
-        return upstream;
+  it("disposes a session after a failed initial browser command", async () => {
+    let failOpen = true;
+    const state = setup({
+      result: (args) => {
+        if (args[3] === "open" && failOpen) {
+          failOpen = false;
+          return { exitCode: 1, stdout: "", stderr: "executor failed" };
+        }
+        return undefined;
       },
     });
-    const response = await sendProxyRequest(
-      port,
-      "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
-    );
-    expect(response).toContain("200 Connection Established");
-    expect(lookupMock).toHaveBeenCalledTimes(1);
-    expect(lookupMock).toHaveBeenCalledWith("example.com", { all: true, verbatim: true });
-    expect(dialed).toEqual(["93.184.215.14"]);
+
+    await expect(
+      state.bridge.execute(binding, { type: "open", url: "https://example.com/" }),
+    ).rejects.toThrow("browser_cli_failed");
+    expect(state.cancelCount).toBe(1);
+    expect(state.closeCount).toBe(1);
+    await state.bridge.execute(binding, { type: "open", url: "https://example.com/" });
+    expect(state.opens).toHaveLength(2);
   });
 });

@@ -1,394 +1,377 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
-import {
-  BrowserBridge,
-  type BrowserAuthorizer,
-  type BrowserCliExecutionContext,
-  type BrowserCliRunner,
-} from "./browser-bridge.js";
+import { describe, expect, it, vi } from "vitest";
+import { BrowserBridge, type BrowserAction, type BrowserAuthorizer } from "./browser-bridge.js";
+import type {
+  BrowserExecutionSession,
+  BrowserExecutorPort,
+  BrowserExecutorResult,
+} from "./browser-executor-port.js";
 import type { BrowserSessionBinding } from "./browser-session.js";
 
 const binding: BrowserSessionBinding = {
   runId: "run-1",
   principalId: "owner-1",
   conversationId: "conv-1",
+  workspaceId: "workspace-1",
+  policyVersion: "policy-4",
 };
 const publicResolver = async () => ["93.184.215.14"];
-const cleanupSessions: Array<() => Promise<void>> = [];
 
-afterEach(async () => {
-  for (const cleanup of cleanupSessions.splice(0)) await cleanup();
-});
-
-function setup(allow = true) {
+function setup(
+  options: { allow?: boolean; result?: (args: readonly string[]) => BrowserExecutorResult } = {},
+) {
   const calls: string[][] = [];
-  const contexts: BrowserCliExecutionContext[] = [];
-  const runner: BrowserCliRunner = vi.fn(async (args, _timeoutMs, context) => {
-    calls.push([...args]);
-    contexts.push(context);
-    return {
-      code: 0,
-      stdout: "snapshot result\n- Page URL: https://example.com/\n",
-      stderr: "",
-    };
+  const openedBindings: Array<{ binding: BrowserSessionBinding; sessionId: string }> = [];
+  const authorize = vi.fn<BrowserAuthorizer>(async () => options.allow ?? true);
+  let closeCount = 0;
+  let cancelCount = 0;
+  const execution: BrowserExecutionSession = {
+    execute: vi.fn(async (args) => {
+      calls.push([...args]);
+      const overridden = options.result?.(args);
+      if (overridden) return overridden;
+      if (args[3] === "get" && args[4] === "url")
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({ success: true, data: "https://example.com/" }),
+          stderr: "",
+        };
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          success: true,
+          data: { text: "ok", url: "https://example.com/" },
+        }),
+        stderr: "",
+      };
+    }),
+    cancel: vi.fn(async () => {
+      cancelCount++;
+    }),
+    close: vi.fn(async () => {
+      closeCount++;
+    }),
+  };
+  const executorOpen = vi.fn(async (sessionBinding: BrowserSessionBinding, sessionId: string) => {
+    openedBindings.push({ binding: sessionBinding, sessionId });
+    return execution;
   });
-  const boundSessions = new Map<string, BrowserSessionBinding>();
-  const authorize = vi.fn<BrowserAuthorizer>(async (session) => {
-    boundSessions.set(JSON.stringify(session), session);
-    return allow;
-  });
-  let proxyNumber = 0;
-  const proxyFactory = vi.fn(() => {
-    const proxyServer = `http://proxy:${++proxyNumber}`;
-    return { start: async () => proxyServer, close: vi.fn(async () => undefined) };
-  });
+  const executor: BrowserExecutorPort = { open: executorOpen };
   const bridge = new BrowserBridge({
     authorize,
-    runner,
-    proxyFactory,
+    executor,
     resolveHost: publicResolver,
-    maxOutputChars: 8,
+    maxOutputChars: 80,
   });
-  cleanupSessions.push(async () => {
-    for (const session of boundSessions.values()) await bridge.cleanup(session);
-  });
-  return { bridge, calls, contexts, authorize, runner, proxyFactory };
+  return {
+    bridge,
+    calls,
+    authorize,
+    executor,
+    executorOpen,
+    execution,
+    openedBindings,
+    get closeCount() {
+      return closeCount;
+    },
+    get cancelCount() {
+      return cancelCount;
+    },
+  };
 }
 
-describe("Playwright CLI bridge", () => {
-  it("builds argv from an action allowlist and bounds returned output", async () => {
-    const { bridge, calls, contexts, authorize } = setup();
-    await bridge.execute(binding, { type: "open", url: "https://example.com/" });
-    const result = await bridge.execute(binding, {
-      type: "fill",
-      ref: "e4",
-      value: "text; stays one argument",
+describe("agent-browser 0.38.1 bridge", () => {
+  it("maps product actions to fixed JSON argv and binds the executor to workspace policy", async () => {
+    const state = setup();
+    await state.bridge.execute(binding, { type: "open", url: "https://example.com/" });
+    const snapshot = await state.bridge.execute(binding, {
+      type: "snapshot",
+      interactive: true,
+      depth: 4,
     });
-    expect(calls[0]).toEqual([
-      expect.stringMatching(/^-s=gb-[a-f0-9]{24}$/u),
+    expect(state.calls[0]).toEqual([
+      "--json",
+      "--session",
+      expect.stringMatching(/^gb-[a-f0-9]{24}$/u),
       "open",
       "https://example.com/",
     ]);
-    expect(calls[1]).toEqual([calls[0]![0], "fill", "e4", "text; stays one argument"]);
-    expect(contexts[0]).toEqual({ proxyServer: "http://proxy:1" });
-    expect(contexts[1]).toEqual(contexts[0]);
-    expect(result).toEqual({ output: "snapshot", truncated: true });
-    expect(authorize.mock.calls.map((call) => call.slice(1))).toEqual([
-      ["browser.read", "open"],
-      ["browser.interact", "fill"],
+    expect(state.calls[3]?.slice(0, 3)).toEqual(["--json", "--session", state.calls[0]?.[2]]);
+    expect(state.calls[3]?.slice(3)).toEqual(["snapshot", "-i", "-d", "4"]);
+    expect(state.openedBindings[0]).toMatchObject({ binding, sessionId: state.calls[0]?.[2] });
+    expect(snapshot.output).toBe(JSON.stringify({ text: "ok", url: "https://example.com/" }));
+  });
+
+  it("separates tool and fallback sessions under the same run and workspace", async () => {
+    const state = setup();
+    await state.bridge.execute(binding, { type: "open", url: "https://example.com/" });
+    await state.bridge.execute(
+      { ...binding, purpose: "fallback" },
+      { type: "open", url: "https://example.com/" },
+    );
+    expect(state.calls[0]?.[2]).not.toBe(state.calls[2]?.[2]);
+    expect(state.openedBindings.map(({ binding: opened }) => opened.purpose)).toEqual([
+      "tool",
+      "fallback",
     ]);
+    await state.bridge.cleanup(binding);
+    await state.bridge.cleanup({ ...binding, purpose: "fallback" });
   });
 
-  it("checks each explicit navigation target with the network guard", async () => {
-    const { bridge, calls } = setup();
+  it("requires a successful versioned JSON envelope even when the executor exits zero", async () => {
+    let getUrlCount = 0;
+    const state = setup({
+      result: (args) => {
+        if (args[3] === "open" || (args[3] === "get" && args[4] === "url" && getUrlCount++ < 2))
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({ success: true, data: { url: "https://example.com/" } }),
+            stderr: "",
+          };
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            success: false,
+            error: "bad selector",
+            code: "selector_not_found",
+          }),
+          stderr: "",
+        };
+      },
+    });
+    await state.bridge.execute(binding, { type: "open", url: "https://example.com/" });
+    await expect(state.bridge.execute(binding, { type: "get", kind: "url" })).rejects.toThrow(
+      "browser_cli_selector_not_found",
+    );
+    const invalid = setup({ result: () => ({ exitCode: 0, stdout: "not json", stderr: "" }) });
     await expect(
-      bridge.execute(binding, { type: "open", url: "http://127.0.0.1/private" }),
-    ).rejects.toThrow("web_target_non_public");
-    expect(calls).toHaveLength(0);
-    await bridge.execute(binding, { type: "open", url: "https://example.com/" });
-    await expect(
-      bridge.execute(binding, { type: "goto", url: "http://10.0.0.1/" }),
-    ).rejects.toThrow("web_target_non_public");
-    expect(calls).toHaveLength(1);
+      invalid.bridge.execute(binding, { type: "open", url: "https://example.com/" }),
+    ).rejects.toThrow("browser_cli_invalid_json");
   });
 
-  it.each([
-    ["http://169.254.169.254/", "redirect target"],
-    ["file:///etc/passwd", "file page"],
-    ["javascript:alert(1)", "non-http page"],
-  ])("rejects a successful CLI result that reports a %s", async (pageUrl) => {
-    const runner: BrowserCliRunner = async () => ({
-      code: 0,
-      stdout: `### Page\n- Page URL: ${pageUrl}\n- Page Title: unsafe\n`,
-      stderr: "",
-    });
-    const bridge = new BrowserBridge({
-      authorize: async () => true,
-      runner,
-      proxyFactory: () => ({
-        start: async () => "http://proxy:8765",
-        close: async () => undefined,
-      }),
-      resolveHost: publicResolver,
-    });
+  it("rejects CLI escapes and parameters outside the fixed product action set", async () => {
+    const state = setup();
+    for (const action of [
+      { type: "eval", code: "document.cookie" },
+      { type: "network_route", url: "*" },
+      { type: "config", args: ["--headed"] },
+    ] as unknown as BrowserAction[]) {
+      await expect(state.bridge.execute(binding, action)).rejects.toThrow(
+        "browser_action_not_allowed",
+      );
+    }
     await expect(
-      bridge.execute(binding, { type: "open", url: "https://example.com/" }),
-    ).rejects.toThrow("browser_result_target_denied");
+      state.bridge.execute(binding, { type: "press", key: "Enter;eval" }),
+    ).rejects.toThrow("browser_invalid_key");
+    await expect(
+      state.bridge.execute(binding, { type: "open", url: "file:///etc/passwd" }),
+    ).rejects.toThrow();
+    expect(state.executorOpen).not.toHaveBeenCalled();
   });
 
-  it("rejects private URLs reached by an interaction even when CLI returns code zero", async () => {
-    let invocation = 0;
-    const runner: BrowserCliRunner = async () => ({
-      code: 0,
-      stdout: `### Page\n- Page URL: ${++invocation === 1 ? "https://example.com/" : "http://10.0.0.8/admin"}\n`,
-      stderr: "",
+  it("rejects direct URL reads so redirects cannot bypass the active-page guard", async () => {
+    const state = setup();
+    await state.bridge.execute(binding, { type: "open", url: "https://example.com/" });
+    const before = state.calls.length;
+    await expect(
+      state.bridge.execute(binding, {
+        type: "read",
+        url: "https://example.com/redirect",
+      } as BrowserAction),
+    ).rejects.toThrow("browser_action_not_allowed");
+    expect(state.calls).toHaveLength(before);
+  });
+
+  it("checks the actual active URL after mutations and closes a failed initial open", async () => {
+    let currentUrl = "https://example.com/";
+    const state = setup({
+      result: (args) => {
+        if (args[3] === "get" && args[4] === "url")
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({ success: true, data: currentUrl }),
+            stderr: "",
+          };
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            success: true,
+            data: args[3] === "snapshot" ? "@e1 button" : {},
+          }),
+          stderr: "",
+        };
+      },
     });
-    const bridge = new BrowserBridge({
-      authorize: async () => true,
-      runner,
-      proxyFactory: () => ({
-        start: async () => "http://proxy:8765",
-        close: async () => undefined,
-      }),
-      resolveHost: publicResolver,
-    });
-    await bridge.execute(binding, { type: "open", url: "https://example.com/" });
-    await expect(bridge.execute(binding, { type: "click", ref: "e2" })).rejects.toThrow(
+    await state.bridge.execute(binding, { type: "open", url: "https://example.com/" });
+    await state.bridge.execute(binding, { type: "snapshot" });
+    currentUrl = "http://10.0.0.8/admin";
+    await expect(state.bridge.execute(binding, { type: "click", ref: "@e1" })).rejects.toThrow(
       "browser_result_target_denied",
     );
-  });
+    expect(state.cancelCount).toBe(1);
+    expect(state.closeCount).toBe(1);
+    await expect(state.bridge.execute(binding, { type: "read" })).rejects.toThrow(
+      "browser_session_not_open",
+    );
 
-  it("allows the explicit about:blank state for a newly created tab", async () => {
-    const runner: BrowserCliRunner = async () => ({
-      code: 0,
-      stdout: "### Page\n- Page URL: about:blank\n- Page Title: \n",
-      stderr: "",
-    });
-    const bridge = new BrowserBridge({
-      authorize: async () => true,
-      runner,
-      proxyFactory: () => ({
-        start: async () => "http://proxy:8765",
-        close: async () => undefined,
-      }),
-      resolveHost: publicResolver,
-    });
-    await bridge.execute(binding, { type: "open", url: "https://example.com/" });
-    await expect(bridge.execute(binding, { type: "tab_new" })).resolves.toMatchObject({
-      output: expect.stringContaining("about:blank"),
-    });
-  });
-
-  it("fails closed when a successful page action omits its final Page URL", async () => {
-    const runner: BrowserCliRunner = async () => ({
-      code: 0,
-      stdout: "action complete",
-      stderr: "",
-    });
-    const bridge = new BrowserBridge({
-      authorize: async () => true,
-      runner,
-      proxyFactory: () => ({
-        start: async () => "http://proxy:8765",
-        close: async () => undefined,
-      }),
-      resolveHost: publicResolver,
-    });
+    const failed = setup({ result: () => ({ exitCode: 0, stdout: "invalid", stderr: "" }) });
     await expect(
-      bridge.execute(binding, { type: "open", url: "https://example.com/" }),
-    ).rejects.toThrow("browser_result_page_url_missing");
+      failed.bridge.execute(binding, { type: "open", url: "https://example.com/" }),
+    ).rejects.toThrow("browser_cli_invalid_json");
+    expect(failed.closeCount).toBe(1);
+    expect(failed.cancelCount).toBe(1);
+    await expect(
+      failed.bridge.execute(binding, { type: "open", url: "https://example.com/" }),
+    ).rejects.toThrow("browser_cli_invalid_json");
   });
 
-  it("requires a fresh session for every Run and Principal binding", async () => {
-    const { bridge, calls } = setup();
-    await bridge.execute(binding, { type: "open", url: "https://example.com/" });
-    await bridge.execute(
-      { ...binding, runId: "run-2" },
-      { type: "open", url: "https://example.com/" },
+  it("closes the session when a navigation redirects to a private target", async () => {
+    let currentUrl = "https://example.com/";
+    let navigationCount = 0;
+    const state = setup({
+      result: (args) => {
+        if (args[3] === "open" && navigationCount++ > 0)
+          currentUrl = "http://169.254.169.254/latest/meta-data/";
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({ success: true, data: args[3] === "get" ? currentUrl : {} }),
+          stderr: "",
+        };
+      },
+    });
+    await state.bridge.execute(binding, { type: "open", url: "https://example.com/" });
+
+    await expect(
+      state.bridge.execute(binding, { type: "goto", url: "https://example.com/redirect" }),
+    ).rejects.toThrow("browser_result_target_denied");
+    expect(state.cancelCount).toBe(1);
+    expect(state.closeCount).toBe(1);
+    await expect(state.bridge.execute(binding, { type: "read" })).rejects.toThrow(
+      "browser_session_not_open",
     );
-    await bridge.execute(
-      { ...binding, principalId: "owner-2" },
-      { type: "open", url: "https://example.com/" },
-    );
-    expect(new Set(calls.map((call) => call[0])).size).toBe(3);
   });
 
-  it("denies actions before launching the CLI and separates read from interaction", async () => {
-    const { bridge, calls, authorize } = setup(false);
-    await expect(bridge.execute(binding, { type: "snapshot" })).rejects.toThrow("browser_denied");
-    await expect(bridge.execute(binding, { type: "click", ref: "e2" })).rejects.toThrow(
+  it("requires current snapshot refs and expires refs after mutation, navigation, and tab switch", async () => {
+    const state = setup({
+      result: (args) => ({
+        exitCode: 0,
+        stdout: JSON.stringify({
+          success: true,
+          data: args[3] === "snapshot" ? "@e1 [button] Submit" : { url: "https://example.com/" },
+        }),
+        stderr: "",
+      }),
+    });
+    await state.bridge.execute(binding, { type: "open", url: "https://example.com/" });
+    await expect(state.bridge.execute(binding, { type: "click", ref: "@e1" })).rejects.toThrow(
+      "browser_stale_ref",
+    );
+    await state.bridge.execute(binding, { type: "snapshot" });
+    await state.bridge.execute(binding, { type: "click", ref: "@e1" });
+    await expect(state.bridge.execute(binding, { type: "click", ref: "@e1" })).rejects.toThrow(
+      "browser_stale_ref",
+    );
+    await state.bridge.execute(binding, { type: "snapshot" });
+    await state.bridge.execute(binding, { type: "tab_select", tabId: "t2" });
+    await expect(state.bridge.execute(binding, { type: "click", ref: "@e1" })).rejects.toThrow(
+      "browser_stale_ref",
+    );
+  });
+
+  it("denies before opening the bound executor session", async () => {
+    const state = setup({ allow: false });
+    await expect(
+      state.bridge.execute(binding, { type: "open", url: "https://example.com/" }),
+    ).rejects.toThrow("browser_denied");
+    expect(state.executorOpen).not.toHaveBeenCalled();
+    expect(state.calls).toHaveLength(0);
+  });
+
+  it("cancels the live executor session when authorization is revoked", async () => {
+    const state = setup();
+    await state.bridge.execute(binding, { type: "open", url: "https://example.com/" });
+    state.authorize.mockResolvedValue(false);
+
+    await expect(state.bridge.execute(binding, { type: "snapshot" })).rejects.toThrow(
       "browser_denied",
     );
-    expect(authorize.mock.calls.map((call) => call[1])).toEqual([
-      "browser.read",
-      "browser.interact",
-    ]);
-    expect(calls).toHaveLength(0);
+    expect(state.cancelCount).toBe(1);
+    expect(state.closeCount).toBe(1);
+    expect(state.calls.some((args) => args[3] === "snapshot")).toBe(false);
   });
 
-  it("rejects unsupported payloads and action parameters before launch", async () => {
-    const { bridge, calls } = setup();
-    await expect(bridge.execute(binding, { type: "snapshot", depth: 99 })).rejects.toThrow(
-      "browser_invalid_depth",
-    );
-    await expect(bridge.execute(binding, { type: "click", ref: "--help" })).rejects.toThrow(
-      "browser_invalid_ref",
-    );
-    await expect(bridge.execute(binding, { type: "press", key: "Enter;run-code" })).rejects.toThrow(
-      "browser_invalid_key",
-    );
-    await expect(
-      bridge.execute(binding, { type: "fill", ref: "e2", value: "--submit" }),
-    ).rejects.toThrow("browser_invalid_text");
-    await expect(
-      bridge.execute(binding, { type: "run-code", code: "page.goto('file:///')" } as never),
-    ).rejects.toThrow("browser_action_not_allowed");
-    await expect(bridge.execute(binding, { type: "screenshot" })).rejects.toThrow(
-      "browser_action_unsupported_file_output",
-    );
-    await expect(bridge.execute(binding, { type: "response_body", index: 1 })).rejects.toThrow(
-      "browser_action_unsupported_file_output",
-    );
-    await expect(bridge.execute(binding, { type: "request_body", index: 1 })).rejects.toThrow(
-      "browser_action_unsupported_file_output",
-    );
-    await expect(bridge.execute(binding, { type: "download_observation" })).rejects.toThrow(
-      "browser_action_unsupported_download_observation",
-    );
-    await expect(
-      bridge.execute(binding, { type: "wait", condition: "selector", value: "#content" }),
-    ).rejects.toThrow("browser_action_unsupported_wait");
-    expect(calls).toHaveLength(0);
-  });
-
-  it("maps safe navigation, tab, console, request-header, and text actions to fixed argv", async () => {
-    const { bridge, calls, authorize } = setup();
-    await bridge.execute(binding, { type: "open", url: "https://example.com/" });
-    const actions = [
-      [{ type: "go_back" }, ["go-back"], "browser.read"],
-      [{ type: "go_forward" }, ["go-forward"], "browser.read"],
-      [{ type: "reload" }, ["reload"], "browser.read"],
-      [{ type: "tab_list" }, ["tab-list"], "browser.read"],
-      [{ type: "tab_new" }, ["tab-new"], "browser.interact"],
-      [{ type: "tab_select", index: 2 }, ["tab-select", "2"], "browser.interact"],
-      [{ type: "tab_close", index: 3 }, ["tab-close", "3"], "browser.interact"],
-      [{ type: "console", level: "warning" }, ["console", "warning"], "browser.read"],
-      [{ type: "requests" }, ["requests"], "browser.read"],
-      [{ type: "request_headers", index: 4 }, ["request-headers", "4"], "browser.read"],
-      [{ type: "response_headers", index: 5 }, ["response-headers", "5"], "browser.read"],
-      [
-        { type: "type", text: "hello; still one argument" },
-        ["type", "hello; still one argument"],
-        "browser.interact",
-      ],
-    ] as const;
-
-    for (const [action, expectedArgs] of actions) {
-      await bridge.execute(binding, action as never);
-      expect(calls.at(-1)?.slice(1)).toEqual(expectedArgs);
-    }
-    expect(authorize.mock.calls.slice(1).map((call) => call[1])).toEqual(
-      actions.map(([, , capability]) => capability),
-    );
-  });
-
-  it("rejects invalid tab, request, and console parameters", async () => {
-    const { bridge, calls } = setup();
-    await expect(bridge.execute(binding, { type: "tab_select", index: 100 })).rejects.toThrow(
-      "browser_invalid_tab_index",
-    );
-    await expect(bridge.execute(binding, { type: "request_headers", index: 1001 })).rejects.toThrow(
-      "browser_invalid_request_index",
-    );
-    await expect(
-      bridge.execute(binding, { type: "console", level: "--raw" } as never),
-    ).rejects.toThrow("browser_invalid_console_level");
-    expect(calls).toHaveLength(0);
-  });
-
-  it("requires an opened session for reads and interactions and closes only its session", async () => {
-    const { bridge, calls } = setup();
-    await expect(bridge.execute(binding, { type: "snapshot" })).rejects.toThrow(
-      "browser_session_not_open",
-    );
-    await bridge.execute(binding, { type: "open", url: "https://example.com/" });
-    const cliSession = calls[0]![0];
-    await bridge.cleanup(binding);
-    expect(calls[1]).toEqual([cliSession, "close"]);
-    await expect(bridge.execute(binding, { type: "snapshot" })).rejects.toThrow(
-      "browser_session_not_open",
-    );
-  });
-
-  it("authorizes close as an interaction and releases the session resources", async () => {
-    const { bridge, calls, authorize, proxyFactory } = setup();
-    await bridge.execute(binding, { type: "open", url: "https://example.com/" });
-    await bridge.execute(binding, { type: "close" });
-    expect(calls.map((call) => call[1])).toEqual(["open", "close"]);
-    expect(authorize.mock.calls.at(-1)?.slice(1)).toEqual(["browser.interact", "close"]);
-    expect(proxyFactory.mock.results[0]?.value.close).toHaveBeenCalledOnce();
-    await expect(bridge.execute(binding, { type: "snapshot" })).rejects.toThrow(
-      "browser_session_not_open",
-    );
-  });
-
-  it("keeps a possibly started session available for cleanup after CLI failure", async () => {
-    let first = true;
-    const runner: BrowserCliRunner = async () => {
-      if (first) {
-        first = false;
-        return { code: 1, stdout: "", stderr: "failure" };
-      }
-      return { code: 0, stdout: "### Page\n- Page URL: https://example.com/\n", stderr: "" };
-    };
-    const bridge = new BrowserBridge({
-      authorize: async () => true,
-      runner,
-      proxyFactory: () => ({
-        start: async () => "http://proxy:8765",
-        close: async () => undefined,
-      }),
-      resolveHost: publicResolver,
+  it("returns screenshot artifacts by reference without exposing executor host paths", async () => {
+    const state = setup({
+      result: (args) =>
+        args[3] === "get" && args[4] === "url"
+          ? {
+              exitCode: 0,
+              stdout: JSON.stringify({ success: true, data: "https://example.com/" }),
+              stderr: "",
+            }
+          : {
+              exitCode: 0,
+              stdout: JSON.stringify({
+                success: true,
+                data: { path: "/private/host/tmp/capture.png" },
+              }),
+              stderr: "",
+              artifact: { id: "artifact-22", mimeType: "image/png", sizeBytes: 1234 },
+            },
     });
-    await expect(
-      bridge.execute(binding, { type: "open", url: "https://example.com/" }),
-    ).rejects.toThrow("browser_cli_failed");
-    await expect(
-      bridge.execute(binding, { type: "open", url: "https://example.com/" }),
-    ).rejects.toThrow("browser_session_already_open");
-    await bridge.cleanup(binding);
+    await state.bridge.execute(binding, { type: "open", url: "https://example.com/" });
+    const result = await state.bridge.execute(binding, { type: "screenshot" });
+    expect(result.artifact).toEqual({ id: "artifact-22", mimeType: "image/png", sizeBytes: 1234 });
+    expect(result.output).not.toContain("/private/host");
   });
 
-  it("always releases proxy resources and forgets the session when cleanup fails", async () => {
-    let failClose = true;
-    const calls: string[][] = [];
-    let proxyClosed = false;
-    const runner: BrowserCliRunner = async (args) => {
-      calls.push([...args]);
-      if (args[1] === "close" && failClose) {
-        failClose = false;
-        return { code: 1, stdout: "", stderr: "failure" };
-      }
-      return { code: 0, stdout: "### Page\n- Page URL: https://example.com/\n", stderr: "" };
-    };
-    const bridge = new BrowserBridge({
-      authorize: async () => true,
-      runner,
-      proxyFactory: () => ({
-        start: async () => "http://proxy:8765",
-        close: async () => {
-          proxyClosed = true;
-        },
-      }),
-      resolveHost: publicResolver,
+  it("redacts credential headers and bounds network inspection output", async () => {
+    const state = setup({
+      result: (args) =>
+        args[3] === "network"
+          ? {
+              exitCode: 0,
+              stdout: JSON.stringify({
+                success: true,
+                data: {
+                  headers: [
+                    { name: "Authorization", value: "Bearer secret" },
+                    { name: "Cookie", value: "sid=private" },
+                    { name: "Accept", value: "*/*" },
+                  ],
+                  body: "x".repeat(300),
+                },
+              }),
+              stderr: "",
+            }
+          : {
+              exitCode: 0,
+              stdout: JSON.stringify({ success: true, data: "https://example.com/" }),
+              stderr: "",
+            },
     });
-    await bridge.execute(binding, { type: "open", url: "https://example.com/" });
-    await expect(bridge.cleanup(binding)).rejects.toThrow("browser_cleanup_failed");
-    await bridge.cleanup(binding);
-    expect(proxyClosed).toBe(true);
-    expect(calls.map((call) => call[1])).toEqual(["open", "close"]);
+    await state.bridge.execute(binding, { type: "open", url: "https://example.com/" });
+    const result = await state.bridge.execute(binding, {
+      type: "network_request",
+      requestId: "req-1",
+    });
+    expect(result.output).toContain("[redacted]");
+    expect(result.output).not.toContain("Bearer secret");
+    expect(result.output.length).toBeLessThanOrEqual(80);
+    expect(result.truncated).toBe(true);
   });
 
-  it("releases proxy resources and forgets the session when the CLI close call throws", async () => {
-    let proxyClosed = false;
-    const runner: BrowserCliRunner = async (args) => {
-      if (args[1] === "close") throw new Error("runner disconnected");
-      return { code: 0, stdout: "### Page\n- Page URL: https://example.com/\n", stderr: "" };
-    };
-    const bridge = new BrowserBridge({
-      authorize: async () => true,
-      runner,
-      proxyFactory: () => ({
-        start: async () => "http://proxy:8765",
-        close: async () => {
-          proxyClosed = true;
-        },
-      }),
-      resolveHost: publicResolver,
-    });
-    await bridge.execute(binding, { type: "open", url: "https://example.com/" });
-    await expect(bridge.cleanup(binding)).rejects.toThrow("runner disconnected");
-    expect(proxyClosed).toBe(true);
-    await expect(bridge.execute(binding, { type: "snapshot" })).rejects.toThrow(
+  it("closes and forgets its bound executor session during explicit close and cleanup", async () => {
+    const explicit = setup();
+    await explicit.bridge.execute(binding, { type: "open", url: "https://example.com/" });
+    await explicit.bridge.execute(binding, { type: "close" });
+    expect(explicit.closeCount).toBe(1);
+
+    const cleanup = setup();
+    await cleanup.bridge.execute(binding, { type: "open", url: "https://example.com/" });
+    await cleanup.bridge.cleanup(binding);
+    expect(cleanup.cancelCount).toBe(1);
+    expect(cleanup.closeCount).toBe(1);
+    await expect(cleanup.bridge.execute(binding, { type: "snapshot" })).rejects.toThrow(
       "browser_session_not_open",
     );
   });

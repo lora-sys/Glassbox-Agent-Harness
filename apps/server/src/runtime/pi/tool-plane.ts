@@ -38,7 +38,7 @@ import { OWNER_GROUP_ADMIN_TOOL } from "./owner-tools.js";
 import { OPS_TOOL_NAMES } from "./ops-tools.js";
 import { SKILL_READ_TOOL } from "./skill-tools.js";
 import { WEB_FETCH_TOOL, WEB_SEARCH_TOOL } from "./web-tools.js";
-import { PLAYWRIGHT_CLI_TOOL } from "./browser-tools.js";
+import { BROWSER_TOOL } from "./browser-tools.js";
 import {
   MEMORY_GOVERN_ACTION,
   MEMORY_READ_ACTION,
@@ -316,11 +316,11 @@ const OPS_TOOL_DESCRIPTORS: readonly ToolDescriptor[] = Object.freeze(
 
 const DOMAIN_TOOL_DESCRIPTORS: readonly ToolDescriptor[] = Object.freeze([
   {
-    name: PLAYWRIGHT_CLI_TOOL,
+    name: BROWSER_TOOL,
     origin: "glassbox_domain",
-    schemaVersion: "playwright-cli-v1",
+    schemaVersion: "agent-browser-v1",
     riskClass: "moderate",
-    provider: "isolated-playwright-cli",
+    provider: "agent-browser",
     discovery: "group_policy",
     authorization: { action: ["browser:read", "browser:interact"], resource: "web-public" },
     availability: "provider_probe",
@@ -823,6 +823,7 @@ export function toolOutcomeFromFailure(code: string): ToolExecutionOutcome {
     case "authorization_denied":
     case "capability_category_disabled":
     case "context_missing":
+    case "mutation_already_attempted":
     case "provider_denied":
       return "denied";
     case "input_validation_failed":

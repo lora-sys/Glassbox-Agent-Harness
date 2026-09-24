@@ -23,12 +23,12 @@ docs/data-observability.md
   persistence, storage, observability
 ```
 
-The current implementation order comes from the intentionally parallel `.plans/04a-memory-taste.md` and `.plans/04b-authorized-retrieval-history.md`. P3 is complete and remains the trust / QQ / Agent Ops foundation.
+P3, P4A, and P4B are complete. Before the next product phase, the repository engineering work follows `.plans/phase-transition-repository-refactor.md` and Issue #21. This plan does not implement P5 product behavior.
 
 ## Runtime and language
 
 ```text
-Node.js 22+
+Node.js 24.12.0+
 TypeScript
 ES modules
 ```
@@ -61,8 +61,10 @@ The configured local Personal Agent environment has one service command surface:
     npm run agent:logs
     npm run agent:down
 
-On Windows, do not start the long-running service with `vp run agent:up`. Vite+ terminates its
-detached service child when the task exits. The npm scripts invoke the service manager directly.
+Use the `npm` commands or invoke `node --import tsx scripts/agent-service.mts <command>`
+directly. On Windows, do not use `vp run agent:up` for the long-lived service manager. Vite+
+cleans detached descendants when its task exits, so the npm scripts or direct Node invocation
+must launch the service process.
 
 agent:up reads optional Herdr, NapCat and Glassbox launch settings from
 <GLASSBOX_DATA_DIR>/service-launch.json. Without that environment variable, it uses
@@ -78,7 +80,9 @@ If NapCat reports that its saved quick-login state has expired, keep the one `ag
 
 The service file accepts only the documented non-secret environment keys.
 
-The service manager launches fixed executables without a shell. It records process identity in the data directory and verifies it before shutdown. Named Herdr sessions use Herdr's public session status and stop commands.
+The service manager launches fixed executables without a shell. It records process identity in the
+data directory and verifies it before shutdown. Named Herdr sessions use Herdr's public session
+status and stop commands.
 
 The `glassbox` CLI and `agent:up` use the same service data directory. By default both use
 `~/.glassbox` and port 3030. Set `GLASSBOX_DATA_DIR` and `PORT` to the same values as the
@@ -434,15 +438,25 @@ Required repository checks:
 
 ```text
 vp run verify:commit
+vp run verify:full
 vp run test:unit
 vp run test:e2e
 vp run test:regression
 ```
 
 `vp run verify:commit` is the required pre-commit gate. Vite+ installs the repository-owned
-`.vite-hooks/pre-commit` dispatcher during `vp install`. The gate checks staged formatting,
-core lint and types, all deterministic unit tests, the P3 end-to-end suite, focused
-regressions, and the web build. It also rejects deleted tests and newly disabled tests.
+`.vite-hooks/pre-commit` dispatcher during `vp install`. The gate checks staged files and test
+integrity, then uses Vitest's changed dependency graph for ordinary changes. Shared contracts,
+authorization, persistence, runtime setup, test/build configuration, validation scripts,
+deletions, renames, and unknown areas run the full unit suite. Test deletion, disabled tests,
+and reduced test declaration counts are rejected.
+
+`vp run verify:full` is the full acceptance gate. It runs core lint and types, validation-selector
+tests, the deterministic unit suite once, and the web build. `test:e2e` and `test:regression`
+remain targeted commands for their listed cases. Their test files are included in `test:unit`,
+so the full gate does not run those suites a second time. The commit gate reports changed paths,
+test scope, and fallback reasons. Successful results are reused only for an identical recorded
+input fingerprint; uncertain inputs always run tests.
 
 The `packageManager` field records the package-manager backend used by `vp install`. It does
 not change the repository command surface. Developers use `vp` directly.

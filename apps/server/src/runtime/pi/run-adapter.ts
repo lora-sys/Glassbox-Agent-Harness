@@ -20,6 +20,7 @@ import { OWNER_MEMORY_ADMIN_TOOL } from "./owner-memory-tools.js";
 import {
   asksLiveQqFact,
   groupHistorySearchRequested,
+  groupHistorySearchSender,
   namedGroupId,
   ownerHistorySearchRequested,
   requestClauses,
@@ -401,6 +402,11 @@ export type RunEvidenceRecord =
       /** The mutating Tool the message requires, when it requires one. */
       requiredToolName?: string;
       requiredToolInput?: Record<string, unknown>;
+      /** Safe rejection metadata for an explicit mutation that cannot be bound to exact inputs. */
+      blockedMutation?: {
+        operation: string;
+        reason: "incomplete_parameters" | "not_permitted_in_group";
+      };
     }
   | {
       type: "tool_evidence";
@@ -461,17 +467,38 @@ function requiredToolCall(
   authorizedToolNames?: readonly string[],
 ): RequiredToolCall | undefined {
   if (input.caller.scope.chatType === "group") {
-    if (!groupHistorySearchRequested(input.text) && !groupHistorySearchFollowUpRequested(input))
+    if (groupHistorySearchRequested(input.text) || groupHistorySearchFollowUpRequested(input)) {
+      // A single segmented identifier is a literal query, not prose for the model to reinterpret.
+      // Bind it into the required input so a call for a different value cannot satisfy this Run.
+      // Bare digit runs are excluded because they can name a sender rather than message text.
+      const identifiers = exactTerms(requestClauses(input.text)).filter((term) =>
+        /[a-z]/iu.test(term),
+      );
+      const sender = groupHistorySearchSender(input.text);
+      return {
+        name: GROUP_HISTORY_SEARCH_TOOL,
+        input: {
+          ...(identifiers.length === 1 ? { query: identifiers[0] } : {}),
+          ...(sender ? { sender } : {}),
+        },
+      };
+    }
+    const text = requestClauses(input.text);
+    const mutation = MUTATION_REQUESTS.find((entry) => entry.words.test(text));
+    if (!mutation) return undefined;
+    const params = mutation.params(text);
+    if (params === undefined) return undefined;
+    // Group-native roles get only the explicit local subset. `set_group_admin` and file writes
+    // remain Glassbox Owner-private even when the current QQ sender is a group owner.
+    if (mutation.operation === "set_group_admin" || mutation.tool === "qq_group_file_ops")
       return undefined;
-    // A single segmented identifier is a literal query, not prose for the model to reinterpret.
-    // Bind it into the required input so a call for a different value cannot satisfy this Run.
-    // Bare digit runs are excluded because they can name a sender rather than message text.
-    const identifiers = exactTerms(requestClauses(input.text)).filter((term) =>
-      /[a-z]/iu.test(term),
-    );
     return {
-      name: GROUP_HISTORY_SEARCH_TOOL,
-      input: identifiers.length === 1 ? { query: identifiers[0] } : {},
+      name: mutation.tool === "qq_group_settings" ? "qq_group_local_settings" : mutation.tool,
+      input: {
+        groupId: input.caller.scope.chatId,
+        operation: mutation.operation,
+        params,
+      },
     };
   }
   // Everything below is the Owner-private surface. A management Tool is never required
@@ -569,6 +596,38 @@ function requiredToolCall(
   };
 }
 
+interface BlockedMutation {
+  operation: string;
+  reason: "incomplete_parameters" | "not_permitted_in_group";
+}
+
+/**
+ * A mutation is explicit only when the current request uses command syntax. This prevents
+ * explanatory questions and quoted capability descriptions from being treated as actions.
+ */
+function blockedMutationRequest(
+  input: ExecutionInput,
+  isOwner: boolean,
+): BlockedMutation | undefined {
+  const text = requestClauses(input.text).trim();
+  if (!text) return undefined;
+  const command =
+    /^(?:(?:请|麻烦|帮我|马上|现在)\s*)?(?:(?:把|将)\s*|全员禁言|全体禁言|禁言|闭嘴|踢出|踢掉|踢人|踢了|移出群|新建文件夹|建文件夹|创建文件夹|删除文件|删文件|改名)/u;
+  if (!command.test(text)) return undefined;
+  const mutation = MUTATION_REQUESTS.find((entry) => entry.words.test(text));
+  if (!mutation) return undefined;
+  if (mutation.params(text) === undefined)
+    return { operation: mutation.operation, reason: "incomplete_parameters" };
+  if (
+    input.caller.scope.chatType === "group" &&
+    (mutation.operation === "set_group_admin" || mutation.tool === "qq_group_file_ops")
+  )
+    return { operation: mutation.operation, reason: "not_permitted_in_group" };
+  if (input.caller.scope.chatType === "private" && isOwner && namedGroupId(text) === undefined)
+    return { operation: mutation.operation, reason: "incomplete_parameters" };
+  return undefined;
+}
+
 function recreatedPrompt(input: ExecutionInput): string {
   if (input.history.length === 0) return input.text;
   const history = input.history
@@ -586,10 +645,29 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
   ) {}
 
   async execute(input: ExecutionInput): Promise<ExecutionResult> {
-    await this.runtime.initialize();
     const isOwner = this.options.isOwner
       ? await this.options.isOwner(input)
       : input.caller.principalId === "owner";
+    const blockedMutation = blockedMutationRequest(input, isOwner);
+    if (blockedMutation) {
+      await this.recordEvidence({
+        type: "tool_evidence",
+        runId: input.run.id,
+        conversationId: input.conversation.id,
+        principalId: input.caller.principalId,
+        phase: "required",
+        required: [],
+        blockedMutation,
+      });
+      return {
+        status: "failed",
+        text:
+          blockedMutation.reason === "not_permitted_in_group"
+            ? "该操作未在群聊中开放，未执行。"
+            : "请求的操作未执行，请补齐必要参数后重试。",
+      };
+    }
+    await this.runtime.initialize();
     const profile: PiRuntimeProfileName = this.options.resolveProfileName
       ? await this.options.resolveProfileName(input)
       : input.caller.scope.chatType === "group"
@@ -677,7 +755,12 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
           (call) =>
             call.name === required.name &&
             call.failed === false &&
-            satisfiesRequiredInput(required.input, call.input),
+            satisfiesRequiredInput(
+              required.input,
+              input.caller.scope.chatType === "group"
+                ? { ...call.input, groupId: input.caller.scope.chatId }
+                : call.input,
+            ),
         );
       // §2/§3 — every domain the message asked about, not the first one the check reached. A
       // message that asks about members *and* notices is not answered by observing one of them.

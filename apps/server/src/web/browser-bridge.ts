@@ -1,9 +1,14 @@
 import {
   BrowserSessionRegistry,
+  browserSessionBindingKey,
   type BrowserSessionBinding,
   type BrowserSession,
 } from "./browser-session.js";
-import type { BrowserProxyHandle } from "./browser-proxy.js";
+import type {
+  BrowserArtifactReference,
+  BrowserExecutionSession,
+  BrowserExecutorPort,
+} from "./browser-executor-port.js";
 import { assertPublicWebUrl, type ResolveWebHost } from "./network-guard.js";
 
 export type BrowserCapability = "browser.read" | "browser.interact";
@@ -12,49 +17,31 @@ export type BrowserAction =
   | { type: "open"; url: string }
   | { type: "close" }
   | { type: "goto"; url: string }
-  | { type: "go_back" }
-  | { type: "go_forward" }
-  | { type: "reload" }
-  | { type: "snapshot"; depth?: number }
-  | { type: "find"; text: string }
-  | { type: "tab_list" }
-  | { type: "tab_new" }
-  | { type: "tab_select"; index: number }
-  | { type: "tab_close"; index: number }
-  | { type: "console"; level?: "error" | "warning" | "info" | "debug" }
-  | { type: "requests" }
-  | { type: "request_body"; index: number }
-  | { type: "request_headers"; index: number }
-  | { type: "response_headers"; index: number }
-  | { type: "wait"; condition: "selector" | "url"; value: string }
-  | { type: "screenshot" }
-  | { type: "download_observation" }
-  | { type: "response_body"; index: number }
-  | { type: "type"; text: string }
-  | { type: "click"; ref: string }
-  | { type: "fill"; ref: string; value: string }
+  | { type: "back" | "forward" | "reload" }
+  | { type: "read" }
+  | { type: "snapshot"; interactive?: boolean; compact?: boolean; depth?: number }
+  | {
+      type: "get";
+      kind: "text" | "html" | "value" | "attr" | "box" | "styles";
+      ref: string;
+      name?: string;
+    }
+  | { type: "get"; kind: "title" | "url" }
+  | { type: "get"; kind: "count"; selector: string }
+  | { type: "is"; kind: "visible" | "enabled" | "checked"; ref: string }
+  | { type: "click" | "check" | "uncheck" | "hover" | "scroll_into_view"; ref: string }
+  | { type: "fill" | "type"; ref: string; text: string }
   | { type: "press"; key: string }
   | { type: "select"; ref: string; value: string }
-  | { type: "check"; ref: string }
-  | { type: "uncheck"; ref: string }
-  | { type: "hover"; ref: string };
+  | { type: "scroll"; direction: "up" | "down"; pixels?: number }
+  | { type: "wait"; condition: "selector" | "text" | "url" | "load"; value: string }
+  | { type: "screenshot"; fullPage?: boolean }
+  | { type: "network_requests"; filter?: string }
+  | { type: "network_request"; requestId: string }
+  | { type: "console"; clear?: boolean }
+  | { type: "tab_list" | "tab_new" | "tab_close" }
+  | { type: "tab_select"; tabId: string };
 
-export interface BrowserCliResult {
-  code: number;
-  stdout: string;
-  stderr: string;
-}
-
-export interface BrowserCliExecutionContext {
-  proxyServer: string;
-}
-
-export type BrowserCliRunner = (
-  args: readonly string[],
-  timeoutMs: number,
-  context: BrowserCliExecutionContext,
-) => Promise<BrowserCliResult>;
-export type BrowserProxyFactory = () => BrowserProxyHandle;
 export type BrowserAuthorizer = (
   binding: BrowserSessionBinding,
   capability: BrowserCapability,
@@ -63,33 +50,68 @@ export type BrowserAuthorizer = (
 
 export interface BrowserBridgeOptions {
   authorize: BrowserAuthorizer;
-  runner: BrowserCliRunner;
-  proxyFactory: BrowserProxyFactory;
+  executor: BrowserExecutorPort;
   resolveHost?: ResolveWebHost;
   sessions?: BrowserSessionRegistry;
   timeoutMs?: number;
   maxOutputChars?: number;
+  maxArtifactBytes?: number;
 }
 
 export interface BrowserBridgeResult {
   output: string;
   truncated: boolean;
+  artifact?: BrowserArtifactReference;
+  warning?: string;
 }
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const DEFAULT_MAX_OUTPUT_CHARS = 20_000;
+const DEFAULT_MAX_ARTIFACT_BYTES = 8_000_000;
 const MAX_INPUT_CHARS = 8_000;
+
+interface Command {
+  capability: BrowserCapability;
+  args: string[];
+  navigation?: boolean;
+  mutation?: boolean;
+  tabChange?: boolean;
+  snapshot?: boolean;
+  needsRef?: string;
+}
+
+interface ParsedCliResult {
+  success: boolean;
+  data?: unknown;
+  error?: string;
+  code?: string;
+  warning?: string;
+}
+
+interface LiveBrowserSession {
+  execution: BrowserExecutionSession;
+  sessionId: string;
+  refs: Set<string>;
+  activeTab: string;
+  snapshotTab?: string;
+}
 
 function validateBinding(binding: BrowserSessionBinding): void {
   if (
-    ![binding.runId, binding.principalId, binding.conversationId].every(
-      (value) => typeof value === "string" && value.length > 0,
-    )
+    ![
+      binding.runId,
+      binding.principalId,
+      binding.conversationId,
+      binding.workspaceId,
+      binding.policyVersion,
+    ].every((value) => typeof value === "string" && value.length > 0)
   )
+    throw new Error("browser_invalid_binding");
+  if (binding.purpose !== undefined && binding.purpose !== "tool" && binding.purpose !== "fallback")
     throw new Error("browser_invalid_binding");
 }
 
-function validateText(value: string, code: string): string {
+function validateText(value: string, code = "browser_invalid_text"): string {
   if (
     typeof value !== "string" ||
     value.length > MAX_INPUT_CHARS ||
@@ -101,12 +123,12 @@ function validateText(value: string, code: string): string {
 }
 
 function validateRef(value: string): string {
-  if (!/^[A-Za-z][A-Za-z0-9_-]{0,63}$/u.test(value)) throw new Error("browser_invalid_ref");
+  if (!/^@e[1-9][0-9]{0,5}$/u.test(value)) throw new Error("browser_invalid_ref");
   return value;
 }
 
 function validateKey(value: string): string {
-  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/u.test(value)) throw new Error("browser_invalid_key");
+  if (!/^[A-Za-z0-9][A-Za-z0-9_+.-]{0,31}$/u.test(value)) throw new Error("browser_invalid_key");
   return value;
 }
 
@@ -115,193 +137,313 @@ function validateIndex(value: number, code: string, maximum = 1_000): number {
   return value;
 }
 
-function actionArgs(action: BrowserAction): {
-  capability: BrowserCapability;
-  args: string[];
-  url?: string;
-} {
+function commandFor(action: BrowserAction): Command {
   switch (action.type) {
     case "open":
     case "goto":
       return {
         capability: "browser.read",
-        args: [action.type, validateText(action.url, "browser_invalid_url")],
-        url: action.url,
+        args: ["open", validateText(action.url, "browser_invalid_url")],
+        navigation: true,
       };
     case "close":
       return { capability: "browser.interact", args: ["close"] };
-    case "go_back":
-      return { capability: "browser.read", args: ["go-back"] };
-    case "go_forward":
-      return { capability: "browser.read", args: ["go-forward"] };
+    case "back":
+      return { capability: "browser.read", args: ["back"], navigation: true };
+    case "forward":
+      return { capability: "browser.read", args: ["forward"], navigation: true };
     case "reload":
-      return { capability: "browser.read", args: ["reload"] };
+      return { capability: "browser.read", args: ["reload"], navigation: true };
+    case "read":
+      if ("url" in action) throw new Error("browser_action_not_allowed");
+      return { capability: "browser.read", args: ["read"] };
     case "snapshot": {
-      const depth = action.depth ?? 8;
-      if (!Number.isInteger(depth) || depth < 1 || depth > 20)
-        throw new Error("browser_invalid_depth");
-      return { capability: "browser.read", args: ["snapshot", `--depth=${depth}`] };
+      const args = ["snapshot"];
+      if (action.interactive) args.push("-i");
+      if (action.compact) args.push("-c");
+      if (action.depth !== undefined) {
+        validateIndex(action.depth, "browser_invalid_depth", 20);
+        if (action.depth < 1) throw new Error("browser_invalid_depth");
+        args.push("-d", `${action.depth}`);
+      }
+      return { capability: "browser.read", args, snapshot: true };
     }
-    case "find":
-      return {
-        capability: "browser.read",
-        args: ["find", validateText(action.text, "browser_invalid_text")],
-      };
-    case "tab_list":
-      return { capability: "browser.read", args: ["tab-list"] };
-    case "tab_new":
-      return { capability: "browser.interact", args: ["tab-new"] };
-    case "tab_select":
+    case "get": {
+      if (action.kind === "count")
+        return {
+          capability: "browser.read",
+          args: ["get", "count", validateText(action.selector)],
+        };
+      if (action.kind === "title" || action.kind === "url")
+        return { capability: "browser.read", args: ["get", action.kind] };
+      if (!("ref" in action)) throw new Error("browser_invalid_action");
+      const ref = validateRef(action.ref);
+      if (action.kind === "attr") {
+        if (!action.name || !/^[A-Za-z_:][A-Za-z0-9_.:-]{0,63}$/u.test(action.name))
+          throw new Error("browser_invalid_attribute");
+        return {
+          capability: "browser.read",
+          args: ["get", "attr", ref, action.name],
+          needsRef: ref,
+        };
+      }
+      return { capability: "browser.read", args: ["get", action.kind, ref], needsRef: ref };
+    }
+    case "is": {
+      const ref = validateRef(action.ref);
+      return { capability: "browser.read", args: ["is", action.kind, ref], needsRef: ref };
+    }
+    case "click":
+    case "check":
+    case "uncheck":
+    case "hover":
+    case "scroll_into_view": {
+      const ref = validateRef(action.ref);
       return {
         capability: "browser.interact",
-        args: ["tab-select", `${validateIndex(action.index, "browser_invalid_tab_index", 99)}`],
+        args: [action.type === "scroll_into_view" ? "scrollintoview" : action.type, ref],
+        mutation: true,
+        needsRef: ref,
+      };
+    }
+    case "fill":
+    case "type": {
+      const ref = validateRef(action.ref);
+      return {
+        capability: "browser.interact",
+        args: [action.type, ref, validateText(action.text)],
+        mutation: true,
+        needsRef: ref,
+      };
+    }
+    case "press":
+      return {
+        capability: "browser.interact",
+        args: ["press", validateKey(action.key)],
+        mutation: true,
+      };
+    case "select": {
+      const ref = validateRef(action.ref);
+      return {
+        capability: "browser.interact",
+        args: ["select", ref, validateText(action.value)],
+        mutation: true,
+        needsRef: ref,
+      };
+    }
+    case "scroll": {
+      const pixels = action.pixels ?? 300;
+      if (action.direction !== "up" && action.direction !== "down")
+        throw new Error("browser_invalid_scroll");
+      if (!Number.isInteger(pixels) || pixels < 1 || pixels > 5_000)
+        throw new Error("browser_invalid_scroll");
+      return {
+        capability: "browser.interact",
+        args: ["scroll", action.direction, `${pixels}`],
+        mutation: true,
+      };
+    }
+    case "wait": {
+      const value = validateText(action.value);
+      if (action.condition === "selector")
+        return { capability: "browser.read", args: ["wait", value] };
+      if (action.condition === "text")
+        return { capability: "browser.read", args: ["wait", "--text", value] };
+      if (action.condition === "url")
+        return { capability: "browser.read", args: ["wait", "--url", value] };
+      if (!["domcontentloaded", "load", "networkidle"].includes(value))
+        throw new Error("browser_invalid_wait");
+      return { capability: "browser.read", args: ["wait", "--load", value] };
+    }
+    case "screenshot":
+      return {
+        capability: "browser.read",
+        args: action.fullPage ? ["screenshot", "--full"] : ["screenshot"],
+      };
+    case "network_requests":
+      return {
+        capability: "browser.read",
+        args: action.filter
+          ? ["network", "requests", "--filter", validateText(action.filter)]
+          : ["network", "requests"],
+      };
+    case "network_request": {
+      if (!/^[A-Za-z0-9_-]{1,128}$/u.test(action.requestId))
+        throw new Error("browser_invalid_request_id");
+      return { capability: "browser.read", args: ["network", "request", action.requestId] };
+    }
+    case "console":
+      return {
+        capability: "browser.read",
+        args: action.clear ? ["console", "--clear"] : ["console"],
+      };
+    case "tab_list":
+      return { capability: "browser.read", args: ["tab"] };
+    case "tab_new":
+      return {
+        capability: "browser.interact",
+        args: ["tab", "new"],
+        tabChange: true,
+        mutation: true,
       };
     case "tab_close":
       return {
         capability: "browser.interact",
-        args: ["tab-close", `${validateIndex(action.index, "browser_invalid_tab_index", 99)}`],
+        args: ["tab", "close"],
+        tabChange: true,
+        mutation: true,
       };
-    case "console":
-      if (
-        action.level !== undefined &&
-        !["error", "warning", "info", "debug"].includes(action.level)
-      )
-        throw new Error("browser_invalid_console_level");
-      return { capability: "browser.read", args: ["console", action.level ?? "info"] };
-    case "requests":
-      return { capability: "browser.read", args: ["requests"] };
-    case "request_headers":
-      return {
-        capability: "browser.read",
-        args: [
-          "request-headers",
-          `${validateIndex(action.index, "browser_invalid_request_index", 1_000)}`,
-        ],
-      };
-    case "request_body":
-      validateIndex(action.index, "browser_invalid_request_index", 1_000);
-      throw new Error("browser_action_unsupported_file_output");
-    case "response_headers":
-      return {
-        capability: "browser.read",
-        args: [
-          "response-headers",
-          `${validateIndex(action.index, "browser_invalid_request_index", 1_000)}`,
-        ],
-      };
-    case "wait":
-      validateText(action.value, "browser_invalid_text");
-      throw new Error("browser_action_unsupported_wait");
-    case "screenshot":
-      throw new Error("browser_action_unsupported_file_output");
-    case "download_observation":
-      throw new Error("browser_action_unsupported_download_observation");
-    case "response_body":
-      validateIndex(action.index, "browser_invalid_request_index", 1_000);
-      throw new Error("browser_action_unsupported_file_output");
-    case "type":
-      return {
-        capability: "browser.interact",
-        args: ["type", validateText(action.text, "browser_invalid_text")],
-      };
-    case "click":
-      return { capability: "browser.interact", args: ["click", validateRef(action.ref)] };
-    case "fill":
-      return {
-        capability: "browser.interact",
-        args: ["fill", validateRef(action.ref), validateText(action.value, "browser_invalid_text")],
-      };
-    case "press":
-      return { capability: "browser.interact", args: ["press", validateKey(action.key)] };
-    case "select":
-      return {
-        capability: "browser.interact",
-        args: [
-          "select",
-          validateRef(action.ref),
-          validateText(action.value, "browser_invalid_text"),
-        ],
-      };
-    case "check":
-    case "uncheck":
-    case "hover":
-      return { capability: "browser.interact", args: [action.type, validateRef(action.ref)] };
+    case "tab_select": {
+      if (!/^t[1-9][0-9]{0,5}$/u.test(action.tabId)) throw new Error("browser_invalid_tab_id");
+      return { capability: "browser.interact", args: ["tab", action.tabId], tabChange: true };
+    }
     default:
       throw new Error("browser_action_not_allowed");
   }
 }
 
-/**
- * The bridge accepts a caller-provided authorization decision on every action.
- * The isolated-container runner builds the CLI configuration with the supplied
- * mandatory proxy endpoint. Callers cannot provide CLI configuration.
- */
+/** Maps product actions to the allowlisted agent-browser 0.38.1 CLI surface. */
 export class BrowserBridge {
-  private readonly runner: BrowserCliRunner;
   private readonly sessions: BrowserSessionRegistry;
-  private readonly proxyFactory: BrowserProxyFactory;
-  private readonly sessionResources = new Map<
-    string,
-    { proxy: BrowserProxyHandle; proxyServer: string }
-  >();
+  private readonly live = new Map<string, LiveBrowserSession>();
 
   constructor(private readonly options: BrowserBridgeOptions) {
-    this.runner = options.runner;
     this.sessions = options.sessions ?? new BrowserSessionRegistry();
-    this.proxyFactory = options.proxyFactory;
   }
 
   async execute(
     binding: BrowserSessionBinding,
     action: BrowserAction,
   ): Promise<BrowserBridgeResult> {
+    binding = { ...binding, purpose: binding.purpose ?? "tool" };
     validateBinding(binding);
-    const command = actionArgs(action);
-    if (!(await this.options.authorize(binding, command.capability, action.type)))
+    const command = commandFor(action);
+    if (!(await this.options.authorize(binding, command.capability, action.type))) {
+      await this.cleanup(binding).catch(() => undefined);
       throw new Error("browser_denied");
-    if (command.url) {
-      const publicUrl = await assertPublicWebUrl(command.url, this.options.resolveHost);
-      command.args[command.args.length - 1] = publicUrl.href;
+    }
+    if (action.type === "open" || action.type === "goto") {
+      const targetUrl = action.url;
+      if (!targetUrl) throw new Error("browser_invalid_url");
+      const safe = await assertPublicWebUrl(targetUrl, this.options.resolveHost);
+      command.args[command.args.length - 1] = safe.href;
     }
 
     return this.sessions.exclusive(binding, async (session) => {
+      const key = browserSessionBindingKey(binding);
       if (action.type === "open") {
         if (session.opened) throw new Error("browser_session_already_open");
-      } else if (action.type !== "goto" && !session.opened) {
-        throw new Error("browser_session_not_open");
-      } else if (action.type === "goto" && !session.opened) {
+        try {
+          const execution = await this.options.executor.open(binding, session.cliSession);
+          this.live.set(key, {
+            execution,
+            sessionId: session.cliSession,
+            refs: new Set(),
+            activeTab: "t1",
+          });
+          session.opened = true;
+        } catch (error) {
+          this.sessions.forget(binding);
+          throw error;
+        }
+      } else if (!session.opened) {
         throw new Error("browser_session_not_open");
       }
-      let proxyServer: string | undefined;
-      if (action.type === "open") {
-        const resources = await this.createSessionResources(session);
-        proxyServer = resources.proxyServer;
-        // Mark the session as potentially live before launching the CLI. Cleanup
-        // must still close it if the CLI returns an error after starting Chromium.
-        session.opened = true;
+      const live = this.live.get(key);
+      if (!live) throw new Error("browser_executor_session_missing");
+      if (
+        command.needsRef &&
+        (live.snapshotTab !== live.activeTab || !live.refs.has(command.needsRef))
+      )
+        throw new Error("browser_stale_ref");
+      if (command.navigation || command.mutation || command.tabChange) this.invalidateRefs(live);
+      const args = ["--json", "--session", session.cliSession, ...command.args];
+      try {
+        if (action.type !== "open" && action.type !== "close")
+          await this.assertCurrentUrlSafe(live);
+        const result = await live.execution.execute(args, this.limits());
+        if (result.exitCode !== 0) throw new Error("browser_cli_failed");
+        const parsed = parseJsonResult(result.stdout);
+        if (!parsed.success) throw new Error(`browser_cli_${parsed.code ?? "failed"}`);
+        if (command.snapshot) {
+          live.refs = extractRefs(parsed.data);
+          live.snapshotTab = live.activeTab;
+        }
+        if (
+          action.type === "tab_select" ||
+          action.type === "tab_new" ||
+          action.type === "tab_close"
+        ) {
+          live.activeTab = action.type === "tab_select" ? action.tabId : `unknown-${Date.now()}`;
+        }
+        const needsUrlCheck = command.navigation || command.mutation || command.tabChange;
+        if (needsUrlCheck) await this.assertCurrentUrlSafe(live);
+        const artifact = action.type === "screenshot" ? result.artifact : undefined;
+        if (action.type === "screenshot") {
+          if (
+            !artifact?.id ||
+            (artifact.sizeBytes !== undefined &&
+              artifact.sizeBytes > (this.options.maxArtifactBytes ?? DEFAULT_MAX_ARTIFACT_BYTES))
+          )
+            throw new Error("browser_artifact_invalid");
+        }
+        const output = safeOutput(
+          parsed.data,
+          artifact,
+          action.type === "network_requests" || action.type === "network_request",
+        );
+        const max = this.options.maxOutputChars ?? DEFAULT_MAX_OUTPUT_CHARS;
+        if (action.type === "close") await this.closeSession(binding, session, true);
+        return {
+          output: output.slice(0, max),
+          truncated: output.length > max,
+          ...(artifact ? { artifact } : {}),
+          ...(parsed.warning ? { warning: parsed.warning.slice(0, 500) } : {}),
+        };
+      } catch (error) {
+        await this.closeSession(binding, session, false).catch(() => undefined);
+        throw error;
       }
-      const resources = this.sessionResources.get(session.cliSession);
-      const result = await this.call(session, command.args, proxyServer ?? resources?.proxyServer);
-      if (result.code !== 0) throw new Error("browser_cli_failed");
-      await assertReportedPageUrlsSafe(
-        result.stdout,
-        this.options.resolveHost,
-        action.type !== "close",
-      );
-      const output = bounded(
-        result.stdout,
-        this.options.maxOutputChars ?? DEFAULT_MAX_OUTPUT_CHARS,
-      );
-      if (action.type === "close") await this.closeSession(binding, session, true);
-      return output;
     });
   }
 
   async cleanup(binding: BrowserSessionBinding): Promise<void> {
+    binding = { ...binding, purpose: binding.purpose ?? "tool" };
     validateBinding(binding);
-    await this.sessions.exclusive(binding, async (session) => {
-      await this.closeSession(binding, session, false);
-    });
+    await this.sessions.exclusive(binding, async (session) =>
+      this.closeSession(binding, session, false),
+    );
+  }
+
+  private invalidateRefs(live: LiveBrowserSession): void {
+    live.refs.clear();
+    live.snapshotTab = undefined;
+  }
+
+  private limits() {
+    return {
+      timeoutMs: this.options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      maxOutputChars: this.options.maxOutputChars ?? DEFAULT_MAX_OUTPUT_CHARS,
+      maxArtifactBytes: this.options.maxArtifactBytes ?? DEFAULT_MAX_ARTIFACT_BYTES,
+    };
+  }
+
+  private async assertCurrentUrlSafe(live: LiveBrowserSession): Promise<void> {
+    const result = await live.execution.execute(
+      ["--json", "--session", live.sessionId, "get", "url"],
+      this.limits(),
+    );
+    if (result.exitCode !== 0) throw new Error("browser_result_url_unavailable");
+    const parsed = parseJsonResult(result.stdout);
+    if (!parsed.success) throw new Error("browser_result_url_unavailable");
+    const url = extractCurrentUrl(parsed.data);
+    if (url === "about:blank") return;
+    if (!url || !/^https?:\/\//iu.test(url)) throw new Error("browser_result_target_denied");
+    try {
+      await assertPublicWebUrl(url, this.options.resolveHost);
+    } catch {
+      throw new Error("browser_result_target_denied");
+    }
   }
 
   private async closeSession(
@@ -309,79 +451,103 @@ export class BrowserBridge {
     session: BrowserSession,
     cliAlreadyClosed: boolean,
   ): Promise<void> {
+    const key = browserSessionBindingKey(binding);
+    const live = this.live.get(key);
     let failure: unknown;
-    const resources = this.sessionResources.get(session.cliSession);
     try {
-      if (session.opened && !cliAlreadyClosed) {
-        if (!resources) throw new Error("browser_cleanup_state_missing");
-        const result = await this.call(session, ["close"], resources.proxyServer);
-        if (result.code !== 0) throw new Error("browser_cleanup_failed");
+      if (live && !cliAlreadyClosed && session.opened) {
+        const result = await live.execution.execute(
+          ["--json", "--session", session.cliSession, "close"],
+          {
+            timeoutMs: this.options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+            maxOutputChars: this.options.maxOutputChars ?? DEFAULT_MAX_OUTPUT_CHARS,
+            maxArtifactBytes: this.options.maxArtifactBytes ?? DEFAULT_MAX_ARTIFACT_BYTES,
+          },
+        );
+        if (result.exitCode !== 0 || !parseJsonResult(result.stdout).success)
+          throw new Error("browser_cleanup_failed");
       }
     } catch (error) {
       failure = error;
     } finally {
       try {
-        await resources?.proxy.close();
+        if (live) {
+          if (!cliAlreadyClosed) await live.execution.cancel().catch(() => undefined);
+          await live.execution.close();
+        }
       } catch (error) {
         failure ??= error;
-      } finally {
-        this.sessionResources.delete(session.cliSession);
-        session.opened = false;
-        this.sessions.forget(binding);
       }
+      this.live.delete(key);
+      session.opened = false;
+      this.sessions.forget(binding);
     }
     if (failure) throw failure;
   }
-
-  private async createSessionResources(
-    session: BrowserSession,
-  ): Promise<{ proxy: BrowserProxyHandle; proxyServer: string }> {
-    const proxy = this.proxyFactory();
-    try {
-      const proxyServer = await proxy.start();
-      const resources = { proxy, proxyServer };
-      this.sessionResources.set(session.cliSession, resources);
-      return resources;
-    } catch {
-      await proxy.close().catch(() => undefined);
-      throw new Error("browser_proxy_setup_failed");
-    }
-  }
-
-  private call(
-    session: BrowserSession,
-    command: readonly string[],
-    proxyServer?: string,
-  ): Promise<BrowserCliResult> {
-    if (!proxyServer) throw new Error("browser_proxy_unavailable");
-    return this.runner(
-      [`-s=${session.cliSession}`, ...command],
-      this.options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-      { proxyServer },
-    );
-  }
 }
 
-function bounded(value: string, maxChars: number): BrowserBridgeResult {
-  const max = Number.isInteger(maxChars) && maxChars > 0 ? maxChars : DEFAULT_MAX_OUTPUT_CHARS;
-  return { output: value.slice(0, max), truncated: value.length > max };
+function parseJsonResult(stdout: string): ParsedCliResult {
+  let value: unknown;
+  try {
+    value = JSON.parse(stdout);
+  } catch {
+    throw new Error("browser_cli_invalid_json");
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw new Error("browser_cli_invalid_json");
+  const result = value as Record<string, unknown>;
+  if (typeof result.success !== "boolean") throw new Error("browser_cli_invalid_json");
+  return {
+    success: result.success,
+    ...(result.data !== undefined ? { data: result.data } : {}),
+    ...(typeof result.error === "string" ? { error: result.error } : {}),
+    ...(typeof result.code === "string" ? { code: result.code } : {}),
+    ...(typeof result.warning === "string" ? { warning: result.warning } : {}),
+  };
 }
 
-async function assertReportedPageUrlsSafe(
-  output: string,
-  resolveHost?: ResolveWebHost,
-  requirePageUrl = true,
-): Promise<void> {
-  const urls = [...output.matchAll(/^\s*(?:[-*]\s*)?Page URL:\s*(\S+)\s*$/gimu)].map(
-    (match) => match[1]!,
-  );
-  if (!urls.length && requirePageUrl) throw new Error("browser_result_page_url_missing");
-  for (const value of urls) {
-    if (value === "about:blank") continue;
-    try {
-      await assertPublicWebUrl(value, resolveHost);
-    } catch {
-      throw new Error("browser_result_target_denied");
-    }
+function extractRefs(data: unknown): Set<string> {
+  const text = typeof data === "string" ? data : JSON.stringify(data ?? "");
+  return new Set([...text.matchAll(/@e[1-9][0-9]{0,5}\b/gu)].map((match) => match[0]));
+}
+
+function extractCurrentUrl(data: unknown): string | undefined {
+  if (typeof data === "string") return data.trim();
+  if (!data || typeof data !== "object" || Array.isArray(data)) return undefined;
+  const record = data as Record<string, unknown>;
+  for (const key of ["url", "href", "currentUrl"])
+    if (typeof record[key] === "string") return record[key] as string;
+  return undefined;
+}
+
+function safeOutput(data: unknown, artifact?: BrowserArtifactReference, redact = false): string {
+  if (artifact) return JSON.stringify({ artifact });
+  const output = redact ? redactSensitiveData(data) : data;
+  return typeof output === "string" ? output : JSON.stringify(output ?? null);
+}
+
+function redactSensitiveData(value: unknown): unknown {
+  if (Array.isArray(value))
+    return value.map((entry) => {
+      if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+        const record = entry as Record<string, unknown>;
+        if (
+          typeof record.name === "string" &&
+          /^(?:authorization|proxy-authorization|cookie|set-cookie|password|token|secret)$/iu.test(
+            record.name,
+          )
+        )
+          return { ...record, value: "[redacted]" };
+      }
+      return redactSensitiveData(entry);
+    });
+  if (!value || typeof value !== "object") return value;
+  const result: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+    result[key] =
+      /^(?:authorization|proxy-authorization|cookie|set-cookie|password|token|secret)$/iu.test(key)
+        ? "[redacted]"
+        : redactSensitiveData(child);
   }
+  return result;
 }

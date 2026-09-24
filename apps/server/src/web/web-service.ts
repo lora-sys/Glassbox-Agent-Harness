@@ -55,18 +55,42 @@ export interface WebPlanner {
   ): Promise<readonly { url: string; relevanceScore: number }[]>;
 }
 
+export type BrowserFallbackStatus =
+  | "succeeded"
+  | "blocked"
+  | "unavailable"
+  | "fallback_denied"
+  | "partial"
+  | "failed"
+  | "unknown";
+
 export interface BrowserSearchFallback {
   search(
     query: string,
     maxResults: number,
-  ): Promise<
-    readonly {
+  ): Promise<{
+    status: BrowserFallbackStatus;
+    results: readonly {
       url: string;
-      title: string;
+      title?: string;
       highlights: readonly string[];
-    }[]
-  >;
-  fetch(url: string): Promise<{ title?: string; text: string; contentType?: string } | null>;
+      author?: string | null;
+      publishedAt?: string | null;
+    }[];
+    partial?: boolean;
+  }>;
+  fetch(url: string): Promise<{
+    status: BrowserFallbackStatus;
+    finalUrl?: string;
+    title?: string;
+    text?: string;
+    contentType?: string;
+    extractionMethod?: string;
+    author?: string | null;
+    publishedAt?: string | null;
+    partial?: boolean;
+    truncated?: boolean;
+  }>;
 }
 
 export interface WebServiceOptions {
@@ -134,7 +158,7 @@ function matchesDomain(hostname: string, domains: readonly string[]): boolean {
 }
 
 function isInTimeRange(
-  publishedAt: string | undefined,
+  publishedAt: string | null | undefined,
   range: keyof typeof TIME_RANGE_MS,
   nowMs: number,
 ): boolean {
@@ -208,15 +232,23 @@ export class WebService {
           ? ["failed" as const]
           : [],
     );
-    const fallbackNeeded = successes.length === 0 && this.options.browserFallback !== undefined;
-    const browserResults = fallbackNeeded
-      ? await this.options.browserFallback!.search(query, limit).catch(() => [])
-      : [];
+    const fallbackNeeded =
+      this.options.browserFallback !== undefined &&
+      successes.every((result) => result.results.length === 0);
+    const browserOutcome = fallbackNeeded
+      ? await this.options.browserFallback!.search(query, limit).catch(() => ({
+          status: "failed" as const,
+          results: [],
+          partial: false,
+        }))
+      : undefined;
+    const browserResults = browserOutcome?.results ?? [];
     const candidates: Array<{
       url: string;
       title: string;
       highlights: readonly string[];
-      publishedAt?: string;
+      publishedAt?: string | null;
+      author?: string | null;
       providerOrigin: string;
       retrievalMethod: "exa_search" | "browser_search";
     }> = successes
@@ -226,6 +258,7 @@ export class WebService {
         title: result.title ?? result.url ?? "",
         highlights: result.highlights ?? [],
         publishedAt: result.publishedDate,
+        author: result.author,
         providerOrigin: "exa_mcp",
         retrievalMethod: "exa_search" as const,
       }));
@@ -233,7 +266,7 @@ export class WebService {
       candidates.push(
         ...browserResults.map((result) => ({
           ...result,
-          publishedAt: undefined,
+          title: result.title ?? result.url,
           providerOrigin: "browser",
           retrievalMethod: "browser_search" as const,
         })),
@@ -270,7 +303,8 @@ export class WebService {
           retrievedAt: this.now().toISOString(),
           providerOrigins: [candidate.providerOrigin],
           retrievalMethod: candidate.retrievalMethod,
-          ...(candidate.publishedAt ? { publishedAt: candidate.publishedAt } : {}),
+          ...(candidate.publishedAt !== undefined ? { publishedAt: candidate.publishedAt } : {}),
+          ...(candidate.author !== undefined ? { author: candidate.author } : {}),
           highlights,
           rank: seen.size + 1,
         });
@@ -291,9 +325,22 @@ export class WebService {
     }
     const truncated = ordered.length > limit || discarded > 0;
     ordered = ordered.slice(0, limit).map((entry, index) => ({ ...entry, rank: index + 1 }));
-    const partial = failures.length > 0 && ordered.length > 0;
+    const partial =
+      (failures.length > 0 && ordered.length > 0) ||
+      browserOutcome?.status === "partial" ||
+      browserOutcome?.partial === true;
     const providerStatus =
       successes.length > 0 ? (partial ? "partial" : "ready") : (failures[0] ?? "unknown");
+    const fallbackStatus = browserOutcome?.status;
+    const resultStatus =
+      fallbackStatus ??
+      (failures[0] === "failed" || failures[0] === "timeout"
+        ? "failed"
+        : failures[0] === "unknown"
+          ? "unknown"
+          : failures.length > 0
+            ? "unavailable"
+            : "unknown");
     return {
       query,
       status:
@@ -301,14 +348,16 @@ export class WebService {
           ? partial
             ? "partial"
             : "succeeded"
-          : successes.length > 0
-            ? "succeeded"
-            : "unavailable",
+          : fallbackNeeded && fallbackStatus && fallbackStatus !== "succeeded"
+            ? fallbackStatus
+            : successes.length > 0 || fallbackStatus === "succeeded"
+              ? "succeeded"
+              : resultStatus,
       providerStatus,
       partial,
       truncated,
       plan: {
-        mode: browserResults.length > 0 ? "browser_fallback" : planned.mode,
+        mode: fallbackNeeded ? "browser_fallback" : planned.mode,
         queryVariants: boundedVariants,
         jevUsed: planned.jevUsed,
         ...(planned.timeRange ? { timeRange: planned.timeRange } : {}),
@@ -321,7 +370,6 @@ export class WebService {
 
   async fetch(runId: string, input: WebFetchInput): Promise<WebFetchResult> {
     const url = await this.publicUrl(input.url);
-    const canonicalUrl = canonicalWebUrl(url);
     const maxChars = boundedInteger(input.maxChars, 8_000, MAX_FETCH_CHARS);
     const response = await this.provider.contents(url.href, input.query).catch(() => ({
       status: "failed" as const,
@@ -332,30 +380,64 @@ export class WebService {
         ? response.results.find((entry) => entry.url === url.href)
         : undefined;
     let method: "exa_contents" | "browser" = "exa_contents";
-    let browserContent: Awaited<ReturnType<BrowserSearchFallback["fetch"]>> = null;
+    let browserContent: Awaited<ReturnType<BrowserSearchFallback["fetch"]>> | undefined;
     if (!raw?.text && this.options.browserFallback) {
-      browserContent = await this.options.browserFallback.fetch(url.href).catch(() => null);
-      if (browserContent) method = "browser";
+      browserContent = await this.options.browserFallback.fetch(url.href).catch(() => ({
+        status: "failed" as const,
+      }));
+      method = "browser";
     }
-    const text = browserContent?.text ?? raw?.text ?? "";
-    const succeeded = Boolean(text);
+    const fetchUrl = browserContent?.finalUrl ?? raw?.url ?? url.href;
+    const validatedFinalUrl = await this.publicUrl(fetchUrl).catch(() => undefined);
+    const resolvedUrl = validatedFinalUrl ?? url;
+    const canonicalFetchUrl = canonicalWebUrl(resolvedUrl);
+    const contentType = browserContent?.contentType;
+    const textContent =
+      !contentType || /^(?:text\/|application\/(?:json|xml|xhtml\+xml))/iu.test(contentType);
+    const text = validatedFinalUrl && textContent ? (browserContent?.text ?? raw?.text ?? "") : "";
+    const browserStatus = browserContent?.status;
+    const succeeded = textContent && (Boolean(text) || browserStatus === "succeeded");
+    const status: WebFetchResult["status"] = !validatedFinalUrl
+      ? "failed"
+      : browserStatus && browserStatus !== "succeeded"
+        ? browserStatus
+        : browserContent?.partial
+          ? "partial"
+          : succeeded
+            ? "succeeded"
+            : response.status === "ready"
+              ? "unavailable"
+              : response.status === "unknown"
+                ? "unknown"
+                : response.status === "failed" || response.status === "timeout"
+                  ? "failed"
+                  : "unavailable";
     return {
-      sourceId: webSourceId(runId, canonicalUrl),
-      url: url.href,
-      canonicalUrl,
-      domain: url.hostname,
+      sourceId: webSourceId(runId, canonicalFetchUrl),
+      url: resolvedUrl.href,
+      canonicalUrl: canonicalFetchUrl,
+      domain: resolvedUrl.hostname,
       retrievedAt: this.now().toISOString(),
       providerOrigins: [method === "browser" ? "browser" : "exa_mcp"],
       retrievalMethod: method,
-      status: succeeded ? "succeeded" : "unavailable",
+      status,
       providerStatus: response.status,
       ...((browserContent?.title ?? raw?.title)
         ? { title: browserContent?.title ?? raw?.title }
         : {}),
-      ...(browserContent?.contentType ? { contentType: browserContent.contentType } : {}),
+      ...(contentType ? { contentType } : {}),
+      ...(browserContent?.extractionMethod
+        ? { extractionMethod: browserContent.extractionMethod }
+        : raw?.text
+          ? { extractionMethod: "exa_contents" }
+          : {}),
+      ...(browserContent?.author !== undefined ? { author: browserContent.author } : {}),
+      ...(browserContent?.publishedAt !== undefined
+        ? { publishedAt: browserContent.publishedAt }
+        : {}),
       text: text.slice(0, maxChars),
-      partial: false,
-      truncated: text.length > maxChars,
+      partial: browserContent?.partial ?? false,
+      truncated: browserContent?.truncated ?? text.length > maxChars,
     };
   }
 }

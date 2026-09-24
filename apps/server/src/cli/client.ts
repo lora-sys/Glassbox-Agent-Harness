@@ -17,7 +17,7 @@ export interface ManagementRequest {
   method: "GET" | "POST";
   path: string;
   body?: unknown;
-  query?: { cursor: string };
+  query?: { cursor: string } | { channelId: string; groupId: string };
 }
 
 export function validCursor(value: unknown): value is string {
@@ -86,14 +86,11 @@ export function createManagementClient(
         request.query !== undefined &&
         (request.method !== "GET" ||
           !isRecord(request.query) ||
-          Object.keys(request.query).length !== 1 ||
-          !validCursor(request.query.cursor))
+          !validManagementQuery(request.query))
       )
         throw new CliError("INVALID_ARGUMENTS");
       const suffix =
-        request.query === undefined
-          ? ""
-          : `?${new URLSearchParams({ cursor: request.query.cursor }).toString()}`;
+        request.query === undefined ? "" : `?${new URLSearchParams(request.query).toString()}`;
       let body: string | undefined;
       try {
         body = request.body === undefined ? undefined : JSON.stringify(request.body);
@@ -193,4 +190,20 @@ export function createManagementClient(
       }
     },
   };
+}
+
+function validManagementQuery(
+  query: Record<string, unknown>,
+): query is { cursor: string } | { channelId: string; groupId: string } {
+  const keys = Object.keys(query).sort();
+  if (keys.length === 1 && keys[0] === "cursor") return validCursor(query.cursor);
+  return (
+    keys.length === 2 &&
+    keys[0] === "channelId" &&
+    keys[1] === "groupId" &&
+    typeof query.channelId === "string" &&
+    /^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$/u.test(query.channelId) &&
+    typeof query.groupId === "string" &&
+    /^[1-9]\d{0,15}$/u.test(query.groupId)
+  );
 }

@@ -15,6 +15,7 @@ import {
   type OneBotHistoryMessage,
 } from "./history.ts";
 import { GROUP_SCOPED_NAPCAT_ACTIONS, isAllowedNapCatAction } from "./capabilities.ts";
+import { normalizeQqNativeGroupRole, type QqNativeGroupRole } from "./group-role.js";
 
 const GROUP_SCOPED_ACTIONS = new Set(GROUP_SCOPED_NAPCAT_ACTIONS);
 
@@ -58,6 +59,15 @@ export type OneBotGroupInfoResult =
     }
   | OneBotReadFailure;
 
+export type OneBotGroupMemberRoleResult =
+  | {
+      status: "ok";
+      groupId: string;
+      userId: string;
+      role: QqNativeGroupRole;
+    }
+  | OneBotReadFailure;
+
 export type OneBotCapabilityResult =
   | { status: "ok"; data: unknown }
   | { status: "rejected"; code: "action_not_allowlisted" | "group_not_configured" }
@@ -77,6 +87,13 @@ export interface OneBotState {
     | "identity_check_failed"
     | "invalid_frame"
     | "ingress_overflow";
+}
+
+/** Payload-free group ingress status for a bounded, Owner-authorized diagnostic projection. */
+export interface OneBotIngressDiagnostic {
+  groupId: string;
+  stage: "normalized" | "ignored";
+  reason?: "not_addressed" | "empty_message";
 }
 
 export type OneBotDeliveryResult =
@@ -150,7 +167,10 @@ export interface OneBotAdapterOptions {
   onIngressError?: (error: {
     code: "invalid_message" | "unsupported_message" | "acceptance_failed" | "ingress_overflow";
     messageId?: string;
+    groupId?: string;
   }) => void;
+  /** Receives only a configured group id and fixed status codes, never message or member data. */
+  onIngressDiagnostic?: (diagnostic: OneBotIngressDiagnostic) => void;
   requestTimeoutMs?: number;
   reconnectDelayMs?: number;
   maxPendingIncoming?: number;
@@ -312,6 +332,46 @@ export class OneBotAdapter {
       return { status: "unknown", code: "invalid_response" };
     const name = typeof data.group_name === "string" ? data.group_name.trim() : "";
     return { status: "ok", groupId, name: name === "" ? null : name };
+  }
+
+  /**
+   * Re-reads one member's current QQ-native role immediately before a protected mutation.
+   *
+   * The target group must be configured, the authenticated socket must be ready, and the
+   * response must identify the same group and member. Only the normalized role leaves the
+   * adapter. Profile fields and the raw provider payload never enter model-visible Context.
+   */
+  async getGroupMemberRole(input: {
+    groupId: string;
+    userId: string;
+  }): Promise<OneBotGroupMemberRoleResult> {
+    const parsed = parseOneBotConfig({ ...this.config, groupIds: [input.groupId] });
+    const groupId = parsed.groupIds[0];
+    const userId = qqId(input.userId);
+    if (
+      groupId !== input.groupId ||
+      !this.config.groupIds.includes(input.groupId) ||
+      userId !== input.userId
+    )
+      return { status: "failed", code: "invalid_group" };
+    const socket = this.#socket;
+    if (this.#state.status !== "ready" || !socket)
+      return { status: "failed", code: "not_connected" };
+    const result = await this.#request(socket, "get_group_member_info", {
+      group_id: Number(groupId),
+      user_id: Number(userId),
+      no_cache: true,
+    });
+    if (result.status !== "ok") return toReadFailure(result);
+    const data = object(result.data);
+    if (
+      !data ||
+      qqId(data.group_id) !== groupId ||
+      qqId(data.user_id) !== userId ||
+      (data.role !== "owner" && data.role !== "admin" && data.role !== "member")
+    )
+      return { status: "unknown", code: "invalid_response" };
+    return { status: "ok", groupId, userId, role: normalizeQqNativeGroupRole(data.role) };
   }
 
   /**
@@ -490,6 +550,15 @@ export class OneBotAdapter {
       this.#options.onIngressError?.(error);
     } catch {
       /* No message payload is included in diagnostics. */
+    }
+  }
+
+  #ingressDiagnostic(diagnostic: OneBotIngressDiagnostic): void {
+    if (!this.config.groupIds.includes(diagnostic.groupId)) return;
+    try {
+      this.#options.onIngressDiagnostic?.(diagnostic);
+    } catch {
+      /* Diagnostics cannot affect message acceptance. */
     }
   }
 
@@ -687,15 +756,30 @@ export class OneBotAdapter {
       this.#ingressError({
         code: normalized.code,
         ...(normalized.messageId !== undefined && { messageId: normalized.messageId }),
+        ...(normalized.groupId !== undefined && { groupId: normalized.groupId }),
       });
       return;
     }
-    if (normalized.kind !== "message") return;
+    if (normalized.kind === "ignored") {
+      if (normalized.diagnostic)
+        this.#ingressDiagnostic({
+          groupId: normalized.diagnostic.groupId,
+          stage: "ignored",
+          reason: normalized.diagnostic.reason,
+        });
+      return;
+    }
     if (this.#state.status === "verifying") {
       if (this.#beforeVerification.length < this.#incomingLimit)
         this.#beforeVerification.push(normalized.message);
       else {
-        this.#ingressError({ code: "ingress_overflow", messageId: normalized.message.messageId });
+        this.#ingressError({
+          code: "ingress_overflow",
+          messageId: normalized.message.messageId,
+          ...(normalized.message.scope.chatType === "group"
+            ? { groupId: normalized.message.scope.chatId }
+            : {}),
+        });
         socket.terminate();
       }
       return;
@@ -704,8 +788,14 @@ export class OneBotAdapter {
   }
 
   #enqueue(message: OneBotIncomingMessage, socket: WebSocket, generation: number): void {
+    if (message.scope.chatType === "group")
+      this.#ingressDiagnostic({ groupId: message.scope.chatId, stage: "normalized" });
     if (this.#incomingCount >= this.#incomingLimit) {
-      this.#ingressError({ code: "ingress_overflow", messageId: message.messageId });
+      this.#ingressError({
+        code: "ingress_overflow",
+        messageId: message.messageId,
+        ...(message.scope.chatType === "group" ? { groupId: message.scope.chatId } : {}),
+      });
       this.#setState({ status: "reconnecting", reason: "ingress_overflow" });
       socket.terminate();
       return;
@@ -721,6 +811,7 @@ export class OneBotAdapter {
           this.#ingressError({
             code: "acceptance_failed",
             messageId: message.messageId,
+            ...(message.scope.chatType === "group" ? { groupId: message.scope.chatId } : {}),
           });
         }
       })

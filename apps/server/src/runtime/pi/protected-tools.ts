@@ -39,6 +39,14 @@ export class ToolInputError extends Error {
   }
 }
 
+/** A fixed-code execution-time authorization refusal outside the durable grant service. */
+export class ToolAuthorizationError extends Error {
+  constructor(code: "native_group_role_denied" | "native_group_role_unverified") {
+    super(code);
+    this.name = "ToolAuthorizationError";
+  }
+}
+
 export interface ProtectedToolOptions<
   TParams extends Record<string, unknown> = Record<string, unknown>,
   TResult = unknown,
@@ -111,9 +119,9 @@ function isTextualPrimitive(value: unknown): value is string | number | bigint {
  * The top level stays a subset check: it is the Tool's own envelope (which Tool, which
  * operation, which Resource), which a message never enumerates in full.
  *
- * This is the single comparison the Run-completion check and the mutating-Tool gate share. If
- * the two disagreed, a call could satisfy one and not the other: the Run would be retried
- * against a gate it cannot pass, or accepted while the Tool itself refuses.
+ * Run completion uses this comparison after a Tool reports success. Mutating Tools also
+ * reject additional top-level authority-bearing fields before execution, so a refused call
+ * cannot be counted as completed.
  */
 export function satisfiesRequiredInput(
   required: Readonly<Record<string, unknown>>,
@@ -131,6 +139,17 @@ export function satisfiesRequiredInput(
     if (!samePrimitive(actualValue, value)) return false;
   }
   return true;
+}
+
+/** Mutations may not add a target or switch that the current message did not bind. */
+function satisfiesRequiredMutationInput(
+  required: Readonly<Record<string, unknown>>,
+  actual: Readonly<Record<string, unknown>>,
+): boolean {
+  return (
+    satisfiesRequiredInput(required, actual) &&
+    Object.entries(actual).every(([key, value]) => value === undefined || key in required)
+  );
 }
 
 /**
@@ -166,8 +185,36 @@ export function requireMutationIntent(
 ): void {
   if (context.requiredToolName !== name) throw new ToolInputError("mutation_not_requested");
   const required = context.requiredToolInput;
-  if (!required || !satisfiesRequiredInput(required, actual))
+  if (!required || !satisfiesRequiredMutationInput(required, actual))
     throw new ToolInputError("mutation_not_requested");
+}
+
+/**
+ * The exact mutation request objects already used by this process.
+ *
+ * `requiredToolInput` is created once for a Run and every Tool context keeps that same object
+ * reference. A WeakSet therefore gives the Run one mutation attempt without adding mutable
+ * authority to persisted input or retaining completed Runs. The check and add are synchronous,
+ * so two concurrent calls cannot both cross the boundary before the provider is invoked.
+ */
+const consumedMutationIntents = new WeakSet<Readonly<Record<string, unknown>>>();
+
+/**
+ * Consumes the current Run's exact mutation request immediately before its side effect.
+ *
+ * Provider success is deliberately irrelevant. Once Glassbox has attempted the requested
+ * mutation, a model retry in the same Run is refused. A new user message creates a new Run and
+ * a new request object, so an explicit retry by the user remains possible.
+ */
+export function consumeMutationIntent(
+  context: ProtectedToolContext,
+  name: string,
+  actual: Readonly<Record<string, unknown>>,
+): void {
+  requireMutationIntent(context, name, actual);
+  const required = context.requiredToolInput!;
+  if (consumedMutationIntents.has(required)) throw new ToolInputError("mutation_already_attempted");
+  consumedMutationIntents.add(required);
 }
 
 export function createProtectedTool<
@@ -246,7 +293,7 @@ export function createProtectedTool<
         ) {
           throw new Error("Operation cancelled");
         }
-        if (error instanceof ToolInputError) throw error;
+        if (error instanceof ToolInputError || error instanceof ToolAuthorizationError) throw error;
         // A provider refusal is a fact about the world, not a broken Tool. Collapsing it into
         // the generic failure would erase the difference between "the bridge is down" and
         // "the Tool threw", which is exactly what a Run has to be able to report.

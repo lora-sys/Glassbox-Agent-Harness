@@ -153,14 +153,65 @@ describe("Web service", () => {
       provider: exa,
       resolveHost: publicResolver,
       browserFallback: {
-        search: async () => [{ url: "https://example.com/a", title: "A", highlights: ["found"] }],
-        fetch: async () => null,
+        search: async () => ({
+          status: "succeeded" as const,
+          results: [{ url: "https://example.com/a", title: "A", highlights: ["found"] }],
+        }),
+        fetch: async () => ({ status: "unavailable" as const }),
       },
     });
     const result = await fallback.search("run-1", { query: "query" });
     expect(result.plan.mode).toBe("browser_fallback");
     expect(result.providerStatus).toBe("quota_exhausted");
     expect(result.results[0]?.retrievalMethod).toBe("browser_search");
+  });
+
+  it.each(["blocked", "fallback_denied", "unavailable"] as const)(
+    "preserves browser search status %s without reporting zero-result success",
+    async (status) => {
+      const exa: WebProvider = {
+        search: async () => ({ status: "rate_limited", results: [] }),
+        contents: async () => ({ status: "rate_limited", results: [] }),
+      };
+      const result = await new WebService({
+        provider: exa,
+        resolveHost: publicResolver,
+        browserFallback: {
+          search: async () => ({ status, results: [] }),
+          fetch: async () => ({ status: "unavailable" }),
+        },
+      }).search("run-1", { query: "query" });
+      expect(result).toMatchObject({ status, providerStatus: "rate_limited", results: [] });
+      expect(result.plan.mode).toBe("browser_fallback");
+    },
+  );
+
+  it("preserves browser partial search output and unknown metadata", async () => {
+    const exa: WebProvider = {
+      search: async () => ({ status: "failed", results: [] }),
+      contents: async () => ({ status: "failed", results: [] }),
+    };
+    const result = await new WebService({
+      provider: exa,
+      resolveHost: publicResolver,
+      browserFallback: {
+        search: async () => ({
+          status: "partial",
+          results: [
+            {
+              url: "https://example.com/a",
+              title: "A",
+              highlights: [],
+              author: null,
+              publishedAt: null,
+            },
+          ],
+        }),
+        fetch: async () => ({ status: "unavailable" }),
+      },
+    }).search("run-1", { query: "query" });
+    expect(result).toMatchObject({ status: "partial", partial: true });
+    expect(result.results[0]).toMatchObject({ author: null, publishedAt: null });
   });
 
   it("fetches one validated URL with the same source ID and bounded content", async () => {
@@ -174,6 +225,39 @@ describe("Web service", () => {
       "web_target_non_public",
     );
     expect((exa.contents as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(1);
+  });
+
+  it("retains browser fetch status, final URL, extraction method, and avoids prose for binary content", async () => {
+    const exa: WebProvider = {
+      search: async () => ({ status: "ready", results: [] }),
+      contents: async () => ({ status: "failed", results: [] }),
+    };
+    const service = new WebService({
+      provider: exa,
+      resolveHost: publicResolver,
+      browserFallback: {
+        search: async () => ({ status: "unavailable", results: [] }),
+        fetch: async () => ({
+          status: "partial",
+          finalUrl: "https://example.com/final.pdf",
+          title: "PDF",
+          text: "must not be rendered as prose",
+          contentType: "application/pdf",
+          extractionMethod: "none",
+          author: null,
+          publishedAt: null,
+        }),
+      },
+    });
+    const fetched = await service.fetch("run-1", { url: "https://example.com/start" });
+    expect(fetched).toMatchObject({
+      status: "partial",
+      url: "https://example.com/final.pdf",
+      extractionMethod: "none",
+      author: null,
+      publishedAt: null,
+      text: "",
+    });
   });
 
   it("canonicalizes only known tracking parameters", () => {

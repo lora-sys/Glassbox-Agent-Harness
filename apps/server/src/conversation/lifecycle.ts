@@ -94,6 +94,22 @@ function storedScope(row: Row): TrustedChannelScope {
     requireIdentifier(value.threadId);
     scope.threadId = value.threadId;
   }
+  if ("nativeGroupRole" in value) {
+    const observed = value.nativeGroupRole;
+    if (
+      typeof observed !== "object" ||
+      observed === null ||
+      !("role" in observed) ||
+      !("source" in observed) ||
+      !("observedAt" in observed)
+    )
+      throw new Error("Invalid persisted scope");
+    scope.nativeGroupRole = {
+      role: observed.role as NonNullable<TrustedChannelScope["nativeGroupRole"]>["role"],
+      source: observed.source as NonNullable<TrustedChannelScope["nativeGroupRole"]>["source"],
+      observedAt: observed.observedAt as string,
+    };
+  }
   scopeKey(scope);
   return scope;
 }

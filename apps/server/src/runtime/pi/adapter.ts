@@ -77,6 +77,10 @@ export interface PiSdkRuntimeOptions {
    * excluded and why. `resolveToolNames` remains for fakes that only need the active names.
    */
   resolveToolCandidates?: (context: PiRunContext) => Promise<readonly ToolSurfaceCandidate[]>;
+  /** Current backend readiness is separate from discovery and authorization. */
+  resolveProviderReadiness?: (
+    context: PiRunContext,
+  ) => Promise<Readonly<Record<string, "ready" | "unavailable" | "unknown">>>;
   onEvent?: (event: PiNormalizedEvent) => void | Promise<void>;
   createSession?: (params: {
     conversation: Conversation;
@@ -159,7 +163,10 @@ function safeToolFailureCode(result: unknown): string {
     return "tool_execution_failed";
   }
   if (text.includes("context_missing")) return "context_missing";
+  if (text.includes("mutation_already_attempted")) return "mutation_already_attempted";
   if (text.includes("Permission denied")) return "authorization_denied";
+  if (text.includes("native_group_role_denied") || text.includes("native_group_role_unverified"))
+    return "authorization_denied";
   if (text.includes("capability_category_disabled")) return "capability_category_disabled";
   // A provider refusal is its own fact: "the bridge is not connected" and "the request was
   // rejected" are not the same as "the Tool broke", and a Run that cannot tell them apart
@@ -357,6 +364,9 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
           profileName,
           profileActiveTools: profile.activeTools,
           candidates,
+          ...(context && this.options.resolveProviderReadiness
+            ? { providerReadiness: await this.options.resolveProviderReadiness(context) }
+            : {}),
           // The digest of the profile file that produced this surface, so an old Run's
           // evidence can be read against the declaration it actually ran under.
           profileVersion: profileFingerprint(runtimeEvidence, profileName),

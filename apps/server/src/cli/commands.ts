@@ -46,6 +46,8 @@ export const CLI_HELP = `Glassbox 本机管理
   runs show <id>               查看任务
   runs cancel <id>             请求取消，显示服务端实际状态
   trace show <run-id>          查看任务 Trace，可用 --cursor 翻页
+  trace group-role-audit <channel-id> <group-id>
+                              查看已管理群最近一次角色审计，不含消息正文
   runs trace <run-id>          trace show 的兼容命令
   eval run <run-id>            执行该任务的 run-integrity-v1 固定验收
   eval list <run-id>           列出该任务的 Eval 结果，可用 --cursor 翻页
@@ -244,6 +246,26 @@ export function parseCommand(args: readonly string[]): ParsedCommand {
         // picked a group for the operator could call one that was never meant to be touched.
         groupId: identifier(positionals[3], "group"),
       });
+    }
+    if (
+      positionals[0] === "trace" &&
+      positionals[1] === "group-role-audit" &&
+      positionals.length === 4
+    ) {
+      only();
+      return {
+        kind: "request",
+        json,
+        input: "none",
+        request: {
+          method: "GET",
+          path: "/manage/group-role-audit",
+          query: {
+            channelId: identifier(positionals[2], "channel"),
+            groupId: identifier(positionals[3], "group"),
+          },
+        },
+      };
     }
     if (
       positionals.length === 3 &&

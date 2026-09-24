@@ -14,18 +14,19 @@ describe("keyless Exa MCP adapter", () => {
         title: "Example",
         url: "https://example.com/a",
         publishedDate: "2026-09-01",
+        author: "A",
         highlights: ["Fact one", "Fact two"],
       },
     ]);
   });
 
-  it("bounds requested results and distinguishes rate limit from empty results", async () => {
+  it("bounds requested results and distinguishes rate limiting from quota exhaustion", async () => {
     const call = vi.fn<ExaMcpCaller["call"]>(async () => ({
       isError: true,
       content: [{ type: "text", text: "Rate limit exceeded" }],
     }));
     const result = await new ExaMcpProvider({ call }).search({ query: "test", maxResults: 100 });
-    expect(result.status).toBe("quota_exhausted");
+    expect(result.status).toBe("rate_limited");
     expect(call).toHaveBeenCalledWith("web_search_exa", {
       query: "test",
       numResults: 10,

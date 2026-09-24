@@ -157,6 +157,25 @@ it("changes one category without clobbering the group's other policy fields", as
   }
 });
 
+it("changes history capability and memory source together in one version step", async () => {
+  const { store } = await fixture();
+  try {
+    const input = { connectionId: "qq", groupId: "100", principalId: "owner" };
+    const enabled = await store.capabilities.setHistory({ ...input, enabled: true });
+    expect(enabled.version).toBe(1);
+    const policy = await store.capabilities.read("qq", "100");
+    expect(policy?.policy.categories["group.history"]).toBe(true);
+    expect(policy?.policy.memorySources.history).toBe(true);
+    const disabled = await store.capabilities.setHistory({ ...input, enabled: false });
+    expect(disabled.version).toBe(2);
+    const after = await store.capabilities.read("qq", "100");
+    expect(after?.policy.categories["group.history"]).toBe(false);
+    expect(after?.policy.memorySources.history).toBe(false);
+  } finally {
+    await store.close();
+  }
+});
+
 it("refuses a single-field mutation that names an unimplemented category or source class", async () => {
   const { store } = await fixture();
   try {

@@ -5,13 +5,14 @@ import {
   type PublicChannelProfile,
   type QqSourceClass,
 } from "@glassbox/contracts";
-import { ChannelProfileStore, ChannelConfigurationError } from "../config/channel-profiles.js";
+import { ChannelProfileStore } from "../config/channel-profiles.js";
 import { GroupRuntimeStore } from "../config/group-runtime.js";
 import type { ModelProfileStore } from "../config/model-profiles.js";
-import { ExecutorConfiguration, ExecutorBusyError } from "../config/executors.js";
+import { ExecutorConfiguration } from "../config/executors.js";
 import {
   OneBotAdapter,
   OneBotConnectionError,
+  type OneBotIngressDiagnostic,
   type OneBotState,
 } from "../channels/onebot/index.js";
 import {
@@ -28,7 +29,7 @@ import {
 } from "../runtime/pi/index.js";
 import { configuredPiModel } from "../runtime/pi/configured-model.js";
 import { createOpsTools, OPS_TOOL_NAMES, type WorkerTarget } from "../runtime/pi/ops-tools.js";
-import { createBrowserTools, PLAYWRIGHT_CLI_TOOL } from "../runtime/pi/browser-tools.js";
+import { createBrowserTools, BROWSER_TOOL } from "../runtime/pi/browser-tools.js";
 import {
   createWebTools,
   WEB_ACTIONS,
@@ -38,6 +39,10 @@ import {
 } from "../runtime/pi/web-tools.js";
 import { WebService } from "../web/web-service.js";
 import { GuardedBrowserFallback } from "../web/browser-fallback.js";
+import { BrowserBridge } from "../web/browser-bridge.js";
+import { BrowserSessionRegistry, type BrowserSessionBinding } from "../web/browser-session.js";
+import type { BrowserExecutorPort } from "../web/browser-executor-port.js";
+import { dohResolveWebHost } from "../web/network-guard.js";
 import {
   isWebCapabilityEnabled,
   WEB_CAPABILITIES,
@@ -82,7 +87,7 @@ import {
   GROUP_RUN_CAPABILITY_CATEGORIES,
 } from "../runtime/pi/capability-tools.js";
 import { resolveSkillVisibility } from "../runtime/pi/skill-visibility.js";
-import { requireProviderSuccess } from "../runtime/pi/provider-outcome.js";
+import { ProviderCallError, requireProviderSuccess } from "../runtime/pi/provider-outcome.js";
 import type { PiRunContext } from "../runtime/pi/types.js";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import {
@@ -111,23 +116,18 @@ import { groupResourceId, resolveAssignedGroupIds } from "../retrieval/source-re
 import { AuthorizedOpsService, type WorkerPolicy } from "../ops/service.js";
 import { OpsReconciler } from "../ops/reconciler.js";
 import type { HerdrBridge } from "../ops/herdr-bridge.js";
+import { openDomainStore, type DomainStore } from "../application/domain-store.js";
 import {
-  openDomainStore,
   agentResourceId,
-  type DomainStore,
   type TrustedChannelScope,
   type CallerContext,
 } from "../persistence/index.js";
 import { RunTraceStore } from "../trace/run-store.js";
-import type { TraceEntry } from "../trace/store.js";
-import { createRunEvaluator, RunEvalError } from "../eval/index.js";
+import { createRunEvaluator } from "../eval/index.js";
 import { ManagementError } from "./access.js";
-import { readManagementJson } from "./http.js";
-import {
-  projectToolPlaneDiagnostics,
-  TOOL_PLANE_DIAGNOSTIC_RECORD_CAP,
-} from "./tool-plane-diagnostics.js";
+import { GROUP_ROLE_AUDIT_RECORD_CAP, projectGroupRoleAudit } from "./group-role-audit.js";
 import { grantOpsPermissions } from "./ops-grants.js";
+import { routeManagementRequest } from "./routes.js";
 import { createQqDeliveryPolicy, hostDeliveryForbiddenValues } from "../delivery/content-policy.js";
 import {
   TOOL_DESCRIPTORS,
@@ -138,6 +138,18 @@ import {
 
 const OWNER_ID = "owner";
 const AGENT_ID = "personal";
+interface GroupIngressDiagnosticCounts {
+  serviceStartedAt: string;
+  lastObservedAt: string | null;
+  normalized: number;
+  ignoredNotAddressed: number;
+  ignoredEmptyMessage: number;
+  rejectedInvalidMessage: number;
+  rejectedUnsupportedMessage: number;
+  rejectedOverflow: number;
+  acceptanceFailed: number;
+}
+
 type AuthorizationContext = {
   caller: CallerContext;
   conversationId?: string;
@@ -272,13 +284,15 @@ export class ManagementApplication {
   readonly archive: ChannelArchiveStore;
   executors!: ExecutorConfiguration;
   private readonly connections = new Map<string, OneBotAdapter>();
-  private readonly browserCleanups = new Map<string, () => Promise<void>>();
+  private readonly browserCleanups = new Map<string, Set<() => Promise<void>>>();
   private readonly deliveryPolicy: ReturnType<typeof createQqDeliveryPolicy>;
   private readonly kitLoader: KitLoader;
   private readonly states = new Map<
     string,
     Pick<PublicChannelProfile, "connectionState" | "lastError">
   >();
+  private readonly ingressStartedAt = new Date().toISOString();
+  private readonly groupIngressDiagnostics = new Map<string, GroupIngressDiagnosticCounts>();
   private operations: Promise<unknown> = Promise.resolve();
   private accepting = false;
   private releaseIngress!: () => void;
@@ -291,6 +305,7 @@ export class ManagementApplication {
       dataDirectory: string;
       kitPath?: string;
       models: ModelProfileStore;
+      browserExecutor?: BrowserExecutorPort;
       executors?: ReadonlyMap<string, RunExecutionAdapter>;
       ops?: {
         bridge: HerdrBridge;
@@ -363,6 +378,7 @@ export class ManagementApplication {
     databasePath?: string;
     kitPath?: string;
     models: ModelProfileStore;
+    browserExecutor?: BrowserExecutorPort;
     executors?: ReadonlyMap<string, RunExecutionAdapter>;
     ops?: {
       bridge: HerdrBridge;
@@ -422,9 +438,9 @@ export class ManagementApplication {
       createTools: (getContext) => this.createRuntimeTools(getContext),
       onRunEnd: async (context) => {
         if (!context.runId) return;
-        const cleanup = this.browserCleanups.get(context.runId);
+        const cleanups = this.browserCleanups.get(context.runId);
         this.browserCleanups.delete(context.runId);
-        await cleanup?.();
+        if (cleanups) await Promise.allSettled([...cleanups].map((cleanup) => cleanup()));
       },
       resolveSkillNames: async (context, profile) => {
         if (!context.caller)
@@ -461,6 +477,9 @@ export class ManagementApplication {
       },
       resolveToolNames: (context) => this.resolveRunToolNames(context),
       resolveToolCandidates: (context) => this.resolveRunToolCandidates(context),
+      resolveProviderReadiness: async () => ({
+        [BROWSER_TOOL]: this.options.browserExecutor ? "unknown" : "unavailable",
+      }),
       onEvent: async (event) => {
         const runId =
           event.runId ?? (typeof event.data.runId === "string" ? event.data.runId : undefined);
@@ -495,41 +514,87 @@ export class ManagementApplication {
    * test proves the product path rather than the helper.
    */
   private createRuntimeTools(getContext: () => PiRunContext | undefined): ToolDefinition[] {
+    const sessions = new BrowserSessionRegistry();
+    const browserBinding = async (
+      context: ProtectedToolContext,
+    ): Promise<BrowserSessionBinding> => {
+      const scope = context.caller.scope;
+      const policyVersion =
+        scope.chatType === "group"
+          ? `group-${(await this.store.capabilities.read(scope.connectionId, scope.chatId))?.version ?? 0}`
+          : "owner-private-v1";
+      return {
+        principalId: context.caller.principalId,
+        runId: context.runId,
+        conversationId: context.conversationId,
+        workspaceId: WEB_RESOURCE,
+        policyVersion,
+      };
+    };
+    const registerBrowserCleanup = (runId: string, cleanup: () => Promise<void>) => {
+      let cleanups = this.browserCleanups.get(runId);
+      if (!cleanups) {
+        cleanups = new Set();
+        this.browserCleanups.set(runId, cleanups);
+      }
+      cleanups.add(cleanup);
+    };
+    const authorizeBrowser = async (
+      binding: BrowserSessionBinding,
+      capability: "browser.read" | "browser.interact",
+    ) => {
+      const context = getContext();
+      if (
+        !context?.caller ||
+        context.runId !== binding.runId ||
+        context.conversationId !== binding.conversationId ||
+        context.caller.principalId !== binding.principalId
+      )
+        return false;
+      const protectedContext = {
+        caller: context.caller,
+        runId: binding.runId,
+        conversationId: binding.conversationId,
+      };
+      const current = await browserBinding(protectedContext);
+      if (
+        current.workspaceId !== binding.workspaceId ||
+        current.policyVersion !== binding.policyVersion
+      )
+        return false;
+      if (!(await this.isWebEnabled(protectedContext, capability))) return false;
+      const decision = await this.store.authorization.check({
+        caller: context.caller,
+        resourceId: WEB_RESOURCE,
+        action: WEB_ACTIONS[capability],
+        runId: binding.runId,
+        conversationId: binding.conversationId,
+      });
+      return decision.decision === "ALLOW";
+    };
+    const browserBridge = this.options.browserExecutor
+      ? new BrowserBridge({
+          executor: this.options.browserExecutor,
+          sessions,
+          resolveHost: dohResolveWebHost,
+          authorize: (binding, capability) => authorizeBrowser(binding, capability),
+        })
+      : undefined;
     const browserFallback = new GuardedBrowserFallback({
-      binding: () => {
+      bridge: browserBridge,
+      resolveHost: dohResolveWebHost,
+      binding: async () => {
         const context = getContext();
         return context?.caller && context.runId && context.conversationId
-          ? {
-              principalId: context.caller.principalId,
+          ? browserBinding({
+              caller: context.caller,
               runId: context.runId,
               conversationId: context.conversationId,
-            }
+            })
           : undefined;
       },
-      authorizeRead: async (binding) => {
-        const context = getContext();
-        if (
-          !context?.caller ||
-          context.runId !== binding.runId ||
-          context.conversationId !== binding.conversationId ||
-          context.caller.principalId !== binding.principalId
-        )
-          return false;
-        const protectedContext = {
-          caller: context.caller,
-          runId: binding.runId,
-          conversationId: binding.conversationId,
-        };
-        if (!(await this.isWebEnabled(protectedContext, "browser.read"))) return false;
-        const decision = await this.store.authorization.check({
-          caller: context.caller,
-          resourceId: WEB_RESOURCE,
-          action: WEB_ACTIONS["browser.read"],
-          runId: binding.runId,
-          conversationId: binding.conversationId,
-        });
-        return decision.decision === "ALLOW";
-      },
+      authorize: authorizeBrowser,
+      onActivated: (binding, cleanup) => registerBrowserCleanup(binding.runId, cleanup),
     });
     return [
       ...createWebTools({
@@ -545,9 +610,12 @@ export class ManagementApplication {
       ...createBrowserTools({
         store: this.store,
         getContext,
+        binding: browserBinding,
+        bridge: browserBridge,
+        sessions,
         isEnabled: (context, capability) => this.isWebEnabled(context, capability),
-        onActivated: (context, cleanup) => this.browserCleanups.set(context.runId, cleanup),
-        onClosed: (runId) => this.browserCleanups.delete(runId),
+        onActivated: (context, cleanup) => registerBrowserCleanup(context.runId, cleanup),
+        onClosed: () => undefined,
         recordEvidence: async (evidence, context) => {
           const cursor = await this.trace.append(context.runId, evidence, "glassbox-browser");
           await this.store.evidence.advanceTrace(context.caller, cursor);
@@ -601,7 +669,107 @@ export class ManagementApplication {
         invoke: async ({ action, params, context }) => {
           const connection = this.connections.get(context.caller.scope.connectionId);
           if (!connection) throw new Error("channel_not_connected");
-          return requireProviderSuccess(await connection.invokeCapability({ action, params }));
+          const providerResult = requireProviderSuccess(
+            await connection.invokeCapability({ action, params }),
+          );
+          // NapCat can acknowledge `set_group_admin` even when QQ keeps the member's old role.
+          // The mutation is not successful until a fresh provider read proves the requested
+          // postcondition. This check is below the model and uses the same authenticated
+          // connection, so a provider no-op cannot become a successful Tool result or reply.
+          if (
+            action === "set_group_admin" &&
+            (typeof params.group_id === "number" || typeof params.group_id === "string") &&
+            (typeof params.user_id === "number" || typeof params.user_id === "string") &&
+            typeof params.enable === "boolean"
+          ) {
+            const groupId = String(params.group_id);
+            const userId = String(params.user_id);
+            const expectedRole = params.enable ? "qq_group_admin" : "qq_group_member";
+            const observed = await connection.getGroupMemberRole({ groupId, userId });
+            const verified = observed.status === "ok" && observed.role === expectedRole;
+            const cursor = await this.trace.append(
+              context.runId,
+              {
+                type: "provider_mutation_verification",
+                runId: context.runId,
+                conversationId: context.conversationId,
+                principalId: context.caller.principalId,
+                resourceId: groupResourceId(groupId),
+                requestedTool: "qq_group_settings",
+                requestedOperation: action,
+                targetUserId: userId,
+                expectedRole,
+                observedRole: observed.status === "ok" ? observed.role : null,
+                verificationStatus:
+                  observed.status === "ok"
+                    ? verified
+                      ? "verified"
+                      : "mismatch"
+                    : observed.status === "unknown"
+                      ? "unknown"
+                      : observed.code === "not_connected"
+                        ? "unavailable"
+                        : "failed",
+              },
+              "glassbox-provider-postcondition",
+            );
+            await this.store.evidence.advanceTrace(context.caller, cursor);
+            if (!verified) {
+              if (observed.status === "failed" && observed.code === "not_connected")
+                throw new ProviderCallError("provider_unavailable", "provider_unavailable");
+              if (observed.status === "unknown")
+                throw new ProviderCallError("unknown", "provider_unknown");
+              throw new ProviderCallError("provider_failed", "provider_postcondition_failed");
+            }
+          }
+          return providerResult;
+        },
+        verifyNativeGroupRole: async ({ context, groupId, capability, operation }) => {
+          const connection = this.connections.get(context.caller.scope.connectionId);
+          const result = connection
+            ? await connection.getGroupMemberRole({
+                groupId,
+                userId: context.caller.scope.senderId,
+              })
+            : ({ status: "failed", code: "not_connected" } as const);
+          const verificationStatus =
+            result.status === "ok"
+              ? capability.nativeGroupRoles?.includes(result.role)
+                ? "verified"
+                : "mismatch"
+              : result.status === "unknown"
+                ? "unknown"
+                : result.code === "not_connected"
+                  ? "unavailable"
+                  : "failed";
+          const cursor = await this.trace.append(
+            context.runId,
+            {
+              type: "native_group_role_verification",
+              runId: context.runId,
+              conversationId: context.conversationId,
+              principalId: context.caller.principalId,
+              resourceId: groupResourceId(groupId),
+              groupId,
+              senderId: context.caller.scope.senderId,
+              observedRole: context.caller.scope.nativeGroupRole?.role ?? "qq_group_member",
+              roleSource:
+                context.caller.scope.nativeGroupRole?.source ?? "missing_defaults_to_member",
+              verifiedRole: result.status === "ok" ? result.role : null,
+              verificationStatus,
+              requestedTool: capability.tool,
+              requestedOperation: operation,
+              authorizationDecision: verificationStatus === "verified" ? "ALLOW" : "DENY",
+            },
+            "glassbox-qq-role",
+          );
+          await this.store.evidence.advanceTrace(context.caller, cursor);
+          if (result.status === "ok") return result.role;
+          if (result.status === "failed" && result.code === "not_connected")
+            throw new ProviderCallError("provider_unavailable", "provider_unavailable");
+          if (result.status === "unknown")
+            throw new ProviderCallError("unknown", "provider_unknown");
+          throw new ProviderCallError("provider_failed", "provider_failed");
         },
         search: (input) => this.searchCapabilities(input.context, input),
         projectManagedGroups: (context) => this.projectManagedGroups(context),
@@ -715,6 +883,7 @@ export class ManagementApplication {
         isOwner,
         chatType: scope.chatType,
         enabledCategories: capabilityCategories,
+        nativeGroupRole: scope.nativeGroupRole?.role,
       }),
     );
     for (const [name, capability] of [
@@ -730,7 +899,7 @@ export class ManagementApplication {
       )
         scopeGates.set(name, "policy_disabled");
     }
-    classified.add(PLAYWRIGHT_CLI_TOOL);
+    classified.add(BROWSER_TOOL);
     const webContext = {
       caller: context.caller,
       conversationId: context.conversationId,
@@ -740,7 +909,7 @@ export class ManagementApplication {
       !(await this.isWebEnabled(webContext, "browser.read")) &&
       !(await this.isWebEnabled(webContext, "browser.interact"))
     )
-      scopeGates.set(PLAYWRIGHT_CLI_TOOL, "policy_disabled");
+      scopeGates.set(BROWSER_TOOL, "policy_disabled");
 
     // The Agent Ops and Owner-control surface is Owner-private. A group Run reaches neither,
     // however the Owner's own grants look, so this is a scope boundary rather than a policy.
@@ -953,6 +1122,8 @@ export class ManagementApplication {
             });
         }
       },
+      onIngressError: (error) => this.recordGroupIngressError(id, error),
+      onIngressDiagnostic: (diagnostic) => this.recordGroupIngressDiagnostic(id, diagnostic),
       onIncoming: async (message, signal) => {
         await this.ingressReady;
         await connectionReady;
@@ -976,13 +1147,33 @@ export class ManagementApplication {
           });
           return;
         }
-        await this.runs.receive({
+        const accepted = await this.store.conversations.acceptIncoming({
           agentId: AGENT_ID,
           scope: message.scope,
           messageId: message.messageId,
           text: message.text,
           executionRef: configured.executionRef,
         });
+        if (!accepted.duplicate && message.scope.nativeGroupRole) {
+          const cursor = await this.trace.append(
+            accepted.run.id,
+            {
+              type: "native_group_role_observed",
+              runId: accepted.run.id,
+              conversationId: accepted.conversation.id,
+              principalId: accepted.caller.principalId,
+              resourceId: groupResourceId(message.scope.chatId),
+              groupId: message.scope.chatId,
+              senderId: message.scope.senderId,
+              observedRole: message.scope.nativeGroupRole.role,
+              roleSource: message.scope.nativeGroupRole.source,
+              observedAt: message.scope.nativeGroupRole.observedAt,
+            },
+            "glassbox-qq-role",
+          );
+          await this.store.evidence.advanceTrace(accepted.caller, cursor);
+        }
+        await this.runs.enqueueAccepted(accepted);
       },
     });
     this.connections.set(id, adapter);
@@ -1159,7 +1350,7 @@ export class ManagementApplication {
           effect: "allow",
         });
       }
-      for (const name of [WEB_SEARCH_TOOL, WEB_FETCH_TOOL, PLAYWRIGHT_CLI_TOOL]) {
+      for (const name of [WEB_SEARCH_TOOL, WEB_FETCH_TOOL, BROWSER_TOOL]) {
         const resourceId = toolResourceId(name);
         await this.store.authorization.registerResource({
           id: resourceId,
@@ -1186,11 +1377,11 @@ export class ManagementApplication {
         visibility: "public",
         ifAbsent: true,
       });
-      // A Run inside a configured group may read that same group. This is not implied by bot
-      // membership: the grant exists only for a group Glassbox has configured, it is scoped to
-      // that one group, and it covers only the read-only categories. The Run's candidate list
-      // narrows them to the Owner's current policy, and every call is re-authorized.
-      for (const action of this.groupRunReadActions()) {
+      // A Run inside a configured group may address that same group. This is not implied by bot
+      // membership: the grant exists only for a group Glassbox has configured and is scoped to
+      // that one group. The candidate list narrows it by current policy and the message's
+      // observed native role. Mutations also require live role verification and re-authorization.
+      for (const action of this.groupRunActions()) {
         const existing = await this.store.authorization.check({
           caller,
           resourceId: groupResource,
@@ -1394,6 +1585,7 @@ export class ManagementApplication {
       isOwner,
       chatType: input.scope.chatType,
       enabledCategories: [...QQ_CAPABILITY_CATEGORIES],
+      ...(input.scope.chatType === "group" ? { nativeGroupRole: "qq_group_owner" as const } : {}),
     });
     for (const name of names) {
       const resourceId = toolResourceId(name);
@@ -1513,9 +1705,10 @@ export class ManagementApplication {
         // its group-scope grants. A sibling Owner's assignment keeps the group alive.
         lastAssignedOwner = (await this.assignedOwners(configured, input.groupId)).length === 0;
         if (lastAssignedOwner) {
-          await this.store.authorization.revokeResource(groupResource);
-          // Dynamic group members are not part of the static profile. Revoke the whole
-          // Channel location so no sender-specific Agent or Tool grant survives disable.
+          // The Resource name is shared across connections. Revoke this connection's
+          // location, not the whole Resource, or a second connection's grant is lost.
+          // Dynamic group members are not part of the static profile, so this also removes
+          // sender-specific Agent and Tool grants left by the disabled location.
           await this.store.authorization.revokeLocationScopes({
             connectionId: configured.config.connectionId,
             botId: configured.config.botId,
@@ -1608,16 +1801,21 @@ export class ManagementApplication {
   }
 
   /**
-   * The read-only protected Actions a Run inside a configured group may perform on that group.
+   * The protected Actions a Run inside a configured group can ever request on that group.
    *
    * Derived from the same category registry the Tools are, so the grant and the Tool surface
-   * cannot drift. Mutation categories are absent from `GROUP_RUN_CAPABILITY_CATEGORIES`, so a
-   * group Run can never acquire one through this path.
+   * cannot drift. The durable grant is a superset, not native-role truth. Candidate discovery
+   * and execution-time provider verification keep ordinary members read-only.
    */
-  private groupRunReadActions(): string[] {
+  private groupRunActions(): string[] {
     return [
       ...new Set(
-        GROUP_RUN_CAPABILITY_CATEGORIES.flatMap((category) => this.categoryActions(category)),
+        QQ_CAPABILITIES.filter(
+          (capability) =>
+            capability.resource === "group" &&
+            (GROUP_RUN_CAPABILITY_CATEGORIES.includes(capability.category) ||
+              capability.nativeGroupRoles !== undefined),
+        ).map((capability) => capability.action),
       ),
     ];
   }
@@ -1642,10 +1840,11 @@ export class ManagementApplication {
           isOwner: false,
           chatType: "group",
           enabledCategories: [...QQ_CAPABILITY_CATEGORIES],
+          nativeGroupRole: "qq_group_owner",
         }),
         WEB_SEARCH_TOOL,
         WEB_FETCH_TOOL,
-        PLAYWRIGHT_CLI_TOOL,
+        BROWSER_TOOL,
       ]),
     ];
   }
@@ -1795,6 +1994,7 @@ export class ManagementApplication {
           );
     if (input.action === "set_memory_source") return this.setGroupMemorySource(context, input);
     if (input.action === "set_history") return this.setGroupHistory(context, input);
+    await this.requireManagedGroup(context, input.groupId);
     const runtime = this.groupRuntime.get(
       caller.scope.connectionId,
       input.groupId,
@@ -1825,7 +2025,9 @@ export class ManagementApplication {
         qqCapabilitiesForCategory(category)
           // Account-scoped capabilities describe the Agent's own connection; granting their
           // Action on a group Resource would be a dead grant, so the bundle never writes one.
-          .filter((capability) => capability.resource === "group")
+          .filter(
+            (capability) => capability.resource === "group" && capability.ownerPrivate !== false,
+          )
           .map((capability) => capability.action),
       ),
     ];
@@ -2032,11 +2234,7 @@ export class ManagementApplication {
         principalId: context.caller.principalId,
         enabled: input.enabled,
       };
-      await this.store.capabilities.setCategory({ ...common, category: "group.history" });
-      const { version } = await this.store.capabilities.setMemorySource({
-        ...common,
-        sourceClass: "history",
-      });
+      const { version } = await this.store.capabilities.setHistory(common);
       await this.applyCategoryAuthority({
         context,
         groupId: input.groupId,
@@ -2414,160 +2612,142 @@ export class ManagementApplication {
     return caller;
   }
 
-  async route(request: IncomingMessage): Promise<{ status: number; body: unknown } | undefined> {
-    const url = new URL(request.url ?? "/", "http://localhost");
-    const path = url.pathname;
-    if (request.method === "POST" && path === "/manage/ops/grants") {
-      const result = await grantOpsPermissions(
-        this.store,
-        this.options.ops?.workerPolicy,
-        await readManagementJson(request),
-      );
-      return { status: 200, body: result };
-    }
-    const revokeOpsGrant = /^\/manage\/ops\/grants\/([a-zA-Z0-9-]{1,80})\/revoke$/u.exec(path);
-    if (request.method === "POST" && revokeOpsGrant) {
-      await this.store.authorization.revoke(revokeOpsGrant[1]!);
-      await this.store.tasks.recordTrace({
-        type: "authorization.revoked",
-        principalId: OWNER_ID,
-        data: { grantId: revokeOpsGrant[1], authority: "local-management" },
-      });
-      return { status: 200, body: { revoked: true } };
-    }
-    const options = {
-      ...(url.searchParams.has("cursor") ? { cursor: url.searchParams.get("cursor")! } : {}),
-      limit: 30,
-    };
-    const ok = (body: unknown) => ({ status: 200, body });
+  private async requireManagedRoleAuditGroup(channelId: string, groupId: string) {
+    let configured: ReturnType<ChannelProfileStore["resolve"]>;
     try {
-      if (path === "/manage/executors") {
-        if (request.method === "GET") return ok({ executors: await this.executors.list() });
-        if (request.method === "POST")
-          return ok({ executor: await this.executors.save(await readManagementJson(request)) });
-      }
-      if (request.method === "POST" && path === "/manage/executors/claude-code/check") {
-        await readManagementJson(request);
-        return ok({ executor: await this.executors.check() });
-      }
-      if (path === "/manage/channels") {
-        if (request.method === "GET") return ok({ channels: this.listChannels() });
-        if (request.method === "POST")
-          return ok({ channel: await this.saveChannel(await readManagementJson(request)) });
-      }
-      const channelAction = /^\/manage\/channels\/([A-Za-z0-9_-]+)\/(connect|disconnect)$/u.exec(
-        path,
-      );
-      if (request.method === "POST" && channelAction)
-        return ok({
-          channel:
-            channelAction[2] === "connect"
-              ? await this.connectChannel(channelAction[1]!)
-              : await this.disconnectChannel(channelAction[1]!),
-        });
-      if (request.method === "POST" && path === "/manage/capabilities/probe") {
-        const input = await readManagementJson(request);
-        const value = (input ?? {}) as Record<string, unknown>;
-        if (typeof value.channelId !== "string" || typeof value.groupId !== "string")
-          throw new ManagementError("INVALID_REQUEST", "A channel and a group are required");
-        return ok({
-          probe: await this.probeCapabilities(value.channelId, value.groupId),
-        });
-      }
-      if (request.method === "GET" && path === "/manage/conversations")
-        return ok(await this.store.management.listConversations(OWNER_ID, options));
-      if (request.method === "GET" && path === "/manage/runs") {
-        const conversationId = url.searchParams.get("conversationId");
-        if (conversationId && !/^[A-Za-z0-9-]{1,80}$/u.test(conversationId))
-          throw new ManagementError("INVALID_REQUEST", "Invalid conversation identifier");
-        return ok(
-          await this.store.management.listRuns(OWNER_ID, {
-            ...options,
-            ...(conversationId ? { conversationId } : {}),
-          }),
-        );
-      }
-      const runAction =
-        /^\/manage\/runs\/([A-Za-z0-9-]+)(?:\/(cancel|trace|tool-plane|deliveries|evals))?$/u.exec(
-          path,
-        );
-      if (runAction) {
-        const runId = runAction[1]!;
-        const caller = await this.runCaller(runId);
-        if (request.method === "POST" && runAction[2] === "evals") {
-          const input = await readManagementJson(request);
-          if (
-            !input ||
-            typeof input !== "object" ||
-            !("suiteId" in input) ||
-            typeof input.suiteId !== "string"
-          )
-            throw new ManagementError("INVALID_REQUEST", "An Eval suite is required");
-          return ok({ evaluation: await this.evaluator.evaluate(caller, runId, input.suiteId) });
-        }
-        if (request.method === "GET" && runAction[2] === "evals")
-          return ok(await this.evaluator.list(caller, runId, options));
-        if (request.method === "POST" && runAction[2] === "cancel")
-          return ok({ run: await this.runs.cancel(caller, runId) });
-        if (request.method === "GET" && runAction[2] === "deliveries")
-          return ok(await this.store.lifecycle.listDeliveries(caller, runId, options));
-        if (request.method === "GET" && runAction[2] === "trace") {
-          const indexed = await this.store.evidence.getTrace(caller, runId);
-          if (!indexed) return ok({ records: [], nextCursor: null, indexed: null });
-          const { records, nextCursor } = await this.trace.readPage(runId, {
-            ...options,
-            redactSecrets: true,
-          });
-          // Recheck after file I/O before returning a protected projection.
-          await this.store.conversations.getRun(caller, runId);
-          return ok({ records, nextCursor, indexed });
-        }
-        if (request.method === "GET" && runAction[2] === "tool-plane") {
-          const indexed = await this.store.evidence.getTrace(caller, runId);
-          const records: TraceEntry<unknown>[] = [];
-          let cursor: string | undefined;
-          let nextCursor: string | null = null;
-          if (indexed) {
-            do {
-              const page = await this.trace.readPage(runId, {
-                ...(cursor ? { cursor } : {}),
-                limit: 50,
-                redactSecrets: true,
-              });
-              records.push(...page.records);
-              nextCursor = page.nextCursor;
-              cursor = page.nextCursor ?? undefined;
-            } while (nextCursor && records.length < TOOL_PLANE_DIAGNOSTIC_RECORD_CAP);
-          }
-          // The projection contains metadata only. Recheck after file I/O so a revoked or
-          // otherwise unavailable Owner Run never receives a stale trace view.
-          await this.store.conversations.getRun(caller, runId);
-          return ok(
-            projectToolPlaneDiagnostics({
-              runId,
-              records,
-              complete:
-                indexed !== null && nextCursor === null && records.length === indexed.eventCount,
-            }),
-          );
-        }
-        if (request.method === "GET" && !runAction[2])
-          return ok({ run: await this.store.conversations.getRun(caller, runId) });
-      }
-      return undefined;
-    } catch (error) {
-      if (error instanceof RunEvalError)
-        throw new ManagementError(
-          error.code,
-          error.message,
-          error.code === "EVAL_SUITE_NOT_FOUND" ? 400 : 409,
-        );
-      if (error instanceof ExecutorBusyError)
-        throw new ManagementError("EXECUTOR_BUSY", error.message, 409);
-      if (error instanceof ChannelConfigurationError)
-        throw new ManagementError("INVALID_CONFIGURATION", CHANNEL_SAFE_ERRORS.configuration);
-      throw error;
+      configured = this.channels.resolve(channelId);
+    } catch {
+      throw new ManagementError("NOT_FOUND", "The requested record was not found.", 404);
     }
+    if (!configured.config.groupIds.includes(groupId))
+      throw new ManagementError("NOT_FOUND", "The requested record was not found.", 404);
+    const owner = this.ownerPrivateScopes(configured).find(
+      ({ principalId }) => principalId === OWNER_ID,
+    );
+    if (!owner) throw new ManagementError("NOT_FOUND", "The requested record was not found.", 404);
+    const decision = await this.store.authorization.check({
+      caller: { principalId: owner.principalId, scope: owner.scope },
+      resourceId: groupResourceId(groupId),
+      action: GROUP_ASSIGN_ACTION,
+    });
+    if (decision.decision !== "ALLOW")
+      throw new ManagementError("NOT_FOUND", "The requested record was not found.", 404);
+    return { configured, owner };
+  }
+
+  private async groupRoleAudit(channelId: string, groupId: string) {
+    const { configured } = await this.requireManagedRoleAuditGroup(channelId, groupId);
+    const latest = await this.store.management.latestManagedGroupRuns(OWNER_ID, {
+      connectionId: configured.config.connectionId,
+      botId: configured.config.botId,
+      groupId,
+    });
+    const audits = [];
+    for (const run of latest) {
+      const trace = await this.trace.readPage(run.runId, {
+        limit: GROUP_ROLE_AUDIT_RECORD_CAP,
+        redactSecrets: true,
+      });
+      audits.push(
+        projectGroupRoleAudit({
+          runId: run.runId,
+          groupId,
+          createdAt: run.createdAt,
+          principalKind: run.principalKind,
+          records: trace.records,
+          complete: trace.nextCursor === null,
+        }),
+      );
+    }
+
+    // The group assignment may have been revoked while the Raw Trace file was being read.
+    // Re-authorize before returning even the bounded metadata projection.
+    await this.requireManagedRoleAuditGroup(channelId, groupId);
+    return { audits, ingressDiagnostics: this.groupIngressDiagnosticsFor(channelId, groupId) };
+  }
+
+  private groupIngressDiagnosticKey(channelId: string, groupId: string): string {
+    return `${channelId}:${groupId}`;
+  }
+
+  private groupIngressDiagnosticsFor(
+    channelId: string,
+    groupId: string,
+  ): GroupIngressDiagnosticCounts {
+    return (
+      this.groupIngressDiagnostics.get(this.groupIngressDiagnosticKey(channelId, groupId)) ?? {
+        serviceStartedAt: this.ingressStartedAt,
+        lastObservedAt: null,
+        normalized: 0,
+        ignoredNotAddressed: 0,
+        ignoredEmptyMessage: 0,
+        rejectedInvalidMessage: 0,
+        rejectedUnsupportedMessage: 0,
+        rejectedOverflow: 0,
+        acceptanceFailed: 0,
+      }
+    );
+  }
+
+  private recordGroupIngressDiagnostic(
+    channelId: string,
+    diagnostic: OneBotIngressDiagnostic,
+  ): void {
+    if (!this.channels.resolve(channelId).config.groupIds.includes(diagnostic.groupId)) return;
+    const key = this.groupIngressDiagnosticKey(channelId, diagnostic.groupId);
+    const current = this.groupIngressDiagnosticsFor(channelId, diagnostic.groupId);
+    const next = { ...current, lastObservedAt: new Date().toISOString() };
+    const field =
+      diagnostic.stage === "normalized"
+        ? "normalized"
+        : diagnostic.reason === "not_addressed"
+          ? "ignoredNotAddressed"
+          : "ignoredEmptyMessage";
+    next[field] = Math.min(1_000_000, next[field] + 1);
+    this.groupIngressDiagnostics.set(key, next);
+  }
+
+  private recordGroupIngressError(
+    channelId: string,
+    error: {
+      code: "invalid_message" | "unsupported_message" | "acceptance_failed" | "ingress_overflow";
+      groupId?: string;
+    },
+  ): void {
+    if (!error.groupId || !this.channels.resolve(channelId).config.groupIds.includes(error.groupId))
+      return;
+    const key = this.groupIngressDiagnosticKey(channelId, error.groupId);
+    const current = this.groupIngressDiagnosticsFor(channelId, error.groupId);
+    const next = { ...current, lastObservedAt: new Date().toISOString() };
+    const field =
+      error.code === "invalid_message"
+        ? "rejectedInvalidMessage"
+        : error.code === "unsupported_message"
+          ? "rejectedUnsupportedMessage"
+          : error.code === "ingress_overflow"
+            ? "rejectedOverflow"
+            : "acceptanceFailed";
+    next[field] = Math.min(1_000_000, next[field] + 1);
+    this.groupIngressDiagnostics.set(key, next);
+  }
+
+  async route(request: IncomingMessage): Promise<{ status: number; body: unknown } | undefined> {
+    return routeManagementRequest(request, {
+      store: this.store,
+      grantOpsPermissions: (input) =>
+        grantOpsPermissions(this.store, this.options.ops?.workerPolicy, input),
+      executors: this.executors,
+      listChannels: () => this.listChannels(),
+      saveChannel: (input) => this.saveChannel(input),
+      connectChannel: (id) => this.connectChannel(id),
+      disconnectChannel: (id) => this.disconnectChannel(id),
+      probeCapabilities: (channelId, groupId) => this.probeCapabilities(channelId, groupId),
+      groupRoleAudit: (channelId, groupId) => this.groupRoleAudit(channelId, groupId),
+      runCaller: (runId) => this.runCaller(runId),
+      runs: this.runs,
+      trace: this.trace,
+      evaluator: this.evaluator,
+    });
   }
 
   async close() {
@@ -2579,6 +2759,12 @@ export class ManagementApplication {
     await this.runs.stop({ abortRunning: true, wait: true });
     for (const adapter of this.piAdapters.values()) await adapter.cleanup();
     this.piAdapters.clear();
+    await Promise.allSettled(
+      [...this.browserCleanups.values()].flatMap((cleanups) =>
+        [...cleanups].map((cleanup) => cleanup()),
+      ),
+    );
+    this.browserCleanups.clear();
     await this.opsReconciler?.stop();
     await this.options.ops?.bridge.disconnect();
     await this.store.close();

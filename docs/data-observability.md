@@ -21,6 +21,22 @@ Public visitor
 
 QQ, email, Pi, Lora PI Kit, MCP, Herdr, Moshi, and other external entry points do not receive management authority merely because they can reach a process or UI.
 
+QQ-native group roles are provider observations scoped to one message sender and one group
+Resource. `qq_group_admin` and `qq_group_owner` are not Principal kinds and are not stored as
+durable Glassbox role truth. The Run keeps its ingress observation for reconstruction. A
+protected mutation re-verifies the role through the current authenticated OneBot connection, so
+a restart or old Run record cannot preserve revoked QQ authority.
+
+The local Owner may inspect `trace group-role-audit <channel-id> <group-id>` for one currently
+managed group. The endpoint reports the newest Owner Run and newest Visitor Run separately. It requires the current
+Owner `group:manage` grant and an exact match to
+the configured Channel connection, bot, and group. It returns only normalized role observations,
+principal kind, role-verification status, allowlisted role Tool selection and outcome metadata, and bounded Trace
+completeness. It never returns message text, Tool arguments or results, provider error text,
+member identifiers, or Conversation scope. The ordinary Run and Trace endpoints keep their
+same-Principal `conversation:read` boundary; this audit view does not grant access to Visitor
+Conversation content. Losing the group grant before the response is sent denies the audit result.
+
 ## Service / authority map
 
 | Responsibility | Service / authority |
@@ -61,6 +77,7 @@ relationships / permissions
 AuthorizationDecision
 Approval
 Run metadata
+Run-scoped external role observation and verification evidence
 message dedupe
 runtime session binding
 visibility / Share metadata
@@ -86,6 +103,11 @@ statistics / product projections
 ```
 
 The model does not receive unrestricted SQL access.
+
+Raw QQ member profiles do not enter model-visible Context or durable role state. Native-role
+Trace events contain only Principal, group Resource, sender id, normalized observed and verified
+roles, role source, verification status, requested Tool and operation, Run, Conversation, and a
+safe authorization status. Provider response bodies and error text are excluded.
 
 The browser does not receive direct Turso credentials.
 

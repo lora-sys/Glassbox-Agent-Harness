@@ -78,6 +78,10 @@ export function namedGroupId(text: string): string | undefined {
 const GROUP_HISTORY_REQUEST =
   /(?:搜索|搜|查找|查|检索|查询|翻)\s*(?:一下|一翻|一遍)?\s*(?:本群|群里|群内|该群|此群|当前群|群)\s*(?:的)?\s*(?:历史|聊天记录|消息记录|群聊记录|聊天历史|历史消息)/iu;
 
+/** A sender-qualified history search, where the sender filter precedes the history noun. */
+const GROUP_HISTORY_SENDER_REQUEST =
+  /(?:搜索|搜|查找|查|检索|查询|翻)\s*(?:发送者|群成员|成员|用户)\s*(?:QQ(?:号)?\s*)?([1-9]\d{4,15})\s*(?:发的|发过的|发送的|发布的|的)\s*(?:本群|群里|群内|该群|此群|当前群|群)\s*(?:的)?\s*(?:历史|聊天记录|消息记录|群聊记录|聊天历史|历史消息)/iu;
+
 /**
  * The negations that can refuse a request, and the verbs that make one.
  *
@@ -184,7 +188,13 @@ export function requestClauses(rawText: string): string {
 export function groupHistorySearchRequested(rawText: string): boolean {
   // Read from the requests that ask for something, so a question about how to search does not
   // delete a search request made beside it.
-  return GROUP_HISTORY_REQUEST.test(requestClauses(rawText));
+  const asking = requestClauses(rawText);
+  return GROUP_HISTORY_REQUEST.test(asking) || GROUP_HISTORY_SENDER_REQUEST.test(asking);
+}
+
+/** The QQ sender id bound by an explicit sender-qualified group-history search, if present. */
+export function groupHistorySearchSender(rawText: string): string | undefined {
+  return GROUP_HISTORY_SENDER_REQUEST.exec(requestClauses(rawText))?.[1];
 }
 
 /**
@@ -238,7 +248,8 @@ const MUTATION_VERB =
  * at all, so a Run could answer 是 or 否 with the evidence check satisfied and nothing behind the
  * answer. A question that really is about possibility names possibility: 能否, 能不能, 可否.
  */
-const CAPABILITY_QUESTION = /如何|怎么|能否|能不能|可否|可以吗/u;
+const CAPABILITY_QUESTION =
+  /如何|怎么|能否|能不能|可否|可以吗|(?:谁|我|管理员|群主|成员|机器人|你)[^。！？\n]{0,80}可以[^。！？\n]{0,80}吗/u;
 
 interface LiveDomain {
   readonly domain: RequiredEvidenceDomain;

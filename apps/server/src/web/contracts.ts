@@ -1,13 +1,21 @@
 export type WebProviderStatus =
   | "ready"
   | "auth_missing"
+  | "rate_limited"
   | "quota_exhausted"
   | "timeout"
   | "failed"
   | "partial"
   | "unknown";
 
-export type WebResultStatus = "succeeded" | "partial" | "unavailable" | "failed";
+export type WebResultStatus =
+  | "succeeded"
+  | "partial"
+  | "blocked"
+  | "fallback_denied"
+  | "unavailable"
+  | "failed"
+  | "unknown";
 
 export interface WebSourceRef {
   sourceId: string;
@@ -16,12 +24,20 @@ export interface WebSourceRef {
   domain: string;
   retrievedAt: string;
   providerOrigins: readonly string[];
-  retrievalMethod: "exa_search" | "exa_contents" | "browser_search" | "browser";
+  retrievalMethod:
+    | "exa_search"
+    | "exa_contents"
+    | "browser_search"
+    | "browser"
+    | "agent_browser_dom"
+    | "agent_browser_url_read";
+  author?: string | null;
+  publishedAt?: string | null;
 }
 
 export interface WebSearchResultItem extends WebSourceRef {
   title: string;
-  publishedAt?: string;
+  publishedAt?: string | null;
   highlights: readonly string[];
   rank: number;
   /** Ranking signal only. It is never a factual confidence score. */
@@ -52,16 +68,31 @@ export interface WebFetchResult extends WebSourceRef {
   providerStatus: WebProviderStatus;
   title?: string;
   contentType?: string;
+  extractionMethod?: string;
   text: string;
   partial: boolean;
   truncated: boolean;
 }
 
 export interface BrowserActionResult {
-  status: "succeeded";
+  status:
+    | "succeeded"
+    | "blocked"
+    | "unavailable"
+    | "fallback_denied"
+    | "partial"
+    | "failed"
+    | "unknown";
+  backend: "agent-browser";
   browserSessionId: string;
   action: string;
   output: string;
   truncated: boolean;
   observedAt: string;
+  artifact?: {
+    id: string;
+    mimeType?: string;
+    sizeBytes?: number;
+  };
+  postStateVerified?: boolean;
 }

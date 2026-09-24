@@ -58,10 +58,12 @@ function contextFrom(getContext: () => PiRunContext | undefined): ProtectedToolC
 
 function requireWebSuccess(status: WebResultStatus): void {
   if (status === "succeeded" || status === "partial") return;
-  throw new ProviderCallError(
-    status === "unavailable" ? "provider_unavailable" : "provider_failed",
-    status === "unavailable" ? "provider_unavailable" : "provider_failed",
-  );
+  if (status === "fallback_denied") throw new ProviderCallError("denied", "fallback_denied");
+  if (status === "unavailable")
+    throw new ProviderCallError("provider_unavailable", "provider_unavailable");
+  if (status === "unknown") throw new ProviderCallError("unknown", "web_result_unknown");
+  if (status === "blocked") throw new ProviderCallError("provider_failed", "browser_blocked");
+  throw new ProviderCallError("provider_failed", "provider_failed");
 }
 
 function webInputError(error: unknown): never {
@@ -119,7 +121,6 @@ export function createWebTools(options: {
     execute: async (params, context) => {
       await requireEnabled(context, "web.search");
       const result = await options.service.search(context.runId, params).catch(webInputError);
-      requireWebSuccess(result.status);
       await options.recordEvidence?.(
         {
           type: "web_search",
@@ -145,6 +146,7 @@ export function createWebTools(options: {
         },
         context,
       );
+      requireWebSuccess(result.status);
       return result;
     },
     projectResult: (result) => JSON.stringify(result),
@@ -170,7 +172,6 @@ export function createWebTools(options: {
       if (params.query !== undefined && params.query.trim() === "")
         throw new ToolInputError("invalid_web_query");
       const result = await options.service.fetch(context.runId, params).catch(webInputError);
-      requireWebSuccess(result.status);
       await options.recordEvidence?.(
         {
           type: "web_fetch",
@@ -190,6 +191,7 @@ export function createWebTools(options: {
         },
         context,
       );
+      requireWebSuccess(result.status);
       return result;
     },
     projectResult: (result) => JSON.stringify(result),

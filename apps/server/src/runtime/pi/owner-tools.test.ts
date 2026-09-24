@@ -238,6 +238,77 @@ it("refuses a mutation the current user message did not ask for", async () => {
   }
 });
 
+it("refuses a category or source class invented by the model", async () => {
+  const { store, tool, manageGroup, require: requireMutation } = await mutationFixture(true);
+  try {
+    requireMutation("owner_group_admin", {
+      action: "set_capability",
+      groupId: "1126022432",
+      enabled: true,
+    });
+    await expect(
+      tool.execute(
+        "extra-category",
+        {
+          action: "set_capability",
+          groupId: "1126022432",
+          enabled: true,
+          category: "group.moderate",
+        },
+        undefined,
+        undefined,
+        {} as never,
+      ),
+    ).rejects.toThrow("mutation_not_requested");
+    requireMutation("owner_group_admin", {
+      action: "set_memory_source",
+      groupId: "1126022432",
+      enabled: true,
+    });
+    await expect(
+      tool.execute(
+        "extra-source",
+        {
+          action: "set_memory_source",
+          groupId: "1126022432",
+          enabled: true,
+          sourceClass: "history",
+        },
+        undefined,
+        undefined,
+        {} as never,
+      ),
+    ).rejects.toThrow("mutation_not_requested");
+    expect(manageGroup).not.toHaveBeenCalled();
+  } finally {
+    await store.close();
+  }
+});
+
+it("attempts one requested Owner mutation at most once in a Run", async () => {
+  const { store, tool, manageGroup, require: requireMutation } = await mutationFixture(true);
+  try {
+    const capability = {
+      action: "set_capability" as const,
+      groupId: "1126022432",
+      category: "group.moderate",
+      enabled: true,
+    };
+    requireMutation("owner_group_admin", capability);
+    manageGroup.mockRejectedValueOnce(new Error("write_failed"));
+
+    await expect(
+      tool.execute("first", capability, undefined, undefined, {} as never),
+    ).rejects.toThrow("protected_tool_failed");
+    await expect(
+      tool.execute("retry", capability, undefined, undefined, {} as never),
+    ).rejects.toThrow("mutation_already_attempted");
+    expect(manageGroup).toHaveBeenCalledTimes(1);
+  } finally {
+    await store.close();
+  }
+});
+
 it("reads the inventory without a required-Tool context", async () => {
   const { store, tool, manageGroup } = await mutationFixture(true);
   try {

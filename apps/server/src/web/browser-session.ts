@@ -4,6 +4,9 @@ export interface BrowserSessionBinding {
   runId: string;
   principalId: string;
   conversationId: string;
+  workspaceId: string;
+  policyVersion: string;
+  purpose?: "tool" | "fallback";
 }
 
 export interface BrowserSession {
@@ -12,8 +15,15 @@ export interface BrowserSession {
   opened: boolean;
 }
 
-function bindingKey(binding: BrowserSessionBinding): string {
-  return JSON.stringify([binding.runId, binding.principalId, binding.conversationId]);
+export function browserSessionBindingKey(binding: BrowserSessionBinding): string {
+  return JSON.stringify([
+    binding.runId,
+    binding.principalId,
+    binding.conversationId,
+    binding.workspaceId,
+    binding.policyVersion,
+    binding.purpose ?? "tool",
+  ]);
 }
 
 /** Run-scoped session registry. Sessions are never shared across a Run or Principal. */
@@ -24,7 +34,7 @@ export class BrowserSessionRegistry {
   constructor(private readonly createId: () => string = randomUUID) {}
 
   session(binding: BrowserSessionBinding): BrowserSession {
-    const key = bindingKey(binding);
+    const key = browserSessionBindingKey(binding);
     let session = this.sessions.get(key);
     if (!session) {
       const suffix = createHash("sha256")
@@ -42,7 +52,7 @@ export class BrowserSessionRegistry {
     binding: BrowserSessionBinding,
     operation: (session: BrowserSession) => Promise<T>,
   ): Promise<T> {
-    const key = bindingKey(binding);
+    const key = browserSessionBindingKey(binding);
     const prior = this.locks.get(key) ?? Promise.resolve();
     let release!: () => void;
     const current = new Promise<void>((resolve) => {
@@ -60,6 +70,6 @@ export class BrowserSessionRegistry {
   }
 
   forget(binding: BrowserSessionBinding): void {
-    this.sessions.delete(bindingKey(binding));
+    this.sessions.delete(browserSessionBindingKey(binding));
   }
 }

@@ -3,6 +3,7 @@ import { agentResourceId, openDomainStore } from "../../persistence/index.js";
 import type { CallerContext, TrustedChannelScope } from "../../persistence/index.js";
 import { groupResourceId } from "../../retrieval/source-resolver.js";
 import { availableCapabilityToolNames, createCapabilityTools } from "./capability-tools.js";
+import { ProviderCallError } from "./provider-outcome.js";
 
 const connectionId = "qq";
 const botId = "bot";
@@ -111,6 +112,18 @@ function tools(
   calls: Array<{ action: string; params: Record<string, unknown> }>,
   /** The required-Tool context the Run carries, derived from the current user message. */
   required?: { name: string; input: Record<string, unknown> },
+  memberListResult: unknown = [
+    { user_id: 10004, nickname: "private-nickname", role: "member", mute_time: 123 },
+    { user_id: 10005, nickname: "another-private-nickname", role: "admin", mute_time: 0 },
+  ],
+  memberInfoResult: unknown = {
+    group_id: 100,
+    user_id: 10004,
+    nickname: "private-nickname",
+    card: "private-card",
+    role: "member",
+    mute_time: 123,
+  },
 ) {
   return createCapabilityTools({
     store,
@@ -128,6 +141,8 @@ function tools(
     },
     invoke: async (input) => {
       calls.push({ action: input.action, params: input.params });
+      if (input.action === "get_group_member_list") return memberListResult;
+      if (input.action === "get_group_member_info") return memberInfoResult;
       return { ok: true, action: input.action };
     },
     search: async (input) => ({
@@ -136,6 +151,69 @@ function tools(
       capabilities: [],
     }),
     projectManagedGroups: async () => ({ groups: [{ groupId: "100" }] }),
+  });
+}
+
+function nativeGroupScope(role: "qq_group_owner" | "qq_group_admin" | "qq_group_member") {
+  return {
+    ...ownerGroupScope,
+    nativeGroupRole: {
+      role,
+      source: "onebot_message_sender" as const,
+      observedAt: "2026-09-22T01:02:03.000Z",
+    },
+  };
+}
+
+async function grantNativeGroupAction(store: Store, scope: TrustedChannelScope, action: string) {
+  await store.authorization.grant({
+    principalId: "owner",
+    resourceId: groupResourceId(scope.chatId),
+    action,
+    scope,
+    effect: "allow",
+  });
+}
+
+function nativeGroupTools(
+  store: Store,
+  accepted: { run: { id: string }; conversation: { id: string } },
+  input: {
+    scope: TrustedChannelScope;
+    required: { name: string; input: Record<string, unknown> };
+    verifiedRole?: "qq_group_owner" | "qq_group_admin" | "qq_group_member";
+    verificationError?: Error;
+  },
+  calls: Array<{ action: string; params: Record<string, unknown> }>,
+) {
+  return createCapabilityTools({
+    store,
+    getContext: () => ({
+      caller: { principalId: "owner", scope: input.scope },
+      runId: accepted.run.id,
+      conversationId: accepted.conversation.id,
+      requiredToolName: input.required.name,
+      requiredToolInput: input.required.input,
+    }),
+    isCategoryEnabled: async (conn, groupId, category) => {
+      const stored = await store.capabilities.read(conn, groupId);
+      return stored?.policy.categories[category] === true;
+    },
+    verifyNativeGroupRole: async () => {
+      if (input.verificationError) throw input.verificationError;
+      return input.verifiedRole ?? "qq_group_member";
+    },
+    invoke: async ({ action, params }) => {
+      calls.push({ action, params });
+      if (action === "get_group_member_list")
+        return [
+          { user_id: 10004, nickname: "private-nickname", role: "member", mute_time: 123 },
+          { user_id: 10005, nickname: "another-private-nickname", role: "admin", mute_time: 0 },
+        ];
+      return { ok: true, action };
+    },
+    search: async () => ({ capabilities: [] }),
+    projectManagedGroups: async () => ({ groups: [] }),
   });
 }
 
@@ -153,7 +231,7 @@ function call(tool: { execute: (...args: never[]) => unknown }, params: Record<s
       s?: AbortSignal,
       u?: unknown,
       c?: unknown,
-    ) => Promise<{ details?: unknown }>
+    ) => Promise<{ details?: unknown; content?: Array<{ text?: string }> }>
   )("call", params, undefined, undefined, {} as never);
 }
 
@@ -181,7 +259,7 @@ it("exposes the capability surface only to an Owner-private Run", async () => {
       enabledCategories: enabled,
     }),
   ).not.toContain("qq_group_moderation");
-  // A group Run sees only the read-only capabilities its own group's policy enables.
+  // With no privileged native role, a group Run sees only policy-enabled reads.
   expect(
     availableCapabilityToolNames({ isOwner: true, chatType: "group", enabledCategories: enabled }),
   ).toEqual(["qq_groups", "qq_group_members"]);
@@ -194,7 +272,7 @@ it("exposes the capability surface only to an Owner-private Run", async () => {
   ).toEqual([]);
 });
 
-it("hides a group Run's read-only Tool once its category is disabled, and never exposes mutation", () => {
+it("hides disabled group reads and keeps an ordinary member's Run free of mutation Tools", () => {
   // A disabled category is absent from the surface on the next Run.
   expect(
     availableCapabilityToolNames({
@@ -219,6 +297,249 @@ it("hides a group Run's read-only Tool once its category is disabled, and never 
       enabledCategories: ["group.read", "group.moderate"],
     }),
   ).toEqual([]);
+});
+
+it("projects native QQ roles only onto the current group's configured mutation subset", () => {
+  const enabled = ["group.read", "group.moderate", "group.settings", "message.manage"] as const;
+  const member = availableCapabilityToolNames({
+    isOwner: false,
+    chatType: "group",
+    enabledCategories: enabled,
+    nativeGroupRole: "qq_group_member",
+  });
+  const admin = availableCapabilityToolNames({
+    isOwner: false,
+    chatType: "group",
+    enabledCategories: enabled,
+    nativeGroupRole: "qq_group_admin",
+  });
+  const owner = availableCapabilityToolNames({
+    isOwner: false,
+    chatType: "group",
+    enabledCategories: enabled,
+    nativeGroupRole: "qq_group_owner",
+  });
+  expect(member).toEqual(["qq_groups"]);
+  expect(admin).toEqual(["qq_groups", "qq_group_moderation"]);
+  expect(owner).toEqual(["qq_groups", "qq_group_moderation", "qq_group_local_settings"]);
+  expect(admin).not.toContain("qq_group_settings");
+  expect(owner).not.toContain("qq_group_settings");
+  expect(admin).not.toContain("qq_capability_search");
+  expect(
+    availableCapabilityToolNames({
+      isOwner: false,
+      chatType: "group",
+      enabledCategories: ["group.read"],
+      nativeGroupRole: "qq_group_admin",
+    }),
+  ).toEqual(["qq_groups"]);
+  // The same Principal can carry a fresh role observation in group A and ordinary membership
+  // in group B. The role is scope data, not a Principal-wide promotion.
+  expect(
+    availableCapabilityToolNames({
+      isOwner: false,
+      chatType: "group",
+      enabledCategories: enabled,
+      nativeGroupRole: "qq_group_member",
+    }),
+  ).not.toContain("qq_group_moderation");
+});
+
+it("publishes exact parameter requirements for each QQ operation", async () => {
+  const { store, accepted } = await fixture();
+  try {
+    const scope = nativeGroupScope("qq_group_admin");
+    const created = nativeGroupTools(
+      store,
+      accepted,
+      {
+        scope,
+        required: { name: "qq_group_moderation", input: {} },
+        verifiedRole: "qq_group_admin",
+      },
+      [],
+    );
+    const schema = toolByName(created, "qq_group_moderation").parameters as {
+      anyOf: Array<{
+        properties: {
+          operation: { const: string };
+          params?: {
+            additionalProperties: boolean;
+            properties: Record<string, unknown>;
+            required?: string[];
+          };
+        };
+        required?: string[];
+      }>;
+    };
+    const operation = (name: string) => {
+      const variant = schema.anyOf.find((entry) => entry.properties.operation.const === name);
+      if (!variant) throw new Error(`missing operation schema ${name}`);
+      return variant;
+    };
+
+    const mute = operation("set_group_ban");
+    expect(mute.required).toContain("params");
+    expect(mute.properties.params?.required).toEqual(["user_id", "duration"]);
+    expect(mute.properties.params?.properties).toHaveProperty("user_id");
+    expect(mute.properties.params?.properties).toHaveProperty("duration");
+    expect(mute.properties.params?.properties).not.toHaveProperty("group_id");
+    expect(mute.properties.params?.additionalProperties).toBe(false);
+
+    const kick = operation("set_group_kick");
+    expect(kick.properties.params?.required).toEqual(["user_id"]);
+    expect(kick.properties.params?.properties).toHaveProperty("reject_add_request");
+    expect(operation("set_group_whole_ban").properties.params?.required).toEqual(["enable"]);
+  } finally {
+    await store.close();
+  }
+});
+
+it("executes exact current-group moderation only after fresh native-role verification", async () => {
+  const { store, accepted } = await fixture();
+  try {
+    const scope = nativeGroupScope("qq_group_admin");
+    await enableCategory(store, "group.moderate");
+    await grantNativeGroupAction(store, scope, "group:moderate");
+    const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
+    const required = {
+      name: "qq_group_moderation",
+      input: {
+        groupId: "100",
+        operation: "set_group_ban",
+        params: { user_id: 10004, duration: 60 },
+      },
+    };
+    const created = nativeGroupTools(
+      store,
+      accepted,
+      { scope, required, verifiedRole: "qq_group_admin" },
+      calls,
+    );
+    await call(toolByName(created, required.name), {
+      operation: "set_group_ban",
+      params: { user_id: 10004, duration: 60 },
+    });
+    expect(calls).toEqual([
+      {
+        action: "set_group_ban",
+        params: { group_id: 100, user_id: 10004, duration: 60 },
+      },
+    ]);
+  } finally {
+    await store.close();
+  }
+});
+
+it("denies a demoted admin before provider mutation and keeps provider outage distinct", async () => {
+  const { store, accepted } = await fixture();
+  try {
+    const scope = nativeGroupScope("qq_group_admin");
+    await enableCategory(store, "group.moderate");
+    await grantNativeGroupAction(store, scope, "group:moderate");
+    const required = {
+      name: "qq_group_moderation",
+      input: {
+        groupId: "100",
+        operation: "set_group_whole_ban",
+        params: { enable: true },
+      },
+    };
+    const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
+    const demoted = nativeGroupTools(
+      store,
+      accepted,
+      { scope, required, verifiedRole: "qq_group_member" },
+      calls,
+    );
+    await expect(
+      call(toolByName(demoted, required.name), {
+        operation: "set_group_whole_ban",
+        params: { enable: true },
+      }),
+    ).rejects.toThrow("native_group_role_denied");
+    expect(calls).toEqual([]);
+
+    const unavailable = nativeGroupTools(
+      store,
+      accepted,
+      {
+        scope,
+        required,
+        verificationError: new ProviderCallError("provider_unavailable", "provider_unavailable"),
+      },
+      calls,
+    );
+    await expect(
+      call(toolByName(unavailable, required.name), {
+        operation: "set_group_whole_ban",
+        params: { enable: true },
+      }),
+    ).rejects.toBeInstanceOf(ProviderCallError);
+    expect(calls).toEqual([]);
+  } finally {
+    await store.close();
+  }
+});
+
+it("keeps local settings group-owner-only and set_group_admin Owner-private", async () => {
+  const { store, accepted } = await fixture();
+  try {
+    await enableCategory(store, "group.settings");
+    const adminScope = nativeGroupScope("qq_group_admin");
+    const ownerScope = nativeGroupScope("qq_group_owner");
+    await grantNativeGroupAction(store, adminScope, "group:settings:local");
+    const required = {
+      name: "qq_group_local_settings",
+      input: {
+        groupId: "100",
+        operation: "set_group_name",
+        params: { group_name: "新群名" },
+      },
+    };
+    const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
+    const admin = nativeGroupTools(
+      store,
+      accepted,
+      { scope: adminScope, required, verifiedRole: "qq_group_admin" },
+      calls,
+    );
+    await expect(
+      call(toolByName(admin, required.name), {
+        operation: "set_group_name",
+        params: { group_name: "新群名" },
+      }),
+    ).rejects.toThrow("native_group_role_denied");
+    const owner = nativeGroupTools(
+      store,
+      accepted,
+      { scope: ownerScope, required, verifiedRole: "qq_group_owner" },
+      calls,
+    );
+    await call(toolByName(owner, required.name), {
+      operation: "set_group_name",
+      params: { group_name: "新群名" },
+    });
+    await expect(
+      call(toolByName(owner, required.name), {
+        operation: "set_group_name",
+        params: { group_name: "新群名" },
+      }),
+    ).rejects.toThrow("mutation_already_attempted");
+    // The earlier role denial did not consume the request. The successful provider attempt did,
+    // so a model retry in this Run never reaches the provider a second time.
+    expect(calls).toHaveLength(1);
+    expect(
+      availableCapabilityToolNames({
+        isOwner: false,
+        chatType: "group",
+        enabledCategories: ["group.settings"],
+        nativeGroupRole: "qq_group_owner",
+      }),
+    ).not.toContain("qq_group_settings");
+  } finally {
+    await store.close();
+  }
 });
 
 it("binds a group Run to its own group and refuses a model-supplied one", async () => {
@@ -246,6 +567,11 @@ it("binds a group Run to its own group and refuses a model-supplied one", async 
       },
       invoke: async (input) => {
         calls.push({ action: input.action, params: input.params });
+        if (input.action === "get_group_member_list")
+          return [
+            { user_id: 10004, nickname: "private-nickname", role: "member", mute_time: 123 },
+            { user_id: 10005, nickname: "another-private-nickname", role: "admin", mute_time: 0 },
+          ];
         return { ok: true, action: input.action };
       },
       search: async () => ({ capabilities: [] }),
@@ -259,7 +585,27 @@ it("binds a group Run to its own group and refuses a model-supplied one", async 
     // The group is derived from the trusted Run scope, so the call reaches the group it is in.
     const result = await call(members, { operation: "get_group_member_list" });
     expect(calls).toEqual([{ action: "get_group_member_list", params: { group_id: 100 } }]);
-    expect(result.details).toMatchObject({ action: "get_group_member_list" });
+    expect(result.details).toEqual({ memberCount: 2 });
+    expect(result.content?.[0]?.text).toBe('{"memberCount":2}');
+    expect(JSON.stringify(result)).not.toContain("private-nickname");
+    expect(JSON.stringify(result)).not.toContain("10004");
+  } finally {
+    await store.close();
+  }
+});
+
+it("refuses a group id that cannot be represented exactly in provider parameters", async () => {
+  const { store, accepted } = await fixture();
+  try {
+    const groupId = "9007199254740993";
+    await enableCategory(store, "group.members", groupId);
+    await grantGroupAction(store, "group:members:read", groupId);
+    const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
+    const members = toolByName(tools(store, accepted, calls), "qq_group_members");
+    await expect(call(members, { groupId, operation: "get_group_member_list" })).rejects.toThrow(
+      "invalid_capability_group",
+    );
+    expect(calls).toEqual([]);
   } finally {
     await store.close();
   }
@@ -325,7 +671,119 @@ it("reaches the provider only when policy and grant agree, binding group_id serv
       operation: "get_group_member_list",
     });
     expect(calls).toEqual([{ action: "get_group_member_list", params: { group_id: 100 } }]);
-    expect(result.details).toMatchObject({ action: "get_group_member_list" });
+    expect(result.details).toEqual({ memberCount: 2 });
+  } finally {
+    await store.close();
+  }
+});
+
+it("fails closed when the group member provider returns an unexpected shape", async () => {
+  const { store, accepted } = await fixture();
+  try {
+    await enableCategory(store, "group.members");
+    await grantGroupAction(store, "group:members:read", "100");
+    const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
+    const created = tools(store, accepted, calls, undefined, {
+      data: [{ user_id: 10004, nickname: "must-not-leak" }],
+    });
+    await expect(
+      call(toolByName(created, "qq_group_members"), {
+        groupId: "100",
+        operation: "get_group_member_list",
+      }),
+    ).rejects.toBeInstanceOf(ProviderCallError);
+    expect(calls).toEqual([{ action: "get_group_member_list", params: { group_id: 100 } }]);
+  } finally {
+    await store.close();
+  }
+});
+
+it("validates every member identity before returning only the aggregate count", async () => {
+  const { store, accepted } = await fixture();
+  try {
+    await enableCategory(store, "group.members");
+    await grantGroupAction(store, "group:members:read", "100");
+    for (const malformed of [
+      [{ user_id: 10004 }, null],
+      [{ user_id: "not-a-qq-id" }],
+      [{ user_id: 0 }],
+      [{ user_id: 10004 }, { user_id: 10004 }],
+    ]) {
+      const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
+      const created = tools(store, accepted, calls, undefined, malformed);
+      await expect(
+        call(toolByName(created, "qq_group_members"), {
+          groupId: "100",
+          operation: "get_group_member_list",
+        }),
+      ).rejects.toMatchObject({ outcome: "provider_failed", message: "invalid_response" });
+      expect(calls).toEqual([{ action: "get_group_member_list", params: { group_id: 100 } }]);
+    }
+
+    const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
+    const empty = tools(store, accepted, calls, undefined, []);
+    const result = await call(toolByName(empty, "qq_group_members"), {
+      groupId: "100",
+      operation: "get_group_member_list",
+    });
+    expect(result.details).toEqual({ memberCount: 0 });
+    expect(result.content?.[0]?.text).toBe('{"memberCount":0}');
+  } finally {
+    await store.close();
+  }
+});
+
+it("projects a member-info read to the verified native role only", async () => {
+  const { store, accepted } = await fixture();
+  try {
+    await enableCategory(store, "group.members");
+    await grantGroupAction(store, "group:members:read", "100");
+    const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
+    const created = tools(store, accepted, calls);
+    const result = await call(toolByName(created, "qq_group_members"), {
+      groupId: "100",
+      operation: "get_group_member_info",
+      params: { user_id: 10004 },
+    });
+    expect(calls).toEqual([
+      { action: "get_group_member_info", params: { group_id: 100, user_id: 10004 } },
+    ]);
+    expect(result.details).toEqual({ role: "qq_group_member" });
+    expect(result.content?.[0]?.text).toBe('{"role":"qq_group_member"}');
+    expect(JSON.stringify(result)).not.toContain("private-nickname");
+    expect(JSON.stringify(result)).not.toContain("private-card");
+    expect(JSON.stringify(result)).not.toContain("10004");
+  } finally {
+    await store.close();
+  }
+});
+
+it("fails closed on mismatched or malformed member-info provider results", async () => {
+  const { store, accepted } = await fixture();
+  try {
+    await enableCategory(store, "group.members");
+    await grantGroupAction(store, "group:members:read", "100");
+    const malformedResults = [
+      { group_id: 999, user_id: 10004, role: "member", nickname: "must-not-leak" },
+      { group_id: 100, user_id: 10005, role: "member", nickname: "must-not-leak" },
+      { group_id: 100, user_id: 10004, role: "superadmin", nickname: "must-not-leak" },
+      { group_id: 100, user_id: 10004, nickname: "must-not-leak" },
+      null,
+    ];
+    for (const memberInfoResult of malformedResults) {
+      const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
+      const created = tools(store, accepted, calls, undefined, undefined, memberInfoResult);
+      await expect(
+        call(toolByName(created, "qq_group_members"), {
+          groupId: "100",
+          operation: "get_group_member_info",
+          params: { user_id: 10004 },
+        }),
+      ).rejects.toMatchObject({ outcome: "provider_failed", message: "invalid_response" });
+      expect(calls).toEqual([
+        { action: "get_group_member_info", params: { group_id: 100, user_id: 10004 } },
+      ]);
+    }
   } finally {
     await store.close();
   }
@@ -652,6 +1110,41 @@ it("refuses a mutation that changes the member or duration the message named", a
   }
 });
 
+it("rejects malformed moderation parameter types before calling QQ", async () => {
+  const { store, accepted } = await fixture();
+  try {
+    await enableCategory(store, "group.moderate");
+    await grantGroupAction(store, "group:moderate");
+    const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
+    const created = tools(store, accepted, calls, {
+      name: "qq_group_moderation",
+      input: {
+        groupId: "100",
+        operation: "set_group_ban",
+        params: { user_id: 10004, duration: 60 },
+      },
+    });
+    const moderation = toolByName(created, "qq_group_moderation");
+    await expect(
+      call(moderation, {
+        groupId: "100",
+        operation: "set_group_ban",
+        params: { user_id: 10004, duration: "sixty" },
+      }),
+    ).rejects.toThrow("invalid_capability_params");
+    await expect(
+      call(moderation, {
+        groupId: "100",
+        operation: "set_group_ban",
+        params: { user_id: true, duration: 60 },
+      }),
+    ).rejects.toThrow("invalid_capability_params");
+    expect(calls).toEqual([]);
+  } finally {
+    await store.close();
+  }
+});
+
 it("binds the boolean a flag-shaped mutation asked for", async () => {
   const { store, accepted } = await fixture();
   try {
@@ -802,7 +1295,8 @@ it("keeps numeric-string equivalence and strict booleans in the exact comparison
       { action: "set_group_kick", params: { user_id: "10004", group_id: 100 } },
     ]);
 
-    // A flag is a flag: the string `"true"` is not the `true` the message named.
+    // A flag has a boolean schema and the server boundary refuses the string before intent
+    // comparison or provider invocation.
     const flagged = tools(store, accepted, calls, {
       name: "qq_group_moderation",
       input: {
@@ -817,7 +1311,7 @@ it("keeps numeric-string equivalence and strict booleans in the exact comparison
         operation: "set_group_whole_ban",
         params: { enable: "true" },
       }),
-    ).rejects.toThrow("mutation_not_requested");
+    ).rejects.toThrow("invalid_capability_params");
     expect(calls).toHaveLength(1);
   } finally {
     await store.close();
