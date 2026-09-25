@@ -123,8 +123,9 @@ function validateText(value: string, code = "browser_invalid_text"): string {
 }
 
 function validateRef(value: string): string {
-  if (!/^@e[1-9][0-9]{0,5}$/u.test(value)) throw new Error("browser_invalid_ref");
-  return value;
+  const normalized = /^e[1-9][0-9]{0,5}$/u.test(value) ? `@${value}` : value;
+  if (!/^@e[1-9][0-9]{0,5}$/u.test(normalized)) throw new Error("browser_invalid_ref");
+  return normalized;
 }
 
 function validateKey(value: string): string {
@@ -511,8 +512,28 @@ function parseJsonResult(stdout: string): ParsedCliResult {
 }
 
 function extractRefs(data: unknown): Set<string> {
-  const text = typeof data === "string" ? data : JSON.stringify(data ?? "");
-  return new Set([...text.matchAll(/@e[1-9][0-9]{0,5}\b/gu)].map((match) => match[0]));
+  let snapshot: string | undefined;
+  const refs = new Set<string>();
+  if (data && typeof data === "object" && !Array.isArray(data)) {
+    const record = data as Record<string, unknown>;
+    if (Object.hasOwn(record, "refs")) {
+      const structuredRefs = record.refs;
+      if (!structuredRefs || typeof structuredRefs !== "object" || Array.isArray(structuredRefs))
+        return refs;
+      for (const ref of Object.keys(structuredRefs)) {
+        if (/^e[1-9][0-9]{0,5}$/u.test(ref)) refs.add(`@${ref}`);
+      }
+      return refs;
+    }
+    snapshot = typeof record.snapshot === "string" ? record.snapshot : undefined;
+  } else if (typeof data === "string") {
+    snapshot = data;
+  }
+  if (!snapshot) return refs;
+  for (const match of snapshot.matchAll(/(?:@e|\bref=e)[1-9][0-9]{0,5}\b/gu)) {
+    refs.add(match[0].startsWith("@") ? match[0] : `@${match[0].slice(4)}`);
+  }
+  return refs;
 }
 
 function extractCurrentUrl(data: unknown): string | undefined {

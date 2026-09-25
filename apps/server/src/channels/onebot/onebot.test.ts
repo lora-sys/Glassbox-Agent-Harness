@@ -451,6 +451,7 @@ describe("OneBot forward WebSocket", () => {
       group_id: 10003,
       message: [
         { type: "reply", data: { id: "-7" } },
+        { type: "at", data: { qq: 10002 } },
         { type: "text", data: { text: "中文 [CQ:at,qq=all]" } },
       ],
     });
@@ -484,6 +485,15 @@ describe("OneBot forward WebSocket", () => {
     expect(
       await adapter.send({ deliveryId: "member-group", target: memberScope, text: "群回复" }),
     ).toEqual({ status: "confirmed", messageId: "321" });
+    expect(
+      (await fake.actions.next((action) => action.action === "send_group_msg")).params,
+    ).toEqual({
+      group_id: 10003,
+      message: [
+        { type: "at", data: { qq: 10099 } },
+        { type: "text", data: { text: "群回复" } },
+      ],
+    });
     expect(
       await adapter.send({
         deliveryId: "member-private",
@@ -609,6 +619,7 @@ describe("OneBot forward WebSocket", () => {
     ).toEqual({ status: "confirmed", messageId: "321" });
     const groupSend = await fake.actions.next((action) => action.action === "send_group_msg");
     expect(groupSend.params.message).toEqual([
+      { type: "at", data: { qq: 10002 } },
       { type: "text", data: { text: "截图 Artifact" } },
       { type: "image", data: { file: `base64://${pngBase64}` } },
     ]);
@@ -673,10 +684,16 @@ describe("OneBot forward WebSocket", () => {
     expect(sent.params.group_id).toBe(10003);
     const nodes = sent.params.messages as Array<{
       type: string;
-      data: { user_id: number; nickname: string; content: Array<{ data: { text?: string } }> };
+      data: {
+        user_id: number;
+        nickname: string;
+        content: Array<{ type: string; data: { qq?: number; text?: string } }>;
+      };
     }>;
     expect(nodes.length).toBeGreaterThan(1);
     expect(nodes.every((node) => node.type === "node" && node.data.user_id === 10001)).toBe(true);
+    expect(nodes[0]?.data.content[0]).toEqual({ type: "at", data: { qq: 10002 } });
+    expect(nodes.slice(1).every((node) => node.data.content[0]?.type === "text")).toBe(true);
     expect(
       nodes
         .flatMap((node) => node.data.content)

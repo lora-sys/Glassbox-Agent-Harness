@@ -120,6 +120,65 @@ describe("agent-browser 0.38.1 bridge", () => {
     await state.bridge.cleanup({ ...binding, purpose: "fallback" });
   });
 
+  it("isolates browser sessions and snapshot refs across principals", async () => {
+    const principalB = { ...binding, principalId: "owner-2" };
+    const state = setup({
+      result: (args) => {
+        const sessionId = args[2];
+        if (args[3] === "get" && args[4] === "url")
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({ success: true, data: "https://example.com/" }),
+            stderr: "",
+          };
+        if (args[3] === "snapshot") {
+          const principalId = state.openedBindings.find((opened) => opened.sessionId === sessionId)
+            ?.binding.principalId;
+          const page = principalId === "owner-1" ? "Owner A private page" : "Owner B page";
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              success: true,
+              data: { snapshot: `${page} button [ref=e1]`, url: "https://example.com/" },
+            }),
+            stderr: "",
+          };
+        }
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({ success: true, data: { url: "https://example.com/" } }),
+          stderr: "",
+        };
+      },
+    });
+
+    await state.bridge.execute(binding, { type: "open", url: "https://example.com/" });
+    const ownerASnapshot = await state.bridge.execute(binding, { type: "snapshot" });
+    const ownerASessionId = state.openedBindings[0]?.sessionId;
+    expect(ownerASnapshot.output).toContain("Owner A private page");
+
+    await expect(state.bridge.execute(principalB, { type: "snapshot" })).rejects.toThrow(
+      "browser_session_not_open",
+    );
+    await expect(state.bridge.execute(principalB, { type: "click", ref: "@e1" })).rejects.toThrow(
+      "browser_session_not_open",
+    );
+    expect(state.calls.some((args) => args[3] === "snapshot" && args[2] !== ownerASessionId)).toBe(
+      false,
+    );
+
+    await state.bridge.execute(principalB, { type: "open", url: "https://example.com/" });
+    await expect(state.bridge.execute(principalB, { type: "click", ref: "@e1" })).rejects.toThrow(
+      "browser_stale_ref",
+    );
+    const ownerBSnapshot = await state.bridge.execute(principalB, { type: "snapshot" });
+    expect(state.openedBindings[1]?.sessionId).not.toBe(ownerASessionId);
+    expect(ownerBSnapshot.output).toContain("Owner B page");
+    expect(ownerBSnapshot.output).not.toContain("Owner A private page");
+    await state.bridge.cleanup(binding);
+    await state.bridge.cleanup(principalB);
+  });
+
   it("requires a successful versioned JSON envelope even when the executor exits zero", async () => {
     let getUrlCount = 0;
     const state = setup({
@@ -278,6 +337,39 @@ describe("agent-browser 0.38.1 bridge", () => {
     await expect(state.bridge.execute(binding, { type: "click", ref: "@e1" })).rejects.toThrow(
       "browser_stale_ref",
     );
+  });
+
+  it("normalizes a bare snapshot ref while still requiring that exact current ref", async () => {
+    const state = setup({
+      result: (args) => ({
+        exitCode: 0,
+        stdout: JSON.stringify({
+          success: true,
+          data:
+            args[3] === "snapshot"
+              ? {
+                  snapshot: 'textbox "Text input" [ref=e3]\\nbutton "Submit" [ref=e2]',
+                  text: "Page copy may mention @e4, but it is not a snapshot reference.",
+                  refs: {
+                    e3: { role: "textbox", name: "Text input" },
+                    e2: { role: "button", name: "Submit" },
+                  },
+                }
+              : { url: "https://example.com/" },
+        }),
+        stderr: "",
+      }),
+    });
+    await state.bridge.execute(binding, { type: "open", url: "https://example.com/" });
+    await state.bridge.execute(binding, { type: "snapshot", interactive: true });
+
+    await state.bridge.execute(binding, { type: "fill", ref: "e3", text: "form value" });
+    expect(state.calls.some((args) => args.slice(3).join(" ") === "fill @e3 form value")).toBe(
+      true,
+    );
+    await expect(
+      state.bridge.execute(binding, { type: "fill", ref: "e4", text: "form value" }),
+    ).rejects.toThrow("browser_stale_ref");
   });
 
   it("denies before opening the bound executor session", async () => {

@@ -283,13 +283,25 @@ export function createBrowserTools(options: {
   const getContext = () => contextFrom(options.getContext);
   const tool = createProtectedTool<BrowserToolInput, BrowserActionResult>({
     name: BROWSER_TOOL,
-    description:
-      "Use the authorized isolated browser to read, inspect, and interact with public pages. Take a fresh snapshot before using an element reference. Screenshot returns a protected Artifact reference.",
+    description: [
+      "Use the authorized isolated browser to read, inspect, and interact with public pages.",
+      "For a new page, call open first, then snapshot with interactive=true.",
+      "Use only an exact @eN reference shown by that snapshot for fill, click, select, and other element actions.",
+      "Do not call get title before open or use a CSS selector, HTML id, label, or guessed value as ref.",
+      "After an interaction, take a new snapshot and verify the resulting page state before reporting success.",
+      "Screenshot returns a protected Artifact reference.",
+    ].join(" "),
     parameters: Type.Object(
       {
         action: Type.Union(ACTIONS.map((name) => Type.Literal(name))),
         url: Type.Optional(Type.String({ maxLength: 2048 })),
-        ref: Type.Optional(Type.String({ maxLength: 64 })),
+        ref: Type.Optional(
+          Type.String({
+            maxLength: 64,
+            description:
+              "Exact @eN reference from the current interactive snapshot, never a CSS selector or HTML id.",
+          }),
+        ),
         kind: Type.Optional(Type.String({ maxLength: 32 })),
         name: Type.Optional(Type.String({ maxLength: 64 })),
         selector: Type.Optional(Type.String({ maxLength: 1000 })),
@@ -308,7 +320,11 @@ export function createBrowserTools(options: {
         ),
         requestId: Type.Optional(Type.String({ maxLength: 128 })),
         tabId: Type.Optional(Type.String({ maxLength: 32 })),
-        interactive: Type.Optional(Type.Boolean()),
+        interactive: Type.Optional(
+          Type.Boolean({
+            description: "Set true to show the @eN references needed for element actions.",
+          }),
+        ),
         compact: Type.Optional(Type.Boolean()),
         depth: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
         fullPage: Type.Optional(Type.Boolean()),

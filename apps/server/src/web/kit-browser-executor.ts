@@ -32,6 +32,7 @@ const CALL_ID = /^[A-Za-z0-9_-]{1,80}$/u;
 const MAX_ARGUMENTS = 256;
 const MAX_ARGUMENT_CHARS = 4_096;
 const MAX_KIT_ARTIFACT_BYTES = 2 * 1024 * 1024;
+const SNAPSHOT_TRUNCATION_MARKER = "[snapshot truncated by Glassbox]";
 
 function validateArgs(args: readonly string[], sessionId: string): string[] {
   if (
@@ -58,6 +59,75 @@ function validateLimits(limits: BrowserExecutorLimits): void {
     limits.maxArtifactBytes < 1
   )
     throw new Error("browser_invalid_limits");
+}
+
+/** Keep oversized interactive snapshots valid JSON and expose refs only for visible snapshot rows. */
+function boundedCliStdout(stdout: string, maxOutputChars: number): string {
+  if (stdout.length <= maxOutputChars) return stdout;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    return stdout.slice(0, maxOutputChars);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+    return stdout.slice(0, maxOutputChars);
+
+  const result = parsed as Record<string, unknown>;
+  const data = result.data;
+  if (
+    !data ||
+    typeof data !== "object" ||
+    Array.isArray(data) ||
+    typeof (data as Record<string, unknown>).snapshot !== "string" ||
+    !(data as Record<string, unknown>).refs ||
+    typeof (data as Record<string, unknown>).refs !== "object" ||
+    Array.isArray((data as Record<string, unknown>).refs)
+  )
+    return JSON.stringify({ success: false, code: "output_truncated" });
+
+  const record = data as Record<string, unknown>;
+  const snapshot = record.snapshot as string;
+  const refs = record.refs as Record<string, unknown>;
+  const refIds = new Set(Object.keys(refs).filter((ref) => /^e[1-9][0-9]{0,5}$/u.test(ref)));
+  let low = 0;
+  let high = snapshot.length;
+  let best: string | undefined;
+
+  while (low <= high) {
+    const midpoint = Math.floor((low + high) / 2);
+    let end = midpoint;
+    if (end < snapshot.length) {
+      const lineEnd = snapshot.lastIndexOf("\n", end);
+      if (lineEnd > 0) end = lineEnd;
+    }
+    const visibleSnapshot =
+      end < snapshot.length ? `${snapshot.slice(0, end)}\n${SNAPSHOT_TRUNCATION_MARKER}` : snapshot;
+    const visibleIds = new Set(
+      [...visibleSnapshot.matchAll(/(?:@|ref=)(e[1-9][0-9]{0,5})\b/gu)].map((match) => match[1]!),
+    );
+    const visibleRefs = Object.fromEntries(
+      Object.entries(refs).filter(([ref]) => refIds.has(ref) && visibleIds.has(ref)),
+    );
+    const boundedData = {
+      ...(typeof record.origin === "string" ? { origin: record.origin } : {}),
+      snapshot: visibleSnapshot,
+      refs: visibleRefs,
+      ...(end < snapshot.length ? { truncated: true } : {}),
+    };
+    const candidate = JSON.stringify({ ...result, data: boundedData });
+    if (candidate.length <= maxOutputChars) {
+      best = candidate;
+      low = midpoint + 1;
+    } else {
+      high = midpoint - 1;
+    }
+  }
+
+  if (best) return best;
+  const failure = JSON.stringify({ success: false, code: "output_truncated" });
+  return failure.length <= maxOutputChars ? failure : "{}".slice(0, maxOutputChars);
 }
 
 function structuredResult(
@@ -126,7 +196,7 @@ function structuredResult(
   return {
     result: {
       exitCode: details.exitCode as number,
-      stdout: details.stdout.slice(0, maxOutputChars),
+      stdout: boundedCliStdout(details.stdout, maxOutputChars),
       stderr: details.stderr.slice(0, maxOutputChars),
     },
     ...(base64Png ? { base64Png } : {}),

@@ -5,7 +5,7 @@ import type { BrowserFallbackStatus, BrowserSearchFallback } from "./web-service
 
 const CAPTCHA =
   /captcha|challenge|verify (?:you are|you're) human|unusual traffic|too many requests|rate limit|sign in to continue/iu;
-const SEARCH_URL = "https://duckduckgo.com/";
+const SEARCH_URL = "https://www.bing.com/search";
 const MAX_SEARCH_RESULTS = 10;
 
 interface SnapshotLink {
@@ -13,35 +13,72 @@ interface SnapshotLink {
   title: string;
 }
 
+function snapshotRef(line: string): string | undefined {
+  const match =
+    /\[(?:ref=)?@?(e[1-9][0-9]{0,5})\]|\bref=@?(e[1-9][0-9]{0,5})\b|(@e[1-9][0-9]{0,5})\b/u.exec(
+      line,
+    );
+  const ref = match?.[1] ?? match?.[2] ?? match?.[3];
+  return ref ? (ref.startsWith("@") ? ref : `@${ref}`) : undefined;
+}
+
 function snapshotText(output: string): string {
   return output.slice(0, 20_000);
+}
+
+function snapshotContent(output: string): string {
+  try {
+    const parsed = JSON.parse(output) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const snapshot = (parsed as Record<string, unknown>).snapshot;
+      if (typeof snapshot === "string") return snapshotText(snapshot);
+    }
+  } catch {
+    /* Tests and alternate bridge ports may return plain snapshots. */
+  }
+  return snapshotText(output);
 }
 
 function blocked(output: string): boolean {
   return CAPTCHA.test(output);
 }
 
+function isSearchProviderHost(hostname: string): boolean {
+  return ["bing.com", "duckduckgo.com"].some(
+    (domain) => hostname === domain || hostname.endsWith(`.${domain}`),
+  );
+}
+
+function isGenericSearchTitle(title: string, hostname: string): boolean {
+  const normalized = title.trim().toLocaleLowerCase();
+  return (
+    normalized === hostname.toLocaleLowerCase() ||
+    ["read more", "more", "here", "visit site"].includes(normalized)
+  );
+}
+
 /** The target URL comes from a separate, bounded `get attr` action, never from page instructions. */
 export function parseBrowserSearchSnapshot(snapshot: string, maxResults: number): SnapshotLink[] {
+  snapshot = snapshotContent(snapshot);
+  const lines = snapshot.split(/\r?\n/u);
+  const hasMain = lines.some((line) => /^\s*-\s*main\b/iu.test(line));
   const links: SnapshotLink[] = [];
   const seen = new Set<string>();
-  for (const line of snapshot.split(/\r?\n/u)) {
-    const match = /\blink\s+"([^"]{3,300})"[^\n]*?(?:\[ref=)?(@e[1-9][0-9]{0,5})\]?/iu.exec(line);
-    if (!match || seen.has(match[2]!)) continue;
-    seen.add(match[2]!);
-    links.push({ title: match[1]!, ref: match[2]! });
+  let inResults = !hasMain;
+  for (const line of lines) {
+    if (/^\s*-\s*main\b/iu.test(line)) {
+      inResults = true;
+      continue;
+    }
+    if (!inResults) continue;
+    const title = /(?:\blink\s+|\[link\]\s*)"([^"]{3,300})"/iu.exec(line)?.[1];
+    const ref = snapshotRef(line);
+    if (!title || !ref || seen.has(ref)) continue;
+    seen.add(ref);
+    links.push({ title, ref });
     if (links.length >= Math.min(maxResults, MAX_SEARCH_RESULTS)) break;
   }
   return links;
-}
-
-function searchInputRef(snapshot: string): string | undefined {
-  for (const line of snapshot.split(/\r?\n/u)) {
-    if (!/\b(?:searchbox|textbox|combobox)\b/iu.test(line)) continue;
-    const ref = /@e[1-9][0-9]{0,5}\b/u.exec(line)?.[0];
-    if (ref) return ref;
-  }
-  return undefined;
 }
 
 function hrefFromOutput(value: string): string | undefined {
@@ -97,33 +134,28 @@ export class GuardedBrowserFallback implements BrowserSearchFallback {
   }
 
   async search(query: string, maxResults: number): ReturnType<BrowserSearchFallback["search"]> {
-    const binding = await this.preparedBinding(["browser.read", "browser.interact"]);
+    const binding = await this.preparedBinding(["browser.read"]);
     if (!binding) return { status: "fallback_denied", results: [] };
     const bridge = this.options.bridge;
     if (!bridge) return { status: "unavailable", results: [] };
     this.options.onActivated?.(binding, () => bridge.cleanup(binding));
     try {
-      await bridge.execute(binding, { type: "open", url: SEARCH_URL });
-      const first = snapshotText(
-        (await bridge.execute(binding, { type: "snapshot", interactive: true })).output,
-      );
-      if (blocked(first)) return { status: "blocked", results: [] };
-      const input = searchInputRef(first);
-      if (!input) return { status: "blocked", results: [] };
-      if (!(await this.options.authorize(binding, "browser.interact")))
-        return { status: "fallback_denied", results: [] };
-      await bridge.execute(binding, { type: "fill", ref: input, text: query });
-      if (!(await this.options.authorize(binding, "browser.interact")))
-        return { status: "fallback_denied", results: [] };
-      await bridge.execute(binding, { type: "press", key: "Enter" });
-      const snapshot = snapshotText(
-        (await bridge.execute(binding, { type: "snapshot", interactive: true })).output,
+      const searchUrl = new URL(SEARCH_URL);
+      searchUrl.searchParams.set("q", query);
+      await bridge.execute(binding, { type: "open", url: searchUrl.href });
+      await bridge.execute(binding, {
+        type: "wait",
+        condition: "load",
+        value: "domcontentloaded",
+      });
+      const snapshot = snapshotContent(
+        (await bridge.execute(binding, { type: "snapshot", interactive: true, compact: true }))
+          .output,
       );
       if (blocked(snapshot)) return { status: "blocked", results: [] };
-      const found = parseBrowserSearchSnapshot(snapshot, Math.min(maxResults * 2, 20));
+      const found = parseBrowserSearchSnapshot(snapshot, Math.min(maxResults * 4, 20));
       const results: Array<{ url: string; title: string; highlights: readonly string[] }> = [];
       for (const link of found) {
-        if (results.length >= maxResults) break;
         if (!(await this.options.authorize(binding, "browser.read")))
           return { status: "fallback_denied", results: [] };
         try {
@@ -146,7 +178,14 @@ export class GuardedBrowserFallback implements BrowserSearchFallback {
             redirected ?? external.href,
             this.options.resolveHost,
           );
-          if (target.hostname.endsWith("duckduckgo.com")) continue;
+          if (isSearchProviderHost(target.hostname)) continue;
+          const existing = results.findIndex((result) => result.url === target.href);
+          if (existing >= 0) {
+            if (!isGenericSearchTitle(link.title, target.hostname))
+              results[existing] = { ...results[existing]!, title: link.title };
+            continue;
+          }
+          if (results.length >= maxResults) continue;
           results.push({ url: target.href, title: link.title, highlights: [] });
         } catch {
           /* One malformed result does not erase valid results. */

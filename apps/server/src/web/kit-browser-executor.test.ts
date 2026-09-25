@@ -71,6 +71,73 @@ describe("Kit browser executor adapter", () => {
     expect(closeRun).not.toHaveBeenCalled();
   });
 
+  it("keeps oversized snapshots valid and exposes only refs present in visible snapshot text", async () => {
+    const refs = Object.fromEntries(
+      Array.from({ length: 240 }, (_, index) => [
+        `e${index + 1}`,
+        { role: "link", name: `Result ${index + 1} ${"long result label ".repeat(5)}` },
+      ]),
+    );
+    const snapshot = Object.keys(refs)
+      .map(
+        (ref, index) =>
+          `- link "Result ${index + 1} ${"long result label ".repeat(5)}" [ref=${ref}]`,
+      )
+      .join("\n");
+    const stdout = JSON.stringify({
+      success: true,
+      data: { lifecycle: { reused: true }, origin: "https://example.com", refs, snapshot },
+    });
+    const executeCli = vi.fn<KitCliSession["executeCli"]>(async () => ({
+      content: [],
+      details: { stdout, stderr: "", exitCode: 0 },
+    }));
+    const wrapper = await setup({ executeCli, cancel: vi.fn(async () => undefined) }).executor.open(
+      binding,
+      sessionId,
+    );
+
+    const result = await wrapper.execute(["--json", "--session", sessionId, "snapshot", "-i"], {
+      ...limits,
+      maxOutputChars: 1_500,
+    });
+    const parsed = JSON.parse(result.stdout) as {
+      success: boolean;
+      data: { snapshot: string; refs: Record<string, unknown>; truncated?: boolean };
+    };
+    const snapshotRefs = new Set(
+      [...parsed.data.snapshot.matchAll(/ref=(e[1-9][0-9]{0,5})\b/gu)].map((match) => match[1]),
+    );
+
+    expect(stdout.length).toBeGreaterThan(20_000);
+    expect(result.stdout.length).toBeLessThanOrEqual(1_500);
+    expect(parsed.success).toBe(true);
+    expect(parsed.data.truncated).toBe(true);
+    expect(parsed.data.snapshot).toContain("[snapshot truncated by Glassbox]");
+    expect(Object.keys(parsed.data.refs)).toEqual([...snapshotRefs]);
+    expect(Object.keys(parsed.data.refs).length).toBeLessThan(Object.keys(refs).length);
+  });
+
+  it("returns a valid explicit failure for oversized non-snapshot JSON", async () => {
+    const executeCli = vi.fn<KitCliSession["executeCli"]>(async () => ({
+      content: [],
+      details: {
+        stdout: JSON.stringify({ success: true, data: { body: "x".repeat(2_000) } }),
+        stderr: "",
+        exitCode: 0,
+      },
+    }));
+    const wrapper = await setup({ executeCli, cancel: vi.fn(async () => undefined) }).executor.open(
+      binding,
+      sessionId,
+    );
+
+    const result = await wrapper.execute(args, { ...limits, maxOutputChars: 1_000 });
+
+    expect(result.stdout).toBe('{"success":false,"code":"output_truncated"}');
+    expect(() => JSON.parse(result.stdout)).not.toThrow();
+  });
+
   it("fails closed when the session is missing, argv is malformed, or result details are absent", async () => {
     const artifacts = { write: vi.fn(async () => artifactReference) };
     const noSession = createKitBrowserExecutor(async () => undefined, artifacts);

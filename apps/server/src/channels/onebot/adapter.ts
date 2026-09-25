@@ -516,12 +516,17 @@ export class OneBotAdapter {
     if (this.#state.status !== "ready" || !socket)
       return { status: "failed", code: "not_connected" };
     if (Array.from(input.text).length > QQ_DIRECT_TEXT_LIMIT) {
-      const messages = splitForwardText(input.text).map((text) => ({
+      const messages = splitForwardText(input.text).map((text, index) => ({
         type: "node",
         data: {
           user_id: Number(this.config.botId),
           nickname: this.config.label.slice(0, 64),
-          content: [{ type: "text", data: { text } }],
+          content: [
+            ...(target.chatType === "group" && index === 0
+              ? [{ type: "at", data: { qq: Number(target.senderId) } }]
+              : []),
+            { type: "text", data: { text } },
+          ],
         },
       }));
       const result = await this.#request(
@@ -544,6 +549,9 @@ export class OneBotAdapter {
     }
     const message = [
       ...(replyTo === undefined ? [] : [{ type: "reply", data: { id: replyTo } }]),
+      ...(target.chatType === "group"
+        ? [{ type: "at", data: { qq: Number(target.senderId) } }]
+        : []),
       { type: "text", data: { text: input.text } },
       ...(input.image === undefined
         ? []

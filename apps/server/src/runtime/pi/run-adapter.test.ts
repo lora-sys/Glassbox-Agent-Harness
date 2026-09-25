@@ -124,6 +124,45 @@ describe("Pi required Tool execution", () => {
     });
   });
 
+  it("requires an explicit task_delegate call and does not retry a denied delegation", async () => {
+    const title = "GB20-HERDR-REVOKE-CHECK";
+    const f = fixture([
+      { status: "completed", text: "权限不足，未执行。", toolCalls: [] },
+      {
+        status: "completed",
+        text: "Permission denied: no_grant",
+        toolCalls: [
+          {
+            name: "task_delegate",
+            input: { title, prompt: "Create the isolated acceptance file." },
+            failed: true,
+            outcome: "denied",
+          },
+        ],
+      },
+    ]);
+    f.input.text =
+      "GB20-HERDR-REVOKE-0925：请尝试调用 task_delegate 创建一个名为 GB20-HERDR-REVOKE-CHECK 的隔离测试任务。";
+
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "failed",
+      text: "请求的操作未执行，请稍后重试。",
+    });
+    expect(f.run).toHaveBeenCalledTimes(2);
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe("task_delegate");
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({ title });
+    expect(f.run.mock.calls[1]?.[2]).toContain("task_delegate");
+  });
+
+  it("does not turn questions or negated task_delegate mentions into actions", async () => {
+    for (const text of ["task_delegate 是什么？", "请不要调用 task_delegate。"]) {
+      const f = fixture([{ status: "completed", text: "说明如下。", toolCalls: [] }]);
+      f.input.text = text;
+      await f.executor.execute(f.input);
+      expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBeUndefined();
+    }
+  });
+
   it("binds an explicit Owner Memory command to the current Run's exact Tool input", async () => {
     const f = fixture([
       {
@@ -1365,6 +1404,47 @@ describe("an explicit current-group history search requires the group Tool", () 
       [{ status: "aborted", text: "发送者是 member-a，原文是 P4B-A-1349。", toolCalls: [] }],
       [GROUP_HISTORY_SEARCH_TOOL],
     );
+    await expect(f.executor.execute(f.input)).resolves.toEqual({
+      status: "cancelled",
+      providerSessionId: "session-1",
+    });
+    expect(f.run).toHaveBeenCalledOnce();
+  });
+
+  it("keeps a Run cancelled when a failed browser Tool is followed by a completed model turn", async () => {
+    const f = fixture([
+      {
+        status: "completed",
+        text: "浏览器操作未完成，无法确认页面或提供截图。",
+        toolCalls: [
+          {
+            name: "browser",
+            input: { action: "open", url: "https://httpbin.org/delay/20" },
+            failed: true,
+            outcome: "provider_failed",
+          },
+        ],
+      },
+    ]);
+    const controller = new AbortController();
+    f.input.signal = controller.signal;
+    f.input.text = "用 browser 打开 https://httpbin.org/delay/20 并读取页面标题";
+    f.run.mockImplementationOnce(async (..._args) => {
+      controller.abort();
+      return {
+        status: "completed",
+        text: "浏览器操作未完成，无法确认页面或提供截图。",
+        toolCalls: [
+          {
+            name: "browser",
+            input: { action: "open", url: "https://httpbin.org/delay/20" },
+            failed: true,
+            outcome: "provider_failed",
+          },
+        ],
+      };
+    });
+
     await expect(f.executor.execute(f.input)).resolves.toEqual({
       status: "cancelled",
       providerSessionId: "session-1",

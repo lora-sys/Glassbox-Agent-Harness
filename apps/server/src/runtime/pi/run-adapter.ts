@@ -147,6 +147,15 @@ function ownerMemoryCommand(text: string): RequiredToolCall | undefined {
   };
 }
 
+/** Explicitly named Ops calls must be backed by a real Tool result, never model narration. */
+function ownerTaskDelegationRequest(text: string): RequiredToolCall | undefined {
+  const request = requestClauses(text);
+  if (!/(?:调用|执行|使用|尝试调用)\s*`?task_delegate`?/iu.test(request)) return undefined;
+  if (/(?:不要|别|不需要|无需|停止)\s*(?:调用|执行|使用|委派)/u.test(request)) return undefined;
+  const title = /名为\s*[“"「]?([A-Za-z0-9][A-Za-z0-9._-]{0,127})/u.exec(request)?.[1];
+  return { name: "task_delegate", input: title ? { title } : {} };
+}
+
 /** The provider parameters the current message pins down, or `undefined` when it pins none. */
 type RequiredMutationParams = Record<string, string | number | boolean> | undefined;
 
@@ -518,6 +527,8 @@ function requiredToolCall(
   // outside a private Owner Run, whatever else a message may name.
   if (input.caller.scope.chatType !== "private" || !isOwner) return undefined;
   const rawText = input.text;
+  const taskDelegation = ownerTaskDelegationRequest(rawText);
+  if (taskDelegation) return taskDelegation;
   if (authorizedToolNames?.includes(OWNER_MEMORY_ADMIN_TOOL)) {
     const memory = ownerMemoryCommand(rawText);
     if (memory) return memory;
@@ -874,7 +885,20 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
           evidence.some((item) => item.domain === "web_fetch")
         )
       ) {
-        if (result.status === "completed" && missing.length > 0 && !input.signal.aborted) {
+        const delegationAttempted = requiredCalls.some(
+          (call) =>
+            call.name === "task_delegate" &&
+            observedCalls.some(
+              (observed) =>
+                observed.name === call.name && satisfiesRequiredInput(call.input, observed.input),
+            ),
+        );
+        if (
+          result.status === "completed" &&
+          missing.length > 0 &&
+          !input.signal.aborted &&
+          !delegationAttempted
+        ) {
           result = await this.runtime.run(
             binding,
             { ...input.run, principalId: input.caller.principalId },
@@ -931,7 +955,10 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         (item) => item.domain,
       );
       const missingEvidence = missingEvidenceDomains.length > 0;
-      if (result.status === "aborted") {
+      // A Tool can settle as a failure after cancellation, then the provider can emit a completed
+      // turn containing only a refusal or fallback sentence. The Run's explicit cancel signal
+      // remains authoritative even when the latest provider result is not `aborted`.
+      if (input.signal.aborted || result.status === "aborted") {
         return missingTool || missingEvidence
           ? { status: "cancelled", providerSessionId: binding.runtimeSessionId }
           : {
