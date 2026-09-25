@@ -19,7 +19,7 @@
     "agent:inspect": "tsx scripts/inspect-latest-run.mts",
     "agent:down": "tsx scripts/agent-service.mts down",
     "dev:web": "vp dev",
-    "test:unit": "vp test run --allowOnly=false --maxWorkers=4",
+    "test:unit": "vp test run --allowOnly=false --maxWorkers=2",
     "test:e2e": "vp test run --allowOnly=false --maxWorkers=4 apps/server/src/ops/p3-closed-loop.test.ts apps/server/src/management/application.test.ts",
     "test:regression": "vp test run --allowOnly=false --maxWorkers=4 apps/server/src/channels/onebot/dual-owner.test.ts apps/server/src/channels/onebot/onebot.test.ts apps/server/src/config/group-runtime.test.ts apps/server/src/delivery/presentation.test.ts apps/server/src/ops/reconciler.test.ts apps/server/src/ops/socket-herdr-bridge.test.ts apps/server/src/ops/trace-persistence.test.ts apps/server/src/persistence/foundation.test.ts apps/server/src/runtime/pi/owner-tools.test.ts apps/server/src/runtime/pi/skill-tools.test.ts",
     "check:core": "vp check --no-fmt apps/server packages/contracts scripts vite.config.ts",

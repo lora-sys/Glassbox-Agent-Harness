@@ -1,4 +1,5 @@
 import type { IncomingMessage } from "node:http";
+import { isAbsolute } from "node:path";
 import { CHANNEL_SAFE_ERRORS } from "@glassbox/contracts";
 import type { ExecutorConfiguration } from "../config/executors.js";
 import type { CallerContext } from "../identity/scope.js";
@@ -30,6 +31,12 @@ type RouteStore = {
 };
 
 export interface ManagementRouteDependencies {
+  sandboxStatus(): unknown;
+  listWorkspaces(principalId: string): Promise<unknown>;
+  registerWorkspace(input: unknown): Promise<unknown>;
+  grantWorkspace(input: unknown): Promise<unknown>;
+  revokeWorkspace(input: unknown): Promise<unknown>;
+  selectWorkspace(input: unknown): Promise<unknown>;
   store: RouteStore;
   grantOpsPermissions(input: unknown): Promise<unknown>;
   executors: Pick<ExecutorConfiguration, "list" | "save" | "check">;
@@ -40,9 +47,62 @@ export interface ManagementRouteDependencies {
   probeCapabilities(channelId: string, groupId: string): Promise<CapabilityProbeReport>;
   groupRoleAudit(channelId: string, groupId: string): Promise<unknown>;
   runCaller(runId: string): Promise<CallerContext>;
+  readBrowserArtifact(id: string): Promise<unknown>;
   runs: Pick<RunService, "cancel">;
   trace: Pick<RunTraceStore, "readPage">;
   evaluator: ReturnType<typeof createRunEvaluator>;
+}
+
+function workspaceInput(input: unknown): Record<string, unknown> {
+  if (!input || typeof input !== "object" || Array.isArray(input))
+    throw new ManagementError("INVALID_REQUEST", "A workspace object is required");
+  return input as Record<string, unknown>;
+}
+
+function principalId(value: unknown): string {
+  if (typeof value !== "string" || !/^[\p{L}\p{N}_.:@-]{1,512}$/u.test(value))
+    throw new ManagementError("INVALID_REQUEST", "Invalid principal identifier");
+  return value;
+}
+
+function workspaceId(value: unknown): string {
+  if (
+    typeof value !== "string" ||
+    !/^(?:default-[a-f0-9]{32}|workspace-[a-f0-9-]{36})$/u.test(value)
+  )
+    throw new ManagementError("INVALID_REQUEST", "Invalid workspace identifier");
+  return value;
+}
+
+function workspaceActionInput(action: "register" | "grant" | "revoke" | "select", input: unknown) {
+  const value = workspaceInput(input);
+  if (action === "register") {
+    if (
+      typeof value.path !== "string" ||
+      value.path.trim() !== value.path ||
+      !isAbsolute(value.path) ||
+      value.path.includes("\0") ||
+      typeof value.label !== "string" ||
+      !value.label.trim() ||
+      value.label.length > 120
+    )
+      throw new ManagementError("INVALID_REQUEST", "An absolute path and label are required");
+    return {
+      path: value.path,
+      label: value.label.trim(),
+      ownerPrincipalId: principalId(value.ownerPrincipalId),
+    };
+  }
+  const base = {
+    workspaceId: workspaceId(value.workspaceId),
+    principalId: principalId(value.principalId),
+  };
+  if (action === "grant") {
+    if (value.access !== "read" && value.access !== "write")
+      throw new ManagementError("INVALID_REQUEST", "Workspace access must be read or write");
+    return { ...base, access: value.access };
+  }
+  return base;
 }
 
 /** Dispatch the management routes owned by ManagementApplication. */
@@ -72,6 +132,30 @@ export async function routeManagementRequest(
   };
   const ok = (body: unknown) => ({ status: 200, body });
   try {
+    if (request.method === "GET" && path === "/manage/sandbox")
+      return ok({ sandbox: dependencies.sandboxStatus() });
+    const browserArtifact =
+      /^\/manage\/browser-artifacts\/([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/u.exec(
+        path,
+      );
+    if (request.method === "GET" && browserArtifact)
+      return ok({ artifact: await dependencies.readBrowserArtifact(browserArtifact[1]!) });
+    if (request.method === "GET" && path === "/manage/workspaces")
+      return ok({
+        workspaces: await dependencies.listWorkspaces(
+          principalId(url.searchParams.get("principalId")),
+        ),
+      });
+    const workspaceAction = /^\/manage\/workspaces\/(register|grant|revoke|select)$/u.exec(path);
+    if (request.method === "POST" && workspaceAction) {
+      const action = workspaceAction[1] as "register" | "grant" | "revoke" | "select";
+      const input = workspaceActionInput(action, await readManagementJson(request));
+      if (action === "register")
+        return ok({ workspace: await dependencies.registerWorkspace(input) });
+      if (action === "grant") return ok(await dependencies.grantWorkspace(input));
+      if (action === "revoke") return ok(await dependencies.revokeWorkspace(input));
+      return ok(await dependencies.selectWorkspace(input));
+    }
     if (path === "/manage/executors") {
       if (request.method === "GET") return ok({ executors: await dependencies.executors.list() });
       if (request.method === "POST")

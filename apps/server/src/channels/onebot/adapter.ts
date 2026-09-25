@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { Buffer } from "node:buffer";
 import WebSocket, { type RawData } from "ws";
 import type { TrustedChannelScope } from "../../identity/scope.js";
 import {
@@ -140,6 +141,28 @@ interface PendingRequest {
 }
 
 const QQ_DIRECT_TEXT_LIMIT = 3_500;
+const QQ_PNG_MAX_BYTES = 8 * 1024 * 1024;
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+function isBoundedPngBase64(value: unknown): value is string {
+  if (
+    typeof value !== "string" ||
+    value.length < 32 ||
+    value.length > Math.ceil(QQ_PNG_MAX_BYTES / 3) * 4 ||
+    value.length % 4 !== 0 ||
+    !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)
+  )
+    return false;
+  const bytes = Buffer.from(value, "base64");
+  return (
+    bytes.length <= QQ_PNG_MAX_BYTES &&
+    bytes.length >= 24 &&
+    bytes.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE) &&
+    bytes.readUInt32BE(8) === 13 &&
+    bytes.toString("ascii", 12, 16) === "IHDR" &&
+    bytes.toString("base64") === value
+  );
+}
 const QQ_FORWARD_NODE_LIMIT = 1_800;
 const ONE_BOT_HISTORY_PAGE_LIMIT = 100;
 
@@ -457,6 +480,7 @@ export class OneBotAdapter {
     target: TrustedChannelScope;
     text: string;
     replyTo?: string;
+    image?: { pngBase64: string };
   }): Promise<OneBotDeliveryResult> {
     const target = input.target;
     if (!target) return { status: "failed", code: "invalid_target" };
@@ -482,19 +506,27 @@ export class OneBotAdapter {
       typeof input.text !== "string" ||
       !input.text.trim() ||
       input.text.length > 64_000 ||
-      (input.replyTo !== undefined && replyTo === undefined)
+      (input.replyTo !== undefined && replyTo === undefined) ||
+      (input.image !== undefined &&
+        (!isBoundedPngBase64(input.image.pngBase64) ||
+          Array.from(input.text).length > QQ_DIRECT_TEXT_LIMIT))
     )
       return { status: "failed", code: "invalid_message" };
     const socket = this.#socket;
     if (this.#state.status !== "ready" || !socket)
       return { status: "failed", code: "not_connected" };
     if (Array.from(input.text).length > QQ_DIRECT_TEXT_LIMIT) {
-      const messages = splitForwardText(input.text).map((text) => ({
+      const messages = splitForwardText(input.text).map((text, index) => ({
         type: "node",
         data: {
           user_id: Number(this.config.botId),
           nickname: this.config.label.slice(0, 64),
-          content: [{ type: "text", data: { text } }],
+          content: [
+            ...(target.chatType === "group" && index === 0
+              ? [{ type: "at", data: { qq: Number(target.senderId) } }]
+              : []),
+            { type: "text", data: { text } },
+          ],
         },
       }));
       const result = await this.#request(
@@ -517,7 +549,13 @@ export class OneBotAdapter {
     }
     const message = [
       ...(replyTo === undefined ? [] : [{ type: "reply", data: { id: replyTo } }]),
+      ...(target.chatType === "group"
+        ? [{ type: "at", data: { qq: Number(target.senderId) } }]
+        : []),
       { type: "text", data: { text: input.text } },
+      ...(input.image === undefined
+        ? []
+        : [{ type: "image", data: { file: `base64://${input.image.pngBase64}` } }]),
     ];
     const result = await this.#request(
       socket,

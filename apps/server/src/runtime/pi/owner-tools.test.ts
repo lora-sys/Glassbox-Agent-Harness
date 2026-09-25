@@ -61,6 +61,10 @@ it("exposes a provider-compatible group admin schema and validates each action",
       additionalProperties: false,
     });
     expect(tool!.parameters).not.toHaveProperty("anyOf");
+    expect(
+      (tool!.parameters as { properties: { category: { enum: string[] } } }).properties.category
+        .enum,
+    ).toContain("web.search");
     await tool!.execute(
       "get-call",
       { action: "get", groupId: "1126022432" },
@@ -165,6 +169,15 @@ it("accepts each explicit Owner capability mutation and parses it before mutatio
           action: "set_capability",
           groupId: "1126022432",
           category: "group.members",
+          enabled: true,
+        },
+      ],
+      [
+        "set_capability",
+        {
+          action: "set_capability",
+          groupId: "1126022432",
+          category: "browser.interact",
           enabled: true,
         },
       ],

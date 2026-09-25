@@ -8,7 +8,11 @@ export interface DeliveryContentDecision {
   text?: string;
   reasons: string[];
   candidateSha256: string;
+  artifactIds?: readonly string[];
 }
+
+export const DELIVERY_UUID =
+  /\b[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/giu;
 
 function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
@@ -32,15 +36,17 @@ export function createQqDeliveryPolicy(
       regex:
         /\bhttps?:\/\/(?:localhost|[^\s/:]+\.(?:localhost|local|internal)|127\.0\.0\.1|\[::1\]|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+)(?::\d+)?(?:\/[^\s]*)?/iu,
     },
-    {
-      name: "internal-uuid",
-      regex: /\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/iu,
-    },
   ] as const;
 
-  const inspect = (text: string): string[] => {
+  const inspect = (text: string, allowedArtifactIds: ReadonlySet<string>): string[] => {
     const reasons = screenText(text).hits.map((hit) => `secret:${hit}`);
     for (const pattern of patterns) if (pattern.regex.test(text)) reasons.push(pattern.name);
+    if (
+      [...text.matchAll(DELIVERY_UUID)].some(
+        (match) => !allowedArtifactIds.has(match[0]!.toLowerCase()),
+      )
+    )
+      reasons.push("internal-uuid");
     const inspectValues = (
       input: readonly string[] | (() => readonly string[]) | undefined,
       prefix: string,
@@ -62,16 +68,17 @@ export function createQqDeliveryPolicy(
   };
 
   return {
-    prepare(candidate: string): DeliveryContentDecision {
+    prepare(candidate: string, allowedArtifacts: readonly string[] = []): DeliveryContentDecision {
       const candidateSha256 = createHash("sha256").update(candidate).digest("hex");
-      const initial = inspect(candidate);
+      const allowedArtifactIds = new Set(allowedArtifacts.map((id) => id.toLowerCase()));
+      const initial = inspect(candidate, allowedArtifactIds);
       if (initial.length > 0) return { allowed: false, reasons: initial, candidateSha256 };
       const text = renderQqPlainText(candidate);
       if (!text) return { allowed: false, reasons: ["empty-rendered-output"], candidateSha256 };
-      const rendered = inspect(text);
+      const rendered = inspect(text, allowedArtifactIds);
       return rendered.length > 0
         ? { allowed: false, reasons: rendered, candidateSha256 }
-        : { allowed: true, text, reasons: [], candidateSha256 };
+        : { allowed: true, text, reasons: [], candidateSha256, artifactIds: allowedArtifacts };
     },
   };
 }

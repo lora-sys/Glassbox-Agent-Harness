@@ -41,6 +41,22 @@ describe("QQ delivery presentation", () => {
     );
   });
 
+  it("allows only explicitly verified Artifact IDs while still blocking other UUIDs", () => {
+    const artifactId = "ca181a0c-6f10-44ba-bd1f-5fba48024a48";
+    const otherId = "83a4513a-742f-4d87-b047-ec67cc775c98";
+    const policy = createQqDeliveryPolicy();
+    expect(policy.prepare(`截图 Artifact：${artifactId}`, [artifactId])).toMatchObject({
+      allowed: true,
+      artifactIds: [artifactId],
+    });
+    expect(
+      policy.prepare(`截图 Artifact：${artifactId}；Run：${otherId}`, [artifactId]),
+    ).toMatchObject({
+      allowed: false,
+      reasons: ["internal-uuid"],
+    });
+  });
+
   it("reads configured forbidden values for every candidate without exposing the value", () => {
     let credential = "first-runtime-credential";
     const policy = createQqDeliveryPolicy({ forbiddenValues: () => [credential] });

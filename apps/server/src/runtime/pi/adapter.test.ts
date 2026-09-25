@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vite-plus/test";
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import type { AgentRun, Conversation } from "@glassbox/contracts";
 import type {
@@ -427,6 +427,26 @@ describe("PiSdkRuntimeAdapter", () => {
     );
 
     await adapter.cleanup();
+
+    const isolated = new PiSdkRuntimeAdapter({
+      kitPath: fileURLToPath(new URL("./fixtures/lora-pi-kit", import.meta.url)),
+      runtimeBaseDir,
+      model,
+      modelRuntime,
+      resolveToolCandidates: async () => [{ name: "read", exclusion: null }],
+      resolveSkillNames: async () => ({ names: [] }),
+      openSandboxToolSession: async () => ({
+        tools: [{ ...tool("read"), description: "Isolated read fixture" }],
+        close: async () => {},
+      }),
+    });
+    await isolated.initialize();
+    const isolatedBinding = await isolated.createOrRestoreSession(conversation, "test", context);
+    await isolated.run(isolatedBinding, run, "say hello", context);
+    expect(capturedContext?.tools?.find((entry) => entry.name === "read")).toEqual(
+      expect.objectContaining({ description: "Isolated read fixture" }),
+    );
+    await isolated.cleanup();
   });
 
   it("enforces isolated Pi sessions across Owner and Visitor in the same Conversation, creating fresh sessions without caching", async () => {
@@ -486,6 +506,37 @@ describe("PiSdkRuntimeAdapter", () => {
     expect(disposedSessions).toContain("pi-session-2");
 
     await adapter.cleanup();
+  });
+
+  it("keeps one Run's browser cleanup until all model turns finish", async () => {
+    const runtimeBaseDir = await mkdtemp(join(tmpdir(), "glassbox-pi-runtime-"));
+    directories.push(runtimeBaseDir);
+    const onRunEnd = vi.fn(async () => {});
+    const adapter = new PiSdkRuntimeAdapter({
+      kitPath: fileURLToPath(new URL("./fixtures/lora-pi-kit", import.meta.url)),
+      runtimeBaseDir,
+      onRunEnd,
+      createSession: async () =>
+        ({
+          sessionId: "pi-browser-test",
+          messages: [],
+          subscribe: () => () => {},
+          async prompt() {},
+          async abort() {},
+          dispose() {},
+        }) as never,
+    });
+    await adapter.initialize();
+    const context = { runId: run.id, conversationId: conversation.id };
+    const binding = await adapter.createOrRestoreSession(conversation, "test", context);
+    await adapter.run(binding, run, "open page", context);
+    await adapter.run(binding, run, "read title", context);
+    expect(onRunEnd).not.toHaveBeenCalled();
+    expect(adapter.getRunContext(binding.runtimeSessionId)).toBeUndefined();
+
+    await adapter.disposeSession(binding.runtimeSessionId);
+    expect(onRunEnd).toHaveBeenCalledOnce();
+    expect(adapter.getRunContext(binding.runtimeSessionId)).toBeUndefined();
   });
 
   it("PiRunExecutionAdapter disposes sessions per run and reconstructs prompt from authorized Glassbox context, preventing cross-actor and post-revoke context leaks", async () => {

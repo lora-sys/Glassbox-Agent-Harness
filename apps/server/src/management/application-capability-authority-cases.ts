@@ -80,9 +80,9 @@ describe("configured group Run capability authority", () => {
     // The Agent Ops and Owner-control surface is Owner-private too.
     expect(reason("owner_group_admin")).toBe("scope_not_permitted");
     expect(reason("ops_status")).toBe("scope_not_permitted");
-    // The Kit profile's host Tools were removed by the host, and that is named as such.
-    expect(reason("read")).toBe("disabled_by_host");
-    expect(reason("bash")).toBe("disabled_by_host");
+    // Isolated file and Shell Tools are still outside every group Run's scope.
+    expect(reason("read")).toBe("scope_not_permitted");
+    expect(reason("bash")).toBe("scope_not_permitted");
     // The eligible read-only Tools are the selected set, and agree with the name projection.
     const selected = candidates
       .filter((entry) => entry.exclusion === null)

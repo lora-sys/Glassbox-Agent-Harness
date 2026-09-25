@@ -94,11 +94,15 @@ export interface RunServiceOptions {
   concurrency?: number;
   deliveryTimeoutMs?: number;
   onEvent?: (event: RunServiceEvent) => void | Promise<void>;
-  prepareDelivery?: (candidate: string) => Promise<{
+  prepareDelivery?: (
+    candidate: string,
+    context: { caller: CallerContext; run: RunRecord },
+  ) => Promise<{
     allowed: boolean;
     text?: string;
     reasons: string[];
     candidateSha256: string;
+    artifactIds?: readonly string[];
   }>;
   /** Fixed diagnostic codes only; provider errors and protected payloads are excluded. */
   onError?: (error: {

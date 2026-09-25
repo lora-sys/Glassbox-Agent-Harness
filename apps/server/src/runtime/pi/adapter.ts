@@ -16,6 +16,7 @@ import {
 import { KitLoader, type ResolvedKitProfile } from "./kit-loader.js";
 import { QQ_CAPABILITY_CATEGORIES } from "../../channels/onebot/capabilities.js";
 import { requiredInputClause } from "./protected-tools.js";
+import type { RequiredEvidence } from "./required-evidence.js";
 import {
   GLASSBOX_HOST_EXCLUDED_PI_TOOLS,
   assertProfileSelectionComplete,
@@ -47,6 +48,27 @@ interface ActiveSession {
   authorizedSkillNames: readonly string[];
   modelVisibleSkillNames: readonly string[];
   skillPolicy: Record<string, unknown>;
+  sandboxToolSession?: SandboxToolSession;
+  sandboxWorkspaceId?: string;
+  sandboxPrincipalId?: string;
+  lastRunContext?: PiRunContext;
+}
+
+/** A Run-scoped, already-authorized set of Pi tools backed by an isolated executor. */
+export interface SandboxToolSession {
+  tools: ToolDefinition[];
+  close(): Promise<void>;
+}
+
+export function requiredEvidencePromptClause(evidence: readonly RequiredEvidence[]): string {
+  if (evidence.length === 0) return "";
+  const calls = evidence
+    .map((item) => `${item.tool}(${JSON.stringify(item.input)})`)
+    .join(", then ");
+  const browserNote = evidence.some((item) => item.tool === "browser")
+    ? " A private Owner browser request does not require changing group capabilities."
+    : "";
+  return `\n\nThe current request requires live Tool observations. Call ${calls} in order before reporting the requested facts or Artifact. Use successful Tool results as evidence. If a call fails, state what could not be confirmed and do not invent a result.${browserNote}`;
 }
 
 export interface PiSdkRuntimeOptions {
@@ -58,6 +80,13 @@ export interface PiSdkRuntimeOptions {
   resolveModel?: () => Promise<{ model: Model<any>; modelRuntime: ModelRuntime }>;
   customTools?: ToolDefinition[];
   createTools?: (getContext: () => PiRunContext | undefined) => ToolDefinition[];
+  /** Release Run-scoped external resources before the execution context is discarded. */
+  onRunEnd?: (context: PiRunContext) => Promise<void>;
+  openSandboxToolSession?: (input: {
+    context: PiRunContext;
+    selectedNames: readonly string[];
+  }) => Promise<SandboxToolSession>;
+  openSandboxForBrowser?: boolean;
   resolveSkillNames?: (
     context: PiRunContext,
     profile: ResolvedKitProfile,
@@ -75,6 +104,10 @@ export interface PiSdkRuntimeOptions {
    * excluded and why. `resolveToolNames` remains for fakes that only need the active names.
    */
   resolveToolCandidates?: (context: PiRunContext) => Promise<readonly ToolSurfaceCandidate[]>;
+  /** Current backend readiness is separate from discovery and authorization. */
+  resolveProviderReadiness?: (
+    context: PiRunContext,
+  ) => Promise<Readonly<Record<string, "ready" | "unavailable" | "unknown">>>;
   onEvent?: (event: PiNormalizedEvent) => void | Promise<void>;
   createSession?: (params: {
     conversation: Conversation;
@@ -358,6 +391,18 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
           profileName,
           profileActiveTools: profile.activeTools,
           candidates,
+          providerReadiness: Object.fromEntries([
+            ...candidates
+              .filter(
+                (candidate) =>
+                  candidate.exclusion === null &&
+                  GLASSBOX_HOST_EXCLUDED_PI_TOOLS.includes(candidate.name),
+              )
+              .map((candidate) => [candidate.name, "ready" as const]),
+            ...(context && this.options.resolveProviderReadiness
+              ? Object.entries(await this.options.resolveProviderReadiness(context))
+              : []),
+          ]),
           // The digest of the profile file that produced this surface, so an old Run's
           // evidence can be read against the declaration it actually ran under.
           profileVersion: profileFingerprint(runtimeEvidence, profileName),
@@ -370,21 +415,42 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
     await mkdir(config.agentDir, { recursive: true });
     const sessionDir = path.join(config.agentDir, "sessions", conversation.id);
     await mkdir(sessionDir, { recursive: true });
-    const session = this.options.createSession
-      ? await this.options.createSession({
-          conversation,
-          profile: effectiveProfile,
-          agentDir: config.agentDir,
-          sessionDir,
-          modelVisibleSkillNames,
-        })
-      : await this.createRealSession(
-          effectiveProfile,
-          config.agentDir,
-          sessionDir,
-          authorizedToolNames,
-          modelVisibleSkillNames,
-        );
+    const sandboxToolSession =
+      context &&
+      !this.options.createSession &&
+      this.options.openSandboxToolSession &&
+      authorizedToolNames?.some(
+        (name) =>
+          GLASSBOX_HOST_EXCLUDED_PI_TOOLS.includes(name) ||
+          (this.options.openSandboxForBrowser && name === "browser"),
+      )
+        ? await this.options.openSandboxToolSession({
+            context,
+            selectedNames: authorizedToolNames,
+          })
+        : undefined;
+    let session: ActiveSession["session"];
+    try {
+      session = this.options.createSession
+        ? await this.options.createSession({
+            conversation,
+            profile: effectiveProfile,
+            agentDir: config.agentDir,
+            sessionDir,
+            modelVisibleSkillNames,
+          })
+        : await this.createRealSession(
+            effectiveProfile,
+            config.agentDir,
+            sessionDir,
+            authorizedToolNames,
+            modelVisibleSkillNames,
+            sandboxToolSession?.tools,
+          );
+    } catch (error) {
+      await sandboxToolSession?.close();
+      throw error;
+    }
     const now = new Date().toISOString();
     const binding: PiSessionBinding = {
       conversationId: conversation.id,
@@ -403,6 +469,9 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
       authorizedSkillNames,
       modelVisibleSkillNames,
       skillPolicy: structuredClone(resolvedSkills.policy ?? { source: "kit-profile" }),
+      sandboxToolSession,
+      sandboxWorkspaceId: sandboxToolSession ? context?.workspaceId : undefined,
+      sandboxPrincipalId: sandboxToolSession ? context?.caller?.principalId : undefined,
     });
     return { ...binding };
   }
@@ -413,6 +482,7 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
     sessionDir: string,
     authorizedToolNames?: readonly string[],
     modelVisibleSkillNames?: readonly string[],
+    sandboxTools: readonly ToolDefinition[] = [],
   ): Promise<ActiveSession["session"]> {
     const kitPath = this.loader.getKitPath();
     const cwd = this.options.cwd ?? process.cwd();
@@ -433,15 +503,8 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
       const required = requiredToolName
         ? `${basePrompt}\n\nThe current request requires the ${requiredToolName} tool. Call it before reporting the action as completed${exactInput}. Do not ask for a second confirmation and never claim execution without a successful tool result.`
         : basePrompt;
-      // The Tool the Runtime requires for a factual answer. This sentence guides the model; it
-      // is not the requirement. A Run that answers without the call fails closed below the
-      // model either way, so this only decides whether the Run can still answer honestly.
-      const evidenceTools = [
-        ...new Set((runContext?.requiredEvidence ?? []).map((evidence) => evidence.tool)),
-      ];
-      return evidenceTools.length === 0
-        ? required
-        : `${required}\n\nThe current request asks for facts that only QQ can report. Call ${evidenceTools.join(" and ")} and answer from its result. If the call does not succeed, say the information could not be confirmed. Never answer from what the request itself says, from earlier Conversation, or from what you expect the tool to return.`;
+      // This guides Tool choice. The evidence gate below the model remains authoritative.
+      return `${required}${requiredEvidencePromptClause(runContext?.requiredEvidence ?? [])}`;
     };
     // Standalone Kit MCP factories are configured separately. Glassbox exposes
     // only explicitly registered product-authorized Tools, never ambient servers.
@@ -491,8 +554,19 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
       [];
     const selectedNames = authorizedToolNames ? new Set(authorizedToolNames) : undefined;
     const selectedTools = selectedNames
-      ? customTools.filter((tool) => selectedNames.has(tool.name))
-      : customTools;
+      ? [...customTools, ...sandboxTools].filter((tool) => selectedNames.has(tool.name))
+      : [...customTools, ...sandboxTools];
+    const selectedPiTools = (authorizedToolNames ?? []).filter((name) =>
+      GLASSBOX_HOST_EXCLUDED_PI_TOOLS.includes(name),
+    );
+    for (const name of selectedPiTools)
+      if (!sandboxTools.some((tool) => tool.name === name))
+        throw new Error(`Isolated Pi tool unavailable: ${name}`);
+    if (new Set(selectedTools.map((tool) => tool.name)).size !== selectedTools.length)
+      throw new Error("Duplicate Pi tool registration");
+    for (const tool of sandboxTools)
+      if (!GLASSBOX_HOST_EXCLUDED_PI_TOOLS.includes(tool.name))
+        throw new Error("Sandbox registered an unexpected Pi tool");
     const customToolNames = selectedTools.map((tool) => tool.name);
     const tools = Array.from(new Set(customToolNames));
     const configured = await this.options.resolveModel?.();
@@ -506,7 +580,6 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
       modelRuntime: configured?.modelRuntime ?? this.options.modelRuntime,
       noTools: "all",
       tools,
-      excludeTools: [...GLASSBOX_HOST_EXCLUDED_PI_TOOLS],
       customTools: selectedTools,
       thinkingLevel: profile.thinkingLevel === "none" ? "minimal" : profile.thinkingLevel,
     });
@@ -540,6 +613,7 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
     }
     if (context) {
       this.runContexts.set(binding.runtimeSessionId, context);
+      active.lastRunContext = context;
     }
     const toolCalls: PiRunResult["toolCalls"] = [];
     let text = "";
@@ -644,8 +718,8 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
       };
     } finally {
       unsubscribe();
-      this.runContexts.delete(binding.runtimeSessionId);
       await eventQueue;
+      this.runContexts.delete(binding.runtimeSessionId);
     }
   }
 
@@ -654,15 +728,31 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
     if (active) await active.session.abort();
   }
 
+  async disposeWorkspaceSessions(principalId: string, workspaceId: string): Promise<void> {
+    const matches = [...this.sessions.entries()]
+      .filter(
+        ([, active]) =>
+          active.sandboxPrincipalId === principalId && active.sandboxWorkspaceId === workspaceId,
+      )
+      .map(([id]) => id);
+    for (const id of matches) await this.disposeSession(id);
+  }
+
   async disposeSession(runtimeSessionId: string): Promise<void> {
     const active = this.sessions.get(runtimeSessionId);
     if (active) {
       try {
+        const context = active.lastRunContext;
+        if (context) await this.options.onRunEnd?.(context);
         await active.session.extensionRunner?.emit({ type: "session_shutdown", reason: "quit" });
       } finally {
-        active.session.dispose();
-        this.sessions.delete(runtimeSessionId);
-        this.runContexts.delete(runtimeSessionId);
+        try {
+          await active.sandboxToolSession?.close();
+        } finally {
+          active.session.dispose();
+          this.sessions.delete(runtimeSessionId);
+          this.runContexts.delete(runtimeSessionId);
+        }
       }
     }
   }

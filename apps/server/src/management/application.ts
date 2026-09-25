@@ -1,5 +1,8 @@
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { chmod, mkdtemp, rm } from "node:fs/promises";
 import type { IncomingMessage } from "node:http";
+import { tmpdir } from "node:os";
 import {
   CHANNEL_SAFE_ERRORS,
   type PublicChannelProfile,
@@ -29,6 +32,28 @@ import {
 } from "../runtime/pi/index.js";
 import { configuredPiModel } from "../runtime/pi/configured-model.js";
 import { createOpsTools, OPS_TOOL_NAMES, type WorkerTarget } from "../runtime/pi/ops-tools.js";
+import { createBrowserTools, BROWSER_TOOL } from "../runtime/pi/browser-tools.js";
+import {
+  BROWSER_ARTIFACT_DELIVER_ACTION,
+  createWebTools,
+  WEB_ACTIONS,
+  WEB_FETCH_TOOL,
+  WEB_RESOURCE,
+  WEB_SEARCH_TOOL,
+} from "../runtime/pi/web-tools.js";
+import { WebService } from "../web/web-service.js";
+import { GuardedBrowserFallback } from "../web/browser-fallback.js";
+import { BrowserBridge } from "../web/browser-bridge.js";
+import { BrowserSessionRegistry, type BrowserSessionBinding } from "../web/browser-session.js";
+import type { BrowserExecutorPort } from "../web/browser-executor-port.js";
+import { createKitBrowserExecutor } from "../web/kit-browser-executor.js";
+import { BrowserArtifactStore } from "../web/browser-artifact-store.js";
+import { dohResolveWebHost } from "../web/network-guard.js";
+import {
+  isWebCapabilityEnabled,
+  WEB_CAPABILITIES,
+  type WebCapability,
+} from "./web-capability-policy.js";
 import {
   createOwnerTools,
   type OwnerGroupAdminInput,
@@ -109,7 +134,18 @@ import { ManagementError } from "./access.js";
 import { GROUP_ROLE_AUDIT_RECORD_CAP, projectGroupRoleAudit } from "./group-role-audit.js";
 import { grantOpsPermissions } from "./ops-grants.js";
 import { routeManagementRequest } from "./routes.js";
-import { createQqDeliveryPolicy, hostDeliveryForbiddenValues } from "../delivery/content-policy.js";
+import {
+  createQqDeliveryPolicy,
+  DELIVERY_UUID,
+  hostDeliveryForbiddenValues,
+} from "../delivery/content-policy.js";
+import { scopeKey } from "../identity/scope.js";
+import { WorkspaceRegistry } from "../workspace/registry.js";
+import { WorkspaceWriteOccupancy } from "../workspace/write-occupancy.js";
+import { GLASSBOX_HOST_EXCLUDED_PI_TOOLS } from "../runtime/pi/tool-plane.js";
+import { loadKitSandbox } from "../runtime/pi/sandbox-kit.js";
+import { createIsolatedPiTools } from "../runtime/pi/sandbox-pi-tools.js";
+import type { IsolatedPiSession } from "../runtime/pi/sandbox-pi-tools.js";
 import {
   TOOL_DESCRIPTORS,
   type ToolDescriptor,
@@ -199,7 +235,7 @@ export const DEFAULT_OWNER_GROUP_POLICY: GroupCapabilityPolicy = (() => {
   for (const category of DEFAULT_OWNER_GROUP_CATEGORIES) categories[category] = true;
   const memorySources: Partial<Record<QqSourceClass, boolean>> = {};
   for (const sourceClass of DEFAULT_OWNER_GROUP_SOURCES) memorySources[sourceClass] = true;
-  return { categories, memorySources };
+  return { categories, memorySources, webCapabilities: {} };
 })();
 
 /** The Action that records one Owner's assignment of one managed group. */
@@ -263,8 +299,24 @@ export class ManagementApplication {
   readonly evaluator: ReturnType<typeof createRunEvaluator>;
   /** Durable Channel history, separate from Run inputs. */
   readonly archive: ChannelArchiveStore;
+  workspaces!: WorkspaceRegistry;
+  readonly workspaceWrites: WorkspaceWriteOccupancy;
+  private sandboxRuntime: Awaited<ReturnType<typeof loadKitSandbox>> = null;
+  private kitBrowserExecutor?: BrowserExecutorPort;
+  private browserArtifacts?: BrowserArtifactStore;
+  private readonly sandboxRuns = new Map<
+    string,
+    {
+      session: IsolatedPiSession;
+      principalId: string;
+      workspaceId: string;
+      browserEnabled: boolean;
+    }
+  >();
+  private sandboxFailure: string | null = null;
   executors!: ExecutorConfiguration;
   private readonly connections = new Map<string, OneBotAdapter>();
+  private readonly browserCleanups = new Map<string, Set<() => Promise<void>>>();
   private readonly deliveryPolicy: ReturnType<typeof createQqDeliveryPolicy>;
   private readonly kitLoader: KitLoader;
   private readonly states = new Map<
@@ -285,6 +337,7 @@ export class ManagementApplication {
       dataDirectory: string;
       kitPath?: string;
       models: ModelProfileStore;
+      browserExecutor?: BrowserExecutorPort;
       executors?: ReadonlyMap<string, RunExecutionAdapter>;
       ops?: {
         bridge: HerdrBridge;
@@ -302,6 +355,7 @@ export class ManagementApplication {
     this.groupRuntime = groupRuntime;
     this.archive = new ChannelArchiveStore(store.db);
     this.kitLoader = new KitLoader(options.kitPath);
+    this.workspaceWrites = new WorkspaceWriteOccupancy(options.dataDirectory);
     this.deliveryPolicy = createQqDeliveryPolicy({
       forbiddenValues: () => [
         ...hostDeliveryForbiddenValues({
@@ -337,6 +391,36 @@ export class ManagementApplication {
           if (signal.aborted) return { status: "failed" };
           const connection = this.connections.get(destination.connectionId);
           if (!connection) return { status: "failed" };
+          if (delivery.payloadKind === "browser_artifact") {
+            try {
+              if (!this.browserArtifacts) return { status: "failed" };
+              const binding = await this.browserArtifacts.binding(delivery.payloadText);
+              if (binding.runId !== delivery.runId) return { status: "failed" };
+              const caller = await this.store.lifecycle.traceCaller(
+                binding.runId,
+                binding.principalId,
+              );
+              if (scopeKey(caller.scope) !== scopeKey(destination)) return { status: "failed" };
+              const artifact = await this.readBrowserArtifact({
+                id: delivery.payloadText,
+                binding,
+                caller,
+              });
+              if (artifact.sizeBytes > 2 * 1024 * 1024 || signal.aborted)
+                return { status: "failed" };
+              const sent = await connection.send({
+                deliveryId: delivery.id,
+                target: destination,
+                text: "浏览器截图",
+                image: { pngBase64: artifact.data.toString("base64") },
+              });
+              return sent.status === "confirmed"
+                ? { status: "sent", externalId: sent.messageId }
+                : { status: sent.status };
+            } catch {
+              return { status: "failed" };
+            }
+          }
           const result = await connection.send({
             deliveryId: delivery.id,
             target: destination,
@@ -348,7 +432,31 @@ export class ManagementApplication {
         },
       },
       onEvent: (event) => this.recordEvent(event),
-      prepareDelivery: async (candidate) => this.deliveryPolicy.prepare(candidate),
+      prepareDelivery: async (candidate, { caller, run }) => {
+        const ids = [
+          ...new Set(
+            [...candidate.matchAll(DELIVERY_UUID)].map((match) => match[0]!.toLowerCase()),
+          ),
+        ];
+        const allowed: string[] = [];
+        for (const id of ids.slice(0, 3)) {
+          try {
+            if (!this.browserArtifacts) break;
+            const binding = await this.browserArtifacts.binding(id);
+            if (
+              binding.runId !== run.id ||
+              binding.conversationId !== run.conversationId ||
+              binding.principalId !== caller.principalId
+            )
+              continue;
+            const artifact = await this.readBrowserArtifact({ id, binding, caller });
+            if (artifact.sizeBytes <= 2 * 1024 * 1024) allowed.push(id);
+          } catch {
+            // An unverified UUID stays blocked by the delivery content policy.
+          }
+        }
+        return this.deliveryPolicy.prepare(candidate, allowed);
+      },
     });
   }
 
@@ -357,6 +465,7 @@ export class ManagementApplication {
     databasePath?: string;
     kitPath?: string;
     models: ModelProfileStore;
+    browserExecutor?: BrowserExecutorPort;
     executors?: ReadonlyMap<string, RunExecutionAdapter>;
     ops?: {
       bridge: HerdrBridge;
@@ -372,6 +481,50 @@ export class ManagementApplication {
     });
     const application = new ManagementApplication(options, store, channels, groupRuntime);
     try {
+      application.workspaces = await WorkspaceRegistry.open({
+        dataRoot: options.dataDirectory,
+        forbiddenRoots: [application.kitLoader.getKitPath()],
+      });
+      try {
+        application.sandboxRuntime = await loadKitSandbox(application.kitLoader.getKitPath());
+        if (application.sandboxRuntime) {
+          if (application.sandboxRuntime.cliAvailable) {
+            application.browserArtifacts = await BrowserArtifactStore.open(options.dataDirectory);
+            application.kitBrowserExecutor = createKitBrowserExecutor(async (binding) => {
+              const run = application.sandboxRuns.get(binding.runId);
+              if (
+                !run?.browserEnabled ||
+                run.principalId !== binding.principalId ||
+                run.workspaceId !== binding.workspaceId ||
+                !run.session.executeCli ||
+                !run.session.cancel
+              )
+                return undefined;
+              return {
+                executeCli: (input) => run.session.executeCli!(input),
+                cancel: (id) => run.session.cancel!(id),
+                closeRun: () => run.session.close(),
+              };
+            }, application.browserArtifacts);
+          }
+          for (const { lease, state } of application.workspaceWrites.listUnresolved()) {
+            if (state !== "quarantined" || lease.policyVersion !== "workspace-sandbox-v1") continue;
+            try {
+              await application.workspaceWrites.releaseQuarantined(
+                lease,
+                async ({ sandboxSessionId }) => {
+                  await application.sandboxRuntime!.executor.ensureSessionStopped(sandboxSessionId);
+                  return true;
+                },
+              );
+            } catch (error) {
+              application.sandboxFailure = `An old sandbox stop could not be verified: ${error instanceof Error ? error.message : String(error)}`;
+            }
+          }
+        }
+      } catch (error) {
+        application.sandboxFailure = error instanceof Error ? error.message : String(error);
+      }
       application.executors = await ExecutorConfiguration.open({
         dataDirectory: options.dataDirectory,
         models: options.models,
@@ -406,6 +559,224 @@ export class ManagementApplication {
   private readonly piAdapters = new Map<string, PiRunExecutionAdapter>();
   private opsReconciler?: OpsReconciler;
 
+  sandboxStatus(): {
+    ready: boolean;
+    provider: "docker" | null;
+    availableTools: string[];
+    reason: string | null;
+  } {
+    return {
+      ready: this.sandboxRuntime !== null,
+      provider: this.sandboxRuntime ? "docker" : null,
+      availableTools: [...(this.sandboxRuntime?.availableTools ?? [])],
+      reason: this.sandboxFailure,
+    };
+  }
+
+  /** Reauthorize both the browser read and delivery to the Run's original scope. */
+  async readBrowserArtifact(input: {
+    id: string;
+    binding: BrowserSessionBinding;
+    caller: CallerContext;
+  }): Promise<{ data: Buffer; mimeType: "image/png"; sizeBytes: number }> {
+    if (!this.browserArtifacts) throw new Error("browser_artifact_unavailable");
+    const { binding, caller } = input;
+    if (caller.principalId !== binding.principalId) throw new Error("browser_artifact_denied");
+    const original = await this.store.lifecycle.traceCaller(binding.runId, binding.principalId);
+    if (
+      original.principalId !== caller.principalId ||
+      original.scope.connectionId !== caller.scope.connectionId ||
+      original.scope.botId !== caller.scope.botId ||
+      original.scope.chatType !== caller.scope.chatType ||
+      original.scope.chatId !== caller.scope.chatId ||
+      original.scope.senderId !== caller.scope.senderId
+    )
+      throw new Error("browser_artifact_denied");
+    const protectedContext = {
+      caller,
+      runId: binding.runId,
+      conversationId: binding.conversationId,
+    };
+    if (!(await this.isWebEnabled(protectedContext, "browser.read")))
+      throw new Error("browser_artifact_denied");
+    const decision = await this.store.authorization.check({
+      caller,
+      resourceId: WEB_RESOURCE,
+      action: WEB_ACTIONS["browser.read"],
+      runId: binding.runId,
+      conversationId: binding.conversationId,
+    });
+    if (decision.decision !== "ALLOW") throw new Error("browser_artifact_denied");
+    const delivery = await this.store.authorization.check({
+      caller,
+      resourceId: WEB_RESOURCE,
+      action: BROWSER_ARTIFACT_DELIVER_ACTION,
+      runId: binding.runId,
+      conversationId: binding.conversationId,
+    });
+    if (delivery.decision !== "ALLOW") throw new Error("browser_artifact_denied");
+    return this.browserArtifacts.read(input.id, binding);
+  }
+
+  /** Read an Artifact by opaque ID, deriving its Run and Principal from private service metadata. */
+  async readBrowserArtifactById(
+    id: string,
+  ): Promise<{ id: string; data: string; mimeType: "image/png"; sizeBytes: number }> {
+    try {
+      if (!this.browserArtifacts) throw new Error("browser_artifact_not_found");
+      const binding = await this.browserArtifacts.binding(id);
+      const caller = await this.store.lifecycle.traceCaller(binding.runId, binding.principalId);
+      const artifact = await this.readBrowserArtifact({ id, binding, caller });
+      if (artifact.sizeBytes > 2 * 1024 * 1024) throw new Error("browser_artifact_too_large");
+      return {
+        id,
+        data: artifact.data.toString("base64"),
+        mimeType: artifact.mimeType,
+        sizeBytes: artifact.sizeBytes,
+      };
+    } catch {
+      // Keep missing IDs, stale Runs, and revoked authorization indistinguishable to clients.
+      throw new ManagementError(
+        "NOT_FOUND",
+        "Browser artifact was not found or access is unavailable",
+        404,
+      );
+    }
+  }
+
+  private workspacePrivateScopes(principalId: string): TrustedChannelScope[] {
+    const scopes: TrustedChannelScope[] = [];
+    for (const channel of this.channels.list()) {
+      const config = this.channels.resolve(channel.id).config;
+      const senderId =
+        principalId === OWNER_ID
+          ? config.ownerId
+          : config.coOwnerId && principalId === `owner-${config.coOwnerId}`
+            ? config.coOwnerId
+            : null;
+      if (senderId)
+        scopes.push({
+          connectionId: config.connectionId,
+          botId: config.botId,
+          chatType: "private",
+          chatId: senderId,
+          senderId,
+        });
+    }
+    return scopes;
+  }
+
+  private async requireOwnerPrincipal(principalId: string): Promise<void> {
+    if (!(await this.store.identities.isOwner(principalId)))
+      throw new ManagementError("FORBIDDEN", "Owner principal is required", 403);
+  }
+
+  private async grantWorkspaceScope(
+    principalId: string,
+    scope: TrustedChannelScope,
+    workspaceId: string,
+  ): Promise<void> {
+    const workspace = await this.workspaces.resolveAuthorized(principalId, workspaceId, "read");
+    const resourceId = `workspace:${workspace.id}`;
+    await this.store.authorization.registerResource({
+      id: resourceId,
+      kind: "workspace",
+      visibility: "private",
+      ownerId: workspace.ownerPrincipalId,
+      ifAbsent: true,
+    });
+    for (const action of [
+      "workspace:read",
+      ...(workspace.grants[principalId] === "write" ? ["workspace:write"] : []),
+    ])
+      await this.store.authorization.grant({
+        principalId,
+        resourceId,
+        action,
+        scope,
+        effect: "allow",
+      });
+  }
+
+  async listWorkspaces(principalId: string) {
+    await this.requireOwnerPrincipal(principalId);
+    return this.workspaces.listForPrincipal(principalId);
+  }
+
+  async registerWorkspace(input: unknown) {
+    const value = input as Record<string, unknown>;
+    if (
+      !value ||
+      typeof value.path !== "string" ||
+      typeof value.label !== "string" ||
+      typeof value.ownerPrincipalId !== "string"
+    )
+      throw new ManagementError("INVALID_REQUEST", "Workspace path, label and Owner are required");
+    await this.requireOwnerPrincipal(value.ownerPrincipalId);
+    const workspace = await this.workspaces.registerExistingTrusted({
+      path: value.path,
+      label: value.label,
+      ownerPrincipalId: value.ownerPrincipalId,
+    });
+    for (const scope of this.workspacePrivateScopes(value.ownerPrincipalId))
+      await this.grantWorkspaceScope(value.ownerPrincipalId, scope, workspace.id);
+    return { id: workspace.id, label: workspace.label, kind: workspace.kind };
+  }
+
+  async grantWorkspace(input: unknown) {
+    const value = input as Record<string, unknown>;
+    if (
+      !value ||
+      typeof value.workspaceId !== "string" ||
+      typeof value.principalId !== "string" ||
+      (value.access !== "read" && value.access !== "write")
+    )
+      throw new ManagementError("INVALID_REQUEST", "Workspace ID, Owner and access are required");
+    await this.requireOwnerPrincipal(value.principalId);
+    await this.workspaces.grantTrusted(value.workspaceId, value.principalId, value.access);
+    for (const scope of this.workspacePrivateScopes(value.principalId)) {
+      if (value.access === "read")
+        await this.store.authorization.revokeScopeAction({
+          principalId: value.principalId,
+          resourceId: `workspace:${value.workspaceId}`,
+          action: "workspace:write",
+          scope,
+        });
+      await this.grantWorkspaceScope(value.principalId, scope, value.workspaceId);
+    }
+    if (value.access === "read")
+      for (const adapter of this.piAdapters.values())
+        await adapter.disposeWorkspaceSessions(value.principalId, value.workspaceId);
+    return { granted: true };
+  }
+
+  async revokeWorkspace(input: unknown) {
+    const value = input as Record<string, unknown>;
+    if (!value || typeof value.workspaceId !== "string" || typeof value.principalId !== "string")
+      throw new ManagementError("INVALID_REQUEST", "Workspace ID and Owner are required");
+    await this.requireOwnerPrincipal(value.principalId);
+    await this.workspaces.revokeTrusted(value.workspaceId, value.principalId);
+    // Revoke the product grant in every configured private scope and stop old tool sessions.
+    for (const scope of this.workspacePrivateScopes(value.principalId))
+      await this.store.authorization.revokeScope({
+        principalId: value.principalId,
+        resourceId: `workspace:${value.workspaceId}`,
+        scope,
+      });
+    for (const adapter of this.piAdapters.values())
+      await adapter.disposeWorkspaceSessions(value.principalId, value.workspaceId);
+    return { revoked: true };
+  }
+
+  async selectWorkspace(input: unknown) {
+    const value = input as Record<string, unknown>;
+    if (!value || typeof value.workspaceId !== "string" || typeof value.principalId !== "string")
+      throw new ManagementError("INVALID_REQUEST", "Workspace ID and Owner are required");
+    await this.requireOwnerPrincipal(value.principalId);
+    await this.workspaces.select(value.principalId, value.workspaceId);
+    return { selected: value.workspaceId };
+  }
+
   private getOrCreateDefaultPiAdapter(profileId: string): PiRunExecutionAdapter {
     const existing = this.piAdapters.get(profileId);
     if (existing) return existing;
@@ -414,6 +785,13 @@ export class ManagementApplication {
       runtimeBaseDir: join(this.options.dataDirectory, "pi"),
       resolveModel: () => configuredPiModel(this.options.models, profileId),
       createTools: (getContext) => this.createRuntimeTools(getContext),
+      openSandboxForBrowser: Boolean(this.kitBrowserExecutor && !this.options.browserExecutor),
+      onRunEnd: async (context) => {
+        if (!context.runId) return;
+        const cleanups = this.browserCleanups.get(context.runId);
+        this.browserCleanups.delete(context.runId);
+        if (cleanups) await Promise.allSettled([...cleanups].map((cleanup) => cleanup()));
+      },
       resolveSkillNames: async (context, profile) => {
         if (!context.caller)
           return resolveSkillVisibility({
@@ -449,6 +827,127 @@ export class ManagementApplication {
       },
       resolveToolNames: (context) => this.resolveRunToolNames(context),
       resolveToolCandidates: (context) => this.resolveRunToolCandidates(context),
+      resolveProviderReadiness: async () => ({
+        [BROWSER_TOOL]:
+          this.options.browserExecutor || this.kitBrowserExecutor ? "ready" : "unavailable",
+      }),
+      openSandboxToolSession: async ({ context, selectedNames }) => {
+        const caller = context.caller;
+        if (!caller || !context.runId || !context.conversationId)
+          throw new Error("Sandbox Run binding missing");
+        if (!this.sandboxRuntime) throw new Error("Sandbox backend unavailable");
+        const browserEnabled =
+          selectedNames.includes(BROWSER_TOOL) &&
+          Boolean(this.kitBrowserExecutor) &&
+          !this.options.browserExecutor;
+        const writable = selectedNames.some((name) =>
+          ["write", "edit", "bash", "powershell"].includes(name),
+        );
+        const workspace = context.workspaceId
+          ? await this.workspaces.resolveAuthorized(
+              caller.principalId,
+              context.workspaceId,
+              writable ? "write" : "read",
+            )
+          : null;
+        if (
+          !workspace &&
+          (!browserEnabled ||
+            selectedNames.some((name) => GLASSBOX_HOST_EXCLUDED_PI_TOOLS.includes(name)))
+        )
+          throw new Error("Sandbox workspace binding missing");
+        if (workspace) {
+          const decision = await this.store.authorization.check({
+            caller,
+            resourceId: `workspace:${workspace.id}`,
+            action: writable ? "workspace:write" : "workspace:read",
+            conversationId: context.conversationId,
+            runId: context.runId,
+          });
+          if (decision.decision !== "ALLOW")
+            throw new Error("Sandbox workspace authorization denied");
+        }
+        const scratchPath = workspace ? null : await mkdtemp(join(tmpdir(), "glassbox-web-"));
+        if (scratchPath) {
+          try {
+            await chmod(scratchPath, 0o755);
+          } catch (error) {
+            await rm(scratchPath, { recursive: true, force: true });
+            throw error;
+          }
+        }
+        const workspaceId = workspace?.id ?? `web-${context.runId}`;
+        const sessionId = randomUUID();
+        // Keep a durable stop record for network-enabled browser containers even
+        // when they only mount a read-only scratch directory.
+        const lease =
+          writable || browserEnabled
+            ? this.workspaceWrites.acquire({
+                workspaceId: writable ? workspaceId : `browser-${context.runId}`,
+                principalId: caller.principalId,
+                executionId: context.runId,
+                sandboxSessionId: sessionId,
+                policyVersion: "workspace-sandbox-v1",
+              })
+            : null;
+        let session;
+        try {
+          session = await this.sandboxRuntime.executor.openSession({
+            sessionId,
+            workspacePath: workspace?.canonicalPath ?? scratchPath!,
+            writable,
+            policyVersion: "workspace-sandbox-v1",
+            network: browserEnabled ? "public_web" : "none",
+          });
+        } catch (error) {
+          if (lease) this.workspaceWrites.quarantine(lease);
+          if (scratchPath) await rm(scratchPath, { recursive: true, force: true });
+          throw error;
+        }
+        this.sandboxRuns.set(context.runId, {
+          session,
+          principalId: caller.principalId,
+          workspaceId,
+          browserEnabled,
+        });
+        const tools = workspace
+          ? createIsolatedPiTools({
+              session,
+              workspaceId,
+              registry: this.workspaces,
+              store: this.store,
+              getContext: () => context,
+              onEvidence: async (record) => {
+                const cursor = await this.trace.append(
+                  context.runId!,
+                  {
+                    ...record,
+                    sandboxProvider: "docker",
+                    sandboxImage: this.sandboxRuntime?.image,
+                    policyVersion: "workspace-sandbox-v1",
+                  },
+                  "glassbox-sandbox-tool",
+                );
+                await this.store.evidence.advanceTrace(caller, cursor);
+              },
+            })
+          : [];
+        let closed = false;
+        return {
+          tools,
+          close: async () => {
+            if (closed) return;
+            closed = true;
+            this.sandboxRuns.delete(context.runId!);
+            try {
+              if (lease) await this.workspaceWrites.closeAndRelease(lease, () => session.close());
+              else await session.close();
+            } finally {
+              if (scratchPath) await rm(scratchPath, { recursive: true, force: true });
+            }
+          },
+        };
+      },
       onEvent: async (event) => {
         const runId =
           event.runId ?? (typeof event.data.runId === "string" ? event.data.runId : undefined);
@@ -483,7 +982,117 @@ export class ManagementApplication {
    * test proves the product path rather than the helper.
    */
   private createRuntimeTools(getContext: () => PiRunContext | undefined): ToolDefinition[] {
+    const sessions = new BrowserSessionRegistry();
+    const browserBinding = async (
+      context: ProtectedToolContext,
+    ): Promise<BrowserSessionBinding> => {
+      const scope = context.caller.scope;
+      const policyVersion =
+        scope.chatType === "group"
+          ? `group-${(await this.store.capabilities.read(scope.connectionId, scope.chatId))?.version ?? 0}`
+          : "owner-private-v1";
+      return {
+        principalId: context.caller.principalId,
+        runId: context.runId,
+        conversationId: context.conversationId,
+        workspaceId: getContext()?.workspaceId ?? `web-${context.runId}`,
+        policyVersion,
+      };
+    };
+    const registerBrowserCleanup = (runId: string, cleanup: () => Promise<void>) => {
+      let cleanups = this.browserCleanups.get(runId);
+      if (!cleanups) {
+        cleanups = new Set();
+        this.browserCleanups.set(runId, cleanups);
+      }
+      cleanups.add(cleanup);
+    };
+    const authorizeBrowser = async (
+      binding: BrowserSessionBinding,
+      capability: "browser.read" | "browser.interact",
+    ) => {
+      const context = getContext();
+      if (
+        !context?.caller ||
+        context.runId !== binding.runId ||
+        context.conversationId !== binding.conversationId ||
+        context.caller.principalId !== binding.principalId
+      )
+        return false;
+      const protectedContext = {
+        caller: context.caller,
+        runId: binding.runId,
+        conversationId: binding.conversationId,
+      };
+      const current = await browserBinding(protectedContext);
+      if (
+        current.workspaceId !== binding.workspaceId ||
+        current.policyVersion !== binding.policyVersion
+      )
+        return false;
+      if (!(await this.isWebEnabled(protectedContext, capability))) return false;
+      const decision = await this.store.authorization.check({
+        caller: context.caller,
+        resourceId: WEB_RESOURCE,
+        action: WEB_ACTIONS[capability],
+        runId: binding.runId,
+        conversationId: binding.conversationId,
+      });
+      return decision.decision === "ALLOW";
+    };
+    const browserExecutor = this.options.browserExecutor ?? this.kitBrowserExecutor;
+    const browserBridge = browserExecutor
+      ? new BrowserBridge({
+          executor: browserExecutor,
+          sessions,
+          resolveHost: dohResolveWebHost,
+          authorize: (binding, capability) => authorizeBrowser(binding, capability),
+          ...(!this.options.browserExecutor && this.kitBrowserExecutor
+            ? { maxArtifactBytes: 2 * 1024 * 1024 }
+            : {}),
+        })
+      : undefined;
+    const browserFallback = new GuardedBrowserFallback({
+      bridge: browserBridge,
+      resolveHost: dohResolveWebHost,
+      binding: async () => {
+        const context = getContext();
+        return context?.caller && context.runId && context.conversationId
+          ? browserBinding({
+              caller: context.caller,
+              runId: context.runId,
+              conversationId: context.conversationId,
+            })
+          : undefined;
+      },
+      authorize: authorizeBrowser,
+      onActivated: (binding, cleanup) => registerBrowserCleanup(binding.runId, cleanup),
+    });
     return [
+      ...createWebTools({
+        store: this.store,
+        getContext,
+        service: new WebService({ browserFallback }),
+        isEnabled: (context, capability) => this.isWebEnabled(context, capability),
+        recordEvidence: async (evidence, context) => {
+          const cursor = await this.trace.append(context.runId, evidence, "glassbox-web");
+          await this.store.evidence.advanceTrace(context.caller, cursor);
+        },
+      }),
+      ...createBrowserTools({
+        store: this.store,
+        getContext,
+        binding: browserBinding,
+        bridge: browserBridge,
+        sessions,
+        isEnabled: (context, capability) => this.isWebEnabled(context, capability),
+        onActivated: (context, cleanup) => registerBrowserCleanup(context.runId, cleanup),
+        onClosed: () => undefined,
+        recordEvidence: async (evidence, context) => {
+          const cursor = await this.trace.append(context.runId, evidence, "glassbox-browser");
+          await this.store.evidence.advanceTrace(context.caller, cursor);
+        },
+      }),
       ...(this.options.ops
         ? createOpsTools({
             store: this.store,
@@ -664,6 +1273,18 @@ export class ManagementApplication {
     return this.isCategoryEnabled(connectionId, groupId, "group.history");
   }
 
+  private async isWebEnabled(
+    context: ProtectedToolContext,
+    capability: WebCapability,
+  ): Promise<boolean> {
+    const scope = context.caller.scope;
+    if (scope.chatType === "private")
+      return this.store.identities.isOwner(context.caller.principalId);
+    if (scope.chatType !== "group") return false;
+    const stored = await this.store.capabilities.read(scope.connectionId, scope.chatId);
+    return isWebCapabilityEnabled(stored?.policy.webCapabilities, capability);
+  }
+
   /**
    * Every registered Tool, classified for this Run's scope, policy and grants.
    *
@@ -737,10 +1358,38 @@ export class ManagementApplication {
         nativeGroupRole: scope.nativeGroupRole?.role,
       }),
     );
+    for (const [name, capability] of [
+      [WEB_SEARCH_TOOL, "web.search"],
+      [WEB_FETCH_TOOL, "web.fetch"],
+    ] as const) {
+      classified.add(name);
+      if (
+        !(await this.isWebEnabled(
+          { caller: context.caller, conversationId: context.conversationId, runId: context.runId },
+          capability,
+        ))
+      )
+        scopeGates.set(name, "policy_disabled");
+    }
+    classified.add(BROWSER_TOOL);
+    const webContext = {
+      caller: context.caller,
+      conversationId: context.conversationId,
+      runId: context.runId,
+    };
+    if (
+      !(await this.isWebEnabled(webContext, "browser.read")) &&
+      !(await this.isWebEnabled(webContext, "browser.interact"))
+    )
+      scopeGates.set(BROWSER_TOOL, "policy_disabled");
 
     // The Agent Ops and Owner-control surface is Owner-private. A group Run reaches neither,
     // however the Owner's own grants look, so this is a scope boundary rather than a policy.
     const ownerPrivate = isOwner && scope.chatType === "private";
+    const selectedWorkspace = ownerPrivate
+      ? await this.workspaces.resolveSelected(context.caller.principalId).catch(() => null)
+      : null;
+    if (selectedWorkspace) context.workspaceId = selectedWorkspace.id;
     for (const name of OPS_TOOL_NAMES) {
       classified.add(name);
       if (!(ownerPrivate && this.options.ops)) scopeGates.set(name, "scope_not_permitted");
@@ -755,11 +1404,38 @@ export class ManagementApplication {
     const candidates: ToolSurfaceCandidate[] = [];
     for (const descriptor of registered) {
       if (descriptor.origin === "pi_builtin") {
-        // A Pi built-in is classified by its origin, and excluded on the same evidence the
-        // real session uses: the host never offers it to a Glassbox Run.
         classified.add(descriptor.name);
-        candidates.push({ name: descriptor.name, exclusion: "disabled_by_host" });
-        continue;
+        if (!ownerPrivate) scopeGates.set(descriptor.name, "scope_not_permitted");
+        else if (!this.sandboxRuntime?.availableTools.has(descriptor.name))
+          scopeGates.set(descriptor.name, "backend_unavailable");
+        else if (!selectedWorkspace) scopeGates.set(descriptor.name, "policy_disabled");
+        else {
+          const access = ["write", "edit", "bash", "powershell"].includes(descriptor.name)
+            ? "write"
+            : "read";
+          if (access === "write" && this.workspaceWrites.status(selectedWorkspace.id) !== "free") {
+            scopeGates.set(descriptor.name, "policy_disabled");
+          } else {
+            const allowed = await this.workspaces
+              .resolveAuthorized(context.caller.principalId, selectedWorkspace.id, access)
+              .then(
+                () => true,
+                () => false,
+              );
+            if (!allowed) scopeGates.set(descriptor.name, "policy_disabled");
+            else {
+              const decision = await this.store.authorization.check({
+                caller: context.caller,
+                resourceId: `workspace:${selectedWorkspace.id}`,
+                action: access === "write" ? "workspace:write" : "workspace:read",
+                conversationId: context.conversationId,
+                runId: context.runId,
+              });
+              if (decision.decision !== "ALLOW")
+                scopeGates.set(descriptor.name, "discovery_denied");
+            }
+          }
+        }
       }
       // A registered Tool no rule classified is a wiring bug. Withholding it keeps it out of
       // the model's surface and makes the gap visible instead of silently offering it.
@@ -913,6 +1589,7 @@ export class ManagementApplication {
     });
     const acceptConnection = () => {
       connectionAccepted = true;
+      if (adapter.state.status === "ready") this.states.set(id, { connectionState: "connected" });
       if (!connectionReleased) {
         connectionReleased = true;
         releaseConnection();
@@ -930,7 +1607,9 @@ export class ManagementApplication {
       config: configured.config,
       token: configured.token,
       onState: (state) => {
-        this.updateChannelState(id, state);
+        if (state.status === "ready" && !connectionAccepted)
+          this.states.set(id, { connectionState: "connecting" });
+        else this.updateChannelState(id, state);
         if (!remember && state.status === "ready") {
           void provisionConfiguredAccess()
             .then(acceptConnection)
@@ -1161,6 +1840,46 @@ export class ManagementApplication {
       scope,
       effect: "allow",
     });
+    if (isOwner || scope.chatType === "group") {
+      await this.store.authorization.registerResource({
+        id: WEB_RESOURCE,
+        kind: "web-public",
+        visibility: "public",
+        ifAbsent: true,
+      });
+      for (const capability of WEB_CAPABILITIES) {
+        await this.store.authorization.grant({
+          principalId,
+          resourceId: WEB_RESOURCE,
+          action: WEB_ACTIONS[capability],
+          scope,
+          effect: "allow",
+        });
+      }
+      await this.store.authorization.grant({
+        principalId,
+        resourceId: WEB_RESOURCE,
+        action: BROWSER_ARTIFACT_DELIVER_ACTION,
+        scope,
+        effect: "allow",
+      });
+      for (const name of [WEB_SEARCH_TOOL, WEB_FETCH_TOOL, BROWSER_TOOL]) {
+        const resourceId = toolResourceId(name);
+        await this.store.authorization.registerResource({
+          id: resourceId,
+          kind: "tool-definition",
+          visibility: "public",
+          ifAbsent: true,
+        });
+        await this.store.authorization.grant({
+          principalId,
+          resourceId,
+          action: TOOL_DISCOVERY_ACTION,
+          scope,
+          effect: "allow",
+        });
+      }
+    }
     // A group is a protected Resource. Bot membership never creates this row: it exists only
     // for a group Glassbox has configured, and reading it still needs an explicit grant.
     if (scope.chatType === "group") {
@@ -1222,6 +1941,45 @@ export class ManagementApplication {
       });
     }
     if (isOwner && scope.chatType === "private") {
+      const defaultWorkspace = await this.workspaces.ensureDefault(principalId);
+      const workspaceResource = `workspace:${defaultWorkspace.id}`;
+      await this.store.authorization.registerResource({
+        id: workspaceResource,
+        kind: "workspace",
+        visibility: "private",
+        ownerId: principalId,
+        ifAbsent: true,
+      });
+      for (const action of ["workspace:read", "workspace:write"]) {
+        await this.store.authorization.grant({
+          principalId,
+          resourceId: workspaceResource,
+          action,
+          scope,
+          effect: "allow",
+        });
+      }
+      for (const workspace of await this.workspaces.listForPrincipal(principalId)) {
+        if (workspace.id !== defaultWorkspace.id)
+          await this.grantWorkspaceScope(principalId, scope, workspace.id);
+      }
+      for (const name of GLASSBOX_HOST_EXCLUDED_PI_TOOLS) {
+        const resourceId = toolResourceId(name);
+        await this.store.authorization.registerResource({
+          id: resourceId,
+          kind: "tool-definition",
+          visibility: "private",
+          ownerId: OWNER_ID,
+          ifAbsent: true,
+        });
+        await this.store.authorization.grant({
+          principalId,
+          resourceId,
+          action: TOOL_DISCOVERY_ACTION,
+          scope,
+          effect: "allow",
+        });
+      }
       await this.store.authorization.registerResource({
         id: OWNER_CONTROL_RESOURCE,
         kind: "owner-control",
@@ -1584,6 +2342,7 @@ export class ManagementApplication {
       agentResourceId(AGENT_ID),
       SKILL_CATALOG_RESOURCE,
       toolResourceId(SKILL_READ_TOOL),
+      WEB_RESOURCE,
       // The group Run's Tool discovery is granted as a superset for the same reason the
       // Owner-private one is, so it is revoked here for the same reason: leaving it behind
       // would let a re-configured group rediscover a surface it no longer has authority for.
@@ -1635,6 +2394,9 @@ export class ManagementApplication {
           enabledCategories: [...QQ_CAPABILITY_CATEGORIES],
           nativeGroupRole: "qq_group_owner",
         }),
+        WEB_SEARCH_TOOL,
+        WEB_FETCH_TOOL,
+        BROWSER_TOOL,
       ]),
     ];
   }
@@ -1772,7 +2534,16 @@ export class ManagementApplication {
     if (!isOwner || caller.scope.chatType !== "private") throw new Error("owner_private_required");
     if (input.action === "set_access") return this.setGroupAccess(context, input);
     if (input.action === "set_skill") return this.setGroupSkill(context, input);
-    if (input.action === "set_capability") return this.setGroupCategory(context, input);
+    if (input.action === "set_capability")
+      return WEB_CAPABILITIES.includes(input.category as WebCapability)
+        ? this.setGroupWebCapability(
+            context,
+            input as { groupId: string; category: WebCapability; enabled: boolean },
+          )
+        : this.setGroupCategory(
+            context,
+            input as { groupId: string; category: QqCapabilityCategory; enabled: boolean },
+          );
     if (input.action === "set_memory_source") return this.setGroupMemorySource(context, input);
     if (input.action === "set_history") return this.setGroupHistory(context, input);
     await this.requireManagedGroup(context, input.groupId);
@@ -1793,6 +2564,7 @@ export class ManagementApplication {
       version: runtime.version,
       managedGroups,
       categories: stored?.policy.categories ?? {},
+      webCapabilities: stored?.policy.webCapabilities ?? {},
       memorySources: stored?.policy.memorySources ?? {},
       capabilityVersion: stored?.version ?? 0,
     };
@@ -1933,6 +2705,31 @@ export class ManagementApplication {
         connectionId: context.caller.scope.connectionId,
         groupId: input.groupId,
         category: input.category,
+        enabled: input.enabled,
+        policyVersion: version,
+      });
+      return { groupId: input.groupId, category: input.category, enabled: input.enabled, version };
+    });
+  }
+
+  private async setGroupWebCapability(
+    context: ProtectedToolContext,
+    input: { groupId: string; category: WebCapability; enabled: boolean },
+  ): Promise<unknown> {
+    return this.serialize(async () => {
+      await this.requireManagedGroup(context, input.groupId);
+      const { version } = await this.store.capabilities.setWebCapability({
+        connectionId: context.caller.scope.connectionId,
+        groupId: input.groupId,
+        principalId: context.caller.principalId,
+        capability: input.category,
+        enabled: input.enabled,
+      });
+      await this.recordOwnerControl(context, {
+        type: "group_web_capability_changed",
+        connectionId: context.caller.scope.connectionId,
+        groupId: input.groupId,
+        capability: input.category,
         enabled: input.enabled,
         policyVersion: version,
       });
@@ -2146,6 +2943,7 @@ export class ManagementApplication {
           historyRead: fact.historyRead,
         },
         categories: fact.policy.categories,
+        webCapabilities: fact.policy.webCapabilities ?? {},
         memorySources: fact.policy.memorySources,
         skills: fact.skills,
         version: fact.version,
@@ -2488,6 +3286,12 @@ export class ManagementApplication {
   async route(request: IncomingMessage): Promise<{ status: number; body: unknown } | undefined> {
     return routeManagementRequest(request, {
       store: this.store,
+      sandboxStatus: () => this.sandboxStatus(),
+      listWorkspaces: (principalId) => this.listWorkspaces(principalId),
+      registerWorkspace: (input) => this.registerWorkspace(input),
+      grantWorkspace: (input) => this.grantWorkspace(input),
+      revokeWorkspace: (input) => this.revokeWorkspace(input),
+      selectWorkspace: (input) => this.selectWorkspace(input),
       grantOpsPermissions: (input) =>
         grantOpsPermissions(this.store, this.options.ops?.workerPolicy, input),
       executors: this.executors,
@@ -2498,6 +3302,7 @@ export class ManagementApplication {
       probeCapabilities: (channelId, groupId) => this.probeCapabilities(channelId, groupId),
       groupRoleAudit: (channelId, groupId) => this.groupRoleAudit(channelId, groupId),
       runCaller: (runId) => this.runCaller(runId),
+      readBrowserArtifact: (id) => this.readBrowserArtifactById(id),
       runs: this.runs,
       trace: this.trace,
       evaluator: this.evaluator,
@@ -2513,6 +3318,13 @@ export class ManagementApplication {
     await this.runs.stop({ abortRunning: true, wait: true });
     for (const adapter of this.piAdapters.values()) await adapter.cleanup();
     this.piAdapters.clear();
+    await Promise.allSettled(
+      [...this.browserCleanups.values()].flatMap((cleanups) =>
+        [...cleanups].map((cleanup) => cleanup()),
+      ),
+    );
+    this.browserCleanups.clear();
+    await this.sandboxRuntime?.executor.close();
     await this.opsReconciler?.stop();
     await this.options.ops?.bridge.disconnect();
     await this.store.close();

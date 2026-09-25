@@ -115,7 +115,7 @@ describe("P4A durable learning truth", () => {
     const { store } = await fixture(databasePath);
     expect(await store.learning.listCandidates(context)).toEqual([]);
     const db = createClient({ url: localDatabaseUrl(databasePath) });
-    expect((await db.execute("PRAGMA user_version")).rows[0]?.user_version).toBe(9);
+    expect((await db.execute("PRAGMA user_version")).rows[0]?.user_version).toBe(10);
     expect((await db.execute("PRAGMA table_info(channel_messages)")).rows.length).toBeGreaterThan(
       0,
     );

@@ -17,6 +17,8 @@ const logPath = join(dataDirectory, "service.log");
 const serviceEnvironmentKeys = new Set([
   "PORT",
   "LORA_PI_KIT_PATH",
+  "GLASSBOX_SANDBOX_IMAGE",
+  "GLASSBOX_SANDBOX_DNS_MODE",
   "GLASSBOX_RUNTIME_DIR",
   "GLASSBOX_REPO_ROOT",
   "GLASSBOX_WORKSPACE_CODEX",

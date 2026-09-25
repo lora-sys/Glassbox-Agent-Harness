@@ -60,4 +60,31 @@ describe("management routes", () => {
     const result = await routeManagementRequest(request("GET", "/manage/unknown"), {} as never);
     expect(result).toBeUndefined();
   });
+
+  it("reads an opaque browser Artifact ID without accepting scope from the request", async () => {
+    const requested: string[] = [];
+    const dependencies = {
+      readBrowserArtifact: async (id: string) => {
+        requested.push(id);
+        return { id, data: "iVBORw0KGgo=", mimeType: "image/png", sizeBytes: 8 };
+      },
+    } as unknown as ManagementRouteDependencies;
+    const id = "123e4567-e89b-42d3-a456-426614174000";
+
+    const result = await routeManagementRequest(
+      request("GET", `/manage/browser-artifacts/${id}?principalId=attacker&runId=other`),
+      dependencies,
+    );
+
+    expect(result).toEqual({
+      status: 200,
+      body: {
+        artifact: { id, data: "iVBORw0KGgo=", mimeType: "image/png", sizeBytes: 8 },
+      },
+    });
+    expect(requested).toEqual([id]);
+    await expect(
+      routeManagementRequest(request("GET", "/manage/browser-artifacts/not-an-id"), dependencies),
+    ).resolves.toBeUndefined();
+  });
 });
