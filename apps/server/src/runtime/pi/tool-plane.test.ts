@@ -99,14 +99,15 @@ describe("P5 tool plane origins", () => {
     });
   });
 
-  it("describes Pi built-ins as host-only so no policy can mistake them for product Tools", () => {
+  it("describes isolated Pi adapters as Owner-private workspace Tools while excluding host originals", () => {
     for (const name of GLASSBOX_HOST_EXCLUDED_PI_TOOLS) {
       const descriptor = toolDescriptor(name);
       expect(descriptor, name).toBeDefined();
       expect(descriptor?.origin).toBe("pi_builtin");
-      // A built-in is not an authorized product capability: it has no Glassbox Action.
-      expect(descriptor?.authorization).toBeNull();
-      expect(descriptor?.discovery).toBe("host_only");
+      expect(descriptor?.provider).toBe("lora-pi-kit-docker");
+      expect(descriptor?.authorization?.resource).toBe("workspace");
+      expect(descriptor?.discovery).toBe("owner_private");
+      expect(GLASSBOX_HOST_EXCLUDED_PI_TOOLS).toContain(name);
     }
   });
 
@@ -544,6 +545,23 @@ describe("P5 profile selection ledger", () => {
 });
 
 describe("P5 effective Tool surface snapshot", () => {
+  it("reports a selected isolated Pi tool as available without reclassifying its host original", () => {
+    const surface = describeToolSurface({
+      profileName: "main-agent",
+      profileActiveTools: ["read"],
+      candidates: [{ name: "read", exclusion: null }],
+      providerReadiness: { read: "ready" },
+    });
+    expect(surface.selected).toEqual([
+      expect.objectContaining({
+        name: "read",
+        provider: "lora-pi-kit-docker",
+        providerReadiness: "ready",
+      }),
+    ]);
+    expect(surface.disabledByHost).toEqual([]);
+    expect(GLASSBOX_HOST_EXCLUDED_PI_TOOLS).toContain("read");
+  });
   it("keeps selected and excluded Tools in one inspectable record with a reason code", () => {
     const surface = describeToolSurface({
       profileName: "qq-group",

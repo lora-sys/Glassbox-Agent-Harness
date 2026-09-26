@@ -27,6 +27,11 @@ it("uses Pi provider models and declared capacities without exposing credentials
                 input: ["text"],
               },
               { id: "missing-capacity", name: "Missing Capacity" },
+              {
+                id: "missing-output-capacity",
+                name: "Missing Output Capacity",
+                contextWindow: 32_768,
+              },
             ],
           },
         },
@@ -37,6 +42,7 @@ it("uses Pi provider models and declared capacities without exposing credentials
     const profiles = catalog.list();
     const selected = profiles.find((profile) => profile.model === "fixture-model");
     const incomplete = profiles.find((profile) => profile.model === "missing-capacity");
+    const missingOutput = profiles.find((profile) => profile.model === "missing-output-capacity");
 
     expect(selected).toMatchObject({
       label: "Fixture Provider / Fixture Model",
@@ -47,9 +53,14 @@ it("uses Pi provider models and declared capacities without exposing credentials
       routingAvailable: true,
     });
     expect(JSON.stringify(profiles)).not.toContain(secret);
-    if (!selected || !incomplete) throw new Error("Pi fixture models were not loaded");
-    expect(incomplete).toMatchObject({ routingAvailable: false });
+    if (!selected || !incomplete || !missingOutput)
+      throw new Error("Pi fixture models were not loaded");
+    expect(incomplete).not.toHaveProperty("routingAvailable");
     expect(() => catalog.resolve(incomplete.id)).toThrow("capacity is unknown");
+    expect(missingOutput).toMatchObject({ contextWindowTokens: 32_768 });
+    expect(missingOutput).not.toHaveProperty("maxOutputTokens");
+    expect(missingOutput).not.toHaveProperty("routingAvailable");
+    expect(() => catalog.resolve(missingOutput.id)).toThrow("capacity is unknown");
     expect(catalog.resolve(selected.id).model).toMatchObject({
       provider: "fixture",
       id: "fixture-model",

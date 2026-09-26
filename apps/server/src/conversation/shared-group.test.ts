@@ -1004,7 +1004,7 @@ describe("shared group conversation and durable actor routing", () => {
     // 10. Verify all current migrations completed. V7 adds the P4B channel history
     // archive (channel_messages + FTS index) and group capability policies.
     const ver = await rawCheck.execute("PRAGMA user_version");
-    expect(Number(ver.rows[0]?.user_version)).toBe(9);
+    expect(Number(ver.rows[0]?.user_version)).toBe(10);
 
     rawCheck.close();
   });

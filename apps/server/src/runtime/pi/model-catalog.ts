@@ -65,7 +65,11 @@ export class PiModelCatalog {
           supportsVision: model.input.includes("image"),
           routingEnabled: false,
           allowRouting: false,
-          routingAvailable: capacity.context !== undefined && capacity.output !== undefined,
+          // Missing capacity is unknown, not an operator-disabled route. Downstream capacity
+          // checks still fail closed because the limits remain absent.
+          ...(capacity.context !== undefined && capacity.output !== undefined
+            ? { routingAvailable: true }
+            : {}),
         };
       });
   }
@@ -90,11 +94,9 @@ export class PiModelCatalog {
   private capacity(model: Model<any>): { context?: number; output?: number } {
     if (this.customProviderIds.has(model.provider)) {
       const declared = this.customCapacity.get(modelKey(model.provider, model.id));
-      if (!declared || !validCapacity(declared.context, declared.output)) return {};
-      return { context: declared.context, output: declared.output };
+      return declared ? knownCapacity(declared.context, declared.output) : {};
     }
-    if (!validCapacity(model.contextWindow, model.maxTokens)) return {};
-    return { context: model.contextWindow, output: model.maxTokens };
+    return knownCapacity(model.contextWindow, model.maxTokens);
   }
 }
 
@@ -106,14 +108,21 @@ function modelKey(providerId: string, modelId: string): string {
   return `${providerId}\u0000${modelId}`;
 }
 
-function validCapacity(context: unknown, output: unknown): context is number {
-  return (
-    Number.isSafeInteger(context) &&
-    Number.isSafeInteger(output) &&
-    (context as number) > 0 &&
-    (output as number) > 0 &&
-    (output as number) < (context as number)
-  );
+function knownCapacity(context: unknown, output: unknown): { context?: number; output?: number } {
+  const knownContext =
+    Number.isSafeInteger(context) && (context as number) > 0 ? (context as number) : undefined;
+  const declaredOutput =
+    Number.isSafeInteger(output) && (output as number) > 0 ? (output as number) : undefined;
+  const knownOutput =
+    knownContext !== undefined && declaredOutput !== undefined && declaredOutput < knownContext
+      ? declaredOutput
+      : knownContext === undefined
+        ? declaredOutput
+        : undefined;
+  return {
+    ...(knownContext === undefined ? {} : { context: knownContext }),
+    ...(knownOutput === undefined ? {} : { output: knownOutput }),
+  };
 }
 
 async function readPiModelConfig(path: string): Promise<{

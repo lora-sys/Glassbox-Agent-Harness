@@ -7,6 +7,7 @@ import {
   QQ_CAPABILITY_CATEGORIES,
   type QqCapabilityCategory,
 } from "../../channels/onebot/capabilities.js";
+import { WEB_CAPABILITIES, type WebCapability } from "../../management/web-capability-policy.js";
 import {
   consumeMutationIntent,
   createProtectedTool,
@@ -17,11 +18,18 @@ import type { PiRunContext } from "./types.js";
 export const OWNER_GROUP_ADMIN_TOOL = "owner_group_admin";
 export const OWNER_CONTROL_RESOURCE = "owner-control";
 
+export type OwnerCapabilityCategory = QqCapabilityCategory | WebCapability;
+
 export type OwnerGroupAdminInput =
   | { action: "get"; groupId: string }
   | { action: "set_access"; groupId: string; enabled: boolean }
   | { action: "set_skill"; groupId: string; skillName: string; enabled: boolean }
-  | { action: "set_capability"; groupId: string; category: QqCapabilityCategory; enabled: boolean }
+  | {
+      action: "set_capability";
+      groupId: string;
+      category: OwnerCapabilityCategory;
+      enabled: boolean;
+    }
   | { action: "set_history"; groupId: string; enabled: boolean }
   | { action: "set_memory_source"; groupId: string; sourceClass: QqSourceClass; enabled: boolean };
 
@@ -40,7 +48,7 @@ type OwnerGroupAdminToolInput = Record<string, unknown> & {
   sourceClass?: string;
 };
 
-const CATEGORIES = new Set<string>(QQ_CAPABILITY_CATEGORIES);
+const CATEGORIES = new Set<string>([...QQ_CAPABILITY_CATEGORIES, ...WEB_CAPABILITIES]);
 const SOURCE_CLASSES = new Set<string>(QQ_SOURCE_CLASSES);
 
 /**
@@ -74,7 +82,7 @@ function validatedInput(input: OwnerGroupAdminToolInput): OwnerGroupAdminInput {
     return {
       action: "set_capability",
       groupId: input.groupId,
-      category: input.category as QqCapabilityCategory,
+      category: input.category as OwnerCapabilityCategory,
       enabled: input.enabled,
     };
   if (input.action === "set_history" && typeof input.enabled === "boolean")
@@ -120,7 +128,7 @@ export function createOwnerTools(options: {
       name: OWNER_GROUP_ADMIN_TOOL,
       label: "QQ 群高级权限",
       description:
-        "Read or change advanced QQ group permissions. This single Owner-only tool manages the strict group allowlist, the per-group Skill whitelist, the per-group capability categories, and which memory source classes may generate candidates. Use set_history to enable or disable searching one group's history. When the Owner explicitly requests a change, call it immediately without asking for a second confirmation.",
+        "Read or change advanced QQ group permissions. This single Owner-only tool manages the strict group allowlist, the per-group Skill whitelist, QQ capability categories, web and browser capabilities, and which memory source classes may generate candidates. Use set_history to enable or disable searching one group's history. When the Owner explicitly requests a change, call it immediately without asking for a second confirmation.",
       // Keep the provider-facing schema as one object. Some OpenAI-compatible
       // providers expose top-level union schemas but fail to generate a valid
       // branch. Glassbox validates the action-specific fields before mutation.
@@ -141,9 +149,9 @@ export function createOwnerTools(options: {
           enabled: Type.Optional(Type.Boolean()),
           skillName: Type.Optional(Type.String({ pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$" })),
           category: Type.Optional(
-            Type.Unsafe<QqCapabilityCategory>({
+            Type.Unsafe<OwnerCapabilityCategory>({
               type: "string",
-              enum: [...QQ_CAPABILITY_CATEGORIES],
+              enum: [...QQ_CAPABILITY_CATEGORIES, ...WEB_CAPABILITIES],
             }),
           ),
           sourceClass: Type.Optional(

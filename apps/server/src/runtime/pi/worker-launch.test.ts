@@ -14,8 +14,14 @@ it("launches Pi with explicit Kit resources and disables ambient resource discov
     const profile = JSON.parse(await readFile(join(directory, "profiles/main-agent.json"), "utf8"));
     await writeFile(
       join(directory, "profiles/herdr-worker.json"),
-      JSON.stringify({ ...profile, name: "herdr-worker" }),
+      JSON.stringify({
+        ...profile,
+        name: "herdr-worker",
+        enabledExtensions: [...profile.enabledExtensions, "core/sandbox-tools"],
+      }),
     );
+    await mkdir(join(directory, "extensions/core"), { recursive: true });
+    await writeFile(join(directory, "extensions/core/sandbox-tools.ts"), "// Kit fixture");
     const input = {
       kitPath: directory,
       agentDir: join(directory, "isolated-agent"),
@@ -49,6 +55,7 @@ it("launches Pi with explicit Kit resources and disables ambient resource discov
     expect(launch.args).toContain(
       fileURLToPath(new URL("./worker-tools-extension.ts", import.meta.url)),
     );
+    expect(launch.args).not.toContain(join(directory, "extensions/core/sandbox-tools.ts"));
     await expect(piWorkerLaunch({ ...input, agentDir: "relative" })).rejects.toThrow(
       "Invalid Pi worker configuration",
     );

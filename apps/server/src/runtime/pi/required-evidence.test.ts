@@ -21,6 +21,65 @@ function ownerPrivate(text: string): RequiredEvidenceInput {
 const domains = (input: RequiredEvidenceInput) =>
   requiredEvidenceFor(input).map((evidence) => evidence.domain);
 
+describe("required web evidence", () => {
+  it("requires browser navigation, title and a screenshot Artifact for an explicit browser request", () => {
+    expect(
+      requiredEvidenceFor(
+        ownerPrivate(
+          "浏览器验收：用 browser 打开 https://nodejs.org/en/download，读取页面标题，再截一张图，告诉我截图的 Artifact 编号。",
+        ),
+      ),
+    ).toEqual([
+      {
+        domain: "browser_open",
+        tool: "browser",
+        input: { action: "open", url: "https://nodejs.org/en/download" },
+      },
+      {
+        domain: "browser_title",
+        tool: "browser",
+        input: { action: "get", kind: "title" },
+      },
+      {
+        domain: "browser_screenshot",
+        tool: "browser",
+        input: { action: "screenshot" },
+      },
+    ]);
+  });
+
+  it("requires a successful search for an explicit web research request", () => {
+    expect(requiredEvidenceFor(ownerPrivate("请搜索网上最新的 Playwright CLI 资料"))).toEqual([
+      { domain: "web_search", tool: "web_search", input: {} },
+    ]);
+  });
+
+  it("requires reading a page when a search request asks to verify its official source", () => {
+    expect(
+      requiredEvidenceFor(
+        inGroup("搜索 Vercel 官方博客最近的文章，核对官网来源和发布日期，附链接"),
+      ),
+    ).toEqual([
+      { domain: "web_search", tool: "web_search", input: {} },
+      { domain: "web_fetch", tool: "web_fetch", input: {} },
+    ]);
+  });
+
+  it("binds an explicitly requested page read to its URL", () => {
+    expect(requiredEvidenceFor(inGroup("请读取 https://example.com/docs 并总结"))).toEqual([
+      { domain: "web_fetch", tool: "web_fetch", input: { url: "https://example.com/docs" } },
+    ]);
+  });
+
+  it("requires a search for a current public price", () => {
+    expect(domains(ownerPrivate("查一下当前官网价格"))).toEqual(["web_search"]);
+  });
+
+  it("does not mistake group history search for web search", () => {
+    expect(domains(inGroup("搜索本群历史，找最新的消息"))).not.toContain("web_search");
+  });
+});
+
 describe("required evidence for a live QQ fact", () => {
   it("requires the member list for a question about members", () => {
     expect(requiredEvidenceFor(inGroup("这个群有哪些成员？"))).toEqual([
@@ -364,6 +423,49 @@ describe("resolving required evidence against a Run's calls", () => {
     ]);
     expect(unobservedEvidence(resolutions)).toEqual([]);
     expect(resolutions[0]?.toolCallId).toBe("call-2");
+  });
+
+  it("requires a successful screenshot call to return a durable Artifact id", () => {
+    const screenshot = requiredEvidenceFor(
+      ownerPrivate("用 browser 打开 https://nodejs.org/en/download 并截一张图"),
+    ).find((item) => item.domain === "browser_screenshot");
+    expect(screenshot).toBeDefined();
+    expect(
+      resolveEvidence(
+        [screenshot!],
+        [
+          {
+            name: "browser",
+            input: { action: "screenshot" },
+            failed: false,
+            outcome: "success",
+            result: { status: "succeeded", action: "screenshot", artifact: { id: "artifact-1" } },
+          },
+        ],
+      ),
+    ).toEqual([
+      {
+        domain: "browser_screenshot",
+        tool: "browser",
+        outcome: "success",
+      },
+    ]);
+    const missingArtifact = resolveEvidence(
+      [screenshot!],
+      [
+        {
+          name: "browser",
+          input: { action: "screenshot" },
+          failed: false,
+          outcome: "success",
+          result: { status: "succeeded", action: "screenshot" },
+        },
+      ],
+    );
+    expect(missingArtifact).toEqual([
+      { domain: "browser_screenshot", tool: "browser", outcome: "not_called" },
+    ]);
+    expect(unobservedEvidence(missingArtifact)).toHaveLength(1);
   });
 });
 

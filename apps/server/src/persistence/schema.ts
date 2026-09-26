@@ -43,7 +43,7 @@ export const baseSchema = [
   `CREATE INDEX runs_page ON runs(conversation_id, created_at, id)`,
   `CREATE INDEX runs_principal ON runs(principal_id, created_at, id)`,
   `CREATE INDEX conversations_page ON conversations(principal_id, scope_key, created_at, id)`,
-  `CREATE TABLE deliveries (id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id), dedup_key TEXT NOT NULL, destination_scope_key TEXT NOT NULL, payload_text TEXT NOT NULL, payload_kind TEXT NOT NULL CHECK(payload_kind IN ('text','result','ack')), status TEXT NOT NULL CHECK(status IN ('pending','sending','sent','failed','unknown')), external_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(run_id, dedup_key))`,
+  `CREATE TABLE deliveries (id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id), dedup_key TEXT NOT NULL, destination_scope_key TEXT NOT NULL, payload_text TEXT NOT NULL, payload_kind TEXT NOT NULL CHECK(payload_kind IN ('text','result','ack','browser_artifact')), status TEXT NOT NULL CHECK(status IN ('pending','sending','sent','failed','unknown')), external_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(run_id, dedup_key))`,
   `CREATE TABLE authorization_decisions (id TEXT PRIMARY KEY, principal_id TEXT, resource_id TEXT NOT NULL, action TEXT NOT NULL, scope_key TEXT NOT NULL, decision TEXT NOT NULL CHECK(decision IN ('ALLOW','DENY','REQUIRES_APPROVAL')), reason TEXT NOT NULL, grant_id TEXT, approval_id TEXT, conversation_id TEXT REFERENCES conversations(id), run_id TEXT REFERENCES runs(id), created_at TEXT NOT NULL)`,
   `CREATE INDEX decisions_page ON authorization_decisions(principal_id, scope_key, created_at, id)`,
   `CREATE TABLE trace_cursors (run_id TEXT PRIMARY KEY REFERENCES runs(id), trace_ref TEXT NOT NULL, byte_offset INTEGER NOT NULL CHECK(byte_offset >= 0), event_count INTEGER NOT NULL CHECK(event_count >= 0), updated_at TEXT NOT NULL)`,
@@ -165,3 +165,10 @@ export async function applySchemaV4Migration(tx: Transaction): Promise<void> {
 export const schemaV6Migration = ["DROP INDEX IF EXISTS one_owner"];
 
 export const schemaV9Migration = learningSchema;
+
+export const schemaV10Migration = [
+  `CREATE TABLE deliveries_v10 (id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id), dedup_key TEXT NOT NULL, destination_scope_key TEXT NOT NULL, payload_text TEXT NOT NULL, payload_kind TEXT NOT NULL CHECK(payload_kind IN ('text','result','ack','browser_artifact')), status TEXT NOT NULL CHECK(status IN ('pending','sending','sent','failed','unknown')), external_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(run_id, dedup_key))`,
+  `INSERT INTO deliveries_v10 SELECT id, run_id, dedup_key, destination_scope_key, payload_text, payload_kind, status, external_id, created_at, updated_at FROM deliveries`,
+  `DROP TABLE deliveries`,
+  `ALTER TABLE deliveries_v10 RENAME TO deliveries`,
+];

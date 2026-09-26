@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TrustedChannelScope } from "../identity/scope.js";
 import type { ModelProfileStore } from "../config/model-profiles.js";
-import { textResponse } from "../model/testing/streams.js";
+import { eventStream, textResponse } from "../model/testing/streams.js";
 import { createApplicationFixtureScope } from "./application-test-helpers.js";
 import type { ManagementApplication } from "./application.js";
 import { OWNER_MODEL_ADMIN_TOOL } from "../runtime/pi/owner-model-tools.js";
@@ -549,6 +549,105 @@ describe("Management model routing wrapper", () => {
     expect(
       scored.assessment?.scores.find((score) => score.id === "unavailable_fallback")?.value,
     ).toBe("pass");
+  });
+
+  it("records provider health and routes the next Run away from a failed profile", async () => {
+    const urls: string[] = [];
+    vi.stubGlobal("fetch", async (input: string | URL) => {
+      const url = String(input);
+      urls.push(url);
+      return url.includes("/origin/v1/")
+        ? Response.json({ error: { message: "fixture unavailable" } }, { status: 503 })
+        : textResponse("openai-completions", "alternate answer");
+    });
+    const f = await fixture(async () => ({ status: "failed" }));
+    await configureModelRoute(f.app, [
+      {
+        id: "origin",
+        routingEnabled: true,
+        allowRouting: true,
+        routePriority: 0,
+        contextWindowTokens: 32_768,
+        maxOutputTokens: 4_096,
+      },
+      {
+        id: "alternate",
+        allowRouting: true,
+        routePriority: 1,
+        contextWindowTokens: 32_768,
+        maxOutputTokens: 4_096,
+      },
+    ]);
+
+    const failed = await executePrivateRun(f.app, "routing-health-failed", "fixture request");
+    const recovered = await executePrivateRun(f.app, "routing-health-fallback", "fixture request");
+
+    expect(failed.run.status).toBe("failed");
+    expect(failed.events).toContainEqual(
+      expect.objectContaining({
+        type: "runtime_health_observation",
+        executionRef: "model:origin",
+        state: "unavailable",
+        freshnessWindowMs: 60_000,
+        reasonCode: "execution_failed",
+      }),
+    );
+    expect(recovered.run.status).toBe("succeeded");
+    expect(urls).toHaveLength(2);
+    expect(urls[0]).toContain("/origin/v1/");
+    expect(urls[1]).toContain("/alternate/v1/");
+    expect(recovered.events.find((event) => event.type === "routing_decision")).toMatchObject({
+      executionRef: "model:alternate",
+      candidates: [
+        { profileId: "origin", eligible: false, reason: "health_unavailable" },
+        { profileId: "alternate", eligible: true, reason: "eligible" },
+      ],
+    });
+  });
+
+  it("keeps SDK-derived token totals out of provider-reported usage evidence", async () => {
+    const urls: string[] = [];
+    vi.stubGlobal("fetch", async (input: string | URL) => {
+      urls.push(String(input));
+      return eventStream([
+        {
+          id: "derived-usage",
+          choices: [
+            {
+              index: 0,
+              delta: { role: "assistant", content: "answer" },
+              finish_reason: null,
+            },
+          ],
+        },
+        {
+          id: "derived-usage",
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+          usage: { prompt_tokens: 10, completion_tokens: 3 },
+        },
+      ]);
+    });
+    const f = await fixture(async () => ({ status: "failed" }));
+    await configureModelRoute(f.app, [
+      {
+        id: "origin",
+        contextWindowTokens: 32_768,
+        maxOutputTokens: 4_096,
+      },
+    ]);
+
+    const result = await executePrivateRun(f.app, "routing-derived-usage", "fixture request");
+    const evaluation = result.events.find((event) => event.type === "routing_eval_evidence");
+
+    expect(result.run.status).toBe("succeeded");
+    expect(urls).toHaveLength(1);
+    expect(evaluation).toMatchObject({
+      usage: {
+        actualTokens: null,
+        reportedTokens: null,
+        reportedSource: "unknown",
+      },
+    });
   });
 
   it("upgrades only a pre-provider capacity overflow to a larger eligible profile", async () => {

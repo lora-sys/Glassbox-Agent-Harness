@@ -451,6 +451,7 @@ describe("OneBot forward WebSocket", () => {
       group_id: 10003,
       message: [
         { type: "reply", data: { id: "-7" } },
+        { type: "at", data: { qq: 10002 } },
         { type: "text", data: { text: "中文 [CQ:at,qq=all]" } },
       ],
     });
@@ -484,6 +485,15 @@ describe("OneBot forward WebSocket", () => {
     expect(
       await adapter.send({ deliveryId: "member-group", target: memberScope, text: "群回复" }),
     ).toEqual({ status: "confirmed", messageId: "321" });
+    expect(
+      (await fake.actions.next((action) => action.action === "send_group_msg")).params,
+    ).toEqual({
+      group_id: 10003,
+      message: [
+        { type: "at", data: { qq: 10099 } },
+        { type: "text", data: { text: "群回复" } },
+      ],
+    });
     expect(
       await adapter.send({
         deliveryId: "member-private",
@@ -593,6 +603,74 @@ describe("OneBot forward WebSocket", () => {
       (await fake.actions.next((action) => action.action === "send_private_msg")).params,
     ).toMatchObject({ user_id: 10002 });
   });
+  it("sends validated PNG base64 image segments in direct group and private messages", async () => {
+    const fake = await server();
+    const { adapter } = client(fake.endpoint);
+    await adapter.start();
+    const pngBase64 =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADUlEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+    expect(
+      await adapter.send({
+        deliveryId: "group-image",
+        target: groupScope,
+        text: "截图 Artifact",
+        image: { pngBase64 },
+      }),
+    ).toEqual({ status: "confirmed", messageId: "321" });
+    const groupSend = await fake.actions.next((action) => action.action === "send_group_msg");
+    expect(groupSend.params.message).toEqual([
+      { type: "at", data: { qq: 10002 } },
+      { type: "text", data: { text: "截图 Artifact" } },
+      { type: "image", data: { file: `base64://${pngBase64}` } },
+    ]);
+
+    const privateTarget = { ...groupScope, chatType: "private" as const, chatId: base.ownerId };
+    expect(
+      await adapter.send({
+        deliveryId: "private-image",
+        target: privateTarget,
+        text: "截图已生成",
+        replyTo: "42",
+        image: { pngBase64 },
+      }),
+    ).toEqual({ status: "confirmed", messageId: "321" });
+    const privateSend = await fake.actions.next((action) => action.action === "send_private_msg");
+    expect(privateSend.params.message).toEqual([
+      { type: "reply", data: { id: "42" } },
+      { type: "text", data: { text: "截图已生成" } },
+      { type: "image", data: { file: `base64://${pngBase64}` } },
+    ]);
+  });
+  it("rejects malformed, oversized, or merged-forward PNG image payloads before sending", async () => {
+    const fake = await server();
+    const { adapter } = client(fake.endpoint);
+    await adapter.start();
+    const oversizedBase64 = "A".repeat(Math.ceil((8 * 1024 * 1024) / 3) * 4 + 4);
+    for (const pngBase64 of ["not-base64", oversizedBase64]) {
+      expect(
+        await adapter.send({
+          deliveryId: "invalid-image",
+          target: groupScope,
+          text: "无效图片",
+          image: { pngBase64 },
+        }),
+      ).toEqual({ status: "failed", code: "invalid_message" });
+    }
+    expect(
+      await adapter.send({
+        deliveryId: "long-image",
+        target: groupScope,
+        text: "长文本".repeat(1_200),
+        image: {
+          pngBase64:
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADUlEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+        },
+      }),
+    ).toEqual({ status: "failed", code: "invalid_message" });
+    expect(
+      fake.history.filter((action) => action.action.startsWith("send_")).map((a) => a.action),
+    ).toEqual([]);
+  });
   it("delivers a long result as one bounded merged-forward message without truncation", async () => {
     const fake = await server();
     const { adapter } = client(fake.endpoint);
@@ -606,10 +684,16 @@ describe("OneBot forward WebSocket", () => {
     expect(sent.params.group_id).toBe(10003);
     const nodes = sent.params.messages as Array<{
       type: string;
-      data: { user_id: number; nickname: string; content: Array<{ data: { text?: string } }> };
+      data: {
+        user_id: number;
+        nickname: string;
+        content: Array<{ type: string; data: { qq?: number; text?: string } }>;
+      };
     }>;
     expect(nodes.length).toBeGreaterThan(1);
     expect(nodes.every((node) => node.type === "node" && node.data.user_id === 10001)).toBe(true);
+    expect(nodes[0]?.data.content[0]).toEqual({ type: "at", data: { qq: 10002 } });
+    expect(nodes.slice(1).every((node) => node.data.content[0]?.type === "text")).toBe(true);
     expect(
       nodes
         .flatMap((node) => node.data.content)

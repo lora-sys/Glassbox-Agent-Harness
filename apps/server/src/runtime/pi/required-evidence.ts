@@ -26,6 +26,7 @@
  */
 
 import { GROUP_HISTORY_SEARCH_TOOL, OWNER_HISTORY_SEARCH_TOOL } from "./history-tools.js";
+import { WEB_FETCH_TOOL, WEB_SEARCH_TOOL } from "./web-tools.js";
 import { satisfiesRequiredInput } from "./protected-tools.js";
 import type { ToolExecutionOutcome } from "./tool-plane.js";
 
@@ -37,6 +38,8 @@ import type { ToolExecutionOutcome } from "./tool-plane.js";
  * the fact the evidence has to explain.
  */
 export type RequiredEvidenceDomain =
+  | "web_search"
+  | "web_fetch"
   | "group_history_search"
   | "owner_history_search"
   | "group_metadata"
@@ -44,7 +47,10 @@ export type RequiredEvidenceDomain =
   | "group_history_page"
   | "group_content"
   | "group_files"
-  | "account_status";
+  | "account_status"
+  | "browser_open"
+  | "browser_title"
+  | "browser_screenshot";
 
 export interface RequiredEvidence {
   readonly domain: RequiredEvidenceDomain;
@@ -349,6 +355,13 @@ export interface RequiredEvidenceInput {
   readonly isOwner: boolean;
 }
 
+export function officialSourceVerificationRequested(rawText: string): boolean {
+  const text = requestClauses(rawText);
+  return /(?:核对|验证|查证|确认|verify|check)[^。！？!?\n]{0,80}(?:官网|官方|来源|source|official)|(?:官网|官方|来源|source|official)[^。！？!?\n]{0,80}(?:核对|验证|查证|确认|verify|check)/iu.test(
+    text,
+  );
+}
+
 /**
  * The evidence the current message requires before the Run may state a factual answer.
  *
@@ -371,6 +384,49 @@ export function requiredEvidenceFor(input: RequiredEvidenceInput): RequiredEvide
   const text = requestClauses(input.text);
   const required: RequiredEvidence[] = [];
   const group = namedGroupId(text);
+  const explicitUrl = /https?:\/\/[^\s，,。！？!?]+/iu.exec(text)?.[0];
+  const explicitBrowser = /(?:浏览器|\bbrowser\b)/iu.test(text);
+  if (explicitBrowser && explicitUrl && /(?:打开|访问|open|navigate)/iu.test(text)) {
+    required.push({
+      domain: "browser_open",
+      tool: "browser",
+      input: { action: "open", url: explicitUrl },
+    });
+    if (/(?:页面标题|网页标题|标题|page title)/iu.test(text))
+      required.push({
+        domain: "browser_title",
+        tool: "browser",
+        input: { action: "get", kind: "title" },
+      });
+    if (/(?:截图|截一张图|截屏|screenshot|screen shot)/iu.test(text))
+      required.push({
+        domain: "browser_screenshot",
+        tool: "browser",
+        input: { action: "screenshot" },
+      });
+  } else if (
+    explicitUrl &&
+    /(?:打开|读取|抓取|查看|总结|摘要|read|fetch|open|summarize)/iu.test(text)
+  )
+    required.push({ domain: "web_fetch", tool: WEB_FETCH_TOOL, input: { url: explicitUrl } });
+  else if (
+    ((/(?:搜索|搜一下|查找|检索|查询|上网查|web search|search the web|look up)/iu.test(text) &&
+      /(?:网页|网站|互联网|网上|网络|资料|新闻|来源|web|online|internet|latest|current|最近|最新)/iu.test(
+        text,
+      )) ||
+      /(?:今天|现在|当前|最新|近期|today|latest|current)\s*[^，,。！？!?]{0,60}(?:发布|版本|价格|新闻|官网|release|version|price|announc)/iu.test(
+        text,
+      )) &&
+    !groupHistorySearchRequested(text) &&
+    !ownerHistorySearchRequested(text) &&
+    !asksLiveQqFact(text)
+  ) {
+    required.push({ domain: "web_search", tool: WEB_SEARCH_TOOL, input: {} });
+    // Search snippets are candidate evidence. When the caller explicitly asks to verify an
+    // official source, a successful search alone cannot support "I checked the official page".
+    if (officialSourceVerificationRequested(text))
+      required.push({ domain: "web_fetch", tool: WEB_FETCH_TOOL, input: {} });
+  }
 
   if (input.chatType === "group") {
     // A group Run is bound to its own group, so a domain the message asks about needs no
@@ -391,7 +447,7 @@ export function requiredEvidenceFor(input: RequiredEvidenceInput): RequiredEvide
 
   // Everything below is the Owner-private surface. A cross-group search is answered by its own
   // Tool, which addresses groups the message names rather than the Run's scope.
-  if (!input.isOwner) return [];
+  if (!input.isOwner) return required;
   const searched = ownerHistorySearchRequested(text);
   if (searched)
     required.push({ domain: "owner_history_search", tool: OWNER_HISTORY_SEARCH_TOOL, input: {} });
@@ -482,6 +538,7 @@ export interface ObservedToolCall {
   readonly failed?: boolean;
   readonly toolCallId?: string;
   readonly outcome?: ToolExecutionOutcome;
+  readonly result?: unknown;
 }
 
 /**
@@ -508,11 +565,36 @@ export interface EvidenceResolution {
  * answered a different question is not evidence for this one.
  */
 function callObserved(evidence: RequiredEvidence, call: ObservedToolCall): boolean {
-  return (
+  const matches =
     call.name === evidence.tool &&
     call.failed === false &&
-    satisfiesRequiredInput(evidence.input, call.input)
-  );
+    satisfiesRequiredInput(evidence.input, call.input);
+  if (!matches) return false;
+  return evidence.domain !== "browser_screenshot" || hasArtifactId(call.result);
+}
+
+/** A screenshot is evidence only when the browser Tool returned its durable Artifact id. */
+function hasArtifactId(value: unknown, depth = 0): boolean {
+  if (depth > 5 || value === null || value === undefined) return false;
+  if (typeof value === "string") {
+    try {
+      return hasArtifactId(JSON.parse(value) as unknown, depth + 1);
+    } catch {
+      return false;
+    }
+  }
+  if (Array.isArray(value)) return value.some((item) => hasArtifactId(item, depth + 1));
+  if (typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+  const artifact = record.artifact;
+  if (
+    artifact !== null &&
+    typeof artifact === "object" &&
+    typeof (artifact as Record<string, unknown>).id === "string" &&
+    (artifact as Record<string, unknown>).id !== ""
+  )
+    return true;
+  return Object.values(record).some((item) => hasArtifactId(item, depth + 1));
 }
 
 /**

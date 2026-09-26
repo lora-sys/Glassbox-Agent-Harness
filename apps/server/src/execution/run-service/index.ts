@@ -423,56 +423,64 @@ export class RunService {
     const run = await this.getRun(caller, record.id);
     if (!terminal.has(run.status)) return;
     const existing = await this.options.store.lifecycle.findDelivery(caller, run.id, "result");
-    if (!existing) {
-      const candidate = run.resultText ?? `任务处理未完成，状态为 ${run.status}。`;
-      const prepared = this.options.prepareDelivery
-        ? await this.options.prepareDelivery(candidate)
-        : { allowed: true, text: candidate, reasons: [], candidateSha256: "not-recorded" };
-      if (!prepared.allowed || !prepared.text) {
-        const newlyBlocked = await this.options.store.conversations.excludeRunFromContext(
-          caller,
-          run.id,
-        );
-        if (!newlyBlocked) return;
-        await this.emit({
-          type: "delivery_blocked",
-          runId: run.id,
-          conversationId: run.conversationId,
-          reasons: [...prepared.reasons],
-          candidateSha256: prepared.candidateSha256,
-          candidateBytes: Buffer.byteLength(candidate, "utf8"),
-        });
-        return;
-      }
-      try {
+    const candidate = run.resultText ?? `任务处理未完成，状态为 ${run.status}。`;
+    const prepared = this.options.prepareDelivery
+      ? await this.options.prepareDelivery(candidate, { caller, run })
+      : { allowed: true, text: candidate, reasons: [], candidateSha256: "not-recorded" };
+    if (!existing && (!prepared.allowed || !prepared.text)) {
+      const newlyBlocked = await this.options.store.conversations.excludeRunFromContext(
+        caller,
+        run.id,
+      );
+      if (!newlyBlocked) return;
+      await this.emit({
+        type: "delivery_blocked",
+        runId: run.id,
+        conversationId: run.conversationId,
+        reasons: [...prepared.reasons],
+        candidateSha256: prepared.candidateSha256,
+        candidateBytes: Buffer.byteLength(candidate, "utf8"),
+      });
+      return;
+    }
+    try {
+      if (!existing)
         await this.options.store.lifecycle.createDelivery(caller, {
           runId: run.id,
           dedupKey: "result",
           destination: caller.scope,
-          payloadText: prepared.text,
+          payloadText: prepared.text!,
           payloadKind: "result",
         });
-      } catch (error) {
-        // A delivery authorization refusal is a blocked outcome, not a transport failure: the
-        // answer never left the process, so no send is attempted and nothing is retried. Trace
-        // records that fact and the decision that caused it, never the payload the Run was
-        // trying to send. The exact Resource and Action remain in the authorization ledger,
-        // joined to this Run and Conversation.
-        if (!(error instanceof AccessDeniedError)) throw error;
-        const newlyDenied = await this.options.store.conversations.excludeRunFromContext(
-          caller,
-          run.id,
-        );
-        if (!newlyDenied) return;
-        await this.emit({
-          type: "delivery_denied",
-          runId: run.id,
-          conversationId: run.conversationId,
-          decision: error.decision.decision,
-          reason: error.decision.reason,
-        });
-        return;
-      }
+      if (prepared.allowed)
+        for (const artifactId of prepared.artifactIds ?? [])
+          await this.options.store.lifecycle.createDelivery(caller, {
+            runId: run.id,
+            dedupKey: `browser-artifact-${artifactId}`,
+            destination: caller.scope,
+            payloadText: artifactId,
+            payloadKind: "browser_artifact",
+          });
+    } catch (error) {
+      // A delivery authorization refusal is a blocked outcome, not a transport failure: the
+      // answer never left the process, so no send is attempted and nothing is retried. Trace
+      // records that fact and the decision that caused it, never the payload the Run was
+      // trying to send. The exact Resource and Action remain in the authorization ledger,
+      // joined to this Run and Conversation.
+      if (!(error instanceof AccessDeniedError)) throw error;
+      const newlyDenied = await this.options.store.conversations.excludeRunFromContext(
+        caller,
+        run.id,
+      );
+      if (!newlyDenied) return;
+      await this.emit({
+        type: "delivery_denied",
+        runId: run.id,
+        conversationId: run.conversationId,
+        decision: error.decision.decision,
+        reason: error.decision.reason,
+      });
+      return;
     }
     let cursor: string | undefined;
     do {

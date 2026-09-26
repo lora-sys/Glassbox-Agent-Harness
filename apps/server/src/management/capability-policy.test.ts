@@ -8,6 +8,7 @@ import {
   enabledCategoriesFor,
   isCategoryEnabled,
   isMemorySourceEnabled,
+  isWebCapabilityEnabled,
   type GroupCapabilityPolicy,
 } from "./capability-policy.js";
 
@@ -51,6 +52,9 @@ it("defaults to deny for a group with no stored policy", async () => {
     expect(isCategoryEnabled(DEFAULT_GROUP_CAPABILITY_POLICY, "group.members")).toBe(false);
     expect(isCategoryEnabled(DEFAULT_GROUP_CAPABILITY_POLICY, "group.history")).toBe(false);
     expect(isMemorySourceEnabled(DEFAULT_GROUP_CAPABILITY_POLICY, "history")).toBe(false);
+    expect(
+      isWebCapabilityEnabled(DEFAULT_GROUP_CAPABILITY_POLICY.webCapabilities, "web.search"),
+    ).toBe(false);
   } finally {
     await store.close();
   }
@@ -195,6 +199,51 @@ it("refuses a single-field mutation that names an unimplemented category or sour
     ).rejects.toThrow("invalid_memory_source_class");
     // A refused mutation leaves no row behind.
     expect(await store.capabilities.read("qq", "100")).toBeUndefined();
+  } finally {
+    await store.close();
+  }
+});
+
+it("stores web capabilities independently and reads pre-web policy records as disabled", async () => {
+  const { store } = await fixture();
+  try {
+    await store.capabilities.write({
+      connectionId: "qq",
+      groupId: "100",
+      principalId: "owner",
+      policy: { categories: { "group.members": true }, memorySources: { history: true } },
+    });
+    const initial = await store.capabilities.read("qq", "100");
+    for (const capability of [
+      "web.search",
+      "web.fetch",
+      "browser.read",
+      "browser.interact",
+    ] as const)
+      expect(isWebCapabilityEnabled(initial?.policy.webCapabilities, capability)).toBe(false);
+
+    await store.capabilities.setWebCapability({
+      connectionId: "qq",
+      groupId: "100",
+      principalId: "owner",
+      capability: "web.search",
+      enabled: true,
+    });
+    const updated = await store.capabilities.read("qq", "100");
+    expect(updated?.version).toBe(2);
+    expect(isWebCapabilityEnabled(updated?.policy.webCapabilities, "web.search")).toBe(true);
+    expect(isCategoryEnabled(updated!.policy, "group.members")).toBe(true);
+    expect(isMemorySourceEnabled(updated!.policy, "history")).toBe(true);
+
+    await expect(
+      store.capabilities.setWebCapability({
+        connectionId: "qq",
+        groupId: "100",
+        principalId: "owner",
+        capability: "web.shell" as never,
+        enabled: true,
+      }),
+    ).rejects.toThrow("invalid_web_capability");
   } finally {
     await store.close();
   }

@@ -13,6 +13,7 @@ import {
 } from "../../efficiency/index.js";
 import { exactTerms } from "../../retrieval/exact-term.js";
 import type { QqCapabilityCategory } from "../../channels/onebot/capabilities.js";
+import { WEB_CAPABILITIES } from "../../management/web-capability-policy.js";
 import type { PiRunContext, PiRuntimeAdapter, PiRuntimeProfileName } from "./types.js";
 import {
   GROUP_HISTORY_SEARCH_TOOL,
@@ -29,6 +30,7 @@ import {
   groupHistorySearchRequested,
   groupHistorySearchSender,
   namedGroupId,
+  officialSourceVerificationRequested,
   ownerHistorySearchRequested,
   requestClauses,
   requiredEvidenceFor,
@@ -37,11 +39,14 @@ import {
   type EvidenceResolution,
   type RequiredEvidence,
 } from "./required-evidence.js";
+import { safeWebEvidenceReply, webAnswerEvidenceFailure } from "./web-answer-evidence.js";
 
 interface RequiredToolCall {
   name: string;
   /** The exact input the current user message requires; every key must match the call. */
   input: Record<string, unknown>;
+  /** Additional explicit actions that need independent Tool calls in the same Run. */
+  additional?: readonly RequiredToolCall[];
 }
 
 /** Parse only the current Owner message; historical or retrieved text is never mutation intent. */
@@ -147,6 +152,15 @@ function ownerMemoryCommand(text: string): RequiredToolCall | undefined {
       ...(quotedQuery ? { query: quotedQuery } : {}),
     },
   };
+}
+
+/** Explicitly named Ops calls must be backed by a real Tool result, never model narration. */
+function ownerTaskDelegationRequest(text: string): RequiredToolCall | undefined {
+  const request = requestClauses(text);
+  if (!/(?:调用|执行|使用|尝试调用)\s*`?task_delegate`?/iu.test(request)) return undefined;
+  if (/(?:不要|别|不需要|无需|停止)\s*(?:调用|执行|使用|委派)/u.test(request)) return undefined;
+  const title = /名为\s*[“"「]?([A-Za-z0-9][A-Za-z0-9._-]{0,127})/u.exec(request)?.[1];
+  return { name: "task_delegate", input: title ? { title } : {} };
 }
 
 /** The provider parameters the current message pins down, or `undefined` when it pins none. */
@@ -452,6 +466,14 @@ export type RunEvidenceRecord =
       conversationId: string;
       phase: "resolved";
       resolutions: readonly EvidenceResolution[];
+    }
+  | {
+      type: "web_answer_evidence";
+      runId: string;
+      principalId: string;
+      conversationId: string;
+      status: "accepted" | "withheld";
+      reason?: "source_not_read" | "unqualified_latest_claim";
     };
 
 function groupHistorySearchFollowUpRequested(input: ExecutionInput): boolean {
@@ -547,6 +569,8 @@ function requiredToolCall(
     const model = ownerModelCommand(rawText, modelProfiles);
     if (model) return model;
   }
+  const taskDelegation = ownerTaskDelegationRequest(rawText);
+  if (taskDelegation) return taskDelegation;
   if (authorizedToolNames?.includes(OWNER_MEMORY_ADMIN_TOOL)) {
     const memory = ownerMemoryCommand(rawText);
     if (memory) return memory;
@@ -583,8 +607,20 @@ function requiredToolCall(
     };
   }
 
+  const webCategories = WEB_CAPABILITIES.filter((category) =>
+    new RegExp(`(?:^|[^\\w])${category.replace(".", "\\.")}(?=$|[^\\w])`, "iu").test(text),
+  );
   const disabled = /关闭|停用|禁用|取消|移除/u.test(text);
-  const changeRequested = disabled || /启用|开启|打开|允许|恢复|加入/u.test(text);
+  const enabled = /启用|开启|打开|允许|恢复|加入/u.test(text);
+  // Mixed or negated Web requests cannot be represented by one shared enabled flag.
+  // Refuse the mutation instead of changing any category in the wrong direction.
+  if (
+    webCategories.length > 0 &&
+    ((disabled && enabled) ||
+      /(?:不要|别|请勿|禁止|不)(?:再)?(?:启用|开启|打开|允许|恢复|加入)/u.test(text))
+  )
+    return undefined;
+  const changeRequested = disabled || enabled;
   if (!changeRequested && !text.includes(OWNER_GROUP_ADMIN_TOOL)) return undefined;
 
   if (/记忆来源|记忆源/u.test(text)) {
@@ -603,6 +639,29 @@ function requiredToolCall(
     return {
       name: OWNER_GROUP_ADMIN_TOOL,
       input: { action: "set_history", groupId, enabled: !disabled },
+    };
+  if (webCategories.length > 0)
+    return {
+      name: OWNER_GROUP_ADMIN_TOOL,
+      input: {
+        action: "set_capability",
+        groupId,
+        enabled: !disabled,
+        category: webCategories[0],
+      },
+      ...(webCategories.length > 1
+        ? {
+            additional: webCategories.slice(1).map((category) => ({
+              name: OWNER_GROUP_ADMIN_TOOL,
+              input: {
+                action: "set_capability",
+                groupId,
+                enabled: !disabled,
+                category,
+              },
+            })),
+          }
+        : {}),
     };
   if (/能力|capability|owner_group_admin/iu.test(text)) {
     const category = CAPABILITY_WORDS.find((entry) => entry.words.test(text))?.category;
@@ -842,6 +901,9 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       context,
     );
     const required = requiredToolCall(input, isOwner, context.authorizedToolNames, modelProfiles);
+    const requiredCalls = required
+      ? [{ name: required.name, input: required.input }, ...(required.additional ?? [])]
+      : [];
     if (required !== undefined) {
       context.requiredToolName = required.name;
       context.requiredToolInput = required.input;
@@ -959,26 +1021,24 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       // The same comparison the mutating-Tool gate uses: a call counts as having carried out
       // the required action only when every key the message pinned down agrees with it. Using
       // a looser check here would accept a Run whose Tool call the gate had refused.
-      const completedRequiredTool = () =>
-        required === undefined ||
+      const callSatisfied = (expected: RequiredToolCall) =>
         observedCalls.some(
           (call) =>
-            call.name === required.name &&
+            call.name === expected.name &&
             call.failed === false &&
             satisfiesRequiredInput(
-              required.input,
+              expected.input,
               input.caller.scope.chatType === "group"
                 ? { ...call.input, groupId: input.caller.scope.chatId }
                 : call.input,
             ),
         );
+      const missingRequiredCalls = () => requiredCalls.filter((call) => !callSatisfied(call));
+      const completedRequiredTool = () => missingRequiredCalls().length === 0;
       // §2/§3 — every domain the message asked about, not the first one the check reached. A
       // message that asks about members *and* notices is not answered by observing one of them.
       const missingRequirements = () => {
-        const requiredCall =
-          completedRequiredTool() || required === undefined
-            ? undefined
-            : { name: required.name, input: required.input };
+        const requiredCall = missingRequiredCalls()[0];
         const evidenceCalls = resolveEvidence(evidence, observedCalls).flatMap(
           (resolution, index) => {
             if (resolution.outcome === "success") return [];
@@ -997,19 +1057,90 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         );
         return [...(requiredCall ? [requiredCall] : []), ...evidenceCalls];
       };
-      const missing = missingRequirements();
-      if (result.status === "completed" && missing.length > 0 && !input.signal.aborted) {
-        result = await this.runtime.run(
-          binding,
-          { ...input.run, principalId: input.caller.principalId },
-          `The required action has not executed. Call ${missing
-            .map(({ name, input: requiredInput }) => `${name}${requiredInputClause(requiredInput)}`)
-            .join(
-              " and ",
-            )} now. Do not ask for confirmation and do not report success without the tool result.`,
-          context,
+      let missing = missingRequirements();
+      if (evidence.some((item) => item.domain.startsWith("browser_"))) {
+        // Browser reads depend on navigation. Ask for one missing action per turn so the
+        // model cannot dispatch title and screenshot beside the open call in parallel.
+        while (result.status === "completed" && missing.length > 0 && !input.signal.aborted) {
+          const nextRequired = missing[0]!;
+          context.requiredToolName = nextRequired.name;
+          context.requiredToolInput = nextRequired.input;
+          context.requiredEvidence = evidence.filter(
+            (item) =>
+              item.tool === nextRequired.name &&
+              satisfiesRequiredInput(item.input, nextRequired.input),
+          );
+          result = await this.runtime.run(
+            binding,
+            { ...input.run, principalId: input.caller.principalId },
+            `Call ${nextRequired.name}${requiredInputClause(nextRequired.input)} now. Wait for its result before another browser action. Do not report success without the Tool result.`,
+            context,
+          );
+          observedCalls.push(...result.toolCalls);
+          const remaining = missingRequirements();
+          if (
+            remaining.some(
+              (item) =>
+                item.name === nextRequired.name &&
+                satisfiesRequiredInput(item.input, nextRequired.input),
+            )
+          )
+            break;
+          missing = remaining;
+        }
+      } else if (
+        requiredCalls.length <= 1 &&
+        !(
+          evidence.some((item) => item.domain === "web_search") &&
+          evidence.some((item) => item.domain === "web_fetch")
+        )
+      ) {
+        const delegationAttempted = requiredCalls.some(
+          (call) =>
+            call.name === "task_delegate" &&
+            observedCalls.some(
+              (observed) =>
+                observed.name === call.name && satisfiesRequiredInput(call.input, observed.input),
+            ),
         );
-        observedCalls.push(...result.toolCalls);
+        if (
+          result.status === "completed" &&
+          missing.length > 0 &&
+          !input.signal.aborted &&
+          !delegationAttempted
+        ) {
+          result = await this.runtime.run(
+            binding,
+            { ...input.run, principalId: input.caller.principalId },
+            `The required action has not executed. Call ${missing
+              .map(
+                ({ name, input: requiredInput }) => `${name}${requiredInputClause(requiredInput)}`,
+              )
+              .join(
+                " and ",
+              )} now. Do not ask for confirmation and do not report success without the tool result.`,
+            context,
+          );
+          observedCalls.push(...result.toolCalls);
+        }
+      } else {
+        while (result.status === "completed" && missing.length > 0 && !input.signal.aborted) {
+          const nextRequired = missing[0]!;
+          context.requiredToolName = nextRequired.name;
+          context.requiredToolInput = nextRequired.input;
+          result = await this.runtime.run(
+            binding,
+            { ...input.run, principalId: input.caller.principalId },
+            `The required action has not executed. Call ${nextRequired.name}${requiredInputClause(
+              nextRequired.input,
+            )} now. Do not ask for confirmation and do not report success without the tool result.`,
+            context,
+          );
+          observedCalls.push(...result.toolCalls);
+          // Each required action gets one targeted retry. A failed or missing result stays closed.
+          if (!callSatisfied(nextRequired)) break;
+          missing = missingRequirements();
+        }
       }
       const finalResolutions = resolveEvidence(evidence, observedCalls);
       await this.recordEvidence({
@@ -1030,8 +1161,14 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       // whenever the user happened to press Stop. A cancelled Run that cannot back its text
       // reports none, and that fixed line states the outcome instead.
       const missingTool = requiredName !== undefined && !completedRequiredTool();
-      const missingEvidence = unobservedEvidence(finalResolutions).length > 0;
-      if (result.status === "aborted") {
+      const missingEvidenceDomains = unobservedEvidence(finalResolutions).map(
+        (item) => item.domain,
+      );
+      const missingEvidence = missingEvidenceDomains.length > 0;
+      // A Tool can settle as a failure after cancellation, then the provider can emit a completed
+      // turn containing only a refusal or fallback sentence. The Run's explicit cancel signal
+      // remains authoritative even when the latest provider result is not `aborted`.
+      if (input.signal.aborted || result.status === "aborted") {
         return missingTool || missingEvidence
           ? { status: "cancelled", providerSessionId: binding.runtimeSessionId }
           : {
@@ -1051,9 +1188,34 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       if (missingEvidence)
         return {
           status: "failed",
-          text: "未能从 QQ 获取该信息，因此无法确认。",
+          text: missingEvidenceDomains.some((domain) => domain.startsWith("browser_"))
+            ? "浏览器操作未完成，无法确认页面或提供截图。"
+            : missingEvidenceDomains.some((domain) => domain.startsWith("web_"))
+              ? "网页检索或读取未完成，因此无法确认。"
+              : "未能从 QQ 获取该信息，因此无法确认。",
           providerSessionId: binding.runtimeSessionId,
         };
+      if (result.status === "completed" && officialSourceVerificationRequested(input.text)) {
+        const failure = webAnswerEvidenceFailure({
+          request: input.text,
+          answer: result.text,
+          toolCalls: observedCalls,
+        });
+        await this.recordEvidence({
+          type: "web_answer_evidence",
+          runId: input.run.id,
+          principalId: input.caller.principalId,
+          conversationId: input.conversation.id,
+          status: failure ? "withheld" : "accepted",
+          ...(failure ? { reason: failure.reason } : {}),
+        });
+        if (failure)
+          return {
+            status: "failed",
+            text: safeWebEvidenceReply(failure),
+            providerSessionId: binding.runtimeSessionId,
+          };
+      }
       const strictReply = strictHistoryReplySpec(input.text);
       if (
         strictReply &&
@@ -1105,5 +1267,9 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
 
   async cleanup(): Promise<void> {
     return this.runtime.cleanup();
+  }
+
+  async disposeWorkspaceSessions(principalId: string, workspaceId: string): Promise<void> {
+    await this.runtime.disposeWorkspaceSessions?.(principalId, workspaceId);
   }
 }
