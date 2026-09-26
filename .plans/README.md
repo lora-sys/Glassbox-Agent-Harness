@@ -6,15 +6,15 @@ This directory contains the active implementation plans and durable technical fi
 
 P3 completed on 2026-09-19.
 
-P4A and P4B are complete. Before starting the next product phase, Issue #21 owns this repository refactor:
+P4A, P4B, and Issue #21 are complete. Issue #24 owns the current closeout before the next product phase:
 
 ```text
-phase-transition-repository-refactor.md
-  Issue #21
-  Server modularization, test structure, and validation workflow
+issue-24-closeout.md
+  Issue #24
+  Delivery-source reauthorization, Herdr Worker workspace occupancy, acceptance
 ```
 
-The P4 plans remain as completed architecture and acceptance records. This refactor does not implement P5 product behavior.
+The P4 and Issue #21 plans remain as completed architecture and acceptance records. This closeout does not implement P5 product behavior.
 
 ## Completed P4 plans
 
@@ -28,11 +28,11 @@ The P4 plans remain as completed architecture and acceptance records. This refac
   Authorized retrieval / QQ history search
 ```
 
-## Read order for repository refactoring
+## Read order for the current closeout
 
 1. `../AGENTS.md`
-2. `phase-transition-repository-refactor.md`
-3. Issue #21
+2. `issue-24-closeout.md`
+3. Issue #24
 4. only the relevant files under `findings/`
 5. current production code and focused tests
 

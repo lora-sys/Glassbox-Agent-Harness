@@ -4,7 +4,7 @@ Status: CURRENT DIRECTION
 
 This document defines the stable ownership boundary between Glassbox, Pi, Lora PI Kit, Herdr, Codex, Claude Code, and future runtimes.
 
-The active implementation order remains `.plans/03-personal-agent-foundation.md`.
+The current pre-P5 closeout is `.plans/issue-24-closeout.md`. Plan 03 remains the completed P3 foundation record.
 
 Read these companion documents for details:
 

@@ -16,6 +16,7 @@ export interface HerdrPaneInfo {
   agentName?: string;
   agentKind: string;
   state: HerdrAgentLifecycleState;
+  cwd?: string;
   worktreePath?: string;
   branch?: string;
 }
@@ -41,6 +42,7 @@ export interface HerdrBridge {
   startAgent(params: {
     workspaceId: string;
     agentKind: string;
+    agentName?: string;
     worktreePath?: string;
     branch?: string;
     workerContextFile?: string;
@@ -55,4 +57,5 @@ export interface HerdrBridge {
     timeoutMs?: number;
   }): Promise<{ state: HerdrAgentLifecycleState }>;
   stopAgent(params: { paneId: string; agentName?: string }): Promise<void>;
+  closeAgent(params: { paneId: string; agentName: string; herdrSession: string }): Promise<void>;
 }

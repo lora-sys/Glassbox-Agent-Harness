@@ -538,6 +538,33 @@ export class ManagementApplication {
       await store.conversations.createAgent(AGENT_ID);
       if (options.ops) {
         await options.ops.bridge.connect();
+        for (const { lease, state } of application.workspaceWrites.listUnresolved()) {
+          if (lease.policyVersion !== "herdr-worker-v1" || state !== "quarantined") continue;
+          const binding = await store.tasks.getWorkerBinding(lease.executionId);
+          if (!binding?.agentName || binding.agentName !== lease.sandboxSessionId) continue;
+          try {
+            await application.workspaceWrites.releaseQuarantined(lease, async () => {
+              const snapshot = await options.ops!.bridge.getSnapshot();
+              if (snapshot.sessionId !== binding.herdrSession) return false;
+              await options.ops!.bridge.closeAgent({
+                paneId: binding.paneId,
+                agentName: binding.agentName!,
+                herdrSession: binding.herdrSession,
+              });
+              return true;
+            });
+            const attempt = await store.tasks.getAttempt(lease.executionId);
+            await store.tasks.recordTrace({
+              type: "worker.workspace_lease",
+              ...(attempt ? { taskId: attempt.taskId } : {}),
+              taskAttemptId: lease.executionId,
+              principalId: lease.principalId,
+              data: { workspaceId: lease.workspaceId, leaseId: lease.leaseId, state: "released" },
+            });
+          } catch {
+            // A missing or disconnected Herdr pane is not positive stop evidence.
+          }
+        }
         application.opsReconciler = new OpsReconciler(store.tasks, options.ops.bridge);
         await application.opsReconciler.start();
       }
@@ -688,6 +715,7 @@ export class ManagementApplication {
     for (const action of [
       "workspace:read",
       ...(workspace.grants[principalId] === "write" ? ["workspace:write"] : []),
+      DELIVERY_SEND_ACTION,
     ])
       await this.store.authorization.grant({
         principalId,
@@ -755,14 +783,22 @@ export class ManagementApplication {
     if (!value || typeof value.workspaceId !== "string" || typeof value.principalId !== "string")
       throw new ManagementError("INVALID_REQUEST", "Workspace ID and Owner are required");
     await this.requireOwnerPrincipal(value.principalId);
-    await this.workspaces.revokeTrusted(value.workspaceId, value.principalId);
-    // Revoke the product grant in every configured private scope and stop old tool sessions.
+    const workspace = await this.workspaces.resolveAuthorized(
+      value.principalId,
+      value.workspaceId,
+      "read",
+    );
+    if (workspace.kind === "default" || workspace.ownerPrincipalId === value.principalId)
+      throw new Error("Workspace grant cannot be revoked");
+    // Remove database authority first, so no delivery can pass between registry revocation
+    // and the matching Action grant revocation.
     for (const scope of this.workspacePrivateScopes(value.principalId))
       await this.store.authorization.revokeScope({
         principalId: value.principalId,
         resourceId: `workspace:${value.workspaceId}`,
         scope,
       });
+    await this.workspaces.revokeTrusted(value.workspaceId, value.principalId);
     for (const adapter of this.piAdapters.values())
       await adapter.disposeWorkspaceSessions(value.principalId, value.workspaceId);
     return { revoked: true };
@@ -1100,6 +1136,7 @@ export class ManagementApplication {
               this.store,
               this.options.ops!.bridge,
               this.options.ops!.workerPolicy,
+              { registry: this.workspaces, writes: this.workspaceWrites },
             ),
             workerTarget: this.options.ops!.workerTarget,
             getContext,
@@ -1950,7 +1987,7 @@ export class ManagementApplication {
         ownerId: principalId,
         ifAbsent: true,
       });
-      for (const action of ["workspace:read", "workspace:write"]) {
+      for (const action of ["workspace:read", "workspace:write", DELIVERY_SEND_ACTION]) {
         await this.store.authorization.grant({
           principalId,
           resourceId: workspaceResource,
@@ -1994,6 +2031,13 @@ export class ManagementApplication {
         scope,
         effect: "allow",
       });
+      await this.store.authorization.grant({
+        principalId,
+        resourceId: OWNER_CONTROL_RESOURCE,
+        action: DELIVERY_SEND_ACTION,
+        scope,
+        effect: "allow",
+      });
       await this.store.authorization.registerResource({
         id: OWNER_MEMORY_RESOURCE,
         kind: "owner-memory",
@@ -2006,6 +2050,28 @@ export class ManagementApplication {
           principalId,
           resourceId: OWNER_MEMORY_RESOURCE,
           action,
+          scope,
+          effect: "allow",
+        });
+      }
+      await this.store.authorization.grant({
+        principalId,
+        resourceId: OWNER_MEMORY_RESOURCE,
+        action: DELIVERY_SEND_ACTION,
+        scope,
+        effect: "allow",
+      });
+      if (this.options.ops) {
+        await this.store.authorization.registerResource({
+          id: "agent-operations",
+          kind: "ops",
+          visibility: "public",
+          ifAbsent: true,
+        });
+        await this.store.authorization.grant({
+          principalId,
+          resourceId: "agent-operations",
+          action: DELIVERY_SEND_ACTION,
           scope,
           effect: "allow",
         });

@@ -436,6 +436,8 @@ async function executeMemoryActionRaw(
           ),
         );
       }
+      if (items.length > 0)
+        await store.authorization.markDeliverySource(decision.id, "content_source");
       return candidates;
     }
   }
@@ -526,6 +528,8 @@ export function createOwnerMemoryTools(options: {
         { additionalProperties: false },
       ),
       action: authorizationAction,
+      deliverySource: (params) =>
+        ["list", "get", "list_candidates"].includes(params.action) ? "content_source" : undefined,
       resourceId: OWNER_MEMORY_RESOURCE,
       authService: options.store.authorization,
       getContext,

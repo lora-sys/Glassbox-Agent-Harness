@@ -139,12 +139,25 @@ export class LifecycleStore {
     caller: CallerContext,
     runId: string,
   ): Promise<AuthorizedResult<null>> {
-    // Authorization evidence conservatively records every protected read admitted
-    // to this Run. Model text cannot remove a dependency from this set.
-    const sources = await tx.execute({
-      sql: `SELECT DISTINCT resource_id, action FROM authorization_decisions WHERE run_id = ? AND principal_id = ?
-        AND decision = 'ALLOW' AND action IN ('read', 'context:read', 'history:read', 'worker:read', 'worker:status', 'worker:file:read', 'task:read')`,
+    // Trusted execution paths mark an ALLOW only after a protected read succeeds.
+    // Discovery checks remain unmarked, so they cannot become delivery dependencies.
+    const decisions = await tx.execute({
+      sql: `SELECT DISTINCT d.resource_id, d.action, d.delivery_source, r.kind AS resource_kind
+        FROM authorization_decisions d LEFT JOIN resources r ON r.id = d.resource_id
+        WHERE d.run_id = ? AND d.principal_id = ? AND d.decision = 'ALLOW'
+          AND d.delivery_source IS NOT NULL`,
       args: [runId, caller.principalId],
+    });
+    const sources = decisions.rows.flatMap((source) => {
+      const persistedClass = stringColumn(source, "delivery_source");
+      const classification =
+        persistedClass === "legacy_content_source"
+          ? "content_source"
+          : persistedClass === "legacy_access_gate"
+            ? "access_gate"
+            : persistedClass;
+      if (classification !== "content_source" && classification !== "access_gate") return [];
+      return classification ? [{ source, classification }] : [];
     });
     // Every delivery decision is evidence about one Run in one Conversation, so the delivery
     // recheck names both. A denial then explains which Run tried to send which Resource's
@@ -154,8 +167,10 @@ export class LifecycleStore {
       args: [runId, caller.principalId],
     });
     const conversationId = runs.rows[0] ? stringColumn(runs.rows[0], "conversation_id") : undefined;
-    for (const source of sources.rows) {
-      for (const action of [stringColumn(source, "action"), "delivery:send"]) {
+    for (const { source, classification } of sources) {
+      const actions = [stringColumn(source, "action")];
+      if (classification === "content_source") actions.push("delivery:send");
+      for (const action of actions) {
         const decision = await evaluate(tx, {
           caller,
           runId,
