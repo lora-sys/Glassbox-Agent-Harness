@@ -1,4 +1,5 @@
 import { mkdir } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { QQ_SOURCE_CLASSES, type AgentRun, type Conversation } from "@glassbox/contracts";
 import type { Model } from "@earendil-works/pi-ai";
@@ -15,6 +16,18 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { KitLoader, type ResolvedKitProfile } from "./kit-loader.js";
 import { QQ_CAPABILITY_CATEGORIES } from "../../channels/onebot/capabilities.js";
+import {
+  estimateUnicodeTokens,
+  admitDuplicateCall,
+  projectContextBudget,
+  projectToolResultsForTurn,
+  type ContextDemandEstimate,
+  type DuplicateCallAdmissionRecord,
+  type ModelCapacity as EfficiencyModelCapacity,
+  type ToolResultBudgetPolicy,
+  type ToolResultClass,
+  type ToolResultForProjection,
+} from "../../efficiency/index.js";
 import { requiredInputClause } from "./protected-tools.js";
 import type { RequiredEvidence } from "./required-evidence.js";
 import {
@@ -37,7 +50,7 @@ import type {
 interface ActiveSession {
   session: Pick<
     AgentSession,
-    "sessionId" | "subscribe" | "prompt" | "abort" | "dispose" | "messages"
+    "sessionId" | "subscribe" | "prompt" | "abort" | "dispose" | "messages" | "model"
   > &
     Partial<Pick<AgentSession, "extensionRunner">>;
   binding: PiSessionBinding;
@@ -48,6 +61,17 @@ interface ActiveSession {
   authorizedSkillNames: readonly string[];
   modelVisibleSkillNames: readonly string[];
   skillPolicy: Record<string, unknown>;
+  modelCapacity?: EfficiencyModelCapacity;
+  staticContextEstimate?: { systemTokens: number; toolSchemaTokens: number };
+  thinkingLevel: string | null;
+  resultProjectionEvidence: Map<string, Record<string, unknown>>;
+  turnToolResults: ToolResultForProjection[];
+  turnInputBudgetTokens?: number;
+  duplicateCalls: DuplicateCallAdmissionRecord[];
+  duplicateCallIndexes: Map<string, number>;
+  retryableDuplicateKeys: Set<string>;
+  contextBudgetEvidence?: Record<string, unknown>;
+  pendingBudgetFailure?: string;
   sandboxToolSession?: SandboxToolSession;
   sandboxWorkspaceId?: string;
   sandboxPrincipalId?: string;
@@ -145,6 +169,231 @@ function textFromContent(content: unknown): string {
     .filter((part) => part.type === "text" && typeof part.text === "string")
     .map((part) => part.text)
     .join("");
+}
+
+function estimateStructuredTokens(value: unknown): number {
+  let visited = 0;
+  let tokens = 0;
+  const visit = (current: unknown, depth: number): void => {
+    if (++visited > 16_384 || depth > 24) {
+      tokens = Number.MAX_SAFE_INTEGER;
+      return;
+    }
+    if (typeof current === "string") tokens += estimateUnicodeTokens(current);
+    else if (typeof current === "number" || typeof current === "boolean") tokens += 1;
+    else if (Array.isArray(current)) {
+      tokens += 2;
+      for (const item of current) visit(item, depth + 1);
+    } else if (current && typeof current === "object") {
+      tokens += 2;
+      for (const [key, item] of Object.entries(current)) {
+        tokens += estimateUnicodeTokens(key) + 1;
+        visit(item, depth + 1);
+        if (tokens >= Number.MAX_SAFE_INTEGER) return;
+      }
+    }
+  };
+  visit(value, 0);
+  return Math.min(Number.MAX_SAFE_INTEGER, Math.ceil(tokens));
+}
+
+export function capacityFromModel(
+  model: Model<any> | undefined,
+): EfficiencyModelCapacity | undefined {
+  if (
+    !model ||
+    !Number.isSafeInteger(model.contextWindow) ||
+    !Number.isSafeInteger(model.maxTokens) ||
+    model.contextWindow <= 0 ||
+    model.maxTokens <= 0
+  )
+    return undefined;
+  const outputReserveTokens = Math.min(model.maxTokens, model.contextWindow);
+  // Pi exposes the combined maximum output ceiling, but does not expose a declared thinking
+  // reserve. Keep the full ceiling reserved for output and report no separate thinking reserve.
+  // The reasoning flag controls runtime behavior; it does not establish a token allocation.
+  return {
+    contextWindowTokens: model.contextWindow,
+    outputReserveTokens,
+    thinkingReserveTokens: 0,
+    safetyMarginTokens: 0,
+  };
+}
+
+function contextDemand(
+  systemTokens: number,
+  toolSchemaTokens: number,
+  messages: readonly unknown[],
+  requiredToolName?: string,
+): {
+  demand: ContextDemandEstimate;
+  messageIndexesByExchangeId: Map<string, number[]>;
+  currentMessageIndexes: number[];
+} {
+  const groups: Array<{
+    id: string;
+    indexes: number[];
+    userTokens: number;
+    assistantTokens: number;
+    required: boolean;
+  }> = [];
+  let current: (typeof groups)[number] | undefined;
+  let currentMessageIndex = -1;
+  for (const [index, value] of messages.entries()) {
+    const message = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+    const role = typeof message.role === "string" ? message.role : "unknown";
+    if (role === "user" || !current) {
+      current = {
+        id: `exchange-${index}`,
+        indexes: [],
+        userTokens: 0,
+        assistantTokens: 0,
+        required: false,
+      };
+      groups.push(current);
+    }
+    current.indexes.push(index);
+    const tokens = estimateStructuredTokens(message);
+    if (role === "user") {
+      current.userTokens += tokens;
+      currentMessageIndex = index;
+    } else current.assistantTokens += tokens;
+    if (
+      message.isError === true ||
+      (typeof message.toolName === "string" &&
+        (message.toolName === requiredToolName ||
+          classifyToolResultClass(message.toolName, false) === "control"))
+    )
+      current.required = true;
+  }
+  if (groups.length > 0) groups[groups.length - 1]!.required = true;
+  const currentGroup =
+    groups.find((group) => group.indexes.includes(currentMessageIndex)) ?? groups.at(-1);
+  const requiredFloorTokens = currentGroup?.assistantTokens ?? 0;
+  const exchanges = groups
+    .filter((group) => group !== currentGroup)
+    .map((group) => ({
+      id: group.id,
+      userTokens: group.userTokens,
+      assistantTokens: group.assistantTokens,
+      required: group.required,
+    }));
+  const currentMessageTokens =
+    currentGroup?.userTokens ??
+    (messages.length > 0 ? estimateStructuredTokens(messages[messages.length - 1]) : 0);
+  return {
+    demand: {
+      estimatedMaterialTokens:
+        systemTokens +
+        toolSchemaTokens +
+        currentMessageTokens +
+        requiredFloorTokens +
+        exchanges.reduce(
+          (sum, exchange) => sum + exchange.userTokens + exchange.assistantTokens,
+          0,
+        ),
+      estimateSource: "unicode_conservative",
+      hasLargeAuthorizedContext: false,
+      requiredOutputClass: "standard",
+      hasToolOrRetrieval: false,
+      hasAttachmentsOrArtifacts: false,
+      trustedPolicyFlags: [],
+      systemTokens,
+      currentMessageTokens,
+      toolSchemaTokens,
+      requiredFloorTokens,
+      exchanges,
+    },
+    messageIndexesByExchangeId: new Map(groups.map((group) => [group.id, group.indexes])),
+    currentMessageIndexes: currentGroup?.indexes ?? [],
+  };
+}
+
+function classifyToolResultClass(toolName: string, isError: boolean): ToolResultClass {
+  if (isError) return "error";
+  if (/admin|task_(?:accept|rework|cancel)|worker_(?:assign|cancel)/iu.test(toolName))
+    return "control";
+  if (/file|asset|artifact/iu.test(toolName)) return "artifact";
+  if (/memory|skill|worker/iu.test(toolName)) return "local";
+  return "external";
+}
+
+function toolBudgetClass(toolName: string): ToolResultForProjection["budgetClass"] {
+  if (/worker/iu.test(toolName)) return "worker";
+  if (/admin|task_|memory_(?:write|govern)/iu.test(toolName)) return "domain_write";
+  if (/file|asset|artifact|bash|powershell/iu.test(toolName)) return "host";
+  if (/history|search|read|memory|skill/iu.test(toolName)) return "domain_read";
+  return "core";
+}
+
+function compactToolResultText(text: string, maxTokens: number): string | undefined {
+  const digest = createHash("sha256").update(text).digest("hex");
+  const marker = `[Tool result compacted; chars=${text.length}; sha256=${digest}]`;
+  const markerTokens = estimateUnicodeTokens(marker) + 2;
+  if (maxTokens < markerTokens) return undefined;
+  let structural: unknown;
+  try {
+    structural = JSON.parse(text);
+  } catch {
+    structural = undefined;
+  }
+  if (structural && typeof structural === "object") {
+    const entries = Array.isArray(structural)
+      ? structural.map((value, index) => [String(index), value] as const)
+      : Object.entries(structural as Record<string, unknown>);
+    const preview: Record<string, unknown> | unknown[] = Array.isArray(structural) ? [] : {};
+    for (const [key, value] of entries) {
+      const keyOrIndex = Array.isArray(preview) ? Number(key) : key;
+      let projectedValue = value;
+      const candidateFor = (item: unknown) =>
+        Array.isArray(preview) ? [...preview, item] : { ...preview, [keyOrIndex]: item };
+      let candidate = candidateFor(projectedValue);
+      const candidateWithMarker = Array.isArray(candidate)
+        ? { _glassbox_compacted: true, preview: candidate }
+        : { ...candidate, _glassbox_compacted: true };
+      if (estimateUnicodeTokens(JSON.stringify(candidateWithMarker)) > maxTokens) {
+        const serializedValue = JSON.stringify(value) ?? "";
+        projectedValue = `[value omitted; chars=${serializedValue.length}; sha256=${createHash("sha256").update(serializedValue).digest("hex")}]`;
+        candidate = candidateFor(projectedValue);
+        const abbreviatedWithMarker = Array.isArray(candidate)
+          ? { _glassbox_compacted: true, preview: candidate }
+          : { ...candidate, _glassbox_compacted: true };
+        if (estimateUnicodeTokens(JSON.stringify(abbreviatedWithMarker)) > maxTokens) break;
+      }
+      if (Array.isArray(preview)) preview.push(projectedValue);
+      else (preview as Record<string, unknown>)[keyOrIndex as string] = projectedValue;
+    }
+    const candidate = Array.isArray(preview)
+      ? { _glassbox_compacted: true, preview }
+      : { ...preview, _glassbox_compacted: true };
+    const serialized = JSON.stringify(candidate);
+    if (estimateUnicodeTokens(serialized) <= maxTokens) return serialized;
+  }
+  let low = 0;
+  let high = Math.floor((maxTokens - markerTokens) / 2);
+  let best = marker;
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    const candidate =
+      middle === 0 ? marker : `${text.slice(0, middle)}\n${marker}\n${text.slice(-middle)}`;
+    if (estimateUnicodeTokens(candidate) <= maxTokens) {
+      best = candidate;
+      low = middle + 1;
+    } else high = middle - 1;
+  }
+  return best;
+}
+
+function toolResultText(
+  content: readonly { type: string; text?: string; data?: string }[],
+): string {
+  return content
+    .map((part) =>
+      part.type === "text" && typeof part.text === "string"
+        ? part.text
+        : "[non-text content omitted]",
+    )
+    .join("\n");
 }
 
 export function glassboxSystemPrompt(modelPrompt: string): string {
@@ -259,7 +508,21 @@ function normalizeEvent(
                   outputTokens: event.message.usage.output,
                   cacheReadTokens: event.message.usage.cacheRead,
                   cacheWriteTokens: event.message.usage.cacheWrite,
+                  ...(typeof event.message.usage.reasoning === "number"
+                    ? { reasoningTokens: event.message.usage.reasoning }
+                    : {}),
                   totalTokens: event.message.usage.totalTokens,
+                  ...(event.message.usage.cost
+                    ? {
+                        cost: {
+                          input: event.message.usage.cost.input,
+                          output: event.message.usage.cost.output,
+                          cacheRead: event.message.usage.cost.cacheRead,
+                          cacheWrite: event.message.usage.cost.cacheWrite,
+                          total: event.message.usage.cost.total,
+                        },
+                      }
+                    : {}),
                 },
               }
             : {}),
@@ -330,6 +593,12 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
   private readonly loader: KitLoader;
   private readonly sessions = new Map<string, ActiveSession>();
   private readonly runContexts = new Map<string, PiRunContext>();
+  private readonly modelCapacities = new Map<string, EfficiencyModelCapacity | undefined>();
+  private readonly staticContextEstimates = new Map<
+    string,
+    { systemTokens: number; toolSchemaTokens: number }
+  >();
+  private readonly thinkingLevels = new Map<string, string | null>();
   private initialized = false;
 
   constructor(private readonly options: PiSdkRuntimeOptions = {}) {
@@ -469,6 +738,15 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
       authorizedSkillNames,
       modelVisibleSkillNames,
       skillPolicy: structuredClone(resolvedSkills.policy ?? { source: "kit-profile" }),
+      modelCapacity:
+        this.modelCapacities.get(session.sessionId) ?? capacityFromModel(session.model),
+      staticContextEstimate: this.staticContextEstimates.get(session.sessionId),
+      thinkingLevel: this.thinkingLevels.get(session.sessionId) ?? null,
+      resultProjectionEvidence: new Map(),
+      turnToolResults: [],
+      duplicateCalls: [],
+      duplicateCallIndexes: new Map(),
+      retryableDuplicateKeys: new Set(),
       sandboxToolSession,
       sandboxWorkspaceId: sandboxToolSession ? context?.workspaceId : undefined,
       sandboxPrincipalId: sandboxToolSession ? context?.caller?.principalId : undefined,
@@ -492,6 +770,8 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
     const basePrompt = glassboxSystemPrompt(
       this.loader.modelPrompt(profile.name, modelVisibleSkillNames ?? []),
     );
+    let systemPromptTokens = estimateUnicodeTokens(basePrompt);
+    let toolSchemaTokens = 0;
     let runtimeSessionId: string | undefined;
     const promptForRun = () => {
       const runContext = runtimeSessionId ? this.runContexts.get(runtimeSessionId) : undefined;
@@ -525,7 +805,282 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
       // assembled prompt through the public event before the provider sees it.
       extensionFactories: [
         (pi) => {
-          pi.on("before_agent_start", () => ({ systemPrompt: promptForRun() }));
+          pi.on("before_agent_start", () => {
+            const systemPrompt = promptForRun();
+            systemPromptTokens = estimateUnicodeTokens(systemPrompt);
+            const active = runtimeSessionId ? this.sessions.get(runtimeSessionId) : undefined;
+            if (active?.staticContextEstimate)
+              active.staticContextEstimate.systemTokens = systemPromptTokens;
+            return { systemPrompt };
+          });
+          pi.on("context", (event, ctx) => {
+            if (!runtimeSessionId) {
+              ctx.abort();
+              return undefined;
+            }
+            const active = this.sessions.get(runtimeSessionId);
+            const capacity = active?.modelCapacity;
+            const staticEstimate = active?.staticContextEstimate;
+            if (!active || !capacity || !staticEstimate) {
+              if (active) active.pendingBudgetFailure = "context_budget_capacity_unknown";
+              ctx.abort();
+              return undefined;
+            }
+            const runContext = this.runContexts.get(runtimeSessionId);
+            const measured = contextDemand(
+              staticEstimate.systemTokens,
+              staticEstimate.toolSchemaTokens,
+              event.messages,
+              runContext?.requiredToolName,
+            );
+            const projection = projectContextBudget(measured.demand, capacity);
+            if (!projection.ok) {
+              active.contextBudgetEvidence = {
+                policyVersion: "p5a-context-v1",
+                estimateSource: "unicode_conservative",
+                overflow: projection.overflow.kind,
+                capacityTokens: capacity.contextWindowTokens,
+              };
+              active.pendingBudgetFailure = `context_budget_overflow:${projection.overflow.kind}`;
+              ctx.abort();
+              return undefined;
+            }
+            const included = new Set(projection.projection.includedExchangeIds);
+            const keep = new Set(measured.currentMessageIndexes);
+            for (const exchangeId of included) {
+              for (const index of measured.messageIndexesByExchangeId.get(exchangeId) ?? [])
+                keep.add(index);
+            }
+            const omitted = projection.projection.omittedExchangeIds.length;
+            if (active.turnInputBudgetTokens === undefined)
+              active.turnInputBudgetTokens = Math.max(
+                0,
+                projection.projection.budgetTokens - projection.projection.projectedTokens,
+              );
+            active.contextBudgetEvidence = {
+              policyVersion: "p5a-context-v1",
+              estimateSource: "unicode_conservative",
+              capacityTokens: capacity.contextWindowTokens,
+              outputReserveTokens: capacity.outputReserveTokens,
+              thinkingReserveTokens: capacity.thinkingReserveTokens,
+              inputBudgetTokens: projection.projection.budgetTokens,
+              projectedTokens: projection.projection.projectedTokens,
+              omittedExchangeCount: omitted,
+              overflow: null,
+            };
+            return keep.size === event.messages.length
+              ? undefined
+              : { messages: event.messages.filter((_message, index) => keep.has(index)) };
+          });
+          pi.on("tool_call", (event) => {
+            if (!runtimeSessionId) return { block: true, reason: "tool_admission_context_missing" };
+            const active = this.sessions.get(runtimeSessionId);
+            const runContext = this.runContexts.get(runtimeSessionId);
+            if (!active || !runContext?.caller)
+              return { block: true, reason: "tool_admission_context_missing" };
+            const caller = runContext.caller;
+            const authorityScope = [
+              caller.principalId,
+              caller.scope.connectionId,
+              caller.scope.chatId,
+              caller.scope.senderId,
+            ].join(":");
+            const input = event.input;
+            const identity = {
+              authorityScope,
+              resourceId: active.binding.conversationId,
+              toolName: event.toolName,
+              input: structuredClone(input),
+            };
+            let record = admitDuplicateCall(active.duplicateCalls, identity);
+            if (
+              !record.admitted &&
+              record.reason === "retry_limit_reached" &&
+              active.retryableDuplicateKeys.has(record.key)
+            ) {
+              record = admitDuplicateCall(active.duplicateCalls, {
+                ...identity,
+                retryAllowed: true,
+              });
+              if (record.admitted) active.retryableDuplicateKeys.delete(record.key);
+            }
+            if (!record.admitted)
+              return { block: true, reason: `duplicate_tool_call:${record.reason}` };
+            active.duplicateCallIndexes.set(event.toolCallId, active.duplicateCalls.length);
+            active.duplicateCalls.push({
+              authorityScope,
+              resourceId: active.binding.conversationId,
+              toolName: event.toolName,
+              input: identity.input,
+              attempt: record.attempt,
+              state: "running",
+            });
+            return undefined;
+          });
+          pi.on("tool_result", (event, ctx) => {
+            if (!runtimeSessionId) {
+              ctx.abort();
+              return undefined;
+            }
+            const active = this.sessions.get(runtimeSessionId);
+            const capacity = active?.modelCapacity;
+            const staticEstimate = active?.staticContextEstimate;
+            if (!active || !capacity || !staticEstimate) {
+              if (active) active.pendingBudgetFailure = "tool_result_budget_capacity_unknown";
+              ctx.abort();
+              return undefined;
+            }
+            const content = event.content as Array<{ type: string; text?: string; data?: string }>;
+            const text = toolResultText(content);
+            const duplicateIndex = active.duplicateCallIndexes.get(event.toolCallId);
+            if (duplicateIndex !== undefined) {
+              const record = active.duplicateCalls[duplicateIndex];
+              if (record) record.state = event.isError ? "failed" : "succeeded";
+              const failureCode = event.isError ? safeToolFailureCode(event.content) : undefined;
+              if (
+                record &&
+                (failureCode === "provider_unavailable" || failureCode === "provider_failed")
+              ) {
+                const admission = admitDuplicateCall(active.duplicateCalls, {
+                  authorityScope: record.authorityScope,
+                  resourceId: record.resourceId,
+                  toolName: record.toolName,
+                  input: record.input,
+                  retryAllowed: true,
+                });
+                active.retryableDuplicateKeys.add(admission.key);
+              }
+              active.duplicateCallIndexes.delete(event.toolCallId);
+            }
+            const resultClass = classifyToolResultClass(event.toolName, event.isError);
+            const remainingTokens = active.turnInputBudgetTokens;
+            if (remainingTokens === undefined) {
+              active.pendingBudgetFailure = "tool_result_budget_turn_not_started";
+              ctx.abort();
+              return undefined;
+            }
+            const budgetClass = toolBudgetClass(event.toolName);
+            const policy: ToolResultBudgetPolicy = {
+              policyVersion: "p5a-tool-result-v1",
+              perTurnTokens: remainingTokens,
+              singleResultTokens: {
+                external: remainingTokens,
+                local: remainingTokens,
+                artifact: remainingTokens,
+                error: remainingTokens,
+                control: remainingTokens,
+                unknown: remainingTokens,
+              },
+            };
+            const candidate: ToolResultForProjection = {
+              callId: event.toolCallId,
+              toolName: event.toolName,
+              budgetClass,
+              resultClass,
+              projection: "full",
+              text,
+            };
+            const hasNonTextContent = content.some((part) => part.type !== "text");
+            if (hasNonTextContent) {
+              candidate.projection = "compact";
+              candidate.projectedText = text;
+            }
+            const initial = projectToolResultsForTurn(
+              [...active.turnToolResults, candidate],
+              policy,
+            );
+            const beforeTokens = estimateStructuredTokens(content);
+            const currentAdmission =
+              "calls" in initial
+                ? initial.calls.find((call) => call.callId === event.toolCallId)
+                : undefined;
+            if (currentAdmission?.admitted) {
+              active.resultProjectionEvidence.set(event.toolCallId, {
+                class: resultClass,
+                mode: hasNonTextContent ? "compact" : "full",
+                beforeTokens,
+                afterTokens: beforeTokens,
+                policyVersion: policy.policyVersion,
+                omitted: false,
+              });
+              active.turnToolResults.push(candidate);
+              return hasNonTextContent ? { content: [{ type: "text", text }] } : undefined;
+            }
+            const alreadyUsedTokens = "calls" in initial ? initial.usedTokens : remainingTokens;
+            const availableForThisResult = Math.max(0, remainingTokens - alreadyUsedTokens);
+            const compact = compactToolResultText(text, availableForThisResult);
+            if (compact === undefined) {
+              active.pendingBudgetFailure = "tool_result_budget_overflow:required_result_floor";
+              ctx.abort();
+              return undefined;
+            }
+            const compactCandidate: ToolResultForProjection = {
+              ...candidate,
+              projection: "compact",
+              projectedText: compact,
+            };
+            const compacted = projectToolResultsForTurn(
+              [...active.turnToolResults, compactCandidate],
+              policy,
+            );
+            const compactAdmission =
+              "calls" in compacted
+                ? compacted.calls.find((call) => call.callId === event.toolCallId)
+                : undefined;
+            if (!compactAdmission?.admitted) {
+              active.pendingBudgetFailure = "tool_result_budget_overflow:required_result_floor";
+              ctx.abort();
+              return undefined;
+            }
+            const afterTokens = estimateUnicodeTokens(compact);
+            active.resultProjectionEvidence.set(event.toolCallId, {
+              class: resultClass,
+              mode: "compact",
+              beforeTokens,
+              afterTokens,
+              policyVersion: policy.policyVersion,
+              omitted: false,
+            });
+            active.turnToolResults.push(compactCandidate);
+            return {
+              content: [{ type: "text", text: compact }],
+            };
+          });
+          pi.on("before_provider_request", (event, ctx) => {
+            if (!runtimeSessionId) {
+              ctx.abort();
+              return undefined;
+            }
+            const active = this.sessions.get(runtimeSessionId);
+            const capacity = active?.modelCapacity;
+            if (!active || !capacity) {
+              if (active) active.pendingBudgetFailure = "provider_budget_capacity_unknown";
+              ctx.abort();
+              return undefined;
+            }
+            const payloadTokens = estimateStructuredTokens(event.payload);
+            const maxInputTokens =
+              capacity.contextWindowTokens -
+              capacity.outputReserveTokens -
+              capacity.thinkingReserveTokens -
+              capacity.safetyMarginTokens;
+            if (payloadTokens > maxInputTokens) {
+              active.contextBudgetEvidence = {
+                ...active.contextBudgetEvidence,
+                policyVersion: "p5a-context-v1",
+                estimateSource: "unicode_conservative",
+                providerPayloadTokens: payloadTokens,
+                inputBudgetTokens: maxInputTokens,
+                outputReserveTokens: capacity.outputReserveTokens,
+                thinkingReserveTokens: capacity.thinkingReserveTokens,
+                safetyMarginTokens: capacity.safetyMarginTokens,
+                overflow: "provider_payload_exceeds_capacity",
+              };
+              active.pendingBudgetFailure =
+                "context_budget_overflow:provider_payload_exceeds_capacity";
+              ctx.abort();
+            }
+          });
         },
       ],
       additionalSkillPaths: [path.join(kitPath, "skills")],
@@ -567,23 +1122,50 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
     for (const tool of sandboxTools)
       if (!GLASSBOX_HOST_EXCLUDED_PI_TOOLS.includes(tool.name))
         throw new Error("Sandbox registered an unexpected Pi tool");
+    toolSchemaTokens = estimateStructuredTokens(
+      selectedTools.map((tool) => ({
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.parameters,
+      })),
+    );
+    systemPromptTokens = estimateUnicodeTokens(basePrompt);
     const customToolNames = selectedTools.map((tool) => tool.name);
     const tools = Array.from(new Set(customToolNames));
     const configured = await this.options.resolveModel?.();
+    const configuredModel = configured?.model ?? this.options.model;
     const created = await createAgentSession({
       cwd,
       agentDir,
       resourceLoader,
       sessionManager,
       settingsManager,
-      model: configured?.model ?? this.options.model,
+      model: configuredModel,
       modelRuntime: configured?.modelRuntime ?? this.options.modelRuntime,
       noTools: "all",
       tools,
       customTools: selectedTools,
-      thinkingLevel: profile.thinkingLevel === "none" ? "minimal" : profile.thinkingLevel,
+      thinkingLevel:
+        configuredModel?.reasoning === true
+          ? profile.thinkingLevel === "none"
+            ? "minimal"
+            : profile.thinkingLevel
+          : undefined,
     });
     runtimeSessionId = created.session.sessionId;
+    const actualModel = created.session.model ?? configuredModel;
+    const actualThinkingLevel =
+      actualModel?.reasoning === true
+        ? profile.thinkingLevel === "none"
+          ? "minimal"
+          : profile.thinkingLevel
+        : null;
+    this.modelCapacities.set(runtimeSessionId, capacityFromModel(actualModel));
+    this.staticContextEstimates.set(runtimeSessionId, {
+      systemTokens: systemPromptTokens,
+      toolSchemaTokens,
+    });
+    this.thinkingLevels.set(runtimeSessionId, actualThinkingLevel);
     await created.session.bindExtensions({});
     created.session.setActiveToolsByName(customToolNames);
     return created.session;
@@ -591,6 +1173,16 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
 
   getRunContext(runtimeSessionId: string): PiRunContext | undefined {
     return this.runContexts.get(runtimeSessionId);
+  }
+
+  getModelCapacity(runtimeSessionId: string): EfficiencyModelCapacity | undefined {
+    return this.sessions.get(runtimeSessionId)?.modelCapacity;
+  }
+
+  getStaticContextEstimate(
+    runtimeSessionId: string,
+  ): { systemTokens: number; toolSchemaTokens: number } | undefined {
+    return this.sessions.get(runtimeSessionId)?.staticContextEstimate;
   }
 
   async run(
@@ -619,8 +1211,17 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
     let text = "";
     let eventQueue = Promise.resolve();
     let evidenceFailed = false;
+    let turnStartedAt: number | undefined;
+    active.duplicateCalls = [];
+    active.duplicateCallIndexes.clear();
+    active.retryableDuplicateKeys.clear();
 
     const unsubscribe = active.session.subscribe((event) => {
+      if (event.type === "turn_start") {
+        turnStartedAt = performance.now();
+        active.turnToolResults = [];
+        active.turnInputBudgetTokens = undefined;
+      }
       const normalized = normalizeEvent(active.session.sessionId, event, run, context);
       if (normalized?.type === "session_start") {
         normalized.data = {
@@ -634,7 +1235,32 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
           authorizedSkills: active.authorizedSkillNames,
           modelVisibleSkills: active.modelVisibleSkillNames,
           skillPolicy: active.skillPolicy,
+          modelCapacity: active.modelCapacity
+            ? {
+                contextWindowTokens: active.modelCapacity.contextWindowTokens,
+                outputReserveTokens: active.modelCapacity.outputReserveTokens,
+                thinkingReserveTokens: active.modelCapacity.thinkingReserveTokens,
+                safetyMarginTokens: active.modelCapacity.safetyMarginTokens,
+              }
+            : null,
+          thinkingLevel: active.thinkingLevel,
         };
+      }
+      if (normalized?.type === "tool_result" && event.type === "tool_execution_end") {
+        const projection = active.resultProjectionEvidence.get(event.toolCallId);
+        if (projection) {
+          normalized.data = { ...normalized.data, projection };
+          active.resultProjectionEvidence.delete(event.toolCallId);
+        }
+      }
+      if (normalized?.type === "turn_end") {
+        normalized.data = {
+          ...normalized.data,
+          durationMs:
+            turnStartedAt === undefined ? null : Math.max(0, performance.now() - turnStartedAt),
+          contextBudget: active.contextBudgetEvidence ?? null,
+        };
+        turnStartedAt = undefined;
       }
       if (normalized && this.options.onEvent) {
         eventQueue = eventQueue.then(async () => {
@@ -675,8 +1301,16 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
       }
     });
     try {
+      active.pendingBudgetFailure = undefined;
       await active.session.prompt(prompt, { source: "rpc" });
       await eventQueue;
+      if (active.pendingBudgetFailure)
+        return {
+          status: "error",
+          text: "",
+          toolCalls: [],
+          error: active.pendingBudgetFailure,
+        };
       if (evidenceFailed)
         return { status: "error", text: "", toolCalls: [], error: "trace_write_failed" };
       const last = [...active.session.messages]
@@ -712,9 +1346,10 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
     } catch (error) {
       return {
         status: "error",
-        text,
-        toolCalls,
-        error: error instanceof Error ? error.message : String(error),
+        text: active.pendingBudgetFailure ? "" : text,
+        toolCalls: active.pendingBudgetFailure ? [] : toolCalls,
+        error:
+          active.pendingBudgetFailure ?? (error instanceof Error ? error.message : String(error)),
       };
     } finally {
       unsubscribe();
@@ -751,6 +1386,9 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
         } finally {
           active.session.dispose();
           this.sessions.delete(runtimeSessionId);
+          this.modelCapacities.delete(runtimeSessionId);
+          this.staticContextEstimates.delete(runtimeSessionId);
+          this.thinkingLevels.delete(runtimeSessionId);
           this.runContexts.delete(runtimeSessionId);
         }
       }

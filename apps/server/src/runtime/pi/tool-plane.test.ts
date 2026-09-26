@@ -70,6 +70,7 @@ describe("P5 tool plane origins", () => {
     for (const name of [
       "owner_group_admin",
       "owner_memory_admin",
+      "owner_model_admin",
       "skill_read",
       "group_history_search",
       "owner_history_search",
@@ -88,6 +89,13 @@ describe("P5 tool plane origins", () => {
     expect(toolDescriptor("owner_memory_admin")?.authorization).toEqual({
       action: ["memory:read", "memory:write", "memory:govern"],
       resource: "owner-memory",
+    });
+  });
+
+  it("describes Owner model reading and switching as separate protected Actions", () => {
+    expect(toolDescriptor("owner_model_admin")?.authorization).toEqual({
+      action: ["model:read", "model:switch"],
+      resource: "owner-control",
     });
   });
 

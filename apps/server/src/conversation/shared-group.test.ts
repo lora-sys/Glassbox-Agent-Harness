@@ -108,6 +108,35 @@ afterEach(async () => {
 });
 
 describe("shared group conversation and durable actor routing", () => {
+  it("loads more than forty short authorized exchanges without a fixed twenty-run cutoff", async () => {
+    const store = await setupStore();
+    const runIds: string[] = [];
+    for (let index = 0; index < 42; index++) {
+      const accepted = await store.conversations.acceptIncoming({
+        agentId: "personal",
+        scope: ownerPrivate.scope,
+        messageId: `budget-history-${index}`,
+        text: `Question ${index}`,
+        executionRef: "pi:test",
+      });
+      runIds.push(accepted.run.id);
+      const lease = await store.lifecycle.claimQueuedRun(ownerPrivate, accepted.run.id);
+      await lease.settle("succeeded", `Answer ${index}`);
+    }
+    const next = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: ownerPrivate.scope,
+      messageId: "budget-history-next",
+      text: "What did we discuss?",
+      executionRef: "pi:test",
+    });
+    const input = await store.conversations.loadRunInput(ownerPrivate, next.run.id);
+    expect(input.history).toHaveLength(84);
+    expect(input.history[0]).toEqual({ role: "user", text: "Question 0" });
+    expect(input.historyRunIds).toEqual(runIds);
+    expect(input.historyScanTruncated).toBe(false);
+  });
+
   it("excludes unsafe exchanges from future context without rewriting results, including after reopen", async () => {
     const directory = await mkdtemp(join(tmpdir(), "glassbox-context-exclusion-"));
     tempDirectories.push(directory);
@@ -1158,7 +1187,7 @@ describe("shared group conversation and durable actor routing", () => {
     expect(JSON.stringify(visitorInput)).not.toContain(canarySecret);
   });
 
-  it("excludes same-principal prior run from history if the grant authorizing that prior run was revoked", async () => {
+  it("rebuilds protected history after revocation instead of reusing an old projection", async () => {
     const store = await openStore();
     await store.conversations.createAgent("personal");
     await store.identities.bindOwner("owner", ownerGroup.scope);
@@ -1197,6 +1226,22 @@ describe("shared group conversation and durable actor routing", () => {
     const lease1 = await store.lifecycle.claimQueuedRun(ownerGroup, run1Res.run.id);
     await lease1.settle("succeeded", "turn 1 confidential answer");
 
+    const beforeRevoke = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: ownerGroup.scope,
+      messageId: "msg-owner-before-revoke",
+      text: "read history before revoke",
+      executionRef: "executor-main",
+    });
+    const beforeRevokeInput = await store.conversations.loadRunInput(
+      ownerGroup,
+      beforeRevoke.run.id,
+    );
+    expect(beforeRevokeInput.history).toEqual([
+      { role: "user", text: "turn 1 under grant1" },
+      { role: "assistant", text: "turn 1 confidential answer" },
+    ]);
+
     // Revoke the grant that authorized Run 1
     await store.authorization.revoke(grantRunCreate1);
 
@@ -1224,6 +1269,7 @@ describe("shared group conversation and durable actor routing", () => {
     // Prior run 1 authorized by revoked grant MUST be excluded from history
     expect(input2.history).toHaveLength(0);
     expect(JSON.stringify(input2)).not.toContain("turn 1 confidential answer");
+    expect(JSON.stringify(input2)).not.toContain("read history before revoke");
   });
 
   it("excludes cross-actor prior run from history if the grant authorizing that prior run was revoked", async () => {

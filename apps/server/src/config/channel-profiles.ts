@@ -8,6 +8,7 @@ import { parseOneBotConfig, type OneBotConnectionConfig } from "../channels/oneb
 interface StoredChannel extends Omit<ChannelSaveInput, "token"> {
   credentialSlot: string;
   autoConnect: boolean;
+  modelOverrideProfileId?: string;
 }
 interface Settings {
   version: 1;
@@ -102,6 +103,9 @@ function parseChannel(value: unknown): StoredChannel {
     executionRef: executionReference(input.executionRef),
     credentialSlot: identifier(input.credentialSlot),
     autoConnect: input.autoConnect,
+    ...(input.modelOverrideProfileId === undefined
+      ? {}
+      : { modelOverrideProfileId: identifier(input.modelOverrideProfileId) }),
   };
   try {
     const config = toConfig(channel);
@@ -199,6 +203,7 @@ export class ChannelProfileStore {
     config: OneBotConnectionConfig;
     token?: string;
     executionRef: string;
+    modelOverrideProfileId?: string;
     autoConnect: boolean;
   } {
     const channel = this.#find(id);
@@ -209,6 +214,9 @@ export class ChannelProfileStore {
       config: toConfig(channel),
       ...(token === undefined ? {} : { token }),
       executionRef: channel.executionRef,
+      ...(channel.modelOverrideProfileId === undefined
+        ? {}
+        : { modelOverrideProfileId: channel.modelOverrideProfileId }),
       autoConnect: channel.autoConnect,
     };
   }
@@ -263,6 +271,8 @@ export class ChannelProfileStore {
       const credentials = { ...this.#settings.credentials };
       channel.credentialSlot = current?.credentialSlot ?? channel.credentialSlot;
       channel.autoConnect = current?.autoConnect ?? false;
+      if (current?.executionRef === channel.executionRef && current.modelOverrideProfileId)
+        channel.modelOverrideProfileId = current.modelOverrideProfileId;
       if (token === null) delete credentials[channel.credentialSlot];
       else if (typeof token === "string") credentials[channel.credentialSlot] = token;
       const channels = this.#settings.channels.filter((item) => item.id !== channel.id);
@@ -283,6 +293,27 @@ export class ChannelProfileStore {
       );
       await this.#persist(channels, this.#settings.credentials);
       return this.#public(this.#find(id));
+    });
+  }
+
+  /** Owner model selection is persisted separately from the operator's channel execution setting. */
+  setModelOverride(id: string, profileId: string | null): Promise<void> {
+    if (
+      profileId !== null &&
+      (typeof profileId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$/u.test(profileId))
+    )
+      throw new ChannelConfigurationError("Invalid model profile identifier");
+    return this.#enqueue(async () => {
+      const current = this.#find(id);
+      const { modelOverrideProfileId: _old, ...base } = current;
+      const updated = parseChannel({
+        ...base,
+        ...(profileId === null ? {} : { modelOverrideProfileId: profileId }),
+      });
+      const channels = this.#settings.channels.map((channel) =>
+        channel.id === current.id ? updated : channel,
+      );
+      await this.#persist(channels, this.#settings.credentials);
     });
   }
 

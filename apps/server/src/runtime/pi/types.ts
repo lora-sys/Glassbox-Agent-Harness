@@ -1,4 +1,5 @@
 import type { Conversation, AgentRun } from "@glassbox/contracts";
+import type { ModelCapacity as EfficiencyModelCapacity } from "../../efficiency/index.js";
 
 export type PiRuntimeProfileName =
   | "main-agent"
@@ -132,5 +133,12 @@ export interface PiRuntimeAdapter {
   disposeSession?(runtimeSessionId: string): Promise<void>;
   disposeWorkspaceSessions?(principalId: string, workspaceId: string): Promise<void>;
   getRunContext?(runtimeSessionId: string): PiRunContext | undefined;
+  getModelCapacity?(runtimeSessionId: string): EfficiencyModelCapacity | undefined;
+  getStaticContextEstimate?(runtimeSessionId: string):
+    | {
+        systemTokens: number;
+        toolSchemaTokens: number;
+      }
+    | undefined;
   cleanup(): Promise<void>;
 }

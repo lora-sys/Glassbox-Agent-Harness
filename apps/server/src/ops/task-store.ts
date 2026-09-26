@@ -526,6 +526,49 @@ export class TaskStore {
     });
   }
 
+  /** Loads only caller-authorized durable records for the Ops health projection. */
+  async getOpsHealthRecords(
+    caller: CallerContext,
+    evidence?: { runId?: string; conversationId?: string },
+  ): Promise<{ tasks: AgentTask[]; attempts: TaskAttempt[]; bindings: WorkerBinding[] }> {
+    return this.db.transaction(async (tx) => {
+      const taskIdsResult = await tx.execute("SELECT id FROM tasks");
+      const visibleIds: string[] = [];
+      for (const row of taskIdsResult.rows) {
+        const id = stringColumn(row, "id");
+        const decision = await evaluate(tx, {
+          caller,
+          resourceId: `task-${id}`,
+          action: "task:read",
+          ...evidence,
+        });
+        if (decision.decision === "ALLOW") visibleIds.push(id);
+      }
+
+      if (!visibleIds.length) return { tasks: [], attempts: [], bindings: [] };
+      const placeholders = visibleIds.map(() => "?").join(",");
+      const args = visibleIds as InValue[];
+      const taskRows = await tx.execute({
+        sql: `SELECT * FROM tasks WHERE id IN (${placeholders})`,
+        args,
+      });
+      const attemptRows = await tx.execute({
+        sql: `SELECT * FROM task_attempts WHERE task_id IN (${placeholders})`,
+        args,
+      });
+      const bindingRows = await tx.execute({
+        sql: `SELECT b.* FROM worker_bindings b JOIN tasks t ON t.active_attempt_id = b.task_attempt_id WHERE t.id IN (${placeholders}) AND t.status NOT IN ('DONE', 'ACCEPTED', 'FAILED', 'CANCELED')`,
+        args,
+      });
+
+      return {
+        tasks: taskRows.rows.map(parseTask),
+        attempts: attemptRows.rows.map(parseAttempt),
+        bindings: bindingRows.rows.map(parseBinding),
+      };
+    });
+  }
+
   async createAttempt(params: {
     taskId: string;
     attemptNumber?: number;

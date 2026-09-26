@@ -225,6 +225,8 @@ export function createApplicationFixtureScope() {
       memberRole?: () => "owner" | "admin" | "member";
       /** One provider mutation to reject after caller authorization has passed. */
       failAction?: string;
+      /** Isolated Pi config directory for tests that exercise native Pi model routing. */
+      piAgentDirectory?: string | null;
       /** Applies provider-side state changes before the fake peer answers an action. */
       onAction?: (action: Action) => void;
     } = {},
@@ -311,6 +313,7 @@ export function createApplicationFixtureScope() {
         dataDirectory: directory,
         databasePath: options.persistentDatabase ? join(directory, "glassbox.db") : ":memory:",
         kitPath: fileURLToPath(new URL("../runtime/pi/fixtures/lora-pi-kit", import.meta.url)),
+        piAgentDirectory: options.piAgentDirectory,
         models,
         executors,
       });

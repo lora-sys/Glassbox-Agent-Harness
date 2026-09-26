@@ -42,6 +42,33 @@ afterEach(async () => {
 });
 
 describe("OpsReconciler safety", () => {
+  it("keeps event-loss health stale until a fresh snapshot succeeds", async () => {
+    const store = await storeAt();
+    const bridge = new FakeHerdrBridge("session-1");
+    const reconciler = new OpsReconciler(store.tasks, bridge);
+    const { attempt } = await taskWithWorker(store, bridge);
+    const snapshot = await bridge.getSnapshot();
+    await reconciler.reconcileSnapshot(snapshot);
+    const originalGetSnapshot = bridge.getSnapshot.bind(bridge);
+    vi.spyOn(bridge, "getSnapshot").mockRejectedValueOnce(new Error("snapshot unavailable"));
+    await expect(
+      reconciler.handleEvent({
+        type: "events.lost",
+        sessionId: "session-1",
+        workspaceId: "",
+        paneId: "",
+        timestamp: new Date().toISOString(),
+      }),
+    ).rejects.toThrow("snapshot unavailable");
+    expect(reconciler.healthObservation().eventsLost).toBe(true);
+    expect((await store.tasks.getWorkerBinding(attempt.id))?.lastObservedAgentState).toBe(
+      "unknown",
+    );
+    await reconciler.reconcileSnapshot(await originalGetSnapshot());
+    expect(reconciler.healthObservation().eventsLost).toBe(false);
+    expect(reconciler.healthObservation().lastSuccessfulReconciliationAt).not.toBeNull();
+  });
+
   it("resolves a recovered session alert after snapshot reconciliation without hiding task failures", async () => {
     const store = await storeAt();
     const bridge = new FakeHerdrBridge("session-1");

@@ -11,6 +11,9 @@ export interface ExecutionInput {
   run: RunRecord;
   text: string;
   history: Array<{ role: "user" | "assistant"; text: string }>;
+  historyRunIds?: string[];
+  historyScanTruncated?: boolean;
+  historyOmittedRunIds?: string[];
   /** Only present when saved for this exact execution configuration and Conversation. */
   providerSessionId: string | null;
   signal: AbortSignal;
@@ -21,6 +24,8 @@ export interface ExecutionResult {
   status: "succeeded" | "failed" | "cancelled" | "interrupted" | "unknown";
   text?: string;
   providerSessionId?: string;
+  /** The selected model was rejected before any provider request or Tool call. */
+  failureCode?: "pre_provider_context_overflow" | "model_capacity_unknown";
 }
 
 export interface RunExecutionAdapter {

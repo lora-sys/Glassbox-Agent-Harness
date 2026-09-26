@@ -2,6 +2,7 @@ import { mkdir } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { randomBytes } from "node:crypto";
 import type { IncomingMessage } from "node:http";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import lockfile from "proper-lockfile";
 import { ModelProfileStore } from "../config/model-profiles.js";
 import { loadAgentOperations } from "../config/agent-operations.js";
@@ -20,6 +21,8 @@ export async function openManagementRuntime(options: {
   status: () => unknown;
   doctor: () => unknown;
   databasePath?: string;
+  /** Override the Pi config source. Pass null to disable it in isolated tests. */
+  piAgentDirectory?: string | null;
   executors?: ReadonlyMap<string, RunExecutionAdapter>;
 }) {
   if (!isAbsolute(options.dataDirectory)) throw new Error("Data directory must be absolute");
@@ -35,6 +38,8 @@ export async function openManagementRuntime(options: {
     application = await ManagementApplication.open({
       dataDirectory: options.dataDirectory,
       models,
+      piAgentDirectory:
+        options.piAgentDirectory === undefined ? getAgentDir() : options.piAgentDirectory,
       databasePath: options.databasePath,
       executors: options.executors,
       ops: await loadAgentOperations(options.dataDirectory, options.databasePath),

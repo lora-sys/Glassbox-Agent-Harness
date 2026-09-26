@@ -35,6 +35,7 @@ import { QQ_CAPABILITIES, type QqCapabilityRisk } from "../../channels/onebot/ca
 import { GROUP_HISTORY_SEARCH_TOOL, OWNER_HISTORY_SEARCH_TOOL } from "./history-tools.js";
 import { OWNER_MEMORY_ADMIN_TOOL } from "./owner-memory-tools.js";
 import { OWNER_GROUP_ADMIN_TOOL } from "./owner-tools.js";
+import { OWNER_MODEL_ADMIN_TOOL } from "./owner-model-tools.js";
 import { OPS_TOOL_NAMES } from "./ops-tools.js";
 import { SKILL_READ_TOOL } from "./skill-tools.js";
 import { WEB_FETCH_TOOL, WEB_SEARCH_TOOL } from "./web-tools.js";
@@ -392,6 +393,19 @@ const DOMAIN_TOOL_DESCRIPTORS: readonly ToolDescriptor[] = Object.freeze([
     availability: "none",
     resultProjection: "projected",
     grounding: "direct_observation",
+    budgetClass: "core",
+  },
+  {
+    name: OWNER_MODEL_ADMIN_TOOL,
+    origin: "glassbox_domain",
+    schemaVersion: "owner-model-admin-v1",
+    riskClass: "write",
+    provider: "glassbox-management",
+    discovery: "owner_private",
+    authorization: { action: ["model:read", "model:switch"], resource: "owner-control" },
+    availability: "none",
+    resultProjection: "projected",
+    grounding: "local_computation",
     budgetClass: "core",
   },
   {

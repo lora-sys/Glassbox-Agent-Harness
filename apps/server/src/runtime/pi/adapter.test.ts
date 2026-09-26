@@ -11,7 +11,21 @@ import type {
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { glassboxSystemPrompt, PiSdkRuntimeAdapter } from "./adapter.js";
+import { capacityFromModel, glassboxSystemPrompt, PiSdkRuntimeAdapter } from "./adapter.js";
+
+it("does not invent a thinking reserve when Pi exposes only the combined output ceiling", () => {
+  const model = {
+    contextWindow: 8_192,
+    maxTokens: 4_096,
+    reasoning: true,
+  } as never;
+  expect(capacityFromModel(model)).toEqual({
+    contextWindowTokens: 8_192,
+    outputReserveTokens: 4_096,
+    thinkingReserveTokens: 0,
+    safetyMarginTokens: 0,
+  });
+});
 
 it("does not treat a context-hidden tool as an unimplemented product capability", () => {
   const prompt = glassboxSystemPrompt("Base prompt");
@@ -321,10 +335,244 @@ describe("PiSdkRuntimeAdapter", () => {
     await adapter.cleanup();
   });
 
+  it("shares the Tool-result turn budget, compacts structured overflow, and removes image payloads", async () => {
+    const runtimeBaseDir = await mkdtemp(join(tmpdir(), "glassbox-pi-tool-budget-"));
+    directories.push(runtimeBaseDir);
+    const model = {
+      id: "budget-model",
+      name: "Budget model",
+      api: "openai-completions",
+      provider: "fixture-provider",
+      baseUrl: "http://fixture.invalid",
+      reasoning: false,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 10_000,
+      maxTokens: 128,
+    } as never;
+    let providerCalls = 0;
+    let firstToolExecutions = 0;
+    let secondCallResults: string[] = [];
+    const modelRuntime = {
+      hasConfiguredAuth: () => true,
+      checkAuth: async () => undefined,
+      isUsingOAuth: () => false,
+      streamSimple: (
+        _model: unknown,
+        context: { messages: Array<{ role: string; content?: unknown }> },
+      ) => {
+        providerCalls++;
+        if (providerCalls === 2) {
+          secondCallResults = context.messages
+            .filter((message) => message.role === "toolResult")
+            .map((message) => {
+              const content = message.content as Array<{ type: string; text?: string }>;
+              return content
+                .filter((part) => part.type === "text")
+                .map((part) => part.text)
+                .join("");
+            });
+        }
+        const action =
+          providerCalls === 1
+            ? ["fixture_one", "fixture_two", "fixture_image"].map((name, index) => ({
+                type: "toolCall",
+                id: `budget-${index}`,
+                name,
+                arguments: {},
+              }))
+            : providerCalls === 2
+              ? [{ type: "toolCall", id: "budget-replay", name: "fixture_one", arguments: {} }]
+              : [{ type: "text", text: "done" }];
+        const message = {
+          role: "assistant",
+          content: action,
+          api: "openai-completions",
+          provider: "fixture-provider",
+          model: "budget-model",
+          usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2 },
+          stopReason: providerCalls < 3 ? "toolUse" : "stop",
+          timestamp: Date.now(),
+        } as never;
+        const stream = createAssistantMessageEventStream();
+        queueMicrotask(() => {
+          stream.push({ type: "start", partial: message });
+          stream.push({ type: "done", reason: providerCalls < 3 ? "toolUse" : "stop", message });
+        });
+        return stream;
+      },
+    } as unknown as ModelRuntime;
+    const largeResult = JSON.stringify({ source: "fixture", payload: "x".repeat(6_000) });
+    const adapter = new PiSdkRuntimeAdapter({
+      kitPath: fileURLToPath(new URL("./fixtures/lora-pi-kit", import.meta.url)),
+      runtimeBaseDir,
+      model,
+      modelRuntime,
+      customTools: ["fixture_one", "fixture_two", "fixture_image"].map((name) => ({
+        name,
+        label: name,
+        description: `Fixture ${name}`,
+        parameters: Type.Object({}),
+        execute: async () => {
+          if (name === "fixture_one") firstToolExecutions++;
+          return name === "fixture_image"
+            ? {
+                content: [{ type: "image", data: "a".repeat(50_000), mimeType: "image/png" }],
+                details: {},
+              }
+            : { content: [{ type: "text", text: largeResult }], details: {} };
+        },
+      })),
+      resolveToolNames: async () => ["fixture_one", "fixture_two", "fixture_image"],
+      resolveSkillNames: async () => ({ names: [] }),
+    });
+    await adapter.initialize();
+    const context: PiRunContext = {
+      runId: run.id,
+      conversationId: conversation.id,
+      caller: {
+        principalId: "owner",
+        scope: {
+          connectionId: "qq",
+          botId: "bot",
+          chatType: "private",
+          chatId: "owner",
+          senderId: "owner",
+        },
+      },
+    };
+    const binding = await adapter.createOrRestoreSession(conversation, "test", context);
+    const result = await adapter.run(binding, run, "use both tools", context);
+    if (result.status === "error") throw new Error(result.error);
+    expect(result).toMatchObject({ status: "completed" });
+    expect(secondCallResults).toHaveLength(3);
+    expect(secondCallResults[0]).toBe(largeResult);
+    expect(JSON.parse(secondCallResults[1]!)._glassbox_compacted).toBe(true);
+    expect(secondCallResults[1]).toContain("payload");
+    expect(secondCallResults[1]!.length).toBeLessThan(largeResult.length);
+    expect(secondCallResults[2]).toContain("[non-text content omitted]");
+    expect(secondCallResults[2]).not.toContain("a".repeat(1_000));
+    expect(firstToolExecutions).toBe(1);
+    await adapter.cleanup();
+  });
+
+  it("budgets a new Tool result from projected context after omitting oversized prior history", async () => {
+    const runtimeBaseDir = await mkdtemp(join(tmpdir(), "glassbox-pi-projected-tool-budget-"));
+    directories.push(runtimeBaseDir);
+    const model = {
+      id: "projected-budget-model",
+      name: "Projected budget model",
+      api: "openai-completions",
+      provider: "fixture-provider",
+      baseUrl: "http://fixture.invalid",
+      reasoning: false,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 6_000,
+      maxTokens: 128,
+    } as never;
+    let providerCalls = 0;
+    let projectedProviderMessages: Array<{ role: string; content?: unknown }> = [];
+    let nextProviderMessages: Array<{ role: string; content?: unknown }> = [];
+    const toolResult = JSON.stringify({ source: "current-turn", payload: "y".repeat(2_000) });
+    const modelRuntime = {
+      hasConfiguredAuth: () => true,
+      checkAuth: async () => undefined,
+      isUsingOAuth: () => false,
+      streamSimple: (
+        _model: unknown,
+        context: { messages: Array<{ role: string; content?: unknown }> },
+      ) => {
+        providerCalls++;
+        if (providerCalls === 2) projectedProviderMessages = structuredClone(context.messages);
+        if (providerCalls === 3) nextProviderMessages = structuredClone(context.messages);
+        const content =
+          providerCalls === 1
+            ? [{ type: "text", text: `historic-secret-token-needle ${"z".repeat(9_000)}` }]
+            : providerCalls === 2
+              ? [{ type: "toolCall", id: "new-turn-call", name: "current_read", arguments: {} }]
+              : [{ type: "text", text: "completed" }];
+        const message = {
+          role: "assistant",
+          content,
+          api: "openai-completions",
+          provider: "fixture-provider",
+          model: "projected-budget-model",
+          usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2 },
+          stopReason: providerCalls === 2 ? "toolUse" : "stop",
+          timestamp: Date.now(),
+        } as never;
+        const stream = createAssistantMessageEventStream();
+        queueMicrotask(() => {
+          stream.push({ type: "start", partial: message });
+          stream.push({ type: "done", reason: providerCalls === 2 ? "toolUse" : "stop", message });
+        });
+        return stream;
+      },
+    } as unknown as ModelRuntime;
+    const adapter = new PiSdkRuntimeAdapter({
+      kitPath: fileURLToPath(new URL("./fixtures/lora-pi-kit", import.meta.url)),
+      runtimeBaseDir,
+      model,
+      modelRuntime,
+      customTools: [
+        {
+          name: "current_read",
+          label: "current_read",
+          description: "Read current turn fixture",
+          parameters: Type.Object({}),
+          execute: async () => ({ content: [{ type: "text", text: toolResult }], details: {} }),
+        },
+      ],
+      resolveToolNames: async () => ["current_read"],
+      resolveSkillNames: async () => ({ names: [] }),
+    });
+    await adapter.initialize();
+    const context: PiRunContext = {
+      runId: run.id,
+      conversationId: conversation.id,
+      caller: {
+        principalId: "owner",
+        scope: {
+          connectionId: "qq",
+          botId: "bot",
+          chatType: "private",
+          chatId: "owner",
+          senderId: "owner",
+        },
+      },
+    };
+    const binding = await adapter.createOrRestoreSession(conversation, "test", context);
+    const first = await adapter.run(binding, run, "seed long prior history", context);
+    expect(first.status).toBe("completed");
+    const secondContext = { ...context, runId: "run-projected-followup" };
+    const second = await adapter.run(
+      binding,
+      { ...run, id: secondContext.runId },
+      "read current data",
+      secondContext,
+    );
+    expect(second).toMatchObject({ status: "completed", text: "completed" });
+    expect(JSON.stringify(projectedProviderMessages)).not.toContain("historic-secret-token-needle");
+    const projectedToolResult = nextProviderMessages.find(
+      (message) => message.role === "toolResult",
+    );
+    expect(projectedToolResult).toBeDefined();
+    if (!projectedToolResult) throw new Error("Provider context omitted the projected Tool result");
+    const projectedText = (projectedToolResult.content as Array<{ type: string; text?: string }>)
+      .filter((part) => part.type === "text")
+      .map((part) => part.text)
+      .join("");
+    expect(projectedText).toBe(toolResult);
+    await adapter.cleanup();
+  });
+
   it("sends exactly the selected Effective Tool Surface schemas to the Pi model context", async () => {
     const runtimeBaseDir = await mkdtemp(join(tmpdir(), "glassbox-pi-runtime-provider-context-"));
     directories.push(runtimeBaseDir);
     let capturedContext: { tools?: readonly { name: string }[] } | undefined;
+    let sessionEvidence: Record<string, unknown> | undefined;
+    let turnEvidence: Record<string, unknown> | undefined;
     let surface:
       | {
           selected: readonly { name: string }[];
@@ -358,7 +606,15 @@ describe("PiSdkRuntimeAdapter", () => {
           api: "openai-completions",
           provider: "fixture-provider",
           model: "fixture-model",
-          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 },
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            reasoning: 2,
+            totalTokens: 2,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          },
           stopReason: "stop",
           timestamp: Date.now(),
         } as never;
@@ -391,7 +647,11 @@ describe("PiSdkRuntimeAdapter", () => {
       ],
       resolveSkillNames: async () => ({ names: [] }),
       onEvent: (event) => {
-        if (event.type === "session_start") surface = event.data.toolSurface as typeof surface;
+        if (event.type === "session_start") {
+          surface = event.data.toolSurface as typeof surface;
+          sessionEvidence = event.data;
+        }
+        if (event.type === "turn_end") turnEvidence = event.data;
       },
     });
 
@@ -411,6 +671,16 @@ describe("PiSdkRuntimeAdapter", () => {
       },
     };
     const binding = await adapter.createOrRestoreSession(conversation, "test", context);
+    expect(adapter.getModelCapacity(binding.runtimeSessionId)).toEqual({
+      contextWindowTokens: 8_192,
+      outputReserveTokens: 256,
+      thinkingReserveTokens: 0,
+      safetyMarginTokens: 0,
+    });
+    expect(adapter.getStaticContextEstimate(binding.runtimeSessionId)).toMatchObject({
+      systemTokens: expect.any(Number),
+      toolSchemaTokens: expect.any(Number),
+    });
     await adapter.run(binding, run, "say hello", context);
 
     expect(surface).toBeDefined();
@@ -425,6 +695,19 @@ describe("PiSdkRuntimeAdapter", () => {
         expect.objectContaining({ name: "read", reason: "disabled_by_host" }),
       ]),
     );
+    expect(sessionEvidence?.thinkingLevel).toBeNull();
+    expect(sessionEvidence?.modelCapacity).toMatchObject({ contextWindowTokens: 8_192 });
+    expect(turnEvidence?.durationMs).toEqual(expect.any(Number));
+    expect(turnEvidence?.contextBudget).toMatchObject({
+      policyVersion: "p5a-context-v1",
+      estimateSource: "unicode_conservative",
+      overflow: null,
+    });
+    expect((turnEvidence?.usage as Record<string, unknown> | undefined)?.inputTokens).toBe(0);
+    expect(turnEvidence?.usage).toMatchObject({
+      reasoningTokens: 2,
+      cost: { total: 0 },
+    });
 
     await adapter.cleanup();
 
@@ -549,12 +832,36 @@ describe("PiSdkRuntimeAdapter", () => {
     const adapter = new PiSdkRuntimeAdapter({
       kitPath: fileURLToPath(new URL("./fixtures/lora-pi-kit", import.meta.url)),
       runtimeBaseDir,
+      model: {
+        id: "fixture-model",
+        name: "Fixture model",
+        api: "openai-completions",
+        provider: "fixture-provider",
+        baseUrl: "http://fixture.invalid",
+        reasoning: false,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 32_768,
+        maxTokens: 4_096,
+      } as never,
       createSession: async () => {
         sessionCount++;
         const sId = `pi-session-${sessionCount}`;
         let listener: ((event: AgentSessionEvent) => void) | undefined;
         return {
           sessionId: sId,
+          model: {
+            id: "fixture-model",
+            name: "Fixture model",
+            api: "openai-completions",
+            provider: "fixture-provider",
+            baseUrl: "http://fixture.invalid",
+            reasoning: false,
+            input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 32_768,
+            maxTokens: 4_096,
+          } as never,
           messages: [
             {
               role: "assistant",

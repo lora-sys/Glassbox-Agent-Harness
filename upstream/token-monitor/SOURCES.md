@@ -2,7 +2,9 @@
 
 Reference project: `Javis603/token-monitor`
 
-Pinned upstream commit: `97fa89108e9384b48b1d2ffe1c3635655636c1b0`
+Earlier reviewed upstream commit: `97fa89108e9384b48b1d2ffe1c3635655636c1b0`
+
+P5 reviewed stable release (2026-09-21): `v0.60.0` at `8031cf3b75c7f354db8a990a983999c69086da28`
 
 Upstream branch at review time: `main`
 
@@ -152,6 +154,29 @@ The management UI should expose normalized usage and sanitized session metadata 
 
 If a future sync/export mechanism is introduced, keep the payload deliberately narrower than local Raw Trace.
 
+## P5 reviewed source set
+
+Plan 05B refreshed this reference against Token Monitor v0.60.0 / `8031cf3b75c7f354db8a990a983999c69086da28`.
+
+In addition to the source slices above, the P5 review specifically checked:
+
+~~~text
+tests/shared/usageThroughput.test.js
+tests/shared/collectorLoadGuards.test.js
+~~~
+
+Important behavior to preserve:
+
+- throughput has an explicit capability/availability state;
+- a missing measurement is not exact zero;
+- input/output/cacheRead/cacheWrite/reasoning remain separately attributable when the source exposes them;
+- Runtime-specific discovery/limits quirks stay behind collectors;
+- richer/corrected observations can replace derived summaries without rewriting Raw Trace.
+
+P5 starts Pi-first from existing Glassbox runtime events. Broad local-client scanning is not required merely to fill a dashboard.
+
+Detailed audit: `.plans/findings/05-p5-upstream-review-2026-09-21.md`.
+
 ## Expected production boundary
 
 Reference material belongs here:
@@ -191,8 +216,16 @@ Production code must not import directly from `upstream/token-monitor/`.
 
 ## Current phase boundary
 
-Plan 03 is now the QQ Personal Agent closed loop and includes Pi SDK execution, Lora PI Kit, hard authorization gates, scope-based Conversation persistence, NapCat / OneBot, and real QQ acceptance.
+P4A/P4B are closing the Memory/Taste and authorized-retrieval phase. P5B is the first phase that expands Token Monitor usage beyond narrow P3 runtime observations.
 
-P3 may use minimal Pi usage and runtime-health information when it helps Trace or acceptance. It does not require the broader Token Monitor quota dashboard, Antigravity support, cross-runtime historical scanner, or full Runtime observability product.
+The initial production scope is deliberately Pi-first:
 
-Use this reference narrowly during P3 and expand it only when a concrete monitoring slice requires more.
+~~~text
+existing Pi runtime events
+→ Glassbox RuntimeUsage / RuntimeHealth contracts
+→ management / Eval projections
+~~~
+
+Do not port the broad desktop/client scanner catalog merely to make a dashboard look complete. Add a Runtime collector only when Glassbox has a real execution surface and a verified evidence source for it.
+
+Unknown cost, quota, throughput or health remains unknown. Collection never widens authority and never replaces Raw Trace.

@@ -189,13 +189,14 @@ When a requirement is ambiguous, choose the smaller implementation that preserve
 
 Do not silently expand scope from the roadmap.
 
-P4A and P4B are complete. The active implementation plan before the next product phase is:
+P4A, P4B, and the repository transition refactor are complete. The active P5 implementation plans are:
 
 ```text
-.plans/phase-transition-repository-refactor.md
+.plans/05a-context-budgeting-runtime-efficiency.md
+.plans/05b-routing-runtime-observability.md
 ```
 
-Tracking Issue: #21. This plan covers server modularization, test structure, validation speed, hooks, and related documentation. It does not authorize P5 product features or frontend changes. Keep the P4 plans as completed records.
+Tracking Issues: #13 and #14. The Owner requested one implementation PR for both plans. Keep the P4 plans and the completed Issue #21 refactor plan as records.
 
 Read in this order before changing code:
 
@@ -210,7 +211,9 @@ Read in this order before changing code:
 
 | Topic | Source of truth |
 | --- | --- |
-| Repository modularization and validation workflow before the next product phase | `.plans/phase-transition-repository-refactor.md` and Issue #21 |
+| Context budgeting and runtime efficiency | `.plans/05a-context-budgeting-runtime-efficiency.md` and Issue #13 |
+| Routing and runtime observability | `.plans/05b-routing-runtime-observability.md` and Issue #14 |
+| Completed repository modularization and validation workflow | `.plans/phase-transition-repository-refactor.md` and Issue #21 |
 | Completed P4A Memory / Taste implementation and acceptance record | `.plans/04a-memory-taste.md` and Issue #9 |
 | Completed P4B retrieval / QQ history implementation and acceptance record | `.plans/04b-authorized-retrieval-history.md` and Issue #10 |
 | Completed P3 trust / QQ / Agent Ops foundation | `.plans/03-personal-agent-foundation.md` |
