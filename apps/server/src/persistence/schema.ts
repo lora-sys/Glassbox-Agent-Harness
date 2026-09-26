@@ -44,7 +44,7 @@ export const baseSchema = [
   `CREATE INDEX runs_principal ON runs(principal_id, created_at, id)`,
   `CREATE INDEX conversations_page ON conversations(principal_id, scope_key, created_at, id)`,
   `CREATE TABLE deliveries (id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id), dedup_key TEXT NOT NULL, destination_scope_key TEXT NOT NULL, payload_text TEXT NOT NULL, payload_kind TEXT NOT NULL CHECK(payload_kind IN ('text','result','ack','browser_artifact')), status TEXT NOT NULL CHECK(status IN ('pending','sending','sent','failed','unknown')), external_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(run_id, dedup_key))`,
-  `CREATE TABLE authorization_decisions (id TEXT PRIMARY KEY, principal_id TEXT, resource_id TEXT NOT NULL, action TEXT NOT NULL, scope_key TEXT NOT NULL, decision TEXT NOT NULL CHECK(decision IN ('ALLOW','DENY','REQUIRES_APPROVAL')), reason TEXT NOT NULL, grant_id TEXT, approval_id TEXT, conversation_id TEXT REFERENCES conversations(id), run_id TEXT REFERENCES runs(id), created_at TEXT NOT NULL)`,
+  `CREATE TABLE authorization_decisions (id TEXT PRIMARY KEY, principal_id TEXT, resource_id TEXT NOT NULL, action TEXT NOT NULL, scope_key TEXT NOT NULL, decision TEXT NOT NULL CHECK(decision IN ('ALLOW','DENY','REQUIRES_APPROVAL')), reason TEXT NOT NULL, grant_id TEXT, approval_id TEXT, conversation_id TEXT REFERENCES conversations(id), run_id TEXT REFERENCES runs(id), delivery_source TEXT, created_at TEXT NOT NULL)`,
   `CREATE INDEX decisions_page ON authorization_decisions(principal_id, scope_key, created_at, id)`,
   `CREATE TABLE trace_cursors (run_id TEXT PRIMARY KEY REFERENCES runs(id), trace_ref TEXT NOT NULL, byte_offset INTEGER NOT NULL CHECK(byte_offset >= 0), event_count INTEGER NOT NULL CHECK(event_count >= 0), updated_at TEXT NOT NULL)`,
   `CREATE TABLE eval_results (id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id), sample_id TEXT NOT NULL, scorer_version TEXT NOT NULL, trace_ref TEXT NOT NULL, trace_start INTEGER NOT NULL CHECK(trace_start >= 0), trace_end INTEGER NOT NULL CHECK(trace_end >= trace_start), expected TEXT NOT NULL, observed TEXT NOT NULL, passed INTEGER NOT NULL CHECK(passed IN (0,1)), input_tokens INTEGER CHECK(input_tokens >= 0), output_tokens INTEGER CHECK(output_tokens >= 0), duration_ms INTEGER CHECK(duration_ms >= 0), created_at TEXT NOT NULL)`,
@@ -172,3 +172,23 @@ export const schemaV10Migration = [
   `DROP TABLE deliveries`,
   `ALTER TABLE deliveries_v10 RENAME TO deliveries`,
 ];
+
+// Existing ALLOW rows predate trusted execution-source markers. Preserve the old
+// conservative delivery recheck for them, while new discovery decisions stay unmarked.
+export async function applySchemaV11Migration(tx: Transaction): Promise<void> {
+  const table = await tx.execute(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'authorization_decisions'",
+  );
+  // Partial migration fixtures can carry an older user_version without the full product
+  // schema. The production v10 schema always has this table.
+  if (table.rows.length === 0) return;
+  const columns = await tx.execute("PRAGMA table_info(authorization_decisions)");
+  if (!columns.rows.some((row) => row.name === "delivery_source"))
+    await tx.execute("ALTER TABLE authorization_decisions ADD COLUMN delivery_source TEXT");
+  await tx.execute(
+    "UPDATE authorization_decisions SET delivery_source = 'legacy_content_source' WHERE decision = 'ALLOW' AND (action = 'read' OR action LIKE '%:read' OR action LIKE '%:list' OR action LIKE '%:status') AND NOT EXISTS (SELECT 1 FROM resources r WHERE r.id = authorization_decisions.resource_id AND r.kind = 'web-public')",
+  );
+  await tx.execute(
+    "UPDATE authorization_decisions SET delivery_source = 'legacy_access_gate' WHERE decision = 'ALLOW' AND action LIKE '%:search' AND delivery_source IS NULL AND NOT EXISTS (SELECT 1 FROM resources r WHERE r.id = authorization_decisions.resource_id AND r.kind = 'web-public')",
+  );
+}

@@ -35,6 +35,16 @@ it("keeps two Owner workspaces separate and revokes only the shared grant", asyn
     ownerPrincipalId: "owner",
   });
   const sharedId = registered.id;
+  const coOwnerCaller = {
+    principalId: "owner-10006",
+    scope: {
+      connectionId: "fixture",
+      botId: "10001",
+      chatType: "private" as const,
+      chatId: "10006",
+      senderId: "10006",
+    },
+  };
   await f.app.grantWorkspace({
     workspaceId: sharedId,
     principalId: "owner-10006",
@@ -51,6 +61,15 @@ it("keeps two Owner workspaces separate and revokes only the shared grant", asyn
     (await f.app.listWorkspaces("owner-10006")).find((workspace) => workspace.id === sharedId)
       ?.access,
   ).toBe("read");
+  expect(
+    (
+      await f.app.store.authorization.check({
+        caller: coOwnerCaller,
+        resourceId: `workspace:${sharedId}`,
+        action: "delivery:send",
+      })
+    ).decision,
+  ).toBe("ALLOW");
 
   await f.app.revokeWorkspace({ workspaceId: sharedId, principalId: "owner-10006" });
   expect(
@@ -59,22 +78,21 @@ it("keeps two Owner workspaces separate and revokes only the shared grant", asyn
   expect((await f.app.listWorkspaces("owner")).some((workspace) => workspace.id === sharedId)).toBe(
     true,
   );
-  const coOwnerCaller = {
-    principalId: "owner-10006",
-    scope: {
-      connectionId: "fixture",
-      botId: "10001",
-      chatType: "private" as const,
-      chatId: "10006",
-      senderId: "10006",
-    },
-  };
   expect(
     (
       await f.app.store.authorization.check({
         caller: coOwnerCaller,
         resourceId: `workspace:${sharedId}`,
         action: "workspace:write",
+      })
+    ).decision,
+  ).toBe("DENY");
+  expect(
+    (
+      await f.app.store.authorization.check({
+        caller: coOwnerCaller,
+        resourceId: `workspace:${sharedId}`,
+        action: "delivery:send",
       })
     ).decision,
   ).toBe("DENY");

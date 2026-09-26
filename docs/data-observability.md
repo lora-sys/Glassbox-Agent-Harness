@@ -334,6 +334,8 @@ unobserved execution state remains unknown.
 
 QQ result delivery applies a content gate before it creates a Delivery. The gate checks the raw model candidate, renders QQ plain text, and checks the rendered text again. A blocked candidate creates no Delivery and is excluded from later model Context.
 
+An allowed authorization decision becomes a delivery source only after its protected read actually returns. The decision stores the source class. Before initial delivery and every retry, Glassbox rechecks the original read Action against current authority. A content source also requires a separate `delivery:send` decision for that Resource. Protected search gates are rechecked as Actions; concrete search results retain their own content-source decisions. The same source checks apply before an earlier answer enters a later Run's Context. Older decisions retain conservative legacy source classes after database migration.
+
 The append-only delivery_blocked event stores reason codes, candidate byte count and a SHA-256 digest. It does not store the blocked candidate in that event. The original protected Run result remains subject to its existing database and authorization boundary.
 
 ## Server deployment rule

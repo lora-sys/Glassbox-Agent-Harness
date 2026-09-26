@@ -560,6 +560,7 @@ function createProviderCapabilityTool(
     description: providerToolDescription(capability),
     parameters: providerToolParameters(capability),
     action: capability.action,
+    ...(capability.risk === "read" ? { deliverySource: "content_source" as const } : {}),
     // The Resource is derived, never accepted: a group Run is bound to its own group, and
     // an Owner-private Run may name only a group its policy covers.
     resourceId: (params, context) =>
@@ -588,6 +589,7 @@ function createGroupInventoryTool(
     description: options.capability.description,
     parameters: providerToolParameters(options.capability, true),
     action: options.capability.action,
+    ...(options.capability.risk === "read" ? { deliverySource: "content_source" as const } : {}),
     resourceId: (params, context) =>
       capabilityResourceId({
         resource: options.capability.resource,

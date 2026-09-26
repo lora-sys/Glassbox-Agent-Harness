@@ -696,11 +696,15 @@ export class ConversationStore {
           }
 
           const sources = await tx.execute({
-            sql: `SELECT DISTINCT resource_id, action FROM authorization_decisions WHERE run_id = ?
-              AND decision = 'ALLOW' AND action IN ('read', 'context:read', 'worker:read', 'worker:status', 'worker:file:read', 'task:read')`,
+            sql: `SELECT DISTINCT resource_id, action, delivery_source FROM authorization_decisions WHERE run_id = ?
+              AND decision = 'ALLOW' AND delivery_source IS NOT NULL`,
             args: [priorRunId],
           });
           let permitted = true;
+          const currentSourceDecisions: Array<{
+            id: string;
+            source: "content_source" | "access_gate";
+          }> = [];
           for (const source of sources.rows) {
             const decision = await evaluate(tx, {
               caller,
@@ -713,6 +717,14 @@ export class ConversationStore {
               permitted = false;
               break;
             }
+            currentSourceDecisions.push({
+              id: decision.id,
+              source:
+                source.delivery_source === "access_gate" ||
+                source.delivery_source === "legacy_access_gate"
+                  ? "access_gate"
+                  : "content_source",
+            });
           }
           if (!permitted) continue;
 
@@ -746,6 +758,12 @@ export class ConversationStore {
 
           if (user.length + assistant.length > remaining) break;
           remaining -= user.length + assistant.length;
+          for (const source of currentSourceDecisions) {
+            await tx.execute({
+              sql: "UPDATE authorization_decisions SET delivery_source = ? WHERE id = ? AND decision = 'ALLOW' AND delivery_source IS NULL",
+              args: [source.source, source.id],
+            });
+          }
           exchanges.push({ user, assistant });
         }
         const history = exchanges.reverse().flatMap(({ user, assistant }) => [

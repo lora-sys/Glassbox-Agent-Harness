@@ -6,6 +6,11 @@ import {
   type CallerContext,
   type TrustedChannelScope,
 } from "../persistence/index.js";
+import { classifyProtectedReadAction } from "../auth/service.js";
+import { createCapabilityTools } from "../runtime/pi/capability-tools.js";
+import { createProtectedTool } from "../runtime/pi/protected-tools.js";
+import { Type } from "typebox";
+import { OWNER_CONTROL_RESOURCE, OWNER_GROUP_ADMIN_TOOL } from "../runtime/pi/owner-tools.js";
 import { admin, type OwnerContext } from "./application-test-helpers.js";
 
 const { fixture, afterEachCleanup } = createApplicationFixtureScope();
@@ -131,18 +136,26 @@ describe("group history delivery authority", () => {
   }
 
   /** Every decision this Principal holds in this exact scope, across pages. */
-  const decisionsFor = async (f: Awaited<ReturnType<typeof fixture>>, caller: CallerContext) => {
+  type FixtureResult = Awaited<ReturnType<typeof fixture>>;
+  type RawApplication = Awaited<ReturnType<FixtureResult["reopen"]>>;
+
+  const decisionsFor = async (
+    f: Awaited<ReturnType<typeof fixture>>,
+    caller: CallerContext,
+    app: RawApplication = f.app,
+  ) => {
     const items: Array<{
       resourceId: string;
       action: string;
       decision: string;
       reason: string;
+      deliverySource: string | null;
       runId: string | null;
       conversationId: string | null;
     }> = [];
     let cursor: string | undefined;
     do {
-      const page = await f.app.store.evidence.listDecisions(caller, "personal", {
+      const page = await app.store.evidence.listDecisions(caller, "personal", {
         limit: 100,
         ...(cursor === undefined ? {} : { cursor }),
       });
@@ -157,6 +170,38 @@ describe("group history delivery authority", () => {
     caller: CallerContext,
     resourceId: string,
   ) => f.app.store.authorization.check({ caller, resourceId, action: "delivery:send" });
+
+  it("classifies content reads, protected search gates and write Actions", () => {
+    for (const action of [
+      "read",
+      "context:read",
+      "qq:capability:read",
+      "group:read",
+      "group:members:read",
+      "group:content:read",
+      "group:files:read",
+      "history:read",
+      "account:status:read",
+      "task:list",
+      "worker:status",
+    ])
+      expect(classifyProtectedReadAction(action, "qq_group"), action).toBe("content_source");
+
+    expect(classifyProtectedReadAction("history:search", "owner-history")).toBe("access_gate");
+    expect(classifyProtectedReadAction("history:search", undefined)).toBe("access_gate");
+    expect(classifyProtectedReadAction("web:search", "web-public")).toBeUndefined();
+    expect(classifyProtectedReadAction("web:fetch", "web-public")).toBeUndefined();
+
+    for (const action of [
+      "run:create",
+      "delivery:send",
+      "group:settings:write",
+      "group:moderate",
+      "task:delegate",
+      "worker:prompt",
+    ])
+      expect(classifyProtectedReadAction(action, "qq_group"), action).toBeUndefined();
+  });
 
   it("delivers a group Run's own history answer back into that same group", async () => {
     const { f, application, searches } = await historyFixture();
@@ -211,6 +256,298 @@ describe("group history delivery authority", () => {
       `answer:${SEARCH}已授权群里的 P4B-A-1349`,
     ]);
     expect(deliveries.items[0]!.status).toBe("sent");
+
+    // Keep delivery permission in place while revoking only the history source. The same Run
+    // cannot reuse its earlier read decision for a later answer or retry.
+    await f.app.store.authorization.revokeScopeAction({
+      principalId: a.caller.principalId,
+      resourceId: `group:${GROUP}`,
+      action: "history:read",
+      scope: a.caller.scope,
+    });
+    await expect(
+      f.app.store.lifecycle.createDelivery(run.caller, {
+        runId: run.run.id,
+        dedupKey: "history-source-revoked",
+        destination: run.caller.scope,
+        payloadText: `answer:${SEARCH}已授权群里的 P4B-A-1349`,
+        payloadKind: "result",
+      }),
+    ).rejects.toBeInstanceOf(AccessDeniedError);
+    const records = (await decisionsFor(f, run.caller)).filter(
+      (record) =>
+        record.runId === run.run.id &&
+        record.resourceId === `group:${GROUP}` &&
+        record.action === "history:read",
+    );
+    expect(records.some((record) => record.decision === "ALLOW")).toBe(true);
+    expect(records.some((record) => record.decision === "DENY")).toBe(true);
+  });
+
+  it("rechecks a protected history search gate without requiring delivery on its gate Resource", async () => {
+    const { f, application, searches } = await historyFixture({ persistentDatabase: true });
+    f.send(1, "owner-a", true, 10002);
+    const ownerA = await f.started.take();
+    await f.reply("answer:owner-a");
+    const a = ownerContext(ownerA);
+    await application.setGroupAccess(a, { groupId: GROUP, enabled: true });
+
+    f.send(2, `${SEARCH}已授权群里的 P4B-A-1349`, true, 10002);
+    const run = await f.started.take();
+    await f.app.runs.waitForRun(run.caller, run.run.id);
+    await f.app.runs.drain();
+    expect(searches.at(-1)).toEqual([GROUP]);
+    expect((await deliveryDecision(f, run.caller, "owner-history")).decision).toBe("DENY");
+    const groupReads = (await decisionsFor(f, run.caller)).filter(
+      (record) =>
+        record.runId === run.run.id &&
+        record.resourceId === `group:${GROUP}` &&
+        record.action === "history:read",
+    );
+    expect(groupReads.some((record) => record.decision === "ALLOW")).toBe(true);
+    expect(
+      groupReads.some(
+        (record) => record.decision === "ALLOW" && record.deliverySource === "content_source",
+      ),
+    ).toBe(true);
+    const searchGateDecisions = (await decisionsFor(f, run.caller)).filter(
+      (record) =>
+        record.runId === run.run.id &&
+        record.resourceId === "owner-history" &&
+        record.action === "history:search",
+    );
+    expect(searchGateDecisions.some((record) => record.decision === "ALLOW")).toBe(true);
+    expect(
+      searchGateDecisions.some(
+        (record) => record.decision === "ALLOW" && record.deliverySource === "access_gate",
+      ),
+    ).toBe(true);
+
+    const deliveryId = await f.app.store.lifecycle.createDelivery(run.caller, {
+      runId: run.run.id,
+      dedupKey: "history-search-retry",
+      destination: run.caller.scope,
+      payloadText: "history-derived-retry-payload",
+      payloadKind: "result",
+    });
+    const lease = await f.app.store.lifecycle.claimDelivery(run.caller, run.run.id, deliveryId);
+    if (!lease) throw new Error("missing delivery lease");
+    await lease.settle("failed");
+
+    const reopened = await f.reopen();
+    await reopened.store.authorization.revokeScopeAction({
+      principalId: a.caller.principalId,
+      resourceId: "owner-history",
+      action: "history:search",
+      scope: a.caller.scope,
+    });
+    await expect(
+      reopened.store.lifecycle.transitionDelivery(
+        run.caller,
+        run.run.id,
+        deliveryId,
+        "failed",
+        "pending",
+      ),
+    ).rejects.toBeInstanceOf(AccessDeniedError);
+
+    const records = (await decisionsFor(f, run.caller, reopened)).filter(
+      (record) =>
+        record.runId === run.run.id &&
+        record.resourceId === "owner-history" &&
+        record.action === "history:search",
+    );
+    expect(records.some((record) => record.decision === "ALLOW")).toBe(true);
+    expect(
+      records.some(
+        (record) => record.decision === "ALLOW" && record.deliverySource === "access_gate",
+      ),
+    ).toBe(true);
+    expect(records.some((record) => record.decision === "DENY")).toBe(true);
+    expect(JSON.stringify(records)).not.toContain("history-derived-retry-payload");
+  });
+
+  it("rechecks an ordinary read source before retrying a failed delivery", async () => {
+    const { f, application } = await historyFixture();
+    f.send(1, "owner-a", true, 10002);
+    const owner = await f.started.take();
+    await f.reply("answer:owner-a");
+    const context = ownerContext(owner);
+    await application.setGroupAccess(context, { groupId: GROUP, enabled: true });
+
+    // Use the ordinary `read` Action on a protected Resource, as generic protected Tools do.
+    await f.app.store.authorization.grant({
+      principalId: context.caller.principalId,
+      resourceId: `group:${GROUP}`,
+      action: "read",
+      scope: context.caller.scope,
+      effect: "allow",
+    });
+    const tool = createProtectedTool({
+      name: "ordinary_protected_read",
+      description: "Read protected group content.",
+      parameters: Type.Object({}, { additionalProperties: false }),
+      action: "read",
+      deliverySource: "content_source",
+      resourceId: `group:${GROUP}`,
+      authService: f.app.store.authorization,
+      getContext: () => context,
+      execute: async () => "ordinary protected content",
+    });
+    const source = await tool.execute("ordinary-read", {}, undefined, undefined, {} as never);
+    expect(source.details).toBe("ordinary protected content");
+
+    const deliveryId = await f.app.store.lifecycle.createDelivery(context.caller, {
+      runId: context.runId,
+      dedupKey: "ordinary-read-retry",
+      destination: context.caller.scope,
+      payloadText: "ordinary-read-answer",
+      payloadKind: "result",
+    });
+    const lease = await f.app.store.lifecycle.claimDelivery(
+      context.caller,
+      context.runId,
+      deliveryId,
+    );
+    if (!lease) throw new Error("missing delivery lease");
+    await lease.settle("failed");
+
+    await f.app.store.authorization.revokeScopeAction({
+      principalId: context.caller.principalId,
+      resourceId: `group:${GROUP}`,
+      action: "read",
+      scope: context.caller.scope,
+    });
+    await expect(
+      f.app.store.lifecycle.transitionDelivery(
+        context.caller,
+        context.runId,
+        deliveryId,
+        "failed",
+        "pending",
+      ),
+    ).rejects.toBeInstanceOf(AccessDeniedError);
+
+    const records = (await decisionsFor(f, context.caller)).filter(
+      (record) =>
+        record.runId === context.runId &&
+        record.resourceId === `group:${GROUP}` &&
+        record.action === "read",
+    );
+    expect(records.some((record) => record.decision === "ALLOW")).toBe(true);
+    expect(
+      records.some(
+        (record) => record.decision === "ALLOW" && record.deliverySource === "content_source",
+      ),
+    ).toBe(true);
+    expect(records.some((record) => record.decision === "DENY")).toBe(true);
+  });
+
+  it("rechecks a QQ group:members:read decision before creating a delivery", async () => {
+    const { f, application } = await historyFixture();
+    f.send(1, "owner-a", true, 10002);
+    const owner = await f.started.take();
+    await f.reply("answer:owner-a");
+    const context = ownerContext(owner);
+    const configuredGroup = "10003";
+    await application.setGroupAccess(context, { groupId: configuredGroup, enabled: true });
+    await application.setGroupCategory(context, {
+      groupId: configuredGroup,
+      category: "group.members",
+      enabled: true,
+    });
+
+    const tools = createCapabilityTools({
+      store: f.app.store,
+      getContext: () => context,
+      isCategoryEnabled: async () => true,
+      invoke: async ({ params }) => ({
+        group_id: params.group_id,
+        user_id: params.user_id,
+        role: "member",
+      }),
+      search: async () => [],
+      projectManagedGroups: async () => [],
+    });
+    const members = tools.find((tool) => tool.name === "qq_group_members");
+    if (!members) throw new Error("missing qq_group_members");
+    const result = await members.execute(
+      "member-read",
+      {
+        groupId: configuredGroup,
+        operation: "get_group_member_info",
+        params: { user_id: "10004" },
+      },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    expect(result.details).toEqual({ role: "qq_group_member" });
+
+    await application.setGroupCategory(context, {
+      groupId: configuredGroup,
+      category: "group.members",
+      enabled: false,
+    });
+    expect((await deliveryDecision(f, context.caller, `group:${configuredGroup}`)).decision).toBe(
+      "ALLOW",
+    );
+    await expect(
+      f.app.store.lifecycle.createDelivery(context.caller, {
+        runId: context.runId,
+        dedupKey: "member-source-revoked",
+        destination: context.caller.scope,
+        payloadText: "member-derived-answer",
+        payloadKind: "result",
+      }),
+    ).rejects.toBeInstanceOf(AccessDeniedError);
+
+    const records = (await decisionsFor(f, context.caller)).filter(
+      (record) =>
+        record.runId === context.runId &&
+        record.resourceId === `group:${configuredGroup}` &&
+        record.action === "group:members:read",
+    );
+    expect(records.some((record) => record.decision === "ALLOW")).toBe(true);
+    expect(
+      records.some(
+        (record) => record.decision === "ALLOW" && record.deliverySource === "content_source",
+      ),
+    ).toBe(true);
+    expect(records.some((record) => record.decision === "DENY")).toBe(true);
+  });
+
+  it("allows Owner-private control reads to be delivered without granting them to group visitors", async () => {
+    const { f, application } = await historyFixture();
+    f.send(1, "owner-control-read", true, 10002);
+    const ownerRun = await f.started.take();
+    await f.reply("answer:owner-control-read");
+    const owner = ownerContext(ownerRun);
+    await application.setGroupAccess(owner, { groupId: GROUP, enabled: true });
+
+    const groupAdmin = application
+      .createRuntimeTools(() => owner)
+      .find((tool) => tool.name === OWNER_GROUP_ADMIN_TOOL);
+    if (!groupAdmin) throw new Error("missing owner group admin tool");
+    const read = await groupAdmin.execute("owner-group-read", { action: "get", groupId: GROUP });
+    expect(read.details).toBeDefined();
+    const ownerDelivery = await f.app.store.lifecycle.createDelivery(owner.caller, {
+      runId: owner.runId,
+      dedupKey: "owner-control-read-delivery",
+      destination: owner.caller.scope,
+      payloadText: "owner-control-result",
+      payloadKind: "result",
+    });
+    expect(ownerDelivery).toBeTruthy();
+
+    f.send(2, "visitor-control-read", false, 10004, GROUP_ID);
+    const visitorRun = await f.started.take();
+    const visitorDelivery = await f.app.store.authorization.check({
+      caller: visitorRun.caller,
+      resourceId: OWNER_CONTROL_RESOURCE,
+      action: "delivery:send",
+    });
+    expect(visitorDelivery.decision).toBe("DENY");
   });
 
   it("holds delivery authority for one assigned group in one scope, never for another", async () => {

@@ -28,6 +28,7 @@ export type TaskTraceEventType =
   | "task.worker_bound"
   | "worker.state_observed"
   | "worker.tool"
+  | "worker.workspace_lease"
   | "task.status_changed"
   | "task.review_ready"
   | "task.accepted"
@@ -175,6 +176,7 @@ export class TaskStore {
       action: string;
       allowedActions: readonly string[];
       callId: string;
+      productWorkspaceId?: string;
     },
     operation: () => Promise<T>,
   ): Promise<T> {
@@ -198,6 +200,17 @@ export class TaskStore {
         runId: task ? (optionalString(task, "run_id") ?? undefined) : undefined,
         conversationId: task ? (optionalString(task, "conversation_id") ?? undefined) : undefined,
       });
+      const workspaceDecision = input.productWorkspaceId
+        ? await evaluate(tx, {
+            caller: input.caller,
+            resourceId: `workspace:${input.productWorkspaceId}`,
+            action: input.action === "worker:file:write" ? "workspace:write" : "workspace:read",
+            runId: task ? (optionalString(task, "run_id") ?? undefined) : undefined,
+            conversationId: task
+              ? (optionalString(task, "conversation_id") ?? undefined)
+              : undefined,
+          })
+        : null;
       const record = async (outcome: string) =>
         this.appendTraceTx(tx, {
           type: "worker.tool",
@@ -208,13 +221,17 @@ export class TaskStore {
             action: input.action,
             callId: input.callId,
             resourceId: input.resourceId,
+            ...(input.productWorkspaceId ? { productWorkspaceId: input.productWorkspaceId } : {}),
             decisionId: decision.id,
             outcome,
           },
         });
-      if (decision.decision !== "ALLOW") {
+      if (
+        decision.decision !== "ALLOW" ||
+        (workspaceDecision !== null && workspaceDecision.decision !== "ALLOW")
+      ) {
         await record("denied");
-        return { denied: decision };
+        return { denied: decision.decision !== "ALLOW" ? decision : workspaceDecision! };
       }
       if (!live || !input.allowedActions.includes(input.action)) {
         await record("inactive_or_outside_delegation");
@@ -417,13 +434,20 @@ export class TaskStore {
     });
   }
 
-  async workerSourceResources(taskId: string): Promise<string[]> {
+  async workerSourceResources(
+    taskId: string,
+  ): Promise<Array<{ resourceId: string; productWorkspaceId?: string }>> {
     return this.db.transaction(async (tx) => {
       const result = await tx.execute({
-        sql: "SELECT DISTINCT json_extract(data_json, '$.resourceId') AS resource_id FROM ops_trace_events WHERE task_id = ? AND type = 'worker.tool' AND json_extract(data_json, '$.outcome') = 'succeeded'",
+        sql: "SELECT DISTINCT json_extract(data_json, '$.resourceId') AS resource_id, json_extract(data_json, '$.productWorkspaceId') AS product_workspace_id FROM ops_trace_events WHERE task_id = ? AND type = 'worker.tool' AND json_extract(data_json, '$.outcome') = 'succeeded'",
         args: [taskId],
       });
-      return result.rows.map((row) => stringColumn(row, "resource_id"));
+      return result.rows.map((row) => ({
+        resourceId: stringColumn(row, "resource_id"),
+        ...(typeof row.product_workspace_id === "string"
+          ? { productWorkspaceId: row.product_workspace_id }
+          : {}),
+      }));
     });
   }
 
