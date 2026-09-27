@@ -6,6 +6,7 @@ import { WorkspaceRegistry } from "../../workspace/registry.js";
 import { WorkspaceWriteOccupancy } from "../../workspace/write-occupancy.js";
 import { AuthorizedOpsService } from "../service.js";
 import { createAdvanceLongWorkActivity } from "./activity.js";
+import { connectLongWorkWorkflowClient } from "./client.js";
 import { HerdrWorkerRuntime } from "./herdr-worker-runtime.js";
 import { startLongWorkWorker } from "./worker.js";
 
@@ -15,6 +16,7 @@ async function main(): Promise<void> {
   const dataDirectory = getGlassboxDataDir();
   const databasePath = join(dataDirectory, "glassbox.db");
   const store = await openDomainStore({ databasePath });
+  let wakeClient: Awaited<ReturnType<typeof connectLongWorkWorkflowClient>> | undefined;
   try {
     const operations = await loadAgentOperations(dataDirectory, databasePath);
     const workers =
@@ -29,10 +31,17 @@ async function main(): Promise<void> {
             operations.workerTarget,
           )
         : undefined;
+    const connectedWakeClient = await connectLongWorkWorkflowClient({
+      address,
+      namespace: process.env.GLASSBOX_TEMPORAL_NAMESPACE ?? "default",
+    });
+    wakeClient = connectedWakeClient;
     const worker = await startLongWorkWorker({
       address,
       namespace: process.env.GLASSBOX_TEMPORAL_NAMESPACE ?? "default",
-      advanceLongWork: createAdvanceLongWorkActivity(store, workers),
+      advanceLongWork: createAdvanceLongWorkActivity(store, workers, (taskId) =>
+        connectedWakeClient.workflows.wake(taskId),
+      ),
     });
     let shutdown: Promise<void> | undefined;
     const stop = () => {
@@ -48,6 +57,7 @@ async function main(): Promise<void> {
       await (shutdown ?? worker.shutdown());
     }
   } finally {
+    await wakeClient?.close();
     await store.close();
   }
 }

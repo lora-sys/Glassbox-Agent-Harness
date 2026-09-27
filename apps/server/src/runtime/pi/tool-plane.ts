@@ -348,6 +348,13 @@ const OPS_TOOL_BINDINGS: Record<
     budgetClass: "core",
     grounding: "local_computation",
   },
+  task_link_child: {
+    action: "task:delegate",
+    resource: "task",
+    riskClass: "write",
+    budgetClass: "core",
+    grounding: "delegated_worker",
+  },
 };
 
 const OPS_TOOL_DESCRIPTORS: readonly ToolDescriptor[] = Object.freeze(

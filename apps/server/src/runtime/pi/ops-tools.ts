@@ -35,6 +35,7 @@ export const OPS_TOOL_NAMES = Object.freeze([
   "task_steps",
   "task_events",
   "task_plan",
+  "task_link_child",
 ] as const);
 
 /** The model never supplies routing, Principal, filesystem paths or worker kind. */
@@ -79,6 +80,7 @@ export function createOpsTools(options: {
         Type.Literal("model"),
         Type.Literal("tool"),
         Type.Literal("herdr_worker"),
+        Type.Literal("child_task"),
       ]),
       title: Type.String({ minLength: 1, maxLength: 256 }),
       dependencyIds,
@@ -129,12 +131,25 @@ export function createOpsTools(options: {
       resourceId: (params) => `task-${params.taskId}`,
       execute: async (params, context) => options.service.get(context.caller, params.taskId),
     }),
-    createProtectedTool<{ title: string; description?: string }>({
+    createProtectedTool<{
+      title: string;
+      description?: string;
+      acceptanceCriteria?: string[];
+    }>({
       ...common,
       name: "task_create",
       description: "Create durable work without starting a worker.",
       parameters: Type.Object(
-        { title: Type.String({ minLength: 1, maxLength: 256 }), description: Type.Optional(text) },
+        {
+          title: Type.String({ minLength: 1, maxLength: 256 }),
+          description: Type.Optional(text),
+          acceptanceCriteria: Type.Optional(
+            Type.Array(Type.String({ minLength: 1, maxLength: 512 }), {
+              minItems: 1,
+              maxItems: 16,
+            }),
+          ),
+        },
         { additionalProperties: false },
       ),
       action: "task:create",
@@ -143,6 +158,7 @@ export function createOpsTools(options: {
         options.service.create(context.caller, {
           title: params.title,
           description: params.description,
+          acceptanceCriteria: params.acceptanceCriteria,
           runId: context.runId,
           conversationId: context.conversationId,
         }),
@@ -252,6 +268,55 @@ export function createOpsTools(options: {
           { runId: context.runId },
         );
         return { stepId: step.id, status: step.status, version: step.version };
+      },
+    }),
+    createProtectedTool<{
+      parentTaskId: string;
+      parentStepId: string;
+      expectedStepVersion: number;
+      childTaskId: string;
+      acceptanceCriteria: string[];
+      cancellationPolicy: "cancel_child" | "keep_child";
+      failurePolicy: "block_parent" | "fail_parent" | "review_parent";
+    }>({
+      ...common,
+      name: "task_link_child",
+      description:
+        "Link a new same-owner child Task to a ready parent child_task Step. The child receives only the Step's delegated permissions.",
+      parameters: Type.Object(
+        {
+          parentTaskId: taskId,
+          parentStepId: stepId,
+          expectedStepVersion: Type.Integer({ minimum: 1 }),
+          childTaskId: taskId,
+          acceptanceCriteria: Type.Array(Type.String({ minLength: 1, maxLength: 512 }), {
+            minItems: 1,
+            maxItems: 16,
+          }),
+          cancellationPolicy: Type.Union([
+            Type.Literal("cancel_child"),
+            Type.Literal("keep_child"),
+          ]),
+          failurePolicy: Type.Union([
+            Type.Literal("block_parent"),
+            Type.Literal("fail_parent"),
+            Type.Literal("review_parent"),
+          ]),
+        },
+        { additionalProperties: false },
+      ),
+      action: "task:delegate",
+      resourceId: (params) => `task-${params.parentTaskId}`,
+      execute: async (params, context) => {
+        const link = await options.service.linkChildTask(context.caller, params, {
+          runId: context.runId,
+          conversationId: context.conversationId,
+        });
+        return {
+          parentTaskId: link.parentTaskId,
+          parentStepId: link.parentStepId,
+          childTaskId: link.childTaskId,
+        };
       },
     }),
     createProtectedTool<{
@@ -374,7 +439,14 @@ export function createOpsTools(options: {
       rootStepId: string;
       steps: Array<{
         id: string;
-        kind: "timer_wait" | "signal_wait" | "join" | "model" | "tool" | "herdr_worker";
+        kind:
+          | "timer_wait"
+          | "signal_wait"
+          | "join"
+          | "model"
+          | "tool"
+          | "herdr_worker"
+          | "child_task";
         title: string;
         dependencyIds: string[];
         instructions?: string;
@@ -387,7 +459,7 @@ export function createOpsTools(options: {
       ...common,
       name: "task_plan",
       description:
-        "Plan bounded timer, signal-wait, join, text-only model, read-only task_get Tool, and configured Pi Herdr Worker steps for an authorized Task. Approval, child Task, and shell steps are unavailable.",
+        "Plan bounded timer, signal-wait, join, text-only model, read-only task_get Tool, configured Pi Herdr Worker, and child Task steps. Link child Tasks separately before planning their graphs. Approval and shell steps are unavailable.",
       parameters: Type.Object(
         {
           taskId,
@@ -401,7 +473,8 @@ export function createOpsTools(options: {
       execute: async (params, context) => {
         for (const step of params.steps) {
           if (
-            (step.kind !== "herdr_worker" && step.workerAccess !== undefined) ||
+            (!["herdr_worker", "child_task"].includes(step.kind) &&
+              step.workerAccess !== undefined) ||
             (step.kind === "timer_wait" &&
               (step.durationMs === undefined ||
                 step.signalKey !== undefined ||
@@ -434,6 +507,11 @@ export function createOpsTools(options: {
                 !step.workerAccess ||
                 step.durationMs !== undefined ||
                 step.signalKey !== undefined ||
+                step.targetTaskId !== undefined)) ||
+            (step.kind === "child_task" &&
+              (!step.instructions?.trim() ||
+                step.durationMs !== undefined ||
+                step.signalKey !== undefined ||
                 step.targetTaskId !== undefined))
           )
             throw new Error(`Invalid fields for planned ${step.kind} step ${step.id}`);
@@ -451,7 +529,8 @@ export function createOpsTools(options: {
           Awaited<ReturnType<AuthorizedOpsService["plannedWorkerPermissions"]>>
         >();
         for (const step of params.steps) {
-          if (step.kind !== "herdr_worker") continue;
+          if (step.kind !== "herdr_worker" && (step.kind !== "child_task" || !step.workerAccess))
+            continue;
           if (options.workerTarget.agentKind !== "pi" || !options.workerTarget.worktreePath)
             throw new Error("Configured Pi Herdr Worker is unavailable");
           workerPermissions.set(
@@ -491,7 +570,7 @@ export function createOpsTools(options: {
               ? { instructions: step.instructions, specRef: executionRef }
               : step.kind === "tool"
                 ? { specRef: `tool:task_get:${step.targetTaskId}` }
-                : step.kind === "herdr_worker"
+                : step.kind === "herdr_worker" || step.kind === "child_task"
                   ? { instructions: step.instructions }
                   : {}),
             status: "pending" as const,

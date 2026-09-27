@@ -359,6 +359,56 @@ async function settleCancelledModelStep(
   return "settled";
 }
 
+async function settleCancelledChildStep(
+  store: DomainStore,
+  taskId: string,
+  step: TaskStep,
+  wakeChild?: (taskId: string) => Promise<void>,
+): Promise<"settled" | "pending"> {
+  const links = await store.longWork.listChildTaskLinks(taskId, step.id);
+  const link = links[0];
+  let childStatus: string | undefined;
+  if (link && link.cancellationPolicy === "cancel_child") {
+    const child = await store.tasks.getTask(link.childTaskId);
+    if (!child) return "pending";
+    childStatus = child.status;
+    if (!["DONE", "ACCEPTED", "FAILED", "CANCELED"].includes(child.status)) {
+      const caller = await getLongWorkCaller(store, child.id);
+      const decision = await store.authorization.check({
+        caller,
+        resourceId: `task-${child.id}`,
+        action: "task:cancel",
+      });
+      if (decision.decision !== "ALLOW") return "pending";
+      if (child.orchestrationMode === "durable") {
+        await store.longWork.requestDurableCancellation(child.id, {
+          kind: "decision",
+          decisionId: decision.id,
+          actorPrincipalId: caller.principalId,
+        });
+        await wakeChild?.(child.id).catch(() => undefined);
+      } else if (["NEW", "QUEUED"].includes(child.status) && !child.activeAttemptId)
+        await store.tasks.cancelTask(child.id, "Parent Task cancellation", caller.principalId);
+      return "pending";
+    }
+  }
+  await store.longWork.transitionStep({
+    taskId,
+    stepId: step.id,
+    expectedVersion: step.version,
+    from: "running",
+    to: "cancelled",
+    origin: ORIGIN,
+    metadata: {
+      reason: link?.cancellationPolicy === "cancel_child" ? "child_stopped" : "child_kept",
+      ...(link ? { childTaskId: link.childTaskId } : {}),
+      ...(childStatus ? { childStatus } : {}),
+      rollbackPerformed: false,
+    },
+  });
+  return "settled";
+}
+
 async function createClaimedModelRun(
   store: DomainStore,
   input: {
@@ -457,6 +507,7 @@ async function createClaimedModelRun(
 export function createAdvanceLongWorkActivity(
   store: DomainStore,
   workers?: Pick<HerdrWorkerRuntime, "dispatch" | "observe" | "cancel" | "ownerInstanceId">,
+  wakeChild?: (taskId: string) => Promise<void>,
 ): AdvanceLongWorkActivity {
   const scheduler = new LongWorkScheduler(store.longWork, DEFAULT_TASK_GRAPH_LIMITS);
   return async ({ taskId, policyRevision }) => {
@@ -466,6 +517,12 @@ export function createAdvanceLongWorkActivity(
       const steps = await store.longWork.listSteps(taskId);
       let pending = false;
       for (const step of steps) {
+        if (step.kind === "child_task" && step.status === "running") {
+          const result = await settleCancelledChildStep(store, taskId, step, wakeChild);
+          if (result === "settled") return { kind: "continue" };
+          pending = true;
+          continue;
+        }
         if (step.kind === "herdr_worker" && step.status === "running") {
           if (workers && (await workers.cancel(taskId, step)) === "settled")
             return { kind: "continue" };
@@ -513,7 +570,45 @@ export function createAdvanceLongWorkActivity(
     const byId = new Map(steps.map((step) => [step.id, step]));
     let modelRunPending = false;
     let workerPending = false;
+    let childPending = false;
     for (const step of steps) {
+      if (step.kind === "child_task" && step.status === "running") {
+        const links = await store.longWork.listChildTaskLinks(taskId, step.id);
+        if (links.length !== 1) {
+          childPending = true;
+          continue;
+        }
+        try {
+          await authorizeLongWorkAction(store, {
+            taskId,
+            resourceId: `task-${taskId}`,
+            action: "task:continue",
+          });
+        } catch (error) {
+          if (!(error instanceof AccessDeniedError)) throw error;
+          await store.longWork.transitionStep({
+            taskId,
+            stepId: step.id,
+            expectedVersion: step.version,
+            from: "running",
+            to: "blocked",
+            origin: ORIGIN,
+            evidenceRef: `authorization:${error.decision.id}`,
+            metadata: { reason: "child_continuation_denied" },
+          });
+          return { kind: "continue" };
+        }
+        const settled = await store.longWork.observeLinkedChildTask({
+          parentTaskId: taskId,
+          parentStepId: step.id,
+          childTaskId: links[0]!.childTaskId,
+          expectedStepVersion: step.version,
+          origin: ORIGIN,
+        });
+        if (settled) return { kind: "continue" };
+        childPending = true;
+        continue;
+      }
       if (step.kind === "herdr_worker" && step.status === "running" && workers) {
         const observed = await workers.observe(taskId, step);
         if (observed === "settled") return { kind: "continue" };
@@ -530,6 +625,10 @@ export function createAdvanceLongWorkActivity(
     let unsupported = false;
     for (const stepId of progress.runnableStepIds) {
       const step = byId.get(stepId)!;
+      if (step.kind === "child_task") {
+        childPending = true;
+        continue;
+      }
       if (step.kind === "herdr_worker" && workers) {
         if (!step.instructions?.trim() || step.specRef || step.requiredCapabilities.length > 0) {
           await store.longWork.transitionStep({
@@ -776,14 +875,14 @@ export function createAdvanceLongWorkActivity(
     });
     if (blockedStep) {
       await store.longWork.markTaskNeedsAttention(taskId, ORIGIN, blockedStep.id);
-      if (modelRunPending) return modelWake();
+      if (modelRunPending || workerPending || childPending) return modelWake();
       return due === undefined
         ? { kind: "wait" }
         : { kind: "wait", wakeAt: new Date(due).toISOString() };
     }
     // A running non-wait Step may belong to a live executor. Until the executor or
     // reconciler records loss evidence, preserve it and never dispatch it again here.
-    if (modelRunPending || workerPending) return modelWake();
+    if (modelRunPending || workerPending || childPending) return modelWake();
     if (steps.some((step) => step.status === "running")) return { kind: "wait" };
     const terminal = steps.every((step) =>
       ["succeeded", "failed", "cancelled", "skipped"].includes(step.status),

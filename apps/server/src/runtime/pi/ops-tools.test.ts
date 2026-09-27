@@ -75,6 +75,7 @@ it("denies an ungranted Pi delegate before starting any worker", async () => {
         "task_steps",
         "task_events",
         "task_plan",
+        "task_link_child",
       ].sort(),
     );
     await expect(
@@ -255,7 +256,19 @@ it("plans a text-only Model Step from the current Run profile and rejects extra 
       scope: caller.scope,
       effect: "allow",
     });
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: "task-planned",
+      action: "task:delegate",
+      scope: caller.scope,
+      effect: "allow",
+    });
     const planExistingTask = vi.fn(async () => {});
+    const linkChildTask = vi.fn(async () => ({
+      parentTaskId: "planned",
+      parentStepId: "child-step",
+      childTaskId: "child",
+    }));
     const plannedWorkerPermissions = vi.fn(async () => [
       { resourceId: "worker-workspace:configured", action: "worker:file:write" },
       { resourceId: "workspace:configured", action: "workspace:write" },
@@ -263,7 +276,11 @@ it("plans a text-only Model Step from the current Run profile and rejects extra 
     let currentRunId = accepted.run.id;
     const tools = createOpsTools({
       store,
-      service: { planExistingTask, plannedWorkerPermissions } as unknown as AuthorizedOpsService,
+      service: {
+        planExistingTask,
+        plannedWorkerPermissions,
+        linkChildTask,
+      } as unknown as AuthorizedOpsService,
       getContext: () => ({
         caller,
         conversationId: accepted.conversation.id,
@@ -332,6 +349,62 @@ it("plans a text-only Model Step from the current Run profile and rejects extra 
       expect.objectContaining({ runId: accepted.run.id }),
     );
     await plan.execute(
+      "plan-child",
+      {
+        taskId: "planned",
+        rootStepId: "child-step",
+        steps: [
+          {
+            id: "child-step",
+            kind: "child_task",
+            title: "Prepare a child Task",
+            dependencyIds: [],
+            instructions: "Delegate work under the configured workspace",
+            workerAccess: "write",
+          },
+        ],
+      },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    expect(planExistingTask).toHaveBeenLastCalledWith(
+      caller,
+      "planned",
+      [
+        expect.objectContaining({
+          kind: "child_task",
+          delegatedPermissionSet: [
+            { resourceId: "worker-workspace:configured", action: "worker:file:write" },
+            { resourceId: "workspace:configured", action: "workspace:write" },
+          ],
+        }),
+      ],
+      "child-step",
+      expect.objectContaining({ runId: accepted.run.id }),
+    );
+    const link = tools.find((tool) => tool.name === "task_link_child")!;
+    await link.execute(
+      "link-child",
+      {
+        parentTaskId: "planned",
+        parentStepId: "child-step",
+        expectedStepVersion: 2,
+        childTaskId: "child",
+        acceptanceCriteria: ["Child work reviewed"],
+        cancellationPolicy: "cancel_child",
+        failurePolicy: "block_parent",
+      },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    expect(linkChildTask).toHaveBeenCalledWith(
+      caller,
+      expect.objectContaining({ parentTaskId: "planned", childTaskId: "child" }),
+      expect.objectContaining({ runId: accepted.run.id }),
+    );
+    await plan.execute(
       "plan-worker",
       {
         taskId: "planned",
@@ -394,7 +467,7 @@ it("plans a text-only Model Step from the current Run profile and rejects extra 
     await expect(
       plan.execute("plan-with-non-model-run", input, undefined, undefined, {} as never),
     ).rejects.toThrow("protected_tool_failed");
-    expect(planExistingTask).toHaveBeenCalledTimes(3);
+    expect(planExistingTask).toHaveBeenCalledTimes(4);
   } finally {
     await store.close();
   }

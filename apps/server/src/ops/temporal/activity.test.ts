@@ -12,6 +12,331 @@ import { AuthorizedOpsService } from "../service.js";
 import { DEFAULT_TASK_GRAPH_LIMITS } from "../task-graph.js";
 import { createAdvanceLongWorkActivity } from "./activity.js";
 
+it("waits for a linked child Task and hands its accepted result to Step review", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  try {
+    await store.identities.bindOwner("owner", caller.scope);
+    const parent = await store.tasks.createTask({
+      title: "Parent work",
+      creatorPrincipalId: "owner",
+      authorizationScope: caller.scope,
+    });
+    const child = await store.tasks.createTask({
+      title: "Child work",
+      creatorPrincipalId: "owner",
+      authorizationScope: caller.scope,
+    });
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: `task-${parent.id}`,
+      action: "task:continue",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: `task-${parent.id}`,
+      action: "task:delegate",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    const now = new Date().toISOString();
+    const step: TaskStep = {
+      id: "child-step",
+      taskId: parent.id,
+      kind: "child_task",
+      title: "Wait for child",
+      status: "pending",
+      dependencyIds: [],
+      dependencyPolicy: { failed: "block", cancelled: "cancel", skipped: "skip" },
+      maxAttempts: 1,
+      requiredCapabilities: [],
+      delegatedPermissionSet: [],
+      version: 1,
+      createdAt: now,
+      updatedAt: now,
+    };
+    await store.longWork.createGraph(parent.id, [step], step.id, DEFAULT_TASK_GRAPH_LIMITS, {
+      kind: "system",
+      reason: "test child plan",
+    });
+    const advance = createAdvanceLongWorkActivity(store);
+    const input = { taskId: parent.id, policyRevision: 1 };
+    expect((await advance(input)).kind).toBe("wait");
+    const ready = (await store.longWork.listSteps(parent.id))[0]!;
+    expect(ready.status).toBe("ready");
+    const service = new AuthorizedOpsService(store, new FakeHerdrBridge("child-session"));
+    await service.linkChildTask(caller, {
+      parentTaskId: parent.id,
+      parentStepId: step.id,
+      expectedStepVersion: ready.version,
+      childTaskId: child.id,
+      acceptanceCriteria: ["Child result reviewed"],
+      cancellationPolicy: "keep_child",
+      failurePolicy: "block_parent",
+    });
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: `task-${child.id}`,
+      action: "task:plan",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    expect(
+      (
+        await store.authorization.check({
+          caller,
+          resourceId: `task-${child.id}`,
+          action: "task:plan",
+          delegatedTaskId: child.id,
+        })
+      ).decision,
+    ).toBe("ALLOW");
+    const childService = new AuthorizedOpsService(
+      store,
+      new FakeHerdrBridge("child-session"),
+      undefined,
+      {
+        available: () => true,
+        start: async () => undefined,
+        wake: async () => undefined,
+      },
+    );
+    const childStep: TaskStep = {
+      ...step,
+      id: "child-timer-step",
+      taskId: child.id,
+      kind: "timer_wait",
+      waitPolicy: { version: 1, kind: "duration", durationMs: 60_000, overdue: "resume" },
+    };
+    await childService.planExistingTask(caller, child.id, [childStep], childStep.id);
+    expect((await store.tasks.getTask(child.id))?.orchestrationMode).toBe("durable");
+    expect((await advance(input)).kind).toBe("wait");
+    await store.db.transaction(async (tx) => {
+      await tx.execute({
+        sql: "UPDATE tasks SET status = 'DONE' WHERE id = ?",
+        args: [child.id],
+      });
+    });
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    const reviewed = (await store.longWork.listSteps(parent.id))[0]!;
+    expect(reviewed.status).toBe("review");
+    expect(reviewed.outputRef).toBe(`task:${child.id}`);
+    expect((await store.longWork.getChildTaskLink(child.id))?.resultRef).toBe(`task:${child.id}`);
+    expect((await store.tasks.getTask(parent.id))?.status).not.toBe("DONE");
+  } finally {
+    await store.close();
+  }
+});
+
+it("applies the linked child cancellation policy without claiming rollback", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  try {
+    await store.identities.bindOwner("owner", caller.scope);
+    const service = new AuthorizedOpsService(store, new FakeHerdrBridge("child-session"));
+    const wakeChild = vi.fn(async (_taskId: string) => undefined);
+    const advance = createAdvanceLongWorkActivity(store, undefined, wakeChild);
+    for (const policy of ["cancel_child", "keep_child"] as const) {
+      const parent = await store.tasks.createTask({
+        title: `Parent ${policy}`,
+        creatorPrincipalId: "owner",
+        authorizationScope: caller.scope,
+      });
+      const child = await store.tasks.createTask({
+        title: `Child ${policy}`,
+        creatorPrincipalId: "owner",
+        authorizationScope: caller.scope,
+      });
+      for (const action of ["task:continue", "task:delegate", "task:cancel"])
+        await store.authorization.grant({
+          principalId: "owner",
+          resourceId: `task-${parent.id}`,
+          action,
+          scope: caller.scope,
+          effect: "allow",
+        });
+      await store.authorization.grant({
+        principalId: "owner",
+        resourceId: `task-${child.id}`,
+        action: "task:cancel",
+        scope: caller.scope,
+        effect: "allow",
+      });
+      await store.authorization.grant({
+        principalId: "owner",
+        resourceId: `task-${child.id}`,
+        action: "task:delegate",
+        scope: caller.scope,
+        effect: "allow",
+      });
+      const now = new Date().toISOString();
+      const step: TaskStep = {
+        id: `child-step-${policy}`,
+        taskId: parent.id,
+        kind: "child_task",
+        title: "Await child",
+        status: "pending",
+        dependencyIds: [],
+        dependencyPolicy: { failed: "block", cancelled: "cancel", skipped: "skip" },
+        maxAttempts: 1,
+        requiredCapabilities: [],
+        delegatedPermissionSet: [],
+        version: 1,
+        createdAt: now,
+        updatedAt: now,
+      };
+      await store.longWork.createGraph(parent.id, [step], step.id, DEFAULT_TASK_GRAPH_LIMITS, {
+        kind: "system",
+        reason: "test child cancellation",
+      });
+      const input = { taskId: parent.id, policyRevision: 1 };
+      await advance(input);
+      const ready = (await store.longWork.listSteps(parent.id))[0]!;
+      await service.linkChildTask(caller, {
+        parentTaskId: parent.id,
+        parentStepId: step.id,
+        expectedStepVersion: ready.version,
+        childTaskId: child.id,
+        acceptanceCriteria: ["Child work handled"],
+        cancellationPolicy: policy,
+        failurePolicy: "block_parent",
+      });
+      await expect(
+        service.delegate(caller, {
+          taskId: child.id,
+          workspaceId: "configured",
+          agentKind: "pi",
+          prompt: "Bypass the child graph",
+        }),
+      ).rejects.toThrow("Linked child Task requires a durable graph");
+      if (policy === "cancel_child") {
+        await store.authorization.grant({
+          principalId: "owner",
+          resourceId: `task-${child.id}`,
+          action: "task:plan",
+          scope: caller.scope,
+          effect: "allow",
+        });
+        const childService = new AuthorizedOpsService(
+          store,
+          new FakeHerdrBridge("child-session"),
+          undefined,
+          {
+            available: () => true,
+            start: async () => undefined,
+            wake: async () => undefined,
+          },
+        );
+        const childStep: TaskStep = {
+          ...step,
+          id: `child-timer-${policy}`,
+          taskId: child.id,
+          kind: "timer_wait",
+          waitPolicy: { version: 1, kind: "duration", durationMs: 60_000, overdue: "resume" },
+        };
+        await childService.planExistingTask(caller, child.id, [childStep], childStep.id);
+      }
+      expect(await service.cancel(caller, parent.id)).toBe(false);
+      expect((await advance(input)).kind).toBe(policy === "cancel_child" ? "wait" : "continue");
+      if (policy === "cancel_child") {
+        expect(wakeChild).toHaveBeenCalledWith(child.id);
+        expect((await store.tasks.getTask(child.id))?.cancellationState).toBe("requested");
+        expect(await advance({ taskId: child.id, policyRevision: 1 })).toEqual({
+          kind: "complete",
+        });
+        expect((await advance(input)).kind).toBe("continue");
+      }
+      expect((await store.longWork.listSteps(parent.id))[0]?.status).toBe("cancelled");
+      expect(await advance(input)).toEqual({ kind: "complete" });
+      expect((await store.tasks.getTask(parent.id))?.status).toBe("CANCELED");
+      expect((await store.tasks.getTask(child.id))?.status).toBe(
+        policy === "cancel_child" ? "CANCELED" : "NEW",
+      );
+      expect((await store.longWork.listEvents(parent.id)).at(-2)?.metadata).toMatchObject({
+        rollbackPerformed: false,
+      });
+    }
+  } finally {
+    await store.close();
+  }
+});
+
+it("applies each explicit child failure policy to the parent Step", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  try {
+    await store.identities.bindOwner("owner", caller.scope);
+    const service = new AuthorizedOpsService(store, new FakeHerdrBridge("child-session"));
+    const advance = createAdvanceLongWorkActivity(store);
+    for (const [policy, expected] of [
+      ["block_parent", "blocked"],
+      ["fail_parent", "failed"],
+      ["review_parent", "review"],
+    ] as const) {
+      const parent = await store.tasks.createTask({
+        title: `Parent ${policy}`,
+        creatorPrincipalId: "owner",
+        authorizationScope: caller.scope,
+      });
+      const child = await store.tasks.createTask({
+        title: `Child ${policy}`,
+        creatorPrincipalId: "owner",
+        authorizationScope: caller.scope,
+      });
+      for (const action of ["task:continue", "task:delegate"])
+        await store.authorization.grant({
+          principalId: "owner",
+          resourceId: `task-${parent.id}`,
+          action,
+          scope: caller.scope,
+          effect: "allow",
+        });
+      const now = new Date().toISOString();
+      const step: TaskStep = {
+        id: `child-step-${policy}`,
+        taskId: parent.id,
+        kind: "child_task",
+        title: "Await child",
+        status: "pending",
+        dependencyIds: [],
+        dependencyPolicy: { failed: "block", cancelled: "cancel", skipped: "skip" },
+        maxAttempts: 1,
+        requiredCapabilities: [],
+        delegatedPermissionSet: [],
+        version: 1,
+        createdAt: now,
+        updatedAt: now,
+      };
+      await store.longWork.createGraph(parent.id, [step], step.id, DEFAULT_TASK_GRAPH_LIMITS, {
+        kind: "system",
+        reason: "test child failure",
+      });
+      const input = { taskId: parent.id, policyRevision: 1 };
+      await advance(input);
+      const ready = (await store.longWork.listSteps(parent.id))[0]!;
+      await service.linkChildTask(caller, {
+        parentTaskId: parent.id,
+        parentStepId: step.id,
+        expectedStepVersion: ready.version,
+        childTaskId: child.id,
+        acceptanceCriteria: ["Child work handled"],
+        cancellationPolicy: "keep_child",
+        failurePolicy: policy,
+      });
+      await store.db.transaction(async (tx) => {
+        await tx.execute({
+          sql: "UPDATE tasks SET status = 'FAILED' WHERE id = ?",
+          args: [child.id],
+        });
+      });
+      expect(await advance(input)).toEqual({ kind: "continue" });
+      expect((await store.longWork.listSteps(parent.id))[0]?.status).toBe(expected);
+      expect((await store.tasks.getTask(parent.id))?.status).not.toBe("DONE");
+    }
+  } finally {
+    await store.close();
+  }
+});
+
 const caller: CallerContext = {
   principalId: "owner",
   scope: {

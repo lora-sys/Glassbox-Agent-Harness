@@ -64,6 +64,20 @@ it("intersects a child execution grant with every current delegated resource and
       scope: caller.scope,
       effect: "allow",
     });
+    const childPlanningGrant = await store.authorization.grant({
+      principalId: "owner",
+      resourceId: "task-child",
+      action: "task:plan",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: "task-child",
+      action: "task:delegate",
+      scope: caller.scope,
+      effect: "allow",
+    });
     await store.db.transaction(async (tx) => {
       await tx.execute(
         "INSERT INTO task_steps(id,task_id,kind,title,status,dependency_policy_json,max_attempts,required_capabilities_json,delegated_permissions_json,version,created_at,updated_at) VALUES ('parent-step','parent','child_task','Child','running','{}',1,'[]','[]',1,'now','now')",
@@ -107,6 +121,24 @@ it("intersects a child execution grant with every current delegated resource and
         delegatedTaskId: "child",
       }),
     ).toMatchObject({ decision: "DENY", reason: "delegation_scope_denied" });
+    for (const action of ["task:plan", "task:delegate"])
+      expect(
+        await store.authorization.check({
+          caller,
+          resourceId: "task-child",
+          action,
+          delegatedTaskId: "child",
+        }),
+      ).toMatchObject({ decision: "ALLOW" });
+    await store.authorization.revoke(childPlanningGrant);
+    expect(
+      await store.authorization.check({
+        caller,
+        resourceId: "task-child",
+        action: "task:plan",
+        delegatedTaskId: "child",
+      }),
+    ).toMatchObject({ decision: "DENY" });
     expect(
       (
         await store.authorization.check({

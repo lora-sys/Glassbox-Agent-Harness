@@ -1727,6 +1727,8 @@ export class LongWorkStore {
     parentStepId: string;
     expectedStepVersion: number;
     childTaskId: string;
+    /** Required by the external service path; internal migrations may omit it. */
+    delegationDecisionId?: string;
     delegatedPermissionSet: ChildTaskLink["delegatedPermissionSet"];
     acceptanceCriteria: readonly string[];
     cancellationPolicy: ChildTaskLink["cancellationPolicy"];
@@ -1735,6 +1737,7 @@ export class LongWorkStore {
   }): Promise<ChildTaskLink> {
     for (const value of [input.parentTaskId, input.parentStepId, input.childTaskId])
       requireIdentifier(value);
+    if (input.delegationDecisionId) requireIdentifier(input.delegationDecisionId);
     if (
       input.parentTaskId === input.childTaskId ||
       !Number.isSafeInteger(input.expectedStepVersion) ||
@@ -1773,6 +1776,35 @@ export class LongWorkStore {
         ],
       });
       if (!decision.rows[0]) throw new Error("Current Task continuation grant is required");
+      if (input.delegationDecisionId) {
+        const delegation = await tx.execute({
+          sql: `SELECT 1 FROM authorization_decisions d JOIN grants g ON g.id = d.grant_id
+            WHERE d.id = ? AND d.principal_id = ? AND d.resource_id = ?
+              AND d.action = 'task:delegate' AND d.scope_key = ? AND d.decision = 'ALLOW'
+              AND g.revoked_at IS NULL`,
+          args: [
+            input.delegationDecisionId,
+            origin.actorPrincipalId,
+            `task-${input.parentTaskId}`,
+            parent.origin_scope_key,
+          ],
+        });
+        if (!delegation.rows[0]) throw new Error("Current parent Task delegation is required");
+        const scope = reconstructTaskOriginScope(
+          stringColumn(parent, "origin_scope_key"),
+          parent.origin_scope_json,
+        );
+        for (const action of ["task:continue", "task:delegate"]) {
+          const current = await evaluate(tx, {
+            caller: { principalId: origin.actorPrincipalId, scope },
+            resourceId: `task-${input.parentTaskId}`,
+            action,
+            delegatedTaskId: input.parentTaskId,
+          });
+          if (current.decision !== "ALLOW")
+            throw new Error("Current parent Task delegation is required");
+        }
+      }
 
       const parentPermissions = parseJson<TaskStep["delegatedPermissionSet"]>(
         step,
@@ -1942,6 +1974,95 @@ export class LongWorkStore {
         args: parentStepId ? [parentTaskId, parentStepId] : [parentTaskId],
       });
       return result.rows.map(parseChildTaskLink);
+    });
+  }
+
+  /** Converts an accepted or terminal child Task into a parent Step result reference. */
+  async observeLinkedChildTask(input: {
+    parentTaskId: string;
+    parentStepId: string;
+    childTaskId: string;
+    expectedStepVersion: number;
+    origin: LongWorkOrigin;
+  }): Promise<TaskStep | null> {
+    for (const value of [input.parentTaskId, input.parentStepId, input.childTaskId])
+      requireIdentifier(value);
+    if (!Number.isSafeInteger(input.expectedStepVersion) || input.expectedStepVersion < 1)
+      throw new Error("Invalid child Step observation version");
+    return this.db.transaction(async (tx) => {
+      await this.requireOrigin(tx, input.origin);
+      await this.requireActiveDurableTask(tx, input.parentTaskId);
+      const step = await this.requireStep(tx, input.parentTaskId, input.parentStepId);
+      if (
+        step.kind !== "child_task" ||
+        step.status !== "running" ||
+        Number(step.version) !== input.expectedStepVersion
+      )
+        throw new Error("Child Step observation conflict");
+      const links = await tx.execute({
+        sql: `SELECT * FROM task_child_links
+          WHERE parent_task_id = ? AND parent_step_id = ? AND child_task_id = ?`,
+        args: [input.parentTaskId, input.parentStepId, input.childTaskId],
+      });
+      const link = links.rows[0];
+      if (!link) throw new Error("Child Task link is unavailable");
+      const child = await this.requireTask(tx, input.childTaskId);
+      const childStatus = stringColumn(child, "status");
+      if (!["DONE", "ACCEPTED", "FAILED", "CANCELED"].includes(childStatus)) return null;
+      const failurePolicy = stringColumn(link, "failure_policy");
+      const succeeded = childStatus === "DONE" || childStatus === "ACCEPTED";
+      const nextStatus = succeeded
+        ? "review"
+        : failurePolicy === "fail_parent"
+          ? "failed"
+          : failurePolicy === "review_parent"
+            ? "review"
+            : "blocked";
+      const resultRef = succeeded ? `task:${input.childTaskId}` : null;
+      const now = new Date().toISOString();
+      const updated = await tx.execute({
+        sql: `UPDATE task_steps SET status = ?, output_ref = ?, version = version + 1,
+            updated_at = ? WHERE id = ? AND task_id = ? AND version = ? AND status = 'running'`,
+        args: [
+          nextStatus,
+          resultRef,
+          now,
+          input.parentStepId,
+          input.parentTaskId,
+          input.expectedStepVersion,
+        ],
+      });
+      if (updated.rowsAffected !== 1) throw new Error("Child Step observation conflict");
+      if (resultRef) {
+        const linked = await tx.execute({
+          sql: `UPDATE task_child_links SET result_ref = ?
+            WHERE child_task_id = ? AND parent_task_id = ? AND parent_step_id = ?
+              AND result_ref IS NULL`,
+          args: [resultRef, input.childTaskId, input.parentTaskId, input.parentStepId],
+        });
+        if (linked.rowsAffected !== 1) throw new Error("Child result link conflict");
+      }
+      await this.appendEventTx(tx, {
+        taskId: input.parentTaskId,
+        stepId: input.parentStepId,
+        type:
+          nextStatus === "review"
+            ? "STEP_REVIEW"
+            : nextStatus === "failed"
+              ? "STEP_FAILED"
+              : "STEP_BLOCKED",
+        origin: input.origin,
+        evidenceRef: `task:${input.childTaskId}`,
+        metadata: { childTaskId: input.childTaskId, childStatus, failurePolicy },
+      });
+      const dependencies = await tx.execute({
+        sql: "SELECT dependency_id FROM task_step_dependencies WHERE task_id = ? AND step_id = ? ORDER BY dependency_id",
+        args: [input.parentTaskId, input.parentStepId],
+      });
+      return parseStep(
+        await this.requireStep(tx, input.parentTaskId, input.parentStepId),
+        dependencies.rows.map((row) => stringColumn(row, "dependency_id")),
+      );
     });
   }
 

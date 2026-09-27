@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type {
   AgentOpsSnapshot,
   AgentTask,
+  ChildTaskLink,
   TaskPriority,
   TaskSignal,
   TaskStep,
@@ -288,7 +289,10 @@ export class AuthorizedOpsService {
     access: "read" | "write",
     evidence?: RunEvidence,
   ): Promise<TaskStep["delegatedPermissionSet"]> {
-    await this.authorize(caller, `task-${taskId}`, "task:plan", evidence);
+    await this.authorize(caller, `task-${taskId}`, "task:plan", {
+      ...evidence,
+      delegatedTaskId: taskId,
+    });
     if (!this.workerPolicy || !this.workspaceBoundary || !isAbsolute(root))
       throw new Error("Configured Pi Worker workspace is unavailable");
     const canonicalRoot = await realpath(root);
@@ -344,6 +348,48 @@ export class AuthorizedOpsService {
     return [...required, ...optionalRead];
   }
 
+  async linkChildTask(
+    caller: CallerContext,
+    input: {
+      parentTaskId: string;
+      parentStepId: string;
+      expectedStepVersion: number;
+      childTaskId: string;
+      acceptanceCriteria: readonly string[];
+      cancellationPolicy: ChildTaskLink["cancellationPolicy"];
+      failurePolicy: ChildTaskLink["failurePolicy"];
+    },
+    evidence?: RunEvidence,
+  ): Promise<ChildTaskLink> {
+    const continuation = await this.authorize(
+      caller,
+      `task-${input.parentTaskId}`,
+      "task:continue",
+      { ...evidence, delegatedTaskId: input.parentTaskId },
+    );
+    const delegation = await this.authorize(caller, `task-${input.parentTaskId}`, "task:delegate", {
+      ...evidence,
+      delegatedTaskId: input.parentTaskId,
+    });
+    const step = (await this.store.longWork.listSteps(input.parentTaskId)).find(
+      (entry) => entry.id === input.parentStepId,
+    );
+    if (!step || step.kind !== "child_task" || step.version !== input.expectedStepVersion)
+      throw new Error("Child Step version or kind conflict");
+    const link = await this.store.longWork.createChildTaskLink({
+      ...input,
+      delegationDecisionId: delegation.id,
+      delegatedPermissionSet: step.delegatedPermissionSet,
+      origin: {
+        kind: "decision",
+        decisionId: continuation.id,
+        actorPrincipalId: caller.principalId,
+      },
+    });
+    await this.longWorkRuntime?.wake(input.parentTaskId).catch(() => undefined);
+    return link;
+  }
+
   async planExistingTask(
     caller: CallerContext,
     taskId: string,
@@ -351,7 +397,10 @@ export class AuthorizedOpsService {
     rootStepId: string,
     evidence?: RunEvidence,
   ): Promise<void> {
-    const decision = await this.authorize(caller, `task-${taskId}`, "task:plan", evidence);
+    const decision = await this.authorize(caller, `task-${taskId}`, "task:plan", {
+      ...evidence,
+      delegatedTaskId: taskId,
+    });
     for (const step of steps) {
       for (const permission of step.delegatedPermissionSet) {
         const delegated = await this.store.authorization.check({
@@ -546,6 +595,8 @@ export class AuthorizedOpsService {
           description: input.description ?? input.prompt,
         });
     if (!task) throw new Error("Task is unavailable");
+    if (await this.store.longWork.getChildTaskLink(task.id))
+      throw new Error("Linked child Task requires a durable graph before execution");
     const attempt = await this.store.tasks.createAttempt({ taskId: task.id });
     let context: WorkerContext | undefined;
     let started = false;
