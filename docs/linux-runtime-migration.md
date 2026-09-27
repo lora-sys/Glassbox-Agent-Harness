@@ -31,7 +31,7 @@ The pinned Kit commit is currently not obtainable from its GitHub remote. The Ki
 - Glassbox `vp run verify:full` passed with 1482 unit tests passed and one existing live Herdr test skipped. Core checks and Web build passed.
 - Glassbox started with disposable Linux data on a separate port. An unauthenticated management request returned 401. That instance was then stopped.
 - A consistent Windows SQLite backup with schema version 11 passed `PRAGMA quick_check`. Its protected Linux copy has the same SHA256. It is a staging snapshot, not a cutover copy.
-- Linux Herdr 0.9.0, `agent-browser` 0.38.1, Chrome for Testing, `rg`, and `fd` are installed. Chrome has not yet launched because Linux libraries are missing. Linux Docker and NapCat are not yet ready.
+- Linux Herdr 0.9.0, `agent-browser` 0.38.1, Chrome for Testing, `rg`, and `fd` are installed. Chrome has not yet launched because Linux libraries are missing. The pinned Linux NapCat image is downloaded and its Compose configuration parses. User level Linux Docker access and NapCat startup are not yet ready.
 - The Windows Glassbox, NapCat, and Herdr processes remain active. Real Linux QQ and Worker acceptance have not run.
 
 ## Prepare an independent Linux checkout
@@ -39,8 +39,10 @@ The pinned Kit commit is currently not obtainable from its GitHub remote. The Ki
 1. Clone Glassbox and Kit into the Linux filesystem, such as `~/src`. Do not run the Linux service from `/mnt/c` or copy Windows `node_modules` or native binaries.
 2. Run `scripts/setup-linux-toolchain.sh` to install the locked Linux Node and npm versions. Put the reported `bin` directory first in the PATH used by builds and services. The script verifies the Node archive against the official `SHASUMS256.txt` before extracting it.
 3. Install `git`, `rg`, `fd`, browser libraries, a Linux Docker backend, and Linux browser binaries. On Ubuntu, the `fd-find` package installs `fdfind`; provide an `fd` command for tool compatibility.
-4. Run `npm ci` independently in Glassbox and the pinned Kit checkout. Run Kit doctor and Glassbox `vp run verify:full` in Linux. Keep their results separate from Windows verification.
+4. Run `npm ci` independently in Glassbox and the pinned Kit checkout. Run Kit doctor, `scripts/doctor-linux-runtime.sh`, and Glassbox `vp run verify:full` in Linux. Keep their results separate from Windows verification.
 5. Prepare Linux Herdr, NapCat, QQ, browser, sandbox image, and protected service configuration. Pin exact releases or image digests. Use Linux paths and executables in the Linux service configuration.
+
+For NapCat on Linux x86_64, `docs/napcat-linux.compose.yml` pins the v4.18.28 Docker image by its platform digest. Set `NAPCAT_UID`, `NAPCAT_GID`, and `NAPCAT_DATA_DIR` before using Compose. The data directory needs private `config` and `ntqq` directories. The copied OneBot WebSocket server configuration must listen on `0.0.0.0` inside the container; Compose exposes ports 6700 and 6099 only on the Linux host loopback address. Validate the Compose file with `docker-compose -f docs/napcat-linux.compose.yml config --quiet` before cutover. Do not start the Linux bot while the Windows bot is active.
 
 Do not place provider keys, QQ credentials, management tokens, or the live database in the repository. The Linux `service-launch.json` belongs in an access restricted data directory. Keep the Windows and Linux process registries separate.
 
@@ -48,6 +50,7 @@ Do not place provider keys, QQ credentials, management tokens, or the live datab
 
 1. Record Windows process identities, service versions, current database schema, live QQ result, and a consistent database backup. Identify the only active Glassbox consumer.
 2. Stop the Windows Glassbox process before starting the Linux Glassbox consumer against transferred durable state. Never let Windows and Linux write the same SQLite file through `/mnt/c`.
+   Copy the final stopped database and durable files into the Linux data directory. Exclude Windows `runtime`, `service-processes.json`, lock directories, and logs. Convert the copied default workspace paths with `node scripts/migrate-windows-workspaces.mjs <linux-data-root> <windows-data-root>`. This helper only accepts default workspaces whose original paths match their IDs under the Windows data root. It stops if a registered workspace needs a separately reviewed path mapping. Keep the original registry backup that it creates.
 3. Keep Windows NapCat as the temporary QQ protocol endpoint. Connect Linux Glassbox through the configured OneBot contract and verify one Owner private message and one group activation with Run and delivery evidence.
 4. Stop the Windows NapCat bot process. Start the pinned Linux NapCat and Linux QQ runtime using its own Linux profile. Verify account login, OneBot connection, private and group replies, and Trace provenance. Never leave both bot runtimes active.
 5. Move the Herdr service and Worker workspace to Linux. Verify a disposable delegated Task through review and acceptance. Then verify Memory and retrieval, protected QQ tools, Web, Pi basic tools, browser, sandbox, and restart recovery.
