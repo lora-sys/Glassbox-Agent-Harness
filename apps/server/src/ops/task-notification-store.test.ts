@@ -119,6 +119,39 @@ it("enqueues immutable fixed content once for an exact external Run and Task eve
   ).rejects.toThrow("immutable");
 });
 
+it("keeps a Task event when persisted notification routing data is invalid", async () => {
+  const { domain, task, notifications } = await fixture();
+  await domain.db.transaction((tx) =>
+    tx.execute({
+      sql: "UPDATE tasks SET origin_scope_json = ? WHERE id = ?",
+      args: ["{invalid", task.id],
+    }),
+  );
+
+  const sequence = await domain.db.transaction(async (tx) => {
+    const event = await tx.execute({
+      sql: "INSERT INTO task_events(id,task_id,type,metadata_json,created_at) VALUES (?,?,?,?,?) RETURNING sequence",
+      args: ["invalid-route-review", task.id, "TASK_REVIEW", "{}", new Date().toISOString()],
+    });
+    const sequence = Number(event.rows[0]!.sequence);
+    expect(await notifications.enqueueTx(tx, sequence)).toBeNull();
+    return sequence;
+  });
+
+  const persisted = await domain.db.transaction(async (tx) => ({
+    event: await tx.execute({
+      sql: "SELECT sequence FROM task_events WHERE sequence = ?",
+      args: [sequence],
+    }),
+    notifications: await tx.execute({
+      sql: "SELECT id FROM task_notifications WHERE event_sequence = ?",
+      args: [sequence],
+    }),
+  }));
+  expect(persisted.event.rows).toHaveLength(1);
+  expect(persisted.notifications.rows).toHaveLength(0);
+});
+
 it("suppresses a pending notification after delivery permission is revoked", async () => {
   const { domain, task, notifications } = await fixture();
   const sequence = await appendEvent(domain, task.id, "TASK_ACCEPTED");

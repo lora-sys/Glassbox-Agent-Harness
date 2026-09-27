@@ -139,8 +139,16 @@ export class TaskNotificationStore {
     )
       return null;
 
-    const taskScope = reconstructTaskOriginScope(originScopeKey, originScopeJson);
-    const runScope = parseStoredScope(stringColumn(row, "run_scope_json"));
+    let taskScope: TrustedChannelScope;
+    let runScope: TrustedChannelScope;
+    try {
+      taskScope = reconstructTaskOriginScope(originScopeKey, originScopeJson);
+      runScope = parseStoredScope(stringColumn(row, "run_scope_json"));
+    } catch {
+      // Invalid historical routing data cannot authorize a notification. Keep the
+      // Task event durable even when its optional notification cannot be sent.
+      return null;
+    }
     if (
       scopeKey(taskScope) !== originScopeKey ||
       scopeKey(runScope) !== originScopeKey ||
