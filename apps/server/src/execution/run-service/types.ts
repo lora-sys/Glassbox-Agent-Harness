@@ -12,6 +12,7 @@ export interface ExecutionInput {
   conversation: ConversationRecord;
   run: RunRecord;
   taskStepBinding?: { taskId: string; stepId: string; attemptId: string };
+  stepResults?: Array<{ stepId: string; runId: string; text: string; truncated: boolean }>;
   text: string;
   history: Array<{ role: "user" | "assistant"; text: string }>;
   historyRunIds?: string[];

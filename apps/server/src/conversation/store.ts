@@ -84,6 +84,8 @@ export interface RunInputRecord {
   historyOmittedRunIds?: string[];
   providerSessionId: string | null;
   taskStepBinding?: { taskId: string; stepId: string; attemptId: string };
+  /** Current-authorized excerpts of accepted direct Model Step dependencies. */
+  stepResults?: Array<{ stepId: string; runId: string; text: string; truncated: boolean }>;
 }
 
 export function agentResourceId(agentId: string): string {
@@ -994,6 +996,7 @@ export class ConversationStore {
         });
         const conversation = conversationRecord(conversations.rows[0]!, caller.scope);
         let taskStepBinding: RunInputRecord["taskStepBinding"];
+        let stepResults: RunInputRecord["stepResults"];
         if (run.source === "task_step") {
           const bindingRows = await tx.execute({
             sql: `SELECT ar.task_id, ar.step_id, ar.attempt_id
@@ -1026,6 +1029,62 @@ export class ConversationStore {
             stepId: stringColumn(bindingRows.rows[0], "step_id"),
             attemptId: stringColumn(bindingRows.rows[0], "attempt_id"),
           };
+          if (!run.executionRef.startsWith("tool:")) {
+            const dependencies = await tx.execute({
+              sql: `SELECT s.id, s.kind, s.status, s.output_ref
+                FROM task_step_dependencies d
+                JOIN task_steps s ON s.id = d.dependency_id AND s.task_id = d.task_id
+                WHERE d.task_id = ? AND d.step_id = ? ORDER BY s.id`,
+              args: [taskStepBinding.taskId, taskStepBinding.stepId],
+            });
+            stepResults = [];
+            for (const dependency of dependencies.rows) {
+              const outputRef = optionalString(dependency, "output_ref");
+              if (
+                dependency.kind !== "model" ||
+                dependency.status !== "succeeded" ||
+                !outputRef?.startsWith("run:")
+              )
+                continue;
+              const sourceRunId = outputRef.slice(4);
+              requireIdentifier(sourceRunId);
+              const source = await tx.execute({
+                sql: `SELECT r.result_text FROM task_attempt_runs ar
+                  JOIN runs r ON r.id = ar.run_id
+                  WHERE ar.run_id = ? AND ar.task_id = ? AND ar.step_id = ?
+                    AND r.source = 'task_step' AND r.status = 'succeeded'`,
+                args: [sourceRunId, taskStepBinding.taskId, stringColumn(dependency, "id")],
+              });
+              if (!source.rows[0] || typeof source.rows[0].result_text !== "string")
+                throw new Error("Accepted dependency result is unavailable");
+              const sourceAuthorization = await authorizeRun(
+                tx,
+                caller,
+                sourceRunId,
+                "conversation:read",
+              );
+              if ("denied" in sourceAuthorization) return sourceAuthorization;
+              const contentDecision = await evaluate(tx, {
+                caller,
+                resourceId: `task-${taskStepBinding.taskId}`,
+                action: "task:read",
+                conversationId: run.conversationId,
+                runId,
+              });
+              if (contentDecision.decision !== "ALLOW") return { denied: contentDecision };
+              await tx.execute({
+                sql: "UPDATE authorization_decisions SET delivery_source = 'content_source' WHERE id = ?",
+                args: [contentDecision.id],
+              });
+              const text = stringColumn(source.rows[0], "result_text");
+              stepResults.push({
+                stepId: stringColumn(dependency, "id"),
+                runId: sourceRunId,
+                text: text.slice(0, 2_048),
+                truncated: text.length > 2_048,
+              });
+            }
+          }
         }
         const earlier =
           run.source === "external"
@@ -1155,6 +1214,7 @@ export class ConversationStore {
             historyOmittedRunIds: omittedRunIds,
             providerSessionId,
             ...(taskStepBinding ? { taskStepBinding } : {}),
+            ...(stepResults?.length ? { stepResults } : {}),
           },
         };
       }),

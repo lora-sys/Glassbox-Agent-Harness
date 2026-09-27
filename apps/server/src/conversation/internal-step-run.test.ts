@@ -245,6 +245,72 @@ describe("internal Task Step Runs", () => {
     });
   });
 
+  it("loads a bounded accepted Model dependency through current Run authorization", async () => {
+    const { db, conversations } = await fixture();
+    const sourceRun = await conversations.createInternalStepRun({
+      caller,
+      taskId: "task-1",
+      stepId: "step-1",
+      attemptId: "attempt-1",
+      executionRef: "pi:default",
+    });
+    await db.transaction(async (tx) => {
+      await tx.execute({
+        sql: "UPDATE runs SET status = 'succeeded', result_text = ? WHERE id = ?",
+        args: ["A".repeat(2_200), sourceRun.id],
+      });
+      await tx.execute({
+        sql: "UPDATE task_steps SET status = 'succeeded', output_ref = ? WHERE id = 'step-1'",
+        args: [`run:${sourceRun.id}`],
+      });
+      await tx.execute({
+        sql: "INSERT INTO task_steps(id,task_id,kind,title,instructions,status,dependency_policy_json,max_attempts,required_capabilities_json,delegated_permissions_json,version,created_at,updated_at) VALUES ('step-2','task-1','model','Follow-up','Use the accepted result','running','{}',1,'[]','[]',1,?,?)",
+        args: [time, time],
+      });
+      await tx.execute(
+        "INSERT INTO task_step_dependencies(task_id,step_id,dependency_id) VALUES ('task-1','step-2','step-1')",
+      );
+      await tx.execute({
+        sql: "INSERT INTO task_attempts(id,task_id,attempt_number,status,started_at,step_id) VALUES ('attempt-2','task-1',2,'running',?,'step-2')",
+        args: [time],
+      });
+      await tx.execute({
+        sql: "INSERT INTO task_step_leases(id,task_id,step_id,attempt_id,owner_instance_id,state,version,acquired_at,heartbeat_at,expires_at) VALUES ('lease-2','task-1','step-2','attempt-2','worker-1','active',1,?,?,?)",
+        args: [time, time, leaseExpiry],
+      });
+    });
+    const followUp = await conversations.createInternalStepRun({
+      caller,
+      taskId: "task-1",
+      stepId: "step-2",
+      attemptId: "attempt-2",
+      executionRef: "pi:default",
+    });
+    const input = await conversations.loadRunInput(caller, followUp.id);
+    expect(input.text).toBe("Use the accepted result");
+    expect(input.stepResults).toEqual([
+      { stepId: "step-1", runId: sourceRun.id, text: "A".repeat(2_048), truncated: true },
+    ]);
+    await db.transaction(async (tx) => {
+      const decisions = await tx.execute({
+        sql: "SELECT resource_id, action, delivery_source FROM authorization_decisions WHERE run_id = ? AND delivery_source = 'content_source'",
+        args: [followUp.id],
+      });
+      expect(decisions.rows).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ resource_id: "task-task-1", action: "task:read" }),
+        ]),
+      );
+      await tx.execute({
+        sql: "UPDATE grants SET revoked_at = ? WHERE id = 'grant-task'",
+        args: [time],
+      });
+    });
+    await expect(conversations.loadRunInput(caller, followUp.id)).rejects.toMatchObject({
+      decision: { reason: "no_grant" },
+    });
+  });
+
   it("requires the persisted Tool Step kind, exact spec, and active Attempt lease", async () => {
     const { db, conversations } = await fixture();
     const request = {
