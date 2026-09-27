@@ -637,6 +637,133 @@ it("dispatches one Worker, reviews and cancels it safely, and quarantines an unc
     expect((await store.tasks.getTask(cancelledTask.id))?.status).toBe("CANCELED");
     expect(writes.status(workspace.id)).toBe("free");
 
+    const unknownTask = await store.tasks.createTask({
+      title: "Cancel a quarantined bound Worker",
+      creatorPrincipalId: "owner",
+      authorizationScope: caller.scope,
+    });
+    for (const action of ["task:continue", "task:delegate", "task:cancel"])
+      await store.authorization.grant({
+        principalId: "owner",
+        resourceId: `task-${unknownTask.id}`,
+        action,
+        scope: caller.scope,
+        effect: "allow",
+      });
+    const unknownStep = { ...step, id: "unknown-bound-step", taskId: unknownTask.id };
+    await store.longWork.createGraph(
+      unknownTask.id,
+      [unknownStep],
+      unknownStep.id,
+      DEFAULT_TASK_GRAPH_LIMITS,
+      { kind: "system", reason: "test bound Worker quarantine" },
+    );
+    const unknownInput = { taskId: unknownTask.id, policyRevision: 1 };
+    expect(await advance(unknownInput)).toEqual({ kind: "continue" });
+    const unknownAttempt = (await store.tasks.listAttempts(unknownTask.id))[0]!;
+    const unknownBinding = (await store.tasks.getWorkerBinding(unknownAttempt.id))!;
+    const runningUnknown = (await store.longWork.listSteps(unknownTask.id))[0]!;
+    const activeUnknownLease = (await store.longWork.getActiveLease(
+      unknownTask.id,
+      unknownStep.id,
+    ))!;
+    await service.quarantineClaimedWorker(unknownAttempt.id);
+    await store.longWork.settleClaimedStep({
+      taskId: unknownTask.id,
+      stepId: unknownStep.id,
+      attemptId: unknownAttempt.id,
+      leaseId: activeUnknownLease.id,
+      ownerInstanceId: activeUnknownLease.ownerInstanceId,
+      expectedStepVersion: runningUnknown.version,
+      expectedLeaseVersion: activeUnknownLease.version,
+      workerBindingId: unknownBinding.id,
+      outcome: "unknown",
+      evidenceRef: `worker-response-unknown:${unknownAttempt.id}`,
+      origin: { kind: "system", reason: "test unknown Worker" },
+    });
+    expect(writes.status(workspace.id)).toBe("quarantined");
+    expect(await service.cancel(caller, unknownTask.id)).toBe(false);
+    expect((await store.longWork.listSteps(unknownTask.id))[0]?.status).toBe("cancelled");
+    expect(await advance(unknownInput)).toEqual({ kind: "continue" });
+    expect(writes.status(workspace.id)).toBe("free");
+    expect((await bridge.getSnapshot()).workspaces[0]?.panes).toHaveLength(0);
+    expect(await advance(unknownInput)).toEqual({ kind: "complete" });
+    expect((await store.tasks.getTask(unknownTask.id))?.status).toBe("CANCELED");
+    expect(
+      (await store.longWork.listEvents(unknownTask.id)).some(
+        (event) => event.type === "WORKER_LOST",
+      ),
+    ).toBe(true);
+
+    const reworkTask = await store.tasks.createTask({
+      title: "Rework a quarantined bound Worker",
+      creatorPrincipalId: "owner",
+      authorizationScope: caller.scope,
+    });
+    for (const action of ["task:continue", "task:delegate", "task:rework", "task:cancel"])
+      await store.authorization.grant({
+        principalId: "owner",
+        resourceId: `task-${reworkTask.id}`,
+        action,
+        scope: caller.scope,
+        effect: "allow",
+      });
+    const reworkStep = { ...step, id: "rework-unknown-step", taskId: reworkTask.id };
+    await store.longWork.createGraph(
+      reworkTask.id,
+      [reworkStep],
+      reworkStep.id,
+      DEFAULT_TASK_GRAPH_LIMITS,
+      { kind: "system", reason: "test unknown Worker rework" },
+    );
+    const reworkInput = { taskId: reworkTask.id, policyRevision: 1 };
+    expect(await advance(reworkInput)).toEqual({ kind: "continue" });
+    const firstReworkAttempt = (await store.tasks.listAttempts(reworkTask.id))[0]!;
+    const firstReworkBinding = (await store.tasks.getWorkerBinding(firstReworkAttempt.id))!;
+    const firstReworkStep = (await store.longWork.listSteps(reworkTask.id))[0]!;
+    const firstReworkLease = (await store.longWork.getActiveLease(reworkTask.id, reworkStep.id))!;
+    await service.quarantineClaimedWorker(firstReworkAttempt.id);
+    await store.longWork.settleClaimedStep({
+      taskId: reworkTask.id,
+      stepId: reworkStep.id,
+      attemptId: firstReworkAttempt.id,
+      leaseId: firstReworkLease.id,
+      ownerInstanceId: firstReworkLease.ownerInstanceId,
+      expectedStepVersion: firstReworkStep.version,
+      expectedLeaseVersion: firstReworkLease.version,
+      workerBindingId: firstReworkBinding.id,
+      outcome: "unknown",
+      evidenceRef: `worker-response-unknown:${firstReworkAttempt.id}`,
+      origin: { kind: "system", reason: "test unknown Worker" },
+    });
+    expect((await store.longWork.listSteps(reworkTask.id))[0]?.status).toBe("blocked");
+    await expect(
+      service.reworkStep(
+        caller,
+        reworkTask.id,
+        reworkStep.id,
+        (await store.longWork.listSteps(reworkTask.id))[0]!.version,
+        "Verify old Worker stopped before retry",
+      ),
+    ).rejects.toThrow();
+    expect(await advance(reworkInput)).toEqual({ kind: "continue" });
+    expect(writes.status(workspace.id)).toBe("free");
+    expect((await store.tasks.listAttempts(reworkTask.id))[0]?.status).toBe("failed");
+    await service.reworkStep(
+      caller,
+      reworkTask.id,
+      reworkStep.id,
+      (await store.longWork.listSteps(reworkTask.id))[0]!.version,
+      "Old Worker closed and result unknown",
+    );
+    expect(await advance(reworkInput)).toEqual({ kind: "continue" });
+    expect(await store.tasks.listAttempts(reworkTask.id)).toHaveLength(2);
+    expect((await store.tasks.listAttempts(reworkTask.id))[0]?.id).toBe(firstReworkAttempt.id);
+    expect(writes.status(workspace.id)).toBe("active");
+    expect(await service.cancel(caller, reworkTask.id)).toBe(false);
+    expect(await advance(reworkInput)).toEqual({ kind: "continue" });
+    expect(await advance(reworkInput)).toEqual({ kind: "complete" });
+
     const revokedTask = await store.tasks.createTask({
       title: "Revoke while Worker runs",
       creatorPrincipalId: "owner",
@@ -706,7 +833,7 @@ it("dispatches one Worker, reviews and cancels it safely, and quarantines an unc
     expect((await store.longWork.listSteps(uncertainTask.id))[0]?.status).toBe("blocked");
     expect(await store.tasks.listAttempts(uncertainTask.id)).toHaveLength(1);
     expect(writes.status(workspace.id)).toBe("quarantined");
-    expect(await advance(uncertainInput)).toEqual({ kind: "wait" });
+    expect(await advance(uncertainInput)).toMatchObject({ kind: "wait" });
     expect(await store.tasks.listAttempts(uncertainTask.id)).toHaveLength(1);
   } finally {
     await store.close();

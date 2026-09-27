@@ -4097,6 +4097,153 @@ it("quarantines a lost worker lease and preserves unknown outcome", async () => 
   }
 });
 
+it("settles a quarantined Worker only for its exact closed binding, then allows authorized rework", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    const store = await fixture(db);
+    await store.createGraph(
+      "task-1",
+      [step("worker", [], "herdr_worker")],
+      "worker",
+      limits,
+      system,
+    );
+    await store.transitionStep({
+      taskId: "task-1",
+      stepId: "worker",
+      expectedVersion: 1,
+      from: "pending",
+      to: "ready",
+      origin: system,
+    });
+    await store.claimReadyStep({
+      taskId: "task-1",
+      stepId: "worker",
+      expectedStepVersion: 2,
+      attemptId: "worker-attempt",
+      leaseId: "worker-lease",
+      ownerInstanceId: "executor-1",
+      leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+      origin: claimOrigin,
+    });
+    await db.transaction((tx) =>
+      tx.execute({
+        sql: `INSERT INTO worker_bindings
+          (id,task_attempt_id,herdr_session,workspace_id,pane_id,agent_kind,
+           last_observed_agent_state,updated_at)
+          VALUES ('worker-binding','worker-attempt','herdr-session','workspace-1','pane-1',
+            'pi','unknown',?)`,
+        args: [now],
+      }),
+    );
+    await store.attachClaimedWorkerBinding({
+      taskId: "task-1",
+      stepId: "worker",
+      attemptId: "worker-attempt",
+      leaseId: "worker-lease",
+      workerBindingId: "worker-binding",
+      ownerInstanceId: "executor-1",
+      expectedStepVersion: 3,
+      expectedLeaseVersion: 1,
+      origin: claimOrigin,
+    });
+    await store.settleClaimedStep({
+      taskId: "task-1",
+      stepId: "worker",
+      attemptId: "worker-attempt",
+      leaseId: "worker-lease",
+      workerBindingId: "worker-binding",
+      ownerInstanceId: "executor-1",
+      expectedStepVersion: 3,
+      expectedLeaseVersion: 2,
+      outcome: "unknown",
+      evidenceRef: "trace:worker-lost",
+      origin: system,
+    });
+    const originalEvents = await store.listEvents("task-1");
+    const closure = {
+      workerBindingId: "worker-binding",
+      herdrSession: "herdr-session",
+      workspaceId: "workspace-1",
+      paneId: "pane-1",
+      evidenceRef: "herdr-close:worker-binding",
+    };
+    await expect(
+      store.settleQuarantinedWorkerStepClosure({
+        taskId: "task-1",
+        stepId: "worker",
+        attemptId: "worker-attempt",
+        leaseId: "worker-lease",
+        ownerInstanceId: "executor-1",
+        expectedStepVersion: 4,
+        expectedLeaseVersion: 3,
+        closure: { ...closure, paneId: "different-pane" },
+        origin: system,
+      }),
+    ).rejects.toThrow("Quarantined Worker closure binding conflict");
+    expect(await store.getQuarantinedLease("task-1", "worker")).toMatchObject({
+      id: "worker-lease",
+      version: 3,
+      state: "quarantined",
+    });
+
+    const closed = await store.settleQuarantinedWorkerStepClosure({
+      taskId: "task-1",
+      stepId: "worker",
+      attemptId: "worker-attempt",
+      leaseId: "worker-lease",
+      ownerInstanceId: "executor-1",
+      expectedStepVersion: 4,
+      expectedLeaseVersion: 3,
+      closure,
+      origin: system,
+    });
+    expect(closed).toMatchObject({ status: "blocked", version: 4 });
+    expect(await store.getQuarantinedLease("task-1", "worker")).toBeNull();
+    expect((await store.listEvents("task-1")).slice(0, originalEvents.length)).toEqual(
+      originalEvents,
+    );
+    expect((await store.listEvents("task-1")).at(-1)).toMatchObject({
+      type: "ATTEMPT_FINISHED",
+      evidenceRef: closure.evidenceRef,
+      metadata: {
+        outcome: "failed",
+        workerBindingId: "worker-binding",
+        closureVerified: true,
+        sideEffectOutcome: "unknown",
+        rollbackPerformed: false,
+      },
+    });
+    await db.transaction(async (tx) => {
+      expect(
+        (await tx.execute("SELECT status FROM task_attempts WHERE id = 'worker-attempt'")).rows[0],
+      ).toMatchObject({ status: "failed" });
+      expect(
+        (await tx.execute("SELECT state FROM task_step_leases WHERE id = 'worker-lease'")).rows[0],
+      ).toMatchObject({ state: "released" });
+    });
+
+    await addStepDecision(db, "task:rework", "rework-closed-worker");
+    const ready = await store.reworkDurableStep({
+      taskId: "task-1",
+      stepId: "worker",
+      expectedStepVersion: 4,
+      reason: "Retry after external closure",
+      origin: {
+        kind: "decision",
+        decisionId: "rework-closed-worker",
+        actorPrincipalId: "owner",
+      },
+    });
+    expect(ready).toMatchObject({ status: "ready", version: 5 });
+    expect(
+      (await store.listEvents("task-1")).filter((event) => event.type === "WORKER_LOST"),
+    ).toHaveLength(1);
+  } finally {
+    await db.close();
+  }
+});
+
 it("resolves a quarantined Model Step from its linked successful internal Run", async () => {
   const db = await DomainDatabase.open(":memory:");
   try {

@@ -583,7 +583,10 @@ async function createClaimedModelRun(
 /** The Activity claims model Steps and records durable Runs; RunService performs model execution. */
 export function createAdvanceLongWorkActivity(
   store: DomainStore,
-  workers?: Pick<HerdrWorkerRuntime, "dispatch" | "observe" | "cancel" | "ownerInstanceId">,
+  workers?: Pick<
+    HerdrWorkerRuntime,
+    "dispatch" | "observe" | "cancel" | "reconcileQuarantined" | "ownerInstanceId"
+  >,
   wakeChild?: (taskId: string) => Promise<void>,
 ): AdvanceLongWorkActivity {
   const scheduler = new LongWorkScheduler(store.longWork, DEFAULT_TASK_GRAPH_LIMITS);
@@ -594,6 +597,15 @@ export function createAdvanceLongWorkActivity(
       const steps = await store.longWork.listSteps(taskId);
       let pending = false;
       for (const step of steps) {
+        if (step.kind === "herdr_worker" && step.status === "cancelled") {
+          const lease = await store.longWork.getQuarantinedLease(taskId, step.id);
+          if (lease) {
+            if (workers && (await workers.reconcileQuarantined(taskId, step)) === "settled")
+              return { kind: "continue" };
+            pending = true;
+          }
+          continue;
+        }
         if (["model", "tool"].includes(step.kind) && step.status === "cancelled") {
           const lease = await store.longWork.getQuarantinedLease(taskId, step.id);
           if (lease?.attemptId && lease.ownerInstanceId === modelLeaseOwner(taskId, step.id)) {
@@ -666,6 +678,14 @@ export function createAdvanceLongWorkActivity(
     let workerPending = false;
     let childPending = false;
     for (const step of steps) {
+      if (step.kind === "herdr_worker" && step.status === "blocked") {
+        if (await store.longWork.getQuarantinedLease(taskId, step.id)) {
+          if (workers && (await workers.reconcileQuarantined(taskId, step)) === "settled")
+            return { kind: "continue" };
+          workerPending = true;
+        }
+        continue;
+      }
       if (step.status === "blocked" && ["model", "tool"].includes(step.kind)) {
         const observed = await observeQuarantinedRunStep(store, taskId, step);
         if (observed === "settled") return { kind: "continue" };

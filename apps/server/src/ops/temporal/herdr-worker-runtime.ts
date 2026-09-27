@@ -149,6 +149,84 @@ export class HerdrWorkerRuntime {
     return "settled";
   }
 
+  /** Close the exact old Worker before releasing a quarantined Step claim. */
+  async reconcileQuarantined(taskId: string, step: TaskStep): Promise<"settled" | "pending"> {
+    if (step.kind !== "herdr_worker" || !["blocked", "cancelled"].includes(step.status))
+      return "pending";
+    const lease = await this.store.longWork.getQuarantinedLease(taskId, step.id);
+    if (!lease?.attemptId || !lease.workerBindingId) return "pending";
+    const binding = await this.store.tasks.getWorkerBinding(lease.attemptId);
+    if (
+      !binding ||
+      binding.id !== lease.workerBindingId ||
+      !binding.agentName ||
+      !binding.worktreePath
+    )
+      return "pending";
+    try {
+      const snapshot = await this.bridge.getSnapshot();
+      if (snapshot.sessionId !== binding.herdrSession) return "pending";
+      const snapshotTime = Date.parse(snapshot.timestamp);
+      if (
+        !Number.isFinite(snapshotTime) ||
+        snapshotTime < Date.parse(binding.updatedAt) ||
+        snapshotTime < Date.parse(lease.acquiredAt)
+      )
+        return "pending";
+      const pane = snapshot.workspaces
+        .flatMap((workspace) =>
+          workspace.panes.map((item) => ({ ...item, workspaceId: workspace.workspaceId })),
+        )
+        .find((item) => item.paneId === binding.paneId);
+      if (pane) {
+        if (
+          pane.workspaceId !== binding.workspaceId ||
+          pane.agentName !== binding.agentName ||
+          pane.agentKind !== binding.agentKind ||
+          !pane.cwd ||
+          (await realpath(pane.cwd)) !== (await realpath(binding.worktreePath))
+        )
+          return "pending";
+      }
+      await this.service.closeClaimedWorker(lease.attemptId, {
+        paneId: binding.paneId,
+        agentName: binding.agentName,
+        herdrSession: binding.herdrSession,
+      });
+    } catch {
+      return "pending";
+    }
+    try {
+      await this.store.longWork.settleQuarantinedWorkerStepClosure({
+        taskId,
+        stepId: step.id,
+        attemptId: lease.attemptId,
+        leaseId: lease.id,
+        ownerInstanceId: lease.ownerInstanceId,
+        expectedStepVersion: step.version,
+        expectedLeaseVersion: lease.version,
+        closure: {
+          workerBindingId: binding.id,
+          herdrSession: binding.herdrSession,
+          workspaceId: binding.workspaceId,
+          paneId: binding.paneId,
+          evidenceRef: `herdr-closed:${binding.id}`,
+        },
+        origin: ORIGIN,
+      });
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        /(?:settlement conflict|ownership conflict|Step conflict|version conflict)/iu.test(
+          error.message,
+        )
+      )
+        return "pending";
+      throw error;
+    }
+    return "settled";
+  }
+
   private async settleUnknown(
     taskId: string,
     step: TaskStep,

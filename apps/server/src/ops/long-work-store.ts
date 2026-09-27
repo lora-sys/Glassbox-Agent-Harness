@@ -1934,6 +1934,154 @@ export class LongWorkStore {
     });
   }
 
+  /** Releases a quarantined Herdr Worker lease only after its exact external binding is closed. */
+  async settleQuarantinedWorkerStepClosure(input: {
+    taskId: string;
+    stepId: string;
+    attemptId: string;
+    leaseId: string;
+    ownerInstanceId: string;
+    expectedStepVersion: number;
+    expectedLeaseVersion: number;
+    closure: {
+      workerBindingId: string;
+      herdrSession: string;
+      workspaceId: string;
+      paneId: string;
+      evidenceRef: string;
+    };
+    origin: LongWorkOrigin;
+  }): Promise<TaskStep> {
+    for (const value of [
+      input.taskId,
+      input.stepId,
+      input.attemptId,
+      input.leaseId,
+      input.ownerInstanceId,
+      input.closure.workerBindingId,
+      input.closure.herdrSession,
+      input.closure.workspaceId,
+      input.closure.paneId,
+    ])
+      requireIdentifier(value);
+    if (
+      !Number.isSafeInteger(input.expectedStepVersion) ||
+      input.expectedStepVersion < 1 ||
+      !Number.isSafeInteger(input.expectedLeaseVersion) ||
+      input.expectedLeaseVersion < 1 ||
+      !input.closure.evidenceRef.trim() ||
+      input.closure.evidenceRef.length > 512
+    )
+      throw new Error("Invalid quarantined Worker closure evidence or version");
+
+    return this.db.transaction(async (tx) => {
+      await this.requireOrigin(tx, input.origin);
+      const task = await this.requireTask(tx, input.taskId);
+      if (task.orchestration_mode !== "durable") throw new Error("Task is not durable work");
+      const cancellationState = stringColumn(task, "cancellation_state");
+      const cancellationPending = ["requested", "stopping"].includes(cancellationState);
+      if (
+        !cancellationPending &&
+        (cancellationState !== "none" ||
+          ["DONE", "CANCELED", "ACCEPTED", "FAILED"].includes(stringColumn(task, "status")))
+      )
+        throw new Error("Task is not active durable work");
+
+      const step = await this.requireStep(tx, input.taskId, input.stepId);
+      const expectedStepStatus = cancellationPending ? "cancelled" : "blocked";
+      if (
+        step.kind !== "herdr_worker" ||
+        step.status !== expectedStepStatus ||
+        Number(step.version) !== input.expectedStepVersion
+      )
+        throw new Error("Quarantined Worker closure Step conflict");
+      const attempt = await tx.execute({
+        sql: "SELECT status FROM task_attempts WHERE id = ? AND task_id = ? AND step_id = ?",
+        args: [input.attemptId, input.taskId, input.stepId],
+      });
+      if (attempt.rows[0]?.status !== "waiting_input")
+        throw new Error("Quarantined Worker closure Attempt conflict");
+      const lease = await tx.execute({
+        sql: `SELECT state,version,attempt_id,owner_instance_id,worker_binding_id
+          FROM task_step_leases WHERE id = ? AND task_id = ? AND step_id = ?`,
+        args: [input.leaseId, input.taskId, input.stepId],
+      });
+      if (
+        lease.rows[0]?.state !== "quarantined" ||
+        Number(lease.rows[0].version) !== input.expectedLeaseVersion ||
+        lease.rows[0].attempt_id !== input.attemptId ||
+        lease.rows[0].owner_instance_id !== input.ownerInstanceId ||
+        lease.rows[0].worker_binding_id !== input.closure.workerBindingId
+      )
+        throw new Error("Quarantined Worker closure lease conflict");
+      const binding = await tx.execute({
+        sql: `SELECT id FROM worker_bindings
+          WHERE id = ? AND task_attempt_id = ? AND herdr_session = ?
+            AND workspace_id = ? AND pane_id = ?`,
+        args: [
+          input.closure.workerBindingId,
+          input.attemptId,
+          input.closure.herdrSession,
+          input.closure.workspaceId,
+          input.closure.paneId,
+        ],
+      });
+      if (!binding.rows[0]) throw new Error("Quarantined Worker closure binding conflict");
+
+      const now = new Date().toISOString();
+      const nextAttemptStatus = cancellationPending ? "canceled" : "failed";
+      const attemptUpdate = await tx.execute({
+        sql: `UPDATE task_attempts SET status = ?, completed_at = ?
+          WHERE id = ? AND task_id = ? AND step_id = ? AND status = 'waiting_input'`,
+        args: [nextAttemptStatus, now, input.attemptId, input.taskId, input.stepId],
+      });
+      const leaseUpdate = await tx.execute({
+        sql: `UPDATE task_step_leases SET state = 'released', version = version + 1,
+            heartbeat_at = ?, released_at = ?
+          WHERE id = ? AND task_id = ? AND step_id = ? AND attempt_id = ?
+            AND worker_binding_id = ? AND owner_instance_id = ?
+            AND version = ? AND state = 'quarantined'`,
+        args: [
+          now,
+          now,
+          input.leaseId,
+          input.taskId,
+          input.stepId,
+          input.attemptId,
+          input.closure.workerBindingId,
+          input.ownerInstanceId,
+          input.expectedLeaseVersion,
+        ],
+      });
+      if (attemptUpdate.rowsAffected !== 1 || leaseUpdate.rowsAffected !== 1)
+        throw new Error("Quarantined Worker closure settlement conflict");
+
+      await this.appendEventTx(tx, {
+        taskId: input.taskId,
+        stepId: input.stepId,
+        attemptId: input.attemptId,
+        type: "ATTEMPT_FINISHED",
+        origin: input.origin,
+        evidenceRef: input.closure.evidenceRef,
+        metadata: {
+          outcome: cancellationPending ? "cancelled" : "failed",
+          workerBindingId: input.closure.workerBindingId,
+          closureVerified: true,
+          sideEffectOutcome: "unknown",
+          rollbackPerformed: false,
+        },
+      });
+      const dependencies = await tx.execute({
+        sql: "SELECT dependency_id FROM task_step_dependencies WHERE task_id = ? AND step_id = ? ORDER BY dependency_id",
+        args: [input.taskId, input.stepId],
+      });
+      return parseStep(
+        await this.requireStep(tx, input.taskId, input.stepId),
+        dependencies.rows.map((row) => stringColumn(row, "dependency_id")),
+      );
+    });
+  }
+
   /** Reads linked Run state only for the current owned model Step during cancellation. */
   async getClaimedModelRunForCancellation(input: {
     taskId: string;
@@ -3652,8 +3800,9 @@ export class LongWorkStore {
       if (!decision.rows[0]) throw new Error("Matching Step rework ALLOW decision is required");
       const step = await this.requireStep(tx, input.taskId, input.stepId);
       const blockedChild = step.kind === "child_task" && step.status === "blocked";
+      const closedUnknownWorker = step.kind === "herdr_worker" && step.status === "blocked";
       if (
-        (step.status !== "review" && !blockedChild) ||
+        (step.status !== "review" && !blockedChild && !closedUnknownWorker) ||
         Number(step.version) !== input.expectedStepVersion
       )
         throw new Error("Step rework conflict");
@@ -3668,31 +3817,44 @@ export class LongWorkStore {
         if (activeChildren.rows[0])
           throw new Error("Linked child must stop before blocked Step rework");
       }
+      const attempts = await tx.execute({
+        sql: "SELECT id,status FROM task_attempts WHERE task_id = ? AND step_id = ? ORDER BY attempt_number DESC LIMIT 1",
+        args: [input.taskId, input.stepId],
+      });
+      const attempt = attempts.rows[0];
+      const expectedAttemptStatus = blockedChild || closedUnknownWorker ? "failed" : "review";
+      if (!attempt || attempt.status !== expectedAttemptStatus) {
+        if (closedUnknownWorker) throw new Error("Step rework conflict");
+        throw new Error("Latest Step attempt cannot be reworked");
+      }
+      if (closedUnknownWorker) {
+        const closureEvent = await tx.execute({
+          sql: `SELECT 1 FROM task_events
+            WHERE task_id = ? AND step_id = ? AND attempt_id = ?
+              AND type = 'ATTEMPT_FINISHED'
+              AND json_extract(metadata_json, '$.closureVerified') = 1 LIMIT 1`,
+          args: [input.taskId, input.stepId, stringColumn(attempt, "id")],
+        });
+        if (!closureEvent.rows[0]) throw new Error("Step rework conflict");
+      }
       const leases = await tx.execute({
         sql: "SELECT 1 FROM task_step_leases WHERE task_id = ? AND step_id = ? AND state IN ('active','quarantined') LIMIT 1",
         args: [input.taskId, input.stepId],
       });
       if (leases.rows[0])
         throw new Error("Step has an active or quarantined lease and cannot be reworked");
-      const attempts = await tx.execute({
-        sql: "SELECT id,status FROM task_attempts WHERE task_id = ? AND step_id = ? ORDER BY attempt_number DESC LIMIT 1",
-        args: [input.taskId, input.stepId],
-      });
-      const attempt = attempts.rows[0];
-      const expectedAttemptStatus = blockedChild ? "failed" : "review";
-      if (!attempt || attempt.status !== expectedAttemptStatus)
-        throw new Error("Latest Step attempt cannot be reworked");
 
       const now = new Date().toISOString();
       const previousTaskStatus = stringColumn(task, "status");
-      const otherBlocked = blockedChild
-        ? await tx.execute({
-            sql: "SELECT COUNT(*) AS count, COALESCE(MAX(CASE WHEN status = 'blocked' THEN 1 ELSE 0 END),0) AS has_blocked FROM task_steps WHERE task_id = ? AND id <> ? AND status IN ('blocked','failed')",
-            args: [input.taskId, input.stepId],
-          })
-        : null;
+      const otherBlocked =
+        blockedChild || closedUnknownWorker
+          ? await tx.execute({
+              sql: "SELECT COUNT(*) AS count, COALESCE(MAX(CASE WHEN status = 'blocked' THEN 1 ELSE 0 END),0) AS has_blocked FROM task_steps WHERE task_id = ? AND id <> ? AND status IN ('blocked','failed')",
+              args: [input.taskId, input.stepId],
+            })
+          : null;
       const nextTaskStatus =
-        blockedChild && Number(otherBlocked?.rows[0]?.count ?? 0) > 0
+        (blockedChild || closedUnknownWorker) && Number(otherBlocked?.rows[0]?.count ?? 0) > 0
           ? "WAITING_INPUT"
           : ["WAITING_INPUT", "REVIEW"].includes(previousTaskStatus)
             ? "RUNNING"
@@ -3724,7 +3886,10 @@ export class LongWorkStore {
         attemptUpdate.rowsAffected !== 1
       )
         throw new Error("Step rework conflict");
-      if (blockedChild && Number(otherBlocked?.rows[0]?.has_blocked ?? 0) === 0) {
+      if (
+        (blockedChild || closedUnknownWorker) &&
+        Number(otherBlocked?.rows[0]?.has_blocked ?? 0) === 0
+      ) {
         await tx.execute({
           sql: "UPDATE attention_items SET resolved_at = ? WHERE task_id = ? AND kind = 'worker_blocked' AND task_attempt_id IS NULL AND resolved_at IS NULL",
           args: [now, input.taskId],
