@@ -50,6 +50,8 @@ Do not place provider keys, QQ credentials, management tokens, or the live datab
 
 Regenerate `service-launch.json` and `agent-operations.json` for Linux instead of copying their Windows paths. The existing operations file contains Windows paths with forward slashes, so searching only for backslashes misses them. Use the Linux Herdr session socket and a Linux Worker workspace. Preserve historical Task and Trace records as evidence of their original Windows execution.
 
+The WSL installation uses the user units in `deploy/linux`. Place them in `~/.config/systemd/user`, enable lingering for the Linux account, and enable the Herdr, NapCat, and Glassbox units only at their corresponding cutover steps. The service account's `~/.config/glassbox/runtime.env` and `napcat.env` must be mode 600. The Herdr Worker agent directory needs its own copied Pi model credentials and `herdr integration install pi` with `PI_CODING_AGENT_DIR` pointing at that directory. Confirm the Herdr workspace ID and Unix socket before writing `agent-operations.json`. The Glassbox unit starts the server directly; do not also run `agent:up` against the Linux data directory.
+
 ## Bridge and cutover
 
 1. Record Windows process identities, service versions, current database schema, live QQ result, and a consistent database backup. Identify the only active Glassbox consumer.
