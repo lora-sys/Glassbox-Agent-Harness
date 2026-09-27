@@ -1899,7 +1899,8 @@ export class LongWorkStore {
         sql: "SELECT 1 FROM task_child_links WHERE parent_task_id = ? AND parent_step_id = ? LIMIT 1",
         args: [input.parentTaskId, input.parentStepId],
       });
-      if (existingStepLink.rows[0]) throw new Error("Child Task Step already has a link");
+      if (existingStepLink.rows[0] && step.status !== "ready")
+        throw new Error("Child Task Step already has a link");
 
       const cycle = await tx.execute({
         sql: `WITH RECURSIVE descendants(task_id) AS (
@@ -2028,8 +2029,14 @@ export class LongWorkStore {
       await this.requireTask(tx, parentTaskId);
       if (parentStepId) await this.requireStep(tx, parentTaskId, parentStepId);
       const result = await tx.execute({
-        sql: `SELECT * FROM task_child_links WHERE parent_task_id = ?
-          ${parentStepId ? "AND parent_step_id = ?" : ""} ORDER BY created_at,child_task_id`,
+        sql: `SELECT links.* FROM task_child_links links
+          JOIN task_events events ON events.task_id = links.parent_task_id
+            AND events.step_id = links.parent_step_id
+            AND events.type = 'CHILD_TASK_CREATED'
+            AND json_extract(events.metadata_json, '$.childTaskId') = links.child_task_id
+          WHERE links.parent_task_id = ?
+          ${parentStepId ? "AND links.parent_step_id = ?" : ""}
+          ORDER BY events.sequence`,
         args: parentStepId ? [parentTaskId, parentStepId] : [parentTaskId],
       });
       return result.rows.map(parseChildTaskLink);

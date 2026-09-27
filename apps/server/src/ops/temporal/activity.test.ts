@@ -127,19 +127,58 @@ it("waits for a linked child Task and hands its accepted result to Step review",
     await store.authorization.grant({
       principalId: "owner",
       resourceId: `task-${parent.id}`,
+      action: "task:rework",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    const reworked = await service.reworkStep(
+      caller,
+      parent.id,
+      step.id,
+      reviewed.version,
+      "Use a revised child result",
+    );
+    expect(reworked.status).toBe("ready");
+    const revisedChild = await store.tasks.createTask({
+      title: "Revised child work",
+      creatorPrincipalId: "owner",
+      authorizationScope: caller.scope,
+    });
+    await service.linkChildTask(caller, {
+      parentTaskId: parent.id,
+      parentStepId: step.id,
+      expectedStepVersion: reworked.version,
+      childTaskId: revisedChild.id,
+      acceptanceCriteria: ["Revised child result reviewed"],
+      cancellationPolicy: "keep_child",
+      failurePolicy: "block_parent",
+    });
+    await store.db.transaction((tx) =>
+      tx.execute({ sql: "UPDATE tasks SET status = 'DONE' WHERE id = ?", args: [revisedChild.id] }),
+    );
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    const revisedReview = (await store.longWork.listSteps(parent.id))[0]!;
+    expect(revisedReview.status).toBe("review");
+    expect(revisedReview.outputRef).toBe(`task:${revisedChild.id}`);
+    expect(
+      (await store.longWork.listChildTaskLinks(parent.id, step.id)).map((link) => link.childTaskId),
+    ).toEqual([child.id, revisedChild.id]);
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: `task-${parent.id}`,
       action: "task:accept",
       scope: caller.scope,
       effect: "allow",
     });
-    const accepted = await service.acceptStep(caller, parent.id, step.id, reviewed.version);
+    const accepted = await service.acceptStep(caller, parent.id, step.id, revisedReview.version);
     expect(accepted.status).toBe("succeeded");
     const attempts = await store.db.transaction((tx) =>
       tx.execute({
-        sql: "SELECT status FROM task_attempts WHERE task_id = ? AND step_id = ?",
+        sql: "SELECT status FROM task_attempts WHERE task_id = ? AND step_id = ? ORDER BY attempt_number",
         args: [parent.id, step.id],
       }),
     );
-    expect(attempts.rows.map((attempt) => attempt.status)).toEqual(["succeeded"]);
+    expect(attempts.rows.map((attempt) => attempt.status)).toEqual(["review", "succeeded"]);
   } finally {
     await store.close();
   }

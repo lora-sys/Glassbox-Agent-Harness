@@ -366,7 +366,7 @@ async function settleCancelledChildStep(
   wakeChild?: (taskId: string) => Promise<void>,
 ): Promise<"settled" | "pending"> {
   const links = await store.longWork.listChildTaskLinks(taskId, step.id);
-  const link = links[0];
+  const link = links.at(-1);
   let childStatus: string | undefined;
   if (link && link.cancellationPolicy === "cancel_child") {
     const child = await store.tasks.getTask(link.childTaskId);
@@ -574,7 +574,8 @@ export function createAdvanceLongWorkActivity(
     for (const step of steps) {
       if (step.kind === "child_task" && step.status === "running") {
         const links = await store.longWork.listChildTaskLinks(taskId, step.id);
-        if (links.length !== 1) {
+        const link = links.at(-1);
+        if (!link) {
           childPending = true;
           continue;
         }
@@ -601,7 +602,7 @@ export function createAdvanceLongWorkActivity(
         const settled = await store.longWork.observeLinkedChildTask({
           parentTaskId: taskId,
           parentStepId: step.id,
-          childTaskId: links[0]!.childTaskId,
+          childTaskId: link.childTaskId,
           expectedStepVersion: step.version,
           origin: ORIGIN,
         });
