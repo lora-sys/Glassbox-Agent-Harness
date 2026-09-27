@@ -349,6 +349,42 @@ it("plans a text-only Model Step from the current Run profile and rejects extra 
       expect.objectContaining({ runId: accepted.run.id }),
     );
     await plan.execute(
+      "plan-approval",
+      {
+        taskId: "planned",
+        rootStepId: "approval-step",
+        steps: [
+          {
+            id: "approval-step",
+            kind: "approval_wait",
+            title: "Owner approval",
+            dependencyIds: [],
+            signalKey: "approve-release",
+          },
+        ],
+      },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    expect(planExistingTask).toHaveBeenLastCalledWith(
+      caller,
+      "planned",
+      [
+        expect.objectContaining({
+          kind: "approval_wait",
+          waitPolicy: {
+            version: 1,
+            kind: "approval",
+            signalKey: "approve-release",
+            overdue: "stale",
+          },
+        }),
+      ],
+      "approval-step",
+      expect.objectContaining({ runId: accepted.run.id }),
+    );
+    await plan.execute(
       "plan-child",
       {
         taskId: "planned",
@@ -467,7 +503,7 @@ it("plans a text-only Model Step from the current Run profile and rejects extra 
     await expect(
       plan.execute("plan-with-non-model-run", input, undefined, undefined, {} as never),
     ).rejects.toThrow("protected_tool_failed");
-    expect(planExistingTask).toHaveBeenCalledTimes(4);
+    expect(planExistingTask).toHaveBeenCalledTimes(5);
   } finally {
     await store.close();
   }

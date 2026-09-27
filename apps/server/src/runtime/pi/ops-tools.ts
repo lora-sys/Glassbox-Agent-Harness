@@ -76,6 +76,7 @@ export function createOpsTools(options: {
       kind: Type.Union([
         Type.Literal("timer_wait"),
         Type.Literal("signal_wait"),
+        Type.Literal("approval_wait"),
         Type.Literal("join"),
         Type.Literal("model"),
         Type.Literal("tool"),
@@ -442,6 +443,7 @@ export function createOpsTools(options: {
         kind:
           | "timer_wait"
           | "signal_wait"
+          | "approval_wait"
           | "join"
           | "model"
           | "tool"
@@ -459,7 +461,7 @@ export function createOpsTools(options: {
       ...common,
       name: "task_plan",
       description:
-        "Plan bounded timer, signal-wait, join, text-only model, read-only task_get Tool, configured Pi Herdr Worker, and child Task steps. Link child Tasks separately before planning their graphs. Approval and shell steps are unavailable.",
+        "Plan bounded timer, signal, approval, join, text-only model, read-only task_get Tool, configured Pi Herdr Worker, and child Task steps. Link child Tasks separately before planning their graphs. Shell steps are unavailable.",
       parameters: Type.Object(
         {
           taskId,
@@ -480,7 +482,7 @@ export function createOpsTools(options: {
                 step.signalKey !== undefined ||
                 step.instructions !== undefined ||
                 step.targetTaskId !== undefined)) ||
-            (step.kind === "signal_wait" &&
+            (["signal_wait", "approval_wait"].includes(step.kind) &&
               (step.signalKey === undefined ||
                 step.durationMs !== undefined ||
                 step.instructions !== undefined ||
@@ -560,7 +562,14 @@ export function createOpsTools(options: {
                     signalKey: step.signalKey,
                     overdue: "stale" as const,
                   }
-                : undefined;
+                : step.kind === "approval_wait"
+                  ? {
+                      version: 1,
+                      kind: "approval" as const,
+                      signalKey: step.signalKey,
+                      overdue: "stale" as const,
+                    }
+                  : undefined;
           return {
             id: step.id,
             taskId: params.taskId,
