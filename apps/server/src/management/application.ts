@@ -146,8 +146,15 @@ import {
 } from "../channels/onebot/capability-probe.js";
 import { ChannelArchiveStore } from "../retrieval/channel-archive.js";
 import { groupResourceId, resolveAssignedGroupIds } from "../retrieval/source-resolver.js";
-import { AuthorizedOpsService, type WorkerPolicy } from "../ops/service.js";
+import {
+  AuthorizedOpsService,
+  type LongWorkRuntimePort,
+  type WorkerPolicy,
+} from "../ops/service.js";
 import { OpsReconciler } from "../ops/reconciler.js";
+import { readLongWorkHealth } from "../ops/long-work-health.js";
+import { TemporalLongWorkCoordinator } from "../ops/temporal/coordinator.js";
+import { connectLongWorkWorkflowClient } from "../ops/temporal/client.js";
 import type { HerdrBridge } from "../ops/herdr-bridge.js";
 import { openDomainStore, type DomainStore } from "../application/domain-store.js";
 import {
@@ -375,6 +382,7 @@ export class ManagementApplication {
         workerPolicy?: WorkerPolicy;
         protectedValues?: readonly string[];
       };
+      temporal?: { address: string; namespace?: string };
     },
     store: DomainStore,
     channels: ChannelProfileStore,
@@ -580,6 +588,7 @@ export class ManagementApplication {
       workerPolicy?: WorkerPolicy;
       protectedValues?: readonly string[];
     };
+    temporal?: { address: string; namespace?: string };
   }): Promise<ManagementApplication> {
     const channels = await ChannelProfileStore.open(options.dataDirectory);
     const groupRuntime = await GroupRuntimeStore.open(options.dataDirectory);
@@ -661,6 +670,7 @@ export class ManagementApplication {
       await application.runs.start({ recover: true });
       application.accepting = true;
       application.releaseIngress();
+      void application.connectTemporal();
       return application;
     } catch (error) {
       await application.close();
@@ -685,12 +695,111 @@ export class ManagementApplication {
   >();
   private piModelCatalog?: PiModelCatalog;
   private opsReconciler?: OpsReconciler;
+  private temporalRuntime?: TemporalLongWorkCoordinator;
+  private temporalClose?: () => Promise<void>;
+  private temporalConnecting?: Promise<void>;
+  private temporalRecovering?: Promise<void>;
+  private temporalRetry?: ReturnType<typeof setTimeout>;
+  private temporalFailure: string | null = null;
+  private closed = false;
+  private readonly longWorkRuntimePort: LongWorkRuntimePort = {
+    available: () => this.temporalRuntime !== undefined,
+    start: async (taskId, policyRevision) => {
+      if (!this.temporalRuntime) throw new Error("Temporal is unavailable");
+      try {
+        return await this.temporalRuntime.start(taskId, policyRevision);
+      } catch (error) {
+        this.scheduleTemporalRecovery();
+        throw error;
+      }
+    },
+    wake: async (taskId) => {
+      if (!this.temporalRuntime) {
+        this.scheduleTemporalRecovery();
+        throw new Error("Temporal is unavailable");
+      }
+      try {
+        await this.temporalRuntime.wake(taskId);
+      } catch (error) {
+        this.scheduleTemporalRecovery();
+        throw error;
+      }
+    },
+  };
+
+  private scheduleTemporalRecovery(): void {
+    if (!this.options.temporal || this.closed || this.temporalRetry) return;
+    this.temporalRetry = setTimeout(() => {
+      this.temporalRetry = undefined;
+      if (this.closed) return;
+      if (!this.temporalRuntime) {
+        void this.connectTemporal();
+        return;
+      }
+      this.temporalRecovering = this.temporalRuntime
+        .recover()
+        .then((result) => {
+          this.temporalFailure = result.unavailable.length
+            ? `${result.unavailable.length} workflow bindings unavailable`
+            : null;
+          if (result.unavailable.length) this.scheduleTemporalRecovery();
+        })
+        .catch(() => {
+          this.temporalFailure = "Temporal reconciliation failed";
+          this.scheduleTemporalRecovery();
+        })
+        .finally(() => {
+          this.temporalRecovering = undefined;
+        });
+    }, 30_000);
+    this.temporalRetry.unref();
+  }
+
+  private connectTemporal(): Promise<void> {
+    if (!this.options.temporal || this.closed || this.temporalRuntime) return Promise.resolve();
+    if (this.temporalConnecting) return this.temporalConnecting;
+    this.temporalConnecting = (async () => {
+      let connection: Awaited<ReturnType<typeof connectLongWorkWorkflowClient>> | undefined;
+      try {
+        connection = await connectLongWorkWorkflowClient(this.options.temporal!);
+        if (this.closed) {
+          await connection.close();
+          return;
+        }
+        const coordinator = new TemporalLongWorkCoordinator(this.store, connection.workflows);
+        const recovery = await coordinator.recover();
+        this.temporalRuntime = coordinator;
+        this.temporalClose = connection.close;
+        this.temporalFailure = recovery.unavailable.length
+          ? `${recovery.unavailable.length} workflow bindings unavailable`
+          : null;
+        if (recovery.unavailable.length) this.scheduleTemporalRecovery();
+      } catch {
+        await connection?.close().catch(() => undefined);
+        this.temporalFailure = "Temporal connection or reconciliation failed";
+        this.scheduleTemporalRecovery();
+      } finally {
+        this.temporalConnecting = undefined;
+      }
+    })();
+    return this.temporalConnecting;
+  }
 
   private selectableModelProfiles(includePi = true): PublicModelProfile[] {
     return [
       ...this.options.models.list(),
       ...(includePi ? (this.piModelCatalog?.list() ?? []) : []),
     ];
+  }
+
+  longWorkBackendStatus(): {
+    state: "not_configured" | "connected" | "unavailable";
+    reason: string | null;
+  } {
+    if (!this.options.temporal) return { state: "not_configured", reason: null };
+    if (this.temporalFailure) return { state: "unavailable", reason: this.temporalFailure };
+    if (this.temporalRuntime) return { state: "connected", reason: null };
+    return { state: "unavailable", reason: this.temporalFailure };
   }
 
   sandboxStatus(): {
@@ -1281,6 +1390,7 @@ export class ManagementApplication {
               this.store,
               this.options.ops!.bridge,
               this.options.ops!.workerPolicy,
+              this.longWorkRuntimePort,
             ),
             workerTarget: this.options.ops!.workerTarget,
             getContext,
@@ -3968,7 +4078,36 @@ export class ManagementApplication {
       trace: this.trace,
       evaluator: this.evaluator,
       ...(this.options.ops ? { opsHealth: (runId: string) => this.opsHealth(runId) } : {}),
+      ...(this.options.ops
+        ? {
+            opsSignal: (caller, taskId, input, runId) =>
+              this.opsSignal(caller, taskId, input, runId),
+          }
+        : {}),
     });
+  }
+
+  private async opsSignal(
+    caller: CallerContext,
+    taskId: string,
+    input: {
+      stepId: string;
+      targetStepVersion: number;
+      targetAttemptId?: string;
+      type: string;
+      idempotencyKey: string;
+      approval?: boolean;
+    },
+    runId: string,
+  ) {
+    if (!this.options.ops) throw new ManagementError("NOT_FOUND", "Ops is not configured", 404);
+    const service = new AuthorizedOpsService(
+      this.store,
+      this.options.ops.bridge,
+      this.options.ops.workerPolicy,
+      this.longWorkRuntimePort,
+    );
+    return service.signal(caller, { taskId, ...input }, { runId });
   }
 
   private async opsHealth(runId: string) {
@@ -3979,8 +4118,9 @@ export class ManagementApplication {
       this.store,
       this.options.ops.bridge,
       this.options.ops.workerPolicy,
+      this.longWorkRuntimePort,
     );
-    return service.health(
+    const health = await service.healthDetailed(
       caller,
       {
         now: now.toISOString(),
@@ -3996,9 +4136,18 @@ export class ManagementApplication {
       },
       { runId },
     );
+    return {
+      ...health.snapshot,
+      longWorkBackend: this.longWorkBackendStatus(),
+      longWork: await readLongWorkHealth(this.store.db, health.visibleTaskIds),
+    };
   }
 
   async close() {
+    this.closed = true;
+    clearTimeout(this.temporalRetry);
+    await this.temporalConnecting;
+    await this.temporalRecovering;
     this.accepting = false;
     this.releaseIngress();
     await this.operations.catch(() => undefined);
@@ -4016,6 +4165,7 @@ export class ManagementApplication {
     await this.sandboxRuntime?.executor.close();
     await this.opsReconciler?.stop();
     await this.options.ops?.bridge.disconnect();
+    await this.temporalClose?.();
     await this.store.close();
   }
 }

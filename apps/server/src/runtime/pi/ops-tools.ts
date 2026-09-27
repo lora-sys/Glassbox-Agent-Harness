@@ -24,6 +24,9 @@ export const OPS_TOOL_NAMES = Object.freeze([
   "task_accept",
   "task_rework",
   "task_cancel",
+  "task_steps",
+  "task_events",
+  "task_plan",
 ] as const);
 
 /** The model never supplies routing, Principal, filesystem paths or worker kind. */
@@ -40,8 +43,39 @@ export function createOpsTools(options: {
       : undefined;
   };
   const common = { authService: options.store.authorization, getContext };
-  const taskId = Type.String({ minLength: 1, maxLength: 128 });
+  const taskId = Type.String({
+    minLength: 1,
+    maxLength: 128,
+    pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:-]*$",
+  });
   const text = Type.String({ minLength: 1, maxLength: 16000 });
+  const stepId = Type.String({
+    minLength: 1,
+    maxLength: 128,
+    pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:-]*$",
+  });
+  const dependencyIds = Type.Array(stepId, { maxItems: 8 });
+  const plannedStep = Type.Object(
+    {
+      id: stepId,
+      kind: Type.Union([
+        Type.Literal("timer_wait"),
+        Type.Literal("signal_wait"),
+        Type.Literal("join"),
+      ]),
+      title: Type.String({ minLength: 1, maxLength: 256 }),
+      dependencyIds,
+      durationMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 2_592_000_000 })),
+      signalKey: Type.Optional(
+        Type.String({
+          minLength: 1,
+          maxLength: 128,
+          pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:-]*$",
+        }),
+      ),
+    },
+    { additionalProperties: false },
+  );
   return [
     createProtectedTool({
       ...common,
@@ -179,8 +213,121 @@ export function createOpsTools(options: {
       action: "task:cancel",
       resourceId: (params) => `task-${params.taskId}`,
       execute: async (params, context) => {
-        await options.service.cancel(context.caller, params.taskId);
-        return { canceled: true };
+        const canceled = await options.service.cancel(context.caller, params.taskId);
+        return { canceled, cancellationRequested: !canceled };
+      },
+    }),
+    createProtectedTool<{ taskId: string }>({
+      ...common,
+      name: "task_steps",
+      description: "Inspect the bounded durable step list for an authorized Task.",
+      parameters: Type.Object({ taskId }, { additionalProperties: false }),
+      action: "task:read",
+      resourceId: (params) => `task-${params.taskId}`,
+      execute: async (params, context) => options.service.steps(context.caller, params.taskId),
+    }),
+    createProtectedTool<{ taskId: string; afterSequence?: number }>({
+      ...common,
+      name: "task_events",
+      description: "Inspect append-only events for an authorized Task from a sequence cursor.",
+      parameters: Type.Object(
+        {
+          taskId,
+          afterSequence: Type.Optional(Type.Integer({ minimum: 0, maximum: 2_147_483_647 })),
+        },
+        { additionalProperties: false },
+      ),
+      action: "task:read",
+      resourceId: (params) => `task-${params.taskId}`,
+      execute: async (params, context) =>
+        options.service.taskEvents(context.caller, params.taskId, params.afterSequence),
+    }),
+    createProtectedTool<{
+      taskId: string;
+      rootStepId: string;
+      steps: Array<{
+        id: string;
+        kind: "timer_wait" | "signal_wait" | "join";
+        title: string;
+        dependencyIds: string[];
+        durationMs?: number;
+        signalKey?: string;
+      }>;
+    }>({
+      ...common,
+      name: "task_plan",
+      description:
+        "Plan bounded timer, signal-wait, and join steps for an authorized Task. Approval, model, Tool, Worker, child Task, and shell steps are unavailable.",
+      parameters: Type.Object(
+        {
+          taskId,
+          rootStepId: stepId,
+          steps: Type.Array(plannedStep, { minItems: 1, maxItems: 64 }),
+        },
+        { additionalProperties: false },
+      ),
+      action: "task:plan",
+      resourceId: (params) => `task-${params.taskId}`,
+      execute: async (params, context) => {
+        for (const step of params.steps) {
+          if (
+            (step.kind === "timer_wait" &&
+              (step.durationMs === undefined || step.signalKey !== undefined)) ||
+            (step.kind === "signal_wait" &&
+              (step.signalKey === undefined || step.durationMs !== undefined)) ||
+            (step.kind === "join" &&
+              (step.signalKey !== undefined ||
+                step.durationMs !== undefined ||
+                step.dependencyIds.length === 0))
+          )
+            throw new Error(`Invalid fields for planned ${step.kind} step ${step.id}`);
+        }
+        const steps = params.steps.map((step) => {
+          const waitPolicy =
+            step.kind === "timer_wait"
+              ? {
+                  version: 1,
+                  kind: "duration" as const,
+                  durationMs: step.durationMs,
+                  overdue: "resume" as const,
+                }
+              : step.kind === "signal_wait"
+                ? {
+                    version: 1,
+                    kind: "signal" as const,
+                    signalKey: step.signalKey,
+                    overdue: "stale" as const,
+                  }
+                : undefined;
+          return {
+            id: step.id,
+            taskId: params.taskId,
+            kind: step.kind,
+            title: step.title,
+            status: "pending" as const,
+            dependencyIds: step.dependencyIds,
+            dependencyPolicy: {
+              failed: "block" as const,
+              cancelled: "cancel" as const,
+              skipped: "skip" as const,
+            },
+            maxAttempts: 3,
+            waitPolicy,
+            requiredCapabilities: [],
+            delegatedPermissionSet: [],
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+            version: 1,
+          };
+        });
+        await options.service.planExistingTask(
+          context.caller,
+          params.taskId,
+          steps,
+          params.rootStepId,
+          { runId: context.runId, conversationId: context.conversationId },
+        );
+        return { planned: true, stepCount: steps.length };
       },
     }),
   ];

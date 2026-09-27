@@ -1,0 +1,50 @@
+name: glassbox-p6-temporal-spike
+services:
+  server:
+    build: .
+    image: glassbox-p6-temporal-spike:local
+    command:
+      [
+        "temporal",
+        "server",
+        "start-dev",
+        "--ip",
+        "0.0.0.0",
+        "--db-filename",
+        "/data/temporal.db",
+        "--headless",
+      ]
+    volumes:
+      - ./.state:/data
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "temporal",
+          "operator",
+          "namespace",
+          "describe",
+          "default",
+          "--address",
+          "localhost:7233",
+        ]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  worker:
+    image: glassbox-p6-temporal-spike:local
+    command: ["node", "worker.cjs"]
+    environment:
+      TEMPORAL_ADDRESS: server:7233
+    depends_on:
+      server:
+        condition: service_healthy
+  client:
+    image: glassbox-p6-temporal-spike:local
+    entrypoint: ["node", "client.cjs"]
+    environment:
+      TEMPORAL_ADDRESS: server:7233
+    profiles: ["manual"]
+    depends_on:
+      server:
+        condition: service_healthy

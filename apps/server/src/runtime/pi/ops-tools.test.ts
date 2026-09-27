@@ -39,6 +39,11 @@ it("denies an ungranted Pi delegate before starting any worker", async () => {
       kind: "ops",
       visibility: "public",
     });
+    await store.authorization.registerResource({
+      id: "task-t1",
+      kind: "task",
+      visibility: "public",
+    });
     const tools = createOpsTools({
       store,
       service: new AuthorizedOpsService(store, bridge),
@@ -63,6 +68,9 @@ it("denies an ungranted Pi delegate before starting any worker", async () => {
         "task_accept",
         "task_rework",
         "task_cancel",
+        "task_steps",
+        "task_events",
+        "task_plan",
       ].sort(),
     );
     await expect(
@@ -77,6 +85,44 @@ it("denies an ungranted Pi delegate before starting any worker", async () => {
     expect((await bridge.getSnapshot()).workspaces).toEqual([]);
     expect(await store.tasks.listTasks()).toEqual([]);
     expect(delegate.parameters).toMatchObject({ additionalProperties: false });
+    const plan = tools.find((tool) => tool.name === "task_plan")!;
+    expect(plan.parameters).toMatchObject({ additionalProperties: false });
+    const planSchema = plan.parameters as {
+      properties: {
+        steps: {
+          maxItems: number;
+          items: { additionalProperties: boolean; properties: Record<string, unknown> };
+        };
+      };
+    };
+    expect(planSchema.properties.steps.maxItems).toBe(64);
+    expect(planSchema.properties.steps.items.additionalProperties).toBe(false);
+    expect(Object.keys(planSchema.properties.steps.items.properties).sort()).toEqual(
+      ["dependencyIds", "durationMs", "id", "kind", "signalKey", "title"].sort(),
+    );
+    await expect(
+      plan.execute(
+        "ungranted-plan",
+        {
+          taskId: "t1",
+          rootStepId: "root",
+          steps: [
+            {
+              id: "root",
+              kind: "timer_wait",
+              title: "Wait",
+              dependencyIds: [],
+              durationMs: 1000,
+            },
+          ],
+        },
+        undefined,
+        undefined,
+        {} as never,
+      ),
+    ).rejects.toThrow("Permission denied: no_grant");
+    expect(tools.map((tool) => tool.name)).not.toContain("task_signal");
+    expect(tools.map((tool) => tool.name)).not.toContain("task_approve");
     const grant = await store.authorization.grant({
       principalId: "owner",
       resourceId: "agent-operations",

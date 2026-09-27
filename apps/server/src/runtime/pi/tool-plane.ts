@@ -299,6 +299,27 @@ const OPS_TOOL_BINDINGS: Record<
     budgetClass: "core",
     grounding: "local_computation",
   },
+  task_steps: {
+    action: "task:read",
+    resource: "task",
+    riskClass: "read",
+    budgetClass: "core",
+    grounding: "local_computation",
+  },
+  task_events: {
+    action: "task:read",
+    resource: "task",
+    riskClass: "read",
+    budgetClass: "core",
+    grounding: "local_computation",
+  },
+  task_plan: {
+    action: "task:plan",
+    resource: "task",
+    riskClass: "write",
+    budgetClass: "core",
+    grounding: "local_computation",
+  },
 };
 
 const OPS_TOOL_DESCRIPTORS: readonly ToolDescriptor[] = Object.freeze(

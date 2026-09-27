@@ -1001,10 +1001,12 @@ describe("shared group conversation and durable actor routing", () => {
     const fkViolations = await rawCheck.execute("PRAGMA foreign_key_check");
     expect(fkViolations.rows).toHaveLength(0);
 
-    // 10. Verify all current migrations completed. V7 adds the P4B channel history
-    // archive (channel_messages + FTS index) and group capability policies.
+    // 10. Verify all current migrations completed, including P6 TaskStep storage.
     const ver = await rawCheck.execute("PRAGMA user_version");
-    expect(Number(ver.rows[0]?.user_version)).toBe(11);
+    expect(Number(ver.rows[0]?.user_version)).toBe(12);
+    expect((await rawCheck.execute("PRAGMA table_info(task_steps)")).rows.length).toBeGreaterThan(
+      0,
+    );
 
     rawCheck.close();
   });

@@ -75,13 +75,6 @@ export const learningSchema = [
   `CREATE INDEX memory_audit_target ON memory_audit_events(target_id, sequence)`,
 ];
 
-export const schema = [
-  ...baseSchema,
-  ...schemaV7Statements,
-  ...schemaV8Migration,
-  ...learningSchema,
-];
-
 export const schemaV5Migration = ["ALTER TABLE tasks ADD COLUMN origin_scope_key TEXT"];
 
 export const schemaV2Migration = [
@@ -178,4 +171,49 @@ export const schemaV11Migration = [
   `INSERT INTO deliveries_v11 SELECT id, run_id, dedup_key, destination_scope_key, payload_text, payload_kind, status, external_id, created_at, updated_at FROM deliveries`,
   `DROP TABLE deliveries`,
   `ALTER TABLE deliveries_v11 RENAME TO deliveries`,
+];
+
+// P6 records extend the existing Task identity. The legacy columns and rows remain
+// valid; a null step_id on an older TaskAttempt means the P3 whole-Task attempt.
+export const schemaV12Migration = [
+  `ALTER TABLE tasks ADD COLUMN origin_scope_json TEXT`,
+  `ALTER TABLE tasks ADD COLUMN orchestration_mode TEXT NOT NULL DEFAULT 'legacy' CHECK(orchestration_mode IN ('legacy','durable'))`,
+  `ALTER TABLE tasks ADD COLUMN current_phase TEXT`,
+  `ALTER TABLE tasks ADD COLUMN root_step_id TEXT`,
+  `ALTER TABLE tasks ADD COLUMN active_step_ids_json TEXT NOT NULL DEFAULT '[]'`,
+  `ALTER TABLE tasks ADD COLUMN waiting_reason TEXT`,
+  `ALTER TABLE tasks ADD COLUMN checkpoint_ref TEXT`,
+  `ALTER TABLE tasks ADD COLUMN cancellation_state TEXT NOT NULL DEFAULT 'none' CHECK(cancellation_state IN ('none','requested','stopping','settled'))`,
+  `ALTER TABLE tasks ADD COLUMN policy_revision INTEGER NOT NULL DEFAULT 1 CHECK(policy_revision >= 1)`,
+  `ALTER TABLE tasks ADD COLUMN completed_at TEXT`,
+  `ALTER TABLE task_attempts ADD COLUMN step_id TEXT`,
+  `CREATE TABLE task_steps (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), kind TEXT NOT NULL CHECK(kind IN ('model','tool','herdr_worker','timer_wait','signal_wait','approval_wait','child_task','join')), title TEXT NOT NULL, instructions TEXT, spec_ref TEXT, status TEXT NOT NULL CHECK(status IN ('pending','ready','running','waiting','blocked','review','succeeded','failed','cancelled','skipped')), dependency_policy_json TEXT NOT NULL, max_attempts INTEGER NOT NULL CHECK(max_attempts >= 1), timeout_ms INTEGER CHECK(timeout_ms IS NULL OR timeout_ms > 0), retry_policy_json TEXT, wait_policy_json TEXT, required_capabilities_json TEXT NOT NULL, delegated_permissions_json TEXT NOT NULL, checkpoint_ref TEXT, output_ref TEXT, version INTEGER NOT NULL CHECK(version >= 1), created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(task_id,id))`,
+  `CREATE INDEX task_steps_status ON task_steps(task_id,status,created_at,id)`,
+  `CREATE TABLE task_step_dependencies (task_id TEXT NOT NULL, step_id TEXT NOT NULL, dependency_id TEXT NOT NULL, PRIMARY KEY(task_id,step_id,dependency_id), FOREIGN KEY(task_id,step_id) REFERENCES task_steps(task_id,id), FOREIGN KEY(task_id,dependency_id) REFERENCES task_steps(task_id,id), CHECK(step_id <> dependency_id))`,
+  `CREATE INDEX task_step_dependencies_reverse ON task_step_dependencies(task_id,dependency_id,step_id)`,
+  `CREATE TABLE task_events (sequence INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, task_id TEXT NOT NULL REFERENCES tasks(id), step_id TEXT REFERENCES task_steps(id), attempt_id TEXT REFERENCES task_attempts(id), type TEXT NOT NULL, actor_principal_id TEXT REFERENCES principals(id), decision_id TEXT REFERENCES authorization_decisions(id), evidence_ref TEXT, metadata_json TEXT NOT NULL, created_at TEXT NOT NULL)`,
+  `CREATE INDEX task_events_page ON task_events(task_id,sequence)`,
+  `CREATE TRIGGER task_events_no_update BEFORE UPDATE ON task_events BEGIN SELECT RAISE(ABORT,'task events are append only'); END`,
+  `CREATE TRIGGER task_events_no_delete BEFORE DELETE ON task_events BEGIN SELECT RAISE(ABORT,'task events are append only'); END`,
+  `CREATE TABLE task_waits (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), step_id TEXT NOT NULL REFERENCES task_steps(id), attempt_id TEXT REFERENCES task_attempts(id), generation INTEGER NOT NULL CHECK(generation >= 1), kind TEXT NOT NULL CHECK(kind IN ('duration','until','deadline','signal','approval','retry')), status TEXT NOT NULL CHECK(status IN ('waiting','resumed','cancelled','stale')), started_at TEXT NOT NULL, due_at TEXT, signal_key TEXT, timeout_at TEXT, policy_json TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(step_id,generation))`,
+  `CREATE INDEX task_waits_pending ON task_waits(status,due_at,task_id)`,
+  `CREATE TABLE task_signals (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), step_id TEXT NOT NULL REFERENCES task_steps(id), wait_id TEXT REFERENCES task_waits(id), target_step_version INTEGER NOT NULL CHECK(target_step_version >= 1), target_attempt_id TEXT REFERENCES task_attempts(id), signal_type TEXT NOT NULL, principal_id TEXT REFERENCES principals(id), source TEXT NOT NULL CHECK(source IN ('principal','trusted_system')), decision_id TEXT NOT NULL REFERENCES authorization_decisions(id), payload_ref TEXT, metadata_json TEXT NOT NULL, disposition TEXT NOT NULL CHECK(disposition IN ('applied','duplicate','stale','denied')), idempotency_key TEXT NOT NULL, received_at TEXT NOT NULL, UNIQUE(task_id,idempotency_key))`,
+  `CREATE TABLE task_checkpoints (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), step_id TEXT REFERENCES task_steps(id), attempt_id TEXT REFERENCES task_attempts(id), checkpoint_type TEXT NOT NULL, state_ref TEXT NOT NULL, artifact_ref TEXT, evidence_ref TEXT NOT NULL, policy_revision INTEGER NOT NULL CHECK(policy_revision >= 1), created_at TEXT NOT NULL)`,
+  `CREATE INDEX task_checkpoints_latest ON task_checkpoints(task_id,step_id,created_at,id)`,
+  `CREATE TRIGGER task_checkpoints_no_update BEFORE UPDATE ON task_checkpoints BEGIN SELECT RAISE(ABORT,'task checkpoints are append only'); END`,
+  `CREATE TRIGGER task_checkpoints_no_delete BEFORE DELETE ON task_checkpoints BEGIN SELECT RAISE(ABORT,'task checkpoints are append only'); END`,
+  `CREATE TABLE task_child_links (child_task_id TEXT PRIMARY KEY REFERENCES tasks(id), parent_task_id TEXT NOT NULL REFERENCES tasks(id), parent_step_id TEXT NOT NULL REFERENCES task_steps(id), delegated_permissions_json TEXT NOT NULL, acceptance_criteria_json TEXT NOT NULL, cancel_policy TEXT NOT NULL CHECK(cancel_policy IN ('cancel_child','keep_child')), failure_policy TEXT NOT NULL CHECK(failure_policy IN ('block_parent','fail_parent','review_parent')), result_ref TEXT, created_at TEXT NOT NULL, CHECK(child_task_id <> parent_task_id))`,
+  `CREATE INDEX task_child_links_parent ON task_child_links(parent_task_id,parent_step_id)`,
+  `CREATE TABLE task_workflow_bindings (task_id TEXT PRIMARY KEY REFERENCES tasks(id), workflow_id TEXT NOT NULL UNIQUE, run_id TEXT, backend TEXT NOT NULL CHECK(backend = 'temporal'), state TEXT NOT NULL CHECK(state IN ('starting','running','unavailable','closed')), policy_revision INTEGER NOT NULL CHECK(policy_revision >= 1), continuation INTEGER NOT NULL DEFAULT 0 CHECK(continuation >= 0), updated_at TEXT NOT NULL)`,
+  `CREATE TABLE task_step_leases (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), step_id TEXT NOT NULL REFERENCES task_steps(id), attempt_id TEXT REFERENCES task_attempts(id), worker_binding_id TEXT REFERENCES worker_bindings(id), owner_instance_id TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('active','released','expired','quarantined')), version INTEGER NOT NULL CHECK(version >= 1), acquired_at TEXT NOT NULL, heartbeat_at TEXT NOT NULL, expires_at TEXT NOT NULL, released_at TEXT)`,
+  `CREATE UNIQUE INDEX task_step_one_active_lease ON task_step_leases(step_id) WHERE state = 'active'`,
+  `CREATE INDEX task_step_leases_expiry ON task_step_leases(state,expires_at)`,
+];
+
+export const schema = [
+  ...baseSchema,
+  ...schemaV7Statements,
+  ...schemaV8Migration,
+  ...learningSchema,
+  ...schemaV12Migration,
 ];

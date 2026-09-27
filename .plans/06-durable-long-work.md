@@ -1,0 +1,36 @@
+# P6 Durable Long Work and Workers
+
+Status: IMPLEMENTATION IN PROGRESS. Tracking Issue: #33.
+
+## Scope and gates
+
+Extend the existing Glassbox Task, TaskAttempt, WorkerBinding, authorization, delivery, and trace paths. Glassbox remains the source of Task truth. Temporal is the default executor for timers, signals, activities, retries, and replay. Herdr remains the live coding Worker host. A workflow completion or Herdr `done` may move a Step toward review; only authorized Glassbox acceptance may set the Task to `DONE`.
+
+Issue #30 is a prerequisite for production merge and every real Linux/QQ acceptance scenario. As checked on 2026-09-27, #30 is open and the WSL checkout lacks Node, Herdr, and NapCat. Development on this branch may proceed, but no deterministic test or Windows service observation counts as that gate.
+
+The P6.0 disposable Linux spike is recorded in `spikes/temporal/README.md`. Node 24.21.0, Temporal TypeScript SDK 1.24.0, and the CLI embedded Server 1.32.0 passed the listed primitive checks, including Worker and Server restart. Adopt Temporal for the orchestration path. The verified `start-dev` image is a development path only; a pinned production Server with supported persistent storage remains part of P6.11 and the #30 Linux baseline.
+
+The current branch has the P6 contracts, schema migration, DAG state transitions, waits and signals, a Temporal coordinator, durable cancellation records, and a Step claim with an attempt and lease. Temporal currently runs wait and join Steps. Model, Tool, Herdr Worker, and child Task execution, Step review and rework, and real Linux acceptance remain open. Tests of the implemented pieces do not satisfy those gates.
+
+## Delivery order
+
+1. **P6.0 contracts and real Temporal spike.** Freeze TaskStep, TaskEvent, Wait, Signal, RetryPolicy, Checkpoint, ChildTask link, Lease, and WorkflowBinding with bounded metadata. In a disposable Linux environment, pin a supported Temporal SDK and server and exercise workflow start, timer, signal, activity, retry, child workflow, cancellation, Worker and server restart, and continue-as-new. Record versions, commands, results, and adoption decision. Do not choose a custom scheduler without a demonstrated Temporal blocker.
+2. **P6.1 persistence.** Add a schema migration for existing Tasks, plus Step DAG, event history, wait/signal, checkpoint, workflow binding, and lease records. Preserve old Task and TaskAttempt identifiers and historical trace. New records must be queryable after database reopen.
+3. **P6.2 to P6.4 orchestration.** Validate cycles and fan-out on the server, compute deterministic ready sets, and run bounded parallel Steps. Support durable timers, signals, cancellation, retry policy, and an explicit `unknown` outcome for side effects. Temporal Activities must load current Glassbox state and reauthorize immediately before protected execution. A timeout or lost transport must not replay a possible mutation without post-state evidence.
+4. **P6.5 to P6.8 continuation and review.** Store checkpoint references and attempt lineage. Child Tasks use stable links and a delegated permission subset. Herdr Step execution uses TaskAttempt and WorkerBinding with exclusive lease and reconciliation. Step review and Task review remain distinct. Rework preserves old attempts. Task acceptance remains a named authorized action.
+5. **P6.9 to P6.10 reliability.** Add recovery, backend health, resource limits, projections, and focused adversarial tests for restart, duplicate signal, revocation while waiting, unknown side effects, Worker loss, and stale leases. Run `vp run verify:full` before calling the deterministic slice complete.
+6. **P6.11 to P6.12 real acceptance.** After #30 completion, run Issue #33 E2E A through J in the Linux stack, including real Herdr Workers and real QQ ingress and delivery. Record Task, Step, Attempt, WorkerBinding, Run, and process identifiers without exposing private payloads. Only then close #33.
+
+## Contract boundaries
+
+- `Task` is the durable product identity. `TaskStep`, `TaskAttempt`, Temporal workflow execution, and Herdr pane have separate IDs.
+- A Step kind is a closed server-validated set, not an arbitrary executable body. Model and Tool Steps use the current authorized context and tool gate. Worker Steps use existing Ops authorization. Notifications use the delivery gate.
+- TaskEvent is append-only. Store structured decisions, transition metadata, and references, not full prompts, private data, or Tool output.
+- Signals carry a stable ID, acting Principal or trusted system source, authorization decision, attempt/version target, and bounded payload reference. Duplicate and stale signals are recorded without applying them to a later attempt.
+- Lease expiry is evidence of uncertain Worker ownership, not proof that an external side effect did not happen.
+- A child Task may only receive permissions contained in the caller's current delegated set. Parent cancellation and child failure use explicit policy.
+- Temporal workflow input contains stable IDs and policy revision. Activities read current Glassbox truth. Workflow history rollover retains Task identity and unresolved work.
+
+## Review and evidence
+
+Review each finished code slice against authorization, persistence, restart, reversal, trace, and existing P3 behavior. Use an isolated reviewer after implementation, verify every reported finding against source or a reproduction, fix real defects, and rerun affected checks. Record deterministic, real Herdr, and real QQ results separately.

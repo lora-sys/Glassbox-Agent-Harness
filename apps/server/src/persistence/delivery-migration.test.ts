@@ -11,6 +11,9 @@ it("migrates v9 deliveries without losing old rows and accepts browser and media
     const path = join(directory, "glassbox.db");
     const legacy = createClient({ url: localDatabaseUrl(path) });
     await legacy.execute("CREATE TABLE runs (id TEXT PRIMARY KEY)");
+    await legacy.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY)");
+    await legacy.execute("CREATE TABLE task_attempts (id TEXT PRIMARY KEY, task_id TEXT)");
+    await legacy.execute("CREATE TABLE worker_bindings (id TEXT PRIMARY KEY)");
     await legacy.execute(
       "CREATE TABLE deliveries (id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id), dedup_key TEXT NOT NULL, destination_scope_key TEXT NOT NULL, payload_text TEXT NOT NULL, payload_kind TEXT NOT NULL CHECK(payload_kind IN ('text','result','ack')), status TEXT NOT NULL CHECK(status IN ('pending','sending','sent','failed','unknown')), external_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(run_id, dedup_key))",
     );
@@ -24,7 +27,7 @@ it("migrates v9 deliveries without losing old rows and accepts browser and media
     const db = await DomainDatabase.open(path);
     try {
       await db.transaction(async (tx) => {
-        expect((await tx.execute("PRAGMA user_version")).rows[0]?.user_version).toBe(11);
+        expect((await tx.execute("PRAGMA user_version")).rows[0]?.user_version).toBe(12);
         expect(
           (await tx.execute("SELECT payload_text, status FROM deliveries WHERE id = 'delivery-1'"))
             .rows[0],

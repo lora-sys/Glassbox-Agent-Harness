@@ -1,8 +1,16 @@
-import type { AgentOpsSnapshot, AgentTask, TaskPriority } from "@glassbox/contracts";
-import { AccessDeniedError } from "../auth/service.js";
+import { randomUUID } from "node:crypto";
+import type {
+  AgentOpsSnapshot,
+  AgentTask,
+  TaskPriority,
+  TaskSignal,
+  TaskStep,
+} from "@glassbox/contracts";
+import { AccessDeniedError, type AuthorizationDecision } from "../auth/service.js";
 import { scopeKey, type CallerContext } from "../identity/scope.js";
 import type { DomainStore } from "../persistence/index.js";
 import type { HerdrBridge } from "./herdr-bridge.js";
+import { DEFAULT_TASK_GRAPH_LIMITS } from "./task-graph.js";
 import { buildOpsHealthSnapshot, type OpsHealthInput, type OpsHealthSnapshot } from "./health.js";
 import { mkdir, writeFile, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
@@ -15,6 +23,11 @@ export interface WorkerPolicy {
 
 const OPS_RESOURCE = "agent-operations";
 type RunEvidence = { runId?: string; conversationId?: string };
+export interface LongWorkRuntimePort {
+  available?(): boolean;
+  start(taskId: string, policyRevision: number): Promise<unknown>;
+  wake(taskId: string): Promise<void>;
+}
 type CreateTaskInput = RunEvidence & {
   title: string;
   description?: string;
@@ -27,6 +40,7 @@ export class AuthorizedOpsService {
     private readonly store: DomainStore,
     private readonly bridge: HerdrBridge,
     private readonly workerPolicy?: WorkerPolicy,
+    private readonly longWorkRuntime?: LongWorkRuntimePort,
   ) {}
 
   private async workerContext(
@@ -81,7 +95,7 @@ export class AuthorizedOpsService {
     resourceId: string,
     action: string,
     evidence?: RunEvidence,
-  ): Promise<void> {
+  ): Promise<AuthorizationDecision> {
     const decision = await this.store.authorization.check({
       caller,
       resourceId,
@@ -98,6 +112,7 @@ export class AuthorizedOpsService {
       ...evidence,
     });
     if (decision.decision !== "ALLOW") throw new AccessDeniedError(decision);
+    return decision;
   }
 
   async status(caller: CallerContext, evidence?: RunEvidence): Promise<AgentOpsSnapshot> {
@@ -110,6 +125,14 @@ export class AuthorizedOpsService {
     observation: Pick<OpsHealthInput, "herdr" | "now" | "windowStart" | "staleAfterMs">,
     evidence?: RunEvidence,
   ): Promise<OpsHealthSnapshot> {
+    return (await this.healthDetailed(caller, observation, evidence)).snapshot;
+  }
+
+  async healthDetailed(
+    caller: CallerContext,
+    observation: Pick<OpsHealthInput, "herdr" | "now" | "windowStart" | "staleAfterMs">,
+    evidence?: RunEvidence,
+  ): Promise<{ snapshot: OpsHealthSnapshot; visibleTaskIds: string[] }> {
     await this.authorize(caller, OPS_RESOURCE, "ops:status");
     const records = await this.store.tasks.getOpsHealthRecords(caller, evidence);
     const observations = observation.herdr.observations.length
@@ -119,11 +142,14 @@ export class AuthorizedOpsService {
           state: binding.lastObservedAgentState,
           observedAt: binding.updatedAt,
         }));
-    return buildOpsHealthSnapshot({
-      ...records,
-      ...observation,
-      herdr: { ...observation.herdr, observations },
-    });
+    return {
+      snapshot: buildOpsHealthSnapshot({
+        ...records,
+        ...observation,
+        herdr: { ...observation.herdr, observations },
+      }),
+      visibleTaskIds: records.tasks.map((task) => task.id),
+    };
   }
 
   async list(caller: CallerContext, evidence?: RunEvidence): Promise<AgentTask[]> {
@@ -134,6 +160,67 @@ export class AuthorizedOpsService {
   async get(caller: CallerContext, taskId: string): Promise<AgentTask | null> {
     await this.authorize(caller, `task-${taskId}`, "task:read");
     return this.store.tasks.getTask(taskId);
+  }
+
+  async steps(caller: CallerContext, taskId: string): Promise<TaskStep[]> {
+    await this.authorize(caller, `task-${taskId}`, "task:read");
+    return this.store.longWork.listSteps(taskId);
+  }
+
+  async taskEvents(caller: CallerContext, taskId: string, afterSequence = 0) {
+    await this.authorize(caller, `task-${taskId}`, "task:read");
+    return this.store.longWork.listEvents(taskId, afterSequence);
+  }
+
+  async planExistingTask(
+    caller: CallerContext,
+    taskId: string,
+    steps: readonly TaskStep[],
+    rootStepId: string,
+    evidence?: RunEvidence,
+  ): Promise<void> {
+    const decision = await this.authorize(caller, `task-${taskId}`, "task:plan", evidence);
+    if (!this.longWorkRuntime || this.longWorkRuntime.available?.() === false)
+      throw new Error("Durable Task runtime is unavailable");
+    await this.store.longWork.createGraph(taskId, steps, rootStepId, DEFAULT_TASK_GRAPH_LIMITS, {
+      kind: "decision",
+      decisionId: decision.id,
+      actorPrincipalId: caller.principalId,
+    });
+    const task = await this.store.tasks.getTask(taskId);
+    await this.longWorkRuntime.start(taskId, task?.policyRevision ?? 1);
+  }
+
+  async signal(
+    caller: CallerContext,
+    input: {
+      taskId: string;
+      stepId: string;
+      targetStepVersion: number;
+      targetAttemptId?: string;
+      type: string;
+      idempotencyKey: string;
+      approval?: boolean;
+    },
+    evidence?: RunEvidence,
+  ): Promise<TaskSignal> {
+    const action = input.approval ? "task:approve" : "task:signal";
+    const decision = await this.authorize(caller, `task-${input.taskId}`, action, evidence);
+    const signal = await this.store.longWork.recordSignal({
+      id: randomUUID(),
+      taskId: input.taskId,
+      stepId: input.stepId,
+      targetStepVersion: input.targetStepVersion,
+      targetAttemptId: input.targetAttemptId,
+      type: input.type,
+      source: "principal",
+      actorPrincipalId: caller.principalId,
+      authorizationDecisionId: decision.id,
+      idempotencyKey: input.idempotencyKey,
+      receivedAt: new Date().toISOString(),
+    });
+    if (signal.disposition === "applied") await this.longWorkRuntime?.wake(input.taskId);
+    return signal;
   }
 
   async create(caller: CallerContext, input: CreateTaskInput): Promise<AgentTask> {
@@ -258,8 +345,17 @@ export class AuthorizedOpsService {
   }
 
   async accept(caller: CallerContext, taskId: string): Promise<void> {
-    await this.authorize(caller, `task-${taskId}`, "task:accept");
-    await this.store.tasks.acceptTask(taskId, caller.principalId);
+    const decision = await this.authorize(caller, `task-${taskId}`, "task:accept");
+    const task = await this.store.tasks.getTask(taskId);
+    if (task?.orchestrationMode === "durable") {
+      await this.store.longWork.acceptDurableTask(taskId, {
+        kind: "decision",
+        decisionId: decision.id,
+        actorPrincipalId: caller.principalId,
+      });
+    } else {
+      await this.store.tasks.acceptTask(taskId, caller.principalId);
+    }
   }
 
   async rework(
@@ -309,9 +405,35 @@ export class AuthorizedOpsService {
     return (await this.store.tasks.getTask(taskId))!;
   }
 
-  async cancel(caller: CallerContext, taskId: string, reason?: string): Promise<void> {
-    await this.authorize(caller, `task-${taskId}`, "task:cancel");
+  async cancel(caller: CallerContext, taskId: string, reason?: string): Promise<boolean> {
+    const decision = await this.authorize(caller, `task-${taskId}`, "task:cancel");
     const task = await this.store.tasks.getTask(taskId);
+    if (task?.orchestrationMode === "durable") {
+      const origin = {
+        kind: "decision" as const,
+        decisionId: decision.id,
+        actorPrincipalId: caller.principalId,
+      };
+      const requested = await this.store.longWork.requestDurableCancellation(taskId, origin);
+      if (requested.cancellationState === "settled") return true;
+      const steps = await this.store.longWork.listSteps(taskId);
+      if (steps.some((step) => step.status === "running")) {
+        await this.longWorkRuntime?.wake(taskId).catch(() => undefined);
+        return false;
+      }
+      try {
+        await this.store.longWork.settleDurableCancellation(taskId, origin);
+        await this.longWorkRuntime?.wake(taskId).catch(() => undefined);
+        return true;
+      } catch (error) {
+        if (
+          error instanceof Error &&
+          error.message === "Task cancellation still has running Steps or active leases"
+        )
+          return false;
+        throw error;
+      }
+    }
     const binding = task?.activeAttemptId
       ? await this.store.tasks.getWorkerBinding(task.activeAttemptId)
       : null;
@@ -320,5 +442,6 @@ export class AuthorizedOpsService {
       await this.bridge.stopAgent({ paneId: binding.paneId, agentName: binding.agentName });
     }
     await this.store.tasks.cancelTask(taskId, reason, caller.principalId);
+    return true;
   }
 }

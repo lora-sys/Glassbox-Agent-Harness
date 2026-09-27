@@ -7,6 +7,7 @@ import { EvidenceStore } from "../persistence/evidence.js";
 import { OwnerManagementRecords } from "../management/records.js";
 import { CapabilityPolicyStore } from "../management/capability-policy.js";
 import { TaskStore } from "../ops/task-store.js";
+import { LongWorkStore } from "../ops/long-work-store.js";
 import { LearningStore } from "../learning/store.js";
 
 /**
@@ -26,6 +27,7 @@ export async function openDomainStore(options: { databasePath: string }) {
     management: new OwnerManagementRecords(db),
     capabilities: new CapabilityPolicyStore(db),
     tasks: new TaskStore(db),
+    longWork: new LongWorkStore(db),
     learning: new LearningStore(db, authorization),
     close: () => db.close(),
   };

@@ -109,6 +109,21 @@ function parseTask(row: Row): AgentTask {
     runId: optionalString(row, "run_id") ?? undefined,
     activeAttemptId: optionalString(row, "active_attempt_id"),
     acceptanceCriteria,
+    ...(row.orchestration_mode === "durable"
+      ? {
+          orchestrationMode: "durable" as const,
+          currentPhase: optionalString(row, "current_phase") ?? undefined,
+          rootStepId: optionalString(row, "root_step_id") ?? undefined,
+          activeStepIds: JSON.parse(stringColumn(row, "active_step_ids_json")) as string[],
+          waitingReason: optionalString(row, "waiting_reason") ?? undefined,
+          checkpointRef: optionalString(row, "checkpoint_ref") ?? undefined,
+          cancellationState: stringColumn(row, "cancellation_state") as NonNullable<
+            AgentTask["cancellationState"]
+          >,
+          policyRevision: Number(row.policy_revision),
+          completedAt: optionalString(row, "completed_at") ?? undefined,
+        }
+      : {}),
     createdAt: stringColumn(row, "created_at"),
     updatedAt: stringColumn(row, "updated_at"),
   };
@@ -118,6 +133,7 @@ function parseAttempt(row: Row): TaskAttempt {
   return {
     id: stringColumn(row, "id"),
     taskId: stringColumn(row, "task_id"),
+    stepId: optionalString(row, "step_id") ?? undefined,
     attemptNumber: Number(row.attempt_number),
     status: stringColumn(row, "status") as AttemptStatus,
     reworkReason: optionalString(row, "rework_reason") ?? undefined,
@@ -364,8 +380,19 @@ export class TaskStore {
         const policy = taskPolicyResourceId({ principalId: params.creatorPrincipalId, scope });
         const visibility = scope.chatType === "group" ? "public" : "private";
         await tx.execute({
-          sql: "UPDATE tasks SET origin_scope_key = ? WHERE id = ?",
-          args: [scopeKey(scope), id],
+          sql: "UPDATE tasks SET origin_scope_key = ?, origin_scope_json = ? WHERE id = ?",
+          args: [
+            scopeKey(scope),
+            JSON.stringify({
+              connectionId: scope.connectionId,
+              botId: scope.botId,
+              chatType: scope.chatType,
+              chatId: scope.chatId,
+              senderId: scope.senderId,
+              ...(scope.threadId ? { threadId: scope.threadId } : {}),
+            }),
+            id,
+          ],
         });
         await tx.execute({
           sql: "INSERT OR IGNORE INTO resources(id, kind, visibility, owner_id) VALUES (?, 'task-policy', ?, ?)",
@@ -471,6 +498,12 @@ export class TaskStore {
     requireIdentifier(taskId);
     const now = new Date().toISOString();
     await this.db.transaction(async (tx) => {
+      const task = await tx.execute({
+        sql: "SELECT orchestration_mode FROM tasks WHERE id = ?",
+        args: [taskId],
+      });
+      if (task.rows[0]?.orchestration_mode !== "legacy")
+        throw new Error("Durable Task requires step-aware status transitions");
       if (activeAttemptId !== undefined) {
         await tx.execute({
           sql: "UPDATE tasks SET status = ?, active_attempt_id = ?, updated_at = ? WHERE id = ?",
@@ -581,12 +614,13 @@ export class TaskStore {
     return this.db.transaction(async (tx) => {
       let num = params.attemptNumber;
       const tasks = await tx.execute({
-        sql: "SELECT status, active_attempt_id FROM tasks WHERE id = ?",
+        sql: "SELECT status, active_attempt_id, orchestration_mode FROM tasks WHERE id = ?",
         args: [params.taskId],
       });
       const task = tasks.rows[0];
       if (
         !task ||
+        task.orchestration_mode !== "legacy" ||
         task.active_attempt_id != null ||
         !["NEW", "QUEUED", "ASSIGNED"].includes(stringColumn(task, "status"))
       ) {
@@ -827,7 +861,7 @@ export class TaskStore {
   ): Promise<void> {
     await this.db.transaction(async (tx) => {
       const rows = await tx.execute({
-        sql: `SELECT b.*, t.id AS task_id, t.status AS task_status FROM worker_bindings b
+        sql: `SELECT b.*, t.id AS task_id, t.status AS task_status, t.orchestration_mode AS orchestration_mode FROM worker_bindings b
           JOIN task_attempts a ON a.id = b.task_attempt_id
           JOIN tasks t ON t.id = a.task_id AND t.active_attempt_id = a.id
           WHERE b.herdr_session = ? AND b.workspace_id = ? AND b.pane_id = ?`,
@@ -835,6 +869,7 @@ export class TaskStore {
       });
       if (rows.rows.length !== 1) return;
       const row = rows.rows[0]!;
+      if (row.orchestration_mode !== "legacy") return;
       const taskId = stringColumn(row, "task_id");
       const attemptId = stringColumn(row, "task_attempt_id");
       const current = stringColumn(row, "task_status");
@@ -928,6 +963,8 @@ export class TaskStore {
         throw new Error(`Task not found: ${taskId}`);
       }
       const task = parseTask(res.rows[0]);
+      if (res.rows[0].orchestration_mode !== "legacy")
+        throw new Error("Durable Task requires step-aware acceptance");
       if (task.status !== "REVIEW") {
         throw new Error(`Cannot accept task in status ${task.status}; must be in REVIEW`);
       }
@@ -1001,6 +1038,8 @@ export class TaskStore {
         throw new Error(`Task not found: ${taskId}`);
       }
       const task = parseTask(res.rows[0]);
+      if (res.rows[0].orchestration_mode !== "legacy")
+        throw new Error("Durable Task requires step-aware rework");
       if (task.status !== "REVIEW") {
         throw new Error(
           `Cannot request rework for task in status ${task.status}; must be in REVIEW`,
@@ -1093,6 +1132,8 @@ export class TaskStore {
         throw new Error(`Task not found: ${taskId}`);
       }
       const task = parseTask(res.rows[0]);
+      if (res.rows[0].orchestration_mode !== "legacy")
+        throw new Error("Durable Task requires step-aware cancellation");
       if (task.status === "DONE" || task.status === "CANCELED") {
         throw new Error(`Cannot cancel task in terminal status ${task.status}`);
       }

@@ -340,6 +340,21 @@ Glassbox Task DONE
 
 The detailed synchronization contract lives in `docs/agent-operations.md`.
 
+### P6 long-work runtime
+
+Temporal TypeScript SDK 1.24.0 is pinned for P6 coordination. Glassbox stores the Task graph,
+wait state, decisions, review, and event history. Temporal receives a Task ID and policy
+revision, then wakes a Worker Activity that rereads Glassbox state. The Worker process uses
+the same `GLASSBOX_DATA_DIR` as the server. It must not use automated-test state.
+
+Set `GLASSBOX_TEMPORAL_ADDRESS` on the Glassbox server and the long-work Worker. Set
+`GLASSBOX_TEMPORAL_NAMESPACE` when the namespace is not `default`. Start the separate Worker
+with `npm run long-work:worker -w @glassbox/server`. When Temporal is unavailable, Task truth
+remains in Glassbox and the server reports an unavailable backend for affected work. The
+authorized `/manage/ops/health` response includes `longWorkBackend.state`, `reason`, and
+Principal-scoped `longWork` counts. The disposable `spikes/temporal` setup proves SDK
+primitives only. Linux deployment and real acceptance still depend on Issue #30 and the P6 plan.
+
 ## QQ Channel
 
 Plan 03 uses:

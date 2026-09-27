@@ -105,6 +105,17 @@ it("serves authorized Owner health and rejects out-of-scope or revoked Ops statu
     scope: ownerScope,
     effect: "allow",
   });
+  const hiddenTask = await app.store.tasks.createTask({
+    title: "Other scope",
+    creatorPrincipalId: "owner",
+    authorizationScope: { ...ownerScope, chatId: "other-chat" },
+  });
+  await app.store.db.transaction(async (tx) => {
+    await tx.execute({
+      sql: "UPDATE tasks SET orchestration_mode = 'durable' WHERE id = ?",
+      args: [hiddenTask.id],
+    });
+  });
 
   const ownerResponse = await app.route({
     method: "GET",
@@ -118,6 +129,8 @@ it("serves authorized Owner health and rejects out-of-scope or revoked Ops statu
         durable: { activeTasks: 1 },
         workers: { total: 1, unknown: 1 },
         herdr: { state: "healthy", stale: false },
+        longWorkBackend: { state: "not_configured", reason: null },
+        longWork: { tasks: { active: 0, waiting: 0 } },
       },
     },
   });

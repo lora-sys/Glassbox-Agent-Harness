@@ -77,6 +77,9 @@ describe("P5 tool plane origins", () => {
       "ops_status",
       "task_list",
       "worker_read",
+      "task_steps",
+      "task_events",
+      "task_plan",
     ]) {
       const descriptor = toolDescriptor(name);
       expect(descriptor, name).toBeDefined();
@@ -214,6 +217,21 @@ describe("P5 tool plane origins", () => {
         task_accept: { taskId: "t1" },
         task_rework: { taskId: "t1", reason: "No", prompt: "Do work" },
         task_cancel: { taskId: "t1" },
+        task_steps: { taskId: "t1" },
+        task_events: { taskId: "t1", afterSequence: 0 },
+        task_plan: {
+          taskId: "t1",
+          rootStepId: "root",
+          steps: [
+            {
+              id: "root",
+              kind: "timer_wait",
+              title: "Wait",
+              dependencyIds: [],
+              durationMs: 1000,
+            },
+          ],
+        },
       };
 
       for (const tool of tools) {

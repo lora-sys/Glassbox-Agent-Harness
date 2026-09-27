@@ -1,6 +1,25 @@
 // @glassbox/contracts — shared schemas, command and event types.
 
 export const contractsVersion = "0.0.0";
+export { TASK_STEP_KINDS, TASK_STEP_STATUSES, TASK_EVENT_TYPES } from "./long-work.js";
+export type {
+  TaskStepKind,
+  TaskStepStatus,
+  DependencyOutcome,
+  TaskStepDependencyPolicy,
+  TaskRetryPolicy,
+  TaskWaitKind,
+  TaskWaitPolicy,
+  TaskStep,
+  TaskEventType,
+  TaskEvent,
+  TaskWait,
+  TaskSignal,
+  TaskCheckpoint,
+  ChildTaskLink,
+  TaskStepLease,
+  TaskWorkflowBinding,
+} from "./long-work.js";
 export { RUN_INTEGRITY_SUITE } from "./evals.js";
 export type {
   EvalVerdict,
