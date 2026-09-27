@@ -64,6 +64,7 @@ it("denies an ungranted Pi delegate before starting any worker", async () => {
         "task_delegate",
         "worker_status",
         "worker_read",
+        "task_worker_result",
         "worker_prompt",
         "task_accept",
         "task_rework",

@@ -1,4 +1,5 @@
 import { mkdtemp, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, it } from "vite-plus/test";
@@ -1448,6 +1449,125 @@ it("attaches a same-Attempt WorkerBinding to the exact active lease once", async
         origin: claimOrigin,
       }),
     ).rejects.toThrow("Step lease ownership conflict");
+  } finally {
+    await db.close();
+  }
+});
+
+it("stores one immutable bounded Worker candidate for the live claim", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    const store = await fixture(db);
+    await store.createGraph(
+      "task-1",
+      [step("candidate-worker", [], "herdr_worker")],
+      "candidate-worker",
+      limits,
+      system,
+    );
+    await store.transitionStep({
+      taskId: "task-1",
+      stepId: "candidate-worker",
+      expectedVersion: 1,
+      from: "pending",
+      to: "ready",
+      origin: system,
+    });
+    await store.claimReadyStep({
+      taskId: "task-1",
+      stepId: "candidate-worker",
+      expectedStepVersion: 2,
+      attemptId: "candidate-attempt",
+      leaseId: "candidate-lease",
+      ownerInstanceId: "executor-1",
+      leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+      origin: claimOrigin,
+    });
+    await db.transaction((tx) =>
+      tx.execute({
+        sql: "INSERT INTO worker_bindings(id,task_attempt_id,herdr_session,workspace_id,pane_id,agent_kind,last_observed_agent_state,updated_at) VALUES (?,?,?,?,?,?,'working',?)",
+        args: [
+          "candidate-binding",
+          "candidate-attempt",
+          "herdr-session",
+          "workspace-1",
+          "pane-1",
+          "pi",
+          now,
+        ],
+      }),
+    );
+    await store.attachClaimedWorkerBinding({
+      taskId: "task-1",
+      stepId: "candidate-worker",
+      attemptId: "candidate-attempt",
+      leaseId: "candidate-lease",
+      workerBindingId: "candidate-binding",
+      ownerInstanceId: "executor-1",
+      expectedStepVersion: 3,
+      expectedLeaseVersion: 1,
+      origin: claimOrigin,
+    });
+
+    const output = `${"x".repeat(20)}${"😀".repeat(5_000)}`;
+    const input = {
+      taskId: "task-1",
+      stepId: "candidate-worker",
+      attemptId: "candidate-attempt",
+      leaseId: "candidate-lease",
+      ownerInstanceId: "executor-1",
+      workerBindingId: "candidate-binding",
+      expectedStepVersion: 3,
+      expectedLeaseVersion: 2,
+    };
+    const ref = await store.recordWorkerCandidate({ ...input, output });
+    expect(ref).toBe("worker-result:candidate-attempt");
+    expect(
+      await store.recordWorkerCandidate({ ...input, output: "retry must preserve first capture" }),
+    ).toBe(ref);
+
+    const record = await store.getWorkerCandidate(
+      "task-1",
+      "candidate-worker",
+      "candidate-attempt",
+    );
+    expect(record).toMatchObject({
+      taskId: "task-1",
+      stepId: "candidate-worker",
+      attemptId: "candidate-attempt",
+      workerBindingId: "candidate-binding",
+      outputSha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
+      truncated: true,
+    });
+    expect(record!.outputSha256).toBe(createHash("sha256").update(output, "utf8").digest("hex"));
+    expect(Buffer.byteLength(record!.outputExcerpt, "utf8")).toBeLessThanOrEqual(16 * 1024);
+    expect(record!.outputExcerpt).toMatch(/^😀/u);
+    expect(record!.outputSha256).not.toBe(
+      (await store.getWorkerCandidate("task-1", "candidate-worker", "missing-attempt"))
+        ?.outputSha256,
+    );
+    await expect(
+      store.recordWorkerCandidate({ ...input, expectedLeaseVersion: 1, output }),
+    ).rejects.toThrow("Worker candidate claim conflict");
+    await expect(
+      store.recordWorkerCandidate({ ...input, output: "x".repeat(1024 * 1024 + 1) }),
+    ).rejects.toThrow("Worker candidate output exceeds the input byte limit");
+    await expect(
+      db.transaction((tx) =>
+        tx.execute(
+          "UPDATE worker_candidate_outputs SET output_excerpt = 'changed' WHERE attempt_id = 'candidate-attempt'",
+        ),
+      ),
+    ).rejects.toThrow("worker candidate outputs are immutable");
+    await expect(
+      db.transaction((tx) =>
+        tx.execute("DELETE FROM worker_candidate_outputs WHERE attempt_id = 'candidate-attempt'"),
+      ),
+    ).rejects.toThrow("worker candidate outputs are immutable");
+    expect(
+      (await store.getWorkerCandidate("task-1", "candidate-worker", "candidate-attempt"))
+        ?.outputSha256,
+    ).toBe(record?.outputSha256);
   } finally {
     await db.close();
   }

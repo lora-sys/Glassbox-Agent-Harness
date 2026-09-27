@@ -271,6 +271,13 @@ const OPS_TOOL_BINDINGS: Record<
     budgetClass: "worker",
     grounding: "delegated_worker",
   },
+  task_worker_result: {
+    action: "worker:read",
+    resource: "task",
+    riskClass: "read",
+    budgetClass: "worker",
+    grounding: "delegated_worker",
+  },
   worker_prompt: {
     action: "worker:prompt",
     resource: "task",

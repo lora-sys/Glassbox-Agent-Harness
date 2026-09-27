@@ -886,6 +886,57 @@ export class AuthorizedOpsService {
     return result;
   }
 
+  /** Reads a captured durable Worker result only under current Task and source grants. */
+  async workerCandidate(
+    caller: CallerContext,
+    taskId: string,
+    stepId: string,
+    attemptId: string,
+    evidence?: RunEvidence,
+  ) {
+    const delegatedEvidence = { ...evidence, delegatedTaskId: taskId };
+    const decisions = [
+      await this.authorize(caller, `task-${taskId}`, "task:read", delegatedEvidence),
+      await this.authorize(caller, `task-${taskId}`, "worker:read", delegatedEvidence),
+    ];
+    const step = (await this.store.longWork.listSteps(taskId)).find((item) => item.id === stepId);
+    if (step?.kind !== "herdr_worker") throw new Error("Durable Worker Step is unavailable");
+    const candidate = await this.store.longWork.getWorkerCandidate(taskId, stepId, attemptId);
+    if (!candidate) return null;
+    const binding = await this.store.tasks.getWorkerBinding(attemptId);
+    if (!binding || binding.id !== candidate.workerBindingId)
+      throw new Error("Worker result binding is unavailable");
+    for (const permission of step.delegatedPermissionSet) {
+      let readAction: string;
+      if (permission.action === "worker:file:read" || permission.action === "worker:file:write")
+        readAction = "worker:file:read";
+      else if (permission.action === "workspace:read" || permission.action === "workspace:write")
+        readAction = "workspace:read";
+      else throw new Error("Worker result has an unsupported content source");
+      if (readAction === "workspace:read") {
+        const workspaceId = permission.resourceId.startsWith("workspace:")
+          ? permission.resourceId.slice("workspace:".length)
+          : "";
+        if (!workspaceId || !this.workspaceBoundary || !binding.worktreePath)
+          throw new Error("Worker result workspace is unavailable");
+        const workspace = await this.workspaceBoundary.registry.resolveAuthorized(
+          caller.principalId,
+          workspaceId,
+          "read",
+        );
+        if (workspace.canonicalPath !== (await realpath(binding.worktreePath)))
+          throw new Error("Worker result workspace differs from its binding");
+      }
+      decisions.push(
+        await this.authorize(caller, permission.resourceId, readAction, delegatedEvidence),
+      );
+    }
+    if (evidence?.runId)
+      for (const decision of decisions)
+        await this.store.authorization.markDeliverySource(decision.id, "content_source");
+    return candidate;
+  }
+
   async promptWorker(caller: CallerContext, taskId: string, prompt: string): Promise<void> {
     const { binding } = await this.binding(caller, taskId, "worker:prompt");
     await this.bridge.promptAgent({ paneId: binding.paneId, agentName: binding.agentName, prompt });

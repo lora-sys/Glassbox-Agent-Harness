@@ -112,6 +112,8 @@ Glassbox review REWORK
 
 Pi's native Herdr integration reports `working`, `idle`, and `blocked`. For a Pi attempt, an `idle` observation can enter REVIEW only after Glassbox has persisted a `working` observation for that same attempt and the previous observed state is `working`. An initial idle pane is not evidence of completed work. Raw Trace retains the reported `idle` state. This mapping never accepts a Task or marks it DONE.
 
+For a durable Herdr Step, Glassbox records the first terminal Worker output against its live TaskAttempt and WorkerBinding before the Step enters REVIEW. The stored candidate is immutable. It contains a SHA-256 digest of the bounded read and at most 16 KiB of terminal excerpt. The Step holds an opaque `worker-result` reference. A later read checks current Task and Worker read grants, plus read grants for every declared file and workspace source. This permits review after Herdr closes the pane. The excerpt is not a verified file artifact and does not accept the Step or Task.
+
 ## Core domain
 
 ### AttentionItem

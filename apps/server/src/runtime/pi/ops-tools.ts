@@ -24,6 +24,7 @@ export const OPS_TOOL_NAMES = Object.freeze([
   "worker_status",
   "task_delegate",
   "worker_read",
+  "task_worker_result",
   "worker_prompt",
   "task_accept",
   "task_rework",
@@ -211,6 +212,26 @@ export function createOpsTools(options: {
       resourceId: (params) => `task-${params.taskId}`,
       execute: async (params, context) =>
         options.service.readWorker(context.caller, params.taskId, context),
+    }),
+    createProtectedTool<{ taskId: string; stepId: string; attemptId: string }>({
+      ...common,
+      name: "task_worker_result",
+      description: "Read a captured durable Worker result under current Task and source grants.",
+      parameters: Type.Object(
+        { taskId, stepId, attemptId: stepId },
+        { additionalProperties: false },
+      ),
+      action: "worker:read",
+      deliverySource: "content_source",
+      resourceId: (params) => `task-${params.taskId}`,
+      execute: async (params, context) =>
+        options.service.workerCandidate(
+          context.caller,
+          params.taskId,
+          params.stepId,
+          params.attemptId,
+          context,
+        ),
     }),
     createProtectedTool<{ taskId: string; prompt: string }>({
       ...common,

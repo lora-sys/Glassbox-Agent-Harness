@@ -190,9 +190,42 @@ it("dispatches one Worker, reviews and cancels it safely, and quarantines an unc
     );
     expect((await advance(input)).kind).toBe("wait");
     expect(await store.tasks.listAttempts(task.id)).toHaveLength(1);
-    bridge.simulateAgentState(binding!.paneId, "done");
+    bridge.simulateAgentState(binding!.paneId, "done", "Candidate Worker result");
     expect(await advance(input)).toEqual({ kind: "continue" });
-    expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("review");
+    expect((await store.longWork.listSteps(task.id))[0]).toMatchObject({
+      status: "review",
+      outputRef: `worker-result:${attempt.id}`,
+    });
+    expect(await store.longWork.getWorkerCandidate(task.id, step.id, attempt.id)).toMatchObject({
+      outputExcerpt: "Candidate Worker result",
+      truncated: false,
+      workerBindingId: binding!.id,
+    });
+    await expect(service.workerCandidate(caller, task.id, step.id, attempt.id)).rejects.toThrow();
+    for (const [resourceId, action] of [
+      [`task-${task.id}`, "task:read"],
+      [`task-${task.id}`, "worker:read"],
+      [policy.resourceId, "worker:file:read"],
+    ])
+      await store.authorization.grant({
+        principalId: "owner",
+        resourceId: resourceId!,
+        action: action!,
+        scope: caller.scope,
+        effect: "allow",
+      });
+    const workspaceRead = await store.authorization.grant({
+      principalId: "owner",
+      resourceId: `workspace:${workspace.id}`,
+      action: "workspace:read",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    expect(await service.workerCandidate(caller, task.id, step.id, attempt.id)).toMatchObject({
+      outputExcerpt: "Candidate Worker result",
+    });
+    await store.authorization.revoke(workspaceRead);
+    await expect(service.workerCandidate(caller, task.id, step.id, attempt.id)).rejects.toThrow();
     expect((await store.tasks.getTask(task.id))?.status).not.toBe("DONE");
     await store.authorization.grant({
       principalId: "owner",
@@ -205,6 +238,9 @@ it("dispatches one Worker, reviews and cancels it safely, and quarantines an unc
     await service.acceptStep(caller, task.id, step.id, reviewed.version);
     expect(writes.status(workspace.id)).toBe("free");
     expect((await bridge.getSnapshot()).workspaces[0]?.panes).toHaveLength(0);
+    expect(await store.longWork.getWorkerCandidate(task.id, step.id, attempt.id)).toMatchObject({
+      outputExcerpt: "Candidate Worker result",
+    });
 
     const cancelledTask = await store.tasks.createTask({
       title: "Cancel active coding work",

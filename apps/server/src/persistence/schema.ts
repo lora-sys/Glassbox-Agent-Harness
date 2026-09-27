@@ -243,6 +243,12 @@ export const schemaV16Migration = [
   `CREATE TRIGGER IF NOT EXISTS task_notifications_payload_immutable BEFORE UPDATE ON task_notifications WHEN NEW.event_sequence <> OLD.event_sequence OR NEW.task_id <> OLD.task_id OR NEW.origin_run_id <> OLD.origin_run_id OR NEW.conversation_id <> OLD.conversation_id OR NEW.principal_id <> OLD.principal_id OR NEW.destination_scope_key <> OLD.destination_scope_key OR NEW.destination_scope_json <> OLD.destination_scope_json OR NEW.event_type <> OLD.event_type OR NEW.payload_text <> OLD.payload_text OR NEW.payload_kind <> OLD.payload_kind OR NEW.created_at <> OLD.created_at BEGIN SELECT RAISE(ABORT,'task notification payload is immutable'); END`,
 ];
 
+export const schemaV17Migration = [
+  `CREATE TABLE IF NOT EXISTS worker_candidate_outputs (attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, step_id TEXT NOT NULL, worker_binding_id TEXT NOT NULL REFERENCES worker_bindings(id), output_excerpt TEXT NOT NULL CHECK(length(CAST(output_excerpt AS BLOB)) <= 16384), output_sha256 TEXT NOT NULL CHECK(length(output_sha256) = 64), truncated INTEGER NOT NULL CHECK(truncated IN (0,1)), created_at TEXT NOT NULL, FOREIGN KEY(attempt_id,task_id,step_id) REFERENCES task_attempts(id,task_id,step_id), FOREIGN KEY(task_id,step_id) REFERENCES task_steps(task_id,id))`,
+  `CREATE TRIGGER IF NOT EXISTS worker_candidate_outputs_no_update BEFORE UPDATE ON worker_candidate_outputs BEGIN SELECT RAISE(ABORT,'worker candidate outputs are immutable'); END`,
+  `CREATE TRIGGER IF NOT EXISTS worker_candidate_outputs_no_delete BEFORE DELETE ON worker_candidate_outputs BEGIN SELECT RAISE(ABORT,'worker candidate outputs are immutable'); END`,
+];
+
 export const schema = [
   ...baseSchema,
   ...schemaV7Statements,

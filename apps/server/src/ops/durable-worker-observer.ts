@@ -2,10 +2,10 @@ import type { Row } from "@libsql/client";
 import type { HerdrAgentLifecycleState } from "@glassbox/contracts";
 import type { HerdrEvent, HerdrSessionSnapshot } from "./herdr-bridge.js";
 import { DomainDatabase, optionalString, stringColumn } from "../persistence/database.js";
-import { LongWorkStore } from "./long-work-store.js";
+import { LongWorkStore, WorkerCandidateLimitError } from "./long-work-store.js";
 import type { TaskStore } from "./task-store.js";
 
-interface DurableWorkerClaim {
+export interface DurableWorkerClaim {
   bindingId: string;
   taskId: string;
   stepId: string;
@@ -56,6 +56,10 @@ export class DurableWorkerObserver {
     private readonly longWork: LongWorkStore,
     _tasks: TaskStore,
     private readonly settleCompleted = true,
+    private readonly captureCandidate?: (
+      claim: DurableWorkerClaim,
+      state: "done" | "idle",
+    ) => Promise<string>,
   ) {}
 
   /** Attempt IDs owned by the durable path, including claims that are currently uncertain. */
@@ -247,6 +251,20 @@ export class DurableWorkerObserver {
     observedAt?: string,
   ): Promise<void> {
     try {
+      let outputRef: string | undefined;
+      if (
+        outcome === "review" &&
+        (observedAgentState === "done" || observedAgentState === "idle") &&
+        this.captureCandidate
+      ) {
+        try {
+          outputRef = await this.captureCandidate(claim, observedAgentState);
+        } catch (error) {
+          if (!(error instanceof WorkerCandidateLimitError)) throw error;
+          outcome = "unknown";
+          evidenceRef = `worker-output-limit:${claim.bindingId}`;
+        }
+      }
       await this.longWork.settleClaimedStep({
         taskId: claim.taskId,
         stepId: claim.stepId,
@@ -260,6 +278,7 @@ export class DurableWorkerObserver {
         observedAt,
         outcome,
         evidenceRef,
+        ...(outputRef ? { outputRef } : {}),
         origin: SYSTEM_ORIGIN,
       });
     } catch (error) {

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { Row, Transaction } from "@libsql/client";
 import {
   TASK_EVENT_TYPES,
@@ -38,6 +38,14 @@ export const MAX_CHILD_TASKS_PER_PARENT = 16;
 export const MAX_CHILD_TASK_ANCESTOR_DEPTH = 4;
 
 export const MAX_CHECKPOINT_PROJECTION_BYTES = 2048;
+export const MAX_WORKER_CANDIDATE_INPUT_BYTES = 1024 * 1024;
+export const MAX_WORKER_CANDIDATE_EXCERPT_BYTES = 16 * 1024;
+export class WorkerCandidateLimitError extends Error {
+  constructor() {
+    super("Worker candidate output exceeds the input byte limit");
+    this.name = "WorkerCandidateLimitError";
+  }
+}
 export const MAX_CHECKPOINT_FIELD_BYTES = {
   id: 128,
   taskId: 128,
@@ -106,6 +114,34 @@ export class ChildTaskLinkError extends Error {
 
 export interface StoredTaskEvent extends TaskEvent {
   authorizationDecisionId?: string;
+}
+
+export interface WorkerCandidateOutput {
+  taskId: string;
+  stepId: string;
+  attemptId: string;
+  workerBindingId: string;
+  outputExcerpt: string;
+  outputSha256: string;
+  truncated: boolean;
+  createdAt: string;
+}
+
+function workerOutputExcerpt(output: string): {
+  excerpt: string;
+  truncated: boolean;
+  sha256: string;
+} {
+  const bytes = Buffer.from(output, "utf8");
+  if (bytes.length > MAX_WORKER_CANDIDATE_INPUT_BYTES) throw new WorkerCandidateLimitError();
+  const start = Math.max(0, bytes.length - MAX_WORKER_CANDIDATE_EXCERPT_BYTES);
+  let validStart = start;
+  while (validStart < bytes.length && (bytes[validStart]! & 0xc0) === 0x80) validStart += 1;
+  return {
+    excerpt: bytes.subarray(validStart).toString("utf8"),
+    truncated: start > 0,
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+  };
 }
 
 export interface StoredTaskWait {
@@ -686,6 +722,133 @@ export class LongWorkStore {
         metadata: { workerBindingId: input.workerBindingId },
       });
       return parseLease(updated.rows[0]);
+    });
+  }
+
+  /** Persists the first bounded output captured from a currently owned Worker claim. */
+  async recordWorkerCandidate(input: {
+    taskId: string;
+    stepId: string;
+    attemptId: string;
+    leaseId: string;
+    ownerInstanceId: string;
+    workerBindingId: string;
+    expectedStepVersion: number;
+    expectedLeaseVersion: number;
+    output: string;
+  }): Promise<string> {
+    for (const value of [
+      input.taskId,
+      input.stepId,
+      input.attemptId,
+      input.leaseId,
+      input.ownerInstanceId,
+      input.workerBindingId,
+    ])
+      requireIdentifier(value);
+    if (
+      typeof input.output !== "string" ||
+      !Number.isSafeInteger(input.expectedStepVersion) ||
+      input.expectedStepVersion < 1 ||
+      !Number.isSafeInteger(input.expectedLeaseVersion) ||
+      input.expectedLeaseVersion < 1
+    )
+      throw new Error("Invalid Worker candidate claim");
+    const candidate = workerOutputExcerpt(input.output);
+    const ref = `worker-result:${input.attemptId}`;
+
+    return this.db.transaction(async (tx) => {
+      const claim = await tx.execute({
+        sql: `SELECT t.orchestration_mode, s.kind, s.status AS step_status, s.version AS step_version,
+            a.status AS attempt_status, l.state AS lease_state, l.version AS lease_version,
+            l.owner_instance_id, l.worker_binding_id, l.expires_at, b.id AS binding_id
+          FROM tasks t
+          JOIN task_steps s ON s.task_id = t.id AND s.id = ?
+          JOIN task_attempts a ON a.task_id = t.id AND a.step_id = s.id AND a.id = ?
+          JOIN task_step_leases l ON l.task_id = t.id AND l.step_id = s.id
+            AND l.attempt_id = a.id AND l.id = ?
+          JOIN worker_bindings b ON b.id = l.worker_binding_id AND b.task_attempt_id = a.id
+          WHERE t.id = ?`,
+        args: [input.stepId, input.attemptId, input.leaseId, input.taskId],
+      });
+      const claimRow = claim.rows[0];
+      if (
+        !claimRow ||
+        claimRow.orchestration_mode !== "durable" ||
+        claimRow.kind !== "herdr_worker" ||
+        claimRow.step_status !== "running" ||
+        Number(claimRow.step_version) !== input.expectedStepVersion ||
+        claimRow.attempt_status !== "running" ||
+        claimRow.lease_state !== "active" ||
+        Number(claimRow.lease_version) !== input.expectedLeaseVersion ||
+        claimRow.owner_instance_id !== input.ownerInstanceId ||
+        claimRow.worker_binding_id !== input.workerBindingId ||
+        claimRow.binding_id !== input.workerBindingId ||
+        Date.parse(stringColumn(claimRow, "expires_at")) <= Date.now()
+      )
+        throw new Error("Worker candidate claim conflict");
+
+      const existing = await tx.execute({
+        sql: "SELECT task_id,step_id,worker_binding_id FROM worker_candidate_outputs WHERE attempt_id = ?",
+        args: [input.attemptId],
+      });
+      if (existing.rows[0]) {
+        const row = existing.rows[0];
+        if (
+          row.task_id !== input.taskId ||
+          row.step_id !== input.stepId ||
+          row.worker_binding_id !== input.workerBindingId
+        )
+          throw new Error("Worker candidate Attempt is already bound to another claim");
+        return ref;
+      }
+
+      const createdAt = new Date().toISOString();
+      await tx.execute({
+        sql: `INSERT INTO worker_candidate_outputs
+          (attempt_id,task_id,step_id,worker_binding_id,output_excerpt,output_sha256,truncated,created_at)
+          VALUES (?,?,?,?,?,?,?,?)`,
+        args: [
+          input.attemptId,
+          input.taskId,
+          input.stepId,
+          input.workerBindingId,
+          candidate.excerpt,
+          candidate.sha256,
+          candidate.truncated ? 1 : 0,
+          createdAt,
+        ],
+      });
+      return ref;
+    });
+  }
+
+  /** Returns the internal Worker candidate record. Authorization belongs to the caller. */
+  async getWorkerCandidate(
+    taskId: string,
+    stepId: string,
+    attemptId: string,
+  ): Promise<WorkerCandidateOutput | null> {
+    for (const value of [taskId, stepId, attemptId]) requireIdentifier(value);
+    return this.db.transaction(async (tx) => {
+      const result = await tx.execute({
+        sql: `SELECT task_id,step_id,attempt_id,worker_binding_id,output_excerpt,output_sha256,truncated,created_at
+          FROM worker_candidate_outputs WHERE task_id = ? AND step_id = ? AND attempt_id = ?`,
+        args: [taskId, stepId, attemptId],
+      });
+      const row = result.rows[0];
+      return row
+        ? {
+            taskId: stringColumn(row, "task_id"),
+            stepId: stringColumn(row, "step_id"),
+            attemptId: stringColumn(row, "attempt_id"),
+            workerBindingId: stringColumn(row, "worker_binding_id"),
+            outputExcerpt: stringColumn(row, "output_excerpt"),
+            outputSha256: stringColumn(row, "output_sha256"),
+            truncated: Number(row.truncated) === 1,
+            createdAt: stringColumn(row, "created_at"),
+          }
+        : null;
     });
   }
 

@@ -4,6 +4,7 @@ import type { TaskStep } from "@glassbox/contracts";
 import { openDomainStore, type DomainStore } from "../persistence/index.js";
 import { FakeHerdrBridge } from "./fake-herdr-bridge.js";
 import { DurableWorkerObserver } from "./durable-worker-observer.js";
+import { WorkerCandidateLimitError } from "./long-work-store.js";
 import { OpsReconciler } from "./reconciler.js";
 
 const system = { kind: "system", reason: "durable worker observer test" } as const;
@@ -145,6 +146,28 @@ describe("DurableWorkerObserver", () => {
           ?.state,
     );
     expect(lease).toBe("released");
+  });
+
+  it("blocks a completed Worker when its candidate output exceeds the capture limit", async () => {
+    const { store, task, stepId, bridge, worker } = await fixture("pi");
+    const observer = new DurableWorkerObserver(
+      store.db,
+      store.longWork,
+      store.tasks,
+      true,
+      async () => {
+        throw new WorkerCandidateLimitError();
+      },
+    );
+    bridge.simulateAgentState(worker.paneId, "done");
+
+    await observer.observeSnapshot(await bridge.getSnapshot());
+
+    expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("blocked");
+    expect(await store.longWork.getWorkerCandidate(task.id, stepId, "attempt-1")).toBeNull();
+    expect((await store.longWork.listEvents(task.id)).at(-1)?.evidenceRef).toContain(
+      "worker-output-limit",
+    );
   });
 
   it("settles Pi working-to-idle and ignores duplicate completion events", async () => {

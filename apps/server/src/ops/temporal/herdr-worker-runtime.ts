@@ -24,7 +24,31 @@ export class HerdrWorkerRuntime {
     private readonly bridge: HerdrBridge,
     private readonly target: ConfiguredWorkerTarget,
   ) {
-    this.observer = new DurableWorkerObserver(store.db, store.longWork, store.tasks);
+    this.observer = new DurableWorkerObserver(
+      store.db,
+      store.longWork,
+      store.tasks,
+      true,
+      async (claim, state) => {
+        const read = await this.bridge.readAgent({
+          paneId: claim.paneId,
+          agentName: claim.agentName,
+        });
+        if (read.state !== state)
+          throw new Error("Worker state changed before candidate output capture");
+        return this.store.longWork.recordWorkerCandidate({
+          taskId: claim.taskId,
+          stepId: claim.stepId,
+          attemptId: claim.attemptId,
+          leaseId: claim.leaseId,
+          ownerInstanceId: claim.ownerInstanceId,
+          workerBindingId: claim.bindingId,
+          expectedStepVersion: claim.expectedStepVersion,
+          expectedLeaseVersion: claim.expectedLeaseVersion,
+          output: read.output,
+        });
+      },
+    );
   }
 
   dispatch(caller: CallerContext, claim: ClaimedTaskStep): Promise<void> {
