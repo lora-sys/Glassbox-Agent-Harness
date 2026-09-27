@@ -349,6 +349,33 @@ async function claimRetryStep(
   });
 }
 
+it("bounds active durable Tasks per Principal when adopting a graph", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    const store = await fixture(db);
+    await db.transaction((tx) =>
+      tx.execute({
+        sql: "INSERT INTO tasks(id,title,status,priority,creator_principal_id,origin_scope_key,created_at,updated_at) VALUES ('task-2','Second Task','NEW','normal','owner','test',?,?)",
+        args: [now, now],
+      }),
+    );
+    const constrained = { ...limits, maxActiveTasksPerPrincipal: 1 };
+    await store.createGraph("task-1", [step("a")], "a", constrained, system);
+    const second = { ...step("b"), taskId: "task-2" };
+    await expect(
+      store.createGraph("task-2", [second], "b", constrained, system),
+    ).rejects.toMatchObject({ code: "ACTIVE_TASK_LIMIT" });
+    expect(await store.listSteps("task-2")).toEqual([]);
+    await db.transaction((tx) =>
+      tx.execute("UPDATE tasks SET status = 'DONE' WHERE id = 'task-1'"),
+    );
+    await store.createGraph("task-2", [second], "b", constrained, system);
+    expect(await store.listSteps("task-2")).toHaveLength(1);
+  } finally {
+    await db.close();
+  }
+});
+
 it("does not let legacy whole-Task operations bypass a durable graph", async () => {
   const db = await DomainDatabase.open(":memory:");
   try {

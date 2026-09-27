@@ -6,6 +6,7 @@ import {
 } from "@glassbox/contracts";
 
 export interface TaskGraphLimits {
+  maxActiveTasksPerPrincipal?: number;
   maxSteps: number;
   maxDependenciesPerStep: number;
   maxFanOut: number;
@@ -14,6 +15,7 @@ export interface TaskGraphLimits {
 }
 
 export const DEFAULT_TASK_GRAPH_LIMITS: Readonly<TaskGraphLimits> = Object.freeze({
+  maxActiveTasksPerPrincipal: 16,
   maxSteps: 64,
   maxDependenciesPerStep: 8,
   maxFanOut: 8,
@@ -31,7 +33,8 @@ export type TaskGraphErrorCode =
   | "STEP_LIMIT"
   | "DEPENDENCY_LIMIT"
   | "FAN_OUT_LIMIT"
-  | "READY_LIMIT";
+  | "READY_LIMIT"
+  | "ACTIVE_TASK_LIMIT";
 
 export class TaskGraphError extends Error {
   constructor(

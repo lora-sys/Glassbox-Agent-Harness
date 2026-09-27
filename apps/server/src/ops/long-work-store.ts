@@ -16,7 +16,7 @@ import {
 } from "@glassbox/contracts";
 import { requireIdentifier } from "../identity/scope.js";
 import { DomainDatabase, optionalString, stringColumn } from "../persistence/database.js";
-import { validateTaskGraph, type TaskGraphLimits } from "./task-graph.js";
+import { TaskGraphError, validateTaskGraph, type TaskGraphLimits } from "./task-graph.js";
 import { decideTaskRetry, type RetrySideEffectOutcome } from "./long-work-retry.js";
 
 /** Only trusted services may call this store. A decision ID records evidence; it does not
@@ -1527,6 +1527,17 @@ export class LongWorkStore {
         task.active_attempt_id !== null
       )
         throw new Error("Task cannot adopt a graph");
+      const activeLimit = limits.maxActiveTasksPerPrincipal ?? 16;
+      if (!Number.isSafeInteger(activeLimit) || activeLimit < 1)
+        throw new TaskGraphError("INVALID_LIMIT", "Invalid active Task limit");
+      const activeTasks = await tx.execute({
+        sql: `SELECT COUNT(*) AS count FROM tasks
+              WHERE creator_principal_id = ? AND orchestration_mode = 'durable'
+                AND status NOT IN ('DONE','CANCELED','FAILED')`,
+        args: [stringColumn(task, "creator_principal_id")],
+      });
+      if (Number(activeTasks.rows[0]?.count ?? 0) >= activeLimit)
+        throw new TaskGraphError("ACTIVE_TASK_LIMIT", "Active durable Task limit reached");
       const existing = await tx.execute({
         sql: "SELECT 1 FROM task_steps WHERE task_id = ? LIMIT 1",
         args: [taskId],
