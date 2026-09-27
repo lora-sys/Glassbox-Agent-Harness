@@ -2934,9 +2934,18 @@ export class LongWorkStore {
 
       const now = new Date().toISOString();
       const previousTaskStatus = stringColumn(task, "status");
-      const nextTaskStatus = ["WAITING_INPUT", "REVIEW"].includes(previousTaskStatus)
-        ? "RUNNING"
-        : previousTaskStatus;
+      const otherBlocked = blockedChild
+        ? await tx.execute({
+            sql: "SELECT COUNT(*) AS count, COALESCE(MAX(CASE WHEN status = 'blocked' THEN 1 ELSE 0 END),0) AS has_blocked FROM task_steps WHERE task_id = ? AND id <> ? AND status IN ('blocked','failed')",
+            args: [input.taskId, input.stepId],
+          })
+        : null;
+      const nextTaskStatus =
+        blockedChild && Number(otherBlocked?.rows[0]?.count ?? 0) > 0
+          ? "WAITING_INPUT"
+          : ["WAITING_INPUT", "REVIEW"].includes(previousTaskStatus)
+            ? "RUNNING"
+            : previousTaskStatus;
       const taskUpdate = await tx.execute({
         sql: "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND status = ? AND orchestration_mode = 'durable' AND cancellation_state = 'none'",
         args: [nextTaskStatus, now, input.taskId, previousTaskStatus],
@@ -2961,6 +2970,12 @@ export class LongWorkStore {
         attemptUpdate.rowsAffected !== 1
       )
         throw new Error("Step rework conflict");
+      if (blockedChild && Number(otherBlocked?.rows[0]?.has_blocked ?? 0) === 0) {
+        await tx.execute({
+          sql: "UPDATE attention_items SET resolved_at = ? WHERE task_id = ? AND kind = 'worker_blocked' AND task_attempt_id IS NULL AND resolved_at IS NULL",
+          args: [now, input.taskId],
+        });
+      }
       await this.appendEventTx(tx, {
         taskId: input.taskId,
         stepId: input.stepId,

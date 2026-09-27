@@ -401,6 +401,10 @@ it("applies each explicit child failure policy to the parent Step", async () => 
       expect(childAttempt.rows[0]?.status).toBe(expected === "review" ? "review" : "failed");
       expect((await store.tasks.getTask(parent.id))?.status).not.toBe("DONE");
       if (policy === "block_parent") {
+        expect((await advance(input)).kind).toBe("wait");
+        expect(
+          (await store.tasks.listAttentionItems()).filter((item) => item.taskId === parent.id),
+        ).toEqual([expect.objectContaining({ kind: "worker_blocked" })]);
         await store.authorization.grant({
           principalId: "owner",
           resourceId: `task-${parent.id}`,
@@ -417,6 +421,10 @@ it("applies each explicit child failure policy to the parent Step", async () => 
           "Replace the failed child",
         );
         expect(ready.status).toBe("ready");
+        expect((await store.tasks.getTask(parent.id))?.status).toBe("RUNNING");
+        expect(
+          (await store.tasks.listAttentionItems()).filter((item) => item.taskId === parent.id),
+        ).toEqual([]);
         const replacement = await store.tasks.createTask({
           title: "Replacement child",
           creatorPrincipalId: "owner",
