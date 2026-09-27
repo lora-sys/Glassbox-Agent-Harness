@@ -237,6 +237,12 @@ export const schemaV15Migration = [
   `ALTER TABLE worker_bindings ADD COLUMN prompt_dispatched_at TEXT`,
 ];
 
+export const schemaV16Migration = [
+  `CREATE TABLE IF NOT EXISTS task_notifications (id TEXT PRIMARY KEY, event_sequence INTEGER NOT NULL UNIQUE REFERENCES task_events(sequence), task_id TEXT NOT NULL REFERENCES tasks(id), origin_run_id TEXT NOT NULL REFERENCES runs(id), conversation_id TEXT NOT NULL REFERENCES conversations(id), principal_id TEXT NOT NULL REFERENCES principals(id), destination_scope_key TEXT NOT NULL, destination_scope_json TEXT NOT NULL, event_type TEXT NOT NULL CHECK(event_type IN ('STEP_BLOCKED','STEP_REVIEW','STEP_FAILED','TASK_BLOCKED','TASK_REVIEW','TASK_ACCEPTED','WORKER_LOST')), payload_text TEXT NOT NULL CHECK(length(payload_text) <= 2048), payload_kind TEXT NOT NULL CHECK(payload_kind = 'text'), status TEXT NOT NULL CHECK(status IN ('pending','sending','sent','failed','unknown','suppressed')), external_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
+  `CREATE INDEX IF NOT EXISTS task_notifications_pending ON task_notifications(status,event_sequence)`,
+  `CREATE TRIGGER IF NOT EXISTS task_notifications_payload_immutable BEFORE UPDATE ON task_notifications WHEN NEW.event_sequence <> OLD.event_sequence OR NEW.task_id <> OLD.task_id OR NEW.origin_run_id <> OLD.origin_run_id OR NEW.conversation_id <> OLD.conversation_id OR NEW.principal_id <> OLD.principal_id OR NEW.destination_scope_key <> OLD.destination_scope_key OR NEW.destination_scope_json <> OLD.destination_scope_json OR NEW.event_type <> OLD.event_type OR NEW.payload_text <> OLD.payload_text OR NEW.payload_kind <> OLD.payload_kind OR NEW.created_at <> OLD.created_at BEGIN SELECT RAISE(ABORT,'task notification payload is immutable'); END`,
+];
+
 export const schema = [
   ...baseSchema,
   ...schemaV7Statements,

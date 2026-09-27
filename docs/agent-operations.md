@@ -396,6 +396,8 @@ Task result visibility is enforced
 Worker output cannot bypass Delivery Gate
 ```
 
+Durable Task notifications use a separate outbox linked to an append-only TaskEvent. A Task with an exact external origin Run and audience may enqueue fixed status text. The send claim checks current Task read permission and Run delivery permission, then reserves the one send. A changed audience or stale review state suppresses the notice. An uncertain send remains unknown and is not replayed automatically. Tasks without an external origin Run have no implicit QQ recipient.
+
 The rule remains:
 
 ```text

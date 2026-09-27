@@ -69,6 +69,13 @@ export type RunServiceEvent =
       status: DeliveryRecord["status"];
     }
   | {
+      type: "task_notification_changed";
+      runId: string;
+      taskId: string;
+      notificationId: string;
+      status: "sending" | "sent" | "failed" | "unknown";
+    }
+  | {
       type: "delivery_blocked";
       runId: string;
       conversationId: string;

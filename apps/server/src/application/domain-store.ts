@@ -8,6 +8,7 @@ import { OwnerManagementRecords } from "../management/records.js";
 import { CapabilityPolicyStore } from "../management/capability-policy.js";
 import { TaskStore } from "../ops/task-store.js";
 import { LongWorkStore } from "../ops/long-work-store.js";
+import { TaskNotificationStore } from "../ops/task-notification-store.js";
 import { LearningStore } from "../learning/store.js";
 
 /**
@@ -28,6 +29,7 @@ export async function openDomainStore(options: { databasePath: string }) {
     capabilities: new CapabilityPolicyStore(db),
     tasks: new TaskStore(db),
     longWork: new LongWorkStore(db),
+    taskNotifications: new TaskNotificationStore(db),
     learning: new LearningStore(db, authorization),
     close: () => db.close(),
   };

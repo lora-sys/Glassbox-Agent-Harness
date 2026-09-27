@@ -133,6 +133,106 @@ function service(
   return { instance, events, errors };
 }
 
+it("publishes a durable Task review notice through the exact origin audience", async () => {
+  const { store } = await fixture();
+  const accepted = await store.conversations.acceptIncoming(input("notice-source"));
+  await store.tasks.createTask({
+    id: "notice-task",
+    title: "Private title",
+    creatorPrincipalId: "owner",
+    conversationId: accepted.conversation.id,
+    runId: accepted.run.id,
+    authorizationScope: group,
+  });
+  await store.authorization.grant({
+    principalId: "owner",
+    resourceId: "task-notice-task",
+    action: "task:read",
+    scope: group,
+    effect: "allow",
+  });
+  const noticeId = await store.db.transaction(async (tx) => {
+    await tx.execute(
+      "UPDATE tasks SET status = 'REVIEW', orchestration_mode = 'durable' WHERE id = 'notice-task'",
+    );
+    const inserted = await tx.execute({
+      sql: "INSERT INTO task_events(id,task_id,type,metadata_json,created_at) VALUES ('notice-event','notice-task','TASK_REVIEW','{}',?) RETURNING sequence",
+      args: [new Date().toISOString()],
+    });
+    const notice = await store.taskNotifications.enqueueTx(tx, Number(inserted.rows[0]!.sequence));
+    return notice!.id;
+  });
+  const send = vi.fn(async (_request: Parameters<RunTransport["send"]>[0]) => ({
+    status: "sent" as const,
+    externalId: "qq-notice",
+  }));
+  const { instance } = service(
+    store,
+    { supportsGroup: true, execute: async () => ({ status: "succeeded" }) },
+    { send },
+  );
+  await instance.start();
+  await instance.drain();
+  const noticeCalls = send.mock.calls.filter(([request]) => request.delivery.id === noticeId);
+  expect(noticeCalls).toHaveLength(1);
+  expect(noticeCalls[0]![0].destination).toEqual(group);
+  expect(noticeCalls[0]![0].delivery.payloadText).not.toContain("Private title");
+  const row = await store.db.transaction((tx) =>
+    tx.execute({
+      sql: "SELECT status,external_id FROM task_notifications WHERE id = ?",
+      args: [noticeId],
+    }),
+  );
+  expect(row.rows[0]).toMatchObject({ status: "sent", external_id: "qq-notice" });
+});
+
+it("suppresses a Task notification when Task read is revoked before delivery", async () => {
+  const { store } = await fixture();
+  const accepted = await store.conversations.acceptIncoming(input("revoked-notice-source"));
+  await store.tasks.createTask({
+    id: "revoked-notice-task",
+    title: "Private title",
+    creatorPrincipalId: "owner",
+    conversationId: accepted.conversation.id,
+    runId: accepted.run.id,
+    authorizationScope: group,
+  });
+  const taskGrant = await store.authorization.grant({
+    principalId: "owner",
+    resourceId: "task-revoked-notice-task",
+    action: "task:read",
+    scope: group,
+    effect: "allow",
+  });
+  const noticeId = await store.db.transaction(async (tx) => {
+    await tx.execute(
+      "UPDATE tasks SET status = 'REVIEW', orchestration_mode = 'durable' WHERE id = 'revoked-notice-task'",
+    );
+    const inserted = await tx.execute({
+      sql: "INSERT INTO task_events(id,task_id,type,metadata_json,created_at) VALUES ('revoked-notice-event','revoked-notice-task','TASK_REVIEW','{}',?) RETURNING sequence",
+      args: [new Date().toISOString()],
+    });
+    const notice = await store.taskNotifications.enqueueTx(tx, Number(inserted.rows[0]!.sequence));
+    return notice!.id;
+  });
+  await store.authorization.revoke(taskGrant);
+  const send = vi.fn(async (_request: Parameters<RunTransport["send"]>[0]) => ({
+    status: "sent" as const,
+  }));
+  const { instance } = service(
+    store,
+    { supportsGroup: true, execute: async () => ({ status: "succeeded" }) },
+    { send },
+  );
+  await instance.start();
+  await instance.drain();
+  expect(send.mock.calls.some(([request]) => request.delivery.id === noticeId)).toBe(false);
+  const row = await store.db.transaction((tx) =>
+    tx.execute({ sql: "SELECT status FROM task_notifications WHERE id = ?", args: [noticeId] }),
+  );
+  expect(row.rows[0]?.status).toBe("suppressed");
+});
+
 it("never executes a Tool Step adapter from external ingress", async () => {
   const { store } = await fixture();
   const execute = vi.fn(async () => ({ status: "succeeded" as const, text: "protected" }));

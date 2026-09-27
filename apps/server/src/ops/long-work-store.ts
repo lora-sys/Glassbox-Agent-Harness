@@ -26,6 +26,7 @@ import {
 import { decideTaskRetry, type RetrySideEffectOutcome } from "./long-work-retry.js";
 import { parseTaskGetSpec } from "./tool-step-spec.js";
 import { reconstructTaskOriginScope } from "./long-work-authority.js";
+import { TaskNotificationStore } from "./task-notification-store.js";
 
 /** Only trusted services may call this store. A decision ID records evidence; it does not
  * prove that a grant is still current. Callers must reauthorize before protected work. */
@@ -1680,6 +1681,7 @@ export class LongWorkStore {
       ],
     });
     await this.refreshTaskProjectionTx(tx, params.taskId);
+    await new TaskNotificationStore(this.db).enqueueTx(tx, Number(result.rows[0]!.sequence));
     return parseEvent(result.rows[0]!);
   }
 

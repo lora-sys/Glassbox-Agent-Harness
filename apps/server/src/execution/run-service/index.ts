@@ -1,9 +1,15 @@
 import { AccessDeniedError } from "../../auth/service.js";
-import type { RunLease, RunRoute, TerminalRunStatus } from "../../conversation/lifecycle.js";
+import type {
+  DeliveryRecord,
+  RunLease,
+  RunRoute,
+  TerminalRunStatus,
+} from "../../conversation/lifecycle.js";
 import type { IncomingMessage, RunRecord } from "../../conversation/store.js";
 import { requireIdentifier, type CallerContext } from "../../identity/scope.js";
 import { authorizeLongWorkAction } from "../../ops/long-work-authority.js";
 import { parseTaskGetSpec } from "../../ops/tool-step-spec.js";
+import type { TaskNotificationRecord } from "../../ops/task-notification-store.js";
 import { stringColumn } from "../../persistence/database.js";
 import type {
   AcceptedIncoming,
@@ -41,6 +47,8 @@ export class RunService {
   private readonly publications = new Set<Promise<void>>();
   private readonly waiters = new Map<string, Set<RunWaiter>>();
   private queuedPoll?: ReturnType<typeof setInterval>;
+  private notificationPoll?: ReturnType<typeof setInterval>;
+  private notificationPumping?: Promise<void>;
   private pumping: Promise<void> | undefined;
   private pumpAgain = false;
 
@@ -71,6 +79,9 @@ export class RunService {
     await this.captureQueuedNativeRoleRuns();
     this.started = true;
     await this.restorePublications();
+    this.kickTaskNotifications();
+    this.notificationPoll = setInterval(() => this.kickTaskNotifications(), 2_000);
+    this.notificationPoll.unref();
     this.kick();
     // Temporal Activities persist internal Runs in a separate process. The database
     // is the queue; poll it so a process restart or missed in-memory wake cannot
@@ -85,6 +96,7 @@ export class RunService {
     if (this.started || this.active.size || this.pumping)
       throw new Error("Cannot recover active execution");
     const recovered = await this.options.store.lifecycle.recover();
+    await this.options.store.taskNotifications.recover();
     await this.emit({ type: "recovered", ...recovered });
     return recovered;
   }
@@ -409,6 +421,8 @@ export class RunService {
     this.started = false;
     if (this.queuedPoll) clearInterval(this.queuedPoll);
     this.queuedPoll = undefined;
+    if (this.notificationPoll) clearInterval(this.notificationPoll);
+    this.notificationPoll = undefined;
     for (const subscriptions of this.waiters.values())
       for (const waiter of subscriptions) waiter.stop();
     this.waiters.clear();
@@ -719,6 +733,101 @@ export class RunService {
         }
       }
       if (routes.length < 100) return;
+    }
+  }
+
+  /** Task events have their own durable outbox. The claim rechecks the Task and the
+   * exact audience before this method calls the channel transport. */
+  private kickTaskNotifications(): void {
+    if (!this.started || this.notificationPumping) return;
+    const task = (async () => {
+      const candidates = await this.options.store.taskNotifications.listUndelivered(100);
+      for (const candidate of candidates) {
+        if (!this.started) break;
+        await this.sendTaskNotification(candidate);
+      }
+    })()
+      .catch(() => this.report("delivery_failed"))
+      .finally(() => {
+        this.notificationPumping = undefined;
+        this.publications.delete(task);
+      });
+    this.notificationPumping = task;
+    this.publications.add(task);
+  }
+
+  private async sendTaskNotification(candidate: TaskNotificationRecord): Promise<void> {
+    const caller: CallerContext = {
+      principalId: candidate.principalId,
+      scope: structuredClone(candidate.destination),
+    };
+    let lease;
+    try {
+      lease = await this.options.store.taskNotifications.claim(caller, candidate.id);
+    } catch {
+      this.report("delivery_failed", candidate.runId);
+      return;
+    }
+    if (!lease) return;
+    const notice = lease.notification;
+    await this.emit({
+      type: "task_notification_changed",
+      runId: notice.runId,
+      taskId: notice.taskId,
+      notificationId: notice.id,
+      status: "sending",
+    });
+    const delivery: DeliveryRecord = {
+      id: notice.id,
+      runId: notice.runId,
+      dedupKey: `task-event-${notice.eventSequence}`,
+      destinationScopeKey: notice.destinationScopeKey,
+      payloadText: notice.payloadText,
+      payloadKind: "text",
+      status: "sending",
+      externalId: null,
+    };
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<SendOutcome>((resolve) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        resolve({ status: "unknown" });
+      }, this.deliveryTimeoutMs);
+    });
+    let outcome: SendOutcome;
+    try {
+      outcome = await Promise.race([
+        this.options.transport
+          .send({
+            destination: structuredClone(notice.destination),
+            delivery,
+            signal: controller.signal,
+          })
+          .catch((): SendOutcome => ({ status: "unknown" })),
+        timeout,
+      ]);
+      if (!outcome || !["sent", "failed", "unknown"].includes(outcome.status))
+        outcome = { status: "unknown" };
+    } catch {
+      outcome = { status: "unknown" };
+    } finally {
+      clearTimeout(timer);
+    }
+    try {
+      await lease.settle(
+        outcome.status,
+        outcome.status === "sent" ? outcome.externalId : undefined,
+      );
+      await this.emit({
+        type: "task_notification_changed",
+        runId: notice.runId,
+        taskId: notice.taskId,
+        notificationId: notice.id,
+        status: outcome.status,
+      });
+    } catch {
+      this.report("delivery_failed", notice.runId);
     }
   }
 
