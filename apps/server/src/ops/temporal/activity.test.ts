@@ -24,6 +24,7 @@ const caller: CallerContext = {
 async function createModelTask(
   store: Awaited<ReturnType<typeof openDomainStore>>,
   specRef = "pi:test",
+  retryPolicy?: TaskStep["retryPolicy"],
 ) {
   await store.identities.bindOwner("owner", caller.scope);
   await store.conversations.createAgent("personal");
@@ -79,7 +80,8 @@ async function createModelTask(
     status: "pending",
     dependencyIds: [],
     dependencyPolicy: { failed: "block", cancelled: "cancel", skipped: "skip" },
-    maxAttempts: 2,
+    maxAttempts: retryPolicy?.maxAttempts ?? 2,
+    ...(retryPolicy ? { retryPolicy } : {}),
     requiredCapabilities: [],
     delegatedPermissionSet: [],
     createdAt: nowStep,
@@ -629,6 +631,221 @@ it("creates a linked internal Run for a model Step and settles it into Step revi
   }
 });
 
+it("retries a failed model Run after its durable retry wait and fails when attempts are exhausted", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  try {
+    const retryPolicy = {
+      version: 1,
+      maxAttempts: 2,
+      initialDelayMs: 5_000,
+      backoffMultiplier: 2,
+      maxDelayMs: 10_000,
+      retryableErrorClasses: ["model_failed"],
+      nonRetryableErrorClasses: ["policy_denied"],
+      timeoutOutcome: "unknown" as const,
+    };
+    const { task, step } = await createModelTask(store, "pi:test", retryPolicy);
+    const advance = createAdvanceLongWorkActivity(store);
+    const input = { taskId: task.id, policyRevision: 1 };
+
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    const firstLease = await store.longWork.getActiveLease(task.id, step.id);
+    const firstRun = await store.conversations.getInternalStepRun(caller, firstLease!.attemptId!);
+    await store.db.transaction((tx) =>
+      tx.execute({ sql: "UPDATE runs SET status = 'failed' WHERE id = ?", args: [firstRun!.id] }),
+    );
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    const waitingStep = (await store.longWork.listSteps(task.id))[0]!;
+    expect(waitingStep).toMatchObject({ status: "waiting", version: 4 });
+    const waiting = (await store.longWork.listWaiting(task.id))[0]!;
+    expect(waiting).toMatchObject({
+      attemptId: firstLease!.attemptId,
+      policy: { kind: "retry", overdue: "resume" },
+    });
+    expect(
+      (await store.longWork.listEvents(task.id)).filter(
+        (event) => event.type === "RETRY_SCHEDULED",
+      ),
+    ).toHaveLength(1);
+    expect(await advance(input)).toEqual({ kind: "wait", wakeAt: waiting.policy.dueAt });
+
+    const dueAt = "2020-01-01T00:00:00.000Z";
+    await store.db.transaction((tx) =>
+      tx.execute({
+        sql: "UPDATE task_waits SET due_at = ?, policy_json = ? WHERE task_id = ? AND step_id = ? AND status = 'waiting'",
+        args: [dueAt, JSON.stringify({ ...waiting.policy, dueAt }), task.id, step.id],
+      }),
+    );
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    const attempts = await store.db.transaction((tx) =>
+      tx.execute({
+        sql: "SELECT attempt_number,status FROM task_attempts WHERE task_id = ? AND step_id = ? ORDER BY attempt_number",
+        args: [task.id, step.id],
+      }),
+    );
+    expect(attempts.rows).toEqual([
+      expect.objectContaining({ attempt_number: 1, status: "failed" }),
+      expect.objectContaining({ attempt_number: 2, status: "running" }),
+    ]);
+    const secondLease = await store.longWork.getActiveLease(task.id, step.id);
+    const secondRun = await store.conversations.getInternalStepRun(caller, secondLease!.attemptId!);
+    expect(secondRun?.id).not.toBe(firstRun?.id);
+    await store.db.transaction((tx) =>
+      tx.execute({ sql: "UPDATE runs SET status = 'failed' WHERE id = ?", args: [secondRun!.id] }),
+    );
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("failed");
+    expect(
+      (await store.longWork.listEvents(task.id)).filter(
+        (event) => event.type === "RETRY_SCHEDULED",
+      ),
+    ).toHaveLength(1);
+  } finally {
+    await store.close();
+  }
+});
+
+it("counts Model Step retries independently of earlier attempts on the same Task", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  try {
+    const { task, step } = await createModelTask(store, "pi:test", {
+      version: 1,
+      maxAttempts: 2,
+      initialDelayMs: 1_000,
+      backoffMultiplier: 2,
+      maxDelayMs: 10_000,
+      retryableErrorClasses: ["model_failed"],
+      nonRetryableErrorClasses: [],
+      timeoutOutcome: "unknown",
+    });
+    await store.db.transaction((tx) =>
+      tx.execute({
+        sql: "INSERT INTO task_attempts(id,task_id,attempt_number,status,started_at,completed_at) VALUES ('earlier-attempt',?,1,'succeeded',?,?)",
+        args: [task.id, new Date().toISOString(), new Date().toISOString()],
+      }),
+    );
+    const advance = createAdvanceLongWorkActivity(store);
+    const input = { taskId: task.id, policyRevision: 1 };
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    const lease = await store.longWork.getActiveLease(task.id, step.id);
+    const run = await store.conversations.getInternalStepRun(caller, lease!.attemptId!);
+    await store.db.transaction((tx) =>
+      tx.execute({ sql: "UPDATE runs SET status = 'failed' WHERE id = ?", args: [run!.id] }),
+    );
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("waiting");
+    expect((await store.longWork.listWaiting(task.id))[0]?.policy.kind).toBe("retry");
+  } finally {
+    await store.close();
+  }
+});
+
+it("does not retry a model failure classified as nonretryable", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  try {
+    const retryPolicy = {
+      version: 1,
+      maxAttempts: 2,
+      initialDelayMs: 0,
+      backoffMultiplier: 2,
+      maxDelayMs: 10_000,
+      retryableErrorClasses: ["transient"],
+      nonRetryableErrorClasses: ["model_failed"],
+      timeoutOutcome: "unknown" as const,
+    };
+    const { task, step } = await createModelTask(store, "pi:test", retryPolicy);
+    const advance = createAdvanceLongWorkActivity(store);
+    const input = { taskId: task.id, policyRevision: 1 };
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    const lease = await store.longWork.getActiveLease(task.id, step.id);
+    const run = await store.conversations.getInternalStepRun(caller, lease!.attemptId!);
+    await store.db.transaction((tx) =>
+      tx.execute({ sql: "UPDATE runs SET status = 'failed' WHERE id = ?", args: [run!.id] }),
+    );
+
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("failed");
+    expect(
+      (await store.longWork.listEvents(task.id)).some((event) => event.type === "RETRY_SCHEDULED"),
+    ).toBe(false);
+  } finally {
+    await store.close();
+  }
+});
+
+it("does not retry an unknown Model Run outcome", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  try {
+    const retryPolicy = {
+      version: 1,
+      maxAttempts: 2,
+      initialDelayMs: 0,
+      backoffMultiplier: 2,
+      maxDelayMs: 10_000,
+      retryableErrorClasses: ["model_failed"],
+      nonRetryableErrorClasses: [],
+      timeoutOutcome: "unknown" as const,
+    };
+    const { task, step } = await createModelTask(store, "pi:test", retryPolicy);
+    const advance = createAdvanceLongWorkActivity(store);
+    const input = { taskId: task.id, policyRevision: 1 };
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    const lease = await store.longWork.getActiveLease(task.id, step.id);
+    const run = await store.conversations.getInternalStepRun(caller, lease!.attemptId!);
+    await store.db.transaction((tx) =>
+      tx.execute({ sql: "UPDATE runs SET status = 'unknown' WHERE id = ?", args: [run!.id] }),
+    );
+
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("blocked");
+    expect(
+      (await store.longWork.listEvents(task.id)).some((event) => event.type === "RETRY_SCHEDULED"),
+    ).toBe(false);
+  } finally {
+    await store.close();
+  }
+});
+
+it("does not retry a failed Model Run after Task continuation authorization is revoked", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  try {
+    const retryPolicy = {
+      version: 1,
+      maxAttempts: 2,
+      initialDelayMs: 0,
+      backoffMultiplier: 2,
+      maxDelayMs: 10_000,
+      retryableErrorClasses: ["model_failed"],
+      nonRetryableErrorClasses: [],
+      timeoutOutcome: "unknown" as const,
+    };
+    const { task, step } = await createModelTask(store, "pi:test", retryPolicy);
+    const advance = createAdvanceLongWorkActivity(store);
+    const input = { taskId: task.id, policyRevision: 1 };
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    const lease = await store.longWork.getActiveLease(task.id, step.id);
+    const run = await store.conversations.getInternalStepRun(caller, lease!.attemptId!);
+    await store.db.transaction((tx) =>
+      tx.execute({ sql: "UPDATE runs SET status = 'failed' WHERE id = ?", args: [run!.id] }),
+    );
+    await store.authorization.revokeScopeAction({
+      principalId: caller.principalId,
+      resourceId: `task-${task.id}`,
+      action: "task:continue",
+      scope: caller.scope,
+    });
+
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("blocked");
+    expect(
+      (await store.longWork.listEvents(task.id)).some((event) => event.type === "RETRY_SCHEDULED"),
+    ).toBe(false);
+  } finally {
+    await store.close();
+  }
+});
+
 it("keeps Task cancellation pending until the linked model Run is terminal", async () => {
   const store = await openDomainStore({ databasePath: ":memory:" });
   try {
@@ -671,12 +888,6 @@ it("keeps Task cancellation pending until the linked model Run is terminal", asy
     );
 
     await store.db.transaction((tx) =>
-      tx.execute({ sql: "UPDATE runs SET status = 'unknown' WHERE id = ?", args: [run!.id] }),
-    );
-    expect(await advance(input)).toMatchObject({ kind: "wait" });
-    expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("running");
-
-    await store.db.transaction((tx) =>
       tx.execute({ sql: "UPDATE runs SET status = 'cancelled' WHERE id = ?", args: [run!.id] }),
     );
     expect(await advance(input)).toEqual({ kind: "continue" });
@@ -701,6 +912,47 @@ it("keeps Task cancellation pending until the linked model Run is terminal", asy
     expect((await store.longWork.listEvents(task.id)).map((event) => event.type)).toContain(
       "STEP_CANCELLED",
     );
+  } finally {
+    await store.close();
+  }
+});
+
+it("settles Task cancellation after a restarted Model Run becomes unknown without erasing that evidence", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  try {
+    const { task, step } = await createModelTask(store);
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: `task-${task.id}`,
+      action: "task:cancel",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    const advance = createAdvanceLongWorkActivity(store);
+    const input = { taskId: task.id, policyRevision: 1 };
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    const lease = await store.longWork.getActiveLease(task.id, step.id);
+    const run = await store.conversations.getInternalStepRun(caller, lease!.attemptId!);
+    const ops = new AuthorizedOpsService(store, new FakeHerdrBridge());
+    expect(await ops.cancel(caller, task.id)).toBe(false);
+    await store.db.transaction((tx) =>
+      tx.execute({ sql: "UPDATE runs SET status = 'unknown' WHERE id = ?", args: [run!.id] }),
+    );
+
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    expect(await advance(input)).toEqual({ kind: "complete" });
+    expect(await store.tasks.getTask(task.id)).toMatchObject({
+      status: "CANCELED",
+      cancellationState: "settled",
+    });
+    expect(await store.longWork.getActiveLease(task.id, step.id)).toBeNull();
+    expect((await store.conversations.getRun(caller, run!.id)).status).toBe("unknown");
+    expect(
+      (await store.longWork.listEvents(task.id)).find((event) => event.type === "STEP_CANCELLED"),
+    ).toMatchObject({
+      evidenceRef: `run:${run!.id}`,
+      metadata: { runOutcome: "unknown", rollbackPerformed: false },
+    });
   } finally {
     await store.close();
   }

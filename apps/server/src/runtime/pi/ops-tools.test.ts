@@ -102,7 +102,7 @@ it("denies an ungranted Pi delegate before starting any worker", async () => {
     expect(planSchema.properties.steps.maxItems).toBe(64);
     expect(planSchema.properties.steps.items.additionalProperties).toBe(false);
     expect(Object.keys(planSchema.properties.steps.items.properties).sort()).toEqual(
-      ["dependencyIds", "durationMs", "id", "kind", "signalKey", "title"].sort(),
+      ["dependencyIds", "durationMs", "id", "instructions", "kind", "signalKey", "title"].sort(),
     );
     await expect(
       plan.execute(
@@ -192,6 +192,122 @@ it("denies an ungranted Pi delegate before starting any worker", async () => {
       ),
     ).rejects.toThrow("no_grant");
     expect(await store.tasks.listTasks()).toHaveLength(1);
+  } finally {
+    await store.close();
+  }
+});
+
+it("plans a text-only Model Step from the current Run profile and rejects extra execution fields", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  const caller = {
+    principalId: "owner",
+    scope: {
+      connectionId: "qq",
+      botId: "bot",
+      chatType: "private" as const,
+      chatId: "owner",
+      senderId: "owner",
+    },
+  };
+  try {
+    await store.identities.bindOwner("owner", caller.scope);
+    await store.conversations.createAgent("personal");
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: "agent:personal",
+      action: "run:create",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: "agent:personal",
+      action: "conversation:read",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    const accepted = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: caller.scope,
+      messageId: "model-plan-message",
+      text: "Plan a short analysis Task",
+      executionRef: "pi:configured-profile",
+    });
+    await store.authorization.registerResource({
+      id: "task-planned",
+      kind: "task",
+      visibility: "private",
+    });
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: "task-planned",
+      action: "task:plan",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    const planExistingTask = vi.fn(async () => {});
+    let currentRunId = accepted.run.id;
+    const tools = createOpsTools({
+      store,
+      service: { planExistingTask } as unknown as AuthorizedOpsService,
+      getContext: () => ({
+        caller,
+        conversationId: accepted.conversation.id,
+        runId: currentRunId,
+      }),
+      workerTarget: { workspaceId: "configured", agentKind: "test" },
+    });
+    const plan = tools.find((tool) => tool.name === "task_plan")!;
+    const input = {
+      taskId: "planned",
+      rootStepId: "model-step",
+      steps: [
+        {
+          id: "model-step",
+          kind: "model",
+          title: "Analyze",
+          dependencyIds: [],
+          instructions: "Summarize the approved research.",
+        },
+      ],
+    };
+    await plan.execute("plan-model", input, undefined, undefined, {} as never);
+    expect(planExistingTask).toHaveBeenCalledWith(
+      caller,
+      "planned",
+      [
+        expect.objectContaining({
+          kind: "model",
+          instructions: "Summarize the approved research.",
+          specRef: "pi:configured-profile",
+          requiredCapabilities: ["text"],
+          delegatedPermissionSet: [],
+        }),
+      ],
+      "model-step",
+      expect.objectContaining({ runId: accepted.run.id }),
+    );
+    await expect(
+      plan.execute(
+        "plan-model-with-extra-field",
+        { ...input, steps: [{ ...input.steps[0], signalKey: "continue" }] },
+        undefined,
+        undefined,
+        {} as never,
+      ),
+    ).rejects.toThrow("protected_tool_failed");
+    const unsupported = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: caller.scope,
+      messageId: "non-model-plan-message",
+      text: "Plan another Task",
+      executionRef: "claude-code",
+    });
+    currentRunId = unsupported.run.id;
+    await expect(
+      plan.execute("plan-with-non-model-run", input, undefined, undefined, {} as never),
+    ).rejects.toThrow("protected_tool_failed");
+    expect(planExistingTask).toHaveBeenCalledTimes(1);
   } finally {
     await store.close();
   }

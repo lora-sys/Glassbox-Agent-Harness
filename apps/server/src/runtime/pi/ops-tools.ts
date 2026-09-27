@@ -76,9 +76,11 @@ export function createOpsTools(options: {
         Type.Literal("timer_wait"),
         Type.Literal("signal_wait"),
         Type.Literal("join"),
+        Type.Literal("model"),
       ]),
       title: Type.String({ minLength: 1, maxLength: 256 }),
       dependencyIds,
+      instructions: Type.Optional(Type.String({ minLength: 1, maxLength: 4096 })),
       durationMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 2_592_000_000 })),
       signalKey: Type.Optional(
         Type.String({
@@ -361,9 +363,10 @@ export function createOpsTools(options: {
       rootStepId: string;
       steps: Array<{
         id: string;
-        kind: "timer_wait" | "signal_wait" | "join";
+        kind: "timer_wait" | "signal_wait" | "join" | "model";
         title: string;
         dependencyIds: string[];
+        instructions?: string;
         durationMs?: number;
         signalKey?: string;
       }>;
@@ -371,7 +374,7 @@ export function createOpsTools(options: {
       ...common,
       name: "task_plan",
       description:
-        "Plan bounded timer, signal-wait, and join steps for an authorized Task. Approval, model, Tool, Worker, child Task, and shell steps are unavailable.",
+        "Plan bounded timer, signal-wait, join, and text-only model steps for an authorized Task. Approval, Tool, Worker, child Task, and shell steps are unavailable.",
       parameters: Type.Object(
         {
           taskId,
@@ -386,16 +389,33 @@ export function createOpsTools(options: {
         for (const step of params.steps) {
           if (
             (step.kind === "timer_wait" &&
-              (step.durationMs === undefined || step.signalKey !== undefined)) ||
+              (step.durationMs === undefined ||
+                step.signalKey !== undefined ||
+                step.instructions !== undefined)) ||
             (step.kind === "signal_wait" &&
-              (step.signalKey === undefined || step.durationMs !== undefined)) ||
+              (step.signalKey === undefined ||
+                step.durationMs !== undefined ||
+                step.instructions !== undefined)) ||
             (step.kind === "join" &&
               (step.signalKey !== undefined ||
                 step.durationMs !== undefined ||
-                step.dependencyIds.length === 0))
+                step.instructions !== undefined ||
+                step.dependencyIds.length === 0)) ||
+            (step.kind === "model" &&
+              (!step.instructions?.trim() ||
+                step.durationMs !== undefined ||
+                step.signalKey !== undefined))
           )
             throw new Error(`Invalid fields for planned ${step.kind} step ${step.id}`);
         }
+        const sourceRun = params.steps.some((step) => step.kind === "model")
+          ? await options.store.conversations.getRun(context.caller, context.runId)
+          : undefined;
+        if (sourceRun && sourceRun.source !== "external")
+          throw new Error("Model Step planning requires an external Run");
+        const executionRef = sourceRun?.executionRef;
+        if (executionRef !== undefined && !/^(?:model|pi):.+$/u.test(executionRef))
+          throw new Error("Model Step requires a configured model Run");
         const steps = params.steps.map((step) => {
           const waitPolicy =
             step.kind === "timer_wait"
@@ -418,6 +438,9 @@ export function createOpsTools(options: {
             taskId: params.taskId,
             kind: step.kind,
             title: step.title,
+            ...(step.kind === "model"
+              ? { instructions: step.instructions, specRef: executionRef }
+              : {}),
             status: "pending" as const,
             dependencyIds: step.dependencyIds,
             dependencyPolicy: {
@@ -427,7 +450,7 @@ export function createOpsTools(options: {
             },
             maxAttempts: 3,
             waitPolicy,
-            requiredCapabilities: [],
+            requiredCapabilities: step.kind === "model" ? ["text"] : [],
             delegatedPermissionSet: [],
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),

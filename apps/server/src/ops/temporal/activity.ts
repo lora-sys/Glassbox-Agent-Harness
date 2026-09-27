@@ -74,6 +74,7 @@ async function settleModelRun(
     input.run.status === "cancelling"
   )
     return "pending";
+  const attemptId = lease.attemptId!;
 
   let decisionId: string | undefined;
   let authorizationDeniedId: string | undefined;
@@ -95,6 +96,36 @@ async function settleModelRun(
       : input.run.status === "failed"
         ? "failed"
         : "unknown";
+  const currentOrigin =
+    decisionId === undefined
+      ? ORIGIN
+      : { kind: "decision" as const, decisionId, actorPrincipalId: input.caller.principalId };
+  if (
+    outcome === "failed" &&
+    input.step.retryPolicy?.retryableErrorClasses.includes("model_failed")
+  ) {
+    try {
+      await store.longWork.scheduleClaimedStepRetry({
+        taskId: input.taskId,
+        stepId: input.step.id,
+        attemptId,
+        leaseId: lease.id,
+        ownerInstanceId,
+        expectedStepVersion: input.step.version,
+        expectedLeaseVersion: renewed.version,
+        proof: {
+          ref: `run:${input.run.id}`,
+          sideEffectOutcome: "not_applied",
+          errorClass: "model_failed",
+        },
+        origin: currentOrigin,
+      });
+      return "settled";
+    } catch (error) {
+      if (!(error instanceof Error) || !error.message.startsWith("Retry was not authorized:"))
+        throw error;
+    }
+  }
   await store.longWork.settleClaimedStep({
     taskId: input.taskId,
     stepId: input.step.id,
@@ -108,10 +139,7 @@ async function settleModelRun(
       ? `authorization:${authorizationDeniedId}`
       : `run:${input.run.id}`,
     ...(outcome === "review" ? { outputRef: `run:${input.run.id}` } : {}),
-    origin:
-      decisionId === undefined
-        ? ORIGIN
-        : { kind: "decision", decisionId, actorPrincipalId: input.caller.principalId },
+    origin: currentOrigin,
   });
   return "settled";
 }
@@ -303,8 +331,6 @@ async function settleCancelledModelStep(
     });
     return "pending";
   }
-  if (run?.status === "unknown") return "pending";
-
   const renewed = await store.longWork.updateLease({
     taskId,
     leaseId: lease.id,

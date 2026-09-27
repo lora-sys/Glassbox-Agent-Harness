@@ -609,7 +609,8 @@ export class LongWorkStore {
     });
   }
 
-  /** Settles a claimed Step after Task cancellation and proves its internal Run stopped. */
+  /** Settles a cancelled text-only Model Step after its internal Run reaches a terminal record.
+   * An unknown Run stays unknown evidence; Task cancellation never claims rollback. */
   async settleClaimedStepCancellation(input: {
     taskId: string;
     stepId: string;
@@ -680,7 +681,7 @@ export class LongWorkStore {
         if (
           !linked ||
           linked.id !== input.runId ||
-          !["cancelled", "succeeded", "failed", "interrupted"].includes(
+          !["cancelled", "succeeded", "failed", "interrupted", "unknown"].includes(
             stringColumn(linked, "status"),
           )
         )
@@ -715,6 +716,9 @@ export class LongWorkStore {
       )
         throw new Error("Step cancellation settlement conflict");
       const evidenceRef = input.runId ? `run:${input.runId}` : `run-not-created:${input.attemptId}`;
+      const runOutcome = linkedRun.rows[0]
+        ? stringColumn(linkedRun.rows[0], "status")
+        : "not_started";
       await this.appendEventTx(tx, {
         taskId: input.taskId,
         stepId: input.stepId,
@@ -722,7 +726,7 @@ export class LongWorkStore {
         type: "ATTEMPT_FINISHED",
         origin: input.origin,
         evidenceRef,
-        metadata: { outcome: "cancelled", runId: input.runId ?? null },
+        metadata: { outcome: "cancelled", runOutcome, runId: input.runId ?? null },
       });
       await this.appendEventTx(tx, {
         taskId: input.taskId,
@@ -736,6 +740,7 @@ export class LongWorkStore {
           previousStatus: "running",
           status: "cancelled",
           runId: input.runId ?? null,
+          runOutcome,
           rollbackPerformed: false,
         },
       });
