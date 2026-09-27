@@ -275,7 +275,8 @@ export class DurableWorkerObserver {
           JOIN task_step_leases l ON l.worker_binding_id = b.id AND l.attempt_id = a.id
             AND l.step_id = s.id AND l.task_id = a.task_id AND l.state = 'active'
           JOIN tasks t ON t.id = a.task_id AND t.orchestration_mode = 'durable'
-          WHERE b.herdr_session = ? AND t.status NOT IN ('DONE','CANCELED','FAILED','ACCEPTED')`,
+          WHERE b.herdr_session = ? AND b.prompt_dispatched_at IS NOT NULL
+            AND t.status NOT IN ('DONE','CANCELED','FAILED','ACCEPTED')`,
         args: [herdrSession],
       });
       return result.rows.map(parseClaim);

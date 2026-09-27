@@ -233,6 +233,10 @@ export async function applySchemaV14Migration(tx: Transaction): Promise<void> {
   ]);
 }
 
+export const schemaV15Migration = [
+  `ALTER TABLE worker_bindings ADD COLUMN prompt_dispatched_at TEXT`,
+];
+
 export const schema = [
   ...baseSchema,
   ...schemaV7Statements,

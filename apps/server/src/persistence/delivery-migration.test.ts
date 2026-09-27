@@ -27,7 +27,7 @@ it("migrates v9 deliveries without losing old rows and accepts browser and media
     const db = await DomainDatabase.open(path);
     try {
       await db.transaction(async (tx) => {
-        expect((await tx.execute("PRAGMA user_version")).rows[0]?.user_version).toBe(14);
+        expect((await tx.execute("PRAGMA user_version")).rows[0]?.user_version).toBe(15);
         expect(
           (await tx.execute("SELECT payload_text, status FROM deliveries WHERE id = 'delivery-1'"))
             .rows[0],
@@ -77,14 +77,15 @@ it("marks legacy protected reads during migration and leaves public web decision
     }
     await legacy.execute("ALTER TABLE authorization_decisions DROP COLUMN delivery_source");
     // Simulate a P6 database whose delivery_source column was not migrated yet.
-    // The merge advances existing version 13 databases directly to version 14.
+    // Simulate a version 13 database before the version 15 Worker prompt field.
+    await legacy.execute("ALTER TABLE worker_bindings DROP COLUMN prompt_dispatched_at");
     await legacy.execute("PRAGMA user_version = 13");
     legacy.close();
 
     const upgraded = await DomainDatabase.open(path);
     try {
       await upgraded.transaction(async (tx) => {
-        expect((await tx.execute("PRAGMA user_version")).rows[0]?.user_version).toBe(14);
+        expect((await tx.execute("PRAGMA user_version")).rows[0]?.user_version).toBe(15);
         const decisions = await tx.execute(
           "SELECT id, delivery_source FROM authorization_decisions ORDER BY id",
         );

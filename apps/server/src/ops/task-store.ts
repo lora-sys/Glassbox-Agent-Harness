@@ -160,6 +160,7 @@ function parseBinding(row: Row): WorkerBinding {
       row,
       "last_observed_agent_state",
     ) as HerdrAgentLifecycleState,
+    promptDispatchedAt: optionalString(row, "prompt_dispatched_at") ?? undefined,
     updatedAt: stringColumn(row, "updated_at"),
   };
 }
@@ -867,6 +868,25 @@ export class TaskStore {
         args: [taskAttemptId],
       });
       return res.rows[0] ? parseBinding(res.rows[0]) : null;
+    });
+  }
+
+  /** Persist the first prompt acknowledgement for this exact Attempt and WorkerBinding. */
+  async markWorkerPromptDispatched(
+    attemptId: string,
+    bindingId: string,
+    observedAt = new Date().toISOString(),
+  ): Promise<boolean> {
+    requireIdentifier(attemptId);
+    requireIdentifier(bindingId);
+    return this.db.transaction(async (tx) => {
+      const result = await tx.execute({
+        sql: `UPDATE worker_bindings
+          SET prompt_dispatched_at = ?, updated_at = ?
+          WHERE task_attempt_id = ? AND id = ? AND prompt_dispatched_at IS NULL`,
+        args: [observedAt, observedAt, attemptId, bindingId],
+      });
+      return result.rowsAffected === 1;
     });
   }
 

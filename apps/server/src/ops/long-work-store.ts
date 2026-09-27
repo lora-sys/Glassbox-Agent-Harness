@@ -14,12 +14,13 @@ import {
   type TaskWaitPolicy,
   type HerdrAgentLifecycleState,
 } from "@glassbox/contracts";
-import { requireIdentifier, scopeKey, type TrustedChannelScope } from "../identity/scope.js";
+import { requireIdentifier } from "../identity/scope.js";
 import { evaluate } from "../auth/service.js";
 import { DomainDatabase, optionalString, stringColumn } from "../persistence/database.js";
 import { TaskGraphError, validateTaskGraph, type TaskGraphLimits } from "./task-graph.js";
 import { decideTaskRetry, type RetrySideEffectOutcome } from "./long-work-retry.js";
 import { parseTaskGetSpec } from "./tool-step-spec.js";
+import { reconstructTaskOriginScope } from "./long-work-authority.js";
 
 /** Only trusted services may call this store. A decision ID records evidence; it does not
  * prove that a grant is still current. Callers must reauthorize before protected work. */
@@ -921,6 +922,130 @@ export class LongWorkStore {
     });
   }
 
+  /** Settles a Worker cancellation only after a trusted caller verifies pane closure. */
+  async settleClaimedWorkerCancellation(input: {
+    taskId: string;
+    stepId: string;
+    attemptId: string;
+    leaseId: string;
+    workerBindingId: string;
+    ownerInstanceId: string;
+    expectedStepVersion: number;
+    expectedLeaseVersion: number;
+    closureEvidenceRef: string;
+    origin: LongWorkOrigin;
+  }): Promise<TaskStep> {
+    for (const value of [
+      input.taskId,
+      input.stepId,
+      input.attemptId,
+      input.leaseId,
+      input.workerBindingId,
+      input.ownerInstanceId,
+    ])
+      requireIdentifier(value);
+    if (
+      !Number.isSafeInteger(input.expectedStepVersion) ||
+      input.expectedStepVersion < 1 ||
+      !Number.isSafeInteger(input.expectedLeaseVersion) ||
+      input.expectedLeaseVersion < 1 ||
+      !input.closureEvidenceRef.trim() ||
+      input.closureEvidenceRef.length > 512
+    )
+      throw new Error("Invalid Worker cancellation settlement evidence or version");
+    return this.db.transaction(async (tx) => {
+      await this.requireOrigin(tx, input.origin);
+      const task = await this.requireTask(tx, input.taskId);
+      if (
+        task.orchestration_mode !== "durable" ||
+        !["requested", "stopping"].includes(stringColumn(task, "cancellation_state"))
+      )
+        throw new Error("Task cancellation is not pending");
+      const step = await this.requireStep(tx, input.taskId, input.stepId);
+      if (
+        step.kind !== "herdr_worker" ||
+        step.status !== "running" ||
+        Number(step.version) !== input.expectedStepVersion
+      )
+        throw new Error("Worker cancellation Step conflict");
+      const owned = await tx.execute({
+        sql: `SELECT 1 FROM task_attempts a
+          JOIN task_step_leases l ON l.attempt_id = a.id AND l.task_id = a.task_id
+            AND l.step_id = a.step_id
+          JOIN worker_bindings b ON b.id = l.worker_binding_id AND b.task_attempt_id = a.id
+          WHERE a.id = ? AND a.task_id = ? AND a.step_id = ? AND a.status = 'running'
+            AND l.id = ? AND l.worker_binding_id = ? AND l.owner_instance_id = ?
+            AND l.version = ? AND l.state = 'active'`,
+        args: [
+          input.attemptId,
+          input.taskId,
+          input.stepId,
+          input.leaseId,
+          input.workerBindingId,
+          input.ownerInstanceId,
+          input.expectedLeaseVersion,
+        ],
+      });
+      if (!owned.rows[0]) throw new Error("Worker cancellation ownership conflict");
+      const now = new Date().toISOString();
+      const attempt = await tx.execute({
+        sql: "UPDATE task_attempts SET status = 'canceled', completed_at = ? WHERE id = ? AND task_id = ? AND step_id = ? AND status = 'running'",
+        args: [now, input.attemptId, input.taskId, input.stepId],
+      });
+      const stepUpdate = await tx.execute({
+        sql: "UPDATE task_steps SET status = 'cancelled', output_ref = NULL, version = version + 1, updated_at = ? WHERE id = ? AND task_id = ? AND version = ? AND status = 'running'",
+        args: [now, input.stepId, input.taskId, input.expectedStepVersion],
+      });
+      const lease = await tx.execute({
+        sql: "UPDATE task_step_leases SET state = 'released', version = version + 1, heartbeat_at = ?, released_at = ? WHERE id = ? AND task_id = ? AND step_id = ? AND attempt_id = ? AND worker_binding_id = ? AND owner_instance_id = ? AND version = ? AND state = 'active'",
+        args: [
+          now,
+          now,
+          input.leaseId,
+          input.taskId,
+          input.stepId,
+          input.attemptId,
+          input.workerBindingId,
+          input.ownerInstanceId,
+          input.expectedLeaseVersion,
+        ],
+      });
+      if (attempt.rowsAffected !== 1 || stepUpdate.rowsAffected !== 1 || lease.rowsAffected !== 1)
+        throw new Error("Worker cancellation settlement conflict");
+      await this.appendEventTx(tx, {
+        taskId: input.taskId,
+        stepId: input.stepId,
+        attemptId: input.attemptId,
+        type: "ATTEMPT_FINISHED",
+        origin: input.origin,
+        evidenceRef: input.closureEvidenceRef,
+        metadata: { outcome: "cancelled", rollbackPerformed: false },
+      });
+      await this.appendEventTx(tx, {
+        taskId: input.taskId,
+        stepId: input.stepId,
+        attemptId: input.attemptId,
+        type: "STEP_CANCELLED",
+        origin: input.origin,
+        evidenceRef: input.closureEvidenceRef,
+        metadata: {
+          reason: "worker_closed_after_task_cancellation",
+          previousStatus: "running",
+          status: "cancelled",
+          rollbackPerformed: false,
+        },
+      });
+      const deps = await tx.execute({
+        sql: "SELECT dependency_id FROM task_step_dependencies WHERE task_id = ? AND step_id = ? ORDER BY dependency_id",
+        args: [input.taskId, input.stepId],
+      });
+      return parseStep(
+        await this.requireStep(tx, input.taskId, input.stepId),
+        deps.rows.map((row) => stringColumn(row, "dependency_id")),
+      );
+    });
+  }
+
   /** Reads linked Run state only for the current owned model Step during cancellation. */
   async getClaimedModelRunForCancellation(input: {
     taskId: string;
@@ -1551,11 +1676,10 @@ export class LongWorkStore {
       )
         throw new Error("Child permissions exceed the parent Step delegation");
       if (input.delegatedPermissionSet.length > 0) {
-        const scopeJson = optionalString(parent, "origin_scope_json");
-        if (!scopeJson) throw new Error("Parent Task scope is required for delegation");
-        const scope = JSON.parse(scopeJson) as TrustedChannelScope;
-        if (scopeKey(scope) !== parent.origin_scope_key)
-          throw new Error("Parent Task scope changed before child delegation");
+        const scope = reconstructTaskOriginScope(
+          stringColumn(parent, "origin_scope_key"),
+          parent.origin_scope_json,
+        );
         for (const permission of input.delegatedPermissionSet) {
           const current = await evaluate(tx, {
             caller: { principalId: origin.actorPrincipalId, scope },
@@ -1741,11 +1865,10 @@ export class LongWorkStore {
         });
         if (!currentDecision.rows[0]) throw new Error("Current Task planning grant is required");
         if (steps.some((step) => step.delegatedPermissionSet.length > 0)) {
-          const scopeJson = optionalString(task, "origin_scope_json");
-          if (!scopeJson) throw new Error("Task scope is required for delegated permissions");
-          const scope = JSON.parse(scopeJson) as TrustedChannelScope;
-          if (scopeKey(scope) !== task.origin_scope_key)
-            throw new Error("Task scope changed before delegated planning");
+          const scope = reconstructTaskOriginScope(
+            stringColumn(task, "origin_scope_key"),
+            task.origin_scope_json,
+          );
           for (const step of steps) {
             for (const permission of step.delegatedPermissionSet) {
               const delegated = await evaluate(tx, {

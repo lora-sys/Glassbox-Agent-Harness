@@ -83,6 +83,12 @@ it("links a child with a current subset of parent Step permissions and rejects r
       resourceId: `task-${parent.id}`,
       action: "task:continue",
     });
+    await store.db.transaction(async (tx) => {
+      await tx.execute({
+        sql: "UPDATE tasks SET origin_scope_json = NULL WHERE id = ?",
+        args: [parent.id],
+      });
+    });
     const linkInput = {
       parentTaskId: parent.id,
       parentStepId: step.id,
@@ -486,6 +492,12 @@ it("rejects declared Step permissions outside the planner's current grants", asy
       action: "task:accept",
       scope: caller.scope,
       effect: "allow",
+    });
+    await store.db.transaction(async (tx) => {
+      await tx.execute({
+        sql: "UPDATE tasks SET origin_scope_json = NULL WHERE id = ?",
+        args: [task.id],
+      });
     });
     await service.planExistingTask(caller, task.id, [step], step.id);
     expect(runtime.start).toHaveBeenCalledOnce();

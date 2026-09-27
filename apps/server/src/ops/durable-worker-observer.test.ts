@@ -39,7 +39,7 @@ function workerStep(
   };
 }
 
-async function fixture(agentKind = "codex") {
+async function fixture(agentKind = "codex", prompted = true) {
   const store = await openDomainStore({ databasePath: ":memory:" });
   stores.push(store);
   await store.identities.createPrincipal("owner", "owner");
@@ -77,6 +77,7 @@ async function fixture(agentKind = "codex") {
     agentName: worker.agentName,
     agentKind,
   });
+  if (prompted) await store.tasks.markWorkerPromptDispatched("attempt-1", binding.id);
   const lease = await store.longWork.acquireLease({
     id: "lease-1",
     taskId: task.id,
@@ -98,6 +99,17 @@ afterEach(async () => {
 });
 
 describe("DurableWorkerObserver", () => {
+  it("does not accept a Worker completion before its prompt acknowledgement", async () => {
+    const { store, task, stepId, bridge, worker, reconciler } = await fixture("pi", false);
+    bridge.simulateAgentState(worker.paneId, "done");
+
+    await reconciler.reconcileSnapshot(await bridge.getSnapshot());
+
+    expect(
+      (await store.longWork.listSteps(task.id)).find((step) => step.id === stepId)?.status,
+    ).toBe("running");
+  });
+
   it("settles a trusted done observation into Step review without completing the Task", async () => {
     const { store, task, stepId, bridge, worker, reconciler } = await fixture();
     bridge.simulateAgentState(worker.paneId, "done");

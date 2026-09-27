@@ -1,0 +1,242 @@
+import type { TaskStep } from "@glassbox/contracts";
+import { realpath } from "node:fs/promises";
+import type { DomainStore } from "../../application/domain-store.js";
+import { AccessDeniedError } from "../../auth/service.js";
+import type { CallerContext } from "../../identity/scope.js";
+import { DurableWorkerObserver } from "../durable-worker-observer.js";
+import type { HerdrBridge } from "../herdr-bridge.js";
+import { authorizeLongWorkAction } from "../long-work-authority.js";
+import type { ClaimedTaskStep, StoredStepLease } from "../long-work-store.js";
+import { AuthorizedOpsService, type ConfiguredWorkerTarget } from "../service.js";
+
+const ORIGIN = { kind: "system", reason: "Temporal Herdr Worker reconciliation" } as const;
+const WORKER_LEASE_MS = 60_000;
+
+/** The Temporal process observes live Herdr state; Glassbox remains the Step authority. */
+export class HerdrWorkerRuntime {
+  private readonly observer: DurableWorkerObserver;
+
+  constructor(
+    private readonly store: DomainStore,
+    private readonly service: AuthorizedOpsService,
+    private readonly bridge: HerdrBridge,
+    private readonly target: ConfiguredWorkerTarget,
+  ) {
+    this.observer = new DurableWorkerObserver(store.db, store.longWork, store.tasks);
+  }
+
+  dispatch(caller: CallerContext, claim: ClaimedTaskStep): Promise<void> {
+    return this.service.dispatchClaimedWorker(caller, claim, this.target);
+  }
+
+  async cancel(taskId: string, step: TaskStep): Promise<"settled" | "pending"> {
+    const lease = await this.store.longWork.getActiveLease(taskId, step.id);
+    if (!lease?.attemptId || !lease.workerBindingId) return "pending";
+    const binding = await this.store.tasks.getWorkerBinding(lease.attemptId);
+    if (!binding?.agentName || binding.id !== lease.workerBindingId) return "pending";
+    try {
+      await this.service.closeClaimedWorker(lease.attemptId, {
+        paneId: binding.paneId,
+        agentName: binding.agentName,
+        herdrSession: binding.herdrSession,
+      });
+    } catch {
+      return "pending";
+    }
+    try {
+      await this.store.longWork.settleClaimedWorkerCancellation({
+        taskId,
+        stepId: step.id,
+        attemptId: lease.attemptId,
+        leaseId: lease.id,
+        workerBindingId: binding.id,
+        ownerInstanceId: lease.ownerInstanceId,
+        expectedStepVersion: step.version,
+        expectedLeaseVersion: lease.version,
+        closureEvidenceRef: `herdr-closed:${binding.id}`,
+        origin: ORIGIN,
+      });
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        /(?:settlement conflict|ownership conflict|Step conflict)/iu.test(error.message)
+      )
+        return "pending";
+      throw error;
+    }
+    return "settled";
+  }
+
+  private async settleUnknown(
+    taskId: string,
+    step: TaskStep,
+    lease: StoredStepLease,
+    reason: string,
+  ): Promise<void> {
+    if (!lease.attemptId) return;
+    try {
+      await this.store.longWork.settleClaimedStep({
+        taskId,
+        stepId: step.id,
+        attemptId: lease.attemptId,
+        leaseId: lease.id,
+        ownerInstanceId: lease.ownerInstanceId,
+        expectedStepVersion: step.version,
+        expectedLeaseVersion: lease.version,
+        ...(lease.workerBindingId ? { workerBindingId: lease.workerBindingId } : {}),
+        outcome: "unknown",
+        evidenceRef: `${reason}:${lease.attemptId}`,
+        origin: ORIGIN,
+      });
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        /(?:settlement conflict|ownership conflict|status conflict)/iu.test(error.message)
+      )
+        return;
+      throw error;
+    }
+  }
+
+  async observe(taskId: string, step: TaskStep): Promise<"settled" | "pending"> {
+    const lease = await this.store.longWork.getActiveLease(taskId, step.id);
+    if (!lease?.attemptId) return "pending";
+    const binding = await this.store.tasks.getWorkerBinding(lease.attemptId);
+    if (!binding || !lease.workerBindingId || !binding.promptDispatchedAt) {
+      if (Date.parse(lease.expiresAt) > Date.now()) return "pending";
+      if (binding?.agentName) {
+        try {
+          await this.service.closeClaimedWorker(lease.attemptId, {
+            paneId: binding.paneId,
+            agentName: binding.agentName,
+            herdrSession: binding.herdrSession,
+          });
+        } catch {
+          await this.service.quarantineClaimedWorker(lease.attemptId);
+        }
+      } else {
+        await this.service.quarantineClaimedWorker(lease.attemptId);
+      }
+      await this.settleUnknown(taskId, step, lease, "worker-dispatch-unconfirmed");
+      return "settled";
+    }
+
+    let snapshot;
+    try {
+      snapshot = await this.bridge.getSnapshot();
+    } catch {
+      if (Date.parse(lease.expiresAt) <= Date.now()) {
+        await this.service.quarantineClaimedWorker(lease.attemptId);
+        await this.settleUnknown(taskId, step, lease, "worker-session-unavailable");
+        return "settled";
+      }
+      return "pending";
+    }
+    if (snapshot.sessionId !== binding.herdrSession) {
+      await this.service.quarantineClaimedWorker(lease.attemptId);
+      await this.settleUnknown(taskId, step, lease, "worker-session-changed");
+      return "settled";
+    }
+    const snapshotTime = Date.parse(snapshot.timestamp);
+    if (
+      !Number.isFinite(snapshotTime) ||
+      snapshotTime < Date.parse(lease.acquiredAt) ||
+      snapshotTime < Date.parse(binding.updatedAt)
+    ) {
+      if (Date.parse(lease.expiresAt) <= Date.now()) {
+        await this.service.quarantineClaimedWorker(lease.attemptId);
+        await this.settleUnknown(taskId, step, lease, "worker-snapshot-stale");
+        return "settled";
+      }
+      return "pending";
+    }
+    const workspace = snapshot.workspaces.find(
+      (entry) => entry.workspaceId === binding.workspaceId,
+    );
+    const pane = workspace?.panes.find((entry) => entry.paneId === binding.paneId);
+    let exactPane = false;
+    if (
+      pane &&
+      pane.agentName === binding.agentName &&
+      pane.agentKind === binding.agentKind &&
+      pane.cwd &&
+      binding.worktreePath
+    ) {
+      try {
+        exactPane = (await realpath(pane.cwd)) === (await realpath(binding.worktreePath));
+      } catch {
+        // An unavailable directory is not proof that this Worker still owns it.
+      }
+    }
+    if (!exactPane) {
+      await this.service.quarantineClaimedWorker(lease.attemptId);
+      await this.settleUnknown(taskId, step, lease, "worker-identity-or-directory-changed");
+      return "settled";
+    }
+    if (Date.parse(lease.expiresAt) <= Date.now()) {
+      await this.service.quarantineClaimedWorker(lease.attemptId);
+      await this.settleUnknown(taskId, step, lease, "worker-lease-expired");
+      return "settled";
+    }
+    try {
+      for (const [resourceId, action] of [
+        [`task-${taskId}`, "task:continue"],
+        [`task-${taskId}`, "task:delegate"],
+        ...step.delegatedPermissionSet.map((permission) => [
+          permission.resourceId,
+          permission.action,
+        ]),
+      ])
+        await authorizeLongWorkAction(this.store, {
+          taskId,
+          resourceId: resourceId!,
+          action: action!,
+        });
+    } catch (error) {
+      if (!(error instanceof AccessDeniedError)) throw error;
+      try {
+        await this.service.closeClaimedWorker(lease.attemptId, {
+          paneId: binding.paneId,
+          agentName: binding.agentName!,
+          herdrSession: binding.herdrSession,
+        });
+      } catch {
+        await this.service.quarantineClaimedWorker(lease.attemptId);
+      }
+      await this.settleUnknown(
+        taskId,
+        step,
+        lease,
+        `worker-authority-revoked:${error.decision.id}`,
+      );
+      return "settled";
+    }
+    await this.observer.observeSnapshot(snapshot);
+    const current = (await this.store.longWork.listSteps(taskId)).find(
+      (item) => item.id === step.id,
+    );
+    if (!current || current.status !== "running") return "settled";
+    const currentLease = await this.store.longWork.getActiveLease(taskId, step.id);
+    if (!currentLease?.attemptId || !currentLease.workerBindingId) return "pending";
+    if (Date.parse(currentLease.expiresAt) <= Date.now()) {
+      await this.service.quarantineClaimedWorker(currentLease.attemptId);
+      await this.settleUnknown(taskId, current, currentLease, "worker-lease-expired");
+      return "settled";
+    }
+    try {
+      await this.store.longWork.updateLease({
+        taskId,
+        leaseId: currentLease.id,
+        ownerInstanceId: currentLease.ownerInstanceId,
+        expectedVersion: currentLease.version,
+        action: "heartbeat",
+        expiresAt: new Date(Date.now() + WORKER_LEASE_MS).toISOString(),
+        origin: ORIGIN,
+      });
+    } catch (error) {
+      if (!(error instanceof Error) || !error.message.includes("Lease version conflict"))
+        throw error;
+    }
+    return "pending";
+  }
+}

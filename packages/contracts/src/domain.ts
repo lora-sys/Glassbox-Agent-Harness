@@ -187,6 +187,7 @@ export interface WorkerBinding {
   agentName?: string;
   agentKind: string;
   lastObservedAgentState: HerdrAgentLifecycleState;
+  promptDispatchedAt?: string;
   updatedAt: string;
 }
 

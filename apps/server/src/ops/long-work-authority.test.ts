@@ -6,8 +6,9 @@ import { DomainDatabase } from "../persistence/database.js";
 import type { TaskStep } from "@glassbox/contracts";
 import { LongWorkStore } from "./long-work-store.js";
 import { DEFAULT_TASK_GRAPH_LIMITS } from "./task-graph.js";
-import { authorizeLongWorkAction } from "./long-work-authority.js";
+import { authorizeLongWorkAction, reconstructTaskOriginScope } from "./long-work-authority.js";
 import { TaskStore } from "./task-store.js";
+import { scopeKey } from "../identity/scope.js";
 
 const scope: TrustedChannelScope = {
   connectionId: "connection-1",
@@ -135,6 +136,10 @@ it("reconstructs a migrated Task scope from its canonical scope key", async () =
   } finally {
     await cleanup();
   }
+});
+
+it("reconstructs a legacy Task scope from its canonical scope key", () => {
+  expect(reconstructTaskOriginScope(scopeKey(scope))).toEqual(scope);
 });
 
 it("rejects a caller whose principal or exact scope differs from the Task origin", async () => {

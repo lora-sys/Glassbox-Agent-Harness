@@ -53,6 +53,19 @@ function scopeFromLegacyKey(key: string): TrustedChannelScope {
   return scope;
 }
 
+/** Reconstructs a validated Task origin scope and verifies its persisted key. */
+export function reconstructTaskOriginScope(
+  originScopeKey: string,
+  originScopeJson?: unknown,
+): TrustedChannelScope {
+  const scope =
+    typeof originScopeJson === "string"
+      ? parseStoredScope(originScopeJson)
+      : scopeFromLegacyKey(originScopeKey);
+  if (scopeKey(scope) !== originScopeKey) throw new Error("Invalid stored Task origin scope");
+  return scope;
+}
+
 /** Rechecks current identity and grants before a resumed Task performs protected work. */
 export async function authorizeLongWorkAction(
   store: Pick<DomainStore, "db" | "authorization">,
@@ -73,11 +86,7 @@ export async function authorizeLongWorkAction(
   if (!row) throw new Error("Task not found");
   const creatorPrincipalId = stringColumn(row, "creator_principal_id");
   const originScopeKey = stringColumn(row, "origin_scope_key");
-  const storedScopeJson = row.origin_scope_json;
-  const storedScope =
-    typeof storedScopeJson === "string"
-      ? parseStoredScope(storedScopeJson)
-      : scopeFromLegacyKey(originScopeKey);
+  const storedScope = reconstructTaskOriginScope(originScopeKey, row.origin_scope_json);
 
   if (input.caller && input.caller.principalId !== creatorPrincipalId)
     throw new Error("Long-work caller does not match Task creator");
@@ -111,11 +120,6 @@ export async function getLongWorkCaller(
   });
   if (!row) throw new Error("Task not found");
   const originScopeKey = stringColumn(row, "origin_scope_key");
-  const storedScopeJson = row.origin_scope_json;
-  const scope =
-    typeof storedScopeJson === "string"
-      ? parseStoredScope(storedScopeJson)
-      : scopeFromLegacyKey(originScopeKey);
-  if (scopeKey(scope) !== originScopeKey) throw new Error("Invalid stored Task origin scope");
+  const scope = reconstructTaskOriginScope(originScopeKey, row.origin_scope_json);
   return { principalId: stringColumn(row, "creator_principal_id"), scope };
 }

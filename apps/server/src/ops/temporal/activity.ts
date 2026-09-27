@@ -8,6 +8,8 @@ import { LongWorkScheduler } from "../long-work-scheduler.js";
 import { DEFAULT_TASK_GRAPH_LIMITS } from "../task-graph.js";
 import { parseTaskGetSpec } from "../tool-step-spec.js";
 import type { AdvanceLongWorkActivity } from "./contracts.js";
+import { ClaimedWorkerDispatchError } from "../service.js";
+import type { HerdrWorkerRuntime } from "./herdr-worker-runtime.js";
 
 const ORIGIN = { kind: "system", reason: "Temporal coordinator" } as const;
 const RUN_POLL_MS = 10_000;
@@ -452,7 +454,10 @@ async function createClaimedModelRun(
 }
 
 /** The Activity claims model Steps and records durable Runs; RunService performs model execution. */
-export function createAdvanceLongWorkActivity(store: DomainStore): AdvanceLongWorkActivity {
+export function createAdvanceLongWorkActivity(
+  store: DomainStore,
+  workers?: Pick<HerdrWorkerRuntime, "dispatch" | "observe" | "cancel">,
+): AdvanceLongWorkActivity {
   const scheduler = new LongWorkScheduler(store.longWork, DEFAULT_TASK_GRAPH_LIMITS);
   return async ({ taskId, policyRevision }) => {
     const task = assertCurrentTask(await store.tasks.getTask(taskId), policyRevision);
@@ -461,6 +466,12 @@ export function createAdvanceLongWorkActivity(store: DomainStore): AdvanceLongWo
       const steps = await store.longWork.listSteps(taskId);
       let pending = false;
       for (const step of steps) {
+        if (step.kind === "herdr_worker" && step.status === "running") {
+          if (workers && (await workers.cancel(taskId, step)) === "settled")
+            return { kind: "continue" };
+          pending = true;
+          continue;
+        }
         if (!["model", "tool"].includes(step.kind) || step.status !== "running") continue;
         const result = await settleCancelledModelStep(store, taskId, step);
         if (result === "settled") return { kind: "continue" };
@@ -501,7 +512,14 @@ export function createAdvanceLongWorkActivity(store: DomainStore): AdvanceLongWo
     const steps = await store.longWork.listSteps(taskId);
     const byId = new Map(steps.map((step) => [step.id, step]));
     let modelRunPending = false;
+    let workerPending = false;
     for (const step of steps) {
+      if (step.kind === "herdr_worker" && step.status === "running" && workers) {
+        const observed = await workers.observe(taskId, step);
+        if (observed === "settled") return { kind: "continue" };
+        workerPending = true;
+        continue;
+      }
       if (!["model", "tool"].includes(step.kind) || step.status !== "running") continue;
       const observed = await observeRunningModelStep(store, taskId, step);
       if (observed === "settled" || observed === "continue") return { kind: "continue" };
@@ -512,6 +530,87 @@ export function createAdvanceLongWorkActivity(store: DomainStore): AdvanceLongWo
     let unsupported = false;
     for (const stepId of progress.runnableStepIds) {
       const step = byId.get(stepId)!;
+      if (step.kind === "herdr_worker" && workers) {
+        if (!step.instructions?.trim() || step.specRef || step.requiredCapabilities.length > 0) {
+          await store.longWork.transitionStep({
+            taskId,
+            stepId,
+            expectedVersion: step.version,
+            from: "ready",
+            to: "blocked",
+            origin: ORIGIN,
+            metadata: { reason: "invalid_worker_step_spec", outcome: "not_started" },
+          });
+          return { kind: "continue" };
+        }
+        const caller = await getLongWorkCaller(store, taskId);
+        let decisionId: string;
+        try {
+          decisionId = await authorizeLongWorkAction(store, {
+            taskId,
+            caller,
+            resourceId: `task-${taskId}`,
+            action: "task:continue",
+          });
+          await authorizeLongWorkAction(store, {
+            taskId,
+            caller,
+            resourceId: `task-${taskId}`,
+            action: "task:delegate",
+          });
+        } catch (error) {
+          if (!(error instanceof AccessDeniedError)) throw error;
+          await store.longWork.transitionStep({
+            taskId,
+            stepId,
+            expectedVersion: step.version,
+            from: "ready",
+            to: "blocked",
+            origin: ORIGIN,
+            evidenceRef: `authorization:${error.decision.id}`,
+            metadata: { reason: "worker_delegation_denied", outcome: "not_started" },
+          });
+          return { kind: "continue" };
+        }
+        const claimed = await store.longWork.claimReadyStep({
+          taskId,
+          stepId,
+          expectedStepVersion: step.version,
+          attemptId: randomUUID(),
+          leaseId: randomUUID(),
+          ownerInstanceId: `temporal-worker-${randomUUID()}`,
+          leaseExpiresAt: new Date(Date.now() + MODEL_LEASE_MS).toISOString(),
+          origin: { kind: "decision", decisionId, actorPrincipalId: caller.principalId },
+        });
+        try {
+          await workers.dispatch(caller, claimed);
+        } catch (error) {
+          const lease = await store.longWork.getActiveLease(taskId, stepId);
+          if (lease?.attemptId === claimed.attempt.id) {
+            const outcome =
+              error instanceof ClaimedWorkerDispatchError && error.outcome === "not_started"
+                ? "failed"
+                : "unknown";
+            await store.longWork.settleClaimedStep({
+              taskId,
+              stepId,
+              attemptId: claimed.attempt.id,
+              leaseId: lease.id,
+              ownerInstanceId: lease.ownerInstanceId,
+              expectedStepVersion: claimed.step.version,
+              expectedLeaseVersion: lease.version,
+              ...(lease.workerBindingId ? { workerBindingId: lease.workerBindingId } : {}),
+              outcome,
+              evidenceRef:
+                error instanceof ClaimedWorkerDispatchError && error.decisionId
+                  ? `authorization:${error.decisionId}`
+                  : `worker-dispatch:${outcome}:${claimed.attempt.id}`,
+              origin: ORIGIN,
+            });
+          }
+        }
+        return { kind: "continue" };
+      }
       if (step.kind === "model" || step.kind === "tool") {
         if (
           (step.kind === "model"
@@ -684,7 +783,7 @@ export function createAdvanceLongWorkActivity(store: DomainStore): AdvanceLongWo
     }
     // A running non-wait Step may belong to a live executor. Until the executor or
     // reconciler records loss evidence, preserve it and never dispatch it again here.
-    if (modelRunPending) return modelWake();
+    if (modelRunPending || workerPending) return modelWake();
     if (steps.some((step) => step.status === "running")) return { kind: "wait" };
     const terminal = steps.every((step) =>
       ["succeeded", "failed", "cancelled", "skipped"].includes(step.status),

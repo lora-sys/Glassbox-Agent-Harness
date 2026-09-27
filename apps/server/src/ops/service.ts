@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type {
   AgentOpsSnapshot,
   AgentTask,
@@ -17,6 +17,7 @@ import { mkdir, writeFile, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import type { WorkspaceRegistry } from "../workspace/registry.js";
 import { WorkspaceWriteOccupancy, type WriteOccupancyLease } from "../workspace/write-occupancy.js";
+import type { ClaimedTaskStep } from "./long-work-store.js";
 
 export interface WorkerPolicy {
   databasePath: string;
@@ -27,6 +28,24 @@ export interface WorkerPolicy {
 export interface WorkerWorkspaceBoundary {
   registry: WorkspaceRegistry;
   writes: WorkspaceWriteOccupancy;
+}
+
+export interface ConfiguredWorkerTarget {
+  workspaceId: string;
+  agentKind: string;
+  worktreePath: string;
+}
+
+export class ClaimedWorkerDispatchError extends Error {
+  constructor(
+    readonly outcome: "not_started" | "unknown",
+    readonly decisionId?: string,
+  ) {
+    super(
+      outcome === "not_started" ? "Worker was not started" : "Worker dispatch outcome is unknown",
+    );
+    this.name = "ClaimedWorkerDispatchError";
+  }
 }
 
 type WorkerContext = { file: string; lease: WriteOccupancyLease | null };
@@ -60,6 +79,7 @@ export class AuthorizedOpsService {
     taskId: string,
     attemptId: string,
     root?: string,
+    delegated?: Pick<TaskStep, "delegatedPermissionSet">,
   ): Promise<WorkerContext | undefined> {
     if (!this.workerPolicy) {
       if (this.workspaceBoundary) throw new Error("Worker has no bounded file policy");
@@ -100,17 +120,27 @@ export class AuthorizedOpsService {
         throw new Error("Worker directory contains service state");
     }
     const allowedActions: string[] = [];
+    const declared = (resourceId: string, action: string) =>
+      !delegated ||
+      delegated.delegatedPermissionSet.some(
+        (permission) => permission.resourceId === resourceId && permission.action === action,
+      );
     for (const action of ["worker:file:read", "worker:file:write"]) {
+      if (!declared(policy.resourceId, action)) continue;
       const decision = await this.store.authorization.check({
         caller,
         resourceId: policy.resourceId,
         action,
+        ...(delegated ? { delegatedTaskId: taskId } : {}),
       });
       if (decision.decision === "ALLOW") allowedActions.push(action);
     }
     if (!allowedActions.length) throw new Error("No delegated file authority");
     const writable = allowedActions.includes("worker:file:write");
     if (productWorkspaceId) {
+      const workspaceAction = writable ? "workspace:write" : "workspace:read";
+      if (!declared(`workspace:${productWorkspaceId}`, workspaceAction))
+        throw new Error("Worker Step has no delegated workspace authority");
       await this.workspaceBoundary!.registry.resolveAuthorized(
         caller.principalId,
         productWorkspaceId,
@@ -119,7 +149,8 @@ export class AuthorizedOpsService {
       const decision = await this.store.authorization.check({
         caller,
         resourceId: `workspace:${productWorkspaceId}`,
-        action: writable ? "workspace:write" : "workspace:read",
+        action: workspaceAction,
+        ...(delegated ? { delegatedTaskId: taskId } : {}),
       });
       if (decision.decision !== "ALLOW") throw new AccessDeniedError(decision);
     }
@@ -399,9 +430,9 @@ export class AuthorizedOpsService {
     worker?: StartedWorker,
     herdrSession?: string,
   ): Promise<void> {
-    if (!context?.lease) return;
     if (!started) {
-      await this.workspaceBoundary!.writes.closeAndRelease(context.lease, async () => undefined);
+      if (context?.lease)
+        await this.workspaceBoundary!.writes.closeAndRelease(context.lease, async () => undefined);
       return;
     }
     if (worker && herdrSession) {
@@ -412,6 +443,7 @@ export class AuthorizedOpsService {
         // The durable quarantine below remains until a trusted stop check succeeds.
       }
     }
+    if (!context?.lease) return;
     const current = this.workerLease(attemptId);
     if (current?.state === "active") {
       this.workspaceBoundary!.writes.quarantine(current.lease);
@@ -505,6 +537,171 @@ export class AuthorizedOpsService {
       await this.store.tasks.recordDispatchProblem(task.id, attempt.id, caller.principalId);
     }
     return (await this.store.tasks.getTask(task.id))!;
+  }
+
+  /** Starts the already claimed durable Attempt. The configured target is server owned. */
+  async dispatchClaimedWorker(
+    caller: CallerContext,
+    claim: ClaimedTaskStep,
+    target: ConfiguredWorkerTarget,
+  ): Promise<void> {
+    if (
+      claim.step.kind !== "herdr_worker" ||
+      claim.step.status !== "running" ||
+      claim.attempt.stepId !== claim.step.id ||
+      claim.attempt.taskId !== claim.step.taskId ||
+      claim.lease.attemptId !== claim.attempt.id ||
+      claim.lease.stepId !== claim.step.id ||
+      claim.lease.taskId !== claim.step.taskId ||
+      claim.lease.state !== "active" ||
+      claim.lease.workerBindingId ||
+      !claim.step.instructions?.trim() ||
+      claim.step.specRef ||
+      claim.step.requiredCapabilities.length > 0 ||
+      target.agentKind !== "pi" ||
+      !this.workerPolicy ||
+      !this.workspaceBoundary
+    )
+      throw new ClaimedWorkerDispatchError("not_started");
+    const taskId = claim.step.taskId;
+    const attemptId = claim.attempt.id;
+    if (await this.store.tasks.getWorkerBinding(attemptId))
+      throw new ClaimedWorkerDispatchError("unknown");
+    let context: WorkerContext | undefined;
+    let started = false;
+    let worker: StartedWorker | undefined;
+    let dispatchSession: string | undefined;
+    try {
+      await this.authorize(caller, `task-${taskId}`, "task:continue", {
+        delegatedTaskId: taskId,
+      });
+      const delegation = await this.authorize(caller, `task-${taskId}`, "task:delegate", {
+        delegatedTaskId: taskId,
+      });
+      context = await this.workerContext(
+        caller,
+        taskId,
+        attemptId,
+        target.worktreePath,
+        claim.step,
+      );
+      dispatchSession = (await this.bridge.getSnapshot()).sessionId;
+      const agentName =
+        context?.lease?.sandboxSessionId ??
+        `glassbox-${createHash("sha256").update(attemptId).digest("hex").slice(0, 24)}`;
+      started = true;
+      worker = await this.bridge.startAgent({
+        workspaceId: target.workspaceId,
+        agentKind: target.agentKind,
+        worktreePath: target.worktreePath,
+        workerContextFile: context?.file,
+        agentName,
+      });
+      const snapshot = await this.bridge.getSnapshot();
+      if (snapshot.sessionId !== dispatchSession)
+        throw new Error("Herdr session changed during Worker launch");
+      const workspace = snapshot.workspaces.find((entry) =>
+        entry.panes.some((pane) => pane.paneId === worker!.paneId),
+      );
+      const pane = workspace?.panes.find((entry) => entry.paneId === worker!.paneId);
+      if (
+        workspace?.workspaceId !== target.workspaceId ||
+        pane?.agentName !== agentName ||
+        pane.agentKind !== target.agentKind ||
+        !pane.cwd ||
+        (await realpath(pane.cwd)) !== (await realpath(target.worktreePath))
+      )
+        throw new Error("Herdr Worker identity or directory differs from the claimed target");
+      const binding = await this.store.tasks.bindWorker({
+        taskAttemptId: attemptId,
+        herdrSession: dispatchSession,
+        workspaceId: target.workspaceId,
+        paneId: worker.paneId,
+        agentName,
+        agentKind: target.agentKind,
+        runtimeEvidence: worker.runtimeEvidence,
+        worktreePath: target.worktreePath,
+        lastObservedAgentState: "starting",
+      });
+      await this.store.longWork.attachClaimedWorkerBinding({
+        taskId,
+        stepId: claim.step.id,
+        attemptId,
+        leaseId: claim.lease.id,
+        workerBindingId: binding.id,
+        ownerInstanceId: claim.lease.ownerInstanceId,
+        expectedStepVersion: claim.step.version,
+        expectedLeaseVersion: claim.lease.version,
+        origin: {
+          kind: "decision",
+          decisionId: delegation.id,
+          actorPrincipalId: caller.principalId,
+        },
+      });
+      await this.bridge.promptAgent({
+        paneId: worker.paneId,
+        agentName,
+        prompt: claim.step.instructions,
+      });
+      if (!(await this.store.tasks.markWorkerPromptDispatched(attemptId, binding.id)))
+        throw new Error("Worker prompt acknowledgement conflict");
+    } catch (error) {
+      try {
+        await this.failedDispatch(attemptId, context, started, worker, dispatchSession);
+      } catch {
+        // Failure to verify closure leaves the external effect uncertain.
+      }
+      throw new ClaimedWorkerDispatchError(
+        started ? "unknown" : "not_started",
+        error instanceof AccessDeniedError ? error.decision.id : undefined,
+      );
+    }
+  }
+
+  /** Releases workspace write occupancy only after Herdr confirms the pane is closed. */
+  async closeClaimedWorker(
+    attemptId: string,
+    worker: { paneId: string; agentName: string; herdrSession: string },
+  ): Promise<void> {
+    try {
+      if (this.workspaceBoundary) await this.closeWorker(attemptId, worker);
+      else await this.bridge.closeAgent(worker);
+    } catch (error) {
+      const current = this.workerLease(attemptId);
+      if (current?.state === "active") {
+        this.workspaceBoundary!.writes.quarantine(current.lease);
+        await this.recordWorkerLease(attemptId, current.lease, "quarantined");
+      }
+      throw error;
+    }
+  }
+
+  /** A lost dispatch cannot release a possible workspace writer without close evidence. */
+  async quarantineClaimedWorker(attemptId: string): Promise<void> {
+    const current = this.workerLease(attemptId);
+    if (current?.state === "active") {
+      this.workspaceBoundary!.writes.quarantine(current.lease);
+      await this.recordWorkerLease(attemptId, current.lease, "quarantined");
+    }
+  }
+
+  private async closeReviewedWorker(taskId: string, stepId: string): Promise<void> {
+    const step = (await this.store.longWork.listSteps(taskId)).find((item) => item.id === stepId);
+    if (step?.kind !== "herdr_worker" || step.status !== "review") return;
+    const attempt = (await this.store.tasks.listAttempts(taskId))
+      .filter((item) => item.stepId === stepId)
+      .at(-1);
+    if (!this.workspaceBoundary && !attempt) return;
+    if (!attempt || attempt.status !== "review")
+      throw new Error("Reviewed Worker Attempt is missing");
+    const binding = await this.store.tasks.getWorkerBinding(attempt.id);
+    if (!this.workspaceBoundary && !binding) return;
+    if (!binding?.agentName) throw new Error("Reviewed Worker binding is unavailable");
+    await this.closeClaimedWorker(attempt.id, {
+      paneId: binding.paneId,
+      agentName: binding.agentName,
+      herdrSession: binding.herdrSession,
+    });
   }
 
   private async binding(caller: CallerContext, taskId: string, action: string) {
@@ -616,6 +813,7 @@ export class AuthorizedOpsService {
     const task = await this.store.tasks.getTask(taskId);
     if (task?.orchestrationMode !== "durable")
       throw new Error("Step acceptance requires a durable Task");
+    await this.closeReviewedWorker(taskId, stepId);
     const step = await this.store.longWork.acceptDurableStep({
       taskId,
       stepId,
@@ -642,6 +840,7 @@ export class AuthorizedOpsService {
     const task = await this.store.tasks.getTask(taskId);
     if (task?.orchestrationMode !== "durable")
       throw new Error("Step rework requires a durable Task");
+    await this.closeReviewedWorker(taskId, stepId);
     const step = await this.store.longWork.reworkDurableStep({
       taskId,
       stepId,
