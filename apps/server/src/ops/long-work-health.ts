@@ -1,5 +1,7 @@
 import type { Row } from "@libsql/client";
+import type { CallerContext } from "../identity/scope.js";
 import { requireIdentifier } from "../identity/scope.js";
+import { evaluate } from "../auth/service.js";
 import { DomainDatabase } from "../persistence/database.js";
 
 export interface LongWorkHealthSnapshot {
@@ -24,15 +26,27 @@ function countColumn(row: Row, key: string): number {
 }
 
 /**
- * Reads a bounded aggregate projection of Task IDs already authorized for task:read.
+ * Reauthorizes candidate Task IDs in the same transaction as the aggregate read.
  * It returns counts only and never loads protected Task contents.
  */
 export async function readLongWorkHealth(
   db: DomainDatabase,
-  visibleTaskIds: readonly string[],
+  candidateTaskIds: readonly string[],
+  caller: CallerContext,
+  evidence?: { runId?: string; conversationId?: string },
 ): Promise<LongWorkHealthSnapshot> {
-  for (const taskId of visibleTaskIds) requireIdentifier(taskId);
+  for (const taskId of candidateTaskIds) requireIdentifier(taskId);
   return db.transaction(async (tx) => {
+    const authorizedTaskIds: string[] = [];
+    for (const taskId of new Set(candidateTaskIds)) {
+      const decision = await evaluate(tx, {
+        caller,
+        resourceId: `task-${taskId}`,
+        action: "task:read",
+        ...evidence,
+      });
+      if (decision.decision === "ALLOW") authorizedTaskIds.push(taskId);
+    }
     const result = await tx.execute({
       sql: `
       WITH visible_tasks AS (
@@ -53,7 +67,7 @@ export async function readLongWorkHealth(
         (SELECT COUNT(*) FROM task_workflow_bindings WHERE task_id IN visible_tasks) AS observed_backend_bindings,
         (SELECT COUNT(*) FROM task_workflow_bindings WHERE task_id IN visible_tasks AND state = 'unavailable') AS unavailable_backend_bindings
     `,
-      args: [JSON.stringify(visibleTaskIds)],
+      args: [JSON.stringify(authorizedTaskIds)],
     });
     const row = result.rows[0];
     if (!row) throw new Error("Long-work health query returned no aggregate row");

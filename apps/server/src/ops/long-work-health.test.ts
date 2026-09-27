@@ -1,11 +1,23 @@
 import { expect, it } from "vite-plus/test";
+import { identityKey, scopeKey, type CallerContext } from "../identity/scope.js";
 import { DomainDatabase } from "../persistence/database.js";
 import { readLongWorkHealth } from "./long-work-health.js";
+
+const caller: CallerContext = {
+  principalId: "owner",
+  scope: {
+    connectionId: "health-test",
+    botId: "health-bot",
+    chatType: "private",
+    chatId: "owner",
+    senderId: "owner",
+  },
+};
 
 it("returns exact zero counts while backend availability remains unknown without bindings", async () => {
   const db = await DomainDatabase.open(":memory:");
   try {
-    expect(await readLongWorkHealth(db, [])).toEqual({
+    expect(await readLongWorkHealth(db, [], caller)).toEqual({
       tasks: { active: 0, waiting: 0 },
       steps: { blocked: 0, ready: 0, running: 0, review: 0 },
       leases: { active: 0, quarantined: 0 },
@@ -23,6 +35,10 @@ it("aggregates durable work states without returning protected Task content", as
   try {
     await db.transaction(async (tx) => {
       await tx.execute("INSERT INTO principals(id,kind,created_at) VALUES ('owner','owner','now')");
+      await tx.execute({
+        sql: "INSERT INTO channel_identities(identity_key,principal_id,created_at) VALUES (?, 'owner','now')",
+        args: [identityKey(caller.scope)],
+      });
       for (const [id, status] of [
         ["active", "RUNNING"],
         ["waiting-input", "WAITING_INPUT"],
@@ -32,6 +48,16 @@ it("aggregates durable work states without returning protected Task content", as
         await tx.execute({
           sql: "INSERT INTO tasks(id,title,description,status,priority,creator_principal_id,orchestration_mode,created_at,updated_at) VALUES (?, ?, ?, ?, 'normal','owner','durable','now','now')",
           args: [id, `private title ${id}`, "private description", status],
+        });
+      }
+      for (const id of ["active", "waiting-input", "waiting-review", "child"]) {
+        await tx.execute({
+          sql: "INSERT INTO resources(id,kind,visibility,owner_id) VALUES (?, 'task','private','owner')",
+          args: [`task-${id}`],
+        });
+        await tx.execute({
+          sql: "INSERT INTO grants(id,principal_id,resource_id,action,scope_key,effect,created_at) VALUES (?, 'owner', ?, 'task:read', ?, 'allow','now')",
+          args: [`read-${id}`, `task-${id}`, scopeKey(caller.scope)],
         });
       }
       await tx.execute(
@@ -69,12 +95,11 @@ it("aggregates durable work states without returning protected Task content", as
       });
     });
 
-    const snapshot = await readLongWorkHealth(db, [
-      "active",
-      "waiting-input",
-      "waiting-review",
-      "child",
-    ]);
+    const snapshot = await readLongWorkHealth(
+      db,
+      ["active", "waiting-input", "waiting-review", "child"],
+      caller,
+    );
     expect(snapshot).toEqual({
       tasks: { active: 2, waiting: 2 },
       steps: { blocked: 1, ready: 1, running: 1, review: 1 },
@@ -84,8 +109,8 @@ it("aggregates durable work states without returning protected Task content", as
       backend: { status: "unavailable", unavailableBindings: 1, observedBindings: 2 },
     });
     expect(JSON.stringify(snapshot)).not.toContain("private");
-    expect((await readLongWorkHealth(db, [])).tasks).toEqual({ active: 0, waiting: 0 });
-    expect((await readLongWorkHealth(db, ["active"])).tasks).toEqual({
+    expect((await readLongWorkHealth(db, [], caller)).tasks).toEqual({ active: 0, waiting: 0 });
+    expect((await readLongWorkHealth(db, ["active"], caller)).tasks).toEqual({
       active: 1,
       waiting: 0,
     });
@@ -99,18 +124,74 @@ it("reports an evidenced zero unavailable bindings without claiming a live backe
   try {
     await db.transaction(async (tx) => {
       await tx.execute("INSERT INTO principals(id,kind,created_at) VALUES ('owner','owner','now')");
+      await tx.execute({
+        sql: "INSERT INTO channel_identities(identity_key,principal_id,created_at) VALUES (?, 'owner','now')",
+        args: [identityKey(caller.scope)],
+      });
       await tx.execute(
         "INSERT INTO tasks(id,title,status,priority,creator_principal_id,orchestration_mode,created_at,updated_at) VALUES ('task','private','RUNNING','normal','owner','durable','now','now')",
       );
       await tx.execute(
         "INSERT INTO task_workflow_bindings(task_id,workflow_id,backend,state,policy_revision,continuation,updated_at) VALUES ('task','workflow','temporal','running',1,0,'now')",
       );
+      await tx.execute(
+        "INSERT INTO resources(id,kind,visibility,owner_id) VALUES ('task-task','task','private','owner')",
+      );
+      await tx.execute({
+        sql: "INSERT INTO grants(id,principal_id,resource_id,action,scope_key,effect,created_at) VALUES ('read-task','owner','task-task','task:read',?,'allow','now')",
+        args: [scopeKey(caller.scope)],
+      });
     });
 
-    expect((await readLongWorkHealth(db, ["task"])).backend).toEqual({
+    expect((await readLongWorkHealth(db, ["task"], caller)).backend).toEqual({
       status: "not_marked_unavailable",
       unavailableBindings: 0,
       observedBindings: 1,
+    });
+  } finally {
+    await db.close();
+  }
+});
+
+it("rechecks task:read when candidate health IDs outlive a grant", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    await db.transaction(async (tx) => {
+      await tx.execute("INSERT INTO principals(id,kind,created_at) VALUES ('owner','owner','now')");
+      await tx.execute({
+        sql: "INSERT INTO channel_identities(identity_key,principal_id,created_at) VALUES (?, 'owner','now')",
+        args: [identityKey(caller.scope)],
+      });
+      await tx.execute(
+        "INSERT INTO tasks(id,title,status,priority,creator_principal_id,orchestration_mode,created_at,updated_at) VALUES ('private-task','private','RUNNING','normal','owner','durable','now','now')",
+      );
+      await tx.execute(
+        "INSERT INTO task_steps(id,task_id,kind,title,instructions,status,dependency_policy_json,max_attempts,required_capabilities_json,delegated_permissions_json,version,created_at,updated_at) VALUES ('private-step','private-task','model','private step','private instructions','blocked','{}',3,'[]','[]',1,'now','now')",
+      );
+      await tx.execute(
+        "INSERT INTO resources(id,kind,visibility,owner_id) VALUES ('task-private-task','task','private','owner')",
+      );
+      await tx.execute({
+        sql: "INSERT INTO grants(id,principal_id,resource_id,action,scope_key,effect,created_at) VALUES ('private-read','owner','task-private-task','task:read',?,'allow','now')",
+        args: [scopeKey(caller.scope)],
+      });
+    });
+
+    expect((await readLongWorkHealth(db, ["private-task"], caller)).tasks.active).toBe(1);
+    expect(
+      (
+        await readLongWorkHealth(db, ["private-task"], {
+          ...caller,
+          scope: { ...caller.scope, chatId: "other-chat" },
+        })
+      ).tasks.active,
+    ).toBe(0);
+    await db.transaction((tx) =>
+      tx.execute("UPDATE grants SET revoked_at = 'now' WHERE id = 'private-read'"),
+    );
+    expect(await readLongWorkHealth(db, ["private-task"], caller)).toMatchObject({
+      tasks: { active: 0, waiting: 0 },
+      steps: { blocked: 0, ready: 0, running: 0, review: 0 },
     });
   } finally {
     await db.close();

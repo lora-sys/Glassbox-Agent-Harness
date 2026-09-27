@@ -4160,7 +4160,7 @@ export class ManagementApplication {
     return {
       ...health.snapshot,
       longWorkBackend: this.longWorkBackendStatus(),
-      longWork: await readLongWorkHealth(this.store.db, health.visibleTaskIds),
+      longWork: await readLongWorkHealth(this.store.db, health.visibleTaskIds, caller, { runId }),
     };
   }
 
