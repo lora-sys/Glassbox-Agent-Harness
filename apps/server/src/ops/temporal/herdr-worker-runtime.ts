@@ -5,7 +5,7 @@ import type { DomainStore } from "../../application/domain-store.js";
 import { AccessDeniedError } from "../../auth/service.js";
 import type { CallerContext } from "../../identity/scope.js";
 import { DurableWorkerObserver } from "../durable-worker-observer.js";
-import type { HerdrBridge } from "../herdr-bridge.js";
+import { workerTabLabel, type HerdrBridge } from "../herdr-bridge.js";
 import { authorizeLongWorkAction, getLongWorkCaller } from "../long-work-authority.js";
 import type { ClaimedTaskStep, StoredStepLease } from "../long-work-store.js";
 import { AuthorizedOpsService, type ConfiguredWorkerTarget } from "../service.js";
@@ -170,26 +170,39 @@ export class HerdrWorkerRuntime {
       const snapshotTime = Date.parse(snapshot.timestamp);
       if (!Number.isFinite(snapshotTime) || snapshotTime < Date.parse(intent.createdAt))
         return "pending";
-      const matches = snapshot.workspaces.flatMap((workspace) =>
+      const label = workerTabLabel(intent.agentName);
+      const marked = snapshot.workspaces.flatMap((workspace) =>
         workspace.panes
-          .filter((pane) => pane.agentName === intent.agentName)
+          .filter((pane) => pane.tabLabel === label)
           .map((pane) => ({ pane, workspaceId: workspace.workspaceId })),
       );
-      // Absence does not fence an in-flight tab.create or agent.start request.
-      if (matches.length !== 1) return "pending";
-      const [{ pane, workspaceId }] = matches;
+      // Absence does not fence a tab.create request still in flight.
+      if (marked.length !== 1) return "pending";
+      const [{ pane, workspaceId }] = marked;
       if (
         workspaceId !== intent.workspaceId ||
-        pane.agentKind !== intent.agentKind ||
         !pane.cwd ||
-        (await realpath(pane.cwd)) !== intent.worktreePath
+        (await realpath(pane.cwd)) !== intent.worktreePath ||
+        (pane.agentName && pane.agentName !== intent.agentName)
       )
         return "pending";
-      await this.service.closeClaimedWorker(lease.attemptId, {
-        paneId: pane.paneId,
-        agentName: intent.agentName,
-        herdrSession: intent.herdrSession,
-      });
+      if (pane.agentName) {
+        if (pane.agentKind !== intent.agentKind) return "pending";
+        await this.service.closeClaimedWorker(lease.attemptId, {
+          paneId: pane.paneId,
+          agentName: intent.agentName,
+          herdrSession: intent.herdrSession,
+        });
+      } else {
+        await this.service.closeClaimedPreAgentPane(lease.attemptId, {
+          paneId: pane.paneId,
+          agentName: intent.agentName,
+          herdrSession: intent.herdrSession,
+          workspaceId: intent.workspaceId,
+          tabLabel: label,
+          cwd: intent.worktreePath,
+        });
+      }
     } catch {
       return "pending";
     }

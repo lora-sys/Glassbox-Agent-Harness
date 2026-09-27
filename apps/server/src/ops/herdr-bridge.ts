@@ -18,6 +18,8 @@ export interface HerdrEvent {
 
 export interface HerdrPaneInfo {
   paneId: string;
+  tabId?: string;
+  tabLabel?: string;
   agentName?: string;
   agentKind: string;
   state: HerdrAgentLifecycleState;
@@ -68,4 +70,20 @@ export interface HerdrBridge {
   }): Promise<{ state: HerdrAgentLifecycleState }>;
   stopAgent(params: { paneId: string; agentName?: string }): Promise<void>;
   closeAgent(params: { paneId: string; agentName: string; herdrSession: string }): Promise<void>;
+  /**
+   * Close a pre-agent pane after the caller has observed its exact marker.
+   * A fresh exact identity check and post-close absence proof are required.
+   */
+  closePreAgentPane(params: {
+    herdrSession: string;
+    workspaceId: string;
+    paneId: string;
+    agentName: string;
+    tabLabel: string;
+    cwd: string;
+  }): Promise<void>;
+}
+
+export function workerTabLabel(agentName: string): string {
+  return `Glassbox Worker ${agentName}`;
 }

@@ -837,6 +837,33 @@ export class AuthorizedOpsService {
     }
   }
 
+  /** Closes a uniquely marked Tab before Herdr has assigned an Agent identity. */
+  async closeClaimedPreAgentPane(
+    attemptId: string,
+    pane: {
+      herdrSession: string;
+      workspaceId: string;
+      paneId: string;
+      agentName: string;
+      tabLabel: string;
+      cwd: string;
+    },
+  ): Promise<void> {
+    const current = this.workerLease(attemptId);
+    if (current && current.lease.sandboxSessionId !== pane.agentName)
+      throw new Error("Workspace lease and Herdr launch identity differ");
+    if (current?.state === "quarantined") {
+      await this.workspaceBoundary!.writes.releaseQuarantined(current.lease, async () => {
+        await this.bridge.closePreAgentPane(pane);
+        return true;
+      });
+      await this.recordWorkerLease(attemptId, current.lease, "released");
+      return;
+    }
+    if (current) throw new Error("Workspace lease is not quarantined");
+    await this.bridge.closePreAgentPane(pane);
+  }
+
   /** A lost dispatch cannot release a possible workspace writer without close evidence. */
   async quarantineClaimedWorker(attemptId: string): Promise<void> {
     const current = this.workerLease(attemptId);

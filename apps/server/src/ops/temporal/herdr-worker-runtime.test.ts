@@ -892,6 +892,49 @@ it("dispatches one Worker, reviews and cancels it safely, and quarantines an unc
     expect((await store.tasks.getTask(cancelUnboundTask.id))?.status).toBe("CANCELED");
     expect(writes.status(workspace.id)).toBe("free");
 
+    const orphanTask = await store.tasks.createTask({
+      title: "Recover a Tab created before its response was lost",
+      creatorPrincipalId: "owner",
+      authorizationScope: caller.scope,
+    });
+    for (const action of ["task:continue", "task:delegate"])
+      await store.authorization.grant({
+        principalId: "owner",
+        resourceId: `task-${orphanTask.id}`,
+        action,
+        scope: caller.scope,
+        effect: "allow",
+      });
+    const orphanStep = { ...step, id: "orphan-tab-step", taskId: orphanTask.id };
+    await store.longWork.createGraph(
+      orphanTask.id,
+      [orphanStep],
+      orphanStep.id,
+      DEFAULT_TASK_GRAPH_LIMITS,
+      { kind: "system", reason: "test lost tab.create response" },
+    );
+    vi.spyOn(bridge, "startAgent").mockImplementationOnce(async (params) => {
+      bridge.simulatePreAgentTab({
+        workspaceId: params.workspaceId,
+        agentName: params.agentName!,
+        worktreePath: params.worktreePath!,
+      });
+      throw new Error("transport lost after tab.create committed");
+    });
+    const orphanInput = { taskId: orphanTask.id, policyRevision: 1 };
+    expect(await advance(orphanInput)).toEqual({ kind: "continue" });
+    expect(writes.status(workspace.id)).toBe("quarantined");
+    const preAgentClose = vi
+      .spyOn(bridge, "closePreAgentPane")
+      .mockRejectedValueOnce(new Error("Herdr close acknowledgement unavailable"));
+    expect(await advance(orphanInput)).toMatchObject({ kind: "wait" });
+    expect(writes.status(workspace.id)).toBe("quarantined");
+    preAgentClose.mockRestore();
+    expect(await advance(orphanInput)).toEqual({ kind: "continue" });
+    expect((await store.tasks.listAttempts(orphanTask.id))[0]?.status).toBe("failed");
+    expect(writes.status(workspace.id)).toBe("free");
+    expect((await bridge.getSnapshot()).workspaces[0]?.panes).toHaveLength(0);
+
     const absentTask = await store.tasks.createTask({
       title: "Unknown launch with no observed pane",
       creatorPrincipalId: "owner",
@@ -919,10 +962,19 @@ it("dispatches one Worker, reviews and cancels it safely, and quarantines an unc
     const absentInput = { taskId: absentTask.id, policyRevision: 1 };
     expect(await advance(absentInput)).toEqual({ kind: "continue" });
     const absentAttempt = (await store.tasks.listAttempts(absentTask.id))[0]!;
-    expect(await store.longWork.getWorkerLaunchIntent(absentAttempt.id)).toBeTruthy();
+    const absentIntent = (await store.longWork.getWorkerLaunchIntent(absentAttempt.id))!;
     expect(await advance(absentInput)).toMatchObject({ kind: "wait" });
     expect(await store.longWork.getQuarantinedLease(absentTask.id, absentStep.id)).toBeTruthy();
     expect(writes.status(workspace.id)).toBe("quarantined");
+    bridge.simulatePreAgentTab({
+      workspaceId: absentIntent.workspaceId,
+      agentName: absentIntent.agentName,
+      worktreePath: absentIntent.worktreePath,
+    });
+    expect(await advance(absentInput)).toEqual({ kind: "continue" });
+    expect(await store.tasks.listAttempts(absentTask.id)).toHaveLength(1);
+    expect((await store.tasks.listAttempts(absentTask.id))[0]?.status).toBe("failed");
+    expect(writes.status(workspace.id)).toBe("free");
   } finally {
     await store.close();
     await rm(directory, { recursive: true, force: true, maxRetries: 2, retryDelay: 50 }).catch(
