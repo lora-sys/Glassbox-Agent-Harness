@@ -1,4 +1,5 @@
 import { mkdtemp, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vite-plus/test";
@@ -240,7 +241,7 @@ describe("internal Task Step Runs", () => {
       source: "task_step",
     });
     await reopened.transaction(async (tx) => {
-      expect(Number((await tx.execute("PRAGMA user_version")).rows[0]?.user_version)).toBe(20);
+      expect(Number((await tx.execute("PRAGMA user_version")).rows[0]?.user_version)).toBe(21);
       expect(
         (await tx.execute("SELECT attempt_id,run_id,task_id,step_id FROM task_attempt_runs"))
           .rows[0],
@@ -424,6 +425,51 @@ describe("internal Task Step Runs", () => {
     await expect(conversations.loadRunInput(caller, followUp.id)).rejects.toMatchObject({
       decision: { reason: "no_grant" },
     });
+  });
+
+  it("hands a declared Worker text file to a dependent Model only under current source grants", async () => {
+    const { db, conversations } = await fixture();
+    const followUp = await addWorkerFollowUp(db, conversations);
+    const content = "F".repeat(2_200);
+    await db.transaction(async (tx) => {
+      await tx.execute(
+        "UPDATE task_steps SET spec_ref='worker:text-file:result.md' WHERE id='step-1'",
+      );
+      await tx.execute({
+        sql: "INSERT INTO worker_file_artifacts(attempt_id,task_id,step_id,worker_binding_id,relative_path,content_text,content_sha256,created_at) VALUES ('attempt-1','task-1','step-1','worker-binding-1','result.md',?,?,?)",
+        args: [content, createHash("sha256").update(content).digest("hex"), time],
+      });
+    });
+    expect((await conversations.loadRunInput(caller, followUp.id)).stepResults).toEqual([
+      {
+        stepId: "step-1",
+        sourceRef: "worker-file:attempt-1",
+        text: content.slice(0, 2_048),
+        truncated: true,
+      },
+    ]);
+    await db.transaction(async (tx) => {
+      await tx.execute({
+        sql: "UPDATE grants SET revoked_at=? WHERE id='grant-workspace-read'",
+        args: [time],
+      });
+    });
+    await expect(conversations.loadRunInput(caller, followUp.id)).rejects.toMatchObject({
+      decision: { reason: "no_grant" },
+    });
+  });
+
+  it("does not substitute terminal output for a missing declared Worker file", async () => {
+    const { db, conversations } = await fixture();
+    const followUp = await addWorkerFollowUp(db, conversations);
+    await db.transaction(async (tx) => {
+      await tx.execute(
+        "UPDATE task_steps SET spec_ref='worker:text-file:result.md' WHERE id='step-1'",
+      );
+    });
+    await expect(conversations.loadRunInput(caller, followUp.id)).rejects.toThrow(
+      "Accepted Worker file artifact is unavailable",
+    );
   });
 
   it("rejects a Worker candidate with the wrong reference or binding", async () => {
@@ -874,11 +920,22 @@ describe("internal Task Step Runs", () => {
       executionRef: "pi:default",
     });
 
+    const childFile = "Accepted child Worker file content";
+    await db.transaction(async (tx) => {
+      await tx.execute(
+        "UPDATE task_steps SET spec_ref='worker:text-file:child-result.md' WHERE id='child-worker'",
+      );
+      await tx.execute({
+        sql: "INSERT INTO worker_file_artifacts(attempt_id,task_id,step_id,worker_binding_id,relative_path,content_text,content_sha256,created_at) VALUES ('child-attempt','child-1','child-worker','child-binding','child-result.md',?,?,?)",
+        args: [childFile, createHash("sha256").update(childFile).digest("hex"), time],
+      });
+    });
+
     expect((await conversations.loadRunInput(caller, parentRun.id)).stepResults).toEqual([
       {
         stepId: "step-1",
-        sourceRef: "worker-result:child-attempt",
-        text: "Child Worker finding",
+        sourceRef: "worker-file:child-attempt",
+        text: childFile,
         truncated: false,
       },
     ]);

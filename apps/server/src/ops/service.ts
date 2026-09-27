@@ -374,6 +374,7 @@ export class AuthorizedOpsService {
       acceptanceCriteria: readonly string[];
       cancellationPolicy: ChildTaskLink["cancellationPolicy"];
       failurePolicy: ChildTaskLink["failurePolicy"];
+      parentNotificationPolicy?: ChildTaskLink["parentNotificationPolicy"];
     },
     evidence?: RunEvidence,
   ): Promise<ChildTaskLink> {

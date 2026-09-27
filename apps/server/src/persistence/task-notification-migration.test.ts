@@ -4,11 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DomainDatabase } from "./database.js";
 
-it("creates an event-keyed Task notification outbox in schema v18", async () => {
+it("creates an event-keyed Task notification outbox with parent routing", async () => {
   const db = await DomainDatabase.open(":memory:");
   try {
     await db.transaction(async (tx) => {
-      expect(Number((await tx.execute("PRAGMA user_version")).rows[0]?.user_version)).toBe(20);
+      expect(Number((await tx.execute("PRAGMA user_version")).rows[0]?.user_version)).toBe(21);
       const columns = await tx.execute("PRAGMA table_info(task_notifications)");
       expect(columns.rows.map((row) => row.name)).toEqual([
         "id",
@@ -26,6 +26,7 @@ it("creates an event-keyed Task notification outbox in schema v18", async () => 
         "external_id",
         "created_at",
         "updated_at",
+        "routing_parent_task_id",
       ]);
       expect(
         (
@@ -34,6 +35,10 @@ it("creates an event-keyed Task notification outbox in schema v18", async () => 
           )
         ).rows,
       ).toHaveLength(1);
+      const childLinkColumns = await tx.execute("PRAGMA table_info(task_child_links)");
+      expect(
+        childLinkColumns.rows.find((row) => row.name === "parent_notification_policy"),
+      ).toMatchObject({ dflt_value: "'suppress'", notnull: 1 });
     });
   } finally {
     await db.close();
@@ -54,7 +59,7 @@ it("adds immutable Worker candidate output storage when upgrading schema v16", a
     const upgraded = await DomainDatabase.open(databasePath);
     try {
       await upgraded.transaction(async (tx) => {
-        expect((await tx.execute("PRAGMA user_version")).rows[0]?.user_version).toBe(20);
+        expect((await tx.execute("PRAGMA user_version")).rows[0]?.user_version).toBe(21);
         expect(
           (await tx.execute("PRAGMA table_info(worker_candidate_outputs)")).rows.map(
             (row) => row.name,

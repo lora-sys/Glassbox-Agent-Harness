@@ -267,6 +267,10 @@ function parseChildTaskLink(row: Row): ChildTaskLink {
     acceptanceCriteria: parseJson(row, "acceptance_criteria_json"),
     cancellationPolicy: stringColumn(row, "cancel_policy") as ChildTaskLink["cancellationPolicy"],
     failurePolicy: stringColumn(row, "failure_policy") as ChildTaskLink["failurePolicy"],
+    parentNotificationPolicy: stringColumn(
+      row,
+      "parent_notification_policy",
+    ) as ChildTaskLink["parentNotificationPolicy"],
     resultRef: optionalString(row, "result_ref") ?? undefined,
     createdAt: stringColumn(row, "created_at"),
   };
@@ -2966,6 +2970,7 @@ export class LongWorkStore {
     acceptanceCriteria: readonly string[];
     cancellationPolicy: ChildTaskLink["cancellationPolicy"];
     failurePolicy: ChildTaskLink["failurePolicy"];
+    parentNotificationPolicy?: ChildTaskLink["parentNotificationPolicy"];
     origin: LongWorkOrigin;
   }): Promise<ChildTaskLink> {
     for (const value of [input.parentTaskId, input.parentStepId, input.childTaskId])
@@ -2976,7 +2981,9 @@ export class LongWorkStore {
       !Number.isSafeInteger(input.expectedStepVersion) ||
       input.expectedStepVersion < 1 ||
       !["cancel_child", "keep_child"].includes(input.cancellationPolicy) ||
-      !["block_parent", "fail_parent", "review_parent"].includes(input.failurePolicy)
+      !["block_parent", "fail_parent", "review_parent"].includes(input.failurePolicy) ||
+      (input.parentNotificationPolicy !== undefined &&
+        !["suppress", "notify_parent"].includes(input.parentNotificationPolicy))
     )
       throw new Error("Invalid child Task link");
     boundedDelegatedPermissions(input.delegatedPermissionSet, "child delegated permissions");
@@ -3191,8 +3198,8 @@ export class LongWorkStore {
       const inserted = await tx.execute({
         sql: `INSERT INTO task_child_links(
             child_task_id,parent_task_id,parent_step_id,delegated_permissions_json,
-            acceptance_criteria_json,cancel_policy,failure_policy,created_at
-          ) VALUES (?,?,?,?,?,?,?,?) RETURNING *`,
+            acceptance_criteria_json,cancel_policy,failure_policy,parent_notification_policy,created_at
+          ) VALUES (?,?,?,?,?,?,?,?,?) RETURNING *`,
         args: [
           input.childTaskId,
           input.parentTaskId,
@@ -3201,6 +3208,7 @@ export class LongWorkStore {
           acceptanceCriteriaJson,
           input.cancellationPolicy,
           input.failurePolicy,
+          input.parentNotificationPolicy ?? "suppress",
           now,
         ],
       });

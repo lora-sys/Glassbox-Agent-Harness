@@ -17,6 +17,7 @@ import {
 } from "../identity/scope.js";
 import { DomainDatabase, optionalString, stringColumn } from "../persistence/database.js";
 import { parseCheckpointWriteSpec, parseTaskGetSpec } from "../ops/tool-step-spec.js";
+import { parseWorkerTextFileSpec } from "../ops/worker-file-spec.js";
 
 export type RunStatus =
   | "queued"
@@ -1075,7 +1076,7 @@ export class ConversationStore {
               const candidateRows = await tx.execute({
                 sql: `SELECT candidate.task_id,candidate.step_id,candidate.attempt_id,
                     candidate.worker_binding_id,candidate.output_excerpt,candidate.truncated,
-                    step.delegated_permissions_json
+                    step.delegated_permissions_json,step.spec_ref
                   FROM worker_candidate_outputs candidate
                   JOIN task_attempts attempt ON attempt.id = candidate.attempt_id
                     AND attempt.task_id = candidate.task_id AND attempt.step_id = candidate.step_id
@@ -1186,6 +1187,35 @@ export class ConversationStore {
                   sql: "UPDATE authorization_decisions SET delivery_source = 'content_source' WHERE id = ?",
                   args: [decision.id],
                 });
+              const specRef = optionalString(candidate, "spec_ref");
+              if (specRef) {
+                const spec = parseWorkerTextFileSpec(specRef);
+                if (!spec) throw new Error("Accepted Worker file specification is unavailable");
+                const artifactRows = await tx.execute({
+                  sql: `SELECT artifact.relative_path,artifact.content_text
+                    FROM worker_file_artifacts artifact
+                    WHERE artifact.task_id = ? AND artifact.step_id = ? AND artifact.attempt_id = ?
+                      AND artifact.worker_binding_id = ?`,
+                  args: [
+                    sourceTaskId,
+                    sourceStepId,
+                    attemptId,
+                    stringColumn(candidate, "worker_binding_id"),
+                  ],
+                });
+                const artifact = artifactRows.rows[0];
+                if (!artifact || stringColumn(artifact, "relative_path") !== spec.relativePath)
+                  throw new Error("Accepted Worker file artifact is unavailable");
+                const fileText = stringColumn(artifact, "content_text");
+                return {
+                  result: {
+                    stepId: sourceStepId,
+                    sourceRef: `worker-file:${attemptId}`,
+                    text: fileText.slice(0, 2_048),
+                    truncated: fileText.length > 2_048,
+                  },
+                };
+              }
               const text = stringColumn(candidate, "output_excerpt");
               return {
                 result: {

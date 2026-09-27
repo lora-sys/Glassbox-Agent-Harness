@@ -271,6 +271,23 @@ export const schemaV20Migration = [
   `CREATE TRIGGER IF NOT EXISTS worker_launch_intents_no_delete BEFORE DELETE ON worker_launch_intents BEGIN SELECT RAISE(ABORT,'worker launch intents are immutable'); END`,
 ];
 
+export async function applySchemaV21Migration(tx: Transaction): Promise<void> {
+  const childLinkColumns = await tx.execute("PRAGMA table_info(task_child_links)");
+  if (!childLinkColumns.rows.some((row) => row.name === "parent_notification_policy"))
+    await tx.execute(
+      "ALTER TABLE task_child_links ADD COLUMN parent_notification_policy TEXT NOT NULL DEFAULT 'suppress' CHECK(parent_notification_policy IN ('suppress','notify_parent'))",
+    );
+  const notificationColumns = await tx.execute("PRAGMA table_info(task_notifications)");
+  if (!notificationColumns.rows.some((row) => row.name === "routing_parent_task_id"))
+    await tx.execute(
+      "ALTER TABLE task_notifications ADD COLUMN routing_parent_task_id TEXT REFERENCES tasks(id)",
+    );
+  await tx.execute("DROP TRIGGER IF EXISTS task_notifications_payload_immutable");
+  await tx.execute(
+    `CREATE TRIGGER task_notifications_payload_immutable BEFORE UPDATE ON task_notifications WHEN NEW.event_sequence <> OLD.event_sequence OR NEW.task_id <> OLD.task_id OR NEW.origin_run_id <> OLD.origin_run_id OR NEW.conversation_id <> OLD.conversation_id OR NEW.principal_id <> OLD.principal_id OR NEW.destination_scope_key <> OLD.destination_scope_key OR NEW.destination_scope_json <> OLD.destination_scope_json OR NEW.event_type <> OLD.event_type OR NEW.payload_text <> OLD.payload_text OR NEW.payload_kind <> OLD.payload_kind OR NEW.routing_parent_task_id IS NOT OLD.routing_parent_task_id OR NEW.created_at <> OLD.created_at BEGIN SELECT RAISE(ABORT,'task notification payload is immutable'); END`,
+  );
+}
+
 export const schema = [
   ...baseSchema,
   ...schemaV7Statements,

@@ -176,6 +176,7 @@ export interface ChildTaskLink {
   acceptanceCriteria: readonly string[];
   cancellationPolicy: "cancel_child" | "keep_child";
   failurePolicy: "block_parent" | "fail_parent" | "review_parent";
+  parentNotificationPolicy: "suppress" | "notify_parent";
   resultRef?: string;
   createdAt: string;
 }

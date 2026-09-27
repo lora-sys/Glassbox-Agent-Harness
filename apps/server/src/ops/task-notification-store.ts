@@ -38,6 +38,7 @@ export interface TaskNotificationRecord {
   principalId: string;
   destination: TrustedChannelScope;
   destinationScopeKey: string;
+  routingParentTaskId: string | null;
   payloadText: string;
   payloadKind: "text";
   status: TaskNotificationStatus;
@@ -63,6 +64,7 @@ const notificationText: Record<
 };
 
 const eventTypes = Object.keys(notificationText) as TaskNotificationEventType[];
+const parentRouteEvents = new Set(["TASK_ACCEPTED", "TASK_BLOCKED", "STEP_BLOCKED", "STEP_FAILED"]);
 
 function parseStoredScope(value: string): TrustedChannelScope {
   const parsed: unknown = JSON.parse(value);
@@ -96,6 +98,7 @@ function notificationRecord(row: Row): TaskNotificationRecord {
     principalId: stringColumn(row, "principal_id"),
     destination,
     destinationScopeKey,
+    routingParentTaskId: optionalString(row, "routing_parent_task_id"),
     payloadText: stringColumn(row, "payload_text"),
     payloadKind: "text",
     status: stringColumn(row, "status") as TaskNotificationStatus,
@@ -125,17 +128,63 @@ export class TaskNotificationStore {
     if (!eventTypes.includes(eventType as TaskNotificationEventType)) return null;
 
     const taskId = stringColumn(row, "task_id");
-    const principalId = stringColumn(row, "creator_principal_id");
-    const conversationId = optionalString(row, "conversation_id");
-    const runId = optionalString(row, "run_id");
-    const originScopeKey = optionalString(row, "origin_scope_key");
-    const originScopeJson = optionalString(row, "origin_scope_json");
-    if (!conversationId || !runId || !originScopeKey || !originScopeJson || !row.run_scope_json)
+    const taskPrincipalId = stringColumn(row, "creator_principal_id");
+    let principalId = taskPrincipalId;
+    let conversationId = optionalString(row, "conversation_id");
+    let runId = optionalString(row, "run_id");
+    let originScopeKey = optionalString(row, "origin_scope_key");
+    let originScopeJson = optionalString(row, "origin_scope_json");
+    let runPrincipalId = row.run_principal_id;
+    let runConversationId = row.run_conversation_id;
+    let runSource = row.run_source;
+    let runScopeJson = row.run_scope_json;
+    let routingParentTaskId: string | null = null;
+    const linkResult = await tx.execute({
+      sql: "SELECT parent_task_id,parent_notification_policy FROM task_child_links WHERE child_task_id = ?",
+      args: [taskId],
+    });
+    const link = linkResult.rows[0];
+    const optedIntoParentRoute = link?.parent_notification_policy === "notify_parent";
+    // A failed child Step can need attention before the child Task reaches a
+    // terminal status. The parent's later failure event is separate evidence.
+    if (optedIntoParentRoute && parentRouteEvents.has(eventType)) {
+      const parentResult = await tx.execute({
+        sql: `SELECT p.creator_principal_id,p.conversation_id,p.run_id,p.origin_scope_key,p.origin_scope_json,
+                     r.principal_id AS run_principal_id,r.conversation_id AS run_conversation_id,
+                     r.source AS run_source,r.scope_json AS run_scope_json
+              FROM tasks p LEFT JOIN runs r ON r.id = p.run_id WHERE p.id = ?`,
+        args: [stringColumn(link!, "parent_task_id")],
+      });
+      const parent = parentResult.rows[0];
+      if (!parent) return null;
+      principalId = stringColumn(parent, "creator_principal_id");
+      conversationId = optionalString(parent, "conversation_id");
+      runId = optionalString(parent, "run_id");
+      originScopeKey = optionalString(parent, "origin_scope_key");
+      originScopeJson = optionalString(parent, "origin_scope_json");
+      runPrincipalId = parent.run_principal_id;
+      runConversationId = parent.run_conversation_id;
+      runSource = parent.run_source;
+      runScopeJson = parent.run_scope_json;
+      routingParentTaskId = stringColumn(link!, "parent_task_id");
+      if (
+        principalId !== taskPrincipalId ||
+        originScopeKey !== optionalString(row, "origin_scope_key")
+      )
+        return null;
+    }
+    if (
+      !conversationId ||
+      !runId ||
+      !originScopeKey ||
+      !originScopeJson ||
+      typeof runScopeJson !== "string"
+    )
       return null;
     if (
-      row.run_source !== "external" ||
-      row.run_principal_id !== principalId ||
-      row.run_conversation_id !== conversationId
+      runSource !== "external" ||
+      runPrincipalId !== principalId ||
+      runConversationId !== conversationId
     )
       return null;
 
@@ -143,7 +192,18 @@ export class TaskNotificationStore {
     let runScope: TrustedChannelScope;
     try {
       taskScope = reconstructTaskOriginScope(originScopeKey, originScopeJson);
-      runScope = parseStoredScope(stringColumn(row, "run_scope_json"));
+      runScope = parseStoredScope(runScopeJson);
+      if (routingParentTaskId) {
+        const childScope = reconstructTaskOriginScope(
+          stringColumn(row, "origin_scope_key"),
+          stringColumn(row, "origin_scope_json"),
+        );
+        if (
+          scopeKey(childScope) !== originScopeKey ||
+          conversationScopeKey(childScope) !== conversationScopeKey(taskScope)
+        )
+          return null;
+      }
     } catch {
       // Invalid historical routing data cannot authorize a notification. Keep the
       // Task event durable even when its optional notification cannot be sent.
@@ -155,7 +215,6 @@ export class TaskNotificationStore {
       conversationScopeKey(runScope) !== conversationScopeKey(taskScope)
     )
       return null;
-
     const stepId = optionalString(row, "step_id");
     const payloadText = notificationText[eventType as TaskNotificationEventType](taskId, stepId);
     const now = new Date().toISOString();
@@ -163,8 +222,8 @@ export class TaskNotificationStore {
       sql: `INSERT INTO task_notifications(
               id,event_sequence,task_id,origin_run_id,conversation_id,principal_id,
               destination_scope_key,destination_scope_json,event_type,payload_text,payload_kind,
-              status,created_at,updated_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,'text','pending',?,?) ON CONFLICT(event_sequence) DO NOTHING`,
+              routing_parent_task_id,status,created_at,updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,'text',?,'pending',?,?) ON CONFLICT(event_sequence) DO NOTHING`,
       args: [
         randomUUID(),
         eventSequence,
@@ -176,6 +235,7 @@ export class TaskNotificationStore {
         JSON.stringify(taskScope),
         eventType,
         payloadText,
+        routingParentTaskId,
         now,
         now,
       ],
@@ -192,7 +252,8 @@ export class TaskNotificationStore {
       record.principalId !== principalId ||
       record.eventType !== eventType ||
       record.payloadText !== payloadText ||
-      record.destinationScopeKey !== originScopeKey
+      record.destinationScopeKey !== originScopeKey ||
+      record.routingParentTaskId !== routingParentTaskId
     )
       throw new Error("Task notification event is already bound to different immutable data");
     return record;
@@ -241,25 +302,65 @@ export class TaskNotificationStore {
       let originMatches = false;
       try {
         if (row) {
-          const storedRunScope =
-            typeof row.run_scope_json === "string" ? parseStoredScope(row.run_scope_json) : null;
-          originMatches =
-            row.creator_principal_id === notification.principalId &&
-            row.conversation_id === notification.conversationId &&
-            row.run_id === notification.runId &&
-            row.run_principal_id === notification.principalId &&
-            row.run_conversation_id === notification.conversationId &&
-            row.run_source === "external" &&
-            row.origin_scope_key === notification.destinationScopeKey &&
-            typeof row.origin_scope_json === "string" &&
-            scopeKey(
-              reconstructTaskOriginScope(
-                stringColumn(row, "origin_scope_key"),
-                stringColumn(row, "origin_scope_json"),
-              ),
-            ) === notification.destinationScopeKey &&
-            storedRunScope !== null &&
-            scopeKey(storedRunScope) === notification.destinationScopeKey;
+          const childScope = reconstructTaskOriginScope(
+            stringColumn(row, "origin_scope_key"),
+            stringColumn(row, "origin_scope_json"),
+          );
+          if (notification.routingParentTaskId) {
+            const parentResult = await tx.execute({
+              sql: `SELECT p.creator_principal_id,p.conversation_id,p.run_id,p.origin_scope_key,p.origin_scope_json,
+                           r.principal_id AS run_principal_id,r.conversation_id AS run_conversation_id,
+                           r.source AS run_source,r.scope_json AS run_scope_json
+                    FROM task_child_links l JOIN tasks p ON p.id = l.parent_task_id
+                    LEFT JOIN runs r ON r.id = p.run_id
+                    WHERE l.child_task_id = ? AND l.parent_task_id = ?
+                      AND l.parent_notification_policy = 'notify_parent'`,
+              args: [notification.taskId, notification.routingParentTaskId],
+            });
+            const parent = parentResult.rows[0];
+            const parentScope = parent
+              ? reconstructTaskOriginScope(
+                  stringColumn(parent, "origin_scope_key"),
+                  stringColumn(parent, "origin_scope_json"),
+                )
+              : null;
+            const parentRunScope =
+              parent && typeof parent.run_scope_json === "string"
+                ? parseStoredScope(parent.run_scope_json)
+                : null;
+            originMatches =
+              parent !== undefined &&
+              parentRouteEvents.has(notification.eventType) &&
+              row.creator_principal_id === notification.principalId &&
+              row.origin_scope_key === notification.destinationScopeKey &&
+              scopeKey(childScope) === notification.destinationScopeKey &&
+              parent.creator_principal_id === notification.principalId &&
+              parent.conversation_id === notification.conversationId &&
+              parent.run_id === notification.runId &&
+              parent.run_principal_id === notification.principalId &&
+              parent.run_conversation_id === notification.conversationId &&
+              parent.run_source === "external" &&
+              parent.origin_scope_key === notification.destinationScopeKey &&
+              parentScope !== null &&
+              scopeKey(parentScope) === notification.destinationScopeKey &&
+              conversationScopeKey(childScope) === conversationScopeKey(parentScope) &&
+              parentRunScope !== null &&
+              scopeKey(parentRunScope) === notification.destinationScopeKey;
+          } else {
+            const storedRunScope =
+              typeof row.run_scope_json === "string" ? parseStoredScope(row.run_scope_json) : null;
+            originMatches =
+              row.creator_principal_id === notification.principalId &&
+              row.conversation_id === notification.conversationId &&
+              row.run_id === notification.runId &&
+              row.run_principal_id === notification.principalId &&
+              row.run_conversation_id === notification.conversationId &&
+              row.run_source === "external" &&
+              row.origin_scope_key === notification.destinationScopeKey &&
+              scopeKey(childScope) === notification.destinationScopeKey &&
+              storedRunScope !== null &&
+              scopeKey(storedRunScope) === notification.destinationScopeKey;
+          }
         }
       } catch {
         originMatches = false;
@@ -317,8 +418,14 @@ export class TaskNotificationStore {
         caller,
         resourceId: `task-${notification.taskId}`,
         action: "task:read",
-        conversationId: notification.conversationId,
-        runId: notification.runId,
+        ...(notification.routingParentTaskId && row
+          ? {
+              ...(optionalString(row, "conversation_id")
+                ? { conversationId: optionalString(row, "conversation_id")! }
+                : {}),
+              ...(optionalString(row, "run_id") ? { runId: optionalString(row, "run_id")! } : {}),
+            }
+          : { conversationId: notification.conversationId, runId: notification.runId }),
       });
       const runDelivery = await authorizeRun(tx, caller, notification.runId, "delivery:send");
       const authorized =

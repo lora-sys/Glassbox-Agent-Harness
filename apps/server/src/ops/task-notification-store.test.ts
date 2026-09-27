@@ -1,4 +1,8 @@
 import { afterEach, expect, it } from "vite-plus/test";
+import { randomUUID } from "node:crypto";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   agentResourceId,
   openDomainStore,
@@ -17,8 +21,8 @@ const scope = {
 const caller: CallerContext = { principalId: "owner", scope };
 const stores: DomainStore[] = [];
 
-async function fixture() {
-  const domain = await openDomainStore({ databasePath: ":memory:" });
+async function fixture(databasePath = ":memory:") {
+  const domain = await openDomainStore({ databasePath });
   stores.push(domain);
   await domain.conversations.createAgent("personal");
   await domain.identities.bindOwner(caller.principalId, scope);
@@ -56,6 +60,46 @@ async function fixture() {
   return { domain, incoming, task, notifications };
 }
 
+async function linkChildToParent(
+  domain: DomainStore,
+  childTaskId: string,
+  parentNotificationPolicy: "suppress" | "notify_parent",
+) {
+  const parentIncoming = await domain.conversations.acceptIncoming({
+    agentId: "personal",
+    scope,
+    messageId: `parent-notification-${randomUUID()}`,
+    text: "Create parent Task",
+    executionRef: "test-runner",
+  });
+  const parent = await domain.tasks.createTask({
+    id: `parent-${randomUUID()}`,
+    title: "Parent Task",
+    creatorPrincipalId: caller.principalId,
+    conversationId: parentIncoming.conversation.id,
+    runId: parentIncoming.run.id,
+    authorizationScope: scope,
+  });
+  await domain.db.transaction(async (tx) => {
+    const now = new Date().toISOString();
+    await tx.execute({
+      sql: `INSERT INTO task_steps(
+              id,task_id,kind,title,status,dependency_policy_json,max_attempts,
+              required_capabilities_json,delegated_permissions_json,version,created_at,updated_at
+            ) VALUES (?,?, 'child_task','Child Task','running','{}',1,'[]','[]',1,?,?)`,
+      args: [`parent-step-${parent.id}`, parent.id, now, now],
+    });
+    await tx.execute({
+      sql: `INSERT INTO task_child_links(
+              child_task_id,parent_task_id,parent_step_id,delegated_permissions_json,
+              acceptance_criteria_json,cancel_policy,failure_policy,parent_notification_policy,created_at
+            ) VALUES (?,?,?,'[]','[]','keep_child','block_parent',?,?)`,
+      args: [childTaskId, parent.id, `parent-step-${parent.id}`, parentNotificationPolicy, now],
+    });
+  });
+  return { parent, parentIncoming };
+}
+
 async function appendEvent(
   domain: DomainStore,
   taskId: string,
@@ -83,7 +127,7 @@ async function appendEvent(
     }
     const result = await tx.execute({
       sql: "INSERT INTO task_events(id,task_id,step_id,type,metadata_json,created_at) VALUES (?,?,?,?,?,?) RETURNING sequence",
-      args: [`event-${type}-${Date.now()}`, taskId, stepId, type, "{}", new Date().toISOString()],
+      args: [`event-${randomUUID()}`, taskId, stepId, type, "{}", new Date().toISOString()],
     });
     return Number(result.rows[0]!.sequence);
   });
@@ -177,6 +221,190 @@ it("suppresses a pending notification after delivery permission is revoked", asy
   expect(state.notification.rows[0]?.status).toBe("suppressed");
   expect(state.denial.rows[0]).toMatchObject({ decision: "DENY", action: "delivery:send" });
   expect(await notifications.listUndelivered()).toEqual([]);
+});
+
+it("routes an opted-in child acceptance through the parent origin after restart", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "glassbox-child-notice-restart-"));
+  const databasePath = join(directory, "glassbox.db");
+  let activeDomain: DomainStore | undefined;
+  try {
+    const { domain, task } = await fixture(databasePath);
+    activeDomain = domain;
+    const { parent, parentIncoming } = await linkChildToParent(domain, task.id, "notify_parent");
+    await domain.db.transaction((tx) =>
+      tx.execute({ sql: "UPDATE tasks SET status = 'DONE' WHERE id = ?", args: [task.id] }),
+    );
+    const sequence = await appendEvent(domain, task.id, "TASK_ACCEPTED");
+    const notification = await domain.db.transaction((tx) =>
+      new TaskNotificationStore(domain.db).enqueueTx(tx, sequence),
+    );
+    expect(notification).toMatchObject({
+      taskId: task.id,
+      eventType: "TASK_ACCEPTED",
+      runId: parentIncoming.run.id,
+      conversationId: parentIncoming.conversation.id,
+      routingParentTaskId: parent.id,
+      destinationScopeKey: expect.any(String),
+    });
+
+    stores.splice(stores.indexOf(domain), 1);
+    await domain.close();
+    activeDomain = undefined;
+    const reopened = await openDomainStore({ databasePath });
+    activeDomain = reopened;
+    stores.push(reopened);
+    const persisted = await reopened.db.transaction(async (tx) =>
+      tx.execute({
+        sql: "SELECT * FROM task_notifications WHERE id = ?",
+        args: [notification!.id],
+      }),
+    );
+    const afterRestart = (await new TaskNotificationStore(reopened.db).listUndelivered())[0];
+    expect(persisted.rows[0]?.routing_parent_task_id).toBe(parent.id);
+    expect(afterRestart).toMatchObject({
+      runId: parentIncoming.run.id,
+      routingParentTaskId: parent.id,
+    });
+
+    const lease = await new TaskNotificationStore(reopened.db).claim(caller, notification!.id);
+    expect(lease?.notification).toMatchObject({
+      taskId: task.id,
+      runId: parentIncoming.run.id,
+      routingParentTaskId: parent.id,
+    });
+    await lease?.settle("sent", "external-parent-notice");
+  } finally {
+    if (activeDomain) {
+      stores.splice(stores.indexOf(activeDomain), 1);
+      await activeDomain.close();
+    }
+    await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }).catch(
+      (error: NodeJS.ErrnoException) => {
+        if (process.platform !== "win32" || error.code !== "EBUSY") throw error;
+      },
+    );
+  }
+});
+
+it("rechecks the linked parent delivery grant at claim time", async () => {
+  const { domain, task } = await fixture();
+  const { parent } = await linkChildToParent(domain, task.id, "notify_parent");
+  await domain.db.transaction((tx) =>
+    tx.execute({ sql: "UPDATE tasks SET status = 'WAITING_INPUT' WHERE id = ?", args: [task.id] }),
+  );
+  const sequence = await appendEvent(domain, task.id, "TASK_BLOCKED");
+  const notification = await domain.db.transaction((tx) =>
+    new TaskNotificationStore(domain.db).enqueueTx(tx, sequence),
+  );
+  expect(notification?.routingParentTaskId).toBe(parent.id);
+
+  await domain.authorization.revokeScopeAction({
+    principalId: caller.principalId,
+    resourceId: agentResourceId("personal"),
+    action: "delivery:send",
+    scope,
+  });
+  expect(await new TaskNotificationStore(domain.db).claim(caller, notification!.id)).toBeNull();
+  const status = await domain.db.transaction((tx) =>
+    tx.execute({
+      sql: "SELECT status FROM task_notifications WHERE id = ?",
+      args: [notification!.id],
+    }),
+  );
+  expect(status.rows[0]?.status).toBe("suppressed");
+});
+
+it("suppresses an opted-in notice when child read is revoked or the link policy changes", async () => {
+  const readFixture = await fixture();
+  await linkChildToParent(readFixture.domain, readFixture.task.id, "notify_parent");
+  await readFixture.domain.db.transaction((tx) =>
+    tx.execute({
+      sql: "UPDATE tasks SET status = 'DONE' WHERE id = ?",
+      args: [readFixture.task.id],
+    }),
+  );
+  const acceptedSequence = await appendEvent(
+    readFixture.domain,
+    readFixture.task.id,
+    "TASK_ACCEPTED",
+  );
+  const acceptedNotice = await readFixture.domain.db.transaction((tx) =>
+    readFixture.notifications.enqueueTx(tx, acceptedSequence),
+  );
+  await readFixture.domain.authorization.revokeScopeAction({
+    principalId: caller.principalId,
+    resourceId: `task-${readFixture.task.id}`,
+    action: "task:read",
+    scope,
+  });
+  expect(await readFixture.notifications.claim(caller, acceptedNotice!.id)).toBeNull();
+
+  const policyFixture = await fixture();
+  const { parent: policyParent } = await linkChildToParent(
+    policyFixture.domain,
+    policyFixture.task.id,
+    "notify_parent",
+  );
+  await policyFixture.domain.db.transaction((tx) =>
+    tx.execute({
+      sql: "UPDATE tasks SET status = 'WAITING_INPUT' WHERE id = ?",
+      args: [policyFixture.task.id],
+    }),
+  );
+  const blockedSequence = await appendEvent(
+    policyFixture.domain,
+    policyFixture.task.id,
+    "TASK_BLOCKED",
+  );
+  const blockedNotice = await policyFixture.domain.db.transaction((tx) =>
+    policyFixture.notifications.enqueueTx(tx, blockedSequence),
+  );
+  await policyFixture.domain.db.transaction((tx) =>
+    tx.execute({
+      sql: "UPDATE task_child_links SET parent_notification_policy = 'suppress' WHERE child_task_id = ? AND parent_task_id = ?",
+      args: [policyFixture.task.id, policyParent.id],
+    }),
+  );
+  expect(await policyFixture.notifications.claim(caller, blockedNotice!.id)).toBeNull();
+});
+
+it("routes blocked and failed child Steps before the parent observes their outcome", async () => {
+  const { domain, task } = await fixture();
+  const { parent } = await linkChildToParent(domain, task.id, "notify_parent");
+  const notifications = new TaskNotificationStore(domain.db);
+
+  const blockedStep = await appendEvent(domain, task.id, "STEP_BLOCKED", "child-blocked-step");
+  const blockedNotice = await domain.db.transaction((tx) =>
+    notifications.enqueueTx(tx, blockedStep),
+  );
+  expect(blockedNotice).toMatchObject({
+    taskId: task.id,
+    eventType: "STEP_BLOCKED",
+    routingParentTaskId: parent.id,
+  });
+
+  const childFailure = await appendEvent(domain, task.id, "STEP_FAILED", "child-failed-step");
+  expect(
+    await domain.db.transaction((tx) => notifications.enqueueTx(tx, childFailure)),
+  ).toMatchObject({
+    taskId: task.id,
+    eventType: "STEP_FAILED",
+    routingParentTaskId: parent.id,
+  });
+  const parentFailure = await appendEvent(
+    domain,
+    parent.id,
+    "STEP_FAILED",
+    `parent-step-${parent.id}`,
+  );
+  const parentFailureNotice = await domain.db.transaction((tx) =>
+    notifications.enqueueTx(tx, parentFailure),
+  );
+  expect(parentFailureNotice).toMatchObject({
+    taskId: parent.id,
+    eventType: "STEP_FAILED",
+    routingParentTaskId: null,
+  });
 });
 
 it("suppresses a notification claimed for a different audience", async () => {

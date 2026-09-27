@@ -959,6 +959,7 @@ it("links a pristine same-scope child Task with no delegated permissions", async
       acceptanceCriteria: ["Return a verified result"],
       cancellationPolicy: "cancel_child",
       failurePolicy: "review_parent",
+      parentNotificationPolicy: "notify_parent",
       origin: claimOrigin,
     });
     expect(link).toMatchObject({
@@ -969,6 +970,7 @@ it("links a pristine same-scope child Task with no delegated permissions", async
       acceptanceCriteria: ["Return a verified result"],
       cancellationPolicy: "cancel_child",
       failurePolicy: "review_parent",
+      parentNotificationPolicy: "notify_parent",
     });
     expect((await store.listSteps("task-1"))[0]).toMatchObject({ status: "running", version: 3 });
     const childCriteria = await db.transaction((tx) =>
@@ -1117,7 +1119,8 @@ it("rejects duplicate child links and bounds child acceptance criteria", async (
       failurePolicy: "review_parent" as const,
       origin: claimOrigin,
     };
-    await store.createChildTaskLink(request);
+    const link = await store.createChildTaskLink(request);
+    expect(link.parentNotificationPolicy).toBe("suppress");
     await expect(store.createChildTaskLink(request)).rejects.toThrow();
     await expect(
       store.createChildTaskLink({

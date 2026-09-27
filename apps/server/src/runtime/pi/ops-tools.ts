@@ -308,11 +308,12 @@ export function createOpsTools(options: {
       acceptanceCriteria: string[];
       cancellationPolicy: "cancel_child" | "keep_child";
       failurePolicy: "block_parent" | "fail_parent" | "review_parent";
+      parentNotificationPolicy?: "suppress" | "notify_parent";
     }>({
       ...common,
       name: "task_link_child",
       description:
-        "Link a new same-owner child Task to a ready parent child_task Step. The child receives only the Step's delegated permissions.",
+        "Link a new same-owner child Task to a ready parent child_task Step. The child receives only the Step's delegated permissions. Set parentNotificationPolicy to notify_parent to route child acceptance, blocked, and failed Step notices through the parent Task's origin audience.",
       parameters: Type.Object(
         {
           parentTaskId: taskId,
@@ -332,6 +333,9 @@ export function createOpsTools(options: {
             Type.Literal("fail_parent"),
             Type.Literal("review_parent"),
           ]),
+          parentNotificationPolicy: Type.Optional(
+            Type.Union([Type.Literal("suppress"), Type.Literal("notify_parent")]),
+          ),
         },
         { additionalProperties: false },
       ),
