@@ -420,6 +420,131 @@ export class LongWorkStore {
     });
   }
 
+  /** Settles a claimed external attempt under its exclusive lease. Unknown outcomes stay blocked. */
+  async settleClaimedStep(input: {
+    taskId: string;
+    stepId: string;
+    attemptId: string;
+    leaseId: string;
+    ownerInstanceId: string;
+    expectedStepVersion: number;
+    expectedLeaseVersion: number;
+    outcome: "review" | "failed" | "unknown";
+    evidenceRef: string;
+    outputRef?: string;
+    origin: LongWorkOrigin;
+  }): Promise<TaskStep> {
+    for (const value of [input.taskId, input.stepId, input.attemptId, input.leaseId])
+      requireIdentifier(value);
+    requireIdentifier(input.ownerInstanceId);
+    if (
+      !Number.isSafeInteger(input.expectedStepVersion) ||
+      input.expectedStepVersion < 1 ||
+      !Number.isSafeInteger(input.expectedLeaseVersion) ||
+      input.expectedLeaseVersion < 1 ||
+      !input.evidenceRef.trim() ||
+      input.evidenceRef.length > 512 ||
+      (input.outputRef !== undefined &&
+        (!input.outputRef.trim() || input.outputRef.length > 512)) ||
+      (input.outcome !== "review" && input.outputRef !== undefined)
+    )
+      throw new Error("Invalid Step settlement evidence or version");
+    return this.db.transaction(async (tx) => {
+      await this.requireOrigin(tx, input.origin);
+      await this.requireActiveDurableTask(tx, input.taskId);
+      const step = await this.requireStep(tx, input.taskId, input.stepId);
+      if (step.status !== "running" || Number(step.version) !== input.expectedStepVersion)
+        throw new Error("Step settlement conflict");
+      const attempt = await tx.execute({
+        sql: "SELECT status FROM task_attempts WHERE id = ? AND task_id = ? AND step_id = ?",
+        args: [input.attemptId, input.taskId, input.stepId],
+      });
+      if (attempt.rows[0]?.status !== "running") throw new Error("Attempt settlement conflict");
+      const lease = await tx.execute({
+        sql: "SELECT state,version,owner_instance_id,attempt_id FROM task_step_leases WHERE id = ? AND task_id = ? AND step_id = ?",
+        args: [input.leaseId, input.taskId, input.stepId],
+      });
+      const owner = lease.rows[0];
+      if (
+        owner?.state !== "active" ||
+        Number(owner.version) !== input.expectedLeaseVersion ||
+        owner.owner_instance_id !== input.ownerInstanceId ||
+        owner.attempt_id !== input.attemptId
+      )
+        throw new Error("Step lease ownership conflict");
+      const now = new Date().toISOString();
+      const nextStepStatus = input.outcome === "unknown" ? "blocked" : input.outcome;
+      const nextAttemptStatus = input.outcome === "unknown" ? "waiting_input" : input.outcome;
+      const nextLeaseState = input.outcome === "unknown" ? "quarantined" : "released";
+      const attemptUpdate = await tx.execute({
+        sql: "UPDATE task_attempts SET status = ?, completed_at = ? WHERE id = ? AND task_id = ? AND step_id = ? AND status = 'running'",
+        args: [
+          nextAttemptStatus,
+          input.outcome === "unknown" ? null : now,
+          input.attemptId,
+          input.taskId,
+          input.stepId,
+        ],
+      });
+      const stepUpdate = await tx.execute({
+        sql: "UPDATE task_steps SET status = ?, output_ref = ?, version = version + 1, updated_at = ? WHERE id = ? AND task_id = ? AND version = ? AND status = 'running'",
+        args: [
+          nextStepStatus,
+          input.outputRef ?? null,
+          now,
+          input.stepId,
+          input.taskId,
+          input.expectedStepVersion,
+        ],
+      });
+      const leaseUpdate = await tx.execute({
+        sql: "UPDATE task_step_leases SET state = ?, version = version + 1, heartbeat_at = ?, released_at = ? WHERE id = ? AND task_id = ? AND owner_instance_id = ? AND version = ? AND state = 'active'",
+        args: [
+          nextLeaseState,
+          now,
+          nextLeaseState === "released" ? now : null,
+          input.leaseId,
+          input.taskId,
+          input.ownerInstanceId,
+          input.expectedLeaseVersion,
+        ],
+      });
+      if (
+        attemptUpdate.rowsAffected !== 1 ||
+        stepUpdate.rowsAffected !== 1 ||
+        leaseUpdate.rowsAffected !== 1
+      )
+        throw new Error("Step settlement conflict");
+      if (input.outcome !== "unknown" || step.kind === "herdr_worker")
+        await this.appendEventTx(tx, {
+          taskId: input.taskId,
+          stepId: input.stepId,
+          attemptId: input.attemptId,
+          type: input.outcome === "unknown" ? "WORKER_LOST" : "ATTEMPT_FINISHED",
+          origin: input.origin,
+          evidenceRef: input.evidenceRef,
+          metadata: { outcome: input.outcome },
+        });
+      await this.appendEventTx(tx, {
+        taskId: input.taskId,
+        stepId: input.stepId,
+        attemptId: input.attemptId,
+        type: input.outcome === "unknown" ? "STEP_BLOCKED" : statusEvents[nextStepStatus]!,
+        origin: input.origin,
+        evidenceRef: input.evidenceRef,
+        metadata: { outcome: input.outcome },
+      });
+      const dependencies = await tx.execute({
+        sql: "SELECT dependency_id FROM task_step_dependencies WHERE task_id = ? AND step_id = ? ORDER BY dependency_id",
+        args: [input.taskId, input.stepId],
+      });
+      return parseStep(
+        await this.requireStep(tx, input.taskId, input.stepId),
+        dependencies.rows.map((row) => stringColumn(row, "dependency_id")),
+      );
+    });
+  }
+
   private async requireOrigin(tx: Transaction, origin: LongWorkOrigin): Promise<void> {
     if (origin.kind === "system") {
       if (!origin.reason.trim() || origin.reason.length > 256)
@@ -882,6 +1007,20 @@ export class LongWorkStore {
       const step = await this.requireStep(tx, params.taskId, params.stepId);
       if (Number(step.version) !== params.expectedVersion || step.status !== params.from)
         throw new Error("Step version conflict");
+      if (params.from === "running") {
+        const claimed = await tx.execute({
+          sql: "SELECT 1 FROM task_step_leases WHERE task_id = ? AND step_id = ? AND state IN ('active','quarantined') LIMIT 1",
+          args: [params.taskId, params.stepId],
+        });
+        if (claimed.rows[0]) throw new Error("Claimed Step requires lease settlement");
+      }
+      if (params.to === "ready") {
+        const uncertain = await tx.execute({
+          sql: "SELECT 1 FROM task_step_leases WHERE task_id = ? AND step_id = ? AND state = 'quarantined' LIMIT 1",
+          args: [params.taskId, params.stepId],
+        });
+        if (uncertain.rows[0]) throw new Error("Unknown Step outcome requires reconciliation");
+      }
       const now = new Date().toISOString();
       const result = await tx.execute({
         sql: "UPDATE task_steps SET status = ?, version = version + 1, updated_at = ? WHERE id = ? AND task_id = ? AND version = ? AND status = ?",
@@ -1793,7 +1932,7 @@ export class LongWorkStore {
         !row ||
         row.owner_instance_id !== input.ownerInstanceId ||
         Number(row.version) !== input.expectedVersion ||
-        (row.state !== "active" && !(row.state === "quarantined" && input.action === "release"))
+        row.state !== "active"
       )
         throw new Error("Lease version conflict");
       const now = new Date().toISOString();

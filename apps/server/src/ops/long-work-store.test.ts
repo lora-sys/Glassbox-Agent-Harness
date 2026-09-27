@@ -1199,7 +1199,7 @@ it("records a late signal as stale and blocks its timed-out Step using server ti
   }
 });
 
-it("keeps an expired exclusive lease occupied until its owner or reconciler settles it", async () => {
+it("keeps a quarantined lease occupied until explicit outcome reconciliation", async () => {
   const db = await DomainDatabase.open(":memory:");
   try {
     const store = await fixture(db);
@@ -1260,26 +1260,26 @@ it("keeps an expired exclusive lease occupied until its owner or reconciler sett
         origin: system,
       }),
     ).toBeNull();
-    await store.updateLease({
-      taskId: "task-1",
-      leaseId: "lease-1",
-      ownerInstanceId: "one",
-      expectedVersion: 2,
-      action: "release",
-      origin: system,
-    });
+    await expect(
+      store.updateLease({
+        taskId: "task-1",
+        leaseId: "lease-1",
+        ownerInstanceId: "one",
+        expectedVersion: 2,
+        action: "release",
+        origin: system,
+      }),
+    ).rejects.toThrow("Lease version conflict");
     expect(
-      (
-        await store.acquireLease({
-          id: "lease-2",
-          taskId: "task-1",
-          stepId: "a",
-          ownerInstanceId: "two",
-          expiresAt,
-          origin: system,
-        })
-      )?.ownerInstanceId,
-    ).toBe("two");
+      await store.acquireLease({
+        id: "lease-2",
+        taskId: "task-1",
+        stepId: "a",
+        ownerInstanceId: "two",
+        expiresAt,
+        origin: system,
+      }),
+    ).toBeNull();
   } finally {
     await db.close();
   }
@@ -2094,6 +2094,194 @@ it("rejects signal and approval waits after timeout even when overdue policy res
     expect(result.disposition).toBe("stale");
     expect((await store.listSteps("task-1"))[0]?.status).toBe("blocked");
     expect(await store.listWaiting("task-1")).toEqual([]);
+  } finally {
+    await db.close();
+  }
+});
+
+it("settles a claimed worker Step into review without accepting the Task", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    const store = await fixture(db);
+    await store.createGraph(
+      "task-1",
+      [step("worker", [], "herdr_worker")],
+      "worker",
+      limits,
+      system,
+    );
+    await store.transitionStep({
+      taskId: "task-1",
+      stepId: "worker",
+      expectedVersion: 1,
+      from: "pending",
+      to: "ready",
+      origin: system,
+    });
+    await store.claimReadyStep({
+      taskId: "task-1",
+      stepId: "worker",
+      expectedStepVersion: 2,
+      attemptId: "worker-attempt",
+      leaseId: "worker-lease",
+      ownerInstanceId: "executor-1",
+      leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+      origin: claimOrigin,
+    });
+    await expect(
+      store.transitionStep({
+        taskId: "task-1",
+        stepId: "worker",
+        expectedVersion: 3,
+        from: "running",
+        to: "succeeded",
+        origin: system,
+      }),
+    ).rejects.toThrow("lease settlement");
+    await expect(
+      store.settleClaimedStep({
+        taskId: "task-1",
+        stepId: "worker",
+        attemptId: "worker-attempt",
+        leaseId: "worker-lease",
+        ownerInstanceId: "stale-executor",
+        expectedStepVersion: 3,
+        expectedLeaseVersion: 1,
+        outcome: "review",
+        evidenceRef: "trace:worker-done",
+        origin: system,
+      }),
+    ).rejects.toThrow("ownership conflict");
+    const reviewed = await store.settleClaimedStep({
+      taskId: "task-1",
+      stepId: "worker",
+      attemptId: "worker-attempt",
+      leaseId: "worker-lease",
+      ownerInstanceId: "executor-1",
+      expectedStepVersion: 3,
+      expectedLeaseVersion: 1,
+      outcome: "review",
+      evidenceRef: "trace:worker-done",
+      outputRef: "artifact:worker-result",
+      origin: system,
+    });
+    expect(reviewed).toMatchObject({ status: "review", outputRef: "artifact:worker-result" });
+    await db.transaction(async (tx) => {
+      expect(
+        (await tx.execute("SELECT status FROM tasks WHERE id = 'task-1'")).rows[0]?.status,
+      ).not.toBe("DONE");
+      expect(
+        (await tx.execute("SELECT status FROM task_attempts WHERE id = 'worker-attempt'")).rows[0]
+          ?.status,
+      ).toBe("review");
+      expect(
+        (await tx.execute("SELECT state FROM task_step_leases WHERE id = 'worker-lease'")).rows[0]
+          ?.state,
+      ).toBe("released");
+    });
+    expect((await store.listEvents("task-1")).slice(-2).map((event) => event.type)).toEqual([
+      "ATTEMPT_FINISHED",
+      "STEP_REVIEW",
+    ]);
+    await expect(
+      store.settleClaimedStep({
+        taskId: "task-1",
+        stepId: "worker",
+        attemptId: "worker-attempt",
+        leaseId: "worker-lease",
+        ownerInstanceId: "executor-1",
+        expectedStepVersion: 3,
+        expectedLeaseVersion: 1,
+        outcome: "review",
+        evidenceRef: "trace:worker-done",
+        origin: system,
+      }),
+    ).rejects.toThrow("Step settlement conflict");
+  } finally {
+    await db.close();
+  }
+});
+
+it("quarantines a lost worker lease and preserves unknown outcome", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    const store = await fixture(db);
+    await store.createGraph(
+      "task-1",
+      [step("worker", [], "herdr_worker")],
+      "worker",
+      limits,
+      system,
+    );
+    await store.transitionStep({
+      taskId: "task-1",
+      stepId: "worker",
+      expectedVersion: 1,
+      from: "pending",
+      to: "ready",
+      origin: system,
+    });
+    await store.claimReadyStep({
+      taskId: "task-1",
+      stepId: "worker",
+      expectedStepVersion: 2,
+      attemptId: "lost-attempt",
+      leaseId: "lost-lease",
+      ownerInstanceId: "executor-1",
+      leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+      origin: claimOrigin,
+    });
+    const blocked = await store.settleClaimedStep({
+      taskId: "task-1",
+      stepId: "worker",
+      attemptId: "lost-attempt",
+      leaseId: "lost-lease",
+      ownerInstanceId: "executor-1",
+      expectedStepVersion: 3,
+      expectedLeaseVersion: 1,
+      outcome: "unknown",
+      evidenceRef: "trace:worker-lost",
+      origin: system,
+    });
+    expect(blocked.status).toBe("blocked");
+    await db.transaction(async (tx) => {
+      expect(
+        (
+          await tx.execute(
+            "SELECT status,completed_at FROM task_attempts WHERE id = 'lost-attempt'",
+          )
+        ).rows[0],
+      ).toMatchObject({ status: "waiting_input", completed_at: null });
+      expect(
+        (await tx.execute("SELECT state FROM task_step_leases WHERE id = 'lost-lease'")).rows[0]
+          ?.state,
+      ).toBe("quarantined");
+    });
+    expect((await store.listEvents("task-1")).slice(-2).map((event) => event.type)).toEqual([
+      "WORKER_LOST",
+      "STEP_BLOCKED",
+    ]);
+    await expect(
+      store.updateLease({
+        taskId: "task-1",
+        leaseId: "lost-lease",
+        ownerInstanceId: "executor-1",
+        expectedVersion: 2,
+        action: "release",
+        origin: system,
+      }),
+    ).rejects.toThrow("Lease version conflict");
+    await expect(
+      store.transitionStep({
+        taskId: "task-1",
+        stepId: "worker",
+        expectedVersion: 4,
+        from: "blocked",
+        to: "ready",
+        origin: system,
+      }),
+    ).rejects.toThrow("requires reconciliation");
+    expect((await store.listSteps("task-1"))[0]?.status).toBe("blocked");
   } finally {
     await db.close();
   }
