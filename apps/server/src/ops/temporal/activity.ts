@@ -5,7 +5,7 @@ import { AccessDeniedError } from "../../auth/service.js";
 import type { RunRecord } from "../../conversation/store.js";
 import { getLongWorkCaller, authorizeLongWorkAction } from "../long-work-authority.js";
 import { LongWorkScheduler } from "../long-work-scheduler.js";
-import { DEFAULT_TASK_GRAPH_LIMITS } from "../task-graph.js";
+import { DEFAULT_TASK_GRAPH_LIMITS, TaskGraphError } from "../task-graph.js";
 import { parseTaskGetSpec } from "../tool-step-spec.js";
 import type { AdvanceLongWorkActivity } from "./contracts.js";
 import { ClaimedWorkerDispatchError } from "../service.js";
@@ -671,16 +671,25 @@ export function createAdvanceLongWorkActivity(
           });
           return { kind: "continue" };
         }
-        const claimed = await store.longWork.claimReadyStep({
-          taskId,
-          stepId,
-          expectedStepVersion: step.version,
-          attemptId: randomUUID(),
-          leaseId: randomUUID(),
-          ownerInstanceId: workers.ownerInstanceId,
-          leaseExpiresAt: new Date(Date.now() + MODEL_LEASE_MS).toISOString(),
-          origin: { kind: "decision", decisionId, actorPrincipalId: caller.principalId },
-        });
+        let claimed: Awaited<ReturnType<typeof store.longWork.claimReadyStep>>;
+        try {
+          claimed = await store.longWork.claimReadyStep({
+            taskId,
+            stepId,
+            expectedStepVersion: step.version,
+            attemptId: randomUUID(),
+            leaseId: randomUUID(),
+            ownerInstanceId: workers.ownerInstanceId,
+            leaseExpiresAt: new Date(Date.now() + MODEL_LEASE_MS).toISOString(),
+            maxActiveWorkerAttemptsPerPrincipal:
+              DEFAULT_TASK_GRAPH_LIMITS.maxActiveWorkerAttemptsPerPrincipal,
+            origin: { kind: "decision", decisionId, actorPrincipalId: caller.principalId },
+          });
+        } catch (error) {
+          if (error instanceof TaskGraphError && error.code === "ACTIVE_WORKER_LIMIT")
+            return pollResult();
+          throw error;
+        }
         try {
           await workers.dispatch(caller, claimed);
         } catch (error) {

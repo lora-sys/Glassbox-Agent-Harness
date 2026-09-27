@@ -17,7 +17,12 @@ import {
 import { requireIdentifier } from "../identity/scope.js";
 import { evaluate } from "../auth/service.js";
 import { DomainDatabase, optionalString, stringColumn } from "../persistence/database.js";
-import { TaskGraphError, validateTaskGraph, type TaskGraphLimits } from "./task-graph.js";
+import {
+  DEFAULT_TASK_GRAPH_LIMITS,
+  TaskGraphError,
+  validateTaskGraph,
+  type TaskGraphLimits,
+} from "./task-graph.js";
 import { decideTaskRetry, type RetrySideEffectOutcome } from "./long-work-retry.js";
 import { parseTaskGetSpec } from "./tool-step-spec.js";
 import { reconstructTaskOriginScope } from "./long-work-authority.js";
@@ -381,6 +386,7 @@ export class LongWorkStore {
     leaseId: string;
     ownerInstanceId: string;
     leaseExpiresAt: string;
+    maxActiveWorkerAttemptsPerPrincipal?: number;
     origin: LongWorkOrigin;
   }): Promise<ClaimedTaskStep> {
     for (const value of [input.taskId, input.stepId, input.attemptId, input.leaseId])
@@ -420,6 +426,26 @@ export class LongWorkStore {
         stringColumn(step, "status") !== "ready"
       )
         throw new Error("Step claim conflict");
+      if (stringColumn(step, "kind") === "herdr_worker") {
+        const limit =
+          input.maxActiveWorkerAttemptsPerPrincipal ??
+          DEFAULT_TASK_GRAPH_LIMITS.maxActiveWorkerAttemptsPerPrincipal!;
+        if (!Number.isSafeInteger(limit) || limit < 1)
+          throw new TaskGraphError("INVALID_LIMIT", "Worker attempt limit must be positive");
+        const activeWorkers = await tx.execute({
+          sql: `SELECT COUNT(*) AS count FROM task_step_leases l
+            JOIN task_steps s ON s.id = l.step_id AND s.task_id = l.task_id
+            JOIN tasks t ON t.id = l.task_id
+            WHERE t.creator_principal_id = ? AND s.kind = 'herdr_worker'
+              AND l.state IN ('active','quarantined')`,
+          args: [stringColumn(task, "creator_principal_id")],
+        });
+        if (Number(activeWorkers.rows[0]?.count ?? 0) >= limit)
+          throw new TaskGraphError(
+            "ACTIVE_WORKER_LIMIT",
+            `Principal has reached the ${limit} unresolved Worker attempt limit`,
+          );
+      }
       const now = new Date().toISOString();
       if (expiryMs <= Date.parse(now) || expiryMs > Date.parse(now) + 86_400_000)
         throw new Error("Lease expiry must be within 24 hours");

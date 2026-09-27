@@ -1279,6 +1279,63 @@ it("allows only one concurrent claim and rolls back losing claim records", async
   }
 });
 
+it("bounds unresolved Herdr Worker attempts before creating another lease", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    const store = await fixture(db);
+    await store.createGraph(
+      "task-1",
+      [
+        step("worker-a", [], "herdr_worker"),
+        step("worker-b", [], "herdr_worker"),
+        step("join", ["worker-a", "worker-b"]),
+      ],
+      "join",
+      limits,
+      system,
+    );
+    for (const stepId of ["worker-a", "worker-b"])
+      await store.transitionStep({
+        taskId: "task-1",
+        stepId,
+        expectedVersion: 1,
+        from: "pending",
+        to: "ready",
+        origin: system,
+      });
+    const claim = (stepId: string) =>
+      store.claimReadyStep({
+        taskId: "task-1",
+        stepId,
+        expectedStepVersion: 2,
+        attemptId: `${stepId}-attempt`,
+        leaseId: `${stepId}-lease`,
+        ownerInstanceId: "scheduler-1",
+        leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+        maxActiveWorkerAttemptsPerPrincipal: 1,
+        origin: claimOrigin,
+      });
+    await claim("worker-a");
+    await expect(claim("worker-b")).rejects.toMatchObject({
+      code: "ACTIVE_WORKER_LIMIT",
+    });
+    expect((await store.listSteps("task-1")).find((item) => item.id === "worker-b")).toMatchObject({
+      status: "ready",
+      version: 2,
+    });
+    await db.transaction(async (tx) => {
+      expect(
+        (await tx.execute("SELECT id FROM task_attempts WHERE step_id = 'worker-b'")).rows,
+      ).toHaveLength(0);
+      expect(
+        (await tx.execute("SELECT id FROM task_step_leases WHERE step_id = 'worker-b'")).rows,
+      ).toHaveLength(0);
+    });
+  } finally {
+    await db.close();
+  }
+});
+
 it("attaches a same-Attempt WorkerBinding to the exact active lease once", async () => {
   const db = await DomainDatabase.open(":memory:");
   try {
