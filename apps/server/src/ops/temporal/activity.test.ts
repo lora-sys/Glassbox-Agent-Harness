@@ -1049,6 +1049,37 @@ it("blocks model Steps whose specRef cannot select a supported model adapter", a
   }
 });
 
+it("blocks a ready Model Step when its continuation grant was revoked before dispatch", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  try {
+    const { task, step } = await createModelTask(store);
+    await store.authorization.revokeScopeAction({
+      principalId: caller.principalId,
+      resourceId: `task-${task.id}`,
+      action: "task:continue",
+      scope: caller.scope,
+    });
+    const advance = createAdvanceLongWorkActivity(store);
+    const input = { taskId: task.id, policyRevision: 1 };
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("blocked");
+    expect(await store.longWork.getActiveLease(task.id, step.id)).toBeNull();
+    const attempts = await store.db.transaction((tx) =>
+      tx.execute({ sql: "SELECT id FROM task_attempts WHERE task_id = ?", args: [task.id] }),
+    );
+    expect(attempts.rows).toHaveLength(0);
+    expect((await store.longWork.listEvents(task.id)).at(-1)).toMatchObject({
+      type: "STEP_BLOCKED",
+      evidenceRef: expect.stringMatching(/^authorization:/),
+      metadata: { reason: "task_continuation_denied", outcome: "not_started" },
+    });
+    await advance(input);
+    expect((await store.tasks.getTask(task.id))?.status).toBe("WAITING_INPUT");
+  } finally {
+    await store.close();
+  }
+});
+
 it("blocks model Steps that request a capability or delegated permission outside text generation", async () => {
   const store = await openDomainStore({ databasePath: ":memory:" });
   try {

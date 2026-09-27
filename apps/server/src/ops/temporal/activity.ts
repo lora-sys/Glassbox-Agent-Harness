@@ -550,7 +550,19 @@ export function createAdvanceLongWorkActivity(store: DomainStore): AdvanceLongWo
             action: "task:continue",
           });
         } catch (error) {
-          if (error instanceof AccessDeniedError) return pollResult();
+          if (error instanceof AccessDeniedError) {
+            await store.longWork.transitionStep({
+              taskId,
+              stepId,
+              expectedVersion: step.version,
+              from: "ready",
+              to: "blocked",
+              origin: ORIGIN,
+              evidenceRef: `authorization:${error.decision.id}`,
+              metadata: { reason: "task_continuation_denied", outcome: "not_started" },
+            });
+            return { kind: "continue" };
+          }
           throw error;
         }
         await createClaimedModelRun(store, {
