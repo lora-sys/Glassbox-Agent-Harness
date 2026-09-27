@@ -104,6 +104,91 @@ async function executePrivateRun(
 }
 
 describe("Management model routing wrapper", () => {
+  it("uses Pi's PI_CODING_AGENT_DIR as the model catalog source", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "glassbox-pi-env-route-"));
+    try {
+      await writeFile(
+        join(directory, "models.json"),
+        JSON.stringify({
+          providers: {
+            environment: {
+              name: "Environment Pi Provider",
+              api: "openai-completions",
+              baseUrl: "http://127.0.0.1:9898/environment-pi/v1",
+              apiKey: "pi-env-fixture-secret",
+              models: [
+                {
+                  id: "environment-model",
+                  name: "Environment Model",
+                  contextWindow: 65_536,
+                  maxTokens: 8_192,
+                  input: ["text"],
+                },
+              ],
+            },
+          },
+        }),
+        "utf8",
+      );
+      vi.stubEnv("PI_CODING_AGENT_DIR", directory);
+      const f = await fixture(async () => ({ status: "failed" }));
+      const application = f.app as unknown as {
+        piModelCatalog?: {
+          list(): Array<{ providerId: string; model: string }>;
+        };
+      };
+      expect(application.piModelCatalog?.list()).toContainEqual(
+        expect.objectContaining({ providerId: "environment", model: "environment-model" }),
+      );
+    } finally {
+      vi.unstubAllEnvs();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("loads the Pi model catalog from an explicit runtime directory override", async () => {
+    const f = await fixture(async () => ({ status: "failed" }), {
+      mainPiModelConfig: {
+        providers: {
+          fixture: {
+            name: "Main Pi Provider",
+            api: "openai-completions",
+            baseUrl: "http://127.0.0.1:9898/main-pi/v1",
+            apiKey: "pi-main-fixture-secret",
+            models: [
+              {
+                id: "main-profile-model",
+                name: "Main Profile Model",
+                contextWindow: 98_304,
+                maxTokens: 12_288,
+                input: ["text"],
+              },
+            ],
+          },
+        },
+      },
+    });
+
+    const application = f.app as unknown as {
+      piModelCatalog?: {
+        list(): Array<{
+          providerId: string;
+          model: string;
+          contextWindowTokens?: number;
+          maxOutputTokens?: number;
+        }>;
+      };
+    };
+    expect(application.piModelCatalog?.list()).toContainEqual(
+      expect.objectContaining({
+        providerId: "fixture",
+        model: "main-profile-model",
+        contextWindowTokens: 98_304,
+        maxOutputTokens: 12_288,
+      }),
+    );
+  });
+
   it("switches to a Pi-configured model and runs the next QQ execution through Pi", async () => {
     const directory = await mkdtemp(join(tmpdir(), "glassbox-pi-route-"));
     try {
@@ -399,7 +484,19 @@ describe("Management model routing wrapper", () => {
     expect(evaluation).toMatchObject({
       decisionExecutionRef: "model:origin",
       actualExecutionRef: "model:origin",
+      decisionProvider: "origin",
+      decisionModel: "fixture-origin",
+      actualProvider: "origin",
+      actualModel: "fixture-origin",
     });
+    const scored = await f.app.evaluator.evaluate(
+      result.accepted.caller,
+      result.run.id,
+      "routing-safety-v1",
+    );
+    expect(
+      scored.assessment?.scores.find((score) => score.id === "decision_actual_model")?.value,
+    ).toBe("pass");
     expect(result.indexed?.eventCount).toBe(result.events.length);
     expect(
       result.events.some((event) => event.type === "tool_started" || event.type === "tool_call"),

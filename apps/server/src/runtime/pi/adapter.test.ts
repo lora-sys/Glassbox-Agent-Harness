@@ -13,7 +13,7 @@ import type {
 import { Type } from "typebox";
 import { capacityFromModel, glassboxSystemPrompt, PiSdkRuntimeAdapter } from "./adapter.js";
 
-it("does not invent a thinking reserve when Pi exposes only the combined output ceiling", () => {
+it("splits Pi's combined output ceiling between thinking and the visible answer", () => {
   const model = {
     contextWindow: 8_192,
     maxTokens: 4_096,
@@ -21,9 +21,23 @@ it("does not invent a thinking reserve when Pi exposes only the combined output 
   } as never;
   expect(capacityFromModel(model)).toEqual({
     contextWindowTokens: 8_192,
+    outputReserveTokens: 2_048,
+    thinkingReserveTokens: 2_048,
+    safetyMarginTokens: 819,
+  });
+});
+
+it("keeps the full Pi output ceiling for models without reasoning", () => {
+  const model = {
+    contextWindow: 8_192,
+    maxTokens: 4_096,
+    reasoning: false,
+  } as never;
+  expect(capacityFromModel(model)).toEqual({
+    contextWindowTokens: 8_192,
     outputReserveTokens: 4_096,
     thinkingReserveTokens: 0,
-    safetyMarginTokens: 0,
+    safetyMarginTokens: 819,
   });
 });
 
@@ -675,7 +689,7 @@ describe("PiSdkRuntimeAdapter", () => {
       contextWindowTokens: 8_192,
       outputReserveTokens: 256,
       thinkingReserveTokens: 0,
-      safetyMarginTokens: 0,
+      safetyMarginTokens: 819,
     });
     expect(adapter.getStaticContextEstimate(binding.runtimeSessionId)).toMatchObject({
       systemTokens: expect.any(Number),

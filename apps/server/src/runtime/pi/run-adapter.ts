@@ -81,7 +81,8 @@ function ownerMemoryCommand(text: string): RequiredToolCall | undefined {
       input: { action: "list", ...scope },
     };
   }
-  const get = /^\/memory get (\S+)$/u.exec(command);
+  // A pasted read command may keep its closing quotation mark. It is not part of the ID.
+  const get = /^\/memory get ([^\s”]+)”?$/u.exec(command);
   if (get) return { name: OWNER_MEMORY_ADMIN_TOOL, input: { action: "get", id: get[1] } };
   if (command === "/memory candidates")
     return { name: OWNER_MEMORY_ADMIN_TOOL, input: { action: "list_candidates" } };
@@ -704,9 +705,24 @@ interface BlockedMutation {
 
 function explicitModelSelectionCommand(text: string): boolean {
   const command = text.trim().replace(/^(?:Bob|Glassbox|玻璃盒)[，,\s]+/iu, "");
-  return /^(?:请|帮我)?\s*(?:(?:切换(?:模型)?(?:到|成|为)?|换(?:到|成)|switch to)\s*.*|使用\s+.+)$/iu.test(
+  return /^(?:请|帮我)?\s*(?:(?:(?:把|将)\s*(?:我\s*)?(?:后续的\s*)?(?:(?:Owner|QQ)\s*)?(?:好友)?私聊(?:模型)?\s*切换(?:到|成|为)?|切换(?:模型)?(?:到|成|为)?|换(?:到|成)|使用|switch to)\s*.*)$/iu.test(
     command,
   );
+}
+
+function explicitModelResetCommand(text: string): boolean {
+  const command = text
+    .trim()
+    .replace(/^(?:Bob|Glassbox|玻璃盒)[，,\s]+/iu, "")
+    .split(/[，,。！!；;\n]/u, 1)[0]
+    ?.trim();
+  return /^(?:请|帮我)?\s*(?:清除(?:当前)?模型选择|恢复(?:通道)?默认模型|切回(?:通道)?默认模型|使用(?:通道)?默认模型|\/model default)$/iu.test(
+    command ?? "",
+  );
+}
+
+function explicitModelChangeCommand(text: string): boolean {
+  return explicitModelSelectionCommand(text) || explicitModelResetCommand(text);
 }
 
 /**
@@ -718,7 +734,7 @@ function blockedMutationRequest(
   isOwner: boolean,
   modelProfiles: readonly PublicModelProfile[] = [],
 ): BlockedMutation | undefined {
-  if (explicitModelSelectionCommand(input.text)) {
+  if (explicitModelChangeCommand(input.text)) {
     if (input.caller.scope.chatType === "group")
       return { operation: "model:switch", reason: "not_permitted_in_group" };
     if (!isOwner) return { operation: "model:switch", reason: "not_permitted" };
@@ -812,22 +828,42 @@ function ownerModelCommand(
   const command = text.trim().replace(/^(?:Bob|Glassbox|玻璃盒)[，,\s]+/iu, "");
   if (/^(?:当前模型|现在是什么模型|当前用的模型|\/model current)$/iu.test(command))
     return { name: OWNER_MODEL_ADMIN_TOOL, input: { action: "current" } };
-  if (/^(?:恢复默认模型|切回默认模型|使用默认模型|\/model default)$/iu.test(command))
+  if (explicitModelResetCommand(text))
     return { name: OWNER_MODEL_ADMIN_TOOL, input: { action: "clear" } };
   if (/^(?:有哪些模型|列出模型|可切换模型|\/model list)$/iu.test(command))
     return { name: OWNER_MODEL_ADMIN_TOOL, input: { action: "list" } };
-  const requested =
-    /^(?:请|帮我)?\s*(?:切换(?:模型)?(?:到|成|为)|换(?:到|成)|使用|switch to)\s*["'“「]?(.+?)["'”」]?\s*$/iu
-      .exec(command)?.[1]
-      ?.replace(/\s*模型$/u, "")
-      .trim();
+  const selectionPrefix =
+    /^(?:请|帮我)?\s*(?:(?:把|将)\s*(?:我\s*)?(?:后续的\s*)?(?:(?:Owner|QQ)\s*)?(?:好友)?私聊(?:模型)?\s*切换(?:到|成|为)|切换(?:模型)?(?:到|成|为)|换(?:到|成)|使用|switch to)\s*["'“「]?/iu;
+  const selectionMatch = selectionPrefix.exec(command);
+  const requested = selectionMatch
+    ? command
+        .slice(selectionMatch[0].length)
+        .split(/[，,。！？；;\n]/u, 1)[0]
+        ?.replace(/["'“「”」]$/u, "")
+        .replace(/\s*模型$/u, "")
+        .trim()
+    : undefined;
   if (!requested) return undefined;
-  const normalized = (value: string) => value.trim().toLocaleLowerCase();
-  const matches = profiles.filter((profile) =>
-    [profile.id, profile.label, profile.model].some(
-      (alias) => normalized(alias) === normalized(requested),
-    ),
-  );
+  const modelName = requested.replace(/^(?:Pi|派)\s*(?:里|中)(?:配置的|设置的)?\s*/iu, "");
+  const providerQualified = /^(.*?)\s*(?:提供商|provider)(?:的|['’]s)\s*(.+)$/iu.exec(modelName);
+  const targetModel = providerQualified?.[2]?.trim() ?? modelName;
+  const normalized = (value: string) =>
+    value
+      .normalize("NFKC")
+      .trim()
+      .toLocaleLowerCase()
+      .replace(/[\s._-]+/gu, "");
+  const requestedProvider = providerQualified?.[1]?.trim();
+  const matches = profiles.filter((profile) => {
+    if (
+      requestedProvider !== undefined &&
+      (!profile.providerId || normalized(profile.providerId) !== normalized(requestedProvider))
+    )
+      return false;
+    return [profile.id, profile.label, profile.model].some(
+      (alias) => normalized(alias) === normalized(targetModel),
+    );
+  });
   const ids = [...new Set(matches.map((profile) => profile.id))];
   if (ids.length !== 1) return undefined;
   return { name: OWNER_MODEL_ADMIN_TOOL, input: { action: "select", profileId: ids[0] } };
@@ -929,7 +965,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         ? {}
         : { requiredToolName: required.name, requiredToolInput: required.input }),
     });
-    if (explicitModelSelectionCommand(input.text) && isOwner && required === undefined) {
+    if (explicitModelChangeCommand(input.text) && isOwner && required === undefined) {
       await this.recordEvidence({
         type: "tool_evidence",
         runId: input.run.id,

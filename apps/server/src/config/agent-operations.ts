@@ -70,12 +70,8 @@ export async function loadAgentOperations(
         throw new Error("Worker directory contains trusted runtime state");
     }
     const configured = pi as { kitPath: string; agentDir: string; provider: string; model: string };
-    protectedValues.push(
-      configured.kitPath,
-      configured.agentDir,
-      configured.provider,
-      configured.model,
-    );
+    // Provider and model names are public route metadata. Screen only private locations.
+    protectedValues.push(configured.kitPath, configured.agentDir);
     await piWorkerLaunch(configured);
     // Revalidate locks and capture current resource fingerprints for each attempt.
     workerLaunch = () => piWorkerLaunch(configured);

@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { chmod, mkdtemp, rm } from "node:fs/promises";
 import type { IncomingMessage } from "node:http";
 import { tmpdir } from "node:os";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
   CHANNEL_SAFE_ERRORS,
   type PublicChannelProfile,
@@ -379,7 +380,7 @@ export class ManagementApplication {
           kitPath: process.env.LORA_PI_KIT_PATH,
           cwd: process.cwd(),
           modelValues: [
-            ...options.models.list().flatMap((profile) => [profile.id, profile.baseUrl]),
+            ...options.models.list().map((profile) => profile.baseUrl),
             ...(options.ops
               ? [
                   ...(options.ops.protectedValues ?? []),
@@ -498,8 +499,10 @@ export class ManagementApplication {
     });
     const application = new ManagementApplication(options, store, channels, groupRuntime);
     try {
-      if (options.piAgentDirectory)
-        application.piModelCatalog = await PiModelCatalog.open(options.piAgentDirectory);
+      const piAgentDirectory =
+        options.piAgentDirectory === undefined ? getAgentDir() : options.piAgentDirectory;
+      if (piAgentDirectory)
+        application.piModelCatalog = await PiModelCatalog.open(piAgentDirectory);
       application.workspaces = await WorkspaceRegistry.open({
         dataRoot: options.dataDirectory,
         forbiddenRoots: [application.kitLoader.getKitPath()],
@@ -1756,6 +1759,14 @@ export class ManagementApplication {
           const observedModels = this.runtimeModelsByRun.get(input.run.id);
           const actualModel =
             observedModels?.size === 1 ? [...observedModels.values()][0] : undefined;
+          const executionConfig =
+            selectedConfig ??
+            configured.find(
+              (profile) =>
+                decision.executionRef === `${kind === "pi" ? "pi" : "model"}:${profile.id}`,
+            );
+          const decisionMatchesActual =
+            decision.executionRef !== null && decision.executionRef === actualExecutionRef;
           const totalUsage = this.runtimeUsageByRun.get(input.run.id)?.totalTokens;
           const actualTokens = totalUsage?.source === "reported" ? totalUsage.value : null;
           this.runtimeUsageByRun.delete(input.run.id);
@@ -1775,12 +1786,18 @@ export class ManagementApplication {
               fallbackAvailable: unavailableModelEncountered && succeeded,
               decisionExecutionRef: decision.executionRef,
               actualExecutionRef,
-              decisionProvider: selectedConfig
+              decisionProvider: executionConfig
                 ? kind === "pi"
-                  ? `glassbox-${selectedConfig.id}`
-                  : selectedConfig.id
-                : null,
-              decisionModel: selectedConfig?.model ?? null,
+                  ? decisionMatchesActual && actualModel
+                    ? actualModel.provider
+                    : `glassbox-${executionConfig.id}`
+                  : executionConfig.id
+                : decisionMatchesActual
+                  ? (actualModel?.provider ?? null)
+                  : null,
+              decisionModel:
+                executionConfig?.model ??
+                (decisionMatchesActual ? (actualModel?.model ?? null) : null),
               actualProvider: actualModel?.provider ?? null,
               actualModel: actualModel?.model ?? null,
               usage: {

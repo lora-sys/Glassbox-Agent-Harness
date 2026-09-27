@@ -1,5 +1,5 @@
 import { once } from "node:events";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -227,12 +227,23 @@ export function createApplicationFixtureScope() {
       failAction?: string;
       /** Isolated Pi config directory for tests that exercise native Pi model routing. */
       piAgentDirectory?: string | null;
+      /** Pi model configuration written to the default Glassbox main-agent directory. */
+      mainPiModelConfig?: Record<string, unknown>;
       /** Applies provider-side state changes before the fake peer answers an action. */
       onAction?: (action: Action) => void;
     } = {},
   ) {
     const directory = await mkdtemp(join(tmpdir(), "glassbox-channel-loop-"));
     cleanup.push(() => removeDirectory(directory));
+    if (options.mainPiModelConfig) {
+      const piMainAgentDirectory = join(directory, "pi", "main-agent");
+      await mkdir(piMainAgentDirectory, { recursive: true });
+      await writeFile(
+        join(piMainAgentDirectory, "models.json"),
+        JSON.stringify(options.mainPiModelConfig),
+        "utf8",
+      );
+    }
     const actions = new Inbox<Action>();
     const actionLog: Action[] = [];
     const sockets = new Inbox<WebSocket>();
@@ -313,7 +324,10 @@ export function createApplicationFixtureScope() {
         dataDirectory: directory,
         databasePath: options.persistentDatabase ? join(directory, "glassbox.db") : ":memory:",
         kitPath: fileURLToPath(new URL("../runtime/pi/fixtures/lora-pi-kit", import.meta.url)),
-        piAgentDirectory: options.piAgentDirectory,
+        piAgentDirectory:
+          options.piAgentDirectory === undefined && options.mainPiModelConfig
+            ? join(directory, "pi", "main-agent")
+            : options.piAgentDirectory,
         models,
         executors,
       });

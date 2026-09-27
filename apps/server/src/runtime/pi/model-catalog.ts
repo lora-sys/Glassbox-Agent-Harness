@@ -8,6 +8,7 @@ import type { PublicModelProfile } from "@glassbox/contracts";
 const SUPPORTED_TOOL_APIS = new Set([
   "openai-completions",
   "openai-responses",
+  "openai-codex-responses",
   "anthropic-messages",
   "google-generative-ai",
 ]);
@@ -85,6 +86,23 @@ export class PiModelCatalog {
     return { model, modelRuntime: this.runtime };
   }
 
+  resolveMatching(profile: Pick<PublicModelProfile, "protocol" | "baseUrl" | "model">) {
+    const baseUrl = normalizeBaseUrl(profile.baseUrl);
+    const matches = this.models.filter(
+      (candidate) =>
+        SUPPORTED_TOOL_APIS.has(candidate.api) &&
+        candidate.api === profile.protocol &&
+        candidate.id === profile.model &&
+        normalizeBaseUrl(
+          candidate.baseUrl ?? this.runtime.getProvider(candidate.provider)?.baseUrl ?? "",
+        ) === baseUrl,
+    );
+    if (matches.length === 0) return undefined;
+    if (matches.length > 1) throw new Error("Pi model mapping is ambiguous");
+    const model = matches[0]!;
+    return this.resolve(piModelProfileId(model.provider, model.id));
+  }
+
   has(profileId: string): boolean {
     return this.models.some(
       (candidate) => piModelProfileId(candidate.provider, candidate.id) === profileId,
@@ -106,6 +124,10 @@ export function piModelProfileId(providerId: string, modelId: string): string {
 
 function modelKey(providerId: string, modelId: string): string {
   return `${providerId}\u0000${modelId}`;
+}
+
+function normalizeBaseUrl(value: string): string {
+  return value.replace(/\/+$/u, "");
 }
 
 function knownCapacity(context: unknown, output: unknown): { context?: number; output?: number } {

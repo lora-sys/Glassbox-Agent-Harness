@@ -11,7 +11,7 @@ export interface PublicModelProfile {
   label: string;
   /** Pi provider identity for profiles projected from Pi's own ModelRuntime. */
   providerId?: string;
-  protocol: ModelProtocol | "google-generative-ai";
+  protocol: ModelProtocol | "google-generative-ai" | "openai-codex-responses";
   baseUrl: string;
   model: string;
   credentialConfigured: boolean;

@@ -208,15 +208,19 @@ export function capacityFromModel(
     model.maxTokens <= 0
   )
     return undefined;
-  const outputReserveTokens = Math.min(model.maxTokens, model.contextWindow);
-  // Pi exposes the combined maximum output ceiling, but does not expose a declared thinking
-  // reserve. Keep the full ceiling reserved for output and report no separate thinking reserve.
-  // The reasoning flag controls runtime behavior; it does not establish a token allocation.
+  const combinedOutputCeiling = Math.min(model.maxTokens, model.contextWindow);
+  // Pi exposes one combined ceiling for reasoning and the user-facing answer. Reserve half for
+  // each when the selected model enables reasoning, so context projection cannot spend the
+  // hidden reasoning budget on input or treat it as visible answer capacity.
+  const thinkingReserveTokens = model.reasoning ? Math.ceil(combinedOutputCeiling / 2) : 0;
+  const outputReserveTokens = combinedOutputCeiling - thinkingReserveTokens;
   return {
     contextWindowTokens: model.contextWindow,
     outputReserveTokens,
-    thinkingReserveTokens: 0,
-    safetyMarginTokens: 0,
+    thinkingReserveTokens,
+    // The model-facing projection is smaller than the final provider payload. The latter also
+    // carries provider envelope and serialized Tool fields, so leave bounded room for them.
+    safetyMarginTokens: Math.min(4_096, Math.floor(model.contextWindow / 10)),
   };
 }
 
@@ -1059,11 +1063,12 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
               return undefined;
             }
             const payloadTokens = estimateStructuredTokens(event.payload);
+            // The safety margin belongs to the projection budget. The assembled provider
+            // payload may consume that margin, but must still fit the actual model window.
             const maxInputTokens =
               capacity.contextWindowTokens -
               capacity.outputReserveTokens -
-              capacity.thinkingReserveTokens -
-              capacity.safetyMarginTokens;
+              capacity.thinkingReserveTokens;
             if (payloadTokens > maxInputTokens) {
               active.contextBudgetEvidence = {
                 ...active.contextBudgetEvidence,

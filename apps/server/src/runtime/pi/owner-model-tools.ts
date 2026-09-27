@@ -20,6 +20,7 @@ export interface OwnerModelSelection {
   contextWindowTokens: number | null;
   maxOutputTokens: number | null;
   routingAvailable: boolean;
+  unavailableReason?: "disabled" | "tools_unsupported" | "tools_unknown" | "capacity_unknown";
 }
 
 export function createOwnerModelTools(options: {
@@ -64,7 +65,9 @@ export function createOwnerModelTools(options: {
             type: "string",
             enum: ["list", "current", "select", "clear"],
           }),
-          profileId: Type.Optional(Type.String({ pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$" })),
+          // Pi model IDs are provider-owned and may contain punctuation such as dots.
+          // Accept the requested name here, then resolve only against the safe catalog below.
+          profileId: Type.Optional(Type.String({ minLength: 1, maxLength: 160 })),
         },
         { additionalProperties: false },
       ),
@@ -88,7 +91,15 @@ export function createOwnerModelTools(options: {
           action: "select",
           profileId: params.profileId,
         });
-        const profile = options.listModels().find((item) => item.id === params.profileId);
+        const models = options.listModels();
+        const exactId = models.find((item) => item.id === params.profileId);
+        const namedMatches = exactId
+          ? []
+          : models.filter(
+              (item) => item.model === params.profileId || item.label === params.profileId,
+            );
+        if (namedMatches.length > 1) throw new Error("model_profile_ambiguous");
+        const profile = exactId ?? namedMatches[0];
         if (!profile) throw new Error("model_profile_not_found");
         if (profile.routingAvailable === false) throw new Error("model_profile_unavailable");
         if (
@@ -109,6 +120,16 @@ export function createOwnerModelTools(options: {
 }
 
 function safeModel(profile: PublicModelProfile): OwnerModelSelection {
+  const unavailableReason =
+    profile.routingAvailable === false
+      ? "disabled"
+      : profile.supportsTools === false
+        ? "tools_unsupported"
+        : profile.supportsTools !== true
+          ? "tools_unknown"
+          : profile.contextWindowTokens === undefined || profile.maxOutputTokens === undefined
+            ? "capacity_unknown"
+            : undefined;
   return {
     profileId: profile.id,
     label: profile.label,
@@ -117,6 +138,7 @@ function safeModel(profile: PublicModelProfile): OwnerModelSelection {
     supportsTools: profile.supportsTools ?? null,
     contextWindowTokens: profile.contextWindowTokens ?? null,
     maxOutputTokens: profile.maxOutputTokens ?? null,
-    routingAvailable: profile.routingAvailable !== false,
+    routingAvailable: unavailableReason === undefined,
+    ...(unavailableReason === undefined ? {} : { unavailableReason }),
   };
 }

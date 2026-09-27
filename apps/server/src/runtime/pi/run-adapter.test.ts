@@ -225,6 +225,59 @@ describe("Pi required Tool execution", () => {
     });
   });
 
+  it("binds a provider-qualified model switch despite a trailing reply instruction", async () => {
+    const profileId = "pi-7f38cfd90123a4567890abcd";
+    const f = fixture([
+      {
+        status: "completed",
+        text: "SWITCH-MOST-OK",
+        toolCalls: [
+          {
+            name: OWNER_MODEL_ADMIN_TOOL,
+            input: { action: "select", profileId },
+            failed: false,
+          },
+        ],
+      },
+    ]);
+    f.input.text = "切换到 most 提供商的 z-ai/glm-5.3-flash，成功后只回复 SWITCH-MOST-OK";
+    f.createOrRestoreSession.mockImplementation(async (_conversation, _profile, context) => {
+      if (context) context.authorizedToolNames = [OWNER_MODEL_ADMIN_TOOL];
+      return {
+        conversationId: "conversation-1",
+        runtimeSessionId: "session-1",
+        profileName: "main-agent" as const,
+        agentDir: "agent",
+        createdAt: new Date(0).toISOString(),
+        lastActiveAt: new Date(0).toISOString(),
+      };
+    });
+    const executor = new PiRunExecutionAdapter(f.runtime, {
+      listModelProfiles: () => [
+        {
+          id: profileId,
+          label: "most / z-ai/glm-5.3-flash",
+          providerId: "most",
+          model: "z-ai/glm-5.3-flash",
+          protocol: "openai-completions",
+          baseUrl: "https://models.example.invalid/v1",
+          credentialConfigured: true,
+          supportsTools: true,
+          contextWindowTokens: 65_536,
+          maxOutputTokens: 8_192,
+          routingAvailable: true,
+        },
+      ],
+    });
+
+    await expect(executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe(OWNER_MODEL_ADMIN_TOOL);
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({
+      action: "select",
+      profileId,
+    });
+  });
+
   it("denies model switching outside the private Owner conversation", async () => {
     const f = fixture([{ status: "completed", text: "这不是私聊模型切换。", toolCalls: [] }]);
     f.input.text = "切换到 MiniMax M3";
@@ -279,15 +332,19 @@ describe("Pi required Tool execution", () => {
     expect(f.run).not.toHaveBeenCalled();
   });
 
-  it("binds the Owner request to restore the configured default model", async () => {
+  it.each([
+    "恢复默认模型",
+    "清除当前模型选择，切回通道默认模型，成功后只回复 SWITCH-DEFAULT-OK。",
+    "请切回通道默认模型，成功后只回复 SWITCH-DEFAULT-OK。",
+  ])("binds Owner default model reset to the clear Tool: %s", async (request) => {
     const f = fixture([
       {
         status: "completed",
-        text: "已恢复默认模型。",
+        text: "SWITCH-DEFAULT-OK",
         toolCalls: [{ name: OWNER_MODEL_ADMIN_TOOL, input: { action: "clear" }, failed: false }],
       },
     ]);
-    f.input.text = "恢复默认模型";
+    f.input.text = request;
     f.createOrRestoreSession.mockImplementation(async (_conversation, _profile, context) => {
       if (context) context.authorizedToolNames = [OWNER_MODEL_ADMIN_TOOL];
       return {
@@ -303,6 +360,51 @@ describe("Pi required Tool execution", () => {
     await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
     expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe(OWNER_MODEL_ADMIN_TOOL);
     expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({ action: "clear" });
+  });
+
+  it("rejects a default model success claim without a successful clear Tool call", async () => {
+    const noTools = { status: "completed" as const, text: "SWITCH-DEFAULT-OK", toolCalls: [] };
+    const f = fixture([noTools, noTools]);
+    f.input.text = "清除当前模型选择，切回通道默认模型，成功后只回复 SWITCH-DEFAULT-OK。";
+    f.createOrRestoreSession.mockImplementation(async (_conversation, _profile, context) => {
+      if (context) context.authorizedToolNames = [OWNER_MODEL_ADMIN_TOOL];
+      return {
+        conversationId: "conversation-1",
+        runtimeSessionId: "session-1",
+        profileName: "main-agent" as const,
+        agentDir: "agent",
+        createdAt: new Date(0).toISOString(),
+        lastActiveAt: new Date(0).toISOString(),
+      };
+    });
+
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "failed",
+      text: "请求的操作未执行，请稍后重试。",
+    });
+    expect(f.run).toHaveBeenCalledTimes(2);
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({ action: "clear" });
+  });
+
+  it("does not treat a question about resetting the model as a reset request", async () => {
+    const f = fixture([{ status: "completed", text: "可以用 /model default。", toolCalls: [] }]);
+    f.input.text = "如何清除当前模型选择，切回通道默认模型？";
+
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBeUndefined();
+  });
+
+  it("denies a default model reset outside the Owner private conversation", async () => {
+    const f = fixture([]);
+    f.input.text = "清除当前模型选择，切回通道默认模型。";
+    f.input.caller.scope.chatType = "group";
+    f.input.conversation.scope.chatType = "group";
+
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "failed",
+      text: "该操作未在群聊中开放，未执行。",
+    });
+    expect(f.run).not.toHaveBeenCalled();
   });
 
   it("binds an explicit Owner Memory command to the current Run's exact Tool input", async () => {
@@ -356,6 +458,10 @@ describe("Pi required Tool execution", () => {
       },
       {
         text: "/memory get memory-1",
+        input: { action: "get", id: "memory-1" },
+      },
+      {
+        text: "/memory get memory-1”",
         input: { action: "get", id: "memory-1" },
       },
       {

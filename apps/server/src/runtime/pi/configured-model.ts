@@ -11,6 +11,8 @@ export async function configuredPiModel(
 ) {
   if (piCatalog?.has(profileId)) return piCatalog.resolve(profileId);
   const { profile, apiKey } = profiles.resolve(profileId);
+  const configuredPiModel = piCatalog?.resolveMatching(profile);
+  if (configuredPiModel) return configuredPiModel;
   if (
     profile.contextWindowTokens === undefined ||
     profile.maxOutputTokens === undefined ||

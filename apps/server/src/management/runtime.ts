@@ -2,7 +2,6 @@ import { mkdir } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { randomBytes } from "node:crypto";
 import type { IncomingMessage } from "node:http";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import lockfile from "proper-lockfile";
 import { ModelProfileStore } from "../config/model-profiles.js";
 import { loadAgentOperations } from "../config/agent-operations.js";
@@ -38,8 +37,7 @@ export async function openManagementRuntime(options: {
     application = await ManagementApplication.open({
       dataDirectory: options.dataDirectory,
       models,
-      piAgentDirectory:
-        options.piAgentDirectory === undefined ? getAgentDir() : options.piAgentDirectory,
+      piAgentDirectory: options.piAgentDirectory,
       databasePath: options.databasePath,
       executors: options.executors,
       ops: await loadAgentOperations(options.dataDirectory, options.databasePath),
