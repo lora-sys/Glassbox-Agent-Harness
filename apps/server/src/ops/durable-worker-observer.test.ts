@@ -76,7 +76,6 @@ async function fixture(agentKind = "codex") {
     paneId: worker.paneId,
     agentName: worker.agentName,
     agentKind,
-    lastObservedAgentState: "starting",
   });
   const lease = await store.longWork.acquireLease({
     id: "lease-1",
@@ -140,6 +139,24 @@ describe("DurableWorkerObserver", () => {
     ).toBe("review");
     const events = await store.longWork.listEvents(task.id);
     expect(events.filter((entry) => entry.type === "ATTEMPT_FINISHED")).toHaveLength(1);
+  });
+
+  it("does not treat the initial Pi idle observation as completed work", async () => {
+    const { store, task, stepId, worker, reconciler } = await fixture("pi");
+    await reconciler.handleEvent({
+      type: "agent.state",
+      sessionId: "session-1",
+      workspaceId: "workspace-1",
+      paneId: worker.paneId,
+      agentName: worker.agentName,
+      state: "idle",
+      timestamp: new Date().toISOString(),
+    });
+
+    expect((await store.tasks.getWorkerBinding("attempt-1"))?.lastObservedAgentState).toBe("idle");
+    expect(
+      (await store.longWork.listSteps(task.id)).find((step) => step.id === stepId)?.status,
+    ).toBe("running");
   });
 
   it("creates one safe Attention and TASK_BLOCKED event for a blocked Worker", async () => {

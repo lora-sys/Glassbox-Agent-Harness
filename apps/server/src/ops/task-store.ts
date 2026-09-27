@@ -724,7 +724,7 @@ export class TaskStore {
     requireIdentifier(params.taskAttemptId);
     const id = randomUUID();
     const now = new Date().toISOString();
-    const state: HerdrAgentLifecycleState = params.lastObservedAgentState ?? "working";
+    const state: HerdrAgentLifecycleState = params.lastObservedAgentState ?? "starting";
 
     await this.db.transaction(async (tx) => {
       await tx.execute({

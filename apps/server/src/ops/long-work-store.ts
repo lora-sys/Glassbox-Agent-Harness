@@ -514,6 +514,102 @@ export class LongWorkStore {
     });
   }
 
+  /** Attaches an existing Herdr WorkerBinding to the exact claimed Worker Step lease. */
+  async attachClaimedWorkerBinding(input: {
+    taskId: string;
+    stepId: string;
+    attemptId: string;
+    leaseId: string;
+    workerBindingId: string;
+    ownerInstanceId: string;
+    expectedStepVersion: number;
+    expectedLeaseVersion: number;
+    origin: LongWorkOrigin;
+  }): Promise<StoredStepLease> {
+    for (const value of [
+      input.taskId,
+      input.stepId,
+      input.attemptId,
+      input.leaseId,
+      input.workerBindingId,
+      input.ownerInstanceId,
+    ])
+      requireIdentifier(value);
+    if (
+      !Number.isSafeInteger(input.expectedStepVersion) ||
+      input.expectedStepVersion < 1 ||
+      !Number.isSafeInteger(input.expectedLeaseVersion) ||
+      input.expectedLeaseVersion < 1
+    )
+      throw new Error("Invalid Worker binding lease version");
+
+    return this.db.transaction(async (tx) => {
+      await this.requireOrigin(tx, input.origin);
+      const task = await this.requireActiveDurableTask(tx, input.taskId);
+      if (stringColumn(task, "status") === "REVIEW") throw new Error("Task status conflict");
+      const step = await this.requireStep(tx, input.taskId, input.stepId);
+      if (
+        step.kind !== "herdr_worker" ||
+        step.status !== "running" ||
+        Number(step.version) !== input.expectedStepVersion
+      )
+        throw new Error("Worker binding Step conflict");
+
+      const attempt = await tx.execute({
+        sql: "SELECT id FROM task_attempts WHERE id = ? AND task_id = ? AND step_id = ? AND status = 'running'",
+        args: [input.attemptId, input.taskId, input.stepId],
+      });
+      if (!attempt.rows[0]) throw new Error("Worker binding Attempt conflict");
+
+      const lease = await tx.execute({
+        sql: "SELECT * FROM task_step_leases WHERE id = ? AND task_id = ? AND step_id = ? AND attempt_id = ?",
+        args: [input.leaseId, input.taskId, input.stepId, input.attemptId],
+      });
+      const leaseRow = lease.rows[0];
+      if (
+        !leaseRow ||
+        leaseRow.state !== "active" ||
+        Number(leaseRow.version) !== input.expectedLeaseVersion ||
+        leaseRow.owner_instance_id !== input.ownerInstanceId ||
+        leaseRow.worker_binding_id !== null ||
+        Date.parse(stringColumn(leaseRow, "expires_at")) <= Date.now()
+      )
+        throw new Error("Step lease ownership conflict");
+
+      const binding = await tx.execute({
+        sql: "SELECT id FROM worker_bindings WHERE id = ? AND task_attempt_id = ?",
+        args: [input.workerBindingId, input.attemptId],
+      });
+      if (!binding.rows[0]) throw new Error("WorkerBinding does not belong to the claimed Attempt");
+
+      const updated = await tx.execute({
+        sql: `UPDATE task_step_leases SET worker_binding_id = ?, version = version + 1
+          WHERE id = ? AND task_id = ? AND step_id = ? AND attempt_id = ?
+            AND owner_instance_id = ? AND version = ? AND state = 'active'
+            AND worker_binding_id IS NULL RETURNING *`,
+        args: [
+          input.workerBindingId,
+          input.leaseId,
+          input.taskId,
+          input.stepId,
+          input.attemptId,
+          input.ownerInstanceId,
+          input.expectedLeaseVersion,
+        ],
+      });
+      if (!updated.rows[0]) throw new Error("Step lease ownership conflict");
+      await this.appendEventTx(tx, {
+        taskId: input.taskId,
+        stepId: input.stepId,
+        attemptId: input.attemptId,
+        type: "WORKER_BOUND",
+        origin: input.origin,
+        metadata: { workerBindingId: input.workerBindingId },
+      });
+      return parseLease(updated.rows[0]);
+    });
+  }
+
   /** Settles a claimed external attempt under its exclusive lease. Unknown outcomes stay blocked. */
   async settleClaimedStep(input: {
     taskId: string;

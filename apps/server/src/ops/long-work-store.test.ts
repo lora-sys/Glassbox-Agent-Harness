@@ -1261,6 +1261,215 @@ it("allows only one concurrent claim and rolls back losing claim records", async
   }
 });
 
+it("attaches a same-Attempt WorkerBinding to the exact active lease once", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    const store = await fixture(db);
+    await store.createGraph(
+      "task-1",
+      [step("worker-binding", [], "herdr_worker")],
+      "worker-binding",
+      limits,
+      system,
+    );
+    await store.transitionStep({
+      taskId: "task-1",
+      stepId: "worker-binding",
+      expectedVersion: 1,
+      from: "pending",
+      to: "ready",
+      origin: system,
+    });
+    await store.claimReadyStep({
+      taskId: "task-1",
+      stepId: "worker-binding",
+      expectedStepVersion: 2,
+      attemptId: "worker-binding-attempt",
+      leaseId: "worker-binding-lease",
+      ownerInstanceId: "executor-1",
+      leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+      origin: claimOrigin,
+    });
+    await db.transaction((tx) =>
+      tx.execute({
+        sql: "INSERT INTO worker_bindings(id,task_attempt_id,herdr_session,workspace_id,pane_id,agent_kind,last_observed_agent_state,updated_at) VALUES (?,?,?,?,?,?,'starting',?)",
+        args: [
+          "worker-binding-id",
+          "worker-binding-attempt",
+          "herdr-session",
+          "workspace-1",
+          "pane-1",
+          "pi",
+          now,
+        ],
+      }),
+    );
+
+    const attached = await store.attachClaimedWorkerBinding({
+      taskId: "task-1",
+      stepId: "worker-binding",
+      attemptId: "worker-binding-attempt",
+      leaseId: "worker-binding-lease",
+      workerBindingId: "worker-binding-id",
+      ownerInstanceId: "executor-1",
+      expectedStepVersion: 3,
+      expectedLeaseVersion: 1,
+      origin: claimOrigin,
+    });
+    expect(attached).toMatchObject({
+      id: "worker-binding-lease",
+      taskId: "task-1",
+      stepId: "worker-binding",
+      attemptId: "worker-binding-attempt",
+      workerBindingId: "worker-binding-id",
+      ownerInstanceId: "executor-1",
+      state: "active",
+      version: 2,
+    });
+    expect(
+      (await store.listEvents("task-1")).filter((event) => event.type === "WORKER_BOUND"),
+    ).toEqual([
+      expect.objectContaining({
+        stepId: "worker-binding",
+        attemptId: "worker-binding-attempt",
+        metadata: { workerBindingId: "worker-binding-id" },
+      }),
+    ]);
+    await expect(
+      store.attachClaimedWorkerBinding({
+        taskId: "task-1",
+        stepId: "worker-binding",
+        attemptId: "worker-binding-attempt",
+        leaseId: "worker-binding-lease",
+        workerBindingId: "worker-binding-id",
+        ownerInstanceId: "executor-1",
+        expectedStepVersion: 3,
+        expectedLeaseVersion: 1,
+        origin: claimOrigin,
+      }),
+    ).rejects.toThrow("Step lease ownership conflict");
+  } finally {
+    await db.close();
+  }
+});
+
+it("rejects binding an unrelated Attempt or a non-Worker Step", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    const store = await fixture(db);
+    await store.createGraph(
+      "task-1",
+      [step("worker-binding", [], "herdr_worker"), step("join-binding")],
+      "worker-binding",
+      limits,
+      system,
+    );
+    await store.transitionStep({
+      taskId: "task-1",
+      stepId: "worker-binding",
+      expectedVersion: 1,
+      from: "pending",
+      to: "ready",
+      origin: system,
+    });
+    await store.claimReadyStep({
+      taskId: "task-1",
+      stepId: "worker-binding",
+      expectedStepVersion: 2,
+      attemptId: "worker-binding-attempt",
+      leaseId: "worker-binding-lease",
+      ownerInstanceId: "executor-1",
+      leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+      origin: claimOrigin,
+    });
+    await db.transaction(async (tx) => {
+      await tx.execute({
+        sql: "INSERT INTO worker_bindings(id,task_attempt_id,herdr_session,workspace_id,pane_id,agent_kind,last_observed_agent_state,updated_at) VALUES (?,?,?,?,?,?,'starting',?)",
+        args: ["foreign-binding", "attempt-1", "session", "workspace", "pane", "pi", now],
+      });
+      await tx.execute({
+        sql: "INSERT INTO task_attempts(id,task_id,step_id,attempt_number,status,started_at) VALUES (?,?,?,?,'running',?)",
+        args: ["other-attempt", "task-1", "worker-binding", 99, now],
+      });
+    });
+
+    await expect(
+      store.attachClaimedWorkerBinding({
+        taskId: "task-1",
+        stepId: "worker-binding",
+        attemptId: "worker-binding-attempt",
+        leaseId: "worker-binding-lease",
+        workerBindingId: "foreign-binding",
+        ownerInstanceId: "executor-1",
+        expectedStepVersion: 3,
+        expectedLeaseVersion: 1,
+        origin: claimOrigin,
+      }),
+    ).rejects.toThrow("WorkerBinding does not belong to the claimed Attempt");
+    await expect(
+      store.attachClaimedWorkerBinding({
+        taskId: "task-1",
+        stepId: "worker-binding",
+        attemptId: "other-attempt",
+        leaseId: "worker-binding-lease",
+        workerBindingId: "foreign-binding",
+        ownerInstanceId: "executor-1",
+        expectedStepVersion: 3,
+        expectedLeaseVersion: 1,
+        origin: claimOrigin,
+      }),
+    ).rejects.toThrow("Step lease ownership conflict");
+
+    await store.transitionStep({
+      taskId: "task-1",
+      stepId: "join-binding",
+      expectedVersion: 1,
+      from: "pending",
+      to: "ready",
+      origin: system,
+    });
+    await store.claimReadyStep({
+      taskId: "task-1",
+      stepId: "join-binding",
+      expectedStepVersion: 2,
+      attemptId: "join-binding-attempt",
+      leaseId: "join-binding-lease",
+      ownerInstanceId: "executor-1",
+      leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+      origin: claimOrigin,
+    });
+    await db.transaction((tx) =>
+      tx.execute({
+        sql: "INSERT INTO worker_bindings(id,task_attempt_id,herdr_session,workspace_id,pane_id,agent_kind,last_observed_agent_state,updated_at) VALUES (?,?,?,?,?,?,'starting',?)",
+        args: [
+          "join-binding-id",
+          "join-binding-attempt",
+          "session",
+          "workspace",
+          "pane",
+          "pi",
+          now,
+        ],
+      }),
+    );
+    await expect(
+      store.attachClaimedWorkerBinding({
+        taskId: "task-1",
+        stepId: "join-binding",
+        attemptId: "join-binding-attempt",
+        leaseId: "join-binding-lease",
+        workerBindingId: "join-binding-id",
+        ownerInstanceId: "executor-1",
+        expectedStepVersion: 3,
+        expectedLeaseVersion: 1,
+        origin: claimOrigin,
+      }),
+    ).rejects.toThrow("Worker binding Step conflict");
+  } finally {
+    await db.close();
+  }
+});
+
 it("rejects a Step claim after its continuation grant is revoked", async () => {
   const db = await DomainDatabase.open(":memory:");
   try {
