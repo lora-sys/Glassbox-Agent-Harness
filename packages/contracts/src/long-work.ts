@@ -54,6 +54,12 @@ export interface TaskWaitPolicy {
   overdue: "resume" | "stale";
 }
 
+/** One exact protected resource and action. A declaration is not an authorization grant. */
+export interface DelegatedPermission {
+  resourceId: string;
+  action: string;
+}
+
 export interface TaskStep {
   id: string;
   taskId: string;
@@ -69,7 +75,7 @@ export interface TaskStep {
   retryPolicy?: TaskRetryPolicy;
   waitPolicy?: TaskWaitPolicy;
   requiredCapabilities: readonly string[];
-  delegatedPermissionSet: readonly string[];
+  delegatedPermissionSet: readonly DelegatedPermission[];
   checkpointRef?: string;
   outputRef?: string;
   createdAt: string;
@@ -165,7 +171,7 @@ export interface ChildTaskLink {
   parentTaskId: string;
   parentStepId: string;
   childTaskId: string;
-  delegatedPermissionSet: readonly string[];
+  delegatedPermissionSet: readonly DelegatedPermission[];
   acceptanceCriteria: readonly string[];
   cancellationPolicy: "cancel_child" | "keep_child";
   failurePolicy: "block_parent" | "fail_parent" | "review_parent";

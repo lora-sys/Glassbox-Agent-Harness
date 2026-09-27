@@ -163,6 +163,7 @@ export async function authorizeConversation(
   conversationId: string,
   action: string,
   runId?: string,
+  delegatedTaskId?: string,
 ): Promise<AuthorizedResult<{ agentId: string }>> {
   requireIdentifier(conversationId);
   const result = await tx.execute({
@@ -235,6 +236,7 @@ export async function authorizeConversation(
     action,
     conversationId,
     ...(runId ? { runId } : {}),
+    ...(delegatedTaskId ? { delegatedTaskId } : {}),
   });
   return decision.decision === "ALLOW" ? { value: { agentId } } : { denied: decision };
 }
@@ -548,6 +550,7 @@ export class ConversationStore {
         caller: input.caller,
         resourceId: `task-${input.taskId}`,
         action: "task:read",
+        delegatedTaskId: input.taskId,
       });
       if (taskAuthorization.decision !== "ALLOW") return { denied: taskAuthorization };
 
@@ -555,6 +558,7 @@ export class ConversationStore {
         caller: input.caller,
         resourceId: `task-${input.taskId}`,
         action: "task:continue",
+        delegatedTaskId: input.taskId,
       });
       if (taskContinueAuthorization.decision !== "ALLOW")
         return { denied: taskContinueAuthorization };
@@ -588,6 +592,8 @@ export class ConversationStore {
         input.caller,
         conversationId,
         "run:create",
+        undefined,
+        input.taskId,
       );
       if ("denied" in conversationAuthorization) return conversationAuthorization;
 
@@ -596,6 +602,7 @@ export class ConversationStore {
         resourceId: agentResourceId(conversationAuthorization.value.agentId),
         action: "run:create",
         conversationId,
+        delegatedTaskId: input.taskId,
       });
       if (runCreate.decision !== "ALLOW") return { denied: runCreate };
       const conversationRead = await evaluate(tx, {
@@ -603,6 +610,7 @@ export class ConversationStore {
         resourceId: agentResourceId(conversationAuthorization.value.agentId),
         action: "conversation:read",
         conversationId,
+        delegatedTaskId: input.taskId,
       });
       if (conversationRead.decision !== "ALLOW") return { denied: conversationRead };
       const runControl = await evaluate(tx, {
@@ -610,6 +618,7 @@ export class ConversationStore {
         resourceId: agentResourceId(conversationAuthorization.value.agentId),
         action: "run:control",
         conversationId,
+        delegatedTaskId: input.taskId,
       });
       if (runControl.decision !== "ALLOW") return { denied: runControl };
 

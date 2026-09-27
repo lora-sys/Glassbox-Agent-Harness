@@ -8,7 +8,7 @@ import {
   type CallerContext,
   type TrustedChannelScope,
 } from "../identity/scope.js";
-import { DomainDatabase, stringColumn } from "../persistence/database.js";
+import { DomainDatabase, optionalString, stringColumn } from "../persistence/database.js";
 import { taskPolicyResourceId } from "./task-policy.js";
 
 export type DecisionValue = "ALLOW" | "DENY" | "REQUIRES_APPROVAL";
@@ -22,7 +22,8 @@ export type DecisionReason =
   | "approval_required"
   | "approval_invalid"
   | "approved"
-  | "scope_mismatch";
+  | "scope_mismatch"
+  | "delegation_scope_denied";
 export interface AuthorizationDecision {
   id: string;
   decision: DecisionValue;
@@ -37,6 +38,93 @@ export interface AuthorizationRequest {
   approvalId?: string;
   conversationId?: string;
   runId?: string;
+  /** Trusted execution boundary. A Run-to-Task binding also supplies this automatically. */
+  delegatedTaskId?: string;
+}
+
+async function delegatedTaskAllows(
+  tx: Transaction,
+  request: AuthorizationRequest,
+): Promise<boolean> {
+  let runTaskId: string | undefined;
+  let runConversationId: string | undefined;
+  if (request.runId) {
+    const bound = await tx.execute({
+      sql: `SELECT r.source,r.conversation_id,ar.task_id FROM runs r
+            LEFT JOIN task_attempt_runs ar ON ar.run_id = r.id WHERE r.id = ? LIMIT 1`,
+      args: [request.runId],
+    });
+    if (bound.rows[0]) {
+      if (bound.rows[0].source === "task_step") {
+        runTaskId = optionalString(bound.rows[0], "task_id") ?? undefined;
+        if (!runTaskId) return false;
+        runConversationId = stringColumn(bound.rows[0], "conversation_id");
+      } else if (request.delegatedTaskId) return false;
+    }
+  }
+  if (request.delegatedTaskId && request.runId && request.delegatedTaskId !== runTaskId)
+    return false;
+  const taskId = request.delegatedTaskId ?? runTaskId;
+  if (!taskId) return true;
+  requireIdentifier(taskId);
+  const task = await tx.execute({
+    sql: "SELECT creator_principal_id,origin_scope_key,conversation_id FROM tasks WHERE id = ?",
+    args: [taskId],
+  });
+  if (
+    !task.rows[0] ||
+    task.rows[0].creator_principal_id !== request.caller.principalId ||
+    task.rows[0].origin_scope_key !== scopeKey(request.caller.scope)
+  )
+    return false;
+
+  const technicalAction =
+    (request.resourceId === `task-${taskId}` &&
+      ["task:read", "task:continue"].includes(request.action)) ||
+    (request.conversationId !== undefined &&
+      request.conversationId ===
+        (runConversationId ?? optionalString(task.rows[0], "conversation_id")) &&
+      request.resourceId === "agent:personal" &&
+      ["run:create", "conversation:read", "run:control"].includes(request.action));
+  const seen = new Set<string>();
+  let current = taskId;
+  for (let depth = 0; depth < 5; depth++) {
+    if (seen.has(current)) return false;
+    seen.add(current);
+    const links = await tx.execute({
+      sql: "SELECT parent_task_id,delegated_permissions_json FROM task_child_links WHERE child_task_id = ?",
+      args: [current],
+    });
+    const link = links.rows[0];
+    if (!link) return true;
+    let permissions: unknown;
+    try {
+      permissions = JSON.parse(stringColumn(link, "delegated_permissions_json"));
+    } catch {
+      return false;
+    }
+    if (
+      !Array.isArray(permissions) ||
+      permissions.some(
+        (permission) =>
+          !permission ||
+          typeof permission !== "object" ||
+          typeof permission.resourceId !== "string" ||
+          typeof permission.action !== "string",
+      )
+    )
+      return false;
+    if (
+      !technicalAction &&
+      !permissions.some(
+        (permission) =>
+          permission.resourceId === request.resourceId && permission.action === request.action,
+      )
+    )
+      return false;
+    current = stringColumn(link, "parent_task_id");
+  }
+  return false;
 }
 
 export class AccessDeniedError extends Error {
@@ -99,6 +187,8 @@ export async function evaluate(
   ) {
     return recordDecision(tx, request, "DENY", "private_group_context");
   }
+  if (!(await delegatedTaskAllows(tx, request)))
+    return recordDecision(tx, request, "DENY", "delegation_scope_denied");
   const grants = await tx.execute({
     sql: "SELECT id, effect FROM grants WHERE principal_id = ? AND resource_id = ? AND action = ? AND scope_key = ? AND revoked_at IS NULL ORDER BY CASE effect WHEN 'allow' THEN 0 ELSE 1 END, id LIMIT 1",
     args: [resolved, request.resourceId, request.action, scopeKey(request.caller.scope)],

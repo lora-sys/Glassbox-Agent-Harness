@@ -10,6 +10,7 @@ export type {
   TaskRetryPolicy,
   TaskWaitKind,
   TaskWaitPolicy,
+  DelegatedPermission,
   TaskStep,
   TaskEventType,
   TaskEvent,

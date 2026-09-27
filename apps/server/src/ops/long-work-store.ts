@@ -141,6 +141,46 @@ function boundedNames(values: readonly string[], label: string): void {
     throw new Error(`Invalid ${label}`);
 }
 
+function hasControlCharacter(value: string): boolean {
+  for (const character of value) {
+    if (character.charCodeAt(0) < 32) return true;
+  }
+  return false;
+}
+
+function boundedDelegatedPermissions(
+  values: TaskStep["delegatedPermissionSet"],
+  label: string,
+): void {
+  if (
+    !Array.isArray(values) ||
+    values.length > 32 ||
+    values.some(
+      (permission) =>
+        !permission ||
+        typeof permission !== "object" ||
+        Array.isArray(permission) ||
+        Object.keys(permission).length !== 2 ||
+        typeof permission.resourceId !== "string" ||
+        !permission.resourceId.trim() ||
+        permission.resourceId !== permission.resourceId.trim() ||
+        permission.resourceId.length > 512 ||
+        permission.resourceId.includes("*") ||
+        hasControlCharacter(permission.resourceId) ||
+        typeof permission.action !== "string" ||
+        !permission.action.trim() ||
+        permission.action !== permission.action.trim() ||
+        permission.action.length > 128 ||
+        permission.action.includes("*") ||
+        hasControlCharacter(permission.action),
+    ) ||
+    new Set(values.map((permission) => JSON.stringify([permission.resourceId, permission.action])))
+      .size !== values.length ||
+    JSON.stringify(values).length > 32768
+  )
+    throw new Error(`Invalid ${label}`);
+}
+
 function validateInitialStep(step: TaskStep, taskId: string): void {
   const maxWaitHorizonMs = 365 * 24 * 60 * 60 * 1_000;
   const latestWaitAt = Date.now() + maxWaitHorizonMs;
@@ -162,7 +202,7 @@ function validateInitialStep(step: TaskStep, taskId: string): void {
   )
     throw new Error("Invalid initial step");
   boundedNames(step.requiredCapabilities, "required capabilities");
-  boundedNames(step.delegatedPermissionSet, "delegated permissions");
+  boundedDelegatedPermissions(step.delegatedPermissionSet, "delegated permissions");
   const retry = step.retryPolicy;
   if (retry) {
     if (
@@ -1341,7 +1381,7 @@ export class LongWorkStore {
     parentStepId: string;
     expectedStepVersion: number;
     childTaskId: string;
-    delegatedPermissionSet: readonly string[];
+    delegatedPermissionSet: ChildTaskLink["delegatedPermissionSet"];
     acceptanceCriteria: readonly string[];
     cancellationPolicy: ChildTaskLink["cancellationPolicy"];
     failurePolicy: ChildTaskLink["failurePolicy"];
@@ -1357,7 +1397,7 @@ export class LongWorkStore {
       !["block_parent", "fail_parent", "review_parent"].includes(input.failurePolicy)
     )
       throw new Error("Invalid child Task link");
-    boundedNames(input.delegatedPermissionSet, "child delegated permissions");
+    boundedDelegatedPermissions(input.delegatedPermissionSet, "child delegated permissions");
     if (input.delegatedPermissionSet.length > 0)
       throw new Error("Child Task delegated permissions are not yet supported");
     const acceptanceCriteriaJson = boundedCriteria(input.acceptanceCriteria);
@@ -1390,9 +1430,20 @@ export class LongWorkStore {
       });
       if (!decision.rows[0]) throw new Error("Current Task continuation grant is required");
 
-      const parentPermissions = parseJson<string[]>(step, "delegated_permissions_json");
+      const parentPermissions = parseJson<TaskStep["delegatedPermissionSet"]>(
+        step,
+        "delegated_permissions_json",
+      );
+      boundedDelegatedPermissions(parentPermissions, "parent Step delegated permissions");
       if (
-        input.delegatedPermissionSet.some((permission) => !parentPermissions.includes(permission))
+        input.delegatedPermissionSet.some(
+          (permission) =>
+            !parentPermissions.some(
+              (parentPermission) =>
+                parentPermission.resourceId === permission.resourceId &&
+                parentPermission.action === permission.action,
+            ),
+        )
       )
         throw new Error("Child permissions exceed the parent Step delegation");
 

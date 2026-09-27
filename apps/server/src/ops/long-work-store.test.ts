@@ -543,12 +543,70 @@ it("rejects delegated permissions on principal-planned graphs", async () => {
     await expect(
       store.createGraph(
         "task-1",
-        [{ ...step("a"), delegatedPermissionSet: ["task:read"] }],
+        [{ ...step("a"), delegatedPermissionSet: [{ resourceId: "task-1", action: "task:read" }] }],
         "a",
         limits,
         claimOrigin,
       ),
     ).rejects.toThrow("Delegated permissions are not yet supported");
+  } finally {
+    await db.close();
+  }
+});
+
+it("stores exact delegated resource and action pairs on system-origin graphs", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    const store = await fixture(db);
+    const delegatedPermissionSet = [
+      { resourceId: "task-1", action: "task:read" },
+      { resourceId: "task-2", action: "task:read" },
+      { resourceId: "task-1", action: "task:continue" },
+    ];
+    await store.createGraph(
+      "task-1",
+      [{ ...step("a"), delegatedPermissionSet }],
+      "a",
+      limits,
+      system,
+    );
+    expect((await store.listSteps("task-1"))[0]?.delegatedPermissionSet).toEqual(
+      delegatedPermissionSet,
+    );
+  } finally {
+    await db.close();
+  }
+});
+
+it("rejects malformed, wildcard, and duplicate delegated permission entries", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    const store = await fixture(db);
+    const invalidSets = [
+      ["task:read"],
+      [{ resourceId: "task-1" }],
+      [{ resourceId: "task-1", action: "task:read", scope: "all" }],
+      [{ resourceId: "", action: "task:read" }],
+      [{ resourceId: "task-1", action: "" }],
+      [{ resourceId: "*", action: "task:read" }],
+      [{ resourceId: "task-1", action: "*" }],
+      [{ resourceId: "task-1", action: "task:\nread" }],
+      [
+        { resourceId: "task-1", action: "task:read" },
+        { resourceId: "task-1", action: "task:read" },
+      ],
+    ];
+    for (const delegatedPermissionSet of invalidSets) {
+      await expect(
+        store.createGraph(
+          "task-1",
+          [{ ...step("a"), delegatedPermissionSet } as TaskStep],
+          "a",
+          limits,
+          system,
+        ),
+      ).rejects.toThrow("Invalid delegated permissions");
+    }
   } finally {
     await db.close();
   }
@@ -656,7 +714,7 @@ it("rejects child Task links with stale Step state, delegated permissions, or mi
       store.createChildTaskLink({
         ...common,
         expectedStepVersion: 2,
-        delegatedPermissionSet: ["task:read"],
+        delegatedPermissionSet: [{ resourceId: "task-1", action: "task:read" }],
       }),
     ).rejects.toThrow("Child Task delegated permissions are not yet supported");
     await expect(

@@ -91,6 +91,7 @@ export async function authorizeLongWorkAction(
     caller: { principalId: creatorPrincipalId, scope: storedScope },
     resourceId: input.resourceId,
     action: input.action,
+    delegatedTaskId: input.taskId,
   });
   if (decision.decision !== "ALLOW") throw new AccessDeniedError(decision);
   return decision.id;

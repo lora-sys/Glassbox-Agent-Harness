@@ -227,4 +227,37 @@ describe("internal Task Step Runs", () => {
       }),
     ).rejects.toMatchObject({ decision: { reason: "no_grant" } });
   });
+
+  it("checks the child delegation boundary before admitting an internal Run", async () => {
+    const { db, conversations } = await fixture();
+    await db.transaction(async (tx) => {
+      await tx.execute({
+        sql: "INSERT INTO tasks(id,title,status,priority,creator_principal_id,conversation_id,created_at,updated_at,orchestration_mode,origin_scope_key) VALUES ('parent','Parent','RUNNING','normal','owner','conversation-1',?,?,'durable',?)",
+        args: [time, time, scopeKey(scope)],
+      });
+      await tx.execute({
+        sql: "INSERT INTO task_steps(id,task_id,kind,title,status,dependency_policy_json,max_attempts,required_capabilities_json,delegated_permissions_json,version,created_at,updated_at) VALUES ('parent-step','parent','child_task','Child','running','{}',1,'[]','[]',1,?,?)",
+        args: [time, time],
+      });
+      await tx.execute(
+        "INSERT INTO task_child_links(child_task_id,parent_task_id,parent_step_id,delegated_permissions_json,acceptance_criteria_json,cancel_policy,failure_policy,created_at) VALUES ('task-1','parent','parent-step','invalid','[]','keep_child','block_parent','now')",
+      );
+    });
+    const input = {
+      caller,
+      taskId: "task-1",
+      stepId: "step-1",
+      attemptId: "attempt-1",
+      executionRef: "pi:default",
+    };
+    await expect(conversations.createInternalStepRun(input)).rejects.toMatchObject({
+      decision: { reason: "delegation_scope_denied" },
+    });
+    await db.transaction((tx) =>
+      tx.execute(
+        "UPDATE task_child_links SET delegated_permissions_json = '[]' WHERE child_task_id = 'task-1'",
+      ),
+    );
+    expect((await conversations.createInternalStepRun(input)).source).toBe("task_step");
+  });
 });
