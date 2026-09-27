@@ -4,7 +4,7 @@ Issue: #30. This runbook records the migration from the existing Windows service
 
 ## Availability limit
 
-WSL runs on the Windows host. A Windows sleep, shutdown, or reboot interrupts the WSL services. Linux `systemd` can restart services when the distribution starts, but a `systemd` service does not keep the WSL distribution alive. On this host, the Windows scheduled task `Glassbox-WSL-Keepalive` starts `wsl.exe -d Ubuntu -u yanbingzhao -- /usr/bin/sleep infinity` at user logon. Check that task after a Windows login. Continuous service during host downtime requires an independent Linux host.
+WSL runs on the Windows host. A Windows sleep, shutdown, or reboot interrupts the WSL services. Linux `systemd` can restart services when the distribution starts, but a `systemd` service does not keep the WSL distribution alive. On this host, the Windows scheduled task `Glassbox-WSL-Keepalive` starts `wsl.exe -d Ubuntu -u yanbingzhao -- /usr/bin/sleep infinity` at user logon and retries each minute when that process has exited. Its repeated trigger ignores new instances while the task is already running. After a controlled WSL termination, the task restarted Ubuntu and Docker and Herdr recovered. Check the task after a Windows login. Continuous service during host downtime requires an independent Linux host.
 
 ## Frozen baseline
 
