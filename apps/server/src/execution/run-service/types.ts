@@ -6,6 +6,8 @@ import type { DomainStore } from "../../persistence/index.js";
 export type AcceptedIncoming = Awaited<ReturnType<DomainStore["conversations"]["acceptIncoming"]>>;
 
 export interface ExecutionInput {
+  /** Set only by the server from a persisted internal Run source. */
+  executionMode?: "task_step_model";
   caller: CallerContext;
   conversation: ConversationRecord;
   run: RunRecord;
@@ -31,6 +33,8 @@ export interface ExecutionResult {
 export interface RunExecutionAdapter {
   /** True only for adapters with enforced isolation of files, tools and host configuration. */
   supportsGroup: boolean;
+  /** True only when task_step_model executes without any mutating or ambient Tool surface. */
+  supportsTaskStepModel?: boolean;
   execute(input: ExecutionInput): Promise<ExecutionResult>;
 }
 
@@ -97,6 +101,8 @@ export interface RunServiceOptions {
   resolveExecution(executionRef: string): RunExecutionAdapter | undefined;
   transport: RunTransport;
   concurrency?: number;
+  /** Polls the shared durable queue when an external coordinator inserts internal Runs. */
+  queuedPollMs?: number;
   deliveryTimeoutMs?: number;
   onEvent?: (event: RunServiceEvent) => void | Promise<void>;
   prepareDelivery?: (

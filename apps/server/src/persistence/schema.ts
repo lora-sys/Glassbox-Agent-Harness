@@ -210,10 +210,17 @@ export const schemaV12Migration = [
   `CREATE INDEX task_step_leases_expiry ON task_step_leases(state,expires_at)`,
 ];
 
+export const schemaV13Migration = [
+  `ALTER TABLE runs ADD COLUMN source TEXT NOT NULL DEFAULT 'external' CHECK(source IN ('external','task_step'))`,
+  `CREATE UNIQUE INDEX task_attempts_identity_task_step ON task_attempts(id,task_id,step_id)`,
+  `CREATE TABLE task_attempt_runs (attempt_id TEXT PRIMARY KEY, run_id TEXT NOT NULL UNIQUE REFERENCES runs(id), task_id TEXT NOT NULL REFERENCES tasks(id), step_id TEXT NOT NULL, FOREIGN KEY(attempt_id,task_id,step_id) REFERENCES task_attempts(id,task_id,step_id), FOREIGN KEY(task_id,step_id) REFERENCES task_steps(task_id,id))`,
+];
+
 export const schema = [
   ...baseSchema,
   ...schemaV7Statements,
   ...schemaV8Migration,
   ...learningSchema,
   ...schemaV12Migration,
+  ...schemaV13Migration,
 ];

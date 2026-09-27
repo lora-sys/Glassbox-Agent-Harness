@@ -1,7 +1,8 @@
-import { expect, it } from "vite-plus/test";
+import { createHash } from "node:crypto";
+import { expect, it, vi } from "vite-plus/test";
 import type { TaskStep } from "@glassbox/contracts";
 import { openDomainStore } from "../../application/domain-store.js";
-import type { CallerContext } from "../../identity/scope.js";
+import { conversationScopeKey, type CallerContext } from "../../identity/scope.js";
 import { AccessDeniedError } from "../../auth/service.js";
 import { FakeHerdrBridge } from "../fake-herdr-bridge.js";
 import { LongWorkScheduler } from "../long-work-scheduler.js";
@@ -19,6 +20,78 @@ const caller: CallerContext = {
     senderId: "owner",
   },
 };
+
+async function createModelTask(
+  store: Awaited<ReturnType<typeof openDomainStore>>,
+  specRef = "pi:test",
+) {
+  await store.identities.bindOwner("owner", caller.scope);
+  await store.conversations.createAgent("personal");
+  const now = new Date().toISOString();
+  await store.db.transaction(async (tx) => {
+    await tx.execute(
+      "INSERT INTO resources(id,kind,visibility,owner_id) VALUES ('conversation:model-test','conversation','private','owner')",
+    );
+    await tx.execute({
+      sql: "INSERT INTO conversations(id,agent_id,principal_id,scope_key,scope_json,resource_id,created_at) VALUES ('conversation:model-test','personal','owner',?,?,?,?)",
+      args: [
+        conversationScopeKey(caller.scope),
+        JSON.stringify(caller.scope),
+        "conversation:model-test",
+        now,
+      ],
+    });
+    await tx.execute({
+      sql: "INSERT INTO conversation_locations(agent_id,location_key,conversation_id,created_at) VALUES ('personal',?,'conversation:model-test',?)",
+      args: [conversationScopeKey(caller.scope), now],
+    });
+  });
+  const task = await store.tasks.createTask({
+    title: "Model Step",
+    creatorPrincipalId: "owner",
+    conversationId: "conversation:model-test",
+    authorizationScope: caller.scope,
+  });
+  for (const action of ["task:continue", "task:read"])
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: `task-${task.id}`,
+      action,
+      scope: caller.scope,
+      effect: "allow",
+    });
+  for (const action of ["run:create", "conversation:read", "run:control"])
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: "agent:personal",
+      action,
+      scope: caller.scope,
+      effect: "allow",
+    });
+  const nowStep = new Date().toISOString();
+  const step: TaskStep = {
+    id: "model-step",
+    taskId: task.id,
+    kind: "model",
+    title: "Draft an answer",
+    instructions: "Write a short answer",
+    specRef,
+    status: "pending",
+    dependencyIds: [],
+    dependencyPolicy: { failed: "block", cancelled: "cancel", skipped: "skip" },
+    maxAttempts: 2,
+    requiredCapabilities: [],
+    delegatedPermissionSet: [],
+    createdAt: nowStep,
+    updatedAt: nowStep,
+    version: 1,
+  };
+  await store.longWork.createGraph(task.id, [step], step.id, DEFAULT_TASK_GRAPH_LIMITS, {
+    kind: "system",
+    reason: "test plan",
+  });
+  return { task, step };
+}
 
 it("coordinates a signal wait through Glassbox state and stops at Task review", async () => {
   const store = await openDomainStore({ databasePath: ":memory:" });
@@ -505,6 +578,247 @@ it("moves a successful root to review after a non-root Step is cancelled", async
       "cancelled",
       "succeeded",
     ]);
+  } finally {
+    await store.close();
+  }
+});
+
+it("creates a linked internal Run for a model Step and settles it into Step review", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  try {
+    const { task, step } = await createModelTask(store);
+    const advance = createAdvanceLongWorkActivity(store);
+    const input = { taskId: task.id, policyRevision: 1 };
+
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    const claimed = (await store.longWork.listSteps(task.id))[0]!;
+    const lease = await store.longWork.getActiveLease(task.id, step.id);
+    expect(claimed.status).toBe("running");
+    expect(lease?.attemptId).toBeTruthy();
+    const run = await store.conversations.getInternalStepRun(caller, lease!.attemptId!);
+    expect(run).toMatchObject({ source: "task_step", status: "queued", executionRef: "pi:test" });
+
+    const pending = await advance(input);
+    expect(pending.kind).toBe("wait");
+    if (pending.kind !== "wait") throw new Error("Expected a durable Run poll wait");
+    expect(Date.parse(pending.wakeAt!)).toBeGreaterThan(Date.now());
+    const heartbeat = await store.longWork.getActiveLease(task.id, step.id);
+    expect(Date.parse(heartbeat!.expiresAt)).toBeGreaterThan(Date.parse(lease!.expiresAt));
+
+    await store.db.transaction((tx) =>
+      tx.execute({
+        sql: "UPDATE runs SET status = 'succeeded', result_text = 'Draft complete' WHERE id = ?",
+        args: [run!.id],
+      }),
+    );
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    expect((await store.longWork.listSteps(task.id))[0]).toMatchObject({
+      status: "review",
+      outputRef: `run:${run!.id}`,
+    });
+    expect((await store.tasks.getTask(task.id))?.status).not.toBe("DONE");
+    const attemptStatus = await store.db.transaction((tx) =>
+      tx.execute({
+        sql: "SELECT status FROM task_attempts WHERE id = ?",
+        args: [lease!.attemptId!],
+      }),
+    );
+    expect(attemptStatus.rows[0]?.status).toBe("review");
+  } finally {
+    await store.close();
+  }
+});
+
+it("keeps Task cancellation pending until the linked model Run is terminal", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  try {
+    const { task, step } = await createModelTask(store);
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: `task-${task.id}`,
+      action: "task:cancel",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    const advance = createAdvanceLongWorkActivity(store);
+    const input = { taskId: task.id, policyRevision: 1 };
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    const lease = await store.longWork.getActiveLease(task.id, step.id);
+    const run = await store.conversations.getInternalStepRun(caller, lease!.attemptId!);
+    expect(run).toBeTruthy();
+
+    const ops = new AuthorizedOpsService(store, new FakeHerdrBridge());
+    expect(await ops.cancel(caller, task.id)).toBe(false);
+    await store.authorization.revokeScopeAction({
+      principalId: caller.principalId,
+      resourceId: `task-${task.id}`,
+      action: "task:read",
+      scope: caller.scope,
+    });
+    expect(await advance(input)).toMatchObject({ kind: "wait" });
+    expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("running");
+    const queuedHeartbeat = await store.longWork.getActiveLease(task.id, step.id);
+    expect(queuedHeartbeat?.state).toBe("active");
+    expect(queuedHeartbeat!.version).toBeGreaterThan(lease!.version);
+
+    await store.db.transaction((tx) =>
+      tx.execute({ sql: "UPDATE runs SET status = 'cancelling' WHERE id = ?", args: [run!.id] }),
+    );
+    expect(await advance(input)).toMatchObject({ kind: "wait" });
+    expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("running");
+    expect((await store.longWork.getActiveLease(task.id, step.id))!.version).toBeGreaterThan(
+      queuedHeartbeat!.version,
+    );
+
+    await store.db.transaction((tx) =>
+      tx.execute({ sql: "UPDATE runs SET status = 'unknown' WHERE id = ?", args: [run!.id] }),
+    );
+    expect(await advance(input)).toMatchObject({ kind: "wait" });
+    expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("running");
+
+    await store.db.transaction((tx) =>
+      tx.execute({ sql: "UPDATE runs SET status = 'cancelled' WHERE id = ?", args: [run!.id] }),
+    );
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("cancelled");
+    expect(await store.longWork.getActiveLease(task.id, step.id)).toBeNull();
+    expect(
+      await store.db.transaction(
+        async (tx) =>
+          (
+            await tx.execute({
+              sql: "SELECT status FROM task_attempts WHERE id = ?",
+              args: [lease!.attemptId!],
+            })
+          ).rows[0]?.status,
+      ),
+    ).toBe("canceled");
+    expect(await advance(input)).toEqual({ kind: "complete" });
+    expect(await store.tasks.getTask(task.id)).toMatchObject({
+      status: "CANCELED",
+      cancellationState: "settled",
+    });
+    expect((await store.longWork.listEvents(task.id)).map((event) => event.type)).toContain(
+      "STEP_CANCELLED",
+    );
+  } finally {
+    await store.close();
+  }
+});
+
+it("settles a cancelled claimed model Step when no internal Run was created", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  try {
+    const { task, step } = await createModelTask(store);
+    const scheduler = new LongWorkScheduler(store.longWork, DEFAULT_TASK_GRAPH_LIMITS);
+    await scheduler.advance(task.id, { kind: "system", reason: "test ready model Step" });
+    const readyStep = (await store.longWork.listSteps(task.id))[0]!;
+    const decision = await store.authorization.check({
+      caller,
+      resourceId: `task-${task.id}`,
+      action: "task:continue",
+    });
+    expect(decision.decision).toBe("ALLOW");
+    await store.longWork.claimReadyStep({
+      taskId: task.id,
+      stepId: step.id,
+      expectedStepVersion: readyStep.version,
+      attemptId: "model-attempt-without-run",
+      leaseId: "model-lease-without-run",
+      ownerInstanceId: `temporal-model-${createHash("sha256")
+        .update(`${task.id}\0${step.id}`)
+        .digest("hex")}`,
+      leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+      origin: {
+        kind: "decision",
+        decisionId: decision.id,
+        actorPrincipalId: caller.principalId,
+      },
+    });
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: `task-${task.id}`,
+      action: "task:cancel",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    const advance = createAdvanceLongWorkActivity(store);
+    const input = { taskId: task.id, policyRevision: 1 };
+    const ops = new AuthorizedOpsService(store, new FakeHerdrBridge());
+    expect(await ops.cancel(caller, task.id)).toBe(false);
+
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("cancelled");
+    expect(await store.longWork.getActiveLease(task.id, step.id)).toBeNull();
+    expect(await advance(input)).toEqual({ kind: "complete" });
+    expect(await store.tasks.getTask(task.id)).toMatchObject({
+      status: "CANCELED",
+      cancellationState: "settled",
+    });
+  } finally {
+    await store.close();
+  }
+});
+
+it("settles a model Step failed when its internal Run insert fails before commit", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  try {
+    const { task } = await createModelTask(store);
+    vi.spyOn(store.conversations, "createInternalStepRun").mockRejectedValueOnce(
+      new Error("insert failed"),
+    );
+    const advance = createAdvanceLongWorkActivity(store);
+    expect(await advance({ taskId: task.id, policyRevision: 1 })).toEqual({ kind: "continue" });
+    const step = (await store.longWork.listSteps(task.id))[0]!;
+    expect(step.status).toBe("failed");
+    expect(await store.longWork.getActiveLease(task.id, step.id)).toBeNull();
+    expect(
+      (await store.longWork.listEvents(task.id)).map((event) => event.evidenceRef),
+    ).toContainEqual(expect.stringMatching(/^run-create-failed:/));
+    expect(await store.conversations.getInternalStepRun(caller, "missing-attempt")).toBeNull();
+  } finally {
+    await store.close();
+  }
+});
+
+it("blocks model Steps whose specRef cannot select a supported model adapter", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  try {
+    const { task } = await createModelTask(store, "executor-main");
+    const advance = createAdvanceLongWorkActivity(store);
+    expect(await advance({ taskId: task.id, policyRevision: 1 })).toEqual({ kind: "continue" });
+    expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("blocked");
+    expect((await store.longWork.listEvents(task.id)).at(-1)?.metadata).toMatchObject({
+      reason: "invalid_model_execution_ref",
+      outcome: "not_started",
+    });
+  } finally {
+    await store.close();
+  }
+});
+
+it("blocks model Steps that request a capability or delegated permission outside text generation", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  try {
+    const { task, step } = await createModelTask(store);
+    await store.db.transaction((tx) =>
+      tx.execute({
+        sql: "UPDATE task_steps SET required_capabilities_json = ?, delegated_permissions_json = ? WHERE id = ?",
+        args: [JSON.stringify(["browser"]), JSON.stringify(["task:read"]), step.id],
+      }),
+    );
+    const advance = createAdvanceLongWorkActivity(store);
+    expect(await advance({ taskId: task.id, policyRevision: 1 })).toEqual({ kind: "continue" });
+    expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("blocked");
+    expect(await store.longWork.getActiveLease(task.id, step.id)).toBeNull();
+    const attempts = await store.db.transaction((tx) =>
+      tx.execute({ sql: "SELECT id FROM task_attempts WHERE task_id = ?", args: [task.id] }),
+    );
+    expect(attempts.rows).toHaveLength(0);
+    expect((await store.longWork.listEvents(task.id)).at(-1)?.metadata).toMatchObject({
+      reason: "model_execution_boundary_exceeded",
+      outcome: "not_started",
+    });
   } finally {
     await store.close();
   }

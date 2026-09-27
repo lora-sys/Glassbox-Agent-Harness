@@ -17,6 +17,7 @@ import {
 import { requireIdentifier } from "../identity/scope.js";
 import { DomainDatabase, optionalString, stringColumn } from "../persistence/database.js";
 import { validateTaskGraph, type TaskGraphLimits } from "./task-graph.js";
+import { decideTaskRetry, type RetrySideEffectOutcome } from "./long-work-retry.js";
 
 /** Only trusted services may call this store. A decision ID records evidence; it does not
  * prove that a grant is still current. Callers must reauthorize before protected work. */
@@ -351,6 +352,11 @@ export class LongWorkStore {
       const now = new Date().toISOString();
       if (expiryMs <= Date.parse(now) || expiryMs > Date.parse(now) + 86_400_000)
         throw new Error("Lease expiry must be within 24 hours");
+      const taskStarted = await tx.execute({
+        sql: "UPDATE tasks SET status = 'RUNNING', updated_at = ? WHERE id = ? AND orchestration_mode = 'durable' AND cancellation_state = 'none' AND status IN ('NEW','QUEUED','ASSIGNED','RUNNING','WAITING_INPUT')",
+        args: [now, input.taskId],
+      });
+      if (taskStarted.rowsAffected !== 1) throw new Error("Task cannot start a Step");
       const activeLease = await tx.execute({
         sql: "SELECT id FROM task_step_leases WHERE step_id = ? AND state IN ('active','quarantined')",
         args: [input.stepId],
@@ -600,6 +606,406 @@ export class LongWorkStore {
         await this.requireStep(tx, input.taskId, input.stepId),
         dependencies.rows.map((row) => stringColumn(row, "dependency_id")),
       );
+    });
+  }
+
+  /** Settles a claimed Step after Task cancellation and proves its internal Run stopped. */
+  async settleClaimedStepCancellation(input: {
+    taskId: string;
+    stepId: string;
+    attemptId: string;
+    leaseId: string;
+    ownerInstanceId: string;
+    expectedStepVersion: number;
+    expectedLeaseVersion: number;
+    runId?: string;
+    origin: LongWorkOrigin;
+  }): Promise<TaskStep> {
+    for (const value of [input.taskId, input.stepId, input.attemptId, input.leaseId])
+      requireIdentifier(value);
+    requireIdentifier(input.ownerInstanceId);
+    if (input.runId !== undefined) requireIdentifier(input.runId);
+    if (
+      !Number.isSafeInteger(input.expectedStepVersion) ||
+      input.expectedStepVersion < 1 ||
+      !Number.isSafeInteger(input.expectedLeaseVersion) ||
+      input.expectedLeaseVersion < 1
+    )
+      throw new Error("Invalid Step cancellation settlement version");
+    return this.db.transaction(async (tx) => {
+      await this.requireOrigin(tx, input.origin);
+      const task = await this.requireTask(tx, input.taskId);
+      if (
+        task.orchestration_mode !== "durable" ||
+        !["requested", "stopping"].includes(stringColumn(task, "cancellation_state"))
+      )
+        throw new Error("Task cancellation is not pending");
+      const step = await this.requireStep(tx, input.taskId, input.stepId);
+      if (
+        step.kind !== "model" ||
+        step.status !== "running" ||
+        Number(step.version) !== input.expectedStepVersion
+      )
+        throw new Error("Step cancellation settlement conflict");
+      const attempt = await tx.execute({
+        sql: "SELECT status FROM task_attempts WHERE id = ? AND task_id = ? AND step_id = ?",
+        args: [input.attemptId, input.taskId, input.stepId],
+      });
+      if (attempt.rows[0]?.status !== "running")
+        throw new Error("Attempt cancellation settlement conflict");
+      const lease = await tx.execute({
+        sql: "SELECT state,version,owner_instance_id,attempt_id FROM task_step_leases WHERE id = ? AND task_id = ? AND step_id = ?",
+        args: [input.leaseId, input.taskId, input.stepId],
+      });
+      const owner = lease.rows[0];
+      if (
+        owner?.state !== "active" ||
+        Number(owner.version) !== input.expectedLeaseVersion ||
+        owner.owner_instance_id !== input.ownerInstanceId ||
+        owner.attempt_id !== input.attemptId
+      )
+        throw new Error("Step cancellation lease ownership conflict");
+
+      const linkedRun = await tx.execute({
+        sql: `SELECT r.id,r.status FROM task_attempt_runs ar
+          JOIN runs r ON r.id = ar.run_id
+          WHERE ar.attempt_id = ? AND ar.task_id = ? AND ar.step_id = ?`,
+        args: [input.attemptId, input.taskId, input.stepId],
+      });
+      if (input.runId === undefined) {
+        if (linkedRun.rows[0])
+          throw new Error("Internal Run must be terminal before Step cancellation");
+      } else {
+        const linked = linkedRun.rows[0];
+        if (
+          !linked ||
+          linked.id !== input.runId ||
+          !["cancelled", "succeeded", "failed", "interrupted"].includes(
+            stringColumn(linked, "status"),
+          )
+        )
+          throw new Error("Internal Run must be terminal before Step cancellation");
+      }
+
+      const now = new Date().toISOString();
+      const attemptUpdate = await tx.execute({
+        sql: "UPDATE task_attempts SET status = 'canceled', completed_at = ? WHERE id = ? AND task_id = ? AND step_id = ? AND status = 'running'",
+        args: [now, input.attemptId, input.taskId, input.stepId],
+      });
+      const stepUpdate = await tx.execute({
+        sql: "UPDATE task_steps SET status = 'cancelled', output_ref = NULL, version = version + 1, updated_at = ? WHERE id = ? AND task_id = ? AND version = ? AND status = 'running'",
+        args: [now, input.stepId, input.taskId, input.expectedStepVersion],
+      });
+      const leaseUpdate = await tx.execute({
+        sql: "UPDATE task_step_leases SET state = 'released', version = version + 1, heartbeat_at = ?, released_at = ? WHERE id = ? AND task_id = ? AND owner_instance_id = ? AND attempt_id = ? AND version = ? AND state = 'active'",
+        args: [
+          now,
+          now,
+          input.leaseId,
+          input.taskId,
+          input.ownerInstanceId,
+          input.attemptId,
+          input.expectedLeaseVersion,
+        ],
+      });
+      if (
+        attemptUpdate.rowsAffected !== 1 ||
+        stepUpdate.rowsAffected !== 1 ||
+        leaseUpdate.rowsAffected !== 1
+      )
+        throw new Error("Step cancellation settlement conflict");
+      const evidenceRef = input.runId ? `run:${input.runId}` : `run-not-created:${input.attemptId}`;
+      await this.appendEventTx(tx, {
+        taskId: input.taskId,
+        stepId: input.stepId,
+        attemptId: input.attemptId,
+        type: "ATTEMPT_FINISHED",
+        origin: input.origin,
+        evidenceRef,
+        metadata: { outcome: "cancelled", runId: input.runId ?? null },
+      });
+      await this.appendEventTx(tx, {
+        taskId: input.taskId,
+        stepId: input.stepId,
+        attemptId: input.attemptId,
+        type: "STEP_CANCELLED",
+        origin: input.origin,
+        evidenceRef,
+        metadata: {
+          reason: "task_cancellation_settled",
+          previousStatus: "running",
+          status: "cancelled",
+          runId: input.runId ?? null,
+          rollbackPerformed: false,
+        },
+      });
+      const dependencies = await tx.execute({
+        sql: "SELECT dependency_id FROM task_step_dependencies WHERE task_id = ? AND step_id = ? ORDER BY dependency_id",
+        args: [input.taskId, input.stepId],
+      });
+      return parseStep(
+        await this.requireStep(tx, input.taskId, input.stepId),
+        dependencies.rows.map((row) => stringColumn(row, "dependency_id")),
+      );
+    });
+  }
+
+  /** Reads linked Run state only for the current owned model Step during cancellation. */
+  async getClaimedModelRunForCancellation(input: {
+    taskId: string;
+    stepId: string;
+    attemptId: string;
+    leaseId: string;
+    ownerInstanceId: string;
+    expectedStepVersion: number;
+    expectedLeaseVersion: number;
+  }): Promise<{ id: string; status: string } | null> {
+    for (const value of [input.taskId, input.stepId, input.attemptId, input.leaseId])
+      requireIdentifier(value);
+    requireIdentifier(input.ownerInstanceId);
+    if (
+      !Number.isSafeInteger(input.expectedStepVersion) ||
+      input.expectedStepVersion < 1 ||
+      !Number.isSafeInteger(input.expectedLeaseVersion) ||
+      input.expectedLeaseVersion < 1
+    )
+      throw new Error("Invalid Step cancellation observation version");
+    return this.db.transaction(async (tx) => {
+      const task = await this.requireTask(tx, input.taskId);
+      if (
+        task.orchestration_mode !== "durable" ||
+        !["requested", "stopping"].includes(stringColumn(task, "cancellation_state"))
+      )
+        throw new Error("Task cancellation is not pending");
+      const step = await this.requireStep(tx, input.taskId, input.stepId);
+      if (
+        step.kind !== "model" ||
+        step.status !== "running" ||
+        step.version !== input.expectedStepVersion
+      )
+        throw new Error("Step cancellation observation conflict");
+      const attempt = await tx.execute({
+        sql: "SELECT status FROM task_attempts WHERE id = ? AND task_id = ? AND step_id = ?",
+        args: [input.attemptId, input.taskId, input.stepId],
+      });
+      if (attempt.rows[0]?.status !== "running")
+        throw new Error("Attempt cancellation observation conflict");
+      const lease = await tx.execute({
+        sql: "SELECT state,version,owner_instance_id,attempt_id FROM task_step_leases WHERE id = ? AND task_id = ? AND step_id = ?",
+        args: [input.leaseId, input.taskId, input.stepId],
+      });
+      const owner = lease.rows[0];
+      if (
+        owner?.state !== "active" ||
+        Number(owner.version) !== input.expectedLeaseVersion ||
+        owner.owner_instance_id !== input.ownerInstanceId ||
+        owner.attempt_id !== input.attemptId
+      )
+        throw new Error("Step cancellation lease ownership conflict");
+      const linked = await tx.execute({
+        sql: `SELECT r.id,r.status FROM task_attempt_runs ar
+          JOIN runs r ON r.id = ar.run_id
+          WHERE ar.attempt_id = ? AND ar.task_id = ? AND ar.step_id = ?`,
+        args: [input.attemptId, input.taskId, input.stepId],
+      });
+      const row = linked.rows[0];
+      return row ? { id: stringColumn(row, "id"), status: stringColumn(row, "status") } : null;
+    });
+  }
+
+  /** Finishes a failed claimed attempt and schedules a retry only with durable proof that
+   * its side effect did not start or was not applied. The Step, Attempt, lease, wait, and
+   * Raw Trace events change atomically under the exact current lease version. */
+  async scheduleClaimedStepRetry(input: {
+    taskId: string;
+    stepId: string;
+    attemptId: string;
+    leaseId: string;
+    ownerInstanceId: string;
+    expectedStepVersion: number;
+    expectedLeaseVersion: number;
+    proof: {
+      ref: string;
+      sideEffectOutcome: Extract<RetrySideEffectOutcome, "not_started" | "not_applied">;
+      errorClass?: string;
+      timedOut?: boolean;
+    };
+    origin: LongWorkOrigin;
+  }): Promise<TaskStep> {
+    for (const value of [input.taskId, input.stepId, input.attemptId, input.leaseId])
+      requireIdentifier(value);
+    requireIdentifier(input.ownerInstanceId);
+    if (
+      !Number.isSafeInteger(input.expectedStepVersion) ||
+      input.expectedStepVersion < 1 ||
+      !Number.isSafeInteger(input.expectedLeaseVersion) ||
+      input.expectedLeaseVersion < 1 ||
+      !input.proof.ref.trim() ||
+      input.proof.ref.length > 512 ||
+      !["not_started", "not_applied"].includes(input.proof.sideEffectOutcome) ||
+      (input.proof.errorClass !== undefined &&
+        (!input.proof.errorClass.trim() || input.proof.errorClass.length > 128)) ||
+      (input.proof.timedOut !== undefined && typeof input.proof.timedOut !== "boolean")
+    )
+      throw new Error("Invalid retry proof or version");
+
+    return this.db.transaction(async (tx) => {
+      await this.requireOrigin(tx, input.origin);
+      await this.requireActiveDurableTask(tx, input.taskId);
+      const stepRow = await this.requireStep(tx, input.taskId, input.stepId);
+      const dependencyRows = await tx.execute({
+        sql: "SELECT dependency_id FROM task_step_dependencies WHERE task_id = ? AND step_id = ? ORDER BY dependency_id",
+        args: [input.taskId, input.stepId],
+      });
+      const dependencies = dependencyRows.rows.map((row) => stringColumn(row, "dependency_id"));
+      const step = parseStep(stepRow, dependencies);
+      if (step.status !== "running" || Number(step.version) !== input.expectedStepVersion)
+        throw new Error("Step retry settlement conflict");
+      if (!step.retryPolicy) throw new Error("Step retry policy is required");
+
+      const attempt = await tx.execute({
+        sql: "SELECT status FROM task_attempts WHERE id = ? AND task_id = ? AND step_id = ?",
+        args: [input.attemptId, input.taskId, input.stepId],
+      });
+      if (attempt.rows[0]?.status !== "running")
+        throw new Error("Attempt retry settlement conflict");
+      const lease = await tx.execute({
+        sql: "SELECT state,version,owner_instance_id,attempt_id FROM task_step_leases WHERE id = ? AND task_id = ? AND step_id = ?",
+        args: [input.leaseId, input.taskId, input.stepId],
+      });
+      const owner = lease.rows[0];
+      if (
+        owner?.state !== "active" ||
+        Number(owner.version) !== input.expectedLeaseVersion ||
+        owner.owner_instance_id !== input.ownerInstanceId ||
+        owner.attempt_id !== input.attemptId
+      )
+        throw new Error("Step lease ownership conflict");
+
+      const currentCycleCount = await tx.execute({
+        sql: `SELECT COUNT(*) AS count FROM task_attempts a
+          WHERE a.task_id = ? AND a.step_id = ? AND a.attempt_number > COALESCE((
+            SELECT previous.attempt_number FROM task_events e
+              JOIN task_attempts previous ON previous.id = e.attempt_id
+              WHERE e.task_id = ? AND e.step_id = ? AND e.type = 'TASK_REWORK'
+              ORDER BY e.sequence DESC LIMIT 1
+          ),0)`,
+        args: [input.taskId, input.stepId, input.taskId, input.stepId],
+      });
+      const attemptNumber = Number(currentCycleCount.rows[0]?.count ?? 0);
+      const now = new Date().toISOString();
+      const decision = decideTaskRetry({
+        policy: step.retryPolicy,
+        attemptNumber,
+        nowMs: Date.parse(now),
+        errorClass: input.proof.errorClass,
+        timedOut: input.proof.timedOut,
+        sideEffectOutcome: input.proof.sideEffectOutcome,
+      });
+      if (decision.action !== "retry")
+        throw new Error(`Retry was not authorized: ${decision.action}/${decision.reason}`);
+      const dueAt = new Date(decision.retryAtMs).toISOString();
+      const activeWait = await tx.execute({
+        sql: "SELECT id FROM task_waits WHERE task_id = ? AND step_id = ? AND status = 'waiting' LIMIT 1",
+        args: [input.taskId, input.stepId],
+      });
+      if (activeWait.rows[0]) throw new Error("Step already has an active wait");
+      const generation =
+        Number(
+          (
+            await tx.execute({
+              sql: "SELECT COALESCE(MAX(generation),0) AS value FROM task_waits WHERE task_id = ? AND step_id = ?",
+              args: [input.taskId, input.stepId],
+            })
+          ).rows[0]?.value ?? 0,
+        ) + 1;
+      const waitId = randomUUID();
+      const waitPolicy: TaskWaitPolicy = { version: 1, kind: "retry", dueAt, overdue: "resume" };
+
+      const attemptUpdate = await tx.execute({
+        sql: "UPDATE task_attempts SET status = 'failed', completed_at = ? WHERE id = ? AND task_id = ? AND step_id = ? AND status = 'running'",
+        args: [now, input.attemptId, input.taskId, input.stepId],
+      });
+      const stepUpdate = await tx.execute({
+        sql: "UPDATE task_steps SET status = 'waiting', wait_policy_json = ?, version = version + 1, updated_at = ? WHERE id = ? AND task_id = ? AND version = ? AND status = 'running'",
+        args: [
+          JSON.stringify(waitPolicy),
+          now,
+          input.stepId,
+          input.taskId,
+          input.expectedStepVersion,
+        ],
+      });
+      const leaseUpdate = await tx.execute({
+        sql: "UPDATE task_step_leases SET state = 'released', version = version + 1, heartbeat_at = ?, released_at = ? WHERE id = ? AND task_id = ? AND owner_instance_id = ? AND attempt_id = ? AND version = ? AND state = 'active'",
+        args: [
+          now,
+          now,
+          input.leaseId,
+          input.taskId,
+          input.ownerInstanceId,
+          input.attemptId,
+          input.expectedLeaseVersion,
+        ],
+      });
+      if (
+        attemptUpdate.rowsAffected !== 1 ||
+        stepUpdate.rowsAffected !== 1 ||
+        leaseUpdate.rowsAffected !== 1
+      )
+        throw new Error("Step retry settlement conflict");
+      await tx.execute({
+        sql: "INSERT INTO task_waits(id,task_id,step_id,attempt_id,generation,kind,status,started_at,due_at,signal_key,timeout_at,policy_json,updated_at) VALUES (?,?,?,?,?,'retry','waiting',?,?,?,?,?,?)",
+        args: [
+          waitId,
+          input.taskId,
+          input.stepId,
+          input.attemptId,
+          generation,
+          now,
+          dueAt,
+          null,
+          null,
+          JSON.stringify(waitPolicy),
+          now,
+        ],
+      });
+      const metadata = {
+        attemptNumber,
+        delayMs: decision.delayMs,
+        reason: decision.reason,
+        sideEffectOutcome: input.proof.sideEffectOutcome,
+        errorClass: input.proof.errorClass ?? null,
+        timedOut: input.proof.timedOut ?? false,
+      };
+      await this.appendEventTx(tx, {
+        taskId: input.taskId,
+        stepId: input.stepId,
+        attemptId: input.attemptId,
+        type: "ATTEMPT_FINISHED",
+        origin: input.origin,
+        evidenceRef: input.proof.ref,
+        metadata: { outcome: "failed", ...metadata },
+      });
+      await this.appendEventTx(tx, {
+        taskId: input.taskId,
+        stepId: input.stepId,
+        attemptId: input.attemptId,
+        type: "RETRY_SCHEDULED",
+        origin: input.origin,
+        evidenceRef: input.proof.ref,
+        metadata: { dueAt, generation, ...metadata },
+      });
+      await this.appendEventTx(tx, {
+        taskId: input.taskId,
+        stepId: input.stepId,
+        attemptId: input.attemptId,
+        type: "STEP_WAITING",
+        origin: input.origin,
+        evidenceRef: input.proof.ref,
+        metadata: { generation, reason: "retry_scheduled" },
+      });
+      return parseStep(await this.requireStep(tx, input.taskId, input.stepId), step.dependencyIds);
     });
   }
 
@@ -1317,7 +1723,15 @@ export class LongWorkStore {
         attemptId: optionalString(wait, "attempt_id") ?? undefined,
         type: stale ? "STEP_BLOCKED" : nextStatus === "succeeded" ? "STEP_SUCCEEDED" : "STEP_READY",
         origin,
-        metadata: { reason: stale ? "wait_overdue" : timedWait ? "timer_due" : "wait_timeout" },
+        metadata: {
+          reason: stale
+            ? "wait_overdue"
+            : kind === "retry"
+              ? "retry_due"
+              : timedWait
+                ? "timer_due"
+                : "wait_timeout",
+        },
       });
       const dependencies = await tx.execute({
         sql: "SELECT dependency_id FROM task_step_dependencies WHERE task_id = ? AND step_id = ? ORDER BY dependency_id",

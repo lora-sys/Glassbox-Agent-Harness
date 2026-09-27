@@ -189,7 +189,7 @@ it("marks an unexpectedly closed running workflow unavailable during recovery", 
   }
 });
 
-it("leaves requested Task cancellation pending external reconciliation during recovery", async () => {
+it("wakes a running workflow to settle a requested Task cancellation after recovery", async () => {
   const store = await openDomainStore({ databasePath: ":memory:" });
   try {
     const taskId = await durableTask(store);
@@ -211,15 +211,15 @@ it("leaves requested Task cancellation pending external reconciliation during re
       });
     });
 
-    expect(await coordinator.recover()).toEqual({ recovered: [], unavailable: [taskId] });
+    expect(await coordinator.recover()).toEqual({ recovered: [taskId], unavailable: [] });
     expect((await new TaskWorkflowBindingStore(store.db).listRecoverable())[0]).toMatchObject({
       taskId,
       runId: "run-1",
-      status: "unavailable",
+      status: "running",
     });
     expect((await store.tasks.getTask(taskId))?.cancellationState).toBe("requested");
     expect(port.cancel).not.toHaveBeenCalled();
-    expect(port.wake).not.toHaveBeenCalled();
+    expect(port.wake).toHaveBeenCalledTimes(1);
   } finally {
     await store.close();
   }

@@ -16,6 +16,7 @@ export function configuredModelAdapter(options: {
 }): RunExecutionAdapter {
   return {
     supportsGroup: true,
+    supportsTaskStepModel: true,
     async execute(input) {
       const resolved = options.profiles.resolve(options.profileId);
       const contextWindowTokens = resolved.profile.contextWindowTokens;

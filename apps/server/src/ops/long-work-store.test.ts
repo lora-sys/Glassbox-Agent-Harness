@@ -292,6 +292,63 @@ async function fixture(db: DomainDatabase): Promise<LongWorkStore> {
   return new LongWorkStore(db);
 }
 
+const retryPolicy = {
+  version: 1,
+  maxAttempts: 2,
+  initialDelayMs: 0,
+  backoffMultiplier: 2,
+  maxDelayMs: 10_000,
+  retryableErrorClasses: ["transient"],
+  nonRetryableErrorClasses: ["permanent"],
+  timeoutOutcome: "retryable" as const,
+};
+
+async function claimRetryStep(
+  store: LongWorkStore,
+  db: DomainDatabase,
+  options: { seedPriorReworkCycle?: boolean } = {},
+) {
+  await store.createGraph(
+    "task-1",
+    [{ ...step("retry"), maxAttempts: retryPolicy.maxAttempts, retryPolicy }],
+    "retry",
+    limits,
+    system,
+  );
+  if (options.seedPriorReworkCycle) {
+    await db.transaction(async (tx) => {
+      for (const [number, id] of ["old-attempt-1", "old-attempt-2"].entries()) {
+        await tx.execute({
+          sql: "INSERT INTO task_attempts(id,task_id,step_id,attempt_number,status,started_at,completed_at) VALUES (?,?,?,?,'failed',?,?)",
+          args: [id, "task-1", "retry", number + 2, now, now],
+        });
+      }
+      await tx.execute({
+        sql: "INSERT INTO task_events(id,task_id,step_id,attempt_id,type,metadata_json,created_at) VALUES (?,?,?,?,?,?,?)",
+        args: ["rework-event", "task-1", "retry", "old-attempt-2", "TASK_REWORK", "{}", now],
+      });
+    });
+  }
+  await store.transitionStep({
+    taskId: "task-1",
+    stepId: "retry",
+    expectedVersion: 1,
+    from: "pending",
+    to: "ready",
+    origin: system,
+  });
+  return store.claimReadyStep({
+    taskId: "task-1",
+    stepId: "retry",
+    expectedStepVersion: 2,
+    attemptId: "retry-attempt",
+    leaseId: "retry-lease",
+    ownerInstanceId: "executor-1",
+    leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+    origin: claimOrigin,
+  });
+}
+
 it("does not let legacy whole-Task operations bypass a durable graph", async () => {
   const db = await DomainDatabase.open(":memory:");
   try {
@@ -2290,6 +2347,160 @@ it("settles a claimed worker Step into review without accepting the Task", async
   }
 });
 
+it("atomically schedules a retry with the exact claimed lease and fires it after database reopen", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "glassbox-long-work-retry-"));
+  const path = join(directory, "data.db");
+  try {
+    const db = await DomainDatabase.open(path);
+    const store = await fixture(db);
+    try {
+      await claimRetryStep(store, db, { seedPriorReworkCycle: true });
+      expect((await new TaskStore(db).getTask("task-1"))?.status).toBe("RUNNING");
+      const scheduled = await store.scheduleClaimedStepRetry({
+        taskId: "task-1",
+        stepId: "retry",
+        attemptId: "retry-attempt",
+        leaseId: "retry-lease",
+        ownerInstanceId: "executor-1",
+        expectedStepVersion: 3,
+        expectedLeaseVersion: 1,
+        proof: {
+          ref: "evidence:retry-proof",
+          sideEffectOutcome: "not_applied",
+          errorClass: "transient",
+        },
+        origin: system,
+      });
+      expect(scheduled).toMatchObject({ status: "waiting", version: 4 });
+      expect(scheduled.waitPolicy).toMatchObject({ kind: "retry", overdue: "resume" });
+      await db.transaction(async (tx) => {
+        expect(
+          (await tx.execute("SELECT status FROM task_attempts WHERE id = 'retry-attempt'")).rows[0]
+            ?.status,
+        ).toBe("failed");
+        expect(
+          (await tx.execute("SELECT state FROM task_step_leases WHERE id = 'retry-lease'")).rows[0]
+            ?.state,
+        ).toBe("released");
+        expect(
+          (await tx.execute("SELECT kind,status,due_at FROM task_waits WHERE step_id = 'retry'"))
+            .rows[0],
+        ).toMatchObject({ kind: "retry", status: "waiting" });
+      });
+      expect((await store.listEvents("task-1")).slice(-3).map((event) => event.type)).toEqual([
+        "ATTEMPT_FINISHED",
+        "RETRY_SCHEDULED",
+        "STEP_WAITING",
+      ]);
+      await expect(
+        store.scheduleClaimedStepRetry({
+          taskId: "task-1",
+          stepId: "retry",
+          attemptId: "retry-attempt",
+          leaseId: "retry-lease",
+          ownerInstanceId: "executor-1",
+          expectedStepVersion: 3,
+          expectedLeaseVersion: 1,
+          proof: {
+            ref: "evidence:duplicate",
+            sideEffectOutcome: "not_started",
+            errorClass: "transient",
+          },
+          origin: system,
+        }),
+      ).rejects.toThrow("conflict");
+    } finally {
+      await db.close();
+    }
+
+    const reopened = await DomainDatabase.open(path);
+    try {
+      const read = new LongWorkStore(reopened);
+      const waiting = (await read.listWaiting("task-1"))[0];
+      expect(waiting).toMatchObject({
+        stepId: "retry",
+        attemptId: "retry-attempt",
+        policy: { kind: "retry" },
+      });
+      expect(Date.parse(waiting!.policy.dueAt!)).toBeLessThanOrEqual(Date.now());
+      expect(await read.fireDueWait("task-1", "retry", 4, system)).toMatchObject({
+        status: "ready",
+        version: 5,
+      });
+      expect((await read.listEvents("task-1")).at(-1)?.metadata).toMatchObject({
+        reason: "retry_due",
+      });
+      await expect(read.fireDueWait("task-1", "retry", 4, system)).rejects.toThrow(
+        "version conflict",
+      );
+    } finally {
+      await reopened.close();
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }).catch(
+      (error: NodeJS.ErrnoException) => {
+        if (process.platform !== "win32" || error.code !== "EBUSY") throw error;
+      },
+    );
+  }
+});
+
+it("refuses retry without matching policy evidence or the exact active lease version", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    const store = await fixture(db);
+    await claimRetryStep(store, db);
+    const retry = (overrides: Record<string, unknown> = {}) =>
+      store.scheduleClaimedStepRetry({
+        taskId: "task-1",
+        stepId: "retry",
+        attemptId: "retry-attempt",
+        leaseId: "retry-lease",
+        ownerInstanceId: "executor-1",
+        expectedStepVersion: 3,
+        expectedLeaseVersion: 1,
+        proof: {
+          ref: "evidence:retry-proof",
+          sideEffectOutcome: "not_started",
+          errorClass: "transient",
+        },
+        origin: system,
+        ...overrides,
+      } as Parameters<typeof store.scheduleClaimedStepRetry>[0]);
+    await expect(retry({ expectedLeaseVersion: 2 })).rejects.toThrow("ownership conflict");
+    await expect(
+      retry({
+        proof: { ref: "evidence:unknown", sideEffectOutcome: "unknown", errorClass: "transient" },
+      }),
+    ).rejects.toThrow("Invalid retry proof");
+    await expect(
+      retry({
+        proof: {
+          ref: "evidence:permanent",
+          sideEffectOutcome: "not_started",
+          errorClass: "permanent",
+        },
+      }),
+    ).rejects.toThrow("Retry was not authorized");
+    await expect(
+      retry({
+        proof: {
+          ref: "evidence:unclassified",
+          sideEffectOutcome: "not_started",
+          errorClass: "other",
+        },
+      }),
+    ).rejects.toThrow("Retry was not authorized");
+    await expect(
+      retry({
+        proof: { ref: "evidence:applied", sideEffectOutcome: "not_applied", timedOut: true },
+      }),
+    ).resolves.toMatchObject({ status: "waiting" });
+  } finally {
+    await db.close();
+  }
+});
+
 it("accepts a reviewed durable Step with a current matching grant and keeps Task acceptance separate", async () => {
   const db = await DomainDatabase.open(":memory:");
   try {
@@ -2338,7 +2549,7 @@ it("accepts a reviewed durable Step with a current matching grant and keeps Task
       ).toBe("succeeded");
       expect(
         (await tx.execute("SELECT status FROM tasks WHERE id = 'task-1'")).rows[0]?.status,
-      ).toBe("NEW");
+      ).toBe("RUNNING");
     });
     await expect(
       store.acceptDurableStep({

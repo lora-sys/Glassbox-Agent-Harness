@@ -934,6 +934,7 @@ function ownerModelCommand(
 
 export class PiRunExecutionAdapter implements RunExecutionAdapter {
   readonly supportsGroup = true;
+  readonly supportsTaskStepModel = true;
 
   constructor(
     private readonly runtime: PiRuntimeAdapter,
@@ -977,6 +978,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
     // the caller's scope, so the order the session is created in cannot change them: the
     // surface the runtime resolves alongside it decides only whether the Run can satisfy them.
     const context: PiRunContext = {
+      ...(input.executionMode ? { executionMode: input.executionMode } : {}),
       caller: input.caller,
       conversationId: input.conversation.id,
       runId: input.run.id,

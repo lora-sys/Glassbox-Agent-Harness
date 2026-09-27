@@ -116,7 +116,22 @@ export class TemporalLongWorkCoordinator {
       }
       if (task.cancellationState === "requested" || task.cancellationState === "stopping") {
         try {
-          if (binding.status !== "unavailable") {
+          const observed = await this.workflows.inspect(binding.taskId);
+          if (observed?.running) {
+            await this.workflows.wake(binding.taskId);
+            await this.bindings.recordState({
+              taskId: binding.taskId,
+              policyRevision: binding.policyRevision,
+              expectedStatus: binding.status,
+              expectedRunId: binding.runId ?? null,
+              status: "running",
+              runId: observed.runId,
+              updatedAt: new Date().toISOString(),
+            });
+            recovered.push(binding.taskId);
+            continue;
+          }
+          if (binding.status !== "unavailable")
             await this.bindings.recordState({
               taskId: binding.taskId,
               policyRevision: binding.policyRevision,
@@ -125,9 +140,8 @@ export class TemporalLongWorkCoordinator {
               status: "unavailable",
               updatedAt: new Date().toISOString(),
             });
-          }
         } catch {
-          // Keep the Task pending external cancellation reconciliation.
+          // Preserve cancellation intent until the backend can confirm the workflow.
         }
         unavailable.push(binding.taskId);
         continue;

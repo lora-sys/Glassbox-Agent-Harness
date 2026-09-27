@@ -65,6 +65,7 @@ function fixture(results: PiRunResult[]) {
       id: "run-1",
       conversationId: "conversation-1",
       messageId: "message-1",
+      source: "external",
       principalId: "owner",
       executionRef: "pi",
       status: "running" as const,

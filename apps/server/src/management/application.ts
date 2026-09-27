@@ -435,6 +435,7 @@ export class ManagementApplication {
     this.evaluator = createRunEvaluator({ store, trace: this.trace });
     this.runs = new RunService({
       store,
+      queuedPollMs: options.temporal ? 2_000 : 0,
       resolveExecution: (reference) => this.execution(reference),
       transport: {
         send: async ({ destination, delivery, signal }) => {
@@ -1666,6 +1667,11 @@ export class ManagementApplication {
     context: PiRunContext,
     registered: readonly ToolDescriptor[] = TOOL_DESCRIPTORS,
   ): Promise<ToolSurfaceCandidate[]> {
+    if (context.executionMode === "task_step_model")
+      return registered.map((descriptor) => ({
+        name: descriptor.name,
+        exclusion: "policy_disabled" as const,
+      }));
     if (!context.caller || !context.conversationId || !context.runId)
       return registered.map((descriptor) => ({
         name: descriptor.name,
@@ -1839,6 +1845,7 @@ export class ManagementApplication {
     if (!kind) return direct;
     return {
       supportsGroup: direct.supportsGroup,
+      supportsTaskStepModel: direct.supportsTaskStepModel,
       execute: async (input: ExecutionInput) => {
         const profileId = reference.slice(kind.length + 1);
         const configured = this.selectableModelProfiles(kind === "pi");
@@ -1916,6 +1923,7 @@ export class ManagementApplication {
           task: {
             risk:
               kind === "pi" &&
+              input.executionMode !== "task_step_model" &&
               MUTATION_REQUESTS.some(
                 (request) =>
                   request.words.test(input.text) && request.params(input.text) !== undefined,
@@ -1923,7 +1931,9 @@ export class ManagementApplication {
                 ? ("high" as const)
                 : ("medium" as const),
             requiredCapabilities:
-              kind === "pi" ? (["text", "tools"] as const) : (["text"] as const),
+              kind === "pi" && input.executionMode !== "task_step_model"
+                ? (["text", "tools"] as const)
+                : (["text"] as const),
             requiredContextTokens: Math.max(
               estimateUnicodeTokens(input.text) + 6144,
               Math.min(demandTokens, 32768),
@@ -2241,20 +2251,25 @@ export class ManagementApplication {
       for (const runId of [...event.interruptedRunIds, ...event.unknownRunIds]) {
         const caller = await this.store.management.runCaller(OWNER_ID, runId);
         if (!caller) continue;
-        const run = await this.store.conversations.getRun(caller, runId);
-        const cursor = await this.trace.append(
-          runId,
-          {
-            type: "run_finished",
+        try {
+          const run = await this.store.conversations.getRun(caller, runId);
+          const cursor = await this.trace.append(
             runId,
-            conversationId: run.conversationId,
-            status: run.status,
-            outputWithheld: true,
-            recovered: true,
-          },
-          "glassbox-recovery",
-        );
-        await this.store.evidence.advanceTrace(caller, cursor);
+            {
+              type: "run_finished",
+              runId,
+              conversationId: run.conversationId,
+              status: run.status,
+              outputWithheld: true,
+              recovered: true,
+            },
+            "glassbox-recovery",
+          );
+          await this.store.evidence.advanceTrace(caller, cursor);
+        } catch {
+          // A revoked Task or Conversation read grant must not prevent the
+          // supervisor from recovering other persisted Runs.
+        }
       }
       for (const deliveryId of event.unknownDeliveryIds) {
         const runId = await this.store.management.deliveryRunId(OWNER_ID, deliveryId);

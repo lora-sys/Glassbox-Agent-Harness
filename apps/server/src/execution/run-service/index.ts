@@ -2,6 +2,8 @@ import { AccessDeniedError } from "../../auth/service.js";
 import type { RunLease, RunRoute, TerminalRunStatus } from "../../conversation/lifecycle.js";
 import type { IncomingMessage, RunRecord } from "../../conversation/store.js";
 import { requireIdentifier, type CallerContext } from "../../identity/scope.js";
+import { authorizeLongWorkAction } from "../../ops/long-work-authority.js";
+import { stringColumn } from "../../persistence/database.js";
 import type {
   AcceptedIncoming,
   ExecutionResult,
@@ -30,20 +32,28 @@ const terminal = new Set(["cancelled", "succeeded", "failed", "interrupted", "un
 export class RunService {
   private started = false;
   private readonly concurrency: number;
+  private readonly queuedPollMs: number;
   private readonly deliveryTimeoutMs: number;
   private readonly active = new Map<string, ActiveRun>();
   private readonly blocked = new Set<string>();
   private readonly recoveredNativeRoleRunIds = new Set<string>();
   private readonly publications = new Set<Promise<void>>();
   private readonly waiters = new Map<string, Set<RunWaiter>>();
+  private queuedPoll?: ReturnType<typeof setInterval>;
   private pumping: Promise<void> | undefined;
   private pumpAgain = false;
 
   constructor(private readonly options: RunServiceOptions) {
     this.concurrency = options.concurrency ?? 2;
+    this.queuedPollMs = options.queuedPollMs ?? 0;
     this.deliveryTimeoutMs = options.deliveryTimeoutMs ?? 15_000;
     if (!Number.isInteger(this.concurrency) || this.concurrency < 1 || this.concurrency > 32)
       throw new Error("Invalid Run concurrency");
+    if (
+      !Number.isInteger(this.queuedPollMs) ||
+      (this.queuedPollMs !== 0 && (this.queuedPollMs < 500 || this.queuedPollMs > 60_000))
+    )
+      throw new Error("Invalid durable queue polling interval");
     if (
       !Number.isInteger(this.deliveryTimeoutMs) ||
       this.deliveryTimeoutMs < 1 ||
@@ -61,6 +71,13 @@ export class RunService {
     this.started = true;
     await this.restorePublications();
     this.kick();
+    // Temporal Activities persist internal Runs in a separate process. The database
+    // is the queue; poll it so a process restart or missed in-memory wake cannot
+    // strand a queued Run.
+    if (this.queuedPollMs > 0) {
+      this.queuedPoll = setInterval(() => this.kick(), this.queuedPollMs);
+      this.queuedPoll.unref();
+    }
   }
 
   async recover() {
@@ -105,6 +122,7 @@ export class RunService {
     // Re-read by authenticated scope; caller-supplied input text and snapshots are never executed.
     const caller = structuredClone(accepted.caller);
     const run = await this.options.store.conversations.getRun(caller, accepted.run.id);
+    if (run.source !== "external") throw new Error("Incoming Run source mismatch");
     if (!accepted.duplicate)
       await this.emit({ type: "run_queued", runId: run.id, conversationId: run.conversationId });
     if (terminal.has(run.status)) this.publishInBackground(caller, run);
@@ -113,6 +131,117 @@ export class RunService {
 
   getRun(caller: CallerContext, runId: string): Promise<RunRecord> {
     return this.options.store.conversations.getRun(caller, runId);
+  }
+
+  /** Queue a persisted Task Step Run without creating QQ ingress or a delivery. */
+  async enqueueInternalStepRun(caller: CallerContext, runId: string): Promise<RunRecord> {
+    if (!this.started) throw new Error("Run service is not started");
+    const run = await this.getRun(caller, runId);
+    if (run.source !== "task_step") throw new Error("Internal Step Run source mismatch");
+    if (run.status === "queued") {
+      await this.emit({ type: "run_queued", runId: run.id, conversationId: run.conversationId });
+      this.kick();
+    }
+    return run;
+  }
+
+  /** Internal Step Runs follow their owning Task's durable cancellation request.
+   * This reads only the persisted Run-to-Task link and cancellation state. */
+  private async internalTaskCancellationState(
+    caller: CallerContext,
+    runId: string,
+  ): Promise<{ requested: boolean; status: RunRecord["status"]; conversationId: string } | null> {
+    const result = await this.options.store.db.transaction((tx) =>
+      tx.execute({
+        sql: `SELECT t.cancellation_state, r.status, r.conversation_id FROM runs r
+              JOIN task_attempt_runs ar ON ar.run_id = r.id
+              JOIN tasks t ON t.id = ar.task_id
+              WHERE r.id = ? AND r.source = 'task_step' AND r.principal_id = ?`,
+        args: [runId, caller.principalId],
+      }),
+    );
+    const row = result.rows[0];
+    if (!row) return null;
+    const state = row.cancellation_state;
+    return {
+      requested: state === "requested" || state === "stopping" || state === "settled",
+      status: stringColumn(row, "status") as RunRecord["status"],
+      conversationId: stringColumn(row, "conversation_id"),
+    };
+  }
+
+  private async cancelInternalRunForTask(
+    caller: CallerContext,
+    runId: string,
+    activeHint?: ActiveRun,
+  ): Promise<boolean> {
+    const state = await this.internalTaskCancellationState(caller, runId);
+    if (!state?.requested) return false;
+    let status = state.status;
+    if (terminal.has(status)) return true;
+    const active = activeHint ?? this.active.get(state.conversationId);
+    if (status === "queued") {
+      const updated = await this.options.store.db.transaction((tx) =>
+        tx.execute({
+          sql: `UPDATE runs SET status = 'cancelled', updated_at = ? WHERE id = ?
+                AND source = 'task_step' AND principal_id = ? AND status = 'queued'
+                AND EXISTS (SELECT 1 FROM task_attempt_runs ar JOIN tasks t ON t.id = ar.task_id
+                  WHERE ar.run_id = runs.id AND t.cancellation_state IN ('requested','stopping','settled'))`,
+          args: [new Date().toISOString(), runId, caller.principalId],
+        }),
+      );
+      if (updated.rowsAffected === 1) {
+        await this.emit({
+          type: "run_finished",
+          runId,
+          conversationId: state.conversationId,
+          status: "cancelled",
+          outputWithheld: false,
+        });
+        this.kick();
+        return true;
+      }
+      const refreshed = await this.internalTaskCancellationState(caller, runId);
+      if (!refreshed?.requested) return false;
+      status = refreshed.status;
+    }
+    if (status === "running" || status === "cancelling") {
+      if (!active || active.route.runId !== runId) return false;
+      if (status === "running") {
+        const updated = await this.options.store.db.transaction((tx) =>
+          tx.execute({
+            sql: `UPDATE runs SET status = 'cancelling', updated_at = ? WHERE id = ?
+                  AND source = 'task_step' AND principal_id = ? AND status = 'running'
+                  AND EXISTS (SELECT 1 FROM task_attempt_runs ar JOIN tasks t ON t.id = ar.task_id
+                    WHERE ar.run_id = runs.id AND t.cancellation_state IN ('requested','stopping','settled'))`,
+            args: [new Date().toISOString(), runId, caller.principalId],
+          }),
+        );
+        if (updated.rowsAffected === 1) {
+          await this.emit({
+            type: "run_cancelling",
+            runId,
+            conversationId: state.conversationId,
+          });
+        } else {
+          const refreshed = await this.internalTaskCancellationState(caller, runId);
+          if (refreshed?.status !== "cancelling") return false;
+        }
+      }
+      active.controller.abort();
+      return true;
+    }
+    return false;
+  }
+
+  private async reconcileInternalRunCancellations(): Promise<void> {
+    for (const active of this.active.values()) {
+      try {
+        await this.cancelInternalRunForTask(active.route.caller, active.route.runId, active);
+      } catch {
+        this.report("dispatch_failed", active.route.runId);
+      }
+    }
   }
 
   /** Event-driven observation only. Aborting a wait never aborts execution. */
@@ -182,6 +311,8 @@ export class RunService {
 
   async cancel(caller: CallerContext, runId: string): Promise<RunRecord> {
     const run = await this.getRun(caller, runId);
+    if (run.source === "task_step")
+      throw new Error("Task Step Runs require Task cancellation or reconciliation");
     if (terminal.has(run.status) || run.status === "cancelling") return run;
     const active = this.active.get(run.conversationId);
     if (run.status === "queued") {
@@ -218,6 +349,8 @@ export class RunService {
 
   /** Explicit retry is allowed only for a transport-confirmed failed delivery. */
   async retryDelivery(caller: CallerContext, runId: string, deliveryId: string): Promise<void> {
+    if ((await this.getRun(caller, runId)).source === "task_step")
+      throw new Error("Internal Step Runs have no direct delivery");
     await this.options.store.lifecycle.transitionDelivery(
       caller,
       runId,
@@ -238,6 +371,7 @@ export class RunService {
     requireIdentifier(input.messageId);
     const observer = structuredClone(caller);
     const run = await this.getRun(observer, runId);
+    if (run.source === "task_step") throw new Error("Internal Step Runs have no control reply");
     const dedupKey = `control:${input.messageId}`;
     const existing = await this.options.store.lifecycle.findDelivery(observer, run.id, dedupKey);
     const deliveryId =
@@ -272,6 +406,8 @@ export class RunService {
   /** Abort requests do not claim cancellation. The adapter must still settle. */
   async stop(options: { abortRunning?: boolean; wait?: boolean } = {}): Promise<void> {
     this.started = false;
+    if (this.queuedPoll) clearInterval(this.queuedPoll);
+    this.queuedPoll = undefined;
     for (const subscriptions of this.waiters.values())
       for (const waiter of subscriptions) waiter.stop();
     this.waiters.clear();
@@ -287,12 +423,20 @@ export class RunService {
       .then(async () => {
         while (this.started && this.pumpAgain) {
           this.pumpAgain = false;
+          await this.reconcileInternalRunCancellations();
           let cursor = 0;
           while (this.started && this.active.size < this.concurrency) {
             const routes = await this.options.store.lifecycle.listRunRoutes(["queued"], cursor);
             if (routes.length === 0) break;
             for (const route of routes) {
               cursor = route.sequence;
+              try {
+                if (await this.cancelInternalRunForTask(route.caller, route.runId)) continue;
+              } catch {
+                this.blocked.add(route.runId);
+                this.report("dispatch_failed", route.runId);
+                continue;
+              }
               if (this.blocked.has(route.runId) || this.active.has(route.conversationId)) continue;
               this.launch(route);
               if (this.active.size >= this.concurrency) break;
@@ -348,13 +492,27 @@ export class RunService {
     }
 
     let result: ExecutionResult;
+    let executorStarted = false;
     try {
       await this.emit({ type: "run_started", runId, conversationId: run.conversationId });
       const adapter = this.options.resolveExecution(run.executionRef);
-      if (!adapter || (caller.scope.chatType === "group" && adapter.supportsGroup !== true)) {
+      if (
+        !adapter ||
+        (caller.scope.chatType === "group" && adapter.supportsGroup !== true) ||
+        (run.source === "task_step" && adapter.supportsTaskStepModel !== true)
+      ) {
         result = { status: "failed" };
       } else {
         const input = await this.options.store.conversations.loadRunInput(caller, runId);
+        if (run.source === "task_step") {
+          if (!input.taskStepBinding) throw new Error("Internal Step Run binding missing");
+          await authorizeLongWorkAction(this.options.store, {
+            taskId: input.taskStepBinding.taskId,
+            caller,
+            resourceId: `task-${input.taskStepBinding.taskId}`,
+            action: "task:continue",
+          });
+        }
         // Recheck dispatch authority after context I/O and before invoking any external executor.
         const authorization = await this.options.store.authorization.check({
           caller,
@@ -367,8 +525,10 @@ export class RunService {
         if (active.controller.signal.aborted) {
           result = { status: "cancelled" };
         } else {
+          executorStarted = true;
           result = await adapter.execute({
             ...input,
+            ...(run.source === "task_step" ? { executionMode: "task_step_model" as const } : {}),
             caller: structuredClone(caller),
             signal: active.controller.signal,
           });
@@ -376,7 +536,19 @@ export class RunService {
       }
     } catch (error) {
       // A thrown adapter error does not prove that a detached execution stopped.
-      result = { status: error instanceof AccessDeniedError ? "failed" : "unknown" };
+      if (
+        run.source === "task_step" &&
+        !executorStarted &&
+        (await this.internalTaskCancellationState(caller, runId).then(
+          (state) => state?.requested ?? false,
+          () => false,
+        ))
+      ) {
+        await this.cancelInternalRunForTask(caller, runId, active).catch(() => false);
+        result = { status: "cancelled" };
+      } else {
+        result = { status: error instanceof AccessDeniedError ? "failed" : "unknown" };
+      }
     }
     if (
       !result ||
@@ -403,7 +575,7 @@ export class RunService {
       outputWithheld: finished.outputWithheld,
     });
     if (finished.outputWithheld) return;
-    if (status === "succeeded" && result.providerSessionId) {
+    if (run.source === "external" && status === "succeeded" && result.providerSessionId) {
       try {
         await this.options.store.conversations.setProviderSession(
           caller,
@@ -415,12 +587,14 @@ export class RunService {
         this.report("dispatch_failed", runId);
       }
     }
-    await this.publishTerminal(caller, finished.run);
+    if (run.source === "external") await this.publishTerminal(caller, finished.run);
   }
 
   private async publishTerminal(caller: CallerContext, record: RunRecord): Promise<void> {
+    if (record.source === "task_step") return;
     // Re-read through authorization before loading the persisted result for transport.
     const run = await this.getRun(caller, record.id);
+    if (run.source === "task_step") return;
     if (!terminal.has(run.status)) return;
     const existing = await this.options.store.lifecycle.findDelivery(caller, run.id, "result");
     const candidate = run.resultText ?? `任务处理未完成，状态为 ${run.status}。`;
@@ -516,6 +690,7 @@ export class RunService {
       const routes = await this.options.store.lifecycle.listRunRoutes(
         ["succeeded", "failed", "cancelled", "interrupted", "unknown"],
         cursor,
+        "external",
       );
       for (const route of routes) {
         cursor = route.sequence;

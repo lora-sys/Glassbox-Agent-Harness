@@ -95,3 +95,26 @@ export async function authorizeLongWorkAction(
   if (decision.decision !== "ALLOW") throw new AccessDeniedError(decision);
   return decision.id;
 }
+
+/** Reconstructs the trusted origin identity for server-owned Task continuation. */
+export async function getLongWorkCaller(
+  store: Pick<DomainStore, "db">,
+  taskId: string,
+): Promise<CallerContext> {
+  const row = await store.db.transaction(async (tx) => {
+    const result = await tx.execute({
+      sql: "SELECT creator_principal_id, origin_scope_key, origin_scope_json FROM tasks WHERE id = ?",
+      args: [taskId],
+    });
+    return result.rows[0] ?? null;
+  });
+  if (!row) throw new Error("Task not found");
+  const originScopeKey = stringColumn(row, "origin_scope_key");
+  const storedScopeJson = row.origin_scope_json;
+  const scope =
+    typeof storedScopeJson === "string"
+      ? parseStoredScope(storedScopeJson)
+      : scopeFromLegacyKey(originScopeKey);
+  if (scopeKey(scope) !== originScopeKey) throw new Error("Invalid stored Task origin scope");
+  return { principalId: stringColumn(row, "creator_principal_id"), scope };
+}
