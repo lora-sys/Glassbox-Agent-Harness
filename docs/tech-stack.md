@@ -353,7 +353,9 @@ with `npm run long-work:worker -w @glassbox/server`. When Temporal is unavailabl
 remains in Glassbox and the server reports an unavailable backend for affected work. The
 authorized `/manage/ops/health` response includes `longWorkBackend.state`, `reason`, and
 Principal-scoped `longWork` counts. The disposable `spikes/temporal` setup proves SDK
-primitives only. Linux deployment and real acceptance still depend on Issue #30 and the P6 plan.
+primitives only. `deploy/temporal` documents the PostgreSQL-backed Linux Server and its
+separate Worker process. Its isolated startup, namespace, restart, and backup-restore checks
+do not replace the Issue #30 cutover or the P6 real QQ and Herdr acceptance.
 
 ## QQ Channel
 
