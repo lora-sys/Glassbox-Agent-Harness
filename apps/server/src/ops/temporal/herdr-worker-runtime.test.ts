@@ -191,6 +191,37 @@ it("dispatches one Worker, reviews and cancels it safely, and quarantines an unc
     expect((await advance(input)).kind).toBe("wait");
     expect(await store.tasks.listAttempts(task.id)).toHaveLength(1);
     bridge.simulateAgentState(binding!.paneId, "done", "Candidate Worker result");
+    const beforeReviewStep = (await store.longWork.listSteps(task.id))[0]!;
+    const beforeReviewLease = (await store.longWork.getActiveLease(task.id, step.id))!;
+    await store.longWork.recordWorkerCandidate({
+      taskId: task.id,
+      stepId: step.id,
+      attemptId: attempt.id,
+      leaseId: beforeReviewLease.id,
+      ownerInstanceId: beforeReviewLease.ownerInstanceId,
+      workerBindingId: binding!.id,
+      expectedStepVersion: beforeReviewStep.version,
+      expectedLeaseVersion: beforeReviewLease.version,
+      output: "Candidate Worker result",
+    });
+    const beforeReviewGrants = [];
+    for (const [resourceId, action] of [
+      [`task-${task.id}`, "task:read"],
+      [`task-${task.id}`, "worker:read"],
+      [policy.resourceId, "worker:file:read"],
+      [`workspace:${workspace.id}`, "workspace:read"],
+    ])
+      beforeReviewGrants.push(
+        await store.authorization.grant({
+          principalId: "owner",
+          resourceId: resourceId!,
+          action: action!,
+          scope: caller.scope,
+          effect: "allow",
+        }),
+      );
+    expect(await service.workerCandidate(caller, task.id, step.id, attempt.id)).toBeNull();
+    for (const grant of beforeReviewGrants) await store.authorization.revoke(grant);
     expect(await advance(input)).toEqual({ kind: "continue" });
     expect((await store.longWork.listSteps(task.id))[0]).toMatchObject({
       status: "review",
