@@ -321,7 +321,7 @@ Memory candidates / retrieval evidence
 
 The main Agent receives narrower authorized projections rather than raw databases.
 
-The P6 long-work health projection rechecks `task:read` for each candidate Task before aggregating Task, Step, lease, wait, and TaskEvent evidence. Duration estimates include sample counts. Each history source has a 10,000-row projection cap; if exceeded, dependent estimates and counts are `null` and the snapshot marks that source truncated. Persisted workflow binding status does not claim a live Temporal health check.
+The P6 long-work health projection rechecks `task:read` for each candidate Task before aggregating Task, Step, lease, wait, and TaskEvent evidence. Duration estimates include sample counts. Each history source has a 10,000-row projection cap; if exceeded, dependent estimates and counts are `null` and the snapshot marks that source truncated. Persisted workflow binding status remains separate from the authorized Ops health response's fresh, two-second Temporal Server probe. The probe result includes its sample time, is cached for at most five seconds, and does not establish whether a workflow Worker is polling.
 
 Public visitors only receive sanitized, explicitly published Trace or Eval projections.
 

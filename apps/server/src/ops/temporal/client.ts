@@ -19,6 +19,20 @@ export interface LongWorkWorkflowClientPort {
   inspect(workflowId: string): Promise<{ runId: string; running: boolean } | null>;
 }
 
+/** Fresh bounded RPC, distinct from Connection.ensureConnected's memoized startup check. */
+export async function probeTemporalServer(
+  connection: Pick<Connection, "withDeadline" | "workflowService">,
+): Promise<"reachable" | "unavailable"> {
+  try {
+    await connection.withDeadline(Date.now() + 2_000, () =>
+      connection.workflowService.getSystemInfo({}),
+    );
+    return "reachable";
+  } catch {
+    return "unavailable";
+  }
+}
+
 export function createLongWorkWorkflowClient(
   port: LongWorkWorkflowClientPort,
   taskQueue = LONG_WORK_TASK_QUEUE,
@@ -82,5 +96,9 @@ export async function connectLongWorkWorkflowClient(options: {
     },
     options.taskQueue,
   );
-  return { workflows, close: () => connection.close() };
+  return {
+    workflows,
+    probe: () => probeTemporalServer(connection),
+    close: () => connection.close(),
+  };
 }

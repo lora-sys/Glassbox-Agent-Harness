@@ -386,6 +386,7 @@ export class ManagementApplication {
         protectedValues?: readonly string[];
       };
       temporal?: { address: string; namespace?: string };
+      temporalConnector?: typeof connectLongWorkWorkflowClient;
     },
     store: DomainStore,
     channels: ChannelProfileStore,
@@ -593,6 +594,7 @@ export class ManagementApplication {
       protectedValues?: readonly string[];
     };
     temporal?: { address: string; namespace?: string };
+    temporalConnector?: typeof connectLongWorkWorkflowClient;
   }): Promise<ManagementApplication> {
     const channels = await ChannelProfileStore.open(options.dataDirectory);
     const groupRuntime = await GroupRuntimeStore.open(options.dataDirectory);
@@ -733,6 +735,16 @@ export class ManagementApplication {
   private opsReconciler?: OpsReconciler;
   private temporalRuntime?: TemporalLongWorkCoordinator;
   private temporalClose?: () => Promise<void>;
+  private temporalProbe?: () => Promise<"reachable" | "unavailable">;
+  private temporalProbePending?: Promise<{
+    state: "reachable" | "unavailable";
+    checkedAt: string;
+  }>;
+  private temporalProbeCache?: {
+    state: "reachable" | "unavailable";
+    checkedAt: string;
+    sampledAtMs: number;
+  };
   private temporalConnecting?: Promise<void>;
   private temporalRecovering?: Promise<void>;
   private temporalRetry?: ReturnType<typeof setTimeout>;
@@ -797,7 +809,9 @@ export class ManagementApplication {
     this.temporalConnecting = (async () => {
       let connection: Awaited<ReturnType<typeof connectLongWorkWorkflowClient>> | undefined;
       try {
-        connection = await connectLongWorkWorkflowClient(this.options.temporal!);
+        connection = await (this.options.temporalConnector ?? connectLongWorkWorkflowClient)(
+          this.options.temporal!,
+        );
         if (this.closed) {
           await connection.close();
           return;
@@ -806,6 +820,8 @@ export class ManagementApplication {
         const recovery = await coordinator.recover();
         this.temporalRuntime = coordinator;
         this.temporalClose = connection.close;
+        this.temporalProbe = connection.probe;
+        this.temporalProbeCache = undefined;
         this.temporalFailure = recovery.unavailable.length
           ? `${recovery.unavailable.length} workflow bindings unavailable`
           : null;
@@ -836,6 +852,32 @@ export class ManagementApplication {
     if (this.temporalFailure) return { state: "unavailable", reason: this.temporalFailure };
     if (this.temporalRuntime) return { state: "connected", reason: null };
     return { state: "unavailable", reason: this.temporalFailure };
+  }
+
+  private async liveTemporalServerStatus(): Promise<{
+    state: "reachable" | "unavailable" | "not_checked";
+    checkedAt: string | null;
+  }> {
+    const probe = this.temporalProbe;
+    if (!probe) return { state: "not_checked", checkedAt: null };
+    const cached = this.temporalProbeCache;
+    if (cached && Date.now() >= cached.sampledAtMs && Date.now() - cached.sampledAtMs < 5_000)
+      return { state: cached.state, checkedAt: cached.checkedAt };
+    if (!this.temporalProbePending) {
+      const pending = probe()
+        .catch(() => "unavailable" as const)
+        .then((state) => {
+          const checkedAt = new Date().toISOString();
+          if (this.temporalProbe === probe)
+            this.temporalProbeCache = { state, checkedAt, sampledAtMs: Date.now() };
+          return { state, checkedAt };
+        });
+      this.temporalProbePending = pending;
+      void pending.finally(() => {
+        if (this.temporalProbePending === pending) this.temporalProbePending = undefined;
+      });
+    }
+    return this.temporalProbePending;
   }
 
   sandboxStatus(): {
@@ -4227,9 +4269,17 @@ export class ManagementApplication {
       },
       { runId },
     );
+    const backend = this.longWorkBackendStatus();
+    const liveServer = await this.liveTemporalServerStatus();
     return {
       ...health.snapshot,
-      longWorkBackend: this.longWorkBackendStatus(),
+      longWorkBackend: {
+        ...backend,
+        ...(liveServer.state === "unavailable"
+          ? { state: "unavailable" as const, reason: "Temporal live probe failed" }
+          : {}),
+        liveServer,
+      },
       longWork: await readLongWorkHealth(this.store.db, health.visibleTaskIds, caller, { runId }),
     };
   }

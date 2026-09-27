@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { createLongWorkWorkflowClient } from "./client.js";
+import { createLongWorkWorkflowClient, probeTemporalServer } from "./client.js";
 import { longWorkWorkflowId } from "./contracts.js";
 
 describe("long work Temporal client", () => {
@@ -29,4 +29,22 @@ describe("long work Temporal client", () => {
     expect(port.cancel).toHaveBeenCalledWith(longWorkWorkflowId(input.taskId));
     expect(port.inspect).toHaveBeenCalledWith(longWorkWorkflowId(input.taskId));
   });
+});
+
+it("probes Temporal with a fresh bounded RPC and reports failure without raw errors", async () => {
+  const getSystemInfo = vi.fn(async () => ({}));
+  const withDeadline = vi.fn(async (_deadline: number, call: () => Promise<unknown>) => call());
+  const connection = {
+    withDeadline,
+    workflowService: { getSystemInfo },
+  } as unknown as Parameters<typeof probeTemporalServer>[0];
+  const startedAt = Date.now();
+  expect(await probeTemporalServer(connection)).toBe("reachable");
+  expect(await probeTemporalServer(connection)).toBe("reachable");
+  expect(getSystemInfo).toHaveBeenCalledTimes(2);
+  expect(withDeadline.mock.calls[0]?.[0]).toBeGreaterThanOrEqual(startedAt);
+  expect(withDeadline.mock.calls[0]?.[0]).toBeLessThanOrEqual(startedAt + 2_000);
+
+  getSystemInfo.mockRejectedValueOnce(new Error("private Temporal address"));
+  expect(await probeTemporalServer(connection)).toBe("unavailable");
 });

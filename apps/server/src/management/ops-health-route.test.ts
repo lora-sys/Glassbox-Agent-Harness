@@ -1,11 +1,12 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { afterEach, expect, it } from "vite-plus/test";
+import { afterEach, expect, it, vi } from "vite-plus/test";
 import { ModelProfileStore } from "../config/model-profiles.js";
 import { AccessDeniedError } from "../auth/service.js";
 import { agentResourceId } from "../conversation/store.js";
 import { FakeHerdrBridge } from "../ops/fake-herdr-bridge.js";
+import { createLongWorkWorkflowClient } from "../ops/temporal/client.js";
 import { ManagementApplication } from "./application.js";
 
 const directories: string[] = [];
@@ -31,14 +32,24 @@ it("serves authorized Owner health and rejects out-of-scope or revoked Ops statu
   directories.push(dataDirectory);
   const bridge = new FakeHerdrBridge("health-session");
   const models = await ModelProfileStore.open(dataDirectory);
+  const probe = vi.fn(async (): Promise<"reachable" | "unavailable"> => "reachable");
+  const workflows = createLongWorkWorkflowClient({
+    start: async (input) => ({ workflowId: input.workflowId }),
+    wake: async () => {},
+    cancel: async () => {},
+    inspect: async () => null,
+  });
   const app = await ManagementApplication.open({
     dataDirectory,
     databasePath: ":memory:",
     kitPath: new URL("../runtime/pi/fixtures/lora-pi-kit", import.meta.url).pathname,
     models,
     ops: { bridge, workerTarget: { workspaceId: "health-workspace", agentKind: "test" } },
+    temporal: { address: "fixture-temporal" },
+    temporalConnector: async () => ({ workflows, probe, close: async () => {} }),
   });
   applications.push(app);
+  await (app as unknown as { temporalConnecting: Promise<void> }).temporalConnecting;
 
   const ownerScope = {
     connectionId: "health-channel",
@@ -129,8 +140,37 @@ it("serves authorized Owner health and rejects out-of-scope or revoked Ops statu
         durable: { activeTasks: 1 },
         workers: { total: 1, unknown: 1 },
         herdr: { state: "healthy", stale: false },
-        longWorkBackend: { state: "not_configured", reason: null },
+        longWorkBackend: {
+          state: "connected",
+          reason: null,
+          liveServer: { state: "reachable", checkedAt: expect.any(String) },
+        },
         longWork: { tasks: { active: 0, waiting: 0 } },
+      },
+    },
+  });
+  expect(probe).toHaveBeenCalledTimes(1);
+  await app.route({
+    method: "GET",
+    url: `/manage/ops/health?runId=${ownerRun.run.id}`,
+    headers: {},
+  } as never);
+  expect(probe).toHaveBeenCalledTimes(1);
+  (app as unknown as { temporalProbeCache?: unknown }).temporalProbeCache = undefined;
+  probe.mockResolvedValueOnce("unavailable");
+  const unavailableResponse = await app.route({
+    method: "GET",
+    url: `/manage/ops/health?runId=${ownerRun.run.id}`,
+    headers: {},
+  } as never);
+  expect(unavailableResponse).toMatchObject({
+    body: {
+      health: {
+        longWorkBackend: {
+          state: "unavailable",
+          reason: "Temporal live probe failed",
+          liveServer: { state: "unavailable", checkedAt: expect.any(String) },
+        },
       },
     },
   });
@@ -159,6 +199,7 @@ it("serves authorized Owner health and rejects out-of-scope or revoked Ops statu
       headers: {},
     } as never),
   ).rejects.toMatchObject({ status: 404 });
+  expect(probe).toHaveBeenCalledTimes(2);
 
   await app.store.authorization.revoke(opsGrant);
   await expect(
