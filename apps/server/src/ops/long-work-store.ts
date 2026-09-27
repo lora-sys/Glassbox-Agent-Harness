@@ -456,6 +456,33 @@ function parseLease(row: Row): StoredStepLease {
   };
 }
 
+function expectedModelLeaseOwner(taskId: string, stepId: string): string {
+  const digest = createHash("sha256").update(`${taskId}\0${stepId}`).digest("hex");
+  return `temporal-model-${digest}`;
+}
+
+function isClosedReadOnlyRunStep(step: Row): boolean {
+  const kind = stringColumn(step, "kind");
+  const specRef = optionalString(step, "spec_ref");
+  const requiredCapabilities = parseJson<unknown>(step, "required_capabilities_json");
+  const delegatedPermissions = parseJson<unknown>(step, "delegated_permissions_json");
+  if (!Array.isArray(requiredCapabilities) || !Array.isArray(delegatedPermissions)) return false;
+  if (delegatedPermissions.length > 0) return false;
+  if (kind === "model")
+    return (
+      typeof specRef === "string" &&
+      /^(?:model|pi):.+$/u.test(specRef) &&
+      requiredCapabilities.every((capability) => capability === "text")
+    );
+  if (kind === "tool")
+    return (
+      typeof specRef === "string" &&
+      parseTaskGetSpec(specRef) !== null &&
+      requiredCapabilities.length === 0
+    );
+  return false;
+}
+
 const transitions: Readonly<Record<TaskStepStatus, readonly TaskStepStatus[]>> = {
   pending: ["ready", "blocked", "skipped", "cancelled"],
   ready: ["running", "waiting", "cancelled", "blocked"],
@@ -1277,6 +1304,191 @@ export class LongWorkStore {
     });
   }
 
+  /** Resolves a quarantined internal Run only from its durable terminal Run record. */
+  async resolveQuarantinedRunStep(input: {
+    taskId: string;
+    stepId: string;
+    attemptId: string;
+    leaseId: string;
+    expectedStepVersion: number;
+    expectedLeaseVersion: number;
+    runId: string;
+    origin: LongWorkOrigin;
+  }): Promise<TaskStep> {
+    const origin = input.origin;
+    for (const value of [input.taskId, input.stepId, input.attemptId, input.leaseId, input.runId])
+      requireIdentifier(value);
+    if (
+      origin.kind !== "decision" ||
+      !Number.isSafeInteger(input.expectedStepVersion) ||
+      input.expectedStepVersion < 1 ||
+      !Number.isSafeInteger(input.expectedLeaseVersion) ||
+      input.expectedLeaseVersion < 1
+    )
+      throw new Error("Invalid quarantined Run resolution claim");
+    return this.db.transaction(async (tx) => {
+      await this.requireOrigin(tx, origin);
+      const task = await this.requireActiveDurableTask(tx, input.taskId);
+      const grant = await tx.execute({
+        sql: `SELECT 1 FROM authorization_decisions d JOIN grants g ON g.id = d.grant_id
+          WHERE d.id = ? AND d.principal_id = ? AND d.resource_id = ?
+            AND d.action = 'task:continue' AND d.scope_key = ? AND d.decision = 'ALLOW'
+            AND g.revoked_at IS NULL`,
+        args: [
+          origin.decisionId,
+          origin.actorPrincipalId,
+          `task-${input.taskId}`,
+          stringColumn(task, "origin_scope_key"),
+        ],
+      });
+      if (!grant.rows[0]) throw new Error("Current Task continuation grant is required");
+
+      const step = await this.requireStep(tx, input.taskId, input.stepId);
+      if (
+        step.status !== "blocked" ||
+        Number(step.version) !== input.expectedStepVersion ||
+        !isClosedReadOnlyRunStep(step)
+      )
+        throw new Error("Quarantined Run Step conflict");
+      const attempt = await tx.execute({
+        sql: "SELECT status FROM task_attempts WHERE id = ? AND task_id = ? AND step_id = ?",
+        args: [input.attemptId, input.taskId, input.stepId],
+      });
+      if (attempt.rows[0]?.status !== "waiting_input")
+        throw new Error("Quarantined Run Attempt conflict");
+      const lease = await tx.execute({
+        sql: `SELECT state,version,attempt_id,owner_instance_id,worker_binding_id FROM task_step_leases
+          WHERE id = ? AND task_id = ? AND step_id = ?`,
+        args: [input.leaseId, input.taskId, input.stepId],
+      });
+      if (
+        lease.rows[0]?.state !== "quarantined" ||
+        Number(lease.rows[0].version) !== input.expectedLeaseVersion ||
+        lease.rows[0].attempt_id !== input.attemptId ||
+        lease.rows[0].owner_instance_id !== expectedModelLeaseOwner(input.taskId, input.stepId) ||
+        lease.rows[0].worker_binding_id !== null
+      )
+        throw new Error("Quarantined Run lease conflict");
+
+      const linkedRun = await tx.execute({
+        sql: `SELECT r.id,r.status,r.result_text FROM task_attempt_runs ar
+          JOIN runs r ON r.id = ar.run_id
+          WHERE ar.attempt_id = ? AND ar.task_id = ? AND ar.step_id = ?
+            AND ar.run_id = ? AND r.source = 'task_step'`,
+        args: [input.attemptId, input.taskId, input.stepId, input.runId],
+      });
+      const run = linkedRun.rows[0];
+      if (!run) throw new Error("Quarantined Run binding conflict");
+      const runStatus = stringColumn(run, "status");
+      if (runStatus !== "succeeded" && runStatus !== "failed")
+        throw new Error("Internal Run outcome remains unresolved");
+      if (runStatus === "succeeded" && run.result_text === null)
+        throw new Error("Successful internal Run has no persisted result");
+
+      const now = new Date().toISOString();
+      const nextStatus = runStatus === "succeeded" ? "review" : "failed";
+      const evidenceRef = `run:${input.runId}`;
+      const attemptUpdate = await tx.execute({
+        sql: "UPDATE task_attempts SET status = ?, completed_at = ? WHERE id = ? AND task_id = ? AND step_id = ? AND status = 'waiting_input'",
+        args: [nextStatus, now, input.attemptId, input.taskId, input.stepId],
+      });
+      const stepUpdate = await tx.execute({
+        sql: `UPDATE task_steps SET status = ?, output_ref = ?, version = version + 1, updated_at = ?
+          WHERE id = ? AND task_id = ? AND version = ? AND status = 'blocked'`,
+        args: [
+          nextStatus,
+          runStatus === "succeeded" ? evidenceRef : null,
+          now,
+          input.stepId,
+          input.taskId,
+          input.expectedStepVersion,
+        ],
+      });
+      const leaseUpdate = await tx.execute({
+        sql: `UPDATE task_step_leases SET state = 'released', version = version + 1,
+            heartbeat_at = ?, released_at = ?
+          WHERE id = ? AND task_id = ? AND step_id = ? AND attempt_id = ?
+            AND version = ? AND state = 'quarantined'
+            AND owner_instance_id = ? AND worker_binding_id IS NULL`,
+        args: [
+          now,
+          now,
+          input.leaseId,
+          input.taskId,
+          input.stepId,
+          input.attemptId,
+          input.expectedLeaseVersion,
+          expectedModelLeaseOwner(input.taskId, input.stepId),
+        ],
+      });
+      if (
+        attemptUpdate.rowsAffected !== 1 ||
+        stepUpdate.rowsAffected !== 1 ||
+        leaseUpdate.rowsAffected !== 1
+      )
+        throw new Error("Quarantined Run resolution conflict");
+
+      await tx.execute({
+        sql: "UPDATE attention_items SET resolved_at = ? WHERE task_attempt_id = ? AND kind = 'worker_blocked' AND resolved_at IS NULL",
+        args: [now, input.attemptId],
+      });
+      const remainingBlocked = await tx.execute({
+        sql: "SELECT 1 FROM task_steps WHERE task_id = ? AND status IN ('blocked','failed') LIMIT 1",
+        args: [input.taskId],
+      });
+      const otherBlocked = await tx.execute({
+        sql: "SELECT 1 FROM task_steps WHERE task_id = ? AND id <> ? AND status = 'blocked' LIMIT 1",
+        args: [input.taskId, input.stepId],
+      });
+      if (!otherBlocked.rows[0])
+        await tx.execute({
+          sql: "UPDATE attention_items SET resolved_at = ? WHERE task_id = ? AND kind = 'worker_blocked' AND task_attempt_id IS NULL AND resolved_at IS NULL",
+          args: [now, input.taskId],
+        });
+      if (!remainingBlocked.rows[0]) {
+        const attention = await tx.execute({
+          sql: "SELECT 1 FROM attention_items WHERE task_id = ? AND resolved_at IS NULL LIMIT 1",
+          args: [input.taskId],
+        });
+        const waits = await tx.execute({
+          sql: "SELECT 1 FROM task_waits WHERE task_id = ? AND status = 'waiting' LIMIT 1",
+          args: [input.taskId],
+        });
+        if (!attention.rows[0] && !waits.rows[0])
+          await tx.execute({
+            sql: "UPDATE tasks SET status = 'RUNNING', updated_at = ? WHERE id = ? AND status = 'WAITING_INPUT' AND cancellation_state = 'none'",
+            args: [now, input.taskId],
+          });
+      }
+      await this.appendEventTx(tx, {
+        taskId: input.taskId,
+        stepId: input.stepId,
+        attemptId: input.attemptId,
+        type: "ATTEMPT_FINISHED",
+        origin,
+        evidenceRef,
+        metadata: { outcome: nextStatus, runId: input.runId, runStatus },
+      });
+      await this.appendEventTx(tx, {
+        taskId: input.taskId,
+        stepId: input.stepId,
+        attemptId: input.attemptId,
+        type: statusEvents[nextStatus]!,
+        origin,
+        evidenceRef,
+        metadata: { outcome: nextStatus, runId: input.runId, runStatus },
+      });
+      const dependencies = await tx.execute({
+        sql: "SELECT dependency_id FROM task_step_dependencies WHERE task_id = ? AND step_id = ? ORDER BY dependency_id",
+        args: [input.taskId, input.stepId],
+      });
+      return parseStep(
+        await this.requireStep(tx, input.taskId, input.stepId),
+        dependencies.rows.map((row) => stringColumn(row, "dependency_id")),
+      );
+    });
+  }
+
   /** Settles a cancelled text-only Model Step after its internal Run reaches a terminal record.
    * An unknown Run stays unknown evidence; Task cancellation never claims rollback. */
   async settleClaimedStepCancellation(input: {
@@ -1420,6 +1632,143 @@ export class LongWorkStore {
         await this.requireStep(tx, input.taskId, input.stepId),
         dependencies.rows.map((row) => stringColumn(row, "dependency_id")),
       );
+    });
+  }
+
+  /** Settles cancellation for an unknown read-only Run after the Run becomes terminal. */
+  async settleQuarantinedReadOnlyStepCancellation(input: {
+    taskId: string;
+    stepId: string;
+    attemptId: string;
+    leaseId: string;
+    expectedStepVersion: number;
+    expectedLeaseVersion: number;
+    origin: LongWorkOrigin;
+  }): Promise<"pending" | "settled"> {
+    for (const value of [input.taskId, input.stepId, input.attemptId, input.leaseId])
+      requireIdentifier(value);
+    if (
+      !Number.isSafeInteger(input.expectedStepVersion) ||
+      input.expectedStepVersion < 1 ||
+      !Number.isSafeInteger(input.expectedLeaseVersion) ||
+      input.expectedLeaseVersion < 1
+    )
+      throw new Error("Invalid quarantined Step cancellation version");
+    return this.db.transaction(async (tx) => {
+      await this.requireOrigin(tx, input.origin);
+      const task = await this.requireTask(tx, input.taskId);
+      if (
+        task.orchestration_mode !== "durable" ||
+        !["requested", "stopping"].includes(stringColumn(task, "cancellation_state"))
+      )
+        throw new Error("Task cancellation is not pending");
+      const step = await this.requireStep(tx, input.taskId, input.stepId);
+      if (
+        step.status !== "cancelled" ||
+        Number(step.version) !== input.expectedStepVersion ||
+        !isClosedReadOnlyRunStep(step)
+      )
+        throw new Error("Quarantined Step cancellation conflict");
+      const attempt = await tx.execute({
+        sql: "SELECT status FROM task_attempts WHERE id = ? AND task_id = ? AND step_id = ?",
+        args: [input.attemptId, input.taskId, input.stepId],
+      });
+      if (attempt.rows[0]?.status !== "waiting_input")
+        throw new Error("Quarantined Step cancellation Attempt conflict");
+      const lease = await tx.execute({
+        sql: `SELECT state,version,attempt_id,owner_instance_id,worker_binding_id FROM task_step_leases
+          WHERE id = ? AND task_id = ? AND step_id = ?`,
+        args: [input.leaseId, input.taskId, input.stepId],
+      });
+      if (
+        lease.rows[0]?.state !== "quarantined" ||
+        Number(lease.rows[0].version) !== input.expectedLeaseVersion ||
+        lease.rows[0].attempt_id !== input.attemptId ||
+        lease.rows[0].owner_instance_id !== expectedModelLeaseOwner(input.taskId, input.stepId) ||
+        lease.rows[0].worker_binding_id !== null
+      )
+        throw new Error("Quarantined Step cancellation lease conflict");
+      const binding = await tx.execute({
+        sql: "SELECT 1 FROM worker_bindings WHERE task_attempt_id = ? LIMIT 1",
+        args: [input.attemptId],
+      });
+      if (binding.rows[0]) throw new Error("Quarantined Step cancellation has a Worker binding");
+
+      const linkedRun = await tx.execute({
+        sql: `SELECT ar.run_id,r.id,r.status,r.source FROM task_attempt_runs ar
+          LEFT JOIN runs r ON r.id = ar.run_id
+          WHERE ar.attempt_id = ? AND ar.task_id = ? AND ar.step_id = ?`,
+        args: [input.attemptId, input.taskId, input.stepId],
+      });
+      const run = linkedRun.rows[0];
+      if (run && (run.id === null || run.source !== "task_step"))
+        throw new Error("Quarantined Step Run binding conflict");
+      const runOutcome = run ? stringColumn(run, "status") : "not_started";
+      if (["queued", "running", "cancelling"].includes(runOutcome)) return "pending";
+      if (
+        run &&
+        !["cancelled", "succeeded", "failed", "interrupted", "unknown"].includes(runOutcome)
+      )
+        throw new Error("Quarantined Step Run outcome is invalid");
+
+      const now = new Date().toISOString();
+      const evidenceRef = run
+        ? `run:${stringColumn(run, "id")}`
+        : `run-not-created:${input.attemptId}`;
+      const attemptUpdate = await tx.execute({
+        sql: "UPDATE task_attempts SET status = 'canceled', completed_at = ? WHERE id = ? AND task_id = ? AND step_id = ? AND status = 'waiting_input'",
+        args: [now, input.attemptId, input.taskId, input.stepId],
+      });
+      const leaseUpdate = await tx.execute({
+        sql: `UPDATE task_step_leases SET state = 'released', version = version + 1,
+            heartbeat_at = ?, released_at = ?
+          WHERE id = ? AND task_id = ? AND step_id = ? AND attempt_id = ?
+            AND version = ? AND state = 'quarantined' AND worker_binding_id IS NULL
+            AND owner_instance_id = ?`,
+        args: [
+          now,
+          now,
+          input.leaseId,
+          input.taskId,
+          input.stepId,
+          input.attemptId,
+          input.expectedLeaseVersion,
+          expectedModelLeaseOwner(input.taskId, input.stepId),
+        ],
+      });
+      if (attemptUpdate.rowsAffected !== 1 || leaseUpdate.rowsAffected !== 1)
+        throw new Error("Quarantined Step cancellation conflict");
+      await this.appendEventTx(tx, {
+        taskId: input.taskId,
+        stepId: input.stepId,
+        attemptId: input.attemptId,
+        type: "ATTEMPT_FINISHED",
+        origin: input.origin,
+        evidenceRef,
+        metadata: {
+          outcome: "cancelled",
+          runOutcome,
+          runId: run ? stringColumn(run, "id") : null,
+          rollbackPerformed: false,
+        },
+      });
+      await this.appendEventTx(tx, {
+        taskId: input.taskId,
+        stepId: input.stepId,
+        attemptId: input.attemptId,
+        type: "STEP_CANCELLED",
+        origin: input.origin,
+        evidenceRef,
+        metadata: {
+          reason: "task_cancellation_settled",
+          previousStatus: "cancelled",
+          status: "cancelled",
+          runOutcome,
+          runId: run ? stringColumn(run, "id") : null,
+          rollbackPerformed: false,
+        },
+      });
+      return "settled";
     });
   }
 
@@ -3912,6 +4261,20 @@ export class LongWorkStore {
       await this.requireStep(tx, taskId, stepId);
       const result = await tx.execute({
         sql: "SELECT * FROM task_step_leases WHERE task_id = ? AND step_id = ? AND state = 'active'",
+        args: [taskId, stepId],
+      });
+      return result.rows[0] ? parseLease(result.rows[0]) : null;
+    });
+  }
+
+  /** Internal read used to resolve a blocked Step from its quarantined Run lease. */
+  async getQuarantinedLease(taskId: string, stepId: string): Promise<StoredStepLease | null> {
+    requireIdentifier(taskId);
+    requireIdentifier(stepId);
+    return this.db.transaction(async (tx) => {
+      await this.requireStep(tx, taskId, stepId);
+      const result = await tx.execute({
+        sql: "SELECT * FROM task_step_leases WHERE task_id = ? AND step_id = ? AND state = 'quarantined'",
         args: [taskId, stepId],
       });
       return result.rows[0] ? parseLease(result.rows[0]) : null;

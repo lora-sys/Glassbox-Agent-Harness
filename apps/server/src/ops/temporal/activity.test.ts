@@ -1389,6 +1389,96 @@ it("does not retry an unknown Model Run outcome", async () => {
   }
 });
 
+it("reconciles a quarantined Model Step from its original persisted Run result", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  try {
+    const { task, step } = await createModelTask(store);
+    const advance = createAdvanceLongWorkActivity(store);
+    const input = { taskId: task.id, policyRevision: 1 };
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    const lease = await store.longWork.getActiveLease(task.id, step.id);
+    const run = await store.conversations.getInternalStepRun(caller, lease!.attemptId!);
+    expect(run).toBeTruthy();
+    vi.spyOn(store.conversations, "getInternalStepRun").mockRejectedValueOnce(
+      new Error("temporary database read failure"),
+    );
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("blocked");
+    expect(await store.longWork.getQuarantinedLease(task.id, step.id)).toMatchObject({
+      attemptId: lease!.attemptId,
+    });
+
+    await store.db.transaction((tx) =>
+      tx.execute({
+        sql: "UPDATE runs SET status = 'succeeded', result_text = 'Recovered result' WHERE id = ?",
+        args: [run!.id],
+      }),
+    );
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    expect((await store.longWork.listSteps(task.id))[0]).toMatchObject({
+      status: "review",
+      outputRef: `run:${run!.id}`,
+    });
+    expect(await store.longWork.getQuarantinedLease(task.id, step.id)).toBeNull();
+    const events = await store.longWork.listEvents(task.id);
+    expect(events.map((event) => event.type)).toContain("STEP_BLOCKED");
+    expect(events.at(-1)).toMatchObject({ type: "STEP_REVIEW", evidenceRef: `run:${run!.id}` });
+  } finally {
+    await store.close();
+  }
+});
+
+it("keeps a quarantined Model Step blocked after continuation authority is revoked", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  try {
+    const { task, step } = await createModelTask(store);
+    const advance = createAdvanceLongWorkActivity(store);
+    const input = { taskId: task.id, policyRevision: 1 };
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    const lease = await store.longWork.getActiveLease(task.id, step.id);
+    const run = await store.conversations.getInternalStepRun(caller, lease!.attemptId!);
+    vi.spyOn(store.conversations, "getInternalStepRun").mockRejectedValueOnce(
+      new Error("temporary database read failure"),
+    );
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    await store.db.transaction((tx) =>
+      tx.execute({
+        sql: "UPDATE runs SET status = 'succeeded', result_text = 'Recovered result' WHERE id = ?",
+        args: [run!.id],
+      }),
+    );
+    await store.authorization.revokeScopeAction({
+      principalId: caller.principalId,
+      resourceId: `task-${task.id}`,
+      action: "task:continue",
+      scope: caller.scope,
+    });
+
+    expect(await advance(input)).toMatchObject({ kind: "wait", wakeAt: expect.any(String) });
+    expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("blocked");
+    expect(await store.longWork.getQuarantinedLease(task.id, step.id)).toMatchObject({
+      attemptId: lease!.attemptId,
+    });
+    expect(
+      (await store.longWork.listEvents(task.id)).filter((event) => event.type === "STEP_REVIEW"),
+    ).toHaveLength(0);
+    await store.authorization.grant({
+      principalId: caller.principalId,
+      resourceId: `task-${task.id}`,
+      action: "task:continue",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    expect((await store.longWork.listSteps(task.id))[0]).toMatchObject({
+      status: "review",
+      outputRef: `run:${run!.id}`,
+    });
+  } finally {
+    await store.close();
+  }
+});
+
 it("does not retry a failed Model Run after Task continuation authorization is revoked", async () => {
   const store = await openDomainStore({ databasePath: ":memory:" });
   try {
@@ -1535,6 +1625,51 @@ it("settles Task cancellation after a restarted Model Run becomes unknown withou
       evidenceRef: `run:${run!.id}`,
       metadata: { runOutcome: "unknown", rollbackPerformed: false },
     });
+  } finally {
+    await store.close();
+  }
+});
+
+it("settles Task cancellation after a quarantined Model Run becomes terminal", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  try {
+    const { task, step } = await createModelTask(store);
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: `task-${task.id}`,
+      action: "task:cancel",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    const advance = createAdvanceLongWorkActivity(store);
+    const input = { taskId: task.id, policyRevision: 1 };
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    const activeLease = await store.longWork.getActiveLease(task.id, step.id);
+    const run = await store.conversations.getInternalStepRun(caller, activeLease!.attemptId!);
+    vi.spyOn(store.conversations, "getInternalStepRun").mockRejectedValueOnce(
+      new Error("temporary database read failure"),
+    );
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("blocked");
+    const ops = new AuthorizedOpsService(store, new FakeHerdrBridge());
+    expect(await ops.cancel(caller, task.id)).toBe(false);
+    expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("cancelled");
+    expect(await advance(input)).toMatchObject({ kind: "wait", wakeAt: expect.any(String) });
+    await store.db.transaction((tx) =>
+      tx.execute({ sql: "UPDATE runs SET status = 'unknown' WHERE id = ?", args: [run!.id] }),
+    );
+
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    expect(await store.longWork.getQuarantinedLease(task.id, step.id)).toBeNull();
+    expect(await advance(input)).toEqual({ kind: "complete" });
+    expect(await store.tasks.getTask(task.id)).toMatchObject({
+      status: "CANCELED",
+      cancellationState: "settled",
+    });
+    expect((await store.conversations.getRun(caller, run!.id)).status).toBe("unknown");
+    expect((await store.longWork.listEvents(task.id)).map((event) => event.type)).toContain(
+      "STEP_BLOCKED",
+    );
   } finally {
     await store.close();
   }

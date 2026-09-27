@@ -77,6 +77,11 @@ function step(id: string, dependencyIds: string[] = [], kind: TaskStep["kind"] =
   };
 }
 
+function modelLeaseOwner(taskId: string, stepId: string): string {
+  const digest = createHash("sha256").update(`${taskId}\0${stepId}`).digest("hex");
+  return `temporal-model-${digest}`;
+}
+
 async function succeedStep(store: LongWorkStore, stepId: string, version = 1): Promise<void> {
   await store.transitionStep({
     taskId: "task-1",
@@ -328,6 +333,90 @@ async function addTaskContinueDecision(db: DomainDatabase, taskId: string): Prom
     });
   });
   return decisionId;
+}
+
+async function prepareBlockedModelRun(
+  db: DomainDatabase,
+  store: LongWorkStore,
+  withParallelWorker = false,
+): Promise<void> {
+  await store.createGraph(
+    "task-1",
+    [
+      { ...step("model", [], "model"), specRef: "pi:test", requiredCapabilities: ["text"] },
+      ...(withParallelWorker ? [step("worker", [], "herdr_worker")] : []),
+    ],
+    "model",
+    limits,
+    system,
+  );
+  await store.transitionStep({
+    taskId: "task-1",
+    stepId: "model",
+    expectedVersion: 1,
+    from: "pending",
+    to: "ready",
+    origin: system,
+  });
+  await store.claimReadyStep({
+    taskId: "task-1",
+    stepId: "model",
+    expectedStepVersion: 2,
+    attemptId: "model-attempt",
+    leaseId: "model-lease",
+    ownerInstanceId: modelLeaseOwner("task-1", "model"),
+    leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+    origin: claimOrigin,
+  });
+  await store.settleClaimedStep({
+    taskId: "task-1",
+    stepId: "model",
+    attemptId: "model-attempt",
+    leaseId: "model-lease",
+    ownerInstanceId: modelLeaseOwner("task-1", "model"),
+    expectedStepVersion: 3,
+    expectedLeaseVersion: 1,
+    outcome: "unknown",
+    evidenceRef: "trace:model-run-unknown",
+    origin: system,
+  });
+  await db.transaction(async (tx) => {
+    await tx.execute("UPDATE tasks SET status = 'WAITING_INPUT' WHERE id = 'task-1'");
+    await tx.execute({
+      sql: "INSERT INTO agents(id,created_at) VALUES ('agent-1',?)",
+      args: [now],
+    });
+    await tx.execute(
+      "INSERT INTO resources(id,kind,visibility,owner_id) VALUES ('conversation-task-1','conversation','private','owner')",
+    );
+    await tx.execute({
+      sql: "INSERT INTO conversations(id,agent_id,principal_id,scope_key,scope_json,resource_id,created_at) VALUES ('conversation-task-1','agent-1','owner','test','{}','conversation-task-1',?)",
+      args: [now],
+    });
+  });
+}
+
+async function persistLinkedInternalRun(
+  db: DomainDatabase,
+  options: { id?: string; status: string; resultText?: string | null; attemptId?: string },
+): Promise<string> {
+  const id = options.id ?? "model-run";
+  const messageId = `${id}-message`;
+  await db.transaction(async (tx) => {
+    await tx.execute({
+      sql: "INSERT INTO messages(id,conversation_id,scope_key,external_id,text,created_at) VALUES (?, 'conversation-task-1','test',?,'',?)",
+      args: [messageId, messageId, now],
+    });
+    await tx.execute({
+      sql: "INSERT INTO runs(id,conversation_id,message_id,principal_id,scope_json,execution_ref,status,result_text,source,created_at,updated_at) VALUES (?, 'conversation-task-1',?,'owner','{}','pi:test',?,?, 'task_step',?,?)",
+      args: [id, messageId, options.status, options.resultText ?? null, now, now],
+    });
+    await tx.execute({
+      sql: "INSERT INTO task_attempt_runs(attempt_id,run_id,task_id,step_id) VALUES (?,?,'task-1','model')",
+      args: [options.attemptId ?? "model-attempt", id],
+    });
+  });
+  return id;
 }
 
 const retryPolicy = {
@@ -3876,6 +3965,421 @@ it("quarantines a lost worker lease and preserves unknown outcome", async () => 
       }),
     ).rejects.toThrow("requires reconciliation");
     expect((await store.listSteps("task-1"))[0]?.status).toBe("blocked");
+  } finally {
+    await db.close();
+  }
+});
+
+it("resolves a quarantined Model Step from its linked successful internal Run", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    const store = await fixture(db);
+    await prepareBlockedModelRun(db, store);
+    const runId = await persistLinkedInternalRun(db, {
+      status: "succeeded",
+      resultText: "Completed result",
+    });
+    const lease = await store.getQuarantinedLease("task-1", "model");
+    expect(lease).toMatchObject({ id: "model-lease", attemptId: "model-attempt", version: 2 });
+    const resolved = await store.resolveQuarantinedRunStep({
+      taskId: "task-1",
+      stepId: "model",
+      attemptId: "model-attempt",
+      leaseId: "model-lease",
+      expectedStepVersion: 4,
+      expectedLeaseVersion: 2,
+      runId,
+      origin: claimOrigin,
+    });
+    expect(resolved).toMatchObject({ status: "review", outputRef: `run:${runId}`, version: 5 });
+    await db.transaction(async (tx) => {
+      expect(
+        (
+          await tx.execute(
+            "SELECT status,completed_at FROM task_attempts WHERE id = 'model-attempt'",
+          )
+        ).rows[0],
+      ).toMatchObject({ status: "review" });
+      expect(
+        (await tx.execute("SELECT state FROM task_step_leases WHERE id = 'model-lease'")).rows[0],
+      ).toMatchObject({ state: "released" });
+      expect(
+        (await tx.execute("SELECT status FROM tasks WHERE id = 'task-1'")).rows[0],
+      ).toMatchObject({ status: "RUNNING" });
+    });
+    expect((await store.listEvents("task-1")).slice(-3).map((event) => event.type)).toEqual([
+      "STEP_BLOCKED",
+      "ATTEMPT_FINISHED",
+      "STEP_REVIEW",
+    ]);
+    expect((await store.listEvents("task-1")).slice(-2)).toMatchObject([
+      { evidenceRef: `run:${runId}` },
+      { evidenceRef: `run:${runId}` },
+    ]);
+  } finally {
+    await db.close();
+  }
+});
+
+it("preserves waiting Task state when another Worker Attempt still needs input", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    const store = await fixture(db);
+    await prepareBlockedModelRun(db, store, true);
+    const runId = await persistLinkedInternalRun(db, {
+      status: "succeeded",
+      resultText: "Completed result",
+    });
+    await store.transitionStep({
+      taskId: "task-1",
+      stepId: "worker",
+      expectedVersion: 1,
+      from: "pending",
+      to: "ready",
+      origin: system,
+    });
+    await store.claimReadyStep({
+      taskId: "task-1",
+      stepId: "worker",
+      expectedStepVersion: 2,
+      attemptId: "parallel-worker-attempt",
+      leaseId: "parallel-worker-lease",
+      ownerInstanceId: "executor-2",
+      leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+      origin: claimOrigin,
+    });
+    await db.transaction(async (tx) => {
+      await tx.execute({
+        sql: "INSERT INTO attention_items(id,kind,summary,principal_id,task_id,task_attempt_id,created_at) VALUES ('parallel-worker-attention','worker_blocked','Worker needs input','owner','task-1','parallel-worker-attempt',?)",
+        args: [now],
+      });
+      await tx.execute("UPDATE tasks SET status = 'WAITING_INPUT' WHERE id = 'task-1'");
+    });
+
+    expect(
+      await store.resolveQuarantinedRunStep({
+        taskId: "task-1",
+        stepId: "model",
+        attemptId: "model-attempt",
+        leaseId: "model-lease",
+        expectedStepVersion: 4,
+        expectedLeaseVersion: 2,
+        runId,
+        origin: claimOrigin,
+      }),
+    ).toMatchObject({ status: "review" });
+    await db.transaction(async (tx) => {
+      expect(
+        (await tx.execute("SELECT status FROM tasks WHERE id = 'task-1'")).rows[0],
+      ).toMatchObject({
+        status: "WAITING_INPUT",
+      });
+      expect(
+        (
+          await tx.execute(
+            "SELECT resolved_at FROM attention_items WHERE id = 'parallel-worker-attention'",
+          )
+        ).rows[0]?.resolved_at,
+      ).toBeNull();
+    });
+  } finally {
+    await db.close();
+  }
+});
+
+it("rejects a quarantined Run that is not linked to the exact Task Step attempt", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    const store = await fixture(db);
+    await prepareBlockedModelRun(db, store);
+    await persistLinkedInternalRun(db, { status: "succeeded", resultText: "result" });
+    const eventsBefore = await store.listEvents("task-1");
+    await expect(
+      store.resolveQuarantinedRunStep({
+        taskId: "task-1",
+        stepId: "model",
+        attemptId: "model-attempt",
+        leaseId: "model-lease",
+        expectedStepVersion: 4,
+        expectedLeaseVersion: 2,
+        runId: "another-run",
+        origin: claimOrigin,
+      }),
+    ).rejects.toThrow("Quarantined Run binding conflict");
+    expect((await store.listSteps("task-1"))[0]).toMatchObject({ status: "blocked", version: 4 });
+    expect((await store.listEvents("task-1")).map((event) => event.id)).toEqual(
+      eventsBefore.map((event) => event.id),
+    );
+  } finally {
+    await db.close();
+  }
+});
+
+it("rejects quarantined Run resolution after the Task continuation grant is revoked", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    const store = await fixture(db);
+    await prepareBlockedModelRun(db, store);
+    const runId = await persistLinkedInternalRun(db, {
+      status: "succeeded",
+      resultText: "result",
+    });
+    await db.transaction((tx) =>
+      tx.execute({
+        sql: "UPDATE grants SET revoked_at = ? WHERE id = 'continue-grant'",
+        args: [now],
+      }),
+    );
+    await expect(
+      store.resolveQuarantinedRunStep({
+        taskId: "task-1",
+        stepId: "model",
+        attemptId: "model-attempt",
+        leaseId: "model-lease",
+        expectedStepVersion: 4,
+        expectedLeaseVersion: 2,
+        runId,
+        origin: claimOrigin,
+      }),
+    ).rejects.toThrow("Current Task continuation grant is required");
+    expect((await store.listSteps("task-1"))[0]).toMatchObject({ status: "blocked", version: 4 });
+    expect(await store.getQuarantinedLease("task-1", "model")).toMatchObject({
+      state: "quarantined",
+      version: 2,
+    });
+  } finally {
+    await db.close();
+  }
+});
+
+it("keeps quarantined Model Step blocked while its linked internal Run remains unknown", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    const store = await fixture(db);
+    await prepareBlockedModelRun(db, store);
+    const runId = await persistLinkedInternalRun(db, { status: "unknown" });
+    await expect(
+      store.resolveQuarantinedRunStep({
+        taskId: "task-1",
+        stepId: "model",
+        attemptId: "model-attempt",
+        leaseId: "model-lease",
+        expectedStepVersion: 4,
+        expectedLeaseVersion: 2,
+        runId,
+        origin: claimOrigin,
+      }),
+    ).rejects.toThrow("Internal Run outcome remains unresolved");
+    expect((await store.listSteps("task-1"))[0]).toMatchObject({ status: "blocked", version: 4 });
+    expect(await store.getQuarantinedLease("task-1", "model")).toMatchObject({
+      state: "quarantined",
+      version: 2,
+    });
+    expect((await store.listEvents("task-1")).slice(-1)[0]?.type).toBe("STEP_BLOCKED");
+  } finally {
+    await db.close();
+  }
+});
+
+it("resolves blocked attention after a failed internal Run without resuming the Task", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    const store = await fixture(db);
+    await prepareBlockedModelRun(db, store);
+    const runId = await persistLinkedInternalRun(db, { status: "failed" });
+    await store.markTaskNeedsAttention("task-1", system, "model");
+    const resolved = await store.resolveQuarantinedRunStep({
+      taskId: "task-1",
+      stepId: "model",
+      attemptId: "model-attempt",
+      leaseId: "model-lease",
+      expectedStepVersion: 4,
+      expectedLeaseVersion: 2,
+      runId,
+      origin: claimOrigin,
+    });
+    expect(resolved).toMatchObject({ status: "failed", outputRef: undefined, version: 5 });
+    await db.transaction(async (tx) => {
+      expect(
+        (await tx.execute("SELECT status FROM tasks WHERE id = 'task-1'")).rows[0],
+      ).toMatchObject({ status: "WAITING_INPUT" });
+      expect(
+        (
+          await tx.execute(
+            "SELECT kind,resolved_at FROM attention_items WHERE task_id = 'task-1' AND kind = 'worker_blocked'",
+          )
+        ).rows,
+      ).toEqual(
+        expect.arrayContaining([expect.objectContaining({ resolved_at: expect.any(String) })]),
+      );
+    });
+    expect((await store.listEvents("task-1")).slice(-2)).toMatchObject([
+      { type: "ATTEMPT_FINISHED", evidenceRef: `run:${runId}` },
+      { type: "STEP_FAILED", evidenceRef: `run:${runId}` },
+    ]);
+  } finally {
+    await db.close();
+  }
+});
+
+it("settles cancellation of a quarantined read-only Step while preserving its unknown Run and block event", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    const store = await fixture(db);
+    await prepareBlockedModelRun(db, store);
+    const runId = await persistLinkedInternalRun(db, { status: "unknown" });
+    const decisionId = await addCancelDecision(db);
+    await store.requestDurableCancellation("task-1", {
+      kind: "decision",
+      decisionId,
+      actorPrincipalId: "owner",
+    });
+    const result = await store.settleQuarantinedReadOnlyStepCancellation({
+      taskId: "task-1",
+      stepId: "model",
+      attemptId: "model-attempt",
+      leaseId: "model-lease",
+      expectedStepVersion: 5,
+      expectedLeaseVersion: 2,
+      origin: system,
+    });
+    expect(result).toBe("settled");
+    expect((await store.listSteps("task-1"))[0]).toMatchObject({ status: "cancelled", version: 5 });
+    const events = await store.listEvents("task-1");
+    expect(events.some((event) => event.type === "STEP_BLOCKED")).toBe(true);
+    expect(events.slice(-2)).toMatchObject([
+      {
+        type: "ATTEMPT_FINISHED",
+        evidenceRef: `run:${runId}`,
+        metadata: { outcome: "cancelled", runOutcome: "unknown", runId, rollbackPerformed: false },
+      },
+      {
+        type: "STEP_CANCELLED",
+        evidenceRef: `run:${runId}`,
+        metadata: { runOutcome: "unknown", runId, rollbackPerformed: false },
+      },
+    ]);
+    await db.transaction(async (tx) => {
+      expect(
+        (await tx.execute({ sql: "SELECT status FROM runs WHERE id = ?", args: [runId] })).rows[0],
+      ).toMatchObject({ status: "unknown" });
+      expect(
+        (await tx.execute("SELECT status FROM task_attempts WHERE id = 'model-attempt'")).rows[0],
+      ).toMatchObject({ status: "canceled" });
+      expect(
+        (await tx.execute("SELECT state FROM task_step_leases WHERE id = 'model-lease'")).rows[0],
+      ).toMatchObject({ state: "released" });
+    });
+  } finally {
+    await db.close();
+  }
+});
+
+it("leaves a quarantined read-only Step cancellation pending while its internal Run is active", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    const store = await fixture(db);
+    await prepareBlockedModelRun(db, store);
+    const runId = await persistLinkedInternalRun(db, { status: "running" });
+    const decisionId = await addCancelDecision(db);
+    await store.requestDurableCancellation("task-1", {
+      kind: "decision",
+      decisionId,
+      actorPrincipalId: "owner",
+    });
+    const eventsBefore = await store.listEvents("task-1");
+    await expect(
+      store.settleQuarantinedReadOnlyStepCancellation({
+        taskId: "task-1",
+        stepId: "model",
+        attemptId: "model-attempt",
+        leaseId: "model-lease",
+        expectedStepVersion: 5,
+        expectedLeaseVersion: 2,
+        origin: system,
+      }),
+    ).resolves.toBe("pending");
+    expect((await store.listEvents("task-1")).map((event) => event.id)).toEqual(
+      eventsBefore.map((event) => event.id),
+    );
+    await db.transaction(async (tx) => {
+      expect(
+        (await tx.execute({ sql: "SELECT status FROM runs WHERE id = ?", args: [runId] })).rows[0],
+      ).toMatchObject({ status: "running" });
+      expect(
+        (await tx.execute("SELECT status FROM task_attempts WHERE id = 'model-attempt'")).rows[0],
+      ).toMatchObject({ status: "waiting_input" });
+      expect(
+        (await tx.execute("SELECT state FROM task_step_leases WHERE id = 'model-lease'")).rows[0],
+      ).toMatchObject({ state: "quarantined" });
+    });
+  } finally {
+    await db.close();
+  }
+});
+
+it("rejects quarantined read-only cancellation settlement for a Herdr Worker Step", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    const store = await fixture(db);
+    await store.createGraph(
+      "task-1",
+      [step("worker", [], "herdr_worker")],
+      "worker",
+      limits,
+      system,
+    );
+    await store.transitionStep({
+      taskId: "task-1",
+      stepId: "worker",
+      expectedVersion: 1,
+      from: "pending",
+      to: "ready",
+      origin: system,
+    });
+    await store.claimReadyStep({
+      taskId: "task-1",
+      stepId: "worker",
+      expectedStepVersion: 2,
+      attemptId: "worker-attempt",
+      leaseId: "worker-lease",
+      ownerInstanceId: "executor-1",
+      leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+      origin: claimOrigin,
+    });
+    await store.settleClaimedStep({
+      taskId: "task-1",
+      stepId: "worker",
+      attemptId: "worker-attempt",
+      leaseId: "worker-lease",
+      ownerInstanceId: "executor-1",
+      expectedStepVersion: 3,
+      expectedLeaseVersion: 1,
+      outcome: "unknown",
+      evidenceRef: "trace:worker-unknown",
+      origin: system,
+    });
+    const decisionId = await addCancelDecision(db);
+    await store.requestDurableCancellation("task-1", {
+      kind: "decision",
+      decisionId,
+      actorPrincipalId: "owner",
+    });
+    await expect(
+      store.settleQuarantinedReadOnlyStepCancellation({
+        taskId: "task-1",
+        stepId: "worker",
+        attemptId: "worker-attempt",
+        leaseId: "worker-lease",
+        expectedStepVersion: 4,
+        expectedLeaseVersion: 2,
+        origin: system,
+      }),
+    ).rejects.toThrow("Quarantined Step cancellation conflict");
+    expect(await store.getQuarantinedLease("task-1", "worker")).toMatchObject({
+      state: "quarantined",
+      version: 2,
+    });
   } finally {
     await db.close();
   }

@@ -307,6 +307,54 @@ async function observeRunningModelStep(
   }
 }
 
+/** Reconcile only a persisted terminal Run for the original quarantined Attempt. */
+async function observeQuarantinedRunStep(
+  store: DomainStore,
+  taskId: string,
+  step: TaskStep,
+): Promise<"settled" | "pending" | "unresolved"> {
+  if (step.status !== "blocked" || !["model", "tool"].includes(step.kind)) return "unresolved";
+  const lease = await store.longWork.getQuarantinedLease(taskId, step.id);
+  if (!lease?.attemptId || lease.ownerInstanceId !== modelLeaseOwner(taskId, step.id))
+    return "unresolved";
+  const caller = await getLongWorkCaller(store, taskId);
+  let run: RunRecord | null;
+  try {
+    run = await store.conversations.getInternalStepRun(caller, lease.attemptId);
+  } catch (error) {
+    if (error instanceof AccessDeniedError) return "pending";
+    // A failed read is not post-state evidence. Keep the quarantine and try later.
+    return "pending";
+  }
+  if (!run) return "unresolved";
+  if (["queued", "running", "cancelling"].includes(run.status)) return "pending";
+  if (run.status !== "failed" && !(run.status === "succeeded" && run.resultText !== null))
+    return "unresolved";
+  let decisionId: string;
+  try {
+    decisionId = await authorizeLongWorkAction(store, {
+      taskId,
+      caller,
+      resourceId: `task-${taskId}`,
+      action: "task:continue",
+    });
+  } catch (error) {
+    if (error instanceof AccessDeniedError) return "pending";
+    throw error;
+  }
+  await store.longWork.resolveQuarantinedRunStep({
+    taskId,
+    stepId: step.id,
+    attemptId: lease.attemptId,
+    leaseId: lease.id,
+    expectedStepVersion: step.version,
+    expectedLeaseVersion: lease.version,
+    runId: run.id,
+    origin: { kind: "decision", decisionId, actorPrincipalId: caller.principalId },
+  });
+  return "settled";
+}
+
 async function settleCancelledModelStep(
   store: DomainStore,
   taskId: string,
@@ -518,6 +566,23 @@ export function createAdvanceLongWorkActivity(
       const steps = await store.longWork.listSteps(taskId);
       let pending = false;
       for (const step of steps) {
+        if (["model", "tool"].includes(step.kind) && step.status === "cancelled") {
+          const lease = await store.longWork.getQuarantinedLease(taskId, step.id);
+          if (lease?.attemptId && lease.ownerInstanceId === modelLeaseOwner(taskId, step.id)) {
+            const result = await store.longWork.settleQuarantinedReadOnlyStepCancellation({
+              taskId,
+              stepId: step.id,
+              attemptId: lease.attemptId,
+              leaseId: lease.id,
+              expectedStepVersion: step.version,
+              expectedLeaseVersion: lease.version,
+              origin: ORIGIN,
+            });
+            if (result === "settled") return { kind: "continue" };
+            pending = true;
+          }
+          continue;
+        }
         if (step.kind === "child_task" && step.status === "running") {
           const result = await settleCancelledChildStep(store, taskId, step, wakeChild);
           if (result === "settled") return { kind: "continue" };
@@ -573,6 +638,12 @@ export function createAdvanceLongWorkActivity(
     let workerPending = false;
     let childPending = false;
     for (const step of steps) {
+      if (step.status === "blocked" && ["model", "tool"].includes(step.kind)) {
+        const observed = await observeQuarantinedRunStep(store, taskId, step);
+        if (observed === "settled") return { kind: "continue" };
+        if (observed === "pending") modelRunPending = true;
+        continue;
+      }
       if (step.kind === "child_task" && step.status === "running") {
         const links = await store.longWork.listChildTaskLinks(taskId, step.id);
         const link = links.at(-1);
