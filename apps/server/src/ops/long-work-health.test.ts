@@ -23,6 +23,16 @@ it("returns exact zero counts while backend availability remains unknown without
       leases: { active: 0, quarantined: 0 },
       retries: 0,
       children: 0,
+      durations: {
+        retryDelay: { averageMs: null, samples: 0 },
+        wait: { averageMs: null, samples: 0 },
+        blocked: { averageMs: null, samples: 0 },
+        reviewLatency: { averageMs: null, samples: 0 },
+        taskCompletion: { averageMs: null, samples: 0 },
+      },
+      reworkCount: 0,
+      workerReplacementCount: 0,
+      historyTruncated: { tasks: false, waits: false, taskEvents: false },
       backend: { status: "unknown", unavailableBindings: null, observedBindings: 0 },
     });
   } finally {
@@ -106,6 +116,16 @@ it("aggregates durable work states without returning protected Task content", as
       leases: { active: 1, quarantined: 1 },
       retries: 1,
       children: 1,
+      durations: {
+        retryDelay: { averageMs: null, samples: 0 },
+        wait: { averageMs: null, samples: 0 },
+        blocked: { averageMs: null, samples: 0 },
+        reviewLatency: { averageMs: null, samples: 0 },
+        taskCompletion: { averageMs: null, samples: 0 },
+      },
+      reworkCount: 0,
+      workerReplacementCount: 0,
+      historyTruncated: { tasks: false, waits: false, taskEvents: false },
       backend: { status: "unavailable", unavailableBindings: 1, observedBindings: 2 },
     });
     expect(JSON.stringify(snapshot)).not.toContain("private");
@@ -114,6 +134,130 @@ it("aggregates durable work states without returning protected Task content", as
       active: 1,
       waiting: 0,
     });
+  } finally {
+    await db.close();
+  }
+});
+
+it("derives timestamp metrics only from task:read-authorized durable Tasks", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    await db.transaction(async (tx) => {
+      await tx.execute("INSERT INTO principals(id,kind,created_at) VALUES ('owner','owner','now')");
+      await tx.execute({
+        sql: "INSERT INTO channel_identities(identity_key,principal_id,created_at) VALUES (?, 'owner','now')",
+        args: [identityKey(caller.scope)],
+      });
+      for (const id of ["visible", "denied"]) {
+        await tx.execute({
+          sql: `INSERT INTO tasks(id,title,status,priority,creator_principal_id,orchestration_mode,created_at,completed_at,updated_at)
+            VALUES (?, 'private','DONE','normal','owner','durable','2026-01-01T00:00:00.000Z','2026-01-01T00:10:00.000Z','2026-01-01T00:10:00.000Z')`,
+          args: [id],
+        });
+        await tx.execute({
+          sql: "INSERT INTO task_steps(id,task_id,kind,title,status,dependency_policy_json,max_attempts,required_capabilities_json,delegated_permissions_json,version,created_at,updated_at) VALUES (?, ?, 'herdr_worker','private','blocked','{}',3,'[]','[]',1,'now','now')",
+          args: [`step-${id}`, id],
+        });
+      }
+      await tx.execute(
+        "INSERT INTO resources(id,kind,visibility,owner_id) VALUES ('task-visible','task','private','owner')",
+      );
+      await tx.execute({
+        sql: "INSERT INTO grants(id,principal_id,resource_id,action,scope_key,effect,created_at) VALUES ('read-visible','owner','task-visible','task:read',?,'allow','now')",
+        args: [scopeKey(caller.scope)],
+      });
+      const events = [
+        [
+          "retry",
+          "visible",
+          "step-visible",
+          "RETRY_SCHEDULED",
+          "2026-01-01T00:01:00.000Z",
+          JSON.stringify({ dueAt: "2026-01-01T00:01:05.000Z" }),
+        ],
+        ["blocked", "visible", "step-visible", "STEP_BLOCKED", "2026-01-01T00:02:00.000Z", "{}"],
+        ["ready", "visible", "step-visible", "STEP_READY", "2026-01-01T00:02:10.000Z", "{}"],
+        ["review-1", "visible", null, "TASK_REVIEW", "2026-01-01T00:03:00.000Z", "{}"],
+        ["rework", "visible", null, "TASK_REWORK", "2026-01-01T00:03:20.000Z", "{}"],
+        ["review-2", "visible", null, "TASK_REVIEW", "2026-01-01T00:04:00.000Z", "{}"],
+        ["accepted", "visible", null, "TASK_ACCEPTED", "2026-01-01T00:04:30.000Z", "{}"],
+        ["bound-1", "visible", "step-visible", "WORKER_BOUND", "2026-01-01T00:05:00.000Z", "{}"],
+        ["bound-2", "visible", "step-visible", "WORKER_BOUND", "2026-01-01T00:05:10.000Z", "{}"],
+        ["denied-rework", "denied", null, "TASK_REWORK", "2026-01-01T00:06:00.000Z", "{}"],
+        ["denied-bound", "denied", "step-denied", "WORKER_BOUND", "2026-01-01T00:06:10.000Z", "{}"],
+      ] as const;
+      for (const [id, taskId, stepId, type, createdAt, metadata] of events) {
+        await tx.execute({
+          sql: "INSERT INTO task_events(id,task_id,step_id,type,metadata_json,created_at) VALUES (?,?,?,?,?,?)",
+          args: [id, taskId, stepId, type, metadata, createdAt],
+        });
+      }
+      await tx.execute({
+        sql: "INSERT INTO task_waits(id,task_id,step_id,generation,kind,status,started_at,policy_json,updated_at) VALUES ('wait-visible','visible','step-visible',1,'signal','resumed','2026-01-01T00:06:00.000Z','{}','2026-01-01T00:06:15.000Z')",
+      });
+      await tx.execute({
+        sql: "INSERT INTO task_waits(id,task_id,step_id,generation,kind,status,started_at,policy_json,updated_at) VALUES ('wait-denied','denied','step-denied',1,'signal','resumed','2026-01-01T00:06:00.000Z','{}','2026-01-01T00:07:00.000Z')",
+      });
+    });
+
+    const snapshot = await readLongWorkHealth(db, ["visible", "denied"], caller);
+    expect(snapshot.durations).toEqual({
+      retryDelay: { averageMs: 5_000, samples: 1 },
+      wait: { averageMs: 15_000, samples: 1 },
+      blocked: { averageMs: 10_000, samples: 1 },
+      reviewLatency: { averageMs: 25_000, samples: 2 },
+      taskCompletion: { averageMs: 600_000, samples: 1 },
+    });
+    expect(snapshot.reworkCount).toBe(1);
+    expect(snapshot.workerReplacementCount).toBe(1);
+    expect(snapshot.historyTruncated).toEqual({ tasks: false, waits: false, taskEvents: false });
+  } finally {
+    await db.close();
+  }
+});
+
+it("marks event-derived metrics unknown when the bounded event history is truncated", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    await db.transaction(async (tx) => {
+      await tx.execute("INSERT INTO principals(id,kind,created_at) VALUES ('owner','owner','now')");
+      await tx.execute({
+        sql: "INSERT INTO channel_identities(identity_key,principal_id,created_at) VALUES (?, 'owner','now')",
+        args: [identityKey(caller.scope)],
+      });
+      await tx.execute(
+        "INSERT INTO tasks(id,title,status,priority,creator_principal_id,orchestration_mode,created_at,completed_at,updated_at) VALUES ('bounded','private','DONE','normal','owner','durable','2026-01-01T00:00:00.000Z','2026-01-01T00:10:00.000Z','2026-01-01T00:10:00.000Z')",
+      );
+      await tx.execute(
+        "INSERT INTO resources(id,kind,visibility,owner_id) VALUES ('task-bounded','task','private','owner')",
+      );
+      await tx.execute({
+        sql: "INSERT INTO grants(id,principal_id,resource_id,action,scope_key,effect,created_at) VALUES ('read-bounded','owner','task-bounded','task:read',?,'allow','now')",
+        args: [scopeKey(caller.scope)],
+      });
+      await tx.execute(`
+        WITH RECURSIVE seq(value) AS (
+          VALUES (1) UNION ALL SELECT value + 1 FROM seq WHERE value < 10001
+        )
+        INSERT INTO task_events(id,task_id,type,metadata_json,created_at)
+        SELECT 'event-' || value, 'bounded',
+          CASE WHEN value = 1 THEN 'RETRY_SCHEDULED' ELSE 'TASK_REWORK' END,
+          CASE WHEN value = 1 THEN '{"dueAt":"2026-01-01T00:00:05.000Z"}' ELSE '{}' END,
+          '2026-01-01T00:00:00.000Z'
+        FROM seq
+      `);
+    });
+
+    const snapshot = await readLongWorkHealth(db, ["bounded"], caller);
+    expect(snapshot.tasks).toEqual({ active: 0, waiting: 0 });
+    expect(snapshot.retries).toBe(1);
+    expect(snapshot.historyTruncated).toEqual({ tasks: false, waits: false, taskEvents: true });
+    expect(snapshot.durations.retryDelay).toEqual({ averageMs: null, samples: null });
+    expect(snapshot.durations.blocked).toEqual({ averageMs: null, samples: null });
+    expect(snapshot.durations.reviewLatency).toEqual({ averageMs: null, samples: null });
+    expect(snapshot.reworkCount).toBeNull();
+    expect(snapshot.workerReplacementCount).toBeNull();
+    expect(snapshot.durations.taskCompletion).toEqual({ averageMs: 600_000, samples: 1 });
   } finally {
     await db.close();
   }

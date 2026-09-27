@@ -8,6 +8,9 @@ import {
   LongWorkStore,
   MAX_CHILD_TASK_ANCESTOR_DEPTH,
   MAX_CHILD_TASKS_PER_PARENT,
+  MAX_CHECKPOINT_FIELD_BYTES,
+  MAX_CHECKPOINT_PROJECTION_BYTES,
+  TaskCheckpointLimitError,
 } from "./long-work-store.js";
 import { TaskStore } from "./task-store.js";
 import { parseTaskGetSpec } from "./tool-step-spec.js";
@@ -2107,6 +2110,7 @@ it("stores checkpoint references without rewriting an earlier checkpoint", async
       stepId: "a",
       type: "step_state",
       stateRef: "asset:state-1",
+      artifactRef: "artifact:checkpoint-1",
       sourceEvidenceRef: "trace:1",
       policyVersion: 1,
       createdAt: now,
@@ -2117,6 +2121,7 @@ it("stores checkpoint references without rewriting an earlier checkpoint", async
       ...checkpoint,
       id: "checkpoint-2",
       stateRef: "asset:state-2",
+      artifactRef: "artifact:checkpoint-2",
       createdAt: "2020-01-01T00:00:00.000Z",
     };
     await store.writeCheckpoint(laterWrite, system, 2);
@@ -2128,6 +2133,11 @@ it("stores checkpoint references without rewriting an earlier checkpoint", async
         .map((event) => event.metadata?.checkpointId),
     ).toEqual(["checkpoint-1", "checkpoint-2"]);
     await db.transaction(async (tx) => {
+      const rows = await tx.execute("SELECT id, artifact_ref FROM task_checkpoints ORDER BY rowid");
+      expect(rows.rows).toEqual([
+        { id: "checkpoint-1", artifact_ref: "artifact:checkpoint-1" },
+        { id: "checkpoint-2", artifact_ref: "artifact:checkpoint-2" },
+      ]);
       expect(
         (await tx.execute("SELECT checkpoint_ref FROM tasks WHERE id = 'task-1'")).rows[0]
           ?.checkpoint_ref,
@@ -2138,6 +2148,88 @@ it("stores checkpoint references without rewriting an earlier checkpoint", async
         tx.execute("UPDATE task_checkpoints SET state_ref = 'replacement'"),
       ).rejects.toThrow();
     });
+  } finally {
+    await db.close();
+  }
+});
+
+it("rejects an oversized checkpoint artifact reference before storing it", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    const store = await fixture(db);
+    await store.createGraph("task-1", [step("a")], "a", limits, system);
+    const checkpoint = {
+      id: "checkpoint-too-large",
+      taskId: "task-1",
+      stepId: "a",
+      type: "step_state",
+      stateRef: "asset:state-1",
+      artifactRef: "x".repeat(MAX_CHECKPOINT_FIELD_BYTES.artifactRef + 1),
+      sourceEvidenceRef: "trace:1",
+      policyVersion: 1,
+      createdAt: now,
+    };
+
+    let caught: unknown;
+    try {
+      await store.writeCheckpoint(checkpoint, system, 1);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(TaskCheckpointLimitError);
+    expect(caught).toMatchObject({
+      code: "CHECKPOINT_FIELD_LIMIT",
+      field: "artifactRef",
+      limit: MAX_CHECKPOINT_FIELD_BYTES.artifactRef,
+      attempted: MAX_CHECKPOINT_FIELD_BYTES.artifactRef + 1,
+    });
+    expect(await store.latestCheckpoint("task-1", "a")).toBeNull();
+    expect(
+      (await store.listEvents("task-1")).filter((event) => event.type === "CHECKPOINT_WRITTEN"),
+    ).toHaveLength(0);
+    await expect(
+      store.writeCheckpoint(
+        { ...checkpoint, artifactRef: "artifact:" + String.fromCharCode(10) + "private" },
+        system,
+        1,
+      ),
+    ).rejects.toThrow("Invalid checkpoint artifact reference");
+    expect(await store.latestCheckpoint("task-1", "a")).toBeNull();
+  } finally {
+    await db.close();
+  }
+});
+
+it("rejects a checkpoint projection whose combined references exceed its byte limit", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    const store = await fixture(db);
+    await store.createGraph("task-1", [step("a")], "a", limits, system);
+    const checkpoint = {
+      id: "checkpoint-large-projection",
+      taskId: "task-1",
+      stepId: "a",
+      type: "step_state",
+      stateRef: "s".repeat(MAX_CHECKPOINT_FIELD_BYTES.stateRef),
+      artifactRef: "a".repeat(MAX_CHECKPOINT_FIELD_BYTES.artifactRef),
+      sourceEvidenceRef: "e".repeat(MAX_CHECKPOINT_FIELD_BYTES.sourceEvidenceRef),
+      policyVersion: 1,
+      createdAt: now,
+    };
+
+    let caught: unknown;
+    try {
+      await store.writeCheckpoint(checkpoint, system, 1);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(TaskCheckpointLimitError);
+    expect(caught).toMatchObject({
+      code: "CHECKPOINT_PROJECTION_LIMIT",
+      field: "projection",
+      limit: MAX_CHECKPOINT_PROJECTION_BYTES,
+    });
+    expect(await store.latestCheckpoint("task-1", "a")).toBeNull();
   } finally {
     await db.close();
   }

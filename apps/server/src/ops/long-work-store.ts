@@ -37,6 +37,56 @@ export type LongWorkOrigin =
 export const MAX_CHILD_TASKS_PER_PARENT = 16;
 export const MAX_CHILD_TASK_ANCESTOR_DEPTH = 4;
 
+export const MAX_CHECKPOINT_PROJECTION_BYTES = 2048;
+export const MAX_CHECKPOINT_FIELD_BYTES = {
+  id: 128,
+  taskId: 128,
+  stepId: 128,
+  attemptId: 128,
+  type: 64,
+  stateRef: 512,
+  artifactRef: 1024,
+  sourceEvidenceRef: 512,
+  createdAt: 64,
+} as const;
+
+export class TaskCheckpointLimitError extends Error {
+  constructor(
+    readonly code: "CHECKPOINT_FIELD_LIMIT" | "CHECKPOINT_PROJECTION_LIMIT",
+    readonly field: keyof typeof MAX_CHECKPOINT_FIELD_BYTES | "projection",
+    readonly limit: number,
+    readonly attempted: number,
+  ) {
+    super(
+      code === "CHECKPOINT_FIELD_LIMIT"
+        ? `Checkpoint ${field} exceeds its byte limit (${limit})`
+        : `Checkpoint projection exceeds its byte limit (${limit})`,
+    );
+    this.name = "TaskCheckpointLimitError";
+  }
+}
+
+function validateCheckpointProjection(checkpoint: TaskCheckpoint): void {
+  for (const [field, limit] of Object.entries(MAX_CHECKPOINT_FIELD_BYTES) as Array<
+    [keyof typeof MAX_CHECKPOINT_FIELD_BYTES, number]
+  >) {
+    const value = checkpoint[field];
+    if (value !== undefined) {
+      const attempted = Buffer.byteLength(value, "utf8");
+      if (attempted > limit)
+        throw new TaskCheckpointLimitError("CHECKPOINT_FIELD_LIMIT", field, limit, attempted);
+    }
+  }
+  const attempted = Buffer.byteLength(JSON.stringify(checkpoint), "utf8");
+  if (attempted > MAX_CHECKPOINT_PROJECTION_BYTES)
+    throw new TaskCheckpointLimitError(
+      "CHECKPOINT_PROJECTION_LIMIT",
+      "projection",
+      MAX_CHECKPOINT_PROJECTION_BYTES,
+      attempted,
+    );
+}
+
 export type ChildTaskLinkErrorCode = "CHILD_COUNT_LIMIT" | "CHILD_DEPTH_LIMIT";
 
 export class ChildTaskLinkError extends Error {
@@ -3028,10 +3078,25 @@ export class LongWorkStore {
     origin: LongWorkOrigin,
     expectedStepVersion?: number,
   ): Promise<void> {
+    validateCheckpointProjection(checkpoint);
     requireIdentifier(checkpoint.id);
     requireIdentifier(checkpoint.taskId);
     requireIdentifier(checkpoint.stateRef);
     requireIdentifier(checkpoint.sourceEvidenceRef);
+    requireIdentifier(checkpoint.type);
+    if (
+      checkpoint.artifactRef !== undefined &&
+      (typeof checkpoint.artifactRef !== "string" ||
+        checkpoint.artifactRef.length === 0 ||
+        checkpoint.artifactRef.split("").some((character) => character.charCodeAt(0) < 32))
+    )
+      throw new Error("Invalid checkpoint artifact reference");
+    if (
+      typeof checkpoint.createdAt !== "string" ||
+      !Number.isFinite(Date.parse(checkpoint.createdAt)) ||
+      new Date(checkpoint.createdAt).toISOString() !== checkpoint.createdAt
+    )
+      throw new Error("Invalid checkpoint timestamp");
     if (!Number.isSafeInteger(checkpoint.policyVersion) || checkpoint.policyVersion < 1)
       throw new Error("Invalid policy revision");
     await this.db.transaction(async (tx) => {

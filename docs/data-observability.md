@@ -321,6 +321,8 @@ Memory candidates / retrieval evidence
 
 The main Agent receives narrower authorized projections rather than raw databases.
 
+The P6 long-work health projection rechecks `task:read` for each candidate Task before aggregating Task, Step, lease, wait, and TaskEvent evidence. Duration estimates include sample counts. Each history source has a 10,000-row projection cap; if exceeded, dependent estimates and counts are `null` and the snapshot marks that source truncated. Persisted workflow binding status does not claim a live Temporal health check.
+
 Public visitors only receive sanitized, explicitly published Trace or Eval projections.
 
 Private Tasks, Taste, Memory, feedback payloads, Worker output, Herdr pane data, runtime credentials, and private operational metadata are not public by default.
