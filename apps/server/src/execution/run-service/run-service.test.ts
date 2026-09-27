@@ -238,6 +238,46 @@ it("executes a persisted Model Step Run without QQ ingress history or automatic 
   expect(send).toHaveBeenCalledTimes(deliveredBefore);
 });
 
+it("rechecks Task read authority after loading internal Run context", async () => {
+  const { store } = await fixture();
+  const bootstrap = service(store, {
+    supportsGroup: true,
+    execute: async () => ({ status: "succeeded", text: "source" }),
+  }).instance;
+  await bootstrap.start();
+  const source = await bootstrap.receive(input("read-revocation-source"));
+  await bootstrap.waitForRun(owner(), source.run.id);
+  await bootstrap.drain();
+  await bootstrap.stop();
+
+  const internal = await createInternalModelStepRun(store, source.conversation.id);
+  const load = store.conversations.loadRunInput.bind(store.conversations);
+  vi.spyOn(store.conversations, "loadRunInput").mockImplementation(async (caller, runId) => {
+    const loaded = await load(caller, runId);
+    if (runId === internal.runId)
+      await store.db.transaction((tx) =>
+        tx.execute({
+          sql: "UPDATE grants SET revoked_at = ? WHERE resource_id = ? AND action = 'task:read'",
+          args: [new Date().toISOString(), `task-${internal.taskId}`],
+        }),
+      );
+    return loaded;
+  });
+  const execute = vi.fn(async () => ({ status: "succeeded" as const, text: "leaked" }));
+  const resumed = service(store, {
+    supportsGroup: true,
+    supportsTaskStepModel: true,
+    execute,
+  }).instance;
+  await resumed.start();
+  await resumed.drain();
+  const storedRun = await store.db.transaction((tx) =>
+    tx.execute({ sql: "SELECT status FROM runs WHERE id = ?", args: [internal.runId] }),
+  );
+  expect(storedRun.rows[0]?.status).toBe("failed");
+  expect(execute).not.toHaveBeenCalled();
+});
+
 it("cancels a queued internal Run when its owning Task requests cancellation", async () => {
   const { store } = await fixture();
   const execute = vi.fn(async (): Promise<ExecutionResult> => ({

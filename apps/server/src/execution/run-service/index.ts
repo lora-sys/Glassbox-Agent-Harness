@@ -516,6 +516,12 @@ export class RunService {
             taskId: input.taskStepBinding.taskId,
             caller,
             resourceId: `task-${input.taskStepBinding.taskId}`,
+            action: "task:read",
+          });
+          await authorizeLongWorkAction(this.options.store, {
+            taskId: input.taskStepBinding.taskId,
+            caller,
+            resourceId: `task-${input.taskStepBinding.taskId}`,
             action: "task:continue",
           });
         }
