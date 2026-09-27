@@ -352,7 +352,7 @@ function parseLease(row: Row): StoredStepLease {
 const transitions: Readonly<Record<TaskStepStatus, readonly TaskStepStatus[]>> = {
   pending: ["ready", "blocked", "skipped", "cancelled"],
   ready: ["running", "waiting", "cancelled", "blocked"],
-  running: ["waiting", "review", "succeeded", "failed", "cancelled"],
+  running: ["waiting", "blocked", "review", "succeeded", "failed", "cancelled"],
   waiting: ["ready", "running", "review", "failed", "cancelled"],
   blocked: ["ready", "cancelled"],
   review: ["succeeded", "failed", "cancelled", "running"],
@@ -2900,8 +2900,23 @@ export class LongWorkStore {
       });
       if (!decision.rows[0]) throw new Error("Matching Step rework ALLOW decision is required");
       const step = await this.requireStep(tx, input.taskId, input.stepId);
-      if (step.status !== "review" || Number(step.version) !== input.expectedStepVersion)
+      const blockedChild = step.kind === "child_task" && step.status === "blocked";
+      if (
+        (step.status !== "review" && !blockedChild) ||
+        Number(step.version) !== input.expectedStepVersion
+      )
         throw new Error("Step rework conflict");
+      if (blockedChild) {
+        const activeChildren = await tx.execute({
+          sql: `SELECT 1 FROM task_child_links links
+            JOIN tasks child ON child.id = links.child_task_id
+            WHERE links.parent_task_id = ? AND links.parent_step_id = ?
+              AND child.status NOT IN ('DONE','ACCEPTED','FAILED','CANCELED') LIMIT 1`,
+          args: [input.taskId, input.stepId],
+        });
+        if (activeChildren.rows[0])
+          throw new Error("Linked child must stop before blocked Step rework");
+      }
       const leases = await tx.execute({
         sql: "SELECT 1 FROM task_step_leases WHERE task_id = ? AND step_id = ? AND state IN ('active','quarantined') LIMIT 1",
         args: [input.taskId, input.stepId],
@@ -2913,8 +2928,9 @@ export class LongWorkStore {
         args: [input.taskId, input.stepId],
       });
       const attempt = attempts.rows[0];
-      if (!attempt || attempt.status !== "review")
-        throw new Error("Latest Step attempt is not awaiting review");
+      const expectedAttemptStatus = blockedChild ? "failed" : "review";
+      if (!attempt || attempt.status !== expectedAttemptStatus)
+        throw new Error("Latest Step attempt cannot be reworked");
 
       const now = new Date().toISOString();
       const previousTaskStatus = stringColumn(task, "status");
@@ -2926,12 +2942,18 @@ export class LongWorkStore {
         args: [nextTaskStatus, now, input.taskId, previousTaskStatus],
       });
       const stepUpdate = await tx.execute({
-        sql: "UPDATE task_steps SET status = 'ready', output_ref = NULL, version = version + 1, updated_at = ? WHERE id = ? AND task_id = ? AND version = ? AND status = 'review'",
-        args: [now, input.stepId, input.taskId, input.expectedStepVersion],
+        sql: "UPDATE task_steps SET status = 'ready', output_ref = NULL, version = version + 1, updated_at = ? WHERE id = ? AND task_id = ? AND version = ? AND status = ?",
+        args: [now, input.stepId, input.taskId, input.expectedStepVersion, step.status],
       });
       const attemptUpdate = await tx.execute({
-        sql: "UPDATE task_attempts SET rework_reason = ? WHERE id = ? AND task_id = ? AND step_id = ? AND status = 'review'",
-        args: [input.reason.trim(), stringColumn(attempt, "id"), input.taskId, input.stepId],
+        sql: "UPDATE task_attempts SET rework_reason = ? WHERE id = ? AND task_id = ? AND step_id = ? AND status = ?",
+        args: [
+          input.reason.trim(),
+          stringColumn(attempt, "id"),
+          input.taskId,
+          input.stepId,
+          expectedAttemptStatus,
+        ],
       });
       if (
         taskUpdate.rowsAffected !== 1 ||
@@ -2946,7 +2968,7 @@ export class LongWorkStore {
         type: "TASK_REWORK",
         origin,
         metadata: {
-          previousStepStatus: "review",
+          previousStepStatus: blockedChild ? "blocked" : "review",
           status: "ready",
           previousTaskStatus,
           taskStatus: nextTaskStatus,

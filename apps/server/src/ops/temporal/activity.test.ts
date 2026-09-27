@@ -400,6 +400,46 @@ it("applies each explicit child failure policy to the parent Step", async () => 
       );
       expect(childAttempt.rows[0]?.status).toBe(expected === "review" ? "review" : "failed");
       expect((await store.tasks.getTask(parent.id))?.status).not.toBe("DONE");
+      if (policy === "block_parent") {
+        await store.authorization.grant({
+          principalId: "owner",
+          resourceId: `task-${parent.id}`,
+          action: "task:rework",
+          scope: caller.scope,
+          effect: "allow",
+        });
+        const blocked = (await store.longWork.listSteps(parent.id))[0]!;
+        const ready = await service.reworkStep(
+          caller,
+          parent.id,
+          step.id,
+          blocked.version,
+          "Replace the failed child",
+        );
+        expect(ready.status).toBe("ready");
+        const replacement = await store.tasks.createTask({
+          title: "Replacement child",
+          creatorPrincipalId: "owner",
+          authorizationScope: caller.scope,
+        });
+        await service.linkChildTask(caller, {
+          parentTaskId: parent.id,
+          parentStepId: step.id,
+          expectedStepVersion: ready.version,
+          childTaskId: replacement.id,
+          acceptanceCriteria: ["Replacement work reviewed"],
+          cancellationPolicy: "keep_child",
+          failurePolicy: "block_parent",
+        });
+        expect((await store.longWork.listSteps(parent.id))[0]?.status).toBe("running");
+        const attempts = await store.db.transaction((tx) =>
+          tx.execute({
+            sql: "SELECT status FROM task_attempts WHERE task_id = ? AND step_id = ? ORDER BY attempt_number",
+            args: [parent.id, step.id],
+          }),
+        );
+        expect(attempts.rows.map((attempt) => attempt.status)).toEqual(["failed", "running"]);
+      }
     }
   } finally {
     await store.close();

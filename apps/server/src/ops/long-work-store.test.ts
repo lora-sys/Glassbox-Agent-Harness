@@ -729,6 +729,28 @@ it("links a pristine same-scope child Task with no delegated permissions", async
       stepId: "child-step",
       metadata: { childTaskId: "child-1" },
     });
+    await store.transitionStep({
+      taskId: "task-1",
+      stepId: "child-step",
+      expectedVersion: 3,
+      from: "running",
+      to: "blocked",
+      origin: system,
+    });
+    await addStepDecision(db, "task:rework", "child-active-rework");
+    await expect(
+      store.reworkDurableStep({
+        taskId: "task-1",
+        stepId: "child-step",
+        expectedStepVersion: 4,
+        reason: "Replace the child",
+        origin: {
+          kind: "decision",
+          decisionId: "child-active-rework",
+          actorPrincipalId: "owner",
+        },
+      }),
+    ).rejects.toThrow("Linked child must stop before blocked Step rework");
   } finally {
     await db.close();
   }
