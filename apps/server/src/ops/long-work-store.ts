@@ -1953,6 +1953,18 @@ export class LongWorkStore {
         if (updatedChild.rowsAffected !== 1)
           throw new Error("Child Task acceptance criteria changed during linking");
       }
+      const nextNumber = await tx.execute({
+        sql: "SELECT COALESCE(MAX(attempt_number),0) + 1 AS value FROM task_attempts WHERE task_id = ?",
+        args: [input.parentTaskId],
+      });
+      const attemptNumber = Number(nextNumber.rows[0]?.value);
+      if (!Number.isSafeInteger(attemptNumber) || attemptNumber < 1)
+        throw new Error("Invalid child Step attempt number");
+      const attemptId = randomUUID();
+      await tx.execute({
+        sql: "INSERT INTO task_attempts(id,task_id,step_id,attempt_number,status,started_at) VALUES (?,?,?,?,'running',?)",
+        args: [attemptId, input.parentTaskId, input.parentStepId, attemptNumber, now],
+      });
       const updated = await tx.execute({
         sql: `UPDATE task_steps SET status = 'running', version = version + 1, updated_at = ?
           WHERE id = ? AND task_id = ? AND version = ? AND status IN ('ready','running')
@@ -1960,6 +1972,14 @@ export class LongWorkStore {
         args: [now, input.parentStepId, input.parentTaskId, input.expectedStepVersion],
       });
       if (updated.rowsAffected !== 1) throw new Error("Child Task Step version conflict");
+      await this.appendEventTx(tx, {
+        taskId: input.parentTaskId,
+        stepId: input.parentStepId,
+        attemptId,
+        type: "STEP_STARTED",
+        origin,
+        metadata: { childTaskId: input.childTaskId },
+      });
       const inserted = await tx.execute({
         sql: `INSERT INTO task_child_links(
             child_task_id,parent_task_id,parent_step_id,delegated_permissions_json,
@@ -1979,6 +1999,7 @@ export class LongWorkStore {
       await this.appendEventTx(tx, {
         taskId: input.parentTaskId,
         stepId: input.parentStepId,
+        attemptId,
         type: "CHILD_TASK_CREATED",
         origin,
         metadata: { childTaskId: input.childTaskId },
@@ -2071,6 +2092,23 @@ export class LongWorkStore {
         ],
       });
       if (updated.rowsAffected !== 1) throw new Error("Child Step observation conflict");
+      const attempt = await tx.execute({
+        sql: "SELECT id FROM task_attempts WHERE task_id = ? AND step_id = ? AND status = 'running' ORDER BY attempt_number DESC LIMIT 1",
+        args: [input.parentTaskId, input.parentStepId],
+      });
+      if (!attempt.rows[0]) throw new Error("Running child Step attempt is unavailable");
+      const attemptId = stringColumn(attempt.rows[0], "id");
+      const attemptUpdate = await tx.execute({
+        sql: "UPDATE task_attempts SET status = ?, completed_at = ? WHERE id = ? AND task_id = ? AND step_id = ? AND status = 'running'",
+        args: [
+          nextStatus === "review" ? "review" : "failed",
+          now,
+          attemptId,
+          input.parentTaskId,
+          input.parentStepId,
+        ],
+      });
+      if (attemptUpdate.rowsAffected !== 1) throw new Error("Child Step attempt conflict");
       if (resultRef) {
         const linked = await tx.execute({
           sql: `UPDATE task_child_links SET result_ref = ?
@@ -2083,6 +2121,7 @@ export class LongWorkStore {
       await this.appendEventTx(tx, {
         taskId: input.parentTaskId,
         stepId: input.parentStepId,
+        attemptId,
         type:
           nextStatus === "review"
             ? "STEP_REVIEW"
@@ -2276,6 +2315,30 @@ export class LongWorkStore {
         args: [params.to, now, params.stepId, params.taskId, params.expectedVersion, params.from],
       });
       if (result.rowsAffected !== 1) throw new Error("Step version conflict");
+      let eventAttemptId = params.attemptId;
+      if (
+        step.kind === "child_task" &&
+        params.from === "running" &&
+        ["blocked", "cancelled"].includes(params.to)
+      ) {
+        const attempts = await tx.execute({
+          sql: "SELECT id FROM task_attempts WHERE task_id = ? AND step_id = ? AND status = 'running' ORDER BY attempt_number DESC LIMIT 1",
+          args: [params.taskId, params.stepId],
+        });
+        if (!attempts.rows[0]) throw new Error("Running child Step attempt is unavailable");
+        eventAttemptId = stringColumn(attempts.rows[0], "id");
+        const settled = await tx.execute({
+          sql: "UPDATE task_attempts SET status = ?, completed_at = ? WHERE id = ? AND task_id = ? AND step_id = ? AND status = 'running'",
+          args: [
+            params.to === "cancelled" ? "canceled" : "failed",
+            now,
+            eventAttemptId,
+            params.taskId,
+            params.stepId,
+          ],
+        });
+        if (settled.rowsAffected !== 1) throw new Error("Child Step attempt conflict");
+      }
       if (params.from === "waiting") {
         const waits = await tx.execute({
           sql: "SELECT id,attempt_id FROM task_waits WHERE task_id = ? AND step_id = ? AND status = 'waiting'",
@@ -2298,7 +2361,7 @@ export class LongWorkStore {
       await this.appendEventTx(tx, {
         taskId: params.taskId,
         stepId: params.stepId,
-        attemptId: params.attemptId,
+        attemptId: eventAttemptId,
         type: eventType,
         origin: params.origin,
         evidenceRef: params.evidenceRef,

@@ -124,6 +124,22 @@ it("waits for a linked child Task and hands its accepted result to Step review",
     expect(reviewed.outputRef).toBe(`task:${child.id}`);
     expect((await store.longWork.getChildTaskLink(child.id))?.resultRef).toBe(`task:${child.id}`);
     expect((await store.tasks.getTask(parent.id))?.status).not.toBe("DONE");
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: `task-${parent.id}`,
+      action: "task:accept",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    const accepted = await service.acceptStep(caller, parent.id, step.id, reviewed.version);
+    expect(accepted.status).toBe("succeeded");
+    const attempts = await store.db.transaction((tx) =>
+      tx.execute({
+        sql: "SELECT status FROM task_attempts WHERE task_id = ? AND step_id = ?",
+        args: [parent.id, step.id],
+      }),
+    );
+    expect(attempts.rows.map((attempt) => attempt.status)).toEqual(["succeeded"]);
   } finally {
     await store.close();
   }
@@ -247,6 +263,13 @@ it("applies the linked child cancellation policy without claiming rollback", asy
         expect((await advance(input)).kind).toBe("continue");
       }
       expect((await store.longWork.listSteps(parent.id))[0]?.status).toBe("cancelled");
+      const canceledAttempt = await store.db.transaction((tx) =>
+        tx.execute({
+          sql: "SELECT status FROM task_attempts WHERE task_id = ? AND step_id = ?",
+          args: [parent.id, step.id],
+        }),
+      );
+      expect(canceledAttempt.rows[0]?.status).toBe("canceled");
       expect(await advance(input)).toEqual({ kind: "complete" });
       expect((await store.tasks.getTask(parent.id))?.status).toBe("CANCELED");
       expect((await store.tasks.getTask(child.id))?.status).toBe(
@@ -330,6 +353,13 @@ it("applies each explicit child failure policy to the parent Step", async () => 
       });
       expect(await advance(input)).toEqual({ kind: "continue" });
       expect((await store.longWork.listSteps(parent.id))[0]?.status).toBe(expected);
+      const childAttempt = await store.db.transaction((tx) =>
+        tx.execute({
+          sql: "SELECT status FROM task_attempts WHERE task_id = ? AND step_id = ?",
+          args: [parent.id, step.id],
+        }),
+      );
+      expect(childAttempt.rows[0]?.status).toBe(expected === "review" ? "review" : "failed");
       expect((await store.tasks.getTask(parent.id))?.status).not.toBe("DONE");
     }
   } finally {

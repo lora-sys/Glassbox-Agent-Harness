@@ -1048,15 +1048,6 @@ export class ConversationStore {
                 continue;
               const sourceRunId = outputRef.slice(4);
               requireIdentifier(sourceRunId);
-              const source = await tx.execute({
-                sql: `SELECT r.result_text FROM task_attempt_runs ar
-                  JOIN runs r ON r.id = ar.run_id
-                  WHERE ar.run_id = ? AND ar.task_id = ? AND ar.step_id = ?
-                    AND r.source = 'task_step' AND r.status = 'succeeded'`,
-                args: [sourceRunId, taskStepBinding.taskId, stringColumn(dependency, "id")],
-              });
-              if (!source.rows[0] || typeof source.rows[0].result_text !== "string")
-                throw new Error("Accepted dependency result is unavailable");
               const sourceAuthorization = await authorizeRun(
                 tx,
                 caller,
@@ -1076,6 +1067,15 @@ export class ConversationStore {
                 sql: "UPDATE authorization_decisions SET delivery_source = 'content_source' WHERE id = ?",
                 args: [contentDecision.id],
               });
+              const source = await tx.execute({
+                sql: `SELECT r.result_text FROM task_attempt_runs ar
+                  JOIN runs r ON r.id = ar.run_id
+                  WHERE ar.run_id = ? AND ar.task_id = ? AND ar.step_id = ?
+                    AND r.source = 'task_step' AND r.status = 'succeeded'`,
+                args: [sourceRunId, taskStepBinding.taskId, stringColumn(dependency, "id")],
+              });
+              if (!source.rows[0] || typeof source.rows[0].result_text !== "string")
+                throw new Error("Accepted dependency result is unavailable");
               const text = stringColumn(source.rows[0], "result_text");
               stepResults.push({
                 stepId: stringColumn(dependency, "id"),
