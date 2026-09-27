@@ -2,6 +2,7 @@ import { Type } from "typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { DomainStore } from "../../persistence/index.js";
 import type { AuthorizedOpsService } from "../../ops/service.js";
+import { parseWorkerTextFileSpec } from "../../ops/worker-file-spec.js";
 import {
   consumeMutationIntent,
   createProtectedTool,
@@ -99,6 +100,7 @@ export function createOpsTools(options: {
         Type.String({ minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$" }),
       ),
       workerAccess: Type.Optional(Type.Union([Type.Literal("read"), Type.Literal("write")])),
+      resultFile: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
     },
     { additionalProperties: false },
   );
@@ -477,6 +479,7 @@ export function createOpsTools(options: {
         signalKey?: string;
         targetTaskId?: string;
         workerAccess?: "read" | "write";
+        resultFile?: string;
       }>;
     }>({
       ...common,
@@ -498,6 +501,7 @@ export function createOpsTools(options: {
           if (
             (!["herdr_worker", "child_task"].includes(step.kind) &&
               step.workerAccess !== undefined) ||
+            (step.kind !== "herdr_worker" && step.resultFile !== undefined) ||
             (step.kind === "timer_wait" &&
               (step.durationMs === undefined ||
                 step.signalKey !== undefined ||
@@ -528,6 +532,9 @@ export function createOpsTools(options: {
             (step.kind === "herdr_worker" &&
               (!step.instructions?.trim() ||
                 !step.workerAccess ||
+                (step.resultFile !== undefined && step.workerAccess !== "write") ||
+                (step.resultFile !== undefined &&
+                  !parseWorkerTextFileSpec(`worker:text-file:${step.resultFile}`)) ||
                 step.durationMs !== undefined ||
                 step.signalKey !== undefined ||
                 step.targetTaskId !== undefined)) ||
@@ -556,16 +563,20 @@ export function createOpsTools(options: {
             continue;
           if (options.workerTarget.agentKind !== "pi" || !options.workerTarget.worktreePath)
             throw new Error("Configured Pi Herdr Worker is unavailable");
-          workerPermissions.set(
-            step.id,
-            await options.service.plannedWorkerPermissions(
-              context.caller,
-              params.taskId,
-              options.workerTarget.worktreePath,
-              step.workerAccess!,
-              { runId: context.runId, conversationId: context.conversationId },
-            ),
+          const permissions = await options.service.plannedWorkerPermissions(
+            context.caller,
+            params.taskId,
+            options.workerTarget.worktreePath,
+            step.workerAccess!,
+            { runId: context.runId, conversationId: context.conversationId },
           );
+          if (
+            step.resultFile &&
+            (!permissions.some((permission) => permission.action === "worker:file:read") ||
+              !permissions.some((permission) => permission.action === "workspace:read"))
+          )
+            throw new Error("Worker result file requires delegated file and workspace read");
+          workerPermissions.set(step.id, permissions);
         }
         const steps = params.steps.map((step) => {
           const waitPolicy =
@@ -600,9 +611,16 @@ export function createOpsTools(options: {
               ? { instructions: step.instructions, specRef: executionRef }
               : step.kind === "tool"
                 ? { specRef: `tool:task_get:${step.targetTaskId}` }
-                : step.kind === "herdr_worker" || step.kind === "child_task"
-                  ? { instructions: step.instructions }
-                  : {}),
+                : step.kind === "herdr_worker"
+                  ? {
+                      instructions: step.instructions,
+                      ...(step.resultFile
+                        ? { specRef: `worker:text-file:${step.resultFile}` }
+                        : {}),
+                    }
+                  : step.kind === "child_task"
+                    ? { instructions: step.instructions }
+                    : {}),
             status: "pending" as const,
             dependencyIds: step.dependencyIds,
             dependencyPolicy: {

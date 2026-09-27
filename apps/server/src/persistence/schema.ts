@@ -249,6 +249,12 @@ export const schemaV17Migration = [
   `CREATE TRIGGER IF NOT EXISTS worker_candidate_outputs_no_delete BEFORE DELETE ON worker_candidate_outputs BEGIN SELECT RAISE(ABORT,'worker candidate outputs are immutable'); END`,
 ];
 
+export const schemaV18Migration = [
+  `CREATE TABLE IF NOT EXISTS worker_file_artifacts (attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, step_id TEXT NOT NULL, worker_binding_id TEXT NOT NULL REFERENCES worker_bindings(id), relative_path TEXT NOT NULL, content_text TEXT NOT NULL CHECK(length(CAST(content_text AS BLOB)) <= 262144), content_sha256 TEXT NOT NULL CHECK(length(content_sha256) = 64 AND content_sha256 NOT GLOB '*[^0-9a-f]*'), created_at TEXT NOT NULL, FOREIGN KEY(attempt_id,task_id,step_id) REFERENCES task_attempts(id,task_id,step_id))`,
+  `CREATE TRIGGER IF NOT EXISTS worker_file_artifacts_no_update BEFORE UPDATE ON worker_file_artifacts BEGIN SELECT RAISE(ABORT,'worker file artifacts are immutable'); END`,
+  `CREATE TRIGGER IF NOT EXISTS worker_file_artifacts_no_delete BEFORE DELETE ON worker_file_artifacts BEGIN SELECT RAISE(ABORT,'worker file artifacts are immutable'); END`,
+];
+
 export const schema = [
   ...baseSchema,
   ...schemaV7Statements,

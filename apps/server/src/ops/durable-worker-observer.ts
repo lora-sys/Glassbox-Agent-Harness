@@ -5,6 +5,13 @@ import { DomainDatabase, optionalString, stringColumn } from "../persistence/dat
 import { LongWorkStore, WorkerCandidateLimitError } from "./long-work-store.js";
 import type { TaskStore } from "./task-store.js";
 
+export class WorkerArtifactCaptureError extends Error {
+  constructor() {
+    super("Declared Worker result file could not be verified");
+    this.name = "WorkerArtifactCaptureError";
+  }
+}
+
 export interface DurableWorkerClaim {
   bindingId: string;
   taskId: string;
@@ -260,9 +267,16 @@ export class DurableWorkerObserver {
         try {
           outputRef = await this.captureCandidate(claim, observedAgentState);
         } catch (error) {
-          if (!(error instanceof WorkerCandidateLimitError)) throw error;
+          if (
+            !(error instanceof WorkerCandidateLimitError) &&
+            !(error instanceof WorkerArtifactCaptureError)
+          )
+            throw error;
           outcome = "unknown";
-          evidenceRef = `worker-output-limit:${claim.bindingId}`;
+          evidenceRef =
+            error instanceof WorkerCandidateLimitError
+              ? `worker-output-limit:${claim.bindingId}`
+              : `worker-artifact-unverified:${claim.bindingId}`;
         }
       }
       await this.longWork.settleClaimedStep({

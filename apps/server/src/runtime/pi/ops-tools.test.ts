@@ -110,6 +110,7 @@ it("denies an ungranted Pi delegate before starting any worker", async () => {
         "id",
         "instructions",
         "kind",
+        "resultFile",
         "signalKey",
         "targetTaskId",
         "title",
@@ -349,6 +350,44 @@ it("plans a text-only Model Step from the current Run profile and rejects extra 
       "read-step",
       expect.objectContaining({ runId: accepted.run.id }),
     );
+    const fileStep = {
+      id: "worker-file-step",
+      kind: "herdr_worker",
+      title: "Write a review file",
+      dependencyIds: [],
+      instructions: "Write the result",
+      workerAccess: "write",
+      resultFile: "reports/result.txt",
+    };
+    await expect(
+      plan.execute(
+        "plan-worker-file-without-read",
+        { taskId: "planned", rootStepId: fileStep.id, steps: [fileStep] },
+        undefined,
+        undefined,
+        {} as never,
+      ),
+    ).rejects.toThrow("protected_tool_failed");
+    plannedWorkerPermissions.mockResolvedValueOnce([
+      { resourceId: "worker-workspace:configured", action: "worker:file:write" },
+      { resourceId: "workspace:configured", action: "workspace:write" },
+      { resourceId: "worker-workspace:configured", action: "worker:file:read" },
+      { resourceId: "workspace:configured", action: "workspace:read" },
+    ]);
+    await plan.execute(
+      "plan-worker-file",
+      { taskId: "planned", rootStepId: fileStep.id, steps: [fileStep] },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    expect(planExistingTask).toHaveBeenLastCalledWith(
+      caller,
+      "planned",
+      [expect.objectContaining({ specRef: "worker:text-file:reports/result.txt" })],
+      fileStep.id,
+      expect.objectContaining({ runId: accepted.run.id }),
+    );
     await plan.execute(
       "plan-approval",
       {
@@ -504,7 +543,7 @@ it("plans a text-only Model Step from the current Run profile and rejects extra 
     await expect(
       plan.execute("plan-with-non-model-run", input, undefined, undefined, {} as never),
     ).rejects.toThrow("protected_tool_failed");
-    expect(planExistingTask).toHaveBeenCalledTimes(5);
+    expect(planExistingTask).toHaveBeenCalledTimes(6);
   } finally {
     await store.close();
   }

@@ -9,6 +9,7 @@ import type { HerdrBridge } from "../herdr-bridge.js";
 import { authorizeLongWorkAction, getLongWorkCaller } from "../long-work-authority.js";
 import type { ClaimedTaskStep, StoredStepLease } from "../long-work-store.js";
 import { AuthorizedOpsService, type ConfiguredWorkerTarget } from "../service.js";
+import { parseWorkerTextFileSpec } from "../worker-file-spec.js";
 
 const ORIGIN = { kind: "system", reason: "Temporal Herdr Worker reconciliation" } as const;
 const WORKER_LEASE_MS = 60_000;
@@ -30,12 +31,66 @@ export class HerdrWorkerRuntime {
       store.tasks,
       true,
       async (claim, state) => {
+        const step = (await this.store.longWork.listSteps(claim.taskId)).find(
+          (item) => item.id === claim.stepId,
+        );
+        const fileSpec = step?.specRef ? parseWorkerTextFileSpec(step.specRef) : null;
+        const existing = await this.store.longWork.getWorkerCandidate(
+          claim.taskId,
+          claim.stepId,
+          claim.attemptId,
+        );
+        if (existing) {
+          const savedArtifact = await this.store.longWork.getWorkerFileArtifact(
+            claim.taskId,
+            claim.stepId,
+            claim.attemptId,
+          );
+          if (
+            existing.workerBindingId !== claim.bindingId ||
+            (fileSpec &&
+              (!savedArtifact ||
+                savedArtifact.workerBindingId !== claim.bindingId ||
+                savedArtifact.relativePath !== fileSpec.relativePath)) ||
+            (!fileSpec && savedArtifact)
+          )
+            throw new Error("Persisted Worker candidate does not match its claim");
+          // The first capture is immutable. Revalidate the live claim in the store,
+          // then settle from saved evidence without rereading a changed workspace.
+          return this.store.longWork.recordWorkerCandidate({
+            taskId: claim.taskId,
+            stepId: claim.stepId,
+            attemptId: claim.attemptId,
+            leaseId: claim.leaseId,
+            ownerInstanceId: claim.ownerInstanceId,
+            workerBindingId: claim.bindingId,
+            expectedStepVersion: claim.expectedStepVersion,
+            expectedLeaseVersion: claim.expectedLeaseVersion,
+            output: existing.outputExcerpt,
+            ...(savedArtifact
+              ? {
+                  artifact: {
+                    relativePath: savedArtifact.relativePath,
+                    contentText: savedArtifact.contentText,
+                    sha256: savedArtifact.contentSha256,
+                  },
+                }
+              : {}),
+          });
+        }
         const read = await this.bridge.readAgent({
           paneId: claim.paneId,
           agentName: claim.agentName,
         });
         if (read.state !== state)
           throw new Error("Worker state changed before candidate output capture");
+        const artifact = fileSpec
+          ? await this.service.captureClaimedWorkerTextFile(
+              await getLongWorkCaller(this.store, claim.taskId),
+              claim,
+              fileSpec.relativePath,
+            )
+          : undefined;
         return this.store.longWork.recordWorkerCandidate({
           taskId: claim.taskId,
           stepId: claim.stepId,
@@ -46,6 +101,7 @@ export class HerdrWorkerRuntime {
           expectedStepVersion: claim.expectedStepVersion,
           expectedLeaseVersion: claim.expectedLeaseVersion,
           output: read.output,
+          ...(artifact ? { artifact } : {}),
         });
       },
     );

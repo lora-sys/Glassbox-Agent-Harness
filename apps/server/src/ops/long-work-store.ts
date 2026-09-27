@@ -25,6 +25,7 @@ import {
 } from "./task-graph.js";
 import { decideTaskRetry, type RetrySideEffectOutcome } from "./long-work-retry.js";
 import { parseTaskGetSpec } from "./tool-step-spec.js";
+import { parseWorkerTextFileSpec } from "./worker-file-spec.js";
 import { reconstructTaskOriginScope } from "./long-work-authority.js";
 import { TaskNotificationStore } from "./task-notification-store.js";
 
@@ -40,6 +41,7 @@ export const MAX_CHILD_TASK_ANCESTOR_DEPTH = 4;
 export const MAX_CHECKPOINT_PROJECTION_BYTES = 2048;
 export const MAX_WORKER_CANDIDATE_INPUT_BYTES = 1024 * 1024;
 export const MAX_WORKER_CANDIDATE_EXCERPT_BYTES = 16 * 1024;
+export const MAX_WORKER_FILE_ARTIFACT_BYTES = 256 * 1024;
 export class WorkerCandidateLimitError extends Error {
   constructor() {
     super("Worker candidate output exceeds the input byte limit");
@@ -124,6 +126,17 @@ export interface WorkerCandidateOutput {
   outputExcerpt: string;
   outputSha256: string;
   truncated: boolean;
+  createdAt: string;
+}
+
+export interface WorkerFileArtifact {
+  taskId: string;
+  stepId: string;
+  attemptId: string;
+  workerBindingId: string;
+  relativePath: string;
+  contentText: string;
+  contentSha256: string;
   createdAt: string;
 }
 
@@ -306,6 +319,13 @@ function validateInitialStep(step: TaskStep, taskId: string): void {
       step.waitPolicy !== undefined)
   )
     throw new Error("Invalid Tool Step specification");
+  if (
+    (step.kind === "herdr_worker" &&
+      step.specRef !== undefined &&
+      !parseWorkerTextFileSpec(step.specRef)) ||
+    (step.kind !== "herdr_worker" && step.specRef?.startsWith("worker:text-file:"))
+  )
+    throw new Error("Invalid Worker file Step specification");
   const retry = step.retryPolicy;
   if (retry) {
     if (
@@ -736,6 +756,7 @@ export class LongWorkStore {
     expectedStepVersion: number;
     expectedLeaseVersion: number;
     output: string;
+    artifact?: { relativePath: string; contentText: string; sha256: string };
   }): Promise<string> {
     for (const value of [
       input.taskId,
@@ -755,11 +776,23 @@ export class LongWorkStore {
     )
       throw new Error("Invalid Worker candidate claim");
     const candidate = workerOutputExcerpt(input.output);
+    const artifact = input.artifact;
+    if (artifact) {
+      if (
+        typeof artifact.relativePath !== "string" ||
+        typeof artifact.contentText !== "string" ||
+        typeof artifact.sha256 !== "string" ||
+        !/^[a-f0-9]{64}$/u.test(artifact.sha256) ||
+        Buffer.byteLength(artifact.contentText, "utf8") > MAX_WORKER_FILE_ARTIFACT_BYTES ||
+        createHash("sha256").update(artifact.contentText, "utf8").digest("hex") !== artifact.sha256
+      )
+        throw new Error("Invalid Worker file artifact");
+    }
     const ref = `worker-result:${input.attemptId}`;
 
     return this.db.transaction(async (tx) => {
       const claim = await tx.execute({
-        sql: `SELECT t.orchestration_mode, s.kind, s.status AS step_status, s.version AS step_version,
+        sql: `SELECT t.orchestration_mode, s.kind, s.spec_ref, s.status AS step_status, s.version AS step_version,
             a.status AS attempt_status, l.state AS lease_state, l.version AS lease_version,
             l.owner_instance_id, l.worker_binding_id, l.expires_at, b.id AS binding_id
           FROM tasks t
@@ -787,6 +820,11 @@ export class LongWorkStore {
         Date.parse(stringColumn(claimRow, "expires_at")) <= Date.now()
       )
         throw new Error("Worker candidate claim conflict");
+      const fileSpec = parseWorkerTextFileSpec(optionalString(claimRow, "spec_ref") ?? "");
+      if (fileSpec && !artifact)
+        throw new Error("Worker file artifact required by Step specification");
+      if (artifact && (!fileSpec || fileSpec.relativePath !== artifact.relativePath))
+        throw new Error("Worker file artifact does not match Step specification");
 
       const existing = await tx.execute({
         sql: "SELECT task_id,step_id,worker_binding_id FROM worker_candidate_outputs WHERE attempt_id = ?",
@@ -800,6 +838,18 @@ export class LongWorkStore {
           row.worker_binding_id !== input.workerBindingId
         )
           throw new Error("Worker candidate Attempt is already bound to another claim");
+        const savedArtifact = await tx.execute({
+          sql: "SELECT relative_path,content_sha256 FROM worker_file_artifacts WHERE attempt_id = ?",
+          args: [input.attemptId],
+        });
+        const saved = savedArtifact.rows[0];
+        if (
+          (saved !== undefined) !== (artifact !== undefined) ||
+          (saved !== undefined &&
+            (saved.relative_path !== artifact?.relativePath ||
+              saved.content_sha256 !== artifact?.sha256))
+        )
+          throw new Error("Worker file artifact conflicts with first capture");
         return ref;
       }
 
@@ -819,7 +869,80 @@ export class LongWorkStore {
           createdAt,
         ],
       });
+      if (artifact) {
+        await tx.execute({
+          sql: `INSERT INTO worker_file_artifacts
+            (attempt_id,task_id,step_id,worker_binding_id,relative_path,content_text,content_sha256,created_at)
+            VALUES (?,?,?,?,?,?,?,?)`,
+          args: [
+            input.attemptId,
+            input.taskId,
+            input.stepId,
+            input.workerBindingId,
+            artifact.relativePath,
+            artifact.contentText,
+            artifact.sha256,
+            createdAt,
+          ],
+        });
+      }
       return ref;
+    });
+  }
+
+  /** Returns internal captured file evidence. Callers must authorize access; reviewableOnly
+   * additionally requires the exact Worker result to have entered review or succeeded. */
+  async getWorkerFileArtifact(
+    taskId: string,
+    stepId: string,
+    attemptId: string,
+    options: { reviewableOnly?: boolean } = {},
+  ): Promise<WorkerFileArtifact | null> {
+    for (const value of [taskId, stepId, attemptId]) requireIdentifier(value);
+    return this.db.transaction(async (tx) => {
+      const result = await tx.execute({
+        sql: `SELECT artifact.task_id,artifact.step_id,artifact.attempt_id,
+            artifact.worker_binding_id,artifact.relative_path,artifact.content_text,
+            artifact.content_sha256,artifact.created_at
+          FROM worker_file_artifacts artifact
+          JOIN worker_candidate_outputs candidate ON candidate.attempt_id = artifact.attempt_id
+            AND candidate.task_id = artifact.task_id AND candidate.step_id = artifact.step_id
+            AND candidate.worker_binding_id = artifact.worker_binding_id
+          ${
+            options.reviewableOnly
+              ? `JOIN task_steps step ON step.task_id = artifact.task_id AND step.id = artifact.step_id
+            JOIN task_attempts attempt ON attempt.id = artifact.attempt_id
+              AND attempt.task_id = artifact.task_id AND attempt.step_id = artifact.step_id
+            JOIN worker_bindings binding ON binding.id = artifact.worker_binding_id
+              AND binding.task_attempt_id = artifact.attempt_id`
+              : ""
+          }
+          WHERE artifact.task_id = ? AND artifact.step_id = ? AND artifact.attempt_id = ?
+          ${
+            options.reviewableOnly
+              ? `AND step.kind = 'herdr_worker'
+            AND step.status IN ('review','succeeded')
+            AND attempt.status IN ('review','succeeded')
+            AND step.output_ref = ?`
+              : ""
+          }`,
+        args: options.reviewableOnly
+          ? [taskId, stepId, attemptId, `worker-result:${attemptId}`]
+          : [taskId, stepId, attemptId],
+      });
+      const row = result.rows[0];
+      return row
+        ? {
+            taskId: stringColumn(row, "task_id"),
+            stepId: stringColumn(row, "step_id"),
+            attemptId: stringColumn(row, "attempt_id"),
+            workerBindingId: stringColumn(row, "worker_binding_id"),
+            relativePath: stringColumn(row, "relative_path"),
+            contentText: stringColumn(row, "content_text"),
+            contentSha256: stringColumn(row, "content_sha256"),
+            createdAt: stringColumn(row, "created_at"),
+          }
+        : null;
     });
   }
 

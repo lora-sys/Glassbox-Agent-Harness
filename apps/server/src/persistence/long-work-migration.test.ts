@@ -33,7 +33,10 @@ it("migrates a P3 Task to durable-capable schema without changing its identity o
     const db = await DomainDatabase.open(path);
     try {
       await db.transaction(async (tx) => {
-        expect((await tx.execute("PRAGMA user_version")).rows[0]?.user_version).toBe(17);
+        expect((await tx.execute("PRAGMA user_version")).rows[0]?.user_version).toBe(18);
+        expect(
+          (await tx.execute("PRAGMA table_info(worker_file_artifacts)")).rows.length,
+        ).toBeGreaterThan(0);
         expect((await tx.execute("SELECT source FROM runs")).rows).toEqual([]);
         expect(
           (
@@ -57,6 +60,32 @@ it("migrates a P3 Task to durable-capable schema without changing its identity o
         await tx.execute(
           "INSERT INTO task_steps(id,task_id,kind,title,status,dependency_policy_json,max_attempts,required_capabilities_json,delegated_permissions_json,version,created_at,updated_at) VALUES ('step-1','task-1','join','Join','pending','{}',1,'[]','[]',1,'2026-09-27T00:00:00Z','2026-09-27T00:00:00Z')",
         );
+        await tx.execute(
+          "INSERT INTO task_attempts(id,task_id,step_id,attempt_number,status,started_at) VALUES ('attempt-2','task-1','step-1',2,'review','2026-09-27T00:00:00Z')",
+        );
+        await tx.execute(
+          "INSERT INTO worker_bindings(id,task_attempt_id,herdr_session,workspace_id,pane_id,agent_kind,last_observed_agent_state,updated_at) VALUES ('binding-2','attempt-2','session-1','workspace-1','pane-1','herdr','done','2026-09-27T00:00:00Z')",
+        );
+        await tx.execute(
+          "INSERT INTO worker_file_artifacts(attempt_id,task_id,step_id,worker_binding_id,relative_path,content_text,content_sha256,created_at) VALUES ('attempt-2','task-1','step-1','binding-2','src/result.txt','result','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','2026-09-27T00:00:00Z')",
+        );
+        await expect(
+          tx.execute(
+            "UPDATE worker_file_artifacts SET content_text = 'changed' WHERE attempt_id = 'attempt-2'",
+          ),
+        ).rejects.toThrow();
+        await expect(
+          tx.execute("DELETE FROM worker_file_artifacts WHERE attempt_id = 'attempt-2'"),
+        ).rejects.toThrow();
+        await tx.execute(
+          "INSERT INTO task_attempts(id,task_id,step_id,attempt_number,status,started_at) VALUES ('attempt-3','task-1','step-1',3,'review','2026-09-27T00:00:00Z')",
+        );
+        await expect(
+          tx.execute({
+            sql: "INSERT INTO worker_file_artifacts(attempt_id,task_id,step_id,worker_binding_id,relative_path,content_text,content_sha256,created_at) VALUES ('attempt-3','task-1','step-1','binding-2','src/large.txt',?,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','2026-09-27T00:00:00Z')",
+            args: ["é".repeat(131073)],
+          }),
+        ).rejects.toThrow();
         await tx.execute(
           "INSERT INTO task_events(id,task_id,step_id,type,metadata_json,created_at) VALUES ('event-1','task-1','step-1','STEP_ADDED','{}','2026-09-27T00:00:00Z')",
         );

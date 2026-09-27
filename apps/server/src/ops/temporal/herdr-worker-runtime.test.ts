@@ -1,4 +1,5 @@
-import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, it, vi } from "vite-plus/test";
@@ -11,6 +12,267 @@ import { AuthorizedOpsService } from "../service.js";
 import { DEFAULT_TASK_GRAPH_LIMITS } from "../task-graph.js";
 import { createAdvanceLongWorkActivity } from "./activity.js";
 import { HerdrWorkerRuntime } from "./herdr-worker-runtime.js";
+
+it("captures a declared Worker text file before review and rechecks grants when reading it", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "glassbox-p6-worker-artifact-"));
+  const dataRoot = join(directory, "data");
+  const project = join(directory, "project");
+  await mkdir(join(project, "reports"), { recursive: true });
+  const databasePath = join(dataRoot, "glassbox.db");
+  const store = await openDomainStore({ databasePath });
+  try {
+    const caller = {
+      principalId: "owner",
+      scope: {
+        connectionId: "test",
+        botId: "bot",
+        chatType: "private" as const,
+        chatId: "owner",
+        senderId: "owner",
+      },
+    };
+    await store.identities.bindOwner(caller.principalId, caller.scope);
+    const registry = await WorkspaceRegistry.open({ dataRoot });
+    const workspace = await registry.registerExistingTrusted({
+      path: project,
+      label: "artifact-project",
+      ownerPrincipalId: caller.principalId,
+    });
+    const policy = {
+      databasePath,
+      contextDirectory: join(dataRoot, "worker-contexts"),
+      resourceId: "worker-workspace:artifact",
+    };
+    for (const resource of [
+      { id: policy.resourceId, kind: "worker-files", visibility: "public" as const },
+      { id: `workspace:${workspace.id}`, kind: "workspace", visibility: "public" as const },
+    ])
+      await store.authorization.registerResource(resource);
+    const task = await store.tasks.createTask({
+      title: "Capture Worker file",
+      creatorPrincipalId: caller.principalId,
+      authorizationScope: caller.scope,
+    });
+    const grants = new Map<string, string>();
+    for (const [resourceId, action] of [
+      [`task-${task.id}`, "task:continue"],
+      [`task-${task.id}`, "task:delegate"],
+      [`task-${task.id}`, "task:read"],
+      [`task-${task.id}`, "worker:read"],
+      [policy.resourceId, "worker:file:write"],
+      [policy.resourceId, "worker:file:read"],
+      [`workspace:${workspace.id}`, "workspace:write"],
+      [`workspace:${workspace.id}`, "workspace:read"],
+    ]) {
+      const grantId = await store.authorization.grant({
+        principalId: caller.principalId,
+        resourceId: resourceId!,
+        action: action!,
+        scope: caller.scope,
+        effect: "allow",
+      });
+      grants.set(`${resourceId}:${action}`, grantId);
+    }
+    const now = new Date().toISOString();
+    const step: TaskStep = {
+      id: "worker-file-step",
+      taskId: task.id,
+      kind: "herdr_worker",
+      title: "Write the declared file",
+      instructions: "Write the result and finish",
+      specRef: "worker:text-file:reports/result.txt",
+      status: "pending",
+      dependencyIds: [],
+      dependencyPolicy: { failed: "block", cancelled: "cancel", skipped: "skip" },
+      maxAttempts: 1,
+      requiredCapabilities: [],
+      delegatedPermissionSet: [
+        { resourceId: policy.resourceId, action: "worker:file:write" },
+        { resourceId: policy.resourceId, action: "worker:file:read" },
+        { resourceId: `workspace:${workspace.id}`, action: "workspace:write" },
+        { resourceId: `workspace:${workspace.id}`, action: "workspace:read" },
+      ],
+      version: 1,
+      createdAt: now,
+      updatedAt: now,
+    };
+    await store.longWork.createGraph(task.id, [step], step.id, DEFAULT_TASK_GRAPH_LIMITS, {
+      kind: "system",
+      reason: "test plan",
+    });
+    const bridge = new FakeHerdrBridge("artifact-session");
+    const service = new AuthorizedOpsService(store, bridge, policy, undefined, {
+      registry,
+      writes: new WorkspaceWriteOccupancy(dataRoot, "participant"),
+    });
+    const workers = new HerdrWorkerRuntime(store, service, bridge, {
+      workspaceId: "herdr-workspace",
+      agentKind: "pi",
+      worktreePath: project,
+    });
+    const advance = createAdvanceLongWorkActivity(store, workers);
+    const input = { taskId: task.id, policyRevision: 1 };
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    expect((await store.longWork.listSteps(task.id))[0]).toMatchObject({ status: "running" });
+    const attempt = (await store.tasks.listAttempts(task.id))[0]!;
+    const binding = (await store.tasks.getWorkerBinding(attempt.id))!;
+    await writeFile(join(project, "reports", "result.txt"), "Verified Worker result\n", "utf8");
+    bridge.simulateAgentState(binding.paneId, "done", "Worker finished");
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    expect((await store.longWork.listSteps(task.id))[0]).toMatchObject({ status: "review" });
+    expect(await store.longWork.getWorkerFileArtifact(task.id, step.id, attempt.id)).toMatchObject({
+      relativePath: "reports/result.txt",
+      contentText: "Verified Worker result\n",
+      workerBindingId: binding.id,
+    });
+    expect(await service.workerCandidate(caller, task.id, step.id, attempt.id)).toMatchObject({
+      fileArtifact: {
+        relativePath: "reports/result.txt",
+        contentExcerpt: "Verified Worker result\n",
+        truncated: false,
+      },
+    });
+    await store.authorization.revoke(grants.get(`${policy.resourceId}:worker:file:read`)!);
+    await expect(service.workerCandidate(caller, task.id, step.id, attempt.id)).rejects.toThrow();
+    await store.authorization.grant({
+      principalId: caller.principalId,
+      resourceId: policy.resourceId,
+      action: "worker:file:read",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    await store.authorization.grant({
+      principalId: caller.principalId,
+      resourceId: `task-${task.id}`,
+      action: "task:accept",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    const reviewed = (await store.longWork.listSteps(task.id))[0]!;
+    await service.acceptStep(caller, task.id, step.id, reviewed.version);
+
+    const recoveryTask = await store.tasks.createTask({
+      title: "Recover captured Worker file",
+      creatorPrincipalId: caller.principalId,
+      authorizationScope: caller.scope,
+    });
+    for (const action of ["task:continue", "task:delegate", "task:read", "worker:read"])
+      await store.authorization.grant({
+        principalId: caller.principalId,
+        resourceId: `task-${recoveryTask.id}`,
+        action,
+        scope: caller.scope,
+        effect: "allow",
+      });
+    const recoveryStep: TaskStep = {
+      ...step,
+      id: "recovery-file-step",
+      taskId: recoveryTask.id,
+      specRef: "worker:text-file:reports/recovery.txt",
+    };
+    await store.longWork.createGraph(
+      recoveryTask.id,
+      [recoveryStep],
+      recoveryStep.id,
+      DEFAULT_TASK_GRAPH_LIMITS,
+      { kind: "system", reason: "capture recovery test" },
+    );
+    const recoveryInput = { taskId: recoveryTask.id, policyRevision: 1 };
+    expect(await advance(recoveryInput)).toEqual({ kind: "continue" });
+    const recoveryAttempt = (await store.tasks.listAttempts(recoveryTask.id))[0]!;
+    const recoveryBinding = (await store.tasks.getWorkerBinding(recoveryAttempt.id))!;
+    const recoveryLease = (await store.longWork.getActiveLease(recoveryTask.id, recoveryStep.id))!;
+    const runningRecoveryStep = (await store.longWork.listSteps(recoveryTask.id))[0]!;
+    const firstContent = "First captured file\n";
+    await writeFile(join(project, "reports", "recovery.txt"), firstContent, "utf8");
+    bridge.simulateAgentState(recoveryBinding.paneId, "done", "First captured terminal output");
+    await store.longWork.recordWorkerCandidate({
+      taskId: recoveryTask.id,
+      stepId: recoveryStep.id,
+      attemptId: recoveryAttempt.id,
+      leaseId: recoveryLease.id,
+      ownerInstanceId: recoveryLease.ownerInstanceId,
+      workerBindingId: recoveryBinding.id,
+      expectedStepVersion: runningRecoveryStep.version,
+      expectedLeaseVersion: recoveryLease.version,
+      output: "First captured terminal output",
+      artifact: {
+        relativePath: "reports/recovery.txt",
+        contentText: firstContent,
+        sha256: createHash("sha256").update(firstContent).digest("hex"),
+      },
+    });
+    await rm(join(project, "reports", "recovery.txt"));
+    expect(await advance(recoveryInput)).toEqual({ kind: "continue" });
+    expect((await store.longWork.listSteps(recoveryTask.id))[0]).toMatchObject({
+      status: "review",
+    });
+    expect(
+      await service.workerCandidate(caller, recoveryTask.id, recoveryStep.id, recoveryAttempt.id),
+    ).toMatchObject({ fileArtifact: { contentExcerpt: firstContent } });
+    await store.authorization.grant({
+      principalId: caller.principalId,
+      resourceId: `task-${recoveryTask.id}`,
+      action: "task:accept",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    const reviewedRecoveryStep = (await store.longWork.listSteps(recoveryTask.id))[0]!;
+    await service.acceptStep(
+      caller,
+      recoveryTask.id,
+      recoveryStep.id,
+      reviewedRecoveryStep.version,
+    );
+
+    const missingTask = await store.tasks.createTask({
+      title: "Missing Worker result file",
+      creatorPrincipalId: caller.principalId,
+      authorizationScope: caller.scope,
+    });
+    for (const action of ["task:continue", "task:delegate", "task:read", "worker:read"])
+      await store.authorization.grant({
+        principalId: caller.principalId,
+        resourceId: `task-${missingTask.id}`,
+        action,
+        scope: caller.scope,
+        effect: "allow",
+      });
+    const missingStep: TaskStep = {
+      ...step,
+      id: "missing-file-step",
+      taskId: missingTask.id,
+      specRef: "worker:text-file:reports/missing.txt",
+    };
+    await store.longWork.createGraph(
+      missingTask.id,
+      [missingStep],
+      missingStep.id,
+      DEFAULT_TASK_GRAPH_LIMITS,
+      { kind: "system", reason: "missing result test" },
+    );
+    const missingInput = { taskId: missingTask.id, policyRevision: 1 };
+    expect(await advance(missingInput)).toEqual({ kind: "continue" });
+    const missingAttempt = (await store.tasks.listAttempts(missingTask.id))[0]!;
+    const missingBinding = (await store.tasks.getWorkerBinding(missingAttempt.id))!;
+    bridge.simulateAgentState(missingBinding.paneId, "done", "Worker says done without file");
+    expect(await advance(missingInput)).toEqual({ kind: "continue" });
+    expect((await store.longWork.listSteps(missingTask.id))[0]).toMatchObject({
+      status: "blocked",
+    });
+    expect(
+      await store.longWork.getWorkerFileArtifact(missingTask.id, missingStep.id, missingAttempt.id),
+    ).toBeNull();
+    expect((await store.tasks.getTask(missingTask.id))?.status).not.toBe("DONE");
+  } finally {
+    await store.close();
+    await rm(directory, { recursive: true, force: true, maxRetries: 2, retryDelay: 50 }).catch(
+      (error: NodeJS.ErrnoException) => {
+        if (error.code !== "EBUSY") throw error;
+      },
+    );
+  }
+});
 
 it("dispatches one Worker, reviews and cancels it safely, and quarantines an uncertain launch", async () => {
   const directory = await mkdtemp(join(tmpdir(), "glassbox-p6-worker-"));

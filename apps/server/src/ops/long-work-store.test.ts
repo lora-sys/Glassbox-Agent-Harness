@@ -599,6 +599,41 @@ it("accepts only exact task_get Tool Step references", async () => {
   }
 });
 
+it("accepts Worker file references only on Worker Steps and only for safe paths", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    const store = await fixture(db);
+    for (const specRef of [
+      "worker:text-file:",
+      "worker:text-file:../secret.txt",
+      "worker:text-file:src\\secret.txt",
+      "artifact:unknown",
+    ]) {
+      await expect(
+        store.createGraph(
+          "task-1",
+          [{ ...step("worker", [], "herdr_worker"), specRef }],
+          "worker",
+          limits,
+          system,
+        ),
+      ).rejects.toThrow("Invalid Worker file Step specification");
+      expect(await store.listSteps("task-1")).toEqual([]);
+    }
+    await expect(
+      store.createGraph(
+        "task-1",
+        [{ ...step("join"), specRef: "worker:text-file:reports/result.txt" }],
+        "join",
+        limits,
+        system,
+      ),
+    ).rejects.toThrow("Invalid Worker file Step specification");
+  } finally {
+    await db.close();
+  }
+});
+
 it("requires a current planning grant before a principal may declare Step permissions", async () => {
   const db = await DomainDatabase.open(":memory:");
   try {
@@ -1460,7 +1495,12 @@ it("stores one immutable bounded Worker candidate for the live claim", async () 
     const store = await fixture(db);
     await store.createGraph(
       "task-1",
-      [step("candidate-worker", [], "herdr_worker")],
+      [
+        {
+          ...step("candidate-worker", [], "herdr_worker"),
+          specRef: "worker:text-file:reports/result.txt",
+        },
+      ],
       "candidate-worker",
       limits,
       system,
@@ -1520,7 +1560,56 @@ it("stores one immutable bounded Worker candidate for the live claim", async () 
       expectedStepVersion: 3,
       expectedLeaseVersion: 2,
     };
-    const ref = await store.recordWorkerCandidate({ ...input, output });
+    const artifact = {
+      relativePath: "reports/result.txt",
+      contentText: "A reviewed Worker file.\n",
+      sha256: createHash("sha256").update("A reviewed Worker file.\n").digest("hex"),
+    };
+    await expect(store.recordWorkerCandidate({ ...input, output })).rejects.toThrow(
+      "Worker file artifact required by Step specification",
+    );
+    await expect(
+      store.recordWorkerCandidate({
+        ...input,
+        output,
+        artifact: { ...artifact, sha256: "0".repeat(64) },
+      }),
+    ).rejects.toThrow("Invalid Worker file artifact");
+    await expect(
+      store.recordWorkerCandidate({
+        ...input,
+        output,
+        artifact: { ...artifact, relativePath: "reports/other.txt" },
+      }),
+    ).rejects.toThrow("Worker file artifact does not match Step specification");
+    const oversizedText = "é".repeat(128 * 1024 + 1);
+    await expect(
+      store.recordWorkerCandidate({
+        ...input,
+        output,
+        artifact: {
+          ...artifact,
+          contentText: oversizedText,
+          sha256: createHash("sha256").update(oversizedText).digest("hex"),
+        },
+      }),
+    ).rejects.toThrow("Invalid Worker file artifact");
+    await db.transaction((tx) =>
+      tx.execute(
+        "CREATE TRIGGER reject_file_capture BEFORE INSERT ON worker_file_artifacts BEGIN SELECT RAISE(ABORT,'file capture failed'); END",
+      ),
+    );
+    await expect(store.recordWorkerCandidate({ ...input, output, artifact })).rejects.toThrow(
+      "file capture failed",
+    );
+    expect(
+      await store.getWorkerCandidate("task-1", "candidate-worker", "candidate-attempt"),
+    ).toBeNull();
+    expect(
+      await store.getWorkerFileArtifact("task-1", "candidate-worker", "candidate-attempt"),
+    ).toBeNull();
+    await db.transaction((tx) => tx.execute("DROP TRIGGER reject_file_capture"));
+    const ref = await store.recordWorkerCandidate({ ...input, output, artifact });
     expect(ref).toBe("worker-result:candidate-attempt");
     expect(
       await store.getWorkerCandidate("task-1", "candidate-worker", "candidate-attempt", {
@@ -1528,8 +1617,31 @@ it("stores one immutable bounded Worker candidate for the live claim", async () 
       }),
     ).toBeNull();
     expect(
-      await store.recordWorkerCandidate({ ...input, output: "retry must preserve first capture" }),
+      await store.getWorkerFileArtifact("task-1", "candidate-worker", "candidate-attempt", {
+        reviewableOnly: true,
+      }),
+    ).toBeNull();
+    expect(
+      await store.recordWorkerCandidate({
+        ...input,
+        output: "retry must preserve first capture",
+        artifact,
+      }),
     ).toBe(ref);
+    await expect(
+      store.recordWorkerCandidate({
+        ...input,
+        output,
+        artifact: {
+          ...artifact,
+          contentText: "Changed file.\n",
+          sha256: createHash("sha256").update("Changed file.\n").digest("hex"),
+        },
+      }),
+    ).rejects.toThrow("Worker file artifact conflicts with first capture");
+    await expect(store.recordWorkerCandidate({ ...input, output })).rejects.toThrow(
+      "Worker file artifact required by Step specification",
+    );
 
     const record = await store.getWorkerCandidate(
       "task-1",
@@ -1551,11 +1663,22 @@ it("stores one immutable bounded Worker candidate for the live claim", async () 
       (await store.getWorkerCandidate("task-1", "candidate-worker", "missing-attempt"))
         ?.outputSha256,
     );
+    expect(
+      await store.getWorkerFileArtifact("task-1", "candidate-worker", "candidate-attempt"),
+    ).toMatchObject({
+      taskId: "task-1",
+      stepId: "candidate-worker",
+      attemptId: "candidate-attempt",
+      workerBindingId: "candidate-binding",
+      relativePath: artifact.relativePath,
+      contentText: artifact.contentText,
+      contentSha256: artifact.sha256,
+    });
     await expect(
-      store.recordWorkerCandidate({ ...input, expectedLeaseVersion: 1, output }),
+      store.recordWorkerCandidate({ ...input, expectedLeaseVersion: 1, output, artifact }),
     ).rejects.toThrow("Worker candidate claim conflict");
     await expect(
-      store.recordWorkerCandidate({ ...input, output: "x".repeat(1024 * 1024 + 1) }),
+      store.recordWorkerCandidate({ ...input, output: "x".repeat(1024 * 1024 + 1), artifact }),
     ).rejects.toThrow("Worker candidate output exceeds the input byte limit");
     await expect(
       db.transaction((tx) =>
@@ -1564,6 +1687,13 @@ it("stores one immutable bounded Worker candidate for the live claim", async () 
         ),
       ),
     ).rejects.toThrow("worker candidate outputs are immutable");
+    await expect(
+      db.transaction((tx) =>
+        tx.execute(
+          "UPDATE worker_file_artifacts SET content_text = 'changed' WHERE attempt_id = 'candidate-attempt'",
+        ),
+      ),
+    ).rejects.toThrow("worker file artifacts are immutable");
     await expect(
       db.transaction((tx) =>
         tx.execute("DELETE FROM worker_candidate_outputs WHERE attempt_id = 'candidate-attempt'"),
@@ -1585,6 +1715,11 @@ it("stores one immutable bounded Worker candidate for the live claim", async () 
         reviewableOnly: true,
       }),
     ).toMatchObject({ outputSha256: record?.outputSha256 });
+    expect(
+      await store.getWorkerFileArtifact("task-1", "candidate-worker", "candidate-attempt", {
+        reviewableOnly: true,
+      }),
+    ).toMatchObject({ contentSha256: artifact.sha256 });
   } finally {
     await db.close();
   }

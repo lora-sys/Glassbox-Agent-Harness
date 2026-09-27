@@ -7,6 +7,7 @@ import { getLongWorkCaller, authorizeLongWorkAction } from "../long-work-authori
 import { LongWorkScheduler } from "../long-work-scheduler.js";
 import { DEFAULT_TASK_GRAPH_LIMITS, TaskGraphError } from "../task-graph.js";
 import { parseTaskGetSpec } from "../tool-step-spec.js";
+import { parseWorkerTextFileSpec } from "../worker-file-spec.js";
 import type { AdvanceLongWorkActivity } from "./contracts.js";
 import { ClaimedWorkerDispatchError } from "../service.js";
 import type { HerdrWorkerRuntime } from "./herdr-worker-runtime.js";
@@ -631,7 +632,11 @@ export function createAdvanceLongWorkActivity(
         continue;
       }
       if (step.kind === "herdr_worker" && workers) {
-        if (!step.instructions?.trim() || step.specRef || step.requiredCapabilities.length > 0) {
+        if (
+          !step.instructions?.trim() ||
+          (step.specRef && !parseWorkerTextFileSpec(step.specRef)) ||
+          step.requiredCapabilities.length > 0
+        ) {
           await store.longWork.transitionStep({
             taskId,
             stepId,

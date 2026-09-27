@@ -4,11 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DomainDatabase } from "./database.js";
 
-it("creates an event-keyed Task notification outbox in schema v16", async () => {
+it("creates an event-keyed Task notification outbox in schema v18", async () => {
   const db = await DomainDatabase.open(":memory:");
   try {
     await db.transaction(async (tx) => {
-      expect(Number((await tx.execute("PRAGMA user_version")).rows[0]?.user_version)).toBe(17);
+      expect(Number((await tx.execute("PRAGMA user_version")).rows[0]?.user_version)).toBe(18);
       const columns = await tx.execute("PRAGMA table_info(task_notifications)");
       expect(columns.rows.map((row) => row.name)).toEqual([
         "id",
@@ -54,7 +54,7 @@ it("adds immutable Worker candidate output storage when upgrading schema v16", a
     const upgraded = await DomainDatabase.open(databasePath);
     try {
       await upgraded.transaction(async (tx) => {
-        expect((await tx.execute("PRAGMA user_version")).rows[0]?.user_version).toBe(17);
+        expect((await tx.execute("PRAGMA user_version")).rows[0]?.user_version).toBe(18);
         expect(
           (await tx.execute("PRAGMA table_info(worker_candidate_outputs)")).rows.map(
             (row) => row.name,

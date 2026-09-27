@@ -14,6 +14,9 @@ import { stringColumn } from "../persistence/database.js";
 import type { HerdrBridge } from "./herdr-bridge.js";
 import { DEFAULT_TASK_GRAPH_LIMITS } from "./task-graph.js";
 import { parseTaskGetSpec } from "./tool-step-spec.js";
+import { parseWorkerTextFileSpec } from "./worker-file-spec.js";
+import { WorkerFiles } from "./worker-files.js";
+import { WorkerArtifactCaptureError, type DurableWorkerClaim } from "./durable-worker-observer.js";
 import { buildOpsHealthSnapshot, type OpsHealthInput, type OpsHealthSnapshot } from "./health.js";
 import { mkdir, writeFile, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
@@ -52,6 +55,18 @@ export class ClaimedWorkerDispatchError extends Error {
 
 type WorkerContext = { file: string; lease: WriteOccupancyLease | null };
 type StartedWorker = Awaited<ReturnType<HerdrBridge["startAgent"]>>;
+
+function textExcerpt(value: string, byteLimit: number): { text: string; truncated: boolean } {
+  let bytes = 0;
+  let text = "";
+  for (const character of value) {
+    const size = Buffer.byteLength(character);
+    if (bytes + size > byteLimit) return { text, truncated: true };
+    text += character;
+    bytes += size;
+  }
+  return { text, truncated: false };
+}
 
 const OPS_RESOURCE = "agent-operations";
 type RunEvidence = { runId?: string; conversationId?: string; delegatedTaskId?: string };
@@ -672,7 +687,7 @@ export class AuthorizedOpsService {
       claim.lease.state !== "active" ||
       claim.lease.workerBindingId ||
       !claim.step.instructions?.trim() ||
-      claim.step.specRef ||
+      (claim.step.specRef && !parseWorkerTextFileSpec(claim.step.specRef)) ||
       claim.step.requiredCapabilities.length > 0 ||
       target.agentKind !== "pi" ||
       !this.workerPolicy ||
@@ -757,7 +772,9 @@ export class AuthorizedOpsService {
       await this.bridge.promptAgent({
         paneId: worker.paneId,
         agentName,
-        prompt: claim.step.instructions,
+        prompt: claim.step.specRef
+          ? `${claim.step.instructions}\n\nWrite the final UTF-8 text result to ${parseWorkerTextFileSpec(claim.step.specRef)!.relativePath} using the authorized Worker file tool before finishing.`
+          : claim.step.instructions,
       });
       if (!(await this.store.tasks.markWorkerPromptDispatched(attemptId, binding.id)))
         throw new Error("Worker prompt acknowledgement conflict");
@@ -887,6 +904,93 @@ export class AuthorizedOpsService {
     return result;
   }
 
+  /** Snapshots a declared text file while the exact Worker claim still owns the Step. */
+  async captureClaimedWorkerTextFile(
+    caller: CallerContext,
+    claim: DurableWorkerClaim,
+    relativePath: string,
+  ): Promise<{ relativePath: string; contentText: string; sha256: string }> {
+    if (!this.workerPolicy || !this.workspaceBoundary) throw new WorkerArtifactCaptureError();
+    const step = (await this.store.longWork.listSteps(claim.taskId)).find(
+      (item) => item.id === claim.stepId,
+    );
+    const spec = step?.specRef ? parseWorkerTextFileSpec(step.specRef) : null;
+    if (step?.kind !== "herdr_worker" || spec?.relativePath !== relativePath)
+      throw new WorkerArtifactCaptureError();
+    const binding = await this.store.tasks.getWorkerBinding(claim.attemptId);
+    if (!binding?.worktreePath || binding.id !== claim.bindingId)
+      throw new WorkerArtifactCaptureError();
+    const root = await realpath(binding.worktreePath).catch(() => {
+      throw new WorkerArtifactCaptureError();
+    });
+    const fileRead = step.delegatedPermissionSet.some(
+      (permission) =>
+        permission.resourceId === this.workerPolicy!.resourceId &&
+        permission.action === "worker:file:read",
+    );
+    const workspaceResources = step.delegatedPermissionSet.filter(
+      (permission) =>
+        permission.action === "workspace:read" && permission.resourceId.startsWith("workspace:"),
+    );
+    if (!fileRead || workspaceResources.length !== 1) throw new WorkerArtifactCaptureError();
+    const workspaceResource = workspaceResources[0]!.resourceId;
+    const workspaceId = workspaceResource.slice("workspace:".length);
+    const verify = async () => {
+      const lease = await this.store.longWork.getActiveLease(claim.taskId, claim.stepId);
+      if (
+        !lease ||
+        lease.id !== claim.leaseId ||
+        lease.attemptId !== claim.attemptId ||
+        lease.workerBindingId !== claim.bindingId ||
+        lease.ownerInstanceId !== claim.ownerInstanceId ||
+        lease.version !== claim.expectedLeaseVersion ||
+        Date.parse(lease.expiresAt) <= Date.now()
+      )
+        throw new WorkerArtifactCaptureError();
+      const currentStep = (await this.store.longWork.listSteps(claim.taskId)).find(
+        (item) => item.id === claim.stepId,
+      );
+      if (currentStep?.status !== "running" || currentStep.version !== claim.expectedStepVersion)
+        throw new WorkerArtifactCaptureError();
+      const currentBinding = await this.store.tasks.getWorkerBinding(claim.attemptId);
+      if (
+        currentBinding?.id !== claim.bindingId ||
+        !currentBinding.worktreePath ||
+        (await realpath(currentBinding.worktreePath)) !== root
+      )
+        throw new WorkerArtifactCaptureError();
+      const workspace = await this.workspaceBoundary!.registry.resolveAuthorized(
+        caller.principalId,
+        workspaceId,
+        "read",
+      );
+      if (workspace.canonicalPath !== root) throw new WorkerArtifactCaptureError();
+      const evidence = { delegatedTaskId: claim.taskId };
+      for (const [resourceId, action] of [
+        [`task-${claim.taskId}`, "task:continue"],
+        [`task-${claim.taskId}`, "task:read"],
+        [`task-${claim.taskId}`, "worker:read"],
+        [this.workerPolicy!.resourceId, "worker:file:read"],
+        [workspaceResource, "workspace:read"],
+      ])
+        await this.authorize(caller, resourceId, action, evidence);
+    };
+    try {
+      await verify();
+      const files = await WorkerFiles.open(root, { beforeOpen: verify });
+      const bytes = await files.readBytes(relativePath);
+      const contentText = bytes.toString("utf8");
+      if (!Buffer.from(contentText, "utf8").equals(bytes)) throw new WorkerArtifactCaptureError();
+      return {
+        relativePath,
+        contentText,
+        sha256: createHash("sha256").update(bytes).digest("hex"),
+      };
+    } catch {
+      throw new WorkerArtifactCaptureError();
+    }
+  }
+
   /** Reads a captured durable Worker result only under current Task and source grants. */
   async workerCandidate(
     caller: CallerContext,
@@ -967,7 +1071,21 @@ export class AuthorizedOpsService {
     if (evidence?.runId)
       for (const decision of decisions)
         await this.store.authorization.markDeliverySource(decision.id, "content_source");
-    return candidate;
+    const artifact = await this.store.longWork.getWorkerFileArtifact(taskId, stepId, attemptId, {
+      reviewableOnly: true,
+    });
+    if (step.specRef && !artifact) throw new Error("Declared Worker file artifact is unavailable");
+    if (!artifact) return candidate;
+    const excerpt = textExcerpt(artifact.contentText, 16 * 1024);
+    return {
+      ...candidate,
+      fileArtifact: {
+        relativePath: artifact.relativePath,
+        sha256: artifact.contentSha256,
+        contentExcerpt: excerpt.text,
+        truncated: excerpt.truncated,
+      },
+    };
   }
 
   async promptWorker(caller: CallerContext, taskId: string, prompt: string): Promise<void> {
