@@ -828,13 +828,36 @@ export class LongWorkStore {
     taskId: string,
     stepId: string,
     attemptId: string,
+    options: { reviewableOnly?: boolean } = {},
   ): Promise<WorkerCandidateOutput | null> {
     for (const value of [taskId, stepId, attemptId]) requireIdentifier(value);
     return this.db.transaction(async (tx) => {
       const result = await tx.execute({
-        sql: `SELECT task_id,step_id,attempt_id,worker_binding_id,output_excerpt,output_sha256,truncated,created_at
-          FROM worker_candidate_outputs WHERE task_id = ? AND step_id = ? AND attempt_id = ?`,
-        args: [taskId, stepId, attemptId],
+        sql: `SELECT candidate.task_id,candidate.step_id,candidate.attempt_id,
+            candidate.worker_binding_id,candidate.output_excerpt,candidate.output_sha256,
+            candidate.truncated,candidate.created_at
+          FROM worker_candidate_outputs candidate
+          ${
+            options.reviewableOnly
+              ? `JOIN task_steps step ON step.task_id = candidate.task_id AND step.id = candidate.step_id
+            JOIN task_attempts attempt ON attempt.id = candidate.attempt_id
+              AND attempt.task_id = candidate.task_id AND attempt.step_id = candidate.step_id
+            JOIN worker_bindings binding ON binding.id = candidate.worker_binding_id
+              AND binding.task_attempt_id = candidate.attempt_id`
+              : ""
+          }
+          WHERE candidate.task_id = ? AND candidate.step_id = ? AND candidate.attempt_id = ?
+          ${
+            options.reviewableOnly
+              ? `AND step.kind = 'herdr_worker'
+            AND step.status IN ('review','succeeded')
+            AND attempt.status IN ('review','succeeded')
+            AND step.output_ref = ?`
+              : ""
+          }`,
+        args: options.reviewableOnly
+          ? [taskId, stepId, attemptId, `worker-result:${attemptId}`]
+          : [taskId, stepId, attemptId],
       });
       const row = result.rows[0];
       return row

@@ -904,7 +904,9 @@ export class AuthorizedOpsService {
     ];
     const step = (await this.store.longWork.listSteps(taskId)).find((item) => item.id === stepId);
     if (step?.kind !== "herdr_worker") throw new Error("Durable Worker Step is unavailable");
-    const candidate = await this.store.longWork.getWorkerCandidate(taskId, stepId, attemptId);
+    const candidate = await this.store.longWork.getWorkerCandidate(taskId, stepId, attemptId, {
+      reviewableOnly: true,
+    });
     if (!candidate) return null;
     const binding = await this.store.tasks.getWorkerBinding(attemptId);
     if (!binding || binding.id !== candidate.workerBindingId)

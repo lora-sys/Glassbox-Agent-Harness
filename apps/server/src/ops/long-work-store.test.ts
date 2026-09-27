@@ -1523,6 +1523,11 @@ it("stores one immutable bounded Worker candidate for the live claim", async () 
     const ref = await store.recordWorkerCandidate({ ...input, output });
     expect(ref).toBe("worker-result:candidate-attempt");
     expect(
+      await store.getWorkerCandidate("task-1", "candidate-worker", "candidate-attempt", {
+        reviewableOnly: true,
+      }),
+    ).toBeNull();
+    expect(
       await store.recordWorkerCandidate({ ...input, output: "retry must preserve first capture" }),
     ).toBe(ref);
 
@@ -1568,6 +1573,18 @@ it("stores one immutable bounded Worker candidate for the live claim", async () 
       (await store.getWorkerCandidate("task-1", "candidate-worker", "candidate-attempt"))
         ?.outputSha256,
     ).toBe(record?.outputSha256);
+    await store.settleClaimedStep({
+      ...input,
+      outcome: "review",
+      evidenceRef: "candidate:candidate-attempt",
+      outputRef: ref,
+      origin: system,
+    });
+    expect(
+      await store.getWorkerCandidate("task-1", "candidate-worker", "candidate-attempt", {
+        reviewableOnly: true,
+      }),
+    ).toMatchObject({ outputSha256: record?.outputSha256 });
   } finally {
     await db.close();
   }
