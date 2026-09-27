@@ -694,7 +694,7 @@ export class ManagementApplication {
           store.tasks,
           options.ops.bridge,
           1_000,
-          new DurableWorkerObserver(store.db, store.longWork, store.tasks),
+          new DurableWorkerObserver(store.db, store.longWork, store.tasks, false),
         );
         await application.opsReconciler.start();
       }

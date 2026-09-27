@@ -14,6 +14,8 @@ The current branch has the P6 contracts, schema migration, DAG state transitions
 
 The Issue #24 Herdr Worker and delivery safety branch is merged into this P6 branch as commit `06441c5`. This includes workspace occupancy, verified Herdr pane closure, and delivery-source reauthorization. The P6 dispatcher uses the claimed Attempt; the legacy `task_delegate` path remains separate.
 
+Each Temporal Worker process now has a distinct lease owner. A replacement process waits for an old lease to expire, then checks the same live Herdr session, pane identity, directory, prompt acknowledgement, and current Task authority before it can transfer ownership of the same Attempt. The transfer appends `WORKER_RECOVERED` evidence. The previous owner cannot heartbeat or settle the transferred claim. The management reconciler may record live state for durable Workers, but only the Temporal path can settle their Steps after checking authority and lease ownership. If the pane or authority cannot be verified, the outcome stays unknown and possible workspace occupancy remains quarantined.
+
 The first closed Tool Step is `task_get`, a read of one exact Task. `task_plan` accepts its bounded target ID. Graph validation rejects other Tool references and freeform Tool instructions. The Tool Step uses the same durable Attempt, lease, internal Run, retry, cancellation, and Step review path as a Model Step. Run dispatch and result reads recheck the target Task's current `task:read` authority, including a child Task's delegated scope. Its result stays in the internal Run and is never automatically delivered. This does not yet provide general protected Tool execution, a result handoff into dependent Model Steps, or a mutation replay policy.
 
 ## Delivery order

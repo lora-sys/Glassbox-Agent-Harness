@@ -1,11 +1,12 @@
 import type { TaskStep } from "@glassbox/contracts";
+import { randomUUID } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import type { DomainStore } from "../../application/domain-store.js";
 import { AccessDeniedError } from "../../auth/service.js";
 import type { CallerContext } from "../../identity/scope.js";
 import { DurableWorkerObserver } from "../durable-worker-observer.js";
 import type { HerdrBridge } from "../herdr-bridge.js";
-import { authorizeLongWorkAction } from "../long-work-authority.js";
+import { authorizeLongWorkAction, getLongWorkCaller } from "../long-work-authority.js";
 import type { ClaimedTaskStep, StoredStepLease } from "../long-work-store.js";
 import { AuthorizedOpsService, type ConfiguredWorkerTarget } from "../service.js";
 
@@ -14,6 +15,7 @@ const WORKER_LEASE_MS = 60_000;
 
 /** The Temporal process observes live Herdr state; Glassbox remains the Step authority. */
 export class HerdrWorkerRuntime {
+  readonly ownerInstanceId = `temporal-worker-${randomUUID()}`;
   private readonly observer: DurableWorkerObserver;
 
   constructor(
@@ -99,8 +101,10 @@ export class HerdrWorkerRuntime {
   }
 
   async observe(taskId: string, step: TaskStep): Promise<"settled" | "pending"> {
-    const lease = await this.store.longWork.getActiveLease(taskId, step.id);
+    let lease = await this.store.longWork.getActiveLease(taskId, step.id);
     if (!lease?.attemptId) return "pending";
+    if (lease.ownerInstanceId !== this.ownerInstanceId && Date.parse(lease.expiresAt) > Date.now())
+      return "pending";
     const binding = await this.store.tasks.getWorkerBinding(lease.attemptId);
     if (!binding || !lease.workerBindingId || !binding.promptDispatchedAt) {
       if (Date.parse(lease.expiresAt) > Date.now()) return "pending";
@@ -173,11 +177,8 @@ export class HerdrWorkerRuntime {
       await this.settleUnknown(taskId, step, lease, "worker-identity-or-directory-changed");
       return "settled";
     }
-    if (Date.parse(lease.expiresAt) <= Date.now()) {
-      await this.service.quarantineClaimedWorker(lease.attemptId);
-      await this.settleUnknown(taskId, step, lease, "worker-lease-expired");
-      return "settled";
-    }
+    let continuationDecisionId: string;
+    const caller = await getLongWorkCaller(this.store, taskId);
     try {
       for (const [resourceId, action] of [
         [`task-${taskId}`, "task:continue"],
@@ -186,12 +187,16 @@ export class HerdrWorkerRuntime {
           permission.resourceId,
           permission.action,
         ]),
-      ])
-        await authorizeLongWorkAction(this.store, {
+      ]) {
+        const decisionId = await authorizeLongWorkAction(this.store, {
           taskId,
+          caller,
           resourceId: resourceId!,
           action: action!,
         });
+        if (action === "task:continue" && resourceId === `task-${taskId}`)
+          continuationDecisionId = decisionId;
+      }
     } catch (error) {
       if (!(error instanceof AccessDeniedError)) throw error;
       try {
@@ -211,13 +216,47 @@ export class HerdrWorkerRuntime {
       );
       return "settled";
     }
-    await this.observer.observeSnapshot(snapshot);
+    if (Date.parse(lease.expiresAt) <= Date.now()) {
+      if (snapshotTime < Date.parse(lease.expiresAt)) return "pending";
+      try {
+        lease = await this.store.longWork.recoverClaimedWorkerLease({
+          taskId,
+          stepId: step.id,
+          attemptId: lease.attemptId,
+          leaseId: lease.id,
+          workerBindingId: binding.id,
+          previousOwnerInstanceId: lease.ownerInstanceId,
+          nextOwnerInstanceId: this.ownerInstanceId,
+          expectedStepVersion: step.version,
+          expectedLeaseVersion: lease.version,
+          expiresAt: new Date(Date.now() + WORKER_LEASE_MS).toISOString(),
+          evidenceRef: `snapshot:${snapshot.timestamp}:${binding.id}`,
+          origin: {
+            kind: "decision",
+            decisionId: continuationDecisionId!,
+            actorPrincipalId: caller.principalId,
+          },
+        });
+      } catch (error) {
+        if (error instanceof Error && error.message.includes("Worker recovery lease conflict"))
+          return "pending";
+        throw error;
+      }
+    }
+    await this.observer.observeSnapshot(snapshot, this.ownerInstanceId);
     const current = (await this.store.longWork.listSteps(taskId)).find(
       (item) => item.id === step.id,
     );
     if (!current || current.status !== "running") return "settled";
     const currentLease = await this.store.longWork.getActiveLease(taskId, step.id);
-    if (!currentLease?.attemptId || !currentLease.workerBindingId) return "pending";
+    if (
+      !currentLease?.attemptId ||
+      !currentLease.workerBindingId ||
+      currentLease.ownerInstanceId !== this.ownerInstanceId
+    )
+      return "pending";
+    const currentBinding = await this.store.tasks.getWorkerBinding(currentLease.attemptId);
+    if (!currentBinding || snapshotTime < Date.parse(currentBinding.updatedAt)) return "pending";
     if (Date.parse(currentLease.expiresAt) <= Date.now()) {
       await this.service.quarantineClaimedWorker(currentLease.attemptId);
       await this.settleUnknown(taskId, current, currentLease, "worker-lease-expired");

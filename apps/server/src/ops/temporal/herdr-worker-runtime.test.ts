@@ -100,7 +100,7 @@ it("dispatches one Worker, reviews and cancels it safely, and quarantines an unc
       agentKind: "pi",
       worktreePath: project,
     });
-    const advance = createAdvanceLongWorkActivity(store, workers);
+    let advance = createAdvanceLongWorkActivity(store, workers);
     const input = { taskId: task.id, policyRevision: 1 };
     expect(await advance(input)).toEqual({ kind: "continue" });
     const attempt = (await store.tasks.listAttempts(task.id))[0]!;
@@ -121,6 +121,48 @@ it("dispatches one Worker, reviews and cancels it safely, and quarantines an unc
     expect((await advance(input)).kind).toBe("wait");
     expect((await store.longWork.getActiveLease(task.id, step.id))?.version).toBe(
       beforeStale?.version,
+    );
+    const oldAdvance = advance;
+    const recoveredWorkers = new HerdrWorkerRuntime(store, service, bridge, {
+      workspaceId: "herdr-workspace",
+      agentKind: "pi",
+      worktreePath: project,
+    });
+    advance = createAdvanceLongWorkActivity(store, recoveredWorkers);
+    expect((await advance(input)).kind).toBe("wait");
+    expect((await store.longWork.getActiveLease(task.id, step.id))?.version).toBe(
+      beforeStale?.version,
+    );
+    await store.db.transaction(async (tx) => {
+      await tx.execute({
+        sql: "UPDATE task_step_leases SET expires_at = ? WHERE id = ?",
+        args: ["2000-01-01T00:00:00.000Z", beforeStale!.id],
+      });
+    });
+    expect((await advance(input)).kind).toBe("wait");
+    const recoveredLease = await store.longWork.getActiveLease(task.id, step.id);
+    expect(recoveredLease?.ownerInstanceId).toBe(recoveredWorkers.ownerInstanceId);
+    expect(recoveredLease?.version).toBeGreaterThan(beforeStale!.version);
+    expect(await store.tasks.listAttempts(task.id)).toHaveLength(1);
+    expect(
+      (await store.longWork.listEvents(task.id)).filter(
+        (event) => event.type === "WORKER_RECOVERED",
+      ),
+    ).toHaveLength(1);
+    await expect(
+      store.longWork.updateLease({
+        taskId: task.id,
+        leaseId: recoveredLease!.id,
+        ownerInstanceId: workers.ownerInstanceId,
+        expectedVersion: recoveredLease!.version,
+        action: "heartbeat",
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        origin: { kind: "system", reason: "stale process test" },
+      }),
+    ).rejects.toThrow("Lease version conflict");
+    expect((await oldAdvance(input)).kind).toBe("wait");
+    expect((await store.longWork.getActiveLease(task.id, step.id))?.version).toBe(
+      recoveredLease?.version,
     );
     expect((await advance(input)).kind).toBe("wait");
     expect(await store.tasks.listAttempts(task.id)).toHaveLength(1);

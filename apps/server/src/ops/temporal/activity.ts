@@ -456,7 +456,7 @@ async function createClaimedModelRun(
 /** The Activity claims model Steps and records durable Runs; RunService performs model execution. */
 export function createAdvanceLongWorkActivity(
   store: DomainStore,
-  workers?: Pick<HerdrWorkerRuntime, "dispatch" | "observe" | "cancel">,
+  workers?: Pick<HerdrWorkerRuntime, "dispatch" | "observe" | "cancel" | "ownerInstanceId">,
 ): AdvanceLongWorkActivity {
   const scheduler = new LongWorkScheduler(store.longWork, DEFAULT_TASK_GRAPH_LIMITS);
   return async ({ taskId, policyRevision }) => {
@@ -578,7 +578,7 @@ export function createAdvanceLongWorkActivity(
           expectedStepVersion: step.version,
           attemptId: randomUUID(),
           leaseId: randomUUID(),
-          ownerInstanceId: `temporal-worker-${randomUUID()}`,
+          ownerInstanceId: workers.ownerInstanceId,
           leaseExpiresAt: new Date(Date.now() + MODEL_LEASE_MS).toISOString(),
           origin: { kind: "decision", decisionId, actorPrincipalId: caller.principalId },
         });

@@ -99,6 +99,24 @@ afterEach(async () => {
 });
 
 describe("DurableWorkerObserver", () => {
+  it("lets the management observer record done without settling the Temporal-owned Step", async () => {
+    const { store, task, stepId, bridge, worker } = await fixture("pi");
+    const managementObserver = new DurableWorkerObserver(
+      store.db,
+      store.longWork,
+      store.tasks,
+      false,
+    );
+    bridge.simulateAgentState(worker.paneId, "done");
+
+    await managementObserver.observeSnapshot(await bridge.getSnapshot());
+
+    expect(
+      (await store.longWork.listSteps(task.id)).find((step) => step.id === stepId)?.status,
+    ).toBe("running");
+    expect((await store.tasks.getWorkerBinding("attempt-1"))?.lastObservedAgentState).toBe("done");
+  });
+
   it("does not accept a Worker completion before its prompt acknowledgement", async () => {
     const { store, task, stepId, bridge, worker, reconciler } = await fixture("pi", false);
     bridge.simulateAgentState(worker.paneId, "done");

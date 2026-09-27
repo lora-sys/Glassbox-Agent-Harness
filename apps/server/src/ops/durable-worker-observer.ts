@@ -55,6 +55,7 @@ export class DurableWorkerObserver {
     private readonly db: DomainDatabase,
     private readonly longWork: LongWorkStore,
     _tasks: TaskStore,
+    private readonly settleCompleted = true,
   ) {}
 
   /** Attempt IDs owned by the durable path, including claims that are currently uncertain. */
@@ -79,8 +80,8 @@ export class DurableWorkerObserver {
       await this.observeClaim(claim, "unknown", `stale:${claim.bindingId}`, observedAt);
   }
 
-  async observeSnapshot(snapshot: HerdrSessionSnapshot): Promise<void> {
-    const claims = await this.claimsForSession(snapshot.sessionId);
+  async observeSnapshot(snapshot: HerdrSessionSnapshot, ownerInstanceId?: string): Promise<void> {
+    const claims = await this.claimsForSession(snapshot.sessionId, ownerInstanceId);
     for (const claim of claims) {
       if (
         !this.isCurrentObservation(
@@ -157,6 +158,15 @@ export class DurableWorkerObserver {
     const completed =
       state === "done" ||
       (state === "idle" && claim.agentKind === "pi" && claim.lastObservedAgentState === "working");
+    if (!this.settleCompleted) {
+      await this.observeClaim(
+        claim,
+        state,
+        `${evidencePrefix}:${claim.bindingId}:${state}`,
+        observedAt,
+      );
+      return;
+    }
     if (claim.lastObservedAgentState === state) {
       if (completed)
         await this.settle(
@@ -191,6 +201,10 @@ export class DurableWorkerObserver {
     reason: string,
     observedAt: string,
   ): Promise<void> {
+    if (!this.settleCompleted) {
+      await this.observeClaim(claim, "unknown", `${reason}:${claim.bindingId}`, observedAt);
+      return;
+    }
     await this.settle(claim, "unknown", `${reason}:${claim.bindingId}`, "unknown", observedAt);
   }
 
@@ -260,7 +274,10 @@ export class DurableWorkerObserver {
     }
   }
 
-  private async claimsForSession(herdrSession: string): Promise<DurableWorkerClaim[]> {
+  private async claimsForSession(
+    herdrSession: string,
+    ownerInstanceId?: string,
+  ): Promise<DurableWorkerClaim[]> {
     return this.db.transaction(async (tx) => {
       const result = await tx.execute({
         sql: `SELECT b.id AS binding_id, b.task_attempt_id AS attempt_id, b.herdr_session,
@@ -276,8 +293,11 @@ export class DurableWorkerObserver {
             AND l.step_id = s.id AND l.task_id = a.task_id AND l.state = 'active'
           JOIN tasks t ON t.id = a.task_id AND t.orchestration_mode = 'durable'
           WHERE b.herdr_session = ? AND b.prompt_dispatched_at IS NOT NULL
+            AND l.expires_at > ? ${ownerInstanceId ? "AND l.owner_instance_id = ?" : ""}
             AND t.status NOT IN ('DONE','CANCELED','FAILED','ACCEPTED')`,
-        args: [herdrSession],
+        args: ownerInstanceId
+          ? [herdrSession, new Date().toISOString(), ownerInstanceId]
+          : [herdrSession, new Date().toISOString()],
       });
       return result.rows.map(parseClaim);
     });

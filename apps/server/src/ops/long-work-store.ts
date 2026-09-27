@@ -612,6 +612,121 @@ export class LongWorkStore {
     });
   }
 
+  /** Transfers an expired Worker claim only after the runtime verifies its exact live pane. */
+  async recoverClaimedWorkerLease(input: {
+    taskId: string;
+    stepId: string;
+    attemptId: string;
+    leaseId: string;
+    workerBindingId: string;
+    previousOwnerInstanceId: string;
+    nextOwnerInstanceId: string;
+    expectedStepVersion: number;
+    expectedLeaseVersion: number;
+    expiresAt: string;
+    evidenceRef: string;
+    origin: LongWorkOrigin;
+  }): Promise<StoredStepLease> {
+    for (const value of [
+      input.taskId,
+      input.stepId,
+      input.attemptId,
+      input.leaseId,
+      input.workerBindingId,
+      input.previousOwnerInstanceId,
+      input.nextOwnerInstanceId,
+    ])
+      requireIdentifier(value);
+    if (
+      input.origin.kind !== "decision" ||
+      !Number.isSafeInteger(input.expectedStepVersion) ||
+      input.expectedStepVersion < 1 ||
+      !Number.isSafeInteger(input.expectedLeaseVersion) ||
+      input.expectedLeaseVersion < 1 ||
+      !input.evidenceRef.trim() ||
+      input.evidenceRef.length > 512
+    )
+      throw new Error("Invalid Worker recovery claim");
+    const origin = input.origin;
+    return this.db.transaction(async (tx) => {
+      await this.requireOrigin(tx, origin);
+      const task = await this.requireActiveDurableTask(tx, input.taskId);
+      const currentGrant = await tx.execute({
+        sql: `SELECT 1 FROM authorization_decisions d JOIN grants g ON g.id = d.grant_id
+          WHERE d.id = ? AND d.principal_id = ? AND d.resource_id = ?
+            AND d.action = 'task:continue' AND d.scope_key = ? AND d.decision = 'ALLOW'
+            AND g.revoked_at IS NULL`,
+        args: [
+          origin.decisionId,
+          origin.actorPrincipalId,
+          `task-${input.taskId}`,
+          task.origin_scope_key,
+        ],
+      });
+      if (!currentGrant.rows[0]) throw new Error("Current Task continuation grant is required");
+      const step = await this.requireStep(tx, input.taskId, input.stepId);
+      if (
+        step.kind !== "herdr_worker" ||
+        step.status !== "running" ||
+        Number(step.version) !== input.expectedStepVersion
+      )
+        throw new Error("Worker recovery Step conflict");
+      const attempt = await tx.execute({
+        sql: "SELECT 1 FROM task_attempts WHERE id = ? AND task_id = ? AND step_id = ? AND status = 'running'",
+        args: [input.attemptId, input.taskId, input.stepId],
+      });
+      if (!attempt.rows[0]) throw new Error("Worker recovery Attempt conflict");
+      const binding = await tx.execute({
+        sql: "SELECT 1 FROM worker_bindings WHERE id = ? AND task_attempt_id = ? AND prompt_dispatched_at IS NOT NULL",
+        args: [input.workerBindingId, input.attemptId],
+      });
+      if (!binding.rows[0]) throw new Error("Worker recovery binding conflict");
+      const now = new Date().toISOString();
+      const nextExpiry = Date.parse(input.expiresAt);
+      if (
+        !Number.isFinite(nextExpiry) ||
+        nextExpiry <= Date.parse(now) ||
+        nextExpiry > Date.parse(now) + 86_400_000
+      )
+        throw new Error("Invalid Worker recovery expiry");
+      const updated = await tx.execute({
+        sql: `UPDATE task_step_leases SET owner_instance_id = ?, version = version + 1,
+            heartbeat_at = ?, expires_at = ?
+          WHERE id = ? AND task_id = ? AND step_id = ? AND attempt_id = ?
+            AND worker_binding_id = ? AND owner_instance_id = ? AND version = ?
+            AND state = 'active' AND expires_at <= ? RETURNING *`,
+        args: [
+          input.nextOwnerInstanceId,
+          now,
+          input.expiresAt,
+          input.leaseId,
+          input.taskId,
+          input.stepId,
+          input.attemptId,
+          input.workerBindingId,
+          input.previousOwnerInstanceId,
+          input.expectedLeaseVersion,
+          now,
+        ],
+      });
+      if (!updated.rows[0]) throw new Error("Worker recovery lease conflict");
+      await this.appendEventTx(tx, {
+        taskId: input.taskId,
+        stepId: input.stepId,
+        attemptId: input.attemptId,
+        type: "WORKER_RECOVERED",
+        origin: input.origin,
+        evidenceRef: input.evidenceRef,
+        metadata: {
+          previousOwnerInstanceId: input.previousOwnerInstanceId,
+          nextOwnerInstanceId: input.nextOwnerInstanceId,
+          workerBindingId: input.workerBindingId,
+        },
+      });
+      return parseLease(updated.rows[0]);
+    });
+  }
+
   /** Settles a claimed external attempt under its exclusive lease. Unknown outcomes stay blocked. */
   async settleClaimedStep(input: {
     taskId: string;
