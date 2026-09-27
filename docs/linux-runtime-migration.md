@@ -22,7 +22,7 @@ Record actual versions and results again immediately before cutover. Do not infe
 | agent-browser | 0.38.1 |
 | Linux browser | Chrome for Testing 154.0.8037.57, pending launch smoke |
 
-The pinned Kit commit is currently not obtainable from its GitHub remote. The Kit lock also contains `registry.npmmirror.com` URLs, so npm 12 requires that registry for `npm ci`. Publish the exact Kit commit or replace the pin with a reviewed reachable commit before claiming a clean Linux rebuild. The configured sandbox image ID must also be present and checked against `locks/sandbox-image.json` before a sandbox smoke.
+The pinned Kit commit is currently not obtainable from its GitHub remote. The Kit lock also contains `registry.npmmirror.com` URLs, so npm 12 requires that registry for `npm ci`. Publish the exact Kit commit or replace the pin with a reviewed reachable commit before claiming a clean Linux rebuild. The configured sandbox image ID must also be present and checked against the Kit checkout's `locks/sandbox-image.json` before a sandbox smoke.
 
 ## WSL checkpoint on 2026-09-27
 
@@ -31,7 +31,8 @@ The pinned Kit commit is currently not obtainable from its GitHub remote. The Ki
 - Glassbox `vp run verify:full` passed with 1482 unit tests passed and one existing live Herdr test skipped. Core checks and Web build passed.
 - Glassbox started with disposable Linux data on a separate port. An unauthenticated management request returned 401. That instance was then stopped.
 - A consistent Windows SQLite backup with schema version 11 passed `PRAGMA quick_check`. Its protected Linux copy has the same SHA256. It is a staging snapshot, not a cutover copy.
-- Linux Herdr 0.9.0, `agent-browser` 0.38.1, Chrome for Testing, `rg`, and `fd` are installed. Chrome has not yet launched because Linux libraries are missing. The pinned Linux NapCat image is downloaded and its Compose configuration parses. User level Linux Docker access and NapCat startup are not yet ready.
+- Linux Herdr 0.9.0, `agent-browser` 0.38.1, Chrome for Testing, `rg`, and `fd` are installed. A disposable Linux Herdr session started, reported its Unix socket, and stopped. Chrome opened and read a public page using three Ubuntu library packages extracted into a private user directory. Install those libraries through the Ubuntu package manager before service acceptance. The pinned Linux NapCat image is downloaded and its Compose configuration parses. User level Linux Docker access and NapCat startup are not yet ready.
+- Two copied default workspaces passed an isolated path migration rehearsal. IDs, grants, and selection were retained. The Windows runtime and its original data remained active.
 - The Windows Glassbox, NapCat, and Herdr processes remain active. Real Linux QQ and Worker acceptance have not run.
 
 ## Prepare an independent Linux checkout
@@ -45,6 +46,8 @@ The pinned Kit commit is currently not obtainable from its GitHub remote. The Ki
 For NapCat on Linux x86_64, `docs/napcat-linux.compose.yml` pins the v4.18.28 Docker image by its platform digest. Set `NAPCAT_UID`, `NAPCAT_GID`, and `NAPCAT_DATA_DIR` before using Compose. The data directory needs private `config` and `ntqq` directories. The copied OneBot WebSocket server configuration must listen on `0.0.0.0` inside the container; Compose exposes ports 6700 and 6099 only on the Linux host loopback address. Validate the Compose file with `docker-compose -f docs/napcat-linux.compose.yml config --quiet` before cutover. Do not start the Linux bot while the Windows bot is active.
 
 Do not place provider keys, QQ credentials, management tokens, or the live database in the repository. The Linux `service-launch.json` belongs in an access restricted data directory. Keep the Windows and Linux process registries separate.
+
+Regenerate `service-launch.json` and `agent-operations.json` for Linux instead of copying their Windows paths. The existing operations file contains Windows paths with forward slashes, so searching only for backslashes misses them. Use the Linux Herdr session socket and a Linux Worker workspace. Preserve historical Task and Trace records as evidence of their original Windows execution.
 
 ## Bridge and cutover
 
