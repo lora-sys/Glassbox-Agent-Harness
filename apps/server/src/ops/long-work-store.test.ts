@@ -2122,6 +2122,11 @@ it("stores checkpoint references without rewriting an earlier checkpoint", async
     await store.writeCheckpoint(laterWrite, system, 2);
     expect(await store.latestCheckpoint("task-1", "a")).toMatchObject(laterWrite);
     expect(await store.latestCheckpoint("task-1")).toMatchObject(laterWrite);
+    expect(
+      (await store.listEvents("task-1"))
+        .filter((event) => event.type === "CHECKPOINT_WRITTEN")
+        .map((event) => event.metadata?.checkpointId),
+    ).toEqual(["checkpoint-1", "checkpoint-2"]);
     await db.transaction(async (tx) => {
       expect(
         (await tx.execute("SELECT checkpoint_ref FROM tasks WHERE id = 'task-1'")).rows[0]

@@ -3086,6 +3086,7 @@ export class LongWorkStore {
         type: "CHECKPOINT_WRITTEN",
         origin,
         evidenceRef: checkpoint.sourceEvidenceRef,
+        metadata: { checkpointId: checkpoint.id },
       });
     });
   }
@@ -3096,7 +3097,11 @@ export class LongWorkStore {
       await this.requireTask(tx, taskId);
       if (stepId) await this.requireStep(tx, taskId, stepId);
       const rows = await tx.execute({
-        sql: `SELECT * FROM task_checkpoints WHERE task_id = ? ${stepId ? "AND step_id = ?" : ""} ORDER BY rowid DESC LIMIT 1`,
+        sql: `SELECT c.* FROM task_checkpoints c WHERE c.task_id = ? ${stepId ? "AND c.step_id = ?" : ""}
+          ORDER BY COALESCE((SELECT MAX(e.sequence) FROM task_events e
+            WHERE e.task_id = c.task_id AND e.type = 'CHECKPOINT_WRITTEN'
+              AND json_extract(e.metadata_json, '$.checkpointId') = c.id), -1) DESC,
+            c.rowid DESC LIMIT 1`,
         args: stepId ? [taskId, stepId] : [taskId],
       });
       const row = rows.rows[0];
