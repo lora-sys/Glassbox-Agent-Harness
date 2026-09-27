@@ -345,10 +345,13 @@ export class SocketHerdrBridge implements HerdrBridge {
   async startAgent(params: {
     workspaceId: string;
     agentKind: string;
+    agentName?: string;
     worktreePath?: string;
     branch?: string;
     workerContextFile?: string;
   }): Promise<{ paneId: string; agentName: string; runtimeEvidence?: Record<string, unknown> }> {
+    if (params.agentName && !/^glassbox-[a-z0-9-]{1,56}$/u.test(params.agentName))
+      throw new Error("Invalid stable Herdr agent identity");
     const launch =
       typeof this.options.workerLaunch === "function"
         ? await this.options.workerLaunch()
@@ -371,6 +374,21 @@ export class SocketHerdrBridge implements HerdrBridge {
         }
       : undefined;
     let snapshot = await this.getSnapshot();
+    if (params.agentName) {
+      for (const candidate of snapshot.workspaces) {
+        for (const pane of candidate.panes) {
+          if (pane.agentName !== params.agentName) continue;
+          if (
+            candidate.workspaceId !== params.workspaceId ||
+            pane.agentKind !== params.agentKind ||
+            pane.worktreePath !== params.worktreePath ||
+            pane.branch !== params.branch
+          )
+            throw new Error("Stable Herdr agent identity is bound elsewhere");
+          throw new Error("Stable Herdr agent identity already exists; reconcile before dispatch");
+        }
+      }
+    }
     let workspace = snapshot.workspaces.find(
       (candidate) => candidate.workspaceId === params.workspaceId,
     );
@@ -403,7 +421,8 @@ export class SocketHerdrBridge implements HerdrBridge {
       if (!paneId) throw new Error("Herdr tab.create did not return a root pane id");
       return { paneId };
     })();
-    const agentName = `glassbox-${params.agentKind}-${randomUUID().slice(0, 8)}`;
+    const agentName =
+      params.agentName ?? `glassbox-${params.agentKind}-${randomUUID().slice(0, 8)}`;
     // Pane-specific subscriptions do not automatically cover panes created later.
     // Attach each observer before the new Agent can receive work.
     for (const [parent, listener] of this.listeners) {

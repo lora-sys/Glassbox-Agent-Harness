@@ -86,14 +86,32 @@ export class FakeHerdrBridge implements HerdrBridge {
   async startAgent(params: {
     workspaceId: string;
     agentKind: string;
+    agentName?: string;
     worktreePath?: string;
     branch?: string;
   }): Promise<{ paneId: string; agentName: string }> {
     if (!this.connected) {
       throw new Error("HerdrBridge is disconnected");
     }
+    if (params.agentName && !/^glassbox-[a-z0-9-]{1,56}$/u.test(params.agentName))
+      throw new Error("Invalid stable Herdr agent identity");
+    if (params.agentName) {
+      for (const [workspaceId, panes] of this.workspaces) {
+        for (const pane of panes.values()) {
+          if (pane.agentName !== params.agentName) continue;
+          if (
+            workspaceId !== params.workspaceId ||
+            pane.agentKind !== params.agentKind ||
+            pane.worktreePath !== params.worktreePath ||
+            pane.branch !== params.branch
+          )
+            throw new Error("Stable Herdr agent identity is bound elsewhere");
+          throw new Error("Stable Herdr agent identity already exists; reconcile before dispatch");
+        }
+      }
+    }
     const paneId = `pane-${randomUUID().slice(0, 8)}`;
-    const agentName = `agent-${params.agentKind}-${randomUUID().slice(0, 4)}`;
+    const agentName = params.agentName ?? `agent-${params.agentKind}-${randomUUID().slice(0, 4)}`;
 
     let workspace = this.workspaces.get(params.workspaceId);
     if (!workspace) {

@@ -76,7 +76,9 @@ export class WorkspaceWriteOccupancy {
   private readonly anchor: string;
   private readonly instanceId = randomUUID();
 
-  constructor(dataRoot: string) {
+  constructor(dataRoot: string, role: "supervisor" | "participant" = "supervisor") {
+    if (role !== "supervisor" && role !== "participant")
+      throw new Error("Invalid workspace write occupancy role");
     if (!path.isAbsolute(dataRoot) || /^(?:\\\\|\/\/)/u.test(dataRoot))
       throw new Error("An absolute local data root is required");
     mkdirSync(dataRoot, { recursive: true, mode: 0o700 });
@@ -84,12 +86,15 @@ export class WorkspaceWriteOccupancy {
     this.file = path.join(root, "workspace-write-occupancy.json");
     this.anchor = path.join(root, ".workspace-write-occupancy-lock");
     closeSync(openSync(this.anchor, "a", 0o600));
-    // An earlier server may have crashed while its sandbox kept running.
-    this.change((state) => {
-      for (const entry of Object.values(state.entries)) {
-        if (entry.state !== "quarantined") entry.state = "quarantined";
-      }
-    });
+    // A supervisor restart must quarantine old ownership. A separate worker
+    // process joins the same ledger without invalidating the live supervisor.
+    if (role === "supervisor") {
+      this.change((state) => {
+        for (const entry of Object.values(state.entries)) {
+          if (entry.state !== "quarantined") entry.state = "quarantined";
+        }
+      });
+    }
   }
 
   private read(): Ledger {

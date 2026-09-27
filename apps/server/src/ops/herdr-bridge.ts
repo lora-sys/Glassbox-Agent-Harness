@@ -46,6 +46,8 @@ export interface HerdrBridge {
   startAgent(params: {
     workspaceId: string;
     agentKind: string;
+    /** Stable server-assigned identity for detecting duplicate TaskAttempt dispatch. */
+    agentName?: string;
     worktreePath?: string;
     branch?: string;
     workerContextFile?: string;

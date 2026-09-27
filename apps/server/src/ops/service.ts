@@ -219,7 +219,8 @@ export class AuthorizedOpsService {
       idempotencyKey: input.idempotencyKey,
       receivedAt: new Date().toISOString(),
     });
-    if (signal.disposition === "applied") await this.longWorkRuntime?.wake(input.taskId);
+    if (signal.disposition === "applied")
+      await this.longWorkRuntime?.wake(input.taskId).catch(() => undefined);
     return signal;
   }
 
@@ -356,6 +357,58 @@ export class AuthorizedOpsService {
     } else {
       await this.store.tasks.acceptTask(taskId, caller.principalId);
     }
+  }
+
+  async acceptStep(
+    caller: CallerContext,
+    taskId: string,
+    stepId: string,
+    expectedStepVersion: number,
+    evidence?: RunEvidence,
+  ): Promise<TaskStep> {
+    const decision = await this.authorize(caller, `task-${taskId}`, "task:accept", evidence);
+    const task = await this.store.tasks.getTask(taskId);
+    if (task?.orchestrationMode !== "durable")
+      throw new Error("Step acceptance requires a durable Task");
+    const step = await this.store.longWork.acceptDurableStep({
+      taskId,
+      stepId,
+      expectedStepVersion,
+      origin: {
+        kind: "decision",
+        decisionId: decision.id,
+        actorPrincipalId: caller.principalId,
+      },
+    });
+    await this.longWorkRuntime?.wake(taskId).catch(() => undefined);
+    return step;
+  }
+
+  async reworkStep(
+    caller: CallerContext,
+    taskId: string,
+    stepId: string,
+    expectedStepVersion: number,
+    reason: string,
+    evidence?: RunEvidence,
+  ): Promise<TaskStep> {
+    const decision = await this.authorize(caller, `task-${taskId}`, "task:rework", evidence);
+    const task = await this.store.tasks.getTask(taskId);
+    if (task?.orchestrationMode !== "durable")
+      throw new Error("Step rework requires a durable Task");
+    const step = await this.store.longWork.reworkDurableStep({
+      taskId,
+      stepId,
+      expectedStepVersion,
+      reason,
+      origin: {
+        kind: "decision",
+        decisionId: decision.id,
+        actorPrincipalId: caller.principalId,
+      },
+    });
+    await this.longWorkRuntime?.wake(taskId).catch(() => undefined);
+    return step;
   }
 
   async rework(

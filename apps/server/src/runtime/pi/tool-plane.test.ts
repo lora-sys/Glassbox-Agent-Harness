@@ -80,6 +80,10 @@ describe("P5 tool plane origins", () => {
       "task_steps",
       "task_events",
       "task_plan",
+      "task_step_accept",
+      "task_step_rework",
+      "task_signal",
+      "task_approve",
     ]) {
       const descriptor = toolDescriptor(name);
       expect(descriptor, name).toBeDefined();
@@ -216,6 +220,15 @@ describe("P5 tool plane origins", () => {
         worker_prompt: { taskId: "t1", prompt: "Do work" },
         task_accept: { taskId: "t1" },
         task_rework: { taskId: "t1", reason: "No", prompt: "Do work" },
+        task_step_accept: { taskId: "t1", stepId: "s1", expectedStepVersion: 2 },
+        task_step_rework: {
+          taskId: "t1",
+          stepId: "s1",
+          expectedStepVersion: 2,
+          reason: "Redo",
+        },
+        task_signal: { taskId: "t1", stepId: "s1", targetStepVersion: 2, type: "continue" },
+        task_approve: { taskId: "t1", stepId: "s1", targetStepVersion: 2, type: "approve" },
         task_cancel: { taskId: "t1" },
         task_steps: { taskId: "t1" },
         task_events: { taskId: "t1", afterSequence: 0 },

@@ -1,4 +1,4 @@
-import { expect, it } from "vite-plus/test";
+import { expect, it, vi } from "vite-plus/test";
 import { openDomainStore } from "../../persistence/index.js";
 import { FakeHerdrBridge } from "../../ops/fake-herdr-bridge.js";
 import { AuthorizedOpsService } from "../../ops/service.js";
@@ -67,6 +67,10 @@ it("denies an ungranted Pi delegate before starting any worker", async () => {
         "worker_prompt",
         "task_accept",
         "task_rework",
+        "task_step_accept",
+        "task_step_rework",
+        "task_signal",
+        "task_approve",
         "task_cancel",
         "task_steps",
         "task_events",
@@ -121,8 +125,32 @@ it("denies an ungranted Pi delegate before starting any worker", async () => {
         {} as never,
       ),
     ).rejects.toThrow("Permission denied: no_grant");
-    expect(tools.map((tool) => tool.name)).not.toContain("task_signal");
-    expect(tools.map((tool) => tool.name)).not.toContain("task_approve");
+    const signal = tools.find((tool) => tool.name === "task_signal")!;
+    await expect(
+      signal.execute(
+        "unauthorized-signal",
+        { taskId: "t1", stepId: "wait", targetStepVersion: 2, type: "continue" },
+        undefined,
+        undefined,
+        {} as never,
+      ),
+    ).rejects.toThrow("Permission denied: no_grant");
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: "task-t1",
+      action: "task:signal",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    await expect(
+      signal.execute(
+        "unrequested-signal",
+        { taskId: "t1", stepId: "wait", targetStepVersion: 2, type: "continue" },
+        undefined,
+        undefined,
+        {} as never,
+      ),
+    ).rejects.toThrow("mutation_not_requested");
     const grant = await store.authorization.grant({
       principalId: "owner",
       resourceId: "agent-operations",
@@ -164,6 +192,83 @@ it("denies an ungranted Pi delegate before starting any worker", async () => {
       ),
     ).rejects.toThrow("no_grant");
     expect(await store.tasks.listTasks()).toHaveLength(1);
+  } finally {
+    await store.close();
+  }
+});
+
+it("executes one explicit Step acceptance and keeps protected Step fields out of the result", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  const caller = {
+    principalId: "owner",
+    scope: {
+      connectionId: "qq",
+      botId: "bot",
+      chatType: "private" as const,
+      chatId: "owner",
+      senderId: "owner",
+    },
+  };
+  try {
+    await store.identities.bindOwner("owner", caller.scope);
+    await store.conversations.createAgent("personal");
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: "agent:personal",
+      action: "run:create",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    const accepted = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: caller.scope,
+      messageId: "step-accept-message",
+      text: "/task step-accept t1 s1 4",
+      executionRef: "pi:step-test",
+    });
+    await store.authorization.registerResource({
+      id: "task-t1",
+      kind: "task",
+      visibility: "private",
+    });
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: "task-t1",
+      action: "task:accept",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    const acceptStep = vi.fn(async () => ({
+      id: "s1",
+      status: "succeeded" as const,
+      version: 5,
+      instructions: "PROTECTED_STEP_INSTRUCTIONS",
+    }));
+    const requiredToolInput = { taskId: "t1", stepId: "s1", expectedStepVersion: 4 };
+    const tools = createOpsTools({
+      store,
+      service: { acceptStep } as unknown as AuthorizedOpsService,
+      getContext: () => ({
+        caller,
+        conversationId: accepted.conversation.id,
+        runId: accepted.run.id,
+        requiredToolName: "task_step_accept",
+        requiredToolInput,
+      }),
+      workerTarget: { workspaceId: "configured", agentKind: "test" },
+    });
+    const tool = tools.find((entry) => entry.name === "task_step_accept")!;
+    const input = { ...requiredToolInput };
+    const result = await tool.execute("accept-once", input, undefined, undefined, {} as never);
+    expect(result.content).toEqual([
+      { type: "text", text: '{"stepId":"s1","status":"succeeded","version":5}' },
+    ]);
+    expect(result.details).not.toHaveProperty("instructions");
+    expect(acceptStep).toHaveBeenCalledTimes(1);
+    await expect(
+      tool.execute("accept-twice", input, undefined, undefined, {} as never),
+    ).rejects.toThrow("mutation_already_attempted");
+    expect(acceptStep).toHaveBeenCalledTimes(1);
   } finally {
     await store.close();
   }

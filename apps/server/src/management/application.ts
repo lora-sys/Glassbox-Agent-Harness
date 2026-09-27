@@ -152,6 +152,7 @@ import {
   type WorkerPolicy,
 } from "../ops/service.js";
 import { OpsReconciler } from "../ops/reconciler.js";
+import { DurableWorkerObserver } from "../ops/durable-worker-observer.js";
 import { readLongWorkHealth } from "../ops/long-work-health.js";
 import { TemporalLongWorkCoordinator } from "../ops/temporal/coordinator.js";
 import { connectLongWorkWorkflowClient } from "../ops/temporal/client.js";
@@ -659,7 +660,12 @@ export class ManagementApplication {
       await store.conversations.createAgent(AGENT_ID);
       if (options.ops) {
         await options.ops.bridge.connect();
-        application.opsReconciler = new OpsReconciler(store.tasks, options.ops.bridge);
+        application.opsReconciler = new OpsReconciler(
+          store.tasks,
+          options.ops.bridge,
+          1_000,
+          new DurableWorkerObserver(store.db, store.longWork, store.tasks),
+        );
         await application.opsReconciler.start();
       }
       // Restore transport before durable queue dispatch. Incoming events wait for that same gate.

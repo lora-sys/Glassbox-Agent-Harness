@@ -2,7 +2,11 @@ import { Type } from "typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { DomainStore } from "../../persistence/index.js";
 import type { AuthorizedOpsService } from "../../ops/service.js";
-import { createProtectedTool, type ProtectedToolContext } from "./protected-tools.js";
+import {
+  consumeMutationIntent,
+  createProtectedTool,
+  type ProtectedToolContext,
+} from "./protected-tools.js";
 import type { PiRunContext } from "./types.js";
 
 export interface WorkerTarget {
@@ -23,6 +27,10 @@ export const OPS_TOOL_NAMES = Object.freeze([
   "worker_prompt",
   "task_accept",
   "task_rework",
+  "task_step_accept",
+  "task_step_rework",
+  "task_signal",
+  "task_approve",
   "task_cancel",
   "task_steps",
   "task_events",
@@ -39,7 +47,13 @@ export function createOpsTools(options: {
   const getContext = (): ProtectedToolContext | undefined => {
     const value = options.getContext();
     return value?.caller && value.conversationId && value.runId
-      ? { caller: value.caller, conversationId: value.conversationId, runId: value.runId }
+      ? {
+          caller: value.caller,
+          conversationId: value.conversationId,
+          runId: value.runId,
+          requiredToolName: value.requiredToolName,
+          requiredToolInput: value.requiredToolInput,
+        }
       : undefined;
   };
   const common = { authService: options.store.authorization, getContext };
@@ -205,6 +219,106 @@ export function createOpsTools(options: {
       execute: async (params, context) =>
         options.service.rework(context.caller, params.taskId, params.reason, params.prompt),
     }),
+    createProtectedTool<{ taskId: string; stepId: string; expectedStepVersion: number }>({
+      ...common,
+      name: "task_step_accept",
+      description: "Accept one reviewed durable Step. Task acceptance remains separate.",
+      parameters: Type.Object(
+        { taskId, stepId, expectedStepVersion: Type.Integer({ minimum: 1 }) },
+        { additionalProperties: false },
+      ),
+      action: "task:accept",
+      resourceId: (params) => `task-${params.taskId}`,
+      execute: async (params, context) => {
+        consumeMutationIntent(context, "task_step_accept", params);
+        const step = await options.service.acceptStep(
+          context.caller,
+          params.taskId,
+          params.stepId,
+          params.expectedStepVersion,
+          { runId: context.runId },
+        );
+        return { stepId: step.id, status: step.status, version: step.version };
+      },
+    }),
+    createProtectedTool<{
+      taskId: string;
+      stepId: string;
+      expectedStepVersion: number;
+      reason: string;
+    }>({
+      ...common,
+      name: "task_step_rework",
+      description: "Request a fresh attempt for one reviewed durable Step.",
+      parameters: Type.Object(
+        {
+          taskId,
+          stepId,
+          expectedStepVersion: Type.Integer({ minimum: 1 }),
+          reason: Type.String({ minLength: 1, maxLength: 512 }),
+        },
+        { additionalProperties: false },
+      ),
+      action: "task:rework",
+      resourceId: (params) => `task-${params.taskId}`,
+      execute: async (params, context) => {
+        consumeMutationIntent(context, "task_step_rework", params);
+        const step = await options.service.reworkStep(
+          context.caller,
+          params.taskId,
+          params.stepId,
+          params.expectedStepVersion,
+          params.reason,
+          { runId: context.runId },
+        );
+        return { stepId: step.id, status: step.status, version: step.version };
+      },
+    }),
+    ...([false, true] as const).map((approval) =>
+      createProtectedTool<{
+        taskId: string;
+        stepId: string;
+        targetStepVersion: number;
+        type: string;
+      }>({
+        ...common,
+        name: approval ? "task_approve" : "task_signal",
+        description: approval
+          ? "Approve a currently waiting durable Step with the caller's current authority."
+          : "Send a named signal to a currently waiting durable Step.",
+        parameters: Type.Object(
+          {
+            taskId,
+            stepId,
+            targetStepVersion: Type.Integer({ minimum: 1 }),
+            type: Type.String({
+              minLength: 1,
+              maxLength: 128,
+              pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:-]*$",
+            }),
+          },
+          { additionalProperties: false },
+        ),
+        action: approval ? "task:approve" : "task:signal",
+        resourceId: (params) => `task-${params.taskId}`,
+        execute: async (params, context) => {
+          consumeMutationIntent(context, approval ? "task_approve" : "task_signal", params);
+          const signal = await options.service.signal(
+            context.caller,
+            {
+              taskId: params.taskId,
+              stepId: params.stepId,
+              targetStepVersion: params.targetStepVersion,
+              type: params.type,
+              approval,
+              idempotencyKey: `${context.runId}:${approval ? "approval" : "signal"}:${params.stepId}:${params.targetStepVersion}:${params.type}`,
+            },
+            { runId: context.runId },
+          );
+          return { stepId: signal.stepId, disposition: signal.disposition };
+        },
+      }),
+    ),
     createProtectedTool<{ taskId: string }>({
       ...common,
       name: "task_cancel",

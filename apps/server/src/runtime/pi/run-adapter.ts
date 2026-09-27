@@ -165,6 +165,54 @@ function ownerTaskDelegationRequest(text: string): RequiredToolCall | undefined 
   return { name: "task_delegate", input: title ? { title } : {} };
 }
 
+/** Exact Owner commands bind durable mutations to this message's Task, Step and version. */
+export function ownerDurableTaskCommand(text: string): RequiredToolCall | undefined {
+  const command = text.trim();
+  const identifier = "([A-Za-z0-9][A-Za-z0-9._:-]{0,127})";
+  const version = "([1-9]\\d{0,8})";
+  const signal = new RegExp(
+    `^/task (signal|approve) ${identifier} ${identifier} ${version} ${identifier}$`,
+    "u",
+  ).exec(command);
+  if (signal)
+    return {
+      name: signal[1] === "approve" ? "task_approve" : "task_signal",
+      input: {
+        taskId: signal[2],
+        stepId: signal[3],
+        targetStepVersion: Number(signal[4]),
+        type: signal[5],
+      },
+    };
+  const accept = new RegExp(`^/task step-accept ${identifier} ${identifier} ${version}$`, "u").exec(
+    command,
+  );
+  if (accept)
+    return {
+      name: "task_step_accept",
+      input: {
+        taskId: accept[1],
+        stepId: accept[2],
+        expectedStepVersion: Number(accept[3]),
+      },
+    };
+  const rework = new RegExp(
+    `^/task step-rework ${identifier} ${identifier} ${version} (.{1,512})$`,
+    "u",
+  ).exec(command);
+  if (rework)
+    return {
+      name: "task_step_rework",
+      input: {
+        taskId: rework[1],
+        stepId: rework[2],
+        expectedStepVersion: Number(rework[3]),
+        reason: rework[4],
+      },
+    };
+  return undefined;
+}
+
 /** The provider parameters the current message pins down, or `undefined` when it pins none. */
 type RequiredMutationParams = Record<string, string | number | boolean> | undefined;
 
@@ -567,6 +615,8 @@ function requiredToolCall(
   // outside a private Owner Run, whatever else a message may name.
   if (input.caller.scope.chatType !== "private" || !isOwner) return undefined;
   const rawText = input.text;
+  const durableCommand = ownerDurableTaskCommand(rawText);
+  if (durableCommand) return durableCommand;
   const mediaRequest = requestClauses(rawText);
   if (
     /(?:生成|画|制作|创作|编辑|修改|合成|改图)/u.test(mediaRequest) &&

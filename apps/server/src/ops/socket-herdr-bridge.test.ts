@@ -7,6 +7,56 @@ import { expect, it } from "vite-plus/test";
 import { SocketHerdrBridge } from "./socket-herdr-bridge.js";
 import type { HerdrEvent } from "./herdr-bridge.js";
 
+it("refuses to redispatch a named Herdr Worker without creating another pane", async () => {
+  const endpoint =
+    process.platform === "win32"
+      ? `\\\\.\\pipe\\glassbox-test-${randomUUID()}`
+      : join(tmpdir(), `herdr-${randomUUID()}.sock`);
+  const sockets = new Set<net.Socket>();
+  const methods: string[] = [];
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    let buffer = "";
+    socket.on("data", (chunk) => {
+      buffer += chunk.toString();
+      if (!buffer.includes("\n")) return;
+      const request = JSON.parse(buffer.slice(0, buffer.indexOf("\n")));
+      methods.push(request.method);
+      const result = {
+        workspaces: [{ workspace_id: "w" }],
+        panes: [{ workspace_id: "w", pane_id: "existing", agent: "pi" }],
+        agents: [{ pane_id: "existing", name: "glassbox-attempt-one" }],
+      };
+      socket.write(JSON.stringify({ id: request.id, result }) + "\n");
+    });
+  });
+  server.listen(endpoint);
+  await once(server, "listening");
+  const bridge = new SocketHerdrBridge({
+    socketPath: endpoint,
+    sessionId: "s",
+    workerLaunch: { kind: "pi", args: [], env: {}, runtimeEvidence: {} },
+  });
+  const binding = {
+    workspaceId: "w",
+    agentKind: "pi",
+    agentName: "glassbox-attempt-one",
+    workerContextFile: join(tmpdir(), "context.json"),
+  };
+  try {
+    await expect(bridge.startAgent(binding)).rejects.toThrow("already exists");
+    await expect(bridge.startAgent({ ...binding, workspaceId: "other" })).rejects.toThrow(
+      "bound elsewhere",
+    );
+    expect(methods).toEqual(["session.snapshot", "session.snapshot"]);
+  } finally {
+    await bridge.disconnect();
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
 it("rejects a replaced worker before reading output or sending input", async () => {
   const endpoint =
     process.platform === "win32"

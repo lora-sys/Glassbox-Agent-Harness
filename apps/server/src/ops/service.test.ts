@@ -211,6 +211,140 @@ it("authorizes durable graph planning and step reads on the exact Task", async (
   }
 });
 
+it("authorizes durable Step acceptance and rework at the service boundary", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  const caller: CallerContext = {
+    principalId: "owner",
+    scope: {
+      connectionId: "test",
+      botId: "bot",
+      chatType: "private",
+      chatId: "owner",
+      senderId: "owner",
+    },
+  };
+  try {
+    await store.identities.bindOwner("owner", caller.scope);
+    const task = await store.tasks.createTask({
+      title: "Review individual worker Steps",
+      creatorPrincipalId: "owner",
+      authorizationScope: caller.scope,
+    });
+    const grant = async (action: string) =>
+      store.authorization.grant({
+        principalId: "owner",
+        resourceId: `task-${task.id}`,
+        action,
+        scope: caller.scope,
+        effect: "allow",
+      });
+    await grant("task:plan");
+    await grant("task:continue");
+    const runtimeAvailable = vi.fn(() => true);
+    const runtime = {
+      available: runtimeAvailable,
+      start: vi.fn(async () => undefined),
+      wake: vi.fn(async () => undefined),
+    };
+    const service = new AuthorizedOpsService(store, new FakeHerdrBridge(), undefined, runtime);
+    const makeStep = (id: string) => ({
+      id,
+      taskId: task.id,
+      kind: "herdr_worker" as const,
+      title: id,
+      status: "pending" as const,
+      dependencyIds: [],
+      dependencyPolicy: {
+        failed: "block" as const,
+        cancelled: "cancel" as const,
+        skipped: "skip" as const,
+      },
+      maxAttempts: 3,
+      requiredCapabilities: [],
+      delegatedPermissionSet: [],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      version: 1,
+    });
+    await service.planExistingTask(
+      caller,
+      task.id,
+      [makeStep("accept-step"), makeStep("redo-step")],
+      "accept-step",
+    );
+    const continueDecision = await store.authorization.check({
+      caller,
+      resourceId: `task-${task.id}`,
+      action: "task:continue",
+    });
+
+    for (const stepId of ["accept-step", "redo-step"]) {
+      await store.longWork.transitionStep({
+        taskId: task.id,
+        stepId,
+        expectedVersion: 1,
+        from: "pending",
+        to: "ready",
+        origin: { kind: "system", reason: "test ready" },
+      });
+      const claim = await store.longWork.claimReadyStep({
+        taskId: task.id,
+        stepId,
+        expectedStepVersion: 2,
+        attemptId: `${stepId}-attempt`,
+        leaseId: `${stepId}-lease`,
+        ownerInstanceId: "service-test",
+        leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+        origin: {
+          kind: "decision",
+          decisionId: continueDecision.id,
+          actorPrincipalId: "owner",
+        },
+      });
+      await store.longWork.settleClaimedStep({
+        taskId: task.id,
+        stepId,
+        attemptId: claim.attempt.id,
+        leaseId: claim.lease.id,
+        ownerInstanceId: "service-test",
+        expectedStepVersion: claim.step.version,
+        expectedLeaseVersion: claim.lease.version,
+        outcome: "review",
+        evidenceRef: `trace:${stepId}`,
+        origin: { kind: "system", reason: "test settlement" },
+      });
+    }
+
+    await expect(service.acceptStep(caller, task.id, "accept-step", 4)).rejects.toBeInstanceOf(
+      AccessDeniedError,
+    );
+    await grant("task:accept");
+    runtimeAvailable.mockReturnValue(false);
+    runtime.wake.mockRejectedValueOnce(new Error("workflow backend unavailable"));
+    const accepted = await service.acceptStep(caller, task.id, "accept-step", 4);
+    expect(accepted).toMatchObject({ status: "succeeded", version: 5 });
+    await expect(
+      service.reworkStep(caller, task.id, "redo-step", 4, "Add the missing case"),
+    ).rejects.toBeInstanceOf(AccessDeniedError);
+    await grant("task:rework");
+    const reworked = await service.reworkStep(
+      caller,
+      task.id,
+      "redo-step",
+      4,
+      "Add the missing case",
+    );
+    expect(reworked).toMatchObject({ status: "ready", version: 5 });
+    expect(runtime.wake).toHaveBeenCalledTimes(2);
+    expect((await store.tasks.getAttempt("redo-step-attempt"))?.status).toBe("review");
+    expect((await store.longWork.listEvents(task.id)).map((event) => event.evidenceRef)).toContain(
+      "trace:redo-step",
+    );
+  } finally {
+    await store.close();
+  }
+});
+
 it("rechecks Worker source authority before reading terminal output", async () => {
   const store = await openDomainStore({ databasePath: ":memory:" });
   const caller: CallerContext = {

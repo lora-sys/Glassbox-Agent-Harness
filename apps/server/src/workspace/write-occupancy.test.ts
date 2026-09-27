@@ -84,6 +84,22 @@ describe("WorkspaceWriteOccupancy", () => {
     expect(manager.acquire(first).leaseId).toBe(lease.leaseId);
   });
 
+  it("lets a worker participant join without quarantining the live supervisor", async () => {
+    const { root, manager } = fixture();
+    const supervisorLease = manager.acquire(first);
+    const worker = new WorkspaceWriteOccupancy(root, "participant");
+    expect(worker.status(first.workspaceId)).toBe("active");
+    expect(() => worker.acquire(first)).toThrow(WorkspaceWriteBusyError);
+    await expect(worker.closeAndRelease(supervisorLease, async () => undefined)).rejects.toThrow(
+      WorkspaceWriteBusyError,
+    );
+    const workerLease = worker.acquire({ ...first, workspaceId: "worker-only" });
+    expect(manager.status("worker-only")).toBe("active");
+    await worker.closeAndRelease(workerLease, async () => undefined);
+    expect(manager.status("worker-only")).toBe("free");
+    expect(manager.status(first.workspaceId)).toBe("active");
+  });
+
   it("restarts into quarantine until a positive stop check releases the old writer", async () => {
     const { root, manager } = fixture();
     const old = manager.acquire(first);

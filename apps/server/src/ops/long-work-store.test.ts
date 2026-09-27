@@ -95,6 +95,51 @@ async function succeedStep(store: LongWorkStore, stepId: string, version = 1): P
   });
 }
 
+async function settleWorkerStep(
+  store: LongWorkStore,
+  outcome: "review" | "unknown" = "review",
+  maxAttempts = 3,
+): Promise<TaskStep> {
+  await store.createGraph(
+    "task-1",
+    [{ ...step("worker", [], "herdr_worker"), maxAttempts }],
+    "worker",
+    limits,
+    system,
+  );
+  await store.transitionStep({
+    taskId: "task-1",
+    stepId: "worker",
+    expectedVersion: 1,
+    from: "pending",
+    to: "ready",
+    origin: system,
+  });
+  await store.claimReadyStep({
+    taskId: "task-1",
+    stepId: "worker",
+    expectedStepVersion: 2,
+    attemptId: "worker-attempt",
+    leaseId: "worker-lease",
+    ownerInstanceId: "executor-1",
+    leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+    origin: claimOrigin,
+  });
+  return store.settleClaimedStep({
+    taskId: "task-1",
+    stepId: "worker",
+    attemptId: "worker-attempt",
+    leaseId: "worker-lease",
+    ownerInstanceId: "executor-1",
+    expectedStepVersion: 3,
+    expectedLeaseVersion: 1,
+    outcome,
+    evidenceRef: outcome === "unknown" ? "trace:worker-lost" : "trace:worker-result",
+    outputRef: outcome === "review" ? "artifact:worker-result" : undefined,
+    origin: system,
+  });
+}
+
 async function addAcceptDecision(
   db: DomainDatabase,
   overrides: { id?: string; principal?: string; action?: string; scope?: string } = {},
@@ -114,6 +159,49 @@ async function addAcceptDecision(
     });
   });
   return id;
+}
+
+async function addStepDecision(
+  db: DomainDatabase,
+  action: "task:accept" | "task:rework",
+  id: string,
+  overrides: { principal?: string; resource?: string; scope?: string; revoked?: boolean } = {},
+): Promise<void> {
+  const grantId = `${id}-grant`;
+  await db.transaction(async (tx) => {
+    await tx.execute({
+      sql: "INSERT OR IGNORE INTO principals(id,kind,created_at) VALUES (?,'owner',?)",
+      args: [overrides.principal ?? "owner", now],
+    });
+    await tx.execute({
+      sql: "INSERT OR IGNORE INTO resources(id,kind,visibility,owner_id) VALUES (?,'task','private','owner')",
+      args: [overrides.resource ?? "task-task-1"],
+    });
+    await tx.execute({
+      sql: "INSERT INTO grants(id,principal_id,resource_id,action,scope_key,effect,created_at,revoked_at) VALUES (?,?,?,?,?,'allow',?,?)",
+      args: [
+        grantId,
+        overrides.principal ?? "owner",
+        overrides.resource ?? "task-task-1",
+        action,
+        overrides.scope ?? "test",
+        now,
+        overrides.revoked ? now : null,
+      ],
+    });
+    await tx.execute({
+      sql: "INSERT INTO authorization_decisions(id,principal_id,resource_id,action,scope_key,decision,reason,grant_id,created_at) VALUES (?,?,?,?,?,'ALLOW','test',?,?)",
+      args: [
+        id,
+        overrides.principal ?? "owner",
+        overrides.resource ?? "task-task-1",
+        action,
+        overrides.scope ?? "test",
+        grantId,
+        now,
+      ],
+    });
+  });
 }
 
 async function addCancelDecision(
@@ -2197,6 +2285,266 @@ it("settles a claimed worker Step into review without accepting the Task", async
         origin: system,
       }),
     ).rejects.toThrow("Step settlement conflict");
+  } finally {
+    await db.close();
+  }
+});
+
+it("accepts a reviewed durable Step with a current matching grant and keeps Task acceptance separate", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    const store = await fixture(db);
+    await settleWorkerStep(store);
+    for (const [action, id, overrides] of [
+      ["task:rework", "accept-wrong-action", {}],
+      ["task:accept", "accept-wrong-scope", { scope: "other" }],
+      ["task:accept", "accept-wrong-principal", { principal: "other" }],
+      ["task:accept", "accept-revoked", { revoked: true }],
+    ] as const) {
+      await addStepDecision(db, action, id, overrides);
+      await expect(
+        store.acceptDurableStep({
+          taskId: "task-1",
+          stepId: "worker",
+          expectedStepVersion: 4,
+          origin: { kind: "decision", decisionId: id, actorPrincipalId: "owner" },
+        }),
+      ).rejects.toThrow("Matching Step acceptance ALLOW decision is required");
+    }
+
+    await addStepDecision(db, "task:accept", "accept-step");
+    const step = await store.acceptDurableStep({
+      taskId: "task-1",
+      stepId: "worker",
+      expectedStepVersion: 4,
+      origin: {
+        kind: "decision",
+        decisionId: "accept-step",
+        actorPrincipalId: "owner",
+      },
+    });
+    expect(step).toMatchObject({
+      status: "succeeded",
+      version: 5,
+      outputRef: "artifact:worker-result",
+    });
+    expect((await store.listEvents("task-1")).map((event) => event.evidenceRef)).toContain(
+      "trace:worker-result",
+    );
+    await db.transaction(async (tx) => {
+      expect(
+        (await tx.execute("SELECT status FROM task_attempts WHERE id = 'worker-attempt'")).rows[0]
+          ?.status,
+      ).toBe("succeeded");
+      expect(
+        (await tx.execute("SELECT status FROM tasks WHERE id = 'task-1'")).rows[0]?.status,
+      ).toBe("NEW");
+    });
+    await expect(
+      store.acceptDurableStep({
+        taskId: "task-1",
+        stepId: "worker",
+        expectedStepVersion: 4,
+        origin: { kind: "decision", decisionId: "accept-step", actorPrincipalId: "owner" },
+      }),
+    ).rejects.toThrow("Step acceptance conflict");
+  } finally {
+    await db.close();
+  }
+});
+
+it("reworks a reviewed durable Step without replacing attempt or evidence and rejects unknown outcomes", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    const store = await fixture(db);
+    await settleWorkerStep(store, "review", 1);
+    await addStepDecision(db, "task:rework", "rework-wrong-scope", { scope: "other" });
+    await expect(
+      store.reworkDurableStep({
+        taskId: "task-1",
+        stepId: "worker",
+        expectedStepVersion: 4,
+        reason: "Add the missing validation",
+        origin: {
+          kind: "decision",
+          decisionId: "rework-wrong-scope",
+          actorPrincipalId: "owner",
+        },
+      }),
+    ).rejects.toThrow("Matching Step rework ALLOW decision is required");
+
+    await addStepDecision(db, "task:rework", "rework-step");
+    const ready = await store.reworkDurableStep({
+      taskId: "task-1",
+      stepId: "worker",
+      expectedStepVersion: 4,
+      reason: "Add the missing validation",
+      origin: {
+        kind: "decision",
+        decisionId: "rework-step",
+        actorPrincipalId: "owner",
+      },
+    });
+    expect(ready).toMatchObject({ status: "ready", version: 5, outputRef: undefined });
+    expect((await store.listEvents("task-1")).map((event) => event.evidenceRef)).toContain(
+      "trace:worker-result",
+    );
+    expect((await store.listEvents("task-1")).at(-1)).toMatchObject({
+      type: "TASK_REWORK",
+      attemptId: "worker-attempt",
+      metadata: { priorAttemptPreserved: true, status: "ready" },
+    });
+    expect(JSON.stringify((await store.listEvents("task-1")).at(-1)?.metadata)).not.toContain(
+      "Add the missing validation",
+    );
+    await db.transaction(async (tx) => {
+      expect(
+        (
+          await tx.execute(
+            "SELECT id,status,rework_reason FROM task_attempts WHERE step_id = 'worker'",
+          )
+        ).rows,
+      ).toEqual([
+        expect.objectContaining({
+          id: "worker-attempt",
+          status: "review",
+          rework_reason: "Add the missing validation",
+        }),
+      ]);
+    });
+    const nextClaim = await store.claimReadyStep({
+      taskId: "task-1",
+      stepId: "worker",
+      expectedStepVersion: ready.version,
+      attemptId: "worker-attempt-2",
+      leaseId: "worker-lease-2",
+      ownerInstanceId: "executor-1",
+      leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+      origin: claimOrigin,
+    });
+    expect(nextClaim).toMatchObject({
+      step: { status: "running", version: 6 },
+      attempt: { id: "worker-attempt-2", attemptNumber: 3, status: "running" },
+      lease: { id: "worker-lease-2", state: "active" },
+    });
+    await db.transaction(async (tx) => {
+      expect(
+        (await tx.execute("SELECT rework_reason FROM task_attempts WHERE id = 'worker-attempt-2'"))
+          .rows[0]?.rework_reason,
+      ).toBe("Add the missing validation");
+      await tx.execute(
+        "UPDATE task_step_leases SET state = 'released' WHERE id = 'worker-lease-2'",
+      );
+      await tx.execute("UPDATE task_steps SET status = 'ready', version = 7 WHERE id = 'worker'");
+    });
+    await expect(
+      store.claimReadyStep({
+        taskId: "task-1",
+        stepId: "worker",
+        expectedStepVersion: 7,
+        attemptId: "worker-attempt-3",
+        leaseId: "worker-lease-3",
+        ownerInstanceId: "executor-1",
+        leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+        origin: claimOrigin,
+      }),
+    ).rejects.toThrow("Step attempt limit reached");
+  } finally {
+    await db.close();
+  }
+});
+
+it("does not rework an unknown Step outcome while its lease is quarantined", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    const store = await fixture(db);
+    await settleWorkerStep(store, "unknown", 3);
+    await addStepDecision(db, "task:rework", "rework-unknown");
+    await expect(
+      store.reworkDurableStep({
+        taskId: "task-1",
+        stepId: "worker",
+        expectedStepVersion: 4,
+        reason: "Retry it",
+        origin: {
+          kind: "decision",
+          decisionId: "rework-unknown",
+          actorPrincipalId: "owner",
+        },
+      }),
+    ).rejects.toThrow("Step rework conflict");
+    expect((await store.listSteps("task-1"))[0]).toMatchObject({ status: "blocked", version: 4 });
+    expect(await store.getActiveLease("task-1", "worker")).toBeNull();
+    await db.transaction(async (tx) => {
+      expect(
+        (await tx.execute("SELECT state FROM task_step_leases WHERE id = 'worker-lease'")).rows[0],
+      ).toMatchObject({ state: "quarantined" });
+      expect(
+        (await tx.execute("SELECT status FROM task_attempts WHERE id = 'worker-attempt'")).rows[0],
+      ).toMatchObject({ status: "waiting_input" });
+    });
+  } finally {
+    await db.close();
+  }
+});
+
+it("resets the full Step retry budget after rework even when the prior cycle used every attempt", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    const store = await fixture(db);
+    await store.createGraph(
+      "task-1",
+      [{ ...step("worker", [], "herdr_worker"), maxAttempts: 3 }],
+      "worker",
+      limits,
+      system,
+    );
+    await db.transaction(async (tx) => {
+      await tx.execute({
+        sql: "UPDATE task_steps SET status = 'review', version = 4 WHERE id = 'worker'",
+      });
+      for (const [id, number, status] of [
+        ["prior-attempt-1", 2, "failed"],
+        ["prior-attempt-2", 3, "failed"],
+        ["prior-attempt-3", 4, "review"],
+      ] as const) {
+        await tx.execute({
+          sql: "INSERT INTO task_attempts(id,task_id,step_id,attempt_number,status,started_at,completed_at) VALUES (?,'task-1','worker',?,?,?,?)",
+          args: [id, number, status, now, now],
+        });
+      }
+    });
+    await addStepDecision(db, "task:rework", "rework-full-budget");
+    const ready = await store.reworkDurableStep({
+      taskId: "task-1",
+      stepId: "worker",
+      expectedStepVersion: 4,
+      reason: "Start a new reviewed cycle",
+      origin: {
+        kind: "decision",
+        decisionId: "rework-full-budget",
+        actorPrincipalId: "owner",
+      },
+    });
+    const claim = await store.claimReadyStep({
+      taskId: "task-1",
+      stepId: "worker",
+      expectedStepVersion: ready.version,
+      attemptId: "new-cycle-attempt",
+      leaseId: "new-cycle-lease",
+      ownerInstanceId: "executor-1",
+      leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+      origin: claimOrigin,
+    });
+    expect(claim.attempt).toMatchObject({
+      id: "new-cycle-attempt",
+      attemptNumber: 5,
+      status: "running",
+    });
+    expect((await store.listEvents("task-1")).at(-1)).toMatchObject({
+      type: "STEP_STARTED",
+      attemptId: "new-cycle-attempt",
+    });
   } finally {
     await db.close();
   }
