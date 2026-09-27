@@ -1,0 +1,15 @@
+[Unit]
+Description=Glassbox Herdr worker host for %i
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/home/%i/workspaces/glassbox-worker
+Environment=HOME=/home/%i
+Environment=PATH=/home/%i/.local/opt/node-v24.21.0-linux-x64/bin:/home/%i/.local/bin:/home/%i/src/lora-pi-kit/node_modules/.bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/%i/.local/bin/herdr --session glassbox-p3 server
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

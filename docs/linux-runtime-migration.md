@@ -4,7 +4,7 @@ Issue: #30. This runbook records the migration from the existing Windows service
 
 ## Availability limit
 
-WSL runs on the Windows host. A Windows sleep, shutdown, or reboot interrupts the WSL services. Linux `systemd` can restart services when the distribution starts, but a `systemd` service does not keep the WSL distribution alive. Continuous service during host downtime requires an independent Linux host.
+WSL runs on the Windows host. A Windows sleep, shutdown, or reboot interrupts the WSL services. Linux `systemd` can restart services when the distribution starts, but a `systemd` service does not keep the WSL distribution alive. On this host, the Windows scheduled task `Glassbox-WSL-Keepalive` starts `wsl.exe -d Ubuntu -u yanbingzhao -- /usr/bin/sleep infinity` at user logon. Check that task after a Windows login. Continuous service during host downtime requires an independent Linux host.
 
 ## Frozen baseline
 
@@ -16,13 +16,13 @@ Record actual versions and results again immediately before cutover. Do not infe
 | Node.js | 24.21.0 Linux x64 |
 | npm | 12.0.2 |
 | Pi | 0.85.1, loaded through the pinned Kit |
-| Lora PI Kit | Commit `513063950dc0d9dcd4835d6fcc79814728e98b35` |
+| Lora PI Kit | Commit `5375a595e0521923ea87f4bbad08ce8732d4bd64` |
 | NapCat | v4.18.28, identified by the SHA256 of the installed `napcat.mjs` and the official release asset |
 | Herdr | 0.9.0 Linux x86_64 |
 | agent-browser | 0.38.1 |
-| Linux browser | Chrome for Testing 154.0.8037.57, pending launch smoke |
+| Linux browser | Chrome for Testing 154.0.8037.57 |
 
-The pinned Kit commit is currently not obtainable from its GitHub remote. The Kit lock also contains `registry.npmmirror.com` URLs, so npm 12 requires that registry for `npm ci`. Publish the exact Kit commit or replace the pin with a reviewed reachable commit before claiming a clean Linux rebuild. The configured sandbox image ID must also be present and checked against the Kit checkout's `locks/sandbox-image.json` before a sandbox smoke.
+The pinned Kit commit is reachable from `origin/codex/issue-30-linux-kit`. The Kit lock also contains `registry.npmmirror.com` URLs, so npm 12 requires that registry for `npm ci`. The configured sandbox image ID must be built for the target Docker host and checked against the Kit checkout's `locks/sandbox-image.json` before a sandbox smoke.
 
 ## WSL checkpoint on 2026-09-27
 
@@ -31,9 +31,10 @@ The pinned Kit commit is currently not obtainable from its GitHub remote. The Ki
 - Glassbox `vp run verify:full` passed with 1482 unit tests passed and one existing live Herdr test skipped. Core checks and Web build passed.
 - Glassbox started with disposable Linux data on a separate port. An unauthenticated management request returned 401. That instance was then stopped.
 - A consistent Windows SQLite backup with schema version 11 passed `PRAGMA quick_check`. Its protected Linux copy has the same SHA256. It is a staging snapshot, not a cutover copy.
-- Linux Herdr 0.9.0, `agent-browser` 0.38.1, Chrome for Testing, `rg`, and `fd` are installed. A disposable Linux Herdr session started, reported its Unix socket, and stopped. Chrome opened and read a public page using three Ubuntu library packages extracted into a private user directory. Install those libraries through the Ubuntu package manager before service acceptance. The pinned Linux NapCat image is downloaded and its Compose configuration parses. User level Linux Docker access and NapCat startup are not yet ready.
+- Linux Herdr 0.9.0, `agent-browser` 0.38.1, Chrome for Testing, `rg`, and `fd` are installed. Chrome opened and read a public page. Ubuntu browser libraries are installed through apt. The pinned Linux NapCat image is in the Linux Docker daemon, and its Compose configuration parses. Linux NapCat remains stopped until QQ cutover.
 - Two copied default workspaces passed an isolated path migration rehearsal. IDs, grants, and selection were retained. The Windows runtime and its original data remained active.
-- Ubuntu now has a Linux Docker daemon. The v4.18.28 NapCat image was pulled into it by its platform digest. Kit sandbox image `sha256:23c20ebaeaf891f17c77a519af7f657ce869596b0144f537c62ca4c5ed858af2` was built in WSL and passed the real sandbox smoke. Kit commit `5375a595e0521923ea87f4bbad08ce8732d4bd64` records that image and the Linux smoke correction. Publish that commit before treating this as a clean rebuild path.
+- Ubuntu now has a Linux Docker daemon. The v4.18.28 NapCat image was pulled into it by its platform digest. Kit sandbox image `sha256:23c20ebaeaf891f17c77a519af7f657ce869596b0144f537c62ca4c5ed858af2` was built in WSL and passed the real sandbox smoke. Kit commit `5375a595e0521923ea87f4bbad08ce8732d4bd64` records that image and the Linux smoke correction and is pushed to its remote branch.
+- Linux Herdr has a durable session, socket, and Worker workspace. It and Docker recovered after an intentional WSL termination. WSL startup removed the user D-Bus socket, so this installation uses the system-level service templates in `deploy/linux/system` for service control.
 - The Windows Glassbox, NapCat, and Herdr processes remain active. Real Linux QQ and Worker acceptance have not run.
 
 ## Prepare an independent Linux checkout
@@ -50,7 +51,7 @@ Do not place provider keys, QQ credentials, management tokens, or the live datab
 
 Regenerate `service-launch.json` and `agent-operations.json` for Linux instead of copying their Windows paths. The existing operations file contains Windows paths with forward slashes, so searching only for backslashes misses them. Use the Linux Herdr session socket and a Linux Worker workspace. Preserve historical Task and Trace records as evidence of their original Windows execution.
 
-The WSL installation uses the user units in `deploy/linux`. Place them in `~/.config/systemd/user`, enable lingering for the Linux account, and enable the Herdr, NapCat, and Glassbox units only at their corresponding cutover steps. The service account's `~/.config/glassbox/runtime.env` and `napcat.env` must be mode 600. The Herdr Worker agent directory needs its own copied Pi model credentials and `herdr integration install pi` with `PI_CODING_AGENT_DIR` pointing at that directory. Confirm the Herdr workspace ID and Unix socket before writing `agent-operations.json`. The Glassbox unit starts the server directly; do not also run `agent:up` against the Linux data directory.
+This WSL installation uses the system-level template units in `deploy/linux/system`. They assume the service account has a `/home/<user>` home directory and the checkout locations shown in the unit files. Install them under `/etc/systemd/system`, then use instances such as `glassbox-herdr@yanbingzhao.service`. Enable the Herdr, NapCat, and Glassbox instances only at their corresponding cutover steps. Do not also enable the older user-level units in `deploy/linux`. The service account's `~/.config/glassbox/runtime.env` and `napcat.env` must be mode 600. The Herdr Worker agent directory needs its own copied Pi model credentials and `herdr integration install pi` with `PI_CODING_AGENT_DIR` pointing at that directory. Confirm the Herdr workspace ID and Unix socket before writing `agent-operations.json`. The Glassbox unit starts the server directly; do not also run `agent:up` against the Linux data directory.
 
 ## Bridge and cutover
 
