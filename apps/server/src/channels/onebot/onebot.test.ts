@@ -1,4 +1,5 @@
 import { once } from "node:events";
+import { Buffer } from "node:buffer";
 import type { AddressInfo } from "node:net";
 import { WebSocketServer, type WebSocket } from "ws";
 import { afterEach, describe, expect, it } from "vite-plus/test";
@@ -48,6 +49,10 @@ function inbound(overrides: Record<string, unknown> = {}): Record<string, unknow
     ...overrides,
   };
 }
+
+const mp4Base64 = Buffer.from("000000186674797069736F6D0000020069736F6D69736F32", "hex").toString(
+  "base64",
+);
 
 class Queue<T> {
   #items: T[] = [];
@@ -641,6 +646,43 @@ describe("OneBot forward WebSocket", () => {
       { type: "image", data: { file: `base64://${pngBase64}` } },
     ]);
   });
+
+  it("sends bounded JPEG and WebP media through the generic image segment", async () => {
+    const fake = await server();
+    const { adapter } = client(fake.endpoint);
+    await adapter.start();
+    const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xd9]).toString("base64");
+    expect(
+      await adapter.send({
+        deliveryId: "jpeg-image",
+        target: groupScope,
+        text: "图片",
+        image: { base64: jpeg, mimeType: "image/jpeg" },
+      }),
+    ).toEqual({ status: "confirmed", messageId: "321" });
+    const jpegSend = await fake.actions.next((action) => action.action === "send_group_msg");
+    expect(jpegSend.params.message).toEqual([
+      { type: "at", data: { qq: 10002 } },
+      { type: "text", data: { text: "图片" } },
+      { type: "image", data: { file: `base64://${jpeg}` } },
+    ]);
+
+    const webp = Buffer.from("RIFF\u0004\u0000\u0000\u0000WEBP", "binary").toString("base64");
+    expect(
+      await adapter.send({
+        deliveryId: "webp-image",
+        target: groupScope,
+        text: "图片",
+        image: { base64: webp, mimeType: "image/webp" },
+      }),
+    ).toEqual({ status: "confirmed", messageId: "321" });
+    const webpSend = await fake.actions.next((action) => action.action === "send_group_msg");
+    expect(webpSend.params.message).toEqual([
+      { type: "at", data: { qq: 10002 } },
+      { type: "text", data: { text: "图片" } },
+      { type: "image", data: { file: `base64://${webp}` } },
+    ]);
+  });
   it("rejects malformed, oversized, or merged-forward PNG image payloads before sending", async () => {
     const fake = await server();
     const { adapter } = client(fake.endpoint);
@@ -670,6 +712,112 @@ describe("OneBot forward WebSocket", () => {
     expect(
       fake.history.filter((action) => action.action.startsWith("send_")).map((a) => a.action),
     ).toEqual([]);
+  });
+  it("sends bounded MP4 base64 video segments to the validated group or private target", async () => {
+    const fake = await server();
+    const { adapter } = client(fake.endpoint);
+    await adapter.start();
+    expect(
+      await adapter.send({
+        deliveryId: "group-video",
+        target: groupScope,
+        text: "视频已生成",
+        video: { mp4Base64 },
+      }),
+    ).toEqual({ status: "confirmed", messageId: "321" });
+    const groupSend = await fake.actions.next((action) => action.action === "send_group_msg");
+    expect(groupSend.params.message).toEqual([
+      { type: "at", data: { qq: 10002 } },
+      { type: "text", data: { text: "视频已生成" } },
+      { type: "video", data: { file: `base64://${mp4Base64}` } },
+    ]);
+
+    const privateTarget = { ...groupScope, chatType: "private" as const, chatId: base.ownerId };
+    expect(
+      await adapter.send({
+        deliveryId: "private-video",
+        target: privateTarget,
+        text: "视频已生成",
+        replyTo: "42",
+        video: { mp4Base64 },
+      }),
+    ).toEqual({ status: "confirmed", messageId: "321" });
+    const privateSend = await fake.actions.next((action) => action.action === "send_private_msg");
+    expect(privateSend.params.message).toEqual([
+      { type: "reply", data: { id: "42" } },
+      { type: "text", data: { text: "视频已生成" } },
+      { type: "video", data: { file: `base64://${mp4Base64}` } },
+    ]);
+  });
+  it("rejects invalid MP4, arbitrary path or URL, oversized video, and image-video combinations before sending", async () => {
+    const fake = await server();
+    const { adapter } = client(fake.endpoint);
+    await adapter.start();
+    const oversizedBase64 = Buffer.concat([
+      Buffer.from("000000186674797069736F6D0000020069736F6D69736F32", "hex"),
+      Buffer.alloc(16 * 1024 * 1024),
+    ]).toString("base64");
+    for (const value of [
+      "not-base64",
+      "/tmp/output.mp4",
+      "https://media.example/output.mp4",
+      oversizedBase64,
+    ]) {
+      expect(
+        await adapter.send({
+          deliveryId: "invalid-video",
+          target: groupScope,
+          text: "无效视频",
+          video: { mp4Base64: value },
+        }),
+      ).toEqual({ status: "failed", code: "invalid_message" });
+    }
+    const pngBase64 =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADUlEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+    expect(
+      await adapter.send({
+        deliveryId: "image-and-video",
+        target: groupScope,
+        text: "不可同时发送",
+        image: { pngBase64 },
+        video: { mp4Base64 },
+      }),
+    ).toEqual({ status: "failed", code: "invalid_message" });
+    expect(
+      await adapter.send({
+        deliveryId: "long-video",
+        target: groupScope,
+        text: "长文本".repeat(1_200),
+        video: { mp4Base64 },
+      }),
+    ).toEqual({ status: "failed", code: "invalid_message" });
+    expect(
+      await adapter.send({
+        deliveryId: "cross-target-video",
+        target: { ...groupScope, chatId: "10005" },
+        text: "不能发送到未配置群",
+        video: { mp4Base64 },
+      }),
+    ).toEqual({ status: "failed", code: "invalid_target" });
+    expect(fake.history.filter((action) => action.action.startsWith("send_"))).toEqual([]);
+  });
+  it("keeps video delivery unknown on timeout and does not resend", async () => {
+    const fake = await server({ onAction: (action) => action.action !== "get_login_info" });
+    const { adapter } = client(fake.endpoint, { requestTimeoutMs: 30 });
+    await adapter.start();
+    const pending = adapter.send({
+      deliveryId: "timeout-video",
+      target: groupScope,
+      text: "视频已生成",
+      video: { mp4Base64 },
+    });
+    const action = await fake.actions.next((item) => item.action === "send_group_msg");
+    expect(await pending).toEqual({ status: "unknown", code: "timeout" });
+    const socket = await fake.connections.next();
+    socket.send(
+      JSON.stringify({ status: "ok", retcode: 0, data: { message_id: 999 }, echo: action.echo }),
+    );
+    expect(fake.history.filter((item) => item.action === "send_group_msg")).toHaveLength(1);
   });
   it("delivers a long result as one bounded merged-forward message without truncation", async () => {
     const fake = await server();

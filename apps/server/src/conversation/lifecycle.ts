@@ -27,7 +27,7 @@ export interface DeliveryRecord {
   dedupKey: string;
   destinationScopeKey: string;
   payloadText: string;
-  payloadKind: "text" | "result" | "ack" | "browser_artifact";
+  payloadKind: "text" | "result" | "ack" | "browser_artifact" | "media_artifact";
   status: DeliveryStatus;
   externalId: string | null;
 }
@@ -416,8 +416,10 @@ export class LifecycleStore {
     if (
       typeof input.payloadText !== "string" ||
       input.payloadText.length > 64_000 ||
-      !["text", "result", "ack", "browser_artifact"].includes(input.payloadKind) ||
-      (input.payloadKind === "browser_artifact" &&
+      !["text", "result", "ack", "browser_artifact", "media_artifact"].includes(
+        input.payloadKind,
+      ) ||
+      (["browser_artifact", "media_artifact"].includes(input.payloadKind) &&
         !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(
           input.payloadText,
         ))

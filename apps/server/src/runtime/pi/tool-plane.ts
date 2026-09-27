@@ -41,6 +41,11 @@ import { SKILL_READ_TOOL } from "./skill-tools.js";
 import { WEB_FETCH_TOOL, WEB_SEARCH_TOOL } from "./web-tools.js";
 import { BROWSER_TOOL } from "./browser-tools.js";
 import {
+  MEDIA_GENERATION_RESOURCE,
+  MEDIA_GENERATION_TOOL,
+  MEDIA_GENERATE_ACTION,
+} from "./media-tools.js";
+import {
   MEMORY_GOVERN_ACTION,
   MEMORY_READ_ACTION,
   MEMORY_WRITE_ACTION,
@@ -316,6 +321,19 @@ const OPS_TOOL_DESCRIPTORS: readonly ToolDescriptor[] = Object.freeze(
 );
 
 const DOMAIN_TOOL_DESCRIPTORS: readonly ToolDescriptor[] = Object.freeze([
+  {
+    name: MEDIA_GENERATION_TOOL,
+    origin: "glassbox_domain",
+    schemaVersion: "media-generation-v1",
+    riskClass: "moderate",
+    provider: "media-provider-registry",
+    discovery: "owner_private",
+    authorization: { action: MEDIA_GENERATE_ACTION, resource: MEDIA_GENERATION_RESOURCE },
+    availability: "provider_probe",
+    resultProjection: "projected",
+    grounding: "integration",
+    budgetClass: "integration",
+  },
   {
     name: BROWSER_TOOL,
     origin: "glassbox_domain",

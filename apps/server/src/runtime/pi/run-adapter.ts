@@ -24,6 +24,7 @@ import {
 import { requiredInputClause, satisfiesRequiredInput } from "./protected-tools.js";
 import { OWNER_GROUP_ADMIN_TOOL } from "./owner-tools.js";
 import { OWNER_MEMORY_ADMIN_TOOL } from "./owner-memory-tools.js";
+import { MEDIA_GENERATION_TOOL } from "./media-tools.js";
 import { OWNER_MODEL_ADMIN_TOOL } from "./owner-model-tools.js";
 import {
   asksLiveQqFact,
@@ -566,6 +567,18 @@ function requiredToolCall(
   // outside a private Owner Run, whatever else a message may name.
   if (input.caller.scope.chatType !== "private" || !isOwner) return undefined;
   const rawText = input.text;
+  const mediaRequest = requestClauses(rawText);
+  if (
+    /(?:生成|画|制作|创作|编辑|修改|合成|改图)/u.test(mediaRequest) &&
+    (/(?:图片|图像|生图|插画|照片|海报)/u.test(mediaRequest) ||
+      /(?:画|绘制)(?:一|两|几)?(?:张|幅|只|个)/u.test(mediaRequest))
+  )
+    return { name: MEDIA_GENERATION_TOOL, input: { action: "image" } };
+  if (
+    /(?:生成|制作|创作|做一个|做个)/u.test(mediaRequest) &&
+    /(?:视频|短片|动画)/u.test(mediaRequest)
+  )
+    return { name: MEDIA_GENERATION_TOOL, input: { action: "video" } };
   if (authorizedToolNames?.includes(OWNER_MODEL_ADMIN_TOOL)) {
     const model = ownerModelCommand(rawText, modelProfiles);
     if (model) return model;

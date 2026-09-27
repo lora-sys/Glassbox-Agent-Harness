@@ -50,6 +50,7 @@ When source code is substantially ported, preserve the upstream license / copyri
 | `src/openharness/tools/skill_tool.py` | Skill discovery / reading behavior |
 | `src/openharness/tools/web_fetch_tool.py` | Web fetch Tool contract |
 | `src/openharness/tools/web_search_tool.py` | Web search Tool contract |
+| `src/openharness/tools/image_generation_tool.py` | Provider-neutral image generation/edit Tool, profile configuration, output handling |
 | `src/openharness/hooks/` | Hook lifecycle and extension points |
 | `src/openharness/config/` | Profiles, settings and override behavior |
 | `src/openharness/channels/` | Channel adapter patterns |
@@ -189,6 +190,12 @@ Remote
 ```
 
 Before adding a new Lora PI Kit Tool in one of these categories, inspect the corresponding OpenHarness implementation and tests first.
+
+### Image generation reference
+
+At the pinned commit, `src/openharness/tools/image_generation_tool.py` defines one structured `image_generation` Tool and selects an image Provider from configuration. It normalizes success and failure into `ToolResult`, reports the selected Provider/model and output paths, and refuses output overwrite by default. `tests/test_tools/test_image_generation_tool.py` covers missing credentials, generated files, Codex/OpenAI Provider selection, overwrite refusal, multiple outputs, and environment configuration.
+
+Glassbox follows the Tool/Provider separation and focused behavior tests. It does not reuse OpenHarness file paths as user-visible delivery authority: generated output is stored as a private Asset bound to its Principal, Conversation, and Run, then sent only through Glassbox delivery authorization. Provider-specific API details stay inside Provider adapters.
 
 ## Boundary rule
 

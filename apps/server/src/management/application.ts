@@ -64,6 +64,10 @@ import { BrowserSessionRegistry, type BrowserSessionBinding } from "../web/brows
 import type { BrowserExecutorPort } from "../web/browser-executor-port.js";
 import { createKitBrowserExecutor } from "../web/kit-browser-executor.js";
 import { BrowserArtifactStore } from "../web/browser-artifact-store.js";
+import { MediaAssetStore } from "../media/media-asset-store.js";
+import { AgnesMediaProvider } from "../media/agnes-media-provider.js";
+import { MediaProviderRegistry } from "../media/provider-registry.js";
+import type { MediaGenerationProvider } from "../media/provider.js";
 import { dohResolveWebHost } from "../web/network-guard.js";
 import {
   isWebCapabilityEnabled,
@@ -94,6 +98,12 @@ import {
   MEMORY_WRITE_ACTION,
   OWNER_MEMORY_RESOURCE,
 } from "../learning/store.js";
+import {
+  createMediaGenerationTools,
+  MEDIA_GENERATION_RESOURCE,
+  MEDIA_GENERATION_TOOL,
+  MEDIA_GENERATE_ACTION,
+} from "../runtime/pi/media-tools.js";
 import {
   availableHistoryToolNames,
   createHistoryTools,
@@ -321,6 +331,8 @@ export class ManagementApplication {
   private sandboxRuntime: Awaited<ReturnType<typeof loadKitSandbox>> = null;
   private kitBrowserExecutor?: BrowserExecutorPort;
   private browserArtifacts?: BrowserArtifactStore;
+  private mediaAssets?: MediaAssetStore;
+  private readonly mediaProvider: MediaGenerationProvider;
   private readonly sandboxRuns = new Map<
     string,
     {
@@ -354,6 +366,7 @@ export class ManagementApplication {
       dataDirectory: string;
       kitPath?: string;
       models: ModelProfileStore;
+      mediaProvider?: MediaGenerationProvider;
       browserExecutor?: BrowserExecutorPort;
       executors?: ReadonlyMap<string, RunExecutionAdapter>;
       ops?: {
@@ -370,6 +383,13 @@ export class ManagementApplication {
     this.store = store;
     this.channels = channels;
     this.groupRuntime = groupRuntime;
+    const agnes = new AgnesMediaProvider({ apiKey: process.env.AGNES_API_KEY });
+    this.mediaProvider =
+      options.mediaProvider ??
+      new MediaProviderRegistry([agnes], {
+        imageProviderId: process.env.GLASSBOX_IMAGE_PROVIDER ?? agnes.id,
+        videoProviderId: process.env.GLASSBOX_VIDEO_PROVIDER ?? agnes.id,
+      });
     this.archive = new ChannelArchiveStore(store.db);
     this.kitLoader = new KitLoader(options.kitPath);
     this.workspaceWrites = new WorkspaceWriteOccupancy(options.dataDirectory);
@@ -393,7 +413,11 @@ export class ManagementApplication {
           ],
         }),
       ],
-      protectedValues: () => [...options.models.protectedValues(), ...channels.protectedValues()],
+      protectedValues: () => [
+        ...options.models.protectedValues(),
+        ...channels.protectedValues(),
+        ...(process.env.AGNES_API_KEY ? [process.env.AGNES_API_KEY] : []),
+      ],
     });
     this.trace = new RunTraceStore({
       dataDirectory: options.dataDirectory,
@@ -438,6 +462,53 @@ export class ManagementApplication {
               return { status: "failed" };
             }
           }
+          if (delivery.payloadKind === "media_artifact") {
+            try {
+              if (!this.mediaAssets) return { status: "failed" };
+              const binding = await this.mediaAssets.binding(delivery.payloadText);
+              if (binding.runId !== delivery.runId) return { status: "failed" };
+              const caller = await this.store.lifecycle.traceCaller(
+                binding.runId,
+                binding.principalId,
+              );
+              const run = await this.runs.getRun(caller, delivery.runId);
+              if (run.conversationId !== binding.conversationId) return { status: "failed" };
+              if (scopeKey(caller.scope) !== scopeKey(destination)) return { status: "failed" };
+              const artifact = await this.mediaAssets.read(delivery.payloadText, binding);
+              if (signal.aborted) return { status: "failed" };
+              const sent =
+                artifact.mimeType === "video/mp4"
+                  ? await connection.send({
+                      deliveryId: delivery.id,
+                      target: destination,
+                      text: "视频已生成",
+                      video: { mp4Base64: artifact.data.toString("base64") },
+                    })
+                  : artifact.mimeType === "image/png"
+                    ? await connection.send({
+                        deliveryId: delivery.id,
+                        target: destination,
+                        text: "图片已生成",
+                        image: { pngBase64: artifact.data.toString("base64") },
+                      })
+                    : artifact.mimeType === "image/jpeg" || artifact.mimeType === "image/webp"
+                      ? await connection.send({
+                          deliveryId: delivery.id,
+                          target: destination,
+                          text: "图片已生成",
+                          image: {
+                            base64: artifact.data.toString("base64"),
+                            mimeType: artifact.mimeType,
+                          },
+                        })
+                      : { status: "failed" as const };
+              return sent.status === "confirmed"
+                ? { status: "sent", externalId: sent.messageId }
+                : { status: sent.status };
+            } catch {
+              return { status: "failed" };
+            }
+          }
           const result = await connection.send({
             deliveryId: delivery.id,
             target: destination,
@@ -456,23 +527,40 @@ export class ManagementApplication {
           ),
         ];
         const allowed: string[] = [];
+        const allowedMediaAssets: string[] = [];
         for (const id of ids.slice(0, 3)) {
           try {
-            if (!this.browserArtifacts) break;
-            const binding = await this.browserArtifacts.binding(id);
+            if (this.browserArtifacts) {
+              const binding = await this.browserArtifacts.binding(id);
+              if (
+                binding.runId === run.id &&
+                binding.conversationId === run.conversationId &&
+                binding.principalId === caller.principalId
+              ) {
+                const artifact = await this.readBrowserArtifact({ id, binding, caller });
+                if (artifact.sizeBytes <= 2 * 1024 * 1024) allowed.push(id);
+                continue;
+              }
+            }
+          } catch {
+            // Check the media store below before leaving an unverified UUID blocked.
+          }
+          try {
+            if (!this.mediaAssets) continue;
+            const binding = await this.mediaAssets.binding(id);
             if (
               binding.runId !== run.id ||
               binding.conversationId !== run.conversationId ||
               binding.principalId !== caller.principalId
             )
               continue;
-            const artifact = await this.readBrowserArtifact({ id, binding, caller });
-            if (artifact.sizeBytes <= 2 * 1024 * 1024) allowed.push(id);
+            const artifact = await this.mediaAssets.read(id, binding);
+            if (artifact.sizeBytes <= 128 * 1024 * 1024) allowedMediaAssets.push(id);
           } catch {
             // An unverified UUID stays blocked by the delivery content policy.
           }
         }
-        return this.deliveryPolicy.prepare(candidate, allowed);
+        return this.deliveryPolicy.prepare(candidate, allowed, allowedMediaAssets);
       },
     });
   }
@@ -483,6 +571,7 @@ export class ManagementApplication {
     kitPath?: string;
     piAgentDirectory?: string | null;
     models: ModelProfileStore;
+    mediaProvider?: MediaGenerationProvider;
     browserExecutor?: BrowserExecutorPort;
     executors?: ReadonlyMap<string, RunExecutionAdapter>;
     ops?: {
@@ -507,6 +596,7 @@ export class ManagementApplication {
         dataRoot: options.dataDirectory,
         forbiddenRoots: [application.kitLoader.getKitPath()],
       });
+      application.mediaAssets = await MediaAssetStore.open(options.dataDirectory);
       try {
         application.sandboxRuntime = await loadKitSandbox(application.kitLoader.getKitPath());
         if (application.sandboxRuntime) {
@@ -1201,6 +1291,16 @@ export class ManagementApplication {
         getContext,
         manageGroup: (context, input) => this.manageGroup(context, input),
       }),
+      ...createMediaGenerationTools({
+        store: this.store,
+        getContext,
+        assets: this.mediaAssets!,
+        provider: this.mediaProvider,
+        recordEvidence: async (evidence, context) => {
+          const cursor = await this.trace.append(context.runId, evidence, "glassbox-media");
+          await this.store.evidence.advanceTrace(context.caller, cursor);
+        },
+      }),
       ...createOwnerModelTools({
         store: this.store,
         getContext,
@@ -1539,6 +1639,8 @@ export class ManagementApplication {
     if (!ownerPrivate) scopeGates.set(OWNER_MODEL_ADMIN_TOOL, "scope_not_permitted");
     classified.add(OWNER_MEMORY_ADMIN_TOOL);
     if (!ownerPrivate) scopeGates.set(OWNER_MEMORY_ADMIN_TOOL, "scope_not_permitted");
+    classified.add(MEDIA_GENERATION_TOOL);
+    if (!ownerPrivate) scopeGates.set(MEDIA_GENERATION_TOOL, "scope_not_permitted");
     classified.add(SKILL_READ_TOOL);
     if (!context.authorizedSkillNames?.length) scopeGates.set(SKILL_READ_TOOL, "policy_disabled");
 
@@ -2553,11 +2655,26 @@ export class ManagementApplication {
           effect: "allow",
         });
       }
+      await this.store.authorization.registerResource({
+        id: MEDIA_GENERATION_RESOURCE,
+        kind: "media-generation",
+        visibility: "private",
+        ownerId: OWNER_ID,
+        ifAbsent: true,
+      });
+      await this.store.authorization.grant({
+        principalId,
+        resourceId: MEDIA_GENERATION_RESOURCE,
+        action: MEDIA_GENERATE_ACTION,
+        scope,
+        effect: "allow",
+      });
       for (const name of [
         ...(this.options.ops ? OPS_TOOL_NAMES : []),
         OWNER_GROUP_ADMIN_TOOL,
         OWNER_MODEL_ADMIN_TOOL,
         OWNER_MEMORY_ADMIN_TOOL,
+        MEDIA_GENERATION_TOOL,
       ]) {
         const resourceId = toolResourceId(name);
         await this.store.authorization.registerResource({

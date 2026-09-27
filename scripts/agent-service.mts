@@ -2,6 +2,8 @@ import { execFile as execFileCallback, spawn } from "node:child_process";
 import { closeSync, openSync } from "node:fs";
 import { mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import net from "node:net";
+import { DatabaseSync } from "node:sqlite";
+import lockfile from "proper-lockfile";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -25,6 +27,7 @@ const serviceEnvironmentKeys = new Set([
   "GLASSBOX_WORKSPACE_CODEX",
   "GLASSBOX_WORKSPACE_CLAUDE",
   "GLASSBOX_WORKSPACE_DEMO",
+  "AGNES_API_KEY",
   "NAPCAT_DISABLE_MULTI_PROCESS",
   "NAPCAT_INJECT_PATH",
   "NAPCAT_WORKDIR",
@@ -59,6 +62,52 @@ interface ProcessState extends ProcessConfig {
   name: ProcessName;
   pid: number;
   startedAt: string;
+}
+
+interface StartOptions {
+  skipNapcat?: boolean;
+  checkout?: string;
+}
+
+async function checkoutRoot(input?: string): Promise<string> {
+  const candidate = input ?? repoRoot;
+  if (!isAbsolute(candidate)) throw new Error("Checkout path must be absolute");
+  const root = await realpath(candidate);
+  const manifest = JSON.parse(await readFile(join(root, "package.json"), "utf8")) as {
+    name?: unknown;
+  };
+  if (manifest.name !== "glassbox") throw new Error("Checkout is not Glassbox");
+  if (!(await stat(join(root, "apps/server/src/index.ts"))).isFile())
+    throw new Error("Glassbox server entry is unavailable");
+  if (!(await stat(join(root, "node_modules/tsx"))).isDirectory())
+    throw new Error("Checkout dependencies are unavailable; install them before switching");
+  return root;
+}
+
+async function assertDatabaseCompatible(checkout: string): Promise<void> {
+  const databasePath = join(dataDirectory, "glassbox.db");
+  try {
+    if (!(await stat(databasePath)).isFile()) return;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  const source = await readFile(join(checkout, "apps/server/src/persistence/database.ts"), "utf8");
+  const supported = /if\s*\(\s*version\s*>\s*(\d+)\s*\)/u.exec(source);
+  if (!supported) throw new Error("Target checkout does not declare a readable database version");
+  const database = new DatabaseSync(databasePath, { readOnly: true });
+  let current: number;
+  try {
+    current = Number(
+      (database.prepare("PRAGMA user_version").get() as { user_version: number }).user_version,
+    );
+  } finally {
+    database.close();
+  }
+  if (current > Number(supported[1]))
+    throw new Error(
+      `Target checkout supports database version ${supported[1]}, but shared data uses ${current}`,
+    );
 }
 
 function environment(value: unknown, name: string): Record<string, string> | undefined {
@@ -187,7 +236,19 @@ async function loadState(): Promise<ProcessState[]> {
 
 async function writeState(state: ProcessState[]): Promise<void> {
   const temporary = `${statePath}.${process.pid}.tmp`;
-  await writeFile(temporary, JSON.stringify(state, null, 2), { mode: 0o600 });
+  const persisted = state.map(({ env, ...entry }) => ({
+    ...entry,
+    ...(env
+      ? {
+          env: Object.fromEntries(Object.entries(env).filter(([key]) => key !== "AGNES_API_KEY")),
+        }
+      : {}),
+  }));
+  await writeFile(
+    temporary,
+    JSON.stringify(persisted, null, 2),
+    process.platform === "win32" ? undefined : { mode: 0o600 },
+  );
   try {
     await rename(temporary, statePath);
   } catch (error) {
@@ -330,6 +391,16 @@ function endpointAvailable(endpoint: string | { host: string; port: number }): P
   });
 }
 
+async function waitForDataLockRelease(timeoutMs = 30_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  const lockfilePath = join(dataDirectory, "server.lock");
+  while (Date.now() < deadline) {
+    if (!(await lockfile.check(dataDirectory, { lockfilePath }))) return;
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 200));
+  }
+  throw new Error("Previous Glassbox service still owns the data directory");
+}
+
 async function waitFor(
   entry: ProcessState,
   probe: () => Promise<boolean>,
@@ -396,7 +467,9 @@ async function stopEntry(entry: ProcessState): Promise<void> {
   if (alive(entry.pid)) throw new Error(`${entry.name} did not stop`);
 }
 
-async function up(): Promise<void> {
+async function up(options: StartOptions = {}): Promise<void> {
+  const checkout = await checkoutRoot(options.checkout);
+  await assertDatabaseCompatible(checkout);
   await mkdir(dataDirectory, { recursive: true, mode: 0o700 });
   const prior = await loadState();
   const live: ProcessState[] = [];
@@ -405,13 +478,13 @@ async function up(): Promise<void> {
   const config = await loadConfig();
   const desired: Array<[ProcessName, ProcessConfig | undefined]> = [
     ["herdr", config.herdr],
-    ["napcat", config.napcat],
+    ["napcat", options.skipNapcat ? undefined : config.napcat],
     [
       "glassbox",
       {
         executable: process.execPath,
-        args: ["--import", "tsx", join(repoRoot, "apps/server/src/index.ts")],
-        cwd: repoRoot,
+        args: ["--import", "tsx", join(checkout, "apps/server/src/index.ts")],
+        cwd: checkout,
         env: config.glassbox?.env,
       },
     ],
@@ -420,6 +493,7 @@ async function up(): Promise<void> {
   try {
     for (const [name, item] of desired) {
       if (!item || live.some((entry) => entry.name === name)) continue;
+      if (name === "glassbox") await waitForDataLockRelease();
       const entry = await startProcess(name, item);
       live.push(entry);
       started.push(entry);
@@ -451,16 +525,69 @@ async function up(): Promise<void> {
   );
 }
 
+async function switchCheckout(options: StartOptions = {}): Promise<void> {
+  const checkout = await checkoutRoot(options.checkout);
+  await assertDatabaseCompatible(checkout);
+  const prior = await loadState();
+  const live: ProcessState[] = [];
+  for (const entry of prior) if (await verified(entry)) live.push(entry);
+  const previous = live.find((entry) => entry.name === "glassbox");
+  let stoppedPrevious = false;
+  try {
+    if (previous) {
+      await stopEntry(previous);
+      stoppedPrevious = true;
+      await writeState(live.filter((entry) => entry !== previous));
+    }
+    await up({ ...options, checkout });
+  } catch (error) {
+    if (!previous || !stoppedPrevious) throw error;
+    try {
+      const config = await loadConfig();
+      await waitForDataLockRelease();
+      const restored = await startProcess("glassbox", {
+        executable: previous.executable,
+        args: previous.args,
+        cwd: previous.cwd,
+        env: { ...previous.env, ...config.glassbox?.env },
+      });
+      const current = await loadState();
+      await writeState([...current, restored]);
+      const port = Number(restored.env?.PORT ?? "3030");
+      await waitFor(
+        restored,
+        () => endpointAvailable({ host: "127.0.0.1", port }),
+        "restored after failed checkout switch",
+        60_000,
+      );
+    } catch (rollbackError) {
+      throw new AggregateError([error, rollbackError], "Checkout switch and rollback failed");
+    }
+    throw error;
+  }
+  process.stdout.write(`${JSON.stringify({ status: "switched", checkout })}\n`);
+}
+
 async function status(): Promise<void> {
   const state = await loadState();
+  const config = await loadConfig();
   const processes = await Promise.all(
     state.map(async (entry) => ({
       name: entry.name,
       ...(alive(entry.pid) ? { pid: entry.pid } : {}),
       running: await verified(entry),
+      ...(entry.name === "glassbox" ? { checkout: entry.cwd ?? null } : {}),
     })),
   );
-  process.stdout.write(`${JSON.stringify({ dataDirectory, configPath, processes }, null, 2)}\n`);
+  const port = Number(config.glassbox?.env?.PORT ?? process.env.PORT ?? "3030");
+  const glassboxReady =
+    Number.isInteger(port) && port > 0 && port <= 65535
+      ? await endpointAvailable({ host: "127.0.0.1", port })
+      : false;
+  const onebotReady = await endpointAvailable({ host: "127.0.0.1", port: 6700 });
+  process.stdout.write(
+    `${JSON.stringify({ dataDirectory, configPath, processes, glassboxReady, onebotReady }, null, 2)}\n`,
+  );
 }
 
 async function down(): Promise<void> {
@@ -477,8 +604,18 @@ async function logs(): Promise<void> {
 }
 
 const command = process.argv[2];
-if (command === "up") await up();
+const args = process.argv.slice(3);
+const startOptions: StartOptions = {};
+if (command === "up" || command === "switch") {
+  for (let index = 0; index < args.length; index += 1) {
+    if (args[index] === "--skip-napcat") startOptions.skipNapcat = true;
+    else if (args[index] === "--checkout" && args[index + 1]) startOptions.checkout = args[++index];
+    else throw new Error("Unsupported service option");
+  }
+} else if (args.length > 0) throw new Error("This service command does not accept options");
+if (command === "up") await up(startOptions);
+else if (command === "switch") await switchCheckout(startOptions);
 else if (command === "status") await status();
 else if (command === "down") await down();
 else if (command === "logs") await logs();
-else throw new Error("Use up, status, down, or logs");
+else throw new Error("Use up, switch, status, down, or logs");

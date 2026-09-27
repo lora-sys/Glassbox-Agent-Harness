@@ -57,6 +57,20 @@ describe("QQ delivery presentation", () => {
     });
   });
 
+  it("delivers verified media Assets without exposing their internal IDs in QQ text", () => {
+    const assetId = "ca181a0c-6f10-44ba-bd1f-5fba48024a48";
+    const policy = createQqDeliveryPolicy();
+    expect(policy.prepare(`图片已生成 [asset:${assetId}]`, [], [assetId])).toMatchObject({
+      allowed: true,
+      text: "图片已生成",
+      mediaAssetIds: [assetId],
+    });
+    expect(policy.prepare(`图片已生成 [asset:${assetId}]`)).toMatchObject({
+      allowed: false,
+      reasons: ["internal-uuid"],
+    });
+  });
+
   it("reads configured forbidden values for every candidate without exposing the value", () => {
     let credential = "first-runtime-credential";
     const policy = createQqDeliveryPolicy({ forbiddenValues: () => [credential] });

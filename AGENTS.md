@@ -424,6 +424,36 @@ Use browser-level verification when browser behavior is the thing being tested.
 
 Use real QQ, Herdr, Pi, MCP, or other external integrations only when the active Plan requires real integration acceptance.
 
+### Real QQ acceptance across worktrees
+
+Use one local acceptance service and one durable `GLASSBOX_DATA_DIR` across branches. Keep
+NapCat's existing work directory, account state, OneBot settings, and the protected
+`service-launch.json` in place. Do not copy live data or credentials into each worktree.
+Automated tests still use isolated disposable state; the shared directory is only for
+explicit real-environment acceptance.
+
+Before switching, fetch the latest `main`, integrate it into the candidate branch, resolve
+conflicts, install that checkout's dependencies, and run its relevant deterministic checks.
+Record the candidate branch and commit. From a checkout with the service manager, run
+`npm run agent:switch -- --checkout <absolute checkout path>`, then `npm run agent:status`.
+The switch changes only Glassbox. Keep Herdr and NapCat running, and never start a second
+service against the same data directory. The command rejects a checkout that cannot read
+the shared database schema before stopping the current Glassbox process. Bring that
+checkout forward before retrying. See `docs/tech-stack.md` for service details.
+
+Confirm the reported Glassbox checkout and process, Glassbox readiness, and OneBot
+readiness. A listening OneBot port does not prove QQ is logged in. Check the account's
+online state, then send a fresh real QQ message through the configured identity and
+verify the received event, Run, authorization and delivery Trace, and outgoing QQ result.
+Use the active Plan's scenario matrix. Record the message and Run identifiers, checkout
+commit, service process, and data directory with the result. Keep credentials and message
+contents out of diagnostic summaries unless the evidence specifically needs them.
+
+If NapCat reports an expired quick-login state, leave its configuration and process
+intact. QQ must authorize a new login before real QQ acceptance can continue; an old
+message, a simulated OneBot event, or a ready Glassbox port cannot satisfy that gate.
+Report deterministic tests, provider probes, and real QQ delivery as separate results.
+
 ## Pull requests
 
 Do not create a Pull Request unless the user asks for one.

@@ -88,6 +88,21 @@ function fixture(results: PiRunResult[]) {
 }
 
 describe("Pi required Tool execution", () => {
+  it("requires media generation for a direct drawing request", async () => {
+    const f = fixture([
+      {
+        status: "completed",
+        text: "图片已生成。",
+        toolCalls: [{ name: "media_generate", input: { action: "image" }, failed: false }],
+      },
+    ]);
+    f.input.text = "请画一只奶牛猫";
+
+    await f.executor.execute(f.input);
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe("media_generate");
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({ action: "image" });
+  });
+
   it("names a missing browser screenshot without blaming QQ", async () => {
     const noTools = { status: "completed" as const, text: "截图已完成。", toolCalls: [] };
     const f = fixture([noTools, noTools]);

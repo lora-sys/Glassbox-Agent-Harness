@@ -57,6 +57,7 @@ Vite+ is expected to cover Vite / Rolldown, Vitest, Oxlint, Oxfmt, tsdown, and w
 The configured local Personal Agent environment has one service command surface:
 
     npm run agent:up
+    npm run agent:switch -- --checkout C:\absolute\path\to\Glassbox-Agent-Harness
     npm run agent:status
     npm run agent:logs
     npm run agent:down
@@ -72,6 +73,19 @@ agent:up reads optional Herdr, NapCat and Glassbox launch settings from
 on a temporary worktree. Use docs/service-launch.example.json as the shape. Keep
 credentials in the existing protected Channel and model stores. agent:up is idempotent.
 It keeps verified running processes and starts only missing services.
+For QQ acceptance across worktrees, use `agent:switch -- --checkout <absolute checkout path>`.
+The command restarts only Glassbox from the selected checkout. Herdr and NapCat keep their
+processes, QQ login, and OneBot connection settings. All checkouts use the one durable
+`GLASSBOX_DATA_DIR`; no database or NapCat profile copy is needed. The target checkout must
+have its dependencies installed. The command checks the target before stopping Glassbox,
+waits for the old database lock to clear, and restores the previous checkout if startup fails.
+It rejects a checkout whose database code is older than the shared database before stopping
+the current service. Bring that checkout forward to the current schema before testing it.
+`agent:status` shows the running checkout and whether Glassbox and OneBot ports are ready.
+Avoid concurrent switches because both commands change the same service process registry.
+Keep external provider keys in the access-restricted `service-launch.json` environment
+section when the service needs them after restart. The process registry does not store the
+Agnes key.
 For NapCat restart login, append the Bot QQ number to the launcher arguments after the QQ executable and injection library. Pin the first NapCat argument to the tested QQ executable. Do not point it at an auto-updated system QQ installation: an unsupported QQ build can leave OneBot listening while the account is offline. Keep the NapCat work directory, injection library and environment paths from one tested installation together.
 
 The Glassbox launch environment must include `LORA_PI_KIT_PATH` whenever a configured Channel uses a `pi:*` execution reference. Starting only the HTTP server without that path can accept a message but fail before Pi creates the Run session. Use `npm run agent:up` for normal recovery instead of manually launching the three processes with partial environment variables.

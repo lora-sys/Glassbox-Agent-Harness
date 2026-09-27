@@ -108,6 +108,7 @@ export interface RunServiceOptions {
     reasons: string[];
     candidateSha256: string;
     artifactIds?: readonly string[];
+    mediaAssetIds?: readonly string[];
   }>;
   /** Fixed diagnostic codes only; provider errors and protected payloads are excluded. */
   onError?: (error: {

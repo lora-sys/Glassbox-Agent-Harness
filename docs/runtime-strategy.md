@@ -402,6 +402,14 @@ Glassbox talks to Herdr through `HerdrBridge`; Herdr protocol details stay behin
 
 See `docs/agent-operations.md` for lifecycle and reconciliation rules.
 
+## Media generation Providers
+
+Image and video generation use the provider-neutral `MediaGenerationProvider` contract. `MediaProviderRegistry` routes image and video capabilities independently by Provider ID. Provider adapters own vendor endpoints and response parsing. Glassbox owns Owner-only Tool access, Run-bound private Assets, Trace evidence, and delivery authorization.
+
+The current default adapter is Agnes. `AGNES_API_KEY` is supplied through the process environment. `GLASSBOX_IMAGE_PROVIDER` and `GLASSBOX_VIDEO_PROVIDER` select registered Provider IDs; both default to `agnes`. A selected capability without an installed adapter is reported as unavailable. Adding another Provider requires an adapter and registry registration, not changes to QQ delivery or Glassbox Asset storage.
+
+Agnes Image 2.1 Flash supports 1K, 2K, 3K, and 4K generation and image references. Agnes Video 2.5 Flash currently returns 720P output and uses asynchronous job polling. The generic video contract does not promise resolutions a selected Provider cannot produce. Provider credentials belong in the process secret environment and must not enter Trace or delivery text.
+
 ## Security
 
 Glassbox authorization always wins.

@@ -16,6 +16,7 @@ import {
   type QqCapabilityCategory,
 } from "../channels/onebot/capabilities.js";
 import { ManagementApplication } from "./application.js";
+import type { MediaGenerationProvider } from "../media/provider.js";
 import type { ToolDescriptor, ToolExclusionReason } from "../runtime/pi/tool-plane.js";
 
 class Inbox<T> {
@@ -40,7 +41,7 @@ export interface Action {
     user_id?: number;
     message_seq?: number;
     no_cache?: boolean;
-    message?: Array<{ data: { text: string } }>;
+    message?: Array<{ type: string; data: Record<string, string> }>;
   };
 }
 
@@ -48,6 +49,8 @@ export type OwnerContext = {
   caller: ExecutionInput["caller"];
   conversationId: string;
   runId: string;
+  requiredToolName?: string;
+  requiredToolInput?: Record<string, unknown>;
 };
 export interface ManagedGroupProjection {
   connectionId: string;
@@ -225,6 +228,8 @@ export function createApplicationFixtureScope() {
       memberRole?: () => "owner" | "admin" | "member";
       /** One provider mutation to reject after caller authorization has passed. */
       failAction?: string;
+      /** Deterministic media adapter for media Tool and delivery tests. */
+      mediaProvider?: MediaGenerationProvider;
       /** Isolated Pi config directory for tests that exercise native Pi model routing. */
       piAgentDirectory?: string | null;
       /** Pi model configuration written to the default Glassbox main-agent directory. */
@@ -330,6 +335,7 @@ export function createApplicationFixtureScope() {
             : options.piAgentDirectory,
         models,
         executors,
+        ...(options.mediaProvider ? { mediaProvider: options.mediaProvider } : {}),
       });
     let app = await open();
     cleanup.push(() => app.close());
@@ -387,6 +393,7 @@ export function createApplicationFixtureScope() {
     };
     return {
       app,
+      directory,
       calls,
       started,
       send,
