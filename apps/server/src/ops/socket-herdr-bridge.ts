@@ -151,7 +151,10 @@ export class SocketHerdrBridge implements HerdrBridge {
     const snapshot = paneIds ? undefined : await this.getSnapshot();
     const payload = this.payload("events.subscribe", {
       subscriptions: paneIds
-        ? paneIds.map((paneId) => ({ type: "pane.agent_status_changed", pane_id: paneId }))
+        ? paneIds.map((paneId) => ({
+            type: "pane.agent_status_changed",
+            pane_id: paneId,
+          }))
         : [
             ...snapshot!.workspaces.flatMap((workspace) =>
               workspace.panes.map((pane) => ({
@@ -308,9 +311,27 @@ export class SocketHerdrBridge implements HerdrBridge {
   async getSnapshot(): Promise<HerdrSessionSnapshot> {
     const result = await this.request("session.snapshot");
     const snapshot = object(result.snapshot) ?? result;
-    const workspaces = Array.isArray(snapshot.workspaces) ? snapshot.workspaces : [];
-    const panes = Array.isArray(snapshot.panes) ? snapshot.panes : [];
+    if (!Array.isArray(snapshot.workspaces) || !Array.isArray(snapshot.panes))
+      throw new Error("Invalid Herdr session snapshot");
+    const workspaces = snapshot.workspaces;
+    const panes = snapshot.panes;
     const agents = Array.isArray(snapshot.agents) ? snapshot.agents : [];
+    const workspaceIds = new Set<string>();
+    for (const entry of workspaces) {
+      const workspaceId = text(object(entry)?.workspace_id);
+      if (!workspaceId || workspaceIds.has(workspaceId))
+        throw new Error("Invalid Herdr session snapshot");
+      workspaceIds.add(workspaceId);
+    }
+    for (const entry of panes) {
+      const pane = object(entry);
+      const workspaceId = text(pane?.workspace_id);
+      if (!text(pane?.pane_id) || !workspaceId || !workspaceIds.has(workspaceId))
+        throw new Error("Invalid Herdr session snapshot");
+    }
+    const reportedSessionId = text(snapshot.session_id);
+    if (reportedSessionId && reportedSessionId !== this.options.sessionId)
+      throw new Error("Herdr session identity mismatch");
     return {
       sessionId: this.options.sessionId,
       timestamp: new Date().toISOString(),
@@ -331,6 +352,7 @@ export class SocketHerdrBridge implements HerdrBridge {
                   agentName: text(agent?.name),
                   agentKind: text(pane.agent) ?? "unknown",
                   state: state(pane.agent_status),
+                  cwd: text(pane.cwd),
                   worktreePath: text(object(workspace?.worktree)?.checkout_path),
                   branch: text(object(workspace?.worktree)?.branch),
                 },
@@ -349,9 +371,13 @@ export class SocketHerdrBridge implements HerdrBridge {
     worktreePath?: string;
     branch?: string;
     workerContextFile?: string;
-  }): Promise<{ paneId: string; agentName: string; runtimeEvidence?: Record<string, unknown> }> {
+  }): Promise<{
+    paneId: string;
+    agentName: string;
+    runtimeEvidence?: Record<string, unknown>;
+  }> {
     if (params.agentName && !/^glassbox-[a-z0-9-]{1,56}$/u.test(params.agentName))
-      throw new Error("Invalid stable Herdr agent identity");
+      throw new Error("Invalid Herdr agent name");
     const launch =
       typeof this.options.workerLaunch === "function"
         ? await this.options.workerLaunch()
@@ -445,7 +471,11 @@ export class SocketHerdrBridge implements HerdrBridge {
       },
       35_000,
     );
-    return { paneId: pane.paneId, agentName, runtimeEvidence: launch?.runtimeEvidence };
+    return {
+      paneId: pane.paneId,
+      agentName,
+      runtimeEvidence: launch?.runtimeEvidence,
+    };
   }
 
   async promptAgent(params: { paneId: string; agentName?: string; prompt: string }): Promise<void> {
@@ -462,7 +492,10 @@ export class SocketHerdrBridge implements HerdrBridge {
       if (agent.agent_status === "blocked")
         throw new Error("Herdr worker needs input before prompting");
       if (agent.interactive_ready === true && agent.launch_pending !== true) {
-        await this.request("agent.prompt", { target: text(agent.name)!, text: params.prompt });
+        await this.request("agent.prompt", {
+          target: text(agent.name)!,
+          text: params.prompt,
+        });
         return;
       }
       if (Date.now() >= deadline)
@@ -501,7 +534,11 @@ export class SocketHerdrBridge implements HerdrBridge {
     const timeoutMs = params.timeoutMs ?? this.timeoutMs;
     const result = await this.request(
       "agent.wait",
-      { target: params.paneId, until: ["blocked", "done"], timeout_ms: timeoutMs },
+      {
+        target: params.paneId,
+        until: ["blocked", "done"],
+        timeout_ms: timeoutMs,
+      },
       timeoutMs + 1_000,
     );
     const agent = object(result.agent);
@@ -513,7 +550,9 @@ export class SocketHerdrBridge implements HerdrBridge {
   }
 
   private async verifyAgent(params: { paneId: string; agentName?: string }): Promise<void> {
-    const result = await this.request("agent.get", { target: params.agentName ?? params.paneId });
+    const result = await this.request("agent.get", {
+      target: params.agentName ?? params.paneId,
+    });
     const agent = object(result.agent);
     if (agent?.pane_id !== params.paneId || (params.agentName && agent.name !== params.agentName))
       throw new Error("Herdr agent identity mismatch");
@@ -521,6 +560,59 @@ export class SocketHerdrBridge implements HerdrBridge {
 
   async stopAgent(params: { paneId: string; agentName?: string }): Promise<void> {
     if (params.agentName) await this.verifyAgent(params);
-    await this.request("pane.send_keys", { pane_id: params.paneId, keys: ["ctrl+c"] });
+    await this.request("pane.send_keys", {
+      pane_id: params.paneId,
+      keys: ["ctrl+c"],
+    });
+  }
+
+  async closeAgent(params: {
+    paneId: string;
+    agentName: string;
+    herdrSession: string;
+  }): Promise<void> {
+    if (!params.paneId || !params.agentName) throw new Error("Herdr agent identity is required");
+    if (!params.herdrSession || params.herdrSession !== this.options.sessionId)
+      throw new Error("Herdr session identity mismatch");
+    if (!this.connected) throw new Error("HerdrBridge is disconnected");
+
+    const confirmAbsent = async (): Promise<boolean> => {
+      if (!this.connected) throw new Error("HerdrBridge is disconnected");
+      const snapshot = await this.getSnapshot();
+      if (!this.connected) throw new Error("HerdrBridge is disconnected");
+      if (snapshot.sessionId !== params.herdrSession)
+        throw new Error("Herdr session identity mismatch");
+      return !snapshot.workspaces.some((workspace) =>
+        workspace.panes.some((pane) => pane.paneId === params.paneId),
+      );
+    };
+
+    const before = await this.getSnapshot();
+    if (!this.connected) throw new Error("HerdrBridge is disconnected");
+    if (before.sessionId !== params.herdrSession)
+      throw new Error("Herdr session identity mismatch");
+    const pane = before.workspaces
+      .flatMap((workspace) => workspace.panes)
+      .find((entry) => entry.paneId === params.paneId);
+    if (!pane) return;
+    if (pane.agentName !== params.agentName) {
+      if (await confirmAbsent()) return;
+      throw new Error("Herdr agent identity mismatch");
+    }
+
+    try {
+      await this.verifyAgent(params);
+    } catch (error) {
+      if (await confirmAbsent()) return;
+      throw error;
+    }
+    if (!this.connected) throw new Error("HerdrBridge is disconnected");
+    try {
+      await this.request("pane.close", { pane_id: params.paneId });
+    } catch (error) {
+      if (await confirmAbsent()) return;
+      throw error;
+    }
+    if (!(await confirmAbsent())) throw new Error("Herdr pane close was not confirmed");
   }
 }

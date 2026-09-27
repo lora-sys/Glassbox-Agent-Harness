@@ -57,6 +57,14 @@ export interface ProtectedToolOptions<
   parameters: TSchema;
   /** The authorization action may depend on the validated operation selected by the call. */
   action: string | ((params: TParams, context: ProtectedToolContext) => string);
+  /** Marks successful protected reads for later delivery reauthorization. */
+  deliverySource?:
+    | "content_source"
+    | "access_gate"
+    | ((
+        params: TParams,
+        context: ProtectedToolContext,
+      ) => "content_source" | "access_gate" | undefined);
   /**
    * The Resource this Action protects. A function may derive it from the call params
    * and/or the Run context, so a tool can bind to the current Channel scope (for
@@ -273,6 +281,12 @@ export function createProtectedTool<
         if (signal?.aborted) {
           throw new Error("Operation cancelled");
         }
+        const deliverySource =
+          typeof options.deliverySource === "function"
+            ? options.deliverySource(typedParams, context)
+            : options.deliverySource;
+        if (deliverySource)
+          await options.authService.markDeliverySource(decision.id, deliverySource);
         return {
           content: [
             {

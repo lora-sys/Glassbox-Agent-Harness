@@ -77,7 +77,7 @@ async function runThatReadHistory(store: Awaited<ReturnType<typeof fixture>>) {
     scope: group100Scope,
     effect: "allow",
   });
-  // Exactly what the protected history tool records when it admits the source.
+  // Record both the allowed decision and the successful protected read, as the Tool does.
   const decision = await store.authorization.check({
     caller: group100,
     resourceId: groupResourceId("100"),
@@ -85,6 +85,7 @@ async function runThatReadHistory(store: Awaited<ReturnType<typeof fixture>>) {
     runId: accepted.run.id,
   });
   expect(decision.decision).toBe("ALLOW");
+  await store.authorization.markDeliverySource(decision.id, "content_source");
   const lease = await store.lifecycle.claimQueuedRun(group100, accepted.run.id);
   await lease.settle("succeeded", "DERIVED_FROM_GROUP_100_HISTORY");
   return accepted.run.id;

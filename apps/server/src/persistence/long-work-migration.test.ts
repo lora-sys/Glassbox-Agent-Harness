@@ -33,7 +33,7 @@ it("migrates a P3 Task to durable-capable schema without changing its identity o
     const db = await DomainDatabase.open(path);
     try {
       await db.transaction(async (tx) => {
-        expect((await tx.execute("PRAGMA user_version")).rows[0]?.user_version).toBe(13);
+        expect((await tx.execute("PRAGMA user_version")).rows[0]?.user_version).toBe(14);
         expect((await tx.execute("SELECT source FROM runs")).rows).toEqual([]);
         expect(
           (

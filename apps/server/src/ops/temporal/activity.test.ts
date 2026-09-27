@@ -683,6 +683,19 @@ it("executes a closed task_get Tool Step through a durable Run and holds its res
     });
     const finished = await store.conversations.getRun(caller, run!.id);
     expect(JSON.parse(finished.resultText!)).toMatchObject({ id: "target-read", status: "NEW" });
+    const sources = await store.db.transaction((tx) =>
+      tx.execute({
+        sql: "SELECT resource_id,action,delivery_source FROM authorization_decisions WHERE run_id = ? AND delivery_source = 'content_source'",
+        args: [run!.id],
+      }),
+    );
+    expect(sources.rows).toEqual([
+      expect.objectContaining({
+        resource_id: "task-target-read",
+        action: "task:read",
+        delivery_source: "content_source",
+      }),
+    ]);
     expect(await advance(input)).toEqual({ kind: "continue" });
     expect((await store.longWork.listSteps(task.id))[0]).toMatchObject({
       status: "review",

@@ -189,14 +189,7 @@ When a requirement is ambiguous, choose the smaller implementation that preserve
 
 Do not silently expand scope from the roadmap.
 
-P4A, P4B, and the repository transition refactor are complete. The active P5 implementation plans are:
-
-```text
-.plans/05a-context-budgeting-runtime-efficiency.md
-.plans/05b-routing-runtime-observability.md
-```
-
-Tracking Issues: #13 and #14. The Owner requested one implementation PR for both plans. Keep the P4 plans and the completed Issue #21 refactor plan as records.
+P4A, P4B, the Issue #21 repository refactor, and P5A/P5B are complete. The active P6 plan is `.plans/06-durable-long-work.md`, tracked by Issue #33. Issue #24 and `.plans/issue-24-closeout.md` record the Herdr Worker and delivery safety foundation. Issue #30 is the Linux-native acceptance prerequisite.
 
 Read in this order before changing code:
 
@@ -211,8 +204,10 @@ Read in this order before changing code:
 
 | Topic | Source of truth |
 | --- | --- |
-| Context budgeting and runtime efficiency | `.plans/05a-context-budgeting-runtime-efficiency.md` and Issue #13 |
-| Routing and runtime observability | `.plans/05b-routing-runtime-observability.md` and Issue #14 |
+| Active durable long work | `.plans/06-durable-long-work.md` and Issue #33 |
+| Herdr Worker and delivery safety foundation | `.plans/issue-24-closeout.md` and Issue #24 |
+| Completed context budgeting and runtime efficiency | `.plans/05a-context-budgeting-runtime-efficiency.md` and Issue #13 |
+| Completed routing and runtime observability | `.plans/05b-routing-runtime-observability.md` and Issue #14 |
 | Completed repository modularization and validation workflow | `.plans/phase-transition-repository-refactor.md` and Issue #21 |
 | Completed P4A Memory / Taste implementation and acceptance record | `.plans/04a-memory-taste.md` and Issue #9 |
 | Completed P4B retrieval / QQ history implementation and acceptance record | `.plans/04b-authorized-retrieval-history.md` and Issue #10 |

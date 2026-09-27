@@ -4,6 +4,11 @@ import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { openDomainStore, type CallerContext } from "../../persistence/index.js";
 import { WorkerFiles } from "../../ops/worker-files.js";
+import { WorkspaceRegistry } from "../../workspace/registry.js";
+import {
+  WorkspaceWriteOccupancy,
+  type WriteOccupancyLease,
+} from "../../workspace/write-occupancy.js";
 
 export interface WorkerToolContext {
   databasePath: string;
@@ -13,6 +18,9 @@ export interface WorkerToolContext {
   attemptId: string;
   caller: CallerContext;
   allowedActions: string[];
+  productWorkspaceId?: string;
+  occupancyRoot?: string;
+  lease?: WriteOccupancyLease | null;
 }
 
 let workerFileTail: Promise<unknown> = Promise.resolve();
@@ -43,6 +51,10 @@ async function executeWorkerFileOperation(
 ) {
   if (!isAbsolute(context.databasePath) || !isAbsolute(context.root))
     throw new Error("worker_context_invalid");
+  if (context.productWorkspaceId && (!context.occupancyRoot || !isAbsolute(context.occupancyRoot)))
+    throw new Error("worker_context_invalid");
+  if (context.lease && (!context.occupancyRoot || !context.productWorkspaceId))
+    throw new Error("worker_context_invalid");
   const store = await openDomainStore({ databasePath: context.databasePath });
   try {
     return await store.tasks.executeWorkerTool(
@@ -50,14 +62,46 @@ async function executeWorkerFileOperation(
         ...context,
         callId,
         action: operation === "write" ? "worker:file:write" : "worker:file:read",
+        ...(context.productWorkspaceId ? { productWorkspaceId: context.productWorkspaceId } : {}),
       },
       async () => {
-        const files = await WorkerFiles.open(context.root);
-        if (operation === "list") return files.list();
+        if (context.productWorkspaceId) {
+          const registry = await WorkspaceRegistry.open({ dataRoot: context.occupancyRoot! });
+          const workspace = await registry.resolveAuthorized(
+            context.caller.principalId,
+            context.productWorkspaceId,
+            operation === "write" ? "write" : "read",
+          );
+          if (workspace.canonicalPath !== context.root) throw new Error("worker_context_invalid");
+          if (operation === "write" && !context.lease) throw new Error("worker_context_invalid");
+          if (context.lease && context.lease.workspaceId !== context.productWorkspaceId)
+            throw new Error("worker_context_invalid");
+        }
+        const occupancy =
+          context.lease && context.occupancyRoot
+            ? new WorkspaceWriteOccupancy(context.occupancyRoot, { recoverOnOpen: false })
+            : null;
+        const assertActive = () => {
+          if (context.lease) occupancy?.assertActive(context.lease);
+        };
+        assertActive();
+        const files = await WorkerFiles.open(context.root, {
+          beforeOpen: async () => assertActive(),
+        });
+        if (operation === "list") {
+          const listed = await files.list();
+          assertActive();
+          return listed;
+        }
         if (typeof params.path !== "string") throw new Error("worker_path_required");
-        if (operation === "read") return files.read(params.path);
+        if (operation === "read") {
+          const content = await files.read(params.path);
+          assertActive();
+          return content;
+        }
         if (typeof params.content !== "string") throw new Error("worker_content_required");
         await files.write(params.path, params.content);
+        assertActive();
         return { written: true };
       },
     );

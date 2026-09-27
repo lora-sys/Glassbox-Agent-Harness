@@ -70,6 +70,7 @@ export class FakeHerdrBridge implements HerdrBridge {
           agentName: pane.agentName,
           agentKind: pane.agentKind,
           state: pane.state,
+          cwd: pane.cwd,
           worktreePath: pane.worktreePath,
           branch: pane.branch,
         });
@@ -125,6 +126,7 @@ export class FakeHerdrBridge implements HerdrBridge {
       agentName,
       agentKind: params.agentKind,
       state: "working",
+      cwd: params.worktreePath,
       worktreePath: params.worktreePath,
       branch: params.branch,
       outputBuffer: [],
@@ -220,6 +222,44 @@ export class FakeHerdrBridge implements HerdrBridge {
       state: "idle",
       timestamp: new Date().toISOString(),
     });
+  }
+
+  async closeAgent(params: {
+    paneId: string;
+    agentName: string;
+    herdrSession: string;
+  }): Promise<void> {
+    if (!this.connected) throw new Error("HerdrBridge is disconnected");
+    if (!params.herdrSession || params.herdrSession !== this.sessionId)
+      throw new Error("Herdr session identity mismatch");
+    const before = await this.getSnapshot();
+    if (before.sessionId !== params.herdrSession)
+      throw new Error("Herdr session identity mismatch");
+    const paneInfo = before.workspaces
+      .flatMap((workspace) => workspace.panes)
+      .find((entry) => entry.paneId === params.paneId);
+    if (!paneInfo) return;
+    if (paneInfo.agentName !== params.agentName) throw new Error("Herdr agent identity mismatch");
+    const pane = this.findPane(params.paneId);
+    if (!pane || pane.agentName !== params.agentName)
+      throw new Error("Herdr agent identity mismatch");
+    this.workspaces.get(pane.workspaceId)?.delete(pane.paneId);
+    this.emit({
+      type: "workspace.updated",
+      sessionId: this.sessionId,
+      workspaceId: pane.workspaceId,
+      paneId: "",
+      timestamp: new Date().toISOString(),
+    });
+    const snapshot = await this.getSnapshot();
+    if (!this.connected || snapshot.sessionId !== params.herdrSession)
+      throw new Error("Herdr session identity mismatch");
+    if (
+      snapshot.workspaces.some((workspace) =>
+        workspace.panes.some((entry) => entry.paneId === pane.paneId),
+      )
+    )
+      throw new Error("Herdr pane close was not confirmed");
   }
 
   // --- Test helper methods ---

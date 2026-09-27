@@ -1,6 +1,6 @@
 # Owner Pi sandbox
 
-Issue: [#23](https://github.com/lora-sys/Glassbox-Agent-Harness/issues/23)
+Original Owner sandbox Issue: [#23](https://github.com/lora-sys/Glassbox-Agent-Harness/issues/23). Herdr Worker closeout: [#24](https://github.com/lora-sys/Glassbox-Agent-Harness/issues/24).
 
 ## Current execution path
 
@@ -73,16 +73,38 @@ route accepts an absolute existing host directory from a trusted management
 caller. The registry rejects known service, repository, Kit, credential, and
 configuration roots. Default workspaces cannot be shared.
 
-## Remaining acceptance for issue 23
+## Herdr Worker path in Issue 24
 
-The durable occupancy is used by the main Agent's isolated tool sessions.
-Herdr Worker launch still uses its existing task workspace and authorization
-path. It has not been bound to the same product workspace ID and occupancy.
-The existing Worker file tools remain active; Glassbox does not load Kit's new
-sandbox extension on that path until the trusted workspace lease is joined.
+The Pi Worker retains the bounded `worker_read_file`, `worker_write_file`, and
+`worker_list_files` tools. Its configured Herdr directory must exactly match a
+registered product workspace that the caller can access. Glassbox checks both
+the Worker file grant and product workspace grant, then writes an attempt
+context outside the Worker directory. The Worker cannot choose a directory
+through Tool arguments.
+Before enabling delegation, register the configured `agent-operations.json`
+`worktreePath` as a product workspace and grant the acting Owner write access.
+An unregistered or protected host directory fails closed; the server does not
+silently create a workspace grant for an existing Herdr path.
 
-Kit's local and Herdr profiles register isolated Pi tools. The controlled
-browser network and shared Run path are integrated on the local Issue #20
-branches. Local real Docker browser, Artifact, cancellation, and cleanup smoke
-passed with the locked Kit image. Real QQ and Herdr acceptance remain required
-before Issue #23 can be closed.
+A write-capable attempt takes the same durable product-workspace occupancy as
+the main Agent before Herdr starts it. A second Owner or main Run cannot take a
+write lease on that workspace while the Worker retains write ability. Each
+Worker Tool checks the active TaskAttempt, current file grant, and current
+workspace grant. Writes also check the original lease. Separate workspaces
+can run in parallel. Accept, Rework, and Cancel close the named Herdr pane and
+verify its absence before releasing occupancy. Unconfirmed closure leaves the
+lease quarantined. Restart quarantines prior leases, so old Worker processes
+cannot reuse stale write permission. Recovery requires a trusted Herdr stop
+check. Raw Task Trace records lease acquire, quarantine, and release.
+
+This path does not load Kit `core/sandbox-tools` and offers no Shell Tool. A
+future Shell or other write entry must join the same workspace contract before
+it is exposed. Herdr and Glassbox must run on the same host for the current
+Worker file extension and database-backed authorization check.
+
+The controlled browser network and shared Run path were integrated under
+Issue #20. Local Docker browser, Artifact, cancellation, and cleanup smoke
+passed with the locked Kit image. Real QQ Owner delegation to a dedicated
+Herdr workspace, including Review, Rework or Accept, revocation, and cleanup,
+remains the Issue #24 acceptance gate. Linux full-stack migration belongs to
+Issue #30.

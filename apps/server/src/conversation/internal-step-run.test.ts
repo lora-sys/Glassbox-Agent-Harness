@@ -172,7 +172,7 @@ describe("internal Task Step Runs", () => {
       source: "task_step",
     });
     await reopened.transaction(async (tx) => {
-      expect(Number((await tx.execute("PRAGMA user_version")).rows[0]?.user_version)).toBe(13);
+      expect(Number((await tx.execute("PRAGMA user_version")).rows[0]?.user_version)).toBe(14);
       expect(
         (await tx.execute("SELECT attempt_id,run_id,task_id,step_id FROM task_attempt_runs"))
           .rows[0],

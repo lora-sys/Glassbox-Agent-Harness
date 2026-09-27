@@ -76,9 +76,30 @@ export class WorkspaceWriteOccupancy {
   private readonly anchor: string;
   private readonly instanceId = randomUUID();
 
-  constructor(dataRoot: string, role: "supervisor" | "participant" = "supervisor") {
+  constructor(
+    readonly dataRoot: string,
+    roleOrOptions:
+      | "supervisor"
+      | "participant"
+      | {
+          role?: "supervisor" | "participant";
+          recoverOnOpen?: boolean;
+        } = "supervisor",
+  ) {
+    if (
+      typeof roleOrOptions === "string" &&
+      roleOrOptions !== "supervisor" &&
+      roleOrOptions !== "participant"
+    )
+      throw new Error("Invalid workspace write occupancy role");
+    const role =
+      typeof roleOrOptions === "string" ? roleOrOptions : (roleOrOptions.role ?? "supervisor");
     if (role !== "supervisor" && role !== "participant")
       throw new Error("Invalid workspace write occupancy role");
+    const recoverOnOpen =
+      typeof roleOrOptions === "string"
+        ? role === "supervisor"
+        : (roleOrOptions.recoverOnOpen ?? role === "supervisor");
     if (!path.isAbsolute(dataRoot) || /^(?:\\\\|\/\/)/u.test(dataRoot))
       throw new Error("An absolute local data root is required");
     mkdirSync(dataRoot, { recursive: true, mode: 0o700 });
@@ -88,7 +109,7 @@ export class WorkspaceWriteOccupancy {
     closeSync(openSync(this.anchor, "a", 0o600));
     // A supervisor restart must quarantine old ownership. A separate worker
     // process joins the same ledger without invalidating the live supervisor.
-    if (role === "supervisor") {
+    if (recoverOnOpen) {
       this.change((state) => {
         for (const entry of Object.values(state.entries)) {
           if (entry.state !== "quarantined") entry.state = "quarantined";
@@ -177,8 +198,17 @@ export class WorkspaceWriteOccupancy {
     return Object.hasOwn(state.entries, workspaceId) ? state.entries[workspaceId]!.state : "free";
   }
 
+  /** A Worker Tool may write only while its original attempt owns an active lease. */
+  assertActive(lease: WriteOccupancyLease): void {
+    const entry = this.get(this.read(), lease);
+    if (entry.state !== "active") throw new WorkspaceWriteBusyError(lease.workspaceId, entry.state);
+  }
+
   /** The supervisor can use these identifiers to prove old Docker or Herdr sessions stopped. */
-  listUnresolved(): Array<{ lease: WriteOccupancyLease; state: OccupancyState }> {
+  listUnresolved(): Array<{
+    lease: WriteOccupancyLease;
+    state: OccupancyState;
+  }> {
     return Object.values(this.read().entries).map((entry) => ({
       lease: { ...entry.lease },
       state: entry.state,

@@ -55,13 +55,14 @@ export function createTaskGetAdapter(store: DomainStore): RunExecutionAdapter {
           runId: input.run.id,
         });
         if (decision.decision !== "ALLOW") throw new AccessDeniedError(decision);
+        return decision.id;
       };
       if (input.signal.aborted) return { status: "cancelled" };
       await read();
       const task = await store.tasks.getTask(spec.targetTaskId);
       if (!task) return { status: "failed" };
       if (input.signal.aborted) return { status: "cancelled" };
-      await read();
+      const sourceDecisionId = await read();
       if (input.signal.aborted) return { status: "cancelled" };
       const text = JSON.stringify({
         id: task.id,
@@ -72,6 +73,7 @@ export function createTaskGetAdapter(store: DomainStore): RunExecutionAdapter {
         updatedAt: task.updatedAt,
       });
       if (text.length > 64_000) return { status: "unknown" };
+      await store.authorization.markDeliverySource(sourceDecisionId, "content_source");
       return { status: "succeeded", text };
     },
   };

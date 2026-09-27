@@ -23,7 +23,7 @@ docs/data-observability.md
   persistence, storage, observability
 ```
 
-P3, P4A, and P4B are complete. Before the next product phase, the repository engineering work follows `.plans/phase-transition-repository-refactor.md` and Issue #21. This plan does not implement P5 product behavior.
+P3, P4A, P4B, and the Issue #21 repository refactor are complete. The current pre-P5 closeout follows `.plans/issue-24-closeout.md` and Issue #24. It does not implement P5 product behavior.
 
 ## Runtime and language
 

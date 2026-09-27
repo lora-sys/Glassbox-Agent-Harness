@@ -783,6 +783,7 @@ export function createHistoryTools(options: {
     const candidates = assigned ? resolved.filter((groupId) => assigned.has(groupId)) : resolved;
 
     const searched: string[] = [];
+    const sourceDecisions = new Map<string, string>();
     for (const groupId of candidates) {
       const decision = await options.store.authorization.check({
         caller,
@@ -791,7 +792,10 @@ export function createHistoryTools(options: {
         conversationId: context.conversationId,
         runId: context.runId,
       });
-      if (decision.decision === "ALLOW") searched.push(groupId);
+      if (decision.decision === "ALLOW") {
+        searched.push(groupId);
+        sourceDecisions.set(groupId, decision.id);
+      }
     }
 
     // The walk's own report is collected per group, so a cross-group answer can say which
@@ -897,6 +901,11 @@ export function createHistoryTools(options: {
       },
       context,
     );
+    for (const groupId of new Set(items.map((item) => item.groupId))) {
+      const decisionId = sourceDecisions.get(groupId);
+      if (decisionId)
+        await options.store.authorization.markDeliverySource(decisionId, "content_source");
+    }
     return details;
   };
 
@@ -962,6 +971,7 @@ export function createHistoryTools(options: {
       { additionalProperties: false },
     ),
     action: OWNER_HISTORY_ACTION,
+    deliverySource: "access_gate",
     // A multi-group call cannot name one group Resource, so it is gated on the Owner's own
     // search capability; each concrete group Resource is re-authorized inside `execute`.
     resourceId: (_params, context) =>

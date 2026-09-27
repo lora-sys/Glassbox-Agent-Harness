@@ -15,8 +15,9 @@ const caller = {
   },
 };
 
-function fixture(decision: "ALLOW" | "DENY") {
+function fixture(decision: "ALLOW" | "DENY", readError = true) {
   const checks: string[] = [];
+  const markedSources: Array<[string, string]> = [];
   const executions: string[] = [];
   const updates: unknown[] = [];
   const context: PiRunContext = { caller, conversationId: "conversation", runId: "run" };
@@ -32,6 +33,9 @@ function fixture(decision: "ALLOW" | "DENY") {
         checks.push(`auth:${input.action}`);
         return { id: "decision", decision, grantId: decision === "ALLOW" ? "grant" : null };
       },
+      async markDeliverySource(id: string, source: string) {
+        markedSources.push([id, source]);
+      },
     },
   } as unknown as DomainStore;
   const session: IsolatedPiSession = {
@@ -41,7 +45,7 @@ function fixture(decision: "ALLOW" | "DENY") {
     ],
     async execute(input) {
       executions.push(input.name);
-      if (input.name === "read")
+      if (input.name === "read" && readError)
         return { content: [{ type: "text", text: "read failed" }], isError: true };
       input.onUpdate?.({ content: [{ type: "text", text: "progress" }] });
       return {
@@ -58,7 +62,7 @@ function fixture(decision: "ALLOW" | "DENY") {
     workspaceId: "workspace-1",
     getContext: () => context,
   });
-  return { tools, checks, executions, updates };
+  return { tools, checks, executions, updates, markedSources };
 }
 
 describe("isolated Pi tool authorization", () => {
@@ -103,5 +107,20 @@ describe("isolated Pi tool authorization", () => {
       details: undefined,
       isError: true,
     });
+    expect(f.markedSources).toEqual([]);
+  });
+
+  it("marks a successful workspace read as a content source", async () => {
+    const f = fixture("ALLOW", false);
+    const result = await f.tools[0]!.execute(
+      "call",
+      { path: "file" },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    expect(result.content).toEqual([{ type: "image", mimeType: "image/png", data: "aGVsbG8=" }]);
+    expect(f.executions).toEqual(["read"]);
+    expect(f.markedSources).toEqual([["decision", "content_source"]]);
   });
 });
