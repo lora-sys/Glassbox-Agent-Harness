@@ -6,6 +6,7 @@ import { conversationScopeKey, type CallerContext } from "../../identity/scope.j
 import { AccessDeniedError } from "../../auth/service.js";
 import { RunService } from "../../execution/run-service/index.js";
 import { createTaskGetAdapter } from "../../execution/run-service/task-get-adapter.js";
+import { createCheckpointWriteAdapter } from "../../execution/run-service/checkpoint-write-adapter.js";
 import { FakeHerdrBridge } from "../fake-herdr-bridge.js";
 import { LongWorkScheduler } from "../long-work-scheduler.js";
 import { AuthorizedOpsService } from "../service.js";
@@ -506,6 +507,19 @@ async function createModelTask(
       scope: caller.scope,
       effect: "allow",
     });
+  if (
+    kind === "tool" &&
+    String(typeof specRef === "function" ? specRef(task.id) : specRef).startsWith(
+      "tool:checkpoint_write:",
+    )
+  )
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: `task-${task.id}`,
+      action: "task:checkpoint:write",
+      scope: caller.scope,
+      effect: "allow",
+    });
   for (const action of ["run:create", "conversation:read", "run:control"])
     await store.authorization.grant({
       principalId: "owner",
@@ -528,7 +542,13 @@ async function createModelTask(
     maxAttempts: retryPolicy?.maxAttempts ?? 2,
     ...(retryPolicy ? { retryPolicy } : {}),
     requiredCapabilities: [],
-    delegatedPermissionSet: [],
+    delegatedPermissionSet:
+      kind === "tool" &&
+      String(typeof specRef === "function" ? specRef(task.id) : specRef).startsWith(
+        "tool:checkpoint_write:",
+      )
+        ? [{ resourceId: `task-${task.id}`, action: "task:checkpoint:write" }]
+        : [],
     createdAt: nowStep,
     updatedAt: nowStep,
     version: 1,
@@ -1209,6 +1229,147 @@ it("denies a task_get Tool call when target read permission is revoked after Run
     expect(await advance(input)).toEqual({ kind: "continue" });
     expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("blocked");
   } finally {
+    await store.close();
+  }
+});
+
+it("resolves a lost checkpoint write response from the committed post-state without replay", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  let service: RunService | undefined;
+  try {
+    const { task, step } = await createModelTask(
+      store,
+      "tool:checkpoint_write:phase-one",
+      {
+        version: 1,
+        maxAttempts: 2,
+        initialDelayMs: 0,
+        maxDelayMs: 0,
+        backoffMultiplier: 1,
+        retryableErrorClasses: ["checkpoint_not_applied"],
+        nonRetryableErrorClasses: [],
+        timeoutOutcome: "unknown",
+      },
+      "tool",
+    );
+    const advance = createAdvanceLongWorkActivity(store);
+    const input = { taskId: task.id, policyRevision: 1 };
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    const lease = await store.longWork.getActiveLease(task.id, step.id);
+    const run = await store.conversations.getInternalStepRun(caller, lease!.attemptId!);
+    const executionInput = await store.conversations.loadRunInput(caller, run!.id);
+    const adapter = createCheckpointWriteAdapter(store);
+    service = new RunService({
+      store,
+      resolveExecution: () => ({
+        ...adapter,
+        execute: async (executionInput) => {
+          await adapter.execute(executionInput);
+          throw new Error("Response lost after committed checkpoint");
+        },
+      }),
+      transport: {
+        send: async () => {
+          throw new Error("Internal Tool result must not be delivered");
+        },
+      },
+    });
+    await service.start();
+    await service.enqueueInternalStepRun(caller, run!.id);
+    await vi.waitFor(async () => {
+      expect((await store.conversations.getRun(caller, run!.id)).status).toBe("unknown");
+    });
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("blocked");
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    const resolved = (await store.longWork.listSteps(task.id))[0]!;
+    expect(resolved.status).toBe("review");
+    expect(resolved.outputRef).toMatch(/^checkpoint:/u);
+    const checkpoints = await store.db.transaction((tx) =>
+      tx.execute({
+        sql: "SELECT id FROM task_checkpoints WHERE task_id = ? AND checkpoint_type = 'tool_checkpoint_write'",
+        args: [task.id],
+      }),
+    );
+    expect(checkpoints.rows).toHaveLength(1);
+    expect(checkpoints.rows[0]!.id).toBe(resolved.outputRef?.slice("checkpoint:".length));
+    expect(
+      (await store.longWork.listEvents(task.id)).filter(
+        (event) => event.type === "CHECKPOINT_WRITTEN",
+      ),
+    ).toHaveLength(1);
+    await expect(
+      adapter.execute({
+        ...executionInput,
+        executionMode: "task_step_tool",
+        caller,
+        signal: new AbortController().signal,
+      }),
+    ).rejects.toThrow("Checkpoint writer Step conflict");
+  } finally {
+    await service?.stop({ wait: true });
+    await store.close();
+  }
+});
+
+it("retries a checkpoint mutation only after a terminal Run and absent post-state", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  let service: RunService | undefined;
+  try {
+    const { task, step } = await createModelTask(
+      store,
+      "tool:checkpoint_write:phase-two",
+      {
+        version: 1,
+        maxAttempts: 2,
+        initialDelayMs: 0,
+        maxDelayMs: 0,
+        backoffMultiplier: 1,
+        retryableErrorClasses: ["checkpoint_not_applied"],
+        nonRetryableErrorClasses: [],
+        timeoutOutcome: "unknown",
+      },
+      "tool",
+    );
+    const advance = createAdvanceLongWorkActivity(store);
+    const input = { taskId: task.id, policyRevision: 1 };
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    const lease = await store.longWork.getActiveLease(task.id, step.id);
+    const run = await store.conversations.getInternalStepRun(caller, lease!.attemptId!);
+    service = new RunService({
+      store,
+      resolveExecution: () => ({
+        ...createCheckpointWriteAdapter(store),
+        execute: async () => {
+          throw new Error("Transport failed before mutation");
+        },
+      }),
+      transport: {
+        send: async () => {
+          throw new Error("Internal Tool result must not be delivered");
+        },
+      },
+    });
+    await service.start();
+    await service.enqueueInternalStepRun(caller, run!.id);
+    await vi.waitFor(async () => {
+      expect((await store.conversations.getRun(caller, run!.id)).status).toBe("unknown");
+    });
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("blocked");
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("waiting");
+    expect(await store.longWork.getActiveLease(task.id, step.id)).toBeNull();
+    expect(
+      (await store.longWork.listEvents(task.id)).some((event) => event.type === "RETRY_SCHEDULED"),
+    ).toBe(true);
+    expect(
+      (await store.longWork.listEvents(task.id)).filter(
+        (event) => event.type === "CHECKPOINT_WRITTEN",
+      ),
+    ).toHaveLength(0);
+  } finally {
+    await service?.stop({ wait: true });
     await store.close();
   }
 });

@@ -27,7 +27,8 @@ import {
   type RunServiceEvent,
 } from "../execution/run-service/index.js";
 import { createTaskGetAdapter } from "../execution/run-service/task-get-adapter.js";
-import { parseTaskGetSpec } from "../ops/tool-step-spec.js";
+import { createCheckpointWriteAdapter } from "../execution/run-service/checkpoint-write-adapter.js";
+import { parseCheckpointWriteSpec, parseTaskGetSpec } from "../ops/tool-step-spec.js";
 import { configuredModelAdapter } from "../execution/model-adapter.js";
 import { estimateUnicodeTokens } from "../efficiency/index.js";
 import {
@@ -2262,8 +2263,11 @@ export class ManagementApplication {
   }
 
   private directExecution(reference: string): RunExecutionAdapter | undefined {
-    if (reference.startsWith("tool:"))
-      return parseTaskGetSpec(reference) ? createTaskGetAdapter(this.store) : undefined;
+    if (reference.startsWith("tool:")) {
+      if (parseTaskGetSpec(reference)) return createTaskGetAdapter(this.store);
+      if (parseCheckpointWriteSpec(reference)) return createCheckpointWriteAdapter(this.store);
+      return undefined;
+    }
     const harness = this.options.executors?.get(reference);
     if (harness) return harness;
     if (reference === "claude-code") return this.executors.adapter();

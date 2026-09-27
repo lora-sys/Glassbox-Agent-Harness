@@ -255,6 +255,16 @@ export const schemaV18Migration = [
   `CREATE TRIGGER IF NOT EXISTS worker_file_artifacts_no_delete BEFORE DELETE ON worker_file_artifacts BEGIN SELECT RAISE(ABORT,'worker file artifacts are immutable'); END`,
 ];
 
+export const schemaV19Migration = [
+  `ALTER TABLE task_steps ADD COLUMN operation_generation INTEGER NOT NULL DEFAULT 1 CHECK(operation_generation >= 1)`,
+];
+
+export async function applySchemaV19Migration(tx: Transaction): Promise<void> {
+  const columns = await tx.execute("PRAGMA table_info(task_steps)");
+  if (!columns.rows.some((row) => row.name === "operation_generation"))
+    await tx.batch(schemaV19Migration);
+}
+
 export const schema = [
   ...baseSchema,
   ...schemaV7Statements,

@@ -33,7 +33,7 @@ it("migrates a P3 Task to durable-capable schema without changing its identity o
     const db = await DomainDatabase.open(path);
     try {
       await db.transaction(async (tx) => {
-        expect((await tx.execute("PRAGMA user_version")).rows[0]?.user_version).toBe(18);
+        expect((await tx.execute("PRAGMA user_version")).rows[0]?.user_version).toBe(19);
         expect(
           (await tx.execute("PRAGMA table_info(worker_file_artifacts)")).rows.length,
         ).toBeGreaterThan(0);
@@ -60,6 +60,10 @@ it("migrates a P3 Task to durable-capable schema without changing its identity o
         await tx.execute(
           "INSERT INTO task_steps(id,task_id,kind,title,status,dependency_policy_json,max_attempts,required_capabilities_json,delegated_permissions_json,version,created_at,updated_at) VALUES ('step-1','task-1','join','Join','pending','{}',1,'[]','[]',1,'2026-09-27T00:00:00Z','2026-09-27T00:00:00Z')",
         );
+        expect(
+          (await tx.execute("SELECT operation_generation FROM task_steps WHERE id = 'step-1'"))
+            .rows[0]?.operation_generation,
+        ).toBe(1);
         await tx.execute(
           "INSERT INTO task_attempts(id,task_id,step_id,attempt_number,status,started_at) VALUES ('attempt-2','task-1','step-1',2,'review','2026-09-27T00:00:00Z')",
         );

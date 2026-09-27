@@ -13,7 +13,7 @@ import type { DomainStore } from "../persistence/index.js";
 import { stringColumn } from "../persistence/database.js";
 import type { HerdrBridge } from "./herdr-bridge.js";
 import { DEFAULT_TASK_GRAPH_LIMITS } from "./task-graph.js";
-import { parseTaskGetSpec } from "./tool-step-spec.js";
+import { parseCheckpointWriteSpec, parseTaskGetSpec } from "./tool-step-spec.js";
 import { parseWorkerTextFileSpec } from "./worker-file-spec.js";
 import { WorkerFiles } from "./worker-files.js";
 import { WorkerArtifactCaptureError, type DurableWorkerClaim } from "./durable-worker-observer.js";
@@ -429,12 +429,19 @@ export class AuthorizedOpsService {
         if (delegated.decision !== "ALLOW") throw new AccessDeniedError(delegated);
       }
       if (step.kind !== "tool") continue;
-      const spec = step.specRef ? parseTaskGetSpec(step.specRef) : null;
-      if (!spec) throw new Error("Unsupported Tool Step spec");
-      await this.authorize(caller, `task-${spec.targetTaskId}`, "task:read", {
-        ...evidence,
-        delegatedTaskId: taskId,
-      });
+      const readSpec = step.specRef ? parseTaskGetSpec(step.specRef) : null;
+      const writeSpec = step.specRef ? parseCheckpointWriteSpec(step.specRef) : null;
+      if (readSpec) {
+        await this.authorize(caller, `task-${readSpec.targetTaskId}`, "task:read", {
+          ...evidence,
+          delegatedTaskId: taskId,
+        });
+      } else if (writeSpec) {
+        await this.authorize(caller, `task-${taskId}`, "task:checkpoint:write", {
+          ...evidence,
+          delegatedTaskId: taskId,
+        });
+      } else throw new Error("Unsupported Tool Step spec");
     }
     if (!this.longWorkRuntime || this.longWorkRuntime.available?.() === false)
       throw new Error("Durable Task runtime is unavailable");

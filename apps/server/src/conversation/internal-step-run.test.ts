@@ -240,7 +240,7 @@ describe("internal Task Step Runs", () => {
       source: "task_step",
     });
     await reopened.transaction(async (tx) => {
-      expect(Number((await tx.execute("PRAGMA user_version")).rows[0]?.user_version)).toBe(18);
+      expect(Number((await tx.execute("PRAGMA user_version")).rows[0]?.user_version)).toBe(19);
       expect(
         (await tx.execute("SELECT attempt_id,run_id,task_id,step_id FROM task_attempt_runs"))
           .rows[0],
@@ -574,6 +574,73 @@ describe("internal Task Step Runs", () => {
     await expect(conversations.loadRunInput(caller, followUp.id)).rejects.toMatchObject({
       decision: { reason: "no_grant" },
     });
+  });
+
+  it("passes only an accepted checkpoint receipt to a dependent Model Step", async () => {
+    const { db, conversations } = await fixture();
+    await db.transaction((tx) =>
+      tx.execute(
+        "UPDATE task_steps SET kind = 'tool', spec_ref = 'tool:checkpoint_write:phase-one', instructions = NULL WHERE id = 'step-1'",
+      ),
+    );
+    const sourceRun = await conversations.createInternalStepRun({
+      caller,
+      taskId: "task-1",
+      stepId: "step-1",
+      attemptId: "attempt-1",
+      executionRef: "tool:checkpoint_write:phase-one",
+    });
+    await db.transaction(async (tx) => {
+      await tx.execute({
+        sql: "UPDATE runs SET status = 'succeeded', result_text = 'checkpoint:checkpoint-1' WHERE id = ?",
+        args: [sourceRun.id],
+      });
+      await tx.execute({
+        sql: "UPDATE task_steps SET status = 'succeeded', output_ref = 'checkpoint:checkpoint-1' WHERE id = 'step-1'",
+      });
+      await tx.execute({
+        sql: `INSERT INTO task_checkpoints
+          (id,task_id,step_id,attempt_id,checkpoint_type,state_ref,evidence_ref,policy_revision,created_at)
+          VALUES ('checkpoint-1','task-1','step-1','attempt-1','tool_checkpoint_write','phase-one',?,1,?)`,
+        args: [`run:${sourceRun.id}`, time],
+      });
+      await tx.execute({
+        sql: "INSERT INTO task_steps(id,task_id,kind,title,instructions,status,dependency_policy_json,max_attempts,required_capabilities_json,delegated_permissions_json,version,created_at,updated_at) VALUES ('step-2','task-1','model','Follow-up','Use the checkpoint','running','{}',1,'[]','[]',1,?,?)",
+        args: [time, time],
+      });
+      await tx.execute(
+        "INSERT INTO task_step_dependencies(task_id,step_id,dependency_id) VALUES ('task-1','step-2','step-1')",
+      );
+      await tx.execute({
+        sql: "INSERT INTO task_attempts(id,task_id,attempt_number,status,started_at,step_id) VALUES ('attempt-2','task-1',2,'running',?,'step-2')",
+        args: [time],
+      });
+      await tx.execute({
+        sql: "INSERT INTO task_step_leases(id,task_id,step_id,attempt_id,owner_instance_id,state,version,acquired_at,heartbeat_at,expires_at) VALUES ('lease-2','task-1','step-2','attempt-2','worker-1','active',1,?,?,?)",
+        args: [time, time, leaseExpiry],
+      });
+    });
+    const followUp = await conversations.createInternalStepRun({
+      caller,
+      taskId: "task-1",
+      stepId: "step-2",
+      attemptId: "attempt-2",
+      executionRef: "pi:default",
+    });
+    expect((await conversations.loadRunInput(caller, followUp.id)).stepResults).toEqual([
+      {
+        stepId: "step-1",
+        sourceRef: "checkpoint:checkpoint-1",
+        text: '{"checkpointStateRef":"phase-one"}',
+        truncated: false,
+      },
+    ]);
+    await db.transaction((tx) =>
+      tx.execute("UPDATE task_steps SET output_ref = 'checkpoint:missing' WHERE id = 'step-1'"),
+    );
+    await expect(conversations.loadRunInput(caller, followUp.id)).rejects.toThrow(
+      "Accepted checkpoint dependency is unavailable",
+    );
   });
 
   it("hands an accepted child Model result to its parent with source grants rechecked", async () => {

@@ -99,6 +99,12 @@ export function createOpsTools(options: {
       targetTaskId: Type.Optional(
         Type.String({ minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$" }),
       ),
+      toolAction: Type.Optional(
+        Type.Union([Type.Literal("task_get"), Type.Literal("checkpoint_write")]),
+      ),
+      checkpointStateRef: Type.Optional(
+        Type.String({ minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$" }),
+      ),
       workerAccess: Type.Optional(Type.Union([Type.Literal("read"), Type.Literal("write")])),
       resultFile: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
     },
@@ -478,6 +484,8 @@ export function createOpsTools(options: {
         durationMs?: number;
         signalKey?: string;
         targetTaskId?: string;
+        toolAction?: "task_get" | "checkpoint_write";
+        checkpointStateRef?: string;
         workerAccess?: "read" | "write";
         resultFile?: string;
       }>;
@@ -485,7 +493,7 @@ export function createOpsTools(options: {
       ...common,
       name: "task_plan",
       description:
-        "Plan bounded timer, signal, approval, join, text-only model, read-only task_get Tool, configured Pi Herdr Worker, and child Task steps. Link child Tasks separately before planning their graphs. Shell steps are unavailable.",
+        "Plan bounded timer, signal, approval, join, text-only model, task_get or checkpoint_write Tool, configured Pi Herdr Worker, and child Task steps. Link child Tasks separately before planning their graphs. Shell steps are unavailable.",
       parameters: Type.Object(
         {
           taskId,
@@ -499,6 +507,8 @@ export function createOpsTools(options: {
       execute: async (params, context) => {
         for (const step of params.steps) {
           if (
+            (step.kind !== "tool" &&
+              (step.toolAction !== undefined || step.checkpointStateRef !== undefined)) ||
             (!["herdr_worker", "child_task"].includes(step.kind) &&
               step.workerAccess !== undefined) ||
             (step.kind !== "herdr_worker" && step.resultFile !== undefined) ||
@@ -524,8 +534,9 @@ export function createOpsTools(options: {
                 step.signalKey !== undefined ||
                 step.targetTaskId !== undefined)) ||
             (step.kind === "tool" &&
-              (!step.targetTaskId ||
-                !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(step.targetTaskId) ||
+              ((step.toolAction === "checkpoint_write"
+                ? step.targetTaskId !== undefined || !step.checkpointStateRef
+                : !step.targetTaskId || step.checkpointStateRef !== undefined) ||
                 step.instructions !== undefined ||
                 step.durationMs !== undefined ||
                 step.signalKey !== undefined)) ||
@@ -610,7 +621,12 @@ export function createOpsTools(options: {
             ...(step.kind === "model"
               ? { instructions: step.instructions, specRef: executionRef }
               : step.kind === "tool"
-                ? { specRef: `tool:task_get:${step.targetTaskId}` }
+                ? {
+                    specRef:
+                      step.toolAction === "checkpoint_write"
+                        ? `tool:checkpoint_write:${step.checkpointStateRef}`
+                        : `tool:task_get:${step.targetTaskId}`,
+                  }
                 : step.kind === "herdr_worker"
                   ? {
                       instructions: step.instructions,
@@ -628,10 +644,26 @@ export function createOpsTools(options: {
               cancelled: "cancel" as const,
               skipped: "skip" as const,
             },
-            maxAttempts: 3,
+            maxAttempts: step.toolAction === "checkpoint_write" ? 2 : 3,
+            ...(step.toolAction === "checkpoint_write"
+              ? {
+                  retryPolicy: {
+                    version: 1,
+                    maxAttempts: 2,
+                    initialDelayMs: 0,
+                    maxDelayMs: 0,
+                    backoffMultiplier: 1,
+                    retryableErrorClasses: ["checkpoint_not_applied"],
+                    nonRetryableErrorClasses: [],
+                    timeoutOutcome: "unknown" as const,
+                  },
+                  delegatedPermissionSet: [
+                    { resourceId: `task-${params.taskId}`, action: "task:checkpoint:write" },
+                  ],
+                }
+              : { delegatedPermissionSet: workerPermissions.get(step.id) ?? [] }),
             waitPolicy,
             requiredCapabilities: step.kind === "model" ? ["text"] : [],
-            delegatedPermissionSet: workerPermissions.get(step.id) ?? [],
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
             version: 1,

@@ -8,6 +8,7 @@ const collectionActions = ["ops:status", "task:list", "task:create", "task:deleg
 const taskActions = [
   "task:read",
   "task:plan",
+  "task:checkpoint:write",
   "task:continue",
   "task:signal",
   "task:approve",

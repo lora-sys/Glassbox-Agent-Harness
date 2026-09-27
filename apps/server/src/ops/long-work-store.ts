@@ -14,7 +14,7 @@ import {
   type TaskWaitPolicy,
   type HerdrAgentLifecycleState,
 } from "@glassbox/contracts";
-import { requireIdentifier } from "../identity/scope.js";
+import { requireIdentifier, scopeKey, type CallerContext } from "../identity/scope.js";
 import { evaluate } from "../auth/service.js";
 import { DomainDatabase, optionalString, stringColumn } from "../persistence/database.js";
 import {
@@ -24,7 +24,7 @@ import {
   type TaskGraphLimits,
 } from "./task-graph.js";
 import { decideTaskRetry, type RetrySideEffectOutcome } from "./long-work-retry.js";
-import { parseTaskGetSpec } from "./tool-step-spec.js";
+import { parseCheckpointWriteSpec, parseTaskGetSpec } from "./tool-step-spec.js";
 import { parseWorkerTextFileSpec } from "./worker-file-spec.js";
 import { reconstructTaskOriginScope } from "./long-work-authority.js";
 import { TaskNotificationStore } from "./task-notification-store.js";
@@ -311,14 +311,21 @@ function validateInitialStep(step: TaskStep, taskId: string): void {
     throw new Error("Invalid initial step");
   boundedNames(step.requiredCapabilities, "required capabilities");
   boundedDelegatedPermissions(step.delegatedPermissionSet, "delegated permissions");
-  if (
-    step.kind === "tool" &&
-    (typeof step.specRef !== "string" ||
-      !parseTaskGetSpec(step.specRef) ||
+  if (step.kind === "tool") {
+    const readSpec = typeof step.specRef === "string" && parseTaskGetSpec(step.specRef);
+    const writeSpec = typeof step.specRef === "string" && parseCheckpointWriteSpec(step.specRef);
+    if (
+      (!readSpec && !writeSpec) ||
       step.instructions !== undefined ||
-      step.waitPolicy !== undefined)
-  )
-    throw new Error("Invalid Tool Step specification");
+      step.waitPolicy !== undefined ||
+      (writeSpec &&
+        (step.requiredCapabilities.length !== 0 ||
+          step.delegatedPermissionSet.length !== 1 ||
+          step.delegatedPermissionSet[0]?.resourceId !== `task-${taskId}` ||
+          step.delegatedPermissionSet[0]?.action !== "task:checkpoint:write"))
+    )
+      throw new Error("Invalid Tool Step specification");
+  }
   if (
     (step.kind === "herdr_worker" &&
       step.specRef !== undefined &&
@@ -461,6 +468,20 @@ function expectedModelLeaseOwner(taskId: string, stepId: string): string {
   return `temporal-model-${digest}`;
 }
 
+function checkpointWriteIdentity(
+  taskId: string,
+  stepId: string,
+  generation: number,
+): {
+  checkpointId: string;
+  invocationId: string;
+} {
+  const digest = createHash("sha256")
+    .update(JSON.stringify([taskId, stepId, generation]))
+    .digest("hex");
+  return { checkpointId: `checkpoint-${digest}`, invocationId: `checkpoint-write-${digest}` };
+}
+
 function isClosedReadOnlyRunStep(step: Row): boolean {
   const kind = stringColumn(step, "kind");
   const specRef = optionalString(step, "spec_ref");
@@ -481,6 +502,23 @@ function isClosedReadOnlyRunStep(step: Row): boolean {
       requiredCapabilities.length === 0
     );
   return false;
+}
+
+function isClosedCheckpointWriteRunStep(step: Row): boolean {
+  if (step.kind !== "tool" || step.instructions !== null || step.wait_policy_json !== null)
+    return false;
+  const specRef = optionalString(step, "spec_ref");
+  if (!specRef || !parseCheckpointWriteSpec(specRef)) return false;
+  const required = parseJson<unknown>(step, "required_capabilities_json");
+  const delegated = parseJson<unknown>(step, "delegated_permissions_json");
+  return (
+    Array.isArray(required) &&
+    required.length === 0 &&
+    Array.isArray(delegated) &&
+    delegated.length === 1 &&
+    delegated[0]?.resourceId === `task-${stringColumn(step, "task_id")}` &&
+    delegated[0]?.action === "task:checkpoint:write"
+  );
 }
 
 const transitions: Readonly<Record<TaskStepStatus, readonly TaskStepStatus[]>> = {
@@ -1666,7 +1704,7 @@ export class LongWorkStore {
       if (
         step.status !== "cancelled" ||
         Number(step.version) !== input.expectedStepVersion ||
-        !isClosedReadOnlyRunStep(step)
+        !(isClosedReadOnlyRunStep(step) || isClosedCheckpointWriteRunStep(step))
       )
         throw new Error("Quarantined Step cancellation conflict");
       const attempt = await tx.execute({
@@ -3141,8 +3179,11 @@ export class LongWorkStore {
       const nextStatus: TaskStepStatus = stale ? "blocked" : waitOnlyStep ? "succeeded" : "ready";
       const nextWaitStatus = stale ? "stale" : "resumed";
       const updated = await tx.execute({
-        sql: "UPDATE task_steps SET status = ?, version = version + 1, updated_at = ? WHERE id = ? AND task_id = ? AND version = ? AND status = 'waiting'",
-        args: [nextStatus, now, stepId, taskId, expectedVersion],
+        sql: `UPDATE task_steps SET status = ?,
+          wait_policy_json = CASE WHEN ? = 'retry' THEN NULL ELSE wait_policy_json END,
+          version = version + 1, updated_at = ?
+          WHERE id = ? AND task_id = ? AND version = ? AND status = 'waiting'`,
+        args: [nextStatus, kind, now, stepId, taskId, expectedVersion],
       });
       if (updated.rowsAffected !== 1) throw new Error("Step version conflict");
       const settled = await tx.execute({
@@ -3661,7 +3702,10 @@ export class LongWorkStore {
         args: [nextTaskStatus, now, input.taskId, previousTaskStatus],
       });
       const stepUpdate = await tx.execute({
-        sql: "UPDATE task_steps SET status = 'ready', output_ref = NULL, version = version + 1, updated_at = ? WHERE id = ? AND task_id = ? AND version = ? AND status = ?",
+        sql: `UPDATE task_steps SET status = 'ready', output_ref = NULL,
+          operation_generation = operation_generation + CASE WHEN kind = 'tool' AND spec_ref LIKE 'tool:checkpoint_write:%' THEN 1 ELSE 0 END,
+          version = version + 1, updated_at = ?
+          WHERE id = ? AND task_id = ? AND version = ? AND status = ?`,
         args: [now, input.stepId, input.taskId, input.expectedStepVersion, step.status],
       });
       const attemptUpdate = await tx.execute({
@@ -3728,6 +3772,476 @@ export class LongWorkStore {
         args: [taskId, afterSequence, limit],
       });
       return rows.rows.map(parseEvent);
+    });
+  }
+
+  /** The closed mutation Tool writes under the exact live Run, Attempt and lease.
+   * A stable generation key makes a lost response safe to inspect or replay. */
+  async writeClaimedCheckpoint(input: {
+    caller: CallerContext;
+    runId: string;
+    taskId: string;
+    stepId: string;
+    attemptId: string;
+  }): Promise<{ checkpointId: string; invocationId: string; created: boolean }> {
+    for (const value of [input.runId, input.taskId, input.stepId, input.attemptId])
+      requireIdentifier(value);
+    return this.db.transaction(async (tx) => {
+      const task = await this.requireActiveDurableTask(tx, input.taskId);
+      if (
+        task.creator_principal_id !== input.caller.principalId ||
+        task.origin_scope_key !== scopeKey(input.caller.scope)
+      )
+        throw new Error("Checkpoint writer Task origin conflict");
+      const step = await this.requireStep(tx, input.taskId, input.stepId);
+      const writeSpec =
+        step.kind === "tool" && typeof step.spec_ref === "string"
+          ? parseCheckpointWriteSpec(step.spec_ref)
+          : null;
+      const delegated = parseJson<TaskStep["delegatedPermissionSet"]>(
+        step,
+        "delegated_permissions_json",
+      );
+      if (
+        !writeSpec ||
+        step.status !== "running" ||
+        step.instructions !== null ||
+        step.wait_policy_json !== null ||
+        parseJson<unknown[]>(step, "required_capabilities_json").length !== 0 ||
+        delegated.length !== 1 ||
+        delegated[0]?.resourceId !== `task-${input.taskId}` ||
+        delegated[0]?.action !== "task:checkpoint:write"
+      )
+        throw new Error("Checkpoint writer Step conflict");
+      const generation = Number(step.operation_generation);
+      if (!Number.isSafeInteger(generation) || generation < 1)
+        throw new Error("Invalid checkpoint operation generation");
+      const run = await tx.execute({
+        sql: `SELECT r.id,r.status,r.principal_id FROM task_attempt_runs ar
+          JOIN runs r ON r.id = ar.run_id AND r.source = 'task_step'
+          WHERE ar.attempt_id = ? AND ar.task_id = ? AND ar.step_id = ? AND ar.run_id = ?`,
+        args: [input.attemptId, input.taskId, input.stepId, input.runId],
+      });
+      if (
+        run.rows[0]?.status !== "running" ||
+        run.rows[0].principal_id !== input.caller.principalId
+      )
+        throw new Error("Checkpoint writer Run binding conflict");
+      const attempt = await tx.execute({
+        sql: "SELECT 1 FROM task_attempts WHERE id = ? AND task_id = ? AND step_id = ? AND status = 'running'",
+        args: [input.attemptId, input.taskId, input.stepId],
+      });
+      if (!attempt.rows[0]) throw new Error("Checkpoint writer Attempt conflict");
+      for (const action of ["task:continue", "task:read"]) {
+        const current = await evaluate(tx, {
+          caller: input.caller,
+          resourceId: `task-${input.taskId}`,
+          action,
+          runId: input.runId,
+          delegatedTaskId: input.taskId,
+        });
+        if (current.decision !== "ALLOW")
+          throw new Error(`Current ${action} grant is required for checkpoint write`);
+      }
+      const current = await evaluate(tx, {
+        caller: input.caller,
+        resourceId: `task-${input.taskId}`,
+        action: "task:checkpoint:write",
+        runId: input.runId,
+        delegatedTaskId: input.taskId,
+      });
+      if (current.decision !== "ALLOW")
+        throw new Error("Current checkpoint write grant is required");
+      const lease = await tx.execute({
+        sql: `SELECT id,version FROM task_step_leases
+          WHERE task_id = ? AND step_id = ? AND attempt_id = ?
+            AND state = 'active' AND owner_instance_id = ? AND worker_binding_id IS NULL
+            AND expires_at > ?`,
+        args: [
+          input.taskId,
+          input.stepId,
+          input.attemptId,
+          expectedModelLeaseOwner(input.taskId, input.stepId),
+          new Date().toISOString(),
+        ],
+      });
+      if (lease.rows.length !== 1) throw new Error("Checkpoint writer lease conflict");
+      const now = new Date().toISOString();
+      const leaseUpdate = await tx.execute({
+        sql: `UPDATE task_step_leases SET heartbeat_at = ?
+          WHERE id = ? AND task_id = ? AND step_id = ? AND attempt_id = ?
+            AND version = ? AND state = 'active' AND owner_instance_id = ?
+            AND worker_binding_id IS NULL AND expires_at > ?`,
+        args: [
+          now,
+          lease.rows[0]!.id,
+          input.taskId,
+          input.stepId,
+          input.attemptId,
+          Number(lease.rows[0]!.version),
+          expectedModelLeaseOwner(input.taskId, input.stepId),
+          now,
+        ],
+      });
+      if (leaseUpdate.rowsAffected !== 1) throw new Error("Checkpoint writer lease conflict");
+      const identity = checkpointWriteIdentity(input.taskId, input.stepId, generation);
+      const existing = await tx.execute({
+        sql: "SELECT task_id,step_id,checkpoint_type,state_ref FROM task_checkpoints WHERE id = ?",
+        args: [identity.checkpointId],
+      });
+      if (existing.rows[0]) {
+        if (
+          existing.rows[0].task_id !== input.taskId ||
+          existing.rows[0].step_id !== input.stepId ||
+          existing.rows[0].checkpoint_type !== "tool_checkpoint_write" ||
+          existing.rows[0].state_ref !== writeSpec.stateRef
+        )
+          throw new Error("Checkpoint invocation identity conflict");
+        return { ...identity, created: false };
+      }
+      await tx.execute({
+        sql: `INSERT INTO task_checkpoints
+          (id,task_id,step_id,attempt_id,checkpoint_type,state_ref,artifact_ref,evidence_ref,policy_revision,created_at)
+          VALUES (?,?,?,?,?,?,NULL,?,?,?)`,
+        args: [
+          identity.checkpointId,
+          input.taskId,
+          input.stepId,
+          input.attemptId,
+          "tool_checkpoint_write",
+          writeSpec.stateRef,
+          `run:${input.runId}`,
+          Number(task.policy_revision),
+          now,
+        ],
+      });
+      const updatedStep = await tx.execute({
+        sql: "UPDATE task_steps SET checkpoint_ref = ?, updated_at = ? WHERE id = ? AND task_id = ? AND status = 'running' AND version = ? AND operation_generation = ?",
+        args: [
+          writeSpec.stateRef,
+          now,
+          input.stepId,
+          input.taskId,
+          Number(step.version),
+          generation,
+        ],
+      });
+      const updatedTask = await tx.execute({
+        sql: "UPDATE tasks SET checkpoint_ref = ?, updated_at = ? WHERE id = ? AND orchestration_mode = 'durable' AND cancellation_state = 'none'",
+        args: [writeSpec.stateRef, now, input.taskId],
+      });
+      if (updatedStep.rowsAffected !== 1 || updatedTask.rowsAffected !== 1)
+        throw new Error("Checkpoint writer state conflict");
+      await this.appendEventTx(tx, {
+        taskId: input.taskId,
+        stepId: input.stepId,
+        attemptId: input.attemptId,
+        type: "CHECKPOINT_WRITTEN",
+        origin: {
+          kind: "decision",
+          decisionId: current.id,
+          actorPrincipalId: input.caller.principalId,
+        },
+        evidenceRef: `run:${input.runId}`,
+        metadata: { checkpointId: identity.checkpointId, invocationId: identity.invocationId },
+      });
+      return { ...identity, created: true };
+    });
+  }
+
+  /** Resolves an unknown closed mutation from the committed database post-state.
+   * The quarantined lease fences the old Run before absence can authorize a retry. */
+  async reconcileQuarantinedCheckpointStep(input: {
+    taskId: string;
+    stepId: string;
+    attemptId: string;
+    leaseId: string;
+    expectedStepVersion: number;
+    expectedLeaseVersion: number;
+    origin: LongWorkOrigin;
+  }): Promise<{ kind: "review" | "retry" | "failed" | "unresolved"; checkpointId?: string }> {
+    for (const value of [input.taskId, input.stepId, input.attemptId, input.leaseId])
+      requireIdentifier(value);
+    if (
+      input.origin.kind !== "decision" ||
+      !Number.isSafeInteger(input.expectedStepVersion) ||
+      input.expectedStepVersion < 1 ||
+      !Number.isSafeInteger(input.expectedLeaseVersion) ||
+      input.expectedLeaseVersion < 1
+    )
+      throw new Error("Invalid checkpoint reconciliation claim");
+    const origin = input.origin;
+    return this.db.transaction(async (tx) => {
+      await this.requireOrigin(tx, origin);
+      const task = await this.requireActiveDurableTask(tx, input.taskId);
+      const scope = reconstructTaskOriginScope(
+        stringColumn(task, "origin_scope_key"),
+        task.origin_scope_json,
+      );
+      const originEvidence = await tx.execute({
+        sql: `SELECT 1 FROM authorization_decisions WHERE id = ? AND principal_id = ?
+          AND resource_id = ? AND action = 'task:continue' AND scope_key = ?
+          AND decision = 'ALLOW'`,
+        args: [
+          origin.decisionId,
+          origin.actorPrincipalId,
+          `task-${input.taskId}`,
+          task.origin_scope_key,
+        ],
+      });
+      if (!originEvidence.rows[0])
+        throw new Error("Matching Task continuation decision is required");
+      const continueDecision = await evaluate(tx, {
+        caller: { principalId: origin.actorPrincipalId, scope },
+        resourceId: `task-${input.taskId}`,
+        action: "task:continue",
+        delegatedTaskId: input.taskId,
+      });
+      if (continueDecision.decision !== "ALLOW") return { kind: "unresolved" };
+      const writeDecision = await evaluate(tx, {
+        caller: { principalId: origin.actorPrincipalId, scope },
+        resourceId: `task-${input.taskId}`,
+        action: "task:checkpoint:write",
+        delegatedTaskId: input.taskId,
+      });
+      if (writeDecision.decision !== "ALLOW") return { kind: "unresolved" };
+      const step = await this.requireStep(tx, input.taskId, input.stepId);
+      const spec =
+        step.kind === "tool" && typeof step.spec_ref === "string"
+          ? parseCheckpointWriteSpec(step.spec_ref)
+          : null;
+      const delegated = parseJson<TaskStep["delegatedPermissionSet"]>(
+        step,
+        "delegated_permissions_json",
+      );
+      if (
+        !spec ||
+        step.status !== "blocked" ||
+        Number(step.version) !== input.expectedStepVersion ||
+        step.instructions !== null ||
+        step.wait_policy_json !== null ||
+        parseJson<unknown[]>(step, "required_capabilities_json").length !== 0 ||
+        delegated.length !== 1 ||
+        delegated[0]?.resourceId !== `task-${input.taskId}` ||
+        delegated[0]?.action !== "task:checkpoint:write"
+      )
+        throw new Error("Quarantined checkpoint Step conflict");
+      const generation = Number(step.operation_generation);
+      if (!Number.isSafeInteger(generation) || generation < 1)
+        throw new Error("Invalid checkpoint operation generation");
+      const attempt = await tx.execute({
+        sql: "SELECT status FROM task_attempts WHERE id = ? AND task_id = ? AND step_id = ?",
+        args: [input.attemptId, input.taskId, input.stepId],
+      });
+      if (attempt.rows[0]?.status !== "waiting_input")
+        throw new Error("Quarantined checkpoint Attempt conflict");
+      const lease = await tx.execute({
+        sql: `SELECT state,version,attempt_id,owner_instance_id,worker_binding_id
+          FROM task_step_leases WHERE id = ? AND task_id = ? AND step_id = ?`,
+        args: [input.leaseId, input.taskId, input.stepId],
+      });
+      if (
+        lease.rows[0]?.state !== "quarantined" ||
+        Number(lease.rows[0].version) !== input.expectedLeaseVersion ||
+        lease.rows[0].attempt_id !== input.attemptId ||
+        lease.rows[0].owner_instance_id !== expectedModelLeaseOwner(input.taskId, input.stepId) ||
+        lease.rows[0].worker_binding_id !== null
+      )
+        throw new Error("Quarantined checkpoint lease conflict");
+      const linked = await tx.execute({
+        sql: `SELECT r.id,r.source,r.status FROM task_attempt_runs ar
+          JOIN runs r ON r.id = ar.run_id
+          WHERE ar.attempt_id = ? AND ar.task_id = ? AND ar.step_id = ?`,
+        args: [input.attemptId, input.taskId, input.stepId],
+      });
+      const run = linked.rows[0];
+      if (run && run.source !== "task_step")
+        throw new Error("Quarantined checkpoint Run binding conflict");
+      if (!run || ["queued", "running", "cancelling"].includes(stringColumn(run, "status")))
+        return { kind: "unresolved" };
+      if (
+        !["cancelled", "succeeded", "failed", "interrupted", "unknown"].includes(
+          stringColumn(run, "status"),
+        )
+      )
+        throw new Error("Quarantined checkpoint Run outcome is invalid");
+      const identity = checkpointWriteIdentity(input.taskId, input.stepId, generation);
+      const checkpoint = await tx.execute({
+        sql: "SELECT task_id,step_id,checkpoint_type,state_ref FROM task_checkpoints WHERE id = ?",
+        args: [identity.checkpointId],
+      });
+      if (
+        checkpoint.rows[0] &&
+        (checkpoint.rows[0].task_id !== input.taskId ||
+          checkpoint.rows[0].step_id !== input.stepId ||
+          checkpoint.rows[0].checkpoint_type !== "tool_checkpoint_write" ||
+          checkpoint.rows[0].state_ref !== spec.stateRef)
+      )
+        throw new Error("Checkpoint post-state identity conflict");
+      const applied = checkpoint.rows.length === 1;
+      const now = new Date().toISOString();
+      const attemptCount = await tx.execute({
+        sql: `SELECT COUNT(*) AS count FROM task_attempts a
+          WHERE a.task_id = ? AND a.step_id = ? AND a.attempt_number > COALESCE((
+            SELECT previous.attempt_number FROM task_events e
+              JOIN task_attempts previous ON previous.id = e.attempt_id
+              WHERE e.task_id = ? AND e.step_id = ? AND e.type = 'TASK_REWORK'
+              ORDER BY e.sequence DESC LIMIT 1
+          ),0)`,
+        args: [input.taskId, input.stepId, input.taskId, input.stepId],
+      });
+      const attemptNumber = Number(attemptCount.rows[0]?.count ?? 0);
+      const policy =
+        step.retry_policy_json === null
+          ? null
+          : parseJson<TaskStep["retryPolicy"]>(step, "retry_policy_json");
+      const retryDecision =
+        !applied && policy
+          ? decideTaskRetry({
+              policy,
+              attemptNumber,
+              nowMs: Date.parse(now),
+              errorClass: "checkpoint_not_applied",
+              timedOut: false,
+              sideEffectOutcome: "not_applied",
+            })
+          : null;
+      const retry = retryDecision?.action === "retry";
+      const nextStatus = applied ? "review" : retry ? "waiting" : "failed";
+      const evidenceRef = applied
+        ? `checkpoint:${identity.checkpointId}`
+        : `checkpoint-absent:${identity.invocationId}`;
+      const dueAt = retry ? new Date(retryDecision.retryAtMs).toISOString() : undefined;
+      const waitPolicy: TaskWaitPolicy | undefined = dueAt
+        ? { version: 1, kind: "retry", dueAt, overdue: "resume" }
+        : undefined;
+      const attemptUpdate = await tx.execute({
+        sql: "UPDATE task_attempts SET status = ?, completed_at = ? WHERE id = ? AND task_id = ? AND step_id = ? AND status = 'waiting_input'",
+        args: [applied ? "review" : "failed", now, input.attemptId, input.taskId, input.stepId],
+      });
+      const stepUpdate = await tx.execute({
+        sql: `UPDATE task_steps SET status = ?, output_ref = ?, wait_policy_json = ?,
+          version = version + 1, updated_at = ?
+          WHERE id = ? AND task_id = ? AND version = ? AND status = 'blocked'`,
+        args: [
+          nextStatus,
+          applied ? evidenceRef : null,
+          waitPolicy ? JSON.stringify(waitPolicy) : null,
+          now,
+          input.stepId,
+          input.taskId,
+          input.expectedStepVersion,
+        ],
+      });
+      const leaseUpdate = await tx.execute({
+        sql: `UPDATE task_step_leases SET state = 'released', version = version + 1,
+          heartbeat_at = ?, released_at = ?
+          WHERE id = ? AND task_id = ? AND step_id = ? AND attempt_id = ?
+            AND version = ? AND state = 'quarantined' AND owner_instance_id = ?
+            AND worker_binding_id IS NULL`,
+        args: [
+          now,
+          now,
+          input.leaseId,
+          input.taskId,
+          input.stepId,
+          input.attemptId,
+          input.expectedLeaseVersion,
+          expectedModelLeaseOwner(input.taskId, input.stepId),
+        ],
+      });
+      if (
+        attemptUpdate.rowsAffected !== 1 ||
+        stepUpdate.rowsAffected !== 1 ||
+        leaseUpdate.rowsAffected !== 1
+      )
+        throw new Error("Quarantined checkpoint resolution conflict");
+      let waitGeneration: number | undefined;
+      if (waitPolicy) {
+        const activeWait = await tx.execute({
+          sql: "SELECT 1 FROM task_waits WHERE task_id = ? AND step_id = ? AND status = 'waiting' LIMIT 1",
+          args: [input.taskId, input.stepId],
+        });
+        if (activeWait.rows[0]) throw new Error("Checkpoint retry wait conflict");
+        const prior = await tx.execute({
+          sql: "SELECT COALESCE(MAX(generation),0) AS value FROM task_waits WHERE task_id = ? AND step_id = ?",
+          args: [input.taskId, input.stepId],
+        });
+        waitGeneration = Number(prior.rows[0]?.value ?? 0) + 1;
+        await tx.execute({
+          sql: `INSERT INTO task_waits
+            (id,task_id,step_id,attempt_id,generation,kind,status,started_at,due_at,signal_key,timeout_at,policy_json,updated_at)
+            VALUES (?,?,?,?,?,'retry','waiting',?,?,NULL,NULL,?,?)`,
+          args: [
+            randomUUID(),
+            input.taskId,
+            input.stepId,
+            input.attemptId,
+            waitGeneration,
+            now,
+            dueAt!,
+            JSON.stringify(waitPolicy),
+            now,
+          ],
+        });
+      }
+      await tx.execute({
+        sql: "UPDATE attention_items SET resolved_at = ? WHERE task_attempt_id = ? AND kind = 'worker_blocked' AND resolved_at IS NULL",
+        args: [now, input.attemptId],
+      });
+      const otherBlocked = await tx.execute({
+        sql: "SELECT 1 FROM task_steps WHERE task_id = ? AND id <> ? AND status = 'blocked' LIMIT 1",
+        args: [input.taskId, input.stepId],
+      });
+      if (!otherBlocked.rows[0])
+        await tx.execute({
+          sql: "UPDATE attention_items SET resolved_at = ? WHERE task_id = ? AND kind = 'worker_blocked' AND task_attempt_id IS NULL AND resolved_at IS NULL",
+          args: [now, input.taskId],
+        });
+      if (nextStatus !== "failed" && !otherBlocked.rows[0])
+        await tx.execute({
+          sql: "UPDATE tasks SET status = 'RUNNING', updated_at = ? WHERE id = ? AND status = 'WAITING_INPUT' AND cancellation_state = 'none'",
+          args: [now, input.taskId],
+        });
+      const metadata = {
+        outcome: nextStatus,
+        sideEffectOutcome: applied ? "applied" : "not_applied",
+        invocationId: identity.invocationId,
+        runId: run ? stringColumn(run, "id") : null,
+      };
+      await this.appendEventTx(tx, {
+        taskId: input.taskId,
+        stepId: input.stepId,
+        attemptId: input.attemptId,
+        type: "ATTEMPT_FINISHED",
+        origin,
+        evidenceRef,
+        metadata,
+      });
+      if (retry && waitPolicy) {
+        await this.appendEventTx(tx, {
+          taskId: input.taskId,
+          stepId: input.stepId,
+          attemptId: input.attemptId,
+          type: "RETRY_SCHEDULED",
+          origin,
+          evidenceRef,
+          metadata: { ...metadata, dueAt: dueAt!, generation: waitGeneration! },
+        });
+      }
+      await this.appendEventTx(tx, {
+        taskId: input.taskId,
+        stepId: input.stepId,
+        attemptId: input.attemptId,
+        type: statusEvents[nextStatus]!,
+        origin,
+        evidenceRef,
+        metadata,
+      });
+      return {
+        kind: applied ? "review" : retry ? "retry" : "failed",
+        ...(applied ? { checkpointId: identity.checkpointId } : {}),
+      };
     });
   }
 

@@ -8,7 +8,7 @@ import type {
 import type { IncomingMessage, RunRecord } from "../../conversation/store.js";
 import { requireIdentifier, type CallerContext } from "../../identity/scope.js";
 import { authorizeLongWorkAction } from "../../ops/long-work-authority.js";
-import { parseTaskGetSpec } from "../../ops/tool-step-spec.js";
+import { parseCheckpointWriteSpec, parseTaskGetSpec } from "../../ops/tool-step-spec.js";
 import type { TaskNotificationRecord } from "../../ops/task-notification-store.js";
 import { stringColumn } from "../../persistence/database.js";
 import type {
@@ -511,7 +511,10 @@ export class RunService {
     try {
       await this.emit({ type: "run_started", runId, conversationId: run.conversationId });
       const adapter = this.options.resolveExecution(run.executionRef);
-      const toolStep = run.source === "task_step" && parseTaskGetSpec(run.executionRef) !== null;
+      const toolStep =
+        run.source === "task_step" &&
+        (parseTaskGetSpec(run.executionRef) !== null ||
+          parseCheckpointWriteSpec(run.executionRef) !== null);
       if (
         !adapter ||
         (run.source === "external" && run.executionRef.startsWith("tool:")) ||

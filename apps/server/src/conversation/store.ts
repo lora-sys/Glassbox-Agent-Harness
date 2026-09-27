@@ -16,7 +16,7 @@ import {
   type TrustedChannelScope,
 } from "../identity/scope.js";
 import { DomainDatabase, optionalString, stringColumn } from "../persistence/database.js";
-import { parseTaskGetSpec } from "../ops/tool-step-spec.js";
+import { parseCheckpointWriteSpec, parseTaskGetSpec } from "../ops/tool-step-spec.js";
 
 export type RunStatus =
   | "queued"
@@ -323,8 +323,13 @@ export async function authorizeRun(
     if (taskAuthorization.decision !== "ALLOW") return { denied: taskAuthorization };
     const executionRef = stringColumn(row, "execution_ref");
     if (linkedStep?.kind === "tool" || executionRef.startsWith("tool:")) {
-      const toolSpec = parseTaskGetSpec(executionRef);
-      if (!toolSpec || linkedStep?.kind !== "tool" || linkedStep.spec_ref !== executionRef)
+      const readSpec = parseTaskGetSpec(executionRef);
+      const writeSpec = parseCheckpointWriteSpec(executionRef);
+      if (
+        (!readSpec && !writeSpec) ||
+        linkedStep?.kind !== "tool" ||
+        linkedStep.spec_ref !== executionRef
+      )
         return {
           denied: await recordDecision(
             tx,
@@ -333,14 +338,16 @@ export async function authorizeRun(
             "scope_mismatch",
           ),
         };
-      const targetAuthorization = await evaluate(tx, {
-        caller,
-        resourceId: `task-${toolSpec.targetTaskId}`,
-        action: "task:read",
-        conversationId,
-        runId,
-      });
-      if (targetAuthorization.decision !== "ALLOW") return { denied: targetAuthorization };
+      if (readSpec) {
+        const targetAuthorization = await evaluate(tx, {
+          caller,
+          resourceId: `task-${readSpec.targetTaskId}`,
+          action: "task:read",
+          conversationId,
+          runId,
+        });
+        if (targetAuthorization.decision !== "ALLOW") return { denied: targetAuthorization };
+      }
     }
   }
 
@@ -586,7 +593,9 @@ export class ConversationStore {
     for (const value of [input.taskId, input.stepId, input.attemptId, input.executionRef])
       requireIdentifier(value);
     const modelExecution = /^(?:model|pi):.+$/u.test(input.executionRef);
-    const toolExecution = parseTaskGetSpec(input.executionRef) !== null;
+    const toolExecution =
+      parseTaskGetSpec(input.executionRef) !== null ||
+      parseCheckpointWriteSpec(input.executionRef) !== null;
     if (!modelExecution && !toolExecution)
       throw new Error("Unsupported internal Run execution reference");
     const result = await this.db.transaction<AuthorizedResult<RunRecord>>(async (tx) => {
@@ -1304,6 +1313,43 @@ export class ConversationStore {
                 continue;
               }
               if (
+                dependency.kind === "tool" &&
+                dependency.status === "succeeded" &&
+                outputRef?.startsWith("checkpoint:")
+              ) {
+                const spec = parseCheckpointWriteSpec(optionalString(dependency, "spec_ref") ?? "");
+                if (!spec) throw new Error("Accepted checkpoint dependency spec is unavailable");
+                const checkpointId = outputRef.slice("checkpoint:".length);
+                requireIdentifier(checkpointId);
+                const checkpoint = await tx.execute({
+                  sql: `SELECT state_ref FROM task_checkpoints
+                    WHERE id = ? AND task_id = ? AND step_id = ?
+                      AND checkpoint_type = 'tool_checkpoint_write'`,
+                  args: [checkpointId, taskStepBinding.taskId, stringColumn(dependency, "id")],
+                });
+                if (checkpoint.rows[0]?.state_ref !== spec.stateRef)
+                  throw new Error("Accepted checkpoint dependency is unavailable");
+                const contentDecision = await evaluate(tx, {
+                  caller,
+                  resourceId: `task-${taskStepBinding.taskId}`,
+                  action: "task:read",
+                  conversationId: run.conversationId,
+                  runId,
+                });
+                if (contentDecision.decision !== "ALLOW") return { denied: contentDecision };
+                await tx.execute({
+                  sql: "UPDATE authorization_decisions SET delivery_source = 'content_source' WHERE id = ?",
+                  args: [contentDecision.id],
+                });
+                stepResults.push({
+                  stepId: stringColumn(dependency, "id"),
+                  sourceRef: outputRef,
+                  text: JSON.stringify({ checkpointStateRef: spec.stateRef }),
+                  truncated: false,
+                });
+                continue;
+              }
+              if (
                 !["model", "tool"].includes(stringColumn(dependency, "kind")) ||
                 dependency.status !== "succeeded" ||
                 !outputRef?.startsWith("run:")
@@ -1319,20 +1365,24 @@ export class ConversationStore {
               );
               if ("denied" in sourceAuthorization) return sourceAuthorization;
               if (dependency.kind === "tool") {
-                const spec = parseTaskGetSpec(optionalString(dependency, "spec_ref") ?? "");
-                if (!spec) throw new Error("Accepted Tool dependency spec is unavailable");
-                const targetDecision = await evaluate(tx, {
-                  caller,
-                  resourceId: `task-${spec.targetTaskId}`,
-                  action: "task:read",
-                  conversationId: run.conversationId,
-                  runId,
-                });
-                if (targetDecision.decision !== "ALLOW") return { denied: targetDecision };
-                await tx.execute({
-                  sql: "UPDATE authorization_decisions SET delivery_source = 'content_source' WHERE id = ?",
-                  args: [targetDecision.id],
-                });
+                const specRef = optionalString(dependency, "spec_ref") ?? "";
+                const readSpec = parseTaskGetSpec(specRef);
+                if (!readSpec && !parseCheckpointWriteSpec(specRef))
+                  throw new Error("Accepted Tool dependency spec is unavailable");
+                if (readSpec) {
+                  const targetDecision = await evaluate(tx, {
+                    caller,
+                    resourceId: `task-${readSpec.targetTaskId}`,
+                    action: "task:read",
+                    conversationId: run.conversationId,
+                    runId,
+                  });
+                  if (targetDecision.decision !== "ALLOW") return { denied: targetDecision };
+                  await tx.execute({
+                    sql: "UPDATE authorization_decisions SET delivery_source = 'content_source' WHERE id = ?",
+                    args: [targetDecision.id],
+                  });
+                }
               }
               const contentDecision = await evaluate(tx, {
                 caller,

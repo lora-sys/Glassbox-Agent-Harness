@@ -27,7 +27,7 @@ it("migrates v9 deliveries without losing old rows and accepts browser and media
     const db = await DomainDatabase.open(path);
     try {
       await db.transaction(async (tx) => {
-        expect((await tx.execute("PRAGMA user_version")).rows[0]?.user_version).toBe(18);
+        expect((await tx.execute("PRAGMA user_version")).rows[0]?.user_version).toBe(19);
         expect(
           (await tx.execute("SELECT payload_text, status FROM deliveries WHERE id = 'delivery-1'"))
             .rows[0],
@@ -85,7 +85,7 @@ it("marks legacy protected reads during migration and leaves public web decision
     const upgraded = await DomainDatabase.open(path);
     try {
       await upgraded.transaction(async (tx) => {
-        expect((await tx.execute("PRAGMA user_version")).rows[0]?.user_version).toBe(18);
+        expect((await tx.execute("PRAGMA user_version")).rows[0]?.user_version).toBe(19);
         const decisions = await tx.execute(
           "SELECT id, delivery_source FROM authorization_decisions ORDER BY id",
         );

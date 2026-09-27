@@ -410,6 +410,87 @@ it("requires current target Task read authority before planning a task_get Tool 
   }
 });
 
+it("requires an explicit checkpoint write grant when planning a checkpoint Tool Step", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  const caller: CallerContext = {
+    principalId: "owner",
+    scope: {
+      connectionId: "test",
+      botId: "bot",
+      chatType: "private",
+      chatId: "owner",
+      senderId: "owner",
+    },
+  };
+  try {
+    await store.identities.bindOwner("owner", caller.scope);
+    const task = await store.tasks.createTask({
+      title: "Record a checkpoint",
+      creatorPrincipalId: "owner",
+      authorizationScope: caller.scope,
+    });
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: `task-${task.id}`,
+      action: "task:plan",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    const runtime = {
+      available: () => true,
+      start: vi.fn(async () => {}),
+      wake: vi.fn(async () => {}),
+    };
+    const service = new AuthorizedOpsService(store, new FakeHerdrBridge(), undefined, runtime);
+    const now = new Date().toISOString();
+    const step = {
+      id: "checkpoint-step",
+      taskId: task.id,
+      kind: "tool" as const,
+      title: "Record a checkpoint",
+      specRef: "tool:checkpoint_write:phase-one",
+      status: "pending" as const,
+      dependencyIds: [],
+      dependencyPolicy: {
+        failed: "block" as const,
+        cancelled: "cancel" as const,
+        skipped: "skip" as const,
+      },
+      maxAttempts: 2,
+      retryPolicy: {
+        version: 1,
+        maxAttempts: 2,
+        initialDelayMs: 0,
+        maxDelayMs: 0,
+        backoffMultiplier: 1,
+        retryableErrorClasses: ["checkpoint_not_applied"],
+        nonRetryableErrorClasses: [],
+        timeoutOutcome: "unknown" as const,
+      },
+      requiredCapabilities: [],
+      delegatedPermissionSet: [{ resourceId: `task-${task.id}`, action: "task:checkpoint:write" }],
+      createdAt: now,
+      updatedAt: now,
+      version: 1,
+    };
+    await expect(service.planExistingTask(caller, task.id, [step], step.id)).rejects.toBeInstanceOf(
+      AccessDeniedError,
+    );
+    expect((await store.tasks.getTask(task.id))?.orchestrationMode).toBeUndefined();
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: `task-${task.id}`,
+      action: "task:checkpoint:write",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    await service.planExistingTask(caller, task.id, [step], step.id);
+    expect(runtime.start).toHaveBeenCalledWith(task.id, 1);
+  } finally {
+    await store.close();
+  }
+});
+
 it("rejects declared Step permissions outside the planner's current grants", async () => {
   const store = await openDomainStore({ databasePath: ":memory:" });
   const caller: CallerContext = {

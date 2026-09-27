@@ -84,6 +84,6 @@ it("adds nullable prompt acknowledgement when upgrading a version 14 database", 
   expect(
     await upgraded.db.transaction(async (tx) => tx.execute("PRAGMA user_version")),
   ).toMatchObject({
-    rows: [{ user_version: 18 }],
+    rows: [{ user_version: 19 }],
   });
 });

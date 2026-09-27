@@ -15,6 +15,7 @@ import {
 } from "./long-work-store.js";
 import { TaskStore } from "./task-store.js";
 import { parseTaskGetSpec } from "./tool-step-spec.js";
+import { identityKey, scopeKey, type CallerContext } from "../identity/scope.js";
 
 const now = "2026-09-27T00:00:00.000Z";
 const system = { kind: "system", reason: "test scheduler" } as const;
@@ -23,6 +24,16 @@ const claimOrigin = {
   decisionId: "continue-decision",
   actorPrincipalId: "owner",
 } as const;
+const checkpointCaller: CallerContext = {
+  principalId: "owner",
+  scope: {
+    connectionId: "test-connection",
+    botId: "test-bot",
+    chatType: "private",
+    chatId: "test-chat",
+    senderId: "owner-sender",
+  },
+};
 const limits = {
   maxSteps: 8,
   maxDependenciesPerStep: 4,
@@ -304,6 +315,121 @@ async function fixture(db: DomainDatabase): Promise<LongWorkStore> {
     });
   });
   return new LongWorkStore(db);
+}
+
+async function prepareCheckpointWriter(
+  db: DomainDatabase,
+  options: { retry?: boolean; stateRef?: string } = {},
+): Promise<LongWorkStore> {
+  const store = await fixture(db);
+  const key = scopeKey(checkpointCaller.scope);
+  await db.transaction(async (tx) => {
+    await tx.execute({
+      sql: "UPDATE tasks SET origin_scope_key = ?, origin_scope_json = ? WHERE id = 'task-1'",
+      args: [key, JSON.stringify(checkpointCaller.scope)],
+    });
+    await tx.execute({
+      sql: "UPDATE grants SET scope_key = ? WHERE id = 'continue-grant'",
+      args: [key],
+    });
+    await tx.execute({
+      sql: "UPDATE authorization_decisions SET scope_key = ? WHERE id = 'continue-decision'",
+      args: [key],
+    });
+    await tx.execute({
+      sql: "INSERT INTO channel_identities(identity_key,principal_id,created_at) VALUES (?,'owner',?)",
+      args: [identityKey(checkpointCaller.scope), now],
+    });
+    await tx.execute({
+      sql: "INSERT INTO grants(id,principal_id,resource_id,action,scope_key,effect,created_at) VALUES ('checkpoint-write-grant','owner','task-task-1','task:checkpoint:write',?,'allow',?)",
+      args: [key, now],
+    });
+    await tx.execute({
+      sql: "INSERT INTO grants(id,principal_id,resource_id,action,scope_key,effect,created_at) VALUES ('checkpoint-read-grant','owner','task-task-1','task:read',?,'allow',?)",
+      args: [key, now],
+    });
+    await tx.execute({
+      sql: "INSERT INTO agents(id,created_at) VALUES ('checkpoint-agent',?)",
+      args: [now],
+    });
+    await tx.execute(
+      "INSERT INTO resources(id,kind,visibility,owner_id) VALUES ('checkpoint-conversation-resource','conversation','private','owner')",
+    );
+    await tx.execute({
+      sql: "INSERT INTO conversations(id,agent_id,principal_id,scope_key,scope_json,resource_id,created_at) VALUES ('checkpoint-conversation','checkpoint-agent','owner',? ,?,'checkpoint-conversation-resource',?)",
+      args: [key, JSON.stringify(checkpointCaller.scope), now],
+    });
+  });
+  await store.createGraph(
+    "task-1",
+    [
+      {
+        ...step("checkpoint", [], "tool"),
+        specRef: `tool:checkpoint_write:${options.stateRef ?? "state-one"}`,
+        delegatedPermissionSet: [{ resourceId: "task-task-1", action: "task:checkpoint:write" }],
+        ...(options.retry
+          ? {
+              maxAttempts: 2,
+              retryPolicy: {
+                version: 1,
+                maxAttempts: 2,
+                initialDelayMs: 0,
+                backoffMultiplier: 2,
+                maxDelayMs: 1000,
+                retryableErrorClasses: ["checkpoint_not_applied"],
+                nonRetryableErrorClasses: [],
+                timeoutOutcome: "unknown" as const,
+              },
+            }
+          : {}),
+      },
+    ],
+    "checkpoint",
+    limits,
+    system,
+  );
+  await store.transitionStep({
+    taskId: "task-1",
+    stepId: "checkpoint",
+    expectedVersion: 1,
+    from: "pending",
+    to: "ready",
+    origin: system,
+  });
+  await store.claimReadyStep({
+    taskId: "task-1",
+    stepId: "checkpoint",
+    expectedStepVersion: 2,
+    attemptId: "checkpoint-attempt-1",
+    leaseId: "checkpoint-lease-1",
+    ownerInstanceId: modelLeaseOwner("task-1", "checkpoint"),
+    leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+    origin: claimOrigin,
+  });
+  await addCheckpointRun(db, "checkpoint-attempt-1", "checkpoint-run-1");
+  return store;
+}
+
+async function addCheckpointRun(
+  db: DomainDatabase,
+  attemptId: string,
+  runId: string,
+): Promise<void> {
+  await db.transaction(async (tx) => {
+    const key = scopeKey(checkpointCaller.scope);
+    await tx.execute({
+      sql: "INSERT INTO messages(id,conversation_id,scope_key,external_id,text,created_at) VALUES (?,'checkpoint-conversation',?,?, '',?)",
+      args: [`${runId}-message`, key, `${runId}-external`, now],
+    });
+    await tx.execute({
+      sql: "INSERT INTO runs(id,conversation_id,message_id,principal_id,scope_json,execution_ref,status,source,created_at,updated_at) VALUES (?,'checkpoint-conversation',?,'owner',?,'pi:checkpoint','running','task_step',?,?)",
+      args: [runId, `${runId}-message`, JSON.stringify(checkpointCaller.scope), now, now],
+    });
+    await tx.execute({
+      sql: "INSERT INTO task_attempt_runs(attempt_id,run_id,task_id,step_id) VALUES (?,?,'task-1','checkpoint')",
+      args: [attemptId, runId],
+    });
+  });
 }
 
 async function insertLegacyTask(db: DomainDatabase, id: string): Promise<void> {
@@ -4379,6 +4505,441 @@ it("rejects quarantined read-only cancellation settlement for a Herdr Worker Ste
     expect(await store.getQuarantinedLease("task-1", "worker")).toMatchObject({
       state: "quarantined",
       version: 2,
+    });
+  } finally {
+    await db.close();
+  }
+});
+
+it("writes a closed checkpoint once under the exact Run and active lease", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    const store = await prepareCheckpointWriter(db);
+    const input = {
+      caller: checkpointCaller,
+      runId: "checkpoint-run-1",
+      taskId: "task-1",
+      stepId: "checkpoint",
+      attemptId: "checkpoint-attempt-1",
+    };
+    const first = await store.writeClaimedCheckpoint(input);
+    expect(first).toMatchObject({ created: true });
+    expect(await store.writeClaimedCheckpoint(input)).toEqual({ ...first, created: false });
+    await db.transaction(async (tx) => {
+      expect((await tx.execute("SELECT id FROM task_checkpoints")).rows).toHaveLength(1);
+      expect(
+        (await tx.execute("SELECT checkpoint_ref FROM tasks WHERE id = 'task-1'")).rows[0],
+      ).toMatchObject({ checkpoint_ref: "state-one" });
+      expect(
+        (
+          await tx.execute(
+            "SELECT version,state FROM task_step_leases WHERE id = 'checkpoint-lease-1'",
+          )
+        ).rows[0],
+      ).toMatchObject({ version: 1, state: "active" });
+    });
+    expect(
+      (await store.listEvents("task-1")).filter((event) => event.type === "CHECKPOINT_WRITTEN"),
+    ).toHaveLength(1);
+    await store.settleClaimedStep({
+      taskId: "task-1",
+      stepId: "checkpoint",
+      attemptId: "checkpoint-attempt-1",
+      leaseId: "checkpoint-lease-1",
+      ownerInstanceId: modelLeaseOwner("task-1", "checkpoint"),
+      expectedStepVersion: 3,
+      expectedLeaseVersion: 1,
+      outcome: "unknown",
+      evidenceRef: "trace:lost-response",
+      origin: system,
+    });
+    await expect(store.writeClaimedCheckpoint(input)).rejects.toThrow(
+      "Checkpoint writer Step conflict",
+    );
+    await db.transaction((tx) =>
+      tx.execute("UPDATE runs SET status = 'unknown' WHERE id = 'checkpoint-run-1'"),
+    );
+    const resolved = await store.reconcileQuarantinedCheckpointStep({
+      taskId: "task-1",
+      stepId: "checkpoint",
+      attemptId: "checkpoint-attempt-1",
+      leaseId: "checkpoint-lease-1",
+      expectedStepVersion: 4,
+      expectedLeaseVersion: 2,
+      origin: claimOrigin,
+    });
+    expect(resolved).toEqual({ kind: "review", checkpointId: first.checkpointId });
+    expect((await store.listSteps("task-1"))[0]).toMatchObject({
+      status: "review",
+      outputRef: `checkpoint:${first.checkpointId}`,
+    });
+    expect(
+      (await store.listEvents("task-1")).filter((event) => event.type === "CHECKPOINT_WRITTEN"),
+    ).toHaveLength(1);
+  } finally {
+    await db.close();
+  }
+});
+
+it("accepts only an exact delegated permission for a closed checkpoint Tool Step", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    const store = await fixture(db);
+    const valid = {
+      ...step("checkpoint", [], "tool"),
+      specRef: "tool:checkpoint_write:bounded-state",
+      delegatedPermissionSet: [{ resourceId: "task-task-1", action: "task:checkpoint:write" }],
+    };
+    for (const malformed of [
+      { ...valid, delegatedPermissionSet: [] },
+      {
+        ...valid,
+        delegatedPermissionSet: [{ resourceId: "task-other", action: "task:checkpoint:write" }],
+      },
+      { ...valid, instructions: "Do something else" },
+      { ...valid, requiredCapabilities: ["text"] },
+      { ...valid, specRef: "tool:checkpoint_write:bad/path" },
+    ]) {
+      await expect(
+        store.createGraph("task-1", [malformed], "checkpoint", limits, system),
+      ).rejects.toThrow("Invalid Tool Step specification");
+    }
+    await store.createGraph("task-1", [valid], "checkpoint", limits, system);
+    expect((await store.listSteps("task-1"))[0]).toMatchObject({
+      specRef: valid.specRef,
+      delegatedPermissionSet: valid.delegatedPermissionSet,
+    });
+  } finally {
+    await db.close();
+  }
+});
+
+it("keeps a checkpoint Step quarantined until terminal Run and current grants permit reconciliation", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    const store = await prepareCheckpointWriter(db);
+    await store.settleClaimedStep({
+      taskId: "task-1",
+      stepId: "checkpoint",
+      attemptId: "checkpoint-attempt-1",
+      leaseId: "checkpoint-lease-1",
+      ownerInstanceId: modelLeaseOwner("task-1", "checkpoint"),
+      expectedStepVersion: 3,
+      expectedLeaseVersion: 1,
+      outcome: "unknown",
+      evidenceRef: "trace:unknown-checkpoint",
+      origin: system,
+    });
+    const reconcile = () =>
+      store.reconcileQuarantinedCheckpointStep({
+        taskId: "task-1",
+        stepId: "checkpoint",
+        attemptId: "checkpoint-attempt-1",
+        leaseId: "checkpoint-lease-1",
+        expectedStepVersion: 4,
+        expectedLeaseVersion: 2,
+        origin: claimOrigin,
+      });
+    expect(await reconcile()).toEqual({ kind: "unresolved" });
+    await db.transaction(async (tx) => {
+      await tx.execute("UPDATE runs SET status = 'unknown' WHERE id = 'checkpoint-run-1'");
+      await tx.execute({
+        sql: "UPDATE grants SET revoked_at = ? WHERE id = 'checkpoint-write-grant'",
+        args: [now],
+      });
+    });
+    expect(await reconcile()).toEqual({ kind: "unresolved" });
+    expect((await store.listSteps("task-1"))[0]).toMatchObject({ status: "blocked", version: 4 });
+    expect(await store.getQuarantinedLease("task-1", "checkpoint")).toMatchObject({
+      state: "quarantined",
+      version: 2,
+    });
+  } finally {
+    await db.close();
+  }
+});
+
+it("retries an absent checkpoint only after quarantined post-state verification", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    const store = await prepareCheckpointWriter(db, { retry: true });
+    await store.settleClaimedStep({
+      taskId: "task-1",
+      stepId: "checkpoint",
+      attemptId: "checkpoint-attempt-1",
+      leaseId: "checkpoint-lease-1",
+      ownerInstanceId: modelLeaseOwner("task-1", "checkpoint"),
+      expectedStepVersion: 3,
+      expectedLeaseVersion: 1,
+      outcome: "unknown",
+      evidenceRef: "trace:unknown-checkpoint",
+      origin: system,
+    });
+    await db.transaction((tx) =>
+      tx.execute("UPDATE runs SET status = 'unknown' WHERE id = 'checkpoint-run-1'"),
+    );
+    expect(
+      await store.reconcileQuarantinedCheckpointStep({
+        taskId: "task-1",
+        stepId: "checkpoint",
+        attemptId: "checkpoint-attempt-1",
+        leaseId: "checkpoint-lease-1",
+        expectedStepVersion: 4,
+        expectedLeaseVersion: 2,
+        origin: claimOrigin,
+      }),
+    ).toEqual({ kind: "retry" });
+    expect((await store.listSteps("task-1"))[0]).toMatchObject({ status: "waiting", version: 5 });
+    expect(await store.getQuarantinedLease("task-1", "checkpoint")).toBeNull();
+    expect((await store.listWaiting("task-1"))[0]).toMatchObject({
+      stepId: "checkpoint",
+      policy: { kind: "retry" },
+    });
+    await db.transaction(async (tx) => {
+      expect(
+        (await tx.execute("SELECT COUNT(*) AS count FROM task_checkpoints")).rows[0]?.count,
+      ).toBe(0);
+      expect(
+        (await tx.execute("SELECT operation_generation FROM task_steps WHERE id = 'checkpoint'"))
+          .rows[0]?.operation_generation,
+      ).toBe(1);
+    });
+    expect(await store.fireDueWait("task-1", "checkpoint", 5, system)).toMatchObject({
+      status: "ready",
+      version: 6,
+    });
+    await store.claimReadyStep({
+      taskId: "task-1",
+      stepId: "checkpoint",
+      expectedStepVersion: 6,
+      attemptId: "checkpoint-attempt-2",
+      leaseId: "checkpoint-lease-2",
+      ownerInstanceId: modelLeaseOwner("task-1", "checkpoint"),
+      leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+      origin: claimOrigin,
+    });
+    await addCheckpointRun(db, "checkpoint-attempt-2", "checkpoint-run-2");
+    expect(
+      await store.writeClaimedCheckpoint({
+        caller: checkpointCaller,
+        runId: "checkpoint-run-2",
+        taskId: "task-1",
+        stepId: "checkpoint",
+        attemptId: "checkpoint-attempt-2",
+      }),
+    ).toMatchObject({ created: true });
+    await db.transaction(async (tx) => {
+      expect(
+        (await tx.execute("SELECT operation_generation FROM task_steps WHERE id = 'checkpoint'"))
+          .rows[0]?.operation_generation,
+      ).toBe(1);
+    });
+  } finally {
+    await db.close();
+  }
+});
+
+it("uses a new checkpoint invocation only after explicit Step rework", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    const store = await prepareCheckpointWriter(db);
+    const first = await store.writeClaimedCheckpoint({
+      caller: checkpointCaller,
+      runId: "checkpoint-run-1",
+      taskId: "task-1",
+      stepId: "checkpoint",
+      attemptId: "checkpoint-attempt-1",
+    });
+    await store.settleClaimedStep({
+      taskId: "task-1",
+      stepId: "checkpoint",
+      attemptId: "checkpoint-attempt-1",
+      leaseId: "checkpoint-lease-1",
+      ownerInstanceId: modelLeaseOwner("task-1", "checkpoint"),
+      expectedStepVersion: 3,
+      expectedLeaseVersion: 1,
+      outcome: "unknown",
+      evidenceRef: "trace:lost-response",
+      origin: system,
+    });
+    await db.transaction((tx) =>
+      tx.execute("UPDATE runs SET status = 'unknown' WHERE id = 'checkpoint-run-1'"),
+    );
+    expect(
+      await store.reconcileQuarantinedCheckpointStep({
+        taskId: "task-1",
+        stepId: "checkpoint",
+        attemptId: "checkpoint-attempt-1",
+        leaseId: "checkpoint-lease-1",
+        expectedStepVersion: 4,
+        expectedLeaseVersion: 2,
+        origin: claimOrigin,
+      }),
+    ).toEqual({ kind: "review", checkpointId: first.checkpointId });
+    await addStepDecision(db, "task:rework", "checkpoint-rework", {
+      scope: scopeKey(checkpointCaller.scope),
+    });
+    await store.reworkDurableStep({
+      taskId: "task-1",
+      stepId: "checkpoint",
+      expectedStepVersion: 5,
+      reason: "Write another checkpoint",
+      origin: { kind: "decision", decisionId: "checkpoint-rework", actorPrincipalId: "owner" },
+    });
+    await db.transaction(async (tx) => {
+      expect(
+        (await tx.execute("SELECT operation_generation FROM task_steps WHERE id = 'checkpoint'"))
+          .rows[0]?.operation_generation,
+      ).toBe(2);
+    });
+    await store.claimReadyStep({
+      taskId: "task-1",
+      stepId: "checkpoint",
+      expectedStepVersion: 6,
+      attemptId: "checkpoint-attempt-2",
+      leaseId: "checkpoint-lease-2",
+      ownerInstanceId: modelLeaseOwner("task-1", "checkpoint"),
+      leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+      origin: claimOrigin,
+    });
+    await addCheckpointRun(db, "checkpoint-attempt-2", "checkpoint-run-2");
+    const second = await store.writeClaimedCheckpoint({
+      caller: checkpointCaller,
+      runId: "checkpoint-run-2",
+      taskId: "task-1",
+      stepId: "checkpoint",
+      attemptId: "checkpoint-attempt-2",
+    });
+    expect(second.created).toBe(true);
+    expect(second.checkpointId).not.toBe(first.checkpointId);
+    expect(second.invocationId).not.toBe(first.invocationId);
+    expect(
+      (await store.listEvents("task-1")).filter((event) => event.type === "CHECKPOINT_WRITTEN"),
+    ).toHaveLength(2);
+  } finally {
+    await db.close();
+  }
+});
+
+it("rejects stale Run, expired lease and revoked grants before checkpoint mutation", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    const store = await prepareCheckpointWriter(db);
+    const input = {
+      caller: checkpointCaller,
+      runId: "checkpoint-run-1",
+      taskId: "task-1",
+      stepId: "checkpoint",
+      attemptId: "checkpoint-attempt-1",
+    };
+    await expect(
+      store.writeClaimedCheckpoint({ ...input, runId: "unrelated-run" }),
+    ).rejects.toThrow("Checkpoint writer Run binding conflict");
+    await db.transaction((tx) =>
+      tx.execute({
+        sql: "UPDATE task_step_leases SET expires_at = ? WHERE id = 'checkpoint-lease-1'",
+        args: [new Date(Date.now() - 1_000).toISOString()],
+      }),
+    );
+    await expect(store.writeClaimedCheckpoint(input)).rejects.toThrow(
+      "Checkpoint writer lease conflict",
+    );
+    await db.transaction(async (tx) => {
+      await tx.execute({
+        sql: "UPDATE task_step_leases SET expires_at = ? WHERE id = 'checkpoint-lease-1'",
+        args: [new Date(Date.now() + 60_000).toISOString()],
+      });
+      await tx.execute({
+        sql: "UPDATE grants SET revoked_at = ? WHERE id = 'checkpoint-read-grant'",
+        args: [now],
+      });
+    });
+    await expect(store.writeClaimedCheckpoint(input)).rejects.toThrow(
+      "Current task:read grant is required",
+    );
+    await db.transaction(async (tx) => {
+      await tx.execute("UPDATE grants SET revoked_at = NULL WHERE id = 'checkpoint-read-grant'");
+      await tx.execute({
+        sql: "UPDATE grants SET revoked_at = ? WHERE id = 'checkpoint-write-grant'",
+        args: [now],
+      });
+    });
+    await expect(store.writeClaimedCheckpoint(input)).rejects.toThrow(
+      "Current checkpoint write grant is required",
+    );
+    await db.transaction(async (tx) => {
+      expect((await tx.execute("SELECT id FROM task_checkpoints")).rows).toHaveLength(0);
+      expect(
+        (await tx.execute("SELECT checkpoint_ref FROM tasks WHERE id = 'task-1'")).rows[0]
+          ?.checkpoint_ref,
+      ).toBeNull();
+    });
+  } finally {
+    await db.close();
+  }
+});
+
+it("settles checkpoint Step cancellation after terminal Run without rewriting its checkpoint", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    const store = await prepareCheckpointWriter(db);
+    const input = {
+      caller: checkpointCaller,
+      runId: "checkpoint-run-1",
+      taskId: "task-1",
+      stepId: "checkpoint",
+      attemptId: "checkpoint-attempt-1",
+    };
+    const written = await store.writeClaimedCheckpoint(input);
+    await store.settleClaimedStep({
+      taskId: "task-1",
+      stepId: "checkpoint",
+      attemptId: "checkpoint-attempt-1",
+      leaseId: "checkpoint-lease-1",
+      ownerInstanceId: modelLeaseOwner("task-1", "checkpoint"),
+      expectedStepVersion: 3,
+      expectedLeaseVersion: 1,
+      outcome: "unknown",
+      evidenceRef: "trace:lost-response",
+      origin: system,
+    });
+    const decisionId = await addCancelDecision(db, { scope: scopeKey(checkpointCaller.scope) });
+    await store.requestDurableCancellation("task-1", {
+      kind: "decision",
+      decisionId,
+      actorPrincipalId: "owner",
+    });
+    const cancellation = () =>
+      store.settleQuarantinedReadOnlyStepCancellation({
+        taskId: "task-1",
+        stepId: "checkpoint",
+        attemptId: "checkpoint-attempt-1",
+        leaseId: "checkpoint-lease-1",
+        expectedStepVersion: 5,
+        expectedLeaseVersion: 2,
+        origin: system,
+      });
+    expect(await cancellation()).toBe("pending");
+    await db.transaction((tx) =>
+      tx.execute("UPDATE runs SET status = 'unknown' WHERE id = 'checkpoint-run-1'"),
+    );
+    expect(await cancellation()).toBe("settled");
+    await expect(store.writeClaimedCheckpoint(input)).rejects.toThrow();
+    await db.transaction(async (tx) => {
+      expect((await tx.execute("SELECT id,state_ref FROM task_checkpoints")).rows[0]).toMatchObject(
+        { id: written.checkpointId, state_ref: "state-one" },
+      );
+      expect(
+        (await tx.execute("SELECT status FROM task_attempts WHERE id = 'checkpoint-attempt-1'"))
+          .rows[0],
+      ).toMatchObject({ status: "canceled" });
+      expect(
+        (await tx.execute("SELECT state FROM task_step_leases WHERE id = 'checkpoint-lease-1'"))
+          .rows[0],
+      ).toMatchObject({ state: "released" });
+      expect(
+        (await tx.execute("SELECT COUNT(*) AS count FROM task_checkpoints")).rows[0]?.count,
+      ).toBe(1);
     });
   } finally {
     await db.close();

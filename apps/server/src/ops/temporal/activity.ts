@@ -6,7 +6,7 @@ import type { RunRecord } from "../../conversation/store.js";
 import { getLongWorkCaller, authorizeLongWorkAction } from "../long-work-authority.js";
 import { LongWorkScheduler } from "../long-work-scheduler.js";
 import { DEFAULT_TASK_GRAPH_LIMITS, TaskGraphError } from "../task-graph.js";
-import { parseTaskGetSpec } from "../tool-step-spec.js";
+import { parseCheckpointWriteSpec, parseTaskGetSpec } from "../tool-step-spec.js";
 import { parseWorkerTextFileSpec } from "../worker-file-spec.js";
 import type { AdvanceLongWorkActivity } from "./contracts.js";
 import { ClaimedWorkerDispatchError } from "../service.js";
@@ -31,7 +31,8 @@ function assertCurrentTask(task: AgentTask | null, policyRevision: number): Agen
 
 function modelExecutionRef(step: TaskStep): string | null {
   const ref = step.specRef;
-  if (step.kind === "tool") return ref && parseTaskGetSpec(ref) ? ref : null;
+  if (step.kind === "tool")
+    return ref && (parseTaskGetSpec(ref) || parseCheckpointWriteSpec(ref)) ? ref : null;
   return ref && /^(?:model|pi):.+$/u.test(ref) ? ref : null;
 }
 
@@ -94,13 +95,16 @@ async function settleModelRun(
     if (!(error instanceof AccessDeniedError)) throw error;
     authorizationDeniedId = error.decision.id;
   }
-  const outcome = authorizationDeniedId
-    ? "unknown"
-    : input.run.status === "succeeded" && input.run.resultText !== null
-      ? "review"
-      : input.run.status === "failed"
-        ? "failed"
-        : "unknown";
+  const checkpointMutation =
+    input.step.kind === "tool" && !!parseCheckpointWriteSpec(input.step.specRef ?? "");
+  const outcome =
+    authorizationDeniedId || checkpointMutation
+      ? "unknown"
+      : input.run.status === "succeeded" && input.run.resultText !== null
+        ? "review"
+        : input.run.status === "failed"
+          ? "failed"
+          : "unknown";
   const currentOrigin =
     decisionId === undefined
       ? ORIGIN
@@ -318,6 +322,30 @@ async function observeQuarantinedRunStep(
   if (!lease?.attemptId || lease.ownerInstanceId !== modelLeaseOwner(taskId, step.id))
     return "unresolved";
   const caller = await getLongWorkCaller(store, taskId);
+  if (step.kind === "tool" && parseCheckpointWriteSpec(step.specRef ?? "")) {
+    let decisionId: string;
+    try {
+      decisionId = await authorizeLongWorkAction(store, {
+        taskId,
+        caller,
+        resourceId: `task-${taskId}`,
+        action: "task:continue",
+      });
+    } catch (error) {
+      if (error instanceof AccessDeniedError) return "pending";
+      throw error;
+    }
+    const result = await store.longWork.reconcileQuarantinedCheckpointStep({
+      taskId,
+      stepId: step.id,
+      attemptId: lease.attemptId,
+      leaseId: lease.id,
+      expectedStepVersion: step.version,
+      expectedLeaseVersion: lease.version,
+      origin: { kind: "decision", decisionId, actorPrincipalId: caller.principalId },
+    });
+    return result.kind === "unresolved" ? "pending" : "settled";
+  }
   let run: RunRecord | null;
   try {
     run = await store.conversations.getInternalStepRun(caller, lease.attemptId);
@@ -797,11 +825,18 @@ export function createAdvanceLongWorkActivity(
         return { kind: "continue" };
       }
       if (step.kind === "model" || step.kind === "tool") {
+        const checkpointMutation =
+          step.kind === "tool" && !!parseCheckpointWriteSpec(step.specRef ?? "");
+        const validDelegation = checkpointMutation
+          ? step.delegatedPermissionSet.length === 1 &&
+            step.delegatedPermissionSet[0]?.resourceId === `task-${taskId}` &&
+            step.delegatedPermissionSet[0]?.action === "task:checkpoint:write"
+          : step.delegatedPermissionSet.length === 0;
         if (
           (step.kind === "model"
             ? step.requiredCapabilities.some((capability) => capability !== "text")
             : step.requiredCapabilities.length > 0) ||
-          step.delegatedPermissionSet.length > 0
+          !validDelegation
         ) {
           await store.longWork.transitionStep({
             taskId,

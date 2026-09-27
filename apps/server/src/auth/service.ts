@@ -93,7 +93,13 @@ async function delegatedTaskAllows(
 
   const technicalAction =
     (request.resourceId === `task-${taskId}` &&
-      ["task:read", "task:continue", "task:plan", "task:delegate"].includes(request.action)) ||
+      [
+        "task:read",
+        "task:continue",
+        "task:plan",
+        "task:delegate",
+        "task:checkpoint:write",
+      ].includes(request.action)) ||
     (request.conversationId !== undefined &&
       request.conversationId ===
         (runConversationId ?? optionalString(task.rows[0], "conversation_id")) &&
