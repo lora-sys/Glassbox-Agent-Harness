@@ -716,6 +716,12 @@ it("links a pristine same-scope child Task with no delegated permissions", async
       failurePolicy: "review_parent",
     });
     expect((await store.listSteps("task-1"))[0]).toMatchObject({ status: "running", version: 3 });
+    const childCriteria = await db.transaction((tx) =>
+      tx.execute("SELECT acceptance_criteria_json FROM tasks WHERE id = 'child-1'"),
+    );
+    expect(childCriteria.rows[0]?.acceptance_criteria_json).toBe(
+      JSON.stringify(["Return a verified result"]),
+    );
     expect(await store.getChildTaskLink("child-1")).toEqual(link);
     expect(await store.listChildTaskLinks("task-1", "child-step")).toEqual([link]);
     expect((await store.listEvents("task-1")).at(-1)).toMatchObject({
@@ -749,12 +755,16 @@ it("rejects child Task links with stale Step state, delegated permissions, or mi
       for (const [id, owner, scope] of [
         ["child-excess", "owner", "test"],
         ["child-scope", "owner", "other"],
+        ["child-mismatch", "owner", "test"],
       ]) {
         await tx.execute({
           sql: "INSERT INTO tasks(id,title,status,priority,creator_principal_id,origin_scope_key,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
           args: [id, id, "NEW", "normal", owner, scope, now, now],
         });
       }
+      await tx.execute(
+        "UPDATE tasks SET acceptance_criteria_json = '[\"Different criterion\"]' WHERE id = 'child-mismatch'",
+      );
     });
     const common = {
       parentTaskId: "task-1",
@@ -783,6 +793,14 @@ it("rejects child Task links with stale Step state, delegated permissions, or mi
         expectedStepVersion: 2,
       }),
     ).rejects.toThrow("Child Task must be a new Task in the same principal and scope");
+    await expect(
+      store.createChildTaskLink({
+        ...common,
+        childTaskId: "child-mismatch",
+        expectedStepVersion: 2,
+      }),
+    ).rejects.toThrow("Child Task acceptance criteria differ from the link");
+    expect((await store.listSteps("task-1"))[0]).toMatchObject({ status: "ready", version: 2 });
   } finally {
     await db.close();
   }

@@ -1854,6 +1854,9 @@ export class LongWorkStore {
         child.cancellation_state !== "none"
       )
         throw new Error("Child Task must be a new Task in the same principal and scope");
+      const existingCriteria = optionalString(child, "acceptance_criteria_json");
+      if (existingCriteria !== null && existingCriteria !== acceptanceCriteriaJson)
+        throw new Error("Child Task acceptance criteria differ from the link");
 
       const used = await tx.execute({
         sql: `SELECT
@@ -1915,6 +1918,15 @@ export class LongWorkStore {
         );
 
       const now = new Date().toISOString();
+      if (existingCriteria === null) {
+        const updatedChild = await tx.execute({
+          sql: `UPDATE tasks SET acceptance_criteria_json = ?, updated_at = ?
+            WHERE id = ? AND status = 'NEW' AND acceptance_criteria_json IS NULL`,
+          args: [acceptanceCriteriaJson, now, input.childTaskId],
+        });
+        if (updatedChild.rowsAffected !== 1)
+          throw new Error("Child Task acceptance criteria changed during linking");
+      }
       const updated = await tx.execute({
         sql: `UPDATE task_steps SET status = 'running', version = version + 1, updated_at = ?
           WHERE id = ? AND task_id = ? AND version = ? AND status IN ('ready','running')
