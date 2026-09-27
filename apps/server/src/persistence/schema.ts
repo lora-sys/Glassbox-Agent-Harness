@@ -288,6 +288,23 @@ export async function applySchemaV21Migration(tx: Transaction): Promise<void> {
   );
 }
 
+// Durable continuation timers are domain-neutral references. Occurrences are append-only
+// evidence; delivery acknowledgement is mutable and kept in a separate table.
+export const schemaV22Migration = [
+  `CREATE TABLE IF NOT EXISTS durable_continuation_schedules (id TEXT PRIMARY KEY, target_kind TEXT NOT NULL CHECK(target_kind IN ('task','activity')), target_id TEXT NOT NULL, cadence_kind TEXT NOT NULL CHECK(cadence_kind IN ('once','interval')), interval_ms INTEGER CHECK(interval_ms IS NULL OR interval_ms BETWEEN 1000 AND 31536000000), max_occurrences INTEGER NOT NULL CHECK(max_occurrences BETWEEN 1 AND 1000), end_at TEXT, created_at TEXT NOT NULL, initial_due_at TEXT NOT NULL, next_due_at TEXT, occurrence_count INTEGER NOT NULL DEFAULT 0 CHECK(occurrence_count >= 0 AND occurrence_count <= max_occurrences), generation INTEGER NOT NULL CHECK(generation >= 1), version INTEGER NOT NULL CHECK(version >= 1), status TEXT NOT NULL CHECK(status IN ('active','completed','cancelled')), updated_at TEXT NOT NULL, CHECK((cadence_kind = 'once' AND interval_ms IS NULL AND max_occurrences = 1 AND end_at IS NULL) OR (cadence_kind = 'interval' AND interval_ms IS NOT NULL)))`,
+  `CREATE INDEX IF NOT EXISTS durable_continuation_due ON durable_continuation_schedules(status,next_due_at,id)`,
+  `CREATE TABLE IF NOT EXISTS durable_continuation_occurrences (id TEXT PRIMARY KEY, schedule_id TEXT NOT NULL REFERENCES durable_continuation_schedules(id), target_kind TEXT NOT NULL CHECK(target_kind IN ('task','activity')), target_id TEXT NOT NULL, generation INTEGER NOT NULL CHECK(generation >= 1), ordinal INTEGER NOT NULL CHECK(ordinal >= 1), due_at TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(schedule_id,generation,ordinal))`,
+  `CREATE INDEX IF NOT EXISTS durable_continuation_occurrences_page ON durable_continuation_occurrences(schedule_id,ordinal)`,
+  `CREATE TRIGGER IF NOT EXISTS durable_continuation_occurrences_no_update BEFORE UPDATE ON durable_continuation_occurrences BEGIN SELECT RAISE(ABORT,'continuation occurrences are immutable'); END`,
+  `CREATE TRIGGER IF NOT EXISTS durable_continuation_occurrences_no_delete BEFORE DELETE ON durable_continuation_occurrences BEGIN SELECT RAISE(ABORT,'continuation occurrences are immutable'); END`,
+  `CREATE TABLE IF NOT EXISTS durable_continuation_deliveries (occurrence_id TEXT PRIMARY KEY REFERENCES durable_continuation_occurrences(id), status TEXT NOT NULL CHECK(status IN ('pending','acknowledged')), version INTEGER NOT NULL CHECK(version >= 1), acknowledged_at TEXT)`,
+  `CREATE INDEX IF NOT EXISTS durable_continuation_deliveries_pending ON durable_continuation_deliveries(status,occurrence_id)`,
+  `CREATE TABLE IF NOT EXISTS durable_continuation_events (sequence INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, schedule_id TEXT NOT NULL REFERENCES durable_continuation_schedules(id), type TEXT NOT NULL CHECK(type IN ('created','rescheduled','cancelled','fired')), target_kind TEXT NOT NULL CHECK(target_kind IN ('task','activity')), target_id TEXT NOT NULL, generation INTEGER NOT NULL CHECK(generation >= 1), schedule_version INTEGER NOT NULL CHECK(schedule_version >= 1), due_at TEXT, occurrence_id TEXT REFERENCES durable_continuation_occurrences(id), origin_kind TEXT NOT NULL CHECK(origin_kind IN ('decision','system')), decision_id TEXT, actor_principal_id TEXT, system_reason TEXT, created_at TEXT NOT NULL, CHECK((origin_kind = 'decision' AND decision_id IS NOT NULL AND actor_principal_id IS NOT NULL AND system_reason IS NULL) OR (origin_kind = 'system' AND decision_id IS NULL AND actor_principal_id IS NULL AND system_reason IS NOT NULL)), CHECK((type = 'fired' AND occurrence_id IS NOT NULL) OR (type <> 'fired' AND occurrence_id IS NULL)))`,
+  `CREATE INDEX IF NOT EXISTS durable_continuation_events_page ON durable_continuation_events(schedule_id,sequence)`,
+  `CREATE TRIGGER IF NOT EXISTS durable_continuation_events_no_update BEFORE UPDATE ON durable_continuation_events BEGIN SELECT RAISE(ABORT,'continuation events are immutable'); END`,
+  `CREATE TRIGGER IF NOT EXISTS durable_continuation_events_no_delete BEFORE DELETE ON durable_continuation_events BEGIN SELECT RAISE(ABORT,'continuation events are immutable'); END`,
+];
+
 export const schema = [
   ...baseSchema,
   ...schemaV7Statements,

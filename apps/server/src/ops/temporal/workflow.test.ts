@@ -3,6 +3,7 @@ import { LONG_WORK_CONTINUE_AFTER_ITERATIONS } from "./contracts.js";
 
 const temporal = vi.hoisted(() => ({
   advance: vi.fn(),
+  advanceContinuation: vi.fn(),
   continueAsNew: vi.fn(),
   condition: vi.fn(),
   setHandler: vi.fn(),
@@ -10,16 +11,42 @@ const temporal = vi.hoisted(() => ({
 
 vi.mock("@temporalio/workflow", () => ({
   defineSignal: (name: string) => name,
-  proxyActivities: () => ({ advanceLongWork: temporal.advance }),
+  proxyActivities: () => ({
+    advanceLongWork: temporal.advance,
+    advanceContinuation: temporal.advanceContinuation,
+  }),
   continueAsNew: temporal.continueAsNew,
   condition: temporal.condition,
   setHandler: temporal.setHandler,
 }));
 
-import { longWorkWorkflow } from "./workflow.js";
+import { continuationWorkflow, longWorkWorkflow } from "./workflow.js";
 
 beforeEach(() => {
   vi.clearAllMocks();
+});
+
+it("reloads a continuation schedule after a wake and rolls over with the same ID", async () => {
+  const input = { scheduleId: "schedule-1" };
+  let advances = 0;
+  temporal.advanceContinuation.mockImplementation(async () => {
+    advances += 1;
+    if (advances < LONG_WORK_CONTINUE_AFTER_ITERATIONS) return { kind: "continue" };
+    if (advances === LONG_WORK_CONTINUE_AFTER_ITERATIONS)
+      return { kind: "wait", wakeAt: "2030-01-01T00:00:00.000Z" };
+    return { kind: "complete" };
+  });
+  temporal.continueAsNew.mockImplementation((continuedInput: typeof input) =>
+    continuationWorkflow(continuedInput),
+  );
+
+  await continuationWorkflow(input);
+
+  expect(temporal.continueAsNew).toHaveBeenCalledExactlyOnceWith(input);
+  expect(temporal.advanceContinuation).toHaveBeenCalledTimes(
+    LONG_WORK_CONTINUE_AFTER_ITERATIONS + 1,
+  );
+  expect(temporal.condition).not.toHaveBeenCalled();
 });
 
 it("passes the same Task identity and policy revision through bounded rollover", async () => {

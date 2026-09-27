@@ -3,6 +3,7 @@ import type {
   AgentOpsSnapshot,
   AgentTask,
   ChildTaskLink,
+  DurableContinuationCadence,
   TaskPriority,
   TaskSignal,
   TaskStep,
@@ -23,6 +24,10 @@ import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import type { WorkspaceRegistry } from "../workspace/registry.js";
 import { WorkspaceWriteOccupancy, type WriteOccupancyLease } from "../workspace/write-occupancy.js";
 import type { ClaimedTaskStep } from "./long-work-store.js";
+import {
+  AuthorizedContinuationService,
+  type ContinuationRuntimePort,
+} from "./continuation-service.js";
 
 export interface WorkerPolicy {
   databasePath: string;
@@ -89,7 +94,43 @@ export class AuthorizedOpsService {
     private readonly workerPolicy?: WorkerPolicy,
     private readonly longWorkRuntime?: LongWorkRuntimePort,
     private readonly workspaceBoundary?: WorkerWorkspaceBoundary,
+    private readonly continuationRuntime?: ContinuationRuntimePort,
   ) {}
+
+  scheduleContinuation(
+    caller: CallerContext,
+    input: {
+      scheduleId: string;
+      taskId: string;
+      nextDueAt: string;
+      cadence: DurableContinuationCadence;
+    },
+  ) {
+    return new AuthorizedContinuationService(this.store, this.continuationRuntime).scheduleTask(
+      caller,
+      input,
+    );
+  }
+
+  rescheduleContinuation(
+    caller: CallerContext,
+    input: { taskId: string; scheduleId: string; expectedVersion: number; nextDueAt: string },
+  ) {
+    return new AuthorizedContinuationService(this.store, this.continuationRuntime).rescheduleTask(
+      caller,
+      input,
+    );
+  }
+
+  cancelFutureContinuation(
+    caller: CallerContext,
+    input: { taskId: string; scheduleId: string; expectedVersion: number },
+  ) {
+    return new AuthorizedContinuationService(this.store, this.continuationRuntime).cancelFutureTask(
+      caller,
+      input,
+    );
+  }
 
   private async workerContext(
     caller: CallerContext,

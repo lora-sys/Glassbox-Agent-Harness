@@ -6,6 +6,7 @@ import { WorkspaceRegistry } from "../../workspace/registry.js";
 import { WorkspaceWriteOccupancy } from "../../workspace/write-occupancy.js";
 import { AuthorizedOpsService } from "../service.js";
 import { createAdvanceLongWorkActivity } from "./activity.js";
+import { createAdvanceContinuationActivity } from "./continuation-activity.js";
 import { connectLongWorkWorkflowClient } from "./client.js";
 import { HerdrWorkerRuntime } from "./herdr-worker-runtime.js";
 import { startLongWorkWorker } from "./worker.js";
@@ -40,6 +41,9 @@ async function main(): Promise<void> {
       address,
       namespace: process.env.GLASSBOX_TEMPORAL_NAMESPACE ?? "default",
       advanceLongWork: createAdvanceLongWorkActivity(store, workers, (taskId) =>
+        connectedWakeClient.workflows.wake(taskId),
+      ),
+      advanceContinuation: createAdvanceContinuationActivity(store, (taskId) =>
         connectedWakeClient.workflows.wake(taskId),
       ),
     });

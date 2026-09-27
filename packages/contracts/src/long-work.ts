@@ -205,3 +205,62 @@ export interface TaskWorkflowBinding {
   status: "starting" | "running" | "unavailable" | "closed";
   updatedAt: string;
 }
+
+/** Domain-neutral pointer for a durable continuation. It never carries instructions. */
+export interface DurableContinuationTarget {
+  kind: "task" | "activity";
+  targetId: string;
+}
+
+export type DurableContinuationCadence =
+  | { kind: "once" }
+  | { kind: "interval"; intervalMs: number; maxOccurrences: number; endAt?: string };
+
+export type DurableContinuationStatus = "active" | "completed" | "cancelled";
+
+export interface DurableContinuationSchedule {
+  id: string;
+  target: DurableContinuationTarget;
+  cadence: DurableContinuationCadence;
+  createdAt: string;
+  nextDueAt: string | null;
+  occurrenceCount: number;
+  generation: number;
+  version: number;
+  status: DurableContinuationStatus;
+  updatedAt: string;
+}
+
+/** A fired timer is immutable evidence, even if its schedule is later rescheduled. */
+export interface DurableContinuationOccurrence {
+  id: string;
+  scheduleId: string;
+  target: DurableContinuationTarget;
+  generation: number;
+  ordinal: number;
+  dueAt: string;
+  createdAt: string;
+}
+
+export interface PendingContinuationDelivery {
+  occurrence: DurableContinuationOccurrence;
+  version: number;
+}
+
+export type DurableContinuationOrigin =
+  | { kind: "decision"; decisionId: string; actorPrincipalId: string }
+  | { kind: "system"; reason: string };
+
+export interface DurableContinuationEvent {
+  id: string;
+  sequence: number;
+  scheduleId: string;
+  type: "created" | "rescheduled" | "cancelled" | "fired";
+  target: DurableContinuationTarget;
+  generation: number;
+  version: number;
+  dueAt: string | null;
+  occurrenceId?: string;
+  origin: DurableContinuationOrigin;
+  createdAt: string;
+}

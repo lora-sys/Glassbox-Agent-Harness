@@ -1,9 +1,12 @@
 import { Client, Connection, WorkflowNotFoundError } from "@temporalio/client";
 import {
+  CONTINUATION_WORKFLOW_TYPE,
   LONG_WORK_TASK_QUEUE,
   LONG_WORK_WAKE_SIGNAL,
   LONG_WORK_WORKFLOW_TYPE,
+  continuationWorkflowId,
   longWorkWorkflowId,
+  type ContinuationWorkflowInput,
   type LongWorkWorkflowInput,
 } from "./contracts.js";
 
@@ -12,7 +15,7 @@ export interface LongWorkWorkflowClientPort {
     workflowType: string;
     workflowId: string;
     taskQueue: string;
-    args: [LongWorkWorkflowInput];
+    args: [LongWorkWorkflowInput] | [ContinuationWorkflowInput];
   }): Promise<{ workflowId: string; runId?: string }>;
   wake(workflowId: string): Promise<void>;
   cancel(workflowId: string): Promise<void>;
@@ -58,6 +61,31 @@ export function createLongWorkWorkflowClient(
   };
 }
 
+export function createContinuationWorkflowClient(
+  port: LongWorkWorkflowClientPort,
+  taskQueue = LONG_WORK_TASK_QUEUE,
+) {
+  return {
+    start(input: ContinuationWorkflowInput) {
+      return port.start({
+        workflowType: CONTINUATION_WORKFLOW_TYPE,
+        workflowId: continuationWorkflowId(input.scheduleId),
+        taskQueue,
+        args: [input],
+      });
+    },
+    wake(scheduleId: string) {
+      return port.wake(continuationWorkflowId(scheduleId));
+    },
+    cancel(scheduleId: string) {
+      return port.cancel(continuationWorkflowId(scheduleId));
+    },
+    inspect(scheduleId: string) {
+      return port.inspect(continuationWorkflowId(scheduleId));
+    },
+  };
+}
+
 export async function connectLongWorkWorkflowClient(options: {
   address: string;
   namespace?: string;
@@ -65,39 +93,39 @@ export async function connectLongWorkWorkflowClient(options: {
 }) {
   const connection = await Connection.connect({ address: options.address });
   const client = new Client({ connection, namespace: options.namespace });
-  const workflows = createLongWorkWorkflowClient(
-    {
-      async start(input) {
-        const handle = await client.workflow.start(input.workflowType, {
-          workflowId: input.workflowId,
-          taskQueue: input.taskQueue,
-          args: input.args,
-        });
-        return {
-          workflowId: handle.workflowId,
-          runId: handle.firstExecutionRunId,
-        };
-      },
-      async wake(workflowId) {
-        await client.workflow.getHandle(workflowId).signal(LONG_WORK_WAKE_SIGNAL);
-      },
-      async cancel(workflowId) {
-        await client.workflow.getHandle(workflowId).cancel();
-      },
-      async inspect(workflowId) {
-        try {
-          const observed = await client.workflow.getHandle(workflowId).describe();
-          return { runId: observed.runId, running: observed.status.name === "RUNNING" };
-        } catch (error) {
-          if (error instanceof WorkflowNotFoundError) return null;
-          throw error;
-        }
-      },
+  const port: LongWorkWorkflowClientPort = {
+    async start(input) {
+      const handle = await client.workflow.start(input.workflowType, {
+        workflowId: input.workflowId,
+        taskQueue: input.taskQueue,
+        args: input.args,
+      });
+      return {
+        workflowId: handle.workflowId,
+        runId: handle.firstExecutionRunId,
+      };
     },
-    options.taskQueue,
-  );
+    async wake(workflowId) {
+      await client.workflow.getHandle(workflowId).signal(LONG_WORK_WAKE_SIGNAL);
+    },
+    async cancel(workflowId) {
+      await client.workflow.getHandle(workflowId).cancel();
+    },
+    async inspect(workflowId) {
+      try {
+        const observed = await client.workflow.getHandle(workflowId).describe();
+        return { runId: observed.runId, running: observed.status.name === "RUNNING" };
+      } catch (error) {
+        if (error instanceof WorkflowNotFoundError) return null;
+        throw error;
+      }
+    },
+  };
+  const workflows = createLongWorkWorkflowClient(port, options.taskQueue);
+  const continuations = createContinuationWorkflowClient(port, options.taskQueue);
   return {
     workflows,
+    continuations,
     probe: () => probeTemporalServer(connection),
     close: () => connection.close(),
   };

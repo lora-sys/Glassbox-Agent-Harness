@@ -158,7 +158,10 @@ import { OpsReconciler } from "../ops/reconciler.js";
 import { DurableWorkerObserver } from "../ops/durable-worker-observer.js";
 import { readLongWorkHealth } from "../ops/long-work-health.js";
 import { TemporalLongWorkCoordinator } from "../ops/temporal/coordinator.js";
+import { TemporalContinuationCoordinator } from "../ops/temporal/continuation-coordinator.js";
+import type { ContinuationRuntimePort } from "../ops/continuation-service.js";
 import { connectLongWorkWorkflowClient } from "../ops/temporal/client.js";
+
 import type { HerdrBridge } from "../ops/herdr-bridge.js";
 import { openDomainStore, type DomainStore } from "../application/domain-store.js";
 import {
@@ -190,6 +193,13 @@ import {
   type ToolSurfaceCandidate,
   type ToolExclusionReason,
 } from "../runtime/pi/tool-plane.js";
+
+type ConnectedTemporal = Awaited<ReturnType<typeof connectLongWorkWorkflowClient>>;
+type TemporalConnector = (options: Parameters<typeof connectLongWorkWorkflowClient>[0]) => Promise<
+  Omit<ConnectedTemporal, "continuations"> & {
+    continuations?: ConnectedTemporal["continuations"];
+  }
+>;
 
 const OWNER_ID = "owner";
 const AGENT_ID = "personal";
@@ -387,7 +397,7 @@ export class ManagementApplication {
         protectedValues?: readonly string[];
       };
       temporal?: { address: string; namespace?: string };
-      temporalConnector?: typeof connectLongWorkWorkflowClient;
+      temporalConnector?: TemporalConnector;
     },
     store: DomainStore,
     channels: ChannelProfileStore,
@@ -595,7 +605,7 @@ export class ManagementApplication {
       protectedValues?: readonly string[];
     };
     temporal?: { address: string; namespace?: string };
-    temporalConnector?: typeof connectLongWorkWorkflowClient;
+    temporalConnector?: TemporalConnector;
   }): Promise<ManagementApplication> {
     const channels = await ChannelProfileStore.open(options.dataDirectory);
     const groupRuntime = await GroupRuntimeStore.open(options.dataDirectory);
@@ -735,6 +745,7 @@ export class ManagementApplication {
   private piModelCatalog?: PiModelCatalog;
   private opsReconciler?: OpsReconciler;
   private temporalRuntime?: TemporalLongWorkCoordinator;
+  private continuationRuntime?: TemporalContinuationCoordinator;
   private temporalClose?: () => Promise<void>;
   private temporalProbe?: () => Promise<"reachable" | "unavailable">;
   private temporalProbePending?: Promise<{
@@ -775,6 +786,27 @@ export class ManagementApplication {
       }
     },
   };
+  private readonly continuationRuntimePort: ContinuationRuntimePort = {
+    start: (scheduleId) => this.runContinuationRuntime(scheduleId, "start"),
+    wake: (scheduleId) => this.runContinuationRuntime(scheduleId, "wake"),
+    stop: (scheduleId) => this.runContinuationRuntime(scheduleId, "stop"),
+  };
+
+  private async runContinuationRuntime(
+    scheduleId: string,
+    action: "start" | "wake" | "stop",
+  ): Promise<void> {
+    if (!this.continuationRuntime) {
+      this.scheduleTemporalRecovery();
+      throw new Error("Temporal continuation runtime is unavailable");
+    }
+    try {
+      await this.continuationRuntime[action](scheduleId);
+    } catch (error) {
+      this.scheduleTemporalRecovery();
+      throw error;
+    }
+  }
 
   private scheduleTemporalRecovery(): void {
     if (!this.options.temporal || this.closed || this.temporalRetry) return;
@@ -787,6 +819,12 @@ export class ManagementApplication {
       }
       this.temporalRecovering = this.temporalRuntime
         .recover()
+        .then(async (tasks) => {
+          const schedules = await this.continuationRuntime?.recover();
+          return {
+            unavailable: [...tasks.unavailable, ...(schedules?.unavailable ?? [])],
+          };
+        })
         .then((result) => {
           this.temporalFailure = result.unavailable.length
             ? `${result.unavailable.length} workflow bindings unavailable`
@@ -808,7 +846,7 @@ export class ManagementApplication {
     if (!this.options.temporal || this.closed || this.temporalRuntime) return Promise.resolve();
     if (this.temporalConnecting) return this.temporalConnecting;
     this.temporalConnecting = (async () => {
-      let connection: Awaited<ReturnType<typeof connectLongWorkWorkflowClient>> | undefined;
+      let connection: Awaited<ReturnType<TemporalConnector>> | undefined;
       try {
         connection = await (this.options.temporalConnector ?? connectLongWorkWorkflowClient)(
           this.options.temporal!,
@@ -819,14 +857,21 @@ export class ManagementApplication {
         }
         const coordinator = new TemporalLongWorkCoordinator(this.store, connection.workflows);
         const recovery = await coordinator.recover();
+        const continuationCoordinator = connection.continuations
+          ? new TemporalContinuationCoordinator(this.store.continuations, connection.continuations)
+          : undefined;
+        const continuationRecovery = await continuationCoordinator?.recover();
         this.temporalRuntime = coordinator;
+        this.continuationRuntime = continuationCoordinator;
         this.temporalClose = connection.close;
         this.temporalProbe = connection.probe;
         this.temporalProbeCache = undefined;
-        this.temporalFailure = recovery.unavailable.length
-          ? `${recovery.unavailable.length} workflow bindings unavailable`
+        const unavailableCount =
+          recovery.unavailable.length + (continuationRecovery?.unavailable.length ?? 0);
+        this.temporalFailure = unavailableCount
+          ? `${unavailableCount} workflow bindings unavailable`
           : null;
-        if (recovery.unavailable.length) this.scheduleTemporalRecovery();
+        if (unavailableCount) this.scheduleTemporalRecovery();
       } catch {
         await connection?.close().catch(() => undefined);
         this.temporalFailure = "Temporal connection or reconciliation failed";
@@ -1480,6 +1525,7 @@ export class ManagementApplication {
               this.options.ops!.workerPolicy,
               this.longWorkRuntimePort,
               { registry: this.workspaces, writes: this.workspaceWrites },
+              this.continuationRuntimePort,
             ),
             workerTarget: this.options.ops!.workerTarget,
             getContext,

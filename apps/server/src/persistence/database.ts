@@ -26,6 +26,7 @@ import {
   applySchemaV19Migration,
   schemaV20Migration,
   applySchemaV21Migration,
+  schemaV22Migration,
 } from "./schema.js";
 
 export function localDatabaseUrl(databasePath: string): string {
@@ -71,7 +72,7 @@ export class DomainDatabase {
         const version = Number(
           (await tx.execute("PRAGMA user_version")).rows[0]?.user_version ?? 0,
         );
-        if (version > 21) throw new Error("Unsupported database schema version");
+        if (version > 22) throw new Error("Unsupported database schema version");
         if (version === 0) {
           await tx.batch(schema);
           await tx.batch(schemaV15Migration);
@@ -81,7 +82,8 @@ export class DomainDatabase {
           await tx.batch(schemaV19Migration);
           await tx.batch(schemaV20Migration);
           await applySchemaV21Migration(tx);
-          await tx.execute("PRAGMA user_version = 21");
+          await tx.batch(schemaV22Migration);
+          await tx.execute("PRAGMA user_version = 22");
         } else {
           if (version < 2) {
             await tx.batch(schemaV2Migration);
@@ -110,7 +112,8 @@ export class DomainDatabase {
           if (version < 19) await applySchemaV19Migration(tx);
           if (version < 20) await tx.batch(schemaV20Migration);
           if (version < 21) await applySchemaV21Migration(tx);
-          await tx.execute("PRAGMA user_version = 21");
+          if (version < 22) await tx.batch(schemaV22Migration);
+          await tx.execute("PRAGMA user_version = 22");
         }
       });
       return db;

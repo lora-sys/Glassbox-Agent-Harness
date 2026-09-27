@@ -1,6 +1,6 @@
 import { NativeConnection, Worker } from "@temporalio/worker";
 import { fileURLToPath } from "node:url";
-import type { AdvanceLongWorkActivity } from "./contracts.js";
+import type { AdvanceContinuationActivity, AdvanceLongWorkActivity } from "./contracts.js";
 import { LONG_WORK_TASK_QUEUE } from "./contracts.js";
 
 export interface LongWorkWorkerOptions {
@@ -8,6 +8,7 @@ export interface LongWorkWorkerOptions {
   namespace?: string;
   taskQueue?: string;
   advanceLongWork: AdvanceLongWorkActivity;
+  advanceContinuation: AdvanceContinuationActivity;
 }
 
 /** Starts a worker for the durable coordinator. Activities must be idempotent. */
@@ -18,7 +19,10 @@ export async function startLongWorkWorker(options: LongWorkWorkerOptions) {
     namespace: options.namespace,
     taskQueue: options.taskQueue ?? LONG_WORK_TASK_QUEUE,
     workflowsPath: fileURLToPath(new URL("./workflow.ts", import.meta.url)),
-    activities: { advanceLongWork: options.advanceLongWork },
+    activities: {
+      advanceLongWork: options.advanceLongWork,
+      advanceContinuation: options.advanceContinuation,
+    },
   });
 
   const run = worker.run();

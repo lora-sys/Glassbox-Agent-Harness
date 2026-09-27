@@ -20,6 +20,14 @@ export type {
   ChildTaskLink,
   TaskStepLease,
   TaskWorkflowBinding,
+  DurableContinuationTarget,
+  DurableContinuationOrigin,
+  DurableContinuationCadence,
+  DurableContinuationStatus,
+  DurableContinuationSchedule,
+  DurableContinuationOccurrence,
+  DurableContinuationEvent,
+  PendingContinuationDelivery,
 } from "./long-work.js";
 export { RUN_INTEGRITY_SUITE } from "./evals.js";
 export type {
