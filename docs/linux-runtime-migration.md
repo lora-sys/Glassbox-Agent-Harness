@@ -1,0 +1,60 @@
+# Linux runtime migration
+
+Issue: #30. This runbook records the migration from the existing Windows service to a Linux runtime. Keep the Windows service and its data available for rollback until the Linux QQ, Worker, browser, sandbox, and restart paths pass real acceptance.
+
+## Availability limit
+
+WSL runs on the Windows host. A Windows sleep, shutdown, or reboot interrupts the WSL services. Linux `systemd` can restart services when the distribution starts, but a `systemd` service does not keep the WSL distribution alive. Continuous service during host downtime requires an independent Linux host.
+
+## Frozen baseline
+
+Record actual versions and results again immediately before cutover. Do not infer a working QQ login from an open OneBot port.
+
+| Component | Current migration baseline |
+| --- | --- |
+| Glassbox | Same commit on Windows and Linux, before cutover |
+| Node.js | 24.21.0 Linux x64 |
+| npm | 12.0.2 |
+| Pi | 0.85.1, loaded through the pinned Kit |
+| Lora PI Kit | Commit `513063950dc0d9dcd4835d6fcc79814728e98b35` |
+| NapCat | v4.18.28, identified by the SHA256 of the installed `napcat.mjs` and the official release asset |
+| Herdr | 0.9.0 Linux x86_64 |
+| agent-browser | 0.38.1 |
+| Linux browser | Chrome for Testing 154.0.8037.57, pending launch smoke |
+
+The pinned Kit commit is currently not obtainable from its GitHub remote. The Kit lock also contains `registry.npmmirror.com` URLs, so npm 12 requires that registry for `npm ci`. Publish the exact Kit commit or replace the pin with a reviewed reachable commit before claiming a clean Linux rebuild. The configured sandbox image ID must also be present and checked against `locks/sandbox-image.json` before a sandbox smoke.
+
+## WSL checkpoint on 2026-09-27
+
+- Ubuntu 26.04.1 WSL2 has an independent Linux filesystem checkout at the same Glassbox commit as the Windows baseline.
+- Linux Node and npm were installed from pinned versions. `npm ci` succeeded independently for Glassbox and Kit. Kit doctor passed.
+- Glassbox `vp run verify:full` passed with 1482 unit tests passed and one existing live Herdr test skipped. Core checks and Web build passed.
+- Glassbox started with disposable Linux data on a separate port. An unauthenticated management request returned 401. That instance was then stopped.
+- A consistent Windows SQLite backup with schema version 11 passed `PRAGMA quick_check`. Its protected Linux copy has the same SHA256. It is a staging snapshot, not a cutover copy.
+- Linux Herdr 0.9.0, `agent-browser` 0.38.1, Chrome for Testing, `rg`, and `fd` are installed. Chrome has not yet launched because Linux libraries are missing. Linux Docker and NapCat are not yet ready.
+- The Windows Glassbox, NapCat, and Herdr processes remain active. Real Linux QQ and Worker acceptance have not run.
+
+## Prepare an independent Linux checkout
+
+1. Clone Glassbox and Kit into the Linux filesystem, such as `~/src`. Do not run the Linux service from `/mnt/c` or copy Windows `node_modules` or native binaries.
+2. Run `scripts/setup-linux-toolchain.sh` to install the locked Linux Node and npm versions. Put the reported `bin` directory first in the PATH used by builds and services. The script verifies the Node archive against the official `SHASUMS256.txt` before extracting it.
+3. Install `git`, `rg`, `fd`, browser libraries, a Linux Docker backend, and Linux browser binaries. On Ubuntu, the `fd-find` package installs `fdfind`; provide an `fd` command for tool compatibility.
+4. Run `npm ci` independently in Glassbox and the pinned Kit checkout. Run Kit doctor and Glassbox `vp run verify:full` in Linux. Keep their results separate from Windows verification.
+5. Prepare Linux Herdr, NapCat, QQ, browser, sandbox image, and protected service configuration. Pin exact releases or image digests. Use Linux paths and executables in the Linux service configuration.
+
+Do not place provider keys, QQ credentials, management tokens, or the live database in the repository. The Linux `service-launch.json` belongs in an access restricted data directory. Keep the Windows and Linux process registries separate.
+
+## Bridge and cutover
+
+1. Record Windows process identities, service versions, current database schema, live QQ result, and a consistent database backup. Identify the only active Glassbox consumer.
+2. Stop the Windows Glassbox process before starting the Linux Glassbox consumer against transferred durable state. Never let Windows and Linux write the same SQLite file through `/mnt/c`.
+3. Keep Windows NapCat as the temporary QQ protocol endpoint. Connect Linux Glassbox through the configured OneBot contract and verify one Owner private message and one group activation with Run and delivery evidence.
+4. Stop the Windows NapCat bot process. Start the pinned Linux NapCat and Linux QQ runtime using its own Linux profile. Verify account login, OneBot connection, private and group replies, and Trace provenance. Never leave both bot runtimes active.
+5. Move the Herdr service and Worker workspace to Linux. Verify a disposable delegated Task through review and acceptance. Then verify Memory and retrieval, protected QQ tools, Web, Pi basic tools, browser, sandbox, and restart recovery.
+6. Stop remaining Windows project runtime processes. Confirm the Linux runtime works without a Windows executable or project process. The Windows host still needs to be awake while WSL runs.
+
+If the Linux path fails before it writes new durable state, stop the Linux consumer and restore the verified Windows service. After Linux has written state, check schema and current authority before any rollback. Never overwrite newer durable state with an old backup.
+
+## Completion evidence
+
+Keep distinct records for WSL parity, clean Linux rebuild, and real Linux full stack smoke. Deterministic tests and a reachable port do not prove QQ login, delivery, Worker acceptance, sandbox isolation, or recovery after host restart. Record each acceptance as passed, failed, or untested with the runtime, checkout, and timestamp that produced the evidence.
