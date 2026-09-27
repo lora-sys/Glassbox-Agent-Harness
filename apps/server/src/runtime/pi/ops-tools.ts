@@ -78,6 +78,7 @@ export function createOpsTools(options: {
         Type.Literal("join"),
         Type.Literal("model"),
         Type.Literal("tool"),
+        Type.Literal("herdr_worker"),
       ]),
       title: Type.String({ minLength: 1, maxLength: 256 }),
       dependencyIds,
@@ -93,6 +94,7 @@ export function createOpsTools(options: {
       targetTaskId: Type.Optional(
         Type.String({ minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$" }),
       ),
+      workerAccess: Type.Optional(Type.Union([Type.Literal("read"), Type.Literal("write")])),
     },
     { additionalProperties: false },
   );
@@ -372,19 +374,20 @@ export function createOpsTools(options: {
       rootStepId: string;
       steps: Array<{
         id: string;
-        kind: "timer_wait" | "signal_wait" | "join" | "model" | "tool";
+        kind: "timer_wait" | "signal_wait" | "join" | "model" | "tool" | "herdr_worker";
         title: string;
         dependencyIds: string[];
         instructions?: string;
         durationMs?: number;
         signalKey?: string;
         targetTaskId?: string;
+        workerAccess?: "read" | "write";
       }>;
     }>({
       ...common,
       name: "task_plan",
       description:
-        "Plan bounded timer, signal-wait, join, text-only model, and read-only task_get Tool steps for an authorized Task. Approval, Worker, child Task, and shell steps are unavailable.",
+        "Plan bounded timer, signal-wait, join, text-only model, read-only task_get Tool, and configured Pi Herdr Worker steps for an authorized Task. Approval, child Task, and shell steps are unavailable.",
       parameters: Type.Object(
         {
           taskId,
@@ -398,6 +401,7 @@ export function createOpsTools(options: {
       execute: async (params, context) => {
         for (const step of params.steps) {
           if (
+            (step.kind !== "herdr_worker" && step.workerAccess !== undefined) ||
             (step.kind === "timer_wait" &&
               (step.durationMs === undefined ||
                 step.signalKey !== undefined ||
@@ -424,7 +428,13 @@ export function createOpsTools(options: {
                 !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(step.targetTaskId) ||
                 step.instructions !== undefined ||
                 step.durationMs !== undefined ||
-                step.signalKey !== undefined))
+                step.signalKey !== undefined)) ||
+            (step.kind === "herdr_worker" &&
+              (!step.instructions?.trim() ||
+                !step.workerAccess ||
+                step.durationMs !== undefined ||
+                step.signalKey !== undefined ||
+                step.targetTaskId !== undefined))
           )
             throw new Error(`Invalid fields for planned ${step.kind} step ${step.id}`);
         }
@@ -436,6 +446,25 @@ export function createOpsTools(options: {
         const executionRef = sourceRun?.executionRef;
         if (executionRef !== undefined && !/^(?:model|pi):.+$/u.test(executionRef))
           throw new Error("Model Step requires a configured model Run");
+        const workerPermissions = new Map<
+          string,
+          Awaited<ReturnType<AuthorizedOpsService["plannedWorkerPermissions"]>>
+        >();
+        for (const step of params.steps) {
+          if (step.kind !== "herdr_worker") continue;
+          if (options.workerTarget.agentKind !== "pi" || !options.workerTarget.worktreePath)
+            throw new Error("Configured Pi Herdr Worker is unavailable");
+          workerPermissions.set(
+            step.id,
+            await options.service.plannedWorkerPermissions(
+              context.caller,
+              params.taskId,
+              options.workerTarget.worktreePath,
+              step.workerAccess!,
+              { runId: context.runId, conversationId: context.conversationId },
+            ),
+          );
+        }
         const steps = params.steps.map((step) => {
           const waitPolicy =
             step.kind === "timer_wait"
@@ -462,7 +491,9 @@ export function createOpsTools(options: {
               ? { instructions: step.instructions, specRef: executionRef }
               : step.kind === "tool"
                 ? { specRef: `tool:task_get:${step.targetTaskId}` }
-                : {}),
+                : step.kind === "herdr_worker"
+                  ? { instructions: step.instructions }
+                  : {}),
             status: "pending" as const,
             dependencyIds: step.dependencyIds,
             dependencyPolicy: {
@@ -473,7 +504,7 @@ export function createOpsTools(options: {
             maxAttempts: 3,
             waitPolicy,
             requiredCapabilities: step.kind === "model" ? ["text"] : [],
-            delegatedPermissionSet: [],
+            delegatedPermissionSet: workerPermissions.get(step.id) ?? [],
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
             version: 1,

@@ -280,6 +280,70 @@ export class AuthorizedOpsService {
     return this.store.longWork.listEvents(taskId, afterSequence);
   }
 
+  /** Resolves only the configured Pi workspace authority for a planned Worker Step. */
+  async plannedWorkerPermissions(
+    caller: CallerContext,
+    taskId: string,
+    root: string,
+    access: "read" | "write",
+    evidence?: RunEvidence,
+  ): Promise<TaskStep["delegatedPermissionSet"]> {
+    await this.authorize(caller, `task-${taskId}`, "task:plan", evidence);
+    if (!this.workerPolicy || !this.workspaceBoundary || !isAbsolute(root))
+      throw new Error("Configured Pi Worker workspace is unavailable");
+    const canonicalRoot = await realpath(root);
+    let workspaceId: string | undefined;
+    for (const entry of await this.workspaceBoundary.registry.listForPrincipal(
+      caller.principalId,
+    )) {
+      let candidate;
+      try {
+        candidate = await this.workspaceBoundary.registry.resolveAuthorized(
+          caller.principalId,
+          entry.id,
+          "read",
+        );
+      } catch {
+        continue;
+      }
+      if (candidate.canonicalPath === canonicalRoot) {
+        workspaceId = entry.id;
+        break;
+      }
+    }
+    if (!workspaceId) throw new Error("Configured Worker directory is not a granted workspace");
+    await this.workspaceBoundary.registry.resolveAuthorized(
+      caller.principalId,
+      workspaceId,
+      access,
+    );
+    const required = [
+      { resourceId: this.workerPolicy.resourceId, action: `worker:file:${access}` },
+      { resourceId: `workspace:${workspaceId}`, action: `workspace:${access}` },
+    ];
+    for (const permission of required)
+      await this.authorize(caller, permission.resourceId, permission.action, {
+        ...evidence,
+        delegatedTaskId: taskId,
+      });
+    if (access === "read") return required;
+    const optionalRead = [
+      { resourceId: this.workerPolicy.resourceId, action: "worker:file:read" },
+      { resourceId: `workspace:${workspaceId}`, action: "workspace:read" },
+    ];
+    for (const permission of optionalRead) {
+      const decision = await this.store.authorization.check({
+        caller,
+        resourceId: permission.resourceId,
+        action: permission.action,
+        delegatedTaskId: taskId,
+        ...evidence,
+      });
+      if (decision.decision !== "ALLOW") return required;
+    }
+    return [...required, ...optionalRead];
+  }
+
   async planExistingTask(
     caller: CallerContext,
     taskId: string,

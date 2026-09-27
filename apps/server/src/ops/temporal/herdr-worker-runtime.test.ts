@@ -95,6 +95,16 @@ it("dispatches one Worker, reviews and cancels it safely, and quarantines an unc
       registry,
       writes,
     });
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: `task-${task.id}`,
+      action: "task:plan",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    expect(await service.plannedWorkerPermissions(caller, task.id, project, "write")).toEqual(
+      step.delegatedPermissionSet,
+    );
     const workers = new HerdrWorkerRuntime(store, service, bridge, {
       workspaceId: "herdr-workspace",
       agentKind: "pi",

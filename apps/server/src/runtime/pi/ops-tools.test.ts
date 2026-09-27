@@ -111,6 +111,7 @@ it("denies an ungranted Pi delegate before starting any worker", async () => {
         "signalKey",
         "targetTaskId",
         "title",
+        "workerAccess",
       ].sort(),
     );
     await expect(
@@ -255,16 +256,24 @@ it("plans a text-only Model Step from the current Run profile and rejects extra 
       effect: "allow",
     });
     const planExistingTask = vi.fn(async () => {});
+    const plannedWorkerPermissions = vi.fn(async () => [
+      { resourceId: "worker-workspace:configured", action: "worker:file:write" },
+      { resourceId: "workspace:configured", action: "workspace:write" },
+    ]);
     let currentRunId = accepted.run.id;
     const tools = createOpsTools({
       store,
-      service: { planExistingTask } as unknown as AuthorizedOpsService,
+      service: { planExistingTask, plannedWorkerPermissions } as unknown as AuthorizedOpsService,
       getContext: () => ({
         caller,
         conversationId: accepted.conversation.id,
         runId: currentRunId,
       }),
-      workerTarget: { workspaceId: "configured", agentKind: "test" },
+      workerTarget: {
+        workspaceId: "configured",
+        agentKind: "pi",
+        worktreePath: "C:/configured-worker",
+      },
     });
     const plan = tools.find((tool) => tool.name === "task_plan")!;
     const input = {
@@ -322,6 +331,49 @@ it("plans a text-only Model Step from the current Run profile and rejects extra 
       "read-step",
       expect.objectContaining({ runId: accepted.run.id }),
     );
+    await plan.execute(
+      "plan-worker",
+      {
+        taskId: "planned",
+        rootStepId: "worker-step",
+        steps: [
+          {
+            id: "worker-step",
+            kind: "herdr_worker",
+            title: "Edit the configured project",
+            dependencyIds: [],
+            instructions: "Make the requested change and report tests",
+            workerAccess: "write",
+          },
+        ],
+      },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    expect(plannedWorkerPermissions).toHaveBeenCalledWith(
+      caller,
+      "planned",
+      "C:/configured-worker",
+      "write",
+      expect.objectContaining({ runId: accepted.run.id }),
+    );
+    expect(planExistingTask).toHaveBeenLastCalledWith(
+      caller,
+      "planned",
+      [
+        expect.objectContaining({
+          kind: "herdr_worker",
+          instructions: "Make the requested change and report tests",
+          delegatedPermissionSet: [
+            { resourceId: "worker-workspace:configured", action: "worker:file:write" },
+            { resourceId: "workspace:configured", action: "workspace:write" },
+          ],
+        }),
+      ],
+      "worker-step",
+      expect.objectContaining({ runId: accepted.run.id }),
+    );
     await expect(
       plan.execute(
         "plan-model-with-extra-field",
@@ -342,7 +394,7 @@ it("plans a text-only Model Step from the current Run profile and rejects extra 
     await expect(
       plan.execute("plan-with-non-model-run", input, undefined, undefined, {} as never),
     ).rejects.toThrow("protected_tool_failed");
-    expect(planExistingTask).toHaveBeenCalledTimes(2);
+    expect(planExistingTask).toHaveBeenCalledTimes(3);
   } finally {
     await store.close();
   }
