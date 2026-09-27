@@ -115,6 +115,73 @@ async function fixture(path = ":memory:") {
   return { db, conversations };
 }
 
+async function addWorkerFollowUp(
+  db: DomainDatabase,
+  conversations: ConversationStore,
+  options: {
+    outputRef?: string;
+    bindingId?: string;
+    bindingAttemptId?: string;
+    output?: string;
+  } = {},
+) {
+  const outputRef = options.outputRef ?? "worker-result:attempt-1";
+  const bindingId = options.bindingId ?? "worker-binding-1";
+  const output = options.output ?? "Worker candidate output";
+  await db.transaction(async (tx) => {
+    await tx.execute(
+      "INSERT INTO resources(id,kind,visibility,owner_id) VALUES ('workspace:workspace-1','workspace','public','owner')",
+    );
+    await tx.execute({
+      sql: "INSERT INTO grants(id,principal_id,resource_id,action,scope_key,effect,created_at) VALUES ('grant-worker-read','owner','task-task-1','worker:read',?,'allow',?)",
+      args: [scopeKey(scope), time],
+    });
+    await tx.execute({
+      sql: "INSERT INTO grants(id,principal_id,resource_id,action,scope_key,effect,created_at) VALUES ('grant-workspace-read','owner','workspace:workspace-1','workspace:read',?,'allow',?)",
+      args: [scopeKey(scope), time],
+    });
+    await tx.execute({
+      sql: "UPDATE task_steps SET kind='herdr_worker',instructions=NULL,delegated_permissions_json=?,status='succeeded',output_ref=? WHERE id='step-1'",
+      args: [
+        JSON.stringify([{ resourceId: "workspace:workspace-1", action: "workspace:write" }]),
+        outputRef,
+      ],
+    });
+    await tx.execute("UPDATE task_attempts SET status='succeeded' WHERE id='attempt-1'");
+    await tx.execute("UPDATE task_step_leases SET state='released' WHERE id='lease-1'");
+    await tx.execute({
+      sql: "INSERT INTO task_steps(id,task_id,kind,title,instructions,status,dependency_policy_json,max_attempts,required_capabilities_json,delegated_permissions_json,version,created_at,updated_at) VALUES ('step-2','task-1','model','Follow-up','Use the accepted Worker result','running','{}',1,'[]','[]',1,?,?)",
+      args: [time, time],
+    });
+    await tx.execute(
+      "INSERT INTO task_step_dependencies(task_id,step_id,dependency_id) VALUES ('task-1','step-2','step-1')",
+    );
+    await tx.execute({
+      sql: "INSERT INTO task_attempts(id,task_id,attempt_number,status,started_at,step_id) VALUES ('attempt-2','task-1',2,'running',?,'step-2')",
+      args: [time],
+    });
+    await tx.execute({
+      sql: "INSERT INTO task_step_leases(id,task_id,step_id,attempt_id,owner_instance_id,state,version,acquired_at,heartbeat_at,expires_at) VALUES ('lease-2','task-1','step-2','attempt-2','worker-1','active',1,?,?,?)",
+      args: [time, time, leaseExpiry],
+    });
+    await tx.execute({
+      sql: "INSERT INTO worker_bindings(id,task_attempt_id,herdr_session,workspace_id,pane_id,agent_kind,last_observed_agent_state,updated_at) VALUES (?,?,'session-1','herdr-workspace-id','pane-1','pi','done',?)",
+      args: [bindingId, options.bindingAttemptId ?? "attempt-1", time],
+    });
+    await tx.execute({
+      sql: "INSERT INTO worker_candidate_outputs(attempt_id,task_id,step_id,worker_binding_id,output_excerpt,output_sha256,truncated,created_at) VALUES ('attempt-1','task-1','step-1',?,?,?,0,?)",
+      args: [bindingId, output, "a".repeat(64), time],
+    });
+  });
+  return conversations.createInternalStepRun({
+    caller,
+    taskId: "task-1",
+    stepId: "step-2",
+    attemptId: "attempt-2",
+    executionRef: "pi:default",
+  });
+}
+
 describe("internal Task Step Runs", () => {
   it("creates an idempotent linked Run using Step instructions and survives database reopen", async () => {
     const directory = await mkdtemp(join(tmpdir(), "glassbox-internal-run-"));
@@ -307,6 +374,121 @@ describe("internal Task Step Runs", () => {
         args: [time],
       });
     });
+    await expect(conversations.loadRunInput(caller, followUp.id)).rejects.toMatchObject({
+      decision: { reason: "no_grant" },
+    });
+  });
+
+  it("hands a bounded accepted Worker candidate to its dependent Model and rechecks grants", async () => {
+    const { db, conversations } = await fixture();
+    const output = "W".repeat(2_200);
+    const followUp = await addWorkerFollowUp(db, conversations, { output });
+
+    const input = await conversations.loadRunInput(caller, followUp.id);
+    expect(input.stepResults).toEqual([
+      {
+        stepId: "step-1",
+        sourceRef: "worker-result:attempt-1",
+        text: output.slice(0, 2_048),
+        truncated: true,
+      },
+    ]);
+    await db.transaction(async (tx) => {
+      const evidence = await tx.execute({
+        sql: "SELECT resource_id,action,delivery_source FROM authorization_decisions WHERE run_id = ? AND delivery_source = 'content_source'",
+        args: [followUp.id],
+      });
+      expect(evidence.rows).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ resource_id: "task-task-1", action: "task:read" }),
+          expect.objectContaining({ resource_id: "task-task-1", action: "worker:read" }),
+          expect.objectContaining({
+            resource_id: "workspace:workspace-1",
+            action: "workspace:read",
+          }),
+        ]),
+      );
+      expect(
+        (
+          await tx.execute({
+            sql: "SELECT id FROM deliveries WHERE run_id = ?",
+            args: [followUp.id],
+          })
+        ).rows,
+      ).toEqual([]);
+      await tx.execute({
+        sql: "UPDATE grants SET revoked_at = ? WHERE id = 'grant-workspace-read'",
+        args: [time],
+      });
+    });
+    await expect(conversations.loadRunInput(caller, followUp.id)).rejects.toMatchObject({
+      decision: { reason: "no_grant" },
+    });
+  });
+
+  it("rejects a Worker candidate with the wrong reference or binding", async () => {
+    const wrongRef = await fixture();
+    const wrongRefRun = await addWorkerFollowUp(wrongRef.db, wrongRef.conversations, {
+      outputRef: "worker-result:other-attempt",
+    });
+    await expect(wrongRef.conversations.loadRunInput(caller, wrongRefRun.id)).rejects.toThrow(
+      "Accepted Worker result is unavailable",
+    );
+
+    const wrongBinding = await fixture();
+    const wrongBindingRun = await addWorkerFollowUp(wrongBinding.db, wrongBinding.conversations, {
+      bindingId: "worker-binding-other",
+      bindingAttemptId: "attempt-2",
+    });
+    await expect(
+      wrongBinding.conversations.loadRunInput(caller, wrongBindingRun.id),
+    ).rejects.toThrow("Accepted Worker result is unavailable");
+  });
+
+  it("blocks a Worker handoff after a planning Run source is revoked", async () => {
+    const { db, conversations } = await fixture();
+    const followUp = await addWorkerFollowUp(db, conversations);
+    const origin = await conversations.acceptIncoming({
+      agentId: "personal",
+      scope,
+      messageId: "worker-plan-origin",
+      text: "Plan Worker work",
+      executionRef: "pi:default",
+    });
+    await db.transaction(async (tx) => {
+      await tx.execute({
+        sql: "UPDATE tasks SET run_id = ? WHERE id = 'task-1'",
+        args: [origin.run.id],
+      });
+      await tx.execute(
+        "INSERT INTO resources(id,kind,visibility,owner_id) VALUES ('planning-source','document','public','owner')",
+      );
+      await tx.execute({
+        sql: "INSERT INTO grants(id,principal_id,resource_id,action,scope_key,effect,created_at) VALUES ('grant-planning-source','owner','planning-source','read',?,'allow',?)",
+        args: [scopeKey(scope), time],
+      });
+      const source = await evaluate(tx, {
+        caller,
+        resourceId: "planning-source",
+        action: "read",
+        runId: origin.run.id,
+        conversationId: origin.conversation.id,
+      });
+      expect(source.decision).toBe("ALLOW");
+      await tx.execute({
+        sql: "UPDATE authorization_decisions SET delivery_source = 'content_source' WHERE id = ?",
+        args: [source.id],
+      });
+    });
+    expect((await conversations.loadRunInput(caller, followUp.id)).stepResults).toMatchObject([
+      { sourceRef: "worker-result:attempt-1" },
+    ]);
+    await db.transaction((tx) =>
+      tx.execute({
+        sql: "UPDATE grants SET revoked_at = ? WHERE id = 'grant-planning-source'",
+        args: [time],
+      }),
+    );
     await expect(conversations.loadRunInput(caller, followUp.id)).rejects.toMatchObject({
       decision: { reason: "no_grant" },
     });
@@ -531,6 +713,125 @@ describe("internal Task Step Runs", () => {
       await tx.execute("UPDATE grants SET revoked_at = NULL WHERE id = 'grant-source'");
       await tx.execute({
         sql: "UPDATE grants SET revoked_at = ? WHERE id = 'grant-child-read'",
+        args: [time],
+      });
+    });
+    await expect(conversations.loadRunInput(caller, parentRun.id)).rejects.toMatchObject({
+      decision: { reason: "no_grant" },
+    });
+  });
+
+  it("hands an accepted child Worker candidate to its parent under current source grants", async () => {
+    const { db, conversations } = await fixture();
+    await db.transaction(async (tx) => {
+      await tx.execute(
+        "INSERT INTO resources(id,kind,visibility,owner_id) VALUES ('task-child-1','task','public','owner')",
+      );
+      await tx.execute(
+        "INSERT INTO resources(id,kind,visibility,owner_id) VALUES ('workspace:workspace-1','workspace','public','owner')",
+      );
+      for (const [id, resource, action] of [
+        ["grant-child-read", "task-child-1", "task:read"],
+        ["grant-child-worker-read", "task-child-1", "worker:read"],
+        ["grant-workspace-read", "workspace:workspace-1", "workspace:read"],
+      ])
+        await tx.execute({
+          sql: "INSERT INTO grants(id,principal_id,resource_id,action,scope_key,effect,created_at) VALUES (?,'owner',?,?,?,'allow',?)",
+          args: [id, resource, action, scopeKey(scope), time],
+        });
+      await tx.execute({
+        sql: "INSERT INTO tasks(id,title,status,priority,creator_principal_id,conversation_id,created_at,updated_at,orchestration_mode,origin_scope_key,root_step_id) VALUES ('child-1','Child','DONE','normal','owner','conversation-1',?,?,'durable',?,'child-worker')",
+        args: [time, time, scopeKey(scope)],
+      });
+      await tx.execute({
+        sql: "INSERT INTO task_steps(id,task_id,kind,title,instructions,status,dependency_policy_json,max_attempts,required_capabilities_json,delegated_permissions_json,version,created_at,updated_at) VALUES ('child-worker','child-1','herdr_worker','Child Worker',NULL,'succeeded','{}',1,'[]',?,2,?,?)",
+        args: [
+          JSON.stringify([{ resourceId: "workspace:workspace-1", action: "workspace:write" }]),
+          time,
+          time,
+        ],
+      });
+      await tx.execute({
+        sql: "INSERT INTO task_attempts(id,task_id,attempt_number,status,started_at,step_id) VALUES ('child-attempt','child-1',1,'succeeded',?,'child-worker')",
+        args: [time],
+      });
+      await tx.execute({
+        sql: "UPDATE task_steps SET output_ref='worker-result:child-attempt' WHERE id='child-worker'",
+      });
+      await tx.execute({
+        sql: "INSERT INTO worker_bindings(id,task_attempt_id,herdr_session,workspace_id,pane_id,agent_kind,last_observed_agent_state,updated_at) VALUES ('child-binding','child-attempt','session-1','herdr-workspace-id','pane-1','pi','done',?)",
+        args: [time],
+      });
+      await tx.execute({
+        sql: "INSERT INTO worker_candidate_outputs(attempt_id,task_id,step_id,worker_binding_id,output_excerpt,output_sha256,truncated,created_at) VALUES ('child-attempt','child-1','child-worker','child-binding','Child Worker finding',?,0,?)",
+        args: ["b".repeat(64), time],
+      });
+      await tx.execute({
+        sql: "INSERT INTO task_events(id,task_id,type,metadata_json,created_at) VALUES ('child-accepted','child-1','TASK_ACCEPTED','{}',?)",
+        args: [time],
+      });
+      const childPermissions = JSON.stringify([
+        { resourceId: "workspace:workspace-1", action: "workspace:write" },
+      ]);
+      await tx.execute({
+        sql: "UPDATE task_steps SET kind='child_task',instructions=NULL,status='succeeded',output_ref='task:child-1',delegated_permissions_json=? WHERE id='step-1'",
+        args: [childPermissions],
+      });
+      await tx.execute("UPDATE task_attempts SET status='succeeded' WHERE id='attempt-1'");
+      await tx.execute("UPDATE task_step_leases SET state='released' WHERE id='lease-1'");
+      await tx.execute({
+        sql: "INSERT INTO task_child_links(child_task_id,parent_task_id,parent_step_id,delegated_permissions_json,acceptance_criteria_json,cancel_policy,failure_policy,result_ref,created_at) VALUES ('child-1','task-1','step-1',?,'[\"Review child result\"]','keep_child','block_parent','task:child-1',?)",
+        args: [childPermissions, time],
+      });
+      await tx.execute({
+        sql: "INSERT INTO task_steps(id,task_id,kind,title,instructions,status,dependency_policy_json,max_attempts,required_capabilities_json,delegated_permissions_json,version,created_at,updated_at) VALUES ('step-2','task-1','model','Parent follow-up','Use the child Worker result','running','{}',1,'[]','[]',1,?,?)",
+        args: [time, time],
+      });
+      await tx.execute(
+        "INSERT INTO task_step_dependencies(task_id,step_id,dependency_id) VALUES ('task-1','step-2','step-1')",
+      );
+      await tx.execute({
+        sql: "INSERT INTO task_attempts(id,task_id,attempt_number,status,started_at,step_id) VALUES ('attempt-2','task-1',2,'running',?,'step-2')",
+        args: [time],
+      });
+      await tx.execute({
+        sql: "INSERT INTO task_step_leases(id,task_id,step_id,attempt_id,owner_instance_id,state,version,acquired_at,heartbeat_at,expires_at) VALUES ('lease-2','task-1','step-2','attempt-2','worker-1','active',1,?,?,?)",
+        args: [time, time, leaseExpiry],
+      });
+    });
+    const parentRun = await conversations.createInternalStepRun({
+      caller,
+      taskId: "task-1",
+      stepId: "step-2",
+      attemptId: "attempt-2",
+      executionRef: "pi:default",
+    });
+
+    expect((await conversations.loadRunInput(caller, parentRun.id)).stepResults).toEqual([
+      {
+        stepId: "step-1",
+        sourceRef: "worker-result:child-attempt",
+        text: "Child Worker finding",
+        truncated: false,
+      },
+    ]);
+    await db.transaction(async (tx) => {
+      const sources = await tx.execute({
+        sql: "SELECT resource_id,action FROM authorization_decisions WHERE run_id=? AND delivery_source='content_source'",
+        args: [parentRun.id],
+      });
+      expect(sources.rows).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ resource_id: "task-child-1", action: "task:read" }),
+          expect.objectContaining({ resource_id: "task-child-1", action: "worker:read" }),
+          expect.objectContaining({
+            resource_id: "workspace:workspace-1",
+            action: "workspace:read",
+          }),
+        ]),
+      );
+      await tx.execute({
+        sql: "UPDATE grants SET revoked_at=? WHERE id='grant-workspace-read'",
         args: [time],
       });
     });

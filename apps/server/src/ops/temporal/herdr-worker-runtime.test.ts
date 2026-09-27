@@ -226,6 +226,73 @@ it("dispatches one Worker, reviews and cancels it safely, and quarantines an unc
     });
     await store.authorization.revoke(workspaceRead);
     await expect(service.workerCandidate(caller, task.id, step.id, attempt.id)).rejects.toThrow();
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: `workspace:${workspace.id}`,
+      action: "workspace:read",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    await store.conversations.createAgent("personal");
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: "agent:personal",
+      action: "run:create",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    const origin = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: caller.scope,
+      messageId: "worker-origin",
+      text: "Plan protected Worker work",
+      executionRef: "pi:test",
+    });
+    await store.db.transaction(async (tx) => {
+      await tx.execute({
+        sql: "UPDATE tasks SET run_id = ? WHERE id = ?",
+        args: [origin.run.id, task.id],
+      });
+    });
+    await store.authorization.registerResource({
+      id: "worker-plan-source",
+      kind: "document",
+      visibility: "private",
+    });
+    const sourceGrant = await store.authorization.grant({
+      principalId: "owner",
+      resourceId: "worker-plan-source",
+      action: "read",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    const sourceDecision = await store.authorization.check({
+      caller,
+      resourceId: "worker-plan-source",
+      action: "read",
+      runId: origin.run.id,
+      conversationId: origin.conversation.id,
+    });
+    expect(sourceDecision.decision).toBe("ALLOW");
+    await store.authorization.markDeliverySource(sourceDecision.id, "content_source");
+    expect(await service.workerCandidate(caller, task.id, step.id, attempt.id)).toMatchObject({
+      outputExcerpt: "Candidate Worker result",
+    });
+    const inspector = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: caller.scope,
+      messageId: "worker-result-inspection",
+      text: "Inspect the Worker result",
+      executionRef: "pi:test",
+    });
+    expect(
+      await service.workerCandidate(caller, task.id, step.id, attempt.id, {
+        runId: inspector.run.id,
+        conversationId: inspector.conversation.id,
+      }),
+    ).toMatchObject({ outputExcerpt: "Candidate Worker result" });
+    await store.authorization.revoke(sourceGrant);
+    await expect(service.workerCandidate(caller, task.id, step.id, attempt.id)).rejects.toThrow();
     expect((await store.tasks.getTask(task.id))?.status).not.toBe("DONE");
     await store.authorization.grant({
       principalId: "owner",

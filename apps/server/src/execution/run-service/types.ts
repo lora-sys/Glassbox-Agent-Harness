@@ -1,5 +1,10 @@
 import type { DeliveryRecord } from "../../conversation/lifecycle.js";
-import type { ConversationRecord, RunRecord, RunStatus } from "../../conversation/store.js";
+import type {
+  ConversationRecord,
+  RunRecord,
+  RunStatus,
+  StepResultRecord,
+} from "../../conversation/store.js";
 import type { CallerContext, TrustedChannelScope } from "../../identity/scope.js";
 import type { DomainStore } from "../../persistence/index.js";
 
@@ -12,7 +17,7 @@ export interface ExecutionInput {
   conversation: ConversationRecord;
   run: RunRecord;
   taskStepBinding?: { taskId: string; stepId: string; attemptId: string };
-  stepResults?: Array<{ stepId: string; runId: string; text: string; truncated: boolean }>;
+  stepResults?: StepResultRecord[];
   text: string;
   history: Array<{ role: "user" | "assistant"; text: string }>;
   historyRunIds?: string[];

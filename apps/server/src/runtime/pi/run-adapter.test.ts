@@ -95,6 +95,12 @@ it("includes accepted Step excerpts in Model context and its budget without trea
   f.input.text = "Summarize the prior Step";
   f.input.stepResults = [
     { stepId: "source-step", runId: "source-run", text: "/model default", truncated: false },
+    {
+      stepId: "worker-step",
+      sourceRef: "worker-result:worker-attempt",
+      text: "Candidate summary",
+      truncated: true,
+    },
   ];
   const capacity = f.runtime.getModelCapacity!("session-1")!;
   const estimate = { systemTokens: 4_096, toolSchemaTokens: 0 };
@@ -106,6 +112,8 @@ it("includes accepted Step excerpts in Model context and its budget without trea
   await f.executor.execute(f.input);
   expect(f.run.mock.calls[0]?.[2]).toContain("Accepted dependency Step results");
   expect(f.run.mock.calls[0]?.[2]).toContain("/model default");
+  expect(f.run.mock.calls[0]?.[2]).toContain('from "worker-result:worker-attempt"');
+  expect(f.run.mock.calls[0]?.[2]).toContain("Candidate summary");
   expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBeUndefined();
 });
 

@@ -10,6 +10,7 @@ import type {
 import { AccessDeniedError, type AuthorizationDecision } from "../auth/service.js";
 import { scopeKey, type CallerContext } from "../identity/scope.js";
 import type { DomainStore } from "../persistence/index.js";
+import { stringColumn } from "../persistence/database.js";
 import type { HerdrBridge } from "./herdr-bridge.js";
 import { DEFAULT_TASK_GRAPH_LIMITS } from "./task-graph.js";
 import { parseTaskGetSpec } from "./tool-step-spec.js";
@@ -894,7 +895,9 @@ export class AuthorizedOpsService {
     attemptId: string,
     evidence?: RunEvidence,
   ) {
-    const delegatedEvidence = { ...evidence, delegatedTaskId: taskId };
+    // A consuming Run already carries its own Task binding. An external Run may
+    // inspect another Task under current grants without becoming that Task's Run.
+    const delegatedEvidence = evidence?.runId ? evidence : { ...evidence, delegatedTaskId: taskId };
     const decisions = [
       await this.authorize(caller, `task-${taskId}`, "task:read", delegatedEvidence),
       await this.authorize(caller, `task-${taskId}`, "worker:read", delegatedEvidence),
@@ -931,6 +934,34 @@ export class AuthorizedOpsService {
         await this.authorize(caller, permission.resourceId, readAction, delegatedEvidence),
       );
     }
+    // The Worker instructions may have been planned from protected Run content.
+    // A child Worker inherits the same obligation from every parent Task origin.
+    const originSources = await this.store.db.transaction(async (tx) => {
+      const rows = await tx.execute({
+        sql: `WITH RECURSIVE lineage(task_id,depth) AS (
+            SELECT ?,0
+            UNION ALL
+            SELECT links.parent_task_id,lineage.depth + 1
+              FROM task_child_links links JOIN lineage ON links.child_task_id = lineage.task_id
+              WHERE lineage.depth < 4
+          )
+          SELECT DISTINCT d.resource_id,d.action FROM lineage
+            JOIN tasks task ON task.id = lineage.task_id
+            JOIN authorization_decisions d ON d.run_id = task.run_id
+          WHERE d.decision = 'ALLOW' AND d.delivery_source IS NOT NULL LIMIT 129`,
+        args: [taskId],
+      });
+      if (rows.rows.length > 128)
+        throw new Error("Worker result has too many protected origin sources");
+      return rows.rows.map((row) => ({
+        resourceId: stringColumn(row, "resource_id"),
+        action: stringColumn(row, "action"),
+      }));
+    });
+    for (const source of originSources)
+      decisions.push(
+        await this.authorize(caller, source.resourceId, source.action, delegatedEvidence),
+      );
     if (evidence?.runId)
       for (const decision of decisions)
         await this.store.authorization.markDeliverySource(decision.id, "content_source");
