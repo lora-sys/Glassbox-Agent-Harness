@@ -84,7 +84,7 @@ export interface RunInputRecord {
   historyOmittedRunIds?: string[];
   providerSessionId: string | null;
   taskStepBinding?: { taskId: string; stepId: string; attemptId: string };
-  /** Current-authorized excerpts of accepted direct Model Step dependencies. */
+  /** Current-authorized excerpts from accepted direct Step dependencies. */
   stepResults?: Array<{ stepId: string; runId: string; text: string; truncated: boolean }>;
 }
 
@@ -1040,6 +1040,100 @@ export class ConversationStore {
             stepResults = [];
             for (const dependency of dependencies.rows) {
               const outputRef = optionalString(dependency, "output_ref");
+              if (
+                dependency.kind === "child_task" &&
+                dependency.status === "succeeded" &&
+                outputRef?.startsWith("task:")
+              ) {
+                const childTaskId = outputRef.slice(5);
+                requireIdentifier(childTaskId);
+                const childDecision = await evaluate(tx, {
+                  caller,
+                  resourceId: `task-${childTaskId}`,
+                  action: "task:read",
+                  conversationId: run.conversationId,
+                  runId,
+                });
+                if (childDecision.decision !== "ALLOW") return { denied: childDecision };
+                const childRoot = await tx.execute({
+                  sql: `SELECT root.id,root.kind,root.status,root.output_ref
+                    FROM task_child_links link
+                    JOIN tasks child ON child.id = link.child_task_id
+                    JOIN task_steps root ON root.task_id = child.id AND root.id = child.root_step_id
+                    WHERE link.child_task_id = ? AND link.parent_task_id = ?
+                      AND link.parent_step_id = ? AND link.result_ref = ?
+                      AND child.orchestration_mode = 'durable' AND child.status = 'DONE'
+                      AND EXISTS (SELECT 1 FROM task_events e
+                        WHERE e.task_id = child.id AND e.type = 'TASK_ACCEPTED')`,
+                  args: [
+                    childTaskId,
+                    taskStepBinding.taskId,
+                    stringColumn(dependency, "id"),
+                    outputRef,
+                  ],
+                });
+                const root = childRoot.rows[0];
+                const rootRef = root ? optionalString(root, "output_ref") : null;
+                if (
+                  root?.kind !== "model" ||
+                  root.status !== "succeeded" ||
+                  !rootRef?.startsWith("run:")
+                )
+                  continue;
+                const childRunId = rootRef.slice(4);
+                requireIdentifier(childRunId);
+                const sourceAuthorization = await authorizeRun(
+                  tx,
+                  caller,
+                  childRunId,
+                  "conversation:read",
+                );
+                if ("denied" in sourceAuthorization) return sourceAuthorization;
+                const sources = await tx.execute({
+                  sql: `SELECT DISTINCT resource_id,action FROM authorization_decisions
+                    WHERE run_id = ? AND decision = 'ALLOW' AND delivery_source = 'content_source'
+                    LIMIT 129`,
+                  args: [childRunId],
+                });
+                if (sources.rows.length > 128)
+                  throw new Error("Child result has too many protected sources");
+                for (const source of sources.rows) {
+                  const decision = await evaluate(tx, {
+                    caller,
+                    resourceId: stringColumn(source, "resource_id"),
+                    action: stringColumn(source, "action"),
+                    conversationId: run.conversationId,
+                    runId,
+                  });
+                  if (decision.decision !== "ALLOW") return { denied: decision };
+                  await tx.execute({
+                    sql: "UPDATE authorization_decisions SET delivery_source = 'content_source' WHERE id = ?",
+                    args: [decision.id],
+                  });
+                }
+                await tx.execute({
+                  sql: "UPDATE authorization_decisions SET delivery_source = 'content_source' WHERE id = ?",
+                  args: [childDecision.id],
+                });
+                const result = await tx.execute({
+                  sql: `SELECT r.result_text FROM task_attempt_runs ar
+                    JOIN runs r ON r.id = ar.run_id
+                    WHERE ar.run_id = ? AND ar.task_id = ? AND ar.step_id = ?
+                      AND r.source = 'task_step' AND r.status = 'succeeded'`,
+                  args: [childRunId, childTaskId, stringColumn(root, "id")],
+                });
+                const resultText = result.rows[0]
+                  ? optionalString(result.rows[0], "result_text")
+                  : null;
+                if (resultText === null) throw new Error("Accepted child result is unavailable");
+                stepResults.push({
+                  stepId: stringColumn(dependency, "id"),
+                  runId: childRunId,
+                  text: resultText.slice(0, 2_048),
+                  truncated: resultText.length > 2_048,
+                });
+                continue;
+              }
               if (
                 !["model", "tool"].includes(stringColumn(dependency, "kind")) ||
                 dependency.status !== "succeeded" ||

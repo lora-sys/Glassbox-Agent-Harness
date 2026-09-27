@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import { DomainDatabase } from "../persistence/database.js";
+import { evaluate } from "../auth/service.js";
 import { ConversationStore } from "./store.js";
 import {
   identityKey,
@@ -389,6 +390,151 @@ describe("internal Task Step Runs", () => {
       });
     });
     await expect(conversations.loadRunInput(caller, followUp.id)).rejects.toMatchObject({
+      decision: { reason: "no_grant" },
+    });
+  });
+
+  it("hands an accepted child Model result to its parent with source grants rechecked", async () => {
+    const { db, conversations } = await fixture();
+    await db.transaction(async (tx) => {
+      for (const [id, kind] of [
+        ["task-child-1", "task"],
+        ["task-task-3", "task"],
+      ])
+        await tx.execute({
+          sql: "INSERT INTO resources(id,kind,visibility,owner_id) VALUES (?,?,'public','owner')",
+          args: [id, kind],
+        });
+      for (const [id, resource, action] of [
+        ["grant-child-read", "task-child-1", "task:read"],
+        ["grant-child-continue", "task-child-1", "task:continue"],
+        ["grant-source", "task-task-3", "task:read"],
+      ])
+        await tx.execute({
+          sql: "INSERT INTO grants(id,principal_id,resource_id,action,scope_key,effect,created_at) VALUES (?,'owner',?,?,?,'allow',?)",
+          args: [id, resource, action, scopeKey(scope), time],
+        });
+      await tx.execute({
+        sql: "INSERT INTO tasks(id,title,status,priority,creator_principal_id,conversation_id,created_at,updated_at,orchestration_mode,origin_scope_key,root_step_id) VALUES ('child-1','Child','RUNNING','normal','owner','conversation-1',?,?,'durable',?,'child-root')",
+        args: [time, time, scopeKey(scope)],
+      });
+      await tx.execute({
+        sql: "INSERT INTO task_steps(id,task_id,kind,title,instructions,status,dependency_policy_json,max_attempts,required_capabilities_json,delegated_permissions_json,version,created_at,updated_at) VALUES ('child-root','child-1','model','Child root','Summarize the result','running','{}',1,'[]','[]',1,?,?)",
+        args: [time, time],
+      });
+      await tx.execute({
+        sql: "INSERT INTO task_attempts(id,task_id,attempt_number,status,started_at,step_id) VALUES ('child-attempt','child-1',1,'running',?,'child-root')",
+        args: [time],
+      });
+      await tx.execute({
+        sql: "INSERT INTO task_step_leases(id,task_id,step_id,attempt_id,owner_instance_id,state,version,acquired_at,heartbeat_at,expires_at) VALUES ('child-lease','child-1','child-root','child-attempt','worker-1','active',1,?,?,?)",
+        args: [time, time, leaseExpiry],
+      });
+      await tx.execute({
+        sql: "UPDATE task_steps SET kind = 'child_task', instructions = NULL, status = 'succeeded', output_ref = 'task:child-1' WHERE id = 'step-1'",
+      });
+      await tx.execute({
+        sql: "UPDATE task_attempts SET status = 'succeeded' WHERE id = 'attempt-1'",
+      });
+      await tx.execute({
+        sql: "UPDATE task_step_leases SET state = 'released' WHERE id = 'lease-1'",
+      });
+      await tx.execute({
+        sql: "INSERT INTO task_child_links(child_task_id,parent_task_id,parent_step_id,delegated_permissions_json,acceptance_criteria_json,cancel_policy,failure_policy,result_ref,created_at) VALUES ('child-1','task-1','step-1',?,'[\"Child result reviewed\"]','keep_child','block_parent','task:child-1',?)",
+        args: [JSON.stringify([{ resourceId: "task-task-3", action: "task:read" }]), time],
+      });
+    });
+    const childRun = await conversations.createInternalStepRun({
+      caller,
+      taskId: "child-1",
+      stepId: "child-root",
+      attemptId: "child-attempt",
+      executionRef: "pi:default",
+    });
+    await db.transaction(async (tx) => {
+      const decision = await evaluate(tx, {
+        caller,
+        resourceId: "task-task-3",
+        action: "task:read",
+        runId: childRun.id,
+        conversationId: childRun.conversationId,
+      });
+      expect(decision.decision).toBe("ALLOW");
+      await tx.execute({
+        sql: "UPDATE authorization_decisions SET delivery_source = 'content_source' WHERE id = ?",
+        args: [decision.id],
+      });
+      await tx.execute({
+        sql: "UPDATE runs SET status = 'succeeded', result_text = 'Verified child finding' WHERE id = ?",
+        args: [childRun.id],
+      });
+      await tx.execute({
+        sql: "UPDATE task_steps SET status = 'succeeded', output_ref = ? WHERE id = 'child-root'",
+        args: [`run:${childRun.id}`],
+      });
+      await tx.execute("UPDATE tasks SET status = 'DONE' WHERE id = 'child-1'");
+      await tx.execute({
+        sql: "INSERT INTO task_steps(id,task_id,kind,title,instructions,status,dependency_policy_json,max_attempts,required_capabilities_json,delegated_permissions_json,version,created_at,updated_at) VALUES ('step-2','task-1','model','Parent follow-up','Use the child result','running','{}',1,'[]','[]',1,?,?)",
+        args: [time, time],
+      });
+      await tx.execute(
+        "INSERT INTO task_step_dependencies(task_id,step_id,dependency_id) VALUES ('task-1','step-2','step-1')",
+      );
+      await tx.execute({
+        sql: "INSERT INTO task_attempts(id,task_id,attempt_number,status,started_at,step_id) VALUES ('attempt-2','task-1',2,'running',?,'step-2')",
+        args: [time],
+      });
+      await tx.execute({
+        sql: "INSERT INTO task_step_leases(id,task_id,step_id,attempt_id,owner_instance_id,state,version,acquired_at,heartbeat_at,expires_at) VALUES ('lease-2','task-1','step-2','attempt-2','worker-1','active',1,?,?,?)",
+        args: [time, time, leaseExpiry],
+      });
+    });
+    const parentRun = await conversations.createInternalStepRun({
+      caller,
+      taskId: "task-1",
+      stepId: "step-2",
+      attemptId: "attempt-2",
+      executionRef: "pi:default",
+    });
+    expect((await conversations.loadRunInput(caller, parentRun.id)).stepResults).toBeUndefined();
+    await db.transaction((tx) =>
+      tx.execute({
+        sql: "INSERT INTO task_events(id,task_id,type,metadata_json,created_at) VALUES ('child-accepted','child-1','TASK_ACCEPTED','{}',?)",
+        args: [time],
+      }),
+    );
+    expect((await conversations.loadRunInput(caller, parentRun.id)).stepResults).toEqual([
+      {
+        stepId: "step-1",
+        runId: childRun.id,
+        text: "Verified child finding",
+        truncated: false,
+      },
+    ]);
+    await db.transaction(async (tx) => {
+      const sources = await tx.execute({
+        sql: "SELECT resource_id FROM authorization_decisions WHERE run_id = ? AND delivery_source = 'content_source'",
+        args: [parentRun.id],
+      });
+      expect(sources.rows.map((row) => row.resource_id)).toEqual(
+        expect.arrayContaining(["task-child-1", "task-task-3"]),
+      );
+      await tx.execute({
+        sql: "UPDATE grants SET revoked_at = ? WHERE id = 'grant-source'",
+        args: [time],
+      });
+    });
+    await expect(conversations.loadRunInput(caller, parentRun.id)).rejects.toMatchObject({
+      decision: { reason: "no_grant" },
+    });
+    await db.transaction(async (tx) => {
+      await tx.execute("UPDATE grants SET revoked_at = NULL WHERE id = 'grant-source'");
+      await tx.execute({
+        sql: "UPDATE grants SET revoked_at = ? WHERE id = 'grant-child-read'",
+        args: [time],
+      });
+    });
+    await expect(conversations.loadRunInput(caller, parentRun.id)).rejects.toMatchObject({
       decision: { reason: "no_grant" },
     });
   });
