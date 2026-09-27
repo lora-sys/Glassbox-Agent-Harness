@@ -149,12 +149,89 @@ export class HerdrWorkerRuntime {
     return "settled";
   }
 
+  private async reconcileUnboundLaunch(
+    taskId: string,
+    step: TaskStep,
+    lease: StoredStepLease,
+  ): Promise<"settled" | "pending"> {
+    if (!lease.attemptId) return "pending";
+    const intent = await this.store.longWork.getWorkerLaunchIntent(lease.attemptId);
+    if (
+      !intent ||
+      intent.taskId !== taskId ||
+      intent.stepId !== step.id ||
+      intent.leaseId !== lease.id ||
+      intent.ownerInstanceId !== lease.ownerInstanceId
+    )
+      return "pending";
+    try {
+      const snapshot = await this.bridge.getSnapshot();
+      if (snapshot.sessionId !== intent.herdrSession) return "pending";
+      const snapshotTime = Date.parse(snapshot.timestamp);
+      if (!Number.isFinite(snapshotTime) || snapshotTime < Date.parse(intent.createdAt))
+        return "pending";
+      const matches = snapshot.workspaces.flatMap((workspace) =>
+        workspace.panes
+          .filter((pane) => pane.agentName === intent.agentName)
+          .map((pane) => ({ pane, workspaceId: workspace.workspaceId })),
+      );
+      // Absence does not fence an in-flight tab.create or agent.start request.
+      if (matches.length !== 1) return "pending";
+      const [{ pane, workspaceId }] = matches;
+      if (
+        workspaceId !== intent.workspaceId ||
+        pane.agentKind !== intent.agentKind ||
+        !pane.cwd ||
+        (await realpath(pane.cwd)) !== intent.worktreePath
+      )
+        return "pending";
+      await this.service.closeClaimedWorker(lease.attemptId, {
+        paneId: pane.paneId,
+        agentName: intent.agentName,
+        herdrSession: intent.herdrSession,
+      });
+    } catch {
+      return "pending";
+    }
+    try {
+      await this.store.longWork.settleQuarantinedWorkerLaunchClosure({
+        taskId,
+        stepId: step.id,
+        attemptId: lease.attemptId,
+        leaseId: lease.id,
+        ownerInstanceId: lease.ownerInstanceId,
+        expectedStepVersion: step.version,
+        expectedLeaseVersion: lease.version,
+        closure: {
+          herdrSession: intent.herdrSession,
+          workspaceId: intent.workspaceId,
+          agentName: intent.agentName,
+          agentKind: intent.agentKind,
+          worktreePath: intent.worktreePath,
+          evidenceRef: `herdr-closed-unbound:${lease.attemptId}`,
+        },
+        origin: ORIGIN,
+      });
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        /(?:settlement conflict|ownership conflict|Step conflict|version conflict)/iu.test(
+          error.message,
+        )
+      )
+        return "pending";
+      throw error;
+    }
+    return "settled";
+  }
+
   /** Close the exact old Worker before releasing a quarantined Step claim. */
   async reconcileQuarantined(taskId: string, step: TaskStep): Promise<"settled" | "pending"> {
     if (step.kind !== "herdr_worker" || !["blocked", "cancelled"].includes(step.status))
       return "pending";
     const lease = await this.store.longWork.getQuarantinedLease(taskId, step.id);
-    if (!lease?.attemptId || !lease.workerBindingId) return "pending";
+    if (!lease?.attemptId) return "pending";
+    if (!lease.workerBindingId) return this.reconcileUnboundLaunch(taskId, step, lease);
     const binding = await this.store.tasks.getWorkerBinding(lease.attemptId);
     if (
       !binding ||

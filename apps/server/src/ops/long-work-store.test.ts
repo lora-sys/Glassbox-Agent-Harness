@@ -4244,6 +4244,199 @@ it("settles a quarantined Worker only for its exact closed binding, then allows 
   }
 });
 
+it("persists a Worker launch intent before launch and settles only its exact closed identity", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    const store = await fixture(db);
+    await store.createGraph(
+      "task-1",
+      [step("launch-worker", [], "herdr_worker"), step("launch-worker-2", [], "herdr_worker")],
+      "launch-worker",
+      limits,
+      system,
+    );
+    await store.transitionStep({
+      taskId: "task-1",
+      stepId: "launch-worker",
+      expectedVersion: 1,
+      from: "pending",
+      to: "ready",
+      origin: system,
+    });
+    await store.transitionStep({
+      taskId: "task-1",
+      stepId: "launch-worker-2",
+      expectedVersion: 1,
+      from: "pending",
+      to: "ready",
+      origin: system,
+    });
+    await store.claimReadyStep({
+      taskId: "task-1",
+      stepId: "launch-worker",
+      expectedStepVersion: 2,
+      attemptId: "launch-attempt",
+      leaseId: "launch-lease",
+      ownerInstanceId: "executor-1",
+      leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+      origin: claimOrigin,
+    });
+    await store.claimReadyStep({
+      taskId: "task-1",
+      stepId: "launch-worker-2",
+      expectedStepVersion: 2,
+      attemptId: "launch-attempt-2",
+      leaseId: "launch-lease-2",
+      ownerInstanceId: "executor-1",
+      leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+      origin: claimOrigin,
+    });
+
+    const launch = {
+      herdrSession: "herdr-session",
+      workspaceId: "workspace-1",
+      agentName: "glassbox-attempt-launch-attempt",
+      agentKind: "pi",
+      worktreePath: "/workspaces/launch-worker",
+    };
+    const intent = await store.recordWorkerLaunchIntent({
+      taskId: "task-1",
+      stepId: "launch-worker",
+      attemptId: "launch-attempt",
+      leaseId: "launch-lease",
+      ownerInstanceId: "executor-1",
+      expectedStepVersion: 3,
+      expectedLeaseVersion: 1,
+      launch,
+      origin: claimOrigin,
+    });
+    expect(intent).toMatchObject({
+      taskId: "task-1",
+      stepId: "launch-worker",
+      attemptId: "launch-attempt",
+      leaseId: "launch-lease",
+      ownerInstanceId: "executor-1",
+      stepVersion: 3,
+      leaseVersion: 1,
+      ...launch,
+    });
+    expect(await store.getWorkerLaunchIntent("launch-attempt")).toEqual(intent);
+    await expect(
+      store.recordWorkerLaunchIntent({
+        taskId: "task-1",
+        stepId: "launch-worker",
+        attemptId: "launch-attempt",
+        leaseId: "launch-lease",
+        ownerInstanceId: "executor-1",
+        expectedStepVersion: 3,
+        expectedLeaseVersion: 1,
+        launch,
+        origin: claimOrigin,
+      }),
+    ).rejects.toThrow("Worker launch intent already exists");
+    await expect(
+      store.recordWorkerLaunchIntent({
+        taskId: "task-1",
+        stepId: "launch-worker-2",
+        attemptId: "launch-attempt-2",
+        leaseId: "launch-lease-2",
+        ownerInstanceId: "executor-1",
+        expectedStepVersion: 3,
+        expectedLeaseVersion: 1,
+        launch,
+        origin: claimOrigin,
+      }),
+    ).rejects.toThrow();
+    await expect(
+      db.transaction((tx) =>
+        tx.execute({
+          sql: "UPDATE worker_launch_intents SET agent_name = 'different-agent' WHERE attempt_id = ?",
+          args: ["launch-attempt"],
+        }),
+      ),
+    ).rejects.toThrow();
+
+    const originalEvents = await store.listEvents("task-1");
+    await store.updateLease({
+      taskId: "task-1",
+      leaseId: "launch-lease",
+      ownerInstanceId: "executor-1",
+      expectedVersion: 1,
+      action: "heartbeat",
+      expiresAt: new Date(Date.now() + 120_000).toISOString(),
+      origin: system,
+    });
+    await store.settleClaimedStep({
+      taskId: "task-1",
+      stepId: "launch-worker",
+      attemptId: "launch-attempt",
+      leaseId: "launch-lease",
+      ownerInstanceId: "executor-1",
+      expectedStepVersion: 3,
+      expectedLeaseVersion: 2,
+      outcome: "unknown",
+      evidenceRef: "trace:worker-start-unknown",
+      origin: system,
+    });
+    const closure = { ...launch, evidenceRef: "herdr:closed:launch-attempt" };
+    await expect(
+      store.settleQuarantinedWorkerLaunchClosure({
+        taskId: "task-1",
+        stepId: "launch-worker",
+        attemptId: "launch-attempt",
+        leaseId: "launch-lease",
+        ownerInstanceId: "executor-1",
+        expectedStepVersion: 4,
+        expectedLeaseVersion: 3,
+        closure: { ...closure, agentName: "different-agent" },
+        origin: system,
+      }),
+    ).rejects.toThrow("Quarantined Worker launch identity conflict");
+    expect(await store.getQuarantinedLease("task-1", "launch-worker")).toMatchObject({
+      state: "quarantined",
+      version: 3,
+    });
+
+    const closed = await store.settleQuarantinedWorkerLaunchClosure({
+      taskId: "task-1",
+      stepId: "launch-worker",
+      attemptId: "launch-attempt",
+      leaseId: "launch-lease",
+      ownerInstanceId: "executor-1",
+      expectedStepVersion: 4,
+      expectedLeaseVersion: 3,
+      closure,
+      origin: system,
+    });
+    expect(closed).toMatchObject({ status: "blocked", version: 4 });
+    expect(await store.getQuarantinedLease("task-1", "launch-worker")).toBeNull();
+    expect((await store.listEvents("task-1")).slice(0, originalEvents.length)).toEqual(
+      originalEvents,
+    );
+    expect((await store.listEvents("task-1")).at(-1)).toMatchObject({
+      type: "ATTEMPT_FINISHED",
+      evidenceRef: closure.evidenceRef,
+      metadata: {
+        outcome: "failed",
+        workerLaunchIntent: true,
+        closureVerified: true,
+        sideEffectOutcome: "unknown",
+        rollbackPerformed: false,
+      },
+    });
+    await db.transaction(async (tx) => {
+      expect(
+        (await tx.execute("SELECT status FROM task_attempts WHERE id = 'launch-attempt'")).rows[0],
+      ).toMatchObject({ status: "failed" });
+      expect(
+        (await tx.execute("SELECT state FROM task_step_leases WHERE id = 'launch-lease'")).rows[0],
+      ).toMatchObject({ state: "released" });
+    });
+  } finally {
+    await db.close();
+  }
+});
+
 it("resolves a quarantined Model Step from its linked successful internal Run", async () => {
   const db = await DomainDatabase.open(":memory:");
   try {

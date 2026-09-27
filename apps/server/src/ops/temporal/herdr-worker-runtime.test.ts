@@ -831,10 +831,98 @@ it("dispatches one Worker, reviews and cancels it safely, and quarantines an unc
     const uncertainInput = { taskId: uncertainTask.id, policyRevision: 1 };
     expect(await advance(uncertainInput)).toEqual({ kind: "continue" });
     expect((await store.longWork.listSteps(uncertainTask.id))[0]?.status).toBe("blocked");
-    expect(await store.tasks.listAttempts(uncertainTask.id)).toHaveLength(1);
+    const uncertainAttempt = (await store.tasks.listAttempts(uncertainTask.id))[0]!;
+    expect(await store.longWork.getWorkerLaunchIntent(uncertainAttempt.id)).toMatchObject({
+      taskId: uncertainTask.id,
+      stepId: uncertainStep.id,
+      agentKind: "pi",
+      workspaceId: "herdr-workspace",
+    });
     expect(writes.status(workspace.id)).toBe("quarantined");
+    const closeAgent = vi
+      .spyOn(bridge, "closeAgent")
+      .mockRejectedValueOnce(new Error("Herdr close acknowledgement unavailable"));
     expect(await advance(uncertainInput)).toMatchObject({ kind: "wait" });
+    expect(
+      await store.longWork.getQuarantinedLease(uncertainTask.id, uncertainStep.id),
+    ).toBeTruthy();
+    expect(writes.status(workspace.id)).toBe("quarantined");
+    closeAgent.mockRestore();
+    expect(await advance(uncertainInput)).toEqual({ kind: "continue" });
+    expect((await store.tasks.listAttempts(uncertainTask.id))[0]?.status).toBe("failed");
+    expect(await store.longWork.getQuarantinedLease(uncertainTask.id, uncertainStep.id)).toBeNull();
+    expect(writes.status(workspace.id)).toBe("free");
+    expect((await bridge.getSnapshot()).workspaces[0]?.panes).toHaveLength(0);
     expect(await store.tasks.listAttempts(uncertainTask.id)).toHaveLength(1);
+
+    const cancelUnboundTask = await store.tasks.createTask({
+      title: "Cancel an unbound Worker after a lost launch response",
+      creatorPrincipalId: "owner",
+      authorizationScope: caller.scope,
+    });
+    for (const action of ["task:continue", "task:delegate", "task:cancel"])
+      await store.authorization.grant({
+        principalId: "owner",
+        resourceId: `task-${cancelUnboundTask.id}`,
+        action,
+        scope: caller.scope,
+        effect: "allow",
+      });
+    const cancelUnboundStep = {
+      ...step,
+      id: "cancel-unbound-step",
+      taskId: cancelUnboundTask.id,
+    };
+    await store.longWork.createGraph(
+      cancelUnboundTask.id,
+      [cancelUnboundStep],
+      cancelUnboundStep.id,
+      DEFAULT_TASK_GRAPH_LIMITS,
+      { kind: "system", reason: "test unbound Worker cancellation" },
+    );
+    vi.spyOn(bridge, "startAgent").mockImplementationOnce(async (params) => {
+      await startAgent(params);
+      throw new Error("transport lost after Herdr started the Worker");
+    });
+    const cancelUnboundInput = { taskId: cancelUnboundTask.id, policyRevision: 1 };
+    expect(await advance(cancelUnboundInput)).toEqual({ kind: "continue" });
+    expect(await service.cancel(caller, cancelUnboundTask.id)).toBe(false);
+    expect(await advance(cancelUnboundInput)).toEqual({ kind: "continue" });
+    expect(await advance(cancelUnboundInput)).toEqual({ kind: "complete" });
+    expect((await store.tasks.getTask(cancelUnboundTask.id))?.status).toBe("CANCELED");
+    expect(writes.status(workspace.id)).toBe("free");
+
+    const absentTask = await store.tasks.createTask({
+      title: "Unknown launch with no observed pane",
+      creatorPrincipalId: "owner",
+      authorizationScope: caller.scope,
+    });
+    for (const action of ["task:continue", "task:delegate"])
+      await store.authorization.grant({
+        principalId: "owner",
+        resourceId: `task-${absentTask.id}`,
+        action,
+        scope: caller.scope,
+        effect: "allow",
+      });
+    const absentStep = { ...step, id: "absent-worker-step", taskId: absentTask.id };
+    await store.longWork.createGraph(
+      absentTask.id,
+      [absentStep],
+      absentStep.id,
+      DEFAULT_TASK_GRAPH_LIMITS,
+      { kind: "system", reason: "test absent launch snapshot" },
+    );
+    vi.spyOn(bridge, "startAgent").mockRejectedValueOnce(
+      new Error("transport lost before Herdr acknowledged tab creation"),
+    );
+    const absentInput = { taskId: absentTask.id, policyRevision: 1 };
+    expect(await advance(absentInput)).toEqual({ kind: "continue" });
+    const absentAttempt = (await store.tasks.listAttempts(absentTask.id))[0]!;
+    expect(await store.longWork.getWorkerLaunchIntent(absentAttempt.id)).toBeTruthy();
+    expect(await advance(absentInput)).toMatchObject({ kind: "wait" });
+    expect(await store.longWork.getQuarantinedLease(absentTask.id, absentStep.id)).toBeTruthy();
+    expect(writes.status(workspace.id)).toBe("quarantined");
   } finally {
     await store.close();
     await rm(directory, { recursive: true, force: true, maxRetries: 2, retryDelay: 50 }).catch(

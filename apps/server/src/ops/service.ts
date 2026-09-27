@@ -727,6 +727,27 @@ export class AuthorizedOpsService {
       const agentName =
         context?.lease?.sandboxSessionId ??
         `glassbox-${createHash("sha256").update(attemptId).digest("hex").slice(0, 24)}`;
+      await this.store.longWork.recordWorkerLaunchIntent({
+        taskId,
+        stepId: claim.step.id,
+        attemptId,
+        leaseId: claim.lease.id,
+        ownerInstanceId: claim.lease.ownerInstanceId,
+        expectedStepVersion: claim.step.version,
+        expectedLeaseVersion: claim.lease.version,
+        launch: {
+          herdrSession: dispatchSession,
+          workspaceId: target.workspaceId,
+          agentName,
+          agentKind: target.agentKind,
+          worktreePath: await realpath(target.worktreePath),
+        },
+        origin: {
+          kind: "decision",
+          decisionId: delegation.id,
+          actorPrincipalId: caller.principalId,
+        },
+      });
       started = true;
       worker = await this.bridge.startAgent({
         workspaceId: target.workspaceId,

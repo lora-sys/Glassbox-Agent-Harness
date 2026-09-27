@@ -265,6 +265,12 @@ export async function applySchemaV19Migration(tx: Transaction): Promise<void> {
     await tx.batch(schemaV19Migration);
 }
 
+export const schemaV20Migration = [
+  `CREATE TABLE IF NOT EXISTS worker_launch_intents (attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, step_id TEXT NOT NULL, lease_id TEXT NOT NULL UNIQUE REFERENCES task_step_leases(id), owner_instance_id TEXT NOT NULL, step_version INTEGER NOT NULL CHECK(step_version >= 1), lease_version INTEGER NOT NULL CHECK(lease_version >= 1), herdr_session TEXT NOT NULL, workspace_id TEXT NOT NULL, agent_name TEXT NOT NULL UNIQUE, agent_kind TEXT NOT NULL, worktree_path TEXT NOT NULL, created_at TEXT NOT NULL, FOREIGN KEY(attempt_id,task_id,step_id) REFERENCES task_attempts(id,task_id,step_id), FOREIGN KEY(task_id,step_id) REFERENCES task_steps(task_id,id))`,
+  `CREATE TRIGGER IF NOT EXISTS worker_launch_intents_no_update BEFORE UPDATE ON worker_launch_intents BEGIN SELECT RAISE(ABORT,'worker launch intents are immutable'); END`,
+  `CREATE TRIGGER IF NOT EXISTS worker_launch_intents_no_delete BEFORE DELETE ON worker_launch_intents BEGIN SELECT RAISE(ABORT,'worker launch intents are immutable'); END`,
+];
+
 export const schema = [
   ...baseSchema,
   ...schemaV7Statements,

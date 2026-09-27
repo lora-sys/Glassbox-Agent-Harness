@@ -140,6 +140,61 @@ export interface WorkerFileArtifact {
   createdAt: string;
 }
 
+export interface WorkerLaunchIdentity {
+  herdrSession: string;
+  workspaceId: string;
+  agentName: string;
+  agentKind: string;
+  worktreePath: string;
+}
+
+export interface StoredWorkerLaunchIntent extends WorkerLaunchIdentity {
+  taskId: string;
+  stepId: string;
+  attemptId: string;
+  leaseId: string;
+  ownerInstanceId: string;
+  stepVersion: number;
+  leaseVersion: number;
+  createdAt: string;
+}
+
+function parseWorkerLaunchIntent(row: Row): StoredWorkerLaunchIntent {
+  return {
+    taskId: stringColumn(row, "task_id"),
+    stepId: stringColumn(row, "step_id"),
+    attemptId: stringColumn(row, "attempt_id"),
+    leaseId: stringColumn(row, "lease_id"),
+    ownerInstanceId: stringColumn(row, "owner_instance_id"),
+    stepVersion: Number(row.step_version),
+    leaseVersion: Number(row.lease_version),
+    herdrSession: stringColumn(row, "herdr_session"),
+    workspaceId: stringColumn(row, "workspace_id"),
+    agentName: stringColumn(row, "agent_name"),
+    agentKind: stringColumn(row, "agent_kind"),
+    worktreePath: stringColumn(row, "worktree_path"),
+    createdAt: stringColumn(row, "created_at"),
+  };
+}
+
+function validateWorkerLaunchIdentity(identity: WorkerLaunchIdentity): void {
+  for (const value of [
+    identity.herdrSession,
+    identity.workspaceId,
+    identity.agentName,
+    identity.agentKind,
+  ])
+    requireIdentifier(value);
+  if (
+    typeof identity.worktreePath !== "string" ||
+    !identity.worktreePath.trim() ||
+    identity.worktreePath.length > 2048 ||
+    !/^(?:[A-Za-z]:[\\/]|\\\\|\/)/u.test(identity.worktreePath) ||
+    identity.worktreePath.split(/[\\/]/u).some((segment) => segment === "." || segment === "..")
+  )
+    throw new Error("Invalid canonical Worker worktree path");
+}
+
 function workerOutputExcerpt(output: string): {
   excerpt: string;
   truncated: boolean;
@@ -711,6 +766,113 @@ export class LongWorkStore {
         },
         lease: parseLease(leaseRow.rows[0]!),
       };
+    });
+  }
+
+  /** Persists the exact Herdr launch identity before any external launch RPC is sent. */
+  async recordWorkerLaunchIntent(input: {
+    taskId: string;
+    stepId: string;
+    attemptId: string;
+    leaseId: string;
+    ownerInstanceId: string;
+    expectedStepVersion: number;
+    expectedLeaseVersion: number;
+    launch: WorkerLaunchIdentity;
+    origin: LongWorkOrigin;
+  }): Promise<StoredWorkerLaunchIntent> {
+    for (const value of [input.taskId, input.stepId, input.attemptId, input.leaseId])
+      requireIdentifier(value);
+    requireIdentifier(input.ownerInstanceId);
+    validateWorkerLaunchIdentity(input.launch);
+    if (
+      !Number.isSafeInteger(input.expectedStepVersion) ||
+      input.expectedStepVersion < 1 ||
+      !Number.isSafeInteger(input.expectedLeaseVersion) ||
+      input.expectedLeaseVersion < 1
+    )
+      throw new Error("Invalid Worker launch intent version");
+
+    return this.db.transaction(async (tx) => {
+      await this.requireOrigin(tx, input.origin);
+      await this.requireActiveDurableTask(tx, input.taskId);
+      const step = await this.requireStep(tx, input.taskId, input.stepId);
+      if (
+        step.kind !== "herdr_worker" ||
+        step.status !== "running" ||
+        Number(step.version) !== input.expectedStepVersion
+      )
+        throw new Error("Worker launch intent Step conflict");
+      const attempt = await tx.execute({
+        sql: "SELECT 1 FROM task_attempts WHERE id = ? AND task_id = ? AND step_id = ? AND status = 'running'",
+        args: [input.attemptId, input.taskId, input.stepId],
+      });
+      if (!attempt.rows[0]) throw new Error("Worker launch intent Attempt conflict");
+      const lease = await tx.execute({
+        sql: `SELECT * FROM task_step_leases
+          WHERE id = ? AND task_id = ? AND step_id = ? AND attempt_id = ?`,
+        args: [input.leaseId, input.taskId, input.stepId, input.attemptId],
+      });
+      const leaseRow = lease.rows[0];
+      if (
+        !leaseRow ||
+        leaseRow.state !== "active" ||
+        Number(leaseRow.version) !== input.expectedLeaseVersion ||
+        leaseRow.owner_instance_id !== input.ownerInstanceId ||
+        leaseRow.worker_binding_id !== null ||
+        Date.parse(stringColumn(leaseRow, "expires_at")) <= Date.now()
+      )
+        throw new Error("Worker launch intent lease conflict");
+      const existingBinding = await tx.execute({
+        sql: "SELECT 1 FROM worker_bindings WHERE task_attempt_id = ? LIMIT 1",
+        args: [input.attemptId],
+      });
+      if (existingBinding.rows[0]) throw new Error("Worker launch intent already has a binding");
+      const prior = await tx.execute({
+        sql: "SELECT 1 FROM worker_launch_intents WHERE attempt_id = ? OR lease_id = ? LIMIT 1",
+        args: [input.attemptId, input.leaseId],
+      });
+      if (prior.rows[0]) throw new Error("Worker launch intent already exists");
+
+      const createdAt = new Date().toISOString();
+      await tx.execute({
+        sql: `INSERT INTO worker_launch_intents
+          (attempt_id,task_id,step_id,lease_id,owner_instance_id,step_version,lease_version,
+           herdr_session,workspace_id,agent_name,agent_kind,worktree_path,created_at)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        args: [
+          input.attemptId,
+          input.taskId,
+          input.stepId,
+          input.leaseId,
+          input.ownerInstanceId,
+          input.expectedStepVersion,
+          input.expectedLeaseVersion,
+          input.launch.herdrSession,
+          input.launch.workspaceId,
+          input.launch.agentName,
+          input.launch.agentKind,
+          input.launch.worktreePath,
+          createdAt,
+        ],
+      });
+      const stored = await tx.execute({
+        sql: "SELECT * FROM worker_launch_intents WHERE attempt_id = ?",
+        args: [input.attemptId],
+      });
+      if (!stored.rows[0]) throw new Error("Worker launch intent was not persisted");
+      return parseWorkerLaunchIntent(stored.rows[0]);
+    });
+  }
+
+  async getWorkerLaunchIntent(attemptId: string): Promise<StoredWorkerLaunchIntent | null> {
+    requireIdentifier(attemptId);
+    return this.db.transaction(async (tx) => {
+      const stored = await tx.execute({
+        sql: "SELECT * FROM worker_launch_intents WHERE attempt_id = ?",
+        args: [attemptId],
+      });
+      return stored.rows[0] ? parseWorkerLaunchIntent(stored.rows[0]) : null;
     });
   }
 
@@ -2066,6 +2228,155 @@ export class LongWorkStore {
         metadata: {
           outcome: cancellationPending ? "cancelled" : "failed",
           workerBindingId: input.closure.workerBindingId,
+          closureVerified: true,
+          sideEffectOutcome: "unknown",
+          rollbackPerformed: false,
+        },
+      });
+      const dependencies = await tx.execute({
+        sql: "SELECT dependency_id FROM task_step_dependencies WHERE task_id = ? AND step_id = ? ORDER BY dependency_id",
+        args: [input.taskId, input.stepId],
+      });
+      return parseStep(
+        await this.requireStep(tx, input.taskId, input.stepId),
+        dependencies.rows.map((row) => stringColumn(row, "dependency_id")),
+      );
+    });
+  }
+
+  /**
+   * Settles an unknown no-binding Worker only after the caller positively verifies and closes
+   * the exact persisted launch identity. A missing pane snapshot alone is not closure evidence.
+   */
+  async settleQuarantinedWorkerLaunchClosure(input: {
+    taskId: string;
+    stepId: string;
+    attemptId: string;
+    leaseId: string;
+    ownerInstanceId: string;
+    expectedStepVersion: number;
+    expectedLeaseVersion: number;
+    closure: WorkerLaunchIdentity & { evidenceRef: string };
+    origin: LongWorkOrigin;
+  }): Promise<TaskStep> {
+    for (const value of [input.taskId, input.stepId, input.attemptId, input.leaseId])
+      requireIdentifier(value);
+    requireIdentifier(input.ownerInstanceId);
+    validateWorkerLaunchIdentity(input.closure);
+    if (
+      !Number.isSafeInteger(input.expectedStepVersion) ||
+      input.expectedStepVersion < 1 ||
+      !Number.isSafeInteger(input.expectedLeaseVersion) ||
+      input.expectedLeaseVersion < 1 ||
+      !input.closure.evidenceRef.trim() ||
+      input.closure.evidenceRef.length > 512
+    )
+      throw new Error("Invalid quarantined Worker launch closure evidence or version");
+
+    return this.db.transaction(async (tx) => {
+      await this.requireOrigin(tx, input.origin);
+      const task = await this.requireTask(tx, input.taskId);
+      if (task.orchestration_mode !== "durable") throw new Error("Task is not durable work");
+      const cancellationState = stringColumn(task, "cancellation_state");
+      const cancellationPending = ["requested", "stopping"].includes(cancellationState);
+      if (
+        !cancellationPending &&
+        (cancellationState !== "none" ||
+          ["DONE", "CANCELED", "ACCEPTED", "FAILED"].includes(stringColumn(task, "status")))
+      )
+        throw new Error("Task is not active durable work");
+
+      const step = await this.requireStep(tx, input.taskId, input.stepId);
+      const expectedStepStatus = cancellationPending ? "cancelled" : "blocked";
+      if (
+        step.kind !== "herdr_worker" ||
+        step.status !== expectedStepStatus ||
+        Number(step.version) !== input.expectedStepVersion
+      )
+        throw new Error("Quarantined Worker launch closure Step conflict");
+      const attempt = await tx.execute({
+        sql: "SELECT status FROM task_attempts WHERE id = ? AND task_id = ? AND step_id = ?",
+        args: [input.attemptId, input.taskId, input.stepId],
+      });
+      if (attempt.rows[0]?.status !== "waiting_input")
+        throw new Error("Quarantined Worker launch closure Attempt conflict");
+      const lease = await tx.execute({
+        sql: `SELECT state,version,attempt_id,owner_instance_id,worker_binding_id
+          FROM task_step_leases WHERE id = ? AND task_id = ? AND step_id = ?`,
+        args: [input.leaseId, input.taskId, input.stepId],
+      });
+      if (
+        lease.rows[0]?.state !== "quarantined" ||
+        Number(lease.rows[0].version) !== input.expectedLeaseVersion ||
+        lease.rows[0].attempt_id !== input.attemptId ||
+        lease.rows[0].owner_instance_id !== input.ownerInstanceId ||
+        lease.rows[0].worker_binding_id !== null
+      )
+        throw new Error("Quarantined Worker launch closure lease conflict");
+      const intentResult = await tx.execute({
+        sql: `SELECT * FROM worker_launch_intents
+          WHERE attempt_id = ? AND task_id = ? AND step_id = ? AND lease_id = ?
+            AND owner_instance_id = ? AND lease_version < ?
+            AND herdr_session = ? AND workspace_id = ? AND agent_name = ?
+            AND agent_kind = ? AND worktree_path = ?`,
+        args: [
+          input.attemptId,
+          input.taskId,
+          input.stepId,
+          input.leaseId,
+          input.ownerInstanceId,
+          input.expectedLeaseVersion,
+          input.closure.herdrSession,
+          input.closure.workspaceId,
+          input.closure.agentName,
+          input.closure.agentKind,
+          input.closure.worktreePath,
+        ],
+      });
+      if (!intentResult.rows[0]) throw new Error("Quarantined Worker launch identity conflict");
+      const existingBinding = await tx.execute({
+        sql: "SELECT 1 FROM worker_bindings WHERE task_attempt_id = ? LIMIT 1",
+        args: [input.attemptId],
+      });
+      if (existingBinding.rows[0])
+        throw new Error("Quarantined Worker launch closure has a WorkerBinding");
+
+      const now = new Date().toISOString();
+      const nextAttemptStatus = cancellationPending ? "canceled" : "failed";
+      const attemptUpdate = await tx.execute({
+        sql: `UPDATE task_attempts SET status = ?, completed_at = ?
+          WHERE id = ? AND task_id = ? AND step_id = ? AND status = 'waiting_input'`,
+        args: [nextAttemptStatus, now, input.attemptId, input.taskId, input.stepId],
+      });
+      const leaseUpdate = await tx.execute({
+        sql: `UPDATE task_step_leases SET state = 'released', version = version + 1,
+            heartbeat_at = ?, released_at = ?
+          WHERE id = ? AND task_id = ? AND step_id = ? AND attempt_id = ?
+            AND worker_binding_id IS NULL AND owner_instance_id = ?
+            AND version = ? AND state = 'quarantined'`,
+        args: [
+          now,
+          now,
+          input.leaseId,
+          input.taskId,
+          input.stepId,
+          input.attemptId,
+          input.ownerInstanceId,
+          input.expectedLeaseVersion,
+        ],
+      });
+      if (attemptUpdate.rowsAffected !== 1 || leaseUpdate.rowsAffected !== 1)
+        throw new Error("Quarantined Worker launch closure settlement conflict");
+      await this.appendEventTx(tx, {
+        taskId: input.taskId,
+        stepId: input.stepId,
+        attemptId: input.attemptId,
+        type: "ATTEMPT_FINISHED",
+        origin: input.origin,
+        evidenceRef: input.closure.evidenceRef,
+        metadata: {
+          outcome: cancellationPending ? "cancelled" : "failed",
+          workerLaunchIntent: true,
           closureVerified: true,
           sideEffectOutcome: "unknown",
           rollbackPerformed: false,
