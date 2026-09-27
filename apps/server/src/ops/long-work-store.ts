@@ -25,6 +25,26 @@ export type LongWorkOrigin =
   | { kind: "decision"; decisionId: string; actorPrincipalId: string }
   | { kind: "system"; reason: string; decisionId?: string };
 
+export const MAX_CHILD_TASKS_PER_PARENT = 16;
+export const MAX_CHILD_TASK_ANCESTOR_DEPTH = 4;
+
+export type ChildTaskLinkErrorCode = "CHILD_COUNT_LIMIT" | "CHILD_DEPTH_LIMIT";
+
+export class ChildTaskLinkError extends Error {
+  constructor(
+    readonly code: ChildTaskLinkErrorCode,
+    readonly limit: number,
+    readonly attempted: number,
+  ) {
+    super(
+      code === "CHILD_COUNT_LIMIT"
+        ? `Parent Task child limit reached (${limit})`
+        : `Child Task ancestor depth limit exceeded (${limit})`,
+    );
+    this.name = "ChildTaskLinkError";
+  }
+}
+
 export interface StoredTaskEvent extends TaskEvent {
   authorizationDecisionId?: string;
 }
@@ -1419,6 +1439,37 @@ export class LongWorkStore {
         args: [input.childTaskId, input.parentTaskId],
       });
       if (cycle.rows[0]) throw new Error("Child Task link would create a cycle");
+
+      const childCountResult = await tx.execute({
+        sql: "SELECT COUNT(*) AS count FROM task_child_links WHERE parent_task_id = ?",
+        args: [input.parentTaskId],
+      });
+      const attemptedChildCount = Number(childCountResult.rows[0]?.count ?? 0) + 1;
+      if (attemptedChildCount > MAX_CHILD_TASKS_PER_PARENT)
+        throw new ChildTaskLinkError(
+          "CHILD_COUNT_LIMIT",
+          MAX_CHILD_TASKS_PER_PARENT,
+          attemptedChildCount,
+        );
+
+      const ancestorDepthResult = await tx.execute({
+        sql: `WITH RECURSIVE ancestors(task_id,depth) AS (
+            SELECT ?,0
+            UNION ALL
+            SELECT links.parent_task_id,ancestors.depth + 1
+              FROM task_child_links links
+              JOIN ancestors ON links.child_task_id = ancestors.task_id
+              WHERE ancestors.depth < ?
+          ) SELECT MAX(depth) AS depth FROM ancestors`,
+        args: [input.parentTaskId, MAX_CHILD_TASK_ANCESTOR_DEPTH],
+      });
+      const attemptedDepth = Number(ancestorDepthResult.rows[0]?.depth ?? 0) + 1;
+      if (attemptedDepth > MAX_CHILD_TASK_ANCESTOR_DEPTH)
+        throw new ChildTaskLinkError(
+          "CHILD_DEPTH_LIMIT",
+          MAX_CHILD_TASK_ANCESTOR_DEPTH,
+          attemptedDepth,
+        );
 
       const now = new Date().toISOString();
       const updated = await tx.execute({

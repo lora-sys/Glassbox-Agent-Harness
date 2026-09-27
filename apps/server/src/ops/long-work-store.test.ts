@@ -4,7 +4,11 @@ import { join } from "node:path";
 import { expect, it } from "vite-plus/test";
 import type { TaskStep } from "@glassbox/contracts";
 import { DomainDatabase } from "../persistence/database.js";
-import { LongWorkStore } from "./long-work-store.js";
+import {
+  LongWorkStore,
+  MAX_CHILD_TASK_ANCESTOR_DEPTH,
+  MAX_CHILD_TASKS_PER_PARENT,
+} from "./long-work-store.js";
 import { TaskStore } from "./task-store.js";
 
 const now = "2026-09-27T00:00:00.000Z";
@@ -290,6 +294,35 @@ async function fixture(db: DomainDatabase): Promise<LongWorkStore> {
     });
   });
   return new LongWorkStore(db);
+}
+
+async function insertLegacyTask(db: DomainDatabase, id: string): Promise<void> {
+  await db.transaction((tx) =>
+    tx.execute({
+      sql: "INSERT INTO tasks(id,title,status,priority,creator_principal_id,origin_scope_key,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
+      args: [id, id, "NEW", "normal", "owner", "test", now, now],
+    }),
+  );
+}
+
+async function addTaskContinueDecision(db: DomainDatabase, taskId: string): Promise<string> {
+  const decisionId = `continue-decision-${taskId}`;
+  const grantId = `continue-grant-${taskId}`;
+  await db.transaction(async (tx) => {
+    await tx.execute({
+      sql: "INSERT INTO resources(id,kind,visibility,owner_id) VALUES (?, 'task','private','owner')",
+      args: [`task-${taskId}`],
+    });
+    await tx.execute({
+      sql: "INSERT INTO grants(id,principal_id,resource_id,action,scope_key,effect,created_at) VALUES (?,?,?,?,?,'allow',?)",
+      args: [grantId, "owner", `task-${taskId}`, "task:continue", "test", now],
+    });
+    await tx.execute({
+      sql: "INSERT INTO authorization_decisions(id,principal_id,resource_id,action,scope_key,decision,reason,grant_id,created_at) VALUES (?,?,?,?,?,'ALLOW','test',?,?)",
+      args: [decisionId, "owner", `task-${taskId}`, "task:continue", "test", grantId, now],
+    });
+  });
+  return decisionId;
 }
 
 const retryPolicy = {
@@ -681,6 +714,189 @@ it("rejects duplicate child links and bounds child acceptance criteria", async (
         acceptanceCriteria: Array.from({ length: 21 }, (_, index) => `criterion ${index}`),
       }),
     ).rejects.toThrow("Invalid child Task acceptance criteria");
+  } finally {
+    await db.close();
+  }
+});
+
+it("enforces the per-parent child Task limit without partially linking the next child", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    const store = await fixture(db);
+    const childSteps = Array.from({ length: MAX_CHILD_TASKS_PER_PARENT + 1 }, (_, index) => ({
+      ...step(`child-step-${index + 1}`, [], "child_task"),
+      delegatedPermissionSet: [],
+    }));
+    await store.createGraph(
+      "task-1",
+      childSteps,
+      childSteps[0]!.id,
+      {
+        ...limits,
+        maxSteps: childSteps.length,
+        maxReadySteps: childSteps.length,
+        maxParallelSteps: childSteps.length,
+      },
+      system,
+    );
+    for (const childStep of childSteps)
+      await store.transitionStep({
+        taskId: "task-1",
+        stepId: childStep.id,
+        expectedVersion: 1,
+        from: "pending",
+        to: "ready",
+        origin: system,
+      });
+    for (let index = 1; index <= childSteps.length; index++)
+      await insertLegacyTask(db, `count-child-${index}`);
+
+    const linkInput = (index: number) => ({
+      parentTaskId: "task-1",
+      parentStepId: `child-step-${index}`,
+      expectedStepVersion: 2,
+      childTaskId: `count-child-${index}`,
+      delegatedPermissionSet: [],
+      acceptanceCriteria: ["Return a result"],
+      cancellationPolicy: "cancel_child" as const,
+      failurePolicy: "review_parent" as const,
+      origin: claimOrigin,
+    });
+    for (let index = 1; index <= MAX_CHILD_TASKS_PER_PARENT; index++)
+      await store.createChildTaskLink(linkInput(index));
+
+    await expect(
+      store.createChildTaskLink(linkInput(MAX_CHILD_TASKS_PER_PARENT + 1)),
+    ).rejects.toMatchObject({
+      name: "ChildTaskLinkError",
+      code: "CHILD_COUNT_LIMIT",
+      limit: MAX_CHILD_TASKS_PER_PARENT,
+      attempted: MAX_CHILD_TASKS_PER_PARENT + 1,
+    });
+    expect(await store.listChildTaskLinks("task-1")).toHaveLength(MAX_CHILD_TASKS_PER_PARENT);
+    expect(
+      await store.getChildTaskLink(`count-child-${MAX_CHILD_TASKS_PER_PARENT + 1}`),
+    ).toBeNull();
+    expect(await store.listSteps("task-1")).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: `child-step-${MAX_CHILD_TASKS_PER_PARENT + 1}`,
+          status: "ready",
+          version: 2,
+        }),
+      ]),
+    );
+    expect(
+      (await store.listEvents("task-1")).filter((event) => event.type === "CHILD_TASK_CREATED"),
+    ).toHaveLength(MAX_CHILD_TASKS_PER_PARENT);
+  } finally {
+    await db.close();
+  }
+});
+
+it("allows the maximum child ancestor depth and rejects the next level atomically", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    const store = await fixture(db);
+    let parentTaskId = "task-1";
+    let parentDecisionId = "continue-decision";
+
+    for (let depth = 1; depth <= MAX_CHILD_TASK_ANCESTOR_DEPTH; depth++) {
+      if (parentTaskId !== "task-1") {
+        const parentStep = {
+          ...step(`depth-step-${depth}`, [], "child_task"),
+          taskId: parentTaskId,
+        };
+        await store.createGraph(parentTaskId, [parentStep], parentStep.id, limits, system);
+        await store.transitionStep({
+          taskId: parentTaskId,
+          stepId: parentStep.id,
+          expectedVersion: 1,
+          from: "pending",
+          to: "ready",
+          origin: system,
+        });
+        parentDecisionId = await addTaskContinueDecision(db, parentTaskId);
+      } else {
+        const parentStep = {
+          ...step(`depth-step-${depth}`, [], "child_task"),
+          taskId: parentTaskId,
+        };
+        await store.createGraph(parentTaskId, [parentStep], parentStep.id, limits, system);
+        await store.transitionStep({
+          taskId: parentTaskId,
+          stepId: parentStep.id,
+          expectedVersion: 1,
+          from: "pending",
+          to: "ready",
+          origin: system,
+        });
+      }
+      const childTaskId = `depth-child-${depth}`;
+      await insertLegacyTask(db, childTaskId);
+      await store.createChildTaskLink({
+        parentTaskId,
+        parentStepId: `depth-step-${depth}`,
+        expectedStepVersion: 2,
+        childTaskId,
+        delegatedPermissionSet: [],
+        acceptanceCriteria: ["Return a result"],
+        cancellationPolicy: "cancel_child",
+        failurePolicy: "review_parent",
+        origin: {
+          kind: "decision",
+          decisionId: parentDecisionId,
+          actorPrincipalId: "owner",
+        },
+      });
+      parentTaskId = childTaskId;
+    }
+
+    const parentStep = {
+      ...step("depth-step-over-limit", [], "child_task"),
+      taskId: parentTaskId,
+    };
+    await store.createGraph(parentTaskId, [parentStep], parentStep.id, limits, system);
+    await store.transitionStep({
+      taskId: parentTaskId,
+      stepId: parentStep.id,
+      expectedVersion: 1,
+      from: "pending",
+      to: "ready",
+      origin: system,
+    });
+    const parentDecision = await addTaskContinueDecision(db, parentTaskId);
+    await insertLegacyTask(db, "depth-child-over-limit");
+
+    await expect(
+      store.createChildTaskLink({
+        parentTaskId,
+        parentStepId: parentStep.id,
+        expectedStepVersion: 2,
+        childTaskId: "depth-child-over-limit",
+        delegatedPermissionSet: [],
+        acceptanceCriteria: ["Return a result"],
+        cancellationPolicy: "cancel_child",
+        failurePolicy: "review_parent",
+        origin: { kind: "decision", decisionId: parentDecision, actorPrincipalId: "owner" },
+      }),
+    ).rejects.toMatchObject({
+      name: "ChildTaskLinkError",
+      code: "CHILD_DEPTH_LIMIT",
+      limit: MAX_CHILD_TASK_ANCESTOR_DEPTH,
+      attempted: MAX_CHILD_TASK_ANCESTOR_DEPTH + 1,
+    });
+    expect(await store.getChildTaskLink("depth-child-over-limit")).toBeNull();
+    expect(await store.listSteps(parentTaskId)).toMatchObject([
+      expect.objectContaining({ id: parentStep.id, status: "ready", version: 2 }),
+    ]);
+    expect(
+      (await store.listEvents(parentTaskId)).some(
+        (event) =>
+          event.type === "CHILD_TASK_CREATED" &&
+          event.metadata?.childTaskId === "depth-child-over-limit",
+      ),
+    ).toBe(false);
   } finally {
     await db.close();
   }
