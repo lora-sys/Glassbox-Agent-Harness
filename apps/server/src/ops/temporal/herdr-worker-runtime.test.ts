@@ -122,6 +122,20 @@ it("dispatches one Worker, reviews and cancels it safely, and quarantines an unc
     expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("running");
     expect(writes.status(workspace.id)).toBe("active");
     expect((await bridge.getSnapshot()).workspaces[0]?.panes).toHaveLength(1);
+    await bridge.disconnect();
+    expect((await advance(input)).kind).toBe("wait");
+    expect(await store.tasks.listAttempts(task.id)).toHaveLength(1);
+    await bridge.connect();
+    const reconnectedSnapshot = await bridge.getSnapshot();
+    expect(
+      reconnectedSnapshot.workspaces.flatMap((entry) => entry.panes).map((pane) => pane.paneId),
+    ).toEqual([binding!.paneId]);
+    expect((await advance(input)).kind).toBe("wait");
+    expect(await store.tasks.listAttempts(task.id)).toHaveLength(1);
+    const reconnectedBinding = await store.tasks.getWorkerBinding(attempt.id);
+    expect(reconnectedBinding?.id).toBe(binding?.id);
+    expect(reconnectedBinding?.paneId).toBe(binding?.paneId);
+    expect(reconnectedBinding?.taskAttemptId).toBe(attempt.id);
     const beforeStale = await store.longWork.getActiveLease(task.id, step.id);
     const currentSnapshot = await bridge.getSnapshot();
     vi.spyOn(bridge, "getSnapshot").mockResolvedValueOnce({
