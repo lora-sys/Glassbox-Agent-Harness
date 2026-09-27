@@ -354,8 +354,9 @@ remains in Glassbox and the server reports an unavailable backend for affected w
 authorized `/manage/ops/health` response includes `longWorkBackend.state`, `reason`, and
 Principal-scoped `longWork` counts. The disposable `spikes/temporal` setup proves SDK
 primitives only. `deploy/temporal` documents the PostgreSQL-backed Linux Server and its
-separate Worker process. Its isolated startup, namespace, restart, and backup-restore checks
-do not replace the Issue #30 cutover or the P6 real QQ and Herdr acceptance.
+separate Worker process. Its isolated startup, namespace, restart, backup-restore, and
+Glassbox SDK Task-continuation checks do not replace the Issue #30 cutover or the P6 real
+QQ and Herdr acceptance.
 
 ## QQ Channel
 
