@@ -33,6 +33,7 @@ The pinned Kit commit is currently not obtainable from its GitHub remote. The Ki
 - A consistent Windows SQLite backup with schema version 11 passed `PRAGMA quick_check`. Its protected Linux copy has the same SHA256. It is a staging snapshot, not a cutover copy.
 - Linux Herdr 0.9.0, `agent-browser` 0.38.1, Chrome for Testing, `rg`, and `fd` are installed. A disposable Linux Herdr session started, reported its Unix socket, and stopped. Chrome opened and read a public page using three Ubuntu library packages extracted into a private user directory. Install those libraries through the Ubuntu package manager before service acceptance. The pinned Linux NapCat image is downloaded and its Compose configuration parses. User level Linux Docker access and NapCat startup are not yet ready.
 - Two copied default workspaces passed an isolated path migration rehearsal. IDs, grants, and selection were retained. The Windows runtime and its original data remained active.
+- Ubuntu now has a Linux Docker daemon. The v4.18.28 NapCat image was pulled into it by its platform digest. Kit sandbox image `sha256:23c20ebaeaf891f17c77a519af7f657ce869596b0144f537c62ca4c5ed858af2` was built in WSL and passed the real sandbox smoke. Kit commit `5375a595e0521923ea87f4bbad08ce8732d4bd64` records that image and the Linux smoke correction. Publish that commit before treating this as a clean rebuild path.
 - The Windows Glassbox, NapCat, and Herdr processes remain active. Real Linux QQ and Worker acceptance have not run.
 
 ## Prepare an independent Linux checkout
