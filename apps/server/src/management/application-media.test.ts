@@ -72,6 +72,47 @@ it("runs the Owner media Tool through the selected provider and stores a Run-bou
   });
 });
 
+it("allows one corrected media call after an input rejected before provider execution", async () => {
+  const generateImage = vi.fn(async () => ({
+    status: "ready" as const,
+    images: [
+      {
+        base64:
+          "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADUlEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+      },
+    ],
+  }));
+  const f = await fixture(async (input) => ({ status: "succeeded", text: input.text }), {
+    mediaProvider: { id: "fixture-media", capabilities: ["image"], generateImage },
+  });
+  f.send(775, "生成图片", true);
+  const started = await f.started.take();
+  await f.reply("生成图片");
+  const context: OwnerContext = {
+    caller: started.caller,
+    conversationId: started.conversation.id,
+    runId: started.run.id,
+    requiredToolName: "media_generate",
+    requiredToolInput: { action: "image" },
+  };
+  const tool = admin(f.app)
+    .createRuntimeTools(() => context)
+    .find((candidate) => candidate.name === "media_generate");
+  if (!tool) throw new Error("missing media_generate");
+
+  await expect(
+    tool.execute("generate", { action: "image", mode: "text", prompt: "a tree" }),
+  ).rejects.toThrow("protected_tool_failed");
+  expect(generateImage).not.toHaveBeenCalled();
+  const corrected = await tool.execute("generate", {
+    action: "image",
+    mode: "text2image",
+    prompt: "a tree",
+  });
+  expect(corrected.details).toMatchObject({ status: "completed" });
+  expect(generateImage).toHaveBeenCalledOnce();
+});
+
 it("reports the video provider's requested resolution without using image sizes", async () => {
   const provider: MediaGenerationProvider = {
     id: "fixture-video",

@@ -567,18 +567,9 @@ function requiredToolCall(
   // outside a private Owner Run, whatever else a message may name.
   if (input.caller.scope.chatType !== "private" || !isOwner) return undefined;
   const rawText = input.text;
-  const mediaRequest = requestClauses(rawText);
-  if (
-    /(?:生成|画|制作|创作|编辑|修改|合成|改图)/u.test(mediaRequest) &&
-    (/(?:图片|图像|生图|插画|照片|海报)/u.test(mediaRequest) ||
-      /(?:画|绘制)(?:一|两|几)?(?:张|幅|只|个)/u.test(mediaRequest))
-  )
-    return { name: MEDIA_GENERATION_TOOL, input: { action: "image" } };
-  if (
-    /(?:生成|制作|创作|做一个|做个)/u.test(mediaRequest) &&
-    /(?:视频|短片|动画)/u.test(mediaRequest)
-  )
-    return { name: MEDIA_GENERATION_TOOL, input: { action: "video" } };
+  const mediaIntent = mediaRequestIntent(rawText);
+  if (mediaIntent === "image") return { name: MEDIA_GENERATION_TOOL, input: { action: "image" } };
+  if (mediaIntent === "video") return { name: MEDIA_GENERATION_TOOL, input: { action: "video" } };
   if (authorizedToolNames?.includes(OWNER_MODEL_ADMIN_TOOL)) {
     const model = ownerModelCommand(rawText, modelProfiles);
     if (model) return model;
@@ -716,6 +707,37 @@ interface BlockedMutation {
   reason: "incomplete_parameters" | "not_permitted_in_group" | "not_permitted";
 }
 
+function mediaRequestIntent(text: string): "image" | "video" | "ambiguous" | undefined {
+  for (const request of requestClauses(text).split(/，|但是|但|不过|而是/u)) {
+    const clause = request.trim();
+    if (
+      /(?:不要|别|无需|不用|禁止|请勿|不许|停止)(?:再)?(?:为我|给我|帮我)?(?:生成|画|绘制|制作|创作|编辑|修改|合成|改图)/u.test(
+        clause,
+      ) ||
+      /(?:能|可以|能否|是否能|会不会)(?:生成|画|绘制|制作)[^。！？!?]*[吗么]$/u.test(clause)
+    )
+      continue;
+    if (/(?:翻译|解释|是什么意思|怎么说)/u.test(clause)) continue;
+    if (!/(?:生成|画|绘制|制作|创作|编辑|修改|合成|改图)/u.test(clause)) continue;
+    if (/(?:图片|图像|视频|照片|海报)(?:的|用的)?提示词/u.test(clause)) continue;
+    if (/(?:文字描述|用文字|一段文字|代码|脚本|报告|故事|文章|文案)[。！？!?]?$/u.test(clause))
+      continue;
+    const image = [...clause.matchAll(/图片|图像|生图|插画|照片|海报/gu)].at(-1)?.index ?? -1;
+    const video = [...clause.matchAll(/视频|短片|动画/gu)].at(-1)?.index ?? -1;
+    const cover = /(?:视频|短片|动画)(?:封面|缩略图|海报|截图)/u.exec(clause);
+    if (cover && video <= cover.index) return "image";
+    if (video > image) return "video";
+    if (image >= 0 || /(?:画|绘制)(?:一|两|几)?(?:张|幅|只|个)/u.test(clause)) return "image";
+    if (
+      /^(?:(?:请|麻烦|帮我|给我)\s*)?(?:生成|制作|创作)\s*(?:一|两|几)?(?:只|个)\s*[^\s，,。！？!?]{1,12}[。！？!?]?$/u.test(
+        clause,
+      )
+    )
+      return "ambiguous";
+  }
+  return undefined;
+}
+
 function explicitModelSelectionCommand(text: string): boolean {
   const command = text.trim().replace(/^(?:Bob|Glassbox|玻璃盒)[，,\s]+/iu, "");
   return /^(?:请|帮我)?\s*(?:(?:(?:把|将)\s*(?:我\s*)?(?:后续的\s*)?(?:(?:Owner|QQ)\s*)?(?:好友)?私聊(?:模型)?\s*切换(?:到|成|为)?|切换(?:模型)?(?:到|成|为)?|换(?:到|成)|使用|switch to)\s*.*)$/iu.test(
@@ -747,6 +769,14 @@ function blockedMutationRequest(
   isOwner: boolean,
   modelProfiles: readonly PublicModelProfile[] = [],
 ): BlockedMutation | undefined {
+  const mediaIntent = mediaRequestIntent(input.text);
+  if (mediaIntent === "ambiguous")
+    return { operation: "media:generate", reason: "incomplete_parameters" };
+  if (mediaIntent && (input.caller.scope.chatType !== "private" || !isOwner))
+    return {
+      operation: "media:generate",
+      reason: input.caller.scope.chatType === "group" ? "not_permitted_in_group" : "not_permitted",
+    };
   if (explicitModelChangeCommand(input.text)) {
     if (input.caller.scope.chatType === "group")
       return { operation: "model:switch", reason: "not_permitted_in_group" };
@@ -909,11 +939,17 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       return {
         status: "failed",
         text:
-          blockedMutation.reason === "not_permitted_in_group"
-            ? "该操作未在群聊中开放，未执行。"
-            : blockedMutation.reason === "not_permitted"
-              ? "该操作未授权，未执行。"
-              : "请求的操作未执行，请补齐必要参数后重试。",
+          blockedMutation.operation === "media:generate"
+            ? blockedMutation.reason === "incomplete_parameters"
+              ? "请说明你想要图片、视频，还是文字描述。当前请求未执行。"
+              : blockedMutation.reason === "not_permitted_in_group"
+                ? "当前群聊未开放图片和视频生成，未执行。"
+                : "当前会话未授权媒体生成，未执行。"
+            : blockedMutation.reason === "not_permitted_in_group"
+              ? "该操作未在群聊中开放，未执行。"
+              : blockedMutation.reason === "not_permitted"
+                ? "该操作未授权，未执行。"
+                : "请求的操作未执行，请补齐必要参数后重试。",
       };
     }
     await this.runtime.initialize();
