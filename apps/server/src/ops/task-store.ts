@@ -204,17 +204,62 @@ export class TaskStore {
         args: [input.taskId],
       });
       const task = rows.rows[0];
+      let durableWorkerLive = false;
+      let durableWorkerPermitted = false;
+      if (task?.orchestration_mode === "durable" && task.cancellation_state === "none") {
+        const worker = await tx.execute({
+          sql: `SELECT s.delegated_permissions_json FROM task_attempts a
+                JOIN task_steps s ON s.task_id = a.task_id AND s.id = a.step_id
+                JOIN task_step_leases l ON l.task_id = a.task_id AND l.step_id = s.id
+                  AND l.attempt_id = a.id
+                JOIN worker_bindings b ON b.id = l.worker_binding_id
+                  AND b.task_attempt_id = a.id
+                WHERE a.id = ? AND a.task_id = ? AND a.status = 'running'
+                  AND s.kind = 'herdr_worker' AND s.status = 'running'
+                  AND l.state = 'active' AND l.expires_at > ?`,
+          args: [input.attemptId, input.taskId, new Date().toISOString()],
+        });
+        durableWorkerLive = worker.rows.length > 0;
+        if (worker.rows[0]) {
+          try {
+            const declared: unknown = JSON.parse(
+              stringColumn(worker.rows[0], "delegated_permissions_json"),
+            );
+            const hasPermission = (resourceId: string, action: string) =>
+              Array.isArray(declared) &&
+              declared.some(
+                (permission) =>
+                  permission?.resourceId === resourceId && permission?.action === action,
+              );
+            durableWorkerPermitted =
+              hasPermission(input.resourceId, input.action) &&
+              (!input.productWorkspaceId ||
+                hasPermission(
+                  `workspace:${input.productWorkspaceId}`,
+                  input.action === "worker:file:write" ? "workspace:write" : "workspace:read",
+                ));
+          } catch {
+            durableWorkerPermitted = false;
+          }
+        }
+      }
       const live =
         task &&
-        task.active_attempt_id === input.attemptId &&
         task.creator_principal_id === input.caller.principalId &&
-        ["RUNNING", "WAITING_INPUT"].includes(stringColumn(task, "status"));
+        ["RUNNING", "WAITING_INPUT"].includes(stringColumn(task, "status")) &&
+        (task.orchestration_mode === "durable"
+          ? task.cancellation_state === "none" && durableWorkerLive && durableWorkerPermitted
+          : task.active_attempt_id === input.attemptId);
+      // Legacy Tasks without an origin scope predate Task-bound delegation.
+      const delegatedTaskId =
+        task && optionalString(task, "origin_scope_key") ? input.taskId : undefined;
       const decision = await evaluate(tx, {
         caller: input.caller,
         resourceId: input.resourceId,
         action: input.action,
         runId: task ? (optionalString(task, "run_id") ?? undefined) : undefined,
         conversationId: task ? (optionalString(task, "conversation_id") ?? undefined) : undefined,
+        delegatedTaskId,
       });
       const workspaceDecision = input.productWorkspaceId
         ? await evaluate(tx, {
@@ -225,6 +270,7 @@ export class TaskStore {
             conversationId: task
               ? (optionalString(task, "conversation_id") ?? undefined)
               : undefined,
+            delegatedTaskId,
           })
         : null;
       const record = async (outcome: string) =>

@@ -33,7 +33,7 @@ type WorkerContext = { file: string; lease: WriteOccupancyLease | null };
 type StartedWorker = Awaited<ReturnType<HerdrBridge["startAgent"]>>;
 
 const OPS_RESOURCE = "agent-operations";
-type RunEvidence = { runId?: string; conversationId?: string };
+type RunEvidence = { runId?: string; conversationId?: string; delegatedTaskId?: string };
 export interface LongWorkRuntimePort {
   available?(): boolean;
   start(taskId: string, policyRevision: number): Promise<unknown>;
@@ -258,10 +258,23 @@ export class AuthorizedOpsService {
   ): Promise<void> {
     const decision = await this.authorize(caller, `task-${taskId}`, "task:plan", evidence);
     for (const step of steps) {
+      for (const permission of step.delegatedPermissionSet) {
+        const delegated = await this.store.authorization.check({
+          caller,
+          resourceId: permission.resourceId,
+          action: permission.action,
+          delegatedTaskId: taskId,
+          ...evidence,
+        });
+        if (delegated.decision !== "ALLOW") throw new AccessDeniedError(delegated);
+      }
       if (step.kind !== "tool") continue;
       const spec = step.specRef ? parseTaskGetSpec(step.specRef) : null;
       if (!spec) throw new Error("Unsupported Tool Step spec");
-      await this.authorize(caller, `task-${spec.targetTaskId}`, "task:read", evidence);
+      await this.authorize(caller, `task-${spec.targetTaskId}`, "task:read", {
+        ...evidence,
+        delegatedTaskId: taskId,
+      });
     }
     if (!this.longWorkRuntime || this.longWorkRuntime.available?.() === false)
       throw new Error("Durable Task runtime is unavailable");

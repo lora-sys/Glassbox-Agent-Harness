@@ -595,7 +595,7 @@ it("accepts only exact task_get Tool Step references", async () => {
   }
 });
 
-it("rejects delegated permissions on principal-planned graphs", async () => {
+it("requires a current planning grant before a principal may declare Step permissions", async () => {
   const db = await DomainDatabase.open(":memory:");
   try {
     const store = await fixture(db);
@@ -607,7 +607,7 @@ it("rejects delegated permissions on principal-planned graphs", async () => {
         limits,
         claimOrigin,
       ),
-    ).rejects.toThrow("Delegated permissions are not yet supported");
+    ).rejects.toThrow("Current Task planning grant is required");
   } finally {
     await db.close();
   }
@@ -775,7 +775,7 @@ it("rejects child Task links with stale Step state, delegated permissions, or mi
         expectedStepVersion: 2,
         delegatedPermissionSet: [{ resourceId: "task-1", action: "task:read" }],
       }),
-    ).rejects.toThrow("Child Task delegated permissions are not yet supported");
+    ).rejects.toThrow("Child permissions exceed the parent Step delegation");
     await expect(
       store.createChildTaskLink({
         ...common,

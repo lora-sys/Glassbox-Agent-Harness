@@ -48,6 +48,7 @@ async function delegatedTaskAllows(
 ): Promise<boolean> {
   let runTaskId: string | undefined;
   let runConversationId: string | undefined;
+  let originRunMatchesTask = false;
   if (request.runId) {
     const bound = await tx.execute({
       sql: `SELECT r.source,r.conversation_id,ar.task_id FROM runs r
@@ -59,10 +60,22 @@ async function delegatedTaskAllows(
         runTaskId = optionalString(bound.rows[0], "task_id") ?? undefined;
         if (!runTaskId) return false;
         runConversationId = stringColumn(bound.rows[0], "conversation_id");
-      } else if (request.delegatedTaskId) return false;
+      } else if (request.delegatedTaskId) {
+        const origin = await tx.execute({
+          sql: "SELECT 1 FROM tasks WHERE id = ? AND run_id = ?",
+          args: [request.delegatedTaskId, request.runId],
+        });
+        originRunMatchesTask = origin.rows.length > 0;
+        if (!originRunMatchesTask) return false;
+      }
     }
   }
-  if (request.delegatedTaskId && request.runId && request.delegatedTaskId !== runTaskId)
+  if (
+    request.delegatedTaskId &&
+    request.runId &&
+    !originRunMatchesTask &&
+    request.delegatedTaskId !== runTaskId
+  )
     return false;
   const taskId = request.delegatedTaskId ?? runTaskId;
   if (!taskId) return true;

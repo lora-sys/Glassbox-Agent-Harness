@@ -14,7 +14,8 @@ import {
   type TaskWaitPolicy,
   type HerdrAgentLifecycleState,
 } from "@glassbox/contracts";
-import { requireIdentifier } from "../identity/scope.js";
+import { requireIdentifier, scopeKey, type TrustedChannelScope } from "../identity/scope.js";
+import { evaluate } from "../auth/service.js";
 import { DomainDatabase, optionalString, stringColumn } from "../persistence/database.js";
 import { TaskGraphError, validateTaskGraph, type TaskGraphLimits } from "./task-graph.js";
 import { decideTaskRetry, type RetrySideEffectOutcome } from "./long-work-retry.js";
@@ -1503,8 +1504,6 @@ export class LongWorkStore {
     )
       throw new Error("Invalid child Task link");
     boundedDelegatedPermissions(input.delegatedPermissionSet, "child delegated permissions");
-    if (input.delegatedPermissionSet.length > 0)
-      throw new Error("Child Task delegated permissions are not yet supported");
     const acceptanceCriteriaJson = boundedCriteria(input.acceptanceCriteria);
     if (input.origin.kind !== "decision")
       throw new Error("Child Task creation needs a principal continuation decision");
@@ -1551,6 +1550,23 @@ export class LongWorkStore {
         )
       )
         throw new Error("Child permissions exceed the parent Step delegation");
+      if (input.delegatedPermissionSet.length > 0) {
+        const scopeJson = optionalString(parent, "origin_scope_json");
+        if (!scopeJson) throw new Error("Parent Task scope is required for delegation");
+        const scope = JSON.parse(scopeJson) as TrustedChannelScope;
+        if (scopeKey(scope) !== parent.origin_scope_key)
+          throw new Error("Parent Task scope changed before child delegation");
+        for (const permission of input.delegatedPermissionSet) {
+          const current = await evaluate(tx, {
+            caller: { principalId: origin.actorPrincipalId, scope },
+            resourceId: permission.resourceId,
+            action: permission.action,
+            delegatedTaskId: input.parentTaskId,
+          });
+          if (current.decision !== "ALLOW")
+            throw new Error("Child permission is not currently granted to the parent Task");
+        }
+      }
 
       const childResult = await tx.execute({
         sql: "SELECT * FROM tasks WHERE id = ?",
@@ -1707,8 +1723,6 @@ export class LongWorkStore {
       validateInitialStep(step, taskId);
       requireIdentifier(step.id);
     }
-    if (origin.kind === "decision" && steps.some((step) => step.delegatedPermissionSet.length > 0))
-      throw new Error("Delegated permissions are not yet supported for principal-planned graphs");
     await this.db.transaction(async (tx) => {
       await this.requireOrigin(tx, origin);
       const task = await this.requireTask(tx, taskId);
@@ -1726,6 +1740,25 @@ export class LongWorkStore {
           ],
         });
         if (!currentDecision.rows[0]) throw new Error("Current Task planning grant is required");
+        if (steps.some((step) => step.delegatedPermissionSet.length > 0)) {
+          const scopeJson = optionalString(task, "origin_scope_json");
+          if (!scopeJson) throw new Error("Task scope is required for delegated permissions");
+          const scope = JSON.parse(scopeJson) as TrustedChannelScope;
+          if (scopeKey(scope) !== task.origin_scope_key)
+            throw new Error("Task scope changed before delegated planning");
+          for (const step of steps) {
+            for (const permission of step.delegatedPermissionSet) {
+              const delegated = await evaluate(tx, {
+                caller: { principalId: origin.actorPrincipalId, scope },
+                resourceId: permission.resourceId,
+                action: permission.action,
+                delegatedTaskId: taskId,
+              });
+              if (delegated.decision !== "ALLOW")
+                throw new Error("Declared Step permission is not currently granted");
+            }
+          }
+        }
       }
       if (
         task.orchestration_mode !== "legacy" ||

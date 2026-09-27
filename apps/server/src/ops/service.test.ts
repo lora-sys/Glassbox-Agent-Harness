@@ -1,7 +1,124 @@
 import { expect, it, vi } from "vite-plus/test";
+import type { TaskStep } from "@glassbox/contracts";
 import { openDomainStore, AccessDeniedError, type CallerContext } from "../persistence/index.js";
 import { FakeHerdrBridge } from "./fake-herdr-bridge.js";
 import { AuthorizedOpsService } from "./service.js";
+
+it("links a child with a current subset of parent Step permissions and rejects revocation", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  const caller: CallerContext = {
+    principalId: "owner",
+    scope: {
+      connectionId: "test",
+      botId: "bot",
+      chatType: "private",
+      chatId: "owner",
+      senderId: "owner",
+    },
+  };
+  try {
+    await store.identities.bindOwner("owner", caller.scope);
+    const parent = await store.tasks.createTask({
+      title: "Parent",
+      creatorPrincipalId: "owner",
+      authorizationScope: caller.scope,
+    });
+    await store.authorization.registerResource({
+      id: "worker-files",
+      kind: "worker-files",
+      visibility: "public",
+    });
+    const fileGrant = await store.authorization.grant({
+      principalId: "owner",
+      resourceId: "worker-files",
+      action: "worker:file:read",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    for (const action of ["task:plan", "task:continue"])
+      await store.authorization.grant({
+        principalId: "owner",
+        resourceId: `task-${parent.id}`,
+        action,
+        scope: caller.scope,
+        effect: "allow",
+      });
+    const service = new AuthorizedOpsService(store, new FakeHerdrBridge(), undefined, {
+      available: () => true,
+      start: vi.fn(async () => undefined),
+      wake: vi.fn(async () => undefined),
+    });
+    const permission = { resourceId: "worker-files", action: "worker:file:read" };
+    const step: TaskStep = {
+      id: "child-step",
+      taskId: parent.id,
+      kind: "child_task",
+      title: "Child",
+      status: "pending",
+      dependencyIds: [],
+      dependencyPolicy: { failed: "block", cancelled: "cancel", skipped: "skip" },
+      maxAttempts: 1,
+      requiredCapabilities: [],
+      delegatedPermissionSet: [permission],
+      version: 1,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    await service.planExistingTask(caller, parent.id, [step], step.id);
+    await store.longWork.transitionStep({
+      taskId: parent.id,
+      stepId: step.id,
+      expectedVersion: 1,
+      from: "pending",
+      to: "ready",
+      origin: { kind: "system", reason: "test" },
+    });
+    const child = await store.tasks.createTask({
+      title: "Child",
+      creatorPrincipalId: "owner",
+      authorizationScope: caller.scope,
+    });
+    const continuation = await store.authorization.check({
+      caller,
+      resourceId: `task-${parent.id}`,
+      action: "task:continue",
+    });
+    const linkInput = {
+      parentTaskId: parent.id,
+      parentStepId: step.id,
+      expectedStepVersion: 2,
+      childTaskId: child.id,
+      delegatedPermissionSet: [permission],
+      acceptanceCriteria: ["Return a verified result"],
+      cancellationPolicy: "cancel_child" as const,
+      failurePolicy: "block_parent" as const,
+      origin: {
+        kind: "decision" as const,
+        decisionId: continuation.id,
+        actorPrincipalId: "owner",
+      },
+    };
+    await expect(store.longWork.createChildTaskLink(linkInput)).resolves.toMatchObject({
+      delegatedPermissionSet: [permission],
+    });
+    await store.authorization.revoke(fileGrant);
+    const secondChild = await store.tasks.createTask({
+      title: "Second child",
+      creatorPrincipalId: "owner",
+      authorizationScope: caller.scope,
+    });
+    await expect(
+      store.longWork.createChildTaskLink({
+        ...linkInput,
+        childTaskId: secondChild.id,
+        expectedStepVersion: 3,
+      }),
+    ).rejects.toThrow("Child permission is not currently granted to the parent Task");
+    expect(await store.longWork.getChildTaskLink(secondChild.id)).toBeNull();
+  } finally {
+    await store.close();
+  }
+});
 
 it("requests durable cancellation before settling and reports a running Step honestly", async () => {
   const store = await openDomainStore({ databasePath: ":memory:" });
@@ -282,6 +399,96 @@ it("requires current target Task read authority before planning a task_get Tool 
     });
     await service.planExistingTask(caller, task.id, [step], step.id);
     expect(runtime.start).toHaveBeenCalledWith(task.id, 1);
+  } finally {
+    await store.close();
+  }
+});
+
+it("rejects declared Step permissions outside the planner's current grants", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  const caller: CallerContext = {
+    principalId: "owner",
+    scope: {
+      connectionId: "test",
+      botId: "bot",
+      chatType: "private",
+      chatId: "owner",
+      senderId: "owner",
+    },
+  };
+  try {
+    await store.identities.bindOwner("owner", caller.scope);
+    const task = await store.tasks.createTask({
+      title: "Delegated boundary",
+      creatorPrincipalId: "owner",
+      authorizationScope: caller.scope,
+    });
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: `task-${task.id}`,
+      action: "task:plan",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    const runtime = {
+      available: () => true,
+      start: vi.fn(async () => undefined),
+      wake: vi.fn(async () => undefined),
+    };
+    const service = new AuthorizedOpsService(store, new FakeHerdrBridge(), undefined, runtime);
+    const now = new Date().toISOString();
+    const step: TaskStep = {
+      id: "delegated-step",
+      taskId: task.id,
+      kind: "herdr_worker",
+      title: "Worker",
+      status: "pending",
+      dependencyIds: [],
+      dependencyPolicy: { failed: "block", cancelled: "cancel", skipped: "skip" },
+      maxAttempts: 1,
+      requiredCapabilities: [],
+      delegatedPermissionSet: [{ resourceId: `task-${task.id}`, action: "task:accept" }],
+      createdAt: now,
+      updatedAt: now,
+      version: 1,
+    };
+    await expect(service.planExistingTask(caller, task.id, [step], step.id)).rejects.toBeInstanceOf(
+      AccessDeniedError,
+    );
+    const planDecision = await store.authorization.check({
+      caller,
+      resourceId: `task-${task.id}`,
+      action: "task:plan",
+    });
+    await expect(
+      store.longWork.createGraph(
+        task.id,
+        [step],
+        step.id,
+        {
+          maxSteps: 8,
+          maxDependenciesPerStep: 4,
+          maxFanOut: 4,
+          maxReadySteps: 4,
+          maxParallelSteps: 2,
+        },
+        {
+          kind: "decision",
+          decisionId: planDecision.id,
+          actorPrincipalId: caller.principalId,
+        },
+      ),
+    ).rejects.toThrow("Declared Step permission is not currently granted");
+    expect((await store.tasks.getTask(task.id))?.orchestrationMode).toBeUndefined();
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: `task-${task.id}`,
+      action: "task:accept",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    await service.planExistingTask(caller, task.id, [step], step.id);
+    expect(runtime.start).toHaveBeenCalledOnce();
   } finally {
     await store.close();
   }
