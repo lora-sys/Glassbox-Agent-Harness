@@ -319,7 +319,7 @@ async function fixture(db: DomainDatabase): Promise<LongWorkStore> {
 
 async function prepareCheckpointWriter(
   db: DomainDatabase,
-  options: { retry?: boolean; stateRef?: string } = {},
+  options: { retry?: boolean; stateRef?: string; createRun?: boolean } = {},
 ): Promise<LongWorkStore> {
   const store = await fixture(db);
   const key = scopeKey(checkpointCaller.scope);
@@ -406,7 +406,8 @@ async function prepareCheckpointWriter(
     leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
     origin: claimOrigin,
   });
-  await addCheckpointRun(db, "checkpoint-attempt-1", "checkpoint-run-1");
+  if (options.createRun !== false)
+    await addCheckpointRun(db, "checkpoint-attempt-1", "checkpoint-run-1");
   return store;
 }
 
@@ -4733,6 +4734,56 @@ it("retries an absent checkpoint only after quarantined post-state verification"
         (await tx.execute("SELECT operation_generation FROM task_steps WHERE id = 'checkpoint'"))
           .rows[0]?.operation_generation,
       ).toBe(1);
+    });
+  } finally {
+    await db.close();
+  }
+});
+
+it("recovers an unknown checkpoint claim when no internal Run was ever bound", async () => {
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    const store = await prepareCheckpointWriter(db, { retry: true, createRun: false });
+    await store.settleClaimedStep({
+      taskId: "task-1",
+      stepId: "checkpoint",
+      attemptId: "checkpoint-attempt-1",
+      leaseId: "checkpoint-lease-1",
+      ownerInstanceId: modelLeaseOwner("task-1", "checkpoint"),
+      expectedStepVersion: 3,
+      expectedLeaseVersion: 1,
+      outcome: "unknown",
+      evidenceRef: "run-create-unknown:checkpoint-attempt-1",
+      origin: system,
+    });
+    const result = await store.reconcileQuarantinedCheckpointStep({
+      taskId: "task-1",
+      stepId: "checkpoint",
+      attemptId: "checkpoint-attempt-1",
+      leaseId: "checkpoint-lease-1",
+      expectedStepVersion: 4,
+      expectedLeaseVersion: 2,
+      origin: claimOrigin,
+    });
+    expect(result).toEqual({ kind: "retry" });
+    expect((await store.listSteps("task-1"))[0]).toMatchObject({ status: "waiting" });
+    expect(await store.getQuarantinedLease("task-1", "checkpoint")).toBeNull();
+    const events = await store.listEvents("task-1");
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "STEP_BLOCKED",
+          evidenceRef: "run-create-unknown:checkpoint-attempt-1",
+        }),
+        expect.objectContaining({
+          type: "RETRY_SCHEDULED",
+          metadata: expect.objectContaining({ sideEffectOutcome: "not_started", runId: null }),
+        }),
+      ]),
+    );
+    await db.transaction(async (tx) => {
+      expect((await tx.execute("SELECT run_id FROM task_attempt_runs")).rows).toHaveLength(0);
+      expect((await tx.execute("SELECT id FROM task_checkpoints")).rows).toHaveLength(0);
     });
   } finally {
     await db.close();

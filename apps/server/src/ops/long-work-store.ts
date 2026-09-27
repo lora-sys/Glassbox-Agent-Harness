@@ -4049,17 +4049,19 @@ export class LongWorkStore {
       )
         throw new Error("Quarantined checkpoint lease conflict");
       const linked = await tx.execute({
-        sql: `SELECT r.id,r.source,r.status FROM task_attempt_runs ar
-          JOIN runs r ON r.id = ar.run_id
+        sql: `SELECT ar.run_id,r.id,r.source,r.status FROM task_attempt_runs ar
+          LEFT JOIN runs r ON r.id = ar.run_id
           WHERE ar.attempt_id = ? AND ar.task_id = ? AND ar.step_id = ?`,
         args: [input.attemptId, input.taskId, input.stepId],
       });
       const run = linked.rows[0];
+      if (run && run.id === null) throw new Error("Quarantined checkpoint Run binding is missing");
       if (run && run.source !== "task_step")
         throw new Error("Quarantined checkpoint Run binding conflict");
-      if (!run || ["queued", "running", "cancelling"].includes(stringColumn(run, "status")))
+      if (run && ["queued", "running", "cancelling"].includes(stringColumn(run, "status")))
         return { kind: "unresolved" };
       if (
+        run &&
         !["cancelled", "succeeded", "failed", "interrupted", "unknown"].includes(
           stringColumn(run, "status"),
         )
@@ -4079,6 +4081,7 @@ export class LongWorkStore {
       )
         throw new Error("Checkpoint post-state identity conflict");
       const applied = checkpoint.rows.length === 1;
+      if (!run && applied) throw new Error("Checkpoint exists without its required Run binding");
       const now = new Date().toISOString();
       const attemptCount = await tx.execute({
         sql: `SELECT COUNT(*) AS count FROM task_attempts a
@@ -4103,7 +4106,7 @@ export class LongWorkStore {
               nowMs: Date.parse(now),
               errorClass: "checkpoint_not_applied",
               timedOut: false,
-              sideEffectOutcome: "not_applied",
+              sideEffectOutcome: run ? "not_applied" : "not_started",
             })
           : null;
       const retry = retryDecision?.action === "retry";
@@ -4205,7 +4208,7 @@ export class LongWorkStore {
         });
       const metadata = {
         outcome: nextStatus,
-        sideEffectOutcome: applied ? "applied" : "not_applied",
+        sideEffectOutcome: applied ? "applied" : run ? "not_applied" : "not_started",
         invocationId: identity.invocationId,
         runId: run ? stringColumn(run, "id") : null,
       };

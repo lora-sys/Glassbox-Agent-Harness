@@ -1374,6 +1374,53 @@ it("retries a checkpoint mutation only after a terminal Run and absent post-stat
   }
 });
 
+it("recovers a checkpoint claim when Run creation and the immediate lookup both fail", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  try {
+    const { task, step } = await createModelTask(
+      store,
+      "tool:checkpoint_write:phase-three",
+      {
+        version: 1,
+        maxAttempts: 2,
+        initialDelayMs: 0,
+        maxDelayMs: 0,
+        backoffMultiplier: 1,
+        retryableErrorClasses: ["checkpoint_not_applied"],
+        nonRetryableErrorClasses: [],
+        timeoutOutcome: "unknown",
+      },
+      "tool",
+    );
+    const create = vi
+      .spyOn(store.conversations, "createInternalStepRun")
+      .mockRejectedValueOnce(new Error("Run insert unavailable"));
+    const lookup = vi
+      .spyOn(store.conversations, "getInternalStepRun")
+      .mockRejectedValueOnce(new Error("Run lookup unavailable"));
+    const advance = createAdvanceLongWorkActivity(store);
+    const input = { taskId: task.id, policyRevision: 1 };
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("blocked");
+    expect(await store.longWork.getQuarantinedLease(task.id, step.id)).toBeTruthy();
+    create.mockRestore();
+    lookup.mockRestore();
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("waiting");
+    expect(await store.longWork.getQuarantinedLease(task.id, step.id)).toBeNull();
+    const bindings = await store.db.transaction((tx) =>
+      tx.execute({
+        sql: "SELECT run_id FROM task_attempt_runs WHERE task_id = ? AND step_id = ?",
+        args: [task.id, step.id],
+      }),
+    );
+    expect(bindings.rows).toHaveLength(0);
+  } finally {
+    vi.restoreAllMocks();
+    await store.close();
+  }
+});
+
 it("retries a failed model Run after its durable retry wait and fails when attempts are exhausted", async () => {
   const store = await openDomainStore({ databasePath: ":memory:" });
   try {
