@@ -18,6 +18,7 @@ import { requireIdentifier } from "../identity/scope.js";
 import { DomainDatabase, optionalString, stringColumn } from "../persistence/database.js";
 import { TaskGraphError, validateTaskGraph, type TaskGraphLimits } from "./task-graph.js";
 import { decideTaskRetry, type RetrySideEffectOutcome } from "./long-work-retry.js";
+import { parseTaskGetSpec } from "./tool-step-spec.js";
 
 /** Only trusted services may call this store. A decision ID records evidence; it does not
  * prove that a grant is still current. Callers must reauthorize before protected work. */
@@ -203,6 +204,14 @@ function validateInitialStep(step: TaskStep, taskId: string): void {
     throw new Error("Invalid initial step");
   boundedNames(step.requiredCapabilities, "required capabilities");
   boundedDelegatedPermissions(step.delegatedPermissionSet, "delegated permissions");
+  if (
+    step.kind === "tool" &&
+    (typeof step.specRef !== "string" ||
+      !parseTaskGetSpec(step.specRef) ||
+      step.instructions !== undefined ||
+      step.waitPolicy !== undefined)
+  )
+    throw new Error("Invalid Tool Step specification");
   const retry = step.retryPolicy;
   if (retry) {
     if (
@@ -703,7 +712,7 @@ export class LongWorkStore {
         throw new Error("Task cancellation is not pending");
       const step = await this.requireStep(tx, input.taskId, input.stepId);
       if (
-        step.kind !== "model" ||
+        (step.kind !== "model" && step.kind !== "tool") ||
         step.status !== "running" ||
         Number(step.version) !== input.expectedStepVersion
       )
@@ -844,7 +853,7 @@ export class LongWorkStore {
         throw new Error("Task cancellation is not pending");
       const step = await this.requireStep(tx, input.taskId, input.stepId);
       if (
-        step.kind !== "model" ||
+        (step.kind !== "model" && step.kind !== "tool") ||
         step.status !== "running" ||
         step.version !== input.expectedStepVersion
       )

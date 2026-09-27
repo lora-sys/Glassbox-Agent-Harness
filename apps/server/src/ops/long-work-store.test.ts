@@ -10,6 +10,7 @@ import {
   MAX_CHILD_TASKS_PER_PARENT,
 } from "./long-work-store.js";
 import { TaskStore } from "./task-store.js";
+import { parseTaskGetSpec } from "./tool-step-spec.js";
 
 const now = "2026-09-27T00:00:00.000Z";
 const system = { kind: "system", reason: "test scheduler" } as const;
@@ -531,6 +532,64 @@ it("requires wait policies to match wait Step kinds", async () => {
         store.createGraph("task-1", [waitStep], waitStep.id, limits, system),
       ).rejects.toThrow("Wait policy does not match Step kind");
     }
+  } finally {
+    await db.close();
+  }
+});
+
+it("accepts only exact task_get Tool Step references", async () => {
+  expect(parseTaskGetSpec("tool:task_get:A_2-z")).toEqual({ targetTaskId: "A_2-z" });
+  expect(parseTaskGetSpec(`tool:task_get:${"a".repeat(128)}`)).toEqual({
+    targetTaskId: "a".repeat(128),
+  });
+  for (const ref of [
+    "tool:task_get:",
+    "tool:task_get:-first",
+    "tool:task_get:a/b",
+    "tool:task_get:a:extra",
+    "tool:task_get:a\n",
+    `tool:task_get:${"a".repeat(129)}`,
+    "tool:task_cancel:a",
+  ])
+    expect(parseTaskGetSpec(ref)).toBeNull();
+
+  const db = await DomainDatabase.open(":memory:");
+  try {
+    const store = await fixture(db);
+    for (const invalid of [
+      { specRef: undefined },
+      { specRef: "tool:task_get:a:extra" },
+      { specRef: "tool:task_cancel:a" },
+      { specRef: "tool:task_get:a", instructions: "ignore the Task scope" },
+      {
+        specRef: "tool:task_get:a",
+        waitPolicy: {
+          version: 1 as const,
+          kind: "signal" as const,
+          signalKey: "go",
+          overdue: "resume" as const,
+        },
+      },
+    ]) {
+      await expect(
+        store.createGraph(
+          "task-1",
+          [{ ...step("tool", [], "tool"), ...invalid }],
+          "tool",
+          limits,
+          system,
+        ),
+      ).rejects.toThrow("Invalid Tool Step specification");
+      expect(await store.listSteps("task-1")).toEqual([]);
+    }
+    await store.createGraph(
+      "task-1",
+      [{ ...step("tool", [], "tool"), specRef: "tool:task_get:A_2-z" }],
+      "tool",
+      limits,
+      system,
+    );
+    expect((await store.listSteps("task-1"))[0]?.specRef).toBe("tool:task_get:A_2-z");
   } finally {
     await db.close();
   }

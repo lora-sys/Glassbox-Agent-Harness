@@ -7,10 +7,11 @@ export type AcceptedIncoming = Awaited<ReturnType<DomainStore["conversations"]["
 
 export interface ExecutionInput {
   /** Set only by the server from a persisted internal Run source. */
-  executionMode?: "task_step_model";
+  executionMode?: "task_step_model" | "task_step_tool";
   caller: CallerContext;
   conversation: ConversationRecord;
   run: RunRecord;
+  taskStepBinding?: { taskId: string; stepId: string; attemptId: string };
   text: string;
   history: Array<{ role: "user" | "assistant"; text: string }>;
   historyRunIds?: string[];
@@ -35,6 +36,8 @@ export interface RunExecutionAdapter {
   supportsGroup: boolean;
   /** True only when task_step_model executes without any mutating or ambient Tool surface. */
   supportsTaskStepModel?: boolean;
+  /** A closed server Tool executor with no model, ambient Tool registry, or external ingress. */
+  supportsTaskStepTool?: boolean;
   execute(input: ExecutionInput): Promise<ExecutionResult>;
 }
 

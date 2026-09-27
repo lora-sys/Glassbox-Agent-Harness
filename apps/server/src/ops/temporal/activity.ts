@@ -6,6 +6,7 @@ import type { RunRecord } from "../../conversation/store.js";
 import { getLongWorkCaller, authorizeLongWorkAction } from "../long-work-authority.js";
 import { LongWorkScheduler } from "../long-work-scheduler.js";
 import { DEFAULT_TASK_GRAPH_LIMITS } from "../task-graph.js";
+import { parseTaskGetSpec } from "../tool-step-spec.js";
 import type { AdvanceLongWorkActivity } from "./contracts.js";
 
 const ORIGIN = { kind: "system", reason: "Temporal coordinator" } as const;
@@ -27,6 +28,7 @@ function assertCurrentTask(task: AgentTask | null, policyRevision: number): Agen
 
 function modelExecutionRef(step: TaskStep): string | null {
   const ref = step.specRef;
+  if (step.kind === "tool") return ref && parseTaskGetSpec(ref) ? ref : null;
   return ref && /^(?:model|pi):.+$/u.test(ref) ? ref : null;
 }
 
@@ -100,9 +102,10 @@ async function settleModelRun(
     decisionId === undefined
       ? ORIGIN
       : { kind: "decision" as const, decisionId, actorPrincipalId: input.caller.principalId };
+  const failureClass = input.step.kind === "tool" ? "tool_failed" : "model_failed";
   if (
     outcome === "failed" &&
-    input.step.retryPolicy?.retryableErrorClasses.includes("model_failed")
+    input.step.retryPolicy?.retryableErrorClasses.includes(failureClass)
   ) {
     try {
       await store.longWork.scheduleClaimedStepRetry({
@@ -116,7 +119,7 @@ async function settleModelRun(
         proof: {
           ref: `run:${input.run.id}`,
           sideEffectOutcome: "not_applied",
-          errorClass: "model_failed",
+          errorClass: failureClass,
         },
         origin: currentOrigin,
       });
@@ -458,7 +461,7 @@ export function createAdvanceLongWorkActivity(store: DomainStore): AdvanceLongWo
       const steps = await store.longWork.listSteps(taskId);
       let pending = false;
       for (const step of steps) {
-        if (step.kind !== "model" || step.status !== "running") continue;
+        if (!["model", "tool"].includes(step.kind) || step.status !== "running") continue;
         const result = await settleCancelledModelStep(store, taskId, step);
         if (result === "settled") return { kind: "continue" };
         pending = true;
@@ -499,7 +502,7 @@ export function createAdvanceLongWorkActivity(store: DomainStore): AdvanceLongWo
     const byId = new Map(steps.map((step) => [step.id, step]));
     let modelRunPending = false;
     for (const step of steps) {
-      if (step.kind !== "model" || step.status !== "running") continue;
+      if (!["model", "tool"].includes(step.kind) || step.status !== "running") continue;
       const observed = await observeRunningModelStep(store, taskId, step);
       if (observed === "settled" || observed === "continue") return { kind: "continue" };
       if (observed === "pending") modelRunPending = true;
@@ -509,9 +512,11 @@ export function createAdvanceLongWorkActivity(store: DomainStore): AdvanceLongWo
     let unsupported = false;
     for (const stepId of progress.runnableStepIds) {
       const step = byId.get(stepId)!;
-      if (step.kind === "model") {
+      if (step.kind === "model" || step.kind === "tool") {
         if (
-          step.requiredCapabilities.some((capability) => capability !== "text") ||
+          (step.kind === "model"
+            ? step.requiredCapabilities.some((capability) => capability !== "text")
+            : step.requiredCapabilities.length > 0) ||
           step.delegatedPermissionSet.length > 0
         ) {
           await store.longWork.transitionStep({
@@ -521,7 +526,13 @@ export function createAdvanceLongWorkActivity(store: DomainStore): AdvanceLongWo
             from: "ready",
             to: "blocked",
             origin: ORIGIN,
-            metadata: { reason: "model_execution_boundary_exceeded", outcome: "not_started" },
+            metadata: {
+              reason:
+                step.kind === "tool"
+                  ? "tool_execution_boundary_exceeded"
+                  : "model_execution_boundary_exceeded",
+              outcome: "not_started",
+            },
           });
           unsupported = true;
           continue;

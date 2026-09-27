@@ -24,6 +24,7 @@ function step(
     id,
     taskId: "task-1",
     kind,
+    ...(kind === "tool" ? { specRef: "tool:task_get:task-1" } : {}),
     title: id,
     status: "pending",
     dependencyIds,

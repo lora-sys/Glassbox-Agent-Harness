@@ -3,6 +3,7 @@ import type { RunLease, RunRoute, TerminalRunStatus } from "../../conversation/l
 import type { IncomingMessage, RunRecord } from "../../conversation/store.js";
 import { requireIdentifier, type CallerContext } from "../../identity/scope.js";
 import { authorizeLongWorkAction } from "../../ops/long-work-authority.js";
+import { parseTaskGetSpec } from "../../ops/tool-step-spec.js";
 import { stringColumn } from "../../persistence/database.js";
 import type {
   AcceptedIncoming,
@@ -496,10 +497,15 @@ export class RunService {
     try {
       await this.emit({ type: "run_started", runId, conversationId: run.conversationId });
       const adapter = this.options.resolveExecution(run.executionRef);
+      const toolStep = run.source === "task_step" && parseTaskGetSpec(run.executionRef) !== null;
       if (
         !adapter ||
+        (run.source === "external" && run.executionRef.startsWith("tool:")) ||
         (caller.scope.chatType === "group" && adapter.supportsGroup !== true) ||
-        (run.source === "task_step" && adapter.supportsTaskStepModel !== true)
+        (run.source === "task_step" &&
+          (toolStep
+            ? adapter.supportsTaskStepTool !== true
+            : adapter.supportsTaskStepModel !== true))
       ) {
         result = { status: "failed" };
       } else {
@@ -528,7 +534,13 @@ export class RunService {
           executorStarted = true;
           result = await adapter.execute({
             ...input,
-            ...(run.source === "task_step" ? { executionMode: "task_step_model" as const } : {}),
+            ...(run.source === "task_step"
+              ? {
+                  executionMode: toolStep
+                    ? ("task_step_tool" as const)
+                    : ("task_step_model" as const),
+                }
+              : {}),
             caller: structuredClone(caller),
             signal: active.controller.signal,
           });

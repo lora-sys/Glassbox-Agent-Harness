@@ -133,6 +133,18 @@ function service(
   return { instance, events, errors };
 }
 
+it("never executes a Tool Step adapter from external ingress", async () => {
+  const { store } = await fixture();
+  const execute = vi.fn(async () => ({ status: "succeeded" as const, text: "protected" }));
+  const { instance } = service(store, { supportsGroup: true, supportsTaskStepTool: true, execute });
+  await instance.start();
+  const accepted = await instance.receive(
+    input("external-tool", "external-tool", group, "tool:task_get:task-1"),
+  );
+  expect((await instance.waitForRun(owner(), accepted.run.id)).status).toBe("failed");
+  expect(execute).not.toHaveBeenCalled();
+});
+
 it("executes a persisted Model Step Run without QQ ingress history or automatic delivery", async () => {
   const { store } = await fixture();
   const execute = vi.fn(async (request: ExecutionInput) => ({

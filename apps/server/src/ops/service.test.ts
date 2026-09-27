@@ -211,6 +211,82 @@ it("authorizes durable graph planning and step reads on the exact Task", async (
   }
 });
 
+it("requires current target Task read authority before planning a task_get Tool Step", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  const caller: CallerContext = {
+    principalId: "owner",
+    scope: {
+      connectionId: "test",
+      botId: "bot",
+      chatType: "private",
+      chatId: "owner",
+      senderId: "owner",
+    },
+  };
+  try {
+    await store.identities.bindOwner("owner", caller.scope);
+    const task = await store.tasks.createTask({
+      title: "Read target",
+      creatorPrincipalId: "owner",
+      authorizationScope: caller.scope,
+    });
+    const target = await store.tasks.createTask({
+      title: "Protected target",
+      creatorPrincipalId: "owner",
+      authorizationScope: caller.scope,
+    });
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: `task-${task.id}`,
+      action: "task:plan",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    const runtime = {
+      available: () => true,
+      start: vi.fn(async () => {}),
+      wake: vi.fn(async () => {}),
+    };
+    const service = new AuthorizedOpsService(store, new FakeHerdrBridge(), undefined, runtime);
+    const now = new Date().toISOString();
+    const step = {
+      id: "tool-step",
+      taskId: task.id,
+      kind: "tool" as const,
+      title: "Read target",
+      specRef: `tool:task_get:${target.id}`,
+      status: "pending" as const,
+      dependencyIds: [],
+      dependencyPolicy: {
+        failed: "block" as const,
+        cancelled: "cancel" as const,
+        skipped: "skip" as const,
+      },
+      maxAttempts: 1,
+      requiredCapabilities: [],
+      delegatedPermissionSet: [],
+      createdAt: now,
+      updatedAt: now,
+      version: 1,
+    };
+    await expect(service.planExistingTask(caller, task.id, [step], step.id)).rejects.toBeInstanceOf(
+      AccessDeniedError,
+    );
+    expect((await store.tasks.getTask(task.id))?.orchestrationMode).toBeUndefined();
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: `task-${target.id}`,
+      action: "task:read",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    await service.planExistingTask(caller, task.id, [step], step.id);
+    expect(runtime.start).toHaveBeenCalledWith(task.id, 1);
+  } finally {
+    await store.close();
+  }
+});
+
 it("authorizes durable Step acceptance and rework at the service boundary", async () => {
   const store = await openDomainStore({ databasePath: ":memory:" });
   const caller: CallerContext = {

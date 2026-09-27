@@ -11,6 +11,7 @@ import { scopeKey, type CallerContext } from "../identity/scope.js";
 import type { DomainStore } from "../persistence/index.js";
 import type { HerdrBridge } from "./herdr-bridge.js";
 import { DEFAULT_TASK_GRAPH_LIMITS } from "./task-graph.js";
+import { parseTaskGetSpec } from "./tool-step-spec.js";
 import { buildOpsHealthSnapshot, type OpsHealthInput, type OpsHealthSnapshot } from "./health.js";
 import { mkdir, writeFile, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
@@ -180,6 +181,12 @@ export class AuthorizedOpsService {
     evidence?: RunEvidence,
   ): Promise<void> {
     const decision = await this.authorize(caller, `task-${taskId}`, "task:plan", evidence);
+    for (const step of steps) {
+      if (step.kind !== "tool") continue;
+      const spec = step.specRef ? parseTaskGetSpec(step.specRef) : null;
+      if (!spec) throw new Error("Unsupported Tool Step spec");
+      await this.authorize(caller, `task-${spec.targetTaskId}`, "task:read", evidence);
+    }
     if (!this.longWorkRuntime || this.longWorkRuntime.available?.() === false)
       throw new Error("Durable Task runtime is unavailable");
     await this.store.longWork.createGraph(taskId, steps, rootStepId, DEFAULT_TASK_GRAPH_LIMITS, {

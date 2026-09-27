@@ -209,6 +209,75 @@ describe("internal Task Step Runs", () => {
     });
   });
 
+  it("creates a linked task_get Tool Run without loading Step instructions or conversation history", async () => {
+    const { db, conversations } = await fixture();
+    await db.transaction((tx) =>
+      tx.execute({
+        sql: "UPDATE task_steps SET kind = 'tool', spec_ref = 'tool:task_get:task-1', instructions = 'Do not load this text' WHERE id = 'step-1'",
+      }),
+    );
+    const request = {
+      caller,
+      taskId: "task-1",
+      stepId: "step-1",
+      attemptId: "attempt-1",
+      executionRef: "tool:task_get:task-1",
+    };
+    const first = await conversations.createInternalStepRun(request);
+    expect((await conversations.createInternalStepRun(request)).id).toBe(first.id);
+    expect(first).toMatchObject({ source: "task_step", status: "queued" });
+    const input = await conversations.loadRunInput(caller, first.id);
+    expect(input.text).toBe("");
+    expect(input.history).toEqual([]);
+    expect(input.taskStepBinding).toEqual({
+      taskId: "task-1",
+      stepId: "step-1",
+      attemptId: "attempt-1",
+    });
+    expect((await conversations.listMessages(caller, first.conversationId)).items).toEqual([]);
+    await db.transaction((tx) =>
+      tx.execute({
+        sql: "UPDATE task_steps SET kind = 'model', instructions = 'Changed instructions' WHERE id = 'step-1'",
+      }),
+    );
+    await expect(conversations.loadRunInput(caller, first.id)).rejects.toMatchObject({
+      decision: { reason: "scope_mismatch" },
+    });
+  });
+
+  it("requires the persisted Tool Step kind, exact spec, and active Attempt lease", async () => {
+    const { db, conversations } = await fixture();
+    const request = {
+      caller,
+      taskId: "task-1",
+      stepId: "step-1",
+      attemptId: "attempt-1",
+      executionRef: "tool:task_get:task-1",
+    };
+    await expect(conversations.createInternalStepRun(request)).rejects.toMatchObject({
+      decision: { reason: "scope_mismatch" },
+    });
+    await db.transaction((tx) =>
+      tx.execute({
+        sql: "UPDATE task_steps SET kind = 'tool', spec_ref = 'tool:task_get:other-task' WHERE id = 'step-1'",
+      }),
+    );
+    await expect(conversations.createInternalStepRun(request)).rejects.toMatchObject({
+      decision: { reason: "scope_mismatch" },
+    });
+    await db.transaction((tx) =>
+      tx.execute({
+        sql: "UPDATE task_steps SET spec_ref = 'tool:task_get:task-1' WHERE id = 'step-1'",
+      }),
+    );
+    await db.transaction((tx) =>
+      tx.execute({ sql: "UPDATE task_step_leases SET state = 'released' WHERE id = 'lease-1'" }),
+    );
+    await expect(conversations.createInternalStepRun(request)).rejects.toMatchObject({
+      decision: { reason: "scope_mismatch" },
+    });
+  });
+
   it("requires current Task continuation permission before creating a Run", async () => {
     const { db, conversations } = await fixture();
     await db.transaction((tx) =>

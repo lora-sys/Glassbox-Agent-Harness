@@ -16,6 +16,7 @@ import {
   type TrustedChannelScope,
 } from "../identity/scope.js";
 import { DomainDatabase, optionalString, stringColumn } from "../persistence/database.js";
+import { parseTaskGetSpec } from "../ops/tool-step-spec.js";
 
 export type RunStatus =
   | "queued"
@@ -249,7 +250,7 @@ export async function authorizeRun(
 ): Promise<AuthorizedResult<{ conversationId: string }>> {
   requireIdentifier(runId);
   const result = await tx.execute({
-    sql: "SELECT conversation_id, principal_id, source FROM runs WHERE id = ?",
+    sql: "SELECT conversation_id, principal_id, source, execution_ref FROM runs WHERE id = ?",
     args: [runId],
   });
   const row = result.rows[0];
@@ -278,10 +279,13 @@ export async function authorizeRun(
 
   if (stringColumn(row, "source") === "task_step") {
     const linkedTask = await tx.execute({
-      sql: "SELECT task_id FROM task_attempt_runs WHERE run_id = ?",
+      sql: `SELECT ar.task_id,s.kind,s.spec_ref FROM task_attempt_runs ar
+            JOIN task_steps s ON s.id = ar.step_id AND s.task_id = ar.task_id
+            WHERE ar.run_id = ?`,
       args: [runId],
     });
-    const taskId = linkedTask.rows[0] ? stringColumn(linkedTask.rows[0], "task_id") : null;
+    const linkedStep = linkedTask.rows[0];
+    const taskId = linkedStep ? stringColumn(linkedStep, "task_id") : null;
     if (!taskId) {
       return {
         denied: await recordDecision(
@@ -300,6 +304,27 @@ export async function authorizeRun(
       runId,
     });
     if (taskAuthorization.decision !== "ALLOW") return { denied: taskAuthorization };
+    const executionRef = stringColumn(row, "execution_ref");
+    if (linkedStep?.kind === "tool" || executionRef.startsWith("tool:")) {
+      const toolSpec = parseTaskGetSpec(executionRef);
+      if (!toolSpec || linkedStep?.kind !== "tool" || linkedStep.spec_ref !== executionRef)
+        return {
+          denied: await recordDecision(
+            tx,
+            { caller, resourceId: "run", action, runId, conversationId },
+            "DENY",
+            "scope_mismatch",
+          ),
+        };
+      const targetAuthorization = await evaluate(tx, {
+        caller,
+        resourceId: `task-${toolSpec.targetTaskId}`,
+        action: "task:read",
+        conversationId,
+        runId,
+      });
+      if (targetAuthorization.decision !== "ALLOW") return { denied: targetAuthorization };
+    }
   }
 
   const authorization = await authorizeConversation(tx, caller, conversationId, action, runId);
@@ -538,12 +563,14 @@ export class ConversationStore {
     return authorizedValue(outcome);
   }
 
-  /** Creates the durable Run for one already-authorized model Task Step. The
+  /** Creates the durable Run for one already-authorized Model or Tool Task Step. The
    * required messages row is an empty internal key and is never ingress text. */
   async createInternalStepRun(input: InternalStepRunInput): Promise<RunRecord> {
     for (const value of [input.taskId, input.stepId, input.attemptId, input.executionRef])
       requireIdentifier(value);
-    if (!/^(?:model|pi):.+$/u.test(input.executionRef))
+    const modelExecution = /^(?:model|pi):.+$/u.test(input.executionRef);
+    const toolExecution = parseTaskGetSpec(input.executionRef) !== null;
+    if (!modelExecution && !toolExecution)
       throw new Error("Unsupported internal Run execution reference");
     const result = await this.db.transaction<AuthorizedResult<RunRecord>>(async (tx) => {
       const taskAuthorization = await evaluate(tx, {
@@ -622,6 +649,43 @@ export class ConversationStore {
       });
       if (runControl.decision !== "ALLOW") return { denied: runControl };
 
+      const stepRows = await tx.execute({
+        sql: `SELECT s.instructions, s.spec_ref, s.kind, s.status, a.status AS attempt_status,
+                     a.task_id AS attempt_task_id, a.step_id AS attempt_step_id
+              FROM task_steps s JOIN task_attempts a ON a.id = ?
+              WHERE s.id = ? AND s.task_id = ?
+                AND EXISTS (SELECT 1 FROM task_step_leases l WHERE l.task_id = s.task_id
+                  AND l.step_id = s.id AND l.attempt_id = a.id AND l.state = 'active' AND l.expires_at > ?)`,
+        args: [input.attemptId, input.stepId, input.taskId, new Date().toISOString()],
+      });
+      const step = stepRows.rows[0];
+      if (
+        !step ||
+        !(
+          (modelExecution &&
+            stringColumn(step, "kind") === "model" &&
+            typeof step.instructions === "string" &&
+            !!step.instructions.trim() &&
+            step.instructions.length <= 4096) ||
+          (toolExecution &&
+            stringColumn(step, "kind") === "tool" &&
+            optionalString(step, "spec_ref") === input.executionRef)
+        ) ||
+        stringColumn(step, "status") !== "running" ||
+        stringColumn(step, "attempt_status") !== "running" ||
+        stringColumn(step, "attempt_task_id") !== input.taskId ||
+        optionalString(step, "attempt_step_id") !== input.stepId
+      ) {
+        return {
+          denied: await recordDecision(
+            tx,
+            { caller: input.caller, resourceId: `task-${input.taskId}`, action: "run:create" },
+            "DENY",
+            "scope_mismatch",
+          ),
+        };
+      }
+
       const existing = await tx.execute({
         sql: `SELECT r.* FROM task_attempt_runs ar JOIN runs r ON r.id = ar.run_id
               WHERE ar.attempt_id = ? AND ar.task_id = ? AND ar.step_id = ?`,
@@ -644,37 +708,6 @@ export class ConversationStore {
           };
         }
         return { value: runRecord(existing.rows[0]) };
-      }
-
-      const stepRows = await tx.execute({
-        sql: `SELECT s.instructions, s.kind, s.status, a.status AS attempt_status,
-                     a.task_id AS attempt_task_id, a.step_id AS attempt_step_id
-              FROM task_steps s JOIN task_attempts a ON a.id = ?
-              WHERE s.id = ? AND s.task_id = ?
-                AND EXISTS (SELECT 1 FROM task_step_leases l WHERE l.task_id = s.task_id
-                  AND l.step_id = s.id AND l.attempt_id = a.id AND l.state = 'active' AND l.expires_at > ?)`,
-        args: [input.attemptId, input.stepId, input.taskId, new Date().toISOString()],
-      });
-      const step = stepRows.rows[0];
-      if (
-        !step ||
-        stringColumn(step, "kind") !== "model" ||
-        stringColumn(step, "status") !== "running" ||
-        typeof step.instructions !== "string" ||
-        !step.instructions.trim() ||
-        step.instructions.length > 4096 ||
-        stringColumn(step, "attempt_status") !== "running" ||
-        stringColumn(step, "attempt_task_id") !== input.taskId ||
-        optionalString(step, "attempt_step_id") !== input.stepId
-      ) {
-        return {
-          denied: await recordDecision(
-            tx,
-            { caller: input.caller, resourceId: `task-${input.taskId}`, action: "run:create" },
-            "DENY",
-            "scope_mismatch",
-          ),
-        };
       }
 
       const now = new Date().toISOString();
@@ -945,8 +978,10 @@ export class ConversationStore {
         const authorization = await authorizeRun(tx, caller, runId, "conversation:read");
         if ("denied" in authorization) return authorization;
         const rows = await tx.execute({
-          sql: `SELECT runs.*, CASE WHEN runs.source = 'task_step'
-                    THEN (SELECT s.instructions FROM task_attempt_runs ar JOIN task_steps s ON s.id = ar.step_id AND s.task_id = ar.task_id WHERE ar.run_id = runs.id)
+          sql: `SELECT runs.*, CASE WHEN runs.source = 'task_step' AND runs.execution_ref LIKE 'tool:%'
+                    THEN ''
+                    WHEN runs.source = 'task_step'
+                    THEN (SELECT CASE WHEN s.kind = 'model' THEN s.instructions ELSE '' END FROM task_attempt_runs ar JOIN task_steps s ON s.id = ar.step_id AND s.task_id = ar.task_id WHERE ar.run_id = runs.id)
                     ELSE messages.text END AS input_text
                   FROM runs JOIN messages ON messages.id = runs.message_id WHERE runs.id = ?`,
           args: [runId],

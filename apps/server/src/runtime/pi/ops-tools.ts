@@ -77,6 +77,7 @@ export function createOpsTools(options: {
         Type.Literal("signal_wait"),
         Type.Literal("join"),
         Type.Literal("model"),
+        Type.Literal("tool"),
       ]),
       title: Type.String({ minLength: 1, maxLength: 256 }),
       dependencyIds,
@@ -88,6 +89,9 @@ export function createOpsTools(options: {
           maxLength: 128,
           pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:-]*$",
         }),
+      ),
+      targetTaskId: Type.Optional(
+        Type.String({ minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$" }),
       ),
     },
     { additionalProperties: false },
@@ -363,18 +367,19 @@ export function createOpsTools(options: {
       rootStepId: string;
       steps: Array<{
         id: string;
-        kind: "timer_wait" | "signal_wait" | "join" | "model";
+        kind: "timer_wait" | "signal_wait" | "join" | "model" | "tool";
         title: string;
         dependencyIds: string[];
         instructions?: string;
         durationMs?: number;
         signalKey?: string;
+        targetTaskId?: string;
       }>;
     }>({
       ...common,
       name: "task_plan",
       description:
-        "Plan bounded timer, signal-wait, join, and text-only model steps for an authorized Task. Approval, Tool, Worker, child Task, and shell steps are unavailable.",
+        "Plan bounded timer, signal-wait, join, text-only model, and read-only task_get Tool steps for an authorized Task. Approval, Worker, child Task, and shell steps are unavailable.",
       parameters: Type.Object(
         {
           taskId,
@@ -391,18 +396,28 @@ export function createOpsTools(options: {
             (step.kind === "timer_wait" &&
               (step.durationMs === undefined ||
                 step.signalKey !== undefined ||
-                step.instructions !== undefined)) ||
+                step.instructions !== undefined ||
+                step.targetTaskId !== undefined)) ||
             (step.kind === "signal_wait" &&
               (step.signalKey === undefined ||
                 step.durationMs !== undefined ||
-                step.instructions !== undefined)) ||
+                step.instructions !== undefined ||
+                step.targetTaskId !== undefined)) ||
             (step.kind === "join" &&
               (step.signalKey !== undefined ||
                 step.durationMs !== undefined ||
                 step.instructions !== undefined ||
+                step.targetTaskId !== undefined ||
                 step.dependencyIds.length === 0)) ||
             (step.kind === "model" &&
               (!step.instructions?.trim() ||
+                step.durationMs !== undefined ||
+                step.signalKey !== undefined ||
+                step.targetTaskId !== undefined)) ||
+            (step.kind === "tool" &&
+              (!step.targetTaskId ||
+                !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(step.targetTaskId) ||
+                step.instructions !== undefined ||
                 step.durationMs !== undefined ||
                 step.signalKey !== undefined))
           )
@@ -440,7 +455,9 @@ export function createOpsTools(options: {
             title: step.title,
             ...(step.kind === "model"
               ? { instructions: step.instructions, specRef: executionRef }
-              : {}),
+              : step.kind === "tool"
+                ? { specRef: `tool:task_get:${step.targetTaskId}` }
+                : {}),
             status: "pending" as const,
             dependencyIds: step.dependencyIds,
             dependencyPolicy: {

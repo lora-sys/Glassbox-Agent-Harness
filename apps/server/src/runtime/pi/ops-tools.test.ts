@@ -102,7 +102,16 @@ it("denies an ungranted Pi delegate before starting any worker", async () => {
     expect(planSchema.properties.steps.maxItems).toBe(64);
     expect(planSchema.properties.steps.items.additionalProperties).toBe(false);
     expect(Object.keys(planSchema.properties.steps.items.properties).sort()).toEqual(
-      ["dependencyIds", "durationMs", "id", "instructions", "kind", "signalKey", "title"].sort(),
+      [
+        "dependencyIds",
+        "durationMs",
+        "id",
+        "instructions",
+        "kind",
+        "signalKey",
+        "targetTaskId",
+        "title",
+      ].sort(),
     );
     await expect(
       plan.execute(
@@ -287,6 +296,32 @@ it("plans a text-only Model Step from the current Run profile and rejects extra 
       "model-step",
       expect.objectContaining({ runId: accepted.run.id }),
     );
+    await plan.execute(
+      "plan-tool",
+      {
+        taskId: "planned",
+        rootStepId: "read-step",
+        steps: [
+          {
+            id: "read-step",
+            kind: "tool",
+            title: "Read a Task",
+            dependencyIds: [],
+            targetTaskId: "target-read",
+          },
+        ],
+      },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    expect(planExistingTask).toHaveBeenLastCalledWith(
+      caller,
+      "planned",
+      [expect.objectContaining({ kind: "tool", specRef: "tool:task_get:target-read" })],
+      "read-step",
+      expect.objectContaining({ runId: accepted.run.id }),
+    );
     await expect(
       plan.execute(
         "plan-model-with-extra-field",
@@ -307,7 +342,7 @@ it("plans a text-only Model Step from the current Run profile and rejects extra 
     await expect(
       plan.execute("plan-with-non-model-run", input, undefined, undefined, {} as never),
     ).rejects.toThrow("protected_tool_failed");
-    expect(planExistingTask).toHaveBeenCalledTimes(1);
+    expect(planExistingTask).toHaveBeenCalledTimes(2);
   } finally {
     await store.close();
   }

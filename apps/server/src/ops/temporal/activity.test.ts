@@ -4,6 +4,8 @@ import type { TaskStep } from "@glassbox/contracts";
 import { openDomainStore } from "../../application/domain-store.js";
 import { conversationScopeKey, type CallerContext } from "../../identity/scope.js";
 import { AccessDeniedError } from "../../auth/service.js";
+import { RunService } from "../../execution/run-service/index.js";
+import { createTaskGetAdapter } from "../../execution/run-service/task-get-adapter.js";
 import { FakeHerdrBridge } from "../fake-herdr-bridge.js";
 import { LongWorkScheduler } from "../long-work-scheduler.js";
 import { AuthorizedOpsService } from "../service.js";
@@ -23,8 +25,9 @@ const caller: CallerContext = {
 
 async function createModelTask(
   store: Awaited<ReturnType<typeof openDomainStore>>,
-  specRef = "pi:test",
+  specRef: string | ((taskId: string) => string) = "pi:test",
   retryPolicy?: TaskStep["retryPolicy"],
+  kind: "model" | "tool" = "model",
 ) {
   await store.identities.bindOwner("owner", caller.scope);
   await store.conversations.createAgent("personal");
@@ -73,10 +76,10 @@ async function createModelTask(
   const step: TaskStep = {
     id: "model-step",
     taskId: task.id,
-    kind: "model",
+    kind,
     title: "Draft an answer",
-    instructions: "Write a short answer",
-    specRef,
+    ...(kind === "model" ? { instructions: "Write a short answer" } : {}),
+    specRef: typeof specRef === "function" ? specRef(task.id) : specRef,
     status: "pending",
     dependencyIds: [],
     dependencyPolicy: { failed: "block", cancelled: "cancel", skipped: "skip" },
@@ -626,6 +629,130 @@ it("creates a linked internal Run for a model Step and settles it into Step revi
       }),
     );
     expect(attemptStatus.rows[0]?.status).toBe("review");
+  } finally {
+    await store.close();
+  }
+});
+
+it("executes a closed task_get Tool Step through a durable Run and holds its result for review", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  let service: RunService | undefined;
+  try {
+    const { task, step } = await createModelTask(
+      store,
+      "tool:task_get:target-read",
+      undefined,
+      "tool",
+    );
+    await store.tasks.createTask({
+      id: "target-read",
+      title: "Protected target",
+      creatorPrincipalId: "owner",
+      authorizationScope: caller.scope,
+    });
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: "task-target-read",
+      action: "task:read",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    const advance = createAdvanceLongWorkActivity(store);
+    const input = { taskId: task.id, policyRevision: 1 };
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    const lease = await store.longWork.getActiveLease(task.id, step.id);
+    const run = await store.conversations.getInternalStepRun(caller, lease!.attemptId!);
+    expect(run).toMatchObject({
+      source: "task_step",
+      status: "queued",
+      executionRef: "tool:task_get:target-read",
+    });
+    service = new RunService({
+      store,
+      resolveExecution: () => createTaskGetAdapter(store),
+      transport: {
+        send: async () => {
+          throw new Error("Internal Tool result must not be delivered");
+        },
+      },
+    });
+    await service.start();
+    await service.enqueueInternalStepRun(caller, run!.id);
+    await vi.waitFor(async () => {
+      expect((await store.conversations.getRun(caller, run!.id)).status).toBe("succeeded");
+    });
+    const finished = await store.conversations.getRun(caller, run!.id);
+    expect(JSON.parse(finished.resultText!)).toMatchObject({ id: "target-read", status: "NEW" });
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    expect((await store.longWork.listSteps(task.id))[0]).toMatchObject({
+      status: "review",
+      outputRef: `run:${run!.id}`,
+    });
+    expect((await store.tasks.getTask(task.id))?.status).not.toBe("DONE");
+    await store.authorization.revokeScope({
+      principalId: "owner",
+      resourceId: "task-target-read",
+      scope: caller.scope,
+    });
+    await expect(
+      store.conversations.getInternalStepRun(caller, lease!.attemptId!),
+    ).rejects.toMatchObject({
+      decision: { reason: "no_grant" },
+    });
+  } finally {
+    await service?.stop({ wait: true });
+    await store.close();
+  }
+});
+
+it("denies a task_get Tool call when target read permission is revoked after Run creation", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  try {
+    const { task, step } = await createModelTask(
+      store,
+      "tool:task_get:target-read",
+      undefined,
+      "tool",
+    );
+    await store.tasks.createTask({
+      id: "target-read",
+      title: "Protected target",
+      creatorPrincipalId: "owner",
+      authorizationScope: caller.scope,
+    });
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: "task-target-read",
+      action: "task:read",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    const advance = createAdvanceLongWorkActivity(store);
+    const input = { taskId: task.id, policyRevision: 1 };
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    const lease = await store.longWork.getActiveLease(task.id, step.id);
+    const run = await store.conversations.getInternalStepRun(caller, lease!.attemptId!);
+    const executionInput = await store.conversations.loadRunInput(caller, run!.id);
+    const runLease = await store.lifecycle.claimQueuedRun(caller, run!.id);
+    await store.authorization.revokeScope({
+      principalId: "owner",
+      resourceId: "task-target-read",
+      scope: caller.scope,
+    });
+    await expect(
+      createTaskGetAdapter(store).execute({
+        ...executionInput,
+        executionMode: "task_step_tool",
+        caller,
+        signal: new AbortController().signal,
+      }),
+    ).rejects.toBeInstanceOf(AccessDeniedError);
+    await expect(store.conversations.getRun(caller, run!.id)).rejects.toMatchObject({
+      decision: { reason: "no_grant" },
+    });
+    await runLease.settle("failed");
+    expect(await advance(input)).toEqual({ kind: "continue" });
+    expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("blocked");
   } finally {
     await store.close();
   }
