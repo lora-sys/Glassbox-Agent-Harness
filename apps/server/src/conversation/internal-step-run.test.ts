@@ -311,6 +311,88 @@ describe("internal Task Step Runs", () => {
     });
   });
 
+  it("loads an accepted task_get result only while the target Task grant remains current", async () => {
+    const { db, conversations } = await fixture();
+    await db.transaction(async (tx) => {
+      await tx.execute(
+        "INSERT INTO resources(id,kind,visibility,owner_id) VALUES ('task-task-2','task','public','owner')",
+      );
+      await tx.execute({
+        sql: "INSERT INTO grants(id,principal_id,resource_id,action,scope_key,effect,created_at) VALUES ('grant-target','owner','task-task-2','task:read',?,'allow',?)",
+        args: [scopeKey(scope), time],
+      });
+      await tx.execute({
+        sql: "INSERT INTO tasks(id,title,status,priority,creator_principal_id,created_at,updated_at) VALUES ('task-2','Target','DONE','normal','owner',?,?)",
+        args: [time, time],
+      });
+      await tx.execute(
+        "UPDATE task_steps SET kind = 'tool', spec_ref = 'tool:task_get:task-2', instructions = NULL WHERE id = 'step-1'",
+      );
+    });
+    const sourceRun = await conversations.createInternalStepRun({
+      caller,
+      taskId: "task-1",
+      stepId: "step-1",
+      attemptId: "attempt-1",
+      executionRef: "tool:task_get:task-2",
+    });
+    const resultText = JSON.stringify({ id: "task-2", title: "Target", status: "DONE" });
+    await db.transaction(async (tx) => {
+      await tx.execute({
+        sql: "UPDATE runs SET status = 'succeeded', result_text = ? WHERE id = ?",
+        args: [resultText, sourceRun.id],
+      });
+      await tx.execute({
+        sql: "UPDATE task_steps SET status = 'succeeded', output_ref = ? WHERE id = 'step-1'",
+        args: [`run:${sourceRun.id}`],
+      });
+      await tx.execute({
+        sql: "INSERT INTO task_steps(id,task_id,kind,title,instructions,status,dependency_policy_json,max_attempts,required_capabilities_json,delegated_permissions_json,version,created_at,updated_at) VALUES ('step-2','task-1','model','Follow-up','Use the target result','running','{}',1,'[]','[]',1,?,?)",
+        args: [time, time],
+      });
+      await tx.execute(
+        "INSERT INTO task_step_dependencies(task_id,step_id,dependency_id) VALUES ('task-1','step-2','step-1')",
+      );
+      await tx.execute({
+        sql: "INSERT INTO task_attempts(id,task_id,attempt_number,status,started_at,step_id) VALUES ('attempt-2','task-1',2,'running',?,'step-2')",
+        args: [time],
+      });
+      await tx.execute({
+        sql: "INSERT INTO task_step_leases(id,task_id,step_id,attempt_id,owner_instance_id,state,version,acquired_at,heartbeat_at,expires_at) VALUES ('lease-2','task-1','step-2','attempt-2','worker-1','active',1,?,?,?)",
+        args: [time, time, leaseExpiry],
+      });
+    });
+    const followUp = await conversations.createInternalStepRun({
+      caller,
+      taskId: "task-1",
+      stepId: "step-2",
+      attemptId: "attempt-2",
+      executionRef: "pi:default",
+    });
+    const input = await conversations.loadRunInput(caller, followUp.id);
+    expect(input.stepResults).toEqual([
+      { stepId: "step-1", runId: sourceRun.id, text: resultText, truncated: false },
+    ]);
+    await db.transaction(async (tx) => {
+      const source = await tx.execute({
+        sql: "SELECT resource_id, action FROM authorization_decisions WHERE run_id = ? AND delivery_source = 'content_source'",
+        args: [followUp.id],
+      });
+      expect(source.rows).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ resource_id: "task-task-2", action: "task:read" }),
+        ]),
+      );
+      await tx.execute({
+        sql: "UPDATE grants SET revoked_at = ? WHERE id = 'grant-target'",
+        args: [time],
+      });
+    });
+    await expect(conversations.loadRunInput(caller, followUp.id)).rejects.toMatchObject({
+      decision: { reason: "no_grant" },
+    });
+  });
+
   it("requires the persisted Tool Step kind, exact spec, and active Attempt lease", async () => {
     const { db, conversations } = await fixture();
     const request = {

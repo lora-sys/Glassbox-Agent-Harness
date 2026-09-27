@@ -1031,7 +1031,7 @@ export class ConversationStore {
           };
           if (!run.executionRef.startsWith("tool:")) {
             const dependencies = await tx.execute({
-              sql: `SELECT s.id, s.kind, s.status, s.output_ref
+              sql: `SELECT s.id, s.kind, s.status, s.output_ref, s.spec_ref
                 FROM task_step_dependencies d
                 JOIN task_steps s ON s.id = d.dependency_id AND s.task_id = d.task_id
                 WHERE d.task_id = ? AND d.step_id = ? ORDER BY s.id`,
@@ -1041,7 +1041,7 @@ export class ConversationStore {
             for (const dependency of dependencies.rows) {
               const outputRef = optionalString(dependency, "output_ref");
               if (
-                dependency.kind !== "model" ||
+                !["model", "tool"].includes(stringColumn(dependency, "kind")) ||
                 dependency.status !== "succeeded" ||
                 !outputRef?.startsWith("run:")
               )
@@ -1055,6 +1055,22 @@ export class ConversationStore {
                 "conversation:read",
               );
               if ("denied" in sourceAuthorization) return sourceAuthorization;
+              if (dependency.kind === "tool") {
+                const spec = parseTaskGetSpec(optionalString(dependency, "spec_ref") ?? "");
+                if (!spec) throw new Error("Accepted Tool dependency spec is unavailable");
+                const targetDecision = await evaluate(tx, {
+                  caller,
+                  resourceId: `task-${spec.targetTaskId}`,
+                  action: "task:read",
+                  conversationId: run.conversationId,
+                  runId,
+                });
+                if (targetDecision.decision !== "ALLOW") return { denied: targetDecision };
+                await tx.execute({
+                  sql: "UPDATE authorization_decisions SET delivery_source = 'content_source' WHERE id = ?",
+                  args: [targetDecision.id],
+                });
+              }
               const contentDecision = await evaluate(tx, {
                 caller,
                 resourceId: `task-${taskStepBinding.taskId}`,
