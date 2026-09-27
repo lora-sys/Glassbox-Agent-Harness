@@ -39,8 +39,10 @@ it("uses the configured product database for Pi worker authorization", async () 
     const operations = await loadAgentOperations(data, databasePath);
     expect(operations?.workerPolicy?.databasePath).toBe(databasePath);
     expect(operations?.protectedValues).toEqual(
-      expect.arrayContaining(["test", "worker", worker, kit, agent, "fixture", "local"]),
+      expect.arrayContaining(["test", "worker", worker, kit, agent]),
     );
+    expect(operations?.protectedValues).not.toContain("fixture");
+    expect(operations?.protectedValues).not.toContain("local");
     await expect(loadAgentOperations(data, ":memory:")).rejects.toThrow(
       "persistent absolute database path",
     );

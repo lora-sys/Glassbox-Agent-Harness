@@ -605,6 +605,12 @@ describe("configured group Run capability authority", () => {
           lastActiveAt: new Date(0).toISOString(),
         };
       },
+      getModelCapacity: () => ({
+        contextWindowTokens: 32_768,
+        outputReserveTokens: 4_096,
+        thinkingReserveTokens: 0,
+        safetyMarginTokens: 512,
+      }),
       run: async (_binding, _run, _prompt, context) => {
         seen.push(context?.requiredToolName);
         return { status: "completed", text: "ok", toolCalls: [] };

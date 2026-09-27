@@ -1,7 +1,12 @@
 import type { HerdrAgentLifecycleState } from "@glassbox/contracts";
 
 export interface HerdrEvent {
-  type: "agent.state" | "agent.output" | "workspace.updated" | "session.disconnected";
+  type:
+    | "agent.state"
+    | "agent.output"
+    | "workspace.updated"
+    | "session.disconnected"
+    | "events.lost";
   sessionId: string;
   workspaceId: string;
   paneId: string;

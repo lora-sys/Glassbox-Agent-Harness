@@ -5,7 +5,7 @@ import { createClient } from "@libsql/client";
 import { expect, it } from "vite-plus/test";
 import { DomainDatabase, localDatabaseUrl } from "./database.js";
 
-it("migrates v9 deliveries without losing old rows and accepts browser Artifacts", async () => {
+it("migrates v9 deliveries without losing old rows and accepts browser and media Assets", async () => {
   const directory = await mkdtemp(join(tmpdir(), "glassbox-delivery-v9-"));
   try {
     const path = join(directory, "glassbox.db");
@@ -24,7 +24,7 @@ it("migrates v9 deliveries without losing old rows and accepts browser Artifacts
     const db = await DomainDatabase.open(path);
     try {
       await db.transaction(async (tx) => {
-        expect((await tx.execute("PRAGMA user_version")).rows[0]?.user_version).toBe(10);
+        expect((await tx.execute("PRAGMA user_version")).rows[0]?.user_version).toBe(11);
         expect(
           (await tx.execute("SELECT payload_text, status FROM deliveries WHERE id = 'delivery-1'"))
             .rows[0],
@@ -34,6 +34,9 @@ it("migrates v9 deliveries without losing old rows and accepts browser Artifacts
         });
         await tx.execute(
           "INSERT INTO deliveries VALUES ('delivery-2','run-1','artifact','scope','ca181a0c-6f10-44ba-bd1f-5fba48024a48','browser_artifact','pending',NULL,'2026-09-24','2026-09-24')",
+        );
+        await tx.execute(
+          "INSERT INTO deliveries VALUES ('delivery-3','run-1','media','scope','ca181a0c-6f10-44ba-bd1f-5fba48024a49','media_artifact','pending',NULL,'2026-09-24','2026-09-24')",
         );
       });
     } finally {

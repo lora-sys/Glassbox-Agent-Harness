@@ -461,6 +461,15 @@ export class RunService {
             payloadText: artifactId,
             payloadKind: "browser_artifact",
           });
+      if (prepared.allowed)
+        for (const assetId of prepared.mediaAssetIds ?? [])
+          await this.options.store.lifecycle.createDelivery(caller, {
+            runId: run.id,
+            dedupKey: `media-asset-${assetId}`,
+            destination: caller.scope,
+            payloadText: assetId,
+            payloadKind: "media_artifact",
+          });
     } catch (error) {
       // A delivery authorization refusal is a blocked outcome, not a transport failure: the
       // answer never left the process, so no send is attempted and nothing is retried. Trace

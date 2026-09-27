@@ -131,3 +131,50 @@ it("delivers a same-Run screenshot reference and PNG to the original private QQ 
     data: { file: `base64://${pngBase64}` },
   });
 });
+
+it("delivers a same-Run private media Asset as an image after the text result", async () => {
+  let complete!: (value: { status: "succeeded"; text: string }) => void;
+  const result = new Promise<{ status: "succeeded"; text: string }>((resolve) => {
+    complete = resolve;
+  });
+  const f = await fixture(async () => result);
+  f.send(774, "生成一张图", true);
+  const started = await f.started.take();
+  const mediaAssets = (
+    f.app as unknown as { mediaAssets: import("../media/media-asset-store.js").MediaAssetStore }
+  ).mediaAssets;
+  const png = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADUlEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+    "base64",
+  );
+  const asset = await mediaAssets.write(
+    {
+      runId: started.run.id,
+      conversationId: started.conversation.id,
+      principalId: started.caller.principalId,
+    },
+    "image/png",
+    png,
+    1024,
+  );
+  complete({ status: "succeeded", text: `图片已完成。[asset:${asset.id}]` });
+  await f.app.runs.waitForRun(started.caller, started.run.id);
+  await f.app.runs.drain();
+
+  const deliveries = (await f.app.store.lifecycle.listDeliveries(started.caller, started.run.id))
+    .items;
+  expect(deliveries.map((delivery) => [delivery.payloadKind, delivery.status])).toEqual([
+    ["result", "sent"],
+    ["media_artifact", "sent"],
+  ]);
+  const sends = f.actionLog.filter((action) => action.action === "send_private_msg");
+  expect(sends).toHaveLength(2);
+  expect(sends[0]?.params.message).toContainEqual({
+    type: "text",
+    data: { text: "图片已完成。" },
+  });
+  expect(sends[1]?.params.message).toContainEqual({
+    type: "image",
+    data: { file: `base64://${png.toString("base64")}` },
+  });
+});

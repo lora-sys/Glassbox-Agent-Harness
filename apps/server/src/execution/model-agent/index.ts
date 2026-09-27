@@ -19,6 +19,19 @@ export interface AuthorizedModelTool {
 }
 
 export type ModelAgentEvent =
+  | { type: "model_identity"; provider: string; model: string }
+  | { type: "model_capacity"; state: "unknown"; reasonCode: "capacity_unknown" }
+  | {
+      type: "context_budget";
+      policyVersion: string;
+      capacityTokens: number;
+      outputReserveTokens: number;
+      thinkingReserveTokens: number;
+      inputBudgetTokens: number;
+      estimatedTokens: number;
+      omittedExchanges: number;
+      overflow: string | null;
+    }
   | { type: "started" }
   | { type: "turn_started"; turn: number }
   | { type: "text_delta"; text: string }

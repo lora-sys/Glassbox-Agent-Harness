@@ -24,6 +24,45 @@ const profile = {
 };
 
 describe("model configuration", () => {
+  it("persists explicit routing and capacity declarations without treating absent values as known", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "glassbox-model-route-"));
+    try {
+      const store = await ModelProfileStore.open(directory);
+      await store.save({
+        ...profile,
+        contextWindowTokens: 65536,
+        maxOutputTokens: 8192,
+        routingEnabled: true,
+        allowRouting: true,
+        routingAvailable: false,
+        routePriority: 2,
+        capabilityRank: 3,
+        supportsTools: true,
+        supportsThinking: false,
+      });
+      const reopened = await ModelProfileStore.open(directory);
+      expect(reopened.list()[0]).toMatchObject({
+        contextWindowTokens: 65536,
+        maxOutputTokens: 8192,
+        routingEnabled: true,
+        allowRouting: true,
+        routingAvailable: false,
+        capabilityRank: 3,
+      });
+      await reopened.save({ ...profile, label: "Renamed" });
+      expect(reopened.list()[0]).toMatchObject({
+        label: "Renamed",
+        contextWindowTokens: 65536,
+        routingEnabled: true,
+      });
+      expect(() =>
+        reopened.save({ ...profile, contextWindowTokens: 4096, maxOutputTokens: 4096 }),
+      ).toThrow("Output reserve");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("keeps keys out of public profiles and survives a reopen", async () => {
     const { directory, store } = await fixture();
     await store.save({ ...profile, apiKey: "test-secret-123" });

@@ -142,6 +142,7 @@ interface PendingRequest {
 
 const QQ_DIRECT_TEXT_LIMIT = 3_500;
 const QQ_PNG_MAX_BYTES = 8 * 1024 * 1024;
+const QQ_MP4_MAX_BYTES = 16 * 1024 * 1024;
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
 function isBoundedPngBase64(value: unknown): value is string {
@@ -161,6 +162,57 @@ function isBoundedPngBase64(value: unknown): value is string {
     bytes.readUInt32BE(8) === 13 &&
     bytes.toString("ascii", 12, 16) === "IHDR" &&
     bytes.toString("base64") === value
+  );
+}
+
+function isBoundedImageBase64(value: unknown, mimeType: unknown): value is string {
+  if (mimeType === "image/png") return isBoundedPngBase64(value);
+  if (
+    typeof value !== "string" ||
+    (mimeType !== "image/jpeg" && mimeType !== "image/webp") ||
+    value.length < 8 ||
+    value.length > Math.ceil(QQ_PNG_MAX_BYTES / 3) * 4 ||
+    value.length % 4 !== 0 ||
+    !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(value)
+  )
+    return false;
+  const bytes = Buffer.from(value, "base64");
+  if (bytes.length > QQ_PNG_MAX_BYTES || bytes.toString("base64") !== value) return false;
+  if (mimeType === "image/jpeg")
+    return (
+      bytes.length >= 4 &&
+      bytes[0] === 0xff &&
+      bytes[1] === 0xd8 &&
+      bytes.at(-2) === 0xff &&
+      bytes.at(-1) === 0xd9
+    );
+  return (
+    bytes.length >= 12 &&
+    bytes.toString("ascii", 0, 4) === "RIFF" &&
+    bytes.toString("ascii", 8, 12) === "WEBP"
+  );
+}
+
+function isBoundedMp4Base64(value: unknown): value is string {
+  if (
+    typeof value !== "string" ||
+    value.length < 24 ||
+    value.length > Math.ceil(QQ_MP4_MAX_BYTES / 3) * 4 ||
+    value.length % 4 !== 0 ||
+    !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)
+  )
+    return false;
+  const bytes = Buffer.from(value, "base64");
+  if (bytes.length < 16 || bytes.length > QQ_MP4_MAX_BYTES || bytes.toString("base64") !== value)
+    return false;
+
+  // Accept only a conventional ISO BMFF file whose first box is a bounded `ftyp` box.
+  // This deliberately rejects arbitrary base64 payloads, URLs and filesystem paths.
+  const fileTypeBoxSize = bytes.readUInt32BE(0);
+  return (
+    bytes.toString("ascii", 4, 8) === "ftyp" &&
+    fileTypeBoxSize >= 16 &&
+    fileTypeBoxSize <= bytes.length
   );
 }
 const QQ_FORWARD_NODE_LIMIT = 1_800;
@@ -480,7 +532,10 @@ export class OneBotAdapter {
     target: TrustedChannelScope;
     text: string;
     replyTo?: string;
-    image?: { pngBase64: string };
+    image?:
+      | { pngBase64: string }
+      | { base64: string; mimeType: "image/png" | "image/jpeg" | "image/webp" };
+    video?: { mp4Base64: string };
   }): Promise<OneBotDeliveryResult> {
     const target = input.target;
     if (!target) return { status: "failed", code: "invalid_target" };
@@ -508,7 +563,13 @@ export class OneBotAdapter {
       input.text.length > 64_000 ||
       (input.replyTo !== undefined && replyTo === undefined) ||
       (input.image !== undefined &&
-        (!isBoundedPngBase64(input.image.pngBase64) ||
+        (!("pngBase64" in input.image
+          ? isBoundedPngBase64(input.image.pngBase64)
+          : isBoundedImageBase64(input.image.base64, input.image.mimeType)) ||
+          Array.from(input.text).length > QQ_DIRECT_TEXT_LIMIT)) ||
+      (input.video !== undefined &&
+        (!isBoundedMp4Base64(input.video.mp4Base64) ||
+          input.image !== undefined ||
           Array.from(input.text).length > QQ_DIRECT_TEXT_LIMIT))
     )
       return { status: "failed", code: "invalid_message" };
@@ -555,7 +616,17 @@ export class OneBotAdapter {
       { type: "text", data: { text: input.text } },
       ...(input.image === undefined
         ? []
-        : [{ type: "image", data: { file: `base64://${input.image.pngBase64}` } }]),
+        : [
+            {
+              type: "image",
+              data: {
+                file: `base64://${"pngBase64" in input.image ? input.image.pngBase64 : input.image.base64}`,
+              },
+            },
+          ]),
+      ...(input.video === undefined
+        ? []
+        : [{ type: "video", data: { file: `base64://${input.video.mp4Base64}` } }]),
     ];
     const result = await this.#request(
       socket,

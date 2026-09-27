@@ -3,6 +3,7 @@ import { AccessDeniedError } from "../auth/service.js";
 import { scopeKey, type CallerContext } from "../identity/scope.js";
 import type { DomainStore } from "../persistence/index.js";
 import type { HerdrBridge } from "./herdr-bridge.js";
+import { buildOpsHealthSnapshot, type OpsHealthInput, type OpsHealthSnapshot } from "./health.js";
 import { mkdir, writeFile, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 
@@ -102,6 +103,27 @@ export class AuthorizedOpsService {
   async status(caller: CallerContext, evidence?: RunEvidence): Promise<AgentOpsSnapshot> {
     await this.authorize(caller, OPS_RESOURCE, "ops:status");
     return this.store.tasks.getOpsSnapshot(caller, evidence);
+  }
+
+  async health(
+    caller: CallerContext,
+    observation: Pick<OpsHealthInput, "herdr" | "now" | "windowStart" | "staleAfterMs">,
+    evidence?: RunEvidence,
+  ): Promise<OpsHealthSnapshot> {
+    await this.authorize(caller, OPS_RESOURCE, "ops:status");
+    const records = await this.store.tasks.getOpsHealthRecords(caller, evidence);
+    const observations = observation.herdr.observations.length
+      ? observation.herdr.observations
+      : records.bindings.map((binding) => ({
+          taskAttemptId: binding.taskAttemptId,
+          state: binding.lastObservedAgentState,
+          observedAt: binding.updatedAt,
+        }));
+    return buildOpsHealthSnapshot({
+      ...records,
+      ...observation,
+      herdr: { ...observation.herdr, observations },
+    });
   }
 
   async list(caller: CallerContext, evidence?: RunEvidence): Promise<AgentTask[]> {

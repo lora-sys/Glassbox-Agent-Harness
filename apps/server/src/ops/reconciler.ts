@@ -9,6 +9,8 @@ export class OpsReconciler {
   private eventTail: Promise<void> = Promise.resolve();
   private reconnectTimer?: ReturnType<typeof setTimeout>;
   private reconnectTask?: Promise<void>;
+  private eventsLost = false;
+  private lastSuccessfulReconciliationAt: string | null = null;
 
   constructor(
     private readonly store: TaskStore,
@@ -18,6 +20,19 @@ export class OpsReconciler {
 
   getSubscriptionId(): string | null {
     return this.subscriptionId;
+  }
+
+  healthObservation() {
+    return {
+      bridgeState:
+        this.stopped || !this.bridge.isConnected()
+          ? ("disconnected" as const)
+          : this.bootstrapping || !this.subscriptionId
+            ? ("reconnecting" as const)
+            : ("connected" as const),
+      eventsLost: this.eventsLost,
+      lastSuccessfulReconciliationAt: this.lastSuccessfulReconciliationAt,
+    };
   }
 
   async start(): Promise<void> {
@@ -112,10 +127,20 @@ export class OpsReconciler {
     // A complete snapshot closes a previous session-level monitoring gap. Keep
     // task-scoped dispatch failures until their Task is handled explicitly.
     await this.store.resolveGlobalAttentionByKind("ops_connection_problem");
+    this.lastSuccessfulReconciliationAt = snapshot.timestamp;
+    this.eventsLost = false;
   }
 
   async handleEvent(event: HerdrEvent): Promise<void> {
+    if (event.type === "events.lost") {
+      this.eventsLost = true;
+      for (const binding of await this.store.activeWorkerBindings(event.sessionId))
+        await this.store.observeWorker(binding, "unknown");
+      await this.reconcileSnapshot(await this.bridge.getSnapshot());
+      return;
+    }
     if (event.type === "session.disconnected") {
+      this.eventsLost = true;
       const subscriptionId = this.subscriptionId;
       this.subscriptionId = null;
       if (subscriptionId) await this.bridge.unsubscribe(subscriptionId);

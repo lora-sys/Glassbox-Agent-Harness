@@ -34,6 +34,7 @@ describe("local service integration", () => {
       port: 0,
       quiet: true,
       databasePath: ":memory:",
+      piAgentDirectory: null,
     });
     baseUrl = service.baseUrl;
     token = (await readFile(service.credentialFile, "utf8")).trim();
@@ -75,6 +76,7 @@ describe("local service integration", () => {
     await expect(
       openManagementRuntime({
         dataDirectory: directory,
+        piAgentDirectory: null,
         hosts: ["localhost:9999"],
         origins: [],
         status: () => ({}),
@@ -177,6 +179,7 @@ describe("local service integration", () => {
       port: 0,
       quiet: true,
       databasePath: ":memory:",
+      piAgentDirectory: null,
     });
     baseUrl = service.baseUrl;
     expect((await fetch(`${baseUrl}/manage/models`, { headers: headers() })).status).toBe(200);
@@ -191,6 +194,7 @@ it("validates port and directory before opening runtime state", async () => {
   await expect(
     openManagementRuntime({
       dataDirectory: "relative",
+      piAgentDirectory: null,
       hosts: [],
       origins: [],
       status: () => ({}),

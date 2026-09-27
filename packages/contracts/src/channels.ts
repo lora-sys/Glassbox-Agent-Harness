@@ -28,6 +28,8 @@ export interface ChannelSaveInput {
 }
 
 export interface PublicChannelProfile extends Omit<ChannelSaveInput, "token"> {
+  /** Owner selected model profile used by later Runs on this Channel. */
+  modelOverrideProfileId?: string;
   tokenConfigured: boolean;
   /** A persisted instruction to reconnect when the server starts. */
   autoConnect: boolean;

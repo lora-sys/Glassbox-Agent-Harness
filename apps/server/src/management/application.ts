@@ -3,9 +3,11 @@ import { randomUUID } from "node:crypto";
 import { chmod, mkdtemp, rm } from "node:fs/promises";
 import type { IncomingMessage } from "node:http";
 import { tmpdir } from "node:os";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
   CHANNEL_SAFE_ERRORS,
   type PublicChannelProfile,
+  type PublicModelProfile,
   type QqSourceClass,
 } from "@glassbox/contracts";
 import { ChannelProfileStore } from "../config/channel-profiles.js";
@@ -20,12 +22,26 @@ import {
 } from "../channels/onebot/index.js";
 import {
   RunService,
+  type ExecutionInput,
   type RunExecutionAdapter,
   type RunServiceEvent,
 } from "../execution/run-service/index.js";
 import { configuredModelAdapter } from "../execution/model-adapter.js";
+import { estimateUnicodeTokens } from "../efficiency/index.js";
+import {
+  selectRoute,
+  toRoutingEvidence,
+  type ModelCapacity as RouteModelCapacity,
+} from "../routing/index.js";
+import {
+  aggregateRuntimeUsage,
+  normalizePiTurnEndUsage,
+  type NormalizedPiTurnUsage,
+} from "../routing/runtime-telemetry.js";
 import {
   KitLoader,
+  MUTATION_REQUESTS,
+  PiModelCatalog,
   piProfileName,
   PiRunExecutionAdapter,
   PiSdkRuntimeAdapter,
@@ -48,6 +64,10 @@ import { BrowserSessionRegistry, type BrowserSessionBinding } from "../web/brows
 import type { BrowserExecutorPort } from "../web/browser-executor-port.js";
 import { createKitBrowserExecutor } from "../web/kit-browser-executor.js";
 import { BrowserArtifactStore } from "../web/browser-artifact-store.js";
+import { MediaAssetStore } from "../media/media-asset-store.js";
+import { AgnesMediaProvider } from "../media/agnes-media-provider.js";
+import { MediaProviderRegistry } from "../media/provider-registry.js";
+import type { MediaGenerationProvider } from "../media/provider.js";
 import { dohResolveWebHost } from "../web/network-guard.js";
 import {
   isWebCapabilityEnabled,
@@ -60,6 +80,7 @@ import {
   OWNER_CONTROL_RESOURCE,
   OWNER_GROUP_ADMIN_TOOL,
 } from "../runtime/pi/owner-tools.js";
+import { createOwnerModelTools, OWNER_MODEL_ADMIN_TOOL } from "../runtime/pi/owner-model-tools.js";
 import {
   createSkillTools,
   SKILL_CATALOG_RESOURCE,
@@ -77,6 +98,12 @@ import {
   MEMORY_WRITE_ACTION,
   OWNER_MEMORY_RESOURCE,
 } from "../learning/store.js";
+import {
+  createMediaGenerationTools,
+  MEDIA_GENERATION_RESOURCE,
+  MEDIA_GENERATION_TOOL,
+  MEDIA_GENERATE_ACTION,
+} from "../runtime/pi/media-tools.js";
 import {
   availableHistoryToolNames,
   createHistoryTools,
@@ -304,6 +331,8 @@ export class ManagementApplication {
   private sandboxRuntime: Awaited<ReturnType<typeof loadKitSandbox>> = null;
   private kitBrowserExecutor?: BrowserExecutorPort;
   private browserArtifacts?: BrowserArtifactStore;
+  private mediaAssets?: MediaAssetStore;
+  private readonly mediaProvider: MediaGenerationProvider;
   private readonly sandboxRuns = new Map<
     string,
     {
@@ -337,6 +366,7 @@ export class ManagementApplication {
       dataDirectory: string;
       kitPath?: string;
       models: ModelProfileStore;
+      mediaProvider?: MediaGenerationProvider;
       browserExecutor?: BrowserExecutorPort;
       executors?: ReadonlyMap<string, RunExecutionAdapter>;
       ops?: {
@@ -353,6 +383,13 @@ export class ManagementApplication {
     this.store = store;
     this.channels = channels;
     this.groupRuntime = groupRuntime;
+    const agnes = new AgnesMediaProvider({ apiKey: process.env.AGNES_API_KEY });
+    this.mediaProvider =
+      options.mediaProvider ??
+      new MediaProviderRegistry([agnes], {
+        imageProviderId: process.env.GLASSBOX_IMAGE_PROVIDER ?? agnes.id,
+        videoProviderId: process.env.GLASSBOX_VIDEO_PROVIDER ?? agnes.id,
+      });
     this.archive = new ChannelArchiveStore(store.db);
     this.kitLoader = new KitLoader(options.kitPath);
     this.workspaceWrites = new WorkspaceWriteOccupancy(options.dataDirectory);
@@ -363,7 +400,7 @@ export class ManagementApplication {
           kitPath: process.env.LORA_PI_KIT_PATH,
           cwd: process.cwd(),
           modelValues: [
-            ...options.models.list().flatMap((profile) => [profile.id, profile.baseUrl]),
+            ...options.models.list().map((profile) => profile.baseUrl),
             ...(options.ops
               ? [
                   ...(options.ops.protectedValues ?? []),
@@ -376,7 +413,11 @@ export class ManagementApplication {
           ],
         }),
       ],
-      protectedValues: () => [...options.models.protectedValues(), ...channels.protectedValues()],
+      protectedValues: () => [
+        ...options.models.protectedValues(),
+        ...channels.protectedValues(),
+        ...(process.env.AGNES_API_KEY ? [process.env.AGNES_API_KEY] : []),
+      ],
     });
     this.trace = new RunTraceStore({
       dataDirectory: options.dataDirectory,
@@ -421,6 +462,53 @@ export class ManagementApplication {
               return { status: "failed" };
             }
           }
+          if (delivery.payloadKind === "media_artifact") {
+            try {
+              if (!this.mediaAssets) return { status: "failed" };
+              const binding = await this.mediaAssets.binding(delivery.payloadText);
+              if (binding.runId !== delivery.runId) return { status: "failed" };
+              const caller = await this.store.lifecycle.traceCaller(
+                binding.runId,
+                binding.principalId,
+              );
+              const run = await this.runs.getRun(caller, delivery.runId);
+              if (run.conversationId !== binding.conversationId) return { status: "failed" };
+              if (scopeKey(caller.scope) !== scopeKey(destination)) return { status: "failed" };
+              const artifact = await this.mediaAssets.read(delivery.payloadText, binding);
+              if (signal.aborted) return { status: "failed" };
+              const sent =
+                artifact.mimeType === "video/mp4"
+                  ? await connection.send({
+                      deliveryId: delivery.id,
+                      target: destination,
+                      text: "视频已生成",
+                      video: { mp4Base64: artifact.data.toString("base64") },
+                    })
+                  : artifact.mimeType === "image/png"
+                    ? await connection.send({
+                        deliveryId: delivery.id,
+                        target: destination,
+                        text: "图片已生成",
+                        image: { pngBase64: artifact.data.toString("base64") },
+                      })
+                    : artifact.mimeType === "image/jpeg" || artifact.mimeType === "image/webp"
+                      ? await connection.send({
+                          deliveryId: delivery.id,
+                          target: destination,
+                          text: "图片已生成",
+                          image: {
+                            base64: artifact.data.toString("base64"),
+                            mimeType: artifact.mimeType,
+                          },
+                        })
+                      : { status: "failed" as const };
+              return sent.status === "confirmed"
+                ? { status: "sent", externalId: sent.messageId }
+                : { status: sent.status };
+            } catch {
+              return { status: "failed" };
+            }
+          }
           const result = await connection.send({
             deliveryId: delivery.id,
             target: destination,
@@ -439,23 +527,40 @@ export class ManagementApplication {
           ),
         ];
         const allowed: string[] = [];
+        const allowedMediaAssets: string[] = [];
         for (const id of ids.slice(0, 3)) {
           try {
-            if (!this.browserArtifacts) break;
-            const binding = await this.browserArtifacts.binding(id);
+            if (this.browserArtifacts) {
+              const binding = await this.browserArtifacts.binding(id);
+              if (
+                binding.runId === run.id &&
+                binding.conversationId === run.conversationId &&
+                binding.principalId === caller.principalId
+              ) {
+                const artifact = await this.readBrowserArtifact({ id, binding, caller });
+                if (artifact.sizeBytes <= 2 * 1024 * 1024) allowed.push(id);
+                continue;
+              }
+            }
+          } catch {
+            // Check the media store below before leaving an unverified UUID blocked.
+          }
+          try {
+            if (!this.mediaAssets) continue;
+            const binding = await this.mediaAssets.binding(id);
             if (
               binding.runId !== run.id ||
               binding.conversationId !== run.conversationId ||
               binding.principalId !== caller.principalId
             )
               continue;
-            const artifact = await this.readBrowserArtifact({ id, binding, caller });
-            if (artifact.sizeBytes <= 2 * 1024 * 1024) allowed.push(id);
+            const artifact = await this.mediaAssets.read(id, binding);
+            if (artifact.sizeBytes <= 128 * 1024 * 1024) allowedMediaAssets.push(id);
           } catch {
             // An unverified UUID stays blocked by the delivery content policy.
           }
         }
-        return this.deliveryPolicy.prepare(candidate, allowed);
+        return this.deliveryPolicy.prepare(candidate, allowed, allowedMediaAssets);
       },
     });
   }
@@ -464,7 +569,9 @@ export class ManagementApplication {
     dataDirectory: string;
     databasePath?: string;
     kitPath?: string;
+    piAgentDirectory?: string | null;
     models: ModelProfileStore;
+    mediaProvider?: MediaGenerationProvider;
     browserExecutor?: BrowserExecutorPort;
     executors?: ReadonlyMap<string, RunExecutionAdapter>;
     ops?: {
@@ -481,10 +588,15 @@ export class ManagementApplication {
     });
     const application = new ManagementApplication(options, store, channels, groupRuntime);
     try {
+      const piAgentDirectory =
+        options.piAgentDirectory === undefined ? getAgentDir() : options.piAgentDirectory;
+      if (piAgentDirectory)
+        application.piModelCatalog = await PiModelCatalog.open(piAgentDirectory);
       application.workspaces = await WorkspaceRegistry.open({
         dataRoot: options.dataDirectory,
         forbiddenRoots: [application.kitLoader.getKitPath()],
       });
+      application.mediaAssets = await MediaAssetStore.open(options.dataDirectory);
       try {
         application.sandboxRuntime = await loadKitSandbox(application.kitLoader.getKitPath());
         if (application.sandboxRuntime) {
@@ -557,7 +669,29 @@ export class ManagementApplication {
   }
 
   private readonly piAdapters = new Map<string, PiRunExecutionAdapter>();
+  private readonly runtimeUsageByRun = new Map<string, NormalizedPiTurnUsage>();
+  private readonly runtimeModelsByRun = new Map<
+    string,
+    Map<string, { provider: string; model: string }>
+  >();
+  private readonly runtimeHealthByProfile = new Map<
+    string,
+    {
+      state: "healthy" | "unavailable";
+      checkedAt: number;
+      latencyMs: number;
+      reasonCode: string | null;
+    }
+  >();
+  private piModelCatalog?: PiModelCatalog;
   private opsReconciler?: OpsReconciler;
+
+  private selectableModelProfiles(includePi = true): PublicModelProfile[] {
+    return [
+      ...this.options.models.list(),
+      ...(includePi ? (this.piModelCatalog?.list() ?? []) : []),
+    ];
+  }
 
   sandboxStatus(): {
     ready: boolean;
@@ -783,7 +917,7 @@ export class ManagementApplication {
     const runtime = new PiSdkRuntimeAdapter({
       kitPath: this.kitLoader.getKitPath(),
       runtimeBaseDir: join(this.options.dataDirectory, "pi"),
-      resolveModel: () => configuredPiModel(this.options.models, profileId),
+      resolveModel: () => configuredPiModel(this.options.models, profileId, this.piModelCatalog),
       createTools: (getContext) => this.createRuntimeTools(getContext),
       openSandboxForBrowser: Boolean(this.kitBrowserExecutor && !this.options.browserExecutor),
       onRunEnd: async (context) => {
@@ -955,10 +1089,52 @@ export class ManagementApplication {
         const caller = await this.store.lifecycle.traceCaller(runId, event.principalId);
         const cursor = await this.trace.append(runId, event, "pi");
         await this.store.evidence.advanceTrace(caller, cursor);
+        if (event.type === "turn_end") {
+          if (typeof event.data.provider === "string" && typeof event.data.model === "string") {
+            const models = this.runtimeModelsByRun.get(runId) ?? new Map();
+            const model = { provider: event.data.provider, model: event.data.model };
+            models.set(`${model.provider}\u0000${model.model}`, model);
+            this.runtimeModelsByRun.set(runId, models);
+          }
+          const source = event.data.usage;
+          const usage =
+            source && typeof source === "object" && !Array.isArray(source)
+              ? (source as Record<string, unknown>)
+              : {};
+          const normalized = normalizePiTurnEndUsage({
+            usage: {
+              input: typeof usage.inputTokens === "number" ? usage.inputTokens : undefined,
+              output: typeof usage.outputTokens === "number" ? usage.outputTokens : undefined,
+              cacheRead:
+                typeof usage.cacheReadTokens === "number" ? usage.cacheReadTokens : undefined,
+              cacheWrite:
+                typeof usage.cacheWriteTokens === "number" ? usage.cacheWriteTokens : undefined,
+              reasoning:
+                typeof usage.reasoningTokens === "number" ? usage.reasoningTokens : undefined,
+              totalTokens: typeof usage.totalTokens === "number" ? usage.totalTokens : undefined,
+            },
+          });
+          this.runtimeUsageByRun.set(
+            runId,
+            aggregateRuntimeUsage(this.runtimeUsageByRun.get(runId), normalized),
+          );
+          const usageCursor = await this.trace.append(
+            runId,
+            {
+              type: "runtime_usage",
+              runId,
+              schema: "glassbox.runtime-usage.v1",
+              usage: normalized,
+            },
+            "glassbox-runtime-telemetry",
+          );
+          await this.store.evidence.advanceTrace(caller, usageCursor);
+        }
       },
     });
     const adapter = new PiRunExecutionAdapter(runtime, {
       isOwner: (input) => this.store.identities.isOwner(input.caller.principalId),
+      listModelProfiles: () => this.selectableModelProfiles(),
       resolveProfileName: async (input) =>
         piProfileName(
           input.caller.scope.chatType,
@@ -967,6 +1143,11 @@ export class ManagementApplication {
       onEvidence: async (record) => {
         const caller = await this.store.lifecycle.traceCaller(record.runId, record.principalId);
         const cursor = await this.trace.append(record.runId, record, "glassbox-tool-evidence");
+        await this.store.evidence.advanceTrace(caller, cursor);
+      },
+      onBudgetEvidence: async (record) => {
+        const caller = await this.store.lifecycle.traceCaller(record.runId, record.principalId);
+        const cursor = await this.trace.append(record.runId, record, "glassbox-context-budget");
         await this.store.evidence.advanceTrace(caller, cursor);
       },
     });
@@ -1109,6 +1290,64 @@ export class ManagementApplication {
         store: this.store,
         getContext,
         manageGroup: (context, input) => this.manageGroup(context, input),
+      }),
+      ...createMediaGenerationTools({
+        store: this.store,
+        getContext,
+        assets: this.mediaAssets!,
+        provider: this.mediaProvider,
+        recordEvidence: async (evidence, context) => {
+          const cursor = await this.trace.append(context.runId, evidence, "glassbox-media");
+          await this.store.evidence.advanceTrace(context.caller, cursor);
+        },
+      }),
+      ...createOwnerModelTools({
+        store: this.store,
+        getContext,
+        listModels: () => this.selectableModelProfiles(),
+        currentModel: (context) => {
+          const channel = this.channels.resolve(context.caller.scope.connectionId);
+          return (
+            channel.modelOverrideProfileId ??
+            /^(?:pi|model):([A-Za-z0-9][A-Za-z0-9_-]{0,79})$/u.exec(channel.executionRef)?.[1]
+          );
+        },
+        selectModel: async (context, profileId) => {
+          const channel = this.channels.resolve(context.caller.scope.connectionId);
+          if (!/^(?:pi|model):/u.test(channel.executionRef))
+            throw new ManagementError(
+              "INVALID_CONFIGURATION",
+              "This Channel has no model route",
+              409,
+            );
+          await this.channels.setModelOverride(context.caller.scope.connectionId, profileId);
+        },
+        recordSelection: async (context, profileId) => {
+          const profile =
+            profileId === null
+              ? undefined
+              : this.selectableModelProfiles().find((entry) => entry.id === profileId);
+          const cursor = await this.trace.append(
+            context.runId,
+            {
+              type: "model_route_override",
+              schema: "glassbox.model-route-override.v1",
+              runId: context.runId,
+              conversationId: context.conversationId,
+              principalId: context.caller.principalId,
+              connectionId: context.caller.scope.connectionId,
+              profileId,
+              model: profile?.model ?? null,
+              providerId: profile?.providerId ?? null,
+              appliesTo:
+                profileId === null
+                  ? "later_owner_private_runs_use_channel_default"
+                  : "later_owner_private_runs_on_this_qq_connection",
+            },
+            "glassbox-model-selection",
+          );
+          await this.store.evidence.advanceTrace(context.caller, cursor);
+        },
       }),
       ...createOwnerMemoryTools({ store: this.store, getContext }),
       ...createSkillTools({
@@ -1396,8 +1635,12 @@ export class ManagementApplication {
     }
     classified.add(OWNER_GROUP_ADMIN_TOOL);
     if (!ownerPrivate) scopeGates.set(OWNER_GROUP_ADMIN_TOOL, "scope_not_permitted");
+    classified.add(OWNER_MODEL_ADMIN_TOOL);
+    if (!ownerPrivate) scopeGates.set(OWNER_MODEL_ADMIN_TOOL, "scope_not_permitted");
     classified.add(OWNER_MEMORY_ADMIN_TOOL);
     if (!ownerPrivate) scopeGates.set(OWNER_MEMORY_ADMIN_TOOL, "scope_not_permitted");
+    classified.add(MEDIA_GENERATION_TOOL);
+    if (!ownerPrivate) scopeGates.set(MEDIA_GENERATION_TOOL, "scope_not_permitted");
     classified.add(SKILL_READ_TOOL);
     if (!context.authorizedSkillNames?.length) scopeGates.set(SKILL_READ_TOOL, "policy_disabled");
 
@@ -1470,12 +1713,355 @@ export class ManagementApplication {
   }
 
   private execution(reference: string): RunExecutionAdapter | undefined {
+    const direct = this.directExecution(reference);
+    if (!direct || this.options.executors?.has(reference)) return direct;
+    const kind = reference.startsWith("pi:")
+      ? "pi"
+      : reference.startsWith("model:")
+        ? "model"
+        : null;
+    if (!kind) return direct;
+    return {
+      supportsGroup: direct.supportsGroup,
+      execute: async (input: ExecutionInput) => {
+        const profileId = reference.slice(kind.length + 1);
+        const configured = this.selectableModelProfiles(kind === "pi");
+        const origin = configured.find((profile) => profile.id === profileId);
+        if (!origin) return { status: "failed" };
+        const channelSelection = this.channels.resolve(input.caller.scope.connectionId);
+        const explicitOverride =
+          input.caller.scope.chatType === "private" &&
+          (await this.store.identities.isOwner(input.caller.principalId)) &&
+          channelSelection.modelOverrideProfileId === profileId;
+        const demandTokens =
+          estimateUnicodeTokens(input.text) +
+          input.history.reduce((sum, message) => sum + estimateUnicodeTokens(message.text) + 8, 0);
+        const candidates: RouteModelCapacity[] = configured.map((profile) => ({
+          profileId: profile.id,
+          executionRef: `${kind}:${profile.id}`,
+          configured: true,
+          capabilities: [
+            "text",
+            ...(kind === "pi" && profile.supportsTools === true ? ["tools" as const] : []),
+            ...(profile.supportsVision === true ? ["vision" as const] : []),
+            ...(profile.supportsThinking === true ? ["thinking" as const] : []),
+          ],
+          capabilityRank: profile.capabilityRank ?? null,
+          supportsThinking: profile.supportsThinking ?? null,
+          usage: {
+            inputTokens: null,
+            outputTokens: null,
+            concurrentRuns: null,
+            requestsPerMinute: null,
+            tokensPerMinute: null,
+          },
+          limits: {
+            contextWindowTokens: profile.contextWindowTokens ?? null,
+            maxOutputTokens: profile.maxOutputTokens ?? null,
+            maxConcurrentRuns: null,
+            requestsPerMinute: null,
+            tokensPerMinute: null,
+          },
+          health: (() => {
+            const operatorDisabled =
+              this.options.models
+                .list()
+                .find((configuredProfile) => configuredProfile.id === profile.id)
+                ?.routingAvailable === false;
+            const observation = this.runtimeHealthByProfile.get(profile.id);
+            const fresh = observation !== undefined && Date.now() - observation.checkedAt <= 60_000;
+            return {
+              state: operatorDisabled
+                ? ("unavailable" as const)
+                : fresh
+                  ? observation.state
+                  : ("unknown" as const),
+              checkedAt: fresh ? new Date(observation.checkedAt).toISOString() : null,
+              latencyMs: fresh ? observation.latencyMs : null,
+              reasonCode: operatorDisabled
+                ? "operator_disabled"
+                : fresh
+                  ? observation.reasonCode
+                  : null,
+            };
+          })(),
+        }));
+        const ordered = configured
+          .filter((profile) =>
+            explicitOverride
+              ? profile.id === profileId
+              : profile.id === profileId || profile.allowRouting === true,
+          )
+          .sort(
+            (a, b) =>
+              (a.routePriority ?? 1000) - (b.routePriority ?? 1000) || a.id.localeCompare(b.id),
+          );
+        const routingInput = {
+          task: {
+            risk:
+              kind === "pi" &&
+              MUTATION_REQUESTS.some(
+                (request) =>
+                  request.words.test(input.text) && request.params(input.text) !== undefined,
+              )
+                ? ("high" as const)
+                : ("medium" as const),
+            requiredCapabilities:
+              kind === "pi" ? (["text", "tools"] as const) : (["text"] as const),
+            requiredContextTokens: Math.max(
+              estimateUnicodeTokens(input.text) + 6144,
+              Math.min(demandTokens, 32768),
+            ),
+            requiredOutputTokens: 4096,
+            thinking: "disabled" as const,
+          },
+          candidates,
+          options: {
+            enabled: explicitOverride || origin.routingEnabled === true,
+            allowedProfileIds: ordered.map((profile) => profile.id),
+            routeOrder: ordered.map((profile) => profile.id),
+            defaultExecutionRef: reference,
+            capabilityFloorByRisk: { low: 0, medium: 0, high: 2 },
+            allowUnknownHealth: true,
+            allowUnknownCapacity: false,
+          },
+        };
+        let decision = selectRoute(routingInput);
+        const initiallyUnavailable = decision.candidates.some(
+          (candidate) => candidate.reason === "health_unavailable",
+        );
+        const caller = await this.store.lifecycle.traceCaller(
+          input.run.id,
+          input.caller.principalId,
+        );
+        const cursor = await this.trace.append(
+          input.run.id,
+          {
+            type: "routing_decision",
+            runId: input.run.id,
+            conversationId: input.conversation.id,
+            principalId: input.caller.principalId,
+            policyVersion: "p5b-route-v1",
+            demand: {
+              estimatedMaterialTokens: demandTokens,
+              estimateSource: "unicode_conservative",
+            },
+            ...toRoutingEvidence(routingInput, decision),
+          },
+          "glassbox-routing",
+        );
+        await this.store.evidence.advanceTrace(caller, cursor);
+        const appendRoutingEval = async (actualExecutionRef: string | null, succeeded = false) => {
+          const selectedProfile = candidates.find(
+            (candidate) => candidate.executionRef === decision.executionRef,
+          );
+          const selectedConfig = configured.find(
+            (profile) => profile.id === decision.selectedProfileId,
+          );
+          const observedModels = this.runtimeModelsByRun.get(input.run.id);
+          const actualModel =
+            observedModels?.size === 1 ? [...observedModels.values()][0] : undefined;
+          const executionConfig =
+            selectedConfig ??
+            configured.find(
+              (profile) =>
+                decision.executionRef === `${kind === "pi" ? "pi" : "model"}:${profile.id}`,
+            );
+          const decisionMatchesActual =
+            decision.executionRef !== null && decision.executionRef === actualExecutionRef;
+          const totalUsage = this.runtimeUsageByRun.get(input.run.id)?.totalTokens;
+          const actualTokens = totalUsage?.source === "reported" ? totalUsage.value : null;
+          this.runtimeUsageByRun.delete(input.run.id);
+          this.runtimeModelsByRun.delete(input.run.id);
+          const unavailableModelEncountered =
+            initiallyUnavailable ||
+            decision.candidates.some((candidate) => candidate.reason === "health_unavailable");
+          const evidenceCursor = await this.trace.append(
+            input.run.id,
+            {
+              type: "routing_eval_evidence",
+              schema: "glassbox.routing-eval-evidence.v1",
+              capabilityFloor: routingInput.options.capabilityFloorByRisk[routingInput.task.risk],
+              selectedCapabilityRank: selectedProfile?.capabilityRank ?? null,
+              unavailableModelEncountered,
+              fallbackSelected: unavailableModelEncountered && decision.executionRef !== null,
+              fallbackAvailable: unavailableModelEncountered && succeeded,
+              decisionExecutionRef: decision.executionRef,
+              actualExecutionRef,
+              decisionProvider: executionConfig
+                ? kind === "pi"
+                  ? decisionMatchesActual && actualModel
+                    ? actualModel.provider
+                    : `glassbox-${executionConfig.id}`
+                  : executionConfig.id
+                : decisionMatchesActual
+                  ? (actualModel?.provider ?? null)
+                  : null,
+              decisionModel:
+                executionConfig?.model ??
+                (decisionMatchesActual ? (actualModel?.model ?? null) : null),
+              actualProvider: actualModel?.provider ?? null,
+              actualModel: actualModel?.model ?? null,
+              usage: {
+                actualTokens,
+                estimatedTokens: demandTokens,
+                reportedTokens: actualTokens,
+                reportedSource: actualTokens === null ? "unknown" : "actual",
+              },
+              quota: { sourceAvailable: false, availability: "unknown" },
+            },
+            "glassbox-run",
+          );
+          await this.store.evidence.advanceTrace(caller, evidenceCursor);
+        };
+        if (decision.executionRef === null) {
+          await appendRoutingEval(null);
+          return { status: "failed" };
+        }
+        const selected =
+          decision.executionRef === reference
+            ? direct
+            : this.directExecution(decision.executionRef);
+        if (!selected || (input.caller.scope.chatType === "group" && !selected.supportsGroup)) {
+          await appendRoutingEval(null);
+          return { status: "failed" };
+        }
+        let succeeded = false;
+        let actualExecutionRef = decision.executionRef;
+        const observeRuntimeHealth = async (
+          executionRef: string,
+          resultStatus: "succeeded" | "failed",
+          startedAt: number,
+          reasonCode: string | null,
+        ) => {
+          const profileId = executionRef.slice(kind.length + 1);
+          const checkedAt = Date.now();
+          const state = resultStatus === "succeeded" ? "healthy" : "unavailable";
+          const latencyMs = Math.max(0, checkedAt - startedAt);
+          this.runtimeHealthByProfile.set(profileId, { state, checkedAt, latencyMs, reasonCode });
+          const observationCursor = await this.trace.append(
+            input.run.id,
+            {
+              type: "runtime_health_observation",
+              schema: "glassbox.runtime-health-observation.v1",
+              executionRef,
+              state,
+              checkedAt: new Date(checkedAt).toISOString(),
+              freshnessWindowMs: 60_000,
+              latencyMs,
+              reasonCode,
+            },
+            "glassbox-runtime-telemetry",
+          );
+          await this.store.evidence.advanceTrace(caller, observationCursor);
+        };
+        let attemptStartedAt = Date.now();
+        try {
+          attemptStartedAt = Date.now();
+          let result = await selected.execute(input);
+          if (result.failureCode === "pre_provider_context_overflow") {
+            // A provider was not called, so this is not evidence of runtime health.
+            this.runtimeHealthByProfile.delete(decision.selectedProfileId!);
+          } else {
+            await observeRuntimeHealth(
+              actualExecutionRef,
+              result.status === "succeeded" ? "succeeded" : "failed",
+              attemptStartedAt,
+              result.status === "succeeded" ? null : "execution_failed",
+            );
+          }
+          if (
+            result.failureCode === "pre_provider_context_overflow" &&
+            routingInput.options.enabled
+          ) {
+            const firstCapacity = candidates.find(
+              (candidate) => candidate.executionRef === actualExecutionRef,
+            );
+            const firstUsable =
+              (firstCapacity?.limits.contextWindowTokens ?? 0) -
+              (firstCapacity?.limits.maxOutputTokens ?? 0);
+            const larger = ordered.filter(
+              (profile) =>
+                profile.id !== decision.selectedProfileId &&
+                profile.contextWindowTokens !== undefined &&
+                profile.maxOutputTokens !== undefined &&
+                profile.contextWindowTokens - profile.maxOutputTokens > firstUsable,
+            );
+            const upgradeInput = {
+              ...routingInput,
+              options: {
+                ...routingInput.options,
+                allowedProfileIds: larger.map((profile) => profile.id),
+                routeOrder: larger.map((profile) => profile.id),
+                defaultExecutionRef: "",
+              },
+            };
+            const upgrade = selectRoute(upgradeInput);
+            const alternative =
+              upgrade.executionRef === null
+                ? undefined
+                : this.directExecution(upgrade.executionRef);
+            if (
+              upgrade.executionRef !== null &&
+              alternative &&
+              (input.caller.scope.chatType !== "group" || alternative.supportsGroup)
+            ) {
+              const upgradeCursor = await this.trace.append(
+                input.run.id,
+                {
+                  type: "routing_decision",
+                  runId: input.run.id,
+                  conversationId: input.conversation.id,
+                  principalId: input.caller.principalId,
+                  policyVersion: "p5b-route-v1",
+                  trigger: "pre_provider_context_overflow",
+                  previousExecutionRef: actualExecutionRef,
+                  demand: {
+                    estimatedMaterialTokens: demandTokens,
+                    estimateSource: "unicode_conservative",
+                  },
+                  ...toRoutingEvidence(upgradeInput, upgrade),
+                },
+                "glassbox-routing",
+              );
+              await this.store.evidence.advanceTrace(caller, upgradeCursor);
+              decision = upgrade;
+              actualExecutionRef = upgrade.executionRef;
+              attemptStartedAt = Date.now();
+              result = await alternative.execute(input);
+              await observeRuntimeHealth(
+                actualExecutionRef,
+                result.status === "succeeded" ? "succeeded" : "failed",
+                attemptStartedAt,
+                result.status === "succeeded" ? null : "execution_failed",
+              );
+            }
+          }
+          succeeded = result.status === "succeeded";
+          return result;
+        } catch (error) {
+          await observeRuntimeHealth(
+            actualExecutionRef,
+            "failed",
+            attemptStartedAt,
+            "execution_error",
+          );
+          throw error;
+        } finally {
+          await appendRoutingEval(actualExecutionRef, succeeded);
+        }
+      },
+    };
+  }
+
+  private directExecution(reference: string): RunExecutionAdapter | undefined {
     const harness = this.options.executors?.get(reference);
     if (harness) return harness;
     if (reference === "claude-code") return this.executors.adapter();
     if (reference.startsWith("pi:")) {
       const profileId = reference.slice(3);
-      if (!this.options.models.list().some((profile) => profile.id === profileId)) return undefined;
+      if (!this.selectableModelProfiles().some((profile) => profile.id === profileId))
+        return undefined;
       return this.getOrCreateDefaultPiAdapter(profileId);
     }
     if (!reference.startsWith("model:")) return undefined;
@@ -1489,6 +2075,47 @@ export class ManagementApplication {
         if (!caller) return;
         const cursor = await this.trace.append(runId, event, "glassbox-model");
         await this.store.evidence.advanceTrace(caller, cursor);
+        if (event.type === "model_identity") {
+          const models = this.runtimeModelsByRun.get(runId) ?? new Map();
+          const model = { provider: event.provider, model: event.model };
+          models.set(`${model.provider}\u0000${model.model}`, model);
+          this.runtimeModelsByRun.set(runId, models);
+        }
+        if (event.type === "usage") {
+          const normalized = normalizePiTurnEndUsage({
+            usage: {
+              input: event.usage.input ?? undefined,
+              output: event.usage.output ?? undefined,
+              cacheRead: event.usage.cacheRead ?? undefined,
+              cacheWrite: event.usage.cacheWrite ?? undefined,
+              reasoning: event.usage.reasoning ?? undefined,
+              totalTokens: event.usage.totalTokens ?? undefined,
+            },
+            providerReported: {
+              input: event.usage.input !== null,
+              output: event.usage.output !== null,
+              cacheRead: event.usage.cacheRead !== null,
+              cacheWrite: event.usage.cacheWrite !== null,
+              reasoning: event.usage.reasoning !== null,
+              totalTokens: event.usage.totalSource === "reported",
+            },
+          });
+          this.runtimeUsageByRun.set(
+            runId,
+            aggregateRuntimeUsage(this.runtimeUsageByRun.get(runId), normalized),
+          );
+          const usageCursor = await this.trace.append(
+            runId,
+            {
+              type: "runtime_usage",
+              runId,
+              schema: "glassbox.runtime-usage.v1",
+              usage: normalized,
+            },
+            "glassbox-runtime-telemetry",
+          );
+          await this.store.evidence.advanceTrace(caller, usageCursor);
+        }
       },
     });
   }
@@ -1653,12 +2280,21 @@ export class ManagementApplication {
           });
           return;
         }
+        const channelSelection = this.channels.resolve(id);
+        const executionKind = /^(pi|model):/u.exec(configured.executionRef)?.[1];
+        const ownerPrivate =
+          message.scope.chatType === "private" &&
+          message.scope.senderId === configured.config.ownerId;
+        const runExecutionRef =
+          ownerPrivate && channelSelection.modelOverrideProfileId && executionKind
+            ? `${executionKind}:${channelSelection.modelOverrideProfileId}`
+            : configured.executionRef;
         const accepted = await this.store.conversations.acceptIncoming({
           agentId: AGENT_ID,
           scope: message.scope,
           messageId: message.messageId,
           text: message.text,
-          executionRef: configured.executionRef,
+          executionRef: runExecutionRef,
         });
         if (!accepted.duplicate && message.scope.nativeGroupRole) {
           const cursor = await this.trace.append(
@@ -1994,6 +2630,15 @@ export class ManagementApplication {
         scope,
         effect: "allow",
       });
+      for (const action of ["model:read", "model:switch"]) {
+        await this.store.authorization.grant({
+          principalId,
+          resourceId: OWNER_CONTROL_RESOURCE,
+          action,
+          scope,
+          effect: "allow",
+        });
+      }
       await this.store.authorization.registerResource({
         id: OWNER_MEMORY_RESOURCE,
         kind: "owner-memory",
@@ -2010,10 +2655,26 @@ export class ManagementApplication {
           effect: "allow",
         });
       }
+      await this.store.authorization.registerResource({
+        id: MEDIA_GENERATION_RESOURCE,
+        kind: "media-generation",
+        visibility: "private",
+        ownerId: OWNER_ID,
+        ifAbsent: true,
+      });
+      await this.store.authorization.grant({
+        principalId,
+        resourceId: MEDIA_GENERATION_RESOURCE,
+        action: MEDIA_GENERATE_ACTION,
+        scope,
+        effect: "allow",
+      });
       for (const name of [
         ...(this.options.ops ? OPS_TOOL_NAMES : []),
         OWNER_GROUP_ADMIN_TOOL,
+        OWNER_MODEL_ADMIN_TOOL,
         OWNER_MEMORY_ADMIN_TOOL,
+        MEDIA_GENERATION_TOOL,
       ]) {
         const resourceId = toolResourceId(name);
         await this.store.authorization.registerResource({
@@ -3306,7 +3967,35 @@ export class ManagementApplication {
       runs: this.runs,
       trace: this.trace,
       evaluator: this.evaluator,
+      ...(this.options.ops ? { opsHealth: (runId: string) => this.opsHealth(runId) } : {}),
     });
+  }
+
+  private async opsHealth(runId: string) {
+    if (!this.options.ops) throw new ManagementError("NOT_FOUND", "Ops is not configured", 404);
+    const caller = await this.runCaller(runId);
+    const now = new Date();
+    const service = new AuthorizedOpsService(
+      this.store,
+      this.options.ops.bridge,
+      this.options.ops.workerPolicy,
+    );
+    return service.health(
+      caller,
+      {
+        now: now.toISOString(),
+        windowStart: new Date(now.getTime() - 24 * 60 * 60 * 1_000).toISOString(),
+        herdr: {
+          ...(this.opsReconciler?.healthObservation() ?? {
+            bridgeState: "unknown" as const,
+            eventsLost: false,
+            lastSuccessfulReconciliationAt: null,
+          }),
+          observations: [],
+        },
+      },
+      { runId },
+    );
   }
 
   async close() {

@@ -189,13 +189,14 @@ When a requirement is ambiguous, choose the smaller implementation that preserve
 
 Do not silently expand scope from the roadmap.
 
-P4A and P4B are complete. The active implementation plan before the next product phase is:
+P4A, P4B, and the repository transition refactor are complete. The active P5 implementation plans are:
 
 ```text
-.plans/phase-transition-repository-refactor.md
+.plans/05a-context-budgeting-runtime-efficiency.md
+.plans/05b-routing-runtime-observability.md
 ```
 
-Tracking Issue: #21. This plan covers server modularization, test structure, validation speed, hooks, and related documentation. It does not authorize P5 product features or frontend changes. Keep the P4 plans as completed records.
+Tracking Issues: #13 and #14. The Owner requested one implementation PR for both plans. Keep the P4 plans and the completed Issue #21 refactor plan as records.
 
 Read in this order before changing code:
 
@@ -210,7 +211,9 @@ Read in this order before changing code:
 
 | Topic | Source of truth |
 | --- | --- |
-| Repository modularization and validation workflow before the next product phase | `.plans/phase-transition-repository-refactor.md` and Issue #21 |
+| Context budgeting and runtime efficiency | `.plans/05a-context-budgeting-runtime-efficiency.md` and Issue #13 |
+| Routing and runtime observability | `.plans/05b-routing-runtime-observability.md` and Issue #14 |
+| Completed repository modularization and validation workflow | `.plans/phase-transition-repository-refactor.md` and Issue #21 |
 | Completed P4A Memory / Taste implementation and acceptance record | `.plans/04a-memory-taste.md` and Issue #9 |
 | Completed P4B retrieval / QQ history implementation and acceptance record | `.plans/04b-authorized-retrieval-history.md` and Issue #10 |
 | Completed P3 trust / QQ / Agent Ops foundation | `.plans/03-personal-agent-foundation.md` |
@@ -420,6 +423,36 @@ Do not hide races with arbitrary sleeps when a real completion signal or state t
 Use browser-level verification when browser behavior is the thing being tested.
 
 Use real QQ, Herdr, Pi, MCP, or other external integrations only when the active Plan requires real integration acceptance.
+
+### Real QQ acceptance across worktrees
+
+Use one local acceptance service and one durable `GLASSBOX_DATA_DIR` across branches. Keep
+NapCat's existing work directory, account state, OneBot settings, and the protected
+`service-launch.json` in place. Do not copy live data or credentials into each worktree.
+Automated tests still use isolated disposable state; the shared directory is only for
+explicit real-environment acceptance.
+
+Before switching, fetch the latest `main`, integrate it into the candidate branch, resolve
+conflicts, install that checkout's dependencies, and run its relevant deterministic checks.
+Record the candidate branch and commit. From a checkout with the service manager, run
+`npm run agent:switch -- --checkout <absolute checkout path>`, then `npm run agent:status`.
+The switch changes only Glassbox. Keep Herdr and NapCat running, and never start a second
+service against the same data directory. The command rejects a checkout that cannot read
+the shared database schema before stopping the current Glassbox process. Bring that
+checkout forward before retrying. See `docs/tech-stack.md` for service details.
+
+Confirm the reported Glassbox checkout and process, Glassbox readiness, and OneBot
+readiness. A listening OneBot port does not prove QQ is logged in. Check the account's
+online state, then send a fresh real QQ message through the configured identity and
+verify the received event, Run, authorization and delivery Trace, and outgoing QQ result.
+Use the active Plan's scenario matrix. Record the message and Run identifiers, checkout
+commit, service process, and data directory with the result. Keep credentials and message
+contents out of diagnostic summaries unless the evidence specifically needs them.
+
+If NapCat reports an expired quick-login state, leave its configuration and process
+intact. QQ must authorize a new login before real QQ acceptance can continue; an old
+message, a simulated OneBot event, or a ready Glassbox port cannot satisfy that gate.
+Report deterministic tests, provider probes, and real QQ delivery as separate results.
 
 ## Pull requests
 

@@ -3,6 +3,10 @@ import { createModelProvider } from "../model/provider.js";
 import type { Message } from "../model/vendor/pi/types.js";
 import { runModelAgent, type ModelAgentEvent } from "./model-agent/index.js";
 import type { RunExecutionAdapter } from "./run-service/types.js";
+import { estimateUnicodeTokens, projectContextBudget } from "../efficiency/index.js";
+
+const SYSTEM_PROMPT =
+  "You are the Glassbox personal assistant. Use the supplied conversation context. Report unavailable tools accurately.";
 
 /** The copied Pi runtime receives only the context already authorized by RunService. */
 export function configuredModelAdapter(options: {
@@ -14,8 +18,84 @@ export function configuredModelAdapter(options: {
     supportsGroup: true,
     async execute(input) {
       const resolved = options.profiles.resolve(options.profileId);
+      const contextWindowTokens = resolved.profile.contextWindowTokens;
+      const maxOutputTokens = resolved.profile.maxOutputTokens;
+      if (
+        contextWindowTokens === undefined ||
+        maxOutputTokens === undefined ||
+        maxOutputTokens >= contextWindowTokens
+      ) {
+        await options.onEvent?.(input.run.id, {
+          type: "model_capacity",
+          state: "unknown",
+          reasonCode: "capacity_unknown",
+        });
+        return { status: "failed" as const, failureCode: "model_capacity_unknown" as const };
+      }
       const provider = createModelProvider(resolved);
-      const messages: Message[] = input.history.map((entry) => {
+      const exchanges = [];
+      for (let index = 0; index < input.history.length; index += 2) {
+        const first = input.history[index];
+        const second = input.history[index + 1];
+        if (!first || first.role !== "user" || (second && second.role !== "assistant"))
+          return { status: "failed" as const };
+        exchanges.push({
+          id: String(index),
+          userTokens: estimateUnicodeTokens(first.text) + 8,
+          assistantTokens: second ? estimateUnicodeTokens(second.text) + 8 : 0,
+        });
+      }
+      const projection = projectContextBudget(
+        {
+          estimatedMaterialTokens:
+            estimateUnicodeTokens(SYSTEM_PROMPT) +
+            estimateUnicodeTokens(input.text) +
+            exchanges.reduce(
+              (sum, exchange) => sum + exchange.userTokens + exchange.assistantTokens,
+              0,
+            ),
+          estimateSource: "unicode_conservative",
+          hasLargeAuthorizedContext: input.historyScanTruncated === true,
+          requiredOutputClass: "standard",
+          hasToolOrRetrieval: false,
+          hasAttachmentsOrArtifacts: false,
+          trustedPolicyFlags: [],
+          systemTokens: estimateUnicodeTokens(SYSTEM_PROMPT),
+          currentMessageTokens: estimateUnicodeTokens(input.text) + 8,
+          toolSchemaTokens: 0,
+          requiredFloorTokens: 0,
+          exchanges,
+        },
+        {
+          contextWindowTokens,
+          outputReserveTokens: maxOutputTokens,
+          thinkingReserveTokens: 0,
+          safetyMarginTokens: 512,
+        },
+      );
+      await options.onEvent?.(input.run.id, {
+        type: "context_budget",
+        policyVersion: "p5a-context-v1",
+        capacityTokens: contextWindowTokens,
+        outputReserveTokens: maxOutputTokens,
+        thinkingReserveTokens: 0,
+        inputBudgetTokens: Math.max(0, contextWindowTokens - maxOutputTokens - 512),
+        estimatedTokens: projection.ok ? projection.projection.projectedTokens : 0,
+        omittedExchanges: projection.ok ? projection.projection.omittedExchangeIds.length : 0,
+        overflow: projection.ok ? null : projection.overflow.kind,
+      });
+      if (!projection.ok)
+        return { status: "failed" as const, failureCode: "pre_provider_context_overflow" as const };
+      const admitted = new Set(projection.projection.includedExchangeIds);
+      const boundedHistory = input.history.filter((_entry, index) =>
+        admitted.has(String(index - (index % 2))),
+      );
+      await options.onEvent?.(input.run.id, {
+        type: "model_identity",
+        provider: resolved.profile.id,
+        model: resolved.profile.model,
+      });
+      const messages: Message[] = boundedHistory.map((entry) => {
         if (entry.role === "user") return { role: "user", content: entry.text, timestamp: 0 };
         return {
           role: "assistant",
@@ -41,14 +121,13 @@ export function configuredModelAdapter(options: {
       const result = await runModelAgent({
         provider,
         authorizedContext: {
-          systemPrompt:
-            "You are the Glassbox personal assistant. Use the supplied conversation context. Report unavailable tools accurately.",
+          systemPrompt: SYSTEM_PROMPT,
           messages,
         },
         signal: input.signal,
         maxTurns: 8,
         maxToolCalls: 0,
-        maxOutputTokens: 4096,
+        maxOutputTokens,
         onEvent: options.onEvent ? (event) => options.onEvent!(input.run.id, event) : undefined,
       });
       return {

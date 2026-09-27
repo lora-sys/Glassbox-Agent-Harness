@@ -114,6 +114,7 @@ describe("Workbench continuation policy", () => {
       port: 0,
       quiet: true,
       databasePath: ":memory:",
+      piAgentDirectory: null,
     });
     baseUrl = server.baseUrl;
     token = (await readFile(server.credentialFile, "utf8")).trim();

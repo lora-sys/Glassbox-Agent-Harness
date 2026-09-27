@@ -9,6 +9,7 @@ export interface DeliveryContentDecision {
   reasons: string[];
   candidateSha256: string;
   artifactIds?: readonly string[];
+  mediaAssetIds?: readonly string[];
 }
 
 export const DELIVERY_UUID =
@@ -68,17 +69,34 @@ export function createQqDeliveryPolicy(
   };
 
   return {
-    prepare(candidate: string, allowedArtifacts: readonly string[] = []): DeliveryContentDecision {
+    prepare(
+      candidate: string,
+      allowedArtifacts: readonly string[] = [],
+      allowedMediaAssets: readonly string[] = [],
+    ): DeliveryContentDecision {
       const candidateSha256 = createHash("sha256").update(candidate).digest("hex");
-      const allowedArtifactIds = new Set(allowedArtifacts.map((id) => id.toLowerCase()));
+      const allowedArtifactIds = new Set(
+        [...allowedArtifacts, ...allowedMediaAssets].map((id) => id.toLowerCase()),
+      );
       const initial = inspect(candidate, allowedArtifactIds);
       if (initial.length > 0) return { allowed: false, reasons: initial, candidateSha256 };
-      const text = renderQqPlainText(candidate);
+      const visibleCandidate = candidate.replace(
+        /\[asset:([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\]/giu,
+        (_marker, id: string) => (allowedArtifactIds.has(id.toLowerCase()) ? "" : _marker),
+      );
+      const text = renderQqPlainText(visibleCandidate);
       if (!text) return { allowed: false, reasons: ["empty-rendered-output"], candidateSha256 };
       const rendered = inspect(text, allowedArtifactIds);
       return rendered.length > 0
         ? { allowed: false, reasons: rendered, candidateSha256 }
-        : { allowed: true, text, reasons: [], candidateSha256, artifactIds: allowedArtifacts };
+        : {
+            allowed: true,
+            text,
+            reasons: [],
+            candidateSha256,
+            artifactIds: allowedArtifacts,
+            ...(allowedMediaAssets.length > 0 ? { mediaAssetIds: allowedMediaAssets } : {}),
+          };
     },
   };
 }

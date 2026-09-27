@@ -260,6 +260,15 @@ export class SocketHerdrBridge implements HerdrBridge {
       "_",
     );
     if (!kind) return null;
+    if (kind === "events_lost") {
+      return {
+        type: "events.lost",
+        sessionId: this.options.sessionId,
+        workspaceId: "",
+        paneId: "",
+        timestamp: new Date().toISOString(),
+      };
+    }
     if (kind === "pane_updated") data = object(data.pane) ?? {};
     if (kind === "pane_agent_status_changed" || kind === "pane_updated") {
       if (!text(data.workspace_id) || !text(data.pane_id)) return null;

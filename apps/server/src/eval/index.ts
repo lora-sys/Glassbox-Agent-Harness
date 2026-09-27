@@ -1,10 +1,13 @@
 import { randomUUID } from "node:crypto";
+import { RUN_INTEGRITY_SUITE, type RunEvalAssessment } from "@glassbox/contracts";
 import {
-  RUN_INTEGRITY_SUITE,
-  type RunEvalAssessment,
-  type RunEvalPage,
-  type RunEvalView,
-} from "@glassbox/contracts";
+  ROUTING_SAFETY_SCORER_VERSION,
+  ROUTING_SAFETY_SUITE,
+  type EvalPage,
+  type EvalView,
+  type RoutingEvalAssessment,
+  type RoutingEvalView,
+} from "../../../../packages/contracts/src/evals.js";
 import type { PageOptions, RunRecord } from "../conversation/store.js";
 import type { CallerContext } from "../identity/scope.js";
 import { scopeKey } from "../identity/scope.js";
@@ -25,8 +28,19 @@ import {
   verdict,
 } from "./scorers.js";
 import { evalView } from "./view.js";
+import {
+  emptyRoutingTraceObservation,
+  observeRoutingEvidence,
+  routingVerdict,
+  scoreRoutingEvidence,
+} from "./routing-scorers.js";
+import { routingEvalView } from "./view.js";
 
 export { RUN_INTEGRITY_SCORER_VERSION } from "./scorers.js";
+export {
+  ROUTING_SAFETY_SCORER_VERSION,
+  ROUTING_SAFETY_SUITE,
+} from "../../../../packages/contracts/src/evals.js";
 const MAX_TRACE_EVENTS = 10_000;
 const MAX_TRACE_PAGES = 100;
 
@@ -52,6 +66,7 @@ export function createRunEvaluator(options: {
     run: RunRecord,
     indexed: TraceCursor,
     resultDeliveryId: string | undefined,
+    onEntry?: (entry: import("../trace/store.js").TraceEntry) => void,
   ) {
     const observation = emptyTraceObservation();
     if (indexed.traceRef !== run.id) {
@@ -96,6 +111,7 @@ export function createRunEvaluator(options: {
       for (const entry of page.records) {
         observation.scanned++;
         observeLifecycle(observation, entry, run, resultDeliveryId);
+        onEntry?.(entry);
       }
       if (observation.scanned === indexed.eventCount) {
         observation.value = "pass";
@@ -118,7 +134,8 @@ export function createRunEvaluator(options: {
       caller: CallerContext,
       runId: string,
       suiteId: string = RUN_INTEGRITY_SUITE,
-    ): Promise<RunEvalView> {
+    ): Promise<EvalView> {
+      if (suiteId === ROUTING_SAFETY_SUITE) return evaluateRouting(caller, runId);
       if (suiteId !== RUN_INTEGRITY_SUITE) throw new RunEvalError("EVAL_SUITE_NOT_FOUND");
       const observer = structuredClone(caller);
       await store.evidence.assertEvalAccess(observer, runId);
@@ -176,10 +193,69 @@ export function createRunEvaluator(options: {
       await store.evidence.assertEvalAccess(observer, runId);
       return evalView(stored);
     },
-    async list(caller: CallerContext, runId: string, page: PageOptions = {}): Promise<RunEvalPage> {
+    async list(caller: CallerContext, runId: string, page: PageOptions = {}): Promise<EvalPage> {
       const observer = structuredClone(caller);
       const records = await store.evidence.listEvals(observer, runId, page);
-      return { items: records.items.map(evalView), nextCursor: records.nextCursor };
+      return {
+        items: records.items.map((record) =>
+          record.scorerVersion === ROUTING_SAFETY_SCORER_VERSION
+            ? routingEvalView(record)
+            : evalView(record),
+        ),
+        nextCursor: records.nextCursor,
+      };
     },
   };
+
+  async function evaluateRouting(caller: CallerContext, runId: string): Promise<RoutingEvalView> {
+    const observer = structuredClone(caller);
+    await store.evidence.assertEvalAccess(observer, runId);
+    const run = await store.conversations.getRun(observer, runId);
+    const indexed = await store.evidence.getTrace(observer, runId);
+    if (!indexed) throw new RunEvalError("EVAL_TRACE_NOT_INDEXED");
+    const observation = emptyRoutingTraceObservation();
+    const traceObservation = await inspect(observer, run, indexed, undefined, (entry) =>
+      observeRoutingEvidence(observation, entry),
+    );
+    const scores = scoreRoutingEvidence({
+      observation,
+      traceValue: traceObservation.value,
+      traceReason: traceObservation.reason,
+    });
+    const sampleId = randomUUID();
+    const assessment: RoutingEvalAssessment = {
+      suiteId: ROUTING_SAFETY_SUITE,
+      source: "stored-run-evidence",
+      acceptance: "not-assessed",
+      verdict: routingVerdict(scores),
+      sample: { id: sampleId, input: { runId }, target: ROUTING_SAFETY_SUITE },
+      run: {
+        id: run.id,
+        conversationId: run.conversationId,
+        executionRef: run.executionRef,
+        status: run.status,
+      },
+      trace: indexed,
+      scores,
+    };
+    await store.evidence.assertEvalAccess(observer, runId);
+    const id = await store.evidence.recordEval(observer, {
+      runId,
+      sampleId,
+      scorerVersion: ROUTING_SAFETY_SCORER_VERSION,
+      traceRef: indexed.traceRef,
+      traceStart: 0,
+      traceEnd: indexed.eventCount,
+      expected: JSON.stringify({ suiteId: ROUTING_SAFETY_SUITE }),
+      observed: JSON.stringify(assessment),
+      passed: assessment.verdict === "pass",
+      inputTokens: null,
+      outputTokens: null,
+      durationMs: null,
+    });
+    const stored = await store.evidence.getEval(observer, runId, id);
+    if (!stored) throw new Error("The recorded routing Eval could not be read");
+    await store.evidence.assertEvalAccess(observer, runId);
+    return routingEvalView(stored);
+  }
 }

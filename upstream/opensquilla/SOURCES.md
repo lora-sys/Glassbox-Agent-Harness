@@ -2,7 +2,9 @@
 
 Reference project: `TokenRhythm/opensquilla`
 
-Pinned upstream commit: `75a7085960ee57bc7a17acde5ce08071af4e7632`
+Pinned upstream commit used by the earlier retrieval review: `75a7085960ee57bc7a17acde5ce08071af4e7632`
+
+P5 reviewed upstream commit (2026-09-21): `9e38139641daea70db967091aecce9524b93efe0`
 
 Upstream branch at review time: `main`
 
@@ -125,6 +127,40 @@ RoutingDecision
 
 This gives Eval a real surface for measuring cost / quality tradeoffs instead of treating routing as hidden magic.
 
+## P5 reviewed source set
+
+Plan 05 re-audited the live upstream at commit `9e38139641daea70db967091aecce9524b93efe0`.
+
+P5A additionally reviewed:
+
+~~~text
+tests/test_context_budget_governor.py
+tests/test_engine/test_context_budget_coordinator.py
+tests/test_engine/test_tokenjuice_tool_result_projection.py
+tests/test_tools/test_loop_guard.py
+tests/test_session/test_tokenizer.py
+~~~
+
+P5B additionally reviewed:
+
+~~~text
+src/opensquilla/engine/routing/policy.py
+src/opensquilla/observability/decision_log.py
+src/opensquilla/observability/turn_call_log.py
+src/opensquilla/observability/usage_telemetry.py
+tests/test_engine/test_routing_policy_stages.py
+tests/test_engine/test_routing_policy_parity.py
+tests/test_observability/test_decision_log_contract.py
+tests/test_observability/test_decision_log_cost_source.py
+tests/test_observability/test_log_privacy.py
+~~~
+
+P5 deliberately does not make the full ONNX/LightGBM router or ensemble system a baseline dependency. It first ports deterministic routing policy/evidence.
+
+The P5 audit also did not identify a complete generic semantic model-answer cache that satisfies Glassbox authorization/revocation semantics. Treat generic semantic response caching as deferred; first prove authority-scoped deterministic projection/retrieval reuse.
+
+Detailed audit: `.plans/findings/05-p5-upstream-review-2026-09-21.md`.
+
 ## Serverless note
 
 At this review commit, we verified OpenSquilla's gateway, runtime targets, router, persistence, budgeting, retrieval, and provider abstractions, but did not find a clearly named first-class Serverless deployment implementation in the main source tree comparable to a dedicated Lambda / Workers runtime.
@@ -135,8 +171,18 @@ For Glassbox, a future serverless execution layer should keep durable identity, 
 
 ## Current phase boundary
 
-Plan 03 now actively delivers the QQ Personal Agent closed loop with Pi SDK, Lora PI Kit, hard authorization gates, Turso Conversation state, NapCat / OneBot, and real QQ acceptance.
+P4A/P4B are closing the governed learning and authorization-first retrieval phase. P5 planning is now frozen, but production P5 work starts only after both P4 streams are merged and their completion gates pass from main.
 
-OpenSquilla remains a later reference during this phase. Do not add smart routing, vector retrieval, semantic cache, TokenJuice-style projection, or serverless deployment merely to complete P3 unless the active Plan explicitly changes.
+P5A may adapt the reviewed Context-budget, Tool-budget, token-estimation and projection mechanisms. P5B may adapt deterministic routing-policy and decision-observability mechanisms.
 
-The P3 security gates, especially Context Gate, Tool Gate, and Delivery Gate, are authoritative before any later optimization layer is introduced.
+The P3/P4 security order remains authoritative:
+
+~~~text
+Authorization
+→ protected source / Tool access
+→ retrieval / execution
+→ P5 optimization / routing
+→ Delivery
+~~~
+
+Do not let routing, cache, Context compression or token optimization become an alternate authorization path.

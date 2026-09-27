@@ -14,6 +14,7 @@
     "dev:server": "vp run -F @glassbox/server dev",
     "start": "tsx scripts/agent-service.mts up",
     "agent:up": "tsx scripts/agent-service.mts up",
+    "agent:switch": "tsx scripts/agent-service.mts switch",
     "agent:status": "tsx scripts/agent-service.mts status",
     "agent:logs": "tsx scripts/agent-service.mts logs",
     "agent:inspect": "tsx scripts/inspect-latest-run.mts",

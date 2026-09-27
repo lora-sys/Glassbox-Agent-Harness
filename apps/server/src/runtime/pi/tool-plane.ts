@@ -35,10 +35,16 @@ import { QQ_CAPABILITIES, type QqCapabilityRisk } from "../../channels/onebot/ca
 import { GROUP_HISTORY_SEARCH_TOOL, OWNER_HISTORY_SEARCH_TOOL } from "./history-tools.js";
 import { OWNER_MEMORY_ADMIN_TOOL } from "./owner-memory-tools.js";
 import { OWNER_GROUP_ADMIN_TOOL } from "./owner-tools.js";
+import { OWNER_MODEL_ADMIN_TOOL } from "./owner-model-tools.js";
 import { OPS_TOOL_NAMES } from "./ops-tools.js";
 import { SKILL_READ_TOOL } from "./skill-tools.js";
 import { WEB_FETCH_TOOL, WEB_SEARCH_TOOL } from "./web-tools.js";
 import { BROWSER_TOOL } from "./browser-tools.js";
+import {
+  MEDIA_GENERATION_RESOURCE,
+  MEDIA_GENERATION_TOOL,
+  MEDIA_GENERATE_ACTION,
+} from "./media-tools.js";
 import {
   MEMORY_GOVERN_ACTION,
   MEMORY_READ_ACTION,
@@ -316,6 +322,19 @@ const OPS_TOOL_DESCRIPTORS: readonly ToolDescriptor[] = Object.freeze(
 
 const DOMAIN_TOOL_DESCRIPTORS: readonly ToolDescriptor[] = Object.freeze([
   {
+    name: MEDIA_GENERATION_TOOL,
+    origin: "glassbox_domain",
+    schemaVersion: "media-generation-v1",
+    riskClass: "moderate",
+    provider: "media-provider-registry",
+    discovery: "owner_private",
+    authorization: { action: MEDIA_GENERATE_ACTION, resource: MEDIA_GENERATION_RESOURCE },
+    availability: "provider_probe",
+    resultProjection: "projected",
+    grounding: "integration",
+    budgetClass: "integration",
+  },
+  {
     name: BROWSER_TOOL,
     origin: "glassbox_domain",
     schemaVersion: "agent-browser-v1",
@@ -392,6 +411,19 @@ const DOMAIN_TOOL_DESCRIPTORS: readonly ToolDescriptor[] = Object.freeze([
     availability: "none",
     resultProjection: "projected",
     grounding: "direct_observation",
+    budgetClass: "core",
+  },
+  {
+    name: OWNER_MODEL_ADMIN_TOOL,
+    origin: "glassbox_domain",
+    schemaVersion: "owner-model-admin-v1",
+    riskClass: "write",
+    provider: "glassbox-management",
+    discovery: "owner_private",
+    authorization: { action: ["model:read", "model:switch"], resource: "owner-control" },
+    availability: "none",
+    resultProjection: "projected",
+    grounding: "local_computation",
     budgetClass: "core",
   },
   {

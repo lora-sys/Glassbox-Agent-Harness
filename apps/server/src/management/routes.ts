@@ -51,6 +51,7 @@ export interface ManagementRouteDependencies {
   runs: Pick<RunService, "cancel">;
   trace: Pick<RunTraceStore, "readPage">;
   evaluator: ReturnType<typeof createRunEvaluator>;
+  opsHealth?: (runId: string) => Promise<unknown>;
 }
 
 function workspaceInput(input: unknown): Record<string, unknown> {
@@ -132,6 +133,12 @@ export async function routeManagementRequest(
   };
   const ok = (body: unknown) => ({ status: 200, body });
   try {
+    if (request.method === "GET" && path === "/manage/ops/health" && dependencies.opsHealth) {
+      const runId = url.searchParams.get("runId");
+      if (!runId || !/^[A-Za-z0-9-]{1,80}$/u.test(runId))
+        throw new ManagementError("INVALID_REQUEST", "A Run identifier is required");
+      return ok({ health: await dependencies.opsHealth(runId) });
+    }
     if (request.method === "GET" && path === "/manage/sandbox")
       return ok({ sandbox: dependencies.sandboxStatus() });
     const browserArtifact =
