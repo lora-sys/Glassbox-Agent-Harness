@@ -126,6 +126,29 @@ describe("Pi required Tool execution", () => {
     expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({ action: "image" });
   });
 
+  it("recognizes an image selection followed by a short request", async () => {
+    const f = fixture([
+      {
+        status: "completed",
+        text: "图片已生成。",
+        toolCalls: [{ name: "media_generate", input: { action: "image" }, failed: false }],
+      },
+    ]);
+    f.input.text = "图片！给我";
+    f.input.history = [
+      { role: "user", text: "给我生成一个小猫" },
+      {
+        role: "assistant",
+        text: "请说明你想要图片、视频，还是文字描述。当前请求未执行。",
+      },
+    ];
+
+    await f.executor.execute(f.input);
+
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe("media_generate");
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({ action: "image" });
+  });
+
   it("does not treat a short image answer as a new media request without the clarification context", async () => {
     const f = fixture([{ status: "completed", text: "你想生成什么图片？", toolCalls: [] }]);
     f.input.text = "图片";

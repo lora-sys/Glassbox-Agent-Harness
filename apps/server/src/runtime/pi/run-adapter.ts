@@ -744,7 +744,12 @@ function mediaRequestIntentForInput(
   const directIntent = mediaRequestIntent(input.text);
   if (directIntent) return directIntent;
 
-  const answer = input.text.trim().replace(/[。！？!?]$/u, "");
+  const answer = input.text
+    .trim()
+    .replace(/[，,。！？!?]*$/u, "")
+    .replace(/(?:请)?(?:给我|帮我|帮忙|麻烦你?)$/u, "")
+    .replace(/[，,。！？!?]*$/u, "")
+    .trim();
   const selectedIntent = /^(?:图片|图像|生图|插画|照片|海报)$/u.test(answer)
     ? "image"
     : /^(?:视频|短片|动画)$/u.test(answer)
