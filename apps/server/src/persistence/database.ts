@@ -3,6 +3,7 @@ import { dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createClient, type Client, type Transaction, type Row } from "@libsql/client";
 import {
+  CURRENT_SCHEMA_VERSION,
   schema,
   schemaV2Migration,
   schemaV3Migration,
@@ -59,10 +60,11 @@ export class DomainDatabase {
         const version = Number(
           (await tx.execute("PRAGMA user_version")).rows[0]?.user_version ?? 0,
         );
-        if (version > 11) throw new Error("Unsupported database schema version");
+        if (version > CURRENT_SCHEMA_VERSION)
+          throw new Error("Unsupported database schema version");
         if (version === 0) {
           await tx.batch(schema);
-          await tx.execute("PRAGMA user_version = 11");
+          await tx.execute(`PRAGMA user_version = ${CURRENT_SCHEMA_VERSION}`);
         } else {
           if (version < 2) {
             await tx.batch(schemaV2Migration);
@@ -80,7 +82,7 @@ export class DomainDatabase {
           if (version < 9) await tx.batch(schemaV9Migration);
           if (version < 10) await tx.batch(schemaV10Migration);
           if (version < 11) await tx.batch(schemaV11Migration);
-          await tx.execute("PRAGMA user_version = 11");
+          await tx.execute(`PRAGMA user_version = ${CURRENT_SCHEMA_VERSION}`);
         }
       });
       return db;

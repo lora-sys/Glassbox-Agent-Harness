@@ -475,6 +475,31 @@ input fingerprint; uncertain inputs always run tests.
 The `packageManager` field records the package-manager backend used by `vp install`. It does
 not change the repository command surface. Developers use `vp` directly.
 
+### Repository hygiene CI
+
+`.github/workflows/hygiene-ci.yml` runs for pull requests targeting `main`, pushes to `main`,
+and manual dispatch. It pins Node and npm to the project toolchain, installs from the lockfile,
+and runs these checks:
+
+- `npm run verify:full` covers lint, types, test-integrity checks, the deterministic unit suite,
+  and the web build.
+- `npm run hygiene:check` checks workspace and lockfile alignment, runtime versions, generated
+  route configuration, tracked secret/runtime/build/database files, ignore rules, and migration
+  version declarations.
+- Changed tests are checked for deletion, skipped or isolated cases, and reduced declaration
+  counts.
+- The database migration test checks retained rows, schema version, SQLite integrity, and
+  foreign-key integrity using a disposable database.
+- `npm audit` blocks high and critical dependency vulnerabilities. Dependency Review checks
+  dependency changes in pull requests.
+- TruffleHog scans changed Git commits for verified and unverified secret candidates.
+- Pull request titles must follow `type(scope): summary`. Local commits continue to use the
+  repository's pre-commit validation hook.
+
+Configure GitHub branch protection for `main` to require the `Code and test hygiene`,
+`Dependency hygiene`, `Secret hygiene`, `Pull request dependency review`, and `Pull request title
+hygiene` checks. A workflow cannot make its own status checks mandatory or prevent direct pushes.
+
 Playwright remains the browser / E2E layer.
 
 P3 deterministic tests must not require real QQ accounts, paid model quota, the user's normal Pi state, or live Herdr workspaces.

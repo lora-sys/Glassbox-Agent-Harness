@@ -1,4 +1,6 @@
 import type { Transaction } from "@libsql/client";
+
+export const CURRENT_SCHEMA_VERSION = 11;
 import { conversationScopeKey } from "../identity/scope.js";
 
 function persistedText(value: unknown): string {
