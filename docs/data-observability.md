@@ -160,6 +160,12 @@ Lora PI Kit
 
 Neither Pi Session nor Kit Profile replaces durable Glassbox product state.
 
+Configured private QQ image messages keep validated image bytes on their Conversation message
+attachment rows in the durable database. Run input reads those bytes only after the same
+Conversation authorization used for the message. Raw Trace and plain-text Conversation history
+store no image bytes, provider URL, or OneBot file token. A model receives an image only when its
+selected profile explicitly declares `supportsVision`.
+
 The same Kit can be used by several roles without making those roles the same Agent identity.
 
 ## Product truth vs Herdr live execution

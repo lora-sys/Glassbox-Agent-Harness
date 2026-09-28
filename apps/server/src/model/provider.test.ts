@@ -191,3 +191,15 @@ it("rejects unsupported protocols, remote missing credentials and credential URL
     }),
   ).toThrow("not configured");
 });
+
+it("advertises image input only when the profile explicitly supports vision", () => {
+  const textOnly = createModelProvider({ profile: profile("openai-completions") });
+  const vision = createModelProvider({
+    profile: { ...profile("openai-completions"), supportsVision: true },
+  });
+
+  expect(textOnly.model.input).toEqual(["text"]);
+  expect(textOnly.capabilities.images).toBe(false);
+  expect(vision.model.input).toEqual(["text", "image"]);
+  expect(vision.capabilities.images).toBe(true);
+});

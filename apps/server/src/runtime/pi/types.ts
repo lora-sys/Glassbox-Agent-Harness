@@ -90,6 +90,11 @@ export interface PiRunContext {
   caller?: CallerContext;
   conversationId?: string;
   runId?: string;
+  /** Current user attachments, carried to Pi as ImageContent without changing their order. */
+  images?: readonly {
+    mimeType: "image/png" | "image/jpeg" | "image/webp";
+    data: string;
+  }[];
   /** Server-resolved workspace for the current Owner Run, never a model-supplied host path. */
   workspaceId?: string;
   requiredToolName?: string;
@@ -133,6 +138,7 @@ export interface PiRuntimeAdapter {
   disposeSession?(runtimeSessionId: string): Promise<void>;
   disposeWorkspaceSessions?(principalId: string, workspaceId: string): Promise<void>;
   getRunContext?(runtimeSessionId: string): PiRunContext | undefined;
+  getModelSupportsImages?(runtimeSessionId: string): boolean;
   getModelCapacity?(runtimeSessionId: string): EfficiencyModelCapacity | undefined;
   getStaticContextEstimate?(runtimeSessionId: string):
     | {

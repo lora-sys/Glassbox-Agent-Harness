@@ -24,7 +24,7 @@ it("migrates v9 deliveries without losing old rows and accepts browser and media
     const db = await DomainDatabase.open(path);
     try {
       await db.transaction(async (tx) => {
-        expect((await tx.execute("PRAGMA user_version")).rows[0]?.user_version).toBe(11);
+        expect((await tx.execute("PRAGMA user_version")).rows[0]?.user_version).toBe(12);
         expect(
           (await tx.execute("SELECT payload_text, status FROM deliveries WHERE id = 'delivery-1'"))
             .rows[0],

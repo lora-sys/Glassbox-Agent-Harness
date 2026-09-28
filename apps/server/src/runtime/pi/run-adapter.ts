@@ -891,6 +891,11 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
   ) {}
 
   async execute(input: ExecutionInput): Promise<ExecutionResult> {
+    if (input.imageFailureCode)
+      return {
+        status: "succeeded",
+        text: "图片读取失败，暂时无法识别，请重新发送图片。",
+      };
     const isOwner = this.options.isOwner
       ? await this.options.isOwner(input)
       : input.caller.principalId === "owner";
@@ -930,6 +935,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       caller: input.caller,
       conversationId: input.conversation.id,
       runId: input.run.id,
+      ...(input.images?.length ? { images: input.images } : {}),
     };
     const binding = await this.runtime.createOrRestoreSession(
       {
@@ -949,6 +955,16 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       profile,
       context,
     );
+    if (
+      input.images?.length &&
+      this.runtime.getModelSupportsImages?.(binding.runtimeSessionId) !== true
+    ) {
+      await this.runtime.disposeSession?.(binding.runtimeSessionId);
+      return {
+        status: "succeeded",
+        text: "当前配置的模型不支持识别图片，因此没有发送图片。请切换到支持视觉输入的模型后重试。",
+      };
+    }
     const required = requiredToolCall(input, isOwner, context.authorizedToolNames, modelProfiles);
     const requiredCalls = required
       ? [{ name: required.name, input: required.input }, ...(required.additional ?? [])]

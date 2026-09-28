@@ -17,6 +17,11 @@ import {
 } from "./history.ts";
 import { GROUP_SCOPED_NAPCAT_ACTIONS, isAllowedNapCatAction } from "./capabilities.ts";
 import { normalizeQqNativeGroupRole, type QqNativeGroupRole } from "./group-role.js";
+import {
+  readOneBotImageFile,
+  type IncomingImage,
+  type IncomingImageFailure,
+} from "./image-input.js";
 
 const GROUP_SCOPED_ACTIONS = new Set(GROUP_SCOPED_NAPCAT_ACTIONS);
 
@@ -50,6 +55,10 @@ export type OneBotHistoryResult =
       nextCursor?: string;
     }
   | OneBotReadFailure;
+
+export type OneBotImageResult =
+  | { status: "ok"; image: IncomingImage }
+  | { status: "failed"; code: IncomingImageFailure };
 
 export type OneBotGroupInfoResult =
   | {
@@ -379,6 +388,37 @@ export class OneBotAdapter {
       messages,
       ...(oldestCursor === undefined ? {} : { nextCursor: oldestCursor.id }),
     };
+  }
+
+  /** Resolve a normalized private-chat image token through authenticated OneBot get_image. */
+  async getImage(file: string, signal?: AbortSignal): Promise<OneBotImageResult> {
+    if (
+      typeof file !== "string" ||
+      file.length === 0 ||
+      file.length > 128 ||
+      file === "." ||
+      file === ".." ||
+      /[\\/]/u.test(file) ||
+      Array.from(file).some((character) => {
+        const code = character.charCodeAt(0);
+        return code < 32 || code === 127;
+      }) ||
+      /^[a-z][a-z0-9+.-]*:/iu.test(file)
+    )
+      return { status: "failed", code: "image_invalid" };
+    if (signal?.aborted) return { status: "failed", code: "image_timeout" };
+    if (!/^(?:localhost|127\.0\.0\.1|\[::1\])$/iu.test(new URL(this.config.endpoint).hostname))
+      return { status: "failed", code: "image_unavailable" };
+    const socket = this.#socket;
+    if (this.#state.status !== "ready" || !socket)
+      return { status: "failed", code: "image_unavailable" };
+    const result = await this.#request(socket, "get_image", { file });
+    if (signal?.aborted) return { status: "failed", code: "image_timeout" };
+    if (result.status !== "ok") return { status: "failed", code: "image_unavailable" };
+    const image = await readOneBotImageFile(object(result.data)?.file, signal);
+    return image.status === "ready"
+      ? { status: "ok", image: image.image }
+      : { status: "failed", code: image.code };
   }
 
   /**

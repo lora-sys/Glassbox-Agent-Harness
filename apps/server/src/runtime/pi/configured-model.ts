@@ -36,7 +36,7 @@ export async function configuredPiModel(
         id: profile.model,
         name: profile.label,
         reasoning: profile.supportsThinking === true,
-        input: ["text"],
+        input: profile.supportsVision === true ? ["text", "image"] : ["text"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: profile.contextWindowTokens,
         maxTokens: profile.maxOutputTokens,
