@@ -169,7 +169,6 @@ export function createMediaGenerationTools(options: {
       authService: options.store.authorization,
       getContext,
       execute: async (input, context, signal) => {
-        consumeMutationIntent(context, MEDIA_GENERATION_TOOL, { action: input.action });
         if (input.action === "image") {
           if (!options.provider.capabilities.includes("image") || !options.provider.generateImage)
             return { status: "media_capability_unavailable" };
@@ -182,6 +181,7 @@ export function createMediaGenerationTools(options: {
           await validateReferenceUrls(input);
           if (input.ratio && !IMAGE_RATIOS.includes(input.ratio as ImageRatio))
             throw new Error("invalid_media_input");
+          consumeMutationIntent(context, MEDIA_GENERATION_TOOL, { action: input.action });
           const result = await options.provider.generateImage(
             {
               mode,
@@ -256,6 +256,7 @@ export function createMediaGenerationTools(options: {
         if (input.ratio && !VIDEO_RATIOS.includes(input.ratio as VideoRatio))
           throw new Error("invalid_media_input");
         await validateReferenceUrls(input);
+        consumeMutationIntent(context, MEDIA_GENERATION_TOOL, { action: input.action });
         const job = await options.provider.createVideo(
           {
             mode,

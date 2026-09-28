@@ -132,7 +132,12 @@ export function pageParameters(options: PageOptions = {}): {
   }
 }
 
-export function makePage<T>(rows: Row[], limit: number, map: (row: Row) => T): Page<T> {
+export function makePage<T>(
+  rows: Row[],
+  limit: number,
+  map: (row: Row) => T,
+  cursorColumns: readonly [string, string] = ["created_at", "id"],
+): Page<T> {
   const included = rows.slice(0, limit);
   const last = included.at(-1);
   return {
@@ -140,7 +145,10 @@ export function makePage<T>(rows: Row[], limit: number, map: (row: Row) => T): P
     nextCursor:
       rows.length > limit && last
         ? Buffer.from(
-            JSON.stringify([stringColumn(last, "created_at"), stringColumn(last, "id")]),
+            JSON.stringify([
+              stringColumn(last, cursorColumns[0]),
+              stringColumn(last, cursorColumns[1]),
+            ]),
           ).toString("base64url")
         : null,
   };
@@ -679,7 +687,7 @@ export class ConversationStore {
         });
         const conversation = conversationRecord(conversations.rows[0]!, caller.scope);
         const earlier = await tx.execute({
-          sql: "SELECT runs.id, runs.principal_id, runs.sequence, runs.message_id FROM runs WHERE runs.conversation_id = ? AND runs.sequence < ? AND runs.status = 'succeeded' AND runs.result_text IS NOT NULL AND NOT EXISTS (SELECT 1 FROM ops_trace_events e WHERE e.run_id = runs.id AND e.type = 'context.excluded') ORDER BY runs.sequence DESC LIMIT 257",
+          sql: "SELECT runs.id, runs.principal_id, runs.sequence, runs.message_id, runs.status FROM runs WHERE runs.conversation_id = ? AND runs.sequence < ? AND runs.status IN ('succeeded', 'failed') AND runs.result_text IS NOT NULL AND (runs.status = 'succeeded' OR EXISTS (SELECT 1 FROM deliveries d WHERE d.run_id = runs.id AND d.status = 'sent' AND d.payload_kind IN ('text', 'result'))) AND NOT EXISTS (SELECT 1 FROM ops_trace_events e WHERE e.run_id = runs.id AND e.type = 'context.excluded') ORDER BY runs.sequence DESC LIMIT 257",
           args: [run.conversationId, row.sequence!],
         });
         const callerLocationKey = conversationScopeKey(caller.scope);
@@ -733,6 +741,7 @@ export class ConversationStore {
               callerLocationKey,
             ),
           );
+          if (stringColumn(prior, "status") === "failed" && !matchingDelivery) continue;
           if (matchingDelivery) assistant = stringColumn(matchingDelivery, "payload_text");
           else if (priorPrincipalId === caller.principalId) {
             const resultRows = await tx.execute({

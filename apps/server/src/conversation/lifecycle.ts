@@ -514,21 +514,29 @@ export class LifecycleStore {
       await this.db.transaction<AuthorizedResult<Page<DeliveryRecord>>>(async (tx) => {
         const decision = await authorizeRun(tx, caller, runId, "conversation:read");
         if ("denied" in decision) return decision;
+        // Tiebreak on rowid (insertion order), not the random id: result and artifact
+        // deliveries are created back-to-back and can share one created_at millisecond,
+        // and send order must stay deterministic across platforms.
         const rows = await tx.execute({
-          sql: "SELECT * FROM deliveries WHERE run_id = ? AND (created_at, id) > (?, ?) ORDER BY created_at, id LIMIT ?",
+          sql: "SELECT *, rowid AS delivery_sequence FROM deliveries WHERE run_id = ? AND (created_at, rowid) > (?, CAST(? AS INTEGER)) ORDER BY created_at, delivery_sequence LIMIT ?",
           args: [runId, page.afterTime, page.afterId, page.limit + 1],
         });
         return {
-          value: makePage(rows.rows, page.limit, (row) => ({
-            id: stringColumn(row, "id"),
-            runId,
-            dedupKey: stringColumn(row, "dedup_key"),
-            destinationScopeKey: stringColumn(row, "destination_scope_key"),
-            payloadText: stringColumn(row, "payload_text"),
-            payloadKind: stringColumn(row, "payload_kind") as DeliveryRecord["payloadKind"],
-            status: stringColumn(row, "status") as DeliveryStatus,
-            externalId: optionalString(row, "external_id"),
-          })),
+          value: makePage(
+            rows.rows,
+            page.limit,
+            (row) => ({
+              id: stringColumn(row, "id"),
+              runId,
+              dedupKey: stringColumn(row, "dedup_key"),
+              destinationScopeKey: stringColumn(row, "destination_scope_key"),
+              payloadText: stringColumn(row, "payload_text"),
+              payloadKind: stringColumn(row, "payload_kind") as DeliveryRecord["payloadKind"],
+              status: stringColumn(row, "status") as DeliveryStatus,
+              externalId: optionalString(row, "external_id"),
+            }),
+            ["created_at", "delivery_sequence"],
+          ),
         };
       }),
     );
