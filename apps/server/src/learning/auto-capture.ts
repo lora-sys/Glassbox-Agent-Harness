@@ -52,6 +52,8 @@ const groupRelevancePattern =
   /(?:这个群|本群|群里|群聊|在群中|this group|the group|in this group)/iu;
 const groupMemoryRequestPattern =
   /(?:记住|记下|保存|存下|加入记忆|写入记忆).{0,24}(?:这个群|本群|群里|群聊|group)|(?:这个群|本群|群里|群聊|group).{0,24}(?:记住|记下|保存|存下|记忆)/iu;
+const groupResponsePreferencePattern =
+  /(?:本群|这个群|群里).{0,12}(?:回答|回复|答复)(?:问题)?时(?:先|优先|必须|应该|需要|尽量|不要|避免)/u;
 
 /** Return a pending descriptor only for explicit, safe, user-authored signals. */
 export function classifyAutoCapture(input: AutoCaptureInput): AutoCaptureCandidate | undefined {
@@ -82,8 +84,12 @@ export function classifyAutoCapture(input: AutoCaptureInput): AutoCaptureCandida
   const preference = preferencePattern.exec(signalText);
   const rememberedText = explicitRemember?.[1]?.trim();
   const rememberedPreference = rememberedText ? preferencePattern.exec(rememberedText) : undefined;
+  const rememberedGroupResponsePreference = Boolean(
+    isGroup && rememberedText && groupResponsePreferencePattern.test(rememberedText),
+  );
   const isPreferenceSignal = Boolean(
     (rememberedPreference && preferenceVerbPattern.test(rememberedText ?? "")) ||
+    rememberedGroupResponsePreference ||
     (!explicitRemember && preference && preferenceVerbPattern.test(signalText)),
   );
   if (
@@ -101,14 +107,20 @@ export function classifyAutoCapture(input: AutoCaptureInput): AutoCaptureCandida
   }
 
   const kind = isPreferenceSignal
-    ? preferenceVerbPattern.test(text)
-      ? /更正一下|correct(?:ion)?/iu.test(text)
-        ? "explicit_correction"
-        : "explicit_preference"
-      : "group_relevance"
+    ? rememberedGroupResponsePreference
+      ? "explicit_preference"
+      : preferenceVerbPattern.test(text)
+        ? /更正一下|correct(?:ion)?/iu.test(text)
+          ? "explicit_correction"
+          : "explicit_preference"
+        : "group_relevance"
     : "explicit_remember";
   const extracted = (
-    isPreferenceSignal ? (rememberedPreference?.[1] ?? preference?.[1]) : explicitRemember?.[1]
+    isPreferenceSignal
+      ? rememberedGroupResponsePreference
+        ? rememberedText
+        : (rememberedPreference?.[1] ?? preference?.[1])
+      : explicitRemember?.[1]
   )?.trim();
   if (!extracted) return;
 

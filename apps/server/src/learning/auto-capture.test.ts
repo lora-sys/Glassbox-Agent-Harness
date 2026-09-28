@@ -77,6 +77,22 @@ describe("conservative automatic learning signal classification", () => {
     });
   });
 
+  it("captures an explicit group response preference as Taste", () => {
+    expect(
+      classifyAutoCapture(
+        privateInput("请记住：在本群回答时先给结论，再列步骤。", {
+          scope: { type: "group", connectionId: "qq-main", botId: "bot-1", groupId: "1126022432" },
+        }),
+      ),
+    ).toMatchObject({
+      status: "pending",
+      type: "preference",
+      scope: { type: "group", connectionId: "qq-main", botId: "bot-1", groupId: "1126022432" },
+      statement: "在本群回答时先给结论，再列步骤",
+      evidence: { kind: "explicit_preference", source: "current_message" },
+    });
+  });
+
   it("does not turn a private request for group memory into global Memory", () => {
     expect(classifyAutoCapture(privateInput("请记住这个群的记忆：周三集会"))).toBeUndefined();
     expect(classifyAutoCapture(privateInput("以后群里请始终用中文回复"))).toBeUndefined();

@@ -962,6 +962,7 @@ function learningTokens(text: string): string[] {
 function selectLearningContext(
   memories: readonly CanonicalMemory[],
   currentText: string,
+  scopeType: "global" | "group" | "none",
 ): Array<{ memoryId: string; type: string; statement: string }> {
   const currentTokens = new Set(learningTokens(currentText));
   const values = memories.flatMap((memory) => {
@@ -970,7 +971,13 @@ function selectLearningContext(
     const statementTokens = learningTokens(statement);
     const matches = statementTokens.filter((token) => currentTokens.has(token)).length;
     const preference = memory.type === "preference";
-    if (!preference && matches === 0) return [];
+    // Keep earlier group response directives usable after they were captured as semantic facts.
+    const groupResponsePreference =
+      scopeType === "group" &&
+      /(?:本群|这个群|群里).{0,12}(?:回答|回复|答复)(?:问题)?时(?:先|优先|必须|应该|需要|尽量|不要|避免)/u.test(
+        statement,
+      );
+    if (!preference && !groupResponsePreference && matches === 0) return [];
     return [
       {
         memoryId: memory.memoryId,
@@ -1239,7 +1246,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
           } else {
             memories = [];
           }
-          learningItems = selectLearningContext(memories, input.text);
+          learningItems = selectLearningContext(memories, input.text, learningScopeType);
           learningStatus = learningItems.length > 0 ? "loaded" : "empty";
         } catch {
           learningItems = [];

@@ -154,6 +154,49 @@ describe("Pi required Tool execution", () => {
     });
   });
 
+  it("loads a group response preference even when its words do not match the current question", async () => {
+    const f = fixture([{ status: "completed", text: "已按步骤回答。", toolCalls: [] }]);
+    f.input.caller.scope.chatType = "group";
+    f.input.caller.scope.chatId = "1126022432";
+    f.input.conversation.scope.chatType = "group";
+    f.input.conversation.scope.chatId = "1126022432";
+    f.input.text = "怎么整理桌面文件？";
+    const activeMemory = {
+      memoryId: "memory_group_response_preference",
+      type: "semantic_fact",
+      content: { statement: "在本群回答时先给结论，再列步骤" },
+      scope: {
+        type: "group",
+        connectionId: "qq",
+        botId: "bot",
+        groupId: "1126022432",
+      },
+      sensitivity: "public",
+      lifecycleState: "active",
+    } as unknown as CanonicalMemory;
+    const learningEvidence: RunEvidenceRecord[] = [];
+    const executor = new PiRunExecutionAdapter(f.runtime, {
+      learningStore: {
+        listGroupMemories: vi.fn(async () => [activeMemory]),
+        markGroupMemoriesUsed: vi.fn(async () => [activeMemory]),
+      } as unknown as LearningStore,
+      onLearningEvidence: (record) => {
+        learningEvidence.push(record);
+      },
+    });
+
+    await expect(executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(f.run.mock.calls[0]?.[2]).toContain('"statement":"在本群回答时先给结论，再列步骤"');
+    expect(learningEvidence).toContainEqual(
+      expect.objectContaining({
+        type: "learning_context",
+        scopeType: "group",
+        status: "loaded",
+        memoryIds: ["memory_group_response_preference"],
+      }),
+    );
+  });
+
   it("requires media generation for a direct drawing request", async () => {
     const f = fixture([
       {
