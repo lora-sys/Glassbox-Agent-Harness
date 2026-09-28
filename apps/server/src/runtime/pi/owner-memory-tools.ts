@@ -49,7 +49,7 @@ type OwnerMemoryToolInput = Record<string, unknown> & {
   id?: string;
   type?: MemoryType;
   statement?: string;
-  scopeType?: "global" | "project";
+  scopeType?: "global" | "project" | "group";
   projectId?: string;
   confidence?: number;
   ttlSeconds?: number;
@@ -74,10 +74,23 @@ function currentRequestInput(
   return required;
 }
 
-function scopeFrom(input: OwnerMemoryToolInput): GlassboxMemoryScope {
+function scopeFrom(
+  input: OwnerMemoryToolInput,
+  context: ProtectedToolContext,
+): GlassboxMemoryScope {
   if (input.scopeType === "project" && typeof input.projectId === "string")
     return { type: "project", projectId: input.projectId };
   if (input.scopeType === "global" && input.projectId === undefined) return { type: "global" };
+  if (input.scopeType === "group" && input.groupId) {
+    if (context.caller.scope.chatType !== "private" || !/^[1-9]\d{0,15}$/u.test(input.groupId))
+      throw new Error("invalid_memory_scope");
+    return {
+      type: "group",
+      connectionId: context.caller.scope.connectionId,
+      botId: context.caller.scope.botId,
+      groupId: input.groupId,
+    };
+  }
   throw new Error("invalid_memory_scope");
 }
 
@@ -96,14 +109,20 @@ async function ownerCommand(store: DomainStore, context: ProtectedToolContext): 
 }
 
 function commandFor(input: OwnerMemoryToolInput, scope?: GlassboxMemoryScope): string {
+  const scopeCommand = (value: GlassboxMemoryScope) =>
+    value.type === "global"
+      ? "global"
+      : value.type === "project"
+        ? `project:${value.projectId}`
+        : `group:${value.groupId}`;
   if (input.action === "write" && scope && input.type && input.statement)
-    return `/memory write ${scope.type === "global" ? "global" : `project:${scope.projectId}`} ${input.type} ${input.statement.trim()}`;
+    return `/memory write ${scopeCommand(scope)} ${input.type} ${input.statement.trim()}`;
   if (input.action === "supersede" && input.id && input.statement)
     return `/memory supersede ${input.id} ${input.statement.trim()}`;
   if (input.action === "update" && input.id && input.statement)
     return `/memory update ${input.id} ${input.statement.trim()}`;
   if (input.action === "feedback" && scope && input.signalType && input.statement)
-    return `/memory feedback ${scope.type === "global" ? "global" : `project:${scope.projectId}`} ${input.signalType} ${input.statement.trim()}`;
+    return `/memory feedback ${scopeCommand(scope)} ${input.signalType} ${input.statement.trim()}`;
   if (["promote", "reject", "expire", "revoke", "retire"].includes(input.action) && input.id)
     return `/memory ${input.action} ${input.id}`;
   return "";
@@ -184,7 +203,7 @@ async function executeMemoryActionRaw(
       return learning.listMemories(operationContext, {
         ...(input.scopeType === undefined && input.projectId === undefined
           ? {}
-          : { scope: scopeFrom(input) }),
+          : { scope: scopeFrom(input, context) }),
         includeInactive: input.includeInactive === true,
       });
     case "get":
@@ -195,7 +214,7 @@ async function executeMemoryActionRaw(
       if (typeof input.statement !== "string" || typeof input.type !== "string")
         throw new Error("memory_write_fields_required");
       {
-        const scope = scopeFrom(input);
+        const scope = scopeFrom(input, context);
         const command = await ownerCommand(store, context);
         if (
           command.startsWith("/memory write ") &&
@@ -267,7 +286,7 @@ async function executeMemoryActionRaw(
           throw new Error("memory_type_mismatch");
         if (
           input.scopeType !== undefined &&
-          JSON.stringify(scopeFrom(input)) !== JSON.stringify(existing.scope)
+          JSON.stringify(scopeFrom(input, context)) !== JSON.stringify(existing.scope)
         )
           throw new Error("memory_scope_mismatch");
         const command = await ownerCommand(store, context);
@@ -344,7 +363,7 @@ async function executeMemoryActionRaw(
     case "feedback": {
       if (!input.signalType || !feedbackSignals.includes(input.signalType) || !input.statement)
         throw new Error("invalid_feedback_input");
-      const scope = scopeFrom(input);
+      const scope = scopeFrom(input, context);
       if ((await ownerCommand(store, context)) !== commandFor(input, scope))
         throw new Error("owner_confirmation_required");
       return learning.recordFeedback(operationContext, {
@@ -381,7 +400,7 @@ async function executeMemoryActionRaw(
       return consolidator.consolidate({
         context: operationContext,
         subject: { kind: "user", id: context.caller.principalId },
-        scope: scopeFrom(input),
+        scope: scopeFrom(input, context),
         messages: [{ role: "user", text: message, ref: `run:${context.runId}` }],
       });
     }
@@ -407,7 +426,7 @@ async function executeMemoryActionRaw(
         ...(input.since === undefined ? {} : { since: input.since }),
         ...(input.until === undefined ? {} : { until: input.until }),
       });
-      const scope = scopeFrom(input);
+      const scope = scopeFrom(input, context);
       const category = input.sourceClass === "metadata" ? "group_info" : input.sourceClass;
       const candidates = [];
       for (const item of items) {
@@ -474,7 +493,7 @@ export function createOwnerMemoryTools(options: {
       name: OWNER_MEMORY_ADMIN_TOOL,
       label: "Owner Memory 管理",
       description:
-        "Owner-private Memory administration. Read with /memory list [all|global|project:id], /memory get <id>, or /memory candidates. Import an authorized QQ source as pending candidates with /memory source <global|project:id> <groupId> <history|notice|essence|metadata|file|album>. Model-originated write and supersede calls create pending candidates only. Active changes require the exact current-message commands /memory write <global|project:id> <type> <statement>, /memory update <id> <statement>, /memory supersede <id> <statement>, or /memory <promote|reject|expire|revoke|retire> <id>.",
+        "Owner-private Memory administration. Read with /memory list [all|global|project:id|group:id], /memory get <id>, or /memory candidates. Import an authorized QQ source as pending candidates with /memory source <global|project:id> <groupId> <history|notice|essence|metadata|file|album>, or use /memory source group:<id> <history|notice|essence|metadata|file|album> to keep it in that group's scope. Model-originated write and supersede calls create pending candidates only. Active changes require the exact current-message commands /memory write <global|project:id|group:id> <type> <statement>, /memory update <id> <statement>, /memory supersede <id> <statement>, or /memory <promote|reject|expire|revoke|retire> <id>.",
       parameters: Type.Object(
         {
           action: Type.Unsafe<OwnerMemoryToolInput["action"]>({
@@ -505,7 +524,10 @@ export function createOwnerMemoryTools(options: {
           ),
           statement: Type.Optional(Type.String({ minLength: 1, maxLength: 8000 })),
           scopeType: Type.Optional(
-            Type.Unsafe<"global" | "project">({ type: "string", enum: ["global", "project"] }),
+            Type.Unsafe<"global" | "project" | "group">({
+              type: "string",
+              enum: ["global", "project", "group"],
+            }),
           ),
           projectId: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })),
           confidence: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),

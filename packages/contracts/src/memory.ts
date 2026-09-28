@@ -17,7 +17,10 @@ export type MemoryType = (typeof memoryTypes)[number];
 export const lifecycleStates = ["active", "expired", "revoked", "retired"] as const;
 export type MemoryLifecycleState = (typeof lifecycleStates)[number];
 
-export type GlassboxMemoryScope = { type: "global" } | { type: "project"; projectId: string };
+export type GlassboxMemoryScope =
+  | { type: "global" }
+  | { type: "project"; projectId: string }
+  | { type: "group"; connectionId: string; botId: string; groupId: string };
 
 export interface MemorySubject {
   kind: "user" | "agent" | "org" | "task" | "session" | "custom";

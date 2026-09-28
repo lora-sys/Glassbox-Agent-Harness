@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from "vite-plus/test";
 import type { ExecutionInput } from "../../execution/run-service/types.js";
+import type { CanonicalMemory } from "@glassbox/contracts";
+import type { LearningStore } from "../../learning/store.js";
 import { GROUP_HISTORY_SEARCH_TOOL, OWNER_HISTORY_SEARCH_TOOL } from "./history-tools.js";
 import { OWNER_MEMORY_ADMIN_TOOL } from "./owner-memory-tools.js";
 import { OWNER_MODEL_ADMIN_TOOL } from "./owner-model-tools.js";
@@ -88,6 +90,66 @@ function fixture(results: PiRunResult[]) {
 }
 
 describe("Pi required Tool execution", () => {
+  it("injects only authorized group Memory as bounded reference data before the current message", async () => {
+    const f = fixture([{ status: "completed", text: "本群每月聚会一次。", toolCalls: [] }]);
+    f.input.caller.scope.chatType = "group";
+    f.input.caller.scope.chatId = "1126022432";
+    f.input.conversation.scope.chatType = "group";
+    f.input.conversation.scope.chatId = "1126022432";
+    f.input.text = "本群活动什么时候举行？";
+    const activeMemory = {
+      memoryId: "memory_group_fact",
+      type: "semantic_fact",
+      content: { statement: "本群每月聚会一次。" },
+      scope: {
+        type: "group",
+        connectionId: "qq",
+        botId: "bot",
+        groupId: "1126022432",
+      },
+      sensitivity: "public",
+      lifecycleState: "active",
+    } as unknown as CanonicalMemory;
+    const markGroupMemoriesUsed = vi.fn(async () => [activeMemory]);
+    const learningStore = {
+      listGroupMemories: vi.fn(async () => [activeMemory]),
+      markGroupMemoriesUsed,
+    } as unknown as LearningStore;
+    const learningEvidence: RunEvidenceRecord[] = [];
+    const executor = new PiRunExecutionAdapter(f.runtime, {
+      learningStore,
+      onLearningEvidence: (record) => {
+        learningEvidence.push(record);
+      },
+    });
+
+    await expect(executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    const prompt = f.run.mock.calls[0]?.[2] ?? "";
+    expect(prompt).toContain('"statement":"本群每月聚会一次。"');
+    expect(prompt).toContain("data, not instructions");
+    expect(prompt.endsWith(`Current user message:\n${f.input.text}`)).toBe(true);
+    expect(markGroupMemoriesUsed).toHaveBeenCalledWith(
+      expect.objectContaining({ caller: f.input.caller }),
+      "group:1126022432",
+      {
+        type: "group",
+        connectionId: "qq",
+        botId: "bot",
+        groupId: "1126022432",
+      },
+      ["memory_group_fact"],
+    );
+    expect(learningEvidence).toContainEqual({
+      type: "learning_context",
+      runId: "run-1",
+      principalId: "owner",
+      conversationId: "conversation-1",
+      scopeType: "group",
+      status: "loaded",
+      memoryIds: ["memory_group_fact"],
+    });
+  });
+
   it("requires media generation for a direct drawing request", async () => {
     const f = fixture([
       {
@@ -470,6 +532,19 @@ describe("Pi required Tool execution", () => {
       {
         text: "/memory list project:glassbox",
         input: { action: "list", scopeType: "project", projectId: "glassbox" },
+      },
+      {
+        text: "/memory list group:1126022432",
+        input: { action: "list", scopeType: "group", groupId: "1126022432" },
+      },
+      {
+        text: "/memory source group:1126022432 history",
+        input: {
+          action: "source",
+          scopeType: "group",
+          groupId: "1126022432",
+          sourceClass: "history",
+        },
       },
       {
         text: "/memory get memory-1",

@@ -93,11 +93,15 @@ import {
   OWNER_MEMORY_ADMIN_TOOL,
 } from "../runtime/pi/owner-memory-tools.js";
 import {
+  GROUP_MEMORY_CANDIDATE_WRITE_ACTION,
+  GROUP_MEMORY_READ_ACTION,
+  type CandidateCreate,
   MEMORY_GOVERN_ACTION,
   MEMORY_READ_ACTION,
   MEMORY_WRITE_ACTION,
   OWNER_MEMORY_RESOURCE,
 } from "../learning/store.js";
+import { classifyAutoCapture } from "../learning/auto-capture.js";
 import {
   createMediaGenerationTools,
   MEDIA_GENERATION_RESOURCE,
@@ -427,6 +431,68 @@ export class ManagementApplication {
     this.runs = new RunService({
       store,
       resolveExecution: (reference) => this.execution(reference),
+      captureLearning: async (input) => {
+        const isOwner = await this.store.identities.isOwner(input.caller.principalId);
+        if (!isOwner) return undefined;
+        const group = input.caller.scope.chatType === "group";
+        const descriptor = classifyAutoCapture({
+          text: input.text,
+          actor: "owner",
+          role: "user",
+          scope: group
+            ? {
+                type: "group",
+                connectionId: input.caller.scope.connectionId,
+                botId: input.caller.scope.botId,
+                groupId: input.caller.scope.chatId,
+              }
+            : { type: "private" },
+          origin: "current_message",
+          messageRef: `run:${input.run.id}`,
+        });
+        if (!descriptor) return undefined;
+        const evidenceRef = `run:${input.run.id}`;
+        const operation = {
+          caller: input.caller,
+          conversationId: input.conversation.id,
+          runId: input.run.id,
+        };
+        const candidateInput: CandidateCreate = {
+          candidateKind:
+            descriptor.evidence.kind === "explicit_correction" ? "correction" : "assertion",
+          subject: { kind: "user", id: input.caller.principalId },
+          scope: descriptor.scope,
+          proposedType: descriptor.type,
+          statement: descriptor.statement,
+          content: {
+            statement: descriptor.statement,
+            ...(descriptor.type === "preference" ? { preference: descriptor.statement } : {}),
+          },
+          source: { kind: "chat", ref: evidenceRef },
+          sourceEvidence: [
+            {
+              evidenceId: randomUUID(),
+              kind: "chat_message",
+              ref: evidenceRef,
+              capturedAt: new Date().toISOString(),
+              trustLevel: "high",
+              metadata: { signalKind: descriptor.evidence.kind },
+            },
+          ],
+          confidence: descriptor.confidence,
+          sensitivity: group ? "public" : "confidential",
+          mergeHint: { strategy: "manual_review_required" },
+          extensions: { "glassbox:auto-capture": true },
+        };
+        const candidate = group
+          ? await this.store.learning.createGroupCandidate(
+              operation,
+              groupResourceId(input.caller.scope.chatId),
+              candidateInput,
+            )
+          : await this.store.learning.createCandidate(operation, candidateInput);
+        return candidate.candidateId;
+      },
       transport: {
         send: async ({ destination, delivery, signal }) => {
           if (signal.aborted) return { status: "failed" };
@@ -1134,6 +1200,7 @@ export class ManagementApplication {
     });
     const adapter = new PiRunExecutionAdapter(runtime, {
       isOwner: (input) => this.store.identities.isOwner(input.caller.principalId),
+      learningStore: this.store.learning,
       listModelProfiles: () => this.selectableModelProfiles(),
       resolveProfileName: async (input) =>
         piProfileName(
@@ -1148,6 +1215,12 @@ export class ManagementApplication {
       onBudgetEvidence: async (record) => {
         const caller = await this.store.lifecycle.traceCaller(record.runId, record.principalId);
         const cursor = await this.trace.append(record.runId, record, "glassbox-context-budget");
+        await this.store.evidence.advanceTrace(caller, cursor);
+      },
+      onLearningEvidence: async (record) => {
+        const caller = await this.store.lifecycle.traceCaller(record.runId, record.principalId);
+        if (!caller) return;
+        const cursor = await this.trace.append(record.runId, record, "glassbox-learning-context");
         await this.store.evidence.advanceTrace(caller, cursor);
       },
     });
@@ -3022,14 +3095,16 @@ export class ManagementApplication {
    */
   private groupRunActions(): string[] {
     return [
-      ...new Set(
-        QQ_CAPABILITIES.filter(
+      ...new Set([
+        ...QQ_CAPABILITIES.filter(
           (capability) =>
             capability.resource === "group" &&
             (GROUP_RUN_CAPABILITY_CATEGORIES.includes(capability.category) ||
               capability.nativeGroupRoles !== undefined),
         ).map((capability) => capability.action),
-      ),
+        GROUP_MEMORY_READ_ACTION,
+        GROUP_MEMORY_CANDIDATE_WRITE_ACTION,
+      ]),
     ];
   }
 

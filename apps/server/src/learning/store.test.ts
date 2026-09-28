@@ -10,6 +10,8 @@ import { baseSchema, schemaV7Statements, schemaV8Migration } from "../persistenc
 import { MemoryConsolidator } from "./consolidation.js";
 import { candidateFromAuthorizedSource } from "./source.js";
 import {
+  GROUP_MEMORY_CANDIDATE_WRITE_ACTION,
+  GROUP_MEMORY_READ_ACTION,
   MEMORY_GOVERN_ACTION,
   MEMORY_READ_ACTION,
   MEMORY_WRITE_ACTION,
@@ -27,6 +29,10 @@ const privateScope: TrustedChannelScope = {
 const groupScope: TrustedChannelScope = { ...privateScope, chatType: "group", chatId: "group-1" };
 const owner: CallerContext = { principalId: "owner", scope: privateScope };
 const ownerGroup: CallerContext = { principalId: "owner", scope: groupScope };
+const visitorGroup: CallerContext = {
+  principalId: "visitor",
+  scope: { ...groupScope, senderId: "visitor" },
+};
 const visitor: CallerContext = {
   principalId: "visitor",
   scope: { ...privateScope, chatId: "visitor", senderId: "visitor" },
@@ -42,11 +48,17 @@ async function fixture(databasePath = ":memory:") {
   await store.identities.bindOwner("owner", groupScope);
   await store.identities.createPrincipal("visitor", "visitor");
   await store.identities.bindPrincipal("visitor", visitor.scope);
+  await store.identities.bindPrincipal("visitor", visitorGroup.scope);
   await store.authorization.registerResource({
     id: OWNER_MEMORY_RESOURCE,
     kind: "owner-memory",
     visibility: "private",
     ownerId: "owner",
+  });
+  await store.authorization.registerResource({
+    id: "group:group-1",
+    kind: "qq_group",
+    visibility: "public",
   });
   const grantIds: string[] = [];
   for (const action of [MEMORY_READ_ACTION, MEMORY_WRITE_ACTION, MEMORY_GOVERN_ACTION]) {
@@ -67,6 +79,15 @@ async function fixture(databasePath = ":memory:") {
       effect: "allow",
     });
   }
+  for (const action of [GROUP_MEMORY_READ_ACTION, GROUP_MEMORY_CANDIDATE_WRITE_ACTION]) {
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: "group:group-1",
+      action,
+      scope: groupScope,
+      effect: "allow",
+    });
+  }
   return { store, grantIds };
 }
 
@@ -81,6 +102,61 @@ afterEach(async () => {
 });
 
 describe("P4A durable learning truth", () => {
+  it("keeps group Memory isolated and pending until Owner review", async () => {
+    const { store } = await fixture();
+    const groupMemoryScope = {
+      type: "group" as const,
+      connectionId: "qq",
+      botId: "bot",
+      groupId: "group-1",
+    };
+    const candidate = await store.learning.createGroupCandidate(
+      { caller: ownerGroup },
+      "group:group-1",
+      {
+        candidateKind: "assertion",
+        subject: { kind: "user", id: "owner" },
+        scope: groupMemoryScope,
+        proposedType: "semantic_fact",
+        statement: "This group plans a monthly meetup.",
+        content: { statement: "This group plans a monthly meetup." },
+        source: { kind: "chat", ref: "run:group" },
+        sourceEvidence: [
+          {
+            evidenceId: "group-evidence",
+            kind: "chat_message",
+            ref: "run:group",
+            capturedAt: new Date().toISOString(),
+            trustLevel: "high",
+          },
+        ],
+        sensitivity: "public",
+        mergeHint: { strategy: "manual_review_required" },
+        extensions: {},
+      },
+    );
+    expect(candidate.status).toBe("pending");
+    expect(await store.learning.listMemories(context, { scope: groupMemoryScope })).toEqual([]);
+
+    const active = await store.learning.promoteCandidate(context, candidate.candidateId);
+    expect(active.scope).toEqual(groupMemoryScope);
+    expect(
+      await store.learning.listGroupMemories(
+        { caller: ownerGroup },
+        "group:group-1",
+        groupMemoryScope,
+      ),
+    ).toEqual([active]);
+
+    const siblingScope = { ...groupMemoryScope, groupId: "group-2" };
+    await expect(
+      store.learning.listGroupMemories({ caller: ownerGroup }, "group:group-1", siblingScope),
+    ).rejects.toThrow("Group memory scope mismatch");
+    await expect(
+      store.learning.listGroupMemories({ caller: visitorGroup }, "group:group-1", groupMemoryScope),
+    ).rejects.toThrow("Permission denied");
+  });
+
   it("migrates an existing schema-v6 database before opening learning stores", async () => {
     const directory = await mkdtemp(join(tmpdir(), "glassbox-learning-migration-"));
     directories.push(directory);

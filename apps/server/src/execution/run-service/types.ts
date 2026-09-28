@@ -14,6 +14,8 @@ export interface ExecutionInput {
   historyRunIds?: string[];
   historyScanTruncated?: boolean;
   historyOmittedRunIds?: string[];
+  /** Bounded, active, authorized learning records selected for this exact Run scope. */
+  learningContext?: readonly { memoryId: string; type: string; statement: string }[];
   /** Only present when saved for this exact execution configuration and Conversation. */
   providerSessionId: string | null;
   signal: AbortSignal;
@@ -86,6 +88,13 @@ export type RunServiceEvent =
       reason: string;
     }
   | {
+      type: "learning_candidate_created";
+      runId: string;
+      conversationId: string;
+      candidateId: string;
+      scopeType: "global" | "group";
+    }
+  | {
       type: "recovered";
       interruptedRunIds: string[];
       unknownRunIds: string[];
@@ -110,6 +119,8 @@ export interface RunServiceOptions {
     artifactIds?: readonly string[];
     mediaAssetIds?: readonly string[];
   }>;
+  /** Creates pending learning evidence after current Run authorization and before inference. */
+  captureLearning?: (input: ExecutionInput) => Promise<string | undefined>;
   /** Fixed diagnostic codes only; provider errors and protected payloads are excluded. */
   onError?: (error: {
     code: "dispatch_failed" | "delivery_failed" | "evidence_failed";

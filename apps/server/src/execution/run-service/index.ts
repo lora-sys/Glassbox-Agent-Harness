@@ -367,10 +367,29 @@ export class RunService {
         if (active.controller.signal.aborted) {
           result = { status: "cancelled" };
         } else {
-          result = await adapter.execute({
+          const executionInput = {
             ...input,
             caller: structuredClone(caller),
             signal: active.controller.signal,
+          };
+          if (this.options.captureLearning) {
+            try {
+              const candidateId = await this.options.captureLearning(executionInput);
+              if (candidateId) {
+                await this.emit({
+                  type: "learning_candidate_created",
+                  runId,
+                  conversationId: input.conversation.id,
+                  candidateId,
+                  scopeType: caller.scope.chatType === "group" ? "group" : "global",
+                });
+              }
+            } catch {
+              this.report("evidence_failed", runId);
+            }
+          }
+          result = await adapter.execute({
+            ...executionInput,
           });
         }
       }
