@@ -213,6 +213,217 @@ describe("Pi required Tool execution", () => {
     expect(f.run).not.toHaveBeenCalled();
   });
 
+  it("requires media generation when the owner selects an image after a clarification", async () => {
+    const f = fixture([
+      {
+        status: "completed",
+        text: "图片已生成。",
+        toolCalls: [{ name: "media_generate", input: { action: "image" }, failed: false }],
+      },
+    ]);
+    f.input.text = "图片";
+    f.input.history = [
+      { role: "user", text: "给我生成一个小猫" },
+      {
+        role: "assistant",
+        text: "请说明你想要图片、视频，还是文字描述。当前请求未执行。",
+      },
+    ];
+
+    await f.executor.execute(f.input);
+
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe("media_generate");
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({ action: "image" });
+  });
+
+  it("recognizes an image selection followed by a short request", async () => {
+    const f = fixture([
+      {
+        status: "completed",
+        text: "图片已生成。",
+        toolCalls: [{ name: "media_generate", input: { action: "image" }, failed: false }],
+      },
+    ]);
+    f.input.text = "图片！给我";
+    f.input.history = [
+      { role: "user", text: "给我生成一个小猫" },
+      {
+        role: "assistant",
+        text: "请说明你想要图片、视频，还是文字描述。当前请求未执行。",
+      },
+    ];
+
+    await f.executor.execute(f.input);
+
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe("media_generate");
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({ action: "image" });
+  });
+
+  it("does not treat a short image answer as a new media request without the clarification context", async () => {
+    const f = fixture([{ status: "completed", text: "你想生成什么图片？", toolCalls: [] }]);
+    f.input.text = "图片";
+
+    await f.executor.execute(f.input);
+
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBeUndefined();
+  });
+
+  it("does not reuse an old media clarification after an unrelated exchange", async () => {
+    const f = fixture([{ status: "completed", text: "你想生成什么图片？", toolCalls: [] }]);
+    f.input.text = "图片";
+    f.input.history = [
+      { role: "user", text: "给我生成一个小猫" },
+      {
+        role: "assistant",
+        text: "请说明你想要图片、视频，还是文字描述。当前请求未执行。",
+      },
+      { role: "user", text: "顺便告诉我现在时间" },
+      { role: "assistant", text: "当前时间是下午两点。" },
+    ];
+
+    await f.executor.execute(f.input);
+
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBeUndefined();
+  });
+
+  it("rejects an explicit group image request before starting the runtime", async () => {
+    const f = fixture([]);
+    f.input.text = "给我生成一只奶牛猫的图片。";
+    f.input.caller.scope.chatType = "group";
+
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "failed",
+      text: "当前群聊未开放图片和视频生成，未执行。",
+    });
+    expect(f.run).not.toHaveBeenCalled();
+  });
+
+  it("asks for an output type instead of treating a short generation request as prose", async () => {
+    for (const chatType of ["group", "private"] as const) {
+      const f = fixture([]);
+      f.input.text = "给我生成一个小猫";
+      f.input.caller.scope.chatType = chatType;
+
+      await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+        status: "failed",
+        text: "请说明你想要图片、视频，还是文字描述。当前请求未执行。",
+      });
+      expect(f.run).not.toHaveBeenCalled();
+    }
+  });
+
+  it("leaves a group text description request to the runtime", async () => {
+    const f = fixture([{ status: "completed", text: "一只小猫的文字描述。", toolCalls: [] }]);
+    f.input.text = "用文字描述一只小猫";
+    f.input.caller.scope.chatType = "group";
+
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "succeeded",
+      text: "一只小猫的文字描述。",
+    });
+    expect(f.run).toHaveBeenCalledOnce();
+  });
+
+  it("does not block text artifacts or a question about image generation", async () => {
+    for (const text of [
+      "生成一个小猫故事",
+      "生成一张图片的提示词",
+      "生成图片的文字描述",
+      "写一段生成图片的代码",
+      "你能生成图片吗？",
+      "能生成图片吗",
+      "你现在能生成图片吗",
+      "请问你现在能生成图片吗",
+      "把‘生成图片’翻译成英文",
+      "解释一下‘生成图片’是什么意思",
+    ]) {
+      const f = fixture([{ status: "completed", text: "文字回复", toolCalls: [] }]);
+      f.input.text = text;
+      f.input.caller.scope.chatType = "group";
+
+      await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+        status: "succeeded",
+        text: "文字回复",
+      });
+      expect(f.run).toHaveBeenCalledOnce();
+    }
+  });
+
+  it("does not turn a refusal into a media tool requirement", async () => {
+    for (const text of ["不要生成图片", "别生成视频", "别帮我生成图片"]) {
+      const f = fixture([{ status: "completed", text: "未生成。", toolCalls: [] }]);
+      f.input.text = text;
+
+      await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+        status: "succeeded",
+        text: "未生成。",
+      });
+      expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBeUndefined();
+    }
+  });
+
+  it("requires video when images are only part of the requested video", async () => {
+    const f = fixture([
+      {
+        status: "completed",
+        text: "视频已生成。",
+        toolCalls: [{ name: "media_generate", input: { action: "video" }, failed: false }],
+      },
+    ]);
+    f.input.text = "生成一段由图片组成的视频";
+
+    await f.executor.execute(f.input);
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({ action: "video" });
+  });
+
+  it("requires the positive image request after a refused video request", async () => {
+    const f = fixture([
+      {
+        status: "completed",
+        text: "图片已生成。",
+        toolCalls: [{ name: "media_generate", input: { action: "image" }, failed: false }],
+      },
+    ]);
+    f.input.text = "不要生成视频但生成图片";
+
+    await f.executor.execute(f.input);
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({ action: "image" });
+  });
+
+  it("uses the requested artifact rather than words describing its contents", async () => {
+    for (const [text, action] of [
+      ["生成故事插画", "image"],
+      ["生成一张代码示意图片", "image"],
+      ["用视频封面生成一段视频", "video"],
+    ] as const) {
+      const f = fixture([
+        {
+          status: "completed",
+          text: "已生成。",
+          toolCalls: [{ name: "media_generate", input: { action }, failed: false }],
+        },
+      ]);
+      f.input.text = text;
+
+      await f.executor.execute(f.input);
+      expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({ action });
+    }
+  });
+
+  it("requires an image for a video cover", async () => {
+    const f = fixture([
+      {
+        status: "completed",
+        text: "封面已生成。",
+        toolCalls: [{ name: "media_generate", input: { action: "image" }, failed: false }],
+      },
+    ]);
+    f.input.text = "生成一张视频封面";
+
+    await f.executor.execute(f.input);
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({ action: "image" });
+  });
+
   it("names a missing browser screenshot without blaming QQ", async () => {
     const noTools = { status: "completed" as const, text: "截图已完成。", toolCalls: [] };
     const f = fixture([noTools, noTools]);

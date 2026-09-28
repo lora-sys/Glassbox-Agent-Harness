@@ -5,403 +5,188 @@
 </p>
 
 <p align="center">
-  <a href="#-开源协议"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License" /></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License" /></a>
   <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/Node.js-%3E%3D24.12.0-green.svg" alt="Node.js" /></a>
   <a href="https://vite.dev/"><img src="https://img.shields.io/badge/Toolchain-Vite%2B-purple.svg" alt="Vite+" /></a>
-  <a href="./.plans/03-personal-agent-foundation.md"><img src="https://img.shields.io/badge/Stage-Plan%2003%20Done-success.svg" alt="Stage" /></a>
+  <a href="./.plans/roadmap.md"><img src="https://img.shields.io/badge/Stage-P6%20%E5%BC%80%E5%8F%91%E4%B8%AD-orange.svg" alt="Stage" /></a>
 </p>
 
 ---
 
-> **Glassbox 是一个具备显式身份、严格授权、持久化会话、可审查执行、任务闭环与多代理调度的 Personal Agent 系统。**
+Glassbox 是一个 Personal Agent 系统：显式身份、严格授权、持久化会话、可审查执行、任务闭环。
 
-你通过 Workbench、QQ 和未来其他 Channel 使用同一个主 Agent。它可以直接回答，也可以把需要真实执行的工作登记成 Task，交给 Herdr 中的 Pi、Codex、Claude Code 等 coding worker。
+你通过 QQ、Workbench（开发中）和同一个主 Agent 对话。它可以直接回答，也可以把需要真实执行的工作登记成 Task，交给 Herdr 里的 Pi、Codex、Claude Code 等 coding worker。Glassbox 管的是产品真相：身份、权限、Conversation、Task、Taste、Memory、Trace，以及每一条结果能不能发给当前 Audience。
 
-Glassbox 管理的是产品真相：身份、权限、Conversation、Task、Taste、Memory、Trace，以及结果能不能发送给当前 Audience。
+## 已经能跑的能力
 
----
+以下能力已合入 main，有确定性测试和真实验收覆盖：
 
-## 📑 目录
+- **QQ 私聊与群聊接入**。NapCat / OneBot 通道，支持群管理员的原生授权。
+- **四道服务端硬 Gate**。Ingress、Context、Tool / Ops、Delivery 依次把关，权限只有 ALLOW、DENY、REQUIRES_APPROVAL 三种结果，没有显式 Grant 一律 DENY。
+- **Task 生命周期闭环**。派发给 Herdr coding worker 时分配独立隔离分支和独立 worktree，worker 完成后必须经过人工 Review，Accept 才算 DONE，Rework 则开新的 TaskAttempt。
+- **Taste / Memory 持久学习**。受治理的学习真相落库，不是写在 prompt 里的口头记忆。
+- **授权检索**。QQ 历史消息搜索，引用必须来自官方来源。
+- **上下文预算与运行时路由**。按任务和 Audience 控制注入的上下文与技能面。
+- **双 Owner 协同**。主 Owner 与协同 Owner 身份对等，私聊会话在数据库中物理隔离，派发的编码任务互不踩踏。
 
-- [🌟 核心理念与分工](#-核心理念与分工)
-- [🏁 当前开发阶段](#-当前开发阶段)
-  - [1. Personal Agent 闭环](#1-personal-agent-闭环)
-  - [2. Agent Operations 闭环](#2-agent-operations-闭环)
-- [🧭 核心三层关系：Pi、Lora PI Kit、Glassbox](#-核心三层关系pi-lora-pi-kit-glassbox)
-  - [Pi](#pi)
-  - [Lora PI Kit](#lora-pi-kit)
-  - [Glassbox](#glassbox)
-- [🧩 技能、MCP 与 Profiles](#-技能-mcp-与-profiles)
-- [🤖 Herdr Agent Operations](#-herdr-agent-operations)
-- [🔒 权限是硬边界](#-权限是硬边界)
-- [👥 双人协同与双 Owner 架构](#-双人协同与双-owner-架构)
-- [⚡ 快速上手与本地开发](#-快速上手与本地开发)
-- [🚀 给合作开发者（及其 Coding Agent）的快速接入指南](#-给合作开发者及其-coding-agent的快速接入指南)
-- [🗺️ Roadmap 与文档索引](#️-roadmap-与文档索引)
-- [📜 开源协议](#-开源协议)
+Web 管理端和 P6 长任务还在开发中，见[当前开发状态](#当前开发状态)。
 
----
+## 系统架构
 
-## 🌟 核心理念与分工
+```mermaid
+flowchart LR
+    QQ[QQ 私聊 / 群聊] --> OB[NapCat / OneBot]
+    WB[Workbench Web<br/>开发中] --> GB
+    OB --> GB
 
-| 核心组件 | 角色定位 | 核心职责 |
+    subgraph GB[Glassbox 控制面]
+        direction TB
+        G1[Ingress / Context Gate]
+        G2[Identity / Authorization]
+        G3[Task / TaskAttempt]
+        G4[Taste / Memory]
+        G5[Delivery Gate]
+    end
+
+    GB -- Pi SDK --> PI[Pi Agent Engine]
+    PI --> KIT[Lora PI Kit Profile]
+    KIT --> T[Skills / MCP / Tools]
+    GB -- HerdrBridge --> H[Herdr Workers<br/>worktree / pane]
+    GB --> DB[(Turso 持久状态 / Trace)]
+    G5 --> QQ
+```
+
+| 组件 | 角色 | 职责 |
 | :--- | :--- | :--- |
-| **Glassbox** | **Personal Agent 系统** | **产品真相**：身份、权限、会话、Task、Taste、Memory、Trace、投递决策 |
-| **Pi** | **Agent Engine** | 基础运行能力：Agent loop、会话管理、模型接入、SDK 驱动 |
-| **Lora PI Kit** | **Pi Distribution** | 运行分发包：Package 清单、技能快照、扩展、MCP 适配、Profiles |
-| **Herdr** | **Coding Worker 宿主** | 执行现场：工作区（Workspace）、工作树（Worktree）、Pane、终端进程 |
-| **Channel** | **接入端点** | 外部入口（QQ、Workbench、API 等），并非独立的 Agent |
-| **Canvas** | **Projection** | 可视化检查面与工作空间，**不是执行状态真相** |
+| Glassbox | Personal Agent 系统 | 产品真相：身份、权限、会话、Task、Taste、Memory、Trace、投递决策 |
+| Pi | Agent Engine | Agent loop、会话、模型接入、SDK。Glassbox 通过 `@earendil-works/pi-coding-agent` SDK 嵌入 |
+| Lora PI Kit | Pi Distribution | 把裸 Pi 一次安装成完整工作环境：技能快照、扩展、MCP 适配、Profiles、兼容锁 |
+| Herdr | Coding Worker 宿主 | 执行现场：Workspace、Worktree、Pane、终端进程 |
+| Channel | 接入端点 | QQ、Workbench、API 等外部入口，不是独立 Agent |
+| Canvas | Projection | 可视化检查面，不是执行状态真相 |
+
+要点：Channel 只是入口，Pi 是引擎，Kit 是分发，Herdr 是执行现场。Glassbox 才是 Personal Agent 系统，这些产品真相不能被 Pi Profile、Skill、MCP 或模型输出替代。
+
+## 权限是硬边界
+
+权限不靠 prompt。Authorization 只有三种确定性结果：
 
 ```text
-Channel 只是入口
-Pi 是 Agent 引擎
-Lora PI Kit 是 Lora 的 Pi Distribution
-Herdr 是 coding worker 执行现场
-Canvas 是 Projection
-Glassbox 才是 Personal Agent 系统
+ALLOW / DENY / REQUIRES_APPROVAL
 ```
 
----
+没有明确 Grant 就是 DENY。每一次受保护操作都要能回答 Who、Where、What、How、Resource、Audience、Conversation、Run / Task。
 
-## 🏁 当前开发阶段
-
-[`Plan 03 — QQ Personal Agent Closed Loop`](./.plans/03-personal-agent-foundation.md) 已完成。
-
-P3 已完成两个连在一起的真实闭环。完成证据记录在 Active Plan 的 Completion evidence 中：
-- **确定性测试**：覆盖身份、权限、Conversation、Task、Review、Rework、Accept、重启、重连、去重、投递和 Raw Trace。
-- **真实验收**：覆盖 QQ 私聊与群聊、Pi 加载 Lora PI Kit，以及 Herdr Worker 的完整 Task 生命周期。
-
-### 1. Personal Agent 闭环
+核心原则是**能读不等于能发**。Owner 在私聊能读取自己的私人数据，不代表这些数据可以发进 QQ 群。以下概念相互独立：
 
 ```text
-QQ 私聊 / 群聊
-        ↓
-NapCat / OneBot
-        ↓
-Glassbox
-  Identity
-  Authorization
-  Conversation
-  Context Gate
-        ↓
-Pi SDK
-        ↓
-Pi + Lora PI Kit profile
-        ↓
-Tool / Ops Gate
-        ↓
-Delivery Gate
-        ↓
-QQ 回复
-        ↓
-Turso + Raw Trace
+Conversation ≠ Pi Session
+Pi Session ≠ Run
+Task ≠ Run
+Task ≠ Worker
+TaskAttempt ≠ Herdr pane
+Herdr state ≠ Task acceptance
 ```
 
-### 2. Agent Operations 闭环
+## Agent Operations
 
-```text
-用户请求
-  ↓
-Main Agent
-  ↓
-Task / Attention
-  ↓
-Authorized Ops Tools
-  ↓
-HerdrBridge
-  ↓
-Herdr worker / worktree / pane
-  ↓
-working / blocked / done
-  ↓
-OpsReconciler
-  ↓
-TaskAttempt / WorkerBinding
-  ↓
-Review
-  ├─ Accept → DONE
-  └─ Rework → 下一次 Attempt
+Glassbox 与 Herdr 双向通信：下行创建 worktree、启动 Agent、授权跟进或取消；上行回报 workspace / pane 变化、working / blocked / done、worker 掉线与恢复。
+
+```mermaid
+stateDiagram-v2
+    [*] --> Task: 用户请求
+    Task --> TaskAttempt: 派发
+    TaskAttempt --> Worker: 绑定独立 worktree
+    Worker --> REVIEW: Herdr done
+    REVIEW --> DONE: Accept
+    REVIEW --> TaskAttempt: Rework，开新 Attempt
+    DONE --> [*]
 ```
 
 > [!IMPORTANT]
-> 完整施工顺序和 Completion Gate 只看 [`/.plans/03-personal-agent-foundation.md`](./.plans/03-personal-agent-foundation.md)。
+> Herdr agent = done 不等于 Glassbox Task = DONE。正常路径必须经过 REVIEW，Accept 或 Rework 由人决定。
 
----
+## 当前开发状态
 
-## 🧭 核心三层关系：Pi、Lora PI Kit、Glassbox
+| 阶段 | 内容 | 状态 |
+| :--- | :--- | :--- |
+| P3 | QQ Personal Agent + Agent Ops 闭环 | 已完成 |
+| P4A | Taste / Memory 持久学习真相 | 已完成 |
+| P4B | 授权检索与 QQ 历史搜索 | 已完成 |
+| P5A / P5B | 上下文预算、运行时路由与可观测性 | 已完成 |
+| Web 管理端 | Workbench 与管理界面（design freeze v2） | 开发中 |
+| P6 | 持久长任务与 Worker | 开发中 |
+| P7 / P8 | 更多 Channel、评测、技能演化 | 规划中 |
 
-这是系统最重要的 Runtime 架构定义：
+完整 Roadmap 见 [`.plans/roadmap.md`](./.plans/roadmap.md)，各阶段施工顺序与验收证据见 [`.plans/`](./.plans/) 下对应的 plan 文件。
 
-```text
-Pi
-  Agent Engine
+## 快速开始
 
-Lora PI Kit
-  My Pi Distribution
+环境要求：
 
-Glassbox
-  My Personal Agent System
-```
-
-### Pi
-Pi 提供基础运行能力：
-- Agent loop、sessions
-- model / provider support
-- coding tools
-- Packages、Extensions、Skills、Prompt Templates、settings
-- SDK 与 RPC 接口
-
-Glassbox P3 直接通过 `@earendil-works/pi-coding-agent` SDK 嵌入 Pi。
-
-### Lora PI Kit
-Lora PI Kit 不是几个零散配置文件。它的目标是：
-> **把刚安装好的裸 Pi，一次安装变成 Lora 自己的完整 Pi 工作环境。**
-
-目标内容包括：
-- Pi Package manifest
-- Lora Skills snapshot、Extensions、Prompt Templates、Profiles
-- MCP adapter / registry、model / thinking defaults
-- Glassbox bridges、Taste / Feedback / Trace hooks
-- settings / model templates、install / update / doctor / sync tooling、compatibility locks
-
-完整定义见 [`docs/lora-pi-kit.md`](./docs/lora-pi-kit.md)。
-
-### Glassbox
-Glassbox 负责：
-- Agent identity、Principal、Authorization、Conversation
-- Task / TaskAttempt / Attention、WorkerBinding
-- Taste / Memory truth、Audience / Delivery policy
-- Turso durable state、Run、Raw Trace
-
-**这些产品真相不能被 Pi Profile、Skill、MCP、Extension、Herdr 状态或模型输出替代。**
-
----
-
-## 🧩 技能、MCP 与 Profiles
-
-### Lora Skills
-[`lora-sys/skills`](https://github.com/lora-sys/skills) 是 Lora Skills 的源码真相。Lora PI Kit Release 会内置一份锁定版本的 Skills Snapshot：
-
-```text
-lora-sys/skills (canonical source)
-        ↓ sync-skills
-lora-pi-kit/skills
-        ↓
-skills.lock.json
-        ↓
-Kit Release
-```
-
-同一个 Kit 版本在本地、测试和 Linux Server 上得到相同的 Skill 集合。
-> [!NOTE]
-> **内置全部能力 ≠ 每次把全部 Skill 注入模型**。Profile 和当前 Task 决定真正启用哪些 Skills。
-
-### MCP
-Pi Core 不要求内置 MCP。Lora PI Kit 负责通过 Extension / Package 方式提供自己的 MCP Layer：
-
-```text
-Pi → Lora PI Kit MCP Adapter → MCP Registry → Profile 选择需要的 Integration → Tools
-```
-
-- **按需连接**：不会一启动就连接所有 MCP。
-- **权限隔离**：MCP Tool 存在，不等于当前 QQ Principal 有权限调用。
-
-### Profiles
-Lora PI Kit 使用 Profile 区分同一个 Distribution 的不同运行角色：
-- `local-coding`：较完整 coding / GitHub / browser 能力
-- `main-agent`：核心 Product / Ops 能力
-- `owner-direct`：Owner 直连通道
-- `qq-group`：最小化 Tool / MCP Surface
-- `herdr-worker`：当前 Task 真正需要的专项能力
-- `test`：确定性测试专用
-
-> [!WARNING]
-> Profile 可以决定启用哪些能力，但**不能扩大 Glassbox Authorization**。
-
----
-
-## 🤖 Herdr Agent Operations
-
-Herdr 是 coding worker 的实时执行层。Glassbox 和 Herdr 双向通信：
-
-```text
-Glassbox → Herdr
-  create / open worktree
-  start Agent
-  prompt / wait / read
-  authorized follow-up / cancel
-
-Herdr → Glassbox
-  workspace / worktree / pane changes
-  working / blocked / done
-  worker replaced / disappeared
-  connection lost / restored
-```
-
-> [!CAUTION]
-> **Herdr agent = done ≠ Glassbox Task = DONE**  
-> 正常路径必须经历：`Herdr done` → `Task = REVIEW` → `Accept → DONE` 或 `Rework → 新 TaskAttempt`。
-
-详细规则见 [`docs/agent-operations.md`](./docs/agent-operations.md)。
-
----
-
-## 🔒 权限是硬边界
-
-权限不能靠 Prompt。Authorization 只有三种确定性结果：
-```text
-ALLOW
-DENY
-REQUIRES_APPROVAL
-```
-
-**没有明确 Grant 就是 `DENY`。**
-
-每一次受保护操作都必须能明确回答：`Who`、`Where`、`What`、`How`、`Resource`、`Audience`、`Conversation`、`Run / Task`。
-
-### 四道服务端硬 Gate
-
-```text
-Ingress Gate → Context Gate → Tool / Ops Gate → Delivery Gate
-```
-
-- **核心原则**：`能读 ≠ 能发给当前 Audience`。Owner 在私聊能读取自己的私人数据，不代表这些数据可以发进 QQ 群。
-- **概念独立**：
-  ```text
-  Conversation ≠ Pi Session
-  Pi Session ≠ Run
-  Task ≠ Run
-  Task ≠ Worker
-  TaskAttempt ≠ Herdr pane
-  Herdr state ≠ Task acceptance
-  ```
-
----
-
-## 👥 双人协同与双 Owner 架构
-
-本项目支持两人协作开发与对等测试。
-
-1. **身份对等**：主 Owner（`OWNER_QQ`）与协同 Owner（`CO_OWNER_QQ`）均映射为最高特权的主体（`kind = 'owner'`），在群聊与系统中拥有完整的操作、派工、审批与管理权限。
-2. **私聊绝对隔离**：两人的私聊会话具有独立的 `scopeKey`（含各自的 QQ 号），在数据库 `conversations` 表中物理独立，私有资产和私聊上下文互不相通。
-3. **工作空间防碰撞**：向 Herdr 派发编码任务（Task）时，每个 TaskAttempt 的 `worker_bindings` 均分配独立的隔离分支（如 `herdr/task-<principalId>-<taskId>`）和独立 worktree 工作目录，两人派发的编码任务互不踩踏。
-
----
-
-## ⚡ 快速上手与本地开发
-
-### 1. 软件环境要求
-- **Node.js**：`>= 24.12.0`
-- **npm**：`12.0.2`，见根目录 `package.json`
-- **统一工具链**：Vite+，命令入口为 `vp`
-- **NapCat / OneBot**：真实 QQ 收发验收时需要
-- **Herdr**：配置 coding Worker 时需要
-- **Lora PI Kit**：配置使用 `pi:*` Runtime 的 Channel 时需要
-
-### 2. 初始化步骤
-
-```bash
-# 1. 安装仓库依赖
-vp install
-
-# 2. 根据需要配置服务启动项
-# 默认读取 %USERPROFILE%\.glassbox\service-launch.json
-# 配置格式见 docs/service-launch.example.json
-
-# 3. 运行提交门禁
-vp run verify:commit
-```
-
-不要把 QQ、NapCat 或模型凭据写入 `.env`、启动命令或版本库。Channel 和模型凭据应通过 Glassbox 管理界面或 CLI 保存。详细配置说明见 [本地服务启动](./docs/tech-stack.md#repository-toolchain)。
-
-### 3. 服务进程管理
-
-```bash
-# 启动和管理本地服务
-npm run agent:up
-
-# 查看服务状态与健康度
-npm run agent:status
-
-# 查看实时运行日志
-npm run agent:logs
-
-# 停止服务
-npm run agent:down
-```
-
-启动器总是配置并启动 Glassbox；只有 `service-launch.json` 中配置了 NapCat 或 Herdr 时才会启动它们。Windows 下不要用 `vp run agent:up` 管理长驻服务。Vite+ 任务结束时会清理脱离的子进程。NapCat 登录恢复、服务边界和安全停止行为见 [工具链与本地开发](./docs/tech-stack.md#repository-toolchain)。
-
----
-
-## 🚀 给合作开发者（及其 Coding Agent）的快速接入指南
-
-新环境可以克隆仓库并安装依赖。已有工作树必须先检查分支和本地改动。服务启动不会自动拉取代码、切换分支或写入凭据：
-
-新环境：
+- Node.js >= 24.12.0，npm 12.0.2
+- 统一工具链 Vite+，命令入口 `vp`
+- 真实 QQ 收发验收需要 NapCat / OneBot
+- 配置 coding Worker 需要 Herdr；使用 `pi:*` Runtime 的 Channel 需要 Lora PI Kit
 
 ```bash
 git clone https://github.com/lora-sys/Glassbox-Agent-Harness.git
 cd Glassbox-Agent-Harness
+
+# 安装依赖
 vp install
+
+# 运行提交门禁
 vp run verify:commit
 ```
 
-已有工作树更新时，先确认工作区干净、分支正确，再执行 fast-forward 更新：
+服务进程管理（Windows 下不要用 `vp run agent:up` 管理长驻服务）：
+
+```bash
+npm run agent:up      # 启动
+npm run agent:status  # 状态与健康度
+npm run agent:logs    # 实时日志
+npm run agent:down    # 停止
+```
+
+启动器只负责启动 Glassbox，`service-launch.json` 里配置了 NapCat 或 Herdr 才会一并启动。它不会自动拉代码、切分支、装依赖或写凭据。QQ、NapCat、模型凭据不要进 `.env`、启动命令或版本库，通过 Glassbox 管理界面或 CLI 保存。配置格式见 [`docs/service-launch.example.json`](./docs/service-launch.example.json)。
+
+已有工作树更新时，先确认工作区干净、分支正确，再 fast-forward：
 
 ```bash
 git status --short --branch
 git fetch origin
-# 仅在工作区干净且当前分支目标正确时执行
-git pull --ff-only
+git pull --ff-only   # 仅在工作区干净且分支目标正确时执行
 vp install
 vp run verify:commit
 ```
 
-本地服务配置见 [`docs/service-launch.example.json`](./docs/service-launch.example.json)。在 Windows 上用 `npm run agent:up`、`npm run agent:status`、`npm run agent:logs` 和 `npm run agent:down` 管理服务。启动器不会更新 Git 工作树、切换分支、安装依赖或写入 Channel 凭据。
-
----
-
-## 🗺️ Roadmap 与文档索引
-
-### 阶段规划
-- **P3（已完成）**：QQ Personal Agent + Agent Ops Closed Loop
-- **P4**：Memory, Taste and Authorized Retrieval
-- **P5**：Efficient Runtime and Observability
-- **P6**：Durable Long Work and Workers
-- **P7**：More Channels and Personal Domains
-- **P8**：Eval, Learning, Assets and Skill Evolution
-
-详细 Roadmap 参见 [`/.plans/roadmap.md`](./.plans/roadmap.md)。
-
-### 文档导航
+## 文档索引
 
 | 文档 | 说明 |
 | :--- | :--- |
-| [`AGENTS.md`](./AGENTS.md) | **项目稳定不变量与核心准则** |
-| [`.plans/03-personal-agent-foundation.md`](./.plans/03-personal-agent-foundation.md) | 当前 P3 施工顺序和验收证据 |
+| [`AGENTS.md`](./AGENTS.md) | 项目稳定不变量与核心准则，进仓库先读这个 |
+| [`.plans/roadmap.md`](./.plans/roadmap.md) | 产品 Roadmap 与阶段顺序 |
 | [`docs/runtime-strategy.md`](./docs/runtime-strategy.md) | Runtime 归属权与 Pi SDK 边界 |
 | [`docs/lora-pi-kit.md`](./docs/lora-pi-kit.md) | Lora PI Kit 规范与 Profiles 体系 |
 | [`docs/agent-operations.md`](./docs/agent-operations.md) | Herdr、Task、Worker 协调机制 |
 | [`docs/memory-taste.md`](./docs/memory-taste.md) | Rules、Skills、Taste 与 Memory 体系 |
+| [`docs/owner-pi-sandbox.md`](./docs/owner-pi-sandbox.md) | Owner Pi 沙箱 |
 | [`docs/tech-stack.md`](./docs/tech-stack.md) | 技术栈、Vite+ 工具链与部署规范 |
 | [`docs/data-observability.md`](./docs/data-observability.md) | 持久化数据、存储与可观测性 |
+| [`docs/ui-design.md`](./docs/ui-design.md) | Workbench UI 设计 |
 | [`upstream/*/SOURCES.md`](./upstream/) | 上游调研与来源说明 |
 
-### Coding Agent 阅读顺序
+进入本仓库工作的 Coding Agent 按此顺序阅读：
 
-进入本仓库工作的 Coding Agent 必须严格按此顺序阅读：
 ```text
 AGENTS.md
-→ Active Plan (.plans/03-personal-agent-foundation.md)
+→ 当前 Active Plan（.plans/ 下对应文件）
 → 当前任务对应 docs/*.md
-→ relevant upstream notes
+→ 相关 upstream notes
 → production code + focused tests
 ```
 
----
+## 开源协议
 
-## 📜 开源协议
-
-本项目采用 MIT 协议。详见 [`LICENSE`](./LICENSE)。
+MIT。详见 [`LICENSE`](./LICENSE)。

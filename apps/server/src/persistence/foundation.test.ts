@@ -480,6 +480,35 @@ describe("local domain foundation", () => {
     expect((await reopened.identities.resolve(group))?.principalId).toBe("owner");
   });
 
+  it("keeps delivery creation order when created_at values tie", async () => {
+    const store = await fixture();
+    const running = await receive(store, "running");
+    const kinds = ["result", "browser_artifact", "ack", "media_artifact", "text"] as const;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(new Date("2026-09-28T12:00:00.000Z"));
+      const payloads = [
+        "result text",
+        "3f2b8c4a-1d5e-4f6a-9b7c-8d2e1f0a3b4c",
+        "ack text",
+        "7c9e5a1b-2f4d-4a8c-b3e6-1d0f5a9c8e2b",
+        "plain text",
+      ];
+      for (const [index, kind] of kinds.entries())
+        await store.lifecycle.createDelivery(ownerGroup, {
+          runId: running.run.id,
+          dedupKey: `tie-${index}`,
+          destination: group,
+          payloadText: payloads[index]!,
+          payloadKind: kind,
+        });
+    } finally {
+      vi.useRealTimers();
+    }
+    const deliveries = (await store.lifecycle.listDeliveries(ownerGroup, running.run.id)).items;
+    expect(deliveries.map((delivery) => delivery.payloadKind)).toEqual([...kinds]);
+  });
+
   it("bounds queries, preserves stable pagination and enforces foreign keys", async () => {
     const store = await fixture();
     const runs = [];
