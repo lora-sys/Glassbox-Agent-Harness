@@ -148,6 +148,50 @@ describe("shared group conversation and durable actor routing", () => {
     ]);
   });
 
+  it("does not include a failed result delivered only outside the current Conversation location", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "glassbox-failed-context-audience-"));
+    tempDirectories.push(directory);
+    const store = await setupStore(join(directory, "state.db"));
+    const clarification = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: ownerPrivate.scope,
+      messageId: "failed-audience-source",
+      text: "Give me a cat",
+      executionRef: "pi:test",
+    });
+    const lease = await store.lifecycle.claimQueuedRun(ownerPrivate, clarification.run.id);
+    await lease.settle("failed", "PRIVATE_FAILED_RESULT");
+    const db = createClient({ url: localDatabaseUrl(join(directory, "state.db")) });
+    try {
+      const now = new Date().toISOString();
+      await db.execute({
+        sql: "INSERT INTO deliveries(id, run_id, dedup_key, destination_scope_key, payload_text, payload_kind, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'result', 'sent', ?, ?)",
+        args: [
+          "failed-audience-delivery",
+          clarification.run.id,
+          "failed-audience-delivery",
+          scopeKey(otherGroup.scope),
+          "PRIVATE_FAILED_RESULT",
+          now,
+          now,
+        ],
+      });
+    } finally {
+      db.close();
+    }
+
+    const selection = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: ownerPrivate.scope,
+      messageId: "failed-audience-next",
+      text: "Next question",
+      executionRef: "pi:test",
+    });
+    expect(
+      (await store.conversations.loadRunInput(ownerPrivate, selection.run.id)).history,
+    ).toEqual([]);
+  });
+
   it("loads more than forty short authorized exchanges without a fixed twenty-run cutoff", async () => {
     const store = await setupStore();
     const runIds: string[] = [];
