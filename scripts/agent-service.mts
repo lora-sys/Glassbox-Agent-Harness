@@ -92,8 +92,11 @@ async function assertDatabaseCompatible(checkout: string): Promise<void> {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
     throw error;
   }
-  const source = await readFile(join(checkout, "apps/server/src/persistence/database.ts"), "utf8");
-  const supported = /if\s*\(\s*version\s*>\s*(\d+)\s*\)/u.exec(source);
+  const schemaSource = await readFile(
+    join(checkout, "apps/server/src/persistence/schema.ts"),
+    "utf8",
+  );
+  const supported = /export\s+const\s+CURRENT_SCHEMA_VERSION\s*=\s*(\d+)\s*;/u.exec(schemaSource);
   if (!supported) throw new Error("Target checkout does not declare a readable database version");
   const database = new DatabaseSync(databasePath, { readOnly: true });
   let current: number;

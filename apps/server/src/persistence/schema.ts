@@ -1,4 +1,5 @@
 import type { Transaction } from "@libsql/client";
+
 import { conversationScopeKey } from "../identity/scope.js";
 
 export const CURRENT_SCHEMA_VERSION = 12;

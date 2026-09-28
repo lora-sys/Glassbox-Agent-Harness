@@ -11,6 +11,9 @@ dist/
 .vite-hooks/_
 .cache/
 coverage/
+*.db
+*.sqlite
+*.sqlite3
 
 # Test artifacts
 test-results/
@@ -38,5 +41,5 @@ npm-debug.log*
 
 # Env
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
