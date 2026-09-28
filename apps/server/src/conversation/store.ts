@@ -132,7 +132,12 @@ export function pageParameters(options: PageOptions = {}): {
   }
 }
 
-export function makePage<T>(rows: Row[], limit: number, map: (row: Row) => T): Page<T> {
+export function makePage<T>(
+  rows: Row[],
+  limit: number,
+  map: (row: Row) => T,
+  cursorColumns: readonly [string, string] = ["created_at", "id"],
+): Page<T> {
   const included = rows.slice(0, limit);
   const last = included.at(-1);
   return {
@@ -140,7 +145,10 @@ export function makePage<T>(rows: Row[], limit: number, map: (row: Row) => T): P
     nextCursor:
       rows.length > limit && last
         ? Buffer.from(
-            JSON.stringify([stringColumn(last, "created_at"), stringColumn(last, "id")]),
+            JSON.stringify([
+              stringColumn(last, cursorColumns[0]),
+              stringColumn(last, cursorColumns[1]),
+            ]),
           ).toString("base64url")
         : null,
   };
