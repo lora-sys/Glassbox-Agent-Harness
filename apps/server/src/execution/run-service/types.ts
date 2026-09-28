@@ -1,5 +1,11 @@
 import type { DeliveryRecord } from "../../conversation/lifecycle.js";
-import type { ConversationRecord, RunRecord, RunStatus } from "../../conversation/store.js";
+import type {
+  ConversationRecord,
+  IncomingImageFailure,
+  IncomingImageMimeType,
+  RunRecord,
+  RunStatus,
+} from "../../conversation/store.js";
 import type { CallerContext, TrustedChannelScope } from "../../identity/scope.js";
 import type { DomainStore } from "../../persistence/index.js";
 
@@ -10,6 +16,8 @@ export interface ExecutionInput {
   conversation: ConversationRecord;
   run: RunRecord;
   text: string;
+  images?: readonly { mimeType: IncomingImageMimeType; data: string }[];
+  imageFailureCode?: IncomingImageFailure;
   history: Array<{ role: "user" | "assistant"; text: string }>;
   historyRunIds?: string[];
   historyScanTruncated?: boolean;

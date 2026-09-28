@@ -7,6 +7,7 @@ import { estimateUnicodeTokens, projectContextBudget } from "../efficiency/index
 
 const SYSTEM_PROMPT =
   "You are the Glassbox personal assistant. Use the supplied conversation context. Report unavailable tools accurately.";
+const IMAGE_READ_FAILURE_REPLY = "图片读取失败，暂时无法识别，请重新发送图片。";
 
 /** The copied Pi runtime receives only the context already authorized by RunService. */
 export function configuredModelAdapter(options: {
@@ -17,6 +18,8 @@ export function configuredModelAdapter(options: {
   return {
     supportsGroup: true,
     async execute(input) {
+      if (input.imageFailureCode)
+        return { status: "succeeded" as const, text: IMAGE_READ_FAILURE_REPLY };
       const resolved = options.profiles.resolve(options.profileId);
       const contextWindowTokens = resolved.profile.contextWindowTokens;
       const maxOutputTokens = resolved.profile.maxOutputTokens;
@@ -33,6 +36,11 @@ export function configuredModelAdapter(options: {
         return { status: "failed" as const, failureCode: "model_capacity_unknown" as const };
       }
       const provider = createModelProvider(resolved);
+      if (input.images?.length && !provider.model.input.includes("image"))
+        return {
+          status: "succeeded" as const,
+          text: "当前配置的模型不支持识别图片，因此没有发送图片。请切换到支持视觉输入的模型后重试。",
+        };
       const exchanges = [];
       for (let index = 0; index < input.history.length; index += 2) {
         const first = input.history[index];
@@ -58,7 +66,7 @@ export function configuredModelAdapter(options: {
           hasLargeAuthorizedContext: input.historyScanTruncated === true,
           requiredOutputClass: "standard",
           hasToolOrRetrieval: false,
-          hasAttachmentsOrArtifacts: false,
+          hasAttachmentsOrArtifacts: input.images !== undefined && input.images.length > 0,
           trustedPolicyFlags: [],
           systemTokens: estimateUnicodeTokens(SYSTEM_PROMPT),
           currentMessageTokens: estimateUnicodeTokens(input.text) + 8,
@@ -117,7 +125,20 @@ export function configuredModelAdapter(options: {
           timestamp: 0,
         };
       });
-      messages.push({ role: "user", content: input.text, timestamp: Date.now() });
+      messages.push({
+        role: "user",
+        content: input.images?.length
+          ? [
+              { type: "text", text: input.text },
+              ...input.images.map((image) => ({
+                type: "image" as const,
+                data: image.data,
+                mimeType: image.mimeType,
+              })),
+            ]
+          : input.text,
+        timestamp: Date.now(),
+      });
       const result = await runModelAgent({
         provider,
         authorizedContext: {

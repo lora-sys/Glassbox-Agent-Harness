@@ -8,9 +8,12 @@ export interface OneBotIncomingMessage {
   scope: TrustedChannelScope;
   messageId: string;
   text: string;
+  parts: OneBotMessagePart[];
   receivedAt: string;
   replyTo?: string;
 }
+
+export type OneBotMessagePart = { type: "text"; text: string } | { type: "image"; file: string };
 
 export type NormalizeResult =
   | { kind: "message"; message: OneBotIncomingMessage }
@@ -28,6 +31,22 @@ function unescapeCq(value: string): string {
     .replaceAll("&#93;", "]")
     .replaceAll("&#44;", ",")
     .replaceAll("&amp;", "&");
+}
+
+function isOpaqueImageFile(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= 128 &&
+    value !== "." &&
+    value !== ".." &&
+    !/[\\/]/u.test(value) &&
+    !Array.from(value).some((character) => {
+      const code = character.charCodeAt(0);
+      return code < 32 || code === 127;
+    }) &&
+    !/^[a-z][a-z0-9+.-]*:/iu.test(value)
+  );
 }
 
 /** Parse protocol CQ encoding before decoding text, so escaped CQ text cannot become an @. */
@@ -103,6 +122,9 @@ export function normalizeOneBotMessage(
   let addressed = false;
   let replyTo: string | undefined;
   let unsupported = false;
+  let invalidImage = false;
+  let imageCount = 0;
+  const parts: OneBotMessagePart[] = [];
   for (const segment of segments) {
     const part = object(segment);
     const data = object(part?.data);
@@ -122,11 +144,15 @@ export function normalizeOneBotMessage(
           ...(groupId ? { groupId } : {}),
         };
       texts.push(data.text);
+      parts.push({ type: "text", text: data.text });
     } else if (part.type === "at") {
       const target = qqId(data.qq);
       if (target === config.botId) addressed = true;
-      else if (target || data.qq === "all") texts.push(`@${target ?? "all"}`);
-      else
+      else if (target || data.qq === "all") {
+        const text = `@${target ?? "all"}`;
+        texts.push(text);
+        parts.push({ type: "text", text });
+      } else
         return {
           kind: "rejected",
           code: "invalid_message",
@@ -143,13 +169,20 @@ export function normalizeOneBotMessage(
           ...(groupId ? { groupId } : {}),
         };
       replyTo = replyId;
+    } else if (part.type === "image") {
+      imageCount += 1;
+      const file = data.file;
+      if (
+        type !== "private" ||
+        imageCount > 4 ||
+        !isOpaqueImageFile(file) ||
+        data.type === "flash" ||
+        data.sub_type === "flash"
+      ) {
+        invalidImage = true;
+      } else parts.push({ type: "image", file });
     } else unsupported = true;
   }
-  if (type === "group" && !addressed)
-    return {
-      kind: "ignored",
-      ...(groupId ? { diagnostic: { groupId, reason: "not_addressed" as const } } : {}),
-    };
   if (unsupported)
     return {
       kind: "rejected",
@@ -157,8 +190,20 @@ export function normalizeOneBotMessage(
       messageId: id,
       ...(groupId ? { groupId } : {}),
     };
+  if (invalidImage)
+    return {
+      kind: "rejected",
+      code: type === "group" ? "unsupported_message" : "invalid_message",
+      messageId: id,
+      ...(groupId ? { groupId } : {}),
+    };
+  if (type === "group" && !addressed)
+    return {
+      kind: "ignored",
+      ...(groupId ? { diagnostic: { groupId, reason: "not_addressed" as const } } : {}),
+    };
   const text = texts.join("").trim();
-  if (!text)
+  if (!text && parts.every((part) => part.type !== "image"))
     return {
       kind: "ignored",
       ...(groupId ? { diagnostic: { groupId, reason: "empty_message" as const } } : {}),
@@ -193,6 +238,7 @@ export function normalizeOneBotMessage(
       },
       messageId: id,
       text,
+      parts,
       receivedAt: now.toISOString(),
       ...(replyTo !== undefined && { replyTo }),
     },

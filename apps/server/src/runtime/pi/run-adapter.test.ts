@@ -165,6 +165,50 @@ describe("Pi required Tool execution", () => {
     expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({ action: "image" });
   });
 
+  it("passes current image content to the Pi runtime when its model supports vision", async () => {
+    const f = fixture([{ status: "completed", text: "看见一只猫。", toolCalls: [] }]);
+    f.runtime.getModelSupportsImages = () => true;
+    f.input.text = "这张图里有什么？";
+    f.input.images = [{ mimeType: "image/png", data: "aGVsbG8=" }];
+
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "succeeded",
+      text: "看见一只猫。",
+    });
+    expect(f.run.mock.calls[0]?.[3]?.images).toEqual(f.input.images);
+  });
+
+  it("explains that Pi cannot inspect an image when the current model lacks vision", async () => {
+    const f = fixture([{ status: "completed", text: "must not run", toolCalls: [] }]);
+    f.runtime.getModelSupportsImages = () => false;
+    f.input.text = "这张图里有什么？";
+    f.input.images = [{ mimeType: "image/png", data: "aGVsbG8=" }];
+
+    const result = await f.executor.execute(f.input);
+    expect(result).toMatchObject({
+      status: "succeeded",
+      text: expect.stringContaining("不支持识别图片"),
+    });
+    expect(result).not.toHaveProperty("providerSessionId");
+    expect(f.run).not.toHaveBeenCalled();
+    expect(f.disposeSession).toHaveBeenCalledWith("session-1");
+  });
+
+  it("reports an image read failure before initializing Pi or evaluating tools", async () => {
+    const f = fixture([{ status: "completed", text: "must not run", toolCalls: [] }]);
+    const initialize = vi.spyOn(f.runtime, "initialize");
+    f.input.text = "这张图里有什么？";
+    f.input.imageFailureCode = "image_unavailable";
+
+    await expect(f.executor.execute(f.input)).resolves.toEqual({
+      status: "succeeded",
+      text: "图片读取失败，暂时无法识别，请重新发送图片。",
+    });
+    expect(initialize).not.toHaveBeenCalled();
+    expect(f.createOrRestoreSession).not.toHaveBeenCalled();
+    expect(f.run).not.toHaveBeenCalled();
+  });
+
   it("names a missing browser screenshot without blaming QQ", async () => {
     const noTools = { status: "completed" as const, text: "截图已完成。", toolCalls: [] };
     const f = fixture([noTools, noTools]);

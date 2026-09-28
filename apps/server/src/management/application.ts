@@ -20,6 +20,7 @@ import {
   type OneBotIngressDiagnostic,
   type OneBotState,
 } from "../channels/onebot/index.js";
+import { fitsIncomingImageBudget } from "../channels/onebot/image-input.js";
 import {
   RunService,
   type ExecutionInput,
@@ -69,6 +70,7 @@ import { AgnesMediaProvider } from "../media/agnes-media-provider.js";
 import { MediaProviderRegistry } from "../media/provider-registry.js";
 import type { MediaGenerationProvider } from "../media/provider.js";
 import { dohResolveWebHost } from "../web/network-guard.js";
+import type { IncomingImage, IncomingImageFailure } from "../conversation/store.js";
 import {
   isWebCapabilityEnabled,
   WEB_CAPABILITIES,
@@ -2303,7 +2305,8 @@ export class ManagementApplication {
         : this.serialize(() => this.provisionConfiguredAccess(configured));
       return provisionPromise;
     };
-    const adapter = new OneBotAdapter({
+    let adapter!: OneBotAdapter;
+    adapter = new OneBotAdapter({
       config: configured.config,
       token: configured.token,
       onState: (state) => {
@@ -2339,7 +2342,10 @@ export class ManagementApplication {
           // current profile instead of preserving the connect-time allowlist in this closure.
           await this.provisionAddressedGroupMember(this.channels.resolve(id), message.scope);
         }
-        const control = /^\/(status|cancel)\s+([a-zA-Z0-9-]{1,80})\s*$/u.exec(message.text);
+        const hasImage = message.parts.some((part) => part.type === "image");
+        const control = hasImage
+          ? null
+          : /^\/(status|cancel)\s+([a-zA-Z0-9-]{1,80})\s*$/u.exec(message.text);
         if (control) {
           const caller = await this.store.identities.resolve(message.scope);
           if (!caller) return;
@@ -2362,12 +2368,43 @@ export class ManagementApplication {
           ownerPrivate && channelSelection.modelOverrideProfileId && executionKind
             ? `${executionKind}:${channelSelection.modelOverrideProfileId}`
             : configured.executionRef;
+        const images: IncomingImage[] = [];
+        let imageFailureCode: IncomingImageFailure | undefined;
+        if (hasImage) {
+          const caller = await this.store.identities.resolve(message.scope);
+          const authorization = caller
+            ? await this.store.authorization.check({
+                caller,
+                resourceId: agentResourceId(AGENT_ID),
+                action: "run:create",
+              })
+            : undefined;
+          if (authorization?.decision === "ALLOW") {
+            let totalImageBytes = 0;
+            for (const part of message.parts) {
+              if (part.type !== "image") continue;
+              const result = await adapter.getImage(part.file, signal);
+              if (result.status !== "ok") {
+                imageFailureCode = result.code;
+                break;
+              }
+              if (!fitsIncomingImageBudget(totalImageBytes, result.image.data.length)) {
+                imageFailureCode = "image_too_large";
+                break;
+              }
+              totalImageBytes += result.image.data.length;
+              images.push(result.image);
+            }
+          }
+        }
+        if (imageFailureCode) images.length = 0;
         const accepted = await this.store.conversations.acceptIncoming({
           agentId: AGENT_ID,
           scope: message.scope,
           messageId: message.messageId,
-          text: message.text,
+          text: message.text || (hasImage ? "请描述这张图片。" : ""),
           executionRef: runExecutionRef,
+          ...(imageFailureCode ? { imageFailureCode } : images.length > 0 ? { images } : {}),
         });
         if (!accepted.duplicate && message.scope.nativeGroupRole) {
           const cursor = await this.trace.append(

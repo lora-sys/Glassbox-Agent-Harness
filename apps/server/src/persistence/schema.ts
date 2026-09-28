@@ -1,7 +1,8 @@
 import type { Transaction } from "@libsql/client";
 
-export const CURRENT_SCHEMA_VERSION = 11;
 import { conversationScopeKey } from "../identity/scope.js";
+
+export const CURRENT_SCHEMA_VERSION = 12;
 
 function persistedText(value: unknown): string {
   if (typeof value !== "string") throw new Error("Invalid migration record");
@@ -77,11 +78,29 @@ export const learningSchema = [
   `CREATE INDEX memory_audit_target ON memory_audit_events(target_id, sequence)`,
 ];
 
+export const schemaV12Migration = [
+  `CREATE TABLE message_attachments (
+    message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    status TEXT NOT NULL CHECK(status IN ('ready','failed')),
+    mime_type TEXT CHECK(mime_type IS NULL OR mime_type IN ('image/png','image/jpeg','image/webp')),
+    image_bytes BLOB CHECK(image_bytes IS NULL OR (typeof(image_bytes) = 'blob' AND length(image_bytes) > 0)),
+    size_bytes INTEGER CHECK(size_bytes IS NULL OR size_bytes > 0),
+    failure_code TEXT CHECK(failure_code IS NULL OR failure_code IN ('image_unavailable','image_invalid','image_too_large','image_timeout')),
+    CHECK (
+      (status = 'ready' AND mime_type IS NOT NULL AND image_bytes IS NOT NULL AND size_bytes IS NOT NULL AND size_bytes = length(image_bytes) AND failure_code IS NULL)
+      OR (status = 'failed' AND image_bytes IS NULL AND failure_code IS NOT NULL)
+    ),
+    PRIMARY KEY (message_id, ordinal)
+  )`,
+];
+
 export const schema = [
   ...baseSchema,
   ...schemaV7Statements,
   ...schemaV8Migration,
   ...learningSchema,
+  ...schemaV12Migration,
 ];
 
 export const schemaV5Migration = ["ALTER TABLE tasks ADD COLUMN origin_scope_key TEXT"];

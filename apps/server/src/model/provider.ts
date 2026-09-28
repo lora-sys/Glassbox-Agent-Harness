@@ -24,6 +24,7 @@ export interface ModelProfile {
   contextWindowTokens?: number;
   maxOutputTokens?: number;
   supportsThinking?: boolean;
+  supportsVision?: boolean;
 }
 
 export interface ModelUsage {
@@ -55,7 +56,7 @@ export interface ModelProvider {
     readonly cancel: true;
     readonly tools: true;
     readonly resume: false;
-    readonly images: false;
+    readonly images: boolean;
   };
   readonly model: Model<ModelProtocol>;
   stream(request: ModelRequest): AsyncIterable<ModelEvent>;
@@ -177,7 +178,7 @@ export function createModelProvider(options: {
     provider: profile.protocol === "anthropic-messages" ? "anthropic" : "openai",
     baseUrl: profile.baseUrl,
     reasoning: profile.supportsThinking === true,
-    input: ["text"],
+    input: profile.supportsVision === true ? ["text", "image"] : ["text"],
     cost: { ...EMPTY_COST },
     // Request budgets, not claims about an unregistered model's measured capacity.
     contextWindow: profile.contextWindowTokens ?? 32_768,
@@ -241,7 +242,13 @@ export function createModelProvider(options: {
   return {
     profile,
     model,
-    capabilities: { streaming: true, cancel: true, tools: true, resume: false, images: false },
+    capabilities: {
+      streaming: true,
+      cancel: true,
+      tools: true,
+      resume: false,
+      images: profile.supportsVision === true,
+    },
     streamForAgent,
     async *stream(request): AsyncGenerator<ModelEvent> {
       const controller = new AbortController();

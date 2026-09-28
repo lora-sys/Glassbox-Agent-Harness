@@ -41,7 +41,7 @@ it.each(
           id: "deterministic",
           name: "Deterministic",
           reasoning: false,
-          input: ["text"],
+          input: ["text", "image"],
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
           contextWindow: 8192,
           maxTokens: 256,
@@ -55,6 +55,13 @@ it.each(
           caller: { principalId: "owner" },
         });
         expect(context.tools ?? []).toHaveLength(0);
+        expect(context.messages.at(-1)).toMatchObject({
+          role: "user",
+          content: [
+            { type: "text", text: "这张图里有什么？" },
+            { type: "image", data: "aGVsbG8=", mimeType: "image/png" },
+          ],
+        });
         expect(context.systemPrompt).not.toContain("Current working directory:");
         expect(context.systemPrompt).not.toContain(directory);
         expect(context.systemPrompt).not.toContain(directory.replace(/\\/gu, "/"));
@@ -143,10 +150,11 @@ it.each(
           createdAt: new Date(0).toISOString(),
           updatedAt: new Date(0).toISOString(),
         },
-        "Reply with SDK_RESPONSE",
+        "这张图里有什么？",
         {
           runId: "run",
           conversationId: "conversation",
+          images: [{ mimeType: "image/png", data: "aGVsbG8=" }],
           caller: {
             principalId: "owner",
             scope: {
@@ -159,6 +167,7 @@ it.each(
           },
         },
       );
+      expect(adapter.getModelSupportsImages(binding.runtimeSessionId)).toBe(true);
       expect(calls).toBe(1);
       expect(result).toMatchObject({
         status: "completed",
