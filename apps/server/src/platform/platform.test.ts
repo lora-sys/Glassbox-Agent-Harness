@@ -26,6 +26,11 @@ import {
 import { gitLsFiles, gitDiffForScan } from "./git.js";
 import { CodexAdapter } from "../codex/adapter.js";
 
+function windowsPathExistsOnHost(candidate: string): boolean {
+  const hostPath = process.platform === "win32" ? candidate : candidate.replaceAll("\\", path.sep);
+  return fs.existsSync(hostPath);
+}
+
 describe("Platform Paths and Repo Validation", () => {
   it("discovers repository root containing package.json", () => {
     const root = getRepoRoot();
@@ -302,8 +307,9 @@ describe("Safe Argv and Launcher Resolution", () => {
         binaryPath: claudeCmd,
         platform: "win32",
         env: { PATH: tempDir, PATHEXT: ".CMD;.EXE" },
+        isFile: windowsPathExistsOnHost,
       });
-      expect(resolved).toBe(cliJs);
+      expect(resolved).toBe(path.win32.resolve(cliJs));
 
       // 2. When cli.js is removed: no valid entry exists next to the .cmd shim
       fs.unlinkSync(cliJs);
@@ -311,6 +317,7 @@ describe("Safe Argv and Launcher Resolution", () => {
         binaryPath: claudeCmd,
         platform: "win32",
         env: { PATH: tempDir, PATHEXT: ".CMD;.EXE" },
+        isFile: windowsPathExistsOnHost,
       });
       // Must fail clearly (return undefined) rather than returning the unspawnable .cmd shim
       expect(resolvedMissing).toBeUndefined();
@@ -347,10 +354,11 @@ describe("Safe Argv and Launcher Resolution", () => {
       const nativeRes = resolveCodexExecutable({
         binaryPath: codexCmd,
         platform: "win32",
+        isFile: windowsPathExistsOnHost,
       });
       expect(nativeRes).toBeDefined();
       expect(nativeRes?.shell).toBe(false);
-      expect(nativeRes?.command).toBe(vendorExe);
+      expect(nativeRes?.command).toBe(path.win32.resolve(vendorExe));
 
       // 2. When native exe is removed and only codex.js exists: runs via process.execPath with shell: false
       fs.unlinkSync(vendorExe);
@@ -360,11 +368,12 @@ describe("Safe Argv and Launcher Resolution", () => {
       const jsRes = resolveCodexExecutable({
         binaryPath: codexCmd,
         platform: "win32",
+        isFile: windowsPathExistsOnHost,
       });
       expect(jsRes).toBeDefined();
       expect(jsRes?.shell).toBe(false);
       expect(jsRes?.command).toBe(process.execPath);
-      expect(jsRes?.args).toEqual([jsEntry, "app-server"]);
+      expect(jsRes?.args).toEqual([path.win32.resolve(jsEntry), "app-server"]);
     } finally {
       fs.rmSync(tempDir, { recursive: true, force: true });
     }
