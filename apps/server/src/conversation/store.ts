@@ -679,7 +679,7 @@ export class ConversationStore {
         });
         const conversation = conversationRecord(conversations.rows[0]!, caller.scope);
         const earlier = await tx.execute({
-          sql: "SELECT runs.id, runs.principal_id, runs.sequence, runs.message_id FROM runs WHERE runs.conversation_id = ? AND runs.sequence < ? AND runs.status = 'succeeded' AND runs.result_text IS NOT NULL AND NOT EXISTS (SELECT 1 FROM ops_trace_events e WHERE e.run_id = runs.id AND e.type = 'context.excluded') ORDER BY runs.sequence DESC LIMIT 257",
+          sql: "SELECT runs.id, runs.principal_id, runs.sequence, runs.message_id FROM runs WHERE runs.conversation_id = ? AND runs.sequence < ? AND runs.status IN ('succeeded', 'failed') AND runs.result_text IS NOT NULL AND (runs.status = 'succeeded' OR EXISTS (SELECT 1 FROM deliveries d WHERE d.run_id = runs.id AND d.status = 'sent' AND d.payload_kind IN ('text', 'result'))) AND NOT EXISTS (SELECT 1 FROM ops_trace_events e WHERE e.run_id = runs.id AND e.type = 'context.excluded') ORDER BY runs.sequence DESC LIMIT 257",
           args: [run.conversationId, row.sequence!],
         });
         const callerLocationKey = conversationScopeKey(caller.scope);

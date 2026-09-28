@@ -108,6 +108,46 @@ afterEach(async () => {
 });
 
 describe("shared group conversation and durable actor routing", () => {
+  it("includes a failed clarification in later context only after its reply was delivered", async () => {
+    const store = await setupStore();
+    const clarification = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: ownerPrivate.scope,
+      messageId: "media-clarification",
+      text: "给我生成一个小猫",
+      executionRef: "pi:test",
+    });
+    const lease = await store.lifecycle.claimQueuedRun(ownerPrivate, clarification.run.id);
+    await lease.settle("failed", "请说明你想要图片、视频，还是文字描述。当前请求未执行。");
+    const delivery = await store.lifecycle.createDelivery(ownerPrivate, {
+      runId: clarification.run.id,
+      dedupKey: "media-clarification-reply",
+      destination: ownerPrivate.scope,
+      payloadText: "请说明你想要图片、视频，还是文字描述。当前请求未执行。",
+      payloadKind: "result",
+    });
+    const send = await store.lifecycle.claimDelivery(ownerPrivate, clarification.run.id, delivery);
+    await send!.settle("sent", "external-clarification");
+
+    const selection = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: ownerPrivate.scope,
+      messageId: "media-selection",
+      text: "图片",
+      executionRef: "pi:test",
+    });
+
+    expect(
+      (await store.conversations.loadRunInput(ownerPrivate, selection.run.id)).history,
+    ).toEqual([
+      { role: "user", text: "给我生成一个小猫" },
+      {
+        role: "assistant",
+        text: "请说明你想要图片、视频，还是文字描述。当前请求未执行。",
+      },
+    ]);
+  });
+
   it("loads more than forty short authorized exchanges without a fixed twenty-run cutoff", async () => {
     const store = await setupStore();
     const runIds: string[] = [];
