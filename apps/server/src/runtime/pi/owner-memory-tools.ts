@@ -47,6 +47,7 @@ type OwnerMemoryToolInput = Record<string, unknown> & {
     | "extract"
     | "source";
   id?: string;
+  candidateIds?: string[];
   type?: MemoryType;
   statement?: string;
   scopeType?: "global" | "project" | "group";
@@ -121,6 +122,8 @@ function commandFor(input: OwnerMemoryToolInput, scope?: GlassboxMemoryScope): s
     return `/memory supersede ${input.id} ${input.statement.trim()}`;
   if (input.action === "update" && input.id && input.statement)
     return `/memory update ${input.id} ${input.statement.trim()}`;
+  if ((input.action === "promote" || input.action === "reject") && input.candidateIds?.length)
+    return `/memory ${input.action} ${input.candidateIds.join(" ")}`;
   if (input.action === "feedback" && scope && input.signalType && input.statement)
     return `/memory feedback ${scopeCommand(scope)} ${input.signalType} ${input.statement.trim()}`;
   if (["promote", "reject", "expire", "revoke", "retire"].includes(input.action) && input.id)
@@ -329,6 +332,33 @@ async function executeMemoryActionRaw(
         );
       }
     case "promote":
+      if (input.candidateIds) {
+        const candidateIds = checkedCandidateIds(input.candidateIds);
+        if ((await ownerCommand(store, context)) !== commandFor({ ...input, candidateIds }))
+          throw new Error("owner_confirmation_required");
+        const results = [];
+        for (const publicId of candidateIds) {
+          const candidateId = internalLearningId("candidate", publicId);
+          const candidate = await learning.getCandidate(operationContext, candidateId);
+          if (!candidate) {
+            results.push({ candidateId: publicId, status: "not_found" });
+          } else if (candidate.status !== "pending") {
+            results.push({ candidateId: publicId, status: candidate.status });
+          } else {
+            try {
+              const memory = await learning.promoteCandidate(operationContext, candidateId);
+              results.push({
+                candidateId: publicId,
+                status: "promoted",
+                memoryId: memory.memoryId,
+              });
+            } catch {
+              results.push({ candidateId: publicId, status: "failed", reason: "review_failed" });
+            }
+          }
+        }
+        return { results };
+      }
       if ((await ownerCommand(store, context)) !== commandFor(input))
         throw new Error("owner_confirmation_required");
       {
@@ -345,6 +375,29 @@ async function executeMemoryActionRaw(
         return learning.promoteCandidate(operationContext, candidateId);
       }
     case "reject":
+      if (input.candidateIds) {
+        const candidateIds = checkedCandidateIds(input.candidateIds);
+        if ((await ownerCommand(store, context)) !== commandFor({ ...input, candidateIds }))
+          throw new Error("owner_confirmation_required");
+        const results = [];
+        for (const publicId of candidateIds) {
+          const candidateId = internalLearningId("candidate", publicId);
+          const candidate = await learning.getCandidate(operationContext, candidateId);
+          if (!candidate) {
+            results.push({ candidateId: publicId, status: "not_found" });
+          } else if (candidate.status !== "pending") {
+            results.push({ candidateId: publicId, status: candidate.status });
+          } else {
+            try {
+              await learning.rejectCandidate(operationContext, candidateId);
+              results.push({ candidateId: publicId, status: "rejected" });
+            } catch {
+              results.push({ candidateId: publicId, status: "failed", reason: "review_failed" });
+            }
+          }
+        }
+        return { results };
+      }
       if ((await ownerCommand(store, context)) !== commandFor(input))
         throw new Error("owner_confirmation_required");
       {
@@ -468,6 +521,17 @@ async function executeMemoryAction(
   return ownerVisibleLearningResult(await executeMemoryActionRaw(store, context, input));
 }
 
+function checkedCandidateIds(value: string[]): string[] {
+  if (
+    value.length < 2 ||
+    value.length > 20 ||
+    new Set(value).size !== value.length ||
+    value.some((id) => !/^candidate_(?:[a-f0-9]{32}|legacy_[a-f0-9]{32})$/iu.test(id))
+  )
+    throw new Error("invalid_candidate_ids");
+  return value;
+}
+
 export function createOwnerMemoryTools(options: {
   store: DomainStore;
   getContext: () => PiRunContext | undefined;
@@ -493,7 +557,7 @@ export function createOwnerMemoryTools(options: {
       name: OWNER_MEMORY_ADMIN_TOOL,
       label: "Owner Memory 管理",
       description:
-        "Owner-private Memory administration. Read with /memory list [all|global|project:id|group:id], /memory get <id>, or /memory candidates. Import an authorized QQ source as pending candidates with /memory source <global|project:id> <groupId> <history|notice|essence|metadata|file|album>, or use /memory source group:<id> <history|notice|essence|metadata|file|album> to keep it in that group's scope. Model-originated write and supersede calls create pending candidates only. Active changes require the exact current-message commands /memory write <global|project:id|group:id> <type> <statement>, /memory update <id> <statement>, /memory supersede <id> <statement>, or /memory <promote|reject|expire|revoke|retire> <id>.",
+        "Owner-private Memory administration. Read with /memory list [all|global|project:id|group:id], /memory get <id>, or /memory candidates. Import an authorized QQ source as pending candidates with /memory source <global|project:id> <groupId> <history|notice|essence|metadata|file|album>, or use /memory source group:<id> <history|notice|essence|metadata|file|album> to keep it in that group's scope. Model-originated write and supersede calls create pending candidates only. Review candidates with the exact current-message commands /memory promote <id> [id ...] or /memory reject <id> [id ...], up to 20 distinct candidates. Other active changes require exact current-message commands.",
       parameters: Type.Object(
         {
           action: Type.Unsafe<OwnerMemoryToolInput["action"]>({
@@ -516,6 +580,12 @@ export function createOwnerMemoryTools(options: {
             ],
           }),
           id: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })),
+          candidateIds: Type.Optional(
+            Type.Array(Type.String({ minLength: 1, maxLength: 80 }), {
+              minItems: 2,
+              maxItems: 20,
+            }),
+          ),
           type: Type.Optional(
             Type.Unsafe<MemoryType>({
               type: "string",

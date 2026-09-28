@@ -5,9 +5,11 @@
 The Owner-private `owner_memory_admin` Tool reads the current persisted Run input before
 changing canonical Memory. A model-suggested `write` or `supersede` creates a pending
 candidate; it cannot use a prompt description as confirmation. The Owner can inspect
-the candidate and send `/memory promote <candidate-id>` in a later message. Exact
-`/memory reject <candidate-id>` and `/memory expire|revoke|retire <memory-id>` commands
-govern lifecycle. An explicit write uses
+all pending candidates together with `/memory candidates`, then promote or reject up to
+20 candidates in one Owner-private message with `/memory promote <candidate-id> <candidate-id>`
+or `/memory reject <candidate-id> <candidate-id>`. A single candidate may also be reviewed
+with one ID. Exact `/memory expire|revoke|retire <memory-id>` commands govern lifecycle.
+An explicit write uses
 `/memory write global|project:<project-id> <memory-type> <statement>`; an explicit
 correction uses `/memory supersede <memory-id> <statement>` and inherits the original
 scope and type. `/memory feedback global|project:<project-id> <signal> <statement>`

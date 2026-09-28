@@ -9,18 +9,22 @@ import { piProfileName, PiRunExecutionAdapter } from "./run-adapter.js";
 import type { RunEvidenceRecord } from "./run-adapter.js";
 import type { PiRunResult, PiRuntimeAdapter } from "./types.js";
 
-function fixture(results: PiRunResult[]) {
+function fixture(results: PiRunResult[], authorizedToolNames: string[] = []) {
   const run = vi.fn(async (..._args: Parameters<PiRuntimeAdapter["run"]>) => results.shift()!);
   const disposeSession = vi.fn(async () => {});
   const createOrRestoreSession = vi.fn(
-    async (..._args: Parameters<PiRuntimeAdapter["createOrRestoreSession"]>) => ({
-      conversationId: "conversation-1",
-      runtimeSessionId: "session-1",
-      profileName: "main-agent" as const,
-      agentDir: "agent",
-      createdAt: new Date(0).toISOString(),
-      lastActiveAt: new Date(0).toISOString(),
-    }),
+    async (...args: Parameters<PiRuntimeAdapter["createOrRestoreSession"]>) => {
+      if (authorizedToolNames.length > 0 && args[2])
+        args[2].authorizedToolNames = authorizedToolNames;
+      return {
+        conversationId: "conversation-1",
+        runtimeSessionId: "session-1",
+        profileName: "main-agent" as const,
+        agentDir: "agent",
+        createdAt: new Date(0).toISOString(),
+        lastActiveAt: new Date(0).toISOString(),
+      };
+    },
   );
   const runtime: PiRuntimeAdapter = {
     initialize: async () => {},
@@ -909,6 +913,63 @@ describe("Pi required Tool execution", () => {
 });
 
 describe("mutation intent comes only from the current user message", () => {
+  it("binds a batch Memory review to the exact candidate IDs named by the Owner", async () => {
+    const ids = [
+      "candidate_0123456789abcdef0123456789abcdef",
+      "candidate_abcdef0123456789abcdef0123456789",
+    ];
+    const f = fixture(
+      [
+        {
+          status: "completed",
+          text: "已处理。",
+          toolCalls: [
+            {
+              name: OWNER_MEMORY_ADMIN_TOOL,
+              input: { action: "promote", candidateIds: ids },
+              failed: false,
+            },
+          ],
+        },
+      ],
+      [OWNER_MEMORY_ADMIN_TOOL],
+    );
+    f.input.text = `/memory promote ${ids.join(" ")}`;
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe(OWNER_MEMORY_ADMIN_TOOL);
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({
+      action: "promote",
+      candidateIds: ids,
+    });
+  });
+
+  it("does not bind duplicate or oversized candidate review batches", async () => {
+    const id = "candidate_0123456789abcdef0123456789abcdef";
+    const f = fixture(
+      [{ status: "completed", text: "请确认候选编号。", toolCalls: [] }],
+      [OWNER_MEMORY_ADMIN_TOOL],
+    );
+    f.input.text = `/memory reject ${id} ${id}`;
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBeUndefined();
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toBeUndefined();
+  });
+
+  it("does not bind a candidate review batch larger than 20", async () => {
+    const ids = Array.from(
+      { length: 21 },
+      (_, index) => `candidate_${index.toString(16).padStart(32, "0")}`,
+    );
+    const f = fixture(
+      [{ status: "completed", text: "请分批审核候选。", toolCalls: [] }],
+      [OWNER_MEMORY_ADMIN_TOOL],
+    );
+    f.input.text = `/memory promote ${ids.join(" ")}`;
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBeUndefined();
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toBeUndefined();
+  });
+
   it("ignores a moderation instruction that arrives in Conversation history", async () => {
     const f = fixture([{ status: "completed", text: "这个群最近比较安静。", toolCalls: [] }]);
     f.input.text = "群 1126022432 最近活跃吗？";

@@ -130,6 +130,20 @@ function ownerMemoryCommand(text: string): RequiredToolCall | undefined {
       name: OWNER_MEMORY_ADMIN_TOOL,
       input: { action: changed[1], id: changed[2], statement: changed[3] },
     };
+  const batchReview = /^\/memory (promote|reject) (.+)$/u.exec(command);
+  if (batchReview) {
+    const candidateIds = batchReview[2]!.split(/\s+/u);
+    if (
+      candidateIds.length >= 2 &&
+      candidateIds.length <= 20 &&
+      new Set(candidateIds).size === candidateIds.length &&
+      candidateIds.every((id) => /^candidate_(?:[a-f0-9]{32}|legacy_[a-f0-9]{32})$/iu.test(id))
+    )
+      return {
+        name: OWNER_MEMORY_ADMIN_TOOL,
+        input: { action: batchReview[1], candidateIds },
+      };
+  }
   const governed = /^\/memory (promote|reject|expire|revoke|retire) (\S+)$/u.exec(command);
   if (governed)
     return { name: OWNER_MEMORY_ADMIN_TOOL, input: { action: governed[1], id: governed[2] } };

@@ -10,6 +10,120 @@ import { ChannelArchiveStore } from "../../retrieval/channel-archive.js";
 import { groupResourceId } from "../../retrieval/source-resolver.js";
 import { createOwnerMemoryTools, OWNER_MEMORY_ADMIN_TOOL } from "./owner-memory-tools.js";
 
+it("reviews multiple pending candidates from one exact Owner-private command", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  const caller = {
+    principalId: "owner",
+    scope: {
+      connectionId: "qq",
+      botId: "bot",
+      chatType: "private" as const,
+      chatId: "owner",
+      senderId: "owner",
+    },
+  };
+  try {
+    await store.identities.bindOwner("owner", caller.scope);
+    await store.conversations.createAgent("personal");
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: "agent:personal",
+      action: "run:create",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    await store.authorization.registerResource({
+      id: OWNER_MEMORY_RESOURCE,
+      kind: "owner-memory",
+      visibility: "private",
+      ownerId: "owner",
+    });
+    for (const action of [MEMORY_READ_ACTION, MEMORY_WRITE_ACTION, MEMORY_GOVERN_ACTION])
+      await store.authorization.grant({
+        principalId: "owner",
+        resourceId: OWNER_MEMORY_RESOURCE,
+        action,
+        scope: caller.scope,
+        effect: "allow",
+      });
+    const initial = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: caller.scope,
+      messageId: "batch-start",
+      text: "开始候选审核",
+      executionRef: "pi:test",
+    });
+    const create = async (statement: string) =>
+      store.learning.createCandidate(
+        { caller, conversationId: initial.conversation.id, runId: initial.run.id },
+        {
+          candidateKind: "assertion",
+          subject: { kind: "user", id: "owner" },
+          scope: { type: "global" },
+          proposedType: "semantic_fact",
+          statement,
+          content: { statement },
+          source: { kind: "system", ref: `run:${initial.run.id}` },
+          sourceEvidence: [],
+          confidence: 0.9,
+          mergeHint: { strategy: "manual_review_required" },
+          extensions: {},
+        },
+      );
+    const promoteIds = [(await create("Fact A")).candidateId, (await create("Fact B")).candidateId];
+    const rejectIds = [(await create("Fact C")).candidateId, (await create("Fact D")).candidateId];
+    let currentRunId = initial.run.id;
+    const [tool] = createOwnerMemoryTools({
+      store,
+      getContext: () => ({
+        caller,
+        runId: currentRunId,
+        conversationId: initial.conversation.id,
+      }),
+    });
+    const promoteRun = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: caller.scope,
+      messageId: "batch-promote",
+      text: `/memory promote ${promoteIds.join(" ")}`,
+      executionRef: "pi:test",
+    });
+    currentRunId = promoteRun.run.id;
+    const promoted = await tool!.execute(
+      "batch-promote",
+      { action: "promote", candidateIds: promoteIds },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    expect(promoted.details).toMatchObject({
+      results: promoteIds.map((candidateId) => ({ candidateId, status: "promoted" })),
+    });
+
+    const rejectRun = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: caller.scope,
+      messageId: "batch-reject",
+      text: `/memory reject ${rejectIds.join(" ")}`,
+      executionRef: "pi:test",
+    });
+    currentRunId = rejectRun.run.id;
+    const rejected = await tool!.execute(
+      "batch-reject",
+      { action: "reject", candidateIds: rejectIds },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    expect(rejected.details).toMatchObject({
+      results: rejectIds.map((candidateId) => ({ candidateId, status: "rejected" })),
+    });
+    expect(await store.learning.listMemories({ caller })).toHaveLength(2);
+  } finally {
+    await store.close();
+  }
+});
+
 it("exposes Owner-only governed Memory operations and rechecks revoked write authority", async () => {
   const store = await openDomainStore({ databasePath: ":memory:" });
   const caller = {

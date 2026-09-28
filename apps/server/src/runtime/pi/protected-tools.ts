@@ -129,6 +129,15 @@ export function satisfiesRequiredInput(
 ): boolean {
   for (const [key, value] of Object.entries(required)) {
     const actualValue = actual[key];
+    if (Array.isArray(value)) {
+      if (
+        !Array.isArray(actualValue) ||
+        actualValue.length !== value.length ||
+        !value.every((item, index) => samePrimitive(actualValue[index], item))
+      )
+        return false;
+      continue;
+    }
     if (isPlainRecord(value)) {
       if (!isPlainRecord(actualValue)) return false;
       if (Object.keys(actualValue).length !== Object.keys(value).length) return false;
