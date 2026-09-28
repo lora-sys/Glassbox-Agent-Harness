@@ -567,7 +567,7 @@ function requiredToolCall(
   // outside a private Owner Run, whatever else a message may name.
   if (input.caller.scope.chatType !== "private" || !isOwner) return undefined;
   const rawText = input.text;
-  const mediaIntent = mediaRequestIntent(rawText);
+  const mediaIntent = mediaRequestIntentForInput(input);
   if (mediaIntent === "image") return { name: MEDIA_GENERATION_TOOL, input: { action: "image" } };
   if (mediaIntent === "video") return { name: MEDIA_GENERATION_TOOL, input: { action: "video" } };
   if (authorizedToolNames?.includes(OWNER_MODEL_ADMIN_TOOL)) {
@@ -738,6 +738,32 @@ function mediaRequestIntent(text: string): "image" | "video" | "ambiguous" | und
   return undefined;
 }
 
+function mediaRequestIntentForInput(
+  input: Pick<ExecutionInput, "text" | "history">,
+): "image" | "video" | "ambiguous" | undefined {
+  const directIntent = mediaRequestIntent(input.text);
+  if (directIntent) return directIntent;
+
+  const answer = input.text.trim().replace(/[。！？!?]$/u, "");
+  const selectedIntent = /^(?:图片|图像|生图|插画|照片|海报)$/u.test(answer)
+    ? "image"
+    : /^(?:视频|短片|动画)$/u.test(answer)
+      ? "video"
+      : undefined;
+  if (!selectedIntent) return undefined;
+
+  const clarification = input.history.at(-1);
+  const precedingRequest = input.history.at(-2);
+  return clarification?.role === "assistant" &&
+    clarification.text
+      .trim()
+      .startsWith("请说明你想要图片、视频，还是文字描述。当前请求未执行。") &&
+    precedingRequest?.role === "user" &&
+    mediaRequestIntent(precedingRequest.text) === "ambiguous"
+    ? selectedIntent
+    : undefined;
+}
+
 function explicitModelSelectionCommand(text: string): boolean {
   const command = text.trim().replace(/^(?:Bob|Glassbox|玻璃盒)[，,\s]+/iu, "");
   return /^(?:请|帮我)?\s*(?:(?:(?:把|将)\s*(?:我\s*)?(?:后续的\s*)?(?:(?:Owner|QQ)\s*)?(?:好友)?私聊(?:模型)?\s*切换(?:到|成|为)?|切换(?:模型)?(?:到|成|为)?|换(?:到|成)|使用|switch to)\s*.*)$/iu.test(
@@ -769,7 +795,7 @@ function blockedMutationRequest(
   isOwner: boolean,
   modelProfiles: readonly PublicModelProfile[] = [],
 ): BlockedMutation | undefined {
-  const mediaIntent = mediaRequestIntent(input.text);
+  const mediaIntent = mediaRequestIntentForInput(input);
   if (mediaIntent === "ambiguous")
     return { operation: "media:generate", reason: "incomplete_parameters" };
   if (mediaIntent && (input.caller.scope.chatType !== "private" || !isOwner))
