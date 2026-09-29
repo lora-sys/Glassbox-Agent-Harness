@@ -3,6 +3,7 @@ import { isAbsolute } from "node:path";
 import { CHANNEL_SAFE_ERRORS } from "@glassbox/contracts";
 import type { ExecutorConfiguration } from "../config/executors.js";
 import type { CallerContext } from "../identity/scope.js";
+import { validateScope, type TrustedChannelScope } from "../identity/scope.js";
 import type { DomainStore } from "../application/domain-store.js";
 import type { RunService } from "../execution/run-service/index.js";
 import type { RunTraceStore } from "../trace/run-store.js";
@@ -22,7 +23,10 @@ import { ExecutorBusyError } from "../config/executors.js";
 const OWNER_ID = "owner";
 
 type RouteStore = {
-  authorization: Pick<DomainStore["authorization"], "revoke">;
+  authorization: Pick<
+    DomainStore["authorization"],
+    "revoke" | "grant" | "approve" | "hasActiveGrant"
+  >;
   tasks: Pick<DomainStore["tasks"], "recordTrace">;
   management: Pick<DomainStore["management"], "listConversations" | "listRuns">;
   lifecycle: Pick<DomainStore["lifecycle"], "listDeliveries">;
@@ -64,6 +68,26 @@ function principalId(value: unknown): string {
   if (typeof value !== "string" || !/^[\p{L}\p{N}_.:@-]{1,512}$/u.test(value))
     throw new ManagementError("INVALID_REQUEST", "Invalid principal identifier");
   return value;
+}
+
+function approvalPolicyInput(input: unknown) {
+  const value = workspaceInput(input);
+  const principal = principalId(value.principalId);
+  const resource = principalId(value.resourceId);
+  const action = principalId(value.action);
+  const raw = workspaceInput(value.scope);
+  const scope: TrustedChannelScope = {
+    connectionId: principalId(raw.connectionId),
+    botId: principalId(raw.botId),
+    chatType: raw.chatType === "group" ? "group" : "private",
+    chatId: principalId(raw.chatId),
+    senderId: principalId(raw.senderId),
+    ...(raw.threadId === undefined ? {} : { threadId: principalId(raw.threadId) }),
+  };
+  if (raw.chatType !== "group" && raw.chatType !== "private")
+    throw new ManagementError("INVALID_REQUEST", "Invalid channel scope");
+  validateScope(scope);
+  return { principalId: principal, resourceId: resource, action, scope };
 }
 
 function workspaceId(value: unknown): string {
@@ -116,6 +140,47 @@ export async function routeManagementRequest(
   if (request.method === "POST" && path === "/manage/ops/grants") {
     const result = await dependencies.grantOpsPermissions(await readManagementJson(request));
     return { status: 200, body: result };
+  }
+  if (request.method === "POST" && path === "/manage/auth/approval-policies") {
+    const input = approvalPolicyInput(await readManagementJson(request));
+    if (await dependencies.store.authorization.hasActiveGrant(input))
+      throw new ManagementError("INVALID_REQUEST", "An ALLOW grant already covers this action");
+    const grantId = await dependencies.store.authorization.grant({ ...input, effect: "approval" });
+    await dependencies.store.tasks.recordTrace({
+      type: "authorization.granted",
+      principalId: OWNER_ID,
+      data: { grantId, effect: "approval", authority: "local-management" },
+    });
+    return { status: 200, body: { grantId } };
+  }
+  if (request.method === "POST" && path === "/manage/auth/approvals") {
+    const input = workspaceInput(await readManagementJson(request));
+    const grantId = principalId(input.grantId);
+    if (
+      typeof input.expiresAt !== "string" ||
+      !Number.isFinite(Date.parse(input.expiresAt)) ||
+      Date.parse(input.expiresAt) <= Date.now() ||
+      Date.parse(input.expiresAt) > Date.now() + 24 * 60 * 60 * 1_000
+    )
+      throw new ManagementError("INVALID_REQUEST", "Approval expiry must be within 24 hours");
+    let approvalId: string;
+    try {
+      approvalId = await dependencies.store.authorization.approve({
+        grantId,
+        approverId: OWNER_ID,
+        expiresAt: input.expiresAt,
+      });
+    } catch (error) {
+      if (error instanceof Error && error.message === "No eligible approval policy")
+        throw new ManagementError("INVALID_REQUEST", error.message);
+      throw error;
+    }
+    await dependencies.store.tasks.recordTrace({
+      type: "authorization.granted",
+      principalId: OWNER_ID,
+      data: { grantId, approvalIssued: true, authority: "local-management" },
+    });
+    return { status: 200, body: { approvalId } };
   }
   const revokeOpsGrant = /^\/manage\/ops\/grants\/([a-zA-Z0-9-]{1,80})\/revoke$/u.exec(path);
   if (request.method === "POST" && revokeOpsGrant) {
