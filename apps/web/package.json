@@ -4,11 +4,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vite dev --port 5173",
-    "build": "vite build",
-    "preview": "vite preview"
+    "dev": "vp dev --port 5173",
+    "build": "vp build",
+    "preview": "vp preview"
   },
   "dependencies": {
+    "@tanstack/react-query": "^5.103.1",
     "@tanstack/react-router": "^1.132.0",
     "@tanstack/react-start": "^1.168.49",
     "react": "^19.2.0",

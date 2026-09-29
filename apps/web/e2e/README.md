@@ -18,6 +18,8 @@ Several historical files were written during Plan 01 and Plan 02 and may assume:
 
 Do not run the whole directory as the default verification for every change.
 
+`smoke.spec.mjs` is a portable exception: `npx playwright test smoke.spec.mjs` starts the Web dev server on 5173 through `playwright.config.ts` and checks the page without requiring the Glassbox API or credentials.
+
 ## Plan 03 rule
 
 New Personal Agent Foundation tests must be portable.
