@@ -117,8 +117,14 @@ export class CodexAdapter extends EventEmitter implements ProviderAdapter {
   }
 
   /** Register a callback that fires when the next turn/completed event is received. */
-  registerOnTurnEnd(fn: (status: string) => void, threadId?: string): void {
-    this._turnEndSubscribers.push({ fn, threadId });
+  registerOnTurnEnd(fn: (status: string) => void, threadId?: string): () => void {
+    const entry = { fn, threadId };
+    this._turnEndSubscribers.push(entry);
+    return () => {
+      this._turnEndSubscribers = this._turnEndSubscribers.filter(
+        (subscriber) => subscriber !== entry,
+      );
+    };
   }
 
   /** Fire and clear all turn-end subscribers (called from the event handler). */

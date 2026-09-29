@@ -116,7 +116,8 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
   private _info: ServerInfo;
 
   private approvalHandlers: Array<(ev: ApprovalEvent) => void> = [];
-  private turnEndSubscribers: Array<(status: string) => void> = [];
+  private turnEndSubscribers: Array<{ callback: (status: string) => void; sessionId?: string }> =
+    [];
 
   private _lifecycleLatch: {
     beforeSnapshot: FileSnapshot | null;
@@ -194,6 +195,12 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
         typeof _opts.appendSystemPrompt === "string" ? _opts.appendSystemPrompt : "",
     });
     return { id: clientSessionId };
+  }
+
+  releaseSession(sessionId: string): void {
+    const session = this.sessions.get(sessionId);
+    if (session?.turn && !session.turn.finished) return;
+    this.sessions.delete(sessionId);
   }
 
   // -------------------------------------------------------------------------
@@ -558,8 +565,13 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
         error: completed.error ?? null,
       },
     });
-    const subscribers = this.turnEndSubscribers.splice(0);
-    for (const subscriber of subscribers) subscriber(completed.status);
+    const subscribers = this.turnEndSubscribers.filter(
+      (subscriber) => !subscriber.sessionId || subscriber.sessionId === sessionId,
+    );
+    this.turnEndSubscribers = this.turnEndSubscribers.filter(
+      (subscriber) => subscriber.sessionId && subscriber.sessionId !== sessionId,
+    );
+    for (const subscriber of subscribers) subscriber.callback(completed.status);
     return this.makeResult(sessionId, turn.turnId, completed, counts, approvals, agentMessageCount);
   }
 
@@ -639,8 +651,14 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
   // Approval flow
   // -------------------------------------------------------------------------
 
-  registerOnTurnEnd(fn: (status: string) => void): void {
-    this.turnEndSubscribers.push(fn);
+  registerOnTurnEnd(fn: (status: string) => void, sessionId?: string): () => void {
+    const entry = { callback: fn, sessionId };
+    this.turnEndSubscribers.push(entry);
+    return () => {
+      this.turnEndSubscribers = this.turnEndSubscribers.filter(
+        (subscriber) => subscriber !== entry,
+      );
+    };
   }
 
   on(_event: "approval", handler: (ev: ApprovalEvent) => void): void {
