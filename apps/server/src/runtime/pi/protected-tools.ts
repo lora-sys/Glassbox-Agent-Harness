@@ -47,6 +47,70 @@ export class ToolAuthorizationError extends Error {
   }
 }
 
+/**
+ * Glassbox's own fixed codes a Tool may hand back to the model.
+ *
+ * The constructor pattern above is what makes a code safe to show: it is a sentence this
+ * repository wrote, so it carries no provider text and no parameter value. Most execution
+ * failures stay collapsed into `protected_tool_failed`, because "the Tool broke" is all a model
+ * can act on there. These are the exception, and each one names a rule the model can satisfy on
+ * its next call. Collapsing them erased exactly that distinction, which is how a Run came to
+ * report "the Tool failed" for a refusal the Owner's message had caused, tell the user the
+ * instruction had been recorded, and write nothing.
+ */
+const TOOL_GATE_CODES: ReadonlySet<string> = new Set([
+  // The Owner's own message did not carry the literal command this mutation requires.
+  "owner_confirmation_required",
+  "owner_private_required",
+  "memory_manual_review_required",
+  "memory_conflict_unresolved",
+  // The named target does not exist, or is not in a state this action can change.
+  "candidate_not_found",
+  "candidate_not_pending",
+  "memory_not_found",
+  "memory_not_active",
+  "memory_type_mismatch",
+  "memory_scope_mismatch",
+  "memory_match_scope_mismatch",
+  "model_profile_not_found",
+  "model_profile_ambiguous",
+  "model_profile_unavailable",
+  "model_profile_capability_incomplete",
+  "invalid_model_profile",
+  // The request cannot be served in this Run's context at all.
+  "channel_not_connected",
+  "bot_not_in_group",
+  "group_not_enabled",
+  "history_filter_required",
+  "memory_source_denied",
+  "memory_source_query_required",
+  "skill_not_authorized_for_run",
+  "skill_authority_changed",
+]);
+
+/**
+ * The gate code a serialized Tool failure carries, when it carries one.
+ *
+ * This scans rather than compares because the caller only ever has the serialized result, and a
+ * code found here is emitted as a code — never as the message — so nothing else in the result
+ * reaches the model or the Trace.
+ */
+export function toolGateFailureCode(serialized: string): string | undefined {
+  for (const code of TOOL_GATE_CODES) if (serialized.includes(code)) return code;
+  return undefined;
+}
+
+/**
+ * Whether a message is exactly one of the fixed codes, and so safe to hand back to the model.
+ *
+ * Exact matching is required here and not in `toolGateFailureCode` above: this is the pass-through
+ * that returns the message itself, so a message that merely embeds a code —
+ * `owner_confirmation_required for candidate_cafebabe` — would carry the parameter with it.
+ */
+export function isToolGateCode(message: string): boolean {
+  return TOOL_GATE_CODES.has(message);
+}
+
 export interface ProtectedToolOptions<
   TParams extends Record<string, unknown> = Record<string, unknown>,
   TResult = unknown,
@@ -162,16 +226,26 @@ function satisfiesRequiredMutationInput(
 }
 
 /**
- * The exact-input clause of a required-Tool instruction.
+ * The instruction for one required call, naming what to send.
  *
  * A required Tool that pins down no parameter — a search whose query the message does not
- * dictate — contributes no clause at all. Naming the empty object would tell the model to
- * send `{}`, which the Tool's own schema rejects.
+ * dictate — used to contribute no clause at all, on the reasoning that naming the empty object
+ * would tell the model to send `{}`, which the Tool's own schema rejects. Saying nothing did not
+ * avoid that outcome; it produced it. A bare "call the Tool" leaves the model to send an empty
+ * argument, and every Tool behind these requirements rejects a call carrying no filter at all,
+ * so the Run failed closed on an instruction the prompt itself had written.
+ *
+ * The unpinned half therefore names the source the filter has to come from — the user's own
+ * words — which keeps the requirement satisfiable without inventing a parameter the message
+ * never gave.
  */
-export function requiredInputClause(input: Record<string, unknown> | undefined): string {
+export function requiredCallClause(
+  name: string,
+  input: Record<string, unknown> | undefined,
+): string {
   return input && Object.keys(input).length > 0
-    ? ` with exactly this JSON input: ${JSON.stringify(input)}`
-    : "";
+    ? `${name} with exactly this JSON input: ${JSON.stringify(input)}`
+    : `${name} with a filter taken from the user's own words`;
 }
 
 /**
@@ -307,6 +381,9 @@ export function createProtectedTool<
         // the generic failure would erase the difference between "the bridge is down" and
         // "the Tool threw", which is exactly what a Run has to be able to report.
         if (error instanceof ProviderCallError) throw error;
+        // A fixed Glassbox code is a rule the model can satisfy, not an internal failure, so it
+        // passes through unchanged and the next call can be a correction instead of a repeat.
+        if (error instanceof Error && isToolGateCode(error.message)) throw error;
         throw new Error("protected_tool_failed");
       }
     },

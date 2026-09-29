@@ -102,6 +102,9 @@ it("re-authorizes locked Skill reads against the Run snapshot and current group 
     ).resolves.toMatchObject({
       details: { skillName: "fixture", path: "SKILL.md", content: skill },
     });
+    // Each refusal carries its own code rather than a collapsed "the Tool failed": a model that
+    // reads the reason can correct the call, and one that reads only `protected_tool_failed`
+    // repeats it.
     await expect(
       read.execute(
         "unauthorized",
@@ -110,11 +113,13 @@ it("re-authorizes locked Skill reads against the Run snapshot and current group 
         undefined,
         {} as never,
       ),
-    ).rejects.toThrow("protected_tool_failed");
+    ).rejects.toThrow("skill_not_authorized_for_run");
     liveAuthorized = false;
+    // A different code, because it is a different fact: the Run's snapshot still lists the
+    // skill, and the live policy is what withdrew it.
     await expect(
       read.execute("changed", { skillName: "fixture" }, undefined, undefined, {} as never),
-    ).rejects.toThrow("protected_tool_failed");
+    ).rejects.toThrow("skill_authority_changed");
     liveAuthorized = true;
     await store.authorization.revoke(grant);
     await expect(

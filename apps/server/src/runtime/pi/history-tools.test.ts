@@ -272,6 +272,7 @@ it("searches several authorized groups in one Owner-private call", async () => {
       }),
       syncGroup: async (groupId) => {
         synced.push(groupId);
+        return undefined;
       },
     });
 
@@ -313,6 +314,7 @@ it("intersects requested filters with the authorized set before loading text", a
       }),
       syncGroup: async (groupId) => {
         synced.push(groupId);
+        return undefined;
       },
     });
 
@@ -347,6 +349,7 @@ it("fetches nothing and returns no candidate for an unauthorized group", async (
       }),
       syncGroup: async (groupId) => {
         synced.push(groupId);
+        return undefined;
       },
     });
 
@@ -1590,6 +1593,11 @@ it("answers an exact identifier from the message that carries it and nothing els
     expect(view.coverage.coverage).toBe("complete");
     expect(view.guidance).toContain("only the fields the user requested");
     expect(view.guidance).toContain("do not narrate Tool names");
+    // The named term is quoted with corner brackets, not double quotes. The model restates this
+    // sentence when it answers and the outbound pipeline passes its quoting straight through to
+    // QQ, so the style here is the style a group member reads.
+    expect(view.guidance).toContain(`「${EXACT_IDENTIFIER.toLowerCase()}」`);
+    expect(view.guidance).not.toContain(`"${EXACT_IDENTIFIER.toLowerCase()}"`);
   } finally {
     await store.close();
   }
@@ -1647,6 +1655,8 @@ it("never lets a near miss stand in for an identifier the history does not conta
     // produce identical records; the guidance still names the identifier that was asked for.
     expect(view.guidance.toLowerCase()).toContain(EXACT_IDENTIFIER.toLowerCase());
     expect(view.guidance).toContain("verbatim");
+    expect(view.guidance).toContain(`「${EXACT_IDENTIFIER.toLowerCase()}」`);
+    expect(view.guidance).not.toContain(`"${EXACT_IDENTIFIER.toLowerCase()}"`);
     expect(view.coverage.droppedByExactTerm).toBe(2);
     expect(text).not.toContain("1349 已经修好了");
     expect(text).not.toContain("member-c");

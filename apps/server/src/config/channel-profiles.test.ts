@@ -312,4 +312,53 @@ describe("server-owned channel profiles", () => {
       "Channel profile not found",
     );
   });
+
+  it("persists the bot's own display name, and clears it when the name is emptied", async () => {
+    const { directory, store } = await fixture();
+    // This is the first place a rename can be stored: before it, the only self-introduction a
+    // Run could state came from the Kit prompt or from whatever nickname QQ had on file.
+    const saved = await store.save({ ...input, botDisplayName: "lorabot" });
+    expect(saved.botDisplayName).toBe("lorabot");
+    const reopened = await ChannelProfileStore.open(directory);
+    expect(reopened.resolve(input.id).config.botDisplayName).toBe("lorabot");
+    expect(reopened.list()[0]?.botDisplayName).toBe("lorabot");
+    // Emptying the box asks for no configured name, which is a valid state and not a save error.
+    await reopened.save({ ...input, botDisplayName: "   " });
+    const cleared = await ChannelProfileStore.open(directory);
+    expect(cleared.resolve(input.id).config.botDisplayName).toBeUndefined();
+    expect(cleared.list()[0]?.botDisplayName).toBeUndefined();
+    // A channel that never configured a name has none, rather than a substituted one.
+    const other = await ChannelProfileStore.open(directory);
+    await other.save({ ...input, id: "second", botId: "22222", ownerId: "33333" });
+    expect(other.resolve("second").config.botDisplayName).toBeUndefined();
+  });
+
+  it("trims the display name and rejects one that is not a usable name", async () => {
+    const { store } = await fixture();
+    await store.save({ ...input, botDisplayName: "  lorabot  " });
+    expect(store.resolve(input.id).config.botDisplayName).toBe("lorabot");
+    // The name is printed into an outbound QQ message and into the system prompt, so a control
+    // character or an over-long value is refused rather than carried through either.
+    for (const botDisplayName of ["bad\nname", "bad\0name", "x".repeat(65), 42, {}, ["lorabot"]]) {
+      expect(() => store.save({ ...input, botDisplayName })).toThrow();
+    }
+    expect(store.resolve(input.id).config.botDisplayName).toBe("lorabot");
+  });
+
+  it("rejects a display name on a file that was written without one being valid", async () => {
+    const { directory } = await fixture();
+    await writeFile(
+      join(directory, "channels.json"),
+      JSON.stringify({
+        version: 1,
+        channels: [
+          { ...input, credentialSlot: "owned", autoConnect: false, botDisplayName: "bad\nname" },
+        ],
+        credentials: {},
+      }),
+    );
+    await expect(ChannelProfileStore.open(directory)).rejects.toThrow(
+      "Cannot read channel configuration",
+    );
+  });
 });

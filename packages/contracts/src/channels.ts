@@ -23,6 +23,14 @@ export interface ChannelSaveInput {
   coOwnerId?: string;
   groupIds: string[];
   executionRef: string;
+  /**
+   * What the bot calls itself, and the only place a rename can be persisted.
+   *
+   * Omitted means no configured name. This is deliberately not the QQ account's nickname:
+   * that lives on QQ, changes without anyone editing this server, and gave the same account
+   * three different self-introductions in one night.
+   */
+  botDisplayName?: string;
   /** Omitted preserves the token, null clears it, a string replaces it. */
   token?: string | null;
 }

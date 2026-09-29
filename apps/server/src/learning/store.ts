@@ -363,6 +363,34 @@ export class LearningStore {
       status: "pending",
       createdAt: new Date().toISOString(),
     };
+    // The same assertion cannot be queued twice. `memories` has deduplicated on this signature
+    // since the learning schema, and `promoteCandidate` absorbs a candidate into the memory it
+    // matches; candidates had no equivalent, so re-running a source read or a repeated model
+    // inference appended another row with the same statement each time, and the Owner's review
+    // queue filled with duplicates of what was already in it. The queue is the whole pending set
+    // and stays small by construction — it is what an Owner reviews by hand — so it is read in
+    // full rather than indexed.
+    const signature = memorySignature({
+      subject: candidate.subject,
+      scope: candidate.scope,
+      type: candidate.proposedType,
+      statement: candidate.statement,
+    });
+    const pending = (
+      await tx.execute({ sql: "SELECT * FROM memory_candidates WHERE status = 'pending'" })
+    ).rows.map(candidateFromRow);
+    const duplicate = pending.find(
+      (row) =>
+        memorySignature({
+          subject: row.subject,
+          scope: row.scope,
+          type: row.proposedType,
+          statement: row.statement,
+        }) === signature,
+    );
+    // Returning the row already in the queue keeps the caller's answer true — the assertion *is*
+    // pending review — without adding a second copy of it to review.
+    if (duplicate) return duplicate;
     await tx.execute({
       sql: "INSERT INTO memory_candidates(id, candidate_kind, subject_json, scope_json, proposed_type, statement, content_json, source_json, evidence_json, confidence, sensitivity, retention_policy, ttl_seconds, merge_hint_json, extensions_json, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
       args: [
@@ -435,15 +463,23 @@ export class LearningStore {
 
   async listCandidates(
     context: LearningOperationContext,
-    status?: MemoryCandidate["status"],
+    options: { status?: MemoryCandidate["status"]; scope?: GlassboxMemoryScope } = {},
   ): Promise<MemoryCandidate[]> {
     await this.authorize(context, MEMORY_READ_ACTION);
+    if (options.scope) validateScope(options.scope);
+    // The scope is matched in the same canonical form the signature uses, so a caller that states
+    // a scope with its fields in another order still sees the same candidates.
+    const scopeSignature = options.scope ? json(options.scope) : null;
     return this.db.transaction(async (tx) => {
       const result = await tx.execute({
-        sql: `SELECT * FROM memory_candidates${status ? " WHERE status = ?" : ""} ORDER BY created_at ASC, id ASC`,
-        args: status ? [status] : [],
+        sql: `SELECT * FROM memory_candidates${
+          options.status ? " WHERE status = ?" : ""
+        } ORDER BY created_at ASC, id ASC`,
+        args: options.status ? [options.status] : [],
       });
-      return result.rows.map(candidateFromRow);
+      return result.rows
+        .map(candidateFromRow)
+        .filter((candidate) => scopeSignature === null || json(candidate.scope) === scopeSignature);
     });
   }
 

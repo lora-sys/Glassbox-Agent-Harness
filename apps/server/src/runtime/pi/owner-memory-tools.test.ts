@@ -307,6 +307,9 @@ it("exposes Owner-only governed Memory operations and rechecks revoked write aut
       scope: { type: "project", projectId: "glassbox" },
       mergeHint: { ifMatchMemoryId: memoryId },
     });
+    // The refusal is the point, not the fact of one: the model has to be able to tell a promotion
+    // the Owner's own message did not authorize from a Tool that broke, or it reports the second
+    // and the Owner's instruction silently never lands.
     await expect(
       tool!.execute(
         "unconfirmed-promotion",
@@ -318,7 +321,7 @@ it("exposes Owner-only governed Memory operations and rechecks revoked write aut
         undefined,
         {} as never,
       ),
-    ).rejects.toThrow("protected_tool_failed");
+    ).rejects.toThrow("owner_confirmation_required");
     expect((await store.learning.getMemory({ caller }, memoryId))?.lifecycleState).toBe("active");
     await expect(
       tool!.execute(
@@ -334,7 +337,7 @@ it("exposes Owner-only governed Memory operations and rechecks revoked write aut
         undefined,
         {} as never,
       ),
-    ).rejects.toThrow("protected_tool_failed");
+    ).rejects.toThrow("memory_scope_mismatch");
     const listed = await tool!.execute(
       "list",
       { action: "list", scopeType: "project", projectId: "glassbox" },
@@ -414,6 +417,15 @@ it("exposes Owner-only governed Memory operations and rechecks revoked write aut
       normalizedText: "Source fact.",
       occurredAt: "2026-09-20T10:00:00Z",
     });
+    await archive.ingest({
+      channel: "qq",
+      connectionId: "qq",
+      groupId: "100",
+      externalMessageId: "external-2",
+      senderId: "member-2",
+      normalizedText: "哈哈",
+      occurredAt: "2026-09-20T10:01:00Z",
+    });
     const source = await tool!.execute(
       "source",
       {
@@ -422,25 +434,76 @@ it("exposes Owner-only governed Memory operations and rechecks revoked write aut
         sourceClass: "history",
         scopeType: "project",
         projectId: "glassbox",
+        query: "Source fact",
       },
       undefined,
       undefined,
       {} as never,
     );
-    expect(source.details).toMatchObject([
+    expect(source.details).toMatchObject({
+      matched: 1,
+      imported: 1,
+      skipped: 0,
+      candidates: [
+        expect.objectContaining({
+          status: "pending",
+          sourceEvidence: [
+            expect.objectContaining({
+              metadata: expect.objectContaining({
+                externalMessageId: "external-1",
+                senderId: "member-1",
+                untrustedInput: true,
+              }),
+            }),
+          ],
+        }),
+      ],
+    });
+    // The message that asserts nothing was never read as a candidate: the query matched one
+    // message and the rest of the read was dropped before it reached the review queue.
+    const queued = () =>
+      store.learning.listCandidates(
+        { caller },
+        { scope: { type: "project", projectId: "glassbox" } },
+      );
+    const before = (await queued()).length;
+
+    // The same read again queues nothing new: the assertion is already pending review, so a
+    // repeated or re-run read cannot fill the Owner's queue with copies of what is in it.
+    const again = await tool!.execute(
+      "source-again",
       {
-        status: "pending",
-        sourceEvidence: [
-          {
-            metadata: {
-              externalMessageId: "external-1",
-              senderId: "member-1",
-              untrustedInput: true,
-            },
-          },
-        ],
+        action: "source",
+        groupId: "100",
+        sourceClass: "history",
+        scopeType: "project",
+        projectId: "glassbox",
+        query: "Source fact",
       },
-    ]);
+      undefined,
+      undefined,
+      {} as never,
+    );
+    expect(again.details).toMatchObject({ imported: 1 });
+    expect(await queued()).toHaveLength(before);
+
+    // No query at all is refused rather than defaulting to "the most recent messages", and the
+    // refusal says which rule was broken.
+    await expect(
+      tool!.execute(
+        "source-no-query",
+        {
+          action: "source",
+          groupId: "100",
+          sourceClass: "history",
+          scopeType: "project",
+          projectId: "glassbox",
+        },
+        undefined,
+        undefined,
+        {} as never,
+      ),
+    ).rejects.toThrow("memory_source_query_required");
     expect(await store.learning.listMemories({ caller })).toHaveLength(1);
 
     const explicitRun = await store.conversations.acceptIncoming({
@@ -549,6 +612,119 @@ it("rejects the private Memory tool from a group context before loading content"
     await expect(
       tool!.execute("group-list", { action: "list" }, undefined, undefined, {} as never),
     ).rejects.toThrow("private_group_context");
+  } finally {
+    await store.close();
+  }
+});
+
+it("authorizes a governing command the Owner wrote on its own line, and nothing else", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  const caller = {
+    principalId: "owner",
+    scope: {
+      connectionId: "qq",
+      botId: "bot",
+      chatType: "private" as const,
+      chatId: "owner",
+      senderId: "owner",
+    },
+  };
+  try {
+    await store.identities.bindOwner("owner", caller.scope);
+    await store.conversations.createAgent("personal");
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: "agent:personal",
+      action: "run:create",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    await store.authorization.registerResource({
+      id: OWNER_MEMORY_RESOURCE,
+      kind: "owner-memory",
+      visibility: "private",
+      ownerId: "owner",
+    });
+    for (const action of [MEMORY_READ_ACTION, MEMORY_WRITE_ACTION, MEMORY_GOVERN_ACTION])
+      await store.authorization.grant({
+        principalId: "owner",
+        resourceId: OWNER_MEMORY_RESOURCE,
+        action,
+        scope: caller.scope,
+        effect: "allow",
+      });
+    const seed = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: caller.scope,
+      messageId: "seed",
+      text: "开始候选审核",
+      executionRef: "pi:test",
+    });
+    const candidate = await store.learning.createCandidate(
+      { caller, conversationId: seed.conversation.id, runId: seed.run.id },
+      {
+        candidateKind: "assertion",
+        subject: { kind: "user", id: "owner" },
+        scope: { type: "global" },
+        proposedType: "semantic_fact",
+        statement: "A fact the Owner confirmed.",
+        content: { statement: "A fact the Owner confirmed." },
+        source: { kind: "system", ref: `run:${seed.run.id}` },
+        sourceEvidence: [],
+        confidence: 0.9,
+        mergeHint: { strategy: "manual_review_required" },
+        extensions: {},
+      },
+    );
+    let currentRunId = seed.run.id;
+    const [tool] = createOwnerMemoryTools({
+      store,
+      getContext: () => ({
+        caller,
+        runId: currentRunId,
+        conversationId: seed.conversation.id,
+      }),
+    });
+
+    // The command inside a longer message, on its own line: the Owner typed it, so it authorizes
+    // the promotion. Requiring the whole message to equal the command refused this one.
+    const inSentence = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: caller.scope,
+      messageId: "in-sentence",
+      text: `好的，把这条提升吧\n   /memory promote ${candidate.candidateId}   \n谢谢`,
+      executionRef: "pi:test",
+    });
+    currentRunId = inSentence.run.id;
+    expect(
+      await tool!.execute(
+        "in-sentence",
+        { action: "promote", id: candidate.candidateId },
+        undefined,
+        undefined,
+        {} as never,
+      ),
+    ).toMatchObject({ details: { lifecycleState: "active" } });
+
+    // The same command with no command in the message at all still authorizes nothing, and the
+    // refusal names the gate rather than collapsing into "the Tool failed".
+    const prose = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: caller.scope,
+      messageId: "prose-only",
+      text: "把第一个候选提升",
+      executionRef: "pi:test",
+    });
+    currentRunId = prose.run.id;
+    await expect(
+      tool!.execute(
+        "prose-only",
+        { action: "promote", id: candidate.candidateId },
+        undefined,
+        undefined,
+        {} as never,
+      ),
+    ).rejects.toThrow("owner_confirmation_required");
   } finally {
     await store.close();
   }

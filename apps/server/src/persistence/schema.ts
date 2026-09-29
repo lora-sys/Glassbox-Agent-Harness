@@ -2,7 +2,7 @@ import type { Transaction } from "@libsql/client";
 
 import { conversationScopeKey } from "../identity/scope.js";
 
-export const CURRENT_SCHEMA_VERSION = 12;
+export const CURRENT_SCHEMA_VERSION = 13;
 
 function persistedText(value: unknown): string {
   if (typeof value !== "string") throw new Error("Invalid migration record");
@@ -95,12 +95,20 @@ export const schemaV12Migration = [
   )`,
 ];
 
+/**
+ * A Run's terminal status says what happened; `failure_code` says why, for the Runs whose own
+ * text was never produced. Without it the fallback line a reader receives could only name the
+ * status, which turned every executor failure into the same opaque sentence.
+ */
+export const schemaV13Migration = ["ALTER TABLE runs ADD COLUMN failure_code TEXT"];
+
 export const schema = [
   ...baseSchema,
   ...schemaV7Statements,
   ...schemaV8Migration,
   ...learningSchema,
   ...schemaV12Migration,
+  ...schemaV13Migration,
 ];
 
 export const schemaV5Migration = ["ALTER TABLE tasks ADD COLUMN origin_scope_key TEXT"];

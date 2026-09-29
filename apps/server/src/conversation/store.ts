@@ -44,6 +44,8 @@ export interface RunRecord {
   executionRef: string;
   status: RunStatus;
   resultText: string | null;
+  /** Why a non-succeeded Run produced no usable text, when the adapter could name a cause. */
+  failureCode?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -75,6 +77,17 @@ export interface IncomingImage {
   mimeType: IncomingImageMimeType;
   data: Buffer;
 }
+/**
+ * Who wrote one turn of a Conversation's history.
+ *
+ * The principal is the durable identity behind the turn; the QQ number is what a group member
+ * can actually see and refer to, and it is what a rendered label carries.
+ */
+export interface HistoryActor {
+  principalId: string;
+  senderId?: string;
+}
+
 export interface RunInputRecord {
   run: RunRecord;
   conversation: ConversationRecord;
@@ -82,6 +95,15 @@ export interface RunInputRecord {
   images?: Array<{ mimeType: IncomingImageMimeType; data: string }>;
   imageFailureCode?: IncomingImageFailure;
   history: Array<{ role: "user" | "assistant"; text: string }>;
+  /**
+   * One entry per history turn, in the same order, naming the principal who spoke it.
+   *
+   * Present only where the Conversation is shared between senders. A group keeps one Conversation
+   * for everyone in it, so its history interleaves several principals; without this, a turn the
+   * Owner wrote and a turn a visitor wrote arrive at the model as the same unattributed voice,
+   * and the current speaker inherits every claim either of them made.
+   */
+  historyActors?: HistoryActor[];
   /** One Run id per complete user/assistant exchange in history. */
   historyRunIds?: string[];
   /** A bounded source scan or load bound was reached after authorization checks. */
@@ -104,6 +126,9 @@ export function runRecord(row: Row): RunRecord {
     executionRef: stringColumn(row, "execution_ref"),
     status: stringColumn(row, "status") as RunStatus,
     resultText: optionalString(row, "result_text"),
+    ...(optionalString(row, "failure_code") === null
+      ? {}
+      : { failureCode: optionalString(row, "failure_code")! }),
     createdAt: stringColumn(row, "created_at"),
     updatedAt: stringColumn(row, "updated_at"),
   };
@@ -449,6 +474,35 @@ export class ConversationStore {
         });
         remapPrivateLocation = true;
       }
+      // A group Conversation is opened by whoever speaks in it first, so its principal is
+      // usually a visitor and stays that way. The Owner's own management view lists Conversations
+      // by principal, which left a group the Owner actively uses out of that view entirely.
+      // Rebinding records the Owner-facing principal; it grants nothing, because a group's
+      // resource is public and every decision is already keyed on the speaking principal and
+      // scope rather than on the Conversation's.
+      if (
+        conversationRow &&
+        input.scope.chatType === "group" &&
+        stringColumn(conversationRow, "principal_id") !== caller.principalId &&
+        (
+          await tx.execute({
+            sql: "SELECT 1 FROM principals WHERE id = ? AND kind = 'owner'",
+            args: [caller.principalId],
+          })
+        ).rows.length === 1
+      ) {
+        const conversationId = stringColumn(conversationRow, "id");
+        await tx.execute({
+          sql: "UPDATE conversations SET principal_id = ? WHERE id = ?",
+          args: [caller.principalId, conversationId],
+        });
+        conversationRow = (
+          await tx.execute({
+            sql: "SELECT * FROM conversations WHERE id = ?",
+            args: [conversationId],
+          })
+        ).rows[0];
+      }
       if (!conversationRow) {
         const id = randomUUID();
         const resourceId = `conversation:${id}`;
@@ -757,11 +811,28 @@ export class ConversationStore {
         });
         const conversation = conversationRecord(conversations.rows[0]!, caller.scope);
         const earlier = await tx.execute({
-          sql: "SELECT runs.id, runs.principal_id, runs.sequence, runs.message_id, runs.status FROM runs WHERE runs.conversation_id = ? AND runs.sequence < ? AND runs.status IN ('succeeded', 'failed') AND runs.result_text IS NOT NULL AND (runs.status = 'succeeded' OR EXISTS (SELECT 1 FROM deliveries d WHERE d.run_id = runs.id AND d.status = 'sent' AND d.payload_kind IN ('text', 'result'))) AND NOT EXISTS (SELECT 1 FROM ops_trace_events e WHERE e.run_id = runs.id AND e.type = 'context.excluded') ORDER BY runs.sequence DESC LIMIT 257",
+          sql: "SELECT runs.id, runs.principal_id, runs.sequence, runs.message_id, runs.status, runs.scope_json FROM runs WHERE runs.conversation_id = ? AND runs.sequence < ? AND runs.status IN ('succeeded', 'failed') AND runs.result_text IS NOT NULL AND (runs.status = 'succeeded' OR EXISTS (SELECT 1 FROM deliveries d WHERE d.run_id = runs.id AND d.status = 'sent' AND d.payload_kind IN ('text', 'result'))) AND NOT EXISTS (SELECT 1 FROM ops_trace_events e WHERE e.run_id = runs.id AND e.type = 'context.excluded') ORDER BY runs.sequence DESC LIMIT 257",
           args: [run.conversationId, row.sequence!],
         });
+        // The QQ number each turn came from. It is already persisted on the Run as its scope, so
+        // attribution needs no second source: a group's principal id names who spoke only for
+        // visitors, and an Owner's does not name the account at all.
+        const senderIdFor = (prior: Row): string | undefined => {
+          try {
+            const scope = JSON.parse(stringColumn(prior, "scope_json")) as { senderId?: unknown };
+            return typeof scope.senderId === "string" ? scope.senderId : undefined;
+          } catch {
+            return undefined;
+          }
+        };
+        // A group is one Conversation shared by everyone in it, so a turn's author has to be
+        // named for the reader. A private Conversation has one speaker by construction, and the
+        // two scope keys differ there only because they are different tuple lengths — comparing
+        // them would report every private chat as shared.
+        const sharedConversation = caller.scope.chatType === "group";
         const callerLocationKey = conversationScopeKey(caller.scope);
-        const exchanges: Array<{ runId: string; user: string; assistant: string }> = [];
+        const exchanges: Array<HistoryActor & { runId: string; user: string; assistant: string }> =
+          [];
         const omittedRunIds: string[] = [];
         let loadedChars = 0;
         let historyScanTruncated = earlier.rows.length > 256;
@@ -836,7 +907,13 @@ export class ConversationStore {
             continue;
           }
           loadedChars += user.length + assistant.length;
-          exchanges.push({ runId: priorRunId, user, assistant });
+          exchanges.push({
+            runId: priorRunId,
+            user,
+            assistant,
+            principalId: priorPrincipalId,
+            ...(senderIdFor(prior) === undefined ? {} : { senderId: senderIdFor(prior) }),
+          });
         }
         exchanges.reverse();
         const history = exchanges.flatMap(({ user, assistant }) => [
@@ -862,6 +939,20 @@ export class ConversationStore {
             ? { imageFailureCode: imageFailureCode as IncomingImageFailure }
             : {}),
           history,
+          // Only a Conversation that several senders share needs per-turn attribution. A private
+          // Conversation has one speaker by construction, so the field stays absent rather than
+          // repeating the same principal on every line.
+          ...(sharedConversation
+            ? {
+                historyActors: history.map((_, index) => {
+                  const exchange = exchanges[Math.floor(index / 2)]!;
+                  return {
+                    principalId: exchange.principalId,
+                    ...(exchange.senderId === undefined ? {} : { senderId: exchange.senderId }),
+                  };
+                }),
+              }
+            : {}),
           historyRunIds: exchanges.map((exchange) => exchange.runId),
           historyScanTruncated,
           historyOmittedRunIds: omittedRunIds,

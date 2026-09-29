@@ -364,6 +364,26 @@ describe("OneBot configuration", () => {
     expect(() => parseOneBotConfig({ ...base, ownerId: "9007199254740993" })).toThrow();
     expect(() => parseOneBotConfig({ ...base, credentialSlot: "" })).toThrow();
   });
+
+  it("carries a configured bot display name and rejects one that is not a name", () => {
+    // The one rename target Glassbox can persist. The connection label is deliberately not a
+    // fallback for it: the label is the operator's name for the channel, and the bot showing up
+    // under it is the same problem the configured name exists to solve.
+    expect(parseOneBotConfig({ ...base }).botDisplayName).toBeUndefined();
+    expect(parseOneBotConfig({ ...base, botDisplayName: "lorabot" }).botDisplayName).toBe(
+      "lorabot",
+    );
+    expect(parseOneBotConfig({ ...base, botDisplayName: "  lorabot  " }).botDisplayName).toBe(
+      "lorabot",
+    );
+    // A name that trims to nothing means "no configured name", never an empty one.
+    expect(parseOneBotConfig({ ...base, botDisplayName: "   " }).botDisplayName).toBeUndefined();
+    expect(parseOneBotConfig({ ...base, botDisplayName: null }).botDisplayName).toBeUndefined();
+    for (const botDisplayName of ["bad\nname", "x".repeat(65), 42, ["lorabot"]])
+      expect(() => parseOneBotConfig({ ...base, botDisplayName })).toThrow(
+        "Invalid bot display name",
+      );
+  });
 });
 
 describe("OneBot forward WebSocket", () => {

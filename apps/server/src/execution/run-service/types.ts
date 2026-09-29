@@ -1,6 +1,7 @@
 import type { DeliveryRecord } from "../../conversation/lifecycle.js";
 import type {
   ConversationRecord,
+  HistoryActor,
   IncomingImageFailure,
   IncomingImageMimeType,
   RunRecord,
@@ -19,6 +20,8 @@ export interface ExecutionInput {
   images?: readonly { mimeType: IncomingImageMimeType; data: string }[];
   imageFailureCode?: IncomingImageFailure;
   history: Array<{ role: "user" | "assistant"; text: string }>;
+  /** One entry per history turn, in the same order, naming who wrote it. */
+  historyActors?: readonly HistoryActor[];
   historyRunIds?: string[];
   historyScanTruncated?: boolean;
   historyOmittedRunIds?: string[];
@@ -34,8 +37,23 @@ export interface ExecutionResult {
   status: "succeeded" | "failed" | "cancelled" | "interrupted" | "unknown";
   text?: string;
   providerSessionId?: string;
-  /** The selected model was rejected before any provider request or Tool call. */
-  failureCode?: "pre_provider_context_overflow" | "model_capacity_unknown";
+  /**
+   * A fixed diagnostic code naming why this Run produced no answer of its own. It is persisted so
+   * the fallback line a reader receives states the cause rather than the terminal status, and so a
+   * Run recovered at startup still delivers the same line. Provider error text never enters this
+   * union: these are Glassbox's own classifications.
+   */
+  failureCode?:
+    /** The selected model was rejected before any provider request or Tool call. */
+    | "pre_provider_context_overflow"
+    /** The model's context capacity could not be established, so nothing was sent. */
+    | "model_capacity_unknown"
+    /** The action the message pinned down never executed, so the answer cannot stand. */
+    | "required_action_not_completed"
+    /** The facts the message was about were never observed, so the answer cannot stand. */
+    | "required_evidence_missing"
+    /** The executor threw before producing a classified result of its own. */
+    | "execution_threw";
 }
 
 export interface RunExecutionAdapter {

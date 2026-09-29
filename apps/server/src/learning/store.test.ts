@@ -6,7 +6,12 @@ import { createClient } from "@libsql/client";
 import type { CallerContext, DomainStore, TrustedChannelScope } from "../persistence/index.js";
 import { openDomainStore } from "../persistence/index.js";
 import { localDatabaseUrl } from "../persistence/database.js";
-import { baseSchema, schemaV7Statements, schemaV8Migration } from "../persistence/schema.js";
+import {
+  CURRENT_SCHEMA_VERSION,
+  baseSchema,
+  schemaV7Statements,
+  schemaV8Migration,
+} from "../persistence/schema.js";
 import { MemoryConsolidator } from "./consolidation.js";
 import { candidateFromAuthorizedSource } from "./source.js";
 import {
@@ -191,7 +196,11 @@ describe("P4A durable learning truth", () => {
     const { store } = await fixture(databasePath);
     expect(await store.learning.listCandidates(context)).toEqual([]);
     const db = createClient({ url: localDatabaseUrl(databasePath) });
-    expect((await db.execute("PRAGMA user_version")).rows[0]?.user_version).toBe(12);
+    // Read against the current version rather than a literal, so the next migration does not turn
+    // this into a failure about a number nobody meant to pin.
+    expect((await db.execute("PRAGMA user_version")).rows[0]?.user_version).toBe(
+      CURRENT_SCHEMA_VERSION,
+    );
     expect((await db.execute("PRAGMA table_info(channel_messages)")).rows.length).toBeGreaterThan(
       0,
     );

@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
   CHANNEL_SAFE_ERRORS,
+  type ChannelSafeError,
   type PublicChannelProfile,
   type PublicModelProfile,
   type QqSourceClass,
@@ -24,6 +25,7 @@ import { fitsIncomingImageBudget } from "../channels/onebot/image-input.js";
 import {
   RunService,
   type ExecutionInput,
+  type ExecutionResult,
   type RunExecutionAdapter,
   type RunServiceEvent,
 } from "../execution/run-service/index.js";
@@ -33,6 +35,7 @@ import {
   selectRoute,
   toRoutingEvidence,
   type ModelCapacity as RouteModelCapacity,
+  type RuntimeHealthState,
 } from "../routing/index.js";
 import {
   aggregateRuntimeUsage,
@@ -115,6 +118,7 @@ import {
   createHistoryTools,
   historyToolEligibility,
   type HistorySyncOutcome,
+  type HistorySyncStop,
   OWNER_HISTORY_ACTION,
   OWNER_HISTORY_RESOURCE,
 } from "../runtime/pi/history-tools.js";
@@ -126,6 +130,7 @@ import {
   GROUP_RUN_CAPABILITY_CATEGORIES,
 } from "../runtime/pi/capability-tools.js";
 import { resolveSkillVisibility } from "../runtime/pi/skill-visibility.js";
+import { runtimeHealthOf } from "./runtime-health.js";
 import { ProviderCallError, requireProviderSuccess } from "../runtime/pi/provider-outcome.js";
 import type { PiRunContext } from "../runtime/pi/types.js";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -152,6 +157,7 @@ import {
 } from "../channels/onebot/capability-probe.js";
 import { ChannelArchiveStore } from "../retrieval/channel-archive.js";
 import { groupResourceId, resolveAssignedGroupIds } from "../retrieval/source-resolver.js";
+import { GroupHistoryPoller, type HistorySyncTarget } from "./history-poller.js";
 import { AuthorizedOpsService, type WorkerPolicy } from "../ops/service.js";
 import { OpsReconciler } from "../ops/reconciler.js";
 import type { HerdrBridge } from "../ops/herdr-bridge.js";
@@ -198,6 +204,15 @@ interface GroupIngressDiagnosticCounts {
   rejectedUnsupportedMessage: number;
   rejectedOverflow: number;
   acceptanceFailed: number;
+  /**
+   * Group messages that arrived while the socket was not ready and were dropped.
+   *
+   * Before this counter, that path returned silently, so a group that lost messages during a
+   * NapCat restart looked exactly like a group that was quiet. The count does not recover the
+   * messages, but it makes the gap visible and gives the reconnect backfill something to be
+   * measured against.
+   */
+  droppedNotReady: number;
 }
 
 type AuthorizationContext = {
@@ -230,6 +245,34 @@ const GROUP_READ_ACTION = "group:read";
 const HISTORY_SYNC_PAGE_SIZE = 100;
 /** Upper bound on pages walked per sync, so one search cannot scan unbounded history. */
 const HISTORY_SYNC_MAX_PAGES = 5;
+/**
+ * Pages one background tick may walk per group, and pages one reconnect backfill may walk.
+ *
+ * The background cadence is what fills the gap between "nobody searched this group" and "the
+ * group has history", so it uses the same bound a search uses. A reconnect is different: the
+ * newest page after reconnecting is the first page after the gap, so a shallow walk stops
+ * before it reaches back over the outage and the gap stays a hole. The backfill is allowed to
+ * walk deeper, bounded by `syncGroupHistory`'s own ceiling so a pathological provider still
+ * cannot make one reconnect read unbounded history.
+ */
+const HISTORY_POLL_MAX_PAGES = 5;
+const HISTORY_BACKFILL_MAX_PAGES = 20;
+/** Seconds between background archive walks. Overridable for tests and slow providers. */
+const HISTORY_POLL_INTERVAL_MS = Number(process.env.GLASSBOX_HISTORY_POLL_INTERVAL_MS ?? 60_000);
+
+/**
+ * The safe-error text for an adapter `reason`.
+ *
+ * The reason union is a closed set of internal codes, so this is a total mapping rather than a
+ * lookup that can miss. `authentication_failed` and the identity codes have their own text
+ * because they point at a different fix than a socket that keeps dropping.
+ */
+function safeErrorForReason(reason: NonNullable<OneBotState["reason"]>): ChannelSafeError {
+  if (reason === "authentication_failed") return CHANNEL_SAFE_ERRORS.auth;
+  if (reason === "identity_mismatch" || reason === "identity_check_failed")
+    return CHANNEL_SAFE_ERRORS.identity;
+  return CHANNEL_SAFE_ERRORS.connection;
+}
 
 /**
  * The fixed capability bundle an Owner's first `set_access enabled` persists for a group.
@@ -360,6 +403,15 @@ export class ManagementApplication {
   >();
   private readonly ingressStartedAt = new Date().toISOString();
   private readonly groupIngressDiagnostics = new Map<string, GroupIngressDiagnosticCounts>();
+  /**
+   * Channels that have reached `ready` at least once in this process.
+   *
+   * A first connect is not a reconnect: backfilling on it would re-walk history the group
+   * already has. Losing the connection after having been ready is what makes the archive
+   * stale, so that is the transition the backfill keys on.
+   */
+  private readonly connectionEverReady = new Set<string>();
+  private readonly historyPoller: GroupHistoryPoller;
   private operations: Promise<unknown> = Promise.resolve();
   private accepting = false;
   private releaseIngress!: () => void;
@@ -389,6 +441,14 @@ export class ManagementApplication {
     this.store = store;
     this.channels = channels;
     this.groupRuntime = groupRuntime;
+    this.historyPoller = new GroupHistoryPoller({
+      intervalMs: HISTORY_POLL_INTERVAL_MS,
+      maxPages: HISTORY_POLL_MAX_PAGES,
+      // Resolved per tick rather than captured at start, so a newly configured group or a
+      // group whose history capability was switched off both take effect on the next tick.
+      listTargets: () => this.historySyncTargets(),
+      run: (target, walk) => this.syncGroupHistory(target.connectionId, target.groupId, walk),
+    });
     const agnes = new AgnesMediaProvider({ apiKey: process.env.AGNES_API_KEY });
     this.mediaProvider =
       options.mediaProvider ??
@@ -729,6 +789,9 @@ export class ManagementApplication {
       await application.runs.start({ recover: true });
       application.accepting = true;
       application.releaseIngress();
+      // After transport is restored, so the first tick has connections to walk. A group nobody
+      // searches would otherwise never be archived at all.
+      application.historyPoller.start();
       return application;
     } catch (error) {
       await application.close();
@@ -745,7 +808,7 @@ export class ManagementApplication {
   private readonly runtimeHealthByProfile = new Map<
     string,
     {
-      state: "healthy" | "unavailable";
+      state: RuntimeHealthState;
       checkedAt: number;
       latencyMs: number;
       reasonCode: string | null;
@@ -1204,6 +1267,7 @@ export class ManagementApplication {
       isOwner: (input) => this.store.identities.isOwner(input.caller.principalId),
       learningStore: this.store.learning,
       listModelProfiles: () => this.selectableModelProfiles(),
+      botDisplayName: (connectionId) => this.botDisplayName(connectionId),
       resolveProfileName: async (input) =>
         piProfileName(
           input.caller.scope.chatType,
@@ -2005,13 +2069,12 @@ export class ManagementApplication {
         let actualExecutionRef = decision.executionRef;
         const observeRuntimeHealth = async (
           executionRef: string,
-          resultStatus: "succeeded" | "failed",
+          state: RuntimeHealthState,
           startedAt: number,
           reasonCode: string | null,
         ) => {
           const profileId = executionRef.slice(kind.length + 1);
           const checkedAt = Date.now();
-          const state = resultStatus === "succeeded" ? "healthy" : "unavailable";
           const latencyMs = Math.max(0, checkedAt - startedAt);
           this.runtimeHealthByProfile.set(profileId, { state, checkedAt, latencyMs, reasonCode });
           const observationCursor = await this.trace.append(
@@ -2030,21 +2093,24 @@ export class ManagementApplication {
           );
           await this.store.evidence.advanceTrace(caller, observationCursor);
         };
+        const recordRuntimeHealth = async (
+          executionRef: string,
+          result: ExecutionResult,
+          startedAt: number,
+        ) => {
+          const health = runtimeHealthOf(result);
+          if (health === undefined) {
+            // A provider was not called, so this is not evidence of runtime health.
+            this.runtimeHealthByProfile.delete(executionRef.slice(kind.length + 1));
+            return;
+          }
+          await observeRuntimeHealth(executionRef, health.state, startedAt, health.reasonCode);
+        };
         let attemptStartedAt = Date.now();
         try {
           attemptStartedAt = Date.now();
           let result = await selected.execute(input);
-          if (result.failureCode === "pre_provider_context_overflow") {
-            // A provider was not called, so this is not evidence of runtime health.
-            this.runtimeHealthByProfile.delete(decision.selectedProfileId!);
-          } else {
-            await observeRuntimeHealth(
-              actualExecutionRef,
-              result.status === "succeeded" ? "succeeded" : "failed",
-              attemptStartedAt,
-              result.status === "succeeded" ? null : "execution_failed",
-            );
-          }
+          await recordRuntimeHealth(actualExecutionRef, result, attemptStartedAt);
           if (
             result.failureCode === "pre_provider_context_overflow" &&
             routingInput.options.enabled
@@ -2104,12 +2170,7 @@ export class ManagementApplication {
               actualExecutionRef = upgrade.executionRef;
               attemptStartedAt = Date.now();
               result = await alternative.execute(input);
-              await observeRuntimeHealth(
-                actualExecutionRef,
-                result.status === "succeeded" ? "succeeded" : "failed",
-                attemptStartedAt,
-                result.status === "succeeded" ? null : "execution_failed",
-              );
+              await recordRuntimeHealth(actualExecutionRef, result, attemptStartedAt);
             }
           }
           succeeded = result.status === "succeeded";
@@ -2117,7 +2178,7 @@ export class ManagementApplication {
         } catch (error) {
           await observeRuntimeHealth(
             actualExecutionRef,
-            "failed",
+            "unavailable",
             attemptStartedAt,
             "execution_error",
           );
@@ -2313,6 +2374,16 @@ export class ManagementApplication {
         if (state.status === "ready" && !connectionAccepted)
           this.states.set(id, { connectionState: "connecting" });
         else this.updateChannelState(id, state);
+        // A channel that has been ready before and is ready again has a gap in its archive:
+        // the messages that arrived while the socket was down were never ingested, and the
+        // newest page after reconnecting starts after that gap. Walking back over it is the
+        // only thing that closes it, and it has to happen here because nothing else observes
+        // the transition.
+        if (state.status === "ready") {
+          const reconnected = this.connectionEverReady.has(id);
+          this.connectionEverReady.add(id);
+          if (reconnected) void this.backfillGroupHistory(id);
+        }
         if (!remember && state.status === "ready") {
           void provisionConfiguredAccess()
             .then(acceptConnection)
@@ -3203,6 +3274,24 @@ export class ManagementApplication {
     ];
   }
 
+  /**
+   * What the bot on one connection calls itself, from that connection's configuration.
+   *
+   * This is the only name Glassbox can persist, and it is what the prompt states. A channel that
+   * configured no name gets nothing rather than a fallback: the Kit prompt's placeholder name is
+   * not a rename target, and substituting the operator's channel label would reintroduce the same
+   * problem the configured name exists to solve.
+   */
+  private botDisplayName(connectionId: string): string | undefined {
+    try {
+      return this.channels.resolve(connectionId).config.botDisplayName;
+    } catch {
+      // A connection that is not configured has no name to report, and a Run on it has no
+      // name to state. Never let a missing profile become a failed Run.
+      return undefined;
+    }
+  }
+
   /** Every capability category enabled for a group the current Principal is assigned to. */
   private async assignedCategories(caller: CallerContext): Promise<QqCapabilityCategory[]> {
     const assigned = new Set(await resolveAssignedGroupIds(this.store, caller));
@@ -3216,6 +3305,54 @@ export class ManagementApplication {
   }
 
   /**
+   * Every connected channel's configured group whose history capability is on.
+   *
+   * The background walk is not an authorization bypass: it applies the same
+   * `group.history` policy read the history Tool applies, so switching the capability off
+   * stops the poller on its next tick exactly as it stops the Tool. A channel that is not
+   * connected is left out because `syncGroupHistory` would only report
+   * `provider_unavailable` for it.
+   */
+  private async historySyncTargets(): Promise<HistorySyncTarget[]> {
+    const targets: HistorySyncTarget[] = [];
+    for (const [connectionId] of this.connections) {
+      let configured: ReturnType<ChannelProfileStore["resolve"]>;
+      try {
+        configured = this.channels.resolve(connectionId);
+      } catch {
+        continue;
+      }
+      for (const groupId of configured.config.groupIds) {
+        if (!(await this.isHistoryEnabled(connectionId, groupId))) continue;
+        targets.push({ connectionId, groupId });
+      }
+    }
+    return targets;
+  }
+
+  /**
+   * Walk one channel's configured groups deeper than a tick would, right after it reconnects.
+   *
+   * Runs detached: the state callback that triggers it cannot await a provider walk, and a
+   * reconnect must not be blocked by how long the backfill takes. Failures are recorded on the
+   * poller rather than surfaced, because the channel is connected and usable either way — the
+   * cost of a failed backfill is a hole in the archive, not a broken channel.
+   */
+  private async backfillGroupHistory(connectionId: string): Promise<void> {
+    let targets: HistorySyncTarget[];
+    try {
+      targets = (await this.historySyncTargets()).filter(
+        (target) => target.connectionId === connectionId,
+      );
+    } catch {
+      return;
+    }
+    for (const target of targets) {
+      await this.historyPoller.backfill(target, HISTORY_BACKFILL_MAX_PAGES).catch(() => undefined);
+    }
+  }
+
+  /**
    * Pulls real group history through the existing authenticated OneBot connection into
    * the durable archive. Only called for a group whose `history:read` decision was ALLOW.
    *
@@ -3225,7 +3362,7 @@ export class ManagementApplication {
    * the same cursor twice), on a page older than `since`, and on the page bound — so it can
    * never loop forever. Ingest is deduped by (channel, connection, group, external message
    * id) and by message id within one walk, so repeated syncs are idempotent and never
-   * create Runs.
+   * create Runs. Messages the bot itself sent are skipped and counted, not archived.
    */
   private async syncGroupHistory(
     connectionId: string,
@@ -3238,6 +3375,9 @@ export class ManagementApplication {
     const seen = new Set<string>();
     let cursor: string | undefined;
     let pagesWalked = 0;
+    let skippedOwnMessages = 0;
+    const done = (stop: HistorySyncStop): HistorySyncOutcome =>
+      skippedOwnMessages === 0 ? { pagesWalked, stop } : { pagesWalked, stop, skippedOwnMessages };
     for (let page = 0; page < maxPages; page += 1) {
       const result = await connection.getGroupHistory({
         groupId,
@@ -3245,15 +3385,13 @@ export class ManagementApplication {
         count: HISTORY_SYNC_PAGE_SIZE,
       });
       if (result.status !== "ok")
-        return {
-          pagesWalked,
-          stop:
-            result.status === "unknown"
-              ? "provider_unknown"
-              : result.code === "not_connected"
-                ? "provider_unavailable"
-                : "provider_failed",
-        };
+        return done(
+          result.status === "unknown"
+            ? "provider_unknown"
+            : result.code === "not_connected"
+              ? "provider_unavailable"
+              : "provider_failed",
+        );
       pagesWalked += 1;
       let reachedBound = false;
       let newMessages = 0;
@@ -3265,6 +3403,13 @@ export class ManagementApplication {
         if (options.until && message.occurredAt > options.until) continue;
         if (seen.has(message.messageId)) continue;
         seen.add(message.messageId);
+        // The bot's own replies are not what people said. They are filtered here rather than at
+        // retrieval because nothing downstream can un-see them once archived, and they are
+        // counted so a misconfigured `botId` shows up as a count that stopped moving.
+        if (message.senderId === connection.config.botId) {
+          skippedOwnMessages += 1;
+          continue;
+        }
         newMessages += 1;
         await this.archive.ingest({
           channel: "qq-onebot",
@@ -3280,22 +3425,18 @@ export class ManagementApplication {
       }
       const next = result.nextCursor;
       if (next === undefined)
-        return {
-          pagesWalked,
-          stop: result.messages.length === 0 ? "end_of_source" : "provider_unknown",
-        };
+        return done(result.messages.length === 0 ? "end_of_source" : "provider_unknown");
       if (next === cursor)
-        return {
-          pagesWalked,
-          // NapCat's reverse history page includes the cursor record itself. A one-record
-          // page containing only the already-seen cursor is its end-of-source signal. A
-          // larger repeated page is still a stalled provider and must remain partial.
-          stop: newMessages === 0 && result.messages.length <= 1 ? "end_of_source" : "cursor_stuck",
-        };
+        // NapCat's reverse history page includes the cursor record itself. A one-record
+        // page containing only the already-seen cursor is its end-of-source signal. A
+        // larger repeated page is still a stalled provider and must remain partial.
+        return done(
+          newMessages === 0 && result.messages.length <= 1 ? "end_of_source" : "cursor_stuck",
+        );
       cursor = next;
-      if (reachedBound) return { pagesWalked, stop: "since_bound_reached" };
+      if (reachedBound) return done("since_bound_reached");
     }
-    return { pagesWalked, stop: "page_bound_reached" };
+    return done("page_bound_reached");
   }
 
   private async manageGroup(
@@ -3922,12 +4063,34 @@ export class ManagementApplication {
     });
   }
 
+  /**
+   * Projects an adapter state onto the public channel state.
+   *
+   * `connecting`, `verifying` and `reconnecting` all used to collapse to `connecting` with no
+   * `lastError`, so a channel whose login had died looked the same as one still negotiating
+   * and the operator had no reason to act on. The adapter's own `reason` is now carried through,
+   * mapped onto the same safe-error vocabulary the rest of this projection uses: it names which
+   * part failed without exposing the provider's payload.
+   */
   private updateChannelState(id: string, state: OneBotState) {
     if (state.status === "ready") this.states.set(id, { connectionState: "connected" });
     else if (state.status === "stopped") this.states.set(id, { connectionState: "disconnected" });
-    else if (state.status === "faulted")
-      this.states.set(id, { connectionState: "error", lastError: CHANNEL_SAFE_ERRORS.connection });
-    else this.states.set(id, { connectionState: "connecting" });
+    else if (state.status === "faulted") {
+      this.states.set(id, {
+        connectionState: "error",
+        lastError:
+          state.reason === "authentication_failed"
+            ? CHANNEL_SAFE_ERRORS.auth
+            : state.reason === "identity_mismatch" || state.reason === "identity_check_failed"
+              ? CHANNEL_SAFE_ERRORS.identity
+              : CHANNEL_SAFE_ERRORS.connection,
+      });
+    } else {
+      this.states.set(id, {
+        connectionState: "connecting",
+        ...(state.reason === undefined ? {} : { lastError: safeErrorForReason(state.reason) }),
+      });
+    }
   }
 
   private async runCaller(runId: string) {
@@ -4010,6 +4173,7 @@ export class ManagementApplication {
         rejectedUnsupportedMessage: 0,
         rejectedOverflow: 0,
         acceptanceFailed: 0,
+        droppedNotReady: 0,
       }
     );
   }
@@ -4025,9 +4189,11 @@ export class ManagementApplication {
     const field =
       diagnostic.stage === "normalized"
         ? "normalized"
-        : diagnostic.reason === "not_addressed"
-          ? "ignoredNotAddressed"
-          : "ignoredEmptyMessage";
+        : diagnostic.stage === "dropped"
+          ? "droppedNotReady"
+          : diagnostic.reason === "not_addressed"
+            ? "ignoredNotAddressed"
+            : "ignoredEmptyMessage";
     next[field] = Math.min(1_000_000, next[field] + 1);
     this.groupIngressDiagnostics.set(key, next);
   }
@@ -4114,6 +4280,7 @@ export class ManagementApplication {
     this.accepting = false;
     this.releaseIngress();
     await this.operations.catch(() => undefined);
+    await this.historyPoller.stop();
     await Promise.allSettled([...this.connections.values()].map((adapter) => adapter.stop()));
     this.connections.clear();
     await this.runs.stop({ abortRunning: true, wait: true });

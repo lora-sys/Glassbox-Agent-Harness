@@ -102,8 +102,8 @@ export interface OneBotState {
 /** Payload-free group ingress status for a bounded, Owner-authorized diagnostic projection. */
 export interface OneBotIngressDiagnostic {
   groupId: string;
-  stage: "normalized" | "ignored";
-  reason?: "not_addressed" | "empty_message";
+  stage: "normalized" | "ignored" | "dropped";
+  reason?: "not_addressed" | "empty_message" | "not_ready";
 }
 
 export type OneBotDeliveryResult =
@@ -621,7 +621,11 @@ export class OneBotAdapter {
         type: "node",
         data: {
           user_id: Number(this.config.botId),
-          nickname: this.config.label.slice(0, 64),
+          // The name a reader sees on a forwarded node. The configured display name wins over
+          // the connection label: the label is the operator's name for the channel, which is
+          // not what the bot calls itself, and QQ shows this string to whoever opens the
+          // forward message.
+          nickname: (this.config.botDisplayName ?? this.config.label).slice(0, 64),
           content: [
             ...(target.chatType === "group" && index === 0
               ? [{ type: "at", data: { qq: Number(target.senderId) } }]
@@ -899,8 +903,21 @@ export class OneBotAdapter {
         });
       return;
     }
-    if (this.#state.status !== "ready" && this.#state.status !== "verifying") return;
     const normalized = normalizeOneBotMessage(record, this.config);
+    // A message that arrives before the socket is ready is dropped, and this used to drop it
+    // without a trace. Normalization runs first so the drop can be attributed to the group it
+    // was for: a group that lost messages during an outage has to look different from a group
+    // that was simply quiet, or the archive hole is invisible. The check moved rather than
+    // staying above normalization because the group is only known after it.
+    if (this.#state.status !== "ready" && this.#state.status !== "verifying") {
+      if (normalized.kind === "message" && normalized.message.scope.chatType === "group")
+        this.#ingressDiagnostic({
+          groupId: normalized.message.scope.chatId,
+          stage: "dropped",
+          reason: "not_ready",
+        });
+      return;
+    }
     if (normalized.kind === "rejected") {
       this.#ingressError({
         code: normalized.code,

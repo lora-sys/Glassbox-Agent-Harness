@@ -157,6 +157,19 @@ export interface HistorySyncOutcome {
   pagesWalked: number;
   /** Why it stopped. */
   stop: HistorySyncStop;
+  /**
+   * Messages this walk read and deliberately did not archive, because the bot itself sent them.
+   *
+   * Omitted when zero. The archive is a record of what people said in a group, and the bot's
+   * own replies are not that: on 2026-09-28, 254 of the 633 archived messages were the bot
+   * answering, and later Runs read those answers back as something a person had said — which is
+   * how a group came to believe the bot had introduced itself by a name nobody configured.
+   *
+   * Reported rather than dropped quietly because the count is the only sign the filter ran: a
+   * channel whose `botId` is misconfigured stops dropping anything, and nothing else about the
+   * walk looks different.
+   */
+  skippedOwnMessages?: number;
 }
 
 /**
@@ -586,10 +599,14 @@ export function projectStrictHistoryReply(
  * steps: a cut candidate set can be reached by raising the limit, while a source the walk
  * never finished cannot be reached at all from here. `coverage.sourceLimits` carries the
  * reason in structured form for Trace; the sentence says only which window it applies to.
+ *
+ * A named term is quoted with corner brackets rather than double quotes. The model restates
+ * this sentence when it answers, and the outbound pipeline passes whatever quoting it copied
+ * straight through to QQ — so the quoting style here is the quoting style a member reads.
  */
 function historyGuidance(details: HistorySearchDetails): string {
   const { coverage } = details;
-  const terms = coverage.exactTerms.map((term) => `"${term}"`).join(", ");
+  const terms = coverage.exactTerms.map((term) => `「${term}」`).join(", ");
   if (coverage.coverage === "unknown")
     return "No group was searched, so nothing about the world was learned. This is not a negative result.";
   const sourceOpen = coverage.sourceLimits.length > 0;

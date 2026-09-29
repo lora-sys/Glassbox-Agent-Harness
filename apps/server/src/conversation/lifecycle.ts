@@ -43,6 +43,8 @@ export interface RunLease {
   settle(
     status: TerminalRunStatus,
     text?: string,
+    /** Why the Run produced no text of its own. Persisted beside the status it explains. */
+    failureCode?: string,
   ): Promise<{ run: RunRecord; outputWithheld: boolean }>;
 }
 export interface DeliveryLease {
@@ -222,11 +224,13 @@ export class LifecycleStore {
     let active = true;
     return {
       run,
-      settle: async (status, text) => {
+      settle: async (status, text, failureCode) => {
         if (!active) throw new Error("Run lease already settled");
         if (
           !["succeeded", "failed", "cancelled", "interrupted", "unknown"].includes(status) ||
-          (text !== undefined && (typeof text !== "string" || text.length > 64_000))
+          (text !== undefined && (typeof text !== "string" || text.length > 64_000)) ||
+          (failureCode !== undefined &&
+            (typeof failureCode !== "string" || failureCode.length > 64))
         )
           throw new Error("Invalid execution outcome");
         active = false;
@@ -247,10 +251,11 @@ export class LifecycleStore {
                 outputWithheld = true;
             }
             const updated = await tx.execute({
-              sql: "UPDATE runs SET status = ?, result_text = ?, updated_at = ? WHERE id = ? AND status IN ('running','cancelling')",
+              sql: "UPDATE runs SET status = ?, result_text = ?, failure_code = ?, updated_at = ? WHERE id = ? AND status IN ('running','cancelling')",
               args: [
                 status,
                 outputWithheld ? null : (text ?? null),
+                failureCode ?? null,
                 new Date().toISOString(),
                 runId,
               ],

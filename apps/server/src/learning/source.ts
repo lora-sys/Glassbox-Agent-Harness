@@ -51,6 +51,29 @@ export function evidenceFromAuthorizedSource(item: AuthorizedMemorySourceItem): 
   };
 }
 
+/**
+ * Whether an authorized source message carries enough substance to be worth an Owner's review.
+ *
+ * The source action imports QQ messages verbatim, and a chat log is mostly messages that assert
+ * nothing: greetings, bare acknowledgements, a repeated laugh, a question. Each one becomes a
+ * pending candidate the Owner has to read and reject, and the queue fills with noise until the
+ * real ones are buried in it.
+ *
+ * The bar is deliberately about substance rather than length alone, so a long "哈哈哈哈" is still
+ * refused. It is a filter, not a classifier: a short message that does state a fact is kept, and a
+ * chatty one that happens to be long enough is still imported for the Owner to judge.
+ */
+export function sourceStatementIsSubstantive(text: string): boolean {
+  const trimmed = text.trim();
+  // A question asserts nothing, so it can never be a statement of fact.
+  if (/[?？]\s*$/u.test(trimmed)) return false;
+  if (trimmed.length < 8) return false;
+  // Punctuation, symbols and emoji do not carry the statement; what is left has to be varied
+  // enough to be words rather than one character repeated.
+  const meaningful = trimmed.replace(/[\p{P}\p{S}\p{Zs}\p{Cc}]+/gu, "");
+  return new Set(meaningful).size >= 4;
+}
+
 /** Source text is evidence only. It can never request promotion or another side effect. */
 export function candidateFromAuthorizedSource(input: {
   item: AuthorizedMemorySourceItem;

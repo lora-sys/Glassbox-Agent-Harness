@@ -109,6 +109,9 @@ it("rejects ambiguous model names without changing the selected model", async ()
   };
   const f = await createFixture([dottedModel, secondModel], dottedModel.model);
   try {
+    // The reason reaches the Run as the code, not as a collapsed "the Tool failed". A model that
+    // is told only `protected_tool_failed` for an ambiguous name repeats the same call; one told
+    // `model_profile_ambiguous` can ask which profile was meant.
     await expect(
       f.tool.execute(
         "ambiguous-model",
@@ -117,7 +120,7 @@ it("rejects ambiguous model names without changing the selected model", async ()
         undefined,
         {} as never,
       ),
-    ).rejects.toThrow("protected_tool_failed");
+    ).rejects.toThrow("model_profile_ambiguous");
     expect(f.selection).not.toHaveBeenCalled();
     expect(f.recordSelection).not.toHaveBeenCalled();
   } finally {
