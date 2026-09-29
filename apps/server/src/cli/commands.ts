@@ -1,4 +1,4 @@
-﻿// Command grouping and model-profile choices adapted from OpenHarness. See SOURCES.md.
+// Command grouping and model-profile choices adapted from OpenHarness. See SOURCES.md.
 import { parseArgs } from "node:util";
 import { validCursor, type ManagementRequest } from "./client.ts";
 import { CliError, hasControlCharacters } from "./errors.ts";

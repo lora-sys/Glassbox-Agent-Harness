@@ -53,6 +53,23 @@ jobs:
       - name: Check generated route tree is current
         run: git diff --exit-code -- apps/web/src/routeTree.gen.ts
 
+  text-portability:
+    name: Text encoding and line-ending portability
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24.21.0
+
+      - name: Check Windows-authored text survives Linux
+        run: npm run portability:check
+
   dependency-hygiene:
     name: Dependency hygiene
     runs-on: ubuntu-latest

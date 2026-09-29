@@ -26,6 +26,7 @@
     "check:core": "vp check --no-fmt apps/server packages/contracts scripts vite.config.ts",
     "build:web": "vp build",
     "hygiene:check": "node scripts/check-repository-hygiene.mjs",
+    "portability:check": "node scripts/check-text-portability.mjs",
     "verify:commit": "node scripts/verify-commit.mjs",
     "verify:full": "node scripts/verify-commit.mjs --full"
   },
