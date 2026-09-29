@@ -23,11 +23,11 @@ Glassbox 是一个 Personal Agent 系统：显式身份、严格授权、持久�
 
 - **QQ 私聊与群聊接入**。NapCat / OneBot 通道，支持群管理员的原生授权。
 - **四道服务端硬 Gate**。Ingress、Context、Tool / Ops、Delivery 依次把关，权限只有 ALLOW、DENY、REQUIRES_APPROVAL 三种结果，没有显式 Grant 一律 DENY。
-- **Task 生命周期闭环**。派发给 Herdr coding worker 时分配独立隔离分支和独立 worktree，worker 完成后必须经过人工 Review，Accept 才算 DONE，Rework 则开新的 TaskAttempt。
+- **Task 生命周期闭环**。派发给 Herdr coding worker 时使用已配置的 workspace 和 worktree；worker 完成后必须经过人工 Review，Accept 才算 DONE，Rework 则开新的 TaskAttempt。当前不会按 Task 自动创建独立分支或 worktree。
 - **Taste / Memory 持久学习**。受治理的学习真相落库，不是写在 prompt 里的口头记忆。
 - **授权检索**。QQ 历史消息搜索，引用必须来自官方来源。
 - **上下文预算与运行时路由**。按任务和 Audience 控制注入的上下文与技能面。
-- **双 Owner 协同**。主 Owner 与协同 Owner 身份对等，私聊会话在数据库中物理隔离，派发的编码任务互不踩踏。
+- **双 Owner 协同**。主 Owner 与协同 Owner 身份对等，私聊会话在数据库中物理隔离。当前固定的 worker 配置不提供按 Task 的 worktree 隔离，并发编码任务不能依赖此路径避免互相踩踏。
 
 Web 管理端和 P6 长任务还在开发中，见[当前开发状态](#当前开发状态)。
 
@@ -90,13 +90,13 @@ Herdr state ≠ Task acceptance
 
 ## Agent Operations
 
-Glassbox 与 Herdr 双向通信：下行创建 worktree、启动 Agent、授权跟进或取消；上行回报 workspace / pane 变化、working / blocked / done、worker 掉线与恢复。
+Glassbox 与 Herdr 双向通信：下行在已配置的 workspace / worktree 中启动 Agent、授权跟进或取消；上行回报 workspace / pane 变化、working / blocked / done、worker 掉线与恢复。Glassbox 当前不会为每个 Task 创建分支或 worktree；固定的 worker 配置不能作为并发编码任务的隔离保证。
 
 ```mermaid
 stateDiagram-v2
     [*] --> Task: 用户请求
     Task --> TaskAttempt: 派发
-    TaskAttempt --> Worker: 绑定独立 worktree
+    TaskAttempt --> Worker: 绑定配置的工作目录
     Worker --> REVIEW: Herdr done
     REVIEW --> DONE: Accept
     REVIEW --> TaskAttempt: Rework，开新 Attempt
