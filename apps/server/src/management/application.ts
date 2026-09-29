@@ -2680,6 +2680,17 @@ export class ManagementApplication {
       scope,
       effect: "allow",
     });
+    // A Skill file is a content source, so the delivery recheck re-decides `delivery:send` on
+    // this Resource for every Run whose answer derives from one — the same recheck every other
+    // content source already passes. Granting `skill:read` alone denied those Runs at delivery
+    // time: the Run succeeded, whatever it changed was durable, and the sender received nothing.
+    await this.store.authorization.grant({
+      principalId,
+      resourceId: SKILL_CATALOG_RESOURCE,
+      action: "delivery:send",
+      scope,
+      effect: "allow",
+    });
     const skillToolResource = toolResourceId(SKILL_READ_TOOL);
     await this.store.authorization.registerResource({
       id: skillToolResource,

@@ -11,6 +11,7 @@ import { createCapabilityTools } from "../runtime/pi/capability-tools.js";
 import { createProtectedTool } from "../runtime/pi/protected-tools.js";
 import { Type } from "typebox";
 import { OWNER_CONTROL_RESOURCE, OWNER_GROUP_ADMIN_TOOL } from "../runtime/pi/owner-tools.js";
+import { SKILL_CATALOG_RESOURCE, SKILL_READ_ACTION } from "../runtime/pi/skill-tools.js";
 import { admin, type OwnerContext } from "./application-test-helpers.js";
 
 const { fixture, afterEachCleanup } = createApplicationFixtureScope();
@@ -844,5 +845,89 @@ describe("group history delivery authority", () => {
         scope: coOwnerPrivate,
       }),
     ).toBe(false);
+  });
+});
+
+/**
+ * Delivery of a Skill-derived answer is a separate authorization decision from the Skill read
+ * that produced it.
+ *
+ * A Skill file is a content source, so the delivery recheck re-decides `delivery:send` on the
+ * catalog Resource for every Run whose answer derives from one. Provisioning granted
+ * `skill:read` and nothing else, which denied those Runs at delivery time: three real Runs
+ * succeeded, two of them carrying the Owner's own memory commands, and the Owner received no
+ * reply to either. The work those Runs did was durable, so the failure was invisible except as
+ * silence.
+ */
+describe("skill catalog delivery authority", () => {
+  const BOT = "10001";
+  const OWNER = "10002";
+  const CO_OWNER = "10006";
+  const GROUP = "10003";
+  const scopeFor = (chatType: "group" | "private", chatId: string, senderId: string) =>
+    ({
+      connectionId: "fixture",
+      botId: BOT,
+      chatType,
+      chatId,
+      senderId,
+    }) as TrustedChannelScope;
+
+  /**
+   * Connecting the Channel is what provisions authority, so the fixture's own connect is the
+   * setup. No Run is driven: the defect was in what a connect grants, not in what a Run did.
+   */
+  const connect = () =>
+    fixture(async () => ({ status: "succeeded", text: "answer" }), {
+      coOwnerId: CO_OWNER,
+    });
+
+  it("provisions delivery authority for the Skill catalog a Run reads", async () => {
+    const f = await connect();
+    const audiences: Array<readonly [string, readonly TrustedChannelScope[]]> = [
+      ["owner", [scopeFor("private", OWNER, OWNER), scopeFor("group", GROUP, OWNER)]],
+      [`owner-${CO_OWNER}`, [scopeFor("private", CO_OWNER, CO_OWNER)]],
+      ["qq-visitor-10004", [scopeFor("group", GROUP, "10004")]],
+    ];
+    for (const [principalId, scopes] of audiences) {
+      for (const scope of scopes) {
+        expect(
+          (
+            await f.app.store.authorization.check({
+              caller: { principalId, scope },
+              resourceId: SKILL_CATALOG_RESOURCE,
+              action: "delivery:send",
+            })
+          ).decision,
+          `${principalId} must be able to deliver a Skill-derived answer in ${scope.chatType} ${scope.chatId}`,
+        ).toBe("ALLOW");
+      }
+    }
+  });
+
+  it("keeps the Skill read itself authorized, so the recheck has a source to re-decide", async () => {
+    const f = await connect();
+    const decision = await f.app.store.authorization.check({
+      caller: { principalId: "owner", scope: scopeFor("private", OWNER, OWNER) },
+      resourceId: SKILL_CATALOG_RESOURCE,
+      action: SKILL_READ_ACTION,
+    });
+    expect(decision.decision).toBe("ALLOW");
+  });
+
+  it("grants the catalog nothing but reading it and delivering what it produced", async () => {
+    const f = await connect();
+    const ownerPrivate = scopeFor("private", OWNER, OWNER);
+    const held = (action: string) =>
+      f.app.store.authorization.hasActiveGrant({
+        principalId: "owner",
+        resourceId: SKILL_CATALOG_RESOURCE,
+        action,
+        scope: ownerPrivate,
+      });
+    expect(await held(SKILL_READ_ACTION)).toBe(true);
+    expect(await held("delivery:send")).toBe(true);
+    // A grant here is authority over every Skill, so it stays closed to anything else.
+    expect(await held("run:create")).toBe(false);
   });
 });
