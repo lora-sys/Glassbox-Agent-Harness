@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { WebSocketServer, type WebSocket } from "ws";
+import { WebSocket, WebSocketServer, type RawData } from "ws";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import {
   OneBotAdapter,
@@ -51,6 +51,16 @@ function inbound(overrides: Record<string, unknown> = {}): Record<string, unknow
     ],
     ...overrides,
   };
+}
+
+/** The text of a raw WebSocket frame, whatever shape the peer delivered it in. */
+function decode(raw: RawData): string {
+  const bytes = Array.isArray(raw)
+    ? Buffer.concat(raw)
+    : raw instanceof ArrayBuffer
+      ? Buffer.from(raw)
+      : raw;
+  return bytes.toString("utf8");
 }
 
 const mp4Base64 = Buffer.from("000000186674797069736F6D0000020069736F6D69736F32", "hex").toString(
@@ -1155,5 +1165,162 @@ describe("OneBot forward WebSocket", () => {
       status: "failed",
       code: "image_invalid",
     });
+  });
+
+  it("retries at the base delay while nothing is listening", async () => {
+    const attempts: number[] = [];
+    const wss = new WebSocketServer({
+      host: "127.0.0.1",
+      port: 0,
+      // What a peer that has not started serving yet looks like: the handshake is refused
+      // before any frame is exchanged.
+      verifyClient(_info, done) {
+        attempts.push(Date.now());
+        done(false, 503, "Unavailable");
+      },
+    });
+    cleanup.push(
+      () =>
+        new Promise<void>((resolve) => {
+          for (const socket of wss.clients) socket.terminate();
+          wss.close(() => resolve());
+        }),
+    );
+    await once(wss, "listening");
+    const { adapter } = client(`ws://127.0.0.1:${(wss.address() as AddressInfo).port}/`);
+    void adapter.start().catch(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    await adapter.stop();
+    // Exponential backoff spends this whole window on four attempts. NapCat's OneBot server
+    // does not exist until the QR login finishes, so every attempt before that lands here,
+    // and backing off in that state is what turns a login delay into a window where a sent
+    // message is silently lost. A peer that never accepted a connection has not earned
+    // backoff, so it gets the base delay instead.
+    expect(attempts.length).toBeGreaterThanOrEqual(10);
+  });
+
+  it("replays messages held while the login check failed", async () => {
+    let logins = 0;
+    const wss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+    cleanup.push(
+      () =>
+        new Promise<void>((resolve) => {
+          for (const socket of wss.clients) socket.terminate();
+          wss.close(() => resolve());
+        }),
+    );
+    const connections = new Queue<WebSocket>();
+    wss.on("connection", (socket) => {
+      connections.push(socket);
+      // Sent the moment the socket opens, before the login check can answer: the peer really
+      // did send it, so throwing it away with the failed attempt loses a real message.
+      socket.send(JSON.stringify(inbound({ message_id: -11 })));
+      socket.on("message", (raw) => {
+        const request = JSON.parse(decode(raw)) as { echo: string };
+        logins += 1;
+        // A bot that has not finished logging in cannot confirm who it is yet.
+        socket.send(
+          JSON.stringify({
+            echo: request.echo,
+            status: logins === 1 ? "failed" : "ok",
+            retcode: logins === 1 ? 1 : 0,
+            data: { user_id: 10001 },
+          }),
+        );
+      });
+    });
+    await once(wss, "listening");
+    const { adapter, incoming } = client(`ws://127.0.0.1:${(wss.address() as AddressInfo).port}/`);
+    void adapter.start().catch(() => {});
+    expect((await incoming.next()).messageId).toBe("-11");
+    expect(logins).toBeGreaterThanOrEqual(2);
+    // The replay rides the connection that verified, not the one whose login check failed.
+    expect((await connections.next()).readyState).toBe(WebSocket.CLOSED);
+    expect((await connections.next()).readyState).toBe(WebSocket.OPEN);
+  });
+
+  it("drains a full pre-verification buffer instead of reconnecting forever", async () => {
+    const wss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+    cleanup.push(
+      () =>
+        new Promise<void>((resolve) => {
+          for (const socket of wss.clients) socket.terminate();
+          wss.close(() => resolve());
+        }),
+    );
+    const opened: WebSocket[] = [];
+    wss.on("connection", (socket) => {
+      opened.push(socket);
+      // A backlog the peer pushes the moment the socket opens, before the login check can
+      // answer — exactly what a NapCat restart looks like from this side.
+      for (const messageId of [-21, -22, -23])
+        socket.send(JSON.stringify(inbound({ message_id: messageId })));
+      socket.on("message", (raw) => {
+        const request = JSON.parse(decode(raw)) as { echo: string };
+        socket.send(
+          JSON.stringify({
+            echo: request.echo,
+            status: "ok",
+            retcode: 0,
+            data: { user_id: 10001 },
+          }),
+        );
+      });
+    });
+    await once(wss, "listening");
+    const { adapter, errors, incoming } = client(
+      `ws://127.0.0.1:${(wss.address() as AddressInfo).port}/`,
+      { maxPendingIncoming: 1 },
+    );
+    await adapter.start();
+    expect((await incoming.next()).messageId).toBe("-21");
+    // Overflow is reported per dropped message, and the connection still reaches `ready`:
+    // tearing the socket down here would leave the buffer full on every retry and the
+    // backlog would never be replayed.
+    expect(await errors.next()).toMatchObject({ code: "ingress_overflow", messageId: "-22" });
+    expect(await errors.next()).toMatchObject({ code: "ingress_overflow", messageId: "-23" });
+    expect(adapter.state.status).toBe("ready");
+    expect(opened).toHaveLength(1);
+  });
+
+  it("records a private message dropped while the connection is not ready", async () => {
+    const fake = await server();
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const { adapter, errors, diagnostics } = client(fake.endpoint, {
+      maxPendingIncoming: 1,
+      onIncoming: async () => {
+        entered();
+        await new Promise<void>(() => {});
+      },
+    });
+    await adapter.start();
+    const socket = await fake.connections.next();
+    socket.send(JSON.stringify(inbound()));
+    await started;
+    // Back to back, because the second one is what makes the third one droppable: it
+    // overflows the acceptance queue and pushes the adapter out of `ready`, and the message
+    // behind it is still on the same socket when the teardown has not been processed yet.
+    socket.send(JSON.stringify(inbound({ message_id: 8 })));
+    socket.send(
+      JSON.stringify(
+        inbound({
+          message_type: "private",
+          sub_type: "friend",
+          message: "promote the first candidate",
+          message_id: 9,
+        }),
+      ),
+    );
+    expect(await errors.next()).toMatchObject({ code: "ingress_overflow", messageId: "8" });
+    // A private drop used to leave no trace at all: the diagnostic projection is keyed by
+    // group id, so a private message had nothing to be counted in.
+    expect(await diagnostics.next((diagnostic) => diagnostic.stage === "dropped")).toEqual({
+      stage: "dropped",
+      reason: "not_ready",
+    });
+    await adapter.stop();
   });
 });

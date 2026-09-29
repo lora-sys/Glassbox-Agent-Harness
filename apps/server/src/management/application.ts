@@ -404,6 +404,15 @@ export class ManagementApplication {
   private readonly ingressStartedAt = new Date().toISOString();
   private readonly groupIngressDiagnostics = new Map<string, GroupIngressDiagnosticCounts>();
   /**
+   * Per-channel count of messages dropped because the connection was not ready.
+   *
+   * Held apart from `states` on purpose: `updateChannelState` replaces that whole entry on
+   * every transition, so a counter living there would be wiped the moment the connection
+   * recovered — which is exactly when the operator still needs to see that it happened. Held
+   * apart from `groupIngressDiagnostics` because a private drop belongs to no group.
+   */
+  private readonly channelDroppedNotReady = new Map<string, number>();
+  /**
    * Channels that have reached `ready` at least once in this process.
    *
    * A first connect is not a reconnect: backfilling on it would re-walk history the group
@@ -2336,7 +2345,14 @@ export class ManagementApplication {
   }
 
   listChannels(): PublicChannelProfile[] {
-    return this.channels.list().map((channel) => ({ ...channel, ...this.states.get(channel.id) }));
+    return this.channels.list().map((channel) => {
+      const droppedNotReady = this.channelDroppedNotReady.get(channel.id);
+      return {
+        ...channel,
+        ...this.states.get(channel.id),
+        ...(droppedNotReady === undefined ? {} : { droppedNotReady }),
+      };
+    });
   }
 
   private publicChannel(id: string): PublicChannelProfile {
@@ -4261,6 +4277,15 @@ export class ManagementApplication {
     channelId: string,
     diagnostic: OneBotIngressDiagnostic,
   ): void {
+    // A diagnostic with no group is a channel-level fact, which today is only a private
+    // message dropped because the connection was not ready. It has no group projection to be
+    // counted in, and before this branch it was recorded nowhere at all.
+    if (diagnostic.groupId === undefined) {
+      if (diagnostic.stage !== "dropped") return;
+      const dropped = this.channelDroppedNotReady.get(channelId) ?? 0;
+      this.channelDroppedNotReady.set(channelId, Math.min(1_000_000, dropped + 1));
+      return;
+    }
     if (!this.channels.resolve(channelId).config.groupIds.includes(diagnostic.groupId)) return;
     const key = this.groupIngressDiagnosticKey(channelId, diagnostic.groupId);
     const current = this.groupIngressDiagnosticsFor(channelId, diagnostic.groupId);

@@ -44,4 +44,14 @@ export interface PublicChannelProfile extends Omit<ChannelSaveInput, "token"> {
   /** Current runtime observation, never persisted as connection evidence. */
   connectionState: ChannelConnectionState;
   lastError?: ChannelSafeError;
+  /**
+   * Messages that arrived while the connection was not ready and were dropped, private and
+   * group alike, counted since the service started.
+   *
+   * The group diagnostic projection is keyed by group id, so a private message that was
+   * dropped had no projection to be counted in and left no trace at all. The count does not
+   * recover the messages, but it makes the gap visible and tells the operator what kind of
+   * traffic was lost, not just that something was.
+   */
+  droppedNotReady?: number;
 }
