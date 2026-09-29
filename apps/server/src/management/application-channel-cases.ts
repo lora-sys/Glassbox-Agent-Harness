@@ -12,6 +12,7 @@ import { ChannelProfileStore } from "../config/channel-profiles.js";
 import type { ExecutionInput, ExecutionResult } from "../execution/run-service/types.js";
 import type { TrustedChannelScope } from "../persistence/index.js";
 import { ManagementApplication } from "./application.js";
+import { SKILL_CATALOG_RESOURCE, SKILL_READ_ACTION } from "../runtime/pi/skill-tools.js";
 
 const { fixture, afterEachCleanup, cleanup, removeDirectory } = createApplicationFixtureScope();
 afterEach(afterEachCleanup);
@@ -668,5 +669,89 @@ describe("channel to durable run composition", () => {
     await f.started.take((input) => input.text === "queue-barrier");
     await f.reply("answer:queue-barrier");
     expect(f.calls.some((call) => call.text === "revoked-group")).toBe(false);
+  });
+});
+
+/**
+ * A Skill-derived answer has to survive the delivery gate.
+ *
+ * This is the end-to-end shape of the defect that silenced three real Runs on 2026-09-29:
+ * the Run read the Skill catalog, its answer derived from it, and the delivery recheck
+ * re-decided `delivery:send` on that Resource. Provisioning granted `skill:read` alone, so
+ * the Run succeeded, whatever it changed was durable, and the sender received nothing at
+ * all — with no error anywhere except a `delivery_denied` trace event nobody was reading.
+ *
+ * The decision is recorded here exactly the way the Skill Tool records it, so the test
+ * drives the real gate rather than a stand-in for it: an ALLOW on the catalog, marked as the
+ * content source the answer derives from.
+ */
+describe("skill derived answer delivery", () => {
+  /**
+   * Opens a channel whose every Run reads the Skill catalog before answering, exactly as the
+   * real Run did, and records the decision the way the Skill Tool records it.
+   */
+  const skillReadingFixture = async () => {
+    let store: Awaited<ReturnType<typeof fixture>>["app"]["store"] | undefined;
+    const f = await fixture(async (input) => {
+      const source = await store!.authorization.check({
+        caller: input.caller,
+        resourceId: SKILL_CATALOG_RESOURCE,
+        action: SKILL_READ_ACTION,
+        runId: input.run.id,
+        conversationId: input.conversation.id,
+      });
+      await store!.authorization.markDeliverySource(source.id, "content_source");
+      return { status: "succeeded", text: `answer:${input.text}` };
+    });
+    store = f.app.store;
+    return f;
+  };
+
+  it("delivers an Owner's Skill-derived answer in a private chat", async () => {
+    const f = await skillReadingFixture();
+    f.send(1, "skill-answer", true, 10002);
+    const started = await f.started.take();
+    const run = await f.app.runs.waitForRun(started.caller, started.run.id);
+
+    expect(run.status).toBe("succeeded");
+    // Publishing is backgrounded, so the delivery is awaited rather than assumed: a Run that
+    // cannot deliver settles as succeeded and simply never sends.
+    await expect
+      .poll(
+        async () =>
+          (
+            await f.app.store.lifecycle.listDeliveries(started.caller, started.run.id, {
+              limit: 10,
+            })
+          ).items.map((delivery) => delivery.status),
+        { timeout: 5_000 },
+      )
+      .toEqual(["sent"]);
+    expect(f.actionLog.some((action) => action.action === "send_private_msg")).toBe(true);
+  });
+
+  it("delivers a group member's Skill-derived answer back into that group", async () => {
+    const f = await skillReadingFixture();
+    // A member addressed in the group who is in no configuration list: their scope is
+    // provisioned at runtime, which is the scope a connect-time grant cannot reach.
+    f.send(1, "skill-answer", false, 10007);
+    const started = await f.started.take();
+    const run = await f.app.runs.waitForRun(started.caller, started.run.id);
+
+    expect(run.status).toBe("succeeded");
+    // Publishing is backgrounded, so the delivery is awaited rather than assumed: a Run that
+    // cannot deliver settles as succeeded and simply never sends.
+    await expect
+      .poll(
+        async () =>
+          (
+            await f.app.store.lifecycle.listDeliveries(started.caller, started.run.id, {
+              limit: 10,
+            })
+          ).items.map((delivery) => delivery.status),
+        { timeout: 5_000 },
+      )
+      .toEqual(["sent"]);
+    expect(f.actionLog.some((action) => action.action === "send_group_msg")).toBe(true);
   });
 });
