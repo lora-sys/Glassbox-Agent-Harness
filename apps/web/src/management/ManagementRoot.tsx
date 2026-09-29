@@ -176,6 +176,8 @@ export const ManagementRoot: React.FC = () => {
           },
         });
         if (res.status === 401) {
+          clearManagementToken();
+          setTokenState(null);
           return { success: false, status: 401, error: '所有者 Token 鉴权失败 (401 Unauthorized)' };
         }
         if (res.status === 403) {
@@ -192,8 +194,10 @@ export const ManagementRoot: React.FC = () => {
         if (json?.status !== 'ready' || json?.service !== 'glassbox') {
           return { success: false, status: 502, error: '服务端状态异常，非合规 Glassbox 实例' };
         }
+        if (!setManagementToken(newToken.trim(), persist)) {
+          return { success: false, status: 500, error: '浏览器未能按所选方式保存凭据，请检查存储权限或取消持久化后重试。' };
+        }
         setTokenState(newToken.trim());
-        setManagementToken(newToken.trim(), persist);
         return { success: true };
       } catch (err) {
         return {
