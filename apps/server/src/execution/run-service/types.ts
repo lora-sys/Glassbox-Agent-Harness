@@ -133,6 +133,11 @@ export interface RunServiceOptions {
   transport: RunTransport;
   concurrency?: number;
   deliveryTimeoutMs?: number;
+  /**
+   * How long after a Run finishes a restart may still publish it. Defaults to two hours; a Run
+   * holding a delivery that never reached a final state is restored regardless of age.
+   */
+  restoreWindowMs?: number;
   onEvent?: (event: RunServiceEvent) => void | Promise<void>;
   prepareDelivery?: (
     candidate: string,

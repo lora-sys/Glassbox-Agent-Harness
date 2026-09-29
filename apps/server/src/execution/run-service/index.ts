@@ -49,12 +49,23 @@ const statusFallback: Record<string, string> = {
   interrupted: "这次执行被中断，没有给出结果。请稍后重试。",
 };
 
+/**
+ * How long after a Run finishes a restart may still publish it.
+ *
+ * The gap this covers is the one a restart exists for: the process died between settling the
+ * Run and creating its delivery. Two hours is long enough to survive a machine reboot and
+ * short enough that a Run nobody has waited two hours for is not answered by surprise.
+ */
+const DEFAULT_RESTORE_WINDOW_MS = 2 * 60 * 60 * 1000;
+const MAX_RESTORE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
 /** Session task ownership adapts OpenHarness's gateway bridge. Durable queue
  * order, current authorization and immutable deliveries belong to DomainStore. */
 export class RunService {
   private started = false;
   private readonly concurrency: number;
   private readonly deliveryTimeoutMs: number;
+  private readonly restoreWindowMs: number;
   private readonly active = new Map<string, ActiveRun>();
   private readonly blocked = new Set<string>();
   private readonly recoveredNativeRoleRunIds = new Set<string>();
@@ -66,6 +77,7 @@ export class RunService {
   constructor(private readonly options: RunServiceOptions) {
     this.concurrency = options.concurrency ?? 2;
     this.deliveryTimeoutMs = options.deliveryTimeoutMs ?? 15_000;
+    this.restoreWindowMs = options.restoreWindowMs ?? DEFAULT_RESTORE_WINDOW_MS;
     if (!Number.isInteger(this.concurrency) || this.concurrency < 1 || this.concurrency > 32)
       throw new Error("Invalid Run concurrency");
     if (
@@ -74,6 +86,12 @@ export class RunService {
       this.deliveryTimeoutMs > 120_000
     )
       throw new Error("Invalid delivery timeout");
+    if (
+      !Number.isSafeInteger(this.restoreWindowMs) ||
+      this.restoreWindowMs < 0 ||
+      this.restoreWindowMs > MAX_RESTORE_WINDOW_MS
+    )
+      throw new Error("Invalid restore window");
   }
 
   /** The host must already hold exclusive server ownership of this data directory. */
@@ -570,12 +588,21 @@ export class RunService {
     this.publications.add(task);
   }
 
+  /**
+   * Republishes the terminal Runs a restart is entitled to.
+   *
+   * Bounded by `restoreWindowMs`: only Runs that finished recently, or that hold a delivery
+   * that never reached a final state, are candidates. Everything else settled while this
+   * process — or an earlier one — was alive and already had its outcome recorded, so a restart
+   * that republished it would answer a question nobody is still asking.
+   */
   private async restorePublications(): Promise<void> {
     let cursor = 0;
     while (this.started) {
-      const routes = await this.options.store.lifecycle.listRunRoutes(
+      const routes = await this.options.store.lifecycle.listRestorableRunRoutes(
         ["succeeded", "failed", "cancelled", "interrupted", "unknown"],
         cursor,
+        { windowMs: this.restoreWindowMs, now: new Date() },
       );
       for (const route of routes) {
         cursor = route.sequence;

@@ -232,6 +232,60 @@ export class LifecycleStore {
     });
   }
 
+  /**
+   * The subset of terminal Runs a restart may still publish.
+   *
+   * A Run qualifies when it finished inside `windowMs` of `now`, because the process may have
+   * died between settling the Run and creating its delivery — that gap is what a restart
+   * recovers. It also qualifies when it holds a delivery that never reached a final state,
+   * which is work left in flight whatever its age.
+   *
+   * A Run that finished long ago with nothing in flight is deliberately excluded. The process
+   * was up and running when it settled: it either delivered the answer, or recorded in the
+   * trace why it would not. Republishing it on a later restart sends an answer nobody is
+   * waiting for any more, which is how three failed-Run notices from the previous week reached
+   * a private chat days after the fact.
+   */
+  async listRestorableRunRoutes(
+    statuses: readonly RunStatus[],
+    afterSequence: number,
+    window: { windowMs: number; now: Date },
+  ): Promise<RunRoute[]> {
+    if (
+      statuses.length === 0 ||
+      statuses.some((status) => !Object.hasOwn(transitions, status)) ||
+      !Number.isSafeInteger(afterSequence) ||
+      afterSequence < 0 ||
+      !Number.isSafeInteger(window.windowMs) ||
+      window.windowMs < 0
+    )
+      throw new Error("Invalid restore query");
+    const finishedAfter = new Date(window.now.getTime() - window.windowMs).toISOString();
+    return this.db.transaction(async (tx) => {
+      const rows = await tx.execute({
+        sql: `SELECT runs.id, runs.conversation_id, runs.sequence, runs.principal_id, runs.scope_json
+          FROM runs
+          WHERE runs.status IN (${statuses.map(() => "?").join(",")})
+            AND runs.sequence > ?
+            AND (runs.updated_at > ?
+              OR EXISTS (SELECT 1 FROM deliveries WHERE deliveries.run_id = runs.id
+                AND deliveries.status IN ('pending','sending','failed','unknown')))
+          ORDER BY runs.sequence LIMIT 100`,
+        args: [...statuses, afterSequence, finishedAfter],
+      });
+      return rows.rows.map((row) => {
+        const sequence = Number(row.sequence);
+        if (!Number.isSafeInteger(sequence)) throw new Error("Invalid persisted sequence");
+        return {
+          runId: stringColumn(row, "id"),
+          conversationId: stringColumn(row, "conversation_id"),
+          sequence,
+          caller: { principalId: stringColumn(row, "principal_id"), scope: storedScope(row) },
+        };
+      });
+    });
+  }
+
   /** The unforgeable in-process closure records terminal facts only. It neither
    * loads context nor grants permission to execute Tools or publish results. */
   async claimQueuedRun(caller: CallerContext, runId: string): Promise<RunLease> {
