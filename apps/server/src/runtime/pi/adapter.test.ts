@@ -456,6 +456,11 @@ describe("PiSdkRuntimeAdapter", () => {
   });
 
   it("shares the Tool-result turn budget, compacts structured overflow, and removes image payloads", async () => {
+    // The 10,000-token window is what makes the compaction observable, so the image payload has
+    // to stay small enough that the system prompt still fits under it: that prompt grows every
+    // time a rule is added, and at 50,000 characters the fixture had ~100 tokens of headroom,
+    // which one added sentence exhausted. What is under test is that the payload is removed, not
+    // how large a payload the window can absorb.
     const runtimeBaseDir = await mkdtemp(join(tmpdir(), "glassbox-pi-tool-budget-"));
     directories.push(runtimeBaseDir);
     const model = {
@@ -537,7 +542,7 @@ describe("PiSdkRuntimeAdapter", () => {
           if (name === "fixture_one") firstToolExecutions++;
           return name === "fixture_image"
             ? {
-                content: [{ type: "image", data: "a".repeat(50_000), mimeType: "image/png" }],
+                content: [{ type: "image", data: "a".repeat(20_000), mimeType: "image/png" }],
                 details: {},
               }
             : { content: [{ type: "text", text: largeResult }], details: {} };
