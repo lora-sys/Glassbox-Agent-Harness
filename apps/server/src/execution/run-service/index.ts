@@ -25,6 +25,30 @@ interface RunWaiter {
 
 const terminal = new Set(["cancelled", "succeeded", "failed", "interrupted", "unknown"]);
 
+/** What a Run with no text of its own tells its reader, keyed by the cause it recorded.
+ * Each line names what actually went wrong: a reader who is told only "状态为 unknown" cannot
+ * act on it, and the four Runs that reached this fallback on 2026-09-28 all said the same thing. */
+const failureFallback: Record<string, string> = {
+  execution_threw: "执行这次请求的进程中途出错了，没有产出结果。请稍后重试。",
+  pre_provider_context_overflow:
+    "这次请求的内容超出了当前模型的上下文容量，未发送给模型。可以缩小问题范围或另开一个会话再试。",
+  model_capacity_unknown: "没能确认当前模型的上下文容量，因此没有发送给模型。请稍后重试。",
+  required_action_not_completed: "这次请求需要执行的操作没有完成，因此无法给出结果。请稍后重试。",
+  required_evidence_missing: "没能取到这条问题所依赖的原始信息，因此无法确认。请稍后重试。",
+};
+
+function isDeliverableText(text: unknown): text is string | undefined {
+  return text === undefined || (typeof text === "string" && text.length <= 64_000);
+}
+
+/** The last resort when a Run recorded no cause and said nothing. Status names alone are opaque
+ * to a reader on the other end of a chat channel, so the two outcomes a reader can recognise get
+ * a sentence instead. */
+const statusFallback: Record<string, string> = {
+  cancelled: "已停止，这次没有给出结果。",
+  interrupted: "这次执行被中断，没有给出结果。请稍后重试。",
+};
+
 /** Session task ownership adapts OpenHarness's gateway bridge. Durable queue
  * order, current authorization and immutable deliveries belong to DomainStore. */
 export class RunService {
@@ -394,16 +418,24 @@ export class RunService {
         }
       }
     } catch (error) {
-      // A thrown adapter error does not prove that a detached execution stopped.
-      result = { status: error instanceof AccessDeniedError ? "failed" : "unknown" };
+      // A thrown adapter error does not prove that a detached execution stopped. It does prove
+      // that no classified result exists, so the Run keeps a named cause instead of collapsing
+      // into the same opaque status line every other failure produced.
+      result = {
+        status: error instanceof AccessDeniedError ? "failed" : "unknown",
+        ...(error instanceof AccessDeniedError ? {} : { failureCode: "execution_threw" }),
+      };
     }
-    if (
-      !result ||
-      !terminal.has(result.status) ||
-      (result.text !== undefined &&
-        (typeof result.text !== "string" || result.text.length > 64_000))
-    )
-      result = { status: "unknown" };
+    // A result the adapter could not classify still carries whatever cause it named: dropping the
+    // text here is what turned every executor failure into one indistinguishable sentence.
+    const classified =
+      result && terminal.has(result.status) && isDeliverableText(result.text) ? result : undefined;
+    if (!classified)
+      result = {
+        status: "unknown",
+        ...(result && isDeliverableText(result.text) ? { text: result.text } : {}),
+        ...(result?.failureCode ? { failureCode: result.failureCode } : {}),
+      };
     let status: TerminalRunStatus = result.status;
     if (status === "cancelled") {
       // Server shutdown may abort without a user cancellation transition.
@@ -413,7 +445,7 @@ export class RunService {
         status = "interrupted";
       }
     }
-    const finished = await active.lease.settle(status, result.text);
+    const finished = await active.lease.settle(status, result.text, result.failureCode);
     await this.emit({
       type: "run_finished",
       runId,
@@ -442,7 +474,16 @@ export class RunService {
     const run = await this.getRun(caller, record.id);
     if (!terminal.has(run.status)) return;
     const existing = await this.options.store.lifecycle.findDelivery(caller, run.id, "result");
-    const candidate = run.resultText ?? `任务处理未完成，状态为 ${run.status}。`;
+    // A Run that said nothing still owes its reader a sentence, and the cause it recorded decides
+    // which one. The status alone names the outcome, not the reason, and an unrecorded cause falls
+    // back to naming the status rather than staying silent. Blank text counts as having said
+    // nothing: delivering it would send an empty message.
+    const reported = run.resultText?.trim() ? run.resultText : undefined;
+    const candidate =
+      reported ??
+      (run.failureCode ? failureFallback[run.failureCode] : undefined) ??
+      statusFallback[run.status] ??
+      `任务处理未完成，状态为 ${run.status}。`;
     const prepared = this.options.prepareDelivery
       ? await this.options.prepareDelivery(candidate, { caller, run })
       : { allowed: true, text: candidate, reasons: [], candidateSha256: "not-recorded" };

@@ -495,6 +495,113 @@ describe("durable Run scheduling", () => {
     ).not.toContain("SECRET-DIAGNOSTIC-42");
   });
 
+  it("names the cause a thrown executor recorded instead of repeating the terminal status", async () => {
+    const { store } = await fixture();
+    const send = vi.fn(async (): Promise<{ status: "sent" }> => ({ status: "sent" }));
+    const { instance } = service(
+      store,
+      {
+        supportsGroup: true,
+        execute: async () => {
+          throw new Error("SECRET-DIAGNOSTIC-42");
+        },
+      },
+      { send },
+    );
+    await instance.start();
+    const accepted = await instance.receive(input("threw"));
+    await instance.drain();
+    expect(await instance.getRun(owner(), accepted.run.id)).toMatchObject({
+      status: "unknown",
+      failureCode: "execution_threw",
+    });
+    const delivered = (await store.lifecycle.listDeliveries(owner(), accepted.run.id)).items;
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]!.payloadText).toBe(
+      "执行这次请求的进程中途出错了，没有产出结果。请稍后重试。",
+    );
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it("delivers the line the recorded cause selects, and never an empty message", async () => {
+    const { store } = await fixture();
+    const send = vi.fn(async (): Promise<{ status: "sent" }> => ({ status: "sent" }));
+    const execute = vi
+      .fn<RunExecutionAdapter["execute"]>()
+      .mockResolvedValueOnce({
+        status: "failed",
+        failureCode: "required_evidence_missing",
+        text: "未能从 QQ 获取该信息，因此无法确认。",
+      })
+      .mockResolvedValueOnce({ status: "failed", failureCode: "execution_threw" })
+      .mockResolvedValueOnce({ status: "failed", text: "" });
+    const { instance } = service(store, { supportsGroup: true, execute }, { send });
+    await instance.start();
+
+    const carried = await instance.receive(input("carried-cause"));
+    await instance.drain();
+    expect(
+      (await store.lifecycle.listDeliveries(owner(), carried.run.id)).items[0]?.payloadText,
+    ).toBe("未能从 QQ 获取该信息，因此无法确认。");
+
+    // A cause recorded with no text still produces a sentence: the reader learns what went wrong
+    // rather than being told the status code.
+    const silent = await instance.receive(input("silent-cause"));
+    await instance.drain();
+    expect(
+      (await store.lifecycle.listDeliveries(owner(), silent.run.id)).items[0]?.payloadText,
+    ).toBe("执行这次请求的进程中途出错了，没有产出结果。请稍后重试。");
+
+    // Blank text is not an answer. It falls through to the status line rather than being sent.
+    const blank = await instance.receive(input("blank-text"));
+    await instance.drain();
+    expect(
+      (await store.lifecycle.listDeliveries(owner(), blank.run.id)).items[0]?.payloadText,
+    ).toBe("任务处理未完成，状态为 failed。");
+    expect(send).toHaveBeenCalledTimes(3);
+  });
+
+  it("keeps the recorded cause when a result is forced to unknown", async () => {
+    const { store } = await fixture();
+    const execute = vi.fn<RunExecutionAdapter["execute"]>().mockResolvedValue({
+      status: "failed",
+      failureCode: "model_capacity_unknown",
+      // Not a string: the result cannot stand as delivered text, but its cause still can.
+      text: 42 as unknown as string,
+    });
+    const { instance } = service(store, { supportsGroup: true, execute });
+    await instance.start();
+    const accepted = await instance.receive(input("bad-text"));
+    await instance.drain();
+    expect(await instance.getRun(owner(), accepted.run.id)).toMatchObject({
+      status: "unknown",
+      resultText: null,
+      failureCode: "model_capacity_unknown",
+    });
+    expect(
+      (await store.lifecycle.listDeliveries(owner(), accepted.run.id)).items[0]?.payloadText,
+    ).toBe("没能确认当前模型的上下文容量，因此没有发送给模型。请稍后重试。");
+  });
+
+  it("gives a reader a sentence for a stop that reported nothing", async () => {
+    const { store } = await fixture();
+    const { instance } = service(store, {
+      supportsGroup: true,
+      execute: async () => ({ status: "cancelled" }),
+    });
+    await instance.start();
+    const accepted = await instance.receive(input("cancelled-silent"));
+    await instance.drain();
+    // Nobody asked for this stop, so the Run is an interruption rather than a cancellation, and
+    // the reader is told it was interrupted rather than that they stopped it.
+    expect(await instance.getRun(owner(), accepted.run.id)).toMatchObject({
+      status: "interrupted",
+    });
+    expect(
+      (await store.lifecycle.listDeliveries(owner(), accepted.run.id)).items[0]?.payloadText,
+    ).toBe("这次执行被中断，没有给出结果。请稍后重试。");
+  });
+
   it("checks dispatch authority again after context loading", async () => {
     const { store, grants } = await fixture();
     const originalLoad = store.conversations.loadRunInput.bind(store.conversations);

@@ -88,6 +88,27 @@ import type { RequiredEvidence } from "./required-evidence.js";
 
 export interface PiRunContext {
   caller?: CallerContext;
+  /**
+   * Who is speaking right now, resolved from the Channel binding rather than from the message.
+   *
+   * A group Conversation is shared, so the principal frozen on it belongs to whoever spoke first.
+   * This carries the current sender instead, which is the only thing that can answer "who am I
+   * talking to" — and the prompt's identity rules are written against it.
+   */
+  callerIdentity?: {
+    senderId: string;
+    isOwner: boolean;
+    /** True when this Conversation's location is shared by several senders. */
+    sharedConversation: boolean;
+    /**
+     * What this channel's configuration calls the bot.
+     *
+     * Resolved from the connection, never from message text or a provider response, so it is
+     * the one name source the prompt can state as fact. Absent means the channel configured
+     * no name.
+     */
+    botDisplayName?: string;
+  };
   conversationId?: string;
   runId?: string;
   /** Current user attachments, carried to Pi as ImageContent without changing their order. */

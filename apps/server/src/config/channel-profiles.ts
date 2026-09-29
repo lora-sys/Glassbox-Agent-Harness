@@ -10,6 +10,7 @@ interface StoredChannel extends Omit<ChannelSaveInput, "token"> {
   autoConnect: boolean;
   modelOverrideProfileId?: string;
 }
+
 interface Settings {
   version: 1;
   channels: StoredChannel[];
@@ -63,6 +64,18 @@ function executionReference(value: unknown): string {
   throw new ChannelConfigurationError("Invalid execution reference");
 }
 
+/**
+ * The bot's own display name, or nothing.
+ *
+ * A value that trims to nothing clears the field instead of failing the save: an operator who
+ * emptied the box is asking for no configured name, which is a valid state, not a malformed one.
+ */
+function optionalDisplayName(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value === "string" && value.trim() === "") return undefined;
+  return text(value, "bot display name", 64);
+}
+
 function toConfig(channel: StoredChannel): OneBotConnectionConfig {
   return parseOneBotConfig({
     connectionId: channel.id,
@@ -71,6 +84,7 @@ function toConfig(channel: StoredChannel): OneBotConnectionConfig {
     botId: channel.botId,
     ownerId: channel.ownerId,
     ...(channel.coOwnerId !== undefined ? { coOwnerId: channel.coOwnerId } : {}),
+    ...(channel.botDisplayName !== undefined ? { botDisplayName: channel.botDisplayName } : {}),
     visitorIds: channel.visitorIds,
     groupIds: channel.groupIds,
     credentialSlot: channel.credentialSlot,
@@ -90,6 +104,7 @@ function parseChannel(value: unknown): StoredChannel {
     input.groupIds.some((id) => typeof id !== "string")
   )
     throw new ChannelConfigurationError("QQ account and group identifiers must be strings");
+  const botDisplayName = optionalDisplayName(input.botDisplayName);
   const channel: StoredChannel = {
     visitorIds: input.visitorIds === undefined ? [] : (input.visitorIds as string[]),
     id: identifier(input.id),
@@ -99,6 +114,7 @@ function parseChannel(value: unknown): StoredChannel {
     botId: input.botId,
     ownerId: input.ownerId,
     ...(typeof input.coOwnerId === "string" ? { coOwnerId: input.coOwnerId } : {}),
+    ...(botDisplayName === undefined ? {} : { botDisplayName }),
     groupIds: [...input.groupIds] as string[],
     executionRef: executionReference(input.executionRef),
     credentialSlot: identifier(input.credentialSlot),
@@ -243,6 +259,7 @@ export class ChannelProfileStore {
             "visitorIds",
             "groupIds",
             "executionRef",
+            "botDisplayName",
             "token",
           ].includes(key),
       )

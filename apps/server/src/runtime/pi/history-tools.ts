@@ -586,10 +586,14 @@ export function projectStrictHistoryReply(
  * steps: a cut candidate set can be reached by raising the limit, while a source the walk
  * never finished cannot be reached at all from here. `coverage.sourceLimits` carries the
  * reason in structured form for Trace; the sentence says only which window it applies to.
+ *
+ * A named term is quoted with corner brackets rather than double quotes. The model restates
+ * this sentence when it answers, and the outbound pipeline passes whatever quoting it copied
+ * straight through to QQ — so the quoting style here is the quoting style a member reads.
  */
 function historyGuidance(details: HistorySearchDetails): string {
   const { coverage } = details;
-  const terms = coverage.exactTerms.map((term) => `"${term}"`).join(", ");
+  const terms = coverage.exactTerms.map((term) => `「${term}」`).join(", ");
   if (coverage.coverage === "unknown")
     return "No group was searched, so nothing about the world was learned. This is not a negative result.";
   const sourceOpen = coverage.sourceLimits.length > 0;

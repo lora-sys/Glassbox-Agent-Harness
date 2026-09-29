@@ -506,6 +506,16 @@ async function executeProviderCall(
     });
 
   const result = await options.invoke({ capability, action, params: providerParams, context });
+  if (capability.tool === "qq_account_status" && action === "get_login_info") {
+    // The provider answers with the account's QQ nickname beside its number. The nickname is
+    // whatever NapCat read off QQ: nobody configured it here, it changes without this server
+    // being edited, and a model that sees it adopts it as its own name — which is how one
+    // account introduced itself three different ways in a single night. The number is the only
+    // identity fact in this response, so it is the only part that reaches the model.
+    if (!isRecord(result) || safeQqId(result.user_id) === undefined)
+      throw new ProviderCallError("provider_failed", "invalid_response");
+    return { botId: safeQqId(result.user_id) };
+  }
   if (capability.tool === "qq_group_members" && action === "get_group_member_list") {
     // The request is authorized to read group membership, but that does not make every
     // provider profile field necessary or safe to expose to a group audience. Keep the

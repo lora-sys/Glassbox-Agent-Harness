@@ -789,6 +789,97 @@ it("fails closed on mismatched or malformed member-info provider results", async
   }
 });
 
+it("keeps the QQ nickname out of the account-status read", async () => {
+  const { store, accepted } = await fixture();
+  try {
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: agentResourceId("personal"),
+      action: "account:status:read",
+      scope: ownerPrivateScope,
+      effect: "allow",
+    });
+    const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
+    // What NapCat actually answers: the account's number beside whatever nickname QQ has on
+    // file for it. The nickname is not configured anywhere in Glassbox and changes without
+    // this server being edited, which is why the projection drops it.
+    const loginResult = { user_id: 3394947361, nickname: "some-random-napcat-nickname" };
+    const created = createCapabilityTools({
+      store,
+      getContext: () => ({
+        caller: ownerPrivate,
+        runId: accepted.run.id,
+        conversationId: accepted.conversation.id,
+      }),
+      isCategoryEnabled: async () => true,
+      invoke: async (input) => {
+        calls.push({ action: input.action, params: input.params });
+        if (input.action === "get_login_info") return loginResult;
+        return { ok: true, action: input.action };
+      },
+      search: async () => ({ capabilities: [] }),
+      projectManagedGroups: async () => ({ groups: [] }),
+    });
+    const result = await call(toolByName(created, "qq_account_status"), {
+      operation: "get_login_info",
+    });
+    expect(calls).toEqual([{ action: "get_login_info", params: {} }]);
+    // The number survives, because it is the one identity fact the response carries.
+    expect(result.details).toEqual({ botId: "3394947361" });
+    expect(result.content?.[0]?.text).toBe('{"botId":"3394947361"}');
+    // The nickname does not: a model that sees it adopts it as its own name, and this account
+    // introduced itself three different ways in one night because of exactly that.
+    expect(JSON.stringify(result)).not.toContain("nickname");
+    expect(JSON.stringify(result)).not.toContain("some-random-napcat-nickname");
+  } finally {
+    await store.close();
+  }
+});
+
+it("fails closed when the account-status provider answers without the bot number", async () => {
+  const { store, accepted } = await fixture();
+  try {
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: agentResourceId("personal"),
+      action: "account:status:read",
+      scope: ownerPrivateScope,
+      effect: "allow",
+    });
+    for (const loginResult of [
+      { nickname: "a number-less login result" },
+      { user_id: 0, nickname: "must-not-leak" },
+      { user_id: 1.5, nickname: "must-not-leak" },
+      { user_id: "not-a-qq-number", nickname: "must-not-leak" },
+      null,
+    ]) {
+      const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
+      const created = createCapabilityTools({
+        store,
+        getContext: () => ({
+          caller: ownerPrivate,
+          runId: accepted.run.id,
+          conversationId: accepted.conversation.id,
+        }),
+        isCategoryEnabled: async () => true,
+        invoke: async (input) => {
+          calls.push({ action: input.action, params: input.params });
+          if (input.action === "get_login_info") return loginResult;
+          return { ok: true, action: input.action };
+        },
+        search: async () => ({ capabilities: [] }),
+        projectManagedGroups: async () => ({ groups: [] }),
+      });
+      await expect(
+        call(toolByName(created, "qq_account_status"), { operation: "get_login_info" }),
+      ).rejects.toMatchObject({ outcome: "provider_failed", message: "invalid_response" });
+      expect(calls).toEqual([{ action: "get_login_info", params: {} }]);
+    }
+  } finally {
+    await store.close();
+  }
+});
+
 it("refuses a model-supplied group_id, a foreign action and an undeclared parameter", async () => {
   const { store, accepted } = await fixture();
   try {

@@ -6,7 +6,10 @@ import type { FeedbackSignal, GlassboxMemoryScope, MemoryType } from "../../lear
 import { feedbackSignals } from "../../learning/contracts.js";
 import { MemoryConsolidator } from "../../learning/consolidation.js";
 import { internalLearningId, publicLearningId } from "../../learning/ids.js";
-import { candidateFromAuthorizedSource } from "../../learning/source.js";
+import {
+  candidateFromAuthorizedSource,
+  sourceStatementIsSubstantive,
+} from "../../learning/source.js";
 import {
   MEMORY_GOVERN_ACTION,
   MEMORY_READ_ACTION,
@@ -131,6 +134,28 @@ function commandFor(input: OwnerMemoryToolInput, scope?: GlassboxMemoryScope): s
   return "";
 }
 
+/**
+ * The Owner's message as the command lines it contains, each with its whitespace collapsed.
+ *
+ * A command has to be a literal `/memory ...` line the Owner wrote, so a message that merely
+ * mentions promoting a candidate still authorizes nothing. Anchoring on the line rather than on
+ * the whole message lets the Owner put the command inside a longer one, and collapsing runs of
+ * whitespace lets it be indented or wrapped without changing what it says. Requiring byte
+ * equality against the whole message failed on both, and the failure surfaced as an opaque Tool
+ * error instead of as a request for the command.
+ */
+function commandLines(persisted: string): string[] {
+  return persisted
+    .split(/\r?\n/u)
+    .map((line) => line.replace(/\s+/gu, " ").trim())
+    .filter((line) => line.length > 0);
+}
+
+function commandAuthorized(persisted: string, expected: string): boolean {
+  const want = expected.replace(/\s+/gu, " ").trim();
+  return want.length > 0 && commandLines(persisted).includes(want);
+}
+
 function modelEvidence(runId: string) {
   return [
     {
@@ -212,25 +237,27 @@ async function executeMemoryActionRaw(
     case "get":
       return learning.getMemory(operationContext, internalLearningId("memory", requiredId(input)));
     case "list_candidates":
-      return learning.listCandidates(operationContext);
+      return learning.listCandidates(
+        operationContext,
+        input.scopeType === undefined && input.groupId === undefined
+          ? {}
+          : { scope: scopeFrom(input, context) },
+      );
     case "write":
       if (typeof input.statement !== "string" || typeof input.type !== "string")
         throw new Error("memory_write_fields_required");
       {
         const scope = scopeFrom(input, context);
         const command = await ownerCommand(store, context);
+        const explicit = commandAuthorized(command, commandFor(input, scope));
         if (
-          command.startsWith("/memory write ") &&
-          (command !== commandFor(input, scope) ||
-            input.confidence !== undefined ||
-            input.ttlSeconds !== undefined)
+          commandLines(command).some((line) => line.startsWith("/memory write ")) &&
+          (!explicit || input.confidence !== undefined || input.ttlSeconds !== undefined)
         )
           throw new Error("owner_confirmation_required");
-        const explicit =
-          input.confidence === undefined &&
-          input.ttlSeconds === undefined &&
-          command === commandFor(input, scope);
-        if (!explicit)
+        const explicitWrite =
+          input.confidence === undefined && input.ttlSeconds === undefined && explicit;
+        if (!explicitWrite)
           return learning.createCandidate(operationContext, {
             candidateKind: "derived",
             subject: { kind: "user", id: context.caller.principalId },
@@ -256,7 +283,7 @@ async function executeMemoryActionRaw(
     case "update":
       if (input.confidence !== undefined || input.ttlSeconds !== undefined)
         throw new Error("owner_confirmation_required");
-      if ((await ownerCommand(store, context)) !== commandFor(input))
+      if (!commandAuthorized(await ownerCommand(store, context), commandFor(input)))
         throw new Error("owner_confirmation_required");
       return learning.updateMemory(
         operationContext,
@@ -270,7 +297,7 @@ async function executeMemoryActionRaw(
     case "expire":
     case "revoke":
     case "retire":
-      if ((await ownerCommand(store, context)) !== commandFor(input))
+      if (!commandAuthorized(await ownerCommand(store, context), commandFor(input)))
         throw new Error("owner_confirmation_required");
       return learning.setLifecycle(
         operationContext,
@@ -293,18 +320,13 @@ async function executeMemoryActionRaw(
         )
           throw new Error("memory_scope_mismatch");
         const command = await ownerCommand(store, context);
+        const explicit = commandAuthorized(command, commandFor(input));
         if (
-          command.startsWith("/memory supersede ") &&
-          (command !== commandFor(input) ||
-            input.confidence !== undefined ||
-            input.ttlSeconds !== undefined)
+          commandLines(command).some((line) => line.startsWith("/memory supersede ")) &&
+          (!explicit || input.confidence !== undefined || input.ttlSeconds !== undefined)
         )
           throw new Error("owner_confirmation_required");
-        if (
-          input.confidence !== undefined ||
-          input.ttlSeconds !== undefined ||
-          command !== commandFor(input)
-        )
+        if (input.confidence !== undefined || input.ttlSeconds !== undefined || !explicit)
           return learning.createCandidate(operationContext, {
             candidateKind: "correction",
             subject: existing.subject,
@@ -334,7 +356,12 @@ async function executeMemoryActionRaw(
     case "promote":
       if (input.candidateIds) {
         const candidateIds = checkedCandidateIds(input.candidateIds);
-        if ((await ownerCommand(store, context)) !== commandFor({ ...input, candidateIds }))
+        if (
+          !commandAuthorized(
+            await ownerCommand(store, context),
+            commandFor({ ...input, candidateIds }),
+          )
+        )
           throw new Error("owner_confirmation_required");
         const results = [];
         for (const publicId of candidateIds) {
@@ -359,7 +386,7 @@ async function executeMemoryActionRaw(
         }
         return { results };
       }
-      if ((await ownerCommand(store, context)) !== commandFor(input))
+      if (!commandAuthorized(await ownerCommand(store, context), commandFor(input)))
         throw new Error("owner_confirmation_required");
       {
         const candidateId = internalLearningId("candidate", requiredId(input));
@@ -377,7 +404,12 @@ async function executeMemoryActionRaw(
     case "reject":
       if (input.candidateIds) {
         const candidateIds = checkedCandidateIds(input.candidateIds);
-        if ((await ownerCommand(store, context)) !== commandFor({ ...input, candidateIds }))
+        if (
+          !commandAuthorized(
+            await ownerCommand(store, context),
+            commandFor({ ...input, candidateIds }),
+          )
+        )
           throw new Error("owner_confirmation_required");
         const results = [];
         for (const publicId of candidateIds) {
@@ -398,7 +430,7 @@ async function executeMemoryActionRaw(
         }
         return { results };
       }
-      if ((await ownerCommand(store, context)) !== commandFor(input))
+      if (!commandAuthorized(await ownerCommand(store, context), commandFor(input)))
         throw new Error("owner_confirmation_required");
       {
         const candidateId = internalLearningId("candidate", requiredId(input));
@@ -417,7 +449,7 @@ async function executeMemoryActionRaw(
       if (!input.signalType || !feedbackSignals.includes(input.signalType) || !input.statement)
         throw new Error("invalid_feedback_input");
       const scope = scopeFrom(input, context);
-      if ((await ownerCommand(store, context)) !== commandFor(input, scope))
+      if (!commandAuthorized(await ownerCommand(store, context), commandFor(input, scope)))
         throw new Error("owner_confirmation_required");
       return learning.recordFeedback(operationContext, {
         signalType: input.signalType,
@@ -469,12 +501,18 @@ async function executeMemoryActionRaw(
         runId: context.runId,
       });
       if (decision.decision !== "ALLOW") throw new Error("memory_source_denied");
+      // A query is what makes this an import of something asked about rather than a dump of
+      // whatever the archive happened to hold last. Without one the read returns the most recent
+      // messages in the group, which is how the review queue came to hold `可以`, `风控有点严`
+      // and `@3394947361 who are you` as pending candidates.
+      if (typeof input.query !== "string" || !input.query.trim())
+        throw new Error("memory_source_query_required");
       const reader = new AuthorizedQQSourceReader({ store, caller: context.caller });
       const items = await reader.readCandidates({
         connectionId: context.caller.scope.connectionId,
         groupId: input.groupId,
         sourceClass: input.sourceClass,
-        ...(input.query === undefined ? {} : { query: input.query }),
+        query: input.query,
         limit: input.limit ?? 10,
         ...(input.since === undefined ? {} : { since: input.since }),
         ...(input.until === undefined ? {} : { until: input.until }),
@@ -482,7 +520,15 @@ async function executeMemoryActionRaw(
       const scope = scopeFrom(input, context);
       const category = input.sourceClass === "metadata" ? "group_info" : input.sourceClass;
       const candidates = [];
+      let skipped = 0;
       for (const item of items) {
+        // A message that asserts nothing is not a candidate. Counting what was dropped is what
+        // keeps the answer honest: "imported 3 candidates" would otherwise be said about a read
+        // that matched ten messages and queued three.
+        if (!sourceStatementIsSubstantive(item.text)) {
+          skipped += 1;
+          continue;
+        }
         candidates.push(
           await learning.createCandidate(
             operationContext,
@@ -508,7 +554,12 @@ async function executeMemoryActionRaw(
           ),
         );
       }
-      return candidates;
+      return {
+        matched: items.length,
+        imported: candidates.length,
+        skipped,
+        candidates,
+      };
     }
   }
 }
@@ -557,7 +608,7 @@ export function createOwnerMemoryTools(options: {
       name: OWNER_MEMORY_ADMIN_TOOL,
       label: "Owner Memory 管理",
       description:
-        "Owner-private Memory administration. Read with /memory list [all|global|project:id|group:id], /memory get <id>, or /memory candidates. Import an authorized QQ source as pending candidates with /memory source <global|project:id> <groupId> <history|notice|essence|metadata|file|album>, or use /memory source group:<id> <history|notice|essence|metadata|file|album> to keep it in that group's scope. Model-originated write and supersede calls create pending candidates only. Review candidates with the exact current-message commands /memory promote <id> [id ...] or /memory reject <id> [id ...], up to 20 distinct candidates. Other active changes require exact current-message commands.",
+        "Owner-private Memory administration. Read with /memory list [all|global|project:id|group:id], /memory get <id>, or /memory candidates. Import an authorized QQ source as pending candidates with /memory source <global|project:id> <groupId> <history|notice|essence|metadata|file|album> <query> [limit], or use /memory source group:<id> <history|notice|essence|metadata|file|album> <query> [limit] to keep it in that group's scope. The query is required: it names what the import is about, and without it the read would return whatever the archive happened to hold last. Messages that assert nothing are not imported, and the result reports how many were matched, imported and skipped. Model-originated write and supersede calls create pending candidates only. Review candidates with the exact current-message commands /memory promote <id> [id ...] or /memory reject <id> [id ...], up to 20 distinct candidates. Other active changes require exact current-message commands. Every governing command must appear as a literal /memory line in the Owner's own current message; it may be on any line of that message, and extra whitespace around it is ignored. A message that only describes the change in prose authorizes nothing: ask the Owner to type the command and report the refusal instead of claiming the change is done.",
       parameters: Type.Object(
         {
           action: Type.Unsafe<OwnerMemoryToolInput["action"]>({

@@ -9,6 +9,8 @@ export interface OneBotConnectionConfig {
   groupIds: readonly string[];
   credentialSlot: string;
   allowRemote: boolean;
+  /** What the bot calls itself. Absent means the connection configured no name. */
+  botDisplayName?: string;
 }
 
 export class OneBotConfigurationError extends Error {
@@ -44,6 +46,28 @@ function identifier(value: unknown, label: string): string {
   return value;
 }
 
+/**
+ * The bot's own display name: a short free-text name, or nothing.
+ *
+ * Bounded and control-character-free for the same reason the label is, because it is printed
+ * into an outbound QQ message and into the system prompt. A name that trims to nothing means
+ * "no configured name" rather than an empty name, so a form that clears the field cannot leave
+ * the bot introducing itself as the empty string.
+ */
+function displayName(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (
+    typeof value !== "string" ||
+    value.length > 64 ||
+    Array.from(value).some(
+      (character) => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127,
+    )
+  )
+    throw new OneBotConfigurationError("Invalid bot display name");
+  const trimmed = value.trim();
+  return trimmed === "" ? undefined : trimmed;
+}
+
 export function parseOneBotConfig(value: unknown): OneBotConnectionConfig {
   const config = object(value);
   if (!config) throw new OneBotConfigurationError("Expected a OneBot connection object");
@@ -53,7 +77,9 @@ export function parseOneBotConfig(value: unknown): OneBotConnectionConfig {
   if (!botId || !ownerId || botId === ownerId)
     throw new OneBotConfigurationError("Configure separate valid bot and Owner QQ numbers");
   if (coOwnerId !== undefined && (coOwnerId === botId || coOwnerId === ownerId))
-    throw new OneBotConfigurationError("Configure separate valid bot, Owner, and Co-Owner QQ numbers");
+    throw new OneBotConfigurationError(
+      "Configure separate valid bot, Owner, and Co-Owner QQ numbers",
+    );
   if (!Array.isArray(config.groupIds) || config.groupIds.length > 32)
     throw new OneBotConfigurationError("Configure at most 32 allowed group numbers");
   const groups = config.groupIds.map(qqId);
@@ -101,6 +127,7 @@ export function parseOneBotConfig(value: unknown): OneBotConnectionConfig {
   const label = config.label;
   if (typeof label !== "string" || !label.trim() || label.length > 120)
     throw new OneBotConfigurationError("Invalid connection label");
+  const botDisplayName = displayName(config.botDisplayName);
   return Object.freeze({
     connectionId: identifier(config.connectionId, "connection identifier"),
     label: label.trim(),
@@ -112,5 +139,6 @@ export function parseOneBotConfig(value: unknown): OneBotConnectionConfig {
     groupIds: Object.freeze([...new Set(groups as string[])]),
     credentialSlot: identifier(config.credentialSlot, "credential slot"),
     allowRemote,
+    ...(botDisplayName === undefined ? {} : { botDisplayName }),
   });
 }

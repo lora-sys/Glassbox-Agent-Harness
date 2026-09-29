@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { createClient } from "@libsql/client";
 import { expect, it } from "vite-plus/test";
 import { DomainDatabase, localDatabaseUrl } from "./database.js";
+import { CURRENT_SCHEMA_VERSION } from "./schema.js";
 
 it("migrates v11 to constrained message image attachments", async () => {
   const directory = await mkdtemp(join(tmpdir(), "glassbox-schema-v12-"));
@@ -14,13 +15,19 @@ it("migrates v11 to constrained message image attachments", async () => {
 
     const legacy = createClient({ url: localDatabaseUrl(path) });
     await legacy.execute("DROP TABLE message_attachments");
+    // The database above was built by the current schema, so it already carries everything v12
+    // and v13 add. A v11 database has neither, and the migration chain is only exercised over one
+    // if both are absent — otherwise the v13 ALTER runs against a column that is already there.
+    await legacy.execute("ALTER TABLE runs DROP COLUMN failure_code");
     await legacy.execute("PRAGMA user_version = 11");
     legacy.close();
 
     const db = await DomainDatabase.open(path);
     try {
       await db.transaction(async (tx) => {
-        expect((await tx.execute("PRAGMA user_version")).rows[0]?.user_version).toBe(12);
+        expect((await tx.execute("PRAGMA user_version")).rows[0]?.user_version).toBe(
+          CURRENT_SCHEMA_VERSION,
+        );
         await tx.execute("INSERT INTO agents(id, created_at) VALUES ('agent', 'now')");
         await tx.execute(
           "INSERT INTO principals(id, kind, created_at) VALUES ('owner', 'owner', 'now')",

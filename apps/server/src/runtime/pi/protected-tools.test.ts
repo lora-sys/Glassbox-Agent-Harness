@@ -5,6 +5,7 @@ import type { CallerContext } from "../../identity/scope.js";
 import { ProviderCallError } from "./provider-outcome.js";
 import {
   createProtectedTool,
+  requiredCallClause,
   ToolInputError,
   type ProtectedToolContext,
 } from "./protected-tools.js";
@@ -94,5 +95,50 @@ describe("a protected Tool's failure classification", () => {
       throw new ProviderCallError("provider_failed", "provider_failed");
     });
     await expect(run(definition)).rejects.toBeInstanceOf(ProviderCallError);
+  });
+
+  it("hands a Glassbox gate code back unchanged so the next call can be a correction", async () => {
+    // "The Owner's message does not carry the command" is a rule the model can satisfy. Reporting
+    // it as "the Tool failed" instead is what let a Run tell the user an instruction had been
+    // recorded while nothing was written.
+    const { definition } = tool(async () => {
+      throw new Error("owner_confirmation_required");
+    });
+    await expect(run(definition)).rejects.toThrow("owner_confirmation_required");
+  });
+
+  it("still collapses a message that is not one of the fixed codes", async () => {
+    // The whitelist is what makes the pass-through safe: a message this repository did not author
+    // as a code stays opaque, however much it looks like one.
+    for (const message of [
+      "NapCat retcode 100 at ws://internal:3000",
+      "owner_confirmation_required for candidate_cafebabe",
+      "timeout",
+    ]) {
+      const { definition } = tool(async () => {
+        throw new Error(message);
+      });
+      await expect(run(definition)).rejects.toThrow("protected_tool_failed");
+    }
+  });
+});
+
+describe("a required call's instruction", () => {
+  it("pins the exact input when the message bound every parameter", () => {
+    expect(
+      requiredCallClause("group_history_search", { query: "p4b-a-1349", sender: "3526039967" }),
+    ).toBe(
+      'group_history_search with exactly this JSON input: {"query":"p4b-a-1349","sender":"3526039967"}',
+    );
+  });
+
+  it("names where an unpinned filter comes from instead of printing an empty object", () => {
+    // Both alternatives fail: `{}` is rejected by the Tool's own schema, and a bare Tool name
+    // leaves the model to send it anyway.
+    for (const input of [undefined, {}]) {
+      const clause = requiredCallClause("group_history_search", input);
+      expect(clause).toBe("group_history_search with a filter taken from the user's own words");
+      expect(clause).not.toContain("{}");
+    }
   });
 });

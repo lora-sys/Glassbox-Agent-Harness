@@ -568,6 +568,121 @@ describe("shared group conversation and durable actor routing", () => {
     expect(ownerDeliveryId).not.toBe(visitorDeliveryId);
   });
 
+  it("rebinds a shared group Conversation to the Owner once the Owner speaks in it", async () => {
+    const store = await setupStore();
+
+    const visitorRes = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: visitorGroup.scope,
+      messageId: "msg-visitor-opener",
+      text: "hello from visitor",
+      executionRef: "executor-main",
+    });
+    expect(visitorRes.conversation.principalId).toBe("visitor");
+
+    // The Owner joins the Conversation the visitor opened. The principal frozen on it still
+    // names the visitor, which kept this group out of the Owner's own listing entirely.
+    const ownerRes = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: ownerGroup.scope,
+      messageId: "msg-owner-joins",
+      text: "hello from owner",
+      executionRef: "executor-main",
+    });
+    expect(ownerRes.conversation.id).toBe(visitorRes.conversation.id);
+    expect(ownerRes.conversation.principalId).toBe("owner");
+
+    // Rebinding must not split the Conversation, and must not move the Run's own principal:
+    // the next visitor turn lands in the same Conversation as the visitor.
+    const visitorRes2 = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: visitorGroup.scope,
+      messageId: "msg-visitor-after-rebind",
+      text: "hello again from visitor",
+      executionRef: "executor-main",
+    });
+    expect(visitorRes2.conversation.id).toBe(visitorRes.conversation.id);
+    expect(visitorRes2.run.principalId).toBe("visitor");
+  });
+
+  it("names the QQ sender of every history turn in a shared group Conversation", async () => {
+    const store = await setupStore();
+
+    const visitorRes = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: visitorGroup.scope,
+      messageId: "msg-visitor-turn1",
+      text: "question from visitor",
+      executionRef: "executor-main",
+    });
+    const visitorLease = await store.lifecycle.claimQueuedRun(visitorGroup, visitorRes.run.id);
+    await visitorLease.settle("succeeded", "answer to visitor");
+
+    // A turn the whole group saw: the answer was delivered into the group, so every member's
+    // later history carries it and therefore needs to say who asked.
+    const ownerRes = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: ownerGroup.scope,
+      messageId: "msg-owner-turn1",
+      text: "question from owner",
+      executionRef: "executor-main",
+    });
+    const ownerLease = await store.lifecycle.claimQueuedRun(ownerGroup, ownerRes.run.id);
+    await ownerLease.settle("succeeded", "answer to owner");
+    const deliveryId = await store.lifecycle.createDelivery(ownerGroup, {
+      runId: ownerRes.run.id,
+      dedupKey: "result-group",
+      destination: ownerGroup.scope,
+      payloadText: "answer to owner",
+      payloadKind: "result",
+    });
+    const deliveryLease = await store.lifecycle.claimDelivery(
+      ownerGroup,
+      ownerRes.run.id,
+      deliveryId,
+    );
+    expect(deliveryLease).not.toBeNull();
+    await deliveryLease!.settle("sent", "ext-sent-group");
+
+    const visitorRes2 = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: visitorGroup.scope,
+      messageId: "msg-visitor-turn2",
+      text: "follow-up from visitor",
+      executionRef: "executor-main",
+    });
+    const visitorInput = await store.conversations.loadRunInput(visitorGroup, visitorRes2.run.id);
+
+    expect(visitorInput.history).toEqual([
+      { role: "user", text: "question from visitor" },
+      { role: "assistant", text: "answer to visitor" },
+      { role: "user", text: "question from owner" },
+      { role: "assistant", text: "answer to owner" },
+    ]);
+    // Two entries per exchange, in history order, so the reader can pair them without a join.
+    expect(visitorInput.historyActors).toEqual([
+      { principalId: "visitor", senderId: "visitor-qq" },
+      { principalId: "visitor", senderId: "visitor-qq" },
+      { principalId: "owner", senderId: "owner-qq" },
+      { principalId: "owner", senderId: "owner-qq" },
+    ]);
+
+    // A private Conversation has one speaker by construction, so the field stays absent there
+    // rather than repeating the same principal on every line.
+    const ownerPrivateRes = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: ownerPrivate.scope,
+      messageId: "msg-owner-private-turn",
+      text: "private question",
+      executionRef: "executor-main",
+    });
+    const ownerPrivateInput = await store.conversations.loadRunInput(
+      ownerPrivate,
+      ownerPrivateRes.run.id,
+    );
+    expect(ownerPrivateInput.historyActors).toBeUndefined();
+  });
+
   it("enforces complete isolation between private DMs, group chats, and across different groups", async () => {
     const store = await setupStore();
 
@@ -1113,9 +1228,15 @@ describe("shared group conversation and durable actor routing", () => {
     expect(fkViolations.rows).toHaveLength(0);
 
     // 10. Verify all current migrations completed. V7 adds the P4B channel history
-    // archive (channel_messages + FTS index) and group capability policies.
+    // archive (channel_messages + FTS index) and group capability policies; V13 adds the
+    // Run failure cause column that the fallback delivery line is chosen from.
     const ver = await rawCheck.execute("PRAGMA user_version");
-    expect(Number(ver.rows[0]?.user_version)).toBe(12);
+    expect(Number(ver.rows[0]?.user_version)).toBe(13);
+    const runColumns = await rawCheck.execute("PRAGMA table_info(runs)");
+    expect(
+      runColumns.rows.some((row) => row.name === "failure_code"),
+      "runs.failure_code must exist after the V13 migration",
+    ).toBe(true);
 
     rawCheck.close();
   });
