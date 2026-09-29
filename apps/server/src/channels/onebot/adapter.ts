@@ -101,7 +101,12 @@ export interface OneBotState {
 
 /** Payload-free group ingress status for a bounded, Owner-authorized diagnostic projection. */
 export interface OneBotIngressDiagnostic {
-  groupId: string;
+  /**
+   * Omitted only for a channel-level fact that belongs to no group, which today means a
+   * private message dropped because the connection was not ready. The group projection is
+   * keyed by group id, so without this a private drop had nowhere to be recorded at all.
+   */
+  groupId?: string;
   stage: "normalized" | "ignored" | "dropped";
   reason?: "not_addressed" | "empty_message" | "not_ready";
 }
@@ -286,6 +291,15 @@ export class OneBotAdapter {
   #retryCount = 0;
   #pending = new Map<string, PendingRequest>();
   #incomingQueue: Promise<void> = Promise.resolve();
+  /**
+   * Messages that arrived on a live socket before the identity check finished.
+   *
+   * These survive a failed attempt rather than being discarded with it: the socket really did
+   * open, so the peer really did send them, and throwing them away here is how a command
+   * issued while NapCat was still logging in disappeared without a trace. They are replayed
+   * once a connection reaches `ready`, and dropped only when the adapter stops or faults,
+   * because neither ever comes back on its own.
+   */
   #beforeVerification: OneBotIncomingMessage[] = [];
   #incomingCount = 0;
   #incomingAbort = new AbortController();
@@ -564,6 +578,9 @@ export class OneBotAdapter {
         socket.terminate();
       });
     }
+    // A stopped adapter never reaches `ready`, so anything still waiting for verification
+    // would sit here until someone restarted it and got a batch of stale messages.
+    this.#beforeVerification = [];
     this.#setState({ status: "stopped" });
   }
 
@@ -707,7 +724,6 @@ export class OneBotAdapter {
   }
 
   #ingressDiagnostic(diagnostic: OneBotIngressDiagnostic): void {
-    if (!this.config.groupIds.includes(diagnostic.groupId)) return;
     try {
       this.#options.onIngressDiagnostic?.(diagnostic);
     } catch {
@@ -715,9 +731,19 @@ export class OneBotAdapter {
     }
   }
 
+  /**
+   * Backoff for a connection that was established and then dropped.
+   *
+   * Reserved for that case on purpose. A peer that accepted a socket and then went away is
+   * genuinely struggling, and hammering it makes things worse. A peer that never accepted one
+   * is a different situation entirely — see `#connect()`.
+   */
+  #backoffDelay(): number {
+    return Math.min(30_000, this.#reconnectDelay * 2 ** Math.min(this.#retryCount++, 6));
+  }
+
   #connect(): Promise<void> {
     const generation = ++this.#generation;
-    this.#beforeVerification = [];
     this.#setState({ status: "connecting" });
     const socket = new WebSocket(this.config.endpoint, {
       headers: { Authorization: `Bearer ${this.#token}` },
@@ -730,6 +756,10 @@ export class OneBotAdapter {
     return new Promise<void>((resolve, reject) => {
       let settled = false;
       let reason: NonNullable<OneBotState["reason"]> = "disconnected";
+      // Whether this attempt ever reached a peer. NapCat's OneBot server does not exist until
+      // the QR login finishes, so most attempts during a restart never do — and that is a
+      // reason to retry sooner, not later.
+      let opened = false;
       const rejectAttempt = (code: NonNullable<OneBotState["reason"]> | "stopped") => {
         if (!settled) {
           settled = true;
@@ -739,6 +769,7 @@ export class OneBotAdapter {
       const fault = (code: "authentication_failed" | "identity_mismatch") => {
         reason = code;
         this.#active = false;
+        this.#beforeVerification = [];
         this.#setState({ status: "faulted", reason: code });
         rejectAttempt(code);
         socket.terminate();
@@ -771,7 +802,6 @@ export class OneBotAdapter {
             this.#settle(echo, { status: "unknown", code: "disconnected" });
         if (socket !== this.#socket) return;
         this.#socket = undefined;
-        this.#beforeVerification = [];
         if (this.#heartbeat) {
           clearInterval(this.#heartbeat);
           this.#heartbeat = undefined;
@@ -779,10 +809,13 @@ export class OneBotAdapter {
         rejectAttempt(this.#active ? reason : "stopped");
         if (this.#active) {
           this.#setState({ status: "reconnecting", reason });
-          const delay = Math.min(
-            30_000,
-            this.#reconnectDelay * 2 ** Math.min(this.#retryCount++, 6),
-          );
+          // An attempt that never reached a peer is not evidence the peer is struggling, so it
+          // does not earn backoff. NapCat only starts serving OneBot once the QR login
+          // completes, which means every attempt before that lands here; backing off to 30s
+          // in that state is what turned a login delay into a window where a sent message was
+          // silently lost. Retrying at the base delay keeps that window as short as it can be,
+          // and costs one connection attempt per second against a local port.
+          const delay = opened ? this.#backoffDelay() : this.#reconnectDelay;
           this.#retryTimer = setTimeout(() => {
             this.#retryTimer = undefined;
             if (this.#active) void this.start().catch(() => {});
@@ -794,6 +827,7 @@ export class OneBotAdapter {
           socket.terminate();
           return;
         }
+        opened = true;
         this.#setState({ status: "verifying" });
         void this.#request(socket, "get_login_info", {}).then((result) => {
           if (!this.#active || socket !== this.#socket) return;
@@ -910,9 +944,11 @@ export class OneBotAdapter {
     // that was simply quiet, or the archive hole is invisible. The check moved rather than
     // staying above normalization because the group is only known after it.
     if (this.#state.status !== "ready" && this.#state.status !== "verifying") {
-      if (normalized.kind === "message" && normalized.message.scope.chatType === "group")
+      if (normalized.kind === "message")
         this.#ingressDiagnostic({
-          groupId: normalized.message.scope.chatId,
+          ...(normalized.message.scope.chatType === "group"
+            ? { groupId: normalized.message.scope.chatId }
+            : {}),
           stage: "dropped",
           reason: "not_ready",
         });
@@ -939,6 +975,11 @@ export class OneBotAdapter {
       if (this.#beforeVerification.length < this.#incomingLimit)
         this.#beforeVerification.push(normalized.message);
       else {
+        // Reported and dropped, but the socket stays up. Terminating here used to force a
+        // reconnect that would clear the buffer and try again; now that the buffer survives
+        // an attempt, terminating would only guarantee it never drains — every retry would
+        // arrive with the backlog still full and overflow again on the first message. The
+        // count is the signal: it says the peer sent more than this bridge can hold.
         this.#ingressError({
           code: "ingress_overflow",
           messageId: normalized.message.messageId,
@@ -946,7 +987,6 @@ export class OneBotAdapter {
             ? { groupId: normalized.message.scope.chatId }
             : {}),
         });
-        socket.terminate();
       }
       return;
     }
