@@ -141,6 +141,25 @@ describe("identityRulesClause", () => {
     expect(clause).toContain("who you answer to, or where you run");
   });
 
+  it("does not let the bot claim it answers only one person", () => {
+    // With the Kit's possession claim gone, the next Run answered "我是 Lora，这个频道的 bot。只
+    // 响应您本人的指令" — the identity half clean, the second half a service-scope sentence it had
+    // rephrased rather than copied, swapping "Lora" for the sender because the sender was the
+    // Owner. A ban on reproducing a past description does not catch a newly generated one, and a
+    // model asked what it can do reads "who you answer to" as being about names.
+    const clause = identityRulesClause({
+      senderId: "3526039967",
+      isOwner: true,
+      sharedConversation: true,
+      botDisplayName: "Lora",
+    });
+    expect(clause).toContain("Never say that you answer only one person");
+    // The fact that makes the claim false, and the sentence to say instead of it. A ban with
+    // nothing to put in its place is a hole, not a rule — the same lesson as the name clause.
+    expect(clause).toContain("you answer whoever is talking to you");
+    expect(clause).toContain("say what you can do for the person talking to you instead");
+  });
+
   it("states the configured name in a private Conversation too", () => {
     // A rename that only took effect in a group would leave the Owner's own chat still
     // introducing the bot by whatever the Kit prompt happens to say.
