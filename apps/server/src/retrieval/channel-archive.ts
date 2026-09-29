@@ -79,6 +79,18 @@ export function channelMessageDedupKey(
   return `${channel}:${connectionId}:${groupId}:${externalMessageId}`;
 }
 
+/**
+ * Whether a search term names a QQ account rather than a person.
+ *
+ * QQ numbers are the channel's identity key, and they are also a thing a group card can be set
+ * to. The two are told apart by shape alone, because that is the only thing distinguishing them
+ * once a card has been set to a number: the length is QQ's own, so a term inside it is read as an
+ * account, and anything else — a nickname, a card, a fragment of a message — is read as a name.
+ */
+function looksLikeQqNumber(term: string): boolean {
+  return /^[1-9]\d{4,11}$/u.test(term);
+}
+
 export class ChannelArchiveStore implements RetrievalCandidateStore {
   constructor(private readonly db: DomainDatabase) {}
 
@@ -202,8 +214,21 @@ export class ChannelArchiveStore implements RetrievalCandidateStore {
       baseArgs.push(params.until);
     }
     if (params.senderQuery?.trim()) {
-      conditions.push("(m.sender_id = ? OR lower(m.sender_name) = lower(?))");
-      baseArgs.push(params.senderQuery.trim(), params.senderQuery.trim());
+      const sender = params.senderQuery.trim();
+      // A QQ number is the channel's identity key, so it is matched against the identity the
+      // channel observed and nothing else. `sender_name` is the group card, which the sender
+      // types themselves: a member set theirs to the Owner's number, and for eight days every
+      // search for the Owner returned that member's messages alongside the Owner's — the
+      // retrieval half of the same confusion the identity gate closes on the message. A number
+      // that arrives as a card is a claim about who is speaking, and a claim cannot satisfy a
+      // query about an observation.
+      if (looksLikeQqNumber(sender)) {
+        conditions.push("m.sender_id = ?");
+        baseArgs.push(sender);
+      } else {
+        conditions.push("(m.sender_id = ? OR lower(m.sender_name) = lower(?))");
+        baseArgs.push(sender, sender);
+      }
     }
     if (params.mentionedUserId?.trim()) {
       conditions.push(
