@@ -140,6 +140,15 @@ vp install
 vp run verify:commit
 ```
 
+依赖审计请显式使用 npm 官方 registry；仓库的 `.npmrc` 默认使用镜像，镜像不提供 npm 的 security audit API：
+
+```bash
+npm audit --registry=https://registry.npmjs.org --audit-level=high
+npm audit --registry=https://registry.npmjs.org --omit=dev --audit-level=moderate
+```
+
+第二条命令检查生产依赖的中危及以上问题。当前 Pi SDK 仍固定依赖旧版 `undici`，本仓库通过 npm override 锁定已修复的 `undici@8.10.2`；升级 Pi SDK 时应重新审视并尽可能移除该 override。
+
 服务进程管理（Windows 下不要用 `vp run agent:up` 管理长驻服务）：
 
 ```bash
