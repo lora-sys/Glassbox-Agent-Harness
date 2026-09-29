@@ -82,6 +82,17 @@ describe("botNameClause", () => {
     expect(clause).toContain("editing that configuration");
   });
 
+  it("hands the model a self-introduction to say instead of a ban", () => {
+    // The second round of this fix. The first gave a name plus a list of things the bot may not
+    // call itself, and the next Run still answered "我是 Lora，Lora 的个人助理 Agent，跑在 QQ 群
+    // （1121579672）后端" — every clause of that came from the group history. Nothing in the
+    // prompt offered a competing sentence, so the model filled the gap with the only concrete
+    // self-description it had. A ban with nothing to put in its place is a hole.
+    const clause = botNameClause("Lora");
+    expect(clause).toContain("say that you are Lora, the bot of this channel");
+    expect(clause).toContain("add no role, owner, location, or deployment detail");
+  });
+
   it("says nothing when the channel configured no name", () => {
     // Absent, null and a name that trims to nothing are all "no configured name". Substituting
     // the channel label or a Kit placeholder here would put the rename back out of reach.
@@ -113,6 +124,21 @@ describe("identityRulesClause", () => {
     );
     expect(clause).toContain("a record of a past mistake and not a fact about you");
     expect(clause).toContain("answer from this prompt and from nothing else");
+  });
+
+  it("covers a location and a deployment detail, not only a name and a role", () => {
+    // The first version of the rule above banned "a name or role". The next Run got the name
+    // right and still appended "跑在 QQ 群（1121579672）后端" — the model read "role" narrowly
+    // and treated where it runs as something other than identity. A self-introduction is made of
+    // what you are, who you answer to, and where you run, and all three were in the history.
+    const clause = identityRulesClause({
+      senderId: "3526039967",
+      isOwner: true,
+      sharedConversation: true,
+      botDisplayName: "Lora",
+    });
+    expect(clause).toContain("a name, a role, or any description of what you are");
+    expect(clause).toContain("who you answer to, or where you run");
   });
 
   it("states the configured name in a private Conversation too", () => {
