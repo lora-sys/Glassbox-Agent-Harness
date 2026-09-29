@@ -56,7 +56,7 @@ it("migrates v9 deliveries without losing old rows and accepts browser and media
   }
 });
 
-it("marks legacy protected reads during v10 upgrade and leaves public web decisions unmarked", async () => {
+it("marks legacy protected reads during the v14 upgrade and leaves public web decisions unmarked", async () => {
   const directory = await mkdtemp(join(tmpdir(), "glassbox-source-v10-"));
   try {
     const path = join(directory, "glassbox.db");
@@ -78,13 +78,19 @@ it("marks legacy protected reads during v10 upgrade and leaves public web decisi
       });
     }
     await legacy.execute("ALTER TABLE authorization_decisions DROP COLUMN delivery_source");
-    await legacy.execute("PRAGMA user_version = 10");
+    // Rewind to 13, the version immediately before this migration, rather than to 10: a real v13
+    // database has already run v11's deliveries rebuild and v12's attachments table, and rewinding
+    // past them would ask those migrations to run a second time on a schema that already holds
+    // their result. What is under test here is the marker, not the rebuilds.
+    await legacy.execute("PRAGMA user_version = 13");
     legacy.close();
 
     const upgraded = await DomainDatabase.open(path);
     try {
       await upgraded.transaction(async (tx) => {
-        expect((await tx.execute("PRAGMA user_version")).rows[0]?.user_version).toBe(11);
+        expect((await tx.execute("PRAGMA user_version")).rows[0]?.user_version).toBe(
+          CURRENT_SCHEMA_VERSION,
+        );
         const decisions = await tx.execute(
           "SELECT id, delivery_source FROM authorization_decisions ORDER BY id",
         );
