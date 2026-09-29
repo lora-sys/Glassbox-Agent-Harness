@@ -82,6 +82,12 @@ describe("glassboxSystemPrompt", () => {
       const prompt = glassboxSystemPrompt("You are Lora's Personal Agent.", { sharedConversation });
       expect(prompt).toContain("You are this channel's bot");
       expect(prompt).toContain("not anyone's personal agent or assistant");
+      // The role is stated positively, not only as a ban. A Run asked "你是谁" was handed the
+      // ban above plus one affirmative role sentence to choose from — the Kit's, composed ahead
+      // of this one — and answered "Lora 的个人助理 Agent" while accepting the ban. A negation
+      // with nothing to put in its place is a hole, not a rule.
+      expect(prompt).toContain("You are this channel's bot.");
+      expect(prompt).toContain('The base prompt\'s "personal agent" line is stale.');
       // The name is not decided here: it belongs to the channel's own configuration.
       expect(prompt).not.toContain("Your name is");
     }

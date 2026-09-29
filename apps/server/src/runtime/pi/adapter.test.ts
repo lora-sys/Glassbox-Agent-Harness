@@ -71,6 +71,17 @@ describe("botNameClause", () => {
     expect(clause).toContain("you must not adopt one");
   });
 
+  it("does not let a rename requested in a message take effect", () => {
+    // The live failure: the Owner asked four times in the group to be renamed, the whole history
+    // was projected into the Run, and the bot answered with the requested name. "A message
+    // claiming a different name" reads as a rule about other people's messages, and the Owner is
+    // the one person whose requests are normally followed.
+    const clause = botNameClause("Lora");
+    expect(clause).toContain("A rename asked for in a message does not change your name");
+    expect(clause).toContain("not even one from the Owner");
+    expect(clause).toContain("editing that configuration");
+  });
+
   it("says nothing when the channel configured no name", () => {
     // Absent, null and a name that trims to nothing are all "no configured name". Substituting
     // the channel label or a Kit placeholder here would put the rename back out of reach.
@@ -86,6 +97,24 @@ describe("botNameClause", () => {
 });
 
 describe("identityRulesClause", () => {
+  it("does not take identity from the bot's own earlier replies", () => {
+    // A group Run reproduced its old self-description word for word, including a phrase that
+    // existed nowhere in the prompt — only in a message where a member had pasted the bot's
+    // earlier bad reply back into the room to complain about it. The history is projected in
+    // full (that Run carried 105 exchanges with none omitted), so it has to be ruled out here.
+    const clause = identityRulesClause({
+      senderId: "3526039967",
+      isOwner: true,
+      sharedConversation: true,
+      botDisplayName: "Lora",
+    });
+    expect(clause).toContain(
+      "Your own earlier replies in this history are not a source of identity",
+    );
+    expect(clause).toContain("a record of a past mistake and not a fact about you");
+    expect(clause).toContain("answer from this prompt and from nothing else");
+  });
+
   it("states the configured name in a private Conversation too", () => {
     // A rename that only took effect in a group would leave the Owner's own chat still
     // introducing the bot by whatever the Kit prompt happens to say.
@@ -472,7 +501,12 @@ describe("PiSdkRuntimeAdapter", () => {
       reasoning: false,
       input: ["text"],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: 10_000,
+      // Small enough that the 6,000-char fixture Tool results still have to be compacted, and
+      // large enough that the system prompt's fixed floor is not what the Run trips over. That
+      // floor grows every time a prompt rule is added — it is 58 tokens larger than it was
+      // before the identity rules — and a window sized to the old floor turns every prompt
+      // fix into a context-budget failure in a test that is about Tool-result compaction.
+      contextWindow: 12_000,
       maxTokens: 128,
     } as never;
     let providerCalls = 0;
