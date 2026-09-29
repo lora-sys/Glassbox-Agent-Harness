@@ -71,14 +71,28 @@ function assertPublicAddress(
     fromDns &&
     syntheticDnsCidrs.some((cidr) => {
       try {
-        const range = ipaddr.parseCIDR(cidr);
-        return parsed.kind() === range[0].kind() && parsed.match(range);
+        const [rangeAddress, bits] = ipaddr.parseCIDR(cidr);
+        // `parseCIDR` types its result as a union element, so neither `match` overload
+        // accepts the tuple as written. Narrowing both sides to the same class is the check
+        // the `kind()` comparison already made at runtime, and it is what resolves the
+        // overload: an address and a prefix of different families never match.
+        if (parsed instanceof ipaddr.IPv4 && rangeAddress instanceof ipaddr.IPv4)
+          return parsed.match([rangeAddress, bits]);
+        if (parsed instanceof ipaddr.IPv6 && rangeAddress instanceof ipaddr.IPv6)
+          return parsed.match([rangeAddress, bits]);
+        return false;
       } catch {
         throw new WebTargetError("web_target_invalid_synthetic_cidr");
       }
     })
   )
     return;
+  // 198.18.0.0/15 is the RFC 2544 benchmarking range: not public address space, and ipaddr.js
+  // reports it as unicast. A hostname resolving into it must not pass the public-target guard,
+  // which is what the guard test already specifies. Placed after the synthetic-range escape
+  // above, because a range the operator configured on purpose is the one case that may pass.
+  if (parsed instanceof ipaddr.IPv4 && parsed.match([ipaddr.IPv4.parse("198.18.0.0"), 15]))
+    throw new WebTargetError("web_target_non_public");
   if (parsed.range() !== "unicast") throw new WebTargetError("web_target_non_public");
 }
 
