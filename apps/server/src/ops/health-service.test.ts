@@ -45,8 +45,18 @@ it("returns caller-visible Ops health using durable acceptance and explicit Herd
       authorizationScope: caller.scope,
     });
     const acceptedAttempt = await store.tasks.createAttempt({ taskId: acceptedTask.id });
-    await store.tasks.updateAttemptStatus(acceptedAttempt.id, "review");
-    await store.tasks.updateTaskStatus(acceptedTask.id, "REVIEW");
+    const acceptedWorker = {
+      herdrSession: "health-session",
+      workspaceId: "health-workspace",
+      paneId: "accepted-pane",
+    };
+    await store.tasks.bindWorker({
+      taskAttemptId: acceptedAttempt.id,
+      ...acceptedWorker,
+      agentName: "accepted-worker",
+      agentKind: "test",
+    });
+    await store.tasks.observeWorker(acceptedWorker, "done");
     await store.tasks.acceptTask(acceptedTask.id, caller.principalId);
     await grant(store, `task-${acceptedTask.id}`, "task:read");
 
@@ -56,16 +66,18 @@ it("returns caller-visible Ops health using durable acceptance and explicit Herd
       authorizationScope: caller.scope,
     });
     const reviewAttempt = await store.tasks.createAttempt({ taskId: reviewTask.id });
-    await store.tasks.bindWorker({
-      taskAttemptId: reviewAttempt.id,
+    const reviewWorker = {
       herdrSession: "health-session",
       workspaceId: "health-workspace",
       paneId: "health-pane",
+    };
+    await store.tasks.bindWorker({
+      taskAttemptId: reviewAttempt.id,
+      ...reviewWorker,
       agentName: "test-worker",
       agentKind: "test",
     });
-    await store.tasks.updateAttemptStatus(reviewAttempt.id, "review");
-    await store.tasks.updateTaskStatus(reviewTask.id, "REVIEW");
+    await store.tasks.observeWorker(reviewWorker, "done");
     await grant(store, `task-${reviewTask.id}`, "task:read");
 
     const hiddenTask = await store.tasks.createTask({
