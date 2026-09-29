@@ -100,6 +100,29 @@ async function connectWS(port: number, sessionId: string) {
 }
 
 describe("ws: functional broadcast", () => {
+  it("delivers only one event after repeated subscribe messages on one socket", async () => {
+    const ctx = await spawnWSServer();
+    try {
+      const sessionId = "duplicate-subscribe";
+      const client = await connectWS(ctx.port, sessionId);
+      const repeatedAck = client.waitFor(
+        (message) =>
+          message.type === "subscribed" &&
+          client.messages.filter((entry) => entry.type === "subscribed").length === 3,
+      );
+      client.ws.send(JSON.stringify({ action: "subscribe", sessionId }));
+      client.ws.send(JSON.stringify({ action: "subscribe", sessionId }));
+      await repeatedAck;
+      const delivered = client.waitFor((message) => message.type === "derivedState");
+      broadcastEvent(sessionId, { method: "once" });
+      broadcastDerivedState(sessionId, { marker: true });
+      await delivered;
+      expect(client.messages.filter((message) => message.type === "event")).toHaveLength(1);
+    } finally {
+      await cleanupServer(ctx);
+    }
+  });
+
   it("delivers event, derivedState, and sessionEnded in order", async () => {
     const ctx = await spawnWSServer();
     try {

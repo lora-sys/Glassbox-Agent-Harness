@@ -260,13 +260,17 @@ async function handleSubscribe(
     return;
   }
 
-  if (!subscribers.has(sessionId)) {
-    subscribers.set(sessionId, new Set());
+  let room = subscribers.get(sessionId);
+  if (!room) {
+    room = new Set();
+    subscribers.set(sessionId, room);
   }
-  subscribers.get(sessionId)!.add({ ws, sessionId });
+  const alreadySubscribed = [...room].some((subscriber) => subscriber.ws === ws);
+  if (!alreadySubscribed) room.add({ ws, sessionId });
 
   // Acknowledge subscription
   ws.send(JSON.stringify({ type: "subscribed", sessionId }));
+  if (alreadySubscribed) return;
 
   // Catch-up: push approval requests that fired before this client
   // subscribed. Without this, a decision that arrives between the run POST

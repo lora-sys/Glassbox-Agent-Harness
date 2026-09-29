@@ -10,6 +10,17 @@ import { Inspector, type ObjectMeta, type TraceEntryLike } from "../inspector/In
 const dim = "#52525b";
 const muted = "#71717a";
 
+function retireWebSocket(ws: WebSocket | null) {
+	if (!ws) return;
+	ws.onopen = null;
+	ws.onmessage = null;
+	ws.onerror = null;
+	ws.onclose = null;
+	if (ws.readyState < WebSocket.CLOSING) {
+		try { ws.close(); } catch { /* The old socket is already retired. */ }
+	}
+}
+
 function textShape(id: string, x: number, y: number, text: string) {
 	return {
 		id,
@@ -259,6 +270,7 @@ function BoardLayer({
 function App() {
 	const editorRef = useRef<any>(null);
 	const wsRef = useRef<WebSocket | null>(null);
+	const socketGenerationRef = useRef(0);
 
 	const [connected, setConnected] = useState(false);
 	const [running, setRunning] = useState(false);
@@ -344,6 +356,12 @@ function App() {
 			new Date().toLocaleTimeString() + " " + msg,
 		]);
 	}, []);
+	const closeCurrentSocket = useCallback(() => {
+		const ws = wsRef.current;
+		wsRef.current = null;
+		retireWebSocket(ws);
+		setConnected(false);
+	}, []);
 
 	// Persist sessionId to URL + localStorage when it changes
 	useEffect(() => {
@@ -364,6 +382,7 @@ function App() {
 		try { fromStorage = localStorage.getItem("glassbox:lastSessionId"); } catch {}
 		const sessionId = fromUrl || fromStorage;
 		if (!sessionId) return;
+		const generation = socketGenerationRef.current;
 
 		addLog("Restoring session " + sessionId.slice(0, 8) + "...");
 
@@ -377,9 +396,11 @@ function App() {
 				}
 				var stateData = await stateRes.json();
 				var derivedState = stateData?.derivedState ?? null;
+				if (generation !== socketGenerationRef.current) return;
 
 				if (traceRes.ok) {
 					var traceData = await traceRes.json();
+					if (generation !== socketGenerationRef.current) return;
 					var entries = (traceData?.entries ?? []) as TraceEntryLike[];
 					traceCacheRef.current.set(sessionId, entries);
 				}
@@ -388,6 +409,7 @@ function App() {
 				setLocalState(derivedState);
 				addLog("Session restored from trace");
 			} catch (err: any) {
+				if (generation !== socketGenerationRef.current) return;
 				addLog("Restore error: " + (err?.message || String(err)));
 			}
 		})();
@@ -536,6 +558,9 @@ function App() {
 
 	// WS resubscribe helper
 	var resubscribe = useCallback(function(sessionId: string) {
+		const generation = ++socketGenerationRef.current;
+		closeCurrentSocket();
+		currentSidRef.current = sessionId;
 		var ed = editorRef.current;
 		if (ed && shapeIdsRef.current.length > 0) {
 			ed.deleteShapes(shapeIdsRef.current);
@@ -548,11 +573,6 @@ function App() {
 		tracedSessionsRef.current.delete(sessionId);
 		traceCacheRef.current.delete(sessionId);
 
-		if (wsRef.current) {
-			wsRef.current.close();
-			wsRef.current = null;
-		}
-
 		(async function load() {
 			try {
 				var stateRes = await fetch("/api/state/" + sessionId);
@@ -563,9 +583,11 @@ function App() {
 				}
 				var stateData = await stateRes.json();
 				var derivedState = stateData?.derivedState ?? null;
+				if (generation !== socketGenerationRef.current) return;
 
 				if (traceRes.ok) {
 					var traceData = await traceRes.json();
+					if (generation !== socketGenerationRef.current) return;
 					var entries = (traceData?.entries ?? []) as TraceEntryLike[];
 					traceCacheRef.current.set(sessionId, entries);
 				}
@@ -573,19 +595,23 @@ function App() {
 				setLocalState(derivedState);
 				addLog("Loaded session " + sessionId.slice(0, 8));
 			} catch (err: any) {
+				if (generation !== socketGenerationRef.current) return;
 				addLog("Load session error: " + (err?.message || String(err)));
 			}
 		})();
 
 		try {
+			closeCurrentSocket();
 			var ws = new WebSocket("/ws?sessionId=" + sessionId);
 			wsRef.current = ws;
 
 			ws.onopen = function() {
+				if (wsRef.current !== ws || currentSidRef.current !== sessionId) return;
 				setConnected(true);
 				addLog("WS resubscribed to " + sessionId.slice(0, 8));
 			};
 			ws.onmessage = function(ev: MessageEvent) {
+				if (wsRef.current !== ws || currentSidRef.current !== sessionId) return;
 				var msg: any;
 				try { msg = JSON.parse(ev.data); } catch { return; }
 				switch (msg.type) {
@@ -622,8 +648,12 @@ function App() {
 						break;
 				}
 			};
-			ws.onerror = function() { addLog("WS error"); };
+			ws.onerror = function() {
+				if (wsRef.current === ws && currentSidRef.current === sessionId) addLog("WS error");
+			};
 			ws.onclose = function() {
+				if (wsRef.current !== ws || currentSidRef.current !== sessionId) return;
+				wsRef.current = null;
 				setConnected(false);
 				setRunning(false);
 				addLog("WS closed");
@@ -631,10 +661,12 @@ function App() {
 		} catch (err: any) {
 			addLog("WS: " + (err?.message || String(err)));
 		}
-	}, [addLog, localState]);
+	}, [addLog, closeCurrentSocket, localState]);
 
 	// Run test
 	var handleRunTest = useCallback(async function run() {
+		const generation = ++socketGenerationRef.current;
+		closeCurrentSocket();
 		setRunning(true);
 		setLog([]);
 		setSelectedShapeId(null);
@@ -671,25 +703,31 @@ function App() {
 			if (!res.ok) throw new Error("HTTP " + res.status + ": " + respText.slice(0, 200));
 			var data: any = JSON.parse(respText);
 			if (data.error) throw new Error(data.error);
+			if (generation !== socketGenerationRef.current) return;
 			sessionId = data.sessionId;
+			currentSidRef.current = sessionId;
 			setCurrentSessionId(sessionId);
 			setLocalState(data.derivedState ?? {});
 			addLog("Session " + sessionId.slice(0, 8) + "...");
 		} catch (err: any) {
+			if (generation !== socketGenerationRef.current) return;
 			addLog("Error: " + (err?.message || String(err)));
 			setRunning(false);
 			return;
 		}
 
 		try {
+			closeCurrentSocket();
 			var ws = new WebSocket("/ws?sessionId=" + sessionId);
 			wsRef.current = ws;
 
 			ws.onopen = function() {
+				if (wsRef.current !== ws || currentSidRef.current !== sessionId) return;
 				setConnected(true);
 				addLog("WS connected");
 			};
 			ws.onmessage = function(ev: MessageEvent) {
+				if (wsRef.current !== ws || currentSidRef.current !== sessionId) return;
 				var msg: any;
 				try { msg = JSON.parse(ev.data); } catch { return; }
 				switch (msg.type) {
@@ -710,8 +748,12 @@ function App() {
 						break;
 				}
 			};
-			ws.onerror = function() { addLog("WS error"); };
+			ws.onerror = function() {
+				if (wsRef.current === ws && currentSidRef.current === sessionId) addLog("WS error");
+			};
 			ws.onclose = function() {
+				if (wsRef.current !== ws || currentSidRef.current !== sessionId) return;
+				wsRef.current = null;
 				setConnected(false);
 				setRunning(false);
 				addLog("WS closed");
@@ -720,7 +762,7 @@ function App() {
 			addLog("WS: " + (err?.message || String(err)));
 			setRunning(false);
 		}
-	}, [prompt, addLog, provider, repoPath, approvalPolicy, sandboxType, permissionMode]);
+	}, [prompt, addLog, closeCurrentSocket, provider, repoPath, approvalPolicy, sandboxType, permissionMode]);
 	// Pause: end turn but keep session open for steering
 	var handlePause = useCallback(async function pause() {
 		if (!currentSessionId) return;
@@ -851,6 +893,8 @@ function App() {
 
 	// S8: Run demo task — starts a session against the controlled demo workspace
 	var handleRunDemo = useCallback(async function runDemo() {
+		const generation = ++socketGenerationRef.current;
+		closeCurrentSocket();
 		setRunning(true);
 		setLog([]);
 		setSelectedShapeId(null);
@@ -883,11 +927,14 @@ function App() {
 			if (!res.ok) throw new Error("HTTP " + res.status);
 			var data: any = await res.json();
 			if (data.error) throw new Error(data.error);
+			if (generation !== socketGenerationRef.current) return;
 			sessionId = data.sessionId;
+			currentSidRef.current = sessionId;
 			setCurrentSessionId(sessionId);
 			if (data.derivedState) setLocalState(data.derivedState);
 			addLog("Session " + sessionId.slice(0, 8) + " started on workspace " + (data.workspace || ""));
 		} catch (err: any) {
+			if (generation !== socketGenerationRef.current) return;
 			addLog("Error: " + (err?.message || String(err)));
 			setRunning(false);
 			return;
@@ -895,14 +942,17 @@ function App() {
 
 		// Same WS setup as handleRunTest
 		try {
+			closeCurrentSocket();
 			var ws = new WebSocket("/ws?sessionId=" + sessionId);
 			wsRef.current = ws;
 
 			ws.onopen = function() {
+				if (wsRef.current !== ws || currentSidRef.current !== sessionId) return;
 				setConnected(true);
 				addLog("WS connected");
 			};
 			ws.onmessage = function(ev: MessageEvent) {
+				if (wsRef.current !== ws || currentSidRef.current !== sessionId) return;
 				var msg: any;
 				try { msg = JSON.parse(ev.data); } catch { return; }
 				switch (msg.type) {
@@ -952,8 +1002,12 @@ function App() {
 					}
 				}
 			};
-			ws.onerror = function() { addLog("WS error"); };
+			ws.onerror = function() {
+				if (wsRef.current === ws && currentSidRef.current === sessionId) addLog("WS error");
+			};
 			ws.onclose = function() {
+				if (wsRef.current !== ws || currentSidRef.current !== sessionId) return;
+				wsRef.current = null;
 				setConnected(false);
 				setRunning(false);
 				addLog("WS closed");
@@ -962,7 +1016,7 @@ function App() {
 			addLog("WS: " + (err?.message || String(err)));
 			setRunning(false);
 		}
-	}, [prompt, demoWorkspace, provider, approvalPolicy, sandboxType, permissionMode, addLog]);
+	}, [prompt, demoWorkspace, provider, approvalPolicy, sandboxType, permissionMode, addLog, closeCurrentSocket]);
 
 	// S8: Handle user Approve/Decline decision for a file-change request
 	var handleDecide = useCallback(async function decide(itemId: string, approved: boolean) {
@@ -1003,9 +1057,8 @@ function App() {
 	// Unmount cleanup
 	useEffect(function() {
 		return function() {
-			if (wsRef.current && wsRef.current.readyState < 2) {
-				try { wsRef.current.close(); } catch {}
-			}
+			retireWebSocket(wsRef.current);
+			wsRef.current = null;
 			shapeIdsRef.current = [];
 		};
 	}, []);
