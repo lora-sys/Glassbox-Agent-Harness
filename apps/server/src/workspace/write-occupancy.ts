@@ -76,7 +76,10 @@ export class WorkspaceWriteOccupancy {
   private readonly anchor: string;
   private readonly instanceId = randomUUID();
 
-  constructor(dataRoot: string) {
+  constructor(
+    readonly dataRoot: string,
+    options: { recoverOnOpen?: boolean } = {},
+  ) {
     if (!path.isAbsolute(dataRoot) || /^(?:\\\\|\/\/)/u.test(dataRoot))
       throw new Error("An absolute local data root is required");
     mkdirSync(dataRoot, { recursive: true, mode: 0o700 });
@@ -85,11 +88,12 @@ export class WorkspaceWriteOccupancy {
     this.anchor = path.join(root, ".workspace-write-occupancy-lock");
     closeSync(openSync(this.anchor, "a", 0o600));
     // An earlier server may have crashed while its sandbox kept running.
-    this.change((state) => {
-      for (const entry of Object.values(state.entries)) {
-        if (entry.state !== "quarantined") entry.state = "quarantined";
-      }
-    });
+    if (options.recoverOnOpen !== false)
+      this.change((state) => {
+        for (const entry of Object.values(state.entries)) {
+          if (entry.state !== "quarantined") entry.state = "quarantined";
+        }
+      });
   }
 
   private read(): Ledger {
@@ -170,6 +174,12 @@ export class WorkspaceWriteOccupancy {
   status(workspaceId: string): OccupancyState | "free" {
     const state = this.read();
     return Object.hasOwn(state.entries, workspaceId) ? state.entries[workspaceId]!.state : "free";
+  }
+
+  /** A Worker Tool may write only while its original attempt owns an active lease. */
+  assertActive(lease: WriteOccupancyLease): void {
+    const entry = this.get(this.read(), lease);
+    if (entry.state !== "active") throw new WorkspaceWriteBusyError(lease.workspaceId, entry.state);
   }
 
   /** The supervisor can use these identifiers to prove old Docker or Herdr sessions stopped. */

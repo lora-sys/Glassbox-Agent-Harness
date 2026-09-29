@@ -23,17 +23,25 @@ it("rejects a replaced worker before reading output or sending input", async () 
       if (!buffer.includes("\n")) return;
       const request = JSON.parse(buffer.slice(0, buffer.indexOf("\n")));
       methods.push(request.method);
+      const result =
+        request.method === "session.snapshot"
+          ? {
+              workspaces: [{ workspace_id: "w" }],
+              panes: [{ workspace_id: "w", pane_id: "p" }],
+              agents: [{ pane_id: "p", name: "replacement" }],
+            }
+          : {
+              agent: {
+                name: "replacement",
+                pane_id: "p",
+                interactive_ready: true,
+                agent_status: "idle",
+              },
+            };
       socket.write(
         JSON.stringify({
           id: request.id,
-          result: {
-            agent: {
-              name: "replacement",
-              pane_id: "p",
-              interactive_ready: true,
-              agent_status: "idle",
-            },
-          },
+          result,
         }) + "\n",
       );
     });
@@ -42,13 +50,24 @@ it("rejects a replaced worker before reading output or sending input", async () 
   await once(server, "listening");
   const bridge = new SocketHerdrBridge({ socketPath: endpoint, sessionId: "s" });
   try {
+    await bridge.connect();
+    methods.length = 0;
     const target = { paneId: "p", agentName: "bound-worker" };
     await expect(bridge.readAgent(target)).rejects.toThrow("identity mismatch");
     await expect(bridge.promptAgent({ ...target, prompt: "PRIVATE_INSTRUCTION" })).rejects.toThrow(
       "identity mismatch",
     );
     await expect(bridge.stopAgent(target)).rejects.toThrow("identity mismatch");
-    expect(methods).toEqual(["agent.get", "agent.get", "agent.get"]);
+    await expect(bridge.closeAgent({ ...target, herdrSession: "s" })).rejects.toThrow(
+      "identity mismatch",
+    );
+    expect(methods).toEqual([
+      "agent.get",
+      "agent.get",
+      "agent.get",
+      "session.snapshot",
+      "session.snapshot",
+    ]);
   } finally {
     await bridge.disconnect();
     for (const socket of sockets) socket.destroy();
@@ -128,9 +147,30 @@ it("subscribes to new Worker panes before launch and waits for readiness before 
     const worker = await bridge.startAgent({
       workspaceId: "w",
       agentKind: "pi",
+      agentName: "glassbox-pi-attempt-123",
       workerContextFile: join(tmpdir(), "context.json"),
     });
+    expect(name).toBe("glassbox-pi-attempt-123");
     expect(worker.runtimeEvidence).toEqual({ profileName: "herdr-worker", model: "fixture" });
+    const requestsBeforeInvalidName = methods.length;
+    await expect(
+      bridge.startAgent({
+        workspaceId: "w",
+        agentKind: "pi",
+        agentName: "bad name",
+        workerContextFile: join(tmpdir(), "context.json"),
+      }),
+    ).rejects.toThrow("Invalid Herdr agent name");
+    expect(methods).toHaveLength(requestsBeforeInvalidName);
+    await expect(
+      bridge.startAgent({
+        workspaceId: "w",
+        agentKind: "pi",
+        agentName: "x".repeat(129),
+        workerContextFile: join(tmpdir(), "context.json"),
+      }),
+    ).rejects.toThrow("Invalid Herdr agent name");
+    expect(methods).toHaveLength(requestsBeforeInvalidName);
     await bridge.promptAgent({ paneId: worker.paneId, prompt: "Bounded work" });
     child!.write(
       JSON.stringify({
@@ -150,6 +190,204 @@ it("subscribes to new Worker panes before launch and waits for readiness before 
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 });
+
+it("closes a verified pane and requires the snapshot to confirm its removal", async () => {
+  const endpoint =
+    process.platform === "win32"
+      ? `\\\\.\\pipe\\glassbox-test-${randomUUID()}`
+      : join(tmpdir(), `herdr-${randomUUID()}.sock`);
+  const sockets = new Set<net.Socket>();
+  const methods: string[] = [];
+  let panePresent = true;
+  let paneCloseParams: unknown;
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    let buffer = "";
+    socket.on("data", (chunk) => {
+      buffer += chunk.toString();
+      if (!buffer.includes("\n")) return;
+      const request = JSON.parse(buffer.slice(0, buffer.indexOf("\n")));
+      methods.push(request.method);
+      let result: unknown = {};
+      if (request.method === "agent.get")
+        result = { agent: { name: "glassbox-pi-attempt-123", pane_id: "p" } };
+      if (request.method === "pane.close") {
+        paneCloseParams = request.params;
+        panePresent = false;
+      }
+      if (request.method === "session.snapshot")
+        result = {
+          workspaces: [{ workspace_id: "w" }],
+          panes: panePresent ? [{ workspace_id: "w", pane_id: "p" }] : [],
+          agents: panePresent ? [{ pane_id: "p", name: "glassbox-pi-attempt-123" }] : [],
+        };
+      socket.write(JSON.stringify({ id: request.id, result }) + "\n");
+    });
+  });
+  server.listen(endpoint);
+  await once(server, "listening");
+  const bridge = new SocketHerdrBridge({ socketPath: endpoint, sessionId: "s" });
+  try {
+    await bridge.connect();
+    methods.length = 0;
+    await expect(
+      bridge.closeAgent({
+        paneId: "p",
+        agentName: "glassbox-pi-attempt-123",
+        herdrSession: "s",
+      }),
+    ).resolves.toBeUndefined();
+    expect(methods).toEqual(["session.snapshot", "agent.get", "pane.close", "session.snapshot"]);
+    expect(paneCloseParams).toEqual({ pane_id: "p" });
+  } finally {
+    await bridge.disconnect();
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+it("accepts an already-absent pane only with a connected matching session snapshot", async () => {
+  const endpoint =
+    process.platform === "win32"
+      ? `\\\\.\\pipe\\glassbox-test-${randomUUID()}`
+      : join(tmpdir(), `herdr-${randomUUID()}.sock`);
+  const sockets = new Set<net.Socket>();
+  const methods: string[] = [];
+  let malformedSnapshot = false;
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    let buffer = "";
+    socket.on("data", (chunk) => {
+      buffer += chunk.toString();
+      if (!buffer.includes("\n")) return;
+      const request = JSON.parse(buffer.slice(0, buffer.indexOf("\n")));
+      methods.push(request.method);
+      const result =
+        request.method === "session.snapshot"
+          ? malformedSnapshot
+            ? {}
+            : { workspaces: [{ workspace_id: "w" }], panes: [], agents: [] }
+          : {};
+      socket.write(JSON.stringify({ id: request.id, result }) + "\n");
+    });
+  });
+  server.listen(endpoint);
+  await once(server, "listening");
+  const bridge = new SocketHerdrBridge({ socketPath: endpoint, sessionId: "s" });
+  try {
+    await bridge.connect();
+    methods.length = 0;
+    await expect(
+      bridge.closeAgent({
+        paneId: "already-gone",
+        agentName: "glassbox-pi-attempt-123",
+        herdrSession: "s",
+      }),
+    ).resolves.toBeUndefined();
+    expect(methods).toEqual(["session.snapshot"]);
+    await expect(
+      bridge.closeAgent({
+        paneId: "already-gone",
+        agentName: "glassbox-pi-attempt-123",
+        herdrSession: "other-session",
+      }),
+    ).rejects.toThrow("session identity mismatch");
+    expect(methods).toEqual(["session.snapshot"]);
+    malformedSnapshot = true;
+    await expect(
+      bridge.closeAgent({
+        paneId: "unknown",
+        agentName: "glassbox-pi-attempt-123",
+        herdrSession: "s",
+      }),
+    ).rejects.toThrow("Invalid Herdr session snapshot");
+    expect(methods).toEqual(["session.snapshot", "session.snapshot"]);
+    malformedSnapshot = false;
+    await bridge.disconnect();
+    await expect(
+      bridge.closeAgent({
+        paneId: "already-gone",
+        agentName: "glassbox-pi-attempt-123",
+        herdrSession: "s",
+      }),
+    ).rejects.toThrow("disconnected");
+    expect(methods).toEqual(["session.snapshot", "session.snapshot"]);
+  } finally {
+    await bridge.disconnect();
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+it.each(["close-error", "pane-remains", "closed-during-error"])(
+  "does not confirm a Worker stop when pane close fails or the snapshot still contains it (%s)",
+  async (failure) => {
+    const endpoint =
+      process.platform === "win32"
+        ? `\\\\.\\pipe\\glassbox-test-${randomUUID()}`
+        : join(tmpdir(), `herdr-${randomUUID()}.sock`);
+    const sockets = new Set<net.Socket>();
+    const methods: string[] = [];
+    let panePresent = true;
+    const server = net.createServer((socket) => {
+      sockets.add(socket);
+      socket.on("close", () => sockets.delete(socket));
+      let buffer = "";
+      socket.on("data", (chunk) => {
+        buffer += chunk.toString();
+        if (!buffer.includes("\n")) return;
+        const request = JSON.parse(buffer.slice(0, buffer.indexOf("\n")));
+        methods.push(request.method);
+        if (
+          request.method === "pane.close" &&
+          ["close-error", "closed-during-error"].includes(failure)
+        ) {
+          if (failure === "closed-during-error") panePresent = false;
+          socket.write(
+            JSON.stringify({ id: request.id, error: { code: "close_failed", message: "failed" } }) +
+              "\n",
+          );
+          return;
+        }
+        const result =
+          request.method === "agent.get"
+            ? { agent: { name: "glassbox-pi-attempt-123", pane_id: "p" } }
+            : request.method === "session.snapshot"
+              ? {
+                  workspaces: [{ workspace_id: "w" }],
+                  panes: panePresent ? [{ workspace_id: "w", pane_id: "p" }] : [],
+                  agents: panePresent ? [{ pane_id: "p", name: "glassbox-pi-attempt-123" }] : [],
+                }
+              : {};
+        socket.write(JSON.stringify({ id: request.id, result }) + "\n");
+      });
+    });
+    server.listen(endpoint);
+    await once(server, "listening");
+    const bridge = new SocketHerdrBridge({ socketPath: endpoint, sessionId: "s" });
+    try {
+      await bridge.connect();
+      methods.length = 0;
+      const close = bridge.closeAgent({
+        paneId: "p",
+        agentName: "glassbox-pi-attempt-123",
+        herdrSession: "s",
+      });
+      if (failure === "closed-during-error") await expect(close).resolves.toBeUndefined();
+      else
+        await expect(close).rejects.toThrow(
+          failure === "close-error" ? "close_failed" : "not confirmed",
+        );
+      expect(methods).toEqual(["session.snapshot", "agent.get", "pane.close", "session.snapshot"]);
+    } finally {
+      await bridge.disconnect();
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  },
+);
 
 it("reads protocol 22 nested output and observes worker state without losing text", async () => {
   const endpoint =
@@ -287,7 +525,15 @@ it("subscribes with protocol 22 pane selectors, maps events and closes malformed
         request.method === "session.snapshot"
           ? {
               workspaces: [{ workspace_id: "w" }],
-              panes: [{ workspace_id: "w", pane_id: "p", agent: "pi", agent_status: "working" }],
+              panes: [
+                {
+                  workspace_id: "w",
+                  pane_id: "p",
+                  agent: "pi",
+                  agent_status: "working",
+                  cwd: "C:/worktree",
+                },
+              ],
               agents: [{ pane_id: "p", name: "glassbox-pi-instance" }],
             }
           : {};
@@ -312,6 +558,7 @@ it("subscribes with protocol 22 pane selectors, maps events and closes malformed
       agentName: "glassbox-pi-instance",
       agentKind: "pi",
       state: "working",
+      cwd: "C:/worktree",
     });
     await bridge.subscribe((event) => {
       events.push(event);

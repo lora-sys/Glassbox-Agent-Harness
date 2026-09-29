@@ -43,6 +43,7 @@ export interface DecisionRecord {
   action: string;
   grantId: string | null;
   approvalId: string | null;
+  deliverySource: string | null;
   conversationId: string | null;
   runId: string | null;
   createdAt: string;
@@ -279,6 +280,7 @@ export class EvidenceStore {
             action: stringColumn(row, "action"),
             grantId: optionalString(row, "grant_id"),
             approvalId: optionalString(row, "approval_id"),
+            deliverySource: optionalString(row, "delivery_source"),
             conversationId: optionalString(row, "conversation_id"),
             runId: optionalString(row, "run_id"),
             createdAt: stringColumn(row, "created_at"),

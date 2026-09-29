@@ -130,10 +130,15 @@ if (!versionMatch) {
   fail("schema.ts must declare CURRENT_SCHEMA_VERSION.");
 } else {
   const currentVersion = Number(versionMatch[1]);
+  // A migration is either a statement array or a function that needs to read the database first.
+  // Both count as exported; naming only one of the two shapes is how a function-shaped migration
+  // came to be invisible to this check.
   const exportedMigrations = new Set(
-    [...schemaSource.matchAll(/schemaV(\d+)Migration/g)].map((match) => Number(match[1])),
+    [
+      ...schemaSource.matchAll(/schemaV(\d+)Migration/g),
+      ...schemaSource.matchAll(/applySchemaV(\d+)Migration/g),
+    ].map((match) => Number(match[1])),
   );
-  if (schemaSource.includes("applySchemaV4Migration")) exportedMigrations.add(4);
   const appliedMigrations = new Set(
     [...databaseSource.matchAll(/version < (\d+)\)/g)].map((match) => Number(match[1])),
   );

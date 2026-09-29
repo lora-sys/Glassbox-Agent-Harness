@@ -852,11 +852,15 @@ export class ConversationStore {
           }
 
           const sources = await tx.execute({
-            sql: `SELECT DISTINCT resource_id, action FROM authorization_decisions WHERE run_id = ?
-              AND decision = 'ALLOW' AND action IN ('read', 'context:read', 'worker:read', 'worker:status', 'worker:file:read', 'task:read')`,
+            sql: `SELECT DISTINCT resource_id, action, delivery_source FROM authorization_decisions WHERE run_id = ?
+              AND decision = 'ALLOW' AND delivery_source IS NOT NULL`,
             args: [priorRunId],
           });
           let permitted = true;
+          const currentSourceDecisions: Array<{
+            id: string;
+            source: "content_source" | "access_gate";
+          }> = [];
           for (const source of sources.rows) {
             const decision = await evaluate(tx, {
               caller,
@@ -869,6 +873,14 @@ export class ConversationStore {
               permitted = false;
               break;
             }
+            currentSourceDecisions.push({
+              id: decision.id,
+              source:
+                source.delivery_source === "access_gate" ||
+                source.delivery_source === "legacy_access_gate"
+                  ? "access_gate"
+                  : "content_source",
+            });
           }
           if (!permitted) continue;
 
@@ -907,6 +919,17 @@ export class ConversationStore {
             continue;
           }
           loadedChars += user.length + assistant.length;
+          // The recheck above is only half of the source contract: a decision that was made
+          // because a source was a content source stays marked that way for the next Run that
+          // re-reads this turn, so a later reader is not re-adjudicated against a stricter
+          // access gate it never had to pass. Marked here, after the turn is admitted, because
+          // a turn whose delivery is dropped leaves no reason to carry its marker forward.
+          for (const source of currentSourceDecisions) {
+            await tx.execute({
+              sql: "UPDATE authorization_decisions SET delivery_source = ? WHERE id = ? AND decision = 'ALLOW' AND delivery_source IS NULL",
+              args: [source.source, source.id],
+            });
+          }
           exchanges.push({
             runId: priorRunId,
             user,

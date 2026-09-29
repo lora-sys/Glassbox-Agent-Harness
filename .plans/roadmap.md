@@ -4,14 +4,13 @@ Status: ROADMAP ONLY
 
 This file records sequencing and product direction. It is not permission to implement future phases.
 
-P3 is complete. The active implementation plans are the intentionally parallel P4 streams:
+P3, P4A, P4B, and the Issue #21 repository refactor are complete. The current closeout is:
 
 ```text
-.plans/04a-memory-taste.md
-.plans/04b-authorized-retrieval-history.md
+.plans/issue-24-closeout.md
 ```
 
-Each stream has separate ownership, a tracking Issue, and a later PR.
+Issue #24 tracks delivery-source reauthorization, Herdr Worker workspace occupancy, and remaining acceptance. The P4 plans remain completed records. Issue #30 owns Linux full-stack migration.
 
 ## Product thesis
 

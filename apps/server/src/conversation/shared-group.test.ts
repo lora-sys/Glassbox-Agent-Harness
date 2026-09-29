@@ -15,6 +15,7 @@ import {
   type TrustedChannelScope,
 } from "../persistence/index.js";
 import { localDatabaseUrl } from "../persistence/database.js";
+import { CURRENT_SCHEMA_VERSION } from "../persistence/schema.js";
 
 const groupBase: TrustedChannelScope = {
   connectionId: "napcat-local",
@@ -332,12 +333,13 @@ describe("shared group conversation and durable actor routing", () => {
         scope: ownerGroup.scope,
         effect: "allow",
       });
-    await store.authorization.check({
+    const source = await store.authorization.check({
       caller: ownerGroup,
       resourceId: "group-source",
       action: "read",
       runId: first.run.id,
     });
+    await store.authorization.markDeliverySource(source.id, "content_source");
     const lease = await store.lifecycle.claimQueuedRun(ownerGroup, first.run.id);
     await lease.settle("succeeded", "SOURCE_DEPENDENT_ANSWER");
     const delivery = await store.lifecycle.createDelivery(ownerGroup, {
@@ -382,12 +384,13 @@ describe("shared group conversation and durable actor routing", () => {
       scope: ownerPrivate.scope,
       effect: "allow",
     });
-    await store.authorization.check({
+    const source = await store.authorization.check({
       caller: ownerPrivate,
       resourceId: "history-notes",
       action: "read",
       runId: first.run.id,
     });
+    await store.authorization.markDeliverySource(source.id, "content_source");
     const lease = await store.lifecycle.claimQueuedRun(ownerPrivate, first.run.id);
     await lease.settle("succeeded", "PROTECTED_HISTORY");
     const second = await store.conversations.acceptIncoming({
@@ -433,16 +436,14 @@ describe("shared group conversation and durable actor routing", () => {
         scope: ownerPrivate.scope,
         effect: "allow",
       });
-      expect(
-        (
-          await store.authorization.check({
-            caller: ownerPrivate,
-            resourceId: "private-notes",
-            action: readAction,
-            runId: accepted.run.id,
-          })
-        ).decision,
-      ).toBe("ALLOW");
+      const source = await store.authorization.check({
+        caller: ownerPrivate,
+        resourceId: "private-notes",
+        action: readAction,
+        runId: accepted.run.id,
+      });
+      expect(source.decision).toBe("ALLOW");
+      await store.authorization.markDeliverySource(source.id, "content_source");
       const input = {
         runId: accepted.run.id,
         dedupKey: "answer",
@@ -1231,11 +1232,16 @@ describe("shared group conversation and durable actor routing", () => {
     // archive (channel_messages + FTS index) and group capability policies; V13 adds the
     // Run failure cause column that the fallback delivery line is chosen from.
     const ver = await rawCheck.execute("PRAGMA user_version");
-    expect(Number(ver.rows[0]?.user_version)).toBe(13);
+    expect(Number(ver.rows[0]?.user_version)).toBe(CURRENT_SCHEMA_VERSION);
     const runColumns = await rawCheck.execute("PRAGMA table_info(runs)");
     expect(
       runColumns.rows.some((row) => row.name === "failure_code"),
       "runs.failure_code must exist after the V13 migration",
+    ).toBe(true);
+    const decisionColumns = await rawCheck.execute("PRAGMA table_info(authorization_decisions)");
+    expect(
+      decisionColumns.rows.some((row) => row.name === "delivery_source"),
+      "authorization_decisions.delivery_source must exist after the V14 migration",
     ).toBe(true);
 
     rawCheck.close();

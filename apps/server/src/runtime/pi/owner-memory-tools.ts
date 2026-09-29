@@ -554,6 +554,11 @@ async function executeMemoryActionRaw(
           ),
         );
       }
+      // The decision is what a later Run re-reads this turn against, so it has to carry the
+      // marker the recheck looks for. Only marked when the read actually returned something:
+      // an empty read left no delivery for the marker to describe.
+      if (items.length > 0)
+        await store.authorization.markDeliverySource(decision.id, "content_source");
       return {
         matched: items.length,
         imported: candidates.length,
@@ -669,6 +674,8 @@ export function createOwnerMemoryTools(options: {
         { additionalProperties: false },
       ),
       action: authorizationAction,
+      deliverySource: (params) =>
+        ["list", "get", "list_candidates"].includes(params.action) ? "content_source" : undefined,
       resourceId: OWNER_MEMORY_RESOURCE,
       authService: options.store.authorization,
       getContext,

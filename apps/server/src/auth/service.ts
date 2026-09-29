@@ -39,6 +39,32 @@ export interface AuthorizationRequest {
   runId?: string;
 }
 
+export type ProtectedReadClassification =
+  | "content_source"
+  | "access_gate"
+  | "legacy_content_source"
+  | "legacy_access_gate";
+
+/**
+ * Classifies a persisted authorization Action for delivery reauthorization.
+ *
+ * Content-source Actions read protected Resource contents and need both the original Action
+ * and `delivery:send` rechecked. Search Actions gate access to a search surface; concrete
+ * protected results are recorded separately against their own Resources. Public-web Resource
+ * Actions are neither protected content sources nor protected search gates.
+ */
+const PROTECTED_READ_ACTION_VERBS = new Set(["read", "list", "status"]);
+
+export function classifyProtectedReadAction(
+  action: string,
+  resourceKind: string | undefined,
+): ProtectedReadClassification | undefined {
+  if (resourceKind === "web-public") return undefined;
+  const verb = action.split(":").at(-1);
+  if (verb === "search") return "access_gate";
+  return verb !== undefined && PROTECTED_READ_ACTION_VERBS.has(verb) ? "content_source" : undefined;
+}
+
 export class AccessDeniedError extends Error {
   constructor(readonly decision: AuthorizationDecision) {
     super(decision.decision === "REQUIRES_APPROVAL" ? "Approval is required" : "Access denied");
@@ -56,7 +82,7 @@ export async function recordDecision(
 ): Promise<AuthorizationDecision> {
   const id = randomUUID();
   await tx.execute({
-    sql: "INSERT INTO authorization_decisions(id, principal_id, resource_id, action, scope_key, decision, reason, grant_id, approval_id, conversation_id, run_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    sql: "INSERT INTO authorization_decisions(id, principal_id, resource_id, action, scope_key, decision, reason, grant_id, approval_id, conversation_id, run_id, delivery_source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     args: [
       id,
       request.caller.principalId,
@@ -69,6 +95,7 @@ export async function recordDecision(
       approvalId,
       request.conversationId ?? null,
       request.runId ?? null,
+      null,
       new Date().toISOString(),
     ],
   });
@@ -192,6 +219,26 @@ export function authorizedValue<T>(result: AuthorizedResult<T>): T {
 
 export class AuthorizationService {
   constructor(private readonly db: DomainDatabase) {}
+
+  /** Marks an ALLOW decision only after its protected operation returned successfully. */
+  async markDeliverySource(
+    decisionId: string,
+    source: "content_source" | "access_gate",
+  ): Promise<void> {
+    await this.db.transaction(async (tx) => {
+      const updated = await tx.execute({
+        sql: "UPDATE authorization_decisions SET delivery_source = ? WHERE id = ? AND decision = 'ALLOW' AND (delivery_source IS NULL OR delivery_source = ?)",
+        args: [source, decisionId, source],
+      });
+      if (updated.rowsAffected === 1) return;
+      const existing = await tx.execute({
+        sql: "SELECT delivery_source FROM authorization_decisions WHERE id = ? AND decision = 'ALLOW'",
+        args: [decisionId],
+      });
+      if (existing.rows[0]?.delivery_source !== source)
+        throw new Error("delivery_source_decision_mismatch");
+    });
+  }
 
   /** Register metadata only. Protected content stays behind an authorized loader. */
   async registerResource(input: {

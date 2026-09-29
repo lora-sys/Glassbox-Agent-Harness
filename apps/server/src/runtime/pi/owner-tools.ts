@@ -161,6 +161,7 @@ export function createOwnerTools(options: {
         { additionalProperties: false },
       ),
       action: "group:manage",
+      deliverySource: (params) => (params.action === "get" ? "content_source" : undefined),
       resourceId: OWNER_CONTROL_RESOURCE,
       authService: options.store.authorization,
       getContext,

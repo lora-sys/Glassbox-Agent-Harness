@@ -7,7 +7,7 @@ Status: CURRENT DIRECTION / P4 ACTIVE
 
 This document is the source of truth for what `lora-sys/lora-pi-kit` is, what it contains, how it is installed, and how it relates to Pi, Glassbox, Herdr, and `lora-sys/skills`.
 
-The active implementation order still comes from `.plans/03-personal-agent-foundation.md`.
+The current pre-P5 closeout is `.plans/issue-24-closeout.md`. Plan 03 remains the completed P3 foundation record.
 
 ## One sentence
 
