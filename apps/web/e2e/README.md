@@ -20,6 +20,8 @@ Do not run the whole directory as the default verification for every change.
 
 `smoke.spec.mjs` is a portable exception: `npx playwright test smoke.spec.mjs` starts the Web dev server on 5173 through `playwright.config.ts` and checks the page without requiring the Glassbox API or credentials.
 
+`protocol.spec.mjs` starts an isolated Glassbox server on 3030 with disposable data and workspace directories. It checks the Web dev proxy and the real management HTTP boundary: no token returns 401, while the generated fixture token returns ready status. Run both portable specs with `npm run test:web:browser`.
+
 ## Plan 03 rule
 
 New Personal Agent Foundation tests must be portable.
