@@ -1249,3 +1249,10 @@
   r: 5px;
   stroke-width: 2px;
 }
+
+.liveRecordsPage { padding: 24px; }
+.liveRecord { margin: 14px 0; padding: 18px; border: 1px solid var(--line-strong); border-radius: 12px; overflow-wrap: anywhere; }
+.liveRecord h2 { margin: 0 0 8px; font-size: 15px; }
+.liveRecord p { margin: 6px 0; }
+.liveRecordResult { max-height: 180px; overflow: auto; white-space: pre-wrap; }
+.liveRecord pre { max-height: 360px; overflow: auto; white-space: pre-wrap; }

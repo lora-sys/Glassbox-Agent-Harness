@@ -35,6 +35,7 @@ import { ChannelsPage } from './pages/ChannelsPage';
 import { PermissionsPage } from './pages/PermissionsPage';
 import { MonitorPage } from './pages/MonitorPage';
 import { SettingsPage } from './pages/SettingsPage';
+import { LiveRecordsPage, LiveUnavailablePage } from './pages/LiveRecordsPage';
 
 import './styles/management.css';
 
@@ -213,6 +214,19 @@ export const ManagementRoot: React.FC = () => {
   }, []);
 
   const renderCurrentPage = () => {
+    if (mode === 'live') {
+      if (currentPage === 'conversations' || currentPage === 'runs' || currentPage === 'trace')
+        return <LiveRecordsPage kind={currentPage} runId={search?.runId} onNavigate={navigateToPage} />;
+      const unavailable: Partial<Record<ManagementPageId, [string, string]>> = {
+        ops: ['任务协作', '/manage/tasks'],
+        identity: ['身份与访问', '/manage/principals'],
+        permissions: ['权限', '/manage/permissions/rules'],
+        monitor: ['监控', '/manage/monitor/telemetry'],
+        settings: ['设置', '/manage/settings'],
+      };
+      const missing = unavailable[currentPage];
+      if (missing) return <LiveUnavailablePage title={missing[0]} endpoint={missing[1]} />;
+    }
     switch (currentPage) {
       case 'overview':
         return <OverviewPage onNavigate={navigateToPage} />;
