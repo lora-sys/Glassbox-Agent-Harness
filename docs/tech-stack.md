@@ -496,9 +496,18 @@ and runs these checks:
 - Pull request titles must follow `type(scope): summary`. Local commits continue to use the
   repository's pre-commit validation hook.
 
+`.github/workflows/text-portability.yml` runs on the same triggers as its own workflow, so a
+Windows-authored text failure is visible on its own instead of inside the larger hygiene run:
+
+- `npm run portability:check` reads the staged blobs and the working tree to catch text that
+  renders on Windows but breaks on Linux: UTF-8 BOMs, files saved as GBK or UTF-16 instead of
+  UTF-8, double-encoded mojibake, invisible bidi and zero-width characters, CRLF endings in
+  line-oriented files, and non-UTF-8 paths.
+
 Configure GitHub branch protection for `main` to require the `Code and test hygiene`,
-`Dependency hygiene`, `Secret hygiene`, `Pull request dependency review`, and `Pull request title
-hygiene` checks. A workflow cannot make its own status checks mandatory or prevent direct pushes.
+`Text encoding and line-ending portability`, `Dependency hygiene`, `Secret hygiene`,
+`Pull request dependency review`, and `Pull request title hygiene` checks. A workflow cannot
+make its own status checks mandatory or prevent direct pushes.
 
 Playwright remains the browser / E2E layer.
 
