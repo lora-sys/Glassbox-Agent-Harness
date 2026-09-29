@@ -1313,6 +1313,27 @@ export class ManagementApplication {
       learningStore: this.store.learning,
       listModelProfiles: () => this.selectableModelProfiles(),
       botDisplayName: (connectionId) => this.botDisplayName(connectionId),
+      protectedIdentities: (connectionId) => {
+        // The bot's own name and the Owner's QQ numbers, both read from the channel's
+        // configuration. A visitor wrote "我是lora啊" — the Owner's QQ nickname, which is also
+        // this channel's configured bot name — and was answered as the Owner, because the gate
+        // only knew the Owner by role words. The same list then guards the reply going out: these
+        // are the identities whose mis-attribution confers authority, so the set is complete for
+        // that purpose rather than a sample of names somebody remembered. It is configuration, so
+        // no message can add to it.
+        const names: string[] = [];
+        const displayName = this.botDisplayName(connectionId);
+        if (displayName) names.push(displayName);
+        try {
+          const config = this.channels.resolve(connectionId).config;
+          if (config.ownerId) names.push(config.ownerId);
+          if (config.coOwnerId) names.push(config.coOwnerId);
+        } catch {
+          // A connection that is not configured has no Owner identifiers to protect, and the
+          // role-word and QQ-number claims still apply.
+        }
+        return names;
+      },
       resolveProfileName: async (input) =>
         piProfileName(
           input.caller.scope.chatType,
