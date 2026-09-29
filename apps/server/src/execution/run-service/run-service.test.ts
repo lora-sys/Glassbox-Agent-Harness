@@ -20,6 +20,7 @@ import {
   type RunExecutionAdapter,
   type RunServiceEvent,
   type RunTransport,
+  type SendOutcome,
 } from "./index.js";
 
 const group: TrustedChannelScope = {
@@ -1103,5 +1104,118 @@ describe("durable result delivery and recovery", () => {
     await sendLease!.settle("sent", "one-send");
     await expect(sendLease!.settle("unknown")).rejects.toThrow("already settled");
     expect(await store.lifecycle.claimDelivery(owner(), accepted.run.id, deliveryId)).toBeNull();
+  });
+});
+
+describe("restart publication window", () => {
+  /** A Run still marked running, as a process that died mid-flight would have left it. */
+  async function runLeftRunning(text: string) {
+    const { store } = await fixture();
+    const accepted = await store.conversations.acceptIncoming(input(text));
+    await store.lifecycle.transitionRun(owner(), accepted.run.id, "queued", "running");
+    return { store, runId: accepted.run.id };
+  }
+
+  /** Settles the Run at a fixed moment so the test controls how stale it is at restart. */
+  async function settleAt(store: DomainStore, runId: string, at: string, answer: string) {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(at));
+    await store.lifecycle.transitionRun(owner(), runId, "running", "succeeded", answer);
+  }
+
+  it("publishes a Run that finished shortly before the restart", async () => {
+    const { store, runId } = await runLeftRunning("recent-finish");
+    await settleAt(store, runId, "2026-09-29T10:00:00.000Z", "answer nobody sent yet");
+    const send = vi.fn(async (): Promise<SendOutcome> => ({ status: "sent" }));
+    const { instance } = service(
+      store,
+      {
+        supportsGroup: true,
+        execute: async (): Promise<ExecutionResult> => ({ status: "succeeded" }),
+      },
+      { send },
+    );
+    // The process died between settling the Run and creating its delivery. That gap is the
+    // whole reason a restart republishes at all.
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
+    await instance.start({ recover: true });
+    await instance.drain();
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        delivery: expect.objectContaining({ payloadText: "answer nobody sent yet" }),
+      }),
+    );
+    expect((await store.lifecycle.findDelivery(owner(), runId, "result"))?.status).toBe("sent");
+  });
+
+  it("leaves a Run that finished long before the restart unpublished", async () => {
+    const { store, runId } = await runLeftRunning("stale-finish");
+    await settleAt(store, runId, "2026-09-29T10:00:00.000Z", "an answer from last week");
+    const send = vi.fn(async (): Promise<SendOutcome> => ({ status: "sent" }));
+    const { instance } = service(
+      store,
+      {
+        supportsGroup: true,
+        execute: async (): Promise<ExecutionResult> => ({ status: "succeeded" }),
+      },
+      { send },
+    );
+    await vi.advanceTimersByTimeAsync(3 * 60 * 60 * 1000);
+    await instance.start({ recover: true });
+    await instance.drain();
+    // Nobody has waited three hours for this. The process was alive when it settled and
+    // recorded its outcome, so a restart is not a second chance to send it.
+    expect(send).not.toHaveBeenCalled();
+    expect(await store.lifecycle.findDelivery(owner(), runId, "result")).toBeNull();
+    expect(
+      await store.lifecycle.listRestorableRunRoutes(["succeeded"], 0, {
+        windowMs: 2 * 60 * 60 * 1000,
+        now: new Date("2026-09-29T13:00:00.000Z"),
+      }),
+    ).toEqual([]);
+  });
+
+  it("finishes a delivery left in flight however long ago the Run finished", async () => {
+    const { store, runId } = await runLeftRunning("stranded-delivery");
+    await settleAt(store, runId, "2026-09-29T10:00:00.000Z", "answer still in flight");
+    await store.lifecycle.createDelivery(owner(), {
+      runId,
+      dedupKey: "result",
+      destination: group,
+      payloadText: "answer still in flight",
+      payloadKind: "result",
+    });
+    const send = vi.fn(async (): Promise<SendOutcome> => ({ status: "sent" }));
+    const { instance } = service(
+      store,
+      {
+        supportsGroup: true,
+        execute: async (): Promise<ExecutionResult> => ({ status: "succeeded" }),
+      },
+      { send },
+    );
+    // A send that never settled is unfinished work, not an old answer: the transport went
+    // away underneath it and the restart owes the reader the outcome.
+    await vi.advanceTimersByTimeAsync(30 * 60 * 60 * 1000);
+    await instance.start({ recover: true });
+    await instance.drain();
+    expect(send).toHaveBeenCalledTimes(1);
+    expect((await store.lifecycle.findDelivery(owner(), runId, "result"))?.status).toBe("sent");
+  });
+
+  it("rejects a restore window that is not a usable duration", async () => {
+    const { store } = await fixture();
+    for (const restoreWindowMs of [-1, 1.5, Number.NaN, 8 * 24 * 60 * 60 * 1000]) {
+      expect(
+        () =>
+          new RunService({
+            store,
+            resolveExecution: () => undefined,
+            transport: { send: async () => ({ status: "sent" }) },
+            restoreWindowMs,
+          }),
+      ).toThrow("Invalid restore window");
+    }
   });
 });
