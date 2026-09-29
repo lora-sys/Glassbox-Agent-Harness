@@ -2,7 +2,7 @@ import type { Transaction } from "@libsql/client";
 
 import { conversationScopeKey } from "../identity/scope.js";
 
-export const CURRENT_SCHEMA_VERSION = 14;
+export const CURRENT_SCHEMA_VERSION = 15;
 
 function persistedText(value: unknown): string {
   if (typeof value !== "string") throw new Error("Invalid migration record");
@@ -102,6 +102,24 @@ export const schemaV12Migration = [
  */
 export const schemaV13Migration = ["ALTER TABLE runs ADD COLUMN failure_code TEXT"];
 
+export const schemaV15Migration = [
+  `CREATE TABLE IF NOT EXISTS authorization_decisions_archive (id TEXT PRIMARY KEY, principal_id TEXT, resource_id TEXT NOT NULL, action TEXT NOT NULL, scope_key TEXT NOT NULL, decision TEXT NOT NULL, reason TEXT NOT NULL, grant_id TEXT, approval_id TEXT, conversation_id TEXT, run_id TEXT, delivery_source TEXT, created_at TEXT NOT NULL)`,
+  `CREATE INDEX IF NOT EXISTS decisions_archive_page ON authorization_decisions_archive(principal_id, scope_key, created_at, id)`,
+  `CREATE INDEX IF NOT EXISTS decisions_archive_age ON authorization_decisions_archive(created_at, id)`,
+  `CREATE INDEX IF NOT EXISTS decisions_archive_run ON authorization_decisions_archive(run_id)`,
+  `CREATE INDEX IF NOT EXISTS decisions_age ON authorization_decisions(created_at, id)`,
+  `CREATE INDEX IF NOT EXISTS decisions_run ON authorization_decisions(run_id)`,
+  `CREATE INDEX IF NOT EXISTS memory_audit_decision ON memory_audit_events(decision_id)`,
+  `CREATE VIEW IF NOT EXISTS authorization_decisions_all AS SELECT * FROM authorization_decisions UNION ALL SELECT * FROM authorization_decisions_archive`,
+];
+
+export async function applySchemaV15Migration(tx: Transaction): Promise<void> {
+  const decisions = await tx.execute(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'authorization_decisions'",
+  );
+  if (decisions.rows.length) await tx.batch(schemaV15Migration);
+}
+
 export const schema = [
   ...baseSchema,
   ...schemaV7Statements,
@@ -109,6 +127,7 @@ export const schema = [
   ...learningSchema,
   ...schemaV12Migration,
   ...schemaV13Migration,
+  ...schemaV15Migration,
 ];
 
 export const schemaV5Migration = ["ALTER TABLE tasks ADD COLUMN origin_scope_key TEXT"];

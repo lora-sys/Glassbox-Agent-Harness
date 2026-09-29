@@ -15,6 +15,7 @@ import type {
 } from "@glassbox/contracts";
 import { DomainDatabase, optionalString, stringColumn } from "../persistence/database.js";
 import {
+  identityKey,
   requireIdentifier,
   scopeKey,
   type TrustedChannelScope,
@@ -112,6 +113,41 @@ function parseTask(row: Row): AgentTask {
     acceptanceCriteria,
     createdAt: stringColumn(row, "created_at"),
     updatedAt: stringColumn(row, "updated_at"),
+  };
+}
+
+/** The same explicit-grant and creator policy precedence as auth.evaluate, expressed once in
+ * SQL for list projections. The exact current identity binding is part of the predicate. */
+function visibleTaskSubquery(caller: CallerContext): { sql: string; args: InValue[] } {
+  const principal = caller.principalId;
+  const scope = scopeKey(caller.scope);
+  return {
+    sql: `SELECT t.id FROM tasks t JOIN resources r ON r.id = 'task-' || t.id AND r.kind = 'task'
+      WHERE EXISTS (SELECT 1 FROM channel_identities ci
+        WHERE ci.identity_key = ? AND ci.principal_id = ?)
+      AND (? <> 'group' OR r.visibility = 'public')
+      AND (EXISTS (SELECT 1 FROM grants g WHERE g.principal_id = ? AND g.resource_id = r.id
+        AND g.action = 'task:read' AND g.scope_key = ? AND g.effect = 'allow' AND g.revoked_at IS NULL)
+      OR (NOT EXISTS (SELECT 1 FROM grants g WHERE g.principal_id = ? AND g.resource_id = r.id
+        AND g.action = 'task:read' AND g.scope_key = ? AND g.revoked_at IS NULL)
+        AND t.creator_principal_id = ? AND t.origin_scope_key = ?
+        AND EXISTS (SELECT 1 FROM grants g WHERE g.principal_id = ? AND g.resource_id = ?
+          AND g.action = 'task:read' AND g.scope_key = ? AND g.effect = 'allow'
+          AND g.revoked_at IS NULL)))`,
+    args: [
+      identityKey(caller.scope),
+      principal,
+      caller.scope.chatType,
+      principal,
+      scope,
+      principal,
+      scope,
+      principal,
+      scope,
+      principal,
+      taskPolicyResourceId(caller),
+      scope,
+    ],
   };
 }
 
@@ -520,21 +556,9 @@ export class TaskStore {
       let sql = "SELECT * FROM tasks WHERE 1=1";
       const args: InValue[] = [];
       if (options?.caller) {
-        const ids = await tx.execute("SELECT id FROM tasks");
-        const visible: string[] = [];
-        for (const row of ids.rows) {
-          const id = stringColumn(row, "id");
-          const decision = await evaluate(tx, {
-            caller: options.caller,
-            resourceId: `task-${id}`,
-            action: "task:read",
-            runId: options.runId,
-            conversationId: options.conversationId,
-          });
-          if (decision.decision === "ALLOW") visible.push(id);
-        }
-        sql += ` AND id IN (${visible.map(() => "?").join(",") || "NULL"})`;
-        args.push(...visible);
+        const visible = visibleTaskSubquery(options.caller);
+        sql += ` AND id IN (${visible.sql})`;
+        args.push(...visible.args);
       }
       if (options?.creatorPrincipalId) {
         sql += " AND creator_principal_id = ?";
@@ -553,36 +577,21 @@ export class TaskStore {
   /** Loads only caller-authorized durable records for the Ops health projection. */
   async getOpsHealthRecords(
     caller: CallerContext,
-    evidence?: { runId?: string; conversationId?: string },
+    _evidence?: { runId?: string; conversationId?: string },
   ): Promise<{ tasks: AgentTask[]; attempts: TaskAttempt[]; bindings: WorkerBinding[] }> {
     return this.db.transaction(async (tx) => {
-      const taskIdsResult = await tx.execute("SELECT id FROM tasks");
-      const visibleIds: string[] = [];
-      for (const row of taskIdsResult.rows) {
-        const id = stringColumn(row, "id");
-        const decision = await evaluate(tx, {
-          caller,
-          resourceId: `task-${id}`,
-          action: "task:read",
-          ...evidence,
-        });
-        if (decision.decision === "ALLOW") visibleIds.push(id);
-      }
-
-      if (!visibleIds.length) return { tasks: [], attempts: [], bindings: [] };
-      const placeholders = visibleIds.map(() => "?").join(",");
-      const args = visibleIds as InValue[];
+      const visible = visibleTaskSubquery(caller);
       const taskRows = await tx.execute({
-        sql: `SELECT * FROM tasks WHERE id IN (${placeholders})`,
-        args,
+        sql: `SELECT * FROM tasks WHERE id IN (${visible.sql})`,
+        args: visible.args,
       });
       const attemptRows = await tx.execute({
-        sql: `SELECT * FROM task_attempts WHERE task_id IN (${placeholders})`,
-        args,
+        sql: `SELECT * FROM task_attempts WHERE task_id IN (${visible.sql})`,
+        args: visible.args,
       });
       const bindingRows = await tx.execute({
-        sql: `SELECT b.* FROM worker_bindings b JOIN tasks t ON t.active_attempt_id = b.task_attempt_id WHERE t.id IN (${placeholders}) AND t.status NOT IN ('DONE', 'ACCEPTED', 'FAILED', 'CANCELED')`,
-        args,
+        sql: `SELECT b.* FROM worker_bindings b JOIN tasks t ON t.active_attempt_id = b.task_attempt_id WHERE t.id IN (${visible.sql}) AND t.status NOT IN ('DONE', 'ACCEPTED', 'FAILED', 'CANCELED')`,
+        args: visible.args,
       });
 
       return {
@@ -1255,33 +1264,19 @@ export class TaskStore {
 
   async getOpsSnapshot(
     caller?: CallerContext,
-    evidence?: { runId?: string; conversationId?: string },
+    _evidence?: { runId?: string; conversationId?: string },
   ): Promise<AgentOpsSnapshot> {
     return this.db.transaction(async (tx) => {
-      const visibleIds: string[] = [];
-      if (caller) {
-        const metadata = await tx.execute("SELECT id FROM tasks");
-        for (const row of metadata.rows) {
-          const id = stringColumn(row, "id");
-          const decision = await evaluate(tx, {
-            caller,
-            resourceId: `task-${id}`,
-            action: "task:read",
-            ...evidence,
-          });
-          if (decision.decision === "ALLOW") visibleIds.push(id);
-        }
-      }
-      const placeholders = visibleIds.map(() => "?").join(",") || "NULL";
-      const taskFilter = caller ? `id IN (${placeholders})` : "1 = 1";
-      const attentionFilter = caller ? `task_id IN (${placeholders})` : "1 = 1";
+      const visible = caller ? visibleTaskSubquery(caller) : null;
+      const taskFilter = visible ? `id IN (${visible.sql})` : "1 = 1";
+      const attentionFilter = visible ? `task_id IN (${visible.sql})` : "1 = 1";
       const workerFilter = caller
-        ? `task_attempt_id IN (SELECT id FROM task_attempts WHERE task_id IN (${placeholders}))`
+        ? `task_attempt_id IN (SELECT id FROM task_attempts WHERE task_id IN (${visible!.sql}))`
         : "1 = 1";
       // Attention items
       const attentionRows = await tx.execute({
         sql: `SELECT kind, COUNT(*) as count FROM attention_items WHERE resolved_at IS NULL AND ${attentionFilter} GROUP BY kind`,
-        args: visibleIds,
+        args: visible?.args ?? [],
       });
       const attentionCounts: Record<string, number> = {};
       let totalAttention = 0;
@@ -1294,7 +1289,7 @@ export class TaskStore {
       // Tasks
       const taskRows = await tx.execute({
         sql: `SELECT status, COUNT(*) as count FROM tasks WHERE ${taskFilter} GROUP BY status`,
-        args: visibleIds,
+        args: visible?.args ?? [],
       });
       const taskCounts: Record<string, number> = {};
       for (const row of taskRows.rows) {
@@ -1306,14 +1301,14 @@ export class TaskStore {
       startOfDay.setHours(0, 0, 0, 0);
       const doneTodayRes = await tx.execute({
         sql: `SELECT COUNT(*) as count FROM tasks WHERE status = 'DONE' AND updated_at >= ? AND ${taskFilter}`,
-        args: [startOfDay.toISOString(), ...visibleIds],
+        args: [startOfDay.toISOString(), ...(visible?.args ?? [])],
       });
       const doneToday = Number(doneTodayRes.rows[0]?.count ?? 0);
 
       // Workers
       const workerRows = await tx.execute({
         sql: `SELECT last_observed_agent_state as state, COUNT(*) as count FROM worker_bindings WHERE ${workerFilter} GROUP BY last_observed_agent_state`,
-        args: visibleIds,
+        args: visible?.args ?? [],
       });
       const workerCounts: Record<string, number> = {};
       let totalWorkers = 0;

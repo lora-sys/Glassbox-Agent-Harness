@@ -162,7 +162,7 @@ export async function evaluate(
     // Rechecks reuse that evidence only while the same grant and binding are current.
     const locationKey = conversationScopeKey(request.caller.scope);
     const admitted = await tx.execute({
-      sql: "SELECT a.id, a.grant_id FROM approvals a JOIN grants g ON g.id = a.grant_id JOIN authorization_decisions d ON d.approval_id = a.id JOIN runs r ON r.id = d.run_id JOIN conversations c ON c.id = r.conversation_id WHERE d.run_id = ? AND d.principal_id = ? AND d.resource_id = ? AND d.action = ? AND d.scope_key = ? AND d.decision = 'ALLOW' AND d.reason = 'approved' AND d.grant_id = a.grant_id AND g.revoked_at IS NULL AND a.consumed_at IS NOT NULL AND a.expires_at > ? AND r.principal_id = ? AND (c.scope_key = ? OR c.id IN (SELECT conversation_id FROM conversation_locations WHERE location_key = ?)) LIMIT 1",
+      sql: "SELECT a.id, a.grant_id FROM approvals a JOIN grants g ON g.id = a.grant_id JOIN authorization_decisions_all d ON d.approval_id = a.id JOIN runs r ON r.id = d.run_id JOIN conversations c ON c.id = r.conversation_id WHERE d.run_id = ? AND d.principal_id = ? AND d.resource_id = ? AND d.action = ? AND d.scope_key = ? AND d.decision = 'ALLOW' AND d.reason = 'approved' AND d.grant_id = a.grant_id AND g.revoked_at IS NULL AND a.consumed_at IS NOT NULL AND a.expires_at > ? AND r.principal_id = ? AND (c.scope_key = ? OR c.id IN (SELECT conversation_id FROM conversation_locations WHERE location_key = ?)) LIMIT 1",
       args: [
         request.runId,
         resolved,
