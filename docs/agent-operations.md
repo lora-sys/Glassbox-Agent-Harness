@@ -4,7 +4,7 @@ Status: CURRENT DIRECTION
 
 This document defines the bidirectional operations boundary between the Glassbox main Agent and Herdr-managed coding workers.
 
-The active implementation source of truth remains `.plans/03-personal-agent-foundation.md`.
+The current closeout source of truth is `.plans/issue-24-closeout.md`. Plan 03 remains the completed P3 foundation record.
 
 ## Decision
 
@@ -288,6 +288,8 @@ Remote users do not inherit Owner operations merely because the main Agent can c
 The current remote Pi Worker launch disables built-in tools and enables only `worker_list_files`, `worker_read_file`, and `worker_write_file` through a Glassbox Extension. The server creates an immutable per-attempt context outside the Worker directory. It contains the caller, TaskAttempt, authorized directory, workspace Resource, and the file Actions allowed when delegation began. The model cannot choose these values.
 
 Each operation checks the current Glassbox grant and active TaskAttempt before touching a file. A later grant cannot expand an existing attempt's delegated Action set. Revocation and Task termination prevent subsequent access. Reads and writes use relative paths inside the configured directory. Symlinks, hardlinks, private runtime directories, service state, and traversal paths are rejected. Tool evidence records the Action, Resource, decision ID, attempt, and outcome without copying file contents or denied input into Raw Trace.
+
+For a workspace-bound Pi Worker, Glassbox resolves the configured Herdr directory to exactly one registered product workspace. The caller must hold the corresponding product workspace grant. A write-capable attempt acquires the durable workspace write occupancy shared with main Agent Runs before launch. Every write checks the original lease. Herdr pane closure and a confirming snapshot are required before release. A failed close, disconnected Herdr session, or server restart keeps the lease quarantined. The Worker cannot regain write permission from a stale context after restart. The lease and its state changes have TaskAttempt Trace evidence.
 
 These tools do not execute generated code. The current acceptance uses an independent host test run before Accept. A future process-execution tool must have its own enforceable permissions; restoring built-in bash would bypass this boundary. The per-attempt Extension reads the same local durable database as Glassbox, so this configuration requires Glassbox and Herdr on the same host.
 

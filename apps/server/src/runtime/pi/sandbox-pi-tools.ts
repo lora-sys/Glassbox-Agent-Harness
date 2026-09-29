@@ -113,6 +113,8 @@ export function createIsolatedPiTools(input: {
           );
           if (result.isError)
             return { content: result.content, details: result.details, isError: true };
+          if (access === "read")
+            await input.store.authorization.markDeliverySource(decision.id, "content_source");
           return { content: result.content, details: result.details };
         } catch (error) {
           const uncertain =
