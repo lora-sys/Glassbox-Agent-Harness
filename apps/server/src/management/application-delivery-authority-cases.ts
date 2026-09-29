@@ -881,7 +881,6 @@ describe("skill catalog delivery authority", () => {
     fixture(async () => ({ status: "succeeded", text: "answer" }), {
       coOwnerId: CO_OWNER,
     });
-
   it("provisions delivery authority for the Skill catalog a Run reads", async () => {
     const f = await connect();
     const audiences: Array<readonly [string, readonly TrustedChannelScope[]]> = [
@@ -929,5 +928,65 @@ describe("skill catalog delivery authority", () => {
     expect(await held("delivery:send")).toBe(true);
     // A grant here is authority over every Skill, so it stays closed to anything else.
     expect(await held("run:create")).toBe(false);
+  });
+
+  /**
+   * The scope this grant has to reach is the one the Channel configuration does not name.
+   *
+   * A group member is addressed at runtime, so their scope is provisioned after every
+   * connect has already run. Granting the read alone left them with the same denial the
+   * Owner hit, and nothing in the configuration would ever have told them apart.
+   */
+  /**
+   * The scope this grant has to reach is the one the Channel configuration does not name.
+   *
+   * A group member is addressed at runtime, so their scope is provisioned outside every
+   * provisioning pass. One addressed before the delivery grant existed holds the read and
+   * not the grant it implies, and no reconnect would revisit the scope on its own — the
+   * configuration has never heard of them.
+   */
+  it("backfills delivery authority for a member addressed before the grant existed", async () => {
+    const f = await connect();
+    f.send(1, "owner-a", true, 10002);
+    const ownerRun = await f.started.take();
+    await f.reply("answer");
+    await admin(f.app).setGroupAccess(
+      {
+        caller: ownerRun.caller,
+        conversationId: ownerRun.conversation.id,
+        runId: ownerRun.run.id,
+      },
+      { groupId: GROUP, enabled: true },
+    );
+
+    // A member of that group who is in no configuration list at all.
+    const visitor = { principalId: "qq-visitor-10007", scope: scopeFor("group", GROUP, "10007") };
+    f.send(2, "visitor-a", false, 10007, Number(GROUP));
+    // No reply is awaited: this Run is the one that cannot deliver yet.
+    await f.started.take();
+
+    // The scope as an older build left it: the read granted, the delivery grant absent.
+    await f.app.store.authorization.revokeScopeAction({
+      principalId: visitor.principalId,
+      resourceId: SKILL_CATALOG_RESOURCE,
+      action: "delivery:send",
+      scope: visitor.scope,
+    });
+
+    const decided = (action: string) =>
+      f.app.store.authorization.check({
+        caller: visitor,
+        resourceId: SKILL_CATALOG_RESOURCE,
+        action,
+      });
+    expect((await decided(SKILL_READ_ACTION)).decision).toBe("ALLOW");
+    expect((await decided("delivery:send")).decision).toBe("DENY");
+
+    // A reconnect runs the same provisioning as a restart, and the backfill reads the
+    // grants that exist rather than the ones the configuration would create.
+    await f.app.disconnectChannel("fixture");
+    await f.app.connectChannel("fixture");
+
+    expect((await decided("delivery:send")).decision).toBe("ALLOW");
   });
 });
