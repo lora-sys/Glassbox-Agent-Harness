@@ -1,10 +1,11 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "vite-plus/test";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { WebSocket } from "ws";
+import lockfile from "proper-lockfile";
 import { openManagementRuntime, serverPort } from "./runtime.js";
 
 const execute = promisify(execFile);
@@ -185,6 +186,46 @@ describe("local service integration", () => {
     expect((await fetch(`${baseUrl}/manage/models`, { headers: headers() })).status).toBe(200);
     expect((await readFile(service.credentialFile, "utf8")).trim()).toBe(token);
   });
+
+  it("accepts authenticated shutdown and releases the data lock", async () => {
+    expect((await fetch(`${baseUrl}/manage/shutdown`, { method: "POST" })).status).toBe(401);
+    expect((await fetch(`${baseUrl}/manage/status`, { headers: headers() })).status).toBe(200);
+    const response = await fetch(`${baseUrl}/manage/shutdown`, {
+      method: "POST",
+      headers: headers(),
+    });
+    expect(response.status).toBe(202);
+    expect(await response.json()).toEqual({ status: "stopping" });
+    await vi.waitFor(async () => {
+      expect(
+        await lockfile.check(directory, { lockfilePath: join(directory, "server.lock") }),
+      ).toBe(false);
+    });
+  });
+});
+
+it("reclaims a stale service lock after a crash", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "glassbox-stale-lock-"));
+  let runtime: Awaited<ReturnType<typeof openManagementRuntime>> | undefined;
+  try {
+    const lockPath = join(directory, "server.lock");
+    await mkdir(lockPath);
+    const old = new Date(Date.now() - 30_000);
+    await utimes(lockPath, old, old);
+    runtime = await openManagementRuntime({
+      dataDirectory: directory,
+      databasePath: ":memory:",
+      piAgentDirectory: null,
+      hosts: [],
+      origins: [],
+      status: () => ({}),
+      doctor: () => ({}),
+    });
+    expect(await lockfile.check(directory, { lockfilePath: lockPath })).toBe(true);
+  } finally {
+    await runtime?.close();
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 it("validates port and directory before opening runtime state", async () => {

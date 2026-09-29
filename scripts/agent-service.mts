@@ -398,7 +398,7 @@ async function waitForDataLockRelease(timeoutMs = 30_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   const lockfilePath = join(dataDirectory, "server.lock");
   while (Date.now() < deadline) {
-    if (!(await lockfile.check(dataDirectory, { lockfilePath }))) return;
+    if (!(await lockfile.check(dataDirectory, { lockfilePath, stale: 10_000 }))) return;
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 200));
   }
   throw new Error("Previous Glassbox service still owns the data directory");
@@ -435,6 +435,19 @@ async function herdrEndpoint(): Promise<string | undefined> {
   }
 }
 
+async function requestGlassboxShutdown(entry: ProcessState): Promise<void> {
+  const portText = entry.env?.PORT ?? process.env.PORT ?? "3030";
+  if (!/^\d{1,5}$/u.test(portText) || Number(portText) < 1 || Number(portText) > 65535)
+    throw new Error("Invalid Glassbox service port");
+  const token = (await readFile(join(dataDirectory, "management-token"), "utf8")).trim();
+  const response = await fetch(`http://127.0.0.1:${portText}/manage/shutdown`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}` },
+    signal: AbortSignal.timeout(2_000),
+  });
+  if (response.status !== 202) throw new Error("Glassbox did not accept graceful shutdown");
+}
+
 async function stopEntry(entry: ProcessState): Promise<void> {
   const sessionName = herdrSessionName(entry);
   if (sessionName && (await herdrSessionRunning(entry, sessionName))) {
@@ -452,7 +465,8 @@ async function stopEntry(entry: ProcessState): Promise<void> {
   }
   if (!(await verified(entry))) return;
   if (process.platform === "win32") {
-    await execFile("taskkill.exe", ["/PID", String(entry.pid), "/T"]).catch(() => undefined);
+    if (entry.name === "glassbox") await requestGlassboxShutdown(entry).catch(() => undefined);
+    else await execFile("taskkill.exe", ["/PID", String(entry.pid), "/T"]).catch(() => undefined);
   } else {
     process.kill(entry.pid, "SIGTERM");
   }
