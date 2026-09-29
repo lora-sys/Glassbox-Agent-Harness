@@ -7,6 +7,14 @@ function request(method: string, url: string): IncomingMessage {
 }
 
 describe("management routes", () => {
+  it("exposes unresolved Run attention to authenticated local management", async () => {
+    const items = [{ id: "attention-1", kind: "unanswered_message", conversationId: "conv-1" }];
+    const result = await routeManagementRequest(request("GET", "/manage/attention"), {
+      store: { tasks: { listAttentionItems: async () => items } },
+    } as unknown as ManagementRouteDependencies);
+    expect(result).toEqual({ status: 200, body: { items } });
+  });
+
   it("tool-plane route rechecks run access after reading trace pages", async () => {
     const order: string[] = [];
     const dependencies = {

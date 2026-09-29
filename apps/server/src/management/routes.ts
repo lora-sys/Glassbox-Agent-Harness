@@ -23,7 +23,7 @@ const OWNER_ID = "owner";
 
 type RouteStore = {
   authorization: Pick<DomainStore["authorization"], "revoke">;
-  tasks: Pick<DomainStore["tasks"], "recordTrace">;
+  tasks: Pick<DomainStore["tasks"], "recordTrace" | "listAttentionItems">;
   management: Pick<DomainStore["management"], "listConversations" | "listRuns">;
   lifecycle: Pick<DomainStore["lifecycle"], "listDeliveries">;
   evidence: Pick<DomainStore["evidence"], "getTrace">;
@@ -133,6 +133,8 @@ export async function routeManagementRequest(
   };
   const ok = (body: unknown) => ({ status: 200, body });
   try {
+    if (request.method === "GET" && path === "/manage/attention")
+      return ok({ items: await dependencies.store.tasks.listAttentionItems() });
     if (request.method === "GET" && path === "/manage/ops/health" && dependencies.opsHealth) {
       const runId = url.searchParams.get("runId");
       if (!runId || !/^[A-Za-z0-9-]{1,80}$/u.test(runId))
