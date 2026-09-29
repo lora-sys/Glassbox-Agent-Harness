@@ -53,9 +53,9 @@ it("reviews multiple pending candidates from one exact Owner-private command", a
       text: "开始候选审核",
       executionRef: "pi:test",
     });
-    const create = async (statement: string) =>
+    const create = async (statement: string, sourceRunId = initial.run.id) =>
       store.learning.createCandidate(
-        { caller, conversationId: initial.conversation.id, runId: initial.run.id },
+        { caller, conversationId: initial.conversation.id, runId: sourceRunId },
         {
           candidateKind: "assertion",
           subject: { kind: "user", id: "owner" },
@@ -63,7 +63,7 @@ it("reviews multiple pending candidates from one exact Owner-private command", a
           proposedType: "semantic_fact",
           statement,
           content: { statement },
-          source: { kind: "system", ref: `run:${initial.run.id}` },
+          source: { kind: "system", ref: `run:${sourceRunId}` },
           sourceEvidence: [],
           confidence: 0.9,
           mergeHint: { strategy: "manual_review_required" },
@@ -119,6 +119,72 @@ it("reviews multiple pending candidates from one exact Owner-private command", a
       results: rejectIds.map((candidateId) => ({ candidateId, status: "rejected" })),
     });
     expect(await store.learning.listMemories({ caller })).toHaveLength(2);
+
+    const latestIds = [(await create("Fact E")).candidateId, (await create("Fact F")).candidateId];
+    const prose = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: caller.scope,
+      messageId: "ok-prose",
+      text: "这两条都可以",
+      executionRef: "pi:test",
+    });
+    currentRunId = prose.run.id;
+    await expect(
+      tool!.execute("ok-prose", { action: "confirm" }, undefined, undefined, {} as never),
+    ).rejects.toThrow("owner_confirmation_required");
+    const confirmation = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: caller.scope,
+      messageId: "ok-command",
+      text: "/memory ok",
+      executionRef: "pi:test",
+    });
+    currentRunId = confirmation.run.id;
+    const confirmed = await tool!.execute(
+      "ok-command",
+      { action: "confirm" },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    const confirmedResults = (
+      confirmed.details as { results: Array<{ candidateId: string; status: string }> }
+    ).results;
+    expect(confirmedResults.map((result) => result.candidateId).sort()).toEqual(latestIds.sort());
+    expect(confirmedResults.every((result) => result.status === "promoted")).toBe(true);
+    const lastId = (await create("Fact G")).candidateId;
+    const last = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: caller.scope,
+      messageId: "last-command",
+      text: "/memory promote last",
+      executionRef: "pi:test",
+    });
+    currentRunId = last.run.id;
+    const promotedLast = await tool!.execute(
+      "last-command",
+      { action: "promote", id: "last" },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    expect(promotedLast.details).toMatchObject({ lifecycleState: "active" });
+    expect((await store.learning.getCandidate({ caller }, lastId))?.status).toBe("promoted");
+    const sameRun = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: caller.scope,
+      messageId: "same-run-command",
+      text: "/memory ok",
+      executionRef: "pi:test",
+    });
+    currentRunId = sameRun.run.id;
+    const currentCandidate = await create("Fact H", currentRunId);
+    await expect(
+      tool!.execute("same-run-command", { action: "confirm" }, undefined, undefined, {} as never),
+    ).rejects.toThrow("no_pending_conversation_candidates");
+    expect(
+      (await store.learning.getCandidate({ caller }, currentCandidate.candidateId))?.status,
+    ).toBe("pending");
   } finally {
     await store.close();
   }
@@ -214,6 +280,10 @@ it("exposes Owner-only governed Memory operations and rechecks revoked write aut
     expect(await store.learning.listMemories({ caller })).toHaveLength(0);
     const candidateId = (proposed.details as { candidateId: string }).candidateId;
     expect(candidateId).toMatch(/^candidate_[0-9a-f]{32}$/u);
+    expect(proposed.details).toHaveProperty(
+      "confirmationCommand",
+      `/memory promote ${candidateId}`,
+    );
     const confirmation = await store.conversations.acceptIncoming({
       agentId: "personal",
       scope: caller.scope,

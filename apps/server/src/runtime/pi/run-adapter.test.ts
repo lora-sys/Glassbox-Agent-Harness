@@ -1211,6 +1211,28 @@ describe("Pi required Tool execution", () => {
 });
 
 describe("mutation intent comes only from the current user message", () => {
+  it("binds the short Memory confirmation commands to the required Tool", async () => {
+    for (const [text, required] of [
+      ["/memory ok", { action: "confirm" }],
+      ["/memory promote last", { action: "promote", id: "last" }],
+    ] as const) {
+      const f = fixture(
+        [
+          {
+            status: "completed",
+            text: "已处理。",
+            toolCalls: [{ name: OWNER_MEMORY_ADMIN_TOOL, input: required, failed: false }],
+          },
+        ],
+        [OWNER_MEMORY_ADMIN_TOOL],
+      );
+      f.input.text = text;
+      await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+      expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe(OWNER_MEMORY_ADMIN_TOOL);
+      expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual(required);
+    }
+  });
+
   it("binds a batch Memory review to the exact candidate IDs named by the Owner", async () => {
     const ids = [
       "candidate_0123456789abcdef0123456789abcdef",
