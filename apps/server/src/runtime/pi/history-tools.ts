@@ -157,6 +157,19 @@ export interface HistorySyncOutcome {
   pagesWalked: number;
   /** Why it stopped. */
   stop: HistorySyncStop;
+  /**
+   * Messages this walk read and deliberately did not archive, because the bot itself sent them.
+   *
+   * Omitted when zero. The archive is a record of what people said in a group, and the bot's
+   * own replies are not that: on 2026-09-28, 254 of the 633 archived messages were the bot
+   * answering, and later Runs read those answers back as something a person had said — which is
+   * how a group came to believe the bot had introduced itself by a name nobody configured.
+   *
+   * Reported rather than dropped quietly because the count is the only sign the filter ran: a
+   * channel whose `botId` is misconfigured stops dropping anything, and nothing else about the
+   * walk looks different.
+   */
+  skippedOwnMessages?: number;
 }
 
 /**

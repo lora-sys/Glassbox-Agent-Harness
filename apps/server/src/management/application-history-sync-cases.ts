@@ -126,6 +126,49 @@ describe("bounded authorized history synchronization", () => {
     });
   });
 
+  it("does not archive the bot's own replies, and says how many it skipped", async () => {
+    // 254 of the 633 archived messages on 2026-09-28 were the bot answering itself, and later
+    // Runs read those answers back as something a person had said. The count is part of the
+    // outcome because a channel whose `botId` is wrong stops dropping anything, and nothing
+    // else about the walk looks any different.
+    const ownOnEveryPage = (params: { message_seq?: number }) =>
+      paged()(params).map((record) => ({
+        ...record,
+        user_id: 10001,
+        sender: { user_id: 10001, nickname: "Bot" },
+      }));
+    const f = await fixture(async () => ({ status: "succeeded", text: "ok" }), {
+      history: ownOnEveryPage,
+    });
+    await sync(f.app).syncGroupHistory("fixture", "10003", { maxPages: 1 });
+    expect(await storedIds(f.app)).toEqual([]);
+    expect(await sync(f.app).syncGroupHistory("fixture", "10003", { maxPages: 10 })).toEqual({
+      pagesWalked: 5,
+      stop: "end_of_source",
+      skippedOwnMessages: 12,
+    });
+
+    // A page that mixes both is archived for the people and skipped for the bot — on every
+    // page, not just the first one the walk happens to open on.
+    const mixed = (params: { message_seq?: number }) =>
+      paged()(params).map((record, index) =>
+        index === 0
+          ? { ...record, user_id: 10001, sender: { user_id: 10001, nickname: "Bot" } }
+          : record,
+      );
+    const g = await fixture(async () => ({ status: "succeeded", text: "ok" }), {
+      history: mixed,
+    });
+    expect(await sync(g.app).syncGroupHistory("fixture", "10003", { maxPages: 10 })).toEqual({
+      pagesWalked: 5,
+      stop: "end_of_source",
+      skippedOwnMessages: 4,
+    });
+    const stored = await storedIds(g.app);
+    expect(stored).toHaveLength(8);
+    for (const own of ["12", "9", "6", "3"]) expect(stored).not.toContain(own);
+  });
+
   it("names the bound a walk stopped on instead of calling it the end of the source", async () => {
     const f = await fixture(async () => ({ status: "succeeded", text: "ok" }), {
       history: paged(),

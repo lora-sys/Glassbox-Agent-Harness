@@ -118,6 +118,7 @@ import {
   createHistoryTools,
   historyToolEligibility,
   type HistorySyncOutcome,
+  type HistorySyncStop,
   OWNER_HISTORY_ACTION,
   OWNER_HISTORY_RESOURCE,
 } from "../runtime/pi/history-tools.js";
@@ -3361,7 +3362,7 @@ export class ManagementApplication {
    * the same cursor twice), on a page older than `since`, and on the page bound — so it can
    * never loop forever. Ingest is deduped by (channel, connection, group, external message
    * id) and by message id within one walk, so repeated syncs are idempotent and never
-   * create Runs.
+   * create Runs. Messages the bot itself sent are skipped and counted, not archived.
    */
   private async syncGroupHistory(
     connectionId: string,
@@ -3374,6 +3375,9 @@ export class ManagementApplication {
     const seen = new Set<string>();
     let cursor: string | undefined;
     let pagesWalked = 0;
+    let skippedOwnMessages = 0;
+    const done = (stop: HistorySyncStop): HistorySyncOutcome =>
+      skippedOwnMessages === 0 ? { pagesWalked, stop } : { pagesWalked, stop, skippedOwnMessages };
     for (let page = 0; page < maxPages; page += 1) {
       const result = await connection.getGroupHistory({
         groupId,
@@ -3381,15 +3385,13 @@ export class ManagementApplication {
         count: HISTORY_SYNC_PAGE_SIZE,
       });
       if (result.status !== "ok")
-        return {
-          pagesWalked,
-          stop:
-            result.status === "unknown"
-              ? "provider_unknown"
-              : result.code === "not_connected"
-                ? "provider_unavailable"
-                : "provider_failed",
-        };
+        return done(
+          result.status === "unknown"
+            ? "provider_unknown"
+            : result.code === "not_connected"
+              ? "provider_unavailable"
+              : "provider_failed",
+        );
       pagesWalked += 1;
       let reachedBound = false;
       let newMessages = 0;
@@ -3401,6 +3403,13 @@ export class ManagementApplication {
         if (options.until && message.occurredAt > options.until) continue;
         if (seen.has(message.messageId)) continue;
         seen.add(message.messageId);
+        // The bot's own replies are not what people said. They are filtered here rather than at
+        // retrieval because nothing downstream can un-see them once archived, and they are
+        // counted so a misconfigured `botId` shows up as a count that stopped moving.
+        if (message.senderId === connection.config.botId) {
+          skippedOwnMessages += 1;
+          continue;
+        }
         newMessages += 1;
         await this.archive.ingest({
           channel: "qq-onebot",
@@ -3416,22 +3425,18 @@ export class ManagementApplication {
       }
       const next = result.nextCursor;
       if (next === undefined)
-        return {
-          pagesWalked,
-          stop: result.messages.length === 0 ? "end_of_source" : "provider_unknown",
-        };
+        return done(result.messages.length === 0 ? "end_of_source" : "provider_unknown");
       if (next === cursor)
-        return {
-          pagesWalked,
-          // NapCat's reverse history page includes the cursor record itself. A one-record
-          // page containing only the already-seen cursor is its end-of-source signal. A
-          // larger repeated page is still a stalled provider and must remain partial.
-          stop: newMessages === 0 && result.messages.length <= 1 ? "end_of_source" : "cursor_stuck",
-        };
+        // NapCat's reverse history page includes the cursor record itself. A one-record
+        // page containing only the already-seen cursor is its end-of-source signal. A
+        // larger repeated page is still a stalled provider and must remain partial.
+        return done(
+          newMessages === 0 && result.messages.length <= 1 ? "end_of_source" : "cursor_stuck",
+        );
       cursor = next;
-      if (reachedBound) return { pagesWalked, stop: "since_bound_reached" };
+      if (reachedBound) return done("since_bound_reached");
     }
-    return { pagesWalked, stop: "page_bound_reached" };
+    return done("page_bound_reached");
   }
 
   private async manageGroup(

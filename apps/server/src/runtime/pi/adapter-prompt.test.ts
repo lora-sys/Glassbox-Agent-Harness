@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { identityRulesClause, requiredEvidencePromptClause } from "./adapter.js";
+import {
+  glassboxSystemPrompt,
+  identityRulesClause,
+  requiredEvidencePromptClause,
+} from "./adapter.js";
 
 describe("requiredEvidencePromptClause", () => {
   it("guides explicit browser observations without claiming they require QQ group changes", () => {
@@ -41,6 +45,31 @@ describe("requiredEvidencePromptClause", () => {
     expect(prompt).toContain("group_history_search with a filter taken from the user's own words");
     // The rest of the instruction is unchanged: the observation still has to precede the answer.
     expect(prompt).toContain("before reporting the requested facts");
+  });
+});
+
+describe("glassboxSystemPrompt", () => {
+  it("forbids naming the model in a private chat as well as a group", () => {
+    // Three group Runs on 2026-09-28 described the model they run on. The rule that was
+    // supposed to stop it sat at the tail of the group identity clause behind an "unless you
+    // are asked directly" door — which is not a limit, because "what model are you" is always
+    // a direct question — and a private chat had no such rule at all.
+    for (const sharedConversation of [true, false]) {
+      const prompt = glassboxSystemPrompt("base", { sharedConversation });
+      expect(prompt).toContain("Never name the model, provider, version, training data");
+      expect(prompt).toContain("not something this Run's evidence can confirm");
+      expect(prompt).not.toContain("unless you are asked directly");
+    }
+  });
+
+  it("keeps the group audience rules out of a private chat", () => {
+    const group = glassboxSystemPrompt("base", { sharedConversation: true });
+    const priv = glassboxSystemPrompt("base", { sharedConversation: false });
+    expect(group).toContain("a long answer in a group is noise");
+    expect(group).toContain("Never claim that you tested, measured, verified or ran");
+    expect(priv).not.toContain("a long answer in a group is noise");
+    // The rule is not repeated in both places: one wording, one home.
+    expect(priv).not.toContain("Never claim that you tested");
   });
 });
 
