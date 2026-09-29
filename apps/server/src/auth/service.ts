@@ -323,6 +323,56 @@ export class AuthorizationService {
     });
   }
 
+  /**
+   * Gives `delivery:send` to every Principal that can already read a content source, in the
+   * exact scope where they can read it. Returns how many grants it added.
+   *
+   * Reading a source and delivering what it produced are two rows, and a grant introduced
+   * later only reaches the scopes the provisioning path knows about. A group member is
+   * addressed at runtime, so their scope is not in the Channel configuration and never
+   * appears in it: the backfill has to read the grants that exist rather than recreate the
+   * ones it would create.
+   */
+  async backfillDeliveryForReaders(input: {
+    resourceId: string;
+    readAction: string;
+  }): Promise<number> {
+    for (const value of [input.resourceId, input.readAction]) requireIdentifier(value);
+    return this.db.transaction(async (tx) => {
+      const readers = await tx.execute({
+        sql: `SELECT DISTINCT principal_id, scope_key FROM grants
+          WHERE resource_id = ? AND action = ? AND effect = 'allow' AND revoked_at IS NULL`,
+        args: [input.resourceId, input.readAction],
+      });
+      let added = 0;
+      for (const row of readers.rows) {
+        const principalId = stringColumn(row, "principal_id");
+        const key = stringColumn(row, "scope_key");
+        const existing = await tx.execute({
+          sql: `SELECT id FROM grants
+            WHERE principal_id = ? AND resource_id = ? AND action = 'delivery:send'
+              AND scope_key = ? AND effect = 'allow' AND revoked_at IS NULL LIMIT 1`,
+          args: [principalId, input.resourceId, key],
+        });
+        if (existing.rows[0]) continue;
+        await tx.execute({
+          sql: "INSERT INTO grants(id, principal_id, resource_id, action, scope_key, effect, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+          args: [
+            randomUUID(),
+            principalId,
+            input.resourceId,
+            "delivery:send",
+            key,
+            "allow",
+            new Date().toISOString(),
+          ],
+        });
+        added += 1;
+      }
+      return added;
+    });
+  }
+
   async revokeScope(input: {
     principalId: string;
     resourceId: string;

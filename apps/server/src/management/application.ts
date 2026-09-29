@@ -2620,6 +2620,15 @@ export class ManagementApplication {
       ];
       for (const scope of visitorScopes) await this.grantScope(scope, principalId);
     }
+
+    // Group members are addressed at runtime, so their scopes are provisioned after this
+    // loop has already run. A content-source grant they already hold must carry the delivery
+    // grant it implies, or their answers are denied at delivery time with nothing to show
+    // for the work the Run did.
+    await this.store.authorization.backfillDeliveryForReaders({
+      resourceId: SKILL_CATALOG_RESOURCE,
+      readAction: SKILL_READ_ACTION,
+    });
   }
 
   /**
