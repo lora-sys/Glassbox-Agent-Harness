@@ -2,7 +2,7 @@ import { mkdir } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { QQ_SOURCE_CLASSES, type AgentRun, type Conversation } from "@glassbox/contracts";
-import type { Model } from "@earendil-works/pi-ai";
+import type { ImageContent, Model } from "@earendil-works/pi-ai";
 import {
   createAgentSession,
   DefaultResourceLoader,
@@ -171,24 +171,56 @@ function textFromContent(content: unknown): string {
     .join("");
 }
 
-function estimateStructuredTokens(value: unknown): number {
+const IMAGE_PAYLOAD_TOKEN_RATE = 4;
+const IMAGE_PAYLOAD_TOKEN_OVERHEAD = 256;
+
+function estimateImagePayloadTokens(bytes: number): number {
+  return IMAGE_PAYLOAD_TOKEN_OVERHEAD + Math.ceil(bytes / 1024) * IMAGE_PAYLOAD_TOKEN_RATE;
+}
+
+function imageDataUrlBytes(value: string): number | undefined {
+  const match = /^data:image\/[a-z0-9.+-]+;base64,([A-Za-z0-9+/]*={0,2})$/iu.exec(value);
+  return match ? Math.floor((match[1]!.length * 3) / 4) : undefined;
+}
+
+export function estimateStructuredTokens(value: unknown): number {
   let visited = 0;
   let tokens = 0;
-  const visit = (current: unknown, depth: number): void => {
+  const visit = (current: unknown, depth: number, imageContext = false): void => {
     if (++visited > 16_384 || depth > 24) {
       tokens = Number.MAX_SAFE_INTEGER;
       return;
     }
-    if (typeof current === "string") tokens += estimateUnicodeTokens(current);
-    else if (typeof current === "number" || typeof current === "boolean") tokens += 1;
+    if (typeof current === "string") {
+      const bytes = imageContext ? imageDataUrlBytes(current) : undefined;
+      tokens +=
+        bytes === undefined ? estimateUnicodeTokens(current) : estimateImagePayloadTokens(bytes);
+    } else if (current instanceof Uint8Array) {
+      tokens += imageContext ? estimateImagePayloadTokens(current.byteLength) : current.byteLength;
+    } else if (typeof current === "number" || typeof current === "boolean") tokens += 1;
     else if (Array.isArray(current)) {
       tokens += 2;
-      for (const item of current) visit(item, depth + 1);
+      for (const item of current) visit(item, depth + 1, imageContext);
     } else if (current && typeof current === "object") {
+      const record = current as Record<string, unknown>;
+      const isImage =
+        imageContext ||
+        record.type === "image" ||
+        record.type === "image_url" ||
+        record.type === "input_image";
+      const imageBytes = isImage
+        ? record.data instanceof Uint8Array
+          ? record.data.byteLength
+          : typeof record.data === "string"
+            ? Math.floor((record.data.length * 3) / 4)
+            : undefined
+        : undefined;
+      if (imageBytes !== undefined) tokens += estimateImagePayloadTokens(imageBytes);
       tokens += 2;
-      for (const [key, item] of Object.entries(current)) {
+      for (const [key, item] of Object.entries(record)) {
+        if (isImage && key === "data") continue;
         tokens += estimateUnicodeTokens(key) + 1;
-        visit(item, depth + 1);
+        visit(item, depth + 1, isImage);
         if (tokens >= Number.MAX_SAFE_INTEGER) return;
       }
     }
@@ -841,7 +873,7 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
             if (!projection.ok) {
               active.contextBudgetEvidence = {
                 policyVersion: "p5a-context-v1",
-                estimateSource: "unicode_conservative",
+                estimateSource: "unicode_and_bounded_image_bytes",
                 overflow: projection.overflow.kind,
                 capacityTokens: capacity.contextWindowTokens,
               };
@@ -1184,6 +1216,10 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
     return this.sessions.get(runtimeSessionId)?.modelCapacity;
   }
 
+  getModelSupportsImages(runtimeSessionId: string): boolean {
+    return this.sessions.get(runtimeSessionId)?.session.model?.input.includes("image") === true;
+  }
+
   getStaticContextEstimate(
     runtimeSessionId: string,
   ): { systemTokens: number; toolSchemaTokens: number } | undefined {
@@ -1200,6 +1236,14 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
     if (!active || active.binding.conversationId !== binding.conversationId) {
       throw new Error("Pi session binding is not active for this Conversation");
     }
+    const images = context?.images;
+    if (images?.length && active.session.model?.input.includes("image") !== true)
+      return {
+        status: "error",
+        text: "当前配置的模型不支持识别图片，因此没有发送图片。请切换到支持视觉输入的模型后重试。",
+        toolCalls: [],
+        error: "model_does_not_support_images",
+      };
     if (
       run.conversationId !== binding.conversationId ||
       (context?.runId !== undefined && context.runId !== run.id) ||
@@ -1307,7 +1351,18 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
     });
     try {
       active.pendingBudgetFailure = undefined;
-      await active.session.prompt(prompt, { source: "rpc" });
+      await active.session.prompt(prompt, {
+        source: "rpc",
+        ...(images?.length
+          ? {
+              images: images.map((image): ImageContent => ({
+                type: "image",
+                data: image.data,
+                mimeType: image.mimeType,
+              })),
+            }
+          : {}),
+      });
       await eventQueue;
       if (active.pendingBudgetFailure)
         return {

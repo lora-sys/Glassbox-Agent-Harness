@@ -20,6 +20,7 @@ import {
   type OneBotIngressDiagnostic,
   type OneBotState,
 } from "../channels/onebot/index.js";
+import { fitsIncomingImageBudget } from "../channels/onebot/image-input.js";
 import {
   RunService,
   type ExecutionInput,
@@ -69,6 +70,7 @@ import { AgnesMediaProvider } from "../media/agnes-media-provider.js";
 import { MediaProviderRegistry } from "../media/provider-registry.js";
 import type { MediaGenerationProvider } from "../media/provider.js";
 import { dohResolveWebHost } from "../web/network-guard.js";
+import type { IncomingImage, IncomingImageFailure } from "../conversation/store.js";
 import {
   isWebCapabilityEnabled,
   WEB_CAPABILITIES,
@@ -93,11 +95,15 @@ import {
   OWNER_MEMORY_ADMIN_TOOL,
 } from "../runtime/pi/owner-memory-tools.js";
 import {
+  GROUP_MEMORY_CANDIDATE_WRITE_ACTION,
+  GROUP_MEMORY_READ_ACTION,
+  type CandidateCreate,
   MEMORY_GOVERN_ACTION,
   MEMORY_READ_ACTION,
   MEMORY_WRITE_ACTION,
   OWNER_MEMORY_RESOURCE,
 } from "../learning/store.js";
+import { classifyAutoCapture } from "../learning/auto-capture.js";
 import {
   createMediaGenerationTools,
   MEDIA_GENERATION_RESOURCE,
@@ -427,6 +433,68 @@ export class ManagementApplication {
     this.runs = new RunService({
       store,
       resolveExecution: (reference) => this.execution(reference),
+      captureLearning: async (input) => {
+        const isOwner = await this.store.identities.isOwner(input.caller.principalId);
+        if (!isOwner) return undefined;
+        const group = input.caller.scope.chatType === "group";
+        const descriptor = classifyAutoCapture({
+          text: input.text,
+          actor: "owner",
+          role: "user",
+          scope: group
+            ? {
+                type: "group",
+                connectionId: input.caller.scope.connectionId,
+                botId: input.caller.scope.botId,
+                groupId: input.caller.scope.chatId,
+              }
+            : { type: "private" },
+          origin: "current_message",
+          messageRef: `run:${input.run.id}`,
+        });
+        if (!descriptor) return undefined;
+        const evidenceRef = `run:${input.run.id}`;
+        const operation = {
+          caller: input.caller,
+          conversationId: input.conversation.id,
+          runId: input.run.id,
+        };
+        const candidateInput: CandidateCreate = {
+          candidateKind:
+            descriptor.evidence.kind === "explicit_correction" ? "correction" : "assertion",
+          subject: { kind: "user", id: input.caller.principalId },
+          scope: descriptor.scope,
+          proposedType: descriptor.type,
+          statement: descriptor.statement,
+          content: {
+            statement: descriptor.statement,
+            ...(descriptor.type === "preference" ? { preference: descriptor.statement } : {}),
+          },
+          source: { kind: "chat", ref: evidenceRef },
+          sourceEvidence: [
+            {
+              evidenceId: randomUUID(),
+              kind: "chat_message",
+              ref: evidenceRef,
+              capturedAt: new Date().toISOString(),
+              trustLevel: "high",
+              metadata: { signalKind: descriptor.evidence.kind },
+            },
+          ],
+          confidence: descriptor.confidence,
+          sensitivity: group ? "public" : "confidential",
+          mergeHint: { strategy: "manual_review_required" },
+          extensions: { "glassbox:auto-capture": true },
+        };
+        const candidate = group
+          ? await this.store.learning.createGroupCandidate(
+              operation,
+              groupResourceId(input.caller.scope.chatId),
+              candidateInput,
+            )
+          : await this.store.learning.createCandidate(operation, candidateInput);
+        return candidate.candidateId;
+      },
       transport: {
         send: async ({ destination, delivery, signal }) => {
           if (signal.aborted) return { status: "failed" };
@@ -1134,6 +1202,7 @@ export class ManagementApplication {
     });
     const adapter = new PiRunExecutionAdapter(runtime, {
       isOwner: (input) => this.store.identities.isOwner(input.caller.principalId),
+      learningStore: this.store.learning,
       listModelProfiles: () => this.selectableModelProfiles(),
       resolveProfileName: async (input) =>
         piProfileName(
@@ -1148,6 +1217,12 @@ export class ManagementApplication {
       onBudgetEvidence: async (record) => {
         const caller = await this.store.lifecycle.traceCaller(record.runId, record.principalId);
         const cursor = await this.trace.append(record.runId, record, "glassbox-context-budget");
+        await this.store.evidence.advanceTrace(caller, cursor);
+      },
+      onLearningEvidence: async (record) => {
+        const caller = await this.store.lifecycle.traceCaller(record.runId, record.principalId);
+        if (!caller) return;
+        const cursor = await this.trace.append(record.runId, record, "glassbox-learning-context");
         await this.store.evidence.advanceTrace(caller, cursor);
       },
     });
@@ -2230,7 +2305,8 @@ export class ManagementApplication {
         : this.serialize(() => this.provisionConfiguredAccess(configured));
       return provisionPromise;
     };
-    const adapter = new OneBotAdapter({
+    let adapter!: OneBotAdapter;
+    adapter = new OneBotAdapter({
       config: configured.config,
       token: configured.token,
       onState: (state) => {
@@ -2266,7 +2342,10 @@ export class ManagementApplication {
           // current profile instead of preserving the connect-time allowlist in this closure.
           await this.provisionAddressedGroupMember(this.channels.resolve(id), message.scope);
         }
-        const control = /^\/(status|cancel)\s+([a-zA-Z0-9-]{1,80})\s*$/u.exec(message.text);
+        const hasImage = message.parts.some((part) => part.type === "image");
+        const control = hasImage
+          ? null
+          : /^\/(status|cancel)\s+([a-zA-Z0-9-]{1,80})\s*$/u.exec(message.text);
         if (control) {
           const caller = await this.store.identities.resolve(message.scope);
           if (!caller) return;
@@ -2289,12 +2368,43 @@ export class ManagementApplication {
           ownerPrivate && channelSelection.modelOverrideProfileId && executionKind
             ? `${executionKind}:${channelSelection.modelOverrideProfileId}`
             : configured.executionRef;
+        const images: IncomingImage[] = [];
+        let imageFailureCode: IncomingImageFailure | undefined;
+        if (hasImage) {
+          const caller = await this.store.identities.resolve(message.scope);
+          const authorization = caller
+            ? await this.store.authorization.check({
+                caller,
+                resourceId: agentResourceId(AGENT_ID),
+                action: "run:create",
+              })
+            : undefined;
+          if (authorization?.decision === "ALLOW") {
+            let totalImageBytes = 0;
+            for (const part of message.parts) {
+              if (part.type !== "image") continue;
+              const result = await adapter.getImage(part.file, signal);
+              if (result.status !== "ok") {
+                imageFailureCode = result.code;
+                break;
+              }
+              if (!fitsIncomingImageBudget(totalImageBytes, result.image.data.length)) {
+                imageFailureCode = "image_too_large";
+                break;
+              }
+              totalImageBytes += result.image.data.length;
+              images.push(result.image);
+            }
+          }
+        }
+        if (imageFailureCode) images.length = 0;
         const accepted = await this.store.conversations.acceptIncoming({
           agentId: AGENT_ID,
           scope: message.scope,
           messageId: message.messageId,
-          text: message.text,
+          text: message.text || (hasImage ? "请描述这张图片。" : ""),
           executionRef: runExecutionRef,
+          ...(imageFailureCode ? { imageFailureCode } : images.length > 0 ? { images } : {}),
         });
         if (!accepted.duplicate && message.scope.nativeGroupRole) {
           const cursor = await this.trace.append(
@@ -3022,14 +3132,16 @@ export class ManagementApplication {
    */
   private groupRunActions(): string[] {
     return [
-      ...new Set(
-        QQ_CAPABILITIES.filter(
+      ...new Set([
+        ...QQ_CAPABILITIES.filter(
           (capability) =>
             capability.resource === "group" &&
             (GROUP_RUN_CAPABILITY_CATEGORIES.includes(capability.category) ||
               capability.nativeGroupRoles !== undefined),
         ).map((capability) => capability.action),
-      ),
+        GROUP_MEMORY_READ_ACTION,
+        GROUP_MEMORY_CANDIDATE_WRITE_ACTION,
+      ]),
     ];
   }
 

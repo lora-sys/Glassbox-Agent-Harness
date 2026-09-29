@@ -108,6 +108,33 @@ afterEach(async () => {
 });
 
 describe("shared group conversation and durable actor routing", () => {
+  it("persists private image input and rechecks Conversation authorization before reading it", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "glassbox-private-image-input-"));
+    tempDirectories.push(directory);
+    const databasePath = join(directory, "glassbox.db");
+    let store = await setupStore(databasePath);
+    const image = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADUlEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+      "base64",
+    );
+    const accepted = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: ownerPrivate.scope,
+      messageId: "private-image-input-1",
+      text: "这张图是什么？",
+      executionRef: "pi:test",
+      images: [{ mimeType: "image/png", data: image }],
+    });
+    await store.close();
+    stores.splice(stores.indexOf(store), 1);
+    store = await openStore(databasePath);
+    const input = await store.conversations.loadRunInput(ownerPrivate, accepted.run.id);
+    expect(input.images).toEqual([{ mimeType: "image/png", data: image.toString("base64") }]);
+    await expect(
+      store.conversations.loadRunInput(visitorPrivate, accepted.run.id),
+    ).rejects.toBeInstanceOf(AccessDeniedError);
+  });
+
   it("includes a failed clarification in later context only after its reply was delivered", async () => {
     const store = await setupStore();
     const clarification = await store.conversations.acceptIncoming({
@@ -1088,7 +1115,7 @@ describe("shared group conversation and durable actor routing", () => {
     // 10. Verify all current migrations completed. V7 adds the P4B channel history
     // archive (channel_messages + FTS index) and group capability policies.
     const ver = await rawCheck.execute("PRAGMA user_version");
-    expect(Number(ver.rows[0]?.user_version)).toBe(11);
+    expect(Number(ver.rows[0]?.user_version)).toBe(12);
 
     rawCheck.close();
   });

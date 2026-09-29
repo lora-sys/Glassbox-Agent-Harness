@@ -62,11 +62,25 @@ export interface IncomingMessage {
   text: string;
   executionRef: string;
   approvalId?: string;
+  images?: readonly IncomingImage[];
+  imageFailureCode?: IncomingImageFailure;
+}
+export type IncomingImageMimeType = "image/png" | "image/jpeg" | "image/webp";
+export type IncomingImageFailure =
+  | "image_unavailable"
+  | "image_invalid"
+  | "image_too_large"
+  | "image_timeout";
+export interface IncomingImage {
+  mimeType: IncomingImageMimeType;
+  data: Buffer;
 }
 export interface RunInputRecord {
   run: RunRecord;
   conversation: ConversationRecord;
   text: string;
+  images?: Array<{ mimeType: IncomingImageMimeType; data: string }>;
+  imageFailureCode?: IncomingImageFailure;
   history: Array<{ role: "user" | "assistant"; text: string }>;
   /** One Run id per complete user/assistant exchange in history. */
   historyRunIds?: string[];
@@ -326,6 +340,20 @@ export class ConversationStore {
     requireIdentifier(input.executionRef);
     if (typeof input.text !== "string" || input.text.length > 64_000)
       throw new Error("Message exceeds the accepted text limit");
+    const images = input.images ?? [];
+    if (
+      images.length > 4 ||
+      (input.imageFailureCode !== undefined && images.length > 0) ||
+      images.some(
+        (image) =>
+          !["image/png", "image/jpeg", "image/webp"].includes(image.mimeType) ||
+          !Buffer.isBuffer(image.data) ||
+          image.data.length < 1 ||
+          image.data.length > 8 * 1024 * 1024,
+      ) ||
+      images.reduce((sum, image) => sum + image.data.length, 0) > 16 * 1024 * 1024
+    )
+      throw new Error("Invalid incoming image attachments");
     const key = scopeKey(input.scope);
     const convKey = conversationScopeKey(input.scope);
     const outcome = await this.db.transaction<
@@ -490,6 +518,19 @@ export class ConversationStore {
           now,
         ],
       });
+      if (input.imageFailureCode) {
+        await tx.execute({
+          sql: "INSERT INTO message_attachments(message_id, ordinal, status, failure_code) VALUES (?, 0, 'failed', ?)",
+          args: [messageId, input.imageFailureCode],
+        });
+      } else {
+        for (const [ordinal, image] of images.entries()) {
+          await tx.execute({
+            sql: "INSERT INTO message_attachments(message_id, ordinal, status, mime_type, image_bytes, size_bytes) VALUES (?, ?, 'ready', ?, ?, ?)",
+            args: [messageId, ordinal, image.mimeType, image.data, image.data.length],
+          });
+        }
+      }
       const run: RunRecord = {
         id: runId,
         conversationId: conversation.id,
@@ -681,6 +722,35 @@ export class ConversationStore {
         });
         const row = rows.rows[0]!;
         const run = runRecord(row);
+        const attachmentRows = await tx.execute({
+          sql: "SELECT status, mime_type, image_bytes, failure_code FROM message_attachments WHERE message_id = ? ORDER BY ordinal",
+          args: [run.messageId],
+        });
+        const imageFailureCode = attachmentRows.rows.find(
+          (attachment) => attachment.status === "failed",
+        )?.failure_code;
+        const images =
+          imageFailureCode === undefined
+            ? attachmentRows.rows.map((attachment) => {
+                const mimeType = attachment.mime_type as IncomingImageMimeType;
+                const imageBytes = attachment.image_bytes;
+                const bytes =
+                  imageBytes instanceof Uint8Array
+                    ? imageBytes
+                    : imageBytes instanceof ArrayBuffer
+                      ? new Uint8Array(imageBytes)
+                      : undefined;
+                if (
+                  attachment.status !== "ready" ||
+                  (mimeType !== "image/png" &&
+                    mimeType !== "image/jpeg" &&
+                    mimeType !== "image/webp") ||
+                  bytes === undefined
+                )
+                  throw new Error("Invalid persisted image attachment");
+                return { mimeType, data: Buffer.from(bytes).toString("base64") };
+              })
+            : [];
         const conversations = await tx.execute({
           sql: "SELECT * FROM conversations WHERE id = ?",
           args: [run.conversationId],
@@ -778,23 +848,26 @@ export class ConversationStore {
           conversation.providerKind === run.executionRef && sessionPrincipal === caller.principalId
             ? conversation.providerSessionId
             : null;
-        return {
-          value: {
-            run,
-            conversation: {
-              ...conversation,
-              providerKind: providerSessionId ? run.executionRef : null,
-              providerSessionId,
-              providerSessionPrincipalId: providerSessionId ? caller.principalId : null,
-            },
-            text: stringColumn(row, "input_text"),
-            history,
-            historyRunIds: exchanges.map((exchange) => exchange.runId),
-            historyScanTruncated,
-            historyOmittedRunIds: omittedRunIds,
+        const inputRecord: RunInputRecord = {
+          run,
+          conversation: {
+            ...conversation,
+            providerKind: providerSessionId ? run.executionRef : null,
             providerSessionId,
+            providerSessionPrincipalId: providerSessionId ? caller.principalId : null,
           },
+          text: stringColumn(row, "input_text"),
+          ...(images.length ? { images } : {}),
+          ...(typeof imageFailureCode === "string"
+            ? { imageFailureCode: imageFailureCode as IncomingImageFailure }
+            : {}),
+          history,
+          historyRunIds: exchanges.map((exchange) => exchange.runId),
+          historyScanTruncated,
+          historyOmittedRunIds: omittedRunIds,
+          providerSessionId,
         };
+        return { value: inputRecord };
       }),
     );
   }

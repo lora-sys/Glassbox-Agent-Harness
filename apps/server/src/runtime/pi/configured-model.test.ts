@@ -17,6 +17,7 @@ it("uses the selected Glassbox profile and resolves changes for each Pi Session"
       baseUrl: "http://127.0.0.1:1/v1",
       model: "first",
       apiKey: "test-secret",
+      supportsVision: true,
       contextWindowTokens: 8192,
       maxOutputTokens: 1024,
     };
@@ -26,6 +27,7 @@ it("uses the selected Glassbox profile and resolves changes for each Pi Session"
       id: "first",
       api: "openai-completions",
       baseUrl: config.baseUrl,
+      input: ["text", "image"],
     });
     expect(JSON.stringify(first.model)).not.toContain("test-secret");
     await profiles.save({ ...config, model: "second", protocol: "anthropic-messages" });

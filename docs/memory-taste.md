@@ -5,9 +5,11 @@
 The Owner-private `owner_memory_admin` Tool reads the current persisted Run input before
 changing canonical Memory. A model-suggested `write` or `supersede` creates a pending
 candidate; it cannot use a prompt description as confirmation. The Owner can inspect
-the candidate and send `/memory promote <candidate-id>` in a later message. Exact
-`/memory reject <candidate-id>` and `/memory expire|revoke|retire <memory-id>` commands
-govern lifecycle. An explicit write uses
+all pending candidates together with `/memory candidates`, then promote or reject up to
+20 candidates in one Owner-private message with `/memory promote <candidate-id> <candidate-id>`
+or `/memory reject <candidate-id> <candidate-id>`. A single candidate may also be reviewed
+with one ID. Exact `/memory expire|revoke|retire <memory-id>` commands govern lifecycle.
+An explicit write uses
 `/memory write global|project:<project-id> <memory-type> <statement>`; an explicit
 correction uses `/memory supersede <memory-id> <statement>` and inherits the original
 scope and type. `/memory feedback global|project:<project-id> <signal> <statement>`
@@ -235,6 +237,18 @@ global
 project
   preference specific to one Glassbox Project / repository context
 ```
+
+## Owner learning loop and QQ group Memory
+
+Issue #37 extends the completed P4 storage and retrieval paths into normal Runs.
+
+- Clear Owner-authored preferences, corrections, and explicit remember requests create pending candidates. A private Owner conversation proposes global scope. A group Run proposes only that exact QQ connection, bot, and group scope.
+- Visitor messages, quoted text, retrieved history, Tool output, credentials, and ambiguous group statements do not create candidates automatically. The Owner can import authorized group history into candidates with the Owner-private Memory Tool.
+- Pending candidates are available together through `/memory candidates`. No per-candidate private notification is sent. Only an explicit Owner review can promote a candidate.
+- Active global Memory is read only in Owner-private Runs. Active public group Memory is read only in Runs from its exact QQ group scope. Group Memory never becomes global or project Memory.
+- The Runtime selects a bounded set of active preferences and relevant facts. It records Memory IDs and counts in Trace, not statements. Selected context is included in the P5 token budget; optional learning context is dropped first if it would overflow the model capacity.
+
+Group scope is `{ connectionId, botId, groupId }`. QQ-native group roles do not grant Memory authority. The group Resource and current Run authorization gate group candidate writes and active group reads.
 
 Future scopes may include repository, path, language, framework, team, or task class only when a real need appears.
 

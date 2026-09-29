@@ -112,6 +112,7 @@ function service(
     concurrency?: number;
     deliveryTimeoutMs?: number;
     prepareDelivery?: ConstructorParameters<typeof RunService>[0]["prepareDelivery"];
+    captureLearning?: ConstructorParameters<typeof RunService>[0]["captureLearning"];
   } = {},
 ) {
   const events: RunServiceEvent[] = [];
@@ -194,6 +195,45 @@ afterEach(async () => {
 });
 
 describe("durable Run scheduling", () => {
+  it("captures learning only after Run authorization and records candidate identity without payload", async () => {
+    const { store } = await fixture();
+    const order: string[] = [];
+    let captured: ExecutionInput | undefined;
+    const execute = vi.fn(async () => {
+      order.push("execute");
+      return { status: "succeeded" as const, text: "answer" };
+    });
+    const adapter: RunExecutionAdapter = {
+      supportsGroup: true,
+      execute,
+    };
+    const { instance, events } = service(store, adapter, undefined, {
+      captureLearning: async (value) => {
+        order.push("capture");
+        captured = value;
+        return "candidate_safe_id";
+      },
+    });
+    await instance.start();
+    const accepted = await instance.receive(input("learned", "请记住本群周三开会"));
+    await instance.waitForRun(owner(), accepted.run.id);
+
+    expect(captured).toMatchObject({
+      text: "请记住本群周三开会",
+      caller: owner(),
+      run: { id: accepted.run.id },
+    });
+    expect(order).toEqual(["capture", "execute"]);
+    expect(events).toContainEqual({
+      type: "learning_candidate_created",
+      runId: accepted.run.id,
+      conversationId: accepted.conversation.id,
+      candidateId: "candidate_safe_id",
+      scopeType: "group",
+    });
+    expect(JSON.stringify(events)).not.toContain("周三开会");
+  });
+
   it("serializes each Conversation, bounds global concurrency, and isolates prior context", async () => {
     const { store } = await fixture();
     const control = controlledAdapter();

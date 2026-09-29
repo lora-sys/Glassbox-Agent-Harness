@@ -483,13 +483,7 @@ describe("local domain foundation", () => {
   it("keeps delivery creation order when created_at values tie", async () => {
     const store = await fixture();
     const running = await receive(store, "running");
-    const kinds = [
-      "result",
-      "browser_artifact",
-      "ack",
-      "media_artifact",
-      "text",
-    ] as const;
+    const kinds = ["result", "browser_artifact", "ack", "media_artifact", "text"] as const;
     vi.useFakeTimers({ toFake: ["Date"] });
     try {
       vi.setSystemTime(new Date("2026-09-28T12:00:00.000Z"));

@@ -3,7 +3,6 @@ import { dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createClient, type Client, type Transaction, type Row } from "@libsql/client";
 import {
-  CURRENT_SCHEMA_VERSION,
   schema,
   schemaV2Migration,
   schemaV3Migration,
@@ -15,6 +14,8 @@ import {
   schemaV9Migration,
   schemaV10Migration,
   schemaV11Migration,
+  schemaV12Migration,
+  CURRENT_SCHEMA_VERSION,
 } from "./schema.js";
 
 export function localDatabaseUrl(databasePath: string): string {
@@ -82,6 +83,7 @@ export class DomainDatabase {
           if (version < 9) await tx.batch(schemaV9Migration);
           if (version < 10) await tx.batch(schemaV10Migration);
           if (version < 11) await tx.batch(schemaV11Migration);
+          if (version < 12) await tx.batch(schemaV12Migration);
           await tx.execute(`PRAGMA user_version = ${CURRENT_SCHEMA_VERSION}`);
         }
       });

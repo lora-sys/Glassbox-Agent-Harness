@@ -1,6 +1,9 @@
 import { once } from "node:events";
 import { Buffer } from "node:buffer";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import {
@@ -1094,5 +1097,43 @@ describe("OneBot forward WebSocket", () => {
     socket.send(JSON.stringify(inbound({ message: "x".repeat(513 * 1024) })));
     await states.next((state) => state.status === "reconnecting");
     expect(calls).toBe(0);
+  });
+
+  it("retrieves a normalized image token through authenticated get_image", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "glassbox-onebot-get-image-"));
+    const path = join(directory, "incoming.png");
+    const png = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADUlEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+      "base64",
+    );
+    await writeFile(path, png);
+    cleanup.push(() => rm(directory, { recursive: true, force: true }));
+    const fake = await server({
+      onAction: (action, socket) => {
+        if (action.action !== "get_image") return false;
+        socket.send(
+          JSON.stringify({
+            status: "ok",
+            retcode: 0,
+            data: { file: path },
+            echo: action.echo,
+          }),
+        );
+        return true;
+      },
+    });
+    const { adapter } = client(fake.endpoint);
+    await adapter.start();
+    await expect(adapter.getImage("opaque-1.png")).resolves.toMatchObject({
+      status: "ok",
+      image: { mimeType: "image/png", data: png },
+    });
+    expect(fake.history.filter((action) => action.action === "get_image")).toMatchObject([
+      { params: { file: "opaque-1.png" } },
+    ]);
+    expect(await adapter.getImage("../secret.png")).toEqual({
+      status: "failed",
+      code: "image_invalid",
+    });
   });
 });

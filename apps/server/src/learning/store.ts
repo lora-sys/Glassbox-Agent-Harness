@@ -26,8 +26,10 @@ export const OWNER_MEMORY_RESOURCE = "owner-memory";
 export const MEMORY_READ_ACTION = "memory:read";
 export const MEMORY_WRITE_ACTION = "memory:write";
 export const MEMORY_GOVERN_ACTION = "memory:govern";
+export const GROUP_MEMORY_READ_ACTION = "memory:read";
+export const GROUP_MEMORY_CANDIDATE_WRITE_ACTION = "memory:candidate:write";
 
-type CandidateCreate = Omit<
+export type CandidateCreate = Omit<
   MemoryCandidate,
   "candidateId" | "createdAt" | "status" | "reviewedAt" | "promotedMemoryId"
 > & { candidateId?: string };
@@ -83,7 +85,29 @@ function validateScope(scope: GlassboxMemoryScope): void {
     requireIdentifier(scope.projectId);
     return;
   }
+  if (scope.type === "group") {
+    requireIdentifier(scope.connectionId);
+    requireIdentifier(scope.botId);
+    requireIdentifier(scope.groupId);
+    return;
+  }
   throw new Error("Invalid memory scope");
+}
+
+function validateCurrentGroupScope(
+  context: LearningOperationContext,
+  resourceId: string,
+  scope: Extract<GlassboxMemoryScope, { type: "group" }>,
+): void {
+  validateScope(scope);
+  if (
+    context.caller.scope.chatType !== "group" ||
+    context.caller.scope.connectionId !== scope.connectionId ||
+    context.caller.scope.botId !== scope.botId ||
+    context.caller.scope.chatId !== scope.groupId ||
+    resourceId !== `group:${scope.groupId}`
+  )
+    throw new Error("Group memory scope mismatch");
 }
 
 function validateSubject(subject: MemorySubject): void {
@@ -273,9 +297,17 @@ export class LearningStore {
   ) {}
 
   private async authorize(context: LearningOperationContext, action: string): Promise<string> {
+    return this.authorizeResource(context, OWNER_MEMORY_RESOURCE, action);
+  }
+
+  private async authorizeResource(
+    context: LearningOperationContext,
+    resourceId: string,
+    action: string,
+  ): Promise<string> {
     const decision = await this.authorization.check({
       caller: context.caller,
-      resourceId: OWNER_MEMORY_RESOURCE,
+      resourceId,
       action,
       conversationId: context.conversationId,
       runId: context.runId,
@@ -374,6 +406,33 @@ export class LearningStore {
     });
   }
 
+  /** Group-visible conversation signals can create inert candidates under group authority. */
+  async createGroupCandidate(
+    context: LearningOperationContext,
+    groupResourceId: string,
+    input: CandidateCreate,
+  ): Promise<MemoryCandidate> {
+    if (input.scope.type !== "group") throw new Error("Group candidate requires group scope");
+    validateCurrentGroupScope(context, groupResourceId, input.scope);
+    const decisionId = await this.authorizeResource(
+      context,
+      groupResourceId,
+      GROUP_MEMORY_CANDIDATE_WRITE_ACTION,
+    );
+    return this.db.transaction(async (tx) => {
+      const candidate = await this.insertCandidate(tx, input);
+      await this.audit(
+        tx,
+        context,
+        decisionId,
+        "write",
+        candidate.candidateId,
+        candidate.sourceEvidence.map((e) => e.ref),
+      );
+      return candidate;
+    });
+  }
+
   async listCandidates(
     context: LearningOperationContext,
     status?: MemoryCandidate["status"],
@@ -407,25 +466,54 @@ export class LearningStore {
 
   async listMemories(
     context: LearningOperationContext,
-    options: { scope?: GlassboxMemoryScope; includeInactive?: boolean } = {},
+    options: { scope?: GlassboxMemoryScope; includeInactive?: boolean; limit?: number } = {},
   ): Promise<CanonicalMemory[]> {
     await this.authorize(context, MEMORY_READ_ACTION);
     if (options.scope) validateScope(options.scope);
+    if (
+      options.limit !== undefined &&
+      (!Number.isInteger(options.limit) || options.limit < 1 || options.limit > 500)
+    )
+      throw new Error("Invalid memory limit");
     return this.db.transaction(async (tx) => {
       const clauses: string[] = [];
-      const args: string[] = [];
+      const args: Array<string | number> = [];
       if (options.scope) {
         clauses.push("scope_json = ?");
         args.push(json(options.scope));
       }
       if (!options.includeInactive) clauses.push("lifecycle_state = 'active'");
+      const limitClause = options.limit === undefined ? "" : " LIMIT ?";
+      if (options.limit !== undefined) args.push(options.limit);
       const result = await tx.execute({
-        sql: `SELECT * FROM memories${clauses.length ? ` WHERE ${clauses.join(" AND ")}` : ""} ORDER BY updated_at DESC, id ASC`,
+        sql: `SELECT * FROM memories${clauses.length ? ` WHERE ${clauses.join(" AND ")}` : ""} ORDER BY updated_at DESC, id ASC${limitClause}`,
         args,
       });
       return result.rows
         .map(memoryFromRow)
         .filter((memory) => options.includeInactive || memory.lifecycleState === "active");
+    });
+  }
+
+  /** Bounded public group-memory read. Exact group scope and a fresh Action check are required. */
+  async listGroupMemories(
+    context: LearningOperationContext,
+    groupResourceId: string,
+    scope: Extract<GlassboxMemoryScope, { type: "group" }>,
+    limit = 40,
+  ): Promise<CanonicalMemory[]> {
+    validateCurrentGroupScope(context, groupResourceId, scope);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100)
+      throw new Error("Invalid group memory limit");
+    await this.authorizeResource(context, groupResourceId, GROUP_MEMORY_READ_ACTION);
+    return this.db.transaction(async (tx) => {
+      const result = await tx.execute({
+        sql: "SELECT * FROM memories WHERE scope_json = ? AND lifecycle_state = 'active' ORDER BY updated_at DESC, id ASC LIMIT ?",
+        args: [json(scope), limit],
+      });
+      return result.rows
+        .map(memoryFromRow)
+        .filter((memory) => memory.lifecycleState === "active" && memory.sensitivity === "public");
     });
   }
 
@@ -451,6 +539,25 @@ export class LearningStore {
   ): Promise<CanonicalMemory[]> {
     for (const memoryId of memoryIds) requireIdentifier(memoryId);
     await this.authorize(context, MEMORY_READ_ACTION);
+    return this.markUsedRows(memoryIds);
+  }
+
+  async markGroupMemoriesUsed(
+    context: LearningOperationContext,
+    groupResourceId: string,
+    scope: Extract<GlassboxMemoryScope, { type: "group" }>,
+    memoryIds: readonly string[],
+  ): Promise<CanonicalMemory[]> {
+    validateCurrentGroupScope(context, groupResourceId, scope);
+    for (const memoryId of memoryIds) requireIdentifier(memoryId);
+    await this.authorizeResource(context, groupResourceId, GROUP_MEMORY_READ_ACTION);
+    return this.markUsedRows(memoryIds, scope);
+  }
+
+  private async markUsedRows(
+    memoryIds: readonly string[],
+    groupScope?: Extract<GlassboxMemoryScope, { type: "group" }>,
+  ): Promise<CanonicalMemory[]> {
     return this.db.transaction(async (tx) => {
       const updated: CanonicalMemory[] = [];
       for (const memoryId of new Set(memoryIds)) {
@@ -463,6 +570,11 @@ export class LearningStore {
         if (!row) continue;
         const memory = memoryFromRow(row);
         if (memory.lifecycleState !== "active") continue;
+        if (
+          groupScope &&
+          (json(memory.scope) !== json(groupScope) || memory.sensitivity !== "public")
+        )
+          continue;
         const useCount = memory.useCount + 1;
         const retentionFactors = normalizedRetentionFactors({
           ...memory.retentionFactors,
