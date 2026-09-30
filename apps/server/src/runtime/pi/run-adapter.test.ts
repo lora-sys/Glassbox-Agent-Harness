@@ -5,6 +5,7 @@ import type { LearningStore } from "../../learning/store.js";
 import { GROUP_HISTORY_SEARCH_TOOL, OWNER_HISTORY_SEARCH_TOOL } from "./history-tools.js";
 import { OWNER_MEMORY_ADMIN_TOOL } from "./owner-memory-tools.js";
 import { OWNER_MODEL_ADMIN_TOOL } from "./owner-model-tools.js";
+import { OWNER_GROUP_ADMIN_TOOL } from "./owner-tools.js";
 import { piProfileName, PiRunExecutionAdapter } from "./run-adapter.js";
 import type { RunEvidenceRecord } from "./run-adapter.js";
 import type { PiRunResult, PiRuntimeAdapter } from "./types.js";
@@ -1813,16 +1814,63 @@ describe("mutation intent comes only from the current user message", () => {
   });
 
   it("does not authorize a mutation the message left under-specified", async () => {
-    // The explicit request is incomplete, so no model turn may invent the missing values or
-    // claim that the mutation happened.
-    const f = fixture([{ status: "completed", text: "需要指定成员和时长。", toolCalls: [] }]);
+    // The explicit request is incomplete, so no model turn may invent the missing values or claim
+    // that the mutation happened. The Run is consulted — which member and what duration is a roster
+    // question nothing below the model can answer — and it is the Run's own claim that is refused,
+    // not the message. The intent layer no longer answers this before the model exists.
+    const f = fixture([
+      { status: "completed", text: "需要指定成员和时长。", toolCalls: [] },
+      { status: "completed", text: "成员 3654774349 已禁言 10 秒。", toolCalls: [] },
+    ]);
     f.input.text = "把群 1126022432 里的成员禁言一下";
     await expect(f.executor.execute(f.input)).resolves.toMatchObject({
       status: "failed",
-      text: expect.stringMatching(/未执行/u),
+      failureCode: "required_action_not_completed",
     });
-    expect(f.run).not.toHaveBeenCalled();
-    expect(f.createOrRestoreSession).not.toHaveBeenCalled();
+    // The Run happened — once to answer and once to be told plainly that the required call is still
+    // outstanding — and the claim the second turn made without calling anything never reached the
+    // reader. Before the change the intent layer answered this before a session existed, which is
+    // what told the sender their parameters were incomplete when the parameter they gave was a
+    // group card.
+    expect(f.run).toHaveBeenCalledTimes(2);
+    expect(f.createOrRestoreSession).toHaveBeenCalledOnce();
+    expect(f.run.mock.calls[1]?.[2]).toMatch(/required action has not executed/u);
+    expect(f.run.mock.calls[1]?.[3]?.requiredToolInput).toEqual({
+      groupId: "1126022432",
+      operation: "set_group_ban",
+    });
+  });
+
+  it("binds an Owner capability request to the admin Tool that owns the row", async () => {
+    // Verbatim, the message the "已启用 ✅ version：8" answer came back to. It names a capability
+    // category and a direction, and nothing below the model asked who would perform it: the
+    // requirement layer reads the message for Tools a *QQ domain action* needs, and turning a
+    // capability on is not one. So the Run invented the row, the version number, and the summary
+    // line under it, against a policy row that had not moved.
+    const f = fixture([
+      {
+        status: "completed",
+        text: "已启用。\n\n• group.moderate：enabled=true ✅\n• version：8",
+        toolCalls: [],
+      },
+      {
+        status: "completed",
+        text: "已启用。\n\n• group.moderate：enabled=true ✅\n• version：8",
+        toolCalls: [],
+      },
+    ]);
+    f.input.text = '开 1121579672 的 group.moderate"或"给 1121579672 开启群管理能力';
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "failed",
+      failureCode: "required_action_not_completed",
+    });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe(OWNER_GROUP_ADMIN_TOOL);
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({
+      action: "set_capability",
+      groupId: "1121579672",
+      enabled: true,
+      category: "group.moderate",
+    });
   });
 
   it("still binds the mutation when the message adds an instruction the words contain", async () => {
@@ -1932,6 +1980,20 @@ describe("mutation intent comes only from the current user message", () => {
 });
 
 describe("an explicit current-group history search requires the group Tool", () => {
+  /**
+   * The surface of a group Run that can read the room and cannot change it.
+   *
+   * Every one of the tests below is about what happens when the operation the message asked for
+   * was never on offer, so they all resolve to the same short list.
+   */
+  const READ_ONLY_GROUP_SURFACE: readonly string[] = [
+    "qq_groups",
+    "qq_group_members",
+    "qq_group_history",
+    "qq_group_content",
+    "qq_group_files",
+  ];
+
   /**
    * A group Run whose discovered surface is `authorizedToolNames`.
    *
@@ -2249,18 +2311,19 @@ describe("an explicit current-group history search requires the group Tool", () 
     });
   });
 
-  it("withholds an incomplete group mutation before the model can claim success", async () => {
+  it("withholds an incomplete group mutation only after the model has answered", async () => {
+    // The requirement used to be answered before the model existed. Ten consecutive mute requests
+    // were sent away with a fixed line telling the sender their parameters were incomplete, when the
+    // parameter they gave — "Ripped" — is a group card the Run resolves against the roster. So the
+    // Run happens, and what is refused is the claim of a mute nobody performed.
     const f = groupFixture(
       [
-        {
-          status: "completed",
-          text: "成员 3654774349 已禁言 10 秒。",
-          toolCalls: [],
-        },
+        { status: "completed", text: "禁言 Ripped 30 秒已完成。", toolCalls: [] },
+        { status: "completed", text: "成员 3251349264 已禁言 30 秒。", toolCalls: [] },
       ],
       ["qq_group_moderation"],
     );
-    f.input.text = "禁言测试成员3654774349";
+    f.input.text = "禁言 Ripped 30秒";
     const evidence: RunEvidenceRecord[] = [];
     const executor = new PiRunExecutionAdapter(f.runtime, {
       onEvidence: (record) => {
@@ -2270,22 +2333,224 @@ describe("an explicit current-group history search requires the group Tool", () 
 
     await expect(executor.execute(f.input)).resolves.toMatchObject({
       status: "failed",
-      text: expect.stringMatching(/未执行/u),
+      failureCode: "required_action_not_completed",
     });
-    expect(f.run).not.toHaveBeenCalled();
-    expect(f.createOrRestoreSession).not.toHaveBeenCalled();
-    expect(evidence).toEqual([
-      {
-        type: "tool_evidence",
-        runId: "run-1",
-        conversationId: "conversation-1",
-        principalId: "owner",
-        phase: "required",
-        required: [],
-        blockedMutation: { operation: "set_group_ban", reason: "incomplete_parameters" },
-      },
-    ]);
-    expect(JSON.stringify(evidence)).not.toContain("3654774349");
+    expect(f.createOrRestoreSession).toHaveBeenCalledOnce();
+    // The requirement is the operation, left with no member: the Run has to resolve that itself.
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe("qq_group_moderation");
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({
+      groupId: "1126022432",
+      operation: "set_group_ban",
+    });
+    // Nothing pre-model recorded a refusal, because there was nothing to refuse.
+    expect(
+      evidence.some(
+        (record) => "blockedMutation" in record && record.blockedMutation !== undefined,
+      ),
+    ).toBe(false);
+  });
+
+  it("delivers a group Run's own answer when the operation was never on offer", async () => {
+    // The live shape of every one of the ten failures. The group's capability policy declined
+    // `group.moderate`, so the Tool the requirement names was never on this Run's surface, and the
+    // Run is the only thing that can say so. Failing closed on it would trade that sentence for a
+    // fixed line about an action that was never available — the same substitution in the other
+    // direction. The bot's own words on the night were "因为本 Run 给我的工具里没有禁言这个动作".
+    const f = groupFixture(
+      [
+        {
+          status: "completed",
+          text: '因为本 Run 给我的工具里没有"禁言"这个动作，只有读类操作。要找本群真正的群主或管理员帮你禁言。',
+          toolCalls: [],
+        },
+      ],
+      ["qq_groups", "qq_group_members", "qq_group_history", "qq_group_content", "qq_group_files"],
+    );
+    f.input.text = "禁言 Ripped 30秒";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "succeeded",
+      text: '因为本 Run 给我的工具里没有"禁言"这个动作，只有读类操作。要找本群真正的群主或管理员帮你禁言。',
+    });
+    expect(f.run).toHaveBeenCalledOnce();
+  });
+
+  it("withholds a claim of an action the Run's surface made impossible", async () => {
+    // The escape above is conditioned on the Run not narrating what it did not do. The same
+    // missing Tool is exactly the situation in which a fluent "已禁言 Ripped 30 秒" would be
+    // believed, so the claim is what the gate below the model reads.
+    const f = groupFixture(
+      [{ status: "completed", text: "已禁言 Ripped 30 秒。", toolCalls: [] }],
+      READ_ONLY_GROUP_SURFACE,
+    );
+    f.input.text = "禁言 Ripped 30秒";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "failed",
+      text: "本次 Run 没有执行被要求的变更，因此我不会声称它已经完成。请以管理面或群里的实际状态为准。",
+    });
+  });
+
+  it("withholds a claim of a finished action whatever words it is dressed in", async () => {
+    // The completion marker is what is read, not the verb. Each of these says the same thing to
+    // the room, and none of them called the Tool that would have made it true.
+    for (const text of [
+      "禁言 Ripped 30 秒已完成。",
+      "成员 3251349264 已禁言 30 秒。",
+      "已把 Ripped 静音处理。",
+      "搞定，Ripped 眼下已经禁言生效。",
+    ]) {
+      const f = groupFixture(
+        [{ status: "completed", text, toolCalls: [] }],
+        READ_ONLY_GROUP_SURFACE,
+      );
+      f.input.text = "禁言 Ripped 30秒";
+      await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+        status: "failed",
+        failureCode: "claimed_change_not_performed",
+      });
+    }
+  });
+
+  it("delivers a refusal, a gap, or a description instead of a claim", async () => {
+    // Every one of these is what a Run without the Tool owes the sender, and each one contains a
+    // word that would be a completion marker if it were not attached to something that takes the
+    // sentence back. Reading the verb alone would withhold all four and leave the sender with a
+    // fixed line instead of a reason.
+    for (const text of [
+      "禁言需要群管理员权限，我无法执行。",
+      "这个群里没有叫 Ripped 的成员，我没法禁言。",
+      "已尝试但失败了：我没有禁言这个工具。",
+      "当前 group.moderate 是关闭的，所以不能禁言。",
+      "要找本群真正的群主或管理员帮你禁言。",
+    ]) {
+      const f = groupFixture(
+        [{ status: "completed", text, toolCalls: [] }],
+        READ_ONLY_GROUP_SURFACE,
+      );
+      f.input.text = "禁言 Ripped 30秒";
+      await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+        status: "succeeded",
+        text,
+      });
+    }
+  });
+
+  it("delivers the Run's own answer once it performed the operation it was asked for", async () => {
+    // The gate reads the requirement, not the verb, so a Run that actually muted the member and
+    // then says so is answered normally.
+    const f = groupFixture(
+      [
+        {
+          status: "completed",
+          text: "已禁言 Ripped 30 秒。",
+          toolCalls: [
+            {
+              name: "qq_group_moderation",
+              input: {
+                groupId: "1126022432",
+                operation: "set_group_ban",
+                params: { user_id: 3251349264, duration: 30 },
+              },
+              failed: false,
+            },
+          ],
+        },
+      ],
+      READ_ONLY_GROUP_SURFACE,
+    );
+    f.input.text = "禁言 Ripped 30秒";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "succeeded",
+      text: "已禁言 Ripped 30 秒。",
+    });
+  });
+
+  it("withholds a capability row the Run only read, or nobody wrote", async () => {
+    // A message that names a capability category and no QQ domain action binds no Tool: the
+    // requirement layer reads a message for the actions it names, and turning a capability on is
+    // not one of them. So in this shape the only thing between the room and "enabled=true ✅" is
+    // the gate below the model. The Run had even called the owner admin Tool — for `get` — which
+    // is how the model learned the row it then reported in a state it had never seen.
+    const f = groupFixture(
+      [
+        {
+          status: "completed",
+          text: "group.moderate：enabled=true ✅\nversion：8\n现在群里可以禁言了。",
+          toolCalls: [
+            {
+              name: OWNER_GROUP_ADMIN_TOOL,
+              input: { action: "get", groupId: "1121579672" },
+              failed: false,
+            },
+          ],
+        },
+      ],
+      [OWNER_GROUP_ADMIN_TOOL],
+    );
+    f.input.text = "把 group.moderate 打开";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "failed",
+      failureCode: "claimed_change_not_performed",
+    });
+  });
+
+  it("delivers a capability row the Run read and described in the present tense", async () => {
+    // The row is the same one the claim gate reads, and the difference is only the tense: a Run
+    // that called `get` and says "当前 group.moderate：enabled=false" is reporting an observation,
+    // and withholding it would take the answer to "现在是什么状态" away with the bug. What the
+    // gate withholds is the announcement — the same row phrased as something that just happened.
+    const f = groupFixture(
+      [
+        {
+          status: "completed",
+          text: "当前 group.moderate：enabled=false。",
+          toolCalls: [
+            {
+              name: OWNER_GROUP_ADMIN_TOOL,
+              input: { action: "get", groupId: "1121579672" },
+              failed: false,
+            },
+          ],
+        },
+      ],
+      [OWNER_GROUP_ADMIN_TOOL],
+    );
+    f.input.text = "把 group.moderate 打开";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "succeeded",
+      text: "当前 group.moderate：enabled=false。",
+    });
+  });
+
+  it("delivers a Run's report of a capability row it actually wrote", async () => {
+    // The gate reads the requirement and the call, not the verb, so a Run that did write the row
+    // and then reports the state it left behind is answered normally. The same words from a Run
+    // that only read the row are withheld above.
+    const f = groupFixture(
+      [
+        {
+          status: "completed",
+          text: "group.moderate：enabled=true ✅\nversion：8",
+          toolCalls: [
+            {
+              name: OWNER_GROUP_ADMIN_TOOL,
+              input: {
+                action: "set_capability",
+                groupId: "1121579672",
+                category: "group.moderate",
+                enabled: true,
+              },
+              failed: false,
+            },
+          ],
+        },
+      ],
+      [OWNER_GROUP_ADMIN_TOOL],
+    );
+    f.input.text = "把 group.moderate 打开";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "succeeded",
+      text: "group.moderate：enabled=true ✅\nversion：8",
+    });
   });
 
   it("maps local group-owner settings to the reduced Tool and never binds set_group_admin", async () => {
@@ -3066,6 +3331,34 @@ describe("a factual answer requires the observation it depends on", () => {
     await expect(f.executor.execute(f.input)).resolves.toMatchObject({
       status: "succeeded",
       text: "我没有禁言能力，禁言是群主/管理员的权限，Agent 没这工具。",
+    });
+  });
+
+  it("delivers a refusal that names the identity it is refusing on", async () => {
+    // Verbatim, run c3328e22. The sender was 3251349264, the request was an arithmetic question
+    // with no claim in it at all, and the Run answered correctly: not the Lora sender, this request
+    // is not answered, if you want it done let Lora ask. The 本人 gate then withheld it and
+    // replaced it with a refusal of its own, because 本人 sat twelve characters from "Lora" and
+    // the pattern was unanchored — it matched the words the Run used to say who may *start* a
+    // request rather than who is speaking. A gate that cannot tell 冒用身份 from 提及身份的拒绝
+    // silences the correct answer and leaves the wrong one, so the run failed twice: once for the
+    // claim it refused, once for refusing it.
+    const f = memberFixture(
+      [
+        {
+          status: "completed",
+          text: "非 Lora 发件人，本类请求不响应。如需计算，请由 Lora 本人发起。",
+          toolCalls: [],
+        },
+      ],
+      { protectedIdentities: () => ["Lora", "3526039967", "3067670134"] },
+    );
+    f.input.caller.principalId = "visitor";
+    f.input.caller.scope.senderId = "3251349264";
+    f.input.text = "给我列出二的500次方，我要详细过程";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "succeeded",
+      text: "非 Lora 发件人，本类请求不响应。如需计算，请由 Lora 本人发起。",
     });
   });
 

@@ -50,6 +50,8 @@ export interface ExecutionResult {
     | "model_capacity_unknown"
     /** The action the message pinned down never executed, so the answer cannot stand. */
     | "required_action_not_completed"
+    /** The Run asserted a durable change no Tool performed, so the answer cannot stand. */
+    | "claimed_change_not_performed"
     /** The facts the message was about were never observed, so the answer cannot stand. */
     | "required_evidence_missing"
     /** The executor threw before producing a classified result of its own. */

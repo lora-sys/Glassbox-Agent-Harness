@@ -35,6 +35,8 @@ const failureFallback: Record<string, string> = {
     "这次请求的内容超出了当前模型的上下文容量，未发送给模型。可以缩小问题范围或另开一个会话再试。",
   model_capacity_unknown: "没能确认当前模型的上下文容量，因此没有发送给模型。请稍后重试。",
   required_action_not_completed: "这次请求需要执行的操作没有完成，因此无法给出结果。请稍后重试。",
+  claimed_change_not_performed:
+    "这次没有执行被要求的变更，因此我不会声称它已经完成。请以管理面或群里的实际状态为准。",
   required_evidence_missing: "没能取到这条问题所依赖的原始信息，因此无法确认。请稍后重试。",
 };
 
