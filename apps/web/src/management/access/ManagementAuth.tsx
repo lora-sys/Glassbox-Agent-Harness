@@ -11,6 +11,7 @@
  */
 import React, { useState, useEffect, useCallback } from 'react';
 import { isValidManagementToken } from '../adapter/validators';
+import { isManagementTokenPersistent } from '../adapter';
 
 interface ManagementAuthProps {
   mode: 'design' | 'live';
@@ -51,13 +52,17 @@ export const ManagementAuth: React.FC<ManagementAuthProps> = ({
   children,
 }) => {
   const [tokenInput, setTokenInput] = useState('');
-  const [persistToken, setPersistToken] = useState(false);
+  const [persistToken, setPersistToken] = useState(() => isManagementTokenPersistent(token));
   const [isVerifying, setIsVerifying] = useState(false);
   const [authError, setAuthError] = useState<{ message: string; status?: number } | null>(null);
   const [isLiveAuthorized, setIsLiveAuthorized] = useState<boolean>(false);
 
   const verifiedTokenRef = React.useRef<string | null>(null);
   const inFlightTokenRef = React.useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!token) setPersistToken(false);
+  }, [token]);
 
   // When switching modes or when token changes, re-evaluate authorization
   const verifyCurrentToken = useCallback(
@@ -111,7 +116,7 @@ export const ManagementAuth: React.FC<ManagementAuthProps> = ({
       }
       if (action === 'verify') {
         setIsLiveAuthorized(false);
-        verifyCurrentToken(token!, persistToken);
+        verifyCurrentToken(token!, isManagementTokenPersistent(token));
       } else {
         verifiedTokenRef.current = null;
         inFlightTokenRef.current = null;
@@ -124,7 +129,7 @@ export const ManagementAuth: React.FC<ManagementAuthProps> = ({
       setIsLiveAuthorized(false);
       setAuthError(null);
     }
-  }, [mode, token, verifyCurrentToken, persistToken]);
+  }, [mode, token, verifyCurrentToken]);
 
   // --------------------------------------------------------------------------
   // Mode 1: Design Preview Mode (Deterministic Fixtures, Clearly Labeled)
@@ -332,6 +337,13 @@ export const ManagementAuth: React.FC<ManagementAuthProps> = ({
             />
             <label htmlFor="persist-token">持久化保存在当前浏览器本地 (LocalStorage) — 取消勾选仅保存在当前会话 (SessionStorage)</label>
           </div>
+          {persistToken && (
+            <p role="note" style={{ fontSize: 12, color: 'var(--secondary)', margin: '0 0 18px', lineHeight: 1.5 }}>
+              完整管理密钥将留在此浏览器，关闭标签页后仍可读取；请勿在共享设备使用。
+              若怀疑泄露，先停止 Glassbox，安全移走数据目录中的 <code>management-token</code> 文件，
+              再重启服务生成新密钥；旧密钥将失效。随后断开本页连接，清除浏览器保存的旧密钥。
+            </p>
+          )}
 
           <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
             <button
