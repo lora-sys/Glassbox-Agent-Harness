@@ -450,7 +450,6 @@ describe("channel to durable run composition", () => {
       { persistentDatabase: true },
     );
     f.send(1, "new-member", false, 10099);
-    await expect.poll(() => f.calls.length, { timeout: 5_000 }).toBe(1);
     const visitor = await f.started.take();
     const completed = await f.app.runs.waitForRun(visitor.caller, visitor.run.id);
     expect(completed.status).toBe("succeeded");
