@@ -243,7 +243,13 @@ export class ChannelProfileStore {
   }
 
   /** Saving configuration does not connect. Runtime owners must reject edits while a connection is active. */
-  save(input: unknown): Promise<PublicChannelProfile> {
+  save(
+    input: unknown,
+    beforePersist?: (
+      previous: OneBotConnectionConfig | null,
+      next: OneBotConnectionConfig,
+    ) => Promise<void>,
+  ): Promise<PublicChannelProfile> {
     const value = record(input);
     if (
       Object.keys(value).some(
@@ -294,6 +300,7 @@ export class ChannelProfileStore {
       else if (typeof token === "string") credentials[channel.credentialSlot] = token;
       const channels = this.#settings.channels.filter((item) => item.id !== channel.id);
       channels.push(channel);
+      if (beforePersist) await beforePersist(current ? toConfig(current) : null, toConfig(channel));
       await this.#persist(channels, credentials);
       return this.#public(this.#find(channel.id));
     });
