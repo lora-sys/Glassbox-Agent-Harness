@@ -22,7 +22,7 @@ Glassbox 是一个 Personal Agent 系统：显式身份、严格授权、持久�
 以下能力已合入 main，有确定性测试和真实验收覆盖：
 
 - **QQ 私聊与群聊接入**。NapCat / OneBot 通道，支持群管理员的原生授权。
-- **四道服务端硬 Gate**。Ingress、Context、Tool / Ops、Delivery 依次把关，权限只有 ALLOW、DENY、REQUIRES_APPROVAL 三种结果，没有显式 Grant 一律 DENY。
+- **四道服务端检查点**。Ingress、Context、Tool / Ops、Delivery 依次把关；投递路径由 `conversation/lifecycle.ts` 的 `claimDelivery`、来源资源复检及 `delivery/content-policy.ts` 执行。`delivery/gate.ts` 的 `checkDelivery` 目前只供参考测试，不在生产投递路径上。授权决策有 ALLOW、DENY、REQUIRES_APPROVAL 三种结果，没有显式 Grant 一律 DENY。
 - **Task 生命周期闭环**。派发给 Herdr coding worker 时分配独立隔离分支和独立 worktree，worker 完成后必须经过人工 Review，Accept 才算 DONE，Rework 则开新的 TaskAttempt。
 - **Taste / Memory 持久学习**。受治理的学习真相落库，不是写在 prompt 里的口头记忆。
 - **授权检索**。QQ 历史消息搜索，引用必须来自官方来源。
@@ -76,6 +76,8 @@ ALLOW / DENY / REQUIRES_APPROVAL
 ```
 
 没有明确 Grant 就是 DENY。每一次受保护操作都要能回答 Who、Where、What、How、Resource、Audience、Conversation、Run / Task。
+
+`REQUIRES_APPROVAL` 需要先通过本机管理密钥在 `/manage/auth/approval-policies` 建立指定 Principal、Resource、Action 和 Scope 的审批策略，再通过 `/manage/auth/approvals` 签发有效期不超过 24 小时的一次性 Approval ID；调用受保护动作时仍须显式携带该 ID。普通 QQ 消息入口尚无审批交互界面，不会自动把等待审批的请求变成 ALLOW。
 
 核心原则是**能读不等于能发**。Owner 在私聊能读取自己的私人数据，不代表这些数据可以发进 QQ 群。以下概念相互独立：
 
