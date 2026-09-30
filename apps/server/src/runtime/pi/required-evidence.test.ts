@@ -2,6 +2,8 @@ import { describe, expect, it } from "vite-plus/test";
 import { GROUP_HISTORY_SEARCH_TOOL, OWNER_HISTORY_SEARCH_TOOL } from "./history-tools.js";
 import {
   asksLiveQqFact,
+  capabilityStateQuestion,
+  requestClauses,
   requiredEvidenceFor,
   resolveEvidence,
   unobservedEvidence,
@@ -203,6 +205,25 @@ describe("required evidence stays narrow", () => {
     // named 能力 and would have been read as a question about it.
     expect(requiredEvidenceFor(ownerPrivate("给 1121579672 开启群管理能力"))).toEqual([]);
     expect(requiredEvidenceFor(ownerPrivate("把群 1121579672 的群文件写入权限打开"))).toEqual([]);
+  });
+
+  it("reads the backwards question form as a question, not as the command it leads with", () => {
+    // Verbatim, the live message whose particles run after the verb: "开放没有" was not among the
+    // question tails, so the message was read as the mute command its leading 禁言 names and
+    // refused with a line about parameters it never owed.
+    expect(requestClauses("禁言工具开放没有给 1121579672 群里")).toBe("");
+    expect(capabilityStateQuestion("禁言工具开放没有给 1121579672 群里")).toBe(true);
+    // The imperative beside it keeps its reading: no question tail follows the verb.
+    expect(capabilityStateQuestion("给 1121579672 开启群管理能力")).toBe(false);
+  });
+
+  it("reads which-tools-are-open as a state question", () => {
+    // Verbatim, the live message that names the group first and asks which tools stand open: the
+    // noun sits after the verb here, so the backwards form above does not cover it.
+    expect(capabilityStateQuestion("1121579672 群里现在都开放了哪些工具？")).toBe(true);
+    // A how-to question asks for instructions, which no policy row answers, so it is not a state
+    // question: nothing binds a read to it, and its answer is never excused by one.
+    expect(capabilityStateQuestion("怎么禁言")).toBe(false);
   });
 
   it("requires nothing when the message refuses the request", () => {

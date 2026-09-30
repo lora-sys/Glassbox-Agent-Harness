@@ -32,6 +32,7 @@ import { MEDIA_GENERATION_TOOL } from "./media-tools.js";
 import { OWNER_MODEL_ADMIN_TOOL } from "./owner-model-tools.js";
 import {
   asksLiveQqFact,
+  capabilityStateQuestion,
   groupHistorySearchRequested,
   groupHistorySearchSender,
   namedGroupId,
@@ -658,6 +659,22 @@ function requiredToolCall(
   )
     return undefined;
   if (ownerHistorySearchRequested(rawText)) return { name: OWNER_HISTORY_SEARCH_TOOL, input: {} };
+  // A capability question is not a request — requestClauses drops it, so the reduced text below
+  // carries nothing to bind — but it is still a question about a durable row, and the only
+  // answer that can stand behind it is one a read produced this Run. Without this requirement
+  // the Run answered from Conversation, reported "enabled=true（上一轮已启用）", and the
+  // change-claim check below withheld the whole reply for asserting a state nothing had
+  // observed. The group the message names is pinned when the message names it by number; a
+  // group named by label is the Run's to resolve, the same way a member named by card is,
+  // because what the message establishes is the question, and the row it asks about is what
+  // the read answers. A question that names no group asks about the Run's own surface, which
+  // no Tool observes and nothing here can require.
+  if (capabilityStateQuestion(rawText) && authorizedToolNames?.includes(OWNER_GROUP_ADMIN_TOOL)) {
+    const capabilityGroupId = namedGroupId(rawText);
+    if (capabilityGroupId)
+      return { name: OWNER_GROUP_ADMIN_TOOL, input: { action: "get", groupId: capabilityGroupId } };
+    if (/群/u.test(rawText)) return { name: OWNER_GROUP_ADMIN_TOOL, input: { action: "get" } };
+  }
   const groupId = namedGroupId(text);
   if (!groupId) return undefined;
   // A question about what a group *contains* is answered by live QQ evidence, not by reading
@@ -1252,9 +1269,8 @@ function assertsActionCompleted(reply: string): boolean {
 /**
  * Whether a Run wrote the policy row a capability claim is about.
  *
- * The one Tool that can write it is the Owner's group-admin Tool, and reading it is not writing
- * it: a Run that called `get` and then reported "group.moderate：enabled=true" has shown the
- * reader a fact, not a change. The action has to say so.
+ * The one Tool that can write it is the Owner's group-admin Tool. The action has to say so: a
+ * call whose action starts with `set_` wrote the row, and anything else read it.
  */
 function wroteCapabilityPolicy(
   observedCalls: readonly PiRunResult["toolCalls"][number][],
@@ -1263,6 +1279,24 @@ function wroteCapabilityPolicy(
     if (call.failed !== false || call.name !== OWNER_GROUP_ADMIN_TOOL) return false;
     const action = (call.input as { action?: unknown }).action;
     return typeof action === "string" && action.startsWith("set_");
+  });
+}
+
+/**
+ * Whether a Run read the capability row a state report is about.
+ *
+ * A read is what turns "group.moderate：enabled=true" from a claim into an observation. The
+ * defect this check exists for was a Run that called nothing at all and reported the row's
+ * state from Conversation; a Run that called `get` this Run has put the row's own answer
+ * between its reader and its memory, which is exactly what the comment above the write check
+ * already said a read produces — a fact, not a change. The two forms back a state report
+ * together; neither excuses narrating a mutation, which is the other check's job.
+ */
+function readCapabilityPolicy(observedCalls: readonly PiRunResult["toolCalls"][number][]): boolean {
+  return observedCalls.some((call) => {
+    if (call.failed !== false || call.name !== OWNER_GROUP_ADMIN_TOOL) return false;
+    const action = (call.input as { action?: unknown }).action;
+    return action === "get";
   });
 }
 
@@ -2130,7 +2164,14 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       const unbackedChange = result.text
         ? unperformedAction
           ? assertsActionCompleted(result.text)
-          : assertsCapabilityChanged(result.text) && !wroteCapabilityPolicy(observedCalls)
+          : assertsCapabilityChanged(result.text) &&
+            !wroteCapabilityPolicy(observedCalls) &&
+            // A read turns the row's state into an observation only when the message asked for
+            // the state: the read shows what the row is, not what this message asked it to
+            // become, and "把 group.moderate 打开" answered with "enabled=true ✅" is still a
+            // change nobody performed. The same predicate binds the read above, so a Run is
+            // asked to observe exactly the messages whose claims a read can excuse.
+            !(readCapabilityPolicy(observedCalls) && capabilityStateQuestion(input.text))
         : false;
       if (unbackedChange) {
         await this.recordEvidence({

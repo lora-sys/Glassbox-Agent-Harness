@@ -2415,6 +2415,101 @@ describe("an explicit current-group history search requires the group Tool", () 
     });
   });
 
+  it("requires a read of the capability row before a state question is answered", async () => {
+    // Verbatim, the live message whose answer was withheld: the Run reported the row's state
+    // from Conversation — "enabled=true（上一轮已启用）" — having called nothing, and the
+    // change-claim check took the whole reply. The question asks about a durable row, so the
+    // requirement is the read itself: the group is named by label here, which is the Run's to
+    // resolve, the same way a member named by card is.
+    const read: PiRunResult = {
+      status: "completed",
+      text: "OATP 群的 group.moderate：enabled=true（上一轮已启用），禁言这套管理工具是开放的。",
+      toolCalls: [
+        {
+          name: OWNER_GROUP_ADMIN_TOOL,
+          input: { action: "get", groupId: "1121579672" },
+          failed: false,
+        },
+      ],
+    };
+    const f = fixture([read], [OWNER_GROUP_ADMIN_TOOL]);
+    f.input.text = "禁言 工具有没有开放到oatp 群里";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "succeeded",
+      text: read.text,
+    });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe(OWNER_GROUP_ADMIN_TOOL);
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({ action: "get" });
+  });
+
+  it("pins the group a capability state question names by number", async () => {
+    const read: PiRunResult = {
+      status: "completed",
+      text: "该群 group.moderate 当前为 enabled=true。",
+      toolCalls: [
+        {
+          name: OWNER_GROUP_ADMIN_TOOL,
+          input: { action: "get", groupId: "1121579672" },
+          failed: false,
+        },
+      ],
+    };
+    const f = fixture([read], [OWNER_GROUP_ADMIN_TOOL]);
+    f.input.text = "禁言工具有没有开放到 1121579672 群里？";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({
+      action: "get",
+      groupId: "1121579672",
+    });
+  });
+
+  it("withholds the same state report when nothing observed it", async () => {
+    // The read is what makes the report an observation. Without it the reply is the row's state
+    // from memory — the exact reply this gate exists to withhold. Here the requirement is bound
+    // and the Run ignored it, so the Run fails on the requirement it skipped before the claim
+    // check is even reached.
+    const claimed: PiRunResult = {
+      status: "completed",
+      text: "OATP 群的 group.moderate：enabled=true ✅（上一轮已启用）。",
+      toolCalls: [],
+    };
+    const f = fixture([claimed, claimed], [OWNER_GROUP_ADMIN_TOOL]);
+    f.input.text = "禁言 工具有没有开放到oatp 群里";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "failed",
+      failureCode: "required_action_not_completed",
+    });
+  });
+
+  it("reads the backwards question form as a question and requires the same read", async () => {
+    // Verbatim, the message whose particles run after the verb: "开放没有" was not in the list
+    // of question tails, so the message was read as the mute command the leading noun names and
+    // refused for parameters it never owed. The read it now binds is the same one the forward
+    // form binds.
+    const read: PiRunResult = {
+      status: "completed",
+      text: "该群 group.moderate 当前为 enabled=false，禁言工具没有开放。",
+      toolCalls: [
+        {
+          name: OWNER_GROUP_ADMIN_TOOL,
+          input: { action: "get", groupId: "1121579672" },
+          failed: false,
+        },
+      ],
+    };
+    const f = fixture([read], [OWNER_GROUP_ADMIN_TOOL]);
+    f.input.text = "禁言工具开放没有给 1121579672 群里";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "succeeded",
+      text: read.text,
+    });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe(OWNER_GROUP_ADMIN_TOOL);
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({
+      action: "get",
+      groupId: "1121579672",
+    });
+  });
+
   it("withholds an incomplete group mutation only after the model has answered", async () => {
     // The requirement used to be answered before the model existed. Ten consecutive mute requests
     // were sent away with a fixed line telling the sender their parameters were incomplete, when the
