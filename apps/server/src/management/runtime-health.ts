@@ -26,6 +26,7 @@ export function runtimeHealthOf(
       return undefined;
     case "required_action_not_completed":
     case "required_evidence_missing":
+    case "claimed_change_not_performed":
       return { state: "degraded", reasonCode: result.failureCode };
     default:
       return { state: "unavailable", reasonCode: result.failureCode ?? "execution_failed" };

@@ -50,6 +50,8 @@ export interface ExecutionResult {
     | "model_capacity_unknown"
     /** The action the message pinned down never executed, so the answer cannot stand. */
     | "required_action_not_completed"
+    /** The Run asserted a durable change no Tool performed, so the answer cannot stand. */
+    | "claimed_change_not_performed"
     /** The facts the message was about were never observed, so the answer cannot stand. */
     | "required_evidence_missing"
     /** The executor threw before producing a classified result of its own. */
@@ -74,6 +76,33 @@ export interface RunTransport {
 }
 
 export type RunServiceEvent =
+  /**
+   * The first event of a Run's trace: the channel message that produced it.
+   *
+   * Carries the channel-native and storage identifiers so a Run joins back to the message
+   * that caused it, plus a digest and byte count instead of the body. The body stays in
+   * `messages.text`; copying it here would fail the trace-leak gate (AGENTS.md: the Trace
+   * must explain the decision without leaking protected payloads).
+   */
+  | {
+      type: "message_received";
+      runId: string;
+      conversationId: string;
+      /** Channel-native message id (`IncomingMessage.messageId`); joins to `channel_messages`. */
+      externalId: string;
+      /** Storage message id; joins to `messages.id`. */
+      messageId: string;
+      connectionId: string;
+      botId: string;
+      chatType: "private" | "group";
+      chatId: string;
+      senderId: string;
+      threadId?: string;
+      /** UTF-8 byte length of the accepted message text. */
+      textBytes: number;
+      /** Digest of the accepted message text, for equality checks without the body. */
+      textSha256: string;
+    }
   | { type: "run_queued" | "run_started" | "run_cancelling"; runId: string; conversationId: string }
   | {
       type: "run_finished";
@@ -81,12 +110,20 @@ export type RunServiceEvent =
       conversationId: string;
       status: RunStatus;
       outputWithheld: boolean;
+      /**
+       * Why an unsuccessful Run stopped, when the executor could name the cause. Fixed
+       * diagnostic codes only; provider errors and protected payloads are excluded, so a
+       * missing code means the executor did not have a cause to report rather than zero risk.
+       */
+      failureCode?: ExecutionResult["failureCode"];
     }
   | {
       type: "delivery_changed";
       runId: string;
       deliveryId: string;
       status: DeliveryRecord["status"];
+      /** Channel-native id of the sent message, when the transport confirmed one. */
+      externalId?: string;
     }
   | {
       type: "delivery_blocked";

@@ -442,6 +442,53 @@ export class LifecycleStore {
     );
   }
 
+  /** Supervisor-only settlement before an execution lease was returned. The trusted route
+   * must still match the stored Run; a revoked execution grant cannot strand a claimed Run. */
+  async failQueuedDispatch(caller: CallerContext, runId: string): Promise<RunRecord | null> {
+    requireIdentifier(runId);
+    return this.db
+      .transaction(async (tx) => {
+        const stored = (
+          await tx.execute({
+            sql: "SELECT * FROM runs WHERE id = ?",
+            args: [runId],
+          })
+        ).rows[0];
+        if (
+          !stored ||
+          stringColumn(stored, "principal_id") !== caller.principalId ||
+          scopeKey(storedScope(stored)) !== scopeKey(caller.scope)
+        )
+          throw new Error("Run route identity changed");
+        const now = new Date().toISOString();
+        const changed = await tx.execute({
+          sql: `UPDATE runs SET
+            status = CASE WHEN status = 'cancelling' THEN 'cancelled' ELSE 'failed' END,
+            result_text = CASE WHEN status = 'cancelling' THEN '已停止，这次没有给出结果。'
+              ELSE ? END, updated_at = ?
+            WHERE id = ? AND status IN ('queued', 'running', 'cancelling')`,
+          args: ["这次请求未能启动，服务暂时出错了。请稍后重试。", now, runId],
+        });
+        if (changed.rowsAffected !== 1) return { value: null };
+        const row = (await tx.execute({ sql: "SELECT * FROM runs WHERE id = ?", args: [runId] }))
+          .rows[0]!;
+        if (stringColumn(row, "status") === "failed")
+          await tx.execute({
+            sql: `INSERT INTO attention_items(id, kind, summary, principal_id, conversation_id, created_at)
+            VALUES (?, 'unanswered_message', ?, ?, ?, ?)`,
+            args: [
+              randomUUID(),
+              "Run dispatch failed after retries; the Owner may send the request again.",
+              null,
+              stringColumn(stored, "conversation_id"),
+              now,
+            ],
+          });
+        return { value: runRecord(row) };
+      })
+      .then((result) => result.value);
+  }
+
   /** Startup-only recovery. It never reruns a tool or reports an unconfirmed send
    * as successful. Callers append these facts to raw trace after this transaction. */
   async recover(): Promise<{

@@ -1,6 +1,7 @@
 import { readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { isWatchSnapshotReady, parseTraceSnapshot } from "./inspect-trace-lines.mts";
 
 const dataDirectory = process.env.GLASSBOX_DATA_DIR ?? join(homedir(), ".glassbox");
 const runsDirectory = join(dataDirectory, "runs");
@@ -38,18 +39,19 @@ async function getLatestRunId(): Promise<string | undefined> {
   }
 }
 
-async function inspectRun(runId: string) {
+async function inspectRun(runId: string, waitForCompleteLine = false): Promise<boolean> {
   const tracePath = join(runsDirectory, runId, "trace.jsonl");
   let content = "";
   try {
     content = await readFile(tracePath, "utf8");
   } catch {
     console.log(`No trace found for run ${runId}`);
-    return;
+    return false;
   }
 
-  const lines = content.trim().split("\n").filter(Boolean);
-  const events: TraceItem[] = lines.map((l) => JSON.parse(l));
+  const snapshot = parseTraceSnapshot<TraceItem>(content);
+  const { events, hasIncompleteTail } = snapshot;
+  if (waitForCompleteLine && !isWatchSnapshotReady(snapshot)) return false;
 
   console.log(`\n======================================================`);
   console.log(`RUN INSPECTION: ${runId}`);
@@ -104,6 +106,7 @@ async function inspectRun(runId: string) {
     );
   }
   console.log(`======================================================\n`);
+  return !hasIncompleteTail;
 }
 
 async function main() {
@@ -115,8 +118,15 @@ async function main() {
     while (true) {
       const currentRunId = await getLatestRunId();
       if (currentRunId && currentRunId !== lastSeenRunId) {
-        lastSeenRunId = currentRunId;
-        await inspectRun(currentRunId);
+        try {
+          // Retry the same Run until its first complete trace line is available.
+          if (await inspectRun(currentRunId, true)) lastSeenRunId = currentRunId;
+        } catch (error) {
+          // A completed corrupt line is not a partial write. Report this Run and
+          // keep watching so later Runs are still inspectable.
+          console.error(`Could not inspect run ${currentRunId}:`, error);
+          lastSeenRunId = currentRunId;
+        }
       }
       await new Promise((r) => setTimeout(r, 1000));
     }

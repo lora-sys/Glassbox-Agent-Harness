@@ -173,6 +173,11 @@ WorkerBinding
   lastObservedAgentState
 ```
 
+Glassbox currently passes the configured `worktreePath` and `branch` through to Herdr and records
+them in WorkerBinding. It does not create a branch or worktree for each TaskAttempt. Herdr owns the
+execution workspace. The fixed worker target does not route each Task to a distinct worktree, so
+concurrent coding Tasks against one configured target are not isolated by this integration.
+
 ### AgentOpsSnapshot
 
 Compact operational projection for the main Agent.
