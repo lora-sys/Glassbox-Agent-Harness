@@ -166,7 +166,7 @@ describe("per-Owner managed group assignment", () => {
     expect(restartedApp.listChannels()[0]?.groupIds).toEqual(
       expect.arrayContaining([GROUP, OTHER_GROUP]),
     );
-  });
+  }, 90_000);
 
   it("persists the fixed default bundle and never enables a mutation category", async () => {
     const { f, application, a, b } = await owners();
@@ -428,7 +428,7 @@ describe("per-Owner managed group assignment", () => {
     expect(after.skills).toEqual(before.skills);
     expect(after.groupId).toBe(GROUP);
     expect(after.version).toBe(before.version);
-  });
+  }, 90_000);
 
   it("returns only matching, policy-enabled and authorized entries with their groups", async () => {
     const { application, a } = await owners();

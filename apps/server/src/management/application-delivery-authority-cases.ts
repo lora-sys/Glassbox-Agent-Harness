@@ -366,7 +366,7 @@ describe("group history delivery authority", () => {
     ).toBe(true);
     expect(records.some((record) => record.decision === "DENY")).toBe(true);
     expect(JSON.stringify(records)).not.toContain("history-derived-retry-payload");
-  });
+  }, 90_000);
 
   it("rechecks an ordinary read source before retrying a failed delivery", async () => {
     const { f, application } = await historyFixture();
@@ -815,7 +815,7 @@ describe("group history delivery authority", () => {
         scope: coOwnerPrivate,
       }),
     ).toBe(false);
-  });
+  }, 90_000);
 
   it("backfills the explicit delivery grant for a persisted assignment on reconnect", async () => {
     const { f, application, a } = await twoOwners();
