@@ -18,9 +18,13 @@ concurrency:
 
 jobs:
   code-quality:
-    name: Code and test hygiene
-    runs-on: ubuntu-latest
+    name: Code and test hygiene (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
 
     steps:
       - name: Check out repository
@@ -44,14 +48,47 @@ jobs:
         run: npm run hygiene:check
 
       - name: Check changed tests were not weakened
-        if: github.event_name == 'pull_request' || github.event_name == 'push'
+        if: matrix.os == 'ubuntu-latest' && (github.event_name == 'pull_request' || github.event_name == 'push')
         run: node scripts/check-test-hygiene.mjs
 
       - name: Run full deterministic verification
+        if: matrix.os == 'ubuntu-latest'
         run: npm run verify:full
 
+      - name: Run Windows core unit suite
+        if: matrix.os == 'windows-latest'
+        run: npm run test:unit
+
       - name: Check generated route tree is current
+        if: matrix.os == 'ubuntu-latest'
         run: git diff --exit-code -- apps/web/src/routeTree.gen.ts
+
+  browser-protocol:
+    name: Browser and live management protocol
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24.21.0
+          cache: npm
+
+      - name: Use locked npm version
+        run: npm install --global npm@12.0.2
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Exercise Web and live management HTTP
+        run: npm run test:web:browser
 
   dependency-hygiene:
     name: Dependency hygiene

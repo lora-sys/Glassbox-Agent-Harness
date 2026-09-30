@@ -18,10 +18,10 @@ export default defineConfig({
       use: { ...devices["Desktop Chrome"] },
     },
   ],
-  // Expect the servers to already be running (server on 3030, web on 5173)
+  // Start the web server at the same origin used by the specs and server CORS policy.
   webServer: {
-    command: "echo 'assuming servers already running on 3030 and 5173'",
+    command: "npm run dev:web -- --host localhost --port 5173 --strictPort",
     port: 5173,
-    reuseExistingServer: true,
+    reuseExistingServer: !process.env.CI,
   },
 });

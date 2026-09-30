@@ -511,6 +511,14 @@ make its own status checks mandatory or prevent direct pushes.
 
 Playwright remains the browser / E2E layer.
 
+### Web management freeze integration
+
+The `codex/web-management-freeze` branch is an input to a future Web merge, not the repository toolchain authority. Keep main's root `package.json`, lockfile, Node/npm pin, Vite+ overrides, verification scripts, and CI workflow when bringing the UI over. The Web package owns its own `@tanstack/react-query` dependency; update the main lockfile with npm after integrating other Web imports. Do not copy the older root manifest or lockfile from the freeze branch.
+
+Use port 5173 consistently: Playwright's `baseURL` and `webServer`, historical spec `WEB_PORT` constants, and the server's allowed Web origins. Playwright starts the Web dev server; tests that need the Glassbox API must start an isolated server fixture or state that external server setup is required. Historical specs in `apps/web/e2e/README.md` are not a portable CI suite.
+
+Before merging the management UI, check the live management validators and contract changes from issue #57, the main Web regressions from issue #60, and the management token persistence fix from issue #66. Validate the combined tree with `npm ci`, core and Web type checks, unit tests, a Web build, and selected portable browser flows. Keep unmerged issue PRs identified as dependencies until their code is actually in the combined tree.
+
 P3 deterministic tests must not require real QQ accounts, paid model quota, the user's normal Pi state, or live Herdr workspaces.
 
 They should use isolated substitutes such as:
