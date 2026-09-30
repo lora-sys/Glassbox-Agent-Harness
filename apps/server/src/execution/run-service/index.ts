@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { AccessDeniedError } from "../../auth/service.js";
 import type { RunLease, RunRoute, TerminalRunStatus } from "../../conversation/lifecycle.js";
 import type { IncomingMessage, RunRecord } from "../../conversation/store.js";
@@ -34,6 +35,8 @@ const failureFallback: Record<string, string> = {
     "这次请求的内容超出了当前模型的上下文容量，未发送给模型。可以缩小问题范围或另开一个会话再试。",
   model_capacity_unknown: "没能确认当前模型的上下文容量，因此没有发送给模型。请稍后重试。",
   required_action_not_completed: "这次请求需要执行的操作没有完成，因此无法给出结果。请稍后重试。",
+  claimed_change_not_performed:
+    "这次没有执行被要求的变更，因此我不会声称它已经完成。请以管理面或群里的实际状态为准。",
   required_evidence_missing: "没能取到这条问题所依赖的原始信息，因此无法确认。请稍后重试。",
 };
 
@@ -138,8 +141,38 @@ export class RunService {
   async receive(input: IncomingMessage): Promise<AcceptedIncoming> {
     if (!this.started) throw new Error("Run service is not started");
     const accepted = await this.options.store.conversations.acceptIncoming(input);
+    if (!accepted.duplicate) await this.recordMessageReceived(input, accepted.run);
     await this.enqueueAccepted(accepted);
     return accepted;
+  }
+
+  /**
+   * Records the message that produced a Run as the first event on the Run's trace.
+   *
+   * The channel adapter calls `acceptIncoming` itself rather than going through
+   * `receive`, so this is exposed for it to call with the same `IncomingMessage` it
+   * stored. Duplicates reuse an existing Run, which already carries the event.
+   *
+   * Metadata only: the body stays in storage. The identifiers are what let a trace
+   * reader join a Run to its message, channel conversation and sender without the
+   * trace ever holding protected payload text.
+   */
+  async recordMessageReceived(input: IncomingMessage, run: RunRecord): Promise<void> {
+    await this.emit({
+      type: "message_received",
+      runId: run.id,
+      conversationId: run.conversationId,
+      externalId: input.messageId,
+      messageId: run.messageId,
+      connectionId: input.scope.connectionId,
+      botId: input.scope.botId,
+      chatType: input.scope.chatType,
+      chatId: input.scope.chatId,
+      senderId: input.scope.senderId,
+      ...(input.scope.threadId === undefined ? {} : { threadId: input.scope.threadId }),
+      textBytes: Buffer.byteLength(input.text, "utf8"),
+      textSha256: createHash("sha256").update(input.text, "utf8").digest("hex"),
+    });
   }
 
   async enqueueAccepted(accepted: AcceptedIncoming): Promise<void> {
@@ -470,6 +503,7 @@ export class RunService {
       conversationId: run.conversationId,
       status,
       outputWithheld: finished.outputWithheld,
+      ...(result.failureCode ? { failureCode: result.failureCode } : {}),
     });
     if (finished.outputWithheld) return;
     if (status === "succeeded" && result.providerSessionId) {
@@ -662,7 +696,15 @@ export class RunService {
         outcome.status,
         outcome.status === "sent" ? outcome.externalId : undefined,
       );
-      await this.emit({ type: "delivery_changed", runId, deliveryId, status: outcome.status });
+      await this.emit({
+        type: "delivery_changed",
+        runId,
+        deliveryId,
+        status: outcome.status,
+        ...(outcome.status === "sent" && outcome.externalId
+          ? { externalId: outcome.externalId }
+          : {}),
+      });
     } catch {
       this.report("delivery_failed", runId);
     }

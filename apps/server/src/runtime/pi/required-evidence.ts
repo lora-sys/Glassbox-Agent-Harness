@@ -64,10 +64,26 @@ export interface RequiredEvidence {
   readonly input: Record<string, unknown>;
 }
 
-/** The group id the current message names, if it names one. */
+/**
+ * The group id the current message names, if it names one.
+ *
+ * The possessive form is not an extra convenience. The Owner writes "开 1121579672 的
+ * group.moderate", and a reader that only understood `群1121579672` returned nothing for it — so
+ * the layer that decides what the message asked for saw a capability request with no group, bound
+ * no Tool, and a Run answered "已启用 ✅ version：8" against a policy row that had never moved.
+ * Anything that drops a requirement for a reason this shallow has to be assumed to be dropping it
+ * wrongly, because the cost is never a missing answer: it is an answer nothing stood behind.
+ *
+ * The number must still be attached to the group noun by the word that owns it. A bare number on
+ * its own is left unbound on purpose — "把 3526039967 设为管理员" is a member, and guessing would
+ * bind the wrong group, which is worse than binding none.
+ */
 export function namedGroupId(text: string): string | undefined {
-  const match = /(?:群\s*([1-9]\d{4,15})|([1-9]\d{4,15})\s*群)/u.exec(text);
-  return match?.[1] ?? match?.[2];
+  const match =
+    /(?:群\s*([1-9]\d{4,15})|([1-9]\d{4,15})\s*群|([1-9]\d{4,15})\s*的\s*(?:群组?|group\b))/u.exec(
+      text,
+    );
+  return match?.[1] ?? match?.[2] ?? match?.[3];
 }
 
 /**
