@@ -8,6 +8,8 @@ import { isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { getServiceDataDir } from "../apps/server/src/platform/paths.js";
+import { securePrivatePath } from "../apps/server/src/platform/private-path.js";
+import { persistedEnvironment, serviceEnvironmentKeys } from "./service-environment.mjs";
 
 const execFile = promisify(execFileCallback);
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -16,27 +18,6 @@ const statePath = join(dataDirectory, "service-processes.json");
 const priorStatePath = `${statePath}.previous`;
 const configPath = join(dataDirectory, "service-launch.json");
 const logPath = join(dataDirectory, "service.log");
-const serviceEnvironmentKeys = new Set([
-  "PORT",
-  "LORA_PI_KIT_PATH",
-  "GLASSBOX_SANDBOX_IMAGE",
-  "GLASSBOX_SANDBOX_DNS_MODE",
-  "GLASSBOX_RUNTIME_DIR",
-  "PI_CODING_AGENT_DIR",
-  "GLASSBOX_REPO_ROOT",
-  "GLASSBOX_WORKSPACE_CODEX",
-  "GLASSBOX_WORKSPACE_CLAUDE",
-  "GLASSBOX_WORKSPACE_DEMO",
-  "AGNES_API_KEY",
-  "NAPCAT_DISABLE_MULTI_PROCESS",
-  "NAPCAT_INJECT_PATH",
-  "NAPCAT_WORKDIR",
-  "NAPCAT_LOAD_PATH",
-  "NAPCAT_MAIN_PATH",
-  "NAPCAT_PATCH_PACKAGE",
-  "NAPCAT_LAUNCHER_PATH",
-  "NAPCAT_QUICK_ACCOUNT",
-]);
 
 type ProcessName = "herdr" | "napcat" | "glassbox";
 
@@ -220,6 +201,16 @@ function stateEntry(value: unknown): ProcessState {
 
 async function loadState(): Promise<ProcessState[]> {
   try {
+    await securePrivatePath(dataDirectory, true);
+    for (const path of [statePath, priorStatePath]) {
+      try {
+        await stat(path);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        continue;
+      }
+      await securePrivatePath(path, false);
+    }
     let source: string;
     try {
       source = await readFile(statePath, "utf8");
@@ -243,15 +234,18 @@ async function writeState(state: ProcessState[]): Promise<void> {
     ...entry,
     ...(env
       ? {
-          env: Object.fromEntries(Object.entries(env).filter(([key]) => key !== "AGNES_API_KEY")),
+          env: persistedEnvironment(env),
         }
       : {}),
   }));
-  await writeFile(
-    temporary,
-    JSON.stringify(persisted, null, 2),
-    process.platform === "win32" ? undefined : { mode: 0o600 },
-  );
+  await securePrivatePath(dataDirectory, true);
+  await writeFile(temporary, JSON.stringify(persisted, null, 2), { mode: 0o600 });
+  try {
+    await securePrivatePath(temporary, false);
+  } catch (error) {
+    await rm(temporary, { force: true });
+    throw error;
+  }
   try {
     await rename(temporary, statePath);
   } catch (error) {
@@ -398,7 +392,7 @@ async function waitForDataLockRelease(timeoutMs = 30_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   const lockfilePath = join(dataDirectory, "server.lock");
   while (Date.now() < deadline) {
-    if (!(await lockfile.check(dataDirectory, { lockfilePath }))) return;
+    if (!(await lockfile.check(dataDirectory, { lockfilePath, stale: 10_000 }))) return;
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 200));
   }
   throw new Error("Previous Glassbox service still owns the data directory");
@@ -435,6 +429,19 @@ async function herdrEndpoint(): Promise<string | undefined> {
   }
 }
 
+async function requestGlassboxShutdown(entry: ProcessState): Promise<void> {
+  const portText = entry.env?.PORT ?? process.env.PORT ?? "3030";
+  if (!/^\d{1,5}$/u.test(portText) || Number(portText) < 1 || Number(portText) > 65535)
+    throw new Error("Invalid Glassbox service port");
+  const token = (await readFile(join(dataDirectory, "management-token"), "utf8")).trim();
+  const response = await fetch(`http://127.0.0.1:${portText}/manage/shutdown`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}` },
+    signal: AbortSignal.timeout(2_000),
+  });
+  if (response.status !== 202) throw new Error("Glassbox did not accept graceful shutdown");
+}
+
 async function stopEntry(entry: ProcessState): Promise<void> {
   const sessionName = herdrSessionName(entry);
   if (sessionName && (await herdrSessionRunning(entry, sessionName))) {
@@ -452,7 +459,8 @@ async function stopEntry(entry: ProcessState): Promise<void> {
   }
   if (!(await verified(entry))) return;
   if (process.platform === "win32") {
-    await execFile("taskkill.exe", ["/PID", String(entry.pid), "/T"]).catch(() => undefined);
+    if (entry.name === "glassbox") await requestGlassboxShutdown(entry).catch(() => undefined);
+    else await execFile("taskkill.exe", ["/PID", String(entry.pid), "/T"]).catch(() => undefined);
   } else {
     process.kill(entry.pid, "SIGTERM");
   }

@@ -600,31 +600,106 @@ export function identityRulesClause(
 const SAFE_OWNER_GROUP_CATEGORIES = new Set<string>(QQ_CAPABILITY_CATEGORIES);
 const SAFE_OWNER_GROUP_SOURCE_CLASSES = new Set<string>(QQ_SOURCE_CLASSES);
 
-function safeToolInput(toolName: string, args: unknown): Record<string, unknown> | undefined {
-  if (toolName !== "owner_group_admin" || !args || typeof args !== "object") return undefined;
-  const input = args as Record<string, unknown>;
-  const category =
-    typeof input.category === "string" && SAFE_OWNER_GROUP_CATEGORIES.has(input.category)
-      ? input.category
-      : undefined;
-  const sourceClass =
-    typeof input.sourceClass === "string" && SAFE_OWNER_GROUP_SOURCE_CLASSES.has(input.sourceClass)
-      ? input.sourceClass
-      : undefined;
+/** Tools whose serialized output is or contains user message bodies. */
+const PROTECTED_OUTPUT_TOOLS = new Set<string>([
+  "group_history_search",
+  "owner_history_search",
+  "worker_read",
+  "worker_prompt",
+]);
+
+/** Bounded fragment of a tool's return value, so an unexpected result is debuggable. */
+const TOOL_OUTPUT_HEAD_BYTES = 512;
+
+function safeToolOutput(toolName: string, result: unknown): Record<string, unknown> {
+  let serialized = "";
+  try {
+    serialized = JSON.stringify(result) ?? String(result);
+  } catch {
+    serialized = "";
+  }
+  const bytes = Buffer.byteLength(serialized, "utf8");
+  const digest = createHash("sha256").update(serialized, "utf8").digest("hex");
+  // Digest and byte count are recorded for every Tool: they prove a result existed and
+  // let two runs be compared without the trace holding payload text. The head is the part
+  // that needs a decision, so it is limited to Tools whose output is known to be metadata
+  // rather than message bodies — the same reason `safeToolInput` is a whitelist.
+  if (PROTECTED_OUTPUT_TOOLS.has(toolName)) return { outputBytes: bytes, outputSha256: digest };
+  const slice = Buffer.from(serialized, "utf8")
+    .subarray(0, TOOL_OUTPUT_HEAD_BYTES)
+    .toString("utf8");
   return {
-    ...(typeof input.action === "string" && /^[a-z_]{1,32}$/u.test(input.action)
-      ? { action: input.action }
-      : {}),
-    ...(typeof input.groupId === "string" && /^[1-9]\d{0,15}$/u.test(input.groupId)
-      ? { groupId: input.groupId }
-      : {}),
-    ...(typeof input.skillName === "string" && /^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(input.skillName)
-      ? { skillName: input.skillName }
-      : {}),
-    ...(category === undefined ? {} : { category }),
-    ...(sourceClass === undefined ? {} : { sourceClass }),
-    ...(typeof input.enabled === "boolean" ? { enabled: input.enabled } : {}),
+    outputBytes: bytes,
+    outputSha256: digest,
+    outputHead: slice,
+    outputTruncated: bytes > TOOL_OUTPUT_HEAD_BYTES,
   };
+}
+
+/** Tools whose arguments may quote user message bodies. */
+const PROTECTED_INPUT_TOOLS = new Set<string>(["group_history_search", "owner_history_search"]);
+
+/** Argument keys that carry free-form text and are therefore not recorded. */
+const PROTECTED_INPUT_KEYS = new Set<string>([
+  "query",
+  "text",
+  "content",
+  "prompt",
+  "body",
+  "message",
+  "messages",
+  "snippet",
+  "history",
+]);
+
+/**
+ * A bounded argument view for Tools other than `owner_group_admin`.
+ *
+ * `owner_group_admin` keeps its strict field-by-field validation below: a management Tool
+ * gets to record exactly the fields that were checked, not everything that was passed.
+ */
+function boundedToolInput(args: unknown): Record<string, unknown> | undefined {
+  if (!args || typeof args !== "object" || Array.isArray(args)) return undefined;
+  const recorded: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(args as Record<string, unknown>)) {
+    if (PROTECTED_INPUT_KEYS.has(key)) continue;
+    if (typeof value === "string") recorded[key] = value.slice(0, 64);
+    else if (typeof value === "number" || typeof value === "boolean") recorded[key] = value;
+  }
+  return Object.keys(recorded).length > 0 ? recorded : undefined;
+}
+
+function safeToolInput(toolName: string, args: unknown): Record<string, unknown> | undefined {
+  if (toolName === "owner_group_admin") {
+    const input = args as Record<string, unknown> | undefined;
+    if (!input || typeof input !== "object") return undefined;
+    const category =
+      typeof input.category === "string" && SAFE_OWNER_GROUP_CATEGORIES.has(input.category)
+        ? input.category
+        : undefined;
+    const sourceClass =
+      typeof input.sourceClass === "string" &&
+      SAFE_OWNER_GROUP_SOURCE_CLASSES.has(input.sourceClass)
+        ? input.sourceClass
+        : undefined;
+    return {
+      ...(typeof input.action === "string" && /^[a-z_]{1,32}$/u.test(input.action)
+        ? { action: input.action }
+        : {}),
+      ...(typeof input.groupId === "string" && /^[1-9]\d{0,15}$/u.test(input.groupId)
+        ? { groupId: input.groupId }
+        : {}),
+      ...(typeof input.skillName === "string" && /^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(input.skillName)
+        ? { skillName: input.skillName }
+        : {}),
+      ...(category === undefined ? {} : { category }),
+      ...(sourceClass === undefined ? {} : { sourceClass }),
+      ...(typeof input.enabled === "boolean" ? { enabled: input.enabled } : {}),
+    };
+  }
+  // Every other Tool records a bounded view unless its arguments are known to quote bodies.
+  if (PROTECTED_INPUT_TOOLS.has(toolName)) return undefined;
+  return boundedToolInput(args);
 }
 
 function safeToolFailureCode(result: unknown): string {
@@ -705,6 +780,7 @@ function normalizeEvent(
             ? {
                 provider: event.message.provider,
                 model: event.message.model,
+                stopReason: event.message.stopReason,
                 usage: {
                   inputTokens: event.message.usage.input,
                   outputTokens: event.message.usage.output,
@@ -765,7 +841,8 @@ function normalizeEvent(
           toolCallId: event.toolCallId,
           name: event.toolName,
           isError: event.isError,
-          ...(failureCode === undefined ? {} : { failureCode, reason: failureCode }),
+          ...(failureCode === undefined ? {} : { failureCode }),
+          ...safeToolOutput(event.toolName, event.result),
         },
       };
     }

@@ -105,7 +105,7 @@ service when using a custom launch configuration. For the default Windows servic
 ```powershell
 $env:GLASSBOX_DATA_DIR = Join-Path $env:USERPROFILE '.glassbox'
 $env:PORT = '3030'
-npm run glassbox -- capabilities probe p3-qq 1126022432 --json
+npm run glassbox -- capabilities probe p3-qq 123456789 --json
 ```
 
 When running `dev:server` directly, the server uses the repository's `.glassbox` directory unless

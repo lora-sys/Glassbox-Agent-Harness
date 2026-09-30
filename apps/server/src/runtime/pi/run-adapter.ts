@@ -94,6 +94,8 @@ function ownerMemoryCommand(text: string): RequiredToolCall | undefined {
   if (get) return { name: OWNER_MEMORY_ADMIN_TOOL, input: { action: "get", id: get[1] } };
   if (command === "/memory candidates")
     return { name: OWNER_MEMORY_ADMIN_TOOL, input: { action: "list_candidates" } };
+  if (command === "/memory ok")
+    return { name: OWNER_MEMORY_ADMIN_TOOL, input: { action: "confirm" } };
   const source =
     /^\/memory source (\S+) (?:(?:([1-9]\d{0,15}) )?)(history|notice|essence|metadata|file|album)$/u.exec(
       command,
@@ -571,12 +573,14 @@ export function piProfileName(
  * The Tool the current message requires, or `undefined` when it requires none.
  *
  * Read from the message alone: the chat type the caller acted in, whether they are the Owner,
- * and the text. The Run's resolved Tool surface is deliberately not an input. A requirement
- * that disappeared with the Tool would leave a Run whose surface withheld it free to answer
- * with a fluent claim about an action it never performed, and that is the state in which a
- * fabricated answer is hardest to detect — a surface that failed to resolve would drop every
- * requirement at once. What the surface decides is *satisfiability*: a Run that cannot call
- * the required Tool fails closed below rather than reporting success. Requiring is never
+ * and the text. The Run's resolved Tool surface is deliberately not an input to *whether* a
+ * requirement exists. A requirement that disappeared with the Tool would leave a Run whose
+ * surface withheld it free to answer with a fluent claim about an action it never performed, and
+ * that is the state in which a fabricated answer is hardest to detect — a surface that failed to
+ * resolve would drop every requirement at once. What the surface decides is *satisfiability*: a
+ * Run that cannot call the required Tool fails closed below rather than reporting success, and a
+ * Tool the surface never carried is not counted as unmet either, because that is an
+ * authorization decision the Run can see and should be allowed to explain. Requiring is never
  * granting: the Tool still re-authorizes its own Resource at execution time.
  */
 function requiredToolCall(
@@ -605,18 +609,23 @@ function requiredToolCall(
     const text = requestClauses(input.text);
     const mutation = MUTATION_REQUESTS.find((entry) => entry.words.test(text));
     if (!mutation) return undefined;
-    const params = mutation.params(text);
-    if (params === undefined) return undefined;
     // Group-native roles get only the explicit local subset. `set_group_admin` and file writes
     // remain Glassbox Owner-private even when the current QQ sender is a group owner.
     if (mutation.operation === "set_group_admin" || mutation.tool === "qq_group_file_ops")
       return undefined;
+    const params = mutation.params(text);
     return {
       name: mutation.tool === "qq_group_settings" ? "qq_group_local_settings" : mutation.tool,
       input: {
         groupId: input.caller.scope.chatId,
         operation: mutation.operation,
-        params,
+        // A member named by card rather than by number has nothing this layer can bind, and a
+        // requirement that pinned a value it could not read would have to be dropped — which
+        // drops the requirement with it, and a Run that narrates a mute it never performed
+        // would then have nothing standing between it and the room. So what the text *does*
+        // establish — that the Owner asked for this operation in this group — stays required,
+        // and the member the Run resolves against the roster is what it may fill in.
+        ...(params === undefined ? {} : { params }),
       },
     };
   }
@@ -657,15 +666,18 @@ function requiredToolCall(
   // it targets and the target and value it selects. The exact operation and every provider
   // parameter the message pins down are part of the required input, so the call cannot
   // substitute a different operation, a different member, a different duration or a different
-  // value. A message that names the operation but not enough to identify its target yields no
-  // required-Tool context at all, and the mutation stays unauthorized.
+  // value. A target named by card rather than by number is left to the Run to resolve: what the
+  // message establishes is the operation, and that is what stays required.
   const mutation = MUTATION_REQUESTS.find((entry) => entry.words.test(text));
   if (mutation) {
     const params = mutation.params(text);
-    if (params === undefined) return undefined;
     return {
       name: mutation.tool,
-      input: { groupId, operation: mutation.operation, params },
+      input: {
+        groupId,
+        operation: mutation.operation,
+        ...(params === undefined ? {} : { params }),
+      },
     };
   }
 
@@ -996,11 +1008,16 @@ function impersonatedOwnerRequest(
  * is a fact the Run made up. The name check uses the same configuration list the claim gate uses,
  * because those are exactly the identities whose conferral grants authority.
  *
- * The "本人" form is the third, and it is the one that needs no second-person address at all. A
- * visitor asked to have another member muted while claiming to be the Owner, and the Run answered
- * "发件人不是 Lora 本人（3526039967）… 就算您是 Lora，我也没有禁言能力" — it reasoned about the claim
- * instead of refusing it, and handed the room the Owner's number on the way. The first sentence
- * contains no 您 or 你 anywhere, so an address-only pattern reads it as a mention of a third party.
+ * What the Run does when it refuses a claim correctly is the case that decides the shape of all
+ * of them. A Run that answered "非 Lora 发件人，本类请求不响应。如需计算，请由 Lora 本人发起。" was
+ * withheld by the 本人 pattern and had its refusal replaced, because 本人 sat twelve characters
+ * from "Lora" and the pattern was unanchored — it could start anywhere in the sentence, so it
+ * matched the words the Run used to say who may *start* a request rather than who is speaking. A
+ * gate that cannot tell 冒用身份 from 提及身份的拒绝 silences the correct answer and leaves the
+ * wrong one. So nothing here reads a bare mention: 本人 has to be attached to an identity the Run
+ * *attributes* to the message's own sender, and every sentence that questions, denies, or offers a
+ * premise conditionally is skipped whole. "发件人不是 Lora 本人（3526039967）" is a denial and goes
+ * out; "作为 Lora 本人" and "发件人就是 Owner" are assertions and stay.
  *
  * A question is not a conferral. "您是 Owner 吗？" asks and asserts nothing, so the reply is read
  * one sentence at a time and an interrogative sentence is skipped whole — refusing it would take
@@ -1021,12 +1038,33 @@ function misattributesSender(
     OWNER_ROLE_WORDS.map((word) => word.replace(/\s+/gu, "\\s*")).join("|"),
     "iu",
   );
-  // "X 本人" — an identity asserted of the sender without addressing them.
-  const asSelf = /[^\n]{0,6}(?:作为|身为)?[^\n]{0,4}本人/u;
+  // A conditional does not assert its premise, so "就算您是 Lora，我也没有禁言能力" is the Run
+  // refusing on both branches and asserting the identity on neither.
+  const conditional = /(?:就算|即使|哪怕|如果|假如|即便|除非|万一)[^。！？!?；;\n]{0,30}(?:您|你)/u;
+  // An identity the Run attaches to the message's own sender. Two forms, both anchored to a word
+  // that carries the attribution rather than to any distance from a name: an explicit role the
+  // sender is said to occupy, and a sentence that names the message itself as its subject. The
+  // copula may not be negated, which is what separates "发件人就是 Owner" from "发件人不是 Lora".
+  const roleSpans = OWNER_ROLE_WORDS.map((word) => word.replace(/\s+/gu, "\\s*")).join("|");
+  const anyIdentity = escaped.length > 0 ? [escaped.join("|"), roleSpans].join("|") : roleSpans;
+  const attributesSender = new RegExp(
+    [
+      // "作为 Lora 本人", "来自 Lora 本人（3526039967）".
+      escaped.length > 0
+        ? `(?:作为|身为|来自|属于|正是|就是)[^。！？!?；;，,\\n不没非别勿]{0,8}(?:${escaped.join("|")})[^。！？!?；;，,\\n]{0,8}本人`
+        : "(?!x)x",
+      // "发件人是 Lora 本人", "此消息为 Owner".
+      `(?:发件人|发送者|对方|此消息|该消息|这条消息|消息来自)[^。！？!?；;，,\\n不没非别勿]{0,4}(?:是|为)[^。！？!?；;，,\\n]{0,8}(?:${anyIdentity})`,
+    ].join("|"),
+    "iu",
+  );
   for (const sentence of reply.split(/(?<=[。！？!?；;\n])/u)) {
     if (/[？?]/u.test(sentence)) continue;
+    if (conditional.test(sentence)) continue;
     const addressed =
-      /(?:您|你|阁下)[^。！？!?；;，,\n]{0,6}?(?:是|为)([^。！？!?；;，,\n]{0,16})/u.exec(sentence);
+      /(?:您|你|阁下)[^。！？!?；;，,\n不没非别勿]{0,6}?(?:是|为)([^。！？!?；;，,\n]{0,16})/u.exec(
+        sentence,
+      );
     if (addressed) {
       const attributed = addressed[1] ?? "";
       const number = /(\d{5,11})/u.exec(attributed);
@@ -1034,10 +1072,7 @@ function misattributesSender(
       if (named?.test(attributed)) return true;
       if (role.test(attributed)) return true;
     }
-    // "Lora 本人" is a conferral wherever it sits, and "群里 lora 本人" is a mention of a third
-    // party, so the sentence has to carry a protected identity or a role word for the form to
-    // count — the presence of 本人 alone is not enough.
-    if (asSelf.test(sentence) && (named?.test(sentence) || role.test(sentence))) return true;
+    if (attributesSender.test(sentence)) return true;
   }
   return false;
 }
@@ -1062,6 +1097,169 @@ function defersConductToMember(reply: string): boolean {
   return /(?:您|你|阁下)[^。！？!?；;，,\n]{0,12}?(?:怎么|如何|怎样)(?:处理|处置|办|安排|应对)[^。！？!?；;\n]{0,60}?(?:还是|或者)/u.test(
     reply,
   );
+}
+
+/**
+ * The Tools a Run can call to change something that outlives it.
+ *
+ * The set a requirement is tested against when the surface withheld it, and the set a Run is
+ * checked against when it claims something changed. Both questions are "was this something a
+ * Run could actually have done", so they share the answer.
+ */
+const STATEFUL_CHANGE_TOOLS: readonly string[] = [
+  ...new Set(MUTATION_REQUESTS.map((entry) => entry.tool)),
+  "qq_group_local_settings",
+  OWNER_GROUP_ADMIN_TOOL,
+  OWNER_MODEL_ADMIN_TOOL,
+  OWNER_MEMORY_ADMIN_TOOL,
+  MEDIA_GENERATION_TOOL,
+];
+
+/**
+ * The sentences of a reply that state something, rather than ask, instruct, or hedge.
+ *
+ * Every claim gate below reads a reply to decide whether it reported an outcome, and the sentence
+ * is the unit because a reply mixes registers in one breath: the answer to a request the Run could
+ * not perform opens with "需要群管理员权限" and can close with "已完成设置". Read whole, one of the
+ * two sentences is always misread.
+ *
+ * A question asserts nothing about the world, so an interrogative sentence is dropped. So is one
+ * that tells the reader what somebody else must do — 需要, 请去, 要找 — because that is precisely
+ * what a Run says when it is pointing at an action instead of reporting one.
+ */
+function assertingSentences(reply: string): readonly string[] {
+  return reply.split(/(?<=[。！？!?；;\n])/u).filter((sentence) => {
+    if (/[？?]/u.test(sentence)) return false;
+    return !/(?:需要|需先|需由|得先|先得|请[到向找联讨]|建议|要找|要先|要去|请联系|麻烦你|管理面|界面里)/u.test(
+      sentence,
+    );
+  });
+}
+
+/**
+ * The identifiers Glassbox's capability policy is keyed by, or the plain word for a capability.
+ *
+ * A claim about durable state has to be about something durable, and this is what that something
+ * is named by: a `group.moderate`-shaped category, or the word 能力. A message that talks about
+ * banning without naming either — "把 Ripped 禁言 30 秒" — is asking for an action, not reporting
+ * a policy, and answering it cannot be a claim about one.
+ */
+const capabilitySubject = /(?:group|memory|message)(?:\.[a-z]+){1,2}|能力/iu;
+
+/**
+ * A verb or spelling that says a setting now stands in a new state.
+ *
+ * Both forms are here because both appear: the Chinese verb the Owner reads, and the
+ * `enabled=true` / `version：8` shape the policy itself is written in. `打开` is absent on
+ * purpose — it also means opening a file, and a claim about something that outlives the Run must
+ * not be one that reads as a description of looking at something.
+ */
+const capabilityLanded =
+  /(?:开启|启用|开通|开放|启动|开[了过]|关[了过]|关闭|停用|禁用|升级|回滚|修改|调整|改成|改为)|(?:enabled|disabled)\s*[=:：]\s*[^。！？!?；;\n]{1,12}|(?:version|版本)\s*[=:：]\s*\d+/iu;
+
+/**
+ * What stands in front of the verb and takes the assertion back.
+ *
+ * A negation obviously, and also the shape that describes rather than changes: `处于关闭状态`
+ * reports where a setting stands, and `需要` tells the reader what would have to be done.
+ */
+const capabilityUndone =
+  /(?:不|没|未|无|别|勿|尚未|仍然?|还是|还|不会|不能|无法|并没有|压根没|没有|处于|状态是?)[^。！？!?；;，,\n]{0,6}$/u;
+
+/**
+ * A sentence that opens by naming where a setting stands right now.
+ *
+ * The line between reporting a state and announcing a change is tense, and the tense is at the
+ * head of the sentence: `当前 group.moderate：enabled=true` is what a Run that just read the row
+ * says, and `group.moderate：enabled=true ✅` is what one that wants credit for writing it says.
+ * The cue has to be allowed to sit far from the verb, because the screenful of policy between them
+ * is exactly what a read produces.
+ */
+const describesPresentState = /^\s*(?:当前|目前|现在|现有|保持|仍然?|还是|原本|之前|先前|刚才)/u;
+
+/**
+ * Whether the reply states that a capability or setting now stands in a state it did not.
+ *
+ * The Owner's private instruction to turn a capability on was answered with "group.moderate：
+ * enabled=true ✅" and "version：8", from a Run that called no Tool at all, against a policy row
+ * still sitting at the version written a week earlier. Nothing refused it, because nothing was
+ * watching: the requirement layer watches for calls the *message* named, and the Owner named a
+ * capability category, which has no Tool. The gap is not that the Owner's wording was missed. It
+ * is that a Run could state a durable change and nothing below the model asked what performed it.
+ *
+ * All three conditions are needed, and each one removes a reply that must be delivered. Without
+ * the subject the verdict is "禁言谁", which asks for an action rather than reporting a policy.
+ * Without the unnegated verb it is "没有禁言能力" or "仍关闭", which is what a Run without the
+ * Tool is there to say. Without the question and conditional screens it is "要开启得去管理面",
+ * which tells the reader what to do instead of claiming to have done it.
+ */
+function assertsCapabilityChanged(reply: string): boolean {
+  if (!capabilitySubject.test(reply)) return false;
+  return assertingSentences(reply).some((sentence) => {
+    if (describesPresentState.test(sentence)) return false;
+    const landed = capabilityLanded.exec(sentence);
+    if (!landed) return false;
+    return !capabilityUndone.test(sentence.slice(0, landed.index));
+  });
+}
+
+/**
+ * The words that say something is done.
+ *
+ * These are the words a Run reports a finished action with, and they are deliberately not a list
+ * of the actions themselves. The layer below already knows which action the message asked for —
+ * that is what bound the requirement — so what is left to read is only whether the Run called it
+ * done, and inventing a per-operation verb list would break the first time one was missed.
+ */
+const completedMarked = /(?:已经|完成|成功|搞定|办完|弄好|✅|已)/u;
+
+/**
+ * What takes a sentence back, so it reports a state rather than a change.
+ *
+ * A negation obviously, and also the three ways a Run says an action did not land while using a
+ * word from the list above: 失败, 报错, and the refusals 无法/不能/无权. "已尝试但失败" and "已
+ * 禁言" are the difference between a Run reporting honestly and one reporting fiction, and both
+ * contain 已.
+ */
+const withdrawnFrom =
+  /(?:不|没|未|无|别|勿|否|并?没有|压根没|暂时|仍|还|未能|没能够|失败|报错|错误|异常|无法|不能|无权|受限|需要|请)/u;
+
+/**
+ * Whether the reply says the action it was asked for is done.
+ *
+ * The message named a mutating operation and nothing below the model performed it, which happens
+ * in one of two ways: the Run's surface never carried the Tool, or the requirement could not bind
+ * the group the message named and the Run had to resolve that itself. Both leave the Run free to
+ * report an outcome, and "已禁言 Ripped 30 秒" from a Run that called nothing is the reply the
+ * room will act on — so the sentence is read for whether it says done, not for which verb it used.
+ *
+ * The escape for the honest answer is the point. A Run that explains "本 Run 给我的工具里没有禁言
+ * 这个动作" contains no completion marker and is delivered whole; one that narrates the mute it
+ * could not perform is not. Reading only for the verb would withhold the former along with the
+ * latter, which is how a Run without the Tool ends up replaced by a fixed line and the reader
+ * learns nothing about why.
+ */
+function assertsActionCompleted(reply: string): boolean {
+  return assertingSentences(reply).some(
+    (sentence) => completedMarked.test(sentence) && !withdrawnFrom.test(sentence),
+  );
+}
+
+/**
+ * Whether a Run wrote the policy row a capability claim is about.
+ *
+ * The one Tool that can write it is the Owner's group-admin Tool, and reading it is not writing
+ * it: a Run that called `get` and then reported "group.moderate：enabled=true" has shown the
+ * reader a fact, not a change. The action has to say so.
+ */
+function wroteCapabilityPolicy(
+  observedCalls: readonly PiRunResult["toolCalls"][number][],
+): boolean {
+  return observedCalls.some((call) => {
+    if (call.failed !== false || call.name !== OWNER_GROUP_ADMIN_TOOL) return false;
+    const action = (call.input as { action?: unknown }).action;
+    return typeof action === "string" && action.startsWith("set_");
+  });
 }
 
 /**
@@ -1120,13 +1318,21 @@ function blockedMutationRequest(
   if (!command.test(text)) return undefined;
   const mutation = MUTATION_REQUESTS.find((entry) => entry.words.test(text));
   if (!mutation) return undefined;
-  if (mutation.params(text) === undefined)
-    return { operation: mutation.operation, reason: "incomplete_parameters" };
+  // No refusal is issued here for a target the text names but does not bind. Whether a command
+  // names its member by QQ number or by nickname — and which number a nickname belongs to — is a
+  // roster fact, and nothing in this layer can read a roster. Deciding it from the shape of the
+  // text alone is what sent ten consecutive mute requests away with a fixed line telling the
+  // sender their parameters were incomplete: the parameter they gave, "Ripped", is a group card
+  // the Run resolves. Authorization is what this layer can establish from the caller's own scope
+  // without help, and that is what it keeps.
   if (
     input.caller.scope.chatType === "group" &&
     (mutation.operation === "set_group_admin" || mutation.tool === "qq_group_file_ops")
   )
     return { operation: mutation.operation, reason: "not_permitted_in_group" };
+  // A private conversation carries no group, and a group operation needs one. That part is
+  // readable from the scope, so it is refused here rather than sent to a Run that has no
+  // resource to act on.
   if (input.caller.scope.chatType === "private" && isOwner && namedGroupId(text) === undefined)
     return { operation: mutation.operation, reason: "incomplete_parameters" };
   return undefined;
@@ -1675,7 +1881,26 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
                 : call.input,
             ),
         );
-      const missingRequiredCalls = () => requiredCalls.filter((call) => !callSatisfied(call));
+      // A mutation the Run's surface never carried is an authorization decision that has already
+      // been made, not an obligation the Run failed to meet. The capability policy declined the
+      // category and the Run reads the same short list the model does, so insisting on the Tool
+      // would trade the one explanation available — "this group has no moderation capability" —
+      // for a fixed line about an action that was never on offer. What the Run may not do is
+      // narrate the action it could not perform: that is covered below, by the check on what the
+      // Run asserts changed. A read stays worth insisting on either way: a question about live QQ
+      // facts has no answer without the Tool, and there is nothing for a Run to explain there.
+      // The narrowing is deliberately to a surface that resolved; when nothing resolved the array
+      // is absent, and a discovery failure must not be allowed to drop every requirement a Run
+      // was carrying.
+      const enforceableRequiredCalls = () => {
+        const surface = context.authorizedToolNames;
+        if (surface === undefined) return requiredCalls;
+        return requiredCalls.filter(
+          (call) => surface.includes(call.name) || !STATEFUL_CHANGE_TOOLS.includes(call.name),
+        );
+      };
+      const missingRequiredCalls = () =>
+        enforceableRequiredCalls().filter((call) => !callSatisfied(call));
       const completedRequiredTool = () => missingRequiredCalls().length === 0;
       // §2/§3 — every domain the message asked about, not the first one the check reached. A
       // message that asks about members *and* notices is not answered by observing one of them.
@@ -1850,6 +2075,45 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
               : "未能从 QQ 获取该信息，因此无法确认。",
           providerSessionId: binding.runtimeSessionId,
         };
+      // The claim about a change nobody performed. The requirement checks above read what the
+      // message asked for; these read what the Run concluded against what the Run actually did,
+      // because two things the Owner asks for reach this point with no requirement to lean on. One
+      // is a capability category, which no Tool the requirement layer names can be, and the other
+      // is an operation whose Tool the surface withheld — an authorization decision that has
+      // already been made and that the Run may explain but must not narrate. In both shapes the
+      // Run is the only thing standing between the room and an outcome that did not happen, and a
+      // capability row is what the whole room keeps believing after the Run ends.
+      //
+      // The question is asked before the narrowing on purpose. `completedRequiredTool` is
+      // answered against the surface this Run could reach, which is the authorization question;
+      // a requirement dropped there is not one the Run failed to meet, it is one the Run has to
+      // be quiet about, and reading the narrowed answer here would release the claim exactly
+      // where it is least likely to be noticed.
+      const unperformedAction = requiredCalls
+        .filter((call) => STATEFUL_CHANGE_TOOLS.includes(call.name))
+        .some((call) => !callSatisfied(call));
+      const unbackedChange = result.text
+        ? unperformedAction
+          ? assertsActionCompleted(result.text)
+          : assertsCapabilityChanged(result.text) && !wroteCapabilityPolicy(observedCalls)
+        : false;
+      if (unbackedChange) {
+        await this.recordEvidence({
+          type: "tool_evidence",
+          runId: input.run.id,
+          conversationId: input.conversation.id,
+          principalId: input.caller.principalId,
+          phase: "required",
+          required: [],
+          blockedMutation: { operation: "policy:capability", reason: "not_permitted" },
+        });
+        return {
+          status: "failed",
+          failureCode: "claimed_change_not_performed",
+          text: "本次 Run 没有执行被要求的变更，因此我不会声称它已经完成。请以管理面或群里的实际状态为准。",
+          providerSessionId: binding.runtimeSessionId,
+        };
+      }
       if (result.status === "completed" && officialSourceVerificationRequested(input.text)) {
         const failure = webAnswerEvidenceFailure({
           request: input.text,

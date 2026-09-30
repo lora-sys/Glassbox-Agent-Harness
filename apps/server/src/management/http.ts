@@ -61,6 +61,7 @@ export function createManagementHandler(options: {
   models: ModelProfileStore;
   status: () => unknown;
   doctor: () => unknown;
+  requestShutdown?: () => void;
   issueTicket?: (sessionId: unknown) => unknown;
   route?: (request: IncomingMessage) => Promise<{ status: number; body: unknown } | undefined>;
 }) {
@@ -73,7 +74,15 @@ export function createManagementHandler(options: {
         reply(response, 200, await options.status());
       else if (request.method === "GET" && path === "/manage/doctor")
         reply(response, 200, await options.doctor());
-      else if (request.method === "GET" && path === "/manage/models")
+      else if (
+        request.method === "POST" &&
+        path === "/manage/shutdown" &&
+        options.requestShutdown
+      ) {
+        request.resume();
+        reply(response, 202, { status: "stopping" });
+        setImmediate(options.requestShutdown);
+      } else if (request.method === "GET" && path === "/manage/models")
         reply(response, 200, { profiles: options.models.list() });
       else if (request.method === "POST" && path === "/manage/models") {
         reply(response, 200, {

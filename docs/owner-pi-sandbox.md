@@ -60,6 +60,13 @@ releasing that lease.
 
 ## Deployment
 
+Production browser access requires the reviewed Kit sandbox browser executor and its
+proxy, which pins each approved public address for the connection. Do not inject a
+custom `browserExecutor`: Glassbox's URL precheck and navigation/redirect checks do
+not pin DNS between validation and connection, so they cannot replace the proxy's
+DNS-rebinding protection. Browser and web capabilities are disabled by default;
+enable only the intended capabilities after this sandbox path is available.
+
 Build and smoke test the Kit image using the commands in the Kit README. Set
 `LORA_PI_KIT_PATH` to the reviewed Kit checkout and
 `GLASSBOX_SANDBOX_IMAGE` to the exact `sha256:...` image ID in that Kit's

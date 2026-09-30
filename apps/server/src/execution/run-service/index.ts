@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { AccessDeniedError } from "../../auth/service.js";
 import type { RunLease, RunRoute, TerminalRunStatus } from "../../conversation/lifecycle.js";
 import type { IncomingMessage, RunRecord } from "../../conversation/store.js";
@@ -34,6 +35,8 @@ const failureFallback: Record<string, string> = {
     "这次请求的内容超出了当前模型的上下文容量，未发送给模型。可以缩小问题范围或另开一个会话再试。",
   model_capacity_unknown: "没能确认当前模型的上下文容量，因此没有发送给模型。请稍后重试。",
   required_action_not_completed: "这次请求需要执行的操作没有完成，因此无法给出结果。请稍后重试。",
+  claimed_change_not_performed:
+    "这次没有执行被要求的变更，因此我不会声称它已经完成。请以管理面或群里的实际状态为准。",
   required_evidence_missing: "没能取到这条问题所依赖的原始信息，因此无法确认。请稍后重试。",
 };
 
@@ -58,6 +61,8 @@ const statusFallback: Record<string, string> = {
  */
 const DEFAULT_RESTORE_WINDOW_MS = 2 * 60 * 60 * 1000;
 const MAX_RESTORE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+const DISPATCH_RETRY_DELAYS_MS = [500, 1_000, 2_000] as const;
+const DISPATCH_SETTLEMENT_RETRY_MS = 1_000;
 
 /** Session task ownership adapts OpenHarness's gateway bridge. Durable queue
  * order, current authorization and immutable deliveries belong to DomainStore. */
@@ -138,8 +143,38 @@ export class RunService {
   async receive(input: IncomingMessage): Promise<AcceptedIncoming> {
     if (!this.started) throw new Error("Run service is not started");
     const accepted = await this.options.store.conversations.acceptIncoming(input);
+    if (!accepted.duplicate) await this.recordMessageReceived(input, accepted.run);
     await this.enqueueAccepted(accepted);
     return accepted;
+  }
+
+  /**
+   * Records the message that produced a Run as the first event on the Run's trace.
+   *
+   * The channel adapter calls `acceptIncoming` itself rather than going through
+   * `receive`, so this is exposed for it to call with the same `IncomingMessage` it
+   * stored. Duplicates reuse an existing Run, which already carries the event.
+   *
+   * Metadata only: the body stays in storage. The identifiers are what let a trace
+   * reader join a Run to its message, channel conversation and sender without the
+   * trace ever holding protected payload text.
+   */
+  async recordMessageReceived(input: IncomingMessage, run: RunRecord): Promise<void> {
+    await this.emit({
+      type: "message_received",
+      runId: run.id,
+      conversationId: run.conversationId,
+      externalId: input.messageId,
+      messageId: run.messageId,
+      connectionId: input.scope.connectionId,
+      botId: input.scope.botId,
+      chatType: input.scope.chatType,
+      chatId: input.scope.chatId,
+      senderId: input.scope.senderId,
+      ...(input.scope.threadId === undefined ? {} : { threadId: input.scope.threadId }),
+      textBytes: Buffer.byteLength(input.text, "utf8"),
+      textSha256: createHash("sha256").update(input.text, "utf8").digest("hex"),
+    });
   }
 
   async enqueueAccepted(accepted: AcceptedIncoming): Promise<void> {
@@ -224,7 +259,10 @@ export class RunService {
 
   async cancel(caller: CallerContext, runId: string): Promise<RunRecord> {
     const run = await this.getRun(caller, runId);
-    if (terminal.has(run.status) || run.status === "cancelling") return run;
+    if (terminal.has(run.status) || run.status === "cancelling") {
+      this.blocked.delete(runId);
+      return run;
+    }
     const active = this.active.get(run.conversationId);
     if (run.status === "queued") {
       const cancelled = await this.options.store.lifecycle.transitionRun(
@@ -233,6 +271,7 @@ export class RunService {
         "queued",
         "cancelled",
       );
+      this.blocked.delete(runId);
       if (active?.route.runId === runId) active.controller.abort();
       await this.emit({
         type: "run_finished",
@@ -317,7 +356,8 @@ export class RunService {
     for (const subscriptions of this.waiters.values())
       for (const waiter of subscriptions) waiter.stop();
     this.waiters.clear();
-    if (options.abortRunning) for (const active of this.active.values()) active.controller.abort();
+    for (const active of this.active.values())
+      if (options.abortRunning || !active.lease) active.controller.abort();
     if (options.wait) await this.drain();
   }
 
@@ -330,11 +370,14 @@ export class RunService {
         while (this.started && this.pumpAgain) {
           this.pumpAgain = false;
           let cursor = 0;
+          const seenConversations = new Set<string>();
           while (this.started && this.active.size < this.concurrency) {
             const routes = await this.options.store.lifecycle.listRunRoutes(["queued"], cursor);
             if (routes.length === 0) break;
             for (const route of routes) {
               cursor = route.sequence;
+              if (seenConversations.has(route.conversationId)) continue;
+              seenConversations.add(route.conversationId);
               if (this.blocked.has(route.runId) || this.active.has(route.conversationId)) continue;
               this.launch(route);
               if (this.active.size >= this.concurrency) break;
@@ -366,7 +409,6 @@ export class RunService {
     active.task = Promise.resolve()
       .then(() => this.execute(active))
       .catch(() => {
-        this.blocked.add(route.runId);
         this.report("dispatch_failed", route.runId);
       })
       .finally(() => {
@@ -375,19 +417,84 @@ export class RunService {
       });
   }
 
+  private async waitBeforeRetry(ms: number, signal: AbortSignal): Promise<void> {
+    if (signal.aborted) return;
+    await new Promise<void>((resolve) => {
+      const finish = () => {
+        clearTimeout(timer);
+        signal.removeEventListener("abort", finish);
+        resolve();
+      };
+      const timer = setTimeout(finish, ms);
+      signal.addEventListener("abort", finish, { once: true });
+      if (signal.aborted) finish();
+    });
+  }
+
+  private async settleUnclaimedDispatch(active: ActiveRun): Promise<void> {
+    const { caller, runId, conversationId } = active.route;
+    while (this.started) {
+      try {
+        const finished = await this.options.store.lifecycle.failQueuedDispatch(caller, runId);
+        this.blocked.delete(runId);
+        if (!this.started) return;
+        if (!finished) return;
+        await this.emit({
+          type: "run_finished",
+          runId,
+          conversationId,
+          status: finished.status,
+          outputWithheld: false,
+        });
+        this.publishInBackground(caller, finished);
+        return;
+      } catch {
+        this.report("dispatch_failed", runId);
+        // Keep ownership of this conversation until the database can commit the terminal fact.
+        await new Promise<void>((resolve) => setTimeout(resolve, DISPATCH_SETTLEMENT_RETRY_MS));
+      }
+    }
+  }
+
   private async execute(active: ActiveRun): Promise<void> {
     const { caller, runId } = active.route;
-    let run: RunRecord;
-    try {
-      run = await this.getRun(caller, runId);
-      if (run.status !== "queued") return;
-      if (!this.started || active.controller.signal.aborted) return;
-      active.lease = await this.options.store.lifecycle.claimQueuedRun(caller, run.id);
-    } catch (error) {
-      this.blocked.add(runId);
-      if (!(error instanceof AccessDeniedError)) this.report("dispatch_failed", runId);
-      return;
+    let run: RunRecord | undefined;
+    for (let attempt = 0; !active.lease && this.started; attempt++) {
+      try {
+        run = await this.getRun(caller, runId);
+        if (run.status === "running" || run.status === "cancelling") {
+          await this.settleUnclaimedDispatch(active);
+          return;
+        }
+        if (run.status !== "queued") {
+          this.blocked.delete(runId);
+          return;
+        }
+        if (active.controller.signal.aborted) return;
+        active.lease = await this.options.store.lifecycle.claimQueuedRun(caller, run.id);
+        this.blocked.delete(runId);
+      } catch (error) {
+        if (!this.started) return;
+        if (error instanceof AccessDeniedError) {
+          this.blocked.add(runId);
+          return;
+        }
+        this.report("dispatch_failed", runId);
+        const observed = await this.getRun(caller, runId).catch(() => null);
+        if (observed && observed.status !== "queued") {
+          if (observed.status === "running" || observed.status === "cancelling")
+            await this.settleUnclaimedDispatch(active);
+          else this.blocked.delete(runId);
+          return;
+        }
+        if (attempt >= DISPATCH_RETRY_DELAYS_MS.length) {
+          await this.settleUnclaimedDispatch(active);
+          return;
+        }
+        await this.waitBeforeRetry(DISPATCH_RETRY_DELAYS_MS[attempt]!, active.controller.signal);
+      }
     }
+    if (!active.lease || !run) return;
 
     let result: ExecutionResult;
     try {
@@ -470,6 +577,7 @@ export class RunService {
       conversationId: run.conversationId,
       status,
       outputWithheld: finished.outputWithheld,
+      ...(result.failureCode ? { failureCode: result.failureCode } : {}),
     });
     if (finished.outputWithheld) return;
     if (status === "succeeded" && result.providerSessionId) {
@@ -662,7 +770,15 @@ export class RunService {
         outcome.status,
         outcome.status === "sent" ? outcome.externalId : undefined,
       );
-      await this.emit({ type: "delivery_changed", runId, deliveryId, status: outcome.status });
+      await this.emit({
+        type: "delivery_changed",
+        runId,
+        deliveryId,
+        status: outcome.status,
+        ...(outcome.status === "sent" && outcome.externalId
+          ? { externalId: outcome.externalId }
+          : {}),
+      });
     } catch {
       this.report("delivery_failed", runId);
     }

@@ -15,6 +15,7 @@ import { ChannelProfileStore } from "../config/channel-profiles.js";
 import { GroupRuntimeStore } from "../config/group-runtime.js";
 import type { ModelProfileStore } from "../config/model-profiles.js";
 import { ExecutorConfiguration } from "../config/executors.js";
+import { IngressEvidenceLog, type GroupIngressEvidenceCounts } from "./ingress-evidence.js";
 import {
   OneBotAdapter,
   OneBotConnectionError,
@@ -29,6 +30,7 @@ import {
   type RunExecutionAdapter,
   type RunServiceEvent,
 } from "../execution/run-service/index.js";
+import type { IncomingMessage as StoredIncomingMessage } from "../conversation/store.js";
 import { configuredModelAdapter } from "../execution/model-adapter.js";
 import { estimateUnicodeTokens } from "../efficiency/index.js";
 import {
@@ -194,26 +196,6 @@ import {
 
 const OWNER_ID = "owner";
 const AGENT_ID = "personal";
-interface GroupIngressDiagnosticCounts {
-  serviceStartedAt: string;
-  lastObservedAt: string | null;
-  normalized: number;
-  ignoredNotAddressed: number;
-  ignoredEmptyMessage: number;
-  rejectedInvalidMessage: number;
-  rejectedUnsupportedMessage: number;
-  rejectedOverflow: number;
-  acceptanceFailed: number;
-  /**
-   * Group messages that arrived while the socket was not ready and were dropped.
-   *
-   * Before this counter, that path returned silently, so a group that lost messages during a
-   * NapCat restart looked exactly like a group that was quiet. The count does not recover the
-   * messages, but it makes the gap visible and gives the reconnect backfill something to be
-   * measured against.
-   */
-  droppedNotReady: number;
-}
 
 type AuthorizationContext = {
   caller: CallerContext;
@@ -402,14 +384,14 @@ export class ManagementApplication {
     Pick<PublicChannelProfile, "connectionState" | "lastError">
   >();
   private readonly ingressStartedAt = new Date().toISOString();
-  private readonly groupIngressDiagnostics = new Map<string, GroupIngressDiagnosticCounts>();
+  private readonly ingressEvidence: IngressEvidenceLog;
   /**
    * Per-channel count of messages dropped because the connection was not ready.
    *
    * Held apart from `states` on purpose: `updateChannelState` replaces that whole entry on
    * every transition, so a counter living there would be wiped the moment the connection
    * recovered — which is exactly when the operator still needs to see that it happened. Held
-   * apart from `groupIngressDiagnostics` because a private drop belongs to no group.
+   * apart from `ingressEvidence` because a private drop belongs to no group.
    */
   private readonly channelDroppedNotReady = new Map<string, number>();
   /**
@@ -468,6 +450,9 @@ export class ManagementApplication {
     this.archive = new ChannelArchiveStore(store.db);
     this.kitLoader = new KitLoader(options.kitPath);
     this.workspaceWrites = new WorkspaceWriteOccupancy(options.dataDirectory);
+    // Group ingress evidence must outlive the process: the restart that fixes a bug is the
+    // restart after which you most need to know why a group went quiet.
+    this.ingressEvidence = IngressEvidenceLog.open(options.dataDirectory);
     this.deliveryPolicy = createQqDeliveryPolicy({
       forbiddenValues: () => [
         ...hostDeliveryForbiddenValues({
@@ -725,6 +710,10 @@ export class ManagementApplication {
     });
     const application = new ManagementApplication(options, store, channels, groupRuntime);
     try {
+      // Ingress evidence names groups and channel ids, so it gets the same private treatment as
+      // the trace it sits beside. Done here rather than in the constructor because the Windows
+      // ACL step is asynchronous.
+      await application.ingressEvidence.secureFile();
       const piAgentDirectory =
         options.piAgentDirectory === undefined ? getAgentDir() : options.piAgentDirectory;
       if (piAgentDirectory)
@@ -2397,7 +2386,22 @@ export class ManagementApplication {
           "Disconnect the channel before editing its configuration",
           409,
         );
-      const channel = await this.channels.save(input);
+      const channel = await this.channels.save(input, async (previous, next) => {
+        if (!previous) return;
+        const members = (config: typeof next) =>
+          new Map<string, string>([
+            [config.ownerId, OWNER_ID],
+            ...(config.coOwnerId ? [[config.coOwnerId, `owner-${config.coOwnerId}`] as const] : []),
+            ...config.visitorIds.map((senderId) => [senderId, `qq-visitor-${senderId}`] as const),
+          ]);
+        const nextMembers = members(next);
+        for (const [senderId, principalId] of members(previous)) {
+          if (previous.botId === next.botId && nextMembers.get(senderId) === principalId) continue;
+          const identity = { connectionId: previous.connectionId, botId: previous.botId, senderId };
+          await this.store.authorization.revokeSenderScopes(identity);
+          await this.store.identities.unbind(identity);
+        }
+      });
       this.states.delete(id);
       return channel;
     });
@@ -2543,14 +2547,20 @@ export class ManagementApplication {
           }
         }
         if (imageFailureCode) images.length = 0;
-        const accepted = await this.store.conversations.acceptIncoming({
+        const incoming: StoredIncomingMessage = {
           agentId: AGENT_ID,
           scope: message.scope,
           messageId: message.messageId,
           text: message.text || (hasImage ? "请描述这张图片。" : ""),
           executionRef: runExecutionRef,
           ...(imageFailureCode ? { imageFailureCode } : images.length > 0 ? { images } : {}),
-        });
+        };
+        const accepted = await this.store.conversations.acceptIncoming(incoming);
+        // A Run's Trace starts at message_received, which is the only place the two halves of
+        // the ingress path are stitched together: the drop that never became a Run is invisible
+        // in the run's own file, and the run's own file is the only place the message text is
+        // available to correlate.
+        if (!accepted.duplicate) await this.runs.recordMessageReceived(incoming, accepted.run);
         if (!accepted.duplicate && message.scope.nativeGroupRole) {
           const cursor = await this.trace.append(
             accepted.run.id,
@@ -4270,28 +4280,11 @@ export class ManagementApplication {
     return { audits, ingressDiagnostics: this.groupIngressDiagnosticsFor(channelId, groupId) };
   }
 
-  private groupIngressDiagnosticKey(channelId: string, groupId: string): string {
-    return `${channelId}:${groupId}`;
-  }
-
   private groupIngressDiagnosticsFor(
     channelId: string,
     groupId: string,
-  ): GroupIngressDiagnosticCounts {
-    return (
-      this.groupIngressDiagnostics.get(this.groupIngressDiagnosticKey(channelId, groupId)) ?? {
-        serviceStartedAt: this.ingressStartedAt,
-        lastObservedAt: null,
-        normalized: 0,
-        ignoredNotAddressed: 0,
-        ignoredEmptyMessage: 0,
-        rejectedInvalidMessage: 0,
-        rejectedUnsupportedMessage: 0,
-        rejectedOverflow: 0,
-        acceptanceFailed: 0,
-        droppedNotReady: 0,
-      }
-    );
+  ): GroupIngressEvidenceCounts {
+    return this.ingressEvidence.countsFor(channelId, groupId, this.ingressStartedAt);
   }
 
   private recordGroupIngressDiagnostic(
@@ -4308,19 +4301,23 @@ export class ManagementApplication {
       return;
     }
     if (!this.channels.resolve(channelId).config.groupIds.includes(diagnostic.groupId)) return;
-    const key = this.groupIngressDiagnosticKey(channelId, diagnostic.groupId);
-    const current = this.groupIngressDiagnosticsFor(channelId, diagnostic.groupId);
-    const next = { ...current, lastObservedAt: new Date().toISOString() };
-    const field =
-      diagnostic.stage === "normalized"
-        ? "normalized"
-        : diagnostic.stage === "dropped"
-          ? "droppedNotReady"
-          : diagnostic.reason === "not_addressed"
-            ? "ignoredNotAddressed"
-            : "ignoredEmptyMessage";
-    next[field] = Math.min(1_000_000, next[field] + 1);
-    this.groupIngressDiagnostics.set(key, next);
+    const ts = new Date().toISOString();
+    if (diagnostic.stage === "normalized") {
+      this.ingressEvidence.recordNormalized(channelId, diagnostic.groupId, ts);
+      return;
+    }
+    this.ingressEvidence.recordDropped(
+      channelId,
+      diagnostic.groupId,
+      // A drop and an ignore are different failures and must not share a counter: one is the
+      // connection, the other is the Agent's own addressing rules.
+      diagnostic.stage === "dropped"
+        ? "not_ready"
+        : diagnostic.reason === "not_addressed"
+          ? "not_addressed"
+          : "empty_message",
+      ts,
+    );
   }
 
   private recordGroupIngressError(
@@ -4332,19 +4329,12 @@ export class ManagementApplication {
   ): void {
     if (!error.groupId || !this.channels.resolve(channelId).config.groupIds.includes(error.groupId))
       return;
-    const key = this.groupIngressDiagnosticKey(channelId, error.groupId);
-    const current = this.groupIngressDiagnosticsFor(channelId, error.groupId);
-    const next = { ...current, lastObservedAt: new Date().toISOString() };
-    const field =
-      error.code === "invalid_message"
-        ? "rejectedInvalidMessage"
-        : error.code === "unsupported_message"
-          ? "rejectedUnsupportedMessage"
-          : error.code === "ingress_overflow"
-            ? "rejectedOverflow"
-            : "acceptanceFailed";
-    next[field] = Math.min(1_000_000, next[field] + 1);
-    this.groupIngressDiagnostics.set(key, next);
+    this.ingressEvidence.recordDropped(
+      channelId,
+      error.groupId,
+      error.code,
+      new Date().toISOString(),
+    );
   }
 
   async route(request: IncomingMessage): Promise<{ status: number; body: unknown } | undefined> {
