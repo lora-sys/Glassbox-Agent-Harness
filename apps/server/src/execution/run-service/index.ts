@@ -5,6 +5,7 @@ import type { IncomingMessage, RunRecord } from "../../conversation/store.js";
 import { requireIdentifier, type CallerContext } from "../../identity/scope.js";
 import type {
   AcceptedIncoming,
+  ExecutionFailureCode,
   ExecutionResult,
   RunServiceEvent,
   RunServiceOptions,
@@ -28,8 +29,13 @@ const terminal = new Set(["cancelled", "succeeded", "failed", "interrupted", "un
 
 /** What a Run with no text of its own tells its reader, keyed by the cause it recorded.
  * Each line names what actually went wrong: a reader who is told only "状态为 unknown" cannot
- * act on it, and the four Runs that reached this fallback on 2026-09-28 all said the same thing. */
-const failureFallback: Record<string, string> = {
+ * act on it, and the four Runs that reached this fallback on 2026-09-28 all said the same thing.
+ *
+ * The key is the closed union of causes, so a cause added later cannot be added without the
+ * sentence that explains it. A `Record<string, string>` here would let a new cause reach a reader
+ * as "任务处理未完成" — a line that says a Run produced nothing without saying why, which is the
+ * whole defect this table exists to close. */
+const failureFallback: Record<ExecutionFailureCode, string> = {
   execution_threw: "执行这次请求的进程中途出错了，没有产出结果。请稍后重试。",
   pre_provider_context_overflow:
     "这次请求的内容超出了当前模型的上下文容量，未发送给模型。可以缩小问题范围或另开一个会话再试。",
@@ -611,9 +617,13 @@ export class RunService {
     // back to naming the status rather than staying silent. Blank text counts as having said
     // nothing: delivering it would send an empty message.
     const reported = run.resultText?.trim() ? run.resultText : undefined;
+    // The recorded cause is read as the cause type, because that is what the column holds: a
+    // writer went through the closed union. A value that is not in the union is not one of the
+    // causes this table explains, and it falls through to the status line below.
+    const cause = run.failureCode as ExecutionFailureCode | null | undefined;
     const candidate =
       reported ??
-      (run.failureCode ? failureFallback[run.failureCode] : undefined) ??
+      (cause ? failureFallback[cause] : undefined) ??
       statusFallback[run.status] ??
       `任务处理未完成，状态为 ${run.status}。`;
     const prepared = this.options.prepareDelivery
