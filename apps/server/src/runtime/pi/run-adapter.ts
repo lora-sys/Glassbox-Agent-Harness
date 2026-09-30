@@ -94,6 +94,8 @@ function ownerMemoryCommand(text: string): RequiredToolCall | undefined {
   if (get) return { name: OWNER_MEMORY_ADMIN_TOOL, input: { action: "get", id: get[1] } };
   if (command === "/memory candidates")
     return { name: OWNER_MEMORY_ADMIN_TOOL, input: { action: "list_candidates" } };
+  if (command === "/memory ok")
+    return { name: OWNER_MEMORY_ADMIN_TOOL, input: { action: "confirm" } };
   const source =
     /^\/memory source (\S+) (?:(?:([1-9]\d{0,15}) )?)(history|notice|essence|metadata|file|album)$/u.exec(
       command,

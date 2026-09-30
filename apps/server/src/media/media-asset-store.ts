@@ -1,8 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { execFile as execFileCallback } from "node:child_process";
-import { chmod, lstat, mkdir, open, readFile, realpath, rename, rm } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, realpath, rename, rm } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
-import { promisify } from "node:util";
+import { securePrivatePath } from "../platform/private-path.js";
 
 const MIME_EXTENSIONS = {
   "image/png": "png",
@@ -15,7 +14,6 @@ const MAX_METADATA_BYTES = 8 * 1024;
 const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-const execFile = promisify(execFileCallback);
 
 export interface MediaAssetBinding {
   principalId: string;
@@ -120,22 +118,7 @@ async function writePrivateFile(path: string, data: string | Buffer): Promise<vo
 }
 
 async function secureDirectory(path: string): Promise<void> {
-  await chmod(path, 0o700);
-  if (process.platform !== "win32") return;
-
-  const systemRoot = process.env.SystemRoot;
-  if (!systemRoot || !isAbsolute(systemRoot)) throw new Error("media_asset_acl_unavailable");
-  const whoami = join(systemRoot, "System32", "whoami.exe");
-  const icacls = join(systemRoot, "System32", "icacls.exe");
-  const { stdout } = await execFile(whoami, ["/user", "/fo", "csv", "/nh"], {
-    windowsHide: true,
-  });
-  const sid = stdout.match(/\bS-1-(?:[0-9]+-)+[0-9]+\b/u)?.[0];
-  if (!sid) throw new Error("media_asset_acl_unavailable");
-  await execFile(icacls, [path, "/reset"], { windowsHide: true });
-  await execFile(icacls, [path, "/inheritance:r", "/grant:r", `*${sid}:(OI)(CI)F`], {
-    windowsHide: true,
-  });
+  await securePrivatePath(path, true);
 }
 
 /** Stores private media outputs as opaque, Run-bound files under the service data directory. */

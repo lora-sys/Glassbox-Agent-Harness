@@ -184,7 +184,8 @@ describe("P3.0 Test Harness, Contracts, and Minimal Closed Loop", () => {
     expect(groupDenied.decision).toBe("DENY");
     expect(groupDenied.reason).toBe("private_group_context");
 
-    // 4. Delivery gate check:
+    // 4. Reference audience helper check. Production delivery uses lifecycle authorization,
+    // source rechecks, and content policy, covered in the delivery integration suites.
     const groupAudience: Audience = {
       kind: "group",
       destinationScopeKey: JSON.stringify([
