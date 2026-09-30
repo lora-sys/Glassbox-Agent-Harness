@@ -201,6 +201,7 @@ describe("P4A durable learning truth", () => {
     expect((await db.execute("PRAGMA user_version")).rows[0]?.user_version).toBe(
       CURRENT_SCHEMA_VERSION,
     );
+    expect((await db.execute("PRAGMA table_info(task_steps)")).rows.length).toBeGreaterThan(0);
     expect((await db.execute("PRAGMA table_info(channel_messages)")).rows.length).toBeGreaterThan(
       0,
     );

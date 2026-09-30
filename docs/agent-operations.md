@@ -112,6 +112,8 @@ Glassbox review REWORK
 
 Pi's native Herdr integration reports `working`, `idle`, and `blocked`. For a Pi attempt, an `idle` observation can enter REVIEW only after Glassbox has persisted a `working` observation for that same attempt and the previous observed state is `working`. An initial idle pane is not evidence of completed work. Raw Trace retains the reported `idle` state. This mapping never accepts a Task or marks it DONE.
 
+For a durable Herdr Step, Glassbox records the first terminal Worker output against its live TaskAttempt and WorkerBinding before the Step enters REVIEW. The stored candidate is immutable. It contains a SHA-256 digest of the bounded read and at most 16 KiB of terminal excerpt. The Step holds an opaque `worker-result` reference. A later read requires that exact Step and Attempt to be in review or succeeded state and checks current Task and Worker read grants, read grants for every declared file and workspace source, and protected sources from the Task's planning Run and ancestor Tasks. This permits review after Herdr closes the pane without exposing a captured output before Step settlement. After Step acceptance, a directly dependent Model Step can receive a bounded excerpt, including one from an accepted child Task's Worker root. The receiving Run rechecks the source grants and records them for delivery review. The excerpt is untrusted evidence, not a verified file artifact, and does not accept the Step or Task.
+
 ## Core domain
 
 ### AttentionItem
@@ -400,6 +402,8 @@ worktree removal is explicit
 Task result visibility is enforced
 Worker output cannot bypass Delivery Gate
 ```
+
+Durable Task notifications use a separate outbox linked to an append-only TaskEvent. A Task with an exact external origin Run and audience may enqueue fixed status text. The send claim checks current Task read permission and Run delivery permission, then reserves the one send. A changed audience or stale review state suppresses the notice. An uncertain send remains unknown and is not replayed automatically. Tasks without an external origin Run have no implicit QQ recipient.
 
 The rule remains:
 

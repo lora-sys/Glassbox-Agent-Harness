@@ -130,3 +130,26 @@ it("withholds write tools while another Run occupies the selected workspace", as
     (f.app as unknown as { sandboxRuntime: unknown }).sandboxRuntime = null;
   }
 });
+
+it("withholds every registered tool from an internal Model Step Run", async () => {
+  const f = await fixture(async (input) => ({ status: "succeeded", text: input.text }));
+  f.send(502, "internal model tool surface fixture", true);
+  const run = await f.started.take();
+  await f.reply("internal model tool surface fixture");
+  const candidates = await f.app.resolveRunToolCandidates({
+    caller: run.caller,
+    conversationId: run.conversation.id,
+    runId: run.run.id,
+    executionMode: "task_step_model",
+  });
+  expect(candidates.length).toBeGreaterThan(0);
+  expect(candidates.every((candidate) => candidate.exclusion === "policy_disabled")).toBe(true);
+  expect(
+    await f.app.resolveRunToolNames({
+      caller: run.caller,
+      conversationId: run.conversation.id,
+      runId: run.run.id,
+      executionMode: "task_step_model",
+    }),
+  ).toEqual([]);
+});

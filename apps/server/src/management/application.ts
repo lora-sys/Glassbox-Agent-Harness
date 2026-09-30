@@ -31,6 +31,9 @@ import {
   type RunServiceEvent,
 } from "../execution/run-service/index.js";
 import type { IncomingMessage as StoredIncomingMessage } from "../conversation/store.js";
+import { createTaskGetAdapter } from "../execution/run-service/task-get-adapter.js";
+import { createCheckpointWriteAdapter } from "../execution/run-service/checkpoint-write-adapter.js";
+import { parseCheckpointWriteSpec, parseTaskGetSpec } from "../ops/tool-step-spec.js";
 import { configuredModelAdapter } from "../execution/model-adapter.js";
 import { estimateUnicodeTokens } from "../efficiency/index.js";
 import {
@@ -160,8 +163,19 @@ import {
 import { ChannelArchiveStore } from "../retrieval/channel-archive.js";
 import { groupResourceId, resolveAssignedGroupIds } from "../retrieval/source-resolver.js";
 import { GroupHistoryPoller, type HistorySyncTarget } from "./history-poller.js";
-import { AuthorizedOpsService, type WorkerPolicy } from "../ops/service.js";
+import {
+  AuthorizedOpsService,
+  type LongWorkRuntimePort,
+  type WorkerPolicy,
+} from "../ops/service.js";
 import { OpsReconciler } from "../ops/reconciler.js";
+import { DurableWorkerObserver } from "../ops/durable-worker-observer.js";
+import { readLongWorkHealth } from "../ops/long-work-health.js";
+import { TemporalLongWorkCoordinator } from "../ops/temporal/coordinator.js";
+import { TemporalContinuationCoordinator } from "../ops/temporal/continuation-coordinator.js";
+import type { ContinuationRuntimePort } from "../ops/continuation-service.js";
+import { connectLongWorkWorkflowClient } from "../ops/temporal/client.js";
+
 import type { HerdrBridge } from "../ops/herdr-bridge.js";
 import { openDomainStore, type DomainStore } from "../application/domain-store.js";
 import {
@@ -193,6 +207,13 @@ import {
   type ToolSurfaceCandidate,
   type ToolExclusionReason,
 } from "../runtime/pi/tool-plane.js";
+
+type ConnectedTemporal = Awaited<ReturnType<typeof connectLongWorkWorkflowClient>>;
+type TemporalConnector = (options: Parameters<typeof connectLongWorkWorkflowClient>[0]) => Promise<
+  Omit<ConnectedTemporal, "continuations"> & {
+    continuations?: ConnectedTemporal["continuations"];
+  }
+>;
 
 const OWNER_ID = "owner";
 const AGENT_ID = "personal";
@@ -424,6 +445,8 @@ export class ManagementApplication {
         workerPolicy?: WorkerPolicy;
         protectedValues?: readonly string[];
       };
+      temporal?: { address: string; namespace?: string };
+      temporalConnector?: TemporalConnector;
     },
     store: DomainStore,
     channels: ChannelProfileStore,
@@ -486,6 +509,7 @@ export class ManagementApplication {
     this.evaluator = createRunEvaluator({ store, trace: this.trace });
     this.runs = new RunService({
       store,
+      queuedPollMs: options.temporal ? 2_000 : 0,
       resolveExecution: (reference) => this.execution(reference),
       captureLearning: async (input) => {
         const isOwner = await this.store.identities.isOwner(input.caller.principalId);
@@ -702,6 +726,8 @@ export class ManagementApplication {
       workerPolicy?: WorkerPolicy;
       protectedValues?: readonly string[];
     };
+    temporal?: { address: string; namespace?: string };
+    temporalConnector?: TemporalConnector;
   }): Promise<ManagementApplication> {
     const channels = await ChannelProfileStore.open(options.dataDirectory);
     const groupRuntime = await GroupRuntimeStore.open(options.dataDirectory);
@@ -803,7 +829,12 @@ export class ManagementApplication {
             // A missing or disconnected Herdr pane is not positive stop evidence.
           }
         }
-        application.opsReconciler = new OpsReconciler(store.tasks, options.ops.bridge);
+        application.opsReconciler = new OpsReconciler(
+          store.tasks,
+          options.ops.bridge,
+          1_000,
+          new DurableWorkerObserver(store.db, store.longWork, store.tasks, false),
+        );
         await application.opsReconciler.start();
       }
       // Restore transport before durable queue dispatch. Incoming events wait for that same gate.
@@ -817,6 +848,7 @@ export class ManagementApplication {
       // After transport is restored, so the first tick has connections to walk. A group nobody
       // searches would otherwise never be archived at all.
       application.historyPoller.start();
+      void application.connectTemporal();
       return application;
     } catch (error) {
       await application.close();
@@ -841,12 +873,186 @@ export class ManagementApplication {
   >();
   private piModelCatalog?: PiModelCatalog;
   private opsReconciler?: OpsReconciler;
+  private temporalRuntime?: TemporalLongWorkCoordinator;
+  private continuationRuntime?: TemporalContinuationCoordinator;
+  private temporalClose?: () => Promise<void>;
+  private temporalProbe?: () => Promise<"reachable" | "unavailable">;
+  private temporalProbePending?: Promise<{
+    state: "reachable" | "unavailable";
+    checkedAt: string;
+  }>;
+  private temporalProbeCache?: {
+    state: "reachable" | "unavailable";
+    checkedAt: string;
+    sampledAtMs: number;
+  };
+  private temporalConnecting?: Promise<void>;
+  private temporalRecovering?: Promise<void>;
+  private temporalRetry?: ReturnType<typeof setTimeout>;
+  private temporalFailure: string | null = null;
+  private closed = false;
+  private readonly longWorkRuntimePort: LongWorkRuntimePort = {
+    available: () => this.temporalRuntime !== undefined,
+    start: async (taskId, policyRevision) => {
+      if (!this.temporalRuntime) throw new Error("Temporal is unavailable");
+      try {
+        return await this.temporalRuntime.start(taskId, policyRevision);
+      } catch (error) {
+        this.scheduleTemporalRecovery();
+        throw error;
+      }
+    },
+    wake: async (taskId) => {
+      if (!this.temporalRuntime) {
+        this.scheduleTemporalRecovery();
+        throw new Error("Temporal is unavailable");
+      }
+      try {
+        await this.temporalRuntime.wake(taskId);
+      } catch (error) {
+        this.scheduleTemporalRecovery();
+        throw error;
+      }
+    },
+  };
+  private readonly continuationRuntimePort: ContinuationRuntimePort = {
+    start: (scheduleId) => this.runContinuationRuntime(scheduleId, "start"),
+    wake: (scheduleId) => this.runContinuationRuntime(scheduleId, "wake"),
+    stop: (scheduleId) => this.runContinuationRuntime(scheduleId, "stop"),
+  };
+
+  private async runContinuationRuntime(
+    scheduleId: string,
+    action: "start" | "wake" | "stop",
+  ): Promise<void> {
+    if (!this.continuationRuntime) {
+      this.scheduleTemporalRecovery();
+      throw new Error("Temporal continuation runtime is unavailable");
+    }
+    try {
+      await this.continuationRuntime[action](scheduleId);
+    } catch (error) {
+      this.scheduleTemporalRecovery();
+      throw error;
+    }
+  }
+
+  private scheduleTemporalRecovery(): void {
+    if (!this.options.temporal || this.closed || this.temporalRetry) return;
+    this.temporalRetry = setTimeout(() => {
+      this.temporalRetry = undefined;
+      if (this.closed) return;
+      if (!this.temporalRuntime) {
+        void this.connectTemporal();
+        return;
+      }
+      this.temporalRecovering = this.temporalRuntime
+        .recover()
+        .then(async (tasks) => {
+          const schedules = await this.continuationRuntime?.recover();
+          return {
+            unavailable: [...tasks.unavailable, ...(schedules?.unavailable ?? [])],
+          };
+        })
+        .then((result) => {
+          this.temporalFailure = result.unavailable.length
+            ? `${result.unavailable.length} workflow bindings unavailable`
+            : null;
+          if (result.unavailable.length) this.scheduleTemporalRecovery();
+        })
+        .catch(() => {
+          this.temporalFailure = "Temporal reconciliation failed";
+          this.scheduleTemporalRecovery();
+        })
+        .finally(() => {
+          this.temporalRecovering = undefined;
+        });
+    }, 30_000);
+    this.temporalRetry.unref();
+  }
+
+  private connectTemporal(): Promise<void> {
+    if (!this.options.temporal || this.closed || this.temporalRuntime) return Promise.resolve();
+    if (this.temporalConnecting) return this.temporalConnecting;
+    this.temporalConnecting = (async () => {
+      let connection: Awaited<ReturnType<TemporalConnector>> | undefined;
+      try {
+        connection = await (this.options.temporalConnector ?? connectLongWorkWorkflowClient)(
+          this.options.temporal!,
+        );
+        if (this.closed) {
+          await connection.close();
+          return;
+        }
+        const coordinator = new TemporalLongWorkCoordinator(this.store, connection.workflows);
+        const recovery = await coordinator.recover();
+        const continuationCoordinator = connection.continuations
+          ? new TemporalContinuationCoordinator(this.store.continuations, connection.continuations)
+          : undefined;
+        const continuationRecovery = await continuationCoordinator?.recover();
+        this.temporalRuntime = coordinator;
+        this.continuationRuntime = continuationCoordinator;
+        this.temporalClose = connection.close;
+        this.temporalProbe = connection.probe;
+        this.temporalProbeCache = undefined;
+        const unavailableCount =
+          recovery.unavailable.length + (continuationRecovery?.unavailable.length ?? 0);
+        this.temporalFailure = unavailableCount
+          ? `${unavailableCount} workflow bindings unavailable`
+          : null;
+        if (unavailableCount) this.scheduleTemporalRecovery();
+      } catch {
+        await connection?.close().catch(() => undefined);
+        this.temporalFailure = "Temporal connection or reconciliation failed";
+        this.scheduleTemporalRecovery();
+      } finally {
+        this.temporalConnecting = undefined;
+      }
+    })();
+    return this.temporalConnecting;
+  }
 
   private selectableModelProfiles(includePi = true): PublicModelProfile[] {
     return [
       ...this.options.models.list(),
       ...(includePi ? (this.piModelCatalog?.list() ?? []) : []),
     ];
+  }
+
+  longWorkBackendStatus(): {
+    state: "not_configured" | "connected" | "unavailable";
+    reason: string | null;
+  } {
+    if (!this.options.temporal) return { state: "not_configured", reason: null };
+    if (this.temporalFailure) return { state: "unavailable", reason: this.temporalFailure };
+    if (this.temporalRuntime) return { state: "connected", reason: null };
+    return { state: "unavailable", reason: this.temporalFailure };
+  }
+
+  private async liveTemporalServerStatus(): Promise<{
+    state: "reachable" | "unavailable" | "not_checked";
+    checkedAt: string | null;
+  }> {
+    const probe = this.temporalProbe;
+    if (!probe) return { state: "not_checked", checkedAt: null };
+    const cached = this.temporalProbeCache;
+    if (cached && Date.now() >= cached.sampledAtMs && Date.now() - cached.sampledAtMs < 5_000)
+      return { state: cached.state, checkedAt: cached.checkedAt };
+    if (!this.temporalProbePending) {
+      const pending = probe()
+        .catch(() => "unavailable" as const)
+        .then((state) => {
+          const checkedAt = new Date().toISOString();
+          if (this.temporalProbe === probe)
+            this.temporalProbeCache = { state, checkedAt, sampledAtMs: Date.now() };
+          return { state, checkedAt };
+        });
+      this.temporalProbePending = pending;
+      void pending.finally(() => {
+        if (this.temporalProbePending === pending) this.temporalProbePending = undefined;
+      });
+    }
+    return this.temporalProbePending;
   }
 
   sandboxStatus(): {
@@ -1475,7 +1681,9 @@ export class ManagementApplication {
               this.store,
               this.options.ops!.bridge,
               this.options.ops!.workerPolicy,
+              this.longWorkRuntimePort,
               { registry: this.workspaces, writes: this.workspaceWrites },
+              this.continuationRuntimePort,
             ),
             workerTarget: this.options.ops!.workerTarget,
             getContext,
@@ -1745,6 +1953,11 @@ export class ManagementApplication {
     context: PiRunContext,
     registered: readonly ToolDescriptor[] = TOOL_DESCRIPTORS,
   ): Promise<ToolSurfaceCandidate[]> {
+    if (context.executionMode === "task_step_model")
+      return registered.map((descriptor) => ({
+        name: descriptor.name,
+        exclusion: "policy_disabled" as const,
+      }));
     if (!context.caller || !context.conversationId || !context.runId)
       return registered.map((descriptor) => ({
         name: descriptor.name,
@@ -1918,6 +2131,7 @@ export class ManagementApplication {
     if (!kind) return direct;
     return {
       supportsGroup: direct.supportsGroup,
+      supportsTaskStepModel: direct.supportsTaskStepModel,
       execute: async (input: ExecutionInput) => {
         const profileId = reference.slice(kind.length + 1);
         const configured = this.selectableModelProfiles(kind === "pi");
@@ -1995,6 +2209,7 @@ export class ManagementApplication {
           task: {
             risk:
               kind === "pi" &&
+              input.executionMode !== "task_step_model" &&
               MUTATION_REQUESTS.some(
                 (request) =>
                   request.words.test(input.text) && request.params(input.text) !== undefined,
@@ -2002,7 +2217,9 @@ export class ManagementApplication {
                 ? ("high" as const)
                 : ("medium" as const),
             requiredCapabilities:
-              kind === "pi" ? (["text", "tools"] as const) : (["text"] as const),
+              kind === "pi" && input.executionMode !== "task_step_model"
+                ? (["text", "tools"] as const)
+                : (["text"] as const),
             requiredContextTokens: Math.max(
               estimateUnicodeTokens(input.text) + 6144,
               Math.min(demandTokens, 32768),
@@ -2254,6 +2471,11 @@ export class ManagementApplication {
   }
 
   private directExecution(reference: string): RunExecutionAdapter | undefined {
+    if (reference.startsWith("tool:")) {
+      if (parseTaskGetSpec(reference)) return createTaskGetAdapter(this.store);
+      if (parseCheckpointWriteSpec(reference)) return createCheckpointWriteAdapter(this.store);
+      return undefined;
+    }
     const harness = this.options.executors?.get(reference);
     if (harness) return harness;
     if (reference === "claude-code") return this.executors.adapter();
@@ -2324,20 +2546,25 @@ export class ManagementApplication {
       for (const runId of [...event.interruptedRunIds, ...event.unknownRunIds]) {
         const caller = await this.store.management.runCaller(OWNER_ID, runId);
         if (!caller) continue;
-        const run = await this.store.conversations.getRun(caller, runId);
-        const cursor = await this.trace.append(
-          runId,
-          {
-            type: "run_finished",
+        try {
+          const run = await this.store.conversations.getRun(caller, runId);
+          const cursor = await this.trace.append(
             runId,
-            conversationId: run.conversationId,
-            status: run.status,
-            outputWithheld: true,
-            recovered: true,
-          },
-          "glassbox-recovery",
-        );
-        await this.store.evidence.advanceTrace(caller, cursor);
+            {
+              type: "run_finished",
+              runId,
+              conversationId: run.conversationId,
+              status: run.status,
+              outputWithheld: true,
+              recovered: true,
+            },
+            "glassbox-recovery",
+          );
+          await this.store.evidence.advanceTrace(caller, cursor);
+        } catch {
+          // A revoked Task or Conversation read grant must not prevent the
+          // supervisor from recovering other persisted Runs.
+        }
       }
       for (const deliveryId of event.unknownDeliveryIds) {
         const runId = await this.store.management.deliveryRunId(OWNER_ID, deliveryId);
@@ -4368,7 +4595,36 @@ export class ManagementApplication {
       trace: this.trace,
       evaluator: this.evaluator,
       ...(this.options.ops ? { opsHealth: (runId: string) => this.opsHealth(runId) } : {}),
+      ...(this.options.ops
+        ? {
+            opsSignal: (caller, taskId, input, runId) =>
+              this.opsSignal(caller, taskId, input, runId),
+          }
+        : {}),
     });
+  }
+
+  private async opsSignal(
+    caller: CallerContext,
+    taskId: string,
+    input: {
+      stepId: string;
+      targetStepVersion: number;
+      targetAttemptId?: string;
+      type: string;
+      idempotencyKey: string;
+      approval?: boolean;
+    },
+    runId: string,
+  ) {
+    if (!this.options.ops) throw new ManagementError("NOT_FOUND", "Ops is not configured", 404);
+    const service = new AuthorizedOpsService(
+      this.store,
+      this.options.ops.bridge,
+      this.options.ops.workerPolicy,
+      this.longWorkRuntimePort,
+    );
+    return service.signal(caller, { taskId, ...input }, { runId });
   }
 
   private async opsHealth(runId: string) {
@@ -4379,8 +4635,9 @@ export class ManagementApplication {
       this.store,
       this.options.ops.bridge,
       this.options.ops.workerPolicy,
+      this.longWorkRuntimePort,
     );
-    return service.health(
+    const health = await service.healthDetailed(
       caller,
       {
         now: now.toISOString(),
@@ -4396,9 +4653,26 @@ export class ManagementApplication {
       },
       { runId },
     );
+    const backend = this.longWorkBackendStatus();
+    const liveServer = await this.liveTemporalServerStatus();
+    return {
+      ...health.snapshot,
+      longWorkBackend: {
+        ...backend,
+        ...(liveServer.state === "unavailable"
+          ? { state: "unavailable" as const, reason: "Temporal live probe failed" }
+          : {}),
+        liveServer,
+      },
+      longWork: await readLongWorkHealth(this.store.db, health.visibleTaskIds, caller, { runId }),
+    };
   }
 
   async close() {
+    this.closed = true;
+    clearTimeout(this.temporalRetry);
+    await this.temporalConnecting;
+    await this.temporalRecovering;
     this.accepting = false;
     this.releaseIngress();
     await this.operations.catch(() => undefined);
@@ -4417,6 +4691,7 @@ export class ManagementApplication {
     await this.sandboxRuntime?.executor.close();
     await this.opsReconciler?.stop();
     await this.options.ops?.bridge.disconnect();
+    await this.temporalClose?.();
     await this.store.close();
   }
 }

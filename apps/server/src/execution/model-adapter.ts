@@ -17,6 +17,7 @@ export function configuredModelAdapter(options: {
 }): RunExecutionAdapter {
   return {
     supportsGroup: true,
+    supportsTaskStepModel: true,
     async execute(input) {
       if (input.imageFailureCode)
         return { status: "succeeded" as const, text: IMAGE_READ_FAILURE_REPLY };

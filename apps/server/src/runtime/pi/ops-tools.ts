@@ -2,7 +2,12 @@ import { Type } from "typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { DomainStore } from "../../persistence/index.js";
 import type { AuthorizedOpsService } from "../../ops/service.js";
-import { createProtectedTool, type ProtectedToolContext } from "./protected-tools.js";
+import { parseWorkerTextFileSpec } from "../../ops/worker-file-spec.js";
+import {
+  consumeMutationIntent,
+  createProtectedTool,
+  type ProtectedToolContext,
+} from "./protected-tools.js";
 import type { PiRunContext } from "./types.js";
 
 export interface WorkerTarget {
@@ -20,10 +25,19 @@ export const OPS_TOOL_NAMES = Object.freeze([
   "worker_status",
   "task_delegate",
   "worker_read",
+  "task_worker_result",
   "worker_prompt",
   "task_accept",
   "task_rework",
+  "task_step_accept",
+  "task_step_rework",
+  "task_signal",
+  "task_approve",
   "task_cancel",
+  "task_steps",
+  "task_events",
+  "task_plan",
+  "task_link_child",
 ] as const);
 
 /** The model never supplies routing, Principal, filesystem paths or worker kind. */
@@ -36,12 +50,66 @@ export function createOpsTools(options: {
   const getContext = (): ProtectedToolContext | undefined => {
     const value = options.getContext();
     return value?.caller && value.conversationId && value.runId
-      ? { caller: value.caller, conversationId: value.conversationId, runId: value.runId }
+      ? {
+          caller: value.caller,
+          conversationId: value.conversationId,
+          runId: value.runId,
+          requiredToolName: value.requiredToolName,
+          requiredToolInput: value.requiredToolInput,
+        }
       : undefined;
   };
   const common = { authService: options.store.authorization, getContext };
-  const taskId = Type.String({ minLength: 1, maxLength: 128 });
+  const taskId = Type.String({
+    minLength: 1,
+    maxLength: 128,
+    pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:-]*$",
+  });
   const text = Type.String({ minLength: 1, maxLength: 16000 });
+  const stepId = Type.String({
+    minLength: 1,
+    maxLength: 128,
+    pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:-]*$",
+  });
+  const dependencyIds = Type.Array(stepId, { maxItems: 8 });
+  const plannedStep = Type.Object(
+    {
+      id: stepId,
+      kind: Type.Union([
+        Type.Literal("timer_wait"),
+        Type.Literal("signal_wait"),
+        Type.Literal("approval_wait"),
+        Type.Literal("join"),
+        Type.Literal("model"),
+        Type.Literal("tool"),
+        Type.Literal("herdr_worker"),
+        Type.Literal("child_task"),
+      ]),
+      title: Type.String({ minLength: 1, maxLength: 256 }),
+      dependencyIds,
+      instructions: Type.Optional(Type.String({ minLength: 1, maxLength: 4096 })),
+      durationMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 2_592_000_000 })),
+      signalKey: Type.Optional(
+        Type.String({
+          minLength: 1,
+          maxLength: 128,
+          pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:-]*$",
+        }),
+      ),
+      targetTaskId: Type.Optional(
+        Type.String({ minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$" }),
+      ),
+      toolAction: Type.Optional(
+        Type.Union([Type.Literal("task_get"), Type.Literal("checkpoint_write")]),
+      ),
+      checkpointStateRef: Type.Optional(
+        Type.String({ minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$" }),
+      ),
+      workerAccess: Type.Optional(Type.Union([Type.Literal("read"), Type.Literal("write")])),
+      resultFile: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
+    },
+    { additionalProperties: false },
+  );
   return [
     createProtectedTool({
       ...common,
@@ -73,12 +141,25 @@ export function createOpsTools(options: {
       resourceId: (params) => `task-${params.taskId}`,
       execute: async (params, context) => options.service.get(context.caller, params.taskId),
     }),
-    createProtectedTool<{ title: string; description?: string }>({
+    createProtectedTool<{
+      title: string;
+      description?: string;
+      acceptanceCriteria?: string[];
+    }>({
       ...common,
       name: "task_create",
       description: "Create durable work without starting a worker.",
       parameters: Type.Object(
-        { title: Type.String({ minLength: 1, maxLength: 256 }), description: Type.Optional(text) },
+        {
+          title: Type.String({ minLength: 1, maxLength: 256 }),
+          description: Type.Optional(text),
+          acceptanceCriteria: Type.Optional(
+            Type.Array(Type.String({ minLength: 1, maxLength: 512 }), {
+              minItems: 1,
+              maxItems: 16,
+            }),
+          ),
+        },
         { additionalProperties: false },
       ),
       action: "task:create",
@@ -87,6 +168,7 @@ export function createOpsTools(options: {
         options.service.create(context.caller, {
           title: params.title,
           description: params.description,
+          acceptanceCriteria: params.acceptanceCriteria,
           runId: context.runId,
           conversationId: context.conversationId,
         }),
@@ -139,6 +221,26 @@ export function createOpsTools(options: {
       execute: async (params, context) =>
         options.service.readWorker(context.caller, params.taskId, context),
     }),
+    createProtectedTool<{ taskId: string; stepId: string; attemptId: string }>({
+      ...common,
+      name: "task_worker_result",
+      description: "Read a captured durable Worker result under current Task and source grants.",
+      parameters: Type.Object(
+        { taskId, stepId, attemptId: stepId },
+        { additionalProperties: false },
+      ),
+      action: "worker:read",
+      deliverySource: "content_source",
+      resourceId: (params) => `task-${params.taskId}`,
+      execute: async (params, context) =>
+        options.service.workerCandidate(
+          context.caller,
+          params.taskId,
+          params.stepId,
+          params.attemptId,
+          context,
+        ),
+    }),
     createProtectedTool<{ taskId: string; prompt: string }>({
       ...common,
       name: "worker_prompt",
@@ -176,6 +278,159 @@ export function createOpsTools(options: {
       execute: async (params, context) =>
         options.service.rework(context.caller, params.taskId, params.reason, params.prompt),
     }),
+    createProtectedTool<{ taskId: string; stepId: string; expectedStepVersion: number }>({
+      ...common,
+      name: "task_step_accept",
+      description: "Accept one reviewed durable Step. Task acceptance remains separate.",
+      parameters: Type.Object(
+        { taskId, stepId, expectedStepVersion: Type.Integer({ minimum: 1 }) },
+        { additionalProperties: false },
+      ),
+      action: "task:accept",
+      resourceId: (params) => `task-${params.taskId}`,
+      execute: async (params, context) => {
+        consumeMutationIntent(context, "task_step_accept", params);
+        const step = await options.service.acceptStep(
+          context.caller,
+          params.taskId,
+          params.stepId,
+          params.expectedStepVersion,
+          { runId: context.runId },
+        );
+        return { stepId: step.id, status: step.status, version: step.version };
+      },
+    }),
+    createProtectedTool<{
+      parentTaskId: string;
+      parentStepId: string;
+      expectedStepVersion: number;
+      childTaskId: string;
+      acceptanceCriteria: string[];
+      cancellationPolicy: "cancel_child" | "keep_child";
+      failurePolicy: "block_parent" | "fail_parent" | "review_parent";
+      parentNotificationPolicy?: "suppress" | "notify_parent";
+    }>({
+      ...common,
+      name: "task_link_child",
+      description:
+        "Link a new same-owner child Task to a ready parent child_task Step. The child receives only the Step's delegated permissions. Set parentNotificationPolicy to notify_parent to route child acceptance, blocked, and failed Step notices through the parent Task's origin audience.",
+      parameters: Type.Object(
+        {
+          parentTaskId: taskId,
+          parentStepId: stepId,
+          expectedStepVersion: Type.Integer({ minimum: 1 }),
+          childTaskId: taskId,
+          acceptanceCriteria: Type.Array(Type.String({ minLength: 1, maxLength: 512 }), {
+            minItems: 1,
+            maxItems: 16,
+          }),
+          cancellationPolicy: Type.Union([
+            Type.Literal("cancel_child"),
+            Type.Literal("keep_child"),
+          ]),
+          failurePolicy: Type.Union([
+            Type.Literal("block_parent"),
+            Type.Literal("fail_parent"),
+            Type.Literal("review_parent"),
+          ]),
+          parentNotificationPolicy: Type.Optional(
+            Type.Union([Type.Literal("suppress"), Type.Literal("notify_parent")]),
+          ),
+        },
+        { additionalProperties: false },
+      ),
+      action: "task:delegate",
+      resourceId: (params) => `task-${params.parentTaskId}`,
+      execute: async (params, context) => {
+        const link = await options.service.linkChildTask(context.caller, params, {
+          runId: context.runId,
+          conversationId: context.conversationId,
+        });
+        return {
+          parentTaskId: link.parentTaskId,
+          parentStepId: link.parentStepId,
+          childTaskId: link.childTaskId,
+        };
+      },
+    }),
+    createProtectedTool<{
+      taskId: string;
+      stepId: string;
+      expectedStepVersion: number;
+      reason: string;
+    }>({
+      ...common,
+      name: "task_step_rework",
+      description: "Request a fresh attempt for one reviewed durable Step.",
+      parameters: Type.Object(
+        {
+          taskId,
+          stepId,
+          expectedStepVersion: Type.Integer({ minimum: 1 }),
+          reason: Type.String({ minLength: 1, maxLength: 512 }),
+        },
+        { additionalProperties: false },
+      ),
+      action: "task:rework",
+      resourceId: (params) => `task-${params.taskId}`,
+      execute: async (params, context) => {
+        consumeMutationIntent(context, "task_step_rework", params);
+        const step = await options.service.reworkStep(
+          context.caller,
+          params.taskId,
+          params.stepId,
+          params.expectedStepVersion,
+          params.reason,
+          { runId: context.runId },
+        );
+        return { stepId: step.id, status: step.status, version: step.version };
+      },
+    }),
+    ...([false, true] as const).map((approval) =>
+      createProtectedTool<{
+        taskId: string;
+        stepId: string;
+        targetStepVersion: number;
+        type: string;
+      }>({
+        ...common,
+        name: approval ? "task_approve" : "task_signal",
+        description: approval
+          ? "Approve a currently waiting durable Step with the caller's current authority."
+          : "Send a named signal to a currently waiting durable Step.",
+        parameters: Type.Object(
+          {
+            taskId,
+            stepId,
+            targetStepVersion: Type.Integer({ minimum: 1 }),
+            type: Type.String({
+              minLength: 1,
+              maxLength: 128,
+              pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:-]*$",
+            }),
+          },
+          { additionalProperties: false },
+        ),
+        action: approval ? "task:approve" : "task:signal",
+        resourceId: (params) => `task-${params.taskId}`,
+        execute: async (params, context) => {
+          consumeMutationIntent(context, approval ? "task_approve" : "task_signal", params);
+          const signal = await options.service.signal(
+            context.caller,
+            {
+              taskId: params.taskId,
+              stepId: params.stepId,
+              targetStepVersion: params.targetStepVersion,
+              type: params.type,
+              approval,
+              idempotencyKey: `${context.runId}:${approval ? "approval" : "signal"}:${params.stepId}:${params.targetStepVersion}:${params.type}`,
+            },
+            { runId: context.runId },
+          );
+          return { stepId: signal.stepId, disposition: signal.disposition };
+        },
+      }),
+    ),
     createProtectedTool<{ taskId: string }>({
       ...common,
       name: "task_cancel",
@@ -184,8 +439,248 @@ export function createOpsTools(options: {
       action: "task:cancel",
       resourceId: (params) => `task-${params.taskId}`,
       execute: async (params, context) => {
-        await options.service.cancel(context.caller, params.taskId);
-        return { canceled: true };
+        const canceled = await options.service.cancel(context.caller, params.taskId);
+        return { canceled, cancellationRequested: !canceled };
+      },
+    }),
+    createProtectedTool<{ taskId: string }>({
+      ...common,
+      name: "task_steps",
+      description: "Inspect the bounded durable step list for an authorized Task.",
+      parameters: Type.Object({ taskId }, { additionalProperties: false }),
+      action: "task:read",
+      resourceId: (params) => `task-${params.taskId}`,
+      execute: async (params, context) => options.service.steps(context.caller, params.taskId),
+    }),
+    createProtectedTool<{ taskId: string; afterSequence?: number }>({
+      ...common,
+      name: "task_events",
+      description: "Inspect append-only events for an authorized Task from a sequence cursor.",
+      parameters: Type.Object(
+        {
+          taskId,
+          afterSequence: Type.Optional(Type.Integer({ minimum: 0, maximum: 2_147_483_647 })),
+        },
+        { additionalProperties: false },
+      ),
+      action: "task:read",
+      resourceId: (params) => `task-${params.taskId}`,
+      execute: async (params, context) =>
+        options.service.taskEvents(context.caller, params.taskId, params.afterSequence),
+    }),
+    createProtectedTool<{
+      taskId: string;
+      rootStepId: string;
+      steps: Array<{
+        id: string;
+        kind:
+          | "timer_wait"
+          | "signal_wait"
+          | "approval_wait"
+          | "join"
+          | "model"
+          | "tool"
+          | "herdr_worker"
+          | "child_task";
+        title: string;
+        dependencyIds: string[];
+        instructions?: string;
+        durationMs?: number;
+        signalKey?: string;
+        targetTaskId?: string;
+        toolAction?: "task_get" | "checkpoint_write";
+        checkpointStateRef?: string;
+        workerAccess?: "read" | "write";
+        resultFile?: string;
+      }>;
+    }>({
+      ...common,
+      name: "task_plan",
+      description:
+        "Plan bounded timer, signal, approval, join, text-only model, task_get or checkpoint_write Tool, configured Pi Herdr Worker, and child Task steps. Link child Tasks separately before planning their graphs. Shell steps are unavailable.",
+      parameters: Type.Object(
+        {
+          taskId,
+          rootStepId: stepId,
+          steps: Type.Array(plannedStep, { minItems: 1, maxItems: 64 }),
+        },
+        { additionalProperties: false },
+      ),
+      action: "task:plan",
+      resourceId: (params) => `task-${params.taskId}`,
+      execute: async (params, context) => {
+        for (const step of params.steps) {
+          if (
+            (step.kind !== "tool" &&
+              (step.toolAction !== undefined || step.checkpointStateRef !== undefined)) ||
+            (!["herdr_worker", "child_task"].includes(step.kind) &&
+              step.workerAccess !== undefined) ||
+            (step.kind !== "herdr_worker" && step.resultFile !== undefined) ||
+            (step.kind === "timer_wait" &&
+              (step.durationMs === undefined ||
+                step.signalKey !== undefined ||
+                step.instructions !== undefined ||
+                step.targetTaskId !== undefined)) ||
+            (["signal_wait", "approval_wait"].includes(step.kind) &&
+              (step.signalKey === undefined ||
+                step.durationMs !== undefined ||
+                step.instructions !== undefined ||
+                step.targetTaskId !== undefined)) ||
+            (step.kind === "join" &&
+              (step.signalKey !== undefined ||
+                step.durationMs !== undefined ||
+                step.instructions !== undefined ||
+                step.targetTaskId !== undefined ||
+                step.dependencyIds.length === 0)) ||
+            (step.kind === "model" &&
+              (!step.instructions?.trim() ||
+                step.durationMs !== undefined ||
+                step.signalKey !== undefined ||
+                step.targetTaskId !== undefined)) ||
+            (step.kind === "tool" &&
+              ((step.toolAction === "checkpoint_write"
+                ? step.targetTaskId !== undefined || !step.checkpointStateRef
+                : !step.targetTaskId || step.checkpointStateRef !== undefined) ||
+                step.instructions !== undefined ||
+                step.durationMs !== undefined ||
+                step.signalKey !== undefined)) ||
+            (step.kind === "herdr_worker" &&
+              (!step.instructions?.trim() ||
+                !step.workerAccess ||
+                (step.resultFile !== undefined && step.workerAccess !== "write") ||
+                (step.resultFile !== undefined &&
+                  !parseWorkerTextFileSpec(`worker:text-file:${step.resultFile}`)) ||
+                step.durationMs !== undefined ||
+                step.signalKey !== undefined ||
+                step.targetTaskId !== undefined)) ||
+            (step.kind === "child_task" &&
+              (!step.instructions?.trim() ||
+                step.durationMs !== undefined ||
+                step.signalKey !== undefined ||
+                step.targetTaskId !== undefined))
+          )
+            throw new Error(`Invalid fields for planned ${step.kind} step ${step.id}`);
+        }
+        const sourceRun = params.steps.some((step) => step.kind === "model")
+          ? await options.store.conversations.getRun(context.caller, context.runId)
+          : undefined;
+        if (sourceRun && sourceRun.source !== "external")
+          throw new Error("Model Step planning requires an external Run");
+        const executionRef = sourceRun?.executionRef;
+        if (executionRef !== undefined && !/^(?:model|pi):.+$/u.test(executionRef))
+          throw new Error("Model Step requires a configured model Run");
+        const workerPermissions = new Map<
+          string,
+          Awaited<ReturnType<AuthorizedOpsService["plannedWorkerPermissions"]>>
+        >();
+        for (const step of params.steps) {
+          if (step.kind !== "herdr_worker" && (step.kind !== "child_task" || !step.workerAccess))
+            continue;
+          if (options.workerTarget.agentKind !== "pi" || !options.workerTarget.worktreePath)
+            throw new Error("Configured Pi Herdr Worker is unavailable");
+          const permissions = await options.service.plannedWorkerPermissions(
+            context.caller,
+            params.taskId,
+            options.workerTarget.worktreePath,
+            step.workerAccess!,
+            { runId: context.runId, conversationId: context.conversationId },
+          );
+          if (
+            step.resultFile &&
+            (!permissions.some((permission) => permission.action === "worker:file:read") ||
+              !permissions.some((permission) => permission.action === "workspace:read"))
+          )
+            throw new Error("Worker result file requires delegated file and workspace read");
+          workerPermissions.set(step.id, permissions);
+        }
+        const steps = params.steps.map((step) => {
+          const waitPolicy =
+            step.kind === "timer_wait"
+              ? {
+                  version: 1,
+                  kind: "duration" as const,
+                  durationMs: step.durationMs,
+                  overdue: "resume" as const,
+                }
+              : step.kind === "signal_wait"
+                ? {
+                    version: 1,
+                    kind: "signal" as const,
+                    signalKey: step.signalKey,
+                    overdue: "stale" as const,
+                  }
+                : step.kind === "approval_wait"
+                  ? {
+                      version: 1,
+                      kind: "approval" as const,
+                      signalKey: step.signalKey,
+                      overdue: "stale" as const,
+                    }
+                  : undefined;
+          return {
+            id: step.id,
+            taskId: params.taskId,
+            kind: step.kind,
+            title: step.title,
+            ...(step.kind === "model"
+              ? { instructions: step.instructions, specRef: executionRef }
+              : step.kind === "tool"
+                ? {
+                    specRef:
+                      step.toolAction === "checkpoint_write"
+                        ? `tool:checkpoint_write:${step.checkpointStateRef}`
+                        : `tool:task_get:${step.targetTaskId}`,
+                  }
+                : step.kind === "herdr_worker"
+                  ? {
+                      instructions: step.instructions,
+                      ...(step.resultFile
+                        ? { specRef: `worker:text-file:${step.resultFile}` }
+                        : {}),
+                    }
+                  : step.kind === "child_task"
+                    ? { instructions: step.instructions }
+                    : {}),
+            status: "pending" as const,
+            dependencyIds: step.dependencyIds,
+            dependencyPolicy: {
+              failed: "block" as const,
+              cancelled: "cancel" as const,
+              skipped: "skip" as const,
+            },
+            maxAttempts: step.toolAction === "checkpoint_write" ? 2 : 3,
+            ...(step.toolAction === "checkpoint_write"
+              ? {
+                  retryPolicy: {
+                    version: 1,
+                    maxAttempts: 2,
+                    initialDelayMs: 0,
+                    maxDelayMs: 0,
+                    backoffMultiplier: 1,
+                    retryableErrorClasses: ["checkpoint_not_applied"],
+                    nonRetryableErrorClasses: [],
+                    timeoutOutcome: "unknown" as const,
+                  },
+                  delegatedPermissionSet: [
+                    { resourceId: `task-${params.taskId}`, action: "task:checkpoint:write" },
+                  ],
+                }
+              : { delegatedPermissionSet: workerPermissions.get(step.id) ?? [] }),
+            waitPolicy,
+            requiredCapabilities: step.kind === "model" ? ["text"] : [],
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+            version: 1,
+          };
+        });
+        await options.service.planExistingTask(
+          context.caller,
+          params.taskId,
+          steps,
+          params.rootStepId,
+          { runId: context.runId, conversationId: context.conversationId },
+        );
+        return { planned: true, stepCount: steps.length };
       },
     }),
   ];

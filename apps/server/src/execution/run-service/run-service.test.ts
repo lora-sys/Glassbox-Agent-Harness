@@ -113,6 +113,7 @@ function service(
   transport: RunTransport = { send: async () => ({ status: "sent" }) },
   options: {
     concurrency?: number;
+    queuedPollMs?: number;
     deliveryTimeoutMs?: number;
     prepareDelivery?: ConstructorParameters<typeof RunService>[0]["prepareDelivery"];
     captureLearning?: ConstructorParameters<typeof RunService>[0]["captureLearning"];
@@ -134,6 +135,379 @@ function service(
   });
   services.push(instance);
   return { instance, events, errors };
+}
+
+it("publishes a durable Task review notice through the exact origin audience", async () => {
+  const { store } = await fixture();
+  const accepted = await store.conversations.acceptIncoming(input("notice-source"));
+  await store.tasks.createTask({
+    id: "notice-task",
+    title: "Private title",
+    creatorPrincipalId: "owner",
+    conversationId: accepted.conversation.id,
+    runId: accepted.run.id,
+    authorizationScope: group,
+  });
+  await store.authorization.grant({
+    principalId: "owner",
+    resourceId: "task-notice-task",
+    action: "task:read",
+    scope: group,
+    effect: "allow",
+  });
+  const noticeId = await store.db.transaction(async (tx) => {
+    await tx.execute(
+      "UPDATE tasks SET status = 'REVIEW', orchestration_mode = 'durable' WHERE id = 'notice-task'",
+    );
+    const inserted = await tx.execute({
+      sql: "INSERT INTO task_events(id,task_id,type,metadata_json,created_at) VALUES ('notice-event','notice-task','TASK_REVIEW','{}',?) RETURNING sequence",
+      args: [new Date().toISOString()],
+    });
+    const notice = await store.taskNotifications.enqueueTx(tx, Number(inserted.rows[0]!.sequence));
+    return notice!.id;
+  });
+  const send = vi.fn(async (_request: Parameters<RunTransport["send"]>[0]) => ({
+    status: "sent" as const,
+    externalId: "qq-notice",
+  }));
+  const { instance } = service(
+    store,
+    { supportsGroup: true, execute: async () => ({ status: "succeeded" }) },
+    { send },
+  );
+  await instance.start();
+  await instance.drain();
+  const noticeCalls = send.mock.calls.filter(([request]) => request.delivery.id === noticeId);
+  expect(noticeCalls).toHaveLength(1);
+  expect(noticeCalls[0]![0].destination).toEqual(group);
+  expect(noticeCalls[0]![0].delivery.payloadText).not.toContain("Private title");
+  const row = await store.db.transaction((tx) =>
+    tx.execute({
+      sql: "SELECT status,external_id FROM task_notifications WHERE id = ?",
+      args: [noticeId],
+    }),
+  );
+  expect(row.rows[0]).toMatchObject({ status: "sent", external_id: "qq-notice" });
+});
+
+it("suppresses a Task notification when Task read is revoked before delivery", async () => {
+  const { store } = await fixture();
+  const accepted = await store.conversations.acceptIncoming(input("revoked-notice-source"));
+  await store.tasks.createTask({
+    id: "revoked-notice-task",
+    title: "Private title",
+    creatorPrincipalId: "owner",
+    conversationId: accepted.conversation.id,
+    runId: accepted.run.id,
+    authorizationScope: group,
+  });
+  const taskGrant = await store.authorization.grant({
+    principalId: "owner",
+    resourceId: "task-revoked-notice-task",
+    action: "task:read",
+    scope: group,
+    effect: "allow",
+  });
+  const noticeId = await store.db.transaction(async (tx) => {
+    await tx.execute(
+      "UPDATE tasks SET status = 'REVIEW', orchestration_mode = 'durable' WHERE id = 'revoked-notice-task'",
+    );
+    const inserted = await tx.execute({
+      sql: "INSERT INTO task_events(id,task_id,type,metadata_json,created_at) VALUES ('revoked-notice-event','revoked-notice-task','TASK_REVIEW','{}',?) RETURNING sequence",
+      args: [new Date().toISOString()],
+    });
+    const notice = await store.taskNotifications.enqueueTx(tx, Number(inserted.rows[0]!.sequence));
+    return notice!.id;
+  });
+  await store.authorization.revoke(taskGrant);
+  const send = vi.fn(async (_request: Parameters<RunTransport["send"]>[0]) => ({
+    status: "sent" as const,
+  }));
+  const { instance } = service(
+    store,
+    { supportsGroup: true, execute: async () => ({ status: "succeeded" }) },
+    { send },
+  );
+  await instance.start();
+  await instance.drain();
+  expect(send.mock.calls.some(([request]) => request.delivery.id === noticeId)).toBe(false);
+  const row = await store.db.transaction((tx) =>
+    tx.execute({ sql: "SELECT status FROM task_notifications WHERE id = ?", args: [noticeId] }),
+  );
+  expect(row.rows[0]?.status).toBe("suppressed");
+});
+
+it("never executes a Tool Step adapter from external ingress", async () => {
+  const { store } = await fixture();
+  const execute = vi.fn(async () => ({ status: "succeeded" as const, text: "protected" }));
+  const { instance } = service(store, { supportsGroup: true, supportsTaskStepTool: true, execute });
+  await instance.start();
+  const accepted = await instance.receive(
+    input("external-tool", "external-tool", group, "tool:task_get:task-1"),
+  );
+  expect((await instance.waitForRun(owner(), accepted.run.id)).status).toBe("failed");
+  expect(execute).not.toHaveBeenCalled();
+});
+
+it("executes a persisted Model Step Run without QQ ingress history or automatic delivery", async () => {
+  const { store } = await fixture();
+  const execute = vi.fn(async (request: ExecutionInput) => ({
+    status: "succeeded" as const,
+    text: request.executionMode === "task_step_model" ? "step result" : "source result",
+  }));
+  const send = vi.fn(async () => ({ status: "sent" as const }));
+  const { instance } = service(
+    store,
+    { supportsGroup: true, supportsTaskStepModel: true, execute },
+    { send },
+    { queuedPollMs: 500 },
+  );
+  await instance.start();
+  const accepted = await instance.receive(input("model-step-source"));
+  await instance.waitForRun(owner(), accepted.run.id);
+  await instance.drain();
+  const deliveredBefore = send.mock.calls.length;
+
+  await store.tasks.createTask({
+    id: "model-task",
+    title: "Model task",
+    creatorPrincipalId: "owner",
+    conversationId: accepted.conversation.id,
+    authorizationScope: group,
+  });
+  for (const action of ["task:read", "task:continue"])
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: "task-model-task",
+      action,
+      scope: group,
+      effect: "allow",
+    });
+  const now = new Date().toISOString();
+  await store.db.transaction(async (tx) => {
+    await tx.execute({
+      sql: "UPDATE tasks SET status = 'RUNNING', orchestration_mode = 'durable' WHERE id = 'model-task'",
+      args: [],
+    });
+    await tx.execute({
+      sql: "INSERT INTO task_steps(id,task_id,kind,title,instructions,status,dependency_policy_json,max_attempts,required_capabilities_json,delegated_permissions_json,version,created_at,updated_at) VALUES ('model-step','model-task','model','Model','Write a result','running','{}',1,'[]','[]',1,?,?)",
+      args: [now, now],
+    });
+    await tx.execute({
+      sql: "INSERT INTO task_attempts(id,task_id,step_id,attempt_number,status,started_at) VALUES ('model-attempt','model-task','model-step',1,'running',?)",
+      args: [now],
+    });
+    await tx.execute({
+      sql: "INSERT INTO task_step_leases(id,task_id,step_id,attempt_id,owner_instance_id,state,version,acquired_at,heartbeat_at,expires_at) VALUES ('model-lease','model-task','model-step','model-attempt','temporal-model','active',1,?,?,?)",
+      args: [now, now, new Date(Date.now() + 60_000).toISOString()],
+    });
+  });
+  const internal = await store.conversations.createInternalStepRun({
+    caller: owner(),
+    taskId: "model-task",
+    stepId: "model-step",
+    attemptId: "model-attempt",
+    executionRef: "model:fixture",
+  });
+  const finished = await instance.waitForRun(owner(), internal.id);
+  expect(finished).toMatchObject({
+    source: "task_step",
+    status: "succeeded",
+    resultText: "step result",
+  });
+  expect(execute).toHaveBeenCalledWith(
+    expect.objectContaining({
+      executionMode: "task_step_model",
+      text: "Write a result",
+      history: [],
+    }),
+  );
+  await instance.drain();
+  expect(send).toHaveBeenCalledTimes(deliveredBefore);
+  expect((await store.lifecycle.listDeliveries(owner(), internal.id)).items).toEqual([]);
+  expect(
+    (await store.conversations.listRuns(owner(), accepted.conversation.id)).items.map(
+      (run) => run.id,
+    ),
+  ).not.toContain(internal.id);
+
+  await instance.stop({ wait: true });
+  const restored = service(
+    store,
+    { supportsGroup: true, supportsTaskStepModel: true, execute },
+    { send },
+  ).instance;
+  await restored.start();
+  await restored.drain();
+  expect(send).toHaveBeenCalledTimes(deliveredBefore);
+});
+
+it("rechecks Task read authority after loading internal Run context", async () => {
+  const { store } = await fixture();
+  const bootstrap = service(store, {
+    supportsGroup: true,
+    execute: async () => ({ status: "succeeded", text: "source" }),
+  }).instance;
+  await bootstrap.start();
+  const source = await bootstrap.receive(input("read-revocation-source"));
+  await bootstrap.waitForRun(owner(), source.run.id);
+  await bootstrap.drain();
+  await bootstrap.stop();
+
+  const internal = await createInternalModelStepRun(store, source.conversation.id);
+  const load = store.conversations.loadRunInput.bind(store.conversations);
+  vi.spyOn(store.conversations, "loadRunInput").mockImplementation(async (caller, runId) => {
+    const loaded = await load(caller, runId);
+    if (runId === internal.runId)
+      await store.db.transaction((tx) =>
+        tx.execute({
+          sql: "UPDATE grants SET revoked_at = ? WHERE resource_id = ? AND action = 'task:read'",
+          args: [new Date().toISOString(), `task-${internal.taskId}`],
+        }),
+      );
+    return loaded;
+  });
+  const execute = vi.fn(async () => ({ status: "succeeded" as const, text: "leaked" }));
+  const resumed = service(store, {
+    supportsGroup: true,
+    supportsTaskStepModel: true,
+    execute,
+  }).instance;
+  await resumed.start();
+  await resumed.drain();
+  const storedRun = await store.db.transaction((tx) =>
+    tx.execute({ sql: "SELECT status FROM runs WHERE id = ?", args: [internal.runId] }),
+  );
+  expect(storedRun.rows[0]?.status).toBe("failed");
+  expect(execute).not.toHaveBeenCalled();
+});
+
+it("cancels a queued internal Run when its owning Task requests cancellation", async () => {
+  const { store } = await fixture();
+  const execute = vi.fn(async (): Promise<ExecutionResult> => ({
+    status: "succeeded",
+    text: "done",
+  }));
+  const first = service(store, {
+    supportsGroup: true,
+    supportsTaskStepModel: true,
+    execute,
+  }).instance;
+  await first.start();
+  const source = await first.receive(input("queued-task-cancel-source"));
+  await first.waitForRun(owner(), source.run.id);
+  await first.drain();
+  await first.stop();
+
+  const internal = await createInternalModelStepRun(store, source.conversation.id);
+  await store.db.transaction((tx) =>
+    tx.execute({
+      sql: "UPDATE tasks SET cancellation_state = 'requested' WHERE id = ?",
+      args: [internal.taskId],
+    }),
+  );
+  const resumed = service(store, {
+    supportsGroup: true,
+    supportsTaskStepModel: true,
+    execute,
+  }).instance;
+  await resumed.start();
+  expect((await resumed.waitForRun(owner(), internal.runId)).status).toBe("cancelled");
+  await resumed.drain();
+  expect(execute).toHaveBeenCalledTimes(1);
+  expect((await store.lifecycle.listDeliveries(owner(), internal.runId)).items).toEqual([]);
+});
+
+it("aborts an active internal Run when its owning Task requests cancellation", async () => {
+  const { store } = await fixture();
+  const control = controlledAdapter();
+  const execute = vi.fn(async (request: ExecutionInput): Promise<ExecutionResult> =>
+    request.executionMode === "task_step_model"
+      ? control.adapter.execute(request)
+      : { status: "succeeded", text: "source complete" },
+  );
+  const { instance } = service(
+    store,
+    { ...control.adapter, supportsTaskStepModel: true, execute },
+    { send: async () => ({ status: "sent" }) },
+    { queuedPollMs: 500 },
+  );
+  await instance.start();
+  const source = await instance.receive(input("active-task-cancel-source"));
+  await instance.waitForRun(owner(), source.run.id);
+  await instance.drain();
+  const internal = await createInternalModelStepRun(store, source.conversation.id);
+  await instance.enqueueInternalStepRun(owner(), internal.runId);
+  const execution = await control.started("Write a result");
+
+  await store.db.transaction((tx) =>
+    tx.execute({
+      sql: "UPDATE tasks SET cancellation_state = 'requested' WHERE id = ?",
+      args: [internal.taskId],
+    }),
+  );
+  await vi.waitFor(async () => {
+    expect((await instance.getRun(owner(), internal.runId)).status).toBe("cancelling");
+  });
+  expect(execution.signal.aborted).toBe(true);
+  control.finish("Write a result", { status: "cancelled" });
+  await instance.drain();
+  expect((await instance.getRun(owner(), internal.runId)).status).toBe("cancelled");
+  expect((await store.lifecycle.listDeliveries(owner(), internal.runId)).items).toEqual([]);
+});
+
+async function createInternalModelStepRun(store: DomainStore, conversationId: string) {
+  const taskId = `cancel-task-${Math.random().toString(36).slice(2)}`;
+  await store.tasks.createTask({
+    id: taskId,
+    title: "Cancellation test",
+    creatorPrincipalId: "owner",
+    conversationId,
+    authorizationScope: group,
+  });
+  for (const action of ["task:read", "task:continue"])
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: `task-${taskId}`,
+      action,
+      scope: group,
+      effect: "allow",
+    });
+  const now = new Date().toISOString();
+  await store.db.transaction(async (tx) => {
+    await tx.execute({
+      sql: "UPDATE tasks SET status = 'RUNNING', orchestration_mode = 'durable' WHERE id = ?",
+      args: [taskId],
+    });
+    await tx.execute({
+      sql: "INSERT INTO task_steps(id,task_id,kind,title,instructions,status,dependency_policy_json,max_attempts,required_capabilities_json,delegated_permissions_json,version,created_at,updated_at) VALUES (?,?,'model','Model','Write a result','running','{}',1,'[]','[]',1,?,?)",
+      args: [`${taskId}-step`, taskId, now, now],
+    });
+    await tx.execute({
+      sql: "INSERT INTO task_attempts(id,task_id,step_id,attempt_number,status,started_at) VALUES (?,?,?,1,'running',?)",
+      args: [`${taskId}-attempt`, taskId, `${taskId}-step`, now],
+    });
+    await tx.execute({
+      sql: "INSERT INTO task_step_leases(id,task_id,step_id,attempt_id,owner_instance_id,state,version,acquired_at,heartbeat_at,expires_at) VALUES (?,?,?,?,'test-model','active',1,?,?,?)",
+      args: [
+        `${taskId}-lease`,
+        taskId,
+        `${taskId}-step`,
+        `${taskId}-attempt`,
+        now,
+        now,
+        new Date(Date.now() + 60_000).toISOString(),
+      ],
+    });
+  });
+  const run = await store.conversations.createInternalStepRun({
+    caller: owner(),
+    taskId,
+    stepId: `${taskId}-step`,
+    attemptId: `${taskId}-attempt`,
+    executionRef: "model:fixture",
+  });
+  return { taskId, runId: run.id };
 }
 
 function controlledAdapter() {

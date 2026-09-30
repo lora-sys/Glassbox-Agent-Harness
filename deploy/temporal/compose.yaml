@@ -1,0 +1,61 @@
+services:
+  postgresql:
+    image: postgres:16@sha256:1a6ab3f5345eb6dbe04a1349529caabdb0ab09293a09590fad07b2246bfa4b54
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in deploy/temporal/.env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in deploy/temporal/.env}
+      POSTGRES_DB: postgres
+    volumes:
+      - temporal-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", 'pg_isready -U "$${POSTGRES_USER}" -d postgres']
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  temporal-admin-tools:
+    image: temporalio/admin-tools:1.32.0@sha256:a9f84fb9a374b2374fe2e67c8efc0468ff3f1c66c8a0b14597ec86e349e62bca
+    profiles: ["admin"]
+    depends_on:
+      postgresql:
+        condition: service_healthy
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in deploy/temporal/.env}
+      POSTGRES_PWD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in deploy/temporal/.env}
+      POSTGRES_SEEDS: postgresql
+      SQL_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in deploy/temporal/.env}
+      TEMPORAL_ADDRESS: temporal:7233
+    volumes:
+      - ./init-postgres.sh:/scripts/init-postgres.sh:ro
+
+  temporal:
+    image: temporalio/server:1.32.0@sha256:c3e752127759616bb1615e0f9ba0e21635aeb5fdeb922de4f371c350955f46ae
+    restart: unless-stopped
+    depends_on:
+      postgresql:
+        condition: service_healthy
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in deploy/temporal/.env}
+      POSTGRES_PWD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in deploy/temporal/.env}
+      POSTGRES_SEEDS: postgresql
+      BIND_ON_IP: 0.0.0.0
+      DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/production.yaml
+    volumes:
+      - ./dynamicconfig.yaml:/etc/temporal/config/dynamicconfig/production.yaml:ro
+    ports:
+      - "127.0.0.1:${TEMPORAL_HOST_PORT:-7233}:7233"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "7233"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 30s
+
+volumes:
+  temporal-postgres:

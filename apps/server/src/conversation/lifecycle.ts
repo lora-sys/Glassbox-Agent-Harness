@@ -136,6 +136,12 @@ const deliveryTransitions: Record<DeliveryStatus, readonly DeliveryStatus[]> = {
 export class LifecycleStore {
   constructor(private readonly db: DomainDatabase) {}
 
+  private async requireExternalDeliveryRun(tx: Transaction, runId: string): Promise<void> {
+    const rows = await tx.execute({ sql: "SELECT source FROM runs WHERE id = ?", args: [runId] });
+    if (rows.rows[0]?.source !== "external")
+      throw new Error("Internal Step Runs have no direct delivery");
+  }
+
   private async authorizeDeliverySources(
     tx: Transaction,
     caller: CallerContext,
@@ -206,7 +212,11 @@ export class LifecycleStore {
 
   /** Supervisor-only queue metadata. No message, result or provider state is read.
    * Use a single server owner; this method is not a channel-facing query API. */
-  async listRunRoutes(statuses: readonly RunStatus[], afterSequence = 0): Promise<RunRoute[]> {
+  async listRunRoutes(
+    statuses: readonly RunStatus[],
+    afterSequence = 0,
+    source?: "external" | "task_step",
+  ): Promise<RunRoute[]> {
     if (
       statuses.length === 0 ||
       statuses.some((status) => !Object.hasOwn(transitions, status)) ||
@@ -216,8 +226,8 @@ export class LifecycleStore {
       throw new Error("Invalid queue query");
     return this.db.transaction(async (tx) => {
       const rows = await tx.execute({
-        sql: `SELECT runs.id, runs.conversation_id, runs.sequence, runs.principal_id, runs.scope_json FROM runs WHERE runs.status IN (${statuses.map(() => "?").join(",")}) AND runs.sequence > ? ORDER BY runs.sequence LIMIT 100`,
-        args: [...statuses, afterSequence],
+        sql: `SELECT runs.id, runs.conversation_id, runs.sequence, runs.principal_id, runs.scope_json FROM runs WHERE runs.status IN (${statuses.map(() => "?").join(",")}) AND runs.sequence > ? ${source ? "AND runs.source = ?" : ""} ORDER BY runs.sequence LIMIT 100`,
+        args: [...statuses, afterSequence, ...(source ? [source] : [])],
       });
       return rows.rows.map((row) => {
         const sequence = Number(row.sequence);
@@ -357,6 +367,7 @@ export class LifecycleStore {
           const decision = await authorizeRun(tx, caller, runId, action);
           if ("denied" in decision) return decision;
         }
+        await this.requireExternalDeliveryRun(tx, runId);
         const sources = await this.authorizeDeliverySources(tx, caller, runId);
         if ("denied" in sources) return sources;
         const changed = await tx.execute({
@@ -555,6 +566,7 @@ export class LifecycleStore {
         if ("denied" in decision) return decision;
         const deliveryDecision = await authorizeRun(tx, caller, input.runId, "delivery:send");
         if ("denied" in deliveryDecision) return deliveryDecision;
+        await this.requireExternalDeliveryRun(tx, input.runId);
         const sources = await this.authorizeDeliverySources(tx, caller, input.runId);
         if ("denied" in sources) return sources;
         const id = randomUUID();
@@ -605,6 +617,7 @@ export class LifecycleStore {
         if ("denied" in decision) return decision;
         const deliveryDecision = await authorizeRun(tx, caller, runId, "delivery:send");
         if ("denied" in deliveryDecision) return deliveryDecision;
+        await this.requireExternalDeliveryRun(tx, runId);
         const sources = await this.authorizeDeliverySources(tx, caller, runId);
         if ("denied" in sources) return sources;
         const result = await tx.execute({

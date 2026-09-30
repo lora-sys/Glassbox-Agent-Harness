@@ -189,7 +189,7 @@ When a requirement is ambiguous, choose the smaller implementation that preserve
 
 Do not silently expand scope from the roadmap.
 
-P4A, P4B, the repository transition refactor, the P5 context-budgeting and observability plans, and the Issue #24 closeout are complete. No plan is active: take the next scope from the open Issues in `.plans/roadmap.md`, and keep the completed plans as records.
+P4A, P4B, the repository transition refactor, the P5 context-budgeting and observability plans, and the Issue #24 closeout are complete. The durable long work plan `.plans/06-durable-long-work.md` (Issue #33) records the Herdr Worker and delivery safety foundation; Issue #30 is the Linux-native acceptance prerequisite. Beyond those, no plan is active: take the next scope from the open Issues in `.plans/roadmap.md`, and keep the completed plans as records.
 
 Read in this order before changing code:
 
@@ -204,9 +204,10 @@ Read in this order before changing code:
 
 | Topic | Source of truth |
 | --- | --- |
+| Durable long work and Herdr Worker foundation | `.plans/06-durable-long-work.md` and Issue #33 |
+| Delivery-source reauthorization and Herdr Worker closeout | `.plans/issue-24-closeout.md` and Issue #24 |
 | Completed P5 context budgeting and runtime efficiency | `.plans/05a-context-budgeting-runtime-efficiency.md` and Issue #13 |
 | Completed P5 routing and runtime observability | `.plans/05b-routing-runtime-observability.md` and Issue #14 |
-| Completed delivery-source reauthorization and Herdr Worker closeout | `.plans/issue-24-closeout.md` and Issue #24 |
 | Completed repository modularization and validation workflow | `.plans/phase-transition-repository-refactor.md` and Issue #21 |
 | Completed P4A Memory / Taste implementation and acceptance record | `.plans/04a-memory-taste.md` and Issue #9 |
 | Completed P4B retrieval / QQ history implementation and acceptance record | `.plans/04b-authorized-retrieval-history.md` and Issue #10 |

@@ -101,7 +101,11 @@ for (const path of trackedPaths) {
   if (forbiddenTrackedPath.test(path))
     fail(`Generated, test, runtime, or database artifact is tracked: ${path}`);
   if (privateKeyPath.test(path)) fail(`Private-key material must not be tracked: ${path}`);
-  if (envPath.test(path) && path !== ".env.example") {
+  // What the rule forbids is a real environment file. A template is named .env.example wherever
+  // it lives, and .gitignore's negation for it is unanchored too, so a nested one for a
+  // component's own deployment is the allowed shape. Comparing the whole path to the root's
+  // literal instead read the first such template as a tracked secret.
+  if (envPath.test(path) && path.split("/").pop() !== ".env.example") {
     fail(`Environment files must not be tracked; only .env.example is allowed: ${path}`);
   }
 }

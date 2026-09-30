@@ -6,6 +6,7 @@ import type {
   IncomingImageMimeType,
   RunRecord,
   RunStatus,
+  StepResultRecord,
 } from "../../conversation/store.js";
 import type { CallerContext, TrustedChannelScope } from "../../identity/scope.js";
 import type { DomainStore } from "../../persistence/index.js";
@@ -13,9 +14,13 @@ import type { DomainStore } from "../../persistence/index.js";
 export type AcceptedIncoming = Awaited<ReturnType<DomainStore["conversations"]["acceptIncoming"]>>;
 
 export interface ExecutionInput {
+  /** Set only by the server from a persisted internal Run source. */
+  executionMode?: "task_step_model" | "task_step_tool";
   caller: CallerContext;
   conversation: ConversationRecord;
   run: RunRecord;
+  taskStepBinding?: { taskId: string; stepId: string; attemptId: string };
+  stepResults?: StepResultRecord[];
   text: string;
   images?: readonly { mimeType: IncomingImageMimeType; data: string }[];
   imageFailureCode?: IncomingImageFailure;
@@ -111,6 +116,10 @@ export type ExecutionResult =
 export interface RunExecutionAdapter {
   /** True only for adapters with enforced isolation of files, tools and host configuration. */
   supportsGroup: boolean;
+  /** True only when task_step_model executes without any mutating or ambient Tool surface. */
+  supportsTaskStepModel?: boolean;
+  /** A closed server Tool executor with no model, ambient Tool registry, or external ingress. */
+  supportsTaskStepTool?: boolean;
   execute(input: ExecutionInput): Promise<ExecutionResult>;
 }
 
@@ -176,6 +185,13 @@ export type RunServiceEvent =
       externalId?: string;
     }
   | {
+      type: "task_notification_changed";
+      runId: string;
+      taskId: string;
+      notificationId: string;
+      status: "sending" | "sent" | "failed" | "unknown";
+    }
+  | {
       type: "delivery_blocked";
       runId: string;
       conversationId: string;
@@ -219,6 +235,8 @@ export interface RunServiceOptions {
   resolveExecution(executionRef: string): RunExecutionAdapter | undefined;
   transport: RunTransport;
   concurrency?: number;
+  /** Polls the shared durable queue when an external coordinator inserts internal Runs. */
+  queuedPollMs?: number;
   deliveryTimeoutMs?: number;
   /**
    * How long after a Run finishes a restart may still publish it. Defaults to two hours; a Run

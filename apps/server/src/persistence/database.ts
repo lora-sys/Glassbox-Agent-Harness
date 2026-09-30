@@ -19,6 +19,16 @@ import {
   applySchemaV14Migration,
   applySchemaV15Migration,
   CURRENT_SCHEMA_VERSION,
+  applySchemaV16Migration,
+  applySchemaV17Migration,
+  applySchemaV18Migration,
+  schemaV19Migration,
+  schemaV20Migration,
+  schemaV21Migration,
+  applySchemaV22Migration,
+  schemaV23Migration,
+  applySchemaV24Migration,
+  schemaV25Migration,
 } from "./schema.js";
 
 export function localDatabaseUrl(databasePath: string): string {
@@ -68,6 +78,12 @@ export class DomainDatabase {
           throw new Error("Unsupported database schema version");
         if (version === 0) {
           await tx.batch(schema);
+          // V24 is a guarded function rather than a statement batch, so it is the one rung the
+          // `schema` array cannot carry. Running it here is what keeps a fresh installation at
+          // the same shape an upgraded one reaches — the `task_child_links` notification policy,
+          // the `task_notifications` routing parent and the wider immutable-payload trigger
+          // included.
+          await applySchemaV24Migration(tx);
           await tx.execute(`PRAGMA user_version = ${CURRENT_SCHEMA_VERSION}`);
         } else {
           if (version < 2) {
@@ -90,6 +106,16 @@ export class DomainDatabase {
           if (version < 13) await tx.batch(schemaV13Migration);
           if (version < 14) await applySchemaV14Migration(tx);
           if (version < 15) await applySchemaV15Migration(tx);
+          if (version < 16) await applySchemaV16Migration(tx);
+          if (version < 17) await applySchemaV17Migration(tx);
+          if (version < 18) await applySchemaV18Migration(tx);
+          if (version < 19) await tx.batch(schemaV19Migration);
+          if (version < 20) await tx.batch(schemaV20Migration);
+          if (version < 21) await tx.batch(schemaV21Migration);
+          if (version < 22) await applySchemaV22Migration(tx);
+          if (version < 23) await tx.batch(schemaV23Migration);
+          if (version < 24) await applySchemaV24Migration(tx);
+          if (version < 25) await tx.batch(schemaV25Migration);
           await tx.execute(`PRAGMA user_version = ${CURRENT_SCHEMA_VERSION}`);
         }
       });

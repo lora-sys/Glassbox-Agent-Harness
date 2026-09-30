@@ -1,0 +1,20 @@
+[Unit]
+Description=Glassbox long-work Temporal Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Template only. Replace these account and path values for the Linux host.
+User=glassbox
+Group=glassbox
+# Use the active Glassbox checkout and the absolute npm path from that install.
+WorkingDirectory=/REPLACE/WITH/GLASSBOX/CHECKOUT
+EnvironmentFile=/etc/glassbox/runtime.env
+ExecStart=/REPLACE/WITH/ABSOLUTE/NPM/PATH run long-work:worker -w @glassbox/server
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

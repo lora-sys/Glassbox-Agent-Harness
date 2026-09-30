@@ -7,6 +7,11 @@ import { ManagementError } from "./access.js";
 const collectionActions = ["ops:status", "task:list", "task:create", "task:delegate"];
 const taskActions = [
   "task:read",
+  "task:plan",
+  "task:checkpoint:write",
+  "task:continue",
+  "task:signal",
+  "task:approve",
   "task:delegate",
   "worker:status",
   "worker:read",
