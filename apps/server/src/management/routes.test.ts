@@ -17,6 +17,14 @@ function jsonRequest(url: string, body: unknown): IncomingMessage {
 }
 
 describe("management routes", () => {
+  it("exposes unresolved Run attention to authenticated local management", async () => {
+    const items = [{ id: "attention-1", kind: "unanswered_message", conversationId: "conv-1" }];
+    const result = await routeManagementRequest(request("GET", "/manage/attention"), {
+      store: { tasks: { listAttentionItems: async () => items } },
+    } as unknown as ManagementRouteDependencies);
+    expect(result).toEqual({ status: 200, body: { items } });
+  });
+
   it("creates a scoped approval policy and one-use approval under local management identity", async () => {
     const store = await openDomainStore({ databasePath: ":memory:" });
     const scope = {
