@@ -19,6 +19,7 @@ export async function openManagementRuntime(options: {
   origins: string[];
   status: () => unknown;
   doctor: () => unknown;
+  requestShutdown?: () => void;
   databasePath?: string;
   /** Override the Pi config source. Pass null to disable it in isolated tests. */
   piAgentDirectory?: string | null;
@@ -28,6 +29,7 @@ export async function openManagementRuntime(options: {
   await mkdir(options.dataDirectory, { recursive: true, mode: 0o700 });
   const release = await lockfile.lock(options.dataDirectory, {
     lockfilePath: join(options.dataDirectory, "server.lock"),
+    stale: 10_000,
     retries: 0,
   });
   let application: ManagementApplication | undefined;
@@ -87,6 +89,7 @@ export async function openManagementRuntime(options: {
       models,
       status: options.status,
       doctor: options.doctor,
+      requestShutdown: options.requestShutdown,
       issueTicket,
       route: (request) => application!.route(request),
     });
