@@ -284,14 +284,18 @@ const MUTATION_VERB =
  * The ask has to be interrogative. 开启 and 开放 are also the imperative forms — "给 1121579672
  * 开启群管理能力" is a command to turn a capability on, and a list that read the word as a
  * question dropped the requirement that kept that command honest. So a capability noun followed
- * by 开启 is not enough on its own; the question has to carry one of the words that ask.
+ * by 开启 is not enough on its own; the question has to carry one of the words that ask. 没有
+ * belongs among them because a question can also be asked backwards — "禁言工具开放没有给 oatp
+ * 群里" is the same ask as "有没有开放" with the particles after the verb, and a list that only
+ * knew the forward order read that message as the command the verb names and answered it with a
+ * line about missing parameters.
  */
 const CAPABILITY_NOUN = /(?:工具|功能|能力|权限|接口)/u;
 const CAPABILITY_ASK = /(?:有没有|是否|能否|能不能|可否|会不会|支不支持|可以|能够|能用|可用|支持)/u;
-const CAPABILITY_OPENED = /(?:开|开放|开通|开启|启用)[^。！？\n]{0,4}(?:吗|么|了没|没有没)/u;
+const CAPABILITY_OPENED = /(?:开|开放|开通|开启|启用)[^。！？\n]{0,4}(?:吗|么|了没|没有)/u;
 const CAPABILITY_ACTION =
   /(?:禁言|闭嘴|踢人|踢出|移出|生成|绘制|画图|切换|改成|改为|设置|上传|删除|保存|记忆|记住)/u;
-const CAPABILITY_QUESTION = new RegExp(
+export const CAPABILITY_QUESTION = new RegExp(
   [
     "如何|怎么|能否|能不能|可否|可以吗",
     "(?:谁|我|管理员|群主|成员|机器人|你)[^。！？\\n]{0,80}可以[^。！？\\n]{0,80}吗",
@@ -302,6 +306,29 @@ const CAPABILITY_QUESTION = new RegExp(
   ].join("|"),
   "u",
 );
+
+/**
+ * Whether the message asks whether a capability *stands open*, rather than how to use one.
+ *
+ * `CAPABILITY_QUESTION` covers both, and the two need different treatment. A how-to question
+ * ("怎么禁言") asks for instructions, which no policy row answers, so requiring a read of one
+ * would turn the question into "请求的操作未执行" when the Run skipped the pointless call. A
+ * state question names the row's own dimension — whether it is open, which ones are open — and
+ * its only backed answer is a read. Both the requirement that binds the read and the check that
+ * decides whether a state report was observed read this predicate, so the two can never drift:
+ * a Run is required to observe exactly the messages whose claims a read can excuse.
+ */
+export function capabilityStateQuestion(rawText: string): boolean {
+  return (
+    CAPABILITY_OPENED.test(rawText) ||
+    new RegExp(`${CAPABILITY_NOUN.source}[^。！？\\n]{0,16}有没有`, "u").test(rawText) ||
+    /(?:开放|开启|开通|启用)[^。！？\n]{0,12}哪些/u.test(rawText) ||
+    new RegExp(
+      `(?:支不支持|能不能|能否|可否|会不会)[^。！？\\n]{0,4}(?:${CAPABILITY_ACTION.source})`,
+      "u",
+    ).test(rawText)
+  );
+}
 
 interface LiveDomain {
   readonly domain: RequiredEvidenceDomain;
