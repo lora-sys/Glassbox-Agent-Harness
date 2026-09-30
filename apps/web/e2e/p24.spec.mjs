@@ -27,10 +27,12 @@ const SHAPE_TIMEOUT_MS = 50_000;
 
 function portReady(port) {
   return new Promise((r) => {
-    http.get(`http://localhost:${port}/`, (res) => {
-      res.resume();
-      r(res.statusCode < 500);
-    }).on("error", () => r(false));
+    http
+      .get(`http://localhost:${port}/`, (res) => {
+        res.resume();
+        r(res.statusCode < 500);
+      })
+      .on("error", () => r(false));
   });
 }
 
@@ -39,9 +41,14 @@ async function startServer() {
   const c = spawn("npx", ["tsx", "src/index.ts"], { cwd: SERVER_DIR, shell: true });
   let ready = false;
   const end = Date.now() + 20_000;
-  c.stdout?.on("data", (d) => { if (d.toString().includes("listening")) ready = true; });
+  c.stdout?.on("data", (d) => {
+    if (d.toString().includes("listening")) ready = true;
+  });
   c.stderr?.on("data", (d) => console.error("[srv]", d.toString()));
-  while (Date.now() < end) { if (ready || await portReady(SERVER_PORT)) return c; await delay(500); }
+  while (Date.now() < end) {
+    if (ready || (await portReady(SERVER_PORT))) return c;
+    await delay(500);
+  }
   throw new Error("server failed to start");
 }
 
@@ -50,15 +57,23 @@ async function startWeb() {
   const c = spawn("npx", ["vite", "--host"], { cwd: WEB_DIR, shell: true });
   let ready = false;
   const end = Date.now() + 20_000;
-  c.stdout?.on("data", (d) => { if (d.toString().includes("Local:")) ready = true; });
+  c.stdout?.on("data", (d) => {
+    if (d.toString().includes("Local:")) ready = true;
+  });
   c.stderr?.on("data", (d) => console.error("[web]", d.toString()));
-  while (Date.now() < end) { if (ready || await portReady(WEB_PORT)) return c; await delay(500); }
+  while (Date.now() < end) {
+    if (ready || (await portReady(WEB_PORT))) return c;
+    await delay(500);
+  }
   throw new Error("web dev failed to start");
 }
 
 async function kill(child) {
   return new Promise((resolve) => {
-    try { process.kill(-child.pid, "SIGTERM"); setTimeout(() => process.kill(-child.pid, "SIGKILL"), 3000); } catch {}
+    try {
+      process.kill(-child.pid, "SIGTERM");
+      setTimeout(() => process.kill(-child.pid, "SIGKILL"), 3000);
+    } catch {}
     child.on("exit", resolve);
     setTimeout(resolve, 4000);
   });
@@ -94,7 +109,9 @@ async function readAllShapes(page) {
     if (!ed) return [];
     try {
       const shapes = ed.getCurrentPageShapes();
-      return shapes.map(function(s) { return { id: s.id, type: s.type }; });
+      return shapes.map(function (s) {
+        return { id: s.id, type: s.type };
+      });
     } catch (e) {
       return [{ error: e.message }];
     }
@@ -151,8 +168,8 @@ async function waitForSessionEnd(page, timeoutMs) {
   const page = await ctx.newPage();
 
   // Capture browser console for diagnostics
-  page.on('console', (msg) => {
-    console.log('  [browser]', msg.text());
+  page.on("console", (msg) => {
+    console.log("  [browser]", msg.text());
   });
 
   const passed = [];
@@ -162,7 +179,10 @@ async function waitForSessionEnd(page, timeoutMs) {
     /* ── P24a: claude-code + default permission + demo path ─────────────── */
 
     console.log("\n=== P24a: claude-code + default + demo path ===");
-    await page.goto("http://localhost:" + WEB_PORT + "/", { waitUntil: "networkidle", timeout: 20_000 });
+    await page.goto("http://localhost:" + WEB_PORT + "/", {
+      waitUntil: "networkidle",
+      timeout: 20_000,
+    });
     await page.waitForTimeout(1000);
 
     // Clear any stale session from prior test runs (URL param or localStorage)
@@ -206,10 +226,21 @@ async function waitForSessionEnd(page, timeoutMs) {
     // Diagnostic: check if session was set after run-test click
     var postRunDiag = await page.evaluate(() => {
       return {
-        lastSessionId: (() => { try { return localStorage.getItem("glassbox:lastSessionId"); } catch(e) { return null; } })(),
+        lastSessionId: (() => {
+          try {
+            return localStorage.getItem("glassbox:lastSessionId");
+          } catch (e) {
+            return null;
+          }
+        })(),
         urlSession: new URLSearchParams(window.location.search).get("session"),
-        editorShapeCount: (function() {
-          try { var ed = window.__glassboxEditor; return ed ? ed.getCurrentPageShapes().length : 0; } catch(e) { return -1; }
+        editorShapeCount: (function () {
+          try {
+            var ed = window.__glassboxEditor;
+            return ed ? ed.getCurrentPageShapes().length : 0;
+          } catch (e) {
+            return -1;
+          }
         })(),
       };
     });
@@ -217,27 +248,45 @@ async function waitForSessionEnd(page, timeoutMs) {
 
     // Wait for canvas shapes (at least task + agent message = >= 2)
     const shapesA = await waitForShapes(page, SHAPE_TIMEOUT_MS);
-    console.log("  Canvas shapes after claude-code run:", JSON.stringify(shapesA.map(s => s.text?.slice(0, 60))));
+    console.log(
+      "  Canvas shapes after claude-code run:",
+      JSON.stringify(shapesA.map((s) => s.text?.slice(0, 60))),
+    );
 
     // Also dump the panel log + localStorage for diagnostics
     const diagnosticA = await page.evaluate(() => {
       return {
         lastSessionId: localStorage.getItem("glassbox:lastSessionId"),
         urlSession: new URLSearchParams(window.location.search).get("session"),
-        editorShapes: (function() {
+        editorShapes: (function () {
           try {
             var ed = window.__glassboxEditor;
             if (!ed) return "no editor";
             var shapes = ed.getCurrentPageShapes();
-            return shapes.map(function(s) { return { id: s.id, type: s.type, text: (s.props && s.props.text) ? s.props.text.slice(0, 60) : (s.props && s.props.richText) ? JSON.stringify(s.props.richText).slice(0, 60) : "" }; });
-          } catch(e) { return "ERROR: " + e.message; }
+            return shapes.map(function (s) {
+              return {
+                id: s.id,
+                type: s.type,
+                text:
+                  s.props && s.props.text
+                    ? s.props.text.slice(0, 60)
+                    : s.props && s.props.richText
+                      ? JSON.stringify(s.props.richText).slice(0, 60)
+                      : "",
+              };
+            });
+          } catch (e) {
+            return "ERROR: " + e.message;
+          }
         })(),
       };
     });
     console.log("  [diag]", JSON.stringify(diagnosticA));
 
     if (shapesA.length < 2) {
-      failed.push("P24a: canvas did not populate after claude-code run (got " + shapesA.length + " shapes)");
+      failed.push(
+        "P24a: canvas did not populate after claude-code run (got " + shapesA.length + " shapes)",
+      );
     } else {
       passed.push("P24a: canvas populated with " + shapesA.length + " shapes");
     }
@@ -256,8 +305,11 @@ async function waitForSessionEnd(page, timeoutMs) {
           if (!r.ok) return null;
           var data = await r.json();
           // Trace entries have { seq, ts, event: { method, params }, provenance }
-          return (data?.entries ?? []).filter(function(e) {
-            return (e.event && e.event.method === "session.config") || (e.event && e.event.params && e.event.params.kind === "session.config");
+          return (data?.entries ?? []).filter(function (e) {
+            return (
+              (e.event && e.event.method === "session.config") ||
+              (e.event && e.event.params && e.event.params.kind === "session.config")
+            );
           });
         }, sessionIdA);
         if (traceA && traceA.length > 0) break;
@@ -265,10 +317,22 @@ async function waitForSessionEnd(page, timeoutMs) {
       await delay(500);
     }
     console.log("  session.config entries:", JSON.stringify(traceA));
-    if (traceA && traceA.length > 0 && traceA[0].event && traceA[0].event.params && traceA[0].event.params.permissionMode === "default") {
+    if (
+      traceA &&
+      traceA.length > 0 &&
+      traceA[0].event &&
+      traceA[0].event.params &&
+      traceA[0].event.params.permissionMode === "default"
+    ) {
       passed.push("P24a: trace contains session.config with permissionMode=default");
     } else {
-      failed.push("P24a: session.config with permissionMode=default not found in trace (sessionId=" + sessionIdA + ", got: " + JSON.stringify(traceA) + ")");
+      failed.push(
+        "P24a: session.config with permissionMode=default not found in trace (sessionId=" +
+          sessionIdA +
+          ", got: " +
+          JSON.stringify(traceA) +
+          ")",
+      );
     }
 
     /* ── P24b: Glassbox repo path rejection ─────────────────────────────── */
@@ -309,10 +373,16 @@ async function waitForSessionEnd(page, timeoutMs) {
     var idleDeadline = Date.now() + 240_000;
     while (Date.now() < idleDeadline) {
       var disabled = await page.locator('input[placeholder="Enter a task..."]').isDisabled();
-      if (!disabled) { inputOk = true; break; }
+      if (!disabled) {
+        inputOk = true;
+        break;
+      }
       await delay(1000);
     }
-    if (!inputOk) failed.push("P24: task input stayed disabled for 240s (turn never ended / no session-end broadcast)");
+    if (!inputOk)
+      failed.push(
+        "P24: task input stayed disabled for 240s (turn never ended / no session-end broadcast)",
+      );
 
     /* ── P24c: codex + on-request ───────────────────────────────────────── */
 
@@ -336,7 +406,10 @@ async function waitForSessionEnd(page, timeoutMs) {
     await page.click("button:has-text('Run test')");
 
     const shapesC = await waitForShapes(page, SHAPE_TIMEOUT_MS);
-    console.log("  Canvas shapes after codex run:", JSON.stringify(shapesC.map(s => s.text?.slice(0, 60))));
+    console.log(
+      "  Canvas shapes after codex run:",
+      JSON.stringify(shapesC.map((s) => s.text?.slice(0, 60))),
+    );
 
     if (shapesC.length >= 2) {
       passed.push("P24c: canvas populated with " + shapesC.length + " shapes on codex path");
@@ -356,8 +429,8 @@ async function waitForSessionEnd(page, timeoutMs) {
           var r = await fetch("/api/trace/" + s);
           if (!r.ok) return null;
           var data = await r.json();
-          return (data?.entries ?? []).filter(function(e) {
-            return (e.event && e.event.params && e.event.params.kind === "session.config");
+          return (data?.entries ?? []).filter(function (e) {
+            return e.event && e.event.params && e.event.params.kind === "session.config";
           });
         }, sessionIdC);
         if (traceC && traceC.length > 0) break;
@@ -365,12 +438,23 @@ async function waitForSessionEnd(page, timeoutMs) {
       await delay(500);
     }
     console.log("  session.config entries:", JSON.stringify(traceC));
-    if (traceC && traceC.length > 0 && traceC[0].event && traceC[0].event.params && traceC[0].event.params.approvalPolicy === "on-request") {
+    if (
+      traceC &&
+      traceC.length > 0 &&
+      traceC[0].event &&
+      traceC[0].event.params &&
+      traceC[0].event.params.approvalPolicy === "on-request"
+    ) {
       passed.push("P24c: trace contains session.config with approvalPolicy=on-request");
     } else {
-      failed.push("P24c: session.config with approvalPolicy=on-request not found (sessionId=" + sessionIdC + ", got: " + JSON.stringify(traceC) + ")");
+      failed.push(
+        "P24c: session.config with approvalPolicy=on-request not found (sessionId=" +
+          sessionIdC +
+          ", got: " +
+          JSON.stringify(traceC) +
+          ")",
+      );
     }
-
   } catch (err) {
     console.error("TEST ERROR:", err);
     failed.push("Exception: " + err.message);
@@ -391,5 +475,7 @@ async function waitForSessionEnd(page, timeoutMs) {
   if (freshServer) await kill(serverProc);
   if (freshWeb) await kill(webProc);
 
-  console.log(failed.length === 0 ? "\nAll P2.4 checks passed." : `\n${failed.length} check(s) failed.`);
+  console.log(
+    failed.length === 0 ? "\nAll P2.4 checks passed." : `\n${failed.length} check(s) failed.`,
+  );
 })();

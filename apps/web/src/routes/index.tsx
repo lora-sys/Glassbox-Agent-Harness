@@ -44,7 +44,7 @@ function buildBoardObjects(state: Record<string, unknown>, sessionId: string, pr
     shapes.push({
       kind: "task",
       id: "shape:task-" + sessionId.slice(0, 8),
-      text: "Task: " + state.task,
+      text: "Task: " + String(state.task ?? ""),
       meta: { objectType: "task" },
     });
   }
@@ -214,41 +214,14 @@ function buildBoardObjects(state: Record<string, unknown>, sessionId: string, pr
 function applyFlowLayout(
   editor: any,
   templates: { id: string; text: string; meta: ObjectMeta; kind?: string }[],
-  sessionId: string,
+  _sessionId: string,
 ) {
   const X = 120;
   const ANSWER_X = 760;
-  const MAX_WIDTH = 520;
+  const _MAX_WIDTH = 520;
   const LINE_H = 22;
   const GAP = 18;
   const PAD_Y = 14;
-
-  function wrapLines(text: string, maxChars: number): string[] {
-    const raw = text.split("\n");
-    const out: string[] = [];
-    for (const line of raw) {
-      if (line.length <= maxChars) {
-        out.push(line);
-        continue;
-      }
-      let remaining = line;
-      while (remaining.length > maxChars) {
-        let breakAt = remaining.lastIndexOf(" ", maxChars);
-        if (breakAt <= maxChars * 0.4) breakAt = maxChars;
-        out.push(remaining.slice(0, breakAt));
-        remaining = remaining.slice(breakAt).trimStart();
-      }
-      if (remaining.length > 0) out.push(remaining);
-    }
-    return out;
-  }
-
-  function estimateHeight(text: string): number {
-    const longest = Math.max(...wrapLines(text, 90).map((l) => l.length), 1);
-    const growthFactor = Math.max(1, Math.ceil(longest / 65));
-    const lines = text.split("\n").length * growthFactor;
-    return PAD_Y + lines * LINE_H + PAD_Y;
-  }
 
   // Separate Answer shapes (kind "turn-answer") from regular shapes
   const answerTemplates = templates.filter((t) => (t as any).kind === "turn-answer");
@@ -294,7 +267,7 @@ function applyFlowLayout(
 
   // Position Answer shapes in the second column, aligned with their turn
   for (const t of answerTemplates) {
-    const turnIdx = (t.meta as any).turnIndex ?? 0;
+    const _turnIdx = (t.meta as any).turnIndex ?? 0;
     const turnId = (t.meta as any).itemId || "";
     // Find the turn shape in the regular column to align with
     const turnShape = regularTemplates.find(
@@ -496,7 +469,7 @@ function App() {
 
     addLog("Restoring session " + sessionId.slice(0, 8) + "...");
 
-    (async function restore() {
+    void (async function restore() {
       try {
         var stateRes = await fetch("/api/state/" + sessionId);
         var traceRes = await fetch("/api/trace/" + sessionId);
@@ -598,7 +571,7 @@ function App() {
       }
     }
 
-    pendingDecisions.forEach(function (dec: any, idx: number) {
+    pendingDecisions.forEach(function (dec: any, _idx: number) {
       var shapeId = "shape:decision-" + dec.itemId.slice(0, 8);
       var reason = (dec.reason || "File change").slice(0, 60);
       var text = "DECISION NEEDED\n[fileChange] " + reason + "\nClick to Approve or Decline";
@@ -616,10 +589,10 @@ function App() {
         reason: dec.reason,
         grantRoot: dec.grantRoot,
         _onApprove: function (itemId: string) {
-          handleDecideRef.current && handleDecideRef.current(itemId, true);
+          if (handleDecideRef.current) handleDecideRef.current(itemId, true);
         },
         _onDecline: function (itemId: string) {
-          handleDecideRef.current && handleDecideRef.current(itemId, false);
+          if (handleDecideRef.current) handleDecideRef.current(itemId, false);
         },
       } as any);
       y += 100;
@@ -702,7 +675,7 @@ function App() {
       tracedSessionsRef.current.delete(sessionId);
       traceCacheRef.current.delete(sessionId);
 
-      (async function load() {
+      void (async function load() {
         try {
           var stateRes = await fetch("/api/state/" + sessionId);
           var traceRes = await fetch("/api/trace/" + sessionId);
@@ -903,7 +876,16 @@ function App() {
         setRunning(false);
       }
     },
-    [prompt, addLog, closeCurrentSocket, provider, repoPath, approvalPolicy, sandboxType, permissionMode],
+    [
+      prompt,
+      addLog,
+      closeCurrentSocket,
+      provider,
+      repoPath,
+      approvalPolicy,
+      sandboxType,
+      permissionMode,
+    ],
   );
   // Pause: end turn but keep session open for steering
   var handlePause = useCallback(
@@ -1202,7 +1184,16 @@ function App() {
         setRunning(false);
       }
     },
-    [prompt, demoWorkspace, provider, approvalPolicy, sandboxType, permissionMode, addLog, closeCurrentSocket],
+    [
+      prompt,
+      demoWorkspace,
+      provider,
+      approvalPolicy,
+      sandboxType,
+      permissionMode,
+      addLog,
+      closeCurrentSocket,
+    ],
   );
 
   // S8: Handle user Approve/Decline decision for a file-change request
@@ -1428,7 +1419,7 @@ function App() {
               value={steerText}
               onChange={(e) => setSteerText(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter") handleSteer();
+                if (e.key === "Enter") void handleSteer();
               }}
               placeholder="Steer: type instruction..."
               style={{

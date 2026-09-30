@@ -36,7 +36,11 @@ const PAN_PX = 150;
 
 function portReady(port) {
   return new Promise((r) => {
-    http.get("http://localhost:" + port + "/", (res) => { res.resume(); r(res.statusCode < 500); })
+    http
+      .get("http://localhost:" + port + "/", (res) => {
+        res.resume();
+        r(res.statusCode < 500);
+      })
       .on("error", () => r(false));
   });
 }
@@ -123,13 +127,17 @@ async function run() {
     // ── 1. Isolated selection (editor.select() call time) ─────────────────────
     // Measured in rAF: from before the call to the next frame callback.
     // This captures JS execution time only, not React render time.
-    const selIso = await page.evaluate((id) => new Promise((resolve) => {
-      const ed = window.__glassboxEditor;
-      if (!ed) return resolve(0);
-      const before = performance.now();
-      ed.select(id);
-      requestAnimationFrame(() => resolve(performance.now() - before));
-    }), shapeId);
+    const selIso = await page.evaluate(
+      (id) =>
+        new Promise((resolve) => {
+          const ed = window.__glassboxEditor;
+          if (!ed) return resolve(0);
+          const before = performance.now();
+          ed.select(id);
+          requestAnimationFrame(() => resolve(performance.now() - before));
+        }),
+      shapeId,
+    );
     selIsolatedTimes.push(selIso);
 
     // ── 2. Selection + React render (user-perceived) ──────────────────────────
@@ -148,10 +156,12 @@ async function run() {
 
     // ── 3. Inspector open ─────────────────────────────────────────────────────
     const inspT0 = performance.now();
-    const inspLen = await page.evaluate(() => {
-      const el = document.querySelector("[data-glassbox-inspector]");
-      return el ? (el.textContent || "").length : 0;
-    }).catch(() => 0);
+    const inspLen = await page
+      .evaluate(() => {
+        const el = document.querySelector("[data-glassbox-inspector]");
+        return el ? (el.textContent || "").length : 0;
+      })
+      .catch(() => 0);
     const inspEnd = performance.now();
     inspTimes.push(inspEnd - inspT0);
 
@@ -177,7 +187,7 @@ async function run() {
 
   function stats(arr) {
     const sorted = [...arr].sort((a, b) => a - b);
-    const p50 = sorted[Math.floor(sorted.length * 0.50)] || 0;
+    const p50 = sorted[Math.floor(sorted.length * 0.5)] || 0;
     const p95 = sorted[Math.floor(sorted.length * 0.95)] || 0;
     const max = sorted[sorted.length - 1] || 0;
     return { p50, p95, max, n: sorted.length };
@@ -190,7 +200,7 @@ async function run() {
   const z = stats(zoomTimes);
 
   // Bars: isolated select < 5ms, select+render < 250ms, inspector < 250ms
-  const passIso = sIso.p95 < 200;  // rAF captures JS + render; 200ms per-interaction is the real bar
+  const passIso = sIso.p95 < 200; // rAF captures JS + render; 200ms per-interaction is the real bar
   const passSel = sR.p95 < 250;
   const passInsp = i.p95 < 250;
   const passPan = p.p95 < 500;
@@ -205,19 +215,69 @@ async function run() {
   console.log("Iterations:       " + ITERATIONS);
   console.log("──────────────────────────────────────────────────────────────────────");
   console.log("Metric             │ p50 (ms) │ p95 (ms) │ max (ms) │ Bar    │");
-  console.log("Select(ed.)       │ " + pad(sIso.p50.toFixed(1)) + " │ " + pad(sIso.p95.toFixed(1)) + " │ " + pad(sIso.max.toFixed(1)) + " │ 200ms  │");
-  console.log("Select(+render)   │ " + pad(sR.p50.toFixed(1)) + " │ " + pad(sR.p95.toFixed(1)) + " │ " + pad(sR.max.toFixed(1)) + " │ 250ms  │");
-  console.log("Inspector open    │ " + pad(i.p50.toFixed(1)) + " │ " + pad(i.p95.toFixed(1)) + " │ " + pad(i.max.toFixed(1)) + " │ 250ms  │");
-  console.log("Pan (drag)        │ " + pad(p.p50.toFixed(1)) + " │ " + pad(p.p95.toFixed(1)) + " │ " + pad(p.max.toFixed(1)) + " │ 500ms  │");
-  console.log("Zoom (wheel)      │ " + pad(z.p50.toFixed(1)) + " │ " + pad(z.p95.toFixed(1)) + " │ " + pad(z.max.toFixed(1)) + " │ 500ms  │");
-  console.log("Init render       │ " + pad((initialRenderMs / 1000).toFixed(1)) + "  s │ " + pad((initialRenderMs / 1000).toFixed(1)) + "  s │ " + pad((initialRenderMs / 1000).toFixed(1)) + "  s │  5s    │");
+  console.log(
+    "Select(ed.)       │ " +
+      pad(sIso.p50.toFixed(1)) +
+      " │ " +
+      pad(sIso.p95.toFixed(1)) +
+      " │ " +
+      pad(sIso.max.toFixed(1)) +
+      " │ 200ms  │",
+  );
+  console.log(
+    "Select(+render)   │ " +
+      pad(sR.p50.toFixed(1)) +
+      " │ " +
+      pad(sR.p95.toFixed(1)) +
+      " │ " +
+      pad(sR.max.toFixed(1)) +
+      " │ 250ms  │",
+  );
+  console.log(
+    "Inspector open    │ " +
+      pad(i.p50.toFixed(1)) +
+      " │ " +
+      pad(i.p95.toFixed(1)) +
+      " │ " +
+      pad(i.max.toFixed(1)) +
+      " │ 250ms  │",
+  );
+  console.log(
+    "Pan (drag)        │ " +
+      pad(p.p50.toFixed(1)) +
+      " │ " +
+      pad(p.p95.toFixed(1)) +
+      " │ " +
+      pad(p.max.toFixed(1)) +
+      " │ 500ms  │",
+  );
+  console.log(
+    "Zoom (wheel)      │ " +
+      pad(z.p50.toFixed(1)) +
+      " │ " +
+      pad(z.p95.toFixed(1)) +
+      " │ " +
+      pad(z.max.toFixed(1)) +
+      " │ 500ms  │",
+  );
+  console.log(
+    "Init render       │ " +
+      pad((initialRenderMs / 1000).toFixed(1)) +
+      "  s │ " +
+      pad((initialRenderMs / 1000).toFixed(1)) +
+      "  s │ " +
+      pad((initialRenderMs / 1000).toFixed(1)) +
+      "  s │  5s    │",
+  );
   console.log("──────────────────────────────────────────────────────────────────────");
   console.log("Select(ed.)       │ " + verdict(passIso) + " │ p95=" + sIso.p95.toFixed(1) + "ms");
   console.log("Select(+render)   │ " + verdict(passSel) + " │ p95=" + sR.p95.toFixed(1) + "ms");
   console.log("Inspector open    │ " + verdict(passInsp) + " │ p95=" + i.p95.toFixed(1) + "ms");
   console.log("Pan (drag)        │ " + verdict(passPan) + " │ p95=" + p.p95.toFixed(1) + "ms");
   console.log("Zoom (wheel)      │ " + verdict(passZoom) + " │ p95=" + z.p95.toFixed(1) + "ms");
-  console.log("Init render       │ " + verdict(passInit) + " │ " + initialRenderMs.toFixed(0) + "ms");
+  console.log(
+    "Init render       │ " + verdict(passInit) + " │ " + initialRenderMs.toFixed(0) + "ms",
+  );
   console.log("──────────────────────────────────────────────────────────────────────");
   console.log("OVERALL: " + (allPass ? "PASS — all bars met." : "FAIL — see above."));
   console.log("══════════════════════════════════════════════════════════════════════");
@@ -237,7 +297,14 @@ async function run() {
     inspector: { ...i, unit: "ms", bar: 250 },
     pan: { ...p, unit: "ms", bar: 500 },
     zoom: { ...z, unit: "ms", bar: 500 },
-    initialRender: { p50: initialRenderMs, p95: initialRenderMs, max: initialRenderMs, n: 1, bar: 5000, unit: "ms" },
+    initialRender: {
+      p50: initialRenderMs,
+      p95: initialRenderMs,
+      max: initialRenderMs,
+      n: 1,
+      bar: 5000,
+      unit: "ms",
+    },
     verdict: {
       selectIsolated: passIso ? "pass" : "fail",
       selectWithRender: passSel ? "pass" : "fail",

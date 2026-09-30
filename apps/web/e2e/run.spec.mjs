@@ -23,10 +23,12 @@ const SHAPE_TIMEOUT_MS = 35_000;
 
 function portReady(port) {
   return new Promise((r) => {
-    http.get(`http://localhost:${port}/`, (res) => {
-      res.resume();
-      r(res.statusCode < 500);
-    }).on("error", () => r(false));
+    http
+      .get(`http://localhost:${port}/`, (res) => {
+        res.resume();
+        r(res.statusCode < 500);
+      })
+      .on("error", () => r(false));
   });
 }
 
@@ -35,9 +37,14 @@ async function startServer() {
   const c = spawn("npx", ["tsx", "src/index.ts"], { cwd: SERVER_DIR, shell: true });
   let ready = false;
   const end = Date.now() + 20_000;
-  c.stdout?.on("data", (d) => { if (d.toString().includes("listening")) ready = true; });
+  c.stdout?.on("data", (d) => {
+    if (d.toString().includes("listening")) ready = true;
+  });
   c.stderr?.on("data", (d) => console.error("[srv]", d.toString()));
-  while (Date.now() < end) { if (ready || await portReady(SERVER_PORT)) return c; await delay(500); }
+  while (Date.now() < end) {
+    if (ready || (await portReady(SERVER_PORT))) return c;
+    await delay(500);
+  }
   throw new Error("server failed to start");
 }
 
@@ -46,21 +53,29 @@ async function startWeb() {
   const c = spawn("npx", ["vite", "--host"], { cwd: WEB_DIR, shell: true });
   let ready = false;
   const end = Date.now() + 20_000;
-  c.stdout?.on("data", (d) => { if (d.toString().includes("Local:")) ready = true; });
+  c.stdout?.on("data", (d) => {
+    if (d.toString().includes("Local:")) ready = true;
+  });
   c.stderr?.on("data", (d) => console.error("[web]", d.toString()));
-  while (Date.now() < end) { if (ready || await portReady(WEB_PORT)) return c; await delay(500); }
+  while (Date.now() < end) {
+    if (ready || (await portReady(WEB_PORT))) return c;
+    await delay(500);
+  }
   throw new Error("web dev failed to start");
 }
 
 async function kill(child) {
   return new Promise((resolve) => {
-    try { process.kill(-child.pid, "SIGTERM"); setTimeout(() => process.kill(-child.pid, "SIGKILL"), 3000); } catch {}
+    try {
+      process.kill(-child.pid, "SIGTERM");
+      setTimeout(() => process.kill(-child.pid, "SIGKILL"), 3000);
+    } catch {}
     child.on("exit", resolve);
     setTimeout(resolve, 4000);
   });
 }
 
- /**
+/**
  * Extract plain text from a tldraw v5 richText value.
  * richText is a TipTap JSON doc: { type, content: [{type, text|content}] }
  */
@@ -158,7 +173,10 @@ async function readAllTextShapes(page) {
   const page = await ctx.newPage();
 
   try {
-    await page.goto("http://localhost:" + WEB_PORT + "/", { waitUntil: "networkidle", timeout: 20_000 });
+    await page.goto("http://localhost:" + WEB_PORT + "/", {
+      waitUntil: "networkidle",
+      timeout: 20_000,
+    });
     await page.waitForTimeout(2000); // let tldraw settle
 
     // Click Run test
@@ -167,7 +185,8 @@ async function readAllTextShapes(page) {
 
     // Poll editor shapes until we find task + result text
     const deadline = Date.now() + SHAPE_TIMEOUT_MS;
-    let hasTask = false, hasResult = false;
+    let hasTask = false,
+      hasResult = false;
 
     while (Date.now() < deadline) {
       const shapes = await readAllTextShapes(page);
@@ -216,7 +235,9 @@ async function readAllTextShapes(page) {
     const hasWork = finalShapes.some((s) => s.text.startsWith("Agent:"));
     const hasTrace = finalShapes.some((s) => s.text.startsWith("Trace:"));
 
-    console.log(`Object set — task:${!!taskShape} work:${hasWork} result:${hasResult} trace:${hasTrace}`);
+    console.log(
+      `Object set — task:${!!taskShape} work:${hasWork} result:${hasResult} trace:${hasTrace}`,
+    );
 
     if (!hasWork) {
       console.log("WARN: no 'Agent:' (currentWork) shape; turn may not produce agent output");
@@ -283,11 +304,9 @@ async function readAllTextShapes(page) {
 
     if (resultSelectResult.found) {
       const resultLabelOK =
-        resultInspector.includes("Result:") ||
-        /completed|failed/i.test(resultInspector);
+        resultInspector.includes("Result:") || /completed|failed/i.test(resultInspector);
       const durationOK =
-        resultInspector.includes("Duration") ||
-        /\d+\.?\d*\s*s(?:econds)?/i.test(resultInspector);
+        resultInspector.includes("Duration") || /\d+\.?\d*\s*s(?:econds)?/i.test(resultInspector);
 
       if (!resultLabelOK) {
         console.log("FAIL: Inspector does not show result status for result shape");
@@ -321,7 +340,9 @@ async function readAllTextShapes(page) {
       const traceInspector = await readInspectorText(page);
       const hasCounts = Object.keys(traceInspector).length > 0 || traceInspector.length > 30;
       // Look for event Count key indicators
-      const hasEventInfo = /turn\/started|item\/started|turn\/completed|events/i.test(traceInspector);
+      const hasEventInfo = /turn\/started|item\/started|turn\/completed|events/i.test(
+        traceInspector,
+      );
       console.log("Trace inspector length:", traceInspector.length, "hasEventInfo:", hasEventInfo);
       if (hasEventInfo) {
         console.log("PASS: trace inspector shows event breakdown");
@@ -345,7 +366,9 @@ async function readAllTextShapes(page) {
     if (artifactSelectResult.found) {
       const artInspector = await readInspectorText(page);
       const hasArtifactInfo =
-        artInspector.includes("File Changes") || artInspector.includes("kind") || artInspector.length > 30;
+        artInspector.includes("File Changes") ||
+        artInspector.includes("kind") ||
+        artInspector.length > 30;
       console.log(
         "Artifact inspector length:",
         artInspector.length,
@@ -374,11 +397,14 @@ async function readAllTextShapes(page) {
 
     // 2) Capture shape texts before reload
     var preShapes = await readAllTextShapes(page);
-    function keyType(s) { return s.text.slice(0, 30); }
-    var beforeTypes = preShapes.filter(s => s?.id?.startsWith("shape:"))
-      .map(keyType);
-    console.log("Pre-reload shape types (" + beforeTypes.length + "):",
-      JSON.stringify(beforeTypes));
+    function keyType(s) {
+      return s.text.slice(0, 30);
+    }
+    var beforeTypes = preShapes.filter((s) => s?.id?.startsWith("shape:")).map(keyType);
+    console.log(
+      "Pre-reload shape types (" + beforeTypes.length + "):",
+      JSON.stringify(beforeTypes),
+    );
 
     // 3) Reload with session in URL and wait for async restoration
     console.log("Reloading (preserving ?session=" + sessionId + ")...");
@@ -390,7 +416,7 @@ async function readAllTextShapes(page) {
       return new URLSearchParams(window.location.search).get("session") || "";
     });
     if (afterSid !== sessionId) {
-      console.log("FAIL: sessionId lost. Was " + sessionId.slice(0,8) + ", now " + afterSid);
+      console.log("FAIL: sessionId lost. Was " + sessionId.slice(0, 8) + ", now " + afterSid);
       process.exitCode = 1;
       return;
     }
@@ -398,14 +424,12 @@ async function readAllTextShapes(page) {
 
     // 5) Read shapes after reload and verify same shape set
     var postShapes = await readAllTextShapes(page);
-    var afterTypes = postShapes.filter(s => s?.id?.startsWith("shape:"))
-      .map(keyType);
-    console.log("Post-reload shape types (" + afterTypes.length + "):",
-      JSON.stringify(afterTypes));
+    var afterTypes = postShapes.filter((s) => s?.id?.startsWith("shape:")).map(keyType);
+    console.log("Post-reload shape types (" + afterTypes.length + "):", JSON.stringify(afterTypes));
 
     // Compare Type signatures (ignoring exact ids which change per session)
-    var beforeSignatures = beforeTypes.map(t => t.split(":")[0]).sort();
-    var afterSignatures = afterTypes.map(t => t.split(":")[0]).sort();
+    var beforeSignatures = beforeTypes.map((t) => t.split(":")[0]).sort();
+    var afterSignatures = afterTypes.map((t) => t.split(":")[0]).sort();
     if (JSON.stringify(beforeSignatures) !== JSON.stringify(afterSignatures)) {
       console.log("FAIL: shape type set mismatch after reload");
       console.log("  Before:", beforeSignatures);
@@ -436,8 +460,12 @@ async function readAllTextShapes(page) {
     var resultSel2 = await page.evaluate(() => {
       var ed = window.__glassboxEditor;
       if (!ed) return { found: false, error: "no editor" };
-      var shapes = ed.getCurrentPageShapes().filter(function(s) { return s.type === "text"; });
-      var r = shapes.find(function(s) { return s.id.startsWith("shape:result-"); });
+      var shapes = ed.getCurrentPageShapes().filter(function (s) {
+        return s.type === "text";
+      });
+      var r = shapes.find(function (s) {
+        return s.id.startsWith("shape:result-");
+      });
       if (r) ed.select(r.id);
       return { found: !!r };
     });
@@ -447,7 +475,8 @@ async function readAllTextShapes(page) {
     if (resultSel2.found) {
       var resultInsp2 = await readInspectorText(page);
       var resultLabelOK2 = resultInsp2.includes("Result:") || /completed|failed/i.test(resultInsp2);
-      var durationOK2 = resultInsp2.includes("Duration") || /\d+\.?\d*\s*s(?:econds)?/i.test(resultInsp2);
+      var durationOK2 =
+        resultInsp2.includes("Duration") || /\d+\.?\d*\s*s(?:econds)?/i.test(resultInsp2);
       if (!resultLabelOK2) {
         console.log("FAIL: Inspector missing result status after reload");
         process.exitCode = 1;

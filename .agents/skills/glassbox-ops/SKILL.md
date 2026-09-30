@@ -47,20 +47,20 @@ node .agents/skills/glassbox-ops/scripts/gbxtrace.mjs env
 
 路径：`.agents/skills/glassbox-ops/scripts/gbxtrace.mjs`（零依赖，`node` 直接跑，只读，不碰服务、不写数据）。下文用 `gbx` 代指该脚本。
 
-| 命令                                      | 用途                                                                                                                                                                                                    |
-| :---------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `gbx env`                                 | 环境检查：数据目录、run 总数、最新 run、token 文件、服务端口可达性（端口按 `PORT` 环境变量 → `service-launch.json` 的 `glassbox.env.PORT` → 3030 的顺序解析）                                           |
-| `gbx runs [--limit N] [--status failed]`  | 列出最近 run：状态、起止、时长、事件数、conversation、principal                                                                                                                                         |
-| `gbx show [runId] [--full]`               | 单 run 时间线；省略 runId 看最新；`message_chunk` 默认折叠，`--full` 展开                                                                                                                               |
-| `gbx events <runId> --type T [--type T2]` | 按事件类型下钻原始事件（`--type` 可重复）                                                                                                                                                               |
-| `gbx grep <模式> [--last N] [--type T]`   | 跨最近 N 个 run 搜 trace 原文（默认 50）                                                                                                                                                                |
-| `gbx failures [--limit N]`                | 非成功 run（failed/interrupted/unknown）+ 错误证据摘要                                                                                                                                                  |
-| `gbx delivery [--limit N]`                | 投递事件（changed / blocked / denied）汇总                                                                                                                                                              |
-| `gbx replay [runId] [--gap-ms N]`         | **入站→出站六段回放**：逐段报"有/没有证据"，并列出 >= 5s 的时间空洞。**排查任何一次出错的对话，第一个跑这个**                                                                                           |
+| 命令                                      | 用途                                                                                                                                                                                                                |
+| :---------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `gbx env`                                 | 环境检查：数据目录、run 总数、最新 run、token 文件、服务端口可达性（端口按 `PORT` 环境变量 → `service-launch.json` 的 `glassbox.env.PORT` → 3030 的顺序解析）                                                       |
+| `gbx runs [--limit N] [--status failed]`  | 列出最近 run：状态、起止、时长、事件数、conversation、principal                                                                                                                                                     |
+| `gbx show [runId] [--full]`               | 单 run 时间线；省略 runId 看最新；`message_chunk` 默认折叠，`--full` 展开                                                                                                                                           |
+| `gbx events <runId> --type T [--type T2]` | 按事件类型下钻原始事件（`--type` 可重复）                                                                                                                                                                           |
+| `gbx grep <模式> [--last N] [--type T]`   | 跨最近 N 个 run 搜 trace 原文（默认 50）                                                                                                                                                                            |
+| `gbx failures [--limit N]`                | 非成功 run（failed/interrupted/unknown）+ 错误证据摘要                                                                                                                                                              |
+| `gbx delivery [--limit N]`                | 投递事件（changed / blocked / denied）汇总                                                                                                                                                                          |
+| `gbx replay [runId] [--gap-ms N]`         | **入站→出站六段回放**：逐段报"有/没有证据"，并列出 >= 5s 的时间空洞。**排查任何一次出错的对话，第一个跑这个**                                                                                                       |
 | `gbx ingress [--full]`                    | 群入站证据：哪些消息没变成 run、为什么（`not_addressed`/`empty_message`/`not_ready`/`invalid_message`/`acceptance_failed`…）。落在 `<dataDir>/ingress-diagnostics.jsonl`，**重启不丢**；没有 run 可用时这是唯一入口 |
-| `gbx msg [runId]`                         | 这条 run 由哪条消息触发（`messageId`/`externalId`/`textBytes`/`textSha256`），并给出查正文的授权路径——正文按设计不在 trace 里                                                                           |
-| `gbx types`                               | 本地全部 run 的事件类型与终态分布（校准对 trace 的预期）                                                                                                                                                |
-| `gbx drift`                               | **文档漂移检测**：本地 trace 里出现、但 `references/trace-events.md` 没记录的事件类型，附样本 JSON                                                                                                      |
+| `gbx msg [runId]`                         | 这条 run 由哪条消息触发（`messageId`/`externalId`/`textBytes`/`textSha256`），并给出查正文的授权路径——正文按设计不在 trace 里                                                                                       |
+| `gbx types`                               | 本地全部 run 的事件类型与终态分布（校准对 trace 的预期）                                                                                                                                                            |
+| `gbx drift`                               | **文档漂移检测**：本地 trace 里出现、但 `references/trace-events.md` 没记录的事件类型，附样本 JSON                                                                                                                  |
 
 所有命令支持 `--json`（机器可读，便于二次处理）和 `--data-dir <path>`（覆盖数据目录）。runId 支持不冲突的前缀。出错时退出码 2 并给出原因。
 
