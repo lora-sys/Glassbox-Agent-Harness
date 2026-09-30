@@ -1922,7 +1922,7 @@ export class ManagementApplication {
         const profileId = reference.slice(kind.length + 1);
         const configured = this.selectableModelProfiles(kind === "pi");
         const origin = configured.find((profile) => profile.id === profileId);
-        if (!origin) return { status: "failed" };
+        if (!origin) return { status: "failed", failureCode: "execution_unavailable" };
         const channelSelection = this.channels.resolve(input.caller.scope.connectionId);
         const explicitOverride =
           input.caller.scope.chatType === "private" &&
@@ -2111,7 +2111,7 @@ export class ManagementApplication {
         };
         if (decision.executionRef === null) {
           await appendRoutingEval(null);
-          return { status: "failed" };
+          return { status: "failed", failureCode: "execution_unavailable" };
         }
         const selected =
           decision.executionRef === reference
@@ -2119,7 +2119,7 @@ export class ManagementApplication {
             : this.directExecution(decision.executionRef);
         if (!selected || (input.caller.scope.chatType === "group" && !selected.supportsGroup)) {
           await appendRoutingEval(null);
-          return { status: "failed" };
+          return { status: "failed", failureCode: "execution_unavailable" };
         }
         let succeeded = false;
         let actualExecutionRef = decision.executionRef;
@@ -2232,9 +2232,16 @@ export class ManagementApplication {
           succeeded = result.status === "succeeded";
           return result;
         } catch (error) {
+          // An exception escaping the executor does not assert that the runtime was engaged and
+          // failed: it can be a gate, an abort, a fault in recording evidence, or the provider
+          // being unreachable, and from out here there is no way to tell them apart. Recording
+          // `unavailable` anyway would be guessing at the most destructive answer, which is how
+          // a refusal Glassbox issued itself once pulled a working profile out of routing. The
+          // positively asserted form of that signal is `runtime_run_errored`, which only the
+          // runtime can report, and that is what removes the profile.
           await observeRuntimeHealth(
             actualExecutionRef,
-            "unavailable",
+            "degraded",
             attemptStartedAt,
             "execution_error",
           );

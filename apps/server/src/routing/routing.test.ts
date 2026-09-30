@@ -183,6 +183,33 @@ describe("selectRoute", () => {
     });
   });
 
+  it("drops a profile only for health the runtime itself reported, not for a degraded Run", () => {
+    // `degraded` is what a Run that did not succeed records when the cause was not the runtime
+    // failing to answer — a gate of Glassbox's own, or work the model left incomplete. Routing
+    // must keep the profile selectable: removing it is what turned one honest refusal into a Run
+    // with no usable route at all.
+    const degraded = runtime();
+    degraded.health = {
+      state: "degraded",
+      checkedAt: null,
+      latencyMs: null,
+      reasonCode: "gate_refused",
+    };
+    expect(selectRoute(input({ candidates: [degraded] })).executionRef).toBe(degraded.executionRef);
+
+    // Only a cause that says the runtime was engaged and could not answer removes it.
+    const unavailable = runtime();
+    unavailable.health = {
+      state: "unavailable",
+      checkedAt: null,
+      latencyMs: null,
+      reasonCode: "runtime_run_errored",
+    };
+    expect(selectRoute(input({ candidates: [unavailable] })).candidates[0]?.reason).toBe(
+      "health_unavailable",
+    );
+  });
+
   it("treats unknown health and capacity as unknown unless explicitly allowed", () => {
     const unknown = runtime();
     unknown.health.state = "unknown";

@@ -1,5 +1,10 @@
 import type { Options, Query, SDKMessage, tool } from "@anthropic-ai/claude-agent-sdk";
-import type { ExecutionInput, ExecutionResult, RunExecutionAdapter } from "../run-service/types.js";
+import type {
+  ExecutionFailureCode,
+  ExecutionInput,
+  ExecutionResult,
+  RunExecutionAdapter,
+} from "../run-service/types.js";
 
 export type HarnessFailureCode =
   | "INVALID_INPUT"
@@ -19,6 +24,36 @@ export class HarnessFailure extends Error {
   constructor(readonly code: HarnessFailureCode) {
     super(code);
     this.name = "HarnessFailure";
+  }
+}
+
+/**
+ * What a harness stage says about the runtime behind the Run.
+ *
+ * Every one of these stages ends a Run, and the harness codes distinguish "the external runtime
+ * was engaged and failed" from "Glassbox refused to engage it". Mapping them in one place is
+ * what keeps a failed Run from naming no cause at all: a later layer reading a cause-free
+ * failure has to guess, and the guess it used to make was that the runtime was down.
+ */
+export function harnessFailureCause(code: HarnessFailureCode | undefined): ExecutionFailureCode {
+  switch (code) {
+    case undefined:
+    // The stage named nothing, which is the one case that has to fall back on the conservative
+    // answer: the external runtime was engaged and something went wrong that nobody classified.
+    case "SPAWN_FAILED":
+    case "PROVIDER_FAILED":
+    case "OUTPUT_LIMIT":
+    case "TIMED_OUT":
+    case "ISOLATION_VIOLATION":
+    case "EXIT_UNCONFIRMED":
+      return "runtime_run_errored";
+    case "INVALID_INPUT":
+    case "EXECUTABLE_MISSING":
+    case "EXECUTABLE_CHANGED":
+    case "GROUP_ISOLATION_UNVERIFIED":
+    case "CREDENTIAL_UNAVAILABLE":
+    case "CODEX_ISOLATION_UNVERIFIED":
+      return "gate_refused";
   }
 }
 
@@ -48,10 +83,19 @@ export type HarnessEvent =
       code?: HarnessFailureCode;
     };
 
-export interface HarnessResult extends ExecutionResult {
+/**
+ * `ExecutionResult` is a union now, so the extra harness fields have to be distributed over its
+ * members rather than appended to a flattened object — an `extends` would erase the
+ * `status`/`failureCode` pairing that a failed Run is required to name.
+ */
+type WithHarnessFields<T> = T extends unknown ? T & HarnessResultFields : never;
+
+interface HarnessResultFields {
   usage: HarnessUsage | null;
   code?: HarnessFailureCode;
 }
+
+export type HarnessResult = WithHarnessFields<ExecutionResult>;
 
 export interface HarnessAdapter extends RunExecutionAdapter {
   readonly capabilities: {

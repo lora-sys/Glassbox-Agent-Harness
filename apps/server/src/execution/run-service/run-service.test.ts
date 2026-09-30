@@ -769,7 +769,7 @@ describe("durable Run scheduling", () => {
         text: "未能从 QQ 获取该信息，因此无法确认。",
       })
       .mockResolvedValueOnce({ status: "failed", failureCode: "execution_threw" })
-      .mockResolvedValueOnce({ status: "failed", text: "" });
+      .mockResolvedValueOnce({ status: "unknown", text: "" });
     const { instance } = service(store, { supportsGroup: true, execute }, { send });
     await instance.start();
 
@@ -792,7 +792,7 @@ describe("durable Run scheduling", () => {
     await instance.drain();
     expect(
       (await store.lifecycle.listDeliveries(owner(), blank.run.id)).items[0]?.payloadText,
-    ).toBe("任务处理未完成，状态为 failed。");
+    ).toBe("任务处理未完成，状态为 unknown。");
     expect(send).toHaveBeenCalledTimes(3);
   });
 
@@ -863,6 +863,7 @@ describe("durable Run scheduling", () => {
       supportsGroup: true,
       execute: async () => ({
         status: "failed",
+        failureCode: "gate_refused",
         text: "Task failed without provider diagnostics.",
       }),
     });

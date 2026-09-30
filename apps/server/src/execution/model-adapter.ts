@@ -46,7 +46,9 @@ export function configuredModelAdapter(options: {
         const first = input.history[index];
         const second = input.history[index + 1];
         if (!first || first.role !== "user" || (second && second.role !== "assistant"))
-          return { status: "failed" as const };
+          // The history Glassbox handed over does not alternate, so this is a fault in what was
+          // passed in rather than in the runtime that would have received it.
+          return { status: "failed" as const, failureCode: "gate_refused" as const };
         exchanges.push({
           id: String(index),
           userTokens: estimateUnicodeTokens(first.text) + 8,
@@ -151,15 +153,16 @@ export function configuredModelAdapter(options: {
         maxOutputTokens,
         onEvent: options.onEvent ? (event) => options.onEvent!(input.run.id, event) : undefined,
       });
-      return {
-        status:
-          result.status === "completed"
-            ? "succeeded"
-            : result.status === "cancelled"
-              ? "cancelled"
-              : "failed",
-        ...(result.status === "completed" ? { text: result.text } : {}),
-      };
+      return result.status === "completed"
+        ? { status: "succeeded", text: result.text }
+        : result.status === "cancelled"
+          ? { status: "cancelled" }
+          : {
+              // The provider was engaged and the run it was given did not produce an answer, so
+              // this is the one shape of failure that names the runtime itself.
+              status: "failed",
+              failureCode: "runtime_run_errored",
+            };
     },
   };
 }

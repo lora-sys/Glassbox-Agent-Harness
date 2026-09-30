@@ -32,31 +32,81 @@ export interface ExecutionInput {
   signal: AbortSignal;
 }
 
-export interface ExecutionResult {
-  /** A terminal adapter result is evidence; receiving an abort signal alone is not. */
-  status: "succeeded" | "failed" | "cancelled" | "interrupted" | "unknown";
+/**
+ * Why a Run produced no answer of its own.
+ *
+ * This is a closed union on purpose. Every layer that reads it — the fallback line a reader
+ * receives, the health observation routing acts on, the Trace — decides what to do from the
+ * cause alone, so a cause that means "the runtime was down" and one that means "Glassbox
+ * refused this itself" must never collapse into the same value. `status: "failed"` used to be
+ * allowed to name no cause at all, which put every refusal in the same bucket as a provider
+ * outage; that is what let a single gate decision pull a working profile out of routing.
+ */
+export type ExecutionFailureCode =
+  /** The selected model was rejected before any provider request or Tool call. */
+  | "pre_provider_context_overflow"
+  /** The model's context capacity could not be established, so nothing was sent. */
+  | "model_capacity_unknown"
+  /** A gate of Glassbox's own refused the request, so the request was never put to the runtime. */
+  | "gate_refused"
+  /** The configured execution reference has no executor able to take this Run. */
+  | "execution_unavailable"
+  /** The action the message pinned down never executed, so the answer cannot stand. */
+  | "required_action_not_completed"
+  /** The Run asserted a durable change no Tool performed, so the answer cannot stand. */
+  | "claimed_change_not_performed"
+  /** The facts the message was about were never observed, so the answer cannot stand. */
+  | "required_evidence_missing"
+  /** The runtime was engaged and the run it was given ended in an error rather than an answer. */
+  | "runtime_run_errored"
+  /** The executor threw before producing a classified result of its own. */
+  | "execution_threw";
+
+/** What every terminal adapter result carries. */
+interface ExecutionResultShape {
   text?: string;
   providerSessionId?: string;
-  /**
-   * A fixed diagnostic code naming why this Run produced no answer of its own. It is persisted so
-   * the fallback line a reader receives states the cause rather than the terminal status, and so a
-   * Run recovered at startup still delivers the same line. Provider error text never enters this
-   * union: these are Glassbox's own classifications.
-   */
-  failureCode?:
-    /** The selected model was rejected before any provider request or Tool call. */
-    | "pre_provider_context_overflow"
-    /** The model's context capacity could not be established, so nothing was sent. */
-    | "model_capacity_unknown"
-    /** The action the message pinned down never executed, so the answer cannot stand. */
-    | "required_action_not_completed"
-    /** The Run asserted a durable change no Tool performed, so the answer cannot stand. */
-    | "claimed_change_not_performed"
-    /** The facts the message was about were never observed, so the answer cannot stand. */
-    | "required_evidence_missing"
-    /** The executor threw before producing a classified result of its own. */
-    | "execution_threw";
 }
+
+export interface ExecutionResultSucceeded extends ExecutionResultShape {
+  /** A terminal adapter result is evidence; receiving an abort signal alone is not. */
+  status: "succeeded";
+  /** A Run that answered names no reason for not answering. */
+  failureCode?: never;
+}
+
+export interface ExecutionResultFailed extends ExecutionResultShape {
+  status: "failed";
+  /**
+   * Required. A failure that names no cause forces every later layer to guess at one, and the
+   * guess that used to be made — treat an unnamed failure as the runtime being down — is how
+   * a refusal by Glassbox's own gates removed a working profile from routing for a minute.
+   *
+   * Provider error text never enters this union: these are Glassbox's own classifications.
+   */
+  failureCode: ExecutionFailureCode;
+}
+
+export interface ExecutionResultUnfinished extends ExecutionResultShape {
+  /**
+   * A Run that was stopped, interrupted, or that the adapter could not classify. These name
+   * no cause, because none of them is a failure to produce an answer of the Run's own.
+   */
+  status: "cancelled" | "interrupted" | "unknown";
+  failureCode?: ExecutionFailureCode;
+}
+
+/**
+ * The single terminal outcome type an adapter returns.
+ *
+ * The union is what keeps a refusal honest: a `failed` result cannot be written without naming
+ * which of the causes in `ExecutionFailureCode` it was, so a new gate added later has to say
+ * whether it refused the request itself or found the runtime unable to answer.
+ */
+export type ExecutionResult =
+  | ExecutionResultSucceeded
+  | ExecutionResultFailed
+  | ExecutionResultUnfinished;
 
 export interface RunExecutionAdapter {
   /** True only for adapters with enforced isolation of files, tools and host configuration. */

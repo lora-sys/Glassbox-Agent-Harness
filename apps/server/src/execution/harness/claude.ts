@@ -17,6 +17,7 @@ import {
   type HarnessQuery,
   type HarnessResult,
   type HarnessUsage,
+  harnessFailureCause,
 } from "./types.js";
 
 const DEFAULT_SYSTEM_PROMPT =
@@ -105,7 +106,17 @@ export function createClaudeHarnessAdapter(config: ClaudeHarnessOptions): Harnes
       let ownsNamespace = false;
       let process: InstalledProcess | undefined;
       let session: HarnessQuery | undefined;
-      let result: HarnessResult = { status: "failed", usage: null };
+      // Overwritten by whichever stage settles the Run, so it starts as the outcome nothing has
+      // explained yet — and it names a cause, because a failed Run with no cause forces every
+      // later layer to guess at one, and the guess it used to make was that the runtime was down.
+      // The assertion keeps the whole union visible: `consume` above settles this from inside a
+      // closure, which TypeScript cannot follow, and narrowing would otherwise collapse the
+      // status to the placeholder's alone and break the checks in the `finally` block below.
+      let result = {
+        status: "failed",
+        usage: null,
+        failureCode: "runtime_run_errored",
+      } as HarnessResult;
       let stopped = false;
       let timedOut = false;
       let finished = false;
@@ -307,10 +318,12 @@ export function createClaudeHarnessAdapter(config: ClaudeHarnessOptions): Harnes
         // A defective provider may ignore close; cancellation still waits on the independently tracked child.
         await Promise.race([consume(), stopPromise]);
       } catch (error) {
+        const code = error instanceof HarnessFailure ? error.code : "PROVIDER_FAILED";
         result = {
           status: "failed",
           usage: null,
-          code: error instanceof HarnessFailure ? error.code : "PROVIDER_FAILED",
+          failureCode: harnessFailureCause(code),
+          code,
         };
       } finally {
         clearTimeout(timer);
@@ -321,7 +334,12 @@ export function createClaudeHarnessAdapter(config: ClaudeHarnessOptions): Harnes
           const exit = await process.finish(exitTimeoutMs);
           if (!exit) result = { status: "unknown", usage: null, code: "EXIT_UNCONFIRMED" };
           else if (exit.kind === "spawn-error")
-            result = { status: "failed", usage: null, code: "SPAWN_FAILED" };
+            result = {
+              status: "failed",
+              usage: null,
+              failureCode: "runtime_run_errored",
+              code: "SPAWN_FAILED",
+            };
           else if (stopped)
             result = {
               status: timedOut ? "interrupted" : "cancelled",
@@ -329,9 +347,19 @@ export function createClaudeHarnessAdapter(config: ClaudeHarnessOptions): Harnes
               ...(timedOut ? { code: "TIMED_OUT" as const } : {}),
             };
           else if (result.status === "succeeded" && (exit.code !== 0 || exit.signal))
-            result = { status: "failed", usage: null, code: "PROVIDER_FAILED" };
+            result = {
+              status: "failed",
+              usage: null,
+              failureCode: "runtime_run_errored",
+              code: "PROVIDER_FAILED",
+            };
         } else if (result.status === "succeeded") {
-          result = { status: "failed", usage: null, code: "SPAWN_FAILED" };
+          result = {
+            status: "failed",
+            usage: null,
+            failureCode: "runtime_run_errored",
+            code: "SPAWN_FAILED",
+          };
         } else if (stopped) {
           result = {
             status: timedOut ? "interrupted" : "cancelled",
@@ -355,7 +383,12 @@ export function createClaudeHarnessAdapter(config: ClaudeHarnessOptions): Harnes
           ...(result.code ? { code: result.code } : {}),
         });
       } catch {
-        return { status: "failed", usage: null, code: "PROVIDER_FAILED" };
+        return {
+          status: "failed",
+          usage: null,
+          failureCode: "runtime_run_errored",
+          code: "PROVIDER_FAILED",
+        };
       }
       return result;
     },
