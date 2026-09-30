@@ -2397,7 +2397,22 @@ export class ManagementApplication {
           "Disconnect the channel before editing its configuration",
           409,
         );
-      const channel = await this.channels.save(input);
+      const channel = await this.channels.save(input, async (previous, next) => {
+        if (!previous) return;
+        const members = (config: typeof next) =>
+          new Map<string, string>([
+            [config.ownerId, OWNER_ID],
+            ...(config.coOwnerId ? [[config.coOwnerId, `owner-${config.coOwnerId}`] as const] : []),
+            ...config.visitorIds.map((senderId) => [senderId, `qq-visitor-${senderId}`] as const),
+          ]);
+        const nextMembers = members(next);
+        for (const [senderId, principalId] of members(previous)) {
+          if (previous.botId === next.botId && nextMembers.get(senderId) === principalId) continue;
+          const identity = { connectionId: previous.connectionId, botId: previous.botId, senderId };
+          await this.store.authorization.revokeSenderScopes(identity);
+          await this.store.identities.unbind(identity);
+        }
+      });
       this.states.delete(id);
       return channel;
     });

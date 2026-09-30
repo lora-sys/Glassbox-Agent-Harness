@@ -558,6 +558,144 @@ describe("channel to durable run composition", () => {
     });
   });
 
+  it("revokes removed Channel identities and their scoped grants before saving new membership", async () => {
+    const f = await fixture(async () => ({ status: "succeeded", text: "unused" }), {
+      coOwnerId: "10005",
+    });
+    const visitorScope: TrustedChannelScope = {
+      connectionId: "fixture",
+      botId: "10001",
+      chatType: "private",
+      chatId: "10004",
+      senderId: "10004",
+    };
+    const coOwnerScope: TrustedChannelScope = {
+      ...visitorScope,
+      chatId: "10005",
+      senderId: "10005",
+    };
+    const ownerScope: TrustedChannelScope = {
+      ...visitorScope,
+      chatId: "10002",
+      senderId: "10002",
+    };
+    await f.app.store.authorization.registerResource({
+      id: "custom:visitor-secret",
+      kind: "test",
+      visibility: "public",
+    });
+    for (const scope of [
+      visitorScope,
+      { ...visitorScope, chatType: "group" as const, chatId: "10003" },
+    ])
+      await f.app.store.authorization.grant({
+        principalId: "qq-visitor-10004",
+        resourceId: "custom:visitor-secret",
+        action: "secret:read",
+        scope,
+        effect: "allow",
+      });
+    const otherScope = { ...visitorScope, connectionId: "other" };
+    await f.app.store.authorization.grant({
+      principalId: "qq-visitor-10004",
+      resourceId: "custom:visitor-secret",
+      action: "secret:read",
+      scope: otherScope,
+      effect: "allow",
+    });
+    await f.app.disconnectChannel("fixture");
+    const current = f.app.listChannels()[0]!;
+    await f.app.saveChannel({
+      id: current.id,
+      label: current.label,
+      kind: current.kind,
+      endpoint: current.endpoint,
+      botId: current.botId,
+      ownerId: current.ownerId,
+      visitorIds: [],
+      groupIds: current.groupIds,
+      executionRef: current.executionRef,
+    });
+    expect(await f.app.store.identities.resolve(visitorScope)).toBeNull();
+    expect(await f.app.store.identities.resolve(coOwnerScope)).toBeNull();
+    expect(await f.app.store.identities.resolve(ownerScope)).toMatchObject({
+      principalId: "owner",
+    });
+    for (const scope of [
+      visitorScope,
+      { ...visitorScope, chatType: "group" as const, chatId: "10003" },
+    ])
+      expect(
+        await f.app.store.authorization.hasActiveGrant({
+          principalId: "qq-visitor-10004",
+          resourceId: "custom:visitor-secret",
+          action: "secret:read",
+          scope,
+        }),
+      ).toBe(false);
+    expect(
+      await f.app.store.authorization.hasActiveGrant({
+        principalId: "qq-visitor-10004",
+        resourceId: "custom:visitor-secret",
+        action: "secret:read",
+        scope: otherScope,
+      }),
+    ).toBe(true);
+    await f.app.saveChannel({
+      id: current.id,
+      label: current.label,
+      kind: current.kind,
+      endpoint: current.endpoint,
+      botId: current.botId,
+      ownerId: "10006",
+      visitorIds: ["10004"],
+      groupIds: current.groupIds,
+      executionRef: current.executionRef,
+    });
+    expect(await f.app.store.identities.resolve(ownerScope)).toBeNull();
+    expect(
+      await f.app.store.authorization.hasActiveGrant({
+        principalId: "owner",
+        resourceId: "agent:personal",
+        action: "run:create",
+        scope: ownerScope,
+      }),
+    ).toBe(false);
+    await f.app.connectChannel("fixture");
+    expect(await f.app.store.identities.resolve(visitorScope)).toMatchObject({
+      principalId: "qq-visitor-10004",
+    });
+    expect(
+      await f.app.store.authorization.hasActiveGrant({
+        principalId: "qq-visitor-10004",
+        resourceId: "custom:visitor-secret",
+        action: "secret:read",
+        scope: visitorScope,
+      }),
+    ).toBe(false);
+    await f.app.disconnectChannel("fixture");
+    await f.app.saveChannel({
+      id: current.id,
+      label: current.label,
+      kind: current.kind,
+      endpoint: current.endpoint,
+      botId: "10009",
+      ownerId: "10006",
+      visitorIds: ["10004"],
+      groupIds: current.groupIds,
+      executionRef: current.executionRef,
+    });
+    expect(await f.app.store.identities.resolve(visitorScope)).toBeNull();
+    expect(
+      await f.app.store.authorization.hasActiveGrant({
+        principalId: "qq-visitor-10004",
+        resourceId: "agent:personal",
+        action: "run:create",
+        scope: visitorScope,
+      }),
+    ).toBe(false);
+  });
+
   it("blocks a configured channel credential from QQ delivery without copying it into Trace", async () => {
     const f = await fixture(async () => ({ status: "succeeded", text: "fixture-token" }));
     f.send(1, "credential-output", true);

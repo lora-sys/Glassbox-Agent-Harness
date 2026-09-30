@@ -29,6 +29,7 @@ export type TaskTraceEventType =
   | "worker.state_observed"
   | "worker.tool"
   | "worker.workspace_lease"
+  | "worker.cleanup_failed"
   | "task.status_changed"
   | "task.review_ready"
   | "task.accepted"
@@ -455,23 +456,32 @@ export class TaskStore {
     taskId: string,
     attemptId: string,
     principalId: string,
+    failure?: { phase: string; errorName: string },
   ): Promise<void> {
     await this.db.transaction(async (tx) => {
       const now = new Date().toISOString();
+      const binding = await tx.execute({
+        sql: "SELECT task_attempt_id FROM worker_bindings WHERE task_attempt_id = ?",
+        args: [attemptId],
+      });
+      const bound = binding.rows.length > 0;
+      const status = bound ? "WAITING_INPUT" : "FAILED";
       const updated = await tx.execute({
-        sql: "UPDATE tasks SET status = 'WAITING_INPUT', updated_at = ? WHERE id = ? AND active_attempt_id = ? AND status IN ('RUNNING', 'WAITING_INPUT')",
-        args: [now, taskId, attemptId],
+        sql: "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND active_attempt_id = ? AND status IN ('RUNNING', 'WAITING_INPUT')",
+        args: [status, now, taskId, attemptId],
       });
       if (updated.rowsAffected !== 1) return;
       await tx.execute({
-        sql: "UPDATE task_attempts SET status = 'waiting_input' WHERE id = ?",
-        args: [attemptId],
+        sql: "UPDATE task_attempts SET status = ?, completed_at = ? WHERE id = ?",
+        args: [bound ? "waiting_input" : "failed", bound ? null : now, attemptId],
       });
       await tx.execute({
         sql: "INSERT INTO attention_items(id, kind, summary, task_id, task_attempt_id, created_at) VALUES (?, 'ops_connection_problem', ?, ?, ?, ?)",
         args: [
           randomUUID(),
-          "Worker dispatch incomplete. Inspect the bound worker before explicitly retrying; input may have been submitted.",
+          bound
+            ? `Worker dispatch incomplete at ${failure?.phase ?? "unknown"}. Inspect the bound worker before canceling; input may have been submitted.`
+            : `Worker dispatch failed at ${failure?.phase ?? "unknown"} without a binding. Inspect Herdr for a partial launch before creating a replacement Task.`,
           taskId,
           attemptId,
           now,
@@ -482,30 +492,40 @@ export class TaskStore {
         taskId,
         taskAttemptId: attemptId,
         principalId,
-        data: { status: "WAITING_INPUT", reason: "worker_dispatch_incomplete" },
+        data: {
+          status,
+          reason: bound ? "worker_dispatch_incomplete" : "worker_dispatch_unbound",
+          ...(failure ? { failure } : {}),
+        },
       });
     });
   }
 
-  async updateTaskStatus(
+  async recordWorkerCleanupProblem(
     taskId: string,
-    status: TaskStatus,
-    activeAttemptId?: string | null,
+    attemptId: string,
+    principalId: string,
+    errorName: string,
   ): Promise<void> {
-    requireIdentifier(taskId);
-    const now = new Date().toISOString();
     await this.db.transaction(async (tx) => {
-      if (activeAttemptId !== undefined) {
-        await tx.execute({
-          sql: "UPDATE tasks SET status = ?, active_attempt_id = ?, updated_at = ? WHERE id = ?",
-          args: [status, activeAttemptId, now, taskId],
-        });
-      } else {
-        await tx.execute({
-          sql: "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
-          args: [status, now, taskId],
-        });
-      }
+      const now = new Date().toISOString();
+      await tx.execute({
+        sql: "INSERT INTO attention_items(id, kind, summary, task_id, task_attempt_id, created_at) VALUES (?, 'ops_connection_problem', ?, ?, ?, ?)",
+        args: [
+          randomUUID(),
+          "Task was canceled, but worker stop was not confirmed. Inspect Herdr before reusing the workspace.",
+          taskId,
+          attemptId,
+          now,
+        ],
+      });
+      await this.appendTraceTx(tx, {
+        type: "worker.cleanup_failed",
+        taskId,
+        taskAttemptId: attemptId,
+        principalId,
+        data: { errorName },
+      });
     });
   }
 
@@ -717,6 +737,13 @@ export class TaskStore {
     const state: HerdrAgentLifecycleState = params.lastObservedAgentState ?? "working";
 
     await this.db.transaction(async (tx) => {
+      const active = await tx.execute({
+        sql: `SELECT t.id FROM tasks t JOIN task_attempts a ON a.task_id = t.id
+          WHERE a.id = ? AND t.active_attempt_id = ? AND t.status = 'RUNNING'
+          AND a.status = 'running'`,
+        args: [params.taskAttemptId, params.taskAttemptId],
+      });
+      if (!active.rows.length) throw new Error("Worker attempt is no longer running");
       await tx.execute({
         sql: `INSERT INTO worker_bindings(
           id, task_attempt_id, herdr_session, workspace_id, pane_id, tab_id,

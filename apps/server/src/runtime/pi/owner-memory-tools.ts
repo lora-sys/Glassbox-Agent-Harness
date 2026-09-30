@@ -45,6 +45,7 @@ type OwnerMemoryToolInput = Record<string, unknown> & {
     | "retire"
     | "supersede"
     | "promote"
+    | "confirm"
     | "reject"
     | "feedback"
     | "extract"
@@ -113,6 +114,7 @@ async function ownerCommand(store: DomainStore, context: ProtectedToolContext): 
 }
 
 function commandFor(input: OwnerMemoryToolInput, scope?: GlassboxMemoryScope): string {
+  if (input.action === "confirm") return "/memory ok";
   const scopeCommand = (value: GlassboxMemoryScope) =>
     value.type === "global"
       ? "global"
@@ -178,6 +180,48 @@ function authorizationAction(input: OwnerMemoryToolInput): string {
   if (["write", "update", "feedback", "extract", "source"].includes(input.action))
     return MEMORY_WRITE_ACTION;
   return MEMORY_GOVERN_ACTION;
+}
+
+async function latestConversationCandidates(
+  store: DomainStore,
+  context: ProtectedToolContext,
+  learning: LearningStore,
+) {
+  const candidateIds = await store.db.transaction(async (tx) =>
+    (
+      await tx.execute({
+        sql: `SELECT DISTINCT target_id FROM memory_audit_events
+          WHERE action = 'write' AND conversation_id = ? AND principal_id = ?
+          AND run_id IS NOT NULL AND run_id <> ?`,
+        args: [context.conversationId, context.caller.principalId, context.runId],
+      })
+    ).rows.map((row) => stringColumn(row, "target_id")),
+  );
+  // A confirmation can only review candidates created before this Owner message.
+  const allowed = new Set(candidateIds);
+  const pending = (
+    await learning.listCandidates(
+      {
+        caller: context.caller,
+        conversationId: context.conversationId,
+        runId: context.runId,
+      },
+      { status: "pending" },
+    )
+  )
+    .filter(
+      (candidate) =>
+        candidate.subject.kind === "user" &&
+        candidate.subject.id === context.caller.principalId &&
+        allowed.has(candidate.candidateId),
+    )
+    .sort(
+      (left, right) =>
+        right.createdAt.localeCompare(left.createdAt) ||
+        right.candidateId.localeCompare(left.candidateId),
+    );
+  if (!pending.length) throw new Error("no_pending_conversation_candidates");
+  return pending;
 }
 
 const hiddenLearningFields = new Set([
@@ -354,6 +398,12 @@ async function executeMemoryActionRaw(
         );
       }
     case "promote":
+      if (input.id === "last") {
+        if (!commandAuthorized(await ownerCommand(store, context), "/memory promote last"))
+          throw new Error("owner_confirmation_required");
+        const [latest] = await latestConversationCandidates(store, context, learning);
+        return learning.promoteCandidate(operationContext, latest!.candidateId);
+      }
       if (input.candidateIds) {
         const candidateIds = checkedCandidateIds(input.candidateIds);
         if (
@@ -401,6 +451,36 @@ async function executeMemoryActionRaw(
           };
         return learning.promoteCandidate(operationContext, candidateId);
       }
+    case "confirm": {
+      if (
+        input.id !== undefined ||
+        input.candidateIds !== undefined ||
+        !commandAuthorized(await ownerCommand(store, context), "/memory ok")
+      )
+        throw new Error("owner_confirmation_required");
+      const pending = await latestConversationCandidates(store, context, learning);
+      const latestSource = pending[0]!.source.ref;
+      const selected = pending.filter((candidate) => candidate.source.ref === latestSource);
+      if (selected.length > 20) throw new Error("too_many_pending_candidates");
+      const results = [];
+      for (const candidate of selected.reverse()) {
+        try {
+          const memory = await learning.promoteCandidate(operationContext, candidate.candidateId);
+          results.push({
+            candidateId: candidate.candidateId,
+            status: "promoted",
+            memoryId: memory.memoryId,
+          });
+        } catch {
+          results.push({
+            candidateId: candidate.candidateId,
+            status: "failed",
+            reason: "review_failed",
+          });
+        }
+      }
+      return { results };
+    }
     case "reject":
       if (input.candidateIds) {
         const candidateIds = checkedCandidateIds(input.candidateIds);
@@ -574,7 +654,17 @@ async function executeMemoryAction(
   context: ProtectedToolContext,
   input: OwnerMemoryToolInput,
 ): Promise<unknown> {
-  return ownerVisibleLearningResult(await executeMemoryActionRaw(store, context, input));
+  const result = ownerVisibleLearningResult(await executeMemoryActionRaw(store, context, input));
+  if (
+    (input.action === "write" || input.action === "supersede") &&
+    result &&
+    typeof result === "object" &&
+    !Array.isArray(result) &&
+    "candidateId" in result &&
+    typeof result.candidateId === "string"
+  )
+    return { ...result, confirmationCommand: `/memory promote ${result.candidateId}` };
+  return result;
 }
 
 function checkedCandidateIds(value: string[]): string[] {
@@ -613,7 +703,7 @@ export function createOwnerMemoryTools(options: {
       name: OWNER_MEMORY_ADMIN_TOOL,
       label: "Owner Memory 管理",
       description:
-        "Owner-private Memory administration. Read with /memory list [all|global|project:id|group:id], /memory get <id>, or /memory candidates. Import an authorized QQ source as pending candidates with /memory source <global|project:id> <groupId> <history|notice|essence|metadata|file|album> <query> [limit], or use /memory source group:<id> <history|notice|essence|metadata|file|album> <query> [limit] to keep it in that group's scope. The query is required: it names what the import is about, and without it the read would return whatever the archive happened to hold last. Messages that assert nothing are not imported, and the result reports how many were matched, imported and skipped. Model-originated write and supersede calls create pending candidates only. Review candidates with the exact current-message commands /memory promote <id> [id ...] or /memory reject <id> [id ...], up to 20 distinct candidates. Other active changes require exact current-message commands. Every governing command must appear as a literal /memory line in the Owner's own current message; it may be on any line of that message, and extra whitespace around it is ignored. A message that only describes the change in prose authorizes nothing: ask the Owner to type the command and report the refusal instead of claiming the change is done.",
+        "Owner-private Memory administration. Read with /memory list [all|global|project:id|group:id], /memory get <id>, or /memory candidates. Import an authorized QQ source as pending candidates with /memory source <global|project:id> <groupId> <history|notice|essence|metadata|file|album> <query> [limit], or use /memory source group:<id> <history|notice|essence|metadata|file|album> <query> [limit] to keep it in that group's scope. Model-originated write and supersede calls create pending candidates only; include the returned confirmationCommand in your reply so the Owner can copy it. Review candidates with an exact current-message /memory promote <id> [id ...], /memory promote last, or /memory ok (the most recent conversation batch, up to 20). Other active changes require exact current-message commands. Every governing command must appear as a literal /memory line in the Owner's own current message; prose authorizes nothing.",
       parameters: Type.Object(
         {
           action: Type.Unsafe<OwnerMemoryToolInput["action"]>({
@@ -629,6 +719,7 @@ export function createOwnerMemoryTools(options: {
               "retire",
               "supersede",
               "promote",
+              "confirm",
               "reject",
               "feedback",
               "extract",

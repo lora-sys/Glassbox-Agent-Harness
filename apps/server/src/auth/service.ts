@@ -413,6 +413,25 @@ export class AuthorizationService {
     });
   }
 
+  /** Retire every grant tied to one removed Channel sender, without touching other senders
+   * or the same Principal's grants on a different connection or bot. */
+  async revokeSenderScopes(input: {
+    connectionId: string;
+    botId: string;
+    senderId: string;
+  }): Promise<void> {
+    for (const value of [input.connectionId, input.botId, input.senderId]) requireIdentifier(value);
+    await this.db.transaction(async (tx) => {
+      await tx.execute({
+        sql: `UPDATE grants SET revoked_at = ? WHERE revoked_at IS NULL
+          AND json_extract(scope_key, '$[0]') = ?
+          AND json_extract(scope_key, '$[1]') = ?
+          AND json_extract(scope_key, '$[4]') = ?`,
+        args: [new Date().toISOString(), input.connectionId, input.botId, input.senderId],
+      });
+    });
+  }
+
   /**
    * Revoke every active grant on one Resource, across principals and scopes.
    *

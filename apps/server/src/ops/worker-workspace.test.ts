@@ -133,7 +133,7 @@ it("shares one workspace write occupancy across Owners, Workers, and main Runs",
     expect(writes.status(independent.workspaceId)).toBe("active");
     await writes.closeAndRelease(independent, async () => undefined);
     const busy = await delegate(callers[1]!);
-    expect(busy.status).toBe("WAITING_INPUT");
+    expect(busy.status).toBe("FAILED");
     expect(await store.tasks.getWorkerBinding(busy.activeAttemptId!)).toBeNull();
 
     await store.authorization.grant({
@@ -163,9 +163,33 @@ it("shares one workspace write occupancy across Owners, Workers, and main Runs",
       return snapshot;
     });
     const mismatch = await delegate(callers[1]!);
-    expect(mismatch.status).toBe("WAITING_INPUT");
+    expect(mismatch.status).toBe("FAILED");
     expect(writes.status(workspace.id)).toBe("free");
     wrongDirectory.mockRestore();
+
+    const startAgent = bridge.startAgent.bind(bridge);
+    const uncertainLaunch = vi.spyOn(bridge, "startAgent").mockImplementation(async (params) => {
+      await startAgent(params);
+      throw new Error("StartAgentLostReply");
+    });
+    const unbound = await delegate(callers[1]!);
+    expect(unbound.status).toBe("FAILED");
+    expect(await store.tasks.getWorkerBinding(unbound.activeAttemptId!)).toBeNull();
+    expect(writes.status(workspace.id)).toBe("quarantined");
+    uncertainLaunch.mockRestore();
+    await store.authorization.grant({
+      principalId: callers[1]!.principalId,
+      resourceId: `task-${unbound.id}`,
+      action: "task:cancel",
+      scope: callers[1]!.scope,
+      effect: "allow",
+    });
+    await Promise.all([
+      service.cancel(callers[1]!, unbound.id),
+      service.cancel(callers[1]!, unbound.id),
+    ]);
+    expect((await store.tasks.getTask(unbound.id))?.status).toBe("CANCELED");
+    expect(writes.status(workspace.id)).toBe("free");
 
     const second = await delegate(callers[1]!);
     expect(second.status).toBe("RUNNING");
@@ -198,7 +222,13 @@ it("shares one workspace write occupancy across Owners, Workers, and main Runs",
       effect: "allow",
     });
     await bridge.disconnect();
-    await expect(service.cancel(callers[1]!, second.id)).rejects.toThrow();
+    await expect(service.cancel(callers[1]!, second.id)).resolves.toBeUndefined();
+    expect((await store.tasks.getTask(second.id))?.status).toBe("CANCELED");
+    expect(await store.tasks.listAttentionItems()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ taskId: second.id, kind: "ops_connection_problem" }),
+      ]),
+    );
     expect(writes.status(workspace.id)).toBe("quarantined");
     await bridge.connect();
     new WorkspaceWriteOccupancy(dataRoot);

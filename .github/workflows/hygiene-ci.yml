@@ -77,6 +77,9 @@ jobs:
       - name: Check dependency vulnerabilities
         run: npm audit --registry=https://registry.npmjs.org --audit-level=high
 
+      - name: Check production dependency vulnerabilities at moderate severity
+        run: npm audit --registry=https://registry.npmjs.org --omit=dev --audit-level=moderate
+
   secret-hygiene:
     name: Secret hygiene
     runs-on: ubuntu-latest

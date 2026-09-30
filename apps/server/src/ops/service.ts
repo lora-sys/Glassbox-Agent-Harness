@@ -23,6 +23,11 @@ export interface WorkerWorkspaceBoundary {
 type WorkerContext = { file: string; lease: WriteOccupancyLease | null };
 type StartedWorker = Awaited<ReturnType<HerdrBridge["startAgent"]>>;
 
+function safeErrorName(error: unknown): string {
+  const name = error instanceof Error ? error.name : "UnknownError";
+  return /^[A-Za-z][A-Za-z0-9]{0,63}$/u.test(name) ? name : "UnknownError";
+}
+
 const OPS_RESOURCE = "agent-operations";
 type RunEvidence = { runId?: string; conversationId?: string };
 type CreateTaskInput = RunEvidence & {
@@ -33,6 +38,24 @@ type CreateTaskInput = RunEvidence & {
 };
 
 export class AuthorizedOpsService {
+  private readonly taskOperations = new Map<string, Promise<void>>();
+
+  private async withTaskOperation<T>(taskId: string, action: () => Promise<T>): Promise<T> {
+    const previous = this.taskOperations.get(taskId) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.taskOperations.set(taskId, current);
+    await previous;
+    try {
+      return await action();
+    } finally {
+      if (this.taskOperations.get(taskId) === current) this.taskOperations.delete(taskId);
+      release();
+    }
+  }
+
   constructor(
     private readonly store: DomainStore,
     private readonly bridge: HerdrBridge,
@@ -292,7 +315,18 @@ export class AuthorizedOpsService {
     worker?: StartedWorker,
     herdrSession?: string,
   ): Promise<void> {
-    if (!context?.lease) return;
+    if (!context?.lease) {
+      if (worker) {
+        try {
+          if (this.workspaceBoundary && herdrSession)
+            await this.bridge.closeAgent({ ...worker, herdrSession });
+          else await this.bridge.stopAgent(worker);
+        } catch {
+          // The attention item below requires a human to inspect an uncertain launch.
+        }
+      }
+      return;
+    }
     if (!started) {
       await this.workspaceBoundary!.writes.closeAndRelease(context.lease, async () => undefined);
       return;
@@ -310,6 +344,50 @@ export class AuthorizedOpsService {
       this.workspaceBoundary!.writes.quarantine(current.lease);
       await this.recordWorkerLease(attemptId, current.lease, "quarantined");
     }
+  }
+
+  private async recoverUnboundLease(taskId: string, attemptId: string): Promise<void> {
+    const current = this.workerLease(attemptId);
+    if (!current || !this.workspaceBoundary) return;
+    const events = await this.store.tasks.listTraceEvents({
+      taskId,
+      type: "worker.workspace_lease",
+    });
+    const launch = events.find(
+      (event) => event.taskAttemptId === attemptId && event.data.state === "dispatching",
+    );
+    if (!launch || typeof launch.data.herdrSession !== "string")
+      throw new Error("Worker launch session is unknown");
+    const snapshot = await this.bridge.getSnapshot();
+    if (snapshot.sessionId !== launch.data.herdrSession)
+      throw new Error("Worker launch session changed");
+    const panes = snapshot.workspaces
+      .flatMap((workspace) => workspace.panes)
+      .filter((pane) => pane.agentName === current.lease.sandboxSessionId);
+    if (panes.length > 1) throw new Error("Worker launch identity is ambiguous");
+    const close = async () => {
+      if (panes[0])
+        await this.bridge.closeAgent({
+          paneId: panes[0].paneId,
+          agentName: current.lease.sandboxSessionId,
+          herdrSession: snapshot.sessionId,
+        });
+      const verified = await this.bridge.getSnapshot();
+      if (
+        verified.sessionId !== snapshot.sessionId ||
+        verified.workspaces.some((workspace) =>
+          workspace.panes.some((pane) => pane.agentName === current.lease.sandboxSessionId),
+        )
+      )
+        throw new Error("Worker launch closure is unverified");
+    };
+    if (current.state === "quarantined")
+      await this.workspaceBoundary.writes.releaseQuarantined(current.lease, async () => {
+        await close();
+        return true;
+      });
+    else await this.workspaceBoundary.writes.closeAndRelease(current.lease, close);
+    await this.recordWorkerLease(attemptId, current.lease, "released");
   }
 
   async delegate(
@@ -343,61 +421,87 @@ export class AuthorizedOpsService {
           description: input.description ?? input.prompt,
         });
     if (!task) throw new Error("Task is unavailable");
-    const attempt = await this.store.tasks.createAttempt({ taskId: task.id });
-    let context: WorkerContext | undefined;
-    let started = false;
-    let worker: StartedWorker | undefined;
-    let dispatchSession: string | undefined;
-    try {
-      context = await this.workerContext(caller, task.id, attempt.id, input.worktreePath);
-      if (this.workspaceBoundary) dispatchSession = (await this.bridge.getSnapshot()).sessionId;
-      started = true;
-      worker = await this.bridge.startAgent({
-        workspaceId: input.workspaceId,
-        agentKind: input.agentKind,
-        worktreePath: input.worktreePath,
-        branch: input.branch,
-        workerContextFile: context?.file,
-        ...(context?.lease ? { agentName: context.lease.sandboxSessionId } : {}),
-      });
-      const startedWorker = worker;
-      const herdrSnapshot = await this.bridge.getSnapshot();
-      if (dispatchSession && herdrSnapshot.sessionId !== dispatchSession)
-        throw new Error("Herdr session changed during Worker launch");
-      const actualWorkspace = herdrSnapshot.workspaces.find((workspace) =>
-        workspace.panes.some((pane) => pane.paneId === startedWorker.paneId),
-      );
-      if (!actualWorkspace)
-        throw new Error(`Herdr did not expose the started pane: ${startedWorker.paneId}`);
-      const actualPane = actualWorkspace.panes.find((pane) => pane.paneId === startedWorker.paneId);
-      if (
-        this.workspaceBoundary &&
-        (!actualPane?.cwd ||
-          !input.worktreePath ||
-          (await realpath(actualPane.cwd)) !== (await realpath(input.worktreePath)))
-      )
-        throw new Error("Herdr Worker directory differs from the authorized workspace");
-      await this.store.tasks.bindWorker({
-        taskAttemptId: attempt.id,
-        herdrSession: herdrSnapshot.sessionId,
-        workspaceId: actualWorkspace.workspaceId,
-        paneId: startedWorker.paneId,
-        agentName: startedWorker.agentName,
-        agentKind: input.agentKind,
-        runtimeEvidence: startedWorker.runtimeEvidence,
-        worktreePath: input.worktreePath,
-        branch: input.branch,
-      });
-      await this.bridge.promptAgent({
-        paneId: startedWorker.paneId,
-        agentName: startedWorker.agentName,
-        prompt: input.prompt,
-      });
-    } catch {
-      await this.failedDispatch(attempt.id, context, started, worker, dispatchSession);
-      await this.store.tasks.recordDispatchProblem(task.id, attempt.id, caller.principalId);
-    }
-    return (await this.store.tasks.getTask(task.id))!;
+    return this.withTaskOperation(task.id, async () => {
+      const attempt = await this.store.tasks.createAttempt({ taskId: task.id });
+      let context: WorkerContext | undefined;
+      let started = false;
+      let worker: StartedWorker | undefined;
+      let dispatchSession: string | undefined;
+      let phase = "worker_context";
+      try {
+        context = await this.workerContext(caller, task.id, attempt.id, input.worktreePath);
+        phase = "snapshot";
+        if (this.workspaceBoundary) dispatchSession = (await this.bridge.getSnapshot()).sessionId;
+        if (context?.lease && dispatchSession)
+          await this.store.tasks.recordTrace({
+            type: "worker.workspace_lease",
+            taskId: task.id,
+            taskAttemptId: attempt.id,
+            principalId: caller.principalId,
+            data: {
+              workspaceId: context.lease.workspaceId,
+              leaseId: context.lease.leaseId,
+              state: "dispatching",
+              herdrSession: dispatchSession,
+            },
+          });
+        started = true;
+        phase = "start_agent";
+        worker = await this.bridge.startAgent({
+          workspaceId: input.workspaceId,
+          agentKind: input.agentKind,
+          worktreePath: input.worktreePath,
+          branch: input.branch,
+          workerContextFile: context?.file,
+          ...(context?.lease ? { agentName: context.lease.sandboxSessionId } : {}),
+        });
+        phase = "verify_worker";
+        const startedWorker = worker;
+        const herdrSnapshot = await this.bridge.getSnapshot();
+        if (dispatchSession && herdrSnapshot.sessionId !== dispatchSession)
+          throw new Error("Herdr session changed during Worker launch");
+        const actualWorkspace = herdrSnapshot.workspaces.find((workspace) =>
+          workspace.panes.some((pane) => pane.paneId === startedWorker.paneId),
+        );
+        if (!actualWorkspace)
+          throw new Error(`Herdr did not expose the started pane: ${startedWorker.paneId}`);
+        const actualPane = actualWorkspace.panes.find(
+          (pane) => pane.paneId === startedWorker.paneId,
+        );
+        if (
+          this.workspaceBoundary &&
+          (!actualPane?.cwd ||
+            !input.worktreePath ||
+            (await realpath(actualPane.cwd)) !== (await realpath(input.worktreePath)))
+        )
+          throw new Error("Herdr Worker directory differs from the authorized workspace");
+        phase = "bind_worker";
+        await this.store.tasks.bindWorker({
+          taskAttemptId: attempt.id,
+          herdrSession: herdrSnapshot.sessionId,
+          workspaceId: actualWorkspace.workspaceId,
+          paneId: startedWorker.paneId,
+          agentName: startedWorker.agentName,
+          agentKind: input.agentKind,
+          runtimeEvidence: startedWorker.runtimeEvidence,
+          worktreePath: input.worktreePath,
+          branch: input.branch,
+        });
+        phase = "prompt_agent";
+        await this.bridge.promptAgent({
+          paneId: startedWorker.paneId,
+          agentName: startedWorker.agentName,
+          prompt: input.prompt,
+        });
+      } catch (error) {
+        await this.failedDispatch(attempt.id, context, started, worker, dispatchSession);
+        await this.store.tasks.recordDispatchProblem(task.id, attempt.id, caller.principalId, {
+          phase,
+          errorName: safeErrorName(error),
+        });
+      }
+      return (await this.store.tasks.getTask(task.id))!;
+    });
   }
 
   private async binding(caller: CallerContext, taskId: string, action: string) {
@@ -496,91 +600,150 @@ export class AuthorizedOpsService {
     reason: string,
     prompt: string,
   ): Promise<AgentTask> {
-    const current = await this.binding(caller, taskId, "task:rework");
-    await this.authorize(caller, `task-${taskId}`, "worker:prompt");
-    if (current.task.status !== "REVIEW") throw new Error("Task is not ready for rework");
-    if (this.workspaceBoundary)
-      await this.closeWorker(current.task.activeAttemptId!, {
-        paneId: current.binding.paneId,
-        agentName: current.binding.agentName!,
-        herdrSession: current.binding.herdrSession,
-      });
-    const result = await this.store.tasks.reworkTask(taskId, reason, caller.principalId);
-    let context: WorkerContext | undefined;
-    let started = false;
-    let worker: StartedWorker | undefined;
-    let dispatchSession: string | undefined;
-    try {
-      context = await this.workerContext(
-        caller,
-        taskId,
-        result.newAttempt.id,
-        current.binding.worktreePath,
-      );
-      if (this.workspaceBoundary) dispatchSession = (await this.bridge.getSnapshot()).sessionId;
-      started = true;
-      worker = await this.bridge.startAgent({
-        workspaceId: current.binding.workspaceId,
-        agentKind: current.binding.agentKind,
-        worktreePath: current.binding.worktreePath,
-        branch: current.binding.branch,
-        workerContextFile: context?.file,
-        ...(context?.lease ? { agentName: context.lease.sandboxSessionId } : {}),
-      });
-      if (this.workspaceBoundary) {
-        const snapshot = await this.bridge.getSnapshot();
-        if (dispatchSession && snapshot.sessionId !== dispatchSession)
-          throw new Error("Herdr session changed during Worker launch");
-        const pane = snapshot.workspaces
-          .flatMap((workspace) => workspace.panes)
-          .find((candidate) => candidate.paneId === worker!.paneId);
-        if (
-          !pane?.cwd ||
-          !current.binding.worktreePath ||
-          (await realpath(pane.cwd)) !== (await realpath(current.binding.worktreePath))
-        )
-          throw new Error("Herdr Worker directory differs from the authorized workspace");
+    return this.withTaskOperation(taskId, async () => {
+      const current = await this.binding(caller, taskId, "task:rework");
+      await this.authorize(caller, `task-${taskId}`, "worker:prompt");
+      if (current.task.status !== "REVIEW") throw new Error("Task is not ready for rework");
+      if (this.workspaceBoundary)
+        await this.closeWorker(current.task.activeAttemptId!, {
+          paneId: current.binding.paneId,
+          agentName: current.binding.agentName!,
+          herdrSession: current.binding.herdrSession,
+        });
+      const result = await this.store.tasks.reworkTask(taskId, reason, caller.principalId);
+      let context: WorkerContext | undefined;
+      let started = false;
+      let worker: StartedWorker | undefined;
+      let dispatchSession: string | undefined;
+      let phase = "worker_context";
+      try {
+        context = await this.workerContext(
+          caller,
+          taskId,
+          result.newAttempt.id,
+          current.binding.worktreePath,
+        );
+        phase = "snapshot";
+        if (this.workspaceBoundary) dispatchSession = (await this.bridge.getSnapshot()).sessionId;
+        if (context?.lease && dispatchSession)
+          await this.store.tasks.recordTrace({
+            type: "worker.workspace_lease",
+            taskId,
+            taskAttemptId: result.newAttempt.id,
+            principalId: caller.principalId,
+            data: {
+              workspaceId: context.lease.workspaceId,
+              leaseId: context.lease.leaseId,
+              state: "dispatching",
+              herdrSession: dispatchSession,
+            },
+          });
+        started = true;
+        phase = "start_agent";
+        worker = await this.bridge.startAgent({
+          workspaceId: current.binding.workspaceId,
+          agentKind: current.binding.agentKind,
+          worktreePath: current.binding.worktreePath,
+          branch: current.binding.branch,
+          workerContextFile: context?.file,
+          ...(context?.lease ? { agentName: context.lease.sandboxSessionId } : {}),
+        });
+        phase = "verify_worker";
+        if (this.workspaceBoundary) {
+          const snapshot = await this.bridge.getSnapshot();
+          if (dispatchSession && snapshot.sessionId !== dispatchSession)
+            throw new Error("Herdr session changed during Worker launch");
+          const pane = snapshot.workspaces
+            .flatMap((workspace) => workspace.panes)
+            .find((candidate) => candidate.paneId === worker!.paneId);
+          if (
+            !pane?.cwd ||
+            !current.binding.worktreePath ||
+            (await realpath(pane.cwd)) !== (await realpath(current.binding.worktreePath))
+          )
+            throw new Error("Herdr Worker directory differs from the authorized workspace");
+        }
+        if (worker.paneId === current.binding.paneId)
+          throw new Error("Rework requires a new Worker pane");
+        phase = "bind_worker";
+        await this.store.tasks.bindWorker({
+          taskAttemptId: result.newAttempt.id,
+          herdrSession: current.binding.herdrSession,
+          workspaceId: current.binding.workspaceId,
+          paneId: worker.paneId,
+          agentName: worker.agentName,
+          agentKind: current.binding.agentKind,
+          runtimeEvidence: worker.runtimeEvidence,
+          worktreePath: current.binding.worktreePath,
+          branch: current.binding.branch,
+          lastObservedAgentState: "working",
+        });
+        phase = "prompt_agent";
+        await this.bridge.promptAgent({
+          paneId: worker.paneId,
+          agentName: worker.agentName,
+          prompt,
+        });
+      } catch (error) {
+        await this.failedDispatch(result.newAttempt.id, context, started, worker, dispatchSession);
+        await this.store.tasks.recordDispatchProblem(
+          taskId,
+          result.newAttempt.id,
+          caller.principalId,
+          { phase, errorName: safeErrorName(error) },
+        );
       }
-      if (worker.paneId === current.binding.paneId)
-        throw new Error("Rework requires a new Worker pane");
-      await this.store.tasks.bindWorker({
-        taskAttemptId: result.newAttempt.id,
-        herdrSession: current.binding.herdrSession,
-        workspaceId: current.binding.workspaceId,
-        paneId: worker.paneId,
-        agentName: worker.agentName,
-        agentKind: current.binding.agentKind,
-        runtimeEvidence: worker.runtimeEvidence,
-        worktreePath: current.binding.worktreePath,
-        branch: current.binding.branch,
-        lastObservedAgentState: "working",
-      });
-      await this.bridge.promptAgent({ paneId: worker.paneId, agentName: worker.agentName, prompt });
-    } catch {
-      await this.failedDispatch(result.newAttempt.id, context, started, worker, dispatchSession);
-      await this.store.tasks.recordDispatchProblem(
-        taskId,
-        result.newAttempt.id,
-        caller.principalId,
-      );
-    }
-    return (await this.store.tasks.getTask(taskId))!;
+      return (await this.store.tasks.getTask(taskId))!;
+    });
   }
 
   async cancel(caller: CallerContext, taskId: string, reason?: string): Promise<void> {
     await this.authorize(caller, `task-${taskId}`, "task:cancel");
-    const task = await this.store.tasks.getTask(taskId);
-    const binding = task?.activeAttemptId
-      ? await this.store.tasks.getWorkerBinding(task.activeAttemptId)
-      : null;
-    if (binding) {
-      if (!binding.agentName) throw new Error("Worker binding has no verified agent identity");
-      await this.closeWorker(task!.activeAttemptId!, {
-        paneId: binding.paneId,
-        agentName: binding.agentName,
-        herdrSession: binding.herdrSession,
-      });
-    }
-    await this.store.tasks.cancelTask(taskId, reason, caller.principalId);
+    return this.withTaskOperation(taskId, async () => {
+      const task = await this.store.tasks.getTask(taskId);
+      if (!task) throw new Error(`Task not found: ${taskId}`);
+      const binding = task?.activeAttemptId
+        ? await this.store.tasks.getWorkerBinding(task.activeAttemptId)
+        : null;
+      const alreadyCanceled = task?.status === "CANCELED";
+      if (!alreadyCanceled) {
+        try {
+          await this.store.tasks.cancelTask(taskId, reason, caller.principalId);
+        } catch (error) {
+          if ((await this.store.tasks.getTask(taskId))?.status !== "CANCELED") throw error;
+        }
+      }
+      if (binding && task?.activeAttemptId) {
+        try {
+          if (!binding.agentName) throw new Error("Worker binding has no verified agent identity");
+          await this.closeWorker(task.activeAttemptId, {
+            paneId: binding.paneId,
+            agentName: binding.agentName,
+            herdrSession: binding.herdrSession,
+          });
+          if (alreadyCanceled)
+            await this.store.tasks.resolveAttentionByTask(taskId, "ops_connection_problem");
+        } catch (error) {
+          await this.store.tasks.recordWorkerCleanupProblem(
+            taskId,
+            task.activeAttemptId,
+            caller.principalId,
+            safeErrorName(error),
+          );
+        }
+      } else if (task.activeAttemptId && this.workerLease(task.activeAttemptId)) {
+        try {
+          await this.recoverUnboundLease(taskId, task.activeAttemptId);
+          await this.store.tasks.resolveAttentionByTask(taskId, "ops_connection_problem");
+        } catch (error) {
+          await this.store.tasks.recordWorkerCleanupProblem(
+            taskId,
+            task.activeAttemptId,
+            caller.principalId,
+            safeErrorName(error),
+          );
+        }
+      }
+    });
   }
 }
