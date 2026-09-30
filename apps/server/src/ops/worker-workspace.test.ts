@@ -10,6 +10,7 @@ import {
   type WorkerToolContext,
 } from "../runtime/pi/worker-tools-extension.js";
 import { FakeHerdrBridge } from "./fake-herdr-bridge.js";
+import { WorkerFiles } from "./worker-files.js";
 import { AuthorizedOpsService } from "./service.js";
 
 it("shares one workspace write occupancy across Owners, Workers, and main Runs", async () => {
@@ -66,7 +67,10 @@ it("shares one workspace write occupancy across Owners, Workers, and main Runs",
           effect: "allow",
         });
     }
-    const service = new AuthorizedOpsService(store, bridge, policy, { registry, writes });
+    const service = new AuthorizedOpsService(store, bridge, policy, undefined, {
+      registry,
+      writes,
+    });
     const delegate = (caller: CallerContext) =>
       service.delegate(caller, {
         title: "Bounded Worker",
@@ -257,6 +261,46 @@ it("shares one workspace write occupancy across Owners, Workers, and main Runs",
     expect(reworked.activeAttemptId).not.toBe(review.activeAttemptId);
     expect(writes.status(workspace.id)).toBe("active");
     expect((await store.tasks.getAttempt(review.activeAttemptId!))?.status).toBe("review");
+    const reworkedContext = JSON.parse(
+      await readFile(join(policy.contextDirectory, `${reworked.activeAttemptId}.json`), "utf8"),
+    ) as WorkerToolContext;
+    const activeCheck = writes.assertActive.bind(writes);
+    let activeChecks = 0;
+    let fileOpenError: unknown;
+    const originalFileOpen = WorkerFiles.open.bind(WorkerFiles);
+    const fileOpenSpy = vi
+      .spyOn(WorkerFiles, "open")
+      .mockImplementation(async (target, options) => {
+        try {
+          return await originalFileOpen(target, options);
+        } catch (error) {
+          fileOpenError = error;
+          throw error;
+        }
+      });
+    const checkSpy = vi
+      .spyOn(WorkspaceWriteOccupancy.prototype, "assertActive")
+      .mockImplementation(function (this: WorkspaceWriteOccupancy, lease) {
+        activeChecks += 1;
+        activeCheck(lease);
+        if (activeChecks === 1) new WorkspaceWriteOccupancy(dataRoot);
+      });
+    let failedWrite: unknown;
+    try {
+      await executeWorkerFileTool(reworkedContext, "quarantined-before-open", "write", {
+        path: "late-write.txt",
+        content: "PRIVATE_CANARY",
+      }).catch((error: unknown) => {
+        failedWrite = error;
+      });
+    } finally {
+      checkSpy.mockRestore();
+      fileOpenSpy.mockRestore();
+    }
+    expect(failedWrite).toBeInstanceOf(Error);
+    expect(fileOpenError).toBeInstanceOf(WorkspaceWriteBusyError);
+    expect(activeChecks).toBeGreaterThan(1);
+    await expect(readFile(join(root, "late-write.txt"), "utf8")).rejects.toThrow();
     await store.authorization.grant({
       principalId: callers[0]!.principalId,
       resourceId: `task-${review.id}`,

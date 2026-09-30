@@ -56,6 +56,64 @@ export interface ManagementRouteDependencies {
   trace: Pick<RunTraceStore, "readPage">;
   evaluator: ReturnType<typeof createRunEvaluator>;
   opsHealth?: (runId: string) => Promise<unknown>;
+  opsSignal?: (
+    caller: CallerContext,
+    taskId: string,
+    input: {
+      stepId: string;
+      targetStepVersion: number;
+      targetAttemptId?: string;
+      type: string;
+      idempotencyKey: string;
+      approval?: boolean;
+    },
+    runId: string,
+  ) => Promise<unknown>;
+}
+
+function taskSignalInput(input: unknown) {
+  if (!input || typeof input !== "object" || Array.isArray(input))
+    throw new ManagementError("INVALID_REQUEST", "A signal object is required");
+  const value = input as Record<string, unknown>;
+  const allowed = new Set([
+    "runId",
+    "stepId",
+    "targetStepVersion",
+    "targetAttemptId",
+    "type",
+    "idempotencyKey",
+    "approval",
+  ]);
+  if (Object.keys(value).some((key) => !allowed.has(key)))
+    throw new ManagementError("INVALID_REQUEST", "Unexpected signal field");
+  if (
+    typeof value.runId !== "string" ||
+    !/^[A-Za-z0-9-]{1,80}$/u.test(value.runId) ||
+    typeof value.stepId !== "string" ||
+    !/^[A-Za-z0-9_.:-]{1,120}$/u.test(value.stepId) ||
+    !Number.isSafeInteger(value.targetStepVersion) ||
+    (value.targetStepVersion as number) < 1 ||
+    (value.targetAttemptId !== undefined &&
+      (typeof value.targetAttemptId !== "string" ||
+        !/^[A-Za-z0-9_.:-]{1,120}$/u.test(value.targetAttemptId))) ||
+    typeof value.type !== "string" ||
+    !/^[a-z][a-z0-9_.:-]{0,79}$/u.test(value.type) ||
+    typeof value.idempotencyKey !== "string" ||
+    !/^[A-Za-z0-9_.:-]{1,160}$/u.test(value.idempotencyKey) ||
+    (value.approval !== undefined && typeof value.approval !== "boolean")
+  )
+    throw new ManagementError("INVALID_REQUEST", "Invalid Task signal fields");
+  return {
+    runId: value.runId,
+    stepId: value.stepId,
+    targetStepVersion: value.targetStepVersion as number,
+    ...(typeof value.targetAttemptId === "string"
+      ? { targetAttemptId: value.targetAttemptId }
+      : {}),
+    type: value.type,
+    idempotencyKey: value.idempotencyKey,
+    ...(typeof value.approval === "boolean" ? { approval: value.approval } : {}),
+  };
 }
 
 function workspaceInput(input: unknown): Record<string, unknown> {
@@ -198,6 +256,13 @@ export async function routeManagementRequest(
   };
   const ok = (body: unknown) => ({ status: 200, body });
   try {
+    const taskSignal = /^\/manage\/ops\/tasks\/([A-Za-z0-9-]{1,80})\/signal$/u.exec(path);
+    if (request.method === "POST" && taskSignal && dependencies.opsSignal) {
+      const input = taskSignalInput(await readManagementJson(request));
+      const caller = await dependencies.runCaller(input.runId);
+      const { runId, ...signal } = input;
+      return ok({ signal: await dependencies.opsSignal(caller, taskSignal[1]!, signal, runId) });
+    }
     if (request.method === "GET" && path === "/manage/attention")
       return ok({ items: await dependencies.store.tasks.listAttentionItems() });
     if (request.method === "GET" && path === "/manage/ops/health" && dependencies.opsHealth) {

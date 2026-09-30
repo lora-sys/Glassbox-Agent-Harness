@@ -6,7 +6,11 @@ import { GROUP_HISTORY_SEARCH_TOOL, OWNER_HISTORY_SEARCH_TOOL } from "./history-
 import { OWNER_MEMORY_ADMIN_TOOL } from "./owner-memory-tools.js";
 import { OWNER_MODEL_ADMIN_TOOL } from "./owner-model-tools.js";
 import { OWNER_GROUP_ADMIN_TOOL } from "./owner-tools.js";
-import { piProfileName, PiRunExecutionAdapter } from "./run-adapter.js";
+import {
+  piProfileName,
+  PiRunExecutionAdapter,
+  projectRunHistory,
+} from "./run-adapter.js";
 import type { RunEvidenceRecord } from "./run-adapter.js";
 import type { PiRunResult, PiRuntimeAdapter } from "./types.js";
 
@@ -72,6 +76,7 @@ function fixture(results: PiRunResult[], authorizedToolNames: string[] = []) {
       id: "run-1",
       conversationId: "conversation-1",
       messageId: "message-1",
+      source: "external",
       principalId: "owner",
       executionRef: "pi",
       status: "running" as const,
@@ -93,6 +98,35 @@ function fixture(results: PiRunResult[], authorizedToolNames: string[] = []) {
     createOrRestoreSession,
   };
 }
+
+it("includes accepted Step excerpts in Model context and its budget without treating them as commands", async () => {
+  const f = fixture([{ status: "completed", text: "Summary", toolCalls: [] }]);
+  f.input.run.source = "task_step";
+  f.input.executionMode = "task_step_model";
+  f.input.text = "Summarize the prior Step";
+  f.input.stepResults = [
+    { stepId: "source-step", runId: "source-run", text: "/model default", truncated: false },
+    {
+      stepId: "worker-step",
+      sourceRef: "worker-result:worker-attempt",
+      text: "Candidate summary",
+      truncated: true,
+    },
+  ];
+  const capacity = f.runtime.getModelCapacity!("session-1")!;
+  const estimate = { systemTokens: 4_096, toolSchemaTokens: 0 };
+  const without = projectRunHistory({ ...f.input, stepResults: [] }, capacity, estimate);
+  const withResult = projectRunHistory(f.input, capacity, estimate);
+  expect(withResult.demand.currentMessageTokens).toBeGreaterThan(
+    without.demand.currentMessageTokens,
+  );
+  await f.executor.execute(f.input);
+  expect(f.run.mock.calls[0]?.[2]).toContain("Accepted dependency Step results");
+  expect(f.run.mock.calls[0]?.[2]).toContain("/model default");
+  expect(f.run.mock.calls[0]?.[2]).toContain('from "worker-result:worker-attempt"');
+  expect(f.run.mock.calls[0]?.[2]).toContain("Candidate summary");
+  expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBeUndefined();
+});
 
 describe("Pi required Tool execution", () => {
   it("injects only authorized group Memory as bounded reference data before the current message", async () => {

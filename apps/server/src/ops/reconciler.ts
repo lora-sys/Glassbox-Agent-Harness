@@ -1,4 +1,5 @@
 import type { HerdrBridge, HerdrEvent, HerdrSessionSnapshot } from "./herdr-bridge.js";
+import { DurableWorkerObserver } from "./durable-worker-observer.js";
 import { TaskStore } from "./task-store.js";
 
 export class OpsReconciler {
@@ -16,6 +17,7 @@ export class OpsReconciler {
     private readonly store: TaskStore,
     private readonly bridge: HerdrBridge,
     private readonly reconnectDelayMs = 1_000,
+    private readonly durableWorkers?: DurableWorkerObserver,
   ) {}
 
   getSubscriptionId(): string | null {
@@ -117,7 +119,10 @@ export class OpsReconciler {
   }
 
   async reconcileSnapshot(snapshot: HerdrSessionSnapshot): Promise<void> {
+    await this.durableWorkers?.observeSnapshot(snapshot);
+    const durableAttempts = await this.durableWorkers?.durableAttemptIds(snapshot.sessionId);
     for (const binding of await this.store.activeWorkerBindings(snapshot.sessionId)) {
+      if (durableAttempts?.has(binding.taskAttemptId)) continue;
       const pane = snapshot.workspaces
         .find((workspace) => workspace.workspaceId === binding.workspaceId)
         ?.panes.find((entry) => entry.paneId === binding.paneId);
@@ -134,8 +139,11 @@ export class OpsReconciler {
   async handleEvent(event: HerdrEvent): Promise<void> {
     if (event.type === "events.lost") {
       this.eventsLost = true;
+      await this.durableWorkers?.markSessionStale(event.sessionId);
+      const durableAttempts = await this.durableWorkers?.durableAttemptIds(event.sessionId);
       for (const binding of await this.store.activeWorkerBindings(event.sessionId))
-        await this.store.observeWorker(binding, "unknown");
+        if (!durableAttempts?.has(binding.taskAttemptId))
+          await this.store.observeWorker(binding, "unknown");
       await this.reconcileSnapshot(await this.bridge.getSnapshot());
       return;
     }
@@ -144,9 +152,11 @@ export class OpsReconciler {
       const subscriptionId = this.subscriptionId;
       this.subscriptionId = null;
       if (subscriptionId) await this.bridge.unsubscribe(subscriptionId);
-      for (const binding of await this.store.activeWorkerBindings(event.sessionId)) {
-        await this.store.observeWorker(binding, "unknown");
-      }
+      await this.durableWorkers?.markSessionStale(event.sessionId);
+      const durableAttempts = await this.durableWorkers?.durableAttemptIds(event.sessionId);
+      for (const binding of await this.store.activeWorkerBindings(event.sessionId))
+        if (!durableAttempts?.has(binding.taskAttemptId))
+          await this.store.observeWorker(binding, "unknown");
       await this.store.createAttentionItem({
         kind: "ops_connection_problem",
         summary: `Herdr session ${event.sessionId} disconnected`,
@@ -156,8 +166,13 @@ export class OpsReconciler {
     }
 
     if (event.type === "agent.state" && event.state) {
+      await this.durableWorkers?.observeEvent(event);
+      const durableAttempts = await this.durableWorkers?.durableAttemptIds(event.sessionId);
       const binding = (await this.store.activeWorkerBindings(event.sessionId)).find(
-        (entry) => entry.workspaceId === event.workspaceId && entry.paneId === event.paneId,
+        (entry) =>
+          !durableAttempts?.has(entry.taskAttemptId) &&
+          entry.workspaceId === event.workspaceId &&
+          entry.paneId === event.paneId,
       );
       if (!binding) return;
       if (binding.agentName && !event.agentName) {

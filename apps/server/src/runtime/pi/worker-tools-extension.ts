@@ -53,6 +53,8 @@ async function executeWorkerFileOperation(
     throw new Error("worker_context_invalid");
   if (context.productWorkspaceId && (!context.occupancyRoot || !isAbsolute(context.occupancyRoot)))
     throw new Error("worker_context_invalid");
+  if (context.lease && (!context.occupancyRoot || !context.productWorkspaceId))
+    throw new Error("worker_context_invalid");
   const store = await openDomainStore({ databasePath: context.databasePath });
   try {
     return await store.tasks.executeWorkerTool(
@@ -75,16 +77,31 @@ async function executeWorkerFileOperation(
           if (context.lease && context.lease.workspaceId !== context.productWorkspaceId)
             throw new Error("worker_context_invalid");
         }
-        if (context.lease && context.occupancyRoot)
-          new WorkspaceWriteOccupancy(context.occupancyRoot, { recoverOnOpen: false }).assertActive(
-            context.lease,
-          );
-        const files = await WorkerFiles.open(context.root);
-        if (operation === "list") return files.list();
+        const occupancy =
+          context.lease && context.occupancyRoot
+            ? new WorkspaceWriteOccupancy(context.occupancyRoot, { recoverOnOpen: false })
+            : null;
+        const assertActive = () => {
+          if (context.lease) occupancy?.assertActive(context.lease);
+        };
+        assertActive();
+        const files = await WorkerFiles.open(context.root, {
+          beforeOpen: async () => assertActive(),
+        });
+        if (operation === "list") {
+          const listed = await files.list();
+          assertActive();
+          return listed;
+        }
         if (typeof params.path !== "string") throw new Error("worker_path_required");
-        if (operation === "read") return files.read(params.path);
+        if (operation === "read") {
+          const content = await files.read(params.path);
+          assertActive();
+          return content;
+        }
         if (typeof params.content !== "string") throw new Error("worker_content_required");
         await files.write(params.path, params.content);
+        assertActive();
         return { written: true };
       },
     );

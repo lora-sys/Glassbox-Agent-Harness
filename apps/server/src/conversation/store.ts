@@ -16,6 +16,8 @@ import {
   type TrustedChannelScope,
 } from "../identity/scope.js";
 import { DomainDatabase, optionalString, stringColumn } from "../persistence/database.js";
+import { parseCheckpointWriteSpec, parseTaskGetSpec } from "../ops/tool-step-spec.js";
+import { parseWorkerTextFileSpec } from "../ops/worker-file-spec.js";
 
 export type RunStatus =
   | "queued"
@@ -40,6 +42,7 @@ export interface RunRecord {
   id: string;
   conversationId: string;
   messageId: string;
+  source: "external" | "task_step";
   principalId: string;
   executionRef: string;
   status: RunStatus;
@@ -48,6 +51,28 @@ export interface RunRecord {
   failureCode?: string;
   createdAt: string;
   updatedAt: string;
+}
+export type StepResultRecord =
+  | {
+      stepId: string;
+      runId: string;
+      sourceRef?: never;
+      text: string;
+      truncated: boolean;
+    }
+  | {
+      stepId: string;
+      runId?: never;
+      sourceRef: string;
+      text: string;
+      truncated: boolean;
+    };
+export interface InternalStepRunInput {
+  caller: CallerContext;
+  taskId: string;
+  stepId: string;
+  attemptId: string;
+  executionRef: string;
 }
 export interface PageOptions {
   limit?: number;
@@ -110,6 +135,9 @@ export interface RunInputRecord {
   historyScanTruncated?: boolean;
   historyOmittedRunIds?: string[];
   providerSessionId: string | null;
+  taskStepBinding?: { taskId: string; stepId: string; attemptId: string };
+  /** Current-authorized excerpts from accepted direct Step dependencies. */
+  stepResults?: StepResultRecord[];
 }
 
 export function agentResourceId(agentId: string): string {
@@ -122,6 +150,7 @@ export function runRecord(row: Row): RunRecord {
     id: stringColumn(row, "id"),
     conversationId: stringColumn(row, "conversation_id"),
     messageId: stringColumn(row, "message_id"),
+    source: stringColumn(row, "source") as RunRecord["source"],
     principalId: stringColumn(row, "principal_id"),
     executionRef: stringColumn(row, "execution_ref"),
     status: stringColumn(row, "status") as RunStatus,
@@ -200,6 +229,7 @@ export async function authorizeConversation(
   conversationId: string,
   action: string,
   runId?: string,
+  delegatedTaskId?: string,
 ): Promise<AuthorizedResult<{ agentId: string }>> {
   requireIdentifier(conversationId);
   const result = await tx.execute({
@@ -272,6 +302,7 @@ export async function authorizeConversation(
     action,
     conversationId,
     ...(runId ? { runId } : {}),
+    ...(delegatedTaskId ? { delegatedTaskId } : {}),
   });
   return decision.decision === "ALLOW" ? { value: { agentId } } : { denied: decision };
 }
@@ -284,7 +315,7 @@ export async function authorizeRun(
 ): Promise<AuthorizedResult<{ conversationId: string }>> {
   requireIdentifier(runId);
   const result = await tx.execute({
-    sql: "SELECT conversation_id, principal_id FROM runs WHERE id = ?",
+    sql: "SELECT conversation_id, principal_id, source, execution_ref FROM runs WHERE id = ?",
     args: [runId],
   });
   const row = result.rows[0];
@@ -309,6 +340,63 @@ export async function authorizeRun(
         "scope_mismatch",
       ),
     };
+  }
+
+  if (stringColumn(row, "source") === "task_step") {
+    const linkedTask = await tx.execute({
+      sql: `SELECT ar.task_id,s.kind,s.spec_ref FROM task_attempt_runs ar
+            JOIN task_steps s ON s.id = ar.step_id AND s.task_id = ar.task_id
+            WHERE ar.run_id = ?`,
+      args: [runId],
+    });
+    const linkedStep = linkedTask.rows[0];
+    const taskId = linkedStep ? stringColumn(linkedStep, "task_id") : null;
+    if (!taskId) {
+      return {
+        denied: await recordDecision(
+          tx,
+          { caller, resourceId: "run", action, runId, conversationId },
+          "DENY",
+          "scope_mismatch",
+        ),
+      };
+    }
+    const taskAuthorization = await evaluate(tx, {
+      caller,
+      resourceId: `task-${taskId}`,
+      action: "task:read",
+      conversationId,
+      runId,
+    });
+    if (taskAuthorization.decision !== "ALLOW") return { denied: taskAuthorization };
+    const executionRef = stringColumn(row, "execution_ref");
+    if (linkedStep?.kind === "tool" || executionRef.startsWith("tool:")) {
+      const readSpec = parseTaskGetSpec(executionRef);
+      const writeSpec = parseCheckpointWriteSpec(executionRef);
+      if (
+        (!readSpec && !writeSpec) ||
+        linkedStep?.kind !== "tool" ||
+        linkedStep.spec_ref !== executionRef
+      )
+        return {
+          denied: await recordDecision(
+            tx,
+            { caller, resourceId: "run", action, runId, conversationId },
+            "DENY",
+            "scope_mismatch",
+          ),
+        };
+      if (readSpec) {
+        const targetAuthorization = await evaluate(tx, {
+          caller,
+          resourceId: `task-${readSpec.targetTaskId}`,
+          action: "task:read",
+          conversationId,
+          runId,
+        });
+        if (targetAuthorization.decision !== "ALLOW") return { denied: targetAuthorization };
+      }
+    }
   }
 
   const authorization = await authorizeConversation(tx, caller, conversationId, action, runId);
@@ -592,6 +680,7 @@ export class ConversationStore {
         principalId: caller.principalId,
         executionRef: input.executionRef,
         status: "queued",
+        source: "external",
         resultText: null,
         createdAt: now,
         updatedAt: now,
@@ -600,6 +689,232 @@ export class ConversationStore {
       return { value: { conversation, run, duplicate: false, caller } };
     });
     return authorizedValue(outcome);
+  }
+
+  /** Creates the durable Run for one already-authorized Model or Tool Task Step. The
+   * required messages row is an empty internal key and is never ingress text. */
+  async createInternalStepRun(input: InternalStepRunInput): Promise<RunRecord> {
+    for (const value of [input.taskId, input.stepId, input.attemptId, input.executionRef])
+      requireIdentifier(value);
+    const modelExecution = /^(?:model|pi):.+$/u.test(input.executionRef);
+    const toolExecution =
+      parseTaskGetSpec(input.executionRef) !== null ||
+      parseCheckpointWriteSpec(input.executionRef) !== null;
+    if (!modelExecution && !toolExecution)
+      throw new Error("Unsupported internal Run execution reference");
+    const result = await this.db.transaction<AuthorizedResult<RunRecord>>(async (tx) => {
+      const taskAuthorization = await evaluate(tx, {
+        caller: input.caller,
+        resourceId: `task-${input.taskId}`,
+        action: "task:read",
+        delegatedTaskId: input.taskId,
+      });
+      if (taskAuthorization.decision !== "ALLOW") return { denied: taskAuthorization };
+
+      const taskContinueAuthorization = await evaluate(tx, {
+        caller: input.caller,
+        resourceId: `task-${input.taskId}`,
+        action: "task:continue",
+        delegatedTaskId: input.taskId,
+      });
+      if (taskContinueAuthorization.decision !== "ALLOW")
+        return { denied: taskContinueAuthorization };
+
+      const taskRows = await tx.execute({
+        sql: "SELECT conversation_id, creator_principal_id, origin_scope_key, status, orchestration_mode, cancellation_state FROM tasks WHERE id = ?",
+        args: [input.taskId],
+      });
+      const task = taskRows.rows[0];
+      const conversationId = task ? optionalString(task, "conversation_id") : null;
+      if (
+        !task ||
+        !conversationId ||
+        stringColumn(task, "creator_principal_id") !== input.caller.principalId ||
+        optionalString(task, "origin_scope_key") !== scopeKey(input.caller.scope) ||
+        stringColumn(task, "status") !== "RUNNING" ||
+        stringColumn(task, "orchestration_mode") !== "durable" ||
+        stringColumn(task, "cancellation_state") !== "none"
+      ) {
+        return {
+          denied: await recordDecision(
+            tx,
+            { caller: input.caller, resourceId: `task-${input.taskId}`, action: "run:create" },
+            "DENY",
+            "scope_mismatch",
+          ),
+        };
+      }
+      const conversationAuthorization = await authorizeConversation(
+        tx,
+        input.caller,
+        conversationId,
+        "run:create",
+        undefined,
+        input.taskId,
+      );
+      if ("denied" in conversationAuthorization) return conversationAuthorization;
+
+      const runCreate = await evaluate(tx, {
+        caller: input.caller,
+        resourceId: agentResourceId(conversationAuthorization.value.agentId),
+        action: "run:create",
+        conversationId,
+        delegatedTaskId: input.taskId,
+      });
+      if (runCreate.decision !== "ALLOW") return { denied: runCreate };
+      const conversationRead = await evaluate(tx, {
+        caller: input.caller,
+        resourceId: agentResourceId(conversationAuthorization.value.agentId),
+        action: "conversation:read",
+        conversationId,
+        delegatedTaskId: input.taskId,
+      });
+      if (conversationRead.decision !== "ALLOW") return { denied: conversationRead };
+      const runControl = await evaluate(tx, {
+        caller: input.caller,
+        resourceId: agentResourceId(conversationAuthorization.value.agentId),
+        action: "run:control",
+        conversationId,
+        delegatedTaskId: input.taskId,
+      });
+      if (runControl.decision !== "ALLOW") return { denied: runControl };
+
+      const stepRows = await tx.execute({
+        sql: `SELECT s.instructions, s.spec_ref, s.kind, s.status, a.status AS attempt_status,
+                     a.task_id AS attempt_task_id, a.step_id AS attempt_step_id
+              FROM task_steps s JOIN task_attempts a ON a.id = ?
+              WHERE s.id = ? AND s.task_id = ?
+                AND EXISTS (SELECT 1 FROM task_step_leases l WHERE l.task_id = s.task_id
+                  AND l.step_id = s.id AND l.attempt_id = a.id AND l.state = 'active' AND l.expires_at > ?)`,
+        args: [input.attemptId, input.stepId, input.taskId, new Date().toISOString()],
+      });
+      const step = stepRows.rows[0];
+      if (
+        !step ||
+        !(
+          (modelExecution &&
+            stringColumn(step, "kind") === "model" &&
+            typeof step.instructions === "string" &&
+            !!step.instructions.trim() &&
+            step.instructions.length <= 4096) ||
+          (toolExecution &&
+            stringColumn(step, "kind") === "tool" &&
+            optionalString(step, "spec_ref") === input.executionRef)
+        ) ||
+        stringColumn(step, "status") !== "running" ||
+        stringColumn(step, "attempt_status") !== "running" ||
+        stringColumn(step, "attempt_task_id") !== input.taskId ||
+        optionalString(step, "attempt_step_id") !== input.stepId
+      ) {
+        return {
+          denied: await recordDecision(
+            tx,
+            { caller: input.caller, resourceId: `task-${input.taskId}`, action: "run:create" },
+            "DENY",
+            "scope_mismatch",
+          ),
+        };
+      }
+
+      const existing = await tx.execute({
+        sql: `SELECT r.* FROM task_attempt_runs ar JOIN runs r ON r.id = ar.run_id
+              WHERE ar.attempt_id = ? AND ar.task_id = ? AND ar.step_id = ?`,
+        args: [input.attemptId, input.taskId, input.stepId],
+      });
+      if (existing.rows[0]) {
+        if (
+          stringColumn(existing.rows[0], "source") !== "task_step" ||
+          stringColumn(existing.rows[0], "conversation_id") !== conversationId ||
+          stringColumn(existing.rows[0], "principal_id") !== input.caller.principalId ||
+          stringColumn(existing.rows[0], "execution_ref") !== input.executionRef
+        ) {
+          return {
+            denied: await recordDecision(
+              tx,
+              { caller: input.caller, resourceId: `task-${input.taskId}`, action: "run:create" },
+              "DENY",
+              "scope_mismatch",
+            ),
+          };
+        }
+        return { value: runRecord(existing.rows[0]) };
+      }
+
+      const now = new Date().toISOString();
+      const runId = randomUUID();
+      const messageId = randomUUID();
+      const conversationRows = await tx.execute({
+        sql: "SELECT scope_key, scope_json FROM conversations WHERE id = ?",
+        args: [conversationId],
+      });
+      const conversation = conversationRows.rows[0];
+      if (!conversation) throw new Error("Conversation persistence failed");
+      await tx.execute({
+        sql: "INSERT INTO messages(id, conversation_id, scope_key, external_id, text, created_at) VALUES (?, ?, ?, ?, '', ?)",
+        args: [
+          messageId,
+          conversationId,
+          `task-step-internal:${input.taskId}`,
+          `internal:${input.attemptId}`,
+          now,
+        ],
+      });
+      await tx.execute({
+        sql: "INSERT INTO runs(id, conversation_id, message_id, principal_id, scope_json, execution_ref, status, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'queued', 'task_step', ?, ?)",
+        args: [
+          runId,
+          conversationId,
+          messageId,
+          input.caller.principalId,
+          stringColumn(conversation, "scope_json"),
+          input.executionRef,
+          now,
+          now,
+        ],
+      });
+      await tx.execute({
+        sql: "INSERT INTO task_attempt_runs(attempt_id, run_id, task_id, step_id) VALUES (?, ?, ?, ?)",
+        args: [input.attemptId, runId, input.taskId, input.stepId],
+      });
+      await this.linkDecision(tx, runCreate, {
+        id: runId,
+        conversationId,
+        messageId,
+        principalId: input.caller.principalId,
+        executionRef: input.executionRef,
+        status: "queued",
+        source: "task_step",
+        resultText: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+      await tx.execute({
+        sql: "UPDATE authorization_decisions SET conversation_id = ?, run_id = ? WHERE id IN (?, ?, ?, ?)",
+        args: [
+          conversationId,
+          runId,
+          taskAuthorization.id,
+          taskContinueAuthorization.id,
+          conversationRead.id,
+          runControl.id,
+        ],
+      });
+      return {
+        value: {
+          id: runId,
+          conversationId,
+          messageId,
+          principalId: input.caller.principalId,
+          executionRef: input.executionRef,
+          status: "queued",
+          source: "task_step",
+          resultText: null,
+          createdAt: now,
+          updatedAt: now,
+        },
+      };
+    });
+    return authorizedValue(result);
   }
 
   private async linkDecision(
@@ -680,6 +995,28 @@ export class ConversationStore {
     );
   }
 
+  /** Reconnect lookup for a durable Model Step Activity. The attempt is the
+   * idempotency key; current Task and Conversation read grants still apply. */
+  async getInternalStepRun(caller: CallerContext, attemptId: string): Promise<RunRecord | null> {
+    requireIdentifier(attemptId);
+    return authorizedValue(
+      await this.db.transaction<AuthorizedResult<RunRecord | null>>(async (tx) => {
+        const linked = await tx.execute({
+          sql: "SELECT run_id FROM task_attempt_runs WHERE attempt_id = ?",
+          args: [attemptId],
+        });
+        if (!linked.rows[0]) return { value: null };
+        const runId = stringColumn(linked.rows[0], "run_id");
+        const authorization = await authorizeRun(tx, caller, runId, "conversation:read");
+        if ("denied" in authorization) return authorization;
+        const rows = await tx.execute({ sql: "SELECT * FROM runs WHERE id = ?", args: [runId] });
+        if (!rows.rows[0] || stringColumn(rows.rows[0], "source") !== "task_step")
+          return { value: null };
+        return { value: runRecord(rows.rows[0]) };
+      }),
+    );
+  }
+
   async listRuns(
     caller: CallerContext,
     conversationId: string,
@@ -696,7 +1033,7 @@ export class ConversationStore {
         );
         if ("denied" in decision) return decision;
         const rows = await tx.execute({
-          sql: "SELECT * FROM runs WHERE conversation_id = ? AND principal_id = ? AND (created_at, id) > (?, ?) ORDER BY created_at, id LIMIT ?",
+          sql: "SELECT * FROM runs WHERE conversation_id = ? AND principal_id = ? AND source = 'external' AND (created_at, id) > (?, ?) ORDER BY created_at, id LIMIT ?",
           args: [conversationId, caller.principalId, page.afterTime, page.afterId, page.limit + 1],
         });
         return { value: makePage(rows.rows, page.limit, runRecord) };
@@ -722,7 +1059,7 @@ export class ConversationStore {
         );
         if ("denied" in decision) return decision;
         const rows = await tx.execute({
-          sql: "SELECT id, text, created_at FROM messages WHERE conversation_id = ? AND (created_at, id) > (?, ?) ORDER BY created_at, id LIMIT ?",
+          sql: "SELECT id, text, created_at FROM messages WHERE conversation_id = ? AND NOT EXISTS (SELECT 1 FROM runs WHERE runs.message_id = messages.id AND runs.source = 'task_step') AND (created_at, id) > (?, ?) ORDER BY created_at, id LIMIT ?",
           args: [conversationId, page.afterTime, page.afterId, page.limit + 1],
         });
         return {
@@ -771,7 +1108,12 @@ export class ConversationStore {
         const authorization = await authorizeRun(tx, caller, runId, "conversation:read");
         if ("denied" in authorization) return authorization;
         const rows = await tx.execute({
-          sql: "SELECT runs.*, messages.text AS input_text FROM runs JOIN messages ON messages.id = runs.message_id WHERE runs.id = ?",
+          sql: `SELECT runs.*, CASE WHEN runs.source = 'task_step' AND runs.execution_ref LIKE 'tool:%'
+                    THEN ''
+                    WHEN runs.source = 'task_step'
+                    THEN (SELECT CASE WHEN s.kind = 'model' THEN s.instructions ELSE '' END FROM task_attempt_runs ar JOIN task_steps s ON s.id = ar.step_id AND s.task_id = ar.task_id WHERE ar.run_id = runs.id)
+                    ELSE messages.text END AS input_text
+                  FROM runs JOIN messages ON messages.id = runs.message_id WHERE runs.id = ?`,
           args: [runId],
         });
         const row = rows.rows[0]!;
@@ -810,10 +1152,6 @@ export class ConversationStore {
           args: [run.conversationId],
         });
         const conversation = conversationRecord(conversations.rows[0]!, caller.scope);
-        const earlier = await tx.execute({
-          sql: "SELECT runs.id, runs.principal_id, runs.sequence, runs.status, runs.scope_json, runs.result_text, (SELECT text FROM messages WHERE id = runs.message_id) AS input_text FROM runs WHERE runs.conversation_id = ? AND runs.sequence < ? AND runs.status IN ('succeeded', 'failed') AND runs.result_text IS NOT NULL AND (runs.status = 'succeeded' OR EXISTS (SELECT 1 FROM deliveries d WHERE d.run_id = runs.id AND d.status = 'sent' AND d.payload_kind IN ('text', 'result'))) AND NOT EXISTS (SELECT 1 FROM ops_trace_events e WHERE e.run_id = runs.id AND e.type = 'context.excluded') ORDER BY runs.sequence DESC LIMIT 257",
-          args: [run.conversationId, row.sequence!],
-        });
         // The QQ number each turn came from. It is already persisted on the Run as its scope, so
         // attribution needs no second source: a group's principal id names who spoke only for
         // visitors, and an Owner's does not name the account at all.
@@ -830,6 +1168,441 @@ export class ConversationStore {
         // two scope keys differ there only because they are different tuple lengths — comparing
         // them would report every private chat as shared.
         const sharedConversation = caller.scope.chatType === "group";
+        let taskStepBinding: RunInputRecord["taskStepBinding"];
+        let stepResults: RunInputRecord["stepResults"];
+        if (run.source === "task_step") {
+          const bindingRows = await tx.execute({
+            sql: `SELECT ar.task_id, ar.step_id, ar.attempt_id
+                  FROM task_attempt_runs ar
+                  JOIN tasks t ON t.id = ar.task_id AND t.status = 'RUNNING' AND t.orchestration_mode = 'durable' AND t.cancellation_state = 'none'
+                  JOIN task_attempts a ON a.id = ar.attempt_id AND a.task_id = ar.task_id AND a.step_id = ar.step_id
+                  JOIN task_steps s ON s.id = ar.step_id AND s.task_id = ar.task_id
+                  JOIN task_step_leases l ON l.task_id = ar.task_id AND l.step_id = ar.step_id AND l.attempt_id = ar.attempt_id AND l.state = 'active' AND l.expires_at > ?
+                  WHERE ar.run_id = ? AND a.status = 'running' AND s.status = 'running'`,
+            args: [new Date().toISOString(), runId],
+          });
+          if (!bindingRows.rows[0]) {
+            return {
+              denied: await recordDecision(
+                tx,
+                {
+                  caller,
+                  resourceId: "run",
+                  action: "conversation:read",
+                  runId,
+                  conversationId: run.conversationId,
+                },
+                "DENY",
+                "scope_mismatch",
+              ),
+            };
+          }
+          taskStepBinding = {
+            taskId: stringColumn(bindingRows.rows[0], "task_id"),
+            stepId: stringColumn(bindingRows.rows[0], "step_id"),
+            attemptId: stringColumn(bindingRows.rows[0], "attempt_id"),
+          };
+          if (!run.executionRef.startsWith("tool:")) {
+            const dependencies = await tx.execute({
+              sql: `SELECT s.id, s.kind, s.status, s.output_ref, s.spec_ref, s.delegated_permissions_json
+                FROM task_step_dependencies d
+                JOIN task_steps s ON s.id = d.dependency_id AND s.task_id = d.task_id
+                WHERE d.task_id = ? AND d.step_id = ? ORDER BY s.id`,
+              args: [taskStepBinding.taskId, taskStepBinding.stepId],
+            });
+            stepResults = [];
+            const currentTaskId = taskStepBinding.taskId;
+            const loadWorkerResult = async (
+              sourceTaskId: string,
+              sourceStepId: string,
+              outputRef: string,
+            ): Promise<{ result: StepResultRecord } | { denied: AuthorizationDecision }> => {
+              if (!outputRef.startsWith("worker-result:"))
+                throw new Error("Accepted Worker result reference is unavailable");
+              const attemptId = outputRef.slice("worker-result:".length);
+              requireIdentifier(attemptId);
+              const candidateRows = await tx.execute({
+                sql: `SELECT candidate.task_id,candidate.step_id,candidate.attempt_id,
+                    candidate.worker_binding_id,candidate.output_excerpt,candidate.truncated,
+                    step.delegated_permissions_json,step.spec_ref
+                  FROM worker_candidate_outputs candidate
+                  JOIN task_attempts attempt ON attempt.id = candidate.attempt_id
+                    AND attempt.task_id = candidate.task_id AND attempt.step_id = candidate.step_id
+                  JOIN worker_bindings binding ON binding.id = candidate.worker_binding_id
+                    AND binding.task_attempt_id = candidate.attempt_id
+                  JOIN task_steps step ON step.id = candidate.step_id AND step.task_id = candidate.task_id
+                  WHERE candidate.task_id = ? AND candidate.step_id = ? AND candidate.attempt_id = ?
+                    AND step.kind = 'herdr_worker' AND step.status = 'succeeded'
+                    AND attempt.status = 'succeeded'`,
+                args: [sourceTaskId, sourceStepId, attemptId],
+              });
+              const candidate = candidateRows.rows[0];
+              if (!candidate) throw new Error("Accepted Worker result is unavailable");
+              if (
+                stringColumn(candidate, "task_id") !== sourceTaskId ||
+                stringColumn(candidate, "step_id") !== sourceStepId ||
+                stringColumn(candidate, "attempt_id") !== attemptId
+              )
+                throw new Error("Worker result binding is unavailable");
+              let permissions: unknown;
+              try {
+                permissions = JSON.parse(stringColumn(candidate, "delegated_permissions_json"));
+              } catch {
+                throw new Error("Worker result permissions are unavailable");
+              }
+              if (!Array.isArray(permissions))
+                throw new Error("Worker result permissions are unavailable");
+              const delegatedTaskId = sourceTaskId === currentTaskId ? sourceTaskId : undefined;
+              const decisions: AuthorizationDecision[] = [];
+              for (const action of ["task:read", "worker:read"]) {
+                const decision = await evaluate(tx, {
+                  caller,
+                  resourceId: `task-${sourceTaskId}`,
+                  action,
+                  conversationId: run.conversationId,
+                  runId,
+                  ...(delegatedTaskId ? { delegatedTaskId } : {}),
+                });
+                if (decision.decision !== "ALLOW") return { denied: decision };
+                decisions.push(decision);
+              }
+              for (const permission of permissions) {
+                if (
+                  !permission ||
+                  typeof permission !== "object" ||
+                  typeof permission.resourceId !== "string" ||
+                  typeof permission.action !== "string"
+                )
+                  throw new Error("Worker result permissions are unavailable");
+                let readAction: string;
+                if (
+                  permission.action === "worker:file:read" ||
+                  permission.action === "worker:file:write"
+                ) {
+                  readAction = "worker:file:read";
+                } else if (
+                  permission.action === "workspace:read" ||
+                  permission.action === "workspace:write"
+                ) {
+                  if (!permission.resourceId.startsWith("workspace:"))
+                    throw new Error("Worker result permissions are unavailable");
+                  readAction = "workspace:read";
+                } else {
+                  throw new Error("Worker result has an unsupported content source");
+                }
+                const decision = await evaluate(tx, {
+                  caller,
+                  resourceId: permission.resourceId,
+                  action: readAction,
+                  conversationId: run.conversationId,
+                  runId,
+                  ...(delegatedTaskId ? { delegatedTaskId } : {}),
+                });
+                if (decision.decision !== "ALLOW") return { denied: decision };
+                decisions.push(decision);
+              }
+              const originSources = await tx.execute({
+                sql: `WITH RECURSIVE lineage(task_id,depth) AS (
+                    SELECT ?,0
+                    UNION ALL
+                    SELECT link.parent_task_id,lineage.depth + 1
+                      FROM task_child_links link JOIN lineage ON link.child_task_id = lineage.task_id
+                      WHERE lineage.depth < 4
+                  )
+                  SELECT DISTINCT decision.resource_id,decision.action
+                    FROM lineage JOIN tasks source_task ON source_task.id = lineage.task_id
+                    JOIN authorization_decisions decision ON decision.run_id = source_task.run_id
+                    WHERE decision.decision = 'ALLOW' AND decision.delivery_source IS NOT NULL
+                    LIMIT 129`,
+                args: [sourceTaskId],
+              });
+              if (originSources.rows.length > 128)
+                throw new Error("Worker result has too many protected origin sources");
+              for (const source of originSources.rows) {
+                const decision = await evaluate(tx, {
+                  caller,
+                  resourceId: stringColumn(source, "resource_id"),
+                  action: stringColumn(source, "action"),
+                  conversationId: run.conversationId,
+                  runId,
+                  ...(delegatedTaskId ? { delegatedTaskId } : {}),
+                });
+                if (decision.decision !== "ALLOW") return { denied: decision };
+                decisions.push(decision);
+              }
+              for (const decision of decisions)
+                await tx.execute({
+                  sql: "UPDATE authorization_decisions SET delivery_source = 'content_source' WHERE id = ?",
+                  args: [decision.id],
+                });
+              const specRef = optionalString(candidate, "spec_ref");
+              if (specRef) {
+                const spec = parseWorkerTextFileSpec(specRef);
+                if (!spec) throw new Error("Accepted Worker file specification is unavailable");
+                const artifactRows = await tx.execute({
+                  sql: `SELECT artifact.relative_path,artifact.content_text
+                    FROM worker_file_artifacts artifact
+                    WHERE artifact.task_id = ? AND artifact.step_id = ? AND artifact.attempt_id = ?
+                      AND artifact.worker_binding_id = ?`,
+                  args: [
+                    sourceTaskId,
+                    sourceStepId,
+                    attemptId,
+                    stringColumn(candidate, "worker_binding_id"),
+                  ],
+                });
+                const artifact = artifactRows.rows[0];
+                if (!artifact || stringColumn(artifact, "relative_path") !== spec.relativePath)
+                  throw new Error("Accepted Worker file artifact is unavailable");
+                const fileText = stringColumn(artifact, "content_text");
+                return {
+                  result: {
+                    stepId: sourceStepId,
+                    sourceRef: `worker-file:${attemptId}`,
+                    text: fileText.slice(0, 2_048),
+                    truncated: fileText.length > 2_048,
+                  },
+                };
+              }
+              const text = stringColumn(candidate, "output_excerpt");
+              return {
+                result: {
+                  stepId: sourceStepId,
+                  sourceRef: outputRef,
+                  text: text.slice(0, 2_048),
+                  truncated: Number(candidate.truncated) === 1 || text.length > 2_048,
+                },
+              };
+            };
+            for (const dependency of dependencies.rows) {
+              const outputRef = optionalString(dependency, "output_ref");
+              if (dependency.kind === "herdr_worker" && dependency.status === "succeeded") {
+                const candidate = await loadWorkerResult(
+                  taskStepBinding.taskId,
+                  stringColumn(dependency, "id"),
+                  outputRef ?? "",
+                );
+                if ("denied" in candidate) return candidate;
+                stepResults.push(candidate.result);
+                continue;
+              }
+              if (
+                dependency.kind === "child_task" &&
+                dependency.status === "succeeded" &&
+                outputRef?.startsWith("task:")
+              ) {
+                const childTaskId = outputRef.slice(5);
+                requireIdentifier(childTaskId);
+                const childDecision = await evaluate(tx, {
+                  caller,
+                  resourceId: `task-${childTaskId}`,
+                  action: "task:read",
+                  conversationId: run.conversationId,
+                  runId,
+                });
+                if (childDecision.decision !== "ALLOW") return { denied: childDecision };
+                const childRoot = await tx.execute({
+                  sql: `SELECT root.id,root.kind,root.status,root.output_ref
+                    FROM task_child_links link
+                    JOIN tasks child ON child.id = link.child_task_id
+                    JOIN task_steps root ON root.task_id = child.id AND root.id = child.root_step_id
+                    WHERE link.child_task_id = ? AND link.parent_task_id = ?
+                      AND link.parent_step_id = ? AND link.result_ref = ?
+                      AND child.orchestration_mode = 'durable' AND child.status = 'DONE'
+                      AND EXISTS (SELECT 1 FROM task_events e
+                        WHERE e.task_id = child.id AND e.type = 'TASK_ACCEPTED')`,
+                  args: [
+                    childTaskId,
+                    taskStepBinding.taskId,
+                    stringColumn(dependency, "id"),
+                    outputRef,
+                  ],
+                });
+                const root = childRoot.rows[0];
+                const rootRef = root ? optionalString(root, "output_ref") : null;
+                if (root?.kind === "herdr_worker" && root.status === "succeeded") {
+                  const candidate = await loadWorkerResult(
+                    childTaskId,
+                    stringColumn(root, "id"),
+                    rootRef ?? "",
+                  );
+                  if ("denied" in candidate) return candidate;
+                  stepResults.push({ ...candidate.result, stepId: stringColumn(dependency, "id") });
+                  continue;
+                }
+                if (
+                  root?.kind !== "model" ||
+                  root.status !== "succeeded" ||
+                  !rootRef?.startsWith("run:")
+                )
+                  continue;
+                const childRunId = rootRef.slice(4);
+                requireIdentifier(childRunId);
+                const sourceAuthorization = await authorizeRun(
+                  tx,
+                  caller,
+                  childRunId,
+                  "conversation:read",
+                );
+                if ("denied" in sourceAuthorization) return sourceAuthorization;
+                const sources = await tx.execute({
+                  sql: `SELECT DISTINCT resource_id,action FROM authorization_decisions
+                    WHERE run_id = ? AND decision = 'ALLOW' AND delivery_source = 'content_source'
+                    LIMIT 129`,
+                  args: [childRunId],
+                });
+                if (sources.rows.length > 128)
+                  throw new Error("Child result has too many protected sources");
+                for (const source of sources.rows) {
+                  const decision = await evaluate(tx, {
+                    caller,
+                    resourceId: stringColumn(source, "resource_id"),
+                    action: stringColumn(source, "action"),
+                    conversationId: run.conversationId,
+                    runId,
+                  });
+                  if (decision.decision !== "ALLOW") return { denied: decision };
+                  await tx.execute({
+                    sql: "UPDATE authorization_decisions SET delivery_source = 'content_source' WHERE id = ?",
+                    args: [decision.id],
+                  });
+                }
+                await tx.execute({
+                  sql: "UPDATE authorization_decisions SET delivery_source = 'content_source' WHERE id = ?",
+                  args: [childDecision.id],
+                });
+                const result = await tx.execute({
+                  sql: `SELECT r.result_text FROM task_attempt_runs ar
+                    JOIN runs r ON r.id = ar.run_id
+                    WHERE ar.run_id = ? AND ar.task_id = ? AND ar.step_id = ?
+                      AND r.source = 'task_step' AND r.status = 'succeeded'`,
+                  args: [childRunId, childTaskId, stringColumn(root, "id")],
+                });
+                const resultText = result.rows[0]
+                  ? optionalString(result.rows[0], "result_text")
+                  : null;
+                if (resultText === null) throw new Error("Accepted child result is unavailable");
+                stepResults.push({
+                  stepId: stringColumn(dependency, "id"),
+                  runId: childRunId,
+                  text: resultText.slice(0, 2_048),
+                  truncated: resultText.length > 2_048,
+                });
+                continue;
+              }
+              if (
+                dependency.kind === "tool" &&
+                dependency.status === "succeeded" &&
+                outputRef?.startsWith("checkpoint:")
+              ) {
+                const spec = parseCheckpointWriteSpec(optionalString(dependency, "spec_ref") ?? "");
+                if (!spec) throw new Error("Accepted checkpoint dependency spec is unavailable");
+                const checkpointId = outputRef.slice("checkpoint:".length);
+                requireIdentifier(checkpointId);
+                const checkpoint = await tx.execute({
+                  sql: `SELECT state_ref FROM task_checkpoints
+                    WHERE id = ? AND task_id = ? AND step_id = ?
+                      AND checkpoint_type = 'tool_checkpoint_write'`,
+                  args: [checkpointId, taskStepBinding.taskId, stringColumn(dependency, "id")],
+                });
+                if (checkpoint.rows[0]?.state_ref !== spec.stateRef)
+                  throw new Error("Accepted checkpoint dependency is unavailable");
+                const contentDecision = await evaluate(tx, {
+                  caller,
+                  resourceId: `task-${taskStepBinding.taskId}`,
+                  action: "task:read",
+                  conversationId: run.conversationId,
+                  runId,
+                });
+                if (contentDecision.decision !== "ALLOW") return { denied: contentDecision };
+                await tx.execute({
+                  sql: "UPDATE authorization_decisions SET delivery_source = 'content_source' WHERE id = ?",
+                  args: [contentDecision.id],
+                });
+                stepResults.push({
+                  stepId: stringColumn(dependency, "id"),
+                  sourceRef: outputRef,
+                  text: JSON.stringify({ checkpointStateRef: spec.stateRef }),
+                  truncated: false,
+                });
+                continue;
+              }
+              if (
+                !["model", "tool"].includes(stringColumn(dependency, "kind")) ||
+                dependency.status !== "succeeded" ||
+                !outputRef?.startsWith("run:")
+              )
+                continue;
+              const sourceRunId = outputRef.slice(4);
+              requireIdentifier(sourceRunId);
+              const sourceAuthorization = await authorizeRun(
+                tx,
+                caller,
+                sourceRunId,
+                "conversation:read",
+              );
+              if ("denied" in sourceAuthorization) return sourceAuthorization;
+              if (dependency.kind === "tool") {
+                const specRef = optionalString(dependency, "spec_ref") ?? "";
+                const readSpec = parseTaskGetSpec(specRef);
+                if (!readSpec && !parseCheckpointWriteSpec(specRef))
+                  throw new Error("Accepted Tool dependency spec is unavailable");
+                if (readSpec) {
+                  const targetDecision = await evaluate(tx, {
+                    caller,
+                    resourceId: `task-${readSpec.targetTaskId}`,
+                    action: "task:read",
+                    conversationId: run.conversationId,
+                    runId,
+                  });
+                  if (targetDecision.decision !== "ALLOW") return { denied: targetDecision };
+                  await tx.execute({
+                    sql: "UPDATE authorization_decisions SET delivery_source = 'content_source' WHERE id = ?",
+                    args: [targetDecision.id],
+                  });
+                }
+              }
+              const contentDecision = await evaluate(tx, {
+                caller,
+                resourceId: `task-${taskStepBinding.taskId}`,
+                action: "task:read",
+                conversationId: run.conversationId,
+                runId,
+              });
+              if (contentDecision.decision !== "ALLOW") return { denied: contentDecision };
+              await tx.execute({
+                sql: "UPDATE authorization_decisions SET delivery_source = 'content_source' WHERE id = ?",
+                args: [contentDecision.id],
+              });
+              const source = await tx.execute({
+                sql: `SELECT r.result_text FROM task_attempt_runs ar
+                  JOIN runs r ON r.id = ar.run_id
+                  WHERE ar.run_id = ? AND ar.task_id = ? AND ar.step_id = ?
+                    AND r.source = 'task_step' AND r.status = 'succeeded'`,
+                args: [sourceRunId, taskStepBinding.taskId, stringColumn(dependency, "id")],
+              });
+              if (!source.rows[0] || typeof source.rows[0].result_text !== "string")
+                throw new Error("Accepted dependency result is unavailable");
+              const text = stringColumn(source.rows[0], "result_text");
+              stepResults.push({
+                stepId: stringColumn(dependency, "id"),
+                runId: sourceRunId,
+                text: text.slice(0, 2_048),
+                truncated: text.length > 2_048,
+              });
+            }
+          }
+        }
+        // Only a Run the channel delivered externally contributes projected history: an internal
+        // task_step Run belongs to a task graph, not to this Conversation's turns, and it reads its
+        // dependencies through stepResults instead.
+        const earlier =
+          run.source === "external"
+            ? await tx.execute({
+                sql: "SELECT runs.id, runs.principal_id, runs.sequence, runs.status, runs.scope_json, runs.result_text, (SELECT text FROM messages WHERE id = runs.message_id) AS input_text FROM runs WHERE runs.conversation_id = ? AND runs.sequence < ? AND runs.source = 'external' AND runs.status IN ('succeeded', 'failed') AND runs.result_text IS NOT NULL AND (runs.status = 'succeeded' OR EXISTS (SELECT 1 FROM deliveries d WHERE d.run_id = runs.id AND d.status = 'sent' AND d.payload_kind IN ('text', 'result'))) AND NOT EXISTS (SELECT 1 FROM ops_trace_events e WHERE e.run_id = runs.id AND e.type = 'context.excluded') ORDER BY runs.sequence DESC LIMIT 257",
+                args: [run.conversationId, row.sequence!],
+              })
+            : { rows: [] };
         const callerLocationKey = conversationScopeKey(caller.scope);
         const exchanges: Array<HistoryActor & { runId: string; user: string; assistant: string }> =
           [];
@@ -991,6 +1764,8 @@ export class ConversationStore {
           historyScanTruncated,
           historyOmittedRunIds: omittedRunIds,
           providerSessionId,
+          ...(taskStepBinding ? { taskStepBinding } : {}),
+          ...(stepResults?.length ? { stepResults } : {}),
         };
         return { value: inputRecord };
       }),

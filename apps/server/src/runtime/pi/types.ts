@@ -87,6 +87,8 @@ import type { ToolExecutionOutcome } from "./tool-plane.js";
 import type { RequiredEvidence } from "./required-evidence.js";
 
 export interface PiRunContext {
+  /** Trusted server execution mode, not inferred from prompt text. */
+  executionMode?: "task_step_model";
   caller?: CallerContext;
   /**
    * Who is speaking right now, resolved from the Channel binding rather than from the message.

@@ -18,6 +18,8 @@ export interface HerdrEvent {
 
 export interface HerdrPaneInfo {
   paneId: string;
+  tabId?: string;
+  tabLabel?: string;
   agentName?: string;
   agentKind: string;
   state: HerdrAgentLifecycleState;
@@ -47,11 +49,16 @@ export interface HerdrBridge {
   startAgent(params: {
     workspaceId: string;
     agentKind: string;
+    /** Stable server-assigned identity for detecting duplicate TaskAttempt dispatch. */
     agentName?: string;
     worktreePath?: string;
     branch?: string;
     workerContextFile?: string;
-  }): Promise<{ paneId: string; agentName: string; runtimeEvidence?: Record<string, unknown> }>;
+  }): Promise<{
+    paneId: string;
+    agentName: string;
+    runtimeEvidence?: Record<string, unknown>;
+  }>;
   promptAgent(params: { paneId: string; agentName?: string; prompt: string }): Promise<void>;
   readAgent(params: {
     paneId: string;
@@ -63,4 +70,20 @@ export interface HerdrBridge {
   }): Promise<{ state: HerdrAgentLifecycleState }>;
   stopAgent(params: { paneId: string; agentName?: string }): Promise<void>;
   closeAgent(params: { paneId: string; agentName: string; herdrSession: string }): Promise<void>;
+  /**
+   * Close a pre-agent pane after the caller has observed its exact marker.
+   * A fresh exact identity check and post-close absence proof are required.
+   */
+  closePreAgentPane(params: {
+    herdrSession: string;
+    workspaceId: string;
+    paneId: string;
+    agentName: string;
+    tabLabel: string;
+    cwd: string;
+  }): Promise<void>;
+}
+
+export function workerTabLabel(agentName: string): string {
+  return `Glassbox Worker ${agentName}`;
 }

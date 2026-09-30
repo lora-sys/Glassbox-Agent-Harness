@@ -43,6 +43,14 @@ export async function openManagementRuntime(options: {
       databasePath: options.databasePath,
       executors: options.executors,
       ops: await loadAgentOperations(options.dataDirectory, options.databasePath),
+      ...(process.env.GLASSBOX_TEMPORAL_ADDRESS
+        ? {
+            temporal: {
+              address: process.env.GLASSBOX_TEMPORAL_ADDRESS,
+              namespace: process.env.GLASSBOX_TEMPORAL_NAMESPACE ?? "default",
+            },
+          }
+        : {}),
     });
     let authorize = createManagementAccess({
       token,

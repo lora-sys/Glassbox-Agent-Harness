@@ -205,7 +205,7 @@ export class WorkerFiles {
     }
   }
 
-  async read(path: string): Promise<string> {
+  async readBytes(path: string): Promise<Buffer> {
     const file = await this.openChecked(path, "r");
     try {
       const info = await file.stat();
@@ -213,10 +213,14 @@ export class WorkerFiles {
       const buffer = Buffer.alloc(LIMIT + 1);
       const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
       if (bytesRead > LIMIT) throw denied();
-      return buffer.subarray(0, bytesRead).toString("utf8");
+      return buffer.subarray(0, bytesRead);
     } finally {
       await file.close();
     }
+  }
+
+  async read(path: string): Promise<string> {
+    return (await this.readBytes(path)).toString("utf8");
   }
 
   async write(path: string, content: string): Promise<void> {

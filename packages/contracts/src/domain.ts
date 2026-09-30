@@ -133,6 +133,15 @@ export interface AgentTask {
   runId?: string;
   activeAttemptId?: string | null;
   acceptanceCriteria?: readonly string[];
+  orchestrationMode?: "durable";
+  currentPhase?: string;
+  rootStepId?: string;
+  activeStepIds?: readonly string[];
+  waitingReason?: string;
+  checkpointRef?: string;
+  cancellationState?: "none" | "requested" | "stopping" | "settled";
+  policyRevision?: number;
+  completedAt?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -149,6 +158,7 @@ export type AttemptStatus =
 export interface TaskAttempt {
   id: string;
   taskId: string;
+  stepId?: string;
   attemptNumber: number;
   status: AttemptStatus;
   reworkReason?: string;
@@ -177,6 +187,7 @@ export interface WorkerBinding {
   agentName?: string;
   agentKind: string;
   lastObservedAgentState: HerdrAgentLifecycleState;
+  promptDispatchedAt?: string;
   updatedAt: string;
 }
 

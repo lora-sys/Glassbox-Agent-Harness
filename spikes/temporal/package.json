@@ -1,0 +1,15 @@
+{
+  "name": "glassbox-temporal-p6-spike",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "client": "node client.cjs",
+    "worker": "node worker.cjs"
+  },
+  "dependencies": {
+    "@temporalio/activity": "1.24.0",
+    "@temporalio/client": "1.24.0",
+    "@temporalio/worker": "1.24.0",
+    "@temporalio/workflow": "1.24.0"
+  }
+}

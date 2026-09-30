@@ -1,8 +1,17 @@
 import { createHash } from "node:crypto";
 import { AccessDeniedError } from "../../auth/service.js";
-import type { RunLease, RunRoute, TerminalRunStatus } from "../../conversation/lifecycle.js";
+import type {
+  DeliveryRecord,
+  RunLease,
+  RunRoute,
+  TerminalRunStatus,
+} from "../../conversation/lifecycle.js";
 import type { IncomingMessage, RunRecord } from "../../conversation/store.js";
 import { requireIdentifier, type CallerContext } from "../../identity/scope.js";
+import { authorizeLongWorkAction } from "../../ops/long-work-authority.js";
+import { parseCheckpointWriteSpec, parseTaskGetSpec } from "../../ops/tool-step-spec.js";
+import type { TaskNotificationRecord } from "../../ops/task-notification-store.js";
+import { stringColumn } from "../../persistence/database.js";
 import type {
   AcceptedIncoming,
   ExecutionFailureCode,
@@ -78,6 +87,7 @@ const DISPATCH_SETTLEMENT_RETRY_MS = 1_000;
 export class RunService {
   private started = false;
   private readonly concurrency: number;
+  private readonly queuedPollMs: number;
   private readonly deliveryTimeoutMs: number;
   private readonly restoreWindowMs: number;
   private readonly active = new Map<string, ActiveRun>();
@@ -85,15 +95,24 @@ export class RunService {
   private readonly recoveredNativeRoleRunIds = new Set<string>();
   private readonly publications = new Set<Promise<void>>();
   private readonly waiters = new Map<string, Set<RunWaiter>>();
+  private queuedPoll?: ReturnType<typeof setInterval>;
+  private notificationPoll?: ReturnType<typeof setInterval>;
+  private notificationPumping?: Promise<void>;
   private pumping: Promise<void> | undefined;
   private pumpAgain = false;
 
   constructor(private readonly options: RunServiceOptions) {
     this.concurrency = options.concurrency ?? 2;
+    this.queuedPollMs = options.queuedPollMs ?? 0;
     this.deliveryTimeoutMs = options.deliveryTimeoutMs ?? 15_000;
     this.restoreWindowMs = options.restoreWindowMs ?? DEFAULT_RESTORE_WINDOW_MS;
     if (!Number.isInteger(this.concurrency) || this.concurrency < 1 || this.concurrency > 32)
       throw new Error("Invalid Run concurrency");
+    if (
+      !Number.isInteger(this.queuedPollMs) ||
+      (this.queuedPollMs !== 0 && (this.queuedPollMs < 500 || this.queuedPollMs > 60_000))
+    )
+      throw new Error("Invalid durable queue polling interval");
     if (
       !Number.isInteger(this.deliveryTimeoutMs) ||
       this.deliveryTimeoutMs < 1 ||
@@ -116,13 +135,24 @@ export class RunService {
     await this.captureQueuedNativeRoleRuns();
     this.started = true;
     await this.restorePublications();
+    this.kickTaskNotifications();
+    this.notificationPoll = setInterval(() => this.kickTaskNotifications(), 2_000);
+    this.notificationPoll.unref();
     this.kick();
+    // Temporal Activities persist internal Runs in a separate process. The database
+    // is the queue; poll it so a process restart or missed in-memory wake cannot
+    // strand a queued Run.
+    if (this.queuedPollMs > 0) {
+      this.queuedPoll = setInterval(() => this.kick(), this.queuedPollMs);
+      this.queuedPoll.unref();
+    }
   }
 
   async recover() {
     if (this.started || this.active.size || this.pumping)
       throw new Error("Cannot recover active execution");
     const recovered = await this.options.store.lifecycle.recover();
+    await this.options.store.taskNotifications.recover();
     await this.emit({ type: "recovered", ...recovered });
     return recovered;
   }
@@ -191,6 +221,7 @@ export class RunService {
     // Re-read by authenticated scope; caller-supplied input text and snapshots are never executed.
     const caller = structuredClone(accepted.caller);
     const run = await this.options.store.conversations.getRun(caller, accepted.run.id);
+    if (run.source !== "external") throw new Error("Incoming Run source mismatch");
     if (!accepted.duplicate)
       await this.emit({ type: "run_queued", runId: run.id, conversationId: run.conversationId });
     if (terminal.has(run.status)) this.publishInBackground(caller, run);
@@ -199,6 +230,117 @@ export class RunService {
 
   getRun(caller: CallerContext, runId: string): Promise<RunRecord> {
     return this.options.store.conversations.getRun(caller, runId);
+  }
+
+  /** Queue a persisted Task Step Run without creating QQ ingress or a delivery. */
+  async enqueueInternalStepRun(caller: CallerContext, runId: string): Promise<RunRecord> {
+    if (!this.started) throw new Error("Run service is not started");
+    const run = await this.getRun(caller, runId);
+    if (run.source !== "task_step") throw new Error("Internal Step Run source mismatch");
+    if (run.status === "queued") {
+      await this.emit({ type: "run_queued", runId: run.id, conversationId: run.conversationId });
+      this.kick();
+    }
+    return run;
+  }
+
+  /** Internal Step Runs follow their owning Task's durable cancellation request.
+   * This reads only the persisted Run-to-Task link and cancellation state. */
+  private async internalTaskCancellationState(
+    caller: CallerContext,
+    runId: string,
+  ): Promise<{ requested: boolean; status: RunRecord["status"]; conversationId: string } | null> {
+    const result = await this.options.store.db.transaction((tx) =>
+      tx.execute({
+        sql: `SELECT t.cancellation_state, r.status, r.conversation_id FROM runs r
+              JOIN task_attempt_runs ar ON ar.run_id = r.id
+              JOIN tasks t ON t.id = ar.task_id
+              WHERE r.id = ? AND r.source = 'task_step' AND r.principal_id = ?`,
+        args: [runId, caller.principalId],
+      }),
+    );
+    const row = result.rows[0];
+    if (!row) return null;
+    const state = row.cancellation_state;
+    return {
+      requested: state === "requested" || state === "stopping" || state === "settled",
+      status: stringColumn(row, "status") as RunRecord["status"],
+      conversationId: stringColumn(row, "conversation_id"),
+    };
+  }
+
+  private async cancelInternalRunForTask(
+    caller: CallerContext,
+    runId: string,
+    activeHint?: ActiveRun,
+  ): Promise<boolean> {
+    const state = await this.internalTaskCancellationState(caller, runId);
+    if (!state?.requested) return false;
+    let status = state.status;
+    if (terminal.has(status)) return true;
+    const active = activeHint ?? this.active.get(state.conversationId);
+    if (status === "queued") {
+      const updated = await this.options.store.db.transaction((tx) =>
+        tx.execute({
+          sql: `UPDATE runs SET status = 'cancelled', updated_at = ? WHERE id = ?
+                AND source = 'task_step' AND principal_id = ? AND status = 'queued'
+                AND EXISTS (SELECT 1 FROM task_attempt_runs ar JOIN tasks t ON t.id = ar.task_id
+                  WHERE ar.run_id = runs.id AND t.cancellation_state IN ('requested','stopping','settled'))`,
+          args: [new Date().toISOString(), runId, caller.principalId],
+        }),
+      );
+      if (updated.rowsAffected === 1) {
+        await this.emit({
+          type: "run_finished",
+          runId,
+          conversationId: state.conversationId,
+          status: "cancelled",
+          outputWithheld: false,
+        });
+        this.kick();
+        return true;
+      }
+      const refreshed = await this.internalTaskCancellationState(caller, runId);
+      if (!refreshed?.requested) return false;
+      status = refreshed.status;
+    }
+    if (status === "running" || status === "cancelling") {
+      if (!active || active.route.runId !== runId) return false;
+      if (status === "running") {
+        const updated = await this.options.store.db.transaction((tx) =>
+          tx.execute({
+            sql: `UPDATE runs SET status = 'cancelling', updated_at = ? WHERE id = ?
+                  AND source = 'task_step' AND principal_id = ? AND status = 'running'
+                  AND EXISTS (SELECT 1 FROM task_attempt_runs ar JOIN tasks t ON t.id = ar.task_id
+                    WHERE ar.run_id = runs.id AND t.cancellation_state IN ('requested','stopping','settled'))`,
+            args: [new Date().toISOString(), runId, caller.principalId],
+          }),
+        );
+        if (updated.rowsAffected === 1) {
+          await this.emit({
+            type: "run_cancelling",
+            runId,
+            conversationId: state.conversationId,
+          });
+        } else {
+          const refreshed = await this.internalTaskCancellationState(caller, runId);
+          if (refreshed?.status !== "cancelling") return false;
+        }
+      }
+      active.controller.abort();
+      return true;
+    }
+    return false;
+  }
+
+  private async reconcileInternalRunCancellations(): Promise<void> {
+    for (const active of this.active.values()) {
+      try {
+        await this.cancelInternalRunForTask(active.route.caller, active.route.runId, active);
+      } catch {
+        this.report("dispatch_failed", active.route.runId);
+      }
+    }
   }
 
   /** Event-driven observation only. Aborting a wait never aborts execution. */
@@ -268,6 +410,8 @@ export class RunService {
 
   async cancel(caller: CallerContext, runId: string): Promise<RunRecord> {
     const run = await this.getRun(caller, runId);
+    if (run.source === "task_step")
+      throw new Error("Task Step Runs require Task cancellation or reconciliation");
     if (terminal.has(run.status) || run.status === "cancelling") {
       this.blocked.delete(runId);
       return run;
@@ -308,6 +452,8 @@ export class RunService {
 
   /** Explicit retry is allowed only for a transport-confirmed failed delivery. */
   async retryDelivery(caller: CallerContext, runId: string, deliveryId: string): Promise<void> {
+    if ((await this.getRun(caller, runId)).source === "task_step")
+      throw new Error("Internal Step Runs have no direct delivery");
     await this.options.store.lifecycle.transitionDelivery(
       caller,
       runId,
@@ -328,6 +474,7 @@ export class RunService {
     requireIdentifier(input.messageId);
     const observer = structuredClone(caller);
     const run = await this.getRun(observer, runId);
+    if (run.source === "task_step") throw new Error("Internal Step Runs have no control reply");
     const dedupKey = `control:${input.messageId}`;
     const existing = await this.options.store.lifecycle.findDelivery(observer, run.id, dedupKey);
     const deliveryId =
@@ -362,6 +509,10 @@ export class RunService {
   /** Abort requests do not claim cancellation. The adapter must still settle. */
   async stop(options: { abortRunning?: boolean; wait?: boolean } = {}): Promise<void> {
     this.started = false;
+    if (this.queuedPoll) clearInterval(this.queuedPoll);
+    this.queuedPoll = undefined;
+    if (this.notificationPoll) clearInterval(this.notificationPoll);
+    this.notificationPoll = undefined;
     for (const subscriptions of this.waiters.values())
       for (const waiter of subscriptions) waiter.stop();
     this.waiters.clear();
@@ -378,6 +529,7 @@ export class RunService {
       .then(async () => {
         while (this.started && this.pumpAgain) {
           this.pumpAgain = false;
+          await this.reconcileInternalRunCancellations();
           let cursor = 0;
           const seenConversations = new Set<string>();
           while (this.started && this.active.size < this.concurrency) {
@@ -385,6 +537,13 @@ export class RunService {
             if (routes.length === 0) break;
             for (const route of routes) {
               cursor = route.sequence;
+              try {
+                if (await this.cancelInternalRunForTask(route.caller, route.runId)) continue;
+              } catch {
+                this.blocked.add(route.runId);
+                this.report("dispatch_failed", route.runId);
+                continue;
+              }
               if (seenConversations.has(route.conversationId)) continue;
               seenConversations.add(route.conversationId);
               if (this.blocked.has(route.runId) || this.active.has(route.conversationId)) continue;
@@ -506,16 +665,44 @@ export class RunService {
     if (!active.lease || !run) return;
 
     let result: ExecutionResult;
+    let executorStarted = false;
     try {
       await this.emit({ type: "run_started", runId, conversationId: run.conversationId });
       const adapter = this.options.resolveExecution(run.executionRef);
-      if (!adapter || (caller.scope.chatType === "group" && adapter.supportsGroup !== true)) {
+      const toolStep =
+        run.source === "task_step" &&
+        (parseTaskGetSpec(run.executionRef) !== null ||
+          parseCheckpointWriteSpec(run.executionRef) !== null);
+      if (
+        !adapter ||
+        (run.source === "external" && run.executionRef.startsWith("tool:")) ||
+        (caller.scope.chatType === "group" && adapter.supportsGroup !== true) ||
+        (run.source === "task_step" &&
+          (toolStep
+            ? adapter.supportsTaskStepTool !== true
+            : adapter.supportsTaskStepModel !== true))
+      ) {
         // The configured route has no executor able to take this Run, which is a fact about the
         // configuration rather than about the runtime, but it is still a reason to keep this
         // profile out of routing until the route is fixed.
         result = { status: "failed", failureCode: "execution_unavailable" };
       } else {
         const input = await this.options.store.conversations.loadRunInput(caller, runId);
+        if (run.source === "task_step") {
+          if (!input.taskStepBinding) throw new Error("Internal Step Run binding missing");
+          await authorizeLongWorkAction(this.options.store, {
+            taskId: input.taskStepBinding.taskId,
+            caller,
+            resourceId: `task-${input.taskStepBinding.taskId}`,
+            action: "task:read",
+          });
+          await authorizeLongWorkAction(this.options.store, {
+            taskId: input.taskStepBinding.taskId,
+            caller,
+            resourceId: `task-${input.taskStepBinding.taskId}`,
+            action: "task:continue",
+          });
+        }
         // Recheck dispatch authority after context I/O and before invoking any external executor.
         const authorization = await this.options.store.authorization.check({
           caller,
@@ -530,9 +717,17 @@ export class RunService {
         } else {
           const executionInput = {
             ...input,
+            ...(run.source === "task_step"
+              ? {
+                  executionMode: toolStep
+                    ? ("task_step_tool" as const)
+                    : ("task_step_model" as const),
+                }
+              : {}),
             caller: structuredClone(caller),
             signal: active.controller.signal,
           };
+          executorStarted = true;
           if (this.options.captureLearning) {
             try {
               const candidateId = await this.options.captureLearning(executionInput);
@@ -557,11 +752,24 @@ export class RunService {
     } catch (error) {
       // A thrown adapter error does not prove that a detached execution stopped. It does prove
       // that no classified result exists, so the Run keeps a named cause instead of collapsing
-      // into the same opaque status line every other failure produced.
-      result =
-        error instanceof AccessDeniedError
-          ? { status: "failed", failureCode: "gate_refused" }
-          : { status: "unknown", failureCode: "execution_threw" };
+      // into the same opaque status line every other failure produced. An internal Run whose
+      // executor never started is a cancellation the Task must observe instead.
+      if (
+        run.source === "task_step" &&
+        !executorStarted &&
+        (await this.internalTaskCancellationState(caller, runId).then(
+          (state) => state?.requested ?? false,
+          () => false,
+        ))
+      ) {
+        await this.cancelInternalRunForTask(caller, runId, active).catch(() => false);
+        result = { status: "cancelled" };
+      } else {
+        result =
+          error instanceof AccessDeniedError
+            ? { status: "failed", failureCode: "gate_refused" }
+            : { status: "unknown", failureCode: "execution_threw" };
+      }
     }
     // A result the adapter could not classify still carries whatever cause it named: dropping the
     // text here is what turned every executor failure into one indistinguishable sentence.
@@ -592,7 +800,7 @@ export class RunService {
       ...(result.failureCode ? { failureCode: result.failureCode } : {}),
     });
     if (finished.outputWithheld) return;
-    if (status === "succeeded" && result.providerSessionId) {
+    if (run.source === "external" && status === "succeeded" && result.providerSessionId) {
       try {
         await this.options.store.conversations.setProviderSession(
           caller,
@@ -604,12 +812,14 @@ export class RunService {
         this.report("dispatch_failed", runId);
       }
     }
-    await this.publishTerminal(caller, finished.run);
+    if (run.source === "external") await this.publishTerminal(caller, finished.run);
   }
 
   private async publishTerminal(caller: CallerContext, record: RunRecord): Promise<void> {
+    if (record.source === "task_step") return;
     // Re-read through authorization before loading the persisted result for transport.
     const run = await this.getRun(caller, record.id);
+    if (run.source === "task_step") return;
     if (!terminal.has(run.status)) return;
     const existing = await this.options.store.lifecycle.findDelivery(caller, run.id, "result");
     // A Run that said nothing still owes its reader a sentence, and the cause it recorded decides
@@ -737,6 +947,101 @@ export class RunService {
         }
       }
       if (routes.length < 100) return;
+    }
+  }
+
+  /** Task events have their own durable outbox. The claim rechecks the Task and the
+   * exact audience before this method calls the channel transport. */
+  private kickTaskNotifications(): void {
+    if (!this.started || this.notificationPumping) return;
+    const task = (async () => {
+      const candidates = await this.options.store.taskNotifications.listUndelivered(100);
+      for (const candidate of candidates) {
+        if (!this.started) break;
+        await this.sendTaskNotification(candidate);
+      }
+    })()
+      .catch(() => this.report("delivery_failed"))
+      .finally(() => {
+        this.notificationPumping = undefined;
+        this.publications.delete(task);
+      });
+    this.notificationPumping = task;
+    this.publications.add(task);
+  }
+
+  private async sendTaskNotification(candidate: TaskNotificationRecord): Promise<void> {
+    const caller: CallerContext = {
+      principalId: candidate.principalId,
+      scope: structuredClone(candidate.destination),
+    };
+    let lease;
+    try {
+      lease = await this.options.store.taskNotifications.claim(caller, candidate.id);
+    } catch {
+      this.report("delivery_failed", candidate.runId);
+      return;
+    }
+    if (!lease) return;
+    const notice = lease.notification;
+    await this.emit({
+      type: "task_notification_changed",
+      runId: notice.runId,
+      taskId: notice.taskId,
+      notificationId: notice.id,
+      status: "sending",
+    });
+    const delivery: DeliveryRecord = {
+      id: notice.id,
+      runId: notice.runId,
+      dedupKey: `task-event-${notice.eventSequence}`,
+      destinationScopeKey: notice.destinationScopeKey,
+      payloadText: notice.payloadText,
+      payloadKind: "text",
+      status: "sending",
+      externalId: null,
+    };
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<SendOutcome>((resolve) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        resolve({ status: "unknown" });
+      }, this.deliveryTimeoutMs);
+    });
+    let outcome: SendOutcome;
+    try {
+      outcome = await Promise.race([
+        this.options.transport
+          .send({
+            destination: structuredClone(notice.destination),
+            delivery,
+            signal: controller.signal,
+          })
+          .catch((): SendOutcome => ({ status: "unknown" })),
+        timeout,
+      ]);
+      if (!outcome || !["sent", "failed", "unknown"].includes(outcome.status))
+        outcome = { status: "unknown" };
+    } catch {
+      outcome = { status: "unknown" };
+    } finally {
+      clearTimeout(timer);
+    }
+    try {
+      await lease.settle(
+        outcome.status,
+        outcome.status === "sent" ? outcome.externalId : undefined,
+      );
+      await this.emit({
+        type: "task_notification_changed",
+        runId: notice.runId,
+        taskId: notice.taskId,
+        notificationId: notice.id,
+        status: outcome.status,
+      });
+    } catch {
+      this.report("delivery_failed", notice.runId);
     }
   }
 

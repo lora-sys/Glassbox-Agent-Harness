@@ -1230,7 +1230,8 @@ describe("shared group conversation and durable actor routing", () => {
 
     // 10. Verify all current migrations completed. V7 adds the P4B channel history
     // archive (channel_messages + FTS index) and group capability policies; V13 adds the
-    // Run failure cause column that the fallback delivery line is chosen from.
+    // Run failure cause column that the fallback delivery line is chosen from. The P6
+    // migrations from V16 add the durable long work step storage.
     const ver = await rawCheck.execute("PRAGMA user_version");
     expect(Number(ver.rows[0]?.user_version)).toBe(CURRENT_SCHEMA_VERSION);
     const runColumns = await rawCheck.execute("PRAGMA table_info(runs)");
@@ -1243,6 +1244,10 @@ describe("shared group conversation and durable actor routing", () => {
       decisionColumns.rows.some((row) => row.name === "delivery_source"),
       "authorization_decisions.delivery_source must exist after the V14 migration",
     ).toBe(true);
+    expect(
+      (await rawCheck.execute("PRAGMA table_info(task_steps)")).rows.length,
+      "task_steps must exist after the V16 migration",
+    ).toBeGreaterThan(0);
 
     rawCheck.close();
   });

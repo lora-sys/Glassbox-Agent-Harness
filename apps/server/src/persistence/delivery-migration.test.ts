@@ -12,6 +12,9 @@ it("migrates v9 deliveries without losing old rows and accepts browser and media
     const path = join(directory, "glassbox.db");
     const legacy = createClient({ url: localDatabaseUrl(path) });
     await legacy.execute("CREATE TABLE runs (id TEXT PRIMARY KEY)");
+    await legacy.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY)");
+    await legacy.execute("CREATE TABLE task_attempts (id TEXT PRIMARY KEY, task_id TEXT)");
+    await legacy.execute("CREATE TABLE worker_bindings (id TEXT PRIMARY KEY)");
     await legacy.execute(
       "CREATE TABLE deliveries (id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id), dedup_key TEXT NOT NULL, destination_scope_key TEXT NOT NULL, payload_text TEXT NOT NULL, payload_kind TEXT NOT NULL CHECK(payload_kind IN ('text','result','ack')), status TEXT NOT NULL CHECK(status IN ('pending','sending','sent','failed','unknown')), external_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(run_id, dedup_key))",
     );
@@ -82,7 +85,9 @@ it("marks legacy protected reads during the v14 upgrade and leaves public web de
     // Rewind to 13, the version immediately before this migration, rather than to 10: a real v13
     // database has already run v11's deliveries rebuild and v12's attachments table, and rewinding
     // past them would ask those migrations to run a second time on a schema that already holds
-    // their result. What is under test here is the marker, not the rebuilds.
+    // their result. What is under test here is the marker, not the rebuilds. Dropping the V18
+    // Worker prompt column first exercises that migration against a schema that predates it.
+    await legacy.execute("ALTER TABLE worker_bindings DROP COLUMN prompt_dispatched_at");
     await legacy.execute("PRAGMA user_version = 13");
     legacy.close();
 
