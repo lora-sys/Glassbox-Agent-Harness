@@ -50,6 +50,7 @@ export interface ProviderAdapter {
   startSession(clientSessionId: string, opts?: SessionOpts): Promise<Session>;
   startTurn(sessionId: string, input: UserInput[], opts?: TurnOpts): Promise<Turn>;
   interruptTurn(sessionId: string, turnId: string): Promise<void>;
+  releaseSession?(sessionId: string): void;
 
   collectTurnEvents(
     sessionId: string,
@@ -58,7 +59,7 @@ export interface ProviderAdapter {
     traceCollector?: (method: string, params: Record<string, unknown>) => void,
   ): Promise<RunResult>;
 
-  registerOnTurnEnd(fn: (status: string) => void, threadId?: string): void;
+  registerOnTurnEnd(fn: (status: string) => void, threadId?: string): (() => void) | void;
 
   on(event: "approval", handler: (ev: ApprovalEvent) => void): void;
   respondToApproval(requestId: number | string, approved: boolean): void;

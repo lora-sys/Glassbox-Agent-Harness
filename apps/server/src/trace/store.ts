@@ -115,6 +115,10 @@ export class RawTraceStore {
   // In-memory sequence cache to avoid O(N^2) full-history reads on every append
   private readonly sessionSeqs = new Map<string, number>();
 
+  forgetSession(sessionId: string): void {
+    this.sessionSeqs.delete(sessionId);
+  }
+
   private ensureDir(sessionId: string): void {
     assertSafeIdentifier(sessionId, "sessionId");
     const targetPath = getTracePath(sessionId);
@@ -196,6 +200,8 @@ export class RawTraceStore {
     this.ensureDir(sessionId);
     const targetPath = getTracePath(sessionId);
     const seq = this.nextSeq(sessionId);
+    // Old sessions can always recover their sequence from the durable file.
+    if (this.sessionSeqs.size > 256) this.sessionSeqs.delete(this.sessionSeqs.keys().next().value!);
     const entry: TraceEntry<typeof event> = {
       seq,
       ts: new Date().toISOString(),

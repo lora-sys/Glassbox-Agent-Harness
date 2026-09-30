@@ -277,8 +277,10 @@ interface SessionRecord {
   runOptions: Readonly<SessionRunOptions>;
   /** Active turn UUID, or null when no turn is in progress. */
   activeTurnId: string | null;
-  /** Ordered list of every turn UUID for this session. */
-  turnIds: string[];
+  /** Background trace scan and broadcast must finish before idle eviction. */
+  finishingTurn: boolean;
+  /** Count only; turn history is durable in the trace. */
+  turnCount: number;
   /** Pending file-change approval requests awaiting user decision. */
   pendingApprovals: Array<{
     itemId: string;
@@ -291,6 +293,77 @@ interface SessionRecord {
 }
 
 const sessions = new Map<string, SessionRecord>();
+const MAX_WORKBENCH_SESSIONS = 128;
+let openingSessions = 0;
+
+function evictIdleSession(): boolean {
+  for (const [sessionId, session] of sessions) {
+    if (session.activeTurnId || session.finishingTurn) continue;
+    sessions.delete(sessionId);
+    const adapter = sessionAdapters.get(session.threadId) ?? sessionAdapters.get(sessionId);
+    sessionAdapters.delete(sessionId);
+    if (![...sessions.values()].some((other) => other.threadId === session.threadId)) {
+      adapter?.releaseSession?.(session.threadId);
+      sessionAdapters.delete(session.threadId);
+    }
+    traceStore.forgetSession(sessionId);
+    return true;
+  }
+  return false;
+}
+
+function reserveSessionSlot(): () => void {
+  while (sessions.size + openingSessions >= MAX_WORKBENCH_SESSIONS) {
+    if (!evictIdleSession()) throw new Error("Workbench session capacity reached");
+  }
+  openingSessions++;
+  return () => {
+    openingSessions--;
+  };
+}
+
+function settleSessionTurn(sessionId: string, turnId: string, status: string): void {
+  if (status === "inProgress") return;
+  const session = sessions.get(sessionId);
+  if (!session) return;
+  if (session.activeTurnId === turnId) session.activeTurnId = null;
+  session.pendingApprovals = session.pendingApprovals.filter((item) => item.turnId !== turnId);
+}
+
+/** The hook is installed before interrupt so a fast terminal event cannot be missed.
+ * A timeout leaves the old turn active and prevents another turn on its thread. */
+async function interruptActiveTurn(
+  sessionId: string,
+  session: SessionRecord,
+  timeoutMs = 10_000,
+): Promise<{ turnId: string; status: string } | null> {
+  const turnId = session.activeTurnId;
+  if (!turnId) return null;
+  const adapter = getSessionAdapter(session.threadId);
+  let resolveEnd!: (status: string) => void;
+  const ended = new Promise<string>((resolve) => {
+    resolveEnd = resolve;
+  });
+  const unsubscribe = adapter.registerOnTurnEnd((status) => {
+    settleSessionTurn(sessionId, turnId, status);
+    resolveEnd(status);
+  }, session.threadId);
+  void adapter.interruptTurn(session.threadId, turnId).catch(() => {
+    // A terminal event may have raced the interrupt. The bounded wait below decides.
+  });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const status = await Promise.race([
+    ended,
+    new Promise<null>((resolve) => {
+      timer = setTimeout(() => resolve(null), timeoutMs);
+    }),
+  ]);
+  if (timer) clearTimeout(timer);
+  if (typeof unsubscribe === "function") unsubscribe();
+  if (status === null) throw new Error("Previous turn has not ended; retry later");
+  settleSessionTurn(sessionId, turnId, status);
+  return { turnId, status };
+}
 
 // ---------------------------------------------------------------------------
 // /steer helper: wait for previous turn to complete, then start a new one
@@ -309,80 +382,87 @@ async function startNewTurn(
   error?: string;
 }> {
   // If a turn is already running, wait for it to end first
-  if (session.activeTurnId) {
-    await new Promise<void>((resolve) => {
-      getSessionAdapter(session.threadId).registerOnTurnEnd((_status: string) => resolve());
-    });
-  }
+  if (session.activeTurnId) throw new Error("Previous turn has not ended");
+  session.finishingTurn = true;
+  try {
+    // S8: Snapshot workspace before turn — detects file changes missed by event stream
+    getSessionAdapter(session.threadId).snapshotWorkspace(workspace);
 
-  // S8: Snapshot workspace before turn — detects file changes missed by event stream
-  getSessionAdapter(session.threadId).snapshotWorkspace(workspace);
+    // ---- Fire the turn/start request first, then collect its events.
+    // The adapter emits turn/started as soon as the provider receives the
+    // request, so starting first then attaching the handler still captures
+    // that marker while avoiding a 30s timeout if no prior turn is in flight.
+    const turn = await getSessionAdapter(session.threadId).startTurn(
+      session.threadId,
+      [{ type: "text", text: instruction }],
+      { ...turnStartOpts(session.runOptions, workspace), cwd: workspace },
+    );
+    session.activeTurnId = turn.id;
+    getSessionAdapter(session.threadId).registerOnTurnEnd((status) => {
+      if (status !== "inProgress" && session.activeTurnId === turn.id) session.activeTurnId = null;
+    }, session.threadId);
 
-  // ---- Fire the turn/start request first, then collect its events.
-  // The adapter emits turn/started as soon as the provider receives the
-  // request, so starting first then attaching the handler still captures
-  // that marker while avoiding a 30s timeout if no prior turn is in flight.
-  const turn = await getSessionAdapter(session.threadId).startTurn(
-    session.threadId,
-    [{ type: "text", text: instruction }],
-    { ...turnStartOpts(session.runOptions, workspace), cwd: workspace },
-  );
-  session.activeTurnId = turn.id;
+    // Now attach the event collector for the new turn.
+    const evCounts: Record<string, number> = {} as Record<string, number>;
+    let capturedTurnId = turn.id;
+    // Use separate fields to avoid TS narrowing completed to never after
+    // assignment inside the wrappedCollector closure.
+    let turnCompletedDuration: number | null | undefined;
 
-  // Now attach the event collector for the new turn.
-  const evCounts: Record<string, number> = {} as Record<string, number>;
-  let capturedTurnId = turn.id;
-  // Use separate fields to avoid TS narrowing completed to never after
-  // assignment inside the wrappedCollector closure.
-  let turnCompletedDuration: number | null | undefined;
-
-  const wrappedCollector = (method: string, params: Record<string, unknown>) => {
-    traceCollector(method, params);
-    evCounts[method] = (evCounts[method] || 0) + 1;
-    if (method === "turn/started" && params.turnId && !capturedTurnId) {
-      capturedTurnId = params.turnId as string;
-    }
-    if (method === "turn/completed" || method === "turn/interrupted") {
-      const turnData = (params as { turn?: { status?: string; durationMs?: number | null } }).turn;
-      if (turnData) {
-        turnCompletedDuration = turnData.durationMs ?? null;
+    const wrappedCollector = (method: string, params: Record<string, unknown>) => {
+      traceCollector(method, params);
+      evCounts[method] = (evCounts[method] || 0) + 1;
+      if (method === "turn/started" && params.turnId && !capturedTurnId) {
+        capturedTurnId = params.turnId as string;
       }
+      if (method === "turn/completed" || method === "turn/interrupted") {
+        const turnData = (params as { turn?: { status?: string; durationMs?: number | null } })
+          .turn;
+        if (turnData) {
+          turnCompletedDuration = turnData.durationMs ?? null;
+        }
+      }
+    };
+
+    const collected = await getSessionAdapter(session.threadId).collectTurnEvents(
+      session.threadId,
+      turn.id,
+      30_000,
+      wrappedCollector,
+    );
+    if (collected.turnStatus !== "inProgress") {
+      if (session.activeTurnId === turn.id) session.activeTurnId = null;
+      session.pendingApprovals = session.pendingApprovals.filter((item) => item.turnId !== turn.id);
     }
-  };
 
-  const collected = await getSessionAdapter(session.threadId).collectTurnEvents(
-    session.threadId,
-    turn.id,
-    30_000,
-    wrappedCollector,
-  );
-  if (session.activeTurnId === turn.id) session.activeTurnId = null;
+    // S8: Post-turn workspace scan — detects file changes codex omitted from events
+    const scanResult = getSessionAdapter(session.threadId).scanAndFireHooks(workspace);
+    if (scanResult.changes.length > 0) {
+      const itemId = "git-" + turn.id.slice(0, 8);
+      traceCollector("item/fileChange", {
+        itemId,
+        turnId: turn.id,
+        threadId: session.threadId,
+        changes: scanResult.changes,
+      });
+    }
 
-  // S8: Post-turn workspace scan — detects file changes codex omitted from events
-  const scanResult = getSessionAdapter(session.threadId).scanAndFireHooks(workspace);
-  if (scanResult.changes.length > 0) {
-    const itemId = "git-" + turn.id.slice(0, 8);
-    traceCollector("item/fileChange", {
-      itemId,
-      turnId: turn.id,
-      threadId: session.threadId,
-      changes: scanResult.changes,
-    });
+    const finalTurnId = capturedTurnId || turn.id;
+    session.turnCount++;
+
+    // Derive turn status from the collected event counts
+    const turnStatus = collected.turnStatus;
+
+    return {
+      turnId: finalTurnId,
+      eventCounts: evCounts,
+      turnStatus,
+      turnDurationMs: collected.turnDurationMs ?? turnCompletedDuration ?? null,
+      ...(collected.error ? { error: collected.error } : {}),
+    };
+  } finally {
+    session.finishingTurn = false;
   }
-
-  const finalTurnId = capturedTurnId || turn.id;
-  session.turnIds.push(finalTurnId);
-
-  // Derive turn status from the collected event counts
-  const turnStatus = collected.turnStatus;
-
-  return {
-    turnId: finalTurnId,
-    eventCounts: evCounts,
-    turnStatus,
-    turnDurationMs: collected.turnDurationMs ?? turnCompletedDuration ?? null,
-    ...(collected.error ? { error: collected.error } : {}),
-  };
 }
 
 const defaultProvenance = TRACE_PROVENANCE;
@@ -409,11 +489,12 @@ function makeTraceCollector(sessionId: string, provenance = defaultProvenance) {
 // When codex requests approval, we surface it to the UI and record it
 // as a pending decision in the session. The /decide endpoint consumes
 // these pending approvals.
-function registerApprovalHandler(
-  sessionId: string,
-  _onDecide: (itemId: string, approved: boolean) => void,
-) {
-  getSessionAdapter(sessionId).on(
+const approvalListeners = new WeakSet<ProviderAdapter>();
+function registerApprovalHandler(sessionId: string) {
+  const adapter = getSessionAdapter(sessionId);
+  if (approvalListeners.has(adapter)) return;
+  approvalListeners.add(adapter);
+  adapter.on(
     "approval",
     (ev: {
       itemId: string;
@@ -423,19 +504,21 @@ function registerApprovalHandler(
       grantRoot: string | null;
       startedAtMs: number;
     }) => {
-      const session = sessions.get(sessionId);
-      if (session) {
-        session.pendingApprovals.push({
-          itemId: ev.itemId,
-          turnId: ev.turnId,
-          threadId: ev.threadId,
-          reason: ev.reason,
-          grantRoot: ev.grantRoot,
-          startedAtMs: ev.startedAtMs,
-        });
-      }
+      const matched = [...sessions.entries()].find(
+        ([, session]) => session.threadId === ev.threadId && session.activeTurnId === ev.turnId,
+      );
+      if (!matched) return;
+      const [targetSessionId, session] = matched;
+      session.pendingApprovals.push({
+        itemId: ev.itemId,
+        turnId: ev.turnId,
+        threadId: ev.threadId,
+        reason: ev.reason,
+        grantRoot: ev.grantRoot,
+        startedAtMs: ev.startedAtMs,
+      });
       // Broadcast the approval request to WS subscribers
-      broadcastApproval(sessionId, {
+      broadcastApproval(targetSessionId, {
         threadId: ev.threadId,
         turnId: ev.turnId,
         itemId: ev.itemId,
@@ -469,7 +552,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
               sessionId: sid,
               threadId: rec.threadId,
               activeTurnId: rec.activeTurnId,
-              turnCount: rec.turnIds.length,
+              turnCount: rec.turnCount,
             }))
         : null;
     const anyAdapterReady = Array.from(providerSlots.values()).some((s) => s.ready);
@@ -492,9 +575,12 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
   // while the turn is active. Event collection and derived-state broadcast
   // happen in the background.
   if (req.method === "POST" && (req.url === "/run-test" || req.url === "/run-claude")) {
+    const sessionId = randomUUID();
+    let releaseReservation: (() => void) | undefined;
+    let createdThreadId: string | undefined;
+    let createdAdapter: ProviderAdapter | undefined;
     try {
       const body = await parseBody(req);
-      const sessionId = randomUUID();
       const provider =
         req.url === "/run-claude"
           ? "claude-code"
@@ -514,7 +600,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         );
         return;
       }
-      sessionAdapters.set(sessionId, sessionAdapter);
+      createdAdapter = sessionAdapter;
 
       const clientThreadId =
         typeof body.threadId === "string"
@@ -565,7 +651,10 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       });
       // --- end P2.4 ---
 
+      releaseReservation = reserveSessionSlot();
       const thread = await sessionAdapter.startSession(clientThreadId, sessionStartOpts(runOpts));
+      createdThreadId = thread.id;
+      sessionAdapters.set(sessionId, sessionAdapter);
       sessionAdapters.set(thread.id, sessionAdapter);
 
       sessionAdapter.snapshotWorkspace(workspace);
@@ -583,13 +672,18 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         workspace,
         runOptions: Object.freeze({ ...runOpts }),
         activeTurnId: turn.id,
-        turnIds: [turn.id],
+        finishingTurn: true,
+        turnCount: 1,
         pendingApprovals: [],
       });
+      sessionAdapter.registerOnTurnEnd(
+        (status) => settleSessionTurn(sessionId, turn.id, status),
+        thread.id,
+      );
+      releaseReservation();
+      releaseReservation = undefined;
 
-      registerApprovalHandler(sessionId, (_itemId, _approved) => {
-        // Default no-op: the /decide endpoint handles decisions explicitly
-      });
+      registerApprovalHandler(sessionId);
 
       // Return immediately so the caller can interact while turn is active
       res.writeHead(200, { "content-type": "application/json" });
@@ -605,7 +699,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       // P6.4: Collect the event stream for up to 30 s in the background
       sessionAdapter
         .collectTurnEvents(thread.id, turn.id, 30_000, traceCollector)
-        .then(() => {
+        .then((result) => {
           // S8: post-turn workspace scan for file changes omitted from events
           try {
             var scanResult = sessionAdapter.scanAndFireHooks(workspace);
@@ -630,16 +724,30 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             sessionId,
             replayResult.state as unknown as Record<string, unknown>,
           );
-          broadcastSessionEnded(sessionId);
+          if (result.turnStatus !== "inProgress") broadcastSessionEnded(sessionId);
           // Clear active turn once it ends
-          const s = sessions.get(sessionId);
-          if (s) s.activeTurnId = null;
+          settleSessionTurn(sessionId, turn.id, result.turnStatus);
         })
         .catch((err) => {
           console.error(`[run-test background] session ${sessionId} failed:`, err);
+        })
+        .finally(() => {
+          const session = sessions.get(sessionId);
+          if (session) session.finishingTurn = false;
         });
     } catch (err) {
-      res.writeHead(500, { "content-type": "application/json" });
+      releaseReservation?.();
+      if (!sessions.has(sessionId)) {
+        sessionAdapters.delete(sessionId);
+        if (createdThreadId) {
+          sessionAdapters.delete(createdThreadId);
+          createdAdapter?.releaseSession?.(createdThreadId);
+        }
+      }
+      res.writeHead(
+        err instanceof Error && err.message === "Workbench session capacity reached" ? 503 : 500,
+        { "content-type": "application/json" },
+      );
       res.end(
         JSON.stringify({
           error: String(err instanceof Error ? err.message : err),
@@ -650,6 +758,10 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
   }
   // Returns immediately with sessionId; event collection runs in background.
   if (req.method === "POST" && req.url === "/run-stream") {
+    const sessionId = randomUUID();
+    let releaseReservation: (() => void) | undefined;
+    let createdThreadId: string | undefined;
+    let createdAdapter: ProviderAdapter | undefined;
     try {
       const body = await parseBody(req);
       console.error(
@@ -661,7 +773,6 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             approvalPolicy: body.approvalPolicy,
           }),
       );
-      const sessionId = randomUUID();
       const provider =
         typeof body.provider === "string" && ["codex", "claude-code"].includes(body.provider)
           ? body.provider
@@ -679,7 +790,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         );
         return;
       }
-      sessionAdapters.set(sessionId, sessionAdapter);
+      createdAdapter = sessionAdapter;
 
       const clientThreadId =
         typeof body.threadId === "string"
@@ -729,7 +840,10 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         repoPath: workspace,
       });
 
+      releaseReservation = reserveSessionSlot();
       const thread = await sessionAdapter.startSession(clientThreadId, sessionStartOpts(runOpts));
+      createdThreadId = thread.id;
+      sessionAdapters.set(sessionId, sessionAdapter);
       sessionAdapters.set(thread.id, sessionAdapter);
 
       sessionAdapter.snapshotWorkspace(workspace);
@@ -747,13 +861,18 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         workspace,
         runOptions: Object.freeze({ ...runOpts }),
         activeTurnId: turn.id,
-        turnIds: [turn.id],
+        finishingTurn: true,
+        turnCount: 1,
         pendingApprovals: [],
       });
+      sessionAdapter.registerOnTurnEnd(
+        (status) => settleSessionTurn(sessionId, turn.id, status),
+        thread.id,
+      );
+      releaseReservation();
+      releaseReservation = undefined;
 
-      registerApprovalHandler(sessionId, (_itemId, _approved) => {
-        // Default no-op: the /decide endpoint handles decisions explicitly
-      });
+      registerApprovalHandler(sessionId);
 
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
@@ -767,7 +886,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 
       sessionAdapter
         .collectTurnEvents(thread.id, turn.id, 30_000, traceCollector)
-        .then(() => {
+        .then((result) => {
           // S8: post-turn workspace scan for file changes omitted from events
           try {
             var scanResult = sessionAdapter.scanAndFireHooks(workspace);
@@ -792,19 +911,33 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             sessionId,
             replayResult.state as unknown as Record<string, unknown>,
           );
-          broadcastSessionEnded(sessionId);
-          const s = sessions.get(sessionId);
-          if (s) s.activeTurnId = null;
+          if (result.turnStatus !== "inProgress") broadcastSessionEnded(sessionId);
+          settleSessionTurn(sessionId, turn.id, result.turnStatus);
         })
         .catch((err) => {
           console.error(`[run-stream background] session ${sessionId} failed:`, err);
+        })
+        .finally(() => {
+          const session = sessions.get(sessionId);
+          if (session) session.finishingTurn = false;
         });
     } catch (err) {
+      releaseReservation?.();
+      if (!sessions.has(sessionId)) {
+        sessionAdapters.delete(sessionId);
+        if (createdThreadId) {
+          sessionAdapters.delete(createdThreadId);
+          createdAdapter?.releaseSession?.(createdThreadId);
+        }
+      }
       console.error(
         "[e2e-error] /run-stream FAILED:",
         err instanceof Error ? err.message : String(err),
       );
-      res.writeHead(500, { "content-type": "application/json" });
+      res.writeHead(
+        err instanceof Error && err.message === "Workbench session capacity reached" ? 503 : 500,
+        { "content-type": "application/json" },
+      );
       res.end(
         JSON.stringify({
           error: String(err instanceof Error ? err.message : err),
@@ -836,44 +969,20 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       const alreadyIdle = !session.activeTurnId;
 
       if (!alreadyIdle) {
-        const { activeTurnId, threadId } = session;
-
-        // Register hook: append action.pause AFTER turn/completed flows through trace,
-        // giving correct ordering: provider events → action.pause
-        getSessionAdapter(threadId).registerOnTurnEnd((turnStatus) => {
-          traceStore.append(sessionId, {
-            method: "action.pause",
-            params: {
-              kind: "action.pause",
-              source: "glassbox-user",
-              sessionId,
-              threadId,
-              turnId: activeTurnId,
-              turnStatus,
-              ts: new Date().toISOString(),
-            },
-          });
-          broadcastEvent(sessionId, {
-            method: "action.pause",
-            params: {
-              kind: "action.pause",
-              source: "glassbox-user",
-              sessionId,
-              threadId,
-              turnId: activeTurnId,
-              turnStatus,
-              ts: new Date().toISOString(),
-            },
-          });
-        });
-
-        await getSessionAdapter(threadId).interruptTurn(threadId, activeTurnId as string);
-        session.activeTurnId = null;
-
-        // Wait for interrupted turn to finish and action.pause to be recorded
-        await new Promise<void>((resolve) => {
-          getSessionAdapter(threadId).registerOnTurnEnd((_status: string) => resolve());
-        });
+        const ended = await interruptActiveTurn(sessionId, session);
+        if (ended) {
+          const params = {
+            kind: "action.pause",
+            source: "glassbox-user",
+            sessionId,
+            threadId: session.threadId,
+            turnId: ended.turnId,
+            turnStatus: ended.status,
+            ts: new Date().toISOString(),
+          };
+          traceStore.append(sessionId, { method: "action.pause", params });
+          broadcastEvent(sessionId, { method: "action.pause", params });
+        }
       }
 
       const replayResult = replayTrace(sessionId);
@@ -925,43 +1034,20 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       const alreadyStopped = !session.activeTurnId;
 
       if (!alreadyStopped) {
-        const { activeTurnId, threadId } = session;
-
-        // Register a hook: append action.stop to trace AFTER the turn/completed
-        // event flows through, ensuring correct ordering in the trace.
-        getSessionAdapter(threadId).registerOnTurnEnd((turnStatus) => {
-          traceStore.append(sessionId, {
-            method: "action.stop",
-            params: {
-              kind: "action.stop",
-              source: "glassbox-user",
-              ts: new Date().toISOString(),
-              sessionId,
-              threadId,
-              turnId: activeTurnId,
-              turnStatus,
-            },
-          });
-          broadcastEvent(sessionId, {
-            method: "action.stop",
-            params: {
-              kind: "action.stop",
-              source: "glassbox-user",
-              sessionId,
-              threadId,
-              turnId: activeTurnId,
-              turnStatus,
-            },
-          });
-        });
-
-        await getSessionAdapter(threadId).interruptTurn(threadId, activeTurnId as string);
-        session.activeTurnId = null;
-
-        // Wait for the turn to finish and action.stop to be recorded
-        await new Promise<void>((resolve) => {
-          getSessionAdapter(threadId).registerOnTurnEnd((_status: string) => resolve());
-        });
+        const ended = await interruptActiveTurn(sessionId, session);
+        if (ended) {
+          const params = {
+            kind: "action.stop",
+            source: "glassbox-user",
+            sessionId,
+            threadId: session.threadId,
+            turnId: ended.turnId,
+            turnStatus: ended.status,
+            ts: new Date().toISOString(),
+          };
+          traceStore.append(sessionId, { method: "action.stop", params });
+          broadcastEvent(sessionId, { method: "action.stop", params });
+        }
       }
 
       const replayResult = replayTrace(sessionId);
@@ -1017,21 +1103,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       // BEFORE waiting, and bound the wait: a turn hung on an unanswered
       // approval must not deadlock steering.
       if (session.activeTurnId) {
-        const { activeTurnId, threadId } = session;
-
-        const turnEnded = new Promise<void>((resolve) => {
-          getSessionAdapter(threadId).registerOnTurnEnd(() => resolve());
-        });
-        try {
-          await getSessionAdapter(threadId).interruptTurn(threadId, activeTurnId);
-        } catch {
-          // The turn may already have finished; nothing to interrupt.
-        }
-        await Promise.race([
-          turnEnded,
-          new Promise<void>((resolve) => setTimeout(resolve, 10_000)),
-        ]);
-        session.activeTurnId = null;
+        await interruptActiveTurn(sessionId, session);
       }
 
       // Record the steer action after the new turn's events are in trace
@@ -1122,21 +1194,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       // If a turn is active, interrupt it first (interrupt before waiting,
       // bounded wait so a hung turn cannot deadlock the edit-and-send path)
       if (session.activeTurnId) {
-        const { activeTurnId, threadId } = session;
-
-        const turnEnded = new Promise<void>((resolve) => {
-          getSessionAdapter(threadId).registerOnTurnEnd(() => resolve());
-        });
-        try {
-          await getSessionAdapter(threadId).interruptTurn(threadId, activeTurnId);
-        } catch {
-          // The turn may already have finished; nothing to interrupt.
-        }
-        await Promise.race([
-          turnEnded,
-          new Promise<void>((resolve) => setTimeout(resolve, 10_000)),
-        ]);
-        session.activeTurnId = null;
+        await interruptActiveTurn(sessionId, session);
       }
 
       // Start the new turn on the same thread with the edited task text
@@ -1234,26 +1292,13 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       const traceCollector = makeTraceCollector(sessionId);
       const threadId = session.threadId;
 
-      // Set the new instruction on the adapter before starting the next turn
-      (getSessionAdapter(threadId) as any).setAppendSystemPrompt(threadId, value);
-
       // If a turn is active, interrupt it first (bounded wait)
       if (session.activeTurnId) {
-        const { activeTurnId } = session;
-        const turnEnded = new Promise<void>((resolve) => {
-          getSessionAdapter(threadId).registerOnTurnEnd(() => resolve());
-        });
-        try {
-          await getSessionAdapter(threadId).interruptTurn(threadId, activeTurnId);
-        } catch {
-          // turn may already have finished
-        }
-        await Promise.race([
-          turnEnded,
-          new Promise<void>((resolve) => setTimeout(resolve, 10_000)),
-        ]);
-        session.activeTurnId = null;
+        await interruptActiveTurn(sessionId, session);
       }
+
+      // Only change the provider session after the prior turn has actually settled.
+      (getSessionAdapter(threadId) as any).setAppendSystemPrompt(threadId, value);
 
       // Start the new turn on the same thread
       const editTurnSummary = await startNewTurn(
@@ -1309,9 +1354,12 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     return;
   }
   if (req.method === "POST" && req.url === "/run-demo") {
+    const sessionId = randomUUID();
+    let releaseReservation: (() => void) | undefined;
+    let createdThreadId: string | undefined;
+    let createdAdapter: ProviderAdapter | undefined;
     try {
       const body = await parseBody(req);
-      const sessionId = randomUUID();
       const clientThreadId =
         typeof body.threadId === "string"
           ? body.threadId
@@ -1337,7 +1385,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         );
         return;
       }
-      sessionAdapters.set(sessionId, sessionAdapter);
+      createdAdapter = sessionAdapter;
 
       const defaultWs = DEFAULT_WORKSPACE_DEMO;
       let workspace = typeof body.repoPath === "string" ? body.repoPath : defaultWs;
@@ -1381,11 +1429,14 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       });
       // --- end P2.4 ---
 
+      releaseReservation = reserveSessionSlot();
       const thread = await sessionAdapter.startSession(clientThreadId, sessionStartOpts(runOpts));
+      createdThreadId = thread.id;
 
       // Reset the demo fixture so every run starts from the same broken
       // state (a previous run may have already fixed the file in place).
       writeFileSync(join(workspace, "utils.js"), BROKEN_UTILS_JS);
+      sessionAdapters.set(sessionId, sessionAdapter);
       sessionAdapters.set(thread.id, sessionAdapter);
 
       sessionAdapter.snapshotWorkspace(workspace);
@@ -1403,13 +1454,18 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         workspace,
         runOptions: Object.freeze({ ...runOpts }),
         activeTurnId: turn.id,
-        turnIds: [turn.id],
+        finishingTurn: true,
+        turnCount: 1,
         pendingApprovals: [],
       });
+      sessionAdapter.registerOnTurnEnd(
+        (status) => settleSessionTurn(sessionId, turn.id, status),
+        thread.id,
+      );
+      releaseReservation();
+      releaseReservation = undefined;
 
-      registerApprovalHandler(sessionId, (_itemId, _approved) => {
-        // handled by /decide
-      });
+      registerApprovalHandler(sessionId);
 
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
@@ -1424,7 +1480,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 
       sessionAdapter
         .collectTurnEvents(thread.id, turn.id, 30_000, traceCollector)
-        .then(() => {
+        .then((result) => {
           // S8: post-turn workspace scan for file changes omitted from events
           try {
             var scanResult = sessionAdapter.scanAndFireHooks(workspace);
@@ -1449,15 +1505,29 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             sessionId,
             replayResult.state as unknown as Record<string, unknown>,
           );
-          broadcastSessionEnded(sessionId);
-          const s = sessions.get(sessionId);
-          if (s) s.activeTurnId = null;
+          if (result.turnStatus !== "inProgress") broadcastSessionEnded(sessionId);
+          settleSessionTurn(sessionId, turn.id, result.turnStatus);
         })
         .catch((err) => {
           console.error(`[run-demo background] session ${sessionId} failed:`, err);
+        })
+        .finally(() => {
+          const session = sessions.get(sessionId);
+          if (session) session.finishingTurn = false;
         });
     } catch (err) {
-      res.writeHead(500, { "content-type": "application/json" });
+      releaseReservation?.();
+      if (!sessions.has(sessionId)) {
+        sessionAdapters.delete(sessionId);
+        if (createdThreadId) {
+          sessionAdapters.delete(createdThreadId);
+          createdAdapter?.releaseSession?.(createdThreadId);
+        }
+      }
+      res.writeHead(
+        err instanceof Error && err.message === "Workbench session capacity reached" ? 503 : 500,
+        { "content-type": "application/json" },
+      );
       res.end(
         JSON.stringify({
           error: String(err instanceof Error ? err.message : err),
@@ -1614,9 +1684,15 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         return;
       }
 
-      // If we can trace it, record the interrupt as an action
       if (sessionId) {
-        getSessionAdapter(threadId).registerOnTurnEnd((turnStatus) => {
+        const session = sessions.get(sessionId);
+        if (!session || session.threadId !== threadId || session.activeTurnId !== turnId) {
+          res.writeHead(400, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "session and active turn do not match" }));
+          return;
+        }
+        const ended = await interruptActiveTurn(sessionId, session);
+        if (ended) {
           traceStore.append(sessionId, {
             method: "action.interrupt",
             params: {
@@ -1624,19 +1700,13 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
               source: "glassbox-user",
               threadId,
               turnId,
-              turnStatus,
+              turnStatus: ended.status,
               ts: new Date().toISOString(),
             },
           });
-        });
-      }
-
-      await getSessionAdapter(threadId).interruptTurn(threadId, turnId);
-
-      // Clear active turn from session if known
-      if (sessionId) {
-        const s = sessions.get(sessionId);
-        if (s) s.activeTurnId = null;
+        }
+      } else {
+        await getSessionAdapter(threadId).interruptTurn(threadId, turnId);
       }
 
       res.writeHead(200, { "content-type": "application/json" });

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vite-plus/test";
 import type { ProviderAdapter, RunResult, SessionOpts, TurnOpts } from "../provider/types.js";
-import type { UserInput } from "../codex/types.js";
+import type { ApprovalEvent, UserInput } from "../codex/types.js";
 
 const boundary = vi.hoisted(() => ({ createAdapter: vi.fn() }));
 vi.mock("../provider/index.js", () => ({ createAdapter: boundary.createAdapter }));
@@ -15,7 +15,11 @@ class FakeAdapter implements ProviderAdapter {
   readonly instructions = new Map<string, string>();
   readonly interrupt = vi.fn();
   nextStatus: RunResult["turnStatus"] = "completed";
+  holdNextTurn = false;
+  finishOnInterrupt = true;
+  private pendingTurns = new Map<string, () => void>();
   private subscribers: Array<(status: string) => void> = [];
+  private approvalSubscribers: Array<(event: ApprovalEvent) => void> = [];
   start() {}
   stop() {}
   async initialize() {
@@ -46,6 +50,10 @@ class FakeAdapter implements ProviderAdapter {
   }
   async interruptTurn(sessionId: string, turnId: string) {
     this.interrupt(sessionId, turnId);
+    if (this.finishOnInterrupt) this.finishTurn(turnId);
+  }
+  finishTurn(turnId: string) {
+    this.pendingTurns.get(turnId)?.();
   }
   async collectTurnEvents(
     sessionId: string,
@@ -53,33 +61,48 @@ class FakeAdapter implements ProviderAdapter {
     _timeout: number,
     collect?: (method: string, params: Record<string, unknown>) => void,
   ): Promise<RunResult> {
-    const status = this.nextStatus;
-    this.nextStatus = "completed";
-    collect?.("turn/started", {
-      threadId: sessionId,
-      turn: { id: turnId },
-      startedAtMs: Date.now(),
-    });
-    collect?.("turn/completed", {
-      threadId: sessionId,
-      turn: { id: turnId, status, durationMs: 5 },
-    });
-    for (const subscriber of this.subscribers.splice(0)) subscriber(status);
-    return {
-      sessionId,
-      turnId,
-      turnStatus: status,
-      turnDurationMs: 5,
-      eventCounts: { "turn/completed": 1 },
-      approvals: [],
-      agentMessageDeltas: 0,
-      ...(status === "failed" ? { error: "fixture failure" } : {}),
+    const finish = (): RunResult => {
+      this.pendingTurns.delete(turnId);
+      const status = this.nextStatus;
+      this.nextStatus = "completed";
+      collect?.("turn/started", {
+        threadId: sessionId,
+        turn: { id: turnId },
+        startedAtMs: Date.now(),
+      });
+      collect?.("turn/completed", {
+        threadId: sessionId,
+        turn: { id: turnId, status, durationMs: 5 },
+      });
+      for (const subscriber of this.subscribers.splice(0)) subscriber(status);
+      return {
+        sessionId,
+        turnId,
+        turnStatus: status,
+        turnDurationMs: 5,
+        eventCounts: { "turn/completed": 1 },
+        approvals: [],
+        agentMessageDeltas: 0,
+        ...(status === "failed" ? { error: "fixture failure" } : {}),
+      };
     };
+    if (this.holdNextTurn) {
+      this.holdNextTurn = false;
+      return new Promise<RunResult>((resolve) => {
+        this.pendingTurns.set(turnId, () => resolve(finish()));
+      });
+    }
+    return finish();
   }
   registerOnTurnEnd(callback: (status: string) => void) {
     this.subscribers.push(callback);
   }
-  on() {}
+  on(_event: "approval", handler: (event: ApprovalEvent) => void) {
+    this.approvalSubscribers.push(handler);
+  }
+  emitApproval(event: ApprovalEvent) {
+    for (const subscriber of this.approvalSubscribers) subscriber(event);
+  }
   respondToApproval() {}
   findApprovalRequestId() {
     return null;
@@ -220,4 +243,98 @@ describe("Workbench continuation policy", () => {
     ).toMatchObject({ turnStatus: "completed" });
     expect(adapter.interrupt).not.toHaveBeenCalled();
   });
+
+  it("records stop only after the interrupted turn ends", async () => {
+    const adapter = adapters.get("codex")!;
+    adapter.holdNextTurn = true;
+    const created = await post("/run-stream", { provider: "codex", prompt: "wait" });
+    expect(await post("/stop", { sessionId: created.sessionId })).toMatchObject({ stopped: true });
+    expect(adapter.interrupt).toHaveBeenCalled();
+    const response = await fetch(baseUrl + `/trace/${created.sessionId as string}`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    const trace = (await response.json()) as { entries: Array<{ event: { method?: string } }> };
+    const methods = trace.entries.map((entry) => entry.event.method);
+    expect(methods.indexOf("turn/completed")).toBeLessThan(methods.indexOf("action.stop"));
+  });
+
+  it("does not start a second turn when interruption has not completed", async () => {
+    const adapter = adapters.get("codex")!;
+    adapter.holdNextTurn = true;
+    adapter.finishOnInterrupt = false;
+    const created = await post("/run-stream", { provider: "codex", prompt: "wait" });
+    const turnCount = adapter.turns.length;
+    const response = await fetch(baseUrl + "/send-task", {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ sessionId: created.sessionId, task: "must wait" }),
+    });
+    expect(response.status).toBe(500);
+    expect(await response.json()).toMatchObject({
+      error: "Previous turn has not ended; retry later",
+    });
+    expect(adapter.turns).toHaveLength(turnCount);
+    adapter.finishTurn(adapter.turns.at(-1)!.id);
+    expect(
+      await post("/send-task", { sessionId: created.sessionId, task: "now safe" }),
+    ).toMatchObject({ ok: true });
+    expect(adapter.turns).toHaveLength(turnCount + 1);
+    adapter.finishOnInterrupt = true;
+  }, 15_000);
+
+  it("routes approval to the active turn when two sessions share a thread ID", async () => {
+    const adapter = adapters.get("codex")!;
+    const threadId = `shared-${randomUUID()}`;
+    const older = await post("/run-stream", { provider: "codex", threadId, prompt: "old" });
+    adapter.holdNextTurn = true;
+    const newer = await post("/run-stream", { provider: "codex", threadId, prompt: "new" });
+    const turnId = adapter.turns.at(-1)!.id;
+    adapter.emitApproval({
+      type: "approval",
+      method: "item/requestApproval",
+      threadId,
+      turnId,
+      itemId: "shared-approval",
+      startedAtMs: Date.now(),
+      reason: null,
+      grantRoot: null,
+      action: "pending",
+    });
+    expect(
+      await post("/decide", {
+        sessionId: newer.sessionId,
+        itemId: "shared-approval",
+        approved: true,
+      }),
+    ).toMatchObject({ removedPending: 1 });
+    expect(
+      await post("/decide", {
+        sessionId: older.sessionId,
+        itemId: "shared-approval",
+        approved: true,
+      }),
+    ).toMatchObject({ removedPending: 0 });
+    adapter.finishTurn(turnId);
+  });
+
+  it("bounds completed Workbench sessions while keeping trace files readable", async () => {
+    const first = await post("/run-stream", { provider: "codex", prompt: "first" });
+    for (let index = 0; index < 130; index++) {
+      await post("/run-stream", { provider: "codex", prompt: `later ${index}` });
+    }
+    const health = await fetch(baseUrl + "/", {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect((await health.json()) as { sessionCount: number }).toMatchObject({ sessionCount: 128 });
+    const oldSession = await fetch(baseUrl + "/send-task", {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ sessionId: first.sessionId, task: "old" }),
+    });
+    expect(oldSession.status).toBe(404);
+    const trace = await fetch(baseUrl + `/trace/${first.sessionId as string}`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(trace.status).toBe(200);
+  }, 30_000);
 });
