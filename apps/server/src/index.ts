@@ -1821,6 +1821,7 @@ export function startServer(
           eval: true,
         },
       }),
+      requestShutdown: onSignal,
       doctor: () => ({
         checks: ["claude", "codex"].map((command) => {
           try {

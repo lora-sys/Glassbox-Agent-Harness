@@ -253,9 +253,129 @@ it("retains a Task and binding when dispatch fails without silently retrying the
       expect.arrayContaining([
         expect.objectContaining({
           type: "task.status_changed",
-          data: { status: "WAITING_INPUT", reason: "worker_dispatch_incomplete" },
+          data: expect.objectContaining({
+            status: "WAITING_INPUT",
+            reason: "worker_dispatch_incomplete",
+            failure: { phase: "prompt_agent", errorName: "Error" },
+          }),
         }),
       ]),
+    );
+    expect(JSON.stringify(trace)).not.toContain("PRIVATE_ERROR_PAYLOAD");
+  } finally {
+    await store.close();
+  }
+});
+
+it("fails an unbound dispatch and stops a worker launched before verification failed", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  const caller: CallerContext = {
+    principalId: "owner",
+    scope: {
+      connectionId: "test",
+      botId: "bot",
+      chatType: "private",
+      chatId: "owner",
+      senderId: "owner",
+    },
+  };
+  try {
+    await store.identities.bindOwner("owner", caller.scope);
+    await store.authorization.registerResource({
+      id: "agent-operations",
+      kind: "ops",
+      visibility: "public",
+    });
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: "agent-operations",
+      action: "task:delegate",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    const bridge = new FakeHerdrBridge();
+    vi.spyOn(bridge, "getSnapshot").mockRejectedValueOnce(new Error("PRIVATE_ERROR_PAYLOAD"));
+    const stop = vi.spyOn(bridge, "stopAgent");
+    const task = await new AuthorizedOpsService(store, bridge).delegate(caller, {
+      title: "Unbound dispatch",
+      workspaceId: "isolated",
+      agentKind: "pi",
+      prompt: "Bounded work",
+    });
+    expect(task.status).toBe("FAILED");
+    expect(await store.tasks.getWorkerBinding(task.activeAttemptId!)).toBeNull();
+    expect(stop).toHaveBeenCalledTimes(1);
+    const trace = await store.tasks.listTraceEvents({ taskId: task.id });
+    expect(trace).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "task.status_changed",
+          data: expect.objectContaining({
+            status: "FAILED",
+            reason: "worker_dispatch_unbound",
+            failure: { phase: "verify_worker", errorName: "Error" },
+          }),
+        }),
+      ]),
+    );
+    expect(JSON.stringify(trace)).not.toContain("PRIVATE_ERROR_PAYLOAD");
+  } finally {
+    await store.close();
+  }
+});
+
+it("persists cancellation when stopping the bound worker fails", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  const caller: CallerContext = {
+    principalId: "owner",
+    scope: {
+      connectionId: "test",
+      botId: "bot",
+      chatType: "private",
+      chatId: "owner",
+      senderId: "owner",
+    },
+  };
+  try {
+    await store.identities.bindOwner("owner", caller.scope);
+    await store.authorization.registerResource({
+      id: "agent-operations",
+      kind: "ops",
+      visibility: "public",
+    });
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: "agent-operations",
+      action: "task:delegate",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    const bridge = new FakeHerdrBridge();
+    const service = new AuthorizedOpsService(store, bridge);
+    const task = await service.delegate(caller, {
+      title: "Cancelable task",
+      workspaceId: "isolated",
+      agentKind: "pi",
+      prompt: "Bounded work",
+    });
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: `task-${task.id}`,
+      action: "task:cancel",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    vi.spyOn(bridge, "stopAgent").mockRejectedValueOnce(new Error("PRIVATE_ERROR_PAYLOAD"));
+    await expect(service.cancel(caller, task.id)).resolves.toBeUndefined();
+    expect((await store.tasks.getTask(task.id))?.status).toBe("CANCELED");
+    expect(await store.tasks.listAttentionItems()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ taskId: task.id, kind: "ops_connection_problem" }),
+      ]),
+    );
+    const trace = await store.tasks.listTraceEvents({ taskId: task.id });
+    expect(trace).toEqual(
+      expect.arrayContaining([expect.objectContaining({ type: "worker.cleanup_failed" })]),
     );
     expect(JSON.stringify(trace)).not.toContain("PRIVATE_ERROR_PAYLOAD");
   } finally {

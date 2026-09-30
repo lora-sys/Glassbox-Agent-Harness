@@ -15,6 +15,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { TRACE_PROVENANCE, type TraceEntry } from "./store.js";
 import { redactTraceEntry } from "./redact.js";
+import { securePrivatePath } from "../platform/private-path.js";
 
 export class TraceTruncatedError extends Error {
   constructor(
@@ -233,6 +234,7 @@ export function validateTraceEnvelope<T = unknown>(
 interface RunStreamState {
   byteOffset: number;
   eventCount: number;
+  secured?: boolean;
 }
 
 export class RunTraceStore {
@@ -245,6 +247,7 @@ export class RunTraceStore {
 
   private readonly appendLocks = new Map<string, Promise<void>>();
   private readonly runStates = new Map<string, RunStreamState>();
+  private runsDirectorySecured = false;
 
   constructor(options: string | RunTraceStoreOptions) {
     const dataDir = typeof options === "string" ? options : options.dataDirectory;
@@ -553,8 +556,29 @@ export class RunTraceStore {
     return this.withLock(runId, async () => {
       const filePath = this.getTracePath(runId);
       await this.verifyPathSafety(runId, filePath);
+      const runsDirectory = path.dirname(path.dirname(filePath));
+      const runDirectory = path.dirname(filePath);
+      await fs.mkdir(runDirectory, { recursive: true, mode: 0o700 });
+      await this.verifyPathSafety(runId, filePath);
+      const cachedState = this.runStates.get(runId);
+      let existingFileSecured = false;
+      if (!cachedState?.secured) {
+        if (!this.runsDirectorySecured) {
+          await securePrivatePath(runsDirectory, true);
+          this.runsDirectorySecured = true;
+        }
+        await securePrivatePath(runDirectory, true);
+        try {
+          await fs.lstat(filePath);
+          await securePrivatePath(filePath, false);
+          existingFileSecured = true;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+      }
 
       const state = await this.getOrInitState(runId, filePath);
+      if (existingFileSecured) state.secured = true;
 
       const nextSeq = state.eventCount + 1;
       const entry: TraceEntry = {
@@ -580,12 +604,13 @@ export class RunTraceStore {
         );
       }
 
-      await fs.mkdir(path.dirname(filePath), { recursive: true });
-      await this.verifyPathSafety(runId, filePath);
-
       let handle: fs.FileHandle | null = null;
       try {
-        handle = await fs.open(filePath, "a");
+        handle = await fs.open(filePath, "a", 0o600);
+        if (!state.secured) {
+          await securePrivatePath(filePath, false);
+          state.secured = true;
+        }
         await handle.writeFile(lineBuf);
         await handle.sync(); // Fsync to ensure data is physical on disk before DB cursor advances
       } catch (err: unknown) {

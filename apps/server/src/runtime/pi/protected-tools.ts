@@ -67,6 +67,8 @@ const TOOL_GATE_CODES: ReadonlySet<string> = new Set([
   // The named target does not exist, or is not in a state this action can change.
   "candidate_not_found",
   "candidate_not_pending",
+  "no_pending_conversation_candidates",
+  "too_many_pending_candidates",
   "memory_not_found",
   "memory_not_active",
   "memory_type_mismatch",

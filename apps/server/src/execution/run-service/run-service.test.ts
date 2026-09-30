@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
@@ -196,6 +197,176 @@ afterEach(async () => {
 });
 
 describe("durable Run scheduling", () => {
+  it("retries a transient claim failure and executes the queued Run once", async () => {
+    const { store } = await fixture();
+    const claim = store.lifecycle.claimQueuedRun.bind(store.lifecycle);
+    let attempts = 0;
+    vi.spyOn(store.lifecycle, "claimQueuedRun").mockImplementation(async (...args) => {
+      if (++attempts < 3) throw new Error("temporary database failure");
+      return claim(...args);
+    });
+    const execute = vi.fn(async () => ({ status: "succeeded" as const, text: "recovered" }));
+    const { instance } = service(store, { supportsGroup: true, execute });
+    await instance.start();
+    const accepted = await instance.receive(input("transient-claim"));
+    await expect(instance.waitForRun(owner(), accepted.run.id)).resolves.toMatchObject({
+      status: "succeeded",
+      resultText: "recovered",
+    });
+    expect(attempts).toBe(3);
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it("ends an exhausted queued Run and records Owner attention atomically", async () => {
+    const { store } = await fixture();
+    const claim = vi
+      .spyOn(store.lifecycle, "claimQueuedRun")
+      .mockRejectedValue(new Error("temporary database failure"));
+    const execute = vi.fn(async () => ({ status: "succeeded" as const, text: "unexpected" }));
+    const { instance } = service(store, { supportsGroup: true, execute });
+    await instance.start();
+    const accepted = await instance.receive(input("exhausted-claim"));
+    await expect(instance.waitForRun(owner(), accepted.run.id)).resolves.toMatchObject({
+      status: "failed",
+      resultText: expect.stringContaining("未能启动"),
+    });
+    expect(claim).toHaveBeenCalledTimes(4);
+    expect(execute).not.toHaveBeenCalled();
+    const attention = await store.db.transaction((tx) =>
+      tx.execute({
+        sql: "SELECT kind, principal_id, conversation_id FROM attention_items WHERE conversation_id = ?",
+        args: [accepted.conversation.id],
+      }),
+    );
+    expect(attention.rows).toEqual([
+      expect.objectContaining({
+        kind: "unanswered_message",
+        principal_id: null,
+        conversation_id: accepted.conversation.id,
+      }),
+    ]);
+  });
+
+  it("settles a claim whose database transition committed before its reply was lost", async () => {
+    const { store } = await fixture();
+    const claim = store.lifecycle.claimQueuedRun.bind(store.lifecycle);
+    vi.spyOn(store.lifecycle, "claimQueuedRun").mockImplementation(async (...args) => {
+      await claim(...args);
+      throw new Error("claim reply lost");
+    });
+    const execute = vi.fn(async () => ({ status: "succeeded" as const, text: "unexpected" }));
+    const { instance } = service(store, { supportsGroup: true, execute });
+    await instance.start();
+    const accepted = await instance.receive(input("lost-claim-reply"));
+    await expect(instance.waitForRun(owner(), accepted.run.id)).resolves.toMatchObject({
+      status: "failed",
+      resultText: expect.stringContaining("未能启动"),
+    });
+    expect(execute).not.toHaveBeenCalled();
+    const attention = await store.db.transaction((tx) =>
+      tx.execute({
+        sql: "SELECT id FROM attention_items WHERE conversation_id = ? AND kind = 'unanswered_message'",
+        args: [accepted.conversation.id],
+      }),
+    );
+    expect(attention.rows).toHaveLength(1);
+  });
+
+  it("keeps later Runs in one conversation behind a retrying head", async () => {
+    const { store } = await fixture();
+    const first = await store.conversations.acceptIncoming(input("retry-head"));
+    const second = await store.conversations.acceptIncoming(input("retry-following"));
+    const claim = store.lifecycle.claimQueuedRun.bind(store.lifecycle);
+    let attempts = 0;
+    vi.spyOn(store.lifecycle, "claimQueuedRun").mockImplementation(async (...args) => {
+      if (args[1] === first.run.id && ++attempts === 1)
+        throw new Error("temporary database failure");
+      return claim(...args);
+    });
+    const executed: string[] = [];
+    const { instance } = service(store, {
+      supportsGroup: true,
+      execute: async (run) => {
+        executed.push(run.run.id);
+        return { status: "succeeded", text: "done" };
+      },
+    });
+    await instance.start();
+    await expect(instance.waitForRun(owner(), second.run.id)).resolves.toMatchObject({
+      status: "succeeded",
+    });
+    expect(executed).toEqual([first.run.id, second.run.id]);
+  });
+
+  it("lets cancellation win while an unclaimed Run waits for database settlement", async () => {
+    const { store } = await fixture();
+    const claim = store.lifecycle.claimQueuedRun.bind(store.lifecycle);
+    vi.spyOn(store.lifecycle, "claimQueuedRun").mockImplementation(async (...args) => {
+      await claim(...args);
+      throw new Error("claim reply lost");
+    });
+    const settle = store.lifecycle.failQueuedDispatch.bind(store.lifecycle);
+    const firstSettlement = deferred<void>();
+    let settlementCalls = 0;
+    vi.spyOn(store.lifecycle, "failQueuedDispatch").mockImplementation(async (...args) => {
+      if (++settlementCalls === 1) {
+        firstSettlement.resolve();
+        throw new Error("temporary database failure");
+      }
+      return settle(...args);
+    });
+    const execute = vi.fn(async () => ({ status: "succeeded" as const, text: "unexpected" }));
+    const { instance } = service(store, { supportsGroup: true, execute });
+    await instance.start();
+    const accepted = await instance.receive(input("cancel-unclaimed"));
+    await firstSettlement.promise;
+    await expect(instance.cancel(owner(), accepted.run.id)).resolves.toMatchObject({
+      status: "cancelling",
+    });
+    await expect(instance.waitForRun(owner(), accepted.run.id)).resolves.toMatchObject({
+      status: "cancelled",
+    });
+    expect(execute).not.toHaveBeenCalled();
+    const attention = await store.db.transaction((tx) =>
+      tx.execute({
+        sql: "SELECT id FROM attention_items WHERE conversation_id = ? AND kind = 'unanswered_message'",
+        args: [accepted.conversation.id],
+      }),
+    );
+    expect(attention.rows).toHaveLength(0);
+  });
+
+  it("does not publish an unclaimed Run after the service has stopped", async () => {
+    const { store } = await fixture();
+    const claim = store.lifecycle.claimQueuedRun.bind(store.lifecycle);
+    vi.spyOn(store.lifecycle, "claimQueuedRun").mockImplementation(async (...args) => {
+      await claim(...args);
+      throw new Error("claim reply lost");
+    });
+    const settle = store.lifecycle.failQueuedDispatch.bind(store.lifecycle);
+    const entered = deferred<void>();
+    const release = deferred<void>();
+    vi.spyOn(store.lifecycle, "failQueuedDispatch").mockImplementation(async (...args) => {
+      entered.resolve();
+      await release.promise;
+      return settle(...args);
+    });
+    const send = vi.fn(async () => ({ status: "sent" as const }));
+    const { instance } = service(
+      store,
+      { supportsGroup: true, execute: async () => ({ status: "succeeded", text: "unexpected" }) },
+      { send },
+    );
+    await instance.start();
+    const accepted = await instance.receive(input("stop-during-settlement"));
+    await entered.promise;
+    await instance.stop();
+    release.resolve();
+    await instance.drain();
+    expect((await store.conversations.getRun(owner(), accepted.run.id)).status).toBe("failed");
+    expect(send).not.toHaveBeenCalled();
+  });
+
   it("captures learning only after Run authorization and records candidate identity without payload", async () => {
     const { store } = await fixture();
     const order: string[] = [];
@@ -298,6 +469,69 @@ describe("durable Run scheduling", () => {
     expect((await store.lifecycle.listDeliveries(owner(), accepted[0]!.run.id)).items).toEqual([
       expect.objectContaining({ payloadKind: "result", payloadText: "done", status: "sent" }),
     ]);
+  });
+
+  it("opens the trace with the causing message and keeps its body out of the event", async () => {
+    const { store } = await fixture();
+    const execute = vi.fn(async (): Promise<ExecutionResult> => ({
+      status: "succeeded",
+      text: "done",
+    }));
+    const { instance, events } = service(store, { supportsGroup: true, execute });
+    await instance.start();
+    const accepted = await instance.receive(input("msg-1", "protected body text"));
+    await instance.drain();
+
+    const first = events[0];
+    expect(first).toMatchObject({
+      type: "message_received",
+      runId: accepted.run.id,
+      conversationId: accepted.conversation.id,
+      externalId: "msg-1",
+      messageId: accepted.run.messageId,
+      connectionId: "test-connection",
+      botId: "test-bot",
+      chatType: "group",
+      chatId: "test-group",
+      senderId: "test-owner",
+      textBytes: Buffer.byteLength("protected body text", "utf8"),
+    });
+    // The digest must match the body it summarizes, and no event may carry the body itself.
+    expect(first).toMatchObject({
+      textSha256: createHash("sha256").update("protected body text", "utf8").digest("hex"),
+    });
+    for (const event of events) {
+      expect(JSON.stringify(event)).not.toContain("protected body text");
+    }
+    // Ordering: the causing message precedes run_queued and everything after it.
+    expect(events[1]).toMatchObject({ type: "run_queued" });
+
+    // A deduplicated message reuses its Run, so it must not re-record the message.
+    const before = events.length;
+    await instance.receive(input("msg-1", "protected body text"));
+    await instance.drain();
+    expect(events.filter((event) => event.type === "message_received")).toHaveLength(1);
+    expect(events.length).toBe(before);
+  });
+
+  it("records a private-chat message with its own scope", async () => {
+    const { store } = await fixture();
+    const execute = vi.fn(async (): Promise<ExecutionResult> => ({
+      status: "succeeded",
+      text: "done",
+    }));
+    const { instance, events } = service(store, { supportsGroup: true, execute });
+    await instance.start();
+    await instance.receive(input("dm-1", "hello", privateScope));
+    await instance.drain();
+    expect(events[0]).toMatchObject({
+      type: "message_received",
+      externalId: "dm-1",
+      chatType: "private",
+      chatId: "test-owner",
+    });
+    // Absent rather than undefined: the event omits optional scope fields the message did not carry.
+    expect(events[0]).not.toHaveProperty("threadId");
   });
 
   it("rechecks queued authorization and requires explicit refresh after a policy change", async () => {
