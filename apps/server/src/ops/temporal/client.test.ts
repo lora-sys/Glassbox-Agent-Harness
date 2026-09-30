@@ -66,10 +66,14 @@ it("probes Temporal with a fresh bounded RPC and reports failure without raw err
   } as unknown as Parameters<typeof probeTemporalServer>[0];
   const startedAt = Date.now();
   expect(await probeTemporalServer(connection)).toBe("reachable");
+  const firstProbeFinishedAt = Date.now();
   expect(await probeTemporalServer(connection)).toBe("reachable");
   expect(getSystemInfo).toHaveBeenCalledTimes(2);
-  expect(withDeadline.mock.calls[0]?.[0]).toBeGreaterThanOrEqual(startedAt);
-  expect(withDeadline.mock.calls[0]?.[0]).toBeLessThanOrEqual(startedAt + 2_000);
+  // The probe reads the clock inside the call, so its deadline is the timeout added to some
+  // moment between the two times recorded here. Bounding it by the earlier time alone assumed no
+  // clock tick could land in that gap, which a loaded runner breaks by a millisecond.
+  expect(withDeadline.mock.calls[0]?.[0]).toBeGreaterThanOrEqual(startedAt + 2_000);
+  expect(withDeadline.mock.calls[0]?.[0]).toBeLessThanOrEqual(firstProbeFinishedAt + 2_000);
 
   getSystemInfo.mockRejectedValueOnce(new Error("private Temporal address"));
   expect(await probeTemporalServer(connection)).toBe("unavailable");

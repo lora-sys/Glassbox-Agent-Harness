@@ -80,8 +80,9 @@ export class DomainDatabase {
           await tx.batch(schema);
           // V24 is a guarded function rather than a statement batch, so it is the one rung the
           // `schema` array cannot carry. Running it here is what keeps a fresh installation at
-          // the same shape an upgraded one reaches — `routing_parent_task_id` and the wider
-          // immutable-payload trigger included.
+          // the same shape an upgraded one reaches — the `task_child_links` notification policy,
+          // the `task_notifications` routing parent and the wider immutable-payload trigger
+          // included.
           await applySchemaV24Migration(tx);
           await tx.execute(`PRAGMA user_version = ${CURRENT_SCHEMA_VERSION}`);
         } else {
