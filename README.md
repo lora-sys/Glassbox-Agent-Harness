@@ -19,17 +19,21 @@ Glassbox 是一个 Personal Agent 系统：显式身份、严格授权、持久�
 
 ## 已经能跑的能力
 
-以下能力已合入 main，有确定性测试和真实验收覆盖：
+以下能力已合入 main，核心路径有确定性测试；真实环境验收按场景分别记录，不能据此推断所有端到端路径均已验收：
 
 - **QQ 私聊与群聊接入**。NapCat / OneBot 通道，支持群管理员的原生授权。
 - **四道服务端检查点**。Ingress、Context、Tool / Ops、Delivery 依次把关；投递路径由 `conversation/lifecycle.ts` 的 `claimDelivery`、来源资源复检及 `delivery/content-policy.ts` 执行。`delivery/gate.ts` 的 `checkDelivery` 目前只供参考测试，不在生产投递路径上。授权决策有 ALLOW、DENY、REQUIRES_APPROVAL 三种结果，没有显式 Grant 一律 DENY。
 - **Task 生命周期闭环**。派发给 Herdr coding worker 时分配独立隔离分支和独立 worktree，worker 完成后必须经过人工 Review，Accept 才算 DONE，Rework 则开新的 TaskAttempt。
 - **Taste / Memory 持久学习**。受治理的学习真相落库，不是写在 prompt 里的口头记忆。
-- **授权检索**。QQ 历史消息搜索，引用必须来自官方来源。
+- **授权检索**。QQ 历史消息搜索；对明确要求“只回复”指定字段且包含一个拉丁精确词的特定请求，输出由实际工具结果投影。一般回答依赖模型与内容策略约束，不能保证每条引用都来自官方来源。
 - **上下文预算与运行时路由**。按任务和 Audience 控制注入的上下文与技能面。
 - **双 Owner 协同**。主 Owner 与协同 Owner 身份对等，私聊会话在数据库中物理隔离，派发的编码任务互不踩踏。
 
 Web 管理端和 P6 长任务还在开发中，见[当前开发状态](#当前开发状态)。
+
+真实 QQ 驱动的 Task 派发、Review / Rework / Accept 与最终投递仍待验收；现有确定性闭环测试和直接调用 Ops 服务的验收不能替代这条真实流程。
+
+生产启用 browser Tool 时必须使用 [Kit 沙箱浏览器及逐连接钉址代理](./docs/owner-pi-sandbox.md#deployment)，不得注入自定义 `browserExecutor` 绕过它。
 
 ## 系统架构
 
