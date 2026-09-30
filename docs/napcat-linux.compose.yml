@@ -1,0 +1,13 @@
+services:
+  napcat:
+    image: mlikiowa/napcat-docker@sha256:41b1a8e10953065f4796ab19c0c8760cd3175376be976c5480710d29a77357ee
+    restart: unless-stopped
+    environment:
+      NAPCAT_UID: ${NAPCAT_UID:?Set the Linux user ID}
+      NAPCAT_GID: ${NAPCAT_GID:?Set the Linux group ID}
+    ports:
+      - "127.0.0.1:6700:6700"
+      - "127.0.0.1:6099:6099"
+    volumes:
+      - ${NAPCAT_DATA_DIR:?Set the protected Linux NapCat data directory}/config:/app/napcat/config
+      - ${NAPCAT_DATA_DIR:?Set the protected Linux NapCat data directory}/ntqq:/app/.config/QQ
