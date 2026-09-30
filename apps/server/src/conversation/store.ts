@@ -811,7 +811,7 @@ export class ConversationStore {
         });
         const conversation = conversationRecord(conversations.rows[0]!, caller.scope);
         const earlier = await tx.execute({
-          sql: "SELECT runs.id, runs.principal_id, runs.sequence, runs.message_id, runs.status, runs.scope_json FROM runs WHERE runs.conversation_id = ? AND runs.sequence < ? AND runs.status IN ('succeeded', 'failed') AND runs.result_text IS NOT NULL AND (runs.status = 'succeeded' OR EXISTS (SELECT 1 FROM deliveries d WHERE d.run_id = runs.id AND d.status = 'sent' AND d.payload_kind IN ('text', 'result'))) AND NOT EXISTS (SELECT 1 FROM ops_trace_events e WHERE e.run_id = runs.id AND e.type = 'context.excluded') ORDER BY runs.sequence DESC LIMIT 257",
+          sql: "SELECT runs.id, runs.principal_id, runs.sequence, runs.status, runs.scope_json, runs.result_text, (SELECT text FROM messages WHERE id = runs.message_id) AS input_text FROM runs WHERE runs.conversation_id = ? AND runs.sequence < ? AND runs.status IN ('succeeded', 'failed') AND runs.result_text IS NOT NULL AND (runs.status = 'succeeded' OR EXISTS (SELECT 1 FROM deliveries d WHERE d.run_id = runs.id AND d.status = 'sent' AND d.payload_kind IN ('text', 'result'))) AND NOT EXISTS (SELECT 1 FROM ops_trace_events e WHERE e.run_id = runs.id AND e.type = 'context.excluded') ORDER BY runs.sequence DESC LIMIT 257",
           args: [run.conversationId, row.sequence!],
         });
         // The QQ number each turn came from. It is already persisted on the Run as its scope, so
@@ -836,32 +836,56 @@ export class ConversationStore {
         const omittedRunIds: string[] = [];
         let loadedChars = 0;
         let historyScanTruncated = earlier.rows.length > 256;
-        for (const prior of earlier.rows.slice(0, 256)) {
+        const priorRows = earlier.rows.slice(0, 256);
+        const priorIds = priorRows.map((prior) => stringColumn(prior, "id"));
+        const grantByRun = new Map<string, Row[]>();
+        const sourcesByRun = new Map<string, Row[]>();
+        const deliveriesByRun = new Map<string, Row[]>();
+        if (priorIds.length) {
+          const placeholders = priorIds.map(() => "?").join(",");
+          const grants = await tx.execute({
+            sql: `SELECT d.run_id, d.grant_id, g.revoked_at FROM authorization_decisions_all d JOIN grants g ON g.id = d.grant_id WHERE d.run_id IN (${placeholders}) AND d.decision = 'ALLOW'`,
+            args: priorIds,
+          });
+          const sources = await tx.execute({
+            sql: `SELECT DISTINCT run_id, resource_id, action, delivery_source FROM authorization_decisions_all WHERE run_id IN (${placeholders}) AND decision = 'ALLOW' AND delivery_source IS NOT NULL`,
+            args: priorIds,
+          });
+          const deliveries = await tx.execute({
+            sql: `SELECT run_id, payload_text, destination_scope_key FROM deliveries WHERE run_id IN (${placeholders}) AND status = 'sent' AND payload_kind IN ('text', 'result') ORDER BY run_id, created_at DESC`,
+            args: priorIds,
+          });
+          for (const row of grants.rows) {
+            const id = stringColumn(row, "run_id");
+            grantByRun.set(id, [...(grantByRun.get(id) ?? []), row]);
+          }
+          for (const row of sources.rows) {
+            const id = stringColumn(row, "run_id");
+            sourcesByRun.set(id, [...(sourcesByRun.get(id) ?? []), row]);
+          }
+          for (const row of deliveries.rows) {
+            const id = stringColumn(row, "run_id");
+            deliveriesByRun.set(id, [...(deliveriesByRun.get(id) ?? []), row]);
+          }
+        }
+        for (const prior of priorRows) {
           const priorPrincipalId = stringColumn(prior, "principal_id");
           const priorRunId = stringColumn(prior, "id");
-          const priorMessageId = stringColumn(prior, "message_id");
           let user: string;
           let assistant: string;
 
-          const grantRows = await tx.execute({
-            sql: "SELECT d.grant_id, g.revoked_at FROM authorization_decisions d JOIN grants g ON g.id = d.grant_id WHERE d.run_id = ? AND d.decision = 'ALLOW'",
-            args: [priorRunId],
-          });
-          if (grantRows.rows.length === 0 || grantRows.rows.some((r) => r.revoked_at !== null)) {
+          const grantRows = grantByRun.get(priorRunId) ?? [];
+          if (grantRows.length === 0 || grantRows.some((r) => r.revoked_at !== null)) {
             continue;
           }
 
-          const sources = await tx.execute({
-            sql: `SELECT DISTINCT resource_id, action, delivery_source FROM authorization_decisions WHERE run_id = ?
-              AND decision = 'ALLOW' AND delivery_source IS NOT NULL`,
-            args: [priorRunId],
-          });
+          const sources = sourcesByRun.get(priorRunId) ?? [];
           let permitted = true;
           const currentSourceDecisions: Array<{
             id: string;
             source: "content_source" | "access_gate";
           }> = [];
-          for (const source of sources.rows) {
+          for (const source of sources) {
             const decision = await evaluate(tx, {
               caller,
               resourceId: stringColumn(source, "resource_id"),
@@ -884,11 +908,7 @@ export class ConversationStore {
           }
           if (!permitted) continue;
 
-          const deliveryRows = await tx.execute({
-            sql: "SELECT payload_text, destination_scope_key FROM deliveries WHERE run_id = ? AND status = 'sent' AND payload_kind IN ('text', 'result') ORDER BY created_at DESC",
-            args: [priorRunId],
-          });
-          const matchingDelivery = deliveryRows.rows.find((dRow) =>
+          const matchingDelivery = (deliveriesByRun.get(priorRunId) ?? []).find((dRow) =>
             matchesDestinationLocation(
               stringColumn(dRow, "destination_scope_key"),
               callerLocationKey,
@@ -897,21 +917,12 @@ export class ConversationStore {
           if (stringColumn(prior, "status") === "failed" && !matchingDelivery) continue;
           if (matchingDelivery) assistant = stringColumn(matchingDelivery, "payload_text");
           else if (priorPrincipalId === caller.principalId) {
-            const resultRows = await tx.execute({
-              sql: "SELECT result_text FROM runs WHERE id = ?",
-              args: [priorRunId],
-            });
-            if (!resultRows.rows[0]) continue;
-            const result = resultRows.rows[0].result_text;
+            const result = prior.result_text;
             if (typeof result !== "string" || !result) continue;
             assistant = result;
           } else continue;
-          const msgRows = await tx.execute({
-            sql: "SELECT text FROM messages WHERE id = ?",
-            args: [priorMessageId],
-          });
-          if (!msgRows.rows[0]) continue;
-          user = stringColumn(msgRows.rows[0], "text");
+          if (typeof prior.input_text !== "string") continue;
+          user = stringColumn(prior, "input_text");
 
           if (loadedChars + user.length + assistant.length > 1_000_000) {
             omittedRunIds.push(priorRunId);

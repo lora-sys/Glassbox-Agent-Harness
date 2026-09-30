@@ -262,7 +262,7 @@ export class EvidenceStore {
         });
         if (decision.decision !== "ALLOW") return { denied: decision };
         const rows = await tx.execute({
-          sql: "SELECT * FROM authorization_decisions WHERE principal_id = ? AND scope_key = ? AND (created_at, id) > (?, ?) ORDER BY created_at, id LIMIT ?",
+          sql: "SELECT * FROM authorization_decisions_all WHERE principal_id = ? AND scope_key = ? AND (created_at, id) > (?, ?) ORDER BY created_at, id LIMIT ?",
           args: [
             caller.principalId,
             scopeKey(caller.scope),

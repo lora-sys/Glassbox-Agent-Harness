@@ -17,6 +17,7 @@ import {
   schemaV12Migration,
   schemaV13Migration,
   applySchemaV14Migration,
+  applySchemaV15Migration,
   CURRENT_SCHEMA_VERSION,
 } from "./schema.js";
 
@@ -88,6 +89,7 @@ export class DomainDatabase {
           if (version < 12) await tx.batch(schemaV12Migration);
           if (version < 13) await tx.batch(schemaV13Migration);
           if (version < 14) await applySchemaV14Migration(tx);
+          if (version < 15) await applySchemaV15Migration(tx);
           await tx.execute(`PRAGMA user_version = ${CURRENT_SCHEMA_VERSION}`);
         }
       });

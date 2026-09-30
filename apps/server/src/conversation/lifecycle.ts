@@ -145,7 +145,7 @@ export class LifecycleStore {
     // Discovery checks remain unmarked, so they cannot become delivery dependencies.
     const decisions = await tx.execute({
       sql: `SELECT DISTINCT d.resource_id, d.action, d.delivery_source, r.kind AS resource_kind
-        FROM authorization_decisions d LEFT JOIN resources r ON r.id = d.resource_id
+        FROM authorization_decisions_all d LEFT JOIN resources r ON r.id = d.resource_id
         WHERE d.run_id = ? AND d.principal_id = ? AND d.decision = 'ALLOW'
           AND d.delivery_source IS NOT NULL`,
       args: [runId, caller.principalId],

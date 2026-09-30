@@ -77,6 +77,7 @@ it("marks legacy protected reads during the v14 upgrade and leaves public web de
         args: [id, resourceId, action],
       });
     }
+    await legacy.execute("DROP VIEW authorization_decisions_all");
     await legacy.execute("ALTER TABLE authorization_decisions DROP COLUMN delivery_source");
     // Rewind to 13, the version immediately before this migration, rather than to 10: a real v13
     // database has already run v11's deliveries rebuild and v12's attachments table, and rewinding
