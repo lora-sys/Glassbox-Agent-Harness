@@ -8,6 +8,8 @@ import { isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { getServiceDataDir } from "../apps/server/src/platform/paths.js";
+import { securePrivatePath } from "../apps/server/src/platform/private-path.js";
+import { persistedEnvironment, serviceEnvironmentKeys } from "./service-environment.mjs";
 
 const execFile = promisify(execFileCallback);
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -16,27 +18,6 @@ const statePath = join(dataDirectory, "service-processes.json");
 const priorStatePath = `${statePath}.previous`;
 const configPath = join(dataDirectory, "service-launch.json");
 const logPath = join(dataDirectory, "service.log");
-const serviceEnvironmentKeys = new Set([
-  "PORT",
-  "LORA_PI_KIT_PATH",
-  "GLASSBOX_SANDBOX_IMAGE",
-  "GLASSBOX_SANDBOX_DNS_MODE",
-  "GLASSBOX_RUNTIME_DIR",
-  "PI_CODING_AGENT_DIR",
-  "GLASSBOX_REPO_ROOT",
-  "GLASSBOX_WORKSPACE_CODEX",
-  "GLASSBOX_WORKSPACE_CLAUDE",
-  "GLASSBOX_WORKSPACE_DEMO",
-  "AGNES_API_KEY",
-  "NAPCAT_DISABLE_MULTI_PROCESS",
-  "NAPCAT_INJECT_PATH",
-  "NAPCAT_WORKDIR",
-  "NAPCAT_LOAD_PATH",
-  "NAPCAT_MAIN_PATH",
-  "NAPCAT_PATCH_PACKAGE",
-  "NAPCAT_LAUNCHER_PATH",
-  "NAPCAT_QUICK_ACCOUNT",
-]);
 
 type ProcessName = "herdr" | "napcat" | "glassbox";
 
@@ -220,6 +201,16 @@ function stateEntry(value: unknown): ProcessState {
 
 async function loadState(): Promise<ProcessState[]> {
   try {
+    await securePrivatePath(dataDirectory, true);
+    for (const path of [statePath, priorStatePath]) {
+      try {
+        await stat(path);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        continue;
+      }
+      await securePrivatePath(path, false);
+    }
     let source: string;
     try {
       source = await readFile(statePath, "utf8");
@@ -243,15 +234,18 @@ async function writeState(state: ProcessState[]): Promise<void> {
     ...entry,
     ...(env
       ? {
-          env: Object.fromEntries(Object.entries(env).filter(([key]) => key !== "AGNES_API_KEY")),
+          env: persistedEnvironment(env),
         }
       : {}),
   }));
-  await writeFile(
-    temporary,
-    JSON.stringify(persisted, null, 2),
-    process.platform === "win32" ? undefined : { mode: 0o600 },
-  );
+  await securePrivatePath(dataDirectory, true);
+  await writeFile(temporary, JSON.stringify(persisted, null, 2), { mode: 0o600 });
+  try {
+    await securePrivatePath(temporary, false);
+  } catch (error) {
+    await rm(temporary, { force: true });
+    throw error;
+  }
   try {
     await rename(temporary, statePath);
   } catch (error) {

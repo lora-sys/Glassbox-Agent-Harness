@@ -69,9 +69,7 @@ it.each(
         if (process.env.GLASSBOX_TEST_KIT_PATH)
           expect(context.systemPrompt).toContain("Selected Skill: unslop");
         expect(context.systemPrompt).toContain(
-          process.env.GLASSBOX_TEST_KIT_PATH
-            ? "You are Lora's Personal Agent."
-            : "You are the durable Glassbox Personal Agent.",
+          "You operate inside Lora's environment. Your name, your role, and the rules",
         );
         const stream = createAssistantMessageEventStream();
         const message: AssistantMessage = {
