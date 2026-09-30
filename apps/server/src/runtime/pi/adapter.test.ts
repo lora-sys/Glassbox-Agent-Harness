@@ -314,6 +314,7 @@ describe("PiSdkRuntimeAdapter", () => {
     let skillPolicy: unknown;
     let safeToolCall: unknown;
     let safeToolResult: unknown;
+    let recordedTurnEnd: unknown;
     let listener: ((event: AgentSessionEvent) => void) | undefined;
     const fakeSession = {
       sessionId: "pi-session-1",
@@ -362,7 +363,17 @@ describe("PiSdkRuntimeAdapter", () => {
           },
           isError: true,
         } as never);
-        listener?.({ type: "turn_end", message: {} as never, toolResults: [] });
+        listener?.({
+          type: "turn_end",
+          message: {
+            role: "assistant",
+            provider: "openai",
+            model: "test-model",
+            stopReason: "stop",
+            usage: { input: 12, output: 4, cacheRead: 0, cacheWrite: 0, totalTokens: 16 },
+          } as never,
+          toolResults: [] as never,
+        });
         listener?.({ type: "agent_end", messages: [], willRetry: false });
       },
       async abort() {},
@@ -387,6 +398,7 @@ describe("PiSdkRuntimeAdapter", () => {
         }
         if (event.type === "tool_call") safeToolCall = event.data;
         if (event.type === "tool_result") safeToolResult = event.data;
+        if (event.type === "turn_end") recordedTurnEnd = event.data;
       },
       createSession: async ({ profile, agentDir }) => {
         expect(profile.name).toBe("test");
@@ -435,12 +447,30 @@ describe("PiSdkRuntimeAdapter", () => {
         enabled: true,
       },
     });
+    // The return value is recorded as digest, byte count and a bounded head — enough to
+    // debug an unexpected result without the trace holding the whole payload.
+    expect(safeToolResult).toMatchObject({
+      name: "owner_group_admin",
+      isError: true,
+      failureCode: "mutation_already_attempted",
+      outputSha256: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      outputHead: expect.stringContaining("Schema validation failed"),
+      outputTruncated: false,
+    });
     expect(JSON.stringify(safeToolCall)).not.toContain("must-not-enter-trace");
     expect(safeToolResult).toMatchObject({
       name: "owner_group_admin",
       isError: true,
       failureCode: "mutation_already_attempted",
     });
+    // A turn ends for a reason: a Trace reader must be able to tell a clean stop from a
+    // truncated or aborted one, which is otherwise invisible once the run is over.
+    expect(recordedTurnEnd).toMatchObject({
+      toolResultCount: 0,
+      provider: "openai",
+      stopReason: "stop",
+    });
+    expect(recordedTurnEnd).toHaveProperty("usage.totalTokens");
     expect(events).toEqual([
       "session_start",
       "turn_start",
@@ -451,6 +481,147 @@ describe("PiSdkRuntimeAdapter", () => {
       "session_end",
     ]);
     await adapter.cleanup();
+  });
+
+  it("records bounded arguments for ordinary Tools and withholds body-bearing ones", async () => {
+    const runtimeBaseDir = await mkdtemp(join(tmpdir(), "glassbox-pi-runtime-"));
+    directories.push(runtimeBaseDir);
+    const calls: Array<Record<string, unknown>> = [];
+    const results: Array<Record<string, unknown>> = [];
+    const allEvents: string[] = [];
+    let listener: ((event: AgentSessionEvent) => void) | undefined;
+    const fakeSession = {
+      sessionId: "pi-session-bounded",
+      messages: [
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "done" }],
+          stopReason: "stop",
+        },
+      ],
+      subscribe(callback: (event: AgentSessionEvent) => void) {
+        listener = callback;
+        return () => {
+          listener = undefined;
+        };
+      },
+      async prompt() {
+        listener?.({ type: "agent_start" });
+        listener?.({ type: "turn_start" });
+        // Ordinary Tool: primitive arguments are recorded, free-form text keys are not.
+        listener?.({
+          type: "tool_execution_start",
+          toolCallId: "cap-1",
+          toolName: "qq_capability_search",
+          args: { category: "group.settings", limit: 20, query: "how do I mute a member" },
+        } as never);
+        listener?.({
+          type: "tool_execution_end",
+          toolCallId: "cap-1",
+          toolName: "qq_capability_search",
+          result: { matches: [{ category: "group.settings" }] },
+          isError: false,
+        } as never);
+        // Body-bearing Tool: neither the argument nor the head is recorded.
+        listener?.({
+          type: "tool_execution_start",
+          toolCallId: "hist-1",
+          toolName: "group_history_search",
+          args: { query: "secret meeting tomorrow at nine", limit: 5 },
+        } as never);
+        listener?.({
+          type: "tool_execution_end",
+          toolCallId: "hist-1",
+          toolName: "group_history_search",
+          result: { hits: [{ text: "secret meeting tomorrow at nine" }] },
+          isError: false,
+        } as never);
+        listener?.({ type: "turn_end", message: {} as never, toolResults: [] });
+        listener?.({ type: "agent_end", messages: [], willRetry: false });
+      },
+      async abort() {},
+      dispose() {},
+    };
+
+    const adapter = new PiSdkRuntimeAdapter({
+      kitPath: fileURLToPath(new URL("./fixtures/lora-pi-kit", import.meta.url)),
+      runtimeBaseDir,
+      resolveToolNames: async () => ["qq_capability_search", "group_history_search"],
+      resolveSkillNames: async () => ({
+        names: [],
+        policy: { source: "group-profile", configVersion: 3 },
+      }),
+      onEvent: (event) => {
+        allEvents.push(event.type);
+        if (event.type === "tool_call") calls.push(event.data);
+        if (event.type === "tool_result") results.push(event.data);
+      },
+      createSession: async ({ profile, agentDir }) => {
+        expect(profile.name).toBe("test");
+        expect(profile.enabledSkills).toEqual([]);
+        expect(profile.enabledMcpServers).toEqual([]);
+        expect(agentDir.startsWith(runtimeBaseDir)).toBe(true);
+        return fakeSession as never;
+      },
+    });
+
+    await adapter.initialize();
+    const context: PiRunContext = {
+      runId: run.id,
+      conversationId: conversation.id,
+      caller: {
+        principalId: "owner",
+        scope: {
+          connectionId: "qq",
+          botId: "bot",
+          chatType: "private" as const,
+          chatId: "owner",
+          senderId: "owner",
+        },
+      },
+    };
+    const binding = await adapter.createOrRestoreSession(conversation, "test", context);
+    const result = await adapter.run(binding, run, "search something", context);
+    expect(result).toMatchObject({ status: "completed", text: "done" });
+
+    expect(allEvents).toEqual([
+      "session_start",
+      "turn_start",
+      "tool_call",
+      "tool_result",
+      "tool_call",
+      "tool_result",
+      "turn_end",
+      "session_end",
+    ]);
+    expect(calls).toEqual([
+      // The `query` key is withheld; the enumerable arguments still identify the call.
+      expect.objectContaining({
+        name: "qq_capability_search",
+        input: { category: "group.settings", limit: 20 },
+      }),
+      // A body-bearing Tool records the call itself but not what it asked for.
+      expect.objectContaining({ name: "group_history_search" }),
+    ]);
+    expect(calls[1]).not.toHaveProperty("input");
+
+    expect(results[0]).toMatchObject({
+      name: "qq_capability_search",
+      isError: false,
+      outputHead: expect.stringContaining("group.settings"),
+      outputTruncated: expect.any(Boolean),
+    });
+    expect(results[0]).not.toHaveProperty("failureCode");
+    expect(results[1]).toMatchObject({
+      name: "group_history_search",
+      isError: false,
+      outputSha256: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      outputBytes: expect.any(Number),
+    });
+    // The withheld body must not appear anywhere in the recorded evidence.
+    for (const recorded of [...calls, ...results]) {
+      expect(JSON.stringify(recorded)).not.toContain("secret meeting tomorrow at nine");
+    }
   });
 
   it("records the classified Tool surface as Run evidence so a Run can explain its own Tools", async () => {
