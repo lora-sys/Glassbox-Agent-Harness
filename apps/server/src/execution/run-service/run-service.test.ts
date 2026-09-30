@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
@@ -468,6 +469,69 @@ describe("durable Run scheduling", () => {
     expect((await store.lifecycle.listDeliveries(owner(), accepted[0]!.run.id)).items).toEqual([
       expect.objectContaining({ payloadKind: "result", payloadText: "done", status: "sent" }),
     ]);
+  });
+
+  it("opens the trace with the causing message and keeps its body out of the event", async () => {
+    const { store } = await fixture();
+    const execute = vi.fn(async (): Promise<ExecutionResult> => ({
+      status: "succeeded",
+      text: "done",
+    }));
+    const { instance, events } = service(store, { supportsGroup: true, execute });
+    await instance.start();
+    const accepted = await instance.receive(input("msg-1", "protected body text"));
+    await instance.drain();
+
+    const first = events[0];
+    expect(first).toMatchObject({
+      type: "message_received",
+      runId: accepted.run.id,
+      conversationId: accepted.conversation.id,
+      externalId: "msg-1",
+      messageId: accepted.run.messageId,
+      connectionId: "test-connection",
+      botId: "test-bot",
+      chatType: "group",
+      chatId: "test-group",
+      senderId: "test-owner",
+      textBytes: Buffer.byteLength("protected body text", "utf8"),
+    });
+    // The digest must match the body it summarizes, and no event may carry the body itself.
+    expect(first).toMatchObject({
+      textSha256: createHash("sha256").update("protected body text", "utf8").digest("hex"),
+    });
+    for (const event of events) {
+      expect(JSON.stringify(event)).not.toContain("protected body text");
+    }
+    // Ordering: the causing message precedes run_queued and everything after it.
+    expect(events[1]).toMatchObject({ type: "run_queued" });
+
+    // A deduplicated message reuses its Run, so it must not re-record the message.
+    const before = events.length;
+    await instance.receive(input("msg-1", "protected body text"));
+    await instance.drain();
+    expect(events.filter((event) => event.type === "message_received")).toHaveLength(1);
+    expect(events.length).toBe(before);
+  });
+
+  it("records a private-chat message with its own scope", async () => {
+    const { store } = await fixture();
+    const execute = vi.fn(async (): Promise<ExecutionResult> => ({
+      status: "succeeded",
+      text: "done",
+    }));
+    const { instance, events } = service(store, { supportsGroup: true, execute });
+    await instance.start();
+    await instance.receive(input("dm-1", "hello", privateScope));
+    await instance.drain();
+    expect(events[0]).toMatchObject({
+      type: "message_received",
+      externalId: "dm-1",
+      chatType: "private",
+      chatId: "test-owner",
+    });
+    // Absent rather than undefined: the event omits optional scope fields the message did not carry.
+    expect(events[0]).not.toHaveProperty("threadId");
   });
 
   it("rechecks queued authorization and requires explicit refresh after a policy change", async () => {
