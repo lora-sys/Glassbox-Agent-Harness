@@ -120,13 +120,23 @@ export function getManagementToken(): string | null {
   }
 }
 
-export function setManagementToken(token: string | null, persist = false): void {
-  if (typeof window === 'undefined') return;
+export function isManagementTokenPersistent(token: string | null): boolean {
+  if (typeof window === 'undefined' || !isValidManagementToken(token)) return false;
+  try {
+    return localStorage.getItem(TOKEN_STORAGE_KEY) === token;
+  } catch {
+    return false;
+  }
+}
+
+export function setManagementToken(token: string | null, persist = false): boolean {
+  if (typeof window === 'undefined') return false;
   try {
     if (token && isValidManagementToken(token)) {
       sessionStorage.setItem(TOKEN_STORAGE_KEY, token);
       if (persist) {
         localStorage.setItem(TOKEN_STORAGE_KEY, token);
+        if (localStorage.getItem(TOKEN_STORAGE_KEY) !== token) throw new Error('Persistent token write failed');
       } else {
         localStorage.removeItem(TOKEN_STORAGE_KEY);
       }
@@ -134,8 +144,11 @@ export function setManagementToken(token: string | null, persist = false): void 
       sessionStorage.removeItem(TOKEN_STORAGE_KEY);
       localStorage.removeItem(TOKEN_STORAGE_KEY);
     }
+    return true;
   } catch {
-    // Ignore storage quota or access errors
+    try { sessionStorage.removeItem(TOKEN_STORAGE_KEY); } catch { /* Storage may be unavailable. */ }
+    try { localStorage.removeItem(TOKEN_STORAGE_KEY); } catch { /* Storage may be unavailable. */ }
+    return false;
   }
 }
 
