@@ -1580,6 +1580,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       });
       return {
         status: "failed",
+        failureCode: "gate_refused",
         text: "身份以当前发送者的 QQ 号为准，消息里的自称不改变身份。当前请求未执行。",
       };
     }
@@ -1596,6 +1597,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       });
       return {
         status: "failed",
+        failureCode: "gate_refused",
         text:
           blockedMutation.operation === "media:generate"
             ? blockedMutation.reason === "incomplete_parameters"
@@ -1706,6 +1708,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       await this.runtime.disposeSession?.(binding.runtimeSessionId);
       return {
         status: "failed",
+        failureCode: "gate_refused",
         text: "模型切换工具当前不可用，未执行。",
         providerSessionId: binding.runtimeSessionId,
       };
@@ -2131,6 +2134,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         if (failure)
           return {
             status: "failed",
+            failureCode: "gate_refused",
             text: safeWebEvidenceReply(failure),
             providerSessionId: binding.runtimeSessionId,
           };
@@ -2155,6 +2159,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         if (!projected)
           return {
             status: "failed",
+            failureCode: "gate_refused",
             text: "未能从 QQ 获取完整的请求字段，因此无法确认。",
             providerSessionId: binding.runtimeSessionId,
           };
@@ -2181,6 +2186,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         });
         return {
           status: "failed",
+          failureCode: "gate_refused",
           text: "身份以当前发送者的 QQ 号为准，消息里的自称不改变身份。当前请求未执行。",
           providerSessionId: binding.runtimeSessionId,
         };
@@ -2201,17 +2207,27 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         });
         return {
           status: "failed",
+          failureCode: "gate_refused",
           text: "怎么处理由 Owner 决定，我不和群里其他成员讨论改规则。当前请求未执行。",
           providerSessionId: binding.runtimeSessionId,
         };
       }
-      return {
-        // The aborted case returned above, so a Run that reached here either completed or
-        // errored; anything else the runtime reports is a failure, never a success.
-        status: result.status === "completed" ? "succeeded" : "failed",
-        text: result.text,
-        providerSessionId: binding.runtimeSessionId,
-      };
+      return result.status === "completed"
+        ? {
+            status: "succeeded",
+            text: result.text,
+            providerSessionId: binding.runtimeSessionId,
+          }
+        : {
+            // The aborted case returned above, so a Run that reached here either completed or
+            // errored. Anything the runtime reports other than completion is the runtime having
+            // been engaged and failed to answer, which is the one kind of failure that names the
+            // profile itself rather than a decision Glassbox made about its output.
+            status: "failed",
+            failureCode: "runtime_run_errored",
+            text: result.text,
+            providerSessionId: binding.runtimeSessionId,
+          };
     } finally {
       input.signal.removeEventListener("abort", abort);
       await this.runtime.disposeSession?.(binding.runtimeSessionId);

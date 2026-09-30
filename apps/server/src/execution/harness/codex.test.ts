@@ -265,7 +265,12 @@ describe("installed Codex Owner Run boundary", () => {
       await createCodexHarnessAdapter({ ...item.config, executionTimeoutMs: 300 }).execute(
         executionInput(),
       ),
-    ).toEqual({ status: "failed", usage: null, code: "TIMED_OUT" });
+    ).toEqual({
+      status: "failed",
+      usage: null,
+      failureCode: "runtime_run_errored",
+      code: "TIMED_OUT",
+    });
   });
 
   it("starts a fresh native thread home on reopening, never resumes saved sessions", async () => {

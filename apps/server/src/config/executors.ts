@@ -266,7 +266,9 @@ export class ExecutorConfiguration {
         try {
           const { settings, proof } = structuredClone(this.state);
           const executablePath = resolveClaudeExecutable();
-          if (!executablePath) return { status: "failed" };
+          // The executable is not installed, so this is Glassbox declining to engage the runtime
+          // rather than the runtime failing to answer.
+          if (!executablePath) return { status: "failed", failureCode: "gate_refused" };
           const connection = await this.connection(settings);
           const result = await createClaudeHarnessAdapter({
             dataDirectory: this.options.dataDirectory,

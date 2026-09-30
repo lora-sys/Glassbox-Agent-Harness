@@ -38,6 +38,9 @@ const failureFallback: Record<string, string> = {
   claimed_change_not_performed:
     "这次没有执行被要求的变更，因此我不会声称它已经完成。请以管理面或群里的实际状态为准。",
   required_evidence_missing: "没能取到这条问题所依赖的原始信息，因此无法确认。请稍后重试。",
+  gate_refused: "这个请求被我自己的规则拦下了，因此没有执行。",
+  runtime_run_errored: "模型在执行这次请求时出错了，没有产出结果。请稍后重试。",
+  execution_unavailable: "当前没有可以执行这个请求的执行通道，请联系管理员检查模型配置。",
 };
 
 function isDeliverableText(text: unknown): text is string | undefined {
@@ -501,7 +504,10 @@ export class RunService {
       await this.emit({ type: "run_started", runId, conversationId: run.conversationId });
       const adapter = this.options.resolveExecution(run.executionRef);
       if (!adapter || (caller.scope.chatType === "group" && adapter.supportsGroup !== true)) {
-        result = { status: "failed" };
+        // The configured route has no executor able to take this Run, which is a fact about the
+        // configuration rather than about the runtime, but it is still a reason to keep this
+        // profile out of routing until the route is fixed.
+        result = { status: "failed", failureCode: "execution_unavailable" };
       } else {
         const input = await this.options.store.conversations.loadRunInput(caller, runId);
         // Recheck dispatch authority after context I/O and before invoking any external executor.
@@ -546,10 +552,10 @@ export class RunService {
       // A thrown adapter error does not prove that a detached execution stopped. It does prove
       // that no classified result exists, so the Run keeps a named cause instead of collapsing
       // into the same opaque status line every other failure produced.
-      result = {
-        status: error instanceof AccessDeniedError ? "failed" : "unknown",
-        ...(error instanceof AccessDeniedError ? {} : { failureCode: "execution_threw" }),
-      };
+      result =
+        error instanceof AccessDeniedError
+          ? { status: "failed", failureCode: "gate_refused" }
+          : { status: "unknown", failureCode: "execution_threw" };
     }
     // A result the adapter could not classify still carries whatever cause it named: dropping the
     // text here is what turned every executor failure into one indistinguishable sentence.

@@ -98,7 +98,7 @@ describe("Run-linked integrity Eval", () => {
   );
 
   it("distinguishes consistent failed execution evidence from product acceptance", async () => {
-    const current = await fixture({ result: { status: "failed" } });
+    const current = await fixture({ result: { status: "failed", failureCode: "gate_refused" } });
     const runId = await current.run();
     const result = await createRunEvaluator(current).evaluate(evalOwner, runId);
     expect(result.assessment).toMatchObject({

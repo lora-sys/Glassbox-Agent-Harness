@@ -11,7 +11,12 @@ import {
   verifyCodexConfig,
 } from "./codex-config.js";
 import { executeProtectedTool, ProtectedToolActivity } from "./tools.js";
-import { HarnessFailure, type HarnessEvent, type HarnessResult } from "./types.js";
+import {
+  HarnessFailure,
+  harnessFailureCause,
+  type HarnessEvent,
+  type HarnessResult,
+} from "./types.js";
 import type { CodexHarnessAdapter, CodexHarnessOptions } from "./codex-types.js";
 
 const SYSTEM =
@@ -55,7 +60,17 @@ export function createCodexHarnessAdapter(options: CodexHarnessOptions): CodexHa
       let ownsNamespace = false;
       let adapter: CodexAdapter | undefined;
       let shutdown: Promise<boolean> | undefined;
-      let result: HarnessResult = { status: "failed", usage: null };
+      // Overwritten by whichever stage settles the Run, so it starts as the outcome nothing has
+      // explained yet — and it names a cause, because a failed Run with no cause forces every
+      // later layer to guess at one, and the guess it used to make was that the runtime was down.
+      // The assertion keeps the whole union visible: the turn handler above settles this from
+      // inside a closure, which TypeScript cannot follow, and narrowing would otherwise collapse
+      // the status to the placeholder's alone.
+      let result = {
+        status: "failed",
+        usage: null,
+        failureCode: "runtime_run_errored",
+      } as HarnessResult;
       let failure: HarnessFailure | undefined;
       let threadId: string | undefined;
       let turnId: string | undefined;
@@ -175,15 +190,12 @@ export function createCodexHarnessAdapter(options: CodexHarnessOptions): CodexHa
             if (!["completed", "failed", "interrupted"].includes(String(turn.status)))
               throw new HarnessFailure("PROVIDER_FAILED");
             completed = true;
-            result = {
-              status:
-                turn.status === "completed"
-                  ? "succeeded"
-                  : turn.status === "interrupted"
-                    ? "interrupted"
-                    : "failed",
-              usage: null,
-            };
+            result =
+              turn.status === "completed"
+                ? { status: "succeeded", usage: null }
+                : turn.status === "interrupted"
+                  ? { status: "interrupted", usage: null }
+                  : { status: "failed", usage: null, failureCode: "runtime_run_errored" };
             if (result.status === "succeeded") {
               checkText(output);
               result.text = output;
@@ -356,10 +368,13 @@ export function createCodexHarnessAdapter(options: CodexHarnessOptions): CodexHa
         await race(done);
         await eventQueue;
       } catch (error) {
+        const code =
+          failure?.code ?? (error instanceof HarnessFailure ? error.code : "PROVIDER_FAILED");
         result = {
           status: "failed",
           usage: null,
-          code: failure?.code ?? (error instanceof HarnessFailure ? error.code : "PROVIDER_FAILED"),
+          failureCode: harnessFailureCause(code),
+          code,
         };
       } finally {
         clearTimeout(timer);
@@ -370,7 +385,13 @@ export function createCodexHarnessAdapter(options: CodexHarnessOptions): CodexHa
         if (!exitConfirmed || !toolsFinished)
           result = { status: "unknown", usage: null, code: "EXIT_UNCONFIRMED" };
         else if (input.signal.aborted) result = { status: "cancelled", usage: null };
-        else if (timedOut) result = { status: "failed", usage: null, code: "TIMED_OUT" };
+        else if (timedOut)
+          result = {
+            status: "failed",
+            usage: null,
+            failureCode: "runtime_run_errored",
+            code: "TIMED_OUT",
+          };
         if (ownsNamespace && namespace && exitConfirmed && toolsFinished) active.delete(namespace);
         secret = "";
       }
@@ -383,7 +404,12 @@ export function createCodexHarnessAdapter(options: CodexHarnessOptions): CodexHa
           ...(result.code ? { code: result.code } : {}),
         });
       } catch {
-        return { status: "failed", usage: null, code: "PROVIDER_FAILED" };
+        return {
+          status: "failed",
+          usage: null,
+          failureCode: "runtime_run_errored",
+          code: "PROVIDER_FAILED",
+        };
       }
       return result;
     },

@@ -16,6 +16,12 @@ afterEach(async () => {
   await afterEachCleanup();
 });
 
+/** A canned failure that names its cause, the way a real adapter's result has to. */
+const failedExecutor = () => async () => ({
+  status: "failed" as const,
+  failureCode: "execution_threw" as const,
+});
+
 const privateOwnerScope: TrustedChannelScope = {
   connectionId: "fixture",
   botId: "10001",
@@ -131,7 +137,7 @@ describe("Management model routing wrapper", () => {
         "utf8",
       );
       vi.stubEnv("PI_CODING_AGENT_DIR", directory);
-      const f = await fixture(async () => ({ status: "failed" }));
+      const f = await fixture(failedExecutor());
       const application = f.app as unknown as {
         piModelCatalog?: {
           list(): Array<{ providerId: string; model: string }>;
@@ -147,7 +153,7 @@ describe("Management model routing wrapper", () => {
   });
 
   it("loads the Pi model catalog from an explicit runtime directory override", async () => {
-    const f = await fixture(async () => ({ status: "failed" }), {
+    const f = await fixture(failedExecutor(), {
       mainPiModelConfig: {
         providers: {
           fixture: {
@@ -225,7 +231,7 @@ describe("Management model routing wrapper", () => {
       );
       const urls: string[] = [];
       stubModelFetch(urls);
-      const f = await fixture(async () => ({ status: "failed" }), {
+      const f = await fixture(failedExecutor(), {
         piAgentDirectory: directory,
       });
       const defaultProfileId = piModelProfileId("fixture", "default-model");
@@ -300,7 +306,7 @@ describe("Management model routing wrapper", () => {
   it("pins later Runs to the Owner-selected profile while keeping route evidence", async () => {
     const urls: string[] = [];
     stubModelFetch(urls);
-    const f = await fixture(async () => ({ status: "failed" }));
+    const f = await fixture(failedExecutor());
     await configureModelRoute(f.app, [
       {
         id: "origin",
@@ -347,7 +353,7 @@ describe("Management model routing wrapper", () => {
   it("switches the QQ model through the Owner Tool and persists it for subsequent Runs", async () => {
     const urls: string[] = [];
     stubModelFetch(urls);
-    const f = await fixture(async () => ({ status: "failed" }));
+    const f = await fixture(failedExecutor());
     await configureModelRoute(f.app, [
       {
         id: "origin",
@@ -426,7 +432,7 @@ describe("Management model routing wrapper", () => {
   it("fails closed when a manually selected model has unknown context capacity", async () => {
     const urls: string[] = [];
     stubModelFetch(urls);
-    const f = await fixture(async () => ({ status: "failed" }));
+    const f = await fixture(failedExecutor());
     await configureModelRoute(f.app, [
       {
         id: "origin",
@@ -457,7 +463,7 @@ describe("Management model routing wrapper", () => {
   it("keeps the default execution when routing is disabled and persists scoped evidence", async () => {
     const urls: string[] = [];
     stubModelFetch(urls);
-    const f = await fixture(async () => ({ status: "failed" }));
+    const f = await fixture(failedExecutor());
     await configureModelRoute(f.app, [
       {
         id: "origin",
@@ -507,7 +513,7 @@ describe("Management model routing wrapper", () => {
   it("executes the selected opted-in profile and records the actual route", async () => {
     const urls: string[] = [];
     stubModelFetch(urls);
-    const f = await fixture(async () => ({ status: "failed" }));
+    const f = await fixture(failedExecutor());
     await configureModelRoute(f.app, [
       {
         id: "origin",
@@ -567,7 +573,7 @@ describe("Management model routing wrapper", () => {
   it("fails closed when enabled routing has no candidate that satisfies the context floor", async () => {
     const urls: string[] = [];
     stubModelFetch(urls);
-    const f = await fixture(async () => ({ status: "failed" }));
+    const f = await fixture(failedExecutor());
     await configureModelRoute(f.app, [
       {
         id: "origin",
@@ -608,7 +614,7 @@ describe("Management model routing wrapper", () => {
   it("skips an operator-disabled model and records a successful safe fallback", async () => {
     const urls: string[] = [];
     stubModelFetch(urls);
-    const f = await fixture(async () => ({ status: "failed" }));
+    const f = await fixture(failedExecutor());
     await configureModelRoute(f.app, [
       {
         id: "origin",
@@ -657,7 +663,7 @@ describe("Management model routing wrapper", () => {
         ? Response.json({ error: { message: "fixture unavailable" } }, { status: 503 })
         : textResponse("openai-completions", "alternate answer");
     });
-    const f = await fixture(async () => ({ status: "failed" }));
+    const f = await fixture(failedExecutor());
     await configureModelRoute(f.app, [
       {
         id: "origin",
@@ -686,7 +692,7 @@ describe("Management model routing wrapper", () => {
         executionRef: "model:origin",
         state: "unavailable",
         freshnessWindowMs: 60_000,
-        reasonCode: "execution_failed",
+        reasonCode: "runtime_run_errored",
       }),
     );
     expect(recovered.run.status).toBe("succeeded");
@@ -724,7 +730,7 @@ describe("Management model routing wrapper", () => {
         },
       ]);
     });
-    const f = await fixture(async () => ({ status: "failed" }));
+    const f = await fixture(failedExecutor());
     await configureModelRoute(f.app, [
       {
         id: "origin",
@@ -750,7 +756,7 @@ describe("Management model routing wrapper", () => {
   it("upgrades only a pre-provider capacity overflow to a larger eligible profile", async () => {
     const urls: string[] = [];
     stubModelFetch(urls);
-    const f = await fixture(async () => ({ status: "failed" }));
+    const f = await fixture(failedExecutor());
     await configureModelRoute(f.app, [
       {
         id: "origin",
