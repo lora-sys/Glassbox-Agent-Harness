@@ -260,13 +260,20 @@ function runTestCommandWithCache(args, scope) {
   }
 }
 
+// Scripts are outside the unit suite's include pattern, so their tests only run where a runner
+// names them. Listing them here is what keeps them from being files nobody executes.
+const SCRIPT_TESTS = [
+  "scripts/verify-commit.test.mjs",
+  "scripts/migrate-windows-workspaces.test.mjs",
+];
+
 function runFullVerification() {
   const entries = stagedEntries();
   verifyTestIntegrity(entries);
   runStagedChecks(entries);
   console.log("Full verification: core checks, selector checks, unit suite once, and web build.");
   run("vp", ["run", "check:core"]);
-  run(process.execPath, ["--test", "scripts/verify-commit.test.mjs"]);
+  run(process.execPath, ["--test", ...SCRIPT_TESTS]);
   runTestCommandWithCache(["run", "test:unit"], "full unit suite");
   run("vp", ["run", "build:web"]);
   console.log("\nFull verification passed.");
@@ -300,7 +307,7 @@ if (isMain) {
     const entries = stagedEntries();
     verifyTestIntegrity(entries);
     runStagedChecks(entries);
-    run(process.execPath, ["--test", "scripts/verify-commit.test.mjs"]);
+    run(process.execPath, ["--test", ...SCRIPT_TESTS]);
     runChangedTests();
     console.log("\nCommit verification passed.");
   }

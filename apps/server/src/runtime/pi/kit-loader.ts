@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import type { PiRuntimeProfileName, PiRuntimeConfig } from "./types.js";
 
 export const PINNED_KIT_REPO = "https://github.com/lora-sys/lora-pi-kit";
-export const PINNED_KIT_COMMIT = "513063950dc0d9dcd4835d6fcc79814728e98b35";
+export const PINNED_KIT_COMMIT = "5375a595e0521923ea87f4bbad08ce8732d4bd64";
 export const PINNED_PI_VERSION = "0.85.1";
 
 export interface ResolvedKitProfile {

@@ -1,0 +1,19 @@
+[Unit]
+Description=Glassbox NapCat QQ runtime for %i
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/home/%i/src/Glassbox-Agent-Harness
+Environment=HOME=/home/%i
+EnvironmentFile=/home/%i/.config/glassbox/napcat.env
+ExecStartPre=/usr/bin/docker info --format {{.ServerVersion}}
+ExecStart=/home/%i/.local/bin/docker-compose -f /home/%i/src/Glassbox-Agent-Harness/docs/napcat-linux.compose.yml up --no-color
+ExecStop=/home/%i/.local/bin/docker-compose -f /home/%i/src/Glassbox-Agent-Harness/docs/napcat-linux.compose.yml down
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
