@@ -262,13 +262,46 @@ const MUTATION_VERB =
 /**
  * A question about whether or how something is *possible* is not a request for its result.
  *
- * 是否 is deliberately absent. It asks whether a fact holds, which is a question about the world
- * and is answered by observing it; reading it as a possibility question required no observation
- * at all, so a Run could answer 是 or 否 with the evidence check satisfied and nothing behind the
- * answer. A question that really is about possibility names possibility: 能否, 能不能, 可否.
+ * 是否 is deliberately absent on its own. It asks whether a fact holds, which is a question about
+ * the world and is answered by observing it; reading it as a possibility question required no
+ * observation at all, so a Run could answer 是 or 否 with the evidence check satisfied and nothing
+ * behind the answer. A question that really is about possibility names possibility: 能否, 能不能,
+ * 可否.
+ *
+ * The second half is the same idea, applied to a question about what the bot itself can do. The
+ * Owner wrote "禁言 工具有没有开放到 oatp 群里" — a question about the mute Tool — and the mutation
+ * gate read the leading 禁言 as the command itself, found no group in the sentence, and refused it
+ * with a line about missing parameters. It is not distinguishable from "禁言 brain" by the verb,
+ * because it has the same verb: what separates them is that the ask is about the Tool rather than
+ * for its effect. So a capability noun turns any ask into a question about a capability, and the
+ * ask governs one of the bot's own actions directly the same way.
+ *
+ * The capability noun is what keeps this out of the world-fact questions 是否 was excluded for.
+ * "本群历史检索是否已经开启" asks about a setting and keeps its reading; "禁言工具有没有开放"
+ * names 工具 and asks about the bot. Nothing in this half requires an observation, because no
+ * domain observes what the bot itself offers.
+ *
+ * The ask has to be interrogative. 开启 and 开放 are also the imperative forms — "给 1121579672
+ * 开启群管理能力" is a command to turn a capability on, and a list that read the word as a
+ * question dropped the requirement that kept that command honest. So a capability noun followed
+ * by 开启 is not enough on its own; the question has to carry one of the words that ask.
  */
-const CAPABILITY_QUESTION =
-  /如何|怎么|能否|能不能|可否|可以吗|(?:谁|我|管理员|群主|成员|机器人|你)[^。！？\n]{0,80}可以[^。！？\n]{0,80}吗/u;
+const CAPABILITY_NOUN = /(?:工具|功能|能力|权限|接口)/u;
+const CAPABILITY_ASK = /(?:有没有|是否|能否|能不能|可否|会不会|支不支持|可以|能够|能用|可用|支持)/u;
+const CAPABILITY_OPENED = /(?:开|开放|开通|开启|启用)[^。！？\n]{0,4}(?:吗|么|了没|没有没)/u;
+const CAPABILITY_ACTION =
+  /(?:禁言|闭嘴|踢人|踢出|移出|生成|绘制|画图|切换|改成|改为|设置|上传|删除|保存|记忆|记住)/u;
+const CAPABILITY_QUESTION = new RegExp(
+  [
+    "如何|怎么|能否|能不能|可否|可以吗",
+    "(?:谁|我|管理员|群主|成员|机器人|你)[^。！？\\n]{0,80}可以[^。！？\\n]{0,80}吗",
+    `(?:${CAPABILITY_NOUN.source})[^。！？\\n]{0,16}(?:${CAPABILITY_ASK.source})`,
+    `(?:${CAPABILITY_ASK.source})[^。！？\\n]{0,16}(?:${CAPABILITY_NOUN.source})`,
+    `(?:${CAPABILITY_NOUN.source})[^。！？\\n]{0,16}${CAPABILITY_OPENED.source}`,
+    `(?:支不支持|能不能|能否|可否|会不会)[^。！？\\n]{0,4}(?:${CAPABILITY_ACTION.source})`,
+  ].join("|"),
+  "u",
+);
 
 interface LiveDomain {
   readonly domain: RequiredEvidenceDomain;

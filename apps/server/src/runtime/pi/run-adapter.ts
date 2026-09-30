@@ -517,7 +517,11 @@ export type RunEvidenceRecord =
       /** Safe rejection metadata for an explicit mutation that cannot be bound to exact inputs. */
       blockedMutation?: {
         operation: string;
-        reason: "incomplete_parameters" | "not_permitted_in_group" | "not_permitted";
+        reason:
+          | "incomplete_parameters"
+          | "unknown_target"
+          | "not_permitted_in_group"
+          | "not_permitted";
       };
     }
   | {
@@ -773,7 +777,7 @@ function requiredToolCall(
 
 interface BlockedMutation {
   operation: string;
-  reason: "incomplete_parameters" | "not_permitted_in_group" | "not_permitted";
+  reason: "incomplete_parameters" | "unknown_target" | "not_permitted_in_group" | "not_permitted";
 }
 
 function mediaRequestIntent(text: string): "image" | "video" | "ambiguous" | undefined {
@@ -1309,7 +1313,17 @@ function blockedMutationRequest(
       return { operation: "model:switch", reason: "not_permitted_in_group" };
     if (!isOwner) return { operation: "model:switch", reason: "not_permitted" };
     if (!ownerModelCommand(input.text, modelProfiles))
-      return { operation: "model:switch", reason: "incomplete_parameters" };
+      return {
+        operation: "model:switch",
+        // Which of the two went wrong decides what the reader is told, and the two are not
+        // distinguishable from the outside: a message that named no model needs parameters, and
+        // one that named a model no profile answers needs to be told that model does not exist.
+        // Answering the second with the first asks the Owner to repair a message that is complete.
+        reason:
+          namedModelSelection(input.text) === undefined
+            ? "incomplete_parameters"
+            : "unknown_target",
+      };
   }
   const text = requestClauses(input.text).trim();
   if (!text) return undefined;
@@ -1498,6 +1512,31 @@ function selectLearningContext(
     .map(({ memoryId, type, statement }) => ({ memoryId, type, statement }));
 }
 
+/**
+ * The model a switch message names, read out of the text before anything is matched against it.
+ *
+ * Split from the matcher below because the two failure modes are different and have to be told
+ * apart by whoever writes the refusal: a message that names nothing and a message that names
+ * something no profile answers. The Owner's "切换到 most 提供商的 z-ai/glm-5.3-flash" was complete
+ * — provider and model name — and was answered with a line asking for parameters, which sent the
+ * reader off to fix a message that had nothing wrong with it.
+ */
+function namedModelSelection(text: string): string | undefined {
+  const command = text.trim().replace(/^(?:Bob|Glassbox|玻璃盒)[，,\s]+/iu, "");
+  const selectionPrefix =
+    /^(?:请|帮我)?\s*(?:(?:把|将)\s*(?:我\s*)?(?:后续的\s*)?(?:(?:Owner|QQ)\s*)?(?:好友)?私聊(?:模型)?\s*切换(?:到|成|为)|切换(?:模型)?(?:到|成|为)|换(?:到|成)|使用|switch to)\s*["'“「]?/iu;
+  const selectionMatch = selectionPrefix.exec(command);
+  if (!selectionMatch) return undefined;
+  return (
+    command
+      .slice(selectionMatch[0].length)
+      .split(/[，,。！？；;\n]/u, 1)[0]
+      ?.replace(/["'“「”」]$/u, "")
+      .replace(/\s*模型$/u, "")
+      .trim() || undefined
+  );
+}
+
 function ownerModelCommand(
   text: string,
   profiles: readonly PublicModelProfile[],
@@ -1509,17 +1548,7 @@ function ownerModelCommand(
     return { name: OWNER_MODEL_ADMIN_TOOL, input: { action: "clear" } };
   if (/^(?:有哪些模型|列出模型|可切换模型|\/model list)$/iu.test(command))
     return { name: OWNER_MODEL_ADMIN_TOOL, input: { action: "list" } };
-  const selectionPrefix =
-    /^(?:请|帮我)?\s*(?:(?:把|将)\s*(?:我\s*)?(?:后续的\s*)?(?:(?:Owner|QQ)\s*)?(?:好友)?私聊(?:模型)?\s*切换(?:到|成|为)|切换(?:模型)?(?:到|成|为)|换(?:到|成)|使用|switch to)\s*["'“「]?/iu;
-  const selectionMatch = selectionPrefix.exec(command);
-  const requested = selectionMatch
-    ? command
-        .slice(selectionMatch[0].length)
-        .split(/[，,。！？；;\n]/u, 1)[0]
-        ?.replace(/["'“「”」]$/u, "")
-        .replace(/\s*模型$/u, "")
-        .trim()
-    : undefined;
+  const requested = namedModelSelection(text);
   if (!requested) return undefined;
   const modelName = requested.replace(/^(?:Pi|派)\s*(?:里|中)(?:配置的|设置的)?\s*/iu, "");
   const providerQualified = /^(.*?)\s*(?:提供商|provider)(?:的|['’]s)\s*(.+)$/iu.exec(modelName);
@@ -1605,11 +1634,14 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
               : blockedMutation.reason === "not_permitted_in_group"
                 ? "当前群聊未开放图片和视频生成，未执行。"
                 : "当前会话未授权媒体生成，未执行。"
-            : blockedMutation.reason === "not_permitted_in_group"
-              ? "该操作未在群聊中开放，未执行。"
-              : blockedMutation.reason === "not_permitted"
-                ? "该操作未授权，未执行。"
-                : "请求的操作未执行，请补齐必要参数后重试。",
+            : blockedMutation.operation === "model:switch" &&
+                blockedMutation.reason === "unknown_target"
+              ? "没有找到你指定的那个模型，因此没有切换。可以让我先列出可切换的模型，再指定其中一个。"
+              : blockedMutation.reason === "not_permitted_in_group"
+                ? "该操作未在群聊中开放，未执行。"
+                : blockedMutation.reason === "not_permitted"
+                  ? "该操作未授权，未执行。"
+                  : "请求的操作未执行，请补齐必要参数后重试。",
       };
     }
     await this.runtime.initialize();

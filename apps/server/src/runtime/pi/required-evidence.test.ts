@@ -184,6 +184,27 @@ describe("required evidence stays narrow", () => {
     expect(requiredEvidenceFor(inGroup("把群名称改成 Lora 群"))).toEqual([]);
   });
 
+  it("requires nothing for a question about whether the bot's own Tool is available", () => {
+    // The live message, verbatim: a question about the mute Tool, refused as a mute command
+    // because the leading 禁言 is the same word the command starts with. What separates the two
+    // is the ask, so a capability noun plus an ask is what makes this a question — and nothing
+    // observes what the bot itself offers, so nothing is required by it either.
+    expect(requiredEvidenceFor(inGroup("禁言 工具有没有开放到这个群里"))).toEqual([]);
+    expect(requiredEvidenceFor(ownerPrivate("禁言 工具有没有开放到 oatp 群里"))).toEqual([]);
+    expect(requiredEvidenceFor(ownerPrivate("生成图片的工具有没有开放到私聊"))).toEqual([]);
+    expect(requiredEvidenceFor(ownerPrivate("有没有禁言工具"))).toEqual([]);
+    expect(requiredEvidenceFor(inGroup("禁言功能开了吗"))).toEqual([]);
+    expect(requiredEvidenceFor(inGroup("支不支持禁言"))).toEqual([]);
+  });
+
+  it("still reads a command to turn a capability on as a command", () => {
+    // The guard on the pair above. 开启 and 开放 are the imperative forms too, so a capability noun
+    // followed by one is not enough on its own: the Owner's own message to enable group moderation
+    // named 能力 and would have been read as a question about it.
+    expect(requiredEvidenceFor(ownerPrivate("给 1121579672 开启群管理能力"))).toEqual([]);
+    expect(requiredEvidenceFor(ownerPrivate("把群 1121579672 的群文件写入权限打开"))).toEqual([]);
+  });
+
   it("requires nothing when the message refuses the request", () => {
     expect(requiredEvidenceFor(inGroup("不要查看群成员"))).toEqual([]);
     expect(requiredEvidenceFor(inGroup("不用查群文件了"))).toEqual([]);

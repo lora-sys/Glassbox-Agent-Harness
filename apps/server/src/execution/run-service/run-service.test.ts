@@ -16,6 +16,7 @@ import {
 } from "../../persistence/index.js";
 import {
   RunService,
+  type ExecutionFailureCode,
   type ExecutionInput,
   type ExecutionResult,
   type RunExecutionAdapter,
@@ -835,6 +836,39 @@ describe("durable Run scheduling", () => {
     expect(
       (await store.lifecycle.listDeliveries(owner(), accepted.run.id)).items[0]?.payloadText,
     ).toBe("这次执行被中断，没有给出结果。请稍后重试。");
+  });
+
+  it("explains every cause a failed Run can record, and only those", async () => {
+    // The record is exhaustive by type, so a cause added to the union without a line for it fails
+    // to compile rather than reaching a reader as "任务处理未完成，状态为 failed。" — a sentence
+    // that says the Run produced nothing without saying why. The keys below are what makes that
+    // true, and each one is then checked against the line the reader actually receives.
+    const causes: Record<ExecutionFailureCode, true> = {
+      pre_provider_context_overflow: true,
+      model_capacity_unknown: true,
+      gate_refused: true,
+      execution_unavailable: true,
+      required_action_not_completed: true,
+      claimed_change_not_performed: true,
+      required_evidence_missing: true,
+      runtime_run_errored: true,
+      execution_threw: true,
+    };
+    for (const [index, cause] of Object.keys(causes).entries()) {
+      const { store } = await fixture();
+      const execute = vi
+        .fn<RunExecutionAdapter["execute"]>()
+        .mockResolvedValue({ status: "failed", failureCode: cause as ExecutionFailureCode });
+      const { instance } = service(store, { supportsGroup: true, execute });
+      await instance.start();
+      const accepted = await instance.receive(input(`cause-${index}`, `cause-${index}`));
+      await instance.drain();
+      const delivered = (await store.lifecycle.listDeliveries(owner(), accepted.run.id)).items;
+      expect(delivered, cause).toHaveLength(1);
+      // A real explanation names what went wrong; the generic line is the one it must not be.
+      expect(delivered[0]!.payloadText, cause).not.toContain("任务处理未完成");
+      expect(delivered[0]!.payloadText.length, cause).toBeGreaterThan(8);
+    }
   });
 
   it("checks dispatch authority again after context loading", async () => {

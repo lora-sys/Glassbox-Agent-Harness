@@ -1991,6 +1991,95 @@ describe("mutation intent comes only from the current user message", () => {
     });
     expect(f.run).toHaveBeenCalledTimes(2);
   });
+
+  it("answers a question about whether a mutating Tool is open, instead of refusing it as the command", async () => {
+    // The live message, verbatim, in the Owner's private chat: a question about whether the mute
+    // Tool has been opened to a group. The mutation gate read the leading 禁言 as the command
+    // itself, found no group id in the sentence, and refused it with a line about missing
+    // parameters — to a message that named no target and asked for no change. A question about a
+    // capability is not a request to use it, and the bot is exactly the thing that can answer it.
+    const f = fixture([{ status: "completed", text: "禁言工具已开放。", toolCalls: [] }]);
+    f.input.text = "禁言 工具有没有开放到oatp 群里";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "succeeded",
+      text: "禁言工具已开放。",
+    });
+    expect(f.run).toHaveBeenCalledOnce();
+  });
+
+  it("answers a capability question in a group, where the same words carry no group either", async () => {
+    // The same defect on the other side of the chatType branch, so the shape is checked in both.
+    // The group path never reached the refusal — the pre-model gate only refuses a group message it
+    // cannot authorize — but the requirement layer still bound the mute Tool, so the Run was told
+    // to perform the very thing the message asked about, and failed closed when it called nothing.
+    const f = fixture([{ status: "completed", text: "这个群开了禁言工具。", toolCalls: [] }]);
+    f.input.caller.principalId = "visitor";
+    f.input.caller.scope.senderId = "2498701175";
+    f.input.caller.scope.chatType = "group";
+    f.input.caller.scope.chatId = "1126022432";
+    f.input.conversation.scope.chatType = "group";
+    f.input.conversation.scope.chatId = "1126022432";
+    f.input.text = "禁言 工具有没有开放到这个群里";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "succeeded",
+      text: "这个群开了禁言工具。",
+    });
+    expect(f.run).toHaveBeenCalledOnce();
+    // The message asked for no change, so nothing was required that would have made it one.
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBeUndefined();
+  });
+
+  it("answers a question about the media Tool being open, not only about whether an image was asked for", async () => {
+    // The media gate already skips a capability question that ends in 吗, and a question that does
+    // not ends in 吗 went through: it named the image verb, named no picture, and was refused with
+    // the disambiguation line. The ask is what decides it, not which punctuation it ended with.
+    const f = fixture([{ status: "completed", text: "生图工具已开放。", toolCalls: [] }]);
+    f.input.text = "生成图片的工具有没有开放到私聊";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "succeeded",
+      text: "生图工具已开放。",
+    });
+    expect(f.run).toHaveBeenCalledOnce();
+  });
+
+  it("names the model it could not match instead of asking for parameters the Owner already gave", async () => {
+    // The live message, verbatim: a switch to a provider-qualified model, replied to with "请补齐
+    // 必要参数后重试". The parameters were complete — provider and model name both — and what was
+    // missing was the profile. An explanation that describes a different problem than the one that
+    // happened is worse than no explanation, because the reader goes and fixes the wrong thing.
+    const f = fixture([{ status: "completed", text: "不会走到。", toolCalls: [] }]);
+    f.input.text = "切换到 most 提供商的 z-ai/glm-5.3-flash，成功后只回复 SWITCH-MOST-OK";
+    f.createOrRestoreSession.mockImplementation(async (_conversation, _profile, context) => {
+      if (context) context.authorizedToolNames = [OWNER_MODEL_ADMIN_TOOL];
+      return {
+        conversationId: "conversation-1",
+        runtimeSessionId: "session-1",
+        profileName: "main-agent" as const,
+        agentDir: "agent",
+        createdAt: new Date(0).toISOString(),
+        lastActiveAt: new Date(0).toISOString(),
+      };
+    });
+    const executor = new PiRunExecutionAdapter(f.runtime, {
+      listModelProfiles: () => [
+        {
+          id: "minimax-m3",
+          label: "MiniMax M3",
+          model: "MiniMax-M3",
+          protocol: "anthropic-messages",
+          baseUrl: "https://models.example.invalid",
+          credentialConfigured: true,
+        },
+      ],
+    });
+
+    await expect(executor.execute(f.input)).resolves.toMatchObject({
+      status: "failed",
+      failureCode: "gate_refused",
+      text: "没有找到你指定的那个模型，因此没有切换。可以让我先列出可切换的模型，再指定其中一个。",
+    });
+    expect(f.run).not.toHaveBeenCalled();
+  });
 });
 
 describe("an explicit current-group history search requires the group Tool", () => {
