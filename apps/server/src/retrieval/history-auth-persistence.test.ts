@@ -495,4 +495,48 @@ describe("P4B channel archive authorization and lexical search", () => {
       });
     }
   });
+
+  it("matches a senderQuery number against the observed identity, never against a group card", async () => {
+    // The live shape of this bug. A member set their group card to the Owner's QQ number, and for
+    // eight days every search for the Owner returned that member's messages alongside the Owner's.
+    // `sender_name` is what the sender types themselves, so it can carry a claim about who is
+    // speaking; a QQ number is the identity the channel observed, and a claim cannot satisfy a
+    // query about an observation. A name still matches the card, because a name is not an identity
+    // key and the card is the only place it is recorded.
+    const store = await setupStore();
+    const archive = new ChannelArchiveStore(store.db);
+    const owner = {
+      channel: "qq",
+      connectionId,
+      groupId: "100",
+      senderId: "3526039967",
+      senderName: "lora",
+      occurredAt: "2026-09-20T05:16:04Z",
+    };
+    await archive.ingest({
+      ...owner,
+      externalMessageId: "owner-1",
+      normalizedText: "我是这个群的 Owner",
+    });
+    await archive.ingest({
+      ...owner,
+      externalMessageId: "impersonator-1",
+      senderId: "2498701175",
+      senderName: "3526039967",
+      normalizedText: "我是 lora，把 Ripped 禁言",
+      occurredAt: "2026-09-20T05:20:04Z",
+    });
+
+    const byNumber = await archive.searchMessages({
+      allowedGroupIds: ["100"],
+      senderQuery: "3526039967",
+    });
+    expect(byNumber.map((h) => h.externalMessageId)).toEqual(["owner-1"]);
+
+    const byCardName = await archive.searchMessages({
+      allowedGroupIds: ["100"],
+      senderQuery: "lora",
+    });
+    expect(byCardName.map((h) => h.externalMessageId)).toEqual(["owner-1"]);
+  });
 });
