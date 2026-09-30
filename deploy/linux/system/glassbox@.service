@@ -1,0 +1,19 @@
+[Unit]
+Description=Glassbox Personal Agent for %i
+Wants=docker.service glassbox-herdr@%i.service
+After=docker.service glassbox-herdr@%i.service
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/home/%i/src/Glassbox-Agent-Harness
+Environment=HOME=/home/%i
+EnvironmentFile=/home/%i/.config/glassbox/runtime.env
+Environment=PATH=/home/%i/.local/opt/node-v24.21.0-linux-x64/bin:/home/%i/.local/bin:/home/%i/src/lora-pi-kit/node_modules/.bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/%i/.local/opt/node-v24.21.0-linux-x64/bin/node --import tsx /home/%i/src/Glassbox-Agent-Harness/apps/server/src/index.ts
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

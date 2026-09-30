@@ -1,0 +1,17 @@
+[Unit]
+Description=Glassbox Personal Agent
+Wants=glassbox-herdr.service
+After=glassbox-herdr.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/src/Glassbox-Agent-Harness
+EnvironmentFile=%h/.config/glassbox/runtime.env
+Environment=PATH=%h/.local/opt/node-v24.21.0-linux-x64/bin:%h/.local/bin:%h/src/lora-pi-kit/node_modules/.bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/opt/node-v24.21.0-linux-x64/bin/node --import tsx %h/src/Glassbox-Agent-Harness/apps/server/src/index.ts
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

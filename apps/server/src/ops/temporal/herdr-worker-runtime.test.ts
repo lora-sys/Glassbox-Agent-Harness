@@ -274,6 +274,12 @@ it("captures a declared Worker text file before review and rechecks grants when 
   }
 });
 
+// One durable-state sequence, from dispatch through disconnect, lease recovery, review, cancel and
+// quarantine, sharing one task, store and bridge. Every `advance` is a chain of transactions
+// against a file-backed database, so the cost tracks disk and CPU speed rather than the number of
+// assertions: this needs about 5s here and about 40s on a loaded two-core Windows runner. The
+// global 30s budget was silently below the second number, which turned an unrelated change into a
+// red run. Declare what the sequence actually costs instead of racing the default.
 it("dispatches one Worker, reviews and cancels it safely, and quarantines an uncertain launch", async () => {
   const directory = await mkdtemp(join(tmpdir(), "glassbox-p6-worker-"));
   const dataRoot = join(directory, "data");
@@ -983,4 +989,4 @@ it("dispatches one Worker, reviews and cancels it safely, and quarantines an unc
       },
     );
   }
-});
+}, 120_000);
