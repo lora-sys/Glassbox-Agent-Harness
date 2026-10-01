@@ -6,6 +6,7 @@ import {
   type CallerContext,
   type TrustedChannelScope,
 } from "../persistence/index.js";
+import { scopeKey } from "../identity/scope.js";
 import { classifyProtectedReadAction } from "../auth/service.js";
 import { createCapabilityTools } from "../runtime/pi/capability-tools.js";
 import { createProtectedTool } from "../runtime/pi/protected-tools.js";
@@ -760,92 +761,123 @@ describe("group history delivery authority", () => {
     expect(searches.at(-1)).toEqual([]);
   });
 
-  it("backfills the explicit delivery grant for a persisted assignment across a restart", async () => {
-    const { f, application, a } = await twoOwners({ persistentDatabase: true });
-    await application.setGroupAccess(a, { groupId: GROUP, enabled: true });
+  it.each(["absent", "revoked"])(
+    "backfills the explicit delivery grant for a persisted assignment across a restart (%s policy)",
+    async (policy) => {
+      const { f, application, a } = await twoOwners({ persistentDatabase: true });
+      await application.setGroupAccess(a, { groupId: GROUP, enabled: true });
 
-    // The database the previous version left behind: the assignment and its read authority
-    // persisted, the explicit delivery grant never written.
-    await f.app.store.authorization.revokeScopeAction({
-      principalId: "owner",
-      resourceId: `group:${GROUP}`,
-      action: "delivery:send",
-      scope: a.caller.scope,
-    });
-    expect((await deliveryDecision(f, a.caller, `group:${GROUP}`)).decision).toBe("DENY");
-
-    // Restart: the Channel reconnects and the backfill restores the persisted assignment's
-    // delivery authority, so the Owner never has to remove and re-add the group.
-    const restartedApp = await f.reopen();
-    admin(restartedApp);
-    expect(
-      (
-        await restartedApp.store.authorization.check({
-          caller: a.caller,
+      // The database the previous version left behind: the assignment and its read authority
+      // persisted, the explicit delivery grant never written.
+      // Only the absent case models a legacy database before delivery policy existed.
+      // A real revocation is durable policy and must survive reconnect/restart.
+      if (policy === "absent") {
+        await f.app.store.db.transaction(async (tx) => {
+          await tx.execute({
+            sql: "DELETE FROM grants WHERE principal_id = ? AND resource_id = ? AND action = 'delivery:send' AND scope_key = ?",
+            args: ["owner", `group:${GROUP}`, scopeKey(a.caller.scope)],
+          });
+        });
+      } else {
+        await f.app.store.authorization.revokeScopeAction({
+          principalId: "owner",
           resourceId: `group:${GROUP}`,
           action: "delivery:send",
-        })
-      ).decision,
-    ).toBe("ALLOW");
-    expect(
-      (
-        await restartedApp.store.authorization.check({
-          caller: a.caller,
+          scope: a.caller.scope,
+        });
+      }
+      expect((await deliveryDecision(f, a.caller, `group:${GROUP}`)).decision).toBe("DENY");
+
+      // Restart: the Channel reconnects and the backfill restores the persisted assignment's
+      // delivery authority, so the Owner never has to remove and re-add the group.
+      const restartedApp = await f.reopen();
+      admin(restartedApp);
+      expect(
+        (
+          await restartedApp.store.authorization.check({
+            caller: a.caller,
+            resourceId: `group:${GROUP}`,
+            action: "delivery:send",
+          })
+        ).decision,
+      ).toBe(policy === "absent" ? "ALLOW" : "DENY");
+      expect(
+        (
+          await restartedApp.store.authorization.check({
+            caller: a.caller,
+            resourceId: `group:${GROUP}`,
+            action: "history:read",
+          })
+        ).decision,
+      ).toBe("ALLOW");
+
+      // The backfill restores assignments; it never manufactures one. The sibling Owner assigned
+      // nothing, so the restart leaves them with no assignment and no delivery authority.
+      expect(
+        await restartedApp.store.authorization.hasActiveGrant({
+          principalId: `owner-${CO_OWNER}`,
           resourceId: `group:${GROUP}`,
-          action: "history:read",
-        })
-      ).decision,
-    ).toBe("ALLOW");
+          action: "group:manage",
+          scope: coOwnerPrivate,
+        }),
+      ).toBe(false);
+      expect(
+        await restartedApp.store.authorization.hasActiveGrant({
+          principalId: `owner-${CO_OWNER}`,
+          resourceId: `group:${GROUP}`,
+          action: "delivery:send",
+          scope: coOwnerPrivate,
+        }),
+      ).toBe(false);
+    },
+    90_000,
+  );
 
-    // The backfill restores assignments; it never manufactures one. The sibling Owner assigned
-    // nothing, so the restart leaves them with no assignment and no delivery authority.
-    expect(
-      await restartedApp.store.authorization.hasActiveGrant({
-        principalId: `owner-${CO_OWNER}`,
-        resourceId: `group:${GROUP}`,
-        action: "group:manage",
-        scope: coOwnerPrivate,
-      }),
-    ).toBe(false);
-    expect(
-      await restartedApp.store.authorization.hasActiveGrant({
-        principalId: `owner-${CO_OWNER}`,
-        resourceId: `group:${GROUP}`,
-        action: "delivery:send",
-        scope: coOwnerPrivate,
-      }),
-    ).toBe(false);
-  }, 90_000);
+  it.each(["absent", "revoked"])(
+    "backfills the explicit delivery grant for a persisted assignment on reconnect (%s policy)",
+    async (policy) => {
+      const { f, application, a } = await twoOwners();
+      await application.setGroupAccess(a, { groupId: GROUP, enabled: true });
+      // Only the absent case models a legacy database before delivery policy existed.
+      // A real revocation is durable policy and must survive reconnect/restart.
+      if (policy === "absent") {
+        await f.app.store.db.transaction(async (tx) => {
+          await tx.execute({
+            sql: "DELETE FROM grants WHERE principal_id = ? AND resource_id = ? AND action = 'delivery:send' AND scope_key = ?",
+            args: ["owner", `group:${GROUP}`, scopeKey(a.caller.scope)],
+          });
+        });
+      } else {
+        await f.app.store.authorization.revokeScopeAction({
+          principalId: "owner",
+          resourceId: `group:${GROUP}`,
+          action: "delivery:send",
+          scope: a.caller.scope,
+        });
+      }
+      expect((await deliveryDecision(f, a.caller, `group:${GROUP}`)).decision).toBe("DENY");
 
-  it("backfills the explicit delivery grant for a persisted assignment on reconnect", async () => {
-    const { f, application, a } = await twoOwners();
-    await application.setGroupAccess(a, { groupId: GROUP, enabled: true });
-    await f.app.store.authorization.revokeScopeAction({
-      principalId: "owner",
-      resourceId: `group:${GROUP}`,
-      action: "delivery:send",
-      scope: a.caller.scope,
-    });
-    expect((await deliveryDecision(f, a.caller, `group:${GROUP}`)).decision).toBe("DENY");
+      // A reconnect runs the same provisioning as a restart, against the same durable state.
+      await f.app.disconnectChannel("fixture");
+      await f.app.connectChannel("fixture");
 
-    // A reconnect runs the same provisioning as a restart, against the same durable state.
-    await f.app.disconnectChannel("fixture");
-    await f.app.connectChannel("fixture");
-
-    expect((await deliveryDecision(f, a.caller, `group:${GROUP}`)).decision).toBe("ALLOW");
-    // The Owner's own assignment is untouched, and still the only one.
-    expect(await application.projectManagedGroups(a)).toMatchObject({
-      groups: [{ groupId: GROUP, access: { assigned: true } }],
-    });
-    expect(
-      await f.app.store.authorization.hasActiveGrant({
-        principalId: `owner-${CO_OWNER}`,
-        resourceId: `group:${GROUP}`,
-        action: "delivery:send",
-        scope: coOwnerPrivate,
-      }),
-    ).toBe(false);
-  });
+      expect((await deliveryDecision(f, a.caller, `group:${GROUP}`)).decision).toBe(
+        policy === "absent" ? "ALLOW" : "DENY",
+      );
+      // The Owner's own assignment is untouched, and still the only one.
+      expect(await application.projectManagedGroups(a)).toMatchObject({
+        groups: [{ groupId: GROUP, access: { assigned: true } }],
+      });
+      expect(
+        await f.app.store.authorization.hasActiveGrant({
+          principalId: `owner-${CO_OWNER}`,
+          resourceId: `group:${GROUP}`,
+          action: "delivery:send",
+          scope: coOwnerPrivate,
+        }),
+      ).toBe(false);
+    },
+  );
 });
 
 /**
@@ -945,48 +977,64 @@ describe("skill catalog delivery authority", () => {
    * not the grant it implies, and no reconnect would revisit the scope on its own — the
    * configuration has never heard of them.
    */
-  it("backfills delivery authority for a member addressed before the grant existed", async () => {
-    const f = await connect();
-    f.send(1, "owner-a", true, 10002);
-    const ownerRun = await f.started.take();
-    await f.reply("answer");
-    await admin(f.app).setGroupAccess(
-      {
-        caller: ownerRun.caller,
-        conversationId: ownerRun.conversation.id,
-        runId: ownerRun.run.id,
-      },
-      { groupId: GROUP, enabled: true },
-    );
+  it.each(["absent", "revoked"])(
+    "backfills delivery authority for a member addressed before the grant existed (%s policy)",
+    async (policy) => {
+      const f = await connect();
+      f.send(1, "owner-a", true, 10002);
+      const ownerRun = await f.started.take();
+      await f.reply("answer");
+      await admin(f.app).setGroupAccess(
+        {
+          caller: ownerRun.caller,
+          conversationId: ownerRun.conversation.id,
+          runId: ownerRun.run.id,
+        },
+        { groupId: GROUP, enabled: true },
+      );
 
-    // A member of that group who is in no configuration list at all.
-    const visitor = { principalId: "qq-visitor-10007", scope: scopeFor("group", GROUP, "10007") };
-    f.send(2, "visitor-a", false, 10007, Number(GROUP));
-    // No reply is awaited: this Run is the one that cannot deliver yet.
-    await f.started.take();
+      // A member of that group who is in no configuration list at all.
+      const visitor = { principalId: "qq-visitor-10007", scope: scopeFor("group", GROUP, "10007") };
+      f.send(2, "visitor-a", false, 10007, Number(GROUP));
+      // No reply is awaited: this Run is the one that cannot deliver yet.
+      await f.started.take();
 
-    // The scope as an older build left it: the read granted, the delivery grant absent.
-    await f.app.store.authorization.revokeScopeAction({
-      principalId: visitor.principalId,
-      resourceId: SKILL_CATALOG_RESOURCE,
-      action: "delivery:send",
-      scope: visitor.scope,
-    });
+      // The scope as an older build left it: the read granted, the delivery grant absent.
+      // Only the absent case models a legacy database before delivery policy existed.
+      // A real revocation is durable policy and must survive reconnect/restart.
+      if (policy === "absent") {
+        await f.app.store.db.transaction(async (tx) => {
+          await tx.execute({
+            sql: "DELETE FROM grants WHERE principal_id = ? AND resource_id = ? AND action = 'delivery:send' AND scope_key = ?",
+            args: [visitor.principalId, SKILL_CATALOG_RESOURCE, scopeKey(visitor.scope)],
+          });
+        });
+      } else {
+        await f.app.store.authorization.revokeScopeAction({
+          principalId: visitor.principalId,
+          resourceId: SKILL_CATALOG_RESOURCE,
+          action: "delivery:send",
+          scope: visitor.scope,
+        });
+      }
 
-    const decided = (action: string) =>
-      f.app.store.authorization.check({
-        caller: visitor,
-        resourceId: SKILL_CATALOG_RESOURCE,
-        action,
-      });
-    expect((await decided(SKILL_READ_ACTION)).decision).toBe("ALLOW");
-    expect((await decided("delivery:send")).decision).toBe("DENY");
+      const decided = (action: string) =>
+        f.app.store.authorization.check({
+          caller: visitor,
+          resourceId: SKILL_CATALOG_RESOURCE,
+          action,
+        });
+      expect((await decided(SKILL_READ_ACTION)).decision).toBe("ALLOW");
+      expect((await decided("delivery:send")).decision).toBe("DENY");
 
-    // A reconnect runs the same provisioning as a restart, and the backfill reads the
-    // grants that exist rather than the ones the configuration would create.
-    await f.app.disconnectChannel("fixture");
-    await f.app.connectChannel("fixture");
+      // A reconnect runs the same provisioning as a restart, and the backfill reads the
+      // grants that exist rather than the ones the configuration would create.
+      await f.app.disconnectChannel("fixture");
+      await f.app.connectChannel("fixture");
 
-    expect((await decided("delivery:send")).decision).toBe("ALLOW");
-  });
+      expect((await decided("delivery:send")).decision).toBe(
+        policy === "absent" ? "ALLOW" : "DENY",
+      );
+    },
+  );
 });

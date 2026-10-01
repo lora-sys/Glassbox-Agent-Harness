@@ -5,6 +5,7 @@ import {
   conversationScopeKey,
   requireIdentifier,
   scopeKey,
+  validateScope,
   type CallerContext,
   type TrustedChannelScope,
 } from "../identity/scope.js";
@@ -384,7 +385,7 @@ export class AuthorizationService {
     });
   }
 
-  /** Management-only. Identity binding deliberately creates no grants. */
+  /** Management-only. Explicit grants may restore previously revoked authority. */
   async grant(input: {
     principalId: string;
     resourceId: string;
@@ -392,12 +393,101 @@ export class AuthorizationService {
     scope: TrustedChannelScope;
     effect: "allow" | "approval";
   }): Promise<string> {
+    return (await this.writeGrant(input, false))!;
+  }
+
+  /** Initial provisioning only. Any prior policy, including revocation, stays authoritative. */
+  async grantInitial(input: {
+    principalId: string;
+    resourceId: string;
+    action: string;
+    scope: TrustedChannelScope;
+    effect: "allow" | "approval";
+  }): Promise<string | null> {
+    return this.writeGrant(input, true);
+  }
+
+  /** Historical routing metadata for explicit management restoration, never automatic grants. */
+  async listScopeHistory(input: {
+    resourceId: string;
+    action: string;
+    connectionId: string;
+    botId: string;
+    chatType: "private" | "group";
+    chatId: string;
+  }): Promise<CallerContext[]> {
+    for (const value of [
+      input.resourceId,
+      input.action,
+      input.connectionId,
+      input.botId,
+      input.chatId,
+    ])
+      requireIdentifier(value);
+    if (input.chatType !== "private" && input.chatType !== "group")
+      throw new Error("Invalid channel scope");
+    return this.db.transaction(async (tx) => {
+      const rows = await tx.execute({
+        sql: `SELECT DISTINCT principal_id, scope_key FROM grants
+              WHERE resource_id = ? AND action = ?
+                AND json_extract(scope_key, '$[0]') = ?
+                AND json_extract(scope_key, '$[1]') = ?
+                AND json_extract(scope_key, '$[2]') = ?
+                AND json_extract(scope_key, '$[3]') = ?`,
+        args: [
+          input.resourceId,
+          input.action,
+          input.connectionId,
+          input.botId,
+          input.chatType,
+          input.chatId,
+        ],
+      });
+      const scopes: CallerContext[] = [];
+      for (const row of rows.rows) {
+        const key = stringColumn(row, "scope_key");
+        const tuple: unknown = JSON.parse(key);
+        if (!Array.isArray(tuple) || tuple.length !== 6)
+          throw new Error("Invalid persisted channel scope");
+        const scope: TrustedChannelScope = {
+          connectionId: tuple[0],
+          botId: tuple[1],
+          chatType: tuple[2],
+          chatId: tuple[3],
+          senderId: tuple[4],
+          ...(tuple[5] === null ? {} : { threadId: tuple[5] }),
+        };
+        validateScope(scope);
+        if (scopeKey(scope) !== key) throw new Error("Invalid persisted channel scope");
+        scopes.push({ principalId: stringColumn(row, "principal_id"), scope });
+      }
+      return scopes;
+    });
+  }
+
+  private async writeGrant(
+    input: {
+      principalId: string;
+      resourceId: string;
+      action: string;
+      scope: TrustedChannelScope;
+      effect: "allow" | "approval";
+    },
+    initialOnly: boolean,
+  ): Promise<string | null> {
     for (const value of [input.principalId, input.resourceId, input.action])
       requireIdentifier(value);
     if (input.effect !== "allow" && input.effect !== "approval")
       throw new Error("Invalid grant effect");
     const key = scopeKey(input.scope);
     return this.db.transaction(async (tx) => {
+      if (initialOnly) {
+        const configured = await tx.execute({
+          sql: "SELECT id FROM grants WHERE principal_id = ? AND resource_id = ? AND action = ? AND scope_key = ? LIMIT 1",
+          args: [input.principalId, input.resourceId, input.action, key],
+        });
+        if (configured.rows[0]) return null;
+      }
       const existing = await tx.execute({
         sql: "SELECT id FROM grants WHERE principal_id = ? AND resource_id = ? AND action = ? AND scope_key = ? AND effect = ? AND revoked_at IS NULL ORDER BY created_at ASC, id ASC LIMIT 1",
         args: [input.principalId, input.resourceId, input.action, key, input.effect],
@@ -434,7 +524,8 @@ export class AuthorizationService {
 
   /**
    * Gives `delivery:send` to every Principal that can already read a content source, in the
-   * exact scope where they can read it. Returns how many grants it added.
+   * exact scope where they can read it, only if delivery policy has never been configured.
+   * Revocations and approval requirements are preserved. Returns how many grants it added.
    *
    * Reading a source and delivering what it produced are two rows, and a grant introduced
    * later only reaches the scopes the provisioning path knows about. A group member is
@@ -460,7 +551,7 @@ export class AuthorizationService {
         const existing = await tx.execute({
           sql: `SELECT id FROM grants
             WHERE principal_id = ? AND resource_id = ? AND action = 'delivery:send'
-              AND scope_key = ? AND effect = 'allow' AND revoked_at IS NULL LIMIT 1`,
+              AND scope_key = ? LIMIT 1`,
           args: [principalId, input.resourceId, key],
         });
         if (existing.rows[0]) continue;

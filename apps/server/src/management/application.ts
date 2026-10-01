@@ -1171,7 +1171,11 @@ export class ManagementApplication {
     principalId: string,
     scope: TrustedChannelScope,
     workspaceId: string,
+    initialOnly = false,
   ): Promise<void> {
+    const grant = initialOnly
+      ? this.store.authorization.grantInitial.bind(this.store.authorization)
+      : this.store.authorization.grant.bind(this.store.authorization);
     const workspace = await this.workspaces.resolveAuthorized(principalId, workspaceId, "read");
     const resourceId = `workspace:${workspace.id}`;
     await this.store.authorization.registerResource({
@@ -1186,7 +1190,7 @@ export class ManagementApplication {
       ...(workspace.grants[principalId] === "write" ? ["workspace:write"] : []),
       DELIVERY_SEND_ACTION,
     ])
-      await this.store.authorization.grant({
+      await grant({
         principalId,
         resourceId,
         action,
@@ -2620,8 +2624,8 @@ export class ManagementApplication {
           "Disconnect the channel before editing its configuration",
           409,
         );
+      const addedMembers: Array<{ senderId: string; principalId: string }> = [];
       const channel = await this.channels.save(input, async (previous, next) => {
-        if (!previous) return;
         const members = (config: typeof next) =>
           new Map<string, string>([
             [config.ownerId, OWNER_ID],
@@ -2629,13 +2633,44 @@ export class ManagementApplication {
             ...config.visitorIds.map((senderId) => [senderId, `qq-visitor-${senderId}`] as const),
           ]);
         const nextMembers = members(next);
-        for (const [senderId, principalId] of members(previous)) {
+        const previousMembers = previous ? members(previous) : new Map<string, string>();
+        for (const [senderId, principalId] of nextMembers) {
+          if (previous?.botId === next.botId && previousMembers.get(senderId) === principalId)
+            continue;
+          addedMembers.push({ senderId, principalId });
+        }
+        if (!previous) return;
+        for (const [senderId, principalId] of previousMembers) {
           if (previous.botId === next.botId && nextMembers.get(senderId) === principalId) continue;
           const identity = { connectionId: previous.connectionId, botId: previous.botId, senderId };
           await this.store.authorization.revokeSenderScopes(identity);
           await this.store.identities.unbind(identity);
         }
       });
+      // Re-adding an identity is an explicit management decision. Restore only this
+      // membership's built-in defaults, after its new configuration has been persisted.
+      // Identity binding still waits for connect; custom grants stay revoked.
+      for (const member of addedMembers) {
+        for (const location of [
+          { chatType: "private" as const, chatId: member.senderId },
+          ...channel.groupIds.map((chatId) => ({ chatType: "group" as const, chatId })),
+        ]) {
+          const history = await this.store.authorization.listScopeHistory({
+            resourceId: agentResourceId(AGENT_ID),
+            action: "run:create",
+            connectionId: channel.id,
+            botId: channel.botId,
+            ...location,
+          });
+          for (const prior of history) {
+            if (
+              prior.principalId === member.principalId &&
+              prior.scope.senderId === member.senderId
+            )
+              await this.grantScope(prior.scope, member.principalId, false);
+          }
+        }
+      }
       this.states.delete(id);
       return channel;
     });
@@ -2879,7 +2914,12 @@ export class ManagementApplication {
         principalId,
         scope: privateScope,
       }))
-        await this.grantGroupDelivery({ principalId, scope: privateScope, groupId });
+        await this.grantGroupDelivery({
+          principalId,
+          scope: privateScope,
+          groupId,
+          initialOnly: true,
+        });
     }
 
     for (const visitorId of configured.config.visitorIds) {
@@ -2938,7 +2978,10 @@ export class ManagementApplication {
     if (current.decision !== "ALLOW") await this.grantScope(scope, caller.principalId);
   }
 
-  private async grantScope(scope: TrustedChannelScope, principalId = OWNER_ID) {
+  private async grantScope(scope: TrustedChannelScope, principalId = OWNER_ID, initialOnly = true) {
+    const grant = initialOnly
+      ? this.store.authorization.grantInitial.bind(this.store.authorization)
+      : this.store.authorization.grant.bind(this.store.authorization);
     const isOwner = await this.store.identities.isOwner(principalId);
     const caller: CallerContext = { principalId, scope };
     for (const action of ACTIONS) {
@@ -2949,7 +2992,7 @@ export class ManagementApplication {
         action,
       });
       if (existing.decision !== "ALLOW")
-        await this.store.authorization.grant({
+        await grant({
           principalId,
           resourceId: agentResourceId(AGENT_ID),
           action,
@@ -2963,7 +3006,7 @@ export class ManagementApplication {
       visibility: "public",
       ifAbsent: true,
     });
-    await this.store.authorization.grant({
+    await grant({
       principalId,
       resourceId: SKILL_CATALOG_RESOURCE,
       action: SKILL_READ_ACTION,
@@ -2974,7 +3017,7 @@ export class ManagementApplication {
     // this Resource for every Run whose answer derives from one — the same recheck every other
     // content source already passes. Granting `skill:read` alone denied those Runs at delivery
     // time: the Run succeeded, whatever it changed was durable, and the sender received nothing.
-    await this.store.authorization.grant({
+    await grant({
       principalId,
       resourceId: SKILL_CATALOG_RESOURCE,
       action: "delivery:send",
@@ -2988,7 +3031,7 @@ export class ManagementApplication {
       visibility: "public",
       ifAbsent: true,
     });
-    await this.store.authorization.grant({
+    await grant({
       principalId,
       resourceId: skillToolResource,
       action: TOOL_DISCOVERY_ACTION,
@@ -3003,7 +3046,7 @@ export class ManagementApplication {
         ifAbsent: true,
       });
       for (const capability of WEB_CAPABILITIES) {
-        await this.store.authorization.grant({
+        await grant({
           principalId,
           resourceId: WEB_RESOURCE,
           action: WEB_ACTIONS[capability],
@@ -3011,7 +3054,7 @@ export class ManagementApplication {
           effect: "allow",
         });
       }
-      await this.store.authorization.grant({
+      await grant({
         principalId,
         resourceId: WEB_RESOURCE,
         action: BROWSER_ARTIFACT_DELIVER_ACTION,
@@ -3026,7 +3069,7 @@ export class ManagementApplication {
           visibility: "public",
           ifAbsent: true,
         });
-        await this.store.authorization.grant({
+        await grant({
           principalId,
           resourceId,
           action: TOOL_DISCOVERY_ACTION,
@@ -3056,7 +3099,7 @@ export class ManagementApplication {
           action,
         });
         if (existing.decision !== "ALLOW")
-          await this.store.authorization.grant({
+          await grant({
             principalId,
             resourceId: groupResource,
             action,
@@ -3068,11 +3111,11 @@ export class ManagementApplication {
       // The Run's own group scope is the audience it already owns, so this is the one delivery
       // authority a group Run can hold. It is granted only because Glassbox configured
       // this group. Bot membership alone registers nothing and grants nothing.
-      await this.grantGroupDelivery({ principalId, scope, groupId: scope.chatId });
+      await this.grantGroupDelivery({ principalId, scope, groupId: scope.chatId, initialOnly });
       // Discovery is a superset of authority, exactly as for the Owner-private scope: the
       // Run's candidate list narrows it to policy, so a category change applies on the next
       // Run with no re-grant and a revoked category cannot survive as stale discovery.
-      await this.grantCapabilityDiscovery({ principalId, scope });
+      await this.grantCapabilityDiscovery({ principalId, scope, initialOnly });
     }
     for (const name of availableHistoryToolNames({
       isOwner,
@@ -3087,7 +3130,7 @@ export class ManagementApplication {
         ...(scope.chatType === "group" ? {} : { ownerId: OWNER_ID }),
         ifAbsent: true,
       });
-      await this.store.authorization.grant({
+      await grant({
         principalId,
         resourceId,
         action: TOOL_DISCOVERY_ACTION,
@@ -3106,7 +3149,7 @@ export class ManagementApplication {
         ifAbsent: true,
       });
       for (const action of ["workspace:read", "workspace:write", DELIVERY_SEND_ACTION]) {
-        await this.store.authorization.grant({
+        await grant({
           principalId,
           resourceId: workspaceResource,
           action,
@@ -3116,7 +3159,7 @@ export class ManagementApplication {
       }
       for (const workspace of await this.workspaces.listForPrincipal(principalId)) {
         if (workspace.id !== defaultWorkspace.id)
-          await this.grantWorkspaceScope(principalId, scope, workspace.id);
+          await this.grantWorkspaceScope(principalId, scope, workspace.id, initialOnly);
       }
       for (const name of GLASSBOX_HOST_EXCLUDED_PI_TOOLS) {
         const resourceId = toolResourceId(name);
@@ -3127,7 +3170,7 @@ export class ManagementApplication {
           ownerId: OWNER_ID,
           ifAbsent: true,
         });
-        await this.store.authorization.grant({
+        await grant({
           principalId,
           resourceId,
           action: TOOL_DISCOVERY_ACTION,
@@ -3142,7 +3185,7 @@ export class ManagementApplication {
         ownerId: OWNER_ID,
         ifAbsent: true,
       });
-      await this.store.authorization.grant({
+      await grant({
         principalId,
         resourceId: OWNER_CONTROL_RESOURCE,
         action: "group:manage",
@@ -3150,7 +3193,7 @@ export class ManagementApplication {
         effect: "allow",
       });
       for (const action of ["model:read", "model:switch", DELIVERY_SEND_ACTION]) {
-        await this.store.authorization.grant({
+        await grant({
           principalId,
           resourceId: OWNER_CONTROL_RESOURCE,
           action,
@@ -3166,7 +3209,7 @@ export class ManagementApplication {
         ifAbsent: true,
       });
       for (const action of [MEMORY_READ_ACTION, MEMORY_WRITE_ACTION, MEMORY_GOVERN_ACTION]) {
-        await this.store.authorization.grant({
+        await grant({
           principalId,
           resourceId: OWNER_MEMORY_RESOURCE,
           action,
@@ -3174,7 +3217,7 @@ export class ManagementApplication {
           effect: "allow",
         });
       }
-      await this.store.authorization.grant({
+      await grant({
         principalId,
         resourceId: OWNER_MEMORY_RESOURCE,
         action: DELIVERY_SEND_ACTION,
@@ -3188,7 +3231,7 @@ export class ManagementApplication {
         ownerId: OWNER_ID,
         ifAbsent: true,
       });
-      await this.store.authorization.grant({
+      await grant({
         principalId,
         resourceId: MEDIA_GENERATION_RESOURCE,
         action: MEDIA_GENERATE_ACTION,
@@ -3202,7 +3245,7 @@ export class ManagementApplication {
           visibility: "public",
           ifAbsent: true,
         });
-        await this.store.authorization.grant({
+        await grant({
           principalId,
           resourceId: "agent-operations",
           action: DELIVERY_SEND_ACTION,
@@ -3225,7 +3268,7 @@ export class ManagementApplication {
           ownerId: OWNER_ID,
           ifAbsent: true,
         });
-        await this.store.authorization.grant({
+        await grant({
           principalId,
           resourceId,
           action: TOOL_DISCOVERY_ACTION,
@@ -3233,7 +3276,7 @@ export class ManagementApplication {
           effect: "allow",
         });
       }
-      await this.grantCapabilityDiscovery({ principalId, scope });
+      await this.grantCapabilityDiscovery({ principalId, scope, initialOnly });
       // The Owner cross-group history Tool spans several group Resources, so it is gated on
       // this Owner-private search capability. Each concrete group Resource is still
       // re-authorized inside the Tool and the decision recorded with the Run.
@@ -3244,7 +3287,7 @@ export class ManagementApplication {
         ownerId: OWNER_ID,
         ifAbsent: true,
       });
-      await this.store.authorization.grant({
+      await grant({
         principalId,
         resourceId: OWNER_HISTORY_RESOURCE,
         action: OWNER_HISTORY_ACTION,
@@ -3263,7 +3306,7 @@ export class ManagementApplication {
           action,
         });
         if (existing.decision !== "ALLOW")
-          await this.store.authorization.grant({
+          await grant({
             principalId,
             resourceId: agentResourceId(AGENT_ID),
             action,
@@ -3288,10 +3331,14 @@ export class ManagementApplication {
    * group scope, or this Owner's own persisted `group:manage` assignment.
    */
   private async grantGroupDelivery(input: {
+    initialOnly?: boolean;
     principalId: string;
     scope: TrustedChannelScope;
     groupId: string;
   }): Promise<void> {
+    const grant = input.initialOnly
+      ? this.store.authorization.grantInitial.bind(this.store.authorization)
+      : this.store.authorization.grant.bind(this.store.authorization);
     const resourceId = groupResourceId(input.groupId);
     await this.store.authorization.registerResource({
       id: resourceId,
@@ -3306,7 +3353,7 @@ export class ManagementApplication {
       action: DELIVERY_SEND_ACTION,
     });
     if (existing.decision !== "ALLOW")
-      await this.store.authorization.grant({
+      await grant({
         principalId: input.principalId,
         resourceId,
         action: DELIVERY_SEND_ACTION,
@@ -3331,9 +3378,13 @@ export class ManagementApplication {
    * its own `tool:discover` grant, which is what this method writes.
    */
   private async grantCapabilityDiscovery(input: {
+    initialOnly?: boolean;
     principalId: string;
     scope: TrustedChannelScope;
   }): Promise<void> {
+    const grant = input.initialOnly
+      ? this.store.authorization.grantInitial.bind(this.store.authorization)
+      : this.store.authorization.grant.bind(this.store.authorization);
     const isOwner = await this.store.identities.isOwner(input.principalId);
     const names = availableCapabilityToolNames({
       isOwner,
@@ -3355,7 +3406,7 @@ export class ManagementApplication {
         action: TOOL_DISCOVERY_ACTION,
       });
       if (existing.decision !== "ALLOW")
-        await this.store.authorization.grant({
+        await grant({
           principalId: input.principalId,
           resourceId,
           action: TOOL_DISCOVERY_ACTION,
@@ -3442,7 +3493,23 @@ export class ManagementApplication {
         // A Run inside the group needs its own group-scope grants, for the Owner and for
         // every Visitor the transport serves. These are group scope, not Owner assignment.
         for (const scope of groupScopes)
-          await this.grantScope(scope, this.principalForScope(configured, scope));
+          await this.grantScope(scope, this.principalForScope(configured, scope), false);
+        // Dynamic members are absent from the static profile. An explicit reopen restores
+        // the same defaults in their exact historical scopes, including thread boundaries.
+        // Old bindings and unrelated custom grants cannot establish restored authority.
+        for (const prior of await this.store.authorization.listScopeHistory({
+          resourceId: agentResourceId(AGENT_ID),
+          action: "run:create",
+          connectionId: configured.config.connectionId,
+          botId: configured.config.botId,
+          chatType: "group",
+          chatId: input.groupId,
+        })) {
+          if (groupScopes.some((scope) => scopeKey(scope) === scopeKey(prior.scope))) continue;
+          const current = await this.store.identities.resolve(prior.scope);
+          if (current?.principalId === prior.principalId)
+            await this.grantScope(prior.scope, current.principalId, false);
+        }
       } else {
         // Revoke exactly the acting Owner's assignment, bundle and history grant.
         await this.store.authorization.revokeScope({
