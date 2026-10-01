@@ -98,6 +98,15 @@ The service manager launches fixed executables without a shell. It records proce
 data directory and verifies it before shutdown. Named Herdr sessions use Herdr's public session
 status and stop commands.
 
+On Linux, a saved process must match its executable, complete case-sensitive argument list,
+kernel boot ID, and `/proc/<pid>/stat` start time. `agent:status` reports `unknown` when a live
+PID cannot be verified. Start, stop, and checkout switch then refuse to change the registry or
+launch a replacement. This includes older Linux records without a birth identity. Inspect the
+original service through its verified supervisor or owner and stop it there before retrying.
+Do not delete the record or copy the current PID's identity into it to bypass this check.
+Dead PIDs can be removed normally. Windows and named Herdr session ownership checks keep
+their existing contracts.
+
 The `glassbox` CLI and `agent:up` use the same service data directory. By default both use
 `~/.glassbox` and port 3030. Set `GLASSBOX_DATA_DIR` and `PORT` to the same values as the
 service when using a custom launch configuration. For the default Windows service configuration:

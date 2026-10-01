@@ -1,3 +1,4 @@
+import { throwIfWebCancelled } from "./cancellation.js";
 import { ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import type { WebProviderStatus } from "./contracts.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -15,7 +16,11 @@ interface McpResult {
 }
 
 export interface ExaMcpCaller {
-  call(name: "web_search_exa" | "web_fetch_exa", args: Record<string, unknown>): Promise<McpResult>;
+  call(
+    name: "web_search_exa" | "web_fetch_exa",
+    args: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<McpResult>;
 }
 
 /** One provider call gets one short-lived MCP session. No session or provider state crosses Runs. */
@@ -23,12 +28,25 @@ export class HostedExaMcpCaller implements ExaMcpCaller {
   async call(
     name: "web_search_exa" | "web_fetch_exa",
     args: Record<string, unknown>,
+    signal?: AbortSignal,
   ): Promise<McpResult> {
+    throwIfWebCancelled(signal);
     const client = new Client({ name: "glassbox-web", version: "1.0.0" });
-    const transport = new StreamableHTTPClientTransport(MCP_URL);
+    const transport = new StreamableHTTPClientTransport(MCP_URL, {
+      fetch: (url, init) => {
+        throwIfWebCancelled(signal);
+        const signals = [signal, init?.signal].filter((value): value is AbortSignal => !!value);
+        return fetch(url, {
+          ...init,
+          ...(signals.length ? { signal: AbortSignal.any(signals) } : {}),
+        });
+      },
+    });
     try {
-      await client.connect(transport);
-      const result = await client.callTool({ name, arguments: args });
+      await client.connect(transport, { signal });
+      throwIfWebCancelled(signal);
+      const result = await client.callTool({ name, arguments: args }, undefined, { signal });
+      throwIfWebCancelled(signal);
       const content = Array.isArray(result.content) ? result.content : [];
       return {
         isError: result.isError === true,
@@ -112,36 +130,54 @@ export class ExaMcpProvider {
     private readonly syntheticDnsCidrs: readonly string[] = [],
   ) {}
 
-  async search(input: { query: string; maxResults: number }): Promise<ExaResponse> {
+  async search(
+    input: { query: string; maxResults: number },
+    signal?: AbortSignal,
+  ): Promise<ExaResponse> {
+    throwIfWebCancelled(signal);
     try {
-      const result = await this.caller.call("web_search_exa", {
-        query: input.query,
-        numResults: Math.max(1, Math.min(SEARCH_RESULT_LIMIT, input.maxResults)),
-        objective: `Find public sources that directly answer this query: ${input.query}`.slice(
-          0,
-          4096,
-        ),
-      });
+      const result = await this.caller.call(
+        "web_search_exa",
+        {
+          query: input.query,
+          numResults: Math.max(1, Math.min(SEARCH_RESULT_LIMIT, input.maxResults)),
+          objective: `Find public sources that directly answer this query: ${input.query}`.slice(
+            0,
+            4096,
+          ),
+        },
+        signal,
+      );
+      throwIfWebCancelled(signal);
       const text = resultText(result);
       if (result.isError) return { status: failureStatus(text), results: [] };
       return { status: "ready", results: parseExaMcpSearch(text) };
     } catch (error) {
+      throwIfWebCancelled(signal);
       return { status: transportFailureStatus(error), results: [] };
     }
   }
 
-  async contents(url: string): Promise<ExaResponse> {
+  async contents(url: string, _query?: string, signal?: AbortSignal): Promise<ExaResponse> {
+    throwIfWebCancelled(signal);
     const target = await assertPublicWebUrl(url, this.resolveHost, this.syntheticDnsCidrs);
+    throwIfWebCancelled(signal);
     try {
-      const result = await this.caller.call("web_fetch_exa", {
-        urls: [target.href],
-        maxCharacters: FETCH_CHAR_LIMIT,
-      });
+      const result = await this.caller.call(
+        "web_fetch_exa",
+        {
+          urls: [target.href],
+          maxCharacters: FETCH_CHAR_LIMIT,
+        },
+        signal,
+      );
+      throwIfWebCancelled(signal);
       const text = resultText(result);
       if (result.isError) return { status: failureStatus(text), results: [] };
       if (/^No content found/iu.test(text)) return { status: "ready", results: [] };
       return { status: "ready", results: [{ url: target.href, text }] };
     } catch (error) {
+      throwIfWebCancelled(signal);
       return { status: transportFailureStatus(error), results: [] };
     }
   }

@@ -1,3 +1,4 @@
+import { throwIfWebCancelled } from "../../web/cancellation.js";
 import { Type } from "typebox";
 import { createHash } from "node:crypto";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -133,9 +134,12 @@ export function createWebTools(options: {
     resourceId: WEB_RESOURCE,
     authService: options.store.authorization,
     getContext,
-    execute: async (params, context) => {
+    execute: async (params, context, signal) => {
       await requireEnabled(context, "web.search");
-      const result = await options.service.search(context.runId, params).catch(webInputError);
+      const result = await options.service
+        .search(context.runId, params, signal)
+        .catch(webInputError);
+      throwIfWebCancelled(signal);
       await options.recordEvidence?.(
         {
           type: "web_search",
@@ -182,11 +186,14 @@ export function createWebTools(options: {
     resourceId: WEB_RESOURCE,
     authService: options.store.authorization,
     getContext,
-    execute: async (params, context) => {
+    execute: async (params, context, signal) => {
       await requireEnabled(context, "web.fetch");
       if (params.query !== undefined && params.query.trim() === "")
         throw new ToolInputError("invalid_web_query");
-      const result = await options.service.fetch(context.runId, params).catch(webInputError);
+      const result = await options.service
+        .fetch(context.runId, params, signal)
+        .catch(webInputError);
+      throwIfWebCancelled(signal);
       await options.recordEvidence?.(
         {
           type: "web_fetch",

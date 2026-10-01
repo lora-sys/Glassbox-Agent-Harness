@@ -1,3 +1,4 @@
+import { throwIfWebCancelled } from "./cancellation.js";
 import { createHash } from "node:crypto";
 import type { ExaResponse } from "./exa-provider.js";
 import { ExaMcpProvider } from "./exa-mcp-provider.js";
@@ -38,12 +39,15 @@ export interface WebFetchInput extends Record<string, unknown> {
 }
 
 export interface WebProvider {
-  search(input: { query: string; maxResults: number }): Promise<ExaResponse>;
-  contents(url: string, query?: string): Promise<ExaResponse>;
+  search(input: { query: string; maxResults: number }, signal?: AbortSignal): Promise<ExaResponse>;
+  contents(url: string, query?: string, signal?: AbortSignal): Promise<ExaResponse>;
 }
 
 export interface WebPlanner {
-  plan(query: string): Promise<{
+  plan(
+    query: string,
+    signal?: AbortSignal,
+  ): Promise<{
     mode: "fast" | "complex";
     queryVariants: readonly string[];
     timeRange?: string;
@@ -52,6 +56,7 @@ export interface WebPlanner {
   rerank(
     query: string,
     candidates: readonly { url: string; title: string; highlights: readonly string[] }[],
+    signal?: AbortSignal,
   ): Promise<readonly { url: string; relevanceScore: number }[]>;
 }
 
@@ -68,6 +73,7 @@ export interface BrowserSearchFallback {
   search(
     query: string,
     maxResults: number,
+    signal?: AbortSignal,
   ): Promise<{
     status: BrowserFallbackStatus;
     results: readonly {
@@ -79,7 +85,10 @@ export interface BrowserSearchFallback {
     }[];
     partial?: boolean;
   }>;
-  fetch(url: string): Promise<{
+  fetch(
+    url: string,
+    signal?: AbortSignal,
+  ): Promise<{
     status: BrowserFallbackStatus;
     finalUrl?: string;
     title?: string;
@@ -221,7 +230,12 @@ export class WebService {
     );
   }
 
-  async search(runId: string, input: WebSearchInput): Promise<WebSearchResult> {
+  async search(
+    runId: string,
+    input: WebSearchInput,
+    signal?: AbortSignal,
+  ): Promise<WebSearchResult> {
+    throwIfWebCancelled(signal);
     const query = validatedQuery(input.query);
     const limit = boundedInteger(input.maxResults, 5, MAX_RESULTS);
     if (input.language !== undefined) throw new Error("unsupported_web_language_filter");
@@ -229,7 +243,8 @@ export class WebService {
       throw new Error("invalid_web_time_range");
     const includeDomains = normalizedDomains(input.includeDomains, "include_domains");
     const excludeDomains = normalizedDomains(input.excludeDomains, "exclude_domains");
-    const planned = await this.planner.plan(query);
+    const planned = await this.planner.plan(query, signal);
+    throwIfWebCancelled(signal);
     const variants = [...new Set(planned.queryVariants.filter(Boolean))].slice(0, 3);
     if (!variants.includes(query)) variants.unshift(query);
     const now = this.now();
@@ -242,8 +257,12 @@ export class WebService {
     }
     const boundedVariants = variants.slice(0, 3);
     const providerResults = await Promise.allSettled(
-      boundedVariants.map((variant) => this.provider.search({ query: variant, maxResults: limit })),
+      boundedVariants.map(async (variant) => {
+        throwIfWebCancelled(signal);
+        return this.provider.search({ query: variant, maxResults: limit }, signal);
+      }),
     );
+    throwIfWebCancelled(signal);
     const successes = providerResults.flatMap((result) =>
       result.status === "fulfilled" && result.value.status === "ready" ? [result.value] : [],
     );
@@ -258,12 +277,13 @@ export class WebService {
       this.options.browserFallback !== undefined &&
       successes.every((result) => result.results.length === 0);
     const browserOutcome = fallbackNeeded
-      ? await this.options.browserFallback!.search(query, limit).catch(() => ({
+      ? await this.options.browserFallback!.search(query, limit, signal).catch(() => ({
           status: "failed" as const,
           results: [],
           partial: false,
         }))
       : undefined;
+    throwIfWebCancelled(signal);
     const browserResults = browserOutcome?.results ?? [];
     const candidates: Array<{
       url: string;
@@ -297,8 +317,10 @@ export class WebService {
     let discarded = 0;
     const nowMs = now.getTime();
     for (const candidate of candidates) {
+      throwIfWebCancelled(signal);
       try {
         const url = await this.publicUrl(candidate.url);
+        throwIfWebCancelled(signal);
         if (
           (includeDomains.length > 0 && !matchesDomain(url.hostname, includeDomains)) ||
           (excludeDomains.length > 0 && matchesDomain(url.hostname, excludeDomains)) ||
@@ -334,6 +356,7 @@ export class WebService {
         discarded += 1;
       }
     }
+    throwIfWebCancelled(signal);
     let ordered = [...seen.values()];
     if (isFreshnessQuery(query) && planned.mode === "fast") {
       // Use the broad query to rank source domains, then preserve the current-month
@@ -357,7 +380,8 @@ export class WebService {
       );
     }
     if (planned.mode === "complex" && ordered.length > 1) {
-      const scores = await this.planner.rerank(query, ordered).catch(() => []);
+      const scores = await this.planner.rerank(query, ordered, signal).catch(() => []);
+      throwIfWebCancelled(signal);
       const byUrl = new Map(scores.map((score) => [score.url, score.relevanceScore]));
       ordered = ordered
         .map((entry) => ({
@@ -411,13 +435,16 @@ export class WebService {
     };
   }
 
-  async fetch(runId: string, input: WebFetchInput): Promise<WebFetchResult> {
+  async fetch(runId: string, input: WebFetchInput, signal?: AbortSignal): Promise<WebFetchResult> {
+    throwIfWebCancelled(signal);
     const url = await this.publicUrl(input.url);
+    throwIfWebCancelled(signal);
     const maxChars = boundedInteger(input.maxChars, 8_000, MAX_FETCH_CHARS);
-    const response = await this.provider.contents(url.href, input.query).catch(() => ({
+    const response = await this.provider.contents(url.href, input.query, signal).catch(() => ({
       status: "failed" as const,
       results: [] as const,
     }));
+    throwIfWebCancelled(signal);
     let raw =
       response.status === "ready"
         ? response.results.find((entry) => entry.url === url.href)
@@ -425,13 +452,15 @@ export class WebService {
     let method: "exa_contents" | "browser" = "exa_contents";
     let browserContent: Awaited<ReturnType<BrowserSearchFallback["fetch"]>> | undefined;
     if (!raw?.text && this.options.browserFallback) {
-      browserContent = await this.options.browserFallback.fetch(url.href).catch(() => ({
+      browserContent = await this.options.browserFallback.fetch(url.href, signal).catch(() => ({
         status: "failed" as const,
       }));
+      throwIfWebCancelled(signal);
       method = "browser";
     }
     const fetchUrl = browserContent?.finalUrl ?? raw?.url ?? url.href;
     const validatedFinalUrl = await this.publicUrl(fetchUrl).catch(() => undefined);
+    throwIfWebCancelled(signal);
     const resolvedUrl = validatedFinalUrl ?? url;
     const canonicalFetchUrl = canonicalWebUrl(resolvedUrl);
     const contentType = browserContent?.contentType;

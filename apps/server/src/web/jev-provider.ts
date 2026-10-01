@@ -1,3 +1,4 @@
+import { throwIfWebCancelled } from "./cancellation.js";
 import type { WebProviderStatus } from "./contracts.js";
 
 const JEV_ENDPOINT = "https://thejevai.com/v1/systemone";
@@ -25,10 +26,15 @@ export type JevJudgment<T> =
   | { status: Exclude<WebProviderStatus, "ready" | "partial">; value?: never };
 
 export interface JevProviderClient {
-  chooseQuery(query: string, variants: readonly string[]): Promise<JevJudgment<number>>;
+  chooseQuery(
+    query: string,
+    variants: readonly string[],
+    signal?: AbortSignal,
+  ): Promise<JevJudgment<number>>;
   scoreCandidates(
     query: string,
     candidates: readonly JevCandidate[],
+    signal?: AbortSignal,
   ): Promise<JevJudgment<readonly number[]>>;
 }
 
@@ -101,7 +107,9 @@ export class JevProvider implements JevProviderClient {
     state: unknown,
     questions: Record<string, Question>,
     parse: (answers: Record<string, unknown>) => T | undefined,
+    signal?: AbortSignal,
   ): Promise<JevJudgment<T>> {
+    throwIfWebCancelled(signal);
     if (!this.apiKey) return { status: "auth_missing" };
     if (Object.keys(questions).length === 0 || Object.keys(questions).length > MAX_QUESTIONS) {
       return { status: "failed" };
@@ -120,11 +128,13 @@ export class JevProvider implements JevProviderClient {
           "content-type": "application/json",
         },
         body: JSON.stringify({ state, model: JEV_MODEL, questions }),
-        signal: controller.signal,
+        signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal,
         redirect: "error",
       });
+      throwIfWebCancelled(signal);
       if (!response.ok) return { status: mapFailure(response) };
       const text = await readBoundedBody(response);
+      throwIfWebCancelled(signal);
       if (text === undefined) return { status: "failed" };
       if (text.length > MAX_BODY_CHARS) return { status: "failed" };
       const payload = asRecord(JSON.parse(text));
@@ -138,13 +148,19 @@ export class JevProvider implements JevProviderClient {
       const value = parse(answers);
       return value === undefined ? { status: "failed" } : { status: "ready", value };
     } catch {
+      throwIfWebCancelled(signal);
       return { status: controller.signal.aborted ? "timeout" : "failed" };
     } finally {
       clearTimeout(timer);
     }
   }
 
-  chooseQuery(query: string, variants: readonly string[]): Promise<JevJudgment<number>> {
+  chooseQuery(
+    query: string,
+    variants: readonly string[],
+    signal?: AbortSignal,
+  ): Promise<JevJudgment<number>> {
+    throwIfWebCancelled(signal);
     if (variants.length < 2 || variants.length > 4) return Promise.resolve({ status: "failed" });
     const criteria = Object.fromEntries(variants.map((variant, index) => [`q${index}`, variant]));
     return this.evaluate(
@@ -163,13 +179,16 @@ export class JevProvider implements JevProviderClient {
         const index = match ? Number(match[1]) : -1;
         return index >= 0 && index < variants.length ? index : undefined;
       },
+      signal,
     );
   }
 
   scoreCandidates(
     query: string,
     candidates: readonly JevCandidate[],
+    signal?: AbortSignal,
   ): Promise<JevJudgment<readonly number[]>> {
+    throwIfWebCancelled(signal);
     const batch = candidates.slice(0, MAX_QUESTIONS);
     if (batch.length === 0) return Promise.resolve({ status: "ready", value: [] });
     const questions: Record<string, Question> = {};
@@ -190,14 +209,19 @@ export class JevProvider implements JevProviderClient {
         highlights: candidate.highlights.slice(0, 3).map((highlight) => highlight.slice(0, 800)),
       })),
     };
-    return this.evaluate(state, questions, (answers) => {
-      const scores = batch.map((_, index) => {
-        const answer = asRecord(answers[`r${index}`]);
-        return answer?.type === "noul" ? finiteProbability(answer.noul) : undefined;
-      });
-      return scores.some((score) => score !== undefined)
-        ? scores.map((score) => score ?? 0)
-        : undefined;
-    });
+    return this.evaluate(
+      state,
+      questions,
+      (answers) => {
+        const scores = batch.map((_, index) => {
+          const answer = asRecord(answers[`r${index}`]);
+          return answer?.type === "noul" ? finiteProbability(answer.noul) : undefined;
+        });
+        return scores.some((score) => score !== undefined)
+          ? scores.map((score) => score ?? 0)
+          : undefined;
+      },
+      signal,
+    );
   }
 }

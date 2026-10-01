@@ -1,3 +1,4 @@
+import { throwIfWebCancelled } from "./cancellation.js";
 import { JevProvider, type JevCandidate, type JevProviderClient } from "./jev-provider.js";
 
 export interface JevPlan {
@@ -127,7 +128,8 @@ export class JevPlanner {
     this.provider = options.provider ?? new JevProvider();
   }
 
-  async plan(query: string): Promise<JevPlan> {
+  async plan(query: string, signal?: AbortSignal): Promise<JevPlan> {
+    throwIfWebCancelled(signal);
     const variants = expandWebQuery(query);
     if (!variants.length) return { mode: "fast", queryVariants: [], jevUsed: false };
     const timeRange = extractTimeRange(query);
@@ -136,7 +138,12 @@ export class JevPlanner {
       return { mode: "fast", queryVariants: [variants[0]!], ...timeHint, jevUsed: false };
     }
 
-    const judged = await this.provider.chooseQuery(query.slice(0, MAX_QUERY_LENGTH), variants);
+    const judged = await this.provider.chooseQuery(
+      query.slice(0, MAX_QUERY_LENGTH),
+      variants,
+      signal,
+    );
+    throwIfWebCancelled(signal);
     if (judged.status !== "ready" || judged.value < 0 || judged.value >= variants.length) {
       return { mode: "complex", queryVariants: [variants[0]!], ...timeHint, jevUsed: false };
     }
@@ -156,13 +163,17 @@ export class JevPlanner {
   async rerank(
     query: string,
     candidates: readonly { url: string; title: string; highlights: readonly string[] }[],
+    signal?: AbortSignal,
   ): Promise<readonly { url: string; relevanceScore: number }[]> {
+    throwIfWebCancelled(signal);
     if (candidates.length === 0) return [];
     const bounded = candidates.slice(0, 12);
     const judged = await this.provider.scoreCandidates(
       query.slice(0, MAX_QUERY_LENGTH),
       bounded as readonly JevCandidate[],
+      signal,
     );
+    throwIfWebCancelled(signal);
     if (judged.status !== "ready" || judged.value.length !== bounded.length) {
       return candidates.map((candidate) => ({ url: candidate.url, relevanceScore: 0 }));
     }

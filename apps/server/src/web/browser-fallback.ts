@@ -1,3 +1,5 @@
+import { throwIfWebCancelled } from "./cancellation.js";
+import type { BrowserAction } from "./browser-bridge.js";
 import { BrowserBridge } from "./browser-bridge.js";
 import type { BrowserSessionBinding } from "./browser-session.js";
 import { assertPublicWebUrl, type ResolveWebHost } from "./network-guard.js";
@@ -141,43 +143,53 @@ export class GuardedBrowserFallback implements BrowserSearchFallback {
 
   private async preparedBinding(
     capabilities: readonly ("browser.read" | "browser.interact")[],
+    signal?: AbortSignal,
   ): Promise<BrowserSessionBinding | null> {
     const binding = await this.options.binding();
+    throwIfWebCancelled(signal);
     if (!binding) return null;
     for (const capability of capabilities)
       if (!(await this.options.authorize(binding, capability))) return null;
     return { ...binding, purpose: "fallback" };
   }
 
-  async search(query: string, maxResults: number): ReturnType<BrowserSearchFallback["search"]> {
-    const binding = await this.preparedBinding(["browser.read"]);
+  async search(
+    query: string,
+    maxResults: number,
+    signal?: AbortSignal,
+  ): ReturnType<BrowserSearchFallback["search"]> {
+    throwIfWebCancelled(signal);
+    const binding = await this.preparedBinding(["browser.read"], signal);
+    throwIfWebCancelled(signal);
     if (!binding) return { status: "fallback_denied", results: [] };
     const bridge = this.options.bridge;
     if (!bridge) return { status: "unavailable", results: [] };
+    const run = (action: BrowserAction) => bridge.execute(binding, action, signal);
     this.options.onActivated?.(binding, () => bridge.cleanup(binding));
     try {
       const searchUrl = new URL(SEARCH_URL);
       searchUrl.searchParams.set("q", query);
-      await bridge.execute(binding, { type: "open", url: searchUrl.href });
-      await bridge.execute(binding, {
+      await run({ type: "open", url: searchUrl.href });
+      await run({
         type: "wait",
         condition: "load",
         value: "domcontentloaded",
       });
       const snapshot = snapshotContent(
-        (await bridge.execute(binding, { type: "snapshot", interactive: true, compact: true }))
-          .output,
+        (await run({ type: "snapshot", interactive: true, compact: true })).output,
       );
+      throwIfWebCancelled(signal);
       if (blocked(snapshot)) return { status: "blocked", results: [] };
       const found = parseBrowserSearchSnapshot(snapshot, Math.min(maxResults * 4, 20));
       const results: Array<{ url: string; title: string; highlights: readonly string[] }> = [];
       for (const link of found) {
+        throwIfWebCancelled(signal);
         if (!(await this.options.authorize(binding, "browser.read")))
           return { status: "fallback_denied", results: [] };
         try {
           const href = hrefFromOutput(
             (
-              await bridge.execute(binding, {
+              await run({
                 type: "get",
                 kind: "attr",
                 ref: link.ref,
@@ -194,6 +206,7 @@ export class GuardedBrowserFallback implements BrowserSearchFallback {
             redirected ?? external.href,
             this.options.resolveHost,
           );
+          throwIfWebCancelled(signal);
           if (isSearchProviderHost(target.hostname)) continue;
           const existing = results.findIndex((result) => result.url === target.href);
           if (existing >= 0) {
@@ -204,31 +217,37 @@ export class GuardedBrowserFallback implements BrowserSearchFallback {
           if (results.length >= maxResults) continue;
           results.push({ url: target.href, title: link.title, highlights: [] });
         } catch {
+          throwIfWebCancelled(signal);
           /* One malformed result does not erase valid results. */
         }
       }
+      throwIfWebCancelled(signal);
       return { status: results.length ? "succeeded" : "blocked", results };
     } catch (error) {
+      throwIfWebCancelled(signal);
       return { status: statusFromError(error), results: [] };
     } finally {
       await bridge.cleanup(binding).catch(() => undefined);
     }
   }
 
-  async fetch(url: string): ReturnType<BrowserSearchFallback["fetch"]> {
-    const binding = await this.preparedBinding(["browser.read"]);
+  async fetch(url: string, signal?: AbortSignal): ReturnType<BrowserSearchFallback["fetch"]> {
+    throwIfWebCancelled(signal);
+    const binding = await this.preparedBinding(["browser.read"], signal);
+    throwIfWebCancelled(signal);
     if (!binding) return { status: "fallback_denied" };
     const bridge = this.options.bridge;
     if (!bridge) return { status: "unavailable" };
+    const run = (action: BrowserAction) => bridge.execute(binding, action, signal);
     this.options.onActivated?.(binding, () => bridge.cleanup(binding));
     try {
-      await bridge.execute(binding, { type: "open", url });
-      const read = await bridge.execute(binding, { type: "read" });
+      await run({ type: "open", url });
+      const read = await run({ type: "read" });
+      throwIfWebCancelled(signal);
       if (blocked(read.output)) return { status: "blocked" };
-      const final = hrefFromOutput(
-        (await bridge.execute(binding, { type: "get", kind: "url" })).output,
-      );
-      const title = (await bridge.execute(binding, { type: "get", kind: "title" })).output.trim();
+      const final = hrefFromOutput((await run({ type: "get", kind: "url" })).output);
+      const title = (await run({ type: "get", kind: "title" })).output.trim();
+      throwIfWebCancelled(signal);
       const fullText = decodedBrowserText(read.output);
       const text = snapshotText(fullText);
       if (!text) return { status: "blocked" };
@@ -241,6 +260,7 @@ export class GuardedBrowserFallback implements BrowserSearchFallback {
         truncated: read.truncated || fullText.length > text.length,
       };
     } catch (error) {
+      throwIfWebCancelled(signal);
       return { status: statusFromError(error) };
     } finally {
       await bridge.cleanup(binding).catch(() => undefined);

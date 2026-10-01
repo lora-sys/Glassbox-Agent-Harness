@@ -27,11 +27,15 @@ describe("keyless Exa MCP adapter", () => {
     }));
     const result = await new ExaMcpProvider({ call }).search({ query: "test", maxResults: 100 });
     expect(result.status).toBe("rate_limited");
-    expect(call).toHaveBeenCalledWith("web_search_exa", {
-      query: "test",
-      numResults: 10,
-      objective: "Find public sources that directly answer this query: test",
-    });
+    expect(call).toHaveBeenCalledWith(
+      "web_search_exa",
+      {
+        query: "test",
+        numResults: 10,
+        objective: "Find public sources that directly answer this query: test",
+      },
+      undefined,
+    );
   });
 
   it("rejects private URLs before calling hosted Exa", async () => {
