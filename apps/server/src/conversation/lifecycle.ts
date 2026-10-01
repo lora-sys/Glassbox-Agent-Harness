@@ -147,7 +147,8 @@ export class LifecycleStore {
     caller: CallerContext,
     runId: string,
   ): Promise<AuthorizedResult<null>> {
-    // Trusted execution paths mark an ALLOW only after a protected read succeeds.
+    // Trusted execution paths mark ALLOW decisions when protected output may enter Context,
+    // including native streams and partial failures; attribution can precede execution.
     // Discovery checks remain unmarked, so they cannot become delivery dependencies.
     const decisions = await tx.execute({
       sql: `SELECT DISTINCT d.resource_id, d.action, d.delivery_source, r.kind AS resource_kind

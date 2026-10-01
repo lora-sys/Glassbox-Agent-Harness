@@ -329,7 +329,8 @@ export function authorizedValue<T>(result: AuthorizedResult<T>): T {
 export class AuthorizationService {
   constructor(private readonly db: DomainDatabase) {}
 
-  /** Marks an ALLOW decision only after its protected operation returned successfully. */
+  /** Records protected output provenance before releasing content. Native tools mark before
+   * execution because they can stream or return partial content even when the call fails. */
   async markDeliverySource(
     decisionId: string,
     source: "content_source" | "access_gate",
