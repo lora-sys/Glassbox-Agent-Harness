@@ -149,7 +149,8 @@ it.each([
       ).toHaveLength(1);
     } finally {
       await store.close();
-      await rm(directory, { recursive: true, force: true });
+      // Windows can briefly retain a native database file lock after close.
+      await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
     }
   },
 );

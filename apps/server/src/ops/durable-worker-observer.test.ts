@@ -108,8 +108,9 @@ async function fixture(agentKind = "codex", prompted = true, databasePath = ":me
 
 afterEach(async () => {
   for (const store of stores.splice(0)) await store.close();
+  // Windows can briefly retain a native database file lock after close.
   for (const directory of directories.splice(0))
-    await rm(directory, { recursive: true, force: true });
+    await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 });
 
 describe("DurableWorkerObserver", () => {
