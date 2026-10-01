@@ -12,7 +12,12 @@ import {
 import type { PiRunContext } from "./types.js";
 import { WebService, type WebFetchInput, type WebSearchInput } from "../../web/web-service.js";
 import { WebTargetError } from "../../web/network-guard.js";
-import type { WebFetchResult, WebSearchResult, WebResultStatus } from "../../web/contracts.js";
+import type {
+  WebFetchResult,
+  WebSearchResult,
+  WebResultStatus,
+  WebProviderStatus,
+} from "../../web/contracts.js";
 
 export const WEB_SEARCH_TOOL = "web_search";
 export const WEB_FETCH_TOOL = "web_fetch";
@@ -57,13 +62,22 @@ function contextFrom(getContext: () => PiRunContext | undefined): ProtectedToolC
     : undefined;
 }
 
-function requireWebSuccess(status: WebResultStatus): void {
+function requireWebSuccess(status: WebResultStatus, providerStatus: WebProviderStatus): void {
   if (status === "succeeded" || status === "partial") return;
   if (status === "fallback_denied") throw new ProviderCallError("denied", "fallback_denied");
-  if (status === "unavailable")
-    throw new ProviderCallError("provider_unavailable", "provider_unavailable");
   if (status === "unknown") throw new ProviderCallError("unknown", "web_result_unknown");
   if (status === "blocked") throw new ProviderCallError("provider_failed", "browser_blocked");
+  // Keep a fixed safe category through the Tool error, not only in a private trace record.
+  if (providerStatus === "auth_missing")
+    throw new ProviderCallError("provider_unavailable", "web_provider_auth_missing");
+  if (providerStatus === "rate_limited")
+    throw new ProviderCallError("provider_unavailable", "web_provider_rate_limited");
+  if (providerStatus === "quota_exhausted")
+    throw new ProviderCallError("provider_unavailable", "web_provider_quota_exhausted");
+  if (providerStatus === "timeout")
+    throw new ProviderCallError("provider_failed", "web_provider_timeout");
+  if (status === "unavailable")
+    throw new ProviderCallError("provider_unavailable", "provider_unavailable");
   throw new ProviderCallError("provider_failed", "provider_failed");
 }
 
@@ -147,7 +161,7 @@ export function createWebTools(options: {
         },
         context,
       );
-      requireWebSuccess(result.status);
+      requireWebSuccess(result.status, result.providerStatus);
       return result;
     },
     projectResult: (result) => JSON.stringify(result),
@@ -192,7 +206,7 @@ export function createWebTools(options: {
         },
         context,
       );
-      requireWebSuccess(result.status);
+      requireWebSuccess(result.status, result.providerStatus);
       return result;
     },
     projectResult: (result) => JSON.stringify(result),

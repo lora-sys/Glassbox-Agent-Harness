@@ -142,3 +142,94 @@ describe("browser search fallback", () => {
     expect(await fallback.fetch("https://example.com/")).toEqual({ status: "unavailable" });
   });
 });
+
+describe("browser fallback content diagnostics", () => {
+  function contentFallback(text: string, title = "Technical documentation", truncated = false) {
+    const execute = vi.fn(async (_binding, action: Record<string, unknown>) => ({
+      output:
+        action.type === "read"
+          ? text
+          : action.kind === "title"
+            ? title
+            : action.kind === "url"
+              ? "https://example.com/docs"
+              : "",
+      truncated: action.type === "read" && truncated,
+    }));
+    return new GuardedBrowserFallback({
+      bridge: {
+        execute,
+        cleanup: vi.fn().mockResolvedValue(undefined),
+      } as unknown as BrowserBridge,
+      binding: async () => binding,
+      authorize: async () => true,
+    });
+  }
+  it.each(["challenge", "CAPTCHA", "rate limit", "too many requests"])(
+    "reads ordinary articles discussing %s",
+    async (word) => {
+      const text = `This tutorial explains the ${word} mechanism and how to implement it safely.`;
+      expect(await contentFallback(text).fetch("https://example.com/docs")).toMatchObject({
+        status: "succeeded",
+        text,
+      });
+    },
+  );
+  it("reads structured browser output without treating JSON wrapper length as clipping", async () => {
+    const text = "A guide to CAPTCHA challenge design.";
+    expect(
+      await contentFallback(JSON.stringify({ text })).fetch("https://example.com/docs"),
+    ).toMatchObject({ status: "succeeded", text, truncated: false });
+    expect(
+      await contentFallback(JSON.stringify({ text: "Verify you are human" })).fetch(
+        "https://example.com/docs",
+      ),
+    ).toMatchObject({ status: "blocked" });
+  });
+
+  it.each([false, true])(
+    "reports local clipping even when upstream truncated is %s",
+    async (upstream) => {
+      const result = await contentFallback("x".repeat(20001), "Large article", upstream).fetch(
+        "https://example.com/docs",
+      );
+      expect(result).toMatchObject({
+        status: "succeeded",
+        truncated: true,
+        text: "x".repeat(20000),
+      });
+    },
+  );
+  it.each(["Complete the CAPTCHA challenge", "Verify you are human", "Too many requests"])(
+    "still blocks the actual interstitial %s",
+    async (text) => {
+      expect(await contentFallback(text, text).fetch("https://example.com/docs")).toMatchObject({
+        status: "blocked",
+      });
+    },
+  );
+  it("does not mistake a CAPTCHA search result for an interstitial", async () => {
+    const execute = vi.fn(async (_binding, action: Record<string, unknown>) => ({
+      output:
+        action.type === "snapshot"
+          ? '- main "Search Results"\n  - link "CAPTCHA challenge implementation guide" [ref=e1]'
+          : action.type === "get"
+            ? "https://example.com/captcha-guide"
+            : "",
+      truncated: false,
+    }));
+    const fallback = new GuardedBrowserFallback({
+      bridge: {
+        execute,
+        cleanup: vi.fn().mockResolvedValue(undefined),
+      } as unknown as BrowserBridge,
+      binding: async () => binding,
+      authorize: async () => true,
+      resolveHost: async () => ["93.184.215.14"],
+    });
+    expect(await fallback.search("CAPTCHA", 5)).toMatchObject({
+      status: "succeeded",
+      results: [{ url: "https://example.com/captcha-guide" }],
+    });
+  });
+});

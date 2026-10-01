@@ -41,3 +41,36 @@ describe("keyless Exa MCP adapter", () => {
     expect(call).not.toHaveBeenCalled();
   });
 });
+
+describe("MCP transport failure classification", () => {
+  it.each([
+    [401, "auth_missing"],
+    [403, "auth_missing"],
+    [402, "quota_exhausted"],
+    [429, "rate_limited"],
+    [500, "failed"],
+    [-32001, "timeout"],
+  ])("reports code %s as %s without exposing transport details", async (code, status) => {
+    const call = vi.fn<ExaMcpCaller["call"]>(async () => {
+      throw Object.assign(
+        new Error("secret-query=https://private.invalid/token?credential=canary"),
+        { code },
+      );
+    });
+    const provider = new ExaMcpProvider({ call }, publicResolver);
+    expect(await provider.search({ query: "public", maxResults: 1 })).toEqual({
+      status,
+      results: [],
+    });
+    expect(await provider.contents("https://example.com/a")).toEqual({ status, results: [] });
+  });
+  it("does not classify arbitrary error-body digits as an HTTP status", async () => {
+    const call = vi.fn<ExaMcpCaller["call"]>(async () => {
+      throw new Error("example URL /429 and a private token");
+    });
+    expect(await new ExaMcpProvider({ call }).search({ query: "public", maxResults: 1 })).toEqual({
+      status: "failed",
+      results: [],
+    });
+  });
+});

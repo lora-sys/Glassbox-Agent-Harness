@@ -1,3 +1,5 @@
+import { ErrorCode } from "@modelcontextprotocol/sdk/types.js";
+import type { WebProviderStatus } from "./contracts.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { assertPublicWebUrl, type ResolveWebHost } from "./network-guard.js";
@@ -60,6 +62,24 @@ function failureStatus(text: string): "rate_limited" | "quota_exhausted" | "fail
   return /rate limit|too many requests|429/iu.test(text) ? "rate_limited" : "failed";
 }
 
+/** Safe structured failure categories; never return raw URLs, response bodies or credentials. */
+function transportFailureStatus(error: unknown): Exclude<WebProviderStatus, "ready" | "partial"> {
+  if (!error || typeof error !== "object") return "failed";
+  const value = error as { code?: unknown; status?: unknown; statusCode?: unknown; name?: unknown };
+  const code = value.status ?? value.statusCode ?? value.code;
+  if (code === 401 || code === 403) return "auth_missing";
+  if (code === 402) return "quota_exhausted";
+  if (code === 429) return "rate_limited";
+  if (
+    code === ErrorCode.RequestTimeout ||
+    code === "ETIMEDOUT" ||
+    code === "UND_ERR_CONNECT_TIMEOUT" ||
+    value.name === "TimeoutError"
+  )
+    return "timeout";
+  return "failed";
+}
+
 /** The hosted MCP formats search results as Title, URL, Published, Author, Highlights blocks. */
 export function parseExaMcpSearch(text: string): ExaRawResult[] {
   const results: ExaRawResult[] = [];
@@ -105,8 +125,8 @@ export class ExaMcpProvider {
       const text = resultText(result);
       if (result.isError) return { status: failureStatus(text), results: [] };
       return { status: "ready", results: parseExaMcpSearch(text) };
-    } catch {
-      return { status: "failed", results: [] };
+    } catch (error) {
+      return { status: transportFailureStatus(error), results: [] };
     }
   }
 
@@ -121,8 +141,8 @@ export class ExaMcpProvider {
       if (result.isError) return { status: failureStatus(text), results: [] };
       if (/^No content found/iu.test(text)) return { status: "ready", results: [] };
       return { status: "ready", results: [{ url: target.href, text }] };
-    } catch {
-      return { status: "failed", results: [] };
+    } catch (error) {
+      return { status: transportFailureStatus(error), results: [] };
     }
   }
 }
