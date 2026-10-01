@@ -1,8 +1,10 @@
+import type { AuthorizationPolicyCondition } from "../../auth/policy-condition.js";
 import type { AgentToolResult, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "typebox";
 import type { CallerContext } from "../../identity/scope.js";
-import type { AuthorizationService } from "../../auth/service.js";
+import { AccessDeniedError, type AuthorizationService } from "../../auth/service.js";
 import { ProviderCallError } from "./provider-outcome.js";
+import { QQ_CAPABILITIES } from "../../channels/onebot/capabilities.js";
 
 export interface ProtectedToolContext {
   caller: CallerContext;
@@ -71,6 +73,7 @@ const TOOL_GATE_CODES: ReadonlySet<string> = new Set([
   "too_many_pending_candidates",
   "memory_not_found",
   "memory_not_active",
+  "memory_version_conflict",
   "memory_type_mismatch",
   "memory_scope_mismatch",
   "memory_match_scope_mismatch",
@@ -84,10 +87,20 @@ const TOOL_GATE_CODES: ReadonlySet<string> = new Set([
   "bot_not_in_group",
   "group_not_enabled",
   "history_filter_required",
+  "invalid_history_time_bound",
+  "invalid_history_time_range",
+  "invalid_history_limit",
   "memory_source_denied",
+  "memory_source_provenance_unavailable",
   "memory_source_query_required",
   "skill_not_authorized_for_run",
   "skill_authority_changed",
+  "moderation_member_id_required",
+  "moderation_member_not_found",
+  "moderation_member_ambiguous",
+  "moderation_member_changed",
+  "moderation_authority_changed",
+  "moderation_resolution_unrecorded",
 ]);
 
 /**
@@ -123,6 +136,11 @@ export interface ProtectedToolOptions<
   parameters: TSchema;
   /** The authorization action may depend on the validated operation selected by the call. */
   action: string | ((params: TParams, context: ProtectedToolContext) => string);
+  /** Server-produced provenance, never read from Tool arguments as a condition. */
+  policyCondition?: (
+    params: TParams,
+    context: ProtectedToolContext,
+  ) => AuthorizationPolicyCondition | undefined;
   /** Marks successful protected reads for later delivery reauthorization. */
   deliverySource?:
     | "content_source"
@@ -252,9 +270,20 @@ function satisfiesRequiredMutationInput(
 export function requiredCallClause(
   name: string,
   input: Record<string, unknown> | undefined,
+  chatType?: CallerContext["scope"]["chatType"],
 ): string {
-  return input && Object.keys(input).length > 0
-    ? `${name} with exactly this JSON input: ${JSON.stringify(input)}`
+  // Group capability calls omit the server-bound group ID. Keep the original required
+  // input intact for authorization, completion checks and evidence.
+  const callInput =
+    input &&
+    chatType === "group" &&
+    QQ_CAPABILITIES.some(
+      (capability) => capability.tool === name && capability.resource === "group",
+    )
+      ? Object.fromEntries(Object.entries(input).filter(([key]) => key !== "groupId"))
+      : input;
+  return callInput && Object.keys(callInput).length > 0
+    ? `${name} with exactly this JSON input: ${JSON.stringify(callInput)}`
     : `${name} with a filter taken from the user's own words`;
 }
 
@@ -344,13 +373,15 @@ export function createProtectedTool<
           : options.action;
 
       // Gate 3 — Re-authorize immediately before executing side effect!
-      const decision = await options.authService.check({
+      const request = {
         caller: context.caller,
         resourceId,
         action,
+        policyCondition: options.policyCondition?.(typedParams, context),
         conversationId: context.conversationId,
         runId: context.runId,
-      });
+      };
+      const decision = await options.authService.check(request);
 
       if (decision.decision !== "ALLOW") {
         // Redact any confidential arguments from the denial output. Never echo raw parameters.
@@ -370,8 +401,19 @@ export function createProtectedTool<
           typeof options.deliverySource === "function"
             ? options.deliverySource(typedParams, context)
             : options.deliverySource;
-        if (deliverySource)
+        if (deliverySource && request.policyCondition && request.policyCondition.kind !== "none") {
+          try {
+            await options.authService.authorizeReadResults([
+              { request, decisionId: decision.id, source: deliverySource },
+            ]);
+          } catch (error) {
+            if (error instanceof AccessDeniedError)
+              throw new ToolInputError("protected_read_revoked");
+            throw error;
+          }
+        } else if (deliverySource) {
           await options.authService.markDeliverySource(decision.id, deliverySource);
+        }
         return {
           content: [
             {

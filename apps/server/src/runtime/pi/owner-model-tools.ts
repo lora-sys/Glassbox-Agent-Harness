@@ -74,6 +74,7 @@ export function createOwnerModelTools(options: {
       action: (params) =>
         params.action === "select" || params.action === "clear" ? "model:switch" : "model:read",
       resourceId: "owner-control",
+      deliverySource: "content_source",
       authService: options.store.authorization,
       getContext,
       execute: async (params, context) => {

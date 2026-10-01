@@ -35,6 +35,7 @@ import { createTaskGetAdapter } from "../execution/run-service/task-get-adapter.
 import { createCheckpointWriteAdapter } from "../execution/run-service/checkpoint-write-adapter.js";
 import { parseCheckpointWriteSpec, parseTaskGetSpec } from "../ops/tool-step-spec.js";
 import { configuredModelAdapter } from "../execution/model-adapter.js";
+import { ModelConfigurationError, resolveModelCredential } from "../model/provider.js";
 import { estimateUnicodeTokens } from "../efficiency/index.js";
 import {
   selectRoute,
@@ -55,7 +56,7 @@ import {
   PiRunExecutionAdapter,
   PiSdkRuntimeAdapter,
 } from "../runtime/pi/index.js";
-import { configuredPiModel } from "../runtime/pi/configured-model.js";
+import { configuredPiModel, hasConfiguredPiCredential } from "../runtime/pi/configured-model.js";
 import { createOpsTools, OPS_TOOL_NAMES, type WorkerTarget } from "../runtime/pi/ops-tools.js";
 import { createBrowserTools, BROWSER_TOOL } from "../runtime/pi/browser-tools.js";
 import {
@@ -105,13 +106,11 @@ import {
 import {
   GROUP_MEMORY_CANDIDATE_WRITE_ACTION,
   GROUP_MEMORY_READ_ACTION,
-  type CandidateCreate,
   MEMORY_GOVERN_ACTION,
   MEMORY_READ_ACTION,
   MEMORY_WRITE_ACTION,
   OWNER_MEMORY_RESOURCE,
 } from "../learning/store.js";
-import { classifyAutoCapture } from "../learning/auto-capture.js";
 import {
   createMediaGenerationTools,
   MEDIA_GENERATION_RESOURCE,
@@ -512,66 +511,12 @@ export class ManagementApplication {
       queuedPollMs: options.temporal ? 2_000 : 0,
       resolveExecution: (reference) => this.execution(reference),
       captureLearning: async (input) => {
-        const isOwner = await this.store.identities.isOwner(input.caller.principalId);
-        if (!isOwner) return undefined;
-        const group = input.caller.scope.chatType === "group";
-        const descriptor = classifyAutoCapture({
-          text: input.text,
-          actor: "owner",
-          role: "user",
-          scope: group
-            ? {
-                type: "group",
-                connectionId: input.caller.scope.connectionId,
-                botId: input.caller.scope.botId,
-                groupId: input.caller.scope.chatId,
-              }
-            : { type: "private" },
-          origin: "current_message",
-          messageRef: `run:${input.run.id}`,
-        });
-        if (!descriptor) return undefined;
-        const evidenceRef = `run:${input.run.id}`;
-        const operation = {
+        const candidate = await this.store.learning.captureCurrentMessage({
           caller: input.caller,
           conversationId: input.conversation.id,
           runId: input.run.id,
-        };
-        const candidateInput: CandidateCreate = {
-          candidateKind:
-            descriptor.evidence.kind === "explicit_correction" ? "correction" : "assertion",
-          subject: { kind: "user", id: input.caller.principalId },
-          scope: descriptor.scope,
-          proposedType: descriptor.type,
-          statement: descriptor.statement,
-          content: {
-            statement: descriptor.statement,
-            ...(descriptor.type === "preference" ? { preference: descriptor.statement } : {}),
-          },
-          source: { kind: "chat", ref: evidenceRef },
-          sourceEvidence: [
-            {
-              evidenceId: randomUUID(),
-              kind: "chat_message",
-              ref: evidenceRef,
-              capturedAt: new Date().toISOString(),
-              trustLevel: "high",
-              metadata: { signalKind: descriptor.evidence.kind },
-            },
-          ],
-          confidence: descriptor.confidence,
-          sensitivity: group ? "public" : "confidential",
-          mergeHint: { strategy: "manual_review_required" },
-          extensions: { "glassbox:auto-capture": true },
-        };
-        const candidate = group
-          ? await this.store.learning.createGroupCandidate(
-              operation,
-              groupResourceId(input.caller.scope.chatId),
-              candidateInput,
-            )
-          : await this.store.learning.createCandidate(operation, candidateInput);
-        return candidate.candidateId;
+        });
+        return candidate?.candidateId;
       },
       transport: {
         send: async ({ destination, delivery, signal }) => {
@@ -729,6 +674,11 @@ export class ManagementApplication {
     temporal?: { address: string; namespace?: string };
     temporalConnector?: TemporalConnector;
   }): Promise<ManagementApplication> {
+    // Validate copied workspace state before any store can mutate data or migrate the database.
+    await WorkspaceRegistry.preflight({
+      dataRoot: options.dataDirectory,
+      forbiddenRoots: [new KitLoader(options.kitPath).getKitPath()],
+    });
     const channels = await ChannelProfileStore.open(options.dataDirectory);
     const groupRuntime = await GroupRuntimeStore.open(options.dataDirectory);
     const store = await openDomainStore({
@@ -1171,7 +1121,11 @@ export class ManagementApplication {
     principalId: string,
     scope: TrustedChannelScope,
     workspaceId: string,
+    initialOnly = false,
   ): Promise<void> {
+    const grant = initialOnly
+      ? this.store.authorization.grantInitial.bind(this.store.authorization)
+      : this.store.authorization.grant.bind(this.store.authorization);
     const workspace = await this.workspaces.resolveAuthorized(principalId, workspaceId, "read");
     const resourceId = `workspace:${workspace.id}`;
     await this.store.authorization.registerResource({
@@ -1186,7 +1140,7 @@ export class ManagementApplication {
       ...(workspace.grants[principalId] === "write" ? ["workspace:write"] : []),
       DELIVERY_SEND_ACTION,
     ])
-      await this.store.authorization.grant({
+      await grant({
         principalId,
         resourceId,
         action,
@@ -1836,7 +1790,27 @@ export class ManagementApplication {
               throw new ProviderCallError("provider_failed", "provider_postcondition_failed");
             }
           }
-          return providerResult;
+          // These Tools apply their own bounded, identity-checked data projections.
+          // Preserve the verified envelope for every other operation, including mutations.
+          return action === "get_login_info" ||
+            action === "get_group_member_list" ||
+            action === "get_group_member_info"
+            ? providerResult.data
+            : providerResult;
+        },
+        recordModerationResolution: async (resolution, context) => {
+          const cursor = await this.trace.append(
+            context.runId,
+            {
+              type: "moderation_target_resolution",
+              runId: context.runId,
+              conversationId: context.conversationId,
+              principalId: context.caller.principalId,
+              ...resolution,
+            },
+            "glassbox-moderation-resolution",
+          );
+          await this.store.evidence.advanceTrace(context.caller, cursor);
         },
         verifyNativeGroupRole: async ({ context, groupId, capability, operation }) => {
           const connection = this.connections.get(context.caller.scope.connectionId);
@@ -2145,56 +2119,6 @@ export class ManagementApplication {
         const demandTokens =
           estimateUnicodeTokens(input.text) +
           input.history.reduce((sum, message) => sum + estimateUnicodeTokens(message.text) + 8, 0);
-        const candidates: RouteModelCapacity[] = configured.map((profile) => ({
-          profileId: profile.id,
-          executionRef: `${kind}:${profile.id}`,
-          configured: true,
-          capabilities: [
-            "text",
-            ...(kind === "pi" && profile.supportsTools === true ? ["tools" as const] : []),
-            ...(profile.supportsVision === true ? ["vision" as const] : []),
-            ...(profile.supportsThinking === true ? ["thinking" as const] : []),
-          ],
-          capabilityRank: profile.capabilityRank ?? null,
-          supportsThinking: profile.supportsThinking ?? null,
-          usage: {
-            inputTokens: null,
-            outputTokens: null,
-            concurrentRuns: null,
-            requestsPerMinute: null,
-            tokensPerMinute: null,
-          },
-          limits: {
-            contextWindowTokens: profile.contextWindowTokens ?? null,
-            maxOutputTokens: profile.maxOutputTokens ?? null,
-            maxConcurrentRuns: null,
-            requestsPerMinute: null,
-            tokensPerMinute: null,
-          },
-          health: (() => {
-            const operatorDisabled =
-              this.options.models
-                .list()
-                .find((configuredProfile) => configuredProfile.id === profile.id)
-                ?.routingAvailable === false;
-            const observation = this.runtimeHealthByProfile.get(profile.id);
-            const fresh = observation !== undefined && Date.now() - observation.checkedAt <= 60_000;
-            return {
-              state: operatorDisabled
-                ? ("unavailable" as const)
-                : fresh
-                  ? observation.state
-                  : ("unknown" as const),
-              checkedAt: fresh ? new Date(observation.checkedAt).toISOString() : null,
-              latencyMs: fresh ? observation.latencyMs : null,
-              reasonCode: operatorDisabled
-                ? "operator_disabled"
-                : fresh
-                  ? observation.reasonCode
-                  : null,
-            };
-          })(),
-        }));
         const ordered = configured
           .filter((profile) =>
             explicitOverride
@@ -2205,6 +2129,67 @@ export class ManagementApplication {
             (a, b) =>
               (a.routePriority ?? 1000) - (b.routePriority ?? 1000) || a.id.localeCompare(b.id),
           );
+        const candidates: RouteModelCapacity[] = await Promise.all(
+          ordered.map(async (profile) => ({
+            profileId: profile.id,
+            executionRef: `${kind}:${profile.id}`,
+            configured:
+              kind === "pi"
+                ? await hasConfiguredPiCredential(
+                    this.options.models,
+                    profile.id,
+                    this.piModelCatalog,
+                    input.signal,
+                  )
+                : resolveModelCredential(this.options.models.resolve(profile.id)) !== undefined,
+            capabilities: [
+              "text",
+              ...(kind === "pi" && profile.supportsTools === true ? ["tools" as const] : []),
+              ...(profile.supportsVision === true ? ["vision" as const] : []),
+              ...(profile.supportsThinking === true ? ["thinking" as const] : []),
+            ],
+            capabilityRank: profile.capabilityRank ?? null,
+            supportsThinking: profile.supportsThinking ?? null,
+            usage: {
+              inputTokens: null,
+              outputTokens: null,
+              concurrentRuns: null,
+              requestsPerMinute: null,
+              tokensPerMinute: null,
+            },
+            limits: {
+              contextWindowTokens: profile.contextWindowTokens ?? null,
+              maxOutputTokens: profile.maxOutputTokens ?? null,
+              maxConcurrentRuns: null,
+              requestsPerMinute: null,
+              tokensPerMinute: null,
+            },
+            health: (() => {
+              const operatorDisabled =
+                this.options.models
+                  .list()
+                  .find((configuredProfile) => configuredProfile.id === profile.id)
+                  ?.routingAvailable === false;
+              const observation = this.runtimeHealthByProfile.get(profile.id);
+              const fresh =
+                observation !== undefined && Date.now() - observation.checkedAt <= 60_000;
+              return {
+                state: operatorDisabled
+                  ? ("unavailable" as const)
+                  : fresh
+                    ? observation.state
+                    : ("unknown" as const),
+                checkedAt: fresh ? new Date(observation.checkedAt).toISOString() : null,
+                latencyMs: fresh ? observation.latencyMs : null,
+                reasonCode: operatorDisabled
+                  ? "operator_disabled"
+                  : fresh
+                    ? observation.reasonCode
+                    : null,
+              };
+            })(),
+          })),
+        );
         const routingInput = {
           task: {
             risk:
@@ -2216,10 +2201,13 @@ export class ManagementApplication {
               )
                 ? ("high" as const)
                 : ("medium" as const),
-            requiredCapabilities:
-              kind === "pi" && input.executionMode !== "task_step_model"
-                ? (["text", "tools"] as const)
-                : (["text"] as const),
+            requiredCapabilities: [
+              "text" as const,
+              ...(kind === "pi" && input.executionMode !== "task_step_model"
+                ? ["tools" as const]
+                : []),
+              ...(input.images?.length ? ["vision" as const] : []),
+            ],
             requiredContextTokens: Math.max(
               estimateUnicodeTokens(input.text) + 6144,
               Math.min(demandTokens, 32768),
@@ -2326,9 +2314,24 @@ export class ManagementApplication {
           );
           await this.store.evidence.advanceTrace(caller, evidenceCursor);
         };
-        if (decision.executionRef === null) {
+        const selectedCandidate = candidates.find(
+          (candidate) => candidate.executionRef === decision.executionRef,
+        );
+        if (decision.executionRef === null || selectedCandidate?.configured === false) {
           await appendRoutingEval(null);
-          return { status: "failed", failureCode: "execution_unavailable" };
+          const reasons = decision.candidates.map((candidate) => candidate.reason);
+          return {
+            status: "failed",
+            runtimeAttempted: false,
+            failureCode:
+              selectedCandidate?.configured === false
+                ? "model_credential_missing"
+                : reasons.length > 0 && reasons.every((reason) => reason === "missing_capability")
+                  ? "model_capability_missing"
+                  : reasons.length > 0 && reasons.every((reason) => reason === "not_configured")
+                    ? "model_credential_missing"
+                    : "execution_unavailable",
+          };
         }
         const selected =
           decision.executionRef === reference
@@ -2340,16 +2343,19 @@ export class ManagementApplication {
         }
         let succeeded = false;
         let actualExecutionRef = decision.executionRef;
+        let runtimeAttempted: boolean | undefined;
         const observeRuntimeHealth = async (
           executionRef: string,
           state: RuntimeHealthState,
           startedAt: number,
           reasonCode: string | null,
+          measurement: "provider_runtime" | "policy_result" | "unknown" = "provider_runtime",
         ) => {
           const profileId = executionRef.slice(kind.length + 1);
           const checkedAt = Date.now();
           const latencyMs = Math.max(0, checkedAt - startedAt);
-          this.runtimeHealthByProfile.set(profileId, { state, checkedAt, latencyMs, reasonCode });
+          if (measurement === "provider_runtime")
+            this.runtimeHealthByProfile.set(profileId, { state, checkedAt, latencyMs, reasonCode });
           const observationCursor = await this.trace.append(
             input.run.id,
             {
@@ -2357,9 +2363,10 @@ export class ManagementApplication {
               schema: "glassbox.runtime-health-observation.v1",
               executionRef,
               state,
+              measurement,
               checkedAt: new Date(checkedAt).toISOString(),
               freshnessWindowMs: 60_000,
-              latencyMs,
+              latencyMs: measurement === "provider_runtime" ? latencyMs : null,
               reasonCode,
             },
             "glassbox-runtime-telemetry",
@@ -2373,16 +2380,40 @@ export class ManagementApplication {
         ) => {
           const health = runtimeHealthOf(result);
           if (health === undefined) {
-            // A provider was not called, so this is not evidence of runtime health.
-            this.runtimeHealthByProfile.delete(executionRef.slice(kind.length + 1));
+            // A local response does not replace a prior measured health observation.
+            if (result.runtimeAttempted === false) {
+              const cursor = await this.trace.append(
+                input.run.id,
+                {
+                  type: "runtime_health_observation",
+                  schema: "glassbox.runtime-health-observation.v1",
+                  executionRef,
+                  state: "unknown",
+                  measurement: "not_attempted",
+                  checkedAt: new Date().toISOString(),
+                  freshnessWindowMs: 60_000,
+                  latencyMs: null,
+                  reasonCode: result.failureCode ?? "local_response",
+                },
+                "glassbox-runtime-telemetry",
+              );
+              await this.store.evidence.advanceTrace(caller, cursor);
+            }
             return;
           }
-          await observeRuntimeHealth(executionRef, health.state, startedAt, health.reasonCode);
+          await observeRuntimeHealth(
+            executionRef,
+            health.state,
+            startedAt,
+            health.reasonCode,
+            health.state === "degraded" ? "policy_result" : "provider_runtime",
+          );
         };
         let attemptStartedAt = Date.now();
         try {
           attemptStartedAt = Date.now();
           let result = await selected.execute(input);
+          runtimeAttempted = result.runtimeAttempted;
           await recordRuntimeHealth(actualExecutionRef, result, attemptStartedAt);
           if (
             result.failureCode === "pre_provider_context_overflow" &&
@@ -2443,28 +2474,40 @@ export class ManagementApplication {
               actualExecutionRef = upgrade.executionRef;
               attemptStartedAt = Date.now();
               result = await alternative.execute(input);
+              runtimeAttempted = result.runtimeAttempted;
               await recordRuntimeHealth(actualExecutionRef, result, attemptStartedAt);
             }
           }
           succeeded = result.status === "succeeded";
           return result;
         } catch (error) {
-          // An exception escaping the executor does not assert that the runtime was engaged and
-          // failed: it can be a gate, an abort, a fault in recording evidence, or the provider
-          // being unreachable, and from out here there is no way to tell them apart. Recording
-          // `unavailable` anyway would be guessing at the most destructive answer, which is how
-          // a refusal Glassbox issued itself once pulled a working profile out of routing. The
-          // positively asserted form of that signal is `runtime_run_errored`, which only the
-          // runtime can report, and that is what removes the profile.
+          if (
+            error instanceof ModelConfigurationError &&
+            (error.code === "missing_credential" || error.code === "unsupported_credential")
+          ) {
+            const result: ExecutionResult = {
+              status: "failed",
+              failureCode: "model_credential_missing",
+              runtimeAttempted: false,
+            };
+            runtimeAttempted = false;
+            await recordRuntimeHealth(actualExecutionRef, result, attemptStartedAt);
+            return result;
+          }
+          // An escaping exception does not prove that the provider was called.
           await observeRuntimeHealth(
             actualExecutionRef,
-            "degraded",
+            "unknown",
             attemptStartedAt,
             "execution_error",
+            "unknown",
           );
           throw error;
         } finally {
-          await appendRoutingEval(actualExecutionRef, succeeded);
+          await appendRoutingEval(
+            runtimeAttempted === false ? null : actualExecutionRef,
+            succeeded,
+          );
         }
       },
     };
@@ -2620,8 +2663,8 @@ export class ManagementApplication {
           "Disconnect the channel before editing its configuration",
           409,
         );
+      const addedMembers: Array<{ senderId: string; principalId: string }> = [];
       const channel = await this.channels.save(input, async (previous, next) => {
-        if (!previous) return;
         const members = (config: typeof next) =>
           new Map<string, string>([
             [config.ownerId, OWNER_ID],
@@ -2629,13 +2672,44 @@ export class ManagementApplication {
             ...config.visitorIds.map((senderId) => [senderId, `qq-visitor-${senderId}`] as const),
           ]);
         const nextMembers = members(next);
-        for (const [senderId, principalId] of members(previous)) {
+        const previousMembers = previous ? members(previous) : new Map<string, string>();
+        for (const [senderId, principalId] of nextMembers) {
+          if (previous?.botId === next.botId && previousMembers.get(senderId) === principalId)
+            continue;
+          addedMembers.push({ senderId, principalId });
+        }
+        if (!previous) return;
+        for (const [senderId, principalId] of previousMembers) {
           if (previous.botId === next.botId && nextMembers.get(senderId) === principalId) continue;
           const identity = { connectionId: previous.connectionId, botId: previous.botId, senderId };
           await this.store.authorization.revokeSenderScopes(identity);
           await this.store.identities.unbind(identity);
         }
       });
+      // Re-adding an identity is an explicit management decision. Restore only this
+      // membership's built-in defaults, after its new configuration has been persisted.
+      // Identity binding still waits for connect; custom grants stay revoked.
+      for (const member of addedMembers) {
+        for (const location of [
+          { chatType: "private" as const, chatId: member.senderId },
+          ...channel.groupIds.map((chatId) => ({ chatType: "group" as const, chatId })),
+        ]) {
+          const history = await this.store.authorization.listScopeHistory({
+            resourceId: agentResourceId(AGENT_ID),
+            action: "run:create",
+            connectionId: channel.id,
+            botId: channel.botId,
+            ...location,
+          });
+          for (const prior of history) {
+            if (
+              prior.principalId === member.principalId &&
+              prior.scope.senderId === member.senderId
+            )
+              await this.grantScope(prior.scope, member.principalId, false);
+          }
+        }
+      }
       this.states.delete(id);
       return channel;
     });
@@ -2879,7 +2953,12 @@ export class ManagementApplication {
         principalId,
         scope: privateScope,
       }))
-        await this.grantGroupDelivery({ principalId, scope: privateScope, groupId });
+        await this.grantGroupDelivery({
+          principalId,
+          scope: privateScope,
+          groupId,
+          initialOnly: true,
+        });
     }
 
     for (const visitorId of configured.config.visitorIds) {
@@ -2938,7 +3017,10 @@ export class ManagementApplication {
     if (current.decision !== "ALLOW") await this.grantScope(scope, caller.principalId);
   }
 
-  private async grantScope(scope: TrustedChannelScope, principalId = OWNER_ID) {
+  private async grantScope(scope: TrustedChannelScope, principalId = OWNER_ID, initialOnly = true) {
+    const grant = initialOnly
+      ? this.store.authorization.grantInitial.bind(this.store.authorization)
+      : this.store.authorization.grant.bind(this.store.authorization);
     const isOwner = await this.store.identities.isOwner(principalId);
     const caller: CallerContext = { principalId, scope };
     for (const action of ACTIONS) {
@@ -2949,7 +3031,7 @@ export class ManagementApplication {
         action,
       });
       if (existing.decision !== "ALLOW")
-        await this.store.authorization.grant({
+        await grant({
           principalId,
           resourceId: agentResourceId(AGENT_ID),
           action,
@@ -2963,7 +3045,7 @@ export class ManagementApplication {
       visibility: "public",
       ifAbsent: true,
     });
-    await this.store.authorization.grant({
+    await grant({
       principalId,
       resourceId: SKILL_CATALOG_RESOURCE,
       action: SKILL_READ_ACTION,
@@ -2974,7 +3056,7 @@ export class ManagementApplication {
     // this Resource for every Run whose answer derives from one — the same recheck every other
     // content source already passes. Granting `skill:read` alone denied those Runs at delivery
     // time: the Run succeeded, whatever it changed was durable, and the sender received nothing.
-    await this.store.authorization.grant({
+    await grant({
       principalId,
       resourceId: SKILL_CATALOG_RESOURCE,
       action: "delivery:send",
@@ -2988,7 +3070,7 @@ export class ManagementApplication {
       visibility: "public",
       ifAbsent: true,
     });
-    await this.store.authorization.grant({
+    await grant({
       principalId,
       resourceId: skillToolResource,
       action: TOOL_DISCOVERY_ACTION,
@@ -3003,7 +3085,7 @@ export class ManagementApplication {
         ifAbsent: true,
       });
       for (const capability of WEB_CAPABILITIES) {
-        await this.store.authorization.grant({
+        await grant({
           principalId,
           resourceId: WEB_RESOURCE,
           action: WEB_ACTIONS[capability],
@@ -3011,7 +3093,7 @@ export class ManagementApplication {
           effect: "allow",
         });
       }
-      await this.store.authorization.grant({
+      await grant({
         principalId,
         resourceId: WEB_RESOURCE,
         action: BROWSER_ARTIFACT_DELIVER_ACTION,
@@ -3026,7 +3108,7 @@ export class ManagementApplication {
           visibility: "public",
           ifAbsent: true,
         });
-        await this.store.authorization.grant({
+        await grant({
           principalId,
           resourceId,
           action: TOOL_DISCOVERY_ACTION,
@@ -3056,7 +3138,7 @@ export class ManagementApplication {
           action,
         });
         if (existing.decision !== "ALLOW")
-          await this.store.authorization.grant({
+          await grant({
             principalId,
             resourceId: groupResource,
             action,
@@ -3068,11 +3150,11 @@ export class ManagementApplication {
       // The Run's own group scope is the audience it already owns, so this is the one delivery
       // authority a group Run can hold. It is granted only because Glassbox configured
       // this group. Bot membership alone registers nothing and grants nothing.
-      await this.grantGroupDelivery({ principalId, scope, groupId: scope.chatId });
+      await this.grantGroupDelivery({ principalId, scope, groupId: scope.chatId, initialOnly });
       // Discovery is a superset of authority, exactly as for the Owner-private scope: the
       // Run's candidate list narrows it to policy, so a category change applies on the next
       // Run with no re-grant and a revoked category cannot survive as stale discovery.
-      await this.grantCapabilityDiscovery({ principalId, scope });
+      await this.grantCapabilityDiscovery({ principalId, scope, initialOnly });
     }
     for (const name of availableHistoryToolNames({
       isOwner,
@@ -3087,7 +3169,7 @@ export class ManagementApplication {
         ...(scope.chatType === "group" ? {} : { ownerId: OWNER_ID }),
         ifAbsent: true,
       });
-      await this.store.authorization.grant({
+      await grant({
         principalId,
         resourceId,
         action: TOOL_DISCOVERY_ACTION,
@@ -3106,7 +3188,7 @@ export class ManagementApplication {
         ifAbsent: true,
       });
       for (const action of ["workspace:read", "workspace:write", DELIVERY_SEND_ACTION]) {
-        await this.store.authorization.grant({
+        await grant({
           principalId,
           resourceId: workspaceResource,
           action,
@@ -3116,7 +3198,7 @@ export class ManagementApplication {
       }
       for (const workspace of await this.workspaces.listForPrincipal(principalId)) {
         if (workspace.id !== defaultWorkspace.id)
-          await this.grantWorkspaceScope(principalId, scope, workspace.id);
+          await this.grantWorkspaceScope(principalId, scope, workspace.id, initialOnly);
       }
       for (const name of GLASSBOX_HOST_EXCLUDED_PI_TOOLS) {
         const resourceId = toolResourceId(name);
@@ -3127,7 +3209,7 @@ export class ManagementApplication {
           ownerId: OWNER_ID,
           ifAbsent: true,
         });
-        await this.store.authorization.grant({
+        await grant({
           principalId,
           resourceId,
           action: TOOL_DISCOVERY_ACTION,
@@ -3142,7 +3224,7 @@ export class ManagementApplication {
         ownerId: OWNER_ID,
         ifAbsent: true,
       });
-      await this.store.authorization.grant({
+      await grant({
         principalId,
         resourceId: OWNER_CONTROL_RESOURCE,
         action: "group:manage",
@@ -3150,7 +3232,7 @@ export class ManagementApplication {
         effect: "allow",
       });
       for (const action of ["model:read", "model:switch", DELIVERY_SEND_ACTION]) {
-        await this.store.authorization.grant({
+        await grant({
           principalId,
           resourceId: OWNER_CONTROL_RESOURCE,
           action,
@@ -3166,7 +3248,7 @@ export class ManagementApplication {
         ifAbsent: true,
       });
       for (const action of [MEMORY_READ_ACTION, MEMORY_WRITE_ACTION, MEMORY_GOVERN_ACTION]) {
-        await this.store.authorization.grant({
+        await grant({
           principalId,
           resourceId: OWNER_MEMORY_RESOURCE,
           action,
@@ -3174,7 +3256,7 @@ export class ManagementApplication {
           effect: "allow",
         });
       }
-      await this.store.authorization.grant({
+      await grant({
         principalId,
         resourceId: OWNER_MEMORY_RESOURCE,
         action: DELIVERY_SEND_ACTION,
@@ -3188,7 +3270,7 @@ export class ManagementApplication {
         ownerId: OWNER_ID,
         ifAbsent: true,
       });
-      await this.store.authorization.grant({
+      await grant({
         principalId,
         resourceId: MEDIA_GENERATION_RESOURCE,
         action: MEDIA_GENERATE_ACTION,
@@ -3202,7 +3284,7 @@ export class ManagementApplication {
           visibility: "public",
           ifAbsent: true,
         });
-        await this.store.authorization.grant({
+        await grant({
           principalId,
           resourceId: "agent-operations",
           action: DELIVERY_SEND_ACTION,
@@ -3225,7 +3307,7 @@ export class ManagementApplication {
           ownerId: OWNER_ID,
           ifAbsent: true,
         });
-        await this.store.authorization.grant({
+        await grant({
           principalId,
           resourceId,
           action: TOOL_DISCOVERY_ACTION,
@@ -3233,7 +3315,7 @@ export class ManagementApplication {
           effect: "allow",
         });
       }
-      await this.grantCapabilityDiscovery({ principalId, scope });
+      await this.grantCapabilityDiscovery({ principalId, scope, initialOnly });
       // The Owner cross-group history Tool spans several group Resources, so it is gated on
       // this Owner-private search capability. Each concrete group Resource is still
       // re-authorized inside the Tool and the decision recorded with the Run.
@@ -3244,7 +3326,7 @@ export class ManagementApplication {
         ownerId: OWNER_ID,
         ifAbsent: true,
       });
-      await this.store.authorization.grant({
+      await grant({
         principalId,
         resourceId: OWNER_HISTORY_RESOURCE,
         action: OWNER_HISTORY_ACTION,
@@ -3263,7 +3345,7 @@ export class ManagementApplication {
           action,
         });
         if (existing.decision !== "ALLOW")
-          await this.store.authorization.grant({
+          await grant({
             principalId,
             resourceId: agentResourceId(AGENT_ID),
             action,
@@ -3288,10 +3370,14 @@ export class ManagementApplication {
    * group scope, or this Owner's own persisted `group:manage` assignment.
    */
   private async grantGroupDelivery(input: {
+    initialOnly?: boolean;
     principalId: string;
     scope: TrustedChannelScope;
     groupId: string;
   }): Promise<void> {
+    const grant = input.initialOnly
+      ? this.store.authorization.grantInitial.bind(this.store.authorization)
+      : this.store.authorization.grant.bind(this.store.authorization);
     const resourceId = groupResourceId(input.groupId);
     await this.store.authorization.registerResource({
       id: resourceId,
@@ -3306,7 +3392,7 @@ export class ManagementApplication {
       action: DELIVERY_SEND_ACTION,
     });
     if (existing.decision !== "ALLOW")
-      await this.store.authorization.grant({
+      await grant({
         principalId: input.principalId,
         resourceId,
         action: DELIVERY_SEND_ACTION,
@@ -3331,6 +3417,7 @@ export class ManagementApplication {
    * its own `tool:discover` grant, which is what this method writes.
    */
   private async grantCapabilityDiscovery(input: {
+    initialOnly?: boolean;
     principalId: string;
     scope: TrustedChannelScope;
   }): Promise<void> {
@@ -3341,28 +3428,19 @@ export class ManagementApplication {
       enabledCategories: [...QQ_CAPABILITY_CATEGORIES],
       ...(input.scope.chatType === "group" ? { nativeGroupRole: "qq_group_owner" as const } : {}),
     });
-    for (const name of names) {
-      const resourceId = toolResourceId(name);
-      await this.store.authorization.registerResource({
-        id: resourceId,
-        kind: "tool-definition",
-        visibility: "public",
-        ifAbsent: true,
-      });
-      const existing = await this.store.authorization.check({
-        caller: { principalId: input.principalId, scope: input.scope },
-        resourceId,
+    await this.store.authorization.provisionResources({
+      caller: { principalId: input.principalId, scope: input.scope },
+      initialOnly: input.initialOnly ?? false,
+      entries: names.map((name) => ({
+        resource: {
+          id: toolResourceId(name),
+          kind: "tool-definition",
+          visibility: "public",
+          ifAbsent: true,
+        },
         action: TOOL_DISCOVERY_ACTION,
-      });
-      if (existing.decision !== "ALLOW")
-        await this.store.authorization.grant({
-          principalId: input.principalId,
-          resourceId,
-          action: TOOL_DISCOVERY_ACTION,
-          scope: input.scope,
-          effect: "allow",
-        });
-    }
+      })),
+    });
   }
 
   /**
@@ -3442,7 +3520,23 @@ export class ManagementApplication {
         // A Run inside the group needs its own group-scope grants, for the Owner and for
         // every Visitor the transport serves. These are group scope, not Owner assignment.
         for (const scope of groupScopes)
-          await this.grantScope(scope, this.principalForScope(configured, scope));
+          await this.grantScope(scope, this.principalForScope(configured, scope), false);
+        // Dynamic members are absent from the static profile. An explicit reopen restores
+        // the same defaults in their exact historical scopes, including thread boundaries.
+        // Old bindings and unrelated custom grants cannot establish restored authority.
+        for (const prior of await this.store.authorization.listScopeHistory({
+          resourceId: agentResourceId(AGENT_ID),
+          action: "run:create",
+          connectionId: configured.config.connectionId,
+          botId: configured.config.botId,
+          chatType: "group",
+          chatId: input.groupId,
+        })) {
+          if (groupScopes.some((scope) => scopeKey(scope) === scopeKey(prior.scope))) continue;
+          const current = await this.store.identities.resolve(prior.scope);
+          if (current?.principalId === prior.principalId)
+            await this.grantScope(prior.scope, current.principalId, false);
+        }
       } else {
         // Revoke exactly the acting Owner's assignment, bundle and history grant.
         await this.store.authorization.revokeScope({

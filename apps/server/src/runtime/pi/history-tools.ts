@@ -1,3 +1,5 @@
+import { AccessDeniedError } from "../../auth/service.js";
+import { qqCategoryCondition } from "../../auth/policy-condition.js";
 /**
  * Runtime Tools for authorized Channel history search.
  *
@@ -30,6 +32,7 @@ import {
 } from "../../retrieval/context.js";
 import { carriesEveryExactTerm, exactTerms, isBareExactTerm } from "../../retrieval/exact-term.js";
 import { MemoryRetriever, type RetrievalCoverage } from "../../retrieval/retriever.js";
+import { historyLimit, historyTimeWindow } from "../../retrieval/history-time.js";
 import {
   groupResourceId,
   resolveAssignedGroupIds,
@@ -697,17 +700,8 @@ function validatedParams(input: GroupHistoryInput): GroupHistoryInput {
     throw new Error("invalid_history_sender");
   if (input.mentionsMe !== undefined && typeof input.mentionsMe !== "boolean")
     throw new Error("invalid_history_mentions_me");
-  const limit = input.limit === undefined ? DEFAULT_LIMIT : input.limit;
-  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_LIMIT)
-    throw new Error("invalid_history_limit");
-  const bound = (value: unknown): string | undefined => {
-    if (value === undefined) return undefined;
-    if (typeof value !== "string" || Number.isNaN(Date.parse(value)))
-      throw new Error("invalid_history_time_bound");
-    return value;
-  };
-  const since = bound(input.since);
-  const until = bound(input.until);
+  const limit = historyLimit(input.limit, DEFAULT_LIMIT, MAX_LIMIT);
+  const { since, until } = historyTimeWindow(input);
   if (!query.trim() && !sender && input.mentionsMe !== true && !since && !until)
     throw new Error("history_filter_required");
   return {
@@ -806,6 +800,7 @@ export function createHistoryTools(options: {
         caller,
         resourceId: groupResourceId(groupId),
         action: HISTORY_READ_ACTION,
+        policyCondition: qqCategoryCondition(caller, groupId, "group.history"),
         conversationId: context.conversationId,
         runId: context.runId,
       });
@@ -836,6 +831,7 @@ export function createHistoryTools(options: {
       since: params.since,
       until: params.until,
       metadataFilters: {
+        connectionId: caller.scope.connectionId,
         ...(params.sender ? { sender: params.sender } : {}),
         ...(botId ? { mentionedUserId: botId } : {}),
       },
@@ -893,6 +889,25 @@ export function createHistoryTools(options: {
       resultStatus: items.length > 0 ? "matches_found" : "no_matches_in_searched_window",
       coverage,
     };
+    try {
+      await options.store.authorization.authorizeReadResults(
+        [...new Set(items.map((item) => item.groupId))].map((groupId) => ({
+          request: {
+            caller,
+            resourceId: groupResourceId(groupId),
+            action: HISTORY_READ_ACTION,
+            policyCondition: qqCategoryCondition(caller, groupId, "group.history"),
+            conversationId: context.conversationId,
+            runId: context.runId,
+          },
+          decisionId: sourceDecisions.get(groupId) ?? "missing",
+          source: "content_source" as const,
+        })),
+      );
+    } catch (error) {
+      if (error instanceof AccessDeniedError) throw new ToolInputError("protected_read_revoked");
+      throw error;
+    }
     await options.recordEvidence?.(
       {
         type: "history_retrieval",
@@ -918,11 +933,6 @@ export function createHistoryTools(options: {
       },
       context,
     );
-    for (const groupId of new Set(items.map((item) => item.groupId))) {
-      const decisionId = sourceDecisions.get(groupId);
-      if (decisionId)
-        await options.store.authorization.markDeliverySource(decisionId, "content_source");
-    }
     return details;
   };
 

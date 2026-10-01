@@ -80,6 +80,8 @@ export interface PiRunResult {
     totalTokens?: number;
   };
   error?: string;
+  /** Safe diagnostic assigned by the adapter; raw error text cannot select its origin. */
+  failure?: import("./failure-diagnostics.js").PiFailureDiagnostic;
 }
 
 import type { CallerContext } from "../../identity/scope.js";
@@ -87,6 +89,8 @@ import type { ToolExecutionOutcome } from "./tool-plane.js";
 import type { RequiredEvidence } from "./required-evidence.js";
 
 export interface PiRunContext {
+  /** Server-owned authorization callback; never populated from model or Tool input. */
+  authorizeProviderContext?: () => Promise<void>;
   /** Trusted server execution mode, not inferred from prompt text. */
   executionMode?: "task_step_model";
   caller?: CallerContext;

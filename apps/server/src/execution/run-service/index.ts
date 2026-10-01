@@ -48,6 +48,9 @@ const failureFallback: Record<ExecutionFailureCode, string> = {
   execution_threw: "执行这次请求的进程中途出错了，没有产出结果。请稍后重试。",
   pre_provider_context_overflow:
     "这次请求的内容超出了当前模型的上下文容量，未发送给模型。可以缩小问题范围或另开一个会话再试。",
+  model_capability_missing:
+    "当前配置的模型不支持这次输入，因此没有发送给模型。请切换到支持相应输入的模型后重试。",
+  model_credential_missing: "当前模型未配置可用凭据，因此没有发送请求。请检查模型凭据后重试。",
   model_capacity_unknown: "没能确认当前模型的上下文容量，因此没有发送给模型。请稍后重试。",
   required_action_not_completed: "这次请求需要执行的操作没有完成，因此无法给出结果。请稍后重试。",
   claimed_change_not_performed:
@@ -55,6 +58,7 @@ const failureFallback: Record<ExecutionFailureCode, string> = {
   required_evidence_missing: "没能取到这条问题所依赖的原始信息，因此无法确认。请稍后重试。",
   gate_refused: "这个请求被我自己的规则拦下了，因此没有执行。",
   runtime_run_errored: "模型在执行这次请求时出错了，没有产出结果。请稍后重试。",
+  runtime_internal_error: "本次执行发生内部错误，尚未确认是否由模型服务引起。请查看本次执行记录。",
   execution_unavailable: "当前没有可以执行这个请求的执行通道，请联系管理员检查模型配置。",
 };
 

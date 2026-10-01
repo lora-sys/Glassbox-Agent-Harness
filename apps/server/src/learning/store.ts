@@ -1,6 +1,25 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { Row, Transaction } from "@libsql/client";
-import type { AuthorizationService } from "../auth/service.js";
+import {
+  evaluate,
+  recordDecision,
+  classifyProtectedReadAction,
+  type AuthorizationService,
+  type AuthorizationRequest,
+} from "../auth/service.js";
+import {
+  authorizeLearningSources,
+  captureLearningSources,
+  learningSourcesFor,
+  setLearningSources,
+  sourceDependenciesJson,
+  unionLearningSources,
+  verifiedQQImportSources,
+  MemorySourceDeniedError,
+  MemorySourceProvenanceError,
+  type LearningSourceTarget,
+} from "./source-dependencies.js";
+import { classifyAutoCapture } from "./auto-capture.js";
 import { requireIdentifier } from "../identity/scope.js";
 import { DomainDatabase, optionalString, stringColumn } from "../persistence/database.js";
 import type {
@@ -17,6 +36,8 @@ import type {
   MemorySubject,
   MemoryType,
   RetentionFactors,
+  WithheldCandidateReview,
+  WithheldMemoryLifecycle,
 } from "./contracts.js";
 import { candidateKinds, feedbackSignals, memoryTypes, mergeStrategies } from "./contracts.js";
 import { createLearningId } from "./ids.js";
@@ -264,6 +285,28 @@ function memoryFromRow(row: Row): CanonicalMemory {
   };
 }
 
+function inheritCorrectionMetadata(
+  existing: CanonicalMemory,
+  incoming: CanonicalMemory,
+): CanonicalMemory {
+  return {
+    ...incoming,
+    ...(incoming.sensitivity === undefined && existing.sensitivity !== undefined
+      ? { sensitivity: existing.sensitivity }
+      : {}),
+    ...(incoming.retentionPolicy === undefined && existing.retentionPolicy !== undefined
+      ? { retentionPolicy: existing.retentionPolicy }
+      : {}),
+    // Carry the original deadline, not a fresh TTL starting at correction time.
+    ...(incoming.ttlSeconds === undefined
+      ? {
+          ...(existing.ttlSeconds === undefined ? {} : { ttlSeconds: existing.ttlSeconds }),
+          ...(existing.expiresAt === undefined ? {} : { expiresAt: existing.expiresAt }),
+        }
+      : {}),
+  };
+}
+
 function mergeUnique<T>(left: readonly T[], right: readonly T[], key: (value: T) => string): T[] {
   const values = new Map<string, T>();
   for (const item of [...left, ...right]) values.set(key(item), item);
@@ -295,6 +338,107 @@ export class LearningStore {
     private readonly db: DomainDatabase,
     private readonly authorization: AuthorizationService,
   ) {}
+
+  /** Roll back a refused mutation, then retain its denial without protected payloads. */
+  private async sourceTransaction<T>(
+    context: LearningOperationContext,
+    action: string,
+    operation: (tx: Transaction) => Promise<T>,
+    resourceId = OWNER_MEMORY_RESOURCE,
+    requireCollectionRead = true,
+  ): Promise<T> {
+    const request: AuthorizationRequest = { ...context, resourceId, action };
+    try {
+      return await this.db.transaction(async (tx) => {
+        const decision = requireCollectionRead ? await evaluate(tx, request) : undefined;
+        if (decision && decision.decision !== "ALLOW")
+          throw new MemorySourceDeniedError(decision, request);
+        const value = await operation(tx);
+        const records: unknown[] = Array.isArray(value) ? value : [value];
+        // The current Run still depends on the Owner collection gate, but this read
+        // does not make already-public group content private for future derivation.
+        // Underlying QQ sources remain independently constrained.
+        const publicGroupOnly =
+          resourceId === OWNER_MEMORY_RESOURCE &&
+          records.length > 0 &&
+          records.every((item) => {
+            if (!item || typeof item !== "object" || !("scope" in item) || !("sensitivity" in item))
+              return false;
+            const scope = item.scope;
+            return (
+              scope !== null &&
+              typeof scope === "object" &&
+              "type" in scope &&
+              scope.type === "group" &&
+              item.sensitivity === "public"
+            );
+          });
+        if (
+          decision &&
+          context.runId &&
+          classifyProtectedReadAction(action, undefined) === "content_source" &&
+          value !== null &&
+          value !== undefined &&
+          (!Array.isArray(value) || value.length > 0)
+        )
+          await tx.execute({
+            sql: "UPDATE authorization_decisions SET delivery_source = ? WHERE id = ?",
+            args: [publicGroupOnly ? "access_gate" : "content_source", decision.id],
+          });
+        return value;
+      });
+    } catch (error) {
+      if (
+        !(error instanceof MemorySourceDeniedError) &&
+        !(error instanceof MemorySourceProvenanceError)
+      )
+        throw error;
+      const denied = error instanceof MemorySourceDeniedError ? error.decision : undefined;
+      const decision = await this.db.transaction((tx) =>
+        recordDecision(
+          tx,
+          error instanceof MemorySourceDeniedError ? error.request : request,
+          denied?.decision ?? "DENY",
+          denied?.reason ?? "source_provenance_unavailable",
+          denied?.grantId ?? null,
+          denied?.approvalId ?? null,
+        ),
+      );
+      throw Object.assign(new Error(error.message), { decision });
+    }
+  }
+
+  private async targetSources(
+    tx: Transaction,
+    context: LearningOperationContext,
+    target: LearningSourceTarget,
+  ): Promise<string[]> {
+    const sources = await learningSourcesFor(tx, target);
+    await authorizeLearningSources(tx, context, sources);
+    return sources;
+  }
+
+  private async visibleSources(
+    tx: Transaction,
+    context: LearningOperationContext,
+    target: LearningSourceTarget,
+    resourceId = OWNER_MEMORY_RESOURCE,
+  ): Promise<boolean> {
+    try {
+      await this.targetSources(tx, context, target);
+      return true;
+    } catch (error) {
+      if (error instanceof MemorySourceDeniedError) return false;
+      if (!(error instanceof MemorySourceProvenanceError)) throw error;
+      await recordDecision(
+        tx,
+        { ...context, resourceId, action: MEMORY_READ_ACTION },
+        "DENY",
+        "source_provenance_unavailable",
+      );
+      return false;
+    }
+  }
 
   private async authorize(context: LearningOperationContext, action: string): Promise<string> {
     return this.authorizeResource(context, OWNER_MEMORY_RESOURCE, action);
@@ -354,8 +498,20 @@ export class LearningStore {
     });
   }
 
-  private async insertCandidate(tx: Transaction, input: CandidateCreate): Promise<MemoryCandidate> {
+  private async insertCandidate(
+    tx: Transaction,
+    context: LearningOperationContext,
+    input: CandidateCreate,
+    sourceInput: {
+      trustedSourceIds?: readonly string[];
+      userAuthored?: boolean;
+      memoryIds?: readonly string[];
+      deduplicatePending?: boolean;
+    } = {},
+  ): Promise<MemoryCandidate> {
+    const deduplicatePending = sourceInput.deduplicatePending ?? true;
     validateCandidate(input);
+    let sources = await captureLearningSources(tx, context, input.sourceEvidence, sourceInput);
     const candidate: MemoryCandidate = {
       ...structuredClone(input),
       candidateId: input.candidateId ?? createLearningId("candidate"),
@@ -376,9 +532,11 @@ export class LearningStore {
       type: candidate.proposedType,
       statement: candidate.statement,
     });
-    const pending = (
-      await tx.execute({ sql: "SELECT * FROM memory_candidates WHERE status = 'pending'" })
-    ).rows.map(candidateFromRow);
+    const pending = deduplicatePending
+      ? (
+          await tx.execute({ sql: "SELECT * FROM memory_candidates WHERE status = 'pending'" })
+        ).rows.map(candidateFromRow)
+      : [];
     const duplicate = pending.find(
       (row) =>
         memorySignature({
@@ -390,9 +548,19 @@ export class LearningStore {
     );
     // Returning the row already in the queue keeps the caller's answer true — the assertion *is*
     // pending review — without adding a second copy of it to review.
-    if (duplicate) return duplicate;
+    if (duplicate) {
+      sources = await unionLearningSources(
+        tx,
+        sources,
+        await this.targetSources(tx, context, { kind: "candidate", id: duplicate.candidateId }),
+      );
+      await authorizeLearningSources(tx, context, sources);
+      await setLearningSources(tx, { kind: "candidate", id: duplicate.candidateId }, sources);
+      return duplicate;
+    }
+    await authorizeLearningSources(tx, context, sources);
     await tx.execute({
-      sql: "INSERT INTO memory_candidates(id, candidate_kind, subject_json, scope_json, proposed_type, statement, content_json, source_json, evidence_json, confidence, sensitivity, retention_policy, ttl_seconds, merge_hint_json, extensions_json, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+      sql: "INSERT INTO memory_candidates(id, candidate_kind, subject_json, scope_json, proposed_type, statement, content_json, source_json, evidence_json, confidence, sensitivity, retention_policy, ttl_seconds, merge_hint_json, extensions_json, source_dependencies_json, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
       args: [
         candidate.candidateId,
         candidate.candidateKind,
@@ -409,6 +577,7 @@ export class LearningStore {
         candidate.ttlSeconds ?? null,
         json(candidate.mergeHint),
         json(candidate.extensions),
+        sourceDependenciesJson(sources),
         candidate.createdAt,
       ],
     });
@@ -418,10 +587,13 @@ export class LearningStore {
   async createCandidate(
     context: LearningOperationContext,
     input: CandidateCreate,
+    sourceMemoryIds: readonly string[] = [],
   ): Promise<MemoryCandidate> {
     const decisionId = await this.authorize(context, MEMORY_WRITE_ACTION);
-    return this.db.transaction(async (tx) => {
-      const candidate = await this.insertCandidate(tx, input);
+    return this.sourceTransaction(context, MEMORY_WRITE_ACTION, async (tx) => {
+      const candidate = await this.insertCandidate(tx, context, input, {
+        memoryIds: sourceMemoryIds,
+      });
       await this.audit(
         tx,
         context,
@@ -429,6 +601,27 @@ export class LearningStore {
         "write",
         candidate.candidateId,
         candidate.sourceEvidence.map((e) => e.ref),
+      );
+      return candidate;
+    });
+  }
+
+  /** Only the raw QQ import producer uses this path; the archive row and receipt must agree. */
+  async createSourceCandidate(
+    context: LearningOperationContext,
+    input: CandidateCreate,
+  ): Promise<MemoryCandidate> {
+    const decisionId = await this.authorize(context, MEMORY_WRITE_ACTION);
+    return this.sourceTransaction(context, MEMORY_WRITE_ACTION, async (tx) => {
+      const trustedSourceIds = await verifiedQQImportSources(tx, context, input);
+      const candidate = await this.insertCandidate(tx, context, input, { trustedSourceIds });
+      await this.audit(
+        tx,
+        context,
+        decisionId,
+        "write",
+        candidate.candidateId,
+        candidate.sourceEvidence.map((entry) => entry.ref),
       );
       return candidate;
     });
@@ -447,18 +640,101 @@ export class LearningStore {
       groupResourceId,
       GROUP_MEMORY_CANDIDATE_WRITE_ACTION,
     );
-    return this.db.transaction(async (tx) => {
-      const candidate = await this.insertCandidate(tx, input);
-      await this.audit(
-        tx,
-        context,
-        decisionId,
-        "write",
-        candidate.candidateId,
-        candidate.sourceEvidence.map((e) => e.ref),
-      );
-      return candidate;
+    return this.sourceTransaction(
+      context,
+      GROUP_MEMORY_CANDIDATE_WRITE_ACTION,
+      async (tx) => {
+        const candidate = await this.insertCandidate(tx, context, input);
+        await this.audit(
+          tx,
+          context,
+          decisionId,
+          "write",
+          candidate.candidateId,
+          candidate.sourceEvidence.map((e) => e.ref),
+        );
+        return candidate;
+      },
+      groupResourceId,
+    );
+  }
+
+  async captureCurrentMessage(
+    context: LearningOperationContext,
+  ): Promise<MemoryCandidate | undefined> {
+    if (!context.runId) throw new MemorySourceProvenanceError();
+    const rows = await this.db.transaction((tx) =>
+      tx.execute({
+        sql: "SELECT m.text FROM runs r JOIN messages m ON m.id = r.message_id JOIN principals p ON p.id = r.principal_id WHERE r.id = ? AND r.principal_id = ? AND p.kind = 'owner'",
+        args: [context.runId!, context.caller.principalId],
+      }),
+    );
+    if (!rows.rows[0]) return undefined;
+    const scope = context.caller.scope;
+    const descriptor = classifyAutoCapture({
+      text: stringColumn(rows.rows[0], "text"),
+      actor: "owner",
+      role: "user",
+      origin: "current_message",
+      scope:
+        scope.chatType === "group"
+          ? {
+              type: "group",
+              connectionId: scope.connectionId,
+              botId: scope.botId,
+              groupId: scope.chatId,
+            }
+          : { type: "private" },
+      messageRef: `run:${context.runId}`,
     });
+    if (!descriptor) return undefined;
+    const resourceId = scope.chatType === "group" ? `group:${scope.chatId}` : OWNER_MEMORY_RESOURCE;
+    const action =
+      scope.chatType === "group" ? GROUP_MEMORY_CANDIDATE_WRITE_ACTION : MEMORY_WRITE_ACTION;
+    const decisionId = await this.authorizeResource(context, resourceId, action);
+    return this.sourceTransaction(
+      context,
+      action,
+      async (tx) => {
+        const candidate = await this.insertCandidate(
+          tx,
+          context,
+          {
+            candidateKind:
+              descriptor.evidence.kind === "explicit_correction" ? "correction" : "assertion",
+            subject: { kind: "user", id: context.caller.principalId },
+            scope: descriptor.scope,
+            proposedType: descriptor.type,
+            statement: descriptor.statement,
+            content: {
+              statement: descriptor.statement,
+              ...(descriptor.type === "preference" ? { preference: descriptor.statement } : {}),
+            },
+            source: { kind: "chat", ref: `run:${context.runId}` },
+            sourceEvidence: [
+              {
+                evidenceId: randomUUID(),
+                kind: "chat_message",
+                ref: `run:${context.runId}`,
+                capturedAt: new Date().toISOString(),
+                trustLevel: "high",
+                metadata: { signalKind: descriptor.evidence.kind },
+              },
+            ],
+            confidence: descriptor.confidence,
+            sensitivity: scope.chatType === "group" ? "public" : "confidential",
+            mergeHint: { strategy: "manual_review_required" },
+            extensions: { "glassbox:auto-capture": true },
+          },
+          { userAuthored: true },
+        );
+        await this.audit(tx, context, decisionId, "write", candidate.candidateId, [
+          `run:${context.runId}`,
+        ]);
+        return candidate;
+      },
+      resourceId,
+    );
   }
 
   async listCandidates(
@@ -470,16 +746,32 @@ export class LearningStore {
     // The scope is matched in the same canonical form the signature uses, so a caller that states
     // a scope with its fields in another order still sees the same candidates.
     const scopeSignature = options.scope ? json(options.scope) : null;
-    return this.db.transaction(async (tx) => {
+    return this.sourceTransaction(context, MEMORY_READ_ACTION, async (tx) => {
+      const clauses = [];
+      const args = [];
+      if (options.status) {
+        clauses.push("status = ?");
+        args.push(options.status);
+      }
+      if (scopeSignature !== null) {
+        clauses.push("scope_json = ?");
+        args.push(scopeSignature);
+      }
       const result = await tx.execute({
-        sql: `SELECT * FROM memory_candidates${
-          options.status ? " WHERE status = ?" : ""
-        } ORDER BY created_at ASC, id ASC`,
-        args: options.status ? [options.status] : [],
+        sql: `SELECT id FROM memory_candidates${clauses.length ? ` WHERE ${clauses.join(" AND ")}` : ""} ORDER BY created_at ASC, id ASC`,
+        args,
       });
-      return result.rows
-        .map(candidateFromRow)
-        .filter((candidate) => scopeSignature === null || json(candidate.scope) === scopeSignature);
+      const candidates: MemoryCandidate[] = [];
+      for (const row of result.rows) {
+        const id = stringColumn(row, "id");
+        if (!(await this.visibleSources(tx, context, { kind: "candidate", id }))) continue;
+        const body = await tx.execute({
+          sql: "SELECT * FROM memory_candidates WHERE id = ?",
+          args: [id],
+        });
+        candidates.push(candidateFromRow(body.rows[0]!));
+      }
+      return candidates;
     });
   }
 
@@ -489,14 +781,20 @@ export class LearningStore {
   ): Promise<MemoryCandidate | null> {
     requireIdentifier(candidateId);
     await this.authorize(context, MEMORY_READ_ACTION);
-    return this.db.transaction(async (tx) => {
+    return this.sourceTransaction(context, MEMORY_READ_ACTION, async (tx) => {
       const row = (
         await tx.execute({
-          sql: "SELECT * FROM memory_candidates WHERE id = ?",
+          sql: "SELECT id FROM memory_candidates WHERE id = ?",
           args: [candidateId],
         })
       ).rows[0];
-      return row ? candidateFromRow(row) : null;
+      if (!row) return null;
+      await this.targetSources(tx, context, { kind: "candidate", id: candidateId });
+      const body = await tx.execute({
+        sql: "SELECT * FROM memory_candidates WHERE id = ?",
+        args: [candidateId],
+      });
+      return candidateFromRow(body.rows[0]!);
     });
   }
 
@@ -511,23 +809,37 @@ export class LearningStore {
       (!Number.isInteger(options.limit) || options.limit < 1 || options.limit > 500)
     )
       throw new Error("Invalid memory limit");
-    return this.db.transaction(async (tx) => {
+    return this.sourceTransaction(context, MEMORY_READ_ACTION, async (tx) => {
       const clauses: string[] = [];
       const args: Array<string | number> = [];
       if (options.scope) {
         clauses.push("scope_json = ?");
         args.push(json(options.scope));
       }
-      if (!options.includeInactive) clauses.push("lifecycle_state = 'active'");
-      const limitClause = options.limit === undefined ? "" : " LIMIT ?";
-      if (options.limit !== undefined) args.push(options.limit);
-      const result = await tx.execute({
-        sql: `SELECT * FROM memories${clauses.length ? ` WHERE ${clauses.join(" AND ")}` : ""} ORDER BY updated_at DESC, id ASC${limitClause}`,
-        args,
-      });
-      return result.rows
-        .map(memoryFromRow)
-        .filter((memory) => options.includeInactive || memory.lifecycleState === "active");
+      if (!options.includeInactive) {
+        clauses.push("lifecycle_state = 'active'", "(expires_at IS NULL OR expires_at > ?)");
+        args.push(new Date().toISOString());
+      }
+      const memories: CanonicalMemory[] = [];
+      let offset = 0;
+      while (options.limit === undefined || memories.length < options.limit) {
+        const result = await tx.execute({
+          sql: `SELECT id FROM memories${clauses.length ? ` WHERE ${clauses.join(" AND ")}` : ""} ORDER BY updated_at DESC, id ASC LIMIT 128 OFFSET ?`,
+          args: [...args, offset],
+        });
+        for (const row of result.rows) {
+          const id = stringColumn(row, "id");
+          if (!(await this.visibleSources(tx, context, { kind: "memory", id }))) continue;
+          const body = await tx.execute({ sql: "SELECT * FROM memories WHERE id = ?", args: [id] });
+          const memory = memoryFromRow(body.rows[0]!);
+          if (!options.includeInactive && memory.lifecycleState !== "active") continue;
+          memories.push(memory);
+          if (options.limit !== undefined && memories.length >= options.limit) break;
+        }
+        if (result.rows.length < 128) break;
+        offset += result.rows.length;
+      }
+      return memories;
     });
   }
 
@@ -542,15 +854,87 @@ export class LearningStore {
     if (!Number.isInteger(limit) || limit < 1 || limit > 100)
       throw new Error("Invalid group memory limit");
     await this.authorizeResource(context, groupResourceId, GROUP_MEMORY_READ_ACTION);
-    return this.db.transaction(async (tx) => {
-      const result = await tx.execute({
-        sql: "SELECT * FROM memories WHERE scope_json = ? AND lifecycle_state = 'active' ORDER BY updated_at DESC, id ASC LIMIT ?",
-        args: [json(scope), limit],
-      });
-      return result.rows
-        .map(memoryFromRow)
-        .filter((memory) => memory.lifecycleState === "active" && memory.sensitivity === "public");
-    });
+    return this.sourceTransaction(
+      context,
+      GROUP_MEMORY_READ_ACTION,
+      async (tx) => {
+        const memories: CanonicalMemory[] = [];
+        let offset = 0;
+        const eligibilityCutoff = new Date().toISOString();
+        while (memories.length < limit) {
+          const result = await tx.execute({
+            sql: "SELECT id FROM memories WHERE scope_json = ? AND lifecycle_state = 'active' AND sensitivity = 'public' AND (expires_at IS NULL OR expires_at > ?) ORDER BY updated_at DESC, id ASC LIMIT 128 OFFSET ?",
+            args: [json(scope), eligibilityCutoff, offset],
+          });
+          for (const row of result.rows) {
+            const id = stringColumn(row, "id");
+            if (!(await this.visibleSources(tx, context, { kind: "memory", id }, groupResourceId)))
+              continue;
+            const body = await tx.execute({
+              sql: "SELECT * FROM memories WHERE id = ?",
+              args: [id],
+            });
+            const memory = memoryFromRow(body.rows[0]!);
+            if (memory.lifecycleState === "active" && memory.sensitivity === "public")
+              memories.push(memory);
+            if (memories.length >= limit) break;
+          }
+          if (result.rows.length < 128) break;
+          offset += result.rows.length;
+        }
+        return memories;
+      },
+      groupResourceId,
+    );
+  }
+
+  /** Last check after asynchronous prompt preparation and before provider exposure. */
+  async authorizeContext(
+    context: LearningOperationContext,
+    memoryIds: readonly string[],
+  ): Promise<void> {
+    if (memoryIds.length > 100) throw new MemorySourceProvenanceError();
+    const group = context.caller.scope.chatType === "group";
+    const groupScope = {
+      type: "group" as const,
+      connectionId: context.caller.scope.connectionId,
+      botId: context.caller.scope.botId,
+      groupId: context.caller.scope.chatId,
+    };
+    const resourceId = group ? `group:${groupScope.groupId}` : OWNER_MEMORY_RESOURCE;
+    if (group) validateCurrentGroupScope(context, resourceId, groupScope);
+    await this.sourceTransaction(
+      context,
+      MEMORY_READ_ACTION,
+      async (tx) => {
+        // A continuation reuses the provider session, including Tool bodies consumed since
+        // initial Memory selection. Recheck the authoritative Run, not just selected Memory.
+        await authorizeLearningSources(
+          tx,
+          context,
+          await captureLearningSources(tx, context, [], { includeRunAccessGates: true }),
+        );
+        for (const id of new Set(memoryIds)) {
+          requireIdentifier(id);
+          const rows = await tx.execute({
+            sql: "SELECT scope_json,sensitivity,lifecycle_state,expires_at FROM memories WHERE id = ?",
+            args: [id],
+          });
+          const row = rows.rows[0];
+          if (
+            !row ||
+            row.lifecycle_state !== "active" ||
+            (typeof row.expires_at === "string" && row.expires_at <= new Date().toISOString()) ||
+            row.scope_json !== json(group ? groupScope : { type: "global" }) ||
+            (group && row.sensitivity !== "public")
+          )
+            throw new MemorySourceProvenanceError();
+          await this.targetSources(tx, context, { kind: "memory", id });
+        }
+      },
+      resourceId,
+      memoryIds.length > 0,
+    );
   }
 
   async getMemory(
@@ -559,13 +943,18 @@ export class LearningStore {
   ): Promise<CanonicalMemory | null> {
     requireIdentifier(memoryId);
     const decisionId = await this.authorize(context, MEMORY_READ_ACTION);
-    return this.db.transaction(async (tx) => {
+    return this.sourceTransaction(context, MEMORY_READ_ACTION, async (tx) => {
       const row = (
-        await tx.execute({ sql: "SELECT * FROM memories WHERE id = ?", args: [memoryId] })
+        await tx.execute({ sql: "SELECT id FROM memories WHERE id = ?", args: [memoryId] })
       ).rows[0];
       if (!row) return null;
+      await this.targetSources(tx, context, { kind: "memory", id: memoryId });
       await this.audit(tx, context, decisionId, "read", memoryId);
-      return memoryFromRow(row);
+      const body = await tx.execute({
+        sql: "SELECT * FROM memories WHERE id = ?",
+        args: [memoryId],
+      });
+      return memoryFromRow(body.rows[0]!);
     });
   }
 
@@ -575,7 +964,7 @@ export class LearningStore {
   ): Promise<CanonicalMemory[]> {
     for (const memoryId of memoryIds) requireIdentifier(memoryId);
     await this.authorize(context, MEMORY_READ_ACTION);
-    return this.markUsedRows(memoryIds);
+    return this.markUsedRows(context, memoryIds);
   }
 
   async markGroupMemoriesUsed(
@@ -587,47 +976,55 @@ export class LearningStore {
     validateCurrentGroupScope(context, groupResourceId, scope);
     for (const memoryId of memoryIds) requireIdentifier(memoryId);
     await this.authorizeResource(context, groupResourceId, GROUP_MEMORY_READ_ACTION);
-    return this.markUsedRows(memoryIds, scope);
+    return this.markUsedRows(context, memoryIds, scope, groupResourceId);
   }
 
   private async markUsedRows(
+    context: LearningOperationContext,
     memoryIds: readonly string[],
     groupScope?: Extract<GlassboxMemoryScope, { type: "group" }>,
+    resourceId = OWNER_MEMORY_RESOURCE,
   ): Promise<CanonicalMemory[]> {
-    return this.db.transaction(async (tx) => {
-      const updated: CanonicalMemory[] = [];
-      for (const memoryId of new Set(memoryIds)) {
-        const row = (
-          await tx.execute({
-            sql: "SELECT * FROM memories WHERE id = ? AND lifecycle_state = 'active'",
-            args: [memoryId],
-          })
-        ).rows[0];
-        if (!row) continue;
-        const memory = memoryFromRow(row);
-        if (memory.lifecycleState !== "active") continue;
-        if (
-          groupScope &&
-          (json(memory.scope) !== json(groupScope) || memory.sensitivity !== "public")
-        )
-          continue;
-        const useCount = memory.useCount + 1;
-        const retentionFactors = normalizedRetentionFactors({
-          ...memory.retentionFactors,
-          usage: useCount / (1 + useCount),
-        });
-        const next = {
-          ...memory,
-          useCount,
-          lastUsedAt: new Date().toISOString(),
-          retentionFactors,
-          retentionValue: retentionValue(retentionFactors),
-        };
-        await this.persistMemory(tx, next);
-        updated.push(next);
-      }
-      return updated;
-    });
+    return this.sourceTransaction(
+      context,
+      MEMORY_READ_ACTION,
+      async (tx) => {
+        const updated: CanonicalMemory[] = [];
+        for (const memoryId of new Set(memoryIds)) {
+          const row = (
+            await tx.execute({
+              sql: "SELECT * FROM memories WHERE id = ? AND lifecycle_state = 'active'",
+              args: [memoryId],
+            })
+          ).rows[0];
+          if (!row) continue;
+          await this.targetSources(tx, context, { kind: "memory", id: memoryId });
+          const memory = memoryFromRow(row);
+          if (memory.lifecycleState !== "active") continue;
+          if (
+            groupScope &&
+            (json(memory.scope) !== json(groupScope) || memory.sensitivity !== "public")
+          )
+            continue;
+          const useCount = memory.useCount + 1;
+          const retentionFactors = normalizedRetentionFactors({
+            ...memory.retentionFactors,
+            usage: useCount / (1 + useCount),
+          });
+          const next = {
+            ...memory,
+            useCount,
+            lastUsedAt: new Date().toISOString(),
+            retentionFactors,
+            retentionValue: retentionValue(retentionFactors),
+          };
+          await this.persistMemory(tx, next);
+          updated.push(next);
+        }
+        return updated;
+      },
+      resourceId,
+    );
   }
 
   private canonicalFromCandidate(
@@ -699,9 +1096,30 @@ export class LearningStore {
     };
   }
 
-  private async persistMemory(tx: Transaction, memory: CanonicalMemory): Promise<void> {
+  private async persistMemory(
+    tx: Transaction,
+    memory: CanonicalMemory,
+    sources?: readonly string[],
+  ): Promise<void> {
+    const existing = await tx.execute({
+      sql: "SELECT source_dependencies_json FROM memories WHERE id = ?",
+      args: [memory.memoryId],
+    });
+    if (!existing.rows.length && sources === undefined) throw new MemorySourceProvenanceError();
+    const dependencies =
+      sources === undefined
+        ? (existing.rows[0]?.source_dependencies_json ?? null)
+        : sourceDependenciesJson(
+            await unionLearningSources(
+              tx,
+              sources,
+              existing.rows.length
+                ? await learningSourcesFor(tx, { kind: "memory", id: memory.memoryId })
+                : [],
+            ),
+          );
     await tx.execute({
-      sql: "INSERT INTO memories(id, subject_json, scope_json, type, statement, content_json, source_json, confidence, sensitivity, retention_policy, ttl_seconds, assertion_mode, asserted_by_json, confirmed_by_user, evidence_json, derived_from_json, extensions_json, signature, lifecycle_state, expires_at, disabled_at, supersedes_json, use_count, last_used_at, retention_factors_json, retention_value, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET subject_json = excluded.subject_json, scope_json = excluded.scope_json, type = excluded.type, statement = excluded.statement, content_json = excluded.content_json, source_json = excluded.source_json, confidence = excluded.confidence, sensitivity = excluded.sensitivity, retention_policy = excluded.retention_policy, ttl_seconds = excluded.ttl_seconds, assertion_mode = excluded.assertion_mode, asserted_by_json = excluded.asserted_by_json, confirmed_by_user = excluded.confirmed_by_user, evidence_json = excluded.evidence_json, derived_from_json = excluded.derived_from_json, extensions_json = excluded.extensions_json, signature = excluded.signature, lifecycle_state = excluded.lifecycle_state, expires_at = excluded.expires_at, disabled_at = excluded.disabled_at, supersedes_json = excluded.supersedes_json, use_count = excluded.use_count, last_used_at = excluded.last_used_at, retention_factors_json = excluded.retention_factors_json, retention_value = excluded.retention_value, created_at = excluded.created_at, updated_at = excluded.updated_at",
+      sql: "INSERT INTO memories(id, subject_json, scope_json, type, statement, content_json, source_json, confidence, sensitivity, retention_policy, ttl_seconds, assertion_mode, asserted_by_json, confirmed_by_user, evidence_json, derived_from_json, extensions_json, signature, lifecycle_state, expires_at, disabled_at, supersedes_json, use_count, last_used_at, retention_factors_json, retention_value, created_at, updated_at, source_dependencies_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET subject_json = excluded.subject_json, scope_json = excluded.scope_json, type = excluded.type, statement = excluded.statement, content_json = excluded.content_json, source_json = excluded.source_json, confidence = excluded.confidence, sensitivity = excluded.sensitivity, retention_policy = excluded.retention_policy, ttl_seconds = excluded.ttl_seconds, assertion_mode = excluded.assertion_mode, asserted_by_json = excluded.asserted_by_json, confirmed_by_user = excluded.confirmed_by_user, evidence_json = excluded.evidence_json, derived_from_json = excluded.derived_from_json, extensions_json = excluded.extensions_json, signature = excluded.signature, lifecycle_state = excluded.lifecycle_state, expires_at = excluded.expires_at, disabled_at = excluded.disabled_at, supersedes_json = excluded.supersedes_json, use_count = excluded.use_count, last_used_at = excluded.last_used_at, retention_factors_json = excluded.retention_factors_json, retention_value = excluded.retention_value, created_at = excluded.created_at, updated_at = excluded.updated_at, source_dependencies_json = excluded.source_dependencies_json",
       args: [
         memory.memoryId,
         json(memory.subject),
@@ -731,6 +1149,7 @@ export class LearningStore {
         memory.retentionValue,
         memory.createdAt,
         memory.updatedAt,
+        typeof dependencies === "string" ? dependencies : null,
       ],
     });
   }
@@ -779,10 +1198,15 @@ export class LearningStore {
 
   private async promoteInTransaction(
     tx: Transaction,
+    context: LearningOperationContext,
     candidate: MemoryCandidate,
     actor: MemorySubject,
     factors: Partial<RetentionFactors> = {},
   ): Promise<CanonicalMemory> {
+    let sources = await this.targetSources(tx, context, {
+      kind: "candidate",
+      id: candidate.candidateId,
+    });
     if (candidate.status === "promoted" && candidate.promotedMemoryId) {
       const row = (
         await tx.execute({
@@ -790,7 +1214,10 @@ export class LearningStore {
           args: [candidate.promotedMemoryId],
         })
       ).rows[0];
-      if (row) return memoryFromRow(row);
+      if (row) {
+        await this.targetSources(tx, context, { kind: "memory", id: candidate.promotedMemoryId });
+        return memoryFromRow(row);
+      }
     }
     if (candidate.status !== "pending") throw new Error("candidate_not_pending");
     let incoming = this.canonicalFromCandidate(candidate, actor, factors);
@@ -807,6 +1234,11 @@ export class LearningStore {
     ).rows;
     for (const expiredRow of expiredRows) {
       const expired = memoryFromRow(expiredRow);
+      sources = await unionLearningSources(
+        tx,
+        sources,
+        await this.targetSources(tx, context, { kind: "memory", id: expired.memoryId }),
+      );
       await this.persistMemory(tx, {
         ...expired,
         lifecycleState: "expired",
@@ -831,6 +1263,21 @@ export class LearningStore {
         })
       ).rows[0];
     }
+    if (matchId && !existingRow) throw new Error("memory_not_active");
+    if (candidate.mergeHint.ifMatchUpdatedAt !== undefined) {
+      if (!existingRow) throw new Error("memory_not_active");
+      if (stringColumn(existingRow, "updated_at") !== candidate.mergeHint.ifMatchUpdatedAt)
+        throw new Error("memory_version_conflict");
+    }
+    if (existingRow)
+      sources = await unionLearningSources(
+        tx,
+        sources,
+        await this.targetSources(tx, context, {
+          kind: "memory",
+          id: stringColumn(existingRow, "id"),
+        }),
+      );
     const manualReview = candidate.mergeHint.strategy === "manual_review_required";
     const resolvedHint: MemoryMergeHint = manualReview
       ? {
@@ -857,7 +1304,7 @@ export class LearningStore {
         disabledAt: now,
         updatedAt: now,
       };
-      await this.persistMemory(tx, retired);
+      await this.persistMemory(tx, retired, sources);
       await tx.execute({
         sql: "UPDATE memory_candidates SET status = 'promoted', reviewed_at = ?, promoted_memory_id = ?, merge_hint_json = ? WHERE id = ? AND status = 'pending'",
         args: [now, retired.memoryId, json(resolvedHint), candidate.candidateId],
@@ -866,6 +1313,8 @@ export class LearningStore {
     }
     if (existingRow) {
       const existing = memoryFromRow(existingRow);
+      if (candidate.candidateKind === "correction")
+        incoming = inheritCorrectionMetadata(existing, incoming);
       if (
         json(existing.subject) !== json(incoming.subject) ||
         json(existing.scope) !== json(incoming.scope) ||
@@ -885,7 +1334,7 @@ export class LearningStore {
         incoming = this.mergeCandidate(existing, incoming, resolvedHint);
       }
     }
-    await this.persistMemory(tx, incoming);
+    await this.persistMemory(tx, incoming, sources);
     await tx.execute({
       sql: "UPDATE memory_candidates SET status = 'promoted', reviewed_at = ?, promoted_memory_id = ?, merge_hint_json = ? WHERE id = ? AND status = 'pending'",
       args: [now, incoming.memoryId, json(resolvedHint), candidate.candidateId],
@@ -900,7 +1349,7 @@ export class LearningStore {
   ): Promise<CanonicalMemory> {
     requireIdentifier(candidateId);
     const decisionId = await this.authorize(context, MEMORY_GOVERN_ACTION);
-    return this.db.transaction(async (tx) => {
+    return this.sourceTransaction(context, MEMORY_GOVERN_ACTION, async (tx) => {
       const row = (
         await tx.execute({
           sql: "SELECT * FROM memory_candidates WHERE id = ?",
@@ -912,6 +1361,7 @@ export class LearningStore {
       if (candidate.status !== "pending") throw new Error("candidate_not_pending");
       const promoted = await this.promoteInTransaction(
         tx,
+        context,
         candidate,
         { kind: "user", id: context.caller.principalId },
         factors,
@@ -945,13 +1395,57 @@ export class LearningStore {
     });
   }
 
+  /** Governance needs only state, not permission to inspect the candidate body. */
+  async candidateReviewStatus(
+    context: LearningOperationContext,
+    candidateId: string,
+  ): Promise<MemoryCandidate["status"] | undefined> {
+    requireIdentifier(candidateId);
+    return this.sourceTransaction(context, MEMORY_GOVERN_ACTION, async (tx) => {
+      const rows = await tx.execute({
+        sql: "SELECT status FROM memory_candidates WHERE id = ?",
+        args: [candidateId],
+      });
+      return rows.rows[0]?.status as MemoryCandidate["status"] | undefined;
+    });
+  }
+
+  private async maintenanceBodyReadable(
+    tx: Transaction,
+    context: LearningOperationContext,
+    target: LearningSourceTarget,
+  ): Promise<boolean> {
+    const read = await evaluate(tx, {
+      ...context,
+      resourceId: OWNER_MEMORY_RESOURCE,
+      action: MEMORY_READ_ACTION,
+    });
+    if (read.decision !== "ALLOW" || !(await this.visibleSources(tx, context, target)))
+      return false;
+    if (context.runId)
+      await tx.execute({
+        sql: "UPDATE authorization_decisions SET delivery_source = 'content_source' WHERE id = ?",
+        args: [read.id],
+      });
+    return true;
+  }
+
   async rejectCandidate(
     context: LearningOperationContext,
     candidateId: string,
-  ): Promise<MemoryCandidate> {
+  ): Promise<MemoryCandidate | WithheldCandidateReview> {
     requireIdentifier(candidateId);
     const decisionId = await this.authorize(context, MEMORY_GOVERN_ACTION);
-    return this.db.transaction(async (tx) => {
+    return this.sourceTransaction(context, MEMORY_GOVERN_ACTION, async (tx) => {
+      const exists = await tx.execute({
+        sql: "SELECT id FROM memory_candidates WHERE id = ? AND status = 'pending'",
+        args: [candidateId],
+      });
+      if (!exists.rows.length) throw new Error("candidate_not_pending");
+      const readable = await this.maintenanceBodyReadable(tx, context, {
+        kind: "candidate",
+        id: candidateId,
+      });
       const now = new Date().toISOString();
       const result = await tx.execute({
         sql: "UPDATE memory_candidates SET status = 'rejected', reviewed_at = ? WHERE id = ? AND status = 'pending'",
@@ -959,6 +1453,7 @@ export class LearningStore {
       });
       if (result.rowsAffected !== 1) throw new Error("candidate_not_pending");
       await this.audit(tx, context, decisionId, "reject", candidateId);
+      if (!readable) return { executed: true, status: "rejected", contentWithheld: true };
       const row = (
         await tx.execute({
           sql: "SELECT * FROM memory_candidates WHERE id = ?",
@@ -983,25 +1478,35 @@ export class LearningStore {
         trustLevel: "high" as const,
       },
     ];
-    return this.db.transaction(async (tx) => {
-      const candidate = await this.insertCandidate(tx, {
-        candidateKind: "assertion",
-        subject: input.subject,
-        scope: input.scope,
-        proposedType: input.type,
-        statement: input.statement,
-        content: input.content ?? { statement: input.statement },
-        source: input.source ?? { kind: "human", ref: `principal:${context.caller.principalId}` },
-        sourceEvidence: evidence,
-        ...(input.confidence === undefined ? { confidence: 1 } : { confidence: input.confidence }),
-        ...(input.sensitivity === undefined ? {} : { sensitivity: input.sensitivity }),
-        ...(input.retentionPolicy === undefined ? {} : { retentionPolicy: input.retentionPolicy }),
-        ...(input.ttlSeconds === undefined ? {} : { ttlSeconds: input.ttlSeconds }),
-        mergeHint: input.mergeHint ?? { strategy: "dedupe" },
-        extensions: input.extensions ?? {},
-      });
+    return this.sourceTransaction(context, MEMORY_WRITE_ACTION, async (tx) => {
+      const candidate = await this.insertCandidate(
+        tx,
+        context,
+        {
+          candidateKind: "assertion",
+          subject: input.subject,
+          scope: input.scope,
+          proposedType: input.type,
+          statement: input.statement,
+          content: input.content ?? { statement: input.statement },
+          source: input.source ?? { kind: "human", ref: `principal:${context.caller.principalId}` },
+          sourceEvidence: evidence,
+          ...(input.confidence === undefined
+            ? { confidence: 1 }
+            : { confidence: input.confidence }),
+          ...(input.sensitivity === undefined ? {} : { sensitivity: input.sensitivity }),
+          ...(input.retentionPolicy === undefined
+            ? {}
+            : { retentionPolicy: input.retentionPolicy }),
+          ...(input.ttlSeconds === undefined ? {} : { ttlSeconds: input.ttlSeconds }),
+          mergeHint: input.mergeHint ?? { strategy: "dedupe" },
+          extensions: input.extensions ?? {},
+        },
+        { userAuthored: true },
+      );
       const memory = await this.promoteInTransaction(
         tx,
+        context,
         candidate,
         { kind: "user", id: context.caller.principalId },
         input.retentionFactors,
@@ -1032,13 +1537,14 @@ export class LearningStore {
     )
       throw new Error("Invalid memory TTL");
     const decisionId = await this.authorize(context, MEMORY_WRITE_ACTION);
-    return this.db.transaction(async (tx) => {
+    return this.sourceTransaction(context, MEMORY_WRITE_ACTION, async (tx) => {
       const row = (
         await tx.execute({ sql: "SELECT * FROM memories WHERE id = ?", args: [memoryId] })
       ).rows[0];
       if (!row) throw new Error("memory_not_found");
       const memory = memoryFromRow(row);
       if (memory.lifecycleState !== "active") throw new Error("memory_not_active");
+      await this.targetSources(tx, context, { kind: "memory", id: memoryId });
       const statement = input.statement?.trim() ?? statementFromContent(memory.content);
       if (!statement) throw new Error("Invalid memory statement");
       const content = { ...(input.content ?? memory.content), statement };
@@ -1063,10 +1569,19 @@ export class LearningStore {
     context: LearningOperationContext,
     memoryId: string,
     state: "expired" | "revoked" | "retired",
-  ): Promise<CanonicalMemory> {
+  ): Promise<CanonicalMemory | WithheldMemoryLifecycle> {
     requireIdentifier(memoryId);
     const decisionId = await this.authorize(context, MEMORY_GOVERN_ACTION);
-    return this.db.transaction(async (tx) => {
+    return this.sourceTransaction(context, MEMORY_GOVERN_ACTION, async (tx) => {
+      const exists = await tx.execute({
+        sql: "SELECT id FROM memories WHERE id = ? AND lifecycle_state = 'active'",
+        args: [memoryId],
+      });
+      if (!exists.rows.length) throw new Error("memory_not_active");
+      const readable = await this.maintenanceBodyReadable(tx, context, {
+        kind: "memory",
+        id: memoryId,
+      });
       const now = new Date().toISOString();
       const result = await tx.execute({
         sql: "UPDATE memories SET lifecycle_state = ?, disabled_at = ?, updated_at = ? WHERE id = ? AND lifecycle_state = 'active'",
@@ -1080,6 +1595,7 @@ export class LearningStore {
         state === "expired" ? "expire" : state === "revoked" ? "revoke" : "retire",
         memoryId,
       );
+      if (!readable) return { executed: true, lifecycleState: state, contentWithheld: true };
       const row = (
         await tx.execute({ sql: "SELECT * FROM memories WHERE id = ?", args: [memoryId] })
       ).rows[0]!;
@@ -1094,7 +1610,7 @@ export class LearningStore {
   ): Promise<CanonicalMemory> {
     requireIdentifier(memoryId);
     const decisionId = await this.authorize(context, MEMORY_GOVERN_ACTION);
-    return this.db.transaction(async (tx) => {
+    return this.sourceTransaction(context, MEMORY_GOVERN_ACTION, async (tx) => {
       const row = (
         await tx.execute({
           sql: "SELECT * FROM memories WHERE id = ? AND lifecycle_state = 'active'",
@@ -1103,6 +1619,8 @@ export class LearningStore {
       ).rows[0];
       if (!row) throw new Error("memory_not_active");
       const existing = memoryFromRow(row);
+      if (existing.lifecycleState !== "active") throw new Error("memory_not_active");
+      const priorSources = await this.targetSources(tx, context, { kind: "memory", id: memoryId });
       if (
         json(existing.subject) !== json(input.subject) ||
         json(existing.scope) !== json(input.scope) ||
@@ -1118,22 +1636,31 @@ export class LearningStore {
           trustLevel: "high" as const,
         },
       ];
-      const candidate = await this.insertCandidate(tx, {
-        candidateKind: "correction",
-        subject: input.subject,
-        scope: input.scope,
-        proposedType: input.type,
-        statement: input.statement,
-        content: input.content ?? { statement: input.statement },
-        source: input.source ?? { kind: "human", ref: `principal:${context.caller.principalId}` },
-        sourceEvidence: evidence,
-        confidence: input.confidence ?? 1,
-        ...(input.sensitivity === undefined ? {} : { sensitivity: input.sensitivity }),
-        ...(input.retentionPolicy === undefined ? {} : { retentionPolicy: input.retentionPolicy }),
-        ...(input.ttlSeconds === undefined ? {} : { ttlSeconds: input.ttlSeconds }),
-        mergeHint: { strategy: "replace", ifMatchMemoryId: memoryId },
-        extensions: input.extensions ?? {},
-      });
+      // An explicit correction is new confirmation evidence. A pending suggestion
+      // with the same statement must not substitute its metadata or provenance.
+      const candidate = await this.insertCandidate(
+        tx,
+        context,
+        {
+          candidateKind: "correction",
+          subject: input.subject,
+          scope: input.scope,
+          proposedType: input.type,
+          statement: input.statement,
+          content: input.content ?? { statement: input.statement },
+          source: input.source ?? { kind: "human", ref: `principal:${context.caller.principalId}` },
+          sourceEvidence: evidence,
+          confidence: input.confidence ?? 1,
+          ...(input.sensitivity === undefined ? {} : { sensitivity: input.sensitivity }),
+          ...(input.retentionPolicy === undefined
+            ? {}
+            : { retentionPolicy: input.retentionPolicy }),
+          ...(input.ttlSeconds === undefined ? {} : { ttlSeconds: input.ttlSeconds }),
+          mergeHint: { strategy: "replace", ifMatchMemoryId: memoryId },
+          extensions: input.extensions ?? {},
+        },
+        { userAuthored: true, deduplicatePending: false },
+      );
       const now = new Date().toISOString();
       await this.persistMemory(tx, {
         ...existing,
@@ -1143,14 +1670,25 @@ export class LearningStore {
         updatedAt: now,
       });
       const replacement = {
-        ...this.canonicalFromCandidate(
-          candidate,
-          { kind: "user", id: context.caller.principalId },
-          input.retentionFactors,
+        ...inheritCorrectionMetadata(
+          existing,
+          this.canonicalFromCandidate(
+            candidate,
+            { kind: "user", id: context.caller.principalId },
+            input.retentionFactors,
+          ),
         ),
         supersedes: [memoryId, ...existing.supersedes],
       };
-      await this.persistMemory(tx, replacement);
+      await this.persistMemory(
+        tx,
+        replacement,
+        await unionLearningSources(
+          tx,
+          priorSources,
+          await this.targetSources(tx, context, { kind: "candidate", id: candidate.candidateId }),
+        ),
+      );
       await tx.execute({
         sql: "UPDATE memory_candidates SET status = 'promoted', reviewed_at = ?, promoted_memory_id = ? WHERE id = ?",
         args: [now, replacement.memoryId, candidate.candidateId],
@@ -1180,7 +1718,7 @@ export class LearningStore {
     validateScope(input.scope);
     if (!input.statement.trim()) throw new Error("Invalid feedback statement");
     const decisionId = await this.authorize(context, MEMORY_WRITE_ACTION);
-    return this.db.transaction(async (tx) => {
+    return this.sourceTransaction(context, MEMORY_WRITE_ACTION, async (tx) => {
       const subject: MemorySubject = { kind: "user", id: context.caller.principalId };
       const pendingRows = (
         await tx.execute({
@@ -1213,7 +1751,7 @@ export class LearningStore {
         },
       };
       if (!candidate) {
-        candidate = await this.insertCandidate(tx, {
+        candidate = await this.insertCandidate(tx, context, {
           candidateKind: contradicting ? "correction" : "assertion",
           subject,
           scope: input.scope,
@@ -1240,6 +1778,13 @@ export class LearningStore {
           extensions: { "glassbox:taste": true },
         });
       } else {
+        const sources = await unionLearningSources(
+          tx,
+          await this.targetSources(tx, context, { kind: "candidate", id: candidate.candidateId }),
+          await captureLearningSources(tx, context, [evidence]),
+        );
+        await authorizeLearningSources(tx, context, sources);
+        await setLearningSources(tx, { kind: "candidate", id: candidate.candidateId }, sources);
         const evidenceItems = mergeUnique(
           candidate.sourceEvidence,
           [evidence],

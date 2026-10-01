@@ -220,3 +220,102 @@ it("generates candidates without creating a Run, message or Memory record", asyn
     await store.close();
   }
 });
+
+it("filters the exact connection before limiting Memory-source candidates", async () => {
+  const { store, archive } = await fixture();
+  try {
+    await enableSource(store, "history");
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: groupResourceId(groupId),
+      action: "history:read",
+      scope: ownerPrivateScope,
+      effect: "allow",
+    });
+    await archive.ingest({
+      channel: "qq",
+      connectionId: "other-connection",
+      groupId,
+      externalMessageId: "other",
+      senderId: "other",
+      normalizedText: "cross connection protected canary",
+      occurredAt: "2026-09-21T10:00:00Z",
+    });
+    // The newer unauthorized row must not consume the limit before filtering.
+    const result = await reader(store, archive).readCandidates({
+      connectionId,
+      groupId,
+      sourceClass: "history",
+      limit: 1,
+    });
+    expect(result).toHaveLength(1);
+    expect(result[0]!.text).toBe("history alpha decision");
+    expect(
+      await reader(store, archive).readCandidates({
+        connectionId,
+        groupId,
+        sourceClass: "history",
+        query: "cross connection",
+        limit: 1,
+      }),
+    ).toEqual([]);
+    const otherBot = { ...ownerPrivate, scope: { ...ownerPrivateScope, botId: "other-bot" } };
+    expect(
+      await reader(store, archive, otherBot).readCandidates({
+        connectionId,
+        groupId,
+        sourceClass: "history",
+        limit: 1,
+      }),
+    ).toEqual([]);
+  } finally {
+    await store.close();
+  }
+});
+
+it("withholds Memory-source payloads when policy changes during archive retrieval", async () => {
+  const { store, archive } = await fixture();
+  let entered!: () => void;
+  const waiting = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  let release!: () => void;
+  const loaded = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const originalSearch = archive.searchMessages.bind(archive);
+  archive.searchMessages = async (input) => {
+    const result = await originalSearch(input);
+    entered();
+    await loaded;
+    return result;
+  };
+  try {
+    await enableSource(store, "history");
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: groupResourceId(groupId),
+      action: "history:read",
+      scope: ownerPrivateScope,
+      effect: "allow",
+    });
+    const result = reader(store, archive).readCandidates({
+      connectionId,
+      groupId,
+      sourceClass: "history",
+      query: "alpha",
+    });
+    await waiting;
+    await store.capabilities.write({
+      connectionId,
+      groupId,
+      principalId: "owner",
+      policy: { categories: { "group.history": true }, memorySources: {} },
+    });
+    release();
+    expect(await result).toEqual([]);
+  } finally {
+    release?.();
+    await store.close();
+  }
+});

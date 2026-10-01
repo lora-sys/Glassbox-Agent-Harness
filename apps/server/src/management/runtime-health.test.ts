@@ -14,6 +14,17 @@ describe("runtimeHealthOf", () => {
     });
   });
 
+  it("does not turn a successful local reply or a pre-provider policy refusal into a measurement", () => {
+    expect(
+      runtimeHealthOf(result({ status: "succeeded", runtimeAttempted: false })),
+    ).toBeUndefined();
+    expect(
+      runtimeHealthOf(result({ failureCode: "gate_refused", runtimeAttempted: false })),
+    ).toBeUndefined();
+    expect(runtimeHealthOf(result({ failureCode: "model_capability_missing" }))).toBeUndefined();
+    expect(runtimeHealthOf(result({ failureCode: "model_credential_missing" }))).toBeUndefined();
+  });
+
   it("says nothing about a Run that never reached the provider", () => {
     // Nothing was sent, so the runtime was never given the chance to work. Recording either as
     // `unavailable` would pull a working profile out of routing for the next minute.
@@ -85,11 +96,14 @@ describe("runtimeHealthOf", () => {
     const decided: readonly [ExecutionFailureCode, RuntimeHealthState | undefined][] = [
       ["pre_provider_context_overflow", undefined],
       ["model_capacity_unknown", undefined],
+      ["model_capability_missing", undefined],
+      ["model_credential_missing", undefined],
       ["gate_refused", "degraded"],
       ["required_action_not_completed", "degraded"],
       ["claimed_change_not_performed", "degraded"],
       ["required_evidence_missing", "degraded"],
       ["runtime_run_errored", "unavailable"],
+      ["runtime_internal_error", undefined],
       ["execution_threw", "unavailable"],
       ["execution_unavailable", "unavailable"],
     ];

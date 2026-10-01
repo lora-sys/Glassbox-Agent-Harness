@@ -5,57 +5,17 @@ import { createClient } from "@libsql/client";
 import { expect, it } from "vite-plus/test";
 import { DomainDatabase, localDatabaseUrl } from "./database.js";
 import { CURRENT_SCHEMA_VERSION } from "./schema.js";
+import { runFixtureProcess } from "./test-fixture-process.js";
+import { deliveryV9FixtureScript } from "./delivery-v9-fixture.js";
 
-it("migrates v9 deliveries without losing old rows and accepts browser and media Assets", async () => {
+it("migrates v9 deliveries without losing old rows and accepts browser and media Assets", async ({
+  signal,
+}) => {
   const directory = await mkdtemp(join(tmpdir(), "glassbox-delivery-v9-"));
   try {
-    const path = join(directory, "glassbox.db");
-    const legacy = createClient({ url: localDatabaseUrl(path) });
-    await legacy.execute("CREATE TABLE runs (id TEXT PRIMARY KEY)");
-    await legacy.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY)");
-    await legacy.execute("CREATE TABLE task_attempts (id TEXT PRIMARY KEY, task_id TEXT)");
-    await legacy.execute("CREATE TABLE worker_bindings (id TEXT PRIMARY KEY)");
-    await legacy.execute(
-      "CREATE TABLE deliveries (id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id), dedup_key TEXT NOT NULL, destination_scope_key TEXT NOT NULL, payload_text TEXT NOT NULL, payload_kind TEXT NOT NULL CHECK(payload_kind IN ('text','result','ack')), status TEXT NOT NULL CHECK(status IN ('pending','sending','sent','failed','unknown')), external_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(run_id, dedup_key))",
-    );
-    await legacy.execute("INSERT INTO runs(id) VALUES ('run-1')");
-    await legacy.execute(
-      "INSERT INTO deliveries VALUES ('delivery-1','run-1','result','scope','old result','result','sent','external-1','2026-09-24','2026-09-24')",
-    );
-    await legacy.execute("PRAGMA user_version = 9");
-    legacy.close();
-
-    const db = await DomainDatabase.open(path);
-    try {
-      await db.transaction(async (tx) => {
-        expect((await tx.execute("PRAGMA user_version")).rows[0]?.user_version).toBe(
-          CURRENT_SCHEMA_VERSION,
-        );
-        expect(
-          (await tx.execute("SELECT payload_text, status FROM deliveries WHERE id = 'delivery-1'"))
-            .rows[0],
-        ).toMatchObject({
-          payload_text: "old result",
-          status: "sent",
-        });
-        await tx.execute(
-          "INSERT INTO deliveries VALUES ('delivery-2','run-1','artifact','scope','ca181a0c-6f10-44ba-bd1f-5fba48024a48','browser_artifact','pending',NULL,'2026-09-24','2026-09-24')",
-        );
-        await tx.execute(
-          "INSERT INTO deliveries VALUES ('delivery-3','run-1','media','scope','ca181a0c-6f10-44ba-bd1f-5fba48024a49','media_artifact','pending',NULL,'2026-09-24','2026-09-24')",
-        );
-        expect((await tx.execute("PRAGMA integrity_check")).rows[0]?.integrity_check).toBe("ok");
-        expect((await tx.execute("PRAGMA foreign_key_check")).rows).toEqual([]);
-      });
-    } finally {
-      await db.close();
-    }
+    await runFixtureProcess(deliveryV9FixtureScript, [directory], signal);
   } finally {
-    await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }).catch(
-      (error: NodeJS.ErrnoException) => {
-        if (process.platform !== "win32" || error.code !== "EBUSY") throw error;
-      },
-    );
+    await rm(directory, { recursive: true, force: true });
   }
 });
 

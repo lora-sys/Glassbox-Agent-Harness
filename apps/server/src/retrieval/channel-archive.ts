@@ -23,6 +23,7 @@ import type { DomainDatabase } from "../persistence/database.js";
 import { stringColumn } from "../persistence/database.js";
 import { buildFtsQuery, bm25ToScore, segmentForFts } from "./fts.js";
 import { groupResourceId } from "./source-resolver.js";
+import { historyLimit, historyTimestamp, historyTimeWindow } from "./history-time.js";
 import type { RetrievalCandidate, RetrievalCandidateStore } from "./retriever.js";
 
 export interface IngestChannelMessageInput {
@@ -58,6 +59,8 @@ export interface ChannelMessageRecord {
 }
 
 export interface ChannelMessageSearchParams {
+  /** Trusted source connection; applied in SQL before payload loading or limiting. */
+  connectionId?: string;
   allowedGroupIds: readonly string[];
   /** Restricts the candidate pool to these source classes before anything is loaded. */
   sourceClasses?: readonly string[];
@@ -104,6 +107,8 @@ export class ChannelArchiveStore implements RetrievalCandidateStore {
    * alone never registers a Resource.
    */
   async ingest(input: IngestChannelMessageInput): Promise<string> {
+    const occurredAtMs = historyTimestamp(input.occurredAt);
+    const occurredAt = new Date(occurredAtMs).toISOString();
     const dedupKey = channelMessageDedupKey(
       input.channel,
       input.connectionId,
@@ -132,14 +137,15 @@ export class ChannelArchiveStore implements RetrievalCandidateStore {
         await tx.execute({
           sql: `UPDATE channel_messages
                 SET sender_id = ?, sender_name = ?, mention_target_ids_json = ?,
-                    normalized_text = ?, occurred_at = ?
+                    normalized_text = ?, occurred_at = ?, occurred_at_ms = ?
                 WHERE id = ?`,
           args: [
             input.senderId,
             senderName ?? null,
             JSON.stringify(mentionTargetIds),
             input.normalizedText,
-            input.occurredAt,
+            occurredAt,
+            occurredAtMs,
             id,
           ],
         });
@@ -158,8 +164,8 @@ export class ChannelArchiveStore implements RetrievalCandidateStore {
         sql: `INSERT INTO channel_messages (
                 id, channel, connection_id, group_id, external_message_id,
                 sender_id, sender_name, mention_target_ids_json, normalized_text,
-                source_class, occurred_at, ingested_at, resource_id, dedup_key
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                source_class, occurred_at, occurred_at_ms, ingested_at, resource_id, dedup_key
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         args: [
           id,
           input.channel,
@@ -171,7 +177,8 @@ export class ChannelArchiveStore implements RetrievalCandidateStore {
           JSON.stringify(normalizedMentionTargets(input.mentionTargetIds)),
           input.normalizedText,
           input.sourceClass ?? "history",
-          input.occurredAt,
+          occurredAt,
+          occurredAtMs,
           ingestedAt,
           resourceId,
           dedupKey,
@@ -195,23 +202,28 @@ export class ChannelArchiveStore implements RetrievalCandidateStore {
    * only thing standing between protected text and the retriever.
    */
   async searchMessages(params: ChannelMessageSearchParams): Promise<ChannelMessageRecord[]> {
+    const limit = historyLimit(params.limit, 50, 200);
+    const { sinceMs, untilMs } = historyTimeWindow(params);
     if (!params.allowedGroupIds || params.allowedGroupIds.length === 0) return [];
-    const limit = Math.max(1, Math.min(params.limit ?? 50, 200));
     const placeholders = params.allowedGroupIds.map(() => "?").join(", ");
     const baseArgs: InValue[] = [...params.allowedGroupIds];
 
     const conditions = [`m.group_id IN (${placeholders})`];
+    if (params.connectionId !== undefined) {
+      conditions.push("m.connection_id = ?");
+      baseArgs.push(params.connectionId);
+    }
     if (params.sourceClasses && params.sourceClasses.length > 0) {
       conditions.push(`m.source_class IN (${params.sourceClasses.map(() => "?").join(", ")})`);
       baseArgs.push(...params.sourceClasses);
     }
-    if (params.since) {
-      conditions.push("m.occurred_at >= ?");
-      baseArgs.push(params.since);
+    if (sinceMs !== undefined) {
+      conditions.push("m.occurred_at_ms >= ?");
+      baseArgs.push(sinceMs);
     }
-    if (params.until) {
-      conditions.push("m.occurred_at <= ?");
-      baseArgs.push(params.until);
+    if (untilMs !== undefined) {
+      conditions.push("m.occurred_at_ms <= ?");
+      baseArgs.push(untilMs);
     }
     if (params.senderQuery?.trim()) {
       const sender = params.senderQuery.trim();
@@ -245,7 +257,7 @@ export class ChannelArchiveStore implements RetrievalCandidateStore {
         // No usable lexical tokens: bounded time-ordered listing inside the authorized set.
         const sql = `SELECT ${COLUMNS} FROM channel_messages m
                      WHERE ${where}
-                     ORDER BY m.occurred_at DESC
+                     ORDER BY m.occurred_at_ms DESC, m.id ASC
                      LIMIT ?`;
         const result = await tx.execute({ sql, args: [...baseArgs, limit] });
         return result.rows.map(channelMessageRow);
@@ -292,6 +304,7 @@ export class ChannelArchiveStore implements RetrievalCandidateStore {
   }): Promise<RetrievalCandidate[]> {
     const records = await this.searchMessages({
       allowedGroupIds: params.allowedSourceIds,
+      connectionId: params.metadataFilters?.connectionId,
       sourceClasses: params.sourceClasses ?? ["history"],
       query: params.query,
       since: params.since,

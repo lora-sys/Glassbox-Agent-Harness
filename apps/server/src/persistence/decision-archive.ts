@@ -2,7 +2,7 @@ import type { Row } from "@libsql/client";
 import { DomainDatabase, stringColumn } from "./database.js";
 
 const columns =
-  "id, principal_id, resource_id, action, scope_key, decision, reason, grant_id, approval_id, conversation_id, run_id, delivery_source, created_at";
+  "id, principal_id, resource_id, action, scope_key, decision, reason, grant_id, approval_id, conversation_id, run_id, delivery_source, created_at, policy_condition_json";
 
 /** Move a bounded set of old decisions while preserving memory-audit foreign keys.
  * Readers use authorization_decisions_all, so historical run and evidence reads still work. */

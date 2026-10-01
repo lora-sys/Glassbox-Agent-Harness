@@ -1,10 +1,11 @@
+import { classifyPiRuntimeFailure, piFailureCode, piFailureReply } from "./failure-diagnostics.js";
 import type { PublicModelProfile, QqSourceClass } from "@glassbox/contracts";
 import type {
   RunExecutionAdapter,
   ExecutionInput,
   ExecutionResult,
 } from "../../execution/run-service/types.js";
-import { scopeKey } from "../../identity/scope.js";
+import { scopeKey, type TrustedChannelScope } from "../../identity/scope.js";
 import type { HistoryActor } from "../../conversation/store.js";
 import type { CanonicalMemory, GlassboxMemoryScope } from "@glassbox/contracts";
 import type { LearningStore } from "../../learning/store.js";
@@ -259,15 +260,84 @@ function namedMemberId(text: string): number | undefined {
   return value === undefined ? undefined : Number(value);
 }
 
-/** The mute duration the message names, converted to the seconds the provider expects. */
-function namedDuration(text: string): number | undefined {
-  const match = /(\d{1,9})\s*(秒|分钟|分|小时|时|天)/u.exec(text);
-  if (!match) return undefined;
+/** Read duration only from the same single mute request that supplies the target. */
+function namedMuteDuration(text: string): number | undefined {
+  const clause = muteRequestClause(text);
+  if (clause === undefined) return undefined;
+  if (/\d+\s*(?:至|到|~|～|-|–|或(?:者)?)\s*\d+\s*(?:秒|分钟|分|小时|时|天)/u.test(clause))
+    return undefined;
+  const matches = [
+    ...clause.matchAll(/(?<![\d.+\-负])(?<duration>\d{1,9})\s*(秒|分钟|分|小时|时|天)/gu),
+  ];
+  if (matches.length !== 1) return undefined;
+  const match = matches[0]!;
   const unit = match[2];
   const scale =
     unit === "秒" ? 1 : unit === "天" ? 86_400 : unit === "分钟" || unit === "分" ? 60 : 3_600;
   return Number(match[1]) * scale;
 }
+
+function muteRequestClause(text: string): string | undefined {
+  const clauses = text.split(/[，,。！？!?；;\n]/u).filter((part) => /禁言|闭嘴/u.test(part));
+  // One mutation intent cannot choose between, or combine fields from, multiple requests.
+  return clauses.length === 1 ? clauses[0] : undefined;
+}
+
+/** Extract only a literal target in a single mute clause, never an ID inferred by the model. */
+function namedMuteTarget(text: string): string | undefined {
+  const clause = muteRequestClause(text);
+  if (!clause) return undefined;
+  const command = clause
+    .trim()
+    .replace(/^(?:(?:请|麻烦|帮我|马上|现在)\s*)+/u, "")
+    .replace(/^(?:把|将|给|对)\s*/u, "")
+    .replace(/^群\s*[1-9]\d{4,15}\s*(?:里的|的|里|中)?\s*/u, "")
+    .replace(/\d{1,9}\s*(?:秒|分钟|分|小时|时|天)\s*$/u, "")
+    .trim();
+  const match = /^(?:禁言|闭嘴)\s*(.+)$/u.exec(command) ?? /^(.+?)\s*(?:禁言|闭嘴)$/u.exec(command);
+  let selector = match?.[1]?.replace(/^(?:成员|群员|用户)\s*/u, "").trim();
+  if (!selector) return undefined;
+  const quotes: Readonly<Record<string, string>> = {
+    '"': '"',
+    "'": "'",
+    "“": "”",
+    "「": "」",
+    "『": "』",
+  };
+  if (quotes[selector[0]!] === selector.at(-1)) selector = selector.slice(1, -1);
+  if (!selector || selector.length > 128 || /\p{Cc}/u.test(selector) || /禁言|闭嘴/u.test(selector))
+    return undefined;
+  return selector;
+}
+
+function mutationRequestFields(
+  mutation: (typeof MUTATION_REQUESTS)[number],
+  text: string,
+): Record<string, unknown> {
+  const params = mutation.params(text);
+  if (params !== undefined) return { params };
+  if (mutation.operation !== "set_group_ban") return {};
+  const target = namedMuteTarget(text);
+  const memberSelector = target && !/^\d+$/u.test(target) ? target : undefined;
+  const duration = namedMuteDuration(text);
+  return {
+    ...(memberSelector === undefined ? {} : { memberSelector }),
+    ...(duration === undefined ? {} : { params: { duration } }),
+  };
+}
+
+const MODERATION_FAILURE_REPLIES: Readonly<Record<string, string>> = {
+  moderation_member_id_required:
+    "当前无法安全读取或解析群成员，请提供目标成员的 QQ 号和禁言时长。未执行禁言。",
+  moderation_member_not_found:
+    "没有找到唯一的昵称或群名片匹配，请提供目标成员的 QQ 号和禁言时长。未执行禁言。",
+  moderation_member_ambiguous:
+    "有多个成员匹配这个昵称或群名片，请提供目标成员的 QQ 号和禁言时长。未执行禁言。",
+  moderation_member_changed:
+    "该昵称或群名片对应的成员已变化，请提供目标成员的 QQ 号并重新发起请求。未执行禁言。",
+  moderation_authority_changed: "当前禁言权限已变化，未执行禁言。",
+  moderation_resolution_unrecorded: "无法记录本次成员解析结果，未执行禁言。",
+};
 
 /** The free text a message names after a "change it to" verb, with quotes and padding removed. */
 function namedText(text: string): string | undefined {
@@ -365,8 +435,9 @@ export const MUTATION_REQUESTS: readonly {
     operation: "set_group_ban",
     words: /禁言|闭嘴/iu,
     params: (text) => {
-      const user_id = namedMemberId(text);
-      const duration = namedDuration(text);
+      const target = namedMuteTarget(text);
+      const user_id = target && /^[1-9]\d{4,14}$/u.test(target) ? Number(target) : undefined;
+      const duration = namedMuteDuration(text);
       if (user_id === undefined || duration === undefined) return undefined;
       return { user_id, duration };
     },
@@ -666,19 +737,12 @@ function requiredToolCall(
     // remain Glassbox Owner-private even when the current QQ sender is a group owner.
     if (mutation.operation === "set_group_admin" || mutation.tool === "qq_group_file_ops")
       return undefined;
-    const params = mutation.params(text);
     return {
       name: mutation.tool === "qq_group_settings" ? "qq_group_local_settings" : mutation.tool,
       input: {
         groupId: input.caller.scope.chatId,
         operation: mutation.operation,
-        // A member named by card rather than by number has nothing this layer can bind, and a
-        // requirement that pinned a value it could not read would have to be dropped — which
-        // drops the requirement with it, and a Run that narrates a mute it never performed
-        // would then have nothing standing between it and the room. So what the text *does*
-        // establish — that the Owner asked for this operation in this group — stays required,
-        // and the member the Run resolves against the roster is what it may fill in.
-        ...(params === undefined ? {} : { params }),
+        ...mutationRequestFields(mutation, text),
       },
     };
   }
@@ -763,17 +827,15 @@ function requiredToolCall(
   // it targets and the target and value it selects. The exact operation and every provider
   // parameter the message pins down are part of the required input, so the call cannot
   // substitute a different operation, a different member, a different duration or a different
-  // value. A target named by card rather than by number is left to the Run to resolve: what the
-  // message establishes is the operation, and that is what stays required.
+  // value. A literal nickname/card is bound separately for server-controlled roster resolution.
   const mutation = MUTATION_REQUESTS.find((entry) => entry.words.test(text));
   if (mutation) {
-    const params = mutation.params(text);
     return {
       name: mutation.tool,
       input: {
         groupId,
         operation: mutation.operation,
-        ...(params === undefined ? {} : { params }),
+        ...mutationRequestFields(mutation, text),
       },
     };
   }
@@ -982,48 +1044,76 @@ function explicitModelChangeCommand(text: string): boolean {
  * and refused after the copula: a message that says "我不是lora" is the sender agreeing with the
  * channel, and refusing it would spend the gate's credibility on the one case where it is wrong.
  */
+function firstPersonClaimPattern(referent: string): RegExp {
+  const asserts = `(?:就|其实|正|才|不过|并|确实|真的|明明)?(?:是|为|当成|当作|算|叫做?)(?![不没非别勿])`;
+  const names = `[^，。！？!?；;：:\\n]{0,8}${referent}`;
+  return new RegExp(
+    [
+      `(?:我|俺|咱|本人)${asserts}${names}`,
+      `(?:我|俺|咱|本人)的(?:这个|那个|该|此)?[^。！？!?；;：:\\n不没非别勿以，]{0,6}?，?${asserts}${names}`,
+    ].join("|"),
+    "iu",
+  );
+}
+
 function claimsToBe(text: string, referents: readonly string[]): boolean {
   const escaped = referents
     .map((referent) => referent.trim())
     .filter((referent) => referent.length > 0)
     .map((referent) => referent.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"));
   if (escaped.length === 0) return false;
-  const referent = escaped.join("|");
-  // The copula, the modifiers that may precede it, and the negation that may not follow it.
-  const asserts = `(?:就|其实|正|才|不过|并|确实|真的|明明)?(?:是|为|当成|当作|算|叫做?)(?![不没非别勿])`;
-  // The referent must sit directly after the copula, bounded by sentence punctuation.
-  const names = `[^，。！？!?；;：:\\n]{0,8}(?:${referent})`;
-  return new RegExp(
-    [
-      // A bare pronoun: "我是lora", "我就是群主".
-      `(?:我|俺|咱|本人)${asserts}${names}`,
-      // A possessive noun phrase: "我的名称账号，确实是lora本人".
-      `(?:我|俺|咱|本人)的(?:这个|那个|该|此)?[^。！？!?；;：:\\n不没非别勿以，]{0,6}?，?${asserts}${names}`,
-    ].join("|"),
-    "iu",
-  ).test(text);
+  if (firstPersonClaimPattern(`(?:${escaped.join("|")})`).test(text)) return true;
+  return [...text.matchAll(new RegExp(escaped.join("|"), "giu"))].some((match) =>
+    hasIdentityAssertionPrefix(text.slice(0, match.index), firstPersonClaimPattern("$")),
+  );
 }
 
 /**
- * Words a message uses to claim an authority rather than a name.
- *
- * Both axes are here, not only the Glassbox Owner's. A visitor wrote "我是群主" — a claim to the
- * QQ group's own admin role, which this list did not know, and which the bot's permission answer
- * treats as a separate authority from the Owner's. A list that knows one axis and not the other
- * is the same gap as the one that knew roles and not names.
+ * Match complete role labels before deciding which authority they claim. In particular,
+ * "group owner" is one native role label; its "owner" suffix is not a Glassbox Owner claim.
+ * Bare "Owner" still means Glassbox Owner, including "这个群的 Owner". Explicit Glassbox
+ * qualifiers cannot borrow a native-role observation. English labels retain word boundaries.
  */
-const OWNER_ROLE_WORDS = [
-  "owner",
-  "主人",
-  "所有者",
-  "拥有者",
-  "老板",
-  "造物主",
-  "群主",
-  "管理员",
-  "admin",
-  "group owner",
-] as const;
+const AUTHORITY_ROLE =
+  /(?<glassbox>(?<![a-z0-9_])glassbox\s*(?:的\s*)?(?:(?:qq\s+)?group\s+)?(?:owner|administrator|admin|管理员|群主|主人|所有者|拥有者|老板|造物主)(?![a-z0-9_]))|(?<nativeOwner>群主|(?<![a-z0-9_])(?:qq\s+)?group\s+owner(?![a-z0-9_]))|(?<nativeAdmin>管理员|(?<![a-z0-9_])(?:group\s+)?(?:administrator|admin)(?![a-z0-9_]))|(?<owner>主人|所有者|拥有者|老板|造物主|(?<![a-z0-9_])owner(?![a-z0-9_]))/giu;
+
+/** Preserve explicit coordinated claims, without turning a later mention into an assertion. */
+function hasIdentityAssertionPrefix(prefix: string, assertion: RegExp): boolean {
+  if (assertion.test(prefix)) return true;
+  const continuation =
+    /^\s*(?:[,，]\s*)?(?:也是|同时也是|还是|兼|和|及|、|and(?:\s+(?:the|a))?)\s*$/iu;
+  let claimedRoleEnd: number | undefined;
+  for (const role of prefix.matchAll(AUTHORITY_ROLE)) {
+    if (
+      assertion.test(prefix.slice(0, role.index)) ||
+      (claimedRoleEnd !== undefined && continuation.test(prefix.slice(claimedRoleEnd, role.index)))
+    )
+      claimedRoleEnd = role.index + role[0].length;
+  }
+  return claimedRoleEnd !== undefined && continuation.test(prefix.slice(claimedRoleEnd));
+}
+
+function unobservedRoleMentions(text: string, scope: TrustedChannelScope): RegExpExecArray[] {
+  // This is the current message's trusted observation, never the Conversation's old role or
+  // a role inferred from text. It only permits a truthful acknowledgement. Tool visibility,
+  // grants and live OneBot role verification still decide whether any operation may run.
+  const observed = scope.chatType === "group" ? scope.nativeGroupRole?.role : undefined;
+  return [...text.matchAll(AUTHORITY_ROLE)].filter((match) => {
+    // A truthful native-role explanation can explicitly deny Glassbox authority in the same
+    // clause, such as "您是群主但不是Owner". That denial does not attribute the second role.
+    if (/(?:不是|并非|而非)\s*$/u.test(text.slice(0, match.index))) return false;
+    if (match.groups?.nativeOwner) return observed !== "qq_group_owner";
+    if (match.groups?.nativeAdmin) return observed !== "qq_group_admin";
+    return true;
+  });
+}
+
+function claimsUnobservedRole(text: string, scope: TrustedChannelScope): boolean {
+  const claimPrefix = firstPersonClaimPattern("$");
+  return unobservedRoleMentions(text, scope).some((match) =>
+    hasIdentityAssertionPrefix(text.slice(0, match.index), claimPrefix),
+  );
+}
 
 /**
  * A first-person claim to be a QQ number other than the one the channel observed.
@@ -1058,13 +1148,13 @@ function claimsOthersNumber(text: string, senderId: string): boolean {
  */
 function ownerClaimedInText(
   text: string,
-  senderId: string,
+  scope: TrustedChannelScope,
   protectedIdentities: readonly string[],
 ): boolean {
   return (
-    claimsToBe(text, OWNER_ROLE_WORDS) ||
+    claimsUnobservedRole(text, scope) ||
     claimsToBe(text, protectedIdentities) ||
-    claimsOthersNumber(text, senderId) ||
+    claimsOthersNumber(text, scope.senderId) ||
     /(?:以|用|凭|借)(?:我|本人|自己)?(?:的)?\s*(?:glassbox\s*)?(?:owner|主人|所有者|拥有者)\s*(?:身份|权限|名义|命令)/iu.test(
       text,
     )
@@ -1087,7 +1177,7 @@ function impersonatedOwnerRequest(
   return (
     input.caller.scope.chatType === "group" &&
     !isOwner &&
-    ownerClaimedInText(input.text, input.caller.scope.senderId, protectedIdentities)
+    ownerClaimedInText(input.text, input.caller.scope, protectedIdentities)
   );
 }
 
@@ -1124,19 +1214,15 @@ function impersonatedOwnerRequest(
  */
 function misattributesSender(
   reply: string,
-  senderId: string,
+  scope: TrustedChannelScope,
   protectedIdentities: readonly string[],
 ): boolean {
-  const observed = senderId.trim();
+  const observed = scope.senderId.trim();
   const escaped = protectedIdentities
     .map((identity) => identity.trim())
     .filter((identity) => identity.length > 0)
     .map((identity) => identity.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"));
   const named = escaped.length > 0 ? new RegExp(escaped.join("|"), "iu") : undefined;
-  const role = new RegExp(
-    OWNER_ROLE_WORDS.map((word) => word.replace(/\s+/gu, "\\s*")).join("|"),
-    "iu",
-  );
   // A conditional does not assert its premise, so "就算您是 Lora，我也没有禁言能力" is the Run
   // refusing on both branches and asserting the identity on neither.
   const conditional = /(?:就算|即使|哪怕|如果|假如|即便|除非|万一)[^。！？!?；;\n]{0,30}(?:您|你)/u;
@@ -1144,34 +1230,48 @@ function misattributesSender(
   // that carries the attribution rather than to any distance from a name: an explicit role the
   // sender is said to occupy, and a sentence that names the message itself as its subject. The
   // copula may not be negated, which is what separates "发件人就是 Owner" from "发件人不是 Lora".
-  const roleSpans = OWNER_ROLE_WORDS.map((word) => word.replace(/\s+/gu, "\\s*")).join("|");
-  const anyIdentity = escaped.length > 0 ? [escaped.join("|"), roleSpans].join("|") : roleSpans;
-  const attributesSender = new RegExp(
-    [
-      // "作为 Lora 本人", "来自 Lora 本人（3526039967）".
-      escaped.length > 0
-        ? `(?:作为|身为|来自|属于|正是|就是)[^。！？!?；;，,\\n不没非别勿]{0,8}(?:${escaped.join("|")})[^。！？!?；;，,\\n]{0,8}本人`
-        : "(?!x)x",
-      // "发件人是 Lora 本人", "此消息为 Owner".
-      `(?:发件人|发送者|对方|此消息|该消息|这条消息|消息来自)[^。！？!?；;，,\\n不没非别勿]{0,4}(?:是|为)[^。！？!?；;，,\\n]{0,8}(?:${anyIdentity})`,
-    ].join("|"),
-    "iu",
-  );
+  const attributesNamedSender =
+    escaped.length > 0
+      ? new RegExp(
+          [
+            `(?:作为|身为|来自|属于|正是|就是)[^。！？!?；;，,\\n不没非别勿]{0,8}(?:${escaped.join("|")})[^。！？!?；;，,\\n]{0,8}本人`,
+            `(?:发件人|发送者|对方|此消息|该消息|这条消息|消息来自)[^。！？!?；;，,\\n不没非别勿]{0,4}(?:是|为)[^。！？!?；;，,\\n]{0,8}(?:${escaped.join("|")})`,
+          ].join("|"),
+          "iu",
+        )
+      : undefined;
+  const senderRolePrefix =
+    /(?:发件人|发送者|对方|此消息|该消息|这条消息|消息来自)[^。！？!?；;，,\n不没非别勿]{0,4}(?:是|为)[^。！？!?；;，,\n]{0,8}$/u;
+  const addressedRolePrefix =
+    /(?:您|你|阁下)[^。！？!?；;，,\n不没非别勿]{0,6}?(?:是|为)[^。！？!?；;，,\n]{0,16}$/u;
   for (const sentence of reply.split(/(?<=[。！？!?；;\n])/u)) {
     if (/[？?]/u.test(sentence)) continue;
     if (conditional.test(sentence)) continue;
-    const addressed =
-      /(?:您|你|阁下)[^。！？!?；;，,\n不没非别勿]{0,6}?(?:是|为)([^。！？!?；;，,\n]{0,16})/u.exec(
-        sentence,
-      );
-    if (addressed) {
+    const addressedClaims = sentence.matchAll(
+      /(?:您|你|阁下)[^。！？!?；;，,\n不没非别勿]{0,6}?(?:是|为)([^。！？!?；;，,\n]{0,16})/gu,
+    );
+    for (const addressed of addressedClaims) {
       const attributed = addressed[1] ?? "";
       const number = /(\d{5,11})/u.exec(attributed);
       if (number && observed && number[1] !== observed) return true;
       if (named?.test(attributed)) return true;
-      if (role.test(attributed)) return true;
+      if (unobservedRoleMentions(attributed, scope).length > 0) return true;
     }
-    if (attributesSender.test(sentence)) return true;
+    if (attributesNamedSender?.test(sentence)) return true;
+    const unobserved = [
+      ...unobservedRoleMentions(sentence, scope),
+      ...(escaped.length > 0 ? sentence.matchAll(new RegExp(escaped.join("|"), "giu")) : []),
+    ];
+    if (
+      unobserved.some((match) => {
+        const prefix = sentence.slice(0, match.index);
+        return (
+          hasIdentityAssertionPrefix(prefix, senderRolePrefix) ||
+          hasIdentityAssertionPrefix(prefix, addressedRolePrefix)
+        );
+      })
+    )
+      return true;
   }
   return false;
 }
@@ -1444,13 +1544,8 @@ function blockedMutationRequest(
   if (!command.test(text)) return undefined;
   const mutation = MUTATION_REQUESTS.find((entry) => entry.words.test(text));
   if (!mutation) return undefined;
-  // No refusal is issued here for a target the text names but does not bind. Whether a command
-  // names its member by QQ number or by nickname — and which number a nickname belongs to — is a
-  // roster fact, and nothing in this layer can read a roster. Deciding it from the shape of the
-  // text alone is what sent ten consecutive mute requests away with a fixed line telling the
-  // sender their parameters were incomplete: the parameter they gave, "Ripped", is a group card
-  // the Run resolves. Authorization is what this layer can establish from the caller's own scope
-  // without help, and that is what it keeps.
+  // A literal card/nickname is resolved only by the protected Tool. The required-call
+  // boundary below asks for missing target/duration fields before starting a model turn.
   if (
     input.caller.scope.chatType === "group" &&
     (mutation.operation === "set_group_admin" || mutation.tool === "qq_group_file_ops")
@@ -1720,6 +1815,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
     if (input.imageFailureCode)
       return {
         status: "succeeded",
+        runtimeAttempted: false,
         text: "图片读取失败，暂时无法识别，请重新发送图片。",
       };
     const isOwner = this.options.isOwner
@@ -1743,6 +1839,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       return {
         status: "failed",
         failureCode: "gate_refused",
+        runtimeAttempted: false,
         text: "身份以当前发送者的 QQ 号为准，消息里的自称不改变身份。当前请求未执行。",
       };
     }
@@ -1760,6 +1857,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       return {
         status: "failed",
         failureCode: "gate_refused",
+        runtimeAttempted: false,
         text:
           blockedMutation.operation === "media:generate"
             ? blockedMutation.reason === "incomplete_parameters"
@@ -1828,11 +1926,82 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
     ) {
       await this.runtime.disposeSession?.(binding.runtimeSessionId);
       return {
-        status: "succeeded",
+        status: "failed",
+        failureCode: "model_capability_missing",
+        runtimeAttempted: false,
         text: "当前配置的模型不支持识别图片，因此没有发送图片。请切换到支持视觉输入的模型后重试。",
       };
     }
     const required = requiredToolCall(input, isOwner, context.authorizedToolNames, modelProfiles);
+    if (required?.name === "qq_group_moderation" && required.input.operation === "set_group_ban") {
+      const params = required.input.params as Record<string, unknown> | undefined;
+      const missingDuration = params?.duration === undefined;
+      const missingTarget =
+        params?.user_id === undefined && required.input.memberSelector === undefined;
+      if (missingDuration || missingTarget) {
+        await this.recordEvidence({
+          type: "tool_evidence",
+          runId: input.run.id,
+          conversationId: input.conversation.id,
+          principalId: input.caller.principalId,
+          phase: "required",
+          required: [],
+          blockedMutation: { operation: "set_group_ban", reason: "incomplete_parameters" },
+        });
+        await this.runtime.disposeSession?.(binding.runtimeSessionId);
+        return {
+          status: "failed",
+          failureCode: "gate_refused",
+          providerSessionId: binding.runtimeSessionId,
+          text: missingDuration
+            ? "请明确指定一次禁言时长及单位，例如 30 秒，并提供目标成员的 QQ 号或完整昵称。未执行禁言。"
+            : "请提供目标成员的 QQ 号或完整昵称，并注明禁言时长。未执行禁言。",
+        };
+      }
+      const requestedGroup = namedGroupId(muteRequestClause(requestClauses(input.text)) ?? "");
+      if (input.caller.scope.chatType === "private" && requestedGroup !== required.input.groupId) {
+        await this.recordEvidence({
+          type: "tool_evidence",
+          runId: input.run.id,
+          conversationId: input.conversation.id,
+          principalId: input.caller.principalId,
+          phase: "required",
+          required: [],
+          blockedMutation: { operation: "set_group_ban", reason: "incomplete_parameters" },
+        });
+        await this.runtime.disposeSession?.(binding.runtimeSessionId);
+        return {
+          status: "failed",
+          failureCode: "gate_refused",
+          providerSessionId: binding.runtimeSessionId,
+          text: "请在禁言指令中明确指定目标群号、成员及禁言时长。未执行禁言。",
+        };
+      }
+      if (
+        input.caller.scope.chatType === "group" &&
+        requestedGroup !== undefined &&
+        requestedGroup !== input.caller.scope.chatId
+      ) {
+        await this.recordEvidence({
+          type: "tool_evidence",
+          runId: input.run.id,
+          conversationId: input.conversation.id,
+          principalId: input.caller.principalId,
+          phase: "required",
+          required: [],
+          blockedMutation: { operation: "set_group_ban", reason: "not_permitted_in_group" },
+        });
+        await this.runtime.disposeSession?.(binding.runtimeSessionId);
+        return {
+          status: "failed",
+          failureCode: "gate_refused",
+          providerSessionId: binding.runtimeSessionId,
+          text: "群聊中的禁言请求只能针对当前群，请在目标群重新发起请求。未执行禁言。",
+        };
+      }
+      Object.freeze(required.input.params);
+      Object.freeze(required.input);
+    }
     const requiredCalls = required
       ? [{ name: required.name, input: required.input }, ...(required.additional ?? [])]
       : [];
@@ -1875,6 +2044,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       return {
         status: "failed",
         failureCode: "gate_refused",
+        runtimeAttempted: false,
         text: "模型切换工具当前不可用，未执行。",
         providerSessionId: binding.runtimeSessionId,
       };
@@ -1902,6 +2072,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         return {
           status: "failed",
           failureCode: "model_capacity_unknown",
+          runtimeAttempted: false,
           providerSessionId: binding.runtimeSessionId,
         };
       }
@@ -2021,9 +2192,36 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         return {
           status: "failed",
           failureCode: "pre_provider_context_overflow",
+          runtimeAttempted: false,
           text: "当前请求超过已配置模型的上下文容量，未发送给模型。",
           providerSessionId: binding.runtimeSessionId,
         };
+      context.authorizeProviderContext = async () => {
+        if (!this.options.learningStore) return;
+        await this.options.learningStore.authorizeContext(
+          {
+            caller: input.caller,
+            conversationId: input.conversation.id,
+            runId: input.run.id,
+          },
+          learningItems.map((item) => item.memoryId),
+        );
+      };
+      const contextAllowed = async () => {
+        try {
+          await context.authorizeProviderContext!();
+          return true;
+        } catch {
+          return false;
+        }
+      };
+      const refusedContext = {
+        status: "failed" as const,
+        failureCode: "gate_refused" as const,
+        text: "来源授权已变化，已停止继续请求模型。",
+        providerSessionId: binding.runtimeSessionId,
+      };
+      if (!(await contextAllowed())) return { ...refusedContext, runtimeAttempted: false };
       let result = await this.runtime.run(
         binding,
         { ...input.run, principalId: input.caller.principalId },
@@ -2093,6 +2291,11 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         );
         return [...(requiredCall ? [requiredCall] : []), ...evidenceCalls];
       };
+      const moderationFailureReply = () =>
+        observedCalls
+          .filter((call) => call.name === "qq_group_moderation" && call.failed === true)
+          .map((call) => MODERATION_FAILURE_REPLIES[call.reason ?? ""])
+          .find((reply) => reply !== undefined);
       let missing = missingRequirements();
       if (evidence.some((item) => item.domain.startsWith("browser_"))) {
         // Browser reads depend on navigation. Ask for one missing action per turn so the
@@ -2106,10 +2309,11 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
               item.tool === nextRequired.name &&
               satisfiesRequiredInput(item.input, nextRequired.input),
           );
+          if (!(await contextAllowed())) return refusedContext;
           result = await this.runtime.run(
             binding,
             { ...input.run, principalId: input.caller.principalId },
-            `Call ${requiredCallClause(nextRequired.name, nextRequired.input)} now.${refusalClause(
+            `Call ${requiredCallClause(nextRequired.name, nextRequired.input, input.caller.scope.chatType)} now.${refusalClause(
               observedCalls,
               nextRequired.name,
             )} Wait for its result before another browser action. Do not report success without the Tool result.`,
@@ -2146,13 +2350,17 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
           result.status === "completed" &&
           missing.length > 0 &&
           !input.signal.aborted &&
-          !delegationAttempted
+          !delegationAttempted &&
+          moderationFailureReply() === undefined
         ) {
+          if (!(await contextAllowed())) return refusedContext;
           result = await this.runtime.run(
             binding,
             { ...input.run, principalId: input.caller.principalId },
             `The required action has not executed. Call ${missing
-              .map(({ name, input: requiredInput }) => requiredCallClause(name, requiredInput))
+              .map(({ name, input: requiredInput }) =>
+                requiredCallClause(name, requiredInput, input.caller.scope.chatType),
+              )
               .join(" and ")} now.${missing
               .map(({ name }) => refusalClause(observedCalls, name))
               .join(
@@ -2163,16 +2371,23 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
           observedCalls.push(...result.toolCalls);
         }
       } else {
-        while (result.status === "completed" && missing.length > 0 && !input.signal.aborted) {
+        while (
+          result.status === "completed" &&
+          missing.length > 0 &&
+          !input.signal.aborted &&
+          moderationFailureReply() === undefined
+        ) {
           const nextRequired = missing[0]!;
           context.requiredToolName = nextRequired.name;
           context.requiredToolInput = nextRequired.input;
+          if (!(await contextAllowed())) return refusedContext;
           result = await this.runtime.run(
             binding,
             { ...input.run, principalId: input.caller.principalId },
             `The required action has not executed. Call ${requiredCallClause(
               nextRequired.name,
               nextRequired.input,
+              input.caller.scope.chatType,
             )} now.${refusalClause(
               observedCalls,
               nextRequired.name,
@@ -2230,7 +2445,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         return {
           status: "failed",
           failureCode: "required_action_not_completed",
-          text: "请求的操作未执行，请稍后重试。",
+          text: moderationFailureReply() ?? "请求的操作未执行，请稍后重试。",
           providerSessionId: binding.runtimeSessionId,
         };
       if (missingEvidence)
@@ -2346,7 +2561,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       if (
         !isOwner &&
         result.text &&
-        misattributesSender(result.text, input.caller.scope.senderId, protectedIdentities)
+        misattributesSender(result.text, input.caller.scope, protectedIdentities)
       ) {
         await this.recordEvidence({
           type: "tool_evidence",
@@ -2392,13 +2607,13 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
             providerSessionId: binding.runtimeSessionId,
           }
         : {
-            // The aborted case returned above, so a Run that reached here either completed or
-            // errored. Anything the runtime reports other than completion is the runtime having
-            // been engaged and failed to answer, which is the one kind of failure that names the
-            // profile itself rather than a decision Glassbox made about its output.
+            // Local failures carry a server-owned diagnostic. Provider error text cannot
+            // impersonate a source authorization refusal or an internal failure.
             status: "failed",
-            failureCode: "runtime_run_errored",
-            text: result.text,
+            failureCode: piFailureCode(result.failure ?? classifyPiRuntimeFailure(result.error)),
+            text: result.text.trim()
+              ? result.text
+              : piFailureReply(result.failure ?? classifyPiRuntimeFailure(result.error)),
             providerSessionId: binding.runtimeSessionId,
           };
     } finally {

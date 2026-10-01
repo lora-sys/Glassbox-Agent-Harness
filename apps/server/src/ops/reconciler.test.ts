@@ -42,6 +42,119 @@ afterEach(async () => {
 });
 
 describe("OpsReconciler safety", () => {
+  it.each(["events.lost", "reconnect"] as const)(
+    "rejects pre-snapshot idle after %s reconciliation",
+    async (recovery) => {
+      const directory = await mkdtemp(join(tmpdir(), "glassbox-legacy-observation-"));
+      directories.push(directory);
+      const databasePath = join(directory, "state.db");
+      const store = await storeAt(databasePath);
+      const bridge = new FakeHerdrBridge("session-1");
+      const { task, attempt, worker } = await taskWithWorker(store, bridge, "pi");
+      const snapshot = await bridge.getSnapshot();
+      const timestamp = Date.now() + 10;
+      snapshot.timestamp = new Date(timestamp + 2).toISOString();
+      snapshot.workspaces[0]!.panes[0]!.state = "working";
+      vi.spyOn(bridge, "getSnapshot").mockResolvedValue(snapshot);
+      const reconciler = new OpsReconciler(store.tasks, bridge);
+      if (recovery === "events.lost") {
+        await reconciler.handleEvent({
+          type: "events.lost",
+          sessionId: "session-1",
+          workspaceId: "",
+          paneId: "",
+          timestamp: new Date(timestamp).toISOString(),
+        });
+      } else {
+        await reconciler.start();
+        await reconciler.stop();
+        await reconciler.start();
+        await reconciler.stop();
+      }
+      await store.close();
+      stores.splice(stores.indexOf(store), 1);
+      const reopened = await openDomainStore({ databasePath });
+      stores.push(reopened);
+      const observer = new OpsReconciler(reopened.tasks, bridge);
+      const event = {
+        type: "agent.state" as const,
+        sessionId: "session-1",
+        workspaceId: "workspace-1",
+        paneId: worker.paneId,
+        agentName: worker.agentName,
+        state: "idle" as const,
+      };
+      await observer.handleEvent({ ...event, timestamp: new Date(timestamp + 1).toISOString() });
+      expect((await reopened.tasks.getTask(task.id))?.status).toBe("RUNNING");
+      expect((await reopened.tasks.getWorkerBinding(attempt.id))?.updatedAt).toBe(
+        snapshot.timestamp,
+      );
+      await observer.handleEvent({ ...event, timestamp: new Date(timestamp + 3).toISOString() });
+      await observer.handleEvent({ ...event, timestamp: new Date(timestamp + 3).toISOString() });
+      expect((await reopened.tasks.getTask(task.id))?.status).toBe("REVIEW");
+      expect(
+        (await reopened.tasks.listAttentionItems()).filter((item) => item.kind === "task_review"),
+      ).toHaveLength(1);
+    },
+  );
+
+  it("rejects invalid observation timestamps and stale binding identities transactionally", async () => {
+    const store = await storeAt();
+    const bridge = new FakeHerdrBridge("session-1");
+    const { task, attempt, worker } = await taskWithWorker(store, bridge, "pi");
+    const binding = (await store.tasks.getWorkerBinding(attempt.id))!;
+    await store.tasks.observeWorker(binding, "working");
+    await store.tasks.observeWorker(binding, "idle", "not-a-timestamp");
+    await store.tasks.observeWorker({ ...binding, id: "obsolete-binding" }, "idle");
+    await store.tasks.observeWorker({ ...binding, taskAttemptId: "obsolete-attempt" }, "idle");
+    expect((await store.tasks.getTask(task.id))?.status).toBe("RUNNING");
+    expect((await store.tasks.getWorkerBinding(attempt.id))?.paneId).toBe(worker.paneId);
+  });
+
+  it("ignores buffered idle older than the bootstrap working snapshot", async () => {
+    const store = await storeAt();
+    const bridge = new FakeHerdrBridge("session-1");
+    const { task, worker } = await taskWithWorker(store, bridge, "pi");
+    const reconciler = new OpsReconciler(store.tasks, bridge);
+    const snapshot = await bridge.getSnapshot();
+    const timestamp = Date.now() + 10;
+    snapshot.timestamp = new Date(timestamp + 1).toISOString();
+    snapshot.workspaces[0]!.panes[0]!.state = "working";
+    let onEvent: Parameters<typeof bridge.subscribe>[0] | undefined;
+    vi.spyOn(bridge, "subscribe").mockImplementation(async (listener) => {
+      onEvent = listener;
+      return { subscriptionId: "bootstrap-test" };
+    });
+    vi.spyOn(bridge, "getSnapshot").mockImplementation(async () => {
+      onEvent!({
+        type: "agent.state",
+        sessionId: "session-1",
+        workspaceId: "workspace-1",
+        paneId: worker.paneId,
+        agentName: worker.agentName,
+        state: "idle",
+        timestamp: new Date(timestamp).toISOString(),
+      });
+      return snapshot;
+    });
+    try {
+      await reconciler.start();
+      expect((await store.tasks.getTask(task.id))?.status).toBe("RUNNING");
+      await reconciler.handleEvent({
+        type: "agent.state",
+        sessionId: "session-1",
+        workspaceId: "workspace-1",
+        paneId: worker.paneId,
+        agentName: worker.agentName,
+        state: "idle",
+        timestamp: new Date(timestamp + 2).toISOString(),
+      });
+      expect((await store.tasks.getTask(task.id))?.status).toBe("REVIEW");
+    } finally {
+      await reconciler.stop();
+    }
+  });
+
   it("keeps event-loss health stale until a fresh snapshot succeeds", async () => {
     const store = await storeAt();
     const bridge = new FakeHerdrBridge("session-1");

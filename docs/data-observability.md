@@ -439,3 +439,119 @@ Meilisearch
 ```
 
 Turso covers current structured / search / statistics needs. R2 covers large / raw data. Herdr covers live coding-worker execution. Lora PI Kit covers reproducible Pi distribution. Additional infrastructure should be introduced only for a concrete active-Plan requirement.
+
+## Source-policy conditions on authorization decisions
+
+Schema v26 stores a validated `policy_condition_json` beside each live and archived
+AuthorizationDecision. New ordinary decisions write an explicit versioned `none` condition.
+A QQ capability read records its connection, group, and registry category. A QQ Memory-source
+read records its connection, group, and source class. Those routes remain separate even when
+they share an Action. The current flag must be exactly `true`, and the current grant must still
+allow the Action. Both checks run in the same authorization transaction before approval
+consumption.
+
+Only trusted Tool and retrieval code produces conditions. Condition fields are absent from
+model-facing Tool schemas. Conditions narrow grants; they never create authority. Replayed
+content keeps the original source's policy location, rather than adopting the later reader's
+connection or a different source route. Delivery still requires its separate `delivery:send`
+grant. All source conditions are conjunctive, including different source classes on the same
+Resource and Action.
+
+Conversation-history admission, internal Step dependencies, child Task results, and Worker
+results preserve these dependencies through archive-inclusive reads. Task descriptions and
+content-bearing Task projections recheck their origin Run and bounded parent chain. Missing,
+cyclic, overlong, or malformed lineage fails closed. A later read records new authorization
+evidence without rewriting the original decisions or Raw Trace.
+
+The v26 upgrade leaves historical condition fields NULL. NULL means unknown provenance,
+which differs from explicit `none`. Ambiguous legacy QQ source content is withheld from
+replay and pending delivery because its category versus Memory-source route cannot be
+reconstructed from its Resource and Action. New authorized reads can still proceed. Legacy
+non-QQ reads retain grant-based behavior. The migration preserves source markers, archive
+rows, and historical payloads; it does not invent provenance or erase evidence.
+
+Read producers also reauthorize exact successful read receipts after awaited provider work and
+before returning protected bodies. Multi-group history, QQ source imports, and Worker reads
+check every consumed condition atomically. Original execution evidence remains intact; a
+withheld read is not represented as a rolled-back provider operation. Mutating provider calls
+retain truthful execution outcomes. The documented workspace-write and owner-model-switch
+result markers remain valid inherited content receipts; ordinary unmarked writes and other
+marked write Actions are not accepted as read receipts. A nickname-selected mutation uses
+one final transaction for its exact roster receipt and mutation authority after all external
+checks, so neither policy can change between two separate authorization snapshots.
+
+### Derived Memory dependencies
+
+Schema v27 adds a server-owned `source_dependencies_json` column to candidates and canonical
+Memory. It is not exposed in model-editable content or Tool input. Versioned empty dependency
+sets mean a proven source-free origin; NULL means historical origin must be reconstructed.
+Decision references resolve across live and archived evidence. Missing, malformed, cyclic, or
+unbounded dependencies fail closed without deleting the stored content or Raw Trace.
+
+Model-created candidates inherit the consuming Run's recorded source dependencies even when
+model-authored evidence omits them or claims a human origin. Consolidation includes dependencies
+of every Memory supplied to the extractor, regardless of its claimed update target. Raw QQ
+imports use a separately verified archive row and exact successful source receipt, so an
+unrelated history read cannot turn a notice import into a history-derived inference. Fresh
+explicit user writes and server-derived literal current-user-message capture can remain
+source-free. Pending deduplication, merge, replacement, supersession, and subsequent explicit
+edits preserve the union of existing dependencies. Owner promotion confirms an assertion; it
+does not declassify its source.
+
+Candidate inspection and promotion, Memory get/list/group reads, and automatic Runtime learning
+Context evaluate current grants and policy before exposing content. Lists omit refused items
+before satisfying their requested limit. Successful reads propagate exact dependencies to the
+consuming Run, so later history reuse, Tasks, Workers, and delivery create/claim/retry remain
+constrained. Runtime rechecks its selected Memory and current Run sources after asynchronous
+context preparation and before every explicit or SDK-internal provider continuation. The SDK's
+public stream boundary and final payload callback enforce this check directly, because extension
+hook errors are swallowed by the SDK. A revoked source cannot be rescued by an earlier read.
+The current Run retains an Owner collection access gate when it reads only public group records;
+only that exact explicit-none access gate is omitted from durable content derivation. Private or
+mixed reads remain content sources, and all underlying QQ dependencies remain conjunctive.
+
+For legacy rows, reconstruction uses server-written operation-specific ancestry and valid
+source decisions. Generic candidate audit lineage and confirmation flags are model-editable
+and cannot prove source-free origin. Explicit write/supersede ancestry is corroborated with
+persisted candidate-to-Memory links; literal capture must match the complete stored user
+message-derived body and evidence, and prior creation/deduplication origins are still retained.
+Legacy Runs with missing markers for protected reads, native workspace results, or model-switch
+results are incomplete and remain unknown. A matching valid producer marker can cover a
+same-context duplicate preflight; unmarked Memory reads still lack their consumed record set.
+Only the exact same-scope personal-Agent conversation admission check is exempted as a known
+non-producing gate. Neighboring resources, Actions, and scopes are not exempted.
+
+Ambiguous records remain stored but inaccessible through content-bearing learning APIs, with
+the fixed `memory_source_provenance_unavailable` reason. Restoring a revoked policy makes known
+lineage readable again. Unknown lineage needs evidence repair or a new independently authored
+record; there is no automatic reset/declassification recovery command. Otherwise-authorized
+Owners can still expire, revoke, retire, or reject withheld records using metadata-only paths.
+Those operations return a minimal typed action receipt without the body or provenance IDs.
+When both collection-read and source authorization allow the body, the existing full result is
+retained. Promote, update, and supersede still require content/source authorization.
+
+QQ source import and history search also constrain archive queries by the trusted connection
+ID before loading payloads or applying limits. An enabled connection cannot authorize rows
+archived for another connection with the same group ID. The current archive does not retain
+Bot ID, `self_id`, raw provider events, or a configuration revision. Caller/grant checks still
+use Bot identity, but cannot establish which Bot collected old archive rows after the same
+connection is reconfigured. Historical Bot attribution remains an explicit contract and
+migration follow-up; this slice does not claim Bot-isolated archive provenance.
+
+
+## Exact Channel history time windows
+
+Schema v28 adds an indexed integer `occurred_at_ms` projection to `channel_messages`.
+The migration backfills at most 500 rows per read using the timestamp formats already
+accepted by `Date.parse`. It retains each original `occurred_at` string and message body;
+Raw Trace is unchanged. Unparseable legacy timestamps remain stored with a NULL time
+projection. Time-bounded reads exclude them; untimed reads retain their original evidence.
+
+New ingestion and deduplicated enrichment validate timestamps and store canonical UTC
+text plus exact integer milliseconds. History Tools and source reads compare inclusive
+millisecond bounds before SQL LIMIT, keeping the existing authorized group, source-class
+and trusted connection filters. The retriever's secondary filter compares instants before
+duplicate suppression. Equivalent UTC and offset inputs select the same records; invalid
+bounds, reversed windows and invalid limits return fixed input-error codes. Time precision
+is the existing JavaScript Date millisecond precision, with no Julian-day floating-point
+arithmetic.

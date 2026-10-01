@@ -18,6 +18,7 @@ const io = vi.hoisted(() => ({
   execFileAsync: vi.fn(),
   securePrivatePath: vi.fn(),
   createConnection: vi.fn(),
+  databaseVersion: 25,
 }));
 vi.mock("node:fs/promises", () => io);
 vi.mock("node:fs", async (importOriginal) => ({
@@ -30,6 +31,14 @@ vi.mock("node:child_process", async () => {
   Object.defineProperty(io.execFile, promisify.custom, { value: io.execFileAsync });
   return { spawn: io.spawn, execFile: io.execFile };
 });
+vi.mock("node:sqlite", () => ({
+  DatabaseSync: class {
+    prepare() {
+      return { get: () => ({ user_version: io.databaseVersion }) };
+    }
+    close() {}
+  },
+}));
 vi.mock("node:net", () => ({ default: { createConnection: io.createConnection } }));
 vi.mock("proper-lockfile", () => ({ default: { check: async () => false } }));
 vi.mock("./paths.js", () => ({ getServiceDataDir: () => "/fixture/state" }));
@@ -69,6 +78,7 @@ beforeEach(() => {
   Object.defineProperty(process, "platform", { value: "linux" });
   state = [{ ...baseEntry }];
   processAlive = true;
+  io.databaseVersion = 25;
   observedTicks = linuxIdentity.startTimeTicks;
   observedArgs = [...args];
   observedExecutable = executable;
@@ -316,6 +326,32 @@ describe("service commands with unverified Linux ownership", () => {
     expect(state[0]!.linuxIdentity).toBeUndefined();
     expect(io.rm).not.toHaveBeenCalled();
     expect(stdout).not.toHaveBeenCalled();
+  });
+
+  it("refuses an older rollback after a failed candidate upgrades the shared schema", async () => {
+    io.stat.mockResolvedValue({ isFile: () => true, isDirectory: () => true });
+    const fixtureRead = io.readFile.getMockImplementation()!;
+    io.readFile.mockImplementation(async (path: string) => {
+      if (path.endsWith("persistence/schema.ts"))
+        return `export const CURRENT_SCHEMA_VERSION = ${path.startsWith(baseEntry.cwd) ? 25 : 28};`;
+      return fixtureRead(path);
+    });
+    io.spawn.mockImplementation(() => {
+      io.databaseVersion = 28;
+      throw new Error("candidate failed after migration");
+    });
+    const error = await runServiceCommand("switch", ["--checkout", "/srv/candidate"]).catch(
+      (error: unknown) => error,
+    );
+    expect(error).toBeInstanceOf(AggregateError);
+    expect((error as AggregateError).errors.map((item: Error) => item.message)).toEqual([
+      "candidate failed after migration",
+      "Target checkout supports database version 25, but shared data uses 28",
+    ]);
+    expect(io.spawn).toHaveBeenCalledOnce();
+    expect(io.databaseVersion).toBe(28);
+    expect(state).toEqual([]);
+    expect(io.rm).not.toHaveBeenCalled();
   });
 
   it("rejects malformed persisted birth identity without changing state", async () => {

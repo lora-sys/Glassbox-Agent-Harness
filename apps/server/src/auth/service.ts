@@ -1,3 +1,9 @@
+import {
+  policyConditionAllows,
+  isPublicGroupCollectionGate,
+  policyConditionJson,
+  type AuthorizationPolicyCondition,
+} from "./policy-condition.js";
 import { randomUUID } from "node:crypto";
 import type { Transaction } from "@libsql/client";
 import { resolveIdentity } from "../identity/service.js";
@@ -5,11 +11,25 @@ import {
   conversationScopeKey,
   requireIdentifier,
   scopeKey,
+  validateScope,
   type CallerContext,
   type TrustedChannelScope,
 } from "../identity/scope.js";
 import { DomainDatabase, optionalString, stringColumn } from "../persistence/database.js";
 import { taskPolicyResourceId } from "./task-policy.js";
+
+export interface ProvisionedResource {
+  id: string;
+  kind: string;
+  visibility: "public" | "private";
+  ownerId?: string;
+  ifAbsent?: boolean;
+}
+
+export interface ProvisioningEntry {
+  resource: ProvisionedResource;
+  action: string;
+}
 
 export type DecisionValue = "ALLOW" | "DENY" | "REQUIRES_APPROVAL";
 export type DecisionReason =
@@ -23,7 +43,10 @@ export type DecisionReason =
   | "approval_invalid"
   | "approved"
   | "scope_mismatch"
-  | "delegation_scope_denied";
+  | "delegation_scope_denied"
+  | "source_policy_denied"
+  | "source_read_unverified"
+  | "source_provenance_unavailable";
 export interface AuthorizationDecision {
   id: string;
   decision: DecisionValue;
@@ -32,6 +55,8 @@ export interface AuthorizationDecision {
   approvalId: string | null;
 }
 export interface AuthorizationRequest {
+  /** Trusted source route. Undefined creates explicit none; null preserves legacy unknown. */
+  policyCondition?: AuthorizationPolicyCondition | null;
   caller: CallerContext;
   resourceId: string;
   action: string;
@@ -40,6 +65,12 @@ export interface AuthorizationRequest {
   runId?: string;
   /** Trusted execution boundary. A Run-to-Task binding also supplies this automatically. */
   delegatedTaskId?: string;
+}
+
+export interface AuthorizedReadReceipt {
+  request: AuthorizationRequest;
+  decisionId: string;
+  source: "content_source" | "access_gate";
 }
 
 async function delegatedTaskAllows(
@@ -172,6 +203,22 @@ export function classifyProtectedReadAction(
   return verb !== undefined && PROTECTED_READ_ACTION_VERBS.has(verb) ? "content_source" : undefined;
 }
 
+/** AUTH02's two non-read Actions whose verified results carry protected content. */
+export function isDocumentedContentWrite(
+  action: string,
+  resourceKind: string | undefined,
+  resourceId: string,
+): boolean {
+  return (
+    (resourceKind === "workspace" &&
+      resourceId.startsWith("workspace:") &&
+      action === "workspace:write") ||
+    (resourceKind === "owner-control" &&
+      resourceId === "owner-control" &&
+      action === "model:switch")
+  );
+}
+
 export class AccessDeniedError extends Error {
   constructor(readonly decision: AuthorizationDecision) {
     super(decision.decision === "REQUIRES_APPROVAL" ? "Approval is required" : "Access denied");
@@ -189,7 +236,7 @@ export async function recordDecision(
 ): Promise<AuthorizationDecision> {
   const id = randomUUID();
   await tx.execute({
-    sql: "INSERT INTO authorization_decisions(id, principal_id, resource_id, action, scope_key, decision, reason, grant_id, approval_id, conversation_id, run_id, delivery_source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    sql: "INSERT INTO authorization_decisions(id, principal_id, resource_id, action, scope_key, decision, reason, grant_id, approval_id, conversation_id, run_id, delivery_source, policy_condition_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     args: [
       id,
       request.caller.principalId,
@@ -203,6 +250,7 @@ export async function recordDecision(
       request.conversationId ?? null,
       request.runId ?? null,
       null,
+      policyConditionJson(request.policyCondition),
       new Date().toISOString(),
     ],
   });
@@ -214,6 +262,8 @@ export async function recordDecision(
 export async function evaluate(
   tx: Transaction,
   request: AuthorizationRequest,
+  /** Server-only receipt for completion of the same read, not permission for another operation. */
+  completedReadDecisionId?: string,
 ): Promise<AuthorizationDecision> {
   requireIdentifier(request.resourceId);
   requireIdentifier(request.action);
@@ -263,9 +313,47 @@ export async function evaluate(
     }
   }
   if (!grant) return recordDecision(tx, request, "DENY", "no_grant");
+  if (
+    !(await policyConditionAllows(tx, {
+      ...request,
+      resourceKind: stringColumn(resources.rows[0], "kind"),
+    }))
+  )
+    return recordDecision(tx, request, "DENY", "source_policy_denied");
   const grantId = stringColumn(grant, "id");
   if (stringColumn(grant, "effect") === "allow")
     return recordDecision(tx, request, "ALLOW", "explicit_grant", grantId);
+  if (completedReadDecisionId) {
+    const completed = await tx.execute({
+      sql: `SELECT a.id FROM authorization_decisions_all d JOIN approvals a ON a.id = d.approval_id
+        WHERE d.id = ? AND d.decision = 'ALLOW' AND d.reason = 'approved' AND d.grant_id = ?
+          AND d.principal_id = ? AND d.resource_id = ? AND d.action = ? AND d.scope_key = ?
+          AND d.run_id IS ? AND d.conversation_id IS ? AND d.policy_condition_json IS ?
+          AND a.grant_id = d.grant_id AND a.consumed_at IS NOT NULL AND a.expires_at > ?`,
+      args: [
+        completedReadDecisionId,
+        grantId,
+        resolved,
+        request.resourceId,
+        request.action,
+        scopeKey(request.caller.scope),
+        request.runId ?? null,
+        request.conversationId ?? null,
+        policyConditionJson(request.policyCondition),
+        new Date().toISOString(),
+      ],
+    });
+    if (completed.rows[0])
+      return recordDecision(
+        tx,
+        request,
+        "ALLOW",
+        "approved",
+        grantId,
+        stringColumn(completed.rows[0], "id"),
+      );
+    return recordDecision(tx, request, "DENY", "approval_invalid", grantId);
+  }
   if (!request.approvalId && request.runId && request.action === "run:create") {
     // Admission consumes approval once and links its decision to exactly one Run.
     // Rechecks reuse that evidence only while the same grant and binding are current.
@@ -329,7 +417,110 @@ export function authorizedValue<T>(result: AuthorizedResult<T>): T {
 export class AuthorizationService {
   constructor(private readonly db: DomainDatabase) {}
 
-  /** Marks an ALLOW decision only after its protected operation returned successfully. */
+  /** Reauthorize completed reads and record every consumed source in one transaction.
+   * Initial execution evidence remains intact. An approval receipt can finish only the exact
+   * read it originally allowed; it is not consumed twice or reusable for another operation. */
+  async authorizeReadResults(
+    reads: readonly AuthorizedReadReceipt[],
+  ): Promise<AuthorizationDecision[]> {
+    return (await this.completeReadAuthorization(reads)).reads;
+  }
+
+  /** The last source-read and dependent action checks share one authorization snapshot.
+   * Call only after all external role/trace/policy projections have finished. */
+  async authorizeReadResultsAndAction(
+    reads: readonly AuthorizedReadReceipt[],
+    actionRequest: AuthorizationRequest,
+  ): Promise<AuthorizationDecision> {
+    const result = await this.completeReadAuthorization(reads, actionRequest);
+    if (!result.action) throw new Error("Missing final action authorization");
+    return result.action;
+  }
+
+  private async completeReadAuthorization(
+    reads: readonly AuthorizedReadReceipt[],
+    actionRequest?: AuthorizationRequest,
+  ): Promise<{ reads: AuthorizationDecision[]; action?: AuthorizationDecision }> {
+    if (reads.length > 128) throw new Error("Too many completed protected reads");
+    return authorizedValue(
+      await this.db.transaction<
+        AuthorizedResult<{ reads: AuthorizationDecision[]; action?: AuthorizationDecision }>
+      >(async (tx) => {
+        if (
+          actionRequest &&
+          reads.some(
+            ({ request }) =>
+              request.caller.principalId !== actionRequest.caller.principalId ||
+              scopeKey(request.caller.scope) !== scopeKey(actionRequest.caller.scope) ||
+              (request.runId ?? null) !== (actionRequest.runId ?? null) ||
+              (request.conversationId ?? null) !== (actionRequest.conversationId ?? null) ||
+              (request.delegatedTaskId ?? null) !== (actionRequest.delegatedTaskId ?? null),
+          )
+        )
+          return {
+            denied: await recordDecision(tx, actionRequest, "DENY", "source_read_unverified"),
+          };
+        const decisions: AuthorizationDecision[] = [];
+        for (const read of reads) {
+          const { request } = read;
+          const original = await tx.execute({
+            sql: `SELECT d.id,d.delivery_source,r.kind FROM authorization_decisions_all d JOIN resources r ON r.id = d.resource_id
+            WHERE d.id = ? AND d.decision = 'ALLOW' AND d.principal_id = ? AND d.resource_id = ?
+              AND d.action = ? AND d.scope_key = ? AND d.run_id IS ? AND d.conversation_id IS ?
+              AND d.policy_condition_json IS ?`,
+            args: [
+              read.decisionId,
+              request.caller.principalId,
+              request.resourceId,
+              request.action,
+              scopeKey(request.caller.scope),
+              request.runId ?? null,
+              request.conversationId ?? null,
+              policyConditionJson(request.policyCondition),
+            ],
+          });
+          if (
+            !original.rows[0] ||
+            (classifyProtectedReadAction(request.action, stringColumn(original.rows[0], "kind")) !==
+              read.source &&
+              !(
+                read.source === "content_source" &&
+                original.rows[0].delivery_source === "content_source" &&
+                isDocumentedContentWrite(
+                  request.action,
+                  stringColumn(original.rows[0], "kind"),
+                  request.resourceId,
+                )
+              ) &&
+              !(
+                original.rows[0].kind === "owner-memory" &&
+                original.rows[0].delivery_source === "access_gate" &&
+                isPublicGroupCollectionGate({
+                  ...request,
+                  source: read.source,
+                  policyCondition: request.policyCondition ?? null,
+                })
+              ))
+          )
+            return { denied: await recordDecision(tx, request, "DENY", "source_read_unverified") };
+          const decision = await evaluate(tx, request, read.decisionId);
+          if (decision.decision !== "ALLOW") return { denied: decision };
+          decisions.push(decision);
+        }
+        const action = actionRequest ? await evaluate(tx, actionRequest) : undefined;
+        if (action && action.decision !== "ALLOW") return { denied: action };
+        for (let index = 0; index < decisions.length; index++)
+          await tx.execute({
+            sql: "UPDATE authorization_decisions SET delivery_source = ? WHERE id = ?",
+            args: [reads[index]!.source, decisions[index]!.id],
+          });
+        return { value: { reads: decisions, ...(action ? { action } : {}) } };
+      }),
+    );
+  }
+
+  /** Records protected output provenance before releasing content. Native tools mark before
+   * execution because they can stream or return partial content even when the call fails. */
   async markDeliverySource(
     decisionId: string,
     source: "content_source" | "access_gate",
@@ -350,41 +541,78 @@ export class AuthorizationService {
   }
 
   /** Register metadata only. Protected content stays behind an authorized loader. */
-  async registerResource(input: {
-    id: string;
-    kind: string;
-    visibility: "public" | "private";
-    ownerId?: string;
-    ifAbsent?: boolean;
-  }): Promise<void> {
+  async registerResource(input: ProvisionedResource): Promise<void> {
+    await this.db.transaction((tx) => this.registerResourceInTransaction(tx, input));
+  }
+
+  private async registerResourceInTransaction(
+    tx: Transaction,
+    input: ProvisionedResource,
+  ): Promise<void> {
     requireIdentifier(input.id);
     requireIdentifier(input.kind);
     if (input.visibility !== "public" && input.visibility !== "private")
       throw new Error("Invalid resource visibility");
+    await tx.execute({
+      sql: `INSERT ${input.ifAbsent ? "OR IGNORE " : ""}INTO resources(id, kind, visibility, owner_id) VALUES (?, ?, ?, ?)`,
+      args: [input.id, input.kind, input.visibility, input.ownerId ?? null],
+    });
+    if (input.ifAbsent) {
+      const existing = (
+        await tx.execute({
+          sql: "SELECT kind, visibility, owner_id FROM resources WHERE id = ?",
+          args: [input.id],
+        })
+      ).rows[0];
+      if (
+        !existing ||
+        existing.kind !== input.kind ||
+        existing.visibility !== input.visibility ||
+        existing.owner_id !== (input.ownerId ?? null)
+      )
+        throw new Error("Resource metadata conflict");
+    }
+  }
+
+  /** Management-only provisioning. Each ordered check remains in the decision ledger.
+   * A bounded batch commits all metadata, decisions and grants together or rolls back all.
+   * Initial provisioning never restores revoked or approval-only policy.
+   */
+  async provisionResources(input: {
+    caller: CallerContext;
+    entries: readonly ProvisioningEntry[];
+    initialOnly: boolean;
+  }): Promise<void> {
+    if (!Array.isArray(input.entries) || input.entries.length > 128)
+      throw new Error("Invalid provisioning batch size");
+    if (typeof input.initialOnly !== "boolean") throw new Error("Invalid provisioning mode");
+    requireIdentifier(input.caller.principalId);
+    validateScope(input.caller.scope);
     await this.db.transaction(async (tx) => {
-      await tx.execute({
-        sql: `INSERT ${input.ifAbsent ? "OR IGNORE " : ""}INTO resources(id, kind, visibility, owner_id) VALUES (?, ?, ?, ?)`,
-        args: [input.id, input.kind, input.visibility, input.ownerId ?? null],
-      });
-      if (input.ifAbsent) {
-        const existing = (
-          await tx.execute({
-            sql: "SELECT kind, visibility, owner_id FROM resources WHERE id = ?",
-            args: [input.id],
-          })
-        ).rows[0];
-        if (
-          !existing ||
-          existing.kind !== input.kind ||
-          existing.visibility !== input.visibility ||
-          existing.owner_id !== (input.ownerId ?? null)
-        )
-          throw new Error("Resource metadata conflict");
+      for (const entry of input.entries) {
+        await this.registerResourceInTransaction(tx, entry.resource);
+        const existing = await evaluate(tx, {
+          caller: input.caller,
+          resourceId: entry.resource.id,
+          action: entry.action,
+        });
+        if (existing.decision !== "ALLOW")
+          await this.writeGrantInTransaction(
+            tx,
+            {
+              principalId: input.caller.principalId,
+              resourceId: entry.resource.id,
+              action: entry.action,
+              scope: input.caller.scope,
+              effect: "allow",
+            },
+            input.initialOnly,
+          );
       }
     });
   }
 
-  /** Management-only. Identity binding deliberately creates no grants. */
+  /** Management-only. Explicit grants may restore previously revoked authority. */
   async grant(input: {
     principalId: string;
     resourceId: string;
@@ -392,34 +620,135 @@ export class AuthorizationService {
     scope: TrustedChannelScope;
     effect: "allow" | "approval";
   }): Promise<string> {
+    return (await this.writeGrant(input, false))!;
+  }
+
+  /** Initial provisioning only. Any prior policy, including revocation, stays authoritative. */
+  async grantInitial(input: {
+    principalId: string;
+    resourceId: string;
+    action: string;
+    scope: TrustedChannelScope;
+    effect: "allow" | "approval";
+  }): Promise<string | null> {
+    return this.writeGrant(input, true);
+  }
+
+  /** Historical routing metadata for explicit management restoration, never automatic grants. */
+  async listScopeHistory(input: {
+    resourceId: string;
+    action: string;
+    connectionId: string;
+    botId: string;
+    chatType: "private" | "group";
+    chatId: string;
+  }): Promise<CallerContext[]> {
+    for (const value of [
+      input.resourceId,
+      input.action,
+      input.connectionId,
+      input.botId,
+      input.chatId,
+    ])
+      requireIdentifier(value);
+    if (input.chatType !== "private" && input.chatType !== "group")
+      throw new Error("Invalid channel scope");
+    return this.db.transaction(async (tx) => {
+      const rows = await tx.execute({
+        sql: `SELECT DISTINCT principal_id, scope_key FROM grants
+              WHERE resource_id = ? AND action = ?
+                AND json_extract(scope_key, '$[0]') = ?
+                AND json_extract(scope_key, '$[1]') = ?
+                AND json_extract(scope_key, '$[2]') = ?
+                AND json_extract(scope_key, '$[3]') = ?`,
+        args: [
+          input.resourceId,
+          input.action,
+          input.connectionId,
+          input.botId,
+          input.chatType,
+          input.chatId,
+        ],
+      });
+      const scopes: CallerContext[] = [];
+      for (const row of rows.rows) {
+        const key = stringColumn(row, "scope_key");
+        const tuple: unknown = JSON.parse(key);
+        if (!Array.isArray(tuple) || tuple.length !== 6)
+          throw new Error("Invalid persisted channel scope");
+        const scope: TrustedChannelScope = {
+          connectionId: tuple[0],
+          botId: tuple[1],
+          chatType: tuple[2],
+          chatId: tuple[3],
+          senderId: tuple[4],
+          ...(tuple[5] === null ? {} : { threadId: tuple[5] }),
+        };
+        validateScope(scope);
+        if (scopeKey(scope) !== key) throw new Error("Invalid persisted channel scope");
+        scopes.push({ principalId: stringColumn(row, "principal_id"), scope });
+      }
+      return scopes;
+    });
+  }
+
+  private async writeGrant(
+    input: {
+      principalId: string;
+      resourceId: string;
+      action: string;
+      scope: TrustedChannelScope;
+      effect: "allow" | "approval";
+    },
+    initialOnly: boolean,
+  ): Promise<string | null> {
+    return this.db.transaction((tx) => this.writeGrantInTransaction(tx, input, initialOnly));
+  }
+
+  private async writeGrantInTransaction(
+    tx: Transaction,
+    input: {
+      principalId: string;
+      resourceId: string;
+      action: string;
+      scope: TrustedChannelScope;
+      effect: "allow" | "approval";
+    },
+    initialOnly: boolean,
+  ): Promise<string | null> {
     for (const value of [input.principalId, input.resourceId, input.action])
       requireIdentifier(value);
     if (input.effect !== "allow" && input.effect !== "approval")
       throw new Error("Invalid grant effect");
     const key = scopeKey(input.scope);
-    return this.db.transaction(async (tx) => {
-      const existing = await tx.execute({
-        sql: "SELECT id FROM grants WHERE principal_id = ? AND resource_id = ? AND action = ? AND scope_key = ? AND effect = ? AND revoked_at IS NULL ORDER BY created_at ASC, id ASC LIMIT 1",
-        args: [input.principalId, input.resourceId, input.action, key, input.effect],
+    if (initialOnly) {
+      const configured = await tx.execute({
+        sql: "SELECT id FROM grants WHERE principal_id = ? AND resource_id = ? AND action = ? AND scope_key = ? LIMIT 1",
+        args: [input.principalId, input.resourceId, input.action, key],
       });
-      if (existing.rows[0]) {
-        return stringColumn(existing.rows[0], "id");
-      }
-      const id = randomUUID();
-      await tx.execute({
-        sql: "INSERT INTO grants(id, principal_id, resource_id, action, scope_key, effect, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        args: [
-          id,
-          input.principalId,
-          input.resourceId,
-          input.action,
-          key,
-          input.effect,
-          new Date().toISOString(),
-        ],
-      });
-      return id;
+      if (configured.rows[0]) return null;
+    }
+    const existing = await tx.execute({
+      sql: "SELECT id FROM grants WHERE principal_id = ? AND resource_id = ? AND action = ? AND scope_key = ? AND effect = ? AND revoked_at IS NULL ORDER BY created_at ASC, id ASC LIMIT 1",
+      args: [input.principalId, input.resourceId, input.action, key, input.effect],
     });
+    if (existing.rows[0]) {
+      return stringColumn(existing.rows[0], "id");
+    }
+    const id = randomUUID();
+    await tx.execute({
+      sql: "INSERT INTO grants(id, principal_id, resource_id, action, scope_key, effect, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      args: [
+        id,
+        input.principalId,
+        input.resourceId,
+        input.action,
+        key,
+        input.effect,
+        new Date().toISOString(),
+      ],
+    });
+    return id;
   }
 
   async revoke(grantId: string): Promise<void> {
@@ -434,7 +763,8 @@ export class AuthorizationService {
 
   /**
    * Gives `delivery:send` to every Principal that can already read a content source, in the
-   * exact scope where they can read it. Returns how many grants it added.
+   * exact scope where they can read it, only if delivery policy has never been configured.
+   * Revocations and approval requirements are preserved. Returns how many grants it added.
    *
    * Reading a source and delivering what it produced are two rows, and a grant introduced
    * later only reaches the scopes the provisioning path knows about. A group member is
@@ -460,7 +790,7 @@ export class AuthorizationService {
         const existing = await tx.execute({
           sql: `SELECT id FROM grants
             WHERE principal_id = ? AND resource_id = ? AND action = 'delivery:send'
-              AND scope_key = ? AND effect = 'allow' AND revoked_at IS NULL LIMIT 1`,
+              AND scope_key = ? LIMIT 1`,
           args: [principalId, input.resourceId, key],
         });
         if (existing.rows[0]) continue;

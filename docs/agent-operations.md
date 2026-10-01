@@ -110,9 +110,11 @@ Glassbox review REWORK
 → create or resume another attempt
 ```
 
-Pi's native Herdr integration reports `working`, `idle`, and `blocked`. For a Pi attempt, an `idle` observation can enter REVIEW only after Glassbox has persisted a `working` observation for that same attempt and the previous observed state is `working`. An initial idle pane is not evidence of completed work. Raw Trace retains the reported `idle` state. This mapping never accepts a Task or marks it DONE.
+Pi's native Herdr integration reports `working`, `idle`, and `blocked`. For a Pi attempt, an `idle` observation can enter REVIEW only after Glassbox has persisted a `working` observation for that same attempt. Monitoring gaps marked `unknown` do not erase that evidence; `blocked` does not count as completed work. An initial idle pane is not evidence of completion. Durable Worker observations atomically retain the working-to-idle completion evidence in append-only Raw Trace, separately from the latest displayed Worker state. Repeated management observations and a database reopen cannot consume that evidence before the authorized Temporal owner captures the result and settles the Step. Newer working observations supersede an older idle observation. This mapping never accepts a Task or marks it DONE.
 
 For a durable Herdr Step, Glassbox records the first terminal Worker output against its live TaskAttempt and WorkerBinding before the Step enters REVIEW. The stored candidate is immutable. It contains a SHA-256 digest of the bounded read and at most 16 KiB of terminal excerpt. The Step holds an opaque `worker-result` reference. A later read requires that exact Step and Attempt to be in review or succeeded state and checks current Task and Worker read grants, read grants for every declared file and workspace source, and protected sources from the Task's planning Run and ancestor Tasks. This permits review after Herdr closes the pane without exposing a captured output before Step settlement. After Step acceptance, a directly dependent Model Step can receive a bounded excerpt, including one from an accepted child Task's Worker root. The receiving Run rechecks the source grants and records them for delivery review. The excerpt is untrusted evidence, not a verified file artifact, and does not accept the Step or Task.
+
+If Glassbox observes the same Worker resume work after its first output capture, it appends a candidate-invalidation marker to that attempt's observation Trace. The original candidate and declared file remain immutable, including across restart. A later completion cannot expose or reuse them for review. The Temporal owner records `worker-output-stale-rework-required`, blocks the Step, and quarantines its lease. The existing verified pane-closure path must release the old Worker before an authorized explicit Step Rework creates a new attempt and fresh candidate. First capture compares the current binding state, observation timestamp, and append-only observation sequence inside its write transaction. A changed observation prevents insertion, including a working-to-idle cycle within one timestamp. Settlement checks candidate invalidation again in its transaction. These checks never accept a Step or Task.
 
 ## Core domain
 
@@ -259,6 +261,10 @@ open event subscription connection
 ```
 
 After connection loss, repeat snapshot reconciliation.
+
+Both legacy and durable observations compare the original event or snapshot timestamp with the persisted binding timestamp under the database transaction. A buffered event older than the bootstrap or reconnect snapshot cannot change Task state. Legacy reconciliation also carries the exact binding and attempt identity into that transaction, so a replacement attempt cannot receive an earlier binding's observation.
+
+Join barriers and overdue timers perform no external work. If an Activity stops after their running transition commits, the next advance completes the same Step without recording a second start. Cancellation settles these running Steps without waiting for a Worker that does not exist. These recoveries do not apply to Model, Tool, or Herdr Steps, whose side effects still require their existing attempt, lease, and outcome evidence.
 
 A monitoring gap must not silently change a Task to DONE or FAILED.
 

@@ -30,7 +30,7 @@ export class HerdrWorkerRuntime {
       store.longWork,
       store.tasks,
       true,
-      async (claim, state) => {
+      async (claim, state, observedAt, observationSequence) => {
         const step = (await this.store.longWork.listSteps(claim.taskId)).find(
           (item) => item.id === claim.stepId,
         );
@@ -67,6 +67,7 @@ export class HerdrWorkerRuntime {
             expectedStepVersion: claim.expectedStepVersion,
             expectedLeaseVersion: claim.expectedLeaseVersion,
             output: existing.outputExcerpt,
+            expectedObservation: { state, observedAt, sequence: observationSequence },
             ...(savedArtifact
               ? {
                   artifact: {
@@ -101,6 +102,7 @@ export class HerdrWorkerRuntime {
           expectedStepVersion: claim.expectedStepVersion,
           expectedLeaseVersion: claim.expectedLeaseVersion,
           output: read.output,
+          expectedObservation: { state, observedAt, sequence: observationSequence },
           ...(artifact ? { artifact } : {}),
         });
       },

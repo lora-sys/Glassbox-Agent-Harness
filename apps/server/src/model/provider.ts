@@ -139,6 +139,31 @@ function errorMessage(model: Model<ModelProtocol>, cancelled: boolean): Assistan
   };
 }
 
+/** Shared key/no-auth resolution; this never contacts a provider. */
+export function resolveProfileCredential(options: {
+  profile: Pick<ModelProfile, "baseUrl" | "credentialSlot">;
+  apiKey?: string;
+}): string | undefined {
+  const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(
+    new URL(options.profile.baseUrl).hostname,
+  );
+  return (
+    options.apiKey ||
+    (loopback && options.profile.credentialSlot === null ? "glassbox-local-no-auth" : undefined)
+  );
+}
+
+/** The copied model provider accepts API keys; Pi keeps its own OAuth-capable path. */
+export function resolveModelCredential(options: {
+  profile: Pick<ModelProfile, "baseUrl" | "credentialSlot" | "protocol">;
+  apiKey?: string;
+}): string | undefined {
+  const apiKey = resolveProfileCredential(options);
+  return options.profile.protocol === "anthropic-messages" && apiKey?.includes("sk-ant-oat")
+    ? undefined
+    : apiKey;
+}
+
 export function createModelProvider(options: {
   profile: ModelProfile;
   apiKey?: string;
@@ -165,12 +190,10 @@ export function createModelProvider(options: {
     (endpoint.protocol !== "https:" && !(loopback && endpoint.protocol === "http:"))
   )
     throw new ModelConfigurationError("invalid_endpoint");
-  const apiKey =
-    options.apiKey ||
-    (loopback && profile.credentialSlot === null ? "glassbox-local-no-auth" : undefined);
-  if (!apiKey) throw new ModelConfigurationError("missing_credential");
-  if (profile.protocol === "anthropic-messages" && apiKey.includes("sk-ant-oat"))
+  if (profile.protocol === "anthropic-messages" && options.apiKey?.includes("sk-ant-oat"))
     throw new ModelConfigurationError("unsupported_credential");
+  const apiKey = resolveModelCredential({ profile, apiKey: options.apiKey });
+  if (!apiKey) throw new ModelConfigurationError("missing_credential");
   const model: Model<ModelProtocol> = {
     id: profile.model,
     name: profile.label,

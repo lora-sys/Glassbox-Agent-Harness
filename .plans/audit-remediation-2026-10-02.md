@@ -43,3 +43,44 @@ For long tasks, additionally investigate observer completion, cross-transaction 
 ## Owner acceptance handoff
 
 For each PR, explain the original behavior, root cause, changed contract if any, automated results, exact commit, remaining limits and manual QQ scenarios. Include negative and restart cases. Do not ask the Owner to discover basic parser or fake-transport regressions already testable locally.
+
+## AUTH03 source-policy revocation
+
+Status: local implementation and regression verification. Publication and Owner QQ acceptance
+remain pending. Derived Memory enforcement is implemented locally; final review remains open.
+
+- Reproduced grant-only access after a QQ category disable and the sibling-Owner history path.
+- Added versioned conditions to live and archived authorization decisions in schema v26.
+- Kept category flags independent from Memory-source-class flags, including shared Actions.
+- Applied grant and source-policy checks in one authorization transaction before consuming
+  approvals. Conditions come from trusted registry/retrieval producers, not Tool input.
+- Propagated conditions through delivery create/claim/retry, history reuse, internal Steps,
+  Task ancestry, and content-bearing Task/Worker projections without collapsing shared Actions.
+- Added fresh/upgrade/archive/reopen, malformed/legacy provenance, bounded lineage, and actual
+  registered QQ Tool regressions. Legacy QQ dependencies with unknown routes fail closed.
+- Reproduced derived Memory promotion/read/automatic-Context bypasses, then added server-owned
+  v27 dependency snapshots, archive-aware reconstruction, source-preserving merge/supersession,
+  authoritative Run lineage, verified raw imports, and trusted literal capture.
+- Closed held-provider and Worker-read completion windows. A selected-Memory recheck immediately
+  before every Runtime continuation closes the reproduced asynchronous Context-preparation
+  window. Real SDK tests also enforce its public stream and final payload boundaries for both
+  initial Memory and new mid-Run Tool sources; extension hooks alone did not stop transport.
+- Metadata-only expire/revoke/retire/reject remains available under current governance authority,
+  returning a body-free action receipt when collection/source reads are refused.
+- Added v27 fresh/v26-upgrade/archive/process-reopen tests, explicit legacy ancestry and ambiguous
+  retention controls, actual Runtime loading and delivery create/claim/retry checks, source-class
+  independence, forged metadata, older-dedupe, group reads, and all merge strategies.
+- Still required: final aggregate checks, independent review, eventual exact-commit CI, and
+  Owner-run real QQ acceptance. No live state or
+  service switch belongs to this slice.
+
+Existing tests that supplied only an `isHistoryEnabled` callback now seed durable policy in
+fixtures. Execution uses the database policy in the grant transaction. Category denial now
+reports `source_policy_denied` before provider execution. Assertions changed only for that
+intentional contract, with negative-policy and unchanged-grant regressions retained.
+
+A disposable follow-on reproduction confirmed that group-only archive queries returned a
+same-group row from another connection and let it consume the requested limit. AUTH03 now
+binds both Memory-source and history queries to the trusted connection in SQL. The archive
+has no durable Bot attribution, so reconfiguring one connection across Bot identities remains
+a separate provenance/migration risk rather than a completed isolation claim.

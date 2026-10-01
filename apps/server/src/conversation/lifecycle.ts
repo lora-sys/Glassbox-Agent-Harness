@@ -1,3 +1,5 @@
+import { readPolicyCondition } from "../auth/policy-condition.js";
+import { sourceClassification } from "../auth/source-dependencies.js";
 import { randomUUID } from "node:crypto";
 import type { Row, Transaction } from "@libsql/client";
 import { authorizedValue, evaluate, type AuthorizedResult } from "../auth/service.js";
@@ -147,26 +149,20 @@ export class LifecycleStore {
     caller: CallerContext,
     runId: string,
   ): Promise<AuthorizedResult<null>> {
-    // Trusted execution paths mark an ALLOW only after a protected read succeeds.
+    // Trusted execution paths mark ALLOW decisions when protected output may enter Context,
+    // including native streams and partial failures; attribution can precede execution.
     // Discovery checks remain unmarked, so they cannot become delivery dependencies.
     const decisions = await tx.execute({
-      sql: `SELECT DISTINCT d.resource_id, d.action, d.delivery_source, r.kind AS resource_kind
+      sql: `SELECT DISTINCT d.resource_id, d.action, d.delivery_source, d.policy_condition_json, r.kind AS resource_kind
         FROM authorization_decisions_all d LEFT JOIN resources r ON r.id = d.resource_id
         WHERE d.run_id = ? AND d.principal_id = ? AND d.decision = 'ALLOW'
           AND d.delivery_source IS NOT NULL`,
       args: [runId, caller.principalId],
     });
-    const sources = decisions.rows.flatMap((source) => {
-      const persistedClass = stringColumn(source, "delivery_source");
-      const classification =
-        persistedClass === "legacy_content_source"
-          ? "content_source"
-          : persistedClass === "legacy_access_gate"
-            ? "access_gate"
-            : persistedClass;
-      if (classification !== "content_source" && classification !== "access_gate") return [];
-      return classification ? [{ source, classification }] : [];
-    });
+    const sources = decisions.rows.map((source) => ({
+      source,
+      classification: sourceClassification(source),
+    }));
     // Every delivery decision is evidence about one Run in one Conversation, so the delivery
     // recheck names both. A denial then explains which Run tried to send which Resource's
     // derived content, without copying the payload it was carrying.
@@ -185,6 +181,9 @@ export class LifecycleStore {
           ...(conversationId === undefined ? {} : { conversationId }),
           resourceId: stringColumn(source, "resource_id"),
           action,
+          ...(action === stringColumn(source, "action")
+            ? { policyCondition: readPolicyCondition(source) }
+            : {}),
         });
         if (decision.decision !== "ALLOW") return { denied: decision };
       }

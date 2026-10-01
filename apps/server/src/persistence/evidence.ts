@@ -1,3 +1,7 @@
+import {
+  readPolicyCondition,
+  type AuthorizationPolicyCondition,
+} from "../auth/policy-condition.js";
 import { randomUUID } from "node:crypto";
 import { authorizedValue, evaluate, type AuthorizedResult } from "../auth/service.js";
 import {
@@ -44,6 +48,7 @@ export interface DecisionRecord {
   grantId: string | null;
   approvalId: string | null;
   deliverySource: string | null;
+  policyCondition: AuthorizationPolicyCondition | null;
   conversationId: string | null;
   runId: string | null;
   createdAt: string;
@@ -281,6 +286,7 @@ export class EvidenceStore {
             grantId: optionalString(row, "grant_id"),
             approvalId: optionalString(row, "approval_id"),
             deliverySource: optionalString(row, "delivery_source"),
+            policyCondition: readPolicyCondition(row),
             conversationId: optionalString(row, "conversation_id"),
             runId: optionalString(row, "run_id"),
             createdAt: stringColumn(row, "created_at"),

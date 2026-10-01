@@ -127,7 +127,7 @@ export class OpsReconciler {
         .find((workspace) => workspace.workspaceId === binding.workspaceId)
         ?.panes.find((entry) => entry.paneId === binding.paneId);
       const matches = pane && (!binding.agentName || pane.agentName === binding.agentName);
-      await this.store.observeWorker(binding, matches ? pane.state : "unknown");
+      await this.store.observeWorker(binding, matches ? pane.state : "unknown", snapshot.timestamp);
     }
     // A complete snapshot closes a previous session-level monitoring gap. Keep
     // task-scoped dispatch failures until their Task is handled explicitly.
@@ -143,7 +143,7 @@ export class OpsReconciler {
       const durableAttempts = await this.durableWorkers?.durableAttemptIds(event.sessionId);
       for (const binding of await this.store.activeWorkerBindings(event.sessionId))
         if (!durableAttempts?.has(binding.taskAttemptId))
-          await this.store.observeWorker(binding, "unknown");
+          await this.store.observeWorker(binding, "unknown", event.timestamp);
       await this.reconcileSnapshot(await this.bridge.getSnapshot());
       return;
     }
@@ -156,7 +156,7 @@ export class OpsReconciler {
       const durableAttempts = await this.durableWorkers?.durableAttemptIds(event.sessionId);
       for (const binding of await this.store.activeWorkerBindings(event.sessionId))
         if (!durableAttempts?.has(binding.taskAttemptId))
-          await this.store.observeWorker(binding, "unknown");
+          await this.store.observeWorker(binding, "unknown", event.timestamp);
       await this.store.createAttentionItem({
         kind: "ops_connection_problem",
         summary: `Herdr session ${event.sessionId} disconnected`,
@@ -182,17 +182,10 @@ export class OpsReconciler {
         return;
       }
       if (binding.agentName && binding.agentName !== event.agentName) {
-        await this.store.observeWorker(binding, "unknown");
+        await this.store.observeWorker(binding, "unknown", event.timestamp);
         return;
       }
-      await this.store.observeWorker(
-        {
-          paneId: event.paneId,
-          herdrSession: event.sessionId,
-          workspaceId: event.workspaceId,
-        },
-        event.state,
-      );
+      await this.store.observeWorker(binding, event.state, event.timestamp);
     }
   }
 

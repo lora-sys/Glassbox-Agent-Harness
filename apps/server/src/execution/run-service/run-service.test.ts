@@ -1220,12 +1220,15 @@ describe("durable Run scheduling", () => {
     const causes: Record<ExecutionFailureCode, true> = {
       pre_provider_context_overflow: true,
       model_capacity_unknown: true,
+      model_capability_missing: true,
+      model_credential_missing: true,
       gate_refused: true,
       execution_unavailable: true,
       required_action_not_completed: true,
       claimed_change_not_performed: true,
       required_evidence_missing: true,
       runtime_run_errored: true,
+      runtime_internal_error: true,
       execution_threw: true,
     };
     for (const [index, cause] of Object.keys(causes).entries()) {

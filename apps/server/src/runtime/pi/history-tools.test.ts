@@ -75,6 +75,13 @@ async function fixture() {
     });
   }
   for (const gid of ["100", "200"]) {
+    // Execution authorization now reads the durable policy in its grant transaction.
+    await store.capabilities.write({
+      connectionId,
+      groupId: gid,
+      principalId: "owner",
+      policy: { categories: { "group.history": true }, memorySources: {} },
+    });
     await store.authorization.registerResource({
       id: groupResourceId(gid),
       kind: "qq_group",
@@ -1585,7 +1592,7 @@ it("answers an exact identifier from the message that carries it and nothing els
     expect(view.results[0]).toMatchObject({
       groupId: "100",
       sender: "member-e",
-      occurredAt: "2026-09-18T09:00:00Z",
+      occurredAt: "2026-09-18T09:00:00.000Z",
       text: `已合并 ${EXACT_IDENTIFIER} 到 main`,
     });
     expect(view.coverage.exactTerms).toEqual([EXACT_IDENTIFIER.toLowerCase()]);
@@ -1744,6 +1751,150 @@ it("records the exact terms it required in the retrieval evidence", async () => 
       coverage: "complete",
     });
   } finally {
+    await store.close();
+  }
+});
+
+it("a sibling Owner cannot bypass revoked history policy with an independent grant", async () => {
+  const { store, archive } = await fixture();
+  try {
+    await assign(store, "100", coOwnerPrivate, "owner-co");
+    await authorizeHistory(store, "100", coOwnerPrivate, "owner-co");
+    const accepted = await accept(store, coOwnerPrivate, "owner-co");
+    const synced: string[] = [];
+    const tools = createHistoryTools({
+      store,
+      archive,
+      isHistoryEnabled: historyEnabled,
+      syncGroup: async (groupId) => {
+        synced.push(groupId);
+        return undefined;
+      },
+      getContext: () => ({
+        caller: { principalId: "owner-co", scope: coOwnerPrivate },
+        runId: accepted.run.id,
+        conversationId: accepted.conversation.id,
+      }),
+    });
+    const tool = toolByName(tools, OWNER_HISTORY_SEARCH_TOOL);
+    expect((await call(tool, { query: "deploy" })).details).toMatchObject({ groups: ["100"] });
+    await store.capabilities.write({
+      connectionId,
+      groupId: "100",
+      principalId: "owner",
+      policy: { categories: { "group.history": false }, memorySources: { history: true } },
+    });
+    expect((await call(tool, { query: "deploy" })).details).toMatchObject({
+      groups: [],
+      items: [],
+    });
+    expect(synced).toEqual(["100"]);
+    // The co-Owner's independent grant remains intact; the route's policy is the denial.
+    expect(
+      (
+        await store.authorization.check({
+          caller: { principalId: "owner-co", scope: coOwnerPrivate },
+          resourceId: "group:100",
+          action: "history:read",
+        })
+      ).decision,
+    ).toBe("ALLOW");
+    await store.capabilities.write({
+      connectionId,
+      groupId: "100",
+      principalId: "owner-co",
+      policy: { categories: { "group.history": true }, memorySources: {} },
+    });
+    expect((await call(tool, { query: "deploy" })).details).toMatchObject({ groups: ["100"] });
+  } finally {
+    await store.close();
+  }
+});
+
+it("excludes another connection's same-group history before candidate loading and limits", async () => {
+  const { store, archive } = await fixture();
+  try {
+    await assign(store, "100");
+    await authorizeHistory(store, "100");
+    await archive.ingest({
+      channel: "qq",
+      connectionId: "other-connection",
+      groupId: "100",
+      externalMessageId: "other-history",
+      senderId: "other",
+      normalizedText: "deploy rollback protected other connection",
+      occurredAt: "2026-09-21T10:00:00Z",
+    });
+    const accepted = await accept(store, ownerPrivate);
+    const tools = createHistoryTools({
+      store,
+      archive,
+      isHistoryEnabled: historyEnabled,
+      getContext: () => ({
+        caller: { principalId: "owner", scope: ownerPrivate },
+        runId: accepted.run.id,
+        conversationId: accepted.conversation.id,
+      }),
+    });
+    const tool = toolByName(tools, OWNER_HISTORY_SEARCH_TOOL);
+    const result = await call(tool, { since: "2026-09-19T00:00:00Z", limit: 1 });
+    const details = result.details as { items: Array<{ snippet: string }> };
+    expect(details.items).toHaveLength(1);
+    expect(details.items[0]!.snippet).toContain("deploy rollback plan alpha");
+    expect(JSON.stringify(result)).not.toContain("protected other connection");
+    expect((await call(tool, { query: "protected", limit: 1 })).details).toMatchObject({
+      items: [],
+    });
+  } finally {
+    await store.close();
+  }
+});
+
+it("withholds multi-group history when a consumed source is revoked during provider sync", async () => {
+  const { store, archive } = await fixture();
+  let entered!: () => void;
+  const waiting = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  let release!: () => void;
+  const provider = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  try {
+    for (const groupId of ["100", "200"]) {
+      await assign(store, groupId);
+      await authorizeHistory(store, groupId);
+    }
+    const accepted = await accept(store, ownerPrivate);
+    const tools = createHistoryTools({
+      store,
+      archive,
+      isHistoryEnabled: historyEnabled,
+      getContext: () => ({
+        caller: { principalId: "owner", scope: ownerPrivate },
+        runId: accepted.run.id,
+        conversationId: accepted.conversation.id,
+      }),
+      syncGroup: async (groupId) => {
+        if (groupId === "100") {
+          entered();
+          await provider;
+        }
+        return undefined;
+      },
+    });
+    const result = call(toolByName(tools, OWNER_HISTORY_SEARCH_TOOL), { query: "deploy" });
+    await waiting;
+    await store.capabilities.write({
+      connectionId,
+      groupId: "100",
+      principalId: "owner",
+      policy: { categories: {}, memorySources: { history: true } },
+    });
+    release();
+    await expect(result).rejects.toThrow("protected_read_revoked");
+  } finally {
+    release?.();
     await store.close();
   }
 });

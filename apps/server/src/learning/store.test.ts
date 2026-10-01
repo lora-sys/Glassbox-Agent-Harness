@@ -1,3 +1,4 @@
+import { qqMemorySourceCondition } from "../auth/policy-condition.js";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -531,14 +532,56 @@ describe("P4A durable learning truth", () => {
     directories.push(directory);
     const databasePath = join(directory, "glassbox.db");
     const { store } = await fixture(databasePath);
+    // This fixture now carries an actual protected-read receipt, not invented provenance IDs.
+    await store.conversations.createAgent("personal");
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: "agent:personal",
+      action: "run:create",
+      scope: privateScope,
+      effect: "allow",
+    });
+    await store.authorization.registerResource({
+      id: "group:123",
+      kind: "qq_group",
+      visibility: "public",
+    });
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: "group:123",
+      action: "history:read",
+      scope: privateScope,
+      effect: "allow",
+    });
+    await store.capabilities.write({
+      connectionId: "qq",
+      groupId: "123",
+      principalId: "owner",
+      policy: { categories: {}, memorySources: { history: true } },
+    });
+    const sourceRun = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: privateScope,
+      messageId: "source-evidence",
+      text: "Read disposable source",
+      executionRef: "fake",
+    });
+    const sourceDecision = await store.authorization.check({
+      caller: owner,
+      resourceId: "group:123",
+      action: "history:read",
+      runId: sourceRun.run.id,
+      policyCondition: qqMemorySourceCondition(owner, "qq", "123", "history"),
+    });
+    await store.authorization.markDeliverySource(sourceDecision.id, "content_source");
     const candidateInput = candidateFromAuthorizedSource({
       item: {
         channel: "qq",
-        groupResourceId: "qq-group:123",
+        groupResourceId: "group:123",
         groupId: "123",
         category: "history",
-        sourceReadRunId: "run-source",
-        authorizationDecisionId: "decision-source",
+        sourceReadRunId: sourceRun.run.id,
+        authorizationDecisionId: sourceDecision.id,
         externalMessageId: "message-9",
         senderId: "attacker",
         occurredAt: "2026-09-20T00:00:00.000Z",
@@ -558,7 +601,7 @@ describe("P4A durable learning truth", () => {
       channel: "qq",
       groupId: "123",
       externalMessageId: "message-9",
-      authorizationDecisionId: "decision-source",
+      authorizationDecisionId: sourceDecision.id,
       untrustedInput: true,
     });
     expect(await store.learning.listMemories(context)).toEqual([]);

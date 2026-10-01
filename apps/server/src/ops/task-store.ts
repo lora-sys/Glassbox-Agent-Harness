@@ -1,3 +1,4 @@
+import { readTaskSourceRows, reauthorizeSourceRows } from "../auth/source-dependencies.js";
 import { randomUUID } from "node:crypto";
 import type { InValue, Row, Transaction } from "@libsql/client";
 import type {
@@ -692,14 +693,27 @@ export class TaskStore {
       }
       sql += " ORDER BY created_at DESC";
       const res = await tx.execute({ sql, args });
-      return res.rows.map(parseTask);
+      const rows: Row[] = [];
+      for (const row of res.rows) {
+        if (options?.caller) {
+          const sources = await reauthorizeSourceRows(
+            tx,
+            options.caller,
+            await readTaskSourceRows(tx, stringColumn(row, "id")),
+            { runId: options.runId, conversationId: options.conversationId },
+          );
+          if ("denied" in sources) continue;
+        }
+        rows.push(row);
+      }
+      return rows.map(parseTask);
     });
   }
 
   /** Loads only caller-authorized durable records for the Ops health projection. */
   async getOpsHealthRecords(
     caller: CallerContext,
-    _evidence?: { runId?: string; conversationId?: string },
+    evidence?: { runId?: string; conversationId?: string },
   ): Promise<{ tasks: AgentTask[]; attempts: TaskAttempt[]; bindings: WorkerBinding[] }> {
     return this.db.transaction(async (tx) => {
       const visible = visibleTaskSubquery(caller);
@@ -716,10 +730,25 @@ export class TaskStore {
         args: visible.args,
       });
 
+      const allowed: Row[] = [];
+      for (const row of taskRows.rows) {
+        const sources = await reauthorizeSourceRows(
+          tx,
+          caller,
+          await readTaskSourceRows(tx, stringColumn(row, "id")),
+          evidence ?? {},
+        );
+        if (!("denied" in sources)) allowed.push(row);
+      }
+      const ids = new Set(allowed.map((row) => row.id));
+      const attempts = attemptRows.rows.filter((row) => ids.has(row.task_id));
+      const attemptIds = new Set(attempts.map((row) => row.id));
       return {
-        tasks: taskRows.rows.map(parseTask),
-        attempts: attemptRows.rows.map(parseAttempt),
-        bindings: bindingRows.rows.map(parseBinding),
+        tasks: allowed.map(parseTask),
+        attempts: attempts.map(parseAttempt),
+        bindings: bindingRows.rows
+          .filter((row) => attemptIds.has(row.task_attempt_id))
+          .map(parseBinding),
       };
     });
   }
@@ -1009,9 +1038,19 @@ export class TaskStore {
 
   /** Apply an observation and its product transition under the same write lock as review actions. */
   async observeWorker(
-    scope: { herdrSession: string; workspaceId: string; paneId: string },
+    scope: {
+      herdrSession: string;
+      workspaceId: string;
+      paneId: string;
+      id?: string;
+      taskAttemptId?: string;
+    },
     state: HerdrAgentLifecycleState,
+    observedAt = new Date().toISOString(),
   ): Promise<void> {
+    const observedTime = Date.parse(observedAt);
+    if (!Number.isFinite(observedTime)) return;
+    const observationTimestamp = new Date(observedTime).toISOString();
     await this.db.transaction(async (tx) => {
       const rows = await tx.execute({
         sql: `SELECT b.*, t.id AS task_id, t.status AS task_status, t.orchestration_mode AS orchestration_mode FROM worker_bindings b
@@ -1023,6 +1062,12 @@ export class TaskStore {
       if (rows.rows.length !== 1) return;
       const row = rows.rows[0]!;
       if (row.orchestration_mode !== "legacy") return;
+      if (
+        (scope.id && row.id !== scope.id) ||
+        (scope.taskAttemptId && row.task_attempt_id !== scope.taskAttemptId) ||
+        observedTime < Date.parse(stringColumn(row, "updated_at"))
+      )
+        return;
       const taskId = stringColumn(row, "task_id");
       const attemptId = stringColumn(row, "task_attempt_id");
       const current = stringColumn(row, "task_status");
@@ -1041,7 +1086,7 @@ export class TaskStore {
       const now = new Date().toISOString();
       await tx.execute({
         sql: "UPDATE worker_bindings SET last_observed_agent_state = ?, updated_at = ? WHERE id = ?",
-        args: [state, now, stringColumn(row, "id")],
+        args: [state, observationTimestamp, stringColumn(row, "id")],
       });
       const status = completed
         ? "REVIEW"
@@ -1092,7 +1137,12 @@ export class TaskStore {
         type: "worker.state_observed",
         taskId,
         taskAttemptId: attemptId,
-        data: { state, previousStatus: current, status: status ?? current },
+        data: {
+          state,
+          observedAt: observationTimestamp,
+          previousStatus: current,
+          status: status ?? current,
+        },
       });
     });
   }

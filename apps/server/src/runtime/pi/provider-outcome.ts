@@ -81,8 +81,10 @@ export function providerFailureCode(result: OneBotCapabilityResult): string {
  * Called on the one outbound provider path, so no capability Tool can return a provider
  * failure as though it were an answer.
  */
-export function requireProviderSuccess(result: OneBotCapabilityResult): OneBotCapabilityResult {
+export function requireProviderSuccess(
+  result: OneBotCapabilityResult,
+): Extract<OneBotCapabilityResult, { status: "ok" }> {
   const outcome = providerOutcome(result);
-  if (outcome === "success") return result;
+  if (result.status === "ok") return result;
   throw new ProviderCallError(outcome, providerFailureCode(result));
 }

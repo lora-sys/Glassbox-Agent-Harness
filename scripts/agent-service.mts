@@ -604,6 +604,10 @@ async function switchCheckout(options: StartOptions = {}): Promise<void> {
         throw new Error("Cannot restore the previous checkout while Glassbox is still running");
       const config = await loadConfig();
       await waitForDataLockRelease();
+      // The candidate may have migrated shared data before failing. Never blindly restart
+      // an older checkout or restore an old snapshot over newer durable state.
+      if (!previous.cwd) throw new Error("Cannot verify previous checkout for rollback");
+      await assertDatabaseCompatible(await checkoutRoot(previous.cwd));
       const restored = await startProcess("glassbox", {
         executable: previous.executable,
         args: previous.args,

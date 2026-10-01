@@ -1,3 +1,5 @@
+import { qqCategoryCondition } from "../../auth/policy-condition.js";
+import { AccessDeniedError, type AuthorizationRequest } from "../../auth/service.js";
 /**
  * Runtime Tools for the QQ Capability Registry.
  *
@@ -103,6 +105,8 @@ export interface CapabilityToolInput extends Record<string, unknown> {
   groupId?: string;
   operation?: string;
   params?: QqProviderParams;
+  /** Exact current-message card/nickname. Only set_group_ban accepts this alternative to user_id. */
+  memberSelector?: string;
 }
 
 export interface CapabilitySearchToolInput extends Record<string, unknown> {
@@ -340,6 +344,21 @@ function providerToolParameters(capability: QqCapability, allowListing = false) 
       { additionalProperties: false },
     );
   });
+  if (capability.tool === "qq_group_moderation")
+    variants.push(
+      Type.Object(
+        {
+          groupId,
+          operation: Type.Literal("set_group_ban"),
+          memberSelector: Type.String({ minLength: 1, maxLength: 128 }),
+          params: Type.Object(
+            { duration: providerParameterSchema("duration") },
+            { additionalProperties: false },
+          ),
+        },
+        { additionalProperties: false },
+      ),
+    );
   if (allowListing)
     return Type.Union([Type.Object({ groupId }, { additionalProperties: false }), ...variants]);
   return variants.length === 1 ? variants[0]! : Type.Union(variants);
@@ -381,7 +400,11 @@ function providerToolDescription(capability: QqCapability): string {
       return `${operation.action}: params may contain ${modelParams.join(", ") || "nothing"}; required ${required.join(", ") || "nothing"}`;
     })
     .join(". ");
-  return `${capability.description} Set operation to one listed action. Put provider arguments in params. In a group omit groupId. In Owner private chat provide groupId. ${operations}.`;
+  const memberResolution =
+    capability.tool === "qq_group_moderation"
+      ? " For set_group_ban only, a current-message nickname/card may use memberSelector with params.duration and no user_id. The server requires current member-read permission and one exact match. Never infer an ID from history. If resolution fails, ask for the target's QQ user ID."
+      : "";
+  return `${capability.description}${memberResolution} Set operation to one listed action. Put provider arguments in params. In a group omit groupId. In Owner private chat provide groupId. ${operations}.`;
 }
 
 function safeQqId(value: unknown): string | undefined {
@@ -404,8 +427,32 @@ interface ProviderCallOptions {
     groupId: string,
     category: QqCapabilityCategory,
   ) => Promise<boolean>;
-  /** Executes one validated allowlisted provider action. The only outbound provider path. */
+  /**
+   * Executes one validated allowlisted provider action. The only outbound provider path.
+   * Login/member projection reads return validated success data; other operations retain
+   * their verified provider envelope. Failed or unknown responses must throw.
+   */
   invoke: (input: CapabilityInvocation) => Promise<unknown>;
+  /** Owns the exact roster receipt and its read-only and final compound completion checks. */
+  authorizeMemberResolution?: (
+    context: ProtectedToolContext,
+    groupId: string,
+  ) => Promise<{
+    decisionId: string;
+    complete: () => Promise<void>;
+    authorizeMutation: (mutation: QqCapability) => Promise<void>;
+  }>;
+  /** Records the selected ID and read receipt before a nickname mutation can run. No roster. */
+  recordModerationResolution?: (
+    resolution: {
+      groupId: string;
+      resolvedUserId: string;
+      duration: number;
+      method: "exact_card" | "exact_nickname" | "exact_card_and_nickname";
+      rosterReadDecisionId: string;
+    },
+    context: ProtectedToolContext,
+  ) => Promise<void>;
   /** Re-reads the caller's role from QQ immediately before one native-role mutation. */
   verifyNativeGroupRole?: (input: {
     context: ProtectedToolContext;
@@ -413,6 +460,97 @@ interface ProviderCallOptions {
     capability: QqCapability;
     operation: string;
   }) => Promise<QqNativeGroupRole>;
+}
+
+/** The first unique roster result stays bound to this Run's original immutable request. */
+const resolvedModerationTargets = new WeakMap<
+  Record<string, unknown>,
+  Readonly<{
+    groupId: string;
+    memberSelector: string;
+    userId: number;
+    duration: number;
+  }>
+>();
+
+async function resolveModerationMember(
+  context: ProtectedToolContext,
+  groupId: string,
+  memberSelector: string,
+  duration: number,
+  options: ProviderCallOptions,
+  signal?: AbortSignal,
+): Promise<{ userId: number; authorizeMutation: (mutation: QqCapability) => Promise<void> }> {
+  const members = QQ_CAPABILITIES.find((entry) => entry.tool === "qq_group_members")!;
+  if (!options.authorizeMemberResolution) throw new ToolInputError("moderation_member_id_required");
+  const read = await options.authorizeMemberResolution(context, groupId);
+  if (signal?.aborted) throw new Error("Operation cancelled");
+  const roster = await options.invoke({
+    capability: members,
+    action: "get_group_member_list",
+    params: { group_id: Number(groupId) },
+    context,
+  });
+  // A revoked read must not influence even a server-only target selection.
+  await read.complete();
+  if (signal?.aborted) throw new Error("Operation cancelled");
+  if (
+    !Array.isArray(roster) ||
+    roster.length > 10_000 ||
+    roster.some(
+      (member) =>
+        !isRecord(member) ||
+        safeQqId(member.user_id) === undefined ||
+        (member.group_id !== undefined && safeQqId(member.group_id) !== groupId) ||
+        (member.nickname !== undefined && typeof member.nickname !== "string") ||
+        (member.card !== undefined && typeof member.card !== "string"),
+    )
+  )
+    throw new ToolInputError("moderation_member_id_required");
+  // Exact, case-sensitive Unicode code-unit matching. No normalization or fuzzy fallback.
+  // A matching card and nickname belonging to the same QQ ID are one target.
+  const matches = new Set(
+    roster
+      .filter((member) => member.card === memberSelector || member.nickname === memberSelector)
+      .map((member) => Number(safeQqId(member.user_id))),
+  );
+  if (matches.size === 0) throw new ToolInputError("moderation_member_not_found");
+  if (matches.size !== 1) throw new ToolInputError("moderation_member_ambiguous");
+  const userId = [...matches][0]!;
+  const required = context.requiredToolInput!;
+  const pinned = resolvedModerationTargets.get(required);
+  if (
+    pinned &&
+    (pinned.groupId !== groupId ||
+      pinned.memberSelector !== memberSelector ||
+      pinned.userId !== userId ||
+      pinned.duration !== duration)
+  )
+    throw new ToolInputError("moderation_member_changed");
+  resolvedModerationTargets.set(
+    required,
+    Object.freeze({ groupId, memberSelector, userId, duration }),
+  );
+  if (!options.recordModerationResolution)
+    throw new ToolInputError("moderation_resolution_unrecorded");
+  const card = roster.some((member) => member.card === memberSelector);
+  const nickname = roster.some((member) => member.nickname === memberSelector);
+  try {
+    await options.recordModerationResolution(
+      {
+        groupId,
+        resolvedUserId: String(userId),
+        duration,
+        method:
+          card && nickname ? "exact_card_and_nickname" : card ? "exact_card" : "exact_nickname",
+        rosterReadDecisionId: read.decisionId,
+      },
+      context,
+    );
+  } catch {
+    throw new ToolInputError("moderation_resolution_unrecorded");
+  }
+  return { userId, authorizeMutation: read.authorizeMutation };
 }
 
 /**
@@ -427,8 +565,15 @@ async function executeProviderCall(
   params: CapabilityToolInput,
   context: ProtectedToolContext,
   options: ProviderCallOptions,
+  signal?: AbortSignal,
 ): Promise<unknown> {
-  const supplied = validatedProviderParams(params.params);
+  if (
+    Object.keys(params).some(
+      (key) => !["groupId", "operation", "params", "memberSelector"].includes(key),
+    )
+  )
+    throw new ToolInputError("invalid_capability_params");
+  const supplied = { ...validatedProviderParams(params.params) };
   let providerParams: QqProviderParams = supplied;
   let groupId: string | undefined;
   if (capability.resource === "group") {
@@ -455,7 +600,21 @@ async function executeProviderCall(
   const action = params.operation;
   if (typeof action !== "string" || !capability.operations.some((op) => op.action === action))
     throw new ToolInputError("invalid_capability_operation");
-  if (!resolveQqOperation(capability, action, providerParams))
+  const memberSelector = params.memberSelector;
+  if (memberSelector !== undefined) {
+    if (
+      capability.tool !== "qq_group_moderation" ||
+      action !== "set_group_ban" ||
+      typeof memberSelector !== "string" ||
+      !memberSelector.trim() ||
+      memberSelector.length > 128 ||
+      /\p{Cc}/u.test(memberSelector) ||
+      Object.keys(supplied).length !== 1 ||
+      !Object.hasOwn(supplied, "duration") ||
+      !resolveQqOperation(capability, action, { ...providerParams, user_id: 1 })
+    )
+      throw new ToolInputError("invalid_capability_params");
+  } else if (!resolveQqOperation(capability, action, providerParams))
     throw new ToolInputError("invalid_capability_params");
 
   // Owner intent is a second, independent gate: the grant alone is not enough.
@@ -475,12 +634,27 @@ async function executeProviderCall(
   // model. Retrieved text cannot supply that either. The compared parameters are the
   // model-supplied provider parameters — the server-derived `group_id` is not one of
   // them, so the message never has to (and cannot) restate the group the Run bound.
-  if (capability.risk !== "read")
-    requireMutationIntent(context, capability.tool, {
-      groupId: groupId!,
-      operation: action,
-      params: supplied,
-    });
+  const mutationInput = {
+    groupId: groupId!,
+    operation: action,
+    params: supplied,
+    ...(memberSelector === undefined ? {} : { memberSelector }),
+  };
+  if (capability.risk !== "read") requireMutationIntent(context, capability.tool, mutationInput);
+
+  let authorizeResolvedMutation: ((mutation: QqCapability) => Promise<void>) | undefined;
+  if (memberSelector !== undefined) {
+    const resolved = await resolveModerationMember(
+      context,
+      groupId!,
+      memberSelector,
+      supplied.duration as number,
+      options,
+      signal,
+    );
+    providerParams = { ...providerParams, user_id: resolved.userId };
+    authorizeResolvedMutation = resolved.authorizeMutation;
+  }
 
   if (context.caller.scope.chatType === "group" && capability.risk !== "read") {
     const observed = context.caller.scope.nativeGroupRole?.role ?? "qq_group_member";
@@ -498,12 +672,13 @@ async function executeProviderCall(
       throw new ToolAuthorizationError("native_group_role_denied");
   }
 
-  if (capability.risk !== "read")
-    consumeMutationIntent(context, capability.tool, {
-      groupId: groupId!,
-      operation: action,
-      params: supplied,
-    });
+  if (memberSelector !== undefined) {
+    // The exact roster receipt and mutation authority share one final transaction after
+    // evidence, role and category I/O. Separate awaited checks leave a revocation window.
+    await authorizeResolvedMutation!(capability);
+  }
+  if (signal?.aborted) throw new Error("Operation cancelled");
+  if (capability.risk !== "read") consumeMutationIntent(context, capability.tool, mutationInput);
 
   const result = await options.invoke({ capability, action, params: providerParams, context });
   if (capability.tool === "qq_account_status" && action === "get_login_info") {
@@ -570,6 +745,16 @@ function createProviderCapabilityTool(
     description: providerToolDescription(capability),
     parameters: providerToolParameters(capability),
     action: capability.action,
+    policyCondition: (params, context) => {
+      const resource = capabilityResourceId({
+        resource: capability.resource,
+        scope: context.caller.scope,
+        groupId: typeof params.groupId === "string" ? params.groupId : undefined,
+      });
+      return resource.startsWith("group:")
+        ? qqCategoryCondition(context.caller, resource.slice(6), capability.category)
+        : undefined;
+    },
     ...(capability.risk === "read" ? { deliverySource: "content_source" as const } : {}),
     // The Resource is derived, never accepted: a group Run is bound to its own group, and
     // an Owner-private Run may name only a group its policy covers.
@@ -581,7 +766,8 @@ function createProviderCapabilityTool(
       }),
     authService: store.authorization,
     getContext,
-    execute: (params, context) => executeProviderCall(capability, params, context, options),
+    execute: (params, context, signal) =>
+      executeProviderCall(capability, params, context, options, signal),
   });
 }
 
@@ -599,6 +785,17 @@ function createGroupInventoryTool(
     description: options.capability.description,
     parameters: providerToolParameters(options.capability, true),
     action: options.capability.action,
+    policyCondition: (params, context) => {
+      const resource = capabilityResourceId({
+        resource: options.capability.resource,
+        scope: context.caller.scope,
+        groupId: typeof params.groupId === "string" ? params.groupId : undefined,
+        listing: params.operation === undefined,
+      });
+      return resource.startsWith("group:")
+        ? qqCategoryCondition(context.caller, resource.slice(6), options.capability.category)
+        : undefined;
+    },
     ...(options.capability.risk === "read" ? { deliverySource: "content_source" as const } : {}),
     resourceId: (params, context) =>
       capabilityResourceId({
@@ -612,9 +809,9 @@ function createGroupInventoryTool(
       }),
     authService: options.authService,
     getContext: options.getContext,
-    execute: (params, context) => {
+    execute: (params, context, signal) => {
       if (params.operation !== undefined)
-        return executeProviderCall(options.capability, params, context, options);
+        return executeProviderCall(options.capability, params, context, options, signal);
       // The listing names no group and never runs in a group Run: both facts are the
       // inventory's definition, not a hint, so a call that breaks either is refused.
       if (context.caller.scope.chatType !== "private" || params.groupId !== undefined)
@@ -678,6 +875,80 @@ export function createCapabilityTools(
         verifyNativeGroupRole: options.verifyNativeGroupRole,
         projectManagedGroups: options.projectManagedGroups,
       });
-    return createProviderCapabilityTool(capability, options.store, getContext, options);
+    return createProviderCapabilityTool(capability, options.store, getContext, {
+      ...options,
+      authorizeMemberResolution: async (context, groupId) => {
+        const members = QQ_CAPABILITIES.find((entry) => entry.tool === "qq_group_members")!;
+        const request: AuthorizationRequest = {
+          caller: context.caller,
+          resourceId: groupResourceId(groupId),
+          action: members.action,
+          policyCondition: qqCategoryCondition(context.caller, groupId, members.category),
+          conversationId: context.conversationId,
+          runId: context.runId,
+        };
+        const checkCurrentTool = async () => {
+          const current = options.getContext();
+          if (
+            current?.runId !== context.runId ||
+            current.caller?.principalId !== context.caller.principalId ||
+            !current.authorizedToolNames?.includes(members.tool) ||
+            !(await options.isCategoryEnabled(
+              context.caller.scope.connectionId,
+              groupId,
+              members.category,
+            ))
+          )
+            throw new ToolInputError("moderation_member_id_required");
+        };
+        await checkCurrentTool();
+        const decision = await options.store.authorization.check(request);
+        if (decision.decision !== "ALLOW")
+          throw new ToolInputError("moderation_member_id_required");
+        return {
+          decisionId: decision.id,
+          complete: async () => {
+            await checkCurrentTool();
+            try {
+              await options.store.authorization.authorizeReadResults([
+                { request, decisionId: decision.id, source: "content_source" },
+              ]);
+            } catch (error) {
+              if (error instanceof AccessDeniedError)
+                throw new ToolInputError("moderation_member_id_required");
+              throw error;
+            }
+          },
+          authorizeMutation: async (mutation) => {
+            await checkCurrentTool();
+            if (
+              !(await options.isCategoryEnabled(
+                context.caller.scope.connectionId,
+                groupId,
+                mutation.category,
+              ))
+            )
+              throw new ToolInputError("capability_category_disabled");
+            try {
+              await options.store.authorization.authorizeReadResultsAndAction(
+                [{ request, decisionId: decision.id, source: "content_source" }],
+                {
+                  caller: context.caller,
+                  resourceId: groupResourceId(groupId),
+                  action: mutation.action,
+                  policyCondition: qqCategoryCondition(context.caller, groupId, mutation.category),
+                  conversationId: context.conversationId,
+                  runId: context.runId,
+                },
+              );
+            } catch (error) {
+              if (error instanceof AccessDeniedError)
+                throw new ToolInputError("moderation_authority_changed");
+              throw error;
+            }
+          },
+        };
+      },
+    });
   });
 }

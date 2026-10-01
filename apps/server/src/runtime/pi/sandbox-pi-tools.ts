@@ -74,6 +74,9 @@ export function createIsolatedPiTools(input: {
         });
         if (decision.decision !== "ALLOW") throw new Error("authorization_denied");
         if (signal?.aborted) throw new Error("Operation cancelled");
+        // Native tools may expose workspace content through stdout, diffs, partial errors,
+        // or synchronous progress callbacks. Persist provenance before any of those escape.
+        await input.store.authorization.markDeliverySource(decision.id, "content_source");
         await input.onEvidence?.(
           {
             type: "isolated_pi_tool_call",
@@ -88,6 +91,7 @@ export function createIsolatedPiTools(input: {
           },
           context,
         );
+        if (signal?.aborted) throw new Error("Operation cancelled");
         let executionCompleted = false;
         try {
           const result = await input.session.execute({
@@ -113,8 +117,6 @@ export function createIsolatedPiTools(input: {
           );
           if (result.isError)
             return { content: result.content, details: result.details, isError: true };
-          if (access === "read")
-            await input.store.authorization.markDeliverySource(decision.id, "content_source");
           return { content: result.content, details: result.details };
         } catch (error) {
           const uncertain =
