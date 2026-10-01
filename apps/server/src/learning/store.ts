@@ -264,6 +264,28 @@ function memoryFromRow(row: Row): CanonicalMemory {
   };
 }
 
+function inheritCorrectionMetadata(
+  existing: CanonicalMemory,
+  incoming: CanonicalMemory,
+): CanonicalMemory {
+  return {
+    ...incoming,
+    ...(incoming.sensitivity === undefined && existing.sensitivity !== undefined
+      ? { sensitivity: existing.sensitivity }
+      : {}),
+    ...(incoming.retentionPolicy === undefined && existing.retentionPolicy !== undefined
+      ? { retentionPolicy: existing.retentionPolicy }
+      : {}),
+    // Carry the original deadline, not a fresh TTL starting at correction time.
+    ...(incoming.ttlSeconds === undefined
+      ? {
+          ...(existing.ttlSeconds === undefined ? {} : { ttlSeconds: existing.ttlSeconds }),
+          ...(existing.expiresAt === undefined ? {} : { expiresAt: existing.expiresAt }),
+        }
+      : {}),
+  };
+}
+
 function mergeUnique<T>(left: readonly T[], right: readonly T[], key: (value: T) => string): T[] {
   const values = new Map<string, T>();
   for (const item of [...left, ...right]) values.set(key(item), item);
@@ -354,7 +376,11 @@ export class LearningStore {
     });
   }
 
-  private async insertCandidate(tx: Transaction, input: CandidateCreate): Promise<MemoryCandidate> {
+  private async insertCandidate(
+    tx: Transaction,
+    input: CandidateCreate,
+    deduplicatePending = true,
+  ): Promise<MemoryCandidate> {
     validateCandidate(input);
     const candidate: MemoryCandidate = {
       ...structuredClone(input),
@@ -376,9 +402,11 @@ export class LearningStore {
       type: candidate.proposedType,
       statement: candidate.statement,
     });
-    const pending = (
-      await tx.execute({ sql: "SELECT * FROM memory_candidates WHERE status = 'pending'" })
-    ).rows.map(candidateFromRow);
+    const pending = deduplicatePending
+      ? (
+          await tx.execute({ sql: "SELECT * FROM memory_candidates WHERE status = 'pending'" })
+        ).rows.map(candidateFromRow)
+      : [];
     const duplicate = pending.find(
       (row) =>
         memorySignature({
@@ -518,7 +546,10 @@ export class LearningStore {
         clauses.push("scope_json = ?");
         args.push(json(options.scope));
       }
-      if (!options.includeInactive) clauses.push("lifecycle_state = 'active'");
+      if (!options.includeInactive) {
+        clauses.push("lifecycle_state = 'active'", "(expires_at IS NULL OR expires_at > ?)");
+        args.push(new Date().toISOString());
+      }
       const limitClause = options.limit === undefined ? "" : " LIMIT ?";
       if (options.limit !== undefined) args.push(options.limit);
       const result = await tx.execute({
@@ -544,8 +575,8 @@ export class LearningStore {
     await this.authorizeResource(context, groupResourceId, GROUP_MEMORY_READ_ACTION);
     return this.db.transaction(async (tx) => {
       const result = await tx.execute({
-        sql: "SELECT * FROM memories WHERE scope_json = ? AND lifecycle_state = 'active' ORDER BY updated_at DESC, id ASC LIMIT ?",
-        args: [json(scope), limit],
+        sql: "SELECT * FROM memories WHERE scope_json = ? AND lifecycle_state = 'active' AND sensitivity = 'public' AND (expires_at IS NULL OR expires_at > ?) ORDER BY updated_at DESC, id ASC LIMIT ?",
+        args: [json(scope), new Date().toISOString(), limit],
       });
       return result.rows
         .map(memoryFromRow)
@@ -831,6 +862,12 @@ export class LearningStore {
         })
       ).rows[0];
     }
+    if (matchId && !existingRow) throw new Error("memory_not_active");
+    if (candidate.mergeHint.ifMatchUpdatedAt !== undefined) {
+      if (!existingRow) throw new Error("memory_not_active");
+      if (stringColumn(existingRow, "updated_at") !== candidate.mergeHint.ifMatchUpdatedAt)
+        throw new Error("memory_version_conflict");
+    }
     const manualReview = candidate.mergeHint.strategy === "manual_review_required";
     const resolvedHint: MemoryMergeHint = manualReview
       ? {
@@ -866,6 +903,8 @@ export class LearningStore {
     }
     if (existingRow) {
       const existing = memoryFromRow(existingRow);
+      if (candidate.candidateKind === "correction")
+        incoming = inheritCorrectionMetadata(existing, incoming);
       if (
         json(existing.subject) !== json(incoming.subject) ||
         json(existing.scope) !== json(incoming.scope) ||
@@ -1103,6 +1142,7 @@ export class LearningStore {
       ).rows[0];
       if (!row) throw new Error("memory_not_active");
       const existing = memoryFromRow(row);
+      if (existing.lifecycleState !== "active") throw new Error("memory_not_active");
       if (
         json(existing.subject) !== json(input.subject) ||
         json(existing.scope) !== json(input.scope) ||
@@ -1118,22 +1158,30 @@ export class LearningStore {
           trustLevel: "high" as const,
         },
       ];
-      const candidate = await this.insertCandidate(tx, {
-        candidateKind: "correction",
-        subject: input.subject,
-        scope: input.scope,
-        proposedType: input.type,
-        statement: input.statement,
-        content: input.content ?? { statement: input.statement },
-        source: input.source ?? { kind: "human", ref: `principal:${context.caller.principalId}` },
-        sourceEvidence: evidence,
-        confidence: input.confidence ?? 1,
-        ...(input.sensitivity === undefined ? {} : { sensitivity: input.sensitivity }),
-        ...(input.retentionPolicy === undefined ? {} : { retentionPolicy: input.retentionPolicy }),
-        ...(input.ttlSeconds === undefined ? {} : { ttlSeconds: input.ttlSeconds }),
-        mergeHint: { strategy: "replace", ifMatchMemoryId: memoryId },
-        extensions: input.extensions ?? {},
-      });
+      // An explicit correction is new confirmation evidence. A pending suggestion
+      // with the same statement must not substitute its metadata or provenance.
+      const candidate = await this.insertCandidate(
+        tx,
+        {
+          candidateKind: "correction",
+          subject: input.subject,
+          scope: input.scope,
+          proposedType: input.type,
+          statement: input.statement,
+          content: input.content ?? { statement: input.statement },
+          source: input.source ?? { kind: "human", ref: `principal:${context.caller.principalId}` },
+          sourceEvidence: evidence,
+          confidence: input.confidence ?? 1,
+          ...(input.sensitivity === undefined ? {} : { sensitivity: input.sensitivity }),
+          ...(input.retentionPolicy === undefined
+            ? {}
+            : { retentionPolicy: input.retentionPolicy }),
+          ...(input.ttlSeconds === undefined ? {} : { ttlSeconds: input.ttlSeconds }),
+          mergeHint: { strategy: "replace", ifMatchMemoryId: memoryId },
+          extensions: input.extensions ?? {},
+        },
+        false,
+      );
       const now = new Date().toISOString();
       await this.persistMemory(tx, {
         ...existing,
@@ -1143,10 +1191,13 @@ export class LearningStore {
         updatedAt: now,
       });
       const replacement = {
-        ...this.canonicalFromCandidate(
-          candidate,
-          { kind: "user", id: context.caller.principalId },
-          input.retentionFactors,
+        ...inheritCorrectionMetadata(
+          existing,
+          this.canonicalFromCandidate(
+            candidate,
+            { kind: "user", id: context.caller.principalId },
+            input.retentionFactors,
+          ),
         ),
         supersedes: [memoryId, ...existing.supersedes],
       };

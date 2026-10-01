@@ -381,7 +381,11 @@ async function executeMemoryActionRaw(
             source: { kind: "system", ref: `run:${context.runId}` },
             sourceEvidence: modelEvidence(context.runId),
             confidence: input.confidence ?? 0.5,
-            mergeHint: { strategy: "manual_review_required", ifMatchMemoryId: existing.memoryId },
+            mergeHint: {
+              strategy: "manual_review_required",
+              ifMatchMemoryId: existing.memoryId,
+              ifMatchUpdatedAt: existing.updatedAt,
+            },
             extensions: { "glassbox:model_inference": true },
           });
         return learning.supersedeMemory(

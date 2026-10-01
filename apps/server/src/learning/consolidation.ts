@@ -25,6 +25,7 @@ export class MemoryConsolidator {
     const decisions = await this.extractor.extract({ messages: input.messages, existing });
     const candidates = [];
     for (const decision of decisions) {
+      const matched = existing.find((memory) => memory.memoryId === decision.existingMemoryId);
       const evidence = input.messages.map((message) => ({
         evidenceId: randomUUID(),
         kind: "chat_message" as const,
@@ -52,6 +53,7 @@ export class MemoryConsolidator {
           mergeHint: {
             strategy: "manual_review_required",
             ...(decision.existingMemoryId ? { ifMatchMemoryId: decision.existingMemoryId } : {}),
+            ...(matched ? { ifMatchUpdatedAt: matched.updatedAt } : {}),
           },
           extensions: {
             "glassbox:extractor_action": decision.action,

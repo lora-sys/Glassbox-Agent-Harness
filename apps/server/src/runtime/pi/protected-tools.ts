@@ -71,6 +71,7 @@ const TOOL_GATE_CODES: ReadonlySet<string> = new Set([
   "too_many_pending_candidates",
   "memory_not_found",
   "memory_not_active",
+  "memory_version_conflict",
   "memory_type_mismatch",
   "memory_scope_mismatch",
   "memory_match_scope_mismatch",
