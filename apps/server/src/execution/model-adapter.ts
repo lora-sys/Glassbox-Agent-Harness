@@ -1,5 +1,5 @@
 import type { ModelProfileStore } from "../config/model-profiles.js";
-import { createModelProvider } from "../model/provider.js";
+import { createModelProvider, resolveModelCredential } from "../model/provider.js";
 import type { Message } from "../model/vendor/pi/types.js";
 import { runModelAgent, type ModelAgentEvent } from "./model-agent/index.js";
 import type { RunExecutionAdapter } from "./run-service/types.js";
@@ -20,7 +20,11 @@ export function configuredModelAdapter(options: {
     supportsTaskStepModel: true,
     async execute(input) {
       if (input.imageFailureCode)
-        return { status: "succeeded" as const, text: IMAGE_READ_FAILURE_REPLY };
+        return {
+          status: "succeeded" as const,
+          runtimeAttempted: false,
+          text: IMAGE_READ_FAILURE_REPLY,
+        };
       const resolved = options.profiles.resolve(options.profileId);
       const contextWindowTokens = resolved.profile.contextWindowTokens;
       const maxOutputTokens = resolved.profile.maxOutputTokens;
@@ -34,14 +38,26 @@ export function configuredModelAdapter(options: {
           state: "unknown",
           reasonCode: "capacity_unknown",
         });
-        return { status: "failed" as const, failureCode: "model_capacity_unknown" as const };
-      }
-      const provider = createModelProvider(resolved);
-      if (input.images?.length && !provider.model.input.includes("image"))
         return {
-          status: "succeeded" as const,
+          status: "failed" as const,
+          failureCode: "model_capacity_unknown" as const,
+          runtimeAttempted: false,
+        };
+      }
+      if (input.images?.length && resolved.profile.supportsVision !== true)
+        return {
+          status: "failed" as const,
+          failureCode: "model_capability_missing" as const,
+          runtimeAttempted: false,
           text: "当前配置的模型不支持识别图片，因此没有发送图片。请切换到支持视觉输入的模型后重试。",
         };
+      if (resolveModelCredential(resolved) === undefined)
+        return {
+          status: "failed",
+          failureCode: "model_credential_missing",
+          runtimeAttempted: false,
+        };
+      const provider = createModelProvider(resolved);
       const exchanges = [];
       for (let index = 0; index < input.history.length; index += 2) {
         const first = input.history[index];
@@ -49,7 +65,11 @@ export function configuredModelAdapter(options: {
         if (!first || first.role !== "user" || (second && second.role !== "assistant"))
           // The history Glassbox handed over does not alternate, so this is a fault in what was
           // passed in rather than in the runtime that would have received it.
-          return { status: "failed" as const, failureCode: "gate_refused" as const };
+          return {
+            status: "failed" as const,
+            failureCode: "gate_refused" as const,
+            runtimeAttempted: false,
+          };
         exchanges.push({
           id: String(index),
           userTokens: estimateUnicodeTokens(first.text) + 8,
@@ -96,7 +116,11 @@ export function configuredModelAdapter(options: {
         overflow: projection.ok ? null : projection.overflow.kind,
       });
       if (!projection.ok)
-        return { status: "failed" as const, failureCode: "pre_provider_context_overflow" as const };
+        return {
+          status: "failed" as const,
+          failureCode: "pre_provider_context_overflow" as const,
+          runtimeAttempted: false,
+        };
       const admitted = new Set(projection.projection.includedExchangeIds);
       const boundedHistory = input.history.filter((_entry, index) =>
         admitted.has(String(index - (index % 2))),

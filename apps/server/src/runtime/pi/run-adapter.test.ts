@@ -264,7 +264,9 @@ describe("Pi required Tool execution", () => {
 
     const result = await f.executor.execute(f.input);
     expect(result).toMatchObject({
-      status: "succeeded",
+      status: "failed",
+      failureCode: "model_capability_missing",
+      runtimeAttempted: false,
       text: expect.stringContaining("不支持识别图片"),
     });
     expect(result).not.toHaveProperty("providerSessionId");
@@ -280,6 +282,7 @@ describe("Pi required Tool execution", () => {
 
     await expect(f.executor.execute(f.input)).resolves.toEqual({
       status: "succeeded",
+      runtimeAttempted: false,
       text: "图片读取失败，暂时无法识别，请重新发送图片。",
     });
     expect(initialize).not.toHaveBeenCalled();

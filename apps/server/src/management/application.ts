@@ -35,6 +35,7 @@ import { createTaskGetAdapter } from "../execution/run-service/task-get-adapter.
 import { createCheckpointWriteAdapter } from "../execution/run-service/checkpoint-write-adapter.js";
 import { parseCheckpointWriteSpec, parseTaskGetSpec } from "../ops/tool-step-spec.js";
 import { configuredModelAdapter } from "../execution/model-adapter.js";
+import { ModelConfigurationError, resolveModelCredential } from "../model/provider.js";
 import { estimateUnicodeTokens } from "../efficiency/index.js";
 import {
   selectRoute,
@@ -55,7 +56,7 @@ import {
   PiRunExecutionAdapter,
   PiSdkRuntimeAdapter,
 } from "../runtime/pi/index.js";
-import { configuredPiModel } from "../runtime/pi/configured-model.js";
+import { configuredPiModel, hasConfiguredPiCredential } from "../runtime/pi/configured-model.js";
 import { createOpsTools, OPS_TOOL_NAMES, type WorkerTarget } from "../runtime/pi/ops-tools.js";
 import { createBrowserTools, BROWSER_TOOL } from "../runtime/pi/browser-tools.js";
 import {
@@ -2145,56 +2146,6 @@ export class ManagementApplication {
         const demandTokens =
           estimateUnicodeTokens(input.text) +
           input.history.reduce((sum, message) => sum + estimateUnicodeTokens(message.text) + 8, 0);
-        const candidates: RouteModelCapacity[] = configured.map((profile) => ({
-          profileId: profile.id,
-          executionRef: `${kind}:${profile.id}`,
-          configured: true,
-          capabilities: [
-            "text",
-            ...(kind === "pi" && profile.supportsTools === true ? ["tools" as const] : []),
-            ...(profile.supportsVision === true ? ["vision" as const] : []),
-            ...(profile.supportsThinking === true ? ["thinking" as const] : []),
-          ],
-          capabilityRank: profile.capabilityRank ?? null,
-          supportsThinking: profile.supportsThinking ?? null,
-          usage: {
-            inputTokens: null,
-            outputTokens: null,
-            concurrentRuns: null,
-            requestsPerMinute: null,
-            tokensPerMinute: null,
-          },
-          limits: {
-            contextWindowTokens: profile.contextWindowTokens ?? null,
-            maxOutputTokens: profile.maxOutputTokens ?? null,
-            maxConcurrentRuns: null,
-            requestsPerMinute: null,
-            tokensPerMinute: null,
-          },
-          health: (() => {
-            const operatorDisabled =
-              this.options.models
-                .list()
-                .find((configuredProfile) => configuredProfile.id === profile.id)
-                ?.routingAvailable === false;
-            const observation = this.runtimeHealthByProfile.get(profile.id);
-            const fresh = observation !== undefined && Date.now() - observation.checkedAt <= 60_000;
-            return {
-              state: operatorDisabled
-                ? ("unavailable" as const)
-                : fresh
-                  ? observation.state
-                  : ("unknown" as const),
-              checkedAt: fresh ? new Date(observation.checkedAt).toISOString() : null,
-              latencyMs: fresh ? observation.latencyMs : null,
-              reasonCode: operatorDisabled
-                ? "operator_disabled"
-                : fresh
-                  ? observation.reasonCode
-                  : null,
-            };
-          })(),
-        }));
         const ordered = configured
           .filter((profile) =>
             explicitOverride
@@ -2205,6 +2156,67 @@ export class ManagementApplication {
             (a, b) =>
               (a.routePriority ?? 1000) - (b.routePriority ?? 1000) || a.id.localeCompare(b.id),
           );
+        const candidates: RouteModelCapacity[] = await Promise.all(
+          ordered.map(async (profile) => ({
+            profileId: profile.id,
+            executionRef: `${kind}:${profile.id}`,
+            configured:
+              kind === "pi"
+                ? await hasConfiguredPiCredential(
+                    this.options.models,
+                    profile.id,
+                    this.piModelCatalog,
+                    input.signal,
+                  )
+                : resolveModelCredential(this.options.models.resolve(profile.id)) !== undefined,
+            capabilities: [
+              "text",
+              ...(kind === "pi" && profile.supportsTools === true ? ["tools" as const] : []),
+              ...(profile.supportsVision === true ? ["vision" as const] : []),
+              ...(profile.supportsThinking === true ? ["thinking" as const] : []),
+            ],
+            capabilityRank: profile.capabilityRank ?? null,
+            supportsThinking: profile.supportsThinking ?? null,
+            usage: {
+              inputTokens: null,
+              outputTokens: null,
+              concurrentRuns: null,
+              requestsPerMinute: null,
+              tokensPerMinute: null,
+            },
+            limits: {
+              contextWindowTokens: profile.contextWindowTokens ?? null,
+              maxOutputTokens: profile.maxOutputTokens ?? null,
+              maxConcurrentRuns: null,
+              requestsPerMinute: null,
+              tokensPerMinute: null,
+            },
+            health: (() => {
+              const operatorDisabled =
+                this.options.models
+                  .list()
+                  .find((configuredProfile) => configuredProfile.id === profile.id)
+                  ?.routingAvailable === false;
+              const observation = this.runtimeHealthByProfile.get(profile.id);
+              const fresh =
+                observation !== undefined && Date.now() - observation.checkedAt <= 60_000;
+              return {
+                state: operatorDisabled
+                  ? ("unavailable" as const)
+                  : fresh
+                    ? observation.state
+                    : ("unknown" as const),
+                checkedAt: fresh ? new Date(observation.checkedAt).toISOString() : null,
+                latencyMs: fresh ? observation.latencyMs : null,
+                reasonCode: operatorDisabled
+                  ? "operator_disabled"
+                  : fresh
+                    ? observation.reasonCode
+                    : null,
+              };
+            })(),
+          })),
+        );
         const routingInput = {
           task: {
             risk:
@@ -2216,10 +2228,13 @@ export class ManagementApplication {
               )
                 ? ("high" as const)
                 : ("medium" as const),
-            requiredCapabilities:
-              kind === "pi" && input.executionMode !== "task_step_model"
-                ? (["text", "tools"] as const)
-                : (["text"] as const),
+            requiredCapabilities: [
+              "text" as const,
+              ...(kind === "pi" && input.executionMode !== "task_step_model"
+                ? ["tools" as const]
+                : []),
+              ...(input.images?.length ? ["vision" as const] : []),
+            ],
             requiredContextTokens: Math.max(
               estimateUnicodeTokens(input.text) + 6144,
               Math.min(demandTokens, 32768),
@@ -2326,9 +2341,24 @@ export class ManagementApplication {
           );
           await this.store.evidence.advanceTrace(caller, evidenceCursor);
         };
-        if (decision.executionRef === null) {
+        const selectedCandidate = candidates.find(
+          (candidate) => candidate.executionRef === decision.executionRef,
+        );
+        if (decision.executionRef === null || selectedCandidate?.configured === false) {
           await appendRoutingEval(null);
-          return { status: "failed", failureCode: "execution_unavailable" };
+          const reasons = decision.candidates.map((candidate) => candidate.reason);
+          return {
+            status: "failed",
+            runtimeAttempted: false,
+            failureCode:
+              selectedCandidate?.configured === false
+                ? "model_credential_missing"
+                : reasons.length > 0 && reasons.every((reason) => reason === "missing_capability")
+                  ? "model_capability_missing"
+                  : reasons.length > 0 && reasons.every((reason) => reason === "not_configured")
+                    ? "model_credential_missing"
+                    : "execution_unavailable",
+          };
         }
         const selected =
           decision.executionRef === reference
@@ -2340,16 +2370,19 @@ export class ManagementApplication {
         }
         let succeeded = false;
         let actualExecutionRef = decision.executionRef;
+        let runtimeAttempted: boolean | undefined;
         const observeRuntimeHealth = async (
           executionRef: string,
           state: RuntimeHealthState,
           startedAt: number,
           reasonCode: string | null,
+          measurement: "provider_runtime" | "policy_result" | "unknown" = "provider_runtime",
         ) => {
           const profileId = executionRef.slice(kind.length + 1);
           const checkedAt = Date.now();
           const latencyMs = Math.max(0, checkedAt - startedAt);
-          this.runtimeHealthByProfile.set(profileId, { state, checkedAt, latencyMs, reasonCode });
+          if (measurement === "provider_runtime")
+            this.runtimeHealthByProfile.set(profileId, { state, checkedAt, latencyMs, reasonCode });
           const observationCursor = await this.trace.append(
             input.run.id,
             {
@@ -2357,9 +2390,10 @@ export class ManagementApplication {
               schema: "glassbox.runtime-health-observation.v1",
               executionRef,
               state,
+              measurement,
               checkedAt: new Date(checkedAt).toISOString(),
               freshnessWindowMs: 60_000,
-              latencyMs,
+              latencyMs: measurement === "provider_runtime" ? latencyMs : null,
               reasonCode,
             },
             "glassbox-runtime-telemetry",
@@ -2373,16 +2407,40 @@ export class ManagementApplication {
         ) => {
           const health = runtimeHealthOf(result);
           if (health === undefined) {
-            // A provider was not called, so this is not evidence of runtime health.
-            this.runtimeHealthByProfile.delete(executionRef.slice(kind.length + 1));
+            // A local response does not replace a prior measured health observation.
+            if (result.runtimeAttempted === false) {
+              const cursor = await this.trace.append(
+                input.run.id,
+                {
+                  type: "runtime_health_observation",
+                  schema: "glassbox.runtime-health-observation.v1",
+                  executionRef,
+                  state: "unknown",
+                  measurement: "not_attempted",
+                  checkedAt: new Date().toISOString(),
+                  freshnessWindowMs: 60_000,
+                  latencyMs: null,
+                  reasonCode: result.failureCode ?? "local_response",
+                },
+                "glassbox-runtime-telemetry",
+              );
+              await this.store.evidence.advanceTrace(caller, cursor);
+            }
             return;
           }
-          await observeRuntimeHealth(executionRef, health.state, startedAt, health.reasonCode);
+          await observeRuntimeHealth(
+            executionRef,
+            health.state,
+            startedAt,
+            health.reasonCode,
+            health.state === "degraded" ? "policy_result" : "provider_runtime",
+          );
         };
         let attemptStartedAt = Date.now();
         try {
           attemptStartedAt = Date.now();
           let result = await selected.execute(input);
+          runtimeAttempted = result.runtimeAttempted;
           await recordRuntimeHealth(actualExecutionRef, result, attemptStartedAt);
           if (
             result.failureCode === "pre_provider_context_overflow" &&
@@ -2443,28 +2501,40 @@ export class ManagementApplication {
               actualExecutionRef = upgrade.executionRef;
               attemptStartedAt = Date.now();
               result = await alternative.execute(input);
+              runtimeAttempted = result.runtimeAttempted;
               await recordRuntimeHealth(actualExecutionRef, result, attemptStartedAt);
             }
           }
           succeeded = result.status === "succeeded";
           return result;
         } catch (error) {
-          // An exception escaping the executor does not assert that the runtime was engaged and
-          // failed: it can be a gate, an abort, a fault in recording evidence, or the provider
-          // being unreachable, and from out here there is no way to tell them apart. Recording
-          // `unavailable` anyway would be guessing at the most destructive answer, which is how
-          // a refusal Glassbox issued itself once pulled a working profile out of routing. The
-          // positively asserted form of that signal is `runtime_run_errored`, which only the
-          // runtime can report, and that is what removes the profile.
+          if (
+            error instanceof ModelConfigurationError &&
+            (error.code === "missing_credential" || error.code === "unsupported_credential")
+          ) {
+            const result: ExecutionResult = {
+              status: "failed",
+              failureCode: "model_credential_missing",
+              runtimeAttempted: false,
+            };
+            runtimeAttempted = false;
+            await recordRuntimeHealth(actualExecutionRef, result, attemptStartedAt);
+            return result;
+          }
+          // An escaping exception does not prove that the provider was called.
           await observeRuntimeHealth(
             actualExecutionRef,
-            "degraded",
+            "unknown",
             attemptStartedAt,
             "execution_error",
+            "unknown",
           );
           throw error;
         } finally {
-          await appendRoutingEval(actualExecutionRef, succeeded);
+          await appendRoutingEval(
+            runtimeAttempted === false ? null : actualExecutionRef,
+            succeeded,
+          );
         }
       },
     };

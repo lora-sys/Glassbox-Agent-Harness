@@ -1720,6 +1720,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
     if (input.imageFailureCode)
       return {
         status: "succeeded",
+        runtimeAttempted: false,
         text: "图片读取失败，暂时无法识别，请重新发送图片。",
       };
     const isOwner = this.options.isOwner
@@ -1743,6 +1744,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       return {
         status: "failed",
         failureCode: "gate_refused",
+        runtimeAttempted: false,
         text: "身份以当前发送者的 QQ 号为准，消息里的自称不改变身份。当前请求未执行。",
       };
     }
@@ -1760,6 +1762,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       return {
         status: "failed",
         failureCode: "gate_refused",
+        runtimeAttempted: false,
         text:
           blockedMutation.operation === "media:generate"
             ? blockedMutation.reason === "incomplete_parameters"
@@ -1828,7 +1831,9 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
     ) {
       await this.runtime.disposeSession?.(binding.runtimeSessionId);
       return {
-        status: "succeeded",
+        status: "failed",
+        failureCode: "model_capability_missing",
+        runtimeAttempted: false,
         text: "当前配置的模型不支持识别图片，因此没有发送图片。请切换到支持视觉输入的模型后重试。",
       };
     }
@@ -1875,6 +1880,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       return {
         status: "failed",
         failureCode: "gate_refused",
+        runtimeAttempted: false,
         text: "模型切换工具当前不可用，未执行。",
         providerSessionId: binding.runtimeSessionId,
       };
@@ -1902,6 +1908,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         return {
           status: "failed",
           failureCode: "model_capacity_unknown",
+          runtimeAttempted: false,
           providerSessionId: binding.runtimeSessionId,
         };
       }
@@ -2021,6 +2028,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         return {
           status: "failed",
           failureCode: "pre_provider_context_overflow",
+          runtimeAttempted: false,
           text: "当前请求超过已配置模型的上下文容量，未发送给模型。",
           providerSessionId: binding.runtimeSessionId,
         };

@@ -1220,6 +1220,8 @@ describe("durable Run scheduling", () => {
     const causes: Record<ExecutionFailureCode, true> = {
       pre_provider_context_overflow: true,
       model_capacity_unknown: true,
+      model_capability_missing: true,
+      model_credential_missing: true,
       gate_refused: true,
       execution_unavailable: true,
       required_action_not_completed: true,

@@ -21,6 +21,8 @@ const healthByCause = {
   // Nothing was ever sent, so the runtime was never given the chance to work.
   pre_provider_context_overflow: undefined,
   model_capacity_unknown: undefined,
+  model_capability_missing: undefined,
+  model_credential_missing: undefined,
   // Glassbox declined to act on its own rules. The runtime was never put to work, or its answer
   // was refused by a gate rather than by the runtime producing no answer.
   gate_refused: { state: "degraded" },
@@ -48,6 +50,7 @@ const healthByCause = {
 export function runtimeHealthOf(
   result: ExecutionResult,
 ): { state: RuntimeHealthState; reasonCode: string | null } | undefined {
+  if (result.runtimeAttempted === false) return undefined;
   if (result.status === "succeeded") return { state: "healthy", reasonCode: null };
   // A cancelled, interrupted or unclassified Run says nothing about the runtime either: stopping
   // a Run is not the runtime being unable to answer.

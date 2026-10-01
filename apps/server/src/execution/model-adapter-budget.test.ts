@@ -33,7 +33,11 @@ it("fails closed before model construction when configured capacity is unknown",
       signal: new AbortController().signal,
     } as unknown as ExecutionInput);
 
-    expect(result).toEqual({ status: "failed", failureCode: "model_capacity_unknown" });
+    expect(result).toEqual({
+      status: "failed",
+      failureCode: "model_capacity_unknown",
+      runtimeAttempted: false,
+    });
     expect(events).toEqual([
       { type: "model_capacity", state: "unknown", reasonCode: "capacity_unknown" },
     ]);
@@ -145,7 +149,9 @@ it("explains that a text-only model cannot inspect images without making a reque
     } as unknown as ExecutionInput);
 
     expect(result).toMatchObject({
-      status: "succeeded",
+      status: "failed",
+      failureCode: "model_capability_missing",
+      runtimeAttempted: false,
       text: expect.stringContaining("不支持识别图片"),
     });
     expect(fetch).not.toHaveBeenCalled();
@@ -169,6 +175,7 @@ it("reports an image read failure before resolving a model profile", async () =>
 
   expect(result).toEqual({
     status: "succeeded",
+    runtimeAttempted: false,
     text: "图片读取失败，暂时无法识别，请重新发送图片。",
   });
   expect(resolve).not.toHaveBeenCalled();
