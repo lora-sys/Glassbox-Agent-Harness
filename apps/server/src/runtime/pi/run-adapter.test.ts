@@ -6,11 +6,7 @@ import { GROUP_HISTORY_SEARCH_TOOL, OWNER_HISTORY_SEARCH_TOOL } from "./history-
 import { OWNER_MEMORY_ADMIN_TOOL } from "./owner-memory-tools.js";
 import { OWNER_MODEL_ADMIN_TOOL } from "./owner-model-tools.js";
 import { OWNER_GROUP_ADMIN_TOOL } from "./owner-tools.js";
-import {
-  piProfileName,
-  PiRunExecutionAdapter,
-  projectRunHistory,
-} from "./run-adapter.js";
+import { piProfileName, PiRunExecutionAdapter, projectRunHistory } from "./run-adapter.js";
 import type { RunEvidenceRecord } from "./run-adapter.js";
 import type { PiRunResult, PiRuntimeAdapter } from "./types.js";
 
@@ -584,7 +580,13 @@ describe("Pi required Tool execution", () => {
     }
   });
 
-  it("binds an Owner-private natural language model switch to one configured profile", async () => {
+  it.each([
+    "Bob，切换到 MiniMax M3 模型",
+    "切换， MiniMax-M3",
+    "切换 MiniMax-M3",
+    "切换模型 MiniMax M3",
+    "把我的私聊模型切换为 MiniMax M3",
+  ])("binds an Owner-private model switch to one profile: %s", async (text) => {
     const f = fixture([
       {
         status: "completed",
@@ -598,7 +600,7 @@ describe("Pi required Tool execution", () => {
         ],
       },
     ]);
-    f.input.text = "Bob，切换到 MiniMax M3 模型";
+    f.input.text = text;
     f.createOrRestoreSession.mockImplementation(async (_conversation, _profile, context) => {
       if (context) context.authorizedToolNames = [OWNER_MODEL_ADMIN_TOOL];
       return {
@@ -1889,12 +1891,13 @@ describe("mutation intent comes only from the current user message", () => {
     });
   });
 
-  it("binds an Owner capability request to the admin Tool that owns the row", async () => {
-    // Verbatim, the message the "已启用 ✅ version：8" answer came back to. It names a capability
-    // category and a direction, and nothing below the model asked who would perform it: the
-    // requirement layer reads the message for Tools a *QQ domain action* needs, and turning a
-    // capability on is not one. So the Run invented the row, the version number, and the summary
-    // line under it, against a policy row that had not moved.
+  it.each([
+    '开 1121579672 的 group.moderate"或"给 1121579672 开启群管理能力',
+    "开 1121579672 的 group.moderate",
+    "给 1121579672 开启群管理能力",
+  ])("binds each Owner capability request independently: %s", async (text) => {
+    // Keep the combined legacy fixture, but require each standalone instruction to bind
+    // its own target, category and direction without borrowing words from another clause.
     const f = fixture([
       {
         status: "completed",
@@ -1907,7 +1910,7 @@ describe("mutation intent comes only from the current user message", () => {
         toolCalls: [],
       },
     ]);
-    f.input.text = '开 1121579672 的 group.moderate"或"给 1121579672 开启群管理能力';
+    f.input.text = text;
     await expect(f.executor.execute(f.input)).resolves.toMatchObject({
       status: "failed",
       failureCode: "required_action_not_completed",
@@ -1919,6 +1922,43 @@ describe("mutation intent comes only from the current user message", () => {
       enabled: true,
       category: "group.moderate",
     });
+  });
+
+  it.each([
+    "不要开 1121579672 的 group.moderate",
+    "不要给 1121579672 开启群管理能力",
+    "给 1121579672 开启群管理能力然后关闭群管理能力",
+    "怎么给 1121579672 开启群管理能力？",
+  ])("does not turn refused, mixed or explanatory policy text into a write: %s", async (text) => {
+    const f = fixture(
+      [{ status: "completed", text: "未执行任何变更。", toolCalls: [] }],
+      [OWNER_GROUP_ADMIN_TOOL],
+    );
+    f.input.text = text;
+    await f.executor.execute(f.input);
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput?.action).not.toBe("set_capability");
+  });
+
+  it.each([
+    ["关闭群 1121579672 的 group.moderate", false],
+    ["开启群 1121579672 的 group.members", true],
+    ["给 1121579672 禁用群管理能力", false],
+  ])("pins the policy category and direction for %s", async (text, enabled) => {
+    const category = text.includes("group.members") ? "group.members" : "group.moderate";
+    const expected = { action: "set_capability", groupId: "1121579672", category, enabled };
+    const f = fixture(
+      [
+        {
+          status: "completed",
+          text: "操作完成。",
+          toolCalls: [{ name: OWNER_GROUP_ADMIN_TOOL, input: expected, failed: false }],
+        },
+      ],
+      [OWNER_GROUP_ADMIN_TOOL],
+    );
+    f.input.text = text;
+    await f.executor.execute(f.input);
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual(expected);
   });
 
   it("still binds the mutation when the message adds an instruction the words contain", async () => {

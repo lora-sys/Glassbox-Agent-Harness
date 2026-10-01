@@ -733,6 +733,32 @@ function requiredToolCall(
   if (!asksLiveQqFact(text) && /查看|查询|列出|当前|有哪些|状态/u.test(text))
     return { name: OWNER_GROUP_ADMIN_TOOL, input: { action: "get", groupId } };
 
+  // A policy change names a capability, not a QQ moderation action. Resolve it before
+  // looking for domain verbs such as 禁言, and pin all fields in the required Tool call.
+  const explicitCategory = CAPABILITY_WORDS.find(({ category }) =>
+    new RegExp(`(?:^|[^\\w.])${category.replaceAll(".", "\\.")}(?=$|[^\\w.])`, "iu").test(text),
+  )?.category;
+  if (explicitCategory || /能力|capability/iu.test(text)) {
+    const enabling =
+      /启用|开启|打开|允许|恢复|加入/u.test(text) ||
+      /^(?:请|帮我)?\s*开(?=\s*(?:群\s*)?[1-9]\d{4,15})/u.test(text);
+    const disabling = /关闭|停用|禁用|取消|移除/u.test(text);
+    const refused =
+      /(?:不要|不用|无需|不需要|请勿|不许|停止|别|禁止)\s*(?:再)?\s*(?:开|启用|开启|打开|允许|恢复|加入|关闭|停用|禁用|取消|移除)/u.test(
+        text,
+      );
+    if (refused || (enabling && disabling)) return undefined;
+    if (enabling || disabling) {
+      const category =
+        explicitCategory ?? CAPABILITY_WORDS.find((entry) => entry.words.test(text))?.category;
+      if (category)
+        return {
+          name: OWNER_GROUP_ADMIN_TOOL,
+          input: { action: "set_capability", groupId, category, enabled: enabling },
+        };
+    }
+  }
+
   // A mutating QQ domain operation is named by the current message, together with the group
   // it targets and the target and value it selects. The exact operation and every provider
   // parameter the message pins down are part of the required input, so the call cannot
@@ -909,11 +935,13 @@ function mediaRequestIntentForInput(
     : undefined;
 }
 
+/** One grammar for recognizing a switch and extracting its target. */
+const MODEL_SELECTION_PREFIX =
+  /^(?:请|帮我)?\s*(?:(?:把|将)\s*(?:我(?:的)?\s*)?(?:后续的\s*)?(?:(?:Owner|QQ)\s*)?(?:好友)?私聊(?:模型)?\s*切换(?:到|成|为)?|切换(?:模型)?(?:到|成|为)?|换(?:到|成)|使用|switch to)\s*(?:[，,]\s*)?["'“「]?/iu;
+
 function explicitModelSelectionCommand(text: string): boolean {
   const command = text.trim().replace(/^(?:Bob|Glassbox|玻璃盒)[，,\s]+/iu, "");
-  return /^(?:请|帮我)?\s*(?:(?:(?:把|将)\s*(?:我\s*)?(?:后续的\s*)?(?:(?:Owner|QQ)\s*)?(?:好友)?私聊(?:模型)?\s*切换(?:到|成|为)?|切换(?:模型)?(?:到|成|为)?|换(?:到|成)|使用|switch to)\s*.*)$/iu.test(
-    command,
-  );
+  return MODEL_SELECTION_PREFIX.test(command);
 }
 
 function explicitModelResetCommand(text: string): boolean {
@@ -1563,9 +1591,7 @@ function recreatedPrompt(input: ExecutionInput, included: Set<string>): string {
   const current = [input.text, acceptedStepResultText(input)].filter(Boolean).join("\n\n");
   if (!history && !learning) return current;
   const conversation = history ? `Authorized Conversation history:\n${history}` : "";
-  return [learning, conversation, `Current user message:\n${current}`]
-    .filter(Boolean)
-    .join("\n\n");
+  return [learning, conversation, `Current user message:\n${current}`].filter(Boolean).join("\n\n");
 }
 
 function learningTokens(text: string): string[] {
@@ -1631,9 +1657,7 @@ function selectLearningContext(
  */
 function namedModelSelection(text: string): string | undefined {
   const command = text.trim().replace(/^(?:Bob|Glassbox|玻璃盒)[，,\s]+/iu, "");
-  const selectionPrefix =
-    /^(?:请|帮我)?\s*(?:(?:把|将)\s*(?:我\s*)?(?:后续的\s*)?(?:(?:Owner|QQ)\s*)?(?:好友)?私聊(?:模型)?\s*切换(?:到|成|为)|切换(?:模型)?(?:到|成|为)|换(?:到|成)|使用|switch to)\s*["'“「]?/iu;
-  const selectionMatch = selectionPrefix.exec(command);
+  const selectionMatch = MODEL_SELECTION_PREFIX.exec(command);
   if (!selectionMatch) return undefined;
   return (
     command

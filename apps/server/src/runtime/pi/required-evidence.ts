@@ -83,7 +83,11 @@ export function namedGroupId(text: string): string | undefined {
     /(?:群\s*([1-9]\d{4,15})|([1-9]\d{4,15})\s*群|([1-9]\d{4,15})\s*的\s*(?:群组?|group\b))/u.exec(
       text,
     );
-  return match?.[1] ?? match?.[2] ?? match?.[3];
+  const capabilityTarget =
+    /(?:^|[，,])\s*(?:请|帮我)?\s*给\s*([1-9]\d{4,15})\s*(?:启用|开启|打开|关闭|停用|禁用)\s*(?=群[^，,。！？!?\n]*能力|group\.)/u.exec(
+      text,
+    );
+  return match?.[1] ?? match?.[2] ?? match?.[3] ?? capabilityTarget?.[1];
 }
 
 /**
