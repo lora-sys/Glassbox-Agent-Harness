@@ -9,6 +9,7 @@ import { FakeHerdrBridge } from "../../ops/fake-herdr-bridge.js";
 import { AuthorizedOpsService } from "../../ops/service.js";
 import { openDomainStore } from "../../persistence/index.js";
 import { RunTraceStore } from "../../trace/run-store.js";
+import { startWindowsPhaseTiming } from "../../fixtures/windows-phase-timing.js";
 import { createOpsTools } from "./ops-tools.js";
 import { createProtectedTool } from "./protected-tools.js";
 import {
@@ -272,7 +273,11 @@ describe("P5 tool plane origins", () => {
 });
 
 describe("P5 future-origin Tool contract", () => {
-  it("carries one non-QQ MCP Tool through descriptor, discovery, authorization and evidence", async () => {
+  it("carries one non-QQ MCP Tool through descriptor, discovery, authorization and evidence", async ({
+    onTestFinished,
+  }) => {
+    const timing = startWindowsPhaseTiming("future-mcp");
+    onTestFinished(() => timing.finish());
     const descriptor = toolDescriptor(FUTURE_MCP_FIXTURE.name, FUTURE_MCP_CATALOG);
     expect(descriptor).toEqual(FUTURE_MCP_FIXTURE);
     expect(descriptor?.origin).toBe("mcp");
@@ -325,31 +330,36 @@ describe("P5 future-origin Tool contract", () => {
       },
     };
     const traceDirectory = await mkdtemp(join(tmpdir(), "glassbox-tool-plane-mcp-"));
-    const store = await openDomainStore({ databasePath: ":memory:" });
+    const store = await timing.phase("database-open", () =>
+      openDomainStore({ databasePath: ":memory:" }),
+    );
     const trace = new RunTraceStore(traceDirectory);
     try {
-      await store.identities.bindOwner(caller.principalId, caller.scope);
-      await store.conversations.createAgent("personal");
-      for (const action of ["run:create", "conversation:read", "trace:write"])
-        await store.authorization.grant({
-          principalId: caller.principalId,
-          resourceId: "agent:personal",
-          action,
+      const { accepted, targetResourceId } = await timing.phase("setup", async () => {
+        await store.identities.bindOwner(caller.principalId, caller.scope);
+        await store.conversations.createAgent("personal");
+        for (const action of ["run:create", "conversation:read", "trace:write"])
+          await store.authorization.grant({
+            principalId: caller.principalId,
+            resourceId: "agent:personal",
+            action,
+            scope: caller.scope,
+            effect: "allow",
+          });
+        const accepted = await store.conversations.acceptIncoming({
+          agentId: "personal",
           scope: caller.scope,
-          effect: "allow",
+          messageId: "fixture-message",
+          text: "run the fixture MCP lookup",
+          executionRef: "fixture-mcp-test",
         });
-      const accepted = await store.conversations.acceptIncoming({
-        agentId: "personal",
-        scope: caller.scope,
-        messageId: "fixture-message",
-        text: "run the fixture MCP lookup",
-        executionRef: "fixture-mcp-test",
-      });
-      const targetResourceId = "fixture-record-1";
-      await store.authorization.registerResource({
-        id: targetResourceId,
-        kind: descriptor.authorization?.resource ?? "fixture-record",
-        visibility: "public",
+        const targetResourceId = "fixture-record-1";
+        await store.authorization.registerResource({
+          id: targetResourceId,
+          kind: descriptor.authorization?.resource ?? "fixture-record",
+          visibility: "public",
+        });
+        return { accepted, targetResourceId };
       });
 
       const decisions: Awaited<ReturnType<typeof store.authorization.check>>[] = [];
@@ -416,7 +426,9 @@ describe("P5 future-origin Tool contract", () => {
       const invoke = (params: Record<string, unknown>) =>
         fixtureTool.execute("call", params, undefined, undefined, {} as never);
 
-      await expect(invoke({ query: "denied" })).rejects.toThrow("Permission denied: no_grant");
+      await timing.phase("denied-call", async () => {
+        await expect(invoke({ query: "denied" })).rejects.toThrow("Permission denied: no_grant");
+      });
       expect(executions).toBe(0);
       expect(decisions.at(-1)).toMatchObject({
         decision: "DENY",
@@ -427,14 +439,16 @@ describe("P5 future-origin Tool contract", () => {
         action: fixtureAction,
       });
 
-      await store.authorization.grant({
-        principalId: caller.principalId,
-        resourceId: targetResourceId,
-        action: fixtureAction,
-        scope: caller.scope,
-        effect: "allow",
-      });
-      const response = await invoke({ query: "allowed" });
+      await timing.phase("grant", () =>
+        store.authorization.grant({
+          principalId: caller.principalId,
+          resourceId: targetResourceId,
+          action: fixtureAction,
+          scope: caller.scope,
+          effect: "allow",
+        }),
+      );
+      const response = await timing.phase("allowed-call", () => invoke({ query: "allowed" }));
       const authorization = decisions.at(-1);
       expect(authorization).toMatchObject({
         decision: "ALLOW",
@@ -472,7 +486,7 @@ describe("P5 future-origin Tool contract", () => {
         status: "ok",
         records: [{ id: targetResourceId, query: "allowed" }],
       });
-      const rawTrace = await trace.readPage(accepted.run.id);
+      const rawTrace = await timing.phase("trace-read", () => trace.readPage(accepted.run.id));
       expect(rawTrace.records).toHaveLength(1);
       expect(rawTrace.records[0]).toMatchObject({
         seq: 1,
@@ -501,8 +515,10 @@ describe("P5 future-origin Tool contract", () => {
       };
       expect(toolOperationalState(operationalObservation)).toBe("succeeded");
     } finally {
-      await store.close();
-      await rm(traceDirectory, { recursive: true, force: true });
+      await timing.phase("cleanup", async () => {
+        await store.close();
+        await rm(traceDirectory, { recursive: true, force: true });
+      });
     }
   });
 });

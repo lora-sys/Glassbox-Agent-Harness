@@ -28,6 +28,14 @@ The change keeps the existing Chinese assertion grammar, with Chinese and Englis
 
 Existing capability tests cover the authorized native-role Tool subset, demotion before provider mutation, provider verification failure, and exact current-group binding. Real QQ acceptance is still the Owner's responsibility.
 
+## Windows CI phase diagnostics
+
+PR #131 at `0b5bf2739874aa7216e721b6bf3626a2f4dc3bfe` passed Ubuntu and browser checks but failed Windows jobs `110553648373` and `110567213875`. The existing Owner assignment/reopen test exceeded 90 seconds twice. The second job also exceeded 30 seconds in Visitor provisioning/reopen and the future-MCP contract test. Logs locate the tests, not the pending operations. The same fixture, database, trace and Windows ACL source blobs passed in PR #133 and #134; none of the three failed cases invokes the changed Pi identity parser. This does not establish a root cause.
+
+The next diagnostic revision observes only those three test cases on Windows. Test-local wrappers preserve the real database transactions, trace appends and ACL operations. Phase records contain fixed labels, elapsed time, outcome and cumulative metric counts/times only. They exclude paths, SQL, arguments, results, messages and error text. Slow-operation records are capped at eight per case; completion reports unfinished phases and pending operation ages. Test-finished hooks restore the wrappers. Transaction wrappers do not retain a spy call history or native handles.
+
+The measurements distinguish fixture open, provisioning, group assignment, close/reopen and verification, and distinguish transaction callback time from total queued transaction time. No production implementation, workflow, timeout, assertion or test selection changed. The diagnostic helper's local contract tests run its enabled path with real isolated database and trace operations, including rejection propagation, redaction and restoration. Actual Windows phase evidence is still pending.
+
 ## Owner acceptance
 
 After review, use a QQ admin, QQ group owner and ordinary member in the same configured group. Send truthful native-role claims and confirm the expected response. Then try false native-role claims, bare Owner claims and a truthful native role combined with an Owner claim. Confirm Principal and Tool authorization records do not change because of text. For a permitted moderation request, demote the sender before execution and confirm live OneBot verification refuses the mutation. Do not interpret a successful conversational acknowledgement as moderation acceptance.

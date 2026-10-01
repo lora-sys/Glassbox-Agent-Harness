@@ -18,6 +18,7 @@ import {
 import { ManagementApplication } from "./application.js";
 import type { MediaGenerationProvider } from "../media/provider.js";
 import type { ToolDescriptor, ToolExclusionReason } from "../runtime/pi/tool-plane.js";
+import type { WindowsPhaseTiming } from "../fixtures/windows-phase-timing.js";
 
 class Inbox<T> {
   private items: T[] = [];
@@ -224,6 +225,8 @@ export function createApplicationFixtureScope() {
       coOwnerId?: string;
       /** File-backed database so a test can close and reopen the same durable state. */
       persistentDatabase?: boolean;
+      /** Windows-only phase observation for the selected CI diagnostic cases. */
+      timing?: WindowsPhaseTiming;
       /** Current provider role returned by the execution-time member lookup. */
       memberRole?: () => "owner" | "admin" | "member";
       /** One provider mutation to reject after caller authorization has passed. */
@@ -337,27 +340,32 @@ export function createApplicationFixtureScope() {
         executors,
         ...(options.mediaProvider ? { mediaProvider: options.mediaProvider } : {}),
       });
-    let app = await open();
+    const timed: WindowsPhaseTiming["phase"] = options.timing
+      ? (phase, operation) => options.timing!.phase(phase, operation)
+      : (_phase, operation) => operation();
+    let app = await timed("fixture-open", open);
     cleanup.push(() => app.close());
     const reopen = async () => {
-      await app.close();
-      app = await open();
+      await timed("fixture-close", () => app.close());
+      app = await timed("fixture-reopen", open);
       return app;
     };
-    await app.saveChannel({
-      id: "fixture",
-      label: "Disposable QQ fixture",
-      kind: "qq-onebot",
-      endpoint: `ws://127.0.0.1:${(server.address() as AddressInfo).port}/`,
-      botId: "10001",
-      ownerId: "10002",
-      ...(options.coOwnerId !== undefined ? { coOwnerId: options.coOwnerId } : {}),
-      visitorIds: ["10004"],
-      groupIds: ["10003"],
-      token: "fixture-token",
-      executionRef: "claude-code",
-    });
-    await app.connectChannel("fixture");
+    await timed("fixture-save-channel", () =>
+      app.saveChannel({
+        id: "fixture",
+        label: "Disposable QQ fixture",
+        kind: "qq-onebot",
+        endpoint: `ws://127.0.0.1:${(server.address() as AddressInfo).port}/`,
+        botId: "10001",
+        ownerId: "10002",
+        ...(options.coOwnerId !== undefined ? { coOwnerId: options.coOwnerId } : {}),
+        visitorIds: ["10004"],
+        groupIds: ["10003"],
+        token: "fixture-token",
+        executionRef: "claude-code",
+      }),
+    );
+    await timed("fixture-connect", () => app.connectChannel("fixture"));
     const socket = await sockets.take();
     const send = (
       id: number,

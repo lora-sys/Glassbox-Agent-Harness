@@ -3,6 +3,10 @@ import { createApplicationFixtureScope } from "./application-test-helpers.js";
 import { QQ_CAPABILITY_CATEGORIES } from "../channels/onebot/capabilities.js";
 import { DEFAULT_OWNER_GROUP_CATEGORIES, DEFAULT_OWNER_GROUP_POLICY } from "./application.js";
 import {
+  startWindowsPhaseTiming,
+  type WindowsPhaseTiming,
+} from "../fixtures/windows-phase-timing.js";
+import {
   admin,
   MUTATION_CATEGORIES,
   groupActions,
@@ -19,11 +23,14 @@ describe("per-Owner managed group assignment", () => {
   const OTHER_GROUP = "10007";
 
   /** Opens a fixture with a second Owner and returns one Owner-private context per Owner. */
-  async function owners(options: { persistentDatabase?: boolean; groupName?: string } = {}) {
+  async function owners(
+    options: { persistentDatabase?: boolean; groupName?: string; timing?: WindowsPhaseTiming } = {},
+  ) {
     const f = await fixture(
       async (input) => ({ status: "succeeded", text: `answer:${input.text}` }),
       {
         coOwnerId: CO_OWNER,
+        ...(options.timing ? { timing: options.timing } : {}),
         ...(options.persistentDatabase === undefined
           ? {}
           : { persistentDatabase: options.persistentDatabase }),
@@ -150,22 +157,34 @@ describe("per-Owner managed group assignment", () => {
     ).toBe(true);
   });
 
-  it("persists each Owner's assignment and the fixed policy across a restart", async () => {
-    const { f, application, a, b } = await owners({ persistentDatabase: true });
-    await application.setGroupAccess(a, { groupId: GROUP, enabled: true });
-    await application.setGroupAccess(b, { groupId: OTHER_GROUP, enabled: true });
+  it("persists each Owner's assignment and the fixed policy across a restart", async ({
+    onTestFinished,
+  }) => {
+    const timing = startWindowsPhaseTiming("owner-restart");
+    onTestFinished(() => timing.finish());
+    const { f, application, a, b } = await timing.phase("owner-setup", () =>
+      owners({ persistentDatabase: true, timing }),
+    );
+    await timing.phase("enable-group-a", () =>
+      application.setGroupAccess(a, { groupId: GROUP, enabled: true }),
+    );
+    await timing.phase("enable-group-b", () =>
+      application.setGroupAccess(b, { groupId: OTHER_GROUP, enabled: true }),
+    );
 
-    const restartedApp = await f.reopen();
+    const restartedApp = await timing.phase("restart", () => f.reopen());
     const restarted = admin(restartedApp);
 
-    expect(await groupIds(restarted, a)).toEqual([GROUP]);
-    expect(await groupIds(restarted, b)).toEqual([OTHER_GROUP]);
-    expect((await restarted.projectManagedGroups(a)).groups[0]?.categories).toEqual(
-      DEFAULT_OWNER_GROUP_POLICY.categories,
-    );
-    expect(restartedApp.listChannels()[0]?.groupIds).toEqual(
-      expect.arrayContaining([GROUP, OTHER_GROUP]),
-    );
+    await timing.phase("verify", async () => {
+      expect(await groupIds(restarted, a)).toEqual([GROUP]);
+      expect(await groupIds(restarted, b)).toEqual([OTHER_GROUP]);
+      expect((await restarted.projectManagedGroups(a)).groups[0]?.categories).toEqual(
+        DEFAULT_OWNER_GROUP_POLICY.categories,
+      );
+      expect(restartedApp.listChannels()[0]?.groupIds).toEqual(
+        expect.arrayContaining([GROUP, OTHER_GROUP]),
+      );
+    });
   }, 90_000);
 
   it("persists the fixed default bundle and never enables a mutation category", async () => {
