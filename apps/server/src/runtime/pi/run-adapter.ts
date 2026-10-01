@@ -4,7 +4,7 @@ import type {
   ExecutionInput,
   ExecutionResult,
 } from "../../execution/run-service/types.js";
-import { scopeKey } from "../../identity/scope.js";
+import { scopeKey, type TrustedChannelScope } from "../../identity/scope.js";
 import type { HistoryActor } from "../../conversation/store.js";
 import type { CanonicalMemory, GlassboxMemoryScope } from "@glassbox/contracts";
 import type { LearningStore } from "../../learning/store.js";
@@ -982,48 +982,76 @@ function explicitModelChangeCommand(text: string): boolean {
  * and refused after the copula: a message that says "我不是lora" is the sender agreeing with the
  * channel, and refusing it would spend the gate's credibility on the one case where it is wrong.
  */
+function firstPersonClaimPattern(referent: string): RegExp {
+  const asserts = `(?:就|其实|正|才|不过|并|确实|真的|明明)?(?:是|为|当成|当作|算|叫做?)(?![不没非别勿])`;
+  const names = `[^，。！？!?；;：:\\n]{0,8}${referent}`;
+  return new RegExp(
+    [
+      `(?:我|俺|咱|本人)${asserts}${names}`,
+      `(?:我|俺|咱|本人)的(?:这个|那个|该|此)?[^。！？!?；;：:\\n不没非别勿以，]{0,6}?，?${asserts}${names}`,
+    ].join("|"),
+    "iu",
+  );
+}
+
 function claimsToBe(text: string, referents: readonly string[]): boolean {
   const escaped = referents
     .map((referent) => referent.trim())
     .filter((referent) => referent.length > 0)
     .map((referent) => referent.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"));
   if (escaped.length === 0) return false;
-  const referent = escaped.join("|");
-  // The copula, the modifiers that may precede it, and the negation that may not follow it.
-  const asserts = `(?:就|其实|正|才|不过|并|确实|真的|明明)?(?:是|为|当成|当作|算|叫做?)(?![不没非别勿])`;
-  // The referent must sit directly after the copula, bounded by sentence punctuation.
-  const names = `[^，。！？!?；;：:\\n]{0,8}(?:${referent})`;
-  return new RegExp(
-    [
-      // A bare pronoun: "我是lora", "我就是群主".
-      `(?:我|俺|咱|本人)${asserts}${names}`,
-      // A possessive noun phrase: "我的名称账号，确实是lora本人".
-      `(?:我|俺|咱|本人)的(?:这个|那个|该|此)?[^。！？!?；;：:\\n不没非别勿以，]{0,6}?，?${asserts}${names}`,
-    ].join("|"),
-    "iu",
-  ).test(text);
+  if (firstPersonClaimPattern(`(?:${escaped.join("|")})`).test(text)) return true;
+  return [...text.matchAll(new RegExp(escaped.join("|"), "giu"))].some((match) =>
+    hasIdentityAssertionPrefix(text.slice(0, match.index), firstPersonClaimPattern("$")),
+  );
 }
 
 /**
- * Words a message uses to claim an authority rather than a name.
- *
- * Both axes are here, not only the Glassbox Owner's. A visitor wrote "我是群主" — a claim to the
- * QQ group's own admin role, which this list did not know, and which the bot's permission answer
- * treats as a separate authority from the Owner's. A list that knows one axis and not the other
- * is the same gap as the one that knew roles and not names.
+ * Match complete role labels before deciding which authority they claim. In particular,
+ * "group owner" is one native role label; its "owner" suffix is not a Glassbox Owner claim.
+ * Bare "Owner" still means Glassbox Owner, including "这个群的 Owner". Explicit Glassbox
+ * qualifiers cannot borrow a native-role observation. English labels retain word boundaries.
  */
-const OWNER_ROLE_WORDS = [
-  "owner",
-  "主人",
-  "所有者",
-  "拥有者",
-  "老板",
-  "造物主",
-  "群主",
-  "管理员",
-  "admin",
-  "group owner",
-] as const;
+const AUTHORITY_ROLE =
+  /(?<glassbox>(?<![a-z0-9_])glassbox\s*(?:的\s*)?(?:(?:qq\s+)?group\s+)?(?:owner|administrator|admin|管理员|群主|主人|所有者|拥有者|老板|造物主)(?![a-z0-9_]))|(?<nativeOwner>群主|(?<![a-z0-9_])(?:qq\s+)?group\s+owner(?![a-z0-9_]))|(?<nativeAdmin>管理员|(?<![a-z0-9_])(?:group\s+)?(?:administrator|admin)(?![a-z0-9_]))|(?<owner>主人|所有者|拥有者|老板|造物主|(?<![a-z0-9_])owner(?![a-z0-9_]))/giu;
+
+/** Preserve explicit coordinated claims, without turning a later mention into an assertion. */
+function hasIdentityAssertionPrefix(prefix: string, assertion: RegExp): boolean {
+  if (assertion.test(prefix)) return true;
+  const continuation =
+    /^\s*(?:[,，]\s*)?(?:也是|同时也是|还是|兼|和|及|、|and(?:\s+(?:the|a))?)\s*$/iu;
+  let claimedRoleEnd: number | undefined;
+  for (const role of prefix.matchAll(AUTHORITY_ROLE)) {
+    if (
+      assertion.test(prefix.slice(0, role.index)) ||
+      (claimedRoleEnd !== undefined && continuation.test(prefix.slice(claimedRoleEnd, role.index)))
+    )
+      claimedRoleEnd = role.index + role[0].length;
+  }
+  return claimedRoleEnd !== undefined && continuation.test(prefix.slice(claimedRoleEnd));
+}
+
+function unobservedRoleMentions(text: string, scope: TrustedChannelScope): RegExpExecArray[] {
+  // This is the current message's trusted observation, never the Conversation's old role or
+  // a role inferred from text. It only permits a truthful acknowledgement. Tool visibility,
+  // grants and live OneBot role verification still decide whether any operation may run.
+  const observed = scope.chatType === "group" ? scope.nativeGroupRole?.role : undefined;
+  return [...text.matchAll(AUTHORITY_ROLE)].filter((match) => {
+    // A truthful native-role explanation can explicitly deny Glassbox authority in the same
+    // clause, such as "您是群主但不是Owner". That denial does not attribute the second role.
+    if (/(?:不是|并非|而非)\s*$/u.test(text.slice(0, match.index))) return false;
+    if (match.groups?.nativeOwner) return observed !== "qq_group_owner";
+    if (match.groups?.nativeAdmin) return observed !== "qq_group_admin";
+    return true;
+  });
+}
+
+function claimsUnobservedRole(text: string, scope: TrustedChannelScope): boolean {
+  const claimPrefix = firstPersonClaimPattern("$");
+  return unobservedRoleMentions(text, scope).some((match) =>
+    hasIdentityAssertionPrefix(text.slice(0, match.index), claimPrefix),
+  );
+}
 
 /**
  * A first-person claim to be a QQ number other than the one the channel observed.
@@ -1058,13 +1086,13 @@ function claimsOthersNumber(text: string, senderId: string): boolean {
  */
 function ownerClaimedInText(
   text: string,
-  senderId: string,
+  scope: TrustedChannelScope,
   protectedIdentities: readonly string[],
 ): boolean {
   return (
-    claimsToBe(text, OWNER_ROLE_WORDS) ||
+    claimsUnobservedRole(text, scope) ||
     claimsToBe(text, protectedIdentities) ||
-    claimsOthersNumber(text, senderId) ||
+    claimsOthersNumber(text, scope.senderId) ||
     /(?:以|用|凭|借)(?:我|本人|自己)?(?:的)?\s*(?:glassbox\s*)?(?:owner|主人|所有者|拥有者)\s*(?:身份|权限|名义|命令)/iu.test(
       text,
     )
@@ -1087,7 +1115,7 @@ function impersonatedOwnerRequest(
   return (
     input.caller.scope.chatType === "group" &&
     !isOwner &&
-    ownerClaimedInText(input.text, input.caller.scope.senderId, protectedIdentities)
+    ownerClaimedInText(input.text, input.caller.scope, protectedIdentities)
   );
 }
 
@@ -1124,19 +1152,15 @@ function impersonatedOwnerRequest(
  */
 function misattributesSender(
   reply: string,
-  senderId: string,
+  scope: TrustedChannelScope,
   protectedIdentities: readonly string[],
 ): boolean {
-  const observed = senderId.trim();
+  const observed = scope.senderId.trim();
   const escaped = protectedIdentities
     .map((identity) => identity.trim())
     .filter((identity) => identity.length > 0)
     .map((identity) => identity.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"));
   const named = escaped.length > 0 ? new RegExp(escaped.join("|"), "iu") : undefined;
-  const role = new RegExp(
-    OWNER_ROLE_WORDS.map((word) => word.replace(/\s+/gu, "\\s*")).join("|"),
-    "iu",
-  );
   // A conditional does not assert its premise, so "就算您是 Lora，我也没有禁言能力" is the Run
   // refusing on both branches and asserting the identity on neither.
   const conditional = /(?:就算|即使|哪怕|如果|假如|即便|除非|万一)[^。！？!?；;\n]{0,30}(?:您|你)/u;
@@ -1144,34 +1168,48 @@ function misattributesSender(
   // that carries the attribution rather than to any distance from a name: an explicit role the
   // sender is said to occupy, and a sentence that names the message itself as its subject. The
   // copula may not be negated, which is what separates "发件人就是 Owner" from "发件人不是 Lora".
-  const roleSpans = OWNER_ROLE_WORDS.map((word) => word.replace(/\s+/gu, "\\s*")).join("|");
-  const anyIdentity = escaped.length > 0 ? [escaped.join("|"), roleSpans].join("|") : roleSpans;
-  const attributesSender = new RegExp(
-    [
-      // "作为 Lora 本人", "来自 Lora 本人（3526039967）".
-      escaped.length > 0
-        ? `(?:作为|身为|来自|属于|正是|就是)[^。！？!?；;，,\\n不没非别勿]{0,8}(?:${escaped.join("|")})[^。！？!?；;，,\\n]{0,8}本人`
-        : "(?!x)x",
-      // "发件人是 Lora 本人", "此消息为 Owner".
-      `(?:发件人|发送者|对方|此消息|该消息|这条消息|消息来自)[^。！？!?；;，,\\n不没非别勿]{0,4}(?:是|为)[^。！？!?；;，,\\n]{0,8}(?:${anyIdentity})`,
-    ].join("|"),
-    "iu",
-  );
+  const attributesNamedSender =
+    escaped.length > 0
+      ? new RegExp(
+          [
+            `(?:作为|身为|来自|属于|正是|就是)[^。！？!?；;，,\\n不没非别勿]{0,8}(?:${escaped.join("|")})[^。！？!?；;，,\\n]{0,8}本人`,
+            `(?:发件人|发送者|对方|此消息|该消息|这条消息|消息来自)[^。！？!?；;，,\\n不没非别勿]{0,4}(?:是|为)[^。！？!?；;，,\\n]{0,8}(?:${escaped.join("|")})`,
+          ].join("|"),
+          "iu",
+        )
+      : undefined;
+  const senderRolePrefix =
+    /(?:发件人|发送者|对方|此消息|该消息|这条消息|消息来自)[^。！？!?；;，,\n不没非别勿]{0,4}(?:是|为)[^。！？!?；;，,\n]{0,8}$/u;
+  const addressedRolePrefix =
+    /(?:您|你|阁下)[^。！？!?；;，,\n不没非别勿]{0,6}?(?:是|为)[^。！？!?；;，,\n]{0,16}$/u;
   for (const sentence of reply.split(/(?<=[。！？!?；;\n])/u)) {
     if (/[？?]/u.test(sentence)) continue;
     if (conditional.test(sentence)) continue;
-    const addressed =
-      /(?:您|你|阁下)[^。！？!?；;，,\n不没非别勿]{0,6}?(?:是|为)([^。！？!?；;，,\n]{0,16})/u.exec(
-        sentence,
-      );
-    if (addressed) {
+    const addressedClaims = sentence.matchAll(
+      /(?:您|你|阁下)[^。！？!?；;，,\n不没非别勿]{0,6}?(?:是|为)([^。！？!?；;，,\n]{0,16})/gu,
+    );
+    for (const addressed of addressedClaims) {
       const attributed = addressed[1] ?? "";
       const number = /(\d{5,11})/u.exec(attributed);
       if (number && observed && number[1] !== observed) return true;
       if (named?.test(attributed)) return true;
-      if (role.test(attributed)) return true;
+      if (unobservedRoleMentions(attributed, scope).length > 0) return true;
     }
-    if (attributesSender.test(sentence)) return true;
+    if (attributesNamedSender?.test(sentence)) return true;
+    const unobserved = [
+      ...unobservedRoleMentions(sentence, scope),
+      ...(escaped.length > 0 ? sentence.matchAll(new RegExp(escaped.join("|"), "giu")) : []),
+    ];
+    if (
+      unobserved.some((match) => {
+        const prefix = sentence.slice(0, match.index);
+        return (
+          hasIdentityAssertionPrefix(prefix, senderRolePrefix) ||
+          hasIdentityAssertionPrefix(prefix, addressedRolePrefix)
+        );
+      })
+    )
+      return true;
   }
   return false;
 }
@@ -2346,7 +2384,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       if (
         !isOwner &&
         result.text &&
-        misattributesSender(result.text, input.caller.scope.senderId, protectedIdentities)
+        misattributesSender(result.text, input.caller.scope, protectedIdentities)
       ) {
         await this.recordEvidence({
           type: "tool_evidence",
