@@ -2,70 +2,11 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, it, vi } from "vite-plus/test";
-import { openDomainStore } from "../application/domain-store.js";
+import { runFixtureProcess } from "../persistence/test-fixture-process.js";
+import { memoryFixture as fixture } from "./memory-test-fixture.js";
+import { memoryReopenFixtureScript } from "./memory-reopen-fixture.js";
 import { MemoryConsolidator } from "./consolidation.js";
 import { createOwnerMemoryTools } from "../runtime/pi/owner-memory-tools.js";
-
-async function fixture(databasePath = ":memory:") {
-  const store = await openDomainStore({ databasePath });
-  const scope = {
-    connectionId: "qq",
-    botId: "bot",
-    chatType: "private" as const,
-    chatId: "owner",
-    senderId: "owner",
-  };
-  const caller = { principalId: "owner", scope };
-  const context = { caller };
-  const groupContext = {
-    caller: {
-      principalId: "owner",
-      scope: { ...scope, chatType: "group" as const, chatId: "100" },
-    },
-  };
-  const groupScope = { type: "group" as const, connectionId: "qq", botId: "bot", groupId: "100" };
-  await store.identities.bindOwner("owner", scope);
-  await store.conversations.createAgent("personal");
-  await store.authorization.grant({
-    principalId: "owner",
-    resourceId: "agent:personal",
-    action: "run:create",
-    scope,
-    effect: "allow",
-  });
-  await store.authorization.registerResource({
-    id: "owner-memory",
-    kind: "owner-memory",
-    visibility: "private",
-    ownerId: "owner",
-  });
-  await store.authorization.registerResource({
-    id: "group:100",
-    kind: "qq_group",
-    visibility: "public",
-  });
-  for (const action of ["memory:read", "memory:write", "memory:govern"])
-    await store.authorization.grant({
-      principalId: "owner",
-      resourceId: "owner-memory",
-      action,
-      scope,
-      effect: "allow",
-    });
-  await store.authorization.grant({
-    principalId: "owner",
-    resourceId: "group:100",
-    action: "memory:read",
-    scope: groupContext.caller.scope,
-    effect: "allow",
-  });
-  const base = {
-    subject: { kind: "user" as const, id: "owner" },
-    scope: { type: "global" as const },
-    type: "semantic_fact" as const,
-  };
-  return { store, caller, context, scope, groupContext, groupScope, base };
-}
 
 it.each(
   (["global", "group"] as const).flatMap((kind) => [1, 40, 100].map((limit) => ({ kind, limit }))),
@@ -166,216 +107,44 @@ it.each(["global", "group"])("excludes $0 memory expiring exactly at query time"
   }
 });
 
-it.each(
+async function reopenFixture(scenario: string, values: string[], signal: AbortSignal) {
+  const directory = await mkdtemp(join(tmpdir(), "glassbox-memory-reopen-"));
+  try {
+    const output = await runFixtureProcess(
+      memoryReopenFixtureScript,
+      [join(directory, "glassbox.db"), scenario, ...values],
+      signal,
+    );
+    expect(JSON.parse(output)).toEqual({ completed: scenario });
+  } finally {
+    // Native libsql statements can retain file handles until GC. Child exit is
+    // the deterministic release boundary before the parent removes the fixture.
+    await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  }
+}
+
+it.for(
   (["explicit", "candidate"] as const).flatMap((mode) =>
     (["public", "confidential"] as const).map((sensitivity) => ({ mode, sensitivity })),
   ),
 )(
   "preserves $sensitivity group sensitivity for a $mode correction after reopen",
-  async ({ mode, sensitivity }) => {
-    const directory = await mkdtemp(join(tmpdir(), "glassbox-memory-correction-"));
-    const databasePath = join(directory, "glassbox.db");
-    const f = await fixture(databasePath);
-    try {
-      const base = { ...f.base, scope: f.groupScope };
-      const original = await f.store.learning.writeExplicit(f.context, {
-        ...base,
-        statement: "Meeting Monday",
-        sensitivity,
-      });
-      const accepted = await f.store.conversations.acceptIncoming({
-        agentId: "personal",
-        scope: f.scope,
-        messageId: "supersede",
-        text:
-          mode === "explicit"
-            ? `/memory supersede ${original.memoryId} Meeting Tuesday`
-            : "Suggest a correction",
-        executionRef: "fixture",
-      });
-      const [tool] = createOwnerMemoryTools({
-        store: f.store,
-        getContext: () => ({
-          caller: f.caller,
-          runId: accepted.run.id,
-          conversationId: accepted.conversation.id,
-        }),
-      });
-      const result = await tool!.execute(
-        "call",
-        { action: "supersede", id: original.memoryId, statement: "Meeting Tuesday" },
-        undefined,
-        undefined,
-        {} as never,
-      );
-      if (mode === "candidate") {
-        const candidates = await f.store.learning.listCandidates(f.context);
-        const candidate = candidates.find(
-          (row) => row.mergeHint.ifMatchMemoryId === original.memoryId,
-        );
-        expect(candidate).toBeDefined();
-        await f.store.learning.promoteCandidate(f.context, candidate!.candidateId);
-      } else expect(result.details).toMatchObject({ sensitivity });
-      await f.store.close();
-      f.store = await openDomainStore({ databasePath });
-      const rows = await f.store.learning.listGroupMemories(
-        f.groupContext,
-        "group:100",
-        f.groupScope,
-      );
-      expect(rows.map((row) => row.content.statement)).toEqual(
-        sensitivity === "public" ? ["Meeting Tuesday"] : [],
-      );
-      const [replacement] = await f.store.learning.listMemories(f.context, { scope: f.groupScope });
-      expect(replacement).toMatchObject({
-        sensitivity,
-        scope: f.groupScope,
-        content: { statement: "Meeting Tuesday" },
-        supersedes: [original.memoryId],
-      });
-      expect((await f.store.learning.getMemory(f.context, original.memoryId))?.lifecycleState).toBe(
-        "retired",
-      );
-    } finally {
-      await f.store.close();
-      await rm(directory, { recursive: true, force: true });
-    }
+  async ({ mode, sensitivity }, { signal }) => {
+    await reopenFixture("sensitivity", [mode, sensitivity], signal);
   },
 );
 
-it.each(["superseded", "expired", "revoked", "retired", "missing"])(
+it.for(["superseded", "expired", "revoked", "retired", "missing"])(
   "rejects correction promotion with a %s target",
-  async (state) => {
-    vi.useFakeTimers({ toFake: ["Date"] });
-    const start = new Date("2026-10-01T00:00:00.000Z");
-    vi.setSystemTime(start);
-    const directory = await mkdtemp(join(tmpdir(), "glassbox-memory-stale-"));
-    const databasePath = join(directory, "glassbox.db");
-    const f = await fixture(databasePath);
-    try {
-      const original = await f.store.learning.writeExplicit(f.context, {
-        ...f.base,
-        statement: "Launch Monday",
-        ...(state === "expired" ? { ttlSeconds: 1 } : {}),
-      });
-      const candidate = await f.store.learning.createCandidate(f.context, {
-        candidateKind: "correction",
-        subject: f.base.subject,
-        scope: f.base.scope,
-        proposedType: f.base.type,
-        statement: "Launch Tuesday",
-        content: { statement: "Launch Tuesday" },
-        source: { kind: "human", ref: "fixture" },
-        sourceEvidence: [],
-        mergeHint: { strategy: "manual_review_required", ifMatchMemoryId: original.memoryId },
-        extensions: {},
-      });
-      if (state === "superseded")
-        await f.store.learning.supersedeMemory(f.context, original.memoryId, {
-          ...f.base,
-          statement: "Launch Wednesday",
-        });
-      else if (state === "expired") vi.setSystemTime(new Date(start.getTime() + 1_000));
-      else if (state === "missing")
-        await f.store.db.transaction((tx) =>
-          tx.execute({ sql: "DELETE FROM memories WHERE id = ?", args: [original.memoryId] }),
-        );
-      else
-        await f.store.learning.setLifecycle(
-          f.context,
-          original.memoryId,
-          state as "revoked" | "retired",
-        );
-      await expect(
-        f.store.learning.promoteCandidate(f.context, candidate.candidateId),
-      ).rejects.toThrow("memory_not_active");
-      await f.store.close();
-      f.store = await openDomainStore({ databasePath });
-      expect((await f.store.learning.getCandidate(f.context, candidate.candidateId))?.status).toBe(
-        "pending",
-      );
-      const active = await f.store.learning.listMemories(f.context);
-      expect(active.map((row) => row.content.statement)).toEqual(
-        state === "superseded" ? ["Launch Wednesday"] : [],
-      );
-      expect(
-        await f.store.learning.listMemories(f.context, { includeInactive: true }),
-      ).toHaveLength(state === "missing" ? 0 : state === "superseded" ? 2 : 1);
-    } finally {
-      await f.store.close();
-      await rm(directory, { recursive: true, force: true });
-      vi.useRealTimers();
-    }
+  async (state, { signal }) => {
+    await reopenFixture("stale", [state], signal);
   },
 );
 
-it.each(["explicit", "candidate"])(
+it.for(["explicit", "candidate"])(
   "preserves the expiry deadline and retention policy for a %s statement correction",
-  async (mode) => {
-    vi.useFakeTimers({ toFake: ["Date"] });
-    const start = new Date("2026-10-01T00:00:00.000Z");
-    vi.setSystemTime(start);
-    const directory = await mkdtemp(join(tmpdir(), "glassbox-memory-retention-"));
-    const databasePath = join(directory, "glassbox.db");
-    const f = await fixture(databasePath);
-    try {
-      const original = await f.store.learning.writeExplicit(f.context, {
-        ...f.base,
-        statement: "Temporary Monday fact",
-        ttlSeconds: 60,
-        retentionPolicy: "project-window",
-      });
-      vi.setSystemTime(new Date(start.getTime() + 30_000));
-      const statement = "Temporary Tuesday fact";
-      const replacement =
-        mode === "explicit"
-          ? await f.store.learning.supersedeMemory(f.context, original.memoryId, {
-              ...f.base,
-              statement,
-            })
-          : await f.store.learning.promoteCandidate(
-              f.context,
-              (
-                await f.store.learning.createCandidate(f.context, {
-                  candidateKind: "correction",
-                  subject: f.base.subject,
-                  scope: f.base.scope,
-                  proposedType: f.base.type,
-                  statement,
-                  content: { statement },
-                  source: { kind: "human", ref: "fixture" },
-                  sourceEvidence: [],
-                  mergeHint: {
-                    strategy: "manual_review_required",
-                    ifMatchMemoryId: original.memoryId,
-                  },
-                  extensions: {},
-                })
-              ).candidateId,
-            );
-      expect(replacement).toMatchObject({
-        ttlSeconds: original.ttlSeconds,
-        expiresAt: original.expiresAt,
-        retentionPolicy: original.retentionPolicy,
-      });
-      await f.store.close();
-      f.store = await openDomainStore({ databasePath });
-      expect(await f.store.learning.getMemory(f.context, replacement.memoryId)).toMatchObject({
-        ttlSeconds: original.ttlSeconds,
-        expiresAt: original.expiresAt,
-        retentionPolicy: original.retentionPolicy,
-        lifecycleState: "active",
-      });
-      vi.setSystemTime(new Date(start.getTime() + 60_000));
-      expect(await f.store.learning.listMemories(f.context)).toEqual([]);
-      expect(await f.store.learning.getMemory(f.context, replacement.memoryId)).toMatchObject({
-        lifecycleState: "expired",
-      });
-    } finally {
-      await f.store.close();
-      await rm(directory, { recursive: true, force: true });
-      vi.useRealTimers();
-    }
+  async (mode, { signal }) => {
+    await reopenFixture("retention", [mode], signal);
   },
 );
 

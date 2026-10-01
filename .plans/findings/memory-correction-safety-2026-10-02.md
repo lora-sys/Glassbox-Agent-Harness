@@ -50,3 +50,13 @@ Tests use isolated temporary databases and Pi state. No test was disabled or wea
 2. Ask for a suggested correction, change its original fact before promotion, then try promoting the older candidate. Expect a stale-version failure and a still-pending candidate.
 3. Repeat with a target that expires before review. Expect `memory_not_active`, with no restored fact.
 4. Inspect a time-limited corrected Memory after a restart. Its original expiration deadline should remain unchanged.
+
+## PR #132 CI repair
+
+The Windows run exposed native libsql file handles surviving logical close, so the file-backed reopen cases now execute in isolated child processes. Parent cleanup waits for confirmed child exit, then uses bounded removal retries. Case matrices and assertions remain intact. The dependency resource lifetime and production limits are recorded separately in `libsql-native-close-2026-10-02.md`.
+
+The Linux run exposed an independent fake Codex proof-file race. Its in-place shutdown write could leave truncated JSON when interrupted. The fixture now writes a temporary file and renames the complete snapshot into place. A deterministic interrupted-write case reproduced the CI parse error before the change and passes afterward. Existing Codex assertions remain unchanged.
+
+Focused verification after these fixture repairs: the memory/Codex cases and process-helper cases passed. The added cancellation regression verifies that an abort error does not settle the helper before the child writes its exit marker and actually exits. Formatting, lint and types passed for all six changed code/fixture files. The existing staged-test integrity function returned no issues for the actual staged diff; validation configuration is unchanged. Windows acceptance still requires the next CI run. No full gate was started while another repair owned the shared verification slot.
+
+Final serialized verification of the CI-repair snapshot completed with unchanged hashes for all six changed code/test files. Both the commit gate and full gate exited 1 after 2,086 tests passed; their only failures were the same 15 Unix-socket EPERM cases, with one existing skipped test. Full core/Web types and validation scripts passed. The separate Web build and pinned-npm repository hygiene both exited 0. The related-test command now selects all 34 memory cases through the statically imported fixture entry. Import-side-effect verification also passed. The production native-close limitation remains unchanged; Windows cleanup acceptance still requires CI on the updated commit.
