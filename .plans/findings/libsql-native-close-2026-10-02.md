@@ -47,3 +47,9 @@ The parent additionally requires the child's completion marker. A child assertio
 ### Dependency tracking
 
 The parent statically imports the child entry's inert script URL. An explicit main-module guard prevents fixture execution during import. This retains Vitest's changed-test dependency graph without validator changes: targeting `memory-reopen-fixture.ts` through `vp test related` now selects the parent test file and passes all 34 cases. A fresh-process diagnostic, with only tsx's compilation cache disabled, verified zero fixture filesystem writes or child-process calls during import.
+
+### Windows loader-path correction
+
+PR #132 commit `e4c384e` passed Ubuntu CI, but Windows job `110582654021` rejected the raw drive path passed to Node's `--import` with `ERR_UNSUPPORTED_ESM_URL_SCHEME`. The helper now converts the resolved tsx loader path with `pathToFileURL(loader).href`. Process exit, cancellation and cleanup ordering are unchanged.
+
+A real-child regression uses a loader filename containing spaces, `#` and `%`, verifies the encoded `file:///` argument and round-trip path, and checks the native drive prefix on Windows. Before the fix it failed because Node interpreted `#` as a URL fragment; afterward all 38 focused memory/helper tests passed. Both changed files pass lint and type checks without warnings. Native Windows verification and aggregate gates for this follow-up remain pending. The same helper and regression are copied unchanged into PR #130.
