@@ -27,3 +27,9 @@ Observer, no-op recovery and helper suites passed 36 tests in three files. The r
 ## Final serialized gates
 
 The staged commit gate and full gate both exited 1 after completing 2,072 passing tests. Their only failures were the same 15 Unix-socket `listen EPERM` cases in this executor; one existing test remained skipped. Core/Web types and validation scripts passed. The separate Web build and repository hygiene under pinned npm 12.0.2 both exited 0. No worker was killed or timed out. All seven changed code/test file hashes remained unchanged across the gates. This does not certify the unresolved Windows timeout cases or Windows cleanup until CI runs the new commit.
+
+## Windows loader-path follow-up
+
+PR #132 Windows job `110582654021` exposed a shared helper startup failure: Node's `--import` rejects a raw Windows drive path with `ERR_UNSUPPORTED_ESM_URL_SCHEME`. This branch copies the same correction and regression unchanged: convert the resolved tsx loader path with `pathToFileURL(loader).href`.
+
+The real-child regression verifies a loader path containing spaces, `#` and `%`, its encoded `file:///` argument and round-trip path, plus the native Windows drive prefix. It failed before the fix and passed afterward. Observer, recovery and helper suites now pass all 37 tests; both changed files pass lint and types without warnings. No production behavior, timeout or child-close semantics change. Native Windows verification and aggregate gates for this follow-up remain pending.

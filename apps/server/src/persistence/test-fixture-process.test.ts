@@ -1,15 +1,54 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { expect, it, vi } from "vite-plus/test";
 import { runFixtureProcess } from "./test-fixture-process.js";
 
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
   return { ...actual, spawn: vi.fn(actual.spawn) };
+});
+
+vi.mock("node:module", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:module")>();
+  return { createRequire: vi.fn(actual.createRequire) };
+});
+
+it("passes an encoded file URL to --import, including native Windows drive paths", async ({
+  signal,
+}) => {
+  const directory = await mkdtemp(join(tmpdir(), "glassbox-process-loader-"));
+  try {
+    const loader = join(directory, "loader with spaces #100%.mjs");
+    const script = join(directory, "proof.mjs");
+    await writeFile(loader, "export {};");
+    await writeFile(script, "console.log('loaded');");
+    const { createRequire: actualCreateRequire } =
+      await vi.importActual<typeof import("node:module")>("node:module");
+    vi.mocked(createRequire).mockImplementationOnce((filename) => {
+      const require = actualCreateRequire(filename);
+      require.resolve = Object.assign(() => loader, {
+        paths: require.resolve.paths.bind(require.resolve),
+      });
+      return require;
+    });
+
+    expect(await runFixtureProcess(pathToFileURL(script), [], signal)).toBe("loaded\n");
+    const args = vi.mocked(spawn).mock.lastCall?.[1];
+    expect(args?.[0]).toBe("--import");
+    const importUrl = args?.[1];
+    expect(importUrl).toBe(pathToFileURL(loader).href);
+    expect(importUrl).toContain("file:///");
+    expect(importUrl).toContain("loader%20with%20spaces%20%23100%25.mjs");
+    expect(fileURLToPath(importUrl!)).toBe(loader);
+    if (process.platform === "win32") expect(importUrl).toMatch(/^file:\/\/\/[A-Za-z]:\//);
+  } finally {
+    await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  }
 });
 
 it("returns fixture output only after the child has exited", async ({ signal }) => {
