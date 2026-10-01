@@ -597,6 +597,18 @@ export function createAdvanceLongWorkActivity(
       const steps = await store.longWork.listSteps(taskId);
       let pending = false;
       for (const step of steps) {
+        if (["join", "timer_wait"].includes(step.kind) && step.status === "running") {
+          await store.longWork.transitionStep({
+            taskId,
+            stepId: step.id,
+            expectedVersion: step.version,
+            from: "running",
+            to: "cancelled",
+            origin: ORIGIN,
+            metadata: { reason: "no_op_cancellation", rollbackPerformed: false },
+          });
+          return { kind: "continue" };
+        }
         if (step.kind === "herdr_worker" && step.status === "cancelled") {
           const lease = await store.longWork.getQuarantinedLease(taskId, step.id);
           if (lease) {
@@ -678,6 +690,27 @@ export function createAdvanceLongWorkActivity(
     let workerPending = false;
     let childPending = false;
     for (const step of steps) {
+      // An overdue timer has no external side effect. Resume the second commit if
+      // the Activity stopped after recording its running state.
+      if (
+        step.kind === "timer_wait" &&
+        step.status === "running" &&
+        step.waitPolicy &&
+        waitKindMatchesStep(step, step.waitPolicy) &&
+        step.waitPolicy.dueAt &&
+        Date.parse(step.waitPolicy.dueAt) <= Date.now()
+      ) {
+        await store.longWork.transitionStep({
+          taskId,
+          stepId: step.id,
+          expectedVersion: step.version,
+          from: "running",
+          to: step.waitPolicy.overdue === "stale" ? "blocked" : "succeeded",
+          origin: ORIGIN,
+          metadata: { reason: "timer_overdue" },
+        });
+        return { kind: "continue" };
+      }
       if (step.kind === "herdr_worker" && step.status === "blocked") {
         if (await store.longWork.getQuarantinedLease(taskId, step.id)) {
           if (workers && (await workers.reconcileQuarantined(taskId, step)) === "settled")

@@ -2,7 +2,11 @@ import type { Row } from "@libsql/client";
 import type { HerdrAgentLifecycleState } from "@glassbox/contracts";
 import type { HerdrEvent, HerdrSessionSnapshot } from "./herdr-bridge.js";
 import { DomainDatabase, optionalString, stringColumn } from "../persistence/database.js";
-import { LongWorkStore, WorkerCandidateLimitError } from "./long-work-store.js";
+import {
+  LongWorkStore,
+  WorkerCandidateLimitError,
+  WorkerCandidateStaleError,
+} from "./long-work-store.js";
 import type { TaskStore } from "./task-store.js";
 
 export class WorkerArtifactCaptureError extends Error {
@@ -66,6 +70,8 @@ export class DurableWorkerObserver {
     private readonly captureCandidate?: (
       claim: DurableWorkerClaim,
       state: "done" | "idle",
+      observedAt: string,
+      observationSequence: number,
     ) => Promise<string>,
   ) {}
 
@@ -166,45 +172,23 @@ export class DurableWorkerObserver {
     evidencePrefix: string,
     observedAt: string,
   ): Promise<void> {
-    const completed =
-      state === "done" ||
-      (state === "idle" && claim.agentKind === "pi" && claim.lastObservedAgentState === "working");
-    if (!this.settleCompleted) {
-      await this.observeClaim(
-        claim,
-        state,
-        `${evidencePrefix}:${claim.bindingId}:${state}`,
-        observedAt,
-      );
-      return;
-    }
-    if (claim.lastObservedAgentState === state) {
-      if (completed)
-        await this.settle(
-          claim,
-          "review",
-          `${evidencePrefix}:${claim.bindingId}:${state}`,
-          state,
-          observedAt,
-        );
-      return;
-    }
-    if (completed) {
+    // The store preserves completion evidence separately from the latest display state.
+    // A management observation must not consume the Temporal owner's working-to-idle edge.
+    const observation = await this.observeClaim(
+      claim,
+      state,
+      `${evidencePrefix}:${claim.bindingId}:${state}`,
+      observedAt,
+    );
+    if (this.settleCompleted && observation?.completed && (state === "done" || state === "idle"))
       await this.settle(
         claim,
         "review",
         `${evidencePrefix}:${claim.bindingId}:${state}`,
         state,
         observedAt,
+        observation.sequence,
       );
-      return;
-    }
-    await this.observeClaim(
-      claim,
-      state,
-      `${evidencePrefix}:${claim.bindingId}:${state}`,
-      observedAt,
-    );
   }
 
   private async settleUnknown(
@@ -224,9 +208,9 @@ export class DurableWorkerObserver {
     state: HerdrAgentLifecycleState,
     evidenceRef: string,
     observedAt: string,
-  ): Promise<void> {
+  ): Promise<{ completed: boolean; sequence: number } | null> {
     try {
-      await this.longWork.observeClaimedWorkerState({
+      return await this.longWork.observeClaimedWorkerState({
         taskId: claim.taskId,
         stepId: claim.stepId,
         attemptId: claim.attemptId,
@@ -245,7 +229,7 @@ export class DurableWorkerObserver {
         error instanceof Error &&
         /(?:observation conflict|ownership conflict|status conflict)/iu.test(error.message)
       )
-        return;
+        return null;
       throw error;
     }
   }
@@ -256,6 +240,7 @@ export class DurableWorkerObserver {
     evidenceRef: string,
     observedAgentState?: "done" | "idle" | "unknown",
     observedAt?: string,
+    observationSequence?: number,
   ): Promise<void> {
     try {
       let outputRef: string | undefined;
@@ -265,10 +250,16 @@ export class DurableWorkerObserver {
         this.captureCandidate
       ) {
         try {
-          outputRef = await this.captureCandidate(claim, observedAgentState);
+          outputRef = await this.captureCandidate(
+            claim,
+            observedAgentState,
+            observedAt!,
+            observationSequence!,
+          );
         } catch (error) {
           if (
             !(error instanceof WorkerCandidateLimitError) &&
+            !(error instanceof WorkerCandidateStaleError) &&
             !(error instanceof WorkerArtifactCaptureError)
           )
             throw error;
@@ -276,7 +267,9 @@ export class DurableWorkerObserver {
           evidenceRef =
             error instanceof WorkerCandidateLimitError
               ? `worker-output-limit:${claim.bindingId}`
-              : `worker-artifact-unverified:${claim.bindingId}`;
+              : error instanceof WorkerCandidateStaleError
+                ? `worker-output-stale-rework-required:${claim.bindingId}`
+                : `worker-artifact-unverified:${claim.bindingId}`;
         }
       }
       await this.longWork.settleClaimedStep({
@@ -300,7 +293,7 @@ export class DurableWorkerObserver {
       // settleClaimedStep uses Step, Attempt, lease, owner, and version CAS checks.
       if (
         error instanceof Error &&
-        /(?:settlement conflict|ownership conflict)/iu.test(error.message)
+        /(?:settlement conflict|ownership conflict|observation conflict)/iu.test(error.message)
       )
         return;
       throw error;
