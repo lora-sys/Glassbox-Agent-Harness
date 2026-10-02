@@ -1464,7 +1464,9 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
     const providerStream = created.session.agent.streamFunction;
     const authorizeProviderContext = async () => {
       try {
-        await this.runContexts.get(created.session.sessionId)?.authorizeProviderContext?.();
+        const context = this.runContexts.get(created.session.sessionId);
+        await context?.authorizeSkillContext?.();
+        await context?.authorizeProviderContext?.();
       } catch {
         const active = this.sessions.get(created.session.sessionId);
         if (active) active.pendingSourceFailure = "source_context_revoked";

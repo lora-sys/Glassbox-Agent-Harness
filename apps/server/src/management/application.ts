@@ -1,5 +1,6 @@
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { AccessDeniedError } from "../auth/service.js";
 import { chmod, mkdtemp, rm } from "node:fs/promises";
 import type { IncomingMessage } from "node:http";
 import { tmpdir } from "node:os";
@@ -1267,7 +1268,13 @@ export class ManagementApplication {
         if (cleanups) await Promise.allSettled([...cleanups].map((cleanup) => cleanup()));
       },
       resolveSkillNames: async (context, profile) => {
-        if (!context.caller)
+        context.authorizeSkillContext = undefined;
+        if (
+          !context.caller ||
+          !context.runId ||
+          !context.conversationId ||
+          context.executionMode === "task_step_model"
+        )
           return resolveSkillVisibility({
             caller: null,
             isOwner: false,
@@ -1276,6 +1283,22 @@ export class ManagementApplication {
             availableSkills: [],
           });
         const caller = context.caller;
+        const request = {
+          caller,
+          runId: context.runId,
+          conversationId: context.conversationId,
+          resourceId: SKILL_CATALOG_RESOURCE,
+          action: SKILL_READ_ACTION,
+        };
+        const deniedCatalog = () => ({
+          names: [],
+          modelVisibleNames: [],
+          policy: { source: "catalog-denied" },
+        });
+        // A profile or group whitelist can narrow authority, never grant catalog access.
+        // Check before reading the catalog, including its names and descriptions.
+        const decision = await this.store.authorization.check(request);
+        if (decision.decision !== "ALLOW") return deniedCatalog();
         const isOwner = await this.store.identities.isOwner(caller.principalId);
         const group =
           caller.scope.chatType === "group" && !isOwner
@@ -1285,7 +1308,7 @@ export class ManagementApplication {
                 this.kitLoader.loadProfile("qq-group").enabledSkills,
               )
             : null;
-        return resolveSkillVisibility({
+        const visibility = resolveSkillVisibility({
           caller,
           isOwner,
           profile,
@@ -1298,6 +1321,31 @@ export class ManagementApplication {
             : null,
           availableSkills: this.kitLoader.availableSkills().map((skill) => skill.name),
         });
+        if (visibility.modelVisibleNames.length > 0) {
+          try {
+            // Bind the exposed directory to this Run so provider and delivery gates can
+            // recheck its authority after the session prompt has been constructed.
+            await this.store.authorization.authorizeReadResults([
+              { request, decisionId: decision.id, source: "content_source" },
+            ]);
+          } catch (error) {
+            if (error instanceof AccessDeniedError) return deniedCatalog();
+            throw error;
+          }
+          if (visibility.policy.source === "group-whitelist") {
+            const shown = [...visibility.modelVisibleNames];
+            context.authorizeSkillContext = async () => {
+              const current = this.groupRuntime.get(
+                caller.scope.connectionId,
+                caller.scope.chatId,
+                this.kitLoader.loadProfile("qq-group").enabledSkills,
+              );
+              if (shown.some((name) => !current.enabledSkills.includes(name)))
+                throw new Error("skill_policy_changed");
+            };
+          }
+        }
+        return visibility;
       },
       resolveToolNames: (context) => this.resolveRunToolNames(context),
       resolveToolCandidates: (context) => this.resolveRunToolCandidates(context),

@@ -742,6 +742,150 @@ describe("durable Run scheduling", () => {
     expect(send).not.toHaveBeenCalled();
   });
 
+  it("retries terminal persistence without re-executing or overtaking the completed Run", async () => {
+    const { store } = await fixture();
+    const first = await store.conversations.acceptIncoming(input("terminal-retry-head"));
+    const second = await store.conversations.acceptIncoming(input("terminal-retry-next"));
+    const claim = store.lifecycle.claimQueuedRun.bind(store.lifecycle);
+    let attempts = 0;
+    vi.spyOn(store.lifecycle, "claimQueuedRun").mockImplementation(async (...args) => {
+      const lease = await claim(...args);
+      if (args[1] !== first.run.id) return lease;
+      return {
+        ...lease,
+        settle: async (...outcome) => {
+          if (++attempts === 1) throw new Error("temporary terminal write failure");
+          return lease.settle(...outcome);
+        },
+      };
+    });
+    const executed: string[] = [];
+    const send = vi.fn(async () => ({ status: "sent" as const }));
+    const { instance } = service(
+      store,
+      {
+        supportsGroup: true,
+        execute: async (run) => {
+          executed.push(run.run.id);
+          return { status: "succeeded", text: "kept result" };
+        },
+      },
+      { send },
+    );
+    await instance.start();
+    await expect(instance.waitForRun(owner(), second.run.id)).resolves.toMatchObject({
+      status: "succeeded",
+    });
+    await instance.drain();
+    expect(executed).toEqual([first.run.id, second.run.id]);
+    expect(attempts).toBe(2);
+    expect((await instance.getRun(owner(), first.run.id)).resultText).toBe("kept result");
+    expect(send).toHaveBeenCalledTimes(2);
+  });
+
+  it("uses a committed terminal result if the settlement response was lost", async () => {
+    const { store } = await fixture();
+    const claim = store.lifecycle.claimQueuedRun.bind(store.lifecycle);
+    let attempts = 0;
+    vi.spyOn(store.lifecycle, "claimQueuedRun").mockImplementation(async (...args) => {
+      const lease = await claim(...args);
+      return {
+        ...lease,
+        settle: async (...outcome) => {
+          attempts++;
+          await lease.settle(...outcome);
+          throw new Error("settlement response lost");
+        },
+      };
+    });
+    const execute = vi.fn(async () => ({ status: "succeeded" as const, text: "durable result" }));
+    const send = vi.fn(async () => ({ status: "sent" as const }));
+    const { instance } = service(store, { supportsGroup: true, execute }, { send });
+    await instance.start();
+    const accepted = await instance.receive(input("lost-terminal-response"));
+    await instance.drain();
+    expect((await instance.getRun(owner(), accepted.run.id)).resultText).toBe("durable result");
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(attempts).toBe(1);
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["run:control", "conversation:read"])(
+    "rechecks %s withholding when a terminal commit loses its response",
+    async (action) => {
+      const { store, grants } = await fixture();
+      const claim = store.lifecycle.claimQueuedRun.bind(store.lifecycle);
+      vi.spyOn(store.lifecycle, "claimQueuedRun").mockImplementation(async (...args) => {
+        const lease = await claim(...args);
+        return {
+          ...lease,
+          settle: async (...outcome) => {
+            await lease.settle(...outcome);
+            await store.authorization.revoke(grants.get(scopeKey(group) + action)!);
+            throw new Error("settlement response lost");
+          },
+        };
+      });
+      const send = vi.fn(async () => ({ status: "sent" as const }));
+      const { instance } = service(
+        store,
+        {
+          supportsGroup: true,
+          execute: async () => ({ status: "succeeded", text: "withheld after revocation" }),
+        },
+        { send },
+      );
+      await instance.start();
+      await instance.receive(input("lost-response-revoked"));
+      await instance.drain();
+      expect(send).not.toHaveBeenCalled();
+    },
+  );
+
+  it("classifies malformed failure codes instead of retrying an invalid outcome forever", async () => {
+    const { store } = await fixture();
+    const { instance } = service(store, {
+      supportsGroup: true,
+      execute: async () => ({
+        status: "failed",
+        failureCode: "x".repeat(65) as ExecutionFailureCode,
+      }),
+    });
+    await instance.start();
+    const accepted = await instance.receive(input("invalid-failure-code"));
+    await instance.drain();
+    expect(await instance.getRun(owner(), accepted.run.id)).toMatchObject({
+      status: "unknown",
+      failureCode: "execution_threw",
+    });
+  });
+
+  it("can stop a terminal retry without executing or publishing again", async () => {
+    const { store } = await fixture();
+    const claim = store.lifecycle.claimQueuedRun.bind(store.lifecycle);
+    const attempted = deferred<void>();
+    vi.spyOn(store.lifecycle, "claimQueuedRun").mockImplementation(async (...args) => {
+      const lease = await claim(...args);
+      return {
+        ...lease,
+        settle: async () => {
+          attempted.resolve();
+          throw new Error("storage unavailable");
+        },
+      };
+    });
+    const execute = vi.fn(async () => ({ status: "succeeded" as const, text: "not durable" }));
+    const send = vi.fn(async () => ({ status: "sent" as const }));
+    const { instance } = service(store, { supportsGroup: true, execute }, { send });
+    await instance.start();
+    const accepted = await instance.receive(input("stop-terminal-retry"));
+    await attempted.promise;
+    await instance.stop({ wait: true });
+    expect((await instance.getRun(owner(), accepted.run.id)).status).toBe("running");
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(send).not.toHaveBeenCalled();
+  });
+
   it("captures learning only after Run authorization and records candidate identity without payload", async () => {
     const { store } = await fixture();
     const order: string[] = [];

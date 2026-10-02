@@ -44,6 +44,8 @@ export interface RunRoute {
 export type TerminalRunStatus = Exclude<RunStatus, "queued" | "running" | "cancelling">;
 export interface RunLease {
   run: RunRecord;
+  /** Inspect a possibly committed terminal fact without releasing unauthorized output. */
+  reconcileSettlement(): Promise<{ run: RunRecord; outputWithheld: boolean } | undefined>;
   settle(
     status: TerminalRunStatus,
     text?: string,
@@ -308,6 +310,39 @@ export class LifecycleStore {
     let active = true;
     return {
       run,
+      reconcileSettlement: async () => {
+        const settled = await this.db.transaction(async (tx) => {
+          const rows = await tx.execute({
+            sql: "SELECT status FROM runs WHERE id = ?",
+            args: [runId],
+          });
+          const status = rows.rows[0] && stringColumn(rows.rows[0], "status");
+          if (
+            !status ||
+            !["succeeded", "failed", "cancelled", "interrupted", "unknown"].includes(status)
+          )
+            return undefined;
+          for (const action of ["conversation:read", "run:create", "run:control"]) {
+            if ("denied" in (await authorizeRun(tx, caller, runId, action)))
+              return {
+                run: {
+                  ...run,
+                  status: status as TerminalRunStatus,
+                  resultText: null,
+                  failureCode: undefined,
+                },
+                outputWithheld: true,
+              };
+          }
+          const result = await tx.execute({
+            sql: "SELECT * FROM runs WHERE id = ?",
+            args: [runId],
+          });
+          return { run: runRecord(result.rows[0]!), outputWithheld: false };
+        });
+        if (settled) active = false;
+        return settled;
+      },
       settle: async (status, text, failureCode) => {
         if (!active) throw new Error("Run lease already settled");
         if (

@@ -2209,6 +2209,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       };
       const contextAllowed = async () => {
         try {
+          await context.authorizeSkillContext?.();
           await context.authorizeProviderContext!();
           return true;
         } catch {
@@ -2426,6 +2427,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       // A Tool can settle as a failure after cancellation, then the provider can emit a completed
       // turn containing only a refusal or fallback sentence. The Run's explicit cancel signal
       // remains authoritative even when the latest provider result is not `aborted`.
+      if (!(await contextAllowed())) return refusedContext;
       if (input.signal.aborted || result.status === "aborted") {
         return missingTool || missingEvidence
           ? { status: "cancelled", providerSessionId: binding.runtimeSessionId }
@@ -2600,6 +2602,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
           providerSessionId: binding.runtimeSessionId,
         };
       }
+      if (!(await contextAllowed())) return refusedContext;
       return result.status === "completed"
         ? {
             status: "succeeded",

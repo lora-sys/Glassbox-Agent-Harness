@@ -786,6 +786,11 @@ export class RunService {
         ...(result && isDeliverableText(result.text) ? { text: result.text } : {}),
         ...(result?.failureCode ? { failureCode: result.failureCode } : {}),
       };
+    if (
+      result.failureCode !== undefined &&
+      (typeof result.failureCode !== "string" || result.failureCode.length > 64)
+    )
+      result = { status: "unknown", failureCode: "execution_threw" };
     let status: TerminalRunStatus = result.status;
     if (status === "cancelled") {
       // Server shutdown may abort without a user cancellation transition.
@@ -795,17 +800,21 @@ export class RunService {
         status = "interrupted";
       }
     }
-    const finished = await active.lease.settle(status, result.text, result.failureCode);
+    const finished = await this.settleCompletedRun(active, status, result);
+    if (!finished || !this.started) return;
+    const settledStatus = finished.run.status as TerminalRunStatus;
     await this.emit({
       type: "run_finished",
       runId,
       conversationId: run.conversationId,
-      status,
+      status: settledStatus,
       outputWithheld: finished.outputWithheld,
-      ...(result.failureCode ? { failureCode: result.failureCode } : {}),
+      ...(result.failureCode && finished.run.failureCode === result.failureCode
+        ? { failureCode: result.failureCode }
+        : {}),
     });
     if (finished.outputWithheld) return;
-    if (run.source === "external" && status === "succeeded" && result.providerSessionId) {
+    if (run.source === "external" && settledStatus === "succeeded" && result.providerSessionId) {
       try {
         await this.options.store.conversations.setProviderSession(
           caller,
@@ -818,6 +827,34 @@ export class RunService {
       }
     }
     if (run.source === "external") await this.publishTerminal(caller, finished.run);
+  }
+
+  private async settleCompletedRun(
+    active: ActiveRun,
+    status: TerminalRunStatus,
+    result: ExecutionResult,
+  ): Promise<Awaited<ReturnType<RunLease["settle"]>> | undefined> {
+    const { runId } = active.route;
+    // Keep the classified result and conversation ownership until its terminal fact is
+    // durable. Retrying this write must never re-enter the executor or resend a Tool call.
+    for (;;) {
+      try {
+        return await active.lease!.settle(status, result.text, result.failureCode);
+      } catch {
+        this.report("dispatch_failed", runId);
+        if (!this.started) return;
+        // A committed write may have lost its response. Use only an authorized durable
+        // result, rather than overwriting it or repeatedly settling an exhausted lease.
+        try {
+          const observed = await active.lease!.reconcileSettlement();
+          if (observed) return observed;
+        } catch {
+          // A failed or denied diagnostic read cannot discard the pending outcome.
+        }
+        await new Promise<void>((resolve) => setTimeout(resolve, DISPATCH_SETTLEMENT_RETRY_MS));
+        if (!this.started) return;
+      }
+    }
   }
 
   private async publishTerminal(caller: CallerContext, record: RunRecord): Promise<void> {

@@ -13,7 +13,7 @@ import { PiRunExecutionAdapter } from "./run-adapter.js";
 import { AuthorizedQQSourceReader } from "../../retrieval/qq-source-reader.js";
 import { sourcePolicyFixture } from "../../learning/source-policy-test-fixture.js";
 
-it.each(["Memory", "new Tool"])(
+it.each(["Memory", "new Tool", "Skill policy", "Skill policy after answer"])(
   "stops an SDK-internal continuation when a %s source revokes during a Tool",
   async (mode) => {
     const f = await sourcePolicyFixture();
@@ -44,6 +44,7 @@ it.each(["Memory", "new Tool"])(
         maxTokens: 128,
       } as never;
       let providerCalls = 0;
+      let skillPolicyAllowed = true;
       let toolExecutions = 0;
       let firstPrompt = "";
       const events: PiNormalizedEvent[] = [];
@@ -54,13 +55,13 @@ it.each(["Memory", "new Tool"])(
         streamSimple: (_model: unknown, context: unknown) => {
           providerCalls++;
           if (providerCalls === 1) firstPrompt = JSON.stringify(context);
-          const stopReason = providerCalls === 1 ? "toolUse" : "stop";
+          const callTool = providerCalls === 1 && mode !== "Skill policy after answer";
+          const stopReason = callTool ? "toolUse" : "stop";
           const message = {
             role: "assistant",
-            content:
-              providerCalls === 1
-                ? [{ type: "toolCall", id: "revoke-1", name: "fixture_revoke", arguments: {} }]
-                : [{ type: "text", text: "Protected continuation answer" }],
+            content: callTool
+              ? [{ type: "toolCall", id: "revoke-1", name: "fixture_revoke", arguments: {} }]
+              : [{ type: "text", text: "Protected continuation answer" }],
             api: "openai-completions",
             provider: "fixture-provider",
             model: "source-model",
@@ -70,6 +71,7 @@ it.each(["Memory", "new Tool"])(
           } as never;
           const stream = createAssistantMessageEventStream();
           queueMicrotask(() => {
+            if (mode === "Skill policy after answer") skillPolicyAllowed = false;
             stream.push({ type: "start", partial: message });
             stream.push({ type: "done", reason: stopReason, message });
           });
@@ -107,13 +109,20 @@ it.each(["Memory", "new Tool"])(
                 expect(source.items[0]?.text).toBe("Protected orchard history fact.");
                 text = source.items[0]!.text;
               }
-              await f.policy(false);
+              if (mode === "Skill policy") skillPolicyAllowed = false;
+              else await f.policy(false);
               return { content: [{ type: "text", text }], details: {} };
             },
           },
         ],
         resolveToolNames: async () => ["fixture_revoke"],
-        resolveSkillNames: async () => ({ names: [] }),
+        resolveSkillNames: async (context) => {
+          if (mode.startsWith("Skill policy"))
+            context.authorizeSkillContext = async () => {
+              if (!skillPolicyAllowed) throw new Error("skill_policy_changed");
+            };
+          return { names: [] };
+        },
       });
       const executor = new PiRunExecutionAdapter(adapter, {
         learningStore: f.store.learning,
@@ -132,7 +141,7 @@ it.each(["Memory", "new Tool"])(
       });
       if (mode === "Memory") expect(firstPrompt).toContain("Protected orchard history fact.");
       else expect(firstPrompt).not.toContain("Protected orchard history fact.");
-      expect(toolExecutions).toBe(1);
+      expect(toolExecutions).toBe(mode === "Skill policy after answer" ? 0 : 1);
       expect(providerCalls).toBe(1);
       expect(result).toMatchObject({ status: "failed", failureCode: "gate_refused" });
       expect(result.text).not.toContain("Protected continuation answer");
@@ -140,11 +149,13 @@ it.each(["Memory", "new Tool"])(
       const failure = events.find(
         (event) => event.type === "turn_end" && event.data.stopReason === "error",
       );
-      expect(failure?.data.failure).toEqual({
-        origin: "glassbox",
-        category: "source_authorization",
-      });
-      expect(JSON.stringify(failure)).not.toContain("Protected orchard history fact.");
+      if (mode !== "Skill policy after answer")
+        expect(failure?.data.failure).toEqual({
+          origin: "glassbox",
+          category: "source_authorization",
+        });
+      else expect(failure).toBeUndefined();
+      expect(JSON.stringify(failure) ?? "").not.toContain("Protected orchard history fact.");
       expect(runtimeHealthOf(result)).toEqual({ state: "degraded", reasonCode: "gate_refused" });
     } finally {
       await adapter?.cleanup();
