@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "skills": {
+    "glassbox-ops": {
+      "source": ".",
+      "sourceType": "local",
+      "computedHash": "372615ef3e2da9dc021b4cb613e7c044ecb93705a9324d58689acdf120627b02"
+    }
+  }
+}
