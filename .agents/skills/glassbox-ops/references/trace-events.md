@@ -37,6 +37,12 @@ Raw Trace 每行是一条 JSONL 记录，信封固定为：
 | `tool_result`   | `data.{name, isError, failureCode, outputBytes, outputSha256, outputHead?, outputTruncated?, projection.{class, mode, beforeTokens, afterTokens, policyVersion}}` | `isError: true` 时看 `failureCode`。`outputHead` 是返回体前 512 字节（够看 "Schema validation failed" 这类线索），超出部分只有 `outputBytes`/`outputSha256`；受保护工具连 `outputHead` 都不落。`projection` 记录上下文裁剪策略                    |
 | `tool_evidence` | `phase`（`required`=规划期 / `resolved`=执行后）；`required[]`/`resolutions[]`                                                                                    | Glassbox 侧的工具面证据：需要哪些工具、最终怎么解析                                                                                                                                                                                               |
 
+## 检索 / Web
+
+| 类型          | 关键字段                                                                                                                                                                             | 读法                                                                                                                         |
+| :------------ | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------- |
+| `web_search`  | `status`（如 `unavailable`）、`providerStatus`（如 `failed`）、`sourceIds[]`、`urls[]`、`partial`、`truncated`、`providerOrigins[]`、`retrievedAt`、`searchMode`（如 `browser_fallback`）、`queryVariantCount`、`queryDigest` | 一次 web 检索的结果或失败。查询正文不落盘，只有 `queryDigest`（sha 前缀）；失败时不带 provider 错误文本，定位看 `providerStatus` + 服务日志 |
+
 ## 路由与运行时（P5 可观测性）
 
 | 类型                         | 关键字段                                                                                                                                                                     | 读法                                                                                                                                      |
