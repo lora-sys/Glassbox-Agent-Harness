@@ -4,7 +4,6 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   attachWebSocketServer,
   broadcastEvent,
-  broadcastApproval,
   broadcastDerivedState,
   broadcastSessionEnded,
 } from "./server.js";
@@ -150,38 +149,6 @@ describe("ws: functional broadcast", () => {
         },
         { type: "sessionEnded", sessionId },
       ]);
-    } finally {
-      await cleanupServer(ctx);
-    }
-  });
-
-  it("keeps subscribers for later turns and their approvals", async () => {
-    const ctx = await spawnWSServer();
-    try {
-      const sessionId = "multi-turn-fixture";
-      const client = await connectWS(ctx.port, sessionId);
-      const ended = client.waitFor((message) => message.type === "sessionEnded");
-      broadcastSessionEnded(sessionId);
-      await ended;
-      const approval = client.waitFor((message) => message.type === "approval");
-      broadcastApproval(sessionId, {
-        itemId: "second-turn-approval",
-        turnId: "turn-2",
-        threadId: "thread",
-        startedAtMs: 1,
-        reason: "review edit",
-        grantRoot: null,
-      });
-      await approval;
-      const state = client.waitFor((message) => message.type === "derivedState");
-      broadcastDerivedState(sessionId, { turnId: "turn-2" });
-      await state;
-      expect(client.messages).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({ type: "approval", itemId: "second-turn-approval" }),
-          expect.objectContaining({ type: "derivedState", derivedState: { turnId: "turn-2" } }),
-        ]),
-      );
     } finally {
       await cleanupServer(ctx);
     }

@@ -724,7 +724,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             sessionId,
             replayResult.state as unknown as Record<string, unknown>,
           );
-          if (result.turnStatus !== "inProgress") broadcastSessionEnded(sessionId, turn.id);
+          if (result.turnStatus !== "inProgress") broadcastSessionEnded(sessionId);
           // Clear active turn once it ends
           settleSessionTurn(sessionId, turn.id, result.turnStatus);
         })
@@ -911,7 +911,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             sessionId,
             replayResult.state as unknown as Record<string, unknown>,
           );
-          if (result.turnStatus !== "inProgress") broadcastSessionEnded(sessionId, turn.id);
+          if (result.turnStatus !== "inProgress") broadcastSessionEnded(sessionId);
           settleSessionTurn(sessionId, turn.id, result.turnStatus);
         })
         .catch((err) => {
@@ -1505,7 +1505,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             sessionId,
             replayResult.state as unknown as Record<string, unknown>,
           );
-          if (result.turnStatus !== "inProgress") broadcastSessionEnded(sessionId, turn.id);
+          if (result.turnStatus !== "inProgress") broadcastSessionEnded(sessionId);
           settleSessionTurn(sessionId, turn.id, result.turnStatus);
         })
         .catch((err) => {

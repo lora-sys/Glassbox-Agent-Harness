@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { Tldraw, useEditor } from "tldraw";
-import { applyWorkbenchTurnEvent, type WorkbenchTurnState } from "../management/turn-state";
 import { toRichText } from "@tldraw/tlschema";
 import "tldraw/tldraw.css";
 
@@ -344,9 +343,6 @@ function App() {
   const editorRef = useRef<any>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const socketGenerationRef = useRef(0);
-  const turnStateRef = useRef<WorkbenchTurnState>({ turnId: null, running: false });
-  const continuationSerialRef = useRef(0);
-  const continuationRef = useRef<{ id: number; previousTurnId: string | null } | null>(null);
 
   const [connected, setConnected] = useState(false);
   const [running, setRunning] = useState(false);
@@ -441,30 +437,10 @@ function App() {
     setLog((prev) => [...prev.slice(-50), new Date().toLocaleTimeString() + " " + msg]);
   }, []);
 
-  const acceptTurnEvent = useCallback(
-    (event: { method?: unknown; params?: unknown }, response = false) => {
-      const next = applyWorkbenchTurnEvent(
-        turnStateRef.current,
-        event,
-        response ? undefined : continuationRef.current?.previousTurnId,
-      );
-      if (next !== turnStateRef.current) {
-        turnStateRef.current = next;
-        setRunning(next.running);
-      }
-    },
-    [],
-  );
-
   const closeCurrentSocket = useCallback(() => {
     const ws = wsRef.current;
     wsRef.current = null;
     retireWebSocket(ws);
-    continuationSerialRef.current++;
-    continuationRef.current = null;
-    turnStateRef.current = { turnId: null, running: false };
-    setPendingDecisions([]);
-    setIsApplying(false);
     setConnected(false);
   }, []);
 
@@ -596,7 +572,7 @@ function App() {
     }
 
     pendingDecisions.forEach(function (dec: any, _idx: number) {
-      var shapeId = "shape:decision-" + dec.itemId;
+      var shapeId = "shape:decision-" + dec.itemId.slice(0, 8);
       var reason = (dec.reason || "File change").slice(0, 60);
       var text = "DECISION NEEDED\n[fileChange] " + reason + "\nClick to Approve or Decline";
       var shape = {
@@ -744,7 +720,6 @@ function App() {
           } catch {
             return;
           }
-          if (msg.type === "event") acceptTurnEvent(msg.event ?? {});
           switch (msg.type) {
             case "subscribed":
               addLog("Resubscribed");
@@ -752,40 +727,10 @@ function App() {
             case "error":
               addLog("WS: " + msg.message);
               break;
-            case "approval": {
-              // S8: file-change decision request from codex
-              var approval = msg;
-              setPendingDecisions(function (prev) {
-                // Avoid duplicates by itemId
-                if (
-                  prev.some(function (d) {
-                    return d.itemId === approval.itemId;
-                  })
-                )
-                  return prev;
-                return prev.concat([
-                  {
-                    itemId: approval.itemId,
-                    turnId: approval.turnId || "",
-                    threadId: approval.threadId || "",
-                    reason: approval.reason,
-                    grantRoot: approval.grantRoot,
-                    startedAtMs: approval.startedAtMs,
-                  },
-                ]);
-              });
-              addLog(
-                "Decision needed: " +
-                  (approval.reason || "file change") +
-                  " [" +
-                  approval.itemId +
-                  "]",
-              );
-              break;
-            }
             case "sessionEnded":
-              // Tagged turn identity also protects a newer turn from a late old notification.
-              acceptTurnEvent({ method: "turn/completed", params: { turnId: msg.turnId } });
+              ws.close();
+              setConnected(false);
+              setRunning(false);
               break;
             case "event": {
               var method = msg.event?.method;
@@ -815,11 +760,6 @@ function App() {
         ws.onclose = function () {
           if (wsRef.current !== ws || currentSidRef.current !== sessionId) return;
           wsRef.current = null;
-          continuationSerialRef.current++;
-          continuationRef.current = null;
-          turnStateRef.current = { turnId: null, running: false };
-          setPendingDecisions([]);
-          setIsApplying(false);
           setConnected(false);
           setRunning(false);
           addLog("WS closed");
@@ -828,7 +768,7 @@ function App() {
         addLog("WS: " + (err?.message || String(err)));
       }
     },
-    [addLog, closeCurrentSocket, localState, acceptTurnEvent],
+    [addLog, closeCurrentSocket, localState],
   );
 
   // Run test
@@ -903,7 +843,6 @@ function App() {
           } catch {
             return;
           }
-          if (msg.type === "event") acceptTurnEvent(msg.event ?? {});
           switch (msg.type) {
             case "subscribed":
               addLog("Subscribed");
@@ -911,40 +850,10 @@ function App() {
             case "error":
               addLog("WS: " + msg.message);
               break;
-            case "approval": {
-              // S8: file-change decision request from codex
-              var approval = msg;
-              setPendingDecisions(function (prev) {
-                // Avoid duplicates by itemId
-                if (
-                  prev.some(function (d) {
-                    return d.itemId === approval.itemId;
-                  })
-                )
-                  return prev;
-                return prev.concat([
-                  {
-                    itemId: approval.itemId,
-                    turnId: approval.turnId || "",
-                    threadId: approval.threadId || "",
-                    reason: approval.reason,
-                    grantRoot: approval.grantRoot,
-                    startedAtMs: approval.startedAtMs,
-                  },
-                ]);
-              });
-              addLog(
-                "Decision needed: " +
-                  (approval.reason || "file change") +
-                  " [" +
-                  approval.itemId +
-                  "]",
-              );
-              break;
-            }
             case "sessionEnded":
-              // Tagged turn identity also protects a newer turn from a late old notification.
-              acceptTurnEvent({ method: "turn/completed", params: { turnId: msg.turnId } });
+              ws.close();
+              setConnected(false);
+              setRunning(false);
               break;
             case "derivedState":
               addLog("Derived -> canvas");
@@ -958,11 +867,6 @@ function App() {
         ws.onclose = function () {
           if (wsRef.current !== ws || currentSidRef.current !== sessionId) return;
           wsRef.current = null;
-          continuationSerialRef.current++;
-          continuationRef.current = null;
-          turnStateRef.current = { turnId: null, running: false };
-          setPendingDecisions([]);
-          setIsApplying(false);
           setConnected(false);
           setRunning(false);
           addLog("WS closed");
@@ -1037,165 +941,83 @@ function App() {
   var handleSteer = useCallback(
     async function steer() {
       if (!steerText.trim() || !currentSessionId) return;
-      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-        addLog("Session disconnected; reload this session before continuing");
-        return;
-      }
       addLog('Steering: "' + steerText.slice(0, 40) + '"');
-      if (continuationRef.current) {
-        addLog("A continuation request is already pending");
-        return;
-      }
-      const sessionId = currentSessionId;
-      const generation = socketGenerationRef.current;
-      const requestId = ++continuationSerialRef.current;
-      continuationRef.current = { id: requestId, previousTurnId: turnStateRef.current.turnId };
-      turnStateRef.current = { ...turnStateRef.current, running: true };
-      const isCurrent = () =>
-        currentSidRef.current === sessionId &&
-        socketGenerationRef.current === generation &&
-        continuationRef.current?.id === requestId;
       setRunning(true);
       try {
         var res = await fetch("/api/steer", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            sessionId,
+            sessionId: currentSessionId,
             instruction: steerText.trim(),
           }),
         });
-        if (!isCurrent()) return;
         if (!res.ok) {
           var errData: any = await res.json();
           throw new Error(errData.error || "HTTP " + res.status);
         }
         var data: any = await res.json();
-        if (!isCurrent()) return;
-        if (data.turnStatus && data.turnStatus !== "inProgress")
-          acceptTurnEvent({ method: "turn/completed", params: { turnId: data.turnId } }, true);
-        setSteerText("");
         addLog("Steered, turn " + data.turnId?.slice(0, 8) + " started");
         if (data.derivedState) setLocalState(data.derivedState);
       } catch (err: any) {
-        if (!isCurrent()) return;
-        turnStateRef.current = {
-          ...turnStateRef.current,
-          running: Boolean(turnStateRef.current.turnId),
-        };
-        setRunning(turnStateRef.current.running);
         addLog("Steer error: " + (err?.message || String(err)));
-      } finally {
-        if (isCurrent()) continuationRef.current = null;
       }
+      setSteerText("");
     },
-    [currentSessionId, steerText, addLog, acceptTurnEvent],
+    [currentSessionId, steerText, addLog],
   );
 
   // S7: Send edited task — starts a new turn on the same thread
   var handleSendTask = useCallback(
     async function sendTask(taskText: string) {
       if (!currentSessionId) return;
-      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-        addLog("Session disconnected; reload this session before continuing");
-        return;
-      }
-      if (continuationRef.current) {
-        addLog("A continuation request is already pending");
-        return;
-      }
-      const sessionId = currentSessionId;
-      const generation = socketGenerationRef.current;
-      const requestId = ++continuationSerialRef.current;
-      continuationRef.current = { id: requestId, previousTurnId: turnStateRef.current.turnId };
-      turnStateRef.current = { ...turnStateRef.current, running: true };
-      const isCurrent = () =>
-        currentSidRef.current === sessionId &&
-        socketGenerationRef.current === generation &&
-        continuationRef.current?.id === requestId;
-      setRunning(true);
       setIsApplying(true);
       try {
         var res = await fetch("/api/send-task", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            sessionId,
+            sessionId: currentSessionId,
             task: taskText,
           }),
         });
-        if (!isCurrent()) return;
         if (!res.ok) {
           var errData: any = await res.json();
           throw new Error(errData.error || "HTTP " + res.status);
         }
         var data: any = await res.json();
-        if (!isCurrent()) return;
-        if (data.turnStatus && data.turnStatus !== "inProgress")
-          acceptTurnEvent({ method: "turn/completed", params: { turnId: data.turnId } }, true);
         setDraftTask(null);
         addLog("Sent: new turn " + data.turnId?.slice(0, 8) + " with edited task");
         if (data.derivedState) setLocalState(data.derivedState);
       } catch (err: any) {
-        if (!isCurrent()) return;
-        turnStateRef.current = {
-          ...turnStateRef.current,
-          running: Boolean(turnStateRef.current.turnId),
-        };
-        setRunning(turnStateRef.current.running);
         addLog("Send error: " + (err?.message || String(err)));
       } finally {
-        if (isCurrent()) {
-          continuationRef.current = null;
-          setIsApplying(false);
-        }
+        setIsApplying(false);
       }
     },
-    [currentSessionId, addLog, acceptTurnEvent],
+    [currentSessionId, addLog],
   );
 
   // P2.5: Apply edited system instruction — calls /edit-input and starts a new turn
   var handleApplySystemInstruction = useCallback(
     async function applyInstruction(value: string) {
       if (!currentSessionId) return;
-      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-        addLog("Session disconnected; reload this session before continuing");
-        return;
-      }
-      if (continuationRef.current) {
-        addLog("A continuation request is already pending");
-        return;
-      }
-      const sessionId = currentSessionId;
-      const generation = socketGenerationRef.current;
-      const requestId = ++continuationSerialRef.current;
-      continuationRef.current = { id: requestId, previousTurnId: turnStateRef.current.turnId };
-      turnStateRef.current = { ...turnStateRef.current, running: true };
-      const isCurrent = () =>
-        currentSidRef.current === sessionId &&
-        socketGenerationRef.current === generation &&
-        continuationRef.current?.id === requestId;
-      setRunning(true);
       setIsApplying(true);
       try {
         var res = await fetch("/api/edit-input", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            sessionId,
+            sessionId: currentSessionId,
             inputKind: "systemInstruction",
             value: value,
           }),
         });
-        if (!isCurrent()) return;
         if (!res.ok) {
           var errData: any = await res.json();
           throw new Error(errData.error || "HTTP " + res.status);
         }
         var data: any = await res.json();
-        if (!isCurrent()) return;
-        if (data.turnStatus && data.turnStatus !== "inProgress")
-          acceptTurnEvent({ method: "turn/completed", params: { turnId: data.turnId } }, true);
         setDraftSystemInstruction(null);
         addLog(
           "System instruction applied: " +
@@ -1206,21 +1028,12 @@ function App() {
         );
         if (data.derivedState) setLocalState(data.derivedState);
       } catch (err: any) {
-        if (!isCurrent()) return;
-        turnStateRef.current = {
-          ...turnStateRef.current,
-          running: Boolean(turnStateRef.current.turnId),
-        };
-        setRunning(turnStateRef.current.running);
         addLog("Edit-input error: " + (err?.message || String(err)));
       } finally {
-        if (isCurrent()) {
-          continuationRef.current = null;
-          setIsApplying(false);
-        }
+        setIsApplying(false);
       }
     },
-    [currentSessionId, addLog, acceptTurnEvent],
+    [currentSessionId, addLog],
   );
 
   // S8: Run demo task — starts a session against the controlled demo workspace
@@ -1294,13 +1107,17 @@ function App() {
           } catch {
             return;
           }
-          if (msg.type === "event") acceptTurnEvent(msg.event ?? {});
           switch (msg.type) {
             case "subscribed":
               addLog("Subscribed");
               break;
             case "error":
               addLog("WS: " + msg.message);
+              break;
+            case "sessionEnded":
+              ws.close();
+              setConnected(false);
+              setRunning(false);
               break;
             case "approval": {
               // S8: file-change decision request from codex
@@ -1333,10 +1150,6 @@ function App() {
               );
               break;
             }
-            case "sessionEnded":
-              // Tagged turn identity also protects a newer turn from a late old notification.
-              acceptTurnEvent({ method: "turn/completed", params: { turnId: msg.turnId } });
-              break;
             case "derivedState":
               setLocalState(msg.derivedState ?? {});
               break;
@@ -1362,11 +1175,6 @@ function App() {
         ws.onclose = function () {
           if (wsRef.current !== ws || currentSidRef.current !== sessionId) return;
           wsRef.current = null;
-          continuationSerialRef.current++;
-          continuationRef.current = null;
-          turnStateRef.current = { turnId: null, running: false };
-          setPendingDecisions([]);
-          setIsApplying(false);
           setConnected(false);
           setRunning(false);
           addLog("WS closed");
@@ -1385,33 +1193,25 @@ function App() {
       permissionMode,
       addLog,
       closeCurrentSocket,
-      acceptTurnEvent,
     ],
   );
 
   // S8: Handle user Approve/Decline decision for a file-change request
   var handleDecide = useCallback(
     async function decide(itemId: string, approved: boolean) {
-      if (!currentSessionId || !pendingDecisions.some((decision) => decision.itemId === itemId))
-        return;
-      const sessionId = currentSessionId;
-      const generation = socketGenerationRef.current;
-      const isCurrent = () =>
-        currentSidRef.current === sessionId && socketGenerationRef.current === generation;
+      if (!currentSessionId) return;
       addLog(approved ? "Approving " + itemId : "Declining " + itemId);
       try {
         var res = await fetch("/api/decide", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ sessionId, itemId: itemId, approved: approved }),
+          body: JSON.stringify({ sessionId: currentSessionId, itemId: itemId, approved: approved }),
         });
-        if (!isCurrent()) return;
         if (!res.ok) {
           var errData: any = await res.json();
           throw new Error(errData.error || "HTTP " + res.status);
         }
         var data: any = await res.json();
-        if (!isCurrent()) return;
         // Remove from pending decisions locally
         setPendingDecisions(function (prev) {
           return prev.filter(function (d) {
@@ -1421,13 +1221,12 @@ function App() {
         if (data.derivedState) setLocalState(data.derivedState);
         addLog("Decision recorded: " + (approved ? "approved" : "declined"));
       } catch (err: any) {
-        if (!isCurrent()) return;
         addLog("Decide error: " + (err?.message || String(err)));
       }
+      handleDecideRef.current = handleDecide;
     },
-    [currentSessionId, addLog, pendingDecisions],
+    [currentSessionId, addLog],
   );
-  handleDecideRef.current = handleDecide;
   var sessionInputState = useState("");
   var sessionInput = sessionInputState[0];
   var setSessionInput = sessionInputState[1];
