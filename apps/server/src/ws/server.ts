@@ -42,6 +42,7 @@ export interface ErrorPayload {
 export interface SessionEndedPayload {
   type: "sessionEnded";
   sessionId: string;
+  turnId?: string;
 }
 
 export interface ApprovalPushPayload {
@@ -140,13 +141,18 @@ export function broadcastApproval(sessionId: string, approval: Record<string, un
 }
 
 /**
- * Push a sessionEnded notification and clean up subscribers.
+ * Notify that the current turn ended. A Workbench session can run further turns;
+ * subscriptions live until the socket closes, not until this turn completes.
  */
-export function broadcastSessionEnded(sessionId: string): void {
+export function broadcastSessionEnded(sessionId: string, turnId?: string): void {
   const room = subscribers.get(sessionId);
   if (!room || room.size === 0) return;
 
-  const payload: SessionEndedPayload = { type: "sessionEnded", sessionId };
+  const payload: SessionEndedPayload = {
+    type: "sessionEnded",
+    sessionId,
+    ...(turnId ? { turnId } : {}),
+  };
   const data = JSON.stringify(payload);
 
   for (const sub of room) {
@@ -154,7 +160,6 @@ export function broadcastSessionEnded(sessionId: string): void {
       sub.ws.send(data);
     }
   }
-  subscribers.delete(sessionId);
 }
 
 // ---------------------------------------------------------------------------

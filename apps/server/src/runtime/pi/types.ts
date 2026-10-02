@@ -91,6 +91,8 @@ import type { RequiredEvidence } from "./required-evidence.js";
 export interface PiRunContext {
   /** Server-owned authorization callback; never populated from model or Tool input. */
   authorizeProviderContext?: () => Promise<void>;
+  /** Rechecks mutable server-owned policy for Skill metadata already in the prompt. */
+  authorizeSkillContext?: () => Promise<void>;
   /** Trusted server execution mode, not inferred from prompt text. */
   executionMode?: "task_step_model";
   caller?: CallerContext;
