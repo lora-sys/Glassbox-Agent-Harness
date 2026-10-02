@@ -482,3 +482,31 @@ large-scale worker scheduling
 ```
 
 Do not build those mechanisms in P3 unless a current completion-gate requirement proves they are necessary.
+
+### Unconfirmed direct delivery attention
+
+Direct Run delivery preserves execution and transport as separate facts. A successful Run
+may have an `unknown` delivery: a timeout, disconnect, or lost acknowledgement does not
+prove that QQ did not receive the message. Such deliveries are never automatically replayed
+or rewritten as confirmed failure. `RunService.retryDelivery` accepts only confirmed
+`failed` deliveries and rechecks current grants and protected content sources.
+
+The direct-delivery settlement transaction creates one durable `delivery_failed` attention
+item per failed or unconfirmed delivery. Its fixed summary distinguishes failure from
+uncertainty and includes bounded reason codes and Run/delivery identifiers, never the
+message payload or provider error text. Authenticated local `GET /manage/attention` exposes
+these items; model-facing scoped Ops snapshots do not acquire this non-Task information.
+The final `delivery_changed` Trace event carries the same fixed diagnostic reason. Task
+notification Trace events also preserve their transport reason, without creating a new
+notification attention workflow.
+
+Startup recovery marks interrupted sends unknown and backfills at most 1,000 missing
+attention items per start, prioritizing interrupted sends. Larger legacy backlogs need
+additional recovery passes. Existing items, including acknowledged items, are not reopened
+by recovery. A new explicit failed delivery attempt can reopen its item; only a confirmed
+sent outcome resolves it automatically. Acknowledging attention does not establish delivery.
+Unknown delivery currently requires manual inspection of provider or recipient evidence:
+there is no receipt-reconciliation action, safe unknown retry API, or guarantee that a new
+send would not duplicate an already received message. This addresses visibility and reason
+loss in Issue #110; automatic retry of unknown remains unsupported without deduplication or
+conclusive post-send evidence.

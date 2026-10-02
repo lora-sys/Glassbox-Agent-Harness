@@ -1,3 +1,4 @@
+import type { DeliveryReason } from "../../delivery/outcome.js";
 import type { DeliveryRecord } from "../../conversation/lifecycle.js";
 import type {
   ConversationRecord,
@@ -133,7 +134,7 @@ export interface RunExecutionAdapter {
 
 export type SendOutcome =
   | { status: "sent"; externalId?: string }
-  | { status: "failed" | "unknown" };
+  | { status: "failed" | "unknown"; reason?: DeliveryReason };
 export interface RunTransport {
   send(input: {
     destination: TrustedChannelScope;
@@ -189,6 +190,7 @@ export type RunServiceEvent =
       runId: string;
       deliveryId: string;
       status: DeliveryRecord["status"];
+      reason?: DeliveryReason;
       /** Channel-native id of the sent message, when the transport confirmed one. */
       externalId?: string;
     }
@@ -198,6 +200,7 @@ export type RunServiceEvent =
       taskId: string;
       notificationId: string;
       status: "sending" | "sent" | "failed" | "unknown";
+      reason?: DeliveryReason;
     }
   | {
       type: "delivery_blocked";

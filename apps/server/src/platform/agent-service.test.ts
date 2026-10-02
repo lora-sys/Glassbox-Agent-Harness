@@ -329,18 +329,21 @@ describe("service commands with unverified Linux ownership", () => {
   });
 
   it("refuses an older rollback after a failed candidate upgrades the shared schema", async () => {
+    const candidate = resolve("/srv/candidate");
+    const previousSchema = join(baseEntry.cwd, "apps/server/src/persistence/schema.ts");
+    const candidateSchema = join(candidate, "apps/server/src/persistence/schema.ts");
     io.stat.mockResolvedValue({ isFile: () => true, isDirectory: () => true });
     const fixtureRead = io.readFile.getMockImplementation()!;
     io.readFile.mockImplementation(async (path: string) => {
-      if (path.endsWith("persistence/schema.ts"))
-        return `export const CURRENT_SCHEMA_VERSION = ${path.startsWith(baseEntry.cwd) ? 25 : 28};`;
+      if (path === previousSchema) return "export const CURRENT_SCHEMA_VERSION = 25;";
+      if (path === candidateSchema) return "export const CURRENT_SCHEMA_VERSION = 28;";
       return fixtureRead(path);
     });
     io.spawn.mockImplementation(() => {
       io.databaseVersion = 28;
       throw new Error("candidate failed after migration");
     });
-    const error = await runServiceCommand("switch", ["--checkout", "/srv/candidate"]).catch(
+    const error = await runServiceCommand("switch", ["--checkout", candidate]).catch(
       (error: unknown) => error,
     );
     expect(error).toBeInstanceOf(AggregateError);
@@ -350,6 +353,8 @@ describe("service commands with unverified Linux ownership", () => {
     ]);
     expect(io.spawn).toHaveBeenCalledOnce();
     expect(io.databaseVersion).toBe(28);
+    expect(io.readFile).toHaveBeenCalledWith(candidateSchema, "utf8");
+    expect(io.readFile).toHaveBeenCalledWith(previousSchema, "utf8");
     expect(state).toEqual([]);
     expect(io.rm).not.toHaveBeenCalled();
   });

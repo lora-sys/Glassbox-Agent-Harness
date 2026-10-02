@@ -1,3 +1,5 @@
+import { backfillDeliveryAttention, recordDeliveryAttention } from "../delivery/attention.js";
+import type { DeliveryReason } from "../delivery/outcome.js";
 import { readPolicyCondition } from "../auth/policy-condition.js";
 import { sourceClassification } from "../auth/source-dependencies.js";
 import { randomUUID } from "node:crypto";
@@ -51,7 +53,11 @@ export interface RunLease {
 }
 export interface DeliveryLease {
   delivery: DeliveryRecord;
-  settle(status: "sent" | "failed" | "unknown", externalId?: string): Promise<void>;
+  settle(
+    status: "sent" | "failed" | "unknown",
+    externalId?: string,
+    reason?: DeliveryReason,
+  ): Promise<void>;
 }
 
 function deliveryRecord(row: Row, runId: string): DeliveryRecord {
@@ -385,7 +391,7 @@ export class LifecycleStore {
     let active = true;
     return {
       delivery,
-      settle: async (status, externalId) => {
+      settle: async (status, externalId, reason) => {
         if (!active) throw new Error("Delivery lease already settled");
         if (!["sent", "failed", "unknown"].includes(status))
           throw new Error("Invalid delivery outcome");
@@ -398,6 +404,7 @@ export class LifecycleStore {
               args: [status, externalId ?? null, new Date().toISOString(), deliveryId, runId],
             });
             if (result.rowsAffected !== 1) throw new Error("Delivery state changed");
+            await recordDeliveryAttention(tx, runId, deliveryId, status, reason);
           });
         } catch (error) {
           active = true;
@@ -510,6 +517,7 @@ export class LifecycleStore {
       const running = await tx.execute("SELECT id FROM runs WHERE status = 'running'");
       const cancelling = await tx.execute("SELECT id FROM runs WHERE status = 'cancelling'");
       const sending = await tx.execute("SELECT id FROM deliveries WHERE status = 'sending'");
+      await backfillDeliveryAttention(tx);
       const now = new Date().toISOString();
       await tx.batch([
         {
@@ -632,6 +640,8 @@ export class LifecycleStore {
           ],
         });
         if (result.rowsAffected !== 1) throw new Error("Delivery state changed");
+        if (next === "sent" || next === "failed" || next === "unknown")
+          await recordDeliveryAttention(tx, runId, deliveryId, next);
         return { value: undefined };
       }),
     );
@@ -651,7 +661,7 @@ export class LifecycleStore {
         // deliveries are created back-to-back and can share one created_at millisecond,
         // and send order must stay deterministic across platforms.
         const rows = await tx.execute({
-          sql: "SELECT *, rowid AS delivery_sequence FROM deliveries WHERE run_id = ? AND (created_at, rowid) > (?, CAST(? AS INTEGER)) ORDER BY created_at, delivery_sequence LIMIT ?",
+          sql: "SELECT *, CAST(rowid AS TEXT) AS delivery_sequence FROM deliveries WHERE run_id = ? AND (created_at, rowid) > (?, CAST(? AS INTEGER)) ORDER BY created_at, rowid LIMIT ?",
           args: [runId, page.afterTime, page.afterId, page.limit + 1],
         });
         return {

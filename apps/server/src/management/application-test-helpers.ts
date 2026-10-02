@@ -255,6 +255,7 @@ export function createApplicationFixtureScope() {
     const actions = new Inbox<Action>();
     const actionLog: Action[] = [];
     const sockets = new Inbox<WebSocket>();
+    let activeSocket: WebSocket;
     const calls: ExecutionInput[] = [];
     const started = new Inbox<ExecutionInput>();
     // How many `get_group_info` reads the peer has actually been asked for. Counted rather than
@@ -269,6 +270,7 @@ export function createApplicationFixtureScope() {
     // that wants a *later* observation to fail must first let the earlier one succeed.
     let groupInfoFails = false;
     server.on("connection", (socket) => {
+      activeSocket = socket;
       sockets.put(socket);
       socket.on("message", (raw) => {
         const bytes = Array.isArray(raw)
@@ -366,7 +368,7 @@ export function createApplicationFixtureScope() {
       }),
     );
     await timed("fixture-connect", () => app.connectChannel("fixture"));
-    const socket = await sockets.take();
+    await sockets.take();
     const send = (
       id: number,
       text: string,
@@ -374,9 +376,11 @@ export function createApplicationFixtureScope() {
       senderId = 10002,
       groupId = 10003,
       role: "owner" | "admin" | "member" | null = "member",
+      untrustedRouting?: { channelDefaultExecutionRef: string },
     ) =>
-      socket.send(
+      activeSocket.send(
         JSON.stringify({
+          ...untrustedRouting,
           post_type: "message",
           self_id: 10001,
           user_id: senderId,

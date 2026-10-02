@@ -792,3 +792,56 @@ describe("Management model routing wrapper", () => {
     });
   });
 });
+
+it.each(["alternate", "missing"])(
+  "recovers persisted preference %s through trusted QQ ingress",
+  async (preferred) => {
+    const urls: string[] = [];
+    stubModelFetch(urls);
+    const f = await fixture(failedExecutor());
+    await configureModelRoute(f.app, [
+      { id: "origin", contextWindowTokens: 32_768, maxOutputTokens: 4_096 },
+      {
+        id: "alternate",
+        routingAvailable: false,
+        contextWindowTokens: 32_768,
+        maxOutputTokens: 4_096,
+      },
+    ]);
+    await f.app.channels.setModelOverride("fixture", preferred);
+    f.send(121001, "private fixture request", true, 10002, 10003, "member", {
+      channelDefaultExecutionRef: "model:attacker-choice",
+    });
+    await f.reply("routing fixture answer");
+    await f.app.runs.drain();
+    const runs = await f.app.store.management.listRuns("owner");
+    const run = runs.items.find((item) => item.executionRef === `model:${preferred}`);
+    expect(run).toMatchObject({
+      status: "succeeded",
+      executionRef: `model:${preferred}`,
+      channelDefaultExecutionRef: "model:origin",
+    });
+    expect(urls.length).toBeGreaterThan(0);
+    expect(urls.every((url) => url.includes("/origin/v1/"))).toBe(true);
+    expect(f.app.channels.resolve("fixture").modelOverrideProfileId).toBe(preferred);
+  },
+);
+
+it("does not accept preference provenance from an unmarked OneBot payload", async () => {
+  const urls: string[] = [];
+  stubModelFetch(urls);
+  const f = await fixture(failedExecutor());
+  await configureModelRoute(f.app, [
+    { id: "origin", contextWindowTokens: 32_768, maxOutputTokens: 4_096 },
+  ]);
+  f.send(121002, "private fixture request", true, 10002, 10003, "member", {
+    channelDefaultExecutionRef: "model:attacker-choice",
+  });
+  await f.reply("routing fixture answer");
+  await f.app.runs.drain();
+  const runs = await f.app.store.management.listRuns("owner");
+  expect(runs.items).toHaveLength(1);
+  expect(runs.items[0]).toMatchObject({ status: "succeeded", executionRef: "model:origin" });
+  expect(runs.items[0]).not.toHaveProperty("channelDefaultExecutionRef");
+  expect(f.app.channels.resolve("fixture").modelOverrideProfileId).toBeUndefined();
+});

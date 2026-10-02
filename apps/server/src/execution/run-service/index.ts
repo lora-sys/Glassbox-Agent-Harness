@@ -1,3 +1,4 @@
+import { deliveryReason } from "../../delivery/outcome.js";
 import { createHash } from "node:crypto";
 import { AccessDeniedError } from "../../auth/service.js";
 import type {
@@ -1010,7 +1011,7 @@ export class RunService {
     const timeout = new Promise<SendOutcome>((resolve) => {
       timer = setTimeout(() => {
         controller.abort();
-        resolve({ status: "unknown" });
+        resolve({ status: "unknown", reason: "delivery_timeout" });
       }, this.deliveryTimeoutMs);
     });
     let outcome: SendOutcome;
@@ -1022,16 +1023,18 @@ export class RunService {
             delivery,
             signal: controller.signal,
           })
-          .catch((): SendOutcome => ({ status: "unknown" })),
+          .catch((): SendOutcome => ({ status: "unknown", reason: "transport_error" })),
         timeout,
       ]);
       if (!outcome || !["sent", "failed", "unknown"].includes(outcome.status))
-        outcome = { status: "unknown" };
+        outcome = { status: "unknown", reason: "invalid_response" };
     } catch {
-      outcome = { status: "unknown" };
+      outcome = { status: "unknown", reason: "transport_error" };
     } finally {
       clearTimeout(timer);
     }
+    const reason =
+      outcome.status === "sent" ? undefined : deliveryReason(outcome.status, outcome.reason);
     try {
       await lease.settle(
         outcome.status,
@@ -1043,6 +1046,7 @@ export class RunService {
         taskId: notice.taskId,
         notificationId: notice.id,
         status: outcome.status,
+        ...(reason ? { reason } : {}),
       });
     } catch {
       this.report("delivery_failed", notice.runId);
@@ -1068,7 +1072,7 @@ export class RunService {
     const timeout = new Promise<SendOutcome>((resolve) => {
       timer = setTimeout(() => {
         controller.abort();
-        resolve({ status: "unknown" });
+        resolve({ status: "unknown", reason: "delivery_timeout" });
       }, this.deliveryTimeoutMs);
     });
     let outcome: SendOutcome;
@@ -1080,26 +1084,30 @@ export class RunService {
             delivery: structuredClone(lease.delivery),
             signal: controller.signal,
           })
-          .catch((): SendOutcome => ({ status: "unknown" })),
+          .catch((): SendOutcome => ({ status: "unknown", reason: "transport_error" })),
         timeout,
       ]);
       if (!outcome || !["sent", "failed", "unknown"].includes(outcome.status))
-        outcome = { status: "unknown" };
+        outcome = { status: "unknown", reason: "invalid_response" };
     } catch {
-      outcome = { status: "unknown" };
+      outcome = { status: "unknown", reason: "transport_error" };
     } finally {
       clearTimeout(timer);
     }
+    const reason =
+      outcome.status === "sent" ? undefined : deliveryReason(outcome.status, outcome.reason);
     try {
       await lease.settle(
         outcome.status,
         outcome.status === "sent" ? outcome.externalId : undefined,
+        reason,
       );
       await this.emit({
         type: "delivery_changed",
         runId,
         deliveryId,
         status: outcome.status,
+        ...(reason ? { reason } : {}),
         ...(outcome.status === "sent" && outcome.externalId
           ? { externalId: outcome.externalId }
           : {}),

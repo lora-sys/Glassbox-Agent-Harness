@@ -2,7 +2,7 @@ import type { Transaction } from "@libsql/client";
 import { conversationScopeKey } from "../identity/scope.js";
 import { applyHistoryTimeMigration } from "./history-time-migration.js";
 
-export const CURRENT_SCHEMA_VERSION = 28;
+export const CURRENT_SCHEMA_VERSION = 29;
 
 function persistedText(value: unknown): string {
   if (typeof value !== "string") throw new Error("Invalid migration record");
@@ -449,4 +449,12 @@ export async function applySchemaV27Migration(tx: Transaction): Promise<void> {
 /** Add an exact millisecond index while retaining original Channel history evidence. */
 export async function applySchemaV28Migration(tx: Transaction): Promise<void> {
   await applyHistoryTimeMigration(tx);
+}
+
+/** Trusted ingress routing provenance; historical and explicit Runs remain unmarked. */
+export async function applySchemaV29Migration(tx: Transaction): Promise<void> {
+  const columns = await tx.execute("PRAGMA table_info(runs)");
+  if (!columns.rows.length) throw new Error("Run routing provenance migration requires runs table");
+  if (!columns.rows.some((row) => row.name === "channel_default_execution_ref"))
+    await tx.execute("ALTER TABLE runs ADD COLUMN channel_default_execution_ref TEXT");
 }

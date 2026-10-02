@@ -42,7 +42,7 @@ const input = (overrides: Partial<ExecutionInput> = {}): ExecutionInput =>
         senderId: "owner",
       },
     },
-    run: { id: "run" },
+    run: { id: "run", source: "external" },
     text: "Describe the supplied input",
     history: [],
     providerSessionId: null,
@@ -95,6 +95,8 @@ async function fixture(kind: "model" | "pi" = "model") {
     }
   >();
   let override: string | null = null;
+  let owner = true;
+  let defaultRef = `${kind}:vision`;
   let catalog: PiModelCatalog | undefined;
   const self = {
     options: { models },
@@ -105,9 +107,15 @@ async function fixture(kind: "model" | "pi" = "model") {
       ...models.list(),
       ...(includePi ? (catalog?.list() ?? []) : []),
     ],
-    channels: { resolve: () => ({ modelOverrideProfileId: override }) },
+    channels: {
+      resolve: () => ({
+        modelOverrideProfileId: override,
+        executionRef: defaultRef,
+        config: { connectionId: "fixture", botId: "bot", ownerId: "owner" },
+      }),
+    },
     store: {
-      identities: { isOwner: async () => true },
+      identities: { isOwner: async () => owner },
       lifecycle: { traceCaller: async () => input().caller },
       evidence: { advanceTrace: async () => {} },
     },
@@ -168,6 +176,12 @@ async function fixture(kind: "model" | "pi" = "model") {
     requests,
     runtimeHealthByProfile,
     adapter,
+    setOwner: (value: boolean) => {
+      owner = value;
+    },
+    setDefault: (value: string) => {
+      defaultRef = value;
+    },
     setOverride: (id: string) => {
       override = id;
     },
@@ -571,3 +585,187 @@ it("excludes an unsupported Anthropic token from copied model-provider routing",
   expect(f.requests).toHaveLength(1);
   expect(JSON.stringify(f.events)).not.toContain("sk-ant-oat-fixture-only");
 });
+
+describe.each(["model", "pi"] as const)("Owner persisted override recovery: %s", (kind) => {
+  it("falls back only to the configured channel default when the preference is unavailable", async () => {
+    const f = await fixture(kind);
+    await f.save("text", { routingAvailable: false });
+    f.setOverride("text");
+    const request = input();
+    Object.assign(request.run, {
+      executionRef: `${kind}:text`,
+      channelDefaultExecutionRef: `${kind}:vision`,
+    });
+    const result = await f.adapter(`${kind}:text`).execute(request);
+    expect(result).toMatchObject({ status: "succeeded" });
+    expect(f.events[0]).toMatchObject({
+      executionRef: `${kind}:vision`,
+      reason: "default_fallback",
+      usedFallback: true,
+    });
+    expect(f.requests).toHaveLength(1);
+  });
+});
+
+describe.each(["model", "pi"] as const)("bounded preference fallback: %s", (kind) => {
+  function preferenceInput() {
+    const request = input();
+    Object.assign(request.run, {
+      executionRef: `${kind}:text`,
+      channelDefaultExecutionRef: `${kind}:vision`,
+    });
+    return request;
+  }
+
+  it.each(["credential", "health", "operator", "vision", "capacity"])(
+    "recovers an ineligible preference: %s",
+    async (reason) => {
+      const f = await fixture(kind);
+      f.setOverride("text");
+      await f.save("unrelated", { routePriority: 0 });
+      if (reason === "credential") await f.save("text", { apiKey: null });
+      if (reason === "operator") await f.save("text", { routingAvailable: false });
+      if (reason === "capacity") await f.save("text", { contextWindowTokens: 5120 });
+      if (reason === "health")
+        f.runtimeHealthByProfile.set("text", {
+          state: "unavailable",
+          checkedAt: Date.now(),
+          latencyMs: 1,
+          reasonCode: "runtime_run_errored",
+        });
+      const request = preferenceInput();
+      if (reason === "vision") request.images = imageInput().images;
+      const result = await f.adapter(`${kind}:text`).execute(request);
+      expect(result.status).toBe("succeeded");
+      expect(f.events[0]).toMatchObject({
+        executionRef: `${kind}:vision`,
+        reason: "default_fallback",
+      });
+      expect(f.requests).toHaveLength(1);
+      expect(JSON.stringify(f.events)).not.toContain("unrelated");
+      expect(request.run.executionRef).toBe(`${kind}:text`);
+      expect(f.events.find((event) => event.type === "routing_eval_evidence")).toMatchObject({
+        actualExecutionRef: `${kind}:vision`,
+        decisionExecutionRef: `${kind}:vision`,
+      });
+    },
+  );
+
+  it.each(["credential", "operator", "vision", "capacity"])(
+    "rejects an ineligible default: %s",
+    async (reason) => {
+      const f = await fixture(kind);
+      f.setOverride("text");
+      await f.save("text", { routingAvailable: false });
+      await f.save("unrelated", { routePriority: 0 });
+      await f.save(
+        "vision",
+        reason === "credential"
+          ? { apiKey: null }
+          : reason === "operator"
+            ? { routingAvailable: false }
+            : reason === "vision"
+              ? { supportsVision: false }
+              : { contextWindowTokens: 5120 },
+      );
+      const request = preferenceInput();
+      if (reason === "vision") request.images = imageInput().images;
+      expect(await f.adapter(`${kind}:text`).execute(request)).toMatchObject({
+        status: "failed",
+        runtimeAttempted: false,
+      });
+      expect(f.events[0]).toMatchObject({ reason: "no_route", executionRef: null });
+      expect(f.requests).toEqual([]);
+    },
+  );
+
+  it.each(["default", "override", "owner", "group", "connection", "bot", "sender", "task"])(
+    "fails closed on stale or mismatched preference provenance: %s",
+    async (change) => {
+      const f = await fixture(kind);
+      f.setOverride("text");
+      const request = preferenceInput();
+      if (change === "default") f.setDefault(`${kind}:unrelated`);
+      if (change === "override") f.setOverride("vision");
+      if (change === "owner") f.setOwner(false);
+      if (change === "group") request.caller.scope.chatType = "group";
+      if (change === "connection") request.caller.scope.connectionId = "other";
+      if (change === "bot") request.caller.scope.botId = "other";
+      if (change === "sender") request.caller.scope.senderId = "other";
+      if (change === "task") request.run.source = "task_step";
+      expect(await f.adapter(`${kind}:text`).execute(request)).toMatchObject({
+        status: "failed",
+        runtimeAttempted: false,
+      });
+      expect(f.events[0]).toMatchObject({ reason: "no_route", executionRef: null });
+      expect(f.requests).toEqual([]);
+    },
+  );
+
+  it("does not replace an explicit default selection with a persisted preference", async () => {
+    const f = await fixture(kind);
+    f.setOverride("text");
+    await f.save("vision", { routingEnabled: false });
+    const request = input();
+    request.run.executionRef = `${kind}:vision`;
+    expect(await f.adapter(`${kind}:vision`).execute(request)).toMatchObject({
+      status: "succeeded",
+    });
+    expect(f.events[0]).toMatchObject({ executionRef: `${kind}:vision` });
+  });
+
+  it("passes the same authorized input to the default without retrying failures", async () => {
+    const f = await fixture(kind);
+    f.setOverride("text");
+    await f.save("text", { routingAvailable: false });
+    const request = preferenceInput();
+    const execute = vi.fn(async () => ({
+      status: "failed" as const,
+      failureCode: "runtime_run_errored" as const,
+    }));
+    f.setExecutor(execute);
+    expect(await f.adapter(`${kind}:text`).execute(request)).toMatchObject({ status: "failed" });
+    expect(execute).toHaveBeenCalledExactlyOnceWith(request);
+  });
+});
+
+it.each(["model", "pi"] as const)(
+  "keeps a healthy %s preference ahead of a higher-priority default",
+  async (kind) => {
+    const f = await fixture(kind);
+    f.setOverride("text");
+    await f.save("vision", { routePriority: 0 });
+    await f.save("text", { routePriority: 100 });
+    const request = input();
+    Object.assign(request.run, {
+      executionRef: `${kind}:text`,
+      channelDefaultExecutionRef: `${kind}:vision`,
+    });
+    expect(await f.adapter(`${kind}:text`).execute(request)).toMatchObject({ status: "succeeded" });
+    expect(f.events[0]).toMatchObject({
+      executionRef: `${kind}:text`,
+      reason: "selected",
+      usedFallback: false,
+    });
+    expect(f.requests).toHaveLength(1);
+  },
+);
+
+it.each(["model", "pi"] as const)(
+  "does not route an explicit missing %s profile to arbitrary alternatives",
+  async (kind) => {
+    const f = await fixture(kind);
+    const request = input();
+    request.run.executionRef = `${kind}:missing`;
+    expect(await f.adapter(`${kind}:missing`).execute(request)).toMatchObject({
+      status: "failed",
+      runtimeAttempted: false,
+    });
+    expect(f.events[0]).toMatchObject({
+      executionRef: null,
+      reason: "no_route",
+      candidates: [{ profileId: "missing", eligible: false, reason: "not_configured" }],
+    });
+    expect(f.requests).toEqual([]);
+  },
+);

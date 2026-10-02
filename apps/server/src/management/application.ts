@@ -520,9 +520,18 @@ export class ManagementApplication {
       },
       transport: {
         send: async ({ destination, delivery, signal }) => {
-          if (signal.aborted) return { status: "failed" };
+          if (signal.aborted) return { status: "failed", reason: "cancelled_before_send" };
           const connection = this.connections.get(destination.connectionId);
-          if (!connection) return { status: "failed" };
+          if (!connection) return { status: "failed", reason: "not_connected" };
+          // Once the provider send is invoked, an exception cannot prove non-delivery.
+          // Keep preparation/authorization errors outside this transport-only boundary.
+          const send = async (input: Parameters<OneBotAdapter["send"]>[0]) => {
+            try {
+              return await connection.send(input);
+            } catch {
+              return { status: "unknown" as const, code: "transport_error" as const };
+            }
+          };
           if (delivery.payloadKind === "browser_artifact") {
             try {
               if (!this.browserArtifacts) return { status: "failed" };
@@ -540,7 +549,7 @@ export class ManagementApplication {
               });
               if (artifact.sizeBytes > 2 * 1024 * 1024 || signal.aborted)
                 return { status: "failed" };
-              const sent = await connection.send({
+              const sent = await send({
                 deliveryId: delivery.id,
                 target: destination,
                 text: "浏览器截图",
@@ -548,7 +557,10 @@ export class ManagementApplication {
               });
               return sent.status === "confirmed"
                 ? { status: "sent", externalId: sent.messageId }
-                : { status: sent.status };
+                : {
+                    status: sent.status,
+                    reason: "code" in sent ? sent.code : "artifact_unavailable",
+                  };
             } catch {
               return { status: "failed" };
             }
@@ -566,24 +578,24 @@ export class ManagementApplication {
               if (run.conversationId !== binding.conversationId) return { status: "failed" };
               if (scopeKey(caller.scope) !== scopeKey(destination)) return { status: "failed" };
               const artifact = await this.mediaAssets.read(delivery.payloadText, binding);
-              if (signal.aborted) return { status: "failed" };
+              if (signal.aborted) return { status: "failed", reason: "cancelled_before_send" };
               const sent =
                 artifact.mimeType === "video/mp4"
-                  ? await connection.send({
+                  ? await send({
                       deliveryId: delivery.id,
                       target: destination,
                       text: "视频已生成",
                       video: { mp4Base64: artifact.data.toString("base64") },
                     })
                   : artifact.mimeType === "image/png"
-                    ? await connection.send({
+                    ? await send({
                         deliveryId: delivery.id,
                         target: destination,
                         text: "图片已生成",
                         image: { pngBase64: artifact.data.toString("base64") },
                       })
                     : artifact.mimeType === "image/jpeg" || artifact.mimeType === "image/webp"
-                      ? await connection.send({
+                      ? await send({
                           deliveryId: delivery.id,
                           target: destination,
                           text: "图片已生成",
@@ -595,19 +607,22 @@ export class ManagementApplication {
                       : { status: "failed" as const };
               return sent.status === "confirmed"
                 ? { status: "sent", externalId: sent.messageId }
-                : { status: sent.status };
+                : {
+                    status: sent.status,
+                    reason: "code" in sent ? sent.code : "artifact_unavailable",
+                  };
             } catch {
               return { status: "failed" };
             }
           }
-          const result = await connection.send({
+          const result = await send({
             deliveryId: delivery.id,
             target: destination,
             text: delivery.payloadText,
           });
           return result.status === "confirmed"
             ? { status: "sent", externalId: result.messageId }
-            : { status: result.status };
+            : { status: result.status, reason: result.code };
         },
       },
       onEvent: (event) => this.recordEvent(event),
@@ -2096,7 +2111,7 @@ export class ManagementApplication {
 
   private execution(reference: string): RunExecutionAdapter | undefined {
     const direct = this.directExecution(reference);
-    if (!direct || this.options.executors?.has(reference)) return direct;
+    if (this.options.executors?.has(reference)) return direct;
     const kind = reference.startsWith("pi:")
       ? "pi"
       : reference.startsWith("model:")
@@ -2104,25 +2119,43 @@ export class ManagementApplication {
         : null;
     if (!kind) return direct;
     return {
-      supportsGroup: direct.supportsGroup,
-      supportsTaskStepModel: direct.supportsTaskStepModel,
+      supportsGroup: direct?.supportsGroup ?? false,
+      supportsTaskStepModel: direct?.supportsTaskStepModel ?? false,
       execute: async (input: ExecutionInput) => {
         const profileId = reference.slice(kind.length + 1);
         const configured = this.selectableModelProfiles(kind === "pi");
         const origin = configured.find((profile) => profile.id === profileId);
-        if (!origin) return { status: "failed", failureCode: "execution_unavailable" };
         const channelSelection = this.channels.resolve(input.caller.scope.connectionId);
         const explicitOverride =
           input.caller.scope.chatType === "private" &&
           (await this.store.identities.isOwner(input.caller.principalId)) &&
           channelSelection.modelOverrideProfileId === profileId;
+        // Only trusted ingress records this snapshot. Reference equality alone cannot tell
+        // a saved preference from an explicit one-run selection of the very same model.
+        const channelDefaultExecutionRef = input.run.channelDefaultExecutionRef;
+        const recoverPreference =
+          explicitOverride &&
+          input.run.source === "external" &&
+          input.executionMode === undefined &&
+          channelDefaultExecutionRef !== undefined &&
+          channelDefaultExecutionRef === channelSelection.executionRef &&
+          channelDefaultExecutionRef.startsWith(`${kind}:`) &&
+          input.run.executionRef === reference &&
+          channelSelection.config.connectionId === input.caller.scope.connectionId &&
+          channelSelection.config.botId === input.caller.scope.botId &&
+          channelSelection.config.ownerId === input.caller.scope.senderId &&
+          input.caller.scope.chatId === input.caller.scope.senderId;
+        const invalidPreference = channelDefaultExecutionRef !== undefined && !recoverPreference;
+        const fallbackProfileId = recoverPreference
+          ? channelDefaultExecutionRef.slice(kind.length + 1)
+          : undefined;
         const demandTokens =
           estimateUnicodeTokens(input.text) +
           input.history.reduce((sum, message) => sum + estimateUnicodeTokens(message.text) + 8, 0);
         const ordered = configured
           .filter((profile) =>
-            explicitOverride
-              ? profile.id === profileId
+            !origin || explicitOverride || channelDefaultExecutionRef !== undefined
+              ? profile.id === profileId || profile.id === fallbackProfileId
               : profile.id === profileId || profile.allowRouting === true,
           )
           .sort(
@@ -2217,10 +2250,21 @@ export class ManagementApplication {
           },
           candidates,
           options: {
-            enabled: explicitOverride || origin.routingEnabled === true,
-            allowedProfileIds: ordered.map((profile) => profile.id),
-            routeOrder: ordered.map((profile) => profile.id),
-            defaultExecutionRef: reference,
+            enabled:
+              !origin ||
+              channelDefaultExecutionRef !== undefined ||
+              explicitOverride ||
+              origin?.routingEnabled === true,
+            allowedProfileIds: invalidPreference ? [] : ordered.map((profile) => profile.id),
+            routeOrder:
+              !origin || explicitOverride || channelDefaultExecutionRef !== undefined
+                ? [profileId]
+                : ordered.map((profile) => profile.id),
+            defaultExecutionRef: invalidPreference
+              ? ""
+              : recoverPreference
+                ? channelDefaultExecutionRef
+                : reference,
             capabilityFloorByRisk: { low: 0, medium: 0, high: 2 },
             allowUnknownHealth: true,
             allowUnknownCapacity: false,
@@ -2242,6 +2286,16 @@ export class ManagementApplication {
             conversationId: input.conversation.id,
             principalId: input.caller.principalId,
             policyVersion: "p5b-route-v1",
+            ...(channelDefaultExecutionRef === undefined
+              ? {}
+              : {
+                  preference: {
+                    source: "owner_private_channel",
+                    requestedExecutionRef: reference,
+                    defaultExecutionRef: channelDefaultExecutionRef,
+                    provenanceValid: recoverPreference,
+                  },
+                }),
             demand: {
               estimatedMaterialTokens: demandTokens,
               estimateSource: "unicode_conservative",
@@ -2284,8 +2338,12 @@ export class ManagementApplication {
               capabilityFloor: routingInput.options.capabilityFloorByRisk[routingInput.task.risk],
               selectedCapabilityRank: selectedProfile?.capabilityRank ?? null,
               unavailableModelEncountered,
-              fallbackSelected: unavailableModelEncountered && decision.executionRef !== null,
-              fallbackAvailable: unavailableModelEncountered && succeeded,
+              fallbackSelected:
+                decision.reason === "default_fallback" ||
+                (unavailableModelEncountered && decision.executionRef !== null),
+              fallbackAvailable:
+                (decision.reason === "default_fallback" || unavailableModelEncountered) &&
+                succeeded,
               decisionExecutionRef: decision.executionRef,
               actualExecutionRef,
               decisionProvider: executionConfig
@@ -2339,7 +2397,11 @@ export class ManagementApplication {
             : this.directExecution(decision.executionRef);
         if (!selected || (input.caller.scope.chatType === "group" && !selected.supportsGroup)) {
           await appendRoutingEval(null);
-          return { status: "failed", failureCode: "execution_unavailable" };
+          return {
+            status: "failed",
+            failureCode: "execution_unavailable",
+            runtimeAttempted: false,
+          };
         }
         let succeeded = false;
         let actualExecutionRef = decision.executionRef;
@@ -2616,7 +2678,14 @@ export class ManagementApplication {
         if (!caller) continue;
         const cursor = await this.trace.append(
           runId,
-          { type: "delivery_changed", runId, deliveryId, status: "unknown", recovered: true },
+          {
+            type: "delivery_changed",
+            runId,
+            deliveryId,
+            status: "unknown",
+            reason: "process_interrupted",
+            recovered: true,
+          },
           "glassbox-recovery",
         );
         await this.store.evidence.advanceTrace(caller, cursor);
@@ -2861,6 +2930,9 @@ export class ManagementApplication {
           messageId: message.messageId,
           text: message.text || (hasImage ? "请描述这张图片。" : ""),
           executionRef: runExecutionRef,
+          ...(ownerPrivate && channelSelection.modelOverrideProfileId && executionKind
+            ? { channelDefaultExecutionRef: configured.executionRef }
+            : {}),
           ...(imageFailureCode ? { imageFailureCode } : images.length > 0 ? { images } : {}),
         };
         const accepted = await this.store.conversations.acceptIncoming(incoming);
@@ -3121,31 +3193,22 @@ export class ManagementApplication {
     // for a group Glassbox has configured, and reading it still needs an explicit grant.
     if (scope.chatType === "group") {
       const groupResource = groupResourceId(scope.chatId);
-      await this.store.authorization.registerResource({
-        id: groupResource,
-        kind: "qq_group",
-        visibility: "public",
-        ifAbsent: true,
-      });
-      // A Run inside a configured group may address that same group. This is not implied by bot
-      // membership: the grant exists only for a group Glassbox has configured and is scoped to
-      // that one group. The candidate list narrows it by current policy and the message's
-      // observed native role. Mutations also require live role verification and re-authorization.
-      for (const action of this.groupRunActions()) {
-        const existing = await this.store.authorization.check({
-          caller,
-          resourceId: groupResource,
+      // Provision this fixed action set in one atomic authorization batch. Every Action still
+      // records its ordered decision and respects historical initial-provisioning policy.
+      // Candidate discovery and live role verification continue to narrow execution.
+      await this.store.authorization.provisionResources({
+        caller,
+        initialOnly,
+        entries: this.groupRunActions().map((action) => ({
+          resource: {
+            id: groupResource,
+            kind: "qq_group",
+            visibility: "public",
+            ifAbsent: true,
+          },
           action,
-        });
-        if (existing.decision !== "ALLOW")
-          await grant({
-            principalId,
-            resourceId: groupResource,
-            action,
-            scope,
-            effect: "allow",
-          });
-      }
+        })),
+      });
       // Answering back into this group is its own decision, granted separately from reading it.
       // The Run's own group scope is the audience it already owns, so this is the one delivery
       // authority a group Run can hold. It is granted only because Glassbox configured
