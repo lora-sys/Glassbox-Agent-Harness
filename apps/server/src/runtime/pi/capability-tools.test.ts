@@ -129,6 +129,7 @@ function tools(
     store,
     getContext: () => ({
       caller: ownerPrivate,
+      authorizedToolNames: ["qq_group_members", "qq_group_moderation"],
       runId: accepted.run.id,
       conversationId: accepted.conversation.id,
       ...(required === undefined
@@ -139,6 +140,7 @@ function tools(
       const stored = await store.capabilities.read(conn, groupId);
       return stored?.policy.categories[category] === true;
     },
+    recordModerationResolution: async () => {},
     invoke: async (input) => {
       calls.push({ action: input.action, params: input.params });
       if (input.action === "get_group_member_list") return memberListResult;
@@ -646,7 +648,7 @@ it("refuses a category the Owner has not enabled even when the grant exists", as
         groupId: "100",
         operation: "get_group_member_list",
       }),
-    ).rejects.toThrow("capability_category_disabled");
+    ).rejects.toThrow("Permission denied: source_policy_denied");
     expect(calls).toEqual([]);
   } finally {
     await store.close();
@@ -973,6 +975,7 @@ it("serves the Owner's managed-group listing without a provider call", async () 
 it("refuses the managed-group listing inside a group Run", async () => {
   const { store, accepted } = await fixture();
   try {
+    await enableCategory(store, "group.read");
     // The group scope reads its own group, never the Owner's managed set: the listing
     // resolves to a sentinel Resource that was never registered.
     await store.authorization.grant({
@@ -1404,6 +1407,107 @@ it("keeps numeric-string equivalence and strict booleans in the exact comparison
       }),
     ).rejects.toThrow("invalid_capability_params");
     expect(calls).toHaveLength(1);
+  } finally {
+    await store.close();
+  }
+});
+
+it("keeps an already-executed mutation's result separate from read-result revocation", async () => {
+  const { store, accepted } = await fixture();
+  try {
+    await enableCategory(store, "group.files.write");
+    await grantGroupAction(store, "group:files:write");
+    const input = {
+      groupId: "100",
+      operation: "create_group_file_folder",
+      params: { name: "fixture" },
+    };
+    let performed = 0;
+    const created = createCapabilityTools({
+      store,
+      getContext: () => ({
+        caller: ownerPrivate,
+        runId: accepted.run.id,
+        conversationId: accepted.conversation.id,
+        requiredToolName: "qq_group_file_ops",
+        requiredToolInput: input,
+      }),
+      isCategoryEnabled: async () => true,
+      search: async () => ({}),
+      projectManagedGroups: async () => ({}),
+      invoke: async () => {
+        performed++;
+        await store.capabilities.write({
+          connectionId,
+          groupId: "100",
+          principalId: "owner",
+          policy: { categories: {}, memorySources: {} },
+        });
+        return { performed: true };
+      },
+    });
+    expect((await call(toolByName(created, "qq_group_file_ops"), input)).details).toEqual({
+      performed: true,
+    });
+    expect(performed).toBe(1);
+  } finally {
+    await store.close();
+  }
+});
+
+it("resolves a pinned nickname mute through the real Tool without exposing the roster", async () => {
+  const { store, accepted } = await fixture();
+  try {
+    await store.capabilities.write({
+      connectionId,
+      groupId: "100",
+      principalId: "owner",
+      policy: { categories: { "group.moderate": true, "group.members": true }, memorySources: {} },
+    });
+    await grantGroupAction(store, "group:moderate");
+    await grantGroupAction(store, "group:members:read");
+    const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
+    const required = {
+      name: "qq_group_moderation",
+      input: {
+        groupId: "100",
+        operation: "set_group_ban",
+        memberSelector: "private-nickname",
+        params: { duration: 30 },
+      },
+    };
+    const created = tools(store, accepted, calls, required);
+    const result = await call(toolByName(created, required.name), required.input);
+    expect(calls).toEqual([
+      { action: "get_group_member_list", params: { group_id: 100 } },
+      { action: "set_group_ban", params: { group_id: 100, user_id: 10004, duration: 30 } },
+    ]);
+    expect(JSON.stringify(result)).not.toContain("private-nickname");
+    expect(JSON.stringify(result)).not.toContain("10005");
+  } finally {
+    await store.close();
+  }
+});
+
+it("requires a QQ ID without reading a roster when nickname read authority is absent", async () => {
+  const { store, accepted } = await fixture();
+  try {
+    await enableCategory(store, "group.moderate");
+    await grantGroupAction(store, "group:moderate");
+    const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
+    const required = {
+      name: "qq_group_moderation",
+      input: {
+        groupId: "100",
+        operation: "set_group_ban",
+        memberSelector: "Ripped",
+        params: { duration: 30 },
+      },
+    };
+    await expect(
+      call(toolByName(tools(store, accepted, calls, required), required.name), required.input),
+    ).rejects.toThrow("moderation_member_id_required");
+    expect(calls).toEqual([]);
   } finally {
     await store.close();
   }

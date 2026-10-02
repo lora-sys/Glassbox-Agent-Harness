@@ -513,6 +513,8 @@ it("exposes Owner-only governed Memory operations and rechecks revoked write aut
     expect(source.details).toMatchObject({
       matched: 1,
       imported: 1,
+      created: 1,
+      reused: 0,
       skipped: 0,
       candidates: [
         expect.objectContaining({
@@ -528,6 +530,29 @@ it("exposes Owner-only governed Memory operations and rechecks revoked write aut
           ],
         }),
       ],
+    });
+    const imported = source.details as {
+      candidates: Array<{
+        sourceEvidence: Array<{ metadata: { authorizationDecisionId: string } }>;
+      }>;
+    };
+    const sourceDecisionId =
+      imported.candidates[0]!.sourceEvidence[0]!.metadata.authorizationDecisionId;
+    const sourceDecision = await store.db.transaction((tx) =>
+      tx.execute({
+        sql: "SELECT policy_condition_json,delivery_source FROM authorization_decisions_all WHERE id = ?",
+        args: [sourceDecisionId],
+      }),
+    );
+    expect(sourceDecision.rows[0]).toMatchObject({
+      policy_condition_json: JSON.stringify({
+        version: 1,
+        kind: "qq_memory_source",
+        connectionId: "qq",
+        groupId: "100",
+        sourceClass: "history",
+      }),
+      delivery_source: "content_source",
     });
     // The message that asserts nothing was never read as a candidate: the query matched one
     // message and the rest of the read was dropped before it reached the review queue.
@@ -554,7 +579,7 @@ it("exposes Owner-only governed Memory operations and rechecks revoked write aut
       undefined,
       {} as never,
     );
-    expect(again.details).toMatchObject({ imported: 1 });
+    expect(again.details).toMatchObject({ imported: 1, created: 0, reused: 1 });
     expect(await queued()).toHaveLength(before);
 
     // No query at all is refused rather than defaulting to "the most recent messages", and the

@@ -1,3 +1,4 @@
+import { archiveDecisionBatch } from "../persistence/decision-archive.js";
 import { mkdtemp, rm } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -1052,3 +1053,86 @@ describe("internal Task Step Runs", () => {
     expect((await conversations.createInternalStepRun(input)).source).toBe("task_step");
   });
 });
+
+it.each(["worker-result", "task-instructions"])(
+  "preserves archived QQ policy dependencies before loading %s",
+  async (path) => {
+    const { db, conversations } = await fixture();
+    const target =
+      path === "worker-result"
+        ? await addWorkerFollowUp(db, conversations)
+        : await conversations.createInternalStepRun({
+            caller,
+            taskId: "task-1",
+            stepId: "step-1",
+            attemptId: "attempt-1",
+            executionRef: "pi:default",
+          });
+    const origin = await conversations.acceptIncoming({
+      agentId: "personal",
+      scope,
+      messageId: `policy-origin-${path}`,
+      text: "Plan from the protected source",
+      executionRef: "fake",
+    });
+    const policyCondition = {
+      version: 1,
+      kind: "qq_category",
+      connectionId: scope.connectionId,
+      groupId: scope.chatId,
+      category: "group.history",
+    } as const;
+    await db.transaction(async (tx) => {
+      await tx.execute({
+        sql: "UPDATE tasks SET run_id = ? WHERE id = 'task-1'",
+        args: [origin.run.id],
+      });
+      await tx.execute({
+        sql: "INSERT INTO resources(id,kind,visibility) VALUES (?,'qq_group','public')",
+        args: [`group:${scope.chatId}`],
+      });
+      await tx.execute({
+        sql: "INSERT INTO grants(id,principal_id,resource_id,action,scope_key,effect,created_at) VALUES ('policy-source','owner',?,'history:read',?,'allow',?)",
+        args: [`group:${scope.chatId}`, scopeKey(scope), time],
+      });
+      await tx.execute({
+        sql: 'INSERT INTO group_capability_policies(connection_id,group_id,policy_json,version,updated_by_principal_id,updated_at) VALUES (?,?,\'{"categories":{"group.history":true},"memorySources":{}}\',1,\'owner\',?)',
+        args: [scope.connectionId, scope.chatId, time],
+      });
+      const source = await evaluate(tx, {
+        caller,
+        resourceId: `group:${scope.chatId}`,
+        action: "history:read",
+        policyCondition,
+        runId: origin.run.id,
+        conversationId: origin.conversation.id,
+      });
+      expect(source.decision).toBe("ALLOW");
+      await tx.execute({
+        sql: "UPDATE authorization_decisions SET delivery_source = 'content_source' WHERE id = ?",
+        args: [source.id],
+      });
+      await tx.execute({
+        sql: "UPDATE runs SET status = 'succeeded' WHERE id = ?",
+        args: [origin.run.id],
+      });
+    });
+    expect(await archiveDecisionBatch(db, "9999-01-01T00:00:00.000Z")).toBeGreaterThan(0);
+    await conversations.loadRunInput(caller, target.id);
+    await db.transaction(async (tx) => {
+      const copied = await tx.execute({
+        sql: "SELECT policy_condition_json FROM authorization_decisions WHERE run_id = ? AND delivery_source = 'content_source' AND action = 'history:read'",
+        args: [target.id],
+      });
+      expect(
+        copied.rows.some((row) => row.policy_condition_json === JSON.stringify(policyCondition)),
+      ).toBe(true);
+      await tx.execute(
+        'UPDATE group_capability_policies SET policy_json = \'{"categories":{},"memorySources":{"history":true}}\'',
+      );
+    });
+    await expect(conversations.loadRunInput(caller, target.id)).rejects.toMatchObject({
+      decision: { reason: "source_policy_denied" },
+    });
+  },
+);

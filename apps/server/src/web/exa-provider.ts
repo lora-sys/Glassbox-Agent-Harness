@@ -1,3 +1,4 @@
+import { throwIfWebCancelled } from "./cancellation.js";
 import { assertPublicWebUrl, type ResolveWebHost } from "./network-guard.js";
 import type { WebProviderStatus } from "./contracts.js";
 
@@ -66,7 +67,9 @@ export class ExaProvider {
   private async request(
     path: "/search" | "/contents",
     body: Record<string, unknown>,
+    signal?: AbortSignal,
   ): Promise<ExaResponse> {
+    throwIfWebCancelled(signal);
     if (!this.options.apiKey) return { status: "auth_missing", results: [] };
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.options.timeoutMs ?? EXA_TIMEOUT_MS);
@@ -75,15 +78,17 @@ export class ExaProvider {
         method: "POST",
         headers: { "x-api-key": this.options.apiKey, "content-type": "application/json" },
         body: JSON.stringify(body),
-        signal: controller.signal,
+        signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal,
         redirect: "error",
       });
+      throwIfWebCancelled(signal);
       if (response.status === 401 || response.status === 403)
         return { status: "auth_missing", results: [] };
       if (response.status === 402) return { status: "quota_exhausted", results: [] };
       if (response.status === 429) return { status: "rate_limited", results: [] };
       if (!response.ok) return { status: "failed", results: [] };
       const text = await response.text();
+      throwIfWebCancelled(signal);
       if (text.length > MAX_PROVIDER_BODY_CHARS) return { status: "failed", results: [] };
       const parsed = record(JSON.parse(text));
       const results = readResults(parsed?.results);
@@ -94,36 +99,49 @@ export class ExaProvider {
         ...(typeof parsed?.requestId === "string" ? { requestId: parsed.requestId } : {}),
       };
     } catch {
+      throwIfWebCancelled(signal);
       return { status: controller.signal.aborted ? "timeout" : "failed", results: [] };
     } finally {
       clearTimeout(timer);
     }
   }
 
-  search(input: {
-    query: string;
-    maxResults: number;
-    includeDomains?: readonly string[];
-    excludeDomains?: readonly string[];
-    startPublishedDate?: string;
-  }): Promise<ExaResponse> {
-    return this.request("/search", {
-      query: input.query,
-      numResults: input.maxResults,
-      type: "auto",
-      contents: { highlights: { maxCharacters: 800 }, text: false },
-      ...(input.includeDomains ? { includeDomains: input.includeDomains } : {}),
-      ...(input.excludeDomains ? { excludeDomains: input.excludeDomains } : {}),
-      ...(input.startPublishedDate ? { startPublishedDate: input.startPublishedDate } : {}),
-    });
+  search(
+    input: {
+      query: string;
+      maxResults: number;
+      includeDomains?: readonly string[];
+      excludeDomains?: readonly string[];
+      startPublishedDate?: string;
+    },
+    signal?: AbortSignal,
+  ): Promise<ExaResponse> {
+    return this.request(
+      "/search",
+      {
+        query: input.query,
+        numResults: input.maxResults,
+        type: "auto",
+        contents: { highlights: { maxCharacters: 800 }, text: false },
+        ...(input.includeDomains ? { includeDomains: input.includeDomains } : {}),
+        ...(input.excludeDomains ? { excludeDomains: input.excludeDomains } : {}),
+        ...(input.startPublishedDate ? { startPublishedDate: input.startPublishedDate } : {}),
+      },
+      signal,
+    );
   }
 
-  async contents(url: string, query?: string): Promise<ExaResponse> {
+  async contents(url: string, query?: string, signal?: AbortSignal): Promise<ExaResponse> {
+    throwIfWebCancelled(signal);
     const target = await assertPublicWebUrl(url, this.options.resolveHost);
-    return this.request("/contents", {
-      urls: [target.href],
-      text: { maxCharacters: 20_000 },
-      ...(query ? { highlights: { query, maxCharacters: 1_200 } } : {}),
-    });
+    return this.request(
+      "/contents",
+      {
+        urls: [target.href],
+        text: { maxCharacters: 20_000 },
+        ...(query ? { highlights: { query, maxCharacters: 1_200 } } : {}),
+      },
+      signal,
+    );
   }
 }

@@ -114,9 +114,16 @@ export class GroupHistoryPoller {
    * one: a provider that takes longer than the interval must not accumulate concurrent walks.
    */
   tick(): Promise<void> {
-    this.running ??= this.walk().finally(() => {
-      this.running = undefined;
-    });
+    if (this.stopped) return this.running ?? Promise.resolve();
+    this.running ??= this.walk()
+      .catch(() => {
+        // Target discovery reads durable policy too. Its failures happen before a group
+        // exists to record, but must not escape the detached timer or expose raw DB errors.
+        console.warn("Group history poll failed; retrying next interval.");
+      })
+      .finally(() => {
+        this.running = undefined;
+      });
     return this.running;
   }
 

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
 import { GroupHistoryPoller, type HistorySyncTarget } from "./history-poller.js";
 
 /** A fake interval the test drives by hand, so no test waits on a real 60 seconds. */
@@ -40,6 +40,57 @@ const target: HistorySyncTarget = { connectionId: "qq", groupId: "100" };
 const other: HistorySyncTarget = { connectionId: "qq", groupId: "200" };
 
 describe("GroupHistoryPoller", () => {
+  it.each(["sync", "async"])(
+    "contains a %s target-enumeration failure and retries on the next timer tick",
+    async (failureMode) => {
+      const timer = fakeTimer();
+      const diagnostic = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      let attempts = 0;
+      const run = vi.fn(async () => ({ pagesWalked: 1, stop: "end_of_source" as const }));
+      const poller = new GroupHistoryPoller({
+        listTargets: () => {
+          attempts += 1;
+          if (attempts > 1) return [target];
+          const error = new Error("private database path and protected payload");
+          if (failureMode === "sync") throw error;
+          return Promise.reject(error);
+        },
+        run,
+        setTimer: timer.setTimer,
+        clearTimer: timer.clearTimer,
+      });
+      try {
+        poller.start();
+        timer.fire();
+        await expect(poller.tick()).resolves.toBeUndefined();
+        expect(attempts).toBe(1);
+        expect(run).not.toHaveBeenCalled();
+        expect(poller.records().size).toBe(0);
+        expect(diagnostic.mock.calls).toEqual([
+          ["Group history poll failed; retrying next interval."],
+        ]);
+        timer.fire();
+        await poller.tick();
+        expect(attempts).toBe(2);
+        expect(run).toHaveBeenCalledExactlyOnceWith(target, { maxPages: 1 });
+        expect(poller.record("qq", "100")?.error).toBeNull();
+      } finally {
+        await poller.stop();
+        diagnostic.mockRestore();
+      }
+    },
+  );
+
+  it("does not enumerate targets after it has stopped", async () => {
+    const listTargets = vi.fn(() => [target]);
+    const run = vi.fn(async () => ({ pagesWalked: 1, stop: "end_of_source" as const }));
+    const poller = new GroupHistoryPoller({ listTargets, run });
+    await poller.stop();
+    await poller.tick();
+    expect(listTargets).not.toHaveBeenCalled();
+    expect(run).not.toHaveBeenCalled();
+  });
+
   it("walks every current target on a tick, at the tick page bound", async () => {
     const timer = fakeTimer();
     const walked: Array<{ target: HistorySyncTarget; maxPages: number }> = [];

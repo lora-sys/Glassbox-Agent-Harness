@@ -29,6 +29,10 @@ import {
   schemaV23Migration,
   applySchemaV24Migration,
   schemaV25Migration,
+  applySchemaV26Migration,
+  applySchemaV27Migration,
+  applySchemaV28Migration,
+  applySchemaV29Migration,
 } from "./schema.js";
 
 export function localDatabaseUrl(databasePath: string): string {
@@ -84,6 +88,10 @@ export class DomainDatabase {
           // the `task_notifications` routing parent and the wider immutable-payload trigger
           // included.
           await applySchemaV24Migration(tx);
+          await applySchemaV26Migration(tx);
+          await applySchemaV27Migration(tx);
+          await applySchemaV28Migration(tx);
+          await applySchemaV29Migration(tx);
           await tx.execute(`PRAGMA user_version = ${CURRENT_SCHEMA_VERSION}`);
         } else {
           if (version < 2) {
@@ -116,6 +124,10 @@ export class DomainDatabase {
           if (version < 23) await tx.batch(schemaV23Migration);
           if (version < 24) await applySchemaV24Migration(tx);
           if (version < 25) await tx.batch(schemaV25Migration);
+          if (version < 26) await applySchemaV26Migration(tx);
+          if (version < 27) await applySchemaV27Migration(tx);
+          if (version < 28) await applySchemaV28Migration(tx);
+          if (version < 29) await applySchemaV29Migration(tx);
           await tx.execute(`PRAGMA user_version = ${CURRENT_SCHEMA_VERSION}`);
         }
       });

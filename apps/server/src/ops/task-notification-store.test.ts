@@ -498,3 +498,49 @@ it("recovers sending notifications as terminal unknown without retry", async () 
   );
   expect(status.rows[0]?.status).toBe("unknown");
 });
+
+it("preserves a fixed notification timeout reason without creating direct-delivery attention", async () => {
+  const { RunService } = await import("../execution/run-service/index.js");
+  const { domain, incoming, task, notifications } = await fixture();
+  await domain.db.transaction(async (tx) => {
+    await tx.execute({
+      sql: "UPDATE runs SET status = 'succeeded' WHERE id = ?",
+      args: [incoming.run.id],
+    });
+    await tx.execute({ sql: "UPDATE tasks SET status = 'REVIEW' WHERE id = ?", args: [task.id] });
+  });
+  const sequence = await appendEvent(domain, task.id, "TASK_REVIEW");
+  const notification = await domain.db.transaction((tx) => notifications.enqueueTx(tx, sequence));
+  const events: unknown[] = [];
+  let sends = 0;
+  const service = new RunService({
+    store: domain,
+    resolveExecution: () => undefined,
+    transport: {
+      send: async () => {
+        sends++;
+        return { status: "unknown", reason: "timeout" };
+      },
+    },
+    onEvent: (event) => {
+      events.push(event);
+    },
+  });
+  try {
+    await service.start();
+    await service.drain();
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "task_notification_changed",
+        notificationId: notification!.id,
+        status: "unknown",
+        reason: "timeout",
+      }),
+    );
+    expect(await domain.tasks.listAttentionItems()).toEqual([]);
+    await service.drain();
+    expect(sends).toBe(1);
+  } finally {
+    await service.stop({ wait: true });
+  }
+});

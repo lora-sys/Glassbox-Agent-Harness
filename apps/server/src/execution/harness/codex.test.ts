@@ -23,7 +23,11 @@ async function fixture(scenario = "success") {
     const fs = require('node:fs'), path = require('node:path'), rl = require('node:readline');
     const scenario = ${JSON.stringify(scenario)}, proofPath = ${JSON.stringify(proof)};
     const messages = [], responses = [];
-    const proof = () => fs.writeFileSync(proofPath, JSON.stringify({pid:process.pid,cwd:process.cwd(),env:process.env,messages,responses}));
+    const proof = () => {
+      const temporary = proofPath + '.' + process.pid + '.tmp';
+      fs.writeFileSync(temporary, JSON.stringify({pid:process.pid,cwd:process.cwd(),env:process.env,messages,responses}));
+      fs.renameSync(temporary, proofPath);
+    };
     const send = value => process.stdout.write(JSON.stringify(value) + '\\n');
     const config = {};
     for(let i=0; i<process.argv.length; i++) if(process.argv[i]==='--config') {
@@ -57,7 +61,12 @@ async function fixture(scenario = "success") {
         });
       }
     });
-    reader.on('close',()=>{proof();process.exit(0)});
+    reader.on('close',()=>{
+      if(scenario==='interrupted-proof') {
+        fs.writeFileSync=file=>{fs.closeSync(fs.openSync(file,'w'));process.exit(0)};
+      }
+      proof();process.exit(0);
+    });
   `;
   await writeFile(item.executablePath, code);
   const config: CodexHarnessOptions = {
@@ -282,6 +291,18 @@ describe("installed Codex Owner Run boundary", () => {
     expect((await item.readProof()).messages.map((message) => message.method)).not.toContain(
       "thread/resume",
     );
+  });
+
+  it("keeps the last complete proof when the child exits during a shutdown write", async () => {
+    const item = await fixture("interrupted-proof");
+    expect(await createCodexHarnessAdapter(item.config).execute(executionInput())).toMatchObject({
+      status: "succeeded",
+      text: "Hello from Codex.",
+    });
+    const proof = await item.readProof();
+    expect(proof.messages.map((message) => message.method)).toContain("turn/start");
+    expect(proof.env.CODEX_HOME).toContain(item.config.dataDirectory);
+    expect(() => process.kill(proof.pid, 0)).toThrow();
   });
 
   it("constructs Windows paths without inheriting arbitrary host fields", () => {

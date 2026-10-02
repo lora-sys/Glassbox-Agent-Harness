@@ -1220,12 +1220,15 @@ describe("durable Run scheduling", () => {
     const causes: Record<ExecutionFailureCode, true> = {
       pre_provider_context_overflow: true,
       model_capacity_unknown: true,
+      model_capability_missing: true,
+      model_credential_missing: true,
       gate_refused: true,
       execution_unavailable: true,
       required_action_not_completed: true,
       claimed_change_not_performed: true,
       required_evidence_missing: true,
       runtime_run_errored: true,
+      runtime_internal_error: true,
       execution_threw: true,
     };
     for (const [index, cause] of Object.keys(causes).entries()) {
@@ -1475,8 +1478,8 @@ describe("durable result delivery and recovery", () => {
         send: async ({ delivery }) => {
           if (delivery.payloadKind === "ack") return { status: "sent" };
           payloads.push(delivery.payloadText);
-          return ++resultSends === 1
-            ? { status: "failed" }
+          return ++resultSends <= 2
+            ? { status: "failed", reason: "api_rejected" }
             : { status: "sent", externalId: "confirmed" };
         },
       },
@@ -1491,8 +1494,15 @@ describe("durable result delivery and recovery", () => {
       (item) => item.payloadKind === "result",
     )!;
     expect(delivery.status).toBe("failed");
+    const attention = (await store.tasks.listAttentionItems())[0]!;
+    expect(attention.summary).toContain("api_rejected");
+    await store.tasks.resolveAttentionItem(attention.id);
     await instance.retryDelivery(owner(), accepted.run.id, delivery.id);
-    expect(payloads).toEqual(["immutable-result", "immutable-result"]);
+    expect(await store.tasks.listAttentionItems()).toHaveLength(1);
+    expect((await store.tasks.listAttentionItems())[0]!.id).toBe(attention.id);
+    await instance.retryDelivery(owner(), accepted.run.id, delivery.id);
+    expect(await store.tasks.listAttentionItems()).toHaveLength(0);
+    expect(payloads).toEqual(["immutable-result", "immutable-result", "immutable-result"]);
     expect(
       (await store.lifecycle.listDeliveries(owner(), accepted.run.id)).items.find(
         (item) => item.id === delivery.id,
@@ -1561,7 +1571,7 @@ describe("durable result delivery and recovery", () => {
     const { store } = await fixture();
     vi.useFakeTimers();
     const sendStarted = deferred<AbortSignal>();
-    const { instance } = service(
+    const { instance, events } = service(
       store,
       { supportsGroup: true, execute: async () => ({ status: "succeeded", text: "result" }) },
       {
@@ -1579,6 +1589,14 @@ describe("durable result delivery and recovery", () => {
     await vi.advanceTimersByTimeAsync(50);
     await instance.drain();
     expect(signal.aborted).toBe(true);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "delivery_changed",
+        status: "unknown",
+        reason: "delivery_timeout",
+      }),
+    );
+    expect((await store.tasks.listAttentionItems())[0]!.summary).toContain("delivery_timeout");
     expect(
       (await store.lifecycle.listDeliveries(owner(), accepted.run.id)).items.find(
         (item) => item.payloadKind === "result",
@@ -1860,5 +1878,170 @@ describe("restart publication window", () => {
           }),
       ).toThrow("Invalid restore window");
     }
+  });
+});
+
+describe("delivery attention safety", () => {
+  it("keeps attention and receipt state intact when explicit retry loses authority", async () => {
+    const { store, grants } = await fixture();
+    const send = vi.fn(async (): Promise<SendOutcome> => ({
+      status: "failed",
+      reason: "api_rejected",
+    }));
+    const { instance } = service(
+      store,
+      { supportsGroup: true, execute: async () => ({ status: "succeeded", text: "result" }) },
+      { send },
+    );
+    await instance.start();
+    const accepted = await instance.receive(input("retry-revoked"));
+    await instance.drain();
+    const delivery = (await store.lifecycle.listDeliveries(owner(), accepted.run.id)).items[0]!;
+    const attention = await store.tasks.listAttentionItems();
+    await store.authorization.revoke(grants.get(scopeKey(group) + "delivery:send")!);
+    await expect(instance.retryDelivery(owner(), accepted.run.id, delivery.id)).rejects.toThrow();
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(await store.tasks.listAttentionItems()).toEqual(attention);
+    expect((await store.lifecycle.listDeliveries(owner(), accepted.run.id)).items[0]).toMatchObject(
+      { status: "failed", externalId: null },
+    );
+  });
+
+  it.each(["code", "throw"])(
+    "never persists provider secrets from an arbitrary %s",
+    async (mode) => {
+      const { store } = await fixture();
+      const canary = "provider-secret-canary-do-not-persist";
+      const { instance, events } = service(
+        store,
+        { supportsGroup: true, execute: async () => ({ status: "succeeded", text: "answer" }) },
+        {
+          send: async () => {
+            if (mode === "throw") throw new Error(canary);
+            return { status: "unknown", reason: canary } as unknown as SendOutcome;
+          },
+        },
+      );
+      await instance.start();
+      const accepted = await instance.receive(input("secret-provider"));
+      await instance.drain();
+      const attention = await store.tasks.listAttentionItems();
+      expect(attention).toHaveLength(1);
+      expect(JSON.stringify(attention)).not.toContain(canary);
+      expect(JSON.stringify(events)).not.toContain(canary);
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: "delivery_changed",
+          status: "unknown",
+          reason: mode === "throw" ? "transport_error" : "unclassified",
+        }),
+      );
+      expect((await instance.getRun(owner(), accepted.run.id)).status).toBe("succeeded");
+    },
+  );
+
+  it("backfills legacy metadata in bounded batches without reopening acknowledged attention", async () => {
+    const { store } = await fixture();
+    const accepted = await store.conversations.acceptIncoming(input("legacy-deliveries"));
+    await store.db.transaction((tx) =>
+      tx.execute({
+        sql: `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 1002)
+        INSERT INTO deliveries(id, run_id, dedup_key, destination_scope_key, payload_text, payload_kind, status, created_at, updated_at)
+        SELECT 'legacy-' || i, ?, 'legacy-' || i, ?, 'payload-must-not-appear', 'result',
+          CASE WHEN i = 1 THEN 'sending' WHEN i = 2 THEN 'failed' ELSE 'unknown' END, ?, ? FROM n`,
+        args: [
+          accepted.run.id,
+          scopeKey(group),
+          new Date().toISOString(),
+          new Date().toISOString(),
+        ],
+      }),
+    );
+    await store.lifecycle.recover();
+    const first = await store.tasks.listAttentionItems();
+    expect(first).toHaveLength(1000);
+    expect(first.find((item) => item.id === "delivery-legacy-1")!.summary).toContain(
+      "process_interrupted",
+    );
+    expect(JSON.stringify(first)).not.toContain("payload-must-not-appear");
+    await store.tasks.resolveAttentionItem("delivery-legacy-1");
+    await store.lifecycle.recover();
+    expect(await store.tasks.listAttentionItems()).toHaveLength(1001);
+    expect(await store.tasks.listAttentionItems(false)).toHaveLength(1002);
+    await store.lifecycle.recover();
+    expect(await store.tasks.listAttentionItems()).toHaveLength(1001);
+    expect((await store.lifecycle.findDelivery(owner(), accepted.run.id, "legacy-1"))?.status).toBe(
+      "unknown",
+    );
+  });
+});
+
+it("paginates delivery inspection by numeric insertion order without leaking another Run", async () => {
+  const { store } = await fixture();
+  const accepted = await store.conversations.acceptIncoming(input("delivery-pages"));
+  const other = await store.conversations.acceptIncoming(
+    input("other-delivery-pages", "other", otherGroup),
+  );
+  const now = new Date().toISOString();
+  await store.db.transaction(async (tx) => {
+    for (const runId of [accepted.run.id, other.run.id])
+      await tx.execute({
+        sql: `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 123)
+          INSERT INTO deliveries(id, run_id, dedup_key, destination_scope_key, payload_text, payload_kind, status, created_at, updated_at)
+          SELECT ? || '-' || i, ?, 'page-' || i, ?, 'safe', 'result', 'unknown', ?, ? FROM n`,
+        args: [runId, runId, scopeKey(runId === accepted.run.id ? group : otherGroup), now, now],
+      });
+  });
+  const ids: string[] = [];
+  let cursor: string | undefined;
+  for (let pageIndex = 0; pageIndex < 3; pageIndex++) {
+    const page = await store.lifecycle.listDeliveries(owner(), accepted.run.id, {
+      cursor,
+      limit: 50,
+    });
+    ids.push(...page.items.map((item) => item.id));
+    expect(page.items.every((item) => item.runId === accepted.run.id)).toBe(true);
+    if (pageIndex < 2) expect(page.nextCursor).not.toBeNull();
+    else expect(page.nextCursor).toBeNull();
+    cursor = page.nextCursor ?? undefined;
+  }
+  expect(ids).toEqual(Array.from({ length: 123 }, (_, index) => `${accepted.run.id}-${index + 1}`));
+  await expect(
+    store.lifecycle.listDeliveries(owner(otherGroup), accepted.run.id),
+  ).rejects.toThrow();
+  await expect(
+    store.lifecycle.listDeliveries(owner(), accepted.run.id, { cursor: "malformed" }),
+  ).rejects.toThrow();
+});
+
+it("does not overwrite unrelated attention on a deterministic delivery identity collision", async () => {
+  const { store } = await fixture();
+  const accepted = await store.conversations.acceptIncoming(input("attention-collision"));
+  const deliveryId = await store.lifecycle.createDelivery(owner(), {
+    runId: accepted.run.id,
+    dedupKey: "result",
+    destination: group,
+    payloadText: "safe",
+    payloadKind: "result",
+  });
+  const attentionId = `delivery-${deliveryId}`;
+  await store.db.transaction((tx) =>
+    tx.execute({
+      sql: "INSERT INTO attention_items(id,kind,summary,conversation_id,created_at) VALUES (?, 'unanswered_message', 'unrelated', ?, ?)",
+      args: [attentionId, accepted.conversation.id, new Date().toISOString()],
+    }),
+  );
+  const lease = await store.lifecycle.claimDelivery(owner(), accepted.run.id, deliveryId);
+  await expect(lease!.settle("unknown", undefined, "timeout")).rejects.toThrow(
+    "Delivery attention identity conflict",
+  );
+  expect((await store.lifecycle.findDelivery(owner(), accepted.run.id, "result"))?.status).toBe(
+    "sending",
+  );
+  expect((await store.tasks.listAttentionItems())[0]).toMatchObject({
+    id: attentionId,
+    kind: "unanswered_message",
+    summary: "unrelated",
+    resolvedAt: null,
   });
 });

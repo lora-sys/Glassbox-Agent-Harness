@@ -36,6 +36,7 @@ import type {
   RedactionInfo,
 } from "@glassbox/contracts";
 import { jaccardSimilarity, tokenizeText } from "./tokenizer.js";
+import { historyLimit, historyTimeWindow } from "./history-time.js";
 import { carriesEveryExactTerm, exactTerms } from "./exact-term.js";
 
 export interface RetrievalCandidate {
@@ -173,7 +174,8 @@ export class MemoryRetriever {
    * coverage and a caller that does not must never disagree about which items matched.
    */
   async searchDetailed(query: string, opts: MemorySearchOpts): Promise<DetailedSearch> {
-    const limit = opts.limit ?? 10;
+    const limit = historyLimit(opts.limit, 10, 200);
+    const { since, until, sinceMs, untilMs } = historyTimeWindow(opts);
     const overFetchLimit = Math.min(200, limit * 10);
     // An identifier query is answered by containment rather than by tokens. `P4B-A-1349`
     // tokenizes to `p4b`, `a`, `1349`, so a message mentioning only `1349` scores as a hit
@@ -202,8 +204,8 @@ export class MemoryRetriever {
       query,
       allowedSourceIds: opts.allowedSourceIds,
       limit: overFetchLimit,
-      since: opts.since,
-      until: opts.until,
+      since,
+      until,
       metadataFilters: opts.metadataFilters,
     });
 
@@ -238,6 +240,20 @@ export class MemoryRetriever {
         continue;
       }
 
+      // Filter by actual instants before deduplication: an out-of-window copy must
+      // not suppress a matching candidate inside the requested window.
+      if (sinceMs !== undefined || untilMs !== undefined) {
+        const timestamp = Date.parse(candidate.timestamp);
+        if (
+          !Number.isSafeInteger(timestamp) ||
+          (sinceMs !== undefined && timestamp < sinceMs) ||
+          (untilMs !== undefined && timestamp > untilMs)
+        ) {
+          coverage.droppedByFilter++;
+          continue;
+        }
+      }
+
       // Duplicate suppression
       if (this.dedupeDuplicates) {
         const normalized = candidate.text.trim().toLowerCase();
@@ -246,16 +262,6 @@ export class MemoryRetriever {
           continue;
         }
         seenTexts.add(normalized);
-      }
-
-      // Time bounds check
-      if (opts.since && candidate.timestamp < opts.since) {
-        coverage.droppedByFilter++;
-        continue;
-      }
-      if (opts.until && candidate.timestamp > opts.until) {
-        coverage.droppedByFilter++;
-        continue;
       }
 
       // Lexical scoring (metadata 2x, body 1x)

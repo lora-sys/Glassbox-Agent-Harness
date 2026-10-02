@@ -36,6 +36,7 @@ export function createSkillTools(options: {
       ),
       action: SKILL_READ_ACTION,
       resourceId: SKILL_CATALOG_RESOURCE,
+      deliverySource: "content_source",
       authService: options.store.authorization,
       getContext: protectedContext,
       execute: async (params, context) => {

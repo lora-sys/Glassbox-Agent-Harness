@@ -7,6 +7,7 @@ import type { TaskStep } from "@glassbox/contracts";
 import { openDomainStore } from "../../application/domain-store.js";
 import { WorkspaceRegistry } from "../../workspace/registry.js";
 import { WorkspaceWriteOccupancy } from "../../workspace/write-occupancy.js";
+import { DurableWorkerObserver } from "../durable-worker-observer.js";
 import { FakeHerdrBridge } from "../fake-herdr-bridge.js";
 import { AuthorizedOpsService } from "../service.js";
 import { DEFAULT_TASK_GRAPH_LIMITS } from "../task-graph.js";
@@ -769,6 +770,109 @@ it("dispatches one Worker, reviews and cancels it safely, and quarantines an unc
     expect(await service.cancel(caller, reworkTask.id)).toBe(false);
     expect(await advance(reworkInput)).toEqual({ kind: "continue" });
     expect(await advance(reworkInput)).toEqual({ kind: "complete" });
+
+    const staleTask = await store.tasks.createTask({
+      title: "Rework a Worker that resumed after output capture",
+      creatorPrincipalId: "owner",
+      authorizationScope: caller.scope,
+    });
+    for (const action of [
+      "task:continue",
+      "task:delegate",
+      "task:rework",
+      "task:read",
+      "worker:read",
+      "task:accept",
+    ])
+      await store.authorization.grant({
+        principalId: "owner",
+        resourceId: `task-${staleTask.id}`,
+        action,
+        scope: caller.scope,
+        effect: "allow",
+      });
+    const staleStep = { ...step, id: "stale-output-step", taskId: staleTask.id };
+    await store.longWork.createGraph(
+      staleTask.id,
+      [staleStep],
+      staleStep.id,
+      DEFAULT_TASK_GRAPH_LIMITS,
+      { kind: "system", reason: "candidate invalidation test" },
+    );
+    const staleInput = { taskId: staleTask.id, policyRevision: 1 };
+    expect(await advance(staleInput)).toEqual({ kind: "continue" });
+    const staleAttempt = (await store.tasks.listAttempts(staleTask.id))[0]!;
+    const staleBinding = (await store.tasks.getWorkerBinding(staleAttempt.id))!;
+    const management = new DurableWorkerObserver(store.db, store.longWork, store.tasks, false);
+    bridge.simulateAgentState(staleBinding.paneId, "done", "original captured output");
+    const recordCandidate = store.longWork.recordWorkerCandidate.bind(store.longWork);
+    const captureRace = vi
+      .spyOn(store.longWork, "recordWorkerCandidate")
+      .mockImplementationOnce(async (input) => {
+        const result = await recordCandidate(input);
+        bridge.simulateAgentState(staleBinding.paneId, "working", "resumed work");
+        await management.observeSnapshot(await bridge.getSnapshot());
+        return result;
+      });
+    expect((await advance(staleInput)).kind).toBe("wait");
+    captureRace.mockRestore();
+    bridge.simulateAgentState(
+      staleBinding.paneId,
+      "done",
+      "later output must not reuse first capture",
+    );
+    expect(await advance(staleInput)).toEqual({ kind: "continue" });
+    expect((await store.longWork.listSteps(staleTask.id))[0]?.status).toBe("blocked");
+    expect(
+      await service.workerCandidate(caller, staleTask.id, staleStep.id, staleAttempt.id),
+    ).toBeNull();
+    expect((await store.longWork.listEvents(staleTask.id)).at(-1)?.evidenceRef).toContain(
+      "worker-output-stale-rework-required",
+    );
+    await expect(
+      service.reworkStep(
+        caller,
+        staleTask.id,
+        staleStep.id,
+        (await store.longWork.listSteps(staleTask.id))[0]!.version,
+        "Replace the stale output",
+      ),
+    ).rejects.toThrow();
+    expect(await advance(staleInput)).toEqual({ kind: "continue" });
+    expect((await store.tasks.getAttempt(staleAttempt.id))?.status).toBe("failed");
+    await service.reworkStep(
+      caller,
+      staleTask.id,
+      staleStep.id,
+      (await store.longWork.listSteps(staleTask.id))[0]!.version,
+      "Old Worker closed; capture a fresh result",
+    );
+    expect(await advance(staleInput)).toEqual({ kind: "continue" });
+    const freshAttempt = (await store.tasks.listAttempts(staleTask.id)).at(-1)!;
+    expect(freshAttempt.id).not.toBe(staleAttempt.id);
+    const freshBinding = (await store.tasks.getWorkerBinding(freshAttempt.id))!;
+    bridge.simulateAgentState(freshBinding.paneId, "done", "fresh accepted candidate");
+    expect(await advance(staleInput)).toEqual({ kind: "continue" });
+    expect(
+      (await service.workerCandidate(caller, staleTask.id, staleStep.id, freshAttempt.id))
+        ?.outputExcerpt,
+    ).toContain("fresh accepted candidate");
+    expect(
+      await service.workerCandidate(caller, staleTask.id, staleStep.id, staleAttempt.id),
+    ).toBeNull();
+    expect(
+      (await store.longWork.getWorkerCandidate(staleTask.id, staleStep.id, staleAttempt.id))
+        ?.outputExcerpt,
+    ).toContain("original captured output");
+    expect((await store.tasks.getTask(staleTask.id))?.status).not.toBe("DONE");
+    await service.acceptStep(
+      caller,
+      staleTask.id,
+      staleStep.id,
+      (await store.longWork.listSteps(staleTask.id))[0]!.version,
+    );
+    expect((await store.tasks.getTask(staleTask.id))?.status).not.toBe("DONE");
+    expect(writes.status(workspace.id)).toBe("free");
 
     const revokedTask = await store.tasks.createTask({
       title: "Revoke while Worker runs",

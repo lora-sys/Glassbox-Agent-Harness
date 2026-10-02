@@ -27,11 +27,15 @@ describe("keyless Exa MCP adapter", () => {
     }));
     const result = await new ExaMcpProvider({ call }).search({ query: "test", maxResults: 100 });
     expect(result.status).toBe("rate_limited");
-    expect(call).toHaveBeenCalledWith("web_search_exa", {
-      query: "test",
-      numResults: 10,
-      objective: "Find public sources that directly answer this query: test",
-    });
+    expect(call).toHaveBeenCalledWith(
+      "web_search_exa",
+      {
+        query: "test",
+        numResults: 10,
+        objective: "Find public sources that directly answer this query: test",
+      },
+      undefined,
+    );
   });
 
   it("rejects private URLs before calling hosted Exa", async () => {
@@ -39,5 +43,38 @@ describe("keyless Exa MCP adapter", () => {
     const provider = new ExaMcpProvider({ call }, publicResolver);
     await expect(provider.contents("http://127.0.0.1/")).rejects.toThrow("web_target_non_public");
     expect(call).not.toHaveBeenCalled();
+  });
+});
+
+describe("MCP transport failure classification", () => {
+  it.each([
+    [401, "auth_missing"],
+    [403, "auth_missing"],
+    [402, "quota_exhausted"],
+    [429, "rate_limited"],
+    [500, "failed"],
+    [-32001, "timeout"],
+  ])("reports code %s as %s without exposing transport details", async (code, status) => {
+    const call = vi.fn<ExaMcpCaller["call"]>(async () => {
+      throw Object.assign(
+        new Error("secret-query=https://private.invalid/token?credential=canary"),
+        { code },
+      );
+    });
+    const provider = new ExaMcpProvider({ call }, publicResolver);
+    expect(await provider.search({ query: "public", maxResults: 1 })).toEqual({
+      status,
+      results: [],
+    });
+    expect(await provider.contents("https://example.com/a")).toEqual({ status, results: [] });
+  });
+  it("does not classify arbitrary error-body digits as an HTTP status", async () => {
+    const call = vi.fn<ExaMcpCaller["call"]>(async () => {
+      throw new Error("example URL /429 and a private token");
+    });
+    expect(await new ExaMcpProvider({ call }).search({ query: "public", maxResults: 1 })).toEqual({
+      status: "failed",
+      results: [],
+    });
   });
 });

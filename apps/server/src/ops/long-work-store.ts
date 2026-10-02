@@ -42,6 +42,12 @@ export const MAX_CHECKPOINT_PROJECTION_BYTES = 2048;
 export const MAX_WORKER_CANDIDATE_INPUT_BYTES = 1024 * 1024;
 export const MAX_WORKER_CANDIDATE_EXCERPT_BYTES = 16 * 1024;
 export const MAX_WORKER_FILE_ARTIFACT_BYTES = 256 * 1024;
+export class WorkerCandidateStaleError extends Error {
+  constructor() {
+    super("Worker resumed after result capture; close the Worker and request a new attempt");
+    this.name = "WorkerCandidateStaleError";
+  }
+}
 export class WorkerCandidateLimitError extends Error {
   constructor() {
     super("Worker candidate output exceeds the input byte limit");
@@ -987,6 +993,7 @@ export class LongWorkStore {
     expectedStepVersion: number;
     expectedLeaseVersion: number;
     output: string;
+    expectedObservation?: { state: "done" | "idle"; observedAt: string; sequence?: number };
     artifact?: { relativePath: string; contentText: string; sha256: string };
   }): Promise<string> {
     for (const value of [
@@ -1006,6 +1013,15 @@ export class LongWorkStore {
       input.expectedLeaseVersion < 1
     )
       throw new Error("Invalid Worker candidate claim");
+    if (
+      input.expectedObservation &&
+      (!["done", "idle"].includes(input.expectedObservation.state) ||
+        !Number.isFinite(Date.parse(input.expectedObservation.observedAt)) ||
+        (input.expectedObservation.sequence !== undefined &&
+          (!Number.isSafeInteger(input.expectedObservation.sequence) ||
+            input.expectedObservation.sequence < 1)))
+    )
+      throw new Error("Invalid Worker candidate observation");
     const candidate = workerOutputExcerpt(input.output);
     const artifact = input.artifact;
     if (artifact) {
@@ -1025,7 +1041,8 @@ export class LongWorkStore {
       const claim = await tx.execute({
         sql: `SELECT t.orchestration_mode, s.kind, s.spec_ref, s.status AS step_status, s.version AS step_version,
             a.status AS attempt_status, l.state AS lease_state, l.version AS lease_version,
-            l.owner_instance_id, l.worker_binding_id, l.expires_at, b.id AS binding_id
+            l.owner_instance_id, l.worker_binding_id, l.expires_at, b.id AS binding_id,
+            b.last_observed_agent_state, b.updated_at AS observed_at
           FROM tasks t
           JOIN task_steps s ON s.task_id = t.id AND s.id = ?
           JOIN task_attempts a ON a.task_id = t.id AND a.step_id = s.id AND a.id = ?
@@ -1051,6 +1068,28 @@ export class LongWorkStore {
         Date.parse(stringColumn(claimRow, "expires_at")) <= Date.now()
       )
         throw new Error("Worker candidate claim conflict");
+      const invalidation = await tx.execute({
+        sql: `SELECT 1 FROM ops_trace_events WHERE task_id = ? AND task_attempt_id = ?
+          AND type = 'worker.state_observed' AND json_extract(data_json, '$.candidateInvalidated') = 1 LIMIT 1`,
+        args: [input.taskId, input.attemptId],
+      });
+      if (invalidation.rows[0]) throw new WorkerCandidateStaleError();
+      if (
+        input.expectedObservation &&
+        (claimRow.last_observed_agent_state !== input.expectedObservation.state ||
+          Date.parse(stringColumn(claimRow, "observed_at")) !==
+            Date.parse(input.expectedObservation.observedAt))
+      )
+        throw new Error("Worker observation conflict");
+      if (input.expectedObservation?.sequence !== undefined) {
+        const observation = await tx.execute({
+          sql: `SELECT MAX(sequence) AS sequence FROM ops_trace_events
+            WHERE task_id = ? AND task_attempt_id = ? AND type = 'worker.state_observed'`,
+          args: [input.taskId, input.attemptId],
+        });
+        if (Number(observation.rows[0]?.sequence) !== input.expectedObservation.sequence)
+          throw new Error("Worker observation conflict");
+      }
       const fileSpec = parseWorkerTextFileSpec(optionalString(claimRow, "spec_ref") ?? "");
       if (fileSpec && !artifact)
         throw new Error("Worker file artifact required by Step specification");
@@ -1405,6 +1444,16 @@ export class LongWorkStore {
         (input.workerBindingId !== undefined && owner.worker_binding_id !== input.workerBindingId)
       )
         throw new Error("Step lease ownership conflict");
+      if (input.outcome === "review" && input.workerBindingId) {
+        const invalidation = await tx.execute({
+          sql: `SELECT 1 FROM ops_trace_events WHERE task_id = ? AND task_attempt_id = ?
+            AND type = 'worker.state_observed' AND json_extract(data_json, '$.candidateInvalidated') = 1 LIMIT 1`,
+          args: [input.taskId, input.attemptId],
+        });
+        // A Worker may resume and finish again between capture and settlement,
+        // even within one timestamp. The original candidate cannot enter review.
+        if (invalidation.rows[0]) throw new Error("Worker observation conflict");
+      }
       const now = new Date().toISOString();
       const nextStepStatus = input.outcome === "unknown" ? "blocked" : input.outcome;
       const nextAttemptStatus = input.outcome === "unknown" ? "waiting_input" : input.outcome;
@@ -1450,7 +1499,7 @@ export class LongWorkStore {
         throw new Error("Step settlement conflict");
       if (input.observedAgentState && input.workerBindingId) {
         const currentBinding = await tx.execute({
-          sql: "SELECT updated_at FROM worker_bindings WHERE id = ? AND task_attempt_id = ?",
+          sql: "SELECT updated_at,last_observed_agent_state FROM worker_bindings WHERE id = ? AND task_attempt_id = ?",
           args: [input.workerBindingId, input.attemptId],
         });
         const currentObservedAt = currentBinding.rows[0]
@@ -1458,7 +1507,9 @@ export class LongWorkStore {
           : Number.NaN;
         if (
           !Number.isFinite(currentObservedAt) ||
-          Date.parse(input.observedAt!) < currentObservedAt
+          Date.parse(input.observedAt!) < currentObservedAt ||
+          (input.outcome === "review" &&
+            currentBinding.rows[0]?.last_observed_agent_state !== input.observedAgentState)
         )
           throw new Error("Worker observation conflict");
         const observed = await tx.execute({
@@ -2670,7 +2721,7 @@ export class LongWorkStore {
     observedAt: string;
     evidenceRef: string;
     origin: LongWorkOrigin;
-  }): Promise<void> {
+  }): Promise<{ completed: boolean; sequence: number }> {
     for (const value of [
       input.taskId,
       input.stepId,
@@ -2720,6 +2771,29 @@ export class LongWorkStore {
       )
         throw new Error("Step lease ownership conflict");
       const now = new Date().toISOString();
+      const previousBinding = await tx.execute({
+        sql: "SELECT agent_kind,last_observed_agent_state FROM worker_bindings WHERE id = ? AND task_attempt_id = ?",
+        args: [input.workerBindingId, input.attemptId],
+      });
+      const previous = await tx.execute({
+        sql: `SELECT json_extract(data_json, '$.state') AS state,
+            json_extract(data_json, '$.completionObserved') AS completion_observed,
+            json_extract(data_json, '$.candidateInvalidated') AS candidate_invalidated
+          FROM ops_trace_events WHERE task_id = ? AND task_attempt_id = ?
+            AND type = 'worker.state_observed' AND json_extract(data_json, '$.state') != 'unknown'
+          ORDER BY sequence DESC LIMIT 1`,
+        args: [input.taskId, input.attemptId],
+      });
+      // Keep the last meaningful observation through a monitoring gap. Repeated idle
+      // observations preserve completion until the owner settles or the Worker resumes.
+      const previousState =
+        previous.rows[0]?.state ?? previousBinding.rows[0]?.last_observed_agent_state;
+      const completed =
+        input.state === "done" ||
+        (input.state === "idle" &&
+          previousBinding.rows[0]?.agent_kind === "pi" &&
+          (previousState === "working" ||
+            (previousState === "idle" && previous.rows[0]?.completion_observed === 1)));
       const binding = await tx.execute({
         sql: "UPDATE worker_bindings SET last_observed_agent_state = ?, updated_at = ? WHERE id = ? AND task_attempt_id = ? AND updated_at <= ?",
         args: [
@@ -2731,6 +2805,37 @@ export class LongWorkStore {
         ],
       });
       if (binding.rowsAffected !== 1) throw new Error("Worker observation conflict");
+      const captured =
+        input.state === "working"
+          ? await tx.execute({
+              sql: "SELECT 1 FROM worker_candidate_outputs WHERE task_id = ? AND step_id = ? AND attempt_id = ? AND worker_binding_id = ?",
+              args: [input.taskId, input.stepId, input.attemptId, input.workerBindingId],
+            })
+          : undefined;
+      const candidateInvalidated = !!captured?.rows[0];
+      if (
+        previousBinding.rows[0]?.last_observed_agent_state !== input.state ||
+        !previous.rows[0] ||
+        (candidateInvalidated && previous.rows[0]?.candidate_invalidated !== 1)
+      )
+        await tx.execute({
+          sql: `INSERT INTO ops_trace_events(event_id,ts,type,task_id,task_attempt_id,data_json)
+            VALUES (?,?,'worker.state_observed',?,?,?)`,
+          args: [
+            randomUUID(),
+            now,
+            input.taskId,
+            input.attemptId,
+            JSON.stringify({
+              state: input.state,
+              observedAt: input.observedAt,
+              workerBindingId: input.workerBindingId,
+              evidenceRef: input.evidenceRef,
+              completionObserved: completed,
+              ...(candidateInvalidated ? { candidateInvalidated: true } : {}),
+            }),
+          ],
+        });
 
       if (input.state === "blocked") {
         await tx.execute({
@@ -2785,6 +2890,12 @@ export class LongWorkStore {
             args: [now, input.taskId],
           });
       }
+      const observation = await tx.execute({
+        sql: `SELECT MAX(sequence) AS sequence FROM ops_trace_events
+          WHERE task_id = ? AND task_attempt_id = ? AND type = 'worker.state_observed'`,
+        args: [input.taskId, input.attemptId],
+      });
+      return { completed, sequence: Number(observation.rows[0]?.sequence) };
     });
   }
 

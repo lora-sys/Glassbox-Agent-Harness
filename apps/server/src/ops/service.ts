@@ -1,3 +1,12 @@
+import {
+  readPolicyCondition,
+  type AuthorizationPolicyCondition,
+} from "../auth/policy-condition.js";
+import {
+  readTaskSourceRows,
+  reauthorizeSourceRows,
+  sourceClassification,
+} from "../auth/source-dependencies.js";
 import { createHash, randomUUID } from "node:crypto";
 import type {
   AgentOpsSnapshot,
@@ -8,7 +17,11 @@ import type {
   TaskSignal,
   TaskStep,
 } from "@glassbox/contracts";
-import { AccessDeniedError, type AuthorizationDecision } from "../auth/service.js";
+import {
+  AccessDeniedError,
+  type AuthorizationDecision,
+  type AuthorizedReadReceipt,
+} from "../auth/service.js";
 import { scopeKey, type CallerContext } from "../identity/scope.js";
 import type { DomainStore } from "../persistence/index.js";
 import { stringColumn } from "../persistence/database.js";
@@ -155,6 +168,39 @@ export class AuthorizedOpsService {
     );
   }
 
+  private async authorizeTaskSources(
+    caller: CallerContext,
+    taskId: string,
+    evidence?: RunEvidence,
+  ): Promise<AuthorizedReadReceipt[]> {
+    const reads: AuthorizedReadReceipt[] = [];
+    const result = await this.store.db.transaction(async (tx) =>
+      reauthorizeSourceRows(
+        tx,
+        caller,
+        await readTaskSourceRows(tx, taskId),
+        evidence ?? {},
+        reads,
+      ),
+    );
+    if ("denied" in result) throw new AccessDeniedError(result.denied);
+    return reads;
+  }
+
+  private async readReceipt(
+    caller: CallerContext,
+    resourceId: string,
+    action: string,
+    evidence?: RunEvidence,
+  ): Promise<AuthorizedReadReceipt> {
+    const decision = await this.authorize(caller, resourceId, action, evidence);
+    return {
+      request: { caller, resourceId, action, ...evidence },
+      decisionId: decision.id,
+      source: "content_source",
+    };
+  }
+
   private async workerContext(
     caller: CallerContext,
     taskId: string,
@@ -162,6 +208,11 @@ export class AuthorizedOpsService {
     root?: string,
     delegated?: Pick<TaskStep, "delegatedPermissionSet">,
   ): Promise<WorkerContext | undefined> {
+    await this.authorizeTaskSources(
+      caller,
+      taskId,
+      delegated ? { delegatedTaskId: taskId } : undefined,
+    );
     if (!this.workerPolicy) {
       if (this.workspaceBoundary) throw new Error("Worker has no bounded file policy");
       return undefined;
@@ -284,11 +335,13 @@ export class AuthorizedOpsService {
     resourceId: string,
     action: string,
     evidence?: RunEvidence,
+    policyCondition?: AuthorizationPolicyCondition | null,
   ): Promise<AuthorizationDecision> {
     const decision = await this.store.authorization.check({
       caller,
       resourceId,
       action,
+      policyCondition,
       ...evidence,
     });
     await this.store.tasks.recordAuthorizationTrace({
@@ -346,19 +399,37 @@ export class AuthorizedOpsService {
     return this.store.tasks.listTasks({ caller, ...evidence });
   }
 
-  async get(caller: CallerContext, taskId: string): Promise<AgentTask | null> {
-    await this.authorize(caller, `task-${taskId}`, "task:read");
-    return this.store.tasks.getTask(taskId);
+  async get(
+    caller: CallerContext,
+    taskId: string,
+    evidence?: RunEvidence,
+  ): Promise<AgentTask | null> {
+    const read = await this.readReceipt(caller, `task-${taskId}`, "task:read", evidence);
+    const sources = await this.authorizeTaskSources(caller, taskId, evidence);
+    const result = await this.store.tasks.getTask(taskId);
+    await this.store.authorization.authorizeReadResults([read, ...sources]);
+    return result;
   }
 
-  async steps(caller: CallerContext, taskId: string): Promise<TaskStep[]> {
-    await this.authorize(caller, `task-${taskId}`, "task:read");
-    return this.store.longWork.listSteps(taskId);
+  async steps(caller: CallerContext, taskId: string, evidence?: RunEvidence): Promise<TaskStep[]> {
+    const read = await this.readReceipt(caller, `task-${taskId}`, "task:read", evidence);
+    const sources = await this.authorizeTaskSources(caller, taskId, evidence);
+    const result = await this.store.longWork.listSteps(taskId);
+    await this.store.authorization.authorizeReadResults([read, ...sources]);
+    return result;
   }
 
-  async taskEvents(caller: CallerContext, taskId: string, afterSequence = 0) {
-    await this.authorize(caller, `task-${taskId}`, "task:read");
-    return this.store.longWork.listEvents(taskId, afterSequence);
+  async taskEvents(
+    caller: CallerContext,
+    taskId: string,
+    afterSequence = 0,
+    evidence?: RunEvidence,
+  ) {
+    const read = await this.readReceipt(caller, `task-${taskId}`, "task:read", evidence);
+    const sources = await this.authorizeTaskSources(caller, taskId, evidence);
+    const result = await this.store.longWork.listEvents(taskId, afterSequence);
+    await this.store.authorization.authorizeReadResults([read, ...sources]);
+    return result;
   }
 
   /** Resolves only the configured Pi workspace authority for a planned Worker Step. */
@@ -1054,11 +1125,11 @@ export class AuthorizedOpsService {
     const sources = await this.store.tasks.workerSourceResources(taskId);
     const resourceIds = new Set(sources.map((source) => source.resourceId));
     if (this.workerPolicy) resourceIds.add(this.workerPolicy.resourceId);
-    const sourceDecisionIds: string[] = [];
+    const reads: AuthorizedReadReceipt[] = [
+      await this.readReceipt(caller, `task-${taskId}`, "worker:read", evidence),
+    ];
     for (const resourceId of resourceIds)
-      sourceDecisionIds.push(
-        (await this.authorize(caller, resourceId, "worker:file:read", evidence)).id,
-      );
+      reads.push(await this.readReceipt(caller, resourceId, "worker:file:read", evidence));
     if (this.workspaceBoundary && sources.length) {
       if (!binding.worktreePath) throw new Error("Worker source directory is unavailable");
       const boundPath = await realpath(binding.worktreePath);
@@ -1087,22 +1158,21 @@ export class AuthorizedOpsService {
         );
         if (workspace.canonicalPath !== boundPath)
           throw new Error("Worker source directory differs from the bound workspace");
-        const decision = await this.authorize(
+        const read = await this.readReceipt(
           caller,
           `workspace:${workspaceId}`,
           "workspace:read",
           evidence,
         );
-        sourceDecisionIds.push(decision.id);
+        reads.push(read);
       }
     }
+    reads.push(...(await this.authorizeTaskSources(caller, taskId, evidence)));
     const result = await this.bridge.readAgent({
       paneId: binding.paneId,
       agentName: binding.agentName,
     });
-    if (evidence?.runId)
-      for (const decisionId of sourceDecisionIds)
-        await this.store.authorization.markDeliverySource(decisionId, "content_source");
+    await this.store.authorization.authorizeReadResults(reads);
     return result;
   }
 
@@ -1244,32 +1314,21 @@ export class AuthorizedOpsService {
     }
     // The Worker instructions may have been planned from protected Run content.
     // A child Worker inherits the same obligation from every parent Task origin.
-    const originSources = await this.store.db.transaction(async (tx) => {
-      const rows = await tx.execute({
-        sql: `WITH RECURSIVE lineage(task_id,depth) AS (
-            SELECT ?,0
-            UNION ALL
-            SELECT links.parent_task_id,lineage.depth + 1
-              FROM task_child_links links JOIN lineage ON links.child_task_id = lineage.task_id
-              WHERE lineage.depth < 4
-          )
-          SELECT DISTINCT d.resource_id,d.action FROM lineage
-            JOIN tasks task ON task.id = lineage.task_id
-            JOIN authorization_decisions d ON d.run_id = task.run_id
-          WHERE d.decision = 'ALLOW' AND d.delivery_source IS NOT NULL LIMIT 129`,
-        args: [taskId],
-      });
-      if (rows.rows.length > 128)
-        throw new Error("Worker result has too many protected origin sources");
-      return rows.rows.map((row) => ({
-        resourceId: stringColumn(row, "resource_id"),
-        action: stringColumn(row, "action"),
-      }));
-    });
-    for (const source of originSources)
-      decisions.push(
-        await this.authorize(caller, source.resourceId, source.action, delegatedEvidence),
+    const originSources = await this.store.db.transaction((tx) => readTaskSourceRows(tx, taskId));
+    for (const source of originSources) {
+      const decision = await this.authorize(
+        caller,
+        stringColumn(source, "resource_id"),
+        stringColumn(source, "action"),
+        delegatedEvidence,
+        readPolicyCondition(source),
       );
+      if (evidence?.runId)
+        await this.store.authorization.markDeliverySource(
+          decision.id,
+          sourceClassification(source),
+        );
+    }
     if (evidence?.runId)
       for (const decision of decisions)
         await this.store.authorization.markDeliverySource(decision.id, "content_source");

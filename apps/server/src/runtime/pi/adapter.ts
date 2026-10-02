@@ -15,6 +15,7 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { KitLoader, type ResolvedKitProfile } from "./kit-loader.js";
+import { classifyPiRuntimeFailure, type PiFailureDiagnostic } from "./failure-diagnostics.js";
 import { QQ_CAPABILITY_CATEGORIES } from "../../channels/onebot/capabilities.js";
 import {
   estimateUnicodeTokens,
@@ -72,6 +73,7 @@ interface ActiveSession {
   retryableDuplicateKeys: Set<string>;
   contextBudgetEvidence?: Record<string, unknown>;
   pendingBudgetFailure?: string;
+  pendingSourceFailure?: string;
   sandboxToolSession?: SandboxToolSession;
   sandboxWorkspaceId?: string;
   sandboxPrincipalId?: string;
@@ -741,6 +743,7 @@ function normalizeEvent(
   event: AgentSessionEvent,
   run?: AgentRun,
   context?: PiRunContext,
+  failure?: PiFailureDiagnostic,
 ): PiNormalizedEvent | null {
   const timestamp = new Date().toISOString();
   const runId = run?.id ?? context?.runId;
@@ -781,6 +784,11 @@ function normalizeEvent(
                 provider: event.message.provider,
                 model: event.message.model,
                 stopReason: event.message.stopReason,
+                ...(failure
+                  ? { failure }
+                  : event.message.stopReason === "error"
+                    ? { failure: classifyPiRuntimeFailure(event.message.errorMessage) }
+                    : {}),
                 usage: {
                   inputTokens: event.message.usage.input,
                   outputTokens: event.message.usage.output,
@@ -1076,6 +1084,7 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
         ? `${base}\n\nThe current request requires the ${requiredCallClause(
             requiredToolName,
             runContext?.requiredToolInput,
+            runContext?.caller?.scope.chatType,
           )}. Call it before reporting the action as completed. Do not ask for a second confirmation and never claim execution without a successful tool result.`
         : base;
       // This guides Tool choice. The evidence gate below the model remains authoritative.
@@ -1449,6 +1458,30 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
           : undefined,
     });
     runtimeSessionId = created.session.sessionId;
+    // Extension hook errors are swallowed by Pi, and aborting a context hook alone
+    // can still start a stream. Guard the public stream boundary and its final payload
+    // callback directly so denied Context can never reach the provider transport.
+    const providerStream = created.session.agent.streamFunction;
+    const authorizeProviderContext = async () => {
+      try {
+        await this.runContexts.get(created.session.sessionId)?.authorizeProviderContext?.();
+      } catch {
+        const active = this.sessions.get(created.session.sessionId);
+        if (active) active.pendingSourceFailure = "source_context_revoked";
+        throw new Error("source_context_revoked");
+      }
+    };
+    created.session.agent.streamFunction = async (model, providerContext, options) => {
+      await authorizeProviderContext();
+      return providerStream(model, providerContext, {
+        ...options,
+        onPayload: async (payload, payloadModel) => {
+          const projected = (await options?.onPayload?.(payload, payloadModel)) ?? payload;
+          await authorizeProviderContext();
+          return projected;
+        },
+      });
+    };
     const actualModel = created.session.model ?? configuredModel;
     const actualThinkingLevel =
       actualModel?.reasoning === true
@@ -1502,6 +1535,7 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
         text: "当前配置的模型不支持识别图片，因此没有发送图片。请切换到支持视觉输入的模型后重试。",
         toolCalls: [],
         error: "model_does_not_support_images",
+        failure: { origin: "glassbox", category: "model_capability" },
       };
     if (
       run.conversationId !== binding.conversationId ||
@@ -1530,7 +1564,18 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
         active.turnToolResults = [];
         active.turnInputBudgetTokens = undefined;
       }
-      const normalized = normalizeEvent(active.session.sessionId, event, run, context);
+      const localFailure: PiFailureDiagnostic | undefined = active.pendingSourceFailure
+        ? { origin: "glassbox", category: "source_authorization" }
+        : active.pendingBudgetFailure
+          ? { origin: "glassbox", category: "context_budget" }
+          : undefined;
+      const normalized = normalizeEvent(
+        active.session.sessionId,
+        event,
+        run,
+        context,
+        localFailure,
+      );
       if (normalized?.type === "session_start") {
         normalized.data = {
           ...normalized.data,
@@ -1614,6 +1659,7 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
     });
     try {
       active.pendingBudgetFailure = undefined;
+      active.pendingSourceFailure = undefined;
       await active.session.prompt(prompt, {
         source: "rpc",
         ...(images?.length
@@ -1627,15 +1673,30 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
           : {}),
       });
       await eventQueue;
+      if (active.pendingSourceFailure)
+        return {
+          status: "error",
+          text: "",
+          toolCalls,
+          error: active.pendingSourceFailure,
+          failure: { origin: "glassbox", category: "source_authorization" },
+        };
       if (active.pendingBudgetFailure)
         return {
           status: "error",
           text: "",
           toolCalls: [],
           error: active.pendingBudgetFailure,
+          failure: { origin: "glassbox", category: "context_budget" },
         };
       if (evidenceFailed)
-        return { status: "error", text: "", toolCalls: [], error: "trace_write_failed" };
+        return {
+          status: "error",
+          text: "",
+          toolCalls: [],
+          error: "trace_write_failed",
+          failure: { origin: "glassbox", category: "trace_write" },
+        };
       const last = [...active.session.messages]
         .reverse()
         .find((message) => (message as { role?: string }).role === "assistant") as
@@ -1665,14 +1726,27 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
             }
           : undefined,
         error: last?.errorMessage,
+        ...(last?.stopReason === "error"
+          ? { failure: classifyPiRuntimeFailure(last.errorMessage) }
+          : {}),
       };
     } catch (error) {
       return {
         status: "error",
-        text: active.pendingBudgetFailure ? "" : text,
+        text: active.pendingBudgetFailure || active.pendingSourceFailure ? "" : text,
         toolCalls: active.pendingBudgetFailure ? [] : toolCalls,
         error:
-          active.pendingBudgetFailure ?? (error instanceof Error ? error.message : String(error)),
+          active.pendingSourceFailure ??
+          active.pendingBudgetFailure ??
+          (error instanceof Error ? error.message : String(error)),
+        failure: {
+          origin: "glassbox",
+          category: active.pendingSourceFailure
+            ? "source_authorization"
+            : active.pendingBudgetFailure
+              ? "context_budget"
+              : "runtime_exception",
+        },
       };
     } finally {
       unsubscribe();

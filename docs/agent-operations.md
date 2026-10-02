@@ -110,9 +110,11 @@ Glassbox review REWORK
 → create or resume another attempt
 ```
 
-Pi's native Herdr integration reports `working`, `idle`, and `blocked`. For a Pi attempt, an `idle` observation can enter REVIEW only after Glassbox has persisted a `working` observation for that same attempt and the previous observed state is `working`. An initial idle pane is not evidence of completed work. Raw Trace retains the reported `idle` state. This mapping never accepts a Task or marks it DONE.
+Pi's native Herdr integration reports `working`, `idle`, and `blocked`. For a Pi attempt, an `idle` observation can enter REVIEW only after Glassbox has persisted a `working` observation for that same attempt. Monitoring gaps marked `unknown` do not erase that evidence; `blocked` does not count as completed work. An initial idle pane is not evidence of completion. Durable Worker observations atomically retain the working-to-idle completion evidence in append-only Raw Trace, separately from the latest displayed Worker state. Repeated management observations and a database reopen cannot consume that evidence before the authorized Temporal owner captures the result and settles the Step. Newer working observations supersede an older idle observation. This mapping never accepts a Task or marks it DONE.
 
 For a durable Herdr Step, Glassbox records the first terminal Worker output against its live TaskAttempt and WorkerBinding before the Step enters REVIEW. The stored candidate is immutable. It contains a SHA-256 digest of the bounded read and at most 16 KiB of terminal excerpt. The Step holds an opaque `worker-result` reference. A later read requires that exact Step and Attempt to be in review or succeeded state and checks current Task and Worker read grants, read grants for every declared file and workspace source, and protected sources from the Task's planning Run and ancestor Tasks. This permits review after Herdr closes the pane without exposing a captured output before Step settlement. After Step acceptance, a directly dependent Model Step can receive a bounded excerpt, including one from an accepted child Task's Worker root. The receiving Run rechecks the source grants and records them for delivery review. The excerpt is untrusted evidence, not a verified file artifact, and does not accept the Step or Task.
+
+If Glassbox observes the same Worker resume work after its first output capture, it appends a candidate-invalidation marker to that attempt's observation Trace. The original candidate and declared file remain immutable, including across restart. A later completion cannot expose or reuse them for review. The Temporal owner records `worker-output-stale-rework-required`, blocks the Step, and quarantines its lease. The existing verified pane-closure path must release the old Worker before an authorized explicit Step Rework creates a new attempt and fresh candidate. First capture compares the current binding state, observation timestamp, and append-only observation sequence inside its write transaction. A changed observation prevents insertion, including a working-to-idle cycle within one timestamp. Settlement checks candidate invalidation again in its transaction. These checks never accept a Step or Task.
 
 ## Core domain
 
@@ -259,6 +261,10 @@ open event subscription connection
 ```
 
 After connection loss, repeat snapshot reconciliation.
+
+Both legacy and durable observations compare the original event or snapshot timestamp with the persisted binding timestamp under the database transaction. A buffered event older than the bootstrap or reconnect snapshot cannot change Task state. Legacy reconciliation also carries the exact binding and attempt identity into that transaction, so a replacement attempt cannot receive an earlier binding's observation.
+
+Join barriers and overdue timers perform no external work. If an Activity stops after their running transition commits, the next advance completes the same Step without recording a second start. Cancellation settles these running Steps without waiting for a Worker that does not exist. These recoveries do not apply to Model, Tool, or Herdr Steps, whose side effects still require their existing attempt, lease, and outcome evidence.
 
 A monitoring gap must not silently change a Task to DONE or FAILED.
 
@@ -476,3 +482,31 @@ large-scale worker scheduling
 ```
 
 Do not build those mechanisms in P3 unless a current completion-gate requirement proves they are necessary.
+
+### Unconfirmed direct delivery attention
+
+Direct Run delivery preserves execution and transport as separate facts. A successful Run
+may have an `unknown` delivery: a timeout, disconnect, or lost acknowledgement does not
+prove that QQ did not receive the message. Such deliveries are never automatically replayed
+or rewritten as confirmed failure. `RunService.retryDelivery` accepts only confirmed
+`failed` deliveries and rechecks current grants and protected content sources.
+
+The direct-delivery settlement transaction creates one durable `delivery_failed` attention
+item per failed or unconfirmed delivery. Its fixed summary distinguishes failure from
+uncertainty and includes bounded reason codes and Run/delivery identifiers, never the
+message payload or provider error text. Authenticated local `GET /manage/attention` exposes
+these items; model-facing scoped Ops snapshots do not acquire this non-Task information.
+The final `delivery_changed` Trace event carries the same fixed diagnostic reason. Task
+notification Trace events also preserve their transport reason, without creating a new
+notification attention workflow.
+
+Startup recovery marks interrupted sends unknown and backfills at most 1,000 missing
+attention items per start, prioritizing interrupted sends. Larger legacy backlogs need
+additional recovery passes. Existing items, including acknowledged items, are not reopened
+by recovery. A new explicit failed delivery attempt can reopen its item; only a confirmed
+sent outcome resolves it automatically. Acknowledging attention does not establish delivery.
+Unknown delivery currently requires manual inspection of provider or recipient evidence:
+there is no receipt-reconciliation action, safe unknown retry API, or guarantee that a new
+send would not duplicate an already received message. This addresses visibility and reason
+loss in Issue #110; automatic retry of unknown remains unsupported without deduplication or
+conclusive post-send evidence.

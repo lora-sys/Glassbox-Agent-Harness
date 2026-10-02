@@ -54,24 +54,28 @@ export class LongWorkScheduler {
 
       // A join is a no-op barrier. It may finish once all of its dependencies are terminal
       // and dependency policy has allowed it to become ready. It performs no protected work.
+      // A prior Activity may have stopped between the running and succeeded commits.
       const joins = steps.filter(
         (step) =>
           step.kind === "join" &&
-          step.status === "ready" &&
+          ["ready", "running"].includes(step.status) &&
           step.dependencyIds.every((id) => isTerminal(steps.find((item) => item.id === id)!)),
       );
       for (const join of joins) {
-        const running = await this.store.transitionStep({
-          taskId,
-          stepId: join.id,
-          expectedVersion: join.version,
-          from: "ready",
-          to: "running",
-          origin,
-          metadata: { scheduler: "join" },
-        });
-        steps = replaceStep(steps, running);
-        recorded.push({ stepId: join.id, status: "running", reason: "barrier_satisfied" });
+        let running = join;
+        if (join.status === "ready") {
+          running = await this.store.transitionStep({
+            taskId,
+            stepId: join.id,
+            expectedVersion: join.version,
+            from: "ready",
+            to: "running",
+            origin,
+            metadata: { scheduler: "join" },
+          });
+          steps = replaceStep(steps, running);
+          recorded.push({ stepId: join.id, status: "running", reason: "barrier_satisfied" });
+        }
         const succeeded = await this.store.transitionStep({
           taskId,
           stepId: join.id,

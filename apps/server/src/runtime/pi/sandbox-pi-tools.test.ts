@@ -15,7 +15,12 @@ const caller = {
   },
 };
 
-function fixture(decision: "ALLOW" | "DENY", readError = true) {
+function fixture(
+  decision: "ALLOW" | "DENY",
+  readError = true,
+  markingFails = false,
+  onMark?: () => void,
+) {
   const checks: string[] = [];
   const markedSources: Array<[string, string]> = [];
   const executions: string[] = [];
@@ -34,7 +39,9 @@ function fixture(decision: "ALLOW" | "DENY", readError = true) {
         return { id: "decision", decision, grantId: decision === "ALLOW" ? "grant" : null };
       },
       async markDeliverySource(id: string, source: string) {
+        if (markingFails) throw new Error("fixture_source_write_failed");
         markedSources.push([id, source]);
+        onMark?.();
       },
     },
   } as unknown as DomainStore;
@@ -73,6 +80,39 @@ describe("isolated Pi tool authorization", () => {
     ).rejects.toThrow("authorization_denied");
     expect(f.checks).toEqual(["registry:owner:workspace-1:read", "auth:workspace:read"]);
     expect(f.executions).toEqual([]);
+    expect(f.markedSources).toEqual([]);
+  });
+
+  it("does not execute or stream native content if provenance cannot be persisted", async () => {
+    const f = fixture("ALLOW", false, true);
+    await expect(
+      f.tools[1]!.execute(
+        "call",
+        { command: "read protected data" },
+        undefined,
+        (update) => f.updates.push(update),
+        {} as never,
+      ),
+    ).rejects.toThrow("fixture_source_write_failed");
+    expect(f.executions).toEqual([]);
+    expect(f.updates).toEqual([]);
+  });
+
+  it("does not execute after cancellation while recording provenance", async () => {
+    const controller = new AbortController();
+    const f = fixture("ALLOW", false, false, () => controller.abort());
+    await expect(
+      f.tools[1]!.execute(
+        "call",
+        { command: "write data" },
+        controller.signal,
+        (update) => f.updates.push(update),
+        {} as never,
+      ),
+    ).rejects.toThrow("Operation cancelled");
+    expect(f.markedSources).toEqual([["decision", "content_source"]]);
+    expect(f.executions).toEqual([]);
+    expect(f.updates).toEqual([]);
   });
 
   it("treats Shell as writable and preserves Pi image and details", async () => {
@@ -107,7 +147,7 @@ describe("isolated Pi tool authorization", () => {
       details: undefined,
       isError: true,
     });
-    expect(f.markedSources).toEqual([]);
+    expect(f.markedSources).toEqual([["decision", "content_source"]]);
   });
 
   it("marks a successful workspace read as a content source", async () => {

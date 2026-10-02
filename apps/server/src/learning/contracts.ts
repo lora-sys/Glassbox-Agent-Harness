@@ -114,3 +114,15 @@ export interface MemoryExtractor {
     existing: readonly CanonicalMemory[];
   }): Promise<readonly ExtractedMemoryDecision[]>;
 }
+
+/** Body-free governance receipts when source content cannot currently be read. */
+export type WithheldCandidateReview = {
+  executed: true;
+  status: "rejected";
+  contentWithheld: true;
+};
+export type WithheldMemoryLifecycle = {
+  executed: true;
+  lifecycleState: "expired" | "revoked" | "retired";
+  contentWithheld: true;
+};

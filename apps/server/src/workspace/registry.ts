@@ -158,11 +158,27 @@ export class WorkspaceRegistry {
     this.forbidden = forbidden;
   }
 
-  static async open(options: WorkspaceRegistryOptions): Promise<WorkspaceRegistry> {
+  /** Read-only startup check: no directories, lock files, or registry state are created. */
+  static async preflight(options: WorkspaceRegistryOptions): Promise<void> {
+    const registry = await WorkspaceRegistry.inspect(options);
+    try {
+      const state = await registry.read();
+      for (const record of Object.values(state.workspaces)) await registry.verifyPath(record);
+    } catch {
+      throw new Error(
+        "Workspace registry preflight failed; validate the registry and migrate copied workspace paths before starting Glassbox. No workspace state was changed.",
+      );
+    }
+  }
+
+  private static async inspect(options: WorkspaceRegistryOptions): Promise<WorkspaceRegistry> {
     const rootInput = absoluteLocalDirectory(options.dataRoot);
-    await mkdir(rootInput, { recursive: true, mode: 0o700 });
-    const root = await existingRealPath(rootInput);
-    await chmod(root, 0o700);
+    let root = rootInput;
+    try {
+      root = await existingRealPath(rootInput);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
     const sensitive = [
       getRepoRoot(),
       getServiceDataDir(),
@@ -185,9 +201,18 @@ export class WorkspaceRegistry {
         forbidden.push(absolute);
       }
     }
-    const handle = await open(path.join(root, ".workspace-registry-lock"), "a", 0o600);
-    await handle.close();
     return new WorkspaceRegistry(root, forbidden);
+  }
+
+  static async open(options: WorkspaceRegistryOptions): Promise<WorkspaceRegistry> {
+    await WorkspaceRegistry.preflight(options);
+    const rootInput = absoluteLocalDirectory(options.dataRoot);
+    await mkdir(rootInput, { recursive: true, mode: 0o700 });
+    const registry = await WorkspaceRegistry.inspect(options);
+    await chmod(registry.root, 0o700);
+    const handle = await open(registry.anchor, "a", 0o600);
+    await handle.close();
+    return registry;
   }
 
   private async read(): Promise<RegistryState> {

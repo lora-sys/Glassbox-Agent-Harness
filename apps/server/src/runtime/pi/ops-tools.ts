@@ -139,7 +139,8 @@ export function createOpsTools(options: {
       action: "task:read",
       deliverySource: "content_source",
       resourceId: (params) => `task-${params.taskId}`,
-      execute: async (params, context) => options.service.get(context.caller, params.taskId),
+      execute: async (params, context) =>
+        options.service.get(context.caller, params.taskId, context),
     }),
     createProtectedTool<{
       title: string;
@@ -450,7 +451,8 @@ export function createOpsTools(options: {
       parameters: Type.Object({ taskId }, { additionalProperties: false }),
       action: "task:read",
       resourceId: (params) => `task-${params.taskId}`,
-      execute: async (params, context) => options.service.steps(context.caller, params.taskId),
+      execute: async (params, context) =>
+        options.service.steps(context.caller, params.taskId, context),
     }),
     createProtectedTool<{ taskId: string; afterSequence?: number }>({
       ...common,
@@ -466,7 +468,7 @@ export function createOpsTools(options: {
       action: "task:read",
       resourceId: (params) => `task-${params.taskId}`,
       execute: async (params, context) =>
-        options.service.taskEvents(context.caller, params.taskId, params.afterSequence),
+        options.service.taskEvents(context.caller, params.taskId, params.afterSequence, context),
     }),
     createProtectedTool<{
       taskId: string;

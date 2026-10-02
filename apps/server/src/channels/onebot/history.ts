@@ -82,9 +82,12 @@ export function historyCursor(record: unknown): { id: string; occurredAt: string
 }
 
 function secondsToIso(value: unknown): string | undefined {
+  if (typeof value !== "number" && typeof value !== "string") return undefined;
+  if (typeof value === "string" && value.trim() === "") return undefined;
   const seconds = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(seconds) || seconds <= 0) return undefined;
-  return new Date(seconds * 1000).toISOString();
+  const date = new Date(seconds * 1000);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : undefined;
 }
 
 /**

@@ -1,7 +1,8 @@
 import type { Transaction } from "@libsql/client";
 import { conversationScopeKey } from "../identity/scope.js";
+import { applyHistoryTimeMigration } from "./history-time-migration.js";
 
-export const CURRENT_SCHEMA_VERSION = 25;
+export const CURRENT_SCHEMA_VERSION = 29;
 
 function persistedText(value: unknown): string {
   if (typeof value !== "string") throw new Error("Invalid migration record");
@@ -199,7 +200,6 @@ export const schemaV12Migration = [
  */
 
 export const schemaV13Migration = ["ALTER TABLE runs ADD COLUMN failure_code TEXT"];
-
 
 export async function applySchemaV14Migration(tx: Transaction): Promise<void> {
   const table = await tx.execute(
@@ -417,3 +417,44 @@ export const schema = [
 
 // Existing ALLOW rows predate trusted execution-source markers. Preserve the old
 // conservative delivery recheck for them, while new discovery decisions stay unmarked.
+
+/** Preserve NULL for legacy decisions; never infer which QQ source route was used. */
+export async function applySchemaV26Migration(tx: Transaction): Promise<void> {
+  const tables = await tx.execute(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'authorization_decisions'",
+  );
+  if (!tables.rows.length) return;
+  await tx.execute("DROP VIEW IF EXISTS authorization_decisions_all");
+  for (const table of ["authorization_decisions", "authorization_decisions_archive"]) {
+    const columns = await tx.execute(`PRAGMA table_info(${table})`);
+    if (!columns.rows.some((row) => row.name === "policy_condition_json"))
+      await tx.execute(`ALTER TABLE ${table} ADD COLUMN policy_condition_json TEXT`);
+  }
+  const columns =
+    "id,principal_id,resource_id,action,scope_key,decision,reason,grant_id,approval_id,conversation_id,run_id,delivery_source,created_at,policy_condition_json";
+  await tx.execute(
+    `CREATE VIEW authorization_decisions_all AS SELECT ${columns} FROM authorization_decisions UNION ALL SELECT ${columns} FROM authorization_decisions_archive`,
+  );
+}
+
+/** Unknown legacy provenance is retained until trusted learning audit lineage resolves it. */
+export async function applySchemaV27Migration(tx: Transaction): Promise<void> {
+  for (const table of ["memory_candidates", "memories"]) {
+    const columns = await tx.execute(`PRAGMA table_info(${table})`);
+    if (columns.rows.length && !columns.rows.some((row) => row.name === "source_dependencies_json"))
+      await tx.execute(`ALTER TABLE ${table} ADD COLUMN source_dependencies_json TEXT`);
+  }
+}
+
+/** Add an exact millisecond index while retaining original Channel history evidence. */
+export async function applySchemaV28Migration(tx: Transaction): Promise<void> {
+  await applyHistoryTimeMigration(tx);
+}
+
+/** Trusted ingress routing provenance; historical and explicit Runs remain unmarked. */
+export async function applySchemaV29Migration(tx: Transaction): Promise<void> {
+  const columns = await tx.execute("PRAGMA table_info(runs)");
+  if (!columns.rows.length) throw new Error("Run routing provenance migration requires runs table");
+  if (!columns.rows.some((row) => row.name === "channel_default_execution_ref"))
+    await tx.execute("ALTER TABLE runs ADD COLUMN channel_default_execution_ref TEXT");
+}

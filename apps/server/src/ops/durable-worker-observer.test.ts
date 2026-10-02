@@ -1,105 +1,34 @@
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
-import { randomUUID } from "node:crypto";
-import type { TaskStep } from "@glassbox/contracts";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { openDomainStore, type DomainStore } from "../persistence/index.js";
-import { FakeHerdrBridge } from "./fake-herdr-bridge.js";
 import { DurableWorkerObserver } from "./durable-worker-observer.js";
 import { WorkerCandidateLimitError } from "./long-work-store.js";
-import { OpsReconciler } from "./reconciler.js";
+import { durableWorkerFixture, system } from "./durable-worker-test-fixture.js";
+import { runFixtureProcess } from "../persistence/test-fixture-process.js";
+import { durableWorkerReopenFixtureScript } from "./durable-worker-reopen-fixture.js";
 
-const system = { kind: "system", reason: "durable worker observer test" } as const;
-const limits = {
-  maxSteps: 8,
-  maxDependenciesPerStep: 4,
-  maxFanOut: 4,
-  maxReadySteps: 4,
-  maxParallelSteps: 2,
-};
 const stores: DomainStore[] = [];
-
-function workerStep(
-  taskId: string,
-  stepId: string,
-  kind: TaskStep["kind"] = "herdr_worker",
-): TaskStep {
-  const now = new Date().toISOString();
-  return {
-    id: stepId,
-    taskId,
-    kind,
-    title: "Run worker",
-    status: "pending",
-    dependencyIds: [],
-    dependencyPolicy: { failed: "block", cancelled: "cancel", skipped: "skip" },
-    maxAttempts: 1,
-    requiredCapabilities: [],
-    delegatedPermissionSet: [],
-    version: 1,
-    createdAt: now,
-    updatedAt: now,
-  };
-}
 
 async function fixture(agentKind = "codex", prompted = true) {
   const store = await openDomainStore({ databasePath: ":memory:" });
   stores.push(store);
-  await store.identities.createPrincipal("owner", "owner");
-  const task = await store.tasks.createTask({
-    title: "Durable worker",
-    creatorPrincipalId: "owner",
-  });
-  const stepId = `step-${randomUUID()}`;
-  await store.longWork.createGraph(task.id, [workerStep(task.id, stepId)], stepId, limits, system);
-  await store.longWork.transitionStep({
-    taskId: task.id,
-    stepId,
-    expectedVersion: 1,
-    from: "pending",
-    to: "ready",
-    origin: system,
-  });
-  await store.db.transaction(async (tx) => {
-    await tx.execute({
-      sql: "UPDATE task_steps SET status = 'running', version = 3 WHERE id = ?",
-      args: [stepId],
-    });
-    // A durable Task reaches RUNNING when its first Step attempt starts; adopting a graph
-    // instead leaves it NEW. The Worker binding guard reads that status, so a fixture that
-    // skips it describes a Task no Worker could ever have been bound to.
-    await tx.execute({
-      sql: "UPDATE tasks SET status = 'RUNNING', updated_at = ? WHERE id = ?",
-      args: [new Date().toISOString(), task.id],
-    });
-    await tx.execute({
-      sql: "INSERT INTO task_attempts(id,task_id,step_id,attempt_number,status,started_at) VALUES ('attempt-1',?,?,1,'running',?)",
-      args: [task.id, stepId, new Date().toISOString()],
-    });
-  });
-  const bridge = new FakeHerdrBridge("session-1");
-  const worker = await bridge.startAgent({ workspaceId: "workspace-1", agentKind });
-  const binding = await store.tasks.bindWorker({
-    taskAttemptId: "attempt-1",
-    herdrSession: "session-1",
-    workspaceId: "workspace-1",
-    paneId: worker.paneId,
-    agentName: worker.agentName,
-    agentKind,
-  });
-  if (prompted) await store.tasks.markWorkerPromptDispatched("attempt-1", binding.id);
-  const lease = await store.longWork.acquireLease({
-    id: "lease-1",
-    taskId: task.id,
-    stepId,
-    attemptId: "attempt-1",
-    workerBindingId: binding.id,
-    ownerInstanceId: "owner-instance",
-    expiresAt: new Date(Date.now() + 60_000).toISOString(),
-    origin: system,
-  });
-  if (!lease) throw new Error("Expected exclusive Worker lease");
-  const observer = new DurableWorkerObserver(store.db, store.longWork, store.tasks);
-  const reconciler = new OpsReconciler(store.tasks, bridge, 1_000, observer);
-  return { store, task, stepId, bridge, worker, binding, observer, reconciler };
+  return durableWorkerFixture(store, agentKind, prompted);
+}
+
+async function reopenFixture(scenario: string, values: string[], signal: AbortSignal) {
+  const directory = await mkdtemp(join(tmpdir(), "glassbox-worker-reopen-"));
+  try {
+    const output = await runFixtureProcess(
+      durableWorkerReopenFixtureScript,
+      [join(directory, "state.db"), scenario, ...values],
+      signal,
+    );
+    expect(JSON.parse(output)).toEqual({ completed: scenario });
+  } finally {
+    await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  }
 }
 
 afterEach(async () => {
@@ -107,6 +36,344 @@ afterEach(async () => {
 });
 
 describe("DurableWorkerObserver", () => {
+  it("rejects an invalidated candidate when working and idle share the capture timestamp", async () => {
+    const { store, task, stepId, worker } = await fixture("pi");
+    const management = new DurableWorkerObserver(store.db, store.longWork, store.tasks, false);
+    const event = {
+      type: "agent.state" as const,
+      sessionId: "session-1",
+      workspaceId: "workspace-1",
+      paneId: worker.paneId,
+      agentName: worker.agentName,
+      timestamp: new Date(Date.now() + 10).toISOString(),
+    };
+    await management.observeEvent({ ...event, state: "working" });
+    let captured = false;
+    const observer = new DurableWorkerObserver(
+      store.db,
+      store.longWork,
+      store.tasks,
+      true,
+      async (claim, state, observedAt, observationSequence) => {
+        const ref = await store.longWork.recordWorkerCandidate({
+          ...claim,
+          workerBindingId: claim.bindingId,
+          output: "first output",
+          expectedObservation: { state, observedAt, sequence: observationSequence },
+        });
+        if (!captured) {
+          captured = true;
+          await management.observeEvent({ ...event, state: "working" });
+          await management.observeEvent({ ...event, state: "idle" });
+        }
+        return ref;
+      },
+    );
+    await observer.observeEvent({ ...event, state: "idle" });
+    expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("running");
+    expect(
+      await store.longWork.getWorkerCandidate(task.id, stepId, "attempt-1", {
+        reviewableOnly: true,
+      }),
+    ).toBeNull();
+    await observer.observeEvent({ ...event, state: "idle" });
+    expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("blocked");
+    expect((await store.longWork.listEvents(task.id)).at(-1)?.evidenceRef).toContain(
+      "worker-output-stale-rework-required",
+    );
+    expect((await store.tasks.getTask(task.id))?.status).not.toBe("DONE");
+  });
+
+  it.each(["state", "timestamp", "same-timestamp cycle"] as const)(
+    "checks candidate observation %s before the first insert",
+    async (change) => {
+      const { store, task, stepId, worker } = await fixture("pi");
+      const management = new DurableWorkerObserver(store.db, store.longWork, store.tasks, false);
+      const timestamp = Date.now() + 10;
+      const event = {
+        type: "agent.state" as const,
+        sessionId: "session-1",
+        workspaceId: "workspace-1",
+        paneId: worker.paneId,
+        agentName: worker.agentName,
+      };
+      await management.observeEvent({
+        ...event,
+        state: "working",
+        timestamp: new Date(timestamp).toISOString(),
+      });
+      let racing = true;
+      const observer = new DurableWorkerObserver(
+        store.db,
+        store.longWork,
+        store.tasks,
+        true,
+        async (claim, state, observedAt, observationSequence) => {
+          if (racing) {
+            racing = false;
+            await management.observeEvent({
+              ...event,
+              state: change === "timestamp" ? "idle" : "working",
+              timestamp: new Date(timestamp + (change === "timestamp" ? 2 : 1)).toISOString(),
+            });
+            if (change === "same-timestamp cycle")
+              await management.observeEvent({
+                ...event,
+                state: "idle",
+                timestamp: new Date(timestamp + 1).toISOString(),
+              });
+          }
+          return store.longWork.recordWorkerCandidate({
+            ...claim,
+            workerBindingId: claim.bindingId,
+            output: "current output",
+            expectedObservation: { state, observedAt, sequence: observationSequence },
+          });
+        },
+      );
+      await observer.observeEvent({
+        ...event,
+        state: "idle",
+        timestamp: new Date(timestamp + 1).toISOString(),
+      });
+      expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("running");
+      expect(await store.longWork.getWorkerCandidate(task.id, stepId, "attempt-1")).toBeNull();
+      await observer.observeEvent({
+        ...event,
+        state: "idle",
+        timestamp: new Date(timestamp + 3).toISOString(),
+      });
+      expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("review");
+      expect(
+        (
+          await store.longWork.getWorkerCandidate(task.id, stepId, "attempt-1", {
+            reviewableOnly: true,
+          })
+        )?.outputExcerpt,
+      ).toBe("current output");
+    },
+  );
+
+  it("keeps candidate invalidation after a database reopen", async ({ signal }) => {
+    await reopenFixture("candidate", [], signal);
+  });
+
+  it("quarantines an immutable candidate when its Worker resumes before a later completion", async () => {
+    const { store, task, worker } = await fixture("pi");
+    const management = new DurableWorkerObserver(store.db, store.longWork, store.tasks, false);
+    const timestamp = Date.now() + 10;
+    const event = {
+      type: "agent.state" as const,
+      sessionId: "session-1",
+      workspaceId: "workspace-1",
+      paneId: worker.paneId,
+      agentName: worker.agentName,
+    };
+    await management.observeEvent({
+      ...event,
+      state: "working",
+      timestamp: new Date(timestamp).toISOString(),
+    });
+    let captures = 0;
+    const observer = new DurableWorkerObserver(
+      store.db,
+      store.longWork,
+      store.tasks,
+      true,
+      async (claim) => {
+        const ref = await store.longWork.recordWorkerCandidate({
+          ...claim,
+          workerBindingId: claim.bindingId,
+          output: captures === 0 ? "first output" : "later output",
+        });
+        if (captures++ === 0)
+          await management.observeEvent({
+            ...event,
+            state: "working",
+            timestamp: new Date(timestamp + 2).toISOString(),
+          });
+        return ref;
+      },
+    );
+    await observer.observeEvent({
+      ...event,
+      state: "idle",
+      timestamp: new Date(timestamp + 1).toISOString(),
+    });
+    expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("running");
+    await observer.observeEvent({
+      ...event,
+      state: "idle",
+      timestamp: new Date(timestamp + 3).toISOString(),
+    });
+    expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("blocked");
+    expect(
+      (
+        await store.longWork.getWorkerCandidate(
+          task.id,
+          (await store.longWork.listSteps(task.id))[0]!.id,
+          "attempt-1",
+        )
+      )?.outputExcerpt,
+    ).toBe("first output");
+    expect(
+      await store.longWork.getWorkerCandidate(
+        task.id,
+        (await store.longWork.listSteps(task.id))[0]!.id,
+        "attempt-1",
+        { reviewableOnly: true },
+      ),
+    ).toBeNull();
+    expect(
+      (
+        await store.longWork.getQuarantinedLease(
+          task.id,
+          (await store.longWork.listSteps(task.id))[0]!.id,
+        )
+      )?.attemptId,
+    ).toBe("attempt-1");
+    expect((await store.tasks.getTask(task.id))?.status).not.toBe("DONE");
+  });
+
+  it("does not settle captured idle evidence after management sees resumed work in the same timestamp", async () => {
+    const { store, task, worker } = await fixture("pi");
+    const management = new DurableWorkerObserver(store.db, store.longWork, store.tasks, false);
+    const timestamp = new Date(Date.now() + 10).toISOString();
+    const event = {
+      type: "agent.state" as const,
+      sessionId: "session-1",
+      workspaceId: "workspace-1",
+      paneId: worker.paneId,
+      agentName: worker.agentName,
+      timestamp,
+    };
+    await management.observeEvent({ ...event, state: "working" });
+    const observer = new DurableWorkerObserver(
+      store.db,
+      store.longWork,
+      store.tasks,
+      true,
+      async () => {
+        await management.observeEvent({ ...event, state: "working" });
+        return "candidate-result";
+      },
+    );
+    await observer.observeEvent({ ...event, state: "idle" });
+    expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("running");
+    expect((await store.tasks.getWorkerBinding("attempt-1"))?.lastObservedAgentState).toBe(
+      "working",
+    );
+    expect(
+      (await store.longWork.listEvents(task.id)).filter(
+        (entry) => entry.type === "ATTEMPT_FINISHED",
+      ),
+    ).toHaveLength(0);
+  });
+
+  it.for([
+    ["working", "unknown", "idle"],
+    ["working", "idle", "unknown"],
+    ["working", "idle", "idle"],
+  ] as const)(
+    "recovers durable Pi completion after observations %j and database reopen",
+    async (states, { signal }) => {
+      await reopenFixture("observations", [...states], signal);
+    },
+  );
+
+  it("does not use an older idle after the management observer sees renewed work", async () => {
+    const { store, task, worker, observer } = await fixture("pi");
+    const management = new DurableWorkerObserver(store.db, store.longWork, store.tasks, false);
+    const timestamp = Date.now() + 10;
+    const event = {
+      type: "agent.state" as const,
+      sessionId: "session-1",
+      workspaceId: "workspace-1",
+      paneId: worker.paneId,
+      agentName: worker.agentName,
+    };
+    await management.observeEvent({
+      ...event,
+      state: "working",
+      timestamp: new Date(timestamp).toISOString(),
+    });
+    await management.observeEvent({
+      ...event,
+      state: "idle",
+      timestamp: new Date(timestamp + 1).toISOString(),
+    });
+    await management.observeEvent({
+      ...event,
+      state: "working",
+      timestamp: new Date(timestamp + 2).toISOString(),
+    });
+    await observer.observeEvent({
+      ...event,
+      state: "idle",
+      timestamp: new Date(timestamp + 1).toISOString(),
+    });
+    expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("running");
+    await observer.observeEvent({
+      ...event,
+      state: "idle",
+      timestamp: new Date(timestamp + 3).toISOString(),
+    });
+    expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("review");
+  });
+
+  it("does not infer Pi completion through a blocked observation", async () => {
+    const { store, task, worker, observer } = await fixture("pi");
+    const management = new DurableWorkerObserver(store.db, store.longWork, store.tasks, false);
+    const timestamp = Date.now() + 10;
+    const event = {
+      type: "agent.state" as const,
+      sessionId: "session-1",
+      workspaceId: "workspace-1",
+      paneId: worker.paneId,
+      agentName: worker.agentName,
+    };
+    for (const [index, state] of (["working", "blocked", "unknown", "idle"] as const).entries())
+      await management.observeEvent({
+        ...event,
+        state,
+        timestamp: new Date(timestamp + index).toISOString(),
+      });
+    await observer.observeEvent({
+      ...event,
+      state: "idle",
+      timestamp: new Date(timestamp + 4).toISOString(),
+    });
+    expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("running");
+  });
+
+  it("retains Pi completion when management observes working and idle before Temporal", async () => {
+    const { store, task, worker, observer } = await fixture("pi");
+    const management = new DurableWorkerObserver(store.db, store.longWork, store.tasks, false);
+    const timestamp = new Date(Date.now() + 10).toISOString();
+    const event = {
+      type: "agent.state" as const,
+      sessionId: "session-1",
+      workspaceId: "workspace-1",
+      paneId: worker.paneId,
+      agentName: worker.agentName,
+      state: "working" as const,
+      timestamp,
+    };
+    await management.observeEvent(event);
+    const idle = { ...event, state: "idle" as const };
+    await management.observeEvent(idle);
+    expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("running");
+    await observer.observeEvent(idle);
+    await observer.observeEvent(idle);
+    expect((await store.longWork.listSteps(task.id))[0]?.status).toBe("review");
+    expect((await store.tasks.getTask(task.id))?.status).not.toBe("DONE");
+    expect(
+      (await store.longWork.listEvents(task.id)).filter(
+        (entry) => entry.type === "ATTEMPT_FINISHED",
+      ),
+    ).toHaveLength(1);
+  });
+
   it("lets the management observer record done without settling the Temporal-owned Step", async () => {
     const { store, task, stepId, bridge, worker } = await fixture("pi");
     const managementObserver = new DurableWorkerObserver(

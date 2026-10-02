@@ -5,11 +5,18 @@ import net from "node:net";
 import { DatabaseSync } from "node:sqlite";
 import lockfile from "proper-lockfile";
 import { isAbsolute, join, relative, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { getServiceDataDir } from "../apps/server/src/platform/paths.js";
 import { securePrivatePath } from "../apps/server/src/platform/private-path.js";
 import { persistedEnvironment, serviceEnvironmentKeys } from "./service-environment.mjs";
+import {
+  isLinuxProcessIdentity,
+  linuxProcessHasExited,
+  readLinuxProcessIdentity,
+  verifyLinuxProcess,
+  type LinuxProcessIdentity,
+} from "./service-process-identity.mjs";
 
 const execFile = promisify(execFileCallback);
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -43,7 +50,10 @@ interface ProcessState extends ProcessConfig {
   name: ProcessName;
   pid: number;
   startedAt: string;
+  linuxIdentity?: LinuxProcessIdentity;
 }
+
+type ProcessStatus = "running" | "stopped" | "unknown";
 
 interface StartOptions {
   skipNapcat?: boolean;
@@ -172,13 +182,17 @@ function stateEntry(value: unknown): ProcessState {
   const item = value as Record<string, unknown>;
   if (
     Object.keys(item).some(
-      (key) => !["name", "pid", "startedAt", "executable", "args", "cwd", "env"].includes(key),
+      (key) =>
+        !["name", "pid", "startedAt", "executable", "args", "cwd", "env", "linuxIdentity"].includes(
+          key,
+        ),
     ) ||
     !["herdr", "napcat", "glassbox"].includes(String(item.name)) ||
     !Number.isSafeInteger(item.pid) ||
     (item.pid as number) < 1 ||
     typeof item.startedAt !== "string" ||
-    Number.isNaN(Date.parse(item.startedAt))
+    Number.isNaN(Date.parse(item.startedAt)) ||
+    (item.linuxIdentity !== undefined && !isLinuxProcessIdentity(item.linuxIdentity))
   )
     throw new Error("Invalid service state");
   const config = processConfig(
@@ -195,6 +209,7 @@ function stateEntry(value: unknown): ProcessState {
     name: item.name as ProcessName,
     pid: item.pid as number,
     startedAt: item.startedAt,
+    ...(item.linuxIdentity === undefined ? {} : { linuxIdentity: item.linuxIdentity }),
     ...config,
   };
 }
@@ -271,12 +286,13 @@ function alive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    // Lack of permission is not evidence that the PID is unused.
+    return process.platform === "linux" && (error as NodeJS.ErrnoException).code !== "ESRCH";
   }
 }
 
-function commandHasArgs(commandLine: string, args: readonly string[]): boolean {
+function windowsCommandHasArgs(commandLine: string, args: readonly string[]): boolean {
   const normalizedCmd = commandLine.replace(/\\/gu, "/").toLowerCase();
   return args.every((arg) => {
     const normalizedArg = arg.replace(/\\/gu, "/").toLowerCase();
@@ -313,10 +329,10 @@ async function herdrSessionRunning(entry: ProcessState, name: string): Promise<b
   }
 }
 
-async function verified(entry: ProcessState): Promise<boolean> {
+async function processStatus(entry: ProcessState): Promise<ProcessStatus> {
   const sessionName = herdrSessionName(entry);
-  if (sessionName && (await herdrSessionRunning(entry, sessionName))) return true;
-  if (!alive(entry.pid)) return false;
+  if (sessionName && (await herdrSessionRunning(entry, sessionName))) return "running";
+  if (!alive(entry.pid)) return "stopped";
   if (process.platform === "win32") {
     const command =
       `$p=Get-CimInstance Win32_Process -Filter "ProcessId=${entry.pid}";` +
@@ -324,7 +340,7 @@ async function verified(entry: ProcessState): Promise<boolean> {
     const result = await execFile("powershell.exe", ["-NoProfile", "-Command", command], {
       windowsHide: true,
     }).catch(() => ({ stdout: "" }));
-    if (!result.stdout.trim()) return false;
+    if (!result.stdout.trim()) return "stopped";
     const processInfo = JSON.parse(result.stdout) as {
       ExecutablePath?: string;
       CommandLine?: string;
@@ -335,18 +351,33 @@ async function verified(entry: ProcessState): Promise<boolean> {
         resolve(entry.executable).toLowerCase() ||
         (entry.executable.toLowerCase().endsWith("node.exe") &&
           processInfo.ExecutablePath.toLowerCase().endsWith("node.exe")));
-    return (
-      sameExecutable &&
+    return sameExecutable &&
       typeof processInfo.CommandLine === "string" &&
-      commandHasArgs(processInfo.CommandLine, entry.args)
-    );
+      windowsCommandHasArgs(processInfo.CommandLine, entry.args)
+      ? "running"
+      : "stopped";
   }
-  const executable = await realpath(`/proc/${entry.pid}/exe`).catch(() => "");
-  const commandLine = await readFile(`/proc/${entry.pid}/cmdline`, "utf8").catch(() => "");
-  return (
-    executable === (await realpath(entry.executable).catch(() => entry.executable)) &&
-    commandHasArgs(commandLine, entry.args)
+  if (await linuxProcessHasExited(entry.pid)) return "stopped";
+  if (await verifyLinuxProcess(entry)) return "running";
+  if (await linuxProcessHasExited(entry.pid)) return "stopped";
+  return alive(entry.pid) ? "unknown" : "stopped";
+}
+
+async function knownProcessStatus(entry: ProcessState): Promise<"running" | "stopped"> {
+  const status = await processStatus(entry);
+  if (status !== "unknown") return status;
+  throw new Error(
+    `Cannot verify ${entry.name} PID ${entry.pid}; service state was preserved. ` +
+      "Inspect and stop the original service through its verified owner before retrying. " +
+      "Do not delete the record or adopt the current PID as proof of ownership.",
   );
+}
+
+async function runningState(state: ProcessState[]): Promise<ProcessState[]> {
+  const running: ProcessState[] = [];
+  for (const entry of state)
+    if ((await knownProcessStatus(entry)) === "running") running.push(entry);
+  return running;
 }
 
 async function startProcess(name: ProcessName, config: ProcessConfig): Promise<ProcessState> {
@@ -365,7 +396,16 @@ async function startProcess(name: ProcessName, config: ProcessConfig): Promise<P
     });
     if (!child.pid) throw new Error(`${name} did not start`);
     child.unref();
-    return { name, ...config, pid: child.pid, startedAt: new Date().toISOString() };
+    let linuxIdentity =
+      process.platform === "linux" ? await readLinuxProcessIdentity(child.pid) : undefined;
+    if (child.exitCode !== null || child.signalCode !== null) linuxIdentity = undefined;
+    return {
+      name,
+      ...config,
+      pid: child.pid,
+      startedAt: new Date().toISOString(),
+      ...(linuxIdentity === undefined ? {} : { linuxIdentity }),
+    };
   } finally {
     closeSync(descriptor);
   }
@@ -406,7 +446,8 @@ async function waitFor(
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (!(await verified(entry))) throw new Error(`${entry.name} exited before ${description}`);
+    if ((await knownProcessStatus(entry)) === "stopped")
+      throw new Error(`${entry.name} exited before ${description}`);
     if (await probe()) return;
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 150));
   }
@@ -457,7 +498,7 @@ async function stopEntry(entry: ProcessState): Promise<void> {
       throw new Error(`Herdr session ${sessionName} did not stop`);
     return;
   }
-  if (!(await verified(entry))) return;
+  if ((await knownProcessStatus(entry)) === "stopped") return;
   if (process.platform === "win32") {
     if (entry.name === "glassbox") await requestGlassboxShutdown(entry).catch(() => undefined);
     else await execFile("taskkill.exe", ["/PID", String(entry.pid), "/T"]).catch(() => undefined);
@@ -465,17 +506,21 @@ async function stopEntry(entry: ProcessState): Promise<void> {
     process.kill(entry.pid, "SIGTERM");
   }
   const gracefulDeadline = Date.now() + 5_000;
-  while (alive(entry.pid) && Date.now() < gracefulDeadline)
+  const stillRunning = async () =>
+    process.platform === "win32"
+      ? alive(entry.pid)
+      : (await knownProcessStatus(entry)) === "running";
+  while ((await stillRunning()) && Date.now() < gracefulDeadline)
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
-  if (!alive(entry.pid)) return;
-  if (!(await verified(entry))) return;
+  if (!(await stillRunning())) return;
+  if ((await knownProcessStatus(entry)) === "stopped") return;
   if (process.platform === "win32")
     await execFile("taskkill.exe", ["/PID", String(entry.pid), "/T", "/F"]);
   else process.kill(entry.pid, "SIGKILL");
   const forcedDeadline = Date.now() + 5_000;
-  while (alive(entry.pid) && Date.now() < forcedDeadline)
+  while ((await stillRunning()) && Date.now() < forcedDeadline)
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
-  if (alive(entry.pid)) throw new Error(`${entry.name} did not stop`);
+  if (await stillRunning()) throw new Error(`${entry.name} did not stop`);
 }
 
 async function up(options: StartOptions = {}): Promise<void> {
@@ -483,8 +528,7 @@ async function up(options: StartOptions = {}): Promise<void> {
   await assertDatabaseCompatible(checkout);
   await mkdir(dataDirectory, { recursive: true, mode: 0o700 });
   const prior = await loadState();
-  const live: ProcessState[] = [];
-  for (const entry of prior) if (await verified(entry)) live.push(entry);
+  const live = await runningState(prior);
   await writeState(live);
   const config = await loadConfig();
   const desired: Array<[ProcessName, ProcessConfig | undefined]> = [
@@ -509,6 +553,8 @@ async function up(options: StartOptions = {}): Promise<void> {
       live.push(entry);
       started.push(entry);
       await writeState(live);
+      if (process.platform === "linux" && (await knownProcessStatus(entry)) === "stopped")
+        throw new Error(`${name} exited during startup`);
       if (name === "herdr") {
         const endpoint = await herdrEndpoint();
         if (endpoint)
@@ -540,8 +586,7 @@ async function switchCheckout(options: StartOptions = {}): Promise<void> {
   const checkout = await checkoutRoot(options.checkout);
   await assertDatabaseCompatible(checkout);
   const prior = await loadState();
-  const live: ProcessState[] = [];
-  for (const entry of prior) if (await verified(entry)) live.push(entry);
+  const live = await runningState(prior);
   const previous = live.find((entry) => entry.name === "glassbox");
   let stoppedPrevious = false;
   try {
@@ -554,15 +599,21 @@ async function switchCheckout(options: StartOptions = {}): Promise<void> {
   } catch (error) {
     if (!previous || !stoppedPrevious) throw error;
     try {
+      const current = await loadState();
+      if ((await runningState(current)).some((entry) => entry.name === "glassbox"))
+        throw new Error("Cannot restore the previous checkout while Glassbox is still running");
       const config = await loadConfig();
       await waitForDataLockRelease();
+      // The candidate may have migrated shared data before failing. Never blindly restart
+      // an older checkout or restore an old snapshot over newer durable state.
+      if (!previous.cwd) throw new Error("Cannot verify previous checkout for rollback");
+      await assertDatabaseCompatible(await checkoutRoot(previous.cwd));
       const restored = await startProcess("glassbox", {
         executable: previous.executable,
         args: previous.args,
         cwd: previous.cwd,
         env: { ...previous.env, ...config.glassbox?.env },
       });
-      const current = await loadState();
       await writeState([...current, restored]);
       const port = Number(restored.env?.PORT ?? "3030");
       await waitFor(
@@ -583,12 +634,16 @@ async function status(): Promise<void> {
   const state = await loadState();
   const config = await loadConfig();
   const processes = await Promise.all(
-    state.map(async (entry) => ({
-      name: entry.name,
-      ...(alive(entry.pid) ? { pid: entry.pid } : {}),
-      running: await verified(entry),
-      ...(entry.name === "glassbox" ? { checkout: entry.cwd ?? null } : {}),
-    })),
+    state.map(async (entry) => {
+      const status = await processStatus(entry);
+      return {
+        name: entry.name,
+        ...(alive(entry.pid) ? { pid: entry.pid } : {}),
+        running: status === "running",
+        status,
+        ...(entry.name === "glassbox" ? { checkout: entry.cwd ?? null } : {}),
+      };
+    }),
   );
   const port = Number(config.glassbox?.env?.PORT ?? process.env.PORT ?? "3030");
   const glassboxReady =
@@ -603,6 +658,7 @@ async function status(): Promise<void> {
 
 async function down(): Promise<void> {
   const state = await loadState();
+  await runningState(state);
   for (const entry of [...state].reverse()) await stopEntry(entry);
   await rm(statePath, { force: true });
   await rm(priorStatePath, { force: true });
@@ -614,19 +670,26 @@ async function logs(): Promise<void> {
   process.stdout.write(content.split(/\r?\n/u).slice(-200).join("\n"));
 }
 
-const command = process.argv[2];
-const args = process.argv.slice(3);
-const startOptions: StartOptions = {};
-if (command === "up" || command === "switch") {
-  for (let index = 0; index < args.length; index += 1) {
-    if (args[index] === "--skip-napcat") startOptions.skipNapcat = true;
-    else if (args[index] === "--checkout" && args[index + 1]) startOptions.checkout = args[++index];
-    else throw new Error("Unsupported service option");
-  }
-} else if (args.length > 0) throw new Error("This service command does not accept options");
-if (command === "up") await up(startOptions);
-else if (command === "switch") await switchCheckout(startOptions);
-else if (command === "status") await status();
-else if (command === "down") await down();
-else if (command === "logs") await logs();
-else throw new Error("Use up, switch, status, down, or logs");
+export async function runServiceCommand(
+  command: string | undefined,
+  args: string[],
+): Promise<void> {
+  const startOptions: StartOptions = {};
+  if (command === "up" || command === "switch") {
+    for (let index = 0; index < args.length; index += 1) {
+      if (args[index] === "--skip-napcat") startOptions.skipNapcat = true;
+      else if (args[index] === "--checkout" && args[index + 1])
+        startOptions.checkout = args[++index];
+      else throw new Error("Unsupported service option");
+    }
+  } else if (args.length > 0) throw new Error("This service command does not accept options");
+  if (command === "up") await up(startOptions);
+  else if (command === "switch") await switchCheckout(startOptions);
+  else if (command === "status") await status();
+  else if (command === "down") await down();
+  else if (command === "logs") await logs();
+  else throw new Error("Use up, switch, status, down, or logs");
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href)
+  await runServiceCommand(process.argv[2], process.argv.slice(3));

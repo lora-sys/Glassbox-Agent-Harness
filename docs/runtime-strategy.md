@@ -319,6 +319,33 @@ reason public boundaries were insufficient
 removal / upstreaming condition
 ```
 
+## Safe runtime failure diagnostics
+
+Pi error messages may contain provider response bodies, URLs, credentials, or exception details.
+Glassbox does not copy those messages into normalized Trace or fallback replies. Error
+`turn_end` records carry a bounded `failure` object with a fixed `origin`, fixed `category`,
+and an optional validated HTTP status. Successful turns carry no failure diagnostic. A
+server-owned guard diagnostic also accompanies a turn that Pi reports as aborted.
+
+`runtime_reported` means the SDK reported an error. It does not establish an independently
+verified provider root cause or prove that a network request reached the provider. Glassbox
+recognizes only exact allowlisted codes, explicit structured status/code fields in bounded
+JSON, and anchored HTTP status forms. Missing, oversized, ambiguous, and unrecognized
+messages remain `unknown`. These categories do not change routing health decisions.
+
+`glassbox` origin is assigned only by Glassbox's own branches for source authorization,
+context budget, evidence recording, input capability, or an unclassified session exception.
+A provider message containing `source_context_revoked` cannot claim that a source guard ran.
+Source refusals keep the gate outcome. Local failures use `runtime_internal_error`, which
+produces no provider-health observation. Existing runtime-reported failures retain
+`runtime_run_errored` and its established health mapping.
+
+For an empty failed result, the execution adapter returns a fixed category-specific
+explanation. It preserves successful and partial output and keeps cancellation, required
+Tool execution, and required evidence checks ahead of the diagnostic fallback. Existing
+raw SDK error text remains an internal adapter field and is never interpolated into these
+records or replies. Prior Trace is not rewritten.
+
 ## Glassbox runtime instances
 
 Glassbox owns the concrete Pi environments that it launches.
@@ -505,3 +532,20 @@ Do not build a throwaway P3 installer that will later be replaced by the actual 
 Do not perform a blind big-bang rewrite of existing Codex / Claude Code paths.
 
 Add the Pi + Lora PI Kit path as a vertical slice, preserve useful existing adapters, and move shared behavior only after the new path proves the contracts.
+
+
+## Owner-private model preference recovery
+
+A model selected for later Owner-private QQ messages is a persisted Channel preference.
+Trusted ingress stores the preferred requested execution reference and a separate nullable
+snapshot of that Channel's default execution reference on the Run. Explicit one-run selections
+and historical Runs have no snapshot; they do not acquire preference fallback implicitly.
+
+At execution, the server rechecks Owner identity, private scope, connection, bot, sender,
+current preference and current Channel default. Stale or mismatched provenance fails closed.
+An ineligible preference can fall back only to that same configured default, after the normal
+credential, health, input capability, risk and capacity checks. Other routing candidates are
+excluded. The fallback receives the same authorized Run input and does not create credentials,
+change the saved preference, or retry an uncertain provider failure. Requested execution identity
+stays unchanged; append-only routing and evaluation evidence records the actual selected route
+and fallback reason.

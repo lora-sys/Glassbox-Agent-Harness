@@ -4,7 +4,7 @@ import { WebSocketServer, type WebSocket } from "ws";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import { OneBotAdapter, type OneBotAdapterOptions } from "./adapter.ts";
 import { parseOneBotConfig } from "./config.ts";
-import { historyCursor } from "./history.ts";
+import { historyCursor, normalizeOneBotHistoryRecord } from "./history.ts";
 
 const base = {
   connectionId: "napcat-test",
@@ -114,6 +114,21 @@ function client(endpoint: string, options: Partial<OneBotAdapterOptions> = {}) {
 }
 
 describe("OneBot typed group history bridge", () => {
+  it("keeps valid records and paging when one history timestamp is outside the Date range", async () => {
+    const fixture = await server([
+      historyRecord({ message_id: 503, message_seq: 503, time: 1_758_000_003 }),
+      historyRecord({ message_id: 502, message_seq: 502, time: 1e20 }),
+      historyRecord({ message_id: 501, message_seq: 501, time: "1758000001" }),
+    ]);
+    const adapter = client(fixture.endpoint);
+    await adapter.start();
+    const result = await adapter.getGroupHistory({ groupId: "10003" });
+    expect(result.status).toBe("ok");
+    if (result.status !== "ok") return;
+    expect(result.messages.map((message) => message.messageId)).toEqual(["503", "501"]);
+    expect(result.nextCursor).toBe("501");
+  });
+
   it("normalizes a history page for an allowlisted group", async () => {
     const fixture = await server([historyRecord()]);
     const adapter = client(fixture.endpoint);
@@ -316,6 +331,15 @@ describe("OneBot typed group history bridge", () => {
 });
 
 describe("OneBot history paging cursor", () => {
+  it.each([1e20, 8_640_000_000_001, "1e309", true, [1758000000], {}, "", " "])(
+    "drops a malformed timestamp %j without throwing or coercing another JSON type",
+    (time) => {
+      const record = historyRecord({ time });
+      expect(historyCursor(record)).toBeUndefined();
+      expect(normalizeOneBotHistoryRecord(record, "10003", "10001")).toBeUndefined();
+    },
+  );
+
   it("reads a short message id paired with the provider timestamp", () => {
     const occurredAt = new Date(1_758_000_000 * 1000).toISOString();
     expect(historyCursor({ message_id: 501, message_seq: 501, time: 1_758_000_000 })).toEqual({

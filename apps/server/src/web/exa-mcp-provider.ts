@@ -1,3 +1,6 @@
+import { throwIfWebCancelled } from "./cancellation.js";
+import { ErrorCode } from "@modelcontextprotocol/sdk/types.js";
+import type { WebProviderStatus } from "./contracts.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { assertPublicWebUrl, type ResolveWebHost } from "./network-guard.js";
@@ -13,7 +16,11 @@ interface McpResult {
 }
 
 export interface ExaMcpCaller {
-  call(name: "web_search_exa" | "web_fetch_exa", args: Record<string, unknown>): Promise<McpResult>;
+  call(
+    name: "web_search_exa" | "web_fetch_exa",
+    args: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<McpResult>;
 }
 
 /** One provider call gets one short-lived MCP session. No session or provider state crosses Runs. */
@@ -21,12 +28,25 @@ export class HostedExaMcpCaller implements ExaMcpCaller {
   async call(
     name: "web_search_exa" | "web_fetch_exa",
     args: Record<string, unknown>,
+    signal?: AbortSignal,
   ): Promise<McpResult> {
+    throwIfWebCancelled(signal);
     const client = new Client({ name: "glassbox-web", version: "1.0.0" });
-    const transport = new StreamableHTTPClientTransport(MCP_URL);
+    const transport = new StreamableHTTPClientTransport(MCP_URL, {
+      fetch: (url, init) => {
+        throwIfWebCancelled(signal);
+        const signals = [signal, init?.signal].filter((value): value is AbortSignal => !!value);
+        return fetch(url, {
+          ...init,
+          ...(signals.length ? { signal: AbortSignal.any(signals) } : {}),
+        });
+      },
+    });
     try {
-      await client.connect(transport);
-      const result = await client.callTool({ name, arguments: args });
+      await client.connect(transport, { signal });
+      throwIfWebCancelled(signal);
+      const result = await client.callTool({ name, arguments: args }, undefined, { signal });
+      throwIfWebCancelled(signal);
       const content = Array.isArray(result.content) ? result.content : [];
       return {
         isError: result.isError === true,
@@ -58,6 +78,24 @@ function resultText(result: McpResult): string {
 function failureStatus(text: string): "rate_limited" | "quota_exhausted" | "failed" {
   if (/quota|credits? (?:exhausted|depleted)|402/iu.test(text)) return "quota_exhausted";
   return /rate limit|too many requests|429/iu.test(text) ? "rate_limited" : "failed";
+}
+
+/** Safe structured failure categories; never return raw URLs, response bodies or credentials. */
+function transportFailureStatus(error: unknown): Exclude<WebProviderStatus, "ready" | "partial"> {
+  if (!error || typeof error !== "object") return "failed";
+  const value = error as { code?: unknown; status?: unknown; statusCode?: unknown; name?: unknown };
+  const code = value.status ?? value.statusCode ?? value.code;
+  if (code === 401 || code === 403) return "auth_missing";
+  if (code === 402) return "quota_exhausted";
+  if (code === 429) return "rate_limited";
+  if (
+    code === ErrorCode.RequestTimeout ||
+    code === "ETIMEDOUT" ||
+    code === "UND_ERR_CONNECT_TIMEOUT" ||
+    value.name === "TimeoutError"
+  )
+    return "timeout";
+  return "failed";
 }
 
 /** The hosted MCP formats search results as Title, URL, Published, Author, Highlights blocks. */
@@ -92,37 +130,55 @@ export class ExaMcpProvider {
     private readonly syntheticDnsCidrs: readonly string[] = [],
   ) {}
 
-  async search(input: { query: string; maxResults: number }): Promise<ExaResponse> {
+  async search(
+    input: { query: string; maxResults: number },
+    signal?: AbortSignal,
+  ): Promise<ExaResponse> {
+    throwIfWebCancelled(signal);
     try {
-      const result = await this.caller.call("web_search_exa", {
-        query: input.query,
-        numResults: Math.max(1, Math.min(SEARCH_RESULT_LIMIT, input.maxResults)),
-        objective: `Find public sources that directly answer this query: ${input.query}`.slice(
-          0,
-          4096,
-        ),
-      });
+      const result = await this.caller.call(
+        "web_search_exa",
+        {
+          query: input.query,
+          numResults: Math.max(1, Math.min(SEARCH_RESULT_LIMIT, input.maxResults)),
+          objective: `Find public sources that directly answer this query: ${input.query}`.slice(
+            0,
+            4096,
+          ),
+        },
+        signal,
+      );
+      throwIfWebCancelled(signal);
       const text = resultText(result);
       if (result.isError) return { status: failureStatus(text), results: [] };
       return { status: "ready", results: parseExaMcpSearch(text) };
-    } catch {
-      return { status: "failed", results: [] };
+    } catch (error) {
+      throwIfWebCancelled(signal);
+      return { status: transportFailureStatus(error), results: [] };
     }
   }
 
-  async contents(url: string): Promise<ExaResponse> {
+  async contents(url: string, _query?: string, signal?: AbortSignal): Promise<ExaResponse> {
+    throwIfWebCancelled(signal);
     const target = await assertPublicWebUrl(url, this.resolveHost, this.syntheticDnsCidrs);
+    throwIfWebCancelled(signal);
     try {
-      const result = await this.caller.call("web_fetch_exa", {
-        urls: [target.href],
-        maxCharacters: FETCH_CHAR_LIMIT,
-      });
+      const result = await this.caller.call(
+        "web_fetch_exa",
+        {
+          urls: [target.href],
+          maxCharacters: FETCH_CHAR_LIMIT,
+        },
+        signal,
+      );
+      throwIfWebCancelled(signal);
       const text = resultText(result);
       if (result.isError) return { status: failureStatus(text), results: [] };
       if (/^No content found/iu.test(text)) return { status: "ready", results: [] };
       return { status: "ready", results: [{ url: target.href, text }] };
-    } catch {
-      return { status: "failed", results: [] };
+    } catch (error) {
+      throwIfWebCancelled(signal);
+      return { status: transportFailureStatus(error), results: [] };
     }
   }
 }

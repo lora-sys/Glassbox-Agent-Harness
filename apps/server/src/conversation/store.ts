@@ -1,3 +1,10 @@
+import { readPolicyCondition } from "../auth/policy-condition.js";
+import {
+  readRunSourceRows,
+  readTaskSourceRows,
+  reauthorizeSourceRows,
+  sourceClassification,
+} from "../auth/source-dependencies.js";
 import { randomUUID } from "node:crypto";
 import type { Row, Transaction } from "@libsql/client";
 import {
@@ -45,6 +52,8 @@ export interface RunRecord {
   source: "external" | "task_step";
   principalId: string;
   executionRef: string;
+  /** Server-owned snapshot, only supplied for a persisted Owner-private Channel preference. */
+  channelDefaultExecutionRef?: string;
   status: RunStatus;
   resultText: string | null;
   /** Why a non-succeeded Run produced no usable text, when the adapter could name a cause. */
@@ -88,6 +97,8 @@ export interface IncomingMessage {
   messageId: string;
   text: string;
   executionRef: string;
+  /** Trusted Channel ingress only; never accepted from external request payloads. */
+  channelDefaultExecutionRef?: string;
   approvalId?: string;
   images?: readonly IncomingImage[];
   imageFailureCode?: IncomingImageFailure;
@@ -153,6 +164,9 @@ export function runRecord(row: Row): RunRecord {
     source: stringColumn(row, "source") as RunRecord["source"],
     principalId: stringColumn(row, "principal_id"),
     executionRef: stringColumn(row, "execution_ref"),
+    ...(typeof row.channel_default_execution_ref === "string"
+      ? { channelDefaultExecutionRef: row.channel_default_execution_ref }
+      : {}),
     status: stringColumn(row, "status") as RunStatus,
     resultText: optionalString(row, "result_text"),
     ...(optionalString(row, "failure_code") === null
@@ -451,6 +465,8 @@ export class ConversationStore {
   }> {
     requireIdentifier(input.messageId);
     requireIdentifier(input.executionRef);
+    if (input.channelDefaultExecutionRef !== undefined)
+      requireIdentifier(input.channelDefaultExecutionRef);
     if (typeof input.text !== "string" || input.text.length > 64_000)
       throw new Error("Message exceeds the accepted text limit");
     const images = input.images ?? [];
@@ -648,7 +664,7 @@ export class ConversationStore {
         args: [messageId, conversation.id, key, input.messageId, input.text, now],
       });
       await tx.execute({
-        sql: "INSERT INTO runs(id, conversation_id, message_id, principal_id, scope_json, execution_ref, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)",
+        sql: "INSERT INTO runs(id, conversation_id, message_id, principal_id, scope_json, execution_ref, channel_default_execution_ref, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)",
         args: [
           runId,
           conversation.id,
@@ -656,6 +672,7 @@ export class ConversationStore {
           caller.principalId,
           JSON.stringify(caller.scope),
           input.executionRef,
+          input.channelDefaultExecutionRef ?? null,
           now,
           now,
         ],
@@ -679,6 +696,9 @@ export class ConversationStore {
         messageId,
         principalId: caller.principalId,
         executionRef: input.executionRef,
+        ...(input.channelDefaultExecutionRef === undefined
+          ? {}
+          : { channelDefaultExecutionRef: input.channelDefaultExecutionRef }),
         status: "queued",
         source: "external",
         resultText: null,
@@ -1202,6 +1222,13 @@ export class ConversationStore {
             stepId: stringColumn(bindingRows.rows[0], "step_id"),
             attemptId: stringColumn(bindingRows.rows[0], "attempt_id"),
           };
+          const originSources = await reauthorizeSourceRows(
+            tx,
+            caller,
+            await readTaskSourceRows(tx, taskStepBinding.taskId),
+            { conversationId: run.conversationId, runId },
+          );
+          if ("denied" in originSources) return originSources;
           if (!run.executionRef.startsWith("tool:")) {
             const dependencies = await tx.execute({
               sql: `SELECT s.id, s.kind, s.status, s.output_ref, s.spec_ref, s.delegated_permissions_json
@@ -1301,35 +1328,17 @@ export class ConversationStore {
                 if (decision.decision !== "ALLOW") return { denied: decision };
                 decisions.push(decision);
               }
-              const originSources = await tx.execute({
-                sql: `WITH RECURSIVE lineage(task_id,depth) AS (
-                    SELECT ?,0
-                    UNION ALL
-                    SELECT link.parent_task_id,lineage.depth + 1
-                      FROM task_child_links link JOIN lineage ON link.child_task_id = lineage.task_id
-                      WHERE lineage.depth < 4
-                  )
-                  SELECT DISTINCT decision.resource_id,decision.action
-                    FROM lineage JOIN tasks source_task ON source_task.id = lineage.task_id
-                    JOIN authorization_decisions decision ON decision.run_id = source_task.run_id
-                    WHERE decision.decision = 'ALLOW' AND decision.delivery_source IS NOT NULL
-                    LIMIT 129`,
-                args: [sourceTaskId],
-              });
-              if (originSources.rows.length > 128)
-                throw new Error("Worker result has too many protected origin sources");
-              for (const source of originSources.rows) {
-                const decision = await evaluate(tx, {
-                  caller,
-                  resourceId: stringColumn(source, "resource_id"),
-                  action: stringColumn(source, "action"),
+              const inherited = await reauthorizeSourceRows(
+                tx,
+                caller,
+                await readTaskSourceRows(tx, sourceTaskId),
+                {
                   conversationId: run.conversationId,
                   runId,
                   ...(delegatedTaskId ? { delegatedTaskId } : {}),
-                });
-                if (decision.decision !== "ALLOW") return { denied: decision };
-                decisions.push(decision);
-              }
+                },
+              );
+              if ("denied" in inherited) return inherited;
               for (const decision of decisions)
                 await tx.execute({
                   sql: "UPDATE authorization_decisions SET delivery_source = 'content_source' WHERE id = ?",
@@ -1445,28 +1454,13 @@ export class ConversationStore {
                   "conversation:read",
                 );
                 if ("denied" in sourceAuthorization) return sourceAuthorization;
-                const sources = await tx.execute({
-                  sql: `SELECT DISTINCT resource_id,action FROM authorization_decisions
-                    WHERE run_id = ? AND decision = 'ALLOW' AND delivery_source = 'content_source'
-                    LIMIT 129`,
-                  args: [childRunId],
-                });
-                if (sources.rows.length > 128)
-                  throw new Error("Child result has too many protected sources");
-                for (const source of sources.rows) {
-                  const decision = await evaluate(tx, {
-                    caller,
-                    resourceId: stringColumn(source, "resource_id"),
-                    action: stringColumn(source, "action"),
-                    conversationId: run.conversationId,
-                    runId,
-                  });
-                  if (decision.decision !== "ALLOW") return { denied: decision };
-                  await tx.execute({
-                    sql: "UPDATE authorization_decisions SET delivery_source = 'content_source' WHERE id = ?",
-                    args: [decision.id],
-                  });
-                }
+                const inherited = await reauthorizeSourceRows(
+                  tx,
+                  caller,
+                  await readRunSourceRows(tx, [childRunId]),
+                  { conversationId: run.conversationId, runId },
+                );
+                if ("denied" in inherited) return inherited;
                 await tx.execute({
                   sql: "UPDATE authorization_decisions SET delivery_source = 'content_source' WHERE id = ?",
                   args: [childDecision.id],
@@ -1562,6 +1556,13 @@ export class ConversationStore {
                   });
                 }
               }
+              const inherited = await reauthorizeSourceRows(
+                tx,
+                caller,
+                await readRunSourceRows(tx, [sourceRunId]),
+                { conversationId: run.conversationId, runId },
+              );
+              if ("denied" in inherited) return inherited;
               const contentDecision = await evaluate(tx, {
                 caller,
                 resourceId: `task-${taskStepBinding.taskId}`,
@@ -1621,7 +1622,7 @@ export class ConversationStore {
             args: priorIds,
           });
           const sources = await tx.execute({
-            sql: `SELECT DISTINCT run_id, resource_id, action, delivery_source FROM authorization_decisions_all WHERE run_id IN (${placeholders}) AND decision = 'ALLOW' AND delivery_source IS NOT NULL`,
+            sql: `SELECT DISTINCT run_id, resource_id, action, delivery_source, policy_condition_json FROM authorization_decisions_all WHERE run_id IN (${placeholders}) AND decision = 'ALLOW' AND delivery_source IS NOT NULL`,
             args: priorIds,
           });
           const deliveries = await tx.execute({
@@ -1663,6 +1664,7 @@ export class ConversationStore {
               caller,
               resourceId: stringColumn(source, "resource_id"),
               action: stringColumn(source, "action"),
+              policyCondition: readPolicyCondition(source),
               conversationId: run.conversationId,
               runId,
             });
@@ -1672,11 +1674,7 @@ export class ConversationStore {
             }
             currentSourceDecisions.push({
               id: decision.id,
-              source:
-                source.delivery_source === "access_gate" ||
-                source.delivery_source === "legacy_access_gate"
-                  ? "access_gate"
-                  : "content_source",
+              source: sourceClassification(source),
             });
           }
           if (!permitted) continue;

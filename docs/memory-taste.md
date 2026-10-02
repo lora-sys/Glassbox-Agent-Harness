@@ -8,11 +8,27 @@ candidate; it cannot use a prompt description as confirmation. The Owner can ins
 all pending candidates together with `/memory candidates`, then promote or reject up to
 20 candidates in one Owner-private message with `/memory promote <candidate-id> <candidate-id>`
 or `/memory reject <candidate-id> <candidate-id>`. A single candidate may also be reviewed
-with one ID. Exact `/memory expire|revoke|retire <memory-id>` commands govern lifecycle.
+with one ID. `/memory ok` reviews the latest pending creation Run in this Owner's current
+Conversation, up to 20 candidates. `/memory promote last` reviews the last candidate in
+that Run. Both use server-written creation audit events and persisted Run order, so source
+message references, candidate timestamps and model metadata cannot choose the batch.
+Current and later Runs are excluded. A repeated suggestion that reuses a pending candidate
+does not change its original batch; use its explicit ID to review it separately. Source
+results distinguish newly created candidates from reused pending candidates. `imported`
+counts both kinds returned by the read, while `created` counts additions to this Run.
+Exact `/memory expire|revoke|retire <memory-id>` commands govern lifecycle.
 An explicit write uses
 `/memory write global|project:<project-id> <memory-type> <statement>`; an explicit
 correction uses `/memory supersede <memory-id> <statement>` and inherits the original
-scope and type. `/memory feedback global|project:<project-id> <signal> <statement>`
+scope and type. Statement-only corrections also preserve sensitivity, retention policy and
+the original absolute TTL deadline. Explicit replacement metadata takes precedence. An explicit
+supersession records its own confirmation candidate, even when a matching suggestion is
+already pending; the suggestion and its evidence remain unchanged.
+Pending corrections require an active target at promotion time. When a candidate records
+`ifMatchUpdatedAt`, its target must still have that exact version. New Owner Tool and
+extraction candidates record the version they inspected; historical candidates without
+that field retain the active-target check. A stale review leaves the candidate pending and
+writes no replacement. `/memory feedback global|project:<project-id> <signal> <statement>`
 records a feedback event and a scoped candidate, never immediate Taste.
 
 Inspection uses `/memory list [all|global|project:<project-id>]`, `/memory get <memory-id>`
@@ -246,6 +262,7 @@ Issue #37 extends the completed P4 storage and retrieval paths into normal Runs.
 - Visitor messages, quoted text, retrieved history, Tool output, credentials, and ambiguous group statements do not create candidates automatically. The Owner can import authorized group history into candidates with the Owner-private Memory Tool.
 - Pending candidates are available together through `/memory candidates`. No per-candidate private notification is sent. Only an explicit Owner review can promote a candidate.
 - Active global Memory is read only in Owner-private Runs. Active public group Memory is read only in Runs from its exact QQ group scope. Group Memory never becomes global or project Memory.
+- Bounded Memory reads filter expired rows before applying the limit. Group reads also filter non-public rows before the limit. Expiry at the query timestamp is inactive; Owner inspection can still request inactive records.
 - The Runtime selects a bounded set of active preferences and relevant facts. It records Memory IDs and counts in Trace, not statements. Selected context is included in the P5 token budget; optional learning context is dropped first if it would overflow the model capacity.
 
 Group scope is `{ connectionId, botId, groupId }`. QQ-native group roles do not grant Memory authority. The group Resource and current Run authorization gate group candidate writes and active group reads.

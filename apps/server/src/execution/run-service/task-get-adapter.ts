@@ -1,3 +1,5 @@
+import { readTaskSourceRows, reauthorizeSourceRows } from "../../auth/source-dependencies.js";
+import { authorizedValue } from "../../auth/service.js";
 import type { DomainStore } from "../../application/domain-store.js";
 import { AccessDeniedError } from "../../auth/service.js";
 import { parseTaskGetSpec } from "../../ops/tool-step-spec.js";
@@ -10,7 +12,8 @@ export function createTaskGetAdapter(store: DomainStore): RunExecutionAdapter {
     supportsGroup: true,
     supportsTaskStepTool: true,
     async execute(input) {
-      if (input.executionMode !== "task_step_tool") return { status: "failed", failureCode: "gate_refused" };
+      if (input.executionMode !== "task_step_tool")
+        return { status: "failed", failureCode: "gate_refused" };
       const spec = parseTaskGetSpec(input.run.executionRef);
       if (!spec || !input.taskStepBinding) return { status: "failed", failureCode: "gate_refused" };
       const taskStepBinding = input.taskStepBinding;
@@ -55,6 +58,16 @@ export function createTaskGetAdapter(store: DomainStore): RunExecutionAdapter {
           runId: input.run.id,
         });
         if (decision.decision !== "ALLOW") throw new AccessDeniedError(decision);
+        authorizedValue(
+          await store.db.transaction(async (tx) =>
+            reauthorizeSourceRows(
+              tx,
+              input.caller,
+              await readTaskSourceRows(tx, spec.targetTaskId),
+              { conversationId: input.conversation.id, runId: input.run.id },
+            ),
+          ),
+        );
         return decision.id;
       };
       if (input.signal.aborted) return { status: "cancelled" };

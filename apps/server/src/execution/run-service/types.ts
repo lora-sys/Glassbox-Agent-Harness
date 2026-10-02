@@ -1,3 +1,4 @@
+import type { DeliveryReason } from "../../delivery/outcome.js";
 import type { DeliveryRecord } from "../../conversation/lifecycle.js";
 import type {
   ConversationRecord,
@@ -52,6 +53,10 @@ export type ExecutionFailureCode =
   | "pre_provider_context_overflow"
   /** The model's context capacity could not be established, so nothing was sent. */
   | "model_capacity_unknown"
+  /** Loaded input requires a capability the selected model does not support. */
+  | "model_capability_missing"
+  /** The selected execution path cannot resolve a currently configured credential. */
+  | "model_credential_missing"
   /** A gate of Glassbox's own refused the request, so the request was never put to the runtime. */
   | "gate_refused"
   /** The configured execution reference has no executor able to take this Run. */
@@ -64,11 +69,15 @@ export type ExecutionFailureCode =
   | "required_evidence_missing"
   /** The runtime was engaged and the run it was given ended in an error rather than an answer. */
   | "runtime_run_errored"
+  /** Glassbox observed a local failure, not evidence that the provider is unavailable. */
+  | "runtime_internal_error"
   /** The executor threw before producing a classified result of its own. */
   | "execution_threw";
 
 /** What every terminal adapter result carries. */
 interface ExecutionResultShape {
+  /** False is explicit evidence that no provider Run was attempted, even for local replies. */
+  runtimeAttempted?: boolean;
   text?: string;
   providerSessionId?: string;
 }
@@ -125,7 +134,7 @@ export interface RunExecutionAdapter {
 
 export type SendOutcome =
   | { status: "sent"; externalId?: string }
-  | { status: "failed" | "unknown" };
+  | { status: "failed" | "unknown"; reason?: DeliveryReason };
 export interface RunTransport {
   send(input: {
     destination: TrustedChannelScope;
@@ -181,6 +190,7 @@ export type RunServiceEvent =
       runId: string;
       deliveryId: string;
       status: DeliveryRecord["status"];
+      reason?: DeliveryReason;
       /** Channel-native id of the sent message, when the transport confirmed one. */
       externalId?: string;
     }
@@ -190,6 +200,7 @@ export type RunServiceEvent =
       taskId: string;
       notificationId: string;
       status: "sending" | "sent" | "failed" | "unknown";
+      reason?: DeliveryReason;
     }
   | {
       type: "delivery_blocked";

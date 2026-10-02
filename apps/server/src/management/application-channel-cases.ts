@@ -13,6 +13,7 @@ import type { ExecutionInput, ExecutionResult } from "../execution/run-service/t
 import type { TrustedChannelScope } from "../persistence/index.js";
 import { ManagementApplication } from "./application.js";
 import { SKILL_CATALOG_RESOURCE, SKILL_READ_ACTION } from "../runtime/pi/skill-tools.js";
+import { startWindowsPhaseTiming } from "../fixtures/windows-phase-timing.js";
 
 const { fixture, afterEachCleanup, cleanup, removeDirectory } = createApplicationFixtureScope();
 afterEach(afterEachCleanup);
@@ -441,52 +442,146 @@ describe("channel to durable run composition", () => {
     expect(owner.history).toEqual([]);
     expect(owner.conversation.id).not.toBe(visitor.conversation.id);
   });
-  it("provisions an addressed group member as a group-scoped Visitor", async () => {
+  it("provisions an addressed group member as a group-scoped Visitor", async ({
+    onTestFinished,
+  }) => {
+    const timing = startWindowsPhaseTiming("visitor-restart");
+    onTestFinished(() => timing.finish());
     const f = await fixture(
       async (input) => ({
         status: "succeeded",
         text: `answer:${input.text}`,
       }),
-      { persistentDatabase: true },
+      { persistentDatabase: true, timing },
     );
-    f.send(1, "new-member", false, 10099);
-    const visitor = await f.started.take();
-    const completed = await f.app.runs.waitForRun(visitor.caller, visitor.run.id);
-    expect(completed.status).toBe("succeeded");
-    const reply = await f.reply("answer:new-member");
-
-    expect(visitor.caller).toMatchObject({
-      principalId: "qq-visitor-10099",
-      scope: { chatType: "group", chatId: "10003", senderId: "10099" },
+    const { visitor, reply } = await timing.phase("visitor-run", async () => {
+      f.send(1, "new-member", false, 10099);
+      const visitor = await f.started.take();
+      const completed = await f.app.runs.waitForRun(visitor.caller, visitor.run.id);
+      expect(completed.status).toBe("succeeded");
+      const reply = await f.reply("answer:new-member");
+      return { visitor, reply };
     });
-    expect(reply.action).toBe("send_group_msg");
-    expect(String(reply.params.group_id)).toBe("10003");
+
+    await timing.phase("verify", async () => {
+      expect(visitor.caller).toMatchObject({
+        principalId: "qq-visitor-10099",
+        scope: { chatType: "group", chatId: "10003", senderId: "10099" },
+      });
+      expect(reply.action).toBe("send_group_msg");
+      expect(String(reply.params.group_id)).toBe("10003");
+      expect(
+        (
+          await f.app.store.authorization.check({
+            caller: visitor.caller,
+            resourceId: "tool:owner_group_admin",
+            action: "tool:discover",
+          })
+        ).decision,
+      ).toBe("DENY");
+    });
+
+    await timing.phase("private-rejection", async () => {
+      f.send(2, "private-must-stay-closed", true, 10099);
+      await expect.poll(() => f.calls.length).toBe(1);
+    });
+
+    const restarted = await timing.phase("restart", () => f.reopen());
+    await timing.phase("verify", async () => {
+      const resolved = await restarted.store.identities.resolve(visitor.caller.scope);
+      expect(resolved?.principalId).toBe("qq-visitor-10099");
+      expect(
+        (
+          await restarted.store.authorization.check({
+            caller: visitor.caller,
+            resourceId: "agent:personal",
+            action: "run:create",
+          })
+        ).decision,
+      ).toBe("ALLOW");
+    });
+  });
+  it.each([
+    [10004, "revoked"],
+    [10099, "revoked"],
+    [10004, "approval"],
+    [10099, "approval"],
+  ])("preserves %s member admission policy after %s on new ingress", async (senderId, policy) => {
+    const f = await fixture(async () => ({ status: "succeeded", text: "fixture answer" }), {
+      piAgentDirectory: null,
+    });
+    f.send(1, "first", false, senderId);
+    const first = await f.started.take();
+    await f.app.runs.waitForRun(first.caller, first.run.id);
+    await f.reply("fixture answer");
+    const scoped = {
+      principalId: first.caller.principalId,
+      scope: first.caller.scope,
+      resourceId: "agent:personal",
+      action: "run:create",
+    };
+    await f.app.store.authorization.revokeScopeAction(scoped);
+    if (policy === "approval")
+      await f.app.store.authorization.grant({ ...scoped, effect: "approval" });
+    const expected = policy === "approval" ? "REQUIRES_APPROVAL" : "DENY";
     expect(
       (
         await f.app.store.authorization.check({
-          caller: visitor.caller,
-          resourceId: "tool:owner_group_admin",
-          action: "tool:discover",
+          caller: first.caller,
+          resourceId: scoped.resourceId,
+          action: scoped.action,
         })
       ).decision,
-    ).toBe("DENY");
-
-    f.send(2, "private-must-stay-closed", true, 10099);
-    await expect.poll(() => f.calls.length).toBe(1);
-
-    const restarted = await f.reopen();
-    const resolved = await restarted.store.identities.resolve(visitor.caller.scope);
-    expect(resolved?.principalId).toBe("qq-visitor-10099");
+    ).toBe(expected);
+    const ownerScope: TrustedChannelScope = {
+      connectionId: "fixture",
+      botId: "10001",
+      chatType: "private",
+      chatId: "10002",
+      senderId: "10002",
+    };
+    await f.app.store.authorization.grant({
+      principalId: "owner",
+      scope: ownerScope,
+      resourceId: "group:10003",
+      action: "group:manage",
+      effect: "allow",
+    });
+    f.send(2, "must not restore admission", false, senderId);
+    // Wait for a completed admission decision, not an arbitrary delay or an already-true count.
+    await expect
+      .poll(async () => {
+        const result = await f.app.route({
+          method: "GET",
+          url: "/manage/group-role-audit?channelId=fixture&groupId=10003",
+        } as never);
+        const body = result?.body as { ingressDiagnostics: { acceptanceFailed: number } };
+        return f.calls.length > 1 || body.ingressDiagnostics.acceptanceFailed > 0;
+      })
+      .toBe(true);
+    expect(f.calls).toHaveLength(1);
     expect(
       (
-        await restarted.store.authorization.check({
-          caller: visitor.caller,
-          resourceId: "agent:personal",
-          action: "run:create",
+        await f.app.store.authorization.check({
+          caller: first.caller,
+          resourceId: scoped.resourceId,
+          action: scoped.action,
         })
       ).decision,
-    ).toBe("ALLOW");
+    ).toBe(expected);
+    await f.app.disconnectChannel("fixture");
+    await f.app.connectChannel("fixture");
+    expect(
+      (
+        await f.app.store.authorization.check({
+          caller: first.caller,
+          resourceId: scoped.resourceId,
+          action: scoped.action,
+        })
+      ).decision,
+    ).toBe(expected);
   });
+
   it("runs a group mention once, isolates Owner DM history, and indexes actual trace records", async () => {
     const f = await fixture(async (input) => ({
       status: "succeeded",
@@ -665,6 +760,15 @@ describe("channel to durable run composition", () => {
       principalId: "qq-visitor-10004",
     });
     expect(
+      (
+        await f.app.store.authorization.check({
+          caller: { principalId: "qq-visitor-10004", scope: visitorScope },
+          resourceId: "agent:personal",
+          action: "run:create",
+        })
+      ).decision,
+    ).toBe("ALLOW");
+    expect(
       await f.app.store.authorization.hasActiveGrant({
         principalId: "qq-visitor-10004",
         resourceId: "custom:visitor-secret",
@@ -693,6 +797,64 @@ describe("channel to durable run composition", () => {
         scope: visitorScope,
       }),
     ).toBe(false);
+  });
+
+  it("restores an explicitly re-added Owner across restart without resetting unchanged members", async () => {
+    const f = await fixture(async () => ({ status: "succeeded", text: "unused" }), {
+      persistentDatabase: true,
+      piAgentDirectory: null,
+    });
+    const current = f.app.listChannels()[0]!;
+    const profile = {
+      id: current.id,
+      label: current.label,
+      kind: current.kind,
+      endpoint: current.endpoint,
+      botId: current.botId,
+      ownerId: current.ownerId,
+      visitorIds: current.visitorIds,
+      groupIds: current.groupIds,
+      executionRef: current.executionRef,
+    };
+    const ownerScope: TrustedChannelScope = {
+      connectionId: "fixture",
+      botId: "10001",
+      chatType: "private",
+      chatId: "10002",
+      senderId: "10002",
+    };
+    const visitorScope = { ...ownerScope, chatId: "10004", senderId: "10004" };
+    await f.app.store.authorization.revokeScopeAction({
+      principalId: "qq-visitor-10004",
+      scope: visitorScope,
+      resourceId: "agent:personal",
+      action: "run:create",
+    });
+    await f.app.disconnectChannel("fixture");
+    await f.app.saveChannel({ ...profile, ownerId: "10006" });
+    await f.app.saveChannel(profile);
+    // Saving a profile restores policy, but does not bind an identity before connect.
+    expect(await f.app.store.identities.resolve(ownerScope)).toBeNull();
+    const restarted = await f.reopen();
+    await restarted.connectChannel("fixture");
+    expect(
+      (
+        await restarted.store.authorization.check({
+          caller: { principalId: "owner", scope: ownerScope },
+          resourceId: "agent:personal",
+          action: "run:create",
+        })
+      ).decision,
+    ).toBe("ALLOW");
+    expect(
+      (
+        await restarted.store.authorization.check({
+          caller: { principalId: "qq-visitor-10004", scope: visitorScope },
+          resourceId: "agent:personal",
+          action: "run:create",
+        })
+      ).decision,
+    ).toBe("DENY");
   });
 
   it("blocks a configured channel credential from QQ delivery without copying it into Trace", async () => {
@@ -790,6 +952,61 @@ describe("channel to durable run composition", () => {
     expect(newGroupRun.caller.principalId).toBe("qq-visitor-10099");
     expect(newGroupRun.caller.scope.chatId).toBe("10005");
 
+    const principalId = newGroupRun.caller.principalId;
+    const scope = newGroupRun.caller.scope;
+    const threadedScope = { ...scope, threadId: "previous-thread" };
+    await f.app.store.authorization.grant({
+      principalId,
+      scope: threadedScope,
+      resourceId: "agent:personal",
+      action: "run:create",
+      effect: "allow",
+    });
+    await f.app.store.authorization.registerResource({
+      id: "custom:group-member",
+      kind: "test",
+      visibility: "public",
+    });
+    await f.app.store.authorization.grant({
+      principalId,
+      scope,
+      resourceId: "custom:group-member",
+      action: "secret:read",
+      effect: "allow",
+    });
+    const excludedScopes = [
+      { ...scope, connectionId: "another-connection" },
+      { ...scope, botId: "10009" },
+      { ...scope, chatId: "10008" },
+    ];
+    for (const excluded of excludedScopes) {
+      const id = await f.app.store.authorization.grant({
+        principalId,
+        scope: excluded,
+        resourceId: "agent:personal",
+        action: "run:create",
+        effect: "allow",
+      });
+      await f.app.store.authorization.revoke(id);
+    }
+    const staleScopes = [
+      { ...scope, senderId: "10097" },
+      { ...scope, senderId: "10098" },
+    ];
+    for (const stale of staleScopes) {
+      const oldPrincipalId = `qq-visitor-${stale.senderId}`;
+      await f.app.store.identities.createPrincipal(oldPrincipalId, "visitor");
+      await f.app.store.authorization.grant({
+        principalId: oldPrincipalId,
+        scope: stale,
+        resourceId: "agent:personal",
+        action: "run:create",
+        effect: "allow",
+      });
+    }
+    // One sender is now bound to a different Principal; the other is no longer bound.
+    await f.app.store.identities.bindPrincipal(principalId, staleScopes[0]!);
+
     await application.setGroupAccess(context, { groupId: "10005", enabled: false });
     expect(f.app.listChannels()[0]?.groupIds).not.toContain("10005");
     expect(
@@ -806,6 +1023,58 @@ describe("channel to durable run composition", () => {
     await f.started.take((input) => input.text === "queue-barrier");
     await f.reply("answer:queue-barrier");
     expect(f.calls.some((call) => call.text === "revoked-group")).toBe(false);
+
+    // An explicit reopen restores defaults for members who were admitted dynamically too.
+    await application.setGroupAccess(context, { groupId: "10005", enabled: true });
+    expect(
+      (
+        await f.app.store.authorization.check({
+          caller: newGroupRun.caller,
+          resourceId: "agent:personal",
+          action: "run:create",
+        })
+      ).decision,
+    ).toBe("ALLOW");
+    expect(
+      (
+        await f.app.store.authorization.check({
+          caller: { principalId, scope: threadedScope },
+          resourceId: "agent:personal",
+          action: "run:create",
+        })
+      ).decision,
+    ).toBe("ALLOW");
+    expect(
+      await f.app.store.authorization.hasActiveGrant({
+        principalId,
+        scope,
+        resourceId: "custom:group-member",
+        action: "secret:read",
+      }),
+    ).toBe(false);
+    for (const excluded of excludedScopes)
+      expect(
+        await f.app.store.authorization.hasActiveGrant({
+          principalId,
+          scope: excluded,
+          resourceId: "agent:personal",
+          action: "run:create",
+        }),
+      ).toBe(false);
+    for (const stale of staleScopes) {
+      for (const candidate of [principalId, `qq-visitor-${stale.senderId}`])
+        expect(
+          await f.app.store.authorization.hasActiveGrant({
+            principalId: candidate,
+            scope: stale,
+            resourceId: "agent:personal",
+            action: "run:create",
+          }),
+        ).toBe(false);
+    }
+    f.send(5, "reopened-group", false, 10099, 10005);
+    await f.started.take((input) => input.text === "reopened-group");
+    await f.reply("answer:reopened-group");
   });
 });
 

@@ -1,5 +1,7 @@
 export const persistedEnvironmentKeys = new Set([
   "PORT",
+  "GLASSBOX_TEMPORAL_ADDRESS",
+  "GLASSBOX_TEMPORAL_NAMESPACE",
   "LORA_PI_KIT_PATH",
   "GLASSBOX_SANDBOX_IMAGE",
   "GLASSBOX_SANDBOX_DNS_MODE",

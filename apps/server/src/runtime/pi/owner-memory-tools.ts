@@ -5,7 +5,7 @@ import { QQ_SOURCE_CLASSES, type QqSourceClass } from "@glassbox/contracts";
 import type { FeedbackSignal, GlassboxMemoryScope, MemoryType } from "../../learning/contracts.js";
 import { feedbackSignals } from "../../learning/contracts.js";
 import { MemoryConsolidator } from "../../learning/consolidation.js";
-import { internalLearningId, publicLearningId } from "../../learning/ids.js";
+import { createLearningId, internalLearningId, publicLearningId } from "../../learning/ids.js";
 import {
   candidateFromAuthorizedSource,
   sourceStatementIsSubstantive,
@@ -19,10 +19,7 @@ import {
 } from "../../learning/store.js";
 import type { DomainStore } from "../../persistence/index.js";
 import { stringColumn } from "../../persistence/database.js";
-import {
-  AuthorizedQQSourceReader,
-  sourceClassAuthority,
-} from "../../retrieval/qq-source-reader.js";
+import { AuthorizedQQSourceReader } from "../../retrieval/qq-source-reader.js";
 import { groupResourceId } from "../../retrieval/source-resolver.js";
 import {
   createProtectedTool,
@@ -186,40 +183,62 @@ async function latestConversationCandidates(
   store: DomainStore,
   context: ProtectedToolContext,
   learning: LearningStore,
+  wholeBatch = false,
 ) {
-  const candidateIds = await store.db.transaction(async (tx) =>
-    (
-      await tx.execute({
-        sql: `SELECT DISTINCT target_id FROM memory_audit_events
-          WHERE action = 'write' AND conversation_id = ? AND principal_id = ?
-          AND run_id IS NOT NULL AND run_id <> ?`,
-        args: [context.conversationId, context.caller.principalId, context.runId],
-      })
-    ).rows.map((row) => stringColumn(row, "target_id")),
+  // Only the first server-written creation audit owns a candidate's batch. A repeated
+  // model suggestion can reuse a pending row, but cannot move it into another Run.
+  const rows = await store.db.transaction(
+    async (tx) =>
+      (
+        await tx.execute({
+          sql: `WITH origins AS (
+          SELECT target_id, MIN(sequence) AS sequence FROM memory_audit_events
+          WHERE action = 'write' GROUP BY target_id
+        )
+        SELECT c.id, source_run.id AS run_id
+        FROM origins
+        JOIN memory_audit_events e ON e.sequence = origins.sequence
+        JOIN memory_candidates c ON c.id = origins.target_id
+        JOIN runs source_run ON source_run.id = e.run_id
+        JOIN runs current_run ON current_run.id = ?
+        WHERE current_run.conversation_id = ? AND current_run.principal_id = ?
+          AND e.conversation_id = current_run.conversation_id
+          AND e.principal_id = current_run.principal_id
+          AND source_run.conversation_id = current_run.conversation_id
+          AND source_run.principal_id = current_run.principal_id
+          AND source_run.sequence < current_run.sequence
+          AND c.status = 'pending'
+          AND json_extract(c.subject_json, '$.kind') = 'user'
+          AND json_extract(c.subject_json, '$.id') = current_run.principal_id
+        ORDER BY source_run.sequence DESC, e.sequence DESC
+        LIMIT ?`,
+          args: [
+            context.runId,
+            context.conversationId,
+            context.caller.principalId,
+            wholeBatch ? 21 : 1,
+          ],
+        })
+      ).rows,
   );
-  // A confirmation can only review candidates created before this Owner message.
-  const allowed = new Set(candidateIds);
-  const pending = (
-    await learning.listCandidates(
+  const latestRunId = rows[0] && stringColumn(rows[0], "run_id");
+  const selected = wholeBatch
+    ? rows.filter((row) => stringColumn(row, "run_id") === latestRunId)
+    : rows;
+  // Read one extra row to reject an oversized batch before any promotion occurs.
+  if (selected.length > 20) throw new Error("too_many_pending_candidates");
+  const pending = [];
+  for (const row of selected) {
+    const candidate = await learning.getCandidate(
       {
         caller: context.caller,
         conversationId: context.conversationId,
         runId: context.runId,
       },
-      { status: "pending" },
-    )
-  )
-    .filter(
-      (candidate) =>
-        candidate.subject.kind === "user" &&
-        candidate.subject.id === context.caller.principalId &&
-        allowed.has(candidate.candidateId),
-    )
-    .sort(
-      (left, right) =>
-        right.createdAt.localeCompare(left.createdAt) ||
-        right.candidateId.localeCompare(left.candidateId),
+      stringColumn(row, "id"),
     );
+    if (candidate?.status === "pending") pending.push(candidate);
+  }
   if (!pending.length) throw new Error("no_pending_conversation_candidates");
   return pending;
 }
@@ -381,7 +400,11 @@ async function executeMemoryActionRaw(
             source: { kind: "system", ref: `run:${context.runId}` },
             sourceEvidence: modelEvidence(context.runId),
             confidence: input.confidence ?? 0.5,
-            mergeHint: { strategy: "manual_review_required", ifMatchMemoryId: existing.memoryId },
+            mergeHint: {
+              strategy: "manual_review_required",
+              ifMatchMemoryId: existing.memoryId,
+              ifMatchUpdatedAt: existing.updatedAt,
+            },
             extensions: { "glassbox:model_inference": true },
           });
         return learning.supersedeMemory(
@@ -458,10 +481,7 @@ async function executeMemoryActionRaw(
         !commandAuthorized(await ownerCommand(store, context), "/memory ok")
       )
         throw new Error("owner_confirmation_required");
-      const pending = await latestConversationCandidates(store, context, learning);
-      const latestSource = pending[0]!.source.ref;
-      const selected = pending.filter((candidate) => candidate.source.ref === latestSource);
-      if (selected.length > 20) throw new Error("too_many_pending_candidates");
+      const selected = await latestConversationCandidates(store, context, learning, true);
       const results = [];
       for (const candidate of selected.reverse()) {
         try {
@@ -494,11 +514,11 @@ async function executeMemoryActionRaw(
         const results = [];
         for (const publicId of candidateIds) {
           const candidateId = internalLearningId("candidate", publicId);
-          const candidate = await learning.getCandidate(operationContext, candidateId);
-          if (!candidate) {
+          const status = await learning.candidateReviewStatus(operationContext, candidateId);
+          if (!status) {
             results.push({ candidateId: publicId, status: "not_found" });
-          } else if (candidate.status !== "pending") {
-            results.push({ candidateId: publicId, status: candidate.status });
+          } else if (status !== "pending") {
+            results.push({ candidateId: publicId, status: status });
           } else {
             try {
               await learning.rejectCandidate(operationContext, candidateId);
@@ -514,14 +534,14 @@ async function executeMemoryActionRaw(
         throw new Error("owner_confirmation_required");
       {
         const candidateId = internalLearningId("candidate", requiredId(input));
-        const candidate = await learning.getCandidate(operationContext, candidateId);
-        if (!candidate) throw new Error("candidate_not_found");
-        if (candidate.status !== "pending")
+        const status = await learning.candidateReviewStatus(operationContext, candidateId);
+        if (!status) throw new Error("candidate_not_found");
+        if (status !== "pending")
           return {
             executed: false,
             reason: "candidate_not_pending",
-            candidateId: candidate.candidateId,
-            status: candidate.status,
+            candidateId,
+            status: status,
           };
         return learning.rejectCandidate(operationContext, candidateId);
       }
@@ -573,14 +593,6 @@ async function executeMemoryActionRaw(
       if (!input.groupId || !input.sourceClass || !QQ_SOURCE_CLASSES.includes(input.sourceClass))
         throw new Error("invalid_memory_source_input");
       const resourceId = groupResourceId(input.groupId);
-      const decision = await store.authorization.check({
-        caller: context.caller,
-        resourceId,
-        action: sourceClassAuthority(input.sourceClass).action,
-        conversationId: context.conversationId,
-        runId: context.runId,
-      });
-      if (decision.decision !== "ALLOW") throw new Error("memory_source_denied");
       // A query is what makes this an import of something asked about rather than a dump of
       // whatever the archive happened to hold last. Without one the read returns the most recent
       // messages in the group, which is how the review queue came to hold `可以`, `风控有点严`
@@ -588,7 +600,9 @@ async function executeMemoryActionRaw(
       if (typeof input.query !== "string" || !input.query.trim())
         throw new Error("memory_source_query_required");
       const reader = new AuthorizedQQSourceReader({ store, caller: context.caller });
-      const items = await reader.readCandidates({
+      const { items, decision } = await reader.readAuthorizedCandidates({
+        conversationId: context.conversationId,
+        runId: context.runId,
         connectionId: context.caller.scope.connectionId,
         groupId: input.groupId,
         sourceClass: input.sourceClass,
@@ -600,6 +614,8 @@ async function executeMemoryActionRaw(
       const scope = scopeFrom(input, context);
       const category = input.sourceClass === "metadata" ? "group_info" : input.sourceClass;
       const candidates = [];
+      const reusedCandidateIds: string[] = [];
+      let created = 0;
       let skipped = 0;
       for (const item of items) {
         // A message that asserts nothing is not a candidate. Counting what was dropped is what
@@ -609,39 +625,43 @@ async function executeMemoryActionRaw(
           skipped += 1;
           continue;
         }
-        candidates.push(
-          await learning.createCandidate(
-            operationContext,
-            candidateFromAuthorizedSource({
-              item: {
-                channel: "qq",
-                groupResourceId: resourceId,
-                groupId: input.groupId,
-                category,
-                sourceReadRunId: context.runId,
-                authorizationDecisionId: decision.id,
-                occurredAt: item.occurredAt,
-                stableRef: `qq:${item.id}`,
-                snippet: item.text,
-                ...(item.externalMessageId ? { externalMessageId: item.externalMessageId } : {}),
-                ...(item.senderId ? { senderId: item.senderId } : {}),
-              },
-              subject: { kind: "user", id: context.caller.principalId },
-              scope,
-              type: "semantic_fact",
-              statement: item.text.slice(0, 8000),
-            }),
-          ),
-        );
+        const candidateId = createLearningId("candidate");
+        const candidate = await learning.createSourceCandidate(operationContext, {
+          ...candidateFromAuthorizedSource({
+            item: {
+              channel: "qq",
+              groupResourceId: resourceId,
+              groupId: input.groupId,
+              category,
+              sourceReadRunId: context.runId,
+              authorizationDecisionId: decision!.id,
+              occurredAt: item.occurredAt,
+              stableRef: `qq:${item.id}`,
+              snippet: item.text,
+              ...(item.externalMessageId ? { externalMessageId: item.externalMessageId } : {}),
+              ...(item.senderId ? { senderId: item.senderId } : {}),
+            },
+            subject: { kind: "user", id: context.caller.principalId },
+            scope,
+            type: "semantic_fact",
+            statement: item.text.slice(0, 8000),
+          }),
+          candidateId,
+        });
+        candidates.push(candidate);
+        if (candidate.candidateId === candidateId) created++;
+        else reusedCandidateIds.push(publicLearningId("candidate", candidate.candidateId));
       }
-      // The decision is what a later Run re-reads this turn against, so it has to carry the
-      // marker the recheck looks for. Only marked when the read actually returned something:
-      // an empty read left no delivery for the marker to describe.
-      if (items.length > 0)
-        await store.authorization.markDeliverySource(decision.id, "content_source");
+      // The source reader reauthorized and marked the actual returned source before any
+      // candidate was created, so the store can snapshot trusted Run dependencies.
       return {
         matched: items.length,
         imported: candidates.length,
+        created,
+        reused: reusedCandidateIds.length,
+        reusedCandidateIds,
+        reviewGuidance:
+          "Only newly created candidates join this Run's batch. Reused pending candidates keep their original batch; review them with /memory promote <candidateId>.",
         skipped,
         candidates,
       };

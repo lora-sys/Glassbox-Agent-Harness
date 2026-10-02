@@ -500,7 +500,7 @@ describe("configured group Run capability authority", () => {
         operation: "set_group_whole_ban",
         params: { enable: true },
       }),
-    ).rejects.toThrow("capability_category_disabled");
+    ).rejects.toThrow("Permission denied: source_policy_denied");
   });
 
   it("hides and refuses group history on the next Run after the Owner disables it", async () => {
@@ -527,7 +527,7 @@ describe("configured group Run capability authority", () => {
     if (!domainHistory) throw new Error("missing qq_group_history");
     await expect(
       domainHistory.execute("call", { operation: "get_group_msg_history" }),
-    ).rejects.toThrow("capability_category_disabled");
+    ).rejects.toThrow("Permission denied: source_policy_denied");
   });
 
   it("keeps set_history and set_capability(group.history) coherent for the group Run", async () => {

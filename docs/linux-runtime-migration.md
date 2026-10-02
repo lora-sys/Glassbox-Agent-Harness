@@ -70,3 +70,30 @@ If the Linux path fails before it writes new durable state, stop the Linux consu
 ## Completion evidence
 
 Keep distinct records for WSL parity, clean Linux rebuild, and real Linux full stack smoke. Deterministic tests and a reachable port do not prove QQ login, delivery, Worker acceptance, sandbox isolation, or recovery after host restart. Record each acceptance as passed, failed, or untested with the runtime, checkout, and timestamp that produced the evidence.
+
+## Read-only startup checks and explicit environment
+
+The Linux unit templates run `scripts/linux-runtime-preflight.mts` before starting the server.
+Start from `deploy/linux/runtime.env.example` and set explicit `GLASSBOX_DATA_DIR`, `PORT`,
+`LORA_PI_KIT_PATH`, and `PI_CODING_AGENT_DIR` in the private runtime.env. Use real absolute
+Linux paths; systemd does not expand shell variables. Keep the same GLASSBOX_DATA_DIR and PORT
+in the shell used for the management CLI. The direct server historically defaults to checkout/.glassbox,
+while the service launcher and CLI default to HOME/.glassbox; those defaults remain unchanged.
+Do not put GLASSBOX_DATA_DIR in service-launch.json: the launcher resolves its data directory from
+its own environment before loading that file. Export it before invoking any npm service command.
+The direct systemd entry does not read service-launch.json. Do not run both service managers.
+
+With the intended environment loaded, run `node --import tsx scripts/linux-runtime-preflight.mts`
+from the checkout for an offline check. It requires the configured Kit and main Pi directories,
+allows a missing data directory for a new install, and validates existing workspace metadata and
+paths without creating directories, lock files, or changing data. It does not test credentials,
+provider access, Temporal readiness, QQ, or Herdr. Temporal remains optional; when configured,
+its address and namespace can also be passed through the npm launcher's environment allowlist.
+Herdr Worker credentials still need separate acceptance. Optional Jev setup is not a migration gate.
+
+Application startup validates workspace state before opening stores or migrating the database.
+Malformed registries and unavailable or unconverted paths stop startup; map registered paths explicitly
+and use the existing default-workspace migration helper only after reviewing a stopped copy.
+The checkout switch rechecks the previous checkout's supported schema after candidate failure and
+before rollback spawn. If the candidate upgraded beyond that version, rollback fails without replacing
+new durable state with a backup. This guard is not a database downgrade or proof of full cutover.

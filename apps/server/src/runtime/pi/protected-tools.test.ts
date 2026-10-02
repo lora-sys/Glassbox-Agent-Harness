@@ -142,3 +142,22 @@ describe("a required call's instruction", () => {
     }
   });
 });
+
+it("projects only server-bound QQ group IDs out of model call examples", () => {
+  const input = Object.freeze({
+    groupId: "1126022432",
+    operation: "set_group_ban",
+    memberSelector: "Ripped",
+    params: Object.freeze({ duration: 30 }),
+  });
+  expect(requiredCallClause("qq_group_moderation", input, "group")).toBe(
+    'qq_group_moderation with exactly this JSON input: {"operation":"set_group_ban","memberSelector":"Ripped","params":{"duration":30}}',
+  );
+  expect(requiredCallClause("qq_group_moderation", input, "private")).toContain(
+    JSON.stringify(input),
+  );
+  expect(requiredCallClause("owner_group_admin", input, "group")).toContain(JSON.stringify(input));
+  expect(requiredCallClause("qq_group_moderation", input)).toContain(JSON.stringify(input));
+  expect(input.groupId).toBe("1126022432");
+  expect(input.params).toEqual({ duration: 30 });
+});

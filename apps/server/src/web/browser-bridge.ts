@@ -1,3 +1,4 @@
+import { throwIfWebCancelled, cancellableBrowserCommand } from "./cancellation.js";
 import {
   BrowserSessionRegistry,
   browserSessionBindingKey,
@@ -315,7 +316,9 @@ export class BrowserBridge {
   async execute(
     binding: BrowserSessionBinding,
     action: BrowserAction,
+    signal?: AbortSignal,
   ): Promise<BrowserBridgeResult> {
+    throwIfWebCancelled(signal);
     binding = { ...binding, purpose: binding.purpose ?? "tool" };
     validateBinding(binding);
     const command = commandFor(action);
@@ -323,14 +326,17 @@ export class BrowserBridge {
       await this.cleanup(binding).catch(() => undefined);
       throw new Error("browser_denied");
     }
+    throwIfWebCancelled(signal);
     if (action.type === "open" || action.type === "goto") {
       const targetUrl = action.url;
       if (!targetUrl) throw new Error("browser_invalid_url");
       const safe = await assertPublicWebUrl(targetUrl, this.options.resolveHost);
+      throwIfWebCancelled(signal);
       command.args[command.args.length - 1] = safe.href;
     }
 
     return this.sessions.exclusive(binding, async (session) => {
+      throwIfWebCancelled(signal);
       const key = browserSessionBindingKey(binding);
       if (action.type === "open") {
         if (session.opened) throw new Error("browser_session_already_open");
@@ -360,13 +366,16 @@ export class BrowserBridge {
       if (command.navigation || command.mutation || command.tabChange) this.invalidateRefs(live);
       const args = ["--json", "--session", session.cliSession, ...command.args];
       try {
+        throwIfWebCancelled(signal);
         if (!(await this.options.authorize(binding, command.capability, action.type)))
           throw new Error("browser_denied");
+        throwIfWebCancelled(signal);
         if (action.type !== "open" && action.type !== "close")
-          await this.assertCurrentUrlSafe(live);
-        const result = await live.execution.execute(args, this.limits());
+          await this.assertCurrentUrlSafe(live, signal);
+        const result = await this.executeCommand(live, args, signal);
         if (!(await this.options.authorize(binding, command.capability, action.type)))
           throw new Error("browser_denied");
+        throwIfWebCancelled(signal);
         if (result.exitCode !== 0) throw new Error("browser_cli_failed");
         const parsed = parseJsonResult(result.stdout);
         if (!parsed.success) throw new Error(`browser_cli_${parsed.code ?? "failed"}`);
@@ -382,7 +391,7 @@ export class BrowserBridge {
           live.activeTab = action.type === "tab_select" ? action.tabId : `unknown-${Date.now()}`;
         }
         const needsUrlCheck = command.navigation || command.mutation || command.tabChange;
-        if (needsUrlCheck) await this.assertCurrentUrlSafe(live);
+        if (needsUrlCheck) await this.assertCurrentUrlSafe(live, signal);
         const artifact = action.type === "screenshot" ? result.artifact : undefined;
         if (action.type === "screenshot") {
           if (
@@ -399,6 +408,7 @@ export class BrowserBridge {
         );
         const max = this.options.maxOutputChars ?? DEFAULT_MAX_OUTPUT_CHARS;
         if (action.type === "close") await this.closeSession(binding, session, true);
+        throwIfWebCancelled(signal);
         return {
           output: output.slice(0, max),
           truncated: output.length > max,
@@ -433,10 +443,22 @@ export class BrowserBridge {
     };
   }
 
-  private async assertCurrentUrlSafe(live: LiveBrowserSession): Promise<void> {
-    const result = await live.execution.execute(
+  private executeCommand(live: LiveBrowserSession, args: string[], signal?: AbortSignal) {
+    return cancellableBrowserCommand(
+      signal,
+      () => live.execution.execute(args, this.limits()),
+      () => live.execution.cancel(),
+    );
+  }
+
+  private async assertCurrentUrlSafe(
+    live: LiveBrowserSession,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const result = await this.executeCommand(
+      live,
       ["--json", "--session", live.sessionId, "get", "url"],
-      this.limits(),
+      signal,
     );
     if (result.exitCode !== 0) throw new Error("browser_result_url_unavailable");
     const parsed = parseJsonResult(result.stdout);
@@ -446,7 +468,9 @@ export class BrowserBridge {
     if (!url || !/^https?:\/\//iu.test(url)) throw new Error("browser_result_target_denied");
     try {
       await assertPublicWebUrl(url, this.options.resolveHost);
+      throwIfWebCancelled(signal);
     } catch {
+      throwIfWebCancelled(signal);
       throw new Error("browser_result_target_denied");
     }
   }

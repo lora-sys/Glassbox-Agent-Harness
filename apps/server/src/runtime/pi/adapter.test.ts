@@ -1685,3 +1685,95 @@ describe("PiSdkRuntimeAdapter provider outcomes", () => {
     ]);
   });
 });
+
+it.each([
+  ["group", { memberSelector: "Ripped", params: { duration: 30 } }],
+  ["group", { params: { user_id: 10004, duration: 30 } }],
+  ["private", { memberSelector: "Ripped", params: { duration: 30 } }],
+  ["private", { params: { user_id: 10004, duration: 30 } }],
+] as const)(
+  "projects a callable moderation example in the actual Pi model prompt: %s %j",
+  async (chatType, target) => {
+    const runtimeBaseDir = await mkdtemp(join(tmpdir(), "glassbox-pi-moderation-prompt-"));
+    directories.push(runtimeBaseDir);
+    let capturedPrompt = "";
+    const model = {
+      id: "moderation-prompt-fixture",
+      name: "Moderation prompt fixture",
+      api: "openai-completions",
+      provider: "fixture-provider",
+      baseUrl: "http://fixture.invalid",
+      reasoning: false,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 32768,
+      maxTokens: 256,
+    } as never;
+    const modelRuntime = {
+      hasConfiguredAuth: () => true,
+      checkAuth: async () => undefined,
+      isUsingOAuth: () => false,
+      streamSimple: (_model: unknown, context: { systemPrompt?: string }) => {
+        capturedPrompt = context.systemPrompt ?? "";
+        const stream = createAssistantMessageEventStream();
+        const message = {
+          role: "assistant",
+          content: [{ type: "text", text: "fixture response" }],
+          api: "openai-completions",
+          provider: "fixture-provider",
+          model: "moderation-prompt-fixture",
+          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 },
+          stopReason: "stop",
+          timestamp: Date.now(),
+        } as never;
+        queueMicrotask(() => {
+          stream.push({ type: "start", partial: message });
+          stream.push({ type: "done", reason: "stop", message });
+        });
+        return stream;
+      },
+    } as unknown as ModelRuntime;
+    const adapter = new PiSdkRuntimeAdapter({
+      kitPath: fileURLToPath(new URL("./fixtures/lora-pi-kit", import.meta.url)),
+      runtimeBaseDir,
+      model,
+      modelRuntime,
+      resolveToolNames: async () => [],
+      resolveSkillNames: async () => ({ names: [] }),
+    });
+    const required = Object.freeze({
+      groupId: "1126022432",
+      operation: "set_group_ban",
+      ...target,
+    });
+    const context: PiRunContext = {
+      caller: {
+        principalId: "owner",
+        scope: {
+          connectionId: "qq",
+          botId: "10001",
+          chatType,
+          chatId: chatType === "group" ? "1126022432" : "10002",
+          senderId: "10002",
+        },
+      },
+      runId: run.id,
+      conversationId: conversation.id,
+      requiredToolName: "qq_group_moderation",
+      requiredToolInput: required,
+    };
+    try {
+      await adapter.initialize();
+      const binding = await adapter.createOrRestoreSession(conversation, "test", context);
+      await adapter.run(binding, run, "禁言 Ripped 30 秒", context);
+      const expected = chatType === "group" ? { operation: "set_group_ban", ...target } : required;
+      expect(capturedPrompt).toContain(
+        `qq_group_moderation with exactly this JSON input: ${JSON.stringify(expected)}.`,
+      );
+      expect(context.requiredToolInput).toBe(required);
+      expect(context.requiredToolInput?.groupId).toBe("1126022432");
+    } finally {
+      await adapter.cleanup();
+    }
+  },
+);

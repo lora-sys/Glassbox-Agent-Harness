@@ -1,3 +1,7 @@
+import { backfillDeliveryAttention, recordDeliveryAttention } from "../delivery/attention.js";
+import type { DeliveryReason } from "../delivery/outcome.js";
+import { readPolicyCondition } from "../auth/policy-condition.js";
+import { sourceClassification } from "../auth/source-dependencies.js";
 import { randomUUID } from "node:crypto";
 import type { Row, Transaction } from "@libsql/client";
 import { authorizedValue, evaluate, type AuthorizedResult } from "../auth/service.js";
@@ -49,7 +53,11 @@ export interface RunLease {
 }
 export interface DeliveryLease {
   delivery: DeliveryRecord;
-  settle(status: "sent" | "failed" | "unknown", externalId?: string): Promise<void>;
+  settle(
+    status: "sent" | "failed" | "unknown",
+    externalId?: string,
+    reason?: DeliveryReason,
+  ): Promise<void>;
 }
 
 function deliveryRecord(row: Row, runId: string): DeliveryRecord {
@@ -147,26 +155,20 @@ export class LifecycleStore {
     caller: CallerContext,
     runId: string,
   ): Promise<AuthorizedResult<null>> {
-    // Trusted execution paths mark an ALLOW only after a protected read succeeds.
+    // Trusted execution paths mark ALLOW decisions when protected output may enter Context,
+    // including native streams and partial failures; attribution can precede execution.
     // Discovery checks remain unmarked, so they cannot become delivery dependencies.
     const decisions = await tx.execute({
-      sql: `SELECT DISTINCT d.resource_id, d.action, d.delivery_source, r.kind AS resource_kind
+      sql: `SELECT DISTINCT d.resource_id, d.action, d.delivery_source, d.policy_condition_json, r.kind AS resource_kind
         FROM authorization_decisions_all d LEFT JOIN resources r ON r.id = d.resource_id
         WHERE d.run_id = ? AND d.principal_id = ? AND d.decision = 'ALLOW'
           AND d.delivery_source IS NOT NULL`,
       args: [runId, caller.principalId],
     });
-    const sources = decisions.rows.flatMap((source) => {
-      const persistedClass = stringColumn(source, "delivery_source");
-      const classification =
-        persistedClass === "legacy_content_source"
-          ? "content_source"
-          : persistedClass === "legacy_access_gate"
-            ? "access_gate"
-            : persistedClass;
-      if (classification !== "content_source" && classification !== "access_gate") return [];
-      return classification ? [{ source, classification }] : [];
-    });
+    const sources = decisions.rows.map((source) => ({
+      source,
+      classification: sourceClassification(source),
+    }));
     // Every delivery decision is evidence about one Run in one Conversation, so the delivery
     // recheck names both. A denial then explains which Run tried to send which Resource's
     // derived content, without copying the payload it was carrying.
@@ -185,6 +187,9 @@ export class LifecycleStore {
           ...(conversationId === undefined ? {} : { conversationId }),
           resourceId: stringColumn(source, "resource_id"),
           action,
+          ...(action === stringColumn(source, "action")
+            ? { policyCondition: readPolicyCondition(source) }
+            : {}),
         });
         if (decision.decision !== "ALLOW") return { denied: decision };
       }
@@ -386,7 +391,7 @@ export class LifecycleStore {
     let active = true;
     return {
       delivery,
-      settle: async (status, externalId) => {
+      settle: async (status, externalId, reason) => {
         if (!active) throw new Error("Delivery lease already settled");
         if (!["sent", "failed", "unknown"].includes(status))
           throw new Error("Invalid delivery outcome");
@@ -399,6 +404,7 @@ export class LifecycleStore {
               args: [status, externalId ?? null, new Date().toISOString(), deliveryId, runId],
             });
             if (result.rowsAffected !== 1) throw new Error("Delivery state changed");
+            await recordDeliveryAttention(tx, runId, deliveryId, status, reason);
           });
         } catch (error) {
           active = true;
@@ -511,6 +517,7 @@ export class LifecycleStore {
       const running = await tx.execute("SELECT id FROM runs WHERE status = 'running'");
       const cancelling = await tx.execute("SELECT id FROM runs WHERE status = 'cancelling'");
       const sending = await tx.execute("SELECT id FROM deliveries WHERE status = 'sending'");
+      await backfillDeliveryAttention(tx);
       const now = new Date().toISOString();
       await tx.batch([
         {
@@ -633,6 +640,8 @@ export class LifecycleStore {
           ],
         });
         if (result.rowsAffected !== 1) throw new Error("Delivery state changed");
+        if (next === "sent" || next === "failed" || next === "unknown")
+          await recordDeliveryAttention(tx, runId, deliveryId, next);
         return { value: undefined };
       }),
     );
@@ -652,7 +661,7 @@ export class LifecycleStore {
         // deliveries are created back-to-back and can share one created_at millisecond,
         // and send order must stay deterministic across platforms.
         const rows = await tx.execute({
-          sql: "SELECT *, rowid AS delivery_sequence FROM deliveries WHERE run_id = ? AND (created_at, rowid) > (?, CAST(? AS INTEGER)) ORDER BY created_at, delivery_sequence LIMIT ?",
+          sql: "SELECT *, CAST(rowid AS TEXT) AS delivery_sequence FROM deliveries WHERE run_id = ? AND (created_at, rowid) > (?, CAST(? AS INTEGER)) ORDER BY created_at, rowid LIMIT ?",
           args: [runId, page.afterTime, page.afterId, page.limit + 1],
         });
         return {

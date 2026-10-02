@@ -708,3 +708,50 @@ Owner private retrieval ≠ group-to-group sharing
 Schedule truth ≠ scheduler transport
 generated proposal ≠ activated capability
 ```
+
+## Implemented nickname moderation boundary
+
+`qq_group_moderation/set_group_ban` accepts either a fixed `params.user_id` plus
+`params.duration`, or a literal `memberSelector` plus `params.duration`. The current
+message binds the group, operation, target and explicit duration. The mute target, duration
+and explicit group must come from the same single mute clause. The server does not borrow
+them from another clause, Conversation history, or roster instructions. Multiple mute
+requests fail before a model turn instead of selecting one or combining their parameters.
+Missing or ambiguous duration asks the user for one duration with a unit before a model turn
+begins. Durations in unrelated clauses do not change a complete mute request. A group request
+cannot silently retarget a different named group.
+
+Nickname/card matching is exact and case-sensitive, with no Unicode normalization,
+whitespace normalization, substring or fuzzy matching. The parser removes only syntax
+quotes and surrounding command whitespace. Multiple matching fields or duplicate records
+for one QQ ID identify one member. Matches across multiple QQ IDs are ambiguous. An
+absent, ambiguous, malformed, or unauthorized roster produces a fixed response asking for
+the member's QQ number; it never triggers a model-chosen fallback target.
+
+Resolution requires the current Run's `qq_group_members` Tool, the registry's
+`group:members:read` Action and the current `group.members` category. Moderation permission
+does not imply roster permission. The roster AuthorizationRequest carries the trusted
+`qq_category` condition for `group.members`. Its exact initial read receipt is reused after
+provider I/O. After trace, live-role and category projections finish, one final authorization
+transaction checks both the original roster receipt and the mutation's own current category
+condition. It records the read completion only when both requests allow and never consumes
+the initial read approval twice. A numeric-ID request does not need a roster read.
+
+The first unique resolved QQ ID, original selector, group and duration stay pinned to the
+Run's original request object. A retry that resolves the name to another member is refused.
+Before dispatch, append-only evidence records the selected QQ ID, duration, exact-match
+method and roster-read authorization decision ID. It contains no roster or raw names.
+Failed evidence recording prevents the mutation and cannot enable a retargeted retry.
+The existing one-attempt mutation gate applies even after an unknown or failed provider
+response. Cancellation during resolution or role verification prevents dispatch.
+
+The application verifies OneBot success before projecting `get_login_info`,
+`get_group_member_list` and `get_group_member_info` response data. Their Tools still check
+identity and response shape before returning a bot ID, count or role. All other provider
+operations retain their existing success-envelope contract. Failed and unknown envelopes
+are never treated as successful data, and nested objects with a `data` key are not unwrapped.
+
+Model-facing group capability call examples omit the server-bound `groupId`. The trusted
+required input still retains it for mutation authorization, completion checks and evidence.
+Owner-private call examples keep their explicit group target. Both the initial Pi prompt and
+retry instructions use the same projection.

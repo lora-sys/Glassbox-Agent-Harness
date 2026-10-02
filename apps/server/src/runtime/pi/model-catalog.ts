@@ -86,7 +86,26 @@ export class PiModelCatalog {
     return { model, modelRuntime: this.runtime };
   }
 
+  async hasCredential(profileId: string, signal?: AbortSignal): Promise<boolean> {
+    const model = this.models.find(
+      (candidate) => piModelProfileId(candidate.provider, candidate.id) === profileId,
+    );
+    // Pinned Pi 0.85.1 built-in/JSON checks use local auth state without refreshing OAuth.
+    // Extension-supplied provider auth hooks may have additional side effects.
+    return (
+      model !== undefined &&
+      (await this.runtime.checkAuth(model.provider, { signal })) !== undefined
+    );
+  }
+
   resolveMatching(profile: Pick<PublicModelProfile, "protocol" | "baseUrl" | "model">) {
+    const profileId = this.matchingProfileId(profile);
+    return profileId === undefined ? undefined : this.resolve(profileId);
+  }
+
+  matchingProfileId(
+    profile: Pick<PublicModelProfile, "protocol" | "baseUrl" | "model">,
+  ): string | undefined {
     const baseUrl = normalizeBaseUrl(profile.baseUrl);
     const matches = this.models.filter(
       (candidate) =>
@@ -100,7 +119,7 @@ export class PiModelCatalog {
     if (matches.length === 0) return undefined;
     if (matches.length > 1) throw new Error("Pi model mapping is ambiguous");
     const model = matches[0]!;
-    return this.resolve(piModelProfileId(model.provider, model.id));
+    return piModelProfileId(model.provider, model.id);
   }
 
   has(profileId: string): boolean {

@@ -25,6 +25,7 @@ export class MemoryConsolidator {
     const decisions = await this.extractor.extract({ messages: input.messages, existing });
     const candidates = [];
     for (const decision of decisions) {
+      const matched = existing.find((memory) => memory.memoryId === decision.existingMemoryId);
       const evidence = input.messages.map((message) => ({
         evidenceId: randomUUID(),
         kind: "chat_message" as const,
@@ -34,30 +35,37 @@ export class MemoryConsolidator {
         metadata: { role: message.role, untrustedInput: true },
       }));
       candidates.push(
-        await this.store.createCandidate(input.context, {
-          candidateKind:
-            decision.action === "update" || decision.action === "retire" ? "correction" : "derived",
-          subject: input.subject,
-          scope: input.scope,
-          proposedType: decision.type,
-          statement: decision.statement,
-          content: decision.content ?? { statement: decision.statement },
-          source: {
-            kind: "chat",
-            ref: input.messages[0]?.ref ?? `run:${input.context.runId ?? "unknown"}`,
+        await this.store.createCandidate(
+          input.context,
+          {
+            candidateKind:
+              decision.action === "update" || decision.action === "retire"
+                ? "correction"
+                : "derived",
+            subject: input.subject,
+            scope: input.scope,
+            proposedType: decision.type,
+            statement: decision.statement,
+            content: decision.content ?? { statement: decision.statement },
+            source: {
+              kind: "chat",
+              ref: input.messages[0]?.ref ?? `run:${input.context.runId ?? "unknown"}`,
+            },
+            sourceEvidence: evidence,
+            confidence: decision.confidence ?? 0.5,
+            sensitivity: "confidential",
+            mergeHint: {
+              strategy: "manual_review_required",
+              ...(decision.existingMemoryId ? { ifMatchMemoryId: decision.existingMemoryId } : {}),
+              ...(matched ? { ifMatchUpdatedAt: matched.updatedAt } : {}),
+            },
+            extensions: {
+              "glassbox:extractor_action": decision.action,
+              "glassbox:model_inference": true,
+            },
           },
-          sourceEvidence: evidence,
-          confidence: decision.confidence ?? 0.5,
-          sensitivity: "confidential",
-          mergeHint: {
-            strategy: "manual_review_required",
-            ...(decision.existingMemoryId ? { ifMatchMemoryId: decision.existingMemoryId } : {}),
-          },
-          extensions: {
-            "glassbox:extractor_action": decision.action,
-            "glassbox:model_inference": true,
-          },
-        }),
+          existing.map((memory) => memory.memoryId),
+        ),
       );
     }
     return candidates;
