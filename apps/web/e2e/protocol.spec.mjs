@@ -236,7 +236,7 @@ test("Workbench keeps a newer turn running and retires old-session approvals", a
       grantRoot: null,
     }),
   );
-  await page.getByText(/DECISION NEEDED/).click();
+  await page.getByTestId("canvas").getByText("DECISION NEEDED", { exact: true }).click();
   await page.getByRole("button", { name: "Approve", exact: true }).click();
   await expect
     .poll(() => decidePayload)
@@ -246,6 +246,8 @@ test("Workbench keeps a newer turn running and retires old-session approvals", a
   await expect.poll(() => sockets.has("new-session")).toBe(true);
   await expect(page.getByText(/DECISION NEEDED/)).toHaveCount(0);
   releaseDecision();
-  await expect(page.getByText("Task: new task", { exact: true })).toBeVisible();
+  await expect(
+    page.getByTestId("canvas").getByText("Task: new task", { exact: true }),
+  ).toBeVisible();
   await expect(page.getByText("Task: stale decision response", { exact: true })).toHaveCount(0);
 });
