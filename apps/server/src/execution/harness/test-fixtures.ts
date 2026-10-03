@@ -89,9 +89,8 @@ export async function harnessFixture() {
     executablePath,
     executionRef: "claude-local",
     credentials: async () => ({ ANTHROPIC_API_KEY: "fixture-api-secret-canary" }),
-    hostEnvironment: { SystemRoot: process.env.SystemRoot },
-    // Match the adapter's Windows process-exit margin closely enough that a
-    // child which has closed stdin is not killed during a busy parallel run.
+    // Match the adapter's process-exit margin closely enough that a child which
+    // has closed stdin is not killed during a busy parallel run.
     exitTimeoutMs: 1000,
   };
   const dispose = async () => {

@@ -142,34 +142,19 @@ export function createCodexEnvironment(input: {
   workspace: string;
   temp: string;
   executablePath: string;
-  hostEnvironment?: Readonly<Record<string, string | undefined>>;
-  platform?: NodeJS.Platform;
 }): Record<string, string> {
-  const platform = input.platform ?? process.platform;
-  const paths = platform === "win32" ? path.win32 : path.posix;
-  const systemRoot = input.hostEnvironment?.SystemRoot ?? input.hostEnvironment?.SYSTEMROOT;
-  if (platform === "win32" && (!systemRoot || !paths.isAbsolute(systemRoot)))
-    throw new HarnessFailure("INVALID_INPUT");
   return {
-    ...(platform === "win32" ? { SystemRoot: systemRoot!, WINDIR: systemRoot! } : {}),
-    PATH: [
-      paths.dirname(input.executablePath),
-      paths.dirname(process.execPath),
-      ...(platform === "win32" ? [paths.join(systemRoot!, "System32")] : []),
-    ].join(platform === "win32" ? ";" : ":"),
+    PATH: [path.dirname(input.executablePath), path.dirname(process.execPath)].join(":"),
     HOME: input.home,
-    USERPROFILE: input.home,
     CODEX_HOME: input.home,
-    APPDATA: paths.join(input.home, "AppData", "Roaming"),
-    LOCALAPPDATA: paths.join(input.home, "AppData", "Local"),
-    XDG_CONFIG_HOME: paths.join(input.home, ".config"),
-    XDG_DATA_HOME: paths.join(input.home, ".local", "share"),
-    XDG_CACHE_HOME: paths.join(input.home, ".cache"),
+    XDG_CONFIG_HOME: path.join(input.home, ".config"),
+    XDG_DATA_HOME: path.join(input.home, ".local", "share"),
+    XDG_CACHE_HOME: path.join(input.home, ".cache"),
     TMP: input.temp,
     TEMP: input.temp,
     TMPDIR: input.temp,
     GIT_CONFIG_NOSYSTEM: "1",
-    GIT_CONFIG_GLOBAL: paths.join(input.home, ".gitconfig"),
+    GIT_CONFIG_GLOBAL: path.join(input.home, ".gitconfig"),
     CODEX_DISABLE_UPDATE_CHECK: "1",
   };
 }

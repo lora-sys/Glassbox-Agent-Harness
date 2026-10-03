@@ -82,13 +82,10 @@ export function getDefaultWorkspace(provider: string): string {
 
 /**
  * Tests whether `candidate` is equal to or located inside `parent`.
- * Respects Windows case-insensitivity and path normalization.
  */
 export function isPathInsideOrEqual(parent: string, candidate: string): boolean {
-  const p =
-    process.platform === "win32" ? path.resolve(parent).toLowerCase() : path.resolve(parent);
-  const c =
-    process.platform === "win32" ? path.resolve(candidate).toLowerCase() : path.resolve(candidate);
+  const p = path.resolve(parent);
+  const c = path.resolve(candidate);
   if (p === c) return true;
   const rel = path.relative(p, c);
   if (path.isAbsolute(rel)) return false;

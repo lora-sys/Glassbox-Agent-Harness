@@ -21,41 +21,30 @@ afterEach(async () => {
 });
 
 describe("isolated homes and explicit environment", () => {
-  it("keeps Windows paths with spaces and excludes inherited configuration and credentials", () => {
-    const root = "C:\\Disposable State\\harness";
+  it("builds the explicit POSIX environment without inherited host fields", () => {
+    const root = "/disposable state/harness";
     const layout = {
       root,
-      workspace: `${root}\\workspace`,
-      home: `${root}\\home`,
-      config: `${root}\\config`,
-      temp: `${root}\\temp`,
+      workspace: `${root}/workspace`,
+      home: `${root}/home`,
+      config: `${root}/config`,
+      temp: `${root}/temp`,
     };
     const env = createHarnessEnvironment({
       layout,
-      executablePath: "C:\\Program Files\\Claude\\claude.exe",
-      platform: "win32",
-      nodeExecutable: "C:\\Program Files\\nodejs\\node.exe",
+      executablePath: "/opt/claude/claude",
+      nodeExecutable: "/usr/bin/node",
       credentials: { CLAUDE_CODE_OAUTH_TOKEN: "explicit-credential" },
-      hostEnvironment: {
-        SystemRoot: "C:\\Windows",
-        HOME: "C:\\Owner",
-        ANTHROPIC_API_KEY: "must-not-copy",
-        NODE_OPTIONS: "owner-module",
-        CLAUDE_CONFIG_DIR: "owner-config",
-        HTTP_PROXY: "private-proxy",
-      },
     });
-    expect(env.PATH).toBe(
-      "C:\\Program Files\\Claude;C:\\Program Files\\nodejs;C:\\Windows\\System32",
-    );
+    expect(env.PATH).toBe("/opt/claude:/usr/bin");
     expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe("explicit-credential");
     expect(env.HOME).toBe(layout.home);
-    expect(env.USERPROFILE).toBe(layout.home);
     expect(env.CLAUDE_CONFIG_DIR).toBe(layout.config);
-    expect(env.APPDATA).toBe(`${layout.home}\\AppData\\Roaming`);
-    expect(JSON.stringify(env)).not.toContain("must-not-copy");
+    expect(env.XDG_CONFIG_HOME).toBe(`${layout.home}/.config`);
     expect(env).not.toHaveProperty("NODE_OPTIONS");
     expect(env).not.toHaveProperty("HTTP_PROXY");
+    expect(env).not.toHaveProperty("USERPROFILE");
+    expect(env).not.toHaveProperty("APPDATA");
   });
 
   it("rejects empty, conflicting or injected credential environment", () => {
@@ -122,11 +111,7 @@ describe("isolated homes and explicit environment", () => {
     const outside = path.join(item.directory, "outside");
     await mkdir(item.config.dataDirectory);
     await mkdir(outside);
-    await symlink(
-      outside,
-      path.join(item.config.dataDirectory, "harness"),
-      process.platform === "win32" ? "junction" : "dir",
-    );
+    await symlink(outside, path.join(item.config.dataDirectory, "harness"), "dir");
     await expect(createHarnessLayout(item.config.dataDirectory, executionInput())).rejects.toThrow(
       "ISOLATION_VIOLATION",
     );

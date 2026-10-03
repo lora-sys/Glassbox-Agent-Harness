@@ -1,11 +1,11 @@
 // apps/server/src/platform/platform.test.ts
-// Deterministic unit tests for Windows runtime baseline slice A0.
+// Deterministic unit tests for the POSIX runtime platform layer.
 
 import { describe, it, expect } from "vite-plus/test";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import {
   getRepoRoot,
   getGlassboxDataDir,
@@ -15,24 +15,14 @@ import {
   isPathInsideOrEqual,
 } from "./paths.js";
 import {
-  escapeWindowsShellArg,
-  sanitizeShellModeArgsForPlatform,
-  resolveWindowsPathExtensions,
-  resolveCommandCandidates,
+  defaultIsExecutableFile,
   resolveClaudeExecutable,
   resolveCodexExecutable,
+  resolveExecutablePath,
   resolveSpawnCommand,
 } from "./executable.js";
 import { gitLsFiles, gitDiffForScan } from "./git.js";
 import { CodexAdapter } from "../codex/adapter.js";
-
-function isHostFileFromWindowsPath(candidate: string): boolean {
-  try {
-    return fs.statSync(candidate.replaceAll("\\", path.sep)).isFile();
-  } catch {
-    return false;
-  }
-}
 
 describe("Platform Paths and Repo Validation", () => {
   it("discovers repository root containing package.json", () => {
@@ -77,11 +67,6 @@ describe("Platform Paths and Repo Validation", () => {
       expect(codexWs).toContain("glassbox-codex-ws");
       expect(claudeWs).toContain("glassbox-claude-ws");
       expect(demoWs).toContain("glassbox-demo-repo");
-
-      if (process.platform === "win32") {
-        expect(codexWs).not.toMatch(/^\/tmp\//);
-        expect(claudeWs).not.toMatch(/^\/tmp\//);
-      }
     } finally {
       if (origCodex !== undefined) process.env.GLASSBOX_WORKSPACE_CODEX = origCodex;
       if (origClaude !== undefined) process.env.GLASSBOX_WORKSPACE_CLAUDE = origClaude;
@@ -89,13 +74,9 @@ describe("Platform Paths and Repo Validation", () => {
     }
   });
 
-  it("detects path containment respecting Windows case insensitivity and child named ..data", () => {
+  it("detects path containment and child named ..data", () => {
     const repo = getRepoRoot();
-    const repoLower = repo.toLowerCase();
 
-    if (process.platform === "win32") {
-      expect(isPathInsideOrEqual(repo, repoLower)).toBe(true);
-    }
     expect(isPathInsideOrEqual(repo, path.join(repo, "apps", "server"))).toBe(true);
     expect(isPathInsideOrEqual(repo, os.tmpdir())).toBe(false);
 
@@ -134,29 +115,20 @@ describe("Platform Paths and Repo Validation", () => {
       expect(repoRootResult.error).toContain("Glassbox repo path is not allowed");
     }
 
-    // 5. Glassbox repo with alternate case on Windows
-    if (process.platform === "win32") {
-      const lowerRepoResult = validateRepoPath(getRepoRoot().toLowerCase());
-      expect(lowerRepoResult.ok).toBe(false);
-      if (!lowerRepoResult.ok) {
-        expect(lowerRepoResult.error).toContain("Glassbox repo path is not allowed");
-      }
-    }
-
-    // 6. Subdirectory inside Glassbox repo
+    // 5. Subdirectory inside Glassbox repo
     const subRepoResult = validateRepoPath(path.join(getRepoRoot(), "apps", "server"));
     expect(subRepoResult.ok).toBe(false);
     if (!subRepoResult.ok) {
       expect(subRepoResult.error).toContain("Glassbox repo path is not allowed");
     }
 
-    // 7. Reserved ~/.glassbox
+    // 6. Reserved ~/.glassbox
     expect(validateRepoPath("~/.glassbox")).toEqual({
       ok: false,
       error: "~/.glassbox is reserved",
     });
 
-    // 8. Legitimate temporary directory outside repo returns canonical realPath
+    // 7. Legitimate temporary directory outside repo returns canonical realPath
     const validTemp = fs.mkdtempSync(path.join(os.tmpdir(), "glassbox-valid-test-"));
     try {
       const validResult = validateRepoPath(validTemp);
@@ -170,28 +142,20 @@ describe("Platform Paths and Repo Validation", () => {
     }
   });
 
-  it("handles Windows junction / symlink resolution in disposable directory", () => {
+  it("resolves symlinks to the canonical target directory", () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "glassbox-junction-test-"));
     const targetDir = path.join(tempRoot, "target");
     const linkDir = path.join(tempRoot, "link_to_target");
     fs.mkdirSync(targetDir, { recursive: true });
 
     try {
-      // Create NTFS junction on Windows, directory symlink on POSIX
-      if (process.platform === "win32") {
-        fs.symlinkSync(targetDir, linkDir, "junction");
-      } else {
-        fs.symlinkSync(targetDir, linkDir, "dir");
-      }
+      fs.symlinkSync(targetDir, linkDir, "dir");
 
       const res = validateRepoPath(linkDir);
       expect(res.ok).toBe(true);
       if (res.ok) {
-        // realPath must point to canonical targetDir
-        const canonicalTarget = fs.realpathSync.native
-          ? fs.realpathSync.native(targetDir)
-          : fs.realpathSync(targetDir);
-        expect(res.realPath.toLowerCase()).toBe(canonicalTarget.toLowerCase());
+        const canonicalTarget = fs.realpathSync(targetDir);
+        expect(res.realPath).toBe(canonicalTarget);
       }
     } finally {
       try {
@@ -204,179 +168,102 @@ describe("Platform Paths and Repo Validation", () => {
   });
 });
 
-describe("Safe Argv and Launcher Resolution", () => {
-  it("escapes Windows shell arguments safely for cmd.exe", () => {
-    const escaped1 = escapeWindowsShellArg("hello world");
-    expect(escaped1).toBe('^"hello^ world^"');
-
-    const escaped2 = escapeWindowsShellArg("foo&bar|baz<qux>test^1%VAR%");
-    expect(escaped2).toContain("^&");
-    expect(escaped2).toContain("^|");
-    expect(escaped2).toContain("^<");
-    expect(escaped2).toContain("^>");
-    expect(escaped2).toContain("^^");
-    expect(escaped2).toContain("^%");
-  });
-
-  it("sanitizes arguments array based on platform", () => {
-    const rawArgs = ["param1", "param with space", "a&b"];
-    const sanitizedWin = sanitizeShellModeArgsForPlatform(rawArgs, "win32");
-    expect(sanitizedWin[1]).toBe('^"param^ with^ space^"');
-    expect(sanitizedWin[2]).toBe('^"a^&b^"');
-
-    const sanitizedPosix = sanitizeShellModeArgsForPlatform(rawArgs, "linux");
-    expect(sanitizedPosix).toEqual(rawArgs);
-  });
-
-  it("resolves Windows PATHEXT extensions", () => {
-    const exts = resolveWindowsPathExtensions({ PATHEXT: ".EXE;.CMD;.BAT;.PS1" });
-    expect(exts).toEqual([".EXE", ".CMD", ".BAT", ".PS1"]);
-
-    const fallback = resolveWindowsPathExtensions({});
-    expect(fallback).toContain(".EXE");
-    expect(fallback).toContain(".CMD");
-  });
-
-  it("generates command candidates with extensions on win32", () => {
-    const winCandidates = resolveCommandCandidates("claude", "win32", [".EXE", ".CMD"]);
-    expect(winCandidates).toContain("claude.EXE");
-    expect(winCandidates).toContain("claude.exe");
-    expect(winCandidates).toContain("claude.CMD");
-    expect(winCandidates).toContain("claude.cmd");
-
-    const posixCandidates = resolveCommandCandidates("claude", "linux");
-    expect(posixCandidates).toEqual(["claude"]);
-  });
-
-  it("executes an actual temporary .cmd launcher in a path with spaces & metacharacters", async () => {
-    if (process.platform !== "win32") return;
-
-    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gb test (meta & space) [v1]-"));
-    const dumpScript = path.join(tempDir, "dump.js");
-    const cmdLauncher = path.join(tempDir, "launcher.cmd");
-    const outFile = path.join(tempDir, "out.json");
-
-    // dump.js writes remaining arguments to JSON file
-    fs.writeFileSync(
-      dumpScript,
-      `const fs = require('fs'); fs.writeFileSync(process.argv[2], JSON.stringify(process.argv.slice(3)));`,
-    );
-
-    // launcher.cmd executes node dump.js %*
-    fs.writeFileSync(cmdLauncher, `@"${process.execPath}" "%~dp0dump.js" %*\n`);
+describe("Executable and Launcher Resolution", () => {
+  it("resolves an executable on a fixture PATH via X_OK and rejects missing commands", () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gb-exec-path-test-"));
+    const tool = path.join(tempDir, "fixture-tool");
+    fs.writeFileSync(tool, "#!/bin/sh\n");
+    fs.chmodSync(tool, 0o755);
+    const notExecutable = path.join(tempDir, "fixture-plain");
+    fs.writeFileSync(notExecutable, "data\n");
 
     try {
-      const testArgs = [outFile, "arg with spaces", 'quote"test"', "meta&^%chars"];
-      const resolved = resolveSpawnCommand(cmdLauncher, testArgs, { platform: "win32" });
-
-      expect(resolved.shell).toBe(true);
-
-      await new Promise<void>((resolve, reject) => {
-        const proc = spawn(resolved.command, [...resolved.args], {
-          shell: resolved.shell,
-          stdio: "ignore",
-          windowsHide: true,
-        });
-        proc.on("error", reject);
-        proc.on("exit", (code) => {
-          if (code === 0) resolve();
-          else reject(new Error("Launcher exited with code " + code));
-        });
-      });
-
-      expect(fs.existsSync(outFile)).toBe(true);
-      const captured = JSON.parse(fs.readFileSync(outFile, "utf-8"));
-      expect(captured[0]).toBe("arg with spaces");
-      expect(captured[1]).toBe('quote"test"');
-      expect(captured[2]).toBe("meta&^%chars");
+      const env = { PATH: tempDir };
+      expect(resolveExecutablePath("fixture-tool", { env })).toBe(path.resolve(tool));
+      expect(resolveExecutablePath("fixture-plain", { env })).toBeUndefined();
+      expect(resolveExecutablePath("fixture-missing", { env })).toBeUndefined();
     } finally {
       fs.rmSync(tempDir, { recursive: true, force: true });
     }
   });
 
-  it("resolves Claude Code launcher shims with old cli.js fallback in disposable directory", () => {
-    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gb-claude-shim-test-"));
-    const claudeCmd = path.join(tempDir, "claude.cmd");
-    const cliJsDir = path.join(tempDir, "node_modules", "@anthropic-ai", "claude-code");
-    const cliJs = path.join(cliJsDir, "cli.js");
-
-    fs.writeFileSync(claudeCmd, "@echo off\n");
-    fs.mkdirSync(cliJsDir, { recursive: true });
-    fs.writeFileSync(cliJs, "// cli.js\n");
+  it("resolves an explicit Claude binary path and fails clearly when it is missing", () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gb-claude-explicit-test-"));
+    const claude = path.join(tempDir, "claude");
+    fs.writeFileSync(claude, "#!/bin/sh\n");
+    fs.chmodSync(claude, 0o755);
 
     try {
-      // 1. With cli.js present: resolves to cli.js even though .js is not in PATHEXT
-      const resolved = resolveClaudeExecutable({
-        binaryPath: claudeCmd,
-        platform: "win32",
-        env: { PATH: tempDir, PATHEXT: ".CMD;.EXE" },
-        isFile: isHostFileFromWindowsPath,
-      });
-      expect(resolved).toBe(path.win32.resolve(cliJs));
-
-      // 2. When cli.js is removed: no valid entry exists next to the .cmd shim
-      fs.unlinkSync(cliJs);
-      const resolvedMissing = resolveClaudeExecutable({
-        binaryPath: claudeCmd,
-        platform: "win32",
-        env: { PATH: tempDir, PATHEXT: ".CMD;.EXE" },
-        isFile: isHostFileFromWindowsPath,
-      });
-      // Must fail clearly (return undefined) rather than returning the unspawnable .cmd shim
-      expect(resolvedMissing).toBeUndefined();
+      expect(resolveClaudeExecutable({ binaryPath: claude })).toBe(path.resolve(claude));
+      expect(resolveClaudeExecutable({ binaryPath: "/nonexistent/claude" })).toBeUndefined();
     } finally {
       fs.rmSync(tempDir, { recursive: true, force: true });
     }
   });
 
-  it("resolves Codex executable preferring native entry and node entry", () => {
-    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gb-codex-entry-test-"));
-    const codexCmd = path.join(tempDir, "codex.cmd");
-    const vendorDir = path.join(
-      tempDir,
-      "node_modules",
-      "@openai",
-      "codex",
-      "node_modules",
-      "@openai",
-      process.arch === "arm64" ? "codex-win32-arm64" : "codex-win32-x64",
-      "vendor",
-      process.arch === "arm64" ? "aarch64-pc-windows-msvc" : "x86_64-pc-windows-msvc",
-      "bin",
-    );
-    const vendorExe = path.join(vendorDir, "codex.exe");
-    const jsDir = path.join(tempDir, "node_modules", "@openai", "codex", "bin");
-    const jsEntry = path.join(jsDir, "codex.js");
-
-    fs.writeFileSync(codexCmd, "@echo off\n");
-    fs.mkdirSync(vendorDir, { recursive: true });
-    fs.writeFileSync(vendorExe, "binary\n");
+  it("resolves a bare Claude command on PATH and fails clearly when unresolvable", () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gb-claude-path-test-"));
+    const claude = path.join(tempDir, "claude");
+    fs.writeFileSync(claude, "#!/bin/sh\n");
+    fs.chmodSync(claude, 0o755);
 
     try {
-      // 1. When native codex.exe exists: resolves directly to native exe with shell: false
-      const nativeRes = resolveCodexExecutable({
-        binaryPath: codexCmd,
-        platform: "win32",
-        isFile: isHostFileFromWindowsPath,
-      });
-      expect(nativeRes).toBeDefined();
-      expect(nativeRes?.shell).toBe(false);
-      expect(nativeRes?.command).toBe(path.win32.resolve(vendorExe));
+      expect(
+        resolveClaudeExecutable({ env: { PATH: tempDir }, isFile: defaultIsExecutableFile }),
+      ).toBe(path.resolve(claude));
+      expect(
+        resolveClaudeExecutable({ binaryPath: "claude-missing-xyz", env: { PATH: tempDir } }),
+      ).toBeUndefined();
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
 
-      // 2. When native exe is removed and only codex.js exists: runs via process.execPath with shell: false
-      fs.unlinkSync(vendorExe);
-      fs.mkdirSync(jsDir, { recursive: true });
-      fs.writeFileSync(jsEntry, "// codex.js\n");
+  it("resolves a slash-bearing command directly without scanning PATH", () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gb-exec-slash-test-"));
+    const tool = path.join(tempDir, "fixture-tool");
+    fs.writeFileSync(tool, "#!/bin/sh\n");
+    fs.chmodSync(tool, 0o755);
 
-      const jsRes = resolveCodexExecutable({
-        binaryPath: codexCmd,
-        platform: "win32",
-        isFile: isHostFileFromWindowsPath,
-      });
+    try {
+      const env = { PATH: "/definitely-empty-path" };
+      expect(resolveExecutablePath(tool, { env })).toBe(path.resolve(tool));
+      expect(resolveExecutablePath(path.join(tempDir, "missing"), { env })).toBeUndefined();
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("runs a JS entry Codex executable under the current Node runtime", () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gb-codex-js-test-"));
+    const jsEntry = path.join(tempDir, "codex.js");
+    fs.writeFileSync(jsEntry, "// codex.js\n");
+
+    try {
+      const jsRes = resolveCodexExecutable({ binaryPath: jsEntry });
       expect(jsRes).toBeDefined();
       expect(jsRes?.shell).toBe(false);
       expect(jsRes?.command).toBe(process.execPath);
-      expect(jsRes?.args).toEqual([path.win32.resolve(jsEntry), "app-server"]);
+      expect(jsRes?.args).toEqual([path.resolve(jsEntry), "app-server"]);
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("runs a native Codex executable directly and rejects missing binaries", () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gb-codex-native-test-"));
+    const nativeEntry = path.join(tempDir, "codex-native");
+    fs.writeFileSync(nativeEntry, "binary\n");
+    fs.chmodSync(nativeEntry, 0o755);
+
+    try {
+      const nativeRes = resolveCodexExecutable({ binaryPath: nativeEntry });
+      expect(nativeRes).toBeDefined();
+      expect(nativeRes?.shell).toBe(false);
+      expect(nativeRes?.command).toBe(path.resolve(nativeEntry));
+      expect(nativeRes?.args).toEqual(["app-server"]);
+
+      expect(resolveCodexExecutable({ binaryPath: "/nonexistent/codex" })).toBeUndefined();
     } finally {
       fs.rmSync(tempDir, { recursive: true, force: true });
     }
@@ -384,14 +271,19 @@ describe("Safe Argv and Launcher Resolution", () => {
 
   it("preserves explicit configured binary path without silent fallback", () => {
     const missingClaude = resolveClaudeExecutable({
-      binaryPath: "C:/nonexistent/claude-binary-xyz.exe",
+      binaryPath: "/nonexistent/claude-binary-xyz",
     });
     expect(missingClaude).toBeUndefined();
 
     const missingCodex = resolveCodexExecutable({
-      binaryPath: "C:/nonexistent/codex-binary-xyz.exe",
+      binaryPath: "/nonexistent/codex-binary-xyz",
     });
     expect(missingCodex).toBeUndefined();
+  });
+
+  it("spawns POSIX commands directly without a shell", () => {
+    const resolved = resolveSpawnCommand("fixture-tool", ["--flag"]);
+    expect(resolved).toEqual({ command: "fixture-tool", args: ["--flag"], shell: false });
   });
 
   it("can run installed Codex --version if present on host without inference", () => {
@@ -405,8 +297,6 @@ describe("Safe Argv and Launcher Resolution", () => {
       {
         encoding: "utf-8",
         timeout: 5000,
-        shell: resolved.shell,
-        windowsHide: true,
       },
     ).trim();
 

@@ -292,17 +292,6 @@ function alive(pid: number): boolean {
   }
 }
 
-function windowsCommandHasArgs(commandLine: string, args: readonly string[]): boolean {
-  const normalizedCmd = commandLine.replace(/\\/gu, "/").toLowerCase();
-  return args.every((arg) => {
-    const normalizedArg = arg.replace(/\\/gu, "/").toLowerCase();
-    const relativeArg = isAbsolute(arg)
-      ? relative(repoRoot, arg).replace(/\\/gu, "/").toLowerCase()
-      : normalizedArg;
-    return normalizedCmd.includes(normalizedArg) || normalizedCmd.includes(relativeArg);
-  });
-}
-
 function herdrSessionName(entry: ProcessState): string | undefined {
   if (entry.name !== "herdr") return undefined;
   const marker = entry.args.indexOf("--session");
@@ -314,7 +303,6 @@ async function herdrSessionRunning(entry: ProcessState, name: string): Promise<b
   const result = await execFile(entry.executable, ["session", "list", "--json"], {
     cwd: entry.cwd ?? repoRoot,
     env: { ...process.env, ...entry.env },
-    windowsHide: true,
   }).catch(() => ({ stdout: "" }));
   if (!result.stdout.trim()) return false;
   try {
@@ -333,30 +321,6 @@ async function processStatus(entry: ProcessState): Promise<ProcessStatus> {
   const sessionName = herdrSessionName(entry);
   if (sessionName && (await herdrSessionRunning(entry, sessionName))) return "running";
   if (!alive(entry.pid)) return "stopped";
-  if (process.platform === "win32") {
-    const command =
-      `$p=Get-CimInstance Win32_Process -Filter "ProcessId=${entry.pid}";` +
-      "if($p){[pscustomobject]@{ExecutablePath=$p.ExecutablePath;CommandLine=$p.CommandLine}|ConvertTo-Json -Compress}";
-    const result = await execFile("powershell.exe", ["-NoProfile", "-Command", command], {
-      windowsHide: true,
-    }).catch(() => ({ stdout: "" }));
-    if (!result.stdout.trim()) return "stopped";
-    const processInfo = JSON.parse(result.stdout) as {
-      ExecutablePath?: string;
-      CommandLine?: string;
-    };
-    const sameExecutable =
-      typeof processInfo.ExecutablePath === "string" &&
-      (resolve(processInfo.ExecutablePath).toLowerCase() ===
-        resolve(entry.executable).toLowerCase() ||
-        (entry.executable.toLowerCase().endsWith("node.exe") &&
-          processInfo.ExecutablePath.toLowerCase().endsWith("node.exe")));
-    return sameExecutable &&
-      typeof processInfo.CommandLine === "string" &&
-      windowsCommandHasArgs(processInfo.CommandLine, entry.args)
-      ? "running"
-      : "stopped";
-  }
   if (await linuxProcessHasExited(entry.pid)) return "stopped";
   if (await verifyLinuxProcess(entry)) return "running";
   if (await linuxProcessHasExited(entry.pid)) return "stopped";
@@ -390,7 +354,6 @@ async function startProcess(name: ProcessName, config: ProcessConfig): Promise<P
     const child = spawn(config.executable, config.args, {
       cwd: config.cwd ?? repoRoot,
       detached: true,
-      windowsHide: true,
       stdio: ["ignore", descriptor, descriptor],
       env: { ...process.env, ...config.env, GLASSBOX_DATA_DIR: dataDirectory },
     });
@@ -460,27 +423,11 @@ async function herdrEndpoint(): Promise<string | undefined> {
       await readFile(join(dataDirectory, "agent-operations.json"), "utf8"),
     ) as Record<string, unknown>;
     if (typeof value.socketPath !== "string" || !isAbsolute(value.socketPath)) return undefined;
-    if (process.platform !== "win32") return value.socketPath;
-    return value.socketPath.startsWith("\\\\.\\pipe\\")
-      ? value.socketPath
-      : `\\\\.\\pipe\\${resolve(value.socketPath)}`;
+    return value.socketPath;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw new Error("Invalid agent operations configuration");
   }
-}
-
-async function requestGlassboxShutdown(entry: ProcessState): Promise<void> {
-  const portText = entry.env?.PORT ?? process.env.PORT ?? "3030";
-  if (!/^\d{1,5}$/u.test(portText) || Number(portText) < 1 || Number(portText) > 65535)
-    throw new Error("Invalid Glassbox service port");
-  const token = (await readFile(join(dataDirectory, "management-token"), "utf8")).trim();
-  const response = await fetch(`http://127.0.0.1:${portText}/manage/shutdown`, {
-    method: "POST",
-    headers: { authorization: `Bearer ${token}` },
-    signal: AbortSignal.timeout(2_000),
-  });
-  if (response.status !== 202) throw new Error("Glassbox did not accept graceful shutdown");
 }
 
 async function stopEntry(entry: ProcessState): Promise<void> {
@@ -489,7 +436,6 @@ async function stopEntry(entry: ProcessState): Promise<void> {
     await execFile(entry.executable, ["session", "stop", sessionName], {
       cwd: entry.cwd ?? repoRoot,
       env: { ...process.env, ...entry.env },
-      windowsHide: true,
     });
     const deadline = Date.now() + 10_000;
     while ((await herdrSessionRunning(entry, sessionName)) && Date.now() < deadline)
@@ -499,24 +445,14 @@ async function stopEntry(entry: ProcessState): Promise<void> {
     return;
   }
   if ((await knownProcessStatus(entry)) === "stopped") return;
-  if (process.platform === "win32") {
-    if (entry.name === "glassbox") await requestGlassboxShutdown(entry).catch(() => undefined);
-    else await execFile("taskkill.exe", ["/PID", String(entry.pid), "/T"]).catch(() => undefined);
-  } else {
-    process.kill(entry.pid, "SIGTERM");
-  }
+  process.kill(entry.pid, "SIGTERM");
   const gracefulDeadline = Date.now() + 5_000;
-  const stillRunning = async () =>
-    process.platform === "win32"
-      ? alive(entry.pid)
-      : (await knownProcessStatus(entry)) === "running";
+  const stillRunning = async () => (await knownProcessStatus(entry)) === "running";
   while ((await stillRunning()) && Date.now() < gracefulDeadline)
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
   if (!(await stillRunning())) return;
   if ((await knownProcessStatus(entry)) === "stopped") return;
-  if (process.platform === "win32")
-    await execFile("taskkill.exe", ["/PID", String(entry.pid), "/T", "/F"]);
-  else process.kill(entry.pid, "SIGKILL");
+  process.kill(entry.pid, "SIGKILL");
   const forcedDeadline = Date.now() + 5_000;
   while ((await stillRunning()) && Date.now() < forcedDeadline)
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));

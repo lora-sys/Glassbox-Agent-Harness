@@ -74,12 +74,6 @@ async function fixture(scenario = "success") {
     executablePath: item.executablePath,
     executionRef: item.config.executionRef,
     credentials: async () => ({ apiKey: "fixture-api-secret-canary" }),
-    hostEnvironment: {
-      SystemRoot: process.env.SystemRoot,
-      OWNER_PRIVATE_CANARY: "private",
-      NODE_OPTIONS: "--require owner.js",
-      OPENAI_API_KEY: "ambient-secret",
-    },
     executionTimeoutMs: 1500,
     exitTimeoutMs: 100,
   };
@@ -305,18 +299,18 @@ describe("installed Codex Owner Run boundary", () => {
     expect(() => process.kill(proof.pid, 0)).toThrow();
   });
 
-  it("constructs Windows paths without inheriting arbitrary host fields", () => {
+  it("constructs the explicit POSIX environment without inherited host fields", () => {
     const env = createCodexEnvironment({
-      home: "C:\\data\\home",
-      workspace: "C:\\data\\work",
-      temp: "C:\\data\\temp",
-      executablePath: "C:\\Apps\\Codex\\codex.exe",
-      platform: "win32",
-      hostEnvironment: { SystemRoot: "C:\\Windows", PATH: "C:\\owner", SECRET: "canary" },
+      home: "/data/home",
+      workspace: "/data/work",
+      temp: "/data/temp",
+      executablePath: "/opt/codex/codex",
     });
-    expect(env.APPDATA).toBe("C:\\data\\home\\AppData\\Roaming");
-    expect(env.PATH).not.toContain("owner");
-    expect(env).not.toHaveProperty("SECRET");
+    expect(env.PATH).toBe("/opt/codex:" + path.dirname(process.execPath));
+    expect(env.CODEX_HOME).toBe("/data/home");
+    expect(env.XDG_CONFIG_HOME).toBe("/data/home/.config");
+    expect(env).not.toHaveProperty("USERPROFILE");
+    expect(env).not.toHaveProperty("APPDATA");
   });
 });
 

@@ -131,11 +131,6 @@ describe("installed Claude execution boundary", () => {
     };
     const adapter = createClaudeHarnessAdapter({
       ...item.config,
-      hostEnvironment: {
-        ...item.config.hostEnvironment,
-        OWNER_PRIVATE_CANARY: "owner-secret",
-        NODE_OPTIONS: "--require owner.js",
-      },
       query: fakeQuery({ inspect }),
       onEvent: (event) => {
         events.push(event);

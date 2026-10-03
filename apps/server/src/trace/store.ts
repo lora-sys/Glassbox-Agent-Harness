@@ -84,9 +84,7 @@ export function getTracePath(sessionId: string): string {
       realCheck = path.resolve(checkDir);
     }
 
-    const normBase = process.platform === "win32" ? realBase.toLowerCase() : realBase;
-    const normCheck = process.platform === "win32" ? realCheck.toLowerCase() : realCheck;
-    if (normCheck !== normBase && !normCheck.startsWith(normBase + path.sep)) {
+    if (realCheck !== realBase && !realCheck.startsWith(realBase + path.sep)) {
       throw new Error(
         "Security violation: path resolves outside data directory via symlink/junction",
       );
@@ -99,8 +97,7 @@ export function getTracePath(sessionId: string): string {
       } catch {
         realFile = resolved;
       }
-      const normFile = process.platform === "win32" ? realFile.toLowerCase() : realFile;
-      if (!normFile.startsWith(normBase + path.sep)) {
+      if (!realFile.startsWith(realBase + path.sep)) {
         throw new Error(
           "Security violation: trace file resolves outside data directory via symlink/junction",
         );

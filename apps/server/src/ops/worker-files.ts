@@ -132,11 +132,12 @@ export class WorkerFiles {
   private async readDirectory(path: string) {
     const target = await this.directoryTarget(path);
     await this.beforeOpen?.(path || ".");
-    const noFollow = process.platform === "win32" ? 0 : constants.O_NOFOLLOW;
-    const directoryFlag = process.platform === "win32" ? 0 : constants.O_DIRECTORY;
     let handle: FileHandle;
     try {
-      handle = await open(target, constants.O_RDONLY | noFollow | directoryFlag);
+      handle = await open(
+        target,
+        constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_DIRECTORY,
+      );
     } catch {
       throw denied();
     }
@@ -175,14 +176,17 @@ export class WorkerFiles {
     await this.beforeOpen?.(path);
     let file: FileHandle;
     try {
-      const noFollow = process.platform === "win32" ? 0 : constants.O_NOFOLLOW;
       const numericFlags =
         flags === "r"
           ? constants.O_RDONLY
           : flags === "r+"
             ? constants.O_RDWR
             : constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL;
-      file = await open(target, numericFlags | noFollow, flags === "wx" ? 0o666 : undefined);
+      file = await open(
+        target,
+        numericFlags | constants.O_NOFOLLOW,
+        flags === "wx" ? 0o666 : undefined,
+      );
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "EEXIST") throw error;
       throw denied();

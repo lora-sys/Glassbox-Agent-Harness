@@ -57,14 +57,7 @@ export class SocketHerdrBridge implements HerdrBridge {
   }
 
   private endpoint(): string {
-    if (process.platform !== "win32") return this.options.socketPath;
-    if (
-      this.options.socketPath.startsWith("\\\\.\\pipe\\") ||
-      this.options.socketPath.startsWith("//./pipe/")
-    ) {
-      return this.options.socketPath;
-    }
-    return `\\\\.\\pipe\\${path.resolve(this.options.socketPath)}`;
+    return this.options.socketPath;
   }
 
   private payload(method: string, params: JsonObject): JsonObject {

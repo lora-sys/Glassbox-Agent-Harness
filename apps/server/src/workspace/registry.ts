@@ -69,9 +69,7 @@ function checkWorkspaceId(value: string): void {
 }
 
 function contains(parent: string, candidate: string): boolean {
-  const base = process.platform === "win32" ? parent.toLowerCase() : parent;
-  const target = process.platform === "win32" ? candidate.toLowerCase() : candidate;
-  const relative = path.relative(base, target);
+  const relative = path.relative(parent, candidate);
   return (
     relative === "" ||
     (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))

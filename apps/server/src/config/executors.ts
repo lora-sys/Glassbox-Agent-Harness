@@ -277,7 +277,6 @@ export class ExecutorConfiguration {
             credentials: async () => connection.credentials,
             apiBaseUrl: connection.apiBaseUrl,
             model: connection.model,
-            hostEnvironment: { SystemRoot: process.env.SystemRoot },
             onEvent: (event) => this.options.onEvent?.(event),
             ...(proof
               ? {
@@ -351,7 +350,6 @@ export class ExecutorConfiguration {
           credentials: async () => connection.credentials,
           apiBaseUrl: connection.apiBaseUrl,
           model: connection.model,
-          hostEnvironment: { SystemRoot: process.env.SystemRoot },
           executionTimeoutMs: 90_000,
         }).execute(input);
         if (result.status !== "succeeded" || result.text?.trim() !== "GLASSBOX_EXECUTOR_OK")

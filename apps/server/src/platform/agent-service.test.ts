@@ -369,21 +369,17 @@ describe("service commands with unverified Linux ownership", () => {
 });
 
 describe("existing service ownership contracts", () => {
-  it("keeps Windows case-insensitive command matching without requiring a Linux token", async () => {
-    Object.defineProperty(process, "platform", { value: "win32" });
-    delete state[0]!.linuxIdentity;
-    io.execFileAsync.mockResolvedValue({
-      stdout: JSON.stringify({
-        ExecutablePath: executable.toUpperCase(),
-        CommandLine: [executable, ...args].join(" ").toUpperCase(),
-      }),
-    });
+  it("reports stopped for a dead legacy record without a saved Linux identity", async () => {
+    state = [{ ...baseEntry, linuxIdentity: undefined }];
+    processAlive = false;
     await runServiceCommand("status", []);
     const result = JSON.parse(String(stdout.mock.calls[0]![0])) as {
-      processes: Array<{ running: boolean }>;
+      processes: Array<{ running: boolean; status?: string }>;
     };
-    expect(result.processes[0]!.running).toBe(true);
-    expect(io.readFile.mock.calls.some(([path]) => String(path).startsWith("/proc/"))).toBe(false);
+    expect(result.processes[0]!.running).toBe(false);
+    expect(io.spawn).not.toHaveBeenCalled();
+    // Liveness probes use signal 0 only; a dead record must never be signaled.
+    expect(kill.mock.calls.some(([, signal]) => signal !== 0)).toBe(false);
   });
 
   it("stops named Herdr sessions through the public session command without signaling their saved PID", async () => {

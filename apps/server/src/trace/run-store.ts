@@ -329,10 +329,7 @@ export class RunTraceStore {
       realAncestor = path.resolve(current);
     }
 
-    const normDataDir = process.platform === "win32" ? realDataDir.toLowerCase() : realDataDir;
-    const normAncestor = process.platform === "win32" ? realAncestor.toLowerCase() : realAncestor;
-
-    if (normAncestor !== normDataDir && !normAncestor.startsWith(normDataDir + path.sep)) {
+    if (realAncestor !== realDataDir && !realAncestor.startsWith(realDataDir + path.sep)) {
       throw new Error(
         `Security violation: path for run '${runId}' resolves outside dataDirectory via symlink/junction`,
       );
@@ -342,8 +339,7 @@ export class RunTraceStore {
     try {
       await fs.access(filePath);
       const realFile = path.resolve(await fs.realpath(filePath));
-      const normFile = process.platform === "win32" ? realFile.toLowerCase() : realFile;
-      if (!normFile.startsWith(normDataDir + path.sep)) {
+      if (!realFile.startsWith(realDataDir + path.sep)) {
         throw new Error(
           `Security violation: trace file for run '${runId}' resolves outside dataDirectory via symlink/junction`,
         );

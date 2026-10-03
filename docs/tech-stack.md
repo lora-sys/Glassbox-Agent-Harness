@@ -57,15 +57,18 @@ Vite+ is expected to cover Vite / Rolldown, Vitest, Oxlint, Oxfmt, tsdown, and w
 The configured local Personal Agent environment has one service command surface:
 
     npm run agent:up
-    npm run agent:switch -- --checkout C:\absolute\path\to\Glassbox-Agent-Harness
+    npm run agent:switch -- --checkout /absolute/path/to/Glassbox-Agent-Harness
     npm run agent:status
     npm run agent:logs
     npm run agent:down
 
 Use the `npm` commands or invoke `node --import tsx scripts/agent-service.mts <command>`
-directly. On Windows, do not use `vp run agent:up` for the long-lived service manager. Vite+
-cleans detached descendants when its task exits, so the npm scripts or direct Node invocation
-must launch the service process.
+directly. Do not use `vp run agent:up` for the long-lived service manager: Vite+
+cleans detached descendants when its task exits, so the npm scripts or direct Node
+invocation must launch the service process. On the supervised Linux deployment the
+systemd units in `deploy/linux/system/` own the services instead of this launcher;
+never run both service managers against one data directory (see
+`docs/linux-runtime-migration.md`).
 
 agent:up reads optional Herdr, NapCat and Glassbox launch settings from
 <GLASSBOX_DATA_DIR>/service-launch.json. Without that environment variable, it uses
@@ -86,11 +89,18 @@ Avoid concurrent switches because both commands change the same service process 
 Keep external provider keys in the access-restricted `service-launch.json` environment
 section when the service needs them after restart. The process registry does not store the
 Agnes key.
-For NapCat restart login, append the Bot QQ number to the launcher arguments after the QQ executable and injection library. Pin the first NapCat argument to the tested QQ executable. Do not point it at an auto-updated system QQ installation: an unsupported QQ build can leave OneBot listening while the account is offline. Keep the NapCat work directory, injection library and environment paths from one tested installation together.
+NapCat runs as a Linux container defined by `docs/napcat-linux.compose.yml` (supervised by
+`glassbox-napcat@.service` on the deployment host, or `docker compose -f docs/napcat-linux.compose.yml`
+manually). Set `NAPCAT_UID`, `NAPCAT_GID`, and the protected `NAPCAT_DATA_DIR`; keep the NapCat
+`config` and `ntqq` volumes on one tested installation. For restart-tolerant login, pass the
+Bot QQ number as the compose `command` (`["-q", "<account>"]`, supplied through
+`NAPCAT_QUICK_ACCOUNT` in the unit's environment file) so NapCat quick-logins from its saved
+state instead of printing a QR code on every restart. If NapCat reports that its saved
+quick-login state has expired, keep the stack running and complete login once through the
+local NapCat WebUI (port 6099). A successful login starts the configured OneBot endpoint,
+and the auto-connect Channel then reconnects without restarting Glassbox.
 
 The Glassbox launch environment must include `LORA_PI_KIT_PATH` whenever a configured Channel uses a `pi:*` execution reference. Starting only the HTTP server without that path can accept a message but fail before Pi creates the Run session. Use `npm run agent:up` for normal recovery instead of manually launching the three processes with partial environment variables.
-
-If NapCat reports that its saved quick-login state has expired, keep the one `agent:up` process running and complete login through the local NapCat WebUI. Do not restart it repeatedly to refresh QR images. A successful login starts the configured OneBot endpoint, and the auto-connect Channel then reconnects without restarting Glassbox.
 
 The service file accepts only the documented non-secret environment keys.
 
@@ -104,16 +114,15 @@ PID cannot be verified. Start, stop, and checkout switch then refuse to change t
 launch a replacement. This includes older Linux records without a birth identity. Inspect the
 original service through its verified supervisor or owner and stop it there before retrying.
 Do not delete the record or copy the current PID's identity into it to bypass this check.
-Dead PIDs can be removed normally. Windows and named Herdr session ownership checks keep
-their existing contracts.
+Dead PIDs can be removed normally. Named Herdr session ownership checks keep their existing contracts.
 
 The `glassbox` CLI and `agent:up` use the same service data directory. By default both use
 `~/.glassbox` and port 3030. Set `GLASSBOX_DATA_DIR` and `PORT` to the same values as the
-service when using a custom launch configuration. For the default Windows service configuration:
+service when using a custom launch configuration:
 
-```powershell
-$env:GLASSBOX_DATA_DIR = Join-Path $env:USERPROFILE '.glassbox'
-$env:PORT = '3030'
+```bash
+export GLASSBOX_DATA_DIR="$HOME/.glassbox"
+export PORT=3030
 npm run glassbox -- capabilities probe p3-qq 123456789 --json
 ```
 

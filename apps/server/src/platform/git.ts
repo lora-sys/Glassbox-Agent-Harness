@@ -141,10 +141,7 @@ function capture(cwd: string, previousPaths: string[] = []): FileSnapshot | null
           snapshot[path] = null;
           continue;
         }
-        descriptor = openSync(
-          target,
-          constants.O_RDONLY | (process.platform === "win32" ? 0 : constants.O_NOFOLLOW),
-        );
+        descriptor = openSync(target, constants.O_RDONLY | constants.O_NOFOLLOW);
         const opened = fstatSync(descriptor);
         const verified = lstatSync(checkedPath(root, path));
         if (

@@ -159,7 +159,6 @@ export function createCodexHarnessAdapter(options: CodexHarnessOptions): CodexHa
           workspace,
           temp,
           executablePath: await realpath(installed.command),
-          hostEnvironment: options.hostEnvironment,
         });
         const payload = JSON.stringify({ history: input.history, input: input.text });
         if (Buffer.byteLength(payload) > 1024 * 1024) throw new HarnessFailure("INVALID_INPUT");

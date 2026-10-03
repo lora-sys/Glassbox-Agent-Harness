@@ -16,7 +16,6 @@ export interface CodexHarnessOptions {
   executionRef: string;
   executablePath: string;
   credentials(input: ExecutionInput): Promise<{ apiKey: string }>;
-  hostEnvironment?: Readonly<Record<string, string | undefined>>;
   model?: string;
   protectedTools?: readonly CodexProtectedTool[];
   onEvent?(event: HarnessEvent): void | Promise<void>;

@@ -137,8 +137,6 @@ export interface ClaudeHarnessOptions {
   executablePath: string;
   /** Host resolves an authorized credential. Only these exact environment fields survive. */
   credentials(input: ExecutionInput): Promise<ClaudeCredentialEnvironment>;
-  /** Only SystemRoot and WINDIR are read, even when a caller passes process.env. */
-  hostEnvironment?: Readonly<Record<string, string | undefined>>;
   apiBaseUrl?: string;
   model?: string;
   systemPrompt?: string;

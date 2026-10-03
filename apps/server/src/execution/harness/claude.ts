@@ -188,7 +188,6 @@ export function createClaudeHarnessAdapter(config: ClaudeHarnessOptions): Harnes
           layout,
           executablePath,
           credentials,
-          hostEnvironment: config.hostEnvironment,
           apiBaseUrl: config.apiBaseUrl,
         });
         const secrets = Object.values(credentials).filter(

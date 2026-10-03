@@ -1,7 +1,7 @@
 // apps/server/src/codex/adapter.ts
 // Spawns `codex app-server`, communicates via JSON-RPC 2.0 over stdio.
 
-import { spawn, execFileSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import type {
   ApprovalEvent,
@@ -291,21 +291,9 @@ export class CodexAdapter extends EventEmitter implements ProviderAdapter {
     this._turnEndSubscribers = [];
     this.rejectAllPending(new Error("codex adapter stopped"));
     if (this.child) {
-      const pidToKill = this.pid;
       try {
         this.child.removeAllListeners();
-        if (process.platform === "win32" && pidToKill > 0) {
-          try {
-            execFileSync("taskkill.exe", ["/pid", String(pidToKill), "/T", "/F"], {
-              stdio: "ignore",
-              windowsHide: true,
-            });
-          } catch {
-            this.child.kill("SIGTERM");
-          }
-        } else {
-          this.child.kill("SIGTERM");
-        }
+        this.child.kill("SIGTERM");
       } catch {
         // already gone
       }
@@ -344,17 +332,7 @@ export class CodexAdapter extends EventEmitter implements ProviderAdapter {
     if (await wait()) return true;
     child.kill("SIGTERM");
     if (await wait()) return true;
-    if (process.platform === "win32" && child.pid) {
-      try {
-        execFileSync("taskkill.exe", ["/pid", String(child.pid), "/T", "/F"], {
-          stdio: "ignore",
-          windowsHide: true,
-          timeout: timeoutMs,
-        });
-      } catch {
-        child.kill("SIGKILL");
-      }
-    } else child.kill("SIGKILL");
+    child.kill("SIGKILL");
     return wait();
   }
 
