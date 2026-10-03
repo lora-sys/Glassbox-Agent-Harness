@@ -1303,6 +1303,12 @@ describe("OneBot forward WebSocket", () => {
     // Back to back, because the second one is what makes the third one droppable: it
     // overflows the acceptance queue and pushes the adapter out of `ready`, and the message
     // behind it is still on the same socket when the teardown has not been processed yet.
+    // Both frames also leave in one flushed TCP write: the overflow tears the socket down,
+    // and a frame delivered in a separate write after that teardown is lost before the
+    // adapter can see it, which would turn the drop diagnostic into a platform-timing
+    // coin flip instead of a deterministic assertion.
+    const raw = (socket as unknown as { _socket: { cork(): void; uncork(): void } })._socket;
+    raw.cork();
     socket.send(JSON.stringify(inbound({ message_id: 8 })));
     socket.send(
       JSON.stringify(
@@ -1314,6 +1320,7 @@ describe("OneBot forward WebSocket", () => {
         }),
       ),
     );
+    raw.uncork();
     expect(await errors.next()).toMatchObject({ code: "ingress_overflow", messageId: "8" });
     // A private drop used to leave no trace at all: the diagnostic projection is keyed by
     // group id, so a private message had nothing to be counted in.
