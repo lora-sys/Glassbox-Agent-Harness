@@ -16,6 +16,52 @@ export class ManagementError extends Error {
 }
 
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/u;
+const IPV4_PATTERN = /^\d{1,3}(?:\.\d{1,3}){3}$/u;
+
+/** Deployment-configurable widening of the local-only management boundary (IPv4 CIDRs or bare addresses). */
+export function parseManagementNetworks(value: string | undefined): readonly string[] {
+  if (value === undefined || value.trim() === "") return [];
+  const networks = value
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry !== "");
+  if (networks.length === 0) return [];
+  for (const network of networks) {
+    const [base, suffix] = network.split("/", 2);
+    const bits = suffix === undefined ? undefined : Number(suffix);
+    if (
+      base === undefined ||
+      !IPV4_PATTERN.test(base) ||
+      base.split(".").some((part) => Number(part) > 255) ||
+      (bits !== undefined && (!Number.isInteger(bits) || bits < 0 || bits > 32))
+    )
+      throw new ManagementError("INVALID_NETWORK", `Invalid management network: ${network}`, 400);
+  }
+  return networks;
+}
+
+function ipv4ToNumber(value: string): number {
+  const [a, b, c, d] = value.split(".").map((part) => Number(part));
+  return (((a ?? 0) << 24) | ((b ?? 0) << 16) | ((c ?? 0) << 8) | (d ?? 0)) >>> 0;
+}
+
+export function addressInNetworks(
+  address: string | undefined,
+  networks: readonly string[],
+): boolean {
+  if (!address || networks.length === 0) return false;
+  // Node reports IPv4 peers as IPv4-mapped IPv6 addresses on dual-stack sockets.
+  const mapped = address.startsWith("::ffff:") ? address.slice("::ffff:".length) : address;
+  if (!IPV4_PATTERN.test(mapped)) return false;
+  const addressKey = ipv4ToNumber(mapped);
+  return networks.some((network) => {
+    const [base, suffix] = network.split("/", 2);
+    const bits = suffix === undefined ? 32 : Number(suffix);
+    if (bits === 0) return true;
+    const mask = bits >= 32 ? 0xffffffff : (0xffffffff << (32 - bits)) >>> 0;
+    return ((ipv4ToNumber(base ?? "") ^ addressKey) & mask) === 0;
+  });
+}
 
 export async function loadManagementToken(dataDirectory: string): Promise<string> {
   if (!isAbsolute(dataDirectory))
@@ -62,16 +108,19 @@ export function createManagementAccess(options: {
   token: string;
   allowedHosts: readonly string[];
   allowedOrigins: readonly string[];
+  allowedNetworks?: readonly string[];
 }) {
   if (!TOKEN_PATTERN.test(options.token))
     throw new ManagementError("INVALID_KEY", "Invalid management key");
   const expected = Buffer.from(options.token, "utf8");
   const hosts = new Set(options.allowedHosts);
   const origins = new Set(options.allowedOrigins);
+  const networks = options.allowedNetworks ?? [];
   return (request: IncomingMessage): void => {
     const address = request.socket.remoteAddress;
+    const isLocal = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(address ?? "");
     if (
-      !["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(address ?? "") ||
+      (!isLocal && !addressInNetworks(address, networks)) ||
       !hosts.has(request.headers.host ?? "")
     ) {
       throw new ManagementError("FORBIDDEN", "Management access is local only", 403);

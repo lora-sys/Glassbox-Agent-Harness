@@ -1797,6 +1797,7 @@ export function startServer(
     const port = options.port ?? serverPort();
     if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("Invalid port");
     const dataDirectory = getGlassboxDataDir();
+    const bindHost = process.env.GLASSBOX_MANAGEMENT_BIND?.trim() || "127.0.0.1";
     const hosts = [`127.0.0.1:${port}`, `localhost:${port}`];
     const origins = hosts.map((host) => `http://${host}`);
     origins.push("http://localhost:5173", "http://127.0.0.1:5173");
@@ -1855,7 +1856,7 @@ export function startServer(
       sockets = mountSockets();
       await new Promise<void>((resolve, reject) => {
         server.once("error", reject);
-        server.listen(port, "127.0.0.1", () => {
+        server.listen(port, bindHost, () => {
           server.off("error", reject);
           resolve();
         });
@@ -1924,7 +1925,8 @@ export function stopServer(): Promise<void> {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  void startServer().catch(() => {
+  void startServer().catch((error: unknown) => {
+    console.error("[glassbox] startup failed:", error);
     console.error("Glassbox could not start. Check the port and data directory ownership.");
     process.exitCode = 1;
   });

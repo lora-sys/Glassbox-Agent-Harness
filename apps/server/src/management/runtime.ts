@@ -5,7 +5,12 @@ import type { IncomingMessage } from "node:http";
 import lockfile from "proper-lockfile";
 import { ModelProfileStore } from "../config/model-profiles.js";
 import { loadAgentOperations } from "../config/agent-operations.js";
-import { createManagementAccess, loadManagementToken, ManagementError } from "./access.js";
+import {
+  createManagementAccess,
+  loadManagementToken,
+  ManagementError,
+  parseManagementNetworks,
+} from "./access.js";
 import { createManagementHandler } from "./http.js";
 import { ManagementApplication } from "./application.js";
 import type { RunExecutionAdapter } from "../execution/run-service/types.js";
@@ -56,6 +61,7 @@ export async function openManagementRuntime(options: {
       token,
       allowedHosts: options.hosts,
       allowedOrigins: options.origins,
+      allowedNetworks: parseManagementNetworks(process.env.GLASSBOX_MANAGEMENT_ALLOW_NETWORKS),
     });
     const tickets = new Map<string, { sessionId: string; expiresAt: number }>();
     const issueTicket = (sessionId: unknown) => {
@@ -114,6 +120,7 @@ export async function openManagementRuntime(options: {
           token,
           allowedHosts: hosts,
           allowedOrigins: [...options.origins, ...hosts.map((host) => `http://${host}`)],
+          allowedNetworks: parseManagementNetworks(process.env.GLASSBOX_MANAGEMENT_ALLOW_NETWORKS),
         });
       },
       async close() {
