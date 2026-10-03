@@ -26,9 +26,12 @@ import {
 import { gitLsFiles, gitDiffForScan } from "./git.js";
 import { CodexAdapter } from "../codex/adapter.js";
 
-function windowsPathExistsOnHost(candidate: string): boolean {
-  const hostPath = process.platform === "win32" ? candidate : candidate.replaceAll("\\", path.sep);
-  return fs.existsSync(hostPath);
+function isHostFileFromWindowsPath(candidate: string): boolean {
+  try {
+    return fs.statSync(candidate.replaceAll("\\", path.sep)).isFile();
+  } catch {
+    return false;
+  }
 }
 
 describe("Platform Paths and Repo Validation", () => {
@@ -307,7 +310,7 @@ describe("Safe Argv and Launcher Resolution", () => {
         binaryPath: claudeCmd,
         platform: "win32",
         env: { PATH: tempDir, PATHEXT: ".CMD;.EXE" },
-        isFile: windowsPathExistsOnHost,
+        isFile: isHostFileFromWindowsPath,
       });
       expect(resolved).toBe(path.win32.resolve(cliJs));
 
@@ -317,7 +320,7 @@ describe("Safe Argv and Launcher Resolution", () => {
         binaryPath: claudeCmd,
         platform: "win32",
         env: { PATH: tempDir, PATHEXT: ".CMD;.EXE" },
-        isFile: windowsPathExistsOnHost,
+        isFile: isHostFileFromWindowsPath,
       });
       // Must fail clearly (return undefined) rather than returning the unspawnable .cmd shim
       expect(resolvedMissing).toBeUndefined();
@@ -354,7 +357,7 @@ describe("Safe Argv and Launcher Resolution", () => {
       const nativeRes = resolveCodexExecutable({
         binaryPath: codexCmd,
         platform: "win32",
-        isFile: windowsPathExistsOnHost,
+        isFile: isHostFileFromWindowsPath,
       });
       expect(nativeRes).toBeDefined();
       expect(nativeRes?.shell).toBe(false);
@@ -368,7 +371,7 @@ describe("Safe Argv and Launcher Resolution", () => {
       const jsRes = resolveCodexExecutable({
         binaryPath: codexCmd,
         platform: "win32",
-        isFile: windowsPathExistsOnHost,
+        isFile: isHostFileFromWindowsPath,
       });
       expect(jsRes).toBeDefined();
       expect(jsRes?.shell).toBe(false);
