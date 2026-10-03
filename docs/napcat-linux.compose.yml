@@ -2,6 +2,7 @@ services:
   napcat:
     image: mlikiowa/napcat-docker@sha256:41b1a8e10953065f4796ab19c0c8760cd3175376be976c5480710d29a77357ee
     restart: unless-stopped
+    stop_grace_period: 30s
     environment:
       NAPCAT_UID: ${NAPCAT_UID:?Set the Linux user ID}
       NAPCAT_GID: ${NAPCAT_GID:?Set the Linux group ID}
@@ -9,9 +10,17 @@ services:
       # from its saved session instead of printing a QR code on every restart.
       # NAPCAT_QUICK_ACCOUNT comes from the unit's environment file (napcat.env), never the repo.
       ACCOUNT: ${NAPCAT_QUICK_ACCOUNT:?Set the Bot QQ account for quick login}
+      # Optional fallback when the saved quick-login token was invalidated server-side.
+      # Set NAPCAT_QUICK_PASSWORD (or NAPCAT_QUICK_PASSWORD_MD5) in the unit environment file.
+      NAPCAT_QUICK_PASSWORD: ${NAPCAT_QUICK_PASSWORD:-}
+      NAPCAT_QUICK_PASSWORD_MD5: ${NAPCAT_QUICK_PASSWORD_MD5:-}
     ports:
       - "127.0.0.1:6700:6700"
       - "127.0.0.1:6099:6099"
     volumes:
+      # QQ must run as PID 1 (exec) so stop signals reach it and the NT session store is
+      # flushed on shutdown; the stock entrypoint runs QQ as an unforwarded child, which
+      # SIGKILLs it and invalidates the quick-login token on every restart.
+      - ${NAPCAT_DATA_DIR:?Set the protected Linux NapCat data directory}/entrypoint.sh:/app/entrypoint.sh:ro
       - ${NAPCAT_DATA_DIR:?Set the protected Linux NapCat data directory}/config:/app/napcat/config
       - ${NAPCAT_DATA_DIR:?Set the protected Linux NapCat data directory}/ntqq:/app/.config/QQ
