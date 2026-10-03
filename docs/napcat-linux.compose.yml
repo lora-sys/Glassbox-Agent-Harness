@@ -5,6 +5,10 @@ services:
     environment:
       NAPCAT_UID: ${NAPCAT_UID:?Set the Linux user ID}
       NAPCAT_GID: ${NAPCAT_GID:?Set the Linux group ID}
+      # The image entrypoint passes this to QQ as `-q $ACCOUNT` so NapCat quick-logins
+      # from its saved session instead of printing a QR code on every restart.
+      # NAPCAT_QUICK_ACCOUNT comes from the unit's environment file (napcat.env), never the repo.
+      ACCOUNT: ${NAPCAT_QUICK_ACCOUNT:?Set the Bot QQ account for quick login}
     ports:
       - "127.0.0.1:6700:6700"
       - "127.0.0.1:6099:6099"
