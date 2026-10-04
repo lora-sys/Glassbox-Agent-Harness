@@ -22,6 +22,8 @@ async function runFixture() {
   let executions = 0;
   const service = new RunService({
     store,
+    // This fixture proves attention survives a restart, so one unconfirmed send must stay one.
+    deliveryRetryDelaysMs: [],
     resolveExecution: () => ({
       supportsGroup: true,
       execute: async () => {

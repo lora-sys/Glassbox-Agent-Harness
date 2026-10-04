@@ -4,7 +4,7 @@ import { mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/
 import net from "node:net";
 import { DatabaseSync } from "node:sqlite";
 import lockfile from "proper-lockfile";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { getServiceDataDir } from "../apps/server/src/platform/paths.js";
@@ -37,6 +37,16 @@ interface ProcessConfig {
 
 interface GlassboxConfig {
   env?: Record<string, string>;
+  /** Absolute path of the checkout production runs from. Never inferred from cwd. */
+  checkout?: string;
+  /** Optional full commit sha the checkout HEAD must equal before it is deployed. */
+  expectedCommit?: string;
+}
+
+interface CheckoutIdentity {
+  checkout: string | null;
+  branch: string | null;
+  commit: string | null;
 }
 
 interface LaunchConfig {
@@ -60,8 +70,39 @@ interface StartOptions {
   checkout?: string;
 }
 
-async function checkoutRoot(input?: string): Promise<string> {
-  const candidate = input ?? repoRoot;
+async function git(cwd: string, args: string[]): Promise<string | undefined> {
+  try {
+    const result = await execFile("git", ["-C", cwd, ...args], { windowsHide: true });
+    const text = typeof result?.stdout === "string" ? result.stdout.trim() : "";
+    return text.length > 0 ? text : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** HEAD sha and branch of a checkout, so "what is running" never depends on a live cwd. */
+async function checkoutIdentity(checkout: string): Promise<CheckoutIdentity> {
+  return {
+    checkout,
+    branch: (await git(checkout, ["symbolic-ref", "--short", "-q", "HEAD"])) ?? null,
+    commit: (await git(checkout, ["rev-parse", "HEAD"])) ?? null,
+  };
+}
+
+/**
+ * The checkout production runs from: an explicit --checkout, else the one recorded in
+ * service-launch.json, else the repository's main checkout. The directory the script happens
+ * to live in (often a disposable task worktree) is only a last resort when git cannot answer.
+ */
+async function defaultCheckout(configured: string | undefined): Promise<string> {
+  if (configured) return configured;
+  const common = await git(repoRoot, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+  if (common && basename(common) === ".git") return dirname(common);
+  return repoRoot;
+}
+
+async function checkoutRoot(input?: string, config?: LaunchConfig): Promise<string> {
+  const candidate = input ?? (await defaultCheckout(config?.glassbox?.checkout));
   if (!isAbsolute(candidate)) throw new Error("Checkout path must be absolute");
   const root = await realpath(candidate);
   const manifest = JSON.parse(await readFile(join(root, "package.json"), "utf8")) as {
@@ -72,6 +113,16 @@ async function checkoutRoot(input?: string): Promise<string> {
     throw new Error("Glassbox server entry is unavailable");
   if (!(await stat(join(root, "node_modules/tsx"))).isDirectory())
     throw new Error("Checkout dependencies are unavailable; install them before switching");
+  const expected = config?.glassbox?.expectedCommit;
+  // The pin guards the recorded production checkout. An explicit --checkout is a deliberate
+  // candidate (e.g. an acceptance branch) and is reported by HEAD instead.
+  if (expected && input === undefined) {
+    const { commit } = await checkoutIdentity(root);
+    if (commit !== expected)
+      throw new Error(
+        `Checkout HEAD is ${commit ?? "unreadable"}, but service-launch.json expects ${expected}`,
+      );
+  }
   return root;
 }
 
@@ -151,9 +202,20 @@ function glassboxConfig(value: unknown): GlassboxConfig | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value))
     throw new Error("Invalid Glassbox launch configuration");
   const item = value as Record<string, unknown>;
-  if (Object.keys(item).some((key) => key !== "env"))
+  if (Object.keys(item).some((key) => !["env", "checkout", "expectedCommit"].includes(key)))
     throw new Error("Invalid Glassbox launch configuration");
-  return item.env === undefined ? {} : { env: environment(item.env, "Glassbox") };
+  if (
+    (item.checkout !== undefined &&
+      (typeof item.checkout !== "string" || !isAbsolute(item.checkout))) ||
+    (item.expectedCommit !== undefined &&
+      (typeof item.expectedCommit !== "string" || !/^[0-9a-f]{40}$/u.test(item.expectedCommit)))
+  )
+    throw new Error("Invalid Glassbox launch configuration");
+  return {
+    ...(item.env === undefined ? {} : { env: environment(item.env, "Glassbox") }),
+    ...(item.checkout === undefined ? {} : { checkout: resolve(item.checkout as string) }),
+    ...(item.expectedCommit === undefined ? {} : { expectedCommit: item.expectedCommit }),
+  };
 }
 
 async function loadConfig(): Promise<LaunchConfig> {
@@ -524,13 +586,13 @@ async function stopEntry(entry: ProcessState): Promise<void> {
 }
 
 async function up(options: StartOptions = {}): Promise<void> {
-  const checkout = await checkoutRoot(options.checkout);
+  const config = await loadConfig();
+  const checkout = await checkoutRoot(options.checkout, config);
   await assertDatabaseCompatible(checkout);
   await mkdir(dataDirectory, { recursive: true, mode: 0o700 });
   const prior = await loadState();
   const live = await runningState(prior);
   await writeState(live);
-  const config = await loadConfig();
   const desired: Array<[ProcessName, ProcessConfig | undefined]> = [
     ["herdr", config.herdr],
     ["napcat", options.skipNapcat ? undefined : config.napcat],
@@ -578,12 +640,12 @@ async function up(options: StartOptions = {}): Promise<void> {
     throw error;
   }
   process.stdout.write(
-    `${JSON.stringify({ status: "started", processes: live.map(({ name, pid }) => ({ name, pid })), logPath })}\n`,
+    `${JSON.stringify({ status: "started", processes: live.map(({ name, pid }) => ({ name, pid })), logPath, ...(await checkoutIdentity(checkout)) })}\n`,
   );
 }
 
 async function switchCheckout(options: StartOptions = {}): Promise<void> {
-  const checkout = await checkoutRoot(options.checkout);
+  const checkout = await checkoutRoot(options.checkout, await loadConfig());
   await assertDatabaseCompatible(checkout);
   const prior = await loadState();
   const live = await runningState(prior);
@@ -627,7 +689,9 @@ async function switchCheckout(options: StartOptions = {}): Promise<void> {
     }
     throw error;
   }
-  process.stdout.write(`${JSON.stringify({ status: "switched", checkout })}\n`);
+  process.stdout.write(
+    `${JSON.stringify({ status: "switched", ...(await checkoutIdentity(checkout)) })}\n`,
+  );
 }
 
 async function status(): Promise<void> {
@@ -641,7 +705,11 @@ async function status(): Promise<void> {
         ...(alive(entry.pid) ? { pid: entry.pid } : {}),
         running: status === "running",
         status,
-        ...(entry.name === "glassbox" ? { checkout: entry.cwd ?? null } : {}),
+        ...(entry.name === "glassbox"
+          ? entry.cwd
+            ? await checkoutIdentity(entry.cwd)
+            : { checkout: null, branch: null, commit: null }
+          : {}),
       };
     }),
   );

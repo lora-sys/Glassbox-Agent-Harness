@@ -3518,6 +3518,31 @@ describe("a factual answer requires the observation it depends on", () => {
     }
   });
 
+  it("delivers a correct answer that only mentions the bot's name or an observed role (#117)", async () => {
+    for (const [role, reply] of [
+      ["qq_group_member", "您是在跟 Lora 对话。"],
+      ["qq_group_member", "您正在和 Lora 对话。"],
+      ["qq_group_owner", "您是群主。"],
+      ["qq_group_admin", "您是管理员。"],
+    ] as const) {
+      const f = nativeRoleFixture(role, "你是谁", reply);
+      await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+        status: "succeeded",
+        text: reply,
+      });
+    }
+  });
+
+  it("still refuses a reply that attributes the protected identity itself to the sender (#117)", async () => {
+    for (const reply of ["您是 Lora。", "您是 Lora 本人。", "发件人是 Lora 本人（3526039967）。"]) {
+      const f = nativeRoleFixture("qq_group_member", "你是谁", reply);
+      await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+        status: "failed",
+        failureCode: "gate_refused",
+      });
+    }
+  });
+
   it("preserves negative, conditional and interrogative identity replies", async () => {
     for (const reply of [
       "您不是Owner。您是群主。",
