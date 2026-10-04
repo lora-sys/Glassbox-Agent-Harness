@@ -2,9 +2,12 @@ import type { Row, Transaction } from "@libsql/client";
 import { QQ_SOURCE_CLASSES, type QqSourceClass } from "@glassbox/contracts";
 import { QQ_CAPABILITIES, type QqCapabilityCategory } from "../channels/onebot/capabilities.js";
 import { requireIdentifier, type CallerContext } from "../identity/scope.js";
+import { progressPolicyAllows, type ProgressSourceCondition } from "../learning-progress/policy.js";
+import { learningProgressResourceId } from "../learning-progress/identity.js";
 
 /** Server-owned provenance. NULL means unknown legacy provenance, never explicit none. */
 export type AuthorizationPolicyCondition =
+  | ProgressSourceCondition
   | { version: 1; kind: "none" }
   | {
       version: 1;
@@ -70,6 +73,15 @@ function isCondition(value: unknown): value is AuthorizationPolicyCondition {
   const c = value as Record<string, unknown>;
   if (c.version !== 1) return false;
   if (c.kind === "none") return Object.keys(c).length === 2;
+  if (c.kind === "learning_progress")
+    return (
+      Object.keys(c).length === 4 &&
+      typeof c.recordId === "string" &&
+      c.recordId.length > 0 &&
+      c.recordId.length <= 512 &&
+      Number.isSafeInteger(c.revision) &&
+      Number(c.revision) > 0
+    );
   if (typeof c.connectionId !== "string" || typeof c.groupId !== "string") return false;
   try {
     requireIdentifier(c.connectionId);
@@ -117,6 +129,7 @@ export async function policyConditionAllows(
     resourceId: string;
     resourceKind: string;
     action: string;
+    caller?: CallerContext;
     policyCondition?: AuthorizationPolicyCondition | null;
   },
 ): Promise<boolean> {
@@ -132,6 +145,14 @@ export async function policyConditionAllows(
   }
   if (!isCondition(condition)) return false;
   if (condition.kind === "none") return true;
+  if (condition.kind === "learning_progress")
+    return (
+      input.caller !== undefined &&
+      input.resourceKind === "learning-progress" &&
+      input.resourceId === learningProgressResourceId(input.caller) &&
+      input.action === "progress:read" &&
+      (await progressPolicyAllows(tx, input.caller, condition))
+    );
   if (input.resourceKind !== "qq_group" || input.resourceId !== `group:${condition.groupId}`)
     return false;
   const matchesAction =

@@ -33,6 +33,7 @@ import {
   applySchemaV27Migration,
   applySchemaV28Migration,
   applySchemaV29Migration,
+  schemaV30Migration,
 } from "./schema.js";
 
 export function localDatabaseUrl(databasePath: string): string {
@@ -128,6 +129,7 @@ export class DomainDatabase {
           if (version < 27) await applySchemaV27Migration(tx);
           if (version < 28) await applySchemaV28Migration(tx);
           if (version < 29) await applySchemaV29Migration(tx);
+          if (version < 30) await tx.batch(schemaV30Migration);
           await tx.execute(`PRAGMA user_version = ${CURRENT_SCHEMA_VERSION}`);
         }
       });

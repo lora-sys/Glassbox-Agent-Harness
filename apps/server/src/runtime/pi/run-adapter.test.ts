@@ -126,6 +126,93 @@ it("includes accepted Step excerpts in Model context and its budget without trea
   expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBeUndefined();
 });
 
+describe("personal Context projection", () => {
+  it("includes authorized progress in the provider prompt and records inclusion", async () => {
+    const f = fixture([
+      { status: "completed", text: "I'll tailor the explanation.", toolCalls: [] },
+    ]);
+    f.input.text = "Explain Rust async.";
+    const recordProjection = vi.fn(async (_included: boolean) => {});
+    f.executor = new PiRunExecutionAdapter(f.runtime, {
+      personalContext: {
+        command: async () => undefined,
+        load: async () => ({
+          items: [{ kind: "learning_progress", text: JSON.stringify({ statement: "Rust async" }) }],
+          reauthorize: async () => {},
+          recordProjection,
+        }),
+      },
+    });
+
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(f.run.mock.calls[0]?.[2]).toContain("Rust async");
+    expect(recordProjection).toHaveBeenCalledOnce();
+    expect(recordProjection).toHaveBeenCalledWith(true);
+  });
+
+  it("stops before a retry when personal Context reauthorization is denied", async () => {
+    const fabricated = { status: "completed" as const, text: "No search needed.", toolCalls: [] };
+    const f = fixture([fabricated, fabricated], [GROUP_HISTORY_SEARCH_TOOL]);
+    f.input.caller.scope.chatType = "group";
+    f.input.caller.scope.chatId = "1126022432";
+    f.input.conversation.scope.chatType = "group";
+    f.input.conversation.scope.chatId = "1126022432";
+    f.input.text = "请搜索本群历史，找到 P4B-A-1349，并回复发送者和原文";
+    const reauthorize = vi
+      .fn()
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error("source grant revoked"));
+    f.executor = new PiRunExecutionAdapter(f.runtime, {
+      personalContext: {
+        command: async () => undefined,
+        load: async () => ({
+          items: [{ kind: "learning_progress", text: "Rust async" }],
+          reauthorize,
+        }),
+      },
+    });
+
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "failed",
+      failureCode: "gate_refused",
+      text: "来源授权已变化，已停止继续请求模型。",
+    });
+    expect(reauthorize).toHaveBeenCalledTimes(2);
+    expect(f.run).toHaveBeenCalledOnce();
+  });
+
+  it("records omission when authorized personal Context does not fit the model budget", async () => {
+    const f = fixture([
+      { status: "completed", text: "Answered without the optional context.", toolCalls: [] },
+    ]);
+    f.input.text = "Explain the current question.";
+    f.runtime.getModelCapacity = () => ({
+      contextWindowTokens: 5_000,
+      outputReserveTokens: 512,
+      thinkingReserveTokens: 0,
+      safetyMarginTokens: 0,
+    });
+    f.runtime.getStaticContextEstimate = () => ({ systemTokens: 4_096, toolSchemaTokens: 0 });
+    const recordProjection = vi.fn(async (_included: boolean) => {});
+    const privateText = "学习偏好 ".repeat(8_000);
+    f.executor = new PiRunExecutionAdapter(f.runtime, {
+      personalContext: {
+        command: async () => undefined,
+        load: async () => ({
+          items: [{ kind: "learning_progress", text: privateText }],
+          reauthorize: async () => {},
+          recordProjection,
+        }),
+      },
+    });
+
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(recordProjection).toHaveBeenCalledOnce();
+    expect(recordProjection).toHaveBeenCalledWith(false);
+    expect(f.run.mock.calls[0]?.[2]).not.toContain("学习偏好");
+  });
+});
+
 describe("Pi required Tool execution", () => {
   it("injects only authorized group Memory as bounded reference data before the current message", async () => {
     const f = fixture([{ status: "completed", text: "本群每月聚会一次。", toolCalls: [] }]);

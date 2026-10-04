@@ -1,8 +1,14 @@
 import type { Transaction } from "@libsql/client";
 import { conversationScopeKey } from "../identity/scope.js";
 import { applyHistoryTimeMigration } from "./history-time-migration.js";
+import { knowledgeSchemaStatements } from "../knowledge/schema.js";
+import { learningProgressSchemaStatements } from "../learning-progress/schema.js";
 
-export const CURRENT_SCHEMA_VERSION = 29;
+export const CURRENT_SCHEMA_VERSION = 30;
+export const schemaV30Migration = [
+  ...knowledgeSchemaStatements,
+  ...learningProgressSchemaStatements,
+];
 
 function persistedText(value: unknown): string {
   if (typeof value !== "string") throw new Error("Invalid migration record");
@@ -413,6 +419,7 @@ export const schema = [
   ...schemaV22Migration,
   ...schemaV23Migration,
   ...schemaV25Migration,
+  ...schemaV30Migration,
 ];
 
 // Existing ALLOW rows predate trusted execution-source markers. Preserve the old
