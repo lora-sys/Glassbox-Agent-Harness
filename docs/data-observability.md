@@ -387,6 +387,15 @@ unobserved execution state remains unknown.
 
 QQ result delivery applies a content gate before it creates a Delivery. The gate checks the raw model candidate, renders QQ plain text, and checks the rendered text again. A blocked candidate creates no Delivery and is excluded from later model Context.
 
+Automatic delivery retries preserve the immutable Delivery and recheck its Run, destination
+and protected sources before every resend. Final `delivery_changed` evidence includes the
+attempt count when more than one send ran. `retryStoppedReason` distinguishes an authority
+change from service shutdown without replacing the original transport outcome. A local
+delivery timeout is not automatically retried because its underlying request may still be
+running. OneBot does not provide a delivery-ID deduplication guarantee; a transport-level
+unknown outcome can still result in duplicate QQ messages after a retry. An exhausted
+unknown outcome retains its AttentionItem rather than claiming platform-confirmed failure.
+
 An allowed authorization decision becomes a delivery source only after its protected read actually returns. The decision stores the source class. Before initial delivery and every retry, Glassbox rechecks the original read Action against current authority. A content source also requires a separate `delivery:send` decision for that Resource. Protected search gates are rechecked as Actions; concrete search results retain their own content-source decisions. The same source checks apply before an earlier answer enters a later Run's Context. Older decisions retain conservative legacy source classes after database migration.
 
 The append-only delivery_blocked event stores reason codes, candidate byte count and a SHA-256 digest. It does not store the blocked candidate in that event. The original protected Run result remains subject to its existing database and authorization boundary.
@@ -555,3 +564,18 @@ duplicate suppression. Equivalent UTC and offset inputs select the same records;
 bounds, reversed windows and invalid limits return fixed input-error codes. Time precision
 is the existing JavaScript Date millisecond precision, with no Julian-day floating-point
 arithmetic.
+
+## Background QQ history collection
+
+Configured group polling uses a real configured Owner principal with a current
+`history:read` grant. Each page checks the connection, Bot identity, enabled group
+membership and history setting before the provider request and again before archive
+writes. Revocation during a provider request prevents that page from being archived.
+Per-group serialization prevents concurrent walks from changing the same cursor.
+
+Reconnect starts a bounded backfill toward the previous high-water message. Later
+bounded polls continue its saved cursor until that boundary or the provider source tail.
+Continuation cursors live in process memory; restart does not preserve an unfinished
+walk. Archive collection does not replay historical messages as new Runs or replies.
+Private and group `not_ready` drop counters use the existing durable ingress diagnostics
+journal and survive reopen.

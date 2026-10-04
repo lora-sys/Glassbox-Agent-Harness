@@ -330,6 +330,14 @@ describe("service commands with unverified Linux ownership", () => {
 
   it("refuses an older rollback after a failed candidate upgrades the shared schema", async () => {
     const candidate = resolve("/srv/candidate");
+    state[0]!.checkoutBranch = "main";
+    state[0]!.checkoutCommit = "a".repeat(40);
+    io.execFileAsync.mockImplementation(async (_command: string, commandArgs: string[]) => {
+      if (commandArgs.includes("symbolic-ref")) return { stdout: "main\n" };
+      if (commandArgs.includes("rev-parse") && commandArgs.includes("HEAD"))
+        return { stdout: `${"a".repeat(40)}\n` };
+      return { stdout: "" };
+    });
     const previousSchema = join(baseEntry.cwd, "apps/server/src/persistence/schema.ts");
     const candidateSchema = join(candidate, "apps/server/src/persistence/schema.ts");
     io.stat.mockResolvedValue({ isFile: () => true, isDirectory: () => true });
@@ -454,12 +462,77 @@ describe("production checkout identity (#111)", () => {
     expect(stdout).toHaveBeenCalledWith(expect.stringContaining('"branch":"main"'));
   });
 
-  it("refuses to deploy a recorded checkout whose HEAD differs from the pinned commit", async () => {
-    state = [];
+  it("reports the active checkout when up is asked to use another checkout", async () => {
+    const candidate = resolve("/srv/candidate");
+    state[0]!.checkoutBranch = "active-branch";
+    state[0]!.checkoutCommit = sha;
+    gitAnswers("c".repeat(40));
+    await runServiceCommand("up", ["--checkout", candidate]);
+    const output = JSON.parse(String(stdout.mock.calls.at(-1)![0])) as {
+      checkout: string;
+      branch: string;
+      commit: string;
+    };
+    expect(output).toMatchObject({
+      checkout: baseEntry.cwd,
+      branch: "active-branch",
+      commit: sha,
+    });
+    expect(io.spawn).not.toHaveBeenCalled();
+  });
+
+  it("refuses rollback when the previous checkout no longer matches its launch identity", async () => {
+    const candidate = resolve("/srv/candidate");
+    state[0]!.checkoutBranch = "main";
+    state[0]!.checkoutCommit = sha;
+    io.execFileAsync.mockImplementation(async (_command: string, commandArgs: string[]) => {
+      if (commandArgs.includes("symbolic-ref")) return { stdout: "main\n" };
+      if (commandArgs.includes("rev-parse") && commandArgs.includes("HEAD"))
+        return { stdout: `${commandArgs[1] === baseEntry.cwd ? "c".repeat(40) : sha}\n` };
+      return { stdout: "" };
+    });
+    io.spawn.mockImplementation(() => {
+      throw new Error("candidate startup failed");
+    });
+    const error = await runServiceCommand("switch", ["--checkout", candidate]).catch(
+      (caught: unknown) => caught,
+    );
+    expect(error).toBeInstanceOf(AggregateError);
+    expect((error as AggregateError).errors.map((item: Error) => item.message)).toEqual([
+      "candidate startup failed",
+      `Cannot restore previous checkout: recorded ${sha} but found ${"c".repeat(40)}`,
+    ]);
+    expect(io.spawn).toHaveBeenCalledOnce();
+    expect(state).toEqual([]);
+  });
+
+  it("refuses a pinned production checkout before stopping the current service", async () => {
+    launchConfig({ checkout: production, expectedCommit: "b".repeat(40) });
+    gitAnswers(sha);
+    await expect(runServiceCommand("switch", [])).rejects.toThrow("expects " + "b".repeat(40));
+    expect(kill.mock.calls.filter(([, signal]) => signal !== 0)).toEqual([]);
+    expect(io.spawn).not.toHaveBeenCalled();
+  });
+
+  it("refuses a pinned production checkout on up before spawning any process", async () => {
     launchConfig({ checkout: production, expectedCommit: "b".repeat(40) });
     gitAnswers(sha);
     await expect(runServiceCommand("up", [])).rejects.toThrow("expects " + "b".repeat(40));
     expect(io.spawn).not.toHaveBeenCalled();
+  });
+
+  it("lets an explicit switch checkout override the production commit pin", async () => {
+    const candidate = resolve("/srv/candidate");
+    launchConfig({ checkout: production, expectedCommit: "b".repeat(40) });
+    gitAnswers(sha);
+    await runServiceCommand("switch", ["--checkout", candidate]);
+    expect(kill.mock.calls.filter(([, signal]) => signal !== 0)).toEqual([[pid, "SIGTERM"]]);
+    expect(io.spawn).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.arrayContaining([join(candidate, "apps/server/src/index.ts")]),
+      expect.objectContaining({ cwd: candidate }),
+    );
+    expect(stdout).toHaveBeenCalledWith(expect.stringContaining(`"commit":"${sha}"`));
   });
 
   it("rejects a relative checkout or malformed commit in the launch configuration", async () => {
@@ -470,11 +543,14 @@ describe("production checkout identity (#111)", () => {
     await expect(runServiceCommand("up", [])).rejects.toThrow("Invalid Glassbox launch");
   });
 
-  it("reports the running checkout's branch and commit from status", async () => {
-    gitAnswers(sha);
+  it("reports the launch-time checkout identity, even if the checkout HEAD moved", async () => {
+    state[0]!.checkoutBranch = "deployed-branch";
+    state[0]!.checkoutCommit = sha;
+    gitAnswers("c".repeat(40));
     await runServiceCommand("status", []);
     const output = stdout.mock.calls.map(([chunk]) => String(chunk)).join("");
     expect(output).toContain(`"commit": "${sha}"`);
-    expect(output).toContain('"branch": "main"');
+    expect(output).toContain('"branch": "deployed-branch"');
+    expect(output).not.toContain("c".repeat(40));
   });
 });

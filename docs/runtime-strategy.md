@@ -346,6 +346,38 @@ Tool execution, and required evidence checks ahead of the diagnostic fallback. E
 raw SDK error text remains an internal adapter field and is never interpolated into these
 records or replies. Prior Trace is not rewritten.
 
+## Shared gate reply settings
+
+Glassbox reads optional `runtime-replies.json` from its data directory when creating a Pi
+adapter. Version 1 maps runtime profile names to overrides for the keys in
+`runtime/pi/gate-messages.ts`. Unspecified keys keep their defaults. Invalid keys, empty
+values, control characters, values longer than 1,000 characters and files larger than
+64 KiB are rejected. These are trusted local settings. They do not change authorization,
+identity, Tool definitions or mutation requirements.
+
+For example:
+
+```json
+{
+  "version": 1,
+  "profiles": {
+    "qq-group": {
+      "mediaClarify": "请选择图片、视频或文字描述。当前请求未执行。"
+    }
+  }
+}
+```
+
+The server gate and the model's refusal wording use the same immutable profile snapshot.
+Restart Glassbox after editing the file so all adapters read the new settings. Existing Run
+results and Raw Trace are preserved. Media clarification follow-ups recognize the current
+configured sentence and the previous default sentence.
+
+The Owner-private `/capability <groupId> <category> on|off` command binds its exact target,
+category and direction even when the required Tool is absent. Only a successful matching
+`set_capability` call can support a claim that the change completed. Group messages and
+non-Owner messages cannot use this command to gain an Owner Tool surface.
+
 ## Glassbox runtime instances
 
 Glassbox owns the concrete Pi environments that it launches.

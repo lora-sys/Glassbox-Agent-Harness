@@ -1716,17 +1716,19 @@ describe("durable result delivery and recovery", () => {
     const { store } = await fixture();
     vi.useFakeTimers();
     const sendStarted = deferred<AbortSignal>();
+    let resultAttempts = 0;
     const { instance, events } = service(
       store,
       { supportsGroup: true, execute: async () => ({ status: "succeeded", text: "result" }) },
       {
         send: async ({ delivery, signal }) => {
           if (delivery.payloadKind === "ack") return { status: "sent" };
+          resultAttempts += 1;
           sendStarted.resolve(signal);
           return new Promise(() => {});
         },
       },
-      { deliveryTimeoutMs: 50, deliveryRetryDelaysMs: [] },
+      { deliveryTimeoutMs: 50, deliveryRetryDelaysMs: [1] },
     );
     await instance.start();
     const accepted = await instance.receive(input("timeout-send"));
@@ -1734,6 +1736,7 @@ describe("durable result delivery and recovery", () => {
     await vi.advanceTimersByTimeAsync(50);
     await instance.drain();
     expect(signal.aborted).toBe(true);
+    expect(resultAttempts).toBe(1);
     expect(events).toContainEqual(
       expect.objectContaining({
         type: "delivery_changed",
@@ -1811,6 +1814,84 @@ describe("durable result delivery and recovery", () => {
       }),
     );
     expect((await store.tasks.listAttentionItems())[0]!.summary).toContain("disconnected");
+  });
+
+  it("rechecks delivery authority before each automatic retry (#110)", async () => {
+    const { store, grants } = await fixture();
+    vi.useFakeTimers();
+    const firstAttempt = deferred<void>();
+    let resultAttempts = 0;
+    const { instance, events } = service(
+      store,
+      { supportsGroup: true, execute: async () => ({ status: "succeeded", text: "result" }) },
+      {
+        send: async ({ delivery }) => {
+          if (delivery.payloadKind === "ack") return { status: "sent" };
+          resultAttempts += 1;
+          firstAttempt.resolve();
+          return { status: "unknown", reason: "timeout" };
+        },
+      },
+      { deliveryRetryDelaysMs: [1_000] },
+    );
+    await instance.start();
+    const accepted = await instance.receive(input("retry-revoked-during-backoff"));
+    await firstAttempt.promise;
+    await store.authorization.revoke(grants.get(scopeKey(group) + "delivery:send")!);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    await instance.drain();
+
+    expect(resultAttempts).toBe(1);
+    expect(
+      (await store.lifecycle.listDeliveries(owner(), accepted.run.id)).items.find(
+        (item) => item.payloadKind === "result",
+      )?.status,
+    ).toBe("unknown");
+    expect((await store.tasks.listAttentionItems())[0]!.summary).toContain("timeout");
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "delivery_changed",
+        status: "unknown",
+        retryStoppedReason: "authorization_changed",
+      }),
+    );
+  });
+
+  it("does not start another send after service shutdown during retry backoff (#110)", async () => {
+    const { store } = await fixture();
+    vi.useFakeTimers();
+    const firstAttempt = deferred<void>();
+    let resultAttempts = 0;
+    const { instance, events } = service(
+      store,
+      { supportsGroup: true, execute: async () => ({ status: "succeeded", text: "result" }) },
+      {
+        send: async ({ delivery }) => {
+          if (delivery.payloadKind === "ack") return { status: "sent" };
+          resultAttempts += 1;
+          firstAttempt.resolve();
+          return { status: "unknown", reason: "disconnected" };
+        },
+      },
+      { deliveryRetryDelaysMs: [1_000] },
+    );
+    await instance.start();
+    await instance.receive(input("retry-stopped-during-backoff"));
+    await firstAttempt.promise;
+    await instance.stop();
+    await vi.advanceTimersByTimeAsync(1_000);
+    await instance.drain();
+
+    expect(resultAttempts).toBe(1);
+    expect((await store.tasks.listAttentionItems())[0]!.summary).toContain("disconnected");
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "delivery_changed",
+        status: "unknown",
+        retryStoppedReason: "service_stopped",
+      }),
+    );
   });
 
   it("never re-sends a platform-confirmed failure or an unclassifiable response (#110)", async () => {

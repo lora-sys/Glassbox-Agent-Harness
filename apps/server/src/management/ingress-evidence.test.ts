@@ -79,6 +79,27 @@ it("keeps ingress evidence across a restart, which is when it is needed most", a
   });
 });
 
+it("keeps private not-ready drops across a restart without assigning them to a group", async () => {
+  const dir = await dataDir();
+  const before = IngressEvidenceLog.open(dir);
+  before.recordChannelDroppedNotReady("qq", "2026-09-01T10:00:00.000Z");
+  before.recordChannelDroppedNotReady("qq", "2026-09-01T10:00:01.000Z");
+
+  const after = IngressEvidenceLog.open(dir);
+
+  expect(after.channelDroppedNotReadyFor("qq")).toBe(2);
+  expect(after.channelDroppedNotReadyFor("other-qq")).toBeUndefined();
+  expect(after.countsFor("qq", "group-1", "unused").droppedNotReady).toBe(0);
+  const entries = (await readFile(join(dir, "ingress-diagnostics.jsonl"), "utf-8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as Record<string, unknown>);
+  expect(entries).toEqual([
+    { ts: "2026-09-01T10:00:00.000Z", channelId: "qq", reason: "not_ready" },
+    { ts: "2026-09-01T10:00:01.000Z", channelId: "qq", reason: "not_ready" },
+  ]);
+});
+
 it("writes no message content into the evidence log", async () => {
   const dir = await dataDir();
   const log = IngressEvidenceLog.open(dir);

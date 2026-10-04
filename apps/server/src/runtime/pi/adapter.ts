@@ -15,6 +15,7 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { KitLoader, type ResolvedKitProfile } from "./kit-loader.js";
+import { GATE_MESSAGES, gateReplyClause, type GateMessages } from "./gate-messages.js";
 import { classifyPiRuntimeFailure, type PiFailureDiagnostic } from "./failure-diagnostics.js";
 import { QQ_CAPABILITY_CATEGORIES } from "../../channels/onebot/capabilities.js";
 import {
@@ -108,6 +109,7 @@ export function requiredEvidencePromptClause(evidence: readonly RequiredEvidence
 }
 
 export interface PiSdkRuntimeOptions {
+  gateMessagesForProfile?: (profile: PiRuntimeProfileName) => GateMessages;
   kitPath?: string;
   runtimeBaseDir?: string;
   cwd?: string;
@@ -488,14 +490,17 @@ function groupConversationClause(): string {
 
 export function glassboxSystemPrompt(
   modelPrompt: string,
-  options: { sharedConversation?: boolean } = {},
+  options: { sharedConversation?: boolean; gateMessages?: GateMessages } = {},
 ): string {
   const base = `${modelPrompt.trim()}\n\nReply in concise plain text suitable for QQ. Follow the response shape and fields the user explicitly requested. Unless the user asks for diagnostics, do not narrate Tool names, Tool parameters, result counts, coverage metadata, internal guidance, or reasoning. Preserve partial-coverage limits when making absence or completeness claims, but do not add unrequested diagnostic sections to a positive match. Do not reveal host paths, internal service addresses, configuration names, or internal identifiers.${basePromptText()}\n\nTool availability is scoped to the current caller, location, and authorization. A tool missing from the current Run does not mean the product capability is unimplemented. State that the capability is unavailable in the current context. Never invent an unimplemented status, future rollout, or replacement API.`;
   // A private Conversation is a one-to-one exchange with the Owner or a Visitor, so it keeps
   // the base prompt alone: the length rule and the no-fabricated-testing rule are answers to
   // what a group audience does to a long or overclaiming reply, not to what a person reading
   // their own chat does.
-  return options.sharedConversation === true ? `${base}${groupConversationClause()}` : base;
+  const wording = gateReplyClause(options.gateMessages ?? GATE_MESSAGES);
+  return options.sharedConversation === true
+    ? `${base}${groupConversationClause()}${wording}`
+    : `${base}${wording}`;
 }
 
 /**
@@ -1070,7 +1075,10 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
     // one session is reused across Runs and the next Run in it may be a private chat. The group
     // rules are part of the prompt rather than an addendum, so the base is rebuilt per Run.
     const basePrompt = (sharedConversation: boolean) =>
-      glassboxSystemPrompt(modelPrompt, { sharedConversation });
+      glassboxSystemPrompt(modelPrompt, {
+        sharedConversation,
+        gateMessages: this.options.gateMessagesForProfile?.(profile.name),
+      });
     let systemPromptTokens = estimateUnicodeTokens(basePrompt(false) + identityRules());
     let toolSchemaTokens = 0;
     const promptForRun = () => {

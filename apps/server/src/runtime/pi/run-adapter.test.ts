@@ -8,6 +8,7 @@ import { GROUP_HISTORY_SEARCH_TOOL, OWNER_HISTORY_SEARCH_TOOL } from "./history-
 import { OWNER_MEMORY_ADMIN_TOOL } from "./owner-memory-tools.js";
 import { OWNER_MODEL_ADMIN_TOOL } from "./owner-model-tools.js";
 import { OWNER_GROUP_ADMIN_TOOL } from "./owner-tools.js";
+import { parseRuntimeReplies } from "../../config/runtime-replies.js";
 import { piProfileName, PiRunExecutionAdapter, projectRunHistory } from "./run-adapter.js";
 import type { RunEvidenceRecord } from "./run-adapter.js";
 import type { PiRunResult, PiRuntimeAdapter } from "./types.js";
@@ -127,6 +128,130 @@ it("includes accepted Step excerpts in Model context and its budget without trea
 });
 
 describe("Pi required Tool execution", () => {
+  it("uses configured gate wording before the model and binds the clarification follow-up", async () => {
+    const gateMessagesForProfile = parseRuntimeReplies({
+      version: 1,
+      profiles: {
+        "main-agent": { mediaClarify: "请选择输出类型。" },
+      },
+    });
+    const f = fixture(
+      [
+        {
+          status: "completed",
+          text: "已生成。",
+          toolCalls: [
+            {
+              name: "media_generate",
+              input: { action: "image" },
+              failed: false,
+            },
+          ],
+        },
+      ],
+      ["media_generate"],
+    );
+    const executor = new PiRunExecutionAdapter(f.runtime, { gateMessagesForProfile });
+    f.input.text = "生成一个猫";
+    await expect(executor.execute(f.input)).resolves.toMatchObject({
+      text: "请选择输出类型。",
+      runtimeAttempted: false,
+    });
+    expect(f.run).not.toHaveBeenCalled();
+    f.input.history = [
+      { role: "user", text: "生成一个猫" },
+      { role: "assistant", text: "请选择输出类型。" },
+    ];
+    f.input.text = "图片";
+    await expect(executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({ action: "image" });
+  });
+
+  it.each(["on", "off"])(
+    "requires the exact successful capability command for %s",
+    async (direction) => {
+      const expected = {
+        action: "set_capability",
+        groupId: "1121579672",
+        category: "group.moderate",
+        enabled: direction === "on",
+      };
+      const f = fixture(
+        [
+          {
+            status: "completed",
+            text: "操作完成。",
+            toolCalls: [{ name: OWNER_GROUP_ADMIN_TOOL, input: expected, failed: false }],
+          },
+        ],
+        [OWNER_GROUP_ADMIN_TOOL],
+      );
+      f.input.text = `/capability 1121579672 group.moderate ${direction}`;
+      await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+      expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual(expected);
+    },
+  );
+
+  it.each([
+    { action: "set_capability", groupId: "1121579672", category: "group.moderate", enabled: false },
+    { action: "set_capability", groupId: "1126022432", category: "group.moderate", enabled: true },
+    { action: "set_capability", groupId: "1121579672", category: "group.history", enabled: true },
+  ])("rejects a capability call that changes a different field", async (input) => {
+    const response: PiRunResult = {
+      status: "completed",
+      text: "操作完成。",
+      toolCalls: [{ name: OWNER_GROUP_ADMIN_TOOL, input, failed: false }],
+    };
+    const f = fixture([response, response], [OWNER_GROUP_ADMIN_TOOL]);
+    f.input.text = "/capability 1121579672 group.moderate on";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "failed",
+      failureCode: "required_action_not_completed",
+    });
+  });
+
+  it("does not accept a failed capability command as a completed mutation", async () => {
+    const response: PiRunResult = {
+      status: "completed",
+      text: "操作完成。",
+      toolCalls: [
+        {
+          name: OWNER_GROUP_ADMIN_TOOL,
+          input: {
+            action: "set_capability",
+            groupId: "1121579672",
+            category: "group.moderate",
+            enabled: true,
+          },
+          failed: true,
+        },
+      ],
+    };
+    const f = fixture([response, response], [OWNER_GROUP_ADMIN_TOOL]);
+    f.input.text = "/capability 1121579672 group.moderate on";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "failed",
+      failureCode: "required_action_not_completed",
+    });
+  });
+
+  it.each(["group", "private"] as const)(
+    "does not bind an Owner command for a non-Owner in %s",
+    async (chatType) => {
+      const f = fixture(
+        [{ status: "completed", text: "该操作未授权。", toolCalls: [] }],
+        ["qq_groups"],
+      );
+      f.input.caller.principalId = "visitor";
+      f.input.caller.scope.chatType = chatType;
+      f.input.conversation.scope.chatType = chatType;
+      f.input.text = "/capability 1121579672 group.moderate on";
+      await f.executor.execute(f.input);
+      expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBeUndefined();
+      expect(f.run.mock.calls[0]?.[3]?.authorizedToolNames).not.toContain(OWNER_GROUP_ADMIN_TOOL);
+    },
+  );
+
   it("injects only authorized group Memory as bounded reference data before the current message", async () => {
     const f = fixture([{ status: "completed", text: "本群每月聚会一次。", toolCalls: [] }]);
     f.input.caller.scope.chatType = "group";
@@ -1962,6 +2087,21 @@ describe("mutation intent comes only from the current user message", () => {
     expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual(expected);
   });
 
+  it("does not claim an exact capability command succeeded when its Tool is absent", async () => {
+    const f = fixture([{ status: "completed", text: "操作完成。", toolCalls: [] }], ["qq_groups"]);
+    f.input.text = "/capability 1121579672 group.moderate on";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "failed",
+      failureCode: "claimed_change_not_performed",
+    });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({
+      action: "set_capability",
+      groupId: "1121579672",
+      category: "group.moderate",
+      enabled: true,
+    });
+  });
+
   it("still binds the mutation when the message adds an instruction the words contain", async () => {
     // A negation refuses a request only when it governs one. `别太久` is the Owner telling the
     // Agent not to overdo the duration, not a refusal to mute; reading the whole message for the
@@ -3532,6 +3672,25 @@ describe("a factual answer requires the observation it depends on", () => {
       });
     }
   });
+
+  it.each([
+    "发送者是在跟 Lora 对话。",
+    "发件人是在跟 Lora 对话。",
+    "您是 Lora 的朋友。",
+    "您是在跟群主对话。",
+    "发件人是在跟管理员对话。",
+    "您是在跟 3526039967 对话。",
+    "发送者是在跟 3526039967 对话。",
+  ])(
+    "delivers a mention of another party rather than attributing their identity: %s",
+    async (reply) => {
+      const f = nativeRoleFixture("qq_group_member", "早上好", reply);
+      await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+        status: "succeeded",
+        text: reply,
+      });
+    },
+  );
 
   it("still refuses a reply that attributes the protected identity itself to the sender (#117)", async () => {
     for (const reply of ["您是 Lora。", "您是 Lora 本人。", "发件人是 Lora 本人（3526039967）。"]) {

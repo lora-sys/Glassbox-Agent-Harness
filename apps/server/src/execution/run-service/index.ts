@@ -91,7 +91,6 @@ const DEFAULT_DELIVERY_RETRY_DELAYS_MS = [1_000, 3_000] as const;
 /** Unknown outcomes where the transport itself could not confirm the write. */
 const RETRYABLE_UNKNOWN_REASONS: ReadonlySet<string> = new Set([
   "timeout",
-  "delivery_timeout",
   "disconnected",
   "send_error",
 ]);
@@ -1123,15 +1122,20 @@ export class RunService {
     if (!lease) return;
     await this.emit({ type: "delivery_changed", runId, deliveryId, status: "sending" });
     // `unknown` from a transport that never confirmed the write is not a terminal fact yet.
-    // Retry a bounded number of times with backoff, reusing the same immutable delivery (same
-    // dedup key) so the channel can recognise a repeat, and settle once with the final outcome.
+    // Retry a bounded number of times with backoff, reusing the same immutable delivery and ID.
+    // The ID preserves trace correlation; it does not guarantee channel-side deduplication.
+    // Settle once with the final outcome.
     // A platform-confirmed `failed` is never retried here; that needs an explicit, authorized
-    // retry. The lease is claimed once, so authorization is not re-evaluated between attempts.
+    // retry. Claiming the already-sending delivery again is a read-only authorization check:
+    // LifecycleStore rechecks the Run, destination and all protected delivery sources before
+    // it returns null because the current lease already owns the row.
     let outcome: SendOutcome;
     let attempts = 0;
+    let retryStoppedReason: "authorization_changed" | "service_stopped" | undefined;
+    let sendLease = lease;
     for (;;) {
       attempts += 1;
-      outcome = await this.sendOnce(caller.scope, lease.delivery);
+      outcome = await this.sendOnce(caller.scope, sendLease.delivery);
       const retryDelay = this.deliveryRetryDelaysMs[attempts - 1];
       if (
         outcome.status !== "unknown" ||
@@ -1140,11 +1144,30 @@ export class RunService {
       )
         break;
       await new Promise((resolveDelay) => setTimeout(resolveDelay, retryDelay));
+      if (!this.started) {
+        retryStoppedReason = "service_stopped";
+        break;
+      }
+      try {
+        const retryLease = await this.options.store.lifecycle.claimDelivery(
+          caller,
+          runId,
+          deliveryId,
+        );
+        // The delivery is still `sending`, so the existing lease remains the owner. A lease
+        // returned here means another state transition released it; use the newly claimed
+        // lease so the next send is still protected by the same authorization transaction.
+        if (retryLease) sendLease = retryLease;
+      } catch (error) {
+        if (!(error instanceof AccessDeniedError)) throw error;
+        retryStoppedReason = "authorization_changed";
+        break;
+      }
     }
     const reason =
       outcome.status === "sent" ? undefined : deliveryReason(outcome.status, outcome.reason);
     try {
-      await lease.settle(
+      await sendLease.settle(
         outcome.status,
         outcome.status === "sent" ? outcome.externalId : undefined,
         reason,
@@ -1156,6 +1179,7 @@ export class RunService {
         status: outcome.status,
         ...(reason ? { reason } : {}),
         ...(attempts > 1 ? { attempts } : {}),
+        ...(retryStoppedReason ? { retryStoppedReason } : {}),
         ...(outcome.status === "sent" && outcome.externalId
           ? { externalId: outcome.externalId }
           : {}),

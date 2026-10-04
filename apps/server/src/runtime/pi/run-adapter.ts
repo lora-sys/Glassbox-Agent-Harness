@@ -33,7 +33,7 @@ import { requiredCallClause, satisfiesRequiredInput } from "./protected-tools.js
 import { OWNER_GROUP_ADMIN_TOOL } from "./owner-tools.js";
 import { OWNER_MEMORY_ADMIN_TOOL } from "./owner-memory-tools.js";
 import { MEDIA_GENERATION_TOOL } from "./media-tools.js";
-import { GATE_MESSAGES } from "./gate-messages.js";
+import { GATE_MESSAGES, type GateMessages } from "./gate-messages.js";
 import { OWNER_MODEL_ADMIN_TOOL } from "./owner-model-tools.js";
 import {
   asksLiveQqFact,
@@ -571,6 +571,7 @@ const SOURCE_CLASS_WORDS: readonly { sourceClass: QqSourceClass; words: RegExp }
  * a file, an order — never binds the Tool.
  */
 export interface PiRunExecutionAdapterOptions {
+  gateMessagesForProfile?: (profile: PiRuntimeProfileName) => GateMessages;
   isOwner?: (input: ExecutionInput) => Promise<boolean>;
   learningStore?: LearningStore;
   listModelProfiles?: () => readonly PublicModelProfile[];
@@ -743,6 +744,7 @@ function requiredToolCall(
   isOwner: boolean,
   authorizedToolNames?: readonly string[],
   modelProfiles: readonly PublicModelProfile[] = [],
+  gateMessages: GateMessages = GATE_MESSAGES,
 ): RequiredToolCall | undefined {
   if (input.caller.scope.chatType === "group") {
     if (groupHistorySearchRequested(input.text) || groupHistorySearchFollowUpRequested(input)) {
@@ -783,11 +785,9 @@ function requiredToolCall(
   const rawText = input.text;
   const durableCommand = ownerDurableTaskCommand(rawText);
   if (durableCommand) return durableCommand;
-  if (authorizedToolNames?.includes(OWNER_GROUP_ADMIN_TOOL)) {
-    const capabilityCommand = ownerCapabilityCommand(rawText);
-    if (capabilityCommand) return capabilityCommand;
-  }
-  const mediaIntent = mediaRequestIntentForInput(input);
+  const capabilityCommand = ownerCapabilityCommand(rawText);
+  if (capabilityCommand) return capabilityCommand;
+  const mediaIntent = mediaRequestIntentForInput(input, gateMessages);
   if (mediaIntent === "image") return { name: MEDIA_GENERATION_TOOL, input: { action: "image" } };
   if (mediaIntent === "video") return { name: MEDIA_GENERATION_TOOL, input: { action: "video" } };
   if (authorizedToolNames?.includes(OWNER_MODEL_ADMIN_TOOL)) {
@@ -1003,6 +1003,7 @@ function mediaRequestIntent(text: string): "image" | "video" | "ambiguous" | und
 
 function mediaRequestIntentForInput(
   input: Pick<ExecutionInput, "text" | "history">,
+  gateMessages: GateMessages = GATE_MESSAGES,
 ): "image" | "video" | "ambiguous" | undefined {
   const directIntent = mediaRequestIntent(input.text);
   if (directIntent) return directIntent;
@@ -1023,7 +1024,9 @@ function mediaRequestIntentForInput(
   const clarification = input.history.at(-1);
   const precedingRequest = input.history.at(-2);
   return clarification?.role === "assistant" &&
-    clarification.text.trim().startsWith(GATE_MESSAGES.mediaClarify) &&
+    [gateMessages.mediaClarify, GATE_MESSAGES.mediaClarify].some((text) =>
+      clarification.text.trim().startsWith(text),
+    ) &&
     precedingRequest?.role === "user" &&
     mediaRequestIntent(precedingRequest.text) === "ambiguous"
     ? selectedIntent
@@ -1267,7 +1270,6 @@ function misattributesSender(
       .replace(/^[\s"'“”‘’「」『』]+|[\s"'“”‘’「」『』]+$/gu, "");
     return namedSpan?.test(core) ?? false;
   };
-  const addressedNamePrefix = /(?:您|你|阁下)[^。！？!?；;，,\n不没非别勿]{0,6}?(?:是|为)\s*$/u;
   // A conditional does not assert its premise, so "就算您是 Lora，我也没有禁言能力" is the Run
   // refusing on both branches and asserting the identity on neither.
   const conditional = /(?:就算|即使|哪怕|如果|假如|即便|除非|万一)[^。！？!?；;\n]{0,30}(?:您|你)/u;
@@ -1280,27 +1282,27 @@ function misattributesSender(
       ? new RegExp(
           [
             `(?:作为|身为|来自|属于|正是|就是)[^。！？!?；;，,\\n不没非别勿]{0,8}(?:${escaped.join("|")})[^。！？!?；;，,\\n]{0,8}本人`,
-            `(?:发件人|发送者|对方|此消息|该消息|这条消息|消息来自)[^。！？!?；;，,\\n不没非别勿]{0,4}(?:是|为)[^。！？!?；;，,\\n]{0,8}(?:${escaped.join("|")})`,
           ].join("|"),
           "iu",
         )
       : undefined;
   const senderRolePrefix =
-    /(?:发件人|发送者|对方|此消息|该消息|这条消息|消息来自)[^。！？!?；;，,\n不没非别勿]{0,4}(?:是|为)[^。！？!?；;，,\n]{0,8}$/u;
-  const addressedRolePrefix =
-    /(?:您|你|阁下)[^。！？!?；;，,\n不没非别勿]{0,6}?(?:是|为)[^。！？!?；;，,\n]{0,16}$/u;
+    /(?:发件人|发送者|对方|此消息|该消息|这条消息|消息来自)[^。！？!?；;，,\n不没非别勿]{0,4}(?:是|为)\s*$/u;
+  const addressedRolePrefix = /(?:您|你|阁下)[^。！？!?；;，,\n不没非别勿]{0,6}?(?:是|为)\s*$/u;
   for (const sentence of reply.split(/(?<=[。！？!?；;\n])/u)) {
     if (/[？?]/u.test(sentence)) continue;
     if (conditional.test(sentence)) continue;
     const addressedClaims = sentence.matchAll(
-      /(?:您|你|阁下)[^。！？!?；;，,\n不没非别勿]{0,6}?(?:是|为)([^。！？!?；;，,\n]{0,16})/gu,
+      /(?:您|你|阁下|发件人|发送者|对方|此消息|该消息|这条消息)[^。！？!?；;，,\n不没非别勿]{0,6}?(?:是|为)([^。！？!?；;，,\n]*)/gu,
     );
     for (const addressed of addressedClaims) {
       const attributed = addressed[1] ?? "";
-      const number = /(\d{5,11})/u.exec(attributed);
+      const number =
+        /^\s*(?:qq\s*号?\s*)?([1-9]\d{4,10})(?!\d)(?:\s*(?:本人|本尊))?\s*(?:$|[（(])/iu.exec(
+          attributed,
+        );
       if (number && observed && number[1] !== observed) return true;
       if (spanIsNamedIdentity(attributed)) return true;
-      if (unobservedRoleMentions(attributed, scope).length > 0) return true;
     }
     if (attributesNamedSender?.test(sentence)) return true;
     const roleMentions = unobservedRoleMentions(sentence, scope);
@@ -1316,14 +1318,15 @@ function misattributesSender(
       })
     )
       return true;
-    // A name counts only when the copula points straight at it; the role prefix tolerates a
-    // 16-character gap, which let "您是在跟 Lora 对话" read as "您是 Lora".
+    // A name is attributed only if the complete predicate names that identity. A prefix alone
+    // would still misread "您是 Lora 的朋友" as the sender being Lora.
     if (
       nameMentions.some((match) => {
         const prefix = sentence.slice(0, match.index);
         return (
-          hasIdentityAssertionPrefix(prefix, senderRolePrefix) ||
-          hasIdentityAssertionPrefix(prefix, addressedNamePrefix)
+          (hasIdentityAssertionPrefix(prefix, senderRolePrefix) ||
+            hasIdentityAssertionPrefix(prefix, addressedRolePrefix)) &&
+          spanIsNamedIdentity(sentence.slice(match.index).replace(/[。！？!?；;，,\n].*$/u, ""))
         );
       })
     )
@@ -1567,8 +1570,9 @@ function blockedMutationRequest(
   input: ExecutionInput,
   isOwner: boolean,
   modelProfiles: readonly PublicModelProfile[] = [],
+  gateMessages: GateMessages = GATE_MESSAGES,
 ): BlockedMutation | undefined {
-  const mediaIntent = mediaRequestIntentForInput(input);
+  const mediaIntent = mediaRequestIntentForInput(input, gateMessages);
   if (mediaIntent === "ambiguous")
     return { operation: "media:generate", reason: "incomplete_parameters" };
   if (mediaIntent && (input.caller.scope.chatType !== "private" || !isOwner))
@@ -1868,15 +1872,21 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
   ) {}
 
   async execute(input: ExecutionInput): Promise<ExecutionResult> {
+    const isOwner = this.options.isOwner
+      ? await this.options.isOwner(input)
+      : input.caller.principalId === "owner";
+    const profile: PiRuntimeProfileName = this.options.resolveProfileName
+      ? await this.options.resolveProfileName(input)
+      : input.caller.scope.chatType === "group"
+        ? "qq-group"
+        : "main-agent";
+    const gateMessages = this.options.gateMessagesForProfile?.(profile) ?? GATE_MESSAGES;
     if (input.imageFailureCode)
       return {
         status: "succeeded",
         runtimeAttempted: false,
-        text: "图片读取失败，暂时无法识别，请重新发送图片。",
+        text: gateMessages.imageReadFailed,
       };
-    const isOwner = this.options.isOwner
-      ? await this.options.isOwner(input)
-      : input.caller.principalId === "owner";
     const botDisplayName = this.options.botDisplayName?.(input.caller.scope.connectionId);
     const modelProfiles = this.options.listModelProfiles?.() ?? [];
     const protectedIdentities = this.options.protectedIdentities
@@ -1896,10 +1906,10 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         status: "failed",
         failureCode: "gate_refused",
         runtimeAttempted: false,
-        text: GATE_MESSAGES.identityNotChangedBySelfClaim,
+        text: gateMessages.identityNotChangedBySelfClaim,
       };
     }
-    const blockedMutation = blockedMutationRequest(input, isOwner, modelProfiles);
+    const blockedMutation = blockedMutationRequest(input, isOwner, modelProfiles, gateMessages);
     if (blockedMutation) {
       await this.recordEvidence({
         type: "tool_evidence",
@@ -1917,26 +1927,21 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         text:
           blockedMutation.operation === "media:generate"
             ? blockedMutation.reason === "incomplete_parameters"
-              ? GATE_MESSAGES.mediaClarify
+              ? gateMessages.mediaClarify
               : blockedMutation.reason === "not_permitted_in_group"
-                ? GATE_MESSAGES.mediaGroupDisabled
-                : GATE_MESSAGES.mediaNotAuthorized
+                ? gateMessages.mediaGroupDisabled
+                : gateMessages.mediaNotAuthorized
             : blockedMutation.operation === "model:switch" &&
                 blockedMutation.reason === "unknown_target"
-              ? GATE_MESSAGES.modelUnknownTarget
+              ? gateMessages.modelUnknownTarget
               : blockedMutation.reason === "not_permitted_in_group"
-                ? GATE_MESSAGES.notPermittedInGroup
+                ? gateMessages.notPermittedInGroup
                 : blockedMutation.reason === "not_permitted"
-                  ? GATE_MESSAGES.notPermitted
-                  : GATE_MESSAGES.incompleteParameters,
+                  ? gateMessages.notPermitted
+                  : gateMessages.incompleteParameters,
       };
     }
     await this.runtime.initialize();
-    const profile: PiRuntimeProfileName = this.options.resolveProfileName
-      ? await this.options.resolveProfileName(input)
-      : input.caller.scope.chatType === "group"
-        ? "qq-group"
-        : "main-agent";
     // The requirements are written onto the context after the session exists, because the
     // context is what the runtime carries into the Run. They are decided from the message and
     // the caller's scope, so the order the session is created in cannot change them: the
@@ -1985,10 +1990,16 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         status: "failed",
         failureCode: "model_capability_missing",
         runtimeAttempted: false,
-        text: "当前配置的模型不支持识别图片，因此没有发送图片。请切换到支持视觉输入的模型后重试。",
+        text: gateMessages.imageModelUnsupported,
       };
     }
-    const required = requiredToolCall(input, isOwner, context.authorizedToolNames, modelProfiles);
+    const required = requiredToolCall(
+      input,
+      isOwner,
+      context.authorizedToolNames,
+      modelProfiles,
+      gateMessages,
+    );
     if (required?.name === "qq_group_moderation" && required.input.operation === "set_group_ban") {
       const params = required.input.params as Record<string, unknown> | undefined;
       const missingDuration = params?.duration === undefined;
@@ -2030,7 +2041,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
           status: "failed",
           failureCode: "gate_refused",
           providerSessionId: binding.runtimeSessionId,
-          text: "请在禁言指令中明确指定目标群号、成员及禁言时长。未执行禁言。",
+          text: gateMessages.moderationParametersMissing,
         };
       }
       if (
@@ -2052,7 +2063,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
           status: "failed",
           failureCode: "gate_refused",
           providerSessionId: binding.runtimeSessionId,
-          text: "群聊中的禁言请求只能针对当前群，请在目标群重新发起请求。未执行禁言。",
+          text: gateMessages.moderationWrongGroup,
         };
       }
       Object.freeze(required.input.params);
@@ -2101,7 +2112,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         status: "failed",
         failureCode: "gate_refused",
         runtimeAttempted: false,
-        text: "模型切换工具当前不可用，未执行。",
+        text: gateMessages.modelToolUnavailable,
         providerSessionId: binding.runtimeSessionId,
       };
     }
@@ -2249,7 +2260,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
           status: "failed",
           failureCode: "pre_provider_context_overflow",
           runtimeAttempted: false,
-          text: "当前请求超过已配置模型的上下文容量，未发送给模型。",
+          text: gateMessages.contextOverflow,
           providerSessionId: binding.runtimeSessionId,
         };
       context.authorizeProviderContext = async () => {
@@ -2275,7 +2286,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       const refusedContext = {
         status: "failed" as const,
         failureCode: "gate_refused" as const,
-        text: "来源授权已变化，已停止继续请求模型。",
+        text: gateMessages.sourceAuthorityChanged,
         providerSessionId: binding.runtimeSessionId,
       };
       if (!(await contextAllowed())) return { ...refusedContext, runtimeAttempted: false };
@@ -2503,7 +2514,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         return {
           status: "failed",
           failureCode: "required_action_not_completed",
-          text: moderationFailureReply() ?? "请求的操作未执行，请稍后重试。",
+          text: moderationFailureReply() ?? gateMessages.requiredActionMissing,
           providerSessionId: binding.runtimeSessionId,
         };
       if (missingEvidence)
@@ -2511,10 +2522,10 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
           status: "failed",
           failureCode: "required_evidence_missing",
           text: missingEvidenceDomains.some((domain) => domain.startsWith("browser_"))
-            ? "浏览器操作未完成，无法确认页面或提供截图。"
+            ? gateMessages.browserEvidenceMissing
             : missingEvidenceDomains.some((domain) => domain.startsWith("web_"))
-              ? "网页检索或读取未完成，因此无法确认。"
-              : "未能从 QQ 获取该信息，因此无法确认。",
+              ? gateMessages.webEvidenceMissing
+              : gateMessages.qqEvidenceMissing,
           providerSessionId: binding.runtimeSessionId,
         };
       // The claim about a change nobody performed. The requirement checks above read what the
@@ -2559,7 +2570,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         return {
           status: "failed",
           failureCode: "claimed_change_not_performed",
-          text: GATE_MESSAGES.claimedChangeNotPerformed,
+          text: gateMessages.claimedChangeNotPerformed,
           providerSessionId: binding.runtimeSessionId,
         };
       }
@@ -2606,7 +2617,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
           return {
             status: "failed",
             failureCode: "gate_refused",
-            text: "未能从 QQ 获取完整的请求字段，因此无法确认。",
+            text: gateMessages.qqFieldsMissing,
             providerSessionId: binding.runtimeSessionId,
           };
         result = { ...result, text: projected };
@@ -2633,7 +2644,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         return {
           status: "failed",
           failureCode: "gate_refused",
-          text: GATE_MESSAGES.identityNotChangedBySelfClaim,
+          text: gateMessages.identityNotChangedBySelfClaim,
           providerSessionId: binding.runtimeSessionId,
         };
       }
@@ -2654,7 +2665,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         return {
           status: "failed",
           failureCode: "gate_refused",
-          text: GATE_MESSAGES.ownerDecidesConduct,
+          text: gateMessages.ownerDecidesConduct,
           providerSessionId: binding.runtimeSessionId,
         };
       }

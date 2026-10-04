@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
@@ -35,10 +36,20 @@ interface SkillLock {
   skills: Record<string, { name: string; description: string; files: SkillLockEntry[] }>;
 }
 
+interface KitSourceIdentity {
+  isGitCheckout: boolean;
+  actualKitCommit: string | null;
+  workingTreeClean: boolean | null;
+  verificationError: boolean;
+}
+
 export class KitLoader {
   private kitPath: string;
+  private readonly expectedKitCommit: string;
+  private verifiedKitSource?: Pick<KitSourceIdentity, "isGitCheckout" | "actualKitCommit">;
 
-  constructor(customKitPath?: string) {
+  constructor(customKitPath?: string, expectedKitCommit = PINNED_KIT_COMMIT) {
+    this.expectedKitCommit = expectedKitCommit;
     if (customKitPath) {
       this.kitPath = path.resolve(customKitPath);
     } else if (process.env.LORA_PI_KIT_PATH) {
@@ -54,6 +65,84 @@ export class KitLoader {
 
   public getKitPath(): string {
     return this.kitPath;
+  }
+
+  private kitSourceIdentity(): KitSourceIdentity {
+    // Check only metadata rooted at the Kit path. A parent Glassbox repository must not
+    // identify an unpacked Kit directory as a Kit checkout.
+    if (!fs.existsSync(path.join(this.kitPath, ".git"))) {
+      return {
+        isGitCheckout: false,
+        actualKitCommit: null,
+        workingTreeClean: null,
+        verificationError: false,
+      };
+    }
+    try {
+      const options = {
+        cwd: this.kitPath,
+        encoding: "utf8" as const,
+        timeout: 5_000,
+        maxBuffer: 64 * 1024,
+        stdio: ["ignore", "pipe", "ignore"] as ["ignore", "pipe", "ignore"],
+      };
+      const actualKitCommit = execFileSync(
+        "git",
+        ["-C", this.kitPath, "rev-parse", "--verify", "HEAD"],
+        options,
+      ).trim();
+      if (!/^[a-f0-9]{40}$/u.test(actualKitCommit)) throw new Error("invalid Git identity");
+      const status = execFileSync(
+        "git",
+        ["-C", this.kitPath, "status", "--porcelain=v1", "--untracked-files=all"],
+        options,
+      );
+      return {
+        isGitCheckout: true,
+        actualKitCommit,
+        workingTreeClean: status.length === 0,
+        verificationError: false,
+      };
+    } catch {
+      // Git diagnostics can contain local paths. Expose only a safe failure marker.
+      return {
+        isGitCheckout: true,
+        actualKitCommit: null,
+        workingTreeClean: null,
+        verificationError: true,
+      };
+    }
+  }
+
+  private kitCommitVerified(source: KitSourceIdentity): boolean {
+    return (
+      source.isGitCheckout &&
+      !source.verificationError &&
+      source.actualKitCommit === this.expectedKitCommit &&
+      source.workingTreeClean === true
+    );
+  }
+
+  private assertRuntimeKitSource(source: KitSourceIdentity): void {
+    if (source.isGitCheckout && !this.kitCommitVerified(source))
+      throw new Error("Lora PI Kit checkout does not match its configured commit or is not clean");
+    if (
+      this.verifiedKitSource &&
+      (source.isGitCheckout !== this.verifiedKitSource.isGitCheckout ||
+        source.actualKitCommit !== this.verifiedKitSource.actualKitCommit)
+    )
+      throw new Error("Lora PI Kit source changed after compatibility verification");
+  }
+
+  private kitSourceDetails(source: KitSourceIdentity): Record<string, unknown> {
+    return {
+      configuredKitCommit: this.expectedKitCommit,
+      actualKitCommit: source.actualKitCommit,
+      kitCommitVerified: this.kitCommitVerified(source),
+      kitWorkingTreeClean: source.workingTreeClean,
+      kitSourceType: source.isGitCheckout ? "git-checkout" : "distribution",
+      ...(source.verificationError ? { kitIdentityError: true } : {}),
+    };
   }
 
   private skillLock(): SkillLock {
@@ -185,13 +274,14 @@ export class KitLoader {
     compatible: boolean;
     details: Record<string, unknown>;
   } {
+    const source = this.kitSourceIdentity();
     const lockPath = path.join(this.kitPath, "locks", "compatibility.json");
     const piLockPath = path.join(this.kitPath, "locks", "pi.lock.json");
 
     if (!fs.existsSync(lockPath) || !fs.existsSync(piLockPath)) {
       return {
         compatible: false,
-        details: { error: "Kit lockfiles not found at " + this.kitPath },
+        details: { error: "Kit lockfiles not found", ...this.kitSourceDetails(source) },
       };
     }
 
@@ -205,14 +295,22 @@ export class KitLoader {
       Array.isArray(compat.testedPiVersions) &&
       compat.testedPiVersions.includes(runtimeVersion);
 
+    const sourceCompatible = !source.isGitCheckout || this.kitCommitVerified(source);
+    const compatible = piVersionMatches && sourceCompatible;
+    if (compatible)
+      this.verifiedKitSource = {
+        isGitCheckout: source.isGitCheckout,
+        actualKitCommit: source.actualKitCommit,
+      };
     return {
-      compatible: piVersionMatches,
+      compatible,
       details: {
         kitVersion: compat.kitVersion,
         pinnedPiVersion: compat.pinnedPiVersion,
         piLockVersion: piLock.version,
         runtimeVersion,
         testedPiVersions: compat.testedPiVersions,
+        ...this.kitSourceDetails(source),
       },
     };
   }
@@ -254,6 +352,8 @@ export class KitLoader {
     profileName: PiRuntimeProfileName,
     enabledSkills?: readonly string[],
   ): Record<string, unknown> {
+    const source = this.kitSourceIdentity();
+    this.assertRuntimeKitSource(source);
     const profile = this.loadProfile(profileName);
     const selectedSkills = [...new Set(enabledSkills ?? profile.enabledSkills)];
     const files = [
@@ -307,10 +407,17 @@ export class KitLoader {
         throw new Error("Kit resource escapes package");
       fingerprints[file] = createHash("sha256").update(fs.readFileSync(resolved)).digest("hex");
     }
+    const sourceAfterEvidence = this.kitSourceIdentity();
+    this.assertRuntimeKitSource(sourceAfterEvidence);
+    if (
+      source.isGitCheckout !== sourceAfterEvidence.isGitCheckout ||
+      source.actualKitCommit !== sourceAfterEvidence.actualKitCommit
+    )
+      throw new Error("Lora PI Kit source changed while runtime evidence was collected");
     return {
       profileName,
       piVersion: PINNED_PI_VERSION,
-      configuredKitCommit: PINNED_KIT_COMMIT,
+      ...this.kitSourceDetails(sourceAfterEvidence),
       skillsCommit,
       enabledSkills: selectedSkills,
       skillFingerprints,
@@ -319,6 +426,8 @@ export class KitLoader {
   }
 
   public buildRuntimeConfig(profileName: PiRuntimeProfileName, baseDir?: string): PiRuntimeConfig {
+    const source = this.kitSourceIdentity();
+    this.assertRuntimeKitSource(source);
     const profile = this.loadProfile(profileName);
     const agentDir = this.resolveAgentDir(profile, baseDir);
 
@@ -326,7 +435,7 @@ export class KitLoader {
       profileName,
       kitPath: this.kitPath,
       kitRepo: PINNED_KIT_REPO,
-      kitCommit: PINNED_KIT_COMMIT,
+      kitCommit: source.actualKitCommit ?? "unknown",
       agentDir,
       allowedTools: profile.activeTools,
       timeoutMs: 30000,

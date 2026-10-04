@@ -136,6 +136,8 @@ export type HistorySyncStop =
   | "end_of_source"
   /** The walk reached the `since` it was given; older history was deliberately not fetched. */
   | "since_bound_reached"
+  /** A bounded background backfill reached the newest message seen before the outage. */
+  | "cursor_boundary_reached"
   /** The walk hit its own page bound with more history still available. */
   | "page_bound_reached"
   /** The provider kept returning the same cursor, so paging could not advance. */
@@ -144,6 +146,8 @@ export type HistorySyncStop =
   | "provider_unavailable"
   /** The provider rejected the read. */
   | "provider_failed"
+  /** The current Principal no longer has the required history:read authority. */
+  | "authorization_denied"
   /** The provider's answer could not be interpreted, so the walk's reach is unknown. */
   | "provider_unknown";
 

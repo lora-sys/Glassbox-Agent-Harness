@@ -193,6 +193,7 @@ export type RunServiceEvent =
       reason?: DeliveryReason;
       /** Present only when the delivery was re-sent; counts every transport attempt. */
       attempts?: number;
+      retryStoppedReason?: "authorization_changed" | "service_stopped";
       /** Channel-native id of the sent message, when the transport confirmed one. */
       externalId?: string;
     }

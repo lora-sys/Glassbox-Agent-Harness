@@ -14,6 +14,7 @@ import {
 } from "@glassbox/contracts";
 import { ChannelProfileStore } from "../config/channel-profiles.js";
 import { GroupRuntimeStore } from "../config/group-runtime.js";
+import { loadRuntimeReplies } from "../config/runtime-replies.js";
 import type { ModelProfileStore } from "../config/model-profiles.js";
 import { ExecutorConfiguration } from "../config/executors.js";
 import { IngressEvidenceLog, type GroupIngressEvidenceCounts } from "./ingress-evidence.js";
@@ -162,6 +163,7 @@ import {
 } from "../channels/onebot/capability-probe.js";
 import { ChannelArchiveStore } from "../retrieval/channel-archive.js";
 import { groupResourceId, resolveAssignedGroupIds } from "../retrieval/source-resolver.js";
+import { qqCategoryCondition } from "../auth/policy-condition.js";
 import { GroupHistoryPoller, type HistorySyncTarget } from "./history-poller.js";
 import {
   AuthorizedOpsService,
@@ -260,6 +262,20 @@ const HISTORY_SYNC_MAX_PAGES = 5;
  */
 const HISTORY_POLL_MAX_PAGES = 5;
 const HISTORY_BACKFILL_MAX_PAGES = 20;
+interface HistoryBackfillProgress {
+  boundaryMessageId: string;
+  cursor?: string;
+}
+
+interface HistorySyncWalkResult {
+  outcome: HistorySyncOutcome;
+  latestMessageId?: string;
+  continuationCursor?: string;
+}
+
+function historyTargetKey(connectionId: string, groupId: string): string {
+  return JSON.stringify([connectionId, groupId]);
+}
 /** Seconds between background archive walks. Overridable for tests and slow providers. */
 const HISTORY_POLL_INTERVAL_MS = Number(process.env.GLASSBOX_HISTORY_POLL_INTERVAL_MS ?? 60_000);
 
@@ -407,15 +423,6 @@ export class ManagementApplication {
   private readonly ingressStartedAt = new Date().toISOString();
   private readonly ingressEvidence: IngressEvidenceLog;
   /**
-   * Per-channel count of messages dropped because the connection was not ready.
-   *
-   * Held apart from `states` on purpose: `updateChannelState` replaces that whole entry on
-   * every transition, so a counter living there would be wiped the moment the connection
-   * recovered — which is exactly when the operator still needs to see that it happened. Held
-   * apart from `ingressEvidence` because a private drop belongs to no group.
-   */
-  private readonly channelDroppedNotReady = new Map<string, number>();
-  /**
    * Channels that have reached `ready` at least once in this process.
    *
    * A first connect is not a reconnect: backfilling on it would re-walk history the group
@@ -424,6 +431,9 @@ export class ManagementApplication {
    */
   private readonly connectionEverReady = new Set<string>();
   private readonly historyPoller: GroupHistoryPoller;
+  private readonly historyHighWater = new Map<string, string>();
+  private readonly historyBackfills = new Map<string, HistoryBackfillProgress>();
+  private readonly historySyncFlights = new Map<string, Promise<HistorySyncOutcome>>();
   private operations: Promise<unknown> = Promise.resolve();
   private accepting = false;
   private releaseIngress!: () => void;
@@ -461,7 +471,7 @@ export class ManagementApplication {
       // Resolved per tick rather than captured at start, so a newly configured group or a
       // group whose history capability was switched off both take effect on the next tick.
       listTargets: () => this.historySyncTargets(),
-      run: (target, walk) => this.syncGroupHistory(target.connectionId, target.groupId, walk),
+      run: (target, walk) => this.syncPolledGroupHistory(target, walk),
     });
     const agnes = new AgnesMediaProvider({ apiKey: process.env.AGNES_API_KEY });
     this.mediaProvider =
@@ -1255,7 +1265,9 @@ export class ManagementApplication {
   private getOrCreateDefaultPiAdapter(profileId: string): PiRunExecutionAdapter {
     const existing = this.piAdapters.get(profileId);
     if (existing) return existing;
+    const gateMessagesForProfile = loadRuntimeReplies(this.options.dataDirectory);
     const runtime = new PiSdkRuntimeAdapter({
+      gateMessagesForProfile,
       kitPath: this.kitLoader.getKitPath(),
       runtimeBaseDir: join(this.options.dataDirectory, "pi"),
       resolveModel: () => configuredPiModel(this.options.models, profileId, this.piModelCatalog),
@@ -1521,6 +1533,7 @@ export class ManagementApplication {
       },
     });
     const adapter = new PiRunExecutionAdapter(runtime, {
+      gateMessagesForProfile,
       isOwner: (input) => this.store.identities.isOwner(input.caller.principalId),
       learningStore: this.store.learning,
       listModelProfiles: () => this.selectableModelProfiles(),
@@ -1782,7 +1795,7 @@ export class ManagementApplication {
         getContext,
         isHistoryEnabled: (connectionId, groupId) => this.isHistoryEnabled(connectionId, groupId),
         syncGroup: (groupId, context) =>
-          this.syncGroupHistory(context.caller.scope.connectionId, groupId),
+          this.syncGroupHistory(context.caller.scope.connectionId, groupId, {}, context.caller),
         botIdForConnection: (connectionId) => this.channels.resolve(connectionId).config.botId,
         // Safe retrieval evidence: Run, Resource, source kind and id, mode, score, rank and
         // matched terms — never a snippet or protected message text.
@@ -2750,7 +2763,7 @@ export class ManagementApplication {
 
   listChannels(): PublicChannelProfile[] {
     return this.channels.list().map((channel) => {
-      const droppedNotReady = this.channelDroppedNotReady.get(channel.id);
+      const droppedNotReady = this.ingressEvidence.channelDroppedNotReadyFor(channel.id);
       return {
         ...channel,
         ...this.states.get(channel.id),
@@ -2885,7 +2898,10 @@ export class ManagementApplication {
         if (state.status === "ready") {
           const reconnected = this.connectionEverReady.has(id);
           this.connectionEverReady.add(id);
-          if (reconnected) void this.backfillGroupHistory(id);
+          if (reconnected) {
+            this.markHistoryBackfillBoundaries(id, configured.config.groupIds);
+            void this.backfillGroupHistory(id);
+          }
         }
         if (!remember && state.status === "ready") {
           void provisionConfiguredAccess()
@@ -3872,11 +3888,10 @@ export class ManagementApplication {
   /**
    * Every connected channel's configured group whose history capability is on.
    *
-   * The background walk is not an authorization bypass: it applies the same
-   * `group.history` policy read the history Tool applies, so switching the capability off
-   * stops the poller on its next tick exactly as it stops the Tool. A channel that is not
-   * connected is left out because `syncGroupHistory` would only report
-   * `provider_unavailable` for it.
+   * Collection is limited to configured groups with the durable `group.history` policy on and
+   * a configured Owner who currently has `history:read` on that Resource. Request-driven
+   * history Tools pass their own checked caller to the synchronizer. A channel that is not
+   * connected is left out because `syncGroupHistory` would report `provider_unavailable`.
    */
   private async historySyncTargets(): Promise<HistorySyncTarget[]> {
     const targets: HistorySyncTarget[] = [];
@@ -3889,10 +3904,51 @@ export class ManagementApplication {
       }
       for (const groupId of configured.config.groupIds) {
         if (!(await this.isHistoryEnabled(connectionId, groupId))) continue;
-        targets.push({ connectionId, groupId });
+        const caller = await this.authorizedHistoryCollectionCaller(configured, groupId);
+        if (caller) targets.push({ connectionId, groupId, caller });
       }
     }
     return targets;
+  }
+
+  /** Resolve a real configured Owner identity with current authority for this Resource. */
+  private async authorizedHistoryCollectionCaller(
+    configured: ReturnType<ChannelProfileStore["resolve"]>,
+    groupId: string,
+  ): Promise<CallerContext | undefined> {
+    for (const candidate of this.ownerPrivateScopes(configured)) {
+      if (await this.historyReadAllowed(configured.config.connectionId, groupId, candidate))
+        return candidate;
+    }
+    return undefined;
+  }
+
+  /** Recheck membership, Owner intent and history:read authority before each provider read. */
+  private async historyReadAllowed(
+    connectionId: string,
+    groupId: string,
+    caller: CallerContext,
+  ): Promise<boolean> {
+    let configured: ReturnType<ChannelProfileStore["resolve"]>;
+    try {
+      configured = this.channels.resolve(connectionId);
+    } catch {
+      return false;
+    }
+    if (
+      caller.scope.connectionId !== connectionId ||
+      caller.scope.botId !== configured.config.botId ||
+      !configured.config.groupIds.includes(groupId) ||
+      !(await this.isHistoryEnabled(connectionId, groupId))
+    )
+      return false;
+    const decision = await this.store.authorization.check({
+      caller,
+      resourceId: groupResourceId(groupId),
+      action: HISTORY_READ_ACTION,
+      policyCondition: qqCategoryCondition(caller, groupId, "group.history"),
+    });
+    return decision.decision === "ALLOW";
   }
 
   /**
@@ -3913,13 +3969,82 @@ export class ManagementApplication {
       return;
     }
     for (const target of targets) {
+      const key = historyTargetKey(target.connectionId, target.groupId);
+      if (!this.historyBackfills.has(key)) continue;
       await this.historyPoller.backfill(target, HISTORY_BACKFILL_MAX_PAGES).catch(() => undefined);
     }
   }
 
+  /** Captures each group's last observed message before asynchronous target discovery yields. */
+  private markHistoryBackfillBoundaries(connectionId: string, groupIds: readonly string[]): void {
+    for (const groupId of groupIds) {
+      const key = historyTargetKey(connectionId, groupId);
+      const boundaryMessageId = this.historyHighWater.get(key);
+      // There is no outage window to close until this process has observed at least one
+      // message for the group. The regular poll will establish that boundary.
+      if (boundaryMessageId !== undefined && !this.historyBackfills.has(key))
+        this.historyBackfills.set(key, { boundaryMessageId });
+    }
+  }
+
+  /** Serializes the regular poll and reconnect backfill for one group. */
+  private async syncPolledGroupHistory(
+    target: HistorySyncTarget,
+    options: { maxPages: number; mode: "poll" | "backfill" },
+  ): Promise<HistorySyncOutcome> {
+    const key = historyTargetKey(target.connectionId, target.groupId);
+    const previous = this.historySyncFlights.get(key);
+    const next = (previous ?? Promise.resolve({ pagesWalked: 0, stop: "end_of_source" as const }))
+      .catch(() => ({ pagesWalked: 0, stop: "provider_failed" as const }))
+      .then(() => this.runPolledGroupHistory(target, options, key));
+    this.historySyncFlights.set(key, next);
+    try {
+      return await next;
+    } finally {
+      if (this.historySyncFlights.get(key) === next) this.historySyncFlights.delete(key);
+    }
+  }
+
+  private async runPolledGroupHistory(
+    target: HistorySyncTarget,
+    options: { maxPages: number; mode: "poll" | "backfill" },
+    key: string,
+  ): Promise<HistorySyncOutcome> {
+    let progress = this.historyBackfills.get(key);
+    if (options.mode === "backfill" && progress === undefined) {
+      const boundaryMessageId = this.historyHighWater.get(key);
+      if (boundaryMessageId === undefined) return { pagesWalked: 0, stop: "provider_unknown" };
+      progress = { boundaryMessageId };
+      this.historyBackfills.set(key, progress);
+    }
+
+    if (progress !== undefined) {
+      const walk = await this.walkGroupHistory(target.connectionId, target.groupId, {
+        maxPages: options.maxPages,
+        ...(target.caller === undefined ? {} : { caller: target.caller }),
+        ...(progress.cursor === undefined ? {} : { cursor: progress.cursor }),
+        stopAtMessageId: progress.boundaryMessageId,
+      });
+      if (walk.continuationCursor !== undefined) progress.cursor = walk.continuationCursor;
+      if (walk.outcome.stop === "cursor_boundary_reached" || walk.outcome.stop === "end_of_source")
+        this.historyBackfills.delete(key);
+      return walk.outcome;
+    }
+
+    const walk = await this.walkGroupHistory(target.connectionId, target.groupId, {
+      maxPages: options.maxPages,
+      ...(target.caller === undefined ? {} : { caller: target.caller }),
+    });
+    if (walk.latestMessageId !== undefined && !this.historyBackfills.has(key))
+      this.historyHighWater.set(key, walk.latestMessageId);
+    return walk.outcome;
+  }
+
   /**
    * Pulls real group history through the existing authenticated OneBot connection into
-   * the durable archive. Only called for a group whose `history:read` decision was ALLOW.
+   * the durable archive. Both background collection and request-driven calls recheck current
+   * configured membership, `group.history` policy and the acting Principal's `history:read`
+   * grant before each provider page.
    *
    * Older history is reachable: the walk follows the provider's `nextCursor` backwards for
    * up to `maxPages` pages, so a single recent page is never the only thing archived. It
@@ -3933,17 +4058,51 @@ export class ManagementApplication {
     connectionId: string,
     groupId: string,
     options: { maxPages?: number; since?: string; until?: string } = {},
+    caller?: CallerContext,
   ): Promise<HistorySyncOutcome> {
+    const walk = await this.walkGroupHistory(connectionId, groupId, { ...options, caller });
+    const key = historyTargetKey(connectionId, groupId);
+    if (walk.latestMessageId !== undefined && !this.historyBackfills.has(key))
+      this.historyHighWater.set(key, walk.latestMessageId);
+    return walk.outcome;
+  }
+
+  private async walkGroupHistory(
+    connectionId: string,
+    groupId: string,
+    options: {
+      maxPages?: number;
+      since?: string;
+      until?: string;
+      cursor?: string;
+      stopAtMessageId?: string;
+      caller?: CallerContext;
+    } = {},
+  ): Promise<HistorySyncWalkResult> {
+    if (
+      options.caller === undefined ||
+      !(await this.historyReadAllowed(connectionId, groupId, options.caller))
+    )
+      return { outcome: { pagesWalked: 0, stop: "authorization_denied" } };
     const connection = this.connections.get(connectionId);
-    if (!connection) return { pagesWalked: 0, stop: "provider_unavailable" };
+    if (!connection) return { outcome: { pagesWalked: 0, stop: "provider_unavailable" } };
     const maxPages = Math.max(1, Math.min(options.maxPages ?? HISTORY_SYNC_MAX_PAGES, 20));
     const seen = new Set<string>();
-    let cursor: string | undefined;
+    let cursor = options.cursor;
     let pagesWalked = 0;
     let skippedOwnMessages = 0;
-    const done = (stop: HistorySyncStop): HistorySyncOutcome =>
-      skippedOwnMessages === 0 ? { pagesWalked, stop } : { pagesWalked, stop, skippedOwnMessages };
+    let latestMessageId: string | undefined;
+    const done = (stop: HistorySyncStop, continuationCursor?: string): HistorySyncWalkResult => ({
+      outcome:
+        skippedOwnMessages === 0
+          ? { pagesWalked, stop }
+          : { pagesWalked, stop, skippedOwnMessages },
+      ...(latestMessageId === undefined ? {} : { latestMessageId }),
+      ...(continuationCursor === undefined ? {} : { continuationCursor }),
+    });
     for (let page = 0; page < maxPages; page += 1) {
+      if (!(await this.historyReadAllowed(connectionId, groupId, options.caller)))
+        return done("authorization_denied");
       const result = await connection.getGroupHistory({
         groupId,
         cursor,
@@ -3958,9 +4117,20 @@ export class ManagementApplication {
               : "provider_failed",
         );
       pagesWalked += 1;
+      // Authority can change while the provider request is in flight. Recheck before any
+      // returned message enters the archive.
+      if (!(await this.historyReadAllowed(connectionId, groupId, options.caller)))
+        return done("authorization_denied");
+      if (page === 0 && options.cursor === undefined)
+        latestMessageId = result.messages[0]?.messageId;
       let reachedBound = false;
+      let reachedCursorBoundary = false;
       let newMessages = 0;
       for (const message of result.messages) {
+        if (options.stopAtMessageId === message.messageId) {
+          reachedCursorBoundary = true;
+          break;
+        }
         if (options.since && message.occurredAt < options.since) {
           reachedBound = true;
           continue;
@@ -3988,6 +4158,7 @@ export class ManagementApplication {
           occurredAt: message.occurredAt,
         });
       }
+      if (reachedCursorBoundary) return done("cursor_boundary_reached");
       const next = result.nextCursor;
       if (next === undefined)
         return done(result.messages.length === 0 ? "end_of_source" : "provider_unknown");
@@ -3996,12 +4167,14 @@ export class ManagementApplication {
         // page containing only the already-seen cursor is its end-of-source signal. A
         // larger repeated page is still a stalled provider and must remain partial.
         return done(
-          newMessages === 0 && result.messages.length <= 1 ? "end_of_source" : "cursor_stuck",
+          result.messages.length === 1 && result.messages[0]?.messageId === cursor
+            ? "end_of_source"
+            : "cursor_stuck",
         );
       cursor = next;
       if (reachedBound) return done("since_bound_reached");
     }
-    return done("page_bound_reached");
+    return done("page_bound_reached", cursor);
   }
 
   private async manageGroup(
@@ -4735,8 +4908,7 @@ export class ManagementApplication {
     // counted in, and before this branch it was recorded nowhere at all.
     if (diagnostic.groupId === undefined) {
       if (diagnostic.stage !== "dropped") return;
-      const dropped = this.channelDroppedNotReady.get(channelId) ?? 0;
-      this.channelDroppedNotReady.set(channelId, Math.min(1_000_000, dropped + 1));
+      this.ingressEvidence.recordChannelDroppedNotReady(channelId, new Date().toISOString());
       return;
     }
     if (!this.channels.resolve(channelId).config.groupIds.includes(diagnostic.groupId)) return;

@@ -61,6 +61,8 @@ interface ProcessState extends ProcessConfig {
   pid: number;
   startedAt: string;
   linuxIdentity?: LinuxProcessIdentity;
+  checkoutBranch?: string | null;
+  checkoutCommit?: string | null;
 }
 
 type ProcessStatus = "running" | "stopped" | "unknown";
@@ -68,6 +70,8 @@ type ProcessStatus = "running" | "stopped" | "unknown";
 interface StartOptions {
   skipNapcat?: boolean;
   checkout?: string;
+  resolvedIdentity?: CheckoutIdentity;
+  enforceExpectedCommit?: boolean;
 }
 
 async function git(cwd: string, args: string[]): Promise<string | undefined> {
@@ -245,16 +249,31 @@ function stateEntry(value: unknown): ProcessState {
   if (
     Object.keys(item).some(
       (key) =>
-        !["name", "pid", "startedAt", "executable", "args", "cwd", "env", "linuxIdentity"].includes(
-          key,
-        ),
+        ![
+          "name",
+          "pid",
+          "startedAt",
+          "executable",
+          "args",
+          "cwd",
+          "env",
+          "linuxIdentity",
+          "checkoutBranch",
+          "checkoutCommit",
+        ].includes(key),
     ) ||
     !["herdr", "napcat", "glassbox"].includes(String(item.name)) ||
     !Number.isSafeInteger(item.pid) ||
     (item.pid as number) < 1 ||
     typeof item.startedAt !== "string" ||
     Number.isNaN(Date.parse(item.startedAt)) ||
-    (item.linuxIdentity !== undefined && !isLinuxProcessIdentity(item.linuxIdentity))
+    (item.linuxIdentity !== undefined && !isLinuxProcessIdentity(item.linuxIdentity)) ||
+    (item.checkoutBranch !== undefined &&
+      item.checkoutBranch !== null &&
+      typeof item.checkoutBranch !== "string") ||
+    (item.checkoutCommit !== undefined &&
+      item.checkoutCommit !== null &&
+      typeof item.checkoutCommit !== "string")
   )
     throw new Error("Invalid service state");
   const config = processConfig(
@@ -272,6 +291,8 @@ function stateEntry(value: unknown): ProcessState {
     pid: item.pid as number,
     startedAt: item.startedAt,
     ...(item.linuxIdentity === undefined ? {} : { linuxIdentity: item.linuxIdentity }),
+    ...(item.checkoutBranch === undefined ? {} : { checkoutBranch: item.checkoutBranch }),
+    ...(item.checkoutCommit === undefined ? {} : { checkoutCommit: item.checkoutCommit }),
     ...config,
   };
 }
@@ -442,7 +463,11 @@ async function runningState(state: ProcessState[]): Promise<ProcessState[]> {
   return running;
 }
 
-async function startProcess(name: ProcessName, config: ProcessConfig): Promise<ProcessState> {
+async function startProcess(
+  name: ProcessName,
+  config: ProcessConfig,
+  checkout?: CheckoutIdentity,
+): Promise<ProcessState> {
   if (!(await stat(config.executable)).isFile())
     throw new Error(`${name} executable is unavailable`);
   if (config.cwd && !(await stat(config.cwd)).isDirectory())
@@ -467,6 +492,9 @@ async function startProcess(name: ProcessName, config: ProcessConfig): Promise<P
       pid: child.pid,
       startedAt: new Date().toISOString(),
       ...(linuxIdentity === undefined ? {} : { linuxIdentity }),
+      ...(name === "glassbox"
+        ? { checkoutBranch: checkout?.branch ?? null, checkoutCommit: checkout?.commit ?? null }
+        : {}),
     };
   } finally {
     closeSync(descriptor);
@@ -588,6 +616,15 @@ async function stopEntry(entry: ProcessState): Promise<void> {
 async function up(options: StartOptions = {}): Promise<void> {
   const config = await loadConfig();
   const checkout = await checkoutRoot(options.checkout, config);
+  const identity = options.resolvedIdentity ?? (await checkoutIdentity(checkout));
+  if (
+    (options.enforceExpectedCommit ?? !options.checkout) &&
+    config.glassbox?.expectedCommit &&
+    identity.commit !== config.glassbox.expectedCommit
+  )
+    throw new Error(
+      `Checkout HEAD is ${identity.commit ?? "unreadable"}, but service-launch.json expects ${config.glassbox.expectedCommit}`,
+    );
   await assertDatabaseCompatible(checkout);
   await mkdir(dataDirectory, { recursive: true, mode: 0o700 });
   const prior = await loadState();
@@ -611,7 +648,7 @@ async function up(options: StartOptions = {}): Promise<void> {
     for (const [name, item] of desired) {
       if (!item || live.some((entry) => entry.name === name)) continue;
       if (name === "glassbox") await waitForDataLockRelease();
-      const entry = await startProcess(name, item);
+      const entry = await startProcess(name, item, name === "glassbox" ? identity : undefined);
       live.push(entry);
       started.push(entry);
       await writeState(live);
@@ -639,13 +676,31 @@ async function up(options: StartOptions = {}): Promise<void> {
     await writeState(live.filter((entry) => !started.includes(entry)));
     throw error;
   }
+  const activeGlassbox = live.find((entry) => entry.name === "glassbox");
+  const activeIdentity: CheckoutIdentity = activeGlassbox
+    ? {
+        checkout: activeGlassbox.cwd ?? null,
+        branch: activeGlassbox.checkoutBranch ?? null,
+        commit: activeGlassbox.checkoutCommit ?? null,
+      }
+    : identity;
   process.stdout.write(
-    `${JSON.stringify({ status: "started", processes: live.map(({ name, pid }) => ({ name, pid })), logPath, ...(await checkoutIdentity(checkout)) })}\n`,
+    `${JSON.stringify({ status: "started", processes: live.map(({ name, pid }) => ({ name, pid })), logPath, ...activeIdentity })}\n`,
   );
 }
 
 async function switchCheckout(options: StartOptions = {}): Promise<void> {
-  const checkout = await checkoutRoot(options.checkout, await loadConfig());
+  const config = await loadConfig();
+  const checkout = await checkoutRoot(options.checkout, config);
+  const identity = await checkoutIdentity(checkout);
+  if (
+    !options.checkout &&
+    config.glassbox?.expectedCommit &&
+    identity.commit !== config.glassbox.expectedCommit
+  )
+    throw new Error(
+      `Checkout HEAD is ${identity.commit ?? "unreadable"}, but service-launch.json expects ${config.glassbox.expectedCommit}`,
+    );
   await assertDatabaseCompatible(checkout);
   const prior = await loadState();
   const live = await runningState(prior);
@@ -657,7 +712,12 @@ async function switchCheckout(options: StartOptions = {}): Promise<void> {
       stoppedPrevious = true;
       await writeState(live.filter((entry) => entry !== previous));
     }
-    await up({ ...options, checkout });
+    await up({
+      ...options,
+      checkout,
+      resolvedIdentity: identity,
+      enforceExpectedCommit: !options.checkout,
+    });
   } catch (error) {
     if (!previous || !stoppedPrevious) throw error;
     try {
@@ -668,14 +728,28 @@ async function switchCheckout(options: StartOptions = {}): Promise<void> {
       await waitForDataLockRelease();
       // The candidate may have migrated shared data before failing. Never blindly restart
       // an older checkout or restore an old snapshot over newer durable state.
-      if (!previous.cwd) throw new Error("Cannot verify previous checkout for rollback");
-      await assertDatabaseCompatible(await checkoutRoot(previous.cwd));
-      const restored = await startProcess("glassbox", {
-        executable: previous.executable,
-        args: previous.args,
-        cwd: previous.cwd,
-        env: { ...previous.env, ...config.glassbox?.env },
-      });
+      if (!previous.cwd || !previous.checkoutCommit)
+        throw new Error("Cannot verify previous checkout identity for rollback");
+      const previousCheckout = await checkoutRoot(previous.cwd);
+      const restoredIdentity = await checkoutIdentity(previousCheckout);
+      if (
+        restoredIdentity.commit !== previous.checkoutCommit ||
+        (previous.checkoutBranch && restoredIdentity.branch !== previous.checkoutBranch)
+      )
+        throw new Error(
+          `Cannot restore previous checkout: recorded ${previous.checkoutCommit} but found ${restoredIdentity.commit ?? "unreadable"}`,
+        );
+      await assertDatabaseCompatible(previousCheckout);
+      const restored = await startProcess(
+        "glassbox",
+        {
+          executable: previous.executable,
+          args: previous.args,
+          cwd: previous.cwd,
+          env: { ...previous.env, ...config.glassbox?.env },
+        },
+        restoredIdentity,
+      );
       await writeState([...current, restored]);
       const port = Number(restored.env?.PORT ?? "3030");
       await waitFor(
@@ -689,9 +763,7 @@ async function switchCheckout(options: StartOptions = {}): Promise<void> {
     }
     throw error;
   }
-  process.stdout.write(
-    `${JSON.stringify({ status: "switched", ...(await checkoutIdentity(checkout)) })}\n`,
-  );
+  process.stdout.write(`${JSON.stringify({ status: "switched", ...identity })}\n`);
 }
 
 async function status(): Promise<void> {
@@ -706,9 +778,11 @@ async function status(): Promise<void> {
         running: status === "running",
         status,
         ...(entry.name === "glassbox"
-          ? entry.cwd
-            ? await checkoutIdentity(entry.cwd)
-            : { checkout: null, branch: null, commit: null }
+          ? {
+              checkout: entry.cwd ?? null,
+              branch: entry.checkoutBranch ?? null,
+              commit: entry.checkoutCommit ?? null,
+            }
           : {}),
       };
     }),
