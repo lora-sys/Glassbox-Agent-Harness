@@ -151,7 +151,9 @@ node tools/qq-live/cli.mjs plan --scenarios tools/qq-live/examples/scenarios.exa
 
 拒绝流程必须证明原候选已被拒绝，没有生成 Memory，项目没有活动 Memory 或待处理候选。它的检查点使用版本 3，恢复时保留固定流程身份。拒绝流程的已验证技能经验必须重新核验两条历史 Run、固定工具操作、Owner 与候选来源、拒绝审计及无残留状态。登记时只能选择最终 memory-reject Run。完整 Memory 隔离和授权负例仍待实现及实机验收。
 
-`history-current-group-complete` 和 `history-owner-group-a-complete` 在原历史读取范围上增加来源及结果窗口完整性检查。它们要求单个群 A、当前测试编号、limit 1、同步终态 end_of_source、没有来源限制或结果截断，并核对 Trace 中的来源数量和返回条目。任何未报告的同步、部分覆盖或不一致元数据都会停止验收。报告不保存历史正文。完整来源窗口不等于正命中、无命中或跨群隔离验收，这些回归项仍保留为待实现。
+`history-current-group-complete` 和 `history-owner-group-a-complete` 在原历史读取范围上增加来源及结果窗口完整性检查。它们要求单个群 A、当前测试编号、limit 1、同步终态 end_of_source、没有来源限制或结果截断，并核对 Trace 中的来源数量和返回条目。任何未报告的同步、部分覆盖或不一致元数据都会停止验收。报告不保存历史正文。完整来源窗口不能替代结果来源或跨群隔离验收。
+
+`history-current-group-hit` 核对本轮群内输入的实际归档记录、发送者、时间和有界正文摘要。`history-owner-group-a-no-match` 使用新私聊测试编号，独立确认群 A 的已完整同步归档窗口没有匹配正文。两者都把历史证据的工具输出摘要与实际受保护 Tool result 对应，缺失新证据字段不能通过。无命中结论只适用于该归档窗口，不表示 QQ 历史之外没有相关内容。读取套件现在最多声明 16 个固定范围用例，执行消息预算仍单独检查。更早的种子消息、跨群隔离和授权负例仍需补齐。
 
 该 Memory 用例只允许 Owner 私聊中的固定创建、推广和过期流程。用例不能增加自定义消息、工具、目标或清理脚本。成功报告必须包含三个不同 Run 的独立证据，以及重新读取的 Owner 项目清理状态。交付门禁会重新核对这些证据。此用例不覆盖 Memory 范围隔离、拒绝和授权负例，完整功能目录仍要求这些用例通过。
 

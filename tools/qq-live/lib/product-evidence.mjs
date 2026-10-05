@@ -366,7 +366,7 @@ export async function verifyProductEvidence(report, config, clients) {
       const messageBinding = await verifyMessageBindings(c, config, clients, evidence.delivery);
       const featureTypes =
         c.featureAssertions?.filter((a) => a.kind === "trace").map((a) => a.type) ?? [];
-      if (c.featureAssertions?.some((a) => a.kind === "history_coverage"))
+      if (c.featureAssertions?.some((a) => ["history_coverage", "history_result"].includes(a.kind)))
         featureTypes.push("history_retrieval");
       const trace = readTraceEvents(
         after.checkout,

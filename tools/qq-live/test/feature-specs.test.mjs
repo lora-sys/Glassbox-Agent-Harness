@@ -175,6 +175,43 @@ test("group member case is Owner-private, group A list-only, and independently o
   }
 });
 
+test("history result cases preserve exact four-assertion scope and allow the expanded bounded baseline", async () => {
+  const raw = JSON.parse(
+    await readFile(new URL("../examples/feature-read.example.json", import.meta.url), "utf8"),
+  );
+  const resolved = resolveReadFeatureSpecs(raw, config);
+  assert.equal(resolved.length, 11);
+  for (const [id, result, tool] of [
+    ["history-current-group-hit", "hit", "group_history_search"],
+    ["history-owner-group-a-no-match", "no_match", "owner_history_search"],
+  ]) {
+    const source = resolved.find((item) => item.id === id);
+    assert.deepEqual(source.featureAssertions[3], {
+      kind: "history_result",
+      tool,
+      query: "{{nonce}}",
+      groupId: "20001",
+      result,
+      count: 1,
+    });
+    for (const change of [
+      { groupId: "20002" },
+      { result: result === "hit" ? "no_match" : "hit" },
+      { count: 2 },
+      { tool: "task_get" },
+    ]) {
+      const bad = structuredClone(source);
+      Object.assign(bad.featureAssertions[3], change);
+      assert.throws(() => validateReadFeatureSpecs({ schemaVersion: 2, cases: [bad] }, config));
+    }
+  }
+  assert.throws(
+    () =>
+      validateReadFeatureSpecs({ schemaVersion: 2, cases: Array(17).fill(raw.cases[0]) }, config),
+    { code: "FEATURE_SUITE" },
+  );
+});
+
 test("resolver preserves nonce and rejects unknown group or arbitrary templates", async () => {
   const raw = JSON.parse(
     await readFile(new URL("../examples/feature-read.example.json", import.meta.url), "utf8"),

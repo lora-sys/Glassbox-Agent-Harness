@@ -558,6 +558,10 @@ arithmetic.
 
 ## QQ acceptance evidence
 
+New `history_retrieval` events record the result status and the expected successful Tool return's SHA-256 and UTF-8 byte count. Each returned item records its archive UUID, projected text digest and bytes, sender identity and occurrence time. No projected text or nickname is added to these fields. The protected Tool result retains only its existing output digest and byte count; acceptance compares both records before claiming result proof. Trace access remains protected, and these identifiers are not added to public projections. Old events are unchanged. New result assertions cannot use old events that lack this evidence.
+
+The scoped acceptance observer reads only the exact current-input archive row for positive proof, or a target-group nonce count for a no-match proof. It verifies the Owner Run and source scope independently and returns sanitized counts. A complete archive search window does not establish absence outside that source window.
+
 Real-environment acceptance uses the designated shared data directory. Its safe restriction
 lifecycle and pre-Run denials append to `qq-live-acceptance-audit.jsonl`. The event kind is
 `lease_registered`, `run_bound`, `lease_revoked` or `message_denied`. Entries contain a timestamp

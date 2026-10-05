@@ -48,6 +48,10 @@ const COMPLETE_HISTORY_CASES = new Set([
   "history-current-group-complete",
   "history-owner-group-a-complete",
 ]);
+const HISTORY_RESULT_CASES = new Map([
+  ["history-current-group-hit", { tool: "group_history_search", result: "hit" }],
+  ["history-owner-group-a-no-match", { tool: "owner_history_search", result: "no_match" }],
+]);
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(SCRIPT_DIR, "../../../..");
 
@@ -227,9 +231,13 @@ function requiresIndependentMemberCountVerification(caseRecord, accepted, events
 }
 
 function verifyCompleteHistoryCase(caseRecord, accepted, events, runId) {
-  if (!COMPLETE_HISTORY_CASES.has(caseRecord?.id)) return;
-  const currentGroup = caseRecord.id === "history-current-group-complete";
-  const toolName = currentGroup ? "group_history_search" : "owner_history_search";
+  const resultContract = HISTORY_RESULT_CASES.get(caseRecord?.id);
+  if (!COMPLETE_HISTORY_CASES.has(caseRecord?.id) && !resultContract) return;
+  const currentGroup =
+    caseRecord.id === "history-current-group-complete" ||
+    caseRecord.id === "history-current-group-hit";
+  const toolName =
+    resultContract?.tool ?? (currentGroup ? "group_history_search" : "owner_history_search");
   const calls = events.filter(
     (event) =>
       event?.runId === runId && event.type === "tool_call" && event.data?.name === toolName,
@@ -284,6 +292,15 @@ function verifyCompleteHistoryCase(caseRecord, accepted, events, runId) {
     },
     { kind: "history_coverage", query: token, groupId, count: 1 },
   ];
+  if (resultContract)
+    expectedAssertions.push({
+      kind: "history_result",
+      tool: resultContract.tool,
+      query: token,
+      groupId,
+      result: resultContract.result,
+      count: 1,
+    });
   if (
     !/^[a-f0-9]{32}$/.test(token ?? "") ||
     !caseRecord.prompt?.startsWith(`GLASSBOX_ACCEPTANCE_V1 ${token}\n`) ||
@@ -301,7 +318,7 @@ function verifyCompleteHistoryCase(caseRecord, accepted, events, runId) {
     results[0].data?.isError !== false ||
     !isDeepStrictEqual(input, expectedInput)
   )
-    invalid("Complete history lesson lacks its fixed group A lease and coverage assertion");
+    invalid("Fixed history lesson lacks its exact group A lease and result assertions");
 
   const historyEvents = events.filter(
     (event) => event?.runId === runId && event.type === "history_retrieval",
@@ -462,7 +479,8 @@ export function verifyFeatureReport(report, lesson, evidence, capture = execFile
   }
   const featureTypes = assertions.filter((item) => item.kind === "trace").map((item) => item.type);
   featureTypes.push("tool_call", "tool_result");
-  if (COMPLETE_HISTORY_CASES.has(caseRecord.id)) featureTypes.push("history_retrieval");
+  if (COMPLETE_HISTORY_CASES.has(caseRecord.id) || HISTORY_RESULT_CASES.has(caseRecord.id))
+    featureTypes.push("history_retrieval");
   let trace;
   try {
     trace = readTraceEvents(
@@ -494,7 +512,9 @@ export function verifyFeatureReport(report, lesson, evidence, capture = execFile
     invalid("Feature Run lease, scope, or Trace evidence did not verify");
   }
 
-  const needsDatabase = assertions.some((item) => item.kind === "state");
+  const needsDatabase = assertions.some(
+    (item) => item.kind === "state" || item.kind === "history_result",
+  );
   let db;
   try {
     if (needsDatabase)

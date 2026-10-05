@@ -1,4 +1,5 @@
 import { expect, it, vi } from "vite-plus/test";
+import { createHash } from "node:crypto";
 import { createQqDeliveryPolicy } from "../../delivery/content-policy.js";
 import { openDomainStore } from "../../persistence/index.js";
 import { ChannelArchiveStore } from "../../retrieval/channel-archive.js";
@@ -485,6 +486,92 @@ it("records safe retrieval evidence without protected message text", async () =>
     // Evidence carries identifiers, scores and terms — never the message text itself.
     expect(JSON.stringify(value)).not.toContain("plan alpha");
     expect(JSON.stringify(value)).not.toContain("plan beta");
+  } finally {
+    await store.close();
+  }
+});
+
+it("binds history evidence to the exact protected Tool output without retaining its payload", async () => {
+  const { store, archive } = await fixture();
+  try {
+    await archive.ingest({
+      channel: "qq",
+      connectionId,
+      groupId: "100",
+      externalMessageId: "history-evidence-record",
+      senderId: "member-private-id",
+      senderName: "Protected Nickname",
+      normalizedText: "history payload sentinel",
+      occurredAt: "2026-09-20T10:30:00.000Z",
+    });
+    await assign(store, "100");
+    await authorizeHistory(store, "100");
+    const accepted = await accept(store, ownerPrivate);
+    const evidence: HistoryRetrievalEvidence[] = [];
+    const tools = createHistoryTools({
+      store,
+      archive,
+      isHistoryEnabled: historyEnabled,
+      getContext: () => ({
+        caller: { principalId: "owner", scope: ownerPrivate },
+        runId: accepted.run.id,
+        conversationId: accepted.conversation.id,
+      }),
+      recordEvidence: async (value) => {
+        evidence.push(value);
+      },
+    });
+
+    const result = (await call(toolByName(tools, OWNER_HISTORY_SEARCH_TOOL), {
+      groupIds: ["100"],
+      query: "history payload",
+    })) as {
+      content: Array<{ type: string; text: string }>;
+      details: { items: Array<{ id: string; snippet: string; occurredAt?: string }> };
+    };
+    expect(evidence).toHaveLength(1);
+    const serialized = JSON.stringify(result);
+    expect(evidence[0]).toMatchObject({
+      resultStatus: "matches_found",
+      toolOutput: {
+        sha256: createHash("sha256").update(serialized, "utf8").digest("hex"),
+        bytes: Buffer.byteLength(serialized, "utf8"),
+      },
+    });
+    const sourceItem = result.details.items.find(
+      (item) => item.snippet === "history payload sentinel",
+    );
+    const traceItem = evidence[0]!.items.find((item) => item.recordId === sourceItem?.id);
+    expect(sourceItem).toBeDefined();
+    expect(traceItem).toMatchObject({
+      recordId: sourceItem!.id,
+      textSha256: createHash("sha256").update(sourceItem!.snippet, "utf8").digest("hex"),
+      textBytes: Buffer.byteLength(sourceItem!.snippet, "utf8"),
+      occurredAt: sourceItem!.occurredAt ?? null,
+      senderId: "member-private-id",
+    });
+    const serializedEvidence = JSON.stringify(evidence[0]);
+    expect(serializedEvidence).not.toContain("history payload sentinel");
+    expect(serializedEvidence).not.toContain("Protected Nickname");
+    expect(serializedEvidence).not.toContain("senderName");
+    expect(serializedEvidence).not.toContain("snippet");
+
+    evidence.length = 0;
+    const emptyResult = (await call(toolByName(tools, OWNER_HISTORY_SEARCH_TOOL), {
+      groupIds: ["100"],
+      query: "no-such-history-result-31fd",
+    })) as { content: Array<{ type: string; text: string }>; details: { items: unknown[] } };
+    const emptySerialized = JSON.stringify(emptyResult);
+    expect(emptyResult.details.items).toHaveLength(0);
+    expect(evidence).toHaveLength(1);
+    expect(evidence[0]).toMatchObject({
+      resultStatus: "no_matches_in_searched_window",
+      items: [],
+      toolOutput: {
+        sha256: createHash("sha256").update(emptySerialized, "utf8").digest("hex"),
+        bytes: Buffer.byteLength(emptySerialized, "utf8"),
+      },
+    });
   } finally {
     await store.close();
   }

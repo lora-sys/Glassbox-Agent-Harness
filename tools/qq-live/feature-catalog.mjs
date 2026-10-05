@@ -418,12 +418,137 @@ export const FEATURE_CATALOG = Object.freeze({
       mutation: "none",
     },
     {
+      id: "history-current-group-hit",
+      domain: "history_retrieval",
+      executionStatus: "executable",
+      tools: ["group_history_search"],
+      suiteCaseId: "history-current-group-hit",
+      leaseTools: [
+        {
+          name: "group_history_search",
+          operations: [
+            {
+              action: "history:read",
+              resourceId: "group:{{group:A}}",
+              inputConstraint: {
+                query: "{{nonce}}",
+                limit: 1,
+              },
+            },
+          ],
+        },
+      ],
+      assertions: [
+        {
+          kind: "trace",
+          type: "tool_result",
+          where: {
+            name: "group_history_search",
+            isError: false,
+          },
+          count: 1,
+        },
+        {
+          kind: "trace",
+          type: "history_retrieval",
+          where: {
+            query: "{{nonce}}",
+            groups: ["{{group:A}}"],
+            resources: ["group:{{group:A}}"],
+            sourceKind: "channel_message",
+            retrievalMode: "lexical",
+          },
+          count: 1,
+        },
+        {
+          kind: "history_coverage",
+          query: "{{nonce}}",
+          groupId: "{{group:A}}",
+          count: 1,
+        },
+        {
+          kind: "history_result",
+          tool: "group_history_search",
+          query: "{{nonce}}",
+          groupId: "{{group:A}}",
+          result: "hit",
+          count: 1,
+        },
+      ],
+      coveragePlan:
+        "Verify the current group input archive record and actual protected Tool result digest.",
+      mutation: "none",
+    },
+    {
+      id: "history-owner-group-a-no-match",
+      domain: "history_retrieval",
+      executionStatus: "executable",
+      tools: ["owner_history_search"],
+      suiteCaseId: "history-owner-group-a-no-match",
+      leaseTools: [
+        {
+          name: "owner_history_search",
+          operations: [
+            {
+              action: "history:search",
+              resourceId: "owner-history",
+              inputConstraint: {
+                query: "{{nonce}}",
+                groupIds: ["{{group:A}}"],
+                limit: 1,
+              },
+            },
+          ],
+        },
+      ],
+      assertions: [
+        {
+          kind: "trace",
+          type: "tool_result",
+          where: {
+            name: "owner_history_search",
+            isError: false,
+          },
+          count: 1,
+        },
+        {
+          kind: "trace",
+          type: "history_retrieval",
+          where: {
+            query: "{{nonce}}",
+            groups: ["{{group:A}}"],
+            resources: ["group:{{group:A}}"],
+            sourceKind: "channel_message",
+            retrievalMode: "lexical",
+          },
+          count: 1,
+        },
+        {
+          kind: "history_coverage",
+          query: "{{nonce}}",
+          groupId: "{{group:A}}",
+          count: 1,
+        },
+        {
+          kind: "history_result",
+          tool: "owner_history_search",
+          query: "{{nonce}}",
+          groupId: "{{group:A}}",
+          result: "no_match",
+          count: 1,
+        },
+      ],
+      coveragePlan:
+        "Verify the fresh private nonce has no matches in the complete target-group archive window and the actual protected Tool output reports no matches. This is not absence outside that archive window.",
+      mutation: "none",
+    },
+    {
       id: "history-positive-and-negative-result-proof",
       domain: "history_retrieval",
       executionStatus: "planned",
       tools: ["group_history_search", "owner_history_search"],
       coveragePlan:
-        "The current Trace observer cannot prove result items, no-match semantics, or safe handling of a seeded nonce message. Add separate positive-hit and negative-result evidence before claiming retrieval behavior coverage.",
+        "Current-input positive and fresh private no-match seeds now bind actual output digests and scoped archive evidence. Distinct older seeded messages, cross-group isolation and authorization negatives still need dedicated live scenarios before full retrieval coverage.",
       mutation: "none",
     },
     {

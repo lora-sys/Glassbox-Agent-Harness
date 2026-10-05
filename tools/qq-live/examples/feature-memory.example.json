@@ -368,6 +368,125 @@
           "count": 1
         }
       ]
+    },
+    {
+      "id": "history-current-group-hit",
+      "chat": "A",
+      "prompt": "调用 group_history_search，用 {{nonce}} 查询本群，limit=1。说明结果并回复 {{nonce}}。",
+      "expectContains": ["{{nonce}}"],
+      "sideEffect": "none",
+      "leaseTools": [
+        {
+          "name": "group_history_search",
+          "operations": [
+            {
+              "action": "history:read",
+              "resourceId": "group:{{group:A}}",
+              "inputConstraint": {
+                "query": "{{nonce}}",
+                "limit": 1
+              }
+            }
+          ]
+        }
+      ],
+      "featureAssertions": [
+        {
+          "kind": "trace",
+          "type": "tool_result",
+          "where": {
+            "name": "group_history_search",
+            "isError": false
+          },
+          "count": 1
+        },
+        {
+          "kind": "trace",
+          "type": "history_retrieval",
+          "where": {
+            "query": "{{nonce}}",
+            "groups": ["{{group:A}}"],
+            "resources": ["group:{{group:A}}"],
+            "sourceKind": "channel_message",
+            "retrievalMode": "lexical"
+          },
+          "count": 1
+        },
+        {
+          "kind": "history_coverage",
+          "query": "{{nonce}}",
+          "groupId": "{{group:A}}",
+          "count": 1
+        },
+        {
+          "kind": "history_result",
+          "tool": "group_history_search",
+          "query": "{{nonce}}",
+          "groupId": "{{group:A}}",
+          "result": "hit",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "history-owner-group-a-no-match",
+      "chat": "private",
+      "prompt": "调用 owner_history_search，仅查询群 {{group:A}}，query={{nonce}}、limit=1。说明有无匹配并回复 {{nonce}}。",
+      "expectContains": ["{{nonce}}"],
+      "sideEffect": "none",
+      "leaseTools": [
+        {
+          "name": "owner_history_search",
+          "operations": [
+            {
+              "action": "history:search",
+              "resourceId": "owner-history",
+              "inputConstraint": {
+                "query": "{{nonce}}",
+                "groupIds": ["{{group:A}}"],
+                "limit": 1
+              }
+            }
+          ]
+        }
+      ],
+      "featureAssertions": [
+        {
+          "kind": "trace",
+          "type": "tool_result",
+          "where": {
+            "name": "owner_history_search",
+            "isError": false
+          },
+          "count": 1
+        },
+        {
+          "kind": "trace",
+          "type": "history_retrieval",
+          "where": {
+            "query": "{{nonce}}",
+            "groups": ["{{group:A}}"],
+            "resources": ["group:{{group:A}}"],
+            "sourceKind": "channel_message",
+            "retrievalMode": "lexical"
+          },
+          "count": 1
+        },
+        {
+          "kind": "history_coverage",
+          "query": "{{nonce}}",
+          "groupId": "{{group:A}}",
+          "count": 1
+        },
+        {
+          "kind": "history_result",
+          "tool": "owner_history_search",
+          "query": "{{nonce}}",
+          "groupId": "{{group:A}}",
+          "result": "no_match",
+          "count": 1
+        }
+      ]
     }
   ]
 }

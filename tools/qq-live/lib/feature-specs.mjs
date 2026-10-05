@@ -149,11 +149,24 @@ function validateHistoryCase(c, tool, config) {
     ...assertions,
     { kind: "history_coverage", query: "{{nonce}}", groupId: id, count: 1 },
   ];
+  const withResult = (assertions, id) => [
+    ...withCoverage(assertions, id),
+    {
+      kind: "history_result",
+      tool: tool.name,
+      query: "{{nonce}}",
+      groupId: id,
+      result: tool.name === "group_history_search" ? "hit" : "no_match",
+      count: 1,
+    },
+  ];
   if (
     canonical(c.featureAssertions) !== canonical(rawAssertions) &&
     canonical(c.featureAssertions) !== canonical(resolvedAssertions) &&
     canonical(c.featureAssertions) !== canonical(withCoverage(rawAssertions, templateGroupId)) &&
-    canonical(c.featureAssertions) !== canonical(withCoverage(resolvedAssertions, groupId))
+    canonical(c.featureAssertions) !== canonical(withCoverage(resolvedAssertions, groupId)) &&
+    canonical(c.featureAssertions) !== canonical(withResult(rawAssertions, templateGroupId)) &&
+    canonical(c.featureAssertions) !== canonical(withResult(resolvedAssertions, groupId))
   )
     fail(
       "FEATURE_HISTORY_TRACE",
@@ -201,9 +214,9 @@ export function validateReadFeatureSpecs(raw, config) {
     raw?.schemaVersion !== 2 ||
     !Array.isArray(raw.cases) ||
     !raw.cases.length ||
-    raw.cases.length > 10
+    raw.cases.length > 16
   )
-    fail("FEATURE_SUITE", "功能套件需要 schemaVersion=2 和 1 至 10 个用例。");
+    fail("FEATURE_SUITE", "功能套件需要 schemaVersion=2 和 1 至 16 个用例。");
   const ids = new Set();
   for (const c of raw.cases) {
     if (

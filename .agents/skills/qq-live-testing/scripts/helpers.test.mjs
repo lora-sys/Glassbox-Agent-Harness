@@ -11,6 +11,7 @@ import { appendLesson, validateLesson } from "./record-lesson.mjs";
 import { memoryFixtureStep } from "../../../../tools/qq-live/lib/memory-scenario.mjs";
 import { toolManifestDigest } from "../../../../tools/qq-live/lib/core.mjs";
 import { MEMORY_REJECT_FAMILY_ID } from "../../../../tools/qq-live/lib/memory-workflow.mjs";
+import { historySnippet } from "../../../../tools/qq-live/lib/history-result.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const hypothesis = {
@@ -444,9 +445,156 @@ async function createPassingCompleteHistoryReport(t, caseId) {
   return {
     ...fixture,
     report,
+    events,
     input: {
       ...fixture.input,
       case: caseId,
+      verification: { ...fixture.input.verification, reportSha256: hash(bytes) },
+    },
+  };
+}
+
+async function createPassingHistoryResultReport(t, caseId) {
+  const hit = caseId === "history-current-group-hit";
+  const baseCaseId = hit ? "history-current-group-complete" : "history-owner-group-a-complete";
+  const fixture = await createPassingCompleteHistoryReport(t, baseCaseId);
+  const report = structuredClone(fixture.report);
+  const caseRecord = report.cases[0];
+  const accepted = report.productAcceptance.cases[0];
+  const runId = accepted.runId;
+  const token = caseRecord.token;
+  const groupId = "20001";
+  const toolName = hit ? "group_history_search" : "owner_history_search";
+  const result = hit ? "hit" : "no_match";
+  const history = fixture.events.find((event) => event.type === "history_retrieval");
+  const call = fixture.events.find((event) => event.type === "tool_call");
+  const toolResult = fixture.events.find((event) => event.type === "tool_result");
+  const output = "fixed protected history output";
+  const outputSha256 = hash(Buffer.from(output, "utf8"));
+  const outputBytes = Buffer.byteLength(output, "utf8");
+
+  caseRecord.id = caseId;
+  accepted.caseId = caseId;
+  caseRecord.featureAssertions.push({
+    kind: "history_result",
+    tool: toolName,
+    query: token,
+    groupId,
+    result,
+    count: 1,
+  });
+  accepted.feature.observations.find((item) => item.kind === "history_coverage").returned = hit
+    ? 1
+    : 0;
+  accepted.feature.observations.push({
+    kind: "history_result",
+    result,
+    returned: hit ? 1 : 0,
+    sourceVerified: true,
+    toolOutputVerified: true,
+  });
+  const input = hit ? { query: token, limit: 1 } : { query: token, groupIds: [groupId], limit: 1 };
+  call.data.name = toolName;
+  call.data.input = input;
+  toolResult.data.name = toolName;
+  toolResult.data.outputSha256 = outputSha256;
+  toolResult.data.outputBytes = outputBytes;
+  history.resultStatus = hit ? "matches_found" : "no_matches_in_searched_window";
+  history.toolOutput = { sha256: outputSha256, bytes: outputBytes };
+  history.principalId = "owner-fixture";
+  history.conversationId = "conversation-fixture";
+  history.coverage.returned = hit ? 1 : 0;
+  history.coverage.considered = hit ? 1 : 0;
+  history.coverage.sourceCoverage[0].returned = hit ? 1 : 0;
+  history.coverage.sourceCoverage[0].considered = hit ? 1 : 0;
+  history.considered = hit ? 1 : 0;
+  history.items = [];
+
+  const db = new DatabaseSync(join(report.runtime.dataDirectory, "glassbox.db"));
+  db.exec(`
+    CREATE TABLE principals (id TEXT, kind TEXT);
+    CREATE TABLE messages (id TEXT, external_id TEXT, scope_key TEXT);
+    CREATE TABLE runs (
+      id TEXT, principal_id TEXT, conversation_id TEXT, scope_json TEXT,
+      status TEXT, message_id TEXT
+    );
+    CREATE TABLE channel_messages (
+      id TEXT, channel TEXT, connection_id TEXT, group_id TEXT, resource_id TEXT,
+      source_class TEXT, external_message_id TEXT, sender_id TEXT, occurred_at TEXT,
+      occurred_at_ms INTEGER, normalized_text TEXT
+    );
+  `);
+  const scope = accepted.scope;
+  const scopeKey = JSON.stringify([
+    scope.connectionId,
+    scope.botId,
+    scope.chatType,
+    scope.chatId,
+    scope.senderId,
+    scope.threadId ?? null,
+  ]);
+  const externalId = String(caseRecord.inputBinding.botMessageId);
+  db.prepare("INSERT INTO principals VALUES ('owner-fixture','owner')").run();
+  db.prepare("INSERT INTO messages VALUES ('history-input',?,?)").run(externalId, scopeKey);
+  db.prepare("INSERT INTO runs VALUES (?,?,?,?,?,?)").run(
+    runId,
+    "owner-fixture",
+    "conversation-fixture",
+    JSON.stringify(scope),
+    "succeeded",
+    "history-input",
+  );
+  if (hit) {
+    const recordId = "11111111-1111-4111-8111-111111111111";
+    const occurredAt = "2026-10-05T00:00:00.000Z";
+    const text = `test ${token} ${"x".repeat(300)}`;
+    const snippet = historySnippet(text, token);
+    db.prepare("INSERT INTO channel_messages VALUES (?,?,?,?,?,?,?,?,?,?,?)").run(
+      recordId,
+      "qq-onebot",
+      scope.connectionId,
+      groupId,
+      `group:${groupId}`,
+      "history",
+      externalId,
+      scope.senderId,
+      occurredAt,
+      Date.parse(occurredAt),
+      text,
+    );
+    history.items = [
+      {
+        resourceId: `group:${groupId}`,
+        sourceId: groupId,
+        rank: 1,
+        score: 1,
+        matchedTerms: [token],
+        returnMode: "raw",
+        recordId,
+        textSha256: hash(Buffer.from(snippet, "utf8")),
+        textBytes: Buffer.byteLength(snippet, "utf8"),
+        occurredAt,
+        senderId: scope.senderId,
+      },
+    ];
+  }
+  db.close();
+
+  const tracePath = join(report.runtime.dataDirectory, "runs", runId, "trace.jsonl");
+  await writeFile(
+    tracePath,
+    fixture.events.map((event, seq) => JSON.stringify({ seq: seq + 1, event })).join("\n") + "\n",
+    "utf8",
+  );
+  const bytes = Buffer.from(JSON.stringify(report));
+  await writeFile(fixture.reportPath, bytes);
+  return {
+    ...fixture,
+    report,
+    input: {
+      ...fixture.input,
+      case: caseId,
+      evidence: { type: "run", runId },
       verification: { ...fixture.input.verification, reportSha256: hash(bytes) },
     },
   };
@@ -1110,7 +1258,7 @@ test("complete history lessons cannot drop coverage assertion or trace observati
     const lessonsPath = join(fixture.temp, `${caseId}-coverage-removed.jsonl`);
     await assert.rejects(
       appendLesson(input, lessonsPath),
-      /Feature Run lease, scope, or Trace evidence|fixed group A lease and coverage assertion/,
+      /Feature Run lease, scope, or Trace evidence|exact group A lease and result assertions/,
       caseId,
     );
     await assert.rejects(readFile(lessonsPath, "utf8"), { code: "ENOENT" });
@@ -1708,4 +1856,44 @@ test("lesson helper refuses missing evidence, secrets, personal messages, and ra
     () => validateLesson({ ...hypothesis, message: "private conversation" }),
     /Unexpected field/,
   );
+});
+
+test("history result lessons independently recheck archive rows and reject assertion removal", async (t) => {
+  for (const caseId of ["history-current-group-hit", "history-owner-group-a-no-match"]) {
+    const fixture = await createPassingHistoryResultReport(t, caseId);
+    const recorded = await appendLesson(fixture.input, join(fixture.temp, "valid-result.jsonl"));
+    assert.equal(recorded.status, "verified");
+    const report = structuredClone(fixture.report);
+    report.cases[0].featureAssertions = report.cases[0].featureAssertions.filter(
+      (item) => item.kind !== "history_result",
+    );
+    const input = await rewriteReport(fixture, report);
+    await assert.rejects(
+      appendLesson(input, join(fixture.temp, "removed-result.jsonl")),
+      /Feature Run lease, scope, or Trace evidence/,
+    );
+    await writeFile(fixture.reportPath, JSON.stringify(fixture.report));
+    const db = new DatabaseSync(join(fixture.report.runtime.dataDirectory, "glassbox.db"));
+    if (caseId === "history-current-group-hit")
+      db.exec("UPDATE channel_messages SET normalized_text = 'unrelated'");
+    else
+      db.prepare("INSERT INTO channel_messages VALUES (?,?,?,?,?,?,?,?,?,?,?)").run(
+        "22222222-2222-4222-8222-222222222222",
+        "qq-onebot",
+        fixture.report.productAcceptance.cases[0].scope.connectionId,
+        "20001",
+        "group:20001",
+        "history",
+        "different-input",
+        "10002",
+        "2026-10-05T00:00:00.000Z",
+        Date.parse("2026-10-05T00:00:00.000Z"),
+        fixture.report.cases[0].token,
+      );
+    db.close();
+    await assert.rejects(
+      appendLesson(fixture.input, join(fixture.temp, "forged-source.jsonl")),
+      /Feature trace or read-only state assertions did not verify/,
+    );
+  }
 });

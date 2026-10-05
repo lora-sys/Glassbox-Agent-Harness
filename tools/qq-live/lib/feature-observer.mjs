@@ -1,6 +1,7 @@
 import { fail } from "./core.mjs";
 import { createHash } from "node:crypto";
 import { observeHistoryCoverage, validateHistoryCoverageAssertion } from "./history-coverage.mjs";
+import { observeHistoryResult, validateHistoryResultAssertion } from "./history-result.mjs";
 
 const TYPES = new Set([
   "tool_call",
@@ -87,6 +88,8 @@ export function validateFeatureAssertions(assertions) {
         Object.keys(a).some((k) => !["kind", "type", "where", "count"].includes(k))
       )
         fail("FEATURE_ASSERTIONS", "Trace 断言必须指定已支持的事件、字段和值及精确数量。");
+    } else if (a.kind === "history_result") {
+      validateHistoryResultAssertion(a);
     } else if (a.kind === "history_coverage") {
       validateHistoryCoverageAssertion(a);
     } else if (a.kind === "aggregate_projection") {
@@ -149,6 +152,8 @@ export function observeFeature(assertions, { db, events, runId }) {
         type: assertion.type,
         count: matches.length,
       });
+    } else if (assertion.kind === "history_result") {
+      observations.push(observeHistoryResult(assertion, { db, events, runId }));
     } else if (assertion.kind === "history_coverage") {
       observations.push(observeHistoryCoverage(assertion, events, runId));
     } else if (assertion.kind === "aggregate_projection") {
