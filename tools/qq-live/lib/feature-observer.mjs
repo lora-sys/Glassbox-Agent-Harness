@@ -6,6 +6,8 @@ import {
   validateHistoryResultAssertion,
   observeHistorySeedResult,
   validateHistorySeedAssertion,
+  observeHistoryExclusionResult,
+  validateHistoryExclusionAssertion,
 } from "./history-result.mjs";
 
 const TYPES = new Set([
@@ -93,6 +95,8 @@ export function validateFeatureAssertions(assertions) {
         Object.keys(a).some((k) => !["kind", "type", "where", "count"].includes(k))
       )
         fail("FEATURE_ASSERTIONS", "Trace 断言必须指定已支持的事件、字段和值及精确数量。");
+    } else if (a.kind === "history_exclusion_result") {
+      validateHistoryExclusionAssertion(a);
     } else if (a.kind === "history_seed_result") {
       validateHistorySeedAssertion(a);
     } else if (a.kind === "history_result") {
@@ -159,6 +163,10 @@ export function observeFeature(assertions, { db, events, runId, inputBinding }) 
         type: assertion.type,
         count: matches.length,
       });
+    } else if (assertion.kind === "history_exclusion_result") {
+      observations.push(
+        observeHistoryExclusionResult(assertion, { db, events, runId, inputBinding }),
+      );
     } else if (assertion.kind === "history_seed_result") {
       observations.push(observeHistorySeedResult(assertion, { db, events, runId, inputBinding }));
     } else if (assertion.kind === "history_result") {

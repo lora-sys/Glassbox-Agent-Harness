@@ -320,3 +320,166 @@ export function observeHistorySeedResult(assertion, { db, events, runId, inputBi
     distinctEarlierInput: true,
   };
 }
+
+export function validateHistoryExclusionAssertion(assertion) {
+  const numericId = (value) => typeof value === "string" && /^[1-9]\d{0,15}$/.test(value);
+  if (
+    !assertion ||
+    typeof assertion !== "object" ||
+    Array.isArray(assertion) ||
+    Object.keys(assertion).sort().join(",") !==
+      "count,groupId,kind,query,result,sentinelSha256,sourceGroupId,sourceRunId,tool,until" ||
+    assertion.kind !== "history_exclusion_result" ||
+    assertion.tool !== "owner_history_search" ||
+    typeof assertion.query !== "string" ||
+    !/^[a-f0-9]{32}$/.test(assertion.query ?? "") ||
+    assertion.count !== 1 ||
+    typeof assertion.groupId !== "string" ||
+    !numericId(assertion.groupId) ||
+    typeof assertion.sourceGroupId !== "string" ||
+    !numericId(assertion.sourceGroupId) ||
+    assertion.groupId === assertion.sourceGroupId ||
+    typeof assertion.sourceRunId !== "string" ||
+    !/^[A-Za-z0-9_-]{1,128}$/.test(assertion.sourceRunId ?? "") ||
+    typeof assertion.until !== "string" ||
+    !Number.isFinite(Date.parse(assertion.until)) ||
+    new Date(assertion.until).toISOString() !== assertion.until ||
+    Date.parse(assertion.until) <= 0 ||
+    Date.parse(assertion.until) % 1000 !== 0 ||
+    typeof assertion.sentinelSha256 !== "string" ||
+    !/^[a-f0-9]{64}$/.test(assertion.sentinelSha256) ||
+    assertion.result !== "no_match"
+  )
+    invalid();
+}
+
+/** Prove a source-group hit did not appear in a complete target-group search. */
+export function observeHistoryExclusionResult(assertion, { db, events, runId, inputBinding }) {
+  validateHistoryExclusionAssertion(assertion);
+  const untilMs = Date.parse(assertion.until);
+  if (
+    !db ||
+    runId === assertion.sourceRunId ||
+    !Number.isSafeInteger(inputBinding?.time) ||
+    inputBinding.time <= 0 ||
+    inputBinding.time * 1000 <= untilMs
+  )
+    invalid();
+  const { history } = protectedHistoryResultTrace(
+    { ...assertion, result: "no_match" },
+    events,
+    runId,
+    {
+      query: assertion.query,
+      groupIds: [assertion.groupId],
+      limit: 1,
+      until: assertion.until,
+    },
+  );
+
+  const load = (id) =>
+    db
+      .prepare(
+        "SELECT r.principal_id,r.conversation_id,r.scope_json,r.status,m.external_id,m.scope_key,p.kind FROM runs r JOIN messages m ON m.id=r.message_id JOIN principals p ON p.id=r.principal_id WHERE r.id=?",
+      )
+      .all(id);
+  const sources = load(assertion.sourceRunId),
+    recalls = load(runId);
+  if (sources.length !== 1 || recalls.length !== 1) invalid();
+  const source = sources[0],
+    recall = recalls[0];
+  let sourceScope, recallScope;
+  try {
+    sourceScope = JSON.parse(source.scope_json);
+    recallScope = JSON.parse(recall.scope_json);
+  } catch {
+    invalid();
+  }
+  const scopeKey = (scope) =>
+    JSON.stringify([
+      scope.connectionId,
+      scope.botId,
+      scope.chatType,
+      scope.chatId,
+      scope.senderId,
+      scope.threadId ?? null,
+    ]);
+  const numericId = (value) => typeof value === "string" && /^[1-9]\d{0,15}$/.test(value);
+  if (
+    source.kind !== "owner" ||
+    recall.kind !== "owner" ||
+    source.status !== "succeeded" ||
+    recall.status !== "succeeded" ||
+    source.principal_id !== recall.principal_id ||
+    history.principalId !== recall.principal_id ||
+    history.conversationId !== recall.conversation_id ||
+    !sourceScope ||
+    !recallScope ||
+    sourceScope.chatType !== "group" ||
+    sourceScope.chatId !== assertion.sourceGroupId ||
+    recallScope.chatType !== "private" ||
+    recallScope.chatId !== recallScope.senderId ||
+    typeof sourceScope.connectionId !== "string" ||
+    !sourceScope.connectionId ||
+    sourceScope.connectionId !== recallScope.connectionId ||
+    sourceScope.botId !== recallScope.botId ||
+    sourceScope.senderId !== recallScope.senderId ||
+    !numericId(sourceScope.botId) ||
+    !numericId(sourceScope.senderId) ||
+    scopeKey(sourceScope) !== source.scope_key ||
+    scopeKey(recallScope) !== recall.scope_key
+  )
+    invalid();
+
+  const rows = db
+    .prepare(
+      "SELECT id,normalized_text FROM channel_messages WHERE channel='qq-onebot' AND connection_id=? AND group_id=? AND resource_id=? AND source_class='history' AND external_message_id=? AND sender_id=? AND occurred_at=? AND occurred_at_ms=? AND instr(lower(normalized_text),?)>0",
+    )
+    .all(
+      sourceScope.connectionId,
+      assertion.sourceGroupId,
+      `group:${assertion.sourceGroupId}`,
+      source.external_id,
+      sourceScope.senderId,
+      assertion.until,
+      Date.parse(assertion.until),
+      assertion.query,
+    );
+  if (
+    rows.length !== 1 ||
+    !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(rows[0].id ?? "") ||
+    typeof rows[0].normalized_text !== "string"
+  )
+    invalid();
+  const body = rows[0].normalized_text;
+  const sentinels = body.match(/qq-isolation-secret-[a-f0-9]{32}/g) ?? [];
+  if (
+    body.length > 4096 ||
+    sentinels.length !== 1 ||
+    sentinels[0].slice("qq-isolation-secret-".length) === assertion.query ||
+    hash(sentinels[0]) !== assertion.sentinelSha256
+  )
+    invalid();
+
+  const targetMatches = db
+    .prepare(
+      "SELECT COUNT(*) AS count FROM channel_messages WHERE channel='qq-onebot' AND connection_id=? AND group_id=? AND resource_id=? AND source_class='history' AND occurred_at_ms<=? AND instr(lower(normalized_text),?)>0",
+    )
+    .get(
+      recallScope.connectionId,
+      assertion.groupId,
+      `group:${assertion.groupId}`,
+      untilMs,
+      assertion.query,
+    );
+  if (targetMatches?.count !== 0) invalid();
+
+  return {
+    kind: "history_exclusion_result",
+    result: "no_match",
+    returned: 0,
+    sourceVerified: true,
+    exclusionVerified: true,
+    toolOutputVerified: true,
+  };
+}

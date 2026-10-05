@@ -11,6 +11,7 @@ import {
   id,
   messageId,
   toolManifestDigest,
+  digest,
 } from "../lib/core.mjs";
 test("Tool specification hashing matches the server canonical JSON contract", () => {
   const tools = [
@@ -251,4 +252,92 @@ test("old run marker cannot satisfy a new run", () => {
     message: "QQLIVE_OLD",
   });
   assert.equal(r.cases[0].replies.length, 0);
+});
+
+test("bound reply excludes fixture content using the actual fetched body", async () => {
+  const client = { call: async () => boundFixture() };
+  const expected = { ...boundExpected(), forbiddenContains: ["isolated-fixture-sentinel"] };
+  const result = await boundMessage(client, "123456", expected);
+  assert.deepEqual(Object.keys(result).sort(), ["messageId", "realSequence", "textSha256", "time"]);
+  const actual = boundFixture();
+  const leaked = {
+    ...actual,
+    message: [
+      { type: "text", data: { text: `${textOf(actual.message)} isolated-fixture-sentinel` } },
+    ],
+  };
+  await assert.rejects(
+    boundMessage({ call: async () => leaked }, "123456", {
+      ...expected,
+      text: undefined,
+      textSha256: undefined,
+    }),
+    { code: "MESSAGE_BINDING_MISMATCH" },
+  );
+});
+
+test("bound reply rejects malformed or unbounded exclusion constraints", async () => {
+  for (const forbiddenContains of [
+    null,
+    "sentinel",
+    [""],
+    [5],
+    ["x".repeat(257)],
+    Array(9).fill("x"),
+  ]) {
+    await assert.rejects(
+      boundMessage({ call: async () => boundFixture() }, "123456", {
+        ...boundExpected(),
+        forbiddenContains,
+      }),
+      { code: "MESSAGE_BINDING_MISMATCH" },
+    );
+  }
+});
+
+test("bound reply checks a fixed isolation fixture digest without retaining its content", async () => {
+  const sentinel = `qq-isolation-secret-${"b".repeat(32)}`;
+  const forbiddenFixtureSha256 = digest(sentinel);
+  const expected = { ...boundExpected(), forbiddenFixtureSha256 };
+  const actual = boundFixture();
+  await boundMessage({ call: async () => actual }, "123456", expected);
+  const leaked = {
+    ...actual,
+    message: [{ type: "text", data: { text: `${textOf(actual.message)} ${sentinel}` } }],
+  };
+  await assert.rejects(
+    boundMessage({ call: async () => leaked }, "123456", {
+      ...expected,
+      text: undefined,
+      textSha256: undefined,
+    }),
+    { code: "MESSAGE_BINDING_MISMATCH" },
+  );
+  await assert.rejects(
+    boundMessage({ call: async () => actual }, "123456", {
+      ...expected,
+      forbiddenFixtureSha256: [forbiddenFixtureSha256],
+    }),
+    { code: "MESSAGE_BINDING_MISMATCH" },
+  );
+});
+
+test("isolation fixture content in non-text QQ segments cannot evade reply checking", async () => {
+  const sentinel = `qq-isolation-secret-${"c".repeat(32)}`;
+  const actual = boundFixture();
+  const message = Array.isArray(actual.message)
+    ? actual.message
+    : [{ type: "text", data: { text: textOf(actual.message) } }];
+  const leaked = {
+    ...actual,
+    message: [...message, { type: "image", data: { url: `https://example.invalid/${sentinel}` } }],
+  };
+  assert.equal(textOf(leaked.message), textOf(actual.message));
+  await assert.rejects(
+    boundMessage({ call: async () => leaked }, "123456", {
+      ...boundExpected(),
+      forbiddenFixtureSha256: digest(sentinel),
+    }),
+    { code: "MESSAGE_BINDING_MISMATCH" },
+  );
 });

@@ -781,3 +781,37 @@ test("member count requires one successful call-result pair scoped to group A", 
       { code: "MEMBER_COUNT_TRACE", status: "INCONCLUSIVE" },
     );
 });
+
+test("isolation reply proof checks actual QQ content even when report hash and nonce match", async () => {
+  const sentinel = `qq-isolation-secret-${"b".repeat(32)}`;
+  const assertion = {
+    kind: "history_exclusion_result",
+    tool: "owner_history_search",
+    result: "no_match",
+    count: 1,
+    query: "a".repeat(32),
+    groupId: "20001",
+    sourceGroupId: "20002",
+    sourceRunId: "seed-run",
+    until: "2026-10-06T00:00:00.000Z",
+    sentinelSha256: messageDigest(sentinel),
+  };
+  const clean = boundMessageFixture();
+  clean.c.featureAssertions = [assertion];
+  await verifyMessageBindings(clean.c, clean.config, clean.clients, clean.delivery);
+  const leaked = boundMessageFixture({
+    driverReplyText: `reply with nonce-expected and 42 ${sentinel}`,
+  });
+  leaked.c.featureAssertions = [assertion];
+  leaked.c.replies[0].textSha256 = messageDigest(leaked.replyText);
+  await assert.rejects(
+    verifyMessageBindings(leaked.c, leaked.config, leaked.clients, leaked.delivery),
+    { code: "MESSAGE_BINDING_MISMATCH" },
+  );
+  const duplicate = boundMessageFixture();
+  duplicate.c.featureAssertions = [assertion, assertion];
+  await assert.rejects(
+    verifyMessageBindings(duplicate.c, duplicate.config, duplicate.clients, duplicate.delivery),
+    { code: "MESSAGE_BINDING" },
+  );
+});

@@ -25,7 +25,31 @@ export async function boundMessage(client, requestedMessageId, expected) {
       : Array.isArray(expected.contains)
         ? expected.contains
         : [expected.contains];
+  const forbidden = expected.forbiddenContains === undefined ? [] : expected.forbiddenContains;
   if (
+    !Array.isArray(forbidden) ||
+    forbidden.length > 8 ||
+    forbidden.some((part) => typeof part !== "string" || !part || part.length > 256)
+  )
+    mismatch();
+  const forbiddenFixtureSha256 = expected.forbiddenFixtureSha256;
+  if (
+    forbiddenFixtureSha256 !== undefined &&
+    (typeof forbiddenFixtureSha256 !== "string" || !/^[a-f0-9]{64}$/.test(forbiddenFixtureSha256))
+  )
+    mismatch();
+  const fixtureHashes = (
+    forbiddenFixtureSha256 === undefined
+      ? []
+      : [
+          ...`${text}\n${JSON.stringify(result?.message)}`.matchAll(
+            /qq-isolation-secret-[a-f0-9]{32}/g,
+          ),
+        ]
+  ).map(([value]) => createHash("sha256").update(value, "utf8").digest("hex"));
+  if (
+    (forbiddenFixtureSha256 !== undefined && fixtureHashes.includes(forbiddenFixtureSha256)) ||
+    forbidden.some((part) => text.includes(part)) ||
     actualId !== requested ||
     id(result?.self_id) !== id(expected.selfId) ||
     !senderIds.length ||

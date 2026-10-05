@@ -278,10 +278,19 @@ export async function verifyMessageBindings(c, config, clients, delivery) {
   const inputMatch = compareSameMessage(inputBot, inputDriver);
   sameMessageBinding(binding, inputMatch);
 
+  const isolationAssertions = (c.featureAssertions ?? []).filter(
+    (a) => a.kind === "history_exclusion_result",
+  );
+  if (isolationAssertions.length > 1)
+    fail("MESSAGE_BINDING", "跨群隔离回复缺少唯一的测试内容约束。", "INCONCLUSIVE");
+  if (isolationAssertions.length) validateFeatureAssertions(isolationAssertions);
   const expected = {
     messageType,
     groupId,
     contains: c.expected,
+    ...(isolationAssertions.length
+      ? { forbiddenFixtureSha256: isolationAssertions[0].sentinelSha256 }
+      : {}),
     textSha256: reply[0].textSha256,
     afterTime: c.startedAt,
   };
@@ -375,7 +384,12 @@ export async function verifyProductEvidence(report, config, clients) {
         c.featureAssertions?.filter((a) => a.kind === "trace").map((a) => a.type) ?? [];
       if (
         c.featureAssertions?.some((a) =>
-          ["history_coverage", "history_result", "history_seed_result"].includes(a.kind),
+          [
+            "history_coverage",
+            "history_result",
+            "history_seed_result",
+            "history_exclusion_result",
+          ].includes(a.kind),
         )
       )
         featureTypes.push("history_retrieval");
