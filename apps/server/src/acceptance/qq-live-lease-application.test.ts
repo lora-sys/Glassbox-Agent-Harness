@@ -102,6 +102,21 @@ describe("QQ live lease application wiring", () => {
     });
     const latest = (await fixture.app.store.management.listRuns("owner")).items[0];
     if (!latest) throw new Error("marked message did not create a Run");
+    const auditEvents = (
+      await readFile(join(fixture.directory, "qq-live-acceptance-audit.jsonl"), "utf8")
+    )
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    const runBound = auditEvents.find((event) => event.event === "run_bound");
+    expect(runBound).toMatchObject({
+      messageId: "704",
+      runId: latest.id,
+      marker,
+      textSha256: canonicalQqLiveTextSha256(text),
+    });
+    expect(JSON.stringify(runBound)).not.toContain("Reply with one word.");
+    expect(JSON.stringify(runBound)).not.toContain(text);
     if (latest && (latest.status === "queued" || latest.status === "running"))
       await fixture.app.runs.cancel(
         (await fixture.app.store.identities.resolve(acceptedScope))!,

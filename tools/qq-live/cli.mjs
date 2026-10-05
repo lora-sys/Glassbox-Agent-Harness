@@ -366,35 +366,63 @@ async function main() {
       const { discoverFeedbackCandidate, discoverPromotedMemory, verifyMemoryCleanup } =
         await import("./lib/memory-fixture.mjs");
       const { DatabaseSync } = await import("node:sqlite");
+      const { writeMemoryCheckpoint } = await import("./lib/memory-checkpoint.mjs");
+      const { captureMemoryProcess } = await import("./lib/memory-process.mjs");
+      const memoryOrigin = {
+        runtime: report.runtime,
+        process: await captureMemoryProcess(),
+        scope: {
+          connectionId: config.runtime.connectionId,
+          botId: config.bot.qq,
+          chatType: "private",
+          chatId: config.driver.qq,
+          senderId: config.driver.qq,
+          threadId: config.runtime.threadId ?? null,
+        },
+        driverSha256: digest(config.driver.qq),
+        suiteSha256: report.suiteSha256,
+        startedAt: report.startedAt,
+      };
       let memoryCheckpointState;
+      let memoryCheckpointSequence = 0;
+      let memoryCheckpointSha256 = null;
       const checkpointMemory = async (state) => {
         const row = {
-          schemaVersion: 1,
+          schemaVersion: 2,
+          origin: memoryOrigin,
+          sequence: memoryCheckpointSequence + 1,
+          previousSha256: memoryCheckpointSha256,
           ...state,
           at: new Date().toISOString(),
           runId,
           reportDirectory: runDir,
         };
-        const pending = await open(pendingFixturePath, pendingFixtureCreated ? "w" : "wx", 0o600);
-        try {
-          pendingFixtureCreated = true;
-          await pending.writeFile(JSON.stringify(row) + "\n");
-          await pending.sync();
-        } finally {
-          await pending.close();
-        }
-        await syncDirectory(lockRoot);
-        await syncDirectory(dirname(lockRoot));
-        const journal = await open(join(runDir, "memory-fixture.jsonl"), "a", 0o600);
-        try {
-          await journal.writeFile(JSON.stringify(row) + "\n");
-          await journal.sync();
-        } finally {
-          await journal.close();
-        }
-        await syncDirectory(runDir);
-        await syncDirectory(out);
+        row.checkpointSha256 = digest(JSON.stringify(row));
+        await writeMemoryCheckpoint({
+          pendingPath: pendingFixturePath,
+          journalPath: join(runDir, "memory-fixture.jsonl"),
+          row,
+          first: !pendingFixtureCreated,
+        });
+        pendingFixtureCreated = true;
+        memoryCheckpointSequence = row.sequence;
+        memoryCheckpointSha256 = row.checkpointSha256;
         memoryCheckpointState = state;
+      };
+      acceptance.beforeRegister = async (c) => {
+        if (!memoryCheckpointState)
+          fail("CHECKPOINT_UNCONFIRMED", "记忆流程没有注册前的状态记录。");
+        await checkpointMemory({
+          ...memoryCheckpointState,
+          phase: "lease_intent",
+          preparedCase: {
+            caseId: c.id,
+            marker: c.token,
+            textSha256: digest(c.prompt),
+            startedAt: c.startedAt,
+            route: c.route,
+          },
+        });
       };
       acceptance.beforeSend = async (c, lease) => {
         if (!memoryCheckpointState)
@@ -412,6 +440,13 @@ async function main() {
             expiresAt: lease.expiresAt,
             toolsSha256: lease.toolsSha256,
           },
+        });
+      };
+      acceptance.afterSend = async (c) => {
+        await checkpointMemory({
+          ...memoryCheckpointState,
+          phase: "sent",
+          sentCase: { caseId: c.id, driverMessageId: c.sentMessageId, startedAt: c.startedAt },
         });
       };
       report.memoryLifecycle = await runMemoryLifecycle({

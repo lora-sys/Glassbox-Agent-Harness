@@ -280,18 +280,53 @@ export async function replyCase(config, clients, recorder, spec, signal, accepta
       );
       const tools = JSON.parse(JSON.stringify(spec.leaseTools).replaceAll("{{nonce}}", marker));
       c.leasedToolNames = tools.map((tool) => tool.name);
+      if (acceptance.beforeRegister) {
+        let confirmed;
+        let failed = false;
+        try {
+          confirmed = await acceptance.beforeRegister(c);
+        } catch {
+          failed = true;
+        }
+        check(clients, signal, config);
+        if (failed || confirmed === false)
+          fail("CHECKPOINT_UNCONFIRMED", "注册前的测试进度记录未确认。");
+      }
       registrationAttempted = true;
       c.leaseRegistrationAttempted = true;
       lease = await acceptance.register(config, c, tools);
       c.acceptanceLease = lease;
       check(clients, signal, config);
       if (acceptance.beforeSend) {
-        if ((await acceptance.beforeSend(c, lease)) === false)
-          fail("CHECKPOINT_UNCONFIRMED", "发送前的测试进度记录未确认。");
+        let confirmed;
+        let failed = false;
+        try {
+          confirmed = await acceptance.beforeSend(c, lease);
+        } catch {
+          failed = true;
+        }
         check(clients, signal, config);
+        if (failed || confirmed === false)
+          fail("CHECKPOINT_UNCONFIRMED", "发送前的测试进度记录未确认。");
       }
     }
     await sendCase(config, clients, c);
+    if (featureCase && acceptance?.afterSend) {
+      let confirmed;
+      let failed = false;
+      try {
+        confirmed = await acceptance.afterSend(c);
+      } catch {
+        failed = true;
+      }
+      check(clients, signal, config);
+      if (failed || confirmed === false)
+        fail(
+          "SEND_CHECKPOINT_UNCONFIRMED",
+          "消息已发送，但发送回执未能持久化确认，不会重发。",
+          "INCONCLUSIVE",
+        );
+    }
     const end = Date.now() + config.timeoutMs;
     let matchedAt = 0;
     while (Date.now() < end) {

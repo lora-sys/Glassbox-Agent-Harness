@@ -203,6 +203,7 @@ import {
   QqLiveLeaseRegistry,
   QQ_LIVE_ACCEPTANCE_MAX_TTL_MS,
   appendQqLiveAcceptanceAudit,
+  canonicalQqLiveTextSha256,
   hasQqLiveAcceptanceMarker,
   type QqLiveLeaseBinding,
   type QqLiveLeaseTool,
@@ -3264,6 +3265,9 @@ export class ManagementApplication {
               scope: message.scope,
               principalId: accepted.caller.principalId,
               leaseId: leaseResolution.leaseId,
+              runId: accepted.run.id,
+              marker: leaseResolution.marker,
+              textSha256: canonicalQqLiveTextSha256(message.text),
               toolsSha256: leaseResolution.toolsSha256,
             }).catch(() => undefined);
             this.qqLiveRunBindings.set(accepted.run.id, {

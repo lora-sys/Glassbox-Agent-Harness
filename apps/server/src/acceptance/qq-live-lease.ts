@@ -189,6 +189,8 @@ export async function appendQqLiveAcceptanceAudit(
     marker?: string;
     expiresAt?: number;
     toolsSha256?: string;
+    runId?: string;
+    textSha256?: string;
     at?: string;
   },
 ): Promise<void> {
@@ -202,6 +204,8 @@ export async function appendQqLiveAcceptanceAudit(
     ...(input.marker === undefined ? {} : { marker: input.marker }),
     ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
     ...(input.toolsSha256 === undefined ? {} : { toolsSha256: input.toolsSha256 }),
+    ...(input.runId === undefined ? {} : { runId: input.runId }),
+    ...(input.textSha256 === undefined ? {} : { textSha256: input.textSha256 }),
     ...(input.scope === undefined
       ? {}
       : { scopeSha256: createHash("sha256").update(scopeKey(input.scope), "utf8").digest("hex") }),

@@ -41,12 +41,21 @@ test("feature request registers before sending and revokes its exact lease", asy
   let registered = false,
     revoked = false,
     checkpointed = false;
+  const order = [];
   const c = await replyCase(w.config, w.clients, w.recorder, featureSpec, undefined, {
+    beforeRegister: async (prepared) => {
+      assert.equal(w.actions.filter((a) => a.action.startsWith("send_")).length, 0);
+      assert.match(prepared.prompt, /^GLASSBOX_ACCEPTANCE_V1 [a-f0-9]{32}\n/);
+      assert.equal(prepared.sentMessageId, undefined);
+      assert.equal(prepared.sendAttempted, undefined);
+      order.push("beforeRegister");
+    },
     register: async (config, c, tools) => {
       assert.equal(w.actions.filter((a) => a.action.startsWith("send_")).length, 0);
       assert.match(c.prompt, /^GLASSBOX_ACCEPTANCE_V1 [a-f0-9]{32}\n/);
       assert.deepEqual(tools, []);
       registered = true;
+      order.push("register");
       return { leaseId, expiresAt: Date.now() + 10000 };
     },
     revoke: async (id) => {
@@ -59,12 +68,21 @@ test("feature request registers before sending and revokes its exact lease", asy
       assert.equal(lease.leaseId, leaseId);
       assert.ok(prepared.prompt.startsWith(`GLASSBOX_ACCEPTANCE_V1 ${prepared.token}\n`));
       checkpointed = true;
+      order.push("beforeSend");
+    },
+    afterSend: async (sent) => {
+      assert.equal(sent.sendAttempted, true);
+      assert.match(sent.sentMessageId, /^\d+$/);
+      assert.equal(sent.inputObserved, false);
+      assert.equal(w.actions.filter((a) => a.action.startsWith("send_")).length, 1);
+      order.push("afterSend");
     },
   });
   assert.equal(c.status, "PASS");
   assert.equal(registered, true);
   assert.equal(revoked, true);
   assert.equal(checkpointed, true);
+  assert.deepEqual(order, ["beforeRegister", "register", "beforeSend", "afterSend"]);
   assert.equal(c.leaseRevoked, true);
   assert.deepEqual(c.featureAssertions, featureSpec.featureAssertions);
 });
@@ -89,6 +107,76 @@ test("failed or unconfirmed prepared-message checkpoint revokes the lease withou
     assert.equal(revoked, true);
   }
   assert.equal(w.actions.filter((a) => a.action.startsWith("send_")).length, 0);
+});
+test("failed registration checkpoint prevents registration, sending and cleanup calls", async (t) => {
+  const w = await setup(t);
+  for (const mode of ["throw", "false"]) {
+    let registered = false;
+    let revoked = false;
+    const c = await replyCase(w.config, w.clients, w.recorder, featureSpec, undefined, {
+      beforeRegister: async () => {
+        if (mode === "throw") throw new Error("fixture checkpoint failure");
+        return false;
+      },
+      register: async () => {
+        registered = true;
+        return { leaseId: "fixture-lease" };
+      },
+      revoke: async () => {
+        revoked = true;
+      },
+    });
+    assert.notEqual(c.status, "PASS");
+    assert.equal(c.code, "CHECKPOINT_UNCONFIRMED");
+    assert.equal(c.leaseRegistrationAttempted, undefined);
+    assert.equal(c.sendAttempted, undefined);
+    assert.equal(registered, false);
+    assert.equal(revoked, false);
+  }
+  assert.equal(w.actions.filter((a) => a.action.startsWith("send_")).length, 0);
+});
+test("registration cancellation is checked after the beforeRegister hook", async (t) => {
+  const w = await setup(t);
+  const controller = new AbortController();
+  let registered = false;
+  const c = await replyCase(w.config, w.clients, w.recorder, featureSpec, controller.signal, {
+    beforeRegister: async () => {
+      controller.abort();
+      return true;
+    },
+    register: async () => {
+      registered = true;
+      return { leaseId: "fixture-lease" };
+    },
+  });
+  assert.equal(c.code, "CANCELLED");
+  assert.equal(registered, false);
+  assert.equal(c.sendAttempted, undefined);
+  assert.equal(w.actions.filter((a) => a.action.startsWith("send_")).length, 0);
+});
+test("failed post-send checkpoint remains inconclusive without retry and revokes the exact lease", async (t) => {
+  const w = await setup(t);
+  const leaseId = "12345678-1234-1234-1234-123456789abc";
+  for (const mode of ["throw", "false"]) {
+    const revoked = [];
+    const c = await replyCase(w.config, w.clients, w.recorder, featureSpec, undefined, {
+      register: async () => ({ leaseId }),
+      afterSend: async (sent) => {
+        assert.equal(sent.sendAttempted, true);
+        assert.match(sent.sentMessageId, /^\d+$/);
+        if (mode === "throw") throw new Error("fixture checkpoint failure");
+        return false;
+      },
+      revoke: async (id) => revoked.push(id),
+    });
+    assert.equal(c.status, "INCONCLUSIVE");
+    assert.equal(c.code, "SEND_CHECKPOINT_UNCONFIRMED");
+    assert.equal(c.sendAttempted, true);
+    assert.match(c.sentMessageId, /^\d+$/);
+    assert.equal(c.leaseRevoked, true);
+    assert.deepEqual(revoked, [leaseId]);
+  }
+  assert.equal(w.actions.filter((a) => a.action.startsWith("send_")).length, 2);
 });
 test("missing or rejected feature lease prevents all sends", async (t) => {
   const w = await setup(t);

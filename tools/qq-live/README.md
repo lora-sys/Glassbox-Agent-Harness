@@ -6,7 +6,7 @@
 
 固定 Memory 生命周期使用 `plan --case memory-lifecycle` 审阅三步消息，再执行 `run --live --case memory-lifecycle --approve-suite <SHA256>`。配置中的 `memoryFixtures.enabled` 和 `memoryFixtures.retainAuditConfirmed` 都必须为 `true`。流程在唯一的 `qqtest-<32hex>` 项目中创建反馈候选，提升该候选，再过期本轮 Memory。每一步都需要独立 Run、工具 Trace、成功投递和只读状态证据，才会继续下一步。完成后保留反馈、候选、Memory 及审计历史，不删除历史记录。
 
-固定记忆流程在 Linux 环境运行。测试器会同步保存 `memory-fixture.jsonl` 进度记录。发送前保存实际消息标记、哈希及许可回执，并同步文件与目录。写盘未确认时不发送消息。未确认步骤或清理时，发起账号的全局锁目录会保留 `.memory-pending.json`，后续实机运行会停止，即使改用另一个报告目录。不要直接删除这个记录来重试。中断后的自动核实和清理入口仍在开发中，当前需先核实原报告、Run 终态和独立清理证据。这个固定流程不代表完整 Memory 功能回归，也不满足完整目录的自动合并门禁。
+固定记忆流程在 Linux 环境运行。测试器会同步保存 `memory-fixture.jsonl` 进度记录。注册许可前保存实际消息标记和哈希，发送前保存许可回执，发送成功后保存账号侧消息回执。检查点同时记录原测试进程的 PID、Linux 启动身份、进程启动标识、私聊范围及运行版本。文件与目录写盘确认后才继续。更新 guard 时使用原子替换，保留完整旧记录；首次发布禁止覆盖已有 guard。写盘未确认时不发送消息。未确认步骤或清理时，发起账号的全局锁目录会保留 `.memory-pending.json`，后续实机运行会停止，即使改用另一个报告目录。不要直接删除这个记录来重试。中断后的自动核实和清理入口仍在开发中，当前需先核实原报告、Run 终态和独立清理证据。这个固定流程不代表完整 Memory 功能回归，也不满足完整目录的自动合并门禁。
 
 报告新增 `productAcceptance`。未配置 runtime 时，收发 PASS 只代表 QQ 传输观察通过，产品验收仍为 BLOCKED，不能据此合并。
 
