@@ -243,6 +243,34 @@ test("fixed Memory family binds only its exact private promote-expire contract",
   assert.deepEqual(result.coveredDomains, ["memory_taste"]);
 });
 
+test("history complete cases cannot downgrade to scope-only catalog coverage", async () => {
+  const source = JSON.parse(
+    await readFile(new URL("../examples/feature-read.example.json", import.meta.url), "utf8"),
+  );
+  for (const id of ["history-current-group-complete", "history-owner-group-a-complete"]) {
+    const definition = FEATURE_CATALOG.cases.find((item) => item.id === id);
+    const suiteCase = source.cases.find((item) => item.id === id);
+    const catalog = {
+      schemaVersion: 1,
+      descriptorBaseline: definition.tools,
+      requiredDomains: ["history_retrieval"],
+      cases: [definition],
+    };
+    const input = {
+      catalog,
+      descriptors: definition.tools.map((name) => ({ name })),
+      executableSuiteCases: [suiteCase],
+      suiteConfig: { groups: [{ alias: "A", id: "10001" }] },
+    };
+    assert.equal(checkFeatureCoverage(input).status, "PASS");
+    const downgraded = structuredClone(suiteCase);
+    downgraded.featureAssertions.pop();
+    const result = checkFeatureCoverage({ ...input, executableSuiteCases: [downgraded] });
+    assert.equal(result.status, "BLOCKED");
+    assert.ok(result.gaps.some((gap) => gap.code === "SUITE_ASSERTIONS_MISMATCH"));
+  }
+});
+
 test("fixed Memory reject family has its own bounded executable catalog case", () => {
   const result = checkFeatureCoverage({
     catalog: memoryCatalog({}, memoryRejectFamily),

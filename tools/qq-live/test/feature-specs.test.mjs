@@ -75,6 +75,23 @@ test("history cases resolve only the exact A-group nonce search scope", async ()
     retrievalMode: "lexical",
   });
   assert.equal(ownerCase.leaseTools[0].operations[0].resourceId, "owner-history");
+  const complete = resolved.find((entry) => entry.id === "history-current-group-complete");
+  assert.deepEqual(complete.featureAssertions[2], {
+    kind: "history_coverage",
+    query: "{{nonce}}",
+    groupId: "20001",
+    count: 1,
+  });
+  for (const change of [
+    { groupId: "20002" },
+    { count: 0 },
+    { query: "unbounded" },
+    { coverage: "complete" },
+  ]) {
+    const bad = structuredClone(complete);
+    Object.assign(bad.featureAssertions[2], change);
+    assert.throws(() => validateReadFeatureSpecs({ schemaVersion: 2, cases: [bad] }, config));
+  }
   assert.deepEqual(ownerCase.leaseTools[0].operations[0].inputConstraint, {
     query: "{{nonce}}",
     groupIds: ["20001"],

@@ -145,9 +145,15 @@ function validateHistoryCase(c, tool, config) {
 
   const rawAssertions = expectedHistoryAssertions(tool.name, templateGroupId);
   const resolvedAssertions = expectedHistoryAssertions(tool.name, groupId);
+  const withCoverage = (assertions, id) => [
+    ...assertions,
+    { kind: "history_coverage", query: "{{nonce}}", groupId: id, count: 1 },
+  ];
   if (
     canonical(c.featureAssertions) !== canonical(rawAssertions) &&
-    canonical(c.featureAssertions) !== canonical(resolvedAssertions)
+    canonical(c.featureAssertions) !== canonical(resolvedAssertions) &&
+    canonical(c.featureAssertions) !== canonical(withCoverage(rawAssertions, templateGroupId)) &&
+    canonical(c.featureAssertions) !== canonical(withCoverage(resolvedAssertions, groupId))
   )
     fail(
       "FEATURE_HISTORY_TRACE",

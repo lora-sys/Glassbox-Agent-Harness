@@ -225,6 +225,109 @@
           "count": 1
         }
       ]
+    },
+    {
+      "id": "history-current-group-complete",
+      "chat": "A",
+      "prompt": "请只调用 group_history_search，以当前测试编号 {{nonce}} 精确搜索本群。限制返回 1 条。只说明检索结果是否找到这条编号，不引用任何其他消息。{{nonce}}",
+      "expectContains": ["{{nonce}}"],
+      "sideEffect": "none",
+      "leaseTools": [
+        {
+          "name": "group_history_search",
+          "operations": [
+            {
+              "action": "history:read",
+              "resourceId": "group:{{group:A}}",
+              "inputConstraint": {
+                "query": "{{nonce}}",
+                "limit": 1
+              }
+            }
+          ]
+        }
+      ],
+      "featureAssertions": [
+        {
+          "kind": "trace",
+          "type": "tool_result",
+          "where": {
+            "name": "group_history_search",
+            "isError": false
+          },
+          "count": 1
+        },
+        {
+          "kind": "trace",
+          "type": "history_retrieval",
+          "where": {
+            "query": "{{nonce}}",
+            "groups": ["{{group:A}}"],
+            "resources": ["group:{{group:A}}"],
+            "sourceKind": "channel_message",
+            "retrievalMode": "lexical"
+          },
+          "count": 1
+        },
+        {
+          "kind": "history_coverage",
+          "query": "{{nonce}}",
+          "groupId": "{{group:A}}",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "history-owner-group-a-complete",
+      "chat": "private",
+      "prompt": "请只调用 owner_history_search，在测试群 A 中以当前测试编号 {{nonce}} 精确搜索，限制返回 1 条。只说明是否找到这条编号，不引用任何其他消息。回复测试编号 {{nonce}}。",
+      "expectContains": ["{{nonce}}"],
+      "sideEffect": "none",
+      "leaseTools": [
+        {
+          "name": "owner_history_search",
+          "operations": [
+            {
+              "action": "history:search",
+              "resourceId": "owner-history",
+              "inputConstraint": {
+                "query": "{{nonce}}",
+                "groupIds": ["{{group:A}}"],
+                "limit": 1
+              }
+            }
+          ]
+        }
+      ],
+      "featureAssertions": [
+        {
+          "kind": "trace",
+          "type": "tool_result",
+          "where": {
+            "name": "owner_history_search",
+            "isError": false
+          },
+          "count": 1
+        },
+        {
+          "kind": "trace",
+          "type": "history_retrieval",
+          "where": {
+            "query": "{{nonce}}",
+            "groups": ["{{group:A}}"],
+            "resources": ["group:{{group:A}}"],
+            "sourceKind": "channel_message",
+            "retrievalMode": "lexical"
+          },
+          "count": 1
+        },
+        {
+          "kind": "history_coverage",
+          "query": "{{nonce}}",
+          "groupId": "{{group:A}}",
+          "count": 1
+        }
+      ]
     }
   ]
 }

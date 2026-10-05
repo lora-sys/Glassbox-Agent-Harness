@@ -10,6 +10,7 @@ import { verifyCore } from "./verify-core.mjs";
 import { appendLesson, validateLesson } from "./record-lesson.mjs";
 import { memoryFixtureStep } from "../../../../tools/qq-live/lib/memory-scenario.mjs";
 import { toolManifestDigest } from "../../../../tools/qq-live/lib/core.mjs";
+import { MEMORY_REJECT_FAMILY_ID } from "../../../../tools/qq-live/lib/memory-workflow.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const hypothesis = {
@@ -286,6 +287,166 @@ async function createPassingFeatureReport(t, update = () => {}) {
     bytes,
     input: {
       ...fixture.input,
+      verification: { ...fixture.input.verification, reportSha256: hash(bytes) },
+    },
+  };
+}
+
+async function createPassingCompleteHistoryReport(t, caseId) {
+  const fixture = await createPassingFeatureReport(t);
+  const report = JSON.parse(fixture.bytes.toString("utf8"));
+  const runId = fixture.input.evidence.runId;
+  const token = "a".repeat(32);
+  const currentGroup = caseId === "history-current-group-complete";
+  const toolName = currentGroup ? "group_history_search" : "owner_history_search";
+  const groupId = "20001";
+  const caseRecord = report.cases[0];
+  const accepted = report.productAcceptance.cases[0];
+  const prompt = `GLASSBOX_ACCEPTANCE_V1 ${token}\nSearch the fixed group history for the current test marker.`;
+  const promptHash = hash(Buffer.from(prompt, "utf8"));
+  const input = currentGroup
+    ? { query: token, limit: 1 }
+    : { query: token, groupIds: [groupId], limit: 1 };
+  const tools = [
+    {
+      name: toolName,
+      operations: [
+        {
+          action: currentGroup ? "history:read" : "history:search",
+          resourceId: currentGroup ? `group:${groupId}` : "owner-history",
+          inputConstraint: input,
+        },
+      ],
+    },
+  ];
+  Object.assign(caseRecord, {
+    id: caseId,
+    route: currentGroup ? groupId : "private",
+    token,
+    prompt,
+    expected: [token],
+    inputBinding: { ...caseRecord.inputBinding, textSha256: promptHash },
+    acceptanceLease: { leaseId: "lease-fixture", toolsSha256: toolManifestDigest(tools) },
+    leasedToolNames: [toolName],
+    leaseRegistrationAttempted: true,
+    leaseRevoked: true,
+  });
+  caseRecord.featureAssertions = [
+    { kind: "trace", type: "tool_result", where: { name: toolName, isError: false }, count: 1 },
+    {
+      kind: "trace",
+      type: "history_retrieval",
+      where: {
+        query: token,
+        groups: [groupId],
+        resources: [`group:${groupId}`],
+        sourceKind: "channel_message",
+        retrievalMode: "lexical",
+      },
+      count: 1,
+    },
+    { kind: "history_coverage", query: token, groupId, count: 1 },
+  ];
+  accepted.caseId = caseId;
+  accepted.scope.chatType = currentGroup ? "group" : "private";
+  accepted.scope.chatId = currentGroup ? groupId : accepted.scope.senderId;
+  accepted.feature = {
+    status: "PASS",
+    runId,
+    observations: [
+      { kind: "trace", type: "tool_result", count: 1 },
+      { kind: "trace", type: "history_retrieval", count: 1 },
+      { kind: "history_coverage", coverage: "complete", returned: 0, sourceComplete: true },
+    ],
+  };
+  accepted.messageBinding.input.textSha256 = promptHash;
+
+  const tracePath = join(report.runtime.dataDirectory, "runs", runId, "trace.jsonl");
+  const events = [
+    {
+      type: "message_received",
+      runId,
+      externalId: caseRecord.inputBinding.botMessageId,
+      textSha256: promptHash,
+      ...accepted.scope,
+    },
+    {
+      type: "delivery_changed",
+      runId,
+      deliveryId: accepted.delivery.id,
+      status: "sent",
+      externalId: accepted.delivery.external_id,
+    },
+    {
+      type: "session_start",
+      runId,
+      data: {
+        acceptanceLease: {
+          leaseId: "lease-fixture",
+          toolsSha256: toolManifestDigest(tools),
+          marker: token,
+          narrowedTools: [toolName],
+        },
+        authorizedTools: [toolName],
+      },
+    },
+    { type: "tool_call", runId, toolCallId: "history-call", data: { name: toolName, input } },
+    {
+      type: "tool_result",
+      runId,
+      toolCallId: "history-call",
+      data: { name: toolName, isError: false },
+    },
+    {
+      type: "history_retrieval",
+      runId,
+      query: token,
+      groups: [groupId],
+      resources: [`group:${groupId}`],
+      sourceKind: "channel_message",
+      retrievalMode: "lexical",
+      considered: 0,
+      droppedByExactTerm: 0,
+      truncated: false,
+      items: [],
+      coverage: {
+        coverage: "complete",
+        requestedLimit: 1,
+        groupsSearched: 1,
+        perSourceCap: null,
+        truncated: false,
+        truncationReasons: [],
+        sourceLimits: [],
+        returned: 0,
+        considered: 0,
+        droppedByExactTerm: 0,
+        exactTerms: [token],
+        sourceCoverage: [
+          {
+            groupId,
+            capped: false,
+            returned: 0,
+            considered: 0,
+            sync: { stop: "end_of_source", pagesWalked: 1 },
+          },
+        ],
+        observedAt: "2026-10-05T00:00:00.000Z",
+      },
+    },
+  ];
+  await writeFile(
+    tracePath,
+    events.map((event, seq) => JSON.stringify({ seq: seq + 1, event })).join("\n") + "\n",
+    "utf8",
+  );
+  const bytes = Buffer.from(JSON.stringify(report));
+  await writeFile(fixture.reportPath, bytes);
+  return {
+    ...fixture,
+    report,
+    input: {
+      ...fixture.input,
+      case: caseId,
       verification: { ...fixture.input.verification, reportSha256: hash(bytes) },
     },
   };
@@ -641,6 +802,234 @@ async function createPassingMemoryLifecycleReport(t) {
   return { ...fixture, report, input, dbPath, writeReport, runIds, candidateId, memoryId };
 }
 
+async function createPassingMemoryRejectReport(t) {
+  const fixture = await createPassingMemoryLifecycleReport(t);
+  const report = structuredClone(fixture.report);
+  const fixtureNonce = report.memoryLifecycle.handles.fixtureNonce;
+  const projectId = report.memoryLifecycle.handles.projectId;
+  const principalId = report.memoryLifecycle.handles.principalId;
+  const candidateId = report.memoryLifecycle.handles.candidateId;
+  const runIds = [fixture.runIds[0], fixture.runIds[2]];
+  const stages = ["feedback", "reject"];
+  const db = new DatabaseSync(fixture.dbPath);
+  db.prepare("DELETE FROM memory_audit_events WHERE action IN ('promote', 'expire')").run();
+  db.prepare("DELETE FROM memories").run();
+  db.prepare(
+    "UPDATE memory_candidates SET status='rejected', promoted_memory_id=NULL WHERE id=?",
+  ).run(candidateId);
+  db.prepare(
+    "INSERT INTO memory_audit_events (id, principal_id, action, target_id, run_id, lineage_json) VALUES (?, ?, 'reject', ?, ?, ?)",
+  ).run(
+    "audit-reject",
+    principalId,
+    candidateId,
+    runIds[1],
+    JSON.stringify([candidateId, `run:${runIds[1]}`]),
+  );
+  db.close();
+
+  const scope = {
+    connectionId: report.runtime.connectionId,
+    botId: "10002",
+    chatType: "private",
+    chatId: "10001",
+    senderId: "10001",
+    threadId: null,
+  };
+  const scopeKey = JSON.stringify([
+    scope.connectionId,
+    scope.botId,
+    scope.chatType,
+    scope.chatId,
+    scope.senderId,
+    scope.threadId,
+  ]);
+  const cases = [];
+  const acceptedCases = [];
+  for (const [index, stage] of stages.entries()) {
+    const runId = runIds[index];
+    const caseId = `memory-${stage}`;
+    const token = `${index + 1}`.repeat(32);
+    const spec = memoryFixtureStep(stage, { nonce: fixtureNonce, candidateId });
+    const replace = (value) => JSON.parse(JSON.stringify(value).replaceAll("{{nonce}}", token));
+    const prompt = `GLASSBOX_ACCEPTANCE_V1 ${token}\n${spec.prompt.replaceAll("{{nonce}}", token).trim()}`;
+    const tools = replace(spec.leaseTools);
+    const binding = {
+      driverMessageId: String(9101 + index),
+      botMessageId: String(9201 + index),
+      realSequence: String(9301 + index),
+      time: 1791158400000 + index * 1000,
+      textSha256: hash(Buffer.from(prompt, "utf8")),
+    };
+    const delivery = {
+      id: `delivery-reject-${index + 1}`,
+      status: "sent",
+      external_id: String(9401 + index),
+      destination_scope_key: scopeKey,
+    };
+    const replyHash = hash(Buffer.from(`reply ${token}`, "utf8"));
+    cases.push({
+      id: caseId,
+      token,
+      route: "private",
+      prompt,
+      expected: replace(spec.expectContains),
+      startedAt: "2026-10-05T00:00:00.000Z",
+      sentMessageId: binding.driverMessageId,
+      status: "PASS",
+      inputBinding: binding,
+      replies: [
+        {
+          route: "private",
+          messageId: String(9501 + index),
+          textSha256: replyHash,
+          textBytes: 12,
+          matches: true,
+          receivedAt: "2026-10-05T00:00:01.000Z",
+        },
+      ],
+      anomalies: [],
+      featureAssertions: replace(spec.featureAssertions),
+      leasedToolNames: tools.map((tool) => tool.name),
+      acceptanceLease: {
+        leaseId: `12345678-1234-1234-1234-${String(index + 1).padStart(12, "0")}`,
+        expiresAt: Date.parse("2026-10-05T00:01:00.000Z"),
+        toolsSha256: toolManifestDigest(tools),
+      },
+      leaseRegistrationAttempted: true,
+      leaseRevoked: true,
+    });
+    acceptedCases.push({
+      caseId,
+      runId,
+      scope,
+      decisions: [{ decision: "ALLOW" }],
+      delivery,
+      traceVerified: true,
+      messageBinding: {
+        input: {
+          realSequence: binding.realSequence,
+          time: binding.time,
+          textSha256: binding.textSha256,
+        },
+        reply: {
+          messageId: String(9501 + index),
+          realSequence: String(9601 + index),
+          time: binding.time + 1000,
+          textSha256: replyHash,
+        },
+      },
+      feature: {
+        status: "PASS",
+        runId,
+        observations: spec.featureAssertions.map((assertion) => ({
+          kind: "trace",
+          type: assertion.type,
+          count: assertion.count,
+        })),
+      },
+    });
+    const events = [
+      {
+        type: "message_received",
+        runId,
+        externalId: binding.botMessageId,
+        textSha256: binding.textSha256,
+        ...scope,
+      },
+      {
+        type: "delivery_changed",
+        runId,
+        deliveryId: delivery.id,
+        status: "sent",
+        externalId: delivery.external_id,
+      },
+      {
+        type: "session_start",
+        runId,
+        data: {
+          acceptanceLease: {
+            leaseId: `12345678-1234-1234-1234-${String(index + 1).padStart(12, "0")}`,
+            toolsSha256: toolManifestDigest(tools),
+            marker: token,
+            narrowedTools: tools.map((tool) => tool.name),
+          },
+          authorizedTools: tools.map((tool) => tool.name),
+        },
+      },
+      {
+        type: "tool_call",
+        runId,
+        toolCallId: `reject-call-${index + 1}`,
+        data: { name: "owner_memory_admin", input: tools[0].operations[0].inputConstraint },
+      },
+      {
+        type: "tool_result",
+        runId,
+        toolCallId: `reject-call-${index + 1}`,
+        data: { name: "owner_memory_admin", isError: false },
+      },
+    ];
+    const tracePath = join(report.runtime.dataDirectory, "runs", runId, "trace.jsonl");
+    await mkdir(dirname(tracePath), { recursive: true });
+    await writeFile(
+      tracePath,
+      events.map((event, seq) => JSON.stringify({ seq: seq + 1, event })).join("\n") + "\n",
+      "utf8",
+    );
+  }
+
+  report.cases = cases;
+  report.productAcceptance.cases = acceptedCases;
+  report.productAcceptance.status = "PASS";
+  report.productAcceptance.runtime = report.runtime;
+  report.status = "PASS";
+  report.plannedCaseCount = 2;
+  report.executedCaseCount = 2;
+  report.memoryFamily = { caseId: MEMORY_REJECT_FAMILY_ID };
+  report.memoryLifecycle = {
+    status: "PASS",
+    stage: "reject",
+    handles: {
+      fixtureNonce,
+      projectId,
+      stepRunId: runIds[1],
+      principalId,
+      creationRunId: runIds[0],
+      candidateId,
+      cleanupRunId: runIds[1],
+      cleanupStatus: "rejected",
+    },
+    steps: stages.map((stage, index) => ({
+      stage,
+      currentRunId: runIds[index],
+      runId: runIds[index],
+      productAcceptance: {
+        status: "PASS",
+        runtime: report.runtime,
+        caseId: `memory-${stage}`,
+        traceVerified: true,
+        featureStatus: "PASS",
+      },
+    })),
+    requiresReconciliation: false,
+    cleanup: { status: "rejected", runId: runIds[1] },
+  };
+
+  async function writeReport(nextReport) {
+    const bytes = Buffer.from(JSON.stringify(nextReport));
+    await writeFile(fixture.reportPath, bytes);
+    return {
+      ...fixture.input,
+      case: "memory-reject",
+      evidence: { type: "run", runId: runIds[1] },
+      verification: { ...fixture.input.verification, reportSha256: hash(bytes) },
+    };
+  }
+  const input = await writeReport(report);
+  return { ...fixture, report, input, writeReport, runIds, candidateId };
+}
+
 async function updateTrace(fixture, runId, update) {
   const report = fixture.report ?? JSON.parse(fixture.bytes.toString("utf8"));
   const tracePath = join(report.runtime.dataDirectory, "runs", runId, "trace.jsonl");
@@ -694,6 +1083,38 @@ test("verified feature lesson checks lease, tool and state evidence via existing
   assert.equal(recorded.status, "verified");
   assert.equal(recorded.evidence.reportSha256, fixture.input.verification.reportSha256);
   assert.deepEqual(JSON.parse(await readFile(lessonsPath, "utf8")), recorded);
+});
+
+test("complete history lessons recheck the fixed nonce, group A lease and source window", async (t) => {
+  for (const caseId of ["history-current-group-complete", "history-owner-group-a-complete"]) {
+    const fixture = await createPassingCompleteHistoryReport(t, caseId);
+    const lessonsPath = join(fixture.temp, `${caseId}.jsonl`);
+    const recorded = await appendLesson(fixture.input, lessonsPath);
+    assert.equal(recorded.status, "verified", caseId);
+    assert.equal(recorded.case, caseId);
+  }
+});
+
+test("complete history lessons cannot drop coverage assertion or trace observation", async (t) => {
+  for (const caseId of ["history-current-group-complete", "history-owner-group-a-complete"]) {
+    const fixture = await createPassingCompleteHistoryReport(t, caseId);
+    const report = structuredClone(fixture.report);
+    report.cases[0].featureAssertions = report.cases[0].featureAssertions.filter(
+      (assertion) => assertion.kind !== "history_coverage",
+    );
+    report.productAcceptance.cases[0].feature.observations =
+      report.productAcceptance.cases[0].feature.observations.filter(
+        (observation) => observation.kind !== "history_coverage",
+      );
+    const input = await rewriteReport(fixture, report);
+    const lessonsPath = join(fixture.temp, `${caseId}-coverage-removed.jsonl`);
+    await assert.rejects(
+      appendLesson(input, lessonsPath),
+      /Feature Run lease, scope, or Trace evidence|fixed group A lease and coverage assertion/,
+      caseId,
+    );
+    await assert.rejects(readFile(lessonsPath, "utf8"), { code: "ENOENT" });
+  }
 });
 
 test("verified member-count lesson cannot be downgraded by deleting report assertions and metadata", async (t) => {
@@ -787,6 +1208,73 @@ test("verified Memory lifecycle rechecks Owner state and all three fresh Run tra
   assert.equal(recorded.status, "verified");
   assert.equal(recorded.evidence.runId, fixture.runIds[2]);
   assert.deepEqual(JSON.parse(await readFile(lessonsPath, "utf8")), recorded);
+});
+
+test("verified feedback-reject lesson checks two historical Runs and rejected Owner cleanup", async (t) => {
+  const fixture = await createPassingMemoryRejectReport(t);
+  const lessonsPath = join(fixture.temp, "memory-reject-lessons.jsonl");
+  const recorded = await appendLesson(fixture.input, lessonsPath);
+  assert.equal(recorded.status, "verified");
+  assert.equal(recorded.case, "memory-reject");
+  assert.equal(recorded.evidence.runId, fixture.runIds[1]);
+  assert.deepEqual(JSON.parse(await readFile(lessonsPath, "utf8")), recorded);
+});
+
+test("feedback-reject verified lessons reject missing metadata and a non-final selected Run", async (t) => {
+  const missing = await createPassingMemoryRejectReport(t);
+  const missingReport = structuredClone(missing.report);
+  delete missingReport.memoryFamily;
+  delete missingReport.memoryLifecycle;
+  const missingInput = await missing.writeReport(missingReport);
+  const missingPath = join(missing.temp, "memory-reject-missing-metadata.jsonl");
+  await assert.rejects(appendLesson(missingInput, missingPath), /complete Memory lifecycle report/);
+  await assert.rejects(readFile(missingPath, "utf8"), { code: "ENOENT" });
+
+  const unknownFamily = await createPassingMemoryRejectReport(t);
+  const unknownReport = structuredClone(unknownFamily.report);
+  unknownReport.memoryFamily.caseId = "memory-unapproved-family";
+  const unknownInput = await unknownFamily.writeReport(unknownReport);
+  const unknownPath = join(unknownFamily.temp, "memory-reject-unknown-family.jsonl");
+  await assert.rejects(appendLesson(unknownInput, unknownPath), /Unknown Memory family/);
+  await assert.rejects(readFile(unknownPath, "utf8"), { code: "ENOENT" });
+
+  const wrongRun = await createPassingMemoryRejectReport(t);
+  const wrongPath = join(wrongRun.temp, "memory-reject-not-final-run.jsonl");
+  const wrongInput = {
+    ...wrongRun.input,
+    evidence: { type: "run", runId: wrongRun.runIds[0] },
+  };
+  await assert.rejects(
+    appendLesson(wrongInput, wrongPath),
+    /lacks passing authorization, delivery, and message evidence/,
+  );
+  await assert.rejects(readFile(wrongPath, "utf8"), { code: "ENOENT" });
+});
+
+test("feedback-reject verified lessons require fixed reject Trace and no residual state", async (t) => {
+  const changedOperation = await createPassingMemoryRejectReport(t);
+  await updateTrace(changedOperation, changedOperation.runIds[1], (rows) => {
+    rows.find((row) => row.event.type === "tool_call").event.data.input.action = "promote";
+  });
+  const operationPath = join(changedOperation.temp, "memory-reject-wrong-operation.jsonl");
+  await assert.rejects(
+    appendLesson(changedOperation.input, operationPath),
+    /exact leased operation and input|historical evidence did not verify/,
+  );
+  await assert.rejects(readFile(operationPath, "utf8"), { code: "ENOENT" });
+
+  const residual = await createPassingMemoryRejectReport(t);
+  const residualDb = new DatabaseSync(residual.dbPath);
+  residualDb
+    .prepare("UPDATE memory_candidates SET status='pending' WHERE id=?")
+    .run(residual.candidateId);
+  residualDb.close();
+  const residualPath = join(residual.temp, "memory-reject-residual-state.jsonl");
+  await assert.rejects(
+    appendLesson(residual.input, residualPath),
+    /historical evidence did not verify/,
+  );
+  await assert.rejects(readFile(residualPath, "utf8"), { code: "ENOENT" });
 });
 
 test("verified Memory mutation prompts require lifecycle proof when its report marker is removed", async (t) => {

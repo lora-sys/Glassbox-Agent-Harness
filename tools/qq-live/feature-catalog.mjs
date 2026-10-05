@@ -190,7 +190,7 @@ export const FEATURE_CATALOG = Object.freeze({
       executionStatus: "planned",
       tools: ["owner_memory_admin"],
       coveragePlan:
-        "Keep complete scope-isolation, rejection and negative Memory/Taste cases planned. The fixed promote-expire happy path does not cover them.",
+        "Keep complete scope-isolation, Taste learning and authorization-negative cases planned. The fixed promotion and rejection families do not cover them.",
       mutation: "isolated",
       fixture: "unique project scope and qqtest nonce; Owner private Run",
       cleanup:
@@ -309,6 +309,115 @@ export const FEATURE_CATALOG = Object.freeze({
       mutation: "none",
     },
     {
+      id: "history-current-group-complete",
+      domain: "history_retrieval",
+      executionStatus: "executable",
+      tools: ["group_history_search"],
+      suiteCaseId: "history-current-group-complete",
+      leaseTools: [
+        {
+          name: "group_history_search",
+          operations: [
+            {
+              action: "history:read",
+              resourceId: "group:{{group:A}}",
+              inputConstraint: {
+                query: "{{nonce}}",
+                limit: 1,
+              },
+            },
+          ],
+        },
+      ],
+      assertions: [
+        {
+          kind: "trace",
+          type: "tool_result",
+          where: {
+            name: "group_history_search",
+            isError: false,
+          },
+          count: 1,
+        },
+        {
+          kind: "trace",
+          type: "history_retrieval",
+          where: {
+            query: "{{nonce}}",
+            groups: ["{{group:A}}"],
+            resources: ["group:{{group:A}}"],
+            sourceKind: "channel_message",
+            retrievalMode: "lexical",
+          },
+          count: 1,
+        },
+        {
+          kind: "history_coverage",
+          query: "{{nonce}}",
+          groupId: "{{group:A}}",
+          count: 1,
+        },
+      ],
+      coveragePlan:
+        "Verify the single test group source walk and nonce search window are complete. Positive-result semantics and cross-group negatives remain separate pending acceptance.",
+      mutation: "none",
+    },
+    {
+      id: "history-owner-group-a-complete",
+      domain: "history_retrieval",
+      executionStatus: "executable",
+      tools: ["owner_history_search"],
+      suiteCaseId: "history-owner-group-a-complete",
+      leaseTools: [
+        {
+          name: "owner_history_search",
+          operations: [
+            {
+              action: "history:search",
+              resourceId: "owner-history",
+              inputConstraint: {
+                query: "{{nonce}}",
+                groupIds: ["{{group:A}}"],
+                limit: 1,
+              },
+            },
+          ],
+        },
+      ],
+      assertions: [
+        {
+          kind: "trace",
+          type: "tool_result",
+          where: {
+            name: "owner_history_search",
+            isError: false,
+          },
+          count: 1,
+        },
+        {
+          kind: "trace",
+          type: "history_retrieval",
+          where: {
+            query: "{{nonce}}",
+            groups: ["{{group:A}}"],
+            resources: ["group:{{group:A}}"],
+            sourceKind: "channel_message",
+            retrievalMode: "lexical",
+          },
+          count: 1,
+        },
+        {
+          kind: "history_coverage",
+          query: "{{nonce}}",
+          groupId: "{{group:A}}",
+          count: 1,
+        },
+      ],
+      coveragePlan:
+        "Verify the single test group source walk and nonce search window are complete. Positive-result semantics and cross-group negatives remain separate pending acceptance.",
+      mutation: "none",
+    },
+    {
       id: "history-positive-and-negative-result-proof",
       domain: "history_retrieval",
       executionStatus: "planned",
@@ -323,7 +432,7 @@ export const FEATURE_CATALOG = Object.freeze({
       executionStatus: "planned",
       tools: ["group_history_search", "owner_history_search"],
       coveragePlan:
-        "History retrieval Trace carries nested coverage and per-source sync stops, but the feature observer cannot yet assert those structures. Keep completeness and truncation behavior uncovered.",
+        "Complete-source seeds now verify the fixed single-group window. Provider failures, cursor and page bounds, and actual truncation behavior still need dedicated live scenarios and remain uncovered.",
       mutation: "none",
     },
     {

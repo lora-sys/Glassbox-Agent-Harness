@@ -52,7 +52,7 @@ FAIL 表示验收结果不满足预期，先查证故障位置。BLOCKED 表示�
 
 固定记忆流程使用 plan --case memory-lifecycle 审阅消息，再传入 --approve-suite 执行。先明确启用 memoryFixtures.enabled 和 retainAuditConfirmed。每一步核对独立 Run、工具、状态与投递，成功后过期本轮项目 Memory 并保留审计历史。未核实的步骤会保留账号级 .memory-pending.json，禁止通过更换报告目录或删除文件来重试。使用 reconcile-memory 只读核实中断的原流程，再按输出的固定清理计划哈希执行授权清理。恢复只执行 reject 或 expire，不重发反馈或推广。恢复自身中断时继续保留记录，不自动接管。CLEANED 只证明清理完成，固定流程也不能替代完整 Memory 回归。
 
-schemaVersion 3 套件可同时包含推广后过期和 memory-project-feedback-reject 两个固定流程，每次调用只执行一个。反馈后拒绝需要两个独立 Run、原候选来源和拒绝审计证据，不允许出现 Memory 或推广 Run。版本 3 检查点固定记录此流程身份。拒绝流程尚未经过真实 QQ 验收，也不支持登记为已验证技能经验。
+schemaVersion 3 套件可同时包含推广后过期和 memory-project-feedback-reject 两个固定流程，每次调用只执行一个。反馈后拒绝需要两个独立 Run、原候选来源和拒绝审计证据，不允许出现 Memory 或推广 Run。版本 3 检查点固定记录此流程身份。拒绝流程尚未经过真实 QQ 验收。经验登记现已支持独立重验历史反馈与拒绝 Run，必须选择最终 memory-reject Run，并通过 Owner、候选来源、拒绝审计和无残留状态检查。
 
 ## 交付与合并后验收
 

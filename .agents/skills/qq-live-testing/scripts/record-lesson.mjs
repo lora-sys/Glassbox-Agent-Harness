@@ -20,6 +20,11 @@ import {
 } from "../../../../tools/qq-live/lib/memory-fixture.mjs";
 import { memoryFixtureStep } from "../../../../tools/qq-live/lib/memory-scenario.mjs";
 import { toolManifestDigest } from "../../../../tools/qq-live/lib/core.mjs";
+import { verifyMemoryFamilyReport } from "../../../../tools/qq-live/lib/memory-family-evidence.mjs";
+import {
+  MEMORY_FAMILY_ID,
+  MEMORY_REJECT_FAMILY_ID,
+} from "../../../../tools/qq-live/lib/memory-workflow.mjs";
 
 const CASE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{1,79}$/;
 const COMMIT = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i;
@@ -33,7 +38,16 @@ const PERSONAL_MESSAGE =
   /[“”「」『』]|(^|\s)["'][^"']{3,}["']|(?:^|[\s,，。！？])(?:我|你|您)(?:想|要|是|在|能|可以|帮|给|觉得|怎么|为什么|请|好|吗|呢)|(?:您好|你好|谢谢|请问|在吗|麻烦|能不能)/i;
 const FIELDS = new Set(["case", "commit", "status", "evidence", "symptom", "lesson", "nextStep"]);
 const VERIFIED_FIELDS = new Set([...FIELDS, "verification"]);
-const MEMORY_LIFECYCLE_CASES = new Set(["memory-feedback", "memory-promote", "memory-expire"]);
+const MEMORY_LIFECYCLE_CASES = new Set([
+  "memory-feedback",
+  "memory-promote",
+  "memory-expire",
+  "memory-reject",
+]);
+const COMPLETE_HISTORY_CASES = new Set([
+  "history-current-group-complete",
+  "history-owner-group-a-complete",
+]);
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(SCRIPT_DIR, "../../../..");
 
@@ -172,6 +186,7 @@ function hasUnsafeMemoryToolTrace(events, runId) {
 function requiresMemoryLifecycleVerification(report, events, runId) {
   return (
     Object.hasOwn(report, "memoryLifecycle") ||
+    Object.hasOwn(report, "memoryFamily") ||
     (Array.isArray(report.cases) &&
       report.cases.some(
         (item) => MEMORY_LIFECYCLE_CASES.has(item?.id) || hasMarkedMemoryMutationPrompt(item),
@@ -209,6 +224,94 @@ function requiresIndependentMemberCountVerification(caseRecord, accepted, events
     hasRawToolTrace ||
     hasRawNarrowedTool
   );
+}
+
+function verifyCompleteHistoryCase(caseRecord, accepted, events, runId) {
+  if (!COMPLETE_HISTORY_CASES.has(caseRecord?.id)) return;
+  const currentGroup = caseRecord.id === "history-current-group-complete";
+  const toolName = currentGroup ? "group_history_search" : "owner_history_search";
+  const calls = events.filter(
+    (event) =>
+      event?.runId === runId && event.type === "tool_call" && event.data?.name === toolName,
+  );
+  const results = events.filter(
+    (event) =>
+      event?.runId === runId && event.type === "tool_result" && event.data?.name === toolName,
+  );
+  const token = caseRecord.token;
+  const groupId = currentGroup ? caseRecord.route : calls[0]?.data?.input?.groupIds?.[0];
+  const input = calls[0]?.data?.input;
+  const scopedRoute = currentGroup
+    ? caseRecord.route === groupId &&
+      accepted.scope?.chatType === "group" &&
+      String(accepted.scope?.chatId) === String(groupId)
+    : caseRecord.route === "private" &&
+      accepted.scope?.chatType === "private" &&
+      accepted.scope?.chatId === accepted.scope?.senderId;
+  const expectedInput = currentGroup
+    ? { query: token, limit: 1 }
+    : { query: token, groupIds: [groupId], limit: 1 };
+  const tools = [
+    {
+      name: toolName,
+      operations: [
+        {
+          action: currentGroup ? "history:read" : "history:search",
+          resourceId: currentGroup ? `group:${groupId}` : "owner-history",
+          inputConstraint: expectedInput,
+        },
+      ],
+    },
+  ];
+  const expectedAssertions = [
+    {
+      kind: "trace",
+      type: "tool_result",
+      where: { name: toolName, isError: false },
+      count: 1,
+    },
+    {
+      kind: "trace",
+      type: "history_retrieval",
+      where: {
+        query: token,
+        groups: [groupId],
+        resources: [`group:${groupId}`],
+        sourceKind: "channel_message",
+        retrievalMode: "lexical",
+      },
+      count: 1,
+    },
+    { kind: "history_coverage", query: token, groupId, count: 1 },
+  ];
+  if (
+    !/^[a-f0-9]{32}$/.test(token ?? "") ||
+    !caseRecord.prompt?.startsWith(`GLASSBOX_ACCEPTANCE_V1 ${token}\n`) ||
+    !/^\d{1,16}$/.test(String(groupId ?? "")) ||
+    !scopedRoute ||
+    !isDeepStrictEqual(caseRecord.leasedToolNames, [toolName]) ||
+    caseRecord.leaseRegistrationAttempted !== true ||
+    caseRecord.leaseRevoked !== true ||
+    caseRecord.acceptanceLease?.toolsSha256 !== toolManifestDigest(tools) ||
+    !isDeepStrictEqual(caseRecord.featureAssertions, expectedAssertions) ||
+    calls.length !== 1 ||
+    results.length !== 1 ||
+    !calls[0].toolCallId ||
+    calls[0].toolCallId !== results[0].toolCallId ||
+    results[0].data?.isError !== false ||
+    !isDeepStrictEqual(input, expectedInput)
+  )
+    invalid("Complete history lesson lacks its fixed group A lease and coverage assertion");
+
+  const historyEvents = events.filter(
+    (event) => event?.runId === runId && event.type === "history_retrieval",
+  );
+  if (
+    historyEvents.length !== 1 ||
+    historyEvents[0].query !== token ||
+    !isDeepStrictEqual(historyEvents[0].groups, [groupId])
+  )
+    invalid("Complete history Trace does not match its fixed nonce and group A");
 }
 
 function traceEventsForLesson(report, lesson, evidence, capture) {
@@ -359,6 +462,7 @@ export function verifyFeatureReport(report, lesson, evidence, capture = execFile
   }
   const featureTypes = assertions.filter((item) => item.kind === "trace").map((item) => item.type);
   featureTypes.push("tool_call", "tool_result");
+  if (COMPLETE_HISTORY_CASES.has(caseRecord.id)) featureTypes.push("history_retrieval");
   let trace;
   try {
     trace = readTraceEvents(
@@ -385,6 +489,7 @@ export function verifyFeatureReport(report, lesson, evidence, capture = execFile
   try {
     verifyProductTraceEvidence(events, caseRecord, config, accepted.delivery);
     verifyLeaseTraceEvidence(events, caseRecord, evidence.runId);
+    verifyCompleteHistoryCase(caseRecord, accepted, events, evidence.runId);
   } catch {
     invalid("Feature Run lease, scope, or Trace evidence did not verify");
   }
@@ -628,6 +733,114 @@ export function verifyMemoryLifecycleReport(report, lesson, evidence, capture = 
   }
 }
 
+export async function verifyMemoryRejectReport(report, lesson, evidence, capture = execFileSync) {
+  if (
+    lesson.case !== "memory-reject" ||
+    report?.memoryFamily?.caseId !== MEMORY_REJECT_FAMILY_ID ||
+    lesson.evidence.runId !== report.memoryLifecycle?.handles?.cleanupRunId
+  )
+    invalid("Verified reject lessons must select the final memory-reject Run");
+
+  try {
+    await verifyMemoryFamilyReport(report, {
+      verifyProduct: async (source) => {
+        const cases = [];
+        for (const caseRecord of source.cases) {
+          const accepted = source.productAcceptance?.cases?.find(
+            (item) => item.caseId === caseRecord.id,
+          );
+          if (
+            !accepted ||
+            caseRecord.leaseRegistrationAttempted !== true ||
+            !Array.isArray(accepted.decisions) ||
+            accepted.decisions.length === 0 ||
+            accepted.decisions.some((item) => item?.decision !== "ALLOW")
+          )
+            invalid("Reject-family product or authorization evidence is incomplete");
+          const stageEvidence = {
+            ...evidence,
+            runId: accepted.runId,
+            scope: accepted.scope,
+          };
+          const events = verifyFeatureReport(
+            source,
+            {
+              ...lesson,
+              case: caseRecord.id,
+              evidence: { ...lesson.evidence, runId: accepted.runId },
+            },
+            stageEvidence,
+            capture,
+          );
+          verifyTracePromptHash(caseRecord, accepted, events);
+          const spec = memoryFixtureStep(caseRecord.id.slice("memory-".length), {
+            nonce: source.memoryLifecycle.handles.fixtureNonce,
+            candidateId: source.memoryLifecycle.handles.candidateId,
+          });
+          const expectedTools = spec.leaseTools.map((tool) => tool.name);
+          const calls = events.filter(
+            (event) => event.runId === accepted.runId && event.type === "tool_call",
+          );
+          const sessions = events.filter(
+            (event) => event.runId === accepted.runId && event.type === "session_start",
+          );
+          if (
+            calls.length !== 1 ||
+            calls[0].data?.name !== "owner_memory_admin" ||
+            !isDeepStrictEqual(
+              calls[0].data?.input,
+              spec.leaseTools[0].operations[0].inputConstraint,
+            ) ||
+            sessions.length === 0 ||
+            sessions.some((event) => {
+              const lease = event.data?.acceptanceLease;
+              return (
+                lease?.toolsSha256 !== toolManifestDigest(spec.leaseTools) ||
+                !isDeepStrictEqual(lease?.narrowedTools, expectedTools) ||
+                !isDeepStrictEqual(event.data?.authorizedTools, expectedTools)
+              );
+            })
+          )
+            invalid("Reject-family Trace does not match the exact leased operation and input");
+          cases.push({
+            caseId: caseRecord.id,
+            runId: accepted.runId,
+            scope: accepted.scope,
+            delivery: accepted.delivery,
+            traceVerified: accepted.traceVerified,
+            messageBinding: accepted.messageBinding,
+            feature: accepted.feature,
+          });
+        }
+        return { status: source.productAcceptance?.status, runtime: source.runtime, cases };
+      },
+      readCleanup: async (input) => {
+        let db;
+        try {
+          db = new DatabaseSync(join(evidence.dataDirectory, "glassbox.db"), { readOnly: true });
+          const principal = db
+            .prepare("SELECT kind FROM principals WHERE id=?")
+            .get(input.principalId);
+          if (principal?.kind !== "owner") invalid("Reject-family source Principal is not Owner");
+          return {
+            ...verifyMemoryCleanup(db, input),
+            principalKind: principal.kind,
+          };
+        } finally {
+          db?.close();
+        }
+      },
+    });
+  } catch (error) {
+    if (
+      error.message.startsWith("Verified reject lessons") ||
+      error.message.startsWith("Reject-family")
+    )
+      throw error;
+    invalid("Read-only reject-family historical evidence did not verify");
+  }
+}
+
 export function verifyStandardReport(report, lesson, evidence, capture = execFileSync) {
   const events = traceEventsForLesson(report, lesson, evidence, capture);
   const caseRecord = report.cases.find((item) => item.id === lesson.case);
@@ -683,9 +896,18 @@ export async function appendLesson(
       )
     )
       invalid("Independent group member count evidence is unavailable for verified lessons");
-    if (requiresMemoryLifecycleVerification(report, traceEvents, evidence.runId))
-      verifyMemoryLifecycleReport(report, lesson, evidence, capture);
-    else {
+    if (requiresMemoryLifecycleVerification(report, traceEvents, evidence.runId)) {
+      if (report.memoryFamily?.caseId === MEMORY_REJECT_FAMILY_ID)
+        await verifyMemoryRejectReport(report, lesson, evidence, capture);
+      else {
+        if (
+          Object.hasOwn(report, "memoryFamily") &&
+          report.memoryFamily?.caseId !== MEMORY_FAMILY_ID
+        )
+          invalid("Unknown Memory family cannot produce a verified lesson");
+        verifyMemoryLifecycleReport(report, lesson, evidence, capture);
+      }
+    } else {
       const caseRecord = report.cases.find((item) => item.id === lesson.case);
       const accepted = report.productAcceptance.cases.find((item) => item.caseId === lesson.case);
       verifyTracePromptHash(caseRecord, accepted, traceEvents);

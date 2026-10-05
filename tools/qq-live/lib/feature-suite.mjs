@@ -20,7 +20,7 @@ function memoryPlanSpec(stage, nonce) {
   );
 }
 
-/** Return the fixed three-stage plan for display. This does not execute the family. */
+/** Return the selected fixed workflow for display. This does not execute the family. */
 export function memoryFamilyPlan(familyId = MEMORY_FAMILY_ID) {
   const contract = memoryWorkflow(familyId);
   const placeholder = "0".repeat(32);
