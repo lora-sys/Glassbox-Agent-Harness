@@ -13,6 +13,7 @@ import { runtimeSnapshot, verifyProductEvidence } from "./lib/product-evidence.m
 import { acceptanceManagement } from "./lib/management-client.mjs";
 import { resolveReadFeatureSpecs } from "./lib/feature-specs.mjs";
 import { memoryFixtureStep } from "./lib/memory-scenario.mjs";
+import { runMemoryRecoveryCli } from "./lib/memory-recovery-cli.mjs";
 
 const root = dirname(fileURLToPath(import.meta.url));
 const help = `QQ 实机测试器 0.1.0
@@ -25,6 +26,8 @@ node cli.mjs run --live --case group-A
 node cli.mjs run --live --case moderation
 node cli.mjs plan --case memory-lifecycle
 node cli.mjs run --live --case memory-lifecycle --approve-suite <SHA256>
+node cli.mjs reconcile-memory
+node cli.mjs reconcile-memory --live --approve-suite <SHA256>
 node cli.mjs plan --scenarios examples/scenarios.example.json
 node cli.mjs coverage
 node cli.mjs report
@@ -62,7 +65,19 @@ function args(argv) {
       fail("ARGUMENT", "参数无效，运行 node cli.mjs help 查看帮助。");
     o[k.slice(2)] = argv[++i];
   }
-  if (!["help", "init", "doctor", "arm", "run", "plan", "report", "coverage"].includes(command))
+  if (
+    ![
+      "help",
+      "init",
+      "doctor",
+      "arm",
+      "run",
+      "plan",
+      "report",
+      "coverage",
+      "reconcile-memory",
+    ].includes(command)
+  )
     fail("COMMAND", "未知命令。");
   return { command, o };
 }
@@ -185,7 +200,10 @@ async function main() {
     return;
   }
   const { raw } = await jsonFile(configPath);
-  const config = validateConfig(raw, { live: command === "run" });
+  const config = validateConfig(raw, {
+    live: command === "run" || (command === "reconcile-memory" && o.live === true),
+  });
+  if (command === "reconcile-memory") return runMemoryRecoveryCli(config, o, out);
   if (command === "arm") {
     if (
       config.safety?.acceptanceServiceConfirmed !== true ||

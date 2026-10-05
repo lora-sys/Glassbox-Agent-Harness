@@ -7,10 +7,58 @@ import {
   caseEvidence,
   readTraceEvents,
   runtimeSnapshot,
+  runtimeInspectionSnapshot,
   verifyMessageBindings,
   verifyTraceEvidence,
   verifyLeaseTraceEvidence,
 } from "../lib/product-evidence.mjs";
+
+test("offline QQ permits only read-only recovery inspection with the same service identity checks", () => {
+  const runtime = {
+    checkout: process.cwd(),
+    dataDirectory: process.cwd(),
+    expectedCommit: "a".repeat(40),
+    connectionId: "qq-live",
+  };
+  const status = {
+    dataDirectory: runtime.dataDirectory,
+    processes: [
+      {
+        name: "glassbox",
+        running: true,
+        status: "running",
+        pid: 123,
+        checkout: runtime.checkout,
+        launchCommit: runtime.expectedCommit,
+        launchClean: true,
+      },
+    ],
+    glassboxReady: true,
+    onebotReady: false,
+  };
+  const capture = (command, args) =>
+    command === "git"
+      ? args[0] === "rev-parse"
+        ? runtime.expectedCommit
+        : ""
+      : JSON.stringify(status);
+  assert.equal(runtimeInspectionSnapshot(runtime, capture).pid, 123);
+  assert.throws(() => runtimeSnapshot(runtime, capture), { code: "RUNTIME_UNVERIFIED" });
+  for (const change of [
+    () => {
+      status.glassboxReady = false;
+    },
+    () => {
+      status.glassboxReady = true;
+      status.processes[0].running = false;
+    },
+  ]) {
+    change();
+    assert.throws(() => runtimeInspectionSnapshot(runtime, capture), {
+      code: "RUNTIME_UNVERIFIED",
+    });
+  }
+});
 
 test("feature evidence requires server lease identity and the narrowed Tool surface", () => {
   const c = {

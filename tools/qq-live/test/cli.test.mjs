@@ -43,6 +43,18 @@ test("help requires no credentials or network", async (t) => {
   const d = await dir(t);
   assert.equal((await run(["help"], d)).code, 0);
 });
+
+test("reconcile-memory is a named command and requires enabled isolated fixture configuration", async (t) => {
+  const d = await dir(t);
+  const p = join(d, "c.json");
+  await writeFile(p, JSON.stringify(baseConfig()));
+  const result = await run(["reconcile-memory", "--config", p], d);
+  assert.equal(result.code, 2);
+  assert.match(result.stderr + result.stdout, /MEMORY_FIXTURE_DISABLED/);
+  assert.doesNotMatch(result.stderr + result.stdout, /未知命令/);
+  const helpResult = await run(["help"], d);
+  assert.match(helpResult.stdout, /reconcile-memory --live --approve-suite/);
+});
 test("fixed Memory lifecycle plan exposes all steps without enabling writes", async (t) => {
   const d = await dir(t),
     p = join(d, "c.json");

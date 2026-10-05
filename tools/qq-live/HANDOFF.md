@@ -48,4 +48,4 @@ FAIL 表示验收结果不满足预期，先查证故障位置。BLOCKED 表示�
 
 当工具写入 STOP，或者群操作的结果未知时，先停止相关 Bot 待执行动作并核实群状态。只有原操作已结束且环境恢复后，才允许人工清除 STOP 并重测。
 
-固定记忆流程使用 plan --case memory-lifecycle 审阅消息，再传入 --approve-suite 执行。先明确启用 memoryFixtures.enabled 和 retainAuditConfirmed。每一步核对独立 Run、工具、状态与投递，成功后过期本轮项目 Memory 并保留审计历史。未核实的步骤会保留账号级 .memory-pending.json，禁止通过更换报告目录或删除文件来重试。中断核实与清理命令仍待接入，固定流程也不能替代完整 Memory 回归。
+固定记忆流程使用 plan --case memory-lifecycle 审阅消息，再传入 --approve-suite 执行。先明确启用 memoryFixtures.enabled 和 retainAuditConfirmed。每一步核对独立 Run、工具、状态与投递，成功后过期本轮项目 Memory 并保留审计历史。未核实的步骤会保留账号级 .memory-pending.json，禁止通过更换报告目录或删除文件来重试。使用 reconcile-memory 只读核实中断的原流程，再按输出的固定清理计划哈希执行授权清理。恢复只执行 reject 或 expire，不重发反馈或推广。恢复自身中断时继续保留记录，不自动接管。CLEANED 只证明清理完成，固定流程也不能替代完整 Memory 回归。

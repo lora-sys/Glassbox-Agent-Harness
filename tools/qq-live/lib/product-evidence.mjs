@@ -6,6 +6,15 @@ import { boundMessage, compareSameMessage } from "./message-binding.mjs";
 import { observeFeature, validateFeatureAssertions } from "./feature-observer.mjs";
 
 export function runtimeSnapshot(runtime, capture = execFileSync) {
+  return serviceSnapshot(runtime, capture, true);
+}
+
+/** Read-only recovery inspection may run while QQ awaits login; sends still use runtimeSnapshot. */
+export function runtimeInspectionSnapshot(runtime, capture = execFileSync) {
+  return serviceSnapshot(runtime, capture, false);
+}
+
+function serviceSnapshot(runtime, capture, requireOnebot) {
   if (
     !runtime ||
     !/^[a-f0-9]{40}$/.test(runtime.expectedCommit ?? "") ||
@@ -53,7 +62,7 @@ export function runtimeSnapshot(runtime, capture = execFileSync) {
     !Number.isSafeInteger(processInfo.pid) ||
     resolve(processInfo.checkout ?? "") !== checkout ||
     !status.glassboxReady ||
-    !status.onebotReady
+    (requireOnebot && !status.onebotReady)
   )
     fail("RUNTIME_UNVERIFIED", "服务管理器未确认待测进程、数据目录或 OneBot 就绪。");
   if (processInfo.launchCommit !== commit || processInfo.launchClean !== true)
