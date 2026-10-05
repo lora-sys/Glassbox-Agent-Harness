@@ -272,6 +272,8 @@ const SCRIPT_TESTS = [
   "tools/qq-live/test/feature-catalog.test.mjs",
   "tools/qq-live/test/feature-observer.test.mjs",
   "tools/qq-live/test/feature-specs.test.mjs",
+  "tools/qq-live/test/memory-scenario.test.mjs",
+  "tools/qq-live/test/memory-fixture.test.mjs",
   "tools/qq-live/test/management-client.test.mjs",
   ".agents/skills/qq-live-testing/scripts/helpers.test.mjs",
   "scripts/verify-commit.test.mjs",

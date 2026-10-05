@@ -212,10 +212,107 @@ it("parses only the verified acceptance body for Owner Memory commands and prese
   });
 });
 
+it("strips only the exact acceptance nonce footer from promoted and expired Memory commands", async () => {
+  const marker = "00112233445566778899aabbccddeeff";
+  const cases = [
+    { action: "promote", id: `candidate_${"a".repeat(32)}` },
+    { action: "expire", id: "memory-fixture" },
+  ] as const;
+  for (const { action, id } of cases) {
+    const text = `GLASSBOX_ACCEPTANCE_V1 ${marker}\n/memory ${action} ${id}\n请在回复中包含本轮测试编号 ${marker}。`;
+    const f = fixture(
+      [
+        {
+          status: "completed",
+          text: "Memory command completed.",
+          toolCalls: [{ name: OWNER_MEMORY_ADMIN_TOOL, input: { action, id }, failed: false }],
+        },
+      ],
+      [OWNER_MEMORY_ADMIN_TOOL],
+    );
+    f.input.text = text;
+    const executor = new PiRunExecutionAdapter(f.runtime, {
+      resolveAcceptanceLease: () => ({
+        leaseId: "lease-1",
+        marker,
+        toolsSha256: "0".repeat(64),
+        assertActive: () => true,
+        filterToolNames: (names) => names.filter((name) => name === OWNER_MEMORY_ADMIN_TOOL),
+        checkToolCall: ({ toolName }) => toolName === OWNER_MEMORY_ADMIN_TOOL,
+      }),
+    });
+
+    await expect(executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(f.input.text).toBe(text);
+    expect(f.run.mock.calls[0]?.[2]).toContain(text);
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe(OWNER_MEMORY_ADMIN_TOOL);
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({ action, id });
+  }
+});
+
+it("refuses malformed or misplaced acceptance Memory nonce footers", async () => {
+  const marker = "00112233445566778899aabbccddeeff";
+  const command = `/memory promote candidate_${"a".repeat(32)}`;
+  const invalidFooters = [
+    `请在回复中包含本轮测试编号 ffeeddccbbaa99887766554433221100。`,
+    `请在回复中包含本轮测试编号 ${marker}`,
+    `请在回复中包含本轮测试编号 ${marker}。\nextra`,
+    ` 请在回复中包含本轮测试编号 ${marker}。`,
+    `\t请在回复中包含本轮测试编号 ${marker}。`,
+  ];
+  for (const footer of invalidFooters) {
+    const f = fixture([{ status: "completed", text: "should not reach the model", toolCalls: [] }]);
+    const initialize = vi.spyOn(f.runtime, "initialize");
+    f.input.text = `GLASSBOX_ACCEPTANCE_V1 ${marker}\n${command}\n${footer}`;
+    const executor = new PiRunExecutionAdapter(f.runtime, {
+      resolveAcceptanceLease: () => ({
+        leaseId: "lease-1",
+        marker,
+        toolsSha256: "0".repeat(64),
+        assertActive: () => true,
+        filterToolNames: () => [],
+        checkToolCall: () => false,
+      }),
+    });
+
+    await expect(executor.execute(f.input)).resolves.toMatchObject({
+      status: "failed",
+      runtimeAttempted: false,
+      failureCode: "gate_refused",
+    });
+    expect(initialize).not.toHaveBeenCalled();
+    expect(f.run).not.toHaveBeenCalled();
+  }
+});
+
+it("does not treat extra acceptance body lines as a required Memory command", async () => {
+  const marker = "00112233445566778899aabbccddeeff";
+  const command = `/memory promote candidate_${"a".repeat(32)}`;
+  const text = `GLASSBOX_ACCEPTANCE_V1 ${marker}\ncontext line\n${command}\n请在回复中包含本轮测试编号 ${marker}。`;
+  const f = fixture([{ status: "completed", text: "No action taken.", toolCalls: [] }]);
+  f.input.text = text;
+  const executor = new PiRunExecutionAdapter(f.runtime, {
+    resolveAcceptanceLease: () => ({
+      leaseId: "lease-1",
+      marker,
+      toolsSha256: "0".repeat(64),
+      assertActive: () => true,
+      filterToolNames: (names) => names.filter((name) => name === OWNER_MEMORY_ADMIN_TOOL),
+      checkToolCall: () => true,
+    }),
+  });
+
+  await expect(executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+  expect(f.input.text).toBe(text);
+  expect(f.run.mock.calls[0]?.[2]).toContain(text);
+  expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBeUndefined();
+  expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toBeUndefined();
+});
+
 it("does not bind an acceptance Memory command to a Tool omitted by the lease", async () => {
   const marker = "00112233445566778899aabbccddeeff";
   const f = fixture([{ status: "completed", text: "No action taken.", toolCalls: [] }]);
-  f.input.text = `GLASSBOX_ACCEPTANCE_V1 ${marker}\n/memory promote candidate_${"a".repeat(32)}`;
+  f.input.text = `GLASSBOX_ACCEPTANCE_V1 ${marker}\n/memory promote candidate_${"a".repeat(32)}\n请在回复中包含本轮测试编号 ${marker}。`;
   f.createOrRestoreSession.mockImplementation(async (_conversation, _profile, context) => {
     if (context) context.authorizedToolNames = [];
     return {

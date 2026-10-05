@@ -199,7 +199,26 @@ function acceptanceMemoryCommandText(
   if (!lineBreak) return undefined;
   const firstLine = text.slice(0, lineBreak.index);
   if (firstLine !== `GLASSBOX_ACCEPTANCE_V1 ${lease.marker}`) return undefined;
-  return text.slice(lineBreak.index + lineBreak[0].length);
+  const body = text.slice(lineBreak.index + lineBreak[0].length);
+  const footerPrefix = "请在回复中包含本轮测试编号 ";
+  const lines = body.split(/\r\n|\n|\r/u);
+  const footerIndexes = lines.flatMap((line, index) =>
+    line.trimStart().startsWith(footerPrefix) ? [index] : [],
+  );
+  if (footerIndexes.length === 0) return body;
+  if (footerIndexes.length !== 1) return undefined;
+  const footerIndex = footerIndexes[0]!;
+  const hasTrailingLineBreak = footerIndex === lines.length - 2 && lines.at(-1) === "";
+  if (
+    (footerIndex !== lines.length - 1 && !hasTrailingLineBreak) ||
+    lines[footerIndex] !== `${footerPrefix}${lease.marker}。`
+  )
+    return undefined;
+  const footerStart = body.lastIndexOf(lines[footerIndex]!);
+  const preceding = body.slice(0, footerStart);
+  const separator = /(?:\r\n|\n|\r)$/u.exec(preceding)?.[0];
+  if (footerStart > 0 && !separator) return undefined;
+  return separator ? preceding.slice(0, -separator.length) : "";
 }
 
 /** Explicitly named Ops calls must be backed by a real Tool result, never model narration. */
