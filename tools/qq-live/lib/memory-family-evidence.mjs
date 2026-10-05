@@ -1,10 +1,10 @@
 import { fail, digest, toolManifestDigest } from "./core.mjs";
 import { memoryFixtureStep } from "./memory-scenario.mjs";
-import { MEMORY_FAMILY_ID } from "./feature-suite.mjs";
+import { MEMORY_FAMILY_ID, MEMORY_REJECT_FAMILY_ID, memoryWorkflow } from "./memory-workflow.mjs";
 
 export const MEMORY_FAMILY_CASE_ID = MEMORY_FAMILY_ID;
+export const MEMORY_REJECT_FAMILY_CASE_ID = MEMORY_REJECT_FAMILY_ID;
 
-const STAGES = ["feedback", "promote", "expire"];
 const RUN_ID = /^[A-Za-z0-9_-]{1,128}$/;
 const NONCE = /^[a-f0-9]{32}$/;
 const HASH = /^[a-f0-9]{64}$/;
@@ -36,7 +36,8 @@ function same(a, b) {
 }
 
 function exactKeys(value, expected) {
-  return record(value) && same(Object.keys(value).sort(), [...expected].sort());
+  const compare = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+  return record(value) && same(Object.keys(value).sort(compare), [...expected].sort(compare));
 }
 
 function validRuntime(runtime) {
@@ -197,42 +198,48 @@ function validateFreshCase(evidence, c, stage, transport, runtime, previousScope
   return { runId, scope };
 }
 
-function validateLifecycle(report, cases, freshCases, runtime) {
+function validateLifecycle(report, cases, freshCases, runtime, workflow) {
   const lifecycle = report.memoryLifecycle;
   const handles = lifecycle?.handles;
   const nonce = handles?.fixtureNonce;
+  const stages = workflow.stages;
+  const finalStage = stages.at(-1);
+  const promoted = stages.includes("promote");
   if (
+    !record(lifecycle) ||
+    !record(handles) ||
     report.mode !== "run" ||
     report.cleanupOnly === true ||
     report.status !== "PASS" ||
     report.productAcceptance?.status !== "PASS" ||
     !record(report.memoryFamily) ||
-    !same(report.memoryFamily, { caseId: MEMORY_FAMILY_CASE_ID }) ||
+    !same(report.memoryFamily, { caseId: workflow.id }) ||
     lifecycle?.status !== "PASS" ||
     lifecycle.requiresReconciliation !== false ||
-    lifecycle.stage !== "expire" ||
-    lifecycle.cleanup?.status !== "expired" ||
+    lifecycle.stage !== finalStage ||
+    lifecycle.cleanup?.status !== workflow.cleanupStatus ||
     !NONCE.test(nonce ?? "") ||
     handles.projectId !== `qqtest-${nonce}` ||
     !RUN_ID.test(handles.principalId ?? "") ||
     !CANDIDATE_ID.test(handles.candidateId ?? "") ||
-    !MEMORY_ID.test(handles.memoryId ?? "") ||
     !RUN_ID.test(handles.creationRunId ?? "") ||
-    !RUN_ID.test(handles.promoteRunId ?? "") ||
     !RUN_ID.test(handles.cleanupRunId ?? "") ||
-    handles.cleanupStatus !== "expired" ||
+    handles.cleanupStatus !== workflow.cleanupStatus ||
     handles.stepRunId !== handles.cleanupRunId ||
     lifecycle.cleanup.runId !== handles.cleanupRunId ||
     !Array.isArray(lifecycle.steps) ||
-    lifecycle.steps.length !== STAGES.length ||
+    lifecycle.steps.length !== stages.length ||
+    (promoted
+      ? !MEMORY_ID.test(handles.memoryId ?? "") || !RUN_ID.test(handles.promoteRunId ?? "")
+      : Object.hasOwn(handles, "memoryId") || Object.hasOwn(handles, "promoteRunId")) ||
     !validRuntime(report.runtime) ||
     !same(report.runtime, runtime)
   )
-    invalid("Report does not contain a complete fixed three-step Memory lifecycle.");
+    invalid("Report does not contain a complete fixed Memory lifecycle.");
 
   const stageRunIds = [];
-  for (let index = 0; index < STAGES.length; index++) {
-    const stage = STAGES[index];
+  for (let index = 0; index < stages.length; index++) {
+    const stage = stages[index];
     const step = lifecycle.steps[index];
     const evidence = freshCases[index];
     if (
@@ -250,60 +257,70 @@ function validateLifecycle(report, cases, freshCases, runtime) {
       invalid(`Memory lifecycle ${stage} snapshot does not match fresh product evidence.`);
     stageRunIds.push(evidence.runId);
   }
-  if (new Set(stageRunIds).size !== STAGES.length)
-    invalid("Memory family lifecycle stages must use three distinct Runs.");
+  if (new Set(stageRunIds).size !== stages.length)
+    invalid("Memory family lifecycle stages must use distinct Runs.");
 
   if (
     handles.creationRunId !== stageRunIds[0] ||
-    handles.promoteRunId !== stageRunIds[1] ||
-    handles.cleanupRunId !== stageRunIds[2]
+    handles.promoteRunId !== (promoted ? stageRunIds[stages.indexOf("promote")] : undefined) ||
+    handles.cleanupRunId !== stageRunIds.at(-1)
   )
-    invalid("Lifecycle resource handles do not match the three verified stage Runs.");
-  return { handles, nonce, stageRunIds };
+    invalid("Lifecycle resource handles do not match the verified stage Runs.");
+  return { handles, nonce, stageRunIds, workflow };
 }
 
 /** Independently verify the fixed Memory family against fresh product evidence and SQL state. */
 export async function verifyMemoryFamilyReport(report, { verifyProduct, readCleanup } = {}) {
   if (typeof verifyProduct !== "function" || typeof readCleanup !== "function")
     invalid("Memory family requires trusted fresh product and read-only cleanup verifiers.");
+  let workflow;
+  try {
+    workflow = memoryWorkflow(report?.memoryFamily?.caseId);
+  } catch {
+    invalid("Report does not identify a supported fixed Memory workflow.");
+  }
   if (
     !record(report) ||
     !Array.isArray(report.cases) ||
-    report.cases.length !== STAGES.length ||
-    report.cases.some((c, index) => c?.id !== `memory-${STAGES[index]}`)
+    report.cases.length !== workflow.stages.length ||
+    report.cases.some((c, index) => c?.id !== `memory-${workflow.stages[index]}`)
   )
-    invalid("Memory family requires exactly the fixed feedback, promote, and expire cases.");
+    invalid("Memory family requires exactly its fixed workflow cases.");
 
   const lifecycle = report.memoryLifecycle;
   const handles = lifecycle?.handles;
   const nonce = handles?.fixtureNonce;
   if (
+    !record(lifecycle) ||
+    !record(handles) ||
     !NONCE.test(nonce ?? "") ||
     handles.projectId !== `qqtest-${nonce}` ||
     !CANDIDATE_ID.test(handles.candidateId ?? "") ||
-    !MEMORY_ID.test(handles.memoryId ?? "")
+    (workflow.stages.includes("promote")
+      ? !MEMORY_ID.test(handles.memoryId ?? "")
+      : Object.hasOwn(handles, "memoryId") || Object.hasOwn(handles, "promoteRunId"))
   )
     invalid("Memory family fixture handles are invalid.");
 
   const transport = report.cases.map((c, index) =>
-    validateTransportCase(c, STAGES[index], nonce, handles),
+    validateTransportCase(c, workflow.stages[index], nonce, handles),
   );
   const product = await verifyProduct(report);
   if (
     product?.status !== "PASS" ||
     !validRuntime(product.runtime) ||
     !Array.isArray(product.cases) ||
-    product.cases.length !== STAGES.length
+    product.cases.length !== workflow.stages.length
   )
-    invalid("Fresh product verification did not pass all three Memory cases.");
+    invalid("Fresh product verification did not pass every fixed Memory stage.");
 
   const freshCases = [];
   let previousScope;
-  for (let index = 0; index < STAGES.length; index++) {
+  for (let index = 0; index < workflow.stages.length; index++) {
     const verified = validateFreshCase(
       product.cases[index],
       report.cases[index],
-      STAGES[index],
+      workflow.stages[index],
       transport[index],
       product.runtime,
       previousScope,
@@ -317,34 +334,41 @@ export async function verifyMemoryFamilyReport(report, { verifyProduct, readClea
     report.cases,
     freshCases,
     product.runtime,
+    workflow,
   );
   const cleanupInput = {
     projectId: verifiedHandles.projectId,
     principalId: verifiedHandles.principalId,
     candidateId: verifiedHandles.candidateId,
-    memoryId: verifiedHandles.memoryId,
     creationRunId: verifiedHandles.creationRunId,
-    promoteRunId: verifiedHandles.promoteRunId,
     cleanupRunId: verifiedHandles.cleanupRunId,
+    ...(workflow.stages.includes("promote")
+      ? {
+          memoryId: verifiedHandles.memoryId,
+          promoteRunId: verifiedHandles.promoteRunId,
+        }
+      : {}),
   };
   const cleanup = await readCleanup({ ...cleanupInput });
   if (
     !record(cleanup) ||
     cleanup.principalKind !== "owner" ||
-    cleanup.status !== "expired" ||
+    cleanup.status !== workflow.cleanupStatus ||
+    (!workflow.stages.includes("promote") &&
+      (Object.hasOwn(cleanup, "memoryId") || Object.hasOwn(cleanup, "promoteRunId"))) ||
     Object.entries(cleanupInput).some(([key, value]) => cleanup[key] !== value)
   )
     invalid("Read-only cleanup evidence does not match the exact Owner fixture lineage.");
 
   return {
     status: "PASS",
-    caseId: MEMORY_FAMILY_CASE_ID,
+    caseId: workflow.id,
     runtime: product.runtime,
     handles: { fixtureNonce: nonce, ...cleanupInput },
     stageRunIds,
     cleanup: {
       principalKind: cleanup.principalKind,
-      status: cleanup.status,
+      status: workflow.cleanupStatus,
       ...cleanupInput,
     },
   };

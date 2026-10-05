@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   MEMORY_FAMILY_ID,
+  MEMORY_REJECT_FAMILY_ID,
   memoryFamilyPlan,
   resolveFeatureSuite,
   validateMemoryFamily,
@@ -61,7 +62,7 @@ test("schema 3 admits one exact Memory family with mixed read cases", () => {
   assert.equal(validateMemoryFamily(memoryCase), memoryCase);
 });
 
-test("schema 3 supports only one exact fixed Memory family and rejects extensions", () => {
+test("schema 3 supports only exact fixed Memory families and rejects extensions", () => {
   const invalidFamilies = [
     { ...memoryFamily(), id: "custom-memory" },
     { ...memoryFamily(), kind: "custom-lifecycle" },
@@ -96,6 +97,41 @@ test("schema 3 supports only one exact fixed Memory family and rejects extension
   assert.throws(() => resolveFeatureSuite({ schemaVersion: 3, cases: [readCase()] }, config), {
     code: "FEATURE_MEMORY_FAMILY",
     status: "BLOCKED",
+  });
+});
+
+test("reject family has an exact two-stage plan and can share a suite with promotion", () => {
+  const reject = {
+    id: MEMORY_REJECT_FAMILY_ID,
+    kind: "memory-lifecycle",
+    workflow: "feedback-reject",
+    chat: "private",
+  };
+  const resolved = resolveFeatureSuite(
+    { schemaVersion: 3, cases: [memoryFamily(), reject, readCase()] },
+    config,
+  );
+  assert.deepEqual(
+    resolved.memoryFamilies.map((c) => c.id),
+    [MEMORY_FAMILY_ID, MEMORY_REJECT_FAMILY_ID],
+  );
+  assert.equal(validateMemoryFamily(reject), reject);
+  const plan = memoryFamilyPlan(MEMORY_REJECT_FAMILY_ID);
+  assert.deepEqual(
+    plan.stages.map((s) => s.stage),
+    ["feedback", "reject"],
+  );
+  assert.ok(plan.stages[1].spec.prompt.includes("{{candidate_id}}"));
+  assert.ok(!plan.stages[1].spec.prompt.includes("{{memory_id}}"));
+  for (const changed of [
+    { ...reject, workflow: "promote-expire" },
+    { ...reject, chat: "A" },
+    { ...reject, stages: ["feedback", "reject"] },
+    { ...reject, id: "memory-project-other" },
+  ])
+    assert.throws(() => validateMemoryFamily(changed), { code: "FEATURE_MEMORY_FAMILY" });
+  assert.throws(() => resolveFeatureSuite({ schemaVersion: 3, cases: [reject, reject] }, config), {
+    code: "FEATURE_CASE",
   });
 });
 

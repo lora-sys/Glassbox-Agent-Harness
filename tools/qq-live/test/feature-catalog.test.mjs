@@ -9,6 +9,7 @@ import {
 } from "../feature-catalog.mjs";
 import { validateReadFeatureSpecs } from "../lib/feature-specs.mjs";
 import { resolveReadFeatureSpecs } from "../lib/feature-specs.mjs";
+import { MEMORY_REJECT_FAMILY_ID } from "../lib/memory-workflow.mjs";
 
 function minimalCatalog(overrides = {}) {
   return {
@@ -45,19 +46,26 @@ const memoryFamily = {
   workflow: "promote-expire",
   chat: "private",
 };
-function memoryCatalog(overrides = {}) {
+const memoryRejectFamily = {
+  id: MEMORY_REJECT_FAMILY_ID,
+  kind: "memory-lifecycle",
+  workflow: "feedback-reject",
+  chat: "private",
+};
+function memoryCatalog(overrides = {}, family = memoryFamily) {
+  const rejection = family.id === MEMORY_REJECT_FAMILY_ID;
   return {
     schemaVersion: 1,
     descriptorBaseline: ["owner_memory_admin"],
     requiredDomains: ["memory_taste"],
     cases: [
       {
-        id: "memory-project-promote-expire",
+        id: family.id,
         domain: "memory_taste",
         executionStatus: "executable",
         executionKind: "memory-lifecycle",
         tools: ["owner_memory_admin"],
-        suiteCaseId: "memory-project-promote-expire",
+        suiteCaseId: family.id,
         assertions: [
           {
             kind: "trace",
@@ -66,12 +74,16 @@ function memoryCatalog(overrides = {}) {
             count: 1,
           },
         ],
-        coveragePlan:
-          "Run the fixed Owner-private project Memory lifecycle with independent cleanup proof.",
+        coveragePlan: rejection
+          ? "Run the fixed Owner-private project feedback and candidate rejection family with independent cleanup proof."
+          : "Run the fixed Owner-private project Memory lifecycle with independent cleanup proof.",
         mutation: "isolated",
-        fixture: "unique qqtest project; Owner private feedback, promotion and cleanup Runs",
-        cleanup:
-          "expire the exact promoted fixture; retain feedback, candidate, Memory and audit history",
+        fixture: rejection
+          ? "unique qqtest project; Owner private feedback and rejection Runs for a pending candidate"
+          : "unique qqtest project; Owner private feedback, promotion and cleanup Runs",
+        cleanup: rejection
+          ? "reject the exact pending candidate; verify rejected state and preserve feedback audit history"
+          : "expire the exact promoted fixture; retain feedback, candidate, Memory and audit history",
       },
     ],
     ...overrides,
@@ -231,6 +243,21 @@ test("fixed Memory family binds only its exact private promote-expire contract",
   assert.deepEqual(result.coveredDomains, ["memory_taste"]);
 });
 
+test("fixed Memory reject family has its own bounded executable catalog case", () => {
+  const result = checkFeatureCoverage({
+    catalog: memoryCatalog({}, memoryRejectFamily),
+    descriptors: memoryDescriptor,
+    executableSuiteCases: [memoryRejectFamily],
+  });
+  assert.equal(result.status, "PASS", JSON.stringify(result.gaps));
+  assert.deepEqual(result.coveredTools, ["owner_memory_admin"]);
+  const catalogCase = FEATURE_CATALOG.cases.find((item) => item.id === MEMORY_REJECT_FAMILY_ID);
+  assert.ok(catalogCase);
+  assert.equal(catalogCase.executionStatus, "executable");
+  assert.equal(catalogCase.executionKind, "memory-lifecycle");
+  assert.equal(catalogCase.mutation, "isolated");
+});
+
 test("Memory family rejects extra fields, changed workflow, and a missing family", () => {
   const invalidFamilies = [
     { ...memoryFamily, extra: true },
@@ -242,6 +269,20 @@ test("Memory family rejects extra fields, changed workflow, and a missing family
       catalog: memoryCatalog(),
       descriptors: memoryDescriptor,
       executableSuiteCases: invalidFamily ? [invalidFamily] : [],
+    });
+    assert.equal(result.status, "BLOCKED");
+    assert.deepEqual(result.coveredTools, []);
+    assert.deepEqual(result.coveredDomains, []);
+  }
+  for (const invalidFamily of [
+    { ...memoryRejectFamily, extra: true },
+    { ...memoryRejectFamily, workflow: "promote-expire" },
+    { ...memoryRejectFamily, chat: "A" },
+  ]) {
+    const result = checkFeatureCoverage({
+      catalog: memoryCatalog({}, invalidFamily),
+      descriptors: memoryDescriptor,
+      executableSuiteCases: [invalidFamily],
     });
     assert.equal(result.status, "BLOCKED");
     assert.deepEqual(result.coveredTools, []);

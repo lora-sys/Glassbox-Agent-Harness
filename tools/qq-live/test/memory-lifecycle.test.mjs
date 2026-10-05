@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { runMemoryLifecycle } from "../lib/memory-lifecycle.mjs";
+import { MEMORY_REJECT_FAMILY_ID } from "../lib/memory-workflow.mjs";
 
 const NONCE = "a".repeat(32);
 const OWNER = "owner-12345";
@@ -116,6 +117,106 @@ function harness(overrides = {}) {
     },
   };
 }
+
+function rejectHarness(overrides = {}) {
+  const runId = "run-reject-2";
+  return harness({
+    familyId: MEMORY_REJECT_FAMILY_ID,
+    executeStep: async (stage) => {
+      const result = accepted(stage, stage === "feedback" ? 0 : 1);
+      if (stage === "reject") {
+        result.productAcceptance.cases[0].runId = runId;
+        result.productAcceptance.cases[0].feature.runId = runId;
+      }
+      return result;
+    },
+    observeStep: async (stage, handles) =>
+      stage === "feedback"
+        ? observation(stage, handles.stepRunId)
+        : {
+            principalKind: "owner",
+            principalId: OWNER,
+            projectId: `qqtest-${NONCE}`,
+            stepRunId: handles.stepRunId,
+            candidateId: CANDIDATE,
+            creationRunId: RUNS[0],
+            cleanupRunId: handles.stepRunId,
+            status: "rejected",
+          },
+    ...overrides,
+  });
+}
+
+test("reject family completes two distinct Runs and retains no promoted Memory handles", async () => {
+  const h = rejectHarness();
+  const result = await runMemoryLifecycle(h.args);
+  assert.equal(result.status, "PASS");
+  assert.deepEqual(
+    result.steps.map((s) => s.stage),
+    ["feedback", "reject"],
+  );
+  assert.deepEqual(
+    result.steps.map((s) => s.runId),
+    [RUNS[0], "run-reject-2"],
+  );
+  assert.deepEqual(result.cleanup, { status: "rejected", runId: "run-reject-2" });
+  assert.equal(Object.hasOwn(result.handles, "memoryId"), false);
+  assert.equal(Object.hasOwn(result.handles, "promoteRunId"), false);
+  assert.deepEqual(
+    h.checkpoints.map((c) => [c.phase, c.stage]),
+    [
+      ["before_send", "feedback"],
+      ["observed", "feedback"],
+      ["before_send", "reject"],
+      ["observed", "reject"],
+    ],
+  );
+});
+
+test("reject family stops on wrong cleanup lineage and does not resend either stage", async () => {
+  for (const changed of [
+    { status: "expired" },
+    { candidateId: `candidate_${"f".repeat(32)}` },
+    { principalId: "other-owner" },
+    { projectId: "qqtest-other" },
+    { creationRunId: "other-run" },
+    { cleanupRunId: "other-run" },
+    { memoryId: MEMORY },
+    { promoteRunId: RUNS[1] },
+  ]) {
+    const h = rejectHarness();
+    const originalObserve = h.args.observeStep;
+    h.args.observeStep = async (stage, handles) => ({
+      ...(await originalObserve(stage, handles)),
+      ...(stage === "reject" ? changed : {}),
+    });
+    const result = await runMemoryLifecycle(h.args);
+    assert.equal(result.status, "INCONCLUSIVE");
+    assert.equal(result.requiresReconciliation, true);
+    assert.equal(result.steps.length, 1);
+    assert.equal(h.checkpoints.filter((c) => c.phase === "before_send").length, 2);
+  }
+});
+
+test("reject send uncertainty retains reconciliation handles without automatic retry", async () => {
+  let sends = 0;
+  const h = rejectHarness();
+  const execute = h.args.executeStep;
+  h.args.executeStep = async (stage, spec) => {
+    sends++;
+    if (stage === "reject") throw Object.assign(new Error("uncertain"), { code: "API_TIMEOUT" });
+    return execute(stage, spec);
+  };
+  const result = await runMemoryLifecycle(h.args);
+  assert.equal(result.status, "INCONCLUSIVE");
+  assert.equal(result.requiresReconciliation, true);
+  assert.equal(result.handles.candidateId, CANDIDATE);
+  assert.equal(result.steps.length, 1);
+  assert.equal(sends, 2);
+  await assert.rejects(runMemoryLifecycle({ ...h.args, familyId: "unknown-family" }), {
+    code: "FEATURE_MEMORY_FAMILY",
+  });
+});
 
 test("runs feedback, promote, and expire with per-step durable checkpoints", async () => {
   const h = harness();

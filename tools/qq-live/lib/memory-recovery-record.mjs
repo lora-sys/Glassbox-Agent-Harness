@@ -2,6 +2,7 @@ import { open } from "node:fs/promises";
 import { posix } from "node:path";
 import { digest, fail, toolManifestDigest } from "./core.mjs";
 import { memoryFixtureProject, memoryFixtureStep } from "./memory-scenario.mjs";
+import { MEMORY_FAMILY_ID, MEMORY_REJECT_FAMILY_ID, memoryWorkflow } from "./memory-workflow.mjs";
 
 const MAX_ROWS = 40;
 const MAX_ROW_BYTES = 1024 * 1024;
@@ -16,7 +17,6 @@ const MESSAGE_ID = /^-?\d{1,20}$/;
 const PROCESS_TICKS = /^[1-9]\d{0,31}$/;
 const BOOT_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
 const PHASES = new Set(["before_send", "lease_intent", "prepared", "sent", "observed"]);
-const STAGES = new Set(["feedback", "promote", "expire"]);
 const SCOPE_KEYS = ["connectionId", "botId", "chatType", "chatId", "senderId", "threadId"];
 const RUNTIME_KEYS = ["checkout", "dataDirectory", "commit", "pid", "connectionId", "threadId"];
 const PROCESS_KEYS = ["pid", "bootId", "startTicks"];
@@ -177,7 +177,17 @@ function validateRuntime(originRuntime, runtime) {
 }
 
 function validateOrigin(origin, { driverQQ, scope, runtime }) {
-  const originKeys = ["runtime", "process", "scope", "driverSha256", "suiteSha256", "startedAt"];
+  const checkpointVersion = origin?.familyId === undefined ? 2 : 3;
+  const workflow = checkpointWorkflow(checkpointVersion, origin?.familyId);
+  const originKeys = [
+    "runtime",
+    "process",
+    "scope",
+    "driverSha256",
+    "suiteSha256",
+    "startedAt",
+    ...(checkpointVersion === 3 ? ["familyId"] : []),
+  ];
   if (!exactKeys(origin, originKeys))
     reject("MEMORY_RECORD_ORIGIN", "The saved acceptance origin is incomplete.");
   validateRuntime(origin.runtime, runtime);
@@ -211,12 +221,24 @@ function validateOrigin(origin, { driverQQ, scope, runtime }) {
     !Number.isFinite(Date.parse(origin.startedAt))
   )
     reject("MEMORY_RECORD_ORIGIN", "The saved Driver or suite identity is invalid.");
+  return workflow;
+}
+
+function checkpointWorkflow(checkpointVersion, familyId) {
+  try {
+    if (checkpointVersion === 2 && familyId === undefined) return memoryWorkflow(MEMORY_FAMILY_ID);
+    if (checkpointVersion === 3 && familyId === MEMORY_REJECT_FAMILY_ID)
+      return memoryWorkflow(MEMORY_REJECT_FAMILY_ID);
+  } catch {
+    // Convert unsupported family metadata into the recovery reader's safe failure shape.
+  }
+  reject("MEMORY_RECORD_WORKFLOW", "Memory checkpoint version or fixed workflow is unsupported.");
 }
 
 function validateRow(row, index, previousHash, originState, input) {
   if (
     !exactKeys(row, [...ROW_KEYS, ...ROW_OPTIONAL_KEYS.filter((key) => Object.hasOwn(row, key))]) ||
-    row.schemaVersion !== 2 ||
+    ![2, 3].includes(row.schemaVersion) ||
     row.sequence !== index + 1 ||
     row.previousSha256 !== previousHash ||
     !SHA256.test(row.checkpointSha256 ?? "")
@@ -226,10 +248,15 @@ function validateRow(row, index, previousHash, originState, input) {
   if (digest(JSON.stringify(unsigned)) !== checkpointSha256)
     reject("MEMORY_RECORD_HASH", "A Memory checkpoint hash does not match its contents.");
 
-  validateOrigin(row.origin, input);
+  const workflow = validateOrigin(row.origin, input);
+  if (row.schemaVersion !== workflow.checkpointVersion)
+    reject("MEMORY_RECORD_WORKFLOW", "Checkpoint row version does not match its fixed workflow.");
   if (!originState.value) originState.value = row.origin;
   else if (!sameJson(originState.value, row.origin))
     reject("MEMORY_RECORD_ORIGIN", "Memory checkpoint origin changed within the journal.");
+  if (originState.workflow && originState.workflow.id !== workflow.id)
+    reject("MEMORY_RECORD_WORKFLOW", "Checkpoint chain changed its fixed Memory workflow.");
+  originState.workflow ??= workflow;
 
   if (
     !SAFE_RUN_ID.test(row.runId ?? "") ||
@@ -240,7 +267,7 @@ function validateRow(row, index, previousHash, originState, input) {
       posix.resolve(originState.reportDirectory) !== posix.resolve(row.reportDirectory)) ||
     !Number.isFinite(Date.parse(row.at)) ||
     !PHASES.has(row.phase) ||
-    !STAGES.has(row.stage)
+    !workflow.stages.includes(row.stage)
   )
     reject(
       "MEMORY_RECORD_BINDING",
@@ -271,21 +298,21 @@ function validateRow(row, index, previousHash, originState, input) {
   if (Object.keys(row.handles).some((key) => !HANDLE_KEYS.includes(key)))
     reject("MEMORY_RECORD_FIXTURE", "Memory checkpoint contains an unsupported handle.");
 
-  validateSteps(row, originState.value);
-  validateStageHandles(row);
+  validateSteps(row, originState.value, workflow);
+  validateStageHandles(row, workflow);
   validatePreparedCase(row);
   validateSentCase(row);
   validateRecoveryAttempt(row, originState, input);
 }
 
-function validateSteps(row, origin) {
-  const stageIndex = ["feedback", "promote", "expire"].indexOf(row.stage);
+function validateSteps(row, origin, workflow) {
+  const stageIndex = workflow.stages.indexOf(row.stage);
   const expectedLength = stageIndex + (row.phase === "observed" ? 1 : 0);
   if (!Array.isArray(row.steps) || row.steps.length !== expectedLength)
     reject("MEMORY_RECORD_STEPS", "Checkpoint progress does not match its stage and phase.");
   for (let index = 0; index < row.steps.length; index++) {
     const step = row.steps[index];
-    const stage = ["feedback", "promote", "expire"][index];
+    const stage = workflow.stages[index];
     const acceptance = step?.productAcceptance;
     if (
       !exactKeys(step, STEP_KEYS) ||
@@ -310,12 +337,15 @@ function validateSteps(row, origin) {
       reject("MEMORY_RECORD_RUN", "Feedback candidate is not bound to its creation Run.");
     if (row.stage === "promote" && row.handles.promoteRunId !== current.currentRunId)
       reject("MEMORY_RECORD_RUN", "Promoted Memory is not bound to its governance Run.");
-    if (row.stage === "expire" && row.handles.cleanupRunId !== current.currentRunId)
-      reject("MEMORY_RECORD_RUN", "Expired Memory is not bound to its cleanup Run.");
+    if (
+      ["expire", "reject"].includes(row.stage) &&
+      row.handles.cleanupRunId !== current.currentRunId
+    )
+      reject("MEMORY_RECORD_RUN", "Memory cleanup is not bound to its exact Run.");
   }
 }
 
-function validateStageHandles(row) {
+function validateStageHandles(row, workflow) {
   const { stage, phase, handles } = row;
   if (!handles || typeof handles !== "object" || Array.isArray(handles))
     reject("MEMORY_RECORD_FIXTURE", "Memory checkpoint handles are missing.");
@@ -337,7 +367,22 @@ function validateStageHandles(row) {
         : handles.memoryId !== undefined || handles.promoteRunId !== undefined)
     )
       reject("MEMORY_RECORD_FIXTURE", "Promote checkpoint has inconsistent resource handles.");
+  } else if (stage === "reject") {
+    if (
+      workflow.id !== MEMORY_REJECT_FAMILY_ID ||
+      !CANDIDATE_ID.test(handles.candidateId ?? "") ||
+      !SAFE_RUN_ID.test(handles.creationRunId ?? "") ||
+      !SAFE_RUN_ID.test(handles.principalId ?? "") ||
+      handles.memoryId !== undefined ||
+      handles.promoteRunId !== undefined ||
+      (phase === "observed"
+        ? !SAFE_RUN_ID.test(handles.cleanupRunId ?? "") || handles.cleanupStatus !== "rejected"
+        : handles.cleanupRunId !== undefined || handles.cleanupStatus !== undefined)
+    )
+      reject("MEMORY_RECORD_FIXTURE", "Reject checkpoint has inconsistent resource handles.");
   } else if (
+    stage !== "expire" ||
+    workflow.id !== MEMORY_FAMILY_ID ||
     !CANDIDATE_ID.test(handles.candidateId ?? "") ||
     !MEMORY_ID.test(handles.memoryId ?? "") ||
     !SAFE_RUN_ID.test(handles.creationRunId ?? "") ||

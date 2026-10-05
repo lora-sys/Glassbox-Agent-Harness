@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import { digest, toolManifestDigest } from "../lib/core.mjs";
 import { memoryFixtureStep } from "../lib/memory-scenario.mjs";
+import { MEMORY_REJECT_FAMILY_ID } from "../lib/memory-workflow.mjs";
 import { observeMemoryRecovery } from "../lib/memory-recovery-observer.mjs";
 
 const nonce = "a".repeat(32);
@@ -30,7 +31,6 @@ const marker = "d".repeat(32);
 const leaseId = "12345678-1234-1234-1234-123456789abc";
 const messageId = "123456";
 const runId = "run_feedback_fixture";
-const statement = `qqtest-${nonce}`;
 const userSubject = JSON.stringify({ kind: "user", id: principalId });
 const projectScope = JSON.stringify({ type: "project", projectId });
 
@@ -691,6 +691,63 @@ test("failed terminal Run with trace and SQL effect needs candidate cleanup", (t
   assert.ok(f.sqlSeen.length > 0);
   const serialized = JSON.stringify(result);
   assert.doesNotMatch(serialized, /explicit_positive|qqtest-[a-f0-9]{32} explicit_positive/);
+});
+
+test("reconcile accepts the fixed schema 3 reject-family guard without changing the SQL target", (t) => {
+  const f = fixture(t);
+  const origin = { ...f.record.origin, familyId: MEMORY_REJECT_FAMILY_ID };
+  const rows = f.record.rows.map((row) => ({ ...row, schemaVersion: 3, origin }));
+  f.record = {
+    ...f.record,
+    origin,
+    rows,
+    pending: rows.at(-1),
+  };
+  const result = observeMemoryRecovery(f.db, {
+    record: f.record,
+    auditEvents: f.auditEvents,
+    eventsByRun: f.eventsByRun,
+  });
+  assert.equal(result.status, "NEEDS_CLEANUP");
+  assert.equal(result.cleanupStage, "reject");
+  assert.equal(result.handles.candidateId, candidateId);
+  assert.equal(result.handles.creationRunId, runId);
+  assert.ok(f.sqlSeen.length > 0);
+});
+
+test("reconcile rejects a schema 3 guard with an unsupported family", (t) => {
+  const f = fixture(t);
+  const origin = { ...f.record.origin, familyId: "memory-project-arbitrary" };
+  const rows = f.record.rows.map((row) => ({ ...row, schemaVersion: 3, origin }));
+  f.record = { ...f.record, origin, rows, pending: rows.at(-1) };
+  const result = observeMemoryRecovery(f.db, {
+    record: f.record,
+    auditEvents: f.auditEvents,
+    eventsByRun: f.eventsByRun,
+  });
+  assert.equal(result.status, "INCONCLUSIVE");
+});
+
+test("reconcile rejects altered pending projections and schema 2 family metadata", (t) => {
+  const f = fixture(t);
+  f.record.pending = { ...f.record.pending, stage: "reject" };
+  let result = observeMemoryRecovery(f.db, {
+    record: f.record,
+    auditEvents: f.auditEvents,
+    eventsByRun: f.eventsByRun,
+  });
+  assert.equal(result.status, "INCONCLUSIVE");
+
+  const second = fixture(t);
+  second.record.origin.familyId = MEMORY_REJECT_FAMILY_ID;
+  for (const row of second.record.rows) row.origin = second.record.origin;
+  second.record.pending = second.record.rows.at(-1);
+  result = observeMemoryRecovery(second.db, {
+    record: second.record,
+    auditEvents: second.auditEvents,
+    eventsByRun: second.eventsByRun,
+  });
+  assert.equal(result.status, "INCONCLUSIVE");
 });
 
 test("missing fixture effect evidence never becomes CLEANED", (t) => {

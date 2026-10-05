@@ -147,7 +147,9 @@ node tools/qq-live/cli.mjs plan --scenarios tools/qq-live/examples/scenarios.exa
 
 ## 结果交给开发 Agent
 
-`examples/feature-memory.example.json` 使用 schemaVersion 3，将既有读取用例和固定的 `memory-project-promote-expire` 用例放在同一套件中。先使用 `plan --scenarios <文件>` 审阅套件，再使用 `run --scenarios <文件> --case memory-project-promote-expire --live --approve-suite <套件哈希>` 执行固定 Memory 流程。必须明确启用 Memory fixture 和审计保留，消息预算至少为 3。每次调用只选择一个用例，读取用例也使用同一份套件哈希。
+`examples/feature-memory.example.json` 使用 schemaVersion 3，将既有读取用例和两个固定 Memory 流程放在同一套件中。先使用 `plan --scenarios <文件>` 审阅套件，再使用 `run --scenarios <文件> --case <用例标识> --live --approve-suite <套件哈希>` 执行。必须明确启用 Memory fixture 和审计保留。`memory-project-promote-expire` 需要三个独立 Run，消息预算至少为 3。`memory-project-feedback-reject` 需要两个独立 Run，消息预算至少为 2。每次调用只选择一个用例，读取用例也使用同一份套件哈希。
+
+拒绝流程必须证明原候选已被拒绝，没有生成 Memory，项目没有活动 Memory 或待处理候选。它的检查点使用版本 3，恢复时保留固定流程身份。拒绝流程目前不能登记为已验证技能经验。完整 Memory 隔离和授权负例仍待实现及实机验收。
 
 该 Memory 用例只允许 Owner 私聊中的固定创建、推广和过期流程。用例不能增加自定义消息、工具、目标或清理脚本。成功报告必须包含三个不同 Run 的独立证据，以及重新读取的 Owner 项目清理状态。交付门禁会重新核对这些证据。此用例不覆盖 Memory 范围隔离、拒绝和授权负例，完整功能目录仍要求这些用例通过。
 

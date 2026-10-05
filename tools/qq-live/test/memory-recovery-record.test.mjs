@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { posix } from "node:path";
 import { digest, toolManifestDigest } from "../lib/core.mjs";
 import { memoryFixtureProject, memoryFixtureStep } from "../lib/memory-scenario.mjs";
+import { MEMORY_REJECT_FAMILY_ID } from "../lib/memory-workflow.mjs";
 import { readMemoryRecoveryRecord } from "../lib/memory-recovery-record.mjs";
 
 const DRIVER = "123456789";
@@ -259,6 +260,69 @@ function attachHash(row) {
   return next;
 }
 
+const REJECT_ORIGIN = { ...ORIGIN, familyId: MEMORY_REJECT_FAMILY_ID };
+
+function rejectHandles(stage, phase) {
+  const handles = { fixtureNonce: NONCE, projectId: memoryFixtureProject(NONCE) };
+  if (stage === "reject" || (stage === "feedback" && phase === "observed")) {
+    Object.assign(handles, {
+      principalId: "principal-owner",
+      creationRunId: "run-create-0001",
+      candidateId: CANDIDATE,
+    });
+  }
+  if (phase === "observed")
+    handles.stepRunId = stage === "feedback" ? "run-create-0001" : "run-reject-0002";
+  if (stage === "reject" && phase === "observed")
+    Object.assign(handles, { cleanupRunId: "run-reject-0002", cleanupStatus: "rejected" });
+  return handles;
+}
+
+function rejectRowAt(sequence, phase, stage, previousSha256 = null, patch = {}) {
+  const handles = rejectHandles(stage, phase);
+  const rowsBefore = stage === "feedback" ? [] : [acceptedStep("feedback", "run-create-0001")];
+  const row = {
+    schemaVersion: 3,
+    origin: structuredClone(REJECT_ORIGIN),
+    sequence,
+    previousSha256,
+    phase,
+    stage,
+    handles,
+    steps:
+      phase === "observed"
+        ? [
+            ...rowsBefore,
+            acceptedStep(stage, stage === "feedback" ? "run-create-0001" : "run-reject-0002"),
+          ]
+        : rowsBefore,
+    ...originalPrepared(stage, phase, handles),
+    ...(phase === "sent"
+      ? {
+          sentCase: {
+            caseId: `memory-${stage}`,
+            driverMessageId: stage === "feedback" ? "9000001" : "9000002",
+            startedAt: "2026-10-06T10:01:00.000Z",
+          },
+        }
+      : {}),
+    at: new Date(Date.parse(ORIGIN.startedAt) + sequence * 1000).toISOString(),
+    runId: RUN_ID,
+    reportDirectory: REPORT_DIRECTORY,
+    ...patch,
+  };
+  row.checkpointSha256 = digest(JSON.stringify(row));
+  return row;
+}
+
+function validRejectRows() {
+  const rows = [];
+  for (const stage of ["feedback", "reject"])
+    for (const phase of ["before_send", "lease_intent", "prepared", "sent", "observed"])
+      rows.push(rejectRowAt(rows.length + 1, phase, stage, rows.at(-1)?.checkpointSha256 ?? null));
+  return rows;
+}
+
 test("reads a valid prepared guard and accepts a service PID change", async () => {
   const rows = validFeedbackRows();
   const pending = rows[2];
@@ -272,6 +336,78 @@ test("reads a valid prepared guard and accepts a service PID change", async () =
     source.reads.map((entry) => entry.maxBytes),
     [1024 * 1024 + 1, 40 * (1024 * 1024 + 1)],
   );
+});
+
+test("reads the fixed schema 3 feedback-reject workflow and preserves interrupted reject state", async (t) => {
+  await t.test("complete two-stage checkpoint", async () => {
+    const rows = validRejectRows();
+    const { result } = await loadRecord(rows.at(-1), rows);
+    assert.equal(result.origin.familyId, MEMORY_REJECT_FAMILY_ID);
+    assert.equal(result.pending.schemaVersion, 3);
+    assert.equal(result.pending.stage, "reject");
+    assert.equal(result.pending.handles.cleanupStatus, "rejected");
+    assert.equal(result.pending.handles.cleanupRunId, "run-reject-0002");
+    assert.equal(result.pending.handles.memoryId, undefined);
+    assert.equal(result.pending.handles.promoteRunId, undefined);
+    assert.deepEqual(
+      result.pending.steps.map((step) => step.stage),
+      ["feedback", "reject"],
+    );
+  });
+  await t.test("sent reject remains recoverable without resending its source steps", async () => {
+    const rows = validRejectRows().slice(0, 9);
+    const interrupted = rows.at(-1);
+    const recovered = recoveryRows([{}, {}, {}, {}], {
+      rows,
+      stage: "reject",
+      handles: recoveryHandles("reject"),
+    });
+    const { result } = await loadRecord(recovered.at(-1), recovered);
+    assert.equal(interrupted.stage, "reject");
+    assert.equal(interrupted.phase, "sent");
+    assert.equal(result.pending.schemaVersion, 3);
+    assert.equal(result.pending.recoveryAttempt.stage, "reject");
+    assert.equal(result.pending.recoveryAttempt.phase, "sent");
+    assert.deepEqual(
+      result.pending.steps.map((step) => step.stage),
+      ["feedback"],
+    );
+  });
+});
+
+test("keeps schema 2 fixed and rejects unknown or cross-workflow checkpoint chains", async (t) => {
+  await t.test("schema 2 cannot claim the reject stage", async () => {
+    const row = rowAt(1, "before_send", "reject");
+    await assert.rejects(loadRecord(row, [row]));
+  });
+  await t.test("schema 2 origin cannot add a family id", async () => {
+    const row = rowAt(1);
+    row.origin.familyId = MEMORY_REJECT_FAMILY_ID;
+    const changed = attachHash(row);
+    await assert.rejects(loadRecord(changed, [changed]));
+  });
+  await t.test("schema 3 rejects an unknown family", async () => {
+    const row = rejectRowAt(1, "before_send", "feedback");
+    row.origin.familyId = "memory-project-arbitrary";
+    const changed = attachHash(row);
+    await assert.rejects(loadRecord(changed, [changed]));
+  });
+  await t.test("schema 3 rejects promote-expire stages", async () => {
+    const row = rejectRowAt(1, "before_send", "promote");
+    const changed = attachHash(row);
+    await assert.rejects(loadRecord(changed, [changed]));
+  });
+  await t.test("schema 2 and schema 3 cannot share one journal chain", async () => {
+    const first = rowAt(1);
+    const second = rejectRowAt(2, "before_send", "feedback", first.checkpointSha256);
+    await assert.rejects(loadRecord(second, [first, second]));
+  });
+  await t.test("schema 3 rejects a schema 2 row with the reject origin", async () => {
+    const row = rowAt(1);
+    row.origin = structuredClone(REJECT_ORIGIN);
+    const changed = attachHash(row);
+    await assert.rejects(loadRecord(changed, [changed]));
+  });
 });
 
 test("returns a validated journal tail beyond the pending guard without dropping its marker", async () => {

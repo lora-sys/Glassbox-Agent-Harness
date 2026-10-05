@@ -13,6 +13,7 @@ import { runtimeSnapshot, verifyProductEvidence } from "./lib/product-evidence.m
 import { acceptanceManagement } from "./lib/management-client.mjs";
 import { runMemoryRecoveryCli } from "./lib/memory-recovery-cli.mjs";
 import { resolveFeatureSuite, memoryFamilyPlan } from "./lib/feature-suite.mjs";
+import { MEMORY_FAMILY_ID, memoryWorkflow } from "./lib/memory-workflow.mjs";
 
 const root = dirname(fileURLToPath(import.meta.url));
 const help = `QQ 实机测试器 0.1.0
@@ -283,7 +284,9 @@ async function main() {
         config.memoryFixtures?.retainAuditConfirmed !== true
       )
         fail("MEMORY_FIXTURE_DISABLED", "请明确启用固定记忆测试并确认保留审计。");
-      if (config.maxMessages < 3) fail("MESSAGE_BUDGET", "固定记忆流程需要三条消息的预算。");
+      const requiredMessages = memoryWorkflow(memoryFamilyCase.id).stages.length;
+      if (config.maxMessages < requiredMessages)
+        fail("MESSAGE_BUDGET", `固定记忆流程需要 ${requiredMessages} 条消息的预算。`);
     }
   }
   if (command === "plan") {
@@ -293,9 +296,15 @@ async function main() {
         {
           suiteSha256: suiteHash,
           cases: plannedSuiteCases ?? specs,
-          ...(plannedSuiteCases?.some((c) => c.kind === "memory-lifecycle")
-            ? { memoryPlan: memoryFamilyPlan() }
-            : {}),
+          ...(() => {
+            const families = plannedSuiteCases?.filter((c) => c.kind === "memory-lifecycle") ?? [];
+            if (families.length === 1) return { memoryPlan: memoryFamilyPlan(families[0].id) };
+            if (families.length > 1)
+              return {
+                memoryPlans: families.map((c) => ({ caseId: c.id, plan: memoryFamilyPlan(c.id) })),
+              };
+            return {};
+          })(),
           note: "这是待发送的消息，不是执行结果。sideEffect 声明不能代替代码授权检查。",
         },
         null,
@@ -404,6 +413,7 @@ async function main() {
       await moderationCase(config, clients, recorder, controller.signal);
       report.status = recorder.finalize();
     } else if (memoryLifecycle) {
+      const memoryContract = memoryWorkflow(memoryFamilyCase?.id ?? MEMORY_FAMILY_ID);
       const { runMemoryLifecycle } = await import("./lib/memory-lifecycle.mjs");
       const { discoverFeedbackCandidate, discoverPromotedMemory, verifyMemoryCleanup } =
         await import("./lib/memory-fixture.mjs");
@@ -411,6 +421,7 @@ async function main() {
       const { writeMemoryCheckpoint } = await import("./lib/memory-checkpoint.mjs");
       const { captureMemoryProcess } = await import("./lib/memory-process.mjs");
       const memoryOrigin = {
+        ...(memoryContract.checkpointVersion === 3 ? { familyId: memoryContract.id } : {}),
         runtime: report.runtime,
         process: await captureMemoryProcess(),
         scope: {
@@ -430,7 +441,7 @@ async function main() {
       let memoryCheckpointSha256 = null;
       const checkpointMemory = async (state) => {
         const row = {
-          schemaVersion: 2,
+          schemaVersion: memoryContract.checkpointVersion,
           origin: memoryOrigin,
           sequence: memoryCheckpointSequence + 1,
           previousSha256: memoryCheckpointSha256,
@@ -492,6 +503,7 @@ async function main() {
         });
       };
       report.memoryLifecycle = await runMemoryLifecycle({
+        familyId: memoryContract.id,
         fixtureNonce: randomUUID().replaceAll("-", ""),
         signal: controller.signal,
         checkpoint: checkpointMemory,
@@ -561,7 +573,7 @@ async function main() {
         },
       });
       report.status = report.memoryLifecycle.status;
-      report.plannedCaseCount = 3;
+      report.plannedCaseCount = memoryContract.stages.length;
       report.executedCaseCount = recorder.cases.length;
     } else {
       if (specs.length > config.maxMessages) fail("MESSAGE_BUDGET", "用例数超过本轮消息预算。");

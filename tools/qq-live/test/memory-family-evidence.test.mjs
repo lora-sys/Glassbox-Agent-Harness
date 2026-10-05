@@ -2,7 +2,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { digest, toolManifestDigest } from "../lib/core.mjs";
 import { memoryFixtureStep } from "../lib/memory-scenario.mjs";
-import { MEMORY_FAMILY_CASE_ID, verifyMemoryFamilyReport } from "../lib/memory-family-evidence.mjs";
+import {
+  MEMORY_FAMILY_CASE_ID,
+  MEMORY_REJECT_FAMILY_CASE_ID,
+  verifyMemoryFamilyReport,
+} from "../lib/memory-family-evidence.mjs";
+import { memoryWorkflow } from "../lib/memory-workflow.mjs";
 
 const nonce = "a".repeat(32);
 const principalId = "owner_fixture";
@@ -34,7 +39,7 @@ const scopeKey = JSON.stringify([
   scope.threadId,
 ]);
 
-function expectedCase(stage, index) {
+function expectedCase(stage, index, stageRunIds = runIds) {
   const token = String(index + 1).repeat(32);
   const spec = memoryFixtureStep(stage, { nonce, candidateId, memoryId });
   const replace = (value) => JSON.parse(JSON.stringify(value).replaceAll("{{nonce}}", token));
@@ -80,7 +85,7 @@ function expectedCase(stage, index) {
   };
   const productCase = {
     caseId: spec.id,
-    runId: runIds[index],
+    runId: stageRunIds[index],
     scope: caseScope,
     delivery: {
       id: `delivery-${index + 1}`,
@@ -104,7 +109,7 @@ function expectedCase(stage, index) {
     traceVerified: true,
     feature: {
       status: "PASS",
-      runId: runIds[index],
+      runId: stageRunIds[index],
       observations: spec.featureAssertions.map((assertion) => ({
         kind: "trace",
         type: assertion.type,
@@ -115,26 +120,33 @@ function expectedCase(stage, index) {
   return { caseReport, productCase };
 }
 
-function fixture() {
+function fixture(familyId = MEMORY_FAMILY_CASE_ID) {
+  const workflow = memoryWorkflow(familyId);
   const reportRuntime = structuredClone(runtime);
   const productRuntime = structuredClone(runtime);
-  const pairs = ["feedback", "promote", "expire"].map(expectedCase);
-  const handles = {
-    fixtureNonce: nonce,
+  const stageRunIds = familyId === MEMORY_FAMILY_CASE_ID ? runIds : ["run_feedback", "run_reject"];
+  const promoted = workflow.stages.includes("promote");
+  const cleanupInput = {
     projectId: `qqtest-${nonce}`,
     principalId,
     candidateId,
-    memoryId,
-    creationRunId: runIds[0],
-    promoteRunId: runIds[1],
-    cleanupRunId: runIds[2],
-    cleanupStatus: "expired",
-    stepRunId: runIds[2],
+    creationRunId: stageRunIds[0],
+    cleanupRunId: stageRunIds.at(-1),
+    ...(promoted
+      ? { memoryId, promoteRunId: stageRunIds[workflow.stages.indexOf("promote")] }
+      : {}),
   };
-  const steps = ["feedback", "promote", "expire"].map((stage, index) => ({
+  const pairs = workflow.stages.map((stage, index) => expectedCase(stage, index, stageRunIds));
+  const handles = {
+    fixtureNonce: nonce,
+    ...cleanupInput,
+    cleanupStatus: workflow.cleanupStatus,
+    stepRunId: stageRunIds.at(-1),
+  };
+  const steps = workflow.stages.map((stage, index) => ({
     stage,
-    currentRunId: runIds[index],
-    runId: runIds[index],
+    currentRunId: stageRunIds[index],
+    runId: stageRunIds[index],
     productAcceptance: {
       status: "PASS",
       runtime: structuredClone(reportRuntime),
@@ -148,15 +160,15 @@ function fixture() {
     status: "PASS",
     runtime: reportRuntime,
     productAcceptance: { status: "PASS" },
-    memoryFamily: { caseId: MEMORY_FAMILY_CASE_ID },
+    memoryFamily: { caseId: familyId },
     cases: pairs.map((pair) => pair.caseReport),
     memoryLifecycle: {
       status: "PASS",
-      stage: "expire",
+      stage: workflow.stages.at(-1),
       requiresReconciliation: false,
       handles,
       steps,
-      cleanup: { status: "expired", runId: runIds[2] },
+      cleanup: { status: workflow.cleanupStatus, runId: stageRunIds.at(-1) },
     },
   };
   const product = {
@@ -164,23 +176,15 @@ function fixture() {
     runtime: productRuntime,
     cases: pairs.map((pair) => pair.productCase),
   };
-  const cleanup = { principalKind: "owner", status: "expired", ...handles };
-  return { report, product, cleanup };
+  const cleanup = { principalKind: "owner", status: workflow.cleanupStatus, ...cleanupInput };
+  return { report, product, cleanup, cleanupInput, stageRunIds, workflow };
 }
 
 function verifiers(f) {
   return {
     verifyProduct: async () => structuredClone(f.product),
     readCleanup: async (handles) => {
-      assert.deepEqual(handles, {
-        projectId: `qqtest-${nonce}`,
-        principalId,
-        candidateId,
-        memoryId,
-        creationRunId: runIds[0],
-        promoteRunId: runIds[1],
-        cleanupRunId: runIds[2],
-      });
+      assert.deepEqual(handles, f.cleanupInput);
       return structuredClone(f.cleanup);
     },
   };
@@ -223,6 +227,28 @@ test("verifies a fixed three-step Memory family against fresh product and cleanu
       cleanupRunId: runIds[2],
     },
   });
+});
+
+test("verifies the fixed feedback-reject family with rejected cleanup and no promotion handles", async () => {
+  const f = fixture(MEMORY_REJECT_FAMILY_CASE_ID);
+  const result = await verifyMemoryFamilyReport(f.report, verifiers(f));
+  assert.deepEqual(result, {
+    status: "PASS",
+    caseId: MEMORY_REJECT_FAMILY_CASE_ID,
+    runtime,
+    handles: {
+      fixtureNonce: nonce,
+      ...f.cleanupInput,
+    },
+    stageRunIds: f.stageRunIds,
+    cleanup: {
+      principalKind: "owner",
+      status: "rejected",
+      ...f.cleanupInput,
+    },
+  });
+  assert.equal(Object.hasOwn(result.handles, "memoryId"), false);
+  assert.equal(Object.hasOwn(result.handles, "promoteRunId"), false);
 });
 
 test("rejects cleanup-only or incomplete lifecycle reports", async () => {
@@ -289,4 +315,40 @@ test("rejects unknown cleanup state and cross-resource cleanup rows", async () =
   const g = fixture();
   g.cleanup.memoryId = `memory_${"e".repeat(32)}`;
   await rejected(g);
+});
+
+test("reject family rejects an unknown workflow, wrong stages, and reused Runs", async () => {
+  const unknown = fixture(MEMORY_REJECT_FAMILY_CASE_ID);
+  unknown.report.memoryFamily.caseId = "custom-memory-family";
+  await rejected(unknown);
+  const wrongStage = fixture(MEMORY_REJECT_FAMILY_CASE_ID);
+  wrongStage.report.cases[1].id = "memory-promote";
+  await rejected(wrongStage);
+  const reusedRun = fixture(MEMORY_REJECT_FAMILY_CASE_ID);
+  reusedRun.product.cases[1].runId = reusedRun.product.cases[0].runId;
+  await rejected(reusedRun);
+});
+
+test("reject family requires exact Owner candidate lineage, rejected status, and callbacks", async () => {
+  for (const mutate of [
+    (f) => (f.cleanup.candidateId = `candidate_${"e".repeat(32)}`),
+    (f) => (f.cleanup.principalKind = "visitor"),
+    (f) => (f.cleanup.status = "expired"),
+    (f) => (f.cleanup.memoryId = memoryId),
+    (f) => (f.cleanup.promoteRunId = "run_promote"),
+    (f) => (f.report.memoryLifecycle.handles.memoryId = memoryId),
+    (f) => (f.report.memoryLifecycle.handles.promoteRunId = "run_promote"),
+  ]) {
+    const f = fixture(MEMORY_REJECT_FAMILY_CASE_ID);
+    mutate(f);
+    await rejected(f);
+  }
+  const f = fixture(MEMORY_REJECT_FAMILY_CASE_ID);
+  await assert.rejects(
+    verifyMemoryFamilyReport(f.report, { verifyProduct: async () => f.product }),
+    {
+      code: "MEMORY_FAMILY_EVIDENCE",
+      status: "INCONCLUSIVE",
+    },
+  );
 });

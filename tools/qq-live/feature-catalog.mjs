@@ -2,7 +2,12 @@ import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
-import { MEMORY_FAMILY_ID, validateMemoryFamily } from "./lib/feature-suite.mjs";
+import { validateMemoryFamily } from "./lib/feature-suite.mjs";
+import {
+  MEMORY_FAMILY_ID,
+  MEMORY_REJECT_FAMILY_ID,
+  memoryWorkflow,
+} from "./lib/memory-workflow.mjs";
 import { validateReadFeatureSpecs } from "./lib/feature-specs.mjs";
 import { validateFeatureAssertions } from "./lib/feature-observer.mjs";
 
@@ -14,6 +19,10 @@ const MEMORY_FAMILY_FIXTURE =
   "unique qqtest project; Owner private feedback, promotion and cleanup Runs";
 const MEMORY_FAMILY_CLEANUP =
   "expire the exact promoted fixture; retain feedback, candidate, Memory and audit history";
+const MEMORY_REJECT_FAMILY_FIXTURE =
+  "unique qqtest project; Owner private feedback and rejection Runs for a pending candidate";
+const MEMORY_REJECT_FAMILY_CLEANUP =
+  "reject the exact pending candidate; verify rejected state and preserve feedback audit history";
 const MEMORY_FAMILY_ASSERTIONS = [
   {
     kind: "trace",
@@ -200,6 +209,20 @@ export const FEATURE_CATALOG = Object.freeze({
       mutation: "isolated",
       fixture: MEMORY_FAMILY_FIXTURE,
       cleanup: MEMORY_FAMILY_CLEANUP,
+    },
+    {
+      id: MEMORY_REJECT_FAMILY_ID,
+      domain: "memory_taste",
+      executionStatus: "executable",
+      executionKind: "memory-lifecycle",
+      tools: ["owner_memory_admin"],
+      suiteCaseId: MEMORY_REJECT_FAMILY_ID,
+      assertions: MEMORY_FAMILY_ASSERTIONS,
+      coveragePlan:
+        "Run the fixed Owner-private project feedback and candidate rejection family with an isolated qqtest project and independent cleanup proof.",
+      mutation: "isolated",
+      fixture: MEMORY_REJECT_FAMILY_FIXTURE,
+      cleanup: MEMORY_REJECT_FAMILY_CLEANUP,
     },
     {
       id: "history-search-current-group",
@@ -665,8 +688,19 @@ function stableJson(value) {
 }
 
 function bindMemoryFamily(testCase, suiteCases, gaps) {
-  const matches = suiteCases.filter((suiteCase) => suiteCase?.id === MEMORY_FAMILY_ID);
-  if (matches.length !== 1 || testCase.suiteCaseId !== MEMORY_FAMILY_ID) {
+  let workflow;
+  try {
+    workflow = memoryWorkflow(testCase.suiteCaseId);
+  } catch {
+    gaps.push({
+      code: "SUITE_CASE_NOT_AVAILABLE",
+      caseId: testCase.id,
+      suiteCaseId: testCase.suiteCaseId,
+    });
+    return false;
+  }
+  const matches = suiteCases.filter((suiteCase) => suiteCase?.id === workflow.id);
+  if (matches.length !== 1 || testCase.suiteCaseId !== workflow.id) {
     gaps.push({
       code: matches.length > 1 ? "SUITE_CASE_AMBIGUOUS" : "SUITE_CASE_NOT_AVAILABLE",
       caseId: testCase.id,
@@ -688,12 +722,14 @@ function bindMemoryFamily(testCase, suiteCases, gaps) {
   }
 
   if (
-    testCase.id !== MEMORY_FAMILY_ID ||
+    testCase.id !== workflow.id ||
     testCase.domain !== "memory_taste" ||
     stableJson(testCase.tools) !== stableJson(["owner_memory_admin"]) ||
     testCase.mutation !== "isolated" ||
-    testCase.fixture !== MEMORY_FAMILY_FIXTURE ||
-    testCase.cleanup !== MEMORY_FAMILY_CLEANUP ||
+    testCase.fixture !==
+      (workflow.id === MEMORY_FAMILY_ID ? MEMORY_FAMILY_FIXTURE : MEMORY_REJECT_FAMILY_FIXTURE) ||
+    testCase.cleanup !==
+      (workflow.id === MEMORY_FAMILY_ID ? MEMORY_FAMILY_CLEANUP : MEMORY_REJECT_FAMILY_CLEANUP) ||
     stableJson(testCase.assertions) !== stableJson(MEMORY_FAMILY_ASSERTIONS) ||
     typeof testCase.coveragePlan !== "string" ||
     !testCase.coveragePlan.trim() ||

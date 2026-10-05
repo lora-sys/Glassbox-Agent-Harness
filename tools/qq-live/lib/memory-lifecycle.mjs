@@ -1,7 +1,7 @@
 import { fail, safeError } from "./core.mjs";
 import { memoryFixtureProject, memoryFixtureStep } from "./memory-scenario.mjs";
+import { MEMORY_FAMILY_ID, memoryWorkflow } from "./memory-workflow.mjs";
 
-const STAGES = ["feedback", "promote", "expire"];
 const ID = /^[A-Za-z0-9_-]{1,128}$/;
 const CANDIDATE_ID = /^candidate_[a-f0-9]{32}$/;
 const MEMORY_ID = /^memory_[a-f0-9]{32}$/;
@@ -102,12 +102,14 @@ function stopped(stage, handles, steps, code, message, status = "INCONCLUSIVE") 
 
 /** Execute the fixed feedback → promote → expire acceptance lifecycle once. */
 export async function runMemoryLifecycle({
+  familyId = MEMORY_FAMILY_ID,
   fixtureNonce,
   executeStep,
   observeStep,
   checkpoint,
   signal,
 }) {
+  const contract = memoryWorkflow(familyId);
   let projectId;
   try {
     projectId = memoryFixtureProject(fixtureNonce);
@@ -136,7 +138,7 @@ export async function runMemoryLifecycle({
   const handles = { fixtureNonce, projectId };
   const steps = [];
   let runtimeSnapshot;
-  for (const stage of STAGES) {
+  for (const stage of contract.stages) {
     if (signal?.aborted)
       return stopped(
         stage,
@@ -250,16 +252,18 @@ export async function runMemoryLifecycle({
         Object.assign(handles, { promoteRunId: verified.runId, memoryId: observation.memoryId });
       } else {
         if (
-          observation.status !== "expired" ||
+          observation.status !== contract.cleanupStatus ||
           observation.creationRunId !== handles.creationRunId ||
           observation.promoteRunId !== handles.promoteRunId ||
           observation.cleanupRunId !== verified.runId ||
           observation.candidateId !== handles.candidateId ||
-          observation.memoryId !== handles.memoryId
+          observation.memoryId !== handles.memoryId ||
+          (stage === "reject" &&
+            (observation.memoryId !== undefined || observation.promoteRunId !== undefined))
         )
           fail(
             "MEMORY_LIFECYCLE_CLEANUP",
-            "Cleanup observation does not prove this fixture expired.",
+            "Cleanup observation does not prove the fixed fixture reached its required terminal state.",
             "INCONCLUSIVE",
           );
         handles.cleanupRunId = verified.runId;
@@ -293,10 +297,10 @@ export async function runMemoryLifecycle({
 
   return {
     status: "PASS",
-    stage: "expire",
+    stage: contract.stages.at(-1),
     handles: clone(handles),
     steps: clone(steps),
     requiresReconciliation: false,
-    cleanup: { status: "expired", runId: handles.cleanupRunId },
+    cleanup: { status: contract.cleanupStatus, runId: handles.cleanupRunId },
   };
 }

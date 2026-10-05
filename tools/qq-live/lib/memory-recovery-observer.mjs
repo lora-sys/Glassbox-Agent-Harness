@@ -5,6 +5,7 @@ import {
   discoverPromotedMemory,
   verifyMemoryCleanup,
 } from "./memory-fixture.mjs";
+import { MEMORY_FAMILY_ID, memoryWorkflow } from "./memory-workflow.mjs";
 
 const ID = /^[A-Za-z0-9_-]{1,128}$/;
 const MARKER = /^[a-f0-9]{32}$/;
@@ -85,6 +86,21 @@ function checkpointRows(record) {
       row.sequence <= record.confirmedSequence,
   );
   const pending = record.pending;
+  let workflow;
+  try {
+    workflow = memoryWorkflow(record.origin?.familyId ?? MEMORY_FAMILY_ID);
+  } catch {
+    fail("MEMORY_RECOVERY_WORKFLOW", "Recovery checkpoint family is unsupported.", "INCONCLUSIVE");
+  }
+  if (
+    (workflow.checkpointVersion === 2 && Object.hasOwn(record.origin ?? {}, "familyId")) ||
+    (workflow.checkpointVersion === 3 && record.origin?.familyId !== workflow.id)
+  )
+    fail(
+      "MEMORY_RECOVERY_WORKFLOW",
+      "Recovery checkpoint family metadata is inconsistent.",
+      "INCONCLUSIVE",
+    );
   if (
     pending.runId !== record.runId ||
     pending.reportDirectory !== record.reportDirectory ||
@@ -93,15 +109,21 @@ function checkpointRows(record) {
       (row) =>
         row.runId !== record.runId ||
         row.reportDirectory !== record.reportDirectory ||
+        !workflow.stages.includes(row.stage) ||
+        row.schemaVersion !== workflow.checkpointVersion ||
+        (workflow.checkpointVersion === 3 && row.recoveryAttempt?.stage === "expire") ||
         !equalJson(row.origin, record.origin),
     ) ||
-    pending.schemaVersion !== 2 ||
+    !workflow.stages.includes(pending.stage) ||
+    pending.schemaVersion !== workflow.checkpointVersion ||
     !Number.isSafeInteger(pending.sequence) ||
     pending.sequence > record.confirmedSequence ||
     !HASH.test(pending.checkpointSha256 ?? "") ||
     !rows.some(
       (row) =>
-        row.sequence === pending.sequence && row.checkpointSha256 === pending.checkpointSha256,
+        row.sequence === pending.sequence &&
+        row.checkpointSha256 === pending.checkpointSha256 &&
+        equalJson(row, pending),
     )
   )
     fail(
@@ -932,7 +954,7 @@ export function observeMemoryRecovery(db, { record, auditEvents, eventsByRun } =
           "Rejected candidate has no verified reject tool call.",
           "INCONCLUSIVE",
         );
-      const cleanup = verifyMemoryCleanup(db, {
+      verifyMemoryCleanup(db, {
         candidateId: knownCandidateId,
         creationRunId,
         cleanupRunId,

@@ -2,6 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { evaluateDeliveryGate } from "../lib/delivery-gate.mjs";
 import { digest, toolManifestDigest } from "../lib/core.mjs";
+import {
+  MEMORY_FAMILY_ID,
+  MEMORY_REJECT_FAMILY_ID,
+  memoryWorkflow,
+} from "../lib/memory-workflow.mjs";
 const commit = "a".repeat(40),
   suiteText = JSON.stringify({
     schemaVersion: 2,
@@ -108,17 +113,18 @@ function fixture() {
   return { input, dependencies };
 }
 
-function memoryFixture() {
+function memoryFixture(familyId = MEMORY_FAMILY_ID) {
+  const workflow = memoryWorkflow(familyId);
   const family = {
-    id: "memory-project-promote-expire",
+    id: familyId,
     kind: "memory-lifecycle",
-    workflow: "promote-expire",
-    chat: "private",
+    workflow: workflow.workflow,
+    chat: workflow.chat,
   };
   const suiteText = JSON.stringify({ schemaVersion: 3, cases: [family] });
   const suiteSha256 = digest(suiteText);
-  const runIds = ["run-feedback", "run-promote", "run-expire"];
-  const caseIds = ["feedback-step", "promote-step", "expire-step"];
+  const runIds = workflow.stages.map((stage) => `run-${stage}`);
+  const caseIds = workflow.stages.map((stage) => `memory-${stage}`);
   const report = {
     status: "PASS",
     mode: "run",
@@ -158,8 +164,8 @@ function memoryFixture() {
       caseId: family.id,
       runtime,
       stageRunIds: runIds,
-      cleanup: { status: "expired" },
-      handles: { cleanupRunId: runIds[2] },
+      cleanup: { status: workflow.cleanupStatus },
+      handles: { cleanupRunId: runIds.at(-1) },
     }),
     readRemote: async () => ({
       headCommit: commit,
@@ -330,6 +336,53 @@ test("Memory family gate requires an independent verifier and accepts exact life
     { code: "MEMORY_FAMILY_GATE" },
   );
   assert.equal((await evaluateDeliveryGate(input, dependencies)).status, "PASS");
+});
+
+test("Memory feedback-reject family accepts only two unique Runs and rejected cleanup", async () => {
+  const { input, dependencies } = memoryFixture(MEMORY_REJECT_FAMILY_ID);
+  assert.equal((await evaluateDeliveryGate(input, dependencies)).status, "PASS");
+
+  const wrongFamily = memoryFixture(MEMORY_REJECT_FAMILY_ID);
+  wrongFamily.input.reports[0].memoryFamily.caseId = MEMORY_FAMILY_ID;
+  await assert.rejects(evaluateDeliveryGate(wrongFamily.input, wrongFamily.dependencies), {
+    code: "MEMORY_FAMILY_GATE",
+  });
+
+  const wrongCleanup = memoryFixture(MEMORY_REJECT_FAMILY_ID);
+  wrongCleanup.dependencies.verifyMemoryReport = async () => ({
+    status: "PASS",
+    caseId: MEMORY_REJECT_FAMILY_ID,
+    runtime: { commit, checkout: "/acceptance/repo", dataDirectory: "/acceptance/data" },
+    stageRunIds: ["run-feedback", "run-reject"],
+    cleanup: { status: "expired" },
+    handles: { cleanupRunId: "run-reject" },
+  });
+  await assert.rejects(evaluateDeliveryGate(wrongCleanup.input, wrongCleanup.dependencies), {
+    code: "MEMORY_FAMILY_GATE",
+  });
+
+  const reusedRun = memoryFixture(MEMORY_REJECT_FAMILY_ID);
+  reusedRun.dependencies.verifyReport = async () => ({
+    status: "PASS",
+    runtime: { commit, checkout: "/acceptance/repo", dataDirectory: "/acceptance/data" },
+    cases: [
+      {
+        caseId: "memory-feedback",
+        runId: "run-feedback",
+        traceVerified: true,
+        feature: { status: "PASS" },
+      },
+      {
+        caseId: "memory-reject",
+        runId: "run-feedback",
+        traceVerified: true,
+        feature: { status: "PASS" },
+      },
+    ],
+  });
+  await assert.rejects(evaluateDeliveryGate(reusedRun.input, reusedRun.dependencies), {
+    code: "MEMORY_FAMILY_GATE",
+  });
 });
 
 test("Memory family gate rejects duplicate families and mismatched stage Runs", async () => {

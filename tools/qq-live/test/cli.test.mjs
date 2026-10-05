@@ -278,6 +278,90 @@ test("schema 3 Memory family hashes original suite bytes and plans without netwo
   );
 });
 
+test("schema 3 plans both fixed Memory families with original suite approval", async (t) => {
+  const d = await dir(t);
+  const configPath = join(d, "c.json");
+  const suitePath = join(d, "families.json");
+  const suiteText = JSON.stringify({
+    schemaVersion: 3,
+    cases: [
+      {
+        id: "memory-project-promote-expire",
+        kind: "memory-lifecycle",
+        workflow: "promote-expire",
+        chat: "private",
+      },
+      {
+        id: "memory-project-feedback-reject",
+        kind: "memory-lifecycle",
+        workflow: "feedback-reject",
+        chat: "private",
+      },
+    ],
+  });
+  await writeFile(configPath, JSON.stringify(baseConfig()));
+  await writeFile(suitePath, suiteText);
+  const result = await run(["plan", "--config", configPath, "--scenarios", suitePath], d);
+  assert.equal(result.code, 0, result.stderr);
+  const plan = JSON.parse(result.stdout);
+  assert.equal(plan.suiteSha256, digest(suiteText));
+  assert.deepEqual(
+    plan.memoryPlans.map(({ plan }) => plan.stages.map(({ stage }) => stage)),
+    [
+      ["feedback", "promote", "expire"],
+      ["feedback", "reject"],
+    ],
+  );
+});
+
+test("schema 3 reject family blocks a one-message budget before network", async (t) => {
+  const d = await dir(t);
+  const configPath = join(d, "c.json");
+  const suitePath = join(d, "reject.json");
+  const suiteText = JSON.stringify({
+    schemaVersion: 3,
+    cases: [
+      {
+        id: "memory-project-feedback-reject",
+        kind: "memory-lifecycle",
+        workflow: "feedback-reject",
+        chat: "private",
+      },
+    ],
+  });
+  await writeFile(
+    configPath,
+    JSON.stringify({
+      ...baseConfig(),
+      runtime: {},
+      maxMessages: 1,
+      memoryFixtures: { enabled: true, retainAuditConfirmed: true },
+    }),
+  );
+  await writeFile(suitePath, suiteText);
+  const out = join(d, "out");
+  const result = await run(
+    [
+      "run",
+      "--live",
+      "--config",
+      configPath,
+      "--scenarios",
+      suitePath,
+      "--case",
+      "memory-project-feedback-reject",
+      "--approve-suite",
+      digest(suiteText),
+      "--out",
+      out,
+    ],
+    d,
+  );
+  assert.equal(result.code, 2);
+  assert.match(result.stderr + result.stdout, /MESSAGE_BUDGET/);
+  await assert.rejects(stat(out), { code: "ENOENT" });
+});
+
 test("schema 3 Memory run rejects missing case, approval, fixture enablement and message budget before network", async (t) => {
   const d = await dir(t);
   const configPath = join(d, "c.json");

@@ -118,7 +118,10 @@
         {
           "kind": "trace",
           "type": "tool_result",
-          "where": { "name": "qq_group_members", "isError": false },
+          "where": {
+            "name": "qq_group_members",
+            "isError": false
+          },
           "count": 1
         },
         {
@@ -255,6 +258,12 @@
       "id": "memory-project-promote-expire",
       "kind": "memory-lifecycle",
       "workflow": "promote-expire",
+      "chat": "private"
+    },
+    {
+      "id": "memory-project-feedback-reject",
+      "kind": "memory-lifecycle",
+      "workflow": "feedback-reject",
       "chat": "private"
     }
   ]

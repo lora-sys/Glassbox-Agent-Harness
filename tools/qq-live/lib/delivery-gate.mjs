@@ -2,6 +2,7 @@ import { fail, digest, toolManifestDigest } from "./core.mjs";
 import { validateFeatureAssertions } from "./feature-observer.mjs";
 import { resolveReadFeatureCase } from "./feature-specs.mjs";
 import { validateMemoryFamily } from "./feature-suite.mjs";
+import { memoryWorkflow } from "./memory-workflow.mjs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
@@ -153,7 +154,15 @@ export async function evaluateDeliveryGate(
       const original = approvedCases.get(familyId);
       if (suite.schemaVersion !== 3 || !original || typeof verifyMemoryReport !== "function")
         fail("MEMORY_FAMILY_GATE", "记忆流程必须绑定已批准的固定用例并重新核对资源清理。");
+      let workflow;
+      try {
+        workflow = memoryWorkflow(familyId);
+      } catch {
+        fail("MEMORY_FAMILY_GATE", "记忆流程未绑定受支持的固定工作流。");
+      }
       validateMemoryFamily(original);
+      if (original.id !== workflow.id)
+        fail("MEMORY_FAMILY_GATE", "报告 Memory 家族与审批套件不一致。");
       if (observed.has(familyId)) fail("CASE_DUPLICATE", "交付报告重复声明记忆用例。");
       const memory = await verifyMemoryReport(report, { approvedFamily: original });
       const expectedRuns = report.memoryLifecycle?.steps?.map((s) => s.runId);
@@ -163,13 +172,16 @@ export async function evaluateDeliveryGate(
         memory.runtime?.commit !== commit ||
         JSON.stringify(memory.runtime) !== JSON.stringify(fresh.runtime) ||
         !Array.isArray(memory.stageRunIds) ||
-        memory.stageRunIds.length !== 3 ||
-        new Set(memory.stageRunIds).size !== 3 ||
+        memory.stageRunIds.length !== workflow.stages.length ||
+        new Set(memory.stageRunIds).size !== workflow.stages.length ||
         JSON.stringify(memory.stageRunIds) !== JSON.stringify(expectedRuns) ||
-        memory.cleanup?.status !== "expired" ||
-        memory.handles?.cleanupRunId !== memory.stageRunIds[2] ||
-        report.cases.length !== 3 ||
-        fresh.cases.length !== 3 ||
+        memory.cleanup?.status !== workflow.cleanupStatus ||
+        memory.handles?.cleanupRunId !== memory.stageRunIds.at(-1) ||
+        (!workflow.stages.includes("promote") &&
+          (Object.hasOwn(memory.handles ?? {}, "memoryId") ||
+            Object.hasOwn(memory.handles ?? {}, "promoteRunId"))) ||
+        report.cases.length !== workflow.stages.length ||
+        fresh.cases.length !== workflow.stages.length ||
         fresh.cases.some(
           (e, index) =>
             e.runId !== memory.stageRunIds[index] ||
