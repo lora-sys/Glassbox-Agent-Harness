@@ -204,7 +204,15 @@ async function main() {
     runId,
     mode: command,
     startedAt: new Date().toISOString(),
-    productAcceptance: { status: "BLOCKED", code: "RUNTIME_NOT_CONFIGURED" },
+    productAcceptance: {
+      status: "BLOCKED",
+      code:
+        command === "doctor"
+          ? "DOCTOR_ONLY"
+          : config.runtime
+            ? "NOT_CHECKED"
+            : "RUNTIME_NOT_CONFIGURED",
+    },
     status: "BLOCKED",
     suiteSha256: suiteHash,
     workspace: workspace(),
@@ -217,6 +225,7 @@ async function main() {
     privacy: "仅保留本轮可关联消息和目标通知；报告仍含测试账号信息，请勿公开上传。",
   };
   let timer;
+  const observers = [];
   try {
     await mkdir(runDir, { mode: 0o700 });
     await writeJson(join(runDir, "attempt.json"), {
@@ -235,8 +244,8 @@ async function main() {
     }, 250);
     await clients.driver.connect();
     await clients.bot.connect();
-    clients.driver.subscribe((e) => recorder.ingest("driver", e));
-    clients.bot.subscribe((e) => recorder.ingest("bot", e));
+    observers.push(clients.driver.subscribe((e) => recorder.ingest("driver", e)));
+    observers.push(clients.bot.subscribe((e) => recorder.ingest("bot", e)));
     report.environment = await doctor(config, clients);
     if (command === "doctor") {
       report.status = "PASS";
@@ -262,7 +271,7 @@ async function main() {
     }
     if (command === "run" && config.runtime) {
       try {
-        report.productAcceptance = verifyProductEvidence(report, config);
+        report.productAcceptance = await verifyProductEvidence(report, config, clients);
       } catch (error) {
         report.productAcceptance = safeError(error);
         if (report.status === "PASS") report.status = report.productAcceptance.status;
@@ -278,8 +287,19 @@ async function main() {
     report.status = report.error.status;
   } finally {
     clearInterval(timer);
+    for (const unsubscribe of observers) unsubscribe();
     clients.driver.close();
     clients.bot.close();
+    if (command === "run" && recorder.cases.length > 0) {
+      const finalStatus = recorder.finalize();
+      if (finalStatus === "FAIL" || report.status === "PASS") report.status = finalStatus;
+      if (report.productAcceptance.status === "PASS" && finalStatus !== "PASS")
+        report.productAcceptance = {
+          ...report.productAcceptance,
+          status: finalStatus,
+          code: "OBSERVATION_CHANGED",
+        };
+    }
     process.removeListener("SIGINT", stop);
     process.removeListener("SIGTERM", stop);
     report.finishedAt = new Date().toISOString();
@@ -310,7 +330,12 @@ async function main() {
         ...report.cases.map((c) => `${c.status} ${c.id} ${c.code}\n\n${c.detail}\n`),
       ];
       if (report.error) lines.push(report.error.message);
-      lines.push("", "工作区版本没有经过运行进程校验。需要结合 agent:status 核实所测代码。");
+      lines.push(
+        "",
+        report.productAcceptance.status === "PASS"
+          ? `产品证据通过。运行提交 ${report.productAcceptance.runtime.commit}，进程 ${report.productAcceptance.runtime.pid}。`
+          : "产品证据没有通过，不能用于合并。请检查 report.json 中的 productAcceptance。",
+      );
       await writeFile(join(runDir, "summary.md"), lines.join("\n") + "\n", { mode: 0o600 });
       await writeJson(join(out, "latest.json"), {
         status: report.status,

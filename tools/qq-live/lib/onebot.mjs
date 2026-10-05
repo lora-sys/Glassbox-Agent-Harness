@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { LiveError, fail, id } from "./core.mjs";
+import { LiveError, fail, id, messageId as parseMessageId } from "./core.mjs";
 
 /** OneBot forward WebSocket. Native Node WebSocket, no npm dependencies. */
 export class OneBot {
@@ -14,6 +14,7 @@ export class OneBot {
     this.closed = false;
     this.problem = null;
     this.mutatingMessages = 0;
+    this.knownMessageReads = new Set();
   }
   async connect() {
     if (typeof this.token !== "string" || this.token.length < 8 || /[\r\n]/.test(this.token))
@@ -94,7 +95,13 @@ export class OneBot {
             `OneBot ${item.action} 未确认成功，retcode=${Number.isSafeInteger(obj.retcode) ? obj.retcode : "unknown"}。`,
           ),
         );
-      } else item.resolve(obj.data);
+      } else {
+        if (item.action === "send_private_msg" || item.action === "send_group_msg") {
+          const sentId = parseMessageId(obj.data?.message_id);
+          if (sentId) this.allowMessageRead(sentId);
+        }
+        item.resolve(obj.data);
+      }
       return;
     }
     if (!obj.post_type) return;
@@ -120,9 +127,17 @@ export class OneBot {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
   }
+  allowMessageRead(messageId) {
+    const key = parseMessageId(messageId);
+    if (!key) fail("MESSAGE_READ_DENIED", "消息查询标识无效。");
+    if (this.knownMessageReads.size >= 64 && !this.knownMessageReads.has(key))
+      fail("MESSAGE_READ_LIMIT", "本轮消息查询达到上限。");
+    this.knownMessageReads.add(key);
+  }
   authorize(action, p, cleanup = false) {
     const groups = this.config.groups.map((g) => g.id);
     if (["get_login_info", "get_status", "get_version_info"].includes(action)) return;
+    if (action === "get_msg" && this.knownMessageReads.has(parseMessageId(p.message_id))) return;
     if (
       action === "get_group_member_info" &&
       groups.includes(id(p.group_id)) &&
@@ -169,6 +184,7 @@ export class OneBot {
   }
   async call(action, params = {}, { cleanup = false } = {}) {
     this.authorize(action, params, cleanup);
+    if (action === "get_msg") this.knownMessageReads.delete(parseMessageId(params.message_id));
     if (this.problem) throw this.problem;
     if (this.closed || this.ws?.readyState !== 1) fail("WS_NOT_READY", "OneBot 连接尚未就绪。");
     const echo = randomUUID();

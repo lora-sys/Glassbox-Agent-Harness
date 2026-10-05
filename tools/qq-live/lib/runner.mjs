@@ -11,6 +11,7 @@ import {
   digest,
   statusOf,
 } from "./core.mjs";
+import { boundMessage, compareSameMessage } from "./message-binding.mjs";
 
 export class Recorder {
   constructor(config, secrets = []) {
@@ -31,6 +32,7 @@ export class Recorder {
       startedMs: Date.now(),
       inputObserved: false,
       botInputMessageIds: [],
+      botInputCandidates: [],
       replies: [],
       notices: [],
       anomalies: [],
@@ -66,10 +68,8 @@ export class Recorder {
         }
         if (incoming && route === c.route && text === c.prompt) {
           if (!c.botInputMessageIds.includes(mid)) c.botInputMessageIds.push(mid);
-          if (!c.botInputMessageId) c.botInputMessageId = mid;
-          if (c.sentMessageId && mid === c.sentMessageId) {
-            c.inputObserved = true;
-            c.botInputMessageId = mid;
+          if (!c.botInputCandidates.some((candidate) => candidate.messageId === mid)) {
+            c.botInputCandidates.push({ messageId: mid, textSha256: digest(text) });
           }
         }
         if (reply) {
@@ -213,10 +213,47 @@ export async function sendCase(config, clients, c) {
   c.sentMessageId = messageId(data?.message_id);
   if (!c.sentMessageId)
     fail("SEND_RECEIPT", "发送接口没有返回有效 message_id，结果未知，不会重发。", "INCONCLUSIVE");
-  if (c.botInputMessageIds?.includes(c.sentMessageId)) {
-    c.inputObserved = true;
-    c.botInputMessageId = c.sentMessageId;
-  }
+}
+
+async function bindInput(config, clients, c) {
+  const candidates = c.botInputCandidates ?? [];
+  if (candidates.length !== 1)
+    fail(
+      candidates.length ? "MESSAGE_BINDING_MISMATCH" : "INPUT_OBSERVER_MISSING",
+      candidates.length
+        ? "Bot 端观察到多个本轮输入候选，无法唯一绑定。"
+        : "Bot 端未观察到本轮原始输入。",
+      "INCONCLUSIVE",
+    );
+  const candidate = candidates[0];
+  clients.bot.allowMessageRead(candidate.messageId);
+  const messageType = c.route === "private" ? "private" : "group";
+  const shared = {
+    senderId: config.driver.qq,
+    messageType,
+    ...(messageType === "group" ? { groupId: c.route } : {}),
+    text: c.prompt,
+    afterTime: c.startedAt,
+  };
+  const [driverMessage, botMessage] = await Promise.all([
+    boundMessage(clients.driver, c.sentMessageId, {
+      ...shared,
+      selfId: config.driver.qq,
+    }),
+    boundMessage(clients.bot, candidate.messageId, {
+      ...shared,
+      selfId: config.bot.qq,
+      textSha256: candidate.textSha256,
+    }),
+  ]);
+  const same = compareSameMessage(driverMessage, botMessage);
+  c.inputBinding = {
+    driverMessageId: driverMessage.messageId,
+    botMessageId: botMessage.messageId,
+    ...same,
+  };
+  c.inputObserved = true;
+  c.botInputMessageId = botMessage.messageId;
 }
 export async function replyCase(config, clients, recorder, spec, signal) {
   const route =
@@ -235,13 +272,12 @@ export async function replyCase(config, clients, recorder, spec, signal) {
       if (c.replies.some((r) => r.route === c.route && r.matches)) matchedAt ||= Date.now();
       if (matchedAt && Date.now() - matchedAt >= config.settleMs) {
         if (!c.inputObserved) {
-          const code = c.botInputMessageIds.length
-            ? "INPUT_BINDING_MISMATCH"
-            : "INPUT_OBSERVER_MISSING";
-          const detail = c.botInputMessageIds.length
-            ? "Bot 端输入的 message_id 与发送回执不一致。"
-            : "接收端收到回复，但 Bot 端未观察到本轮原始输入。";
-          return recorder.finish(c, "INCONCLUSIVE", code, detail);
+          try {
+            await bindInput(config, clients, c);
+          } catch (error) {
+            const e = safeError(error);
+            return recorder.finish(c, "INCONCLUSIVE", e.code, e.message);
+          }
         }
         return recorder.finish(
           c,
@@ -259,13 +295,14 @@ export async function replyCase(config, clients, recorder, spec, signal) {
         "REPLY_ASSERTION_FAILED",
         "收到本轮相关回复，但内容未满足断言。",
       );
-    if (!c.inputObserved && c.botInputMessageIds.length)
-      return recorder.finish(
-        c,
-        "INCONCLUSIVE",
-        "INPUT_BINDING_MISMATCH",
-        "Bot 端输入的 message_id 与发送回执不一致。",
-      );
+    if (!c.inputObserved && c.botInputCandidates.length) {
+      try {
+        await bindInput(config, clients, c);
+      } catch (error) {
+        const e = safeError(error);
+        return recorder.finish(c, "INCONCLUSIVE", e.code, e.message);
+      }
+    }
     return recorder.finish(
       c,
       "INCONCLUSIVE",
@@ -316,7 +353,7 @@ export function validateSpecs(raw, config) {
     )
       fail(
         "SUITE_ASSERTION",
-        "自定义用例仅支持 assertion=reply 和非空 expectContains。不能用文字回复证明副作用。",
+        "自定义用例仅支持 assertion=reply，且 expectContains 必须包含 {{nonce}}。不能用文字回复证明副作用。",
       );
     if (s.sideEffect !== "none")
       fail(

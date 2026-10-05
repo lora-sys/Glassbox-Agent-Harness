@@ -61,24 +61,57 @@ test("doctor refuses a mismatched driver membership returned by the Bot", async 
   };
   await assert.rejects(doctor(w.config, w.clients), (e) => e.code === "GROUP_MEMBERSHIP");
 });
-test("private round trip binds input to send acknowledgment", async (t) => {
+test("private round trip binds different account-local IDs to the same input", async (t) => {
   const w = await setup(t);
   const c = await replyCase(w.config, w.clients, w.recorder, spec);
   assert.equal(c.status, "PASS");
   assert.equal(c.inputObserved, true);
-  assert.equal(c.botInputMessageId, c.sentMessageId);
+  assert.notEqual(c.botInputMessageId, c.sentMessageId);
+  assert.equal(c.inputBinding.driverMessageId, c.sentMessageId);
+  assert.equal(c.inputBinding.botMessageId, c.botInputMessageId);
+  assert.equal(c.inputBinding.realSequence, "501");
+  assert.ok(Number.isSafeInteger(c.inputBinding.time));
+  assert.match(c.inputBinding.textSha256, /^[0-9a-f]{64}$/);
+  assert.deepEqual(
+    w.actions
+      .filter((a) => a.action === "get_msg")
+      .map((a) => a.role)
+      .sort(),
+    ["bot", "driver"],
+  );
 });
-test("input with matching nonce but wrong message ID cannot pass", async (t) => {
-  const w = await setup(t);
-  const call = w.clients.driver.call.bind(w.clients.driver);
-  w.clients.driver.call = async (action, ...args) => {
-    const data = await call(action, ...args);
-    return action.startsWith("send_") ? { ...data, message_id: Number(data.message_id) + 1 } : data;
-  };
+test("get_msg must return the requested account-local receipt ID", async (t) => {
+  const w = await setup(t, { mode: "wrong-read-id" });
   const c = await replyCase(w.config, w.clients, w.recorder, spec);
   assert.equal(c.status, "INCONCLUSIVE");
-  assert.equal(c.code, "INPUT_BINDING_MISMATCH");
+  assert.equal(c.code, "MESSAGE_BINDING_MISMATCH");
   assert.notEqual(c.botInputMessageId, c.sentMessageId);
+});
+test("cross-account real sequence mismatch cannot pass", async (t) => {
+  const w = await setup(t, { mode: "binding-sequence-mismatch" });
+  const c = await replyCase(w.config, w.clients, w.recorder, spec);
+  assert.equal(c.status, "INCONCLUSIVE");
+  assert.equal(c.code, "MESSAGE_BINDING_MISMATCH");
+});
+test("multiple Bot-side input candidates cannot pass", async (t) => {
+  const w = await setup(t, { mode: "duplicate-input" });
+  const c = await replyCase(w.config, w.clients, w.recorder, spec);
+  assert.equal(c.status, "INCONCLUSIVE");
+  assert.equal(c.code, "MESSAGE_BINDING_MISMATCH");
+  assert.equal(w.actions.filter((a) => a.action === "get_msg").length, 0);
+});
+test("get_msg text mismatch cannot pass despite a nonce reply", async (t) => {
+  const w = await setup(t, { mode: "binding-text-mismatch" });
+  const c = await replyCase(w.config, w.clients, w.recorder, spec);
+  assert.equal(c.status, "INCONCLUSIVE");
+  assert.equal(c.code, "MESSAGE_BINDING_MISMATCH");
+});
+test("get_msg requires an explicitly registered message ID", async (t) => {
+  const w = await setup(t);
+  await assert.rejects(
+    w.clients.bot.call("get_msg", { message_id: "12345" }),
+    (e) => e.code === "ACTION_DENIED",
+  );
 });
 test("group round trip validates receiving account and route", async (t) => {
   const w = await setup(t);

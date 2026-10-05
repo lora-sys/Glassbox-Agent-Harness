@@ -8,6 +8,8 @@
 
 需要自动核对产品证据时，在本地配置新增 runtime，填写 checkout 的绝对路径、dataDirectory 的绝对路径、expectedCommit 的完整 40 位 Git 提交及 connectionId。threadId 默认 null。必须使用当前仓库 agent-service 管理且工作区干净的待测服务。测试前后核对 PID、checkout、提交和数据目录，再只读关联外部消息 ID、精确会话范围、成功 Run、授权记录及发起账号收到的投递 ID。任何缺失都不能通过产品验收。由 systemd 单独管理的 Glassbox 不支持这项自动核对，不能伪造登记绕过。NapCat 和 Herdr 可以保留各自服务管理方式。
 
+OneBot 消息 ID 属于账号会话。同一条消息在 Driver 和 Bot 中可能有不同 ID。测试器只查询本轮已确认的消息，并以真实序列号、时间、发送者、会话范围及正文哈希核对跨账号关联。产品 Run 和投递 Trace 使用 Bot 会话的 ID，发起账号实际收到的回复使用 Driver 会话的 ID。缺少这些证据时不能通过。
+
 测试报告包含私有账号信息，留在本地。验证器不会自动执行 GitHub 合并。开发 Agent 应确认本次提交的完整验收矩阵及 CI 通过，再按用户授权合并。
 
 这是可放进当前开发仓库的命令行工具。测试器通过发起账号发送真实 QQ 消息，通过独立的接收事件验证回复。它不调用大模型，不修改业务代码，不启动或停止你的 Glassbox。
@@ -132,7 +134,7 @@ node tools/qq-live/cli.mjs plan --scenarios tools/qq-live/examples/scenarios.exa
 
 把 `HANDOFF.md` 交给当前开发 Agent。它规定完成修改后核实运行版本、运行本地回归、运行实机用例、读取失败证据、修复及重测的步骤。测试器本身不自动编辑代码，也不新增第二个大模型。
 
-首版不会自动解析任意 Glassbox Raw Trace，避免把“最近一个 Run”错误关联到当前测试。报告提供测试编号、消息 ID 和时间。开发 Agent 应据此定位对应 Run，再使用仓库的 `agent:inspect` 检查，不能直接认定最新 Run 就是本轮。
+固定收发用例会按消息绑定和完整会话范围查询对应 Run，再调用仓库的 gbxtrace 检查入站与投递证据。产品证据写入 report.json 的 productAcceptance。只有该字段和总结果同时为 PASS，才能用于合并验收。开发 Agent 可使用对应 Run ID 继续检查失败原因。
 
 ## 停止与安全边界
 

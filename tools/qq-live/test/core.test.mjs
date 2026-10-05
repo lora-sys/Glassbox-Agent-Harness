@@ -13,8 +13,28 @@ import {
 } from "../lib/core.mjs";
 import { muteUntil } from "../lib/moderation.mjs";
 import { validateSpecs, Recorder } from "../lib/runner.mjs";
+import { boundMessage, compareSameMessage } from "../lib/message-binding.mjs";
 import { baseConfig } from "./fixture.mjs";
 const throwsCode = (f, code) => assert.throws(f, (e) => e.code === code);
+const boundFixture = (overrides = {}) => ({
+  self_id: "10002",
+  message_id: "123456",
+  real_seq: "554",
+  time: Math.floor(Date.now() / 1000),
+  user_id: "10001",
+  sender: { user_id: "10001" },
+  message_type: "private",
+  message: [{ type: "text", data: { text: "QQLIVE_TEST prompt" } }],
+  ...overrides,
+});
+const boundExpected = () => ({
+  selfId: "10002",
+  senderId: "10001",
+  messageType: "private",
+  text: "QQLIVE_TEST prompt",
+  contains: "QQLIVE_TEST",
+  afterTime: new Date(Date.now() - 1000).toISOString(),
+});
 test("configuration accepts isolated armed fixture", () =>
   assert.equal(validateConfig(baseConfig(), { live: true }).groups.length, 2));
 test("same identities are rejected", () => {
@@ -83,6 +103,41 @@ test("arbitrary exception is not leaked", () =>
 test("CQ metadata is not parsed as text", () => assert.equal(textOf("[CQ:at,qq=10002]hi"), "hi"));
 test("unsafe numeric identifiers rejected", () => assert.equal(id(2 ** 60), ""));
 test("negative message ID supported", () => assert.equal(messageId(-7), "-7"));
+test("bound message returns identity metadata without its body", async () => {
+  const client = { call: async () => boundFixture() };
+  const result = await boundMessage(client, "123456", boundExpected());
+  assert.deepEqual(Object.keys(result).sort(), ["messageId", "realSequence", "textSha256", "time"]);
+  assert.equal(result.realSequence, "554");
+  assert.deepEqual(compareSameMessage(result, result), {
+    realSequence: "554",
+    time: result.time,
+    textSha256: result.textSha256,
+  });
+});
+test("bound message rejects conflicting sender fields", async () => {
+  const client = { call: async () => boundFixture({ user_id: "10003" }) };
+  await assert.rejects(boundMessage(client, "123456", boundExpected()), (e) =>
+    ["MESSAGE_BINDING_MISMATCH"].includes(e.code),
+  );
+});
+test("bound message requires a bounded decimal real sequence", async () => {
+  for (const real_seq of [554, "1".repeat(31)]) {
+    const client = { call: async () => boundFixture({ real_seq }) };
+    await assert.rejects(
+      boundMessage(client, "123456", boundExpected()),
+      (e) => e.code === "MESSAGE_BINDING_MISMATCH",
+    );
+  }
+});
+test("bound message rejects a timestamp far in the future", async () => {
+  const client = {
+    call: async () => boundFixture({ time: Math.floor(Date.now() / 1000) + 6 }),
+  };
+  await assert.rejects(
+    boundMessage(client, "123456", boundExpected()),
+    (e) => e.code === "MESSAGE_BINDING_MISMATCH",
+  );
+});
 test("custom suite must retain nonce", () => {
   const raw = {
     schemaVersion: 1,

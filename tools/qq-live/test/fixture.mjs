@@ -128,6 +128,7 @@ export async function world({
   let mid = 0,
     mute = initialMute;
   const actions = [];
+  const messageReads = { driver: new Map(), bot: new Map() };
   const event = (self, from, route, text, messageId = ++mid) => ({
     time: Math.floor(Date.now() / 1000),
     self_id: Number(self),
@@ -153,6 +154,26 @@ export async function world({
         role: String(req.params.user_id) === "10003" ? "member" : "admin",
         ...(stateField ? { shut_up_timestamp: mute } : {}),
       });
+    if (req.action === "get_msg") {
+      const message = messageReads[role].get(String(req.params.message_id));
+      if (!message) return send({ status: "failed", retcode: 404, data: null, echo: req.echo });
+      return response({
+        ...message,
+        ...(mode === "wrong-read-id" && role === "driver"
+          ? { message_id: Number(message.message_id) + 1 }
+          : {}),
+        ...(mode === "binding-sequence-mismatch" && role === "bot"
+          ? { real_seq: String(Number(message.real_seq) + 1) }
+          : {}),
+        ...(mode === "binding-text-mismatch" && role === "bot"
+          ? {
+              message: [
+                { type: "text", data: { text: `${message.message[0].data.text} changed` } },
+              ],
+            }
+          : {}),
+      });
+    }
     if (req.action === "set_group_ban") {
       mute = 0;
       return response(null);
@@ -169,8 +190,39 @@ export async function world({
         .map((s) => s.data.text)
         .join("");
       const outgoingId = ++mid;
+      const incomingId = ++mid;
+      const time = Math.floor(Date.now() / 1000);
+      const realSequence = String(500 + Math.floor(mid / 2));
+      const common = {
+        user_id: 10001,
+        sender: { user_id: 10001 },
+        message_type: route === "private" ? "private" : "group",
+        ...(route === "private" ? {} : { group_id: Number(route) }),
+        time,
+        real_seq: realSequence,
+        message: [{ type: "text", data: { text } }],
+      };
+      messageReads.driver.set(String(outgoingId), {
+        ...common,
+        self_id: 10001,
+        message_id: outgoingId,
+      });
+      messageReads.bot.set(String(incomingId), {
+        ...common,
+        self_id: 10002,
+        message_id: incomingId,
+      });
       // Deliberately emit the actual input before the API response to test races.
-      bot.broadcast(event("10002", "10001", route, text, outgoingId));
+      bot.broadcast(event("10002", "10001", route, text, incomingId));
+      if (mode === "duplicate-input") {
+        const duplicateId = ++mid;
+        messageReads.bot.set(String(duplicateId), {
+          ...common,
+          self_id: 10002,
+          message_id: duplicateId,
+        });
+        bot.broadcast(event("10002", "10001", route, text, duplicateId));
+      }
       response({ message_id: outgoingId });
       if (mode === "silent") return;
       const marker = text.match(/QQLIVE_[A-Za-z0-9_]+/)?.[0] ?? "";
