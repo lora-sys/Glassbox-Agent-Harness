@@ -2,12 +2,34 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
+import { join } from "node:path";
 import {
   caseEvidence,
+  readTraceEvents,
   runtimeSnapshot,
   verifyMessageBindings,
   verifyTraceEvidence,
 } from "../lib/product-evidence.mjs";
+
+test("Trace reader passes the runs directory to gbxtrace", () => {
+  const checkout = join(process.cwd(), "candidate");
+  const dataDirectory = join(process.cwd(), "data");
+  const trace = readTraceEvents(checkout, dataDirectory, "run-123", (command, args, options) => {
+    assert.equal(command, process.execPath);
+    assert.ok(
+      args[0].endsWith(join(".agents", "skills", "glassbox-ops", "scripts", "gbxtrace.mjs")),
+    );
+    assert.equal(args[1], "events");
+    assert.equal(args[2], "run-123");
+    assert.equal(args.at(-2), "--data-dir");
+    assert.equal(args.at(-1), join(dataDirectory, "runs"));
+    assert.equal(options.encoding, "utf8");
+    return JSON.stringify({
+      events: [{ event: { type: "message_received" } }],
+    });
+  });
+  assert.equal(trace.events[0].event.type, "message_received");
+});
 
 test("runtime verification rejects a stopped process and wrong commit", () => {
   const runtime = {

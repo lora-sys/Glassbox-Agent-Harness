@@ -261,6 +261,32 @@ export async function verifyMessageBindings(c, config, clients, delivery) {
   return { input: inputMatch, reply: replyMatch };
 }
 
+export function readTraceEvents(checkout, dataDirectory, runId, capture = execFileSync) {
+  return JSON.parse(
+    capture(
+      process.execPath,
+      [
+        join(checkout, ".agents/skills/glassbox-ops/scripts/gbxtrace.mjs"),
+        "events",
+        runId,
+        "--type",
+        "message_received",
+        "--type",
+        "delivery_changed",
+        "--json",
+        "--data-dir",
+        join(dataDirectory, "runs"),
+      ],
+      {
+        encoding: "utf8",
+        timeout: 10000,
+        maxBuffer: 1024 * 1024,
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    ),
+  );
+}
+
 export async function verifyProductEvidence(report, config, clients) {
   const after = runtimeSnapshot(config.runtime);
   const before = report.runtime;
@@ -276,29 +302,7 @@ export async function verifyProductEvidence(report, config, clients) {
     for (const c of report.cases) {
       const evidence = caseEvidence(db, c, config);
       const messageBinding = await verifyMessageBindings(c, config, clients, evidence.delivery);
-      const trace = JSON.parse(
-        execFileSync(
-          process.execPath,
-          [
-            join(after.checkout, ".agents/skills/glassbox-ops/scripts/gbxtrace.mjs"),
-            "events",
-            evidence.runId,
-            "--type",
-            "message_received",
-            "--type",
-            "delivery_changed",
-            "--json",
-            "--data-dir",
-            after.dataDirectory,
-          ],
-          {
-            encoding: "utf8",
-            timeout: 10000,
-            maxBuffer: 1024 * 1024,
-            stdio: ["ignore", "pipe", "pipe"],
-          },
-        ),
-      );
+      const trace = readTraceEvents(after.checkout, after.dataDirectory, evidence.runId);
       const events = trace.events?.map((row) => row.event) ?? [];
       verifyTraceEvidence(events, c, config, evidence.delivery);
       cases.push({ ...evidence, messageBinding, traceVerified: true });
