@@ -126,6 +126,43 @@ it("includes accepted Step excerpts in Model context and its budget without trea
   expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBeUndefined();
 });
 
+it("records the derived Pi output capacity when the model ceiling equals its context window", async () => {
+  const f = fixture(
+    Array.from({ length: 10 }, () => ({ status: "completed", text: "ok", toolCalls: [] })),
+  );
+  f.runtime.getModelCapacity = () => ({
+    contextWindowTokens: 256_000,
+    outputReserveTokens: 128_000,
+    thinkingReserveTokens: 128_000,
+    safetyMarginTokens: 4_096,
+  });
+  f.runtime.getThinkingLevel = () => "medium";
+  const evidence: RunEvidenceRecord[] = [];
+  const executor = new PiRunExecutionAdapter(f.runtime, {
+    onBudgetEvidence: (record) => {
+      evidence.push(record);
+    },
+  });
+  await executor.execute(f.input);
+  const budget = evidence.find((record) => record.type === "context_budget");
+  expect(budget).toMatchObject({
+    policyVersion: "p5a-pi-dynamic-output-v1",
+    contextWindowTokens: 256_000,
+    thinkingReserveTokens: 8_192,
+  });
+  expect(budget?.type === "context_budget" ? budget.outputReserveTokens : 128_000).not.toBe(
+    128_000,
+  );
+  expect(
+    budget?.type === "context_budget"
+      ? budget.outputReserveTokens +
+          budget.thinkingReserveTokens +
+          (budget.projectedTokens ?? 256_001) +
+          4_096
+      : 256_001,
+  ).toBeLessThanOrEqual(256_000);
+});
+
 describe("Pi required Tool execution", () => {
   it("injects only authorized group Memory as bounded reference data before the current message", async () => {
     const f = fixture([{ status: "completed", text: "本群每月聚会一次。", toolCalls: [] }]);

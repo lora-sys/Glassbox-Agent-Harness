@@ -149,20 +149,17 @@ function normalizeBaseUrl(value: string): string {
   return value.replace(/\/+$/u, "");
 }
 
-function knownCapacity(context: unknown, output: unknown): { context?: number; output?: number } {
+export function knownCapacity(
+  context: unknown,
+  output: unknown,
+): { context?: number; output?: number } {
   const knownContext =
     Number.isSafeInteger(context) && (context as number) > 0 ? (context as number) : undefined;
   const declaredOutput =
     Number.isSafeInteger(output) && (output as number) > 0 ? (output as number) : undefined;
-  const knownOutput =
-    knownContext !== undefined && declaredOutput !== undefined && declaredOutput < knownContext
-      ? declaredOutput
-      : knownContext === undefined
-        ? declaredOutput
-        : undefined;
   return {
     ...(knownContext === undefined ? {} : { context: knownContext }),
-    ...(knownOutput === undefined ? {} : { output: knownOutput }),
+    ...(declaredOutput === undefined ? {} : { output: declaredOutput }),
   };
 }
 

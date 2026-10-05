@@ -76,7 +76,7 @@ test("private round trip binds different account-local IDs to the same input", a
     w.actions
       .filter((a) => a.action === "get_msg")
       .map((a) => a.role)
-      .sort(),
+      .sort((a, b) => a.localeCompare(b)),
     ["bot", "driver"],
   );
 });

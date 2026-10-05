@@ -853,6 +853,145 @@ describe("PiSdkRuntimeAdapter", () => {
     await adapter.cleanup();
   });
 
+  it("derives equal-window Pi output budgets across a Tool result without mutating model ceilings", async () => {
+    const runtimeBaseDir = await mkdtemp(join(tmpdir(), "glassbox-pi-equal-window-budget-"));
+    directories.push(runtimeBaseDir);
+    const model = {
+      id: "equal-window-model",
+      name: "Equal window model",
+      api: "openai-completions",
+      provider: "fixture-provider",
+      baseUrl: "http://fixture.invalid",
+      reasoning: true,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 256_000,
+      maxTokens: 256_000,
+    } as never;
+    const originalModel = structuredClone(model);
+    const observed: Array<{ maxTokens?: number; thinkingBudgets?: Record<string, number> }> = [];
+    let payloadText = "small serialized provider payload";
+    let payloadCheck: Promise<unknown> | undefined;
+    let providerOnPayload: ((payload: unknown, model: unknown) => unknown) | undefined;
+    let transportRequests = 0;
+    let secondProviderSawToolResult = false;
+    let calls = 0;
+    const modelRuntime = {
+      hasConfiguredAuth: () => true,
+      checkAuth: async () => undefined,
+      isUsingOAuth: () => false,
+      streamSimple: (
+        _model: unknown,
+        context: unknown,
+        options: {
+          maxTokens?: number;
+          thinkingBudgets?: Record<string, number>;
+          onPayload?: (payload: unknown, model: unknown) => unknown;
+        },
+      ) => {
+        observed.push({ maxTokens: options.maxTokens, thinkingBudgets: options.thinkingBudgets });
+        if (calls === 1) {
+          secondProviderSawToolResult =
+            (context as { messages?: Array<{ role: string }> }).messages?.some(
+              (message) => message.role === "toolResult",
+            ) ?? false;
+        }
+        providerOnPayload = options.onPayload;
+        payloadCheck = Promise.resolve(
+          options.onPayload?.({ serialized: payloadText }, model),
+        ).then((result) => {
+          transportRequests++;
+          return result;
+        });
+        calls++;
+        const message = {
+          role: "assistant",
+          content:
+            calls === 1
+              ? [
+                  {
+                    type: "toolCall",
+                    id: "equal-window-tool-call",
+                    name: "budget_tool",
+                    arguments: {},
+                  },
+                ]
+              : [{ type: "text", text: "done" }],
+          api: "openai-completions",
+          provider: "fixture-provider",
+          model: "equal-window-model",
+          usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2 },
+          stopReason: calls === 1 ? "toolUse" : "stop",
+          timestamp: Date.now(),
+        } as never;
+        const stream = createAssistantMessageEventStream();
+        queueMicrotask(() => {
+          stream.push({ type: "start", partial: message });
+          stream.push({ type: "done", reason: calls === 1 ? "toolUse" : "stop", message });
+        });
+        return stream;
+      },
+    } as unknown as ModelRuntime;
+    const adapter = new PiSdkRuntimeAdapter({
+      kitPath: fileURLToPath(new URL("./fixtures/lora-pi-kit", import.meta.url)),
+      runtimeBaseDir,
+      model,
+      modelRuntime,
+      customTools: [
+        {
+          name: "budget_tool",
+          label: "budget_tool",
+          description: "Fixture Tool result",
+          parameters: Type.Object({}),
+          execute: async () => ({
+            content: [{ type: "text", text: "tool-result-".repeat(500) }],
+            details: {},
+          }),
+        },
+      ],
+      resolveToolNames: async () => ["budget_tool"],
+      resolveSkillNames: async () => ({ names: [] }),
+    });
+    await adapter.initialize();
+    const context: PiRunContext = {
+      runId: run.id,
+      conversationId: conversation.id,
+      caller: {
+        principalId: "owner",
+        scope: {
+          connectionId: "qq",
+          botId: "bot",
+          chatType: "private",
+          chatId: "owner",
+          senderId: "owner",
+        },
+      },
+    };
+    const binding = await adapter.createOrRestoreSession(conversation, "test", context);
+    const result = await adapter.run(binding, run, "Use budget_tool", context);
+    expect(result.status).toBe("completed");
+    expect(calls).toBe(2);
+    expect(secondProviderSawToolResult).toBe(true);
+    await payloadCheck;
+    expect(transportRequests).toBe(2);
+    expect(observed[0]!.maxTokens).toBeGreaterThan(observed[1]!.maxTokens!);
+    for (const budget of observed) {
+      expect(budget.thinkingBudgets?.minimal).toBeLessThanOrEqual(2_048);
+      expect(budget.maxTokens! + budget.thinkingBudgets!.minimal).toBeLessThanOrEqual(256_000);
+    }
+    expect(model).toEqual(originalModel);
+    payloadText = "oversized-provider-payload-".repeat(20_000);
+    payloadCheck = Promise.resolve(providerOnPayload?.({ serialized: payloadText }, model)).then(
+      (result) => {
+        transportRequests++;
+        return result;
+      },
+    );
+    await expect(payloadCheck).rejects.toThrow("provider_payload_exceeds_capacity");
+    expect(transportRequests).toBe(2);
+    await adapter.cleanup();
+  });
+
   it("budgets a new Tool result from projected context after omitting oversized prior history", async () => {
     const runtimeBaseDir = await mkdtemp(join(tmpdir(), "glassbox-pi-projected-tool-budget-"));
     directories.push(runtimeBaseDir);

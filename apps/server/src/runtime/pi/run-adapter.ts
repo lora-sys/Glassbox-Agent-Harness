@@ -16,6 +16,7 @@ import {
   type ContextDemandEstimate,
   type ContextProjectionResult,
 } from "../../efficiency/index.js";
+import { deriveRequestCapacity, type RequestCapacityBudget } from "./request-budget.js";
 import { exactTerms } from "../../retrieval/exact-term.js";
 import type { QqCapabilityCategory } from "../../channels/onebot/capabilities.js";
 import { WEB_CAPABILITIES } from "../../management/web-capability-policy.js";
@@ -602,7 +603,7 @@ export type RunEvidenceRecord =
       runId: string;
       principalId: string;
       conversationId: string;
-      policyVersion: "p5a-context-v1";
+      policyVersion: "p5a-context-v1" | "p5a-pi-dynamic-output-v1";
       estimateSource: "unicode_conservative";
       demandTokens: number;
       contextWindowTokens: number;
@@ -1590,7 +1591,14 @@ export function projectRunHistory(
     safetyMarginTokens: number;
   },
   staticEstimate: { systemTokens: number; toolSchemaTokens: number },
-): { result: ContextProjectionResult; demand: ContextDemandEstimate; included: Set<string> } {
+  thinkingLevel?: string | null,
+): {
+  result: ContextProjectionResult;
+  demand: ContextDemandEstimate;
+  included: Set<string>;
+  effectiveCapacity: typeof capacity;
+  requestBudget: RequestCapacityBudget | null;
+} {
   const exchanges = Array.from({ length: Math.floor(input.history.length / 2) }, (_, index) => {
     const user = input.history[index * 2];
     const assistant = input.history[index * 2 + 1];
@@ -1632,11 +1640,25 @@ export function projectRunHistory(
     requiredFloorTokens: 256,
     exchanges,
   };
-  const result = projectContextBudget(demand, capacity);
+  const request = deriveRequestCapacity(capacity, demand, thinkingLevel);
+  const effectiveCapacity = request.ok ? request.budget.capacity : capacity;
+  const result = request.ok
+    ? projectContextBudget(demand, effectiveCapacity)
+    : {
+        ok: false as const,
+        overflow: {
+          kind:
+            request.reason === "invalid_demand"
+              ? ("invalid_demand" as const)
+              : ("invalid_capacity" as const),
+        },
+      };
   return {
     result,
     demand,
     included: new Set(result.ok ? result.projection.includedExchangeIds : []),
+    effectiveCapacity,
+    requestBudget: request.ok ? request.budget : null,
   };
 }
 
@@ -2122,11 +2144,17 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         }
       }
       const contextInput = { ...input, learningContext: learningItems };
-      let projection = projectRunHistory(contextInput, capacity, staticEstimate);
+      const thinkingLevel = this.runtime.getThinkingLevel?.(binding.runtimeSessionId);
+      let projection = projectRunHistory(contextInput, capacity, staticEstimate, thinkingLevel);
       if (!projection.result.ok && learningItems.length > 0) {
         learningItems = [];
         learningStatus = "omitted_for_budget";
-        projection = projectRunHistory({ ...input, learningContext: [] }, capacity, staticEstimate);
+        projection = projectRunHistory(
+          { ...input, learningContext: [] },
+          capacity,
+          staticEstimate,
+          thinkingLevel,
+        );
       }
       if (learningItems.length > 0 && this.options.learningStore) {
         const operation = {
@@ -2170,12 +2198,14 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         runId: input.run.id,
         principalId: input.caller.principalId,
         conversationId: input.conversation.id,
-        policyVersion: "p5a-context-v1",
+        policyVersion: projection.requestBudget?.dynamic
+          ? "p5a-pi-dynamic-output-v1"
+          : "p5a-context-v1",
         estimateSource: "unicode_conservative",
         demandTokens: projection.demand.estimatedMaterialTokens,
-        contextWindowTokens: capacity.contextWindowTokens,
-        outputReserveTokens: capacity.outputReserveTokens,
-        thinkingReserveTokens: capacity.thinkingReserveTokens,
+        contextWindowTokens: projection.effectiveCapacity.contextWindowTokens,
+        outputReserveTokens: projection.effectiveCapacity.outputReserveTokens,
+        thinkingReserveTokens: projection.effectiveCapacity.thinkingReserveTokens,
         projectedTokens: projection.result.ok ? projection.result.projection.projectedTokens : null,
         includedExchangeCount: projection.result.ok
           ? projection.result.projection.includedExchangeIds.length

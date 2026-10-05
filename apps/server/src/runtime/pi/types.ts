@@ -169,6 +169,7 @@ export interface PiRuntimeAdapter {
   getRunContext?(runtimeSessionId: string): PiRunContext | undefined;
   getModelSupportsImages?(runtimeSessionId: string): boolean;
   getModelCapacity?(runtimeSessionId: string): EfficiencyModelCapacity | undefined;
+  getThinkingLevel?(runtimeSessionId: string): string | null | undefined;
   getStaticContextEstimate?(runtimeSessionId: string):
     | {
         systemTokens: number;
