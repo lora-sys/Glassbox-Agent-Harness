@@ -5,7 +5,7 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
-import { afterEach, describe, expect, it } from "vite-plus/test";
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import {
   OneBotAdapter,
   type OneBotAdapterOptions,
@@ -1298,29 +1298,40 @@ describe("OneBot forward WebSocket", () => {
     });
     await adapter.start();
     const socket = await fake.connections.next();
-    socket.send(JSON.stringify(inbound()));
-    await started;
-    // Back to back, because the second one is what makes the third one droppable: it
-    // overflows the acceptance queue and pushes the adapter out of `ready`, and the message
-    // behind it is still on the same socket when the teardown has not been processed yet.
-    socket.send(JSON.stringify(inbound({ message_id: 8 })));
-    socket.send(
-      JSON.stringify(
-        inbound({
-          message_type: "private",
-          sub_type: "friend",
-          message: "promote the first candidate",
-          message_id: 9,
-        }),
-      ),
-    );
-    expect(await errors.next()).toMatchObject({ code: "ingress_overflow", messageId: "8" });
-    // A private drop used to leave no trace at all: the diagnostic projection is keyed by
-    // group id, so a private message had nothing to be counted in.
-    expect(await diagnostics.next((diagnostic) => diagnostic.stage === "dropped")).toEqual({
-      stage: "dropped",
-      reason: "not_ready",
-    });
-    await adapter.stop();
+    const terminate = Reflect.get(WebSocket.prototype, "terminate") as (this: WebSocket) => void;
+    const terminateSpy = vi
+      .spyOn(WebSocket.prototype, "terminate")
+      .mockImplementation(function (this: WebSocket) {
+        if (this.url !== fake.endpoint) terminate.call(this);
+      });
+    try {
+      socket.send(JSON.stringify(inbound()));
+      await started;
+      socket.send(JSON.stringify(inbound({ message_id: 8 })));
+      expect(await errors.next()).toMatchObject({ code: "ingress_overflow", messageId: "8" });
+      expect(adapter.state.status).toBe("reconnecting");
+      expect(terminateSpy).toHaveBeenCalledOnce();
+      // Keep this adapter connection alive long enough to deliver a real subsequent frame
+      // after overflow has made the adapter not ready. The connection is still closed in finally.
+      socket.send(
+        JSON.stringify(
+          inbound({
+            message_type: "private",
+            sub_type: "friend",
+            message: "promote the first candidate",
+            message_id: 9,
+          }),
+        ),
+      );
+      // A private drop used to leave no trace at all: the diagnostic projection is keyed by
+      // group id, so a private message had nothing to be counted in.
+      expect(await diagnostics.next((diagnostic) => diagnostic.stage === "dropped")).toEqual({
+        stage: "dropped",
+        reason: "not_ready",
+      });
+    } finally {
+      terminateSpy.mockRestore();
+      await adapter.stop();
+    }
   });
 });

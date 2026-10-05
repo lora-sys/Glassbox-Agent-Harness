@@ -263,6 +263,11 @@ function runTestCommandWithCache(args, scope) {
 // Scripts are outside the unit suite's include pattern, so their tests only run where a runner
 // names them. Listing them here is what keeps them from being files nobody executes.
 const SCRIPT_TESTS = [
+  "scripts/service-source-identity.test.mjs",
+  "tools/qq-live/test/core.test.mjs",
+  "tools/qq-live/test/integration.test.mjs",
+  "tools/qq-live/test/cli.test.mjs",
+  "tools/qq-live/test/product-evidence.test.mjs",
   "scripts/verify-commit.test.mjs",
   "scripts/migrate-windows-workspaces.test.mjs",
 ];

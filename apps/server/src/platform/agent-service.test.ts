@@ -16,6 +16,7 @@ const io = vi.hoisted(() => ({
   spawn: vi.fn(),
   execFile: vi.fn(),
   execFileAsync: vi.fn(),
+  execFileSync: vi.fn(),
   securePrivatePath: vi.fn(),
   createConnection: vi.fn(),
   databaseVersion: 25,
@@ -29,7 +30,7 @@ vi.mock("node:fs", async (importOriginal) => ({
 vi.mock("node:child_process", async () => {
   const { promisify } = await import("node:util");
   Object.defineProperty(io.execFile, promisify.custom, { value: io.execFileAsync });
-  return { spawn: io.spawn, execFile: io.execFile };
+  return { spawn: io.spawn, execFile: io.execFile, execFileSync: io.execFileSync };
 });
 vi.mock("node:sqlite", () => ({
   DatabaseSync: class {
@@ -75,6 +76,9 @@ const missing = () => Object.assign(new Error("missing fixture"), { code: "ENOEN
 
 beforeEach(() => {
   vi.resetAllMocks();
+  io.execFileSync.mockImplementation((_command: string, args: string[]) =>
+    args[0] === "rev-parse" ? "a".repeat(40) : "",
+  );
   Object.defineProperty(process, "platform", { value: "linux" });
   state = [{ ...baseEntry }];
   processAlive = true;
@@ -276,7 +280,14 @@ describe("service commands with unverified Linux ownership", () => {
     state = [];
     await runServiceCommand("up", []);
     const persisted = JSON.parse(String(io.writeFile.mock.calls.at(-1)![1])) as unknown[];
-    expect(persisted).toEqual([expect.objectContaining({ pid, linuxIdentity })]);
+    expect(persisted).toEqual([
+      expect.objectContaining({
+        pid,
+        linuxIdentity,
+        launchCommit: "a".repeat(40),
+        launchClean: true,
+      }),
+    ]);
     expect(io.spawn).toHaveBeenCalledOnce();
     expect(kill.mock.calls.every(([, signal]) => signal === 0)).toBe(true);
   });

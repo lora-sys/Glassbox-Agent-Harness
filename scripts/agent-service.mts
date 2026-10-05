@@ -19,6 +19,7 @@ import {
 } from "./service-process-identity.mjs";
 
 const execFile = promisify(execFileCallback);
+import { serviceSourceIdentity } from "./service-source-identity.mjs";
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const dataDirectory = getServiceDataDir();
 const statePath = join(dataDirectory, "service-processes.json");
@@ -51,6 +52,8 @@ interface ProcessState extends ProcessConfig {
   pid: number;
   startedAt: string;
   linuxIdentity?: LinuxProcessIdentity;
+  launchCommit?: string;
+  launchClean?: boolean;
 }
 
 type ProcessStatus = "running" | "stopped" | "unknown";
@@ -183,16 +186,28 @@ function stateEntry(value: unknown): ProcessState {
   if (
     Object.keys(item).some(
       (key) =>
-        !["name", "pid", "startedAt", "executable", "args", "cwd", "env", "linuxIdentity"].includes(
-          key,
-        ),
+        ![
+          "name",
+          "pid",
+          "startedAt",
+          "executable",
+          "args",
+          "cwd",
+          "env",
+          "linuxIdentity",
+          "launchCommit",
+          "launchClean",
+        ].includes(key),
     ) ||
     !["herdr", "napcat", "glassbox"].includes(String(item.name)) ||
     !Number.isSafeInteger(item.pid) ||
     (item.pid as number) < 1 ||
     typeof item.startedAt !== "string" ||
     Number.isNaN(Date.parse(item.startedAt)) ||
-    (item.linuxIdentity !== undefined && !isLinuxProcessIdentity(item.linuxIdentity))
+    (item.linuxIdentity !== undefined && !isLinuxProcessIdentity(item.linuxIdentity)) ||
+    (item.launchCommit !== undefined &&
+      (typeof item.launchCommit !== "string" || !/^[a-f0-9]{40}$/.test(item.launchCommit))) ||
+    (item.launchClean !== undefined && typeof item.launchClean !== "boolean")
   )
     throw new Error("Invalid service state");
   const config = processConfig(
@@ -209,6 +224,8 @@ function stateEntry(value: unknown): ProcessState {
     name: item.name as ProcessName,
     pid: item.pid as number,
     startedAt: item.startedAt,
+    ...(item.launchCommit === undefined ? {} : { launchCommit: item.launchCommit as string }),
+    ...(item.launchClean === undefined ? {} : { launchClean: item.launchClean as boolean }),
     ...(item.linuxIdentity === undefined ? {} : { linuxIdentity: item.linuxIdentity }),
     ...config,
   };
@@ -386,6 +403,8 @@ async function startProcess(name: ProcessName, config: ProcessConfig): Promise<P
   if (config.cwd && !(await stat(config.cwd)).isDirectory())
     throw new Error(`${name} working directory is unavailable`);
   const descriptor = openSync(logPath, "a");
+  const sourceIdentity =
+    name === "glassbox" ? serviceSourceIdentity(config.cwd ?? repoRoot) : undefined;
   try {
     const child = spawn(config.executable, config.args, {
       cwd: config.cwd ?? repoRoot,
@@ -404,6 +423,7 @@ async function startProcess(name: ProcessName, config: ProcessConfig): Promise<P
       ...config,
       pid: child.pid,
       startedAt: new Date().toISOString(),
+      ...sourceIdentity,
       ...(linuxIdentity === undefined ? {} : { linuxIdentity }),
     };
   } finally {
@@ -641,7 +661,13 @@ async function status(): Promise<void> {
         ...(alive(entry.pid) ? { pid: entry.pid } : {}),
         running: status === "running",
         status,
-        ...(entry.name === "glassbox" ? { checkout: entry.cwd ?? null } : {}),
+        ...(entry.name === "glassbox"
+          ? {
+              checkout: entry.cwd ?? null,
+              launchCommit: entry.launchCommit ?? null,
+              launchClean: entry.launchClean ?? null,
+            }
+          : {}),
       };
     }),
   );

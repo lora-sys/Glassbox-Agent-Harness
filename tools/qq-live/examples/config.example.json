@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "driver": {
+    "qq": "填写发起账号QQ号",
+    "wsUrl": "ws://127.0.0.1:6701/",
+    "tokenEnv": "QQ_LIVE_DRIVER_TOKEN"
+  },
+  "bot": {
+    "qq": "填写BotQQ号",
+    "wsUrl": "ws://127.0.0.1:6700/",
+    "tokenEnv": "QQ_LIVE_BOT_TOKEN"
+  },
+  "groups": [
+    { "alias": "A", "id": "填写第一个群号" },
+    { "alias": "B", "id": "填写第二个群号" }
+  ],
+  "allowRemote": false,
+  "timeoutMs": 90000,
+  "apiTimeoutMs": 10000,
+  "settleMs": 2000,
+  "minGapMs": 2000,
+  "maxMessages": 12,
+  "safety": {
+    "acceptanceServiceConfirmed": false,
+    "soleConsumerConfirmed": false,
+    "armedUntil": ""
+  },
+  "moderation": {
+    "enabled": false,
+    "group": "A",
+    "target": "",
+    "consentConfirmed": false,
+    "consentUntil": "",
+    "durationSeconds": 60,
+    "emergencyCleanupViaDriver": false
+  }
+}
