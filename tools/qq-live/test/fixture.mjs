@@ -231,7 +231,7 @@ export async function world({
         "10001",
         "10002",
         replyRoute,
-        mode === "mismatch" ? marker + " wrong" : marker + " 42",
+        mode === "mismatch" ? marker + " wrong" : marker + " result: 42",
       );
       const sendReply = () => {
         driver.broadcast(reply);

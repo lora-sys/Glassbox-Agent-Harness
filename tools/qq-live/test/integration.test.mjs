@@ -25,8 +25,8 @@ async function setup(t, opts = {}) {
 const spec = {
   id: "private",
   chat: "private",
-  prompt: "请回复 {{nonce}} 和 42",
-  expectContains: ["{{nonce}}", "42"],
+  prompt: "请回复 {{nonce}} 和 result: 42",
+  expectContains: ["{{nonce}}", "result: 42"],
 };
 test("real localhost WebSocket handshake uses Bearer header", async (t) => {
   const w = await setup(t);
@@ -153,6 +153,8 @@ test("Bot input without reply is inconclusive", async (t) => {
 });
 test("reply assertion mismatch fails", async (t) => {
   const w = await setup(t, { mode: "mismatch" });
+  const begin = w.recorder.begin.bind(w.recorder);
+  w.recorder.begin = (...args) => begin(...args, "QQLIVE_fixture42");
   const c = await replyCase(w.config, w.clients, w.recorder, spec);
   assert.equal(c.code, "REPLY_ASSERTION_FAILED");
 });
