@@ -11,9 +11,8 @@ import { Recorder, doctor, smokeSpecs, validateSpecs, replyCase } from "./lib/ru
 import { moderationCase } from "./lib/moderation.mjs";
 import { runtimeSnapshot, verifyProductEvidence } from "./lib/product-evidence.mjs";
 import { acceptanceManagement } from "./lib/management-client.mjs";
-import { resolveReadFeatureSpecs } from "./lib/feature-specs.mjs";
-import { memoryFixtureStep } from "./lib/memory-scenario.mjs";
 import { runMemoryRecoveryCli } from "./lib/memory-recovery-cli.mjs";
+import { resolveFeatureSuite, memoryFamilyPlan } from "./lib/feature-suite.mjs";
 
 const root = dirname(fileURLToPath(import.meta.url));
 const help = `QQ 实机测试器 0.1.0
@@ -129,28 +128,7 @@ async function syncDirectory(path) {
   }
 }
 function memoryPlan() {
-  const placeholder = "0".repeat(32);
-  return {
-    schemaVersion: 3,
-    scenario: "memory-lifecycle",
-    stages: ["feedback", "promote", "expire"].map((stage) => ({
-      stage,
-      spec: JSON.parse(
-        JSON.stringify(
-          memoryFixtureStep(stage, {
-            nonce: placeholder,
-            candidateId: `candidate_${placeholder}`,
-            memoryId: `memory_${placeholder}`,
-          }),
-        )
-          .replaceAll(`candidate_${placeholder}`, "{{candidate_id}}")
-          .replaceAll(`memory_${placeholder}`, "{{memory_id}}")
-          .replaceAll(`qqtest-${placeholder}`, "qqtest-{{fixture_nonce}}"),
-      ),
-    })),
-    cleanup:
-      "expire the exact promoted fixture; retain feedback, candidate, Memory and audit history",
-  };
+  return memoryFamilyPlan();
 }
 async function main() {
   const { command, o } = args(process.argv.slice(2));
@@ -168,7 +146,7 @@ async function main() {
       const config = validateConfig(
         (await jsonFile(resolve(o.config ?? join(root, "qq-live.local.json")))).raw,
       );
-      resolveReadFeatureSpecs(suite, config);
+      resolveFeatureSuite(suite, config);
       executableSuiteCases = suite.cases;
       suiteConfig = config;
     }
@@ -224,7 +202,9 @@ async function main() {
   let specs = smokeSpecs(config),
     suiteHash = null,
     featureSuite = false;
-  const memoryLifecycle = o.case === "memory-lifecycle";
+  let memoryLifecycle = o.case === "memory-lifecycle";
+  let memoryFamilyCase = null;
+  let plannedSuiteCases = null;
   if (memoryLifecycle) {
     if (o.scenarios) fail("ARGUMENT", "固定记忆流程不能与 scenarios 混用。");
     const plan = memoryPlan();
@@ -248,15 +228,26 @@ async function main() {
   }
   if (o.scenarios) {
     const suite = await jsonFile(resolve(o.scenarios));
-    featureSuite = suite.raw?.schemaVersion === 2;
+    featureSuite = [2, 3].includes(suite.raw?.schemaVersion);
     if (command === "run" && !featureSuite)
       fail(
         "CUSTOM_LIVE_UNSUPPORTED",
         "自定义自然语言尚未有可验证的能力限制，仅支持 plan 审阅。实机运行使用固定用例。",
       );
-    specs = featureSuite
-      ? resolveReadFeatureSpecs(suite.raw, config)
-      : validateSpecs(suite.raw, config);
+    if (featureSuite) {
+      const resolved = resolveFeatureSuite(suite.raw, config);
+      plannedSuiteCases = resolved.cases;
+      specs = resolved.readCases;
+      if (resolved.memoryFamilies.length && command === "run") {
+        if (!o.case)
+          fail("CASE_FAMILY_REQUIRED", "含记忆流程的套件须逐个选择用例运行并保留各自报告。");
+        memoryFamilyCase = resolved.memoryFamilies.find((c) => c.id === o.case) ?? null;
+        if (memoryFamilyCase) {
+          memoryLifecycle = true;
+          specs = [];
+        }
+      }
+    } else specs = validateSpecs(suite.raw, config);
     if (command === "run" && featureSuite && !config.runtime)
       fail("FEATURE_RUNTIME_REQUIRED", "功能用例必须配置并核对真实验收服务版本。");
     suiteHash = digest(suite.text);
@@ -265,6 +256,14 @@ async function main() {
         "SUITE_APPROVAL",
         "先运行 plan 审阅消息，再把输出 SHA256 传入 --approve-suite。文件修改后需要重新审阅。",
       );
+    if (command === "run" && memoryFamilyCase) {
+      if (
+        config.memoryFixtures?.enabled !== true ||
+        config.memoryFixtures?.retainAuditConfirmed !== true
+      )
+        fail("MEMORY_FIXTURE_DISABLED", "请明确启用固定记忆测试并确认保留审计。");
+      if (config.maxMessages < 3) fail("MESSAGE_BUDGET", "固定记忆流程需要三条消息的预算。");
+    }
   }
   if (command === "plan") {
     if (!o.scenarios) fail("SCENARIOS_REQUIRED", "plan 需要 --scenarios。");
@@ -272,7 +271,10 @@ async function main() {
       JSON.stringify(
         {
           suiteSha256: suiteHash,
-          cases: specs,
+          cases: plannedSuiteCases ?? specs,
+          ...(plannedSuiteCases?.some((c) => c.kind === "memory-lifecycle")
+            ? { memoryPlan: memoryFamilyPlan() }
+            : {}),
           note: "这是待发送的消息，不是执行结果。sideEffect 声明不能代替代码授权检查。",
         },
         null,
@@ -335,6 +337,7 @@ async function main() {
     suiteSha256: suiteHash,
     workspace: workspace(),
     cases: recorder.cases,
+    ...(memoryFamilyCase ? { memoryFamily: { caseId: memoryFamilyCase.id } } : {}),
     limitations: [
       "没有验证 QQ 客户端 UI。",
       "工作区版本不等于已运行服务版本。",
@@ -567,6 +570,28 @@ async function main() {
       report.transportStatus = "PASS";
       report.status = "INCONCLUSIVE";
       report.note = "QQ 收发观察通过，但未配置运行版本与产品证据验证。不能用于合并。";
+    }
+    if (memoryFamilyCase && report.status === "PASS") {
+      const { verifyMemoryFamilyReport } = await import("./lib/memory-family-evidence.mjs");
+      const { verifyMemoryCleanup } = await import("./lib/memory-fixture.mjs");
+      const { DatabaseSync } = await import("node:sqlite");
+      report.memoryFamilyAcceptance = await verifyMemoryFamilyReport(report, {
+        verifyProduct: (input) => verifyProductEvidence(input, config, clients),
+        readCleanup: (handles) => {
+          const db = new DatabaseSync(join(config.runtime.dataDirectory, "glassbox.db"), {
+            readOnly: true,
+          });
+          try {
+            const actor = db
+              .prepare("SELECT kind FROM principals WHERE id=?")
+              .get(handles.principalId);
+            const cleanup = verifyMemoryCleanup(db, handles);
+            return { ...cleanup, principalKind: actor?.kind };
+          } finally {
+            db.close();
+          }
+        },
+      });
     }
   } catch (error) {
     report.error = safeError(error);

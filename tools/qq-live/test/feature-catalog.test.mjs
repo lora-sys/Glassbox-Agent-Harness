@@ -38,6 +38,45 @@ function minimalCatalog(overrides = {}) {
 }
 
 const oneDescriptor = [{ name: "ops_status" }];
+const memoryDescriptor = [{ name: "owner_memory_admin" }];
+const memoryFamily = {
+  id: "memory-project-promote-expire",
+  kind: "memory-lifecycle",
+  workflow: "promote-expire",
+  chat: "private",
+};
+function memoryCatalog(overrides = {}) {
+  return {
+    schemaVersion: 1,
+    descriptorBaseline: ["owner_memory_admin"],
+    requiredDomains: ["memory_taste"],
+    cases: [
+      {
+        id: "memory-project-promote-expire",
+        domain: "memory_taste",
+        executionStatus: "executable",
+        executionKind: "memory-lifecycle",
+        tools: ["owner_memory_admin"],
+        suiteCaseId: "memory-project-promote-expire",
+        assertions: [
+          {
+            kind: "trace",
+            type: "tool_result",
+            where: { name: "owner_memory_admin", isError: false },
+            count: 1,
+          },
+        ],
+        coveragePlan:
+          "Run the fixed Owner-private project Memory lifecycle with independent cleanup proof.",
+        mutation: "isolated",
+        fixture: "unique qqtest project; Owner private feedback, promotion and cleanup Runs",
+        cleanup:
+          "expire the exact promoted fixture; retain feedback, candidate, Memory and audit history",
+      },
+    ],
+    ...overrides,
+  };
+}
 const privateSuiteCase = {
   id: "private",
   chat: "private",
@@ -96,11 +135,12 @@ test("read-only example binds only the implemented Ops and QQ inventory cases", 
   const suiteCases = validateReadFeatureSpecs(source, suiteConfig);
   const resolvedCases = resolveReadFeatureSpecs(source, suiteConfig);
   const executableCatalogCases = FEATURE_CATALOG.cases.filter(
-    (testCase) => testCase.executionStatus === "executable",
+    (testCase) =>
+      testCase.executionStatus === "executable" && testCase.executionKind !== "memory-lifecycle",
   );
   assert.equal(
     FEATURE_CATALOG.coverageNotice,
-    "Executable cases are a limited read-only seed, not complete descriptor or domain coverage.",
+    "Executable cases are bounded acceptance seeds, not complete descriptor or domain coverage.",
   );
   for (const testCase of executableCatalogCases) {
     const suiteCase = suiteCases.find((candidate) => candidate.id === testCase.suiteCaseId);
@@ -164,6 +204,45 @@ test("read-only example binds only the implemented Ops and QQ inventory cases", 
   assert.ok(
     result.gaps.some(
       (gap) => gap.code === "MISSING_DOMAIN_COVERAGE" && gap.domain === "history_retrieval",
+    ),
+  );
+});
+
+test("fixed Memory family binds only its exact private promote-expire contract", () => {
+  const result = checkFeatureCoverage({
+    catalog: memoryCatalog(),
+    descriptors: memoryDescriptor,
+    executableSuiteCases: [memoryFamily],
+  });
+  assert.equal(result.status, "PASS", JSON.stringify(result.gaps));
+  assert.deepEqual(result.coveredTools, ["owner_memory_admin"]);
+  assert.deepEqual(result.coveredDomains, ["memory_taste"]);
+});
+
+test("Memory family rejects extra fields, changed workflow, and a missing family", () => {
+  const invalidFamilies = [
+    { ...memoryFamily, extra: true },
+    { ...memoryFamily, workflow: "feedback-only" },
+    null,
+  ];
+  for (const invalidFamily of invalidFamilies) {
+    const result = checkFeatureCoverage({
+      catalog: memoryCatalog(),
+      descriptors: memoryDescriptor,
+      executableSuiteCases: invalidFamily ? [invalidFamily] : [],
+    });
+    assert.equal(result.status, "BLOCKED");
+    assert.deepEqual(result.coveredTools, []);
+    assert.deepEqual(result.coveredDomains, []);
+  }
+});
+
+test("full catalogue remains blocked and keeps complete Memory isolation cases planned", async () => {
+  const result = await checkRepositoryFeatureCoverage();
+  assert.equal(result.status, "BLOCKED");
+  assert.ok(
+    result.gaps.some(
+      (gap) => gap.code === "CASE_NOT_EXECUTABLE" && gap.caseId === "memory-and-taste-lifecycle",
     ),
   );
 });

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile, readFile, rm, mkdir } from "node:fs/promises";
+import { mkdtemp, writeFile, readFile, rm, mkdir, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -222,6 +222,128 @@ test("structured read suite plans locally but cannot run without runtime identit
   const blocked = await run(["run", "--live", "--config", p, "--scenarios", suite], d);
   assert.equal(blocked.code, 2);
   assert.ok(blocked.stderr.includes("FEATURE_RUNTIME_REQUIRED"));
+});
+
+test("schema 3 Memory family hashes original suite bytes and plans without network access", async (t) => {
+  const d = await dir(t);
+  const configPath = join(d, "c.json");
+  const suitePath = join(d, "memory-suite.json");
+  const suiteText = `{
+  "schemaVersion": 3,
+  "cases": [
+    {
+      "id": "memory-project-promote-expire",
+      "kind": "memory-lifecycle",
+      "workflow": "promote-expire",
+      "chat": "private"
+    }
+  ]
+}
+`;
+  await writeFile(configPath, JSON.stringify(baseConfig()));
+  await writeFile(suitePath, suiteText);
+
+  const planResult = await run(
+    ["plan", "--config", configPath, "--scenarios", suitePath, "--out", join(d, "plan-out")],
+    d,
+  );
+  assert.equal(planResult.code, 0);
+  const plan = JSON.parse(planResult.stdout);
+  assert.equal(plan.suiteSha256, digest(suiteText));
+  assert.deepEqual(plan.cases, [
+    {
+      id: "memory-project-promote-expire",
+      kind: "memory-lifecycle",
+      workflow: "promote-expire",
+      chat: "private",
+    },
+  ]);
+  assert.deepEqual(
+    plan.memoryPlan.stages.map((stage) => stage.stage),
+    ["feedback", "promote", "expire"],
+  );
+});
+
+test("schema 3 Memory run rejects missing case, approval, fixture enablement and message budget before network", async (t) => {
+  const d = await dir(t);
+  const configPath = join(d, "c.json");
+  const suitePath = join(d, "memory-suite.json");
+  const out = join(d, "run-out");
+  const suiteText = JSON.stringify({
+    schemaVersion: 3,
+    cases: [
+      {
+        id: "memory-project-promote-expire",
+        kind: "memory-lifecycle",
+        workflow: "promote-expire",
+        chat: "private",
+      },
+    ],
+  });
+  const suite = JSON.parse(suiteText);
+  const suiteSha256 = digest(suiteText);
+  const config = {
+    ...baseConfig(),
+    runtime: {},
+    memoryFixtures: { enabled: true, retainAuditConfirmed: true },
+  };
+  await writeFile(configPath, JSON.stringify(config));
+  await writeFile(suitePath, suiteText);
+  const common = ["run", "--live", "--config", configPath, "--scenarios", suitePath, "--out", out];
+
+  const missingCase = await run([...common, "--approve-suite", suiteSha256], d);
+  assert.equal(missingCase.code, 2);
+  assert.match(missingCase.stderr + missingCase.stdout, /CASE_FAMILY_REQUIRED/);
+
+  const chosen = [...common, "--case", "memory-project-promote-expire"];
+  const wrongApproval = await run([...chosen, "--approve-suite", "0".repeat(64)], d);
+  assert.equal(wrongApproval.code, 2);
+  assert.match(wrongApproval.stderr + wrongApproval.stdout, /SUITE_APPROVAL/);
+
+  await writeFile(
+    configPath,
+    JSON.stringify({ ...config, memoryFixtures: { enabled: false, retainAuditConfirmed: true } }),
+  );
+  const disabled = await run([...chosen, "--approve-suite", suiteSha256], d);
+  assert.equal(disabled.code, 2);
+  assert.match(disabled.stderr + disabled.stdout, /MEMORY_FIXTURE_DISABLED/);
+
+  await writeFile(configPath, JSON.stringify({ ...config, maxMessages: 2 }));
+  const insufficientBudget = await run([...chosen, "--approve-suite", suiteSha256], d);
+  assert.equal(insufficientBudget.code, 2);
+  assert.match(insufficientBudget.stderr + insufficientBudget.stdout, /MESSAGE_BUDGET/);
+
+  await assert.rejects(stat(out), { code: "ENOENT" });
+});
+
+test("schema 3 Memory plan rejects custom family fields before network access", async (t) => {
+  const d = await dir(t);
+  const configPath = join(d, "c.json");
+  const suitePath = join(d, "memory-suite.json");
+  await writeFile(configPath, JSON.stringify(baseConfig()));
+  await writeFile(
+    suitePath,
+    JSON.stringify({
+      schemaVersion: 3,
+      cases: [
+        {
+          id: "memory-project-promote-expire",
+          kind: "memory-lifecycle",
+          workflow: "promote-expire",
+          chat: "private",
+          prompt: "custom command {{nonce}}",
+        },
+      ],
+    }),
+  );
+  const out = join(d, "invalid-out");
+  const result = await run(
+    ["plan", "--config", configPath, "--scenarios", suitePath, "--out", out],
+    d,
+  );
+  assert.equal(result.code, 2);
+  assert.match(result.stderr + result.stdout, /FEATURE_MEMORY_FAMILY/);
+  await assert.rejects(stat(out), { code: "ENOENT" });
 });
 test("default feature inventory reports unimplemented executable coverage without credentials", async (t) => {
   const d = await dir(t),

@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
+import { MEMORY_FAMILY_ID, validateMemoryFamily } from "./lib/feature-suite.mjs";
 import { validateReadFeatureSpecs } from "./lib/feature-specs.mjs";
 import { validateFeatureAssertions } from "./lib/feature-observer.mjs";
 
@@ -9,15 +10,27 @@ const PACKAGE_ROOT = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(PACKAGE_ROOT, "../..");
 
 const MUTATION_CLASSES = new Set(["none", "reversible", "isolated"]);
+const MEMORY_FAMILY_FIXTURE =
+  "unique qqtest project; Owner private feedback, promotion and cleanup Runs";
+const MEMORY_FAMILY_CLEANUP =
+  "expire the exact promoted fixture; retain feedback, candidate, Memory and audit history";
+const MEMORY_FAMILY_ASSERTIONS = [
+  {
+    kind: "trace",
+    type: "tool_result",
+    where: { name: "owner_memory_admin", isError: false },
+    count: 1,
+  },
+];
 
 /**
- * Static Tool inventory plus a small executable read-only seed. This seed is not complete
+ * Static Tool inventory plus a bounded set of executable acceptance cases. It is not complete
  * feature or domain coverage. Group assignments and schedules remain unimplemented.
  */
 export const FEATURE_CATALOG = Object.freeze({
   schemaVersion: 1,
   coverageNotice:
-    "Executable cases are a limited read-only seed, not complete descriptor or domain coverage.",
+    "Executable cases are bounded acceptance seeds, not complete descriptor or domain coverage.",
   descriptorBaseline: [
     "qq_capability_search",
     "qq_groups",
@@ -158,11 +171,25 @@ export const FEATURE_CATALOG = Object.freeze({
       executionStatus: "planned",
       tools: ["owner_memory_admin"],
       coveragePlan:
-        "Use a unique project-scoped candidate and prove pending, review, persisted state, and scope isolation.",
+        "Keep complete scope-isolation, rejection and negative Memory/Taste cases planned. The fixed promote-expire happy path does not cover them.",
       mutation: "isolated",
       fixture: "unique project scope and qqtest nonce; Owner private Run",
       cleanup:
         "reject pending candidate or revoke/retire promoted test Memory; retain audit evidence",
+    },
+    {
+      id: MEMORY_FAMILY_ID,
+      domain: "memory_taste",
+      executionStatus: "executable",
+      executionKind: "memory-lifecycle",
+      tools: ["owner_memory_admin"],
+      suiteCaseId: MEMORY_FAMILY_ID,
+      assertions: MEMORY_FAMILY_ASSERTIONS,
+      coveragePlan:
+        "Run the fixed Owner-private project feedback, promotion and expiration family with an isolated qqtest project and independent cleanup proof.",
+      mutation: "isolated",
+      fixture: MEMORY_FAMILY_FIXTURE,
+      cleanup: MEMORY_FAMILY_CLEANUP,
     },
     {
       id: "history-search-current-group",
@@ -627,7 +654,54 @@ function stableJson(value) {
   return JSON.stringify(value);
 }
 
+function bindMemoryFamily(testCase, suiteCases, gaps) {
+  const matches = suiteCases.filter((suiteCase) => suiteCase?.id === MEMORY_FAMILY_ID);
+  if (matches.length !== 1 || testCase.suiteCaseId !== MEMORY_FAMILY_ID) {
+    gaps.push({
+      code: matches.length > 1 ? "SUITE_CASE_AMBIGUOUS" : "SUITE_CASE_NOT_AVAILABLE",
+      caseId: testCase.id,
+      suiteCaseId: testCase.suiteCaseId,
+    });
+    return false;
+  }
+
+  let valid = true;
+  try {
+    validateMemoryFamily(matches[0]);
+  } catch {
+    gaps.push({
+      code: "SUITE_CASE_INVALID",
+      caseId: testCase.id,
+      suiteCaseId: testCase.suiteCaseId,
+    });
+    valid = false;
+  }
+
+  if (
+    testCase.id !== MEMORY_FAMILY_ID ||
+    testCase.domain !== "memory_taste" ||
+    stableJson(testCase.tools) !== stableJson(["owner_memory_admin"]) ||
+    testCase.mutation !== "isolated" ||
+    testCase.fixture !== MEMORY_FAMILY_FIXTURE ||
+    testCase.cleanup !== MEMORY_FAMILY_CLEANUP ||
+    stableJson(testCase.assertions) !== stableJson(MEMORY_FAMILY_ASSERTIONS) ||
+    typeof testCase.coveragePlan !== "string" ||
+    !testCase.coveragePlan.trim() ||
+    testCase.leaseTools !== undefined
+  ) {
+    gaps.push({ code: "MEMORY_FAMILY_CATALOG_BINDING_INVALID", caseId: testCase.id });
+    valid = false;
+  }
+  return valid;
+}
+
 function bindToSuiteCase(testCase, suiteCases, gaps, suiteConfig) {
+  if (testCase.executionKind === "memory-lifecycle")
+    return bindMemoryFamily(testCase, suiteCases, gaps);
+  if (testCase.executionKind !== undefined) {
+    gaps.push({ code: "UNSUPPORTED_EXECUTION_KIND", caseId: testCase.id });
+    return false;
+  }
   const matches = suiteCases.filter((suiteCase) => suiteCase?.id === testCase.suiteCaseId);
   if (matches.length !== 1) {
     gaps.push({
@@ -804,6 +878,7 @@ export function checkFeatureCoverage({
           "domain",
           "tools",
           "executionStatus",
+          "executionKind",
           "suiteCaseId",
           "leaseTools",
           "assertions",
@@ -858,7 +933,7 @@ export function checkFeatureCoverage({
     }
     if (!MUTATION_CLASSES.has(testCase.mutation))
       gaps.push({ code: "UNKNOWN_MUTATION_CLASS", caseId: testCase.id });
-    if (testCase.mutation !== "none") {
+    if (testCase.mutation !== "none" && testCase.executionKind !== "memory-lifecycle") {
       if (typeof testCase.fixture !== "string" || !testCase.fixture.trim())
         gaps.push({ code: "MUTATION_FIXTURE_REQUIRED", caseId: testCase.id });
       if (typeof testCase.cleanup !== "string" || !testCase.cleanup.trim())

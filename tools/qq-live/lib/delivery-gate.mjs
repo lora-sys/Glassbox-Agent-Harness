@@ -1,6 +1,7 @@
 import { fail, digest, toolManifestDigest } from "./core.mjs";
 import { validateFeatureAssertions } from "./feature-observer.mjs";
 import { resolveReadFeatureCase } from "./feature-specs.mjs";
+import { validateMemoryFamily } from "./feature-suite.mjs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
@@ -28,7 +29,13 @@ async function verifyRepositoryCoverage({ commit, suite, suiteConfig }) {
 
 export async function evaluateDeliveryGate(
   input,
-  { verifyReport, readRemote, resolveRoute, verifyCoverage = verifyRepositoryCoverage },
+  {
+    verifyReport,
+    verifyMemoryReport,
+    readRemote,
+    resolveRoute,
+    verifyCoverage = verifyRepositoryCoverage,
+  },
 ) {
   if (
     typeof verifyReport !== "function" ||
@@ -117,6 +124,40 @@ export async function evaluateDeliveryGate(
     const fresh = await verifyReport(report);
     if (fresh?.status !== "PASS" || fresh.runtime?.commit !== commit || !Array.isArray(fresh.cases))
       fail("LIVE_REVERIFICATION", "重新查询的产品证据未通过。");
+    if (report.memoryFamily !== undefined || report.memoryLifecycle !== undefined) {
+      const familyId = report.memoryFamily?.caseId;
+      const original = approvedCases.get(familyId);
+      if (suite.schemaVersion !== 3 || !original || typeof verifyMemoryReport !== "function")
+        fail("MEMORY_FAMILY_GATE", "记忆流程必须绑定已批准的固定用例并重新核对资源清理。");
+      validateMemoryFamily(original);
+      if (observed.has(familyId)) fail("CASE_DUPLICATE", "交付报告重复声明记忆用例。");
+      const memory = await verifyMemoryReport(report, { approvedFamily: original });
+      const expectedRuns = report.memoryLifecycle?.steps?.map((s) => s.runId);
+      if (
+        memory?.status !== "PASS" ||
+        memory.caseId !== familyId ||
+        memory.runtime?.commit !== commit ||
+        JSON.stringify(memory.runtime) !== JSON.stringify(fresh.runtime) ||
+        !Array.isArray(memory.stageRunIds) ||
+        memory.stageRunIds.length !== 3 ||
+        new Set(memory.stageRunIds).size !== 3 ||
+        JSON.stringify(memory.stageRunIds) !== JSON.stringify(expectedRuns) ||
+        memory.cleanup?.status !== "expired" ||
+        memory.handles?.cleanupRunId !== memory.stageRunIds[2] ||
+        report.cases.length !== 3 ||
+        fresh.cases.length !== 3 ||
+        fresh.cases.some(
+          (e, index) =>
+            e.runId !== memory.stageRunIds[index] ||
+            e.caseId !== report.cases[index].id ||
+            e.feature?.status !== "PASS" ||
+            e.traceVerified !== true,
+        )
+      )
+        fail("MEMORY_FAMILY_GATE", "记忆流程的独立 Run 或清理证据不完整。");
+      observed.add(familyId);
+      continue;
+    }
     for (const c of report.cases) {
       const original = approvedCases.get(c.id);
       if (!original) fail("SUITE_CASE_BINDING", "报告声明了审批套件以外的用例。");

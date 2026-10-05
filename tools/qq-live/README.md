@@ -145,6 +145,10 @@ node tools/qq-live/cli.mjs plan --scenarios tools/qq-live/examples/scenarios.exa
 
 ## 结果交给开发 Agent
 
+`examples/feature-memory.example.json` 使用 schemaVersion 3，将既有读取用例和固定的 `memory-project-promote-expire` 用例放在同一套件中。先使用 `plan --scenarios <文件>` 审阅套件，再使用 `run --scenarios <文件> --case memory-project-promote-expire --live --approve-suite <套件哈希>` 执行固定 Memory 流程。必须明确启用 Memory fixture 和审计保留，消息预算至少为 3。每次调用只选择一个用例，读取用例也使用同一份套件哈希。
+
+该 Memory 用例只允许 Owner 私聊中的固定创建、推广和过期流程。用例不能增加自定义消息、工具、目标或清理脚本。成功报告必须包含三个不同 Run 的独立证据，以及重新读取的 Owner 项目清理状态。交付门禁会重新核对这些证据。此用例不覆盖 Memory 范围隔离、拒绝和授权负例，完整功能目录仍要求这些用例通过。
+
 先读 `artifacts/latest.json`。完整内容在对应运行目录。
 
 | 文件 | 内容 |
