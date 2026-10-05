@@ -1,8 +1,35 @@
 import { fail, digest, toolManifestDigest } from "./core.mjs";
 import { validateFeatureAssertions } from "./feature-observer.mjs";
+import { resolveReadFeatureCase } from "./feature-specs.mjs";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
+const runFile = promisify(execFile);
+const repositoryRoot = fileURLToPath(new URL("../../../", import.meta.url));
 
 /** Gate judgments never execute a merge. Remote checks and evidence are read again by trusted callers. */
-export async function evaluateDeliveryGate(input, { verifyReport, readRemote, resolveRoute }) {
+async function verifyRepositoryCoverage({ commit, suite, suiteConfig }) {
+  const git = async (args) => (await runFile("git", args, { cwd: repositoryRoot })).stdout.trim();
+  if ((await git(["rev-parse", "HEAD"])) !== commit || (await git(["status", "--porcelain"])))
+    fail("COVERAGE_VERSION", "功能目录必须来自待交付提交的干净工作区。");
+  const { FEATURE_CATALOG, checkRepositoryFeatureCoverage } =
+    await import("../feature-catalog.mjs");
+  const coverage = await checkRepositoryFeatureCoverage({
+    executableSuiteCases: suite.cases,
+    suiteConfig,
+  });
+  if ((await git(["rev-parse", "HEAD"])) !== commit || (await git(["status", "--porcelain"])))
+    fail("COVERAGE_VERSION", "检查功能目录期间工作区版本发生变化。");
+  return {
+    ...coverage,
+    requiredCaseIds: FEATURE_CATALOG.cases.map((c) => c.suiteCaseId ?? c.id),
+  };
+}
+
+export async function evaluateDeliveryGate(
+  input,
+  { verifyReport, readRemote, resolveRoute, verifyCoverage = verifyRepositoryCoverage },
+) {
   if (
     typeof verifyReport !== "function" ||
     typeof readRemote !== "function" ||
@@ -29,6 +56,20 @@ export async function evaluateDeliveryGate(input, { verifyReport, readRemote, re
   )
     fail("SUITE_BINDING", "审批套件的用例清单无效。");
   const approvedCases = new Map(suite.cases.map((c) => [c.id, c]));
+  const suiteConfig = {
+    groups: ["A", "B"].flatMap((alias) => {
+      const id = resolveRoute(alias);
+      return typeof id === "string" && /^[1-9][0-9]{4,19}$/.test(id) ? [{ alias, id }] : [];
+    }),
+  };
+  const coverage = await verifyCoverage({ commit, suite, suiteSha256, suiteConfig });
+  if (
+    coverage?.status !== "PASS" ||
+    !Array.isArray(coverage.requiredCaseIds) ||
+    !coverage.requiredCaseIds.length ||
+    coverage.requiredCaseIds.some((id) => typeof id !== "string" || !approvedCases.has(id))
+  )
+    fail("COVERAGE_GATE", "完整既有功能目录未绑定到已批准的可执行用例。");
   if (
     !/^[a-f0-9]{40}$/.test(commit ?? "") ||
     !/^[a-f0-9]{64}$/.test(suiteSha256 ?? "") ||
@@ -77,8 +118,9 @@ export async function evaluateDeliveryGate(input, { verifyReport, readRemote, re
     if (fresh?.status !== "PASS" || fresh.runtime?.commit !== commit || !Array.isArray(fresh.cases))
       fail("LIVE_REVERIFICATION", "重新查询的产品证据未通过。");
     for (const c of report.cases) {
-      const approved = approvedCases.get(c.id);
-      if (!approved) fail("SUITE_CASE_BINDING", "报告声明了审批套件以外的用例。");
+      const original = approvedCases.get(c.id);
+      if (!original) fail("SUITE_CASE_BINDING", "报告声明了审批套件以外的用例。");
+      const approved = resolveReadFeatureCase(original, resolveRoute);
       const featureCase = Array.isArray(approved.leaseTools);
       if (approved.featureAssertions !== undefined && !featureCase)
         fail("SUITE_CASE_BINDING", "审批套件的功能断言缺少测试许可范围。");
@@ -115,7 +157,12 @@ export async function evaluateDeliveryGate(input, { verifyReport, readRemote, re
           !c.featureAssertions.length ||
           JSON.stringify(c.leasedToolNames) !==
             JSON.stringify(approved.leaseTools.map((t) => t.name)) ||
-          JSON.stringify(c.featureAssertions) !== JSON.stringify(approved.featureAssertions))
+          JSON.stringify(c.featureAssertions) !==
+            JSON.stringify(
+              JSON.parse(
+                JSON.stringify(approved.featureAssertions).replaceAll("{{nonce}}", c.token),
+              ),
+            ))
       )
         fail("SUITE_CASE_BINDING", "功能断言或许可与审批套件不一致。");
       if (!featureCase && (c.featureAssertions || c.acceptanceLease))
@@ -131,7 +178,11 @@ export async function evaluateDeliveryGate(input, { verifyReport, readRemote, re
       observed.add(c.id);
     }
   }
-  if ([...requiredCaseIds, ...approvedCases.keys()].some((id) => !observed.has(id)))
+  if (
+    [...requiredCaseIds, ...coverage.requiredCaseIds, ...approvedCases.keys()].some(
+      (id) => !observed.has(id),
+    )
+  )
     fail("COVERAGE_GATE", "新增功能或现有功能回归有未完成用例。");
   const remote = await readRemote();
   if (

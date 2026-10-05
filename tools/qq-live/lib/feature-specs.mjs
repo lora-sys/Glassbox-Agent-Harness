@@ -12,7 +12,141 @@ const READ_ACTIONS = {
   qq_groups: "group:read",
   qq_group_members: "group:members:read",
   qq_capability_search: "qq:capability:read",
+  group_history_search: "history:read",
+  owner_history_search: "history:search",
 };
+
+const HISTORY_TOOLS = new Set(["group_history_search", "owner_history_search"]);
+const TEST_GROUP_ALIASES = new Set(["A", "B"]);
+
+function canonical(value) {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+  if (value && typeof value === "object")
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonical(value[key])}`)
+      .join(",")}}`;
+  return JSON.stringify(value);
+}
+
+function validGroupId(value) {
+  return typeof value === "string" && /^[1-9]\d{0,15}$/u.test(value);
+}
+
+function configGroup(config, alias) {
+  const matches = config?.groups?.filter((group) => group.alias === alias) ?? [];
+  if (!TEST_GROUP_ALIASES.has(alias) || matches.length !== 1 || !validGroupId(matches[0].id))
+    fail("FEATURE_GROUP_BINDING", "测试群别名必须是唯一配置的 A 或 B，并映射到数字群号。");
+  return matches[0];
+}
+
+function expectedHistoryAssertions(toolName, groupId) {
+  return [
+    {
+      kind: "trace",
+      type: "tool_result",
+      where: { name: toolName, isError: false },
+      count: 1,
+    },
+    {
+      kind: "trace",
+      type: "history_retrieval",
+      where: {
+        query: "{{nonce}}",
+        groups: [groupId],
+        resources: [`group:${groupId}`],
+        sourceKind: "channel_message",
+        retrievalMode: "lexical",
+      },
+      count: 1,
+    },
+  ];
+}
+
+function validateHistoryCase(c, tool, config) {
+  if (c.leaseTools.length !== 1 || tool.operations.length !== 1)
+    fail("FEATURE_HISTORY_SCOPE", "历史用例只能租用一个历史工具和一个精确读取操作。");
+  const group = configGroup(config, "A");
+  const templateGroupId = "{{group:A}}";
+  const groupId = group.id;
+  const allowedGroupIds = new Set([templateGroupId, groupId]);
+  let expectedOperation;
+
+  if (tool.name === "group_history_search") {
+    if (c.chat !== "A") fail("FEATURE_HISTORY_SCOPE", "当前群历史测试必须路由到专用测试群 A。");
+    if (!["group:{{group:A}}", `group:${groupId}`].includes(tool.operations[0].resourceId))
+      fail("FEATURE_HISTORY_SCOPE", "当前群历史租约必须绑定聊天别名 A 的群 Resource。");
+    expectedOperation = {
+      action: "history:read",
+      resourceId: tool.operations[0].resourceId,
+      inputConstraint: { query: "{{nonce}}", limit: 1 },
+    };
+  } else {
+    if (c.chat !== "private")
+      fail("FEATURE_HISTORY_SCOPE", "跨群历史测试必须在 Owner 私聊中执行。");
+    if (tool.operations[0].resourceId !== "owner-history")
+      fail("FEATURE_HISTORY_SCOPE", "Owner 历史租约必须绑定 owner-history Resource。");
+    const actualGroupIds = tool.operations[0].inputConstraint?.groupIds;
+    if (
+      !Array.isArray(actualGroupIds) ||
+      actualGroupIds.length !== 1 ||
+      !allowedGroupIds.has(actualGroupIds[0])
+    )
+      fail("FEATURE_HISTORY_SCOPE", "Owner 历史测试只能搜索测试群 A。");
+    expectedOperation = {
+      action: "history:search",
+      resourceId: "owner-history",
+      inputConstraint: { query: "{{nonce}}", limit: 1, groupIds: actualGroupIds },
+    };
+  }
+  if (canonical(tool.operations[0]) !== canonical(expectedOperation))
+    fail("FEATURE_HISTORY_SCOPE", "历史租约必须把查询限制为当前 nonce、limit 1 和指定测试群。");
+
+  const rawAssertions = expectedHistoryAssertions(tool.name, templateGroupId);
+  const resolvedAssertions = expectedHistoryAssertions(tool.name, groupId);
+  if (
+    canonical(c.featureAssertions) !== canonical(rawAssertions) &&
+    canonical(c.featureAssertions) !== canonical(resolvedAssertions)
+  )
+    fail(
+      "FEATURE_HISTORY_TRACE",
+      "历史用例必须核对 nonce 查询、数据源类型、检索方式及唯一测试群的 retrieval Trace。",
+    );
+}
+
+/** Resolve only the explicit group placeholders used by approved history suite templates. */
+export function resolveReadFeatureCase(testCase, resolveGroup) {
+  if (typeof resolveGroup !== "function")
+    fail("FEATURE_GROUP_BINDING", "历史用例需要受信任的群别名解析器。");
+  const resolveValue = (value) => {
+    if (typeof value === "string") {
+      const result = value.replace(/\{\{([^{}]+)\}\}/gu, (placeholder, name) => {
+        if (name === "nonce") return placeholder;
+        const match = /^group:([A-Z])$/u.exec(name);
+        if (!match || !TEST_GROUP_ALIASES.has(match[1]))
+          fail(
+            "FEATURE_TEMPLATE",
+            "功能用例只支持 {{nonce}} 和预先指定的 {{group:A}} / {{group:B}} 模板。",
+          );
+        const groupId = resolveGroup(match[1]);
+        if (!validGroupId(groupId))
+          fail("FEATURE_GROUP_BINDING", "测试群别名必须解析为有效数字群号。");
+        return groupId;
+      });
+      const unresolved = result.replaceAll("{{nonce}}", "");
+      if (unresolved.includes("{{") || unresolved.includes("}}"))
+        fail("FEATURE_TEMPLATE", "功能用例包含未支持的模板占位符。");
+      return result;
+    }
+    if (Array.isArray(value)) return value.map(resolveValue);
+    if (value && typeof value === "object")
+      return Object.fromEntries(
+        Object.entries(value).map(([key, child]) => [key, resolveValue(child)]),
+      );
+    return value;
+  };
+  return resolveValue(testCase);
+}
 
 /** Only implemented read cases are admitted here. Mutations need independent cleanup support. */
 export function validateReadFeatureSpecs(raw, config) {
@@ -87,6 +221,7 @@ export function validateReadFeatureSpecs(raw, config) {
         )
       )
         fail("FEATURE_CAPABILITY", "功能用例含未接入的读取工具或操作。");
+      if (HISTORY_TOOLS.has(tool.name)) validateHistoryCase(c, tool, config);
     }
     validateFeatureAssertions(c.featureAssertions);
     if (
@@ -101,4 +236,12 @@ export function validateReadFeatureSpecs(raw, config) {
       fail("FEATURE_EXECUTION_ASSERTION", "功能用例必须证明指定工具实际执行成功。");
   }
   return raw.cases;
+}
+
+/** Validate a raw schema-2 suite and resolve its approved A/B test-group aliases. */
+export function resolveReadFeatureSpecs(raw, config) {
+  const cases = validateReadFeatureSpecs(raw, config);
+  return cases.map((testCase) =>
+    resolveReadFeatureCase(testCase, (alias) => configGroup(config, alias).id),
+  );
 }

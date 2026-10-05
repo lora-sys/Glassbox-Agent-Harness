@@ -71,6 +71,31 @@ test("missing or rejected feature lease prevents all sends", async (t) => {
   assert.notEqual(denied.status, "PASS");
   assert.equal(w.actions.filter((a) => a.action.startsWith("send_")).length, 0);
 });
+test("feature evidence query is expanded to the exact sent marker", async (t) => {
+  const w = await setup(t);
+  const assertions = [
+    {
+      kind: "trace",
+      type: "history_retrieval",
+      count: 1,
+      where: { query: "{{nonce}}", groups: ["123"], resources: ["group:123"] },
+    },
+  ];
+  const c = await replyCase(
+    w.config,
+    w.clients,
+    w.recorder,
+    { ...featureSpec, featureAssertions: assertions },
+    undefined,
+    {
+      register: async () => ({ leaseId: "fixture-lease" }),
+      revoke: async () => {},
+    },
+  );
+  assert.equal(c.status, "PASS");
+  assert.equal(c.featureAssertions[0].where.query, c.token);
+  assert.equal(assertions[0].where.query, "{{nonce}}");
+});
 test("lost registration response revokes by marker without retrying or sending", async (t) => {
   const w = await setup(t);
   let attempts = 0,

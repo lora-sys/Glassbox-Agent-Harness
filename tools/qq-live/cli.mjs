@@ -11,7 +11,7 @@ import { Recorder, doctor, smokeSpecs, validateSpecs, replyCase } from "./lib/ru
 import { moderationCase } from "./lib/moderation.mjs";
 import { runtimeSnapshot, verifyProductEvidence } from "./lib/product-evidence.mjs";
 import { acceptanceManagement } from "./lib/management-client.mjs";
-import { validateReadFeatureSpecs } from "./lib/feature-specs.mjs";
+import { resolveReadFeatureSpecs } from "./lib/feature-specs.mjs";
 
 const root = dirname(fileURLToPath(import.meta.url));
 const help = `QQ 实机测试器 0.1.0
@@ -110,15 +110,22 @@ async function main() {
   if (command === "coverage") {
     const { checkRepositoryFeatureCoverage } = await import("./feature-catalog.mjs");
     const catalog = o.catalog ? (await jsonFile(resolve(o.catalog))).raw : undefined;
-    const executableSuiteCases = o.scenarios
-      ? validateReadFeatureSpecs(
-          (await jsonFile(resolve(o.scenarios))).raw,
-          validateConfig(
-            (await jsonFile(resolve(o.config ?? join(root, "qq-live.local.json")))).raw,
-          ),
-        )
-      : [];
-    const result = await checkRepositoryFeatureCoverage({ catalog, executableSuiteCases });
+    let executableSuiteCases = [];
+    let suiteConfig;
+    if (o.scenarios) {
+      const suite = (await jsonFile(resolve(o.scenarios))).raw;
+      const config = validateConfig(
+        (await jsonFile(resolve(o.config ?? join(root, "qq-live.local.json")))).raw,
+      );
+      resolveReadFeatureSpecs(suite, config);
+      executableSuiteCases = suite.cases;
+      suiteConfig = config;
+    }
+    const result = await checkRepositoryFeatureCoverage({
+      catalog,
+      executableSuiteCases,
+      suiteConfig,
+    });
     console.log(JSON.stringify(result, null, 2));
     process.exitCode = result.status === "PASS" ? 0 : 2;
     return;
@@ -172,7 +179,7 @@ async function main() {
         "自定义自然语言尚未有可验证的能力限制，仅支持 plan 审阅。实机运行使用固定用例。",
       );
     specs = featureSuite
-      ? validateReadFeatureSpecs(suite.raw, config)
+      ? resolveReadFeatureSpecs(suite.raw, config)
       : validateSpecs(suite.raw, config);
     if (command === "run" && featureSuite && !config.runtime)
       fail("FEATURE_RUNTIME_REQUIRED", "功能用例必须配置并核对真实验收服务版本。");

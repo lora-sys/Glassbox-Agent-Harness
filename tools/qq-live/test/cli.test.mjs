@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { world, baseConfig } from "./fixture.mjs";
+import { digest } from "../lib/core.mjs";
 const cli = fileURLToPath(new URL("../cli.mjs", import.meta.url));
 async function run(args, dir, extraEnv = {}) {
   return new Promise((resolve) => {
@@ -115,6 +116,64 @@ test("default feature inventory reports unimplemented executable coverage withou
   assert.equal(result.code, 2, result.stderr);
   assert.equal(JSON.parse(result.stdout).status, "BLOCKED");
   assert.ok(JSON.parse(result.stdout).gaps.some((g) => g.code === "CASE_NOT_EXECUTABLE"));
+});
+test("history plan resolves the configured group but approves the original suite bytes", async (t) => {
+  const d = await dir(t),
+    configPath = join(d, "c.json"),
+    suitePath = join(d, "s.json");
+  await writeFile(configPath, JSON.stringify(baseConfig()));
+  const suiteText = JSON.stringify({
+    schemaVersion: 2,
+    cases: [
+      {
+        id: "history-test",
+        chat: "A",
+        prompt: "Search group_history_search for {{nonce}} with limit 1",
+        expectContains: ["{{nonce}}"],
+        sideEffect: "none",
+        leaseTools: [
+          {
+            name: "group_history_search",
+            operations: [
+              {
+                action: "history:read",
+                resourceId: "group:{{group:A}}",
+                inputConstraint: { query: "{{nonce}}", limit: 1 },
+              },
+            ],
+          },
+        ],
+        featureAssertions: [
+          {
+            kind: "trace",
+            type: "tool_result",
+            where: { name: "group_history_search", isError: false },
+            count: 1,
+          },
+          {
+            kind: "trace",
+            type: "history_retrieval",
+            where: {
+              query: "{{nonce}}",
+              groups: ["{{group:A}}"],
+              resources: ["group:{{group:A}}"],
+              sourceKind: "channel_message",
+              retrievalMode: "lexical",
+            },
+            count: 1,
+          },
+        ],
+      },
+    ],
+  });
+  await writeFile(suitePath, suiteText);
+  const planned = await run(["plan", "--config", configPath, "--scenarios", suitePath], d);
+  assert.equal(planned.code, 0, planned.stderr);
+  const plan = JSON.parse(planned.stdout);
+  assert.equal(plan.suiteSha256, digest(suiteText));
+  assert.equal(plan.cases[0].leaseTools[0].operations[0].resourceId, "group:20001");
+  assert.deepEqual(plan.cases[0].featureAssertions[1].where.groups, ["20001"]);
+  assert.equal(plan.cases[0].featureAssertions[1].where.query, "{{nonce}}");
 });
 test("invalid configuration blocks before networking", async (t) => {
   const d = await dir(t);

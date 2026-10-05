@@ -79,6 +79,10 @@ function fixture() {
     ],
   };
   const dependencies = {
+    verifyCoverage: async () => ({
+      status: "PASS",
+      requiredCaseIds: ["feature-test", "baseline-test"],
+    }),
     resolveRoute: (chat) => (chat === "private" ? "private" : undefined),
     verifyReport: async () => ({
       status: "PASS",
@@ -103,6 +107,53 @@ function fixture() {
   };
   return { input, dependencies };
 }
+test("default coverage rejects evidence for a different checkout commit before remote checks", async () => {
+  const { input, dependencies } = fixture();
+  delete dependencies.verifyCoverage;
+  let queriedRemote = false;
+  dependencies.readRemote = async () => {
+    queriedRemote = true;
+    throw Error("must not reach remote");
+  };
+  await assert.rejects(evaluateDeliveryGate(input, dependencies), { code: "COVERAGE_VERSION" });
+  assert.equal(queriedRemote, false);
+});
+test("a coverage verifier cannot omit its missing required baseline case", async () => {
+  const { input, dependencies } = fixture();
+  dependencies.verifyCoverage = async () => ({
+    status: "PASS",
+    requiredCaseIds: ["missing-baseline"],
+  });
+  await assert.rejects(evaluateDeliveryGate(input, dependencies), { code: "COVERAGE_GATE" });
+});
+test("gate resolves approved group scope and nonce assertions through trusted bindings", async () => {
+  const { input, dependencies } = fixture();
+  const suite = JSON.parse(input.suiteText);
+  suite.cases[0].featureAssertions.push({
+    kind: "trace",
+    type: "history_retrieval",
+    count: 1,
+    where: { query: "{{nonce}}", groups: ["{{group:A}}"], resources: ["group:{{group:A}}"] },
+  });
+  input.suiteText = JSON.stringify(suite);
+  input.suiteSha256 = digest(input.suiteText);
+  input.reports[0].suiteSha256 = input.suiteSha256;
+  const c = input.reports[0].cases[0];
+  c.featureAssertions.push({
+    kind: "trace",
+    type: "history_retrieval",
+    count: 1,
+    where: { query: c.token, groups: ["10001"], resources: ["group:10001"] },
+  });
+  dependencies.resolveRoute = (chat) =>
+    chat === "private" ? "private" : chat === "A" ? "10001" : undefined;
+  assert.equal((await evaluateDeliveryGate(input, dependencies)).status, "PASS");
+  c.featureAssertions[1].where.query = "old-nonce";
+  await assert.rejects(evaluateDeliveryGate(input, dependencies), { code: "SUITE_CASE_BINDING" });
+  c.featureAssertions[1].where.query = c.token;
+  c.featureAssertions[1].where.groups.push("456");
+  await assert.rejects(evaluateDeliveryGate(input, dependencies), { code: "SUITE_CASE_BINDING" });
+});
 test("gate binds the executed message, route, reply assertions and lease operations to approval", async () => {
   for (const alter of [
     (c) => {

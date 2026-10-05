@@ -8,6 +8,7 @@ import {
   readImplementedToolDescriptors,
 } from "../feature-catalog.mjs";
 import { validateReadFeatureSpecs } from "../lib/feature-specs.mjs";
+import { resolveReadFeatureSpecs } from "../lib/feature-specs.mjs";
 
 function minimalCatalog(overrides = {}) {
   return {
@@ -86,7 +87,14 @@ test("read-only example binds only the implemented Ops and QQ inventory cases", 
   const source = JSON.parse(
     await readFile(new URL("../examples/feature-read.example.json", import.meta.url), "utf8"),
   );
-  const suiteCases = validateReadFeatureSpecs(source, { groups: [] });
+  const suiteConfig = {
+    groups: [
+      { alias: "A", id: "10001" },
+      { alias: "B", id: "10002" },
+    ],
+  };
+  const suiteCases = validateReadFeatureSpecs(source, suiteConfig);
+  const resolvedCases = resolveReadFeatureSpecs(source, suiteConfig);
   const executableCatalogCases = FEATURE_CATALOG.cases.filter(
     (testCase) => testCase.executionStatus === "executable",
   );
@@ -103,15 +111,37 @@ test("read-only example binds only the implemented Ops and QQ inventory cases", 
     );
     assert.deepEqual(testCase.assertions, suiteCase.featureAssertions);
   }
+  const groupCase = resolvedCases.find(
+    (candidate) => candidate.id === "history-current-group-nonce",
+  );
+  const ownerCase = resolvedCases.find(
+    (candidate) => candidate.id === "history-owner-group-a-nonce",
+  );
+  assert.equal(groupCase.leaseTools[0].operations[0].resourceId, "group:10001");
+  assert.deepEqual(groupCase.leaseTools[0].operations[0].inputConstraint, {
+    query: "{{nonce}}",
+    limit: 1,
+  });
+  assert.deepEqual(groupCase.featureAssertions[1].where.groups, ["10001"]);
+  assert.equal(ownerCase.leaseTools[0].operations[0].resourceId, "owner-history");
+  assert.deepEqual(ownerCase.leaseTools[0].operations[0].inputConstraint, {
+    query: "{{nonce}}",
+    groupIds: ["10001"],
+    limit: 1,
+  });
+  assert.deepEqual(ownerCase.featureAssertions[1].where.resources, ["group:10001"]);
 
   const descriptors = await readImplementedToolDescriptors();
   const result = checkFeatureCoverage({
     descriptors,
     executableSuiteCases: suiteCases,
+    suiteConfig,
   });
   assert.equal(result.status, "BLOCKED");
   assert.deepEqual(result.coveredTools, [
+    "group_history_search",
     "ops_status",
+    "owner_history_search",
     "qq_account_status",
     "qq_capability_search",
     "qq_groups",
@@ -129,6 +159,11 @@ test("read-only example binds only the implemented Ops and QQ inventory cases", 
   assert.ok(
     result.gaps.some(
       (gap) => gap.code === "MISSING_DOMAIN_COVERAGE" && gap.domain === "agent_operations",
+    ),
+  );
+  assert.ok(
+    result.gaps.some(
+      (gap) => gap.code === "MISSING_DOMAIN_COVERAGE" && gap.domain === "history_retrieval",
     ),
   );
 });

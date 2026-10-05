@@ -17,7 +17,25 @@ const FIELDS = new Set([
   "memoryId",
   "taskId",
   "assetId",
+  "query",
+  "sourceKind",
+  "retrievalMode",
 ]);
+const ARRAY_FIELDS = new Set(["groups", "resources"]);
+const validFilter = (key, value) =>
+  ARRAY_FIELDS.has(key)
+    ? Array.isArray(value) &&
+      value.length > 0 &&
+      value.length <= 8 &&
+      value.every((item) => typeof item === "string" && item.length > 0 && item.length <= 128) &&
+      new Set(value).size === value.length
+    : FIELDS.has(key) && ["string", "number", "boolean"].includes(typeof value);
+const equalFilter = (actual, expected) =>
+  Array.isArray(expected)
+    ? Array.isArray(actual) &&
+      actual.length === expected.length &&
+      actual.every((value, index) => value === expected[index])
+    : actual === expected;
 const STATES = {
   task: {
     sql: "SELECT id, status, run_id FROM tasks WHERE id=?",
@@ -60,9 +78,7 @@ export function validateFeatureAssertions(assertions) {
         Array.isArray(a.where) ||
         typeof a.where !== "object" ||
         !Object.keys(a.where).length ||
-        Object.entries(a.where).some(
-          ([k, v]) => !FIELDS.has(k) || !["string", "number", "boolean"].includes(typeof v),
-        ) ||
+        Object.entries(a.where).some(([k, v]) => !validFilter(k, v)) ||
         !Number.isSafeInteger(a.count) ||
         a.count < 1 ||
         a.count > 32 ||
@@ -96,8 +112,8 @@ export function observeFeature(assertions, { db, events, runId }) {
           e.type === assertion.type &&
           Object.entries(assertion.where).every(([key, value]) =>
             Object.hasOwn(e.data ?? {}, key)
-              ? e.data[key] === value
-              : Object.hasOwn(e, key) && e[key] === value,
+              ? equalFilter(e.data[key], value)
+              : Object.hasOwn(e, key) && equalFilter(e[key], value),
           ),
       );
       if (matches.length !== assertion.count)

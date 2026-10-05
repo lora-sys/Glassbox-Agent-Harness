@@ -167,19 +167,103 @@ export const FEATURE_CATALOG = Object.freeze({
     {
       id: "history-search-current-group",
       domain: "history_retrieval",
-      executionStatus: "planned",
+      executionStatus: "executable",
       tools: ["group_history_search"],
+      suiteCaseId: "history-current-group-nonce",
+      leaseTools: [
+        {
+          name: "group_history_search",
+          operations: [
+            {
+              action: "history:read",
+              resourceId: "group:{{group:A}}",
+              inputConstraint: { query: "{{nonce}}", limit: 1 },
+            },
+          ],
+        },
+      ],
+      assertions: [
+        {
+          kind: "trace",
+          type: "tool_result",
+          where: { name: "group_history_search", isError: false },
+          count: 1,
+        },
+        {
+          kind: "trace",
+          type: "history_retrieval",
+          where: {
+            query: "{{nonce}}",
+            groups: ["{{group:A}}"],
+            resources: ["group:{{group:A}}"],
+            sourceKind: "channel_message",
+            retrievalMode: "lexical",
+          },
+          count: 1,
+        },
+      ],
       coveragePlan:
-        "Search only a unique message posted to the dedicated test group; assert its retrieval event and coverage.",
+        "Scope-limited read-only path check on dedicated group A. This does not prove a positive hit, absence of a match, or complete source synchronization.",
       mutation: "none",
     },
     {
       id: "history-search-owner-scoped-groups",
       domain: "history_retrieval",
-      executionStatus: "planned",
+      executionStatus: "executable",
       tools: ["owner_history_search"],
+      suiteCaseId: "history-owner-group-a-nonce",
+      leaseTools: [
+        {
+          name: "owner_history_search",
+          operations: [
+            {
+              action: "history:search",
+              resourceId: "owner-history",
+              inputConstraint: { query: "{{nonce}}", groupIds: ["{{group:A}}"], limit: 1 },
+            },
+          ],
+        },
+      ],
+      assertions: [
+        {
+          kind: "trace",
+          type: "tool_result",
+          where: { name: "owner_history_search", isError: false },
+          count: 1,
+        },
+        {
+          kind: "trace",
+          type: "history_retrieval",
+          where: {
+            query: "{{nonce}}",
+            groups: ["{{group:A}}"],
+            resources: ["group:{{group:A}}"],
+            sourceKind: "channel_message",
+            retrievalMode: "lexical",
+          },
+          count: 1,
+        },
+      ],
       coveragePlan:
-        "Search only selected authorized test groups and prove an unauthorized group is absent.",
+        "Owner-private scope-limited read-only path check on dedicated group A. No group message is seeded by this suite, so a positive match is not proven.",
+      mutation: "none",
+    },
+    {
+      id: "history-positive-and-negative-result-proof",
+      domain: "history_retrieval",
+      executionStatus: "planned",
+      tools: ["group_history_search", "owner_history_search"],
+      coveragePlan:
+        "The current Trace observer cannot prove result items, no-match semantics, or safe handling of a seeded nonce message. Add separate positive-hit and negative-result evidence before claiming retrieval behavior coverage.",
+      mutation: "none",
+    },
+    {
+      id: "history-source-sync-completeness",
+      domain: "history_retrieval",
+      executionStatus: "planned",
+      tools: ["group_history_search", "owner_history_search"],
+      coveragePlan:
+        "History retrieval Trace carries nested coverage and per-source sync stops, but the feature observer cannot yet assert those structures. Keep completeness and truncation behavior uncovered.",
       mutation: "none",
     },
     {
@@ -543,7 +627,7 @@ function stableJson(value) {
   return JSON.stringify(value);
 }
 
-function bindToSuiteCase(testCase, suiteCases, gaps) {
+function bindToSuiteCase(testCase, suiteCases, gaps, suiteConfig) {
   const matches = suiteCases.filter((suiteCase) => suiteCase?.id === testCase.suiteCaseId);
   if (matches.length !== 1) {
     gaps.push({
@@ -579,11 +663,34 @@ function bindToSuiteCase(testCase, suiteCases, gaps) {
     }
   }
 
+  if (
+    testCase.leaseTools !== undefined &&
+    stableJson(testCase.leaseTools) !== stableJson(suiteCase.leaseTools)
+  ) {
+    gaps.push({
+      code: "SUITE_LEASE_BINDING_MISMATCH",
+      caseId: testCase.id,
+      suiteCaseId: testCase.suiteCaseId,
+    });
+    valid = false;
+  }
+  const isHistoryCase = (testCase.tools ?? []).some((name) =>
+    ["group_history_search", "owner_history_search"].includes(name),
+  );
+  if (isHistoryCase && !suiteConfig) {
+    gaps.push({
+      code: "SUITE_CONFIG_REQUIRED",
+      caseId: testCase.id,
+      suiteCaseId: testCase.suiteCaseId,
+    });
+    valid = false;
+  }
+
   try {
     validateReadFeatureSpecs(
       { schemaVersion: 2, cases: [suiteCase] },
-      {
-        groups: suiteCase.chat === "private" ? [] : [{ alias: suiteCase.chat }],
+      suiteConfig ?? {
+        groups: suiteCase.chat === "private" ? [] : [{ alias: suiteCase.chat, id: "10001" }],
       },
     );
   } catch {
@@ -626,6 +733,7 @@ export function checkFeatureCoverage({
   changedTools = [],
   prerequisites = [],
   executableSuiteCases = [],
+  suiteConfig,
 } = {}) {
   const gaps = [];
   if (!Array.isArray(descriptors))
@@ -697,6 +805,7 @@ export function checkFeatureCoverage({
           "tools",
           "executionStatus",
           "suiteCaseId",
+          "leaseTools",
           "assertions",
           "coveragePlan",
           "mutation",
@@ -727,7 +836,7 @@ export function checkFeatureCoverage({
     } else if (testCase.executionStatus === "executable") {
       const suiteBound =
         typeof testCase.suiteCaseId === "string" && testCase.suiteCaseId.trim()
-          ? bindToSuiteCase(testCase, executableSuiteCases, gaps)
+          ? bindToSuiteCase(testCase, executableSuiteCases, gaps, suiteConfig)
           : false;
       if (!suiteBound && (typeof testCase.suiteCaseId !== "string" || !testCase.suiteCaseId.trim()))
         gaps.push({

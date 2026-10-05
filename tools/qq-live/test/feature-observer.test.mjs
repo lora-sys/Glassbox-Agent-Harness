@@ -18,6 +18,35 @@ const events = [
     data: { name: "task_create", isError: false },
   },
 ];
+test("history evidence binds exact query and complete source scope without payload", () => {
+  const history = {
+    kind: "trace",
+    type: "history_retrieval",
+    count: 1,
+    where: {
+      query: "fresh-nonce",
+      groups: ["group:123"],
+      resources: ["group:123"],
+      sourceKind: "channel_message",
+      retrievalMode: "lexical",
+    },
+  };
+  const event = { type: "history_retrieval", runId: "run-1", ...history.where };
+  assert.equal(observeFeature([history], { events: [event], runId: "run-1" }).status, "PASS");
+  for (const changed of [
+    { query: "old-nonce" },
+    { groups: ["group:123", "group:456"] },
+    { resources: [] },
+    { groups: "group:123" },
+  ])
+    assert.throws(
+      () => observeFeature([history], { events: [{ ...event, ...changed }], runId: "run-1" }),
+      /功能事件/,
+    );
+  for (const invalid of [[], ["group:123", "group:123"], [123], Array(9).fill("group:123")])
+    assert.throws(() => validateFeatureAssertions([{ ...history, where: { groups: invalid } }]));
+  assert.throws(() => validateFeatureAssertions([{ ...history, where: { items: [] } }]));
+});
 test("successful tool result requires matching current Run and call", () => {
   assert.equal(observeFeature([assertion], { events, runId: "run-1" }).status, "PASS");
   assert.throws(() => observeFeature([assertion], { events, runId: "run-2" }), /功能事件/);

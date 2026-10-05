@@ -275,7 +275,9 @@ export async function replyCase(config, clients, recorder, spec, signal, accepta
     check(clients, signal, config);
     if (featureCase) {
       if (!acceptance) fail("ACCEPTANCE_MANAGEMENT", "功能用例缺少服务端测试许可接口。");
-      c.featureAssertions = validateFeatureAssertions(spec.featureAssertions);
+      c.featureAssertions = validateFeatureAssertions(
+        JSON.parse(JSON.stringify(spec.featureAssertions).replaceAll("{{nonce}}", marker)),
+      );
       const tools = JSON.parse(JSON.stringify(spec.leaseTools).replaceAll("{{nonce}}", marker));
       c.leasedToolNames = tools.map((tool) => tool.name);
       registrationAttempted = true;
