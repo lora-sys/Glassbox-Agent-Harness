@@ -4,7 +4,7 @@ import { appendFileSync } from "node:fs";
 import { dirname, resolve, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { validateConfig, fail, safeError, sleep, digest, exitCode } from "./lib/core.mjs";
 import { OneBot } from "./lib/onebot.mjs";
 import { Recorder, doctor, smokeSpecs, validateSpecs, replyCase } from "./lib/runner.mjs";
@@ -12,6 +12,7 @@ import { moderationCase } from "./lib/moderation.mjs";
 import { runtimeSnapshot, verifyProductEvidence } from "./lib/product-evidence.mjs";
 import { acceptanceManagement } from "./lib/management-client.mjs";
 import { resolveReadFeatureSpecs } from "./lib/feature-specs.mjs";
+import { memoryFixtureStep } from "./lib/memory-scenario.mjs";
 
 const root = dirname(fileURLToPath(import.meta.url));
 const help = `QQ 实机测试器 0.1.0
@@ -22,6 +23,8 @@ node cli.mjs arm --minutes 30
 node cli.mjs run --live
 node cli.mjs run --live --case group-A
 node cli.mjs run --live --case moderation
+node cli.mjs plan --case memory-lifecycle
+node cli.mjs run --live --case memory-lifecycle --approve-suite <SHA256>
 node cli.mjs plan --scenarios examples/scenarios.example.json
 node cli.mjs coverage
 node cli.mjs report
@@ -30,6 +33,7 @@ node cli.mjs report
 run 默认测试私聊和已配置的群。moderation 需要独立配置和成员同意。
 schemaVersion=1 的自然语言 scenarios 仅支持 plan。
 schemaVersion=2 的结构化读取用例需要服务端逐消息许可、运行版本和工具证据。
+memory-lifecycle 是固定的项目范围反馈、提升、过期流程，需要单独启用并保留审计记录。
 退出码 0=通过，1=验收失败，2=环境或配置阻塞，3=无法确认。
 停止文件为报告目录下 STOP。Ctrl+C 也会停止，并尝试已授权的清理。
 `;
@@ -101,6 +105,38 @@ function workspace() {
 async function writeJson(path, value) {
   await writeFile(path, JSON.stringify(value, null, 2) + "\n", { mode: 0o600 });
 }
+async function syncDirectory(path) {
+  const directory = await open(path, "r");
+  try {
+    await directory.sync();
+  } finally {
+    await directory.close();
+  }
+}
+function memoryPlan() {
+  const placeholder = "0".repeat(32);
+  return {
+    schemaVersion: 3,
+    scenario: "memory-lifecycle",
+    stages: ["feedback", "promote", "expire"].map((stage) => ({
+      stage,
+      spec: JSON.parse(
+        JSON.stringify(
+          memoryFixtureStep(stage, {
+            nonce: placeholder,
+            candidateId: `candidate_${placeholder}`,
+            memoryId: `memory_${placeholder}`,
+          }),
+        )
+          .replaceAll(`candidate_${placeholder}`, "{{candidate_id}}")
+          .replaceAll(`memory_${placeholder}`, "{{memory_id}}")
+          .replaceAll(`qqtest-${placeholder}`, "qqtest-{{fixture_nonce}}"),
+      ),
+    })),
+    cleanup:
+      "expire the exact promoted fixture; retain feedback, candidate, Memory and audit history",
+  };
+}
 async function main() {
   const { command, o } = args(process.argv.slice(2));
   if (command === "help") {
@@ -170,6 +206,28 @@ async function main() {
   let specs = smokeSpecs(config),
     suiteHash = null,
     featureSuite = false;
+  const memoryLifecycle = o.case === "memory-lifecycle";
+  if (memoryLifecycle) {
+    if (o.scenarios) fail("ARGUMENT", "固定记忆流程不能与 scenarios 混用。");
+    const plan = memoryPlan();
+    suiteHash = digest(JSON.stringify(plan));
+    featureSuite = true;
+    if (command === "plan") {
+      console.log(JSON.stringify({ suiteSha256: suiteHash, ...plan }, null, 2));
+      return;
+    }
+    if (command !== "run") fail("ARGUMENT", "记忆流程只支持 plan 和 run。");
+    if (!config.runtime) fail("FEATURE_RUNTIME_REQUIRED", "记忆流程必须核对真实验收服务版本。");
+    if (
+      config.memoryFixtures?.enabled !== true ||
+      config.memoryFixtures?.retainAuditConfirmed !== true
+    )
+      fail("MEMORY_FIXTURE_DISABLED", "请在配置中明确启用 memoryFixtures 并确认保留测试审计。");
+    if (o["approve-suite"] !== suiteHash)
+      fail("SUITE_APPROVAL", "请先审阅固定记忆流程并提供 plan 输出的 SHA256。");
+    if (config.maxMessages < 3) fail("MESSAGE_BUDGET", "固定记忆流程需要三条消息的预算。");
+    specs = [];
+  }
   if (o.scenarios) {
     const suite = await jsonFile(resolve(o.scenarios));
     featureSuite = suite.raw?.schemaVersion === 2;
@@ -205,7 +263,7 @@ async function main() {
     );
     return;
   }
-  if (o.case && o.case !== "moderation") {
+  if (o.case && o.case !== "moderation" && !memoryLifecycle) {
     specs = specs.filter((s) => s.id === o.case);
     if (!specs.length) fail("CASE_NOT_FOUND", "没有匹配的用例，未执行任何测试。");
   }
@@ -222,6 +280,7 @@ async function main() {
     lockRoot,
     createHash("sha256").update(config.driver.qq).digest("hex").slice(0, 24) + ".lock",
   );
+  const pendingFixturePath = lockPath.replace(/\.lock$/, ".memory-pending.json");
   let lock;
   try {
     lock = await open(lockPath, "wx", 0o600);
@@ -267,6 +326,7 @@ async function main() {
   };
   let timer;
   let acceptance;
+  let pendingFixtureCreated = false;
   const observers = [];
   try {
     await mkdir(runDir, { mode: 0o700 });
@@ -280,6 +340,11 @@ async function main() {
       appendFileSync(join(runDir, "events.jsonl"), JSON.stringify(e) + "\n", { mode: 0o600 });
     const { existsSync } = await import("node:fs");
     if (existsSync(join(out, "STOP"))) fail("STOP_FILE", "存在 STOP 文件，本轮不会发送消息。");
+    if (command === "run" && existsSync(pendingFixturePath))
+      fail(
+        "MEMORY_RECONCILIATION_REQUIRED",
+        "该发起账号有未核实的记忆测试资源。先核实原始报告和清理证据，禁止续发。",
+      );
     if (command === "run" && config.runtime) report.runtime = runtimeSnapshot(config.runtime);
     if (command === "run" && featureSuite) acceptance = await acceptanceManagement(config.runtime);
     timer = setInterval(() => {
@@ -296,6 +361,131 @@ async function main() {
     } else if (o.case === "moderation") {
       await moderationCase(config, clients, recorder, controller.signal);
       report.status = recorder.finalize();
+    } else if (memoryLifecycle) {
+      const { runMemoryLifecycle } = await import("./lib/memory-lifecycle.mjs");
+      const { discoverFeedbackCandidate, discoverPromotedMemory, verifyMemoryCleanup } =
+        await import("./lib/memory-fixture.mjs");
+      const { DatabaseSync } = await import("node:sqlite");
+      let memoryCheckpointState;
+      const checkpointMemory = async (state) => {
+        const row = {
+          schemaVersion: 1,
+          ...state,
+          at: new Date().toISOString(),
+          runId,
+          reportDirectory: runDir,
+        };
+        const pending = await open(pendingFixturePath, pendingFixtureCreated ? "w" : "wx", 0o600);
+        try {
+          pendingFixtureCreated = true;
+          await pending.writeFile(JSON.stringify(row) + "\n");
+          await pending.sync();
+        } finally {
+          await pending.close();
+        }
+        await syncDirectory(lockRoot);
+        await syncDirectory(dirname(lockRoot));
+        const journal = await open(join(runDir, "memory-fixture.jsonl"), "a", 0o600);
+        try {
+          await journal.writeFile(JSON.stringify(row) + "\n");
+          await journal.sync();
+        } finally {
+          await journal.close();
+        }
+        await syncDirectory(runDir);
+        await syncDirectory(out);
+        memoryCheckpointState = state;
+      };
+      acceptance.beforeSend = async (c, lease) => {
+        if (!memoryCheckpointState)
+          fail("CHECKPOINT_UNCONFIRMED", "记忆流程没有发送前的状态记录。");
+        await checkpointMemory({
+          ...memoryCheckpointState,
+          phase: "prepared",
+          preparedCase: {
+            caseId: c.id,
+            marker: c.token,
+            textSha256: digest(c.prompt),
+            startedAt: c.startedAt,
+            route: c.route,
+            leaseId: lease.leaseId,
+            expiresAt: lease.expiresAt,
+            toolsSha256: lease.toolsSha256,
+          },
+        });
+      };
+      report.memoryLifecycle = await runMemoryLifecycle({
+        fixtureNonce: randomUUID().replaceAll("-", ""),
+        signal: controller.signal,
+        checkpoint: checkpointMemory,
+        executeStep: async (stage, spec) => {
+          if (stage !== "feedback") await sleep(config.minGapMs);
+          const transportCase = await replyCase(
+            config,
+            clients,
+            recorder,
+            spec,
+            controller.signal,
+            acceptance,
+          );
+          if (transportCase.status !== "PASS") return { transportCase };
+          const productAcceptance = await verifyProductEvidence(
+            { mode: "run", status: "PASS", runtime: report.runtime, cases: [transportCase] },
+            config,
+            clients,
+          );
+          return { transportCase, productAcceptance };
+        },
+        observeStep: async (stage, handles) => {
+          const db = new DatabaseSync(join(config.runtime.dataDirectory, "glassbox.db"), {
+            readOnly: true,
+          });
+          try {
+            const actor = db
+              .prepare(
+                "SELECT r.principal_id, p.kind FROM runs r JOIN principals p ON p.id=r.principal_id WHERE r.id=?",
+              )
+              .get(handles.stepRunId);
+            if (
+              !actor ||
+              actor.kind !== "owner" ||
+              (handles.principalId && actor.principal_id !== handles.principalId)
+            )
+              fail(
+                "MEMORY_FIXTURE_OWNER",
+                "本轮记忆测试 Run 的 Owner 身份不一致。",
+                "INCONCLUSIVE",
+              );
+            const input = {
+              runId: handles.stepRunId,
+              principalId: actor.principal_id,
+              projectId: handles.projectId,
+            };
+            const observed =
+              stage === "feedback"
+                ? discoverFeedbackCandidate(db, input)
+                : stage === "promote"
+                  ? discoverPromotedMemory(db, {
+                      ...input,
+                      candidateId: handles.candidateId,
+                      creationRunId: handles.creationRunId,
+                    })
+                  : verifyMemoryCleanup(db, {
+                      ...input,
+                      candidateId: handles.candidateId,
+                      memoryId: handles.memoryId,
+                      creationRunId: handles.creationRunId,
+                      cleanupRunId: handles.stepRunId,
+                    });
+            return { ...observed, principalKind: actor.kind, stepRunId: handles.stepRunId };
+          } finally {
+            db.close();
+          }
+        },
+      });
+      report.status = report.memoryLifecycle.status;
+      report.plannedCaseCount = 3;
+      report.executedCaseCount = recorder.cases.length;
     } else {
       if (specs.length > config.maxMessages) fail("MESSAGE_BUDGET", "用例数超过本轮消息预算。");
       for (const spec of specs) {
@@ -353,7 +543,11 @@ async function main() {
           (c) =>
             (c.cleanup?.required && !c.cleanup.restored) ||
             (c.sendAttempted && c.status === "INCONCLUSIVE"),
-        )
+        ) ||
+        (pendingFixtureCreated &&
+          (report.memoryLifecycle?.requiresReconciliation !== false ||
+            report.status !== "PASS" ||
+            report.productAcceptance.status !== "PASS"))
       ) {
         await writeFile(
           join(out, "STOP"),
@@ -394,6 +588,16 @@ async function main() {
         })),
         error: report.error,
       });
+      if (
+        pendingFixtureCreated &&
+        report.status === "PASS" &&
+        report.productAcceptance.status === "PASS" &&
+        report.memoryLifecycle?.requiresReconciliation === false &&
+        report.memoryLifecycle?.status === "PASS"
+      ) {
+        await rm(pendingFixturePath);
+        await syncDirectory(lockRoot);
+      }
     } finally {
       await lock.close();
       await rm(lockPath, { force: true });

@@ -285,6 +285,11 @@ export async function replyCase(config, clients, recorder, spec, signal, accepta
       lease = await acceptance.register(config, c, tools);
       c.acceptanceLease = lease;
       check(clients, signal, config);
+      if (acceptance.beforeSend) {
+        if ((await acceptance.beforeSend(c, lease)) === false)
+          fail("CHECKPOINT_UNCONFIRMED", "发送前的测试进度记录未确认。");
+        check(clients, signal, config);
+      }
     }
     await sendCase(config, clients, c);
     const end = Date.now() + config.timeoutMs;

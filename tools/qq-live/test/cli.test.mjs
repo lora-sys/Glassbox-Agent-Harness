@@ -43,6 +43,107 @@ test("help requires no credentials or network", async (t) => {
   const d = await dir(t);
   assert.equal((await run(["help"], d)).code, 0);
 });
+test("fixed Memory lifecycle plan exposes all steps without enabling writes", async (t) => {
+  const d = await dir(t),
+    p = join(d, "c.json");
+  await writeFile(p, JSON.stringify(baseConfig()));
+  const r = await run(["plan", "--case", "memory-lifecycle", "--config", p], d);
+  assert.equal(r.code, 0);
+  const plan = JSON.parse(r.stdout);
+  assert.deepEqual(
+    plan.stages.map((s) => s.stage),
+    ["feedback", "promote", "expire"],
+  );
+  assert.ok(plan.stages[0].spec.prompt.includes("qqtest-{{fixture_nonce}}"));
+  assert.ok(plan.stages[1].spec.prompt.includes("{{candidate_id}}"));
+  assert.ok(plan.stages[2].spec.prompt.includes("{{memory_id}}"));
+  assert.match(plan.suiteSha256, /^[a-f0-9]{64}$/);
+  const blocked = await run(
+    [
+      "run",
+      "--live",
+      "--case",
+      "memory-lifecycle",
+      "--config",
+      p,
+      "--approve-suite",
+      plan.suiteSha256,
+    ],
+    d,
+  );
+  assert.equal(blocked.code, 2);
+  assert.ok(blocked.stderr.includes("FEATURE_RUNTIME_REQUIRED"));
+});
+test("Memory fixture writes require explicit enablement before networking", async (t) => {
+  const d = await dir(t),
+    p = join(d, "c.json");
+  await writeFile(p, JSON.stringify({ ...baseConfig(), runtime: {} }));
+  const r = await run(["run", "--live", "--case", "memory-lifecycle", "--config", p], d);
+  assert.equal(r.code, 2);
+  assert.ok(r.stderr.includes("MEMORY_FIXTURE_DISABLED"));
+});
+test("fixed Memory lifecycle rejects changed approval, insufficient budget, and custom suites", async (t) => {
+  const d = await dir(t),
+    p = join(d, "c.json"),
+    suite = join(d, "s.json");
+  const config = {
+    ...baseConfig(),
+    runtime: {},
+    memoryFixtures: { enabled: true, retainAuditConfirmed: true },
+  };
+  await writeFile(p, JSON.stringify(config));
+  await writeFile(suite, "{}");
+  const approved = JSON.parse(
+    (await run(["plan", "--case", "memory-lifecycle", "--config", p], d)).stdout,
+  ).suiteSha256;
+  const wrong = await run(
+    [
+      "run",
+      "--live",
+      "--case",
+      "memory-lifecycle",
+      "--config",
+      p,
+      "--approve-suite",
+      "0".repeat(64),
+    ],
+    d,
+  );
+  assert.equal(wrong.code, 2);
+  assert.ok(wrong.stderr.includes("SUITE_APPROVAL"));
+  await writeFile(p, JSON.stringify({ ...config, maxMessages: 2 }));
+  const budget = await run(
+    ["run", "--live", "--case", "memory-lifecycle", "--config", p, "--approve-suite", approved],
+    d,
+  );
+  assert.equal(budget.code, 2);
+  assert.ok(budget.stderr.includes("MESSAGE_BUDGET"));
+  const mixed = await run(
+    ["plan", "--case", "memory-lifecycle", "--config", p, "--scenarios", suite],
+    d,
+  );
+  assert.equal(mixed.code, 2);
+  assert.ok(mixed.stderr.includes("ARGUMENT"));
+});
+test("pending Memory fixtures block the account even with another report directory", async (t) => {
+  const d = await dir(t),
+    w = await world();
+  t.after(() => w.close());
+  const p = join(d, "c.json"),
+    locks = join(d, ".glassbox-qq-live-locks");
+  await writeFile(p, JSON.stringify(w.config));
+  await mkdir(locks);
+  const pending = join(locks, digest(w.config.driver.qq).slice(0, 24) + ".memory-pending.json");
+  await writeFile(pending, "{}");
+  const r = await run(["run", "--live", "--config", p, "--out", join(d, "different-reports")], d);
+  assert.equal(r.code, 2);
+  assert.ok(
+    JSON.parse(await readFile(join(d, "different-reports", "latest.json"), "utf8")).error.code ===
+      "MEMORY_RECONCILIATION_REQUIRED",
+  );
+  assert.equal(w.actions.length, 0);
+  assert.equal(await readFile(pending, "utf8"), "{}");
+});
 test("unknown ordinary send persists STOP and blocks a later run", async (t) => {
   const d = await dir(t),
     w = await world({ ack: "timeout" });

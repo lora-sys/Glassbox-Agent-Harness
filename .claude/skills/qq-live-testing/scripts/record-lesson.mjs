@@ -14,6 +14,12 @@ import {
   verifyLeaseTraceEvidence,
   verifyTraceEvidence as verifyProductTraceEvidence,
 } from "../../../../tools/qq-live/lib/product-evidence.mjs";
+import {
+  discoverFeedbackCandidate,
+  verifyMemoryCleanup,
+} from "../../../../tools/qq-live/lib/memory-fixture.mjs";
+import { memoryFixtureStep } from "../../../../tools/qq-live/lib/memory-scenario.mjs";
+import { toolManifestDigest } from "../../../../tools/qq-live/lib/core.mjs";
 
 const CASE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{1,79}$/;
 const COMMIT = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i;
@@ -27,6 +33,7 @@ const PERSONAL_MESSAGE =
   /[“”「」『』]|(^|\s)["'][^"']{3,}["']|(?:^|[\s,，。！？])(?:我|你|您)(?:想|要|是|在|能|可以|帮|给|觉得|怎么|为什么|请|好|吗|呢)|(?:您好|你好|谢谢|请问|在吗|麻烦|能不能)/i;
 const FIELDS = new Set(["case", "commit", "status", "evidence", "symptom", "lesson", "nextStep"]);
 const VERIFIED_FIELDS = new Set([...FIELDS, "verification"]);
+const MEMORY_LIFECYCLE_CASES = new Set(["memory-feedback", "memory-promote", "memory-expire"]);
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(SCRIPT_DIR, "../../../..");
 
@@ -122,6 +129,104 @@ function passingBinding(value) {
     Number.isSafeInteger(value.time) &&
     /^[a-f0-9]{64}$/i.test(value.textSha256 ?? "")
   );
+}
+
+function hasMarkedMemoryMutationPrompt(caseRecord) {
+  if (typeof caseRecord?.prompt !== "string") return false;
+  const [markerLine, ...body] = caseRecord.prompt.split(/\r\n|\n|\r/u);
+  return (
+    /^GLASSBOX_ACCEPTANCE_V1 [a-f0-9]{32}$/u.test(markerLine ?? "") &&
+    body.some((line) => /^\s*\/memory\s+(?:feedback|promote|reject|expire)(?:\s|$)/u.test(line))
+  );
+}
+
+function hasUnsafeMemoryToolTrace(events, runId) {
+  const runEvents = events.filter((event) => event?.runId === runId);
+  const memoryEvents = runEvents.filter(
+    (event) =>
+      ["tool_call", "tool_result"].includes(event?.type) &&
+      event.data?.name === "owner_memory_admin",
+  );
+  return memoryEvents.some((event) => {
+    const toolCallId = event.toolCallId ?? event.data?.toolCallId;
+    if (typeof toolCallId !== "string" || !toolCallId) return true;
+    const pairedEvents = runEvents.filter(
+      (candidate) =>
+        ["tool_call", "tool_result"].includes(candidate?.type) &&
+        (candidate.toolCallId ?? candidate.data?.toolCallId) === toolCallId,
+    );
+    const calls = pairedEvents.filter((candidate) => candidate.type === "tool_call");
+    const results = pairedEvents.filter((candidate) => candidate.type === "tool_result");
+    if (
+      pairedEvents.length !== 2 ||
+      calls.length !== 1 ||
+      results.length !== 1 ||
+      pairedEvents.some((candidate) => candidate.data?.name !== "owner_memory_admin")
+    )
+      return true;
+    const action = calls[0].data?.input?.action;
+    return !["list", "get", "list_candidates"].includes(action);
+  });
+}
+
+function requiresMemoryLifecycleVerification(report, events, runId) {
+  return (
+    Object.hasOwn(report, "memoryLifecycle") ||
+    (Array.isArray(report.cases) &&
+      report.cases.some(
+        (item) => MEMORY_LIFECYCLE_CASES.has(item?.id) || hasMarkedMemoryMutationPrompt(item),
+      )) ||
+    hasUnsafeMemoryToolTrace(events, runId)
+  );
+}
+
+function traceEventsForLesson(report, lesson, evidence, capture) {
+  let trace;
+  try {
+    trace = readTraceEvents(evidence.checkout, evidence.dataDirectory, evidence.runId, capture, [
+      "tool_call",
+      "tool_result",
+    ]);
+  } catch {
+    invalid("gbxtrace could not verify Run evidence");
+  }
+  if (trace.runId !== evidence.runId || !Array.isArray(trace.events))
+    invalid("gbxtrace returned evidence for a different Run");
+  const events = trace.events.map((row) => row.event);
+  const caseRecord = report.cases.find((item) => item.id === lesson.case);
+  const accepted = report.productAcceptance.cases.find((item) => item.caseId === lesson.case);
+  const config = {
+    runtime: {
+      connectionId: evidence.scope.connectionId,
+      threadId: evidence.scope.threadId ?? null,
+    },
+    bot: { qq: evidence.scope.botId },
+    driver: { qq: evidence.scope.senderId },
+  };
+  try {
+    verifyProductTraceEvidence(events, caseRecord, config, accepted.delivery);
+  } catch {
+    invalid("gbxtrace did not confirm the report's matching input and sent delivery");
+  }
+  return events;
+}
+
+function verifyTracePromptHash(caseRecord, accepted, events) {
+  const promptHash =
+    typeof caseRecord?.prompt === "string" ? digest(Buffer.from(caseRecord.prompt, "utf8")) : "";
+  const inputEvents = events.filter(
+    (event) =>
+      event.type === "message_received" &&
+      String(event.externalId) === String(caseRecord.inputBinding?.botMessageId),
+  );
+  if (
+    !promptHash ||
+    caseRecord.inputBinding?.textSha256 !== promptHash ||
+    accepted.messageBinding?.input?.textSha256 !== promptHash ||
+    inputEvents.length !== 1 ||
+    inputEvents[0].textSha256 !== promptHash
+  )
+    invalid("Raw Trace input hash does not match the report's bound prompt");
 }
 
 export function validateLiveReport(report, lesson, reportPath, expectedHash) {
@@ -271,20 +376,232 @@ export function verifyFeatureReport(report, lesson, evidence, capture = execFile
   } finally {
     db?.close();
   }
+  return events;
+}
+
+export function verifyMemoryLifecycleReport(report, lesson, evidence, capture = execFileSync) {
+  const lifecycle = report.memoryLifecycle;
+  const handles = lifecycle?.handles;
+  const stages = [
+    { stage: "feedback", caseId: "memory-feedback", runId: handles?.creationRunId },
+    { stage: "promote", caseId: "memory-promote", runId: handles?.promoteRunId },
+    { stage: "expire", caseId: "memory-expire", runId: handles?.cleanupRunId },
+  ];
+  const hasExactKeys = (value, keys) =>
+    value &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    isDeepStrictEqual(
+      Object.keys(value).sort((a, b) => a.localeCompare(b)),
+      [...keys].sort((a, b) => a.localeCompare(b)),
+    );
+  const handleKeys = [
+    "fixtureNonce",
+    "projectId",
+    "stepRunId",
+    "principalId",
+    "creationRunId",
+    "candidateId",
+    "promoteRunId",
+    "memoryId",
+    "cleanupRunId",
+    "cleanupStatus",
+  ];
+  if (
+    !hasExactKeys(lifecycle, [
+      "status",
+      "stage",
+      "handles",
+      "steps",
+      "requiresReconciliation",
+      "cleanup",
+    ]) ||
+    lifecycle.status !== "PASS" ||
+    lifecycle.stage !== "expire" ||
+    lifecycle.requiresReconciliation !== false ||
+    !hasExactKeys(lifecycle.cleanup, ["status", "runId"]) ||
+    lifecycle.cleanup.status !== "expired" ||
+    !hasExactKeys(handles, handleKeys) ||
+    !/^[a-f0-9]{32}$/.test(handles.fixtureNonce ?? "") ||
+    handles.projectId !== `qqtest-${handles.fixtureNonce}` ||
+    !identifier(handles.principalId) ||
+    !/^candidate_[a-f0-9]{32}$/.test(handles.candidateId ?? "") ||
+    !/^memory_[a-f0-9]{32}$/.test(handles.memoryId ?? "") ||
+    !stages.every((item) => identifier(item.runId)) ||
+    new Set(stages.map((item) => item.runId)).size !== 3 ||
+    handles.stepRunId !== handles.cleanupRunId ||
+    handles.cleanupStatus !== "expired" ||
+    lifecycle.cleanup.runId !== handles.cleanupRunId ||
+    lesson.case !== "memory-expire" ||
+    lesson.evidence.runId !== handles.cleanupRunId ||
+    report.plannedCaseCount !== 3 ||
+    report.executedCaseCount !== 3 ||
+    !Array.isArray(lifecycle.steps) ||
+    lifecycle.steps.length !== 3 ||
+    !Array.isArray(report.cases) ||
+    report.cases.length !== 3 ||
+    !Array.isArray(report.productAcceptance?.cases) ||
+    report.productAcceptance.cases.length !== 3
+  )
+    invalid("Verified lesson lacks a complete Memory lifecycle report");
+
+  const databasePath = join(evidence.dataDirectory, "glassbox.db");
+  let db;
+  try {
+    db = new DatabaseSync(databasePath, { readOnly: true });
+    const principal = db.prepare("SELECT kind FROM principals WHERE id=?").get(handles.principalId);
+    if (principal?.kind !== "owner") invalid("Memory lifecycle Owner evidence did not verify");
+    const creation = discoverFeedbackCandidate(db, {
+      runId: handles.creationRunId,
+      principalId: handles.principalId,
+      projectId: handles.projectId,
+    });
+    const cleanup = verifyMemoryCleanup(db, {
+      candidateId: handles.candidateId,
+      memoryId: handles.memoryId,
+      creationRunId: handles.creationRunId,
+      cleanupRunId: handles.cleanupRunId,
+      principalId: handles.principalId,
+      projectId: handles.projectId,
+    });
+    if (
+      creation.candidateId !== handles.candidateId ||
+      creation.principalId !== handles.principalId ||
+      creation.projectId !== handles.projectId ||
+      creation.creationRunId !== handles.creationRunId ||
+      cleanup.status !== "expired" ||
+      cleanup.candidateId !== handles.candidateId ||
+      cleanup.memoryId !== handles.memoryId ||
+      cleanup.principalId !== handles.principalId ||
+      cleanup.projectId !== handles.projectId ||
+      cleanup.creationRunId !== handles.creationRunId ||
+      cleanup.promoteRunId !== handles.promoteRunId ||
+      cleanup.cleanupRunId !== handles.cleanupRunId
+    )
+      invalid("Memory lifecycle database handles did not verify");
+  } catch (error) {
+    if (error.message.startsWith("Memory lifecycle")) throw error;
+    invalid("Read-only Memory lifecycle database evidence did not verify");
+  } finally {
+    db?.close();
+  }
+
+  const acceptedScope = evidence.scope;
+  for (const [index, expected] of stages.entries()) {
+    const step = lifecycle.steps[index];
+    const caseRecords = report.cases.filter((item) => item?.id === expected.caseId);
+    const acceptedRecords = report.productAcceptance.cases.filter(
+      (item) => item?.caseId === expected.caseId,
+    );
+    const caseRecord = caseRecords[0];
+    const accepted = acceptedRecords[0];
+    let spec;
+    try {
+      spec = memoryFixtureStep(expected.stage, {
+        nonce: handles.fixtureNonce,
+        candidateId: handles.candidateId,
+        memoryId: handles.memoryId,
+      });
+    } catch {
+      invalid("Memory lifecycle step does not match the fixed acceptance scenario");
+    }
+    const expectedNames = spec.leaseTools.map((tool) => tool.name);
+    const expectedPrompt = `GLASSBOX_ACCEPTANCE_V1 ${caseRecord?.token ?? ""}\n${spec.prompt.replaceAll("{{nonce}}", caseRecord?.token ?? "").trim()}`;
+    const expectedAssertions = JSON.parse(
+      JSON.stringify(spec.featureAssertions).replaceAll("{{nonce}}", caseRecord?.token ?? ""),
+    );
+    const expectedToolInput = spec.leaseTools[0].operations[0].inputConstraint;
+    if (
+      !hasExactKeys(step, ["stage", "currentRunId", "runId", "productAcceptance"]) ||
+      step.stage !== expected.stage ||
+      step.currentRunId !== expected.runId ||
+      step.runId !== expected.runId ||
+      !hasExactKeys(step.productAcceptance, [
+        "status",
+        "runtime",
+        "caseId",
+        "traceVerified",
+        "featureStatus",
+      ]) ||
+      step.productAcceptance.status !== "PASS" ||
+      !isDeepStrictEqual(step.productAcceptance.runtime, report.runtime) ||
+      step.productAcceptance.caseId !== expected.caseId ||
+      step.productAcceptance.traceVerified !== true ||
+      step.productAcceptance.featureStatus !== "PASS" ||
+      caseRecords.length !== 1 ||
+      acceptedRecords.length !== 1 ||
+      caseRecord.status !== "PASS" ||
+      caseRecord.route !== "private" ||
+      caseRecord.leaseRegistrationAttempted !== true ||
+      caseRecord.leaseRevoked !== true ||
+      !isDeepStrictEqual(caseRecord.featureAssertions, expectedAssertions) ||
+      !isDeepStrictEqual(caseRecord.leasedToolNames, expectedNames) ||
+      new Set(caseRecord.leasedToolNames ?? []).size !== expectedNames.length ||
+      caseRecord.acceptanceLease?.toolsSha256 !== toolManifestDigest(spec.leaseTools) ||
+      !identifier(caseRecord.inputBinding?.botMessageId) ||
+      !identifier(caseRecord.inputBinding?.driverMessageId) ||
+      String(caseRecord.inputBinding.driverMessageId) !== String(caseRecord.sentMessageId) ||
+      accepted.runId !== expected.runId ||
+      accepted.scope?.chatType !== "private" ||
+      accepted.traceVerified !== true ||
+      accepted.feature?.status !== "PASS" ||
+      accepted.feature?.runId !== expected.runId ||
+      !Array.isArray(accepted.decisions) ||
+      accepted.decisions.length === 0 ||
+      accepted.decisions.some((item) => item?.decision !== "ALLOW") ||
+      accepted.delivery?.status !== "sent" ||
+      !identifier(accepted.delivery.id) ||
+      !/^-?\d{1,20}$/.test(String(accepted.delivery.external_id ?? "")) ||
+      !isDeepStrictEqual(accepted.scope, acceptedScope) ||
+      typeof caseRecord.prompt !== "string" ||
+      caseRecord.prompt !== expectedPrompt ||
+      !passingBinding(caseRecord.inputBinding) ||
+      !passingBinding(accepted.messageBinding?.input) ||
+      !passingBinding(accepted.messageBinding?.reply) ||
+      digest(Buffer.from(caseRecord.prompt, "utf8")) !== caseRecord.inputBinding.textSha256 ||
+      caseRecord.inputBinding.textSha256 !== accepted.messageBinding.input.textSha256 ||
+      caseRecord.inputBinding.realSequence !== accepted.messageBinding.input.realSequence ||
+      caseRecord.inputBinding.time !== accepted.messageBinding.input.time ||
+      caseRecord.inputBinding.textSha256 !== accepted.messageBinding.input.textSha256
+    )
+      invalid("Memory lifecycle step evidence does not match its Run and scope");
+
+    const events = verifyFeatureReport(
+      report,
+      { ...lesson, case: expected.caseId, evidence: { ...lesson.evidence, runId: expected.runId } },
+      { ...evidence, runId: expected.runId, scope: accepted.scope },
+      capture,
+    );
+    verifyTracePromptHash(caseRecord, accepted, events);
+    const calls = events.filter(
+      (event) => event.runId === expected.runId && event.type === "tool_call",
+    );
+    const sessions = events.filter(
+      (event) => event.runId === expected.runId && event.type === "session_start",
+    );
+    if (
+      calls.length !== 1 ||
+      calls[0].data?.name !== "owner_memory_admin" ||
+      !isDeepStrictEqual(calls[0].data?.input, expectedToolInput) ||
+      !sessions.length ||
+      sessions.some((event) => {
+        const lease = event.data?.acceptanceLease;
+        return (
+          lease?.toolsSha256 !== toolManifestDigest(spec.leaseTools) ||
+          !isDeepStrictEqual(lease?.narrowedTools, expectedNames) ||
+          !isDeepStrictEqual(event.data?.authorizedTools, expectedNames)
+        );
+      })
+    )
+      invalid("Memory lifecycle Trace does not match the exact leased operation and input");
+  }
 }
 
 export function verifyStandardReport(report, lesson, evidence, capture = execFileSync) {
-  let trace;
-  try {
-    trace = readTraceEvents(evidence.checkout, evidence.dataDirectory, evidence.runId, capture);
-  } catch {
-    invalid("gbxtrace could not verify Run evidence");
-  }
-  if (trace.runId !== evidence.runId || !Array.isArray(trace.events))
-    invalid("gbxtrace returned evidence for a different Run");
-  const events = trace.events.map((row) => row.event);
+  const events = traceEventsForLesson(report, lesson, evidence, capture);
   const caseRecord = report.cases.find((item) => item.id === lesson.case);
   const accepted = report.productAcceptance.cases.find((item) => item.caseId === lesson.case);
+  verifyTracePromptHash(caseRecord, accepted, events);
   const config = {
     runtime: {
       connectionId: evidence.scope.connectionId,
@@ -321,9 +638,17 @@ export async function appendLesson(
       invalid("QQ live report is unreadable or invalid JSON");
     }
     const evidence = validateLiveReport(report, lesson, reportPath, digest(bytes));
-    if (report.cases.find((item) => item.id === lesson.case)?.featureAssertions?.length)
-      verifyFeatureReport(report, lesson, evidence, capture);
-    else verifyStandardReport(report, lesson, evidence, capture);
+    const traceEvents = traceEventsForLesson(report, lesson, evidence, capture ?? execFileSync);
+    if (requiresMemoryLifecycleVerification(report, traceEvents, evidence.runId))
+      verifyMemoryLifecycleReport(report, lesson, evidence, capture);
+    else {
+      const caseRecord = report.cases.find((item) => item.id === lesson.case);
+      const accepted = report.productAcceptance.cases.find((item) => item.caseId === lesson.case);
+      verifyTracePromptHash(caseRecord, accepted, traceEvents);
+      if (caseRecord.featureAssertions?.length)
+        verifyFeatureReport(report, lesson, evidence, capture);
+      else verifyStandardReport(report, lesson, evidence, capture);
+    }
     lesson.evidence.reportSha256 = evidence.reportSha256;
   }
   await appendFile(path, `${JSON.stringify(lesson)}\n`, { encoding: "utf8", flag: "a" });

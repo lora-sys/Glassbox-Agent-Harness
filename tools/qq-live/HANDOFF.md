@@ -42,8 +42,10 @@ FAIL 表示验收结果不满足预期，先查证故障位置。BLOCKED 表示�
 
 固定实机用例覆盖真实私聊、指定群 @ Bot 的收发，以及可选的禁言和解禁效果。它们只证明传输和对应固定操作，不能替代功能回归。结构化读取用例示例见 examples/feature-read.example.json。先运行 plan，审查消息和工具范围，再把套件 SHA256 传入 run 的 --approve-suite。
 
-运行 `node tools/qq-live/cli.mjs coverage` 盘点覆盖缺口。默认功能目录有四个可执行的读取用例，其余条目仍待实现。planned 条目不能计入执行覆盖。将条目接成真实用例、独立观察和清理之后，再运行覆盖检查。不能把补了一段测试说明解释为已经测试。
+运行 `node tools/qq-live/cli.mjs coverage` 盘点覆盖缺口。默认功能目录有六个可执行的读取用例，其余条目仍待实现。planned 条目不能计入执行覆盖。将条目接成真实用例、独立观察和清理之后，再运行覆盖检查。不能把补了一段测试说明解释为已经测试。
 
 权限变更、模型切换、文件传输和长任务等需要新增对应的状态观察及断言。不要只根据 Bot 说成功就报告通过。
 
 当工具写入 STOP，或者群操作的结果未知时，先停止相关 Bot 待执行动作并核实群状态。只有原操作已结束且环境恢复后，才允许人工清除 STOP 并重测。
+
+固定记忆流程使用 plan --case memory-lifecycle 审阅消息，再传入 --approve-suite 执行。先明确启用 memoryFixtures.enabled 和 retainAuditConfirmed。每一步核对独立 Run、工具、状态与投递，成功后过期本轮项目 Memory 并保留审计历史。未核实的步骤会保留账号级 .memory-pending.json，禁止通过更换报告目录或删除文件来重试。中断核实与清理命令仍待接入，固定流程也不能替代完整 Memory 回归。

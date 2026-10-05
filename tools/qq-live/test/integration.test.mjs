@@ -39,7 +39,8 @@ test("feature request registers before sending and revokes its exact lease", asy
   const w = await setup(t);
   const leaseId = "12345678-1234-1234-1234-123456789abc";
   let registered = false,
-    revoked = false;
+    revoked = false,
+    checkpointed = false;
   const c = await replyCase(w.config, w.clients, w.recorder, featureSpec, undefined, {
     register: async (config, c, tools) => {
       assert.equal(w.actions.filter((a) => a.action.startsWith("send_")).length, 0);
@@ -52,12 +53,42 @@ test("feature request registers before sending and revokes its exact lease", asy
       assert.equal(id, leaseId);
       revoked = true;
     },
+    beforeSend: async (prepared, lease) => {
+      assert.equal(registered, true);
+      assert.equal(w.actions.filter((a) => a.action.startsWith("send_")).length, 0);
+      assert.equal(lease.leaseId, leaseId);
+      assert.ok(prepared.prompt.startsWith(`GLASSBOX_ACCEPTANCE_V1 ${prepared.token}\n`));
+      checkpointed = true;
+    },
   });
   assert.equal(c.status, "PASS");
   assert.equal(registered, true);
   assert.equal(revoked, true);
+  assert.equal(checkpointed, true);
   assert.equal(c.leaseRevoked, true);
   assert.deepEqual(c.featureAssertions, featureSpec.featureAssertions);
+});
+test("failed or unconfirmed prepared-message checkpoint revokes the lease without sending", async (t) => {
+  const w = await setup(t);
+  for (const mode of ["throw", "false"]) {
+    let revoked = false;
+    const c = await replyCase(w.config, w.clients, w.recorder, featureSpec, undefined, {
+      register: async () => ({ leaseId: "fixture-lease" }),
+      beforeSend: async () => {
+        if (mode === "throw") throw new Error("fixture disk failure");
+        return false;
+      },
+      revoke: async (id) => {
+        assert.equal(id, "fixture-lease");
+        revoked = true;
+      },
+    });
+    assert.notEqual(c.status, "PASS");
+    assert.equal(c.sendAttempted, undefined);
+    assert.equal(c.leaseRevoked, true);
+    assert.equal(revoked, true);
+  }
+  assert.equal(w.actions.filter((a) => a.action.startsWith("send_")).length, 0);
 });
 test("missing or rejected feature lease prevents all sends", async (t) => {
   const w = await setup(t);

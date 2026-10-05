@@ -20,6 +20,10 @@
   "settleMs": 2000,
   "minGapMs": 2000,
   "maxMessages": 12,
+  "memoryFixtures": {
+    "enabled": false,
+    "retainAuditConfirmed": false
+  },
   "safety": {
     "acceptanceServiceConfirmed": false,
     "soleConsumerConfirmed": false,
