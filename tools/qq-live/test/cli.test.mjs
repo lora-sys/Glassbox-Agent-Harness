@@ -280,7 +280,6 @@ test("schema 3 Memory run rejects missing case, approval, fixture enablement and
       },
     ],
   });
-  const suite = JSON.parse(suiteText);
   const suiteSha256 = digest(suiteText);
   const config = {
     ...baseConfig(),
