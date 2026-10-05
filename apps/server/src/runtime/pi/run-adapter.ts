@@ -186,6 +186,22 @@ function ownerMemoryCommand(text: string): RequiredToolCall | undefined {
   };
 }
 
+/**
+ * Returns only the body of a marker-bound message for Memory command parsing. The persisted
+ * message remains untouched for hashing, authorization checks, and Trace evidence.
+ */
+function acceptanceMemoryCommandText(
+  text: string,
+  lease: PiRunContext["acceptanceLease"],
+): string | undefined {
+  if (!lease || !lease.assertActive() || !/^[a-f0-9]{32}$/u.test(lease.marker)) return undefined;
+  const lineBreak = /\r\n|\n|\r/u.exec(text);
+  if (!lineBreak) return undefined;
+  const firstLine = text.slice(0, lineBreak.index);
+  if (firstLine !== `GLASSBOX_ACCEPTANCE_V1 ${lease.marker}`) return undefined;
+  return text.slice(lineBreak.index + lineBreak[0].length);
+}
+
 /** Explicitly named Ops calls must be backed by a real Tool result, never model narration. */
 function ownerTaskDelegationRequest(text: string): RequiredToolCall | undefined {
   const request = requestClauses(text);
@@ -715,6 +731,7 @@ function requiredToolCall(
   isOwner: boolean,
   authorizedToolNames?: readonly string[],
   modelProfiles: readonly PublicModelProfile[] = [],
+  acceptanceMemoryText?: string,
 ): RequiredToolCall | undefined {
   if (input.caller.scope.chatType === "group") {
     if (groupHistorySearchRequested(input.text) || groupHistorySearchFollowUpRequested(input)) {
@@ -765,7 +782,7 @@ function requiredToolCall(
   const taskDelegation = ownerTaskDelegationRequest(rawText);
   if (taskDelegation) return taskDelegation;
   if (authorizedToolNames?.includes(OWNER_MEMORY_ADMIN_TOOL)) {
-    const memory = ownerMemoryCommand(rawText);
+    const memory = ownerMemoryCommand(acceptanceMemoryText ?? rawText);
     if (memory) return memory;
   }
   const text = requestClauses(rawText);
@@ -1837,10 +1854,11 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
 
   async execute(input: ExecutionInput): Promise<ExecutionResult> {
     const acceptanceLease = this.options.resolveAcceptanceLease?.(input);
-    if (
-      hasQqLiveAcceptanceMarker(input.text) &&
-      (!acceptanceLease || !acceptanceLease.assertActive())
-    )
+    const hasAcceptanceMarker = hasQqLiveAcceptanceMarker(input.text);
+    const acceptanceMemoryText = hasAcceptanceMarker
+      ? acceptanceMemoryCommandText(input.text, acceptanceLease)
+      : undefined;
+    if (hasAcceptanceMarker && acceptanceMemoryText === undefined)
       return {
         status: "failed",
         failureCode: "gate_refused",
@@ -1968,7 +1986,13 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         text: "当前配置的模型不支持识别图片，因此没有发送图片。请切换到支持视觉输入的模型后重试。",
       };
     }
-    const required = requiredToolCall(input, isOwner, context.authorizedToolNames, modelProfiles);
+    const required = requiredToolCall(
+      input,
+      isOwner,
+      context.authorizedToolNames,
+      modelProfiles,
+      acceptanceMemoryText,
+    );
     if (required?.name === "qq_group_moderation" && required.input.operation === "set_group_ban") {
       const params = required.input.params as Record<string, unknown> | undefined;
       const missingDuration = params?.duration === undefined;

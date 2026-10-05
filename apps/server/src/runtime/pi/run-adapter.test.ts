@@ -154,6 +154,120 @@ it("rechecks lease activity after asynchronous source authorization", async () =
   expect(f.run).not.toHaveBeenCalled();
 });
 
+it("parses only the verified acceptance body for Owner Memory commands and preserves raw input", async () => {
+  const marker = "00112233445566778899aabbccddeeff";
+  const text = `GLASSBOX_ACCEPTANCE_V1 ${marker}\r\n/memory feedback project:qqtest-${marker} explicit_positive fixture-${marker}`;
+  const f = fixture([
+    {
+      status: "completed",
+      text: "Feedback recorded.",
+      toolCalls: [
+        {
+          name: OWNER_MEMORY_ADMIN_TOOL,
+          input: {
+            action: "feedback",
+            scopeType: "project",
+            projectId: `qqtest-${marker}`,
+            signalType: "explicit_positive",
+            statement: `fixture-${marker}`,
+          },
+          failed: false,
+        },
+      ],
+    },
+  ]);
+  f.input.text = text;
+  f.createOrRestoreSession.mockImplementation(async (_conversation, _profile, context) => {
+    if (context) context.authorizedToolNames = [OWNER_MEMORY_ADMIN_TOOL];
+    return {
+      conversationId: "conversation-1",
+      runtimeSessionId: "session-1",
+      profileName: "main-agent" as const,
+      agentDir: "agent",
+      createdAt: new Date(0).toISOString(),
+      lastActiveAt: new Date(0).toISOString(),
+    };
+  });
+  const executor = new PiRunExecutionAdapter(f.runtime, {
+    resolveAcceptanceLease: () => ({
+      leaseId: "lease-1",
+      marker,
+      toolsSha256: "0".repeat(64),
+      assertActive: () => true,
+      filterToolNames: (names) => names.filter((name) => name === OWNER_MEMORY_ADMIN_TOOL),
+      checkToolCall: () => true,
+    }),
+  });
+
+  await expect(executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+  expect(f.input.text).toBe(text);
+  expect(f.run.mock.calls[0]?.[2]).toContain(text);
+  expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe(OWNER_MEMORY_ADMIN_TOOL);
+  expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({
+    action: "feedback",
+    scopeType: "project",
+    projectId: `qqtest-${marker}`,
+    signalType: "explicit_positive",
+    statement: `fixture-${marker}`,
+  });
+});
+
+it("does not bind an acceptance Memory command to a Tool omitted by the lease", async () => {
+  const marker = "00112233445566778899aabbccddeeff";
+  const f = fixture([{ status: "completed", text: "No action taken.", toolCalls: [] }]);
+  f.input.text = `GLASSBOX_ACCEPTANCE_V1 ${marker}\n/memory promote candidate_${"a".repeat(32)}`;
+  f.createOrRestoreSession.mockImplementation(async (_conversation, _profile, context) => {
+    if (context) context.authorizedToolNames = [];
+    return {
+      conversationId: "conversation-1",
+      runtimeSessionId: "session-1",
+      profileName: "main-agent" as const,
+      agentDir: "agent",
+      createdAt: new Date(0).toISOString(),
+      lastActiveAt: new Date(0).toISOString(),
+    };
+  });
+  const executor = new PiRunExecutionAdapter(f.runtime, {
+    resolveAcceptanceLease: () => ({
+      leaseId: "lease-1",
+      marker,
+      toolsSha256: "0".repeat(64),
+      assertActive: () => true,
+      filterToolNames: (names) => names.filter((name) => name !== OWNER_MEMORY_ADMIN_TOOL),
+      checkToolCall: () => false,
+    }),
+  });
+
+  await expect(executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+  expect(f.run.mock.calls[0]?.[3]?.authorizedToolNames).not.toContain(OWNER_MEMORY_ADMIN_TOOL);
+  expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBeUndefined();
+});
+
+it("fails closed when the marker does not match the active acceptance lease", async () => {
+  const f = fixture([{ status: "completed", text: "should not reach the model", toolCalls: [] }]);
+  const initialize = vi.spyOn(f.runtime, "initialize");
+  f.input.text =
+    "GLASSBOX_ACCEPTANCE_V1 ffeeddccbbaa99887766554433221100\n/memory promote candidate_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const executor = new PiRunExecutionAdapter(f.runtime, {
+    resolveAcceptanceLease: () => ({
+      leaseId: "lease-1",
+      marker: "00112233445566778899aabbccddeeff",
+      toolsSha256: "0".repeat(64),
+      assertActive: () => true,
+      filterToolNames: () => [],
+      checkToolCall: () => false,
+    }),
+  });
+
+  await expect(executor.execute(f.input)).resolves.toMatchObject({
+    status: "failed",
+    runtimeAttempted: false,
+    failureCode: "gate_refused",
+  });
+  expect(initialize).not.toHaveBeenCalled();
+  expect(f.run).not.toHaveBeenCalled();
+});
+
 it("includes accepted Step excerpts in Model context and its budget without treating them as commands", async () => {
   const f = fixture([{ status: "completed", text: "Summary", toolCalls: [] }]);
   f.input.run.source = "task_step";
