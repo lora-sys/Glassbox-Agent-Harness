@@ -136,6 +136,80 @@ async function createPassingReport(t, overrides = {}) {
   return { input, reportPath, bytes, temp };
 }
 
+async function createPassingOwnerPrivateOpsReport(t, { otherRunMemberTrace = false } = {}) {
+  const fixture = await createPassingReport(t);
+  const report = JSON.parse(fixture.bytes.toString("utf8"));
+  const runId = fixture.input.evidence.runId;
+  const caseRecord = report.cases[0];
+  const accepted = report.productAcceptance.cases[0];
+  const prompt = "Owner private Ops status check for the acceptance fixture.";
+  const promptHash = hash(Buffer.from(prompt, "utf8"));
+  caseRecord.id = "ops-status-read";
+  caseRecord.route = "private";
+  caseRecord.prompt = prompt;
+  caseRecord.inputBinding.textSha256 = promptHash;
+  accepted.caseId = caseRecord.id;
+  accepted.scope.chatType = "private";
+  accepted.scope.chatId = accepted.scope.senderId;
+  accepted.messageBinding.input.textSha256 = promptHash;
+
+  const tracePath = join(report.runtime.dataDirectory, "runs", runId, "trace.jsonl");
+  const rows = (await readFile(tracePath, "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  const events = rows.map((row) => row.event);
+  const input = events.find((event) => event.type === "message_received");
+  Object.assign(input, accepted.scope, { textSha256: promptHash });
+  events.push(
+    {
+      type: "session_start",
+      runId,
+      data: { authorizedTools: ["ops_status", "qq_group_members"] },
+    },
+    { type: "tool_call", runId, toolCallId: "ops-call", data: { name: "ops_status" } },
+    {
+      type: "tool_result",
+      runId,
+      toolCallId: "ops-call",
+      data: { name: "ops_status", isError: false },
+    },
+  );
+  if (otherRunMemberTrace) {
+    const otherRunId = "run_other123";
+    events.push(
+      {
+        type: "tool_call",
+        runId: otherRunId,
+        toolCallId: "other-member-call",
+        data: { name: "qq_group_members" },
+      },
+      {
+        type: "tool_result",
+        runId: otherRunId,
+        toolCallId: "other-member-call",
+        data: { name: "qq_group_members", isError: false },
+      },
+    );
+  }
+  await writeFile(
+    tracePath,
+    events.map((event, seq) => JSON.stringify({ seq: seq + 1, event })).join("\n") + "\n",
+    "utf8",
+  );
+  const bytes = Buffer.from(JSON.stringify(report));
+  await writeFile(fixture.reportPath, bytes);
+  return {
+    ...fixture,
+    bytes,
+    input: {
+      ...fixture.input,
+      case: caseRecord.id,
+      verification: { ...fixture.input.verification, reportSha256: hash(bytes) },
+    },
+  };
+}
+
 async function createPassingFeatureReport(t, update = () => {}) {
   const fixture = await createPassingReport(t);
   const report = JSON.parse(fixture.bytes.toString("utf8"));
@@ -214,6 +288,97 @@ async function createPassingFeatureReport(t, update = () => {}) {
       ...fixture.input,
       verification: { ...fixture.input.verification, reportSha256: hash(bytes) },
     },
+  };
+}
+
+async function createPassingGroupMemberReport(t, { aggregateAssertion = true } = {}) {
+  const fixture = await createPassingFeatureReport(t);
+  const report = JSON.parse(fixture.bytes.toString("utf8"));
+  const runId = fixture.input.evidence.runId;
+  const caseRecord = report.cases[0];
+  const accepted = report.productAcceptance.cases[0];
+  const prompt = "Read only the member count for test group A and report the number.";
+  const promptHash = hash(Buffer.from(prompt, "utf8"));
+  caseRecord.id = "qq-group-member-directory-read";
+  caseRecord.prompt = prompt;
+  caseRecord.inputBinding.textSha256 = promptHash;
+  accepted.caseId = caseRecord.id;
+  accepted.messageBinding.input.textSha256 = promptHash;
+  caseRecord.leasedToolNames = ["qq_group_members"];
+  caseRecord.featureAssertions = [
+    {
+      kind: "trace",
+      type: "tool_result",
+      where: { name: "qq_group_members", isError: false },
+      count: 1,
+    },
+    ...(aggregateAssertion
+      ? [{ kind: "aggregate_projection", tool: "qq_group_members", count: 1 }]
+      : []),
+  ];
+
+  const tracePath = join(report.runtime.dataDirectory, "runs", runId, "trace.jsonl");
+  const rows = (await readFile(tracePath, "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  const events = rows.map((row) => row.event);
+  const session = events.find((event) => event.type === "session_start");
+  session.data.acceptanceLease.narrowedTools = ["qq_group_members"];
+  session.data.authorizedTools = ["qq_group_members"];
+  const call = events.find((event) => event.type === "tool_call");
+  call.data.name = "qq_group_members";
+  const result = events.find((event) => event.type === "tool_result");
+  result.data.name = "qq_group_members";
+  const outputHead = JSON.stringify({
+    content: [{ type: "text", text: '{"memberCount":0}' }],
+    details: { memberCount: 0 },
+  });
+  Object.assign(result.data, {
+    outputHead,
+    outputBytes: Buffer.byteLength(outputHead, "utf8"),
+    outputSha256: hash(Buffer.from(outputHead, "utf8")),
+    outputTruncated: false,
+  });
+  events.find((event) => event.type === "message_received").textSha256 = promptHash;
+  accepted.feature = {
+    status: "PASS",
+    runId,
+    observations: [
+      { kind: "trace", type: "tool_result", count: 1 },
+      ...(aggregateAssertion
+        ? [
+            {
+              kind: "aggregate_projection",
+              tool: "qq_group_members",
+              memberCount: 0,
+              identifiersExposed: false,
+            },
+          ]
+        : []),
+    ],
+  };
+  await writeFile(tracePath, rows.map((row) => JSON.stringify(row)).join("\n") + "\n", "utf8");
+  const bytes = Buffer.from(JSON.stringify(report));
+  await writeFile(fixture.reportPath, bytes);
+  return {
+    ...fixture,
+    report,
+    bytes,
+    input: {
+      ...fixture.input,
+      case: caseRecord.id,
+      verification: { ...fixture.input.verification, reportSha256: hash(bytes) },
+    },
+  };
+}
+
+async function rewriteReport(fixture, report) {
+  const bytes = Buffer.from(JSON.stringify(report));
+  await writeFile(fixture.reportPath, bytes);
+  return {
+    ...fixture.input,
+    verification: { ...fixture.input.verification, reportSha256: hash(bytes) },
   };
 }
 
@@ -529,6 +694,90 @@ test("verified feature lesson checks lease, tool and state evidence via existing
   assert.equal(recorded.status, "verified");
   assert.equal(recorded.evidence.reportSha256, fixture.input.verification.reportSha256);
   assert.deepEqual(JSON.parse(await readFile(lessonsPath, "utf8")), recorded);
+});
+
+test("verified member-count lesson cannot be downgraded by deleting report assertions and metadata", async (t) => {
+  const fixture = await createPassingGroupMemberReport(t);
+  const report = structuredClone(fixture.report);
+  const caseRecord = report.cases[0];
+  delete caseRecord.featureAssertions;
+  delete caseRecord.leasedToolNames;
+  delete caseRecord.acceptanceLease;
+  delete caseRecord.leaseRegistrationAttempted;
+  delete caseRecord.leaseRevoked;
+  delete report.productAcceptance.cases[0].feature;
+  const input = await rewriteReport(fixture, report);
+  const lessonsPath = join(fixture.temp, "member-count-downgrade.jsonl");
+  await assert.rejects(
+    appendLesson(input, lessonsPath),
+    /Independent group member count evidence is unavailable/,
+  );
+  await assert.rejects(readFile(lessonsPath, "utf8"), { code: "ENOENT" });
+});
+
+test("verified member-count aggregate signal requires independent count evidence", async (t) => {
+  const fixture = await createPassingOwnerPrivateOpsReport(t);
+  const report = JSON.parse(fixture.bytes.toString("utf8"));
+  report.cases[0].featureAssertions = [
+    { kind: "aggregate_projection", tool: "qq_group_members", count: 1 },
+  ];
+  report.productAcceptance.cases[0].feature = {
+    status: "PASS",
+    runId: fixture.input.evidence.runId,
+    observations: [
+      {
+        kind: "aggregate_projection",
+        tool: "qq_group_members",
+        memberCount: 0,
+        identifiersExposed: false,
+      },
+    ],
+  };
+  const input = await rewriteReport(fixture, report);
+  const lessonsPath = join(fixture.temp, "member-count-no-witness.jsonl");
+  await assert.rejects(
+    appendLesson(input, lessonsPath),
+    /Independent group member count evidence is unavailable/,
+  );
+  await assert.rejects(readFile(lessonsPath, "utf8"), { code: "ENOENT" });
+});
+
+test("member-count lessons without independent evidence remain recordable as hypotheses", async (t) => {
+  const fixture = await createPassingGroupMemberReport(t, { aggregateAssertion: true });
+  const input = { ...fixture.input, status: "hypothesis" };
+  delete input.verification;
+  const lessonsPath = join(fixture.temp, "member-count-hypothesis.jsonl");
+  const recorded = await appendLesson(input, lessonsPath);
+  assert.equal(recorded.status, "hypothesis");
+  assert.equal(JSON.parse(await readFile(lessonsPath, "utf8")).status, "hypothesis");
+});
+
+test("Owner private Ops lesson is not blocked by an authorized but unused member Tool", async (t) => {
+  const fixture = await createPassingOwnerPrivateOpsReport(t);
+  const lessonsPath = join(fixture.temp, "ops-with-member-visibility.jsonl");
+  const recorded = await appendLesson(fixture.input, lessonsPath);
+  assert.equal(recorded.status, "verified");
+});
+
+test("member Tool Trace from another Run does not block the selected Ops lesson", async (t) => {
+  const fixture = await createPassingOwnerPrivateOpsReport(t, { otherRunMemberTrace: true });
+  const lessonsPath = join(fixture.temp, "ops-with-other-run-member-trace.jsonl");
+  const recorded = await appendLesson(fixture.input, lessonsPath);
+  assert.equal(recorded.status, "verified");
+});
+
+test("same-Run narrowed member Tool surface requires independent count evidence", async (t) => {
+  const fixture = await createPassingOwnerPrivateOpsReport(t);
+  await updateTrace(fixture, fixture.input.evidence.runId, (rows) => {
+    const session = rows.find((row) => row.event.type === "session_start").event;
+    session.data.acceptanceLease = { narrowedTools: ["qq_group_members"] };
+  });
+  const lessonsPath = join(fixture.temp, "ops-with-member-lease.jsonl");
+  await assert.rejects(
+    appendLesson(fixture.input, lessonsPath),
+    /Independent group member count evidence is unavailable/,
+  );
+  await assert.rejects(readFile(lessonsPath, "utf8"), { code: "ENOENT" });
 });
 
 test("verified Memory lifecycle rechecks Owner state and all three fresh Run traces", async (t) => {

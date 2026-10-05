@@ -390,6 +390,72 @@ test("unapproved targets and direct Bot mutations are blocked", async (t) => {
     w.clients.bot.call("set_group_ban", { group_id: "20001", user_id: "10003", duration: 60 }),
     (e) => e.code === "ACTION_DENIED",
   );
+  await assert.rejects(
+    w.clients.bot.call("get_group_member_list", { group_id: "20001" }),
+    (e) => e.code === "ACTION_DENIED",
+  );
+});
+test("member count reads only fixed group A through the Bot and returns no member rows", async (t) => {
+  const w = await setup(t);
+  assert.equal(await w.clients.bot.readGroupMemberCount(), 3);
+  assert.deepEqual(
+    w.actions.filter((action) => action.action === "get_group_member_list"),
+    [{ role: "bot", action: "get_group_member_list", params: { group_id: "20001" } }],
+  );
+  await assert.rejects(w.clients.driver.readGroupMemberCount(), {
+    code: "MEMBER_COUNT_DENIED",
+    status: "INCONCLUSIVE",
+  });
+  assert.equal(w.actions.filter((action) => action.action === "get_group_member_list").length, 1);
+});
+test("member count rejects malformed, mismatched, duplicate, and unavailable lists without retry", async (t) => {
+  for (const memberList of [
+    null,
+    [],
+    [
+      { group_id: 20001, user_id: 10001 },
+      { group_id: 20001, user_id: 10003 },
+    ],
+    [
+      { group_id: 20001, user_id: 10002 },
+      { group_id: 20001, user_id: 10003 },
+    ],
+    [{ group_id: 20002, user_id: 10003 }],
+    [{ group_id: 20001, user_id: "invalid" }],
+    [
+      { group_id: 20001, user_id: 10003 },
+      { group_id: 20001, user_id: 10003 },
+    ],
+  ]) {
+    const w = await setup(t, { memberList });
+    await assert.rejects(w.clients.bot.readGroupMemberCount(), (error) => {
+      assert.equal(error.status, "INCONCLUSIVE");
+      assert.match(error.code, /^MEMBER_COUNT_/);
+      assert.equal(error.message.includes("10003"), false);
+      return true;
+    });
+    assert.equal(w.actions.filter((action) => action.action === "get_group_member_list").length, 1);
+  }
+});
+test("member count fails closed when group A is ambiguous", async (t) => {
+  const w = await setup(t);
+  w.config.groups.push({ alias: "A", id: "20003" });
+  await assert.rejects(w.clients.bot.readGroupMemberCount(), {
+    code: "MEMBER_COUNT_DENIED",
+    status: "INCONCLUSIVE",
+  });
+  assert.equal(w.actions.filter((action) => action.action === "get_group_member_list").length, 0);
+});
+test("member count hides rejected API details and does not retry", async (t) => {
+  const w = await setup(t, { memberListError: true });
+  await assert.rejects(w.clients.bot.readGroupMemberCount(), (error) => {
+    assert.equal(error.code, "MEMBER_COUNT_UNAVAILABLE");
+    assert.equal(error.status, "INCONCLUSIVE");
+    assert.equal(error.message.includes("10003"), false);
+    assert.equal(error.message.includes("403"), false);
+    return true;
+  });
+  assert.equal(w.actions.filter((action) => action.action === "get_group_member_list").length, 1);
 });
 test("direct driver mute forbidden even when emergency cleanup allowed", async (t) => {
   const w = await setup(t);

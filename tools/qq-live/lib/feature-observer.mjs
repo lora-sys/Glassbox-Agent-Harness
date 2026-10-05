@@ -1,4 +1,5 @@
 import { fail } from "./core.mjs";
+import { createHash } from "node:crypto";
 
 const TYPES = new Set([
   "tool_call",
@@ -85,6 +86,13 @@ export function validateFeatureAssertions(assertions) {
         Object.keys(a).some((k) => !["kind", "type", "where", "count"].includes(k))
       )
         fail("FEATURE_ASSERTIONS", "Trace 断言必须指定已支持的事件、字段和值及精确数量。");
+    } else if (a.kind === "aggregate_projection") {
+      if (
+        a.tool !== "qq_group_members" ||
+        a.count !== 1 ||
+        Object.keys(a).some((k) => !["kind", "tool", "count"].includes(k))
+      )
+        fail("FEATURE_ASSERTIONS", "聚合投影断言必须绑定一次群成员数量读取。");
     } else if (a.kind === "state") {
       const definition = STATES[a.resource];
       if (
@@ -133,7 +141,96 @@ export function observeFeature(assertions, { db, events, runId }) {
             fail("FEATURE_TOOL_BINDING", "工具结果缺少同一 Run 的对应调用。", "INCONCLUSIVE");
         }
       }
-      observations.push({ kind: "trace", type: assertion.type, count: matches.length });
+      observations.push({
+        kind: "trace",
+        type: assertion.type,
+        count: matches.length,
+      });
+    } else if (assertion.kind === "aggregate_projection") {
+      const matches = events.filter(
+        (event) =>
+          event.runId === runId &&
+          event.type === "tool_result" &&
+          event.data?.name === assertion.tool &&
+          event.data?.isError === false,
+      );
+      if (matches.length !== assertion.count)
+        fail("FEATURE_TRACE", "本轮 Trace 未满足聚合读取断言。", "FAIL");
+      for (const result of matches) {
+        const data = result.data;
+        if (
+          !result.toolCallId ||
+          !events.some(
+            (event) =>
+              event.runId === runId &&
+              event.type === "tool_call" &&
+              event.toolCallId === result.toolCallId &&
+              event.data?.name === assertion.tool,
+          )
+        )
+          fail("FEATURE_TOOL_BINDING", "聚合工具结果缺少同一 Run 的对应调用。", "INCONCLUSIVE");
+        if (
+          data.outputTruncated !== false ||
+          typeof data.outputHead !== "string" ||
+          !Number.isSafeInteger(data.outputBytes) ||
+          data.outputBytes > 512 ||
+          data.outputBytes !== Buffer.byteLength(data.outputHead, "utf8") ||
+          typeof data.outputSha256 !== "string" ||
+          !/^[0-9a-f]{64}$/u.test(data.outputSha256) ||
+          createHash("sha256").update(data.outputHead, "utf8").digest("hex") !== data.outputSha256
+        )
+          fail(
+            "FEATURE_AGGREGATE_TRACE",
+            "聚合工具 Trace 未提供完整且可校验的输出证据。",
+            "INCONCLUSIVE",
+          );
+        let projection;
+        try {
+          projection = JSON.parse(data.outputHead);
+        } catch {
+          fail("FEATURE_AGGREGATE_TRACE", "聚合工具 Trace 输出无法解析。", "INCONCLUSIVE");
+        }
+        const content = projection?.content;
+        const details = projection?.details;
+        let textProjection;
+        try {
+          if (
+            !projection ||
+            Array.isArray(projection) ||
+            JSON.stringify(projection) !== data.outputHead ||
+            Object.keys(projection).sort().join(",") !== "content,details" ||
+            !Array.isArray(content) ||
+            content.length !== 1 ||
+            !content[0] ||
+            Object.keys(content[0]).sort().join(",") !== "text,type" ||
+            content[0].type !== "text" ||
+            typeof content[0].text !== "string" ||
+            !details ||
+            Array.isArray(details) ||
+            Object.keys(details).join(",") !== "memberCount" ||
+            content[0].text !== JSON.stringify(details)
+          )
+            throw new Error("invalid projection");
+          textProjection = JSON.parse(content[0].text);
+        } catch {
+          fail("FEATURE_AGGREGATE_PROJECTION", "工具输出不符合仅含成员数量的投影格式。", "FAIL");
+        }
+        if (
+          !textProjection ||
+          Array.isArray(textProjection) ||
+          Object.keys(textProjection).join(",") !== "memberCount" ||
+          !Number.isSafeInteger(textProjection.memberCount) ||
+          textProjection.memberCount < 0 ||
+          details.memberCount !== textProjection.memberCount
+        )
+          fail("FEATURE_AGGREGATE_PROJECTION", "工具输出包含非预期字段或无效成员数量。", "FAIL");
+        observations.push({
+          kind: "aggregate_projection",
+          tool: assertion.tool,
+          memberCount: textProjection.memberCount,
+          identifiersExposed: false,
+        });
+      }
     } else {
       const definition = STATES[assertion.resource];
       const row = db.prepare(definition.sql).get(assertion.id);

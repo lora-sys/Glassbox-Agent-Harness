@@ -94,6 +94,41 @@
       ]
     },
     {
+      "id": "qq-group-member-count-read",
+      "chat": "private",
+      "prompt": "请只调用 qq_group_members 的 get_group_member_list 操作读取测试群 A 的成员数量。只报告人数，不输出 QQ 号、昵称、群名片、角色或其他成员资料。回复人数和测试编号 {{nonce}}。",
+      "expectContains": ["{{nonce}}"],
+      "sideEffect": "none",
+      "leaseTools": [
+        {
+          "name": "qq_group_members",
+          "operations": [
+            {
+              "action": "group:members:read",
+              "resourceId": "group:{{group:A}}",
+              "inputConstraint": {
+                "groupId": "{{group:A}}",
+                "operation": "get_group_member_list"
+              }
+            }
+          ]
+        }
+      ],
+      "featureAssertions": [
+        {
+          "kind": "trace",
+          "type": "tool_result",
+          "where": { "name": "qq_group_members", "isError": false },
+          "count": 1
+        },
+        {
+          "kind": "aggregate_projection",
+          "tool": "qq_group_members",
+          "count": 1
+        }
+      ]
+    },
+    {
       "id": "qq-capability-registry-read",
       "chat": "private",
       "prompt": "请调用 qq_capability_search，查询 group.read 类别中已授权的只读群能力，只报告能力数量，不输出群号、群名、成员信息或聊天内容。回复数量和测试编号 {{nonce}}。",

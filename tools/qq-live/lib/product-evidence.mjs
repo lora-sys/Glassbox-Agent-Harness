@@ -330,6 +330,10 @@ export function readTraceEvents(
         "delivery_changed",
         "--type",
         "session_start",
+        "--type",
+        "tool_call",
+        "--type",
+        "tool_result",
         ...[...new Set(featureTypes)].flatMap((type) => ["--type", type]),
         "--json",
         "--data-dir",
@@ -362,7 +366,6 @@ export async function verifyProductEvidence(report, config, clients) {
       const messageBinding = await verifyMessageBindings(c, config, clients, evidence.delivery);
       const featureTypes =
         c.featureAssertions?.filter((a) => a.kind === "trace").map((a) => a.type) ?? [];
-      if (c.featureAssertions) featureTypes.push("tool_call", "tool_result");
       const trace = readTraceEvents(
         after.checkout,
         after.dataDirectory,
@@ -376,6 +379,7 @@ export async function verifyProductEvidence(report, config, clients) {
       const feature = c.featureAssertions
         ? observeFeature(c.featureAssertions, { db, events, runId: evidence.runId })
         : undefined;
+      await verifyGroupMemberCountEvidence(c, feature, config, clients, events, evidence.runId);
       cases.push({
         ...evidence,
         messageBinding,
@@ -390,4 +394,94 @@ export async function verifyProductEvidence(report, config, clients) {
   } finally {
     db.close();
   }
+}
+
+export async function verifyGroupMemberCountEvidence(
+  c,
+  feature,
+  config,
+  clients,
+  events = [],
+  runId,
+) {
+  const assertions =
+    c.featureAssertions?.filter(
+      (assertion) =>
+        assertion.kind === "aggregate_projection" && assertion.tool === "qq_group_members",
+    ) ?? [];
+  const hasMemberToolActivity = events.some(
+    (event) =>
+      event.runId === runId &&
+      ["tool_call", "tool_result"].includes(event.type) &&
+      event.data?.name === "qq_group_members",
+  );
+  if (!hasMemberToolActivity && assertions.length === 0) return;
+  if (assertions.length !== 1 || assertions[0].count !== 1)
+    fail(
+      "MEMBER_COUNT_ASSERTION_MISSING",
+      "成员工具 Trace 缺少固定的聚合数量断言。",
+      "INCONCLUSIVE",
+    );
+  if (c.route !== "private" || config.groups?.filter((group) => group.alias === "A").length !== 1)
+    fail("MEMBER_COUNT_SCOPE", "成员数量验证不在固定私聊和测试群范围内。", "INCONCLUSIVE");
+  const memberCalls = events.filter(
+    (event) =>
+      event.runId === runId &&
+      event.type === "tool_call" &&
+      event.data?.name === "qq_group_members",
+  );
+  const memberResults = events.filter(
+    (event) =>
+      event.runId === runId &&
+      event.type === "tool_result" &&
+      event.data?.name === "qq_group_members",
+  );
+  if (memberCalls.length !== 1 || memberResults.length !== 1)
+    fail("MEMBER_COUNT_TRACE", "成员数量工具缺少唯一的同 Run 调用和结果。", "INCONCLUSIVE");
+  const [call] = memberCalls;
+  const [result] = memberResults;
+  const input = call.data?.input;
+  const groupId = config.groups.find((group) => group.alias === "A").id;
+  if (
+    !call.toolCallId ||
+    call.toolCallId !== result.toolCallId ||
+    call.data.toolCallId !== call.toolCallId ||
+    result.data.toolCallId !== result.toolCallId ||
+    result.data.isError !== false ||
+    !input ||
+    Array.isArray(input) ||
+    typeof input !== "object" ||
+    Object.keys(input).some((key) => !["groupId", "operation", "params"].includes(key)) ||
+    input.groupId !== groupId ||
+    input.operation !== "get_group_member_list" ||
+    (input.params !== undefined &&
+      (!input.params ||
+        Array.isArray(input.params) ||
+        typeof input.params !== "object" ||
+        Object.keys(input.params).length !== 0))
+  )
+    fail("MEMBER_COUNT_TRACE", "成员数量工具调用未绑定到群 A 名单读取。", "INCONCLUSIVE");
+  const observations =
+    feature?.observations?.filter(
+      (observation) =>
+        observation.kind === "aggregate_projection" && observation.tool === "qq_group_members",
+    ) ?? [];
+  if (
+    observations.length !== 1 ||
+    !Number.isSafeInteger(observations[0].memberCount) ||
+    observations[0].memberCount < 0
+  )
+    fail("MEMBER_COUNT_EVIDENCE", "Trace 未提供唯一的成员数量观察。", "INCONCLUSIVE");
+  if (typeof clients.bot?.readGroupMemberCount !== "function")
+    fail("MEMBER_COUNT_UNAVAILABLE", "无法独立确认固定测试群成员数量。", "INCONCLUSIVE");
+  let currentCount;
+  try {
+    currentCount = await clients.bot.readGroupMemberCount();
+  } catch {
+    fail("MEMBER_COUNT_UNAVAILABLE", "无法独立确认固定测试群成员数量。", "INCONCLUSIVE");
+  }
+  if (!Number.isSafeInteger(currentCount) || currentCount < 0)
+    fail("MEMBER_COUNT_INVALID", "固定测试群成员数量响应无效。", "INCONCLUSIVE");
+  if (currentCount !== observations[0].memberCount)
+    fail("MEMBER_COUNT_CHANGED", "Trace 成员数量与独立读取结果不同。", "INCONCLUSIVE");
 }

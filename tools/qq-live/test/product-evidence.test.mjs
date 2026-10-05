@@ -11,7 +11,27 @@ import {
   verifyMessageBindings,
   verifyTraceEvidence,
   verifyLeaseTraceEvidence,
+  verifyGroupMemberCountEvidence,
 } from "../lib/product-evidence.mjs";
+
+function memberCountTrace(
+  input = { groupId: "20001", operation: "get_group_member_list", params: {} },
+) {
+  return [
+    {
+      runId: "run-fixture",
+      type: "tool_call",
+      toolCallId: "member-call",
+      data: { name: "qq_group_members", toolCallId: "member-call", input },
+    },
+    {
+      runId: "run-fixture",
+      type: "tool_result",
+      toolCallId: "member-call",
+      data: { name: "qq_group_members", toolCallId: "member-call", isError: false },
+    },
+  ];
+}
 
 test("offline QQ permits only read-only recovery inspection with the same service identity checks", () => {
   const runtime = {
@@ -141,6 +161,8 @@ test("Trace reader passes the runs directory to gbxtrace", () => {
     );
     assert.equal(args[1], "events");
     assert.equal(args[2], "run-123");
+    assert.equal(args.filter((value) => value === "tool_call").length, 1);
+    assert.equal(args.filter((value) => value === "tool_result").length, 1);
     assert.equal(args.at(-2), "--data-dir");
     assert.equal(args.at(-1), join(dataDirectory, "runs"));
     assert.equal(options.encoding, "utf8");
@@ -532,4 +554,228 @@ test("trace message from another connection or thread cannot satisfy acceptance"
   assert.throws(() => verifyTraceEvidence(events, c, config, { id: "d", external_id: "20" }), {
     code: "TRACE_EVIDENCE",
   });
+});
+
+test("member count projection must match an independent Bot read in private scope", async () => {
+  const c = {
+    route: "private",
+    featureAssertions: [{ kind: "aggregate_projection", tool: "qq_group_members", count: 1 }],
+  };
+  const feature = {
+    observations: [{ kind: "aggregate_projection", tool: "qq_group_members", memberCount: 3 }],
+  };
+  const config = { groups: [{ alias: "A", id: "20001" }] };
+  const events = memberCountTrace();
+  let reads = 0;
+  await verifyGroupMemberCountEvidence(
+    c,
+    feature,
+    config,
+    {
+      bot: {
+        async readGroupMemberCount() {
+          reads++;
+          return 3;
+        },
+      },
+    },
+    events,
+    "run-fixture",
+  );
+  assert.equal(reads, 1);
+  await verifyGroupMemberCountEvidence(
+    c,
+    feature,
+    config,
+    {
+      bot: {
+        async readGroupMemberCount() {
+          return 3;
+        },
+      },
+    },
+    memberCountTrace({ groupId: "20001", operation: "get_group_member_list" }),
+    "run-fixture",
+  );
+  await assert.rejects(
+    verifyGroupMemberCountEvidence(
+      c,
+      feature,
+      config,
+      {
+        bot: {
+          async readGroupMemberCount() {
+            return 2;
+          },
+        },
+      },
+      events,
+      "run-fixture",
+    ),
+    { code: "MEMBER_COUNT_CHANGED", status: "INCONCLUSIVE" },
+  );
+});
+
+test("member count projection rejects missing read, observation, or private scope", async () => {
+  const c = {
+    route: "private",
+    featureAssertions: [{ kind: "aggregate_projection", tool: "qq_group_members", count: 1 }],
+  };
+  const config = { groups: [{ alias: "A", id: "20001" }] };
+  const feature = {
+    observations: [{ kind: "aggregate_projection", tool: "qq_group_members", memberCount: 0 }],
+  };
+  const events = memberCountTrace();
+  await assert.rejects(
+    verifyGroupMemberCountEvidence(c, feature, config, { bot: {} }, events, "run-fixture"),
+    { code: "MEMBER_COUNT_UNAVAILABLE", status: "INCONCLUSIVE" },
+  );
+  await assert.rejects(
+    verifyGroupMemberCountEvidence(
+      c,
+      { observations: [] },
+      config,
+      {
+        bot: {
+          async readGroupMemberCount() {
+            return 0;
+          },
+        },
+      },
+      events,
+      "run-fixture",
+    ),
+    { code: "MEMBER_COUNT_EVIDENCE", status: "INCONCLUSIVE" },
+  );
+  await assert.rejects(
+    verifyGroupMemberCountEvidence(
+      { ...c, route: "20001" },
+      feature,
+      config,
+      {
+        bot: {
+          async readGroupMemberCount() {
+            return 0;
+          },
+        },
+      },
+      events,
+      "run-fixture",
+    ),
+    { code: "MEMBER_COUNT_SCOPE", status: "INCONCLUSIVE" },
+  );
+});
+
+test("raw member-tool Trace cannot downgrade to a transport-only product report", async () => {
+  const config = { groups: [{ alias: "A", id: "20001" }] };
+  const events = [
+    {
+      runId: "run-fixture",
+      type: "tool_call",
+      data: { name: "qq_group_members" },
+    },
+    {
+      runId: "run-fixture",
+      type: "tool_result",
+      data: { name: "qq_group_members" },
+    },
+  ];
+  let reads = 0;
+  const clients = {
+    bot: {
+      async readGroupMemberCount() {
+        reads++;
+        return 3;
+      },
+    },
+  };
+  for (const c of [
+    { route: "private" },
+    {
+      route: "private",
+      featureAssertions: [
+        {
+          kind: "trace",
+          type: "tool_result",
+          where: { name: "qq_group_members", isError: false },
+          count: 1,
+        },
+      ],
+    },
+  ])
+    await assert.rejects(
+      verifyGroupMemberCountEvidence(c, undefined, config, clients, events, "run-fixture"),
+      { code: "MEMBER_COUNT_ASSERTION_MISSING", status: "INCONCLUSIVE" },
+    );
+  assert.equal(reads, 0);
+  await verifyGroupMemberCountEvidence(
+    { route: "private" },
+    undefined,
+    config,
+    clients,
+    [{ ...events[0], runId: "another-run" }],
+    "run-fixture",
+  );
+});
+
+test("member count requires one successful call-result pair scoped to group A", async () => {
+  const c = {
+    route: "private",
+    featureAssertions: [{ kind: "aggregate_projection", tool: "qq_group_members", count: 1 }],
+  };
+  const feature = {
+    observations: [{ kind: "aggregate_projection", tool: "qq_group_members", memberCount: 3 }],
+  };
+  const config = { groups: [{ alias: "A", id: "20001" }] };
+  const valid = memberCountTrace();
+  const wrongGroup = memberCountTrace({ groupId: "20002", operation: "get_group_member_list" });
+  const wrongOperation = memberCountTrace({ groupId: "20001", operation: "get_group_member_info" });
+  const extraInput = memberCountTrace({
+    groupId: "20001",
+    operation: "get_group_member_list",
+    unrestricted: true,
+  });
+  const nonemptyParams = memberCountTrace({
+    groupId: "20001",
+    operation: "get_group_member_list",
+    params: { group_id: "20002" },
+  });
+  const missingInput = memberCountTrace();
+  delete missingInput[0].data.input;
+  const multipleCalls = [...valid, { ...valid[0], toolCallId: "another-call" }];
+  const multipleResults = [...valid, { ...valid[1], toolCallId: "another-call" }];
+  const mismatchedCallId = memberCountTrace();
+  mismatchedCallId[1].toolCallId = "another-call";
+  mismatchedCallId[1].data.toolCallId = "another-call";
+  const failedResult = memberCountTrace();
+  failedResult[1].data.isError = true;
+
+  for (const events of [
+    wrongGroup,
+    wrongOperation,
+    extraInput,
+    nonemptyParams,
+    missingInput,
+    multipleCalls,
+    multipleResults,
+    mismatchedCallId,
+    failedResult,
+  ])
+    await assert.rejects(
+      verifyGroupMemberCountEvidence(
+        c,
+        feature,
+        config,
+        {
+          bot: {
+            async readGroupMemberCount() {
+              return 3;
+            },
+          },
+        },
+        events,
+        "run-fixture",
+      ),
+      { code: "MEMBER_COUNT_TRACE", status: "INCONCLUSIVE" },
+    );
 });

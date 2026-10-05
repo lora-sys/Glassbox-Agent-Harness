@@ -180,6 +180,37 @@ function requiresMemoryLifecycleVerification(report, events, runId) {
   );
 }
 
+function requiresIndependentMemberCountVerification(caseRecord, accepted, events, runId) {
+  const hasAggregateAssertion = caseRecord?.featureAssertions?.some(
+    (assertion) =>
+      assertion?.kind === "aggregate_projection" && assertion.tool === "qq_group_members",
+  );
+  const hasAggregateObservation = accepted?.feature?.observations?.some(
+    (observation) =>
+      observation?.kind === "aggregate_projection" && observation.tool === "qq_group_members",
+  );
+  const hasLeasedTool = caseRecord?.leasedToolNames?.includes("qq_group_members");
+  const hasRawToolTrace = events.some(
+    (event) =>
+      event?.runId === runId &&
+      ["tool_call", "tool_result"].includes(event?.type) &&
+      event.data?.name === "qq_group_members",
+  );
+  const hasRawNarrowedTool = events.some(
+    (event) =>
+      event?.runId === runId &&
+      event?.type === "session_start" &&
+      event.data?.acceptanceLease?.narrowedTools?.includes("qq_group_members"),
+  );
+  return (
+    hasAggregateAssertion ||
+    hasAggregateObservation ||
+    hasLeasedTool ||
+    hasRawToolTrace ||
+    hasRawNarrowedTool
+  );
+}
+
 function traceEventsForLesson(report, lesson, evidence, capture) {
   let trace;
   try {
@@ -639,6 +670,19 @@ export async function appendLesson(
     }
     const evidence = validateLiveReport(report, lesson, reportPath, digest(bytes));
     const traceEvents = traceEventsForLesson(report, lesson, evidence, capture ?? execFileSync);
+    const selectedCase = report.cases.find((item) => item.id === lesson.case);
+    const selectedAccepted = report.productAcceptance.cases.find(
+      (item) => item.caseId === lesson.case,
+    );
+    if (
+      requiresIndependentMemberCountVerification(
+        selectedCase,
+        selectedAccepted,
+        traceEvents,
+        evidence.runId,
+      )
+    )
+      invalid("Independent group member count evidence is unavailable for verified lessons");
     if (requiresMemoryLifecycleVerification(report, traceEvents, evidence.runId))
       verifyMemoryLifecycleReport(report, lesson, evidence, capture);
     else {

@@ -148,10 +148,20 @@ export const FEATURE_CATALOG = Object.freeze({
     {
       id: "qq-group-member-directory-read",
       domain: "qq_read",
-      executionStatus: "planned",
+      executionStatus: "executable",
       tools: ["qq_group_members"],
+      suiteCaseId: "qq-group-member-count-read",
+      assertions: [
+        {
+          kind: "trace",
+          type: "tool_result",
+          where: { name: "qq_group_members", isError: false },
+          count: 1,
+        },
+        { kind: "aggregate_projection", tool: "qq_group_members", count: 1 },
+      ],
       coveragePlan:
-        "Requires a dedicated authorized test group and a no-member-identifiers evidence contract before reading member data.",
+        "Read only group A's aggregate member count in Owner private chat. Independently verify complete Trace outputHead bytes and digest, and require its exact projection to contain only memberCount.",
       mutation: "none",
     },
     {
@@ -748,10 +758,10 @@ function bindToSuiteCase(testCase, suiteCases, gaps, suiteConfig) {
     });
     valid = false;
   }
-  const isHistoryCase = (testCase.tools ?? []).some((name) =>
-    ["group_history_search", "owner_history_search"].includes(name),
+  const needsGroupA = (testCase.tools ?? []).some((name) =>
+    ["group_history_search", "owner_history_search", "qq_group_members"].includes(name),
   );
-  if (isHistoryCase && !suiteConfig) {
+  if (needsGroupA && !suiteConfig) {
     gaps.push({
       code: "SUITE_CONFIG_REQUIRED",
       caseId: testCase.id,

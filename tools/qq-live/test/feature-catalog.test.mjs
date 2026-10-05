@@ -126,6 +126,9 @@ test("read-only example binds only the implemented Ops and QQ inventory cases", 
   const source = JSON.parse(
     await readFile(new URL("../examples/feature-read.example.json", import.meta.url), "utf8"),
   );
+  const memorySource = JSON.parse(
+    await readFile(new URL("../examples/feature-memory.example.json", import.meta.url), "utf8"),
+  );
   const suiteConfig = {
     groups: [
       { alias: "A", id: "10001" },
@@ -134,6 +137,10 @@ test("read-only example binds only the implemented Ops and QQ inventory cases", 
   };
   const suiteCases = validateReadFeatureSpecs(source, suiteConfig);
   const resolvedCases = resolveReadFeatureSpecs(source, suiteConfig);
+  assert.deepEqual(
+    memorySource.cases.find((candidate) => candidate.id === "qq-group-member-count-read"),
+    source.cases.find((candidate) => candidate.id === "qq-group-member-count-read"),
+  );
   const executableCatalogCases = FEATURE_CATALOG.cases.filter(
     (testCase) =>
       testCase.executionStatus === "executable" && testCase.executionKind !== "memory-lifecycle",
@@ -151,6 +158,15 @@ test("read-only example binds only the implemented Ops and QQ inventory cases", 
     );
     assert.deepEqual(testCase.assertions, suiteCase.featureAssertions);
   }
+  const memberCase = resolvedCases.find(
+    (candidate) => candidate.id === "qq-group-member-count-read",
+  );
+  assert.equal(memberCase.chat, "private");
+  assert.deepEqual(memberCase.leaseTools[0].operations[0], {
+    action: "group:members:read",
+    resourceId: "group:10001",
+    inputConstraint: { groupId: "10001", operation: "get_group_member_list" },
+  });
   const groupCase = resolvedCases.find(
     (candidate) => candidate.id === "history-current-group-nonce",
   );
@@ -184,15 +200,11 @@ test("read-only example binds only the implemented Ops and QQ inventory cases", 
     "owner_history_search",
     "qq_account_status",
     "qq_capability_search",
+    "qq_group_members",
     "qq_groups",
   ]);
   assert.deepEqual(result.coveredDomains, []);
-  assert.ok(
-    result.gaps.some(
-      (gap) =>
-        gap.code === "CASE_NOT_EXECUTABLE" && gap.caseId === "qq-group-member-directory-read",
-    ),
-  );
+  assert.ok(!result.gaps.some((gap) => gap.caseId === "qq-group-member-directory-read"));
   assert.ok(
     result.gaps.some((gap) => gap.code === "MISSING_DOMAIN_COVERAGE" && gap.domain === "qq_read"),
   );

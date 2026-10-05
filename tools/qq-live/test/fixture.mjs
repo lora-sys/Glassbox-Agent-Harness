@@ -123,6 +123,12 @@ export async function world({
   initialMute = 0,
   stateField = true,
   delayReply = 0,
+  memberListError = false,
+  memberList = [
+    { group_id: 20001, user_id: 10001 },
+    { group_id: 20001, user_id: 10002 },
+    { group_id: 20001, user_id: 10003 },
+  ],
 } = {}) {
   let driver, bot;
   let mid = 0,
@@ -154,6 +160,11 @@ export async function world({
         role: String(req.params.user_id) === "10003" ? "member" : "admin",
         ...(stateField ? { shut_up_timestamp: mute } : {}),
       });
+    if (req.action === "get_group_member_list") {
+      if (memberListError)
+        return send({ status: "failed", retcode: 403, data: { user_id: 10003 }, echo: req.echo });
+      return response(memberList);
+    }
     if (req.action === "get_msg") {
       const message = messageReads[role].get(String(req.params.message_id));
       if (!message) return send({ status: "failed", retcode: 404, data: null, echo: req.echo });

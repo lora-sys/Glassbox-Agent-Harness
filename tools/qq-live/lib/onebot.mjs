@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { LiveError, fail, id, messageId as parseMessageId } from "./core.mjs";
 
+const MEMBER_COUNT_READ = Symbol("fixed-group-member-count-read");
+
 /** OneBot forward WebSocket. Native Node WebSocket, no npm dependencies. */
 export class OneBot {
   constructor(config, role, { env = process.env, WebSocketClass = globalThis.WebSocket } = {}) {
@@ -134,9 +136,55 @@ export class OneBot {
       fail("MESSAGE_READ_LIMIT", "本轮消息查询达到上限。");
     this.knownMessageReads.add(key);
   }
-  authorize(action, p, cleanup = false) {
+  async readGroupMemberCount() {
+    if (this.role !== "bot")
+      fail("MEMBER_COUNT_DENIED", "仅 Bot 可读取固定测试群成员数量。", "INCONCLUSIVE");
+    const groups = this.config.groups?.filter((group) => group.alias === "A") ?? [];
+    const groupId = groups.length === 1 ? id(groups[0].id) : "";
+    if (!groupId) fail("MEMBER_COUNT_DENIED", "固定测试群配置无效。", "INCONCLUSIVE");
+    let rows;
+    try {
+      rows = await this.#call(
+        "get_group_member_list",
+        { group_id: groupId },
+        false,
+        MEMBER_COUNT_READ,
+      );
+    } catch {
+      fail("MEMBER_COUNT_UNAVAILABLE", "无法确认固定测试群成员数量。", "INCONCLUSIVE");
+    }
+    if (!Array.isArray(rows))
+      fail("MEMBER_COUNT_INVALID", "固定测试群成员响应格式无效。", "INCONCLUSIVE");
+    const seen = new Set();
+    for (const member of rows) {
+      if (
+        !member ||
+        typeof member !== "object" ||
+        Array.isArray(member) ||
+        id(member.group_id) !== groupId ||
+        !id(member.user_id) ||
+        seen.has(id(member.user_id))
+      )
+        fail("MEMBER_COUNT_INVALID", "固定测试群成员响应格式无效。", "INCONCLUSIVE");
+      seen.add(id(member.user_id));
+    }
+    if (!seen.has(id(this.config.bot.qq)) || !seen.has(id(this.config.driver.qq)))
+      fail("MEMBER_COUNT_INVALID", "固定测试群成员响应格式无效。", "INCONCLUSIVE");
+    return seen.size;
+  }
+  authorize(action, p, cleanup = false, capability) {
     const groups = this.config.groups.map((g) => g.id);
     if (["get_login_info", "get_status", "get_version_info"].includes(action)) return;
+    if (
+      capability === MEMBER_COUNT_READ &&
+      this.role === "bot" &&
+      action === "get_group_member_list" &&
+      this.config.groups.filter((group) => group.alias === "A").length === 1 &&
+      groups.includes(id(this.config.groups.find((group) => group.alias === "A")?.id)) &&
+      id(p.group_id) === id(this.config.groups.find((group) => group.alias === "A")?.id) &&
+      Object.keys(p).join(",") === "group_id"
+    )
+      return;
     if (action === "get_msg" && this.knownMessageReads.has(parseMessageId(p.message_id))) return;
     if (
       action === "get_group_member_info" &&
@@ -183,7 +231,10 @@ export class OneBot {
     fail("ACTION_DENIED", `测试器不允许直接调用 ${action}。`);
   }
   async call(action, params = {}, { cleanup = false } = {}) {
-    this.authorize(action, params, cleanup);
+    return this.#call(action, params, cleanup);
+  }
+  async #call(action, params = {}, cleanup = false, capability) {
+    this.authorize(action, params, cleanup, capability);
     if (action === "get_msg") this.knownMessageReads.delete(parseMessageId(params.message_id));
     if (this.problem) throw this.problem;
     if (this.closed || this.ws?.readyState !== 1) fail("WS_NOT_READY", "OneBot 连接尚未就绪。");

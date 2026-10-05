@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { observeFeature, validateFeatureAssertions } from "../lib/feature-observer.mjs";
 
@@ -69,6 +70,102 @@ test("observers reject arbitrary queries, unimplemented events and payload field
     [{ ...assertion, script: "anything" }],
   ])
     assert.throws(() => validateFeatureAssertions(bad));
+});
+
+test("group member aggregate observer verifies full hashed Trace output and exact safe projection", () => {
+  const assertion = {
+    kind: "aggregate_projection",
+    tool: "qq_group_members",
+    count: 1,
+  };
+  const outputHead = JSON.stringify({
+    content: [{ type: "text", text: '{"memberCount":3}' }],
+    details: { memberCount: 3 },
+  });
+  const event = {
+    type: "tool_result",
+    runId: "run-members",
+    toolCallId: "call-members",
+    data: {
+      name: "qq_group_members",
+      isError: false,
+      outputHead,
+      outputTruncated: false,
+      outputBytes: Buffer.byteLength(outputHead, "utf8"),
+      outputSha256: createHash("sha256").update(outputHead, "utf8").digest("hex"),
+    },
+  };
+  const events = [
+    {
+      type: "tool_call",
+      runId: "run-members",
+      toolCallId: "call-members",
+      data: { name: "qq_group_members" },
+    },
+    event,
+  ];
+  const result = observeFeature([assertion], { events, runId: "run-members" });
+  assert.deepEqual(result.observations, [
+    {
+      kind: "aggregate_projection",
+      tool: "qq_group_members",
+      memberCount: 3,
+      identifiersExposed: false,
+    },
+  ]);
+
+  const verifyFailure = (mutate, code) => {
+    const changed = structuredClone(events);
+    mutate(changed[1].data);
+    assert.throws(() => observeFeature([assertion], { events: changed, runId: "run-members" }), {
+      code,
+    });
+  };
+  verifyFailure((data) => (data.outputTruncated = true), "FEATURE_AGGREGATE_TRACE");
+  verifyFailure((data) => (data.outputBytes += 1), "FEATURE_AGGREGATE_TRACE");
+  verifyFailure((data) => (data.outputSha256 = "0".repeat(64)), "FEATURE_AGGREGATE_TRACE");
+
+  for (const details of [
+    { memberCount: 3, user_id: "12345" },
+    { memberCount: 3, nickname: "private-name" },
+    { memberCount: 2 },
+  ]) {
+    const changed = structuredClone(events);
+    const projection = {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(details.memberCount === 2 ? { memberCount: 3 } : details),
+        },
+      ],
+      details,
+    };
+    const head = JSON.stringify(projection);
+    Object.assign(changed[1].data, {
+      outputHead: head,
+      outputBytes: Buffer.byteLength(head, "utf8"),
+      outputSha256: createHash("sha256").update(head, "utf8").digest("hex"),
+    });
+    assert.throws(() => observeFeature([assertion], { events: changed, runId: "run-members" }), {
+      code: "FEATURE_AGGREGATE_PROJECTION",
+    });
+  }
+
+  const duplicateKeyHeads = [
+    `{"content":[{"type":"text","text":${JSON.stringify('{"memberCount":3}')}}],"details":{"memberCount":3,"user_id":"12345"},"details":{"memberCount":3}}`,
+    `{"content":[{"type":"text","text":${JSON.stringify('{"memberCount":3,"user_id":"12345","user_id":"67890"}')}}],"details":{"memberCount":3}}`,
+  ];
+  for (const head of duplicateKeyHeads) {
+    const changed = structuredClone(events);
+    Object.assign(changed[1].data, {
+      outputHead: head,
+      outputBytes: Buffer.byteLength(head, "utf8"),
+      outputSha256: createHash("sha256").update(head, "utf8").digest("hex"),
+    });
+    assert.throws(() => observeFeature([assertion], { events: changed, runId: "run-members" }), {
+      code: "FEATURE_AGGREGATE_PROJECTION",
+    });
+  }
 });
 test("state proves persisted result and originating Run without reading payload", (t) => {
   const db = new DatabaseSync(":memory:");

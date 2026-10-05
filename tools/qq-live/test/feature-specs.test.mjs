@@ -87,14 +87,73 @@ test("history lease rejects broad searches, other resources, and wrong trace sco
     await readFile(new URL("../examples/feature-read.example.json", import.meta.url), "utf8"),
   );
   for (const mutate of [
-    (suite) => (suite.cases[4].leaseTools[0].operations[0].inputConstraint.query = "deploy"),
-    (suite) => (suite.cases[4].leaseTools[0].operations[0].inputConstraint.limit = 8),
-    (suite) => (suite.cases[4].leaseTools[0].operations[0].resourceId = "group:20002"),
-    (suite) => (suite.cases[5].leaseTools[0].operations[0].inputConstraint.groupIds = undefined),
-    (suite) => (suite.cases[5].featureAssertions[1].where.resources = ["group:20002"]),
+    (suite) => (suite.cases[5].leaseTools[0].operations[0].inputConstraint.query = "deploy"),
+    (suite) => (suite.cases[5].leaseTools[0].operations[0].inputConstraint.limit = 8),
+    (suite) => (suite.cases[5].leaseTools[0].operations[0].resourceId = "group:20002"),
+    (suite) => (suite.cases[6].leaseTools[0].operations[0].inputConstraint.groupIds = undefined),
+    (suite) => (suite.cases[6].featureAssertions[1].where.resources = ["group:20002"]),
   ]) {
     const changed = structuredClone(raw);
     mutate(changed);
+    assert.throws(() => validateReadFeatureSpecs(changed, config));
+  }
+});
+
+test("group member case is Owner-private, group A list-only, and independently observes its safe projection", async () => {
+  const raw = JSON.parse(
+    await readFile(new URL("../examples/feature-read.example.json", import.meta.url), "utf8"),
+  );
+  const sourceCase = raw.cases.find((entry) => entry.id === "qq-group-member-count-read");
+  assert.ok(sourceCase);
+  assert.deepEqual(sourceCase.leaseTools, [
+    {
+      name: "qq_group_members",
+      operations: [
+        {
+          action: "group:members:read",
+          resourceId: "group:{{group:A}}",
+          inputConstraint: {
+            groupId: "{{group:A}}",
+            operation: "get_group_member_list",
+          },
+        },
+      ],
+    },
+  ]);
+  assert.deepEqual(sourceCase.featureAssertions[1], {
+    kind: "aggregate_projection",
+    tool: "qq_group_members",
+    count: 1,
+  });
+  const resolved = resolveReadFeatureSpecs(raw, config).find((entry) => entry.id === sourceCase.id);
+  assert.equal(resolved.chat, "private");
+  assert.equal(resolved.leaseTools[0].operations[0].resourceId, "group:20001");
+  assert.deepEqual(resolved.leaseTools[0].operations[0].inputConstraint, {
+    groupId: "20001",
+    operation: "get_group_member_list",
+  });
+
+  for (const mutate of [
+    (entry) => (entry.chat = "A"),
+    (entry) =>
+      (entry.authorization = {
+        action: "group:members:read",
+        resource: "group:20001",
+      }),
+    (entry) => (entry.leaseTools[0].operations[0].action = "group:read"),
+    (entry) => (entry.leaseTools[0].operations[0].resourceId = "group:{{group:B}}"),
+    (entry) =>
+      (entry.leaseTools[0].operations[0].inputConstraint.operation = "get_group_member_info"),
+    (entry) => (entry.leaseTools[0].operations[0].inputConstraint.groupId = "{{group:B}}"),
+    (entry) =>
+      entry.leaseTools[0].operations.push({
+        ...entry.leaseTools[0].operations[0],
+      }),
+    (entry) => (entry.featureAssertions[1].kind = "trace"),
+    (entry) => (entry.featureAssertions[1].tool = "qq_group_members_extra"),
+  ]) {
+    const changed = structuredClone(raw);
+    mutate(changed.cases.find((entry) => entry.id === sourceCase.id));
     assert.throws(() => validateReadFeatureSpecs(changed, config));
   }
 });
