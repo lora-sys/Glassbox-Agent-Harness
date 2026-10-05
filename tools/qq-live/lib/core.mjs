@@ -14,6 +14,19 @@ export const fail = (code, message, status) => {
 export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 export const nonce = () => `QQLIVE_${randomUUID().replaceAll("-", "").slice(0, 20)}`;
 export const digest = (value) => createHash("sha256").update(value).digest("hex");
+export function toolManifestDigest(tools) {
+  const sort = (value) =>
+    Array.isArray(value)
+      ? value.map(sort)
+      : value && typeof value === "object"
+        ? Object.fromEntries(
+            Object.keys(value)
+              .sort()
+              .map((key) => [key, sort(value[key])]),
+          )
+        : value;
+  return digest(JSON.stringify(sort(JSON.parse(JSON.stringify(tools)))));
+}
 export function id(value) {
   if (typeof value === "number" && Number.isSafeInteger(value)) value = String(value);
   if (typeof value === "string" && /^[1-9]\d{4,15}$/.test(value)) return value;

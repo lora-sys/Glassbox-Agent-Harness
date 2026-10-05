@@ -5,7 +5,7 @@
   "description": "Isolated real QQ acceptance CLI for Glassbox. No runtime dependencies.",
   "type": "module",
   "scripts": {
-    "test": "node --test test/core.test.mjs test/integration.test.mjs test/cli.test.mjs test/product-evidence.test.mjs"
+    "test": "node --test test/*.test.mjs"
   },
   "engines": {
     "node": ">=24.12.0"

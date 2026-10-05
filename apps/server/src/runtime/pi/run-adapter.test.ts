@@ -97,6 +97,63 @@ function fixture(results: PiRunResult[], authorizedToolNames: string[] = []) {
   };
 }
 
+it("denies a marked Run with an inactive empty-tool lease before provider initialization", async () => {
+  const f = fixture([{ status: "completed", text: "should not reach the model", toolCalls: [] }]);
+  const initialize = vi.spyOn(f.runtime, "initialize");
+  const input = {
+    ...f.input,
+    text: "GLASSBOX_ACCEPTANCE_V1 00112233445566778899aabbccddeeff\nReply only.",
+  };
+  const executor = new PiRunExecutionAdapter(f.runtime, {
+    resolveAcceptanceLease: () => ({
+      leaseId: "lease-1",
+      marker: "00112233445566778899aabbccddeeff",
+      toolsSha256: "0".repeat(64),
+      assertActive: () => false,
+      filterToolNames: () => [],
+      checkToolCall: () => false,
+    }),
+  });
+  const result = await executor.execute(input);
+  expect(result).toMatchObject({
+    status: "failed",
+    runtimeAttempted: false,
+    failureCode: "gate_refused",
+  });
+  expect(initialize).not.toHaveBeenCalled();
+  expect(f.run).not.toHaveBeenCalled();
+});
+
+it("rechecks lease activity after asynchronous source authorization", async () => {
+  const f = fixture([{ status: "completed", text: "should not reach the model", toolCalls: [] }]);
+  let active = true;
+  const authorizeContext = vi.fn(async () => {
+    active = false;
+  });
+  const executor = new PiRunExecutionAdapter(f.runtime, {
+    resolveAcceptanceLease: () => ({
+      leaseId: "lease-1",
+      marker: "00112233445566778899aabbccddeeff",
+      toolsSha256: "0".repeat(64),
+      assertActive: () => active,
+      filterToolNames: () => [],
+      checkToolCall: () => false,
+    }),
+    learningStore: {
+      listMemories: vi.fn(async () => []),
+      authorizeContext,
+    } as unknown as LearningStore,
+  });
+  f.input.text = "GLASSBOX_ACCEPTANCE_V1 00112233445566778899aabbccddeeff\nReply only.";
+  await expect(executor.execute(f.input)).resolves.toMatchObject({
+    status: "failed",
+    failureCode: "gate_refused",
+    runtimeAttempted: false,
+  });
+  expect(authorizeContext).toHaveBeenCalledOnce();
+  expect(f.run).not.toHaveBeenCalled();
+});
+
 it("includes accepted Step excerpts in Model context and its budget without treating them as commands", async () => {
   const f = fixture([{ status: "completed", text: "Summary", toolCalls: [] }]);
   f.input.run.source = "task_step";

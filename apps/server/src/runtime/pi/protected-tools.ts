@@ -20,6 +20,7 @@ export interface ProtectedToolContext {
   requiredToolName?: string;
   /** The exact input the current user message requires of that Tool. */
   requiredToolInput?: Record<string, unknown>;
+  acceptanceLease?: import("./types.js").PiRunContext["acceptanceLease"];
 }
 
 /**
@@ -372,6 +373,16 @@ export function createProtectedTool<
           ? options.action(typedParams, context)
           : options.action;
 
+      const leaseAllows = () =>
+        !context.acceptanceLease ||
+        context.acceptanceLease.checkToolCall({
+          toolName: options.name,
+          action,
+          resourceId,
+          toolInput: typedParams,
+        });
+      if (!leaseAllows()) throw new ToolInputError("acceptance_lease_denied");
+
       // Gate 3 — Re-authorize immediately before executing side effect!
       const request = {
         caller: context.caller,
@@ -382,6 +393,10 @@ export function createProtectedTool<
         runId: context.runId,
       };
       const decision = await options.authService.check(request);
+
+      // Authorization checks may be asynchronous. Recheck the short-lived lease directly
+      // before effects so an expiry or management revocation during that check takes effect.
+      if (!leaseAllows()) throw new ToolInputError("acceptance_lease_denied");
 
       if (decision.decision !== "ALLOW") {
         // Redact any confidential arguments from the denial output. Never echo raw parameters.

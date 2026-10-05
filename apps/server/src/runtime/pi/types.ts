@@ -89,6 +89,20 @@ import type { ToolExecutionOutcome } from "./tool-plane.js";
 import type { RequiredEvidence } from "./required-evidence.js";
 
 export interface PiRunContext {
+  /** Server-owned, message-bound restriction. It is never serialized into model context. */
+  acceptanceLease?: {
+    leaseId: string;
+    marker: string;
+    toolsSha256: string;
+    assertActive(): boolean;
+    filterToolNames(names: readonly string[]): string[];
+    checkToolCall(input: {
+      toolName: string;
+      action: string;
+      resourceId: string;
+      toolInput: Readonly<Record<string, unknown>>;
+    }): boolean;
+  };
   /** Server-owned authorization callback; never populated from model or Tool input. */
   authorizeProviderContext?: () => Promise<void>;
   /** Rechecks mutable server-owned policy for Skill metadata already in the prompt. */

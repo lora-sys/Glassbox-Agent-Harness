@@ -762,7 +762,12 @@ export function createHistoryTools(options: {
   const getContext = (): ProtectedToolContext | undefined => {
     const value = options.getContext();
     return value?.caller && value.conversationId && value.runId
-      ? { caller: value.caller, conversationId: value.conversationId, runId: value.runId }
+      ? {
+          caller: value.caller,
+          conversationId: value.conversationId,
+          runId: value.runId,
+          ...(value.acceptanceLease ? { acceptanceLease: value.acceptanceLease } : {}),
+        }
       : undefined;
   };
 

@@ -1,6 +1,6 @@
 # QQ live acceptance
 
-Scope: integrate the user-provided QQ live test kit. Fixed private and two-group round trips are the first acceptance matrix. Moderation remains separately configured and requires consent. No web UI or additional model agent is introduced.
+Scope: provide a project-level real QQ acceptance workflow for development Agents. Each delivery must test the new or changed functionality and the existing QQ regression baseline, inspect independent product state and Trace, repair demonstrated failures, and repeat acceptance for the final clean commit. The original private and two-group round trips are transport prerequisites, not complete feature acceptance. Moderation uses a separately consented ordinary test member. No additional model Agent or provider configuration is introduced.
 
 Use the Owner's existing Pi configuration as the model and credential source. Do not copy credentials into Glassbox model profiles or keep a second provider configuration. Native Pi context and output ceilings are independent positive capabilities. Equal ceilings must remain selectable without editing the Owner's model configuration. Derive the current request's output and thinking reserves from its authorized input and available context, then enforce the same budget at the public Pi stream boundary. Missing capacity still blocks execution.
 
@@ -8,6 +8,31 @@ The driver account must have its own authenticated NapCat forward WebSocket sess
 
 Before real execution, confirm the active checkout, commit, PID, data directory, online accounts, and sole QQ consumer. The `runtime` configuration adds service-manager verification before and after sending, then read-only database correlation by external message ID and exact scope. Match successful Run, authorization decisions, and received reply ID to successful delivery. Missing or uncertain evidence blocks product acceptance. A transport PASS alone does not permit merge.
 
-Custom natural-language live suites are disabled until capability narrowing is enforceable. Planning remains available. An unresolved ordinary send writes STOP across runs, as does unconfirmed moderation cleanup. Never clear STOP merely to retry.
+Schema-v1 free-text live suites remain disabled. Schema-v2 read-only feature suites bind a server restriction to the exact Owner Principal, OneBot scope, canonical message hash, external message and Run. Restrictions expire within 30 minutes, intersect the authorized Tool surface and are rechecked before provider work and protected effects. Unsupported execution origins are rejected. This restriction never grants authority. An unresolved ordinary send writes STOP across runs, as does unconfirmed moderation or lease cleanup. Never clear STOP merely to retry.
 
 Delivery gates: tool tests, `vp run verify:commit`, `vp run verify:full`, then fresh private, group-A and group-B QQ acceptance. Record all results separately. Do not merge before fresh acceptance for the reviewed commit. Standalone systemd Glassbox supervision is not represented by the agent-service registry and must not be claimed as verified by this tool. NapCat and Herdr may remain externally supervised. Runtime evidence requires the exact connectionId and threadId scope, destination scope and delivery Trace ID.
+
+## Expanded delivery requirements
+
+1. A discoverable project skill guides feature selection, environment setup, new-feature acceptance, existing-feature regression, debugging, bounded repair and delivery. It uses glassbox-ops and the root-cause discipline from debug. Stable safety and evidence rules remain separate from mutable, evidence-backed lessons.
+2. A maintained feature catalogue maps actual QQ capabilities and affected source paths to executable cases, precise reply/Tool/state assertions, fixture ownership, cleanup and required external prerequisites. Missing implemented-feature coverage blocks a complete regression claim. New functions add their own cases before delivery.
+3. Custom feature suites must execute through trusted server-side narrowing for the exact test message identity and scope. The selected Tool surface and call-time actions/resources stay inside both caller authority and case authority. A Prompt or a suite sideEffect field cannot enforce this boundary.
+4. Assertions verify actual state and result provenance. A Bot saying it succeeded is insufficient. Positive and negative authorization cases, scope isolation, retrieval, learning, media, group operations and durable work require their own observers and fixtures.
+5. Mutable fixtures are explicitly named acceptance resources. Ordinary deterministic tests remain disposable. Real acceptance cleanup verifies both successful operations and interrupted/uncertain operations. Unresolved effects persist STOP and block further sending and merge.
+6. The skill can append sanitized, evidence-linked lessons and update secondary procedures after demonstrated failures and successful rechecks. It must never rewrite historical evidence, alter its stable core, remove assertions or promote an unverified hypothesis to a fact.
+7. A machine-readable gate combines the selected new-feature suite, complete existing-feature regression coverage, successful cleanup, exact runtime/commit identity, deterministic checks, independent review and GitHub CI. It rechecks the remote PR head immediately before an authorized merge. Any absent or stale evidence blocks merge.
+8. After merge, switch the same acceptance service to the merged main commit and repeat the relevant real acceptance. Preserve private reports and record the merged commit separately. Do not claim the final environment is usable until this post-merge round passes.
+
+Environment prerequisites currently include independent logged-in Owner and Bot NapCat sessions, both test groups, the Owner's original StepFun Pi configuration, and consented test subjects for moderation. Expired QQ login requires legitimate account reauthorization. Missing external prerequisites remain explicit blockers while independent implementation and deterministic validation continue.
+
+## Current implementation and remaining acceptance
+
+The new project skill keeps its core hash separate from mutable lessons. Verified lessons require a hashed passing report and matching scoped input/delivery evidence through gbxtrace; evidence without that proof remains a hypothesis.
+
+The feature catalogue inventories implemented descriptors and distinguishes planned cases from runnable cases. Runnable coverage must match the actual suite's leased tools and assertions. Planned coverage and mutations without an implemented cleanup executor remain BLOCKED. The current baseline matrix still needs those executable lifecycle cases.
+
+The local management API registers and revokes read-test restrictions, including idempotent marker revocation after a lost registration reply. Registry state is memory-only. A restarted process cannot reuse a marked message without a live binding. Safe lifecycle and pre-Run denial metadata append to qq-live-acceptance-audit.jsonl; Run evidence stays in Raw Trace. Ordinary messages are unaffected.
+
+The feature observer checks matching tool call/result pairs and exact Task or Memory resource state with originating Run evidence. It permits no arbitrary SQL, scripts or broad history reads. The delivery gate checks the approved suite's original hash/content, all cases, cleanup, exact commit, fresh product evidence, independent review and current remote CI. It is a library gate; CLI delivery orchestration and the full executable baseline are still pending.
+
+Fresh real QQ acceptance, final full verification, PR review/CI for the final implementation, authorized merge and post-merge acceptance remain delivery requirements. Existing provider probes or transport checks cannot satisfy them.

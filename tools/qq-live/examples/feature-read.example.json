@@ -1,0 +1,113 @@
+{
+  "schemaVersion": 2,
+  "cases": [
+    {
+      "id": "ops-status-read",
+      "chat": "private",
+      "prompt": "请调用 ops_status 查询当前授权可见的任务与 Worker 汇总数量。不要读取单个任务或修改状态。回复摘要和测试编号 {{nonce}}。",
+      "expectContains": ["{{nonce}}"],
+      "sideEffect": "none",
+      "leaseTools": [
+        {
+          "name": "ops_status",
+          "operations": [
+            {
+              "action": "ops:status",
+              "resourceId": "agent-operations",
+              "inputConstraint": {}
+            }
+          ]
+        }
+      ],
+      "featureAssertions": [
+        {
+          "kind": "trace",
+          "type": "tool_result",
+          "where": { "name": "ops_status", "isError": false },
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "qq-account-status-read",
+      "chat": "private",
+      "prompt": "请只调用 qq_account_status 的 get_status 操作，说明机器人当前在线状态。不要输出 QQ 号码或版本以外的账号标识。回复状态和测试编号 {{nonce}}。",
+      "expectContains": ["{{nonce}}"],
+      "sideEffect": "none",
+      "leaseTools": [
+        {
+          "name": "qq_account_status",
+          "operations": [
+            {
+              "action": "account:status:read",
+              "resourceId": "agent:personal",
+              "inputConstraint": { "operation": "get_status" }
+            }
+          ]
+        }
+      ],
+      "featureAssertions": [
+        {
+          "kind": "trace",
+          "type": "tool_result",
+          "where": { "name": "qq_account_status", "isError": false },
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "qq-managed-groups-inventory-read",
+      "chat": "private",
+      "prompt": "请调用 qq_groups 查看我管理的群列表，只报告群数量，不要输出群号、群名、成员信息或聊天内容。回复数量和测试编号 {{nonce}}。",
+      "expectContains": ["{{nonce}}"],
+      "sideEffect": "none",
+      "leaseTools": [
+        {
+          "name": "qq_groups",
+          "operations": [
+            {
+              "action": "group:read",
+              "resourceId": "agent:personal",
+              "inputConstraint": {}
+            }
+          ]
+        }
+      ],
+      "featureAssertions": [
+        {
+          "kind": "trace",
+          "type": "tool_result",
+          "where": { "name": "qq_groups", "isError": false },
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "qq-capability-registry-read",
+      "chat": "private",
+      "prompt": "请调用 qq_capability_search，查询 group.read 类别中已授权的只读群能力，只报告能力数量，不输出群号、群名、成员信息或聊天内容。回复数量和测试编号 {{nonce}}。",
+      "expectContains": ["{{nonce}}"],
+      "sideEffect": "none",
+      "leaseTools": [
+        {
+          "name": "qq_capability_search",
+          "operations": [
+            {
+              "action": "qq:capability:read",
+              "resourceId": "agent:personal",
+              "inputConstraint": { "query": "group.read" }
+            }
+          ]
+        }
+      ],
+      "featureAssertions": [
+        {
+          "kind": "trace",
+          "type": "tool_result",
+          "where": { "name": "qq_capability_search", "isError": false },
+          "count": 1
+        }
+      ]
+    }
+  ]
+}

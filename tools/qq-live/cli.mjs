@@ -10,6 +10,8 @@ import { OneBot } from "./lib/onebot.mjs";
 import { Recorder, doctor, smokeSpecs, validateSpecs, replyCase } from "./lib/runner.mjs";
 import { moderationCase } from "./lib/moderation.mjs";
 import { runtimeSnapshot, verifyProductEvidence } from "./lib/product-evidence.mjs";
+import { acceptanceManagement } from "./lib/management-client.mjs";
+import { validateReadFeatureSpecs } from "./lib/feature-specs.mjs";
 
 const root = dirname(fileURLToPath(import.meta.url));
 const help = `QQ 实机测试器 0.1.0
@@ -21,11 +23,13 @@ node cli.mjs run --live
 node cli.mjs run --live --case group-A
 node cli.mjs run --live --case moderation
 node cli.mjs plan --scenarios examples/scenarios.example.json
+node cli.mjs coverage
 node cli.mjs report
 
 通用选项 --config <文件> --out <报告目录>
 run 默认测试私聊和已配置的群。moderation 需要独立配置和成员同意。
-自定义 scenarios 仅支持 plan，实机发送尚未开放。
+schemaVersion=1 的自然语言 scenarios 仅支持 plan。
+schemaVersion=2 的结构化读取用例需要服务端逐消息许可、运行版本和工具证据。
 退出码 0=通过，1=验收失败，2=环境或配置阻塞，3=无法确认。
 停止文件为报告目录下 STOP。Ctrl+C 也会停止，并尝试已授权的清理。
 `;
@@ -39,14 +43,22 @@ function args(argv) {
       continue;
     }
     if (
-      !["--config", "--out", "--case", "--minutes", "--scenarios", "--approve-suite"].includes(k) ||
+      ![
+        "--config",
+        "--out",
+        "--case",
+        "--minutes",
+        "--scenarios",
+        "--approve-suite",
+        "--catalog",
+      ].includes(k) ||
       !argv[i + 1] ||
       argv[i + 1].startsWith("--")
     )
       fail("ARGUMENT", "参数无效，运行 node cli.mjs help 查看帮助。");
     o[k.slice(2)] = argv[++i];
   }
-  if (!["help", "init", "doctor", "arm", "run", "plan", "report"].includes(command))
+  if (!["help", "init", "doctor", "arm", "run", "plan", "report", "coverage"].includes(command))
     fail("COMMAND", "未知命令。");
   return { command, o };
 }
@@ -95,6 +107,22 @@ async function main() {
     console.log(help);
     return;
   }
+  if (command === "coverage") {
+    const { checkRepositoryFeatureCoverage } = await import("./feature-catalog.mjs");
+    const catalog = o.catalog ? (await jsonFile(resolve(o.catalog))).raw : undefined;
+    const executableSuiteCases = o.scenarios
+      ? validateReadFeatureSpecs(
+          (await jsonFile(resolve(o.scenarios))).raw,
+          validateConfig(
+            (await jsonFile(resolve(o.config ?? join(root, "qq-live.local.json")))).raw,
+          ),
+        )
+      : [];
+    const result = await checkRepositoryFeatureCoverage({ catalog, executableSuiteCases });
+    console.log(JSON.stringify(result, null, 2));
+    process.exitCode = result.status === "PASS" ? 0 : 2;
+    return;
+  }
   const configPath = resolve(o.config ?? join(root, "qq-live.local.json"));
   const out = resolve(o.out ?? join(root, "artifacts"));
   if (command === "init") {
@@ -133,15 +161,21 @@ async function main() {
     return;
   }
   let specs = smokeSpecs(config),
-    suiteHash = null;
+    suiteHash = null,
+    featureSuite = false;
   if (o.scenarios) {
-    if (command === "run")
+    const suite = await jsonFile(resolve(o.scenarios));
+    featureSuite = suite.raw?.schemaVersion === 2;
+    if (command === "run" && !featureSuite)
       fail(
         "CUSTOM_LIVE_UNSUPPORTED",
         "自定义自然语言尚未有可验证的能力限制，仅支持 plan 审阅。实机运行使用固定用例。",
       );
-    const suite = await jsonFile(resolve(o.scenarios));
-    specs = validateSpecs(suite.raw, config);
+    specs = featureSuite
+      ? validateReadFeatureSpecs(suite.raw, config)
+      : validateSpecs(suite.raw, config);
+    if (command === "run" && featureSuite && !config.runtime)
+      fail("FEATURE_RUNTIME_REQUIRED", "功能用例必须配置并核对真实验收服务版本。");
     suiteHash = digest(suite.text);
     if (command === "run" && o["approve-suite"] !== suiteHash)
       fail(
@@ -225,6 +259,7 @@ async function main() {
     privacy: "仅保留本轮可关联消息和目标通知；报告仍含测试账号信息，请勿公开上传。",
   };
   let timer;
+  let acceptance;
   const observers = [];
   try {
     await mkdir(runDir, { mode: 0o700 });
@@ -239,6 +274,7 @@ async function main() {
     const { existsSync } = await import("node:fs");
     if (existsSync(join(out, "STOP"))) fail("STOP_FILE", "存在 STOP 文件，本轮不会发送消息。");
     if (command === "run" && config.runtime) report.runtime = runtimeSnapshot(config.runtime);
+    if (command === "run" && featureSuite) acceptance = await acceptanceManagement(config.runtime);
     timer = setInterval(() => {
       if (existsSync(join(out, "STOP"))) controller.abort();
     }, 250);
@@ -257,7 +293,7 @@ async function main() {
       if (specs.length > config.maxMessages) fail("MESSAGE_BUDGET", "用例数超过本轮消息预算。");
       for (const spec of specs) {
         if (controller.signal.aborted) fail("CANCELLED", "测试已停止。");
-        const c = await replyCase(config, clients, recorder, spec, controller.signal);
+        const c = await replyCase(config, clients, recorder, spec, controller.signal, acceptance);
         console.log(`${c.status} ${c.id} ${c.code}`);
         // Fail fast: do not let an unresolved request overlap a later case.
         if (c.status !== "PASS") break;

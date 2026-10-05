@@ -21,6 +21,7 @@ import { exactTerms } from "../../retrieval/exact-term.js";
 import type { QqCapabilityCategory } from "../../channels/onebot/capabilities.js";
 import { WEB_CAPABILITIES } from "../../management/web-capability-policy.js";
 import type { PiRunContext, PiRuntimeAdapter, PiRuntimeProfileName, PiRunResult } from "./types.js";
+import { hasQqLiveAcceptanceMarker } from "../../acceptance/qq-live-lease.js";
 import {
   GROUP_HISTORY_SEARCH_TOOL,
   OWNER_HISTORY_SEARCH_TOOL,
@@ -541,6 +542,7 @@ const SOURCE_CLASS_WORDS: readonly { sourceClass: QqSourceClass; words: RegExp }
  * a file, an order — never binds the Tool.
  */
 export interface PiRunExecutionAdapterOptions {
+  resolveAcceptanceLease?: (input: ExecutionInput) => PiRunContext["acceptanceLease"] | undefined;
   isOwner?: (input: ExecutionInput) => Promise<boolean>;
   learningStore?: LearningStore;
   listModelProfiles?: () => readonly PublicModelProfile[];
@@ -1834,6 +1836,17 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
   ) {}
 
   async execute(input: ExecutionInput): Promise<ExecutionResult> {
+    const acceptanceLease = this.options.resolveAcceptanceLease?.(input);
+    if (
+      hasQqLiveAcceptanceMarker(input.text) &&
+      (!acceptanceLease || !acceptanceLease.assertActive())
+    )
+      return {
+        status: "failed",
+        failureCode: "gate_refused",
+        runtimeAttempted: false,
+        text: "测试消息的临时权限已失效，请重新登记后再试。",
+      };
     if (input.imageFailureCode)
       return {
         status: "succeeded",
@@ -1914,6 +1927,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       caller: input.caller,
       conversationId: input.conversation.id,
       runId: input.run.id,
+      ...(acceptanceLease ? { acceptanceLease } : {}),
       callerIdentity: {
         senderId: input.caller.scope.senderId,
         isOwner,
@@ -2227,6 +2241,8 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
           providerSessionId: binding.runtimeSessionId,
         };
       context.authorizeProviderContext = async () => {
+        if (context.acceptanceLease && !context.acceptanceLease.assertActive())
+          throw new Error("acceptance_lease_denied");
         if (!this.options.learningStore) return;
         await this.options.learningStore.authorizeContext(
           {
@@ -2236,6 +2252,8 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
           },
           learningItems.map((item) => item.memoryId),
         );
+        if (context.acceptanceLease && !context.acceptanceLease.assertActive())
+          throw new Error("acceptance_lease_denied");
       };
       const contextAllowed = async () => {
         try {

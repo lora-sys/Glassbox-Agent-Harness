@@ -10,7 +10,47 @@ import {
   textOf,
   id,
   messageId,
+  toolManifestDigest,
 } from "../lib/core.mjs";
+test("Tool specification hashing matches the server canonical JSON contract", () => {
+  const tools = [
+    {
+      name: "ops_status",
+      operations: [
+        {
+          resourceId: "agent-operations",
+          inputConstraint: { z: 1, a: [2, 3] },
+          action: "ops:status",
+        },
+      ],
+    },
+  ];
+  assert.equal(
+    toolManifestDigest(tools),
+    "4d93a3f0fd2449068b6579b750e7394ca8dc090283f0f3ac4027c934c35a38e1",
+  );
+  assert.equal(
+    toolManifestDigest([
+      {
+        operations: [
+          {
+            action: "ops:status",
+            inputConstraint: { a: [2, 3], z: 1 },
+            resourceId: "agent-operations",
+          },
+        ],
+        name: "ops_status",
+      },
+    ]),
+    toolManifestDigest(tools),
+  );
+  assert.notEqual(
+    toolManifestDigest([
+      { ...tools[0], operations: [{ ...tools[0].operations[0], resourceId: "another-resource" }] },
+    ]),
+    toolManifestDigest(tools),
+  );
+});
 import { muteUntil } from "../lib/moderation.mjs";
 import { validateSpecs, Recorder } from "../lib/runner.mjs";
 import { boundMessage, compareSameMessage } from "../lib/message-binding.mjs";

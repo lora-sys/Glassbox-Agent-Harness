@@ -28,6 +28,80 @@ const spec = {
   prompt: "请回复 {{nonce}} 和 result: 42",
   expectContains: ["{{nonce}}", "result: 42"],
 };
+const featureSpec = {
+  ...spec,
+  leaseTools: [],
+  featureAssertions: [
+    { kind: "trace", type: "tool_result", where: { name: "fixture", isError: false }, count: 1 },
+  ],
+};
+test("feature request registers before sending and revokes its exact lease", async (t) => {
+  const w = await setup(t);
+  const leaseId = "12345678-1234-1234-1234-123456789abc";
+  let registered = false,
+    revoked = false;
+  const c = await replyCase(w.config, w.clients, w.recorder, featureSpec, undefined, {
+    register: async (config, c, tools) => {
+      assert.equal(w.actions.filter((a) => a.action.startsWith("send_")).length, 0);
+      assert.match(c.prompt, /^GLASSBOX_ACCEPTANCE_V1 [a-f0-9]{32}\n/);
+      assert.deepEqual(tools, []);
+      registered = true;
+      return { leaseId, expiresAt: Date.now() + 10000 };
+    },
+    revoke: async (id) => {
+      assert.equal(id, leaseId);
+      revoked = true;
+    },
+  });
+  assert.equal(c.status, "PASS");
+  assert.equal(registered, true);
+  assert.equal(revoked, true);
+  assert.equal(c.leaseRevoked, true);
+  assert.deepEqual(c.featureAssertions, featureSpec.featureAssertions);
+});
+test("missing or rejected feature lease prevents all sends", async (t) => {
+  const w = await setup(t);
+  const c = await replyCase(w.config, w.clients, w.recorder, featureSpec);
+  assert.equal(c.status, "BLOCKED");
+  const denied = await replyCase(w.config, w.clients, w.recorder, featureSpec, undefined, {
+    register: async () => {
+      throw Error("refused");
+    },
+  });
+  assert.notEqual(denied.status, "PASS");
+  assert.equal(w.actions.filter((a) => a.action.startsWith("send_")).length, 0);
+});
+test("lost registration response revokes by marker without retrying or sending", async (t) => {
+  const w = await setup(t);
+  let attempts = 0,
+    marker;
+  const c = await replyCase(w.config, w.clients, w.recorder, featureSpec, undefined, {
+    register: async () => {
+      attempts++;
+      throw Error("response lost");
+    },
+    revokeMarker: async (value) => {
+      marker = value;
+    },
+  });
+  assert.equal(attempts, 1);
+  assert.equal(marker, c.token);
+  assert.equal(c.leaseRevoked, true);
+  assert.notEqual(c.status, "PASS");
+  assert.equal(w.actions.filter((a) => a.action.startsWith("send_")).length, 0);
+});
+test("unconfirmed lease revocation makes a received reply inconclusive", async (t) => {
+  const w = await setup(t);
+  const c = await replyCase(w.config, w.clients, w.recorder, featureSpec, undefined, {
+    register: async () => ({ leaseId: "fixture-lease" }),
+    revoke: async () => {
+      throw Error("offline");
+    },
+  });
+  assert.equal(c.status, "INCONCLUSIVE");
+  assert.equal(c.code, "LEASE_REVOKE_UNCONFIRMED");
+  assert.deepEqual(c.cleanup, { required: true, restored: false });
+});
 test("real localhost WebSocket handshake uses Bearer header", async (t) => {
   const w = await setup(t);
   await doctor(w.config, w.clients);

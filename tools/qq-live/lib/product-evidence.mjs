@@ -1,8 +1,9 @@
 import { execFileSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { resolve, join } from "node:path";
-import { fail } from "./core.mjs";
+import { fail, digest } from "./core.mjs";
 import { boundMessage, compareSameMessage } from "./message-binding.mjs";
+import { observeFeature, validateFeatureAssertions } from "./feature-observer.mjs";
 
 export function runtimeSnapshot(runtime, capture = execFileSync) {
   if (
@@ -164,6 +165,7 @@ export function caseEvidence(db, c, config) {
   return {
     caseId: c.id,
     runId: run.id,
+    scope,
     decisions,
     deliveries,
     delivery: scopedDeliveries[0],
@@ -190,6 +192,37 @@ export function verifyTraceEvidence(events, c, config, delivery) {
     fail("TRACE_EVIDENCE", "对应 Raw Trace 缺少匹配 scope 的入站或成功投递证据。", "INCONCLUSIVE");
 }
 
+export function verifyLeaseTraceEvidence(events, c, runId) {
+  if (!c.featureAssertions) return;
+  const sessions = events.filter((e) => e.runId === runId && e.type === "session_start");
+  if (
+    !/^[a-f0-9]{32}$/.test(c.token ?? "") ||
+    !c.acceptanceLease?.leaseId ||
+    !/^[a-f0-9]{64}$/.test(c.acceptanceLease.toolsSha256 ?? "") ||
+    !Array.isArray(c.leasedToolNames) ||
+    !c.leasedToolNames.length ||
+    !sessions.length ||
+    sessions.some((e) => {
+      const lease = e.data?.acceptanceLease;
+      return (
+        lease?.leaseId !== c.acceptanceLease.leaseId ||
+        lease.toolsSha256 !== c.acceptanceLease.toolsSha256 ||
+        lease.marker !== c.token ||
+        !Array.isArray(lease.narrowedTools) ||
+        JSON.stringify(lease.narrowedTools) !== JSON.stringify(e.data?.authorizedTools) ||
+        lease.narrowedTools.some((name) => !c.leasedToolNames.includes(name))
+      );
+    }) ||
+    events.some(
+      (e) =>
+        e.runId === runId &&
+        ["tool_call", "tool_result"].includes(e.type) &&
+        !c.leasedToolNames.includes(e.data?.name),
+    )
+  )
+    fail("FEATURE_LEASE_TRACE", "功能 Run 缺少对应许可和工具范围的原始证据。", "INCONCLUSIVE");
+}
+
 function sameMessageBinding(binding, evidence) {
   if (
     String(binding.realSequence) !== String(evidence.realSequence) ||
@@ -201,6 +234,8 @@ function sameMessageBinding(binding, evidence) {
 
 export async function verifyMessageBindings(c, config, clients, delivery) {
   const binding = c.inputBinding;
+  if (typeof c.prompt !== "string" || binding?.textSha256 !== digest(c.prompt))
+    fail("MESSAGE_BINDING", "本轮输入消息与审批执行消息不一致。", "INCONCLUSIVE");
   const reply = c.replies.filter((r) => r.matches && r.route === c.route);
   if (reply.length !== 1 || !validIdentifier(delivery.external_id))
     fail("MESSAGE_BINDING", "没有唯一的本轮输入和投递消息。", "INCONCLUSIVE");
@@ -261,7 +296,17 @@ export async function verifyMessageBindings(c, config, clients, delivery) {
   return { input: inputMatch, reply: replyMatch };
 }
 
-export function readTraceEvents(checkout, dataDirectory, runId, capture = execFileSync) {
+export function readTraceEvents(
+  checkout,
+  dataDirectory,
+  runId,
+  capture = execFileSync,
+  featureTypes = [],
+) {
+  if (featureTypes.length)
+    validateFeatureAssertions(
+      featureTypes.map((type) => ({ kind: "trace", type, where: { name: "fixture" }, count: 1 })),
+    );
   return JSON.parse(
     capture(
       process.execPath,
@@ -273,6 +318,9 @@ export function readTraceEvents(checkout, dataDirectory, runId, capture = execFi
         "message_received",
         "--type",
         "delivery_changed",
+        "--type",
+        "session_start",
+        ...[...new Set(featureTypes)].flatMap((type) => ["--type", type]),
         "--json",
         "--data-dir",
         join(dataDirectory, "runs"),
@@ -302,10 +350,28 @@ export async function verifyProductEvidence(report, config, clients) {
     for (const c of report.cases) {
       const evidence = caseEvidence(db, c, config);
       const messageBinding = await verifyMessageBindings(c, config, clients, evidence.delivery);
-      const trace = readTraceEvents(after.checkout, after.dataDirectory, evidence.runId);
+      const featureTypes =
+        c.featureAssertions?.filter((a) => a.kind === "trace").map((a) => a.type) ?? [];
+      if (c.featureAssertions) featureTypes.push("tool_call", "tool_result");
+      const trace = readTraceEvents(
+        after.checkout,
+        after.dataDirectory,
+        evidence.runId,
+        execFileSync,
+        featureTypes,
+      );
       const events = trace.events?.map((row) => row.event) ?? [];
       verifyTraceEvidence(events, c, config, evidence.delivery);
-      cases.push({ ...evidence, messageBinding, traceVerified: true });
+      verifyLeaseTraceEvidence(events, c, evidence.runId);
+      const feature = c.featureAssertions
+        ? observeFeature(c.featureAssertions, { db, events, runId: evidence.runId })
+        : undefined;
+      cases.push({
+        ...evidence,
+        messageBinding,
+        traceVerified: true,
+        ...(feature ? { feature } : {}),
+      });
     }
     const finalRuntime = runtimeSnapshot(config.runtime);
     if (JSON.stringify(after) !== JSON.stringify(finalRuntime))

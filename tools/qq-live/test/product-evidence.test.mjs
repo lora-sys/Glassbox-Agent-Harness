@@ -9,7 +9,79 @@ import {
   runtimeSnapshot,
   verifyMessageBindings,
   verifyTraceEvidence,
+  verifyLeaseTraceEvidence,
 } from "../lib/product-evidence.mjs";
+
+test("feature evidence requires server lease identity and the narrowed Tool surface", () => {
+  const c = {
+    token: "a".repeat(32),
+    acceptanceLease: { leaseId: "lease-fixture", toolsSha256: "b".repeat(64) },
+    leasedToolNames: ["ops_status"],
+    featureAssertions: [{ kind: "trace" }],
+  };
+  const session = {
+    runId: "run-fixture",
+    type: "session_start",
+    data: {
+      authorizedTools: ["ops_status"],
+      acceptanceLease: {
+        leaseId: "lease-fixture",
+        toolsSha256: "b".repeat(64),
+        marker: c.token,
+        narrowedTools: ["ops_status"],
+      },
+    },
+  };
+  const tool = { runId: "run-fixture", type: "tool_call", data: { name: "ops_status" } };
+  assert.doesNotThrow(() => verifyLeaseTraceEvidence([session, tool], c, "run-fixture"));
+  for (const events of [
+    [tool],
+    [{ ...session, runId: "old-run" }, tool],
+    [
+      {
+        ...session,
+        data: { acceptanceLease: { ...session.data.acceptanceLease, leaseId: "other" } },
+      },
+      tool,
+    ],
+    [
+      {
+        ...session,
+        data: {
+          acceptanceLease: { ...session.data.acceptanceLease, narrowedTools: ["task_cancel"] },
+        },
+      },
+      tool,
+    ],
+    [session, { ...tool, data: { name: "task_cancel" } }],
+    [{ ...session, data: { ...session.data, authorizedTools: ["task_cancel"] } }, tool],
+    [session, { ...tool, type: "tool_result", data: { name: "task_cancel" } }],
+    [
+      {
+        ...session,
+        data: {
+          ...session.data,
+          acceptanceLease: { ...session.data.acceptanceLease, toolsSha256: "c".repeat(64) },
+        },
+      },
+      tool,
+    ],
+  ])
+    assert.throws(() => verifyLeaseTraceEvidence(events, c, "run-fixture"), {
+      code: "FEATURE_LEASE_TRACE",
+    });
+});
+test("reported prompt cannot substitute for a different bound QQ input", async () => {
+  await assert.rejects(
+    verifyMessageBindings(
+      { prompt: "approved", inputBinding: { textSha256: messageDigest("different") } },
+      {},
+      {},
+      {},
+    ),
+    { code: "MESSAGE_BINDING" },
+  );
+});
 
 test("Trace reader passes the runs directory to gbxtrace", () => {
   const checkout = join(process.cwd(), "candidate");
@@ -234,6 +306,7 @@ function boundMessageFixture({ driverReplyRealSequence = "555", driverReplyText 
   ]);
   const c = {
     sentMessageId: "2102070094",
+    prompt: inputText,
     inputBinding: {
       driverMessageId: "2102070094",
       botMessageId: "447318472",

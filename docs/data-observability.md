@@ -555,3 +555,24 @@ duplicate suppression. Equivalent UTC and offset inputs select the same records;
 bounds, reversed windows and invalid limits return fixed input-error codes. Time precision
 is the existing JavaScript Date millisecond precision, with no Julian-day floating-point
 arithmetic.
+
+## QQ acceptance evidence
+
+Real-environment acceptance uses the designated shared data directory. Its safe restriction
+lifecycle and pre-Run denials append to `qq-live-acceptance-audit.jsonl`. The event kind is
+`lease_registered`, `run_bound`, `lease_revoked` or `message_denied`. Entries contain a timestamp
+and the relevant identifiers, expiry, scope hash or fixed denial reason. They do not contain
+message bodies, credentials or Tool inputs. A restriction is not an authorization grant, so
+these entries do not create grant/revoke product evidence.
+
+Run Raw Trace remains append-only. `session_start` records the applicable lease identity and
+final narrowed Tool names. The acceptance observer reads Raw Trace through gbxtrace, matches
+the exact scoped input and delivery, and correlates Tool call/result identifiers in that Run.
+Independent state checks use fixed read-only queries for explicitly identified acceptance
+resources and their Run provenance. Arbitrary queries and scripts are not acceptance observers.
+
+Private acceptance reports retain the runtime checkout, clean launch commit, PID, data directory,
+suite hash and account-local message bindings. A feature report must retain its approved
+assertions and verified cleanup. Historical reports or provider probes cannot substitute for
+fresh acceptance of the final commit. Lessons may record sanitized verified findings only after
+the report hash and scoped Raw Trace evidence have been checked.

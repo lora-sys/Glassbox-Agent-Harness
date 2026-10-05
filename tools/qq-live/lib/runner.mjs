@@ -12,6 +12,8 @@ import {
   statusOf,
 } from "./core.mjs";
 import { boundMessage, compareSameMessage } from "./message-binding.mjs";
+import { randomUUID } from "node:crypto";
+import { validateFeatureAssertions } from "./feature-observer.mjs";
 
 export class Recorder {
   constructor(config, secrets = []) {
@@ -255,13 +257,33 @@ async function bindInput(config, clients, c) {
   c.inputObserved = true;
   c.botInputMessageId = botMessage.messageId;
 }
-export async function replyCase(config, clients, recorder, spec, signal) {
+export async function replyCase(config, clients, recorder, spec, signal, acceptance) {
   const route =
     spec.chat === "private" ? "private" : config.groups.find((g) => g.alias === spec.chat)?.id;
   if (!route) fail("CASE_ROUTE", "测试会话没有配置。");
-  const c = recorder.begin(spec.id, route, spec.prompt, spec.expectContains);
+  const featureCase = Array.isArray(spec.leaseTools);
+  if (spec.featureAssertions !== undefined && !featureCase)
+    fail("FEATURE_CAPABILITY", "功能断言缺少服务端测试许可范围。");
+  const marker = featureCase ? randomUUID().replaceAll("-", "") : undefined;
+  const prompt = featureCase
+    ? `GLASSBOX_ACCEPTANCE_V1 {{nonce}}\n${spec.prompt.trim()}`
+    : spec.prompt;
+  const c = recorder.begin(spec.id, route, prompt, spec.expectContains, marker);
+  let lease;
+  let registrationAttempted = false;
   try {
     check(clients, signal, config);
+    if (featureCase) {
+      if (!acceptance) fail("ACCEPTANCE_MANAGEMENT", "功能用例缺少服务端测试许可接口。");
+      c.featureAssertions = validateFeatureAssertions(spec.featureAssertions);
+      const tools = JSON.parse(JSON.stringify(spec.leaseTools).replaceAll("{{nonce}}", marker));
+      c.leasedToolNames = tools.map((tool) => tool.name);
+      registrationAttempted = true;
+      c.leaseRegistrationAttempted = true;
+      lease = await acceptance.register(config, c, tools);
+      c.acceptanceLease = lease;
+      check(clients, signal, config);
+    }
     await sendCase(config, clients, c);
     const end = Date.now() + config.timeoutMs;
     let matchedAt = 0;
@@ -314,6 +336,22 @@ export async function replyCase(config, clients, recorder, spec, signal) {
   } catch (error) {
     const e = safeError(error);
     return recorder.finish(c, e.status, e.code, e.message);
+  } finally {
+    if (registrationAttempted) {
+      try {
+        if (lease) await acceptance.revoke(lease.leaseId);
+        else await acceptance.revokeMarker(marker);
+        c.leaseRevoked = true;
+      } catch {
+        c.cleanup = { required: true, restored: false };
+        recorder.finish(
+          c,
+          "INCONCLUSIVE",
+          "LEASE_REVOKE_UNCONFIRMED",
+          "未确认服务已撤销测试许可，必须先核实对应 Run 与许可状态。",
+        );
+      }
+    }
   }
 }
 export function smokeSpecs(config) {

@@ -194,11 +194,19 @@ import {
   DELIVERY_UUID,
   hostDeliveryForbiddenValues,
 } from "../delivery/content-policy.js";
-import { scopeKey } from "../identity/scope.js";
+import { scopeKey, validateScope } from "../identity/scope.js";
 import { WorkspaceRegistry } from "../workspace/registry.js";
 import { WorkspaceWriteOccupancy } from "../workspace/write-occupancy.js";
 import { GLASSBOX_HOST_EXCLUDED_PI_TOOLS } from "../runtime/pi/tool-plane.js";
 import { loadKitSandbox } from "../runtime/pi/sandbox-kit.js";
+import {
+  QqLiveLeaseRegistry,
+  QQ_LIVE_ACCEPTANCE_MAX_TTL_MS,
+  appendQqLiveAcceptanceAudit,
+  hasQqLiveAcceptanceMarker,
+  type QqLiveLeaseBinding,
+  type QqLiveLeaseTool,
+} from "../acceptance/qq-live-lease.js";
 import { createIsolatedPiTools } from "../runtime/pi/sandbox-pi-tools.js";
 import type { IsolatedPiSession } from "../runtime/pi/sandbox-pi-tools.js";
 import {
@@ -397,6 +405,11 @@ export class ManagementApplication {
   private sandboxFailure: string | null = null;
   executors!: ExecutorConfiguration;
   private readonly connections = new Map<string, OneBotAdapter>();
+  private readonly qqLiveLeases = new QqLiveLeaseRegistry();
+  private readonly qqLiveRunBindings = new Map<
+    string,
+    QqLiveLeaseBinding & { marker: string; toolsSha256: string }
+  >();
   private readonly browserCleanups = new Map<string, Set<() => Promise<void>>>();
   private readonly deliveryPolicy: ReturnType<typeof createQqDeliveryPolicy>;
   private readonly kitLoader: KitLoader;
@@ -1133,6 +1146,150 @@ export class ManagementApplication {
       throw new ManagementError("FORBIDDEN", "Owner principal is required", 403);
   }
 
+  async registerQqLiveLease(input: unknown) {
+    if (!input || typeof input !== "object" || Array.isArray(input))
+      throw new ManagementError("INVALID_REQUEST", "A lease object is required");
+    const value = input as Record<string, unknown>;
+    const rawScope = value.scope;
+    if (!rawScope || typeof rawScope !== "object" || Array.isArray(rawScope))
+      throw new ManagementError("INVALID_REQUEST", "A channel scope is required");
+    const scope = rawScope as TrustedChannelScope;
+    try {
+      validateScope(scope);
+    } catch {
+      throw new ManagementError("INVALID_REQUEST", "Invalid channel scope");
+    }
+    const caller = await this.store.identities.resolve(scope);
+    if (!caller || !(await this.store.identities.isOwner(caller.principalId)))
+      throw new ManagementError("FORBIDDEN", "Owner principal is required for this scope", 403);
+    const channel = this.channels.resolve(scope.connectionId);
+    const configuredOwnerIds = [channel.config.ownerId, channel.config.coOwnerId].filter(
+      (id): id is string => typeof id === "string",
+    );
+    const scopeIsConfigured =
+      channel.config.botId === scope.botId &&
+      (scope.chatType === "group"
+        ? channel.config.groupIds.includes(scope.chatId)
+        : scope.chatId === scope.senderId && configuredOwnerIds.includes(scope.senderId));
+    if (!scopeIsConfigured || !this.supportsQqLiveLeaseExecution(channel.executionRef))
+      throw new ManagementError("INVALID_REQUEST", "Lease scope is not a configured Pi channel");
+    if (typeof value.marker !== "string" || typeof value.textSha256 !== "string")
+      throw new ManagementError("INVALID_REQUEST", "A marker and text hash are required");
+    const expiresAt = value.expiresAt;
+    const requestedAt = Date.now();
+    if (
+      !Number.isSafeInteger(value.ttlMs) ||
+      (value.ttlMs as number) <= 0 ||
+      (value.ttlMs as number) > QQ_LIVE_ACCEPTANCE_MAX_TTL_MS ||
+      !Number.isSafeInteger(expiresAt) ||
+      (expiresAt as number) <= requestedAt ||
+      (expiresAt as number) > requestedAt + (value.ttlMs as number) ||
+      (expiresAt as number) > requestedAt + QQ_LIVE_ACCEPTANCE_MAX_TTL_MS ||
+      !Array.isArray(value.tools)
+    )
+      throw new ManagementError("INVALID_REQUEST", "Invalid lease limits or tools");
+    if (
+      value.tools.some(
+        (tool: unknown) =>
+          !tool ||
+          typeof tool !== "object" ||
+          Array.isArray(tool) ||
+          (() => {
+            const record = tool as Record<string, unknown>;
+            return (
+              typeof record.name !== "string" ||
+              !Array.isArray(record.operations) ||
+              record.operations.some((operation: unknown) => {
+                if (!operation || typeof operation !== "object" || Array.isArray(operation))
+                  return true;
+                const entry = operation as Record<string, unknown>;
+                return typeof entry.action !== "string" || typeof entry.resourceId !== "string";
+              })
+            );
+          })(),
+      )
+    )
+      throw new ManagementError("INVALID_REQUEST", "Lease Tool operations are invalid");
+    const tools = value.tools as QqLiveLeaseTool[];
+    for (const tool of tools) {
+      const descriptor = TOOL_DESCRIPTORS.find((entry) => entry.name === tool.name);
+      if (!descriptor || descriptor.origin !== "glassbox_domain" || !descriptor.authorization)
+        throw new ManagementError("INVALID_REQUEST", "Lease contains an unavailable Tool");
+      const allowedActions = Array.isArray(descriptor.authorization.action)
+        ? descriptor.authorization.action
+        : [descriptor.authorization.action];
+      if (
+        !Array.isArray(tool.operations) ||
+        tool.operations.some(
+          (operation) =>
+            !allowedActions.includes(operation.action) ||
+            !(
+              operation.resourceId === descriptor.authorization!.resource ||
+              operation.resourceId.startsWith(`${descriptor.authorization!.resource}:`) ||
+              operation.resourceId.startsWith(`${descriptor.authorization!.resource}-`) ||
+              (descriptor.authorization!.resource === "web-public" &&
+                operation.resourceId === "web:public") ||
+              ((descriptor.authorization!.resource === "account" || tool.name === "qq_groups") &&
+                operation.resourceId === agentResourceId(AGENT_ID))
+            ),
+        )
+      )
+        throw new ManagementError("INVALID_REQUEST", "Lease operation is outside the Tool binding");
+    }
+    let registered: ReturnType<QqLiveLeaseRegistry["register"]>;
+    try {
+      registered = this.qqLiveLeases.register({
+        principalId: caller.principalId,
+        scope,
+        marker: value.marker,
+        textSha256: value.textSha256,
+        ttlMs: value.ttlMs as number,
+        expiresAt: expiresAt as number,
+        tools,
+      });
+    } catch {
+      throw new ManagementError("INVALID_REQUEST", "Lease could not be registered");
+    }
+    try {
+      await appendQqLiveAcceptanceAudit(this.options.dataDirectory, {
+        event: "lease_registered",
+        principalId: caller.principalId,
+        leaseId: registered.leaseId,
+        marker: registered.marker,
+        expiresAt: registered.expiresAt,
+        toolsSha256: registered.toolsSha256,
+        scope,
+      });
+    } catch {
+      this.qqLiveLeases.revoke(registered.leaseId);
+      throw new ManagementError("INTERNAL_ERROR", "Lease registration evidence failed", 500);
+    }
+    return registered;
+  }
+
+  async revokeQqLiveLease(leaseId: string) {
+    const revoked = this.qqLiveLeases.revoke(leaseId);
+    if (revoked)
+      await appendQqLiveAcceptanceAudit(this.options.dataDirectory, {
+        event: "lease_revoked",
+        principalId: OWNER_ID,
+        leaseId,
+      }).catch(() => undefined);
+    return { revoked, active: false };
+  }
+
+  async revokeQqLiveLeaseByMarker(marker: string) {
+    const result = this.qqLiveLeases.revokeMarker(marker);
+    if (result?.revoked && result.leaseId)
+      await appendQqLiveAcceptanceAudit(this.options.dataDirectory, {
+        event: "lease_revoked",
+        principalId: OWNER_ID,
+        leaseId: result.leaseId,
+        marker: marker.toLowerCase(),
+      }).catch(() => undefined);
+    return { revoked: result?.revoked ?? false, active: false };
+  }
+
   private async grantWorkspaceScope(
     principalId: string,
     scope: TrustedChannelScope,
@@ -1250,6 +1407,28 @@ export class ManagementApplication {
     await this.requireOwnerPrincipal(value.principalId);
     await this.workspaces.select(value.principalId, value.workspaceId);
     return { selected: value.workspaceId };
+  }
+
+  private resolveQqLiveRunLease(
+    input: ExecutionInput,
+  ): PiRunContext["acceptanceLease"] | undefined {
+    const binding = this.qqLiveRunBindings.get(input.run.id);
+    if (!binding) return undefined;
+    const current: QqLiveLeaseBinding = { ...binding, runId: input.run.id };
+    if (!this.qqLiveLeases.isActive(current)) return undefined;
+    return {
+      leaseId: binding.leaseId,
+      marker: binding.marker,
+      toolsSha256: binding.toolsSha256,
+      assertActive: () => this.qqLiveLeases.isActive(current),
+      filterToolNames: (names) =>
+        this.qqLiveLeases.filterToolNames({ ...current, availableToolNames: names }),
+      checkToolCall: (call) => this.qqLiveLeases.checkToolCall({ ...current, ...call }).allowed,
+    };
+  }
+
+  private supportsQqLiveLeaseExecution(reference: string): boolean {
+    return this.directExecution(reference) instanceof PiRunExecutionAdapter;
   }
 
   private getOrCreateDefaultPiAdapter(profileId: string): PiRunExecutionAdapter {
@@ -1521,6 +1700,7 @@ export class ManagementApplication {
       },
     });
     const adapter = new PiRunExecutionAdapter(runtime, {
+      resolveAcceptanceLease: (input) => this.resolveQqLiveRunLease(input),
       isOwner: (input) => this.store.identities.isOwner(input.caller.principalId),
       learningStore: this.store.learning,
       listModelProfiles: () => this.selectableModelProfiles(),
@@ -2148,7 +2328,14 @@ export class ManagementApplication {
         exclusion: decision.decision === "ALLOW" ? null : "discovery_denied",
       });
     }
-    return candidates;
+    const lease = context.acceptanceLease;
+    return lease
+      ? candidates.map((candidate) =>
+          candidate.exclusion === null && lease.filterToolNames([candidate.name]).length === 0
+            ? { ...candidate, exclusion: "policy_disabled" as const }
+            : candidate,
+        )
+      : candidates;
   }
 
   async resolveRunToolNames(context: PiRunContext): Promise<string[]> {
@@ -2451,6 +2638,19 @@ export class ManagementApplication {
             runtimeAttempted: false,
           };
         }
+        if (
+          hasQqLiveAcceptanceMarker(input.text) &&
+          (!(selected instanceof PiRunExecutionAdapter) ||
+            !this.resolveQqLiveRunLease(input)?.assertActive())
+        ) {
+          await appendRoutingEval(null);
+          return {
+            status: "failed",
+            failureCode: "gate_refused",
+            runtimeAttempted: false,
+            text: "测试消息的临时权限已失效，请重新登记后再试。",
+          };
+        }
         let succeeded = false;
         let actualExecutionRef = decision.executionRef;
         let runtimeAttempted: boolean | undefined;
@@ -2697,6 +2897,7 @@ export class ManagementApplication {
   private async recordEvent(event: RunServiceEvent) {
     if (event.type === "recovered") {
       for (const runId of [...event.interruptedRunIds, ...event.unknownRunIds]) {
+        await this.revokeQqLiveRunBinding(runId);
         const caller = await this.store.management.runCaller(OWNER_ID, runId);
         if (!caller) continue;
         try {
@@ -2741,11 +2942,26 @@ export class ManagementApplication {
       return;
     }
     if (!("runId" in event)) return;
+    if (event.type === "run_finished") await this.revokeQqLiveRunBinding(event.runId);
     const caller = await this.store.lifecycle.traceCaller(event.runId);
     // Denials and revoked grants remain in the authorization ledger. No withheld output is copied here.
     if (!caller) return;
     const cursor = await this.trace.append(event.runId, event, "glassbox-run");
     await this.store.evidence.advanceTrace(caller, cursor);
+  }
+
+  private async revokeQqLiveRunBinding(runId: string): Promise<void> {
+    const binding = this.qqLiveRunBindings.get(runId);
+    if (!binding) return;
+    this.qqLiveRunBindings.delete(runId);
+    if (!this.qqLiveLeases.revoke(binding.leaseId)) return;
+    await appendQqLiveAcceptanceAudit(this.options.dataDirectory, {
+      event: "lease_revoked",
+      principalId: binding.principalId,
+      leaseId: binding.leaseId,
+      marker: binding.marker,
+      scope: binding.scope,
+    }).catch(() => undefined);
   }
 
   listChannels(): PublicChannelProfile[] {
@@ -2911,17 +3127,53 @@ export class ManagementApplication {
         await this.ingressReady;
         await connectionReady;
         if (!this.accepting || !connectionAccepted || signal.aborted) return;
+        // Marker messages resolve only against an identity already trusted for this exact
+        // incoming scope. Do not let normal visitor provisioning turn a marked message into
+        // a caller before the lease is checked.
+        let caller = await this.store.identities.resolve(message.scope);
+        let leaseResolution:
+          | { kind: "ordinary" }
+          | { kind: "denied"; reason: string }
+          | { kind: "acceptance"; leaseId: string; marker: string; toolsSha256: string } = {
+          kind: "ordinary",
+        };
+        if (hasQqLiveAcceptanceMarker(message.text)) {
+          leaseResolution = caller
+            ? this.qqLiveLeases.resolveInbound({
+                principalId: caller.principalId,
+                scope: message.scope,
+                messageId: message.messageId,
+                text: message.text,
+              })
+            : { kind: "denied", reason: "lease_unavailable" };
+          if (leaseResolution.kind !== "acceptance") {
+            await appendQqLiveAcceptanceAudit(this.options.dataDirectory, {
+              event: "message_denied",
+              messageId: message.messageId,
+              scope: message.scope,
+              ...(caller ? { principalId: caller.principalId } : {}),
+              reason:
+                leaseResolution.kind === "denied"
+                  ? leaseResolution.reason
+                  : "marker_resolution_failed",
+            }).catch(() => undefined);
+            return;
+          }
+        }
         if (message.scope.chatType === "group") {
           // Group assignments can change while the socket stays connected. Resolve the
           // current profile instead of preserving the connect-time allowlist in this closure.
-          await this.provisionAddressedGroupMember(this.channels.resolve(id), message.scope);
+          if (leaseResolution.kind === "ordinary") {
+            await this.provisionAddressedGroupMember(this.channels.resolve(id), message.scope);
+            caller = await this.store.identities.resolve(message.scope);
+          }
         }
         const hasImage = message.parts.some((part) => part.type === "image");
-        const control = hasImage
-          ? null
-          : /^\/(status|cancel)\s+([a-zA-Z0-9-]{1,80})\s*$/u.exec(message.text);
+        const control =
+          hasImage || leaseResolution.kind !== "ordinary"
+            ? null
+            : /^\/(status|cancel)\s+([a-zA-Z0-9-]{1,80})\s*$/u.exec(message.text);
         if (control) {
-          const caller = await this.store.identities.resolve(message.scope);
           if (!caller) return;
           const run =
             control[1] === "cancel"
@@ -2942,10 +3194,23 @@ export class ManagementApplication {
           ownerPrivate && channelSelection.modelOverrideProfileId && executionKind
             ? `${executionKind}:${channelSelection.modelOverrideProfileId}`
             : configured.executionRef;
+        if (
+          leaseResolution.kind === "acceptance" &&
+          !this.supportsQqLiveLeaseExecution(runExecutionRef)
+        ) {
+          await appendQqLiveAcceptanceAudit(this.options.dataDirectory, {
+            event: "message_denied",
+            messageId: message.messageId,
+            scope: message.scope,
+            ...(caller ? { principalId: caller.principalId } : {}),
+            leaseId: leaseResolution.leaseId,
+            reason: "unsupported_execution_backend",
+          }).catch(() => undefined);
+          return;
+        }
         const images: IncomingImage[] = [];
         let imageFailureCode: IncomingImageFailure | undefined;
         if (hasImage) {
-          const caller = await this.store.identities.resolve(message.scope);
           const authorization = caller
             ? await this.store.authorization.check({
                 caller,
@@ -2984,6 +3249,39 @@ export class ManagementApplication {
           ...(imageFailureCode ? { imageFailureCode } : images.length > 0 ? { images } : {}),
         };
         const accepted = await this.store.conversations.acceptIncoming(incoming);
+        if (leaseResolution.kind === "acceptance") {
+          const binding: QqLiveLeaseBinding = {
+            leaseId: leaseResolution.leaseId,
+            principalId: accepted.caller.principalId,
+            scope: message.scope,
+            messageId: message.messageId,
+            runId: accepted.run.id,
+          };
+          if (this.qqLiveLeases.bindRun(binding)) {
+            this.qqLiveRunBindings.set(accepted.run.id, {
+              ...binding,
+              marker: leaseResolution.marker,
+              toolsSha256: leaseResolution.toolsSha256,
+            });
+            await appendQqLiveAcceptanceAudit(this.options.dataDirectory, {
+              event: "run_bound",
+              messageId: message.messageId,
+              scope: message.scope,
+              principalId: accepted.caller.principalId,
+              leaseId: leaseResolution.leaseId,
+              toolsSha256: leaseResolution.toolsSha256,
+            }).catch(() => undefined);
+          } else {
+            await appendQqLiveAcceptanceAudit(this.options.dataDirectory, {
+              event: "message_denied",
+              messageId: message.messageId,
+              scope: message.scope,
+              principalId: accepted.caller.principalId,
+              leaseId: leaseResolution.leaseId,
+              reason: "run_binding_failed",
+            }).catch(() => undefined);
+          }
+        }
         // A Run's Trace starts at message_received, which is the only place the two halves of
         // the ingress path are stitched together: the drop that never became a Run is invisible
         // in the run's own file, and the run's own file is the only place the message text is
@@ -4785,6 +5083,9 @@ export class ManagementApplication {
       grantWorkspace: (input) => this.grantWorkspace(input),
       revokeWorkspace: (input) => this.revokeWorkspace(input),
       selectWorkspace: (input) => this.selectWorkspace(input),
+      registerQqLiveLease: (input) => this.registerQqLiveLease(input),
+      revokeQqLiveLease: (id) => this.revokeQqLiveLease(id),
+      revokeQqLiveLeaseByMarker: (marker) => this.revokeQqLiveLeaseByMarker(marker),
       grantOpsPermissions: (input) =>
         grantOpsPermissions(this.store, this.options.ops?.workerPolicy, input),
       executors: this.executors,

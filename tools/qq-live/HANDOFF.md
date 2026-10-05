@@ -1,6 +1,6 @@
 # 给当前开发 Agent 的执行要求
 
-仓库接入版补充规则：自定义用例只允许 plan，不允许实机发送。普通发送结果未知也会持久创建 STOP。report 的 productAcceptance 必须为 PASS 才能证明已核对运行版本及产品证据。transport PASS 或 doctor PASS 不满足合并条件。runtime 配置使用 checkout、dataDirectory、expectedCommit 和 connectionId。threadId 默认 null。当前只有 agent-service 登记的服务支持自动进程核对；systemd 服务不能冒充该登记。
+仓库接入版补充规则：schemaVersion=1 的自由文本用例只允许 plan。schemaVersion=2 仅接入指定的读取工具，需要服务端把许可绑定到真实发送者、完整会话、消息哈希和 Run，并验证工具 Trace。修改操作须先补独立观察和清理执行器。普通发送结果未知也会持久创建 STOP。report 的 productAcceptance 必须为 PASS 才能证明已核对运行版本及产品证据。transport PASS 或 doctor PASS 不满足合并条件。runtime 配置使用 checkout、dataDirectory、expectedCommit 和 connectionId。threadId 默认 null。当前只有 agent-service 登记的服务支持自动进程核对；systemd 服务不能冒充该登记。
 
 用户当前需要在开发 Glassbox 的过程中使用真实 QQ 验收。不做网页 UI，不等待项目全部写完。使用本目录现有工具，不另建聊天 Agent，也不要通过模拟 Owner 事件冒充实机测试。
 
@@ -28,7 +28,7 @@
 
 FAIL 表示验收结果不满足预期，先查证故障位置。BLOCKED 表示配置、环境、身份或清理阻塞。INCONCLUSIVE 表示证据不足或结果未知。后二者不能伪装为通过，也不能猜测问题后盲目修改产品。
 
-定位到产品问题后，修改业务代码、补充本地回归、重新启动正确版本，再重跑原失败用例和相关回归。最多进行三轮有证据的修复。没有确认的发送结果不得直接重发，尤其不能重复群操作。
+定位到产品问题后，修改业务代码、补充本地回归、重新启动正确版本，再重跑原失败用例和相关回归。每轮修复必须有故障证据和回归结果。继续处理已定位的问题，直到相关验收通过或需要外部条件。没有确认的发送结果不得直接重发，尤其不能重复群操作。
 
 禁止为了得到 PASS 删除断言、降低断言要求、重写证据、把真实调用替换为模拟、跳过未通过用例或更改权限。需要改变验收标准时单独列出原因和差异，不与修复悄悄合并。
 
@@ -40,7 +40,9 @@ FAIL 表示验收结果不满足预期，先查证故障位置。BLOCKED 表示�
 
 ## 首版范围
 
-固定实机用例覆盖真实私聊、指定群 @ Bot 的收发，以及可选的禁言和解禁效果。自定义用例只支持生成计划，实机发送仍然关闭。
+固定实机用例覆盖真实私聊、指定群 @ Bot 的收发，以及可选的禁言和解禁效果。它们只证明传输和对应固定操作，不能替代功能回归。结构化读取用例示例见 examples/feature-read.example.json。先运行 plan，审查消息和工具范围，再把套件 SHA256 传入 run 的 --approve-suite。
+
+运行 `node tools/qq-live/cli.mjs coverage` 盘点覆盖缺口。默认功能目录有四个可执行的读取用例，其余条目仍待实现。planned 条目不能计入执行覆盖。将条目接成真实用例、独立观察和清理之后，再运行覆盖检查。不能把补了一段测试说明解释为已经测试。
 
 权限变更、模型切换、文件传输和长任务等需要新增对应的状态观察及断言。不要只根据 Bot 说成功就报告通过。
 

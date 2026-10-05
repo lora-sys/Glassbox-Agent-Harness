@@ -55,6 +55,7 @@ function protectedContext(value: PiRunContext | undefined): ProtectedToolContext
         caller: value.caller,
         conversationId: value.conversationId,
         runId: value.runId,
+        ...(value.acceptanceLease ? { acceptanceLease: value.acceptanceLease } : {}),
         ...(value.requiredToolName === undefined
           ? {}
           : { requiredToolName: value.requiredToolName }),

@@ -66,6 +66,56 @@ test("custom live prompts are blocked before any network operation", async (t) =
   assert.equal(r.code, 2);
   assert.ok(r.stderr.includes("CUSTOM_LIVE_UNSUPPORTED"));
 });
+test("structured read suite plans locally but cannot run without runtime identity", async (t) => {
+  const d = await dir(t),
+    p = join(d, "c.json"),
+    suite = join(d, "s.json");
+  await writeFile(p, JSON.stringify(baseConfig()));
+  await writeFile(
+    suite,
+    JSON.stringify({
+      schemaVersion: 2,
+      cases: [
+        {
+          id: "ops-read",
+          chat: "private",
+          prompt: "查询 ops_status 并回复 {{nonce}}",
+          expectContains: ["{{nonce}}"],
+          sideEffect: "none",
+          leaseTools: [
+            {
+              name: "ops_status",
+              operations: [
+                { action: "ops:status", resourceId: "agent-operations", inputConstraint: {} },
+              ],
+            },
+          ],
+          featureAssertions: [
+            {
+              kind: "trace",
+              type: "tool_result",
+              where: { name: "ops_status", isError: false },
+              count: 1,
+            },
+          ],
+        },
+      ],
+    }),
+  );
+  const planned = await run(["plan", "--config", p, "--scenarios", suite], d);
+  assert.equal(planned.code, 0, planned.stderr);
+  assert.match(JSON.parse(planned.stdout).suiteSha256, /^[a-f0-9]{64}$/);
+  const blocked = await run(["run", "--live", "--config", p, "--scenarios", suite], d);
+  assert.equal(blocked.code, 2);
+  assert.ok(blocked.stderr.includes("FEATURE_RUNTIME_REQUIRED"));
+});
+test("default feature inventory reports unimplemented executable coverage without credentials", async (t) => {
+  const d = await dir(t),
+    result = await run(["coverage"], d);
+  assert.equal(result.code, 2, result.stderr);
+  assert.equal(JSON.parse(result.stdout).status, "BLOCKED");
+  assert.ok(JSON.parse(result.stdout).gaps.some((g) => g.code === "CASE_NOT_EXECUTABLE"));
+});
 test("invalid configuration blocks before networking", async (t) => {
   const d = await dir(t);
   const p = join(d, "c.json");

@@ -225,7 +225,10 @@ export async function world({
       }
       response({ message_id: outgoingId });
       if (mode === "silent") return;
-      const marker = text.match(/QQLIVE_[A-Za-z0-9_]+/)?.[0] ?? "";
+      const marker =
+        text.match(/QQLIVE_[A-Za-z0-9_]+/)?.[0] ??
+        text.match(/^GLASSBOX_ACCEPTANCE_V1 ([a-f0-9]{32})\n/)?.[1] ??
+        "";
       const replyRoute = mode === "wrong" ? (route === "20002" ? "20001" : "20002") : route;
       const reply = event(
         "10001",

@@ -2,7 +2,7 @@
 
 仓库接入后的规则以本文及 `.plans/qq-live-acceptance.md` 为准。VERIFICATION.md 和 test-results.txt 是上传工具包的历史记录，不是当前版本或真实 QQ 验收结果。
 
-当前固定用例仍检查真实私聊及两个群。自定义用例只允许 `plan`，`run --scenarios` 会拒绝执行。普通消息已尝试发送但结果无法确认时，也会创建 STOP。核实旧 Run 已结束及环境恢复后再人工清除。
+当前固定用例检查真实私聊及两个群。schemaVersion=1 的自由文本用例仅支持 `plan`。schemaVersion=2 接入指定读取工具，发送前必须取得服务端逐消息许可，完成后核对工具 Trace 并撤销许可。修改功能须先实现独立状态观察和清理。普通消息已尝试发送但结果无法确认时，也会创建 STOP。核实旧 Run 已结束及环境恢复后再人工清除。
 
 报告新增 `productAcceptance`。未配置 runtime 时，收发 PASS 只代表 QQ 传输观察通过，产品验收仍为 BLOCKED，不能据此合并。
 
@@ -20,7 +20,7 @@ OneBot 消息 ID 属于账号会话。同一条消息在 Driver 和 Bot 中可�
 
 压缩包内部已经按 `tools/qq-live` 排列。解压到 Glassbox 仓库根目录即可，不覆盖现有业务文件。若目录已经存在，先比较文件，不直接覆盖。
 
-使用仓库要求的 Node.js 24.12 或更新版本。无需额外安装 npm 依赖。
+使用仓库要求的 Node.js 24.12 或更新版本。读取功能目录需要仓库现有的 TypeScript 依赖，先安装仓库依赖。tools/qq-live 不维护另一套依赖或模型配置。
 
 从仓库根目录执行：
 
@@ -30,6 +30,24 @@ node tools/qq-live/cli.mjs init
 ```
 
 `init` 创建 `tools/qq-live/qq-live.local.json`，不会覆盖已有文件。
+
+## 功能验收
+
+项目技能位于 `.agents/skills/qq-live-testing/SKILL.md`，Claude 镜像位于 `.claude/skills/qq-live-testing/SKILL.md`。先核对稳定核心哈希，再按技能选择新增功能用例和现有功能回归。
+
+```bash
+node .agents/skills/qq-live-testing/scripts/verify-core.mjs
+node tools/qq-live/cli.mjs coverage
+node tools/qq-live/cli.mjs plan --scenarios tools/qq-live/examples/feature-read.example.json
+```
+
+coverage 默认返回尚未接成执行器的功能缺口。目录中的 planned 条目不能用于交付。plan 输出套件 SHA256；审查工具、目标及断言后，把该值传入 `run --live --scenarios <文件> --approve-suite <SHA256>`。还须提供真实服务的 runtime 配置和账号环境变量。
+
+临时许可只缩小当前 Principal 已有权限。它绑定真实发送者、完整会话、消息正文哈希及唯一 Run，限制模型可见工具与实际调用。许可失效或被撤销后继续执行会遭拒绝。自由文本不能替代这项服务端检查。许可登记回包不确定时，测试器按本轮标记撤销，不能确认清理则保留 STOP。
+
+功能观察器目前支持指定工具事件及 Task、Memory 候选、Memory 状态。它不接受任意脚本或 SQL。新功能需要新增对应观察器和隔离测试。一次工具执行成功不能代表其他未测试功能通过。
+
+`lib/delivery-gate.mjs` 提供交付检查函数。调用者必须重新查询产品证据及远端 PR，绑定审批套件原文和哈希，覆盖全部必测用例，并核对当前提交的门禁、独立审查与 CI。该函数不执行 GitHub 合并，CLI 尚未接入完整交付编排。完整功能基线未通过时不得合并。
 
 ## 配置现有两个账号
 

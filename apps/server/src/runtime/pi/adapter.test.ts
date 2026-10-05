@@ -309,6 +309,7 @@ describe("PiSdkRuntimeAdapter", () => {
     directories.push(runtimeBaseDir);
     const events: string[] = [];
     let authorizedTools: unknown;
+    let acceptanceEvidence: unknown;
     let authorizedSkills: unknown;
     let modelVisibleSkills: unknown;
     let skillPolicy: unknown;
@@ -392,6 +393,7 @@ describe("PiSdkRuntimeAdapter", () => {
         events.push(event.type);
         if (event.type === "session_start") {
           authorizedTools = event.data.authorizedTools;
+          acceptanceEvidence = event.data.acceptanceLease;
           authorizedSkills = event.data.authorizedSkills;
           modelVisibleSkills = event.data.modelVisibleSkills;
           skillPolicy = event.data.skillPolicy;
@@ -423,6 +425,14 @@ describe("PiSdkRuntimeAdapter", () => {
           senderId: "owner",
         },
       },
+      acceptanceLease: {
+        leaseId: "lease-fixture",
+        marker: "00112233445566778899aabbccddeeff",
+        toolsSha256: "4d93a3f0fd2449068b6579b750e7394ca8dc090283f0f3ac4027c934c35a38e1",
+        assertActive: () => true,
+        filterToolNames: (names) => [...names],
+        checkToolCall: () => true,
+      },
     };
     const binding = await adapter.createOrRestoreSession(conversation, "test", context);
     const result = await adapter.run(binding, run, "say hello", context);
@@ -431,6 +441,12 @@ describe("PiSdkRuntimeAdapter", () => {
     expect(binding.runtimeSessionId).not.toBe(conversation.id);
     expect(result).toMatchObject({ status: "completed", text: "hello from pi" });
     expect(authorizedTools).toEqual(["owner_group_admin", "skill_read"]);
+    expect(acceptanceEvidence).toEqual({
+      leaseId: "lease-fixture",
+      marker: "00112233445566778899aabbccddeeff",
+      narrowedTools: ["owner_group_admin", "skill_read"],
+      toolsSha256: "4d93a3f0fd2449068b6579b750e7394ca8dc090283f0f3ac4027c934c35a38e1",
+    });
     // The resolved surface is handed back on the Run context too: the execution adapter binds
     // a required Tool only when this Run could really call it.
     expect(context.authorizedToolNames).toEqual(["owner_group_admin", "skill_read"]);

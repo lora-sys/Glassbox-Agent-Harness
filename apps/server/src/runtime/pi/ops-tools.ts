@@ -54,6 +54,7 @@ export function createOpsTools(options: {
           caller: value.caller,
           conversationId: value.conversationId,
           runId: value.runId,
+          ...(value.acceptanceLease ? { acceptanceLease: value.acceptanceLease } : {}),
           requiredToolName: value.requiredToolName,
           requiredToolInput: value.requiredToolInput,
         }

@@ -59,6 +59,40 @@ async function run(
 }
 
 describe("a protected Tool's failure classification", () => {
+  it("rechecks a server-owned lease after asynchronous authorization and before effects", async () => {
+    let checks = 0;
+    const execute = vi.fn(async () => "should not execute");
+    const context: ProtectedToolContext = {
+      caller,
+      conversationId: "conversation-1",
+      runId: "run-1",
+      acceptanceLease: {
+        leaseId: "lease-1",
+        marker: "aabbccddeeff00112233445566778899",
+        toolsSha256: "0".repeat(64),
+        assertActive: () => true,
+        filterToolNames: (names) => [...names],
+        checkToolCall: () => {
+          checks += 1;
+          return checks === 1;
+        },
+      },
+    };
+    const definition = createProtectedTool<Record<string, unknown>, string>({
+      name: "fixture_tool",
+      description: "fixture",
+      parameters: Type.Object({}),
+      action: "read",
+      resourceId: "canary",
+      authService: allowAll,
+      getContext: () => context,
+      execute,
+    });
+    await expect(run(definition)).rejects.toThrow("acceptance_lease_denied");
+    expect(checks).toBe(2);
+    expect(execute).not.toHaveBeenCalled();
+  });
+
   it("returns a successful call's result to the model", async () => {
     const { definition } = tool(async () => ({ members: [] }));
     await expect(run(definition)).resolves.toMatchObject({

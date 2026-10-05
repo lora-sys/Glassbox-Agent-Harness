@@ -1685,6 +1685,16 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
           conversationId: run.conversationId,
           runtime: active.runtimeEvidence,
           authorizedTools: active.authorizedToolNames,
+          ...(context?.acceptanceLease
+            ? {
+                acceptanceLease: {
+                  leaseId: context.acceptanceLease.leaseId,
+                  marker: context.acceptanceLease.marker,
+                  narrowedTools: active.authorizedToolNames,
+                  toolsSha256: context.acceptanceLease.toolsSha256,
+                },
+              }
+            : {}),
           // The classified surface, when discovery reported one. Absent for a fake that only
           // supplies names, and never fabricated here — a missing surface is a fact too.
           ...(active.toolSurface ? { toolSurface: active.toolSurface } : {}),
