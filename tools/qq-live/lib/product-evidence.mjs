@@ -174,6 +174,7 @@ export function caseEvidence(db, c, config) {
   return {
     caseId: c.id,
     runId: run.id,
+    runCreatedAt: run.created_at,
     scope,
     decisions,
     deliveries,

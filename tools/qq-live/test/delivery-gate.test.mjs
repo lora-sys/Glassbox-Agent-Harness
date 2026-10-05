@@ -172,6 +172,17 @@ function memoryFixture() {
   return { input, dependencies };
 }
 
+test("read-only gate judgments cannot authorize a merge", async () => {
+  const { input, dependencies } = fixture();
+  input.userAuthorizedMerge = false;
+  input.checkOnly = true;
+  const result = await evaluateDeliveryGate(input, dependencies);
+  assert.equal(result.status, "PASS");
+  assert.equal(result.mergeAuthorized, false);
+  delete input.checkOnly;
+  await assert.rejects(evaluateDeliveryGate(input, dependencies), { code: "MERGE_AUTHORIZATION" });
+});
+
 test("default coverage rejects evidence for a different checkout commit before remote checks", async () => {
   const { input, dependencies } = fixture();
   delete dependencies.verifyCoverage;

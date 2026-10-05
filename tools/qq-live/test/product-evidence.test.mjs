@@ -290,6 +290,10 @@ test("acceptance binds scoped input, successful Run, authorization and received 
   const { db, c, config } = evidenceFixture();
   t.after(() => db.close());
   assert.equal(caseEvidence(db, c, config).runId, "r");
+  const earlierReport = { ...c, startedAt: new Date(Date.parse(c.startedAt) - 1000).toISOString() };
+  const created = caseEvidence(db, earlierReport, config).runCreatedAt;
+  assert.equal(created, db.prepare("SELECT created_at FROM runs WHERE id='r'").get().created_at);
+  assert.notEqual(created, earlierReport.startedAt);
   db.exec("UPDATE authorization_decisions_all SET decision='DENY'");
   assert.throws(() => caseEvidence(db, c, config), {
     code: "AUTHORIZATION_EVIDENCE",

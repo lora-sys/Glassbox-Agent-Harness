@@ -44,6 +44,12 @@ export async function evaluateDeliveryGate(
   )
     fail("GATE_VERIFIER", "交付检查必须重新验证产品证据和远端状态。");
   const { commit, suiteSha256, requiredCaseIds, reports, requiredCheckNames } = input;
+  const postMerge = input.postMerge === true;
+  if (
+    postMerge &&
+    (input.checkOnly !== true || !/^[a-f0-9]{40}$/.test(input.candidateCommit ?? ""))
+  )
+    fail("POST_MERGE_BINDING", "合并后检查必须绑定原候选提交，且不能授权再次合并。");
   let suite;
   try {
     if (
@@ -90,7 +96,8 @@ export async function evaluateDeliveryGate(
     !reports.length
   )
     fail("GATE_INPUT", "交付检查需要完整提交、套件哈希、必测用例和必需 CI。");
-  if (input.userAuthorizedMerge !== true) fail("MERGE_AUTHORIZATION", "本次交付没有用户合并授权。");
+  if (input.checkOnly !== true && input.userAuthorizedMerge !== true)
+    fail("MERGE_AUTHORIZATION", "本次交付没有用户合并授权。");
   if (
     input.deterministic?.commit !== commit ||
     input.deterministic?.full !== "PASS" ||
@@ -98,12 +105,14 @@ export async function evaluateDeliveryGate(
   )
     fail("DETERMINISTIC_GATE", "当前提交未通过完整验证和提交门禁。");
   if (
-    input.review?.commit !== commit ||
+    input.review?.commit !== (postMerge ? input.candidateCommit : commit) ||
     input.review?.status !== "PASS" ||
     !input.review?.evidenceId
   )
     fail("REVIEW_GATE", "当前提交缺少通过的独立审查证据。");
   const observed = new Set();
+  const freshRunTimes = [];
+  const freshInputTimes = [];
   for (const report of reports) {
     if (
       report.status !== "PASS" ||
@@ -124,6 +133,21 @@ export async function evaluateDeliveryGate(
     const fresh = await verifyReport(report);
     if (fresh?.status !== "PASS" || fresh.runtime?.commit !== commit || !Array.isArray(fresh.cases))
       fail("LIVE_REVERIFICATION", "重新查询的产品证据未通过。");
+    if (postMerge) {
+      for (const evidence of fresh.cases) {
+        const created = Date.parse(evidence.runCreatedAt);
+        if (!Number.isFinite(created)) fail("POST_MERGE_RUN", "合并后验收缺少独立 Run 创建时间。");
+        freshRunTimes.push(created);
+        const inputTime = evidence.messageBinding?.input?.time;
+        if (
+          !Number.isSafeInteger(inputTime) ||
+          !Number.isSafeInteger(inputTime * 1000) ||
+          inputTime <= 0
+        )
+          fail("POST_MERGE_INPUT", "合并后验收缺少真实 QQ 入站消息时间。");
+        freshInputTimes.push(inputTime * 1000);
+      }
+    }
     if (report.memoryFamily !== undefined || report.memoryLifecycle !== undefined) {
       const familyId = report.memoryFamily?.caseId;
       const original = approvedCases.get(familyId);
@@ -226,13 +250,20 @@ export async function evaluateDeliveryGate(
   )
     fail("COVERAGE_GATE", "新增功能或现有功能回归有未完成用例。");
   const remote = await readRemote();
-  if (
-    remote?.headCommit !== commit ||
-    remote.state !== "OPEN" ||
-    remote.draft !== false ||
-    remote.mergeable !== true
-  )
-    fail("REMOTE_HEAD_GATE", "远端 PR 版本或合并状态不满足交付条件。");
+  const remoteMatches = postMerge
+    ? remote?.headCommit === input.candidateCommit &&
+      remote.state === "MERGED" &&
+      remote.mergeCommit === commit &&
+      Number.isFinite(Date.parse(remote.mergedAt)) &&
+      freshRunTimes.length > 0 &&
+      freshRunTimes.every((created) => created >= Date.parse(remote.mergedAt))
+    : remote?.headCommit === commit &&
+      remote.state === "OPEN" &&
+      remote.draft === false &&
+      remote.mergeable === true;
+  if (!remoteMatches) fail("REMOTE_HEAD_GATE", "远端 PR 版本或合并状态不满足交付条件。");
+  if (postMerge && freshInputTimes.some((time) => time <= Date.parse(remote.mergedAt)))
+    fail("POST_MERGE_INPUT", "验收消息必须在合并后新发，不能使用合并前排队的消息。");
   if (
     requiredCheckNames.some(
       (name) =>
@@ -248,5 +279,13 @@ export async function evaluateDeliveryGate(
     suiteSha256,
     caseIds: [...observed],
     remoteHead: remote.headCommit,
+    ...(postMerge
+      ? {
+          candidateCommit: input.candidateCommit,
+          mergeCommit: remote.mergeCommit,
+          mergedAt: remote.mergedAt,
+        }
+      : {}),
+    mergeAuthorized: input.checkOnly !== true && input.userAuthorizedMerge === true,
   };
 }

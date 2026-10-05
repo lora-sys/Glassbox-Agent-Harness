@@ -166,6 +166,14 @@ node tools/qq-live/cli.mjs plan --scenarios tools/qq-live/examples/scenarios.exa
 
 ## 停止与安全边界
 
+交付时使用 `delivery-check --pr <URL> --scenarios <套件文件> --reports <报告清单> --approve-suite <SHA256>`。报告清单只能包含 `schemaVersion: 1` 和 `reports` 文件路径数组，路径相对于清单文件。命令会检查完整功能目录，执行当前干净提交的仓库验证，重新核对 QQ 产品证据、清理、GitHub Actions 和当前 PR 提交的独立审批。缺少覆盖时会在连接外部服务前拒绝继续。
+
+已有用户合并授权后，使用同样参数运行 `deliver --live`。命令在合并前再次检查提交与证据，先持久记录尝试，再使用精确提交执行一次 squash 合并。尝试记录按 PR 保存在当前系统用户的测试锁目录，更换报告目录、套件或测试账号不能绕过已有记录。结果未知时保留记录，不自动重试合并。本地记录用于关联尝试，不能证明拥有同等系统权限的 Agent 没有修改记录。合并事实仍须由 GitHub 确认，实机结果仍须由 QQ 消息和产品 Trace 核实。
+
+合并确认后的结果仍需核对实际合并提交。开发 Agent 应获取 GitHub 的 `mergeCommit`，把验收 checkout 和共享服务切换到该提交，保留 NapCat、数据目录、登录状态和原生 Pi 配置。安装依赖并重新执行完整套件，使用新报告清单运行 `postmerge-check`。该命令核对原合并记录、实际合并提交的 CI，以及合并之后发送的新 QQ 消息和创建的 Run。原记录还绑定账号、测试群、checkout 和数据目录，切换这些对象不能复用原验收。全部条件通过才返回 `DELIVERED`。PR 候选提交的旧报告不能替代这一步。
+
+当前完整功能目录仍有未实现的实机用例，这些命令会返回 `COVERAGE_GATE`。已实现的交付机制不能作为完整 QQ 回归已经通过的证据。
+
 Ctrl+C 会停止继续发送，并尝试已经授权的清理。也可以在报告根目录创建名为 STOP 的文件。SIGKILL、断电或整机故障不能保证自动清理，重新运行前必须检查 QQ 状态和未完成任务。
 
 测试锁保存在当前操作系统用户的 `~/.glassbox-qq-live-locks`，按发起账号区分，避免同一用户的不同 worktree 并发测试。不同机器或不同系统用户之间没有分布式锁，不能并发运行同一账号。

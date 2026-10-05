@@ -29,6 +29,9 @@ node cli.mjs reconcile-memory
 node cli.mjs reconcile-memory --live --approve-suite <SHA256>
 node cli.mjs plan --scenarios examples/scenarios.example.json
 node cli.mjs coverage
+node cli.mjs delivery-check --pr <URL> --scenarios <file> --reports <manifest> --approve-suite <SHA256>
+node cli.mjs deliver --live --pr <URL> --scenarios <file> --reports <manifest> --approve-suite <SHA256>
+node cli.mjs postmerge-check --pr <URL> --scenarios <file> --reports <manifest> --approve-suite <SHA256>
 node cli.mjs report
 
 通用选项 --config <文件> --out <报告目录>
@@ -57,6 +60,8 @@ function args(argv) {
         "--scenarios",
         "--approve-suite",
         "--catalog",
+        "--pr",
+        "--reports",
       ].includes(k) ||
       !argv[i + 1] ||
       argv[i + 1].startsWith("--")
@@ -75,6 +80,9 @@ function args(argv) {
       "report",
       "coverage",
       "reconcile-memory",
+      "delivery-check",
+      "deliver",
+      "postmerge-check",
     ].includes(command)
   )
     fail("COMMAND", "未知命令。");
@@ -182,6 +190,19 @@ async function main() {
     live: command === "run" || (command === "reconcile-memory" && o.live === true),
   });
   if (command === "reconcile-memory") return runMemoryRecoveryCli(config, o, out);
+  if (["delivery-check", "deliver", "postmerge-check"].includes(command)) {
+    if (command === "deliver" && !o.live) fail("LIVE_REQUIRED", "执行合并需要显式 --live。");
+    const { runDeliveryCli } = await import("./lib/delivery-cli.mjs");
+    return runDeliveryCli(
+      config,
+      {
+        ...o,
+        executeMerge: command === "deliver" && o.live === true,
+        postMerge: command === "postmerge-check",
+      },
+      out,
+    );
+  }
   if (command === "arm") {
     if (
       config.safety?.acceptanceServiceConfirmed !== true ||

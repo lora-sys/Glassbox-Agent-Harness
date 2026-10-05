@@ -33,6 +33,20 @@ async function dir(t) {
   t.after(() => rm(d, { recursive: true, force: true }));
   return d;
 }
+test("delivery commands reject missing inputs and implicit merge before network access", async (t) => {
+  const d = await dir(t);
+  const configPath = join(d, "config.json");
+  const out = join(d, "reports");
+  await writeFile(configPath, JSON.stringify({ ...baseConfig(), runtime: {} }));
+  const checked = await run(["delivery-check", "--config", configPath, "--out", out], d);
+  assert.equal(checked.code, 2);
+  assert.ok(checked.stderr.includes("DELIVERY_ARGUMENT"));
+  const merged = await run(["deliver", "--config", configPath, "--out", out], d);
+  assert.equal(merged.code, 2);
+  assert.ok(merged.stderr.includes("LIVE_REQUIRED"));
+  await assert.rejects(stat(out), { code: "ENOENT" });
+});
+
 test("init creates config and refuses overwriting", async (t) => {
   const d = await dir(t);
   const p = join(d, "c.json");
