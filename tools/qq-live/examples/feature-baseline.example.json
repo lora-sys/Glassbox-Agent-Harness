@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 4,
+  "schemaVersion": 5,
   "cases": [
     {
       "id": "ops-status-read",
@@ -492,6 +492,11 @@
       "id": "history-group-seed-private-recall",
       "kind": "history-seed",
       "chat": "A"
+    },
+    {
+      "id": "history-cross-group-isolation",
+      "kind": "history-isolation",
+      "chat": "B"
     }
   ]
 }

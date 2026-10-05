@@ -150,12 +150,27 @@ export async function evaluateDeliveryGate(
         freshInputTimes.push(inputTime * 1000);
       }
     }
-    if (report.historyFamily !== undefined || report.historySeedWorkflow !== undefined) {
+    if (
+      report.historyFamily !== undefined ||
+      report.historySeedWorkflow !== undefined ||
+      report.historyIsolationWorkflow !== undefined
+    ) {
       const familyId = report.historyFamily?.caseId,
         original = approvedCases.get(familyId);
-      if (suite.schemaVersion !== 4 || !original || typeof verifyHistoryReport !== "function")
+      if (
+        ![4, 5].includes(suite.schemaVersion) ||
+        !original ||
+        typeof verifyHistoryReport !== "function"
+      )
         fail("HISTORY_FAMILY_GATE", "历史流程须绑定已批准的固定用例并重新核对两轮来源。");
       validateHistoryFamily(original);
+      const isolation = original.kind === "history-isolation";
+      if (
+        (isolation && (suite.schemaVersion !== 5 || report.historySeedWorkflow !== undefined)) ||
+        (!isolation && report.historyIsolationWorkflow !== undefined)
+      )
+        fail("HISTORY_FAMILY_GATE", "报告历史流程与批准用例不一致。");
+      const workflow = isolation ? report.historyIsolationWorkflow : report.historySeedWorkflow;
       if (observed.has(familyId)) fail("CASE_DUPLICATE", "交付报告重复声明历史用例。");
       const history = await verifyHistoryReport(report, { approvedFamily: original });
       if (
@@ -166,8 +181,7 @@ export async function evaluateDeliveryGate(
         !Array.isArray(history.stageRunIds) ||
         history.stageRunIds.length !== 2 ||
         new Set(history.stageRunIds).size !== 2 ||
-        JSON.stringify(history.stageRunIds) !==
-          JSON.stringify(report.historySeedWorkflow?.stageRunIds) ||
+        JSON.stringify(history.stageRunIds) !== JSON.stringify(workflow?.stageRunIds) ||
         report.cases.length !== 2 ||
         fresh.cases.length !== 2 ||
         fresh.cases.some(
@@ -188,7 +202,7 @@ export async function evaluateDeliveryGate(
       const familyId = report.memoryFamily?.caseId;
       const original = approvedCases.get(familyId);
       if (
-        ![3, 4].includes(suite.schemaVersion) ||
+        ![3, 4, 5].includes(suite.schemaVersion) ||
         !original ||
         typeof verifyMemoryReport !== "function"
       )

@@ -3,13 +3,14 @@ import assert from "node:assert/strict";
 import { digest, toolManifestDigest } from "../lib/core.mjs";
 import { HISTORY_FAMILY_ID, verifyHistoryFamilyReport } from "../lib/history-family-evidence.mjs";
 import { historyRecallSpec, historySeedSpec } from "../lib/history-scenario.mjs";
+import { Recorder } from "../lib/runner.mjs";
 
 const config = {
   driver: { qq: "10002" },
   bot: { qq: "10003" },
   groups: [
-    { alias: "A", id: "123" },
-    { alias: "B", id: "124" },
+    { alias: "A", id: "12345" },
+    { alias: "B", id: "12456" },
   ],
   runtime: { connectionId: "p3-qq", threadId: null },
 };
@@ -25,7 +26,6 @@ const runIds = ["history_seed_run", "history_recall_run"];
 const tokens = ["a".repeat(32), "b".repeat(32)];
 const seedTime = Math.floor(Date.now() / 1000) - 10;
 const times = [seedTime, seedTime + 5];
-const replyHash = (token) => digest(`reply ${token}`);
 
 function replace(value, token) {
   return JSON.parse(JSON.stringify(value).replaceAll("{{nonce}}", token));
@@ -76,20 +76,40 @@ function buildCase(spec, token, runId, index) {
     route,
     messageId: String(-300 - index),
     realSequence: String(400 + index),
-    time: times[index] + 1,
-    textSha256: replyHash(token),
+    time: Math.floor(Date.now() / 1000),
+    textSha256: digest(`reply ${token}`),
   };
+  const recorder = new Recorder(config);
+  const recorded = recorder.begin(spec.id, route, spec.prompt, spec.expectContains, token);
+  recorded.startedAt = new Date((times[index] - 1) * 1000).toISOString();
+  recorded.startedMs = Date.parse(recorded.startedAt);
+  recorded.sentMessageId = binding.driverMessageId;
+  recorder.ingest("driver", {
+    self_id: config.driver.qq,
+    post_type: "message",
+    user_id: config.bot.qq,
+    message_type: route === "private" ? "private" : "group",
+    ...(route === "private" ? {} : { group_id: route }),
+    message_id: reply.messageId,
+    time: reply.time,
+    message: [{ type: "text", data: { text: `reply ${token}` } }],
+  });
+  assert.equal(
+    recorded.replies.length,
+    1,
+    JSON.stringify({ route, replies: recorded.replies, anomalies: recorded.anomalies }),
+  );
   const caseReport = {
     id: spec.id,
     token,
     route,
     prompt,
     expected,
-    startedAt: new Date((times[index] - 1) * 1000).toISOString(),
+    startedAt: recorded.startedAt,
     sentMessageId: binding.driverMessageId,
     status: "PASS",
     inputBinding: binding,
-    replies: [{ ...reply, matches: true }],
+    replies: structuredClone(recorded.replies),
     anomalies: [],
     featureAssertions: assertions,
     leasedToolNames: leaseTools.map((tool) => tool.name),
@@ -125,10 +145,23 @@ function buildCase(spec, token, runId, index) {
     delivery: {
       id: `delivery_${index}`,
       status: "sent",
-      external_id: reply.messageId,
+      external_id: String(-400 - index),
       destination_scope_key: scopeKey,
     },
-    messageBinding: { input: { ...binding }, reply: { ...reply } },
+    messageBinding: {
+      input: {
+        realSequence: binding.realSequence,
+        time: binding.time,
+        textSha256: binding.textSha256,
+      },
+      reply: {
+        botMessageId: String(-400 - index),
+        driverMessageId: reply.messageId,
+        realSequence: reply.realSequence,
+        time: reply.time,
+        textSha256: reply.textSha256,
+      },
+    },
   };
   return { caseReport, freshCase, spec };
 }
@@ -137,7 +170,7 @@ function fixture() {
   const seed = buildCase(historySeedSpec(config), tokens[0], runIds[0], 0);
   const recallSpec = historyRecallSpec({
     config,
-    groupId: "123",
+    groupId: config.groups.find((group) => group.alias === "A").id,
     seedInputTime: times[0],
     seedMarker: tokens[0],
     seedRunId: runIds[0],
@@ -168,6 +201,8 @@ const verifier = (fresh) => async () => structuredClone(fresh);
 
 test("verifies the two fixed Runs and source-linked recall from fresh product evidence", async () => {
   const { report, fresh } = fixture();
+  assert.equal(Object.hasOwn(report.cases[0].replies[0], "realSequence"), false);
+  assert.equal(Object.hasOwn(report.cases[0].replies[0], "time"), false);
   assert.deepEqual(
     await verifyHistoryFamilyReport(report, { config, verifyProduct: verifier(fresh) }),
     {
@@ -194,9 +229,17 @@ test("rejects missing, reordered, duplicated, or altered seed family assertions"
     (f) => f.report.cases.reverse(),
     (f) => (f.report.cases[1].token = f.report.cases[0].token),
     (f) => (f.report.cases[1].inputBinding.time = f.report.cases[0].inputBinding.time),
+    (f) => delete f.report.cases[0].replies[0].textBytes,
+    (f) => delete f.report.cases[0].replies[0].receivedAt,
     (f) => (f.fresh.cases[1].runId = runIds[0]),
     (f) => (f.fresh.cases[1].scope.chatType = "group"),
     (f) => (f.fresh.cases[0].feature.status = "FAIL"),
+    (f) => delete f.fresh.cases[0].messageBinding.reply.botMessageId,
+    (f) => (f.fresh.cases[0].messageBinding.reply.botMessageId = "not-an-id"),
+    (f) => (f.fresh.cases[0].messageBinding.reply.botMessageId = "-999"),
+    (f) => delete f.fresh.cases[0].messageBinding.reply.driverMessageId,
+    (f) => (f.fresh.cases[0].messageBinding.reply.driverMessageId = "not-an-id"),
+    (f) => (f.fresh.cases[0].messageBinding.reply.driverMessageId = "-999"),
   ];
   for (const mutate of mutations) {
     const f = fixture();
@@ -206,6 +249,18 @@ test("rejects missing, reordered, duplicated, or altered seed family assertions"
       { code: "HISTORY_FAMILY_EVIDENCE" },
     );
   }
+});
+
+test("fresh QQ reply metadata keeps Bot and driver local message IDs distinct", async () => {
+  const { report, fresh } = fixture();
+  assert.notEqual(
+    fresh.cases[0].messageBinding.reply.botMessageId,
+    fresh.cases[0].messageBinding.reply.driverMessageId,
+  );
+  assert.equal(
+    (await verifyHistoryFamilyReport(report, { config, verifyProduct: verifier(fresh) })).status,
+    "PASS",
+  );
 });
 
 test("rejects stale, changed, or failed fresh product verification", async () => {

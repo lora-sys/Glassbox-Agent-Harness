@@ -1,3 +1,4 @@
+import { verifyHistoryIsolationFamilyReport } from "./history-isolation-family-evidence.mjs";
 import { readFile, open, mkdir, lstat, rm, realpath } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
@@ -247,7 +248,9 @@ export async function runDeliveryCli(config, options, out) {
     await doctor(config, clients);
     const verifyReport = (report) => verifyProductEvidence(report, config, clients);
     const verifyHistoryReport = (report) =>
-      verifyHistoryFamilyReport(report, { config, verifyProduct: verifyReport });
+      (report.historyFamily?.caseId === "history-cross-group-isolation"
+        ? verifyHistoryIsolationFamilyReport
+        : verifyHistoryFamilyReport)(report, { config, verifyProduct: verifyReport });
     const verifyMemoryReport = (report) =>
       verifyMemoryFamilyReport(report, {
         verifyProduct: verifyReport,

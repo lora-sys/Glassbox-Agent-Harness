@@ -593,3 +593,30 @@ test("history family plan exposes fixed seed and evidence-derived recall without
   assert.match(plan.historyPlan.stages[1].note, /verified seed/);
   assert.match(plan.suiteSha256, /^[a-f0-9]{64}$/);
 });
+
+test("isolation family plan exposes B seed and A-only exclusion without network", async (t) => {
+  const d = await dir(t),
+    p = join(d, "config.json"),
+    suite = join(d, "isolation-suite.json");
+  await writeFile(p, JSON.stringify(baseConfig()));
+  await writeFile(
+    suite,
+    JSON.stringify({
+      schemaVersion: 5,
+      cases: [{ id: "history-cross-group-isolation", kind: "history-isolation", chat: "B" }],
+    }),
+  );
+  const r = await run(["plan", "--config", p, "--scenarios", suite], d);
+  assert.equal(r.code, 0, r.stderr);
+  const plan = JSON.parse(r.stdout);
+  assert.deepEqual(
+    plan.historyIsolationPlan.stages.map((s) => s.stage),
+    ["seed", "exclusion"],
+  );
+  assert.equal(plan.historyIsolationPlan.stages[0].spec.chat, "B");
+  assert.match(plan.historyIsolationPlan.stages[1].note, /group A/);
+  assert.match(plan.suiteSha256, /^[a-f0-9]{64}$/);
+  const unselected = await run(["run", "--live", "--config", p, "--scenarios", suite], d);
+  assert.equal(unselected.code, 2);
+  assert.match(unselected.stdout + unselected.stderr, /CASE_FAMILY_REQUIRED/);
+});

@@ -645,3 +645,41 @@ test("history seed catalog binds its fixed two-stage family and rejects metadata
     "BLOCKED",
   );
 });
+
+test("history isolation catalog binds its fixed two-stage family and rejects metadata downgrade", async () => {
+  const catalogCase = FEATURE_CATALOG.cases.find((c) => c.id === "history-cross-group-isolation");
+  const source = JSON.parse(
+    await readFile(new URL("../examples/feature-baseline.example.json", import.meta.url), "utf8"),
+  );
+  const descriptors = catalogCase.tools.map((name) => ({ name }));
+  const catalog = {
+    schemaVersion: 1,
+    requiredDomains: ["history_retrieval"],
+    descriptorBaseline: catalogCase.tools,
+    cases: [catalogCase],
+  };
+  const suiteConfig = {
+    groups: [
+      { alias: "A", id: "10001" },
+      { alias: "B", id: "10002" },
+    ],
+  };
+  const args = { catalog, descriptors, executableSuiteCases: source.cases, suiteConfig };
+  assert.equal(checkFeatureCoverage(args).status, "PASS");
+  for (const field of ["tools", "assertions", "executionKind", "mutation"]) {
+    const c = structuredClone(catalogCase);
+    if (field === "tools" || field === "assertions") c[field] = [];
+    else c[field] = "changed";
+    assert.equal(
+      checkFeatureCoverage({ ...args, catalog: { ...catalog, cases: [c] } }).status,
+      "BLOCKED",
+    );
+  }
+  assert.equal(
+    checkFeatureCoverage({
+      ...args,
+      executableSuiteCases: source.cases.filter((c) => c.id !== catalogCase.id),
+    }).status,
+    "BLOCKED",
+  );
+});

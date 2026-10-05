@@ -341,3 +341,23 @@ test("isolation fixture content in non-text QQ segments cannot evade reply check
     { code: "MESSAGE_BINDING_MISMATCH" },
   );
 });
+
+test("reply cannot bypass the isolation fixture check by changing its letter case", async () => {
+  const sentinel = `qq-isolation-secret-${"d".repeat(32)}`;
+  const actual = boundFixture();
+  const leaked = {
+    ...actual,
+    message: [
+      { type: "text", data: { text: `${textOf(actual.message)} ${sentinel.toUpperCase()}` } },
+    ],
+  };
+  await assert.rejects(
+    boundMessage({ call: async () => leaked }, "123456", {
+      ...boundExpected(),
+      text: undefined,
+      textSha256: undefined,
+      forbiddenFixtureSha256: digest(sentinel),
+    }),
+    { code: "MESSAGE_BINDING_MISMATCH" },
+  );
+});

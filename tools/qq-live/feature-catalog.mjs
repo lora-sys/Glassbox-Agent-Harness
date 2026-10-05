@@ -1,3 +1,4 @@
+import { historyIsolationSeedSpec } from "./lib/history-isolation-scenario.mjs";
 import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -569,12 +570,37 @@ export const FEATURE_CATALOG = Object.freeze({
       mutation: "none",
     },
     {
+      id: "history-cross-group-isolation",
+      domain: "history_retrieval",
+      executionStatus: "executable",
+      executionKind: "history-isolation",
+      suiteCaseId: "history-cross-group-isolation",
+      tools: ["group_history_search", "owner_history_search"],
+      assertions: [
+        {
+          kind: "trace",
+          type: "tool_result",
+          where: { name: "group_history_search", isError: false },
+          count: 1,
+        },
+        {
+          kind: "trace",
+          type: "tool_result",
+          where: { name: "owner_history_search", isError: false },
+          count: 1,
+        },
+      ],
+      coveragePlan:
+        "Prove a real group B seed exists, then a strictly later A-only private query returns no match in its complete bound. Bind the earlier source Run and fixture digest, actual protected output and both actual reply reads. This is scope isolation, not a revoked-authority test.",
+      mutation: "none",
+    },
+    {
       id: "history-positive-and-negative-result-proof",
       domain: "history_retrieval",
       executionStatus: "planned",
       tools: ["group_history_search", "owner_history_search"],
       coveragePlan:
-        "Current-input positive and fresh private no-match seeds now bind actual output digests and scoped archive evidence. Distinct older seeded messages, cross-group isolation and authorization negatives still need dedicated live scenarios before full retrieval coverage.",
+        "Current-input positive and fresh private no-match seeds now bind actual output digests and scoped archive evidence. Fixed older-message recall and cross-group isolation have separate two-stage families. Revoked-authority negatives and the wider result-proof matrix still need dedicated live scenarios before full retrieval coverage.",
       mutation: "none",
     },
     {
@@ -1002,13 +1028,18 @@ function bindMemoryFamily(testCase, suiteCases, gaps) {
 }
 
 function bindToSuiteCase(testCase, suiteCases, gaps, suiteConfig) {
-  if (testCase.executionKind === "history-seed") {
-    const matches = suiteCases.filter((c) => c?.id === HISTORY_SEED_FAMILY_ID);
-    const fixed = FEATURE_CATALOG.cases.find((c) => c.id === HISTORY_SEED_FAMILY_ID);
+  if (["history-seed", "history-isolation"].includes(testCase.executionKind)) {
+    const matches = suiteCases.filter((c) => c?.id === testCase.id);
+    const fixed = FEATURE_CATALOG.cases.find((c) => c.id === testCase.id);
     try {
       if (matches.length !== 1 || stableJson(testCase) !== stableJson(fixed))
         throw new Error("binding");
       validateHistoryFamily(matches[0]);
+      if (testCase.executionKind === "history-isolation")
+        historyIsolationSeedSpec({
+          config: suiteConfig,
+          sentinel: `qq-isolation-secret-${"0".repeat(32)}`,
+        });
       if (!suiteConfig?.groups?.some((g) => g.alias === "A" && /^[1-9]\d{0,15}$/.test(g.id)))
         throw new Error("group");
       return true;

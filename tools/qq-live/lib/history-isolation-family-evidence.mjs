@@ -1,7 +1,7 @@
 import { fail, digest, toolManifestDigest } from "./core.mjs";
-import { historySeedSpec, historyRecallSpec } from "./history-scenario.mjs";
+import { historyExclusionSpec, historyIsolationSeedSpec } from "./history-isolation-scenario.mjs";
 
-export const HISTORY_FAMILY_ID = "history-group-seed-private-recall";
+export const HISTORY_ISOLATION_FAMILY_ID = "history-cross-group-isolation";
 
 const RUN_ID = /^[A-Za-z0-9_-]{1,128}$/;
 const MARKER = /^[a-f0-9]{32}$/;
@@ -9,9 +9,10 @@ const HASH = /^[a-f0-9]{64}$/;
 const COMMIT = /^[a-f0-9]{40}$/;
 const MESSAGE_ID = /^-?\d{1,20}$/;
 const LEASE_ID = /^[a-f0-9-]{36}$/i;
+const SENTINEL = /^qq-isolation-secret-[a-f0-9]{32}$/;
 
-function invalid(message = "History family evidence is incomplete or inconsistent.") {
-  fail("HISTORY_FAMILY_EVIDENCE", message, "INCONCLUSIVE");
+function invalid(message = "History isolation family evidence is incomplete or inconsistent.") {
+  fail("HISTORY_ISOLATION_FAMILY_EVIDENCE", message, "INCONCLUSIVE");
 }
 
 function record(value) {
@@ -63,7 +64,7 @@ function validRuntime(runtime) {
 }
 
 function expectedCase(spec, token, route) {
-  if (!MARKER.test(token ?? "")) invalid("History case marker is invalid.");
+  if (!MARKER.test(token ?? "")) invalid("History isolation marker is invalid.");
   const replace = (value) => JSON.parse(JSON.stringify(value).replaceAll("{{nonce}}", token));
   const leaseTools = replace(spec.leaseTools);
   return {
@@ -116,6 +117,7 @@ function validateTransportCase(c, spec, route) {
     replies.length !== 1 ||
     replies[0]?.route !== route ||
     replies[0]?.matches !== true ||
+    !MESSAGE_ID.test(String(replies[0]?.messageId ?? "")) ||
     !HASH.test(replies[0]?.textSha256 ?? "") ||
     !Number.isSafeInteger(replies[0]?.textBytes) ||
     replies[0].textBytes <= 0 ||
@@ -126,16 +128,21 @@ function validateTransportCase(c, spec, route) {
     !Array.isArray(c.anomalies) ||
     c.anomalies.length !== 0
   )
-    invalid(`History case ${spec.id} transport, lease, or input binding is invalid.`);
+    invalid(`History isolation case ${spec.id} transport, lease, or QQ binding is invalid.`);
   return { expected, binding, reply: replies[0] };
 }
 
-function expectedObservations(assertions) {
+function expectedObservations(assertions, stage) {
   return assertions.map((assertion) => {
     if (assertion.kind === "trace")
       return { kind: "trace", type: assertion.type, count: assertion.count };
     if (assertion.kind === "history_coverage")
-      return { kind: "history_coverage", coverage: "complete", returned: 1, sourceComplete: true };
+      return {
+        kind: "history_coverage",
+        coverage: "complete",
+        returned: stage === "seed" ? 1 : 0,
+        sourceComplete: true,
+      };
     if (assertion.kind === "history_result")
       return {
         kind: "history_result",
@@ -144,16 +151,16 @@ function expectedObservations(assertions) {
         sourceVerified: true,
         toolOutputVerified: true,
       };
-    if (assertion.kind === "history_seed_result")
+    if (assertion.kind === "history_exclusion_result")
       return {
-        kind: "history_seed_result",
-        result: "hit",
-        returned: 1,
+        kind: "history_exclusion_result",
+        result: "no_match",
+        returned: 0,
         sourceVerified: true,
+        exclusionVerified: true,
         toolOutputVerified: true,
-        distinctEarlierInput: true,
       };
-    invalid("History case contains an unsupported feature assertion.");
+    invalid("History isolation case contains an unsupported feature assertion.");
   });
 }
 
@@ -175,18 +182,18 @@ function scopeFor(scope, runtime, config, stage, groupId) {
 }
 
 function validateFreshCase(evidence, c, spec, transport, runtime, config, stage, groupId) {
-  const expectedScope = scopeFor(evidence?.scope, runtime, config, stage, groupId);
+  const scope = scopeFor(evidence?.scope, runtime, config, stage, groupId);
   const runId = evidence?.runId;
   const scopeKey = JSON.stringify([
-    expectedScope.connectionId,
-    expectedScope.botId,
-    expectedScope.chatType,
-    expectedScope.chatId,
-    expectedScope.senderId,
-    expectedScope.threadId ?? null,
+    scope.connectionId,
+    scope.botId,
+    scope.chatType,
+    scope.chatId,
+    scope.senderId,
+    scope.threadId ?? null,
   ]);
   const feature = evidence?.feature;
-  const expected = expectedObservations(transport.expected.featureAssertions);
+  const expected = expectedObservations(transport.expected.featureAssertions, stage);
   const delivery = evidence?.delivery;
   const binding = evidence?.messageBinding;
   const input = binding?.input;
@@ -203,11 +210,11 @@ function validateFreshCase(evidence, c, spec, transport, runtime, config, stage,
     delivery.destination_scope_key !== scopeKey ||
     !MESSAGE_ID.test(String(delivery.external_id ?? "")) ||
     String(delivery.external_id) !== String(reply?.botMessageId) ||
-    !input ||
+    !exactKeys(input, ["realSequence", "time", "textSha256"]) ||
     String(input.realSequence) !== String(transport.binding.realSequence) ||
     input.time !== transport.binding.time ||
     input.textSha256 !== transport.binding.textSha256 ||
-    !reply ||
+    !exactKeys(reply, ["botMessageId", "driverMessageId", "realSequence", "time", "textSha256"]) ||
     !MESSAGE_ID.test(String(reply.botMessageId ?? "")) ||
     String(reply.botMessageId) !== String(delivery.external_id) ||
     !MESSAGE_ID.test(String(reply.driverMessageId ?? "")) ||
@@ -219,76 +226,91 @@ function validateFreshCase(evidence, c, spec, transport, runtime, config, stage,
     reply.textSha256 !== transport.reply.textSha256
   )
     invalid(`Fresh product evidence for ${spec.id} does not match its fixed transport case.`);
-  return { runId, scope: expectedScope };
+  return { runId, scope };
 }
 
-/** Independently verify the fixed group-seed and private-recall acceptance report. */
-export async function verifyHistoryFamilyReport(report, { config, verifyProduct } = {}) {
+/** Independently verify the fixed B-seed and Owner-private A-exclusion acceptance report. */
+export async function verifyHistoryIsolationFamilyReport(report, { config, verifyProduct } = {}) {
   if (typeof verifyProduct !== "function")
-    invalid("History family requires fresh product verification.");
+    invalid("History isolation family requires fresh product verification.");
   if (
     !record(report) ||
     !record(config) ||
     !Array.isArray(report.cases) ||
     report.cases.length !== 2 ||
     !exactKeys(report.historyFamily, ["caseId"]) ||
-    !same(report.historyFamily, { caseId: HISTORY_FAMILY_ID }) ||
-    !exactKeys(report.historySeedWorkflow, ["status", "familyId", "stageRunIds", "cleanup"]) ||
-    report.historySeedWorkflow.status !== "PASS" ||
-    report.historySeedWorkflow.familyId !== HISTORY_FAMILY_ID ||
-    !Array.isArray(report.historySeedWorkflow.stageRunIds) ||
-    report.historySeedWorkflow.stageRunIds.length !== 2 ||
-    !exactKeys(report.historySeedWorkflow.cleanup, ["required", "leaseRevoked"]) ||
-    report.historySeedWorkflow.cleanup.required !== false ||
-    report.historySeedWorkflow.cleanup.leaseRevoked !== true ||
+    !same(report.historyFamily, { caseId: HISTORY_ISOLATION_FAMILY_ID }) ||
+    !exactKeys(report.historyIsolationWorkflow, ["status", "familyId", "stageRunIds", "cleanup"]) ||
+    report.historyIsolationWorkflow.status !== "PASS" ||
+    report.historyIsolationWorkflow.familyId !== HISTORY_ISOLATION_FAMILY_ID ||
+    !Array.isArray(report.historyIsolationWorkflow.stageRunIds) ||
+    report.historyIsolationWorkflow.stageRunIds.length !== 2 ||
+    !exactKeys(report.historyIsolationWorkflow.cleanup, ["required", "leaseRevoked"]) ||
+    report.historyIsolationWorkflow.cleanup.required !== false ||
+    report.historyIsolationWorkflow.cleanup.leaseRevoked !== true ||
     report.status !== "PASS" ||
     report.mode !== "run"
   )
-    invalid("Report does not contain exactly the fixed history family.");
+    invalid("Report does not contain exactly the fixed cross-group isolation family.");
 
-  const [seedCase, recallCase] = report.cases;
-  if (seedCase?.id !== "history-current-group-hit" || recallCase?.id !== "history-seed-recall")
-    invalid("History family cases are missing, reordered, or unexpected.");
+  const [seedCase, exclusionCase] = report.cases;
+  if (
+    seedCase?.id !== "history-cross-group-seed" ||
+    exclusionCase?.id !== "history-cross-group-private-exclusion"
+  )
+    invalid("History isolation cases are missing, reordered, or unexpected.");
   if (!validRuntime(report.runtime)) invalid("Report runtime identity is invalid.");
+  if (
+    report.runtime.commit !== config.runtime?.expectedCommit ||
+    report.runtime.connectionId !== config.runtime?.connectionId ||
+    report.runtime.threadId !== (config.runtime?.threadId ?? null)
+  )
+    invalid("Report runtime does not match the configured clean acceptance checkout.");
 
-  let groupId;
+  const matches = seedCase.prompt?.match(/qq-isolation-secret-[a-f0-9]{32}/g) ?? [];
+  if (matches.length !== 1 || !SENTINEL.test(matches[0]))
+    invalid("Seed prompt must contain exactly one fixed isolation sentinel.");
+  const sentinel = matches[0];
+  const seedRunId = report.historyIsolationWorkflow.stageRunIds[0];
+  const exclusionRunId = report.historyIsolationWorkflow.stageRunIds[1];
+  if (
+    !RUN_ID.test(seedRunId ?? "") ||
+    !RUN_ID.test(exclusionRunId ?? "") ||
+    seedRunId === exclusionRunId
+  )
+    invalid("History isolation Run identities are invalid or duplicated.");
+
   let seedSpec;
+  let exclusionSpec;
+  let groupB;
   try {
-    seedSpec = historySeedSpec(config);
-    groupId = config.groups.find((group) => group.alias === "A").id;
-  } catch {
-    invalid("Configured history group A is invalid.");
-  }
-  const seedTransport = validateTransportCase(seedCase, seedSpec, groupId);
-  const seedRunId = report.historySeedWorkflow.stageRunIds[0];
-  if (!RUN_ID.test(seedRunId ?? "")) invalid("Seed Run identity is invalid.");
-  let recallSpec;
-  try {
-    recallSpec = historyRecallSpec({
+    seedSpec = historyIsolationSeedSpec({ config, sentinel });
+    groupB = config.groups.find((group) => group.alias === "B").id;
+    exclusionSpec = historyExclusionSpec({
       config,
-      groupId,
-      seedInputTime: seedTransport.binding.time,
+      sourceGroupId: groupB,
       seedMarker: seedCase.token,
-      seedRunId,
+      sentinel,
+      sourceRunId: seedRunId,
+      seedInputTime: seedCase.inputBinding?.time,
     });
   } catch {
-    invalid("Recall specification cannot be derived from the seed input binding.");
+    invalid("History isolation specs cannot be derived from the seed input evidence.");
   }
-  const recallTransport = validateTransportCase(recallCase, recallSpec, "private");
-  const recallRunId = report.historySeedWorkflow.stageRunIds[1];
+  const seedTransport = validateTransportCase(seedCase, seedSpec, groupB);
+  const exclusionTransport = validateTransportCase(exclusionCase, exclusionSpec, "private");
   if (
-    !RUN_ID.test(recallRunId ?? "") ||
-    seedRunId === recallRunId ||
-    seedCase.token === recallCase.token ||
-    recallTransport.binding.time <= seedTransport.binding.time
+    seedCase.token === exclusionCase.token ||
+    seedCase.token === sentinel.slice("qq-isolation-secret-".length) ||
+    exclusionTransport.binding.time <= seedTransport.binding.time
   )
-    invalid("History seed and recall must be distinct Runs, markers, and ordered inputs.");
+    invalid("History isolation markers and QQ input times must be distinct and ordered.");
 
   let fresh;
   try {
     fresh = await verifyProduct(report);
   } catch {
-    invalid("Fresh product verification failed for the history family.");
+    invalid("Fresh product verification failed for the history isolation family.");
   }
   if (
     !record(fresh) ||
@@ -298,7 +320,7 @@ export async function verifyHistoryFamilyReport(report, { config, verifyProduct 
     !Array.isArray(fresh.cases) ||
     fresh.cases.length !== 2
   )
-    invalid("Fresh product verification did not pass the exact two history cases.");
+    invalid("Fresh product verification did not pass the exact two isolation cases.");
 
   const seedEvidence = validateFreshCase(
     fresh.cases[0],
@@ -308,32 +330,32 @@ export async function verifyHistoryFamilyReport(report, { config, verifyProduct 
     fresh.runtime,
     config,
     "seed",
-    groupId,
+    groupB,
   );
-  const recallEvidence = validateFreshCase(
+  const exclusionEvidence = validateFreshCase(
     fresh.cases[1],
-    recallCase,
-    recallSpec,
-    recallTransport,
+    exclusionCase,
+    exclusionSpec,
+    exclusionTransport,
     fresh.runtime,
     config,
-    "recall",
-    groupId,
+    "exclusion",
+    groupB,
   );
   if (
     seedEvidence.runId !== seedRunId ||
-    recallEvidence.runId !== recallRunId ||
-    seedEvidence.scope.connectionId !== recallEvidence.scope.connectionId ||
-    seedEvidence.scope.botId !== recallEvidence.scope.botId ||
-    seedEvidence.scope.senderId !== recallEvidence.scope.senderId
+    exclusionEvidence.runId !== exclusionRunId ||
+    seedEvidence.scope.connectionId !== exclusionEvidence.scope.connectionId ||
+    seedEvidence.scope.botId !== exclusionEvidence.scope.botId ||
+    seedEvidence.scope.senderId !== exclusionEvidence.scope.senderId
   )
-    invalid("Fresh product evidence does not match the recorded seed and recall Runs.");
+    invalid("Fresh product evidence does not match the recorded B seed and A exclusion Runs.");
 
   return {
     status: "PASS",
-    caseId: HISTORY_FAMILY_ID,
+    caseId: HISTORY_ISOLATION_FAMILY_ID,
     runtime: fresh.runtime,
-    stageRunIds: [seedRunId, recallRunId],
+    stageRunIds: [seedRunId, exclusionRunId],
     cleanup: { required: false, leaseRevoked: true },
   };
 }

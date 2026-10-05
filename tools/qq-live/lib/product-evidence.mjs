@@ -1,3 +1,4 @@
+import { verifyLeaseCleanupEvidence } from "./lease-cleanup-evidence.mjs";
 import { execFileSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { resolve, join } from "node:path";
@@ -412,6 +413,18 @@ export async function verifyProductEvidence(report, config, clients) {
           })
         : undefined;
       await verifyGroupMemberCountEvidence(c, feature, config, clients, events, evidence.runId);
+      if (c.featureAssertions) {
+        const actors = db.prepare("SELECT principal_id FROM runs WHERE id=?").all(evidence.runId);
+        if (actors.length !== 1 || typeof actors[0].principal_id !== "string")
+          fail("LEASE_CLEANUP_EVIDENCE", "许可清理缺少独立执行身份。", "INCONCLUSIVE");
+        await verifyLeaseCleanupEvidence({
+          dataDirectory: after.dataDirectory,
+          caseRecord: c,
+          runId: evidence.runId,
+          scope: evidence.scope,
+          principalId: actors[0].principal_id,
+        });
+      }
       cases.push({
         ...evidence,
         messageBinding,

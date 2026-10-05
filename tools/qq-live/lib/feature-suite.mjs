@@ -1,3 +1,4 @@
+import { historyIsolationSeedSpec } from "./history-isolation-scenario.mjs";
 import { historySeedSpec } from "./history-scenario.mjs";
 import { HISTORY_SEED_FAMILY_ID } from "./history-seed-workflow.mjs";
 import { fail } from "./core.mjs";
@@ -72,8 +73,8 @@ export function resolveFeatureSuite(raw, config) {
     const readCases = resolveReadFeatureSpecs(raw, config);
     return { cases: readCases, readCases, memoryFamilies: [], historyFamilies: [] };
   }
-  if (![3, 4].includes(raw?.schemaVersion))
-    fail("FEATURE_SUITE", "Feature suite schemaVersion must be 2, 3 or 4.");
+  if (![3, 4, 5].includes(raw?.schemaVersion))
+    fail("FEATURE_SUITE", "Feature suite schemaVersion must be 2, 3, 4 or 5.");
   if (
     !raw ||
     typeof raw !== "object" ||
@@ -85,12 +86,23 @@ export function resolveFeatureSuite(raw, config) {
     fail("FEATURE_SUITE", "Schema 3 accepts only schemaVersion and cases.");
 
   uniqueCaseIds(raw.cases);
-  const historyFamilies = raw.cases.filter((item) => item.kind === "history-seed");
+  const historyFamilies = raw.cases.filter((item) =>
+    ["history-seed", "history-isolation"].includes(item.kind),
+  );
   if (raw.schemaVersion === 4) {
     if (historyFamilies.length !== 1)
       fail("FEATURE_HISTORY_FAMILY", "Schema 4 requires the fixed history seed family.");
     historyFamilies.forEach(validateHistoryFamily);
+    if (historyFamilies[0].id !== HISTORY_SEED_FAMILY_ID)
+      fail("FEATURE_HISTORY_FAMILY", "Schema 4 requires the original history seed family.");
     historySeedSpec(config);
+  } else if (raw.schemaVersion === 5) {
+    if (historyFamilies.length < 1 || historyFamilies.length > 2)
+      fail("FEATURE_HISTORY_FAMILY", "Schema 5 requires one or both fixed history families.");
+    historyFamilies.forEach(validateHistoryFamily);
+    if (historyFamilies.some((family) => family.kind === "history-seed")) historySeedSpec(config);
+    if (historyFamilies.some((family) => family.kind === "history-isolation"))
+      historyIsolationSeedSpec({ config, sentinel: `qq-isolation-secret-${"0".repeat(32)}` });
   } else if (historyFamilies.length)
     fail("FEATURE_HISTORY_FAMILY", "History family requires schema 4.");
   const families = raw.cases.filter((item) => item.kind === "memory-lifecycle");
@@ -119,9 +131,14 @@ export function validateHistoryFamily(value) {
     !value ||
     Array.isArray(value) ||
     Object.keys(value).sort().join(",") !== "chat,id,kind" ||
-    value.id !== HISTORY_SEED_FAMILY_ID ||
-    value.kind !== "history-seed" ||
-    value.chat !== "A"
+    !(
+      (value.id === HISTORY_SEED_FAMILY_ID &&
+        value.kind === "history-seed" &&
+        value.chat === "A") ||
+      (value.id === "history-cross-group-isolation" &&
+        value.kind === "history-isolation" &&
+        value.chat === "B")
+    )
   )
     fail("FEATURE_HISTORY_FAMILY", "History family must match its fixed definition.");
   return value;
@@ -137,5 +154,25 @@ export function historyFamilyPlan(config) {
     ],
     cleanup:
       "Revoke both temporary leases; retain real message, archive and Run evidence. Never replay an uncertain stage.",
+  };
+}
+
+export function historyIsolationFamilyPlan(config) {
+  return {
+    stages: [
+      {
+        stage: "seed",
+        spec: historyIsolationSeedSpec({
+          config,
+          sentinel: `qq-isolation-secret-${"0".repeat(32)}`,
+        }),
+      },
+      {
+        stage: "exclusion",
+        note: "Owner private search uses only group A and the independently verified group B seed marker, Run and actual input time. The separate B fixture content must be absent from both actual reply reads.",
+      },
+    ],
+    cleanup:
+      "Revoke both temporary leases and retain message, archive and Run evidence. Stop after any uncertain stage without replay.",
   };
 }

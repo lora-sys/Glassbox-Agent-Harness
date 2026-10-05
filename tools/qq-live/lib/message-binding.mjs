@@ -43,10 +43,10 @@ export async function boundMessage(client, requestedMessageId, expected) {
       ? []
       : [
           ...`${text}\n${JSON.stringify(result?.message)}`.matchAll(
-            /qq-isolation-secret-[a-f0-9]{32}/g,
+            /qq-isolation-secret-[a-f0-9]{32}/gi,
           ),
         ]
-  ).map(([value]) => createHash("sha256").update(value, "utf8").digest("hex"));
+  ).map(([value]) => createHash("sha256").update(value.toLowerCase(), "utf8").digest("hex"));
   if (
     (forbiddenFixtureSha256 !== undefined && fixtureHashes.includes(forbiddenFixtureSha256)) ||
     forbidden.some((part) => text.includes(part)) ||

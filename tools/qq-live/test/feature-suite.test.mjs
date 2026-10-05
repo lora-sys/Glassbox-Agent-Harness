@@ -187,3 +187,56 @@ test("schema 4 accepts only the fixed history family alongside existing reads an
   );
   assert.throws(() => resolveFeatureSuite({ schemaVersion: 4, cases: [family] }, config));
 });
+
+test("schema 5 binds both fixed history families while schema 4 stays unchanged", () => {
+  assert.equal(
+    resolveFeatureSuite(
+      {
+        schemaVersion: 5,
+        cases: [{ id: "history-group-seed-private-recall", kind: "history-seed", chat: "A" }],
+      },
+      { groups: [{ alias: "A", id: "123" }] },
+    ).historyFamilies.length,
+    1,
+  );
+  const scopes = {
+    groups: [
+      { alias: "A", id: "123" },
+      { alias: "B", id: "456" },
+    ],
+  };
+  const old = { id: "history-group-seed-private-recall", kind: "history-seed", chat: "A" };
+  const isolation = { id: "history-cross-group-isolation", kind: "history-isolation", chat: "B" };
+  assert.equal(
+    resolveFeatureSuite({ schemaVersion: 5, cases: [old, isolation] }, scopes).historyFamilies
+      .length,
+    2,
+  );
+  assert.equal(
+    resolveFeatureSuite({ schemaVersion: 5, cases: [isolation] }, scopes).historyFamilies.length,
+    1,
+  );
+  assert.equal(
+    resolveFeatureSuite({ schemaVersion: 4, cases: [old] }, scopes).historyFamilies.length,
+    1,
+  );
+  for (const cases of [[isolation], [old, isolation]])
+    assert.throws(() => resolveFeatureSuite({ schemaVersion: 4, cases }, scopes));
+  for (const bad of [
+    { ...isolation, chat: "A" },
+    { ...isolation, id: "arbitrary" },
+    { ...isolation, extra: true },
+  ])
+    assert.throws(() => resolveFeatureSuite({ schemaVersion: 5, cases: [bad] }, scopes));
+  assert.throws(() =>
+    resolveFeatureSuite(
+      { schemaVersion: 5, cases: [isolation] },
+      {
+        groups: [
+          { alias: "A", id: "123" },
+          { alias: "B", id: "123" },
+        ],
+      },
+    ),
+  );
+});

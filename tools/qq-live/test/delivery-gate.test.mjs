@@ -563,3 +563,74 @@ test("history family cannot impersonate reads or an older suite schema", async (
   g.input.reports[0].suiteSha256 = g.input.suiteSha256;
   await assert.rejects(evaluateDeliveryGate(g.input, g.dependencies));
 });
+
+function historyIsolationGateFixture() {
+  const f = historyFamilyFixture();
+  const id = "history-cross-group-isolation";
+  const text = JSON.stringify({
+    schemaVersion: 5,
+    cases: [{ id, kind: "history-isolation", chat: "B" }],
+  });
+  const names = ["history-cross-group-seed", "history-cross-group-private-exclusion"];
+  const runs = ["seed-run", "exclusion-run"];
+  f.input.suiteText = text;
+  f.input.suiteSha256 = digest(text);
+  f.input.requiredCaseIds = [id];
+  const r = f.input.reports[0];
+  r.suiteSha256 = digest(text);
+  r.historyFamily = { caseId: id };
+  delete r.historySeedWorkflow;
+  r.historyIsolationWorkflow = { stageRunIds: runs };
+  r.cases = names.map((id) => ({ id, status: "PASS", leaseRevoked: true }));
+  f.dependencies.verifyCoverage = async () => ({ status: "PASS", requiredCaseIds: [id] });
+  f.dependencies.verifyReport = async () => ({
+    status: "PASS",
+    runtime: { commit },
+    cases: names.map((caseId, i) => ({
+      caseId,
+      runId: runs[i],
+      traceVerified: true,
+      feature: { status: "PASS" },
+    })),
+  });
+  f.dependencies.verifyHistoryReport = async () => ({
+    status: "PASS",
+    caseId: id,
+    runtime: { commit },
+    stageRunIds: runs,
+    cleanup: { required: false, leaseRevoked: true },
+  });
+  return f;
+}
+
+test("delivery independently rechecks the isolation family and rejects workflow substitution", async () => {
+  const f = historyIsolationGateFixture();
+  assert.equal((await evaluateDeliveryGate(f.input, f.dependencies)).status, "PASS");
+  for (const alter of [
+    (f) => {
+      f.input.reports[0].historySeedWorkflow = { stageRunIds: ["seed-run", "exclusion-run"] };
+    },
+    (f) => {
+      delete f.input.reports[0].historyIsolationWorkflow;
+    },
+    (f) => {
+      f.input.reports[0].historyIsolationWorkflow.stageRunIds = ["foreign-run", "exclusion-run"];
+    },
+    (f) => {
+      f.dependencies.verifyHistoryReport = undefined;
+    },
+    (f) => {
+      const suite = JSON.parse(f.input.suiteText);
+      suite.schemaVersion = 4;
+      f.input.suiteText = JSON.stringify(suite);
+      f.input.suiteSha256 = digest(f.input.suiteText);
+      f.input.reports[0].suiteSha256 = f.input.suiteSha256;
+    },
+  ]) {
+    const bad = historyIsolationGateFixture();
+    alter(bad);
+    await assert.rejects(evaluateDeliveryGate(bad.input, bad.dependencies), {
+      code: "HISTORY_FAMILY_GATE",
+    });
+  }
+});

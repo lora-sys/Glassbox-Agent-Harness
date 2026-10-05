@@ -12,7 +12,12 @@ import { moderationCase } from "./lib/moderation.mjs";
 import { runtimeSnapshot, verifyProductEvidence } from "./lib/product-evidence.mjs";
 import { acceptanceManagement } from "./lib/management-client.mjs";
 import { runMemoryRecoveryCli } from "./lib/memory-recovery-cli.mjs";
-import { resolveFeatureSuite, memoryFamilyPlan, historyFamilyPlan } from "./lib/feature-suite.mjs";
+import {
+  resolveFeatureSuite,
+  memoryFamilyPlan,
+  historyFamilyPlan,
+  historyIsolationFamilyPlan,
+} from "./lib/feature-suite.mjs";
 import { MEMORY_FAMILY_ID, memoryWorkflow } from "./lib/memory-workflow.mjs";
 
 const root = dirname(fileURLToPath(import.meta.url));
@@ -42,6 +47,7 @@ run 默认测试私聊和已配置的群。moderation 需要独立配置和成�
 schemaVersion=1 的自然语言 scenarios 仅支持 plan。
 schemaVersion=2 的结构化读取用例需要服务端逐消息许可、运行版本和工具证据。
 schemaVersion=4 增加固定群 A 种子与 Owner 私聊回查流程。
+schemaVersion=5 增加群 B 种子与仅查询群 A 的私聊隔离流程。
 memory-lifecycle 是固定的项目范围反馈、提升、过期流程，需要单独启用并保留审计记录。
 退出码 0=通过，1=验收失败，2=环境或配置阻塞，3=无法确认。
 停止文件为报告目录下 STOP。Ctrl+C 也会停止，并尝试已授权的清理。
@@ -254,7 +260,7 @@ async function main() {
   }
   if (o.scenarios) {
     const suite = await jsonFile(resolve(o.scenarios));
-    featureSuite = [2, 3, 4].includes(suite.raw?.schemaVersion);
+    featureSuite = [2, 3, 4, 5].includes(suite.raw?.schemaVersion);
     if (command === "run" && !featureSuite)
       fail(
         "CUSTOM_LIVE_UNSUPPORTED",
@@ -309,6 +315,9 @@ async function main() {
           cases: plannedSuiteCases ?? specs,
           ...(plannedSuiteCases?.some((c) => c.kind === "history-seed")
             ? { historyPlan: historyFamilyPlan(config) }
+            : {}),
+          ...(plannedSuiteCases?.some((c) => c.kind === "history-isolation")
+            ? { historyIsolationPlan: historyIsolationFamilyPlan(config) }
             : {}),
           ...(() => {
             const families = plannedSuiteCases?.filter((c) => c.kind === "memory-lifecycle") ?? [];
@@ -428,7 +437,10 @@ async function main() {
       await moderationCase(config, clients, recorder, controller.signal);
       report.status = recorder.finalize();
     } else if (historyFamilyCase) {
-      const { runHistorySeedWorkflow } = await import("./lib/history-seed-workflow.mjs");
+      const isolation = historyFamilyCase.kind === "history-isolation";
+      const runWorkflow = isolation
+        ? (await import("./lib/history-isolation-workflow.mjs")).runHistoryIsolationWorkflow
+        : (await import("./lib/history-seed-workflow.mjs")).runHistorySeedWorkflow;
       const checkpoint = async (row) =>
         appendFileSync(join(runDir, "history-fixture.jsonl"), JSON.stringify(row) + "\n", {
           mode: 0o600,
@@ -451,7 +463,7 @@ async function main() {
         });
       acceptance.afterSend = async (c) =>
         checkpoint({ phase: "sent", caseId: c.id, driverMessageId: c.sentMessageId });
-      report.historySeedWorkflow = await runHistorySeedWorkflow({
+      const historyWorkflow = await runWorkflow({
         config,
         signal: controller.signal,
         checkpoint,
@@ -474,7 +486,9 @@ async function main() {
           return { transportCase, productAcceptance };
         },
       });
-      report.status = report.historySeedWorkflow.status;
+      if (isolation) report.historyIsolationWorkflow = historyWorkflow;
+      else report.historySeedWorkflow = historyWorkflow;
+      report.status = historyWorkflow.status;
       report.plannedCaseCount = 2;
       report.executedCaseCount = recorder.cases.length;
     } else if (memoryLifecycle) {
@@ -670,8 +684,12 @@ async function main() {
       report.note = "QQ 收发观察通过，但未配置运行版本与产品证据验证。不能用于合并。";
     }
     if (historyFamilyCase && report.status === "PASS") {
-      const { verifyHistoryFamilyReport } = await import("./lib/history-family-evidence.mjs");
-      report.historyFamilyAcceptance = await verifyHistoryFamilyReport(report, {
+      const verifyHistory =
+        historyFamilyCase.kind === "history-isolation"
+          ? (await import("./lib/history-isolation-family-evidence.mjs"))
+              .verifyHistoryIsolationFamilyReport
+          : (await import("./lib/history-family-evidence.mjs")).verifyHistoryFamilyReport;
+      report.historyFamilyAcceptance = await verifyHistory(report, {
         config,
         verifyProduct: (input) => verifyProductEvidence(input, config, clients),
       });
@@ -722,6 +740,7 @@ async function main() {
     report.reportDirectory = runDir;
     try {
       if (
+        report.error?.code === "LEASE_CLEANUP_EVIDENCE" ||
         report.cases.some(
           (c) =>
             (c.cleanup?.required && !c.cleanup.restored) ||
