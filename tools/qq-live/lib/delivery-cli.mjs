@@ -10,6 +10,7 @@ import { digest, fail, safeError } from "./core.mjs";
 import { resolveFeatureSuite } from "./feature-suite.mjs";
 import { evaluateDeliveryGate } from "./delivery-gate.mjs";
 import { verifyProductEvidence } from "./product-evidence.mjs";
+import { verifyHistoryFamilyReport } from "./history-family-evidence.mjs";
 import { verifyMemoryFamilyReport } from "./memory-family-evidence.mjs";
 import { verifyMemoryCleanup } from "./memory-fixture.mjs";
 import { OneBot } from "./onebot.mjs";
@@ -245,6 +246,8 @@ export async function runDeliveryCli(config, options, out) {
     await clients.bot.connect();
     await doctor(config, clients);
     const verifyReport = (report) => verifyProductEvidence(report, config, clients);
+    const verifyHistoryReport = (report) =>
+      verifyHistoryFamilyReport(report, { config, verifyProduct: verifyReport });
     const verifyMemoryReport = (report) =>
       verifyMemoryFamilyReport(report, {
         verifyProduct: verifyReport,
@@ -296,6 +299,7 @@ export async function runDeliveryCli(config, options, out) {
         {
           verifyReport,
           verifyMemoryReport,
+          verifyHistoryReport,
           readRemote: readRemoteEvidence,
           resolveRoute: (alias) =>
             alias === "private" ? "private" : config.groups.find((g) => g.alias === alias)?.id,

@@ -61,3 +61,6 @@ schemaVersion 3 套件可同时包含推广后过期和 memory-project-feedback-
 已有用户合并授权且全部门禁通过时，deliver --live 才能执行一次精确候选提交的 squash 合并。命令先持久记录 PR 级尝试。结果未知时不重试，也不能用新目录、套件或账号绕过已有尝试。
 
 合并结果不是最终验收。获取实际 mergeCommit，将原验收 checkout 和共享服务切换到该提交，保留账号、测试群、数据目录、NapCat 和原生 Pi 配置。重新运行完整套件，再运行 postmerge-check。消息必须在合并后新发，Run 必须属于实际合并提交。原候选提交的报告不能替代合并后报告。只有全部证据核对通过才能报告 DELIVERED。
+
+
+固定旧消息回查使用 schemaVersion 4 套件中的 `history-group-seed-private-recall`。先 plan 审阅 `feature-baseline.example.json`，再逐个用例运行并批准原文件哈希。第一条群 A 输入必须通过当前消息归档命中检查。第二条 Owner 私聊只查第一条编号，并把 until 固定到第一条实际 QQ 时间。第二条输入同秒时停止，不重发。报告和交付门禁必须重建来源关系、重新读取两轮产品证据，不能用单个回查 Run 代替完整流程。群 B 隔离仍待实现，完整覆盖门禁仍会阻塞。此流程尚未通过真实 QQ 验收。

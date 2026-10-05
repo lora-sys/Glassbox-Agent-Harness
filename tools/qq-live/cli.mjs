@@ -12,7 +12,7 @@ import { moderationCase } from "./lib/moderation.mjs";
 import { runtimeSnapshot, verifyProductEvidence } from "./lib/product-evidence.mjs";
 import { acceptanceManagement } from "./lib/management-client.mjs";
 import { runMemoryRecoveryCli } from "./lib/memory-recovery-cli.mjs";
-import { resolveFeatureSuite, memoryFamilyPlan } from "./lib/feature-suite.mjs";
+import { resolveFeatureSuite, memoryFamilyPlan, historyFamilyPlan } from "./lib/feature-suite.mjs";
 import { MEMORY_FAMILY_ID, memoryWorkflow } from "./lib/memory-workflow.mjs";
 
 const root = dirname(fileURLToPath(import.meta.url));
@@ -26,6 +26,8 @@ node cli.mjs run --live --case group-A
 node cli.mjs run --live --case moderation
 node cli.mjs plan --case memory-lifecycle
 node cli.mjs run --live --case memory-lifecycle --approve-suite <SHA256>
+node cli.mjs plan --scenarios examples/feature-baseline.example.json
+node cli.mjs run --live --case history-group-seed-private-recall --scenarios examples/feature-baseline.example.json --approve-suite <SHA256>
 node cli.mjs reconcile-memory
 node cli.mjs reconcile-memory --live --approve-suite <SHA256>
 node cli.mjs plan --scenarios examples/scenarios.example.json
@@ -39,6 +41,7 @@ node cli.mjs report
 run 默认测试私聊和已配置的群。moderation 需要独立配置和成员同意。
 schemaVersion=1 的自然语言 scenarios 仅支持 plan。
 schemaVersion=2 的结构化读取用例需要服务端逐消息许可、运行版本和工具证据。
+schemaVersion=4 增加固定群 A 种子与 Owner 私聊回查流程。
 memory-lifecycle 是固定的项目范围反馈、提升、过期流程，需要单独启用并保留审计记录。
 退出码 0=通过，1=验收失败，2=环境或配置阻塞，3=无法确认。
 停止文件为报告目录下 STOP。Ctrl+C 也会停止，并尝试已授权的清理。
@@ -226,6 +229,7 @@ async function main() {
     featureSuite = false;
   let memoryLifecycle = o.case === "memory-lifecycle";
   let memoryFamilyCase = null;
+  let historyFamilyCase = null;
   let plannedSuiteCases = null;
   if (memoryLifecycle) {
     if (o.scenarios) fail("ARGUMENT", "固定记忆流程不能与 scenarios 混用。");
@@ -250,7 +254,7 @@ async function main() {
   }
   if (o.scenarios) {
     const suite = await jsonFile(resolve(o.scenarios));
-    featureSuite = [2, 3].includes(suite.raw?.schemaVersion);
+    featureSuite = [2, 3, 4].includes(suite.raw?.schemaVersion);
     if (command === "run" && !featureSuite)
       fail(
         "CUSTOM_LIVE_UNSUPPORTED",
@@ -260,6 +264,11 @@ async function main() {
       const resolved = resolveFeatureSuite(suite.raw, config);
       plannedSuiteCases = resolved.cases;
       specs = resolved.readCases;
+      if (resolved.historyFamilies.length && command === "run") {
+        if (!o.case) fail("CASE_FAMILY_REQUIRED", "含历史流程的套件须逐个选择用例运行。");
+        historyFamilyCase = resolved.historyFamilies.find((c) => c.id === o.case) ?? null;
+        if (historyFamilyCase) specs = [];
+      }
       if (resolved.memoryFamilies.length && command === "run") {
         if (!o.case)
           fail("CASE_FAMILY_REQUIRED", "含记忆流程的套件须逐个选择用例运行并保留各自报告。");
@@ -278,6 +287,8 @@ async function main() {
         "SUITE_APPROVAL",
         "先运行 plan 审阅消息，再把输出 SHA256 传入 --approve-suite。文件修改后需要重新审阅。",
       );
+    if (command === "run" && historyFamilyCase && config.maxMessages < 2)
+      fail("MESSAGE_BUDGET", "固定历史流程需要两条消息预算。");
     if (command === "run" && memoryFamilyCase) {
       if (
         config.memoryFixtures?.enabled !== true ||
@@ -296,6 +307,9 @@ async function main() {
         {
           suiteSha256: suiteHash,
           cases: plannedSuiteCases ?? specs,
+          ...(plannedSuiteCases?.some((c) => c.kind === "history-seed")
+            ? { historyPlan: historyFamilyPlan(config) }
+            : {}),
           ...(() => {
             const families = plannedSuiteCases?.filter((c) => c.kind === "memory-lifecycle") ?? [];
             if (families.length === 1) return { memoryPlan: memoryFamilyPlan(families[0].id) };
@@ -313,7 +327,7 @@ async function main() {
     );
     return;
   }
-  if (o.case && o.case !== "moderation" && !memoryLifecycle) {
+  if (o.case && o.case !== "moderation" && !memoryLifecycle && !historyFamilyCase) {
     specs = specs.filter((s) => s.id === o.case);
     if (!specs.length) fail("CASE_NOT_FOUND", "没有匹配的用例，未执行任何测试。");
   }
@@ -368,6 +382,7 @@ async function main() {
     workspace: workspace(),
     cases: recorder.cases,
     ...(memoryFamilyCase ? { memoryFamily: { caseId: memoryFamilyCase.id } } : {}),
+    ...(historyFamilyCase ? { historyFamily: { caseId: historyFamilyCase.id } } : {}),
     limitations: [
       "没有验证 QQ 客户端 UI。",
       "工作区版本不等于已运行服务版本。",
@@ -412,6 +427,56 @@ async function main() {
     } else if (o.case === "moderation") {
       await moderationCase(config, clients, recorder, controller.signal);
       report.status = recorder.finalize();
+    } else if (historyFamilyCase) {
+      const { runHistorySeedWorkflow } = await import("./lib/history-seed-workflow.mjs");
+      const checkpoint = async (row) =>
+        appendFileSync(join(runDir, "history-fixture.jsonl"), JSON.stringify(row) + "\n", {
+          mode: 0o600,
+        });
+      acceptance.beforeRegister = async (c) =>
+        checkpoint({
+          phase: "lease_intent",
+          caseId: c.id,
+          marker: c.token,
+          textSha256: digest(c.prompt),
+        });
+      acceptance.beforeSend = async (c, lease) =>
+        checkpoint({
+          phase: "send_intent",
+          caseId: c.id,
+          marker: c.token,
+          leaseId: lease.leaseId,
+          toolsSha256: lease.toolsSha256,
+          textSha256: digest(c.prompt),
+        });
+      acceptance.afterSend = async (c) =>
+        checkpoint({ phase: "sent", caseId: c.id, driverMessageId: c.sentMessageId });
+      report.historySeedWorkflow = await runHistorySeedWorkflow({
+        config,
+        signal: controller.signal,
+        checkpoint,
+        executeStep: async (stage, spec) => {
+          if (stage !== "seed") await sleep(config.minGapMs);
+          const transportCase = await replyCase(
+            config,
+            clients,
+            recorder,
+            spec,
+            controller.signal,
+            acceptance,
+          );
+          if (transportCase.status !== "PASS") return { transportCase };
+          const productAcceptance = await verifyProductEvidence(
+            { mode: "run", status: "PASS", runtime: report.runtime, cases: [transportCase] },
+            config,
+            clients,
+          );
+          return { transportCase, productAcceptance };
+        },
+      });
+      report.status = report.historySeedWorkflow.status;
+      report.plannedCaseCount = 2;
+      report.executedCaseCount = recorder.cases.length;
     } else if (memoryLifecycle) {
       const memoryContract = memoryWorkflow(memoryFamilyCase?.id ?? MEMORY_FAMILY_ID);
       const { runMemoryLifecycle } = await import("./lib/memory-lifecycle.mjs");
@@ -603,6 +668,13 @@ async function main() {
       report.transportStatus = "PASS";
       report.status = "INCONCLUSIVE";
       report.note = "QQ 收发观察通过，但未配置运行版本与产品证据验证。不能用于合并。";
+    }
+    if (historyFamilyCase && report.status === "PASS") {
+      const { verifyHistoryFamilyReport } = await import("./lib/history-family-evidence.mjs");
+      report.historyFamilyAcceptance = await verifyHistoryFamilyReport(report, {
+        config,
+        verifyProduct: (input) => verifyProductEvidence(input, config, clients),
+      });
     }
     if (memoryFamilyCase && report.status === "PASS") {
       const { verifyMemoryFamilyReport } = await import("./lib/memory-family-evidence.mjs");

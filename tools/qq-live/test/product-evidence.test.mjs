@@ -427,6 +427,8 @@ test("two account-local ID pairs bind to one real input and reply without retain
     textSha256: fixture.c.inputBinding.textSha256,
   });
   assert.equal(evidence.reply.realSequence, "555");
+  assert.equal(evidence.reply.botMessageId, String(fixture.delivery.external_id));
+  assert.equal(evidence.reply.driverMessageId, fixture.c.replies[0].messageId);
   assert.equal(JSON.stringify(evidence).includes(fixture.inputText), false);
   assert.equal(JSON.stringify(evidence).includes(fixture.replyText), false);
 });

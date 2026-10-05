@@ -40,6 +40,14 @@ export function validateHistoryResultAssertion(assertion) {
 /** Result hashes correlate protected Tool output without opening its payload. */
 export function historyResultTrace(assertion, events, runId) {
   validateHistoryResultAssertion(assertion);
+  const input =
+    assertion.tool === "group_history_search"
+      ? { query: assertion.query, limit: 1 }
+      : { query: assertion.query, groupIds: [assertion.groupId], limit: 1 };
+  return protectedHistoryResultTrace(assertion, events, runId, input);
+}
+
+function protectedHistoryResultTrace(assertion, events, runId, input) {
   const coverage = observeHistoryCoverage(
     { kind: "history_coverage", query: assertion.query, groupId: assertion.groupId, count: 1 },
     events,
@@ -50,10 +58,6 @@ export function historyResultTrace(assertion, events, runId) {
   );
   const calls = events.filter((event) => event?.runId === runId && event.type === "tool_call");
   const results = events.filter((event) => event?.runId === runId && event.type === "tool_result");
-  const input =
-    assertion.tool === "group_history_search"
-      ? { query: assertion.query, limit: 1 }
-      : { query: assertion.query, groupIds: [assertion.groupId], limit: 1 };
   const output = history.toolOutput;
   const expectedCount = assertion.result === "hit" ? 1 : 0;
   if (
@@ -184,5 +188,135 @@ export function observeHistoryResult(assertion, { db, events, runId }) {
     returned: assertion.result === "hit" ? 1 : 0,
     sourceVerified: true,
     toolOutputVerified: true,
+  };
+}
+
+export function validateHistorySeedAssertion(assertion) {
+  if (
+    !assertion ||
+    Array.isArray(assertion) ||
+    Object.keys(assertion).sort().join(",") !==
+      "count,groupId,kind,query,result,sourceRunId,tool,until" ||
+    assertion.kind !== "history_seed_result" ||
+    assertion.tool !== "owner_history_search" ||
+    assertion.result !== "hit" ||
+    !/^[A-Za-z0-9_-]{1,128}$/.test(assertion.sourceRunId ?? "") ||
+    typeof assertion.until !== "string" ||
+    !Number.isFinite(Date.parse(assertion.until)) ||
+    new Date(assertion.until).toISOString() !== assertion.until ||
+    Date.parse(assertion.until) <= 0 ||
+    Date.parse(assertion.until) % 1000 !== 0
+  )
+    invalid();
+  validateHistoryCoverageAssertion({
+    kind: "history_coverage",
+    query: assertion.query,
+    groupId: assertion.groupId,
+    count: assertion.count,
+  });
+}
+
+/** Verify a distinct earlier group input through a later Owner-private Run. */
+export function observeHistorySeedResult(assertion, { db, events, runId, inputBinding }) {
+  validateHistorySeedAssertion(assertion);
+  const untilMs = Date.parse(assertion.until);
+  if (
+    !db ||
+    runId === assertion.sourceRunId ||
+    !Number.isSafeInteger(inputBinding?.time) ||
+    inputBinding.time * 1000 <= untilMs
+  )
+    invalid();
+  const { history, item } = protectedHistoryResultTrace(assertion, events, runId, {
+    query: assertion.query,
+    groupIds: [assertion.groupId],
+    limit: 1,
+    until: assertion.until,
+  });
+  const load = (id) =>
+    db
+      .prepare(
+        "SELECT r.principal_id,r.conversation_id,r.scope_json,r.status,m.external_id,m.scope_key,p.kind FROM runs r JOIN messages m ON m.id=r.message_id JOIN principals p ON p.id=r.principal_id WHERE r.id=?",
+      )
+      .all(id);
+  const seeds = load(assertion.sourceRunId),
+    recalls = load(runId);
+  if (seeds.length !== 1 || recalls.length !== 1) invalid();
+  const seed = seeds[0],
+    recall = recalls[0];
+  let a, b;
+  try {
+    a = JSON.parse(seed.scope_json);
+    b = JSON.parse(recall.scope_json);
+  } catch {
+    invalid();
+  }
+  const scopeKey = (scope) =>
+    JSON.stringify([
+      scope.connectionId,
+      scope.botId,
+      scope.chatType,
+      scope.chatId,
+      scope.senderId,
+      scope.threadId ?? null,
+    ]);
+  const numeric = (value) => typeof value === "string" && /^[1-9]\d{0,15}$/.test(value);
+  if (
+    seed.kind !== "owner" ||
+    recall.kind !== "owner" ||
+    seed.status !== "succeeded" ||
+    recall.status !== "succeeded" ||
+    seed.principal_id !== recall.principal_id ||
+    history.principalId !== recall.principal_id ||
+    history.conversationId !== recall.conversation_id ||
+    !a ||
+    !b ||
+    a.chatType !== "group" ||
+    a.chatId !== assertion.groupId ||
+    b.chatType !== "private" ||
+    b.chatId !== b.senderId ||
+    typeof a.connectionId !== "string" ||
+    !a.connectionId ||
+    a.connectionId !== b.connectionId ||
+    a.botId !== b.botId ||
+    a.senderId !== b.senderId ||
+    !numeric(a.botId) ||
+    !numeric(a.senderId) ||
+    scopeKey(a) !== seed.scope_key ||
+    scopeKey(b) !== recall.scope_key ||
+    item?.senderId !== a.senderId ||
+    item?.occurredAt !== assertion.until ||
+    !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(item?.recordId ?? "")
+  )
+    invalid();
+  const rows = db
+    .prepare(
+      "SELECT normalized_text,occurred_at,occurred_at_ms FROM channel_messages WHERE id=? AND channel='qq-onebot' AND connection_id=? AND group_id=? AND resource_id=? AND source_class='history' AND external_message_id=? AND sender_id=? AND instr(lower(normalized_text),?)>0",
+    )
+    .all(
+      item.recordId,
+      a.connectionId,
+      assertion.groupId,
+      `group:${assertion.groupId}`,
+      seed.external_id,
+      a.senderId,
+      assertion.query,
+    );
+  if (
+    rows.length !== 1 ||
+    rows[0].occurred_at !== assertion.until ||
+    rows[0].occurred_at_ms !== untilMs ||
+    typeof rows[0].normalized_text !== "string" ||
+    rows[0].normalized_text.length > 4096 ||
+    !matchesHistoryText(item, historySnippet(rows[0].normalized_text, assertion.query))
+  )
+    invalid();
+  return {
+    kind: "history_seed_result",
+    result: "hit",
+    returned: 1,
+    sourceVerified: true,
+    toolOutputVerified: true,
+    distinctEarlierInput: true,
   };
 }

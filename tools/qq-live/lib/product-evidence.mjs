@@ -303,7 +303,14 @@ export async function verifyMessageBindings(c, config, clients, delivery) {
   )
     fail("OBSERVATION_CHANGED", "产品证据查询期间收到新的匹配回复。", "INCONCLUSIVE");
   const replyMatch = compareSameMessage(replyBot, replyDriver);
-  return { input: inputMatch, reply: replyMatch };
+  return {
+    input: inputMatch,
+    reply: {
+      botMessageId: String(delivery.external_id),
+      driverMessageId: reply[0].messageId,
+      ...replyMatch,
+    },
+  };
 }
 
 export function readTraceEvents(
@@ -366,7 +373,11 @@ export async function verifyProductEvidence(report, config, clients) {
       const messageBinding = await verifyMessageBindings(c, config, clients, evidence.delivery);
       const featureTypes =
         c.featureAssertions?.filter((a) => a.kind === "trace").map((a) => a.type) ?? [];
-      if (c.featureAssertions?.some((a) => ["history_coverage", "history_result"].includes(a.kind)))
+      if (
+        c.featureAssertions?.some((a) =>
+          ["history_coverage", "history_result", "history_seed_result"].includes(a.kind),
+        )
+      )
         featureTypes.push("history_retrieval");
       const trace = readTraceEvents(
         after.checkout,
@@ -379,7 +390,12 @@ export async function verifyProductEvidence(report, config, clients) {
       verifyTraceEvidence(events, c, config, evidence.delivery);
       verifyLeaseTraceEvidence(events, c, evidence.runId);
       const feature = c.featureAssertions
-        ? observeFeature(c.featureAssertions, { db, events, runId: evidence.runId })
+        ? observeFeature(c.featureAssertions, {
+            db,
+            events,
+            runId: evidence.runId,
+            inputBinding: c.inputBinding,
+          })
         : undefined;
       await verifyGroupMemberCountEvidence(c, feature, config, clients, events, evidence.runId);
       cases.push({

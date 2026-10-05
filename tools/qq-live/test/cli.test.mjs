@@ -569,3 +569,27 @@ test("ambiguous moderation creates persistent safety STOP", async (t) => {
   assert.equal(r.code, 2, r.stdout + r.stderr);
   assert.ok((await readFile(join(out, "STOP"), "utf8")).includes("CLEANUP_UNCONFIRMED"));
 });
+
+test("history family plan exposes fixed seed and evidence-derived recall without network", async (t) => {
+  const d = await dir(t),
+    p = join(d, "config.json"),
+    suite = join(d, "history-suite.json");
+  await writeFile(p, JSON.stringify(baseConfig()));
+  await writeFile(
+    suite,
+    JSON.stringify({
+      schemaVersion: 4,
+      cases: [{ id: "history-group-seed-private-recall", kind: "history-seed", chat: "A" }],
+    }),
+  );
+  const r = await run(["plan", "--config", p, "--scenarios", suite], d);
+  assert.equal(r.code, 0, r.stderr);
+  const plan = JSON.parse(r.stdout);
+  assert.deepEqual(
+    plan.historyPlan.stages.map((s) => s.stage),
+    ["seed", "recall"],
+  );
+  assert.equal(plan.historyPlan.stages[0].spec.chat, "A");
+  assert.match(plan.historyPlan.stages[1].note, /verified seed/);
+  assert.match(plan.suiteSha256, /^[a-f0-9]{64}$/);
+});

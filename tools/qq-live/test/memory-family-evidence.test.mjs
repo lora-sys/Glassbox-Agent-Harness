@@ -100,7 +100,8 @@ function expectedCase(stage, index, stageRunIds = runIds) {
         textSha256: binding.textSha256,
       },
       reply: {
-        messageId: String(40001 + index),
+        botMessageId: String(50001 + index),
+        driverMessageId: String(40001 + index),
         realSequence: String(60001 + index),
         time: 1_800_000_010 + index,
         textSha256: replyTextSha256,
@@ -351,4 +352,21 @@ test("reject family requires exact Owner candidate lineage, rejected status, and
       status: "INCONCLUSIVE",
     },
   );
+});
+
+test("Memory reply proof keeps distinct Bot and Owner local IDs and rejects either mismatch", async () => {
+  const f = fixture();
+  assert.notEqual(
+    f.product.cases[0].messageBinding.reply.botMessageId,
+    f.product.cases[0].messageBinding.reply.driverMessageId,
+  );
+  await verifyMemoryFamilyReport(f.report, verifiers(f));
+  for (const field of ["botMessageId", "driverMessageId"]) {
+    const changed = fixture();
+    changed.product.cases[0].messageBinding.reply[field] = "99999";
+    await rejected(changed);
+  }
+  const absent = fixture();
+  delete absent.product.cases[0].messageBinding.reply.botMessageId;
+  await rejected(absent);
 });

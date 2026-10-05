@@ -489,3 +489,77 @@ test("schema 2 cannot masquerade as an approved Memory family suite", async () =
   input.reports[0].suiteSha256 = input.suiteSha256;
   await assert.rejects(evaluateDeliveryGate(input, dependencies), { code: "MEMORY_FAMILY_GATE" });
 });
+
+function historyFamilyFixture() {
+  const f = fixture();
+  const id = "history-group-seed-private-recall";
+  const text = JSON.stringify({
+    schemaVersion: 4,
+    cases: [{ id, kind: "history-seed", chat: "A" }],
+  });
+  const runs = ["seed-run", "recall-run"],
+    cases = ["history-current-group-hit", "history-seed-recall"];
+  f.input.suiteText = text;
+  f.input.suiteSha256 = digest(text);
+  f.input.requiredCaseIds = [id];
+  const report = {
+    status: "PASS",
+    mode: "run",
+    suiteSha256: digest(text),
+    productAcceptance: { status: "PASS", runtime: { commit } },
+    historyFamily: { caseId: id },
+    historySeedWorkflow: { stageRunIds: runs },
+    cases: cases.map((id) => ({ id, status: "PASS", leaseRevoked: true })),
+  };
+  f.input.reports = [report];
+  f.dependencies.verifyCoverage = async () => ({ status: "PASS", requiredCaseIds: [id] });
+  f.dependencies.verifyReport = async () => ({
+    status: "PASS",
+    runtime: { commit },
+    cases: cases.map((caseId, i) => ({
+      caseId,
+      runId: runs[i],
+      traceVerified: true,
+      feature: { status: "PASS" },
+    })),
+  });
+  f.dependencies.verifyHistoryReport = async () => ({
+    status: "PASS",
+    caseId: id,
+    runtime: { commit },
+    stageRunIds: runs,
+    cleanup: { required: false, leaseRevoked: true },
+  });
+  return f;
+}
+test("delivery rechecks the fixed history family before counting either stage", async () => {
+  const f = historyFamilyFixture();
+  assert.equal((await evaluateDeliveryGate(f.input, f.dependencies)).status, "PASS");
+  for (const changed of [
+    undefined,
+    async () => ({ status: "FAIL" }),
+    async () => ({
+      status: "PASS",
+      caseId: "foreign",
+      runtime: { commit },
+      stageRunIds: ["seed-run", "recall-run"],
+      cleanup: { required: false, leaseRevoked: true },
+    }),
+  ])
+    await assert.rejects(
+      evaluateDeliveryGate(f.input, { ...f.dependencies, verifyHistoryReport: changed }),
+    );
+  f.input.reports[0].historySeedWorkflow.stageRunIds = ["seed-run", "foreign-run"];
+  await assert.rejects(evaluateDeliveryGate(f.input, f.dependencies));
+});
+test("history family cannot impersonate reads or an older suite schema", async () => {
+  const f = historyFamilyFixture();
+  delete f.input.reports[0].historyFamily;
+  delete f.input.reports[0].historySeedWorkflow;
+  await assert.rejects(evaluateDeliveryGate(f.input, f.dependencies));
+  const g = historyFamilyFixture();
+  g.input.suiteText = g.input.suiteText.replace('"schemaVersion":4', '"schemaVersion":3');
+  g.input.suiteSha256 = digest(g.input.suiteText);
+  g.input.reports[0].suiteSha256 = g.input.suiteSha256;
+  await assert.rejects(evaluateDeliveryGate(g.input, g.dependencies));
+});

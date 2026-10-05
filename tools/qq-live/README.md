@@ -210,3 +210,8 @@ https://napneko.github.io/other/security
 ```
 
 成员数用例的经验目前只能记为 hypothesis。经验记录器尚不能独立重核该计数证据，因此拒绝 verified 声明，也会从同一 Run 的原始工具 Trace 检测删除断言的降级。实机报告和技能经验需要各自通过证据检查。
+
+
+schemaVersion 4 的 `feature-baseline.example.json` 同时包含既有读取、两个固定 Memory 流程和 `history-group-seed-private-recall`。每次调用选择一个流程并批准原始套件哈希。固定历史流程先在群 A 验证自己的实际归档输入，再在 Owner 私聊查询该输入编号。后一步的 `until` 取第一条 QQ 回执的整数秒时间，只接受严格晚于第一条的第二条输入。两轮必须使用不同标记和 Run，以及同一服务版本、Owner、Bot 和连接。该流程不覆盖群 B 隔离和授权负例。
+
+最终报告门禁从第一条真实输入重建查询、时间边界、许可和来源 Run，重新读取两轮产品证据及归档来源。不允许指定任意历史 Run 充当种子。失败或进度记录未确认时停止，不自动重发。历史报告的技能经验登记尚未支持独立重核此两轮流程，因此这类经验目前只能记为 hypothesis。不能通过删除来源断言改成 verified。

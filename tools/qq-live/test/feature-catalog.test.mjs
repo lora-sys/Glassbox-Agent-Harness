@@ -154,8 +154,7 @@ test("read-only example binds only the implemented Ops and QQ inventory cases", 
     source.cases.find((candidate) => candidate.id === "qq-group-member-count-read"),
   );
   const executableCatalogCases = FEATURE_CATALOG.cases.filter(
-    (testCase) =>
-      testCase.executionStatus === "executable" && testCase.executionKind !== "memory-lifecycle",
+    (testCase) => testCase.executionStatus === "executable" && testCase.executionKind === undefined,
   );
   assert.equal(
     FEATURE_CATALOG.coverageNotice,
@@ -605,4 +604,44 @@ test("mutating catalog case stays blocked without an implemented cleanup binding
   assert.equal(result.status, "BLOCKED");
   assert.ok(result.gaps.some((gap) => gap.code === "MUTATION_EXECUTION_UNSUPPORTED"));
   assert.deepEqual(result.coveredTools, []);
+});
+
+test("history seed catalog binds its fixed two-stage family and rejects metadata downgrade", async () => {
+  const catalogCase = FEATURE_CATALOG.cases.find(
+    (c) => c.id === "history-group-seed-private-recall",
+  );
+  const source = JSON.parse(
+    await readFile(new URL("../examples/feature-baseline.example.json", import.meta.url), "utf8"),
+  );
+  const descriptors = catalogCase.tools.map((name) => ({ name }));
+  const catalog = {
+    schemaVersion: 1,
+    requiredDomains: ["history_retrieval"],
+    descriptorBaseline: catalogCase.tools,
+    cases: [catalogCase],
+  };
+  const suiteConfig = {
+    groups: [
+      { alias: "A", id: "10001" },
+      { alias: "B", id: "10002" },
+    ],
+  };
+  const args = { catalog, descriptors, executableSuiteCases: source.cases, suiteConfig };
+  assert.equal(checkFeatureCoverage(args).status, "PASS");
+  for (const field of ["tools", "assertions", "executionKind", "mutation"]) {
+    const c = structuredClone(catalogCase);
+    if (field === "tools" || field === "assertions") c[field] = [];
+    else c[field] = "changed";
+    assert.equal(
+      checkFeatureCoverage({ ...args, catalog: { ...catalog, cases: [c] } }).status,
+      "BLOCKED",
+    );
+  }
+  assert.equal(
+    checkFeatureCoverage({
+      ...args,
+      executableSuiteCases: source.cases.filter((c) => c.id !== catalogCase.id),
+    }).status,
+    "BLOCKED",
+  );
 });

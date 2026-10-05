@@ -159,3 +159,31 @@ test("Memory plan uses the same three fixed stage specifications and zeroed IDs"
   assert.ok(plan.stages[2].spec.prompt.includes("{{memory_id}}"));
   assert.ok(plan.stages.every(({ spec }) => spec.leaseTools[0].name === "owner_memory_admin"));
 });
+
+test("schema 4 accepts only the fixed history family alongside existing reads and Memory", () => {
+  const family = { id: "history-group-seed-private-recall", kind: "history-seed", chat: "A" };
+  const cfg = {
+    groups: [
+      { alias: "A", id: "10001" },
+      { alias: "B", id: "10002" },
+    ],
+  };
+  const resolved = resolveFeatureSuite(
+    { schemaVersion: 4, cases: [family, memoryFamily(), readCase()] },
+    cfg,
+  );
+  assert.deepEqual(resolved.historyFamilies, [family]);
+  assert.equal(resolved.readCases.length, 1);
+  assert.equal(resolved.memoryFamilies.length, 1);
+  for (const changed of [
+    { ...family, chat: "B" },
+    { ...family, id: "custom" },
+    { ...family, prompt: "extra" },
+  ])
+    assert.throws(() => resolveFeatureSuite({ schemaVersion: 4, cases: [changed] }, cfg));
+  assert.throws(() => resolveFeatureSuite({ schemaVersion: 4, cases: [readCase()] }, cfg));
+  assert.throws(() =>
+    resolveFeatureSuite({ schemaVersion: 3, cases: [family, memoryFamily()] }, cfg),
+  );
+  assert.throws(() => resolveFeatureSuite({ schemaVersion: 4, cases: [family] }, config));
+});

@@ -1,7 +1,7 @@
 import { fail, digest, toolManifestDigest } from "./core.mjs";
 import { validateFeatureAssertions } from "./feature-observer.mjs";
 import { resolveReadFeatureCase } from "./feature-specs.mjs";
-import { validateMemoryFamily } from "./feature-suite.mjs";
+import { validateMemoryFamily, validateHistoryFamily } from "./feature-suite.mjs";
 import { memoryWorkflow } from "./memory-workflow.mjs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -33,6 +33,7 @@ export async function evaluateDeliveryGate(
   {
     verifyReport,
     verifyMemoryReport,
+    verifyHistoryReport,
     readRemote,
     resolveRoute,
     verifyCoverage = verifyRepositoryCoverage,
@@ -149,10 +150,48 @@ export async function evaluateDeliveryGate(
         freshInputTimes.push(inputTime * 1000);
       }
     }
+    if (report.historyFamily !== undefined || report.historySeedWorkflow !== undefined) {
+      const familyId = report.historyFamily?.caseId,
+        original = approvedCases.get(familyId);
+      if (suite.schemaVersion !== 4 || !original || typeof verifyHistoryReport !== "function")
+        fail("HISTORY_FAMILY_GATE", "历史流程须绑定已批准的固定用例并重新核对两轮来源。");
+      validateHistoryFamily(original);
+      if (observed.has(familyId)) fail("CASE_DUPLICATE", "交付报告重复声明历史用例。");
+      const history = await verifyHistoryReport(report, { approvedFamily: original });
+      if (
+        history?.status !== "PASS" ||
+        history.caseId !== familyId ||
+        history.runtime?.commit !== commit ||
+        JSON.stringify(history.runtime) !== JSON.stringify(fresh.runtime) ||
+        !Array.isArray(history.stageRunIds) ||
+        history.stageRunIds.length !== 2 ||
+        new Set(history.stageRunIds).size !== 2 ||
+        JSON.stringify(history.stageRunIds) !==
+          JSON.stringify(report.historySeedWorkflow?.stageRunIds) ||
+        report.cases.length !== 2 ||
+        fresh.cases.length !== 2 ||
+        fresh.cases.some(
+          (e, i) =>
+            e.runId !== history.stageRunIds[i] ||
+            e.caseId !== report.cases[i].id ||
+            e.feature?.status !== "PASS" ||
+            e.traceVerified !== true,
+        ) ||
+        history.cleanup?.required !== false ||
+        history.cleanup.leaseRevoked !== true
+      )
+        fail("HISTORY_FAMILY_GATE", "历史流程来源或独立 Run 证据不完整。");
+      observed.add(familyId);
+      continue;
+    }
     if (report.memoryFamily !== undefined || report.memoryLifecycle !== undefined) {
       const familyId = report.memoryFamily?.caseId;
       const original = approvedCases.get(familyId);
-      if (suite.schemaVersion !== 3 || !original || typeof verifyMemoryReport !== "function")
+      if (
+        ![3, 4].includes(suite.schemaVersion) ||
+        !original ||
+        typeof verifyMemoryReport !== "function"
+      )
         fail("MEMORY_FAMILY_GATE", "记忆流程必须绑定已批准的固定用例并重新核对资源清理。");
       let workflow;
       try {

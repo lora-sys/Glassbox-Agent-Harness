@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
 import {
@@ -262,33 +262,21 @@ function runTestCommandWithCache(args, scope) {
 
 // Scripts are outside the unit suite's include pattern, so their tests only run where a runner
 // names them. Listing them here is what keeps them from being files nobody executes.
+/** Keep every current and newly added QQ regression in both delivery gates. */
+function discoverQqLiveTests(repoRoot = fileURLToPath(new URL("../", import.meta.url))) {
+  const names = readdirSync(resolve(repoRoot, "tools/qq-live/test"), { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".test.mjs"))
+    .map((entry) => `tools/qq-live/test/${entry.name}`)
+    .sort();
+  if (!names.length) throw new Error("QQ live regression directory has no test files");
+  return names;
+}
+
 const SCRIPT_TESTS = [
   "scripts/service-source-identity.test.mjs",
-  "tools/qq-live/test/core.test.mjs",
-  "tools/qq-live/test/integration.test.mjs",
-  "tools/qq-live/test/cli.test.mjs",
-  "tools/qq-live/test/product-evidence.test.mjs",
-  "tools/qq-live/test/delivery-gate.test.mjs",
-  "tools/qq-live/test/delivery-cli.test.mjs",
-  "tools/qq-live/test/delivery-executor.test.mjs",
-  "tools/qq-live/test/github-delivery.test.mjs",
-  "tools/qq-live/test/postmerge-gate.test.mjs",
-  "tools/qq-live/test/feature-catalog.test.mjs",
-  "tools/qq-live/test/feature-observer.test.mjs",
-  "tools/qq-live/test/feature-specs.test.mjs",
-  "tools/qq-live/test/feature-suite.test.mjs",
-  "tools/qq-live/test/memory-family-evidence.test.mjs",
-  "tools/qq-live/test/memory-scenario.test.mjs",
-  "tools/qq-live/test/memory-fixture.test.mjs",
-  "tools/qq-live/test/memory-lifecycle.test.mjs",
-  "tools/qq-live/test/memory-checkpoint.test.mjs",
-  "tools/qq-live/test/memory-process.test.mjs",
-  "tools/qq-live/test/memory-recovery.test.mjs",
-  "tools/qq-live/test/memory-recovery-record.test.mjs",
-  "tools/qq-live/test/memory-recovery-observer.test.mjs",
-  "tools/qq-live/test/memory-recovery-cli.test.mjs",
-  "tools/qq-live/test/management-client.test.mjs",
+  ...discoverQqLiveTests(),
   ".agents/skills/qq-live-testing/scripts/helpers.test.mjs",
+  ".claude/skills/qq-live-testing/scripts/helpers.test.mjs",
   "scripts/verify-commit.test.mjs",
   "scripts/migrate-windows-workspaces.test.mjs",
 ];
@@ -317,6 +305,7 @@ function runStagedChecks(entries) {
 }
 
 export {
+  discoverQqLiveTests,
   canReuseTestCache,
   getTestIntegrityIssues,
   isTestFilePath,

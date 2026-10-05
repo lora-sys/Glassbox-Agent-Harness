@@ -1061,7 +1061,8 @@ async function createPassingMemoryRejectReport(t) {
           textSha256: binding.textSha256,
         },
         reply: {
-          messageId: String(9501 + index),
+          botMessageId: String(delivery.external_id),
+          driverMessageId: String(9501 + index),
           realSequence: String(9601 + index),
           time: binding.time + 1000,
           textSha256: replyHash,
@@ -1896,4 +1897,24 @@ test("history result lessons independently recheck archive rows and reject asser
       /Feature trace or read-only state assertions did not verify/,
     );
   }
+});
+
+test("seed recall lessons cannot claim verified after removing their source assertions", async (t) => {
+  const f = await createPassingFeatureReport(t);
+  const report = JSON.parse(f.bytes.toString("utf8"));
+  const path = join(report.runtime.dataDirectory, "runs", f.input.evidence.runId, "trace.jsonl");
+  const rows = (await readFile(path, "utf8")).trim().split("\n").map(JSON.parse);
+  const call = rows.find((r) => r.event.type === "tool_call");
+  call.event.data.name = "owner_history_search";
+  call.event.data.input = {
+    query: "a".repeat(32),
+    groupIds: ["20001"],
+    limit: 1,
+    until: "2026-10-05T00:00:00.000Z",
+  };
+  await writeFile(path, rows.map(JSON.stringify).join("\n") + "\n");
+  await assert.rejects(
+    appendLesson(f.input, join(f.temp, "seed-lesson.jsonl")),
+    /seed-family verification is unavailable/,
+  );
 });

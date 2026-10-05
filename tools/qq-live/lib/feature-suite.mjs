@@ -1,3 +1,5 @@
+import { historySeedSpec } from "./history-scenario.mjs";
+import { HISTORY_SEED_FAMILY_ID } from "./history-seed-workflow.mjs";
 import { fail } from "./core.mjs";
 import { memoryFixtureStep } from "./memory-scenario.mjs";
 import { resolveReadFeatureSpecs } from "./feature-specs.mjs";
@@ -68,10 +70,10 @@ function uniqueCaseIds(cases) {
 export function resolveFeatureSuite(raw, config) {
   if (raw?.schemaVersion === 2) {
     const readCases = resolveReadFeatureSpecs(raw, config);
-    return { cases: readCases, readCases, memoryFamilies: [] };
+    return { cases: readCases, readCases, memoryFamilies: [], historyFamilies: [] };
   }
-  if (raw?.schemaVersion !== 3)
-    fail("FEATURE_SUITE", "Feature suite schemaVersion must be 2 or 3.");
+  if (![3, 4].includes(raw?.schemaVersion))
+    fail("FEATURE_SUITE", "Feature suite schemaVersion must be 2, 3 or 4.");
   if (
     !raw ||
     typeof raw !== "object" ||
@@ -83,18 +85,57 @@ export function resolveFeatureSuite(raw, config) {
     fail("FEATURE_SUITE", "Schema 3 accepts only schemaVersion and cases.");
 
   uniqueCaseIds(raw.cases);
+  const historyFamilies = raw.cases.filter((item) => item.kind === "history-seed");
+  if (raw.schemaVersion === 4) {
+    if (historyFamilies.length !== 1)
+      fail("FEATURE_HISTORY_FAMILY", "Schema 4 requires the fixed history seed family.");
+    historyFamilies.forEach(validateHistoryFamily);
+    historySeedSpec(config);
+  } else if (historyFamilies.length)
+    fail("FEATURE_HISTORY_FAMILY", "History family requires schema 4.");
   const families = raw.cases.filter((item) => item.kind === "memory-lifecycle");
-  if (families.length < 1 || families.length > 2)
+  if ((raw.schemaVersion === 3 && families.length < 1) || families.length > 2)
     fail("FEATURE_MEMORY_FAMILY", "Schema 3 requires one or both fixed Memory families.");
   families.forEach(validateMemoryFamily);
-  const readTemplates = raw.cases.filter((item) => !families.includes(item));
+  const readTemplates = raw.cases.filter(
+    (item) => !families.includes(item) && !historyFamilies.includes(item),
+  );
   const readCases = readTemplates.length
     ? resolveReadFeatureSpecs({ schemaVersion: 2, cases: readTemplates }, config)
     : [];
   const resolvedReads = new Map(readCases.map((item) => [item.id, item]));
   return {
-    cases: raw.cases.map((item) => (families.includes(item) ? item : resolvedReads.get(item.id))),
+    cases: raw.cases.map((item) =>
+      families.includes(item) || historyFamilies.includes(item) ? item : resolvedReads.get(item.id),
+    ),
     readCases,
     memoryFamilies: families,
+    historyFamilies,
+  };
+}
+
+export function validateHistoryFamily(value) {
+  if (
+    !value ||
+    Array.isArray(value) ||
+    Object.keys(value).sort().join(",") !== "chat,id,kind" ||
+    value.id !== HISTORY_SEED_FAMILY_ID ||
+    value.kind !== "history-seed" ||
+    value.chat !== "A"
+  )
+    fail("FEATURE_HISTORY_FAMILY", "History family must match its fixed definition.");
+  return value;
+}
+export function historyFamilyPlan(config) {
+  return {
+    stages: [
+      { stage: "seed", spec: historySeedSpec(config) },
+      {
+        stage: "recall",
+        note: "Owner private query uses only the verified seed marker, group A, limit 1 and until derived from the seed's actual QQ time. Its source Run must be the verified seed Run.",
+      },
+    ],
+    cleanup:
+      "Revoke both temporary leases; retain real message, archive and Run evidence. Never replay an uncertain stage.",
   };
 }

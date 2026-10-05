@@ -3,7 +3,11 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { observeFeature, validateFeatureAssertions } from "../lib/feature-observer.mjs";
-import { historySnippet } from "../lib/history-result.mjs";
+import {
+  historySnippet,
+  observeHistorySeedResult,
+  validateHistorySeedAssertion,
+} from "../lib/history-result.mjs";
 
 const nonce = "a".repeat(32),
   recordId = "11111111-1111-4111-8111-111111111111";
@@ -237,4 +241,106 @@ test("history result assertions reject custom recipes and missing database evide
     () => observeFeature([f.assertion], { events: f.events, runId: "run-1" }),
     /独立来源/,
   );
+});
+
+function seedFixture(t) {
+  const f = fixture(t);
+  const scope = { ...f.scope, chatType: "private", chatId: f.scope.senderId };
+  const key = JSON.stringify([
+    scope.connectionId,
+    scope.botId,
+    scope.chatType,
+    scope.chatId,
+    scope.senderId,
+    null,
+  ]);
+  f.db.prepare("INSERT INTO messages VALUES (?,?,?)").run("recall-message", "-23", key);
+  f.db
+    .prepare("INSERT INTO runs VALUES (?,?,?,?,?,?)")
+    .run(
+      "recall-run",
+      "owner",
+      "private-conversation",
+      JSON.stringify(scope),
+      "succeeded",
+      "recall-message",
+    );
+  const until = f.event.items[0].occurredAt;
+  const assertion = {
+    kind: "history_seed_result",
+    tool: "owner_history_search",
+    query: nonce,
+    groupId: "123",
+    result: "hit",
+    count: 1,
+    sourceRunId: "run-1",
+    until,
+  };
+  for (const event of f.events) {
+    event.runId = "recall-run";
+    if (event.data?.name) event.data.name = "owner_history_search";
+  }
+  f.event.conversationId = "private-conversation";
+  f.events.find((e) => e.type === "tool_call").data.input = {
+    query: nonce,
+    groupIds: ["123"],
+    limit: 1,
+    until,
+  };
+  return {
+    ...f,
+    assertion,
+    runId: "recall-run",
+    inputBinding: { time: Date.parse(until) / 1000 + 1 },
+  };
+}
+test("history seed proves a distinct earlier group input from a later private Run", (t) => {
+  const f = seedFixture(t);
+  assert.deepEqual(observeHistorySeedResult(f.assertion, f), {
+    kind: "history_seed_result",
+    result: "hit",
+    returned: 1,
+    sourceVerified: true,
+    toolOutputVerified: true,
+    distinctEarlierInput: true,
+  });
+  for (const change of [
+    (a) => (a.sourceRunId = "recall-run"),
+    (a) => (a.until = "2026-10-06T00:00:00.001Z"),
+    (a) => (a.until = "2026-10-06T00:00:01.000Z"),
+    (a) => (a.tool = "group_history_search"),
+    (a) => (a.sql = "arbitrary"),
+  ]) {
+    const a = structuredClone(f.assertion);
+    change(a);
+    assert.throws(() => observeHistorySeedResult(a, f));
+  }
+  assert.throws(() =>
+    observeHistorySeedResult(f.assertion, {
+      ...f,
+      inputBinding: { time: Date.parse(f.assertion.until) / 1000 },
+    }),
+  );
+  assert.throws(() => observeHistorySeedResult(f.assertion, { ...f, inputBinding: undefined }));
+});
+test("history seed rejects another source, actor, scope and a missing time constraint", (t) => {
+  const f = seedFixture(t);
+  const call = f.events.find((e) => e.type === "tool_call");
+  delete call.data.input.until;
+  assert.throws(() => observeHistorySeedResult(f.assertion, f));
+  call.data.input.until = f.assertion.until;
+  for (const sql of [
+    "UPDATE channel_messages SET external_message_id='-23'",
+    "UPDATE runs SET principal_id='foreign' WHERE id='run-1'",
+    "UPDATE messages SET scope_key='foreign' WHERE id='message'",
+    "UPDATE channel_messages SET occurred_at_ms=0",
+    "UPDATE channel_messages SET normalized_text='unrelated'",
+  ]) {
+    f.db.exec("SAVEPOINT invalid_source");
+    f.db.exec(sql);
+    assert.throws(() => observeHistorySeedResult(f.assertion, f));
+    f.db.exec("ROLLBACK TO invalid_source; RELEASE invalid_source");
+  }
+  const bad = { ...f.assertion, count: 2 };
+  assert.throws(() => validateHistorySeedAssertion(bad));
 });

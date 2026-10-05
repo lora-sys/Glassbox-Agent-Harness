@@ -2,7 +2,8 @@ import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
-import { validateMemoryFamily } from "./lib/feature-suite.mjs";
+import { HISTORY_SEED_FAMILY_ID } from "./lib/history-seed-workflow.mjs";
+import { validateMemoryFamily, validateHistoryFamily } from "./lib/feature-suite.mjs";
 import {
   MEMORY_FAMILY_ID,
   MEMORY_REJECT_FAMILY_ID,
@@ -543,6 +544,31 @@ export const FEATURE_CATALOG = Object.freeze({
       mutation: "none",
     },
     {
+      id: HISTORY_SEED_FAMILY_ID,
+      domain: "history_retrieval",
+      executionStatus: "executable",
+      executionKind: "history-seed",
+      suiteCaseId: HISTORY_SEED_FAMILY_ID,
+      tools: ["group_history_search", "owner_history_search"],
+      assertions: [
+        {
+          kind: "trace",
+          type: "tool_result",
+          where: { name: "group_history_search", isError: false },
+          count: 1,
+        },
+        {
+          kind: "trace",
+          type: "tool_result",
+          where: { name: "owner_history_search", isError: false },
+          count: 1,
+        },
+      ],
+      coveragePlan:
+        "Verify a real group A seed and a strictly later private recall with a fixed until bound, distinct Runs, exact source identity and protected output digest. Cross-group negatives remain separate.",
+      mutation: "none",
+    },
+    {
       id: "history-positive-and-negative-result-proof",
       domain: "history_retrieval",
       executionStatus: "planned",
@@ -976,6 +1002,21 @@ function bindMemoryFamily(testCase, suiteCases, gaps) {
 }
 
 function bindToSuiteCase(testCase, suiteCases, gaps, suiteConfig) {
+  if (testCase.executionKind === "history-seed") {
+    const matches = suiteCases.filter((c) => c?.id === HISTORY_SEED_FAMILY_ID);
+    const fixed = FEATURE_CATALOG.cases.find((c) => c.id === HISTORY_SEED_FAMILY_ID);
+    try {
+      if (matches.length !== 1 || stableJson(testCase) !== stableJson(fixed))
+        throw new Error("binding");
+      validateHistoryFamily(matches[0]);
+      if (!suiteConfig?.groups?.some((g) => g.alias === "A" && /^[1-9]\d{0,15}$/.test(g.id)))
+        throw new Error("group");
+      return true;
+    } catch {
+      gaps.push({ code: "HISTORY_FAMILY_CATALOG_BINDING_INVALID", caseId: testCase.id });
+      return false;
+    }
+  }
   if (testCase.executionKind === "memory-lifecycle")
     return bindMemoryFamily(testCase, suiteCases, gaps);
   if (testCase.executionKind !== undefined) {

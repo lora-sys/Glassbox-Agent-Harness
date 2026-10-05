@@ -188,7 +188,10 @@ function validateFreshCase(evidence, c, stage, transport, runtime, previousScope
     input.time !== transport.binding.time ||
     input.textSha256 !== transport.binding.textSha256 ||
     !reply ||
-    !MESSAGE_ID.test(String(reply.messageId ?? "")) ||
+    !MESSAGE_ID.test(String(reply.botMessageId ?? "")) ||
+    String(reply.botMessageId) !== String(delivery.external_id) ||
+    !MESSAGE_ID.test(String(reply.driverMessageId ?? "")) ||
+    String(reply.driverMessageId) !== String(transport.reply.messageId) ||
     !/^\d{1,30}$/.test(String(reply.realSequence ?? "")) ||
     !Number.isSafeInteger(reply.time) ||
     reply.textSha256 !== transport.reply.textSha256 ||

@@ -580,3 +580,6 @@ suite hash and account-local message bindings. A feature report must retain its 
 assertions and verified cleanup. Historical reports or provider probes cannot substitute for
 fresh acceptance of the final commit. Lessons may record sanitized verified findings only after
 the report hash and scoped Raw Trace evidence have been checked.
+
+
+QQ live reply binding retains the Bot-local message ID and the driver-local message ID separately. The shared sequence, QQ timestamp and full text digest prove that both receipts refer to one physical reply. Family verifiers match each local ID to its own receipt and delivery source; they never require IDs from different accounts to be equal. Old reports without this binding cannot satisfy the new family proof by adding or rewriting historical fields.

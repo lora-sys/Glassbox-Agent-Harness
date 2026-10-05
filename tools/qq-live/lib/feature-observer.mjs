@@ -1,7 +1,12 @@
 import { fail } from "./core.mjs";
 import { createHash } from "node:crypto";
 import { observeHistoryCoverage, validateHistoryCoverageAssertion } from "./history-coverage.mjs";
-import { observeHistoryResult, validateHistoryResultAssertion } from "./history-result.mjs";
+import {
+  observeHistoryResult,
+  validateHistoryResultAssertion,
+  observeHistorySeedResult,
+  validateHistorySeedAssertion,
+} from "./history-result.mjs";
 
 const TYPES = new Set([
   "tool_call",
@@ -88,6 +93,8 @@ export function validateFeatureAssertions(assertions) {
         Object.keys(a).some((k) => !["kind", "type", "where", "count"].includes(k))
       )
         fail("FEATURE_ASSERTIONS", "Trace 断言必须指定已支持的事件、字段和值及精确数量。");
+    } else if (a.kind === "history_seed_result") {
+      validateHistorySeedAssertion(a);
     } else if (a.kind === "history_result") {
       validateHistoryResultAssertion(a);
     } else if (a.kind === "history_coverage") {
@@ -113,7 +120,7 @@ export function validateFeatureAssertions(assertions) {
   return assertions;
 }
 
-export function observeFeature(assertions, { db, events, runId }) {
+export function observeFeature(assertions, { db, events, runId, inputBinding }) {
   validateFeatureAssertions(assertions);
   if (typeof runId !== "string" || !runId || !Array.isArray(events))
     fail("FEATURE_BINDING", "功能证据必须绑定唯一 Run。");
@@ -152,6 +159,8 @@ export function observeFeature(assertions, { db, events, runId }) {
         type: assertion.type,
         count: matches.length,
       });
+    } else if (assertion.kind === "history_seed_result") {
+      observations.push(observeHistorySeedResult(assertion, { db, events, runId, inputBinding }));
     } else if (assertion.kind === "history_result") {
       observations.push(observeHistoryResult(assertion, { db, events, runId }));
     } else if (assertion.kind === "history_coverage") {

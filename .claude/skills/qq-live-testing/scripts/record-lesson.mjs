@@ -496,6 +496,19 @@ export function verifyFeatureReport(report, lesson, evidence, capture = execFile
   if (trace.runId !== evidence.runId || !Array.isArray(trace.events))
     invalid("gbxtrace returned evidence for a different Run");
   const events = trace.events.map((row) => row.event);
+  if (
+    caseRecord.id === "history-seed-recall" ||
+    assertions.some((a) => a.kind === "history_seed_result") ||
+    events.some(
+      (e) =>
+        e?.runId === evidence.runId &&
+        e.type === "tool_call" &&
+        e.data?.name === "owner_history_search" &&
+        /^[a-f0-9]{32}$/.test(e.data?.input?.query ?? "") &&
+        e.data?.input?.until !== undefined,
+    )
+  )
+    invalid("Historical seed-family verification is unavailable for lessons; record a hypothesis.");
   const config = {
     runtime: {
       connectionId: evidence.scope.connectionId,
