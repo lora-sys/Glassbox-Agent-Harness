@@ -3258,11 +3258,6 @@ export class ManagementApplication {
             runId: accepted.run.id,
           };
           if (this.qqLiveLeases.bindRun(binding)) {
-            this.qqLiveRunBindings.set(accepted.run.id, {
-              ...binding,
-              marker: leaseResolution.marker,
-              toolsSha256: leaseResolution.toolsSha256,
-            });
             await appendQqLiveAcceptanceAudit(this.options.dataDirectory, {
               event: "run_bound",
               messageId: message.messageId,
@@ -3271,6 +3266,21 @@ export class ManagementApplication {
               leaseId: leaseResolution.leaseId,
               toolsSha256: leaseResolution.toolsSha256,
             }).catch(() => undefined);
+            this.qqLiveRunBindings.set(accepted.run.id, {
+              ...binding,
+              marker: leaseResolution.marker,
+              toolsSha256: leaseResolution.toolsSha256,
+            });
+            const boundRun = await this.store.conversations
+              .getRun(accepted.caller, accepted.run.id)
+              .catch(() => undefined);
+            if (
+              !boundRun ||
+              (boundRun.status !== "queued" &&
+                boundRun.status !== "running" &&
+                boundRun.status !== "cancelling")
+            )
+              await this.revokeQqLiveRunBinding(accepted.run.id);
           } else {
             await appendQqLiveAcceptanceAudit(this.options.dataDirectory, {
               event: "message_denied",

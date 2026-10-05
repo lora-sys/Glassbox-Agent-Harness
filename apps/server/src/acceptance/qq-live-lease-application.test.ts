@@ -130,6 +130,83 @@ describe("QQ live lease application wiring", () => {
     expect(internals.qqLiveRunBindings.has(latest.id)).toBe(false);
   });
 
+  it("revokes a lease when a queued Run finishes before its binding is recorded", async () => {
+    const fixture = await fixtures.fixture(
+      async (input) => ({ status: "succeeded", text: input.text }),
+      { executionRef: "pi:lease-fixture", piModelProfile },
+    );
+    const marker = "fedcba0987654321fedcba0987654321";
+    const text = `GLASSBOX_ACCEPTANCE_V1 ${marker}\nReply with one word.`;
+    const registration = await fixture.app.registerQqLiveLease({
+      scope: {
+        connectionId: "fixture",
+        botId: "10001",
+        chatType: "private",
+        chatId: "10002",
+        senderId: "10002",
+      },
+      marker,
+      textSha256: canonicalQqLiveTextSha256(text),
+      ttlMs: 60_000,
+      expiresAt: Date.now() + 60_000,
+      tools: [],
+    });
+    const conversations = fixture.app.store.conversations;
+    const acceptIncoming = conversations.acceptIncoming.bind(conversations);
+    let completeInterleaving!: (result: { runId: string; error?: unknown }) => void;
+    const interleavingComplete = new Promise<{ runId: string; error?: unknown }>(
+      (resolve) => (completeInterleaving = resolve),
+    );
+    vi.spyOn(conversations, "acceptIncoming").mockImplementation(async (input) => {
+      const accepted = await acceptIncoming(input);
+      try {
+        await fixture.app.runs.enqueueAccepted(accepted);
+        const terminalRun = await fixture.app.runs.waitForRun(accepted.caller, accepted.run.id);
+        expect(terminalRun).toMatchObject({ status: "failed", failureCode: "gate_refused" });
+        await fixture.app.runs.drain();
+        completeInterleaving({ runId: accepted.run.id });
+      } catch (error) {
+        completeInterleaving({ runId: accepted.run.id, error });
+      }
+      return accepted;
+    });
+
+    fixture.send(705, text, true);
+    const interleaving = await interleavingComplete;
+    if (interleaving.error) throw interleaving.error;
+    const terminalRunId = interleaving.runId;
+    await vi.waitFor(async () => {
+      const audit = await readFile(
+        join(fixture.directory, "qq-live-acceptance-audit.jsonl"),
+        "utf8",
+      );
+      expect(audit).toContain('"event":"run_bound"');
+      expect(audit).toContain('"event":"lease_revoked"');
+    });
+
+    const internals = fixture.app as unknown as {
+      qqLiveLeases: QqLiveLeaseRegistry;
+      qqLiveRunBindings: Map<string, unknown>;
+    };
+    const acceptedScope = {
+      connectionId: "fixture",
+      botId: "10001",
+      chatType: "private" as const,
+      chatId: "10002",
+      senderId: "10002",
+    };
+    expect(
+      internals.qqLiveLeases.isActive({
+        leaseId: registration.leaseId,
+        principalId: "owner",
+        scope: acceptedScope,
+        messageId: "705",
+        runId: terminalRunId!,
+      }),
+    ).toBe(false);
+    expect(internals.qqLiveRunBindings.has(terminalRunId!)).toBe(false);
+  });
+
   it("cancels a registration held across async Owner resolution", async () => {
     const fixture = await fixtures.fixture(
       async (input) => ({ status: "succeeded", text: input.text }),
