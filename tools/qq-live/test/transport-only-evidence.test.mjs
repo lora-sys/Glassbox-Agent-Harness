@@ -17,6 +17,20 @@ function hash(text) {
   return createHash("sha256").update(text).digest("hex");
 }
 
+function emptyEffectiveToolSurface() {
+  return {
+    profileName: "main-agent",
+    profileTools: ["qq_group_history"],
+    profileVersion: "test-profile-version",
+    policyVersion: "tool-surface-policy-v1",
+    selected: [],
+    excluded: [],
+    disabledByHost: [],
+    undescribed: [],
+    generatedAt: new Date().toISOString(),
+  };
+}
+
 async function fixture(t) {
   const directory = await mkdtemp(join(tmpdir(), "qq-transport-evidence-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
@@ -243,7 +257,7 @@ async function fixture(t) {
         type: "session_start",
         data: {
           authorizedTools: [],
-          toolSurface: { selectedCount: 0 },
+          toolSurface: emptyEffectiveToolSurface(),
           acceptanceLease: {
             leaseId,
             marker: token,
@@ -383,6 +397,44 @@ test("transport evidence refuses any visible or called Tool and preserves cleanu
     verifyTransportOnlyCaseEvidence(f.cases[0], f.config, f.clients, f.expectedRuntime, f.capture),
     (error) => error.code === "TRANSPORT_TOOL_CALL" && error.cleanupVerified === true,
   );
+});
+
+test("transport evidence requires an actual empty selected array when toolSurface is present", async (t) => {
+  const f = await fixture(t);
+  const session = f.traces.get("transport-1").find((event) => event.type === "session_start");
+  const emptySurface = session.data.toolSurface;
+  session.data.toolSurface = {
+    ...emptySurface,
+    selected: [{ name: "ops_status" }],
+    selectedCount: 0,
+  };
+  await assert.rejects(
+    verifyTransportOnlyCaseEvidence(f.cases[0], f.config, f.clients, f.expectedRuntime, f.capture),
+    (error) => error.code === "TRANSPORT_TOOL_SURFACE" && error.cleanupVerified === true,
+  );
+
+  session.data.toolSurface = { ...emptySurface };
+  delete session.data.toolSurface.selected;
+  await assert.rejects(
+    verifyTransportOnlyCaseEvidence(f.cases[0], f.config, f.clients, f.expectedRuntime, f.capture),
+    (error) => error.code === "TRANSPORT_TOOL_SURFACE" && error.cleanupVerified === true,
+  );
+
+  session.data.toolSurface = { ...emptySurface, selected: "ops_status" };
+  await assert.rejects(
+    verifyTransportOnlyCaseEvidence(f.cases[0], f.config, f.clients, f.expectedRuntime, f.capture),
+    (error) => error.code === "TRANSPORT_TOOL_SURFACE" && error.cleanupVerified === true,
+  );
+
+  delete session.data.toolSurface;
+  const result = await verifyTransportOnlyCaseEvidence(
+    f.cases[0],
+    f.config,
+    f.clients,
+    f.expectedRuntime,
+    f.capture,
+  );
+  assert.equal(result.runId, "transport-1");
 });
 
 test("transport cleanup fails closed when its persistent lease audit is missing", async (t) => {

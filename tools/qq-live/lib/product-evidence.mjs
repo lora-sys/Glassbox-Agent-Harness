@@ -394,6 +394,14 @@ export function verifyTransportOnlyLeaseTraceEvidence(events, caseRecord, runId)
     (event) => event.runId === runId && ["tool_call", "tool_result"].includes(event.type),
   );
   const lease = sessions.length === 1 ? sessions[0].data?.acceptanceLease : undefined;
+  const toolSurface = sessions.length === 1 ? sessions[0].data?.toolSurface : undefined;
+  const invalidToolSurface =
+    toolSurface !== undefined &&
+    (!toolSurface ||
+      typeof toolSurface !== "object" ||
+      Array.isArray(toolSurface) ||
+      !Array.isArray(toolSurface.selected) ||
+      toolSurface.selected.length !== 0);
   if (
     caseRecord.transportOnly !== true ||
     !Array.isArray(caseRecord.leasedToolNames) ||
@@ -408,8 +416,7 @@ export function verifyTransportOnlyLeaseTraceEvidence(events, caseRecord, runId)
     lease.narrowedTools.length !== 0 ||
     !Array.isArray(sessions[0].data?.authorizedTools) ||
     sessions[0].data.authorizedTools.length !== 0 ||
-    (sessions[0].data?.toolSurface !== undefined &&
-      sessions[0].data.toolSurface.selectedCount !== 0)
+    invalidToolSurface
   )
     fail("TRANSPORT_TOOL_SURFACE", "当前 Run 未证明固定的空模型工具面。", "INCONCLUSIVE");
   if (calls.length) fail("TRANSPORT_TOOL_CALL", "空工具面传输用例记录到了工具调用。", "FAIL");
