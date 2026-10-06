@@ -5,6 +5,7 @@ import { fail } from "./core.mjs";
 import { memoryFixtureStep } from "./memory-scenario.mjs";
 import { resolveReadFeatureSpecs } from "./feature-specs.mjs";
 import { MEMORY_FAMILY_ID, memoryWorkflow } from "./memory-workflow.mjs";
+import { TASTE_FAMILY_ID, tasteFamilyPlan } from "./taste-scenario.mjs";
 
 export { MEMORY_FAMILY_ID, MEMORY_REJECT_FAMILY_ID } from "./memory-workflow.mjs";
 
@@ -55,6 +56,36 @@ export function validateMemoryFamily(value) {
   return value;
 }
 
+export function validateTasteFamily(value) {
+  const plan = tasteFamilyPlan();
+  const expectedStages = [
+    ["taste-feedback", "memory:write"],
+    ["taste-promote", "memory:govern"],
+    ["taste-negative-feedback", "memory:write"],
+    ["taste-retire", "memory:govern"],
+  ];
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.keys(value).sort().join(",") !== "chat,id,kind" ||
+    value.id !== TASTE_FAMILY_ID ||
+    value.kind !== "taste-lifecycle" ||
+    value.chat !== "private" ||
+    plan.familyId !== TASTE_FAMILY_ID ||
+    plan.stages.length !== expectedStages.length ||
+    plan.stages.some(
+      (stage, index) =>
+        stage.id !== expectedStages[index][0] ||
+        stage.action !== expectedStages[index][1] ||
+        stage.route !== "private" ||
+        stage.tool !== "owner_memory_admin",
+    )
+  )
+    fail("FEATURE_TASTE_FAMILY", "Taste family must match the fixed four-stage lifecycle.");
+  return value;
+}
+
 function uniqueCaseIds(cases) {
   if (!Array.isArray(cases) || cases.length === 0)
     fail("FEATURE_SUITE", "Feature suite needs at least one case.");
@@ -71,10 +102,16 @@ function uniqueCaseIds(cases) {
 export function resolveFeatureSuite(raw, config) {
   if (raw?.schemaVersion === 2) {
     const readCases = resolveReadFeatureSpecs(raw, config);
-    return { cases: readCases, readCases, memoryFamilies: [], historyFamilies: [] };
+    return {
+      cases: readCases,
+      readCases,
+      memoryFamilies: [],
+      historyFamilies: [],
+      tasteFamilies: [],
+    };
   }
-  if (![3, 4, 5].includes(raw?.schemaVersion))
-    fail("FEATURE_SUITE", "Feature suite schemaVersion must be 2, 3, 4 or 5.");
+  if (![3, 4, 5, 6].includes(raw?.schemaVersion))
+    fail("FEATURE_SUITE", "Feature suite schemaVersion must be 2, 3, 4, 5 or 6.");
   if (
     !raw ||
     typeof raw !== "object" ||
@@ -89,6 +126,9 @@ export function resolveFeatureSuite(raw, config) {
   const historyFamilies = raw.cases.filter((item) =>
     ["history-seed", "history-isolation"].includes(item.kind),
   );
+  const tasteFamilies = raw.cases.filter((item) => item.kind === "taste-lifecycle");
+  if (raw.schemaVersion !== 6 && tasteFamilies.length)
+    fail("FEATURE_TASTE_FAMILY", "Taste lifecycle family requires schema 6.");
   if (raw.schemaVersion === 4) {
     if (historyFamilies.length !== 1)
       fail("FEATURE_HISTORY_FAMILY", "Schema 4 requires the fixed history seed family.");
@@ -103,14 +143,25 @@ export function resolveFeatureSuite(raw, config) {
     if (historyFamilies.some((family) => family.kind === "history-seed")) historySeedSpec(config);
     if (historyFamilies.some((family) => family.kind === "history-isolation"))
       historyIsolationSeedSpec({ config, sentinel: `qq-isolation-secret-${"0".repeat(32)}` });
+  } else if (raw.schemaVersion === 6) {
+    if (historyFamilies.length > 2)
+      fail("FEATURE_HISTORY_FAMILY", "Schema 6 supports only the fixed history families.");
+    historyFamilies.forEach(validateHistoryFamily);
+    if (historyFamilies.some((family) => family.kind === "history-seed")) historySeedSpec(config);
+    if (historyFamilies.some((family) => family.kind === "history-isolation"))
+      historyIsolationSeedSpec({ config, sentinel: `qq-isolation-secret-${"0".repeat(32)}` });
+    if (tasteFamilies.length !== 1)
+      fail("FEATURE_TASTE_FAMILY", "Schema 6 requires exactly one fixed Taste lifecycle family.");
+    tasteFamilies.forEach(validateTasteFamily);
   } else if (historyFamilies.length)
-    fail("FEATURE_HISTORY_FAMILY", "History family requires schema 4.");
+    fail("FEATURE_HISTORY_FAMILY", "History family requires schema 4, 5 or 6.");
   const families = raw.cases.filter((item) => item.kind === "memory-lifecycle");
   if ((raw.schemaVersion === 3 && families.length < 1) || families.length > 2)
-    fail("FEATURE_MEMORY_FAMILY", "Schema 3 requires one or both fixed Memory families.");
+    fail("FEATURE_MEMORY_FAMILY", "Suite accepts only the fixed Memory families.");
   families.forEach(validateMemoryFamily);
   const readTemplates = raw.cases.filter(
-    (item) => !families.includes(item) && !historyFamilies.includes(item),
+    (item) =>
+      !families.includes(item) && !historyFamilies.includes(item) && !tasteFamilies.includes(item),
   );
   const readCases = readTemplates.length
     ? resolveReadFeatureSpecs({ schemaVersion: 2, cases: readTemplates }, config)
@@ -118,11 +169,14 @@ export function resolveFeatureSuite(raw, config) {
   const resolvedReads = new Map(readCases.map((item) => [item.id, item]));
   return {
     cases: raw.cases.map((item) =>
-      families.includes(item) || historyFamilies.includes(item) ? item : resolvedReads.get(item.id),
+      families.includes(item) || historyFamilies.includes(item) || tasteFamilies.includes(item)
+        ? item
+        : resolvedReads.get(item.id),
     ),
     readCases,
     memoryFamilies: families,
     historyFamilies,
+    tasteFamilies,
   };
 }
 

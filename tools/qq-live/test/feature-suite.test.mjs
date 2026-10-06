@@ -6,13 +6,20 @@ import {
   memoryFamilyPlan,
   resolveFeatureSuite,
   validateMemoryFamily,
+  validateTasteFamily,
 } from "../lib/feature-suite.mjs";
+import { TASTE_FAMILY_ID, tasteFamilyPlan } from "../lib/taste-scenario.mjs";
 
 const config = { groups: [] };
 const memoryFamily = () => ({
   id: MEMORY_FAMILY_ID,
   kind: "memory-lifecycle",
   workflow: "promote-expire",
+  chat: "private",
+});
+const tasteFamily = () => ({
+  id: TASTE_FAMILY_ID,
+  kind: "taste-lifecycle",
   chat: "private",
 });
 const readCase = (id = "ops-status") => ({
@@ -238,5 +245,75 @@ test("schema 5 binds both fixed history families while schema 4 stays unchanged"
         ],
       },
     ),
+  );
+});
+
+test("schema 6 requires one exact Taste family and composes fixed read, Memory and history cases", () => {
+  const taste = tasteFamily();
+  const old = { id: "history-group-seed-private-recall", kind: "history-seed", chat: "A" };
+  const isolation = { id: "history-cross-group-isolation", kind: "history-isolation", chat: "B" };
+  const cfg = {
+    groups: [
+      { alias: "A", id: "10001" },
+      { alias: "B", id: "10002" },
+    ],
+  };
+  const read = readCase();
+  const resolvedTasteOnly = resolveFeatureSuite({ schemaVersion: 6, cases: [taste] }, config);
+  assert.deepEqual(resolvedTasteOnly.tasteFamilies, [taste]);
+  assert.deepEqual(resolvedTasteOnly.memoryFamilies, []);
+  assert.deepEqual(resolvedTasteOnly.historyFamilies, []);
+  assert.deepEqual(resolvedTasteOnly.readCases, []);
+
+  const resolved = resolveFeatureSuite(
+    { schemaVersion: 6, cases: [read, memoryFamily(), old, isolation, taste] },
+    cfg,
+  );
+  assert.deepEqual(
+    resolved.cases.map((item) => item.id),
+    ["ops-status", MEMORY_FAMILY_ID, old.id, isolation.id, TASTE_FAMILY_ID],
+  );
+  assert.deepEqual(resolved.tasteFamilies, [taste]);
+  assert.equal(resolved.memoryFamilies.length, 1);
+  assert.equal(resolved.historyFamilies.length, 2);
+  assert.deepEqual(
+    tasteFamilyPlan().stages.map((stage) => stage.id),
+    ["taste-feedback", "taste-promote", "taste-negative-feedback", "taste-retire"],
+  );
+  assert.equal(validateTasteFamily(taste), taste);
+});
+
+test("Taste suite family is schema 6 only and cannot be extended or omitted", () => {
+  const valid = tasteFamily();
+  for (const changed of [
+    { ...valid, id: "arbitrary-taste" },
+    { ...valid, kind: "memory-lifecycle" },
+    { ...valid, chat: "A" },
+    { ...valid, workflow: "feedback-only" },
+    { ...valid, stages: ["feedback"] },
+  ])
+    assert.throws(() => validateTasteFamily(changed), { code: "FEATURE_TASTE_FAMILY" });
+  for (const schemaVersion of [2, 3, 4, 5]) {
+    if (schemaVersion === 2)
+      assert.throws(() => resolveFeatureSuite({ schemaVersion, cases: [valid] }, config));
+    else
+      assert.throws(() => resolveFeatureSuite({ schemaVersion, cases: [valid] }, config), {
+        code: "FEATURE_TASTE_FAMILY",
+      });
+  }
+  assert.throws(() => resolveFeatureSuite({ schemaVersion: 6, cases: [readCase()] }, config), {
+    code: "FEATURE_TASTE_FAMILY",
+  });
+  assert.throws(
+    () =>
+      resolveFeatureSuite(
+        { schemaVersion: 6, cases: [valid, { ...valid, id: "duplicate" }] },
+        config,
+      ),
+    { code: "FEATURE_TASTE_FAMILY" },
+  );
+  assert.throws(
+    () => resolveFeatureSuite({ schemaVersion: 6, cases: [valid, { ...valid }] }, config),
+    { code: "FEATURE_CASE" },
   );
 });

@@ -10,16 +10,92 @@ import { DatabaseSync } from "node:sqlite";
 import { digest, fail, safeError } from "./core.mjs";
 import { resolveFeatureSuite } from "./feature-suite.mjs";
 import { evaluateDeliveryGate } from "./delivery-gate.mjs";
-import { verifyProductEvidence } from "./product-evidence.mjs";
+import { verifyProductEvidence, runtimeSnapshot } from "./product-evidence.mjs";
+import { verifyTasteFamilyReport } from "./taste-family-evidence.mjs";
+import { observeTasteFixture } from "./taste-fixture.mjs";
 import { verifyHistoryFamilyReport } from "./history-family-evidence.mjs";
 import { verifyMemoryFamilyReport } from "./memory-family-evidence.mjs";
 import { verifyMemoryCleanup } from "./memory-fixture.mjs";
 import { OneBot } from "./onebot.mjs";
 import { doctor } from "./runner.mjs";
 import { FEATURE_CATALOG, checkRepositoryFeatureCoverage } from "../feature-catalog.mjs";
+import {
+  deriveAgentReviewBinding,
+  readVerifiedAgentReview,
+  recordAgentReviewCli as recordAgentReview,
+} from "./agent-review-cli.mjs";
+import { readAgentReviewRecord, defaultAgentReviewStoreDirectory } from "./agent-review-store.mjs";
+import { verifyAgentReviewReceipt } from "./agent-review-receipt.mjs";
 
 const runFile = promisify(execFile);
 const repositoryRoot = fileURLToPath(new URL("../../../", import.meta.url));
+
+export async function recordAgentReviewCli(config, options, out) {
+  return recordAgentReview(config, options, {
+    cwd: repositoryRoot,
+    homeDirectory: homedir(),
+    out,
+  });
+}
+
+async function verifyStoredPostMergeReview({
+  attempt,
+  github,
+  remote,
+  local,
+  homeDirectory = homedir(),
+}) {
+  const evidence = attempt.reviewEvidence;
+  if (evidence?.kind !== "agent-review-receipt") return null;
+  if (!/^[a-f0-9]{64}$/.test(evidence.bindingSha256 ?? ""))
+    fail("POST_MERGE_REVIEW", "The merge attempt has no valid original review binding.");
+  const stored = await readAgentReviewRecord({
+    directory: defaultAgentReviewStoreDirectory(homeDirectory),
+    repositoryRoot,
+    bindingSha256: evidence.bindingSha256,
+  });
+  if (!stored) fail("POST_MERGE_REVIEW", "The original candidate review receipt is missing.");
+  const original = stored.receipt?.binding;
+  if (
+    original?.candidateCommit !== remote.headCommit ||
+    original?.repository !== `https://github.com/${remote.repoIdentity}` ||
+    original?.pullRequestNumber !== remote.pr?.number ||
+    original?.pullRequestUrl !== remote.pullRequestUrl
+  )
+    fail("POST_MERGE_REVIEW", "The stored review does not bind the merged PR candidate.");
+  const parents = (
+    await runFile("git", ["rev-list", "--parents", "-n", "1", local.commit], {
+      cwd: repositoryRoot,
+    })
+  ).stdout
+    .trim()
+    .split(/\s+/);
+  if (parents[1] !== original.baseCommit)
+    fail(
+      "POST_MERGE_REVIEW",
+      "The original review base is not the first parent of this squash merge.",
+    );
+  const binding = await deriveAgentReviewBinding({
+    github,
+    remote,
+    cwd: repositoryRoot,
+    candidateCommit: remote.headCommit,
+    baseCommit: original.baseCommit,
+    allowMerged: true,
+    expectedLocalCommit: local.commit,
+  });
+  const verified = verifyAgentReviewReceipt({
+    receipt: stored.receipt,
+    artifactBytes: stored.artifactBytes,
+    expected: binding,
+  });
+  if (
+    verified.receiptSha256 !== evidence.receiptSha256 ||
+    verified.artifactSha256 !== evidence.artifactSha256
+  )
+    fail("POST_MERGE_REVIEW", "The original candidate review evidence changed after merge.");
+  return { ...verified, candidateCommit: remote.headCommit };
+}
 
 export async function readDeliveryJson(path, maximum = 1024 * 1024) {
   const info = await lstat(path);
@@ -119,6 +195,11 @@ async function absent(path, code) {
   fail(code, "存在停止或未完成记录，交付不能继续。");
 }
 
+export async function assertNoPendingAcceptanceFixtures(lockRoot, account) {
+  await absent(join(lockRoot, `${account}.memory-pending.json`), "MEMORY_FIXTURE_PENDING");
+  await absent(join(lockRoot, `${account}.taste-pending.json`), "TASTE_FIXTURE_PENDING");
+}
+
 async function releaseOwnedLock(lock, lockPath) {
   const owned = await lock.stat();
   await lock.close();
@@ -189,7 +270,7 @@ export async function runDeliveryCli(config, options, out) {
   await mkdir(lockRoot, { recursive: true, mode: 0o700 });
   const account = digest(config.driver.qq).slice(0, 24);
   const lockPath = join(lockRoot, `${account}.lock`);
-  await absent(join(lockRoot, `${account}.memory-pending.json`), "MEMORY_FIXTURE_PENDING");
+  await assertNoPendingAcceptanceFixtures(lockRoot, account);
   await absent(join(out, "STOP"), "SAFETY_STOP");
   let lock;
   try {
@@ -247,6 +328,22 @@ export async function runDeliveryCli(config, options, out) {
     await clients.bot.connect();
     await doctor(config, clients);
     const verifyReport = (report) => verifyProductEvidence(report, config, clients);
+    const verifyTasteReport = (report) =>
+      verifyTasteFamilyReport(report, {
+        config,
+        verifyProduct: verifyReport,
+        readRuntime: () => runtimeSnapshot(config.runtime),
+        readFixture: (input) => {
+          const db = new DatabaseSync(join(config.runtime.dataDirectory, "glassbox.db"), {
+            readOnly: true,
+          });
+          try {
+            return observeTasteFixture(db, input);
+          } finally {
+            db.close();
+          }
+        },
+      });
     const verifyHistoryReport = (report) =>
       (report.historyFamily?.caseId === "history-cross-group-isolation"
         ? verifyHistoryIsolationFamilyReport
@@ -276,10 +373,11 @@ export async function runDeliveryCli(config, options, out) {
       acceptanceIdentitySha256,
     };
     const attemptPath = join(lockRoot, `merge-${digest(github.pullRequestUrl)}.json`);
+    let postMergeAttempt = null;
     const readRemoteEvidence = () => readDeliveryRemoteEvidence(github, local.commit, postMerge);
     const evaluateGate = async () => {
       await absent(join(out, "STOP"), "SAFETY_STOP");
-      await absent(join(lockRoot, `${account}.memory-pending.json`), "MEMORY_FIXTURE_PENDING");
+      await assertNoPendingAcceptanceFixtures(lockRoot, account);
       for (const path of paths) {
         await absent(join(dirname(path), "STOP"), "SAFETY_STOP");
         await absent(join(dirname(dirname(path)), "STOP"), "SAFETY_STOP");
@@ -303,6 +401,32 @@ export async function runDeliveryCli(config, options, out) {
           verifyReport,
           verifyMemoryReport,
           verifyHistoryReport,
+          verifyTasteReport,
+          verifyAgentReview: async ({ commit, remote: freshRemote }) => {
+            if (postMerge) {
+              if (!postMergeAttempt) return null;
+              return verifyStoredPostMergeReview({
+                attempt: postMergeAttempt,
+                github,
+                remote: freshRemote,
+                local,
+              });
+            }
+            if (commit !== freshRemote.headCommit) return null;
+            const reviewBinding = await deriveAgentReviewBinding({
+              github,
+              remote: freshRemote,
+              cwd: repositoryRoot,
+            });
+            const verified = await readVerifiedAgentReview({
+              binding: reviewBinding,
+              repositoryRoot,
+              homeDirectory: homedir(),
+            });
+            return verified
+              ? { ...verified, candidateCommit: reviewBinding.candidateCommit }
+              : null;
+          },
           readRemote: readRemoteEvidence,
           resolveRoute: (alias) =>
             alias === "private" ? "private" : config.groups.find((g) => g.alias === alias)?.id,
@@ -310,12 +434,15 @@ export async function runDeliveryCli(config, options, out) {
       );
     };
     if (postMerge) {
-      const attemptId = verifyPostMergeAttempt(await readDeliveryJson(attemptPath, 65536), {
+      postMergeAttempt = await readDeliveryJson(attemptPath, 65536);
+      const attemptId = verifyPostMergeAttempt(postMergeAttempt, {
         prUrl: github.pullRequestUrl,
         candidateCommit: remote.headCommit,
         suiteSha256,
         acceptanceIdentitySha256,
       });
+      if (postMergeAttempt.reviewEvidence?.kind === "agent-review-receipt")
+        await verifyStoredPostMergeReview({ attempt: postMergeAttempt, github, remote, local });
       const gate = await evaluateGate();
       const current = await readLocalHead();
       if (!current.clean || current.commit !== local.commit)

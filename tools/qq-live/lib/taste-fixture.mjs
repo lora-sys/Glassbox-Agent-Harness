@@ -205,7 +205,7 @@ function promotionRow(
   };
 }
 
-function pendingCounts(db, principalId, projectId) {
+export function pendingCounts(db, principalId, projectId) {
   const rows = db
     .prepare(
       `SELECT

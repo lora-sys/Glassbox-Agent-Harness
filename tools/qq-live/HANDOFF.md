@@ -62,12 +62,9 @@ schemaVersion 3 套件可同时包含推广后过期和 memory-project-feedback-
 
 合并结果不是最终验收。获取实际 mergeCommit，将原验收 checkout 和共享服务切换到该提交，保留账号、测试群、数据目录、NapCat 和原生 Pi 配置。重新运行完整套件，再运行 postmerge-check。消息必须在合并后新发，Run 必须属于实际合并提交。原候选提交的报告不能替代合并后报告。只有全部证据核对通过才能报告 DELIVERED。
 
-
 固定旧消息回查使用 schemaVersion 4 套件中的 `history-group-seed-private-recall`。先 plan 审阅 `feature-baseline.example.json`，再逐个用例运行并批准原文件哈希。第一条群 A 输入必须通过当前消息归档命中检查。第二条 Owner 私聊只查第一条编号，并把 until 固定到第一条实际 QQ 时间。第二条输入同秒时停止，不重发。报告和交付门禁必须重建来源关系、重新读取两轮产品证据，不能用单个回查 Run 代替完整流程。群 B 隔离另有固定流程，其他未完成领域仍阻塞完整覆盖门禁。此流程尚未通过真实 QQ 验收。
 
-
 跨群流程是 schemaVersion 5 中的 `history-cross-group-isolation`。baseline 文件同时保留群 A 旧消息回查。跨群流程先验证群 B 的实际输入，再在 Owner 私聊仅查询群 A。最终校验将测试内容摘要、来源 Run 和实际时间重新绑定到第一步输入，独立重核两步 Trace、归档和回复，并确认两项临时许可撤销。目录仅声明这项范围隔离覆盖，授权撤销拒绝和其他完整历史用例仍未完成。当前两套 QQ 登录均需手机扫码，不能把本地模拟结果称为实机通过。
-
 
 功能验收还会独立读取持久化许可审计，核对同一许可的注册、Run 绑定和撤销记录。记录必须对应本轮编号、工具摘要、Owner、消息范围、输入摘要和 Run，并按顺序产生。报告里的已撤销字段不能单独作为清理证据。审计缺失、不完整或不一致时停止验收并保留 STOP，不能继续发送下一步消息或合并。
 
@@ -82,3 +79,5 @@ schemaVersion 3 套件可同时包含推广后过期和 memory-project-feedback-
 群信息输出预览仍限制为 512 字节。运行时从实际完整工具结果生成固定 groupInfo 字段和完整输出摘要。核验器在预览截断时要求这份独立字段证据，不扩大预览。实际双端回复必须是 QQGROUPINFO 测试编号 count=人数 capacity=容量 的单行纯文本，数量须与工具证据一致。添加文字、媒体消息段或其他字段都不能通过。
 
 The fixed group A root-files read adds exact Owner-private group:files:read narrowing with no arbitrary file IDs, folders, URL resolution or mutations. Runtime groupFiles evidence derives counts and a canonical digest of validated complete returned page data from the actual protected content/details wrapper. The existing full output SHA256/byte count and 512-byte preview remain intact. A separate fixed Bot read must match the page digest and counts. The two account-local actual replies must satisfy the fixed count-only format. Default provider paging is limited to 50 entries at startIndex 0, as recorded in the pinned NapCat GetGroupRootFiles source. This operation supplies no total-directory completeness witness, so directory traversal and wider file coverage remain planned. Changed metadata, malformed entries and unavailable reads cannot pass. Historical root-list lessons remain hypotheses pending an independent historical witness. No ordinary grants, native Pi configuration or locked skill core change.
+
+Agent review recording requires Linux or WSL directory durability; Windows recording returns BLOCKED. Agent review records use the explicit record-agent-review command. Its preview binds the current repository, PR, base, head, tree, complete binary diff and changed paths. Recording requires the exact binding hash and an independently produced full-diff review artifact stored outside the checkout. The private immutable record and raw artifact are re-read at the final gate and again for post-merge candidate review proof. This is a trusted host-operator attestation, not cryptographic identity authentication. Formal GitHub approval remains supported. Current-head changes requests and actual GitHub branch rules remain enforced. Review evidence never substitutes for coverage, fresh QQ acceptance, CI or existing user merge authorization. Do not register this in-progress implementation as reviewed before its final independent review.

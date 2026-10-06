@@ -42,6 +42,7 @@ function requireStep(result, spec) {
 export async function runTasteLifecycle({
   fixtureNonce,
   executeStep,
+  confirmKnownFailure,
   observeStep,
   checkpoint,
   readRuntime,
@@ -50,6 +51,9 @@ export async function runTasteLifecycle({
   const handles = { fixtureNonce, projectId: `qqtest-${fixtureNonce}` };
   const steps = [];
   let stage = STAGES[0];
+  let currentSpec;
+  let currentResult;
+  let currentTransportCase;
   let runtime;
   try {
     if (!/^[a-f0-9]{32}$/.test(fixtureNonce ?? ""))
@@ -85,10 +89,25 @@ export async function runTasteLifecycle({
       if (signal?.aborted) fail("TASTE_ABORTED", "偏好流程已停止。", "INCONCLUSIVE");
       await checkRuntime();
       const spec = tasteFixtureStep(stage, { nonce: fixtureNonce, ...handles });
+      currentSpec = spec;
       await save("before_send");
       if (signal?.aborted) fail("TASTE_ABORTED", "偏好流程已停止。", "INCONCLUSIVE");
       await checkRuntime();
       const result = await executeStep(stage, structuredClone(spec));
+      currentResult = result;
+      currentTransportCase = result?.transportCase;
+      if (
+        result?.transportCase?.status === "FAIL" &&
+        result.transportCase.code === "REPLY_ASSERTION_FAILED"
+      ) {
+        return await confirmFailure(
+          stage,
+          spec,
+          result.transportCase,
+          "REPLY_ASSERTION_FAILED",
+          handles,
+        );
+      }
       const evidence = requireStep(result, spec);
       if (steps.some((step) => step.runId === evidence.runId))
         fail("TASTE_RUN_REUSE", "偏好步骤必须使用不同 Run。", "INCONCLUSIVE");
@@ -113,7 +132,7 @@ export async function runTasteLifecycle({
           !CANDIDATE.test(observed.candidateId ?? "") ||
           observed.candidateStatus !== "pending"
         )
-          fail("TASTE_FEEDBACK", "正反馈未创建本轮待确认候选。", "INCONCLUSIVE");
+          fail("TASTE_FEEDBACK", "正反馈未创建本轮待确认候选。", "FAIL");
         Object.assign(handles, {
           creationRunId: evidence.runId,
           candidateId: observed.candidateId,
@@ -130,7 +149,7 @@ export async function runTasteLifecycle({
             !MEMORY.test(observed.memoryId ?? "") ||
             observed.lifecycleState !== "active"
           )
-            fail("TASTE_PROMOTE", "偏好确认未创建本轮有效记录。", "INCONCLUSIVE");
+            fail("TASTE_PROMOTE", "偏好确认未创建本轮有效记录。", "FAIL");
           Object.assign(handles, { promotionRunId: evidence.runId, memoryId: observed.memoryId });
         } else {
           if (
@@ -146,7 +165,7 @@ export async function runTasteLifecycle({
               observed.correctionStatus !== "pending" ||
               observed.lifecycleState !== "active"
             )
-              fail("TASTE_NEGATIVE", "负反馈未创建独立修正候选或提前改变偏好。", "INCONCLUSIVE");
+              fail("TASTE_NEGATIVE", "负反馈未创建独立修正候选或提前改变偏好。", "FAIL");
             Object.assign(handles, {
               negativeRunId: evidence.runId,
               correctionCandidateId: observed.correctionCandidateId,
@@ -160,7 +179,7 @@ export async function runTasteLifecycle({
             observed.activeCount !== 0 ||
             observed.pendingCount !== 0
           ) {
-            fail("TASTE_RETIRE", "偏好退役或完整测试资源清理未获证明。", "INCONCLUSIVE");
+            fail("TASTE_RETIRE", "偏好退役或完整测试资源清理未获证明。", "FAIL");
           } else handles.cleanupRunId = evidence.runId;
         }
       }
@@ -182,13 +201,82 @@ export async function runTasteLifecycle({
       cleanup: { status: "retired", runId: handles.cleanupRunId },
     };
   } catch (error) {
+    let terminalError = error;
+    const safe = safeError(error);
+    if (
+      safe.status === "FAIL" &&
+      [
+        "TASTE_FEEDBACK",
+        "TASTE_PROMOTE",
+        "TASTE_NEGATIVE",
+        "TASTE_MEMORY",
+        "TASTE_RETIRE",
+        "TASTE_FIXTURE_FEEDBACK",
+        "TASTE_FIXTURE_PROMOTE",
+        "TASTE_FIXTURE_NEGATIVE",
+        "TASTE_FIXTURE_CLEANUP",
+      ].includes(safe.code) &&
+      currentTransportCase?.status === "PASS" &&
+      currentResult?.productAcceptance?.status === "PASS"
+    ) {
+      try {
+        return await confirmFailure(stage, currentSpec, currentTransportCase, safe.code, handles);
+      } catch (confirmationError) {
+        terminalError = confirmationError;
+      }
+    }
     return {
       status: "INCONCLUSIVE",
       stage,
       handles,
       steps,
       requiresReconciliation: true,
-      error: safeError(error),
+      error: safeError(terminalError),
+    };
+  }
+
+  async function confirmFailure(failedStage, spec, transportCase, failureCode, currentHandles) {
+    if (typeof confirmKnownFailure !== "function")
+      fail("TASTE_FAILURE_CLEANUP", "已发送的偏好用例缺少失败清理核验。", "INCONCLUSIVE");
+    const proof = await confirmKnownFailure(
+      failedStage,
+      structuredClone(spec),
+      structuredClone(transportCase),
+      failureCode,
+      structuredClone(currentHandles),
+    );
+    if (
+      proof?.cleanupVerified !== true ||
+      !ID.test(proof.runId ?? "") ||
+      proof.caseId !== transportCase.id ||
+      proof.failureCode !== failureCode ||
+      !/^[a-f0-9]{64}$/.test(proof.toolOutputSha256 ?? "")
+    )
+      fail(
+        "TASTE_FAILURE_CLEANUP",
+        "已发送的偏好用例缺少终态 Run 或许可清理证据。",
+        "INCONCLUSIVE",
+      );
+    const knownFailure = {
+      failureCode,
+      sourceCase: structuredClone(transportCase),
+      terminalProof: structuredClone(proof),
+    };
+    await checkpoint({
+      phase: "cleanup_confirmed",
+      stage: failedStage,
+      handles: structuredClone(currentHandles),
+      knownFailure,
+    });
+    return {
+      status: "FAIL",
+      stage: failedStage,
+      handles: currentHandles,
+      steps,
+      requiresReconciliation: true,
+      cleanupConfirmed: true,
+      knownFailure,
+      error: { code: failureCode, status: "FAIL" },
     };
   }
 }

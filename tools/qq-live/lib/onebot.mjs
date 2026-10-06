@@ -316,6 +316,37 @@ export class OneBot {
       }
     });
   }
+  async closeAndDrain() {
+    const socket = this.ws;
+    if (this.problem) {
+      this.close();
+      throw this.problem;
+    }
+    if (!socket || socket.readyState === 3) {
+      this.close();
+      return;
+    }
+    await new Promise((resolve, reject) => {
+      const finish = (error) => {
+        clearTimeout(timer);
+        socket.removeEventListener("close", onClose);
+        if (error) reject(error);
+        else resolve();
+      };
+      const onClose = (event) => {
+        if (![1000, 1005].includes(event.code))
+          finish(new LiveError("WS_CLOSE_UNCONFIRMED", "OneBot 关闭未获正常确认。"));
+        else finish();
+      };
+      const timer = setTimeout(
+        () => finish(new LiveError("WS_CLOSE_TIMEOUT", "OneBot 关闭确认超时。")),
+        this.config.responseTimeoutMs,
+      );
+      socket.addEventListener("close", onClose, { once: true });
+      this.close();
+    });
+  }
+
   close() {
     if (this.closed) return;
     this.closed = true;

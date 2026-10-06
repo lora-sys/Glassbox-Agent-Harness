@@ -88,6 +88,15 @@ test("reconcile-memory is a named command and requires enabled isolated fixture 
   const helpResult = await run(["help"], d);
   assert.match(helpResult.stdout, /reconcile-memory --live --approve-suite/);
 });
+test("reconcile-taste is a named command and refuses recovery when fixture audit retention is disabled", async (t) => {
+  const d = await dir(t);
+  const p = join(d, "c.json");
+  await writeFile(p, JSON.stringify(baseConfig()));
+  const result = await run(["reconcile-taste", "--config", p], d);
+  assert.equal(result.code, 2);
+  assert.match(result.stderr + result.stdout, /MEMORY_FIXTURE_DISABLED/);
+  assert.doesNotMatch(result.stderr + result.stdout, /未知命令/);
+});
 test("fixed Memory lifecycle plan exposes all steps without enabling writes", async (t) => {
   const d = await dir(t),
     p = join(d, "c.json");
@@ -118,6 +127,70 @@ test("fixed Memory lifecycle plan exposes all steps without enabling writes", as
   );
   assert.equal(blocked.code, 2);
   assert.ok(blocked.stderr.includes("FEATURE_RUNTIME_REQUIRED"));
+});
+test("fixed Taste lifecycle plan binds four exact feedback and governance steps", async (t) => {
+  const d = await dir(t);
+  const p = join(d, "taste-config.json");
+  await writeFile(p, JSON.stringify(baseConfig()));
+  const planned = await run(["plan", "--case", "taste-lifecycle", "--config", p], d);
+  assert.equal(planned.code, 0);
+  const plan = JSON.parse(planned.stdout);
+  assert.equal(plan.familyId, "taste-project-feedback-lifecycle");
+  assert.deepEqual(
+    plan.stages.map((stage) => stage.id),
+    ["taste-feedback", "taste-promote", "taste-negative-feedback", "taste-retire"],
+  );
+  assert.ok(plan.stages[0].prompt.includes("explicit_positive"));
+  assert.ok(plan.stages[2].prompt.includes("explicit_negative"));
+  assert.equal(plan.stages[0].inputConstraint.statement, "qqtest-taste-" + "0".repeat(32));
+  assert.equal(plan.stages[3].inputConstraint.action, "promote");
+  assert.deepEqual(plan.recovery, ["reject-candidate", "reject-correction", "expire-original"]);
+  assert.match(plan.suiteSha256, /^[a-f0-9]{64}$/);
+});
+test("Taste lifecycle requires audit retention and blocks any account with pending Taste state", async (t) => {
+  const d = await dir(t);
+  const p = join(d, "taste-config.json");
+  const out = join(d, "reports");
+  const config = {
+    ...baseConfig(),
+    runtime: {},
+    memoryFixtures: { enabled: true, retainAuditConfirmed: true },
+  };
+  await writeFile(p, JSON.stringify({ ...config, memoryFixtures: { enabled: true } }));
+  const disabled = await run(
+    ["run", "--live", "--case", "taste-lifecycle", "--config", p, "--out", out],
+    d,
+  );
+  assert.equal(disabled.code, 2);
+  assert.match(disabled.stderr + disabled.stdout, /MEMORY_FIXTURE_DISABLED/);
+
+  await writeFile(p, JSON.stringify(config));
+  const planned = JSON.parse(
+    (await run(["plan", "--case", "taste-lifecycle", "--config", p], d)).stdout,
+  );
+  const lockRoot = join(d, ".glassbox-qq-live-locks");
+  await mkdir(lockRoot, { recursive: true });
+  const accountKey = digest(config.driver.qq).slice(0, 24);
+  await writeFile(join(lockRoot, `${accountKey}.taste-pending.json`), "pending");
+  const blocked = await run(
+    [
+      "run",
+      "--live",
+      "--case",
+      "taste-lifecycle",
+      "--config",
+      p,
+      "--out",
+      out,
+      "--approve-suite",
+      planned.suiteSha256,
+    ],
+    d,
+  );
+  assert.equal(blocked.code, 2);
+  const latest = JSON.parse(await readFile(join(out, "latest.json"), "utf8"));
+  assert.equal(latest.error.code, "TASTE_RECONCILIATION_REQUIRED");
+  assert.doesNotMatch(latest.error.code, /RUN_LOCKED/);
 });
 test("Memory fixture writes require explicit enablement before networking", async (t) => {
   const d = await dir(t),

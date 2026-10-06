@@ -10,6 +10,7 @@ import {
 import { validateReadFeatureSpecs } from "../lib/feature-specs.mjs";
 import { resolveReadFeatureSpecs } from "../lib/feature-specs.mjs";
 import { MEMORY_REJECT_FAMILY_ID } from "../lib/memory-workflow.mjs";
+import { TASTE_FAMILY_ID, tasteFamilyPlan } from "../lib/taste-scenario.mjs";
 
 function minimalCatalog(overrides = {}) {
   return {
@@ -50,6 +51,11 @@ const memoryRejectFamily = {
   id: MEMORY_REJECT_FAMILY_ID,
   kind: "memory-lifecycle",
   workflow: "feedback-reject",
+  chat: "private",
+};
+const tasteFamily = {
+  id: TASTE_FAMILY_ID,
+  kind: "taste-lifecycle",
   chat: "private",
 };
 function memoryCatalog(overrides = {}, family = memoryFamily) {
@@ -325,6 +331,14 @@ test("full catalogue remains blocked and keeps complete Memory isolation cases p
     result.gaps.some(
       (gap) => gap.code === "CASE_NOT_EXECUTABLE" && gap.caseId === "memory-and-taste-lifecycle",
     ),
+  );
+  assert.equal(
+    FEATURE_CATALOG.cases.find((item) => item.id === TASTE_FAMILY_ID)?.executionStatus,
+    "executable",
+  );
+  assert.equal(
+    FEATURE_CATALOG.cases.find((item) => item.id === "memory-and-taste-lifecycle")?.executionStatus,
+    "planned",
   );
 });
 
@@ -755,4 +769,42 @@ test("history isolation catalog binds its fixed two-stage family and rejects met
     }).status,
     "BLOCKED",
   );
+});
+
+test("Taste catalog binds only the fixed four-stage lifecycle and rejects metadata downgrade", () => {
+  const catalogCase = FEATURE_CATALOG.cases.find((item) => item.id === TASTE_FAMILY_ID);
+  assert.ok(catalogCase);
+  const catalog = {
+    schemaVersion: 1,
+    requiredDomains: ["memory_taste"],
+    descriptorBaseline: catalogCase.tools,
+    cases: [catalogCase],
+  };
+  const args = {
+    catalog,
+    descriptors: catalogCase.tools.map((name) => ({ name })),
+    executableSuiteCases: [tasteFamily],
+  };
+  assert.equal(checkFeatureCoverage(args).status, "PASS");
+  assert.deepEqual(
+    tasteFamilyPlan().stages.map((stage) => stage.id),
+    ["taste-feedback", "taste-promote", "taste-negative-feedback", "taste-retire"],
+  );
+  for (const field of ["tools", "assertions", "executionKind", "mutation", "fixture", "cleanup"]) {
+    const changed = structuredClone(catalogCase);
+    changed[field] = field === "tools" || field === "assertions" ? [] : "changed";
+    assert.equal(
+      checkFeatureCoverage({ ...args, catalog: { ...catalog, cases: [changed] } }).status,
+      "BLOCKED",
+      `${field} downgrade must block coverage`,
+    );
+  }
+  assert.equal(
+    checkFeatureCoverage({
+      ...args,
+      executableSuiteCases: [{ ...tasteFamily, workflow: "arbitrary" }],
+    }).status,
+    "BLOCKED",
+  );
+  assert.equal(checkFeatureCoverage({ ...args, executableSuiteCases: [] }).status, "BLOCKED");
 });

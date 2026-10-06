@@ -8,6 +8,10 @@
 
 固定记忆流程在 Linux 环境运行。测试器会同步保存 `memory-fixture.jsonl` 进度记录。注册许可前保存实际消息标记和哈希，发送前保存许可回执，发送成功后保存账号侧消息回执。检查点同时记录原测试进程的 PID、Linux 启动身份、进程启动标识、私聊范围及运行版本。文件与目录写盘确认后才继续。更新 guard 时使用原子替换，保留完整旧记录；首次发布禁止覆盖已有 guard。写盘未确认时不发送消息。未确认步骤或清理时，发起账号的全局锁目录会保留 `.memory-pending.json`，后续实机运行会停止，即使改用另一个报告目录。不要直接删除这个记录来重试。中断后使用 reconcile-memory 核实原报告、Run 终态和独立清理证据，再按固定清理计划执行已授权的 reject 或 expire。这个固定流程不代表完整 Memory 功能回归，也不满足完整目录的自动合并门禁。
 
+固定 Taste 流程使用 `plan --case taste-lifecycle` 预览，在唯一项目中依次提交正反馈、提升候选、提交负反馈、提升纠正候选以退役原偏好。运行需要启用两个 memoryFixtures 开关和四条消息预算。schemaVersion=6 可以用固定用例 `taste-project-feedback-lifecycle` 与读取、Memory、历史流程组成套件。选择套件内用例时，审批哈希始终绑定原始文件字节。四次执行必须使用不同 Run，最终只读核验必须确认没有本轮活跃偏好或待处理候选。
+
+Taste 进度保存在账号级 `.taste-pending.json`。该记录会阻止继续发送和自动交付，交付检查在合并前再次检查。最终家族核验失败时，报告必须保留未通过状态和恢复记录。`reconcile-taste` 只处理已经独立确认的测试资源，不重发原始消息。清理完成只证明资源已清理，不能把原失败改成通过。未知发送结果继续保留 STOP。这个固定流程不代表完整 Taste、授权或作用域回归。
+
 报告新增 `productAcceptance`。固定传输 suite 要求配置并核对 runtime，成功后报告 `TRANSPORT_ONLY`。它不算产品功能 PASS，也不能用于合并。
 
 配置 runtime 的普通 read suite 按用例顺序执行。每条 QQ 回复通过传输断言后，测试器会先独立核对该条 Run、Trace、投递和许可撤销审计，再发送下一条。产品证据失败会停止本轮，并保留该条失败及之前已验证的用例，不重发旧消息。许可撤销未能独立确认时，测试器写入账号级 STOP。确定的回复断言失败只有在 cleanup-only 核验确认原 Run 和撤销审计后才允许结束为 FAIL 而不写 STOP；修复后可在已批准的套件和有效授权窗口内启动新一轮，不能自动重试。
@@ -164,7 +168,7 @@ node tools/qq-live/cli.mjs plan --scenarios tools/qq-live/examples/scenarios.exa
 
 ## 停止与安全边界
 
-交付时使用 `delivery-check --pr <URL> --scenarios <套件文件> --reports <报告清单> --approve-suite <SHA256>`。报告清单只能包含 `schemaVersion: 1` 和 `reports` 文件路径数组，路径相对于清单文件。命令会检查完整功能目录，执行当前干净提交的仓库验证，重新核对 QQ 产品证据、清理、GitHub Actions 和当前 PR 提交的独立审批。缺少覆盖时会在连接外部服务前拒绝继续。
+交付时使用 `delivery-check --pr <URL> --scenarios <套件文件> --reports <报告清单> --approve-suite <SHA256>`。报告清单只能包含 `schemaVersion: 1` 和 `reports` 文件路径数组，路径相对于清单文件。命令会检查完整功能目录，执行当前干净提交的仓库验证，重新核对 QQ 产品证据、清理、GitHub Actions 和当前 PR 提交的独立审查证据。缺少覆盖时会在连接外部服务前拒绝继续。
 
 已有用户合并授权后，使用同样参数运行 `deliver --live`。命令在合并前再次检查提交与证据，先持久记录尝试，再使用精确提交执行一次 squash 合并。尝试记录按 PR 保存在当前系统用户的测试锁目录，更换报告目录、套件或测试账号不能绕过已有记录。结果未知时保留记录，不自动重试合并。本地记录用于关联尝试，不能证明拥有同等系统权限的 Agent 没有修改记录。合并事实仍须由 GitHub 确认，实机结果仍须由 QQ 消息和产品 Trace 核实。
 
@@ -223,3 +227,5 @@ schemaVersion 5 的 `feature-baseline.example.json` 同时包含既有读取、�
 群信息输出预览仍限制为 512 字节。运行时从实际完整工具结果生成固定 groupInfo 字段和完整输出摘要。核验器在预览截断时要求这份独立字段证据，不扩大预览。实际双端回复必须是 QQGROUPINFO 测试编号 count=人数 capacity=容量 的单行纯文本，数量须与工具证据一致。添加文字、媒体消息段或其他字段都不能通过。
 
 The fixed group A root-files read adds exact Owner-private group:files:read narrowing with no arbitrary file IDs, folders, URL resolution or mutations. Runtime groupFiles evidence derives counts and a canonical digest of validated complete returned page data from the actual protected content/details wrapper. The existing full output SHA256/byte count and 512-byte preview remain intact. A separate fixed Bot read must match the page digest and counts. The two account-local actual replies must satisfy the fixed count-only format. Default provider paging is limited to 50 entries at startIndex 0, as recorded in the pinned NapCat GetGroupRootFiles source. This operation supplies no total-directory completeness witness, so directory traversal and wider file coverage remain planned. Changed metadata, malformed entries and unavailable reads cannot pass. Historical root-list lessons remain hypotheses pending an independent historical witness. No ordinary grants, native Pi configuration or locked skill core change.
+
+审查记录须在 Linux 或 WSL 中执行，Windows 缺少这里要求的目录持久化能力，登记会返回 BLOCKED。审查记录使用固定命令。先运行 `record-agent-review --pr <URL>` 获取当前 PR、base、head、tree、完整 diff 和文件清单的绑定。独立审查者必须核对完整改动，并在仓库外保存原始审查 JSON。再传入 `--artifact <文件> --expected-review-binding <SHA256>` 登记该绑定的审查。命令拒绝混入发送或合并选项。登记记录与原始文件保存在仓库外的私密目录，交付前会重新读取核验。记录说明受信任的本机操作者已确认审查来源，不提供密码学身份认证。正式 GitHub approval 仍可作为审查证据。当前提交的未撤销修改请求和实际分支规则仍会阻止合并。审查记录不替代功能覆盖、QQ 实机验收、CI 或已有用户合并授权。

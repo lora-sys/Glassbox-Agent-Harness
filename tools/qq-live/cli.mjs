@@ -11,8 +11,10 @@ import { Recorder, doctor, smokeSpecs, validateSpecs, replyCase } from "./lib/ru
 import { moderationCase } from "./lib/moderation.mjs";
 import {
   runtimeSnapshot,
+  readTraceEvents,
   verifyProductEvidence,
   verifyFailedCaseCleanup,
+  verifyKnownTasteFeatureFailureCleanup,
 } from "./lib/product-evidence.mjs";
 import { runReadCaseSequence, productCleanupStopRequired } from "./lib/read-case-sequence.mjs";
 import { acceptanceManagement } from "./lib/management-client.mjs";
@@ -24,6 +26,11 @@ import {
   historyIsolationFamilyPlan,
 } from "./lib/feature-suite.mjs";
 import { MEMORY_FAMILY_ID, memoryWorkflow } from "./lib/memory-workflow.mjs";
+import { TASTE_FAMILY_ID, tasteFamilyPlan } from "./lib/taste-scenario.mjs";
+import {
+  finalizeTasteFamilyAcceptance,
+  tasteFixtureCheckpointRemovable,
+} from "./lib/taste-report-finalization.mjs";
 import {
   TRANSPORT_SUITE_FAMILY_ID,
   transportSmokeSpecs,
@@ -42,12 +49,18 @@ node cli.mjs plan --case transport-smoke
 node cli.mjs run --live --approve-suite <SHA256>
 node cli.mjs plan --case memory-lifecycle
 node cli.mjs run --live --case memory-lifecycle --approve-suite <SHA256>
+node cli.mjs plan --case taste-lifecycle
+node cli.mjs run --live --case taste-lifecycle --approve-suite <SHA256>
 node cli.mjs plan --scenarios examples/feature-baseline.example.json
 node cli.mjs run --live --case history-group-seed-private-recall --scenarios examples/feature-baseline.example.json --approve-suite <SHA256>
 node cli.mjs reconcile-memory
 node cli.mjs reconcile-memory --live --approve-suite <SHA256>
+node cli.mjs reconcile-taste
+node cli.mjs reconcile-taste --live --approve-suite <SHA256>
 node cli.mjs plan --scenarios examples/scenarios.example.json
 node cli.mjs coverage
+node cli.mjs record-agent-review --pr <URL>
+node cli.mjs record-agent-review --pr <URL> --artifact <review-json> --expected-review-binding <SHA256>
 node cli.mjs delivery-check --pr <URL> --scenarios <file> --reports <manifest> --approve-suite <SHA256>
 node cli.mjs deliver --live --pr <URL> --scenarios <file> --reports <manifest> --approve-suite <SHA256>
 node cli.mjs postmerge-check --pr <URL> --scenarios <file> --reports <manifest> --approve-suite <SHA256>
@@ -60,7 +73,9 @@ schemaVersion=1 的自然语言 scenarios 仅支持 plan。
 schemaVersion=2 的结构化读取用例需要服务端逐消息许可、运行版本和工具证据。
 schemaVersion=4 增加固定群 A 种子与 Owner 私聊回查流程。
 schemaVersion=5 增加群 B 种子与仅查询群 A 的私聊隔离流程。
+ schemaVersion=6 增加固定 Taste 生命周期流程。
 memory-lifecycle 是固定的项目范围反馈、提升、过期流程，需要单独启用并保留审计记录。
+taste-lifecycle 是固定的项目范围正向反馈、提升、负向反馈和退役流程。中断时需恢复或清理固定测试资源。
 退出码 0=通过，1=验收失败，2=环境或配置阻塞，3=无法确认。
 停止文件为报告目录下 STOP。Ctrl+C 也会停止，并尝试已授权的清理。
 `;
@@ -85,11 +100,15 @@ function args(argv) {
         "--pr",
         "--reports",
         "--input",
+        "--artifact",
+        "--expected-review-binding",
       ].includes(k) ||
       !argv[i + 1] ||
       argv[i + 1].startsWith("--")
     )
       fail("ARGUMENT", "参数无效，运行 node cli.mjs help 查看帮助。");
+    if (command === "record-agent-review" && Object.hasOwn(o, k.slice(2)))
+      fail("ARGUMENT", "审查登记参数不能重复。");
     o[k.slice(2)] = argv[++i];
   }
   if (
@@ -103,13 +122,28 @@ function args(argv) {
       "report",
       "coverage",
       "reconcile-memory",
+      "reconcile-taste",
       "delivery-check",
       "deliver",
       "postmerge-check",
       "record-lesson",
+      "record-agent-review",
     ].includes(command)
   )
     fail("COMMAND", "未知命令。");
+  if (
+    command !== "record-agent-review" &&
+    (Object.hasOwn(o, "artifact") || Object.hasOwn(o, "expected-review-binding"))
+  )
+    fail("ARGUMENT", "审查文件和绑定哈希仅用于审查登记。");
+  if (
+    command === "record-agent-review" &&
+    (!o.pr ||
+      Object.keys(o).some(
+        (key) => !["config", "out", "pr", "artifact", "expected-review-binding"].includes(key),
+      ))
+  )
+    fail("ARGUMENT", "审查登记需要 --pr，只接受配置、审查文件和绑定哈希选项。");
   return { command, o };
 }
 async function jsonFile(path) {
@@ -218,9 +252,31 @@ async function main() {
   }
   const { raw } = await jsonFile(configPath);
   const config = validateConfig(raw, {
-    live: command === "run" || (command === "reconcile-memory" && o.live === true),
+    live:
+      command === "run" ||
+      (["reconcile-memory", "reconcile-taste"].includes(command) && o.live === true),
   });
+  if (command === "record-agent-review") {
+    const { recordAgentReviewCli } = await import("./lib/delivery-cli.mjs");
+    const result = await recordAgentReviewCli(
+      config,
+      {
+        pr: o.pr,
+        ...(o.artifact !== undefined ? { artifact: o.artifact } : {}),
+        ...(o["expected-review-binding"] !== undefined
+          ? { expectedReviewBindingSha256: o["expected-review-binding"] }
+          : {}),
+      },
+      out,
+    );
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
   if (command === "reconcile-memory") return runMemoryRecoveryCli(config, o, out);
+  if (command === "reconcile-taste") {
+    const { runTasteRecoveryCli } = await import("./lib/taste-recovery-cli.mjs");
+    return runTasteRecoveryCli(config, o, out);
+  }
   if (["delivery-check", "deliver", "postmerge-check"].includes(command)) {
     if (command === "deliver" && !o.live) fail("LIVE_REQUIRED", "执行合并需要显式 --live。");
     const { runDeliveryCli } = await import("./lib/delivery-cli.mjs");
@@ -260,13 +316,15 @@ async function main() {
   }
   const transportOnlySuite =
     !o.scenarios &&
-    !["memory-lifecycle", "moderation"].includes(o.case) &&
+    !["memory-lifecycle", "taste-lifecycle", "moderation"].includes(o.case) &&
     (command === "run" || command === "plan");
   let specs = transportOnlySuite ? transportSmokeSpecs(config) : smokeSpecs(config),
     suiteHash = transportOnlySuite ? transportSuiteHash(config) : null,
     featureSuite = false;
   let memoryLifecycle = o.case === "memory-lifecycle";
+  let tasteLifecycle = o.case === "taste-lifecycle";
   let memoryFamilyCase = null;
+  let tasteFamilyCase = null;
   let historyFamilyCase = null;
   let plannedSuiteCases = null;
   if (transportOnlySuite) {
@@ -326,9 +384,31 @@ async function main() {
     if (config.maxMessages < 3) fail("MESSAGE_BUDGET", "固定记忆流程需要三条消息的预算。");
     specs = [];
   }
+  if (tasteLifecycle) {
+    if (!tasteFamilyCase && o.scenarios)
+      fail("ARGUMENT", "独立固定偏好流程不能与 scenarios 混用。");
+    const plan = tasteFamilyPlan();
+    if (!tasteFamilyCase) suiteHash = digest(JSON.stringify(plan));
+    featureSuite = true;
+    if (command === "plan") {
+      console.log(JSON.stringify({ suiteSha256: suiteHash, ...plan }, null, 2));
+      return;
+    }
+    if (command !== "run") fail("ARGUMENT", "偏好流程只支持 plan 和 run。");
+    if (!config.runtime) fail("FEATURE_RUNTIME_REQUIRED", "偏好流程必须核对真实验收服务版本。");
+    if (
+      config.memoryFixtures?.enabled !== true ||
+      config.memoryFixtures?.retainAuditConfirmed !== true
+    )
+      fail("MEMORY_FIXTURE_DISABLED", "请在配置中启用固定偏好测试并确认保留审计。");
+    if (o["approve-suite"] !== suiteHash)
+      fail("SUITE_APPROVAL", "请先审阅固定偏好流程并提供 plan 输出的 SHA256。");
+    if (config.maxMessages < 4) fail("MESSAGE_BUDGET", "固定偏好流程需要四条消息的预算。");
+    specs = [];
+  }
   if (o.scenarios) {
     const suite = await jsonFile(resolve(o.scenarios));
-    featureSuite = [2, 3, 4, 5].includes(suite.raw?.schemaVersion);
+    featureSuite = [2, 3, 4, 5, 6].includes(suite.raw?.schemaVersion);
     if (command === "run" && !featureSuite)
       fail(
         "CUSTOM_LIVE_UNSUPPORTED",
@@ -349,6 +429,21 @@ async function main() {
         memoryFamilyCase = resolved.memoryFamilies.find((c) => c.id === o.case) ?? null;
         if (memoryFamilyCase) {
           memoryLifecycle = true;
+          specs = [];
+        }
+      }
+      if (resolved.tasteFamilies.length && command === "run") {
+        if (!o.case)
+          fail("CASE_FAMILY_REQUIRED", "含偏好流程的套件须逐个选择用例运行并保留各自报告。");
+        tasteFamilyCase = resolved.tasteFamilies.find((c) => c.id === o.case) ?? null;
+        if (tasteFamilyCase) {
+          tasteLifecycle = true;
+          if (
+            config.memoryFixtures?.enabled !== true ||
+            config.memoryFixtures?.retainAuditConfirmed !== true
+          )
+            fail("MEMORY_FIXTURE_DISABLED", "请明确启用固定偏好测试并确认保留审计。");
+          if (config.maxMessages < 4) fail("MESSAGE_BUDGET", "固定偏好流程需要四条消息的预算。");
           specs = [];
         }
       }
@@ -396,6 +491,9 @@ async function main() {
               };
             return {};
           })(),
+          ...(plannedSuiteCases?.some((c) => c.kind === "taste-lifecycle")
+            ? { tastePlan: tasteFamilyPlan() }
+            : {}),
           note: "这是待发送的消息，不是执行结果。sideEffect 声明不能代替代码授权检查。",
         },
         null,
@@ -404,7 +502,13 @@ async function main() {
     );
     return;
   }
-  if (o.case && o.case !== "moderation" && !memoryLifecycle && !historyFamilyCase) {
+  if (
+    o.case &&
+    o.case !== "moderation" &&
+    !memoryLifecycle &&
+    !tasteLifecycle &&
+    !historyFamilyCase
+  ) {
     specs = specs.filter((s) => s.id === o.case);
     if (!specs.length) fail("CASE_NOT_FOUND", "没有匹配的用例，未执行任何测试。");
   }
@@ -422,6 +526,7 @@ async function main() {
     createHash("sha256").update(config.driver.qq).digest("hex").slice(0, 24) + ".lock",
   );
   const pendingFixturePath = lockPath.replace(/\.lock$/, ".memory-pending.json");
+  const pendingTasteFixturePath = lockPath.replace(/\.lock$/, ".taste-pending.json");
   let lock;
   try {
     lock = await open(lockPath, "wx", 0o600);
@@ -461,6 +566,7 @@ async function main() {
     cases: recorder.cases,
     ...(transportOnlySuite ? { transportOnly: true } : {}),
     ...(memoryFamilyCase ? { memoryFamily: { caseId: memoryFamilyCase.id } } : {}),
+    ...(tasteLifecycle ? { tasteFamily: { familyId: TASTE_FAMILY_ID } } : {}),
     ...(historyFamilyCase ? { historyFamily: { caseId: historyFamilyCase.id } } : {}),
     limitations: [
       "没有验证 QQ 客户端 UI。",
@@ -472,6 +578,7 @@ async function main() {
   let timer;
   let acceptance;
   let pendingFixtureCreated = false;
+  let pendingTasteFixtureCreated = false;
   const observers = [];
   try {
     await mkdir(runDir, { mode: 0o700 });
@@ -489,6 +596,11 @@ async function main() {
       fail(
         "MEMORY_RECONCILIATION_REQUIRED",
         "该发起账号有未核实的记忆测试资源。先核实原始报告和清理证据，禁止续发。",
+      );
+    if (command === "run" && existsSync(pendingTasteFixturePath))
+      fail(
+        "TASTE_RECONCILIATION_REQUIRED",
+        "该发起账号有未核实的偏好测试资源。先核实原始报告和清理证据，禁止续发。",
       );
     if (command === "run" && config.runtime) report.runtime = runtimeSnapshot(config.runtime);
     if (command === "run" && (featureSuite || transportOnlySuite))
@@ -554,6 +666,9 @@ async function main() {
             config,
             clients,
           );
+          if (productAcceptance?.cases?.length !== 1)
+            fail("TASTE_STEP_EVIDENCE", "偏好步骤缺少唯一产品 Run 证据。", "INCONCLUSIVE");
+          transportCase.runId = productAcceptance.cases[0].runId;
           return { transportCase, productAcceptance };
         },
       });
@@ -725,6 +840,209 @@ async function main() {
       report.status = report.memoryLifecycle.status;
       report.plannedCaseCount = memoryContract.stages.length;
       report.executedCaseCount = recorder.cases.length;
+    } else if (tasteLifecycle) {
+      const { runTasteLifecycle } = await import("./lib/taste-lifecycle.mjs");
+      const { verifyTasteKnownReplyFailure } = await import("./lib/taste-known-failure.mjs");
+      const { observeTasteFixture } = await import("./lib/taste-fixture.mjs");
+      const { writeTasteCheckpoint } = await import("./lib/taste-checkpoint.mjs");
+      const { captureMemoryProcess } = await import("./lib/memory-process.mjs");
+      const { DatabaseSync } = await import("node:sqlite");
+      const tasteOrigin = {
+        familyId: TASTE_FAMILY_ID,
+        runtime: report.runtime,
+        process: await captureMemoryProcess(),
+        scope: {
+          connectionId: config.runtime.connectionId,
+          botId: config.bot.qq,
+          chatType: "private",
+          chatId: config.driver.qq,
+          senderId: config.driver.qq,
+          threadId: config.runtime.threadId ?? null,
+        },
+        driverSha256: digest(config.driver.qq),
+        suiteSha256: report.suiteSha256,
+        startedAt: report.startedAt,
+      };
+      let tasteCheckpointState;
+      let tasteCheckpointSequence = 0;
+      let tasteCheckpointSha256 = null;
+      const checkpointTaste = async (state) => {
+        const row = {
+          schemaVersion: 1,
+          familyId: TASTE_FAMILY_ID,
+          origin: tasteOrigin,
+          sequence: tasteCheckpointSequence + 1,
+          previousSha256: tasteCheckpointSha256,
+          ...state,
+          at: new Date().toISOString(),
+          runId,
+          reportDirectory: runDir,
+        };
+        row.checkpointSha256 = digest(JSON.stringify(row));
+        await writeTasteCheckpoint({
+          pendingPath: pendingTasteFixturePath,
+          journalPath: join(runDir, "taste-fixture.jsonl"),
+          row,
+          first: !pendingTasteFixtureCreated,
+        });
+        pendingTasteFixtureCreated = true;
+        tasteCheckpointSequence = row.sequence;
+        tasteCheckpointSha256 = row.checkpointSha256;
+        tasteCheckpointState = state;
+        return { confirmed: true };
+      };
+      acceptance.beforeRegister = async (c) => {
+        if (!tasteCheckpointState)
+          fail("TASTE_CHECKPOINT_UNCONFIRMED", "偏好流程没有注册前的状态记录。", "INCONCLUSIVE");
+        await checkpointTaste({
+          ...tasteCheckpointState,
+          phase: "lease_intent",
+          preparedCase: {
+            caseId: c.id,
+            marker: c.token,
+            textSha256: digest(c.prompt),
+            route: c.route,
+          },
+        });
+      };
+      acceptance.beforeSend = async (c, lease) => {
+        if (!tasteCheckpointState)
+          fail("TASTE_CHECKPOINT_UNCONFIRMED", "偏好流程没有发送前的状态记录。", "INCONCLUSIVE");
+        await checkpointTaste({
+          ...tasteCheckpointState,
+          phase: "prepared",
+          preparedCase: {
+            caseId: c.id,
+            marker: c.token,
+            textSha256: digest(c.prompt),
+            route: c.route,
+            leaseId: lease.leaseId,
+            expiresAt: lease.expiresAt,
+            toolsSha256: lease.toolsSha256,
+          },
+        });
+      };
+      acceptance.afterSend = async (c) =>
+        checkpointTaste({
+          ...tasteCheckpointState,
+          phase: "sent",
+          sentCase: { caseId: c.id, driverMessageId: c.sentMessageId },
+        });
+      report.tasteLifecycle = await runTasteLifecycle({
+        fixtureNonce: randomUUID().replaceAll("-", ""),
+        signal: controller.signal,
+        checkpoint: checkpointTaste,
+        readRuntime: async () => runtimeSnapshot(config.runtime),
+        confirmKnownFailure: async (stage, spec, testCase, failureCode, handles) => {
+          if (failureCode === "REPLY_ASSERTION_FAILED")
+            return verifyTasteKnownReplyFailure(testCase, {
+              stage,
+              handles,
+              runtime: report.runtime,
+              config,
+              verifyCleanup: verifyFailedCaseCleanup,
+              clients,
+              readRuntime: () => runtimeSnapshot(config.runtime),
+              readTrace: (runId) =>
+                readTraceEvents(
+                  report.runtime.checkout,
+                  report.runtime.dataDirectory,
+                  runId,
+                  execFileSync,
+                  ["tool_result"],
+                ),
+            });
+          return verifyKnownTasteFeatureFailureCleanup(
+            testCase,
+            failureCode,
+            config,
+            clients,
+            report.runtime,
+            handles,
+            stage,
+          );
+        },
+        executeStep: async (stage, spec) => {
+          if (stage !== "feedback") await sleep(config.minGapMs);
+          const transportCase = await replyCase(
+            config,
+            clients,
+            recorder,
+            spec,
+            controller.signal,
+            acceptance,
+          );
+          if (transportCase.status !== "PASS") return { transportCase };
+          const productAcceptance = await verifyProductEvidence(
+            { mode: "run", status: "PASS", runtime: report.runtime, cases: [transportCase] },
+            config,
+            clients,
+          );
+          return { transportCase, productAcceptance };
+        },
+        observeStep: async (stage, handles) => {
+          const db = new DatabaseSync(join(config.runtime.dataDirectory, "glassbox.db"), {
+            readOnly: true,
+          });
+          try {
+            const actor = db
+              .prepare(
+                "SELECT r.principal_id, p.kind FROM runs r JOIN principals p ON p.id=r.principal_id WHERE r.id=?",
+              )
+              .get(handles.stepRunId);
+            if (
+              !actor ||
+              actor.kind !== "owner" ||
+              (handles.principalId && actor.principal_id !== handles.principalId)
+            )
+              fail("TASTE_FIXTURE_OWNER", "本轮偏好测试 Run 的 Owner 身份不一致。", "INCONCLUSIVE");
+            return observeTasteFixture(db, {
+              ...handles,
+              stage,
+              fixtureNonce: handles.fixtureNonce,
+              principalId: actor.principal_id,
+            });
+          } finally {
+            db.close();
+          }
+        },
+      });
+      report.plannedCaseCount = 4;
+      report.executedCaseCount = recorder.cases.length;
+      if (
+        report.tasteLifecycle.status === "FAIL" &&
+        report.tasteLifecycle.cleanupConfirmed === true
+      ) {
+        report.status = "FAIL";
+        report.productAcceptance = {
+          status: "FAIL",
+          code: report.tasteLifecycle.knownFailure.failureCode,
+          acceptanceKind: "TASTE_LIFECYCLE",
+          cleanupRequired: true,
+          cleanupVerified: true,
+          cases: [],
+        };
+      }
+      if (report.tasteLifecycle.status === "PASS") {
+        const { verifyTasteFamilyReport } = await import("./lib/taste-family-evidence.mjs");
+        report.tasteFamilyAcceptance = await finalizeTasteFamilyAcceptance(report, (candidate) =>
+          verifyTasteFamilyReport(candidate, {
+            config,
+            verifyProduct: (input) => verifyProductEvidence(input, config, clients),
+            readRuntime: () => runtimeSnapshot(config.runtime),
+            readFixture: (input) => {
+              const db = new DatabaseSync(join(config.runtime.dataDirectory, "glassbox.db"), {
+                readOnly: true,
+              });
+              try {
+                return observeTasteFixture(db, input);
+              } finally {
+                db.close();
+              }
+            },
+          }),
+        );
+      }
     } else {
       if (specs.length > config.maxMessages) fail("MESSAGE_BUDGET", "用例数超过本轮消息预算。");
       const sequence = await runReadCaseSequence({
@@ -907,6 +1225,10 @@ async function main() {
     report.finishedAt = new Date().toISOString();
     report.reportDirectory = runDir;
     try {
+      const tasteKnownFailureCleanupConfirmed =
+        report.tasteLifecycle?.status === "FAIL" &&
+        report.tasteLifecycle?.cleanupConfirmed === true &&
+        report.tasteLifecycle?.knownFailure?.terminalProof?.cleanupVerified === true;
       if (
         report.error?.code === "LEASE_CLEANUP_EVIDENCE" ||
         report.cleanupStopRequired === true ||
@@ -918,6 +1240,11 @@ async function main() {
         ) ||
         (pendingFixtureCreated &&
           (report.memoryLifecycle?.requiresReconciliation !== false ||
+            report.status !== "PASS" ||
+            report.productAcceptance.status !== "PASS")) ||
+        (pendingTasteFixtureCreated &&
+          !tasteKnownFailureCleanupConfirmed &&
+          (report.tasteLifecycle?.requiresReconciliation !== false ||
             report.status !== "PASS" ||
             report.productAcceptance.status !== "PASS"))
       ) {
@@ -973,6 +1300,10 @@ async function main() {
         report.memoryLifecycle?.status === "PASS"
       ) {
         await rm(pendingFixturePath);
+        await syncDirectory(lockRoot);
+      }
+      if (pendingTasteFixtureCreated && tasteFixtureCheckpointRemovable(report)) {
+        await rm(pendingTasteFixturePath);
         await syncDirectory(lockRoot);
       }
     } finally {

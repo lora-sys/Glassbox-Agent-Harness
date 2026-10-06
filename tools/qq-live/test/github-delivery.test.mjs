@@ -7,6 +7,7 @@ import {
 } from "../lib/github-delivery.mjs";
 
 const head = "a".repeat(40);
+const base = "f".repeat(40);
 const mergeCommit = "e".repeat(40);
 const pullRequestUrl = "https://github.com/acme/product/pull/42";
 
@@ -28,6 +29,7 @@ function viewData(overrides = {}) {
     isDraft: false,
     mergeable: "MERGEABLE",
     headRefOid: head,
+    baseRefOid: base,
     mergeCommit: null,
     author: { login: "author" },
     reviews: [
@@ -122,6 +124,8 @@ test("readRemote resolves origin, fixed workflow checks, and independent approva
   assert.deepEqual(remote.repo, "acme/product");
   assert.deepEqual(remote.pr, { number: 42, url: pullRequestUrl });
   assert.equal(remote.headCommit, head);
+  assert.equal(remote.baseCommit, base);
+  assert.equal(remote.authorLogin, "author");
   assert.equal(remote.review.status, "PASS");
   assert.equal(remote.review.reviewer, "reviewer");
   assert.equal(remote.review.commit, head);
@@ -240,6 +244,48 @@ test("a current-head changes-requested review supersedes that reviewer's earlier
     execFileImpl,
   }).readRemote();
   assert.equal(remote.review.status, "CHANGES_REQUESTED");
+});
+
+test("COMMENTED reviews do not clear an approval or an outstanding changes request", async () => {
+  const approvedWithComment = viewData({
+    reviews: [
+      review(1, "APPROVED", "reviewer", head, "2026-10-05T12:00:00Z"),
+      review(2, "COMMENTED", "reviewer", head, "2026-10-05T13:00:00Z"),
+    ],
+  });
+  const requestedWithComment = viewData({
+    reviews: [
+      review(1, "CHANGES_REQUESTED", "reviewer", head, "2026-10-05T12:00:00Z"),
+      review(2, "COMMENTED", "reviewer", head, "2026-10-05T13:00:00Z"),
+    ],
+  });
+  const approvedRemote = await createGitHubDelivery({
+    pullRequestUrl,
+    cwd: "/repo",
+    execFileImpl: mockExec({ view: approvedWithComment }).execFileImpl,
+  }).readRemote();
+  const requestedRemote = await createGitHubDelivery({
+    pullRequestUrl,
+    cwd: "/repo",
+    execFileImpl: mockExec({ view: requestedWithComment }).execFileImpl,
+  }).readRemote();
+  assert.equal(approvedRemote.review.status, "PASS");
+  assert.equal(requestedRemote.review.status, "CHANGES_REQUESTED");
+});
+
+test("an explicit DISMISSED review clears only that reviewer's prior review effect", async () => {
+  const dismissed = viewData({
+    reviews: [
+      review(1, "CHANGES_REQUESTED", "reviewer", head, "2026-10-05T12:00:00Z"),
+      review(2, "DISMISSED", "reviewer", head, "2026-10-05T13:00:00Z"),
+    ],
+  });
+  const remote = await createGitHubDelivery({
+    pullRequestUrl,
+    cwd: "/repo",
+    execFileImpl: mockExec({ view: dismissed }).execFileImpl,
+  }).readRemote();
+  assert.equal(remote.review.status, "MISSING");
 });
 
 test("readRemote exposes an already merged PR as MERGED for one-shot recovery", async () => {

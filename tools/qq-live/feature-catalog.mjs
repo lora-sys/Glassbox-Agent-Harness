@@ -4,7 +4,11 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import { HISTORY_SEED_FAMILY_ID } from "./lib/history-seed-workflow.mjs";
-import { validateMemoryFamily, validateHistoryFamily } from "./lib/feature-suite.mjs";
+import {
+  validateMemoryFamily,
+  validateHistoryFamily,
+  validateTasteFamily,
+} from "./lib/feature-suite.mjs";
 import {
   MEMORY_FAMILY_ID,
   MEMORY_REJECT_FAMILY_ID,
@@ -12,6 +16,7 @@ import {
 } from "./lib/memory-workflow.mjs";
 import { validateReadFeatureSpecs } from "./lib/feature-specs.mjs";
 import { validateFeatureAssertions } from "./lib/feature-observer.mjs";
+import { TASTE_FAMILY_ID, tasteFamilyPlan } from "./lib/taste-scenario.mjs";
 
 const PACKAGE_ROOT = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(PACKAGE_ROOT, "../..");
@@ -26,6 +31,20 @@ const MEMORY_REJECT_FAMILY_FIXTURE =
 const MEMORY_REJECT_FAMILY_CLEANUP =
   "reject the exact pending candidate; verify rejected state and preserve feedback audit history";
 const MEMORY_FAMILY_ASSERTIONS = [
+  {
+    kind: "trace",
+    type: "tool_result",
+    where: { name: "owner_memory_admin", isError: false },
+    count: 1,
+  },
+];
+const TASTE_FAMILY_FIXTURE =
+  "unique qqtest project; four Owner-private feedback and governance Runs";
+const TASTE_FAMILY_CLEANUP =
+  "retire the exact correction-backed preference; verify no active Taste Memory or pending candidates; retain audit evidence";
+const TASTE_FAMILY_COVERAGE =
+  "Run only the fixed four-stage Owner-private Taste fixture with fresh Run, lease, final-state and cleanup evidence. This does not cover general Taste learning, scope isolation or authorization-negative behavior.";
+const TASTE_FAMILY_ASSERTIONS = [
   {
     kind: "trace",
     type: "tool_result",
@@ -287,6 +306,19 @@ export const FEATURE_CATALOG = Object.freeze({
       mutation: "isolated",
       fixture: MEMORY_REJECT_FAMILY_FIXTURE,
       cleanup: MEMORY_REJECT_FAMILY_CLEANUP,
+    },
+    {
+      id: TASTE_FAMILY_ID,
+      domain: "memory_taste",
+      executionStatus: "executable",
+      executionKind: "taste-lifecycle",
+      tools: ["owner_memory_admin"],
+      suiteCaseId: TASTE_FAMILY_ID,
+      assertions: TASTE_FAMILY_ASSERTIONS,
+      coveragePlan: TASTE_FAMILY_COVERAGE,
+      mutation: "isolated",
+      fixture: TASTE_FAMILY_FIXTURE,
+      cleanup: TASTE_FAMILY_CLEANUP,
     },
     {
       id: "history-search-current-group",
@@ -1089,6 +1121,71 @@ function bindMemoryFamily(testCase, suiteCases, gaps) {
   return valid;
 }
 
+function bindTasteFamily(testCase, suiteCases, gaps) {
+  const matches = suiteCases.filter((suiteCase) => suiteCase?.id === TASTE_FAMILY_ID);
+  let valid = true;
+  if (matches.length !== 1 || testCase.suiteCaseId !== TASTE_FAMILY_ID) {
+    gaps.push({
+      code: matches.length > 1 ? "SUITE_CASE_AMBIGUOUS" : "SUITE_CASE_NOT_AVAILABLE",
+      caseId: testCase.id,
+      suiteCaseId: testCase.suiteCaseId,
+    });
+    valid = false;
+  } else {
+    try {
+      validateTasteFamily(matches[0]);
+    } catch {
+      gaps.push({
+        code: "SUITE_CASE_INVALID",
+        caseId: testCase.id,
+        suiteCaseId: TASTE_FAMILY_ID,
+      });
+      valid = false;
+    }
+  }
+
+  const plan = tasteFamilyPlan();
+  const expectedStages = [
+    ["taste-feedback", "memory:write"],
+    ["taste-promote", "memory:govern"],
+    ["taste-negative-feedback", "memory:write"],
+    ["taste-retire", "memory:govern"],
+  ];
+  if (
+    plan.familyId !== TASTE_FAMILY_ID ||
+    plan.stages.length !== expectedStages.length ||
+    plan.stages.some(
+      (stage, index) =>
+        stage.id !== expectedStages[index][0] ||
+        stage.action !== expectedStages[index][1] ||
+        stage.route !== "private" ||
+        stage.tool !== "owner_memory_admin",
+    )
+  ) {
+    gaps.push({ code: "TASTE_FAMILY_SCENARIO_BINDING_INVALID", caseId: testCase.id });
+    valid = false;
+  }
+
+  if (
+    testCase.id !== TASTE_FAMILY_ID ||
+    testCase.domain !== "memory_taste" ||
+    stableJson(testCase.tools) !== stableJson(["owner_memory_admin"]) ||
+    testCase.executionStatus !== "executable" ||
+    testCase.executionKind !== "taste-lifecycle" ||
+    testCase.suiteCaseId !== TASTE_FAMILY_ID ||
+    testCase.mutation !== "isolated" ||
+    testCase.fixture !== TASTE_FAMILY_FIXTURE ||
+    testCase.cleanup !== TASTE_FAMILY_CLEANUP ||
+    testCase.coveragePlan !== TASTE_FAMILY_COVERAGE ||
+    stableJson(testCase.assertions) !== stableJson(TASTE_FAMILY_ASSERTIONS) ||
+    testCase.leaseTools !== undefined
+  ) {
+    gaps.push({ code: "TASTE_FAMILY_CATALOG_BINDING_INVALID", caseId: testCase.id });
+    valid = false;
+  }
+  return valid;
+}
+
 function bindToSuiteCase(testCase, suiteCases, gaps, suiteConfig) {
   if (["history-seed", "history-isolation"].includes(testCase.executionKind)) {
     const matches = suiteCases.filter((c) => c?.id === testCase.id);
@@ -1112,6 +1209,8 @@ function bindToSuiteCase(testCase, suiteCases, gaps, suiteConfig) {
   }
   if (testCase.executionKind === "memory-lifecycle")
     return bindMemoryFamily(testCase, suiteCases, gaps);
+  if (testCase.executionKind === "taste-lifecycle")
+    return bindTasteFamily(testCase, suiteCases, gaps);
   if (testCase.executionKind !== undefined) {
     gaps.push({ code: "UNSUPPORTED_EXECUTION_KIND", caseId: testCase.id });
     return false;

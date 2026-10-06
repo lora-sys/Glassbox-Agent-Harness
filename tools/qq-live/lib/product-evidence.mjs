@@ -12,6 +12,19 @@ import {
   transportSuiteHash,
   validateTransportCase,
 } from "./transport-suite.mjs";
+import { tasteFixtureStep } from "./taste-scenario.mjs";
+
+const TASTE_ASSERTION_FAILURES = new Set([
+  "TASTE_FEEDBACK",
+  "TASTE_PROMOTE",
+  "TASTE_NEGATIVE",
+  "TASTE_MEMORY",
+  "TASTE_RETIRE",
+  "TASTE_FIXTURE_FEEDBACK",
+  "TASTE_FIXTURE_PROMOTE",
+  "TASTE_FIXTURE_NEGATIVE",
+  "TASTE_FIXTURE_CLEANUP",
+]);
 
 export function runtimeSnapshot(runtime, capture = execFileSync) {
   return serviceSnapshot(runtime, capture, true);
@@ -608,6 +621,151 @@ export async function verifyFailedCaseCleanup(report, config, capture = execFile
     return { status: "CLEANUP_VERIFIED", runtime: after, cases: receipts };
   } catch (error) {
     if (error && typeof error === "object") error.cleanupVerified = cleanupVerified;
+    throw error;
+  } finally {
+    db?.close();
+  }
+}
+
+/** Cleanup-only proof for a fixed Taste case whose independent fixture assertion failed. */
+export async function verifyKnownTasteFeatureFailureCleanup(
+  caseRecord,
+  failureCode,
+  config,
+  clients,
+  expectedRuntime,
+  handles,
+  stage,
+  capture = execFileSync,
+) {
+  let after;
+  let db;
+  let cleanupVerified = false;
+  try {
+    if (!TASTE_ASSERTION_FAILURES.has(failureCode))
+      fail("TASTE_FAILURE_CLEANUP", "该偏好断言失败不支持自动恢复。", "INCONCLUSIVE");
+    const spec = tasteFixtureStep(stage, {
+      nonce: handles?.fixtureNonce,
+      candidateId: handles?.candidateId,
+      memoryId: handles?.memoryId,
+      correctionCandidateId: handles?.correctionCandidateId,
+    });
+    const token = caseRecord?.token;
+    const tools = JSON.parse(JSON.stringify(spec.leaseTools).replaceAll("{{nonce}}", token ?? ""));
+    const expectedPrompt = `GLASSBOX_ACCEPTANCE_V1 ${token}\n${spec.prompt
+      .replaceAll("{{nonce}}", token ?? "")
+      .trim()}`;
+    if (
+      caseRecord?.id !== spec.id ||
+      caseRecord.status !== "PASS" ||
+      caseRecord.code !== "REAL_REPLY_RECEIVED" ||
+      caseRecord.route !== "private" ||
+      caseRecord.sendAttempted !== true ||
+      caseRecord.inputObserved !== true ||
+      caseRecord.leaseRegistrationAttempted !== true ||
+      caseRecord.leaseRevoked !== true ||
+      caseRecord.prompt !== expectedPrompt ||
+      !/^[a-f0-9]{32}$/.test(token ?? "") ||
+      JSON.stringify(caseRecord.featureAssertions) !== JSON.stringify(spec.featureAssertions) ||
+      JSON.stringify(caseRecord.expected) !==
+        JSON.stringify(spec.expectContains.map((value) => value.replaceAll("{{nonce}}", token))) ||
+      JSON.stringify(caseRecord.leasedToolNames) !==
+        JSON.stringify(tools.map((tool) => tool.name)) ||
+      caseRecord.acceptanceLease?.toolsSha256 !== toolManifestDigest(tools) ||
+      caseRecord.replies?.length !== 1 ||
+      caseRecord.replies[0]?.route !== "private" ||
+      caseRecord.replies[0]?.matches !== true ||
+      caseRecord.anomalies?.length !== 0
+    )
+      fail("TASTE_FAILURE_CLEANUP", "偏好失败用例不属于固定本轮测试。", "INCONCLUSIVE");
+    after = runtimeSnapshot(config.runtime, capture);
+    if (!expectedRuntime || JSON.stringify(expectedRuntime) !== JSON.stringify(after))
+      fail("RUNTIME_CHANGED", "服务身份与已确认的偏好失败 Run 不一致。", "INCONCLUSIVE");
+    db = new DatabaseSync(join(after.dataDirectory, "glassbox.db"), { readOnly: true });
+    const verified = await verifyCaseWithLeaseCleanup(
+      db,
+      after.dataDirectory,
+      caseRecord,
+      config,
+      async (evidence) => {
+        const messageBinding = await verifyMessageBindings(
+          caseRecord,
+          config,
+          clients,
+          evidence.delivery,
+        );
+        const trace = readTraceEvents(
+          after.checkout,
+          after.dataDirectory,
+          evidence.runId,
+          capture,
+          ["tool_result"],
+        );
+        const events = trace.events?.map((row) => row.event) ?? [];
+        verifyTraceEvidence(events, caseRecord, config, evidence.delivery);
+        verifyLeaseTraceEvidence(events, caseRecord, evidence.runId);
+        const feature = observeFeature(caseRecord.featureAssertions, {
+          db,
+          events,
+          runId: evidence.runId,
+          inputBinding: caseRecord.inputBinding,
+        });
+        const call = events.filter(
+          (event) =>
+            event.runId === evidence.runId &&
+            event.type === "tool_call" &&
+            event.data?.name === "owner_memory_admin",
+        );
+        const result = events.filter(
+          (event) =>
+            event.runId === evidence.runId &&
+            event.type === "tool_result" &&
+            event.data?.name === "owner_memory_admin",
+        );
+        if (
+          feature?.status !== "PASS" ||
+          feature.runId !== evidence.runId ||
+          call.length !== 1 ||
+          result.length !== 1 ||
+          !call[0].toolCallId ||
+          result[0].toolCallId !== call[0].toolCallId ||
+          JSON.stringify(call[0].data?.input) !==
+            JSON.stringify(tools[0]?.operations?.[0]?.inputConstraint) ||
+          result[0].data?.isError !== false ||
+          !/^[a-f0-9]{64}$/.test(result[0].data?.outputSha256 ?? "") ||
+          !Number.isSafeInteger(result[0].data?.outputBytes) ||
+          result[0].data.outputBytes < 1
+        )
+          fail("TASTE_FAILURE_TRACE", "偏好 Run 缺少唯一且完整的工具结果摘要。", "INCONCLUSIVE");
+        return {
+          messageBinding,
+          feature,
+          toolCallId: call[0].toolCallId,
+          toolOutputSha256: result[0].data.outputSha256,
+        };
+      },
+    );
+    cleanupVerified = verified.cleanupVerified === true;
+    const finalRuntime = runtimeSnapshot(config.runtime, capture);
+    if (JSON.stringify(after) !== JSON.stringify(finalRuntime) || !cleanupVerified)
+      fail("RUNTIME_CHANGED", "许可清理或最终服务身份未通过独立核验。", "INCONCLUSIVE");
+    return {
+      status: "CLEANUP_VERIFIED",
+      caseId: caseRecord.id,
+      runId: verified.evidence.runId,
+      cleanupVerified: true,
+      failureCode,
+      toolName: "owner_memory_admin",
+      toolCallId: verified.result.toolCallId,
+      toolOutputSha256: verified.result.toolOutputSha256,
+      toolsSha256: caseRecord.acceptanceLease.toolsSha256,
+      promptSha256: digest(caseRecord.prompt),
+      inputBinding: structuredClone(caseRecord.inputBinding),
+      reply: structuredClone(caseRecord.replies[0]),
+      messageBinding: structuredClone(verified.result.messageBinding),
+    };
+  } catch (error) {
+    if (error && typeof error === "object") error.cleanupVerified = false;
     throw error;
   } finally {
     db?.close();

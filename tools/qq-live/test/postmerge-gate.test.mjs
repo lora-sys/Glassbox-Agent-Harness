@@ -58,6 +58,7 @@ function fixture() {
     mergeCommit,
     mergedAt,
     checks: [{ name: "unit", commit: mergeCommit, status: "SUCCESS" }],
+    review: { commit: candidateCommit, status: "PASS", evidenceId: "candidate-review" },
   };
   const input = {
     commit: mergeCommit,
@@ -149,8 +150,8 @@ test("post-merge gate rejects stale reports, Run times, merge metadata, reviews 
     },
     {
       name: "review belongs to another candidate",
-      mutate({ input }) {
-        input.review.commit = "c".repeat(40);
+      mutate({ remote }) {
+        remote.review.commit = "c".repeat(40);
       },
       code: "REVIEW_GATE",
     },
@@ -181,6 +182,13 @@ test("post-merge gate rejects stale reports, Run times, merge metadata, reviews 
       scenario.name,
     );
   }
+});
+
+test("post-merge gate cannot use a caller review claim instead of fresh remote evidence", async () => {
+  const { input, dependencies, remote } = fixture();
+  delete remote.review;
+  assert.equal(input.review.status, "PASS");
+  await assert.rejects(evaluateDeliveryGate(input, dependencies), { code: "REVIEW_GATE" });
 });
 
 test("post-merge gate requires check-only mode", async () => {

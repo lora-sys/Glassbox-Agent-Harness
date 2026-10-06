@@ -1,13 +1,73 @@
 import { fail, digest, toolManifestDigest } from "./core.mjs";
 import { validateFeatureAssertions } from "./feature-observer.mjs";
 import { resolveReadFeatureCase } from "./feature-specs.mjs";
-import { validateMemoryFamily, validateHistoryFamily } from "./feature-suite.mjs";
+import {
+  validateMemoryFamily,
+  validateHistoryFamily,
+  validateTasteFamily,
+} from "./feature-suite.mjs";
+import { TASTE_FAMILY_ID } from "./taste-scenario.mjs";
 import { memoryWorkflow } from "./memory-workflow.mjs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 const runFile = promisify(execFile);
 const repositoryRoot = fileURLToPath(new URL("../../../", import.meta.url));
+
+function formalReviewPass(review, commit) {
+  return (
+    review?.commit === commit &&
+    review.status === "PASS" &&
+    typeof review.evidenceId === "string" &&
+    review.evidenceId.length > 0
+  );
+}
+
+async function resolveReviewEvidence(remote, commit, verifyAgentReview) {
+  const review = remote?.review;
+  if (review?.commit === commit && review.status === "CHANGES_REQUESTED")
+    fail("REVIEW_GATE", "当前 head 存在未解除的正式 changes-requested review。");
+  if (formalReviewPass(review, commit))
+    return {
+      kind: "github-approval",
+      commit,
+      reviewer: review.reviewer,
+      evidenceId: review.evidenceId,
+    };
+  if (typeof verifyAgentReview !== "function")
+    fail("REVIEW_GATE", "当前提交缺少正式 approval 或已验证的 Agent review receipt。");
+  const agent = await verifyAgentReview({ commit, review, remote });
+  if (
+    agent?.status !== "PASS" ||
+    agent.candidateCommit !== commit ||
+    agent.hostOperatorIdentityAttested !== true ||
+    !/^[a-f0-9]{64}$/.test(agent.receiptSha256 ?? "") ||
+    !/^[a-f0-9]{64}$/.test(agent.bindingSha256 ?? "") ||
+    !/^[a-f0-9]{64}$/.test(agent.artifactSha256 ?? "") ||
+    typeof agent.reviewerId !== "string" ||
+    !agent.reviewerId.trim() ||
+    !Array.isArray(agent.implementationAgentIds) ||
+    agent.implementationAgentIds.length === 0 ||
+    agent.implementationAgentIds.some((id) => typeof id !== "string" || !id.trim()) ||
+    new Set(agent.implementationAgentIds).size !== agent.implementationAgentIds.length ||
+    JSON.stringify(agent.implementationAgentIds) !==
+      JSON.stringify(
+        [...agent.implementationAgentIds].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)),
+      ) ||
+    agent.implementationAgentIds.includes(agent.reviewerId)
+  )
+    fail("REVIEW_GATE", "当前提交缺少正式 approval 或已验证的 Agent review receipt。");
+  return {
+    kind: "agent-review-receipt",
+    commit,
+    reviewer: agent.reviewerId,
+    hostOperatorIdentityAttested: true,
+    implementationAgentIds: [...agent.implementationAgentIds],
+    receiptSha256: agent.receiptSha256,
+    bindingSha256: agent.bindingSha256,
+    artifactSha256: agent.artifactSha256,
+  };
+}
 
 /** Gate judgments never execute a merge. Remote checks and evidence are read again by trusted callers. */
 async function verifyRepositoryCoverage({ commit, suite, suiteConfig }) {
@@ -34,9 +94,11 @@ export async function evaluateDeliveryGate(
     verifyReport,
     verifyMemoryReport,
     verifyHistoryReport,
+    verifyTasteReport,
     readRemote,
     resolveRoute,
     verifyCoverage = verifyRepositoryCoverage,
+    verifyAgentReview,
   },
 ) {
   if (
@@ -106,12 +168,7 @@ export async function evaluateDeliveryGate(
     input.deterministic?.commitGate !== "PASS"
   )
     fail("DETERMINISTIC_GATE", "当前提交未通过完整验证和提交门禁。");
-  if (
-    input.review?.commit !== (postMerge ? input.candidateCommit : commit) ||
-    input.review?.status !== "PASS" ||
-    !input.review?.evidenceId
-  )
-    fail("REVIEW_GATE", "当前提交缺少通过的独立审查证据。");
+  const reviewCommit = postMerge ? input.candidateCommit : commit;
   const observed = new Set();
   const freshRunTimes = [];
   const freshInputTimes = [];
@@ -150,6 +207,54 @@ export async function evaluateDeliveryGate(
         freshInputTimes.push(inputTime * 1000);
       }
     }
+    if (report.tasteFamily !== undefined || report.tasteLifecycle !== undefined) {
+      const familyId = report.tasteFamily?.familyId;
+      const original = approvedCases.get(familyId);
+      if (
+        suite.schemaVersion !== 6 ||
+        familyId !== TASTE_FAMILY_ID ||
+        !original ||
+        typeof verifyTasteReport !== "function" ||
+        report.historyFamily !== undefined ||
+        report.historySeedWorkflow !== undefined ||
+        report.historyIsolationWorkflow !== undefined ||
+        report.memoryFamily !== undefined ||
+        report.memoryLifecycle !== undefined ||
+        report.cleanupOnly === true ||
+        report.tasteLifecycle?.status !== "PASS" ||
+        report.tasteLifecycle?.requiresReconciliation !== false
+      )
+        fail("TASTE_FAMILY_GATE", "偏好流程必须绑定固定批准用例并独立核实完整清理。");
+      validateTasteFamily(original);
+      if (observed.has(familyId)) fail("CASE_DUPLICATE", "交付报告重复声明偏好用例。");
+      const taste = await verifyTasteReport(report, { approvedFamily: original });
+      const expectedRuns = report.tasteLifecycle.steps?.map((step) => step.runId);
+      if (
+        taste?.status !== "PASS" ||
+        taste.familyId !== familyId ||
+        taste.runtime?.commit !== commit ||
+        JSON.stringify(taste.runtime) !== JSON.stringify(fresh.runtime) ||
+        !Array.isArray(taste.stageRunIds) ||
+        taste.stageRunIds.length !== 4 ||
+        new Set(taste.stageRunIds).size !== 4 ||
+        JSON.stringify(taste.stageRunIds) !== JSON.stringify(expectedRuns) ||
+        taste.fixture?.lifecycleState !== "retired" ||
+        taste.fixture.activeCount !== 0 ||
+        taste.fixture.pendingCount !== 0 ||
+        report.cases.length !== 4 ||
+        fresh.cases.length !== 4 ||
+        fresh.cases.some(
+          (evidence, index) =>
+            evidence.runId !== taste.stageRunIds[index] ||
+            evidence.caseId !== report.cases[index].id ||
+            evidence.feature?.status !== "PASS" ||
+            evidence.traceVerified !== true,
+        )
+      )
+        fail("TASTE_FAMILY_GATE", "偏好流程的四轮独立 Run 或最终清理证据不完整。");
+      observed.add(familyId);
+      continue;
+    }
     if (
       report.historyFamily !== undefined ||
       report.historySeedWorkflow !== undefined ||
@@ -158,7 +263,7 @@ export async function evaluateDeliveryGate(
       const familyId = report.historyFamily?.caseId,
         original = approvedCases.get(familyId);
       if (
-        ![4, 5].includes(suite.schemaVersion) ||
+        ![4, 5, 6].includes(suite.schemaVersion) ||
         !original ||
         typeof verifyHistoryReport !== "function"
       )
@@ -166,7 +271,8 @@ export async function evaluateDeliveryGate(
       validateHistoryFamily(original);
       const isolation = original.kind === "history-isolation";
       if (
-        (isolation && (suite.schemaVersion !== 5 || report.historySeedWorkflow !== undefined)) ||
+        (isolation &&
+          (![5, 6].includes(suite.schemaVersion) || report.historySeedWorkflow !== undefined)) ||
         (!isolation && report.historyIsolationWorkflow !== undefined)
       )
         fail("HISTORY_FAMILY_GATE", "报告历史流程与批准用例不一致。");
@@ -202,7 +308,7 @@ export async function evaluateDeliveryGate(
       const familyId = report.memoryFamily?.caseId;
       const original = approvedCases.get(familyId);
       if (
-        ![3, 4, 5].includes(suite.schemaVersion) ||
+        ![3, 4, 5, 6].includes(suite.schemaVersion) ||
         !original ||
         typeof verifyMemoryReport !== "function"
       )
@@ -338,12 +444,14 @@ export async function evaluateDeliveryGate(
     )
   )
     fail("CI_GATE", "当前远端提交存在缺失或未通过的必需 CI。");
+  const reviewEvidence = await resolveReviewEvidence(remote, reviewCommit, verifyAgentReview);
   return {
     status: "PASS",
     commit,
     suiteSha256,
     caseIds: [...observed],
     remoteHead: remote.headCommit,
+    reviewEvidence,
     ...(postMerge
       ? {
           candidateCommit: input.candidateCommit,

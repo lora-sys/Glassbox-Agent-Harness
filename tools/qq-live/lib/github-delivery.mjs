@@ -24,6 +24,7 @@ const VIEW_FIELDS = [
   "isDraft",
   "mergeable",
   "headRefOid",
+  "baseRefOid",
   "author",
   "mergeCommit",
   "statusCheckRollup",
@@ -81,6 +82,7 @@ function selectIndependentReview(reviews, headCommit, authorLogin) {
     if (
       reviewCommit(review) !== headCommit ||
       typeof login !== "string" ||
+      !["APPROVED", "CHANGES_REQUESTED", "DISMISSED"].includes(review.state) ||
       typeof submittedAt !== "string" ||
       !Number.isFinite(Date.parse(submittedAt))
     )
@@ -99,7 +101,8 @@ function selectIndependentReview(reviews, headCommit, authorLogin) {
       });
   }
   const latest = [...latestByReviewer.values()];
-  const changesRequested = latest.filter((review) => review.state === "CHANGES_REQUESTED");
+  const active = latest.filter((review) => review.state !== "DISMISSED");
+  const changesRequested = active.filter((review) => review.state === "CHANGES_REQUESTED");
   if (changesRequested.length)
     return {
       status: "CHANGES_REQUESTED",
@@ -118,7 +121,7 @@ function selectIndependentReview(reviews, headCommit, authorLogin) {
         ),
       ),
     };
-  const eligible = latest
+  const eligible = active
     .filter((review) => review.user.login.toLowerCase() !== authorLogin.toLowerCase())
     .filter((review) => review.state === "APPROVED")
     .sort((a, b) => b.submitted_at.localeCompare(a.submitted_at));
@@ -273,8 +276,9 @@ export function createGitHubDelivery({ pullRequestUrl, cwd, execFileImpl = execF
       fail("GITHUB_PR_DATA", "gh 未返回有效的 pull request 数据。");
     }
     const headCommit = data?.headRefOid;
-    if (!/^[a-f0-9]{40}$/i.test(headCommit ?? ""))
-      fail("GITHUB_PR_DATA", "Pull request 缺少有效的 head commit。");
+    const baseCommit = data?.baseRefOid;
+    if (!/^[a-f0-9]{40}$/i.test(headCommit ?? "") || !/^[a-f0-9]{40}$/i.test(baseCommit ?? ""))
+      fail("GITHUB_PR_DATA", "Pull request 缺少有效的 base 或 head commit。");
     if (data.number !== pr.number || data.url?.replace(/\/$/, "") !== pr.url)
       fail("GITHUB_PR_DATA", "gh 返回的 pull request 与请求地址不一致。");
     const authorLogin = data.author?.login;
@@ -309,7 +313,9 @@ export function createGitHubDelivery({ pullRequestUrl, cwd, execFileImpl = execF
       reviews.some(
         (review) =>
           !Number.isSafeInteger(review?.id) ||
-          typeof review?.state !== "string" ||
+          !["PENDING", "COMMENTED", "APPROVED", "CHANGES_REQUESTED", "DISMISSED"].includes(
+            review?.state,
+          ) ||
           typeof review?.commit_id !== "string" ||
           typeof review?.user?.login !== "string" ||
           (review?.submitted_at === null
@@ -332,6 +338,8 @@ export function createGitHubDelivery({ pullRequestUrl, cwd, execFileImpl = execF
     return {
       repo,
       repoIdentity: repo,
+      authorLogin,
+      baseCommit,
       pullRequestUrl: pr.url,
       pr: { number: pr.number, url: pr.url },
       headCommit,
@@ -394,8 +402,7 @@ export function createGitHubDelivery({ pullRequestUrl, cwd, execFileImpl = execF
         current.state !== "OPEN" ||
         current.draft !== false ||
         current.mergeable !== true ||
-        current.review.status !== "PASS" ||
-        current.review.commit !== current.headCommit ||
+        current.review.status === "CHANGES_REQUESTED" ||
         REQUIRED_CHECK_NAMES.some(
           (name) =>
             current.checks.filter((check) => check.name === name).length !== 1 ||

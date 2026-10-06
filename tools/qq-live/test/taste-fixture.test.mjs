@@ -2,10 +2,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import { observeTasteFixture } from "../lib/taste-fixture.mjs";
+import { observeTasteRecoveryFixture } from "../lib/taste-recovery.mjs";
 import {
-  tasteFixtureProject,
+  TASTE_FAMILY_ID,
   tasteFixtureStatement,
   tasteFixtureStep,
+  tasteFixtureProject,
 } from "../lib/taste-scenario.mjs";
 
 const nonce = "a".repeat(32);
@@ -450,4 +452,147 @@ test("observer fails closed on reused correction, early retirement, wrong Owner,
       }),
     { code: "TASTE_FIXTURE_CLEANUP" },
   );
+});
+
+test("known negative-feedback failure rediscovers the correction and original Memory from SQL", (t) => {
+  const f = fixture(t);
+  f.db
+    .prepare(
+      "UPDATE memory_candidates SET status='pending',reviewed_at=NULL,promoted_memory_id=NULL WHERE id=?",
+    )
+    .run(correctionCandidateId);
+  f.db
+    .prepare("UPDATE memories SET lifecycle_state='active',disabled_at=NULL WHERE id=?")
+    .run(memoryId);
+  f.db.prepare("DELETE FROM memory_audit_events WHERE run_id='run-retire'").run();
+  const feedbackRow = {
+    stage: "feedback",
+    phase: "observed",
+    handles: {
+      fixtureNonce: nonce,
+      projectId,
+      principalId,
+      candidateId,
+      creationRunId: "run-feedback",
+      stepRunId: "run-feedback",
+    },
+  };
+  const promoteRow = {
+    stage: "promote",
+    phase: "observed",
+    handles: {
+      ...feedbackRow.handles,
+      promotionRunId: "run-promote",
+      memoryId,
+      stepRunId: "run-promote",
+    },
+  };
+  const sourceCase = {
+    id: "taste-negative-feedback",
+    status: "PASS",
+    code: "REAL_REPLY_RECEIVED",
+  };
+  const pending = {
+    stage: "negative-feedback",
+    phase: "cleanup_confirmed",
+    handles: { ...promoteRow.handles },
+    knownFailure: {
+      failureCode: "TASTE_NEGATIVE",
+      sourceCase,
+      terminalProof: {
+        failureCode: "TASTE_NEGATIVE",
+        cleanupVerified: true,
+        runId: "run-negative",
+        toolOutputSha256: "e".repeat(64),
+      },
+    },
+  };
+  const record = { rows: [feedbackRow, promoteRow, pending], pending };
+  const observation = observeTasteRecoveryFixture(f.db, record);
+  assert.equal(observation.status, "NEEDS_CLEANUP");
+  assert.deepEqual(observation.recoveryActions, ["reject-correction", "expire-original"]);
+  assert.equal(observation.handles.candidateId, candidateId);
+  assert.equal(observation.handles.memoryId, memoryId);
+  assert.equal(observation.handles.correctionCandidateId, correctionCandidateId);
+  assert.equal(observation.handles.negativeRunId, "run-negative");
+  assert.equal(Object.hasOwn(observation, "statement"), false);
+});
+
+test("Taste recovery observer distinguishes correction rejection from fully expired fixture", (t) => {
+  const f = fixture(t);
+  const handles = {
+    fixtureNonce: nonce,
+    projectId,
+    principalId,
+    candidateId,
+    memoryId,
+    correctionCandidateId,
+    creationRunId: "run-feedback",
+    promotionRunId: "run-promote",
+    negativeRunId: "run-negative",
+    cleanupRunId: "run-retire",
+    stepRunId: "run-retire",
+  };
+  const completed = {
+    pending: {
+      familyId: TASTE_FAMILY_ID,
+      phase: "observed",
+      stage: "retire",
+      handles,
+    },
+  };
+  assert.equal(observeTasteRecoveryFixture(f.db, completed).status, "CLEANED");
+
+  f.db.exec(`
+    INSERT INTO runs(id,conversation_id,message_id,principal_id,scope_json,execution_ref,status,created_at,updated_at)
+      VALUES('run-recovery-reject','conversation-recovery','message-recovery','${principalId}','{"chatType":"private"}','pi','succeeded','now','now');
+    UPDATE memory_candidates SET status='rejected', promoted_memory_id=NULL WHERE id='${correctionCandidateId}';
+    UPDATE memories SET lifecycle_state='active', disabled_at=NULL WHERE id='${memoryId}';
+    INSERT INTO memory_audit_events(id,request_id,principal_id,action,target_id,decision_id,conversation_id,run_id,lineage_json,created_at)
+      VALUES('audit-recovery-reject','request','${principalId}','reject','${correctionCandidateId}','decision','conversation-recovery','run-recovery-reject','["${correctionCandidateId}","run:run-recovery-reject"]','now');
+  `);
+  const rejectedHandles = {
+    ...handles,
+    cleanupRunId: "run-recovery-reject",
+    stepRunId: "run-retire",
+  };
+  const rejected = observeTasteRecoveryFixture(f.db, {
+    pending: {
+      familyId: TASTE_FAMILY_ID,
+      phase: "recovery_observed",
+      stage: "negative-feedback",
+      handles: rejectedHandles,
+      recoveryAttempt: {
+        action: "reject-correction",
+        planSha256: "e".repeat(64),
+        cleanupRunId: "run-recovery-reject",
+      },
+    },
+  });
+  assert.equal(rejected.status, "NEEDS_CLEANUP");
+  assert.equal(rejected.stage, "negative-feedback");
+
+  f.db.exec(`
+    INSERT INTO runs(id,conversation_id,message_id,principal_id,scope_json,execution_ref,status,created_at,updated_at)
+      VALUES('run-recovery-expire','conversation-expire','message-expire','${principalId}','{"chatType":"private"}','pi','succeeded','now','now');
+    UPDATE memories SET lifecycle_state='expired', disabled_at='now' WHERE id='${memoryId}';
+    INSERT INTO memory_audit_events(id,request_id,principal_id,action,target_id,decision_id,conversation_id,run_id,lineage_json,created_at)
+      VALUES('audit-recovery-expire','request','${principalId}','expire','${memoryId}','decision','conversation-expire','run-recovery-expire','["${memoryId}","run:run-recovery-expire"]','now');
+  `);
+  const expired = observeTasteRecoveryFixture(f.db, {
+    pending: {
+      familyId: TASTE_FAMILY_ID,
+      phase: "recovery_observed",
+      stage: "negative-feedback",
+      handles: { ...handles, cleanupRunId: "run-recovery-expire", stepRunId: "run-retire" },
+      recoveryAttempt: {
+        action: "expire-original",
+        planSha256: "f".repeat(64),
+        cleanupRunId: "run-recovery-expire",
+      },
+    },
+  });
+  assert.equal(expired.status, "CLEANED");
+  assert.equal(expired.activeCount, 0);
+  assert.equal(expired.pendingCount, 0);
 });

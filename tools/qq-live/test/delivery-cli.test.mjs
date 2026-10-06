@@ -8,6 +8,7 @@ import {
   validateReportManifest,
   runDeliveryCli,
   readDeliveryRemoteEvidence,
+  assertNoPendingAcceptanceFixtures,
 } from "../lib/delivery-cli.mjs";
 import { baseConfig } from "./fixture.mjs";
 import { digest } from "../lib/core.mjs";
@@ -17,6 +18,25 @@ async function fixture(t) {
   t.after(() => rm(directory, { recursive: true, force: true }));
   return directory;
 }
+
+test("delivery checks both account-wide fixture anchors again before merge", async (t) => {
+  const directory = await fixture(t);
+  const account = "a".repeat(24);
+  await assertNoPendingAcceptanceFixtures(directory, account);
+  for (const [kind, code] of [
+    ["memory", "MEMORY_FIXTURE_PENDING"],
+    ["taste", "TASTE_FIXTURE_PENDING"],
+  ]) {
+    const path = join(directory, `${account}.${kind}-pending.json`);
+    await writeFile(path, "{}");
+    await assert.rejects(assertNoPendingAcceptanceFixtures(directory, account), { code });
+    await rm(path);
+    await assertNoPendingAcceptanceFixtures(directory, account);
+    await mkdir(path);
+    await assert.rejects(assertNoPendingAcceptanceFixtures(directory, account), { code });
+    await rm(path, { recursive: true });
+  }
+});
 
 test("post-merge evidence uses the adapter's merged checks contract instead of candidate checks", async () => {
   const commit = "b".repeat(40);

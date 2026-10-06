@@ -35,6 +35,112 @@ const commit = "a".repeat(40),
     ],
   }),
   suiteSha256 = digest(suiteText);
+
+function tasteGateFixture() {
+  const f = fixture();
+  const familyId = "taste-project-feedback-lifecycle";
+  const suiteText = JSON.stringify({
+    schemaVersion: 6,
+    cases: [{ id: familyId, kind: "taste-lifecycle", chat: "private" }],
+  });
+  const stages = ["feedback", "promote", "negative-feedback", "retire"];
+  const runs = stages.map((stage) => `run-taste-${stage}`);
+  const cases = stages.map((stage) => ({
+    id: `taste-${stage}`,
+    status: "PASS",
+    leaseRevoked: true,
+  }));
+  const report = {
+    mode: "run",
+    status: "PASS",
+    suiteSha256: digest(suiteText),
+    productAcceptance: { status: "PASS", runtime: { commit } },
+    cases,
+    tasteFamily: { familyId },
+    tasteLifecycle: {
+      status: "PASS",
+      requiresReconciliation: false,
+      steps: stages.map((stage, i) => ({ stage, runId: runs[i] })),
+    },
+  };
+  f.input.suiteText = suiteText;
+  f.input.suiteSha256 = digest(suiteText);
+  f.input.requiredCaseIds = [familyId];
+  f.input.reports = [report];
+  f.dependencies.verifyCoverage = async () => ({ status: "PASS", requiredCaseIds: [familyId] });
+  f.dependencies.verifyReport = async () => ({
+    status: "PASS",
+    runtime: { commit },
+    cases: cases.map((item, i) => ({
+      caseId: item.id,
+      runId: runs[i],
+      traceVerified: true,
+      feature: { status: "PASS" },
+    })),
+  });
+  f.dependencies.verifyTasteReport = async () => ({
+    status: "PASS",
+    familyId,
+    runtime: { commit },
+    stageRunIds: runs,
+    fixture: { lifecycleState: "retired", activeCount: 0, pendingCount: 0 },
+  });
+  return f;
+}
+
+test("delivery counts Taste only after independent four-Run final-state verification", async () => {
+  const f = tasteGateFixture();
+  const result = await evaluateDeliveryGate(f.input, f.dependencies);
+  assert.equal(result.status, "PASS");
+});
+
+test("delivery rejects stale, incomplete, duplicate, mixed or cleanup-only Taste evidence", async () => {
+  for (const change of [
+    (f) => {
+      delete f.dependencies.verifyTasteReport;
+    },
+    (f) => {
+      f.input.reports[0].cleanupOnly = true;
+    },
+    (f) => {
+      f.input.reports[0].tasteLifecycle.requiresReconciliation = true;
+    },
+    (f) => {
+      f.input.reports[0].memoryFamily = { caseId: "memory-project-promote-expire" };
+    },
+    (f) => {
+      f.input.reports[0].tasteLifecycle.steps[3].runId = "foreign-run";
+    },
+    (f) => {
+      f.dependencies.verifyTasteReport = async () => ({ status: "PASS" });
+    },
+    (f) => {
+      const original = f.dependencies.verifyTasteReport;
+      f.dependencies.verifyTasteReport = async () => ({
+        ...(await original()),
+        runtime: { commit: "b".repeat(40) },
+      });
+    },
+    (f) => {
+      const original = f.dependencies.verifyTasteReport;
+      f.dependencies.verifyTasteReport = async () => ({
+        ...(await original()),
+        fixture: { lifecycleState: "retired", activeCount: 1, pendingCount: 0 },
+      });
+    },
+  ]) {
+    const f = tasteGateFixture();
+    change(f);
+    await assert.rejects(evaluateDeliveryGate(f.input, f.dependencies), {
+      code: "TASTE_FAMILY_GATE",
+    });
+  }
+  const duplicate = tasteGateFixture();
+  duplicate.input.reports.push(structuredClone(duplicate.input.reports[0]));
+  await assert.rejects(evaluateDeliveryGate(duplicate.input, duplicate.dependencies), {
+    code: "CASE_DUPLICATE",
+  });
+});
 function fixture() {
   const input = {
     commit,
@@ -107,6 +213,7 @@ function fixture() {
       state: "OPEN",
       draft: false,
       mergeable: true,
+      review: { commit, status: "PASS", reviewer: "reviewer", evidenceId: "github-review" },
       checks: [{ name: "unit", commit, status: "SUCCESS" }],
     }),
   };
@@ -172,6 +279,7 @@ function memoryFixture(familyId = MEMORY_FAMILY_ID) {
       state: "OPEN",
       draft: false,
       mergeable: true,
+      review: { commit, status: "PASS", reviewer: "reviewer", evidenceId: "github-review" },
       checks: [{ name: "unit", commit, status: "SUCCESS" }],
     }),
   };
@@ -187,6 +295,119 @@ test("read-only gate judgments cannot authorize a merge", async () => {
   assert.equal(result.mergeAuthorized, false);
   delete input.checkOnly;
   await assert.rejects(evaluateDeliveryGate(input, dependencies), { code: "MERGE_AUTHORIZATION" });
+});
+
+test("an exact verified full-diff Agent receipt can replace missing formal approval", async () => {
+  const { input, dependencies } = fixture();
+  input.review = { commit: null, status: "MISSING", evidenceId: null };
+  dependencies.readRemote = async () => ({
+    headCommit: commit,
+    state: "OPEN",
+    draft: false,
+    mergeable: true,
+    review: { commit: null, status: "MISSING", evidenceId: null },
+    checks: [{ name: "unit", commit, status: "SUCCESS" }],
+  });
+  dependencies.verifyAgentReview = async ({ commit: expectedCommit }) => ({
+    status: "PASS",
+    candidateCommit: expectedCommit,
+    receiptSha256: "b".repeat(64),
+    bindingSha256: "c".repeat(64),
+    artifactSha256: "d".repeat(64),
+    reviewerId: "independent-review-agent",
+    implementationAgentIds: ["agent:implementation-a"],
+    hostOperatorIdentityAttested: true,
+  });
+  const gate = await evaluateDeliveryGate(input, dependencies);
+  assert.equal(gate.reviewEvidence.kind, "agent-review-receipt");
+  assert.equal(gate.reviewEvidence.commit, commit);
+  assert.equal(gate.mergeAuthorized, true);
+});
+
+test("an Agent receipt cannot override a current-head changes-requested review", async () => {
+  const { input, dependencies } = fixture();
+  dependencies.readRemote = async () => ({
+    headCommit: commit,
+    state: "OPEN",
+    draft: false,
+    mergeable: true,
+    review: { commit, status: "CHANGES_REQUESTED", evidenceId: "change-request" },
+    checks: [{ name: "unit", commit, status: "SUCCESS" }],
+  });
+  dependencies.verifyAgentReview = async () => ({
+    status: "PASS",
+    candidateCommit: commit,
+    receiptSha256: "b".repeat(64),
+    bindingSha256: "c".repeat(64),
+    artifactSha256: "d".repeat(64),
+    reviewerId: "independent-review-agent",
+    implementationAgentIds: ["agent:implementation-a"],
+    hostOperatorIdentityAttested: true,
+  });
+  await assert.rejects(evaluateDeliveryGate(input, dependencies), { code: "REVIEW_GATE" });
+});
+
+test("post-merge review receipt stays bound to the candidate while product evidence uses the merge commit", async () => {
+  const { input, dependencies } = fixture();
+  const candidateCommit = commit;
+  const mergeCommit = "f".repeat(40);
+  const mergedAt = "2026-10-06T12:00:00.000Z";
+  input.commit = mergeCommit;
+  input.postMerge = true;
+  input.checkOnly = true;
+  input.candidateCommit = candidateCommit;
+  input.deterministic.commit = mergeCommit;
+  input.reports[0].productAcceptance.runtime.commit = mergeCommit;
+  for (const c of input.reports[0].cases) c.inputTime = Date.parse(mergedAt) / 1000 + 10;
+  dependencies.verifyReport = async () => ({
+    status: "PASS",
+    runtime: { commit: mergeCommit },
+    cases: [
+      {
+        caseId: "feature-test",
+        runId: "run-test-1",
+        traceVerified: true,
+        feature: { status: "PASS" },
+        runCreatedAt: mergedAt,
+        messageBinding: { input: { time: Date.parse(mergedAt) / 1000 + 10 } },
+      },
+      {
+        caseId: "baseline-test",
+        runId: "run-test-2",
+        traceVerified: true,
+        runCreatedAt: mergedAt,
+        messageBinding: { input: { time: Date.parse(mergedAt) / 1000 + 10 } },
+      },
+    ],
+  });
+  dependencies.readRemote = async () => ({
+    headCommit: candidateCommit,
+    state: "MERGED",
+    mergeCommit,
+    mergedAt,
+    review: { commit: candidateCommit, status: "MISSING" },
+    checks: [{ name: "unit", commit: mergeCommit, status: "SUCCESS" }],
+  });
+  const reviewedCommits = [];
+  dependencies.verifyAgentReview = async ({ commit: reviewedCommit }) => {
+    reviewedCommits.push(reviewedCommit);
+    return {
+      status: "PASS",
+      candidateCommit: reviewedCommit,
+      receiptSha256: "1".repeat(64),
+      bindingSha256: "2".repeat(64),
+      artifactSha256: "3".repeat(64),
+      reviewerId: "independent-reviewer",
+      implementationAgentIds: ["agent:implementation-a"],
+      hostOperatorIdentityAttested: true,
+    };
+  };
+  const result = await evaluateDeliveryGate(input, dependencies);
+  assert.equal(result.status, "PASS");
+  assert.equal(result.commit, mergeCommit);
+  assert.equal(result.candidateCommit, candidateCommit);
+  assert.equal(result.reviewEvidence.commit, candidateCommit);
+  assert.deepEqual(reviewedCommits, [candidateCommit]);
 });
 
 test("default coverage rejects evidence for a different checkout commit before remote checks", async () => {
@@ -279,7 +500,6 @@ test("missing regression, unknown cleanup, skipped CI and stale review block mer
     (input) => input.requiredCaseIds.push("uncovered-feature"),
     (input) => (input.reports[0].cases[0].cleanup = { required: true, restored: false }),
     (input) => (input.reports[0].cases[0].leaseRevoked = false),
-    (input) => (input.review.commit = "c".repeat(40)),
     (input) => (input.deterministic.full = "FAIL"),
     (input) => (input.userAuthorizedMerge = false),
   ]) {
@@ -291,6 +511,21 @@ test("missing regression, unknown cleanup, skipped CI and stale review block mer
   await assert.rejects(
     evaluateDeliveryGate(input, {
       ...dependencies,
+      readRemote: async () => ({
+        headCommit: commit,
+        state: "OPEN",
+        draft: false,
+        mergeable: true,
+        review: { commit, status: "CHANGES_REQUESTED" },
+        checks: [{ name: "unit", commit, status: "SUCCESS" }],
+      }),
+    }),
+    { code: "REVIEW_GATE" },
+  );
+  const fresh = fixture();
+  await assert.rejects(
+    evaluateDeliveryGate(fresh.input, {
+      ...fresh.dependencies,
       readRemote: async () => ({
         headCommit: commit,
         state: "OPEN",

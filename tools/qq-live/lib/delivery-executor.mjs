@@ -38,8 +38,7 @@ function validRemoteForMerge(remote, commit) {
     Array.isArray(remote.checks) &&
     remote.checks.length > 0 &&
     remote.checks.every((check) => check?.commit === commit && check.status === "SUCCESS") &&
-    remote.review?.commit === commit &&
-    remote.review.status === "PASS"
+    !(remote.review?.commit === commit && remote.review.status === "CHANGES_REQUESTED")
   );
 }
 
@@ -382,6 +381,7 @@ export async function executeDelivery(input, deps) {
     attemptId: randomUUID(),
     ...binding,
     remoteHead: remoteHead(secondReadiness.remote),
+    reviewEvidence: secondReadiness.gate.reviewEvidence,
     startedAt: new Date().toISOString(),
     status: "ATTEMPTING",
   };

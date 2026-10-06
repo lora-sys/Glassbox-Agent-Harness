@@ -115,6 +115,63 @@ test("unknown Taste send is never repeated and blocks later stages", async () =>
   assert.equal(result.steps.length, 0);
 });
 
+test("a replied marker mismatch remains FAIL after independently confirmed cleanup", async () => {
+  const proof = {
+    cleanupVerified: true,
+    failureCode: "REPLY_ASSERTION_FAILED",
+    caseId: "taste-feedback",
+    runId: "run-feedback",
+    toolOutputSha256: "f".repeat(64),
+  };
+  const f = fixture({
+    executeStep: async (_stage, spec) => {
+      f.sent.push(spec.id);
+      return {
+        transportCase: {
+          id: spec.id,
+          status: "FAIL",
+          code: "REPLY_ASSERTION_FAILED",
+          route: "private",
+        },
+      };
+    },
+    confirmKnownFailure: async () => proof,
+  });
+  const result = await runTasteLifecycle(f.options);
+  assert.equal(result.status, "FAIL");
+  assert.equal(result.error.code, "REPLY_ASSERTION_FAILED");
+  assert.equal(result.cleanupConfirmed, true);
+  assert.deepEqual(result.knownFailure.terminalProof, proof);
+  assert.equal(f.checkpoints.at(-1).phase, "cleanup_confirmed");
+  assert.deepEqual(f.sent, ["taste-feedback"]);
+});
+
+test("a Trace assertion failure does not enter Taste fixture cleanup recovery", async () => {
+  let cleanupCalls = 0;
+  const f = fixture({
+    executeStep: async (_stage, spec) => {
+      f.sent.push(spec.id);
+      return {
+        transportCase: {
+          id: spec.id,
+          status: "PASS",
+          code: "REAL_REPLY_RECEIVED",
+          route: "private",
+        },
+        featureFailureCode: "FEATURE_TRACE",
+      };
+    },
+    confirmKnownFailure: async () => {
+      cleanupCalls++;
+      return proof;
+    },
+  });
+  const result = await runTasteLifecycle(f.options);
+  assert.equal(result.status, "INCONCLUSIVE");
+  assert.equal(result.requiresReconciliation, true);
+  assert.equal(cleanupCalls, 0);
+  assert.deepEqual(f.sent, ["taste-feedback"]);
+});
 test("a claimed reply without independently verified lease cleanup cannot advance", async () => {
   const f = fixture();
   const execute = f.options.executeStep;
@@ -129,7 +186,15 @@ test("a claimed reply without independently verified lease cleanup cannot advanc
 });
 
 test("negative feedback must leave the original preference active until confirmed", async () => {
-  const f = fixture();
+  const f = fixture({
+    confirmKnownFailure: async (_stage, _spec, testCase, failureCode) => ({
+      cleanupVerified: true,
+      failureCode,
+      caseId: testCase.id,
+      runId: "run-negative-feedback",
+      toolOutputSha256: "d".repeat(64),
+    }),
+  });
   const observe = f.options.observeStep;
   f.options.observeStep = async (stage, handles) => {
     const result = await observe(stage, handles);
@@ -137,20 +202,32 @@ test("negative feedback must leave the original preference active until confirme
     return result;
   };
   const result = await runTasteLifecycle(f.options);
-  assert.equal(result.error.code, "TASTE_NEGATIVE");
+  assert.equal(result.status, "FAIL");
+  assert.equal(result.knownFailure.failureCode, "TASTE_NEGATIVE");
+  assert.equal(result.cleanupConfirmed, true);
   assert.deepEqual(f.sent, ["feedback", "promote", "negative-feedback"]);
   assert.equal(result.requiresReconciliation, true);
 });
 
 test("retired preference with another active fixture does not prove cleanup", async () => {
-  const f = fixture();
+  const f = fixture({
+    confirmKnownFailure: async (_stage, _spec, testCase, failureCode) => ({
+      cleanupVerified: true,
+      failureCode,
+      caseId: testCase.id,
+      runId: "run-retire",
+      toolOutputSha256: "e".repeat(64),
+    }),
+  });
   const observe = f.options.observeStep;
   f.options.observeStep = async (stage, handles) => ({
     ...(await observe(stage, handles)),
     ...(stage === "retire" ? { activeCount: 1 } : {}),
   });
   const result = await runTasteLifecycle(f.options);
-  assert.equal(result.error.code, "TASTE_RETIRE");
+  assert.equal(result.status, "FAIL");
+  assert.equal(result.knownFailure.failureCode, "TASTE_RETIRE");
+  assert.equal(result.cleanupConfirmed, true);
   assert.equal(result.requiresReconciliation, true);
 });
 
