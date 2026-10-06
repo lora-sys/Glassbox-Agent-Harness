@@ -1,10 +1,36 @@
 # Glassbox Owner and Group Operations
 
-Status: PLANNED POST-P3
+Status: IMPLEMENTED OWNER CAPABILITY CONTROLS / PLANNED GROUP ASSIGNMENT MODEL
 
-This document defines the planned Owner control surface, group-specific operations, group assignment loop, per-run Tool surface, and safe group capability creation.
+This document separates the implemented Owner group capability controls from the planned group assignment loop, schedules, reports and general Tool registry.
 
-The active implementation source of truth remains `.plans/03-personal-agent-foundation.md`. Nothing in this document is permission to expand P3 before its completion gate passes.
+P3 is complete. Issue #123 closed on 2026-09-30 after the F0-F4 design was brought into the repository; that closure does not mean the group-assignment pilot is implemented. The completed `.plans/03-plus-owner-control-smoke.md` records the Owner-control foundation. Current code and the implementation map below take precedence over conceptual names in later sections.
+
+## Implemented controls
+
+| Contract or behavior | Current source |
+| --- | --- |
+| `GroupCapabilityPolicy` and versioned `group_capability_policies` persistence | `apps/server/src/management/capability-policy.ts` |
+| Owner-private `owner_group_admin` Tool | `apps/server/src/runtime/pi/owner-tools.ts` |
+| Per-Run scope/policy/discovery checks before Tool schemas reach the model | `apps/server/src/management/application.ts` |
+| `ToolDescriptor` and `EffectiveToolSurface` projections | `apps/server/src/runtime/pi/tool-plane.ts` |
+
+`GroupCapabilityPolicy` contains `categories`, `memorySources`, and optional `webCapabilities` boolean maps. The stored record binds the policy to `connectionId` and `groupId`, with `version`, `updatedByPrincipalId`, and `updatedAt`. A missing or false switch does not enable that capability. Policy is product configuration, not a grant.
+
+`owner_group_admin` accepts typed actions:
+
+```text
+get
+set_access
+set_skill
+set_capability
+set_history
+set_memory_source
+```
+
+Each action names one `groupId`; mutation actions validate their action-specific fields. The Tool uses the protected `group:manage` Action on `owner-control`, checks Owner-private scope and mutation intent, and keeps call-time authorization. `set_capability` supports the registered QQ and Web categories. The group access and Skill whitelist settings are separate from the `GroupCapabilityPolicy` maps.
+
+The `RunCapabilitySet`, `ToolDefinition`, `GroupToolBinding`, schedule, assignment, reminder, report and `OwnerInsight` shapes below remain conceptual. Do not treat them as implemented interfaces or database tables.
 
 ## Decision
 
@@ -31,16 +57,16 @@ Schedules
 Assignments
 Reminder policy
 Reports
-Memory namespace after P4
+Memory namespace
 ```
 
 The Owner private Main Agent may inspect and manage those scopes through protected Glassbox Actions.
 
 A group Principal receives only the Context and capability surface authorized for that Run.
 
-## P3 dependency
+## Established P3 foundation
 
-This design depends on P3 proving:
+The implemented controls and remaining design reuse the completed P3 boundaries:
 
 ```text
 Principal and Channel identity
@@ -51,7 +77,7 @@ Tool and Ops Gate
 Delivery Gate
 Pi Runtime Adapter
 narrow runtime profiles
-Turso durability
+local libSQL/SQLite durability
 Raw Trace
 QQ private and group transport
 restart and dedupe
@@ -65,7 +91,7 @@ Reuse the P3 trust boundaries.
 
 The Owner private projection is the highest-authority user-facing control surface.
 
-It may expose protected Actions such as:
+Beyond the implemented `owner_group_admin` actions above, the planned control model may expose operations such as:
 
 ```text
 owner_group_list
@@ -87,7 +113,7 @@ owner_trace_inspect
 owner_failure_list
 ```
 
-These names are conceptual.
+These names are conceptual and are not the current Tool inventory.
 
 Do not implement one unrestricted command string that can mutate anything.
 
@@ -214,7 +240,7 @@ Do not add a broker until a real group has enough Tools to justify it.
 
 ## Group Tool Registry
 
-Glassbox owns the product registry for group-specific capability bindings.
+The planned general registry would remain Glassbox-owned. Current code uses the fixed QQ capability registry and `GroupCapabilityPolicy`; it does not persist the general `ToolDefinition` / `GroupToolBinding` model below.
 
 Conceptual records:
 
@@ -423,7 +449,7 @@ ScheduleOccurrence
 DeliveryAttempt
 ```
 
-For one test group, an in-process scheduler is acceptable when Turso stores the durable schedule and occurrence identities.
+For one test group, an in-process scheduler is acceptable when the local database stores the durable schedule and occurrence identities.
 
 A scheduler tick may be frequent, but each occurrence needs a deterministic idempotency key.
 
@@ -531,9 +557,9 @@ Do not inject every group's full history into every Owner prompt.
 
 Use a compact summary and protected detail Tools.
 
-## Group Memory after P4
+## Group Memory
 
-Group Memory begins only with the P4 Memory system.
+The implemented learning system supports group-scoped `MemoryCandidate` and `CanonicalMemory` records. See `docs/memory-taste.md`.
 
 Default rule:
 
@@ -551,7 +577,7 @@ group A evidence
 
 The Owner private Main Agent may query several authorized group namespaces for Owner use.
 
-Cross-group synthesis should create a derived Owner-only insight:
+A future cross-group synthesis feature should retain this Owner-only conceptual boundary. `OwnerInsight` is not a current type or table:
 
 ```text
 OwnerInsight
@@ -600,7 +626,7 @@ Authorization, secrets, production schema changes, arbitrary shell authority, an
 
 ## Data ownership
 
-Glassbox and Turso own:
+Glassbox owns the implemented group capability policy in local libSQL/SQLite. The planned records below would remain Glassbox-owned:
 
 ```text
 GroupPolicy
@@ -617,10 +643,10 @@ ReminderPolicy
 ReminderEvent
 ReportSnapshot
 OwnerGroupOpsSnapshot projection inputs
-OwnerInsight after P4
+OwnerInsight, planned
 ```
 
-Large artifacts may use R2 with durable references in Turso.
+Large artifacts may use R2 with durable references in the local database.
 
 Lora PI Kit may package Tool implementations, Skills, prompts, and runtime adapters.
 
@@ -628,7 +654,7 @@ The Kit does not own group authorization or assignment truth.
 
 ## First test-group slice
 
-The first useful demo after P3 should be intentionally narrow.
+The planned group-assignment pilot should remain narrow. Its acceptance loop below has not been established merely by completing Owner capability controls.
 
 Use one real test group.
 

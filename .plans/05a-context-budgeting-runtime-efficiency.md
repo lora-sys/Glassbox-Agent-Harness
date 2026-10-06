@@ -1,6 +1,6 @@
 # Plan 05A — Context Budgeting and Runtime Efficiency
 
-Status: ACTIVE COMBINED P5 IMPLEMENTATION AFTER P4 COMPLETION
+Status: COMPLETE (2026-09-27). The combined P5 implementation is complete; Issues #13 and #14 closed on that date. The implementation steps and acceptance evidence below are retained as a historical record.
 
 Tracking Issue: #13
 

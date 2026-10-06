@@ -4,13 +4,11 @@ Status: ROADMAP ONLY
 
 This file records sequencing and product direction. It is not permission to implement future phases.
 
-P3, P4A, P4B, and the Issue #21 repository refactor are complete. The current closeout is:
+As checked on 2026-10-06, P3, P4A, P4B, the Issue #21 repository refactor, and P5A/P5B are complete. Issues #13 and #14 closed on 2026-09-27. Web Search, Fetch and browser implementation and accepted deferrals are recorded in [the Issue #20 plan](./05-web-search-fetch-browser.md); #20 is closed.
 
-```text
-.plans/issue-24-closeout.md
-```
+[Issue #24 closeout](./issue-24-closeout.md) has merged implementation, but #24 remains open for real QQ Owner delegation acceptance. [Durable long work](./06-durable-long-work.md) records the P6 implementation; #33 closed on 2026-09-30 and its remaining Linux-native acceptance is tracked by open Issue #30 and [the migration runbook](../docs/linux-runtime-migration.md).
 
-Issue #24 tracks delivery-source reauthorization, Herdr Worker workspace occupancy, and remaining acceptance. The P4 plans remain completed records. Issue #30 owns Linux full-stack migration. The Post-P3 fast follow below is still planned; Issue #123 tracks it.
+Issue #123 closed after the Owner control / group pilot design was added to the repository. This closes the planning issue, not every F0–F4 implementation and acceptance gate. See [the pilot plan](./03-plus-owner-control-smoke.md) and [current Owner/group contracts](../docs/owner-group-operations.md). The backend audit repairs merged in [PR #136](https://github.com/lora-sys/Glassbox-Agent-Harness/pull/136); its [plan](./audit-remediation-2026-10-02.md) retains the evidence and limits. Historical targets below do not reopen completed implementation or authorize new work.
 
 ## Product thesis
 
@@ -555,6 +553,8 @@ P4 completion requires both P4A and P4B completion gates to pass. A large Memory
 
 ### P5 — Efficient Runtime and Observability
 
+Implementation complete. See [Plan 05A](./05a-context-budgeting-runtime-efficiency.md) and [Plan 05B](./05b-routing-runtime-observability.md) for completion evidence; Issues #13 and #14 are closed. The targets below describe that phase.
+
 Optimize the proven runtime and retrieval paths.
 
 Target capabilities:
@@ -588,6 +588,8 @@ OpenTelemetry concepts
 ```
 
 ### P6 — Durable Long Work and Workers
+
+Current implementation and unmet acceptance gates are recorded in [Plan 06](./06-durable-long-work.md). Issue #33 is closed; Issue #30 owns remaining Linux-native acceptance. The target semantics below are not a claim that every live acceptance path has passed.
 
 Extend the P3 Task foundation into durable long-running work.
 

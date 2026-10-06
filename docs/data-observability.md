@@ -39,6 +39,8 @@ Conversation content. Losing the group grant before the response is sent denies 
 
 ## Service / authority map
 
+This map includes planned service choices and group-assignment concepts. It does not assert that every external service is configured. Current structured storage is local libSQL/SQLite; the local Trace implementation uses append-only JSONL files, with R2 retained as an object-storage target.
+
 | Responsibility | Service / authority |
 | --- | --- |
 | Personal Agent product control plane | Glassbox server |
@@ -48,11 +50,11 @@ Conversation content. Losing the group grant before the response is sent denies 
 | QQ transport | Glassbox server + NapCat / OneBot |
 | Agent Operations control plane | Glassbox server |
 | Live coding-worker workspaces / worktrees / panes / Agent lifecycle | Herdr |
-| Task / TaskAttempt / AttentionItem / WorkerBinding truth | Glassbox server + Turso |
+| Task / TaskAttempt / AttentionItem / WorkerBinding truth | Glassbox server + local libSQL/SQLite |
 | Herdr reconciliation | Glassbox server through `HerdrBridge` |
 | Optional bounded Herdr stage recipe | `herdr-workflows`; never canonical Task truth |
-| Structured durable product state | Turso |
-| Raw append-only Trace / large evidence | Cloudflare R2 where appropriate |
+| Structured durable product state | Local libSQL/SQLite, Turso-compatible |
+| Raw append-only Trace / large evidence | Local JSONL Trace; Cloudflare R2 is an object-storage target |
 | Owner Web authentication | Better Auth |
 | Email transport later | AgentMail |
 | Secrets | Infisical |
@@ -60,14 +62,16 @@ Conversation content. Losing the group grant before the response is sent denies 
 | Infrastructure uptime / error monitoring | Better Stack |
 | Webhook reliability when used | Hookdeck |
 | Delayed HTTP task delivery when later required | Upstash QStash |
-| Group schedule truth | Glassbox server + Turso |
-| Group assignment / progress / reminder / report truth | Glassbox server + Turso |
-| Group Tool registry and bindings | Glassbox server + Turso metadata; executable implementation stays in reviewed runtime code / Kit resources |
+| Group schedule truth, planned | Glassbox server + local libSQL/SQLite |
+| Group assignment / progress / reminder / report truth, planned | Glassbox server + local libSQL/SQLite |
+| General group Tool registry and bindings, planned | Glassbox server + local libSQL/SQLite metadata; executable implementation stays in reviewed runtime code / Kit resources |
 | Human remote operations access | SSH; Moshi may be an optional client |
 
-## Turso product state
+## Local libSQL/SQLite product state
 
-Turso is the default structured durable store for Glassbox product truth.
+Glassbox uses `@libsql/client` with a local `file:` SQLite database. `localDatabaseUrl` in `apps/server/src/persistence/database.ts` accepts a local path or `:memory:` and rejects remote URLs and network paths. This is Turso-compatible storage, not a configured remote Turso service. The current schema version is 29 in `apps/server/src/persistence/schema.ts`.
+
+The list below combines implemented records with planned product concepts. `MemoryCandidate`, `CanonicalMemory` and `FeedbackEvent` are implemented in `apps/server/src/learning/` and the shared Memory contracts. `TasteEntry`, `OwnerInsight`, and the group assignment/registry records are conceptual; they do not name existing tables. See `docs/memory-taste.md` and `docs/owner-group-operations.md` for that distinction.
 
 Current / planned records include:
 
@@ -85,8 +89,8 @@ message dedupe
 runtime session binding
 visibility / Share metadata
 
-GroupPolicy
-ToolDefinition metadata
+GroupCapabilityPolicy, implemented
+ToolDefinition metadata, planned
 ToolVersion metadata
 GroupToolBinding
 ScheduleDefinition
@@ -105,11 +109,10 @@ WorkerBinding
 Herdr reconciliation metadata
 
 FeedbackEvent
-TasteCandidate
-TasteEntry
-Taste confidence / scope / provenance
-Memory metadata
-OwnerInsight metadata
+MemoryCandidate
+CanonicalMemory, including preference records for Taste
+Memory confidence / scope / provenance
+OwnerInsight metadata, planned
 Rules metadata when represented as product state
 Skill registry metadata
 Journal / Asset metadata
@@ -126,7 +129,7 @@ Trace events contain only Principal, group Resource, sender id, normalized obser
 roles, role source, verification status, requested Tool and operation, Run, Conversation, and a
 safe authorization status. Provider response bodies and error text are excluded.
 
-The browser does not receive direct Turso credentials.
+The browser does not receive direct database credentials or database access.
 
 ## Runtime distribution identity
 
@@ -148,12 +151,12 @@ model / provider identity
 
 This metadata may live in Run / runtime configuration records and Trace projections.
 
-Do not store the entire Kit package payload in Turso merely for provenance.
+Do not store the entire Kit package payload in the local database merely for provenance.
 
 ## Product truth vs Pi / Lora PI Kit state
 
 ```text
-Glassbox / Turso
+Glassbox / local libSQL/SQLite
   Agent identity
   Principal
   Authorization
@@ -188,7 +191,7 @@ The same Kit can be used by several roles without making those roles the same Ag
 ## Product truth vs Herdr live execution
 
 ```text
-Glassbox / Turso
+Glassbox / local libSQL/SQLite
   Task
   TaskAttempt history
   Attention Queue
@@ -225,10 +228,10 @@ A connection gap does not silently change Task truth.
 Rules, Skills, Taste, and Memory have different authority.
 
 ```text
-Glassbox / Turso
+Glassbox / local libSQL/SQLite
   FeedbackEvent
-  TasteCandidate
-  TasteEntry
+  MemoryCandidate
+  CanonicalMemory with type = preference for Taste
   confidence
   scope
   promotion / demotion
@@ -252,14 +255,16 @@ Taste is preference, not permission.
 
 A single edit is evidence, not a permanent preference.
 
-Large before/after feedback artifacts may live in R2 while Turso stores structured FeedbackEvent metadata and references.
+Large before/after feedback artifacts may live in R2 while the local database stores structured FeedbackEvent metadata and references.
 
 ## Group operations state
 
-Group scheduling and assignment delivery follow the same durable-state rule as other Glassbox product behavior.
+The current `group_capability_policies` table stores versioned `GroupCapabilityPolicy` records. `owner_group_admin` controls access, Skills, capability categories, history and Memory-source switches. These switches narrow the runtime Tool set and source reads; they do not replace authorization.
+
+The group scheduling, assignment and report model below remains planned. It follows the same durable-state rule as implemented product behavior. Durable Task/Activity continuations already exist, but they do not implement this group-assignment domain.
 
 ```text
-Turso
+Local libSQL/SQLite
   schedule definition
   occurrence identity
   assignment state
@@ -276,7 +281,7 @@ For the first single-group pilot, an in-process scheduler is acceptable if sched
 
 A later QStash or similar timer transport may replace the wake-up mechanism without becoming schedule truth.
 
-Tool executable code should not be stored as arbitrary chat-generated blobs and loaded directly into production. Turso may store Tool metadata, version references, configuration, permission manifests, and group bindings. Reviewed code or Kit resources own executable implementation.
+Tool executable code should not be stored as arbitrary chat-generated blobs and loaded directly into production. The local database may store Tool metadata, version references, configuration, permission manifests, and group bindings. Reviewed code or Kit resources own executable implementation.
 
 See `docs/owner-group-operations.md`.
 
@@ -315,7 +320,7 @@ Raw event volume is not itself a user-facing metric.
 ## Storage split
 
 ```text
-Turso
+Local libSQL/SQLite
   structured product truth
   searchable metadata
   FTS / Vector when later used
@@ -405,7 +410,7 @@ Linux server
   NapCat
   Herdr
   coding Workers / worktrees
-  Turso-compatible durable state
+  local libSQL/SQLite durable state, Turso-compatible
 ```
 
 Do not encode desktop GUI state, Moshi state, developer terminal-window identity, or machine-specific absolute paths as durable domain truth.
@@ -438,7 +443,7 @@ Elasticsearch
 Meilisearch
 ```
 
-Turso covers current structured / search / statistics needs. R2 covers large / raw data. Herdr covers live coding-worker execution. Lora PI Kit covers reproducible Pi distribution. Additional infrastructure should be introduced only for a concrete active-Plan requirement.
+Local libSQL/SQLite covers current structured / search / statistics needs. R2 is the object-storage target for large / raw data. Herdr covers live coding-worker execution. Lora PI Kit covers reproducible Pi distribution. Additional infrastructure should be introduced only for a concrete active-Plan requirement.
 
 ## Source-policy conditions on authorization decisions
 
@@ -555,3 +560,10 @@ duplicate suppression. Equivalent UTC and offset inputs select the same records;
 bounds, reversed windows and invalid limits return fixed input-error codes. Time precision
 is the existing JavaScript Date millisecond precision, with no Julian-day floating-point
 arithmetic.
+
+
+## Channel default routing provenance
+
+Schema v29 adds nullable `runs.channel_default_execution_ref`. Trusted ingress can record the Channel default execution reference separately from the Run's selected `execution_ref` when applying an Owner model preference. Runtime routing uses this provenance to distinguish a saved preference from an explicit one-Run selection before considering recovery to the Channel default.
+
+Historical and explicit Runs remain unmarked. The migration does not infer old routing provenance or rewrite Run results. See `apps/server/src/persistence/schema.ts`, `apps/server/src/conversation/store.ts`, and the ingress/routing paths in `apps/server/src/management/application.ts`.

@@ -1,10 +1,10 @@
 # Glassbox Agent Operations
 
-Status: CURRENT DIRECTION
+Status: CURRENT IMPLEMENTATION AND BOUNDARIES
 
-This document defines the bidirectional operations boundary between the Glassbox main Agent and Herdr-managed coding workers.
+This document describes Glassbox Task operations, durable long-work orchestration, and the boundary with Herdr-managed coding Workers.
 
-The current closeout source of truth is `.plans/issue-24-closeout.md`. Plan 03 remains the completed P3 foundation record.
+The implementation record is [the durable long-work plan](../.plans/06-durable-long-work.md). [Issue #24 closeout](../.plans/issue-24-closeout.md) tracks the remaining real QQ Worker acceptance, and [the Linux migration runbook](linux-runtime-migration.md) tracks Issue #30 acceptance. Plan 03 remains the completed P3 foundation record. Implementation availability does not establish those acceptance results.
 
 ## Decision
 
@@ -12,7 +12,7 @@ Herdr is the live Agent Operations execution layer for coding work.
 
 Glassbox remains the product control plane and source of durable task truth.
 
-The target shape is:
+The operations loop is:
 
 ```text
 User through QQ / Workbench
@@ -136,7 +136,7 @@ ops_connection_problem
 
 ### Task
 
-Minimum P3 state machine:
+Task-level state machine:
 
 ```text
 NEW
@@ -152,7 +152,7 @@ FAILED
 CANCELED
 ```
 
-P3 Task is intentionally smaller than the future LongTask model.
+The Task remains the product-level work record. A Task with `orchestrationMode: "durable"` also has a versioned Step graph, a root Step, active Step IDs, a current phase, a waiting reason, and a policy revision. Step state and TaskAttempt state do not replace Task-level review and acceptance.
 
 ### TaskAttempt
 
@@ -226,24 +226,24 @@ For Glassbox's long-lived integration, use the local socket API for request/resp
 
 Do not parse the rendered Herdr TUI as the primary protocol.
 
-Conceptual bridge:
+The current interface is [`HerdrBridge`](../apps/server/src/ops/herdr-bridge.ts):
 
 ```text
-connect
-disconnect
+connect / disconnect / isConnected
+subscribe / unsubscribe
 getSnapshot
-subscribe
-createWorktree
-openWorktree
 startAgent
 promptAgent
-waitAgent
 readAgent
-sendAgentKeys when deliberate UI interaction is required
-stop or cancel through explicit authorized action
+waitAgent
+stopAgent
+closeAgent
+closePreAgentPane
 ```
 
-Use the protocol schema reported by the installed Herdr version when implementing or updating the bridge.
+`startAgent` accepts a configured workspace, Agent kind, optional stable Agent name, worktree path, branch, and Worker context file. It returns the pane ID, Agent name, and optional runtime evidence. `closeAgent` checks the recorded Agent and session identity. `closePreAgentPane` handles an interrupted launch only after exact session, workspace, pane, Agent marker, Tab label, and directory checks, followed by proof that the pane is absent. Stop and close remain explicit authorized operations.
+
+The interface does not create or open worktrees and does not expose arbitrary key injection. Use the protocol schema reported by the installed Herdr version when implementing or updating the bridge.
 
 ## Bootstrap and reconnect
 
@@ -274,21 +274,32 @@ When state cannot be observed, represent it as stale or unknown until reconcilia
 
 The main Pi Agent should not receive raw unrestricted Herdr terminal control from QQ.
 
-P3 minimum Glassbox Ops Tools:
+[`OPS_TOOL_NAMES`](../apps/server/src/runtime/pi/ops-tools.ts) defines 20 Glassbox Ops Tools. A Run receives only the subset selected by its current authorization and capability policy.
 
 ```text
 ops_status
 task_list
 task_get
 task_create
-task_delegate
 worker_status
+task_delegate
 worker_read
+task_worker_result
 worker_prompt
 task_accept
 task_rework
+task_step_accept
+task_step_rework
+task_signal
+task_approve
 task_cancel
+task_steps
+task_events
+task_plan
+task_link_child
 ```
+
+`task_worker_result` reads captured evidence for an exact Step and Attempt. `task_steps` and `task_events` inspect the graph and append-only Task history. `task_plan` creates the bounded graph; `task_link_child` links a separate child Task. Step accept and rework require the expected Step version. Signal and approval target the current waiting Step version and require separate `task:signal` or `task:approve` authority. The model never supplies the Principal, origin routing, filesystem root, Herdr workspace, or Worker kind.
 
 Every Tool is a protected Glassbox Action.
 
@@ -464,26 +475,61 @@ Task state survives Glassbox restart
 
 P3 real acceptance includes at least one real supported coding Agent managed by Herdr.
 
-## Later evolution
+## Durable long work
 
-P3 proves the minimum operations loop.
+Durable long work is implemented alongside the legacy single-Worker path. Glassbox persists its records in the local libSQL/SQLite database. Temporal coordinates wakeups and Activities; it does not own Task truth, authorization, or acceptance.
 
-The later LongTask phase adds richer durability and orchestration:
+### Step graph and execution limits
 
-```text
-dependency DAG
-checkpoints
-retry policy
-signals
-child tasks
-continuations
-leases / heartbeats
-large-scale worker scheduling
-```
+[`packages/contracts/src/long-work.ts`](../packages/contracts/src/long-work.ts) defines `TaskStep`, `TaskEvent`, `TaskWait`, `TaskSignal`, `TaskCheckpoint`, `ChildTaskLink`, `TaskStepLease`, and `TaskWorkflowBinding`.
 
-Do not build those mechanisms in P3 unless a current completion-gate requirement proves they are necessary.
+The supported Step kinds are `model`, `tool`, `herdr_worker`, `timer_wait`, `signal_wait`, `approval_wait`, `child_task`, and `join`. Step statuses are `pending`, `ready`, `running`, `waiting`, `blocked`, `review`, `succeeded`, `failed`, `cancelled`, and `skipped`.
 
-### Unconfirmed direct delivery attention
+[`task-graph.ts`](../apps/server/src/ops/task-graph.ts) validates dependencies and rejects cycles, missing or duplicate dependencies, and excess fan-out. The default limits are 64 Steps per Task, 8 dependencies per Step, 8 dependents per Step, 16 ready Steps, and 4 parallel running Steps. Admission also limits each Principal to 16 active durable Tasks and 8 unresolved Herdr Worker attempts. Quarantined Worker leases count toward that Worker limit.
+
+[`LongWorkScheduler`](../apps/server/src/ops/long-work-scheduler.ts) computes dependency transitions and persists them with version checks. Each Step declares what a failed, cancelled, or skipped dependency means: continue, block, skip, or cancel. A blocked dependency is treated as failed for this calculation without rewriting its stored evidence. The scheduler completes no-op join barriers; execution of Model, Tool, and Herdr Steps belongs to the runtime path.
+
+The current model-facing planning interface is deliberately bounded. Model Steps are text-only. Tool Steps support only `task_get` and `checkpoint_write`. Herdr Steps use the configured Pi Worker and its delegated file/workspace permissions. Shell Steps and arbitrary protected Tool dispatch are unavailable.
+
+### Claims, leases, and recovery
+
+[`LongWorkStore`](../apps/server/src/ops/long-work-store.ts) claims a ready Step in one transaction before external dispatch. The claim checks the current continuation grant and expected Step version, creates a TaskAttempt and lease, and appends `STEP_STARTED`. A Herdr launch also persists its exact launch identity before sending the start request.
+
+The lease records the owner instance, Attempt, heartbeat, expiry, state, and version. Heartbeat and settlement require the current owner and versions. A replacement Herdr runtime can recover the same Attempt after the old lease expires only after checking the live session, pane identity, directory, prompt acknowledgement, and current authority. Successful transfer records `WORKER_RECOVERED`; an expired lease alone is not permission to launch another Worker.
+
+Unknown side effects leave the Step blocked and its lease quarantined. Verified pane closure or the supported exact-Run/checkpoint reconciliation path must resolve the old claim before further work. Cancellation records durable intent before stopping execution, then settles after the relevant Run or Worker outcome is established. Neither a disconnect nor a stop request proves that side effects were rolled back.
+
+[`long-work-authority.ts`](../apps/server/src/ops/long-work-authority.ts) reconstructs the persisted Task creator and origin scope, verifies their binding, and checks current grants before resumed protected work. A saved graph, checkpoint, workflow, or delegated permission declaration is not a grant.
+
+### Checkpoints, retries, and waits
+
+Checkpoints retain Task, Step, Attempt, state/artifact references, source evidence, and policy revision. Writes check current versions and append `CHECKPOINT_WRITTEN` without replacing older records. Recovery selects the latest checkpoint by event order, with a compatibility fallback for older records. The loaded single-checkpoint projection is bounded to 2,048 serialized bytes. The closed `checkpoint_write` Tool uses a stable operation generation and exact Run/Attempt/lease checks so an uncertain response can be reconciled against the persisted write.
+
+[`long-work-retry.ts`](../apps/server/src/ops/long-work-retry.ts) applies a versioned policy with an attempt limit, capped exponential delay, error-class lists, and timeout outcome. Automatic retry requires evidence that the side effect was `not_started` or `not_applied`. An `applied` effect is not retried; an unknown effect remains unknown. Retry scheduling appends evidence and creates a durable wait rather than erasing the earlier Attempt.
+
+Wait policies cover duration, due time, deadline, signal, approval, and retry. A signal carries the target Step version, optional Attempt, authorization decision, and idempotency key. A duplicate or stale signal cannot advance a newer wait. Approval requires `task:approve`; knowing the signal key is insufficient. Timer and join recovery can finish a previously started no-op Step without inventing another execution Attempt.
+
+### Child Tasks and acceptance
+
+A child link records the parent Step, child Task, exact delegated permission subset, acceptance criteria, cancellation policy, failure policy, and notification policy. `task_link_child` links a pristine same-owner Task to a ready child Step; the child receives its own graph through `task_plan`.
+
+The parent Step waits for the child. Child acceptance moves the Step to review with a result reference. Child failure follows the recorded block, fail, or review policy. Parent cancellation either cancels or keeps the child according to the link. Rework preserves earlier links and Attempts. Accepted child results can supply bounded evidence to a directly dependent Model Step only after current source authorization.
+
+Step acceptance and Task acceptance are separate actions. Model or Worker completion supplies review evidence. It does not automatically mark the Step succeeded or the Task DONE.
+
+### Continuations and Temporal
+
+[`continuation-store.ts`](../apps/server/src/ops/continuation-store.ts) persists schedules, immutable fired occurrences, pending occurrence delivery, and append-only schedule events. Schedules support one occurrence or a bounded interval cadence. A target is only a `task` or `activity` ID; it carries no instructions or authority. Rescheduling changes the generation and version. Cancelling future occurrences preserves occurrences that already fired.
+
+[`AuthorizedContinuationService`](../apps/server/src/ops/continuation-service.ts) exposes Task scheduling, rescheduling, and cancellation under current `task:continue` authority, including a grant check in the write transaction. The current Temporal continuation Activity wakes Task targets and acknowledges their occurrences. Activity targets retain their own policy and consumer boundary. If Temporal is unavailable after a schedule write, the durable mutation remains committed and reports `runtimeReady: false` for later reconciliation.
+
+[`ops/temporal/`](../apps/server/src/ops/temporal/) contains the workflow client, binding store, coordinators, Activities, Herdr runtime, and separate Worker entry point. `longWorkWorkflow` receives only the Task ID and policy revision; `continuationWorkflow` receives only a schedule ID. Activities reload Glassbox state. Workflows wait for the `longWorkWake` signal or a due time and use Continue-As-New after 100 advance iterations. Temporal Activity retries are distinct from the product's side-effect-aware Task retry policy.
+
+The separate Worker runs the `@glassbox/server` package's `long-work:worker` script. It requires `GLASSBOX_TEMPORAL_ADDRESS`, accepts `GLASSBOX_TEMPORAL_NAMESPACE` with default `default`, and uses the `glassbox-long-work` queue. The application reconnects and reconciles persisted bindings. Backend status distinguishes not configured, connected, and unavailable; a successful Temporal Server probe does not prove a Worker is polling the queue.
+
+General protected Tool dispatch, binary or unrestricted Worker file artifacts, and arbitrary unknown-side-effect recovery remain outside this implemented subset. Real Linux, QQ, and history-rollover acceptance must be checked against the plan records. The presence of code and deterministic tests is not deployment acceptance.
+
+## Unconfirmed direct delivery attention
 
 Direct Run delivery preserves execution and transport as separate facts. A successful Run
 may have an `unknown` delivery: a timeout, disconnect, or lost acknowledgement does not
@@ -494,8 +540,8 @@ or rewritten as confirmed failure. `RunService.retryDelivery` accepts only confi
 The direct-delivery settlement transaction creates one durable `delivery_failed` attention
 item per failed or unconfirmed delivery. Its fixed summary distinguishes failure from
 uncertainty and includes bounded reason codes and Run/delivery identifiers, never the
-message payload or provider error text. Authenticated local `GET /manage/attention` exposes
-these items; model-facing scoped Ops snapshots do not acquire this non-Task information.
+message payload or provider error text. Authenticated loopback-only `GET /manage/attention`
+exposes these items; model-facing scoped Ops snapshots do not acquire this non-Task information.
 The final `delivery_changed` Trace event carries the same fixed diagnostic reason. Task
 notification Trace events also preserve their transport reason, without creating a new
 notification attention workflow.
@@ -510,3 +556,9 @@ there is no receipt-reconciliation action, safe unknown retry API, or guarantee 
 send would not duplicate an already received message. This addresses visibility and reason
 loss in Issue #110; automatic retry of unknown remains unsupported without deduplication or
 conclusive post-send evidence.
+
+### Management access boundary
+
+Committed management access checks the remote address against `127.0.0.1`, `::1`, and IPv4-mapped loopback, then checks the allowed Host, optional Origin, and Bearer management token. See [`management/access.ts`](../apps/server/src/management/access.ts).
+
+The [Issue #156 audit](https://github.com/lora-sys/Glassbox-Agent-Harness/issues/156) also described an uncommitted LAN-address allowlist and `0.0.0.0` listener change. Those changes are not part of the committed implementation documented here. If adopted, they require a separate authorization-boundary review and a documentation update in the same change.

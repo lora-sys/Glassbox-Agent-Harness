@@ -23,7 +23,7 @@ docs/data-observability.md
   persistence, storage, observability
 ```
 
-P3, P4A, P4B, and the Issue #21 repository refactor are complete. The current pre-P5 closeout follows `.plans/issue-24-closeout.md` and Issue #24. It does not implement P5 product behavior.
+P3, P4A, P4B, P5 and the Issue #21 repository refactor are complete. The durable long-work implementation is recorded in `.plans/06-durable-long-work.md`; Issue #33 is closed and remaining Linux acceptance is tracked by Issue #30. Issue #24 implementation has merged, but its real QQ Owner delegation acceptance remains open in `.plans/issue-24-closeout.md`.
 
 ## Runtime and language
 
@@ -356,8 +356,9 @@ wait state, decisions, review, and event history. Temporal receives a Task ID an
 revision, then wakes a Worker Activity that rereads Glassbox state. The Worker process uses
 the same `GLASSBOX_DATA_DIR` as the server. It must not use automated-test state.
 
-The Worker also polls `continuationWorkflow` on the same Task queue. Glassbox schema v22
-stores the schedule, immutable occurrences, and event history. A schedule targets a Task
+The Worker also polls `continuationWorkflow` on the same Task queue. The continuation tables,
+introduced in schema v22, store the schedule, immutable occurrences, and event history.
+The current database schema is v29 in `apps/server/src/persistence/schema.ts`. A schedule targets a Task
 or Activity ID, has one next due time, and can use a bounded fixed interval. Use a stable
 schedule ID for retry-safe creation. Reschedule or cancel with the current version;
 the generation rejects an old wake. Target domains must acknowledge fired occurrences
@@ -423,7 +424,7 @@ worker_permissions ⊆ delegated_permissions ⊆ caller_permissions
 
 ## Persistence
 
-Glassbox structured durable state uses Turso / SQLite-compatible storage behind server-owned boundaries.
+Glassbox structured durable state uses local libSQL/SQLite through `@libsql/client`. The storage is Turso-compatible, but `apps/server/src/persistence/database.ts` accepts only local paths or `:memory:` and does not configure remote Turso access. The current schema version is 29.
 
 Current / planned structured state includes:
 
@@ -442,13 +443,15 @@ Task
 TaskAttempt
 WorkerBinding
 FeedbackEvent
-TasteCandidate
-TasteEntry
-Memory metadata
+MemoryCandidate
+CanonicalMemory, including type = preference for Taste
+Memory audit and source-dependency metadata
 Skill / Asset / Journal metadata
 Eval metadata
 analytics projections
 ```
+
+The learning contracts live in `apps/server/src/learning/contracts.ts` and `packages/contracts/src/memory.ts`; `TasteEntry` and `OwnerInsight` are conceptual names, not separate persisted records.
 
 Cloudflare R2 is the target for large objects and Raw Trace evidence where object storage is appropriate.
 
@@ -561,7 +564,7 @@ They should use isolated substitutes such as:
 ```text
 Fake OneBot
 Fake identities
-Disposable Turso / SQLite
+Disposable local libSQL/SQLite
 isolated Pi agentDir
 Lora PI Kit test profile
 deterministic / recording model
