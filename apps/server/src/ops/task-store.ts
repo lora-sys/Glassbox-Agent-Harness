@@ -1322,6 +1322,7 @@ export class TaskStore {
     taskId: string,
     reason?: string,
     callerPrincipalId?: string,
+    runId?: string,
   ): Promise<AgentTask> {
     requireIdentifier(taskId);
     const now = new Date().toISOString();
@@ -1367,6 +1368,7 @@ export class TaskStore {
         type: "task.canceled",
         taskId,
         taskAttemptId: task.activeAttemptId ?? undefined,
+        runId,
         principalId: callerPrincipalId,
         data: {
           reason: reason ?? "Task canceled",

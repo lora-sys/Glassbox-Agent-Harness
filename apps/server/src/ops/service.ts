@@ -1548,8 +1548,9 @@ export class AuthorizedOpsService {
     caller: CallerContext,
     taskId: string,
     reason?: string,
+    evidence?: RunEvidence,
   ): Promise<boolean | undefined> {
-    const decision = await this.authorize(caller, `task-${taskId}`, "task:cancel");
+    const decision = await this.authorize(caller, `task-${taskId}`, "task:cancel", evidence);
     return this.withTaskOperation(taskId, async () => {
       const task = await this.store.tasks.getTask(taskId);
       if (task?.orchestrationMode === "durable") {
@@ -1585,7 +1586,7 @@ export class AuthorizedOpsService {
       const alreadyCanceled = task.status === "CANCELED";
       if (!alreadyCanceled) {
         try {
-          await this.store.tasks.cancelTask(taskId, reason, caller.principalId);
+          await this.store.tasks.cancelTask(taskId, reason, caller.principalId, evidence?.runId);
         } catch (error) {
           if ((await this.store.tasks.getTask(taskId))?.status !== "CANCELED") throw error;
         }
