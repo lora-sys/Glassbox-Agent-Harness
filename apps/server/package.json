@@ -32,6 +32,6 @@
     "@types/proper-lockfile": "4.1.4",
     "tsx": "^4.19.0",
     "typescript": "^5.8.0",
-    "vite-plus": "^0.3.1"
+    "vite-plus": "0.3.2"
   }
 }
