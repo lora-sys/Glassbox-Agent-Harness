@@ -121,6 +121,37 @@ export const FEATURE_CATALOG = Object.freeze({
       mutation: "none",
     },
     {
+      id: "qq-group-a-info-read",
+      domain: "qq_read",
+      executionStatus: "executable",
+      tools: ["qq_groups"],
+      suiteCaseId: "qq-group-a-info-read",
+      leaseTools: [
+        {
+          name: "qq_groups",
+          operations: [
+            {
+              action: "group:read",
+              resourceId: "group:{{group:A}}",
+              inputConstraint: { groupId: "{{group:A}}", operation: "get_group_info" },
+            },
+          ],
+        },
+      ],
+      assertions: [
+        {
+          kind: "trace",
+          type: "tool_result",
+          where: { name: "qq_groups", isError: false },
+          count: 1,
+        },
+        { kind: "group_info", tool: "qq_groups", groupId: "{{group:A}}", count: 1 },
+      ],
+      coveragePlan:
+        "Read only group A provider metadata in Owner private chat. Verify complete Tool output, group identity, name digest and member/capacity counts against a separate fixed Bot-side provider read; retain no group name or extra provider fields.",
+      mutation: "none",
+    },
+    {
       id: "qq-managed-groups-inventory-read",
       domain: "qq_read",
       executionStatus: "executable",
@@ -1100,9 +1131,11 @@ function bindToSuiteCase(testCase, suiteCases, gaps, suiteConfig) {
     });
     valid = false;
   }
-  const needsGroupA = (testCase.tools ?? []).some((name) =>
-    ["group_history_search", "owner_history_search", "qq_group_members"].includes(name),
-  );
+  const needsGroupA =
+    testCase.assertions?.some((a) => a.kind === "group_info") ||
+    (testCase.tools ?? []).some((name) =>
+      ["group_history_search", "owner_history_search", "qq_group_members"].includes(name),
+    );
   if (needsGroupA && !suiteConfig) {
     gaps.push({
       code: "SUITE_CONFIG_REQUIRED",

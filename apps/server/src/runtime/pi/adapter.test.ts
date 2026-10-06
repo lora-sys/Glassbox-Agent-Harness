@@ -1,4 +1,5 @@
 import { mkdtemp, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -255,6 +256,103 @@ describe("glassboxSystemPrompt", () => {
 import type { PiRunContext } from "./types.js";
 
 const directories: string[] = [];
+
+it("records metadata evidence from the actual qq_groups result while preserving the 512-byte head", async () => {
+  const runtimeBaseDir = await mkdtemp(join(tmpdir(), "glassbox-group-info-evidence-"));
+  directories.push(runtimeBaseDir);
+  const metadata = {
+    group_id: 20001,
+    group_name: "测试群",
+    member_count: 3,
+    max_member_count: 200,
+    extra: "private-extra".repeat(100),
+  };
+  const output = { content: [{ type: "text", text: JSON.stringify(metadata) }], details: metadata };
+  let listener: ((event: AgentSessionEvent) => void) | undefined;
+  const results: Record<string, unknown>[] = [];
+  const fakeSession = {
+    sessionId: "group-info-session",
+    messages: [
+      { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" },
+    ],
+    subscribe(callback: (event: AgentSessionEvent) => void) {
+      listener = callback;
+      return () => {
+        listener = undefined;
+      };
+    },
+    async prompt() {
+      listener?.({ type: "agent_start" });
+      listener?.({ type: "turn_start" });
+      for (const [index, entry] of [
+        { toolName: "qq_groups", result: output, isError: false },
+        { toolName: "qq_groups", result: output, isError: true },
+        {
+          toolName: "qq_groups",
+          result: { content: [{ type: "text", text: "[]" }], details: [] },
+          isError: false,
+        },
+        { toolName: "ops_status", result: output, isError: false },
+      ].entries()) {
+        listener?.({
+          type: "tool_execution_start",
+          toolName: entry.toolName,
+          toolCallId: `call-${index}`,
+          args: {},
+        } as never);
+        listener?.({ type: "tool_execution_end", toolCallId: `call-${index}`, ...entry } as never);
+      }
+      listener?.({ type: "agent_end", messages: [], willRetry: false });
+    },
+    async abort() {},
+    dispose() {},
+  };
+  const adapter = new PiSdkRuntimeAdapter({
+    kitPath: fileURLToPath(new URL("./fixtures/lora-pi-kit", import.meta.url)),
+    runtimeBaseDir,
+    resolveToolNames: async () => ["qq_groups", "ops_status"],
+    onEvent: (event) => {
+      if (event.type === "tool_result") results.push(event.data);
+    },
+    createSession: async () => fakeSession as never,
+  });
+  await adapter.initialize();
+  const context: PiRunContext = {
+    runId: run.id,
+    conversationId: conversation.id,
+    caller: {
+      principalId: "owner",
+      scope: {
+        connectionId: "qq",
+        botId: "10001",
+        chatType: "private",
+        chatId: "10002",
+        senderId: "10002",
+      },
+    },
+  };
+  const binding = await adapter.createOrRestoreSession(conversation, "test", context);
+  await adapter.run(binding, run, "read group metadata", context);
+  expect(results).toHaveLength(4);
+  expect(results[0]).toMatchObject({
+    outputTruncated: true,
+    outputBytes: Buffer.byteLength(JSON.stringify(output)),
+    outputSha256: createHash("sha256").update(JSON.stringify(output)).digest("hex"),
+    groupInfo: {
+      schemaVersion: 1,
+      groupId: "20001",
+      groupNameSha256: createHash("sha256").update(metadata.group_name).digest("hex"),
+      memberCount: 3,
+      maxMemberCount: 200,
+    },
+  });
+  expect(results[0].outputHead).toBe(
+    Buffer.from(JSON.stringify(output), "utf8").subarray(0, 512).toString("utf8"),
+  );
+  expect(JSON.stringify(results[0].groupInfo)).not.toContain(metadata.group_name);
+  expect(JSON.stringify(results[0].groupInfo)).not.toContain(metadata.extra);
+  for (const result of results.slice(1)) expect(result.groupInfo).toBeUndefined();
+});
 
 afterEach(async () => {
   for (const directory of directories.splice(0))

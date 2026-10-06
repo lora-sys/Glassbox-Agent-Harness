@@ -76,3 +76,7 @@ schemaVersion 3 套件可同时包含推广后过期和 memory-project-feedback-
 登记已验证历史经验时，给 record-lesson.mjs 增加 --config，复用既有本地 QQ 验收配置和 Token 环境变量。身份、群号、提交、checkout 和数据目录必须与报告一致。缺少双端只读消息证据时拒绝 verified，仍可登记不联网的 hypothesis。
 
 既有受保护启动器也可调用 record-lesson --input <lesson-json>，复用其本地配置和 Token 环境变量。该命令拒绝 --live、用例执行和 PR 选项，不新发消息、不执行回归或合并。证据核验通过后才追加脱敏经验。
+
+群信息读取用例 qq-group-a-info-read 固定在 Owner 私聊，只租用测试群 A 的 qq_groups/get_group_info。核验器检查唯一调用、成功结果、完整输出字节与摘要、群身份和 content/details 一致性，再通过 Bot 独立读取同一群。报告只保留群名摘要、成员数量和容量，不保留群名或未知字段。字段变化或无法读取时判为 INCONCLUSIVE，不重试。该用例不能代表完整群操作覆盖。归档群信息经验缺少独立历史见证时仍只能登记 hypothesis，删除报告断言不能绕过同 Run 的实际工具调用检查。
+
+群信息输出预览仍限制为 512 字节。运行时从实际完整工具结果生成固定 groupInfo 字段和完整输出摘要。核验器在预览截断时要求这份独立字段证据，不扩大预览。实际双端回复必须是 QQGROUPINFO 测试编号 count=人数 capacity=容量 的单行纯文本，数量须与工具证据一致。添加文字、媒体消息段或其他字段都不能通过。

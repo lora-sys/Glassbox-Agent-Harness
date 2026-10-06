@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { LiveError, fail, id, messageId as parseMessageId } from "./core.mjs";
+import { projectGroupInfo } from "./group-info-evidence.mjs";
 
 const MEMBER_COUNT_READ = Symbol("fixed-group-member-count-read");
+const GROUP_INFO_READ = Symbol("fixed-group-info-read");
 
 /** OneBot forward WebSocket. Native Node WebSocket, no npm dependencies. */
 export class OneBot {
@@ -172,9 +174,35 @@ export class OneBot {
       fail("MEMBER_COUNT_INVALID", "固定测试群成员响应格式无效。", "INCONCLUSIVE");
     return seen.size;
   }
+  async readGroupInfo() {
+    const groups = this.config.groups?.filter((group) => group.alias === "A") ?? [];
+    const groupId = groups.length === 1 ? id(groups[0].id) : "";
+    if (this.role !== "bot" || !groupId)
+      fail("GROUP_INFO_DENIED", "仅 Bot 可读取固定测试群 A 的群信息。", "INCONCLUSIVE");
+    try {
+      const result = await this.#call(
+        "get_group_info",
+        { group_id: groupId },
+        false,
+        GROUP_INFO_READ,
+      );
+      return projectGroupInfo(result, groupId);
+    } catch {
+      fail("GROUP_INFO_UNAVAILABLE", "无法独立确认固定测试群信息。", "INCONCLUSIVE");
+    }
+  }
   authorize(action, p, cleanup = false, capability) {
     const groups = this.config.groups.map((g) => g.id);
     if (["get_login_info", "get_status", "get_version_info"].includes(action)) return;
+    if (
+      capability === GROUP_INFO_READ &&
+      this.role === "bot" &&
+      action === "get_group_info" &&
+      this.config.groups.filter((group) => group.alias === "A").length === 1 &&
+      id(p.group_id) === id(this.config.groups.find((group) => group.alias === "A")?.id) &&
+      Object.keys(p).join(",") === "group_id"
+    )
+      return;
     if (
       capability === MEMBER_COUNT_READ &&
       this.role === "bot" &&

@@ -1,5 +1,6 @@
 import { mkdir } from "node:fs/promises";
 import { createHash } from "node:crypto";
+import { groupInfoEvidence } from "./group-info-evidence.js";
 import path from "node:path";
 import { QQ_SOURCE_CLASSES, type AgentRun, type Conversation } from "@glassbox/contracts";
 import type { ImageContent, Model } from "@earendil-works/pi-ai";
@@ -844,6 +845,10 @@ function normalizeEvent(
       // `reason` repeats the code in the field an operator reads, and both come from the same
       // derivation so they cannot disagree.
       const failureCode = event.isError ? safeToolFailureCode(event.result) : undefined;
+      const groupInfo =
+        event.toolName === "qq_groups" && !event.isError
+          ? groupInfoEvidence(event.result)
+          : undefined;
       return {
         type: "tool_result",
         sessionId,
@@ -859,6 +864,7 @@ function normalizeEvent(
           isError: event.isError,
           ...(failureCode === undefined ? {} : { failureCode }),
           ...safeToolOutput(event.toolName, event.result),
+          ...(groupInfo === undefined ? {} : { groupInfo }),
         },
       };
     }

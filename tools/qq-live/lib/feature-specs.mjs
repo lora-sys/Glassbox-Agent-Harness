@@ -104,6 +104,36 @@ function validateGroupMembersCase(c, config) {
     );
 }
 
+function validateGroupInfoCase(c, config) {
+  const group = configGroup(config, "A");
+  const tool = c.leaseTools[0];
+  const operation = tool?.operations?.[0];
+  const makeOperation = (groupId) => ({
+    action: "group:read",
+    resourceId: `group:${groupId}`,
+    inputConstraint: { groupId, operation: "get_group_info" },
+  });
+  const makeAssertions = (groupId) => [
+    { kind: "trace", type: "tool_result", where: { name: "qq_groups", isError: false }, count: 1 },
+    { kind: "group_info", tool: "qq_groups", groupId, count: 1 },
+  ];
+  if (
+    c.chat !== "private" ||
+    c.leaseTools.length !== 1 ||
+    tool?.name !== "qq_groups" ||
+    tool.operations.length !== 1 ||
+    ![group.id, "{{group:A}}"].some(
+      (groupId) =>
+        canonical(operation) === canonical(makeOperation(groupId)) &&
+        canonical(c.featureAssertions) === canonical(makeAssertions(groupId)),
+    )
+  )
+    fail(
+      "FEATURE_GROUP_INFO_SCOPE",
+      "群信息用例必须在 Owner 私聊中限定到群 A 的信息读取和完整输出核验。",
+    );
+}
+
 function validateHistoryCase(c, tool, config) {
   if (c.leaseTools.length !== 1 || tool.operations.length !== 1)
     fail("FEATURE_HISTORY_SCOPE", "历史用例只能租用一个历史工具和一个精确读取操作。");
@@ -284,6 +314,15 @@ export function validateReadFeatureSpecs(raw, config) {
       if (HISTORY_TOOLS.has(tool.name)) validateHistoryCase(c, tool, config);
     }
     validateFeatureAssertions(c.featureAssertions);
+    if (
+      c.featureAssertions.some((a) => a.kind === "group_info") ||
+      c.leaseTools.some(
+        (tool) =>
+          tool.name === "qq_groups" &&
+          tool.operations.some((op) => op.inputConstraint.operation === "get_group_info"),
+      )
+    )
+      validateGroupInfoCase(c, config);
     if (c.leaseTools.some((tool) => tool.name === "qq_group_members"))
       validateGroupMembersCase(c, config);
     if (

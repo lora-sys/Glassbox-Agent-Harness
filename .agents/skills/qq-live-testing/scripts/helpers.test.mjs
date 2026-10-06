@@ -1285,6 +1285,49 @@ test("verified member-count lesson cannot be downgraded by deleting report asser
   await assert.rejects(readFile(lessonsPath, "utf8"), { code: "ENOENT" });
 });
 
+test("group info lessons require an independent witness even when report metadata is removed", async (t) => {
+  for (const signal of ["assertion", "trace"]) {
+    const fixture = await createPassingOwnerPrivateOpsReport(t);
+    const report = JSON.parse(fixture.bytes.toString("utf8"));
+    if (signal === "assertion")
+      report.cases[0].featureAssertions = [
+        { kind: "group_info", tool: "qq_groups", groupId: "20001", count: 1 },
+      ];
+    else {
+      const tracePath = join(
+        report.runtime.dataDirectory,
+        "runs",
+        fixture.input.evidence.runId,
+        "trace.jsonl",
+      );
+      const rows = (await readFile(tracePath, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      rows.push({
+        seq: rows.length + 1,
+        event: {
+          type: "tool_call",
+          runId: fixture.input.evidence.runId,
+          toolCallId: "group-info-call",
+          data: { name: "qq_groups", input: { groupId: "20001", operation: "get_group_info" } },
+        },
+      });
+      await writeFile(tracePath, rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
+    }
+    const input = await rewriteReport(fixture, report);
+    const lessonsPath = join(fixture.temp, `group-info-${signal}.jsonl`);
+    await assert.rejects(
+      appendLesson(input, lessonsPath),
+      /Independent group information evidence is unavailable/,
+    );
+    await assert.rejects(readFile(lessonsPath), { code: "ENOENT" });
+    const hypothesisInput = { ...input, status: "hypothesis" };
+    delete hypothesisInput.verification;
+    assert.equal((await appendLesson(hypothesisInput, lessonsPath)).status, "hypothesis");
+  }
+});
+
 test("verified member-count aggregate signal requires independent count evidence", async (t) => {
   const fixture = await createPassingOwnerPrivateOpsReport(t);
   const report = JSON.parse(fixture.bytes.toString("utf8"));

@@ -5,6 +5,7 @@ import { resolve, join } from "node:path";
 import { fail, digest } from "./core.mjs";
 import { boundMessage, compareSameMessage } from "./message-binding.mjs";
 import { observeFeature, validateFeatureAssertions } from "./feature-observer.mjs";
+import { verifyGroupInfoEvidence } from "./group-info-evidence.mjs";
 
 export function runtimeSnapshot(runtime, capture = execFileSync) {
   return serviceSnapshot(runtime, capture, true);
@@ -289,6 +290,9 @@ export async function verifyMessageBindings(c, config, clients, delivery) {
     messageType,
     groupId,
     contains: c.expected,
+    ...(c.featureAssertions?.some((a) => a.kind === "group_info")
+      ? { groupInfoNonce: c.token }
+      : {}),
     ...(isolationAssertions.length
       ? { forbiddenFixtureSha256: isolationAssertions[0].sentinelSha256 }
       : {}),
@@ -319,6 +323,7 @@ export async function verifyMessageBindings(c, config, clients, delivery) {
       botMessageId: String(delivery.external_id),
       driverMessageId: reply[0].messageId,
       ...replyMatch,
+      ...(replyBot.groupInfo ? { groupInfo: replyBot.groupInfo } : {}),
     },
   };
 }
@@ -413,6 +418,15 @@ export async function verifyProductEvidence(report, config, clients) {
           })
         : undefined;
       await verifyGroupMemberCountEvidence(c, feature, config, clients, events, evidence.runId);
+      await verifyGroupInfoEvidence(
+        c,
+        feature,
+        config,
+        clients,
+        events,
+        evidence.runId,
+        messageBinding.reply.groupInfo,
+      );
       if (c.featureAssertions) {
         const actors = db.prepare("SELECT principal_id FROM runs WHERE id=?").all(evidence.runId);
         if (actors.length !== 1 || typeof actors[0].principal_id !== "string")

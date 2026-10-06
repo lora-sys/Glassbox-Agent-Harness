@@ -2,6 +2,45 @@
   "schemaVersion": 2,
   "cases": [
     {
+      "id": "qq-group-a-info-read",
+      "chat": "private",
+      "prompt": "请只调用 qq_groups 的 get_group_info 操作查询测试群 {{group:A}}。用实际 member_count 和 max_member_count 填入 count 和 capacity，只回复一行 QQGROUPINFO {{nonce}} count=人数 capacity=容量。不要使用 Markdown，不要添加群号、群名、解释或其他内容，不要修改任何状态。",
+      "expectContains": ["{{nonce}}"],
+      "sideEffect": "none",
+      "leaseTools": [
+        {
+          "name": "qq_groups",
+          "operations": [
+            {
+              "action": "group:read",
+              "resourceId": "group:{{group:A}}",
+              "inputConstraint": {
+                "groupId": "{{group:A}}",
+                "operation": "get_group_info"
+              }
+            }
+          ]
+        }
+      ],
+      "featureAssertions": [
+        {
+          "kind": "trace",
+          "type": "tool_result",
+          "where": {
+            "name": "qq_groups",
+            "isError": false
+          },
+          "count": 1
+        },
+        {
+          "kind": "group_info",
+          "tool": "qq_groups",
+          "groupId": "{{group:A}}",
+          "count": 1
+        }
+      ]
+    },
+    {
       "id": "ops-status-read",
       "chat": "private",
       "prompt": "请调用 ops_status 查询当前授权可见的任务与 Worker 汇总数量。不要读取单个任务或修改状态。回复摘要和测试编号 {{nonce}}。",

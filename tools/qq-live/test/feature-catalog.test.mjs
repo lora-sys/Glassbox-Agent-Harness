@@ -606,6 +606,42 @@ test("mutating catalog case stays blocked without an implemented cleanup binding
   assert.deepEqual(result.coveredTools, []);
 });
 
+test("group info catalog binds its fixed A operation and independent output assertion", async () => {
+  const catalogCase = FEATURE_CATALOG.cases.find((c) => c.id === "qq-group-a-info-read");
+  const source = JSON.parse(
+    await readFile(new URL("../examples/feature-baseline.example.json", import.meta.url), "utf8"),
+  );
+  const catalog = {
+    schemaVersion: 1,
+    requiredDomains: ["qq_read"],
+    descriptorBaseline: ["qq_groups"],
+    cases: [catalogCase],
+  };
+  const args = {
+    catalog,
+    descriptors: [{ name: "qq_groups" }],
+    executableSuiteCases: source.cases,
+    suiteConfig: { groups: [{ alias: "A", id: "10001" }] },
+  };
+  assert.equal(checkFeatureCoverage(args).status, "PASS");
+  for (const change of [
+    (c) => {
+      c.featureAssertions.pop();
+    },
+    (c) => {
+      c.leaseTools[0].operations[0].inputConstraint.groupId = "{{group:B}}";
+    },
+    (c) => {
+      c.leaseTools[0].operations[0].inputConstraint.operation = "get_group_list";
+    },
+  ]) {
+    const cases = structuredClone(source.cases);
+    change(cases.find((c) => c.id === catalogCase.id));
+    assert.equal(checkFeatureCoverage({ ...args, executableSuiteCases: cases }).status, "BLOCKED");
+  }
+  assert.equal(checkFeatureCoverage({ ...args, suiteConfig: undefined }).status, "BLOCKED");
+});
+
 test("history seed catalog binds its fixed two-stage family and rejects metadata downgrade", async () => {
   const catalogCase = FEATURE_CATALOG.cases.find(
     (c) => c.id === "history-group-seed-private-recall",

@@ -67,7 +67,47 @@ export async function boundMessage(client, requestedMessageId, expected) {
     contains.some((part) => typeof part !== "string" || !part || !text.includes(part))
   )
     mismatch();
-  return { messageId: actualId, realSequence, time, textSha256 };
+  let groupInfo;
+  if (expected.groupInfoNonce !== undefined) {
+    if (
+      typeof expected.groupInfoNonce !== "string" ||
+      !/^[a-f0-9]{32}$/u.test(expected.groupInfoNonce)
+    )
+      mismatch();
+    const message = result?.message;
+    if (typeof message === "string") {
+      if (message.includes("[CQ:") || message !== text) mismatch();
+    } else if (
+      !Array.isArray(message) ||
+      message.length !== 1 ||
+      message[0]?.type !== "text" ||
+      Object.keys(message[0]).sort().join(",") !== "data,type" ||
+      !message[0].data ||
+      Object.keys(message[0].data).join(",") !== "text" ||
+      message[0].data.text !== text
+    )
+      mismatch();
+    if (result.raw_message !== undefined && result.raw_message !== text) mismatch();
+    const match =
+      /^QQGROUPINFO ([a-f0-9]{32}) count=(0|[1-9]\d{0,15}) capacity=(0|[1-9]\d{0,15})$/u.exec(text);
+    if (!match || match[1] !== expected.groupInfoNonce) mismatch();
+    const memberCount = Number(match[2]);
+    const maxMemberCount = Number(match[3]);
+    if (
+      !Number.isSafeInteger(memberCount) ||
+      !Number.isSafeInteger(maxMemberCount) ||
+      memberCount > maxMemberCount
+    )
+      mismatch();
+    groupInfo = { memberCount, maxMemberCount };
+  }
+  return {
+    messageId: actualId,
+    realSequence,
+    time,
+    textSha256,
+    ...(groupInfo ? { groupInfo } : {}),
+  };
 }
 
 export function compareSameMessage(a, b) {
