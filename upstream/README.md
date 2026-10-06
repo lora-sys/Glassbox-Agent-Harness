@@ -79,9 +79,15 @@ Do not copy its Task, Agent-team, worktree, permission, or memory ownership whol
 
 See `openharness/SOURCES.md`.
 
-## Currently vendored
+## Reference pins and local checkouts
 
-- `pingdotgg/t3code`: Claude Code provider integration, permission handling, binary/config isolation, session resume, and event normalization. See `t3-code/SOURCES.md` for the pinned source and copied files.
+[`manifest.json`](manifest.json) records 25 reference checkout pins at the 2026-10-06 documentation audit base. Each entry names its repository, checkout directory, commit, purpose and recorded license status. Checkout paths are under `upstream/repos/`, which `.gitignore` excludes; a clean clone does not include those repositories. The manifest records research provenance, not runtime dependencies or proof that a local checkout is present.
+
+Read each entry's `license_status` rather than assuming every pin has a verified license file. The manifest explicitly records metadata-only or missing-license cases. Focused `upstream/*/SOURCES.md` notes explain adoption boundaries; copied production mechanisms keep source and license records beside their implementation, such as `apps/server/src/model/SOURCES.md` and `apps/server/src/persistence/SOURCES.md`.
+
+The earlier `t3-code/SOURCES.md` reference was invalid. Existing production ports record `pingdotgg/t3code` at commit `4a4c6dd2adc350a68ba18bb28b24b5a7e4660dab` under the MIT license in [platform/SOURCES.md](../apps/server/src/platform/SOURCES.md), [execution/harness/SOURCES.md](../apps/server/src/execution/harness/SOURCES.md), and [management/SOURCES.md](../apps/server/src/management/SOURCES.md), with licenses retained beside those files.
+
+Issue #156 also reports a local `upstream/repos/t3code` research checkout. The committed manifest has no entry for it, and this audit did not inspect that other working tree. Its actual checkout commit and license state must be checked before adding a manifest entry or relying on it for a new port. The production-port pin above does not prove the local checkout matches it. Do not count that checkout as manifest-managed.
 
 ## Approved references
 
@@ -120,7 +126,7 @@ Vendor selectively when a current implementation slice needs them.
 
 The approved-reference list is a research index, not a dependency list. A project becomes a production dependency only when the active plan explicitly needs it.
 
-Pi is the active primary runtime foundation for Plan 03. Glassbox embeds it through the public SDK and loads Lora PI Kit resources. Glassbox does not become a Pi fork or a Pi wrapper. Product identity, authorization, QQ Channel identity, Conversation, Turso state, audience policy, Task truth, and Trace remain Glassbox-owned. See `pi/SOURCES.md`, `../docs/runtime-strategy.md`, and `../docs/lora-pi-kit.md`.
+Pi is the primary runtime foundation established in the completed Plan 03. Glassbox embeds it through the public SDK and loads Lora PI Kit resources. Glassbox does not become a Pi fork or a Pi wrapper. Product identity, authorization, QQ Channel identity, Conversation, local database state, audience policy, Task truth, and Trace remain Glassbox-owned. See `pi/SOURCES.md`, `../docs/runtime-strategy.md`, and `../docs/lora-pi-kit.md`.
 
 OpenHarness is the default general capability reference after Pi. Pi-native capability wins when equivalent functionality already exists. Otherwise, Lora PI Kit should prefer a focused OpenHarness-derived port over a fresh design for standard harness features such as MCP, LSP, capability discovery, Web Tools, Hooks, profiles, and Skill UX. OpenHarness product-state ownership does not override Glassbox / Herdr boundaries. See `openharness/SOURCES.md`.
 

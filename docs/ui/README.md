@@ -1,8 +1,10 @@
-# Glassbox Web Management — Delivery Workspace & Frozen Spec
+# Glassbox Web Management delivery record and frozen spec
 
-Status: **FROZEN DELIVERY SPEC — DESIGN FREEZE v2 IMPLEMENTATION CONTRACT**<br />
-Tracking Branch: `codex/web-management-freeze`<br />
-Delivery Mode: Dedicated Worktree · Long-lived Draft PR · Contract-First Fixtures · Zero Backend Changes in Setup
+Status: HISTORICAL DESIGN FREEZE v2 DELIVERY RECORD
+
+The primary design overview is [`../ui-design.md`](../ui-design.md). This directory preserves the frontend delivery stream's frozen source copies and historical implementation/verification notes. [`../design-inputs/README.md`](../design-inputs/README.md) describes the original external input archive.
+
+Historical tracking branch: `codex/web-management-freeze`. The dedicated-worktree, draft-PR and fixture-first setup below records that delivery phase, not the current repository workflow. Old API-gap, dependency, command and test-result sections are historical evidence, not claims about current `main`. Use `AGENTS.md`, [`../tech-stack.md`](../tech-stack.md), current contracts and code for implementation status and verification commands.
 
 ---
 
@@ -10,7 +12,7 @@ Delivery Mode: Dedicated Worktree · Long-lived Draft PR · Contract-First Fixtu
 
 ### 1.1 Document Provenance
 
-This directory (`docs/ui/`) is the dedicated, frozen source of truth for the Glassbox Web Management frontend delivery stream. The four core design documents are imported verbatim from the Design Freeze v2 archive:
+This directory (`docs/ui/`) retains the frozen inputs used by the Glassbox Web Management frontend delivery stream. It is not a second current architecture authority. The four core design documents were imported verbatim from the Design Freeze v2 archive:
 
 | File | Role & Authority | Verbatim SHA-256 Checksum |
 | --- | --- | --- |
@@ -21,7 +23,7 @@ This directory (`docs/ui/`) is the dedicated, frozen source of truth for the Gla
 
 ### 1.2 Precedence Hierarchy
 
-When requirements appear ambiguous or interact across layers, apply this strict order of precedence:
+For the historical frozen design inputs, the precedence was recorded as follows. Current repository invariants and implemented security/contracts take precedence over any stale capability or workflow claims in this record:
 
 ```text
 1. AGENTS.md (Root repository invariants, trust & authorization boundary)
@@ -380,5 +382,4 @@ Before any milestone or final delivery is accepted:
     - `trace.test.ts` (6/6): Timeline ordering, event parsing, large trace handling.
     - `stress.test.ts` (4/4): 500+ event windowing, memory safety, responsive viewport layout stability.
 
-> **Delivery Rule**: All frontend development occurs on branch `codex/web-management-freeze` within the dedicated worktree. No direct pushes to `main`, no premature merges, and no unverified backend modifications.
-
+> Historical delivery rule: the freeze stream used branch `codex/web-management-freeze` in a dedicated worktree. Current contribution and verification rules are in `AGENTS.md`.

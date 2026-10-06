@@ -1,6 +1,6 @@
 # Audit remediation
 
-Status: ACTIVE IMPLEMENTATION, scoped backend fixes. Each verified concern gets a reviewable change and regression coverage. No Web UI redesign, live QQ acceptance, service switch, merge, or deployment is included. The Owner performs real QQ acceptance after reviewing the PRs.
+Status: IMPLEMENTATION MERGED in [PR #136](https://github.com/lora-sys/Glassbox-Agent-Harness/pull/136) on 2026-10-02, merge commit `074eaf77851b1f1ce85ee962bc209fa5a709a4e6`. This scoped backend repair plan is a historical implementation record, not an active implementation queue. The per-slice status notes and unchecked items below describe the work before integration; they do not supersede this merged status. Real QQ acceptance and any unreproduced review hypotheses remain unverified. No Web UI redesign, live QQ acceptance, service switch, or deployment was included.
 
 Baseline: `64fa57c475f5332f912a13c6e37fa4c33c47d483`.
 

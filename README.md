@@ -26,10 +26,13 @@ Glassbox 是一个 Personal Agent 系统：显式身份、严格授权、持久�
 - **Task 生命周期闭环**。派发给 Herdr coding worker 时使用已配置的 workspace 和 worktree；worker 完成后必须经过人工 Review，Accept 才算 DONE，Rework 则开新的 TaskAttempt。当前不会按 Task 自动创建独立分支或 worktree。
 - **Taste / Memory 持久学习**。受治理的学习真相落库，不是写在 prompt 里的口头记忆。
 - **授权检索**。QQ 历史消息搜索；对明确要求“只回复”指定字段且包含一个拉丁精确词的特定请求，输出由实际工具结果投影。一般回答依赖模型与内容策略约束，不能保证每条引用都来自官方来源。
+- **Web Search / Fetch / browser**。受授权约束的 `web_search`、`web_fetch` 和沙箱 `browser` 已实现；真实 QQ 验收记录及 Jev、协同 Owner 并发等已接受的遗留项见 [Issue #20 计划](./.plans/05-web-search-fetch-browser.md)。浏览器不可回退到宿主机执行。
 - **上下文预算与运行时路由**。按任务和 Audience 控制注入的上下文与技能面。
 - **双 Owner 协同**。主 Owner 与协同 Owner 身份对等，私聊会话在数据库中物理隔离。当前固定的 worker 配置不提供按 Task 的 worktree 隔离，并发编码任务不能依赖此路径避免互相踩踏。
 
-Web 管理端和 P6 长任务还在开发中，见[当前开发状态](#当前开发状态)。
+Web 管理端仍在开发中。P6 长任务已有持久化、调度与恢复实现，#33 已关闭；Linux 与真实 QQ 的剩余验收仍由 #30 跟踪，见[当前开发状态](#当前开发状态)。
+
+排查 Run 和投递问题可使用仓库自带的 [glassbox-ops 技能](./.agents/skills/glassbox-ops/SKILL.md)，从 Trace 证据重建执行过程；事件字段见其 [Trace 参考](./.agents/skills/glassbox-ops/references/trace-events.md)。
 
 真实 QQ 驱动的 Task 派发、Review / Rework / Accept 与最终投递仍待验收；现有确定性闭环测试和直接调用 Ops 服务的验收不能替代这条真实流程。
 
@@ -56,7 +59,8 @@ flowchart LR
     PI --> KIT[Lora PI Kit Profile]
     KIT --> T[Skills / MCP / Tools]
     GB -- HerdrBridge --> H[Herdr Workers<br/>worktree / pane]
-    GB --> DB[(Turso 持久状态 / Trace)]
+    GB --> DB[(本地 libSQL / SQLite 持久状态)]
+    GB --> TRACE[追加写入 Raw Trace]
     G5 --> QQ
 ```
 
@@ -121,7 +125,7 @@ stateDiagram-v2
 | P4B | 授权检索与 QQ 历史搜索 | 已完成 |
 | P5A / P5B | 上下文预算、运行时路由与可观测性 | 已完成 |
 | Web 管理端 | Workbench 与管理界面（design freeze v2） | 开发中 |
-| P6 | 持久长任务与 Worker | 开发中 |
+| P6 | 持久长任务与 Worker | #33 已关闭；实现与证据见 [Plan 06](./.plans/06-durable-long-work.md)，#30 仍跟踪 Linux / QQ 验收 |
 | P7 / P8 | 更多 Channel、评测、技能演化 | 规划中 |
 
 完整 Roadmap 见 [`.plans/roadmap.md`](./.plans/roadmap.md)，各阶段施工顺序与验收证据见 [`.plans/`](./.plans/) 下对应的 plan 文件。
