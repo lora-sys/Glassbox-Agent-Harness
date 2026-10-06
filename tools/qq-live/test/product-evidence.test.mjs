@@ -332,6 +332,166 @@ test("acceptance binds scoped input, successful Run, authorization and received 
   });
 });
 
+function filteredSourceFixture() {
+  const fixture = evidenceFixture();
+  const { db, scopeKey } = fixture;
+  db.exec(`
+    ALTER TABLE authorization_decisions_all ADD COLUMN principal_id TEXT;
+    ALTER TABLE authorization_decisions_all ADD COLUMN scope_key TEXT;
+    ALTER TABLE authorization_decisions_all ADD COLUMN delivery_source TEXT;
+    ALTER TABLE authorization_decisions_all ADD COLUMN created_at TEXT;
+    ALTER TABLE authorization_decisions_all ADD COLUMN resource_id TEXT;
+    CREATE TABLE resources(id TEXT, kind TEXT);
+    INSERT INTO resources VALUES ('filtered-resource','qq_group');
+    CREATE TABLE ops_trace_events(event_id TEXT, ts TEXT, type TEXT, run_id TEXT, principal_id TEXT, data_json TEXT);
+  `);
+  const at = db.prepare("SELECT created_at FROM runs WHERE id='r'").get().created_at;
+  db.prepare("INSERT INTO authorization_decisions_all VALUES (?,?,?,?,?,?,?,?,?)").run(
+    "filtered-read",
+    "r",
+    "history:read",
+    "DENY",
+    "principal-owner-1",
+    scopeKey,
+    null,
+    at,
+    "filtered-resource",
+  );
+  const witness = {
+    decisionId: "filtered-read",
+    projection: "conversation-history",
+    outcome: "excluded",
+  };
+  const insertWitness = (data = witness, principal = "principal-owner-1", run = "r", ts = at) =>
+    db
+      .prepare("INSERT INTO ops_trace_events VALUES (?,?,?,?,?,?)")
+      .run("filter-event", ts, "authorization.filtered", run, principal, JSON.stringify(data));
+  return { ...fixture, witness, insertWitness, at };
+}
+
+test("source denial remains a DENY and passes only with an exact durable exclusion witness", (t) => {
+  const { db, c, config, insertWitness } = filteredSourceFixture();
+  t.after(() => db.close());
+  assert.throws(() => caseEvidence(db, c, config), { code: "AUTHORIZATION_EVIDENCE" });
+  insertWitness();
+  const result = caseEvidence(db, c, config);
+  assert.equal(
+    result.decisions.find((decision) => decision.id === "filtered-read").decision,
+    "DENY",
+  );
+  assert.deepEqual(result.filteredDecisions, [
+    {
+      decisionId: "filtered-read",
+      eventId: "filter-event",
+      projection: "conversation-history",
+    },
+  ]);
+  db.exec("INSERT INTO ops_trace_events SELECT * FROM ops_trace_events");
+  assert.throws(() => caseEvidence(db, c, config), { code: "AUTHORIZATION_EVIDENCE" });
+});
+
+test("document source exclusions use the same strict pairing contract as history sources", (t) => {
+  const { db, c, config, witness, insertWitness } = filteredSourceFixture();
+  t.after(() => db.close());
+  db.exec("UPDATE authorization_decisions_all SET action='document:read' WHERE id='filtered-read'");
+  assert.throws(() => caseEvidence(db, c, config), { code: "AUTHORIZATION_EVIDENCE" });
+  insertWitness({ ...witness, projection: "task-list" });
+  assert.equal(caseEvidence(db, c, config).filteredDecisions[0].projection, "task-list");
+});
+
+test("all protected source classifications require exact exclusion evidence", (t) => {
+  const cases = [
+    ["read", "qq_group", "filtered-resource"],
+    ["context:read", "qq_group", "filtered-resource"],
+    ["qq:capability:read", "qq_group", "filtered-resource"],
+    ["group:read", "qq_group", "filtered-resource"],
+    ["group:members:read", "qq_group", "filtered-resource"],
+    ["group:content:read", "qq_group", "filtered-resource"],
+    ["group:files:read", "qq_group", "filtered-resource"],
+    ["account:status:read", "qq_group", "filtered-resource"],
+    ["worker:status", "worker", "filtered-resource"],
+    ["task:list", "task", "filtered-resource"],
+    ["history:search", "owner-history", "filtered-resource"],
+    ["workspace:write", "workspace", "workspace:test"],
+    ["model:switch", "owner-control", "owner-control"],
+  ];
+  for (const [action, kind, resourceId] of cases) {
+    const f = filteredSourceFixture();
+    t.after(() => f.db.close());
+    f.db.prepare("UPDATE resources SET id=?, kind=?").run(resourceId, kind);
+    f.db
+      .prepare(
+        "UPDATE authorization_decisions_all SET action=?, resource_id=? WHERE id='filtered-read'",
+      )
+      .run(action, resourceId);
+    assert.throws(() => caseEvidence(f.db, f.c, f.config), { code: "AUTHORIZATION_EVIDENCE" });
+    f.insertWitness();
+    assert.equal(caseEvidence(f.db, f.c, f.config).filteredDecisions.length, 1, action);
+  }
+});
+
+test("exclusion cannot excuse execution denial or approval, or mismatch Run, actor, scope and outcome", (t) => {
+  const cases = [
+    (f) => {
+      f.insertWitness();
+      f.db.exec("UPDATE resources SET kind='web-public'");
+    },
+    (f) => {
+      f.insertWitness();
+      f.db.exec("DELETE FROM resources");
+    },
+    (f) => {
+      f.insertWitness();
+      f.db.exec(
+        "UPDATE authorization_decisions_all SET action='workspace:write' WHERE id='filtered-read'",
+      );
+    },
+    (f) => {
+      f.insertWitness();
+      f.db.exec(
+        "UPDATE authorization_decisions_all SET action='model:switch' WHERE id='filtered-read'",
+      );
+    },
+    (f) => {
+      f.insertWitness();
+      f.db.exec(
+        "UPDATE authorization_decisions_all SET action='delivery:send' WHERE id='filtered-read'",
+      );
+    },
+    (f) => {
+      f.insertWitness();
+      f.db.exec(
+        "UPDATE authorization_decisions_all SET decision='REQUIRES_APPROVAL' WHERE id='filtered-read'",
+      );
+    },
+    (f) => f.insertWitness(f.witness, "another-principal"),
+    (f) => f.insertWitness(f.witness, "principal-owner-1", "another-run"),
+    (f) => {
+      f.insertWitness();
+      f.db.exec(
+        "UPDATE authorization_decisions_all SET scope_key='other-scope' WHERE id='filtered-read'",
+      );
+    },
+    (f) => f.insertWitness({ ...f.witness, outcome: "included" }),
+    (f) => f.insertWitness({ ...f.witness, projection: "tool-execution" }),
+    (f) => f.insertWitness({ ...f.witness, decisionId: "another-decision" }),
+    (f) => f.insertWitness({ ...f.witness, extra: true }),
+    (f) => f.insertWitness(f.witness, "principal-owner-1", "r", "2000-01-01T00:00:00.000Z"),
+    (f) => {
+      f.insertWitness();
+      f.db.exec(
+        "UPDATE authorization_decisions_all SET delivery_source='content_source' WHERE id='filtered-read'",
+      );
+    },
+  ];
+  for (const change of cases) {
+    const f = filteredSourceFixture();
+    t.after(() => f.db.close());
+    change(f);
+    assert.throws(() => caseEvidence(f.db, f.c, f.config), { code: "AUTHORIZATION_EVIDENCE" });
+  }
+});
+
 test("feature lease cleanup is independently verified before a failing feature assertion", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "qq-product-cleanup-order-"));
   t.after(() => rm(directory, { recursive: true, force: true }));

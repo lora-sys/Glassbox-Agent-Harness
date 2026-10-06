@@ -229,3 +229,9 @@ schemaVersion 5 的 `feature-baseline.example.json` 同时包含既有读取、�
 The fixed group A root-files read adds exact Owner-private group:files:read narrowing with no arbitrary file IDs, folders, URL resolution or mutations. Runtime groupFiles evidence derives counts and a canonical digest of validated complete returned page data from the actual protected content/details wrapper. The existing full output SHA256/byte count and 512-byte preview remain intact. A separate fixed Bot read must match the page digest and counts. The two account-local actual replies must satisfy the fixed count-only format. Default provider paging is limited to 50 entries at startIndex 0, as recorded in the pinned NapCat GetGroupRootFiles source. This operation supplies no total-directory completeness witness, so directory traversal and wider file coverage remain planned. Changed metadata, malformed entries and unavailable reads cannot pass. Historical root-list lessons remain hypotheses pending an independent historical witness. No ordinary grants, native Pi configuration or locked skill core change.
 
 审查记录须在 Linux 或 WSL 中执行，Windows 缺少这里要求的目录持久化能力，登记会返回 BLOCKED。审查记录使用固定命令。先运行 `record-agent-review --pr <URL>` 获取当前 PR、base、head、tree、完整 diff 和文件清单的绑定。独立审查者必须核对完整改动，并在仓库外保存原始审查 JSON。再传入 `--artifact <文件> --expected-review-binding <SHA256>` 登记该绑定的审查。命令拒绝混入发送或合并选项。登记记录与原始文件保存在仓库外的私密目录，交付前会重新读取核验。记录说明受信任的本机操作者已确认审查来源，不提供密码学身份认证。正式 GitHub approval 仍可作为审查证据。当前提交的未撤销修改请求和实际分支规则仍会阻止合并。审查记录不替代功能覆盖、QQ 实机验收、CI 或已有用户合并授权。
+
+## Linux 授权过滤与登录恢复
+
+当前及后续部署只以 Linux 为目标。实机核验会保留原始 DENY。只有真实内容排除分支在同一事务中生成 `authorization.filtered`，并与 Run、Principal、scope 和决策 ID 精确匹配时，核验才承认该拒绝已排除内容。执行拒绝、投递拒绝、需要审批以及证据缺失仍会停止测试。旧失败报告不能通过补写历史审计变成通过。
+
+QQ 账号目录和 NapCat 配置目录必须分别持久挂载，每套账号固定自己的启动账号。保存文件不代表 QQ 仍接受快速登录凭据。验证重启时须逐个账号进行，记录重启前后实际在线状态。QQ 报登录态失效或被踢下线时保留账号目录，重新授权后再开始新一轮验收。不能因数据目录存在、接口端口可达或过去在线而继续发测试消息。

@@ -149,6 +149,83 @@ function scopeMatches(actual, expected) {
   );
 }
 
+function filteredAuthorizationEvidence(db, run, expectedScopeKey, decisions) {
+  const rejected = decisions.filter((decision) => decision.decision !== "ALLOW");
+  if (!rejected.length) return [];
+  try {
+    if (rejected.some((decision) => decision.decision !== "DENY"))
+      throw new Error("not a denied source");
+    const metadata = db
+      .prepare(
+        "SELECT d.id, d.action, d.resource_id, d.principal_id, d.scope_key, d.delivery_source, d.created_at, r.kind AS resource_kind FROM authorization_decisions_all d LEFT JOIN resources r ON r.id=d.resource_id WHERE d.run_id=? AND d.decision='DENY'",
+      )
+      .all(run.id);
+    const rows = db
+      .prepare(
+        "SELECT event_id, ts, run_id, principal_id, data_json FROM ops_trace_events WHERE run_id=? AND type='authorization.filtered'",
+      )
+      .all(run.id);
+    const allowedProjections = new Set(["conversation-history", "task-list", "ops-health-records"]);
+    const receipts = [];
+    const rejectedIds = new Set(rejected.map((decision) => decision.id));
+    for (const row of rows) {
+      const data = JSON.parse(row.data_json);
+      if (
+        !data ||
+        typeof data !== "object" ||
+        Array.isArray(data) ||
+        Object.keys(data).sort().join(",") !== "decisionId,outcome,projection" ||
+        !rejectedIds.has(data.decisionId) ||
+        !allowedProjections.has(data.projection) ||
+        data.outcome !== "excluded" ||
+        row.run_id !== run.id ||
+        row.principal_id !== run.principal_id ||
+        !validIdentifier(row.event_id)
+      )
+        throw new Error("invalid exclusion");
+      const matches = metadata.filter((decision) => decision.id === data.decisionId);
+      if (matches.length !== 1) throw new Error("ambiguous denial");
+      const decision = matches[0];
+      const verb = decision.action.split(":").at(-1);
+      const sourceRead =
+        typeof decision.resource_kind === "string" &&
+        decision.resource_kind !== "web-public" &&
+        ["read", "list", "status", "search"].includes(verb);
+      const documentedWrite =
+        (decision.action === "workspace:write" &&
+          decision.resource_kind === "workspace" &&
+          decision.resource_id.startsWith("workspace:")) ||
+        (decision.action === "model:switch" &&
+          decision.resource_kind === "owner-control" &&
+          decision.resource_id === "owner-control");
+      if (!sourceRead && !documentedWrite) throw new Error("not a protected content source");
+      if (
+        decision.principal_id !== run.principal_id ||
+        decision.scope_key !== expectedScopeKey ||
+        decision.delivery_source !== null ||
+        !Number.isFinite(Date.parse(decision.created_at)) ||
+        !Number.isFinite(Date.parse(row.ts)) ||
+        Date.parse(row.ts) < Date.parse(decision.created_at)
+      )
+        throw new Error("invalid denial binding");
+      receipts.push({
+        decisionId: data.decisionId,
+        eventId: row.event_id,
+        projection: data.projection,
+      });
+    }
+    if (
+      rejected.some(
+        (decision) => receipts.filter((row) => row.decisionId === decision.id).length !== 1,
+      )
+    )
+      throw new Error("missing exclusion");
+    return receipts;
+  } catch {
+    fail("AUTHORIZATION_EVIDENCE", "拒绝记录缺少独立且精确绑定的内容排除证据。", "INCONCLUSIVE");
+  }
+}
+
 export function caseEvidence(db, c, config) {
   const binding = c.inputBinding;
   if (
@@ -166,7 +243,7 @@ export function caseEvidence(db, c, config) {
   const expectedScopeKey = scopeKey(scope);
   const candidates = db
     .prepare(
-      "SELECT r.id, r.status, r.scope_json, r.created_at FROM runs r JOIN messages m ON m.id=r.message_id WHERE m.external_id=? AND m.scope_key=?",
+      "SELECT r.id, r.status, r.scope_json, r.created_at, r.principal_id FROM runs r JOIN messages m ON m.id=r.message_id WHERE m.external_id=? AND m.scope_key=?",
     )
     .all(binding.botMessageId, expectedScopeKey);
   const matches = candidates.filter((r) => {
@@ -179,11 +256,9 @@ export function caseEvidence(db, c, config) {
   const decisions = db
     .prepare("SELECT id, action, decision FROM authorization_decisions_all WHERE run_id=?")
     .all(run.id);
-  if (
-    !decisions.some((d) => d.decision === "ALLOW") ||
-    decisions.some((d) => d.decision !== "ALLOW")
-  )
+  if (!decisions.some((d) => d.decision === "ALLOW"))
     fail("AUTHORIZATION_EVIDENCE", "对应 Run 的授权证据不满足收发验收。", "INCONCLUSIVE");
+  const filteredDecisions = filteredAuthorizationEvidence(db, run, expectedScopeKey, decisions);
   const deliveries = db
     .prepare("SELECT id, status, external_id, destination_scope_key FROM deliveries WHERE run_id=?")
     .all(run.id);
@@ -198,6 +273,7 @@ export function caseEvidence(db, c, config) {
     runCreatedAt: run.created_at,
     scope,
     decisions,
+    filteredDecisions,
     deliveries,
     delivery: scopedDeliveries[0],
   };

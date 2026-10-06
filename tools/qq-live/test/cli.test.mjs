@@ -699,6 +699,27 @@ test("transport run rejects missing runtime and approval before creating output 
   assert.equal(blockedReport.error.code, "RUNTIME_CONFIG");
   assert.equal(w.driver.authCount, 0);
   assert.equal(w.bot.authCount, 0);
+  const explicitFamily = await run(
+    [
+      "run",
+      "--case",
+      "transport-smoke",
+      "--live",
+      "--approve-suite",
+      plan.suiteSha256,
+      "--config",
+      p,
+      "--out",
+      out,
+    ],
+    d,
+  );
+  assert.equal(explicitFamily.code, 2);
+  const explicitReport = JSON.parse(await readFile(join(out, "latest.json"), "utf8"));
+  assert.equal(explicitReport.error.code, "RUNTIME_CONFIG");
+  assert.doesNotMatch(explicitFamily.stderr, /CASE_NOT_FOUND/);
+  assert.equal(w.driver.authCount, 0);
+  assert.equal(w.bot.authCount, 0);
 });
 test("STOP file blocks all outgoing messages", async (t) => {
   const d = await dir(t);

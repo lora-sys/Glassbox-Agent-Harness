@@ -504,6 +504,7 @@ async function main() {
   }
   if (
     o.case &&
+    !transportOnlySuite &&
     o.case !== "moderation" &&
     !memoryLifecycle &&
     !tasteLifecycle &&

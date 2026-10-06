@@ -23,6 +23,7 @@ import {
   type CallerContext,
 } from "../identity/scope.js";
 import { taskPolicyResourceId } from "../auth/task-policy.js";
+import { recordFilteredDecision } from "../auth/filtered-decision.js";
 import { authorizedValue, evaluate, type AuthorizedResult } from "../auth/service.js";
 
 export type TaskTraceEventType =
@@ -40,6 +41,7 @@ export type TaskTraceEventType =
   | "authorization.checked"
   | "authorization.granted"
   | "authorization.revoked"
+  | "authorization.filtered"
   | "capability.probed"
   | "runtime.turn";
 
@@ -702,7 +704,16 @@ export class TaskStore {
             await readTaskSourceRows(tx, stringColumn(row, "id")),
             { runId: options.runId, conversationId: options.conversationId },
           );
-          if ("denied" in sources) continue;
+          if ("denied" in sources) {
+            await recordFilteredDecision(
+              tx,
+              options.caller,
+              { runId: options.runId },
+              sources.denied,
+              "task-list",
+            );
+            continue;
+          }
         }
         rows.push(row);
       }
@@ -738,7 +749,17 @@ export class TaskStore {
           await readTaskSourceRows(tx, stringColumn(row, "id")),
           evidence ?? {},
         );
-        if (!("denied" in sources)) allowed.push(row);
+        if (!("denied" in sources)) {
+          allowed.push(row);
+        } else {
+          await recordFilteredDecision(
+            tx,
+            caller,
+            evidence ?? {},
+            sources.denied,
+            "ops-health-records",
+          );
+        }
       }
       const ids = new Set(allowed.map((row) => row.id));
       const attempts = attemptRows.rows.filter((row) => ids.has(row.task_id));
