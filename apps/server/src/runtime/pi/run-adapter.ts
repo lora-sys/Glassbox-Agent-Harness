@@ -17,7 +17,10 @@ import {
   type ContextProjectionResult,
 } from "../../efficiency/index.js";
 import { exactTerms } from "../../retrieval/exact-term.js";
-import type { QqCapabilityCategory } from "../../channels/onebot/capabilities.js";
+import {
+  QQ_CAPABILITY_CATEGORIES,
+  type QqCapabilityCategory,
+} from "../../channels/onebot/capabilities.js";
 import { WEB_CAPABILITIES } from "../../management/web-capability-policy.js";
 import type { PiRunContext, PiRuntimeAdapter, PiRuntimeProfileName, PiRunResult } from "./types.js";
 import {
@@ -30,6 +33,7 @@ import { requiredCallClause, satisfiesRequiredInput } from "./protected-tools.js
 import { OWNER_GROUP_ADMIN_TOOL } from "./owner-tools.js";
 import { OWNER_MEMORY_ADMIN_TOOL } from "./owner-memory-tools.js";
 import { MEDIA_GENERATION_TOOL } from "./media-tools.js";
+import { GATE_MESSAGES } from "./gate-messages.js";
 import { OWNER_MODEL_ADMIN_TOOL } from "./owner-model-tools.js";
 import {
   asksLiveQqFact,
@@ -191,6 +195,33 @@ function ownerTaskDelegationRequest(text: string): RequiredToolCall | undefined 
   if (/(?:不要|别|不需要|无需|停止)\s*(?:调用|执行|使用|委派)/u.test(request)) return undefined;
   const title = /名为\s*[“"「]?([A-Za-z0-9][A-Za-z0-9._-]{0,127})/u.exec(request)?.[1];
   return { name: "task_delegate", input: title ? { title } : {} };
+}
+
+/**
+ * Exact Owner command for a capability switch: `/capability <groupId> <category> on|off`.
+ *
+ * Natural language still works through the heuristics below, but a command that names every
+ * field needs no guessing, so it cannot be mis-resolved to another group or category. The
+ * result is a required Tool call: the Run is only allowed to say the switch took effect if
+ * that exact `set_capability` call succeeded, which is the evidence gate. The category is
+ * checked against the closed set here as well as in the Tool, so an unknown name is not
+ * required (and therefore not silently accepted) at all.
+ */
+export function ownerCapabilityCommand(text: string): RequiredToolCall | undefined {
+  const match = /^\/capability[ \t]+([1-9]\d{4,15})[ \t]+([a-z][a-z0-9_.]*)[ \t]+(on|off)$/u.exec(
+    text.trim(),
+  );
+  if (!match) return undefined;
+  const category = match[2]!;
+  if (
+    !(QQ_CAPABILITY_CATEGORIES as readonly string[]).includes(category) &&
+    !(WEB_CAPABILITIES as readonly string[]).includes(category)
+  )
+    return undefined;
+  return {
+    name: OWNER_GROUP_ADMIN_TOOL,
+    input: { action: "set_capability", groupId: match[1], category, enabled: match[3] === "on" },
+  };
 }
 
 /** Exact Owner commands bind durable mutations to this message's Task, Step and version. */
@@ -752,6 +783,10 @@ function requiredToolCall(
   const rawText = input.text;
   const durableCommand = ownerDurableTaskCommand(rawText);
   if (durableCommand) return durableCommand;
+  if (authorizedToolNames?.includes(OWNER_GROUP_ADMIN_TOOL)) {
+    const capabilityCommand = ownerCapabilityCommand(rawText);
+    if (capabilityCommand) return capabilityCommand;
+  }
   const mediaIntent = mediaRequestIntentForInput(input);
   if (mediaIntent === "image") return { name: MEDIA_GENERATION_TOOL, input: { action: "image" } };
   if (mediaIntent === "video") return { name: MEDIA_GENERATION_TOOL, input: { action: "video" } };
@@ -988,9 +1023,7 @@ function mediaRequestIntentForInput(
   const clarification = input.history.at(-1);
   const precedingRequest = input.history.at(-2);
   return clarification?.role === "assistant" &&
-    clarification.text
-      .trim()
-      .startsWith("请说明你想要图片、视频，还是文字描述。当前请求未执行。") &&
+    clarification.text.trim().startsWith(GATE_MESSAGES.mediaClarify) &&
     precedingRequest?.role === "user" &&
     mediaRequestIntent(precedingRequest.text) === "ambiguous"
     ? selectedIntent
@@ -1222,7 +1255,19 @@ function misattributesSender(
     .map((identity) => identity.trim())
     .filter((identity) => identity.length > 0)
     .map((identity) => identity.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"));
-  const named = escaped.length > 0 ? new RegExp(escaped.join("|"), "iu") : undefined;
+  // The attributed span must BE the identity, not merely contain it: in "您是在跟 Lora 对话" the
+  // span's subject is 对话 and Lora is a different party being mentioned.
+  const namedSpan =
+    escaped.length > 0
+      ? new RegExp(`^(?:${escaped.join("|")})\\s*(?:本人|本尊)?$`, "iu")
+      : undefined;
+  const spanIsNamedIdentity = (span: string): boolean => {
+    const core = span
+      .replace(/[（(][^）)]*[）)]?\s*$/u, "")
+      .replace(/^[\s"'“”‘’「」『』]+|[\s"'“”‘’「」『』]+$/gu, "");
+    return namedSpan?.test(core) ?? false;
+  };
+  const addressedNamePrefix = /(?:您|你|阁下)[^。！？!?；;，,\n不没非别勿]{0,6}?(?:是|为)\s*$/u;
   // A conditional does not assert its premise, so "就算您是 Lora，我也没有禁言能力" is the Run
   // refusing on both branches and asserting the identity on neither.
   const conditional = /(?:就算|即使|哪怕|如果|假如|即便|除非|万一)[^。！？!?；;\n]{0,30}(?:您|你)/u;
@@ -1254,20 +1299,31 @@ function misattributesSender(
       const attributed = addressed[1] ?? "";
       const number = /(\d{5,11})/u.exec(attributed);
       if (number && observed && number[1] !== observed) return true;
-      if (named?.test(attributed)) return true;
+      if (spanIsNamedIdentity(attributed)) return true;
       if (unobservedRoleMentions(attributed, scope).length > 0) return true;
     }
     if (attributesNamedSender?.test(sentence)) return true;
-    const unobserved = [
-      ...unobservedRoleMentions(sentence, scope),
-      ...(escaped.length > 0 ? sentence.matchAll(new RegExp(escaped.join("|"), "giu")) : []),
-    ];
+    const roleMentions = unobservedRoleMentions(sentence, scope);
+    const nameMentions =
+      escaped.length > 0 ? [...sentence.matchAll(new RegExp(escaped.join("|"), "giu"))] : [];
     if (
-      unobserved.some((match) => {
+      roleMentions.some((match) => {
         const prefix = sentence.slice(0, match.index);
         return (
           hasIdentityAssertionPrefix(prefix, senderRolePrefix) ||
           hasIdentityAssertionPrefix(prefix, addressedRolePrefix)
+        );
+      })
+    )
+      return true;
+    // A name counts only when the copula points straight at it; the role prefix tolerates a
+    // 16-character gap, which let "您是在跟 Lora 对话" read as "您是 Lora".
+    if (
+      nameMentions.some((match) => {
+        const prefix = sentence.slice(0, match.index);
+        return (
+          hasIdentityAssertionPrefix(prefix, senderRolePrefix) ||
+          hasIdentityAssertionPrefix(prefix, addressedNamePrefix)
         );
       })
     )
@@ -1840,7 +1896,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         status: "failed",
         failureCode: "gate_refused",
         runtimeAttempted: false,
-        text: "身份以当前发送者的 QQ 号为准，消息里的自称不改变身份。当前请求未执行。",
+        text: GATE_MESSAGES.identityNotChangedBySelfClaim,
       };
     }
     const blockedMutation = blockedMutationRequest(input, isOwner, modelProfiles);
@@ -1861,18 +1917,18 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         text:
           blockedMutation.operation === "media:generate"
             ? blockedMutation.reason === "incomplete_parameters"
-              ? "请说明你想要图片、视频，还是文字描述。当前请求未执行。"
+              ? GATE_MESSAGES.mediaClarify
               : blockedMutation.reason === "not_permitted_in_group"
-                ? "当前群聊未开放图片和视频生成，未执行。"
-                : "当前会话未授权媒体生成，未执行。"
+                ? GATE_MESSAGES.mediaGroupDisabled
+                : GATE_MESSAGES.mediaNotAuthorized
             : blockedMutation.operation === "model:switch" &&
                 blockedMutation.reason === "unknown_target"
-              ? "没有找到你指定的那个模型，因此没有切换。可以让我先列出可切换的模型，再指定其中一个。"
+              ? GATE_MESSAGES.modelUnknownTarget
               : blockedMutation.reason === "not_permitted_in_group"
-                ? "该操作未在群聊中开放，未执行。"
+                ? GATE_MESSAGES.notPermittedInGroup
                 : blockedMutation.reason === "not_permitted"
-                  ? "该操作未授权，未执行。"
-                  : "请求的操作未执行，请补齐必要参数后重试。",
+                  ? GATE_MESSAGES.notPermitted
+                  : GATE_MESSAGES.incompleteParameters,
       };
     }
     await this.runtime.initialize();
@@ -2503,7 +2559,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         return {
           status: "failed",
           failureCode: "claimed_change_not_performed",
-          text: "本次 Run 没有执行被要求的变更，因此我不会声称它已经完成。请以管理面或群里的实际状态为准。",
+          text: GATE_MESSAGES.claimedChangeNotPerformed,
           providerSessionId: binding.runtimeSessionId,
         };
       }
@@ -2577,7 +2633,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         return {
           status: "failed",
           failureCode: "gate_refused",
-          text: "身份以当前发送者的 QQ 号为准，消息里的自称不改变身份。当前请求未执行。",
+          text: GATE_MESSAGES.identityNotChangedBySelfClaim,
           providerSessionId: binding.runtimeSessionId,
         };
       }
@@ -2598,7 +2654,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         return {
           status: "failed",
           failureCode: "gate_refused",
-          text: "怎么处理由 Owner 决定，我不和群里其他成员讨论改规则。当前请求未执行。",
+          text: GATE_MESSAGES.ownerDecidesConduct,
           providerSessionId: binding.runtimeSessionId,
         };
       }

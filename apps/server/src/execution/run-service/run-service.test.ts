@@ -115,6 +115,7 @@ function service(
     concurrency?: number;
     queuedPollMs?: number;
     deliveryTimeoutMs?: number;
+    deliveryRetryDelaysMs?: readonly number[];
     prepareDelivery?: ConstructorParameters<typeof RunService>[0]["prepareDelivery"];
     captureLearning?: ConstructorParameters<typeof RunService>[0]["captureLearning"];
   } = {},
@@ -1725,7 +1726,7 @@ describe("durable result delivery and recovery", () => {
           return new Promise(() => {});
         },
       },
-      { deliveryTimeoutMs: 50 },
+      { deliveryTimeoutMs: 50, deliveryRetryDelaysMs: [] },
     );
     await instance.start();
     const accepted = await instance.receive(input("timeout-send"));
@@ -1746,6 +1747,97 @@ describe("durable result delivery and recovery", () => {
         (item) => item.payloadKind === "result",
       )?.status,
     ).toBe("unknown");
+  });
+
+  it("retries an unconfirmed send with the same delivery and settles once on success (#110)", async () => {
+    const { store } = await fixture();
+    const seen: string[] = [];
+    let resultAttempts = 0;
+    const { instance, events } = service(
+      store,
+      { supportsGroup: true, execute: async () => ({ status: "succeeded", text: "result" }) },
+      {
+        send: async ({ delivery }) => {
+          if (delivery.payloadKind === "ack") return { status: "sent" };
+          seen.push(delivery.id);
+          resultAttempts += 1;
+          return resultAttempts < 3
+            ? { status: "unknown", reason: "timeout" }
+            : { status: "sent", externalId: "m-1" };
+        },
+      },
+      { deliveryRetryDelaysMs: [1, 1] },
+    );
+    await instance.start();
+    const accepted = await instance.receive(input("retry-send"));
+    await instance.drain();
+    expect(resultAttempts).toBe(3);
+    expect(new Set(seen).size).toBe(1);
+    expect(events).toContainEqual(
+      expect.objectContaining({ type: "delivery_changed", status: "sent", attempts: 3 }),
+    );
+    expect(
+      (await store.lifecycle.listDeliveries(owner(), accepted.run.id)).items.find(
+        (item) => item.payloadKind === "result",
+      )?.status,
+    ).toBe("sent");
+  });
+
+  it("settles unknown with an attention item once bounded retries are exhausted (#110)", async () => {
+    const { store } = await fixture();
+    let resultAttempts = 0;
+    const { instance, events } = service(
+      store,
+      { supportsGroup: true, execute: async () => ({ status: "succeeded", text: "result" }) },
+      {
+        send: async ({ delivery }) => {
+          if (delivery.payloadKind === "ack") return { status: "sent" };
+          resultAttempts += 1;
+          return { status: "unknown", reason: "disconnected" };
+        },
+      },
+      { deliveryRetryDelaysMs: [1, 1] },
+    );
+    await instance.start();
+    await instance.receive(input("retry-exhausted"));
+    await instance.drain();
+    expect(resultAttempts).toBe(3);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "delivery_changed",
+        status: "unknown",
+        reason: "disconnected",
+        attempts: 3,
+      }),
+    );
+    expect((await store.tasks.listAttentionItems())[0]!.summary).toContain("disconnected");
+  });
+
+  it("never re-sends a platform-confirmed failure or an unclassifiable response (#110)", async () => {
+    for (const outcome of [
+      { status: "failed", reason: "api_rejected" },
+      { status: "unknown", reason: "invalid_response" },
+      { status: "unknown", reason: "async_response" },
+    ] as const) {
+      const { store } = await fixture();
+      let resultAttempts = 0;
+      const { instance } = service(
+        store,
+        { supportsGroup: true, execute: async () => ({ status: "succeeded", text: "result" }) },
+        {
+          send: async ({ delivery }) => {
+            if (delivery.payloadKind === "ack") return { status: "sent" };
+            resultAttempts += 1;
+            return outcome;
+          },
+        },
+        { deliveryRetryDelaysMs: [1, 1] },
+      );
+      await instance.start();
+      await instance.receive(input(`no-retry-${outcome.reason}`));
+      await instance.drain();
+      expect(resultAttempts).toBe(1);
+    }
   });
 
   it("recovers execution facts and queued work without replaying active or uncertain work", async () => {

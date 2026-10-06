@@ -86,6 +86,15 @@ const DEFAULT_RESTORE_WINDOW_MS = 2 * 60 * 60 * 1000;
 const MAX_RESTORE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 const DISPATCH_RETRY_DELAYS_MS = [500, 1_000, 2_000] as const;
 const DISPATCH_SETTLEMENT_RETRY_MS = 1_000;
+/** Backoff before each re-send of an unconfirmed delivery; its length bounds the retries. */
+const DEFAULT_DELIVERY_RETRY_DELAYS_MS = [1_000, 3_000] as const;
+/** Unknown outcomes where the transport itself could not confirm the write. */
+const RETRYABLE_UNKNOWN_REASONS: ReadonlySet<string> = new Set([
+  "timeout",
+  "delivery_timeout",
+  "disconnected",
+  "send_error",
+]);
 
 /** Session task ownership adapts OpenHarness's gateway bridge. Durable queue
  * order, current authorization and immutable deliveries belong to DomainStore. */
@@ -94,6 +103,7 @@ export class RunService {
   private readonly concurrency: number;
   private readonly queuedPollMs: number;
   private readonly deliveryTimeoutMs: number;
+  private readonly deliveryRetryDelaysMs: readonly number[];
   private readonly restoreWindowMs: number;
   private readonly active = new Map<string, ActiveRun>();
   private readonly blocked = new Set<string>();
@@ -110,6 +120,14 @@ export class RunService {
     this.concurrency = options.concurrency ?? 2;
     this.queuedPollMs = options.queuedPollMs ?? 0;
     this.deliveryTimeoutMs = options.deliveryTimeoutMs ?? 15_000;
+    this.deliveryRetryDelaysMs = options.deliveryRetryDelaysMs ?? DEFAULT_DELIVERY_RETRY_DELAYS_MS;
+    if (
+      this.deliveryRetryDelaysMs.length > 5 ||
+      this.deliveryRetryDelaysMs.some(
+        (delay) => !Number.isInteger(delay) || delay < 0 || delay > 60_000,
+      )
+    )
+      throw new Error("Invalid delivery retry delays");
     this.restoreWindowMs = options.restoreWindowMs ?? DEFAULT_RESTORE_WINDOW_MS;
     if (!Number.isInteger(this.concurrency) || this.concurrency < 1 || this.concurrency > 32)
       throw new Error("Invalid Run concurrency");
@@ -1104,32 +1122,24 @@ export class RunService {
     }
     if (!lease) return;
     await this.emit({ type: "delivery_changed", runId, deliveryId, status: "sending" });
-    const controller = new AbortController();
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<SendOutcome>((resolve) => {
-      timer = setTimeout(() => {
-        controller.abort();
-        resolve({ status: "unknown", reason: "delivery_timeout" });
-      }, this.deliveryTimeoutMs);
-    });
+    // `unknown` from a transport that never confirmed the write is not a terminal fact yet.
+    // Retry a bounded number of times with backoff, reusing the same immutable delivery (same
+    // dedup key) so the channel can recognise a repeat, and settle once with the final outcome.
+    // A platform-confirmed `failed` is never retried here; that needs an explicit, authorized
+    // retry. The lease is claimed once, so authorization is not re-evaluated between attempts.
     let outcome: SendOutcome;
-    try {
-      outcome = await Promise.race([
-        this.options.transport
-          .send({
-            destination: structuredClone(caller.scope),
-            delivery: structuredClone(lease.delivery),
-            signal: controller.signal,
-          })
-          .catch((): SendOutcome => ({ status: "unknown", reason: "transport_error" })),
-        timeout,
-      ]);
-      if (!outcome || !["sent", "failed", "unknown"].includes(outcome.status))
-        outcome = { status: "unknown", reason: "invalid_response" };
-    } catch {
-      outcome = { status: "unknown", reason: "transport_error" };
-    } finally {
-      clearTimeout(timer);
+    let attempts = 0;
+    for (;;) {
+      attempts += 1;
+      outcome = await this.sendOnce(caller.scope, lease.delivery);
+      const retryDelay = this.deliveryRetryDelaysMs[attempts - 1];
+      if (
+        outcome.status !== "unknown" ||
+        retryDelay === undefined ||
+        !RETRYABLE_UNKNOWN_REASONS.has(outcome.reason ?? "unclassified")
+      )
+        break;
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, retryDelay));
     }
     const reason =
       outcome.status === "sent" ? undefined : deliveryReason(outcome.status, outcome.reason);
@@ -1145,6 +1155,7 @@ export class RunService {
         deliveryId,
         status: outcome.status,
         ...(reason ? { reason } : {}),
+        ...(attempts > 1 ? { attempts } : {}),
         ...(outcome.status === "sent" && outcome.externalId
           ? { externalId: outcome.externalId }
           : {}),
@@ -1152,6 +1163,40 @@ export class RunService {
     } catch {
       this.report("delivery_failed", runId);
     }
+  }
+
+  private async sendOnce(
+    destination: CallerContext["scope"],
+    delivery: DeliveryRecord,
+  ): Promise<SendOutcome> {
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<SendOutcome>((resolve) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        resolve({ status: "unknown", reason: "delivery_timeout" });
+      }, this.deliveryTimeoutMs);
+    });
+    let outcome: SendOutcome;
+    try {
+      outcome = await Promise.race([
+        this.options.transport
+          .send({
+            destination: structuredClone(destination),
+            delivery: structuredClone(delivery),
+            signal: controller.signal,
+          })
+          .catch((): SendOutcome => ({ status: "unknown", reason: "transport_error" })),
+        timeout,
+      ]);
+      if (!outcome || !["sent", "failed", "unknown"].includes(outcome.status))
+        outcome = { status: "unknown", reason: "invalid_response" };
+    } catch {
+      outcome = { status: "unknown", reason: "transport_error" };
+    } finally {
+      clearTimeout(timer);
+    }
+    return outcome;
   }
 
   private async emit(event: RunServiceEvent): Promise<void> {

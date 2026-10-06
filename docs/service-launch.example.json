@@ -26,6 +26,8 @@
     }
   },
   "glassbox": {
+    "checkout": "C:\absolute\path\to\production-checkout",
+    "expectedCommit": "0000000000000000000000000000000000000000",
     "env": {
       "PORT": "3030",
       "LORA_PI_KIT_PATH": "C:\\absolute\\path\\to\\lora-pi-kit"

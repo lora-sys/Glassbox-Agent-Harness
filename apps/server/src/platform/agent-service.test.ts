@@ -414,3 +414,67 @@ describe("existing service ownership contracts", () => {
     expect(io.spawn).not.toHaveBeenCalled();
   });
 });
+
+describe("production checkout identity (#111)", () => {
+  const production = resolve("/srv/production");
+  const sha = "a".repeat(40);
+
+  function launchConfig(glassbox: Record<string, unknown>) {
+    const fixtureRead = io.readFile.getMockImplementation()!;
+    io.readFile.mockImplementation(async (path: string) =>
+      path.endsWith("service-launch.json")
+        ? JSON.stringify({ version: 1, glassbox })
+        : fixtureRead(path),
+    );
+  }
+
+  function gitAnswers(head: string) {
+    io.execFileAsync.mockImplementation(async (_command: string, commandArgs: string[]) => {
+      if (commandArgs.includes("symbolic-ref")) return { stdout: "main\n" };
+      if (commandArgs.includes("rev-parse") && commandArgs.includes("HEAD"))
+        return { stdout: `${head}\n` };
+      return { stdout: "" };
+    });
+  }
+
+  it("starts the checkout recorded in service-launch.json, not the script's own location", async () => {
+    state = [];
+    launchConfig({ checkout: production });
+    gitAnswers(sha);
+    await runServiceCommand("up", []);
+    expect(io.spawn).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.arrayContaining([join(production, "apps/server/src/index.ts")]),
+      expect.objectContaining({ cwd: production }),
+    );
+    expect(stdout).toHaveBeenCalledWith(
+      expect.stringContaining(`"checkout":${JSON.stringify(production)}`),
+    );
+    expect(stdout).toHaveBeenCalledWith(expect.stringContaining(`"commit":"${sha}"`));
+    expect(stdout).toHaveBeenCalledWith(expect.stringContaining('"branch":"main"'));
+  });
+
+  it("refuses to deploy a recorded checkout whose HEAD differs from the pinned commit", async () => {
+    state = [];
+    launchConfig({ checkout: production, expectedCommit: "b".repeat(40) });
+    gitAnswers(sha);
+    await expect(runServiceCommand("up", [])).rejects.toThrow("expects " + "b".repeat(40));
+    expect(io.spawn).not.toHaveBeenCalled();
+  });
+
+  it("rejects a relative checkout or malformed commit in the launch configuration", async () => {
+    state = [];
+    launchConfig({ checkout: "relative/path" });
+    await expect(runServiceCommand("up", [])).rejects.toThrow("Invalid Glassbox launch");
+    launchConfig({ expectedCommit: "main" });
+    await expect(runServiceCommand("up", [])).rejects.toThrow("Invalid Glassbox launch");
+  });
+
+  it("reports the running checkout's branch and commit from status", async () => {
+    gitAnswers(sha);
+    await runServiceCommand("status", []);
+    const output = stdout.mock.calls.map(([chunk]) => String(chunk)).join("");
+    expect(output).toContain(`"commit": "${sha}"`);
+    expect(output).toContain('"branch": "main"');
+  });
+});

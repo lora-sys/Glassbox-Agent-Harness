@@ -81,7 +81,10 @@ have its dependencies installed. The command checks the target before stopping G
 waits for the old database lock to clear, and restores the previous checkout if startup fails.
 It rejects a checkout whose database code is older than the shared database before stopping
 the current service. Bring that checkout forward to the current schema before testing it.
-`agent:status` shows the running checkout and whether Glassbox and OneBot ports are ready.
+`agent:status` shows the running checkout with its branch and HEAD commit, and whether Glassbox and OneBot ports are ready.
+The production checkout is declared, not inferred from the working directory: set `glassbox.checkout` (absolute path) in `service-launch.json`; without it `agent:up` uses the repository's main checkout, never the worktree the script happens to live in. An optional `glassbox.expectedCommit` (full sha) makes `agent:up` refuse to start a checkout whose HEAD differs. An explicit `--checkout` is a deliberate candidate and is reported by branch and commit instead of pinned.
+A result delivery whose send times out or disconnects (`unknown`) is re-sent up to twice with backoff using the same immutable delivery; after that it settles `unknown` with an attention item that records the reason. A platform-confirmed `failed` is never re-sent automatically.
+Owners can switch a group capability without natural language: `/capability <groupId> <category> on|off`. The Run may only report success if the matching `set_capability` call succeeded.
 Avoid concurrent switches because both commands change the same service process registry.
 Keep external provider keys in the access-restricted `service-launch.json` environment
 section when the service needs them after restart. The process registry does not store the
