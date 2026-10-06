@@ -375,6 +375,50 @@ test("reply assertion mismatch fails", async (t) => {
   w.recorder.begin = (...args) => begin(...args, "QQLIVE_fixture42");
   const c = await replyCase(w.config, w.clients, w.recorder, spec);
   assert.equal(c.code, "REPLY_ASSERTION_FAILED");
+  assert.equal(c.status, "FAIL");
+  assert.equal(c.inputObserved, true);
+  assert.equal(c.inputBinding.driverMessageId, c.sentMessageId);
+  assert.equal(c.inputBinding.botMessageId, c.botInputMessageId);
+  assert.equal(w.actions.filter((a) => a.action.startsWith("send_")).length, 1);
+});
+
+test("failed feature reply retains actual input binding and revokes without resending", async (t) => {
+  const w = await setup(t, { mode: "mismatch" });
+  const revoked = [];
+  const c = await replyCase(w.config, w.clients, w.recorder, featureSpec, undefined, {
+    register: async () => ({ leaseId: "fixture-failed-reply-lease" }),
+    revoke: async (leaseId) => revoked.push(leaseId),
+  });
+  assert.equal(c.status, "FAIL");
+  assert.equal(c.code, "REPLY_ASSERTION_FAILED");
+  assert.equal(c.inputObserved, true);
+  assert.equal(c.inputBinding.driverMessageId, c.sentMessageId);
+  assert.equal(c.inputBinding.botMessageId, c.botInputMessageId);
+  assert.equal(c.inputBinding.realSequence, "501");
+  assert.equal(c.leaseRevoked, true);
+  assert.deepEqual(revoked, ["fixture-failed-reply-lease"]);
+  assert.equal(w.actions.filter((a) => a.action.startsWith("send_")).length, 1);
+});
+
+test("failed reply with inconsistent account reads remains inconclusive after revocation", async (t) => {
+  const w = await setup(t, { mode: "mismatch" });
+  const call = w.clients.bot.call.bind(w.clients.bot);
+  w.clients.bot.call = async (action, params) => {
+    const result = await call(action, params);
+    return action === "get_msg" ? { ...result, real_seq: "999" } : result;
+  };
+  const revoked = [];
+  const c = await replyCase(w.config, w.clients, w.recorder, featureSpec, undefined, {
+    register: async () => ({ leaseId: "fixture-unknown-binding-lease" }),
+    revoke: async (leaseId) => revoked.push(leaseId),
+  });
+  assert.equal(c.status, "INCONCLUSIVE");
+  assert.equal(c.code, "MESSAGE_BINDING_MISMATCH");
+  assert.equal(c.inputBinding, undefined);
+  assert.equal(c.inputObserved, false);
+  assert.equal(c.leaseRevoked, true);
+  assert.deepEqual(revoked, ["fixture-unknown-binding-lease"]);
+  assert.equal(w.actions.filter((a) => a.action.startsWith("send_")).length, 1);
 });
 test("offline account blocks doctor", async (t) => {
   const w = await setup(t, { online: false });

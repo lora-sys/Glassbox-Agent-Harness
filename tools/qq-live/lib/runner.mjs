@@ -352,13 +352,22 @@ export async function replyCase(config, clients, recorder, spec, signal, accepta
       }
       await sleep(50);
     }
-    if (c.replies.length)
+    if (c.replies.length) {
+      if (!c.inputObserved) {
+        try {
+          await bindInput(config, clients, c);
+        } catch (error) {
+          const e = safeError(error);
+          return recorder.finish(c, "INCONCLUSIVE", e.code, e.message);
+        }
+      }
       return recorder.finish(
         c,
         "FAIL",
         "REPLY_ASSERTION_FAILED",
         "收到本轮相关回复，但内容未满足断言。",
       );
+    }
     if (!c.inputObserved && c.botInputCandidates.length) {
       try {
         await bindInput(config, clients, c);

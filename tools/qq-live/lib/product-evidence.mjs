@@ -376,6 +376,171 @@ export function readTraceEvents(
   );
 }
 
+export async function verifyCaseLeaseCleanupEvidence(db, dataDirectory, caseRecord, evidence) {
+  let actors;
+  try {
+    actors = db.prepare("SELECT principal_id FROM runs WHERE id=?").all(evidence?.runId);
+  } catch {
+    fail("LEASE_CLEANUP_EVIDENCE", "许可清理缺少独立执行身份。", "INCONCLUSIVE");
+  }
+  if (
+    actors.length !== 1 ||
+    typeof actors[0].principal_id !== "string" ||
+    !actors[0].principal_id ||
+    typeof evidence?.runId !== "string" ||
+    !evidence.runId ||
+    !evidence.scope
+  )
+    fail("LEASE_CLEANUP_EVIDENCE", "许可清理缺少独立执行身份。", "INCONCLUSIVE");
+  return verifyLeaseCleanupEvidence({
+    dataDirectory,
+    caseRecord,
+    runId: evidence.runId,
+    scope: evidence.scope,
+    principalId: actors[0].principal_id,
+  });
+}
+
+function failedCaseCleanupCandidates(report, config) {
+  const cases = report?.cases;
+  const failed = Array.isArray(cases) ? cases.at(-1) : undefined;
+  const reply = failed?.replies?.length === 1 ? failed.replies[0] : undefined;
+  if (
+    report?.mode !== "run" ||
+    report.status !== "FAIL" ||
+    !Array.isArray(cases) ||
+    !cases.length ||
+    cases.length > config.maxMessages ||
+    failed?.status !== "FAIL" ||
+    failed.code !== "REPLY_ASSERTION_FAILED" ||
+    failed.sendAttempted !== true ||
+    !validIdentifier(failed.sentMessageId) ||
+    !Array.isArray(failed.featureAssertions) ||
+    !failed.featureAssertions.length ||
+    !failed.acceptanceLease ||
+    failed.leaseRegistrationAttempted !== true ||
+    failed.leaseRevoked !== true ||
+    !reply ||
+    reply.route !== failed.route ||
+    reply.matches !== false ||
+    !validIdentifier(reply.messageId) ||
+    !/^[a-f0-9]{64}$/u.test(reply.textSha256 ?? "") ||
+    !Number.isSafeInteger(reply.textBytes) ||
+    reply.textBytes < 0 ||
+    typeof reply.receivedAt !== "string" ||
+    !Number.isFinite(Date.parse(reply.receivedAt)) ||
+    failed.anomalies?.includes("WRONG_DESTINATION")
+  )
+    fail("CLEANUP_ONLY_UNSUPPORTED", "仅支持已确认回复断言失败的许可清理核验。", "INCONCLUSIVE");
+  const ids = new Set();
+  for (const c of cases) {
+    if (typeof c.id !== "string" || !c.id || ids.has(c.id))
+      fail("CLEANUP_ONLY_UNSUPPORTED", "失败报告的用例身份无效。", "INCONCLUSIVE");
+    ids.add(c.id);
+  }
+  for (const prior of cases.slice(0, -1))
+    if (prior.status !== "PASS" || prior.code !== "REAL_REPLY_RECEIVED")
+      fail("CLEANUP_ONLY_UNSUPPORTED", "失败报告含有无法确认的前序用例。", "INCONCLUSIVE");
+  return cases.filter(
+    (c) => c.featureAssertions || c.acceptanceLease || c.leaseRegistrationAttempted,
+  );
+}
+
+function isKnownTerminalCaseRecord(caseRecord) {
+  const reply = caseRecord?.replies?.length === 1 ? caseRecord.replies[0] : undefined;
+  const expectedMatch = caseRecord?.status === "PASS" && caseRecord.code === "REAL_REPLY_RECEIVED";
+  const expectedFailure =
+    caseRecord?.status === "FAIL" && caseRecord.code === "REPLY_ASSERTION_FAILED";
+  return (
+    (expectedMatch || expectedFailure) &&
+    caseRecord.sendAttempted === true &&
+    validIdentifier(caseRecord.sentMessageId) &&
+    !!reply &&
+    reply.route === caseRecord.route &&
+    reply.matches === expectedMatch &&
+    validIdentifier(reply.messageId) &&
+    /^[a-f0-9]{64}$/u.test(reply.textSha256 ?? "") &&
+    Number.isSafeInteger(reply.textBytes) &&
+    reply.textBytes >= 0 &&
+    typeof reply.receivedAt === "string" &&
+    Number.isFinite(Date.parse(reply.receivedAt)) &&
+    !caseRecord.anomalies?.includes("WRONG_DESTINATION")
+  );
+}
+
+export async function verifyFailedCaseCleanupInDatabase(db, dataDirectory, caseRecord, config) {
+  let cleanupVerified = false;
+  try {
+    if (!isKnownTerminalCaseRecord(caseRecord))
+      fail("CLEANUP_ONLY_UNSUPPORTED", "用例不是可核验的终态回复结果。", "INCONCLUSIVE");
+    if (
+      !caseRecord?.acceptanceLease ||
+      caseRecord.leaseRegistrationAttempted !== true ||
+      caseRecord.leaseRevoked !== true ||
+      !Array.isArray(caseRecord.featureAssertions) ||
+      !caseRecord.featureAssertions.length
+    )
+      fail("CLEANUP_ONLY_UNSUPPORTED", "用例许可清理不能独立核验。", "INCONCLUSIVE");
+    const evidence = caseEvidence(db, caseRecord, config);
+    await verifyCaseLeaseCleanupEvidence(db, dataDirectory, caseRecord, evidence);
+    cleanupVerified = true;
+    return { caseId: caseRecord.id, runId: evidence.runId, cleanupVerified: true };
+  } catch (error) {
+    if (error && typeof error === "object") error.cleanupVerified = cleanupVerified;
+    throw error;
+  }
+}
+
+export async function verifyFailedCaseCleanup(report, config, capture = execFileSync) {
+  let cleanupVerified = false;
+  let db;
+  try {
+    const after = runtimeSnapshot(config.runtime, capture);
+    if (!report?.runtime || JSON.stringify(report.runtime) !== JSON.stringify(after))
+      fail("RUNTIME_CHANGED", "测试期间服务进程或代码版本发生变化。", "INCONCLUSIVE");
+    const cases = failedCaseCleanupCandidates(report, config);
+    if (!cases.length)
+      fail("CLEANUP_ONLY_UNSUPPORTED", "报告没有需要核验的许可清理。", "INCONCLUSIVE");
+    db = new DatabaseSync(join(after.dataDirectory, "glassbox.db"), { readOnly: true });
+    const receipts = [];
+    for (const c of cases)
+      receipts.push(await verifyFailedCaseCleanupInDatabase(db, after.dataDirectory, c, config));
+    const finalRuntime = runtimeSnapshot(config.runtime, capture);
+    if (JSON.stringify(after) !== JSON.stringify(finalRuntime))
+      fail("RUNTIME_CHANGED", "测试期间服务进程或代码版本发生变化。", "INCONCLUSIVE");
+    cleanupVerified = true;
+    return { status: "CLEANUP_VERIFIED", runtime: after, cases: receipts };
+  } catch (error) {
+    if (error && typeof error === "object") error.cleanupVerified = cleanupVerified;
+    throw error;
+  } finally {
+    db?.close();
+  }
+}
+
+export async function verifyCaseWithLeaseCleanup(
+  db,
+  dataDirectory,
+  caseRecord,
+  config,
+  verifyAfterCleanup,
+) {
+  let cleanupVerified = false;
+  try {
+    const evidence = caseEvidence(db, caseRecord, config);
+    if (caseRecord.featureAssertions) {
+      await verifyCaseLeaseCleanupEvidence(db, dataDirectory, caseRecord, evidence);
+      cleanupVerified = true;
+    }
+    const result = await verifyAfterCleanup(evidence);
+    return { evidence, cleanupVerified, result };
+  } catch (error) {
+    if (caseRecord.featureAssertions && error && typeof error === "object")
+      error.cleanupVerified = cleanupVerified;
+    throw error;
+  }
+}
+
 export async function verifyProductEvidence(report, config, clients) {
   const after = runtimeSnapshot(config.runtime);
   const before = report.runtime;
@@ -389,75 +554,74 @@ export async function verifyProductEvidence(report, config, clients) {
   try {
     const cases = [];
     for (const c of report.cases) {
-      const evidence = caseEvidence(db, c, config);
-      const messageBinding = await verifyMessageBindings(c, config, clients, evidence.delivery);
-      const featureTypes =
-        c.featureAssertions?.filter((a) => a.kind === "trace").map((a) => a.type) ?? [];
-      if (
-        c.featureAssertions?.some((a) =>
-          [
-            "history_coverage",
-            "history_result",
-            "history_seed_result",
-            "history_exclusion_result",
-          ].includes(a.kind),
-        )
-      )
-        featureTypes.push("history_retrieval");
-      const trace = readTraceEvents(
-        after.checkout,
+      const verifiedCase = await verifyCaseWithLeaseCleanup(
+        db,
         after.dataDirectory,
-        evidence.runId,
-        execFileSync,
-        featureTypes,
-      );
-      const events = trace.events?.map((row) => row.event) ?? [];
-      verifyTraceEvidence(events, c, config, evidence.delivery);
-      verifyLeaseTraceEvidence(events, c, evidence.runId);
-      const feature = c.featureAssertions
-        ? observeFeature(c.featureAssertions, {
-            db,
+        c,
+        config,
+        async (evidence) => {
+          const messageBinding = await verifyMessageBindings(c, config, clients, evidence.delivery);
+          const featureTypes =
+            c.featureAssertions?.filter((a) => a.kind === "trace").map((a) => a.type) ?? [];
+          if (
+            c.featureAssertions?.some((a) =>
+              [
+                "history_coverage",
+                "history_result",
+                "history_seed_result",
+                "history_exclusion_result",
+              ].includes(a.kind),
+            )
+          )
+            featureTypes.push("history_retrieval");
+          const trace = readTraceEvents(
+            after.checkout,
+            after.dataDirectory,
+            evidence.runId,
+            execFileSync,
+            featureTypes,
+          );
+          const events = trace.events?.map((row) => row.event) ?? [];
+          verifyTraceEvidence(events, c, config, evidence.delivery);
+          verifyLeaseTraceEvidence(events, c, evidence.runId);
+          const feature = c.featureAssertions
+            ? observeFeature(c.featureAssertions, {
+                db,
+                events,
+                runId: evidence.runId,
+                inputBinding: c.inputBinding,
+              })
+            : undefined;
+          await verifyGroupMemberCountEvidence(c, feature, config, clients, events, evidence.runId);
+          await verifyGroupInfoEvidence(
+            c,
+            feature,
+            config,
+            clients,
             events,
-            runId: evidence.runId,
-            inputBinding: c.inputBinding,
-          })
-        : undefined;
-      await verifyGroupMemberCountEvidence(c, feature, config, clients, events, evidence.runId);
-      await verifyGroupInfoEvidence(
-        c,
-        feature,
-        config,
-        clients,
-        events,
-        evidence.runId,
-        messageBinding.reply.groupInfo,
+            evidence.runId,
+            messageBinding.reply.groupInfo,
+          );
+          await verifyGroupFilesEvidence(
+            c,
+            feature,
+            config,
+            clients,
+            events,
+            evidence.runId,
+            messageBinding.reply.groupFiles,
+          );
+          return {
+            messageBinding,
+            ...(feature ? { feature } : {}),
+          };
+        },
       );
-      await verifyGroupFilesEvidence(
-        c,
-        feature,
-        config,
-        clients,
-        events,
-        evidence.runId,
-        messageBinding.reply.groupFiles,
-      );
-      if (c.featureAssertions) {
-        const actors = db.prepare("SELECT principal_id FROM runs WHERE id=?").all(evidence.runId);
-        if (actors.length !== 1 || typeof actors[0].principal_id !== "string")
-          fail("LEASE_CLEANUP_EVIDENCE", "许可清理缺少独立执行身份。", "INCONCLUSIVE");
-        await verifyLeaseCleanupEvidence({
-          dataDirectory: after.dataDirectory,
-          caseRecord: c,
-          runId: evidence.runId,
-          scope: evidence.scope,
-          principalId: actors[0].principal_id,
-        });
-      }
       cases.push({
-        ...evidence,
-        messageBinding,
+        ...verifiedCase.evidence,
+        ...verifiedCase.result,
         traceVerified: true,
-        ...(feature ? { feature } : {}),
+        ...(c.featureAssertions ? { cleanupVerified: verifiedCase.cleanupVerified } : {}),
       });
     }
     const finalRuntime = runtimeSnapshot(config.runtime);

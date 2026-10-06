@@ -1,8 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
-import { join } from "node:path";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import {
   caseEvidence,
   readTraceEvents,
@@ -12,7 +14,11 @@ import {
   verifyTraceEvidence,
   verifyLeaseTraceEvidence,
   verifyGroupMemberCountEvidence,
+  verifyCaseWithLeaseCleanup,
+  verifyFailedCaseCleanupInDatabase,
+  verifyFailedCaseCleanup,
 } from "../lib/product-evidence.mjs";
+import { observeFeature } from "../lib/feature-observer.mjs";
 
 function memberCountTrace(
   input = { groupId: "20001", operation: "get_group_member_list", params: {} },
@@ -244,7 +250,7 @@ test("runtime evidence requires the expected connection ID", () => {
 function evidenceFixture({ connectionId = "qq-live", threadId = null } = {}) {
   const db = new DatabaseSync(":memory:");
   db.exec(
-    "CREATE TABLE messages(id TEXT, external_id TEXT, scope_key TEXT); CREATE TABLE runs(id TEXT, message_id TEXT, status TEXT, scope_json TEXT, created_at TEXT); CREATE TABLE authorization_decisions_all(id TEXT, run_id TEXT, action TEXT, decision TEXT); CREATE TABLE deliveries(id TEXT, run_id TEXT, status TEXT, external_id TEXT, destination_scope_key TEXT);",
+    "CREATE TABLE messages(id TEXT, external_id TEXT, scope_key TEXT); CREATE TABLE runs(id TEXT, message_id TEXT, status TEXT, scope_json TEXT, created_at TEXT, principal_id TEXT); CREATE TABLE authorization_decisions_all(id TEXT, run_id TEXT, action TEXT, decision TEXT); CREATE TABLE deliveries(id TEXT, run_id TEXT, status TEXT, external_id TEXT, destination_scope_key TEXT);",
   );
   const now = new Date().toISOString();
   const scope = {
@@ -264,12 +270,13 @@ function evidenceFixture({ connectionId = "qq-live", threadId = null } = {}) {
     scope.threadId,
   ]);
   db.prepare("INSERT INTO messages VALUES (?,?,?)").run("m", "bot-local-10", scopeKey);
-  db.prepare("INSERT INTO runs VALUES (?,?,?,?,?)").run(
+  db.prepare("INSERT INTO runs VALUES (?,?,?,?,?,?)").run(
     "r",
     "m",
     "succeeded",
     JSON.stringify(scope),
     now,
+    "principal-owner-1",
   );
   db.prepare("INSERT INTO authorization_decisions_all VALUES (?,?,?,?)").run(
     "a",
@@ -323,6 +330,194 @@ test("acceptance binds scoped input, successful Run, authorization and received 
   assert.throws(() => caseEvidence(db, { ...c, route: "20002" }, config), {
     code: "RUN_EVIDENCE",
   });
+});
+
+test("feature lease cleanup is independently verified before a failing feature assertion", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "qq-product-cleanup-order-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const { db, c, config } = evidenceFixture();
+  t.after(() => db.close());
+  const now = Date.now();
+  const leaseId = randomUUID();
+  const token = "0123456789abcdef0123456789abcdef";
+  const prompt = `GLASSBOX_ACCEPTANCE_V1 ${token}\nRead a fixed group summary`;
+  const toolsSha256 = messageDigest("tools");
+  c.startedAt = new Date(now - 10_000).toISOString();
+  c.prompt = prompt;
+  c.token = token;
+  c.leaseRevoked = true;
+  c.status = "FAIL";
+  c.code = "REPLY_ASSERTION_FAILED";
+  c.sendAttempted = true;
+  c.leaseRegistrationAttempted = true;
+  c.replies = [
+    {
+      route: c.route,
+      messageId: "90002",
+      textSha256: messageDigest("reply without nonce"),
+      textBytes: 18,
+      matches: false,
+      receivedAt: new Date(now - 2_000).toISOString(),
+    },
+  ];
+  c.inputBinding.botMessageId = "90001";
+  c.featureAssertions = [
+    { kind: "trace", type: "tool_result", where: { name: "fixture" }, count: 1 },
+  ];
+  db.prepare("UPDATE messages SET external_id=? WHERE id='m'").run(c.inputBinding.botMessageId);
+  c.acceptanceLease = { leaseId, expiresAt: now + 600_000, toolsSha256 };
+  const evidence = caseEvidence(db, c, config);
+  const { runId } = evidence;
+  const scopeSha256 = messageDigest(
+    JSON.stringify([
+      evidence.scope.connectionId,
+      evidence.scope.botId,
+      evidence.scope.chatType,
+      evidence.scope.chatId,
+      evidence.scope.senderId,
+      evidence.scope.threadId,
+    ]),
+  );
+  const principalId = "principal-owner-1";
+  const rows = [
+    {
+      at: new Date(now - 9_000).toISOString(),
+      event: "lease_registered",
+      leaseId,
+      principalId,
+      marker: token,
+      expiresAt: c.acceptanceLease.expiresAt,
+      toolsSha256,
+      scopeSha256,
+    },
+    {
+      at: new Date(now - 8_000).toISOString(),
+      event: "run_bound",
+      leaseId,
+      principalId,
+      marker: token,
+      runId,
+      messageId: c.inputBinding.botMessageId,
+      textSha256: messageDigest(prompt),
+      toolsSha256,
+      scopeSha256,
+    },
+    {
+      at: new Date(now - 7_000).toISOString(),
+      event: "lease_revoked",
+      leaseId,
+      principalId,
+      marker: token,
+      scopeSha256,
+    },
+  ];
+  const auditPath = join(directory, "qq-live-acceptance-audit.jsonl");
+  await writeFile(auditPath, `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`);
+
+  const cleanup = await verifyCaseWithLeaseCleanup(db, directory, c, config, async (resolved) => ({
+    runId: resolved.runId,
+  }));
+  assert.equal(cleanup.cleanupVerified, true);
+  assert.equal(cleanup.evidence.runId, runId);
+
+  const cleanupOnly = await verifyFailedCaseCleanupInDatabase(db, directory, c, config);
+  assert.deepEqual(cleanupOnly, { caseId: c.id, runId, cleanupVerified: true });
+  assert.equal(Object.hasOwn(cleanupOnly, "status"), false);
+
+  const dbPath = join(directory, "glassbox.db");
+  db.exec(`VACUUM INTO '${dbPath.replaceAll("'", "''")}'`);
+  const expectedCommit = "c".repeat(40);
+  const runtimeConfig = {
+    checkout: process.cwd(),
+    dataDirectory: directory,
+    expectedCommit,
+    connectionId: "qq-live",
+  };
+  const expectedRuntime = {
+    checkout: resolve(runtimeConfig.checkout),
+    dataDirectory: resolve(directory),
+    commit: expectedCommit,
+    pid: 123,
+    connectionId: "qq-live",
+    threadId: null,
+  };
+  const failedReport = {
+    mode: "run",
+    status: "FAIL",
+    runtime: expectedRuntime,
+    cases: [c],
+  };
+  const runtimeCapture = (finalPid) => {
+    let statusCalls = 0;
+    return (command, args) => {
+      if (command === "git") return args[0] === "rev-parse" ? expectedCommit : "";
+      if (command === process.execPath) {
+        statusCalls += 1;
+        const pid = statusCalls === 1 ? 123 : finalPid;
+        return JSON.stringify({
+          dataDirectory: directory,
+          processes: [
+            {
+              name: "glassbox",
+              running: true,
+              status: "running",
+              pid,
+              checkout: process.cwd(),
+              launchCommit: expectedCommit,
+              launchClean: true,
+            },
+          ],
+          glassboxReady: true,
+          onebotReady: true,
+        });
+      }
+      throw new Error("Unexpected runtime probe.");
+    };
+  };
+  await assert.rejects(
+    verifyFailedCaseCleanup(
+      failedReport,
+      { ...config, runtime: runtimeConfig },
+      runtimeCapture(124),
+    ),
+    (error) => error.code === "RUNTIME_CHANGED" && error.cleanupVerified === false,
+    "a changed final runtime snapshot must not retain cleanup proof",
+  );
+  const wrapperCleanup = await verifyFailedCaseCleanup(
+    failedReport,
+    { ...config, runtime: runtimeConfig },
+    runtimeCapture(123),
+  );
+  assert.equal(wrapperCleanup.status, "CLEANUP_VERIFIED");
+  assert.equal(wrapperCleanup.cases[0].cleanupVerified, true);
+
+  await assert.rejects(
+    verifyCaseWithLeaseCleanup(db, directory, c, config, async (resolved) => {
+      observeFeature(
+        [{ kind: "trace", type: "tool_result", where: { name: "missing_tool" }, count: 1 }],
+        { db, events: [], runId: resolved.runId },
+      );
+    }),
+    (error) =>
+      error.code === "FEATURE_TRACE" && error.status === "FAIL" && error.cleanupVerified === true,
+    "production case pipeline must finish independent cleanup proof before feature assertions",
+  );
+
+  await assert.rejects(
+    verifyCaseWithLeaseCleanup(db, directory, { ...c, route: "20002" }, config, async () => null),
+    (error) => error.code === "RUN_EVIDENCE" && error.cleanupVerified === false,
+    "a previous verified case must not mark a later case cleanup as verified",
+  );
+
+  await writeFile(auditPath, `${JSON.stringify(rows[0])}\n`);
+  await assert.rejects(
+    verifyFailedCaseCleanupInDatabase(db, directory, c, config),
+    (error) =>
+      error.code === "LEASE_CLEANUP_EVIDENCE" &&
+      error.status === "INCONCLUSIVE" &&
+      error.cleanupVerified === false,
+    "incomplete independent audit remains fail closed",
+  );
 });
 
 test("driver and bot local message IDs may differ while Run and delivery remain scoped", (t) => {

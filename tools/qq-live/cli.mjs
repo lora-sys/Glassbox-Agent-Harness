@@ -9,7 +9,12 @@ import { validateConfig, fail, safeError, sleep, digest, exitCode } from "./lib/
 import { OneBot } from "./lib/onebot.mjs";
 import { Recorder, doctor, smokeSpecs, validateSpecs, replyCase } from "./lib/runner.mjs";
 import { moderationCase } from "./lib/moderation.mjs";
-import { runtimeSnapshot, verifyProductEvidence } from "./lib/product-evidence.mjs";
+import {
+  runtimeSnapshot,
+  verifyProductEvidence,
+  verifyFailedCaseCleanup,
+} from "./lib/product-evidence.mjs";
+import { runReadCaseSequence, productCleanupStopRequired } from "./lib/read-case-sequence.mjs";
 import { acceptanceManagement } from "./lib/management-client.mjs";
 import { runMemoryRecoveryCli } from "./lib/memory-recovery-cli.mjs";
 import {
@@ -666,25 +671,74 @@ async function main() {
       report.executedCaseCount = recorder.cases.length;
     } else {
       if (specs.length > config.maxMessages) fail("MESSAGE_BUDGET", "用例数超过本轮消息预算。");
-      for (const spec of specs) {
-        if (controller.signal.aborted) fail("CANCELLED", "测试已停止。");
-        const c = await replyCase(config, clients, recorder, spec, controller.signal, acceptance);
-        console.log(`${c.status} ${c.id} ${c.code}`);
-        // Fail fast: do not let an unresolved request overlap a later case.
-        if (c.status !== "PASS") break;
-        await sleep(config.minGapMs);
+      const sequence = await runReadCaseSequence({
+        specs,
+        executeCase: async (spec) => {
+          if (controller.signal.aborted) fail("CANCELLED", "测试已停止。");
+          const testCase = await replyCase(
+            config,
+            clients,
+            recorder,
+            spec,
+            controller.signal,
+            acceptance,
+          );
+          console.log(`${testCase.status} ${testCase.id} ${testCase.code}`);
+          return testCase;
+        },
+        verifyProductCase:
+          command === "run" && config.runtime
+            ? (testCase) =>
+                verifyProductEvidence(
+                  { mode: "run", status: "PASS", runtime: report.runtime, cases: [testCase] },
+                  config,
+                  clients,
+                )
+            : undefined,
+        verifyCleanupOnlyCase:
+          command === "run" && config.runtime
+            ? (testCase) =>
+                verifyFailedCaseCleanup(
+                  { mode: "run", status: "FAIL", runtime: report.runtime, cases: [testCase] },
+                  config,
+                )
+            : undefined,
+        delay: () => sleep(config.minGapMs),
+        serializeError: (error) => ({
+          ...safeError(error),
+          ...(typeof error?.cleanupVerified === "boolean"
+            ? { cleanupVerified: error.cleanupVerified }
+            : {}),
+        }),
+      });
+      report.status = sequence.terminalStatus ?? recorder.finalize();
+      if (command === "run" && config.runtime) {
+        report.productAcceptance = sequence.productAcceptance;
       }
-      report.status = recorder.finalize();
+      if (sequence.cleanupStopRequired) report.cleanupStopRequired = true;
       report.plannedCaseCount = specs.length;
       report.executedCaseCount = recorder.cases.length;
       if (recorder.cases.length !== specs.length && report.status === "PASS")
         report.status = "INCONCLUSIVE";
     }
-    if (command === "run" && config.runtime) {
+    if (command === "run" && config.runtime && report.status === "PASS") {
       try {
         report.productAcceptance = await verifyProductEvidence(report, config, clients);
       } catch (error) {
-        report.productAcceptance = safeError(error);
+        const safe = safeError(error);
+        const cleanupRequired = report.cases.some((testCase) =>
+          Array.isArray(testCase.featureAssertions),
+        );
+        report.productAcceptance = {
+          ...safe,
+          ...(typeof error?.cleanupVerified === "boolean"
+            ? { cleanupVerified: error.cleanupVerified }
+            : cleanupRequired
+              ? { cleanupVerified: false }
+              : {}),
+          ...(cleanupRequired ? { cleanupRequired: true } : {}),
+          cases: report.productAcceptance?.cases ?? [],
+        };
         if (report.status === "PASS") report.status = report.productAcceptance.status;
       }
     }
@@ -736,7 +790,7 @@ async function main() {
     clients.bot.close();
     if (command === "run" && recorder.cases.length > 0) {
       const finalStatus = recorder.finalize();
-      if (finalStatus === "FAIL" || report.status === "PASS") report.status = finalStatus;
+      if (report.status === "PASS") report.status = finalStatus;
       if (report.productAcceptance.status === "PASS" && finalStatus !== "PASS")
         report.productAcceptance = {
           ...report.productAcceptance,
@@ -751,6 +805,8 @@ async function main() {
     try {
       if (
         report.error?.code === "LEASE_CLEANUP_EVIDENCE" ||
+        report.cleanupStopRequired === true ||
+        productCleanupStopRequired(report.productAcceptance) ||
         report.cases.some(
           (c) =>
             (c.cleanup?.required && !c.cleanup.restored) ||
