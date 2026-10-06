@@ -273,6 +273,7 @@ function discoverQqLiveTests(repoRoot = fileURLToPath(new URL("../", import.meta
 }
 
 const SCRIPT_TESTS = [
+  "scripts/test/dependency-snapshot.test.mjs",
   "scripts/service-source-identity.test.mjs",
   ...discoverQqLiveTests(),
   ".agents/skills/qq-live-testing/scripts/helpers.test.mjs",

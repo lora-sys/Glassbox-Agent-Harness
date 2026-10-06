@@ -11,6 +11,7 @@ import { validateReadFeatureSpecs } from "../lib/feature-specs.mjs";
 import { resolveReadFeatureSpecs } from "../lib/feature-specs.mjs";
 import { MEMORY_REJECT_FAMILY_ID } from "../lib/memory-workflow.mjs";
 import { TASTE_FAMILY_ID, tasteFamilyPlan } from "../lib/taste-scenario.mjs";
+import { resolveFeatureSuite } from "../lib/feature-suite.mjs";
 
 function minimalCatalog(overrides = {}) {
   return {
@@ -807,4 +808,73 @@ test("Taste catalog binds only the fixed four-stage lifecycle and rejects metada
     "BLOCKED",
   );
   assert.equal(checkFeatureCoverage({ ...args, executableSuiteCases: [] }).status, "BLOCKED");
+});
+
+test("schema 6 baseline binds all executable catalog cases while planned cases stay blocked", async () => {
+  const source = JSON.parse(
+    await readFile(new URL("../examples/feature-baseline.example.json", import.meta.url), "utf8"),
+  );
+  const suiteConfig = {
+    groups: [
+      { alias: "A", id: "10001" },
+      { alias: "B", id: "10002" },
+    ],
+  };
+  assert.equal(source.schemaVersion, 6);
+  const resolved = resolveFeatureSuite(source, suiteConfig);
+  const exampleIds = new Set(resolved.cases.map((item) => item.id));
+  const executable = FEATURE_CATALOG.cases.filter((item) => item.executionStatus === "executable");
+  const planned = FEATURE_CATALOG.cases.filter((item) => item.executionStatus === "planned");
+  assert.equal(executable.length, 18);
+  assert.equal(planned.length, 8);
+  assert.equal(resolved.tasteFamilies.length, 1);
+  assert.deepEqual(resolved.tasteFamilies[0], tasteFamily);
+
+  for (const catalogCase of executable) {
+    const result = checkFeatureCoverage({
+      catalog: {
+        schemaVersion: 1,
+        requiredDomains: [catalogCase.domain],
+        descriptorBaseline: catalogCase.tools,
+        cases: [catalogCase],
+      },
+      descriptors: catalogCase.tools.map((name) => ({ name })),
+      executableSuiteCases: source.cases,
+      suiteConfig,
+    });
+    assert.equal(result.status, "PASS", `${catalogCase.id} must bind to the baseline`);
+  }
+
+  for (const catalogCase of executable) {
+    assert.ok(
+      exampleIds.has(catalogCase.suiteCaseId),
+      `${catalogCase.id} must have its fixed suite case in the baseline`,
+    );
+  }
+  for (const catalogCase of planned) {
+    assert.ok(!exampleIds.has(catalogCase.id), `${catalogCase.id} must remain unexecuted`);
+    if (catalogCase.suiteCaseId)
+      assert.ok(!exampleIds.has(catalogCase.suiteCaseId), `${catalogCase.id} stays planned`);
+  }
+
+  const descriptors = [...new Set(FEATURE_CATALOG.cases.flatMap((item) => item.tools))].map(
+    (name) => ({ name }),
+  );
+  const full = checkFeatureCoverage({
+    catalog: FEATURE_CATALOG,
+    descriptors,
+    executableSuiteCases: source.cases,
+    suiteConfig,
+  });
+  assert.equal(full.status, "BLOCKED");
+  const blockedPlannedIds = full.gaps
+    .filter((gap) => gap.code === "CASE_NOT_EXECUTABLE")
+    .map((gap) => gap.caseId)
+    .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
+  assert.deepEqual(
+    blockedPlannedIds,
+    planned
+      .map((item) => item.id)
+      .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0)),
+  );
 });

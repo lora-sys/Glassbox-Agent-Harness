@@ -711,14 +711,21 @@ function bindingClient(selfId, messages) {
   };
 }
 
-function boundMessageFixture({ driverReplyRealSequence = "555", driverReplyText } = {}) {
+function boundMessageFixture({
+  driverReplyRealSequence = "555",
+  driverReplyText,
+  botTimeOffset = 0,
+  driverTimeOffset = 0,
+  botReplyTimeOffset = botTimeOffset,
+  driverReplyTimeOffset = driverTimeOffset,
+} = {}) {
   const inputText = "private test prompt with hidden input text";
   const replyText = driverReplyText ?? "reply with nonce-expected and 42";
   const time = Math.floor(Date.now() / 1000);
-  const common = (messageId, senderId, text, realSequence) => ({
+  const common = (messageId, senderId, text, realSequence, timeOffset) => ({
     message_id: messageId,
     real_seq: realSequence,
-    time,
+    time: time + timeOffset,
     message_type: "group",
     group_id: "20001",
     user_id: senderId,
@@ -726,12 +733,15 @@ function boundMessageFixture({ driverReplyRealSequence = "555", driverReplyText 
     message: [{ type: "text", data: { text } }],
   });
   const botMessages = new Map([
-    ["447318472", common("447318472", "10001", inputText, "554")],
-    ["2300000001", common("2300000001", "10002", replyText, "555")],
+    ["447318472", common("447318472", "10001", inputText, "554", botTimeOffset)],
+    ["2300000001", common("2300000001", "10002", replyText, "555", botReplyTimeOffset)],
   ]);
   const driverMessages = new Map([
-    ["2102070094", common("2102070094", "10001", inputText, "554")],
-    ["2300000002", common("2300000002", "10002", replyText, driverReplyRealSequence)],
+    ["2102070094", common("2102070094", "10001", inputText, "554", driverTimeOffset)],
+    [
+      "2300000002",
+      common("2300000002", "10002", replyText, driverReplyRealSequence, driverReplyTimeOffset),
+    ],
   ]);
   const c = {
     sentMessageId: "2102070094",
@@ -740,7 +750,8 @@ function boundMessageFixture({ driverReplyRealSequence = "555", driverReplyText 
       driverMessageId: "2102070094",
       botMessageId: "447318472",
       realSequence: "554",
-      time,
+      time: time + botTimeOffset,
+      driverTime: time + driverTimeOffset,
       textSha256: messageDigest(inputText),
     },
     route: "20001",
@@ -768,8 +779,8 @@ function boundMessageFixture({ driverReplyRealSequence = "555", driverReplyText 
   };
 }
 
-test("two account-local ID pairs bind to one real input and reply without retaining text", async () => {
-  const fixture = boundMessageFixture();
+test("two account-local ID pairs preserve distinct actual times without retaining text", async () => {
+  const fixture = boundMessageFixture({ botTimeOffset: 1, driverTimeOffset: 0 });
   const evidence = await verifyMessageBindings(
     fixture.c,
     fixture.config,
@@ -779,13 +790,67 @@ test("two account-local ID pairs bind to one real input and reply without retain
   assert.deepEqual(evidence.input, {
     realSequence: "554",
     time: fixture.c.inputBinding.time,
+    driverTime: fixture.c.inputBinding.driverTime,
     textSha256: fixture.c.inputBinding.textSha256,
   });
   assert.equal(evidence.reply.realSequence, "555");
+  assert.equal(evidence.reply.driverTime, fixture.c.inputBinding.driverTime);
   assert.equal(evidence.reply.botMessageId, String(fixture.delivery.external_id));
   assert.equal(evidence.reply.driverMessageId, fixture.c.replies[0].messageId);
   assert.equal(JSON.stringify(evidence).includes(fixture.inputText), false);
   assert.equal(JSON.stringify(evidence).includes(fixture.replyText), false);
+});
+
+test("legacy single-time binding survives only equal independently read account times", async () => {
+  const equal = boundMessageFixture();
+  delete equal.c.inputBinding.driverTime;
+  const evidence = await verifyMessageBindings(
+    equal.c,
+    equal.config,
+    equal.clients,
+    equal.delivery,
+  );
+  assert.equal(evidence.input.driverTime, equal.c.inputBinding.time);
+
+  const unequal = boundMessageFixture({ botTimeOffset: 1, driverTimeOffset: 0 });
+  delete unequal.c.inputBinding.driverTime;
+  await assert.rejects(
+    verifyMessageBindings(unequal.c, unequal.config, unequal.clients, unequal.delivery),
+    { code: "MESSAGE_BINDING_MISMATCH" },
+  );
+});
+
+test("either account time change breaks its exact input binding", async () => {
+  for (const [role, messageId] of [
+    ["bot", "447318472"],
+    ["driver", "2102070094"],
+  ]) {
+    const fixture = boundMessageFixture({ botTimeOffset: 1, driverTimeOffset: 0 });
+    const message = fixture.clients[role];
+    const call = message.call.bind(message);
+    message.call = async (action, params) => {
+      const result = await call(action, params);
+      if (params.message_id === messageId) result.time += 1;
+      return result;
+    };
+    await assert.rejects(
+      verifyMessageBindings(fixture.c, fixture.config, fixture.clients, fixture.delivery),
+      { code: "MESSAGE_BINDING_MISMATCH" },
+    );
+  }
+});
+
+test("reply time must follow input time on each same account independently", async () => {
+  for (const offsets of [
+    { botTimeOffset: 0, driverTimeOffset: 2, botReplyTimeOffset: 1, driverReplyTimeOffset: 1 },
+    { botTimeOffset: 2, driverTimeOffset: 0, botReplyTimeOffset: 1, driverReplyTimeOffset: 1 },
+  ]) {
+    const fixture = boundMessageFixture(offsets);
+    await assert.rejects(
+      verifyMessageBindings(fixture.c, fixture.config, fixture.clients, fixture.delivery),
+      { code: "MESSAGE_BINDING_MISMATCH" },
+    );
+  }
 });
 
 test("cross-account reply sequence or full-text hash mismatch is inconclusive", async () => {

@@ -1,4 +1,10 @@
 import { fail, safeError } from "./core.mjs";
+import {
+  messageReplyTimesFollowInput,
+  messageTimeBindingKeys,
+  messageTimesMatch,
+  validMessageTimeBinding,
+} from "./message-binding.mjs";
 import { tasteFixtureStep } from "./taste-scenario.mjs";
 
 const STAGES = ["feedback", "promote", "negative-feedback", "retire"];
@@ -6,20 +12,40 @@ const ID = /^[A-Za-z0-9_-]{1,128}$/;
 const CANDIDATE = /^candidate_[a-f0-9]{32}$/;
 const MEMORY = /^memory_[a-f0-9]{32}$/;
 
+function exactKeys(value, expected) {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...expected].sort())
+  );
+}
+
 function requireStep(result, spec) {
   const c = result?.transportCase;
   const a = result?.productAcceptance;
   const e = a?.cases?.length === 1 ? a.cases[0] : undefined;
   const input = c?.inputBinding;
+  const reply = e?.messageBinding?.reply;
   if (
     c?.id !== spec.id ||
     c.route !== "private" ||
     c.status !== "PASS" ||
     c.leaseRevoked !== true ||
     !input ||
+    !exactKeys(
+      input,
+      messageTimeBindingKeys(input, [
+        "driverMessageId",
+        "botMessageId",
+        "realSequence",
+        "time",
+        "textSha256",
+      ]),
+    ) ||
     !/^[a-f0-9]{64}$/.test(input.textSha256 ?? "") ||
     !/^\d{1,30}$/.test(String(input.realSequence ?? "")) ||
-    !Number.isSafeInteger(input.time) ||
+    !validMessageTimeBinding(input) ||
     a?.status !== "PASS" ||
     !a.runtime ||
     e?.caseId !== spec.id ||
@@ -30,9 +56,28 @@ function requireStep(result, spec) {
     e.feature.runId !== e.runId ||
     e.scope?.chatType !== "private" ||
     !ID.test(e.scope?.chatId ?? "") ||
+    !exactKeys(
+      e.messageBinding?.input,
+      messageTimeBindingKeys(e.messageBinding?.input, ["realSequence", "time", "textSha256"]),
+    ) ||
+    !Object.hasOwn(e.messageBinding?.input ?? {}, "driverTime") ||
+    !validMessageTimeBinding(e.messageBinding?.input) ||
     e.messageBinding?.input?.textSha256 !== input.textSha256 ||
     String(e.messageBinding.input.realSequence) !== String(input.realSequence) ||
-    e.messageBinding.input.time !== input.time
+    !messageTimesMatch(input, e.messageBinding.input) ||
+    !exactKeys(
+      reply,
+      messageTimeBindingKeys(reply, [
+        "botMessageId",
+        "driverMessageId",
+        "realSequence",
+        "time",
+        "textSha256",
+      ]),
+    ) ||
+    !Object.hasOwn(reply, "driverTime") ||
+    !validMessageTimeBinding(reply) ||
+    !messageReplyTimesFollowInput(e.messageBinding.input, reply)
   )
     fail("TASTE_STEP_EVIDENCE", "偏好步骤缺少独立消息、Run 或许可清理证据。", "INCONCLUSIVE");
   return e;

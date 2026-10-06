@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 5,
+  "schemaVersion": 6,
   "cases": [
     {
       "id": "qq-group-a-root-files-read",
@@ -342,6 +342,11 @@
       "id": "memory-project-feedback-reject",
       "kind": "memory-lifecycle",
       "workflow": "feedback-reject",
+      "chat": "private"
+    },
+    {
+      "id": "taste-project-feedback-lifecycle",
+      "kind": "taste-lifecycle",
       "chat": "private"
     },
     {

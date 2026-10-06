@@ -28,7 +28,28 @@ function fixture(overrides = {}) {
       executeStep: async (stage, spec) => {
         sent.push(stage);
         const runId = `run-${stage}`;
-        const input = { realSequence: "123", time: 42, textSha256: "b".repeat(64) };
+        const input = {
+          driverMessageId: "12345",
+          botMessageId: "12346",
+          realSequence: "123",
+          time: 42,
+          driverTime: 42,
+          textSha256: "b".repeat(64),
+        };
+        const freshInput = {
+          realSequence: input.realSequence,
+          time: input.time,
+          driverTime: input.driverTime,
+          textSha256: input.textSha256,
+        };
+        const reply = {
+          botMessageId: "12347",
+          driverMessageId: "12348",
+          realSequence: "124",
+          time: 43,
+          driverTime: 43,
+          textSha256: "c".repeat(64),
+        };
         const evidence = {
           caseId: spec.id,
           runId,
@@ -36,7 +57,7 @@ function fixture(overrides = {}) {
           cleanupVerified: true,
           feature: { status: "PASS", runId },
           scope: { chatType: "private", chatId: "owner" },
-          messageBinding: { input },
+          messageBinding: { input: freshInput, reply },
         };
         return {
           transportCase: {

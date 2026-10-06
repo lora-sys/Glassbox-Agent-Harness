@@ -1,6 +1,12 @@
 import { readFile, open, rm } from "node:fs/promises";
 import { dirname, resolve, relative, isAbsolute, sep } from "node:path";
 import { digest, fail, toolManifestDigest } from "./core.mjs";
+import {
+  messageReplyTimesFollowInput,
+  messageTimeBindingKeys,
+  messageTimesMatch,
+  validMessageTimeBinding,
+} from "./message-binding.mjs";
 import { writeMemoryCheckpoint } from "./memory-checkpoint.mjs";
 import { TASTE_FAMILY_ID, tasteFixtureProject, tasteFixtureStep } from "./taste-scenario.mjs";
 
@@ -10,6 +16,15 @@ const NONCE = /^[a-f0-9]{32}$/;
 const ID = /^[A-Za-z0-9_-]{1,128}$/;
 const CANDIDATE = /^candidate_[a-f0-9]{32}$/;
 const MEMORY = /^memory_[a-f0-9]{32}$/;
+
+function exactKeys(value, expected) {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...expected].sort())
+  );
+}
 const HASH = /^[a-f0-9]{64}$/;
 const PHASES = new Set([
   "before_send",
@@ -190,10 +205,20 @@ function validateRow(row, index, previousHash, origin, input) {
         JSON.stringify(expectedTools.map((tool) => tool.name)) ||
       source.route !== "private" ||
       !source.inputBinding ||
+      !exactKeys(
+        source.inputBinding,
+        messageTimeBindingKeys(source.inputBinding, [
+          "driverMessageId",
+          "botMessageId",
+          "realSequence",
+          "time",
+          "textSha256",
+        ]),
+      ) ||
       !/^-?\d{1,20}$/.test(String(source.inputBinding.driverMessageId ?? "")) ||
       !/^-?\d{1,20}$/.test(String(source.inputBinding.botMessageId ?? "")) ||
       !/^\d{1,30}$/.test(String(source.inputBinding.realSequence ?? "")) ||
-      !Number.isSafeInteger(source.inputBinding.time) ||
+      !validMessageTimeBinding(source.inputBinding) ||
       !HASH.test(source.inputBinding.textSha256 ?? "") ||
       !Array.isArray(source.replies) ||
       source.replies.length !== 1 ||
@@ -218,12 +243,32 @@ function validateRow(row, index, previousHash, origin, input) {
       JSON.stringify(proof.inputBinding) !== JSON.stringify(source.inputBinding) ||
       JSON.stringify(proof.reply) !== JSON.stringify(source.replies[0]) ||
       !proof.messageBinding ||
+      !exactKeys(proof.messageBinding, ["input", "reply"]) ||
       !proof.messageBinding.input ||
       !proof.messageBinding.reply ||
+      !exactKeys(
+        proof.messageBinding.input,
+        messageTimeBindingKeys(proof.messageBinding.input, ["realSequence", "time", "textSha256"]),
+      ) ||
+      !Object.hasOwn(proof.messageBinding.input, "driverTime") ||
+      !validMessageTimeBinding(proof.messageBinding.input) ||
       String(proof.messageBinding.input.realSequence) !==
         String(source.inputBinding.realSequence) ||
-      proof.messageBinding.input.time !== source.inputBinding.time ||
+      !messageTimesMatch(source.inputBinding, proof.messageBinding.input) ||
       proof.messageBinding.input.textSha256 !== source.inputBinding.textSha256 ||
+      !exactKeys(
+        proof.messageBinding.reply,
+        messageTimeBindingKeys(proof.messageBinding.reply, [
+          "botMessageId",
+          "driverMessageId",
+          "realSequence",
+          "time",
+          "textSha256",
+        ]),
+      ) ||
+      !Object.hasOwn(proof.messageBinding.reply, "driverTime") ||
+      !validMessageTimeBinding(proof.messageBinding.reply) ||
+      !messageReplyTimesFollowInput(proof.messageBinding.input, proof.messageBinding.reply) ||
       String(proof.messageBinding.reply.driverMessageId) !== String(source.replies[0].messageId) ||
       !/^-?\d{1,20}$/.test(String(proof.messageBinding.reply.botMessageId ?? "")) ||
       !/^-?\d{1,20}$/.test(String(proof.messageBinding.reply.driverMessageId ?? "")) ||

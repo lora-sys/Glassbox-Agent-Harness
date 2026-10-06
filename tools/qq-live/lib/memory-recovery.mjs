@@ -1,5 +1,11 @@
 import { isDeepStrictEqual } from "node:util";
 import { digest, toolManifestDigest } from "./core.mjs";
+import {
+  messageReplyTimesFollowInput,
+  messageTimeBindingKeys,
+  messageTimesMatch,
+  validMessageTimeBinding,
+} from "./message-binding.mjs";
 import { memoryFixtureStep } from "./memory-scenario.mjs";
 
 const NONCE = /^[a-f0-9]{32}$/;
@@ -202,10 +208,20 @@ function validCleanupAcceptance(result, stage, spec, handles, record, runtime) {
     transport.sentMessageId !== binding?.driverMessageId ||
     transport.prompt !== expectedPrompt ||
     !binding ||
+    !exactKeys(
+      binding,
+      messageTimeBindingKeys(binding, [
+        "driverMessageId",
+        "botMessageId",
+        "realSequence",
+        "time",
+        "textSha256",
+      ]),
+    ) ||
     !MESSAGE_ID.test(String(binding.driverMessageId ?? "")) ||
     !MESSAGE_ID.test(String(binding.botMessageId ?? "")) ||
     !/^\d{1,30}$/.test(String(binding.realSequence ?? "")) ||
-    !Number.isSafeInteger(binding.time) ||
+    !validMessageTimeBinding(binding) ||
     !SHA256.test(binding.textSha256 ?? "") ||
     binding.textSha256 !== digest(expectedPrompt) ||
     acceptance?.status !== "PASS" ||
@@ -221,17 +237,44 @@ function validCleanupAcceptance(result, stage, spec, handles, record, runtime) {
     evidence.delivery?.status !== "sent" ||
     !evidence.messageBinding?.input ||
     !evidence.messageBinding?.reply ||
+    !exactKeys(
+      evidence.messageBinding.input,
+      messageTimeBindingKeys(evidence.messageBinding.input, ["realSequence", "time", "textSha256"]),
+    ) ||
+    !Object.hasOwn(evidence.messageBinding.input, "driverTime") ||
+    !exactKeys(
+      evidence.messageBinding.reply,
+      messageTimeBindingKeys(evidence.messageBinding.reply, [
+        "botMessageId",
+        "driverMessageId",
+        "realSequence",
+        "time",
+        "textSha256",
+      ]),
+    ) ||
+    !Object.hasOwn(evidence.messageBinding.reply, "driverTime") ||
+    !validMessageTimeBinding(evidence.messageBinding.input) ||
+    !validMessageTimeBinding(evidence.messageBinding.reply) ||
     !/^\d{1,30}$/.test(String(evidence.messageBinding.reply.realSequence ?? "")) ||
-    !Number.isSafeInteger(evidence.messageBinding.reply.time) ||
     !SHA256.test(evidence.messageBinding.reply.textSha256 ?? "") ||
+    !messageReplyTimesFollowInput(evidence.messageBinding.input, evidence.messageBinding.reply) ||
     evidence.messageBinding?.input?.realSequence !== binding.realSequence ||
-    evidence.messageBinding.input.time !== binding.time ||
+    !messageTimesMatch(binding, evidence.messageBinding.input) ||
     evidence.messageBinding.input.textSha256 !== binding.textSha256 ||
     sourceRunIds.has(runId) ||
     [handles.creationRunId, handles.promoteRunId, handles.cleanupRunId].includes(runId)
   )
     return false;
   return { runId, binding };
+}
+
+function exactKeys(value, expected) {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    isDeepStrictEqual(Object.keys(value).sort(), [...expected].sort())
+  );
 }
 
 function cleanupMatches(observed, expected, stage, cleanupRunId) {

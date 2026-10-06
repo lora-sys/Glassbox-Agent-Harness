@@ -64,6 +64,83 @@ function hashArtifact(artifactBytes) {
   return { bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") };
 }
 
+function assertUniqueJsonKeys(source) {
+  let index = 0;
+  const whitespace = () => {
+    while (/\s/.test(source[index] ?? "") && index < source.length) index++;
+  };
+  const parseString = () => {
+    const start = index;
+    if (source[index++] !== '"') throw new SyntaxError("Expected JSON string.");
+    while (index < source.length) {
+      const character = source[index++];
+      if (character === '"') return JSON.parse(source.slice(start, index));
+      if (character === "\\") {
+        if (index >= source.length) throw new SyntaxError("Incomplete JSON escape.");
+        index++;
+      } else if (character.charCodeAt(0) < 0x20) {
+        throw new SyntaxError("Unescaped JSON control character.");
+      }
+    }
+    throw new SyntaxError("Unterminated JSON string.");
+  };
+  const parseValue = () => {
+    whitespace();
+    if (source[index] === '"') {
+      parseString();
+      return;
+    }
+    if (source[index] === "{") {
+      index++;
+      whitespace();
+      if (source[index] === "}") {
+        index++;
+        return;
+      }
+      const keys = new Set();
+      while (index < source.length) {
+        whitespace();
+        const key = parseString();
+        if (keys.has(key)) throw new SyntaxError("Duplicate JSON object key.");
+        keys.add(key);
+        whitespace();
+        if (source[index++] !== ":") throw new SyntaxError("Expected JSON object colon.");
+        parseValue();
+        whitespace();
+        const separator = source[index++];
+        if (separator === "}") return;
+        if (separator !== ",") throw new SyntaxError("Expected JSON object separator.");
+      }
+      throw new SyntaxError("Unterminated JSON object.");
+    }
+    if (source[index] === "[") {
+      index++;
+      whitespace();
+      if (source[index] === "]") {
+        index++;
+        return;
+      }
+      while (index < source.length) {
+        parseValue();
+        whitespace();
+        const separator = source[index++];
+        if (separator === "]") return;
+        if (separator !== ",") throw new SyntaxError("Expected JSON array separator.");
+      }
+      throw new SyntaxError("Unterminated JSON array.");
+    }
+    const primitive =
+      /^(?:true|false|null|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)(?=\s|,|\}|\]|$)/.exec(
+        source.slice(index),
+      );
+    if (!primitive) throw new SyntaxError("Invalid JSON value.");
+    index += primitive[0].length;
+  };
+
+  parseValue();
+  whitespace();
+  if (index !== source.length) throw new SyntaxError("Trailing JSON content.");
+}
 function validateBinding(binding) {
   if (
     !exactKeys(binding, [
@@ -138,8 +215,10 @@ function validateImplementationAgentIds(value) {
 function parseReviewArtifact(artifactBytes) {
   const artifact = hashArtifact(artifactBytes);
   let parsed;
+  const source = Buffer.from(artifactBytes).toString("utf8");
   try {
-    parsed = JSON.parse(Buffer.from(artifactBytes).toString("utf8"));
+    assertUniqueJsonKeys(source);
+    parsed = JSON.parse(source);
   } catch {
     invalid("The review artifact must be strict JSON with no status field.");
   }

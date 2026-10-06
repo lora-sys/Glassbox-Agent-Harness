@@ -22,6 +22,47 @@ function plainReply(result, text) {
   if (result.raw_message !== undefined && result.raw_message !== text) mismatch();
 }
 
+export function validMessageTimeBinding(binding) {
+  return (
+    !!binding &&
+    Number.isSafeInteger(binding.time) &&
+    binding.time > 0 &&
+    (!Object.hasOwn(binding, "driverTime") ||
+      (Number.isSafeInteger(binding.driverTime) && binding.driverTime > 0))
+  );
+}
+
+export function messageTimeBindingKeys(binding, baseKeys) {
+  return Object.hasOwn(binding ?? {}, "driverTime") ? [...baseKeys, "driverTime"] : baseKeys;
+}
+
+export function messageTimesMatch(binding, evidence) {
+  if (
+    !validMessageTimeBinding(binding) ||
+    !evidence ||
+    !Number.isSafeInteger(evidence.time) ||
+    evidence.time <= 0 ||
+    !Number.isSafeInteger(evidence.driverTime) ||
+    evidence.driverTime <= 0 ||
+    binding.time !== evidence.time
+  )
+    return false;
+  return Object.hasOwn(binding, "driverTime")
+    ? binding.driverTime === evidence.driverTime
+    : binding.time === evidence.driverTime;
+}
+
+export function messageReplyTimesFollowInput(input, reply) {
+  return (
+    validMessageTimeBinding(input) &&
+    Object.hasOwn(input, "driverTime") &&
+    validMessageTimeBinding(reply) &&
+    Object.hasOwn(reply, "driverTime") &&
+    reply.time >= input.time &&
+    reply.driverTime >= input.driverTime
+  );
+}
+
 export async function boundMessage(client, requestedMessageId, expected) {
   const requested = messageId(requestedMessageId);
   if (!requested) mismatch();
@@ -74,6 +115,7 @@ export async function boundMessage(client, requestedMessageId, expected) {
     result?.message_type !== expected.messageType ||
     (expected.groupId !== undefined && id(result?.group_id) !== id(expected.groupId)) ||
     !Number.isSafeInteger(time) ||
+    time <= 0 ||
     !Number.isFinite(freshnessFloor) ||
     time < freshnessFloor ||
     time > freshnessCeiling ||
@@ -133,18 +175,22 @@ export async function boundMessage(client, requestedMessageId, expected) {
   };
 }
 
-export function compareSameMessage(a, b) {
+export function compareSameMessage(botMessage, driverMessage) {
   if (
-    !a ||
-    !b ||
-    a.realSequence !== b.realSequence ||
-    a.time !== b.time ||
-    a.textSha256 !== b.textSha256
+    !botMessage ||
+    !driverMessage ||
+    botMessage.realSequence !== driverMessage.realSequence ||
+    !Number.isSafeInteger(botMessage.time) ||
+    botMessage.time <= 0 ||
+    !Number.isSafeInteger(driverMessage.time) ||
+    driverMessage.time <= 0 ||
+    botMessage.textSha256 !== driverMessage.textSha256
   )
     mismatch();
   return {
-    realSequence: a.realSequence,
-    time: a.time,
-    textSha256: a.textSha256,
+    realSequence: botMessage.realSequence,
+    time: botMessage.time,
+    driverTime: driverMessage.time,
+    textSha256: botMessage.textSha256,
   };
 }

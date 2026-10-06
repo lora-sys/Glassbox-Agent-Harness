@@ -124,6 +124,7 @@ function successfulExecution(stage, spec, record, overrides = {}) {
     botMessageId: "90002",
     realSequence: "501",
     time: 1791158400000,
+    driverTime: 1791158400000,
     textSha256: digest(prompt),
   };
   const evidence = {
@@ -137,9 +138,17 @@ function successfulExecution(stage, spec, record, overrides = {}) {
       input: {
         realSequence: binding.realSequence,
         time: binding.time,
+        driverTime: binding.driverTime,
         textSha256: binding.textSha256,
       },
-      reply: { realSequence: "502", time: binding.time + 1000, textSha256: "9".repeat(64) },
+      reply: {
+        botMessageId: "90003",
+        driverMessageId: "90004",
+        realSequence: "502",
+        time: binding.time + 1000,
+        driverTime: binding.time + 1000,
+        textSha256: "9".repeat(64),
+      },
     },
   };
   return {
@@ -508,6 +517,10 @@ test("cleanup acceptance requires a distinct successful private Run and exact pr
     },
     (execution) => {
       execution.productAcceptance.cases[0].messageBinding.input.textSha256 = "0".repeat(64);
+    },
+    (execution) => {
+      const proof = execution.productAcceptance.cases[0].messageBinding;
+      proof.reply.driverTime = proof.input.driverTime - 1;
     },
   ];
   for (const mutate of mutations) {

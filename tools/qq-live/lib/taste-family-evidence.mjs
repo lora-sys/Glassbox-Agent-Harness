@@ -1,4 +1,10 @@
 import { fail, digest, toolManifestDigest } from "./core.mjs";
+import {
+  messageReplyTimesFollowInput,
+  messageTimeBindingKeys,
+  messageTimesMatch,
+  validMessageTimeBinding,
+} from "./message-binding.mjs";
 import { tasteFixtureStep, TASTE_FAMILY_ID } from "./taste-scenario.mjs";
 
 const STAGES = ["feedback", "promote", "negative-feedback", "retire"];
@@ -78,17 +84,20 @@ function fixedCase(stage, handles, c) {
     lease.expiresAt <= Date.parse(c.startedAt) ||
     !HASH.test(lease.toolsSha256 ?? "") ||
     lease.toolsSha256 !== toolManifestDigest(leaseTools) ||
-    !exactKeys(binding, [
-      "driverMessageId",
-      "botMessageId",
-      "realSequence",
-      "time",
-      "textSha256",
-    ]) ||
+    !exactKeys(
+      binding,
+      messageTimeBindingKeys(binding, [
+        "driverMessageId",
+        "botMessageId",
+        "realSequence",
+        "time",
+        "textSha256",
+      ]),
+    ) ||
     !/^-?\d{1,20}$/.test(String(binding.driverMessageId ?? "")) ||
     !/^-?\d{1,20}$/.test(String(binding.botMessageId ?? "")) ||
     !/^\d{1,30}$/.test(String(binding.realSequence ?? "")) ||
-    !Number.isSafeInteger(binding.time) ||
+    !validMessageTimeBinding(binding) ||
     binding.textSha256 !== digest(expectedPrompt) ||
     !Array.isArray(replies) ||
     replies.length !== 1 ||
@@ -215,10 +224,29 @@ export async function verifyTasteFamilyReport(
       scope.senderId !== config.driver.qq ||
       (scope.threadId ?? null) !== (report.runtime.threadId ?? null) ||
       !message?.input ||
+      !exactKeys(
+        message.input,
+        messageTimeBindingKeys(message.input, ["realSequence", "time", "textSha256"]),
+      ) ||
+      !Object.hasOwn(message.input, "driverTime") ||
+      !validMessageTimeBinding(message.input) ||
       message.input.realSequence !== fixed.binding.realSequence ||
-      message.input.time !== fixed.binding.time ||
+      !messageTimesMatch(fixed.binding, message.input) ||
       message.input.textSha256 !== fixed.binding.textSha256 ||
       !message?.reply ||
+      !exactKeys(
+        message.reply,
+        messageTimeBindingKeys(message.reply, [
+          "botMessageId",
+          "driverMessageId",
+          "realSequence",
+          "time",
+          "textSha256",
+        ]),
+      ) ||
+      !Object.hasOwn(message.reply, "driverTime") ||
+      !validMessageTimeBinding(message.reply) ||
+      !messageReplyTimesFollowInput(message.input, message.reply) ||
       String(message.reply.botMessageId) !== String(evidence.delivery?.external_id) ||
       String(message.reply.driverMessageId) !== String(fixed.reply.messageId) ||
       !/^\d{1,30}$/.test(String(message.reply.realSequence ?? "")) ||

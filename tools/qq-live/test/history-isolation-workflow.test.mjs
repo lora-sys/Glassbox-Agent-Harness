@@ -67,6 +67,7 @@ function accepted(spec, index, options) {
     botMessageId: String(41001 + index),
     realSequence: String(51001 + index),
     time,
+    driverTime: time,
     textSha256: digest(prompt),
   };
   const productRuntime = structuredClone(options.runtimes[index]);
@@ -76,6 +77,7 @@ function accepted(spec, index, options) {
     driverMessageId: String(61001 + index),
     realSequence: String(71001 + index),
     time,
+    driverTime: time,
     textSha256: digest(`reply-${index}`),
   };
   const productCase = {
@@ -94,6 +96,7 @@ function accepted(spec, index, options) {
       input: {
         realSequence: binding.realSequence,
         time: binding.time,
+        driverTime: binding.driverTime,
         textSha256: binding.textSha256,
       },
       reply,
@@ -281,6 +284,14 @@ test("rejects repeated markers, Run IDs, times, or changed runtime", async (t) =
 
 test("rejects weakened transport, lease, feature, scope, and product evidence", async (t) => {
   const cases = [
+    [
+      "Owner reply predates Owner input",
+      (_id, result) => {
+        const evidence = result.productAcceptance.cases[0];
+        evidence.messageBinding.reply.driverTime = evidence.messageBinding.input.driverTime - 1;
+      },
+      ["seed"],
+    ],
     [
       "missing feature assertion",
       (_id, result) => result.transportCase.featureAssertions.pop(),

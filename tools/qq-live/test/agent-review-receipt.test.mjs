@@ -66,6 +66,53 @@ test("records explicit independent full-diff review and rechecks exact artifact 
   });
 });
 
+test("duplicate JSON keys are rejected at every object depth after escape decoding", () => {
+  const duplicateTopLevel = JSON.stringify({ schemaVersion: 2, binding, review }).replace(
+    '"schemaVersion":2',
+    '"schemaVersion":2,"schemaVersion":2',
+  );
+  const duplicateReviewerList = JSON.stringify({ schemaVersion: 2, binding, review }).replace(
+    '"implementationAgentIds":["agent:implementation-7","agent:implementation-8"]',
+    '"implementationAgentIds":["independent-review-agent-9"],"implementationAgent\\u0049ds":["agent:implementation-7","agent:implementation-8"]',
+  );
+  const duplicateBindingField = JSON.stringify({ schemaVersion: 2, binding, review }).replace(
+    `"candidateCommit":"${binding.candidateCommit}"`,
+    `"candidateCommit":"${"e".repeat(40)}","candidateCommit":"${binding.candidateCommit}"`,
+  );
+  const duplicateFindingField = JSON.stringify({ schemaVersion: 2, binding, review }).replace(
+    '"resolution":"fixed"',
+    '"resolution":"open","resolution":"fixed"',
+  );
+  for (const json of [
+    duplicateTopLevel,
+    duplicateReviewerList,
+    duplicateBindingField,
+    duplicateFindingField,
+  ]) {
+    assert.throws(() => record({ artifactBytes: Buffer.from(json) }), {
+      code: "AGENT_REVIEW_RECEIPT",
+    });
+  }
+});
+
+test("duplicate-key-like text inside a JSON string is accepted", () => {
+  const reviewWithExampleText = {
+    ...review,
+    findings: [
+      {
+        ...review.findings[0],
+        summary: 'Example text: {"resolution":"open","resolution":"fixed"}.',
+      },
+    ],
+  };
+  assert.doesNotThrow(() =>
+    record({
+      artifactBytes: Buffer.from(
+        JSON.stringify({ schemaVersion: 2, binding, review: reviewWithExampleText }),
+      ),
+    }),
+  );
+});
 test("arbitrary report PASS and artifact promotion fields are rejected", () => {
   assert.throws(
     () =>

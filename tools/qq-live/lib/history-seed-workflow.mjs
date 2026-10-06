@@ -1,11 +1,25 @@
 import { isDeepStrictEqual } from "node:util";
 import { fail, digest, toolManifestDigest } from "./core.mjs";
+import {
+  messageReplyTimesFollowInput,
+  messageTimeBindingKeys,
+  messageTimesMatch,
+  validMessageTimeBinding,
+} from "./message-binding.mjs";
 import { historySeedSpec, historyRecallSpec } from "./history-scenario.mjs";
 
 export const HISTORY_SEED_FAMILY_ID = "history-group-seed-private-recall";
 const marker = /^[a-f0-9]{32}$/;
 const identifier = /^[A-Za-z0-9_-]{1,128}$/;
 const messageId = /^-?\d{1,20}$/;
+function exactKeys(value, expected) {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    isDeepStrictEqual(Object.keys(value).sort(), [...expected].sort())
+  );
+}
 function invalid() {
   fail("HISTORY_SEED_WORKFLOW", "固定历史流程缺少两轮真实输入、来源或版本证据。", "INCONCLUSIVE");
 }
@@ -36,10 +50,19 @@ function verifyStep(result, spec, config, previous) {
     c.acceptanceLease?.toolsSha256 !== toolManifestDigest(resolve(spec.leaseTools)) ||
     !messageId.test(String(binding?.botMessageId ?? "")) ||
     !messageId.test(String(binding?.driverMessageId ?? "")) ||
+    !exactKeys(
+      binding,
+      messageTimeBindingKeys(binding, [
+        "botMessageId",
+        "driverMessageId",
+        "realSequence",
+        "time",
+        "textSha256",
+      ]),
+    ) ||
     String(c.sentMessageId) !== String(binding.driverMessageId) ||
     !/^\d{1,30}$/.test(binding.realSequence ?? "") ||
-    !Number.isSafeInteger(binding.time) ||
-    binding.time <= 0 ||
+    !validMessageTimeBinding(binding) ||
     binding.textSha256 !== digest(prompt) ||
     product?.status !== "PASS" ||
     product.cases.length !== 1 ||
@@ -48,11 +71,34 @@ function verifyStep(result, spec, config, previous) {
     e.traceVerified !== true ||
     e.feature?.status !== "PASS" ||
     e.feature.runId !== e.runId ||
-    !isDeepStrictEqual(e.messageBinding?.input, {
-      realSequence: binding.realSequence,
-      time: binding.time,
-      textSha256: binding.textSha256,
-    }) ||
+    !exactKeys(e.messageBinding, ["input", "reply"]) ||
+    !exactKeys(
+      e.messageBinding?.input,
+      messageTimeBindingKeys(e.messageBinding?.input, ["realSequence", "time", "textSha256"]),
+    ) ||
+    !validMessageTimeBinding(e.messageBinding?.input) ||
+    !Object.hasOwn(e.messageBinding.input, "driverTime") ||
+    String(e.messageBinding.input.realSequence) !== String(binding.realSequence) ||
+    !messageTimesMatch(binding, e.messageBinding.input) ||
+    e.messageBinding.input.textSha256 !== binding.textSha256 ||
+    !exactKeys(
+      e.messageBinding.reply,
+      messageTimeBindingKeys(e.messageBinding.reply, [
+        "botMessageId",
+        "driverMessageId",
+        "realSequence",
+        "time",
+        "textSha256",
+      ]),
+    ) ||
+    !Object.hasOwn(e.messageBinding.reply, "driverTime") ||
+    !messageId.test(String(e.messageBinding.reply.botMessageId ?? "")) ||
+    !messageId.test(String(e.messageBinding.reply.driverMessageId ?? "")) ||
+    !/^\d{1,30}$/.test(String(e.messageBinding.reply.realSequence ?? "")) ||
+    !validMessageTimeBinding(e.messageBinding.reply) ||
+    e.messageBinding.reply.time < e.messageBinding.input.time ||
+    !/^[a-f0-9]{64}$/.test(e.messageBinding.reply.textSha256 ?? "") ||
+    !messageReplyTimesFollowInput(e.messageBinding.input, e.messageBinding.reply) ||
     scope?.connectionId !== config.runtime?.connectionId ||
     scope.botId !== config.bot?.qq ||
     scope.senderId !== config.driver?.qq ||

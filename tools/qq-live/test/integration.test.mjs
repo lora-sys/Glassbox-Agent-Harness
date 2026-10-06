@@ -326,6 +326,7 @@ test("private round trip binds different account-local IDs to the same input", a
   assert.equal(c.inputBinding.botMessageId, c.botInputMessageId);
   assert.equal(c.inputBinding.realSequence, "501");
   assert.ok(Number.isSafeInteger(c.inputBinding.time));
+  assert.ok(Number.isSafeInteger(c.inputBinding.driverTime));
   assert.match(c.inputBinding.textSha256, /^[0-9a-f]{64}$/);
   assert.deepEqual(
     w.actions

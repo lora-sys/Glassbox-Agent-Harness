@@ -8,6 +8,7 @@ import {
 } from "./feature-suite.mjs";
 import { TASTE_FAMILY_ID } from "./taste-scenario.mjs";
 import { memoryWorkflow } from "./memory-workflow.mjs";
+import { validMessageTimeBinding } from "./message-binding.mjs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
@@ -197,14 +198,17 @@ export async function evaluateDeliveryGate(
         const created = Date.parse(evidence.runCreatedAt);
         if (!Number.isFinite(created)) fail("POST_MERGE_RUN", "合并后验收缺少独立 Run 创建时间。");
         freshRunTimes.push(created);
-        const inputTime = evidence.messageBinding?.input?.time;
+        const inputBinding = evidence.messageBinding?.input;
+        const inputTime = inputBinding?.time;
+        const driverTime = inputBinding?.driverTime;
         if (
-          !Number.isSafeInteger(inputTime) ||
+          !validMessageTimeBinding(inputBinding) ||
+          !Object.hasOwn(inputBinding, "driverTime") ||
           !Number.isSafeInteger(inputTime * 1000) ||
-          inputTime <= 0
+          !Number.isSafeInteger(driverTime * 1000)
         )
-          fail("POST_MERGE_INPUT", "合并后验收缺少真实 QQ 入站消息时间。");
-        freshInputTimes.push(inputTime * 1000);
+          fail("POST_MERGE_INPUT", "合并后验收缺少两端真实 QQ 入站消息时间。");
+        freshInputTimes.push(inputTime * 1000, driverTime * 1000);
       }
     }
     if (report.tasteFamily !== undefined || report.tasteLifecycle !== undefined) {

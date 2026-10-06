@@ -1179,6 +1179,27 @@ async function createPassingMemoryRejectReport(t) {
   return { ...fixture, report, input, writeReport, runIds, candidateId };
 }
 
+function historyBindingsForReport(report, { driverOffset = 0 } = {}) {
+  const bindings = new Map(
+    report.productAcceptance.cases.map((accepted) => {
+      const messageBinding = structuredClone(accepted.messageBinding);
+      messageBinding.input.driverTime = messageBinding.input.time + driverOffset;
+      messageBinding.reply.driverTime = messageBinding.reply.time + driverOffset;
+      return [accepted.caseId, messageBinding];
+    }),
+  );
+  const reads = [];
+  return {
+    reads,
+    read: async (caseRecord, config, delivery) => {
+      reads.push({ caseId: caseRecord.id, config, delivery });
+      const binding = bindings.get(caseRecord.id);
+      if (!binding) throw new Error("missing independent message fixture");
+      return structuredClone(binding);
+    },
+  };
+}
+
 async function updateTrace(fixture, runId, update) {
   const report = fixture.report ?? JSON.parse(fixture.bytes.toString("utf8"));
   const tracePath = join(report.runtime.dataDirectory, "runs", runId, "trace.jsonl");
@@ -1442,7 +1463,11 @@ test("same-Run narrowed member Tool surface requires independent count evidence"
 test("verified Memory lifecycle rechecks Owner state and all three fresh Run traces", async (t) => {
   const fixture = await createPassingMemoryLifecycleReport(t);
   const lessonsPath = join(fixture.temp, "memory-lifecycle-lessons.jsonl");
-  const recorded = await appendLesson(fixture.input, lessonsPath);
+  const history = historyBindingsForReport(fixture.report);
+  const recorded = await appendLesson(fixture.input, lessonsPath, {
+    historyBindings: history.read,
+  });
+  assert.equal(history.reads.length, 3);
   assert.equal(recorded.status, "verified");
   assert.equal(recorded.evidence.runId, fixture.runIds[2]);
   assert.deepEqual(JSON.parse(await readFile(lessonsPath, "utf8")), recorded);
@@ -1451,7 +1476,11 @@ test("verified Memory lifecycle rechecks Owner state and all three fresh Run tra
 test("verified feedback-reject lesson checks two historical Runs and rejected Owner cleanup", async (t) => {
   const fixture = await createPassingMemoryRejectReport(t);
   const lessonsPath = join(fixture.temp, "memory-reject-lessons.jsonl");
-  const recorded = await appendLesson(fixture.input, lessonsPath);
+  const history = historyBindingsForReport(fixture.report);
+  const recorded = await appendLesson(fixture.input, lessonsPath, {
+    historyBindings: history.read,
+  });
+  assert.equal(history.reads.length, 2);
   assert.equal(recorded.status, "verified");
   assert.equal(recorded.case, "memory-reject");
   assert.equal(recorded.evidence.runId, fixture.runIds[1]);
@@ -1489,14 +1518,71 @@ test("feedback-reject verified lessons reject missing metadata and a non-final s
   await assert.rejects(readFile(wrongPath, "utf8"), { code: "ENOENT" });
 });
 
+test("Memory historical lessons accept matching distinct account times", async (t) => {
+  const fixture = await createPassingMemoryRejectReport(t);
+  const report = structuredClone(fixture.report);
+  for (const caseRecord of report.cases) {
+    const accepted = report.productAcceptance.cases.find((item) => item.caseId === caseRecord.id);
+    caseRecord.inputBinding.driverTime = caseRecord.inputBinding.time - 1;
+    accepted.messageBinding.input.driverTime = accepted.messageBinding.input.time - 1;
+    accepted.messageBinding.reply.driverTime = accepted.messageBinding.reply.time - 1;
+  }
+  const input = await fixture.writeReport(report);
+  const history = historyBindingsForReport(report, { driverOffset: -1 });
+  const path = join(fixture.temp, "memory-reject-distinct-account-times.jsonl");
+  const recorded = await appendLesson(input, path, {
+    historyBindings: history.read,
+  });
+  assert.equal(history.reads.length, 2);
+  assert.equal(recorded.status, "verified");
+});
+
+test("Memory historical lesson reads reject legacy time skew and mismatched persisted driverTime", async (t) => {
+  const skewed = await createPassingMemoryRejectReport(t);
+  const skewedHistory = historyBindingsForReport(skewed.report);
+  const readSkewed = skewedHistory.read;
+  skewedHistory.read = async (...args) => {
+    const observed = await readSkewed(...args);
+    if (args[0].id === "memory-feedback") observed.input.driverTime -= 1;
+    return observed;
+  };
+  const skewedPath = join(skewed.temp, "memory-reject-legacy-time-skew.jsonl");
+  await assert.rejects(
+    appendLesson(skewed.input, skewedPath, {
+      historyBindings: skewedHistory.read,
+    }),
+    /Historical QQ message times/,
+  );
+  await assert.rejects(readFile(skewedPath, "utf8"), { code: "ENOENT" });
+
+  const mismatched = await createPassingMemoryRejectReport(t);
+  const actualHistory = historyBindingsForReport(mismatched.report);
+  const report = structuredClone(mismatched.report);
+  for (const accepted of report.productAcceptance.cases) {
+    accepted.messageBinding.input.driverTime = accepted.messageBinding.input.time + 1;
+  }
+  const input = await mismatched.writeReport(report);
+  const mismatchPath = join(mismatched.temp, "memory-reject-driver-time-mismatch.jsonl");
+  await assert.rejects(
+    appendLesson(input, mismatchPath, {
+      historyBindings: actualHistory.read,
+    }),
+    /Historical QQ message times/,
+  );
+  await assert.rejects(readFile(mismatchPath, "utf8"), { code: "ENOENT" });
+});
+
 test("feedback-reject verified lessons require fixed reject Trace and no residual state", async (t) => {
   const changedOperation = await createPassingMemoryRejectReport(t);
   await updateTrace(changedOperation, changedOperation.runIds[1], (rows) => {
     rows.find((row) => row.event.type === "tool_call").event.data.input.action = "promote";
   });
   const operationPath = join(changedOperation.temp, "memory-reject-wrong-operation.jsonl");
+  const operationHistory = historyBindingsForReport(changedOperation.report);
   await assert.rejects(
-    appendLesson(changedOperation.input, operationPath),
+    appendLesson(changedOperation.input, operationPath, {
+      historyBindings: operationHistory.read,
+    }),
     /exact leased operation and input|historical evidence did not verify/,
   );
   await assert.rejects(readFile(operationPath, "utf8"), { code: "ENOENT" });
@@ -1508,8 +1594,11 @@ test("feedback-reject verified lessons require fixed reject Trace and no residua
     .run(residual.candidateId);
   residualDb.close();
   const residualPath = join(residual.temp, "memory-reject-residual-state.jsonl");
+  const residualHistory = historyBindingsForReport(residual.report);
   await assert.rejects(
-    appendLesson(residual.input, residualPath),
+    appendLesson(residual.input, residualPath, {
+      historyBindings: residualHistory.read,
+    }),
     /historical evidence did not verify/,
   );
   await assert.rejects(readFile(residualPath, "utf8"), { code: "ENOENT" });
@@ -1725,7 +1814,11 @@ test("Memory lifecycle requires its fixed operation manifest, command input and 
   wideCase.acceptanceLease.toolsSha256 = toolManifestDigest(wideTools);
   const wideInput = await widened.writeReport(wideReport);
   const widePath = join(widened.temp, "wide-memory-lease.jsonl");
-  await assert.rejects(appendLesson(wideInput, widePath), /step evidence/);
+  const wideHistory = historyBindingsForReport(wideReport);
+  await assert.rejects(
+    appendLesson(wideInput, widePath, { historyBindings: wideHistory.read }),
+    /step evidence/,
+  );
   await assert.rejects(readFile(widePath, "utf8"), { code: "ENOENT" });
 
   const changedOperation = await createPassingMemoryLifecycleReport(t);
@@ -1733,8 +1826,11 @@ test("Memory lifecycle requires its fixed operation manifest, command input and 
     rows.find((row) => row.event.type === "tool_call").event.data.input.action = "list";
   });
   const operationPath = join(changedOperation.temp, "different-memory-operation.jsonl");
+  const operationHistory = historyBindingsForReport(changedOperation.report);
   await assert.rejects(
-    appendLesson(changedOperation.input, operationPath),
+    appendLesson(changedOperation.input, operationPath, {
+      historyBindings: operationHistory.read,
+    }),
     /exact leased operation and input/,
   );
   await assert.rejects(readFile(operationPath, "utf8"), { code: "ENOENT" });
@@ -1744,8 +1840,11 @@ test("Memory lifecycle requires its fixed operation manifest, command input and 
     rows.find((row) => row.event.type === "tool_call").event.data.input.projectId = "qqtest-other";
   });
   const inputPath = join(changedInput.temp, "different-memory-input.jsonl");
+  const inputHistory = historyBindingsForReport(changedInput.report);
   await assert.rejects(
-    appendLesson(changedInput.input, inputPath),
+    appendLesson(changedInput.input, inputPath, {
+      historyBindings: inputHistory.read,
+    }),
     /exact leased operation and input/,
   );
   await assert.rejects(readFile(inputPath, "utf8"), { code: "ENOENT" });
@@ -1767,7 +1866,11 @@ test("Memory lifecycle requires its fixed operation manifest, command input and 
     });
   const groupInput = await wrongGroup.writeReport(groupReport);
   const groupPath = join(wrongGroup.temp, "wrong-group-memory-lifecycle.jsonl");
-  await assert.rejects(appendLesson(groupInput, groupPath), /step evidence/);
+  const groupHistory = historyBindingsForReport(groupReport);
+  await assert.rejects(
+    appendLesson(groupInput, groupPath, { historyBindings: groupHistory.read }),
+    /step evidence/,
+  );
   await assert.rejects(readFile(groupPath, "utf8"), { code: "ENOENT" });
 });
 
@@ -1821,8 +1924,11 @@ test("verified Memory lifecycle rejects residual state, cross-Run handles and mi
     "utf8",
   );
   const staleTracePath = join(staleTrace.temp, "stale-trace-lessons.jsonl");
+  const staleHistory = historyBindingsForReport(staleTrace.report);
   await assert.rejects(
-    appendLesson(staleTrace.input, staleTracePath),
+    appendLesson(staleTrace.input, staleTracePath, {
+      historyBindings: staleHistory.read,
+    }),
     /Feature trace or read-only state assertions did not verify/,
   );
   await assert.rejects(readFile(staleTracePath, "utf8"), { code: "ENOENT" });

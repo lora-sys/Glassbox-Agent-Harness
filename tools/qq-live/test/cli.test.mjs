@@ -1,12 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile, readFile, rm, mkdir, stat } from "node:fs/promises";
+import { mkdtemp, writeFile, readFile, rm, mkdir, stat, open } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { world, baseConfig } from "./fixture.mjs";
 import { digest } from "../lib/core.mjs";
+import { acquireRunLock } from "../cli.mjs";
+import { verifyMemoryProcessStopped } from "../lib/memory-process.mjs";
 const cli = fileURLToPath(new URL("../cli.mjs", import.meta.url));
 
 test("lesson registration rejects execution flags before reading configuration or sending", async (t) => {
@@ -52,6 +54,163 @@ async function dir(t) {
   t.after(() => rm(d, { recursive: true, force: true }));
   return d;
 }
+test("Linux live-run lock captures identity before opening and fsyncs the complete record", async (t) => {
+  const d = await dir(t);
+  const lockPath = join(d, "account.lock");
+  const identity = {
+    pid: 123,
+    bootId: "01234567-1234-1234-1234-0123456789ab",
+    startTicks: "456",
+  };
+  const order = [];
+  const acquired = await acquireRunLock({
+    lockPath,
+    startedAt: "2026-10-06T00:00:00.000Z",
+    identityRequired: true,
+    platform: "linux",
+    pid: 999,
+    captureProcess: async () => {
+      order.push("capture");
+      await assert.rejects(stat(lockPath), { code: "ENOENT" });
+      return identity;
+    },
+    openFile: async (...args) => {
+      order.push("open");
+      const file = await open(...args);
+      return {
+        stat: () => file.stat(),
+        writeFile: (...writeArgs) => file.writeFile(...writeArgs),
+        sync: async () => {
+          order.push("file-sync");
+          return file.sync();
+        },
+        close: () => file.close(),
+      };
+    },
+    syncDirectoryFn: async () => order.push("directory-sync"),
+  });
+  assert.deepEqual(order, ["capture", "open", "file-sync", "directory-sync"]);
+  assert.deepEqual(JSON.parse(await readFile(lockPath, "utf8")), {
+    pid: identity.pid,
+    startedAt: "2026-10-06T00:00:00.000Z",
+    process: identity,
+  });
+  assert.deepEqual(acquired.processIdentity, identity);
+  await acquired.lock.close();
+});
+
+test("Linux identity capture and lock persistence failures leave no half-lock", async (t) => {
+  const d = await dir(t);
+  const lockPath = join(d, "account.lock");
+  await assert.rejects(
+    acquireRunLock({
+      lockPath,
+      identityRequired: true,
+      platform: "linux",
+      captureProcess: async () => {
+        throw Object.assign(new Error("capture failed"), { code: "MEMORY_PROCESS_BOOT" });
+      },
+    }),
+    { code: "MEMORY_PROCESS_BOOT" },
+  );
+  await assert.rejects(stat(lockPath), { code: "ENOENT" });
+
+  let closed = false;
+  await assert.rejects(
+    acquireRunLock({
+      lockPath,
+      identityRequired: true,
+      platform: "linux",
+      captureProcess: async () => ({
+        pid: 123,
+        bootId: "01234567-1234-1234-1234-0123456789ab",
+        startTicks: "456",
+      }),
+      openFile: async (...args) => {
+        const file = await open(...args);
+        return {
+          stat: () => file.stat(),
+          writeFile: (...writeArgs) => file.writeFile(...writeArgs),
+          sync: async () => {
+            throw new Error("sync failed");
+          },
+          close: async () => {
+            closed = true;
+            return file.close();
+          },
+        };
+      },
+    }),
+    { code: "RUN_LOCK_WRITE" },
+  );
+  assert.equal(closed, true);
+  await assert.rejects(stat(lockPath), { code: "ENOENT" });
+});
+
+test("nonlive cross-platform lock keeps its legacy shape without process capture", async (t) => {
+  const d = await dir(t);
+  const lockPath = join(d, "account.lock");
+  const acquired = await acquireRunLock({
+    lockPath,
+    startedAt: "2026-10-06T00:00:00.000Z",
+    identityRequired: false,
+    platform: "win32",
+    captureProcess: async () => assert.fail("nonlive lock must not capture a Linux process"),
+    syncDirectoryFn: async () => assert.fail("nonlive lock must not sync a Linux directory"),
+  });
+  assert.deepEqual(JSON.parse(await readFile(lockPath, "utf8")), {
+    pid: process.pid,
+    startedAt: "2026-10-06T00:00:00.000Z",
+  });
+  await acquired.lock.close();
+});
+
+test("Linux child-process lock records durable process identity for recovery checks", async (t) => {
+  if (process.platform !== "linux") return;
+  const d = await dir(t);
+  const lockPath = join(d, "child.lock");
+  const childScript = `
+    import { acquireRunLock } from ${JSON.stringify(new URL("../cli.mjs", import.meta.url).href)};
+    const lock = await acquireRunLock({ lockPath: ${JSON.stringify(lockPath)}, identityRequired: true });
+    console.log(JSON.stringify(lock.processIdentity));
+    process.stdin.once("data", async () => { await lock.lock.close(); process.exit(0); });
+    process.stdin.resume();
+  `;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", childScript], {
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let childExited = false;
+  child.once("exit", () => {
+    childExited = true;
+  });
+  t.after(() => {
+    if (!childExited) child.kill("SIGKILL");
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8").on("data", (chunk) => (stdout += chunk));
+  child.stderr.setEncoding("utf8").on("data", (chunk) => (stderr += chunk));
+  const ready = await new Promise((resolve, reject) => {
+    child.stdout.once("data", (chunk) => resolve(String(chunk).trim()));
+    child.once("error", reject);
+    child.once("exit", (code) =>
+      reject(new Error(`child exited before lock ready: ${code} ${stderr}`)),
+    );
+  });
+  const identity = JSON.parse(ready);
+  const stored = JSON.parse(await readFile(lockPath, "utf8"));
+  assert.equal(stored.pid, child.pid);
+  assert.deepEqual(stored.process, identity);
+  await assert.rejects(verifyMemoryProcessStopped(identity), { code: "MEMORY_PROCESS_RUNNING" });
+  child.stdin.end("stop");
+  const exitCode = await new Promise((resolve) => child.once("exit", resolve));
+  assert.equal(exitCode, 0);
+  assert.deepEqual(await verifyMemoryProcessStopped(identity), {
+    stopped: true,
+    reason: "process_absent",
+    identity,
+  });
+});
 test("delivery commands reject missing inputs and implicit merge before network access", async (t) => {
   const d = await dir(t);
   const configPath = join(d, "config.json");

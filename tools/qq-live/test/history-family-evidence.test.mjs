@@ -70,6 +70,7 @@ function buildCase(spec, token, runId, index) {
     botMessageId: String(-200 - index),
     realSequence: String(300 + index),
     time: times[index],
+    driverTime: times[index],
     textSha256: digest(prompt),
   };
   const reply = {
@@ -152,6 +153,7 @@ function buildCase(spec, token, runId, index) {
       input: {
         realSequence: binding.realSequence,
         time: binding.time,
+        driverTime: binding.driverTime,
         textSha256: binding.textSha256,
       },
       reply: {
@@ -159,6 +161,7 @@ function buildCase(spec, token, runId, index) {
         driverMessageId: reply.messageId,
         realSequence: reply.realSequence,
         time: reply.time,
+        driverTime: reply.time,
         textSha256: reply.textSha256,
       },
     },
@@ -234,6 +237,9 @@ test("rejects missing, reordered, duplicated, or altered seed family assertions"
     (f) => (f.fresh.cases[1].runId = runIds[0]),
     (f) => (f.fresh.cases[1].scope.chatType = "group"),
     (f) => (f.fresh.cases[0].feature.status = "FAIL"),
+    (f) =>
+      (f.fresh.cases[0].messageBinding.reply.driverTime =
+        f.fresh.cases[0].messageBinding.input.driverTime - 1),
     (f) => delete f.fresh.cases[0].messageBinding.reply.botMessageId,
     (f) => (f.fresh.cases[0].messageBinding.reply.botMessageId = "not-an-id"),
     (f) => (f.fresh.cases[0].messageBinding.reply.botMessageId = "-999"),

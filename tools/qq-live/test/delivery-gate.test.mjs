@@ -369,14 +369,24 @@ test("post-merge review receipt stays bound to the candidate while product evide
         traceVerified: true,
         feature: { status: "PASS" },
         runCreatedAt: mergedAt,
-        messageBinding: { input: { time: Date.parse(mergedAt) / 1000 + 10 } },
+        messageBinding: {
+          input: {
+            time: Date.parse(mergedAt) / 1000 + 10,
+            driverTime: Date.parse(mergedAt) / 1000 + 10,
+          },
+        },
       },
       {
         caseId: "baseline-test",
         runId: "run-test-2",
         traceVerified: true,
         runCreatedAt: mergedAt,
-        messageBinding: { input: { time: Date.parse(mergedAt) / 1000 + 10 } },
+        messageBinding: {
+          input: {
+            time: Date.parse(mergedAt) / 1000 + 10,
+            driverTime: Date.parse(mergedAt) / 1000 + 10,
+          },
+        },
       },
     ],
   });

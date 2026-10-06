@@ -229,6 +229,7 @@ async function archivedFixture(t, family) {
       input: {
         realSequence: String(100 + index),
         time,
+        driverTime: time,
         textSha256: hash(prompt),
       },
       reply: {
@@ -236,6 +237,7 @@ async function archivedFixture(t, family) {
         driverMessageId: driverReplyId,
         realSequence: String(200 + index),
         time: time + 1,
+        driverTime: time + 1,
         textSha256: replyHash,
       },
     };
@@ -252,6 +254,7 @@ async function archivedFixture(t, family) {
         driverMessageId: driverInputId,
         realSequence: String(100 + index),
         time,
+        driverTime: time,
         textSha256: hash(prompt),
       },
       featureAssertions: assertions,

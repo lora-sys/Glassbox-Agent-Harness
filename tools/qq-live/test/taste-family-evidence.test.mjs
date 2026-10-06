@@ -48,6 +48,7 @@ function fixture() {
       botMessageId: String(20 + index),
       realSequence: String(100 + index),
       time: 1000 + index,
+      driverTime: 1000 + index,
       textSha256: digest(prompt),
     };
     return {
@@ -162,12 +163,18 @@ function fixture() {
           ]),
         },
         messageBinding: {
-          input: c.inputBinding,
+          input: {
+            realSequence: c.inputBinding.realSequence,
+            time: c.inputBinding.time,
+            driverTime: c.inputBinding.driverTime,
+            textSha256: c.inputBinding.textSha256,
+          },
           reply: {
             botMessageId: String(Number(c.inputBinding.botMessageId) + 10),
             driverMessageId: c.replies[0].messageId,
             realSequence: String(Number(c.inputBinding.realSequence) + 10),
             time: c.inputBinding.time + 10,
+            driverTime: c.inputBinding.driverTime + 10,
             textSha256: c.replies[0].textSha256,
           },
         },
@@ -223,11 +230,13 @@ test("Taste family verifier rejects Run reuse and a changed final database read"
   );
 });
 
-test("Taste family verifier binds distinct reply identities and rechecks Runtime after the final read", async () => {
+test("Taste family verifier enforces both account timelines and binds distinct reply identities", async () => {
   for (const mutate of [
     (reply) => (reply.driverMessageId = "999"),
     (reply) => (reply.realSequence = "not-a-sequence"),
     (reply) => (reply.time = -1),
+    (reply, input) => (reply.driverTime = input.driverTime - 1),
+    (reply, input) => (reply.time = input.time - 1),
   ]) {
     const f = fixture();
     await assert.rejects(
@@ -235,7 +244,7 @@ test("Taste family verifier binds distinct reply identities and rechecks Runtime
         config,
         verifyProduct: async ({ cases }) => {
           const proof = await f.verifyProduct({ cases });
-          mutate(proof.cases[0].messageBinding.reply);
+          mutate(proof.cases[0].messageBinding.reply, proof.cases[0].messageBinding.input);
           return proof;
         },
         readFixture: async () => f.finalObservation,

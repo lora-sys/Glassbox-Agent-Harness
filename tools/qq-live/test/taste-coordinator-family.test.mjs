@@ -34,6 +34,7 @@ function makeExecution(stage, spec, index) {
     botMessageId: String(20 + index),
     realSequence: String(100 + index),
     time: 1000 + index,
+    driverTime: 1000 + index,
     textSha256: digest(prompt),
   };
   const reply = {
@@ -83,6 +84,7 @@ function makeExecution(stage, spec, index) {
     driverMessageId: reply.messageId,
     realSequence: String(110 + index),
     time: 1010 + index,
+    driverTime: 1010 + index,
     textSha256: reply.textSha256,
   };
   const productAcceptance = {
@@ -96,7 +98,15 @@ function makeExecution(stage, spec, index) {
         cleanupVerified: true,
         feature: { status: "PASS", runId },
         scope,
-        messageBinding: { input, reply: replyBinding },
+        messageBinding: {
+          input: {
+            realSequence: input.realSequence,
+            time: input.time,
+            driverTime: input.driverTime,
+            textSha256: input.textSha256,
+          },
+          reply: replyBinding,
+        },
         delivery: {
           status: "sent",
           external_id: replyBinding.botMessageId,

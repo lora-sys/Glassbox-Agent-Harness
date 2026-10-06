@@ -3,7 +3,14 @@ import { tasteFixtureStep } from "./taste-scenario.mjs";
 import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
 import { caseEvidence } from "./product-evidence.mjs";
-import { boundMessage, compareSameMessage } from "./message-binding.mjs";
+import {
+  boundMessage,
+  compareSameMessage,
+  messageReplyTimesFollowInput,
+  messageTimeBindingKeys,
+  messageTimesMatch,
+  validMessageTimeBinding,
+} from "./message-binding.mjs";
 
 const HASH = /^[a-f0-9]{64}$/;
 const ID = /^[A-Za-z0-9_-]{1,128}$/;
@@ -14,6 +21,15 @@ function invalid() {
   error.code = "TASTE_FAILURE_CLEANUP";
   error.status = "INCONCLUSIVE";
   throw error;
+}
+
+function exactKeys(value, expected) {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...expected].sort())
+  );
 }
 
 /** Independently bind a replied Taste mismatch to its real Run, tool result, and lease audit. */
@@ -65,11 +81,21 @@ export async function verifyTasteKnownReplyFailure(
     JSON.stringify(caseRecord.leasedToolNames) !== JSON.stringify(tools.map((tool) => tool.name)) ||
     caseRecord.acceptanceLease?.toolsSha256 !== toolManifestDigest(tools) ||
     !binding ||
+    !exactKeys(
+      binding,
+      messageTimeBindingKeys(binding, [
+        "driverMessageId",
+        "botMessageId",
+        "realSequence",
+        "time",
+        "textSha256",
+      ]),
+    ) ||
     !MESSAGE_ID.test(String(binding.driverMessageId ?? "")) ||
     !MESSAGE_ID.test(String(binding.botMessageId ?? "")) ||
     String(binding.driverMessageId) !== String(caseRecord.sentMessageId) ||
     !/^\d{1,30}$/.test(String(binding.realSequence ?? "")) ||
-    !Number.isSafeInteger(binding.time) ||
+    !validMessageTimeBinding(binding) ||
     !HASH.test(binding.textSha256 ?? "") ||
     reply?.route !== "private" ||
     reply.matches !== false ||
@@ -102,6 +128,7 @@ export async function verifyTasteKnownReplyFailure(
   try {
     const evidence = caseEvidence(db, caseRecord, config);
     const message = await bindTasteMismatchMessages(caseRecord, config, clients, evidence.delivery);
+    if (!messageTimesMatch(binding, message.input)) invalid();
     messageBinding = message;
   } finally {
     db.close();
@@ -191,6 +218,7 @@ async function bindTasteMismatchMessages(caseRecord, config, clients, delivery) 
     textSha256: reply.textSha256,
   });
   const replyMatch = compareSameMessage(replyBot, replyDriver);
+  if (!messageReplyTimesFollowInput(inputMatch, replyMatch)) invalid();
   if (
     String(delivery.external_id) !== String(replyBot.messageId) ||
     String(reply.messageId) !== String(replyDriver.messageId) ||

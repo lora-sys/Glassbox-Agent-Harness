@@ -47,7 +47,9 @@ function fixture() {
         caseId: "postmerge-smoke",
         runId: "fresh-merged-run",
         runCreatedAt: "2026-10-06T10:01:00.000Z",
-        messageBinding: { input: { time: mergedAtUnixSeconds + 1 } },
+        messageBinding: {
+          input: { time: mergedAtUnixSeconds + 1, driverTime: mergedAtUnixSeconds + 1 },
+        },
         traceVerified: true,
       },
     ],
@@ -89,6 +91,7 @@ test("post-merge gate accepts a fresh Run on the merged commit after GitHub merg
   assert.equal(remote.mergeCommit, input.commit);
   assert.ok(Date.parse(fresh.cases[0].runCreatedAt) > Date.parse(remote.mergedAt));
   assert.ok(fresh.cases[0].messageBinding.input.time * 1000 > Date.parse(remote.mergedAt));
+  assert.ok(fresh.cases[0].messageBinding.input.driverTime * 1000 > Date.parse(remote.mergedAt));
 
   const result = await evaluateDeliveryGate(input, dependencies);
   assert.equal(result.status, "PASS");
@@ -124,6 +127,13 @@ test("post-merge gate rejects stale reports, Run times, merge metadata, reviews 
       name: "input message arrived before merge although SQL Run is newer",
       mutate({ fresh }) {
         fresh.cases[0].messageBinding.input.time = mergedAtUnixSeconds;
+      },
+      code: "POST_MERGE_INPUT",
+    },
+    {
+      name: "driver-side input message arrived before merge although Bot time is newer",
+      mutate({ fresh }) {
+        fresh.cases[0].messageBinding.input.driverTime = mergedAtUnixSeconds;
       },
       code: "POST_MERGE_INPUT",
     },

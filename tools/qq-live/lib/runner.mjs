@@ -248,7 +248,7 @@ async function bindInput(config, clients, c) {
       textSha256: candidate.textSha256,
     }),
   ]);
-  const same = compareSameMessage(driverMessage, botMessage);
+  const same = compareSameMessage(botMessage, driverMessage);
   c.inputBinding = {
     driverMessageId: driverMessage.messageId,
     botMessageId: botMessage.messageId,

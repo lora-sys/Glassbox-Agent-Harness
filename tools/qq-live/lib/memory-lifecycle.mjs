@@ -1,4 +1,10 @@
 import { fail, safeError } from "./core.mjs";
+import {
+  messageReplyTimesFollowInput,
+  messageTimeBindingKeys,
+  messageTimesMatch,
+  validMessageTimeBinding,
+} from "./message-binding.mjs";
 import { memoryFixtureProject, memoryFixtureStep } from "./memory-scenario.mjs";
 import { MEMORY_FAMILY_ID, memoryWorkflow } from "./memory-workflow.mjs";
 
@@ -6,6 +12,15 @@ const ID = /^[A-Za-z0-9_-]{1,128}$/;
 const CANDIDATE_ID = /^candidate_[a-f0-9]{32}$/;
 const MEMORY_ID = /^memory_[a-f0-9]{32}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
+
+function exactKeys(value, expected) {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...expected].sort())
+  );
+}
 
 function clone(value) {
   return structuredClone(value);
@@ -20,10 +35,20 @@ function validAcceptance(result, expectedCaseId) {
     c.status !== "PASS" ||
     c.leaseRevoked !== true ||
     !c.inputBinding ||
+    !exactKeys(
+      c.inputBinding,
+      messageTimeBindingKeys(c.inputBinding, [
+        "driverMessageId",
+        "botMessageId",
+        "realSequence",
+        "time",
+        "textSha256",
+      ]),
+    ) ||
     !ID.test(String(c.inputBinding.driverMessageId ?? "")) ||
     !ID.test(String(c.inputBinding.botMessageId ?? "")) ||
     !/^\d{1,30}$/.test(String(c.inputBinding.realSequence ?? "")) ||
-    !Number.isSafeInteger(c.inputBinding.time) ||
+    !validMessageTimeBinding(c.inputBinding) ||
     !SHA256.test(c.inputBinding.textSha256 ?? "") ||
     acceptance?.status !== "PASS" ||
     !acceptance.runtime ||
@@ -38,6 +63,7 @@ function validAcceptance(result, expectedCaseId) {
   )
     return null;
   const evidence = acceptance.cases[0];
+  const reply = evidence?.messageBinding?.reply;
   if (
     evidence?.caseId !== expectedCaseId ||
     !ID.test(String(evidence.runId ?? "")) ||
@@ -47,9 +73,28 @@ function validAcceptance(result, expectedCaseId) {
     evidence.scope?.chatType !== "private" ||
     !ID.test(String(evidence.scope?.chatId ?? "")) ||
     !evidence.messageBinding?.input ||
+    !exactKeys(
+      evidence.messageBinding.input,
+      messageTimeBindingKeys(evidence.messageBinding.input, ["realSequence", "time", "textSha256"]),
+    ) ||
+    !Object.hasOwn(evidence.messageBinding.input, "driverTime") ||
+    !validMessageTimeBinding(evidence.messageBinding.input) ||
     String(evidence.messageBinding.input.realSequence) !== String(c.inputBinding.realSequence) ||
-    evidence.messageBinding.input.time !== c.inputBinding.time ||
-    evidence.messageBinding.input.textSha256 !== c.inputBinding.textSha256
+    !messageTimesMatch(c.inputBinding, evidence.messageBinding.input) ||
+    evidence.messageBinding.input.textSha256 !== c.inputBinding.textSha256 ||
+    !exactKeys(
+      reply,
+      messageTimeBindingKeys(reply, [
+        "botMessageId",
+        "driverMessageId",
+        "realSequence",
+        "time",
+        "textSha256",
+      ]),
+    ) ||
+    !Object.hasOwn(reply, "driverTime") ||
+    !validMessageTimeBinding(reply) ||
+    !messageReplyTimesFollowInput(evidence.messageBinding.input, reply)
   )
     return null;
   return { transportCase: c, acceptance, evidence, runId: evidence.runId };

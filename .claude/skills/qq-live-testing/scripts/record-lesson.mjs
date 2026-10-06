@@ -147,8 +147,61 @@ function passingBinding(value) {
     typeof value === "object" &&
     /^\d{1,30}$/.test(String(value.realSequence ?? "")) &&
     Number.isSafeInteger(value.time) &&
+    (!Object.hasOwn(value, "driverTime") ||
+      (Number.isSafeInteger(value.driverTime) && value.driverTime > 0)) &&
     /^[a-f0-9]{64}$/i.test(value.textSha256 ?? "")
   );
+}
+
+function historicalTimeBindingMatches(recorded, observed) {
+  if (
+    !passingBinding(recorded) ||
+    !passingBinding(observed) ||
+    recorded.time !== observed.time ||
+    String(recorded.realSequence) !== String(observed.realSequence) ||
+    recorded.textSha256 !== observed.textSha256
+  )
+    return false;
+  if (Object.hasOwn(recorded, "driverTime")) return recorded.driverTime === observed.driverTime;
+  return observed.time === observed.driverTime;
+}
+
+async function readHistoricalMessageBinding(
+  historyBindings,
+  report,
+  evidence,
+  caseRecord,
+  accepted,
+) {
+  if (typeof historyBindings !== "function")
+    invalid("Verified Memory lessons require independent read-only QQ message evidence");
+  const config = {
+    runtime: {
+      checkout: evidence.checkout,
+      dataDirectory: evidence.dataDirectory,
+      expectedCommit: report.runtime.commit,
+      connectionId: report.runtime.connectionId,
+      threadId: report.runtime.threadId ?? null,
+    },
+    bot: { qq: accepted.scope?.botId },
+    driver: { qq: accepted.scope?.senderId },
+  };
+  let observed;
+  try {
+    observed = await historyBindings(caseRecord, config, accepted.delivery);
+  } catch {
+    invalid("Independent read-only QQ message evidence did not verify");
+  }
+  if (
+    !observed ||
+    !historicalTimeBindingMatches(caseRecord.inputBinding, observed.input) ||
+    !historicalTimeBindingMatches(accepted.messageBinding?.input, observed.input) ||
+    !historicalTimeBindingMatches(accepted.messageBinding?.reply, observed.reply) ||
+    observed.reply.time < observed.input.time ||
+    observed.reply.driverTime < observed.input.driverTime
+  )
+    invalid("Historical QQ message times do not match independent account reads");
+  return observed;
 }
 
 function hasMarkedMemoryMutationPrompt(caseRecord) {
@@ -580,7 +633,13 @@ export function verifyFeatureReport(report, lesson, evidence, capture = execFile
   return events;
 }
 
-export function verifyMemoryLifecycleReport(report, lesson, evidence, capture = execFileSync) {
+export async function verifyMemoryLifecycleReport(
+  report,
+  lesson,
+  evidence,
+  capture = execFileSync,
+  historyBindings,
+) {
   const lifecycle = report.memoryLifecycle;
   const handles = lifecycle?.handles;
   const stages = [
@@ -712,6 +771,13 @@ export function verifyMemoryLifecycleReport(report, lesson, evidence, capture = 
       JSON.stringify(spec.featureAssertions).replaceAll("{{nonce}}", caseRecord?.token ?? ""),
     );
     const expectedToolInput = spec.leaseTools[0].operations[0].inputConstraint;
+    const observedMessageBinding = await readHistoricalMessageBinding(
+      historyBindings,
+      report,
+      evidence,
+      caseRecord,
+      accepted,
+    );
     if (
       !hasExactKeys(step, ["stage", "currentRunId", "runId", "productAcceptance"]) ||
       step.stage !== expected.stage ||
@@ -763,7 +829,10 @@ export function verifyMemoryLifecycleReport(report, lesson, evidence, capture = 
       caseRecord.inputBinding.textSha256 !== accepted.messageBinding.input.textSha256 ||
       caseRecord.inputBinding.realSequence !== accepted.messageBinding.input.realSequence ||
       caseRecord.inputBinding.time !== accepted.messageBinding.input.time ||
-      caseRecord.inputBinding.textSha256 !== accepted.messageBinding.input.textSha256
+      caseRecord.inputBinding.textSha256 !== accepted.messageBinding.input.textSha256 ||
+      !historicalTimeBindingMatches(caseRecord.inputBinding, observedMessageBinding.input) ||
+      !historicalTimeBindingMatches(accepted.messageBinding.input, observedMessageBinding.input) ||
+      !historicalTimeBindingMatches(accepted.messageBinding.reply, observedMessageBinding.reply)
     )
       invalid("Memory lifecycle step evidence does not match its Run and scope");
 
@@ -798,7 +867,13 @@ export function verifyMemoryLifecycleReport(report, lesson, evidence, capture = 
   }
 }
 
-export async function verifyMemoryRejectReport(report, lesson, evidence, capture = execFileSync) {
+export async function verifyMemoryRejectReport(
+  report,
+  lesson,
+  evidence,
+  capture = execFileSync,
+  historyBindings,
+) {
   if (
     lesson.case !== "memory-reject" ||
     report?.memoryFamily?.caseId !== MEMORY_REJECT_FAMILY_ID ||
@@ -822,6 +897,13 @@ export async function verifyMemoryRejectReport(report, lesson, evidence, capture
             accepted.decisions.some((item) => item?.decision !== "ALLOW")
           )
             invalid("Reject-family product or authorization evidence is incomplete");
+          const observedMessageBinding = await readHistoricalMessageBinding(
+            historyBindings,
+            source,
+            evidence,
+            caseRecord,
+            accepted,
+          );
           const stageEvidence = {
             ...evidence,
             runId: accepted.runId,
@@ -873,7 +955,7 @@ export async function verifyMemoryRejectReport(report, lesson, evidence, capture
             scope: accepted.scope,
             delivery: accepted.delivery,
             traceVerified: accepted.traceVerified,
-            messageBinding: accepted.messageBinding,
+            messageBinding: observedMessageBinding,
             feature: accepted.feature,
           });
         }
@@ -899,7 +981,9 @@ export async function verifyMemoryRejectReport(report, lesson, evidence, capture
   } catch (error) {
     if (
       error.message.startsWith("Verified reject lessons") ||
-      error.message.startsWith("Reject-family")
+      error.message.startsWith("Reject-family") ||
+      error.message.startsWith("Independent read-only QQ") ||
+      error.message.startsWith("Historical QQ message times")
     )
       throw error;
     invalid("Read-only reject-family historical evidence did not verify");
@@ -990,14 +1074,14 @@ export async function appendLesson(
     if (!archivedHistory) {
       if (requiresMemoryLifecycleVerification(report, traceEvents, evidence.runId)) {
         if (report.memoryFamily?.caseId === MEMORY_REJECT_FAMILY_ID)
-          await verifyMemoryRejectReport(report, lesson, evidence, capture);
+          await verifyMemoryRejectReport(report, lesson, evidence, capture, historyBindings);
         else {
           if (
             Object.hasOwn(report, "memoryFamily") &&
             report.memoryFamily?.caseId !== MEMORY_FAMILY_ID
           )
             invalid("Unknown Memory family cannot produce a verified lesson");
-          verifyMemoryLifecycleReport(report, lesson, evidence, capture);
+          await verifyMemoryLifecycleReport(report, lesson, evidence, capture, historyBindings);
         }
       } else {
         const caseRecord = report.cases.find((item) => item.id === lesson.case);

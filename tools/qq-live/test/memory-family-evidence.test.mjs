@@ -51,6 +51,7 @@ function expectedCase(stage, index, stageRunIds = runIds) {
     botMessageId: String(20001 + index),
     realSequence: String(30001 + index),
     time: 1_800_000_000 + index,
+    driverTime: 1_800_000_000 + index,
     textSha256: digest(prompt),
   };
   const caseReport = {
@@ -97,6 +98,7 @@ function expectedCase(stage, index, stageRunIds = runIds) {
       input: {
         realSequence: binding.realSequence,
         time: binding.time,
+        driverTime: binding.driverTime,
         textSha256: binding.textSha256,
       },
       reply: {
@@ -104,6 +106,7 @@ function expectedCase(stage, index, stageRunIds = runIds) {
         driverMessageId: String(40001 + index),
         realSequence: String(60001 + index),
         time: 1_800_000_010 + index,
+        driverTime: 1_800_000_010 + index,
         textSha256: replyTextSha256,
       },
     },
@@ -302,6 +305,9 @@ test("rejects wrong private scope, delivery destination, and input binding", asy
     (f) => (f.product.cases[0].scope.connectionId = "other_connection"),
     (f) => (f.product.cases[1].delivery.destination_scope_key = "[]"),
     (f) => (f.product.cases[2].messageBinding.input.textSha256 = "f".repeat(64)),
+    (f) =>
+      (f.product.cases[0].messageBinding.reply.driverTime =
+        f.product.cases[0].messageBinding.input.driverTime - 1),
   ]) {
     const f = fixture();
     mutate(f);

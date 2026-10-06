@@ -35,6 +35,7 @@ function accepted(stage, spec, index, options) {
     botMessageId: String(41001 + index),
     realSequence: String(51001 + index),
     time: bindingTime,
+    driverTime: bindingTime,
     textSha256: digest(prompt),
   };
   const productRuntime = structuredClone(options.runtimes[index]);
@@ -53,7 +54,16 @@ function accepted(stage, spec, index, options) {
       input: {
         realSequence: binding.realSequence,
         time: binding.time,
+        driverTime: binding.driverTime,
         textSha256: binding.textSha256,
+      },
+      reply: {
+        botMessageId: String(51001 + index),
+        driverMessageId: String(61001 + index),
+        realSequence: String(71001 + index),
+        time: binding.time,
+        driverTime: binding.time,
+        textSha256: digest(`reply-${index}`),
       },
     },
     traceVerified: true,
@@ -239,6 +249,13 @@ test("rejects missing source evidence, wrong manifest, assertion, scope, or feat
     [
       "failed feature",
       (_stage, result) => (result.productAcceptance.cases[0].feature.status = "FAIL"),
+    ],
+    [
+      "Owner reply predates Owner input",
+      (_stage, result) => {
+        const evidence = result.productAcceptance.cases[0];
+        evidence.messageBinding.reply.driverTime = evidence.messageBinding.input.driverTime - 1;
+      },
     ],
   ];
   for (const [name, mutate] of cases)

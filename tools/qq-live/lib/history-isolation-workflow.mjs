@@ -1,6 +1,12 @@
 import { randomBytes } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { fail, digest, toolManifestDigest } from "./core.mjs";
+import {
+  messageReplyTimesFollowInput,
+  messageTimeBindingKeys,
+  messageTimesMatch,
+  validMessageTimeBinding,
+} from "./message-binding.mjs";
 import { historyExclusionSpec, historyIsolationSeedSpec } from "./history-isolation-scenario.mjs";
 
 export const HISTORY_ISOLATION_FAMILY_ID = "history-cross-group-isolation";
@@ -127,13 +133,16 @@ function verifyStep(result, spec, config, previous, sentinel) {
     lease.toolsSha256 !== toolManifestDigest(resolved(spec.leaseTools)) ||
     !Array.isArray(c.anomalies) ||
     c.anomalies.length !== 0 ||
-    !exactKeys(binding, [
-      "driverMessageId",
-      "botMessageId",
-      "realSequence",
-      "time",
-      "textSha256",
-    ]) ||
+    !exactKeys(
+      binding,
+      messageTimeBindingKeys(binding, [
+        "driverMessageId",
+        "botMessageId",
+        "realSequence",
+        "time",
+        "textSha256",
+      ]),
+    ) ||
     typeof driverMessageId !== "string" ||
     !MESSAGE_ID.test(driverMessageId) ||
     typeof botMessageId !== "string" ||
@@ -142,8 +151,7 @@ function verifyStep(result, spec, config, previous, sentinel) {
     c.sentMessageId !== driverMessageId ||
     typeof binding.realSequence !== "string" ||
     !/^\d{1,30}$/.test(binding.realSequence) ||
-    !Number.isSafeInteger(binding.time) ||
-    binding.time <= 0 ||
+    !validMessageTimeBinding(binding) ||
     typeof binding.textSha256 !== "string" ||
     binding.textSha256 !== digest(prompt) ||
     (spec.chat === "B" && !prompt.includes(sentinel)) ||
@@ -171,16 +179,21 @@ function verifyStep(result, spec, config, previous, sentinel) {
     typeof e.delivery.external_id !== "string" ||
     !MESSAGE_ID.test(e.delivery.external_id) ||
     !exactKeys(e.messageBinding, ["input", "reply"]) ||
-    !isDeepStrictEqual(e.messageBinding.input, {
-      realSequence: binding.realSequence,
-      time: binding.time,
-      textSha256: binding.textSha256,
-    }) ||
+    !exactKeys(
+      e.messageBinding.input,
+      messageTimeBindingKeys(e.messageBinding.input, ["realSequence", "time", "textSha256"]),
+    ) ||
+    !validMessageTimeBinding(e.messageBinding.input) ||
+    !Object.hasOwn(e.messageBinding.input, "driverTime") ||
+    String(e.messageBinding.input.realSequence) !== String(binding.realSequence) ||
+    !messageTimesMatch(binding, e.messageBinding.input) ||
+    e.messageBinding.input.textSha256 !== binding.textSha256 ||
     !exactKeys(e.messageBinding.reply, [
       "botMessageId",
       "driverMessageId",
       "realSequence",
       "time",
+      "driverTime",
       "textSha256",
     ]) ||
     typeof e.messageBinding.reply.botMessageId !== "string" ||
@@ -189,7 +202,8 @@ function verifyStep(result, spec, config, previous, sentinel) {
     !MESSAGE_ID.test(e.messageBinding.reply.driverMessageId) ||
     typeof e.messageBinding.reply.realSequence !== "string" ||
     !/^\d{1,30}$/.test(e.messageBinding.reply.realSequence) ||
-    !Number.isSafeInteger(e.messageBinding.reply.time) ||
+    !validMessageTimeBinding(e.messageBinding.reply) ||
+    !messageReplyTimesFollowInput(e.messageBinding.input, e.messageBinding.reply) ||
     typeof e.messageBinding.reply.textSha256 !== "string" ||
     !HASH.test(e.messageBinding.reply.textSha256) ||
     e.messageBinding.reply.botMessageId !== String(e.delivery.external_id) ||

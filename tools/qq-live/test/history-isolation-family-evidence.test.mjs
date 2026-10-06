@@ -88,6 +88,7 @@ function buildCase(spec, token, runId, index, isSeed) {
     botMessageId: String(-200 - index),
     realSequence: String(300 + index),
     time: times[index],
+    driverTime: times[index],
     textSha256: digest(prompt),
   };
   const reply = {
@@ -170,6 +171,7 @@ function buildCase(spec, token, runId, index, isSeed) {
       input: {
         realSequence: inputBinding.realSequence,
         time: inputBinding.time,
+        driverTime: inputBinding.driverTime,
         textSha256: inputBinding.textSha256,
       },
       reply: {
@@ -177,6 +179,7 @@ function buildCase(spec, token, runId, index, isSeed) {
         driverMessageId: reply.messageId,
         realSequence: reply.realSequence,
         time: reply.time,
+        driverTime: reply.time,
         textSha256: reply.textSha256,
       },
     },
@@ -270,6 +273,9 @@ test("requires fresh source, exclusion, Owner scopes, ordered QQ inputs and shar
     (f) => (f.fresh.cases[1].scope.chatType = "group"),
     (f) => (f.fresh.cases[1].runId = runIds[0]),
     (f) => (f.fresh.cases[1].messageBinding.input.time = times[0]),
+    (f) =>
+      (f.fresh.cases[0].messageBinding.reply.driverTime =
+        f.fresh.cases[0].messageBinding.input.driverTime - 1),
     (f) => (f.fresh.runtime.commit = "e".repeat(40)),
     (f) => (f.report.runtime.commit = "e".repeat(40)),
   ];

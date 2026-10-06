@@ -3,7 +3,14 @@ import { execFileSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { resolve, join } from "node:path";
 import { fail, digest, toolManifestDigest } from "./core.mjs";
-import { boundMessage, compareSameMessage } from "./message-binding.mjs";
+import {
+  boundMessage,
+  compareSameMessage,
+  messageReplyTimesFollowInput,
+  messageTimeBindingKeys,
+  messageTimesMatch,
+  validMessageTimeBinding,
+} from "./message-binding.mjs";
 import { observeFeature, validateFeatureAssertions } from "./feature-observer.mjs";
 import { verifyGroupInfoEvidence } from "./group-info-evidence.mjs";
 import { verifyGroupFilesEvidence } from "./group-files-evidence.mjs";
@@ -25,6 +32,15 @@ const TASTE_ASSERTION_FAILURES = new Set([
   "TASTE_FIXTURE_NEGATIVE",
   "TASTE_FIXTURE_CLEANUP",
 ]);
+
+function exactKeys(value, expected) {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...expected].sort())
+  );
+}
 
 export function runtimeSnapshot(runtime, capture = execFileSync) {
   return serviceSnapshot(runtime, capture, true);
@@ -230,12 +246,22 @@ export function caseEvidence(db, c, config) {
   const binding = c.inputBinding;
   if (
     !binding ||
+    !exactKeys(
+      binding,
+      messageTimeBindingKeys(binding, [
+        "driverMessageId",
+        "botMessageId",
+        "realSequence",
+        "time",
+        "textSha256",
+      ]),
+    ) ||
     !validIdentifier(binding.botMessageId) ||
     !validIdentifier(binding.driverMessageId) ||
     String(binding.driverMessageId) !== String(c.sentMessageId) ||
     typeof binding.realSequence !== "string" ||
     !/^\d{1,30}$/.test(binding.realSequence) ||
-    !Number.isSafeInteger(binding.time) ||
+    !validMessageTimeBinding(binding) ||
     !/^[a-f0-9]{64}$/.test(binding.textSha256 ?? "")
   )
     fail("INPUT_BINDING", "没有完整的跨账号输入消息绑定。", "INCONCLUSIVE");
@@ -425,7 +451,7 @@ export function verifyTransportOnlyLeaseTraceEvidence(events, caseRecord, runId)
 function sameMessageBinding(binding, evidence) {
   if (
     String(binding.realSequence) !== String(evidence.realSequence) ||
-    binding.time !== evidence.time ||
+    !messageTimesMatch(binding, evidence) ||
     binding.textSha256 !== evidence.textSha256
   )
     fail("MESSAGE_BINDING_MISMATCH", "QQ 两端的消息证据与本轮观察不一致。", "INCONCLUSIVE");
@@ -507,6 +533,8 @@ export async function verifyMessageBindings(c, config, clients, delivery) {
   )
     fail("OBSERVATION_CHANGED", "产品证据查询期间收到新的匹配回复。", "INCONCLUSIVE");
   const replyMatch = compareSameMessage(replyBot, replyDriver);
+  if (!messageReplyTimesFollowInput(inputMatch, replyMatch))
+    fail("MESSAGE_BINDING_MISMATCH", "QQ 两端回复时间早于各自入站消息。", "INCONCLUSIVE");
   return {
     input: inputMatch,
     reply: {

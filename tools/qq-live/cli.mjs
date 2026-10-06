@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { readFile, writeFile, mkdir, open, rm } from "node:fs/promises";
+import { readFile, writeFile, mkdir, open, rm, lstat } from "node:fs/promises";
 import { appendFileSync } from "node:fs";
 import { dirname, resolve, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -191,6 +191,68 @@ async function syncDirectory(path) {
     await directory.sync();
   } finally {
     await directory.close();
+  }
+}
+export async function acquireRunLock({
+  lockPath,
+  startedAt = new Date().toISOString(),
+  identityRequired = false,
+  platform = process.platform,
+  pid = process.pid,
+  captureProcess = async () => {
+    const { captureMemoryProcess } = await import("./lib/memory-process.mjs");
+    return captureMemoryProcess();
+  },
+  openFile = open,
+  syncDirectoryFn = syncDirectory,
+} = {}) {
+  const processIdentity = identityRequired && platform === "linux" ? await captureProcess() : null;
+  let lock;
+  let created = false;
+  let lockStat;
+  try {
+    lock = await openFile(lockPath, "wx", 0o600);
+    created = true;
+    lockStat = await lock.stat();
+    await lock.writeFile(
+      JSON.stringify({
+        pid: processIdentity?.pid ?? pid,
+        startedAt,
+        ...(processIdentity ? { process: processIdentity } : {}),
+      }),
+    );
+    await lock.sync();
+    if (identityRequired && platform === "linux") await syncDirectoryFn(dirname(lockPath));
+    return { lock, lockStat, processIdentity, startedAt };
+  } catch (error) {
+    if (lock) {
+      try {
+        await lock.close();
+      } catch {
+        // Keep the failure closed; the lock path is removed only if it is ours.
+      }
+    }
+    if (created && lockStat) {
+      try {
+        const current = await lstat(lockPath);
+        if (current.dev === lockStat.dev && current.ino === lockStat.ino) {
+          await rm(lockPath);
+          await syncDirectoryFn(dirname(lockPath));
+        }
+      } catch {
+        // A cleanup failure leaves the account locked rather than permitting overlap.
+      }
+    }
+    if (error?.code === "EEXIST")
+      fail(
+        "RUN_LOCKED",
+        "该发起账号已有测试锁。先确认旧测试已停止及副作用已清理，不自动删除旧锁。",
+      );
+    fail(
+      "RUN_LOCK_WRITE",
+      "无法持久化测试账号锁，本轮未执行外部操作。请检查锁目录后再运行。",
+      "INCONCLUSIVE",
+    );
   }
 }
 function memoryPlan() {
@@ -544,13 +606,12 @@ async function main() {
   );
   const pendingFixturePath = lockPath.replace(/\.lock$/, ".memory-pending.json");
   const pendingTasteFixturePath = lockPath.replace(/\.lock$/, ".taste-pending.json");
-  let lock;
-  try {
-    lock = await open(lockPath, "wx", 0o600);
-    await lock.writeFile(JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
-  } catch {
-    fail("RUN_LOCKED", "该发起账号已有测试锁。先确认旧测试已停止及副作用已清理，不自动删除旧锁。");
-  }
+  const runStartedAt = new Date().toISOString();
+  const { lock, processIdentity: runProcessIdentity } = await acquireRunLock({
+    lockPath,
+    startedAt: runStartedAt,
+    identityRequired: command === "run" && o.live === true,
+  });
   const runId =
     new Date().toISOString().replaceAll(":", "-") + "_" + digest(String(Math.random())).slice(0, 8);
   const runDir = join(out, runId);
@@ -566,7 +627,7 @@ async function main() {
     toolVersion: "0.1.0",
     runId,
     mode: command,
-    startedAt: new Date().toISOString(),
+    startedAt: runStartedAt,
     productAcceptance: {
       status: "BLOCKED",
       ...(transportOnlySuite ? { acceptanceKind: "TRANSPORT_ONLY" } : {}),
@@ -705,7 +766,7 @@ async function main() {
       const memoryOrigin = {
         ...(memoryContract.checkpointVersion === 3 ? { familyId: memoryContract.id } : {}),
         runtime: report.runtime,
-        process: await captureMemoryProcess(),
+        process: runProcessIdentity ?? (await captureMemoryProcess()),
         scope: {
           connectionId: config.runtime.connectionId,
           botId: config.bot.qq,
@@ -867,7 +928,7 @@ async function main() {
       const tasteOrigin = {
         familyId: TASTE_FAMILY_ID,
         runtime: report.runtime,
-        process: await captureMemoryProcess(),
+        process: runProcessIdentity ?? (await captureMemoryProcess()),
         scope: {
           connectionId: config.runtime.connectionId,
           botId: config.bot.qq,

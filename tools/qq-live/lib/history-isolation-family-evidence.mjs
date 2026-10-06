@@ -1,4 +1,10 @@
 import { fail, digest, toolManifestDigest } from "./core.mjs";
+import {
+  messageReplyTimesFollowInput,
+  messageTimeBindingKeys,
+  messageTimesMatch,
+  validMessageTimeBinding,
+} from "./message-binding.mjs";
 import { historyExclusionSpec, historyIsolationSeedSpec } from "./history-isolation-scenario.mjs";
 
 export const HISTORY_ISOLATION_FAMILY_ID = "history-cross-group-isolation";
@@ -98,20 +104,22 @@ function validateTransportCase(c, spec, route) {
     !Number.isFinite(Date.parse(c.startedAt)) ||
     lease.expiresAt <= Date.parse(c.startedAt) ||
     lease.toolsSha256 !== expected.toolsSha256 ||
-    !exactKeys(binding, [
-      "driverMessageId",
-      "botMessageId",
-      "realSequence",
-      "time",
-      "textSha256",
-    ]) ||
+    !exactKeys(
+      binding,
+      messageTimeBindingKeys(binding, [
+        "driverMessageId",
+        "botMessageId",
+        "realSequence",
+        "time",
+        "textSha256",
+      ]),
+    ) ||
     !MESSAGE_ID.test(String(binding.driverMessageId ?? "")) ||
     !MESSAGE_ID.test(String(binding.botMessageId ?? "")) ||
     String(c.sentMessageId) !== String(binding.driverMessageId) ||
     typeof binding.realSequence !== "string" ||
     !/^\d{1,30}$/.test(binding.realSequence) ||
-    !Number.isSafeInteger(binding.time) ||
-    binding.time <= 0 ||
+    !validMessageTimeBinding(binding) ||
     binding.textSha256 !== digest(expected.prompt) ||
     !Array.isArray(replies) ||
     replies.length !== 1 ||
@@ -210,17 +218,30 @@ function validateFreshCase(evidence, c, spec, transport, runtime, config, stage,
     delivery.destination_scope_key !== scopeKey ||
     !MESSAGE_ID.test(String(delivery.external_id ?? "")) ||
     String(delivery.external_id) !== String(reply?.botMessageId) ||
-    !exactKeys(input, ["realSequence", "time", "textSha256"]) ||
+    !exactKeys(input, messageTimeBindingKeys(input, ["realSequence", "time", "textSha256"])) ||
+    !validMessageTimeBinding(input) ||
     String(input.realSequence) !== String(transport.binding.realSequence) ||
-    input.time !== transport.binding.time ||
+    !messageTimesMatch(transport.binding, input) ||
     input.textSha256 !== transport.binding.textSha256 ||
-    !exactKeys(reply, ["botMessageId", "driverMessageId", "realSequence", "time", "textSha256"]) ||
+    !exactKeys(
+      reply,
+      messageTimeBindingKeys(reply, [
+        "botMessageId",
+        "driverMessageId",
+        "realSequence",
+        "time",
+        "textSha256",
+      ]),
+    ) ||
     !MESSAGE_ID.test(String(reply.botMessageId ?? "")) ||
     String(reply.botMessageId) !== String(delivery.external_id) ||
     !MESSAGE_ID.test(String(reply.driverMessageId ?? "")) ||
     String(reply.driverMessageId) !== String(transport.reply.messageId) ||
+    !validMessageTimeBinding(reply) ||
+    !Object.hasOwn(reply, "driverTime") ||
     !/^\d{1,30}$/.test(String(reply.realSequence ?? "")) ||
     !Number.isSafeInteger(reply.time) ||
+    !messageReplyTimesFollowInput(input, reply) ||
     reply.time < input.time ||
     reply.time <= 0 ||
     reply.textSha256 !== transport.reply.textSha256

@@ -174,6 +174,7 @@ test("bound message returns identity metadata without its body", async () => {
   assert.deepEqual(compareSameMessage(result, result), {
     realSequence: "554",
     time: result.time,
+    driverTime: result.time,
     textSha256: result.textSha256,
   });
 });
