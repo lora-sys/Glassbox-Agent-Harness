@@ -340,7 +340,7 @@ export class OneBot {
       };
       const timer = setTimeout(
         () => finish(new LiveError("WS_CLOSE_TIMEOUT", "OneBot 关闭确认超时。")),
-        this.config.responseTimeoutMs,
+        this.config.apiTimeoutMs,
       );
       socket.addEventListener("close", onClose, { once: true });
       this.close();

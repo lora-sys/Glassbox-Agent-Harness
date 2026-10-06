@@ -3259,32 +3259,43 @@ export class ManagementApplication {
             runId: accepted.run.id,
           };
           if (this.qqLiveLeases.bindRun(binding)) {
-            await appendQqLiveAcceptanceAudit(this.options.dataDirectory, {
-              event: "run_bound",
-              messageId: message.messageId,
-              scope: message.scope,
-              principalId: accepted.caller.principalId,
-              leaseId: leaseResolution.leaseId,
-              runId: accepted.run.id,
-              marker: leaseResolution.marker,
-              textSha256: canonicalQqLiveTextSha256(message.text),
-              toolsSha256: leaseResolution.toolsSha256,
-            }).catch(() => undefined);
-            this.qqLiveRunBindings.set(accepted.run.id, {
-              ...binding,
-              marker: leaseResolution.marker,
-              toolsSha256: leaseResolution.toolsSha256,
-            });
-            const boundRun = await this.store.conversations
-              .getRun(accepted.caller, accepted.run.id)
-              .catch(() => undefined);
-            if (
-              !boundRun ||
-              (boundRun.status !== "queued" &&
-                boundRun.status !== "running" &&
-                boundRun.status !== "cancelling")
-            )
-              await this.revokeQqLiveRunBinding(accepted.run.id);
+            let auditRecorded = false;
+            try {
+              await appendQqLiveAcceptanceAudit(this.options.dataDirectory, {
+                event: "run_bound",
+                messageId: message.messageId,
+                scope: message.scope,
+                principalId: accepted.caller.principalId,
+                leaseId: leaseResolution.leaseId,
+                runId: accepted.run.id,
+                marker: leaseResolution.marker,
+                textSha256: canonicalQqLiveTextSha256(message.text),
+                toolsSha256: leaseResolution.toolsSha256,
+              });
+              auditRecorded = true;
+            } catch {
+              // The persisted message keeps its marker, so the execution wrapper will
+              // settle this Run as gate_refused after revocation. Never execute an
+              // acceptance Run without its durable binding evidence.
+              this.qqLiveLeases.revoke(leaseResolution.leaseId);
+            }
+            if (auditRecorded) {
+              this.qqLiveRunBindings.set(accepted.run.id, {
+                ...binding,
+                marker: leaseResolution.marker,
+                toolsSha256: leaseResolution.toolsSha256,
+              });
+              const boundRun = await this.store.conversations
+                .getRun(accepted.caller, accepted.run.id)
+                .catch(() => undefined);
+              if (
+                !boundRun ||
+                (boundRun.status !== "queued" &&
+                  boundRun.status !== "running" &&
+                  boundRun.status !== "cancelling")
+              )
+                await this.revokeQqLiveRunBinding(accepted.run.id);
+            }
           } else {
             await appendQqLiveAcceptanceAudit(this.options.dataDirectory, {
               event: "message_denied",

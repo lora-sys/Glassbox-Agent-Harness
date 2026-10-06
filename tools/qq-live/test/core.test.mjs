@@ -141,6 +141,28 @@ test("tokens and terminal escapes redacted", () =>
   ));
 test("arbitrary exception is not leaked", () =>
   assert.ok(!safeError(new Error("my token")).message.includes("my token")));
+test("internal diagnostics retain only known local frames without error payloads", () => {
+  const error = new TypeError("secret-token private-message");
+  const local = new URL("../lib/product-evidence.mjs", import.meta.url).href;
+  error.stack = `TypeError: secret-token private-message\n    at verify (${local}:42:7)\n    at remote (https://secret-token.example/private.mjs:8:2)\n    at external (/tmp/private-message.mjs:3:1)`;
+  const result = safeError(error);
+  assert.deepEqual(result.diagnostic, {
+    type: "TypeError",
+    frames: [{ path: "tools/qq-live/lib/product-evidence.mjs", line: 42, column: 7 }],
+  });
+  assert.ok(!JSON.stringify(result).includes("secret-token"));
+  assert.ok(!JSON.stringify(result).includes("private-message"));
+});
+test("diagnostics ignore stack getters and arbitrary thrown objects", () => {
+  const error = new Error("secret");
+  Object.defineProperty(error, "stack", {
+    get() {
+      throw new Error("secret getter");
+    },
+  });
+  assert.deepEqual(safeError(error).diagnostic, { type: "Error", frames: [] });
+  assert.equal(safeError({ name: "TypeError", stack: "secret" }).diagnostic, undefined);
+});
 test("CQ metadata is not parsed as text", () => assert.equal(textOf("[CQ:at,qq=10002]hi"), "hi"));
 test("unsafe numeric identifiers rejected", () => assert.equal(id(2 ** 60), ""));
 test("negative message ID supported", () => assert.equal(messageId(-7), "-7"));

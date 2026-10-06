@@ -1,4 +1,6 @@
 import { randomUUID, createHash } from "node:crypto";
+import { fileURLToPath } from "node:url";
+import { resolve, relative, isAbsolute } from "node:path";
 
 export class LiveError extends Error {
   constructor(code, message, status = "BLOCKED") {
@@ -142,14 +144,58 @@ export function statusOf(cases) {
 }
 export const exitCode = (status) =>
   ({ PASS: 0, FAIL: 1, BLOCKED: 2, INCONCLUSIVE: 3 })[status] ?? 2;
+function internalErrorDiagnostic(error) {
+  try {
+    const types = [
+      Error,
+      TypeError,
+      RangeError,
+      SyntaxError,
+      ReferenceError,
+      EvalError,
+      URIError,
+      AggregateError,
+    ];
+    const type = types.find((candidate) => Object.getPrototypeOf(error) === candidate.prototype);
+    if (!type) return undefined;
+    const root = fileURLToPath(new URL("../../../", import.meta.url));
+    let stack;
+    try {
+      stack = error.stack;
+    } catch {
+      stack = undefined;
+    }
+    const frames = [];
+    if (typeof stack === "string") {
+      // Ignore the first line, which includes the untrusted error message.
+      for (const line of stack.split("\n").slice(1)) {
+        const match = line.match(
+          /^\s+at (?:.*?\()?((?:file:\/\/\/|\/|[A-Za-z]:[\\/]).*\.mjs):(\d{1,8}):(\d{1,8})\)?$/,
+        );
+        if (!match) continue;
+        const absolute = match[1].startsWith("file:") ? fileURLToPath(match[1]) : resolve(match[1]);
+        const path = relative(root, absolute).replaceAll("\\", "/");
+        if (isAbsolute(path) || !/^tools\/qq-live\/(?:lib\/|test\/)?[a-z0-9-]+\.mjs$/.test(path))
+          continue;
+        frames.push({ path, line: Number(match[2]), column: Number(match[3]) });
+        if (frames.length === 4) break;
+      }
+    }
+    return { type: type.name, frames };
+  } catch {
+    return undefined;
+  }
+}
 export function safeError(error) {
   if (error instanceof LiveError)
     return { code: error.code, status: error.status, message: error.message };
   // Untrusted provider/OS errors may contain URLs, tokens or message content.
+  const diagnostic = internalErrorDiagnostic(error);
   return {
     code: "INTERNAL_ERROR",
     status: "BLOCKED",
     message: "测试器内部异常。未输出原始错误，以避免泄露凭证。请运行本地自检。",
+    ...(diagnostic ? { diagnostic } : {}),
   };
 }
 export function safeText(value, secrets = []) {

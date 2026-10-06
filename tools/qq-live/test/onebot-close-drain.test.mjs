@@ -41,12 +41,12 @@ class ControlledSocket {
   }
 }
 
-function client(responseTimeoutMs = 100) {
+function client(apiTimeoutMs = 100) {
   const value = new OneBot(
     {
       bot: { tokenEnv: "BOT_TOKEN", qq: "10002" },
       driver: { tokenEnv: "DRIVER_TOKEN", qq: "10001" },
-      responseTimeoutMs,
+      apiTimeoutMs,
     },
     "bot",
   );
@@ -91,4 +91,25 @@ test("closeAndDrain reports timeout when the peer never confirms closure", async
   await assert.rejects(value.closeAndDrain(), { code: "WS_CLOSE_TIMEOUT" });
   assert.equal(socket.closeCalls, 1);
   assert.equal(socket.listenerCount("close"), 0);
+});
+
+test("closeAndDrain keeps message observers active until the peer confirms closure", async () => {
+  const { value, socket } = client();
+  const received = [];
+  value.subscribe((event) => received.push(event.message_id));
+  socket.addEventListener("message", (event) => value.onFrame(event.data));
+  const drain = value.closeAndDrain();
+
+  socket.emit("message", {
+    data: JSON.stringify({
+      post_type: "message",
+      self_id: 10002,
+      message_id: 987654,
+    }),
+  });
+  assert.deepEqual(received, [987654]);
+
+  socket.readyState = 3;
+  socket.emit("close", { code: 1000 });
+  await drain;
 });

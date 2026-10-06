@@ -196,6 +196,22 @@ async function syncDirectory(path) {
 function memoryPlan() {
   return memoryFamilyPlan();
 }
+
+export function applyCloseDrainFailure(report, error) {
+  report.connectionClose = safeError(error);
+  if (report.cases.some((testCase) => testCase.sendAttempted === true))
+    report.cleanupStopRequired = true;
+  if (["PASS", "TRANSPORT_ONLY"].includes(report.status)) report.status = "INCONCLUSIVE";
+  if (report.transportOnly) report.transportStatus = "INCONCLUSIVE";
+  if (["PASS", "TRANSPORT_ONLY"].includes(report.productAcceptance.status)) {
+    report.productAcceptance = {
+      ...report.productAcceptance,
+      status: "INCONCLUSIVE",
+      code: report.connectionClose.code,
+    };
+  }
+}
+
 async function main() {
   const { command, o } = args(process.argv.slice(2));
   if (command === "help") {
@@ -1203,9 +1219,13 @@ async function main() {
     report.status = report.error.status;
   } finally {
     clearInterval(timer);
+    const closeResults = await Promise.allSettled([
+      clients.driver.closeAndDrain(),
+      clients.bot.closeAndDrain(),
+    ]);
+    const closeFailure = closeResults.find((result) => result.status === "rejected");
+    if (closeFailure) applyCloseDrainFailure(report, closeFailure.reason);
     for (const unsubscribe of observers) unsubscribe();
-    clients.driver.close();
-    clients.bot.close();
     if (command === "run" && recorder.cases.length > 0) {
       const finalStatus = recorder.finalize();
       if (report.status === "PASS") report.status = finalStatus;
@@ -1315,7 +1335,8 @@ async function main() {
   console.log(`${report.status} 报告位于 ${runDir}`);
   process.exitCode = exitCode(report.status);
 }
-main().catch((error) => {
-  console.error(JSON.stringify(safeError(error)));
-  process.exitCode = exitCode(safeError(error).status);
-});
+if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1]))
+  main().catch((error) => {
+    console.error(JSON.stringify(safeError(error)));
+    process.exitCode = exitCode(safeError(error).status);
+  });

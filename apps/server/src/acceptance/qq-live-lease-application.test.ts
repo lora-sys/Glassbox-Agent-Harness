@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { IncomingMessage } from "node:http";
 import { Readable } from "node:stream";
 import { join } from "node:path";
@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { createApplicationFixtureScope } from "../management/application-test-helpers.js";
 import type { ExecutionInput } from "../execution/run-service/types.js";
+import { PiRunExecutionAdapter } from "../runtime/pi/run-adapter.js";
 import {
   canonicalQqLiveToolsSha256,
   canonicalQqLiveTextSha256,
@@ -29,6 +30,7 @@ const piModelProfile = {
 };
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await fixtures.afterEachCleanup();
 });
 
@@ -220,6 +222,156 @@ describe("QQ live lease application wiring", () => {
       }),
     ).toBe(false);
     expect(internals.qqLiveRunBindings.has(terminalRunId!)).toBe(false);
+  });
+
+  it("revokes a lease and refuses the Run when run-bound audit persistence fails", async () => {
+    const fixture = await fixtures.fixture(
+      async (input) => ({ status: "succeeded", text: input.text }),
+      { executionRef: "pi:lease-fixture", piModelProfile },
+    );
+    const executeSpy = vi.spyOn(PiRunExecutionAdapter.prototype, "execute");
+    const marker = "0123456789abcdef0123456789abcdef";
+    const text = `GLASSBOX_ACCEPTANCE_V1 ${marker}\nReply with one word.`;
+    const registration = await fixture.app.registerQqLiveLease({
+      scope: {
+        connectionId: "fixture",
+        botId: "10001",
+        chatType: "private",
+        chatId: "10002",
+        senderId: "10002",
+      },
+      marker,
+      textSha256: canonicalQqLiveTextSha256(text),
+      ttlMs: 60_000,
+      expiresAt: Date.now() + 60_000,
+      tools: [],
+    });
+    const appOptions = (fixture.app as unknown as { options: { dataDirectory: string } }).options;
+    const originalDataDirectory = appOptions.dataDirectory;
+    const nonDirectoryPath = join(fixture.directory, "audit-path-is-a-file");
+    await writeFile(nonDirectoryPath, "isolated test fixture", "utf8");
+    appOptions.dataDirectory = nonDirectoryPath;
+    try {
+      fixture.send(706, text, true);
+      let terminalRun:
+        | Awaited<ReturnType<typeof fixture.app.store.management.listRuns>>["items"][number]
+        | undefined;
+      await vi.waitFor(async () => {
+        terminalRun = (await fixture.app.store.management.listRuns("owner")).items[0];
+        expect(terminalRun).toMatchObject({ status: "failed", failureCode: "gate_refused" });
+      });
+      const failedRun = terminalRun;
+      if (!failedRun) throw new Error("audit failure did not create a Run");
+
+      const internals = fixture.app as unknown as {
+        qqLiveLeases: QqLiveLeaseRegistry;
+        qqLiveRunBindings: Map<string, unknown>;
+      };
+      expect(
+        internals.qqLiveLeases.isActive({
+          leaseId: registration.leaseId,
+          principalId: "owner",
+          scope: {
+            connectionId: "fixture",
+            botId: "10001",
+            chatType: "private",
+            chatId: "10002",
+            senderId: "10002",
+          },
+          messageId: "706",
+          runId: failedRun.id,
+        }),
+      ).toBe(false);
+      expect(internals.qqLiveRunBindings.has(failedRun.id)).toBe(false);
+      await vi.waitFor(async () => {
+        const trace = await fixture.app.trace.readPage(failedRun.id);
+        expect(trace.records.map((record) => record.event)).toContainEqual(
+          expect.objectContaining({
+            type: "run_finished",
+            status: "failed",
+            failureCode: "gate_refused",
+          }),
+        );
+      });
+      expect(executeSpy).not.toHaveBeenCalled();
+    } finally {
+      appOptions.dataDirectory = originalDataDirectory;
+      executeSpy.mockRestore();
+    }
+    const audit = await readFile(join(fixture.directory, "qq-live-acceptance-audit.jsonl"), "utf8");
+    expect(audit).toContain('"event":"lease_registered"');
+    expect(audit).not.toContain('"event":"run_bound"');
+  });
+
+  it("refuses a queued marker Run after restart when its in-memory lease is lost", async () => {
+    const fixture = await fixtures.fixture(
+      async (input) => ({ status: "succeeded", text: input.text }),
+      { executionRef: "pi:lease-fixture", piModelProfile, persistentDatabase: true },
+    );
+    const executeSpy = vi.spyOn(PiRunExecutionAdapter.prototype, "execute");
+    const marker = "abcdef0123456789abcdef0123456789";
+    const text = `GLASSBOX_ACCEPTANCE_V1 ${marker}\nReply with one word.`;
+    await fixture.app.registerQqLiveLease({
+      scope: {
+        connectionId: "fixture",
+        botId: "10001",
+        chatType: "private",
+        chatId: "10002",
+        senderId: "10002",
+      },
+      marker,
+      textSha256: canonicalQqLiveTextSha256(text),
+      ttlMs: 60_000,
+      expiresAt: Date.now() + 60_000,
+      tools: [],
+    });
+    vi.spyOn(fixture.app.runs, "enqueueAccepted").mockResolvedValue();
+    fixture.send(707, text, true);
+
+    let queuedRun:
+      | Awaited<ReturnType<typeof fixture.app.store.management.listRuns>>["items"][number]
+      | undefined;
+    await vi.waitFor(async () => {
+      queuedRun = (await fixture.app.store.management.listRuns("owner")).items[0];
+      expect(queuedRun?.status).toBe("queued");
+      const audit = await readFile(
+        join(fixture.directory, "qq-live-acceptance-audit.jsonl"),
+        "utf8",
+      );
+      expect(audit).toContain('"event":"run_bound"');
+    });
+    const acceptedRun = queuedRun;
+    if (!acceptedRun) throw new Error("marked message did not create a queued Run");
+    await vi.waitFor(async () => {
+      const trace = await fixture.app.trace.readPage(acceptedRun.id);
+      expect(trace.records.map((record) => record.event)).toContainEqual(
+        expect.objectContaining({ type: "message_received", externalId: "707" }),
+      );
+    });
+
+    const reopened = await fixture.reopen();
+    const caller = await reopened.store.identities.resolve({
+      connectionId: "fixture",
+      botId: "10001",
+      chatType: "private",
+      chatId: "10002",
+      senderId: "10002",
+    });
+    if (!caller) throw new Error("Owner caller was not restored");
+    const recoveredRun = await reopened.runs.waitForRun(caller, acceptedRun.id);
+    expect(recoveredRun).toMatchObject({ status: "failed", failureCode: "gate_refused" });
+    await vi.waitFor(async () => {
+      const trace = await reopened.trace.readPage(acceptedRun.id);
+      expect(trace.records.map((record) => record.event)).toContainEqual(
+        expect.objectContaining({
+          type: "run_finished",
+          status: "failed",
+          failureCode: "gate_refused",
+        }),
+      );
+    });
+    expect(executeSpy).not.toHaveBeenCalled();
+    executeSpy.mockRestore();
   });
 
   it("cancels a registration held across async Owner resolution", async () => {
