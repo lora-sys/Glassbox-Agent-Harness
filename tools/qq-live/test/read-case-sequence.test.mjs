@@ -149,6 +149,62 @@ test("unknown transport outcome stops after an attempted feature send", async ()
   assert.equal(result.cleanupStopRequired, true);
 });
 
+test("transport-only unknown cleanup stops before the next send", async () => {
+  const sent = [];
+  const result = await runReadCaseSequence({
+    specs: [{ id: "transport-private" }, { id: "transport-group-A" }],
+    executeCase: async (spec) => {
+      sent.push(spec.id);
+      return {
+        id: spec.id,
+        status: "INCONCLUSIVE",
+        code: "REPLY_TIMEOUT",
+        transportOnly: true,
+        leaseRegistrationAttempted: true,
+        sendAttempted: true,
+      };
+    },
+    verifyProductCase: async () => assert.fail("unknown transport must not be product-verified"),
+    serializeError: safeError,
+  });
+
+  assert.deepEqual(sent, ["transport-private"]);
+  assert.equal(result.cleanupStopRequired, true);
+  assert.equal(result.productAcceptance.cleanupRequired, true);
+  assert.equal(productCleanupStopRequired(result.productAcceptance), true);
+});
+
+test("transport-only known reply failure stays FAIL after independent cleanup proof", async () => {
+  const sent = [];
+  const result = await runReadCaseSequence({
+    specs: [{ id: "transport-private" }, { id: "transport-group-A" }],
+    executeCase: async (spec) => {
+      sent.push(spec.id);
+      return {
+        id: spec.id,
+        status: "FAIL",
+        code: "REPLY_ASSERTION_FAILED",
+        detail: "The actual reply did not satisfy the fixed marker assertion.",
+        transportOnly: true,
+        leaseRegistrationAttempted: true,
+        sendAttempted: true,
+      };
+    },
+    verifyCleanupOnlyCase: async () => ({
+      status: "CLEANUP_VERIFIED",
+      runtime: { commit: "abc" },
+      cases: [{ caseId: "transport-private", runId: "actual-run", cleanupVerified: true }],
+    }),
+    serializeError: safeError,
+  });
+
+  assert.deepEqual(sent, ["transport-private"]);
+  assert.equal(result.terminalStatus, "FAIL");
+  assert.equal(result.productAcceptance.status, "FAIL");
+  assert.equal(result.productAcceptance.cleanupVerified, true);
+  assert.equal(productCleanupStopRequired(result.productAcceptance), false);
+});
+
 test("non-feature failures do not claim lease cleanup is required", async () => {
   const result = await runReadCaseSequence({
     specs: [{ id: "ordinary" }],

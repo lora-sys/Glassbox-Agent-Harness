@@ -1,6 +1,6 @@
 # 给当前开发 Agent 的执行要求
 
-仓库接入版补充规则：schemaVersion=1 的自由文本用例只允许 plan。schemaVersion=2 仅接入指定的读取工具，需要服务端把许可绑定到真实发送者、完整会话、消息哈希和 Run，并验证工具 Trace。修改操作须先补独立观察和清理执行器。普通发送结果未知也会持久创建 STOP。report 的 productAcceptance 必须为 PASS 才能证明已核对运行版本及产品证据。transport PASS 或 doctor PASS 不满足合并条件。runtime 配置使用 checkout、dataDirectory、expectedCommit 和 connectionId。threadId 默认 null。当前只有 agent-service 登记的服务支持自动进程核对；systemd 服务不能冒充该登记。
+仓库接入版补充规则：默认传输基线是 identity-bound 固定 private、group A 和 group B 零工具用例。先运行 `plan --case transport-smoke`，再用其 SHA256、runtime、有效授权窗口和 `--live` 执行。每条消息必须先取得范围和输入绑定的空工具 lease，并在下一条前核对实际 Run、投递和持久清理证据。整轮复核通过后报告仍为 `TRANSPORT_ONLY`，不能计作功能 PASS 或交付覆盖。schemaVersion=1 的自由文本用例只允许 plan。schemaVersion=2 仅接入指定的读取工具，需要服务端把许可绑定到真实发送者、完整会话、消息哈希和 Run，并验证工具 Trace。修改操作须先补独立观察和清理执行器。普通发送结果未知也会持久创建 STOP。产品功能验收仍要求 feature `productAcceptance` 为 PASS，并有运行版本及产品证据。doctor PASS 也不满足合并条件。live moderation 当前在连接 QQ 前阻断，直到精确 mutation lease、状态观察和清理验证接入。runtime 配置使用 checkout、dataDirectory、expectedCommit 和 connectionId。threadId 默认 null。当前只有 agent-service 登记的服务支持自动进程核对；systemd 服务不能冒充该登记。
 
 用户当前需要在开发 Glassbox 的过程中使用真实 QQ 验收。不做网页 UI，不等待项目全部写完。使用本目录现有工具，不另建聊天 Agent，也不要通过模拟 Owner 事件冒充实机测试。
 
@@ -22,7 +22,7 @@
 
 运行 doctor。账号掉线、Token 拒绝、成员关系缺失或实例无法确认时停止。不要为了连通而放宽授权、关闭鉴权或更改测试预期。
 
-在有效授权窗口内运行相关实机用例。首次至少运行 private、group-A 和 group-B。禁言测试只有在目标与同意时段明确、独立配置已启用时才运行。
+在有效授权窗口内运行相关实机用例。先计划、审阅并批准固定 private、group-A 和 group-B transport-only suite。它不证明功能覆盖。禁言协议目前只有隔离 fixture 测试，live CLI 会在连接前阻断。
 
 先读 latest.json 的结果。需要定位时只读对应运行目录，不读取整套个人聊天历史。用测试编号、消息 ID 和时间定位 Glassbox Run。不得仅凭“这是最新 Run”关联执行证据。
 
@@ -40,7 +40,7 @@ FAIL 表示验收结果不满足预期，先查证故障位置。BLOCKED 表示�
 
 ## 首版范围
 
-固定实机用例覆盖真实私聊、指定群 @ Bot 的收发，以及可选的禁言和解禁效果。它们只证明传输和对应固定操作，不能替代功能回归。结构化读取用例示例见 examples/feature-read.example.json。先运行 plan，审查消息和工具范围，再把套件 SHA256 传入 run 的 --approve-suite。
+固定实机基线覆盖真实私聊、群 A 和群 B 的收发。每条用例只获准空工具面，报告类型固定为 `TRANSPORT_ONLY`，不能替代功能回归。结构化读取用例示例见 examples/feature-read.example.json。先运行 plan，审查消息、身份和工具范围，再把套件 SHA256 传入 run 的 `--approve-suite`。live moderation 尚无精确许可路径，当前禁止执行。
 
 运行 `node tools/qq-live/cli.mjs coverage` 盘点覆盖缺口。默认功能目录已有受限读取用例和固定 Memory 家族，其余条目仍待实现。planned 条目不能计入执行覆盖。将条目接成真实用例、独立观察和清理之后，再运行覆盖检查。不能把补了一段测试说明解释为已经测试。
 

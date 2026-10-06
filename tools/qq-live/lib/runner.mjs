@@ -261,23 +261,31 @@ export async function replyCase(config, clients, recorder, spec, signal, accepta
   const route =
     spec.chat === "private" ? "private" : config.groups.find((g) => g.alias === spec.chat)?.id;
   if (!route) fail("CASE_ROUTE", "测试会话没有配置。");
-  const featureCase = Array.isArray(spec.leaseTools);
-  if (spec.featureAssertions !== undefined && !featureCase)
+  const leaseCase = Array.isArray(spec.leaseTools);
+  const transportOnly = spec.transportOnly === true;
+  if (spec.featureAssertions !== undefined && !leaseCase)
     fail("FEATURE_CAPABILITY", "功能断言缺少服务端测试许可范围。");
-  const marker = featureCase ? randomUUID().replaceAll("-", "") : undefined;
-  const prompt = featureCase
+  if (
+    transportOnly &&
+    (!leaseCase || spec.featureAssertions !== undefined || spec.leaseTools.length !== 0)
+  )
+    fail("TRANSPORT_ONLY_SPEC", "传输用例只能绑定空工具许可，不能包含功能断言。");
+  const marker = leaseCase ? randomUUID().replaceAll("-", "") : undefined;
+  const prompt = leaseCase
     ? `GLASSBOX_ACCEPTANCE_V1 {{nonce}}\n${spec.prompt.trim()}`
     : spec.prompt;
   const c = recorder.begin(spec.id, route, prompt, spec.expectContains, marker);
+  if (transportOnly) c.transportOnly = true;
   let lease;
   let registrationAttempted = false;
   try {
     check(clients, signal, config);
-    if (featureCase) {
-      if (!acceptance) fail("ACCEPTANCE_MANAGEMENT", "功能用例缺少服务端测试许可接口。");
-      c.featureAssertions = validateFeatureAssertions(
-        JSON.parse(JSON.stringify(spec.featureAssertions).replaceAll("{{nonce}}", marker)),
-      );
+    if (leaseCase) {
+      if (!acceptance) fail("ACCEPTANCE_MANAGEMENT", "受限用例缺少服务端测试许可接口。");
+      if (spec.featureAssertions !== undefined)
+        c.featureAssertions = validateFeatureAssertions(
+          JSON.parse(JSON.stringify(spec.featureAssertions).replaceAll("{{nonce}}", marker)),
+        );
       const tools = JSON.parse(JSON.stringify(spec.leaseTools).replaceAll("{{nonce}}", marker));
       c.leasedToolNames = tools.map((tool) => tool.name);
       if (acceptance.beforeRegister) {
@@ -311,7 +319,7 @@ export async function replyCase(config, clients, recorder, spec, signal, accepta
       }
     }
     await sendCase(config, clients, c);
-    if (featureCase && acceptance?.afterSend) {
+    if (leaseCase && acceptance?.afterSend) {
       let confirmed;
       let failed = false;
       try {

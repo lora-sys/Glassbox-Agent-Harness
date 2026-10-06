@@ -24,6 +24,13 @@ import {
   historyIsolationFamilyPlan,
 } from "./lib/feature-suite.mjs";
 import { MEMORY_FAMILY_ID, memoryWorkflow } from "./lib/memory-workflow.mjs";
+import {
+  TRANSPORT_SUITE_FAMILY_ID,
+  transportSmokeSpecs,
+  transportSuiteDefinition,
+  transportSuiteHash,
+  validateTransportCase,
+} from "./lib/transport-suite.mjs";
 
 const root = dirname(fileURLToPath(import.meta.url));
 const help = `QQ 实机测试器 0.1.0
@@ -31,9 +38,8 @@ const help = `QQ 实机测试器 0.1.0
 node cli.mjs init
 node cli.mjs doctor
 node cli.mjs arm --minutes 30
-node cli.mjs run --live
-node cli.mjs run --live --case group-A
-node cli.mjs run --live --case moderation
+node cli.mjs plan --case transport-smoke
+node cli.mjs run --live --approve-suite <SHA256>
 node cli.mjs plan --case memory-lifecycle
 node cli.mjs run --live --case memory-lifecycle --approve-suite <SHA256>
 node cli.mjs plan --scenarios examples/feature-baseline.example.json
@@ -228,6 +234,13 @@ async function main() {
       out,
     );
   }
+  if (command === "run" && o.case === "moderation")
+    fail(
+      "MODERATION_LEASE_UNSUPPORTED",
+      "实机禁言流程尚无精确范围的服务端许可，已在建立连接和发送之前阻止。",
+    );
+  if (command === "run" && o.live !== true)
+    fail("LIVE_REQUIRED", "真正发消息必须显式传入 --live。");
   if (command === "arm") {
     if (
       config.safety?.acceptanceServiceConfirmed !== true ||
@@ -245,13 +258,53 @@ async function main() {
     console.log(`测试授权有效至 ${raw.safety.armedUntil}。本命令不发送消息。`);
     return;
   }
-  let specs = smokeSpecs(config),
-    suiteHash = null,
+  const transportOnlySuite =
+    !o.scenarios &&
+    !["memory-lifecycle", "moderation"].includes(o.case) &&
+    (command === "run" || command === "plan");
+  let specs = transportOnlySuite ? transportSmokeSpecs(config) : smokeSpecs(config),
+    suiteHash = transportOnlySuite ? transportSuiteHash(config) : null,
     featureSuite = false;
   let memoryLifecycle = o.case === "memory-lifecycle";
   let memoryFamilyCase = null;
   let historyFamilyCase = null;
   let plannedSuiteCases = null;
+  if (transportOnlySuite) {
+    if (
+      o.case &&
+      o.case !== "transport-smoke" &&
+      !["private", "group-A", "group-B"].includes(o.case)
+    )
+      fail("CASE_NOT_FOUND", "没有匹配的固定传输用例。");
+    if (o.case && o.case !== "transport-smoke")
+      fail("TRANSPORT_SUITE_FIXED", "默认传输检查必须整轮运行 private、group A 和 group B。");
+    if (command === "plan") {
+      const definition = transportSuiteDefinition(config);
+      console.log(
+        JSON.stringify(
+          {
+            suiteSha256: suiteHash,
+            transportOnly: true,
+            familyId: TRANSPORT_SUITE_FAMILY_ID,
+            identities: definition.identities,
+            cases: definition.cases,
+            note: "固定零工具传输检查。即使通过，也不计入功能覆盖或完整 QQ 交付验收。",
+          },
+          null,
+          2,
+        ),
+      );
+      return;
+    }
+    specs.forEach((spec) => validateTransportCase(spec, config));
+    if (!config.runtime)
+      fail("TRANSPORT_RUNTIME_REQUIRED", "固定传输 suite 需要核验真实验收服务版本。");
+    if (o["approve-suite"] !== suiteHash)
+      fail("SUITE_APPROVAL", "先运行 plan 审阅固定传输套件，再提供其身份绑定 SHA256。");
+    const neededMessages = specs.length;
+    if (config.maxMessages < neededMessages)
+      fail("MESSAGE_BUDGET", `固定传输 suite 需要 ${neededMessages} 条消息预算。`);
+  }
   if (memoryLifecycle) {
     if (o.scenarios) fail("ARGUMENT", "固定记忆流程不能与 scenarios 混用。");
     const plan = memoryPlan();
@@ -394,6 +447,7 @@ async function main() {
     startedAt: new Date().toISOString(),
     productAcceptance: {
       status: "BLOCKED",
+      ...(transportOnlySuite ? { acceptanceKind: "TRANSPORT_ONLY" } : {}),
       code:
         command === "doctor"
           ? "DOCTOR_ONLY"
@@ -405,6 +459,7 @@ async function main() {
     suiteSha256: suiteHash,
     workspace: workspace(),
     cases: recorder.cases,
+    ...(transportOnlySuite ? { transportOnly: true } : {}),
     ...(memoryFamilyCase ? { memoryFamily: { caseId: memoryFamilyCase.id } } : {}),
     ...(historyFamilyCase ? { historyFamily: { caseId: historyFamilyCase.id } } : {}),
     limitations: [
@@ -436,7 +491,8 @@ async function main() {
         "该发起账号有未核实的记忆测试资源。先核实原始报告和清理证据，禁止续发。",
       );
     if (command === "run" && config.runtime) report.runtime = runtimeSnapshot(config.runtime);
-    if (command === "run" && featureSuite) acceptance = await acceptanceManagement(config.runtime);
+    if (command === "run" && (featureSuite || transportOnlySuite))
+      acceptance = await acceptanceManagement(config.runtime);
     timer = setInterval(() => {
       if (existsSync(join(out, "STOP"))) controller.abort();
     }, 250);
@@ -689,11 +745,25 @@ async function main() {
         verifyProductCase:
           command === "run" && config.runtime
             ? (testCase) =>
-                verifyProductEvidence(
-                  { mode: "run", status: "PASS", runtime: report.runtime, cases: [testCase] },
-                  config,
-                  clients,
-                )
+                transportOnlySuite
+                  ? import("./lib/product-evidence.mjs").then(
+                      ({ verifyTransportOnlyCaseEvidence }) =>
+                        verifyTransportOnlyCaseEvidence(
+                          testCase,
+                          config,
+                          clients,
+                          report.runtime,
+                        ).then((evidence) => ({
+                          status: evidence.status,
+                          runtime: evidence.runtime,
+                          cases: [evidence],
+                        })),
+                    )
+                  : verifyProductEvidence(
+                      { mode: "run", status: "PASS", runtime: report.runtime, cases: [testCase] },
+                      config,
+                      clients,
+                    )
             : undefined,
         verifyCleanupOnlyCase:
           command === "run" && config.runtime
@@ -721,13 +791,42 @@ async function main() {
       if (recorder.cases.length !== specs.length && report.status === "PASS")
         report.status = "INCONCLUSIVE";
     }
-    if (command === "run" && config.runtime && report.status === "PASS") {
+    if (command === "run" && config.runtime && report.status === "PASS" && transportOnlySuite) {
+      try {
+        const { verifyTransportOnlyEvidence } = await import("./lib/product-evidence.mjs");
+        const verified = await verifyTransportOnlyEvidence(
+          { ...report, mode: "run", status: "PASS", transportOnly: true },
+          config,
+          clients,
+          report.runtime,
+        );
+        report.transportStatus = "PASS";
+        report.productAcceptance = {
+          ...verified,
+          status: "TRANSPORT_ONLY",
+          acceptanceKind: "TRANSPORT_ONLY",
+          suiteSha256: report.suiteSha256,
+        };
+      } catch (error) {
+        const safe = safeError(error);
+        report.productAcceptance = {
+          ...safe,
+          acceptanceKind: "TRANSPORT_ONLY",
+          cleanupVerified: error?.cleanupVerified === true,
+          cleanupRequired: true,
+          cases: report.productAcceptance?.cases ?? [],
+        };
+        if (report.productAcceptance.cleanupVerified !== true) report.cleanupStopRequired = true;
+        if (report.status === "PASS") report.status = report.productAcceptance.status;
+      }
+    } else if (command === "run" && config.runtime && report.status === "PASS") {
       try {
         report.productAcceptance = await verifyProductEvidence(report, config, clients);
       } catch (error) {
         const safe = safeError(error);
-        const cleanupRequired = report.cases.some((testCase) =>
-          Array.isArray(testCase.featureAssertions),
+        const cleanupRequired = report.cases.some(
+          (testCase) =>
+            testCase.transportOnly === true || Array.isArray(testCase.featureAssertions),
         );
         report.productAcceptance = {
           ...safe,
@@ -791,12 +890,17 @@ async function main() {
     if (command === "run" && recorder.cases.length > 0) {
       const finalStatus = recorder.finalize();
       if (report.status === "PASS") report.status = finalStatus;
-      if (report.productAcceptance.status === "PASS" && finalStatus !== "PASS")
+      if (
+        ["PASS", "TRANSPORT_ONLY"].includes(report.productAcceptance.status) &&
+        finalStatus !== "PASS"
+      ) {
         report.productAcceptance = {
           ...report.productAcceptance,
           status: finalStatus,
           code: "OBSERVATION_CHANGED",
         };
+        if (report.transportOnly) report.transportStatus = finalStatus;
+      }
     }
     process.removeListener("SIGINT", stop);
     process.removeListener("SIGTERM", stop);
@@ -837,9 +941,11 @@ async function main() {
       if (report.error) lines.push(report.error.message);
       lines.push(
         "",
-        report.productAcceptance.status === "PASS"
-          ? `产品证据通过。运行提交 ${report.productAcceptance.runtime.commit}，进程 ${report.productAcceptance.runtime.pid}。`
-          : "产品证据没有通过，不能用于合并。请检查 report.json 中的 productAcceptance。",
+        report.productAcceptance.acceptanceKind === "TRANSPORT_ONLY"
+          ? "传输核验通过，但不计入功能覆盖或交付验收。"
+          : report.productAcceptance.status === "PASS"
+            ? `产品证据通过。运行提交 ${report.productAcceptance.runtime.commit}，进程 ${report.productAcceptance.runtime.pid}。`
+            : "产品证据没有通过，不能用于合并。请检查 report.json 中的 productAcceptance。",
       );
       await writeFile(join(runDir, "summary.md"), lines.join("\n") + "\n", { mode: 0o600 });
       await writeJson(join(out, "latest.json"), {
@@ -848,6 +954,9 @@ async function main() {
         runId,
         reportDirectory: runDir,
         productAcceptance: report.productAcceptance,
+        ...(report.transportOnly
+          ? { transportOnly: true, transportStatus: report.transportStatus }
+          : {}),
         cases: report.cases.map((c) => ({
           id: c.id,
           status: c.status,

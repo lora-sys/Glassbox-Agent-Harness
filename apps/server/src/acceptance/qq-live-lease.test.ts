@@ -274,6 +274,40 @@ describe("QQ live acceptance lease", () => {
         availableToolNames: ["qq_group_members"],
       }),
     ).toEqual([]);
+    const emptyBinding = {
+      leaseId: empty.leaseId,
+      principalId: "owner",
+      scope,
+      messageId: "empty-message",
+      runId: "empty-run",
+    };
+    expect(
+      f.registry.checkToolCall({
+        ...f.binding(),
+        toolName: "qq_group_members",
+        action: "qq:group:members:read",
+        resourceId: "group:12345",
+        toolInput: { groupId: "12345", filter: { role: "owner" } },
+      }),
+    ).toEqual({ allowed: true, reason: "allowed_by_lease" });
+    for (const operation of [
+      {
+        toolName: "qq_group_members",
+        action: "qq:group:members:read",
+        resourceId: "group:12345",
+        toolInput: { groupId: "12345", filter: { role: "owner" } },
+      },
+      {
+        toolName: "ops_status",
+        action: "ops:status",
+        resourceId: "agent-operations",
+        toolInput: {},
+      },
+    ])
+      expect(f.registry.checkToolCall({ ...emptyBinding, ...operation })).toEqual({
+        allowed: false,
+        reason: "capability_mismatch",
+      });
   });
 
   it("limits calls to listed tool operations and subset-shaped JSON input", () => {

@@ -8,7 +8,7 @@
 
 固定记忆流程在 Linux 环境运行。测试器会同步保存 `memory-fixture.jsonl` 进度记录。注册许可前保存实际消息标记和哈希，发送前保存许可回执，发送成功后保存账号侧消息回执。检查点同时记录原测试进程的 PID、Linux 启动身份、进程启动标识、私聊范围及运行版本。文件与目录写盘确认后才继续。更新 guard 时使用原子替换，保留完整旧记录；首次发布禁止覆盖已有 guard。写盘未确认时不发送消息。未确认步骤或清理时，发起账号的全局锁目录会保留 `.memory-pending.json`，后续实机运行会停止，即使改用另一个报告目录。不要直接删除这个记录来重试。中断后使用 reconcile-memory 核实原报告、Run 终态和独立清理证据，再按固定清理计划执行已授权的 reject 或 expire。这个固定流程不代表完整 Memory 功能回归，也不满足完整目录的自动合并门禁。
 
-报告新增 `productAcceptance`。未配置 runtime 时，收发 PASS 只代表 QQ 传输观察通过，产品验收仍为 BLOCKED，不能据此合并。
+报告新增 `productAcceptance`。固定传输 suite 要求配置并核对 runtime，成功后报告 `TRANSPORT_ONLY`。它不算产品功能 PASS，也不能用于合并。
 
 配置 runtime 的普通 read suite 按用例顺序执行。每条 QQ 回复通过传输断言后，测试器会先独立核对该条 Run、Trace、投递和许可撤销审计，再发送下一条。产品证据失败会停止本轮，并保留该条失败及之前已验证的用例，不重发旧消息。许可撤销未能独立确认时，测试器写入账号级 STOP。确定的回复断言失败只有在 cleanup-only 核验确认原 Run 和撤销审计后才允许结束为 FAIL 而不写 STOP；修复后可在已批准的套件和有效授权窗口内启动新一轮，不能自动重试。
 
@@ -92,44 +92,32 @@ coverage 默认返回尚未接成执行器的功能缺口。目录中的 planned
 ```bash
 node --env-file=tools/qq-live/.env tools/qq-live/cli.mjs doctor
 node tools/qq-live/cli.mjs arm --minutes 30
-node --env-file=tools/qq-live/.env tools/qq-live/cli.mjs run --live
+node tools/qq-live/cli.mjs plan --case transport-smoke
+node --env-file=tools/qq-live/.env tools/qq-live/cli.mjs run --live --approve-suite <SHA256>
 ```
 
 `doctor` 只读取登录身份、在线状态、版本和群成员信息，不发送消息。它通过不代表实机收发通过。
 
-`arm` 开启最多 120 分钟的测试窗口，不发送消息。`run --live` 默认依次发送私聊、群 A 和群 B 的收发测试。配置只有一个群时只执行对应群。
+`arm` 开启最多 120 分钟的测试窗口，不发送消息。默认传输套件固定执行私聊、群 A 和群 B 三条用例。套件哈希绑定发起账号、Bot 和两个群号。实机运行要求 runtime 配置、有效授权窗口、`--live`、匹配的 `--approve-suite` 和服务端许可管理接口。每条消息获得只绑定当前输入且工具面为空的临时许可。
+
+报告把这类结果标为 `transportOnly`，产品验收类型为 `TRANSPORT_ONLY`。它只证明固定消息的传输、实际 Run 关联和许可撤销，不计入功能目录、功能 PASS 或完整交付验收。逐条产品核验和清理记录完成后才继续下一条，全部通过后还会进行整轮复核。
 
 每条消息要求 Bot 返回本轮唯一编号。只有 Bot 端观察到原始输入，发起账号在正确会话收到符合断言的回复，且观察窗口内没有重复合格回复，才能通过。接口成功回执不算通过。
 
 测试串行执行，默认限制为 12 条发送消息。出现失败或无法确认时停止，不自动重发发送请求。QQ 或模型响应慢可能得到无法确认结果，需要检查证据，而不是反复运行直到偶然通过。
 
-只运行某个场景：
+运行固定三条传输套件。单条 route 选择会被拒绝，避免把部分传输结果写成完整 baseline：
 
 ```bash
-node --env-file=tools/qq-live/.env tools/qq-live/cli.mjs run --live --case private
-node --env-file=tools/qq-live/.env tools/qq-live/cli.mjs run --live --case group-A
-node --env-file=tools/qq-live/.env tools/qq-live/cli.mjs run --live --case group-B
+node tools/qq-live/cli.mjs plan --case transport-smoke
+node --env-file=tools/qq-live/.env tools/qq-live/cli.mjs run --live --approve-suite <SHA256>
 ```
+
+只有同时提供 A 和 B 的配置才能生成这份固定计划。
 
 ## 禁言与解禁
 
-默认关闭。只在明确同意的成员和约定时段内使用。目标不能是发起账号，也不能是 Bot，必须是普通成员。Bot 必须有 QQ 群管理角色，Glassbox 内部授权也需要正常允许该请求。工具不会绕过内部授权。
-
-在配置 moderation 中设置 enabled=true、target 为成员 QQ 号、consentConfirmed=true，以及有效的 consentUntil。时间使用包含时区的 ISO 格式，例如 `2026-10-05T15:00:00+08:00`。示例日期不是默认授权，需要换成双方约定的真实日期。
-
-durationSeconds 只接受 30 至 60 秒。程序开始前检查目标原本没有被禁言。
-
-```bash
-node --env-file=tools/qq-live/.env tools/qq-live/cli.mjs run --live --case moderation
-```
-
-测试通过群聊请求让 Glassbox 禁言，再通过群聊请求让 Glassbox 解禁。程序不直接调用 Bot 的禁言接口。
-
-验收同时需要发起账号收到 Bot 操作的 group_ban 通知，以及成员查询返回相符的 shut_up_timestamp。后者是实现扩展，不保证每个 OneBot 实现都支持。字段不存在、结构错误或状态不明时，程序在操作前阻塞，不猜测默认状态。
-
-自动到期不算解禁功能通过。正常解禁失败后，可以选用已经明确授权的主号紧急解禁。启用 `emergencyCleanupViaDriver=true` 时，发起账号也必须有 QQ 群管理角色。紧急解禁只允许 duration=0，并且必须取得本轮 Bot 禁言的通知及相符状态，避免覆盖其他管理员操作。
-
-紧急清理成功不能替代业务验收成功。没有足够证据时，程序不会擅自解禁。清理或延迟操作无法确认时会创建 STOP 文件，阻止后续测试。此时先检查 Bot 待执行任务和群状态，不要直接删 STOP 后重试。
+禁言与解禁协议 fixture 保留目标身份、同意窗口、原始状态、通知和恢复断言。当前 live CLI 在建立 OneBot 连接前拒绝 moderation，因为服务端还没有能绑定到实际消息和 Run 的精确 mutation lease。不得通过提示词或配置绕过 `MODERATION_LEASE_UNSUPPORTED`。重新接入前，必须增加受限许可、独立状态观察和清理证据。
 
 ## 把当前任务写成测试用例
 

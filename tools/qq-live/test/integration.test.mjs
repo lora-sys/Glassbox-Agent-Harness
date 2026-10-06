@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { OneBot } from "../lib/onebot.mjs";
 import { Recorder, doctor, replyCase } from "../lib/runner.mjs";
 import { moderationCase } from "../lib/moderation.mjs";
+import { transportSmokeSpecs } from "../lib/transport-suite.mjs";
 import { world } from "./fixture.mjs";
 const env = { DRIVER_TOKEN: "fixture-token-only", BOT_TOKEN: "fixture-token-only" };
 async function setup(t, opts = {}) {
@@ -85,6 +86,42 @@ test("feature request registers before sending and revokes its exact lease", asy
   assert.deepEqual(order, ["beforeRegister", "register", "beforeSend", "afterSend"]);
   assert.equal(c.leaseRevoked, true);
   assert.deepEqual(c.featureAssertions, featureSpec.featureAssertions);
+});
+test("fixed transport case registers and revokes an exact zero-tool lease", async (t) => {
+  const w = await setup(t);
+  const spec = transportSmokeSpecs(w.config)[0];
+  const leaseId = "12345678-1234-1234-1234-123456789abc";
+  let toolsAtRegistration;
+  let revoked = false;
+  const c = await replyCase(w.config, w.clients, w.recorder, spec, undefined, {
+    register: async (_config, prepared, tools) => {
+      assert.equal(prepared.transportOnly, true);
+      assert.match(prepared.prompt, /^GLASSBOX_ACCEPTANCE_V1 [a-f0-9]{32}\n/);
+      toolsAtRegistration = tools;
+      return { leaseId, expiresAt: Date.now() + 10000, toolsSha256: "empty-manifest" };
+    },
+    revoke: async (id) => {
+      assert.equal(id, leaseId);
+      revoked = true;
+    },
+  });
+
+  assert.equal(c.status, "PASS");
+  assert.equal(c.transportOnly, true);
+  assert.deepEqual(c.leasedToolNames, []);
+  assert.equal(c.featureAssertions, undefined);
+  assert.deepEqual(toolsAtRegistration, []);
+  assert.equal(c.leaseRevoked, true);
+  assert.equal(revoked, true);
+});
+test("malformed transport-only case without an explicit empty lease is rejected before sending", async (t) => {
+  const w = await setup(t);
+  const spec = { ...transportSmokeSpecs(w.config)[0] };
+  delete spec.leaseTools;
+  await assert.rejects(replyCase(w.config, w.clients, w.recorder, spec), {
+    code: "TRANSPORT_ONLY_SPEC",
+  });
+  assert.equal(w.actions.filter((action) => action.action.startsWith("send_")).length, 0);
 });
 test("failed or unconfirmed prepared-message checkpoint revokes the lease without sending", async (t) => {
   const w = await setup(t);

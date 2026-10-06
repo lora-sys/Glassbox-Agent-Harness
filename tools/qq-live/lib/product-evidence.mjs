@@ -2,11 +2,16 @@ import { verifyLeaseCleanupEvidence } from "./lease-cleanup-evidence.mjs";
 import { execFileSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { resolve, join } from "node:path";
-import { fail, digest } from "./core.mjs";
+import { fail, digest, toolManifestDigest } from "./core.mjs";
 import { boundMessage, compareSameMessage } from "./message-binding.mjs";
 import { observeFeature, validateFeatureAssertions } from "./feature-observer.mjs";
 import { verifyGroupInfoEvidence } from "./group-info-evidence.mjs";
 import { verifyGroupFilesEvidence } from "./group-files-evidence.mjs";
+import {
+  transportSmokeSpecs,
+  transportSuiteHash,
+  validateTransportCase,
+} from "./transport-suite.mjs";
 
 export function runtimeSnapshot(runtime, capture = execFileSync) {
   return serviceSnapshot(runtime, capture, true);
@@ -236,6 +241,91 @@ export function verifyLeaseTraceEvidence(events, c, runId) {
     fail("FEATURE_LEASE_TRACE", "功能 Run 缺少对应许可和工具范围的原始证据。", "INCONCLUSIVE");
 }
 
+function transportCaseSpec(caseRecord, config, allowReplyFailure = false) {
+  const spec = transportSmokeSpecs(config).find((candidate) => candidate.id === caseRecord?.id);
+  if (!spec)
+    fail("TRANSPORT_CASE_BINDING", "传输用例不属于固定私聊和 A/B 群范围。", "INCONCLUSIVE");
+  validateTransportCase(spec, config);
+  const token = caseRecord.token;
+  const route =
+    spec.chat === "private"
+      ? "private"
+      : config.groups.find((group) => group.alias === spec.chat)?.id;
+  const expectedPrompt = `GLASSBOX_ACCEPTANCE_V1 ${token}\n${spec.prompt.replaceAll("{{nonce}}", token)}`;
+  const terminalPass = caseRecord.status === "PASS" && caseRecord.code === "REAL_REPLY_RECEIVED";
+  const terminalFailure =
+    allowReplyFailure &&
+    caseRecord.status === "FAIL" &&
+    caseRecord.code === "REPLY_ASSERTION_FAILED";
+  if (
+    caseRecord.transportOnly !== true ||
+    (caseRecord.featureAssertions !== undefined && caseRecord.featureAssertions !== null) ||
+    !/^[a-f0-9]{32}$/u.test(token ?? "") ||
+    caseRecord.route !== route ||
+    caseRecord.prompt !== expectedPrompt ||
+    JSON.stringify(caseRecord.expected) !== JSON.stringify([token]) ||
+    !Array.isArray(caseRecord.leasedToolNames) ||
+    caseRecord.leasedToolNames.length !== 0 ||
+    (caseRecord.leaseTools !== undefined &&
+      (!Array.isArray(caseRecord.leaseTools) || caseRecord.leaseTools.length !== 0)) ||
+    caseRecord.sendAttempted !== true ||
+    caseRecord.leaseRegistrationAttempted !== true ||
+    caseRecord.leaseRevoked !== true ||
+    !caseRecord.acceptanceLease ||
+    Object.keys(caseRecord.acceptanceLease).sort().join(",") !== "expiresAt,leaseId,toolsSha256" ||
+    !/^[a-f0-9-]{36}$/u.test(caseRecord.acceptanceLease.leaseId ?? "") ||
+    !Number.isSafeInteger(caseRecord.acceptanceLease.expiresAt) ||
+    caseRecord.acceptanceLease.toolsSha256 !== toolManifestDigest([]) ||
+    !(terminalPass || terminalFailure)
+  )
+    fail("TRANSPORT_CASE_BINDING", "传输用例或零工具许可与固定模板不一致。", "INCONCLUSIVE");
+
+  const reply = caseRecord.replies?.length === 1 ? caseRecord.replies[0] : undefined;
+  if (
+    !reply ||
+    reply.route !== route ||
+    reply.matches !== terminalPass ||
+    !validIdentifier(reply.messageId) ||
+    !/^[a-f0-9]{64}$/u.test(reply.textSha256 ?? "") ||
+    !Number.isSafeInteger(reply.textBytes) ||
+    reply.textBytes < 0 ||
+    typeof reply.receivedAt !== "string" ||
+    !Number.isFinite(Date.parse(reply.receivedAt)) ||
+    !validIdentifier(caseRecord.sentMessageId)
+  )
+    fail("TRANSPORT_REPLY_BINDING", "传输用例缺少唯一且可关联的 QQ 回复记录。", "INCONCLUSIVE");
+  return spec;
+}
+
+export function verifyTransportOnlyLeaseTraceEvidence(events, caseRecord, runId) {
+  const sessions = events.filter(
+    (event) => event.runId === runId && event.type === "session_start",
+  );
+  const calls = events.filter(
+    (event) => event.runId === runId && ["tool_call", "tool_result"].includes(event.type),
+  );
+  const lease = sessions.length === 1 ? sessions[0].data?.acceptanceLease : undefined;
+  if (
+    caseRecord.transportOnly !== true ||
+    !Array.isArray(caseRecord.leasedToolNames) ||
+    caseRecord.leasedToolNames.length !== 0 ||
+    sessions.length !== 1 ||
+    !lease ||
+    Object.keys(lease).sort().join(",") !== "leaseId,marker,narrowedTools,toolsSha256" ||
+    lease.leaseId !== caseRecord.acceptanceLease?.leaseId ||
+    lease.marker !== caseRecord.token ||
+    lease.toolsSha256 !== toolManifestDigest([]) ||
+    !Array.isArray(lease.narrowedTools) ||
+    lease.narrowedTools.length !== 0 ||
+    !Array.isArray(sessions[0].data?.authorizedTools) ||
+    sessions[0].data.authorizedTools.length !== 0 ||
+    (sessions[0].data?.toolSurface !== undefined &&
+      sessions[0].data.toolSurface.selectedCount !== 0)
+  )
+    fail("TRANSPORT_TOOL_SURFACE", "当前 Run 未证明固定的空模型工具面。", "INCONCLUSIVE");
+  if (calls.length) fail("TRANSPORT_TOOL_CALL", "空工具面传输用例记录到了工具调用。", "FAIL");
+}
+
 function sameMessageBinding(binding, evidence) {
   if (
     String(binding.realSequence) !== String(evidence.realSequence) ||
@@ -415,8 +505,8 @@ function failedCaseCleanupCandidates(report, config) {
     failed.code !== "REPLY_ASSERTION_FAILED" ||
     failed.sendAttempted !== true ||
     !validIdentifier(failed.sentMessageId) ||
-    !Array.isArray(failed.featureAssertions) ||
-    !failed.featureAssertions.length ||
+    ((!Array.isArray(failed.featureAssertions) || !failed.featureAssertions.length) &&
+      failed.transportOnly !== true) ||
     !failed.acceptanceLease ||
     failed.leaseRegistrationAttempted !== true ||
     failed.leaseRevoked !== true ||
@@ -442,7 +532,8 @@ function failedCaseCleanupCandidates(report, config) {
     if (prior.status !== "PASS" || prior.code !== "REAL_REPLY_RECEIVED")
       fail("CLEANUP_ONLY_UNSUPPORTED", "失败报告含有无法确认的前序用例。", "INCONCLUSIVE");
   return cases.filter(
-    (c) => c.featureAssertions || c.acceptanceLease || c.leaseRegistrationAttempted,
+    (c) =>
+      c.featureAssertions || c.acceptanceLease || c.leaseRegistrationAttempted || c.transportOnly,
   );
 }
 
@@ -473,14 +564,19 @@ export async function verifyFailedCaseCleanupInDatabase(db, dataDirectory, caseR
   try {
     if (!isKnownTerminalCaseRecord(caseRecord))
       fail("CLEANUP_ONLY_UNSUPPORTED", "用例不是可核验的终态回复结果。", "INCONCLUSIVE");
+    const isTransportOnly = caseRecord.transportOnly === true;
     if (
       !caseRecord?.acceptanceLease ||
       caseRecord.leaseRegistrationAttempted !== true ||
       caseRecord.leaseRevoked !== true ||
-      !Array.isArray(caseRecord.featureAssertions) ||
-      !caseRecord.featureAssertions.length
+      (isTransportOnly
+        ? caseRecord.featureAssertions !== undefined ||
+          !Array.isArray(caseRecord.leasedToolNames) ||
+          caseRecord.leasedToolNames.length !== 0
+        : !Array.isArray(caseRecord.featureAssertions) || !caseRecord.featureAssertions.length)
     )
       fail("CLEANUP_ONLY_UNSUPPORTED", "用例许可清理不能独立核验。", "INCONCLUSIVE");
+    if (isTransportOnly) transportCaseSpec(caseRecord, config, true);
     const evidence = caseEvidence(db, caseRecord, config);
     await verifyCaseLeaseCleanupEvidence(db, dataDirectory, caseRecord, evidence);
     cleanupVerified = true;
@@ -526,17 +622,142 @@ export async function verifyCaseWithLeaseCleanup(
   verifyAfterCleanup,
 ) {
   let cleanupVerified = false;
+  const requiresLeaseCleanup = Boolean(
+    caseRecord.featureAssertions ||
+    caseRecord.transportOnly === true ||
+    caseRecord.acceptanceLease ||
+    caseRecord.leaseRegistrationAttempted === true,
+  );
   try {
     const evidence = caseEvidence(db, caseRecord, config);
-    if (caseRecord.featureAssertions) {
+    if (requiresLeaseCleanup) {
       await verifyCaseLeaseCleanupEvidence(db, dataDirectory, caseRecord, evidence);
       cleanupVerified = true;
     }
     const result = await verifyAfterCleanup(evidence);
     return { evidence, cleanupVerified, result };
   } catch (error) {
-    if (caseRecord.featureAssertions && error && typeof error === "object")
+    if (requiresLeaseCleanup && error && typeof error === "object")
       error.cleanupVerified = cleanupVerified;
+    throw error;
+  }
+}
+
+export async function verifyTransportOnlyCaseEvidence(
+  caseRecord,
+  config,
+  clients,
+  expectedRuntime,
+  capture = execFileSync,
+) {
+  let after;
+  let db;
+  try {
+    transportCaseSpec(caseRecord, config);
+    after = runtimeSnapshot(config.runtime, capture);
+    if (!expectedRuntime || JSON.stringify(expectedRuntime) !== JSON.stringify(after))
+      fail("RUNTIME_CHANGED", "服务版本或进程与传输用例开始时不一致。", "INCONCLUSIVE");
+    db = new DatabaseSync(join(after.dataDirectory, "glassbox.db"), { readOnly: true });
+    const verified = await verifyCaseWithLeaseCleanup(
+      db,
+      after.dataDirectory,
+      caseRecord,
+      config,
+      async (evidence) => {
+        const messageBinding = await verifyMessageBindings(
+          caseRecord,
+          config,
+          clients,
+          evidence.delivery,
+        );
+        const trace = readTraceEvents(after.checkout, after.dataDirectory, evidence.runId, capture);
+        const events = trace.events?.map((row) => row.event) ?? [];
+        verifyTraceEvidence(events, caseRecord, config, evidence.delivery);
+        verifyTransportOnlyLeaseTraceEvidence(events, caseRecord, evidence.runId);
+        return { messageBinding };
+      },
+    );
+    const finalRuntime = runtimeSnapshot(config.runtime, capture);
+    if (
+      JSON.stringify(after) !== JSON.stringify(finalRuntime) ||
+      JSON.stringify(expectedRuntime) !== JSON.stringify(finalRuntime)
+    )
+      fail("RUNTIME_CHANGED", "核验证据期间服务进程或代码版本发生变化。", "INCONCLUSIVE");
+    return {
+      status: "PASS",
+      acceptanceKind: "TRANSPORT_ONLY",
+      transportOnly: true,
+      caseId: caseRecord.id,
+      runId: verified.evidence.runId,
+      runCreatedAt: verified.evidence.runCreatedAt,
+      runtime: after,
+      messageBinding: verified.result.messageBinding,
+      traceVerified: true,
+      cleanupVerified: verified.cleanupVerified,
+    };
+  } catch (error) {
+    let cleanupVerified = error?.cleanupVerified === true;
+    if (cleanupVerified) {
+      try {
+        const finalRuntime = runtimeSnapshot(config.runtime, capture);
+        cleanupVerified =
+          !!after &&
+          JSON.stringify(after) === JSON.stringify(finalRuntime) &&
+          JSON.stringify(expectedRuntime) === JSON.stringify(finalRuntime);
+      } catch {
+        cleanupVerified = false;
+      }
+    }
+    if (error && typeof error === "object") error.cleanupVerified = cleanupVerified;
+    throw error;
+  } finally {
+    db?.close();
+  }
+}
+
+export async function verifyTransportOnlyEvidence(
+  report,
+  config,
+  clients,
+  expectedRuntime = report?.runtime,
+  capture = execFileSync,
+) {
+  let after;
+  try {
+    after = runtimeSnapshot(config.runtime, capture);
+    const specs = transportSmokeSpecs(config);
+    if (
+      report?.mode !== "run" ||
+      report.status !== "PASS" ||
+      report.transportOnly !== true ||
+      report.suiteSha256 !== transportSuiteHash(config) ||
+      !Array.isArray(report.cases) ||
+      report.cases.length !== specs.length ||
+      !report.runtime ||
+      !expectedRuntime ||
+      JSON.stringify(report.runtime) !== JSON.stringify(expectedRuntime) ||
+      JSON.stringify(expectedRuntime) !== JSON.stringify(after) ||
+      report.cases.some((caseRecord, index) => caseRecord.id !== specs[index].id)
+    )
+      fail("TRANSPORT_SUITE_BINDING", "传输报告与固定三条用例或服务身份不一致。", "INCONCLUSIVE");
+
+    const cases = [];
+    for (const caseRecord of report.cases)
+      cases.push(
+        await verifyTransportOnlyCaseEvidence(caseRecord, config, clients, after, capture),
+      );
+    const finalRuntime = runtimeSnapshot(config.runtime, capture);
+    if (JSON.stringify(after) !== JSON.stringify(finalRuntime))
+      fail("RUNTIME_CHANGED", "整轮传输核验期间服务进程或代码版本发生变化。", "INCONCLUSIVE");
+    return {
+      status: "PASS",
+      acceptanceKind: "TRANSPORT_ONLY",
+      runtime: after,
+      cases,
+    };
+  } catch (error) {
+    if (error && typeof error === "object" && error.cleanupVerified !== true)
+      error.cleanupVerified = false;
     throw error;
   }
 }
@@ -546,7 +767,12 @@ export async function verifyProductEvidence(report, config, clients) {
   const before = report.runtime;
   if (!before || JSON.stringify(before) !== JSON.stringify(after))
     fail("RUNTIME_CHANGED", "测试期间服务进程或代码版本发生变化。", "INCONCLUSIVE");
-  if (report.status !== "PASS" || report.mode !== "run" || report.cases.some((c) => c.moderation))
+  if (
+    report.status !== "PASS" ||
+    report.mode !== "run" ||
+    report.transportOnly === true ||
+    report.cases.some((c) => c.moderation || c.transportOnly === true)
+  )
     fail("ACCEPTANCE_SCOPE", "产品证据验收仅支持通过的固定收发用例。");
   const db = new DatabaseSync(join(after.dataDirectory, "glassbox.db"), {
     readOnly: true,

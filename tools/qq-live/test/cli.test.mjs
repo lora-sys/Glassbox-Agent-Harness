@@ -177,10 +177,24 @@ test("pending Memory fixtures block the account even with another report directo
   const p = join(d, "c.json"),
     locks = join(d, ".glassbox-qq-live-locks");
   await writeFile(p, JSON.stringify(w.config));
+  const suiteSha256 = JSON.parse((await run(["plan", "--config", p], d)).stdout).suiteSha256;
+  await writeFile(p, JSON.stringify({ ...w.config, runtime: {} }));
   await mkdir(locks);
   const pending = join(locks, digest(w.config.driver.qq).slice(0, 24) + ".memory-pending.json");
   await writeFile(pending, "{}");
-  const r = await run(["run", "--live", "--config", p, "--out", join(d, "different-reports")], d);
+  const r = await run(
+    [
+      "run",
+      "--live",
+      "--approve-suite",
+      suiteSha256,
+      "--config",
+      p,
+      "--out",
+      join(d, "different-reports"),
+    ],
+    d,
+  );
   assert.equal(r.code, 2);
   assert.ok(
     JSON.parse(await readFile(join(d, "different-reports", "latest.json"), "utf8")).error.code ===
@@ -189,19 +203,41 @@ test("pending Memory fixtures block the account even with another report directo
   assert.equal(w.actions.length, 0);
   assert.equal(await readFile(pending, "utf8"), "{}");
 });
-test("unknown ordinary send persists STOP and blocks a later run", async (t) => {
+test("default sends are blocked without runtime and identity-bound zero-tool approval", async (t) => {
   const d = await dir(t),
-    w = await world({ ack: "timeout" });
+    w = await world();
   t.after(() => w.close());
   const p = join(d, "c.json"),
     out = join(d, "reports");
   await writeFile(p, JSON.stringify(w.config));
-  const first = await run(["run", "--live", "--case", "private", "--config", p, "--out", out], d);
-  assert.equal(first.code, 3);
-  assert.ok(await readFile(join(out, "STOP"), "utf8"));
-  const count = w.actions.length;
-  assert.equal((await run(["run", "--live", "--config", p, "--out", out], d)).code, 2);
-  assert.equal(w.actions.length, count);
+  const blocked = await run(["run", "--live", "--config", p, "--out", out], d);
+  assert.equal(blocked.code, 2);
+  assert.match(blocked.stderr, /TRANSPORT_RUNTIME_REQUIRED/);
+  assert.equal(w.actions.length, 0);
+  await writeFile(p, JSON.stringify({ ...w.config, runtime: {} }));
+  const unapproved = await run(
+    ["run", "--live", "--approve-suite", "0".repeat(64), "--config", p, "--out", out],
+    d,
+  );
+  assert.equal(unapproved.code, 2);
+  assert.match(unapproved.stderr, /SUITE_APPROVAL/);
+  assert.equal(w.actions.length, 0);
+});
+test("transport suite rejects partial route selection before networking", async (t) => {
+  const d = await dir(t);
+  const w = await world();
+  t.after(() => w.close());
+  const p = join(d, "c.json"),
+    out = join(d, "reports");
+  await writeFile(p, JSON.stringify(w.config));
+  for (const route of ["private", "group-A", "group-B"]) {
+    const result = await run(["run", "--live", "--case", route, "--config", p, "--out", out], d);
+    assert.equal(result.code, 2);
+    assert.match(result.stderr, /TRANSPORT_SUITE_FIXED/);
+  }
+  assert.equal(w.driver.authCount, 0);
+  assert.equal(w.bot.authCount, 0);
+  await assert.rejects(stat(out), { code: "ENOENT" });
 });
 test("custom live prompts are blocked before any network operation", async (t) => {
   const d = await dir(t),
@@ -532,21 +568,64 @@ test("invalid configuration blocks before networking", async (t) => {
   await writeFile(p, '{"schemaVersion":1}');
   assert.equal((await run(["doctor", "--config", p], d)).code, 2);
 });
-test("CLI performs three local-fixture round trips and writes report", async (t) => {
+test("transport plan fixes the three zero-tool cases and binds identities into approval", async (t) => {
+  const d = await dir(t);
+  const p = join(d, "c.json");
+  const config = baseConfig();
+  await writeFile(p, JSON.stringify(config));
+  const planned = await run(["plan", "--case", "transport-smoke", "--config", p], d);
+  assert.equal(planned.code, 0, planned.stderr);
+  const plan = JSON.parse(planned.stdout);
+  assert.equal(plan.transportOnly, true);
+  assert.equal(plan.familyId, "qq-transport-smoke");
+  assert.deepEqual(
+    plan.cases.map((c) => [c.id, c.chat, c.leaseTools]),
+    [
+      ["transport-private", "private", []],
+      ["transport-group-A", "A", []],
+      ["transport-group-B", "B", []],
+    ],
+  );
+  assert.match(plan.suiteSha256, /^[a-f0-9]{64}$/);
+
+  const changed = { ...config, groups: [config.groups[0], { ...config.groups[1], id: "20009" }] };
+  await writeFile(p, JSON.stringify(changed));
+  const replanned = await run(["plan", "--config", p], d);
+  assert.notEqual(JSON.parse(replanned.stdout).suiteSha256, plan.suiteSha256);
+});
+
+test("transport run rejects missing runtime and approval before creating output or connecting", async (t) => {
   const d = await dir(t);
   const w = await world();
   t.after(() => w.close());
   const p = join(d, "c.json"),
     out = join(d, "reports");
   await writeFile(p, JSON.stringify(w.config));
-  const r = await run(["run", "--live", "--config", p, "--out", out], d);
-  assert.equal(r.code, 3, r.stderr + r.stdout);
-  const report = JSON.parse(await readFile(join(out, "latest.json")));
-  assert.equal(report.cases.length, 3);
-  assert.equal(report.productAcceptance.status, "BLOCKED");
-  assert.ok(report.cases.every((c) => c.status === "PASS"));
-  const events = await readFile(join(report.reportDirectory, "events.jsonl"), "utf8");
-  assert.ok(!events.includes("fixture-token-only"));
+  const noRuntime = await run(["run", "--live", "--config", p, "--out", out], d);
+  assert.equal(noRuntime.code, 2);
+  assert.match(noRuntime.stderr, /TRANSPORT_RUNTIME_REQUIRED/);
+  await assert.rejects(stat(out), { code: "ENOENT" });
+  assert.equal(w.driver.authCount, 0);
+  assert.equal(w.bot.authCount, 0);
+
+  const plan = JSON.parse((await run(["plan", "--config", p], d)).stdout);
+  await writeFile(p, JSON.stringify({ ...w.config, runtime: {} }));
+  const noApproval = await run(["run", "--live", "--config", p, "--out", out], d);
+  assert.equal(noApproval.code, 2);
+  assert.match(noApproval.stderr, /SUITE_APPROVAL/);
+  await assert.rejects(stat(out), { code: "ENOENT" });
+  assert.equal(w.driver.authCount, 0);
+  assert.equal(w.bot.authCount, 0);
+
+  const missingRuntime = await run(
+    ["run", "--live", "--approve-suite", plan.suiteSha256, "--config", p, "--out", out],
+    d,
+  );
+  assert.equal(missingRuntime.code, 2);
+  const blockedReport = JSON.parse(await readFile(join(out, "latest.json"), "utf8"));
+  assert.equal(blockedReport.error.code, "RUNTIME_CONFIG");
+  assert.equal(w.driver.authCount, 0);
+  assert.equal(w.bot.authCount, 0);
 });
 test("STOP file blocks all outgoing messages", async (t) => {
   const d = await dir(t);
@@ -555,9 +634,14 @@ test("STOP file blocks all outgoing messages", async (t) => {
   const p = join(d, "c.json"),
     out = join(d, "reports");
   await writeFile(p, JSON.stringify(w.config));
+  const suiteSha256 = JSON.parse((await run(["plan", "--config", p], d)).stdout).suiteSha256;
+  await writeFile(p, JSON.stringify({ ...w.config, runtime: {} }));
   await mkdir(out);
   await writeFile(join(out, "STOP"), "stop");
-  const r = await run(["run", "--live", "--config", p, "--out", out], d);
+  const r = await run(
+    ["run", "--live", "--approve-suite", suiteSha256, "--config", p, "--out", out],
+    d,
+  );
   assert.equal(r.code, 2);
   assert.equal(w.actions.length, 0);
 });
@@ -577,7 +661,7 @@ test("unknown case cannot produce an empty pass", async (t) => {
   assert.equal(r.code, 2);
   assert.ok(r.stderr.includes("CASE_NOT_FOUND"));
 });
-test("ambiguous moderation creates persistent safety STOP", async (t) => {
+test("moderation live command is blocked before creating files or connecting", async (t) => {
   const d = await dir(t);
   const w = await world({ mode: "pretend" });
   t.after(() => w.close());
@@ -586,7 +670,10 @@ test("ambiguous moderation creates persistent safety STOP", async (t) => {
   await writeFile(p, JSON.stringify(w.config));
   const r = await run(["run", "--live", "--case", "moderation", "--config", p, "--out", out], d);
   assert.equal(r.code, 2, r.stdout + r.stderr);
-  assert.ok((await readFile(join(out, "STOP"), "utf8")).includes("CLEANUP_UNCONFIRMED"));
+  assert.match(r.stderr, /MODERATION_LEASE_UNSUPPORTED/);
+  await assert.rejects(stat(out), { code: "ENOENT" });
+  assert.equal(w.driver.authCount, 0);
+  assert.equal(w.bot.authCount, 0);
 });
 
 test("history family plan exposes fixed seed and evidence-derived recall without network", async (t) => {

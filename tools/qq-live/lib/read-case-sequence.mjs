@@ -11,13 +11,15 @@ export async function runReadCaseSequence({
   let productAcceptance = { status: "BLOCKED", code: "NOT_CHECKED", cases: productCases };
   let cleanupStopRequired = false;
   let terminalStatus;
+  const requiresLease = (testCase) =>
+    testCase?.transportOnly === true || Array.isArray(testCase?.featureAssertions);
 
   for (const spec of specs) {
     const testCase = await executeCase(spec);
     cases.push(testCase);
     if (testCase.status !== "PASS") {
       if (
-        Array.isArray(testCase.featureAssertions) &&
+        requiresLease(testCase) &&
         (testCase.leaseRegistrationAttempted === true || testCase.sendAttempted === true)
       ) {
         if (
@@ -97,35 +99,35 @@ export async function runReadCaseSequence({
         verified = await verifyProductCase(testCase);
       } catch (error) {
         const safe = serializeError(error);
-        const featureCase = Array.isArray(testCase.featureAssertions);
-        const cleanupVerified = featureCase && error?.cleanupVerified === true;
+        const leaseCase = requiresLease(testCase);
+        const cleanupVerified = leaseCase && error?.cleanupVerified === true;
         productAcceptance = {
           ...safe,
           cases: productCases,
-          ...(featureCase ? { cleanupRequired: true, cleanupVerified } : {}),
+          ...(leaseCase ? { cleanupRequired: true, cleanupVerified } : {}),
         };
-        if (featureCase && !cleanupVerified) cleanupStopRequired = true;
+        if (leaseCase && !cleanupVerified) cleanupStopRequired = true;
         terminalStatus = safe.status;
         break;
       }
 
       const evidence = verified?.cases?.length === 1 ? verified.cases[0] : undefined;
-      const featureCase = Array.isArray(testCase.featureAssertions);
+      const leaseCase = requiresLease(testCase);
       if (
         verified?.status !== "PASS" ||
         !evidence ||
-        (featureCase && evidence.cleanupVerified !== true)
+        (leaseCase && evidence.cleanupVerified !== true)
       ) {
-        const cleanupVerified = featureCase && evidence?.cleanupVerified === true;
+        const cleanupVerified = leaseCase && evidence?.cleanupVerified === true;
         const failure = {
           status: "INCONCLUSIVE",
-          code: featureCase ? "LEASE_CLEANUP_EVIDENCE" : "PRODUCT_EVIDENCE_INCOMPLETE",
+          code: leaseCase ? "LEASE_CLEANUP_EVIDENCE" : "PRODUCT_EVIDENCE_INCOMPLETE",
           message: "单条用例的产品证据或独立清理回执不完整。",
-          ...(featureCase ? { cleanupRequired: true, cleanupVerified } : {}),
+          ...(leaseCase ? { cleanupRequired: true, cleanupVerified } : {}),
           cases: productCases,
         };
         productAcceptance = failure;
-        if (featureCase && !cleanupVerified) cleanupStopRequired = true;
+        if (leaseCase && !cleanupVerified) cleanupStopRequired = true;
         terminalStatus = failure.status;
         break;
       }
