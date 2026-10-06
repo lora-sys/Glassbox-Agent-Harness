@@ -696,6 +696,16 @@ See `upstream/command-code/SOURCES.md` for the reference note.
 
 ## Stable boundaries
 
+### Website knowledge and personal learning progress
+
+Issue #139 adds two separate sources. Published articles from `https://lora-sys.github.io/loraSys/` form a versioned website corpus. They do not become Canonical Memory. The Owner can use `/knowledge sync`, `/knowledge enable`, `/knowledge disable`, and `/knowledge status` in private chat. Enabled synchronization refreshes every six hours and retains the last complete corpus when a refresh fails. Related answers can cite published article URLs and expose the source dates in runtime Context.
+
+Learning progress records belong to a trusted channel identity and retain their original source scope. Current group Context uses only the sender's records from that group. Private Context can continue that sender's group progress only while current identity, original history permission, source enablement and destination permission allow it. General group Memory and another person's records remain excluded.
+
+Explicit learning goals are observations. Repeated questions are low-confidence cues and require separate occurrences. Neither creates confirmed Taste. `/progress list`, `/progress remember <statement>`, `/progress confirm <id>`, `/progress correct <id> | <statement>`, and `/progress delete <id>` operate on the caller's own records. Correction and deletion change the revision and invalidate previous Context and pending delivery dependencies. Normal group replies do not disclose the sender's previous questions.
+
+The Owner can request `/knowledge interests <topic>` to create pending preference candidates supported by article excerpts. The existing Owner candidate review decides promotion. Website updates retire old delivery dependencies. Progress source revocation, identity unbinding and record revision changes are checked before provider requests and delivery.
+
 - Rules are explicit authority; Taste is preference.
 - Skills are reusable procedures; Taste is not a procedure library.
 - Taste is not generic Memory.

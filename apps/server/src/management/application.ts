@@ -1,4 +1,7 @@
 import { join } from "node:path";
+import { KnowledgeProgressContext } from "../application/knowledge-progress.js";
+import { WEBSITE_KNOWLEDGE_RESOURCE, type KnowledgeNetworkProvider } from "../knowledge/index.js";
+import { learningProgressResourceId } from "../learning-progress/identity.js";
 import { randomUUID } from "node:crypto";
 import { AccessDeniedError } from "../auth/service.js";
 import { chmod, mkdtemp, rm } from "node:fs/promises";
@@ -425,6 +428,10 @@ export class ManagementApplication {
   private readonly connectionEverReady = new Set<string>();
   private readonly historyPoller: GroupHistoryPoller;
   private operations: Promise<unknown> = Promise.resolve();
+  private readonly personalContext: KnowledgeProgressContext;
+  private knowledgeSyncTimer?: NodeJS.Timeout;
+  private knowledgeSyncJob?: Promise<void>;
+  private readonly knowledgeSyncAbort = new AbortController();
   private accepting = false;
   private releaseIngress!: () => void;
   private readonly ingressReady = new Promise<void>((resolve) => {
@@ -437,6 +444,7 @@ export class ManagementApplication {
       kitPath?: string;
       models: ModelProfileStore;
       mediaProvider?: MediaGenerationProvider;
+      knowledgeNetwork?: KnowledgeNetworkProvider;
       browserExecutor?: BrowserExecutorPort;
       executors?: ReadonlyMap<string, RunExecutionAdapter>;
       ops?: {
@@ -506,12 +514,39 @@ export class ManagementApplication {
       dataDirectory: options.dataDirectory,
       maxEventBytes: 128 * 1024,
     });
+    this.personalContext = new KnowledgeProgressContext(store, async (input, record) => {
+      const cursor = await this.trace.append(
+        input.run.id,
+        {
+          ...record,
+          runId: input.run.id,
+          principalId: input.caller.principalId,
+          conversationId: input.conversation.id,
+        },
+        "glassbox-knowledge-learning",
+      );
+      await this.store.evidence.advanceTrace(input.caller, cursor);
+    });
     this.evaluator = createRunEvaluator({ store, trace: this.trace });
     this.runs = new RunService({
       store,
       queuedPollMs: options.temporal ? 2_000 : 0,
       resolveExecution: (reference) => this.execution(reference),
       captureLearning: async (input) => {
+        try {
+          await this.store.progress.captureCurrentRun({
+            caller: input.caller,
+            conversationId: input.conversation.id,
+            runId: input.run.id,
+          });
+        } catch {
+          const cursor = await this.trace.append(
+            input.run.id,
+            { type: "learning_progress_capture", status: "unavailable", runId: input.run.id },
+            "glassbox-learning-progress",
+          );
+          await this.store.evidence.advanceTrace(input.caller, cursor);
+        }
         const candidate = await this.store.learning.captureCurrentMessage({
           caller: input.caller,
           conversationId: input.conversation.id,
@@ -679,6 +714,7 @@ export class ManagementApplication {
     piAgentDirectory?: string | null;
     models: ModelProfileStore;
     mediaProvider?: MediaGenerationProvider;
+    knowledgeNetwork?: KnowledgeNetworkProvider;
     browserExecutor?: BrowserExecutorPort;
     executors?: ReadonlyMap<string, RunExecutionAdapter>;
     ops?: {
@@ -699,6 +735,7 @@ export class ManagementApplication {
     const groupRuntime = await GroupRuntimeStore.open(options.dataDirectory);
     const store = await openDomainStore({
       databasePath: options.databasePath ?? join(options.dataDirectory, "glassbox.db"),
+      knowledgeNetwork: options.knowledgeNetwork,
     });
     const application = new ManagementApplication(options, store, channels, groupRuntime);
     try {
@@ -814,6 +851,17 @@ export class ManagementApplication {
       // After transport is restored, so the first tick has connections to walk. A group nobody
       // searches would otherwise never be archived at all.
       application.historyPoller.start();
+      application.knowledgeSyncTimer = setInterval(() => {
+        if (application.knowledgeSyncJob) return;
+        application.knowledgeSyncJob = store.knowledge
+          .refreshIfDue(application.knowledgeSyncAbort.signal)
+          .then(() => undefined)
+          .catch(() => undefined)
+          .finally(() => {
+            application.knowledgeSyncJob = undefined;
+          });
+      }, 60_000);
+      application.knowledgeSyncTimer.unref();
       void application.connectTemporal();
       return application;
     } catch (error) {
@@ -1521,6 +1569,7 @@ export class ManagementApplication {
       },
     });
     const adapter = new PiRunExecutionAdapter(runtime, {
+      personalContext: this.personalContext,
       isOwner: (input) => this.store.identities.isOwner(input.caller.principalId),
       learningStore: this.store.learning,
       listModelProfiles: () => this.selectableModelProfiles(),
@@ -2170,6 +2219,10 @@ export class ManagementApplication {
       supportsGroup: direct?.supportsGroup ?? false,
       supportsTaskStepModel: direct?.supportsTaskStepModel ?? false,
       execute: async (input: ExecutionInput) => {
+        const personalCommand = /^\/(?:knowledge|progress)\b/iu.test(input.text.trim())
+          ? await this.personalContext.command(input)
+          : undefined;
+        if (personalCommand) return personalCommand;
         const profileId = reference.slice(kind.length + 1);
         const configured = this.selectableModelProfiles(kind === "pi");
         const origin = configured.find((profile) => profile.id === profileId);
@@ -3143,6 +3196,37 @@ export class ManagementApplication {
       : this.store.authorization.grant.bind(this.store.authorization);
     const isOwner = await this.store.identities.isOwner(principalId);
     const caller: CallerContext = { principalId, scope };
+    await this.store.authorization.provisionResources({
+      caller,
+      initialOnly,
+      entries: [
+        ...[
+          "knowledge:read",
+          "delivery:send",
+          ...(isOwner && scope.chatType === "private" ? ["knowledge:sync"] : []),
+        ].map((action) => ({
+          resource: {
+            id: WEBSITE_KNOWLEDGE_RESOURCE,
+            kind: "website-knowledge",
+            visibility: "public" as const,
+            ifAbsent: true,
+          },
+          action,
+        })),
+        ...["progress:read", "progress:write", "progress:manage", "delivery:send"].map(
+          (action) => ({
+            resource: {
+              id: learningProgressResourceId(caller),
+              kind: "learning-progress",
+              visibility: "public" as const,
+              ownerId: principalId,
+              ifAbsent: true,
+            },
+            action,
+          }),
+        ),
+      ],
+    });
     for (const action of ACTIONS) {
       if (!isOwner && action === "eval:write") continue;
       const existing = await this.store.authorization.check({
@@ -4874,6 +4958,9 @@ export class ManagementApplication {
   }
 
   async close() {
+    if (this.knowledgeSyncTimer) clearInterval(this.knowledgeSyncTimer);
+    this.knowledgeSyncAbort.abort();
+    await this.knowledgeSyncJob;
     this.closed = true;
     clearTimeout(this.temporalRetry);
     await this.temporalConnecting;

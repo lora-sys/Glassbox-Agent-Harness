@@ -11,12 +11,17 @@ import { LongWorkStore } from "../ops/long-work-store.js";
 import { DurableContinuationStore } from "../ops/continuation-store.js";
 import { TaskNotificationStore } from "../ops/task-notification-store.js";
 import { LearningStore } from "../learning/store.js";
+import { WebsiteKnowledgeService, type KnowledgeNetworkProvider } from "../knowledge/index.js";
+import { LearningProgressStore } from "../learning-progress/store.js";
 
 /**
  * Composition root for the stores shared by server application workflows.
  * Product domains own each store; this module only wires their dependencies and lifecycle.
  */
-export async function openDomainStore(options: { databasePath: string }) {
+export async function openDomainStore(options: {
+  databasePath: string;
+  knowledgeNetwork?: KnowledgeNetworkProvider;
+}) {
   const db = await DomainDatabase.open(options.databasePath);
   const authorization = new AuthorizationService(db);
   return {
@@ -33,6 +38,12 @@ export async function openDomainStore(options: { databasePath: string }) {
     continuations: new DurableContinuationStore(db),
     taskNotifications: new TaskNotificationStore(db),
     learning: new LearningStore(db, authorization),
+    knowledge: new WebsiteKnowledgeService({
+      db,
+      authorization,
+      network: options.knowledgeNetwork,
+    }),
+    progress: new LearningProgressStore(db, authorization),
     close: () => db.close(),
   };
 }

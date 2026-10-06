@@ -33,6 +33,8 @@ export interface ExecutionInput {
   historyOmittedRunIds?: string[];
   /** Bounded, active, authorized learning records selected for this exact Run scope. */
   learningContext?: readonly { memoryId: string; type: string; statement: string }[];
+  /** Server-selected website excerpts and own learning progress; untrusted source data. */
+  personalContext?: readonly { kind: "website" | "learning_progress"; text: string }[];
   /** Only present when saved for this exact execution configuration and Conversation. */
   providerSessionId: string | null;
   signal: AbortSignal;
