@@ -5,6 +5,7 @@ import { isDeepStrictEqual } from "node:util";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { createHistoryLessonReader } from "../../../../tools/qq-live/lib/history-lesson-reader.mjs";
 import {
   observeFeature,
   validateFeatureAssertions,
@@ -19,8 +20,9 @@ import {
   verifyMemoryCleanup,
 } from "../../../../tools/qq-live/lib/memory-fixture.mjs";
 import { memoryFixtureStep } from "../../../../tools/qq-live/lib/memory-scenario.mjs";
-import { toolManifestDigest } from "../../../../tools/qq-live/lib/core.mjs";
+import { toolManifestDigest, validateConfig } from "../../../../tools/qq-live/lib/core.mjs";
 import { verifyMemoryFamilyReport } from "../../../../tools/qq-live/lib/memory-family-evidence.mjs";
+import { verifyArchivedHistoryLesson } from "../../../../tools/qq-live/lib/history-lesson-evidence.mjs";
 import {
   MEMORY_FAMILY_ID,
   MEMORY_REJECT_FAMILY_ID,
@@ -897,7 +899,7 @@ export function verifyStandardReport(report, lesson, evidence, capture = execFil
 export async function appendLesson(
   input,
   path = join(dirname(SCRIPT_DIR), "references", "lessons.jsonl"),
-  { capture } = {},
+  { capture, historyBindings } = {},
 ) {
   const validated = validateLesson(input);
   const lesson = validated.lesson;
@@ -916,11 +918,19 @@ export async function appendLesson(
     }
     const evidence = validateLiveReport(report, lesson, reportPath, digest(bytes));
     const traceEvents = traceEventsForLesson(report, lesson, evidence, capture ?? execFileSync);
+    const archivedHistory = await verifyArchivedHistoryLesson(
+      report,
+      lesson,
+      evidence,
+      capture ?? execFileSync,
+      { historyBindings },
+    );
     const selectedCase = report.cases.find((item) => item.id === lesson.case);
     const selectedAccepted = report.productAcceptance.cases.find(
       (item) => item.caseId === lesson.case,
     );
     if (
+      !archivedHistory &&
       requiresIndependentMemberCountVerification(
         selectedCase,
         selectedAccepted,
@@ -929,24 +939,26 @@ export async function appendLesson(
       )
     )
       invalid("Independent group member count evidence is unavailable for verified lessons");
-    if (requiresMemoryLifecycleVerification(report, traceEvents, evidence.runId)) {
-      if (report.memoryFamily?.caseId === MEMORY_REJECT_FAMILY_ID)
-        await verifyMemoryRejectReport(report, lesson, evidence, capture);
-      else {
-        if (
-          Object.hasOwn(report, "memoryFamily") &&
-          report.memoryFamily?.caseId !== MEMORY_FAMILY_ID
-        )
-          invalid("Unknown Memory family cannot produce a verified lesson");
-        verifyMemoryLifecycleReport(report, lesson, evidence, capture);
+    if (!archivedHistory) {
+      if (requiresMemoryLifecycleVerification(report, traceEvents, evidence.runId)) {
+        if (report.memoryFamily?.caseId === MEMORY_REJECT_FAMILY_ID)
+          await verifyMemoryRejectReport(report, lesson, evidence, capture);
+        else {
+          if (
+            Object.hasOwn(report, "memoryFamily") &&
+            report.memoryFamily?.caseId !== MEMORY_FAMILY_ID
+          )
+            invalid("Unknown Memory family cannot produce a verified lesson");
+          verifyMemoryLifecycleReport(report, lesson, evidence, capture);
+        }
+      } else {
+        const caseRecord = report.cases.find((item) => item.id === lesson.case);
+        const accepted = report.productAcceptance.cases.find((item) => item.caseId === lesson.case);
+        verifyTracePromptHash(caseRecord, accepted, traceEvents);
+        if (caseRecord.featureAssertions?.length)
+          verifyFeatureReport(report, lesson, evidence, capture);
+        else verifyStandardReport(report, lesson, evidence, capture);
       }
-    } else {
-      const caseRecord = report.cases.find((item) => item.id === lesson.case);
-      const accepted = report.productAcceptance.cases.find((item) => item.caseId === lesson.case);
-      verifyTracePromptHash(caseRecord, accepted, traceEvents);
-      if (caseRecord.featureAssertions?.length)
-        verifyFeatureReport(report, lesson, evidence, capture);
-      else verifyStandardReport(report, lesson, evidence, capture);
     }
     lesson.evidence.reportSha256 = evidence.reportSha256;
   }
@@ -954,23 +966,58 @@ export async function appendLesson(
   return lesson;
 }
 
-async function main(args) {
-  if (args.length !== 2 || args[0] !== "--input") {
-    invalid("Usage: node record-lesson.mjs --input <json-file>");
-  }
+export function parseLessonArguments(args) {
+  if (
+    !Array.isArray(args) ||
+    ![2, 4].includes(args.length) ||
+    args[0] !== "--input" ||
+    typeof args[1] !== "string" ||
+    !args[1].trim() ||
+    args[1].includes("\0") ||
+    (args.length === 4 &&
+      (args[2] !== "--config" ||
+        typeof args[3] !== "string" ||
+        !args[3].trim() ||
+        args[3].includes("\0")))
+  )
+    invalid("Usage: node record-lesson.mjs --input <json-file> [--config <qq-live-config>]");
+  return { input: args[1], ...(args.length === 4 ? { config: args[3] } : {}) };
+}
+
+export async function runLessonCli(args) {
+  const options = parseLessonArguments(args);
   let input;
   try {
-    input = JSON.parse(await readFile(resolve(args[1]), "utf8"));
+    input = JSON.parse(await readFile(resolve(options.input), "utf8"));
   } catch {
     invalid("Input file is unreadable or is not valid JSON");
   }
-  const lesson = await appendLesson(input);
-  process.stdout.write(`Recorded ${lesson.status} lesson for ${lesson.case} at ${lesson.commit}\n`);
+  let reader;
+  if (options.config) {
+    let raw;
+    try {
+      raw = JSON.parse(await readFile(resolve(options.config), "utf8"));
+    } catch {
+      invalid("QQ live configuration is unreadable or invalid JSON");
+    }
+    reader = createHistoryLessonReader(validateConfig(raw));
+  }
+  try {
+    const historyBindings = reader
+      ? (caseRecord, config, delivery) => reader.readBindings(caseRecord, config, delivery)
+      : undefined;
+    const lesson = await appendLesson(input, undefined, { historyBindings });
+    process.stdout.write(
+      `Recorded ${lesson.status} lesson for ${lesson.case} at ${lesson.commit}\n`,
+    );
+  } finally {
+    reader?.close();
+  }
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
   try {
-    await main(process.argv.slice(2));
+    await runLessonCli(process.argv.slice(2));
   } catch (error) {
     process.stderr.write(`${error.message}\n`);
     process.exitCode = 1;

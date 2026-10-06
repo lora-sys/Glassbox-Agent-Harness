@@ -8,6 +8,25 @@ import { fileURLToPath } from "node:url";
 import { world, baseConfig } from "./fixture.mjs";
 import { digest } from "../lib/core.mjs";
 const cli = fileURLToPath(new URL("../cli.mjs", import.meta.url));
+
+test("lesson registration rejects execution flags before reading configuration or sending", async (t) => {
+  const d = await dir(t);
+  for (const options of [
+    [],
+    ["--input", "lesson.json", "--live"],
+    ["--input", "lesson.json", "--case", "group-A"],
+    ["--input", "lesson.json", "--pr", "https://example.invalid/pr"],
+  ]) {
+    const result = await run(["record-lesson", ...options], d);
+    assert.notEqual(result.code, 0);
+    assert.ok(result.stderr.includes("ARGUMENT"));
+  }
+  const input = join(d, "invalid-lesson.json");
+  await writeFile(input, '{"private":"do-not-expose-this-value"');
+  const invalid = await run(["record-lesson", "--input", input], d);
+  assert.notEqual(invalid.code, 0);
+  assert.ok(!`${invalid.stdout}${invalid.stderr}`.includes("do-not-expose-this-value"));
+});
 async function run(args, dir, extraEnv = {}) {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [cli, ...args], {

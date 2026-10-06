@@ -40,6 +40,7 @@ node cli.mjs coverage
 node cli.mjs delivery-check --pr <URL> --scenarios <file> --reports <manifest> --approve-suite <SHA256>
 node cli.mjs deliver --live --pr <URL> --scenarios <file> --reports <manifest> --approve-suite <SHA256>
 node cli.mjs postmerge-check --pr <URL> --scenarios <file> --reports <manifest> --approve-suite <SHA256>
+node cli.mjs record-lesson --input <lesson-json> --config <local-config>
 node cli.mjs report
 
 通用选项 --config <文件> --out <报告目录>
@@ -72,6 +73,7 @@ function args(argv) {
         "--catalog",
         "--pr",
         "--reports",
+        "--input",
       ].includes(k) ||
       !argv[i + 1] ||
       argv[i + 1].startsWith("--")
@@ -93,6 +95,7 @@ function args(argv) {
       "delivery-check",
       "deliver",
       "postmerge-check",
+      "record-lesson",
     ].includes(command)
   )
     fail("COMMAND", "未知命令。");
@@ -178,6 +181,13 @@ async function main() {
     return;
   }
   const configPath = resolve(o.config ?? join(root, "qq-live.local.json"));
+  if (command === "record-lesson") {
+    if (!o.input || Object.keys(o).some((key) => !["input", "config"].includes(key)))
+      fail("ARGUMENT", "经验登记只接受 --input 和既有 --config，不接受发送或合并选项。");
+    const { runLessonCli } =
+      await import("../../.agents/skills/qq-live-testing/scripts/record-lesson.mjs");
+    return runLessonCli(["--input", resolve(o.input), "--config", configPath]);
+  }
   const out = resolve(o.out ?? join(root, "artifacts"));
   if (command === "init") {
     const template = await readFile(join(root, "examples/config.example.json"), "utf8");

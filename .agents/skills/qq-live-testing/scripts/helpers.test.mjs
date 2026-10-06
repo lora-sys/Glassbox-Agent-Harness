@@ -1918,3 +1918,13 @@ test("seed recall lessons cannot claim verified after removing their source asse
     /seed-family verification is unavailable/,
   );
 });
+
+test("archived history final-stage cases cannot downgrade when family metadata is removed", async (t) => {
+  for (const caseId of ["history-seed-recall", "history-cross-group-private-exclusion"]) {
+    const fixture = await createPassingHistoryResultReport(t, caseId);
+    await assert.rejects(
+      appendLesson(fixture.input, join(fixture.temp, `${caseId}.jsonl`)),
+      /Archived history family evidence did not verify/,
+    );
+  }
+});
