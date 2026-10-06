@@ -677,6 +677,20 @@ async function executeProviderCall(
     // evidence, role and category I/O. Separate awaited checks leave a revocation window.
     await authorizeResolvedMutation!(capability);
   }
+  if (
+    context.acceptanceLease &&
+    !context.acceptanceLease.checkToolCall({
+      toolName: capability.tool,
+      action: capability.action,
+      resourceId: capabilityResourceId({
+        resource: capability.resource,
+        scope: context.caller.scope,
+        groupId,
+      }),
+      toolInput: params,
+    })
+  )
+    throw new ToolInputError("acceptance_lease_denied");
   if (signal?.aborted) throw new Error("Operation cancelled");
   if (capability.risk !== "read") consumeMutationIntent(context, capability.tool, mutationInput);
 
@@ -847,6 +861,7 @@ export function createCapabilityTools(
           caller: value.caller,
           conversationId: value.conversationId,
           runId: value.runId,
+          ...(value.acceptanceLease ? { acceptanceLease: value.acceptanceLease } : {}),
           ...(value.requiredToolName === undefined
             ? {}
             : { requiredToolName: value.requiredToolName }),

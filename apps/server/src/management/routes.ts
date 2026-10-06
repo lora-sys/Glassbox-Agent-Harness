@@ -41,6 +41,9 @@ export interface ManagementRouteDependencies {
   grantWorkspace(input: unknown): Promise<unknown>;
   revokeWorkspace(input: unknown): Promise<unknown>;
   selectWorkspace(input: unknown): Promise<unknown>;
+  registerQqLiveLease(input: unknown): Promise<unknown>;
+  revokeQqLiveLease(id: string): Promise<unknown>;
+  revokeQqLiveLeaseByMarker(marker: string): Promise<unknown>;
   store: RouteStore;
   grantOpsPermissions(input: unknown): Promise<unknown>;
   executors: Pick<ExecutorConfiguration, "list" | "save" | "check">;
@@ -195,6 +198,20 @@ export async function routeManagementRequest(
 ): Promise<{ status: number; body: unknown } | undefined> {
   const url = new URL(request.url ?? "/", "http://localhost");
   const path = url.pathname;
+  if (request.method === "POST" && path === "/manage/qq-live/leases") {
+    const result = await dependencies.registerQqLiveLease(await readManagementJson(request));
+    return { status: 200, body: result };
+  }
+  const qqLiveMarker = /^\/manage\/qq-live\/leases\/by-marker\/([a-f0-9]{32})$/iu.exec(path);
+  if (request.method === "DELETE" && qqLiveMarker) {
+    const result = await dependencies.revokeQqLiveLeaseByMarker(qqLiveMarker[1]!);
+    return { status: 200, body: result };
+  }
+  const qqLiveLease = /^\/manage\/qq-live\/leases\/([a-f0-9-]{36})$/iu.exec(path);
+  if (request.method === "DELETE" && qqLiveLease) {
+    const result = await dependencies.revokeQqLiveLease(qqLiveLease[1]!);
+    return { status: 200, body: result };
+  }
   if (request.method === "POST" && path === "/manage/ops/grants") {
     const result = await dependencies.grantOpsPermissions(await readManagementJson(request));
     return { status: 200, body: result };

@@ -62,7 +62,7 @@ node .agents/skills/glassbox-ops/scripts/gbxtrace.mjs env
 | `gbx types`                               | 本地全部 run 的事件类型与终态分布（校准对 trace 的预期）                                                                                                                                                            |
 | `gbx drift`                               | **文档漂移检测**：本地 trace 里出现、但 `references/trace-events.md` 没记录的事件类型，附样本 JSON                                                                                                                  |
 
-所有命令支持 `--json`（机器可读，便于二次处理）和 `--data-dir <path>`（覆盖数据目录）。runId 支持不冲突的前缀。出错时退出码 2 并给出原因。
+所有命令支持 `--json`（机器可读，便于二次处理）。当前 `--data-dir <path>` 直接指定 runs 目录，例如 `--data-dir /home/yanbingzhao/.glassbox/runs`。它不是 Glassbox 数据根目录。当前 CLI 也会把 `GLASSBOX_DATA_DIR` 直接当作 runs 目录，这与服务管理器的数据根目录语义不同。调试时显式使用 `--data-dir <数据根目录>/runs`，不要为了调试改动服务环境。runId 支持不冲突的前缀。出错时退出码 2 并给出原因。
 
 常用组合：
 

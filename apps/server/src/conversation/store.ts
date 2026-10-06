@@ -1,4 +1,5 @@
 import { readPolicyCondition } from "../auth/policy-condition.js";
+import { recordFilteredDecision } from "../auth/filtered-decision.js";
 import {
   readRunSourceRows,
   readTaskSourceRows,
@@ -1669,6 +1670,7 @@ export class ConversationStore {
               runId,
             });
             if (decision.decision !== "ALLOW") {
+              await recordFilteredDecision(tx, caller, { runId }, decision, "conversation-history");
               permitted = false;
               break;
             }

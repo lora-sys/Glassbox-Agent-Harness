@@ -97,6 +97,274 @@ function fixture(results: PiRunResult[], authorizedToolNames: string[] = []) {
   };
 }
 
+it("denies a marked Run with an inactive empty-tool lease before provider initialization", async () => {
+  const f = fixture([{ status: "completed", text: "should not reach the model", toolCalls: [] }]);
+  const initialize = vi.spyOn(f.runtime, "initialize");
+  const input = {
+    ...f.input,
+    text: "GLASSBOX_ACCEPTANCE_V1 00112233445566778899aabbccddeeff\nReply only.",
+  };
+  const executor = new PiRunExecutionAdapter(f.runtime, {
+    resolveAcceptanceLease: () => ({
+      leaseId: "lease-1",
+      marker: "00112233445566778899aabbccddeeff",
+      toolsSha256: "0".repeat(64),
+      assertActive: () => false,
+      filterToolNames: () => [],
+      checkToolCall: () => false,
+    }),
+  });
+  const result = await executor.execute(input);
+  expect(result).toMatchObject({
+    status: "failed",
+    runtimeAttempted: false,
+    failureCode: "gate_refused",
+  });
+  expect(initialize).not.toHaveBeenCalled();
+  expect(f.run).not.toHaveBeenCalled();
+});
+
+it("rechecks lease activity after asynchronous source authorization", async () => {
+  const f = fixture([{ status: "completed", text: "should not reach the model", toolCalls: [] }]);
+  let active = true;
+  const authorizeContext = vi.fn(async () => {
+    active = false;
+  });
+  const executor = new PiRunExecutionAdapter(f.runtime, {
+    resolveAcceptanceLease: () => ({
+      leaseId: "lease-1",
+      marker: "00112233445566778899aabbccddeeff",
+      toolsSha256: "0".repeat(64),
+      assertActive: () => active,
+      filterToolNames: () => [],
+      checkToolCall: () => false,
+    }),
+    learningStore: {
+      listMemories: vi.fn(async () => []),
+      authorizeContext,
+    } as unknown as LearningStore,
+  });
+  f.input.text = "GLASSBOX_ACCEPTANCE_V1 00112233445566778899aabbccddeeff\nReply only.";
+  await expect(executor.execute(f.input)).resolves.toMatchObject({
+    status: "failed",
+    failureCode: "gate_refused",
+    runtimeAttempted: false,
+  });
+  expect(authorizeContext).toHaveBeenCalledOnce();
+  expect(f.run).not.toHaveBeenCalled();
+});
+
+it("parses only the verified acceptance body for Owner Memory commands and preserves raw input", async () => {
+  const marker = "00112233445566778899aabbccddeeff";
+  const text = `GLASSBOX_ACCEPTANCE_V1 ${marker}\r\n/memory feedback project:qqtest-${marker} explicit_positive fixture-${marker}`;
+  const f = fixture([
+    {
+      status: "completed",
+      text: "Feedback recorded.",
+      toolCalls: [
+        {
+          name: OWNER_MEMORY_ADMIN_TOOL,
+          input: {
+            action: "feedback",
+            scopeType: "project",
+            projectId: `qqtest-${marker}`,
+            signalType: "explicit_positive",
+            statement: `fixture-${marker}`,
+          },
+          failed: false,
+        },
+      ],
+    },
+  ]);
+  f.input.text = text;
+  f.createOrRestoreSession.mockImplementation(async (_conversation, _profile, context) => {
+    if (context) context.authorizedToolNames = [OWNER_MEMORY_ADMIN_TOOL];
+    return {
+      conversationId: "conversation-1",
+      runtimeSessionId: "session-1",
+      profileName: "main-agent" as const,
+      agentDir: "agent",
+      createdAt: new Date(0).toISOString(),
+      lastActiveAt: new Date(0).toISOString(),
+    };
+  });
+  const executor = new PiRunExecutionAdapter(f.runtime, {
+    resolveAcceptanceLease: () => ({
+      leaseId: "lease-1",
+      marker,
+      toolsSha256: "0".repeat(64),
+      assertActive: () => true,
+      filterToolNames: (names) => names.filter((name) => name === OWNER_MEMORY_ADMIN_TOOL),
+      checkToolCall: () => true,
+    }),
+  });
+
+  await expect(executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+  expect(f.input.text).toBe(text);
+  expect(f.run.mock.calls[0]?.[2]).toContain(text);
+  expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe(OWNER_MEMORY_ADMIN_TOOL);
+  expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({
+    action: "feedback",
+    scopeType: "project",
+    projectId: `qqtest-${marker}`,
+    signalType: "explicit_positive",
+    statement: `fixture-${marker}`,
+  });
+});
+
+it("strips only the exact acceptance nonce footer from promoted and expired Memory commands", async () => {
+  const marker = "00112233445566778899aabbccddeeff";
+  const cases = [
+    { action: "promote", id: `candidate_${"a".repeat(32)}` },
+    { action: "expire", id: "memory-fixture" },
+  ] as const;
+  for (const { action, id } of cases) {
+    const text = `GLASSBOX_ACCEPTANCE_V1 ${marker}\n/memory ${action} ${id}\n请在回复中包含本轮测试编号 ${marker}。`;
+    const f = fixture(
+      [
+        {
+          status: "completed",
+          text: "Memory command completed.",
+          toolCalls: [{ name: OWNER_MEMORY_ADMIN_TOOL, input: { action, id }, failed: false }],
+        },
+      ],
+      [OWNER_MEMORY_ADMIN_TOOL],
+    );
+    f.input.text = text;
+    const executor = new PiRunExecutionAdapter(f.runtime, {
+      resolveAcceptanceLease: () => ({
+        leaseId: "lease-1",
+        marker,
+        toolsSha256: "0".repeat(64),
+        assertActive: () => true,
+        filterToolNames: (names) => names.filter((name) => name === OWNER_MEMORY_ADMIN_TOOL),
+        checkToolCall: ({ toolName }) => toolName === OWNER_MEMORY_ADMIN_TOOL,
+      }),
+    });
+
+    await expect(executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(f.input.text).toBe(text);
+    expect(f.run.mock.calls[0]?.[2]).toContain(text);
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe(OWNER_MEMORY_ADMIN_TOOL);
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({ action, id });
+  }
+});
+
+it("refuses malformed or misplaced acceptance Memory nonce footers", async () => {
+  const marker = "00112233445566778899aabbccddeeff";
+  const command = `/memory promote candidate_${"a".repeat(32)}`;
+  const invalidFooters = [
+    `请在回复中包含本轮测试编号 ffeeddccbbaa99887766554433221100。`,
+    `请在回复中包含本轮测试编号 ${marker}`,
+    `请在回复中包含本轮测试编号 ${marker}。\nextra`,
+    ` 请在回复中包含本轮测试编号 ${marker}。`,
+    `\t请在回复中包含本轮测试编号 ${marker}。`,
+  ];
+  for (const footer of invalidFooters) {
+    const f = fixture([{ status: "completed", text: "should not reach the model", toolCalls: [] }]);
+    const initialize = vi.spyOn(f.runtime, "initialize");
+    f.input.text = `GLASSBOX_ACCEPTANCE_V1 ${marker}\n${command}\n${footer}`;
+    const executor = new PiRunExecutionAdapter(f.runtime, {
+      resolveAcceptanceLease: () => ({
+        leaseId: "lease-1",
+        marker,
+        toolsSha256: "0".repeat(64),
+        assertActive: () => true,
+        filterToolNames: () => [],
+        checkToolCall: () => false,
+      }),
+    });
+
+    await expect(executor.execute(f.input)).resolves.toMatchObject({
+      status: "failed",
+      runtimeAttempted: false,
+      failureCode: "gate_refused",
+    });
+    expect(initialize).not.toHaveBeenCalled();
+    expect(f.run).not.toHaveBeenCalled();
+  }
+});
+
+it("does not treat extra acceptance body lines as a required Memory command", async () => {
+  const marker = "00112233445566778899aabbccddeeff";
+  const command = `/memory promote candidate_${"a".repeat(32)}`;
+  const text = `GLASSBOX_ACCEPTANCE_V1 ${marker}\ncontext line\n${command}\n请在回复中包含本轮测试编号 ${marker}。`;
+  const f = fixture([{ status: "completed", text: "No action taken.", toolCalls: [] }]);
+  f.input.text = text;
+  const executor = new PiRunExecutionAdapter(f.runtime, {
+    resolveAcceptanceLease: () => ({
+      leaseId: "lease-1",
+      marker,
+      toolsSha256: "0".repeat(64),
+      assertActive: () => true,
+      filterToolNames: (names) => names.filter((name) => name === OWNER_MEMORY_ADMIN_TOOL),
+      checkToolCall: () => true,
+    }),
+  });
+
+  await expect(executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+  expect(f.input.text).toBe(text);
+  expect(f.run.mock.calls[0]?.[2]).toContain(text);
+  expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBeUndefined();
+  expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toBeUndefined();
+});
+
+it("does not bind an acceptance Memory command to a Tool omitted by the lease", async () => {
+  const marker = "00112233445566778899aabbccddeeff";
+  const f = fixture([{ status: "completed", text: "No action taken.", toolCalls: [] }]);
+  f.input.text = `GLASSBOX_ACCEPTANCE_V1 ${marker}\n/memory promote candidate_${"a".repeat(32)}\n请在回复中包含本轮测试编号 ${marker}。`;
+  f.createOrRestoreSession.mockImplementation(async (_conversation, _profile, context) => {
+    if (context) context.authorizedToolNames = [];
+    return {
+      conversationId: "conversation-1",
+      runtimeSessionId: "session-1",
+      profileName: "main-agent" as const,
+      agentDir: "agent",
+      createdAt: new Date(0).toISOString(),
+      lastActiveAt: new Date(0).toISOString(),
+    };
+  });
+  const executor = new PiRunExecutionAdapter(f.runtime, {
+    resolveAcceptanceLease: () => ({
+      leaseId: "lease-1",
+      marker,
+      toolsSha256: "0".repeat(64),
+      assertActive: () => true,
+      filterToolNames: (names) => names.filter((name) => name !== OWNER_MEMORY_ADMIN_TOOL),
+      checkToolCall: () => false,
+    }),
+  });
+
+  await expect(executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+  expect(f.run.mock.calls[0]?.[3]?.authorizedToolNames).not.toContain(OWNER_MEMORY_ADMIN_TOOL);
+  expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBeUndefined();
+});
+
+it("fails closed when the marker does not match the active acceptance lease", async () => {
+  const f = fixture([{ status: "completed", text: "should not reach the model", toolCalls: [] }]);
+  const initialize = vi.spyOn(f.runtime, "initialize");
+  f.input.text =
+    "GLASSBOX_ACCEPTANCE_V1 ffeeddccbbaa99887766554433221100\n/memory promote candidate_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const executor = new PiRunExecutionAdapter(f.runtime, {
+    resolveAcceptanceLease: () => ({
+      leaseId: "lease-1",
+      marker: "00112233445566778899aabbccddeeff",
+      toolsSha256: "0".repeat(64),
+      assertActive: () => true,
+      filterToolNames: () => [],
+      checkToolCall: () => false,
+    }),
+  });
+
+  await expect(executor.execute(f.input)).resolves.toMatchObject({
+    status: "failed",
+    runtimeAttempted: false,
+    failureCode: "gate_refused",
+  });
+  expect(initialize).not.toHaveBeenCalled();
+  expect(f.run).not.toHaveBeenCalled();
+});
+
 it("includes accepted Step excerpts in Model context and its budget without treating them as commands", async () => {
   const f = fixture([{ status: "completed", text: "Summary", toolCalls: [] }]);
   f.input.run.source = "task_step";
@@ -124,6 +392,43 @@ it("includes accepted Step excerpts in Model context and its budget without trea
   expect(f.run.mock.calls[0]?.[2]).toContain('from "worker-result:worker-attempt"');
   expect(f.run.mock.calls[0]?.[2]).toContain("Candidate summary");
   expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBeUndefined();
+});
+
+it("records the derived Pi output capacity when the model ceiling equals its context window", async () => {
+  const f = fixture(
+    Array.from({ length: 10 }, () => ({ status: "completed", text: "ok", toolCalls: [] })),
+  );
+  f.runtime.getModelCapacity = () => ({
+    contextWindowTokens: 256_000,
+    outputReserveTokens: 128_000,
+    thinkingReserveTokens: 128_000,
+    safetyMarginTokens: 4_096,
+  });
+  f.runtime.getThinkingLevel = () => "medium";
+  const evidence: RunEvidenceRecord[] = [];
+  const executor = new PiRunExecutionAdapter(f.runtime, {
+    onBudgetEvidence: (record) => {
+      evidence.push(record);
+    },
+  });
+  await executor.execute(f.input);
+  const budget = evidence.find((record) => record.type === "context_budget");
+  expect(budget).toMatchObject({
+    policyVersion: "p5a-pi-dynamic-output-v1",
+    contextWindowTokens: 256_000,
+    thinkingReserveTokens: 8_192,
+  });
+  expect(budget?.type === "context_budget" ? budget.outputReserveTokens : 128_000).not.toBe(
+    128_000,
+  );
+  expect(
+    budget?.type === "context_budget"
+      ? budget.outputReserveTokens +
+          budget.thinkingReserveTokens +
+          (budget.projectedTokens ?? 256_001) +
+          4_096
+      : 256_001,
+  ).toBeLessThanOrEqual(256_000);
 });
 
 describe("Pi required Tool execution", () => {

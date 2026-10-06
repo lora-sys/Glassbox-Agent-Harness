@@ -1,8 +1,11 @@
 import { mkdir } from "node:fs/promises";
 import { createHash } from "node:crypto";
+import { groupInfoEvidence } from "./group-info-evidence.js";
+import { groupFilesEvidence } from "./group-files-evidence.js";
 import path from "node:path";
 import { QQ_SOURCE_CLASSES, type AgentRun, type Conversation } from "@glassbox/contracts";
 import type { ImageContent, Model } from "@earendil-works/pi-ai";
+import { DEFAULT_THINKING_BUDGETS } from "@earendil-works/pi-ai/api/simple-options";
 import {
   createAgentSession,
   DefaultResourceLoader,
@@ -30,6 +33,11 @@ import {
   type ToolResultForProjection,
 } from "../../efficiency/index.js";
 import { requiredCallClause, toolGateFailureCode } from "./protected-tools.js";
+import {
+  availableRequestInputHeadroom,
+  deriveRequestCapacity,
+  type RequestCapacityBudget,
+} from "./request-budget.js";
 import type { RequiredEvidence } from "./required-evidence.js";
 import {
   GLASSBOX_HOST_EXCLUDED_PI_TOOLS,
@@ -63,6 +71,8 @@ interface ActiveSession {
   modelVisibleSkillNames: readonly string[];
   skillPolicy: Record<string, unknown>;
   modelCapacity?: EfficiencyModelCapacity;
+  requestCapacity?: EfficiencyModelCapacity;
+  requestBudget?: RequestCapacityBudget;
   staticContextEstimate?: { systemTokens: number; toolSchemaTokens: number };
   thinkingLevel: string | null;
   resultProjectionEvidence: Map<string, Record<string, unknown>>;
@@ -836,6 +846,14 @@ function normalizeEvent(
       // `reason` repeats the code in the field an operator reads, and both come from the same
       // derivation so they cannot disagree.
       const failureCode = event.isError ? safeToolFailureCode(event.result) : undefined;
+      const groupInfo =
+        event.toolName === "qq_groups" && !event.isError
+          ? groupInfoEvidence(event.result)
+          : undefined;
+      const groupFiles =
+        event.toolName === "qq_group_files" && !event.isError
+          ? groupFilesEvidence(event.result)
+          : undefined;
       return {
         type: "tool_result",
         sessionId,
@@ -851,6 +869,8 @@ function normalizeEvent(
           isError: event.isError,
           ...(failureCode === undefined ? {} : { failureCode }),
           ...safeToolOutput(event.toolName, event.result),
+          ...(groupInfo === undefined ? {} : { groupInfo }),
+          ...(groupFiles === undefined ? {} : { groupFiles }),
         },
       };
     }
@@ -1137,10 +1157,19 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
               event.messages,
               runContext?.requiredToolName,
             );
-            const projection = projectContextBudget(measured.demand, capacity);
+            const request = deriveRequestCapacity(capacity, measured.demand, active.thinkingLevel);
+            if (!request.ok) {
+              active.pendingBudgetFailure = `context_budget_overflow:${request.reason}`;
+              ctx.abort();
+              return undefined;
+            }
+            const effectiveCapacity = request.budget.capacity;
+            const projection = projectContextBudget(measured.demand, effectiveCapacity);
             if (!projection.ok) {
               active.contextBudgetEvidence = {
-                policyVersion: "p5a-context-v1",
+                policyVersion: request.budget.dynamic
+                  ? "p5a-pi-dynamic-output-v1"
+                  : "p5a-context-v1",
                 estimateSource: "unicode_and_bounded_image_bytes",
                 overflow: projection.overflow.kind,
                 capacityTokens: capacity.contextWindowTokens,
@@ -1156,17 +1185,22 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
                 keep.add(index);
             }
             const omitted = projection.projection.omittedExchangeIds.length;
+            active.requestCapacity = effectiveCapacity;
+            active.requestBudget = request.budget;
             if (active.turnInputBudgetTokens === undefined)
-              active.turnInputBudgetTokens = Math.max(
-                0,
-                projection.projection.budgetTokens - projection.projection.projectedTokens,
+              active.turnInputBudgetTokens = availableRequestInputHeadroom(
+                request.budget,
+                projection.projection.projectedTokens,
               );
             active.contextBudgetEvidence = {
-              policyVersion: "p5a-context-v1",
+              policyVersion: request.budget.dynamic ? "p5a-pi-dynamic-output-v1" : "p5a-context-v1",
               estimateSource: "unicode_conservative",
               capacityTokens: capacity.contextWindowTokens,
-              outputReserveTokens: capacity.outputReserveTokens,
-              thinkingReserveTokens: capacity.thinkingReserveTokens,
+              outputReserveTokens: effectiveCapacity.outputReserveTokens,
+              thinkingReserveTokens: effectiveCapacity.thinkingReserveTokens,
+              dynamicRequestBudget: request.budget.dynamic,
+              fullInputDemandTokens: request.budget.fullInputDemandTokens,
+              minimumCombinedReserveTokens: request.budget.minimumCombinedReserveTokens,
               inputBudgetTokens: projection.projection.budgetTokens,
               projectedTokens: projection.projection.projectedTokens,
               omittedExchangeCount: omitted,
@@ -1356,7 +1390,7 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
               return undefined;
             }
             const active = this.sessions.get(runtimeSessionId);
-            const capacity = active?.modelCapacity;
+            const capacity = active?.requestCapacity ?? active?.modelCapacity;
             if (!active || !capacity) {
               if (active) active.pendingBudgetFailure = "provider_budget_capacity_unknown";
               ctx.abort();
@@ -1372,7 +1406,9 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
             if (payloadTokens > maxInputTokens) {
               active.contextBudgetEvidence = {
                 ...active.contextBudgetEvidence,
-                policyVersion: "p5a-context-v1",
+                policyVersion: active.requestBudget?.dynamic
+                  ? "p5a-pi-dynamic-output-v1"
+                  : "p5a-context-v1",
                 estimateSource: "unicode_conservative",
                 providerPayloadTokens: payloadTokens,
                 inputBudgetTokens: maxInputTokens,
@@ -1475,11 +1511,82 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
     };
     created.session.agent.streamFunction = async (model, providerContext, options) => {
       await authorizeProviderContext();
+      const active = this.sessions.get(created.session.sessionId);
+      const baseCapacity = active?.modelCapacity;
+      const staticEstimate = active?.staticContextEstimate;
+      const streamMessages = (providerContext as { messages?: readonly unknown[] }).messages;
+      let streamOptions = options;
+      if (!active || !baseCapacity || !staticEstimate || !Array.isArray(streamMessages)) {
+        if (active) active.pendingBudgetFailure = "provider_budget_capacity_unknown";
+        throw new Error("provider_budget_capacity_unknown");
+      }
+      const streamDemand = contextDemand(
+        staticEstimate.systemTokens,
+        staticEstimate.toolSchemaTokens,
+        streamMessages,
+        this.runContexts.get(created.session.sessionId)?.requiredToolName,
+      ).demand;
+      const request = deriveRequestCapacity(baseCapacity, streamDemand, active.thinkingLevel);
+      if (!request.ok) {
+        active.pendingBudgetFailure = `context_budget_overflow:${request.reason}`;
+        throw new Error(active.pendingBudgetFailure);
+      }
+      const streamProjection = projectContextBudget(streamDemand, request.budget.capacity);
+      if (!streamProjection.ok) {
+        active.pendingBudgetFailure = `context_budget_overflow:${streamProjection.overflow.kind}`;
+        throw new Error(active.pendingBudgetFailure);
+      }
+      active.requestCapacity = request.budget.capacity;
+      active.requestBudget = request.budget;
+      if (request.budget.dynamic) {
+        const visibleBudget = Math.min(
+          request.budget.capacity.outputReserveTokens,
+          options?.maxTokens ?? request.budget.capacity.outputReserveTokens,
+        );
+        const thinkingBudgets = Object.fromEntries(
+          Object.entries(DEFAULT_THINKING_BUDGETS).map(([level, budget]) => [
+            level,
+            Math.min(
+              options?.thinkingBudgets?.[level as keyof typeof DEFAULT_THINKING_BUDGETS] ?? budget,
+              budget,
+              request.budget.capacity.thinkingReserveTokens,
+            ),
+          ]),
+        );
+        streamOptions = { ...options, maxTokens: visibleBudget, thinkingBudgets };
+      }
       return providerStream(model, providerContext, {
-        ...options,
+        ...streamOptions,
         onPayload: async (payload, payloadModel) => {
-          const projected = (await options?.onPayload?.(payload, payloadModel)) ?? payload;
+          const projected = (await streamOptions?.onPayload?.(payload, payloadModel)) ?? payload;
           await authorizeProviderContext();
+          if (active.pendingBudgetFailure) throw new Error(active.pendingBudgetFailure);
+          const capacity = active.requestCapacity;
+          if (!capacity) {
+            active.pendingBudgetFailure = "provider_budget_capacity_unknown";
+            throw new Error(active.pendingBudgetFailure);
+          }
+          const payloadTokens = estimateStructuredTokens(projected);
+          const maxInputTokens =
+            capacity.contextWindowTokens -
+            capacity.outputReserveTokens -
+            capacity.thinkingReserveTokens;
+          if (payloadTokens > maxInputTokens) {
+            active.pendingBudgetFailure =
+              "context_budget_overflow:provider_payload_exceeds_capacity";
+            active.contextBudgetEvidence = {
+              ...active.contextBudgetEvidence,
+              policyVersion: request.budget.dynamic ? "p5a-pi-dynamic-output-v1" : "p5a-context-v1",
+              estimateSource: "unicode_conservative",
+              providerPayloadTokens: payloadTokens,
+              inputBudgetTokens: maxInputTokens,
+              outputReserveTokens: capacity.outputReserveTokens,
+              thinkingReserveTokens: capacity.thinkingReserveTokens,
+              safetyMarginTokens: capacity.safetyMarginTokens,
+              overflow: "provider_payload_exceeds_capacity",
+            };
+            throw new Error(active.pendingBudgetFailure);
+          }
           return projected;
         },
       });
@@ -1508,6 +1615,10 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
 
   getModelCapacity(runtimeSessionId: string): EfficiencyModelCapacity | undefined {
     return this.sessions.get(runtimeSessionId)?.modelCapacity;
+  }
+
+  getThinkingLevel(runtimeSessionId: string): string | null | undefined {
+    return this.sessions.get(runtimeSessionId)?.thinkingLevel;
   }
 
   getModelSupportsImages(runtimeSessionId: string): boolean {
@@ -1565,6 +1676,8 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
         turnStartedAt = performance.now();
         active.turnToolResults = [];
         active.turnInputBudgetTokens = undefined;
+        active.requestCapacity = undefined;
+        active.requestBudget = undefined;
       }
       const localFailure: PiFailureDiagnostic | undefined = active.pendingSourceFailure
         ? { origin: "glassbox", category: "source_authorization" }
@@ -1584,6 +1697,16 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
           conversationId: run.conversationId,
           runtime: active.runtimeEvidence,
           authorizedTools: active.authorizedToolNames,
+          ...(context?.acceptanceLease
+            ? {
+                acceptanceLease: {
+                  leaseId: context.acceptanceLease.leaseId,
+                  marker: context.acceptanceLease.marker,
+                  narrowedTools: active.authorizedToolNames,
+                  toolsSha256: context.acceptanceLease.toolsSha256,
+                },
+              }
+            : {}),
           // The classified surface, when discovery reported one. Absent for a fake that only
           // supplies names, and never fabricated here — a missing surface is a fact too.
           ...(active.toolSurface ? { toolSurface: active.toolSurface } : {}),

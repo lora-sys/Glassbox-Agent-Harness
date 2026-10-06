@@ -549,3 +549,39 @@ excluded. The fallback receives the same authorized Run input and does not creat
 change the saved preference, or retry an uncertain provider failure. Requested execution identity
 stays unchanged; append-only routing and evaluation evidence records the actual selected route
 and fallback reason.
+
+## Pi model ceilings and request budgets
+
+Native Pi models and credentials come from the configured Pi agent directory. Glassbox keeps
+the model's declared `contextWindow` and `maxTokens` unchanged. They are independent capacity
+ceilings, so equal values do not mean capacity is unknown or leave every request with zero
+input space.
+
+When the output ceiling spans the context window, Glassbox derives the current request's
+output and thinking reserves from its authorized input, available context and Pi's answer and
+thinking floors. The history projection, assembled-payload check and public Pi stream options
+use that same request budget. A later turn recalculates it as the context changes. This budget
+does not modify the Pi model or persist a replacement model configuration. Missing or invalid
+capacity still blocks execution before a provider request.
+
+Dynamic requests record `p5a-pi-dynamic-output-v1` and the derived numeric reserves in Trace.
+The existing static-reserve path keeps `p5a-context-v1`; historical evidence is unchanged.
+
+## Real QQ acceptance restrictions
+
+Local authenticated management may register a short-lived restriction for one prepared Owner
+QQ test message. It binds the trusted Principal, complete Channel scope, canonical text hash,
+external message ID and Run. Registration narrows authority; ordinary identity resolution,
+discovery, authorization, delivery and mutation-intent checks remain mandatory.
+
+The Pi runtime intersects model-visible Tool definitions with the restriction before composing
+its Tool surface. Protected calls check Tool, action, resource and structured input both before
+authorization and immediately after its asynchronous check. Provider-context requests recheck
+active restrictions, including Runs with no permitted Tools. Unsupported execution origins
+cannot register a restriction. A queued or recovered marked Run without its live binding fails
+before provider work. Restart never recreates authority from a marker in message text.
+
+Registry state is process-local and expires within thirty minutes. Local management may revoke
+by lease ID or marker. Marker revocation supports cleanup when registration succeeded but its
+response was lost. Unconfirmed cleanup blocks later acceptance and merge. Ordinary messages
+without the reserved marker follow their existing execution path.

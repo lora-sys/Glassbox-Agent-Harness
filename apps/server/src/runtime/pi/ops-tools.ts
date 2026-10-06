@@ -54,6 +54,7 @@ export function createOpsTools(options: {
           caller: value.caller,
           conversationId: value.conversationId,
           runId: value.runId,
+          ...(value.acceptanceLease ? { acceptanceLease: value.acceptanceLease } : {}),
           requiredToolName: value.requiredToolName,
           requiredToolInput: value.requiredToolInput,
         }
@@ -440,7 +441,10 @@ export function createOpsTools(options: {
       action: "task:cancel",
       resourceId: (params) => `task-${params.taskId}`,
       execute: async (params, context) => {
-        const canceled = await options.service.cancel(context.caller, params.taskId);
+        const canceled = await options.service.cancel(context.caller, params.taskId, undefined, {
+          runId: context.runId,
+          conversationId: context.conversationId,
+        });
         return { canceled, cancellationRequested: !canceled };
       },
     }),

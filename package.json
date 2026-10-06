@@ -41,15 +41,17 @@
   "devDependencies": {
     "@playwright/test": "^1.62.1",
     "playwright": "^1.62.1",
-    "vite-plus": "^0.3.1"
+    "vite-plus": "0.3.2"
   },
   "overrides": {
     "@glassbox/web": {
-      "vite": "npm:@voidzero-dev/vite-plus-core@0.3.1"
+      "vite": "npm:@voidzero-dev/vite-plus-core@0.3.2"
     },
     "ip-address": "10.7.2",
+    "proxy-addr": "2.0.8",
+    "source-map-js": "1.2.2",
     "undici": "8.10.2",
-    "vite": "npm:@voidzero-dev/vite-plus-core@0.3.1",
+    "vite": "npm:@voidzero-dev/vite-plus-core@0.3.2",
     "vitest": "4.1.11"
   },
   "engines": {

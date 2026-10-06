@@ -555,3 +555,35 @@ duplicate suppression. Equivalent UTC and offset inputs select the same records;
 bounds, reversed windows and invalid limits return fixed input-error codes. Time precision
 is the existing JavaScript Date millisecond precision, with no Julian-day floating-point
 arithmetic.
+
+## QQ acceptance evidence
+
+New `history_retrieval` events record the result status and the expected successful Tool return's SHA-256 and UTF-8 byte count. Each returned item records its archive UUID, projected text digest and bytes, sender identity and occurrence time. No projected text or nickname is added to these fields. The protected Tool result retains only its existing output digest and byte count; acceptance compares both records before claiming result proof. Trace access remains protected, and these identifiers are not added to public projections. Old events are unchanged. New result assertions cannot use old events that lack this evidence.
+
+The scoped acceptance observer reads only the exact current-input archive row for positive proof, or a target-group nonce count for a no-match proof. It verifies the Owner Run and source scope independently and returns sanitized counts. A complete archive search window does not establish absence outside that source window.
+
+Real-environment acceptance uses the designated shared data directory. Its safe restriction
+lifecycle and pre-Run denials append to `qq-live-acceptance-audit.jsonl`. The event kind is
+`lease_registered`, `run_bound`, `lease_revoked` or `message_denied`. Entries contain a timestamp
+and the relevant identifiers, expiry, scope hash or fixed denial reason. They do not contain
+message bodies, credentials or Tool inputs. A restriction is not an authorization grant, so
+these entries do not create grant/revoke product evidence.
+
+Run Raw Trace remains append-only. `session_start` records the applicable lease identity and
+final narrowed Tool names. The acceptance observer reads Raw Trace through gbxtrace, matches
+the exact scoped input and delivery, and correlates Tool call/result identifiers in that Run.
+Independent state checks use fixed read-only queries for explicitly identified acceptance
+resources and their Run provenance. Arbitrary queries and scripts are not acceptance observers.
+
+Private acceptance reports retain the runtime checkout, clean launch commit, PID, data directory,
+suite hash and account-local message bindings. A feature report must retain its approved
+assertions and verified cleanup. Historical reports or provider probes cannot substitute for
+fresh acceptance of the final commit. Lessons may record sanitized verified findings only after
+the report hash and scoped Raw Trace evidence have been checked.
+
+
+QQ live reply binding retains the Bot-local message ID and the driver-local message ID separately. The shared sequence, QQ timestamp and full text digest prove that both receipts refer to one physical reply. Family verifiers match each local ID to its own receipt and delivery source; they never require IDs from different accounts to be equal. Old reports without this binding cannot satisfy the new family proof by adding or rewriting historical fields.
+
+For successful qq_groups metadata results, tool_result.data.groupInfo records schemaVersion 1, groupId, groupNameSha256, memberCount and maxMemberCount. The runtime derives these fields from the actual protected Tool result after validating the content/details envelope and raw provider fields. The existing full output byte count and SHA256 remain bound to that same result. The 512-byte outputHead limit stays unchanged. Invalid envelopes, failed results, inventory listings and other Tools do not produce this projection. Historical events are not rewritten. Real metadata acceptance additionally requires an independent fixed Bot read and actual two-account text replies whose counts match the projection.
+
+A successful qq_group_files result may include data.groupFiles with schemaVersion 1, fileCount, folderCount and listingSha256. It derives only from a validated protected root-list-shaped result. The digest covers canonical complete returned-page JSON, with sorted object keys and preserved array order, including extra provider metadata. Counts and digest do not imply complete-directory coverage. No file name, file ID or uploader field enters this projection. Existing full result digest/bytes and 512-byte outputHead remain unchanged. Historical events missing this projection cannot satisfy the new root-page acceptance case.

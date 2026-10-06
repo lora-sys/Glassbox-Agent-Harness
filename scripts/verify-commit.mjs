@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
 import {
@@ -262,7 +262,22 @@ function runTestCommandWithCache(args, scope) {
 
 // Scripts are outside the unit suite's include pattern, so their tests only run where a runner
 // names them. Listing them here is what keeps them from being files nobody executes.
+/** Keep every current and newly added QQ regression in both delivery gates. */
+function discoverQqLiveTests(repoRoot = fileURLToPath(new URL("../", import.meta.url))) {
+  const names = readdirSync(resolve(repoRoot, "tools/qq-live/test"), { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".test.mjs"))
+    .map((entry) => `tools/qq-live/test/${entry.name}`)
+    .sort();
+  if (!names.length) throw new Error("QQ live regression directory has no test files");
+  return names;
+}
+
 const SCRIPT_TESTS = [
+  "scripts/test/dependency-snapshot.test.mjs",
+  "scripts/service-source-identity.test.mjs",
+  ...discoverQqLiveTests(),
+  ".agents/skills/qq-live-testing/scripts/helpers.test.mjs",
+  ".claude/skills/qq-live-testing/scripts/helpers.test.mjs",
   "scripts/verify-commit.test.mjs",
   "scripts/migrate-windows-workspaces.test.mjs",
 ];
@@ -291,6 +306,7 @@ function runStagedChecks(entries) {
 }
 
 export {
+  discoverQqLiveTests,
   canReuseTestCache,
   getTestIntegrityIssues,
   isTestFilePath,

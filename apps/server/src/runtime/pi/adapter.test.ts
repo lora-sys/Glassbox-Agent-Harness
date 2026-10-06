@@ -1,4 +1,5 @@
 import { mkdtemp, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -256,6 +257,216 @@ import type { PiRunContext } from "./types.js";
 
 const directories: string[] = [];
 
+it("records metadata evidence from the actual qq_groups result while preserving the 512-byte head", async () => {
+  const runtimeBaseDir = await mkdtemp(join(tmpdir(), "glassbox-group-info-evidence-"));
+  directories.push(runtimeBaseDir);
+  const metadata = {
+    group_id: 20001,
+    group_name: "测试群",
+    member_count: 3,
+    max_member_count: 200,
+    extra: "private-extra".repeat(100),
+  };
+  const output = { content: [{ type: "text", text: JSON.stringify(metadata) }], details: metadata };
+  let listener: ((event: AgentSessionEvent) => void) | undefined;
+  const results: Record<string, unknown>[] = [];
+  const fakeSession = {
+    sessionId: "group-info-session",
+    messages: [
+      { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" },
+    ],
+    subscribe(callback: (event: AgentSessionEvent) => void) {
+      listener = callback;
+      return () => {
+        listener = undefined;
+      };
+    },
+    async prompt() {
+      listener?.({ type: "agent_start" });
+      listener?.({ type: "turn_start" });
+      for (const [index, entry] of [
+        { toolName: "qq_groups", result: output, isError: false },
+        { toolName: "qq_groups", result: output, isError: true },
+        {
+          toolName: "qq_groups",
+          result: { content: [{ type: "text", text: "[]" }], details: [] },
+          isError: false,
+        },
+        { toolName: "ops_status", result: output, isError: false },
+      ].entries()) {
+        listener?.({
+          type: "tool_execution_start",
+          toolName: entry.toolName,
+          toolCallId: `call-${index}`,
+          args: {},
+        } as never);
+        listener?.({ type: "tool_execution_end", toolCallId: `call-${index}`, ...entry } as never);
+      }
+      listener?.({ type: "agent_end", messages: [], willRetry: false });
+    },
+    async abort() {},
+    dispose() {},
+  };
+  const adapter = new PiSdkRuntimeAdapter({
+    kitPath: fileURLToPath(new URL("./fixtures/lora-pi-kit", import.meta.url)),
+    runtimeBaseDir,
+    resolveToolNames: async () => ["qq_groups", "ops_status"],
+    onEvent: (event) => {
+      if (event.type === "tool_result") results.push(event.data);
+    },
+    createSession: async () => fakeSession as never,
+  });
+  await adapter.initialize();
+  const context: PiRunContext = {
+    runId: run.id,
+    conversationId: conversation.id,
+    caller: {
+      principalId: "owner",
+      scope: {
+        connectionId: "qq",
+        botId: "10001",
+        chatType: "private",
+        chatId: "10002",
+        senderId: "10002",
+      },
+    },
+  };
+  const binding = await adapter.createOrRestoreSession(conversation, "test", context);
+  await adapter.run(binding, run, "read group metadata", context);
+  expect(results).toHaveLength(4);
+  expect(results[0]).toMatchObject({
+    outputTruncated: true,
+    outputBytes: Buffer.byteLength(JSON.stringify(output)),
+    outputSha256: createHash("sha256").update(JSON.stringify(output)).digest("hex"),
+    groupInfo: {
+      schemaVersion: 1,
+      groupId: "20001",
+      groupNameSha256: createHash("sha256").update(metadata.group_name).digest("hex"),
+      memberCount: 3,
+      maxMemberCount: 200,
+    },
+  });
+  expect(results[0].outputHead).toBe(
+    Buffer.from(JSON.stringify(output), "utf8").subarray(0, 512).toString("utf8"),
+  );
+  expect(JSON.stringify(results[0].groupInfo)).not.toContain(metadata.group_name);
+  expect(JSON.stringify(results[0].groupInfo)).not.toContain(metadata.extra);
+  for (const result of results.slice(1)) expect(result.groupInfo).toBeUndefined();
+});
+
+it("records root file page evidence from the actual qq_group_files result while preserving the 512-byte head", async () => {
+  const runtimeBaseDir = await mkdtemp(join(tmpdir(), "glassbox-group-files-evidence-"));
+  directories.push(runtimeBaseDir);
+  const metadata = {
+    files: [
+      {
+        group_id: 20001,
+        file_id: "fixture-file",
+        file_name: "fixture private name",
+        file_size: 12,
+        extra: "private-extra".repeat(100),
+      },
+    ],
+    folders: [],
+  };
+  const expectedListing = {
+    files: [
+      {
+        extra: metadata.files[0].extra,
+        file_id: "fixture-file",
+        file_name: "fixture private name",
+        file_size: 12,
+        group_id: 20001,
+      },
+    ],
+    folders: [],
+  };
+  const output = { content: [{ type: "text", text: JSON.stringify(metadata) }], details: metadata };
+  let listener: ((event: AgentSessionEvent) => void) | undefined;
+  const results: Record<string, unknown>[] = [];
+  const fakeSession = {
+    sessionId: "group-files-session",
+    messages: [
+      { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" },
+    ],
+    subscribe(callback: (event: AgentSessionEvent) => void) {
+      listener = callback;
+      return () => {
+        listener = undefined;
+      };
+    },
+    async prompt() {
+      listener?.({ type: "agent_start" });
+      listener?.({ type: "turn_start" });
+      for (const [index, entry] of [
+        { toolName: "qq_group_files", result: output, isError: false },
+        { toolName: "qq_group_files", result: output, isError: true },
+        {
+          toolName: "qq_group_files",
+          result: { content: [{ type: "text", text: "[]" }], details: [] },
+          isError: false,
+        },
+        { toolName: "ops_status", result: output, isError: false },
+      ].entries()) {
+        listener?.({
+          type: "tool_execution_start",
+          toolName: entry.toolName,
+          toolCallId: `call-${index}`,
+          args: { groupId: "20001", operation: "get_group_root_files" },
+        } as never);
+        listener?.({ type: "tool_execution_end", toolCallId: `call-${index}`, ...entry } as never);
+      }
+      listener?.({ type: "agent_end", messages: [], willRetry: false });
+    },
+    async abort() {},
+    dispose() {},
+  };
+  const adapter = new PiSdkRuntimeAdapter({
+    kitPath: fileURLToPath(new URL("./fixtures/lora-pi-kit", import.meta.url)),
+    runtimeBaseDir,
+    resolveToolNames: async () => ["qq_group_files", "ops_status"],
+    onEvent: (event) => {
+      if (event.type === "tool_result") results.push(event.data);
+    },
+    createSession: async () => fakeSession as never,
+  });
+  await adapter.initialize();
+  const context: PiRunContext = {
+    runId: run.id,
+    conversationId: conversation.id,
+    caller: {
+      principalId: "owner",
+      scope: {
+        connectionId: "qq",
+        botId: "10001",
+        chatType: "private",
+        chatId: "10002",
+        senderId: "10002",
+      },
+    },
+  };
+  const binding = await adapter.createOrRestoreSession(conversation, "test", context);
+  await adapter.run(binding, run, "read group root file page", context);
+  expect(results).toHaveLength(4);
+  expect(results[0]).toMatchObject({
+    outputTruncated: true,
+    outputBytes: Buffer.byteLength(JSON.stringify(output)),
+    outputSha256: createHash("sha256").update(JSON.stringify(output)).digest("hex"),
+    groupFiles: {
+      schemaVersion: 1,
+      fileCount: 1,
+      folderCount: 0,
+      listingSha256: createHash("sha256").update(JSON.stringify(expectedListing)).digest("hex"),
+    },
+  });
+  expect(results[0].outputHead).toBe(
+    Buffer.from(JSON.stringify(output), "utf8").subarray(0, 512).toString("utf8"),
+  );
+  expect(JSON.stringify(results[0].groupFiles)).not.toContain(metadata.files[0].file_name);
+  expect(JSON.stringify(results[0].groupFiles)).not.toContain(metadata.files[0].extra);
+  for (const result of results.slice(1)) expect(result.groupFiles).toBeUndefined();
+});
+
 afterEach(async () => {
   for (const directory of directories.splice(0))
     await rm(directory, { recursive: true, force: true });
@@ -309,6 +520,7 @@ describe("PiSdkRuntimeAdapter", () => {
     directories.push(runtimeBaseDir);
     const events: string[] = [];
     let authorizedTools: unknown;
+    let acceptanceEvidence: unknown;
     let authorizedSkills: unknown;
     let modelVisibleSkills: unknown;
     let skillPolicy: unknown;
@@ -392,6 +604,7 @@ describe("PiSdkRuntimeAdapter", () => {
         events.push(event.type);
         if (event.type === "session_start") {
           authorizedTools = event.data.authorizedTools;
+          acceptanceEvidence = event.data.acceptanceLease;
           authorizedSkills = event.data.authorizedSkills;
           modelVisibleSkills = event.data.modelVisibleSkills;
           skillPolicy = event.data.skillPolicy;
@@ -423,6 +636,14 @@ describe("PiSdkRuntimeAdapter", () => {
           senderId: "owner",
         },
       },
+      acceptanceLease: {
+        leaseId: "lease-fixture",
+        marker: "00112233445566778899aabbccddeeff",
+        toolsSha256: "4d93a3f0fd2449068b6579b750e7394ca8dc090283f0f3ac4027c934c35a38e1",
+        assertActive: () => true,
+        filterToolNames: (names) => [...names],
+        checkToolCall: () => true,
+      },
     };
     const binding = await adapter.createOrRestoreSession(conversation, "test", context);
     const result = await adapter.run(binding, run, "say hello", context);
@@ -431,6 +652,12 @@ describe("PiSdkRuntimeAdapter", () => {
     expect(binding.runtimeSessionId).not.toBe(conversation.id);
     expect(result).toMatchObject({ status: "completed", text: "hello from pi" });
     expect(authorizedTools).toEqual(["owner_group_admin", "skill_read"]);
+    expect(acceptanceEvidence).toEqual({
+      leaseId: "lease-fixture",
+      marker: "00112233445566778899aabbccddeeff",
+      narrowedTools: ["owner_group_admin", "skill_read"],
+      toolsSha256: "4d93a3f0fd2449068b6579b750e7394ca8dc090283f0f3ac4027c934c35a38e1",
+    });
     // The resolved surface is handed back on the Run context too: the execution adapter binds
     // a required Tool only when this Run could really call it.
     expect(context.authorizedToolNames).toEqual(["owner_group_admin", "skill_read"]);
@@ -850,6 +1077,145 @@ describe("PiSdkRuntimeAdapter", () => {
     expect(secondCallResults[2]).toContain("[non-text content omitted]");
     expect(secondCallResults[2]).not.toContain("a".repeat(1_000));
     expect(firstToolExecutions).toBe(1);
+    await adapter.cleanup();
+  });
+
+  it("derives equal-window Pi output budgets across a Tool result without mutating model ceilings", async () => {
+    const runtimeBaseDir = await mkdtemp(join(tmpdir(), "glassbox-pi-equal-window-budget-"));
+    directories.push(runtimeBaseDir);
+    const model = {
+      id: "equal-window-model",
+      name: "Equal window model",
+      api: "openai-completions",
+      provider: "fixture-provider",
+      baseUrl: "http://fixture.invalid",
+      reasoning: true,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 256_000,
+      maxTokens: 256_000,
+    } as never;
+    const originalModel = structuredClone(model);
+    const observed: Array<{ maxTokens?: number; thinkingBudgets?: Record<string, number> }> = [];
+    let payloadText = "small serialized provider payload";
+    let payloadCheck: Promise<unknown> | undefined;
+    let providerOnPayload: ((payload: unknown, model: unknown) => unknown) | undefined;
+    let transportRequests = 0;
+    let secondProviderSawToolResult = false;
+    let calls = 0;
+    const modelRuntime = {
+      hasConfiguredAuth: () => true,
+      checkAuth: async () => undefined,
+      isUsingOAuth: () => false,
+      streamSimple: (
+        _model: unknown,
+        context: unknown,
+        options: {
+          maxTokens?: number;
+          thinkingBudgets?: Record<string, number>;
+          onPayload?: (payload: unknown, model: unknown) => unknown;
+        },
+      ) => {
+        observed.push({ maxTokens: options.maxTokens, thinkingBudgets: options.thinkingBudgets });
+        if (calls === 1) {
+          secondProviderSawToolResult =
+            (context as { messages?: Array<{ role: string }> }).messages?.some(
+              (message) => message.role === "toolResult",
+            ) ?? false;
+        }
+        providerOnPayload = options.onPayload;
+        payloadCheck = Promise.resolve(
+          options.onPayload?.({ serialized: payloadText }, model),
+        ).then((result) => {
+          transportRequests++;
+          return result;
+        });
+        calls++;
+        const message = {
+          role: "assistant",
+          content:
+            calls === 1
+              ? [
+                  {
+                    type: "toolCall",
+                    id: "equal-window-tool-call",
+                    name: "budget_tool",
+                    arguments: {},
+                  },
+                ]
+              : [{ type: "text", text: "done" }],
+          api: "openai-completions",
+          provider: "fixture-provider",
+          model: "equal-window-model",
+          usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2 },
+          stopReason: calls === 1 ? "toolUse" : "stop",
+          timestamp: Date.now(),
+        } as never;
+        const stream = createAssistantMessageEventStream();
+        queueMicrotask(() => {
+          stream.push({ type: "start", partial: message });
+          stream.push({ type: "done", reason: calls === 1 ? "toolUse" : "stop", message });
+        });
+        return stream;
+      },
+    } as unknown as ModelRuntime;
+    const adapter = new PiSdkRuntimeAdapter({
+      kitPath: fileURLToPath(new URL("./fixtures/lora-pi-kit", import.meta.url)),
+      runtimeBaseDir,
+      model,
+      modelRuntime,
+      customTools: [
+        {
+          name: "budget_tool",
+          label: "budget_tool",
+          description: "Fixture Tool result",
+          parameters: Type.Object({}),
+          execute: async () => ({
+            content: [{ type: "text", text: "tool-result-".repeat(500) }],
+            details: {},
+          }),
+        },
+      ],
+      resolveToolNames: async () => ["budget_tool"],
+      resolveSkillNames: async () => ({ names: [] }),
+    });
+    await adapter.initialize();
+    const context: PiRunContext = {
+      runId: run.id,
+      conversationId: conversation.id,
+      caller: {
+        principalId: "owner",
+        scope: {
+          connectionId: "qq",
+          botId: "bot",
+          chatType: "private",
+          chatId: "owner",
+          senderId: "owner",
+        },
+      },
+    };
+    const binding = await adapter.createOrRestoreSession(conversation, "test", context);
+    const result = await adapter.run(binding, run, "Use budget_tool", context);
+    expect(result.status).toBe("completed");
+    expect(calls).toBe(2);
+    expect(secondProviderSawToolResult).toBe(true);
+    await payloadCheck;
+    expect(transportRequests).toBe(2);
+    expect(observed[0]!.maxTokens).toBeGreaterThan(observed[1]!.maxTokens!);
+    for (const budget of observed) {
+      expect(budget.thinkingBudgets?.minimal).toBeLessThanOrEqual(2_048);
+      expect(budget.maxTokens! + budget.thinkingBudgets!.minimal).toBeLessThanOrEqual(256_000);
+    }
+    expect(model).toEqual(originalModel);
+    payloadText = "oversized-provider-payload-".repeat(20_000);
+    payloadCheck = Promise.resolve(providerOnPayload?.({ serialized: payloadText }, model)).then(
+      (result) => {
+        transportRequests++;
+        return result;
+      },
+    );
+    await expect(payloadCheck).rejects.toThrow("provider_payload_exceeds_capacity");
+    expect(transportRequests).toBe(2);
     await adapter.cleanup();
   });
 

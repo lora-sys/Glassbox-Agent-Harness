@@ -1,9 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  discoverQqLiveTests,
   canReuseTestCache,
   getTestIntegrityIssues,
   isTestFilePath,
@@ -231,5 +232,33 @@ test("test cache does not record interrupted or input-changing runs", () => {
     assert.equal(lookupTestCache(context).hit, false);
   } finally {
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("delivery gates discover newly added QQ tests without a handwritten manifest", () => {
+  const root = mkdtempSync(join(tmpdir(), "qq-test-discovery-"));
+  try {
+    const dir = join(root, "tools", "qq-live", "test");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "existing.test.mjs"), "");
+    writeFileSync(join(dir, "fixture.mjs"), "");
+    mkdirSync(join(dir, "directory.test.mjs"));
+    assert.deepEqual(discoverQqLiveTests(root), ["tools/qq-live/test/existing.test.mjs"]);
+    writeFileSync(join(dir, "added.test.mjs"), "");
+    assert.deepEqual(discoverQqLiveTests(root), [
+      "tools/qq-live/test/added.test.mjs",
+      "tools/qq-live/test/existing.test.mjs",
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("empty QQ regression directory blocks gate discovery", () => {
+  const root = mkdtempSync(join(tmpdir(), "qq-test-empty-"));
+  try {
+    mkdirSync(join(root, "tools", "qq-live", "test"), { recursive: true });
+    assert.throws(() => discoverQqLiveTests(root), /no test files/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });

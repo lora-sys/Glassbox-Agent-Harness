@@ -16,10 +16,12 @@ import {
   type ContextDemandEstimate,
   type ContextProjectionResult,
 } from "../../efficiency/index.js";
+import { deriveRequestCapacity, type RequestCapacityBudget } from "./request-budget.js";
 import { exactTerms } from "../../retrieval/exact-term.js";
 import type { QqCapabilityCategory } from "../../channels/onebot/capabilities.js";
 import { WEB_CAPABILITIES } from "../../management/web-capability-policy.js";
 import type { PiRunContext, PiRuntimeAdapter, PiRuntimeProfileName, PiRunResult } from "./types.js";
+import { hasQqLiveAcceptanceMarker } from "../../acceptance/qq-live-lease.js";
 import {
   GROUP_HISTORY_SEARCH_TOOL,
   OWNER_HISTORY_SEARCH_TOOL,
@@ -182,6 +184,41 @@ function ownerMemoryCommand(text: string): RequiredToolCall | undefined {
       ...(quotedQuery ? { query: quotedQuery } : {}),
     },
   };
+}
+
+/**
+ * Returns only the body of a marker-bound message for Memory command parsing. The persisted
+ * message remains untouched for hashing, authorization checks, and Trace evidence.
+ */
+function acceptanceMemoryCommandText(
+  text: string,
+  lease: PiRunContext["acceptanceLease"],
+): string | undefined {
+  if (!lease || !lease.assertActive() || !/^[a-f0-9]{32}$/u.test(lease.marker)) return undefined;
+  const lineBreak = /\r\n|\n|\r/u.exec(text);
+  if (!lineBreak) return undefined;
+  const firstLine = text.slice(0, lineBreak.index);
+  if (firstLine !== `GLASSBOX_ACCEPTANCE_V1 ${lease.marker}`) return undefined;
+  const body = text.slice(lineBreak.index + lineBreak[0].length);
+  const footerPrefix = "请在回复中包含本轮测试编号 ";
+  const lines = body.split(/\r\n|\n|\r/u);
+  const footerIndexes = lines.flatMap((line, index) =>
+    line.trimStart().startsWith(footerPrefix) ? [index] : [],
+  );
+  if (footerIndexes.length === 0) return body;
+  if (footerIndexes.length !== 1) return undefined;
+  const footerIndex = footerIndexes[0]!;
+  const hasTrailingLineBreak = footerIndex === lines.length - 2 && lines.at(-1) === "";
+  if (
+    (footerIndex !== lines.length - 1 && !hasTrailingLineBreak) ||
+    lines[footerIndex] !== `${footerPrefix}${lease.marker}。`
+  )
+    return undefined;
+  const footerStart = body.lastIndexOf(lines[footerIndex]!);
+  const preceding = body.slice(0, footerStart);
+  const separator = /(?:\r\n|\n|\r)$/u.exec(preceding)?.[0];
+  if (footerStart > 0 && !separator) return undefined;
+  return separator ? preceding.slice(0, -separator.length) : "";
 }
 
 /** Explicitly named Ops calls must be backed by a real Tool result, never model narration. */
@@ -540,6 +577,7 @@ const SOURCE_CLASS_WORDS: readonly { sourceClass: QqSourceClass; words: RegExp }
  * a file, an order — never binds the Tool.
  */
 export interface PiRunExecutionAdapterOptions {
+  resolveAcceptanceLease?: (input: ExecutionInput) => PiRunContext["acceptanceLease"] | undefined;
   isOwner?: (input: ExecutionInput) => Promise<boolean>;
   learningStore?: LearningStore;
   listModelProfiles?: () => readonly PublicModelProfile[];
@@ -602,7 +640,7 @@ export type RunEvidenceRecord =
       runId: string;
       principalId: string;
       conversationId: string;
-      policyVersion: "p5a-context-v1";
+      policyVersion: "p5a-context-v1" | "p5a-pi-dynamic-output-v1";
       estimateSource: "unicode_conservative";
       demandTokens: number;
       contextWindowTokens: number;
@@ -712,6 +750,7 @@ function requiredToolCall(
   isOwner: boolean,
   authorizedToolNames?: readonly string[],
   modelProfiles: readonly PublicModelProfile[] = [],
+  acceptanceMemoryText?: string,
 ): RequiredToolCall | undefined {
   if (input.caller.scope.chatType === "group") {
     if (groupHistorySearchRequested(input.text) || groupHistorySearchFollowUpRequested(input)) {
@@ -762,7 +801,7 @@ function requiredToolCall(
   const taskDelegation = ownerTaskDelegationRequest(rawText);
   if (taskDelegation) return taskDelegation;
   if (authorizedToolNames?.includes(OWNER_MEMORY_ADMIN_TOOL)) {
-    const memory = ownerMemoryCommand(rawText);
+    const memory = ownerMemoryCommand(acceptanceMemoryText ?? rawText);
     if (memory) return memory;
   }
   const text = requestClauses(rawText);
@@ -1590,7 +1629,14 @@ export function projectRunHistory(
     safetyMarginTokens: number;
   },
   staticEstimate: { systemTokens: number; toolSchemaTokens: number },
-): { result: ContextProjectionResult; demand: ContextDemandEstimate; included: Set<string> } {
+  thinkingLevel?: string | null,
+): {
+  result: ContextProjectionResult;
+  demand: ContextDemandEstimate;
+  included: Set<string>;
+  effectiveCapacity: typeof capacity;
+  requestBudget: RequestCapacityBudget | null;
+} {
   const exchanges = Array.from({ length: Math.floor(input.history.length / 2) }, (_, index) => {
     const user = input.history[index * 2];
     const assistant = input.history[index * 2 + 1];
@@ -1632,11 +1678,25 @@ export function projectRunHistory(
     requiredFloorTokens: 256,
     exchanges,
   };
-  const result = projectContextBudget(demand, capacity);
+  const request = deriveRequestCapacity(capacity, demand, thinkingLevel);
+  const effectiveCapacity = request.ok ? request.budget.capacity : capacity;
+  const result = request.ok
+    ? projectContextBudget(demand, effectiveCapacity)
+    : {
+        ok: false as const,
+        overflow: {
+          kind:
+            request.reason === "invalid_demand"
+              ? ("invalid_demand" as const)
+              : ("invalid_capacity" as const),
+        },
+      };
   return {
     result,
     demand,
     included: new Set(result.ok ? result.projection.includedExchangeIds : []),
+    effectiveCapacity,
+    requestBudget: request.ok ? request.budget : null,
   };
 }
 
@@ -1812,6 +1872,18 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
   ) {}
 
   async execute(input: ExecutionInput): Promise<ExecutionResult> {
+    const acceptanceLease = this.options.resolveAcceptanceLease?.(input);
+    const hasAcceptanceMarker = hasQqLiveAcceptanceMarker(input.text);
+    const acceptanceMemoryText = hasAcceptanceMarker
+      ? acceptanceMemoryCommandText(input.text, acceptanceLease)
+      : undefined;
+    if (hasAcceptanceMarker && acceptanceMemoryText === undefined)
+      return {
+        status: "failed",
+        failureCode: "gate_refused",
+        runtimeAttempted: false,
+        text: "测试消息的临时权限已失效，请重新登记后再试。",
+      };
     if (input.imageFailureCode)
       return {
         status: "succeeded",
@@ -1892,6 +1964,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       caller: input.caller,
       conversationId: input.conversation.id,
       runId: input.run.id,
+      ...(acceptanceLease ? { acceptanceLease } : {}),
       callerIdentity: {
         senderId: input.caller.scope.senderId,
         isOwner,
@@ -1932,7 +2005,13 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         text: "当前配置的模型不支持识别图片，因此没有发送图片。请切换到支持视觉输入的模型后重试。",
       };
     }
-    const required = requiredToolCall(input, isOwner, context.authorizedToolNames, modelProfiles);
+    const required = requiredToolCall(
+      input,
+      isOwner,
+      context.authorizedToolNames,
+      modelProfiles,
+      acceptanceMemoryText,
+    );
     if (required?.name === "qq_group_moderation" && required.input.operation === "set_group_ban") {
       const params = required.input.params as Record<string, unknown> | undefined;
       const missingDuration = params?.duration === undefined;
@@ -2122,11 +2201,17 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         }
       }
       const contextInput = { ...input, learningContext: learningItems };
-      let projection = projectRunHistory(contextInput, capacity, staticEstimate);
+      const thinkingLevel = this.runtime.getThinkingLevel?.(binding.runtimeSessionId);
+      let projection = projectRunHistory(contextInput, capacity, staticEstimate, thinkingLevel);
       if (!projection.result.ok && learningItems.length > 0) {
         learningItems = [];
         learningStatus = "omitted_for_budget";
-        projection = projectRunHistory({ ...input, learningContext: [] }, capacity, staticEstimate);
+        projection = projectRunHistory(
+          { ...input, learningContext: [] },
+          capacity,
+          staticEstimate,
+          thinkingLevel,
+        );
       }
       if (learningItems.length > 0 && this.options.learningStore) {
         const operation = {
@@ -2170,12 +2255,14 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         runId: input.run.id,
         principalId: input.caller.principalId,
         conversationId: input.conversation.id,
-        policyVersion: "p5a-context-v1",
+        policyVersion: projection.requestBudget?.dynamic
+          ? "p5a-pi-dynamic-output-v1"
+          : "p5a-context-v1",
         estimateSource: "unicode_conservative",
         demandTokens: projection.demand.estimatedMaterialTokens,
-        contextWindowTokens: capacity.contextWindowTokens,
-        outputReserveTokens: capacity.outputReserveTokens,
-        thinkingReserveTokens: capacity.thinkingReserveTokens,
+        contextWindowTokens: projection.effectiveCapacity.contextWindowTokens,
+        outputReserveTokens: projection.effectiveCapacity.outputReserveTokens,
+        thinkingReserveTokens: projection.effectiveCapacity.thinkingReserveTokens,
         projectedTokens: projection.result.ok ? projection.result.projection.projectedTokens : null,
         includedExchangeCount: projection.result.ok
           ? projection.result.projection.includedExchangeIds.length
@@ -2197,6 +2284,8 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
           providerSessionId: binding.runtimeSessionId,
         };
       context.authorizeProviderContext = async () => {
+        if (context.acceptanceLease && !context.acceptanceLease.assertActive())
+          throw new Error("acceptance_lease_denied");
         if (!this.options.learningStore) return;
         await this.options.learningStore.authorizeContext(
           {
@@ -2206,6 +2295,8 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
           },
           learningItems.map((item) => item.memoryId),
         );
+        if (context.acceptanceLease && !context.acceptanceLease.assertActive())
+          throw new Error("acceptance_lease_denied");
       };
       const contextAllowed = async () => {
         try {

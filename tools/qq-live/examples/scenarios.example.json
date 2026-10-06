@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "id": "private-calculation",
+      "chat": "private",
+      "prompt": "请计算 17 加 25。回复里必须包含计算结果和测试编号 {{nonce}}，不要执行任何修改操作。",
+      "assertion": "reply",
+      "sideEffect": "none",
+      "expectContains": ["42", "{{nonce}}"]
+    },
+    {
+      "id": "group-calculation",
+      "chat": "A",
+      "prompt": "请计算 12 乘 12。回复里必须包含计算结果和测试编号 {{nonce}}，不要执行任何修改操作。",
+      "assertion": "reply",
+      "sideEffect": "none",
+      "expectContains": ["144", "{{nonce}}"]
+    }
+  ]
+}

@@ -233,6 +233,10 @@ export function createApplicationFixtureScope() {
       failAction?: string;
       /** Deterministic media adapter for media Tool and delivery tests. */
       mediaProvider?: MediaGenerationProvider;
+      /** Execution reference used by one fixture, defaulting to the fake direct adapter. */
+      executionRef?: string;
+      /** Disposable loopback-only model profile for actual Pi ingress wiring tests. */
+      piModelProfile?: Record<string, unknown>;
       /** Isolated Pi config directory for tests that exercise native Pi model routing. */
       piAgentDirectory?: string | null;
       /** Pi model configuration written to the default Glassbox main-agent directory. */
@@ -316,6 +320,7 @@ export function createApplicationFixtureScope() {
     });
     await once(server, "listening");
     const models = await ModelProfileStore.open(directory);
+    if (options.piModelProfile) await models.save(options.piModelProfile);
     const executors = new Map<string, RunExecutionAdapter>([
       [
         "claude-code",
@@ -364,7 +369,7 @@ export function createApplicationFixtureScope() {
         visitorIds: ["10004"],
         groupIds: ["10003"],
         token: "fixture-token",
-        executionRef: "claude-code",
+        executionRef: options.executionRef ?? "claude-code",
       }),
     );
     await timed("fixture-connect", () => app.connectChannel("fixture"));
