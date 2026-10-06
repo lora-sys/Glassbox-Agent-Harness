@@ -5,6 +5,23 @@ const mismatch = () => {
   throw new LiveError("MESSAGE_BINDING_MISMATCH", "消息证据与本轮输入不一致。", "INCONCLUSIVE");
 };
 
+function plainReply(result, text) {
+  const message = result?.message;
+  if (typeof message === "string") {
+    if (message.includes("[CQ:") || message !== text) mismatch();
+  } else if (
+    !Array.isArray(message) ||
+    message.length !== 1 ||
+    message[0]?.type !== "text" ||
+    Object.keys(message[0]).sort().join(",") !== "data,type" ||
+    !message[0].data ||
+    Object.keys(message[0].data).join(",") !== "text" ||
+    message[0].data.text !== text
+  )
+    mismatch();
+  if (result.raw_message !== undefined && result.raw_message !== text) mismatch();
+}
+
 export async function boundMessage(client, requestedMessageId, expected) {
   const requested = messageId(requestedMessageId);
   if (!requested) mismatch();
@@ -74,20 +91,7 @@ export async function boundMessage(client, requestedMessageId, expected) {
       !/^[a-f0-9]{32}$/u.test(expected.groupInfoNonce)
     )
       mismatch();
-    const message = result?.message;
-    if (typeof message === "string") {
-      if (message.includes("[CQ:") || message !== text) mismatch();
-    } else if (
-      !Array.isArray(message) ||
-      message.length !== 1 ||
-      message[0]?.type !== "text" ||
-      Object.keys(message[0]).sort().join(",") !== "data,type" ||
-      !message[0].data ||
-      Object.keys(message[0].data).join(",") !== "text" ||
-      message[0].data.text !== text
-    )
-      mismatch();
-    if (result.raw_message !== undefined && result.raw_message !== text) mismatch();
+    plainReply(result, text);
     const match =
       /^QQGROUPINFO ([a-f0-9]{32}) count=(0|[1-9]\d{0,15}) capacity=(0|[1-9]\d{0,15})$/u.exec(text);
     if (!match || match[1] !== expected.groupInfoNonce) mismatch();
@@ -101,12 +105,31 @@ export async function boundMessage(client, requestedMessageId, expected) {
       mismatch();
     groupInfo = { memberCount, maxMemberCount };
   }
+  let groupFiles;
+  if (expected.groupFilesNonce !== undefined) {
+    if (
+      typeof expected.groupFilesNonce !== "string" ||
+      !/^[a-f0-9]{32}$/u.test(expected.groupFilesNonce) ||
+      expected.groupInfoNonce !== undefined
+    )
+      mismatch();
+    plainReply(result, text);
+    const match = /^QQGROUPFILES ([a-f0-9]{32}) files=(0|[1-9]\d?) folders=(0|[1-9]\d?)$/u.exec(
+      text,
+    );
+    if (!match || match[1] !== expected.groupFilesNonce) mismatch();
+    const fileCount = Number(match[2]);
+    const folderCount = Number(match[3]);
+    if (fileCount + folderCount > 50) mismatch();
+    groupFiles = { fileCount, folderCount };
+  }
   return {
     messageId: actualId,
     realSequence,
     time,
     textSha256,
     ...(groupInfo ? { groupInfo } : {}),
+    ...(groupFiles ? { groupFiles } : {}),
   };
 }
 

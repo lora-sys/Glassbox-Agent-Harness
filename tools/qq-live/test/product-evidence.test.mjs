@@ -461,6 +461,48 @@ test("cross-account reply sequence or full-text hash mismatch is inconclusive", 
   );
 });
 
+test("group files witness comes from both actual private reply reads and rejects hidden media", async () => {
+  const nonce = "a".repeat(32);
+  const replyText = `QQGROUPFILES ${nonce} files=1 folders=2`;
+  const fixture = boundMessageFixture();
+  fixture.c.route = "private";
+  fixture.c.token = nonce;
+  fixture.c.expected = [nonce];
+  fixture.c.featureAssertions = [
+    { kind: "group_files", tool: "qq_group_files", groupId: "20001", count: 1 },
+  ];
+  fixture.c.replies[0].route = "private";
+  fixture.c.replies[0].textSha256 = messageDigest(replyText);
+  let hideMedia = false;
+  for (const [role, client] of Object.entries(fixture.clients)) {
+    const call = client.call.bind(client);
+    client.call = async (action, params) => {
+      const result = await call(action, params);
+      result.message_type = "private";
+      delete result.group_id;
+      if (["2300000001", "2300000002"].includes(params.message_id)) {
+        result.message = [{ type: "text", data: { text: replyText } }];
+        if (hideMedia && role === "driver")
+          result.message.push({ type: "image", data: { file: "fixture-private-file" } });
+      }
+      return result;
+    };
+  }
+  const verified = await verifyMessageBindings(
+    fixture.c,
+    fixture.config,
+    fixture.clients,
+    fixture.delivery,
+  );
+  assert.deepEqual(verified.reply.groupFiles, { fileCount: 1, folderCount: 2 });
+  assert.equal(JSON.stringify(verified).includes(replyText), false);
+  hideMedia = true;
+  await assert.rejects(
+    verifyMessageBindings(fixture.c, fixture.config, fixture.clients, fixture.delivery),
+    { code: "MESSAGE_BINDING_MISMATCH" },
+  );
+});
+
 test("a new matching reply during asynchronous message reads invalidates the evidence", async () => {
   const fixture = boundMessageFixture();
   const originalCall = fixture.clients.driver.call.bind(fixture.clients.driver);

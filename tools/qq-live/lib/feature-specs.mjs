@@ -11,6 +11,7 @@ const READ_ACTIONS = {
   qq_account_status: "account:status:read",
   qq_groups: "group:read",
   qq_group_members: "group:members:read",
+  qq_group_files: "group:files:read",
   qq_capability_search: "qq:capability:read",
   group_history_search: "history:read",
   owner_history_search: "history:search",
@@ -131,6 +132,40 @@ function validateGroupInfoCase(c, config) {
     fail(
       "FEATURE_GROUP_INFO_SCOPE",
       "群信息用例必须在 Owner 私聊中限定到群 A 的信息读取和完整输出核验。",
+    );
+}
+
+function validateGroupFilesCase(c, config) {
+  const group = configGroup(config, "A");
+  const tool = c.leaseTools[0];
+  const makeOperation = (groupId) => ({
+    action: "group:files:read",
+    resourceId: `group:${groupId}`,
+    inputConstraint: { groupId, operation: "get_group_root_files" },
+  });
+  const makeAssertions = (groupId) => [
+    {
+      kind: "trace",
+      type: "tool_result",
+      where: { name: "qq_group_files", isError: false },
+      count: 1,
+    },
+    { kind: "group_files", tool: "qq_group_files", groupId, count: 1 },
+  ];
+  if (
+    c.chat !== "private" ||
+    c.leaseTools.length !== 1 ||
+    tool?.name !== "qq_group_files" ||
+    tool.operations.length !== 1 ||
+    ![group.id, "{{group:A}}"].some(
+      (groupId) =>
+        canonical(tool.operations[0]) === canonical(makeOperation(groupId)) &&
+        canonical(c.featureAssertions) === canonical(makeAssertions(groupId)),
+    )
+  )
+    fail(
+      "FEATURE_GROUP_FILES_SCOPE",
+      "群文件用例必须在 Owner 私聊中限定到群 A 的根目录第一页读取和完整返回证据核验。",
     );
 }
 
@@ -323,6 +358,11 @@ export function validateReadFeatureSpecs(raw, config) {
       )
     )
       validateGroupInfoCase(c, config);
+    if (
+      c.featureAssertions.some((a) => a.kind === "group_files") ||
+      c.leaseTools.some((tool) => tool.name === "qq_group_files")
+    )
+      validateGroupFilesCase(c, config);
     if (c.leaseTools.some((tool) => tool.name === "qq_group_members"))
       validateGroupMembersCase(c, config);
     if (

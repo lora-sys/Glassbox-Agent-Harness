@@ -104,6 +104,37 @@ export const FEATURE_CATALOG = Object.freeze({
   ],
   cases: [
     {
+      id: "qq-group-a-root-files-read",
+      domain: "qq_read",
+      executionStatus: "executable",
+      tools: ["qq_group_files"],
+      suiteCaseId: "qq-group-a-root-files-read",
+      leaseTools: [
+        {
+          name: "qq_group_files",
+          operations: [
+            {
+              action: "group:files:read",
+              resourceId: "group:{{group:A}}",
+              inputConstraint: { groupId: "{{group:A}}", operation: "get_group_root_files" },
+            },
+          ],
+        },
+      ],
+      assertions: [
+        {
+          kind: "trace",
+          type: "tool_result",
+          where: { name: "qq_group_files", isError: false },
+          count: 1,
+        },
+        { kind: "group_files", tool: "qq_group_files", groupId: "{{group:A}}", count: 1 },
+      ],
+      coveragePlan:
+        "Read group A's default root page in Owner private chat and independently compare validated returned entries, counts and canonical digest against a fixed Bot read. This proves only that returned page, not a complete directory, folder traversal, downloads or mutations.",
+      mutation: "none",
+    },
+    {
       id: "qq-account-status-read",
       domain: "qq_read",
       executionStatus: "executable",

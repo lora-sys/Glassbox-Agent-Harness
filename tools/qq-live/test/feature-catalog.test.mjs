@@ -211,6 +211,7 @@ test("read-only example binds only the implemented Ops and QQ inventory cases", 
     "owner_history_search",
     "qq_account_status",
     "qq_capability_search",
+    "qq_group_files",
     "qq_group_members",
     "qq_groups",
   ]);
@@ -633,6 +634,42 @@ test("group info catalog binds its fixed A operation and independent output asse
     },
     (c) => {
       c.leaseTools[0].operations[0].inputConstraint.operation = "get_group_list";
+    },
+  ]) {
+    const cases = structuredClone(source.cases);
+    change(cases.find((c) => c.id === catalogCase.id));
+    assert.equal(checkFeatureCoverage({ ...args, executableSuiteCases: cases }).status, "BLOCKED");
+  }
+  assert.equal(checkFeatureCoverage({ ...args, suiteConfig: undefined }).status, "BLOCKED");
+});
+
+test("group root page catalog binds its fixed A operation and independent output assertion", async () => {
+  const catalogCase = FEATURE_CATALOG.cases.find((c) => c.id === "qq-group-a-root-files-read");
+  const source = JSON.parse(
+    await readFile(new URL("../examples/feature-baseline.example.json", import.meta.url), "utf8"),
+  );
+  const catalog = {
+    schemaVersion: 1,
+    requiredDomains: ["qq_read"],
+    descriptorBaseline: ["qq_group_files"],
+    cases: [catalogCase],
+  };
+  const args = {
+    catalog,
+    descriptors: [{ name: "qq_group_files" }],
+    executableSuiteCases: source.cases,
+    suiteConfig: { groups: [{ alias: "A", id: "10001" }] },
+  };
+  assert.equal(checkFeatureCoverage(args).status, "PASS");
+  for (const change of [
+    (c) => {
+      c.featureAssertions.pop();
+    },
+    (c) => {
+      c.leaseTools[0].operations[0].inputConstraint.groupId = "{{group:B}}";
+    },
+    (c) => {
+      c.leaseTools[0].operations[0].inputConstraint.operation = "get_group_files_by_folder";
     },
   ]) {
     const cases = structuredClone(source.cases);

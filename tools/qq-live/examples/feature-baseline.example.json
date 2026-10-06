@@ -2,6 +2,45 @@
   "schemaVersion": 5,
   "cases": [
     {
+      "id": "qq-group-a-root-files-read",
+      "chat": "private",
+      "prompt": "请只调用 qq_group_files 的 get_group_root_files 操作查询测试群 {{group:A}} 的根目录第一页。只计算实际返回的 files 和 folders 数组长度，回复一行 QQGROUPFILES {{nonce}} files=文件数 folders=文件夹数。不要使用 Markdown，不要添加群号、文件名称、文件标识、上传者或其他内容，不要解析下载地址，不要读取其他页或修改状态。",
+      "expectContains": ["{{nonce}}"],
+      "sideEffect": "none",
+      "leaseTools": [
+        {
+          "name": "qq_group_files",
+          "operations": [
+            {
+              "action": "group:files:read",
+              "resourceId": "group:{{group:A}}",
+              "inputConstraint": {
+                "groupId": "{{group:A}}",
+                "operation": "get_group_root_files"
+              }
+            }
+          ]
+        }
+      ],
+      "featureAssertions": [
+        {
+          "kind": "trace",
+          "type": "tool_result",
+          "where": {
+            "name": "qq_group_files",
+            "isError": false
+          },
+          "count": 1
+        },
+        {
+          "kind": "group_files",
+          "tool": "qq_group_files",
+          "groupId": "{{group:A}}",
+          "count": 1
+        }
+      ]
+    },
+    {
       "id": "qq-group-a-info-read",
       "chat": "private",
       "prompt": "请只调用 qq_groups 的 get_group_info 操作查询测试群 {{group:A}}。用实际 member_count 和 max_member_count 填入 count 和 capacity，只回复一行 QQGROUPINFO {{nonce}} count=人数 capacity=容量。不要使用 Markdown，不要添加群号、群名、解释或其他内容，不要修改任何状态。",

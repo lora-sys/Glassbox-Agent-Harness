@@ -247,6 +247,21 @@ function requiresIndependentGroupInfoVerification(caseRecord, accepted, events, 
   );
 }
 
+function requiresIndependentGroupFilesVerification(caseRecord, accepted, events, runId) {
+  return (
+    caseRecord?.id === "qq-group-a-root-files-read" ||
+    caseRecord?.featureAssertions?.some((a) => a?.kind === "group_files") ||
+    accepted?.feature?.observations?.some((o) => o?.kind === "group_files") ||
+    events.some(
+      (event) =>
+        event?.runId === runId &&
+        event.type === "tool_call" &&
+        event.data?.name === "qq_group_files" &&
+        event.data?.input?.operation === "get_group_root_files",
+    )
+  );
+}
+
 function verifyCompleteHistoryCase(caseRecord, accepted, events, runId) {
   const resultContract = HISTORY_RESULT_CASES.get(caseRecord?.id);
   if (!COMPLETE_HISTORY_CASES.has(caseRecord?.id) && !resultContract) return;
@@ -944,6 +959,15 @@ export async function appendLesson(
     const selectedAccepted = report.productAcceptance.cases.find(
       (item) => item.caseId === lesson.case,
     );
+    if (
+      requiresIndependentGroupFilesVerification(
+        selectedCase,
+        selectedAccepted,
+        traceEvents,
+        evidence.runId,
+      )
+    )
+      invalid("Independent group files evidence is unavailable for verified lessons");
     if (
       requiresIndependentGroupInfoVerification(
         selectedCase,

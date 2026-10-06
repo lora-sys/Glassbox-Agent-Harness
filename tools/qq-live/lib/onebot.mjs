@@ -1,9 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { LiveError, fail, id, messageId as parseMessageId } from "./core.mjs";
 import { projectGroupInfo } from "./group-info-evidence.mjs";
+import { projectGroupFiles } from "./group-files-evidence.mjs";
 
 const MEMBER_COUNT_READ = Symbol("fixed-group-member-count-read");
 const GROUP_INFO_READ = Symbol("fixed-group-info-read");
+const GROUP_FILES_READ = Symbol("fixed-group-root-files-read");
 
 /** OneBot forward WebSocket. Native Node WebSocket, no npm dependencies. */
 export class OneBot {
@@ -195,6 +197,15 @@ export class OneBot {
     const groups = this.config.groups.map((g) => g.id);
     if (["get_login_info", "get_status", "get_version_info"].includes(action)) return;
     if (
+      capability === GROUP_FILES_READ &&
+      this.role === "bot" &&
+      action === "get_group_root_files" &&
+      this.config.groups.filter((group) => group.alias === "A").length === 1 &&
+      id(p.group_id) === id(this.config.groups.find((group) => group.alias === "A")?.id) &&
+      Object.keys(p).join(",") === "group_id"
+    )
+      return;
+    if (
       capability === GROUP_INFO_READ &&
       this.role === "bot" &&
       action === "get_group_info" &&
@@ -260,6 +271,23 @@ export class OneBot {
   }
   async call(action, params = {}, { cleanup = false } = {}) {
     return this.#call(action, params, cleanup);
+  }
+  async readGroupRootFiles() {
+    const groups = this.config.groups?.filter((group) => group.alias === "A") ?? [];
+    const groupId = groups.length === 1 ? id(groups[0].id) : "";
+    if (this.role !== "bot" || !groupId)
+      fail("GROUP_FILES_DENIED", "仅 Bot 可读取固定测试群 A 的根目录第一页。", "INCONCLUSIVE");
+    try {
+      const result = await this.#call(
+        "get_group_root_files",
+        { group_id: groupId },
+        false,
+        GROUP_FILES_READ,
+      );
+      return projectGroupFiles(result, groupId);
+    } catch {
+      fail("GROUP_FILES_UNAVAILABLE", "无法独立确认固定测试群文件读取结果。", "INCONCLUSIVE");
+    }
   }
   async #call(action, params = {}, cleanup = false, capability) {
     this.authorize(action, params, cleanup, capability);

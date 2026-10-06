@@ -6,6 +6,7 @@ import { fail, digest } from "./core.mjs";
 import { boundMessage, compareSameMessage } from "./message-binding.mjs";
 import { observeFeature, validateFeatureAssertions } from "./feature-observer.mjs";
 import { verifyGroupInfoEvidence } from "./group-info-evidence.mjs";
+import { verifyGroupFilesEvidence } from "./group-files-evidence.mjs";
 
 export function runtimeSnapshot(runtime, capture = execFileSync) {
   return serviceSnapshot(runtime, capture, true);
@@ -293,6 +294,9 @@ export async function verifyMessageBindings(c, config, clients, delivery) {
     ...(c.featureAssertions?.some((a) => a.kind === "group_info")
       ? { groupInfoNonce: c.token }
       : {}),
+    ...(c.featureAssertions?.some((a) => a.kind === "group_files")
+      ? { groupFilesNonce: c.token }
+      : {}),
     ...(isolationAssertions.length
       ? { forbiddenFixtureSha256: isolationAssertions[0].sentinelSha256 }
       : {}),
@@ -324,6 +328,7 @@ export async function verifyMessageBindings(c, config, clients, delivery) {
       driverMessageId: reply[0].messageId,
       ...replyMatch,
       ...(replyBot.groupInfo ? { groupInfo: replyBot.groupInfo } : {}),
+      ...(replyBot.groupFiles ? { groupFiles: replyBot.groupFiles } : {}),
     },
   };
 }
@@ -426,6 +431,15 @@ export async function verifyProductEvidence(report, config, clients) {
         events,
         evidence.runId,
         messageBinding.reply.groupInfo,
+      );
+      await verifyGroupFilesEvidence(
+        c,
+        feature,
+        config,
+        clients,
+        events,
+        evidence.runId,
+        messageBinding.reply.groupFiles,
       );
       if (c.featureAssertions) {
         const actors = db.prepare("SELECT principal_id FROM runs WHERE id=?").all(evidence.runId);

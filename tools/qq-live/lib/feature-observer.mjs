@@ -1,6 +1,7 @@
 import { fail } from "./core.mjs";
 import { createHash } from "node:crypto";
 import { validateGroupInfoAssertion, observeGroupInfoResult } from "./group-info-evidence.mjs";
+import { validateGroupFilesAssertion, observeGroupFilesResult } from "./group-files-evidence.mjs";
 import { observeHistoryCoverage, validateHistoryCoverageAssertion } from "./history-coverage.mjs";
 import {
   observeHistoryResult,
@@ -106,6 +107,8 @@ export function validateFeatureAssertions(assertions) {
       validateHistoryCoverageAssertion(a);
     } else if (a.kind === "group_info") {
       validateGroupInfoAssertion(a);
+    } else if (a.kind === "group_files") {
+      validateGroupFilesAssertion(a);
     } else if (a.kind === "aggregate_projection") {
       if (
         a.tool !== "qq_group_members" ||
@@ -178,6 +181,8 @@ export function observeFeature(assertions, { db, events, runId, inputBinding }) 
       observations.push(observeHistoryCoverage(assertion, events, runId));
     } else if (assertion.kind === "group_info") {
       observations.push(observeGroupInfoResult(assertion, { events, runId }));
+    } else if (assertion.kind === "group_files") {
+      observations.push(observeGroupFilesResult(assertion, { events, runId }));
     } else if (assertion.kind === "aggregate_projection") {
       const matches = events.filter(
         (event) =>

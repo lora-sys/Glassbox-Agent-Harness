@@ -44,6 +44,42 @@ test("group info case binds exact private A operation and refuses weaker or extr
     assert.throws(() => validateReadFeatureSpecs({ schemaVersion: 2, cases: [changed] }, config));
   }
 });
+test("group root page case binds exact private A operation and refuses weaker or extra capabilities", async () => {
+  const raw = JSON.parse(
+    await readFile(new URL("../examples/feature-baseline.example.json", import.meta.url), "utf8"),
+  );
+  const source = raw.cases.find((c) => c.id === "qq-group-a-root-files-read");
+  assert.equal(validateReadFeatureSpecs({ schemaVersion: 2, cases: [source] }, config).length, 1);
+  const [resolved] = resolveReadFeatureSpecs({ schemaVersion: 2, cases: [source] }, config);
+  assert.equal(resolved.featureAssertions[1].groupId, "20001");
+  for (const change of [
+    (c) => {
+      c.chat = "A";
+    },
+    (c) => {
+      c.leaseTools[0].operations[0].resourceId = "group:20002";
+    },
+    (c) => {
+      c.leaseTools[0].operations[0].inputConstraint.groupId = "20002";
+    },
+    (c) => {
+      c.leaseTools[0].operations[0].inputConstraint.params = { no_cache: true };
+    },
+    (c) => {
+      c.featureAssertions.pop();
+    },
+    (c) => {
+      c.featureAssertions[1].groupId = "{{group:B}}";
+    },
+    (c) => {
+      c.leaseTools[0].operations.push(structuredClone(c.leaseTools[0].operations[0]));
+    },
+  ]) {
+    const changed = structuredClone(source);
+    change(changed);
+    assert.throws(() => validateReadFeatureSpecs({ schemaVersion: 2, cases: [changed] }, config));
+  }
+});
 function suite() {
   return {
     schemaVersion: 2,
@@ -232,7 +268,7 @@ test("history result cases preserve exact four-assertion scope and allow the exp
     await readFile(new URL("../examples/feature-read.example.json", import.meta.url), "utf8"),
   );
   const resolved = resolveReadFeatureSpecs(raw, config);
-  assert.equal(resolved.length, 12);
+  assert.equal(resolved.length, 13);
   for (const [id, result, tool] of [
     ["history-current-group-hit", "hit", "group_history_search"],
     ["history-owner-group-a-no-match", "no_match", "owner_history_search"],
