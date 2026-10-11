@@ -143,6 +143,12 @@ function tools(
   definitionScope: TrustedChannelScope = ownerPrivateScope,
   definitionLease?: PiRunContext["acceptanceLease"],
   recordInput?: NonNullable<PiRunContext["recordQqToolExecutionInput"]>,
+  preconditions?: PiRunContext["requiredModerationPreconditions"],
+  verifyPreconditions?: (input: {
+    groupId: string;
+    userId: number;
+    preconditions: NonNullable<PiRunContext["requiredModerationPreconditions"]>;
+  }) => Promise<void>,
 ) {
   return createCapabilityTools({
     store,
@@ -153,6 +159,7 @@ function tools(
       conversationId: accepted.conversation.id,
       recordQqToolExecutionInput: recordInput ?? (async () => {}),
       ...(definitionLease ? { acceptanceLease: definitionLease } : {}),
+      ...(preconditions ? { requiredModerationPreconditions: preconditions } : {}),
       ...(required === undefined
         ? {}
         : {
@@ -165,6 +172,12 @@ function tools(
       return stored?.policy.categories[category] === true;
     },
     recordModerationResolution: async () => {},
+    ...(verifyPreconditions
+      ? {
+          verifyModerationPreconditions: async ({ groupId, userId, preconditions }) =>
+            verifyPreconditions({ groupId, userId, preconditions }),
+        }
+      : {}),
     invoke: async (input) => {
       await input.recordVerifiedInput?.();
       calls.push({ action: input.action, params: input.params });
@@ -1506,6 +1519,90 @@ it("refuses the registry search outside an Owner-private Run", async () => {
     await expect(call(toolByName(created, "qq_capability_search"), {})).rejects.toThrow(
       "Permission denied: resource_missing",
     );
+  } finally {
+    await store.close();
+  }
+});
+
+it("checks explicit moderation conditions before executing the mutation", async () => {
+  const { store, accepted } = await fixture();
+  try {
+    await enableCategory(store, "group.moderate");
+    await grantGroupAction(store, "group:moderate");
+    const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
+    const checks: unknown[] = [];
+    const preconditions = {
+      botMustBeAdmin: true,
+      targetMustBeOrdinaryMember: true,
+      targetMustNotBeMuted: true,
+    };
+    const created = tools(
+      store,
+      accepted,
+      calls,
+      {
+        name: "qq_group_moderation",
+        input: {
+          groupId: "100",
+          operation: "set_group_ban",
+          params: { user_id: 10004, duration: 5 },
+        },
+      },
+      undefined,
+      undefined,
+      ownerPrivateScope,
+      undefined,
+      undefined,
+      preconditions,
+      async (input) => {
+        checks.push(input);
+      },
+    );
+    await call(toolByName(created, "qq_group_moderation"), {
+      groupId: "100",
+      operation: "set_group_ban",
+      params: { user_id: 10004, duration: 5 },
+    });
+    expect(checks).toEqual([{ groupId: "100", userId: 10004, preconditions }]);
+    expect(calls.map((entry) => entry.action)).toEqual(["set_group_ban"]);
+  } finally {
+    await store.close();
+  }
+});
+
+it("refuses a conditional mute when the server cannot verify its preconditions", async () => {
+  const { store, accepted } = await fixture();
+  try {
+    await enableCategory(store, "group.moderate");
+    await grantGroupAction(store, "group:moderate");
+    const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
+    const created = tools(
+      store,
+      accepted,
+      calls,
+      {
+        name: "qq_group_moderation",
+        input: {
+          groupId: "100",
+          operation: "set_group_ban",
+          params: { user_id: 10004, duration: 5 },
+        },
+      },
+      undefined,
+      undefined,
+      ownerPrivateScope,
+      undefined,
+      undefined,
+      { targetMustNotBeMuted: true },
+    );
+    await expect(
+      call(toolByName(created, "qq_group_moderation"), {
+        groupId: "100",
+        operation: "set_group_ban",
+        params: { user_id: 10004, duration: 5 },
+      }),
+    ).rejects.toThrow("moderation_precondition_unverified");
+    expect(calls).toEqual([]);
   } finally {
     await store.close();
   }

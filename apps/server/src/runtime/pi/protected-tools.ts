@@ -29,6 +29,7 @@ export interface ProtectedToolContext {
   requiredToolName?: string;
   /** The exact input the current user message requires of that Tool. */
   requiredToolInput?: Record<string, unknown>;
+  requiredModerationPreconditions?: import("./types.js").PiRunContext["requiredModerationPreconditions"];
   acceptanceLease?: import("./types.js").PiRunContext["acceptanceLease"];
   recordQqToolExecutionInput?: import("./types.js").PiRunContext["recordQqToolExecutionInput"];
   /** Installed only after Glassbox authorization allows the protected call. */

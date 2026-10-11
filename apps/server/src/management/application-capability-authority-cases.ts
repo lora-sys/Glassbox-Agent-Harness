@@ -42,13 +42,15 @@ describe("configured group Run capability authority", () => {
     botRole: "owner" | "admin" | "member" = "member",
     beforeActionReply?: (action: Action) => Promise<void>,
     memberMuteUntil?: (userId: string) => number,
+    memberRoleForUser?: (userId: string) => "owner" | "admin" | "member",
   ) {
     const f = await fixture(
       async (input) => ({ status: "succeeded", text: `answer:${input.text}` }),
       {
         coOwnerId: CO_OWNER,
         memberRole,
-        memberRoleForUser: (userId) => (userId === "10001" ? botRole : memberRole()),
+        memberRoleForUser: (userId) =>
+          userId === "10001" ? botRole : (memberRoleForUser?.(userId) ?? memberRole()),
         ...(beforeActionReply === undefined ? {} : { beforeActionReply }),
         ...(memberMuteUntil === undefined ? {} : { memberMuteUntil }),
         ...(failAction === undefined ? {} : { failAction }),
@@ -1082,6 +1084,140 @@ describe("configured group Run capability authority", () => {
       }),
     );
   });
+  it("verifies requested mute conditions from fresh QQ state before mutating", async () => {
+    const { application, a, context, f } = await configuredGroup(
+      "admin",
+      () => "member",
+      undefined,
+      undefined,
+      "admin",
+      undefined,
+      () => 0,
+      (userId) => (userId === "10002" ? "admin" : "member"),
+    );
+    await application.setGroupCategory(a, {
+      groupId: GROUP,
+      category: "group.moderate",
+      enabled: true,
+    });
+    const runtimeContext = Object.assign(context, {
+      recordQqToolExecutionInput: async (
+        record: Parameters<NonNullable<PiRunContext["recordQqToolExecutionInput"]>>[0],
+      ) => {
+        const cursor = await f.app.trace.append(
+          context.runId,
+          { type: "qq_tool_execution_input_verified", runId: context.runId, ...record },
+          "glassbox-tool-evidence",
+        );
+        await f.app.store.evidence.advanceTrace(context.caller, cursor);
+      },
+      requiredToolName: "qq_group_moderation",
+      requiredToolInput: {
+        groupId: GROUP,
+        operation: "set_group_ban",
+        params: { user_id: 10004, duration: 5 },
+      },
+      requiredModerationPreconditions: {
+        botMustBeAdmin: true,
+        targetMustBeOrdinaryMember: true,
+        targetMustNotBeMuted: true,
+      },
+    });
+    const moderation = application
+      .createRuntimeTools(() => runtimeContext)
+      .find((tool) => tool.name === "qq_group_moderation");
+    if (!moderation) throw new Error("missing moderation Tool");
+    await expect(
+      moderation.execute("conditional-mute", {
+        operation: "set_group_ban",
+        params: { user_id: 10004, duration: 5 },
+      }),
+    ).resolves.toMatchObject({ details: { status: "ok" } });
+    const memberReadIndex = f.actionLog.findIndex(
+      (action) => action.action === "get_group_member_info" && action.params.user_id === 10004,
+    );
+    const mutationIndex = f.actionLog.findIndex((action) => action.action === "set_group_ban");
+    expect(memberReadIndex).toBeGreaterThanOrEqual(0);
+    expect(mutationIndex).toBeGreaterThan(memberReadIndex);
+    expect(f.actionLog[memberReadIndex]?.params.no_cache).toBe(true);
+    const trace = await f.app.trace.readPage(context.runId);
+    expect(trace.records.map((record) => record.event)).toContainEqual(
+      expect.objectContaining({
+        type: "qq_moderation_preconditions",
+        targetUserId: "10004",
+        verificationStatus: "verified",
+        checks: {
+          botIsAdmin: true,
+          targetIsOrdinaryMember: true,
+          targetIsNotMuted: true,
+        },
+      }),
+    );
+  });
+
+  it.each([
+    { botRole: "member" as const, targetRole: "member" as const, muteUntil: 0 },
+    { botRole: "admin" as const, targetRole: "admin" as const, muteUntil: 0 },
+    {
+      botRole: "admin" as const,
+      targetRole: "member" as const,
+      muteUntil: () => Math.floor(Date.now() / 1000) + 60,
+    },
+  ])(
+    "does not mute when a requested native precondition is false",
+    async ({ botRole, targetRole, muteUntil }) => {
+      const { application, a, context, f } = await configuredGroup(
+        "admin",
+        () => targetRole,
+        undefined,
+        undefined,
+        botRole,
+        undefined,
+        typeof muteUntil === "function" ? muteUntil : () => muteUntil,
+        (userId) => (userId === "10002" ? "admin" : targetRole),
+      );
+      await application.setGroupCategory(a, {
+        groupId: GROUP,
+        category: "group.moderate",
+        enabled: true,
+      });
+      const runtimeContext = Object.assign(context, {
+        recordQqToolExecutionInput: async (
+          record: Parameters<NonNullable<PiRunContext["recordQqToolExecutionInput"]>>[0],
+        ) => {
+          const cursor = await f.app.trace.append(
+            context.runId,
+            { type: "qq_tool_execution_input_verified", runId: context.runId, ...record },
+            "glassbox-tool-evidence",
+          );
+          await f.app.store.evidence.advanceTrace(context.caller, cursor);
+        },
+        requiredToolName: "qq_group_moderation",
+        requiredToolInput: {
+          groupId: GROUP,
+          operation: "set_group_ban",
+          params: { user_id: 10004, duration: 5 },
+        },
+        requiredModerationPreconditions: {
+          botMustBeAdmin: true,
+          targetMustBeOrdinaryMember: true,
+          targetMustNotBeMuted: true,
+        },
+      });
+      const moderation = application
+        .createRuntimeTools(() => runtimeContext)
+        .find((tool) => tool.name === "qq_group_moderation");
+      if (!moderation) throw new Error("missing moderation Tool");
+      await expect(
+        moderation.execute("conditional-mute", {
+          operation: "set_group_ban",
+          params: { user_id: 10004, duration: 5 },
+        }),
+      ).rejects.toBeDefined();
+      expect(f.actionLog.some((action) => action.action === "set_group_ban")).toBe(false);
+    },
+  );
+
   it.each(["mute", "unmute"] as const)(
     "checks the lease-bound native %s state before invoking the real capability",
     async (phase) => {

@@ -60,6 +60,7 @@ interface RequiredToolCall {
   input: Record<string, unknown>;
   /** Additional explicit actions that need independent Tool calls in the same Run. */
   additional?: readonly RequiredToolCall[];
+  requiredModerationPreconditions?: PiRunContext["requiredModerationPreconditions"];
 }
 
 /** Parse only the current Owner message; historical or retrieved text is never mutation intent. */
@@ -350,7 +351,7 @@ function namedMemberId(text: string): number | undefined {
 
 /** Read duration only from the same single mute request that supplies the target. */
 function namedMuteDuration(text: string): number | undefined {
-  const clause = muteRequestClause(text);
+  const clause = muteActionClause(text);
   if (clause === undefined) return undefined;
   const explicitRequest = parseExplicitGroupModerationClause(clause);
   if (explicitRequest) return explicitRequest.duration;
@@ -387,6 +388,33 @@ function muteRequestClause(text: string): string | undefined {
   const clauses = text.split(/[，,。！？!?；;\n]/u).filter((part) => /禁言|闭嘴/u.test(part));
   // One mutation intent cannot choose between, or combine fields from, multiple requests.
   return clauses.length === 1 ? clauses[0] : undefined;
+}
+
+/** The command clause that names a target and a duration, excluding mute-state conditions. */
+function muteActionClause(text: string): string | undefined {
+  const clauses = text.split(/[，,。！？!?；;\n]/u).filter((part) => /禁言|闭嘴/u.test(part));
+  const requests = clauses.filter(
+    (clause) =>
+      !/(?:目前|当前|现在|尚未|此前).{0,12}(?:没有|未|不).{0,8}(?:被)?(?:禁言|闭嘴)/u.test(clause),
+  );
+  if (requests.length !== 1) return undefined;
+  const actions = requests.filter((clause) => {
+    if (parseExplicitGroupModerationClause(clause)) return true;
+    const durationCount = [
+      ...clause.matchAll(/(?<![\d.+\-负])\d{1,9}\s*(?:秒|分钟|分|小时|时|天)/gu),
+    ].length;
+    if (durationCount !== 1) return false;
+    const normalized = clause
+      .trim()
+      .replace(/^(?:(?:请|麻烦|帮我|马上|现在)\s*)+/u, "")
+      .replace(/\d{1,9}\s*(?:秒|分钟|分|小时|时|天)\s*$/u, "")
+      .trim();
+    return (
+      /^(?:(?:把|将|给|对)\s*)?.+\s*(?:禁言|闭嘴)$/u.test(normalized) ||
+      /^(?:(?:群\s*[1-9]\d{4,15}\s*(?:的|里|中)?\s*)?(?:禁言|闭嘴)\s*.+)$/u.test(normalized)
+    );
+  });
+  return actions.length === 1 ? actions[0] : undefined;
 }
 
 type ExplicitGroupModerationRequest = {
@@ -444,7 +472,7 @@ function parseExplicitGroupModerationClause(
 
 /** Extract only a literal target in a single mute clause, never an ID inferred by the model. */
 function namedMuteTarget(text: string): string | undefined {
-  const clause = muteRequestClause(text);
+  const clause = muteActionClause(text);
   if (!clause) return undefined;
   const explicitRequest = parseExplicitGroupModerationClause(clause);
   if (explicitRequest) return explicitRequest.target;
@@ -458,6 +486,7 @@ function namedMuteTarget(text: string): string | undefined {
     .replace(/^(?:(?:请|麻烦|帮我|马上|现在)\s*)+/u, "")
     .replace(/^(?:把|将|给|对)\s*/u, "")
     .replace(/^群\s*[1-9]\d{4,15}\s*(?:里的|的|里|中)?\s*/u, "")
+    .replace(/^(?:把|将|给|对)\s*/u, "")
     .replace(/\d{1,9}\s*(?:秒|分钟|分|小时|时|天)\s*$/u, "")
     .trim();
   const match = /^(?:禁言|闭嘴)\s*(.+)$/u.exec(command) ?? /^(.+?)\s*(?:禁言|闭嘴)$/u.exec(command);
@@ -909,6 +938,32 @@ export function piProfileName(
  * authorization decision the Run can see and should be allowed to explain. Requiring is never
  * granting: the Tool still re-authorizes its own Resource at execution time.
  */
+function moderationPreconditionsFor(
+  text: string,
+  operation: string,
+): PiRunContext["requiredModerationPreconditions"] {
+  if (operation !== "set_group_ban") return undefined;
+  const value: NonNullable<PiRunContext["requiredModerationPreconditions"]> = {};
+  if (
+    /(?:你|机器人|Bot).{0,12}(?:有|是).{0,8}(?:管理员|群主)(?:权限)?|(?:管理员|群主)权限/u.test(
+      text,
+    )
+  )
+    value.botMustBeAdmin = true;
+  if (/(?:对方|目标|这个人|该成员).{0,12}(?:本群)?普通成员|普通成员/u.test(text))
+    value.targetMustBeOrdinaryMember = true;
+  if (/(?:目前|当前|现在|尚未|此前).{0,12}(?:没有|未|不).{0,8}(?:被)?(?:禁言|闭嘴)/u.test(text))
+    value.targetMustNotBeMuted = true;
+  if (/(?:如果|若|先确认|先检查|条件不满足|不满足就)/u.test(text) && /禁言/u.test(text)) {
+    // Conditional moderation is fail-closed: when it names moderation checks, bind the
+    // supported predicates explicitly instead of letting the model decide them from prose.
+    if (/管理员|群主/u.test(text)) value.botMustBeAdmin = true;
+    if (/普通成员/u.test(text)) value.targetMustBeOrdinaryMember = true;
+    if (/没有被禁言|未被禁言|不被禁言|目前没有禁言/u.test(text)) value.targetMustNotBeMuted = true;
+  }
+  return Object.keys(value).length === 0 ? undefined : value;
+}
+
 function requiredToolCall(
   input: ExecutionInput,
   isOwner: boolean,
@@ -948,6 +1003,14 @@ function requiredToolCall(
         operation: mutation.operation,
         ...mutationRequestFields(mutation, text),
       },
+      ...(moderationPreconditionsFor(input.text, mutation.operation)
+        ? {
+            requiredModerationPreconditions: moderationPreconditionsFor(
+              input.text,
+              mutation.operation,
+            ),
+          }
+        : {}),
     };
   }
   // Everything below is the Owner-private surface. A management Tool is never required
@@ -1051,6 +1114,14 @@ function requiredToolCall(
         operation: mutation.operation,
         ...mutationRequestFields(mutation, text),
       },
+      ...(moderationPreconditionsFor(rawText, mutation.operation)
+        ? {
+            requiredModerationPreconditions: moderationPreconditionsFor(
+              rawText,
+              mutation.operation,
+            ),
+          }
+        : {}),
     };
   }
 
@@ -2218,6 +2289,9 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       acceptanceMemoryText,
       gateMessages,
     );
+    if (required?.requiredModerationPreconditions)
+      context.requiredModerationPreconditions = required.requiredModerationPreconditions;
+
     if (required?.name === "qq_group_moderation" && required.input.operation === "set_group_ban") {
       const params = required.input.params as Record<string, unknown> | undefined;
       const missingDuration = params?.duration === undefined;
@@ -2246,7 +2320,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
             : "请提供目标成员的 QQ 号或完整昵称，并注明禁言时长。未执行禁言。",
         };
       }
-      const requestedGroup = namedGroupId(muteRequestClause(requestClauses(input.text)) ?? "");
+      const requestedGroup = namedGroupId(muteActionClause(requestClauses(input.text)) ?? "");
       if (input.caller.scope.chatType === "private" && requestedGroup !== required.input.groupId) {
         await this.recordEvidence({
           type: "tool_evidence",

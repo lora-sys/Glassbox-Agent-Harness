@@ -750,6 +750,13 @@ interface ProviderCallOptions {
     capability: QqCapability;
     operation: string;
   }) => Promise<QqNativeGroupRole>;
+  /** Checks current-message moderation conditions against fresh, authorized QQ state. */
+  verifyModerationPreconditions?: (input: {
+    context: ProtectedToolContext;
+    groupId: string;
+    userId: number;
+    preconditions: NonNullable<ProtectedToolContext["requiredModerationPreconditions"]>;
+  }) => Promise<void>;
 }
 
 /** The first unique roster result stays bound to this Run's original immutable request. */
@@ -963,6 +970,23 @@ async function executeProviderCall(
     });
     if (!capability.nativeGroupRoles.includes(verified))
       throw new ToolAuthorizationError("native_group_role_denied");
+  }
+
+  const moderationPreconditions = context.requiredModerationPreconditions;
+  if (
+    capability.tool === "qq_group_moderation" &&
+    action === "set_group_ban" &&
+    moderationPreconditions
+  ) {
+    const targetId = Number(providerParams.user_id);
+    if (!Number.isSafeInteger(targetId) || targetId <= 0 || !options.verifyModerationPreconditions)
+      throw new ToolInputError("moderation_precondition_unverified");
+    await options.verifyModerationPreconditions({
+      context,
+      groupId: groupId!,
+      userId: targetId,
+      preconditions: moderationPreconditions,
+    });
   }
 
   if (memberSelector !== undefined) {
@@ -1226,6 +1250,9 @@ export function createCapabilityTools(
           ...(value.requiredToolInput === undefined
             ? {}
             : { requiredToolInput: value.requiredToolInput }),
+          ...(value.requiredModerationPreconditions === undefined
+            ? {}
+            : { requiredModerationPreconditions: value.requiredModerationPreconditions }),
         }
       : undefined;
   };

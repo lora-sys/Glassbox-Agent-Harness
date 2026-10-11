@@ -89,6 +89,12 @@ import type { ToolExecutionOutcome } from "./tool-plane.js";
 import type { RequiredEvidence } from "./required-evidence.js";
 
 export interface PiRunContext {
+  /** Current-message conditions for one mute request. Server-owned and never model-visible. */
+  requiredModerationPreconditions?: {
+    botMustBeAdmin?: boolean;
+    targetMustBeOrdinaryMember?: boolean;
+    targetMustNotBeMuted?: boolean;
+  };
   /** Server-owned, message-bound restriction. It is never serialized into model context. */
   acceptanceLease?: {
     leaseId: string;

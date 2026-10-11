@@ -1,7 +1,7 @@
 import { verifyQqLiveNativeMuteStatePrecondition } from "../acceptance/qq-live-native-mute-state.js";
 import { join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { AccessDeniedError } from "../auth/service.js";
+import { AccessDeniedError, type AuthorizationRequest } from "../auth/service.js";
 import { qqCategoryCondition } from "../auth/policy-condition.js";
 import { chmod, mkdtemp, rm } from "node:fs/promises";
 import type { IncomingMessage } from "node:http";
@@ -2300,6 +2300,117 @@ export class ManagementApplication {
             "glassbox-moderation-resolution",
           );
           await this.store.evidence.advanceTrace(context.caller, cursor);
+        },
+        verifyModerationPreconditions: async ({ context, groupId, userId, preconditions }) => {
+          const caller = context.caller;
+          const connection = this.connections.get(caller.scope.connectionId);
+          if (!connection || !context.runId || !context.conversationId)
+            throw new ProviderCallError("provider_unavailable", "provider_unavailable");
+          const members = QQ_CAPABILITIES.find((entry) => entry.tool === "qq_group_members")!;
+          const resourceId = groupResourceId(groupId);
+          const readRequest: AuthorizationRequest = {
+            caller,
+            resourceId,
+            action: members.action,
+            policyCondition: qqCategoryCondition(caller, groupId, members.category),
+            conversationId: context.conversationId,
+            runId: context.runId,
+          };
+          const authorizeRead = async (): Promise<string> => {
+            const current = this.resolveRunToolNames(context);
+            const discovery = await this.store.authorization.check({
+              caller,
+              resourceId: toolResourceId(members.tool),
+              action: TOOL_DISCOVERY_ACTION,
+              conversationId: context.conversationId,
+              runId: context.runId,
+            });
+            if (
+              !(await current).includes(members.tool) ||
+              !(await this.isCategoryEnabled(
+                caller.scope.connectionId,
+                groupId,
+                members.category,
+              )) ||
+              (caller.scope.chatType === "private" &&
+                !(await this.store.authorization.hasActiveGrant({
+                  principalId: caller.principalId,
+                  resourceId,
+                  action: GROUP_ASSIGN_ACTION,
+                  scope: caller.scope,
+                }))) ||
+              discovery.decision !== "ALLOW"
+            )
+              throw new ProviderCallError("denied", "moderation_precondition_denied");
+            const decision = await this.store.authorization.check(readRequest);
+            if (decision.decision !== "ALLOW")
+              throw new ProviderCallError("denied", "moderation_precondition_denied");
+            return decision.id;
+          };
+          const decisionId = await authorizeRead();
+          let botIsAdmin: boolean | null = null;
+          if (preconditions.botMustBeAdmin) {
+            const configured = this.channels.resolve(caller.scope.connectionId);
+            const role = await connection.getGroupMemberRole({
+              groupId,
+              userId: configured.config.botId,
+            });
+            botIsAdmin =
+              role.status === "ok" &&
+              (role.role === "qq_group_admin" || role.role === "qq_group_owner");
+          }
+          const member = requireProviderSuccess(
+            await connection.invokeCapability({
+              action: "get_group_member_info",
+              params: { group_id: Number(groupId), user_id: userId, no_cache: true },
+            }),
+          ).data;
+          if (
+            !member ||
+            typeof member !== "object" ||
+            Array.isArray(member) ||
+            String((member as Record<string, unknown>).group_id) !== groupId ||
+            Number((member as Record<string, unknown>).user_id) !== userId ||
+            ((member as Record<string, unknown>).role !== "owner" &&
+              (member as Record<string, unknown>).role !== "admin" &&
+              (member as Record<string, unknown>).role !== "member") ||
+            !Number.isSafeInteger(Number((member as Record<string, unknown>).shut_up_timestamp)) ||
+            Number((member as Record<string, unknown>).shut_up_timestamp) < 0
+          )
+            throw new ProviderCallError("provider_failed", "provider_failed");
+          const memberValue = member as Record<string, unknown>;
+          const isOrdinaryMember = memberValue.role === "member";
+          const isNotMuted = Number(memberValue.shut_up_timestamp) <= Math.floor(Date.now() / 1000);
+          await this.store.authorization.authorizeReadResults([
+            { request: readRequest, decisionId, source: "content_source" },
+          ]);
+          await authorizeRead();
+          const checks = {
+            botIsAdmin,
+            targetIsOrdinaryMember: isOrdinaryMember,
+            targetIsNotMuted: isNotMuted,
+          };
+          const verified =
+            (!preconditions.botMustBeAdmin || checks.botIsAdmin === true) &&
+            (!preconditions.targetMustBeOrdinaryMember || checks.targetIsOrdinaryMember) &&
+            (!preconditions.targetMustNotBeMuted || checks.targetIsNotMuted);
+          const cursor = await this.trace.append(
+            context.runId,
+            {
+              type: "qq_moderation_preconditions",
+              runId: context.runId,
+              conversationId: context.conversationId,
+              principalId: caller.principalId,
+              resourceId,
+              targetUserId: String(userId),
+              requested: Object.keys(preconditions).sort(),
+              checks,
+              verificationStatus: verified ? "verified" : "mismatch",
+            },
+            "glassbox-qq-moderation-preconditions",
+          );
+          await this.store.evidence.advanceTrace(caller, cursor);
+          if (!verified) throw new ProviderCallError("denied", "moderation_precondition_denied");
         },
         verifyNativeGroupRole: async ({ context, groupId, capability, operation }) => {
           const connection = this.connections.get(context.caller.scope.connectionId);

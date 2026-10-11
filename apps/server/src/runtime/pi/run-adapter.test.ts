@@ -5531,6 +5531,29 @@ describe.each(["group", "private"] as const)("mute duration clause binding in %s
     },
   );
 
+  it("keeps the mute command separate from stated member and mute-state checks", async () => {
+    const f = muteFixture(
+      "把 QQ 3654774349 禁言 5 秒，先确认你现在有管理员权限，对方是本群普通成员，而且目前没有被禁言。条件不满足就不要改。",
+    );
+    f.run.mockImplementation(async (..._args: Parameters<PiRuntimeAdapter["run"]>) => ({
+      status: "completed",
+      text: "未执行",
+      toolCalls: [],
+    }));
+    await f.executor.execute(f.input);
+    await f.executor.execute(f.input);
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({
+      groupId: "1126022432",
+      operation: "set_group_ban",
+      params: { user_id: 3654774349, duration: 5 },
+    });
+    expect(f.run.mock.calls[0]?.[3]?.requiredModerationPreconditions).toEqual({
+      botMustBeAdmin: true,
+      targetMustBeOrdinaryMember: true,
+      targetMustNotBeMuted: true,
+    });
+  });
+
   it.each([
     "禁言 Ripped，另外禁言 Other 30 秒",
     "禁言 10004，另外禁言 10005 30 秒",
