@@ -5643,12 +5643,25 @@ it.each([
   },
 );
 
+it("asks for the group when a private natural-language mute request omits it", async () => {
+  const f = fixture([], ["qq_group_moderation"]);
+  f.input.text =
+    "请把成员 QQ 3654774349 禁言 5 秒。执行前先确认 Bot 是管理员，对方是普通成员，目前没有被禁言。条件不满足就不要操作。";
+  await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+    status: "failed",
+    failureCode: "gate_refused",
+    runtimeAttempted: false,
+    text: expect.stringContaining("在哪个群"),
+  });
+  expect(f.run).not.toHaveBeenCalled();
+});
+
 it("does not borrow a private mute group from an unrelated read clause", async () => {
   const f = fixture([], ["qq_group_moderation"]);
   f.input.text = "禁言 Ripped 30 秒，另外查看群 1126022432 的成员";
   await expect(f.executor.execute(f.input)).resolves.toMatchObject({
     status: "failed",
-    text: expect.stringContaining("目标群号"),
+    text: expect.stringContaining("在哪个群"),
   });
   expect(f.run).not.toHaveBeenCalled();
 });

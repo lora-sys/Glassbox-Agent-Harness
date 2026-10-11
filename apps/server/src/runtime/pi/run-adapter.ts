@@ -2213,11 +2213,14 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
             : blockedMutation.operation === "model:switch" &&
                 blockedMutation.reason === "unknown_target"
               ? gateMessages.modelUnknownTarget
-              : blockedMutation.reason === "not_permitted_in_group"
-                ? gateMessages.notPermittedInGroup
-                : blockedMutation.reason === "not_permitted"
-                  ? gateMessages.notPermitted
-                  : gateMessages.incompleteParameters,
+              : blockedMutation.operation === "set_group_ban" &&
+                  blockedMutation.reason === "incomplete_parameters"
+                ? gateMessages.moderationParametersMissing
+                : blockedMutation.reason === "not_permitted_in_group"
+                  ? gateMessages.notPermittedInGroup
+                  : blockedMutation.reason === "not_permitted"
+                    ? gateMessages.notPermitted
+                    : gateMessages.incompleteParameters,
       };
     }
     await this.runtime.initialize();

@@ -756,7 +756,13 @@ interface ProviderCallOptions {
     groupId: string;
     userId: number;
     preconditions: NonNullable<ProtectedToolContext["requiredModerationPreconditions"]>;
-  }) => Promise<void>;
+  }) => Promise<
+    Readonly<{
+      botIsAdmin?: true;
+      targetIsOrdinaryMember?: true;
+      targetIsNotMuted?: true;
+    }>
+  >;
 }
 
 /** The first unique roster result stays bound to this Run's original immutable request. */
@@ -973,6 +979,13 @@ async function executeProviderCall(
   }
 
   const moderationPreconditions = context.requiredModerationPreconditions;
+  let verifiedModerationPreconditions:
+    | Readonly<{
+        botIsAdmin?: true;
+        targetIsOrdinaryMember?: true;
+        targetIsNotMuted?: true;
+      }>
+    | undefined;
   if (
     capability.tool === "qq_group_moderation" &&
     action === "set_group_ban" &&
@@ -981,12 +994,21 @@ async function executeProviderCall(
     const targetId = Number(providerParams.user_id);
     if (!Number.isSafeInteger(targetId) || targetId <= 0 || !options.verifyModerationPreconditions)
       throw new ToolInputError("moderation_precondition_unverified");
-    await options.verifyModerationPreconditions({
+    verifiedModerationPreconditions = await options.verifyModerationPreconditions({
       context,
       groupId: groupId!,
       userId: targetId,
       preconditions: moderationPreconditions,
     });
+    if (
+      (moderationPreconditions.botMustBeAdmin &&
+        verifiedModerationPreconditions.botIsAdmin !== true) ||
+      (moderationPreconditions.targetMustBeOrdinaryMember &&
+        verifiedModerationPreconditions.targetIsOrdinaryMember !== true) ||
+      (moderationPreconditions.targetMustNotBeMuted &&
+        verifiedModerationPreconditions.targetIsNotMuted !== true)
+    )
+      throw new ToolInputError("moderation_precondition_unverified");
   }
 
   if (memberSelector !== undefined) {
@@ -1042,6 +1064,11 @@ async function executeProviderCall(
   });
   if (requiresInputWitness && !inputWitnessRecorded)
     throw new ToolInputError("verified_input_evidence_unavailable");
+  if (verifiedModerationPreconditions)
+    return {
+      providerResult: result,
+      verifiedModerationPreconditions,
+    };
   if (capability.tool === "qq_account_status" && action === "get_login_info") {
     // The provider answers with the account's QQ nickname beside its number. The nickname is
     // whatever NapCat read off QQ: nobody configured it here, it changes without this server

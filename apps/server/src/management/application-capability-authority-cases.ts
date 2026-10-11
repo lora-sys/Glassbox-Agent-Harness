@@ -1132,7 +1132,16 @@ describe("configured group Run capability authority", () => {
         operation: "set_group_ban",
         params: { user_id: 10004, duration: 5 },
       }),
-    ).resolves.toMatchObject({ details: { status: "ok" } });
+    ).resolves.toMatchObject({
+      details: {
+        providerResult: { status: "ok" },
+        verifiedModerationPreconditions: {
+          botIsAdmin: true,
+          targetIsOrdinaryMember: true,
+          targetIsNotMuted: true,
+        },
+      },
+    });
     const memberReadIndex = f.actionLog.findIndex(
       (action) => action.action === "get_group_member_info" && action.params.user_id === 10004,
     );

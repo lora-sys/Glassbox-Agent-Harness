@@ -2411,6 +2411,13 @@ export class ManagementApplication {
           );
           await this.store.evidence.advanceTrace(caller, cursor);
           if (!verified) throw new ProviderCallError("denied", "moderation_precondition_denied");
+          return {
+            ...(preconditions.botMustBeAdmin ? { botIsAdmin: true as const } : {}),
+            ...(preconditions.targetMustBeOrdinaryMember
+              ? { targetIsOrdinaryMember: true as const }
+              : {}),
+            ...(preconditions.targetMustNotBeMuted ? { targetIsNotMuted: true as const } : {}),
+          };
         },
         verifyNativeGroupRole: async ({ context, groupId, capability, operation }) => {
           const connection = this.connections.get(context.caller.scope.connectionId);

@@ -23,7 +23,8 @@ export const GATE_MESSAGES = {
   imageReadFailed: "图片读取失败，暂时无法识别，请重新发送图片。",
   imageModelUnsupported:
     "当前配置的模型不支持识别图片，因此没有发送图片。请切换到支持视觉输入的模型后重试。",
-  moderationParametersMissing: "请在禁言指令中明确指定目标群号、成员及禁言时长。未执行禁言。",
+  moderationParametersMissing:
+    "请说明要在哪个群执行禁言，并在同一句请求中写明目标成员和时长。未执行禁言。",
   moderationWrongGroup: "群聊中的禁言请求只能针对当前群，请在目标群重新发起请求。未执行禁言。",
   modelToolUnavailable: "模型切换工具当前不可用，未执行。",
   contextOverflow: "当前请求超过已配置模型的上下文容量，未发送给模型。",

@@ -148,7 +148,9 @@ function tools(
     groupId: string;
     userId: number;
     preconditions: NonNullable<PiRunContext["requiredModerationPreconditions"]>;
-  }) => Promise<void>,
+  }) => Promise<
+    Readonly<{ botIsAdmin?: true; targetIsOrdinaryMember?: true; targetIsNotMuted?: true }>
+  >,
 ) {
   return createCapabilityTools({
     store,
@@ -1556,14 +1558,24 @@ it("checks explicit moderation conditions before executing the mutation", async 
       preconditions,
       async (input) => {
         checks.push(input);
+        return { botIsAdmin: true, targetIsOrdinaryMember: true, targetIsNotMuted: true };
       },
     );
-    await call(toolByName(created, "qq_group_moderation"), {
+    const result = await call(toolByName(created, "qq_group_moderation"), {
       groupId: "100",
       operation: "set_group_ban",
       params: { user_id: 10004, duration: 5 },
     });
     expect(checks).toEqual([{ groupId: "100", userId: 10004, preconditions }]);
+    expect(result.details).toEqual({
+      providerResult: { ok: true, action: "set_group_ban" },
+      verifiedModerationPreconditions: {
+        botIsAdmin: true,
+        targetIsOrdinaryMember: true,
+        targetIsNotMuted: true,
+      },
+    });
+    expect(result.content?.[0]?.text).toContain("verifiedModerationPreconditions");
     expect(calls.map((entry) => entry.action)).toEqual(["set_group_ban"]);
   } finally {
     await store.close();
