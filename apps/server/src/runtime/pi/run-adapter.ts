@@ -528,7 +528,7 @@ const MODERATION_FAILURE_REPLIES: Readonly<Record<string, string>> = {
   moderation_member_id_required:
     "当前无法安全读取或解析群成员，请提供目标成员的 QQ 号和禁言时长。未执行禁言。",
   moderation_member_not_found:
-    "没有找到唯一的昵称或群名片匹配，请提供目标成员的 QQ 号和禁言时长。未执行禁言。",
+    "当前群成员列表中没有找到该 QQ 号、昵称或群名片，请确认目标成员的 QQ 号和禁言时长。未执行禁言。",
   moderation_member_ambiguous:
     "有多个成员匹配这个昵称或群名片，请提供目标成员的 QQ 号和禁言时长。未执行禁言。",
   moderation_member_changed:

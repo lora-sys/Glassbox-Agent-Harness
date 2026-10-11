@@ -140,7 +140,7 @@ export interface CapabilityToolInput extends Record<string, unknown> {
   groupId?: string;
   operation?: string;
   params?: QqProviderParams;
-  /** Exact current-message card/nickname. Only set_group_ban accepts this alternative to user_id. */
+  /** Exact QQ user ID, card, or nickname. Only set_group_ban accepts this alternative to user_id. */
   memberSelector?: string;
 }
 
@@ -510,7 +510,11 @@ function providerToolOperationParameters(
         {
           ...groupIdProperty,
           operation: Type.Literal("set_group_ban"),
-          memberSelector: Type.String({ minLength: 1, maxLength: 128 }),
+          memberSelector: Type.String({
+            minLength: 1,
+            maxLength: 128,
+            description: "Exact QQ user ID, group card, or nickname from the current request.",
+          }),
           params: Type.Object(
             { duration: providerParameterSchema("duration") },
             { additionalProperties: false },
@@ -682,7 +686,7 @@ function providerToolDescription(
     .join(". ");
   const memberResolution =
     capability.tool === "qq_group_moderation"
-      ? " For set_group_ban only, a current-message nickname/card may use memberSelector with params.duration and no user_id. The server requires current member-read permission and one exact match. Never infer an ID from history. If resolution fails, ask for the target's QQ user ID."
+      ? " For set_group_ban only, use memberSelector with params.duration and no user_id. memberSelector may be the exact QQ user ID, nickname, or group card from the current request. The server checks the current roster and requires one exact match. Never infer an ID from history. If resolution fails, ask for the target's QQ user ID."
       : "";
   const groupBinding =
     capability.resource !== "group"
@@ -738,7 +742,7 @@ interface ProviderCallOptions {
       groupId: string;
       resolvedUserId: string;
       duration: number;
-      method: "exact_card" | "exact_nickname" | "exact_card_and_nickname";
+      method: "exact_qq_id" | "exact_card" | "exact_nickname" | "exact_card_and_nickname";
       rosterReadDecisionId: string;
     },
     context: ProtectedToolContext,
@@ -813,11 +817,18 @@ async function resolveModerationMember(
     )
   )
     throw new ToolInputError("moderation_member_id_required");
-  // Exact, case-sensitive Unicode code-unit matching. No normalization or fuzzy fallback.
-  // A matching card and nickname belonging to the same QQ ID are one target.
+  // Numeric selectors identify an exact QQ ID. Text selectors use exact, case-sensitive
+  // Unicode code-unit matching against the current card or nickname. No fuzzy fallback.
+  // A matching ID, card, and nickname belonging to the same QQ ID are one target.
+  const selectedQqId = safeQqId(memberSelector);
   const matches = new Set(
     roster
-      .filter((member) => member.card === memberSelector || member.nickname === memberSelector)
+      .filter(
+        (member) =>
+          (selectedQqId !== undefined && safeQqId(member.user_id) === selectedQqId) ||
+          member.card === memberSelector ||
+          member.nickname === memberSelector,
+      )
       .map((member) => Number(safeQqId(member.user_id))),
   );
   if (matches.size === 0) throw new ToolInputError("moderation_member_not_found");
@@ -848,7 +859,13 @@ async function resolveModerationMember(
         resolvedUserId: String(userId),
         duration,
         method:
-          card && nickname ? "exact_card_and_nickname" : card ? "exact_card" : "exact_nickname",
+          selectedQqId !== undefined && selectedQqId === String(userId)
+            ? "exact_qq_id"
+            : card && nickname
+              ? "exact_card_and_nickname"
+              : card
+                ? "exact_card"
+                : "exact_nickname",
         rosterReadDecisionId: read.decisionId,
       },
       context,

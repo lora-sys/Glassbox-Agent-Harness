@@ -255,6 +255,30 @@ it.each([
   }
 });
 
+it("resolves an exact QQ ID from the current roster", async () => {
+  const f = await fixture({ roster: [{ user_id: 10004, nickname: "Ripped" }] });
+  const byId = { operation: "set_group_ban", memberSelector: "10004", params: { duration: 30 } };
+  f.context.requiredToolInput = { groupId, ...byId };
+  try {
+    await f.call(byId);
+    expect(f.calls).toEqual([
+      {
+        action: "get_group_member_list",
+        params: { group_id: Number(groupId) },
+        principalId: "owner",
+      },
+      {
+        action: "set_group_ban",
+        params: { group_id: Number(groupId), user_id: 10004, duration: 30 },
+        principalId: "owner",
+      },
+    ]);
+    expect(f.resolutions).toMatchObject([{ resolvedUserId: "10004", method: "exact_qq_id" }]);
+  } finally {
+    await f.store.close();
+  }
+});
+
 it("deduplicates the same QQ ID and never treats roster identity claims as authority", async () => {
   const f = await fixture({
     groupScope: true,
