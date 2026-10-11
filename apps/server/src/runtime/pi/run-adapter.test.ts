@@ -5450,23 +5450,25 @@ it.each([
   },
 );
 
-it.each(["把 QQ 3654774349 禁言 30 秒。", "把QQ号3654774349禁言30秒", "禁言 QQ 3654774349 30 秒"])(
-  "binds an explicit QQ identifier as a numeric target: %s",
-  async (text) => {
-    const empty: PiRunResult = { status: "completed", text: "未执行", toolCalls: [] };
-    const f = fixture([empty, empty], ["qq_group_moderation"]);
-    f.input.caller.scope.chatType = "group";
-    f.input.caller.scope.chatId = "1126022432";
-    f.input.conversation.scope = f.input.caller.scope;
-    f.input.text = text;
-    await f.executor.execute(f.input);
-    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({
-      groupId: "1126022432",
-      operation: "set_group_ban",
-      params: { user_id: 3654774349, duration: 30 },
-    });
-  },
-);
+it.each([
+  "把 QQ 3654774349 禁言 30 秒。",
+  "把 QQ 号 3654774349 禁言 30 秒",
+  "把QQ号3654774349禁言30秒",
+  "禁言 QQ 3654774349 30 秒",
+])("binds an explicit QQ identifier as a numeric target: %s", async (text) => {
+  const empty: PiRunResult = { status: "completed", text: "未执行", toolCalls: [] };
+  const f = fixture([empty, empty], ["qq_group_moderation"]);
+  f.input.caller.scope.chatType = "group";
+  f.input.caller.scope.chatId = "1126022432";
+  f.input.conversation.scope = f.input.caller.scope;
+  f.input.text = text;
+  await f.executor.execute(f.input);
+  expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({
+    groupId: "1126022432",
+    operation: "set_group_ban",
+    params: { user_id: 3654774349, duration: 30 },
+  });
+});
 
 it.each([
   "禁言 Ripped",

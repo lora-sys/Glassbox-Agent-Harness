@@ -504,7 +504,7 @@ function namedMuteTarget(text: string): string | undefined {
     return undefined;
   // QQ/QQ号 identifies an account when followed by one complete numeric ID. Keep
   // every other literal selector intact for the existing unique nickname resolution.
-  const qqIdentifier = /^QQ(?:号)?\s*([1-9]\d{4,14})$/iu.exec(selector);
+  const qqIdentifier = /^QQ\s*(?:号)?\s*([1-9]\d{4,14})$/iu.exec(selector);
   return qqIdentifier?.[1] ?? selector;
 }
 

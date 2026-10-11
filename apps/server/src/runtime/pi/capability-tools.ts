@@ -513,7 +513,8 @@ function providerToolOperationParameters(
           memberSelector: Type.String({
             minLength: 1,
             maxLength: 128,
-            description: "Exact QQ user ID, group card, or nickname from the current request.",
+            description:
+              'Exact QQ user ID, group card, or nickname from the current request. Example: {"memberSelector":"12345","params":{"duration":5}}. When using memberSelector, do not include params.user_id.',
           }),
           params: Type.Object(
             { duration: providerParameterSchema("duration") },
@@ -686,7 +687,7 @@ function providerToolDescription(
     .join(". ");
   const memberResolution =
     capability.tool === "qq_group_moderation"
-      ? " For set_group_ban only, use memberSelector with params.duration and no user_id. memberSelector may be the exact QQ user ID, nickname, or group card from the current request. The server checks the current roster and requires one exact match. Never infer an ID from history. If resolution fails, ask for the target's QQ user ID."
+      ? ` For set_group_ban only, use memberSelector with params.duration and no params.user_id. memberSelector may be the exact QQ user ID, nickname, or group card from the current request. Example: {"memberSelector":"12345","params":{"duration":5}}. The server checks the current roster and requires one exact match. Never infer an ID from history.`
       : "";
   const groupBinding =
     capability.resource !== "group"
@@ -957,11 +958,15 @@ async function executeProviderCall(
   // model. Retrieved text cannot supply that either. The compared parameters are the
   // model-supplied provider parameters — the server-derived `group_id` is not one of
   // them, so the message never has to (and cannot) restate the group the Run bound.
+  const numericSelector = memberSelector === undefined ? undefined : safeQqId(memberSelector);
   const mutationInput = {
     groupId: groupId!,
     operation: action,
-    params: supplied,
-    ...(memberSelector === undefined ? {} : { memberSelector }),
+    params:
+      action === "set_group_ban" && numericSelector !== undefined
+        ? { ...supplied, user_id: Number(numericSelector) }
+        : supplied,
+    ...(memberSelector === undefined || numericSelector !== undefined ? {} : { memberSelector }),
   };
   if (capability.risk !== "read") requireMutationIntent(context, capability.tool, mutationInput);
 

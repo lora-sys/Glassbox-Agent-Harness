@@ -257,8 +257,9 @@ it.each([
 
 it("resolves an exact QQ ID from the current roster", async () => {
   const f = await fixture({ roster: [{ user_id: 10004, nickname: "Ripped" }] });
+  const requested = { operation: "set_group_ban", params: { user_id: 10004, duration: 30 } };
   const byId = { operation: "set_group_ban", memberSelector: "10004", params: { duration: 30 } };
-  f.context.requiredToolInput = { groupId, ...byId };
+  f.context.requiredToolInput = { groupId, ...requested };
   try {
     await f.call(byId);
     expect(f.calls).toEqual([
