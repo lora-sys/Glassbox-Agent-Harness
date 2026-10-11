@@ -5356,6 +5356,34 @@ it("observes the Bot role only after binding the current required moderation cal
   expect(f.run.mock.calls[0]?.[3]?.authorizeBotGroupRoleObservation).toBeDefined();
 });
 
+it("counts a successful numeric memberSelector as the exact requested mute action", async () => {
+  const result: PiRunResult = {
+    status: "completed",
+    text: "已禁言。",
+    toolCalls: [
+      {
+        name: "qq_group_moderation",
+        failed: false,
+        input: {
+          operation: "set_group_ban",
+          memberSelector: "3654774349",
+          params: { duration: 5 },
+        },
+      },
+    ],
+  };
+  const f = fixture([result], ["qq_group_moderation"]);
+  f.input.caller.scope.chatType = "group";
+  f.input.caller.scope.chatId = "1121579672";
+  f.input.conversation.scope = f.input.caller.scope;
+  f.input.text = "请把 QQ 号 3654774349 禁言 5 秒";
+
+  await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+    status: "succeeded",
+    text: "已禁言。",
+  });
+});
+
 it("refuses the Run when Bot-role authorization is revoked before provider context", async () => {
   const result: PiRunResult = {
     status: "completed",

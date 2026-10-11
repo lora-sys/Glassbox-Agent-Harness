@@ -2656,17 +2656,42 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       // the required action only when every key the message pinned down agrees with it. Using
       // a looser check here would accept a Run whose Tool call the gate had refused.
       const callSatisfied = (expected: RequiredToolCall) =>
-        observedCalls.some(
-          (call) =>
-            call.name === expected.name &&
-            call.failed === false &&
-            satisfiesRequiredInput(
-              expected.input,
-              input.caller.scope.chatType === "group"
-                ? { ...call.input, groupId: input.caller.scope.chatId }
-                : call.input,
-            ),
-        );
+        observedCalls.some((call) => {
+          if (call.name !== expected.name || call.failed !== false) return false;
+          const actual: Record<string, unknown> =
+            input.caller.scope.chatType === "group"
+              ? { ...call.input, groupId: input.caller.scope.chatId }
+              : { ...call.input };
+          const requiredParams = expected.input.params;
+          const actualParams = actual.params;
+          const numericSelector = actual.memberSelector;
+          const requiredParamsRecord =
+            typeof requiredParams === "object" &&
+            requiredParams !== null &&
+            !Array.isArray(requiredParams)
+              ? (requiredParams as Record<string, unknown>)
+              : undefined;
+          const actualParamsRecord =
+            typeof actualParams === "object" &&
+            actualParams !== null &&
+            !Array.isArray(actualParams)
+              ? (actualParams as Record<string, unknown>)
+              : undefined;
+          if (
+            expected.name === "qq_group_moderation" &&
+            expected.input.operation === "set_group_ban" &&
+            requiredParamsRecord !== undefined &&
+            typeof requiredParamsRecord.user_id === "number" &&
+            actualParamsRecord !== undefined &&
+            Object.keys(actualParamsRecord).length === 1 &&
+            actualParamsRecord.duration !== undefined &&
+            typeof numericSelector === "string" &&
+            /^[1-9]\d{4,14}$/u.test(numericSelector) &&
+            Number(numericSelector) === requiredParamsRecord.user_id
+          )
+            actual.params = { ...actualParamsRecord, user_id: Number(numericSelector) };
+          return satisfiesRequiredInput(expected.input, actual);
+        });
       // A mutation the Run's surface never carried is an authorization decision that has already
       // been made, not an obligation the Run failed to meet. The capability policy declined the
       // category and the Run reads the same short list the model does, so insisting on the Tool
