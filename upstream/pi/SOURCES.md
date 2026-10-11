@@ -2,7 +2,7 @@
 
 Reference project: `earendil-works/pi`
 
-Pinned upstream commit for the next implementation review should be refreshed before P3.1 code starts. The previous research pin was `ceea48f5d5d12fd7915dfefba2835ccd55f23bb9`; current upstream has moved since then.
+Recorded source pin: `71dca871bc80b6bc97be37f0ca3189399d651fff` in `upstream/manifest.json`, package snapshot 0.85.1. The runtime compatibility boundary pins Pi 0.85.1 in `apps/server/src/runtime/pi/kit-loader.ts`. Copied provider and Agent-loop slices record the same source commit in `apps/server/src/model/SOURCES.md` and `apps/server/src/execution/model-agent/SOURCES.md`. These are tested repository pins, not a claim about the latest upstream release.
 
 Upstream branch: `main`
 
@@ -242,9 +242,9 @@ Protected execution must remain meaningful to the Glassbox Authorization Engine.
 
 Do not pin documentation to a stale upstream commit forever.
 
-Before P3.1 implementation:
+For a future Pi upgrade:
 
-1. fetch the current Pi release / tested commit;
+1. select and inspect the proposed Pi release / commit;
 2. record it in Lora PI Kit compatibility metadata;
 3. run Package / SDK compatibility tests;
 4. pin the tested runtime set.

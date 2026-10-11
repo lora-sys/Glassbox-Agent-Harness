@@ -142,7 +142,8 @@ test("completes seed then private recall with distinct bound Runs and increasing
   );
   assert.equal(h.calls[0].spec.id, "history-current-group-hit");
   assert.equal(h.calls[1].spec.id, "history-seed-recall");
-  assert.match(h.calls[1].spec.prompt, new RegExp(`query=${TOKENS[0]}`));
+  const query = `gbxhistory1-${TOKENS[0]}`;
+  assert.match(h.calls[1].spec.prompt, new RegExp(query));
   assert.equal(
     h.calls[1].spec.leaseTools[0].operations[0].inputConstraint.until,
     new Date(BASE_TIME * 1000).toISOString(),
@@ -150,7 +151,7 @@ test("completes seed then private recall with distinct bound Runs and increasing
   assert.deepEqual(h.calls[1].spec.featureAssertions[3], {
     kind: "history_seed_result",
     tool: "owner_history_search",
-    query: TOKENS[0],
+    query,
     groupId: "20001",
     result: "hit",
     count: 1,

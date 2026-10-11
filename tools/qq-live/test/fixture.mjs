@@ -108,9 +108,10 @@ export const baseConfig = () => ({
   },
   moderation: {
     enabled: true,
-    group: "A",
+    group: "B",
     target: "10003",
     consentConfirmed: true,
+    consentConfirmedAt: new Date().toISOString(),
     consentUntil: new Date(Date.now() + 86400000).toISOString(),
     durationSeconds: 60,
     emergencyCleanupViaDriver: false,
@@ -124,6 +125,8 @@ export async function world({
   stateField = true,
   delayReply = 0,
   memberListError = false,
+  replyText,
+  captureReplyReads = false,
   memberList = [
     { group_id: 20001, user_id: 10001 },
     { group_id: 20001, user_id: 10002 },
@@ -135,6 +138,7 @@ export async function world({
     mute = initialMute;
   const actions = [];
   const messageReads = { driver: new Map(), bot: new Map() };
+  const replyObservations = [];
   const event = (self, from, route, text, messageId = ++mid) => ({
     time: Math.floor(Date.now() / 1000),
     self_id: Number(self),
@@ -245,8 +249,26 @@ export async function world({
         "10001",
         "10002",
         replyRoute,
-        mode === "mismatch" ? marker + " wrong" : marker + " result: 42",
+        replyText ?? (mode === "mismatch" ? marker + " wrong" : marker + " result: 42"),
       );
+      if (captureReplyReads) {
+        const driverReplyId = String(reply.message_id);
+        const botReplyId = String(++mid);
+        const realSequence = String(500 + Math.floor(mid / 2));
+        const sharedReply = {
+          ...reply,
+          real_seq: realSequence,
+          sender: { user_id: 10002 },
+        };
+        messageReads.driver.set(driverReplyId, sharedReply);
+        messageReads.bot.set(botReplyId, {
+          ...sharedReply,
+          self_id: 10002,
+          user_id: 10002,
+          message_id: Number(botReplyId),
+        });
+        replyObservations.push({ botMessageId: botReplyId, driverMessageId: driverReplyId });
+      }
       const sendReply = () => {
         driver.broadcast(reply);
         if (mode === "replay") driver.broadcast(reply);
@@ -282,6 +304,7 @@ export async function world({
   return {
     config,
     actions,
+    replyObservations,
     driver,
     bot,
     close: async () => {

@@ -3,6 +3,11 @@ import { fail } from "./core.mjs";
 const MARKER = /^[a-f0-9]{32}$/;
 const RUN_ID = /^[A-Za-z0-9_-]{1,128}$/;
 const GROUP_ID = /^[1-9]\d{0,15}$/;
+const QUERY_PREFIX = "gbxhistory1-";
+
+function queryForMarker(marker) {
+  return `${QUERY_PREFIX}${marker}`;
+}
 
 function invalid() {
   fail("HISTORY_SCENARIO_INPUT", "固定历史场景需要本轮群 A 输入的有效证据。", "BLOCKED");
@@ -27,7 +32,7 @@ function seedSpecForGroup(groupId) {
   return {
     id: "history-current-group-hit",
     chat: "A",
-    prompt: "调用 group_history_search，用 {{nonce}} 查询本群，limit=1。说明结果并回复 {{nonce}}。",
+    prompt: "请搜索本群历史，查找编号 gbxhistory1-{{nonce}}，说明结果并回复本轮编号 {{nonce}}。",
     expectContains: ["{{nonce}}"],
     sideEffect: "none",
     leaseTools: [
@@ -37,7 +42,7 @@ function seedSpecForGroup(groupId) {
           {
             action: "history:read",
             resourceId: `group:${groupId}`,
-            inputConstraint: { query: "{{nonce}}", limit: 1 },
+            inputConstraint: { query: "gbxhistory1-{{nonce}}", limit: 1 },
           },
         ],
       },
@@ -53,7 +58,7 @@ function seedSpecForGroup(groupId) {
         kind: "trace",
         type: "history_retrieval",
         where: {
-          query: "{{nonce}}",
+          query: "gbxhistory1-{{nonce}}",
           groups: [groupId],
           resources: [`group:${groupId}`],
           sourceKind: "channel_message",
@@ -61,11 +66,11 @@ function seedSpecForGroup(groupId) {
         },
         count: 1,
       },
-      { kind: "history_coverage", query: "{{nonce}}", groupId, count: 1 },
+      { kind: "history_coverage", query: "gbxhistory1-{{nonce}}", groupId, count: 1 },
       {
         kind: "history_result",
         tool: "group_history_search",
-        query: "{{nonce}}",
+        query: "gbxhistory1-{{nonce}}",
         groupId,
         result: "hit",
         count: 1,
@@ -93,11 +98,12 @@ export function historyRecallSpec(input = {}) {
   const until = untilFromUnixSeconds(seedInputTime);
   if (groupId !== configuredId || !MARKER.test(seedMarker ?? "") || !RUN_ID.test(seedRunId ?? ""))
     invalid();
+  const query = queryForMarker(seedMarker);
 
   const recall = {
     id: "history-seed-recall",
     chat: "private",
-    prompt: `调用 owner_history_search，仅查询群 ${configuredId}，query=${seedMarker}、until=${until}、limit=1。只说明是否找到这条种子编号，并回复本轮编号 {{nonce}}。`,
+    prompt: `请搜索群 ${configuredId} 的历史记录，查找编号 ${query}。检索截止时间为 ${until}，最多查询 1 条。只说明是否找到这条种子编号，并回复本轮编号 {{nonce}}。`,
     expectContains: ["{{nonce}}"],
     sideEffect: "none",
     leaseTools: [
@@ -108,7 +114,7 @@ export function historyRecallSpec(input = {}) {
             action: "history:search",
             resourceId: "owner-history",
             inputConstraint: {
-              query: seedMarker,
+              query,
               groupIds: [configuredId],
               limit: 1,
               until,
@@ -128,7 +134,7 @@ export function historyRecallSpec(input = {}) {
         kind: "trace",
         type: "history_retrieval",
         where: {
-          query: seedMarker,
+          query,
           groups: [configuredId],
           resources: [`group:${configuredId}`],
           sourceKind: "channel_message",
@@ -136,11 +142,11 @@ export function historyRecallSpec(input = {}) {
         },
         count: 1,
       },
-      { kind: "history_coverage", query: seedMarker, groupId: configuredId, count: 1 },
+      { kind: "history_coverage", query, groupId: configuredId, count: 1 },
       {
         kind: "history_seed_result",
         tool: "owner_history_search",
-        query: seedMarker,
+        query,
         groupId: configuredId,
         result: "hit",
         count: 1,

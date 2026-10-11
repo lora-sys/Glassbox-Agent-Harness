@@ -1,0 +1,59 @@
+name: 问题报告
+description: 记录复现条件、实际结果和验收证据。
+title: "问题："
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请用中文填写。区分源码发现、隔离测试和真实环境结果。
+        不要上传密码、Token、登录文件或未经授权的消息正文。
+        WebUI 在线、端口监听和测试报告自报通过都不能单独证明真实投递成功。
+  - type: textarea
+    id: who
+    attributes:
+      label: 谁受到影响 Who
+      description: 说明执行者、使用者、有效身份和接收对象。账号可用角色代称。
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: 发生了什么 What
+      description: 分别说明预期行为、实际行为和影响范围。
+    validations:
+      required: true
+  - type: textarea
+    id: when
+    attributes:
+      label: 何时发生 When
+      description: 写明时间和时区，区分首次发生、最近复现和验证时间。
+    validations:
+      required: true
+  - type: textarea
+    id: where
+    attributes:
+      label: 在哪里发生 Where
+      description: 记录 Linux 环境、checkout、分支、提交、源码摘要、服务进程和数据目录。仅填相关项。
+    validations:
+      required: true
+  - type: textarea
+    id: how
+    attributes:
+      label: 如何复现 How
+      description: 写出最小操作顺序、前置权限和触发输入。写明是否会修改状态及如何恢复。
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 证据与判断
+      description: 提供错误码、Run 或消息标识、Trace 事件、日志位置和测试结果。区分已证明的事实与待验证的原因。
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 修复与关闭条件
+      description: 列出所需正向、拒绝、恢复和持久化检查，以及适用的上下文、执行、数据和投递边界。记录本地、实机、发布与 CI 的完成状态。
+    validations:
+      required: true

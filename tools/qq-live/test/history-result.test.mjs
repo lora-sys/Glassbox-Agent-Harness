@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { observeFeature, validateFeatureAssertions } from "../lib/feature-observer.mjs";
+import { historyInputDigest } from "../lib/history-input-evidence.mjs";
 import {
   historySnippet,
   observeHistorySeedResult,
@@ -125,14 +126,33 @@ function fixture(t, result = "hit") {
   const input = returned
     ? { query: nonce, limit: 1 }
     : { query: nonce, groupIds: ["123"], limit: 1 };
+  const toolCallId = "call-1";
   const events = [
+    {
+      type: "tool_call",
+      runId: "run-1",
+      principalId: "owner",
+      toolCallId,
+      timestamp: "2026-10-06T00:00:00.000Z",
+      data: {
+        runId: "run-1",
+        principalId: "owner",
+        toolCallId,
+        name: tool,
+        ...historyInputDigest(input),
+      },
+    },
     event,
-    { type: "tool_call", runId: "run-1", toolCallId: "call-1", data: { name: tool, input } },
     {
       type: "tool_result",
       runId: "run-1",
-      toolCallId: "call-1",
+      principalId: "owner",
+      toolCallId,
+      timestamp: "2026-10-06T00:00:01.000Z",
       data: {
+        runId: "run-1",
+        principalId: "owner",
+        toolCallId,
         name: tool,
         isError: false,
         outputSha256: digest(output),
@@ -165,6 +185,19 @@ test("history result proves the current input source and protected output withou
   assert.ok(!JSON.stringify(result).includes(nonce));
   assert.ok(!JSON.stringify(result).includes(recordId));
 });
+test("protected history producer omits raw arguments and binds the canonical input digest", (t) => {
+  const f = fixture(t);
+  const call = f.events.find((event) => event.type === "tool_call");
+  assert.equal(call.data.input, undefined);
+  assert.deepEqual(
+    { inputSha256: call.data.inputSha256, inputBytes: call.data.inputBytes },
+    historyInputDigest({ query: nonce, limit: 1 }),
+  );
+  assert.equal(
+    observeFeature([f.assertion], { db: f.db, events: f.events, runId: "run-1" }).status,
+    "PASS",
+  );
+});
 test("private history no-match requires complete source and independently empty scoped archive", (t) => {
   const f = fixture(t, "no_match");
   assert.equal(
@@ -180,25 +213,25 @@ test("private history no-match requires complete source and independently empty 
 test("history result rejects changed output hashes, source records and identity", (t) => {
   const f = fixture(t);
   for (const mutate of [
-    (e) => (e[0].toolOutput.sha256 = "b".repeat(64)),
-    (e) => (e[0].resultStatus = "no_matches_in_searched_window"),
-    (e) => (e[0].principalId = "visitor"),
-    (e) => (e[0].conversationId = "other"),
-    (e) => (e[0].items[0].recordId = "22222222-2222-4222-8222-222222222222"),
-    (e) => (e[0].items[0].senderId = "10004"),
-    (e) => (e[0].items[0].textSha256 = "c".repeat(64)),
-    (e) => (e[0].items[0].textBytes = 0),
-    (e) => (e[0].items[0].occurredAt = "2026-10-05T00:00:00.000Z"),
+    (e) => (e[1].toolOutput.sha256 = "b".repeat(64)),
+    (e) => (e[1].resultStatus = "no_matches_in_searched_window"),
+    (e) => (e[1].principalId = "visitor"),
+    (e) => (e[1].conversationId = "other"),
+    (e) => (e[1].items[0].recordId = "22222222-2222-4222-8222-222222222222"),
+    (e) => (e[1].items[0].senderId = "10004"),
+    (e) => (e[1].items[0].textSha256 = "c".repeat(64)),
+    (e) => (e[1].items[0].textBytes = 0),
+    (e) => (e[1].items[0].occurredAt = "2026-10-05T00:00:00.000Z"),
     (e) => (e[2].toolCallId = "other"),
-    (e) => (e[1].data.input.limit = 2),
+    (e) => Object.assign(e[0].data, historyInputDigest({ query: nonce, limit: 2 })),
+    (e) => delete e[0].data.inputSha256,
+    (e) => (e[0].data.inputBytes += 1),
+    (e) => (e[0].data.input = { query: nonce, limit: 1 }),
     (e) => (e[2].data.isError = true),
   ]) {
     const events = structuredClone(f.events);
     mutate(events);
-    assert.throws(
-      () => observeFeature([f.assertion], { db: f.db, events, runId: "run-1" }),
-      /独立来源/,
-    );
+    assert.throws(() => observeFeature([f.assertion], { db: f.db, events, runId: "run-1" }));
   }
   f.db.exec("UPDATE principals SET kind='visitor'");
   assert.throws(
@@ -206,6 +239,31 @@ test("history result rejects changed output hashes, source records and identity"
     /独立来源/,
   );
 });
+test("history result requires exact safe Trace fields, matching identities, and producer order", (t) => {
+  const f = fixture(t);
+  const cases = [
+    (events) => (events[0].data.query = nonce),
+    (events) => (events[0].data.extra = "unexpected"),
+    (events) => (events[0].data.principalId = "visitor"),
+    (events) => (events[0].principalId = "visitor"),
+    (events) => (events[2].data.outputHead = "protected result"),
+    (events) => (events[2].data.outputTruncated = true),
+    (events) => (events[2].data.extra = "unexpected"),
+    (events) => (events[2].data.runId = "other-run"),
+    (events) => events.reverse(),
+    (events) => (events[0].timestamp = "2026-10-06T00:00:03.000Z"),
+    (events) => (events[2].timestamp = "2026-10-05T23:59:59.000Z"),
+    (events) => (events[1].coverage.observedAt = "2026-10-06T00:00:04.000Z"),
+    (events) => (events[1].coverage.observedAt = "2026-10-06T00:00:02Z"),
+    (events) => (events[1].timestamp = "2026-10-06T00:00:02.000Z"),
+  ];
+  for (const mutate of cases) {
+    const events = structuredClone(f.events);
+    mutate(events);
+    assert.throws(() => observeFeature([f.assertion], { db: f.db, events, runId: "run-1" }));
+  }
+});
+
 test("history result rejects current-source metadata and archive-scope mismatches", (t) => {
   const f = fixture(t);
   for (const [column, value] of [
@@ -278,15 +336,21 @@ function seedFixture(t) {
   };
   for (const event of f.events) {
     event.runId = "recall-run";
-    if (event.data?.name) event.data.name = "owner_history_search";
+    if (event.data?.name) {
+      event.data.name = "owner_history_search";
+      event.data.runId = "recall-run";
+    }
   }
   f.event.conversationId = "private-conversation";
-  f.events.find((e) => e.type === "tool_call").data.input = {
-    query: nonce,
-    groupIds: ["123"],
-    limit: 1,
-    until,
-  };
+  Object.assign(
+    f.events.find((e) => e.type === "tool_call").data,
+    historyInputDigest({
+      query: nonce,
+      groupIds: ["123"],
+      limit: 1,
+      until,
+    }),
+  );
   return {
     ...f,
     assertion,
@@ -326,9 +390,12 @@ test("history seed proves a distinct earlier group input from a later private Ru
 test("history seed rejects another source, actor, scope and a missing time constraint", (t) => {
   const f = seedFixture(t);
   const call = f.events.find((e) => e.type === "tool_call");
-  delete call.data.input.until;
+  Object.assign(call.data, historyInputDigest({ query: nonce, groupIds: ["123"], limit: 1 }));
   assert.throws(() => observeHistorySeedResult(f.assertion, f));
-  call.data.input.until = f.assertion.until;
+  Object.assign(
+    call.data,
+    historyInputDigest({ query: nonce, groupIds: ["123"], limit: 1, until: f.assertion.until }),
+  );
   for (const sql of [
     "UPDATE channel_messages SET external_message_id='-23'",
     "UPDATE runs SET principal_id='foreign' WHERE id='run-1'",

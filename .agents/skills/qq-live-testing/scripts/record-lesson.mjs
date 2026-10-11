@@ -23,6 +23,7 @@ import { memoryFixtureStep } from "../../../../tools/qq-live/lib/memory-scenario
 import { toolManifestDigest, validateConfig } from "../../../../tools/qq-live/lib/core.mjs";
 import { verifyMemoryFamilyReport } from "../../../../tools/qq-live/lib/memory-family-evidence.mjs";
 import { verifyArchivedHistoryLesson } from "../../../../tools/qq-live/lib/history-lesson-evidence.mjs";
+import { verifyHistoryInputEvidence } from "../../../../tools/qq-live/lib/history-input-evidence.mjs";
 import {
   MEMORY_FAMILY_ID,
   MEMORY_REJECT_FAMILY_ID,
@@ -325,15 +326,24 @@ function verifyCompleteHistoryCase(caseRecord, accepted, events, runId) {
     resultContract?.tool ?? (currentGroup ? "group_history_search" : "owner_history_search");
   const calls = events.filter(
     (event) =>
-      event?.runId === runId && event.type === "tool_call" && event.data?.name === toolName,
+      event?.runId === runId &&
+      event.type === "tool_call" &&
+      ["group_history_search", "owner_history_search"].includes(event.data?.name),
   );
   const results = events.filter(
     (event) =>
-      event?.runId === runId && event.type === "tool_result" && event.data?.name === toolName,
+      event?.runId === runId &&
+      event.type === "tool_result" &&
+      ["group_history_search", "owner_history_search"].includes(event.data?.name),
   );
   const token = caseRecord.token;
-  const groupId = currentGroup ? caseRecord.route : calls[0]?.data?.input?.groupIds?.[0];
-  const input = calls[0]?.data?.input;
+  const groupAssertion = caseRecord.featureAssertions?.find(
+    (assertion) => assertion.kind === "history_coverage",
+  );
+  const groupId = currentGroup ? caseRecord.route : groupAssertion?.groupId;
+  const input = currentGroup
+    ? { query: token, limit: 1 }
+    : { query: token, groupIds: [groupId], limit: 1 };
   const scopedRoute = currentGroup
     ? caseRecord.route === groupId &&
       accepted.scope?.chatType === "group" &&
@@ -398,6 +408,8 @@ function verifyCompleteHistoryCase(caseRecord, accepted, events, runId) {
     !isDeepStrictEqual(caseRecord.featureAssertions, expectedAssertions) ||
     calls.length !== 1 ||
     results.length !== 1 ||
+    calls[0].data?.name !== toolName ||
+    results[0].data?.name !== toolName ||
     !calls[0].toolCallId ||
     calls[0].toolCallId !== results[0].toolCallId ||
     results[0].data?.isError !== false ||
@@ -408,12 +420,47 @@ function verifyCompleteHistoryCase(caseRecord, accepted, events, runId) {
   const historyEvents = events.filter(
     (event) => event?.runId === runId && event.type === "history_retrieval",
   );
+  const history = historyEvents[0];
+  const resultDataKeys = results[0]?.data && Object.keys(results[0].data).sort().join(",");
+  const callTime = Date.parse(calls[0]?.timestamp);
+  const observedAt = Date.parse(history?.coverage?.observedAt);
+  const resultTime = Date.parse(results[0]?.timestamp);
+  const canonicalTime = (value, parsed) =>
+    typeof value === "string" &&
+    Number.isFinite(parsed) &&
+    new Date(parsed).toISOString() === value;
   if (
     historyEvents.length !== 1 ||
-    historyEvents[0].query !== token ||
-    !isDeepStrictEqual(historyEvents[0].groups, [groupId])
+    history?.query !== token ||
+    !isDeepStrictEqual(history?.groups, [groupId]) ||
+    Object.hasOwn(history ?? {}, "timestamp") ||
+    history?.principalId !== calls[0]?.principalId ||
+    results[0]?.runId !== calls[0]?.runId ||
+    results[0]?.principalId !== calls[0]?.principalId ||
+    resultDataKeys !== "isError,name,outputBytes,outputSha256,principalId,runId,toolCallId" ||
+    results[0].data.runId !== runId ||
+    results[0].data.principalId !== calls[0].principalId ||
+    results[0].data.toolCallId !== calls[0].toolCallId ||
+    !history?.toolOutput ||
+    Object.keys(history.toolOutput).sort().join(",") !== "bytes,sha256" ||
+    !Number.isSafeInteger(history.toolOutput.bytes) ||
+    history.toolOutput.bytes < 1 ||
+    !/^[a-f0-9]{64}$/.test(history.toolOutput.sha256 ?? "") ||
+    results[0].data.outputBytes !== history.toolOutput.bytes ||
+    results[0].data.outputSha256 !== history.toolOutput.sha256 ||
+    !canonicalTime(calls[0]?.timestamp, callTime) ||
+    !canonicalTime(history?.coverage?.observedAt, observedAt) ||
+    !canonicalTime(results[0]?.timestamp, resultTime) ||
+    !(callTime < observedAt && observedAt < resultTime) ||
+    events.indexOf(calls[0]) >= events.indexOf(history) ||
+    events.indexOf(history) >= events.indexOf(results[0])
   )
     invalid("Complete history Trace does not match its fixed nonce and group A");
+  try {
+    verifyHistoryInputEvidence(calls[0], expectedInput);
+  } catch {
+    invalid("Fixed history lesson lacks its private, digest-bound Tool input");
+  }
 }
 
 function traceEventsForLesson(report, lesson, evidence, capture) {
@@ -581,19 +628,30 @@ export function verifyFeatureReport(report, lesson, evidence, capture = execFile
   if (trace.runId !== evidence.runId || !Array.isArray(trace.events))
     invalid("gbxtrace returned evidence for a different Run");
   const events = trace.events.map((row) => row.event);
+  const hasProtectedHistoryCall = events.some(
+    (event) =>
+      event?.runId === evidence.runId &&
+      event.type === "tool_call" &&
+      ["group_history_search", "owner_history_search"].includes(event.data?.name),
+  );
   if (
     caseRecord.id === "history-seed-recall" ||
     assertions.some((a) => a.kind === "history_seed_result") ||
     events.some(
-      (e) =>
-        e?.runId === evidence.runId &&
-        e.type === "tool_call" &&
-        e.data?.name === "owner_history_search" &&
-        /^[a-f0-9]{32}$/.test(e.data?.input?.query ?? "") &&
-        e.data?.input?.until !== undefined,
+      (event) =>
+        event?.runId === evidence.runId &&
+        event.type === "tool_call" &&
+        ["group_history_search", "owner_history_search"].includes(event.data?.name) &&
+        event.data?.input?.until !== undefined,
     )
   )
     invalid("Historical seed-family verification is unavailable for lessons; record a hypothesis.");
+  if (
+    hasProtectedHistoryCall &&
+    !COMPLETE_HISTORY_CASES.has(caseRecord.id) &&
+    !HISTORY_RESULT_CASES.has(caseRecord.id)
+  )
+    invalid("Protected history Tool calls require a fixed verified lesson contract");
   const config = {
     runtime: {
       connectionId: evidence.scope.connectionId,

@@ -149,6 +149,7 @@ test("read-only example binds only the implemented Ops and QQ inventory cases", 
     await readFile(new URL("../examples/feature-memory.example.json", import.meta.url), "utf8"),
   );
   const suiteConfig = {
+    bot: { qq: "10003" },
     groups: [
       { alias: "A", id: "10001" },
       { alias: "B", id: "10002" },
@@ -193,13 +194,13 @@ test("read-only example binds only the implemented Ops and QQ inventory cases", 
   );
   assert.equal(groupCase.leaseTools[0].operations[0].resourceId, "group:10001");
   assert.deepEqual(groupCase.leaseTools[0].operations[0].inputConstraint, {
-    query: "{{nonce}}",
+    query: "gbxhistory1-{{nonce}}",
     limit: 1,
   });
   assert.deepEqual(groupCase.featureAssertions[1].where.groups, ["10001"]);
   assert.equal(ownerCase.leaseTools[0].operations[0].resourceId, "owner-history");
   assert.deepEqual(ownerCase.leaseTools[0].operations[0].inputConstraint, {
-    query: "{{nonce}}",
+    query: "gbxhistory1-{{nonce}}",
     groupIds: ["10001"],
     limit: 1,
   });
@@ -815,6 +816,7 @@ test("schema 6 baseline binds all executable catalog cases while planned cases s
     await readFile(new URL("../examples/feature-baseline.example.json", import.meta.url), "utf8"),
   );
   const suiteConfig = {
+    bot: { qq: "10003" },
     groups: [
       { alias: "A", id: "10001" },
       { alias: "B", id: "10002" },
@@ -825,8 +827,11 @@ test("schema 6 baseline binds all executable catalog cases while planned cases s
   const exampleIds = new Set(resolved.cases.map((item) => item.id));
   const executable = FEATURE_CATALOG.cases.filter((item) => item.executionStatus === "executable");
   const planned = FEATURE_CATALOG.cases.filter((item) => item.executionStatus === "planned");
-  assert.equal(executable.length, 18);
-  assert.equal(planned.length, 8);
+  assert.equal(executable.length, 19);
+  assert.equal(planned.length, 9);
+  const membersBoundary = planned.find((item) => item.id === "qq-group-members-policy-isolation");
+  assert.equal(membersBoundary.executionStatus, "planned");
+  assert.match(membersBoundary.coveragePlan, /does not yet bind this mutation family/u);
   assert.equal(resolved.tasteFamilies.length, 1);
   assert.deepEqual(resolved.tasteFamilies[0], tasteFamily);
 

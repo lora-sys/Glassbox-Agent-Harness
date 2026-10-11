@@ -175,6 +175,73 @@ export async function boundMessage(client, requestedMessageId, expected) {
   };
 }
 
+/** Bind one received media message without returning its private locator or payload. */
+export async function boundMediaMessage(client, requestedMessageId, expected) {
+  const requested = messageId(requestedMessageId);
+  if (!requested) mismatch();
+  const result = await client.call("get_msg", { message_id: requested });
+  const actualId = messageId(result?.message_id);
+  const segments = result?.message;
+  const realSequence = result?.real_seq;
+  const time = result?.time;
+  const senderIds = [result?.sender?.user_id, result?.user_id].filter(
+    (value) => value !== undefined && value !== null,
+  );
+  const textSegments = Array.isArray(segments)
+    ? segments.filter((segment) => segment?.type === "text")
+    : [];
+  const mediaSegments = Array.isArray(segments)
+    ? segments.filter((segment) => segment?.type === expected.mediaType)
+    : [];
+  const caption =
+    textSegments.length === 1 && typeof textSegments[0]?.data?.text === "string"
+      ? textSegments[0].data.text
+      : "";
+  const mediaData = mediaSegments.length === 1 ? mediaSegments[0]?.data : undefined;
+  const hasMediaPayload =
+    mediaData &&
+    typeof mediaData === "object" &&
+    !Array.isArray(mediaData) &&
+    [mediaData.file, mediaData.url, mediaData.file_id].some(
+      (value) => typeof value === "string" && value.length > 0 && value.length <= 4096,
+    );
+  const freshnessFloor = Math.floor(Date.parse(expected.afterTime) / 1000) - 1;
+  const freshnessCeiling = Math.floor(Date.now() / 1000) + 5;
+  if (
+    actualId !== requested ||
+    id(result?.self_id) !== id(expected.selfId) ||
+    !senderIds.length ||
+    senderIds.some((senderId) => id(senderId) !== id(expected.senderId)) ||
+    result?.message_type !== expected.messageType ||
+    expected.messageType !== "private" ||
+    !["image", "video"].includes(expected.mediaType) ||
+    !Array.isArray(segments) ||
+    segments.length !== 2 ||
+    textSegments.length !== 1 ||
+    mediaSegments.length !== 1 ||
+    !hasMediaPayload ||
+    caption !== expected.caption ||
+    !Number.isSafeInteger(time) ||
+    time <= 0 ||
+    !Number.isFinite(freshnessFloor) ||
+    time < freshnessFloor ||
+    time > freshnessCeiling ||
+    typeof realSequence !== "string" ||
+    !/^\d{1,30}$/.test(realSequence)
+  )
+    mismatch();
+  const captionSha256 = createHash("sha256").update(caption, "utf8").digest("hex");
+  return {
+    messageId: actualId,
+    realSequence,
+    time,
+    textSha256: captionSha256,
+    captionSha256,
+    mediaType: expected.mediaType,
+    segmentCount: segments.length,
+  };
+}
+
 export function compareSameMessage(botMessage, driverMessage) {
   if (
     !botMessage ||

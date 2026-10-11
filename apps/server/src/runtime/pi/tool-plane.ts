@@ -928,6 +928,7 @@ export type ToolExecutionOutcome =
  */
 export function toolOutcomeFromFailure(code: string): ToolExecutionOutcome {
   switch (code) {
+    case "worker_file_authority_missing":
     case "authorization_denied":
     case "capability_category_disabled":
     case "context_missing":

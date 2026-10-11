@@ -30,7 +30,8 @@
     "hygiene:check": "node scripts/check-repository-hygiene.mjs",
     "portability:check": "node scripts/check-text-portability.mjs",
     "verify:commit": "node scripts/verify-commit.mjs",
-    "verify:full": "node scripts/verify-commit.mjs --full"
+    "verify:full": "node scripts/verify-commit.mjs --full",
+    "qq:chat": "node tools/qq-live/chat.mjs"
   },
   "dependencies": {
     "@glassbox/web": "^0.0.0",
@@ -50,6 +51,7 @@
     "ip-address": "10.7.2",
     "proxy-addr": "2.0.8",
     "source-map-js": "1.2.2",
+    "tinypool": "2.1.2",
     "undici": "8.10.2",
     "vite": "npm:@voidzero-dev/vite-plus-core@0.3.2",
     "vitest": "4.1.11"

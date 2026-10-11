@@ -29,6 +29,7 @@ import { authorizedValue, evaluate, type AuthorizedResult } from "../auth/servic
 export type TaskTraceEventType =
   | "task.created"
   | "task.worker_bound"
+  | "task.worker_dispatch_confirmed"
   | "worker.state_observed"
   | "worker.tool"
   | "worker.workspace_lease"
@@ -42,6 +43,7 @@ export type TaskTraceEventType =
   | "authorization.granted"
   | "authorization.revoked"
   | "authorization.filtered"
+  | "authorization.projection_receipt"
   | "capability.probed"
   | "runtime.turn";
 
@@ -326,6 +328,7 @@ export class TaskStore {
             resourceId: input.resourceId,
             ...(input.productWorkspaceId ? { productWorkspaceId: input.productWorkspaceId } : {}),
             decisionId: decision.id,
+            ...(workspaceDecision ? { workspaceDecisionId: workspaceDecision.id } : {}),
             outcome,
           },
         });
@@ -569,7 +572,11 @@ export class TaskStore {
     taskId: string,
     attemptId: string,
     principalId: string,
-    failure?: { phase: string; errorName: string },
+    failure?: {
+      phase: string;
+      errorName: string;
+      code?: import("./errors.js").WorkerDispatchFailure["code"];
+    },
   ): Promise<void> {
     await this.db.transaction(async (tx) => {
       const now = new Date().toISOString();
@@ -1174,7 +1181,11 @@ export class TaskStore {
    * Updates task to DONE, active attempt to succeeded, resolves review attention,
    * and appends to append-only RawTrace in a single atomic database transaction.
    */
-  async acceptTask(taskId: string, reviewerPrincipalId?: string): Promise<AgentTask> {
+  async acceptTask(
+    taskId: string,
+    reviewerPrincipalId?: string,
+    runId?: string,
+  ): Promise<AgentTask> {
     requireIdentifier(taskId);
     const now = new Date().toISOString();
 
@@ -1219,6 +1230,7 @@ export class TaskStore {
         type: "task.accepted",
         taskId,
         taskAttemptId: task.activeAttemptId ?? undefined,
+        runId,
         principalId: reviewerPrincipalId,
         data: {
           previousStatus: task.status,

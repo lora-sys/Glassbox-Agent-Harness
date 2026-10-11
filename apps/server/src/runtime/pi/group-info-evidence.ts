@@ -15,7 +15,16 @@ export function groupInfoEvidence(result: unknown):
     }
   | undefined {
   if (!isRecord(result) || Object.keys(result).sort().join(",") !== "content,details") return;
-  const { content, details } = result;
+  const { content } = result;
+  const envelope = result.details;
+  if (
+    !isRecord(envelope) ||
+    Object.keys(envelope).sort().join(",") !== "data,status" ||
+    envelope.status !== "ok" ||
+    !isRecord(envelope.data)
+  )
+    return;
+  const details = envelope.data;
   if (
     !Array.isArray(content) ||
     content.length !== 1 ||
@@ -43,7 +52,7 @@ export function groupInfoEvidence(result: unknown):
         : "";
   if (!/^[1-9]\d{4,15}$/u.test(groupId)) return;
   try {
-    if (content[0].text !== JSON.stringify(details)) return;
+    if (content[0].text !== JSON.stringify(envelope)) return;
   } catch {
     return;
   }

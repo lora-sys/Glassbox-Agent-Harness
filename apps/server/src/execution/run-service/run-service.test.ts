@@ -117,6 +117,7 @@ function service(
     deliveryTimeoutMs?: number;
     prepareDelivery?: ConstructorParameters<typeof RunService>[0]["prepareDelivery"];
     captureLearning?: ConstructorParameters<typeof RunService>[0]["captureLearning"];
+    beforeExecution?: ConstructorParameters<typeof RunService>[0]["beforeExecution"];
   } = {},
 ) {
   const events: RunServiceEvent[] = [];
@@ -886,6 +887,126 @@ describe("durable Run scheduling", () => {
     expect(send).not.toHaveBeenCalled();
   });
 
+  it("refuses protocol dispatch before learning and executor effects", async () => {
+    const { store } = await fixture();
+    const captureLearning = vi.fn(async () => "unexpected_candidate");
+    const execute = vi.fn(async () => ({ status: "succeeded" as const, text: "unexpected" }));
+    const beforeExecution = vi.fn(async () => ({
+      status: "failed" as const,
+      failureCode: "gate_refused" as const,
+      runtimeAttempted: false,
+      text: "验收授权失效。",
+    }));
+    const { instance, events } = service(store, { supportsGroup: true, execute }, undefined, {
+      beforeExecution,
+      captureLearning,
+    });
+    await instance.start();
+    const accepted = await instance.receive(input("protocol-refusal", "请记住测试偏好"));
+    await instance.waitForRun(owner(), accepted.run.id);
+    expect(beforeExecution).toHaveBeenCalledTimes(1);
+    expect(captureLearning).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+    expect(await instance.getRun(owner(), accepted.run.id)).toMatchObject({
+      status: "failed",
+      failureCode: "gate_refused",
+    });
+    expect(events.some((event) => event.type === "learning_candidate_created")).toBe(false);
+  });
+
+  it.each([
+    undefined,
+    {
+      status: "failed" as const,
+      failureCode: "gate_refused" as const,
+      runtimeAttempted: false,
+      text: "验收授权失效。",
+    },
+  ])(
+    "lets cancellation win while protocol authorization is pending, result %j",
+    async (preflightResult) => {
+      const { store } = await fixture();
+      const entered = deferred<void>();
+      const released = deferred<ExecutionResult | undefined>();
+      const captureLearning = vi.fn(async () => undefined);
+      const execute = vi.fn(async () => ({ status: "succeeded" as const, text: "unexpected" }));
+      const { instance } = service(store, { supportsGroup: true, execute }, undefined, {
+        beforeExecution: async () => {
+          entered.resolve();
+          return released.promise;
+        },
+        captureLearning,
+      });
+      await instance.start();
+      const accepted = await instance.receive(input("protocol-cancel"));
+      await entered.promise;
+      expect(captureLearning).not.toHaveBeenCalled();
+      expect(execute).not.toHaveBeenCalled();
+      await instance.cancel(owner(), accepted.run.id);
+      released.resolve(preflightResult);
+      expect((await instance.waitForRun(owner(), accepted.run.id)).status).toBe("cancelled");
+      expect(captureLearning).not.toHaveBeenCalled();
+      expect(execute).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not capture or execute when cancellation occurs during post-handoff authorization", async () => {
+    const { store } = await fixture();
+    const entered = deferred<void>();
+    const released = deferred<void>();
+    let prepared = false;
+    const check = store.authorization.check.bind(store.authorization);
+    vi.spyOn(store.authorization, "check").mockImplementation(async (request) => {
+      const decision = await check(request);
+      if (prepared && request.action === "run:create") {
+        entered.resolve();
+        await released.promise;
+      }
+      return decision;
+    });
+    const captureLearning = vi.fn(async () => "unexpected_candidate");
+    const execute = vi.fn(async () => ({ status: "succeeded" as const, text: "unexpected" }));
+    const { instance } = service(store, { supportsGroup: true, execute }, undefined, {
+      beforeExecution: async () => {
+        prepared = true;
+        return undefined;
+      },
+      captureLearning,
+    });
+    await instance.start();
+    const accepted = await instance.receive(input("post-handoff-cancel"));
+    await entered.promise;
+    await instance.cancel(owner(), accepted.run.id);
+    released.resolve();
+    expect((await instance.waitForRun(owner(), accepted.run.id)).status).toBe("cancelled");
+    expect(captureLearning).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("rechecks revoked Run authority after an asynchronous protocol handoff", async () => {
+    const { store, grants } = await fixture();
+    const entered = deferred<void>();
+    const released = deferred<undefined>();
+    const captureLearning = vi.fn(async () => "unexpected_candidate");
+    const execute = vi.fn(async () => ({ status: "succeeded" as const, text: "unexpected" }));
+    const { instance } = service(store, { supportsGroup: true, execute }, undefined, {
+      beforeExecution: async () => {
+        entered.resolve();
+        return released.promise;
+      },
+      captureLearning,
+    });
+    await instance.start();
+    const accepted = await instance.receive(input("protocol-revoke"));
+    await entered.promise;
+    await store.authorization.revoke(grants.get(scopeKey(group) + "run:create")!);
+    released.resolve(undefined);
+    const completed = await instance.waitForRun(owner(), accepted.run.id);
+    expect(completed.failureCode).toBe("gate_refused");
+    expect(captureLearning).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+  });
+
   it("captures learning only after Run authorization and records candidate identity without payload", async () => {
     const { store } = await fixture();
     const order: string[] = [];
@@ -1109,7 +1230,7 @@ describe("durable Run scheduling", () => {
     ).toBeNull();
   });
 
-  it("blocks an unsafe candidate, records only its digest, and excludes it from later context", async () => {
+  it("blocks an unsafe candidate, sends one safe notice, and excludes it from later context", async () => {
     const { store } = await fixture();
     const send = vi.fn(async (): Promise<{ status: "sent" }> => ({ status: "sent" }));
     const execute = vi
@@ -1134,8 +1255,15 @@ describe("durable Run scheduling", () => {
     await instance.start();
     const blocked = await instance.receive(input("blocked-output"));
     await instance.drain();
-    expect(send).not.toHaveBeenCalled();
-    expect((await store.lifecycle.listDeliveries(owner(), blocked.run.id)).items).toEqual([]);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(send.mock.calls)).not.toContain("C:\\Users\\owner\\secret");
+    expect((await store.lifecycle.listDeliveries(owner(), blocked.run.id)).items).toMatchObject([
+      {
+        payloadKind: "result",
+        status: "sent",
+        payloadText: "这次回复未通过发送检查，内容已保留供检查。请勿重复提交可能已经执行的操作。",
+      },
+    ]);
     expect(events).toContainEqual(
       expect.objectContaining({
         type: "delivery_blocked",
@@ -1148,6 +1276,7 @@ describe("durable Run scheduling", () => {
     await instance.drain();
     expect(duplicate.duplicate).toBe(true);
     expect(execute).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledTimes(1);
     expect(events.filter((event) => event.type === "delivery_blocked")).toHaveLength(1);
 
     const next = await instance.receive(input("after-block"));

@@ -33,6 +33,7 @@ async function fixture(t) {
     open: async (path, ...args) => {
       const handle = await open(path, ...args);
       return {
+        stat: (...statArgs) => handle.stat(...statArgs),
         chmod: async (mode) => {
           chmodCalls.push({ path, mode });
           return handle.chmod(mode);

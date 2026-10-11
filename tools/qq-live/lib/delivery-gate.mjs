@@ -24,6 +24,18 @@ function formalReviewPass(review, commit) {
   );
 }
 
+function developmentRuntimeEvidence(report) {
+  const runtimeIsNotClean = (runtime) =>
+    runtime !== null &&
+    typeof runtime === "object" &&
+    ["development", "sourceTreeSha256", "expectedSourceTreeSha256", "launchSourceTreeSha256"].some(
+      (key) => Object.hasOwn(runtime, key),
+    );
+  return (
+    runtimeIsNotClean(report?.runtime) || runtimeIsNotClean(report?.productAcceptance?.runtime)
+  );
+}
+
 async function resolveReviewEvidence(remote, commit, verifyAgentReview) {
   const review = remote?.review;
   if (review?.commit === commit && review.status === "CHANGES_REQUESTED")
@@ -174,6 +186,8 @@ export async function evaluateDeliveryGate(
   const freshRunTimes = [];
   const freshInputTimes = [];
   for (const report of reports) {
+    if (developmentRuntimeEvidence(report))
+      fail("DEVELOPMENT_RUNTIME", "显式开发验收报告不能用于交付或合并后验收。");
     if (
       report.status !== "PASS" ||
       report.mode !== "run" ||
@@ -193,6 +207,8 @@ export async function evaluateDeliveryGate(
     const fresh = await verifyReport(report);
     if (fresh?.status !== "PASS" || fresh.runtime?.commit !== commit || !Array.isArray(fresh.cases))
       fail("LIVE_REVERIFICATION", "重新查询的产品证据未通过。");
+    if (developmentRuntimeEvidence(fresh))
+      fail("DEVELOPMENT_RUNTIME", "显式开发验收报告不能用于交付或合并后验收。");
     if (postMerge) {
       for (const evidence of fresh.cases) {
         const created = Date.parse(evidence.runCreatedAt);

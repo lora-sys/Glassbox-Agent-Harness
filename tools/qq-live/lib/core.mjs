@@ -1,6 +1,7 @@
 import { randomUUID, createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { resolve, relative, isAbsolute } from "node:path";
+import { projectOneBotSendDiagnostic } from "./onebot-send-diagnostic.mjs";
 
 export class LiveError extends Error {
   constructor(code, message, status = "BLOCKED") {
@@ -109,6 +110,28 @@ export function validateConfig(raw, { live = false, now = Date.now() } = {}) {
   c.settleMs = integer(c.settleMs, 2000, 100, 10000, "settleMs");
   c.minGapMs = integer(c.minGapMs, 2000, 500, 30000, "minGapMs");
   c.maxMessages = integer(c.maxMessages, 12, 1, 30, "maxMessages");
+  if (c.mediaFixtures !== undefined) {
+    if (
+      !c.mediaFixtures ||
+      Array.isArray(c.mediaFixtures) ||
+      Object.keys(c.mediaFixtures).sort().join(",") !== "enabled,retainAssetsConfirmed,timeoutMs" ||
+      typeof c.mediaFixtures.enabled !== "boolean" ||
+      typeof c.mediaFixtures.retainAssetsConfirmed !== "boolean"
+    )
+      fail("CONFIG_MEDIA_FIXTURE", "媒体测试配置必须明确启用和保留测试文件。");
+    c.mediaFixtures.timeoutMs = integer(
+      c.mediaFixtures.timeoutMs,
+      600000,
+      1000,
+      900000,
+      "mediaFixtures.timeoutMs",
+    );
+  }
+  if (
+    c.runtime?.expectedSourceTreeSha256 !== undefined &&
+    !/^[a-f0-9]{64}$/.test(c.runtime.expectedSourceTreeSha256)
+  )
+    fail("CONFIG_RUNTIME", "开发验收源代码树哈希必须是 SHA256。");
   if (live) {
     if (c.safety?.acceptanceServiceConfirmed !== true || c.safety?.soleConsumerConfirmed !== true)
       fail(
@@ -121,20 +144,58 @@ export function validateConfig(raw, { live = false, now = Date.now() } = {}) {
   }
   return c;
 }
-export function validateModeration(c, now = Date.now()) {
-  const m = c.moderation;
+export function validateModeration(c, now = Date.now(), { allowOwnerRequest = false } = {}) {
+  const m = c?.moderation;
   if (m?.enabled !== true) fail("MODERATION_DISABLED", "禁言测试默认关闭，需要单独启用。");
-  const group = c.groups.find((g) => g.alias === m.group);
+  const group = c?.groups?.find((g) => g.alias === m.group);
   const target = id(m.target);
-  if (!group || !target || [c.bot.qq, c.driver.qq].includes(target))
-    fail(
-      "MODERATION_TARGET",
-      "需要指定测试群及同意配合的普通成员，不能使用 Bot 或发起账号作为目标。",
-    );
-  if (m.consentConfirmed !== true || !(Date.parse(m.consentUntil) > now))
-    fail("CONSENT_REQUIRED", "必须确认成员同意，且 consentUntil 尚未过期。");
+  const authorizationBasis = m.authorizationBasis ?? "member-consent";
+  if (m.group !== "B" || !group || !target || [c?.bot?.qq, c?.driver?.qq].includes(target))
+    fail("MODERATION_TARGET", "固定禁言只允许群 B 的明确普通成员目标，不能使用 Bot 或发起账号。");
   const duration = integer(m.durationSeconds, 60, 30, 60, "durationSeconds");
-  return { ...m, target, groupId: group.id, durationSeconds: duration };
+  if (authorizationBasis === "member-consent") {
+    const confirmedAt = Date.parse(m.consentConfirmedAt ?? "");
+    const consentUntil = Date.parse(m.consentUntil ?? "");
+    if (
+      m.consentConfirmed !== true ||
+      !Number.isFinite(confirmedAt) ||
+      new Date(confirmedAt).toISOString() !== m.consentConfirmedAt ||
+      confirmedAt > now ||
+      now - confirmedAt > 15 * 60_000 ||
+      !Number.isFinite(consentUntil) ||
+      new Date(consentUntil).toISOString() !== m.consentUntil ||
+      consentUntil <= now + 2 * c.timeoutMs + duration * 1000
+    )
+      fail("CONSENT_REQUIRED", "必须记录本轮成员明确同意，并覆盖完整禁言和恢复时段。");
+  } else if (authorizationBasis === "group-owner-request" && allowOwnerRequest) {
+    const authorizedAt = Date.parse(m.ownerAuthorizationAt ?? "");
+    const validUntil = Date.parse(m.ownerAuthorizationUntil ?? "");
+    if (
+      c?.driver?.qq !== "3526039967" ||
+      group.id !== "1126022432" ||
+      m.emergencyCleanupViaDriver === true ||
+      m.ownerAuthorizationConfirmed !== true ||
+      duration !== 30 ||
+      m.consentConfirmed === true ||
+      (m.consentConfirmedAt !== undefined && m.consentConfirmedAt !== "") ||
+      (m.consentUntil !== undefined && m.consentUntil !== "") ||
+      !Number.isFinite(authorizedAt) ||
+      new Date(authorizedAt).toISOString() !== m.ownerAuthorizationAt ||
+      authorizedAt > now ||
+      now - authorizedAt > 15 * 60_000 ||
+      !Number.isFinite(validUntil) ||
+      new Date(validUntil).toISOString() !== m.ownerAuthorizationUntil ||
+      !Number.isSafeInteger(c.timeoutMs) ||
+      validUntil <= now + 2 * c.timeoutMs + duration * 1000
+    )
+      fail(
+        "OWNER_AUTHORIZATION_REQUIRED",
+        "群主请求必须明确确认，并覆盖两个 Run、等待时间和 30 秒禁言。",
+      );
+  } else {
+    fail("CONSENT_REQUIRED", "该禁言授权依据未被当前流程支持。");
+  }
+  return { ...m, authorizationBasis, target, groupId: group.id, durationSeconds: duration };
 }
 export function statusOf(cases) {
   if (!cases.length) return "BLOCKED";
@@ -181,14 +242,57 @@ function internalErrorDiagnostic(error) {
         if (frames.length === 4) break;
       }
     }
-    return { type: type.name, frames };
+    const code = Object.getOwnPropertyDescriptor(error, "code")?.value;
+    const sqliteCode = Object.getOwnPropertyDescriptor(error, "errcode")?.value;
+    return {
+      type: type.name,
+      frames,
+      ...(code === "ERR_SQLITE_ERROR" &&
+      Number.isSafeInteger(sqliteCode) &&
+      sqliteCode >= 0 &&
+      sqliteCode <= 65535
+        ? { sqliteCode }
+        : {}),
+    };
   } catch {
     return undefined;
   }
 }
+function safeOneBotSendFailure(error) {
+  const failure = Object.getOwnPropertyDescriptor(error, "transportFailure")?.value;
+  if (!failure || typeof failure !== "object" || Array.isArray(failure)) return undefined;
+  const keys = Object.keys(failure).sort().join(",");
+  const retcode = failure.retcode;
+  if (!Number.isSafeInteger(retcode) || retcode < 0 || retcode > 2147483647) return undefined;
+  if (keys === "retcode") return { retcode };
+  if (
+    keys === "classification,providerResult,retcode" &&
+    failure.classification === "ACCOUNT_REAUTH_REQUIRED" &&
+    failure.providerResult === -10003 &&
+    retcode === 1200
+  )
+    return {
+      retcode,
+      classification: "ACCOUNT_REAUTH_REQUIRED",
+      providerResult: -10003,
+    };
+  return undefined;
+}
 export function safeError(error) {
-  if (error instanceof LiveError)
-    return { code: error.code, status: error.status, message: error.message };
+  if (error instanceof LiveError) {
+    const result = {
+      code: error.code,
+      status: error.status,
+      message: error.message,
+    };
+    const transportFailure = safeOneBotSendFailure(error);
+    if (transportFailure) result.transportFailure = transportFailure;
+    const transportDiagnostic = projectOneBotSendDiagnostic(
+      Object.getOwnPropertyDescriptor(error, "transportDiagnostic")?.value,
+    );
+    if (transportDiagnostic) result.transportDiagnostic = transportDiagnostic;
+    return result;
+  }
   // Untrusted provider/OS errors may contain URLs, tokens or message content.
   const diagnostic = internalErrorDiagnostic(error);
   return {

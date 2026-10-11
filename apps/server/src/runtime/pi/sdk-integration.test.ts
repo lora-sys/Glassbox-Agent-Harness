@@ -98,6 +98,7 @@ it.each(
     const evidence: string[] = [];
     let runtimeEvidence: unknown;
     let turnEvidence: unknown;
+    let definitionContext: Readonly<PiRunContext> | undefined;
     const adapter = new PiSdkRuntimeAdapter({
       kitPath:
         process.env.GLASSBOX_TEST_KIT_PATH ??
@@ -106,8 +107,9 @@ it.each(
       cwd: directory,
       modelRuntime: models,
       model: models.getModel("glassbox-test", "deterministic")!,
-      createTools: (getContext) => {
+      createTools: (getContext, context) => {
         currentContext = getContext;
+        definitionContext = context;
         return [];
       },
       onEvent: async (event) => {
@@ -119,6 +121,20 @@ it.each(
     });
     try {
       await adapter.initialize();
+      const runContext: PiRunContext = {
+        runId: "run",
+        conversationId: "conversation",
+        caller: {
+          principalId: "owner",
+          scope: {
+            connectionId: "qq",
+            botId: "bot",
+            chatType: "private",
+            chatId: "owner",
+            senderId: "owner",
+          },
+        },
+      };
       const binding = await adapter.createOrRestoreSession(
         {
           id: "conversation",
@@ -135,7 +151,13 @@ it.each(
           createdAt: new Date(0).toISOString(),
         },
         profile,
+        runContext,
       );
+      expect(definitionContext).toMatchObject({
+        runId: "run",
+        conversationId: "conversation",
+        caller: { principalId: "owner", scope: { chatType: "private" } },
+      });
       const result = await adapter.run(
         binding,
         {
@@ -149,21 +171,7 @@ it.each(
           updatedAt: new Date(0).toISOString(),
         },
         "这张图里有什么？",
-        {
-          runId: "run",
-          conversationId: "conversation",
-          images: [{ mimeType: "image/png", data: "aGVsbG8=" }],
-          caller: {
-            principalId: "owner",
-            scope: {
-              connectionId: "qq",
-              botId: "bot",
-              chatType: "private",
-              chatId: "owner",
-              senderId: "owner",
-            },
-          },
-        },
+        { ...runContext, images: [{ mimeType: "image/png", data: "aGVsbG8=" }] },
       );
       expect(adapter.getModelSupportsImages(binding.runtimeSessionId)).toBe(true);
       expect(calls).toBe(1);

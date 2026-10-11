@@ -28,12 +28,16 @@ test("builds a fixed seed without fabricated Run or time evidence", () => {
   assert.deepEqual(seed.leaseTools[0].operations[0], {
     action: "history:read",
     resourceId: "group:20001",
-    inputConstraint: { query: "{{nonce}}", limit: 1 },
+    inputConstraint: { query: "gbxhistory1-{{nonce}}", limit: 1 },
   });
+  assert.match(seed.prompt, /搜索本群历史/u);
+  assert.match(seed.prompt, /gbxhistory1-\{\{nonce\}\}/u);
+  assert.equal(seed.featureAssertions[1].where.query, "gbxhistory1-{{nonce}}");
+  assert.equal(seed.featureAssertions[2].query, "gbxhistory1-{{nonce}}");
   assert.deepEqual(seed.featureAssertions[3], {
     kind: "history_result",
     tool: "group_history_search",
-    query: "{{nonce}}",
+    query: "gbxhistory1-{{nonce}}",
     groupId: "20001",
     result: "hit",
     count: 1,
@@ -45,16 +49,18 @@ test("builds Owner-private recall from independent seed Run and Unix-second evid
   const until = new Date(seedEvidence.seedInputTime * 1000).toISOString();
   const recall = historyRecallSpec(seedEvidence);
   const composed = historyScenarioSteps(seedEvidence);
+  const query = `gbxhistory1-${marker}`;
   assert.equal(recall.chat, "private");
-  assert.match(recall.prompt, new RegExp(`query=${marker}`));
-  assert.match(recall.prompt, new RegExp(`until=${until.replaceAll(".", "\\.")}`));
+  assert.match(recall.prompt, /搜索群 20001 的历史记录/u);
+  assert.match(recall.prompt, new RegExp(query));
+  assert.match(recall.prompt, new RegExp(`检索截止时间为 ${until.replaceAll(".", "\\.")}`));
   assert.match(recall.prompt, /\{\{nonce\}\}/);
   assert.deepEqual(recall.expectContains, ["{{nonce}}"]);
   assert.deepEqual(recall.leaseTools[0].operations[0], {
     action: "history:search",
     resourceId: "owner-history",
     inputConstraint: {
-      query: marker,
+      query,
       groupIds: ["20001"],
       limit: 1,
       until,
@@ -63,7 +69,7 @@ test("builds Owner-private recall from independent seed Run and Unix-second evid
   assert.deepEqual(recall.featureAssertions[3], {
     kind: "history_seed_result",
     tool: "owner_history_search",
-    query: marker,
+    query,
     groupId: "20001",
     result: "hit",
     count: 1,

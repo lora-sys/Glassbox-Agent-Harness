@@ -1,5 +1,9 @@
 import { fail } from "./core.mjs";
 import { createHash } from "node:crypto";
+import {
+  observeGroupMemberRole,
+  validateGroupMemberRoleAssertion,
+} from "./group-member-role-evidence.mjs";
 import { validateGroupInfoAssertion, observeGroupInfoResult } from "./group-info-evidence.mjs";
 import { validateGroupFilesAssertion, observeGroupFilesResult } from "./group-files-evidence.mjs";
 import { observeHistoryCoverage, validateHistoryCoverageAssertion } from "./history-coverage.mjs";
@@ -16,7 +20,9 @@ const TYPES = new Set([
   "tool_call",
   "tool_result",
   "history_retrieval",
+  "qq_tool_execution_input_verified",
   "media_generation_completed",
+  "native_mute_state_precondition_verified",
 ]);
 const FIELDS = new Set([
   "name",
@@ -92,7 +98,7 @@ export function validateFeatureAssertions(assertions) {
         !Object.keys(a.where).length ||
         Object.entries(a.where).some(([k, v]) => !validFilter(k, v)) ||
         !Number.isSafeInteger(a.count) ||
-        a.count < 1 ||
+        a.count < (a.type === "tool_call" ? 0 : 1) ||
         a.count > 32 ||
         Object.keys(a).some((k) => !["kind", "type", "where", "count"].includes(k))
       )
@@ -107,6 +113,8 @@ export function validateFeatureAssertions(assertions) {
       validateHistoryCoverageAssertion(a);
     } else if (a.kind === "group_info") {
       validateGroupInfoAssertion(a);
+    } else if (a.kind === "group_member_role") {
+      validateGroupMemberRoleAssertion(a);
     } else if (a.kind === "group_files") {
       validateGroupFilesAssertion(a);
     } else if (a.kind === "aggregate_projection") {
@@ -181,6 +189,8 @@ export function observeFeature(assertions, { db, events, runId, inputBinding }) 
       observations.push(observeHistoryCoverage(assertion, events, runId));
     } else if (assertion.kind === "group_info") {
       observations.push(observeGroupInfoResult(assertion, { events, runId }));
+    } else if (assertion.kind === "group_member_role") {
+      observations.push(observeGroupMemberRole(assertion, { events, runId }));
     } else if (assertion.kind === "group_files") {
       observations.push(observeGroupFilesResult(assertion, { events, runId }));
     } else if (assertion.kind === "aggregate_projection") {

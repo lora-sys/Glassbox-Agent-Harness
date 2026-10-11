@@ -1,4 +1,4 @@
-import { readFile, open, rm } from "node:fs/promises";
+import { readFile, open, rm, lstat } from "node:fs/promises";
 import { dirname, resolve, relative, isAbsolute, sep } from "node:path";
 import { digest, fail, toolManifestDigest } from "./core.mjs";
 import {
@@ -482,6 +482,63 @@ export async function readTasteCheckpointRecord({
     pendingLag,
     reportDirectory,
   };
+}
+
+/** Read a finalized Taste journal after its pending checkpoint has been removed. */
+export async function readTasteJournalRecord({
+  journalPath,
+  outDirectory,
+  runtime,
+  scope,
+  driverQQ,
+  read = readFile,
+}) {
+  const journal = resolve(journalPath);
+  const reportDirectory = resolve(dirname(journal));
+  const relativeDirectory = relative(resolve(outDirectory), reportDirectory);
+  if (
+    !relativeDirectory ||
+    relativeDirectory.startsWith(`..${sep}`) ||
+    relativeDirectory === ".." ||
+    isAbsolute(relativeDirectory)
+  )
+    invalid(
+      "TASTE_CHECKPOINT_PATH",
+      "Taste journal path is outside the configured report directory.",
+    );
+  let before;
+  let journalText;
+  try {
+    before = await lstat(journal);
+    if (!before.isFile() || before.isSymbolicLink() || before.size > MAX_ROWS * MAX_BYTES)
+      invalid("TASTE_CHECKPOINT_JOURNAL", "Taste checkpoint journal is unsafe or too large.");
+    journalText = await read(journal, "utf8");
+    const after = await lstat(journal);
+    if (
+      !after.isFile() ||
+      after.isSymbolicLink() ||
+      before.dev !== after.dev ||
+      before.ino !== after.ino ||
+      before.size !== after.size
+    )
+      invalid("TASTE_CHECKPOINT_JOURNAL", "Taste checkpoint journal changed while being read.");
+  } catch (error) {
+    if (error.code?.startsWith("TASTE_")) throw error;
+    invalid("TASTE_CHECKPOINT_JOURNAL", "Taste checkpoint journal could not be read.");
+  }
+  const rows = parseCanonicalLines(journalText, "Taste checkpoint journal");
+  let previousHash = null;
+  let origin;
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index];
+    validateRow(row, index, previousHash, origin ?? row.origin, { runtime, scope, driverQQ });
+    origin ??= row.origin;
+    previousHash = row.checkpointSha256;
+  }
+  validateTransitions(rows);
+  if (resolve(rows.at(-1).reportDirectory) !== reportDirectory)
+    invalid("TASTE_CHECKPOINT_PATH", "Taste journal report directory does not match its rows.");
+  return { origin, rows, pending: rows.at(-1), reportDirectory };
 }
 
 export async function clearTasteCheckpoint(pendingPath) {

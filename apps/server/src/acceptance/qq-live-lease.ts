@@ -14,10 +14,17 @@ const BLOCKED_KEYS = new Set(["__proto__", "prototype", "constructor"]);
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonConstraint = JsonPrimitive | JsonConstraint[] | { [key: string]: JsonConstraint };
 
+export interface QqLiveNativeMuteStatePrecondition {
+  kind: "qq-member-mute-state";
+  phase: "mute" | "unmute";
+  expectedMuteUntil: number;
+}
+
 export interface QqLiveLeaseOperation {
   action: string;
   resourceId: string;
   inputConstraint: { [key: string]: JsonConstraint };
+  nativeMuteState?: QqLiveNativeMuteStatePrecondition;
 }
 
 export interface QqLiveLeaseTool {
@@ -87,6 +94,65 @@ function plainRecord(value: unknown): value is Record<string, unknown> {
   return prototype === Object.prototype || prototype === null;
 }
 
+function exactKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
+  const keys = Reflect.ownKeys(value);
+  return (
+    keys.length === allowed.length &&
+    keys.every((key) => typeof key === "string" && allowed.includes(key))
+  );
+}
+
+function cloneNativeMuteState(
+  value: unknown,
+  toolName: string,
+  action: string,
+  resourceId: string,
+  inputConstraint: Record<string, unknown>,
+): QqLiveNativeMuteStatePrecondition {
+  if (
+    !plainRecord(value) ||
+    !exactKeys(value, ["kind", "phase", "expectedMuteUntil"]) ||
+    value.kind !== "qq-member-mute-state" ||
+    (value.phase !== "mute" && value.phase !== "unmute") ||
+    !Number.isSafeInteger(value.expectedMuteUntil) ||
+    (value.expectedMuteUntil as number) < 0 ||
+    toolName !== "qq_group_moderation" ||
+    action !== "group:moderate" ||
+    !plainRecord(inputConstraint) ||
+    !exactKeys(inputConstraint, ["groupId", "operation", "params"])
+  )
+    throw new Error("invalid_lease_native_mute_precondition");
+
+  const groupId = inputConstraint.groupId;
+  const params = inputConstraint.params;
+  if (
+    typeof groupId !== "string" ||
+    !/^[1-9][0-9]{0,19}$/u.test(groupId) ||
+    !Number.isSafeInteger(Number(groupId)) ||
+    resourceId !== `group:${groupId}` ||
+    inputConstraint.operation !== "set_group_ban" ||
+    !plainRecord(params) ||
+    !exactKeys(params, ["user_id", "duration"]) ||
+    !Number.isSafeInteger(params.user_id) ||
+    (params.user_id as number) <= 0 ||
+    !Number.isSafeInteger(params.duration)
+  )
+    throw new Error("invalid_lease_native_mute_precondition");
+
+  const duration = params.duration as number;
+  if (
+    (value.phase === "mute" && (duration < 30 || duration > 60)) ||
+    (value.phase === "unmute" && (duration !== 0 || value.expectedMuteUntil === 0))
+  )
+    throw new Error("invalid_lease_native_mute_precondition");
+
+  return {
+    kind: "qq-member-mute-state",
+    phase: value.phase,
+    expectedMuteUntil: value.expectedMuteUntil as number,
+  };
+}
+
 function cloneJson(value: unknown, depth = 0): JsonConstraint {
   if (depth > 32) throw new Error("invalid_lease_constraint");
   if (value === null || typeof value === "string" || typeof value === "boolean") return value;
@@ -125,6 +191,7 @@ function cloneTools(input: readonly QqLiveLeaseTool[]): QqLiveLeaseTool[] {
   return input.map((tool) => {
     if (
       !plainRecord(tool) ||
+      !exactKeys(tool, ["name", "operations"]) ||
       typeof tool.name !== "string" ||
       !/^[a-z][a-z0-9_]{0,63}$/u.test(tool.name) ||
       names.has(tool.name) ||
@@ -137,6 +204,12 @@ function cloneTools(input: readonly QqLiveLeaseTool[]): QqLiveLeaseTool[] {
     const operations = tool.operations.map((operation) => {
       if (
         !plainRecord(operation) ||
+        !exactKeys(operation, [
+          "action",
+          "resourceId",
+          "inputConstraint",
+          ...(Object.hasOwn(operation, "nativeMuteState") ? ["nativeMuteState"] : []),
+        ]) ||
         typeof operation.action !== "string" ||
         operation.action.length === 0 ||
         operation.action.length > 128 ||
@@ -146,11 +219,21 @@ function cloneTools(input: readonly QqLiveLeaseTool[]): QqLiveLeaseTool[] {
         !plainRecord(operation.inputConstraint)
       )
         throw new Error("invalid_lease_operation");
-      return {
-        action: operation.action,
-        resourceId: operation.resourceId,
+      const cloned: QqLiveLeaseOperation = {
+        action: operation.action as string,
+        resourceId: operation.resourceId as string,
         inputConstraint: cloneJson(operation.inputConstraint) as { [key: string]: JsonConstraint },
       };
+      if (Object.hasOwn(operation, "nativeMuteState")) {
+        cloned.nativeMuteState = cloneNativeMuteState(
+          operation.nativeMuteState,
+          tool.name as string,
+          operation.action as string,
+          operation.resourceId as string,
+          operation.inputConstraint,
+        );
+      }
+      return cloned;
     });
     return { name: tool.name, operations };
   });
@@ -415,12 +498,84 @@ export class QqLiveLeaseRegistry {
     if (!lease) return { allowed: false, reason: "lease_unavailable" };
     if (this.now() >= lease.expiresAt) return { allowed: false, reason: "lease_expired" };
     const tool = lease.tools.find((entry) => entry.name === input.toolName);
-    const operation = tool?.operations.find(
+    const operations = tool?.operations.filter(
       (entry) => entry.action === input.action && entry.resourceId === input.resourceId,
     );
-    if (!operation || !matchesConstraint(operation.inputConstraint, input.toolInput))
+    if (!operations?.some((entry) => matchesConstraint(entry.inputConstraint, input.toolInput)))
       return { allowed: false, reason: "capability_mismatch" };
     return { allowed: true, reason: "allowed_by_lease" };
+  }
+
+  /** Returns an explicit no-precondition result or a detached native state check. */
+  getNativeMuteStatePrecondition(
+    input: QqLiveLeaseBinding & {
+      toolName: string;
+      action: string;
+      resourceId: string;
+      toolInput: Readonly<Record<string, unknown>>;
+    },
+  ): QqLiveNativeMuteStatePrecondition | null {
+    const lease = this.getBoundRun(input);
+    if (!lease) throw new Error("lease_unavailable");
+    if (this.now() >= lease.expiresAt) throw new Error("lease_expired");
+    if (!plainRecord(input.toolInput)) throw new Error("capability_mismatch");
+    const tool = lease.tools.find((entry) => entry.name === input.toolName);
+    if (!tool) throw new Error("capability_mismatch");
+    const matching = tool.operations.filter(
+      (operation) =>
+        operation.action === input.action &&
+        operation.resourceId === input.resourceId &&
+        matchesConstraint(operation.inputConstraint, input.toolInput),
+    );
+    if (matching.length !== 1) throw new Error("capability_mismatch");
+    const precondition = matching[0]!.nativeMuteState;
+    return precondition ? { ...precondition } : null;
+  }
+
+  /** Returns detached input restrictions for one active, exactly bound Run. */
+  getToolInputRestrictions(input: QqLiveLeaseBinding & { toolName: string }): readonly {
+    action: string;
+    resourceId: string;
+    inputConstraint: { [key: string]: JsonConstraint };
+  }[] {
+    const lease = this.getBoundRun(input);
+    if (!lease || this.now() >= lease.expiresAt) return [];
+    const tool = lease.tools.find((entry) => entry.name === input.toolName);
+    if (!tool) return [];
+    return tool.operations.map((operation) => ({
+      action: operation.action,
+      resourceId: operation.resourceId,
+      inputConstraint: cloneJson(operation.inputConstraint) as {
+        [key: string]: JsonConstraint;
+      },
+    }));
+  }
+
+  /** Fixed refusal categories only. No argument, constraint or protected payload is returned. */
+  diagnoseToolCall(
+    input: QqLiveLeaseBinding & {
+      toolName: string;
+      action: string;
+      resourceId: string;
+      toolInput: Readonly<Record<string, unknown>>;
+    },
+  ): string | undefined {
+    const lease = this.getBoundRun(input);
+    if (!lease) return "acceptance_lease_unavailable";
+    if (this.now() >= lease.expiresAt) return "acceptance_lease_expired";
+    const tool = lease.tools.find((entry) => entry.name === input.toolName);
+    if (!tool) return "acceptance_lease_tool_mismatch";
+    const actionOperations = tool.operations.filter((entry) => entry.action === input.action);
+    if (!actionOperations.length) return "acceptance_lease_action_mismatch";
+    const matchingOperations = actionOperations.filter(
+      (entry) => entry.resourceId === input.resourceId,
+    );
+    if (!matchingOperations.length) return "acceptance_lease_resource_mismatch";
+    return matchingOperations.some((entry) =>
+      matchesConstraint(entry.inputConstraint, input.toolInput),
+    )
+      ? undefined
+      : "acceptance_lease_input_mismatch";
   }
 
   private getBoundMessage(input: QqLiveLeaseBinding): LeaseRecord | undefined {

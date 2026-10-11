@@ -233,7 +233,12 @@ afterEach(async () => {
   for (const store of stores.splice(0)) await store.close();
 });
 
-function execute(store: DomainStore, taskId: string, operation: () => Promise<string>) {
+function execute(
+  store: DomainStore,
+  taskId: string,
+  operation: () => Promise<string>,
+  productWorkspaceId: string | null = "workspace-1",
+) {
   return store.tasks.executeWorkerTool(
     {
       caller,
@@ -243,10 +248,22 @@ function execute(store: DomainStore, taskId: string, operation: () => Promise<st
       action: "worker:file:read",
       allowedActions: ["worker:file:read"],
       callId: "call-1",
-      productWorkspaceId: "workspace-1",
+      ...(productWorkspaceId ? { productWorkspaceId } : {}),
     },
     operation,
   );
+}
+
+async function lastWorkerToolEvent(store: DomainStore, taskId: string) {
+  const result = await store.db.transaction((tx) =>
+    tx.execute({
+      sql: "SELECT data_json FROM ops_trace_events WHERE task_id = ? AND type = 'worker.tool' ORDER BY sequence DESC LIMIT 1",
+      args: [taskId],
+    }),
+  );
+  const data = result.rows[0]?.data_json;
+  if (typeof data !== "string") throw new Error("Missing Worker Tool trace event");
+  return JSON.parse(data) as Record<string, unknown>;
 }
 
 it("allows a durable Worker Tool while its running Step, Attempt, lease, and binding are live", async () => {
@@ -255,6 +272,47 @@ it("allows a durable Worker Tool while its running Step, Attempt, lease, and bin
 
   await expect(execute(store, task.id, operation)).resolves.toBe("result");
   expect(operation).toHaveBeenCalledOnce();
+  const event = await lastWorkerToolEvent(store, task.id);
+  if (typeof event.decisionId !== "string" || typeof event.workspaceDecisionId !== "string")
+    throw new Error("Missing linked Worker and Workspace decision IDs");
+  const decisionId = event.decisionId;
+  const workspaceDecisionId = event.workspaceDecisionId;
+  expect(event).toMatchObject({
+    decisionId: expect.any(String),
+    workspaceDecisionId: expect.any(String),
+    productWorkspaceId: "workspace-1",
+    outcome: "succeeded",
+  });
+  const decisions = await store.db.transaction((tx) =>
+    tx.execute({
+      sql: "SELECT id,resource_id,action,decision FROM authorization_decisions WHERE id IN (?,?) ORDER BY resource_id",
+      args: [decisionId, workspaceDecisionId],
+    }),
+  );
+  expect(decisions.rows).toEqual([
+    {
+      id: event.decisionId,
+      resource_id: "worker-files",
+      action: "worker:file:read",
+      decision: "ALLOW",
+    },
+    {
+      id: event.workspaceDecisionId,
+      resource_id: "workspace:workspace-1",
+      action: "workspace:read",
+      decision: "ALLOW",
+    },
+  ]);
+});
+
+it("omits a workspace decision reference when no product workspace applies", async () => {
+  const { store, task } = await fixture();
+  await expect(execute(store, task.id, async () => "result", null)).resolves.toBe("result");
+  const event = await lastWorkerToolEvent(store, task.id);
+
+  expect(event).toMatchObject({ decisionId: expect.any(String), outcome: "succeeded" });
+  expect(Object.hasOwn(event, "workspaceDecisionId")).toBe(false);
+  expect(Object.hasOwn(event, "productWorkspaceId")).toBe(false);
 });
 
 it("preserves the external origin Run while checking durable Worker Task delegation", async () => {

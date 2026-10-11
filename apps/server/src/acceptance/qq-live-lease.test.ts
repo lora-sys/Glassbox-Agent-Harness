@@ -310,6 +310,46 @@ describe("QQ live acceptance lease", () => {
       });
   });
 
+  it("classifies lease refusals without returning protected constraints", () => {
+    const f = fixture();
+    f.bind();
+    const base = {
+      ...f.binding(),
+      toolName: "qq_group_members",
+      action: "qq:group:members:read",
+      resourceId: "group:12345",
+      toolInput: { groupId: "12345", filter: { role: "owner" } },
+    };
+    expect(f.registry.diagnoseToolCall(base)).toBeUndefined();
+    expect(f.registry.diagnoseToolCall({ ...base, toolName: "private_canary_tool" })).toBe(
+      "acceptance_lease_tool_mismatch",
+    );
+    expect(f.registry.diagnoseToolCall({ ...base, action: "private:canary" })).toBe(
+      "acceptance_lease_action_mismatch",
+    );
+    expect(f.registry.diagnoseToolCall({ ...base, resourceId: "private-canary-resource" })).toBe(
+      "acceptance_lease_resource_mismatch",
+    );
+    expect(f.registry.diagnoseToolCall({ ...base, toolInput: {} })).toBe(
+      "acceptance_lease_input_mismatch",
+    );
+    expect(
+      f.registry.diagnoseToolCall({
+        ...base,
+        toolInput: {
+          groupId: "12345",
+          filter: { role: "owner", extra: true },
+          page: 3,
+        },
+      }),
+    ).toBeUndefined();
+    expect(f.registry.diagnoseToolCall({ ...base, runId: "wrong-run" })).toBe(
+      "acceptance_lease_unavailable",
+    );
+    f.advance(10_000);
+    expect(f.registry.diagnoseToolCall(base)).toBe("acceptance_lease_expired");
+  });
+
   it("limits calls to listed tool operations and subset-shaped JSON input", () => {
     const f = fixture();
     f.bind();
@@ -346,6 +386,315 @@ describe("QQ live acceptance lease", () => {
         toolInput: { groupId: "12345", filter: { role: "owner" } },
       }),
     ).toEqual({ allowed: true, reason: "allowed_by_lease" });
+  });
+
+  it("binds native mute-state preconditions into the lease and returns only a clone", () => {
+    const operation = {
+      action: "group:moderate",
+      resourceId: "group:12345",
+      inputConstraint: {
+        groupId: "12345",
+        operation: "set_group_ban",
+        params: { user_id: 10003, duration: 0 },
+      },
+      nativeMuteState: {
+        kind: "qq-member-mute-state" as const,
+        phase: "unmute" as const,
+        expectedMuteUntil: 120,
+      },
+    };
+    const withoutPrecondition = structuredClone(operation);
+    Reflect.deleteProperty(withoutPrecondition, "nativeMuteState");
+    expect(
+      canonicalQqLiveToolsSha256([{ name: "qq_group_moderation", operations: [operation] }]),
+    ).not.toBe(
+      canonicalQqLiveToolsSha256([
+        { name: "qq_group_moderation", operations: [withoutPrecondition] },
+      ]),
+    );
+
+    const f = fixtureWithTools([{ name: "qq_group_moderation", operations: [operation] }]);
+    f.bind();
+    const call = {
+      ...f.binding(),
+      toolName: "qq_group_moderation",
+      action: "group:moderate",
+      resourceId: "group:12345",
+      toolInput: operation.inputConstraint,
+    };
+    const returned = f.registry.getNativeMuteStatePrecondition(call);
+    expect(returned).toEqual(operation.nativeMuteState);
+    expect(returned).not.toBe(operation.nativeMuteState);
+    expect(
+      f.registry.getNativeMuteStatePrecondition({
+        ...call,
+        toolInput: { ...operation.inputConstraint, additional: true },
+      }),
+    ).toEqual(operation.nativeMuteState);
+  });
+
+  it("distinguishes no guard from invalid, expired, revoked, and ambiguous bindings", () => {
+    const ordinary = {
+      name: "qq_group_members",
+      operations: [
+        {
+          action: "qq:group:members:read",
+          resourceId: "group:12345",
+          inputConstraint: { groupId: "12345" },
+        },
+      ],
+    };
+    const f = fixtureWithTools([ordinary]);
+    f.bind();
+    const call = {
+      ...f.binding(),
+      toolName: ordinary.name,
+      action: ordinary.operations[0]!.action,
+      resourceId: ordinary.operations[0]!.resourceId,
+      toolInput: ordinary.operations[0]!.inputConstraint,
+    };
+    expect(f.registry.getNativeMuteStatePrecondition(call)).toBeNull();
+    expect(() =>
+      f.registry.getNativeMuteStatePrecondition({ ...call, runId: "wrong-run" }),
+    ).toThrow("lease_unavailable");
+    expect(() =>
+      f.registry.getNativeMuteStatePrecondition({ ...call, action: "wrong-action" }),
+    ).toThrow("capability_mismatch");
+    f.registry.revoke(f.registration.leaseId);
+    expect(() => f.registry.getNativeMuteStatePrecondition(call)).toThrow("lease_unavailable");
+
+    const expired = fixtureWithTools([ordinary]);
+    expired.bind();
+    expired.advance(10_000);
+    expect(() =>
+      expired.registry.getNativeMuteStatePrecondition({
+        ...expired.binding(),
+        toolName: ordinary.name,
+        action: ordinary.operations[0]!.action,
+        resourceId: ordinary.operations[0]!.resourceId,
+        toolInput: ordinary.operations[0]!.inputConstraint,
+      }),
+    ).toThrow("lease_expired");
+
+    const guarded = {
+      name: "qq_group_moderation",
+      operations: [
+        {
+          action: "group:moderate",
+          resourceId: "group:12345",
+          inputConstraint: {
+            groupId: "12345",
+            operation: "set_group_ban",
+            params: { user_id: 10003, duration: 0 },
+          },
+          nativeMuteState: {
+            kind: "qq-member-mute-state",
+            phase: "unmute",
+            expectedMuteUntil: 120,
+          },
+        },
+      ],
+    } satisfies QqLiveLeaseTool;
+    const ambiguous = fixtureWithTools([
+      { ...guarded, operations: [...guarded.operations, structuredClone(guarded.operations[0]!)] },
+    ]);
+    ambiguous.bind();
+    expect(() =>
+      ambiguous.registry.getNativeMuteStatePrecondition({
+        ...ambiguous.binding(),
+        toolName: guarded.name,
+        action: guarded.operations[0]!.action,
+        resourceId: guarded.operations[0]!.resourceId,
+        toolInput: guarded.operations[0]!.inputConstraint,
+      }),
+    ).toThrow("capability_mismatch");
+  });
+
+  it("rejects native preconditions outside the exact QQ moderation contract", () => {
+    const constraint = {
+      groupId: "12345",
+      operation: "set_group_ban",
+      params: { user_id: 10003, duration: 0 },
+    };
+    const descriptor = {
+      kind: "qq-member-mute-state",
+      phase: "unmute",
+      expectedMuteUntil: 120,
+    };
+    const operation = (overrides: Record<string, unknown> = {}) => ({
+      action: "group:moderate",
+      resourceId: "group:12345",
+      inputConstraint: constraint,
+      nativeMuteState: descriptor,
+      ...overrides,
+    });
+    const invalidTools: unknown[] = [
+      { name: "other_tool", operations: [operation()] },
+      { name: "qq_group_moderation", operations: [operation({ action: "qq:group:ban" })] },
+      { name: "qq_group_moderation", operations: [operation({ resourceId: "group:other" })] },
+      {
+        name: "qq_group_moderation",
+        operations: [operation({ inputConstraint: { ...constraint, extra: true } })],
+      },
+      {
+        name: "qq_group_moderation",
+        operations: [
+          operation({
+            inputConstraint: { ...constraint, params: { user_id: "10003", duration: 0 } },
+          }),
+        ],
+      },
+      {
+        name: "qq_group_moderation",
+        operations: [
+          operation({
+            inputConstraint: { ...constraint, params: { user_id: 10003, duration: 30 } },
+          }),
+        ],
+      },
+      {
+        name: "qq_group_moderation",
+        operations: [operation({ nativeMuteState: { ...descriptor, expectedMuteUntil: -1 } })],
+      },
+      {
+        name: "qq_group_moderation",
+        operations: [operation({ nativeMuteState: { ...descriptor, expectedMuteUntil: 1.5 } })],
+      },
+      {
+        name: "qq_group_moderation",
+        operations: [operation({ nativeMuteState: { ...descriptor, expectedMuteUntil: 0 } })],
+      },
+      {
+        name: "qq_group_moderation",
+        operations: [operation({ nativeMuteState: { ...descriptor, unexpected: true } })],
+      },
+    ];
+    for (const tool of invalidTools)
+      expect(() => fixtureWithTools([tool as QqLiveLeaseTool])).toThrow(
+        "invalid_lease_native_mute_precondition",
+      );
+  });
+
+  it("returns only cloned restrictions for an active exact Run binding", () => {
+    const registered = [
+      {
+        action: "qq:group:members:read",
+        resourceId: "group:12345",
+        inputConstraint: { groupId: "12345", filter: { role: "member" } },
+      },
+      {
+        action: "qq:group:members:read",
+        resourceId: "group:12345",
+        inputConstraint: { groupId: "12345", filter: { role: "owner" } },
+      },
+    ];
+    const f = fixtureWithTools([{ name: "qq_group_members", operations: registered }]);
+    f.bind();
+    const restrictions = f.registry.getToolInputRestrictions({
+      ...f.binding(),
+      toolName: "qq_group_members",
+    });
+    expect(restrictions).toEqual(registered);
+    expect(Object.keys(restrictions[0]!).sort()).toEqual([
+      "action",
+      "inputConstraint",
+      "resourceId",
+    ]);
+    (restrictions[0]!.inputConstraint.filter as Record<string, unknown>).role = "changed";
+    expect(
+      f.registry.getToolInputRestrictions({ ...f.binding(), toolName: "qq_group_members" }),
+    ).toEqual(registered);
+    expect(
+      f.registry.getToolInputRestrictions({ ...f.binding(), toolName: "not_registered" }),
+    ).toEqual([]);
+    expect(
+      f.registry.getToolInputRestrictions({
+        ...f.binding("different-run"),
+        toolName: "qq_group_members",
+      }),
+    ).toEqual([]);
+  });
+
+  it("unions matching registered operation constraints without widening resources", () => {
+    const f = fixtureWithTools([
+      {
+        name: "qq_group_members",
+        operations: [
+          {
+            action: "qq:group:members:read",
+            resourceId: "group:12345",
+            inputConstraint: { groupId: "12345", filter: { role: "member" } },
+          },
+          {
+            action: "qq:group:members:read",
+            resourceId: "group:12345",
+            inputConstraint: { groupId: "12345", filter: { role: "owner" } },
+          },
+        ],
+      },
+    ]);
+    f.bind();
+    const call = {
+      ...f.binding(),
+      toolName: "qq_group_members",
+      action: "qq:group:members:read",
+      resourceId: "group:12345",
+    };
+    for (const role of ["member", "owner"]) {
+      const toolInput = { groupId: "12345", filter: { role } };
+      expect(f.registry.checkToolCall({ ...call, toolInput }).allowed).toBe(true);
+      expect(f.registry.diagnoseToolCall({ ...call, toolInput })).toBeUndefined();
+    }
+    expect(
+      f.registry.checkToolCall({
+        ...call,
+        resourceId: "group:other",
+        toolInput: { groupId: "12345", filter: { role: "owner" } },
+      }).allowed,
+    ).toBe(false);
+    expect(
+      f.registry.diagnoseToolCall({
+        ...call,
+        resourceId: "group:other",
+        toolInput: { groupId: "12345", filter: { role: "owner" } },
+      }),
+    ).toBe("acceptance_lease_resource_mismatch");
+    expect(
+      f.registry.checkToolCall({
+        ...call,
+        toolName: "not_registered",
+        toolInput: { groupId: "12345", filter: { role: "owner" } },
+      }).allowed,
+    ).toBe(false);
+    expect(
+      f.registry.diagnoseToolCall({
+        ...call,
+        toolName: "not_registered",
+        toolInput: { groupId: "12345", filter: { role: "owner" } },
+      }),
+    ).toBe("acceptance_lease_tool_mismatch");
+  });
+
+  it("returns no input restrictions after expiry or revocation", () => {
+    const expired = fixture();
+    expired.bind();
+    expired.advance(10_000);
+    expect(
+      expired.registry.getToolInputRestrictions({
+        ...expired.binding(),
+        toolName: "qq_group_members",
+      }),
+    ).toEqual([]);
+
+    const revoked = fixture();
+    revoked.bind();
+    expect(revoked.registry.revoke(revoked.registration.leaseId)).toBe(true);
+    expect(
+      revoked.registry.getToolInputRestrictions({
+        ...revoked.binding(),
+        toolName: "qq_group_members",
+      }),
+    ).toEqual([]);
   });
 
   it("matches arrays exactly inside an input constraint", () => {
@@ -554,10 +903,14 @@ function fixtureWithTools(customTools: QqLiveLeaseTool[]) {
   });
   return {
     registry,
+    registration,
     bind() {
       registry.resolveInbound({ principalId: "owner", scope, messageId: "message-1", text });
       return registry.bindRun(binding());
     },
     binding,
+    advance(ms: number) {
+      now += ms;
+    },
   };
 }

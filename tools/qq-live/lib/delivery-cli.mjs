@@ -10,6 +10,8 @@ import { DatabaseSync } from "node:sqlite";
 import { digest, fail, safeError } from "./core.mjs";
 import { resolveFeatureSuite } from "./feature-suite.mjs";
 import { evaluateDeliveryGate } from "./delivery-gate.mjs";
+import { loadDeliveryBundle, readRepositoryDeliverySuite } from "./delivery-bundle-loader.mjs";
+import { taskWorkerFixtureConfig } from "./task-worker-config.mjs";
 import { verifyProductEvidence, runtimeSnapshot } from "./product-evidence.mjs";
 import { verifyTasteFamilyReport } from "./taste-family-evidence.mjs";
 import { observeTasteFixture } from "./taste-fixture.mjs";
@@ -198,6 +200,15 @@ async function absent(path, code) {
 export async function assertNoPendingAcceptanceFixtures(lockRoot, account) {
   await absent(join(lockRoot, `${account}.memory-pending.json`), "MEMORY_FIXTURE_PENDING");
   await absent(join(lockRoot, `${account}.taste-pending.json`), "TASTE_FIXTURE_PENDING");
+  await absent(join(lockRoot, `${account}.media-pending.json`), "MEDIA_FIXTURE_PENDING");
+  await absent(
+    join(lockRoot, `${account}.task-worker-pending.json`),
+    "TASK_WORKER_FIXTURE_PENDING",
+  );
+  await absent(
+    join(lockRoot, `${account}.group-members-policy-pending.json`),
+    "GROUP_MEMBERS_POLICY_FIXTURE_PENDING",
+  );
 }
 
 async function releaseOwnedLock(lock, lockPath) {
@@ -217,8 +228,10 @@ export async function runDeliveryCli(config, options, out) {
     fail("POST_MERGE_BINDING", "合并后检查不能再次执行合并。");
   if (!config.runtime || !options.pr || !options.scenarios || !options.reports)
     fail("DELIVERY_ARGUMENT", "交付需要运行配置、PR、原始套件和报告清单。");
+  if (config.runtime.expectedSourceTreeSha256 !== undefined)
+    fail("DEVELOPMENT_RUNTIME", "显式开发验收不能用于交付或合并后验收。");
   const suitePath = resolve(options.scenarios);
-  const suiteText = await readFile(suitePath, "utf8");
+  const suiteText = await readRepositoryDeliverySuite(suitePath, { repositoryRoot });
   if (suiteText.length > 100000 || digest(suiteText) !== options["approve-suite"])
     fail("SUITE_APPROVAL", "交付必须使用已审阅套件的原始文件哈希。");
   let suite;
@@ -226,6 +239,39 @@ export async function runDeliveryCli(config, options, out) {
     suite = JSON.parse(suiteText);
   } catch {
     fail("SUITE_BINDING", "套件文件无效。");
+  }
+  let deliveryBundle;
+  if (suite?.schemaVersion === 1 && Array.isArray(suite.suites)) {
+    deliveryBundle = await loadDeliveryBundle(suitePath, options["approve-suite"], {
+      repositoryRoot,
+    });
+    let workerSuite;
+    try {
+      suite = JSON.parse(deliveryBundle.suites.coverage.text);
+      workerSuite = JSON.parse(deliveryBundle.suites["task-worker"].text);
+    } catch {
+      fail("DELIVERY_BUNDLE", "交付套件成员不是有效 JSON。");
+    }
+    if (workerSuite.schemaVersion !== 8)
+      fail("DELIVERY_BUNDLE", "Worker 成员必须使用固定 Schema 8 套件。");
+    resolveFeatureSuite(workerSuite, config);
+    taskWorkerFixtureConfig(config);
+    if (deliveryBundle.suites.media) {
+      let mediaSuite;
+      try {
+        mediaSuite = JSON.parse(deliveryBundle.suites.media.text);
+      } catch {
+        fail("DELIVERY_BUNDLE", "媒体成员不是有效 JSON。");
+      }
+      if (mediaSuite.schemaVersion !== 7)
+        fail("DELIVERY_BUNDLE", "媒体成员必须使用固定 Schema 7 套件。");
+      resolveFeatureSuite(mediaSuite, config);
+      if (
+        config.mediaFixtures?.enabled !== true ||
+        config.mediaFixtures.retainAssetsConfirmed !== true
+      )
+        fail("MEDIA_FIXTURE_DISABLED", "媒体交付需要已启用且确认保留测试 Asset 的配置。");
+    }
   }
   resolveFeatureSuite(suite, config);
   const coverage = await checkRepositoryFeatureCoverage({
@@ -245,6 +291,22 @@ export async function runDeliveryCli(config, options, out) {
     await absent(join(dirname(dirname(path)), "STOP"), "SAFETY_STOP");
     reports.push(await readDeliveryJson(path));
   }
+  if (
+    reports.some((report) =>
+      [report?.runtime, report?.productAcceptance?.runtime].some(
+        (runtime) =>
+          runtime &&
+          typeof runtime === "object" &&
+          [
+            "development",
+            "sourceTreeSha256",
+            "expectedSourceTreeSha256",
+            "launchSourceTreeSha256",
+          ].some((key) => Object.hasOwn(runtime, key)),
+      ),
+    )
+  )
+    fail("DEVELOPMENT_RUNTIME", "显式开发验收报告不能用于交付或合并后验收。");
   const git = async (args) => (await runFile("git", args, { cwd: repositoryRoot })).stdout.trim();
   const readLocalHead = async () => ({
     commit: await git(["rev-parse", "HEAD"]),
@@ -328,6 +390,58 @@ export async function runDeliveryCli(config, options, out) {
     await clients.bot.connect();
     await doctor(config, clients);
     const verifyReport = (report) => verifyProductEvidence(report, config, clients);
+    const verifyMediaReport = async (report, { suiteSha256 }) => {
+      const expectedRuntime = runtimeSnapshot(config.runtime);
+      const { verifyMediaHistoricalReport } = await import("./media-report.mjs");
+      const verified = await verifyMediaHistoricalReport({
+        report,
+        config,
+        clients,
+        expectedRuntime,
+        approvedSuiteSha256: suiteSha256,
+      });
+      if (JSON.stringify(runtimeSnapshot(config.runtime)) !== JSON.stringify(expectedRuntime))
+        fail("MEDIA_DELIVERY", "媒体证据复核期间运行版本发生变化。");
+      return verified;
+    };
+    const verifyTaskWorkerReport = async (report) => {
+      const fixture = taskWorkerFixtureConfig(config);
+      const expectedRuntime = await runtimeSnapshot(config.runtime);
+      const { createTaskWorkerHistoricalReportVerifier } =
+        await import("./task-worker-evidence.mjs");
+      if (typeof createTaskWorkerHistoricalReportVerifier !== "function")
+        fail("TASK_WORKER_DELIVERY", "Worker 历史证据验证器不可用。");
+      const db = new DatabaseSync(join(config.runtime.dataDirectory, "glassbox.db"), {
+        readOnly: true,
+      });
+      try {
+        const verified = await createTaskWorkerHistoricalReportVerifier({
+          db,
+          dataDirectory: config.runtime.dataDirectory,
+          config,
+          clients,
+          expectedRuntime,
+          trustedFixture: {
+            canonicalRoot: fixture.canonicalRoot,
+            productWorkspaceId: fixture.productWorkspaceId,
+            markerSha256: fixture.markerSha256,
+          },
+          expectedWorkerTarget: {
+            workspaceId: fixture.workspaceId,
+            herdrSession: fixture.herdrSession,
+            agentKind: fixture.agentKind,
+            markerSha256: fixture.markerSha256,
+          },
+        })(report);
+        if (
+          JSON.stringify(await runtimeSnapshot(config.runtime)) !== JSON.stringify(expectedRuntime)
+        )
+          fail("TASK_WORKER_DELIVERY", "Worker 证据复核期间运行版本发生变化。");
+        return verified;
+      } finally {
+        db.close();
+      }
+    };
     const verifyTasteReport = (report) =>
       verifyTasteFamilyReport(report, {
         config,
@@ -378,16 +492,49 @@ export async function runDeliveryCli(config, options, out) {
     const evaluateGate = async () => {
       await absent(join(out, "STOP"), "SAFETY_STOP");
       await assertNoPendingAcceptanceFixtures(lockRoot, account);
+      if (deliveryBundle) {
+        const currentBundle = await loadDeliveryBundle(resolve(options.scenarios), suiteSha256, {
+          repositoryRoot,
+        });
+        if (JSON.stringify(currentBundle) !== JSON.stringify(deliveryBundle))
+          fail("DELIVERY_BUNDLE", "交付套件在复核期间发生变化。");
+      }
+      if (deliveryBundle) {
+        const currentBundle = await loadDeliveryBundle(resolve(options.scenarios), suiteSha256, {
+          repositoryRoot,
+        });
+        if (JSON.stringify(currentBundle) !== JSON.stringify(deliveryBundle))
+          fail("DELIVERY_BUNDLE", "交付套件在复核期间发生变化。");
+      }
       for (const path of paths) {
         await absent(join(dirname(path), "STOP"), "SAFETY_STOP");
         await absent(join(dirname(dirname(path)), "STOP"), "SAFETY_STOP");
       }
       const currentRemote = await readRemoteEvidence();
-      return evaluateDeliveryGate(
+      const evaluate = deliveryBundle
+        ? (await import("./delivery-bundle-gate.mjs")).evaluateBundledDeliveryGate
+        : evaluateDeliveryGate;
+      return evaluate(
         {
           commit: local.commit,
           suiteText,
           suiteSha256,
+          ...(deliveryBundle
+            ? {
+                bundleText: suiteText,
+                memberSuiteTexts: {
+                  coverage: deliveryBundle.suites.coverage.text,
+                  "task-worker": deliveryBundle.suites["task-worker"].text,
+                  ...(deliveryBundle.suites.media
+                    ? { media: deliveryBundle.suites.media.text }
+                    : {}),
+                  ...(deliveryBundle.suites.media
+                    ? { media: deliveryBundle.suites.media.text }
+                    : {}),
+                },
+                suiteConfig: config,
+              }
+            : {}),
           requiredCaseIds: FEATURE_CATALOG.cases.map((c) => c.suiteCaseId ?? c.id),
           reports,
           requiredCheckNames: currentRemote.requiredCheckNames,
@@ -399,6 +546,8 @@ export async function runDeliveryCli(config, options, out) {
         },
         {
           verifyReport,
+          verifyTaskWorkerReport,
+          verifyMediaReport,
           verifyMemoryReport,
           verifyHistoryReport,
           verifyTasteReport,

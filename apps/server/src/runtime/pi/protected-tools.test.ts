@@ -3,9 +3,12 @@ import { Type } from "typebox";
 import type { AuthorizationService } from "../../auth/service.js";
 import type { CallerContext } from "../../identity/scope.js";
 import { ProviderCallError } from "./provider-outcome.js";
+import { authorizationProjectionResult } from "./authorization-projection.js";
+import { safeToolOutput } from "./tool-output-evidence.js";
 import {
   createProtectedTool,
   requiredCallClause,
+  toolGateFailureCode,
   ToolInputError,
   type ProtectedToolContext,
 } from "./protected-tools.js";
@@ -72,6 +75,10 @@ describe("a protected Tool's failure classification", () => {
         toolsSha256: "0".repeat(64),
         assertActive: () => true,
         filterToolNames: (names) => [...names],
+        getToolInputRestrictions: (toolName) =>
+          toolName === "fixture_tool"
+            ? [{ action: "read", resourceId: "canary", inputConstraint: {} }]
+            : [],
         checkToolCall: () => {
           checks += 1;
           return checks === 1;
@@ -93,6 +100,103 @@ describe("a protected Tool's failure classification", () => {
     expect(execute).not.toHaveBeenCalled();
   });
 
+  it("fails closed with a fixed code when the lease check throws", async () => {
+    const privateValue = "lease-check-private-321";
+    const execute = vi.fn(async () => "must not execute");
+    const context: ProtectedToolContext = {
+      caller,
+      conversationId: "conversation-lease-check-throw",
+      runId: "run-lease-check-throw",
+      acceptanceLease: {
+        leaseId: "lease-1",
+        marker: "aabbccddeeff00112233445566778899",
+        toolsSha256: "0".repeat(64),
+        assertActive: () => true,
+        filterToolNames: (names) => [...names],
+        getToolInputRestrictions: (toolName) =>
+          toolName === "fixture_tool"
+            ? [{ action: "read", resourceId: "canary", inputConstraint: { value: privateValue } }]
+            : [],
+        checkToolCall: () => {
+          throw new Error(`private callback detail ${privateValue}`);
+        },
+      },
+    };
+    const definition = createProtectedTool<Record<string, unknown>, string>({
+      name: "fixture_tool",
+      description: "fixture",
+      parameters: Type.Object({ value: Type.String() }),
+      action: "read",
+      resourceId: "canary",
+      authService: allowAll,
+      getContext: () => context,
+      execute,
+    });
+
+    let failure: unknown;
+    try {
+      await run(definition, { value: privateValue });
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(ToolInputError);
+    expect((failure as Error).message).toBe("acceptance_lease_unavailable");
+    expect((failure as Error).message).not.toContain(privateValue);
+    expect(toolGateFailureCode(JSON.stringify({ message: (failure as Error).message }))).toBe(
+      "acceptance_lease_unavailable",
+    );
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("fails closed with a fixed code when the final lease check throws", async () => {
+    const privateValue = "lease-final-check-private-654";
+    let checks = 0;
+    const execute = vi.fn(async () => "must not execute");
+    const context: ProtectedToolContext = {
+      caller,
+      conversationId: "conversation-lease-final-check-throw",
+      runId: "run-lease-final-check-throw",
+      acceptanceLease: {
+        leaseId: "lease-1",
+        marker: "aabbccddeeff00112233445566778899",
+        toolsSha256: "0".repeat(64),
+        assertActive: () => true,
+        filterToolNames: (names) => [...names],
+        getToolInputRestrictions: (toolName) =>
+          toolName === "fixture_tool"
+            ? [{ action: "read", resourceId: "canary", inputConstraint: { value: privateValue } }]
+            : [],
+        checkToolCall: () => {
+          checks += 1;
+          if (checks === 2) throw new Error(`private callback detail ${privateValue}`);
+          return true;
+        },
+      },
+    };
+    const definition = createProtectedTool<Record<string, unknown>, string>({
+      name: "fixture_tool",
+      description: "fixture",
+      parameters: Type.Object({ value: Type.String() }),
+      action: "read",
+      resourceId: "canary",
+      authService: allowAll,
+      getContext: () => context,
+      execute,
+    });
+
+    let failure: unknown;
+    try {
+      await run(definition, { value: privateValue });
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(ToolInputError);
+    expect((failure as Error).message).toBe("acceptance_lease_unavailable");
+    expect((failure as Error).message).not.toContain(privateValue);
+    expect(checks).toBe(2);
+    expect(execute).not.toHaveBeenCalled();
+  });
+
   it("returns a successful call's result to the model", async () => {
     const { definition } = tool(async () => ({ members: [] }));
     await expect(run(definition)).resolves.toMatchObject({
@@ -105,6 +209,94 @@ describe("a protected Tool's failure classification", () => {
       throw new Error("NapCat retcode 100 at ws://internal:3000");
     });
     await expect(run(definition)).rejects.toThrow("protected_tool_failed");
+  });
+
+  it.each([
+    ["acceptance_lease_input_mismatch", "acceptance_lease_input_mismatch"],
+    ["private-callback-payload-123", "acceptance_lease_denied"],
+    ["owner_confirmation_required", "acceptance_lease_denied"],
+  ])("restricts lease diagnosis %s to its own fixed codes", async (diagnostic, expected) => {
+    const execute = vi.fn(async () => "must not execute");
+    const context: ProtectedToolContext = {
+      caller,
+      conversationId: "diagnostic-conversation",
+      runId: "diagnostic-run",
+      acceptanceLease: {
+        leaseId: "lease-1",
+        marker: "aabbccddeeff00112233445566778899",
+        toolsSha256: "0".repeat(64),
+        assertActive: () => true,
+        filterToolNames: (names) => [...names],
+        getToolInputRestrictions: (toolName) =>
+          toolName === "fixture_tool"
+            ? [
+                {
+                  action: "read",
+                  resourceId: "canary",
+                  inputConstraint: { value: "private-argument-321" },
+                },
+              ]
+            : [],
+        checkToolCall: () => false,
+        diagnoseToolCall: () => diagnostic,
+      },
+    };
+    const definition = createProtectedTool<Record<string, unknown>, string>({
+      name: "fixture_tool",
+      description: "fixture",
+      parameters: Type.Object({ value: Type.String() }),
+      action: "read",
+      resourceId: "canary",
+      authService: allowAll,
+      getContext: () => context,
+      execute,
+    });
+    await expect(run(definition, { value: "private-argument-321" })).rejects.toThrow(expected);
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("refuses a throwing lease diagnostic without exposing its error or arguments", async () => {
+    const execute = vi.fn(async () => "must not execute");
+    const context: ProtectedToolContext = {
+      caller,
+      conversationId: "diagnostic-conversation",
+      runId: "diagnostic-run",
+      acceptanceLease: {
+        leaseId: "lease-1",
+        marker: "aabbccddeeff00112233445566778899",
+        toolsSha256: "0".repeat(64),
+        assertActive: () => true,
+        filterToolNames: (names) => [...names],
+        getToolInputRestrictions: (toolName) =>
+          toolName === "fixture_tool"
+            ? [
+                {
+                  action: "read",
+                  resourceId: "canary",
+                  inputConstraint: { value: "private-argument-321" },
+                },
+              ]
+            : [],
+        checkToolCall: () => false,
+        diagnoseToolCall: () => {
+          throw new Error("private-diagnostic-canary-456");
+        },
+      },
+    };
+    const definition = createProtectedTool<Record<string, unknown>, string>({
+      name: "fixture_tool",
+      description: "fixture",
+      parameters: Type.Object({ value: Type.String() }),
+      action: "read",
+      resourceId: "canary",
+      authService: allowAll,
+      getContext: () => context,
+      execute,
+    });
+    await expect(run(definition, { value: "private-argument-321" })).rejects.toThrow(
+      /^acceptance_lease_unavailable$/,
+    );
+    expect(execute).not.toHaveBeenCalled();
   });
 
   it("re-throws a provider refusal unchanged, as its own fact", async () => {
@@ -194,4 +386,59 @@ it("projects only server-bound QQ group IDs out of model call examples", () => {
   expect(requiredCallClause("qq_group_moderation", input)).toContain(JSON.stringify(input));
   expect(input.groupId).toBe("1126022432");
   expect(input.params).toEqual({ duration: 30 });
+});
+
+it("binds a server projection callback to the exact Tool call and normalized output", async () => {
+  const record = vi.fn(async (receipt: { context: unknown; input: unknown; output: unknown }) => {
+    void receipt;
+  });
+  const definition = createProtectedTool<Record<string, unknown>, { visible: string }>({
+    name: "qq_groups",
+    description: "fixture",
+    parameters: Type.Object({ value: Type.String() }),
+    action: "read",
+    resourceId: "canary",
+    authService: allowAll,
+    getContext: () => ({
+      caller,
+      conversationId: "conversation-projection",
+      runId: "run-projection",
+    }),
+    execute: async (params) =>
+      authorizationProjectionResult(
+        { visible: "safe metadata" },
+        {
+          kind: "managed_group_inventory",
+          purpose: "managed_group_category_availability",
+          decisions: [],
+          input: params,
+          record,
+        },
+      ),
+  });
+  const result = await definition.execute(
+    "call-projection",
+    { value: "private-query" },
+    undefined,
+    undefined,
+    {} as never,
+  );
+  const normalized = safeToolOutput("qq_groups", result);
+  expect(record).toHaveBeenCalledTimes(1);
+  const receipt = record.mock.calls[0]![0];
+  expect(receipt.context).toMatchObject({
+    runId: "run-projection",
+    conversationId: "conversation-projection",
+    toolCallId: "call-projection",
+    caller: { principalId: "owner" },
+  });
+  expect(receipt.input).toMatchObject({
+    inputSha256: expect.any(String),
+    inputBytes: expect.any(Number),
+  });
+  expect(receipt.output).toEqual({
+    outputSha256: normalized.outputSha256,
+    outputBytes: normalized.outputBytes,
+  });
+  expect(JSON.stringify(receipt)).not.toContain("private-query");
 });

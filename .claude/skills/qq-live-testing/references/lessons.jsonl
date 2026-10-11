@@ -1,0 +1,2 @@
+{"case":"ops-status-read","commit":"40e279855b34962b08942038ae039eb28792a8ba","status":"hypothesis","evidence":{"type":"preflight_error","errorCode":"API_REJECTED"},"symptom":"账号状态报告在线，实际发送被接口拒绝。","lesson":"在线状态不能代替实际收发证据。","nextStep":"用新消息核对双端消息记录、入站事件、Run 和投递，再判断会话是否可用。"}
+{"case":"ops-status-read","commit":"40e279855b34962b08942038ae039eb28792a8ba","status":"hypothesis","evidence":{"type":"preflight_error","errorCode":"INPUT_NOT_OBSERVED"},"symptom":"双端历史包含同一条消息，但没有产品入站和新 Run。","lesson":"消息历史与实时事件可能不同步，具体原因仍待核验。","nextStep":"先回查同一消息的双端记录，再检查订阅恢复，不重发结果未知的请求。"}

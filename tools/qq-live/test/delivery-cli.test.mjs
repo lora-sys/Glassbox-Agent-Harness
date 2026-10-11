@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, writeFile, rm, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   readDeliveryJson,
   validateReportManifest,
@@ -13,8 +14,13 @@ import {
 import { baseConfig } from "./fixture.mjs";
 import { digest } from "../lib/core.mjs";
 
-async function fixture(t) {
-  const directory = await mkdtemp(join(tmpdir(), "qq-delivery-cli-"));
+async function fixture(t, repositorySuite = false) {
+  const directory = await mkdtemp(
+    join(
+      repositorySuite ? fileURLToPath(new URL("../", import.meta.url)) : tmpdir(),
+      ".qq-delivery-cli-",
+    ),
+  );
   t.after(() => rm(directory, { recursive: true, force: true }));
   return directory;
 }
@@ -26,6 +32,9 @@ test("delivery checks both account-wide fixture anchors again before merge", asy
   for (const [kind, code] of [
     ["memory", "MEMORY_FIXTURE_PENDING"],
     ["taste", "TASTE_FIXTURE_PENDING"],
+    ["media", "MEDIA_FIXTURE_PENDING"],
+    ["task-worker", "TASK_WORKER_FIXTURE_PENDING"],
+    ["group-members-policy", "GROUP_MEMBERS_POLICY_FIXTURE_PENDING"],
   ]) {
     const path = join(directory, `${account}.${kind}-pending.json`);
     await writeFile(path, "{}");
@@ -109,7 +118,7 @@ test("delivery JSON rejects oversized, malformed and non-file evidence", async (
 });
 
 test("delivery refuses incomplete baseline before reports, output, validation or GitHub access", async (t) => {
-  const directory = await fixture(t);
+  const directory = await fixture(t, true);
   const suitePath = join(directory, "suite.json");
   const suiteText = JSON.stringify({
     schemaVersion: 3,
@@ -141,7 +150,7 @@ test("delivery refuses incomplete baseline before reports, output, validation or
 });
 
 test("delivery refuses missing arguments and changed suite approval", async (t) => {
-  const directory = await fixture(t);
+  const directory = await fixture(t, true);
   await assert.rejects(
     runDeliveryCli(baseConfig(), {}, directory),
     (error) => error.code === "DELIVERY_ARGUMENT",

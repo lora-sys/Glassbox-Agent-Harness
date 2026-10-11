@@ -9,6 +9,7 @@ import {
   validateTasteFamily,
 } from "../lib/feature-suite.mjs";
 import { TASTE_FAMILY_ID, tasteFamilyPlan } from "../lib/taste-scenario.mjs";
+import { MEDIA_FAMILY_ID } from "../lib/media-scenario.mjs";
 
 const config = { groups: [] };
 const memoryFamily = () => ({
@@ -20,6 +21,11 @@ const memoryFamily = () => ({
 const tasteFamily = () => ({
   id: TASTE_FAMILY_ID,
   kind: "taste-lifecycle",
+  chat: "private",
+});
+const mediaFamily = () => ({
+  id: MEDIA_FAMILY_ID,
+  kind: "media-private-delivery",
   chat: "private",
 });
 const readCase = (id = "ops-status") => ({
@@ -51,6 +57,37 @@ test("schema 2 read suites retain the existing parser behavior", () => {
   assert.deepEqual(resolved.cases, resolved.readCases);
   assert.deepEqual(resolved.memoryFamilies, []);
   assert.equal(resolved.readCases[0].id, "ops-status");
+});
+
+test("schema 7 admits only the fixed single private media family", () => {
+  const family = mediaFamily();
+  const resolved = resolveFeatureSuite({ schemaVersion: 7, cases: [family] }, config);
+  assert.deepEqual(resolved.cases, [family]);
+  assert.deepEqual(resolved.readCases, []);
+  assert.deepEqual(resolved.memoryFamilies, []);
+  assert.deepEqual(resolved.historyFamilies, []);
+  assert.deepEqual(resolved.tasteFamilies, []);
+  assert.deepEqual(resolved.mediaFamilies, [family]);
+
+  assert.throws(
+    () => resolveFeatureSuite({ schemaVersion: 7, cases: [{ ...family, extra: true }] }, config),
+    { code: "MEDIA_FAMILY", status: "BLOCKED" },
+  );
+  assert.throws(
+    () => resolveFeatureSuite({ schemaVersion: 7, cases: [{ ...family, chat: "A" }] }, config),
+    { code: "MEDIA_FAMILY", status: "BLOCKED" },
+  );
+  assert.throws(
+    () => resolveFeatureSuite({ schemaVersion: 7, cases: [family, readCase()] }, config),
+    { code: "FEATURE_MEDIA_FAMILY", status: "BLOCKED" },
+  );
+  assert.throws(
+    () => resolveFeatureSuite({ schemaVersion: 7, cases: [family, mediaFamily()] }, config),
+    { code: "FEATURE_MEDIA_FAMILY", status: "BLOCKED" },
+  );
+
+  for (const schemaVersion of [2, 3, 4, 5, 6])
+    assert.throws(() => resolveFeatureSuite({ schemaVersion, cases: [family] }, config));
 });
 
 test("schema 3 admits one exact Memory family with mixed read cases", () => {

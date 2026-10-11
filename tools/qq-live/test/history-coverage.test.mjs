@@ -61,6 +61,16 @@ test("complete history source and window return only sanitized counts", () => {
     assert.ok(!JSON.stringify(result).includes("123"));
   }
 });
+test("accepts the fixed history scenario's parser-supported prefixed exact term", () => {
+  const query = `gbxhistory1-${nonce}`;
+  const event = evidence();
+  event.query = query;
+  event.coverage.exactTerms = [query];
+  assert.equal(
+    observeFeature([{ ...assertion, query }], { events: [event], runId: "run-1" }).status,
+    "PASS",
+  );
+});
 test("history completeness accepts considered exact-term rejects without calling them truncation", () => {
   const event = evidence();
   event.considered = 2;

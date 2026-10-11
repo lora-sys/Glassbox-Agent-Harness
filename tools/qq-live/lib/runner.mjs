@@ -1,5 +1,6 @@
 import {
   fail,
+  LiveError,
   id,
   messageId,
   textOf,
@@ -22,6 +23,8 @@ export class Recorder {
     this.cases = [];
     this.events = [];
     this.sequence = 0;
+    this.mediaObservationWaiters = new Map();
+    this.mediaObservationExpectations = new Map();
   }
   begin(name, route, prompt, expected, token = nonce()) {
     const c = {
@@ -61,17 +64,39 @@ export class Recorder {
               messageId(s.data?.id) &&
               messageId(s.data.id) === c.sentMessageId,
           );
-        if (!text.includes(c.token) && !(reply && route === c.route && replyRef)) continue;
-        if (Number.isFinite(event.time) && event.time * 1000 < c.startedMs - 2000) continue;
+        const eventTimeMs = Number.isFinite(event.time) ? event.time * 1000 : NaN;
+        const startedMs = c.startedMs ?? Date.parse(c.startedAt);
+        // Media delivery can arrive after the text reply completed. Its observer has its own
+        // close boundary; finishing the text transport must not discard the later media event.
+        const mediaObservationOpen = c.mediaObservationExpectedType && !c.mediaObservationClosed;
+        const freshUnmarkedReply =
+          reply &&
+          route === c.route &&
+          (!c.finishedAt || mediaObservationOpen) &&
+          Number.isFinite(eventTimeMs) &&
+          eventTimeMs >= startedMs - 2000 &&
+          eventTimeMs <= Date.now() + 5000;
+        if (
+          !text.includes(c.token) &&
+          !(reply && route === c.route && replyRef) &&
+          !freshUnmarkedReply
+        )
+          continue;
+        if (Number.isFinite(eventTimeMs) && eventTimeMs < startedMs - 2000) continue;
         const mid = messageId(event.message_id);
         if (!mid) {
           c.anomalies.push("MISSING_MESSAGE_ID");
           continue;
         }
+        if (c.mediaObservationExpectedType && freshUnmarkedReply)
+          this.observeMediaMessage(c, event);
         if (incoming && route === c.route && text === c.prompt) {
           if (!c.botInputMessageIds.includes(mid)) c.botInputMessageIds.push(mid);
           if (!c.botInputCandidates.some((candidate) => candidate.messageId === mid)) {
-            c.botInputCandidates.push({ messageId: mid, textSha256: digest(text) });
+            c.botInputCandidates.push({
+              messageId: mid,
+              textSha256: digest(text),
+            });
           }
         }
         if (reply) {
@@ -99,8 +124,14 @@ export class Recorder {
       }
     }
     if (role === "driver" && event.post_type === "notice" && event.notice_type === "group_ban") {
-      for (const c of this.cases.filter((x) => x.moderation && !x.finishedAt)) {
-        if (id(event.group_id) !== c.route || id(event.user_id) !== c.target) continue;
+      for (const c of this.cases.filter(
+        (x) => x.moderation && (x.moderationObservationActive === true || !x.finishedAt),
+      )) {
+        if (
+          id(event.group_id) !== (c.moderationGroupId ?? c.route) ||
+          id(event.user_id) !== (c.moderationTarget ?? c.target)
+        )
+          continue;
         if (!Number.isFinite(event.time) || event.time < Math.floor(c.startedMs / 1000) - 1)
           continue;
         const n = {
@@ -154,9 +185,178 @@ export class Recorder {
     }
     return statusOf(this.cases);
   }
+  expectMediaObservation(c, expected) {
+    if (
+      !this.cases.includes(c) ||
+      !expected ||
+      typeof expected !== "object" ||
+      Array.isArray(expected) ||
+      JSON.stringify(Object.keys(expected).sort()) !==
+        JSON.stringify(["expectedCaption", "expectedType"]) ||
+      !["image", "video"].includes(expected.expectedType) ||
+      typeof expected.expectedCaption !== "string" ||
+      !expected.expectedCaption ||
+      expected.expectedCaption.length > 100 ||
+      c.mediaObservationExpectedType
+    )
+      fail("MEDIA_OBSERVATION_CONFIG", "媒体观察配置无效。", "BLOCKED");
+    c.mediaObservationExpectedType = expected.expectedType;
+    c.mediaObservationExpectedCaptionSha256 = digest(expected.expectedCaption);
+    c.mediaObservations = [];
+    c.mediaObservationOverflow = false;
+    c.mediaObservationClosed = false;
+    this.mediaObservationWaiters.set(c.id, new Set());
+    this.mediaObservationExpectations.set(c.id, {
+      expectedType: expected.expectedType,
+      expectedCaption: expected.expectedCaption,
+    });
+  }
+  observeMediaMessage(c, event) {
+    if (c.mediaObservationClosed || !Array.isArray(event.message)) return;
+    const textSegments = event.message.filter((segment) => segment?.type === "text");
+    if (
+      textSegments.length !== 1 ||
+      textSegments[0]?.data?.text !== this.mediaObservationExpectations.get(c.id)?.expectedCaption
+    )
+      return;
+    const mediaSegments = event.message.filter((segment) =>
+      ["image", "video"].includes(segment?.type),
+    );
+    const hasPayload = (segment) =>
+      segment?.data &&
+      typeof segment.data === "object" &&
+      !Array.isArray(segment.data) &&
+      ["file", "url", "file_id"].some(
+        (key) =>
+          typeof segment.data[key] === "string" &&
+          segment.data[key].length > 0 &&
+          segment.data[key].length <= 4096,
+      );
+    if (!mediaSegments.length || !mediaSegments.some(hasPayload)) return;
+    const observedMessageId = messageId(event.message_id);
+    if (!observedMessageId) return;
+    if (c.mediaObservations.some((candidate) => candidate.messageId === observedMessageId)) return;
+    if (c.mediaObservations.length >= 2) {
+      c.mediaObservationOverflow = true;
+      this.notifyMediaObservation(c.id);
+      return;
+    }
+    c.mediaObservations.push({
+      messageId: observedMessageId,
+      mediaType: mediaSegments.length === 1 ? mediaSegments[0].type : null,
+      captionSha256: digest(textSegments[0].data.text),
+      segmentCount: event.message.length,
+      receivedAt: new Date().toISOString(),
+    });
+    this.notifyMediaObservation(c.id);
+  }
+  notifyMediaObservation(caseId, error) {
+    const waiters = this.mediaObservationWaiters.get(caseId);
+    if (!waiters) return;
+    for (const finish of [...waiters]) finish(error);
+  }
+  waitForMediaObservation(caseId, signal) {
+    const c = this.cases.find((candidate) => candidate.id === caseId);
+    if (!c?.mediaObservationExpectedType)
+      fail("MEDIA_OBSERVATION_UNAVAILABLE", "本轮没有媒体观察器。", "INCONCLUSIVE");
+    if (c.mediaObservations.length || c.mediaObservationOverflow) return Promise.resolve();
+    if (c.mediaObservationClosed)
+      fail("MEDIA_OBSERVATION_CLOSED", "媒体观察已关闭。", "INCONCLUSIVE");
+    if (signal?.aborted)
+      return Promise.reject(new LiveError("CANCELLED", "媒体观察已停止。", "INCONCLUSIVE"));
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const waiters = this.mediaObservationWaiters.get(caseId);
+      const onAbort = () => finish(new LiveError("CANCELLED", "媒体观察已停止。", "INCONCLUSIVE"));
+      const finish = (error) => {
+        if (settled) return;
+        settled = true;
+        waiters?.delete(finish);
+        signal?.removeEventListener?.("abort", onAbort);
+        if (error) reject(error);
+        else resolve();
+      };
+      waiters?.add(finish);
+      signal?.addEventListener?.("abort", onAbort, { once: true });
+      if (signal?.aborted) onAbort();
+    });
+  }
+  mediaObservationSnapshot(caseId) {
+    const c = this.cases.find((candidate) => candidate.id === caseId);
+    if (!c?.mediaObservationExpectedType)
+      fail("MEDIA_OBSERVATION_UNAVAILABLE", "本轮没有媒体观察器。", "INCONCLUSIVE");
+    return {
+      candidates: c.mediaObservations.map((candidate) => ({ ...candidate })),
+      overflow: c.mediaObservationOverflow,
+    };
+  }
+  closeMediaObservation(caseId) {
+    const c = this.cases.find((candidate) => candidate.id === caseId);
+    if (!c?.mediaObservationExpectedType)
+      fail("MEDIA_OBSERVATION_UNAVAILABLE", "本轮没有媒体观察器。", "INCONCLUSIVE");
+    if (c.mediaObservationClosed) return;
+    c.mediaObservationClosed = true;
+    this.mediaObservationExpectations.delete(caseId);
+    this.notifyMediaObservation(
+      caseId,
+      c.mediaObservations.length || c.mediaObservationOverflow
+        ? undefined
+        : new LiveError("MEDIA_OBSERVATION_CLOSED", "媒体观察在收到结果前已关闭。", "INCONCLUSIVE"),
+    );
+  }
 }
 
-export async function doctor(config, clients) {
+/** These exact private read capabilities never target a QQ group. Unknown surfaces stay broad. */
+export function privateAccountPreflightOnly(specs) {
+  return (
+    Array.isArray(specs) &&
+    specs.length > 0 &&
+    specs.every((spec) => {
+      if (
+        spec?.chat !== "private" ||
+        spec.sideEffect !== "none" ||
+        !Array.isArray(spec.leaseTools) ||
+        spec.leaseTools.length !== 1
+      )
+        return false;
+      const tool = spec.leaseTools[0];
+      if (!Array.isArray(tool?.operations) || tool.operations.length !== 1) return false;
+      const operation = tool.operations[0];
+      const constraint = operation?.inputConstraint;
+      if (!constraint || typeof constraint !== "object" || Array.isArray(constraint)) return false;
+      return (
+        (tool.name === "qq_account_status" &&
+          operation.action === "account:status:read" &&
+          operation.resourceId === "agent:personal" &&
+          Object.keys(constraint).length === 1 &&
+          constraint.operation === "get_status") ||
+        (tool.name === "ops_status" &&
+          operation.action === "ops:status" &&
+          operation.resourceId === "agent-operations" &&
+          Object.keys(constraint).length === 0)
+      );
+    })
+  );
+}
+
+export async function doctor(config, clients, options = {}) {
+  if (
+    !options ||
+    typeof options !== "object" ||
+    Array.isArray(options) ||
+    Object.keys(options).some((key) => key !== "groupAliases")
+  )
+    fail("PREFLIGHT_SCOPE", "实机前置检查范围无效。");
+  const aliases = options.groupAliases ?? config.groups.map((group) => group.alias);
+  if (
+    !Array.isArray(aliases) ||
+    new Set(aliases).size !== aliases.length ||
+    aliases.some(
+      (alias) => typeof alias !== "string" || !config.groups.some((group) => group.alias === alias),
+    )
+  )
+    fail("PREFLIGHT_SCOPE", "实机前置检查范围无效。");
+  const requiredGroups = config.groups.filter((group) => aliases.includes(group.alias));
   const result = {};
   for (const role of ["driver", "bot"]) {
     const login = await clients[role].call("get_login_info");
@@ -177,7 +377,7 @@ export async function doctor(config, clients) {
       /* Version query is informational. Identity and online checks are mandatory. */
     }
     const groups = [];
-    for (const g of config.groups) {
+    for (const g of requiredGroups) {
       // Verify both identities from the Bot's group membership view. A newly logged-in
       // NapCat driver can have an empty member cache even when it belongs to the group.
       const member = await clients.bot.call("get_group_member_info", {
@@ -193,7 +393,13 @@ export async function doctor(config, clients) {
         fail("GROUP_MEMBERSHIP", `${role} 在群 ${g.alias} 的成员信息未通过验证。`);
       groups.push({ alias: g.alias, role: member.role });
     }
-    result[role] = { identityVerified: true, online: true, version, groups };
+    result[role] = {
+      identityVerified: true,
+      online: true,
+      version,
+      groups,
+      groupMembershipRequired: requiredGroups.length > 0,
+    };
   }
   return result;
 }
@@ -257,7 +463,15 @@ async function bindInput(config, clients, c) {
   c.inputObserved = true;
   c.botInputMessageId = botMessage.messageId;
 }
-export async function replyCase(config, clients, recorder, spec, signal, acceptance) {
+export async function replyCase(
+  config,
+  clients,
+  recorder,
+  spec,
+  signal,
+  acceptance,
+  mediaObservation,
+) {
   const route =
     spec.chat === "private" ? "private" : config.groups.find((g) => g.alias === spec.chat)?.id;
   if (!route) fail("CASE_ROUTE", "测试会话没有配置。");
@@ -275,6 +489,7 @@ export async function replyCase(config, clients, recorder, spec, signal, accepta
     ? `GLASSBOX_ACCEPTANCE_V1 {{nonce}}\n${spec.prompt.trim()}`
     : spec.prompt;
   const c = recorder.begin(spec.id, route, prompt, spec.expectContains, marker);
+  if (mediaObservation !== undefined) recorder.expectMediaObservation(c, mediaObservation);
   if (transportOnly) c.transportOnly = true;
   let lease;
   let registrationAttempted = false;
@@ -394,6 +609,8 @@ export async function replyCase(config, clients, recorder, spec, signal, accepta
     );
   } catch (error) {
     const e = safeError(error);
+    if (e.transportFailure) c.transportFailure = e.transportFailure;
+    if (e.transportDiagnostic) c.transportDiagnostic = e.transportDiagnostic;
     return recorder.finish(c, e.status, e.code, e.message);
   } finally {
     if (registrationAttempted) {

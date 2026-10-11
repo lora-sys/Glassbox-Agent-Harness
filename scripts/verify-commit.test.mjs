@@ -1,9 +1,11 @@
 import test from "node:test";
+import { execFileSync } from "node:child_process";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  verificationChildEnvironment,
   discoverQqLiveTests,
   canReuseTestCache,
   getTestIntegrityIssues,
@@ -258,6 +260,67 @@ test("empty QQ regression directory blocks gate discovery", () => {
   try {
     mkdirSync(join(root, "tools", "qq-live", "test"), { recursive: true });
     assert.throws(() => discoverQqLiveTests(root), /no test files/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("captures large test diffs without dropping integrity evidence at the tail", async () => {
+  const { capture } = await import("./verify-commit.mjs");
+  const disabled = ["it", ".", "skip("].join("") + "'disabled', () => {});";
+  const tail = JSON.stringify(`+${disabled}\n`);
+  const program = String.raw`process.stdout.write("+// fixture\n".repeat(120000) + ${tail})`;
+  const diff = capture(process.execPath, ["-e", program]);
+  assert.ok(Buffer.byteLength(diff) > 1024 * 1024);
+  assert.ok(getTestIntegrityIssues([], diff).some((issue) => issue.message.includes("disable")));
+});
+
+test("validation children cannot inherit hook repository selectors into fixture Git operations", () => {
+  const root = mkdtempSync(join(tmpdir(), "verification-hook-isolation-"));
+  try {
+    const outer = join(root, "outer");
+    const inner = join(root, "inner");
+    mkdirSync(outer);
+    mkdirSync(inner);
+    const git = (cwd, args, env = process.env) =>
+      execFileSync("git", args, { cwd, env, encoding: "utf8" }).trim();
+    git(outer, ["init", "-b", "main"]);
+    const inherited = {
+      ...process.env,
+      GIT_DIR: join(outer, ".git"),
+      GIT_WORK_TREE: outer,
+      GIT_INDEX_FILE: join(outer, ".git", "index"),
+      GIT_PREFIX: "",
+      GIT_AUTHOR_NAME: "hook",
+      GIT_AUTHOR_EMAIL: "hook@example.test",
+    };
+    const clean = verificationChildEnvironment(inherited);
+    assert.equal(clean.PATH, inherited.PATH);
+    assert.equal(
+      Object.keys(clean).some((key) => key.startsWith("GIT_")),
+      false,
+    );
+    git(inner, ["init", "-b", "main"], clean);
+    writeFileSync(join(inner, "fixture.txt"), "isolated fixture\n");
+    git(inner, ["add", "fixture.txt"], clean);
+    git(
+      inner,
+      [
+        "-c",
+        "user.name=fixture",
+        "-c",
+        "user.email=fixture@example.test",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "commit",
+        "-m",
+        "fixture",
+      ],
+      clean,
+    );
+    assert.equal(git(outer, ["status", "--porcelain"]), "");
+    assert.equal(git(inner, ["ls-files"], clean), "fixture.txt");
+    assert.equal(git(outer, ["ls-files"]), "");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

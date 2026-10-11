@@ -1415,6 +1415,8 @@ it("produces a result the QQ Delivery Gate accepts, where the raw detail is refu
 
 it("never carries another group's sender into the current group's result", async () => {
   const { store, archive } = await fixture();
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(new Date("2026-10-07T06:33:50.200Z"));
   try {
     const tools = await groupRunTools(store, archive);
     const { text } = await callModelVisible(toolByName(tools, GROUP_HISTORY_SEARCH_TOOL), {
@@ -1424,8 +1426,20 @@ it("never carries another group's sender into the current group's result", async
     // it. A group Run reads its own group only.
     expect(text).not.toContain("member-b");
     expect(text).not.toContain("plan beta");
-    expect(text).not.toContain("200");
+    const view = JSON.parse(text) as {
+      groups: string[];
+      results: Array<{ groupId: string }>;
+      coverage: { sourceCoverage: Array<{ groupId: string }>; observedAt: string };
+    };
+    expect(view.groups).toEqual(["100"]);
+    expect(view.results.map((result) => result.groupId)).toEqual(["100"]);
+    expect(view.coverage.sourceCoverage.map((source) => source.groupId)).toEqual(["100"]);
+    // An exact JSON group identifier is forbidden anywhere. The digits may legitimately
+    // occur inside observedAt; freeze that collision so the old substring check stays red.
+    expect(text).not.toContain('"200"');
+    expect(view.coverage.observedAt).toBe("2026-10-07T06:33:50.200Z");
   } finally {
+    vi.useRealTimers();
     await store.close();
   }
 });

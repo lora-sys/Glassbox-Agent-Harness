@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "driver": {
+    "qq": "10001",
+    "wsUrl": "ws://127.0.0.1:6701",
+    "tokenEnv": "QQ_CHAT_DRIVER_TOKEN",
+    "onebotConfigPath": "/home/your-user/.napcat-driver/config/onebot11.json"
+  },
+  "bot": {
+    "qq": "10002",
+    "wsUrl": "ws://127.0.0.1:6700",
+    "tokenEnv": "QQ_CHAT_BOT_TOKEN",
+    "onebotConfigPath": "/home/your-user/.napcat/config/onebot11.json"
+  },
+  "groups": [
+    {
+      "alias": "A",
+      "id": "20001"
+    },
+    {
+      "alias": "B",
+      "id": "20002"
+    }
+  ],
+  "runtime": {
+    "checkout": "/home/your-user/src/Glassbox-Agent-Harness",
+    "dataDirectory": "/home/your-user/.glassbox",
+    "connectionId": "p3-qq"
+  },
+  "stateDirectory": "/home/your-user/.glassbox/qq-chat"
+}

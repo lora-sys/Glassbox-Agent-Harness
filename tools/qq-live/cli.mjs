@@ -1,14 +1,27 @@
 #!/usr/bin/env node
 import { readFile, writeFile, mkdir, open, rm, lstat } from "node:fs/promises";
 import { appendFileSync } from "node:fs";
-import { dirname, resolve, join } from "node:path";
+import { dirname, resolve, join, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { validateConfig, fail, safeError, sleep, digest, exitCode } from "./lib/core.mjs";
 import { OneBot } from "./lib/onebot.mjs";
-import { Recorder, doctor, smokeSpecs, validateSpecs, replyCase } from "./lib/runner.mjs";
+import { writeDurableReport } from "./lib/durable-report.mjs";
+import {
+  Recorder,
+  doctor,
+  smokeSpecs,
+  validateSpecs,
+  replyCase,
+  privateAccountPreflightOnly,
+} from "./lib/runner.mjs";
 import { moderationCase } from "./lib/moderation.mjs";
+import { runModerationCli, resolveModerationSelection } from "./lib/moderation-cli.mjs";
+import { MODERATION_FAMILY_ID } from "./lib/moderation-scenario.mjs";
+import { readModerationPolicyState } from "./lib/moderation-state.mjs";
+import { isFixedPreRunReadCase } from "./lib/pre-run-cleanup-cases.mjs";
 import {
   runtimeSnapshot,
   readTraceEvents,
@@ -16,9 +29,19 @@ import {
   verifyFailedCaseCleanup,
   verifyKnownTasteFeatureFailureCleanup,
 } from "./lib/product-evidence.mjs";
-import { runReadCaseSequence, productCleanupStopRequired } from "./lib/read-case-sequence.mjs";
+import {
+  runReadCaseSequence,
+  productCleanupStopRequired,
+  fixedReadTimeoutCleanupConfirmed,
+  fixedPreRunCleanupConfirmed,
+} from "./lib/read-case-sequence.mjs";
 import { acceptanceManagement } from "./lib/management-client.mjs";
 import { runMemoryRecoveryCli } from "./lib/memory-recovery-cli.mjs";
+import {
+  runAcceptanceMemoryReconciliationCli,
+  hasUnresolvedAcceptanceMemoryReconciliation,
+} from "./lib/acceptance-memory-reconciliation.mjs";
+import { hasUnresolvedPreRunStopReconciliation } from "./lib/pre-run-stop-reconciliation.mjs";
 import {
   resolveFeatureSuite,
   memoryFamilyPlan,
@@ -27,6 +50,22 @@ import {
 } from "./lib/feature-suite.mjs";
 import { MEMORY_FAMILY_ID, memoryWorkflow } from "./lib/memory-workflow.mjs";
 import { TASTE_FAMILY_ID, tasteFamilyPlan } from "./lib/taste-scenario.mjs";
+import { mediaFamilyPlan } from "./lib/media-scenario.mjs";
+import { TASK_WORKER_FAMILY_ID, taskWorkerFamilyPlan } from "./lib/task-worker-scenario.mjs";
+import { taskWorkerFixtureConfig } from "./lib/task-worker-config.mjs";
+import { verifyTaskWorkerPreflight } from "./lib/task-worker-preflight.mjs";
+import { resolveGroupPolicyCli, runGroupPolicyCli } from "./lib/group-policy-cli.mjs";
+import { GROUP_POLICY_FAMILY_ID } from "./lib/group-policy-scenario.mjs";
+import {
+  resolveGroupMembersPolicyCli,
+  runGroupMembersPolicyCli,
+} from "./lib/group-members-policy-cli.mjs";
+import { GROUP_MEMBERS_POLICY_FAMILY_ID } from "./lib/group-members-policy-scenario.mjs";
+import {
+  verifyGroupMembersPolicyTransition,
+  readGroupMembersPolicyState,
+} from "./lib/group-members-policy-state.mjs";
+import { verifyGroupPolicyTransition, readGroupPolicyState } from "./lib/group-policy-state.mjs";
 import {
   finalizeTasteFamilyAcceptance,
   tasteFixtureCheckpointRemovable,
@@ -40,6 +79,196 @@ import {
 } from "./lib/transport-suite.mjs";
 
 const root = dirname(fileURLToPath(import.meta.url));
+
+export function shouldWriteLatest(command, report, mediaRecoveryFinalProof) {
+  return (
+    command !== "resume-media" || (report?.status === "PASS" && Boolean(mediaRecoveryFinalProof))
+  );
+}
+
+export async function runModerationNoEffectRecoveryCli(
+  config,
+  { reportPath, live = false, approvedPlanSha256, locksDirectory } = {},
+  dependencies = {},
+) {
+  if (
+    typeof reportPath !== "string" ||
+    !isAbsolute(reportPath) ||
+    resolve(reportPath) !== reportPath
+  )
+    fail("ARGUMENT", "禁言恢复需要规范的绝对报告路径。");
+  if (
+    (live !== true && approvedPlanSha256 !== undefined) ||
+    (live === true && !/^[a-f0-9]{64}$/u.test(approvedPlanSha256 ?? ""))
+  )
+    fail("MODERATION_RECOVERY_APPROVAL", "归档必须显式 --live 并提供计划 SHA256。");
+
+  const recovery =
+    dependencies.recovery ?? (await import("./lib/moderation-no-effect-recovery.mjs"));
+  const clients = dependencies.clients ?? {
+    driver: new OneBot(config, "driver"),
+    bot: new OneBot(config, "bot"),
+  };
+  try {
+    await clients.driver.connect();
+    await clients.bot.connect();
+    const planInput = {
+      reportPath,
+      config,
+      clients,
+      ...(locksDirectory ? { locksDirectory } : {}),
+    };
+    const planned = await recovery.planModerationKnownNoEffectRecovery(planInput);
+    if (live !== true) return planned;
+    if (planned.planSha256 !== approvedPlanSha256)
+      fail(
+        "MODERATION_RECOVERY_APPROVAL",
+        "禁言恢复计划已变化。请重新查看只读计划，再用当前 SHA256 批准归档。",
+        "INCONCLUSIVE",
+      );
+    return await recovery.archiveModerationKnownNoEffectRecovery(
+      { plan: planned.plan, planSha256: planned.planSha256 },
+      {
+        config,
+        clients,
+        approvedPlanSha256,
+        ...(locksDirectory ? { locksDirectory } : {}),
+      },
+    );
+  } finally {
+    clients.driver.close();
+    clients.bot.close();
+  }
+}
+
+export function shouldCreateSafetyStop(
+  report,
+  {
+    pendingFixtureCreated = false,
+    pendingTasteFixtureCreated = false,
+    pendingTaskWorkerFixtureCreated = false,
+    pendingGroupPolicyFixtureCreated = false,
+    pendingGroupMembersPolicyFixtureCreated = false,
+    pendingModerationFixtureCreated = false,
+    tasteKnownFailureCleanupConfirmed = false,
+  } = {},
+) {
+  return (
+    report.error?.code === "LEASE_CLEANUP_EVIDENCE" ||
+    report.cleanupStopRequired === true ||
+    productCleanupStopRequired(report.productAcceptance) ||
+    report.cases.some(
+      (c) =>
+        (c.cleanup?.required && !c.cleanup.restored) ||
+        (c.sendAttempted &&
+          c.code === "API_REJECTED" &&
+          isFixedPreRunReadCase(c.id) &&
+          !fixedPreRunCleanupConfirmed(report.productAcceptance, c)) ||
+        (c.sendAttempted &&
+          c.status === "INCONCLUSIVE" &&
+          !fixedReadTimeoutCleanupConfirmed(report.productAcceptance, c)),
+    ) ||
+    (pendingFixtureCreated &&
+      (report.memoryLifecycle?.requiresReconciliation !== false ||
+        report.status !== "PASS" ||
+        report.productAcceptance.status !== "PASS")) ||
+    (pendingTasteFixtureCreated &&
+      !tasteKnownFailureCleanupConfirmed &&
+      (report.tasteLifecycle?.requiresReconciliation !== false ||
+        report.status !== "PASS" ||
+        report.productAcceptance.status !== "PASS")) ||
+    (pendingTaskWorkerFixtureCreated &&
+      (report.status !== "PASS" ||
+        report.taskWorkerAcceptance?.status !== "PASS" ||
+        report.productAcceptance?.status !== "PASS" ||
+        report.productAcceptance?.cleanupVerified !== true)) ||
+    (pendingGroupPolicyFixtureCreated && !groupPolicyCompletionSafe(report)) ||
+    (pendingGroupMembersPolicyFixtureCreated && !groupMembersPolicyCompletionSafe(report)) ||
+    (pendingModerationFixtureCreated && !moderationCompletionSafe(report))
+  );
+}
+
+function moderationCompletionSafe(report) {
+  const result = report.moderationAcceptance;
+  return (
+    report.status === "PASS" &&
+    result?.status === "MODERATION_WORKFLOW_VERIFIED" &&
+    result.familyId === MODERATION_FAMILY_ID &&
+    result.requiresReconciliation === false &&
+    result.cleanupVerified === true &&
+    result.actualQqDeliveryVerified === true &&
+    report.productAcceptance?.status === "PASS" &&
+    report.productAcceptance?.cleanupVerified === true &&
+    report.moderationFinalStateProof?.status === "MODERATION_FINAL_STATE_VERIFIED"
+  );
+}
+
+function groupPolicyCompletionSafe(report) {
+  const finalStateVerified =
+    report.groupPolicyFinalStateProof?.status === "GROUP_POLICY_FINAL_STATE_VERIFIED";
+  const acceptance = report.groupPolicyAcceptance;
+  const product = report.productAcceptance;
+  const common =
+    acceptance?.requiresReconciliation === false &&
+    acceptance?.cleanupVerified === true &&
+    acceptance?.actualQqDeliveryVerified === true &&
+    product?.cleanupVerified === true &&
+    finalStateVerified;
+  return (
+    common &&
+    ((report.status === "PASS" &&
+      acceptance.status === "GROUP_POLICY_WORKFLOW_VERIFIED" &&
+      product.status === "PASS") ||
+      (report.status === "FAIL" &&
+        acceptance.status === "GROUP_POLICY_RESTORED_FEATURE_FAILED" &&
+        product.status === "FAIL"))
+  );
+}
+
+async function assertNoGroupMembersPolicyPending(config) {
+  const { homedir } = await import("node:os");
+  const account = createHash("sha256").update(config.driver.qq).digest("hex").slice(0, 24);
+  const guard = join(
+    homedir(),
+    ".glassbox-qq-live-locks",
+    account + ".group-members-policy-pending.json",
+  );
+  try {
+    await lstat(guard);
+  } catch (error) {
+    if (error.code === "ENOENT") return;
+    throw error;
+  }
+  fail(
+    "GROUP_MEMBERS_POLICY_RECONCILIATION_REQUIRED",
+    "该账号有未确认的群成员权限测试。先核实原始报告和检查点，禁止发送、清理或交付。",
+    "INCONCLUSIVE",
+  );
+}
+function groupMembersPolicyCompletionSafe(report) {
+  const acceptance = report.groupMembersPolicyAcceptance;
+  return (
+    report.status === "PASS" &&
+    acceptance?.status === "GROUP_MEMBERS_POLICY_BOUNDARY_VERIFIED" &&
+    acceptance.requiresReconciliation === false &&
+    acceptance.cleanupVerified === true &&
+    acceptance.actualQqDeliveryVerified === true &&
+    report.groupMembersPolicyFinalStateProof?.status ===
+      "GROUP_MEMBERS_POLICY_FINAL_STATE_VERIFIED" &&
+    report.productAcceptance?.status === "PASS" &&
+    report.productAcceptance?.acceptanceKind === "GROUP_MEMBERS_POLICY_BOUNDARY" &&
+    report.productAcceptance?.cleanupVerified === true
+  );
+}
+function groupPolicyRestoredFeatureFailure(report) {
+  const acceptance = report.groupPolicyAcceptance;
+  return (
+    acceptance?.status === "GROUP_POLICY_RESTORED_FEATURE_FAILED" &&
+    acceptance.requiresReconciliation === false &&
+    acceptance.cleanupVerified === true &&
+    acceptance.actualQqDeliveryVerified === true
+  );
+}
 const help = `QQ 实机测试器 0.1.0
 
 node cli.mjs init
@@ -51,10 +280,29 @@ node cli.mjs plan --case memory-lifecycle
 node cli.mjs run --live --case memory-lifecycle --approve-suite <SHA256>
 node cli.mjs plan --case taste-lifecycle
 node cli.mjs run --live --case taste-lifecycle --approve-suite <SHA256>
+node cli.mjs plan --case qq-group-policy-isolation
+node cli.mjs run --live --case qq-group-policy-isolation --approve-suite <SHA256>
+node cli.mjs plan --case qq-group-members-policy-isolation
+node cli.mjs run --live --case qq-group-members-policy-isolation --approve-suite <SHA256>
+node cli.mjs plan --case qq-group-moderation-exact-b
+node cli.mjs run --live --case qq-group-moderation-exact-b --approve-suite <SHA256>
 node cli.mjs plan --scenarios examples/feature-baseline.example.json
+node cli.mjs plan --scenarios examples/media-private.example.json
+node cli.mjs run --live --case media-private-delivery --scenarios examples/media-private.example.json --approve-suite <SHA256>
+node cli.mjs plan-media-recovery --report <blocked-media-report.json>
+node cli.mjs plan-media-delivery-gap-cleanup --report <blocked-media-report.json>
+node cli.mjs reconcile-media-delivery-gap-cleanup --report <blocked-media-report.json> --live --approve-plan <SHA256>
+node cli.mjs resume-media --live --report <blocked-media-report.json> --case media-private-delivery --scenarios examples/media-private.example.json --approve-suite <SHA256> --approve-recovery <SHA256>
 node cli.mjs run --live --case history-group-seed-private-recall --scenarios examples/feature-baseline.example.json --approve-suite <SHA256>
 node cli.mjs reconcile-memory
 node cli.mjs reconcile-memory --live --approve-suite <SHA256>
+node cli.mjs cleanup-acceptance-memory --input <manifest-json>
+node cli.mjs cleanup-acceptance-memory --input <manifest-json> --live --approve-suite <SHA256>
+node cli.mjs reconcile-acceptance-memory --input <manifest-json> --cleanup-report <report-json>
+node cli.mjs reconcile-acceptance-memory --input <manifest-json> --cleanup-report <report-json> --live --approve-suite <SHA256>
+node cli.mjs reconcile-completed-cleanup --input <manifest-json> --cleanup-failure <failed-report-json>
+node cli.mjs reconcile-moderation --report <blocked-moderation-report.json>
+node cli.mjs reconcile-moderation --report <blocked-moderation-report.json> --live --approve-suite <SHA256>
 node cli.mjs reconcile-taste
 node cli.mjs reconcile-taste --live --approve-suite <SHA256>
 node cli.mjs plan --scenarios examples/scenarios.example.json
@@ -68,14 +316,18 @@ node cli.mjs record-lesson --input <lesson-json> --config <local-config>
 node cli.mjs report
 
 通用选项 --config <文件> --out <报告目录>
-run 默认测试私聊和已配置的群。moderation 需要独立配置和成员同意。
+run 默认测试私聊和已配置的群。moderation 需要独立配置，并使用目标明确同意或严格的群主请求依据。群主请求仅适用于固定群 B，需每步重新确认发起者为群主，禁言时长固定为 30 秒。
 schemaVersion=1 的自然语言 scenarios 仅支持 plan。
 schemaVersion=2 的结构化读取用例需要服务端逐消息许可、运行版本和工具证据。
 schemaVersion=4 增加固定群 A 种子与 Owner 私聊回查流程。
 schemaVersion=5 增加群 B 种子与仅查询群 A 的私聊隔离流程。
  schemaVersion=6 增加固定 Taste 生命周期流程。
+schemaVersion=7 提供固定 Owner 私聊图片和视频流程，需要启用并保留测试文件。
 memory-lifecycle 是固定的项目范围反馈、提升、过期流程，需要单独启用并保留审计记录。
 taste-lifecycle 是固定的项目范围正向反馈、提升、负向反馈和退役流程。中断时需恢复或清理固定测试资源。
+qq-group-policy-isolation 是固定的 Owner 私聊群 B 历史检索关闭、核查与恢复流程，需要明确启用并保留审计记录。
+qq-group-members-policy-isolation 是固定的 Owner 私聊群 B 成员读取关闭、拒绝核查与恢复流程。它验证权限边界，不证明已授权成员人数读取功能。
+qq-group-moderation-exact-b 是固定的 Owner 私聊群 B 单一目标禁言与明确解禁流程，需要本轮目标同意、独立角色/策略检查和两次独立服务端许可。
 退出码 0=通过，1=验收失败，2=环境或配置阻塞，3=无法确认。
 停止文件为报告目录下 STOP。Ctrl+C 也会停止，并尝试已授权的清理。
 `;
@@ -100,6 +352,11 @@ function args(argv) {
         "--pr",
         "--reports",
         "--input",
+        "--cleanup-report",
+        "--cleanup-failure",
+        "--report",
+        "--approve-recovery",
+        "--approve-plan",
         "--artifact",
         "--expected-review-binding",
       ].includes(k) ||
@@ -107,7 +364,20 @@ function args(argv) {
       argv[i + 1].startsWith("--")
     )
       fail("ARGUMENT", "参数无效，运行 node cli.mjs help 查看帮助。");
-    if (command === "record-agent-review" && Object.hasOwn(o, k.slice(2)))
+    if (
+      [
+        "record-agent-review",
+        "cleanup-acceptance-memory",
+        "reconcile-acceptance-memory",
+        "reconcile-completed-cleanup",
+        "reconcile-moderation",
+        "plan-media-recovery",
+        "plan-media-delivery-gap-cleanup",
+        "reconcile-media-delivery-gap-cleanup",
+        "resume-media",
+      ].includes(command) &&
+      Object.hasOwn(o, k.slice(2))
+    )
       fail("ARGUMENT", "审查登记参数不能重复。");
     o[k.slice(2)] = argv[++i];
   }
@@ -122,6 +392,14 @@ function args(argv) {
       "report",
       "coverage",
       "reconcile-memory",
+      "cleanup-acceptance-memory",
+      "reconcile-acceptance-memory",
+      "reconcile-completed-cleanup",
+      "reconcile-moderation",
+      "plan-media-recovery",
+      "plan-media-delivery-gap-cleanup",
+      "reconcile-media-delivery-gap-cleanup",
+      "resume-media",
       "reconcile-taste",
       "delivery-check",
       "deliver",
@@ -136,6 +414,22 @@ function args(argv) {
     (Object.hasOwn(o, "artifact") || Object.hasOwn(o, "expected-review-binding"))
   )
     fail("ARGUMENT", "审查文件和绑定哈希仅用于审查登记。");
+  if (command !== "reconcile-acceptance-memory" && Object.hasOwn(o, "cleanup-report"))
+    fail("ARGUMENT", "--cleanup-report 仅用于固定记忆清理归档。");
+  if (command !== "reconcile-completed-cleanup" && Object.hasOwn(o, "cleanup-failure"))
+    fail("ARGUMENT", "--cleanup-failure 仅用于固定完成清理核验。");
+  if (
+    !["plan-media-recovery", "resume-media"].includes(command) &&
+    Object.hasOwn(o, "approve-recovery")
+  )
+    fail("ARGUMENT", "--approve-recovery 仅用于固定媒体恢复。");
+  if (
+    !["plan-media-delivery-gap-cleanup", "reconcile-media-delivery-gap-cleanup"].includes(
+      command,
+    ) &&
+    Object.hasOwn(o, "approve-plan")
+  )
+    fail("ARGUMENT", "--approve-plan 仅用于固定媒体缺失证据清理归档。");
   if (
     command === "record-agent-review" &&
     (!o.pr ||
@@ -144,6 +438,89 @@ function args(argv) {
       ))
   )
     fail("ARGUMENT", "审查登记需要 --pr，只接受配置、审查文件和绑定哈希选项。");
+  if (
+    command === "cleanup-acceptance-memory" &&
+    (!o.input ||
+      Object.keys(o).some(
+        (key) => !["input", "config", "out", "live", "approve-suite"].includes(key),
+      ))
+  )
+    fail("ARGUMENT", "固定清理需要 --input，只接受配置、报告目录和当前计划审批选项。");
+  if (
+    command === "reconcile-acceptance-memory" &&
+    (!o.input ||
+      !o["cleanup-report"] ||
+      Object.keys(o).some(
+        (key) =>
+          !["input", "cleanup-report", "config", "out", "live", "approve-suite"].includes(key),
+      ))
+  )
+    fail("ARGUMENT", "固定清理归档需要 --input 和 --cleanup-report，只接受当前计划审批选项。");
+  if (
+    command === "reconcile-completed-cleanup" &&
+    (!o.input ||
+      !o["cleanup-failure"] ||
+      Object.keys(o).some((key) => !["input", "cleanup-failure", "config", "out"].includes(key)))
+  )
+    fail("ARGUMENT", "完成清理核验需要 --input 和 --cleanup-failure，只接受配置和报告目录选项。");
+  if (
+    command === "reconcile-moderation" &&
+    (!o.report ||
+      !isAbsolute(o.report) ||
+      Object.keys(o).some((key) => !["report", "config", "live", "approve-suite"].includes(key)) ||
+      (o.live === true && !/^[a-f0-9]{64}$/u.test(o["approve-suite"] ?? "")) ||
+      (o.live !== true && o["approve-suite"] !== undefined))
+  )
+    fail("ARGUMENT", "禁言恢复需要绝对报告路径；归档还需要显式 --live 和当前计划 SHA256。");
+  if (
+    command === "plan-media-recovery" &&
+    (!o.report || Object.keys(o).some((key) => !["report", "config", "out"].includes(key)))
+  )
+    fail("ARGUMENT", "媒体恢复计划需要 --report，只接受配置和报告目录选项。");
+  if (
+    command === "plan-media-delivery-gap-cleanup" &&
+    (!o.report || Object.keys(o).some((key) => !["report", "config", "out"].includes(key)))
+  )
+    fail("ARGUMENT", "固定媒体清理计划需要 --report，只接受配置和报告目录选项。");
+  if (
+    command === "reconcile-media-delivery-gap-cleanup" &&
+    (!o.report ||
+      o.live !== true ||
+      !/^[a-f0-9]{64}$/u.test(o["approve-plan"] ?? "") ||
+      Object.keys(o).some(
+        (key) => !["report", "config", "out", "live", "approve-plan"].includes(key),
+      ))
+  )
+    fail("ARGUMENT", "固定媒体清理归档需要精确报告、当前计划 SHA256 和显式 --live。");
+  if (
+    command === "resume-media" &&
+    (!o.report ||
+      !o["approve-recovery"] ||
+      o.live !== true ||
+      !["media-private-delivery"].includes(o.case) ||
+      !o.scenarios ||
+      !o["approve-suite"] ||
+      Object.keys(o).some(
+        (key) =>
+          ![
+            "report",
+            "approve-recovery",
+            "live",
+            "case",
+            "scenarios",
+            "approve-suite",
+            "config",
+            "out",
+          ].includes(key),
+      ))
+  )
+    fail("ARGUMENT", "媒体恢复需要精确报告、固定媒体套件、计划哈希和显式 --live。");
+  if (
+    ["plan-media-recovery", "resume-media"].includes(command) &&
+    Object.hasOwn(o, "approve-recovery") &&
+    !/^[a-f0-9]{64}$/u.test(o["approve-recovery"])
+  )
+    fail("ARGUMENT", "--approve-recovery 必须是 64 位小写 SHA256。");
   return { command, o };
 }
 async function jsonFile(path) {
@@ -179,11 +556,14 @@ function workspace() {
       note: "仅记录调用命令所在工作区，不证明已运行服务使用该版本。未跟踪文件不在 diff 摘要中。",
     };
   } catch {
-    return { runtimeProcessVerified: false, note: "未取得 Git 工作区版本，也未验证运行服务版本。" };
+    return {
+      runtimeProcessVerified: false,
+      note: "未取得 Git 工作区版本，也未验证运行服务版本。",
+    };
   }
 }
 async function writeJson(path, value) {
-  await writeFile(path, JSON.stringify(value, null, 2) + "\n", { mode: 0o600 });
+  await writeDurableReport(path, value);
 }
 async function syncDirectory(path) {
   const directory = await open(path, "r");
@@ -332,8 +712,164 @@ async function main() {
   const config = validateConfig(raw, {
     live:
       command === "run" ||
-      (["reconcile-memory", "reconcile-taste"].includes(command) && o.live === true),
+      command === "resume-media" ||
+      (command === "reconcile-media-delivery-gap-cleanup" && o.live === true) ||
+      (command === "reconcile-moderation" && o.live === true) ||
+      ([
+        "reconcile-memory",
+        "reconcile-taste",
+        "cleanup-acceptance-memory",
+        "reconcile-acceptance-memory",
+      ].includes(command) &&
+        o.live === true),
   });
+  if (command === "plan-media-recovery") {
+    if (
+      !config.runtime ||
+      config.mediaFixtures?.enabled !== true ||
+      config.mediaFixtures?.retainAssetsConfirmed !== true
+    )
+      fail(
+        "MEDIA_FIXTURE_DISABLED",
+        "媒体恢复计划需要真实运行版本及已确认保留的固定媒体测试文件。",
+      );
+    const { planMediaImageRecovery } = await import("./lib/media-recovery.mjs");
+    const plan = await planMediaImageRecovery({
+      reportPath: resolve(o.report),
+      config,
+      expectedRuntime: runtimeSnapshot(config.runtime),
+    });
+    console.log(JSON.stringify(plan, null, 2));
+    return plan;
+  }
+  if (
+    ["plan-media-delivery-gap-cleanup", "reconcile-media-delivery-gap-cleanup"].includes(command)
+  ) {
+    if (
+      !config.runtime ||
+      config.mediaFixtures?.enabled !== true ||
+      config.mediaFixtures?.retainAssetsConfirmed !== true
+    )
+      fail(
+        "MEDIA_FIXTURE_DISABLED",
+        "固定媒体清理核验需要已配置运行版本和已确认保留的媒体测试文件。",
+      );
+    const { applyMediaDeliveryGapCleanup, planMediaDeliveryGapCleanup } =
+      await import("./lib/media-delivery-gap-cleanup.mjs");
+    const clients = {
+      driver: new OneBot(config, "driver"),
+      bot: new OneBot(config, "bot"),
+    };
+    try {
+      await clients.driver.connect();
+      await clients.bot.connect();
+      const input = {
+        reportPath: resolve(o.report),
+        config,
+        expectedRuntime: runtimeSnapshot(config.runtime),
+        clients,
+      };
+      const planned = await planMediaDeliveryGapCleanup(input);
+      if (command === "plan-media-delivery-gap-cleanup") {
+        console.log(JSON.stringify(planned, null, 2));
+        return planned;
+      }
+      if (planned.plan.planSha256 !== o["approve-plan"])
+        fail(
+          "MEDIA_CLEANUP_APPROVAL",
+          "媒体清理归档计划已变化，请先重新查看只读计划。",
+          "INCONCLUSIVE",
+        );
+      const receipt = await applyMediaDeliveryGapCleanup(planned.plan, input, o["approve-plan"]);
+      console.log(JSON.stringify(receipt, null, 2));
+      return receipt;
+    } finally {
+      clients.driver.close();
+      clients.bot.close();
+    }
+  }
+  if (
+    o.live === true &&
+    [
+      "run",
+      "resume-media",
+      "reconcile-memory",
+      "reconcile-taste",
+      "cleanup-acceptance-memory",
+      "reconcile-acceptance-memory",
+      "deliver",
+    ].includes(command)
+  ) {
+    const { homedir } = await import("node:os");
+    const { hasUnresolvedMediaDeliveryGapCleanup } =
+      await import("./lib/media-delivery-gap-cleanup.mjs");
+    if (
+      await hasUnresolvedMediaDeliveryGapCleanup({
+        config,
+        locksDirectory: join(homedir(), ".glassbox-qq-live-locks"),
+      })
+    )
+      fail(
+        "MEDIA_DELIVERY_GAP_CLEANUP_REQUIRED",
+        "该账号存在未完成的固定媒体清理归档。先核验原报告、检查点和归档收据，不得开始其他发送或交付。",
+        "INCONCLUSIVE",
+      );
+  }
+  if (
+    o.live === true &&
+    [
+      "run",
+      "resume-media",
+      "reconcile-memory",
+      "reconcile-taste",
+      "cleanup-acceptance-memory",
+      "reconcile-acceptance-memory",
+      "deliver",
+    ].includes(command)
+  ) {
+    const { homedir } = await import("node:os");
+    const { existsSync } = await import("node:fs");
+    const account = createHash("sha256").update(config.driver.qq).digest("hex").slice(0, 24);
+    const guard = join(homedir(), ".glassbox-qq-live-locks", `${account}.moderation-pending.json`);
+    if (existsSync(guard))
+      fail(
+        "MODERATION_RECONCILIATION_REQUIRED",
+        "该账号有未确认的禁言或恢复操作。先独立核对目标状态和检查点，禁止继续发送或交付。",
+        "INCONCLUSIVE",
+      );
+  }
+  if (
+    o.live === true &&
+    [
+      "run",
+      "resume-media",
+      "reconcile-memory",
+      "reconcile-taste",
+      "cleanup-acceptance-memory",
+      "reconcile-acceptance-memory",
+      "deliver",
+    ].includes(command) &&
+    (await hasUnresolvedPreRunStopReconciliation(out))
+  )
+    fail(
+      "PRE_RUN_STOP_RECONCILIATION_REQUIRED",
+      "存在未完成的预运行停止归档。先核实归档意图和停止文件，不得继续发送。",
+    );
+  if (
+    [
+      "run",
+      "reconcile-memory",
+      "reconcile-taste",
+      "cleanup-acceptance-memory",
+      "reconcile-acceptance-memory",
+      "reconcile-completed-cleanup",
+      "resume-media",
+      "delivery-check",
+      "deliver",
+      "postmerge-check",
+    ].includes(command)
+  )
+    await assertNoGroupMembersPolicyPending(config);
   if (command === "record-agent-review") {
     const { recordAgentReviewCli } = await import("./lib/delivery-cli.mjs");
     const result = await recordAgentReviewCli(
@@ -350,7 +886,52 @@ async function main() {
     console.log(JSON.stringify(result, null, 2));
     return;
   }
+  if (command === "reconcile-moderation") {
+    const result = await runModerationNoEffectRecoveryCli(config, {
+      reportPath: o.report,
+      live: o.live === true,
+      ...(o["approve-suite"] !== undefined ? { approvedPlanSha256: o["approve-suite"] } : {}),
+    });
+    console.log(JSON.stringify(result, null, 2));
+    return result;
+  }
   if (command === "reconcile-memory") return runMemoryRecoveryCli(config, o, out);
+  if (command === "cleanup-acceptance-memory") {
+    const { runAcceptanceMemoryCleanupCli } =
+      await import("./lib/acceptance-memory-cleanup-cli.mjs");
+    const result = await runAcceptanceMemoryCleanupCli(config, o, out);
+    console.log(JSON.stringify(result, null, 2));
+    return result;
+  }
+  if (command === "reconcile-acceptance-memory") {
+    const result = await runAcceptanceMemoryReconciliationCli(
+      config,
+      {
+        input: o.input,
+        cleanupReport: o["cleanup-report"],
+        ...(o.live === true ? { live: true } : {}),
+        ...(o["approve-suite"] !== undefined ? { "approve-suite": o["approve-suite"] } : {}),
+      },
+      out,
+    );
+    console.log(JSON.stringify(result, null, 2));
+    return result;
+  }
+  if (command === "reconcile-completed-cleanup") {
+    const { verifyAcceptanceMemoryCompletedCleanup } =
+      await import("./lib/acceptance-memory-completed-cleanup.mjs");
+    const reportPath = resolve(o["cleanup-failure"]);
+    const result = await verifyAcceptanceMemoryCompletedCleanup({
+      reportPath,
+      reportDirectory: dirname(reportPath),
+      manifestPath: resolve(o.input),
+      config,
+      out,
+      expectedRuntime: runtimeSnapshot(config.runtime),
+    });
+    console.log(JSON.stringify(result, null, 2));
+    return result;
+  }
   if (command === "reconcile-taste") {
     const { runTasteRecoveryCli } = await import("./lib/taste-recovery-cli.mjs");
     return runTasteRecoveryCli(config, o, out);
@@ -373,7 +954,7 @@ async function main() {
       "MODERATION_LEASE_UNSUPPORTED",
       "实机禁言流程尚无精确范围的服务端许可，已在建立连接和发送之前阻止。",
     );
-  if (command === "run" && o.live !== true)
+  if (["run", "resume-media"].includes(command) && o.live !== true)
     fail("LIVE_REQUIRED", "真正发消息必须显式传入 --live。");
   if (command === "arm") {
     if (
@@ -392,18 +973,89 @@ async function main() {
     console.log(`测试授权有效至 ${raw.safety.armedUntil}。本命令不发送消息。`);
     return;
   }
+  let groupPolicySelection = null;
+  let groupMembersPolicySelection = null;
+  let moderationSelection = null;
+  if (o.case === GROUP_POLICY_FAMILY_ID) {
+    if (!["plan", "run"].includes(command) || o.scenarios)
+      fail("ARGUMENT", "群策略流程只支持固定用例的 plan 和 run，不接受 scenarios。");
+    groupPolicySelection = resolveGroupPolicyCli({
+      command,
+      caseId: o.case,
+      config,
+      approvedSuite: o["approve-suite"],
+    });
+    if (command === "run" && config.maxMessages < groupPolicySelection.plan.stages.length)
+      fail(
+        "MESSAGE_BUDGET",
+        `群策略流程需要 ${groupPolicySelection.plan.stages.length} 条消息预算。`,
+      );
+    if (command === "plan") {
+      console.log(JSON.stringify(groupPolicySelection, null, 2));
+      return;
+    }
+  }
+  if (o.case === GROUP_MEMBERS_POLICY_FAMILY_ID) {
+    if (!["plan", "run"].includes(command) || o.scenarios)
+      fail("ARGUMENT", "群成员权限流程只支持固定用例的 plan 和 run，不接受 scenarios。");
+    groupMembersPolicySelection = resolveGroupMembersPolicyCli({
+      command,
+      caseId: o.case,
+      config,
+      approvedSuite: o["approve-suite"],
+    });
+    if (command === "run" && config.maxMessages < groupMembersPolicySelection.plan.stages.length)
+      fail("MESSAGE_BUDGET", "群成员权限流程需要三条消息预算。");
+    if (command === "plan") {
+      console.log(JSON.stringify(groupMembersPolicySelection, null, 2));
+      return;
+    }
+  }
+  if (o.case === MODERATION_FAMILY_ID) {
+    if (!["plan", "run"].includes(command) || o.scenarios)
+      fail("ARGUMENT", "固定禁言流程只支持 plan 和 run，不接受 scenarios。");
+    moderationSelection = resolveModerationSelection({
+      command,
+      caseId: o.case,
+      config,
+      approvedSuite: o["approve-suite"],
+    });
+    if (command === "run" && config.maxMessages < 2)
+      fail("MESSAGE_BUDGET", "禁言和恢复流程需要两条消息预算。");
+    if (command === "plan") {
+      console.log(JSON.stringify(moderationSelection, null, 2));
+      return;
+    }
+  }
   const transportOnlySuite =
     !o.scenarios &&
-    !["memory-lifecycle", "taste-lifecycle", "moderation"].includes(o.case) &&
-    (command === "run" || command === "plan");
+    ![
+      "memory-lifecycle",
+      "taste-lifecycle",
+      "moderation",
+      GROUP_POLICY_FAMILY_ID,
+      GROUP_MEMBERS_POLICY_FAMILY_ID,
+      MODERATION_FAMILY_ID,
+    ].includes(o.case) &&
+    ["run", "resume-media", "plan"].includes(command);
   let specs = transportOnlySuite ? transportSmokeSpecs(config) : smokeSpecs(config),
     suiteHash = transportOnlySuite ? transportSuiteHash(config) : null,
-    featureSuite = false;
+    featureSuite = Boolean(
+      groupPolicySelection || groupMembersPolicySelection || moderationSelection,
+    );
+  if (groupPolicySelection || groupMembersPolicySelection || moderationSelection) {
+    suiteHash = (groupPolicySelection || groupMembersPolicySelection || moderationSelection)
+      .suiteSha256;
+    specs = [];
+  }
   let memoryLifecycle = o.case === "memory-lifecycle";
   let tasteLifecycle = o.case === "taste-lifecycle";
   let memoryFamilyCase = null;
   let tasteFamilyCase = null;
   let historyFamilyCase = null;
+  let mediaFamilyCase = null;
+  let taskWorkerFamilyCase = null;
+  let taskWorkerFixture = null;
   let plannedSuiteCases = null;
   if (transportOnlySuite) {
     if (
@@ -486,7 +1138,7 @@ async function main() {
   }
   if (o.scenarios) {
     const suite = await jsonFile(resolve(o.scenarios));
-    featureSuite = [2, 3, 4, 5, 6].includes(suite.raw?.schemaVersion);
+    featureSuite = [2, 3, 4, 5, 6, 7, 8].includes(suite.raw?.schemaVersion);
     if (command === "run" && !featureSuite)
       fail(
         "CUSTOM_LIVE_UNSUPPORTED",
@@ -496,6 +1148,27 @@ async function main() {
       const resolved = resolveFeatureSuite(suite.raw, config);
       plannedSuiteCases = resolved.cases;
       specs = resolved.readCases;
+      if (resolved.mediaFamilies?.length && ["run", "resume-media"].includes(command)) {
+        if (o.case !== "media-private-delivery")
+          fail("CASE_FAMILY_REQUIRED", "媒体流程需要选择固定用例。");
+        mediaFamilyCase = resolved.mediaFamilies[0];
+        if (
+          config.mediaFixtures?.enabled !== true ||
+          config.mediaFixtures?.retainAssetsConfirmed !== true
+        )
+          fail("MEDIA_FIXTURE_DISABLED", "请启用固定媒体测试并确认保留测试文件。");
+        const remainingMessages = command === "resume-media" ? 1 : 2;
+        if (config.maxMessages < remainingMessages)
+          fail("MESSAGE_BUDGET", `固定媒体流程需要 ${remainingMessages} 条消息预算。`);
+      }
+      if (resolved.taskWorkerFamilies?.length && command === "run") {
+        if (o.case !== TASK_WORKER_FAMILY_ID)
+          fail("CASE_FAMILY_REQUIRED", "Worker 流程需要选择固定用例。");
+        taskWorkerFamilyCase = resolved.taskWorkerFamilies[0];
+        taskWorkerFixture = taskWorkerFixtureConfig(config);
+        if (config.maxMessages < 4) fail("MESSAGE_BUDGET", "Worker 流程需要四条消息预算。");
+        specs = [];
+      }
       if (resolved.historyFamilies.length && command === "run") {
         if (!o.case) fail("CASE_FAMILY_REQUIRED", "含历史流程的套件须逐个选择用例运行。");
         historyFamilyCase = resolved.historyFamilies.find((c) => c.id === o.case) ?? null;
@@ -526,10 +1199,10 @@ async function main() {
         }
       }
     } else specs = validateSpecs(suite.raw, config);
-    if (command === "run" && featureSuite && !config.runtime)
+    if (["run", "resume-media"].includes(command) && featureSuite && !config.runtime)
       fail("FEATURE_RUNTIME_REQUIRED", "功能用例必须配置并核对真实验收服务版本。");
     suiteHash = digest(suite.text);
-    if (command === "run" && o["approve-suite"] !== suiteHash)
+    if (["run", "resume-media"].includes(command) && o["approve-suite"] !== suiteHash)
       fail(
         "SUITE_APPROVAL",
         "先运行 plan 审阅消息，再把输出 SHA256 传入 --approve-suite。文件修改后需要重新审阅。",
@@ -546,6 +1219,26 @@ async function main() {
       if (config.maxMessages < requiredMessages)
         fail("MESSAGE_BUDGET", `固定记忆流程需要 ${requiredMessages} 条消息的预算。`);
     }
+  }
+  if (command === "resume-media" && !mediaFamilyCase)
+    fail("CASE_FAMILY_REQUIRED", "媒体恢复必须解析为固定媒体流程。");
+  let mediaRecoveryPlan = null;
+  if (command === "resume-media") {
+    if (
+      !config.runtime ||
+      config.mediaFixtures?.enabled !== true ||
+      config.mediaFixtures?.retainAssetsConfirmed !== true
+    )
+      fail("MEDIA_FIXTURE_DISABLED", "媒体恢复需要真实运行版本及保留测试文件的确认。");
+    const { planMediaImageRecovery } = await import("./lib/media-recovery.mjs");
+    const planned = await planMediaImageRecovery({
+      reportPath: resolve(o.report),
+      config,
+      expectedRuntime: runtimeSnapshot(config.runtime),
+    });
+    if (planned.planSha256 !== o["approve-recovery"])
+      fail("MEDIA_RECOVERY_APPROVAL", "媒体恢复计划已变化，请重新审阅并提供新的计划 SHA256。");
+    mediaRecoveryPlan = planned.plan;
   }
   if (command === "plan") {
     if (!o.scenarios) fail("SCENARIOS_REQUIRED", "plan 需要 --scenarios。");
@@ -565,12 +1258,21 @@ async function main() {
             if (families.length === 1) return { memoryPlan: memoryFamilyPlan(families[0].id) };
             if (families.length > 1)
               return {
-                memoryPlans: families.map((c) => ({ caseId: c.id, plan: memoryFamilyPlan(c.id) })),
+                memoryPlans: families.map((c) => ({
+                  caseId: c.id,
+                  plan: memoryFamilyPlan(c.id),
+                })),
               };
             return {};
           })(),
           ...(plannedSuiteCases?.some((c) => c.kind === "taste-lifecycle")
             ? { tastePlan: tasteFamilyPlan() }
+            : {}),
+          ...(plannedSuiteCases?.some((c) => c.kind === "media-private-delivery")
+            ? { mediaPlan: mediaFamilyPlan() }
+            : {}),
+          ...(plannedSuiteCases?.some((c) => c.kind === "task-worker-artifact-lifecycle")
+            ? { taskWorkerPlan: taskWorkerFamilyPlan() }
             : {}),
           note: "这是待发送的消息，不是执行结果。sideEffect 声明不能代替代码授权检查。",
         },
@@ -584,14 +1286,19 @@ async function main() {
     o.case &&
     !transportOnlySuite &&
     o.case !== "moderation" &&
+    !groupPolicySelection &&
+    !groupMembersPolicySelection &&
+    !moderationSelection &&
     !memoryLifecycle &&
     !tasteLifecycle &&
-    !historyFamilyCase
+    !historyFamilyCase &&
+    !mediaFamilyCase &&
+    !taskWorkerFamilyCase
   ) {
     specs = specs.filter((s) => s.id === o.case);
     if (!specs.length) fail("CASE_NOT_FOUND", "没有匹配的用例，未执行任何测试。");
   }
-  if (command === "run" && o.live !== true)
+  if (["run", "resume-media"].includes(command) && o.live !== true)
     fail("LIVE_REQUIRED", "真正发消息必须显式传入 --live。");
   if (command === "run" && o.case === "moderation" && o.scenarios)
     fail("ARGUMENT", "moderation 不与自定义用例文件混用。");
@@ -606,11 +1313,19 @@ async function main() {
   );
   const pendingFixturePath = lockPath.replace(/\.lock$/, ".memory-pending.json");
   const pendingTasteFixturePath = lockPath.replace(/\.lock$/, ".taste-pending.json");
+  const pendingMediaFixturePath = lockPath.replace(/\.lock$/, ".media-pending.json");
+  const pendingTaskWorkerFixturePath = lockPath.replace(/\.lock$/, ".task-worker-pending.json");
+  const pendingGroupPolicyFixturePath = lockPath.replace(/\.lock$/, ".group-policy-pending.json");
+  const pendingGroupMembersPolicyFixturePath = lockPath.replace(
+    /\.lock$/,
+    ".group-members-policy-pending.json",
+  );
+  const pendingModerationFixturePath = lockPath.replace(/\.lock$/, ".moderation-pending.json");
   const runStartedAt = new Date().toISOString();
   const { lock, processIdentity: runProcessIdentity } = await acquireRunLock({
     lockPath,
     startedAt: runStartedAt,
-    identityRequired: command === "run" && o.live === true,
+    identityRequired: ["run", "resume-media"].includes(command) && o.live === true,
   });
   const runId =
     new Date().toISOString().replaceAll(":", "-") + "_" + digest(String(Math.random())).slice(0, 8);
@@ -619,7 +1334,10 @@ async function main() {
   const stop = () => controller.abort();
   process.on("SIGINT", stop);
   process.on("SIGTERM", stop);
-  const clients = { driver: new OneBot(config, "driver"), bot: new OneBot(config, "bot") };
+  const clients = {
+    driver: new OneBot(config, "driver"),
+    bot: new OneBot(config, "bot"),
+  };
   const secrets = [clients.driver.token, clients.bot.token];
   const recorder = new Recorder(config, secrets);
   const report = {
@@ -655,8 +1373,32 @@ async function main() {
   };
   let timer;
   let acceptance;
+  let mediaRecoveryEvidence = null;
+  let mediaRecoveryFinalProof = null;
+  let mediaRecoveryVideoCase = null;
+  let mediaRecoveryVideoAcceptance = null;
   let pendingFixtureCreated = false;
   let pendingTasteFixtureCreated = false;
+  let pendingMediaFixtureCreated = false;
+  let pendingTaskWorkerFixtureCreated = false;
+  let pendingGroupPolicyFixtureCreated = false;
+  let pendingGroupMembersPolicyFixtureCreated = false;
+  let pendingModerationFixtureCreated = false;
+  let groupPolicyExecution;
+  let groupMembersPolicyExecution;
+  let moderationExecution;
+  let recheckGroupMembersPolicyFinalState;
+  let recheckGroupPolicyFinalState;
+  let recheckModerationFinalState;
+  let taskFixtureNonce;
+  let taskExpectedTarget;
+  let taskTrustedFixture;
+  let taskDatabase;
+  let taskVerifier;
+  let taskCheckpointIdentity;
+  let recheckTaskTerminal;
+  const taskReceipts = [];
+  const verifiedMediaSnapshots = new Map();
   const observers = [];
   try {
     await mkdir(runDir, { mode: 0o700 });
@@ -667,36 +1409,622 @@ async function main() {
       status: "STARTED",
     });
     recorder.onEvent = (e) =>
-      appendFileSync(join(runDir, "events.jsonl"), JSON.stringify(e) + "\n", { mode: 0o600 });
+      appendFileSync(join(runDir, "events.jsonl"), JSON.stringify(e) + "\n", {
+        mode: 0o600,
+      });
     const { existsSync } = await import("node:fs");
-    if (existsSync(join(out, "STOP"))) fail("STOP_FILE", "存在 STOP 文件，本轮不会发送消息。");
-    if (command === "run" && existsSync(pendingFixturePath))
+    if (existsSync(join(out, "STOP")) && command !== "resume-media")
+      fail("STOP_FILE", "存在 STOP 文件，本轮不会发送消息。");
+    if (o.live === true && ["run", "resume-media", "deliver"].includes(command)) {
+      const { hasUnresolvedMediaRecoveryRelease } = await import("./lib/media-recovery.mjs");
+      if (await hasUnresolvedMediaRecoveryRelease(config, lockRoot))
+        fail(
+          "MEDIA_RECOVERY_RELEASE_REQUIRED",
+          "媒体恢复的停止记录归档未完成。先核对恢复报告和发布意图，禁止继续发送。",
+        );
+    }
+    let memoryReconciliationOptions = {
+      stopPath: join(out, "STOP"),
+      guardPath: pendingFixturePath,
+    };
+    if (command === "resume-media" && mediaRecoveryPlan) {
+      const { mediaRecoveryPlanBinding } = await import("./lib/media-recovery.mjs");
+      memoryReconciliationOptions = {
+        ...memoryReconciliationOptions,
+        replacementStop: mediaRecoveryPlanBinding(mediaRecoveryPlan),
+        mediaRecoveryContext: {
+          config,
+          expectedRuntime: runtimeSnapshot(config.runtime),
+          locksDirectory: lockRoot,
+        },
+      };
+    }
+    if (
+      ["run", "resume-media"].includes(command) &&
+      (await hasUnresolvedAcceptanceMemoryReconciliation(out, memoryReconciliationOptions))
+    )
+      fail(
+        "MEMORY_RECONCILIATION_REQUIRED",
+        "该发起账号有未核实的记忆清理归档。先核实原始报告和归档收据，禁止续发。",
+      );
+    if (["run", "resume-media"].includes(command) && existsSync(pendingFixturePath))
       fail(
         "MEMORY_RECONCILIATION_REQUIRED",
         "该发起账号有未核实的记忆测试资源。先核实原始报告和清理证据，禁止续发。",
       );
-    if (command === "run" && existsSync(pendingTasteFixturePath))
+    if (["run", "resume-media"].includes(command) && existsSync(pendingTasteFixturePath))
       fail(
         "TASTE_RECONCILIATION_REQUIRED",
         "该发起账号有未核实的偏好测试资源。先核实原始报告和清理证据，禁止续发。",
       );
-    if (command === "run" && config.runtime) report.runtime = runtimeSnapshot(config.runtime);
-    if (command === "run" && (featureSuite || transportOnlySuite))
+    if (command === "run" && existsSync(pendingMediaFixturePath))
+      fail(
+        "MEDIA_RECONCILIATION_REQUIRED",
+        "该账号有未确认的媒体测试。请核实原始报告、发送状态和临时许可，禁止重复生成。",
+      );
+    if (["run", "resume-media"].includes(command) && existsSync(pendingTaskWorkerFixturePath))
+      fail(
+        "TASK_WORKER_RECONCILIATION_REQUIRED",
+        "该账号有未确认的 Worker 测试。请核实原始报告和检查点，禁止重发。",
+      );
+    if (["run", "resume-media"].includes(command) && existsSync(pendingGroupPolicyFixturePath))
+      fail(
+        "GROUP_POLICY_RECONCILIATION_REQUIRED",
+        "该账号有未确认的群策略测试。先核实原始报告和检查点，禁止重发。",
+      );
+    if (
+      ["run", "resume-media"].includes(command) &&
+      existsSync(pendingGroupMembersPolicyFixturePath)
+    )
+      fail(
+        "GROUP_MEMBERS_POLICY_RECONCILIATION_REQUIRED",
+        "该账号有未确认的群成员权限测试。先核实原始报告和检查点，禁止重发。",
+      );
+    if (["run", "resume-media"].includes(command) && existsSync(pendingModerationFixturePath))
+      fail(
+        "MODERATION_RECONCILIATION_REQUIRED",
+        "该账号有未确认的禁言或恢复操作。先独立核对目标状态和检查点，禁止重试。",
+        "INCONCLUSIVE",
+      );
+    if (["run", "resume-media"].includes(command) && config.runtime)
+      report.runtime = runtimeSnapshot(config.runtime);
+    if (["run", "resume-media"].includes(command) && (featureSuite || transportOnlySuite))
       acceptance = await acceptanceManagement(config.runtime);
     timer = setInterval(() => {
-      if (existsSync(join(out, "STOP"))) controller.abort();
+      if (command !== "resume-media" && existsSync(join(out, "STOP"))) controller.abort();
     }, 250);
     await clients.driver.connect();
     await clients.bot.connect();
     observers.push(clients.driver.subscribe((e) => recorder.ingest("driver", e)));
     observers.push(clients.bot.subscribe((e) => recorder.ingest("bot", e)));
-    report.environment = await doctor(config, clients);
+    if (command === "resume-media") {
+      const { verifyMediaImageRecoveryPlan } = await import("./lib/media-recovery.mjs");
+      mediaRecoveryEvidence = await verifyMediaImageRecoveryPlan(mediaRecoveryPlan, {
+        reportPath: resolve(o.report),
+        config,
+        expectedRuntime: report.runtime,
+        clients,
+      });
+      const recoveredImageCase = {
+        ...mediaRecoveryEvidence.transportCase,
+        runId: mediaRecoveryEvidence.productRunId,
+        mediaObservationExpectedType: "image",
+        mediaObservationExpectedCaptionSha256: digest("图片已生成"),
+        mediaObservations: mediaRecoveryEvidence.mediaObservations.candidates,
+        mediaObservationOverflow: false,
+        mediaObservationClosed: true,
+      };
+      recorder.cases.push(recoveredImageCase);
+      report.mediaRecoveryPrefix = {
+        status: mediaRecoveryEvidence.status,
+        planSha256: mediaRecoveryEvidence.planSha256,
+        proofSha256: mediaRecoveryEvidence.proofSha256,
+        runId: mediaRecoveryEvidence.productRunId,
+        mediaMessageBinding: mediaRecoveryEvidence.mediaMessageBinding,
+      };
+    }
+    // These fixed families have exclusively Owner-private stages and no group targets.
+    // Keep comprehensive group checks for standalone doctor, history and other cases.
+    const privateFixtureOnly =
+      ["run", "resume-media"].includes(command) &&
+      Boolean(
+        taskWorkerFamilyCase ||
+        groupMembersPolicySelection ||
+        mediaFamilyCase ||
+        memoryLifecycle ||
+        tasteLifecycle ||
+        privateAccountPreflightOnly(specs),
+      );
+    report.environment = await doctor(
+      config,
+      clients,
+      privateFixtureOnly ? { groupAliases: [] } : {},
+    );
     if (command === "doctor") {
       report.status = "PASS";
       report.note = "只完成账号、在线状态和群成员检查，没有执行实机收发验收。";
     } else if (o.case === "moderation") {
       await moderationCase(config, clients, recorder, controller.signal);
       report.status = recorder.finalize();
+    } else if (moderationSelection) {
+      pendingModerationFixtureCreated = true;
+      moderationExecution = await runModerationCli({
+        selection: moderationSelection,
+        config,
+        clients,
+        recorder,
+        acceptance,
+        signal: controller.signal,
+        pendingPath: pendingModerationFixturePath,
+        reportDirectory: runDir,
+        reportRuntime: report.runtime,
+        driverSha256: digest(config.driver.qq),
+        processIdentity: runProcessIdentity,
+      });
+      report.moderationAcceptance = moderationExecution.result;
+      report.moderationFinalStateProof = moderationExecution.result.finalProof;
+      report.productAcceptance = {
+        ...moderationExecution.productAcceptance,
+        cleanupRequired: true,
+        cleanupVerified: moderationExecution.result.cleanupVerified === true,
+      };
+      report.status =
+        moderationExecution.result.status === "MODERATION_WORKFLOW_VERIFIED" &&
+        report.productAcceptance.status === "PASS"
+          ? "PASS"
+          : "INCONCLUSIVE";
+      report.plannedCaseCount = 2;
+      report.executedCaseCount = recorder.cases.length;
+      recheckModerationFinalState = () => {
+        if (!isDeepStrictEqual(runtimeSnapshot(config.runtime), report.runtime))
+          fail("MODERATION_RUNTIME_CHANGED", "禁言验收服务发生变化。", "INCONCLUSIVE");
+        const currentPolicy = readModerationPolicyState(config);
+        if (!isDeepStrictEqual(currentPolicy, moderationExecution.result.policyState))
+          fail(
+            "MODERATION_POLICY_CHANGED",
+            "群 B 的禁言策略或授权在验收后发生变化。",
+            "INCONCLUSIVE",
+          );
+        if (
+          moderationExecution.result.finalProof?.status !== "MODERATION_FINAL_STATE_VERIFIED" ||
+          moderationExecution.result.finalProof.roles?.status !==
+            "MODERATION_FINAL_STATE_VERIFIED" ||
+          moderationExecution.result.finalProof.roles.targetShutUpUntil > Date.now() / 1000
+        )
+          fail("MODERATION_FINAL_STATE", "禁言恢复后的双账号成员状态未通过复核。", "INCONCLUSIVE");
+        return moderationExecution.result.finalProof;
+      };
+    } else if (groupPolicySelection) {
+      pendingGroupPolicyFixtureCreated = true;
+      groupPolicyExecution = await runGroupPolicyCli({
+        selection: groupPolicySelection,
+        config,
+        clients,
+        recorder,
+        acceptance,
+        signal: controller.signal,
+        pendingPath: pendingGroupPolicyFixturePath,
+        reportDirectory: runDir,
+        reportRuntime: report.runtime,
+        driverSha256: digest(config.driver.qq),
+        processIdentity: runProcessIdentity,
+      });
+      report.groupPolicyAcceptance = groupPolicyExecution.result;
+      recheckGroupPolicyFinalState = () => {
+        const runtimeBefore = runtimeSnapshot(config.runtime);
+        if (!isDeepStrictEqual(runtimeBefore, report.runtime))
+          fail("GROUP_POLICY_RUNTIME_CHANGED", "群策略验收服务发生变化。", "INCONCLUSIVE");
+        const originalHistoryGrantId = groupPolicyExecution.baseline?.B?.historyGrants?.[0]?.id;
+        if (typeof originalHistoryGrantId !== "string" || !originalHistoryGrantId)
+          fail("GROUP_POLICY_STATE_RECHECK", "群策略原始授权基线缺失。", "INCONCLUSIVE");
+        const current = readGroupPolicyState(config, {
+          originalHistoryGrantId,
+        });
+        const stateProof = verifyGroupPolicyTransition(
+          groupPolicyExecution.baseline,
+          current,
+          "restore",
+        );
+        if (!isDeepStrictEqual(stateProof, groupPolicyExecution.result.finalProof))
+          fail(
+            "GROUP_POLICY_STATE_RECHECK",
+            "群策略恢复后的独立状态与报告不一致。",
+            "INCONCLUSIVE",
+          );
+        if (!isDeepStrictEqual(runtimeSnapshot(config.runtime), report.runtime))
+          fail("GROUP_POLICY_RUNTIME_CHANGED", "群策略验收服务发生变化。", "INCONCLUSIVE");
+        return {
+          status: "GROUP_POLICY_FINAL_STATE_VERIFIED",
+          policyVersion: current.B.version,
+          stateProof,
+          actualQqDeliveryVerified: false,
+        };
+      };
+      const verified =
+        report.groupPolicyAcceptance.status === "GROUP_POLICY_WORKFLOW_VERIFIED" &&
+        report.groupPolicyAcceptance.requiresReconciliation === false &&
+        report.groupPolicyAcceptance.cleanupVerified === true &&
+        report.groupPolicyAcceptance.actualQqDeliveryVerified === true;
+      const restoredFeatureFailure = groupPolicyRestoredFeatureFailure(report);
+      report.status = verified ? "PASS" : restoredFeatureFailure ? "FAIL" : "INCONCLUSIVE";
+      report.productAcceptance = {
+        status: verified ? "PASS" : restoredFeatureFailure ? "FAIL" : "INCONCLUSIVE",
+        runtime: report.runtime,
+        cleanupRequired: true,
+        cleanupVerified: verified || restoredFeatureFailure,
+        cases: report.groupPolicyAcceptance.steps.map((step) => step.proof),
+      };
+      report.plannedCaseCount = 2;
+      report.executedCaseCount = recorder.cases.length;
+    } else if (groupMembersPolicySelection) {
+      pendingGroupMembersPolicyFixtureCreated = true;
+      groupMembersPolicyExecution = await runGroupMembersPolicyCli({
+        selection: groupMembersPolicySelection,
+        config,
+        clients,
+        recorder,
+        acceptance,
+        signal: controller.signal,
+        pendingPath: pendingGroupMembersPolicyFixturePath,
+        reportDirectory: runDir,
+        reportRuntime: report.runtime,
+        driverSha256: digest(config.driver.qq),
+        processIdentity: runProcessIdentity,
+      });
+      report.groupMembersPolicyAcceptance = groupMembersPolicyExecution.result;
+      recheckGroupMembersPolicyFinalState = () => {
+        if (!isDeepStrictEqual(runtimeSnapshot(config.runtime), report.runtime))
+          fail(
+            "GROUP_MEMBERS_POLICY_RUNTIME_CHANGED",
+            "群成员权限验收服务发生变化。",
+            "INCONCLUSIVE",
+          );
+        const originalId = groupMembersPolicyExecution.baseline?.B?.memberGrants?.[0]?.id;
+        if (typeof originalId !== "string" || !originalId)
+          fail("GROUP_MEMBERS_POLICY_STATE_RECHECK", "缺少原始群成员授权记录。", "INCONCLUSIVE");
+        const current = readGroupMembersPolicyState(config, {
+          originalMemberGrantId: originalId,
+        });
+        const stateProof = verifyGroupMembersPolicyTransition(
+          groupMembersPolicyExecution.baseline,
+          current,
+          "restore",
+        );
+        if (!isDeepStrictEqual(stateProof, groupMembersPolicyExecution.result.finalProof))
+          fail(
+            "GROUP_MEMBERS_POLICY_STATE_RECHECK",
+            "群成员权限恢复后的独立状态与报告不一致。",
+            "INCONCLUSIVE",
+          );
+        if (!isDeepStrictEqual(runtimeSnapshot(config.runtime), report.runtime))
+          fail(
+            "GROUP_MEMBERS_POLICY_RUNTIME_CHANGED",
+            "群成员权限验收服务发生变化。",
+            "INCONCLUSIVE",
+          );
+        return {
+          status: "GROUP_MEMBERS_POLICY_FINAL_STATE_VERIFIED",
+          policyVersion: current.B.version,
+          stateProof,
+          actualQqDeliveryVerified: false,
+        };
+      };
+      const accepted =
+        report.groupMembersPolicyAcceptance.status === "GROUP_MEMBERS_POLICY_BOUNDARY_VERIFIED" &&
+        report.groupMembersPolicyAcceptance.requiresReconciliation === false &&
+        report.groupMembersPolicyAcceptance.cleanupVerified === true &&
+        report.groupMembersPolicyAcceptance.actualQqDeliveryVerified === true;
+      report.status = accepted ? "PASS" : "INCONCLUSIVE";
+      report.productAcceptance = {
+        status: accepted ? "PASS" : "INCONCLUSIVE",
+        acceptanceKind: "GROUP_MEMBERS_POLICY_BOUNDARY",
+        runtime: report.runtime,
+        cleanupRequired: true,
+        cleanupVerified: accepted,
+        cases: report.groupMembersPolicyAcceptance.steps.map((step) => step.proof),
+      };
+      report.plannedCaseCount = 3;
+      report.executedCaseCount = recorder.cases.length;
+    } else if (taskWorkerFamilyCase) {
+      const { runTaskWorkerFamily } = await import("./lib/task-worker-family.mjs");
+      const { createTaskWorkerStepVerifier } = await import("./lib/task-worker-evidence.mjs");
+      const { openReadOnlyDatabase } = await import("./lib/read-only-database.mjs");
+      const { createTaskWorkerCheckpoint, advanceTaskWorkerCheckpoint } =
+        await import("./lib/task-worker-checkpoint.mjs");
+      const { waitForTaskWorkerCompletion } = await import("./lib/task-worker-completion.mjs");
+      await verifyTaskWorkerPreflight({
+        dataDirectory: report.runtime.dataDirectory,
+        fixture: taskWorkerFixture,
+        runtime: report.runtime,
+      });
+      taskFixtureNonce = randomUUID().replaceAll("-", "");
+      taskExpectedTarget = {
+        workspaceId: taskWorkerFixture.workspaceId,
+        herdrSession: taskWorkerFixture.herdrSession,
+        agentKind: taskWorkerFixture.agentKind,
+        markerSha256: taskWorkerFixture.markerSha256,
+      };
+      taskTrustedFixture = {
+        canonicalRoot: taskWorkerFixture.canonicalRoot,
+        productWorkspaceId: taskWorkerFixture.productWorkspaceId,
+        markerSha256: taskWorkerFixture.markerSha256,
+      };
+      taskDatabase = openReadOnlyDatabase(join(report.runtime.dataDirectory, "glassbox.db"));
+      taskVerifier = createTaskWorkerStepVerifier({
+        db: taskDatabase,
+        dataDirectory: report.runtime.dataDirectory,
+        config,
+        clients,
+        trustedFixture: taskTrustedFixture,
+      });
+      recheckTaskTerminal = async () => {
+        if (JSON.stringify(runtimeSnapshot(config.runtime)) !== JSON.stringify(report.runtime))
+          fail("RUNTIME_CHANGED", "Worker 验收服务发生变化。", "INCONCLUSIVE");
+        const { verifyTaskWorkerTerminalState } = await import("./lib/task-worker-evidence.mjs");
+        const createdReceipt = taskReceipts[0];
+        const acceptedReceipt = taskReceipts.at(-1);
+        return verifyTaskWorkerTerminalState({
+          db: taskDatabase,
+          taskId: acceptedReceipt.taskId,
+          attemptId: acceptedReceipt.attemptId,
+          bindingId: acceptedReceipt.bindingId,
+          creationRunId: createdReceipt.runId,
+          acceptedRunId: acceptedReceipt.acceptedRunId,
+          fixtureNonce: taskFixtureNonce,
+          expectedWorkerTarget: taskExpectedTarget,
+          trustedFixture: taskTrustedFixture,
+          scope: acceptedReceipt.scope,
+          principalId: acceptedReceipt.principalId,
+        });
+      };
+      pendingTaskWorkerFixtureCreated = true;
+      const created = await createTaskWorkerCheckpoint({
+        pendingPath: pendingTaskWorkerFixturePath,
+        reportDirectory: runDir,
+        identity: {
+          runtime: report.runtime,
+          suiteSha256: suiteHash,
+          fixtureNonce: taskFixtureNonce,
+          workerTarget: taskExpectedTarget,
+          startedAt: report.startedAt,
+        },
+      });
+      taskCheckpointIdentity = created.identity;
+      const taskConfig = { ...config, timeoutMs: taskWorkerFixture.timeoutMs };
+      const productCases = [];
+      report.productAcceptance = {
+        status: "INCONCLUSIVE",
+        runtime: report.runtime,
+        cleanupRequired: true,
+        cleanupVerified: false,
+        cases: productCases,
+      };
+      report.taskWorkerAcceptance = await runTaskWorkerFamily({
+        fixtureNonce: taskFixtureNonce,
+        expectedWorkerTarget: taskExpectedTarget,
+        signal: controller.signal,
+        readRuntime: () => runtimeSnapshot(config.runtime),
+        checkpoint: async (row) => {
+          await advanceTaskWorkerCheckpoint({
+            pendingPath: pendingTaskWorkerFixturePath,
+            reportDirectory: runDir,
+            identity: taskCheckpointIdentity,
+            stage: row.stage,
+            phase: row.phase,
+            ...(row.phase === "verified" ? { proof: taskReceipts.at(-1) } : {}),
+          });
+          return true;
+        },
+        executeStep: async (stage, spec) => {
+          if (stage === "delegate")
+            await verifyTaskWorkerPreflight({
+              dataDirectory: report.runtime.dataDirectory,
+              fixture: taskWorkerFixture,
+              runtime: report.runtime,
+            });
+          if (stage === "inspect") {
+            const prior = taskReceipts.at(-1);
+            await waitForTaskWorkerCompletion({
+              config,
+              taskId: prior.taskId,
+              attemptId: prior.attemptId,
+              bindingId: prior.bindingId,
+              expectedRuntime: report.runtime,
+              signal: controller.signal,
+            });
+          }
+          const transportCase = await replyCase(
+            taskConfig,
+            clients,
+            recorder,
+            spec,
+            controller.signal,
+            acceptance,
+          );
+          if (transportCase.status !== "PASS")
+            fail(
+              "TASK_WORKER_TRANSPORT_UNCONFIRMED",
+              "Worker 请求的真实回复未确认，本轮不会重发。",
+              "INCONCLUSIVE",
+            );
+          const productAcceptance = await verifyProductEvidence(
+            {
+              mode: "run",
+              status: "PASS",
+              runtime: report.runtime,
+              cases: [transportCase],
+            },
+            config,
+            clients,
+          );
+          transportCase.runId = productAcceptance.cases[0]?.runId;
+          productCases.push(productAcceptance.cases[0]);
+          return { transportCase, productAcceptance };
+        },
+        verifyStep: async (stage, ctx) => {
+          const receipt = await taskVerifier(stage, ctx);
+          taskReceipts.push(receipt);
+          return receipt;
+        },
+      });
+      report.taskWorkerReceipts = taskReceipts;
+      report.productAcceptance = {
+        status: "PASS",
+        runtime: report.runtime,
+        cleanupRequired: true,
+        cleanupVerified: true,
+        cases: productCases,
+      };
+      report.status = "PASS";
+      report.plannedCaseCount = 4;
+      report.executedCaseCount = recorder.cases.length;
+    } else if (mediaFamilyCase) {
+      const { runMediaWorkflow } = await import("./lib/media-workflow.mjs");
+      const { mediaObservationFor } = await import("./lib/media-scenario.mjs");
+      const { verifyMediaCase } = await import("./lib/media-product-evidence.mjs");
+      const { waitForMediaCompletion } = await import("./lib/media-completion.mjs");
+      const { writeMemoryCheckpoint } = await import("./lib/memory-checkpoint.mjs");
+      const mediaConfig = {
+        ...config,
+        timeoutMs: config.mediaFixtures.timeoutMs,
+      };
+      let sequence = mediaRecoveryEvidence ? 4 : 0,
+        currentStage;
+      const checkpoint = async (row) => {
+        const first = sequence === 0;
+        pendingMediaFixtureCreated = true;
+        await writeMemoryCheckpoint({
+          pendingPath: pendingMediaFixturePath,
+          journalPath: mediaRecoveryPlan?.checkpointPath ?? join(runDir, "media-fixture.jsonl"),
+          first,
+          row: {
+            schemaVersion: 1,
+            familyId: mediaFamilyCase.id,
+            sequence: ++sequence,
+            driverSha256: digest(config.driver.qq),
+            suiteSha256: suiteHash,
+            runtime: report.runtime,
+            process: runProcessIdentity,
+            reportDirectory: runDir,
+            recordedAt: new Date().toISOString(),
+            ...row,
+          },
+        });
+        return true;
+      };
+      acceptance.beforeRegister = (c) =>
+        checkpoint({
+          stage: currentStage,
+          phase: "lease_intent",
+          caseId: c.id,
+          marker: c.token,
+          textSha256: digest(c.prompt),
+        });
+      acceptance.beforeSend = (c, lease) =>
+        checkpoint({
+          stage: currentStage,
+          phase: "send_intent",
+          caseId: c.id,
+          marker: c.token,
+          leaseId: lease.leaseId,
+          toolsSha256: lease.toolsSha256,
+          textSha256: digest(c.prompt),
+        });
+      acceptance.afterSend = (c) =>
+        checkpoint({
+          stage: currentStage,
+          phase: "sent",
+          caseId: c.id,
+          driverMessageId: c.sentMessageId,
+        });
+      const receipts = mediaRecoveryEvidence
+        ? [
+            {
+              caseId: "media-image-1k",
+              ...mediaRecoveryEvidence.mediaAcceptance,
+            },
+          ]
+        : [];
+      report.mediaFamilyAcceptance = await runMediaWorkflow({
+        signal: controller.signal,
+        checkpoint,
+        ...(mediaRecoveryEvidence
+          ? {
+              verifiedPrefix: mediaRecoveryEvidence.prefix,
+              revalidatePrefix: async (prefix) => {
+                if (!isDeepStrictEqual(prefix, mediaRecoveryEvidence.prefix))
+                  fail("MEDIA_RECOVERY_PREFIX_CHANGED", "图片前缀证据已变化。", "INCONCLUSIVE");
+                const { revalidateMediaImagePrefix } = await import("./lib/media-recovery.mjs");
+                return revalidateMediaImagePrefix(mediaRecoveryPlan, mediaRecoveryEvidence, {
+                  reportPath: resolve(o.report),
+                  config,
+                  expectedRuntime: report.runtime,
+                  clients,
+                });
+              },
+            }
+          : {}),
+        executeStep: async (stage, spec) => {
+          currentStage = stage;
+          const transportCase = await replyCase(
+            mediaConfig,
+            clients,
+            recorder,
+            spec,
+            controller.signal,
+            acceptance,
+            mediaObservationFor(stage),
+          );
+          if (transportCase.status !== "PASS")
+            fail("MEDIA_TRANSPORT_UNCONFIRMED", "媒体请求的真实回复未确认。", "INCONCLUSIVE");
+          const stageController = new AbortController();
+          const stageSignal = AbortSignal.any([
+            controller.signal,
+            stageController.signal,
+            AbortSignal.timeout(config.mediaFixtures.timeoutMs),
+          ]);
+          try {
+            await Promise.all([
+              recorder.waitForMediaObservation(transportCase.id, stageSignal),
+              waitForMediaCompletion({
+                config,
+                caseRecord: transportCase,
+                signal: stageSignal,
+              }),
+            ]);
+          } finally {
+            stageController.abort();
+          }
+          const observations = recorder.mediaObservationSnapshot(transportCase.id);
+          const receipt = await verifyMediaCase({
+            stage,
+            caseRecord: transportCase,
+            config,
+            clients,
+            expectedRuntime: report.runtime,
+            mediaObservations: observations,
+          });
+          transportCase.runId = receipt.runId;
+          receipts.push({ caseId: transportCase.id, ...receipt });
+          if (mediaRecoveryEvidence && stage === "video-4s") {
+            mediaRecoveryVideoCase = transportCase;
+            mediaRecoveryVideoAcceptance = receipt;
+          }
+          verifiedMediaSnapshots.set(transportCase.id, observations);
+          recorder.closeMediaObservation(transportCase.id);
+          return { transportCase, mediaAcceptance: receipt };
+        },
+      });
+      report.status = report.mediaFamilyAcceptance.status;
+      report.productAcceptance = {
+        status: report.status,
+        runtime: report.runtime,
+        cleanupRequired: true,
+        cleanupVerified: true,
+        cases: receipts,
+      };
+      report.plannedCaseCount = 2;
+      report.executedCaseCount = recorder.cases.length;
     } else if (historyFamilyCase) {
       const isolation = historyFamilyCase.kind === "history-isolation";
       const runWorkflow = isolation
@@ -723,7 +2051,11 @@ async function main() {
           textSha256: digest(c.prompt),
         });
       acceptance.afterSend = async (c) =>
-        checkpoint({ phase: "sent", caseId: c.id, driverMessageId: c.sentMessageId });
+        checkpoint({
+          phase: "sent",
+          caseId: c.id,
+          driverMessageId: c.sentMessageId,
+        });
       const historyWorkflow = await runWorkflow({
         config,
         signal: controller.signal,
@@ -740,7 +2072,12 @@ async function main() {
           );
           if (transportCase.status !== "PASS") return { transportCase };
           const productAcceptance = await verifyProductEvidence(
-            { mode: "run", status: "PASS", runtime: report.runtime, cases: [transportCase] },
+            {
+              mode: "run",
+              status: "PASS",
+              runtime: report.runtime,
+              cases: [transportCase],
+            },
             config,
             clients,
           );
@@ -842,7 +2179,11 @@ async function main() {
         await checkpointMemory({
           ...memoryCheckpointState,
           phase: "sent",
-          sentCase: { caseId: c.id, driverMessageId: c.sentMessageId, startedAt: c.startedAt },
+          sentCase: {
+            caseId: c.id,
+            driverMessageId: c.sentMessageId,
+            startedAt: c.startedAt,
+          },
         });
       };
       report.memoryLifecycle = await runMemoryLifecycle({
@@ -862,7 +2203,12 @@ async function main() {
           );
           if (transportCase.status !== "PASS") return { transportCase };
           const productAcceptance = await verifyProductEvidence(
-            { mode: "run", status: "PASS", runtime: report.runtime, cases: [transportCase] },
+            {
+              mode: "run",
+              status: "PASS",
+              runtime: report.runtime,
+              cases: [transportCase],
+            },
             config,
             clients,
           );
@@ -909,7 +2255,11 @@ async function main() {
                       creationRunId: handles.creationRunId,
                       cleanupRunId: handles.stepRunId,
                     });
-            return { ...observed, principalKind: actor.kind, stepRunId: handles.stepRunId };
+            return {
+              ...observed,
+              principalKind: actor.kind,
+              stepRunId: handles.stepRunId,
+            };
           } finally {
             db.close();
           }
@@ -1052,7 +2402,12 @@ async function main() {
           );
           if (transportCase.status !== "PASS") return { transportCase };
           const productAcceptance = await verifyProductEvidence(
-            { mode: "run", status: "PASS", runtime: report.runtime, cases: [transportCase] },
+            {
+              mode: "run",
+              status: "PASS",
+              runtime: report.runtime,
+              cases: [transportCase],
+            },
             config,
             clients,
           );
@@ -1156,7 +2511,12 @@ async function main() {
                         })),
                     )
                   : verifyProductEvidence(
-                      { mode: "run", status: "PASS", runtime: report.runtime, cases: [testCase] },
+                      {
+                        mode: "run",
+                        status: "PASS",
+                        runtime: report.runtime,
+                        cases: [testCase],
+                      },
                       config,
                       clients,
                     )
@@ -1165,7 +2525,12 @@ async function main() {
           command === "run" && config.runtime
             ? (testCase) =>
                 verifyFailedCaseCleanup(
-                  { mode: "run", status: "FAIL", runtime: report.runtime, cases: [testCase] },
+                  {
+                    mode: "run",
+                    status: "FAIL",
+                    runtime: report.runtime,
+                    cases: [testCase],
+                  },
                   config,
                 )
             : undefined,
@@ -1215,7 +2580,12 @@ async function main() {
         if (report.productAcceptance.cleanupVerified !== true) report.cleanupStopRequired = true;
         if (report.status === "PASS") report.status = report.productAcceptance.status;
       }
-    } else if (command === "run" && config.runtime && report.status === "PASS") {
+    } else if (
+      command === "run" &&
+      config.runtime &&
+      report.status === "PASS" &&
+      !mediaFamilyCase
+    ) {
       try {
         report.productAcceptance = await verifyProductEvidence(report, config, clients);
       } catch (error) {
@@ -1287,6 +2657,21 @@ async function main() {
     const closeFailure = closeResults.find((result) => result.status === "rejected");
     if (closeFailure) applyCloseDrainFailure(report, closeFailure.reason);
     for (const unsubscribe of observers) unsubscribe();
+    if (mediaFamilyCase) {
+      for (const [caseId, verified] of verifiedMediaSnapshots) {
+        if (
+          JSON.stringify(recorder.mediaObservationSnapshot(caseId)) !== JSON.stringify(verified)
+        ) {
+          report.status = "INCONCLUSIVE";
+          report.productAcceptance = {
+            ...report.productAcceptance,
+            status: "INCONCLUSIVE",
+            code: "MEDIA_OBSERVATION_CHANGED",
+          };
+        }
+      }
+      if (pendingMediaFixtureCreated && report.status !== "PASS") report.cleanupStopRequired = true;
+    }
     if (command === "run" && recorder.cases.length > 0) {
       const finalStatus = recorder.finalize();
       if (report.status === "PASS") report.status = finalStatus;
@@ -1302,6 +2687,119 @@ async function main() {
         if (report.transportOnly) report.transportStatus = finalStatus;
       }
     }
+    if (
+      pendingGroupPolicyFixtureCreated &&
+      ((report.status === "PASS" &&
+        report.groupPolicyAcceptance?.status === "GROUP_POLICY_WORKFLOW_VERIFIED") ||
+        (report.status === "FAIL" && groupPolicyRestoredFeatureFailure(report)))
+    ) {
+      try {
+        if (
+          closeResults.some((result) => result.status !== "fulfilled") ||
+          clients.driver.closed !== true ||
+          clients.bot.closed !== true ||
+          clients.driver.pending.size !== 0 ||
+          clients.bot.pending.size !== 0
+        )
+          fail("GROUP_POLICY_DRAIN_UNCONFIRMED", "群策略观察连接没有完成排空。", "INCONCLUSIVE");
+        report.groupPolicyFinalStateProof = recheckGroupPolicyFinalState();
+      } catch (error) {
+        report.status = "INCONCLUSIVE";
+        report.error = safeError(error);
+        report.groupPolicyAcceptance = {
+          ...report.groupPolicyAcceptance,
+          status: "INCONCLUSIVE",
+          requiresReconciliation: true,
+          actualQqDeliveryVerified: false,
+        };
+        report.productAcceptance = {
+          ...report.productAcceptance,
+          status: "INCONCLUSIVE",
+          cleanupVerified: false,
+          code: report.error.code,
+        };
+        report.cleanupStopRequired = true;
+      }
+    }
+    if (
+      pendingGroupMembersPolicyFixtureCreated &&
+      report.status === "PASS" &&
+      report.groupMembersPolicyAcceptance?.status === "GROUP_MEMBERS_POLICY_BOUNDARY_VERIFIED"
+    ) {
+      try {
+        if (
+          closeResults.some((result) => result.status !== "fulfilled") ||
+          clients.driver.closed !== true ||
+          clients.bot.closed !== true ||
+          clients.driver.pending.size !== 0 ||
+          clients.bot.pending.size !== 0
+        )
+          fail(
+            "GROUP_MEMBERS_POLICY_DRAIN_UNCONFIRMED",
+            "群成员权限观察连接没有完成排空。",
+            "INCONCLUSIVE",
+          );
+        report.groupMembersPolicyFinalStateProof = recheckGroupMembersPolicyFinalState();
+      } catch (error) {
+        report.status = "INCONCLUSIVE";
+        report.error = safeError(error);
+        report.groupMembersPolicyAcceptance = {
+          ...report.groupMembersPolicyAcceptance,
+          status: "INCONCLUSIVE",
+          requiresReconciliation: true,
+          actualQqDeliveryVerified: false,
+        };
+        report.productAcceptance = {
+          ...report.productAcceptance,
+          status: "INCONCLUSIVE",
+          cleanupVerified: false,
+          code: report.error.code,
+        };
+        report.cleanupStopRequired = true;
+      }
+    }
+    if (command === "resume-media" && report.status === "PASS") {
+      try {
+        if (
+          closeResults.some((result) => result.status !== "fulfilled") ||
+          clients.driver.closed !== true ||
+          clients.bot.closed !== true ||
+          clients.driver.pending.size !== 0 ||
+          clients.bot.pending.size !== 0 ||
+          !mediaRecoveryEvidence ||
+          !mediaRecoveryVideoCase ||
+          !mediaRecoveryVideoAcceptance
+        )
+          fail(
+            "MEDIA_RECOVERY_DRAIN_UNCONFIRMED",
+            "媒体恢复观察连接没有完成排空。",
+            "INCONCLUSIVE",
+          );
+        const { verifyMediaRecoveryAppendOnly } = await import("./lib/media-recovery.mjs");
+        mediaRecoveryFinalProof = await verifyMediaRecoveryAppendOnly(mediaRecoveryPlan, {
+          config,
+          expectedRuntime: report.runtime,
+          reportDirectory: runDir,
+          processIdentity: runProcessIdentity,
+          imagePrefixProofSha256: mediaRecoveryEvidence.proofSha256,
+          imagePrefixProductRunId: mediaRecoveryEvidence.productRunId,
+          imagePrefixAssetId: mediaRecoveryEvidence.mediaAcceptance.asset.assetId,
+          videoCase: mediaRecoveryVideoCase,
+          videoAcceptance: mediaRecoveryVideoAcceptance,
+        });
+        report.mediaRecoveryFinalProof = mediaRecoveryFinalProof;
+      } catch (error) {
+        report.status = "INCONCLUSIVE";
+        report.error = safeError(error);
+        report.productAcceptance = {
+          ...report.productAcceptance,
+          status: "INCONCLUSIVE",
+          cleanupVerified: false,
+          code: report.error.code,
+        };
+        report.cleanupStopRequired = true;
+      }
+    }
     process.removeListener("SIGINT", stop);
     process.removeListener("SIGTERM", stop);
     report.finishedAt = new Date().toISOString();
@@ -1312,23 +2810,22 @@ async function main() {
         report.tasteLifecycle?.cleanupConfirmed === true &&
         report.tasteLifecycle?.knownFailure?.terminalProof?.cleanupVerified === true;
       if (
-        report.error?.code === "LEASE_CLEANUP_EVIDENCE" ||
-        report.cleanupStopRequired === true ||
-        productCleanupStopRequired(report.productAcceptance) ||
-        report.cases.some(
-          (c) =>
-            (c.cleanup?.required && !c.cleanup.restored) ||
-            (c.sendAttempted && c.status === "INCONCLUSIVE"),
-        ) ||
-        (pendingFixtureCreated &&
-          (report.memoryLifecycle?.requiresReconciliation !== false ||
-            report.status !== "PASS" ||
-            report.productAcceptance.status !== "PASS")) ||
-        (pendingTasteFixtureCreated &&
-          !tasteKnownFailureCleanupConfirmed &&
-          (report.tasteLifecycle?.requiresReconciliation !== false ||
-            report.status !== "PASS" ||
-            report.productAcceptance.status !== "PASS"))
+        shouldCreateSafetyStop(report, {
+          pendingFixtureCreated,
+          pendingTasteFixtureCreated,
+          pendingTaskWorkerFixtureCreated,
+          pendingGroupPolicyFixtureCreated,
+          pendingGroupMembersPolicyFixtureCreated,
+          pendingModerationFixtureCreated,
+          tasteKnownFailureCleanupConfirmed,
+        }) &&
+        !(
+          command === "resume-media" &&
+          (await lstat(join(out, "STOP")).then(
+            () => true,
+            () => false,
+          ))
+        )
       ) {
         await writeFile(
           join(out, "STOP"),
@@ -1350,30 +2847,295 @@ async function main() {
       if (report.error) lines.push(report.error.message);
       lines.push(
         "",
-        report.productAcceptance.acceptanceKind === "TRANSPORT_ONLY"
-          ? "传输核验通过，但不计入功能覆盖或交付验收。"
-          : report.productAcceptance.status === "PASS"
-            ? `产品证据通过。运行提交 ${report.productAcceptance.runtime.commit}，进程 ${report.productAcceptance.runtime.pid}。`
-            : "产品证据没有通过，不能用于合并。请检查 report.json 中的 productAcceptance。",
+        report.productAcceptance.acceptanceKind === "GROUP_MEMBERS_POLICY_BOUNDARY"
+          ? "群成员权限边界核验通过。结果只证明关闭后的拒绝和策略恢复，不证明允许读取成员人数。"
+          : report.productAcceptance.acceptanceKind === "TRANSPORT_ONLY"
+            ? "传输核验通过，但不计入功能覆盖或交付验收。"
+            : report.productAcceptance.status === "PASS"
+              ? `产品证据通过。运行提交 ${report.productAcceptance.runtime.commit}，进程 ${report.productAcceptance.runtime.pid}。`
+              : "产品证据没有通过，不能用于合并。请检查 report.json 中的 productAcceptance。",
       );
-      await writeFile(join(runDir, "summary.md"), lines.join("\n") + "\n", { mode: 0o600 });
-      await writeJson(join(out, "latest.json"), {
-        status: report.status,
-        mode: command,
-        runId,
-        reportDirectory: runDir,
-        productAcceptance: report.productAcceptance,
-        ...(report.transportOnly
-          ? { transportOnly: true, transportStatus: report.transportStatus }
-          : {}),
-        cases: report.cases.map((c) => ({
-          id: c.id,
-          status: c.status,
-          code: c.code,
-          detail: c.detail,
-        })),
-        error: report.error,
+      await writeFile(join(runDir, "summary.md"), lines.join("\n") + "\n", {
+        mode: 0o600,
       });
+      if (shouldWriteLatest(command, report, mediaRecoveryFinalProof))
+        await writeJson(join(out, "latest.json"), {
+          status: report.status,
+          mode: command,
+          runId,
+          reportDirectory: runDir,
+          productAcceptance: report.productAcceptance,
+          ...(report.mediaRecoveryFinalProof
+            ? { mediaRecoveryFinalProof: report.mediaRecoveryFinalProof }
+            : {}),
+          ...(report.mediaFamilyAcceptance
+            ? { mediaFamilyAcceptance: report.mediaFamilyAcceptance }
+            : {}),
+          ...(report.groupMembersPolicyAcceptance
+            ? {
+                groupMembersPolicyAcceptance: report.groupMembersPolicyAcceptance,
+              }
+            : {}),
+          ...(report.groupMembersPolicyFinalStateProof
+            ? {
+                groupMembersPolicyFinalStateProof: report.groupMembersPolicyFinalStateProof,
+              }
+            : {}),
+          ...(report.transportOnly
+            ? { transportOnly: true, transportStatus: report.transportStatus }
+            : {}),
+          cases: report.cases.map((c) => ({
+            id: c.id,
+            status: c.status,
+            code: c.code,
+            detail: c.detail,
+          })),
+          error: report.error,
+        });
+      if (
+        pendingGroupPolicyFixtureCreated &&
+        groupPolicyCompletionSafe(report) &&
+        groupPolicyExecution
+      ) {
+        try {
+          for (const path of [join(runDir, "report.json"), join(out, "latest.json")]) {
+            const file = await open(path, "r");
+            try {
+              await file.sync();
+            } finally {
+              await file.close();
+            }
+          }
+          await syncDirectory(runDir);
+          await syncDirectory(out);
+          const guard = await groupPolicyExecution.complete({
+            reportPath: join(runDir, "report.json"),
+            connectionsDrained: true,
+            recheck: recheckGroupPolicyFinalState,
+          });
+          pendingGroupPolicyFixtureCreated = false;
+          await writeJson(join(out, "latest.json"), {
+            status: report.status,
+            mode: command,
+            runId,
+            reportDirectory: runDir,
+            productAcceptance: report.productAcceptance,
+            groupPolicyAcceptance: report.groupPolicyAcceptance,
+            groupPolicyGuardLifecycle: guard,
+            groupPolicyFinalStateProof: report.groupPolicyFinalStateProof,
+            cases: report.cases.map((c) => ({
+              id: c.id,
+              status: c.status,
+              code: c.code,
+              detail: c.detail,
+            })),
+            error: report.error,
+          });
+        } catch (error) {
+          report.status = "INCONCLUSIVE";
+          report.error = safeError(error);
+          report.groupPolicyAcceptance = {
+            ...report.groupPolicyAcceptance,
+            status: "INCONCLUSIVE",
+            requiresReconciliation: true,
+            actualQqDeliveryVerified: false,
+          };
+          report.productAcceptance = {
+            ...report.productAcceptance,
+            status: "INCONCLUSIVE",
+            cleanupVerified: false,
+            code: report.error.code,
+          };
+          report.cleanupStopRequired = true;
+          report.safetyStopCreated = true;
+          await writeFile(
+            join(out, "STOP"),
+            "GROUP_POLICY_COMPLETION_UNCONFIRMED\n请核对群策略检查点与报告后再恢复测试。\n",
+            { mode: 0o600 },
+          );
+          await writeJson(join(runDir, "report.json"), report);
+          lines[2] = `结果 ${report.status}`;
+          lines.push(report.error.message);
+          await writeFile(join(runDir, "summary.md"), lines.join("\n") + "\n", {
+            mode: 0o600,
+          });
+          await writeJson(join(out, "latest.json"), {
+            status: report.status,
+            mode: command,
+            runId,
+            reportDirectory: runDir,
+            productAcceptance: report.productAcceptance,
+            groupPolicyAcceptance: report.groupPolicyAcceptance,
+            groupPolicyFinalStateProof: report.groupPolicyFinalStateProof,
+            error: report.error,
+          });
+        }
+      }
+      if (
+        pendingGroupMembersPolicyFixtureCreated &&
+        groupMembersPolicyCompletionSafe(report) &&
+        groupMembersPolicyExecution
+      ) {
+        try {
+          for (const path of [join(runDir, "report.json"), join(out, "latest.json")]) {
+            const file = await open(path, "r");
+            try {
+              await file.sync();
+            } finally {
+              await file.close();
+            }
+          }
+          await syncDirectory(runDir);
+          await syncDirectory(out);
+          const guard = await groupMembersPolicyExecution.complete({
+            reportPath: join(runDir, "report.json"),
+            connectionsDrained: true,
+            recheck: recheckGroupMembersPolicyFinalState,
+          });
+          pendingGroupMembersPolicyFixtureCreated = false;
+          await writeJson(join(out, "latest.json"), {
+            status: report.status,
+            mode: command,
+            runId,
+            reportDirectory: runDir,
+            productAcceptance: report.productAcceptance,
+            groupMembersPolicyAcceptance: report.groupMembersPolicyAcceptance,
+            groupMembersPolicyGuardLifecycle: guard,
+            groupMembersPolicyFinalStateProof: report.groupMembersPolicyFinalStateProof,
+            cases: report.cases.map((c) => ({
+              id: c.id,
+              status: c.status,
+              code: c.code,
+              detail: c.detail,
+            })),
+            error: report.error,
+          });
+        } catch (error) {
+          report.status = "INCONCLUSIVE";
+          report.error = safeError(error);
+          report.groupMembersPolicyAcceptance = {
+            ...report.groupMembersPolicyAcceptance,
+            status: "INCONCLUSIVE",
+            requiresReconciliation: true,
+            actualQqDeliveryVerified: false,
+          };
+          report.productAcceptance = {
+            ...report.productAcceptance,
+            status: "INCONCLUSIVE",
+            cleanupVerified: false,
+            code: report.error.code,
+          };
+          report.cleanupStopRequired = true;
+          report.safetyStopCreated = true;
+          await writeFile(
+            join(out, "STOP"),
+            "GROUP_MEMBERS_POLICY_COMPLETION_UNCONFIRMED\n请核对群成员权限检查点与报告后再恢复测试。\n",
+            { mode: 0o600 },
+          );
+          await writeJson(join(runDir, "report.json"), report);
+          lines[2] = "结果 " + report.status;
+          lines.push(report.error.message);
+          await writeFile(join(runDir, "summary.md"), lines.join("\n") + "\n", {
+            mode: 0o600,
+          });
+          await writeJson(join(out, "latest.json"), {
+            status: report.status,
+            mode: command,
+            runId,
+            reportDirectory: runDir,
+            productAcceptance: report.productAcceptance,
+            groupMembersPolicyAcceptance: report.groupMembersPolicyAcceptance,
+            groupMembersPolicyFinalStateProof: report.groupMembersPolicyFinalStateProof,
+            error: report.error,
+          });
+        }
+      }
+      if (
+        pendingModerationFixtureCreated &&
+        moderationCompletionSafe(report) &&
+        moderationExecution
+      ) {
+        try {
+          for (const path of [join(runDir, "report.json"), join(out, "latest.json")]) {
+            const file = await open(path, "r");
+            try {
+              await file.sync();
+            } finally {
+              await file.close();
+            }
+          }
+          await syncDirectory(runDir);
+          await syncDirectory(out);
+          const guard = await moderationExecution.complete({
+            reportPath: join(runDir, "report.json"),
+            connectionsDrained:
+              closeResults.every((result) => result.status === "fulfilled") &&
+              clients.driver.closed === true &&
+              clients.bot.closed === true &&
+              clients.driver.pending.size === 0 &&
+              clients.bot.pending.size === 0,
+            recheck: recheckModerationFinalState,
+          });
+          report.moderationGuardLifecycle = guard;
+          await writeJson(join(out, "latest.json"), {
+            status: report.status,
+            mode: command,
+            runId,
+            reportDirectory: runDir,
+            productAcceptance: report.productAcceptance,
+            moderationAcceptance: report.moderationAcceptance,
+            moderationFinalStateProof: report.moderationFinalStateProof,
+            moderationGuardLifecycle: guard,
+            cases: report.cases.map((c) => ({
+              id: c.id,
+              status: c.status,
+              code: c.code,
+              detail: c.detail,
+            })),
+            error: report.error,
+          });
+          await syncDirectory(out);
+          await rm(pendingModerationFixturePath);
+          await syncDirectory(lockRoot);
+          pendingModerationFixtureCreated = false;
+        } catch (error) {
+          report.status = "INCONCLUSIVE";
+          report.error = safeError(error);
+          report.moderationAcceptance = {
+            ...report.moderationAcceptance,
+            status: "INCONCLUSIVE",
+            requiresReconciliation: true,
+            cleanupVerified: false,
+            actualQqDeliveryVerified: false,
+          };
+          report.productAcceptance = {
+            ...report.productAcceptance,
+            status: "INCONCLUSIVE",
+            cleanupVerified: false,
+            code: report.error.code,
+          };
+          report.cleanupStopRequired = true;
+          report.safetyStopCreated = true;
+          await writeFile(
+            join(out, "STOP"),
+            "MODERATION_COMPLETION_UNCONFIRMED\n请核对禁言和解禁检查点后再恢复。\n",
+            { mode: 0o600 },
+          );
+          await writeJson(join(runDir, "report.json"), report);
+          lines[2] = `结果 ${report.status}`;
+          lines.push(report.error.message);
+          await writeFile(join(runDir, "summary.md"), lines.join("\n") + "\n", { mode: 0o600 });
+          await writeJson(join(out, "latest.json"), {
+            status: report.status,
+            mode: command,
+            runId,
+            reportDirectory: runDir,
+            productAcceptance: report.productAcceptance,
+            moderationAcceptance: report.moderationAcceptance,
+            error: report.error,
+          });
+        }
+      }
       if (
         pendingFixtureCreated &&
         report.status === "PASS" &&
@@ -1388,7 +3150,141 @@ async function main() {
         await rm(pendingTasteFixturePath);
         await syncDirectory(lockRoot);
       }
+      if (pendingTaskWorkerFixtureCreated && report.status === "PASS") {
+        try {
+          report.taskWorkerFinalState = await recheckTaskTerminal();
+          if (closeResults.some((result) => result.status !== "fulfilled"))
+            fail("TASK_WORKER_DRAIN", "Worker 测试观察连接没有完成关闭。", "INCONCLUSIVE");
+          const { completeTaskWorkerCheckpoint } = await import("./lib/task-worker-checkpoint.mjs");
+          for (const path of [join(runDir, "report.json"), join(out, "latest.json")]) {
+            const file = await open(path, "r");
+            try {
+              await file.sync();
+            } finally {
+              await file.close();
+            }
+          }
+          await syncDirectory(runDir);
+          await syncDirectory(out);
+          report.taskWorkerGuardLifecycle = await completeTaskWorkerCheckpoint({
+            pendingPath: pendingTaskWorkerFixturePath,
+            reportDirectory: runDir,
+            identity: taskCheckpointIdentity,
+            receipts: taskReceipts,
+            drainReceipt: Object.fromEntries(
+              ["driver", "bot"].map((role) => [
+                role,
+                {
+                  closed: clients[role].closed,
+                  pendingCount: clients[role].pending.size,
+                },
+              ]),
+            ),
+          });
+          await writeJson(join(runDir, "report.json"), report);
+        } catch (error) {
+          report.status = "INCONCLUSIVE";
+          report.error = safeError(error);
+          report.cleanupStopRequired = true;
+          report.safetyStopCreated = true;
+          await writeFile(
+            join(out, "STOP"),
+            "TASK_WORKER_COMPLETION_UNCONFIRMED\n请核对 Worker 检查点与报告后再恢复测试。\n",
+            { mode: 0o600 },
+          );
+          await writeJson(join(runDir, "report.json"), report);
+        }
+        await writeJson(join(out, "latest.json"), {
+          status: report.status,
+          mode: command,
+          runId,
+          reportDirectory: runDir,
+          taskWorkerGuardLifecycle: report.taskWorkerGuardLifecycle,
+          productAcceptance: report.productAcceptance,
+          error: report.error,
+        });
+      }
+      if (
+        pendingMediaFixtureCreated &&
+        command === "run" &&
+        report.status === "PASS" &&
+        report.productAcceptance.status === "PASS" &&
+        report.mediaFamilyAcceptance?.status === "PASS" &&
+        report.productAcceptance.cleanupVerified === true
+      ) {
+        for (const path of [join(runDir, "report.json"), join(out, "latest.json")]) {
+          const file = await open(path, "r");
+          try {
+            await file.sync();
+          } finally {
+            await file.close();
+          }
+        }
+        await syncDirectory(runDir);
+        await syncDirectory(out);
+        await rm(pendingMediaFixturePath);
+        await syncDirectory(lockRoot);
+      }
+      if (
+        command === "resume-media" &&
+        mediaRecoveryFinalProof &&
+        report.status === "PASS" &&
+        report.productAcceptance.status === "PASS"
+      ) {
+        for (const path of [join(runDir, "report.json"), join(out, "latest.json")]) {
+          const file = await open(path, "r");
+          try {
+            await file.sync();
+          } finally {
+            await file.close();
+          }
+        }
+        await syncDirectory(runDir);
+        await syncDirectory(out);
+        const { releaseMediaRecoveryGuards } = await import("./lib/media-recovery.mjs");
+        try {
+          await releaseMediaRecoveryGuards(mediaRecoveryPlan, mediaRecoveryFinalProof, {
+            finalReportPath: join(runDir, "report.json"),
+            finalLatestPath: join(out, "latest.json"),
+            reportRunId: runId,
+          });
+        } catch (error) {
+          report.status = "INCONCLUSIVE";
+          report.error = safeError(error);
+          report.cleanupStopRequired = true;
+          report.productAcceptance = {
+            ...report.productAcceptance,
+            status: "INCONCLUSIVE",
+            cleanupVerified: false,
+            code: report.error.code,
+          };
+          if (
+            !(await lstat(join(out, "STOP")).then(
+              () => true,
+              () => false,
+            ))
+          )
+            await writeFile(
+              join(out, "STOP"),
+              "MEDIA_RECOVERY_RELEASE_UNCONFIRMED\n请核对媒体恢复发布意图和报告后再恢复测试。\n",
+              { mode: 0o600 },
+            );
+          report.safetyStopCreated = true;
+          await writeJson(join(runDir, "report.json"), report);
+          await writeJson(join(out, "latest.json"), {
+            status: report.status,
+            mode: command,
+            runId,
+            reportDirectory: runDir,
+            productAcceptance: report.productAcceptance,
+            mediaFamilyAcceptance: report.mediaFamilyAcceptance,
+            mediaRecoveryFinalProof: report.mediaRecoveryFinalProof,
+            error: report.error,
+          });
+        }
+      }
     } finally {
+      taskDatabase?.close();
       await lock.close();
       await rm(lockPath, { force: true });
     }

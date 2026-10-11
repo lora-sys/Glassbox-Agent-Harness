@@ -86,20 +86,66 @@ function groupInfoEvents(events, runId) {
       event.type === "tool_result" &&
       (event.data?.name === "qq_groups" || event.name === "qq_groups"),
   );
-  const infoCalls = calls.filter((event) => event.data?.input?.operation === "get_group_info");
-  if (infoCalls.length !== 1 || calls.length !== 1 || results.length !== 1) invalid();
-  const [call] = infoCalls;
-  const [result] = results;
+  const maxRejectedAttempts = 3;
+  if (calls.length < 1 || calls.length > maxRejectedAttempts + 1 || results.length !== calls.length)
+    invalid();
+  const pairs = [];
+  const ids = new Set();
+  for (const call of calls) {
+    const callId = call.toolCallId;
+    if (
+      typeof callId !== "string" ||
+      !callId ||
+      ids.has(callId) ||
+      call.data?.toolCallId !== callId
+    )
+      invalid();
+    ids.add(callId);
+    const matches = results.filter(
+      (result) => result.toolCallId === callId || result.data?.toolCallId === callId,
+    );
+    if (
+      matches.length !== 1 ||
+      matches[0].toolCallId !== callId ||
+      matches[0].data?.toolCallId !== callId
+    )
+      invalid();
+    pairs.push({
+      call,
+      result: matches[0],
+      callIndex: events.indexOf(call),
+      resultIndex: events.indexOf(matches[0]),
+    });
+  }
   if (
-    events.indexOf(call) >= events.indexOf(result) ||
-    typeof call.toolCallId !== "string" ||
-    !call.toolCallId ||
-    call.data?.toolCallId !== call.toolCallId ||
-    result.toolCallId !== call.toolCallId ||
-    result.data?.toolCallId !== call.toolCallId ||
-    result.data?.isError !== false
+    results.some((result) => !ids.has(result.toolCallId)) ||
+    pairs.some(
+      (pair) => pair.callIndex < 0 || pair.resultIndex < 0 || pair.callIndex >= pair.resultIndex,
+    )
   )
     invalid();
+  pairs.sort((left, right) => left.callIndex - right.callIndex);
+  for (let index = 0; index < pairs.length - 1; index += 1) {
+    const rejected = pairs[index];
+    const input = rejected.call.data?.input;
+    const validInfoInput =
+      isRecord(input) &&
+      Object.keys(input).every((key) => ["groupId", "operation", "params"].includes(key)) &&
+      input.groupId === pairs.at(-1).call.data?.input?.groupId &&
+      input.operation === "get_group_info" &&
+      (input.params === undefined ||
+        (isRecord(input.params) && Object.keys(input.params).length === 0));
+    const failureCode = rejected.result.data?.failureCode;
+    if (
+      rejected.result.data?.isError !== true ||
+      !["input_validation_failed", "acceptance_lease_input_mismatch"].includes(failureCode) ||
+      (failureCode === "input_validation_failed" && validInfoInput) ||
+      rejected.resultIndex >= pairs[index + 1].callIndex
+    )
+      invalid();
+  }
+  const { call, result } = pairs.at(-1);
+  if (call.data?.input?.operation !== "get_group_info" || result.data?.isError !== false) invalid();
   return { call, result };
 }
 
@@ -152,8 +198,11 @@ export function observeGroupInfoResult(assertion, { events, runId }) {
       projection.content[0].type !== "text" ||
       typeof projection.content[0].text !== "string" ||
       !isRecord(projection.details) ||
+      Object.keys(projection.details).sort().join(",") !== "data,status" ||
+      projection.details.status !== "ok" ||
+      !isRecord(projection.details.data) ||
       projection.content[0].text !== JSON.stringify(projection.details) ||
-      canonical(projectGroupInfo(projection.details, expectedGroupId)) !== canonical(safe)
+      canonical(projectGroupInfo(projection.details.data, expectedGroupId)) !== canonical(safe)
     )
       invalid();
   } else if (data.outputTruncated === true) {

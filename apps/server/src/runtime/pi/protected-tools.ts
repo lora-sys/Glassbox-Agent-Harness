@@ -4,12 +4,21 @@ import type { TSchema } from "typebox";
 import type { CallerContext } from "../../identity/scope.js";
 import { AccessDeniedError, type AuthorizationService } from "../../auth/service.js";
 import { ProviderCallError } from "./provider-outcome.js";
+import { OPS_STATE_CODES } from "../../ops/errors.js";
 import { QQ_CAPABILITIES } from "../../channels/onebot/capabilities.js";
+import { safeToolOutput } from "./tool-output-evidence.js";
+import {
+  projectionInputEvidence,
+  unwrapAuthorizationProjection,
+  type ProjectionEnvelope,
+} from "./authorization-projection.js";
 
 export interface ProtectedToolContext {
   caller: CallerContext;
   conversationId: string;
   runId: string;
+  /** Exact Pi Tool call identity, supplied by the runtime rather than Tool arguments. */
+  toolCallId?: string;
   /**
    * The Tool the *current user message* requires, when it requires one.
    *
@@ -21,6 +30,21 @@ export interface ProtectedToolContext {
   /** The exact input the current user message requires of that Tool. */
   requiredToolInput?: Record<string, unknown>;
   acceptanceLease?: import("./types.js").PiRunContext["acceptanceLease"];
+  recordQqToolExecutionInput?: import("./types.js").PiRunContext["recordQqToolExecutionInput"];
+  /** Installed only after Glassbox authorization allows the protected call. */
+  onVerifiedInput?: (input: {
+    action: string;
+    resourceId: string;
+    toolInput: Readonly<Record<string, unknown>>;
+  }) => Promise<void>;
+}
+
+export interface VerifiedProtectedToolInput {
+  toolCallId: string;
+  toolName: string;
+  action: string;
+  resourceId: string;
+  toolInput: Readonly<Record<string, unknown>>;
 }
 
 /**
@@ -61,7 +85,24 @@ export class ToolAuthorizationError extends Error {
  * report "the Tool failed" for a refusal the Owner's message had caused, tell the user the
  * instruction had been recorded, and write nothing.
  */
+const ACCEPTANCE_LEASE_FAILURE_CODES: ReadonlySet<string> = new Set([
+  "acceptance_lease_unavailable",
+  "acceptance_lease_expired",
+  "acceptance_lease_tool_mismatch",
+  "acceptance_lease_action_mismatch",
+  "acceptance_lease_resource_mismatch",
+  "acceptance_lease_input_mismatch",
+]);
+
 const TOOL_GATE_CODES: ReadonlySet<string> = new Set([
+  ...OPS_STATE_CODES,
+  "acceptance_lease_denied",
+  "acceptance_lease_unavailable",
+  "acceptance_lease_expired",
+  "acceptance_lease_tool_mismatch",
+  "acceptance_lease_action_mismatch",
+  "acceptance_lease_resource_mismatch",
+  "acceptance_lease_input_mismatch",
   // The Owner's own message did not carry the literal command this mutation requires.
   "owner_confirmation_required",
   "owner_private_required",
@@ -158,11 +199,16 @@ export interface ProtectedToolOptions<
   resourceId: string | ((params: TParams, context: ProtectedToolContext) => string);
   authService: AuthorizationService;
   getContext: () => ProtectedToolContext | undefined;
+  /** Called only after authorization ALLOW; capability execution supplies normalized input. */
+  onVerifiedInput?: (
+    input: VerifiedProtectedToolInput,
+    context: ProtectedToolContext,
+  ) => Promise<void>;
   execute: (
     params: TParams,
     context: ProtectedToolContext,
     signal?: AbortSignal,
-  ) => Promise<TResult>;
+  ) => Promise<TResult | ProjectionEnvelope<TResult>>;
   redactSensitive?: (params: TParams) => Record<string, unknown>;
   /**
    * Builds the text the model receives, when the raw result must not be shown verbatim.
@@ -364,6 +410,7 @@ export function createProtectedTool<
       }
 
       const typedParams = (params ?? {}) as TParams;
+      const toolContext: ProtectedToolContext = { ...context, toolCallId: _id };
       const resourceId =
         typeof options.resourceId === "function"
           ? options.resourceId(typedParams, context)
@@ -373,15 +420,28 @@ export function createProtectedTool<
           ? options.action(typedParams, context)
           : options.action;
 
-      const leaseAllows = () =>
-        !context.acceptanceLease ||
-        context.acceptanceLease.checkToolCall({
-          toolName: options.name,
-          action,
-          resourceId,
-          toolInput: typedParams,
-        });
-      if (!leaseAllows()) throw new ToolInputError("acceptance_lease_denied");
+      const leaseFailure = (): string | null => {
+        const lease = context.acceptanceLease;
+        if (!lease) return null;
+        try {
+          const call = {
+            toolName: options.name,
+            action,
+            resourceId,
+            toolInput: typedParams,
+          };
+          if (lease.checkToolCall(call)) return null;
+          const diagnostic = lease.diagnoseToolCall?.(call);
+          return diagnostic && ACCEPTANCE_LEASE_FAILURE_CODES.has(diagnostic)
+            ? diagnostic
+            : "acceptance_lease_denied";
+        } catch {
+          // A lease callback failure must refuse the call without exposing callback details.
+          return "acceptance_lease_unavailable";
+        }
+      };
+      const initialLeaseFailure = leaseFailure();
+      if (initialLeaseFailure) throw new ToolInputError(initialLeaseFailure);
 
       // Gate 3 — Re-authorize immediately before executing side effect!
       const request = {
@@ -396,7 +456,8 @@ export function createProtectedTool<
 
       // Authorization checks may be asynchronous. Recheck the short-lived lease directly
       // before effects so an expiry or management revocation during that check takes effect.
-      if (!leaseAllows()) throw new ToolInputError("acceptance_lease_denied");
+      const finalLeaseFailure = leaseFailure();
+      if (finalLeaseFailure) throw new ToolInputError(finalLeaseFailure);
 
       if (decision.decision !== "ALLOW") {
         // Redact any confidential arguments from the denial output. Never echo raw parameters.
@@ -407,8 +468,22 @@ export function createProtectedTool<
         throw new Error("Operation cancelled");
       }
 
+      if (options.onVerifiedInput) {
+        toolContext.onVerifiedInput = async (input) =>
+          options.onVerifiedInput!(
+            {
+              toolCallId: _id,
+              toolName: options.name,
+              ...input,
+            },
+            toolContext,
+          );
+      }
+
       try {
-        const result = await options.execute(typedParams, context, signal);
+        const rawResult = await options.execute(typedParams, toolContext, signal);
+        const projection = unwrapAuthorizationProjection<TResult>(rawResult);
+        const result = projection ? projection.result : (rawResult as TResult);
         if (signal?.aborted) {
           throw new Error("Operation cancelled");
         }
@@ -429,7 +504,7 @@ export function createProtectedTool<
         } else if (deliverySource) {
           await options.authService.markDeliverySource(decision.id, deliverySource);
         }
-        return {
+        const toolResult: AgentToolResult<TResult> = {
           content: [
             {
               type: "text",
@@ -442,6 +517,31 @@ export function createProtectedTool<
           ],
           details: result,
         };
+        if (projection) {
+          const actualInput = projectionInputEvidence(typedParams);
+          const projectedInput = projectionInputEvidence(projection.metadata.input);
+          if (
+            !toolContext.toolCallId ||
+            actualInput.inputSha256 !== projectedInput.inputSha256 ||
+            actualInput.inputBytes !== projectedInput.inputBytes
+          )
+            throw new ToolInputError("authorization_projection_binding_failed");
+          const normalized = safeToolOutput(options.name, toolResult);
+          if (
+            typeof normalized.outputSha256 !== "string" ||
+            typeof normalized.outputBytes !== "number"
+          )
+            throw new ToolInputError("authorization_projection_binding_failed");
+          await projection.metadata.record({
+            context: toolContext,
+            input: actualInput,
+            output: {
+              outputSha256: normalized.outputSha256,
+              outputBytes: normalized.outputBytes,
+            },
+          });
+        }
+        return toolResult;
       } catch (error) {
         if (
           signal?.aborted ||

@@ -193,7 +193,7 @@ When a requirement is ambiguous, choose the smaller implementation that preserve
 
 Do not silently expand scope from the roadmap.
 
-P4A, P4B, the repository transition refactor, the P5 context-budgeting and observability plans, and the Issue #24 closeout are complete. The durable long work plan `.plans/06-durable-long-work.md` (Issue #33) records the Herdr Worker and delivery safety foundation; Issue #30 is the Linux-native acceptance prerequisite. Beyond those, no plan is active: take the next scope from the open Issues in `.plans/roadmap.md`, and keep the completed plans as records.
+P4A, P4B, the repository transition refactor, and the P5 context-budgeting and observability plans are complete. Issue #24 closeout code has merged, but real QQ Owner delegation acceptance remains open in `.plans/issue-24-closeout.md`. The durable long work implementation is recorded in `.plans/06-durable-long-work.md`; Issue #33 is closed and its remaining Linux-native acceptance is tracked by Issue #30. The backend audit implementation merged in PR #136; its plan retains unverified acceptance and review hypotheses as historical context. Read the status and evidence in each plan, and take new scope from the open Issues in `.plans/roadmap.md`. Do not treat merged implementation or a closed development issue as proof of real-environment acceptance.
 
 Read in this order before changing code:
 
@@ -208,7 +208,7 @@ Read in this order before changing code:
 
 | Topic | Source of truth |
 | --- | --- |
-| Durable long work and Herdr Worker foundation | `.plans/06-durable-long-work.md` and Issue #33 |
+| Durable long work and Herdr Worker foundation | `.plans/06-durable-long-work.md`; closed Issue #33, remaining acceptance in Issue #30 |
 | Delivery-source reauthorization and Herdr Worker closeout | `.plans/issue-24-closeout.md` and Issue #24 |
 | Completed P5 context budgeting and runtime efficiency | `.plans/05a-context-budgeting-runtime-efficiency.md` and Issue #13 |
 | Completed P5 routing and runtime observability | `.plans/05b-routing-runtime-observability.md` and Issue #14 |
@@ -216,6 +216,12 @@ Read in this order before changing code:
 | Completed P4A Memory / Taste implementation and acceptance record | `.plans/04a-memory-taste.md` and Issue #9 |
 | Completed P4B retrieval / QQ history implementation and acceptance record | `.plans/04b-authorized-retrieval-history.md` and Issue #10 |
 | Completed P3 trust / QQ / Agent Ops foundation | `.plans/03-personal-agent-foundation.md` |
+| Completed Web Search, Fetch and browser foundation | `.plans/05-web-search-fetch-browser.md` and closed Issue #20 |
+| Merged backend audit repairs and remaining acceptance | `.plans/audit-remediation-2026-10-02.md` and merged PR #136 |
+| Owner control and group pilot plan | `.plans/03-plus-owner-control-smoke.md` and closed planning Issue #123 |
+| Linux runtime migration and real-environment acceptance | `docs/linux-runtime-migration.md` and open Issue #30 |
+| Documentation freshness audit and remaining local-only items | `.plans/issue-156-doc-freshness.md` |
+| Repository trace investigation skill | `.agents/skills/glassbox-ops/SKILL.md` and its `references/trace-events.md` |
 | Product sequencing after the active Plan | `.plans/roadmap.md` |
 | Runtime ownership and Pi SDK boundary | `docs/runtime-strategy.md` |
 | Lora PI Kit distribution, bundled Skills, MCP, profiles, install, locks | `docs/lora-pi-kit.md` |
@@ -386,7 +392,7 @@ Use isolated and disposable state for:
 ```text
 Pi configuration and sessions
 Lora PI Kit test profiles / package fixtures
-Turso / SQLite test databases
+libSQL / SQLite test databases
 QQ / OneBot fixtures
 Herdr sessions and worktrees
 repositories

@@ -118,6 +118,18 @@ through the current OneBot connection.
 
 Group history remains a protected source and is authorized before retrieval.
 
+For private acceptance receipt recovery, the pinned action is
+`get_friend_msg_history`, declared by `ActionName.GetFriendMsgHistory` in
+`packages/napcat-onebot/action/router.ts` and implemented in
+`packages/napcat-onebot/action/go-cqhttp/GetFriendMsgHistory.ts`. Its payload
+requires `user_id` and `count`; `message_seq`, `reverse_order`,
+`disable_get_url`, `parse_mult_msg`, `quick_reply`, and the compatibility
+`reverseOrder` are optional. Its response is `{ messages: [...] }`. The live
+acceptance adapter uses only the configured Bot as `user_id`, requests at most
+20 records, disables URL fetching, and returns message hashes and identifiers
+without exposing message text. This is a fixed audit read, not a model Tool or
+a general history search surface.
+
 The pinned `GetGroupMsgHistory` action treats `message_seq` as an opaque short message id.
 It resolves that id through `MessageUnique` before calling QQ. Response `message_seq` values
 are short ids too, so they are not chronological counters. To walk older pages, select the

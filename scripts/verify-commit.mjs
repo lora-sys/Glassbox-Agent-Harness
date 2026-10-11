@@ -37,11 +37,21 @@ const FULL_TEST_FALLBACK = [
   ],
 ];
 
+/** Git hooks export repository selectors which must not escape into disposable test repos. */
+function verificationChildEnvironment(environment = process.env) {
+  const child = { ...environment };
+  for (const key of Object.keys(child)) {
+    if (key.startsWith("GIT_")) delete child[key];
+  }
+  return child;
+}
+
 function run(command, args) {
   console.log(`\n> ${command} ${args.join(" ")}`);
   const result = spawnSync(command, args, {
     cwd: process.cwd(),
     stdio: "inherit",
+    env: verificationChildEnvironment(),
     shell: false,
   });
 
@@ -58,6 +68,7 @@ function capture(command, args) {
   const result = spawnSync(command, args, {
     cwd: process.cwd(),
     encoding: "utf8",
+    maxBuffer: 64 * 1024 * 1024,
     shell: false,
   });
 
@@ -273,8 +284,12 @@ function discoverQqLiveTests(repoRoot = fileURLToPath(new URL("../", import.meta
 }
 
 const SCRIPT_TESTS = [
+  "scripts/test/check-test-hygiene.test.mjs",
   "scripts/test/dependency-snapshot.test.mjs",
   "scripts/service-source-identity.test.mjs",
+  "scripts/test/agent-service-source-identity.test.mjs",
+  "scripts/test/service-shutdown.test.mjs",
+  "scripts/test/agent-service-shutdown.integration.test.mjs",
   ...discoverQqLiveTests(),
   ".agents/skills/qq-live-testing/scripts/helpers.test.mjs",
   ".claude/skills/qq-live-testing/scripts/helpers.test.mjs",
@@ -306,6 +321,8 @@ function runStagedChecks(entries) {
 }
 
 export {
+  verificationChildEnvironment,
+  capture,
   discoverQqLiveTests,
   canReuseTestCache,
   getTestIntegrityIssues,

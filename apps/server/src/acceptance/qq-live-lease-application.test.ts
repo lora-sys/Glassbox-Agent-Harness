@@ -15,6 +15,7 @@ import {
 } from "./qq-live-lease.js";
 import type { PiRunContext } from "../runtime/pi/types.js";
 import { OWNER_MODEL_ADMIN_TOOL } from "../runtime/pi/owner-model-tools.js";
+import { scopeKey } from "../identity/scope.js";
 
 const fixtures = createApplicationFixtureScope();
 const piModelProfile = {
@@ -147,81 +148,441 @@ describe("QQ live lease application wiring", () => {
     expect(internals.qqLiveRunBindings.has(latest.id)).toBe(false);
   });
 
-  it("revokes a lease when a queued Run finishes before its binding is recorded", async () => {
+  it("holds an early queued acceptance Run until its exact binding is ready", async () => {
     const fixture = await fixtures.fixture(
       async (input) => ({ status: "succeeded", text: input.text }),
       { executionRef: "pi:lease-fixture", piModelProfile },
     );
-    const marker = "fedcba0987654321fedcba0987654321";
-    const text = `GLASSBOX_ACCEPTANCE_V1 ${marker}\nReply with one word.`;
-    const registration = await fixture.app.registerQqLiveLease({
-      scope: {
-        connectionId: "fixture",
-        botId: "10001",
-        chatType: "private",
-        chatId: "10002",
-        senderId: "10002",
-      },
-      marker,
-      textSha256: canonicalQqLiveTextSha256(text),
-      ttlMs: 60_000,
-      expiresAt: Date.now() + 60_000,
-      tools: [],
-    });
-    const conversations = fixture.app.store.conversations;
-    const acceptIncoming = conversations.acceptIncoming.bind(conversations);
-    let completeInterleaving!: (result: { runId: string; error?: unknown }) => void;
-    const interleavingComplete = new Promise<{ runId: string; error?: unknown }>(
-      (resolve) => (completeInterleaving = resolve),
-    );
-    vi.spyOn(conversations, "acceptIncoming").mockImplementation(async (input) => {
-      const accepted = await acceptIncoming(input);
-      try {
-        await fixture.app.runs.enqueueAccepted(accepted);
-        const terminalRun = await fixture.app.runs.waitForRun(accepted.caller, accepted.run.id);
-        expect(terminalRun).toMatchObject({ status: "failed", failureCode: "gate_refused" });
-        await fixture.app.runs.drain();
-        completeInterleaving({ runId: accepted.run.id });
-      } catch (error) {
-        completeInterleaving({ runId: accepted.run.id, error });
-      }
-      return accepted;
-    });
-
-    fixture.send(705, text, true);
-    const interleaving = await interleavingComplete;
-    if (interleaving.error) throw interleaving.error;
-    const terminalRunId = interleaving.runId;
-    await vi.waitFor(async () => {
-      const audit = await readFile(
-        join(fixture.directory, "qq-live-acceptance-audit.jsonl"),
-        "utf8",
-      );
-      expect(audit).toContain('"event":"run_bound"');
-      expect(audit).toContain('"event":"lease_revoked"');
-    });
-
-    const internals = fixture.app as unknown as {
-      qqLiveLeases: QqLiveLeaseRegistry;
-      qqLiveRunBindings: Map<string, unknown>;
-    };
-    const acceptedScope = {
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("isolated provider fixture"));
+    const captureSpy = vi.spyOn(fixture.app.store.learning, "captureCurrentMessage");
+    const scope = {
       connectionId: "fixture",
       botId: "10001",
       chatType: "private" as const,
       chatId: "10002",
       senderId: "10002",
     };
+    const caller = await fixture.app.store.identities.resolve(scope);
+    if (!caller) throw new Error("Owner caller was not restored");
+
+    fixture.send(708, "我喜欢简洁的回答。", true);
+    let ordinaryRun:
+      | Awaited<ReturnType<typeof fixture.app.store.management.listRuns>>["items"][number]
+      | undefined;
+    await vi.waitFor(async () => {
+      ordinaryRun = (await fixture.app.store.management.listRuns("owner")).items[0];
+      expect(ordinaryRun?.status).not.toBe("queued");
+      expect(ordinaryRun?.status).not.toBe("running");
+      expect(ordinaryRun?.status).not.toBe("cancelling");
+      expect(captureSpy).toHaveBeenCalledTimes(1);
+    });
+    if (!ordinaryRun) throw new Error("ordinary Owner message did not create a Run");
+    const ordinaryCandidates = await fixture.app.store.learning.listCandidates({ caller });
+    expect(
+      ordinaryCandidates.some((candidate) => candidate.source.ref === "run:" + ordinaryRun!.id),
+    ).toBe(true);
+
+    const marker = "aabbccddeeff00112233445566778899";
+    const acceptanceText = "GLASSBOX_ACCEPTANCE_V1 " + marker + "\n我喜欢简洁的回答。";
+    const internals = fixture.app as unknown as {
+      qqLiveLeases: QqLiveLeaseRegistry;
+      qqLiveRunBindings: Map<string, unknown>;
+      qqLiveAcceptanceHandoffs: Map<
+        string,
+        {
+          key: string;
+          principalId: string;
+          scope: typeof scope;
+          messageId: string;
+          leaseId: string;
+          textSha256: string;
+          settled: boolean;
+          promise: Promise<
+            | {
+                runId: string;
+                runMessageId: string;
+                messageId: string;
+                textSha256: string;
+              }
+            | undefined
+          >;
+        }
+      >;
+    };
+    const registration = await fixture.app.registerQqLiveLease({
+      scope,
+      marker,
+      textSha256: canonicalQqLiveTextSha256(acceptanceText),
+      ttlMs: 60_000,
+      expiresAt: Date.now() + 60_000,
+      tools: [],
+    });
+    const runOptions = (
+      fixture.app.runs as unknown as {
+        options: {
+          beforeExecution: (input: ExecutionInput) => Promise<unknown>;
+          captureLearning: (input: ExecutionInput) => Promise<string | undefined>;
+        };
+      }
+    ).options;
+    const beforeExecution = runOptions.beforeExecution;
+    let gateInput: ExecutionInput | undefined;
+    let gateResult: unknown;
+    let leaseActiveAtGateReturn = false;
+    let handoffAtGate:
+      | {
+          key: string;
+          principalId: string;
+          scope: typeof scope;
+          messageId: string;
+          leaseId: string;
+          textSha256: string;
+          settled: boolean;
+          promise: Promise<unknown>;
+        }
+      | undefined;
+    const beforeExecutionSpy = vi.fn(async (input: ExecutionInput) => {
+      if (input.text === acceptanceText) {
+        gateInput = input;
+        handoffAtGate = [...internals.qqLiveAcceptanceHandoffs.values()].find(
+          (handoff) => !handoff.settled,
+        );
+      }
+      const result = await beforeExecution(input);
+      if (input.text === acceptanceText) {
+        gateResult = result;
+        leaseActiveAtGateReturn = internals.qqLiveLeases.isActive({
+          leaseId: registration.leaseId,
+          principalId: "owner",
+          scope,
+          messageId: "709",
+          runId: input.run.id,
+        });
+      }
+      return result;
+    });
+    runOptions.beforeExecution = beforeExecutionSpy;
+    const captureLearning = runOptions.captureLearning;
+    const captureLearningSpy = vi.fn(captureLearning);
+    runOptions.captureLearning = captureLearningSpy;
+
+    const conversations = fixture.app.store.conversations;
+    const acceptIncoming = conversations.acceptIncoming.bind(conversations);
+    vi.spyOn(conversations, "acceptIncoming").mockImplementation(async (input) => {
+      const accepted = await acceptIncoming(input);
+      if (input.messageId === "709") {
+        // Reproduce a queue poll seeing the committed Run before the ingress callback
+        // receives the accepted row and installs its authenticated handoff.
+        await fixture.app.runs.enqueueAccepted(accepted);
+        await vi.waitFor(() => expect(beforeExecutionSpy).toHaveBeenCalled());
+      }
+      return accepted;
+    });
+
+    fixture.send(709, acceptanceText, true);
+    let acceptanceRun:
+      | Awaited<ReturnType<typeof fixture.app.store.management.listRuns>>["items"][number]
+      | undefined;
+    await vi.waitFor(async () => {
+      const audit = await readFile(
+        join(fixture.directory, "qq-live-acceptance-audit.jsonl"),
+        "utf8",
+      );
+      const bound = audit
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as { event?: string; messageId?: string; runId?: string })
+        .find((event) => event.event === "run_bound" && event.messageId === "709");
+      expect(bound?.runId).toBeTruthy();
+      acceptanceRun = bound?.runId
+        ? (await fixture.app.store.management.listRuns("owner")).items.find(
+            (run) => run.id === bound.runId,
+          )
+        : undefined;
+      expect(acceptanceRun).toBeDefined();
+    });
+    if (!acceptanceRun) throw new Error("acceptance message did not create a Run");
+    await vi.waitFor(() => expect(captureLearningSpy).toHaveBeenCalledTimes(1));
+
+    expect(beforeExecutionSpy).toHaveBeenCalled();
+    expect(gateInput?.run.id).toBe(acceptanceRun.id);
+    expect(handoffAtGate).toBeDefined();
+    expect(handoffAtGate?.key).toBe(
+      JSON.stringify([
+        gateInput?.caller.principalId,
+        scopeKey(gateInput!.caller.scope),
+        gateInput?.caller.scope.senderId,
+        canonicalQqLiveTextSha256(gateInput?.text ?? ""),
+      ]),
+    );
+    const handoffBinding = await handoffAtGate?.promise;
+    expect(gateResult).toBeUndefined();
+    expect(leaseActiveAtGateReturn).toBe(true);
+    expect(handoffBinding).toMatchObject({
+      runId: acceptanceRun.id,
+      runMessageId: gateInput?.run.messageId,
+      messageId: "709",
+      textSha256: canonicalQqLiveTextSha256(acceptanceText),
+    });
+    expect(captureLearningSpy).toHaveBeenCalledTimes(1);
+    expect(captureSpy).toHaveBeenCalledTimes(1);
+    const candidatesAfterAcceptance = await fixture.app.store.learning.listCandidates({ caller });
+    expect(candidatesAfterAcceptance).toEqual(ordinaryCandidates);
+  });
+
+  it("refuses an acceptance Run before learning when its lease expires at the execution gate", async () => {
+    const fixture = await fixtures.fixture(
+      async (input) => ({ status: "succeeded", text: input.text }),
+      { executionRef: "pi:lease-fixture", piModelProfile },
+    );
+    const scope = {
+      connectionId: "fixture",
+      botId: "10001",
+      chatType: "private" as const,
+      chatId: "10002",
+      senderId: "10002",
+    };
+    const marker = "99887766554433221100ffeeddccbbaa";
+    const acceptanceText = "GLASSBOX_ACCEPTANCE_V1 " + marker + "\nReply with one word.";
+    const internals = fixture.app as unknown as { qqLiveLeases: QqLiveLeaseRegistry };
+    let clockNow = Date.now();
+    internals.qqLiveLeases = new QqLiveLeaseRegistry({ now: () => clockNow });
+    const registration = await fixture.app.registerQqLiveLease({
+      scope,
+      marker,
+      textSha256: canonicalQqLiveTextSha256(acceptanceText),
+      ttlMs: 60_000,
+      expiresAt: clockNow + 60_000,
+      tools: [],
+    });
+    const captureSpy = vi.spyOn(fixture.app.store.learning, "captureCurrentMessage");
+    const executeSpy = vi.spyOn(PiRunExecutionAdapter.prototype, "execute");
+    const runOptions = (
+      fixture.app.runs as unknown as {
+        options: { beforeExecution: (input: ExecutionInput) => Promise<unknown> };
+      }
+    ).options;
+    const beforeExecution = runOptions.beforeExecution;
+    let gateCalled = false;
+    runOptions.beforeExecution = vi.fn(async (input: ExecutionInput) => {
+      if (input.text === acceptanceText) {
+        gateCalled = true;
+        clockNow = registration.expiresAt + 1;
+      }
+      return beforeExecution(input);
+    });
+
+    fixture.send(710, acceptanceText, true);
+    let runId: string | undefined;
+    await vi.waitFor(async () => {
+      const audit = await readFile(
+        join(fixture.directory, "qq-live-acceptance-audit.jsonl"),
+        "utf8",
+      );
+      const bound = audit
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as { event?: string; messageId?: string; runId?: string })
+        .find((event) => event.event === "run_bound" && event.messageId === "710");
+      runId = bound?.runId;
+      expect(runId).toBeTruthy();
+    });
+    if (!runId) throw new Error("expired acceptance message did not create a Run");
+    const caller = await fixture.app.store.identities.resolve(scope);
+    if (!caller) throw new Error("Owner caller was not restored");
+    const terminalRun = await fixture.app.runs.waitForRun(caller, runId);
+    expect(terminalRun).toMatchObject({ status: "failed", failureCode: "gate_refused" });
+    expect(gateCalled).toBe(true);
+    expect(captureSpy).not.toHaveBeenCalled();
+    expect(executeSpy).not.toHaveBeenCalled();
+    const trace = await fixture.app.trace.readPage(runId);
+    expect(trace.records.map((record) => record.event)).toContainEqual(
+      expect.objectContaining({
+        type: "run_finished",
+        status: "failed",
+        failureCode: "gate_refused",
+      }),
+    );
+  });
+
+  it("does not capture learning if the lease is revoked after pre-execution validation", async () => {
+    const fixture = await fixtures.fixture(
+      async (input) => ({ status: "succeeded", text: input.text }),
+      { executionRef: "pi:lease-fixture", piModelProfile },
+    );
+    const scope = {
+      connectionId: "fixture",
+      botId: "10001",
+      chatType: "private" as const,
+      chatId: "10002",
+      senderId: "10002",
+    };
+    const marker = "1029384756abcdef1029384756abcdef";
+    const text = "GLASSBOX_ACCEPTANCE_V1 " + marker + "\nReply with one word.";
+    const registration = await fixture.app.registerQqLiveLease({
+      scope,
+      marker,
+      textSha256: canonicalQqLiveTextSha256(text),
+      ttlMs: 60_000,
+      expiresAt: Date.now() + 60_000,
+      tools: [],
+    });
+    const internals = fixture.app as unknown as { qqLiveLeases: QqLiveLeaseRegistry };
+    const captureSpy = vi.spyOn(fixture.app.store.learning, "captureCurrentMessage");
+    const runOptions = (
+      fixture.app.runs as unknown as {
+        options: {
+          beforeExecution: (input: ExecutionInput) => Promise<unknown>;
+          captureLearning: (input: ExecutionInput) => Promise<string | undefined>;
+        };
+      }
+    ).options;
+    const beforeExecution = runOptions.beforeExecution;
+    let guardedRunId: string | undefined;
+    runOptions.beforeExecution = vi.fn(async (input: ExecutionInput) => {
+      if (input.text === text) guardedRunId = input.run.id;
+      return beforeExecution(input);
+    });
+    const captureLearning = runOptions.captureLearning;
+    const captureLearningSpy = vi.fn(captureLearning);
+    runOptions.captureLearning = captureLearningSpy;
+
+    const authorization = fixture.app.store.authorization;
+    const originalCheck = authorization.check.bind(authorization);
+    let revokedAtFreshAuthorization = false;
+    vi.spyOn(authorization, "check").mockImplementation(async (input) => {
+      if (
+        guardedRunId &&
+        input.runId === guardedRunId &&
+        input.action === "run:create" &&
+        !revokedAtFreshAuthorization
+      ) {
+        revokedAtFreshAuthorization = true;
+        internals.qqLiveLeases.revoke(registration.leaseId);
+      }
+      return originalCheck(input);
+    });
+
+    fixture.send(711, text, true);
+    let runId: string | undefined;
+    await vi.waitFor(async () => {
+      const audit = await readFile(
+        join(fixture.directory, "qq-live-acceptance-audit.jsonl"),
+        "utf8",
+      );
+      const bound = audit
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as { event?: string; messageId?: string; runId?: string })
+        .find((event) => event.event === "run_bound" && event.messageId === "711");
+      runId = bound?.runId;
+      expect(runId).toBeTruthy();
+    });
+    if (!runId) throw new Error("revoked acceptance message did not create a Run");
+    const caller = await fixture.app.store.identities.resolve(scope);
+    if (!caller) throw new Error("Owner caller was not restored");
+    const terminalRun = await fixture.app.runs.waitForRun(caller, runId);
+    expect(terminalRun).toMatchObject({ status: "failed", failureCode: "gate_refused" });
+    expect(revokedAtFreshAuthorization).toBe(true);
+    expect(captureLearningSpy).toHaveBeenCalledTimes(1);
+    expect(captureSpy).not.toHaveBeenCalled();
+    const candidates = await fixture.app.store.learning.listCandidates({ caller });
+    expect(candidates).toEqual([]);
+  });
+
+  it("refuses an early queued Run if its lease expires before handoff completion", async () => {
+    const fixture = await fixtures.fixture(
+      async (input) => ({ status: "succeeded", text: input.text }),
+      { executionRef: "pi:lease-fixture", piModelProfile },
+    );
+    const scope = {
+      connectionId: "fixture",
+      botId: "10001",
+      chatType: "private" as const,
+      chatId: "10002",
+      senderId: "10002",
+    };
+    const marker = "fedcba0987654321fedcba0987654321";
+    const text = "GLASSBOX_ACCEPTANCE_V1 " + marker + "\nReply with one word.";
+    let clockNow = Date.now();
+    const internals = fixture.app as unknown as {
+      qqLiveLeases: QqLiveLeaseRegistry;
+      qqLiveRunBindings: Map<string, unknown>;
+    };
+    internals.qqLiveLeases = new QqLiveLeaseRegistry({ now: () => clockNow });
+    const registration = await fixture.app.registerQqLiveLease({
+      scope,
+      marker,
+      textSha256: canonicalQqLiveTextSha256(text),
+      ttlMs: 60_000,
+      expiresAt: clockNow + 60_000,
+      tools: [],
+    });
+    const captureSpy = vi.spyOn(fixture.app.store.learning, "captureCurrentMessage");
+    const executeSpy = vi.spyOn(PiRunExecutionAdapter.prototype, "execute");
+    const runOptions = (
+      fixture.app.runs as unknown as {
+        options: { beforeExecution: (input: ExecutionInput) => Promise<unknown> };
+      }
+    ).options;
+    const beforeExecution = runOptions.beforeExecution;
+    let signalGateStarted!: () => void;
+    const gateStarted = new Promise<void>((resolve) => (signalGateStarted = resolve));
+    runOptions.beforeExecution = vi.fn(async (input: ExecutionInput) => {
+      if (input.text === text) signalGateStarted();
+      return beforeExecution(input);
+    });
+
+    const conversations = fixture.app.store.conversations;
+    const acceptIncoming = conversations.acceptIncoming.bind(conversations);
+    vi.spyOn(conversations, "acceptIncoming").mockImplementation(async (input) => {
+      const accepted = await acceptIncoming(input);
+      if (input.messageId === "705") {
+        await fixture.app.runs.enqueueAccepted(accepted);
+        await gateStarted;
+        clockNow = registration.expiresAt + 1;
+      }
+      return accepted;
+    });
+
+    fixture.send(705, text, true);
+    let queuedRun:
+      | Awaited<ReturnType<typeof fixture.app.store.management.listRuns>>["items"][number]
+      | undefined;
+    await vi.waitFor(async () => {
+      queuedRun = (await fixture.app.store.management.listRuns("owner")).items[0];
+      expect(queuedRun).toBeDefined();
+    });
+    if (!queuedRun) throw new Error("queued acceptance message did not create a Run");
+    const runId = queuedRun.id;
+    const caller = await fixture.app.store.identities.resolve(scope);
+    if (!caller) throw new Error("Owner caller was not restored");
+    const terminalRun = await fixture.app.runs.waitForRun(caller, runId);
+    expect(terminalRun).toMatchObject({ status: "failed", failureCode: "gate_refused" });
+    expect(captureSpy).not.toHaveBeenCalled();
+    expect(executeSpy).not.toHaveBeenCalled();
     expect(
       internals.qqLiveLeases.isActive({
         leaseId: registration.leaseId,
         principalId: "owner",
-        scope: acceptedScope,
+        scope,
         messageId: "705",
-        runId: terminalRunId!,
+        runId,
       }),
     ).toBe(false);
-    expect(internals.qqLiveRunBindings.has(terminalRunId!)).toBe(false);
+    expect(internals.qqLiveRunBindings.has(runId)).toBe(false);
+    const audit = await readFile(join(fixture.directory, "qq-live-acceptance-audit.jsonl"), "utf8");
+    expect(audit).toContain('"event":"message_denied"');
+    expect(audit).toContain('"reason":"run_binding_failed"');
+    expect(audit).not.toContain('"event":"run_bound"');
+    const trace = await fixture.app.trace.readPage(runId);
+    expect(trace.records.map((record) => record.event)).toContainEqual(
+      expect.objectContaining({
+        type: "run_finished",
+        status: "failed",
+        failureCode: "gate_refused",
+      }),
+    );
   });
 
   it("revokes a lease and refuses the Run when run-bound audit persistence fails", async () => {
@@ -358,6 +719,7 @@ describe("QQ live lease application wiring", () => {
       senderId: "10002",
     });
     if (!caller) throw new Error("Owner caller was not restored");
+    const captureSpy = vi.spyOn(reopened.store.learning, "captureCurrentMessage");
     const recoveredRun = await reopened.runs.waitForRun(caller, acceptedRun.id);
     expect(recoveredRun).toMatchObject({ status: "failed", failureCode: "gate_refused" });
     await vi.waitFor(async () => {
@@ -370,6 +732,7 @@ describe("QQ live lease application wiring", () => {
         }),
       );
     });
+    expect(captureSpy).not.toHaveBeenCalled();
     expect(executeSpy).not.toHaveBeenCalled();
     executeSpy.mockRestore();
   });
@@ -587,7 +950,7 @@ describe("QQ live lease application wiring", () => {
         undefined,
         {} as never,
       ),
-    ).rejects.toThrow("acceptance_lease_denied");
+    ).rejects.toThrow("acceptance_lease_action_mismatch");
   });
 
   it("refuses to register a lease for a direct execution backend", async () => {

@@ -1,4 +1,5 @@
 import { OneBotAdapter } from "../channels/onebot/adapter.js";
+import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -254,5 +255,119 @@ it.each([false, true])(
       type: "image",
       data: { file: `base64://${png.toString("base64")}` },
     });
+    const trace = await f.app.trace.readPage(started.run.id);
+    const witnessRows = trace.records.filter(
+      (record) =>
+        (record.event as { type?: unknown }).type === "media_delivery_sent" &&
+        (record.event as { assetId?: unknown }).assetId === asset.id,
+    );
+    expect(witnessRows).toHaveLength(1);
+    expect(witnessRows[0]).toMatchObject({
+      provenance: "glassbox-media-delivery",
+      event: {
+        schemaVersion: 1,
+        runId: started.run.id,
+        deliveryId: deliveries[1]!.id,
+        assetId: asset.id,
+        externalId: deliveries[1]!.externalId,
+        mimeType: "image/png",
+        sizeBytes: png.byteLength,
+        sha256: createHash("sha256").update(png).digest("hex"),
+      },
+    });
+  },
+);
+
+it.each(["append", "advance"] as const)(
+  "does not retry a confirmed media send when witness %s fails",
+  async (failurePoint) => {
+    let complete!: (value: { status: "succeeded"; text: string }) => void;
+    const result = new Promise<{ status: "succeeded"; text: string }>((resolve) => {
+      complete = resolve;
+    });
+    const f = await fixture(async () => result);
+    f.send(775, "生成一张图", true);
+    const started = await f.started.take();
+    const mediaAssets = (
+      f.app as unknown as { mediaAssets: import("../media/media-asset-store.js").MediaAssetStore }
+    ).mediaAssets;
+    const png = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADUlEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAADUlEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+      "base64",
+    );
+    const asset = await mediaAssets.write(
+      {
+        runId: started.run.id,
+        conversationId: started.conversation.id,
+        principalId: started.caller.principalId,
+      },
+      "image/png",
+      png,
+      1024,
+    );
+    let imageSends = 0;
+    const connection = (
+      f.app as unknown as { connections: Map<string, OneBotAdapter> }
+    ).connections.get("fixture")!;
+    vi.spyOn(connection, "send").mockImplementation(async (input) => {
+      if (input.image) imageSends++;
+      return { status: "confirmed", messageId: "confirmed-media-message" };
+    });
+    let witnessAppended = false;
+    let advanceFailureObserved = false;
+    const append = f.app.trace.append.bind(f.app.trace);
+    vi.spyOn(f.app.trace, "append").mockImplementation(async (runId, event, provenance) => {
+      if (
+        typeof event === "object" &&
+        event !== null &&
+        (event as { type?: unknown }).type === "media_delivery_sent"
+      ) {
+        if (failurePoint === "append") throw new Error("witness_write_failed");
+        const cursor = await append(runId, event, provenance);
+        witnessAppended = true;
+        return cursor;
+      }
+      return append(runId, event, provenance);
+    });
+    if (failurePoint === "advance") {
+      const advance = f.app.store.evidence.advanceTrace.bind(f.app.store.evidence);
+      vi.spyOn(f.app.store.evidence, "advanceTrace").mockImplementation(async (caller, cursor) => {
+        if (witnessAppended) {
+          advanceFailureObserved = true;
+          throw new Error("witness_advance_failed");
+        }
+        return advance(caller, cursor);
+      });
+    }
+
+    complete({ status: "succeeded", text: `图片已完成。[asset:${asset.id}]` });
+    await f.app.runs.waitForRun(started.caller, started.run.id);
+    await f.app.runs.drain();
+
+    const deliveries = (await f.app.store.lifecycle.listDeliveries(started.caller, started.run.id))
+      .items;
+    const delivery = deliveries.find((item) => item.payloadKind === "media_artifact")!;
+    expect(delivery.status).toBe("unknown");
+    const trace = await f.app.trace.readPage(started.run.id);
+    expect(trace.records.map((record) => record.event)).toContainEqual(
+      expect.objectContaining({
+        type: "delivery_changed",
+        deliveryId: delivery.id,
+        status: "unknown",
+        reason: "unclassified",
+      }),
+    );
+    const witnesses = trace.records.filter(
+      (record) =>
+        (record.event as { type?: unknown }).type === "media_delivery_sent" &&
+        (record.event as { assetId?: unknown }).assetId === asset.id,
+    );
+    expect(witnesses).toHaveLength(failurePoint === "append" ? 0 : 1);
+    expect(advanceFailureObserved).toBe(failurePoint === "advance");
+    await expect(
+      f.app.runs.retryDelivery(started.caller, started.run.id, delivery.id),
+    ).rejects.toThrow();
+    await f.app.runs.drain();
+    expect(imageSends).toBe(1);
   },
 );

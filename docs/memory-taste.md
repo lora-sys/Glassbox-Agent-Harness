@@ -43,11 +43,11 @@ the source content remains untrusted evidence with group, message, sender, Run a
 authorization provenance. This is a deterministic product path, not proof of a live
 QQ/NapCat acceptance run.
 
-Status: CURRENT DIRECTION / P4A ACTIVE / P4B CONSUMER
+Status: IMPLEMENTED LEARNING BOUNDARY / P4A AND P4B COMPLETE
 
 This document defines the ownership and learning boundary between Rules, Skills, Taste, Feedback, and durable Memory.
 
-P3 is complete. Memory and Taste implementation now belongs to `.plans/04a-memory-taste.md` and Issue #9. Authorized retrieval and QQ history search belong to `.plans/04b-authorized-retrieval-history.md` and Issue #10.
+P3, P4A and P4B are complete. `.plans/04a-memory-taste.md` and Issue #9 record the learning implementation; `.plans/04b-authorized-retrieval-history.md` and Issue #10 record authorized retrieval and QQ history search. The current learning implementation lives in `apps/server/src/learning/`; later sections retain explicitly labeled conceptual designs.
 
 ## Decision
 
@@ -126,20 +126,51 @@ Glassbox owns durable learning truth:
 
 ```text
 FeedbackEvent
-TasteCandidate
-TasteEntry
-confidence
-scope
-promotion / demotion
+MemoryCandidate
+CanonicalMemory
+confidence and scope
+promotion / rejection / lifecycle changes
 retrieval
 visibility and authorization
-provenance
-MemoryCandidate
-Semantic Memory
-Episodic Memory
+source provenance and audit evidence
 ```
 
-Turso is the default structured store for these records.
+The server stores these records in its local libSQL/SQLite database through `@libsql/client`. The format is Turso-compatible; the current database boundary accepts local paths or `:memory:` and has no remote Turso configuration.
+
+### Implemented learning records
+
+- `apps/server/src/learning/contracts.ts` defines `MemoryCandidate` and `FeedbackEvent`
+- `apps/server/src/learning/store.ts` owns candidate creation, feedback, review, promotion and Memory lifecycle operations
+- `packages/contracts/src/memory.ts` defines the shared `CanonicalMemory`, scope, evidence and retention contracts
+- `apps/server/src/persistence/schema.ts` stores `memory_candidates`, `memories`, `feedback_events` and `memory_audit_events`
+
+`MemoryCandidate` carries the following fields. The TypeScript contract is authoritative:
+
+```text
+candidateId
+candidateKind = assertion | confirmation | correction | derived
+subject
+scope = { type: global } | { type: project, projectId } | { type: group, connectionId, botId, groupId }
+proposedType = preference | semantic_fact | episodic_event | relationship
+statement
+content
+source
+sourceEvidence
+confidence?
+sensitivity?
+retentionPolicy?
+ttlSeconds?
+mergeHint
+extensions
+status = pending | promoted | rejected
+createdAt
+reviewedAt?
+promotedMemoryId?
+```
+
+Feedback-derived Taste uses a `MemoryCandidate` with `proposedType = preference` and `extensions["glassbox:taste"] = true`. Promotion uses the shared `CanonicalMemory` contract with `type = preference`; there is no separate `taste_*` table. Semantic and episodic Memory use the same contract with their respective types. Server-owned source dependencies are stored separately from model-editable candidate content.
+
+`TasteEntry` and `OwnerInsight` below are conceptual designs, not implemented record types or tables. In particular, there is no `owner_insights` table or `OwnerInsight` contract.
 
 Lora PI Kit owns Pi-specific integration behavior:
 
@@ -179,7 +210,7 @@ NapCat / OneBot
   QQ history source
 ```
 
-Glassbox keeps Principal, Authorization, Project / Resource scope, Conversation / Run / Task linkage, Turso truth, Audience / Delivery and Trace.
+Glassbox keeps Principal, Authorization, Project / Resource scope, Conversation / Run / Task linkage, local database truth, Audience / Delivery and Trace.
 
 Do not design a second generic Memory or Retrieval protocol when the upstream contract fits.
 
@@ -271,9 +302,9 @@ Future scopes may include repository, path, language, framework, team, or task c
 
 Do not let project Taste silently contaminate global Taste.
 
-### TasteEntry
+### Conceptual TasteEntry
 
-Initial conceptual shape:
+Historical design sketch, not the current persistence or API contract. Use `MemoryCandidate` and `CanonicalMemory` above when implementing or consuming learning records:
 
 ```json
 {
@@ -293,7 +324,7 @@ Initial conceptual shape:
 }
 ```
 
-The exact schema is not frozen until P4 implementation begins.
+The implemented schema is defined by the learning and shared Memory contracts linked above. The counters in this sketch are not separate persisted `TasteEntry` fields.
 
 ## Feedback Ledger
 
@@ -301,23 +332,23 @@ Do not update Taste directly from a transient UI event without preserving the ev
 
 First persist a FeedbackEvent.
 
-Conceptual shape:
+Current shape from `apps/server/src/learning/contracts.ts`:
 
 ```text
 FeedbackEvent
   id
-  userId
-  projectId?
+  principalId
+  scope
+  signalType
+  statement
+  category?
   conversationId?
   runId?
   taskId?
   artifactRef?
-  signalType
-  beforeRef?
-  afterRef?
-  categoryHints?
-  visibility
+  evidence
   createdAt
+  candidateId
 ```
 
 Minimum signal types:
@@ -351,7 +382,7 @@ FeedbackEvent
 
 Do not freeze arbitrary numeric confidence thresholds in architecture documentation.
 
-The first implementation should use the smallest explainable evidence policy needed to prove:
+The learning store applies an evidence policy with these boundaries:
 
 ```text
 single edit
@@ -367,7 +398,7 @@ explicit current user instruction
   wins over learned Taste
 ```
 
-If implementation needs a confidence formula not provided by the approved upstream mechanisms, record that gap in the P4A PR before adding one.
+The current feedback confidence calculation lives in `LearningStore.recordFeedback`. Changes to that calculation need evidence and tests; confidence never grants permission or bypasses Owner review.
 
 ## Confidence
 
@@ -431,7 +462,7 @@ What fact should remain available?
 What result did an earlier Task produce?
 ```
 
-P4 keeps at least two durable Memory classes:
+The canonical Memory contract includes these two knowledge types, alongside `preference` and `relationship`:
 
 ```text
 Semantic Memory
@@ -468,7 +499,7 @@ It must not silently become group B Context.
 
 The Owner private Main Agent may retrieve across several authorized group namespaces for Owner use. Cross-group synthesis should create a derived Owner-only insight with source provenance instead of rewriting source group Memory.
 
-Conceptual shape:
+Planned conceptual shape; no dedicated `OwnerInsight` type or table exists:
 
 ```text
 OwnerInsight
@@ -481,7 +512,7 @@ OwnerInsight
 
 A later explicit promotion may turn repeated cross-group evidence into a Skill candidate, Rule candidate, system-learning candidate, or product improvement proposal.
 
-Group assignment outcomes may become Memory evidence after P4 exists. The assignment database itself remains operational product state.
+A future group-assignment implementation may contribute Memory evidence. Group assignments remain a planned operational model; their outcomes must use the governed learning path rather than imply automatic promotion.
 
 ## Memory promotion
 
@@ -560,7 +591,7 @@ Do not create a separate Taste truth inside every Runtime.
 
 ## P4 split ownership
 
-P4 is now two intentionally parallel streams.
+P4 was delivered as two parallel streams. The completed plans record their acceptance; the responsibilities below still define the write/read boundary.
 
 ### P4A — Memory and Taste
 
@@ -620,7 +651,7 @@ P4A exposes canonical MGP-derived Memory objects plus Glassbox Resource / scope 
 The shared `@glassbox/contracts` package exports this canonical Memory, scope, lifecycle,
 evidence and retention boundary. P4B does not import the P4A store implementation.
 
-Taste still comes before broad Memory retrieval as a learning mechanism, but P4A and P4B can be implemented in parallel because P4B develops against deterministic retrieval fixtures until the P4A projection is available.
+P4B consumes the implemented canonical Memory projection. Deterministic fixtures continue to test retrieval without writing to live learning state.
 
 ## Eval
 
@@ -673,6 +704,6 @@ See `upstream/command-code/SOURCES.md` for the reference note.
 - Project Taste does not silently become global Taste.
 - Taste and Memory are filtered by authorization before model-visible Context.
 - Only task-relevant Taste is injected.
-- Glassbox/Turso owns durable Taste and Feedback truth.
+- Glassbox owns durable Taste and Feedback truth in the local libSQL/SQLite database.
 - Lora PI Kit may bridge Taste into Pi but does not become the canonical store.
 - Runtime-specific learning signals must map back to Glassbox-owned FeedbackEvent records.

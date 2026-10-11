@@ -6,7 +6,8 @@ import { memoryFixtureStep } from "./memory-scenario.mjs";
 import { resolveReadFeatureSpecs } from "./feature-specs.mjs";
 import { MEMORY_FAMILY_ID, memoryWorkflow } from "./memory-workflow.mjs";
 import { TASTE_FAMILY_ID, tasteFamilyPlan } from "./taste-scenario.mjs";
-
+import { validateMediaFamily } from "./media-scenario.mjs";
+import { TASK_WORKER_FAMILY_ID } from "./task-worker-scenario.mjs";
 export { MEMORY_FAMILY_ID, MEMORY_REJECT_FAMILY_ID } from "./memory-workflow.mjs";
 
 function memoryPlanSpec(stage, nonce) {
@@ -100,6 +101,49 @@ function uniqueCaseIds(cases) {
 
 /** Resolve schema 2 reads or schema 3 with one or both fixed Memory families and optional reads. */
 export function resolveFeatureSuite(raw, config) {
+  if (raw?.schemaVersion === 8) {
+    const family = raw.cases?.[0];
+    if (
+      Object.keys(raw).sort().join(",") !== "cases,schemaVersion" ||
+      !Array.isArray(raw.cases) ||
+      raw.cases.length !== 1 ||
+      !family ||
+      Array.isArray(family) ||
+      Object.keys(family).sort().join(",") !== "chat,id,kind" ||
+      family.id !== TASK_WORKER_FAMILY_ID ||
+      family.kind !== "task-worker-artifact-lifecycle" ||
+      family.chat !== "private"
+    )
+      fail("FEATURE_TASK_WORKER_FAMILY", "Schema 8 只支持固定的私聊 Worker 验收流程。");
+    return {
+      cases: [family],
+      readCases: [],
+      memoryFamilies: [],
+      historyFamilies: [],
+      tasteFamilies: [],
+      mediaFamilies: [],
+      taskWorkerFamilies: [family],
+    };
+  }
+  if (raw?.schemaVersion === 7) {
+    if (
+      !raw ||
+      Array.isArray(raw) ||
+      Object.keys(raw).sort().join(",") !== "cases,schemaVersion" ||
+      !Array.isArray(raw.cases) ||
+      raw.cases.length !== 1
+    )
+      fail("FEATURE_MEDIA_FAMILY", "Schema 7 requires exactly one fixed media family.");
+    const family = validateMediaFamily(raw.cases[0]);
+    return {
+      cases: [family],
+      readCases: [],
+      memoryFamilies: [],
+      historyFamilies: [],
+      tasteFamilies: [],
+      mediaFamilies: [family],
+    };
+  }
   if (raw?.schemaVersion === 2) {
     const readCases = resolveReadFeatureSpecs(raw, config);
     return {

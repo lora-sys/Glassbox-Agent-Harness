@@ -226,7 +226,9 @@ test("rejects missing, reordered, duplicated, or altered seed family assertions"
     (f) => (f.report.historySeedWorkflow.cleanup.leaseRevoked = false),
     (f) => (f.report.cases[0].featureAssertions = []),
     (f) => (f.report.cases[1].featureAssertions[3].sourceRunId = "unrelated_run"),
-    (f) => (f.report.cases[1].featureAssertions[3].query = "c".repeat(32)),
+    // Old archived reports with the bare seed nonce must not be silently upgraded to the
+    // current prefixed exact-term query contract.
+    (f) => (f.report.cases[1].featureAssertions[3].query = tokens[0]),
     (f) => (f.report.cases[1].featureAssertions[3].until = "2027-01-01T00:00:00.000Z"),
     (f) => (f.report.cases[1].acceptanceLease.toolsSha256 = "0".repeat(64)),
     (f) => f.report.cases.reverse(),

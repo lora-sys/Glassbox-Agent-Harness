@@ -12,6 +12,7 @@ import { memoryFixtureStep } from "../../../../tools/qq-live/lib/memory-scenario
 import { toolManifestDigest } from "../../../../tools/qq-live/lib/core.mjs";
 import { MEMORY_REJECT_FAMILY_ID } from "../../../../tools/qq-live/lib/memory-workflow.mjs";
 import { historySnippet } from "../../../../tools/qq-live/lib/history-result.mjs";
+import { historyInputDigest } from "../../../../tools/qq-live/lib/history-input-evidence.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const hypothesis = {
@@ -362,6 +363,9 @@ async function createPassingCompleteHistoryReport(t, caseId) {
   };
   accepted.messageBinding.input.textSha256 = promptHash;
 
+  const output = "complete history output fixture";
+  const outputSha256 = hash(Buffer.from(output, "utf8"));
+  const outputBytes = Buffer.byteLength(output, "utf8");
   const tracePath = join(report.runtime.dataDirectory, "runs", runId, "trace.jsonl");
   const events = [
     {
@@ -391,16 +395,25 @@ async function createPassingCompleteHistoryReport(t, caseId) {
         authorizedTools: [toolName],
       },
     },
-    { type: "tool_call", runId, toolCallId: "history-call", data: { name: toolName, input } },
     {
-      type: "tool_result",
+      type: "tool_call",
       runId,
+      principalId: "owner-fixture",
+      timestamp: "2026-10-04T23:59:59.000Z",
       toolCallId: "history-call",
-      data: { name: toolName, isError: false },
+      data: {
+        runId,
+        principalId: "owner-fixture",
+        toolCallId: "history-call",
+        name: toolName,
+        ...historyInputDigest(input),
+      },
     },
     {
       type: "history_retrieval",
       runId,
+      principalId: "owner-fixture",
+      conversationId: "conversation-fixture",
       query: token,
       groups: [groupId],
       resources: [`group:${groupId}`],
@@ -410,6 +423,7 @@ async function createPassingCompleteHistoryReport(t, caseId) {
       droppedByExactTerm: 0,
       truncated: false,
       items: [],
+      toolOutput: { sha256: outputSha256, bytes: outputBytes },
       coverage: {
         coverage: "complete",
         requestedLimit: 1,
@@ -432,6 +446,22 @@ async function createPassingCompleteHistoryReport(t, caseId) {
           },
         ],
         observedAt: "2026-10-05T00:00:00.000Z",
+      },
+    },
+    {
+      type: "tool_result",
+      runId,
+      principalId: "owner-fixture",
+      timestamp: "2026-10-05T00:00:01.000Z",
+      toolCallId: "history-call",
+      data: {
+        runId,
+        principalId: "owner-fixture",
+        toolCallId: "history-call",
+        name: toolName,
+        isError: false,
+        outputBytes,
+        outputSha256,
       },
     },
   ];
@@ -495,7 +525,8 @@ async function createPassingHistoryResultReport(t, caseId) {
   });
   const input = hit ? { query: token, limit: 1 } : { query: token, groupIds: [groupId], limit: 1 };
   call.data.name = toolName;
-  call.data.input = input;
+  delete call.data.input;
+  Object.assign(call.data, historyInputDigest(input));
   toolResult.data.name = toolName;
   toolResult.data.outputSha256 = outputSha256;
   toolResult.data.outputBytes = outputBytes;
@@ -1284,6 +1315,105 @@ test("complete history lessons cannot drop coverage assertion or trace observati
       caseId,
     );
     await assert.rejects(readFile(lessonsPath, "utf8"), { code: "ENOENT" });
+  }
+});
+
+test("complete history lessons reject missing, altered, or raw protected Tool arguments", async (t) => {
+  const corruptions = [
+    (call) => delete call.data.inputSha256,
+    (call) => {
+      call.data.inputSha256 = "0".repeat(64);
+    },
+    (call) => {
+      call.data.input = { query: "a".repeat(32), groupIds: ["20001"], limit: 1 };
+    },
+  ];
+  for (const [index, corrupt] of corruptions.entries()) {
+    const caseId = "history-owner-group-a-complete";
+    const fixture = await createPassingCompleteHistoryReport(t, caseId);
+    const call = fixture.events.find((event) => event.type === "tool_call");
+    corrupt(call);
+    const tracePath = join(
+      fixture.report.runtime.dataDirectory,
+      "runs",
+      fixture.input.evidence.runId,
+      "trace.jsonl",
+    );
+    await writeFile(
+      tracePath,
+      fixture.events.map((event, seq) => JSON.stringify({ seq: seq + 1, event })).join("\n") + "\n",
+      "utf8",
+    );
+    await assert.rejects(
+      appendLesson(fixture.input, join(fixture.temp, `bad-history-input-${index}.jsonl`)),
+      /Feature Run lease, scope, or Trace evidence did not verify/,
+    );
+  }
+});
+
+test("complete history lessons reject missing, altered, or raw protected Tool arguments", async (t) => {
+  const corruptions = [
+    (call) => delete call.data.inputSha256,
+    (call) => {
+      call.data.inputSha256 = "0".repeat(64);
+    },
+    (call) => {
+      call.data.input = { query: "a".repeat(32), groupIds: ["20001"], limit: 1 };
+    },
+  ];
+  for (const [index, corrupt] of corruptions.entries()) {
+    const caseId = "history-owner-group-a-complete";
+    const fixture = await createPassingCompleteHistoryReport(t, caseId);
+    const call = fixture.events.find((event) => event.type === "tool_call");
+    corrupt(call);
+    const tracePath = join(
+      fixture.report.runtime.dataDirectory,
+      "runs",
+      fixture.input.evidence.runId,
+      "trace.jsonl",
+    );
+    await writeFile(
+      tracePath,
+      fixture.events.map((event, seq) => JSON.stringify({ seq: seq + 1, event })).join("\n") + "\n",
+      "utf8",
+    );
+    await assert.rejects(
+      appendLesson(fixture.input, join(fixture.temp, `bad-history-input-${index}.jsonl`)),
+      /Feature Run lease, scope, or Trace evidence did not verify/,
+    );
+  }
+});
+
+test("complete history lessons reject missing, altered, or raw protected Tool arguments", async (t) => {
+  const corruptions = [
+    (call) => delete call.data.inputSha256,
+    (call) => {
+      call.data.inputSha256 = "0".repeat(64);
+    },
+    (call) => {
+      call.data.input = { query: "a".repeat(32), groupIds: ["20001"], limit: 1 };
+    },
+  ];
+  for (const [index, corrupt] of corruptions.entries()) {
+    const caseId = "history-owner-group-a-complete";
+    const fixture = await createPassingCompleteHistoryReport(t, caseId);
+    const call = fixture.events.find((event) => event.type === "tool_call");
+    corrupt(call);
+    const tracePath = join(
+      fixture.report.runtime.dataDirectory,
+      "runs",
+      fixture.input.evidence.runId,
+      "trace.jsonl",
+    );
+    await writeFile(
+      tracePath,
+      fixture.events.map((event, seq) => JSON.stringify({ seq: seq + 1, event })).join("\n") + "\n",
+      "utf8",
+    );
+    await assert.rejects(
+      appendLesson(fixture.input, join(fixture.temp, `bad-history-input-${index}.jsonl`)),
+      /Feature Run lease, scope, or Trace evidence did not verify/,
+    );
   }
 });
 

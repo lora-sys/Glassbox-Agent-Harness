@@ -257,6 +257,43 @@ export const FEATURE_CATALOG = Object.freeze({
       mutation: "none",
     },
     {
+      id: "qq-bot-group-role-read",
+      domain: "qq_read",
+      executionStatus: "executable",
+      tools: ["qq_group_members"],
+      suiteCaseId: "qq-bot-group-role-read",
+      assertions: [
+        {
+          kind: "trace",
+          type: "tool_result",
+          where: { name: "qq_group_members", isError: false },
+          count: 1,
+        },
+        {
+          kind: "group_member_role",
+          tool: "qq_group_members",
+          groupId: "{{group:B}}",
+          userId: "{{bot}}",
+          count: 1,
+        },
+      ],
+      coveragePlan:
+        "Read only the configured Bot account's role in group B from Owner private chat. Compare the normalized same-Run Tool result with an independent Bot-side get_group_member_info read. This does not test moderation authority.",
+      mutation: "none",
+    },
+    {
+      id: "qq-group-members-policy-isolation",
+      domain: "qq_group_policy",
+      executionStatus: "planned",
+      tools: ["owner_group_admin", "qq_group_members"],
+      coveragePlan:
+        "A separate fixed CLI family can verify Group B member-read exclusion and restore. The feature-suite catalog does not yet bind this mutation family, so it remains outside executable baseline coverage. It does not establish visitor denial or positive member-count functionality.",
+      mutation: "reversible",
+      fixture: "dedicated Group B with one restorable Owner-private group:members:read grant",
+      cleanup:
+        "restore the exact Group B capability and grant state, then verify durable guard release",
+    },
+    {
       id: "qq-group-policy-isolation",
       domain: "qq_group_policy",
       executionStatus: "planned",
@@ -333,7 +370,7 @@ export const FEATURE_CATALOG = Object.freeze({
             {
               action: "history:read",
               resourceId: "group:{{group:A}}",
-              inputConstraint: { query: "{{nonce}}", limit: 1 },
+              inputConstraint: { query: "gbxhistory1-{{nonce}}", limit: 1 },
             },
           ],
         },
@@ -349,7 +386,7 @@ export const FEATURE_CATALOG = Object.freeze({
           kind: "trace",
           type: "history_retrieval",
           where: {
-            query: "{{nonce}}",
+            query: "gbxhistory1-{{nonce}}",
             groups: ["{{group:A}}"],
             resources: ["group:{{group:A}}"],
             sourceKind: "channel_message",
@@ -375,7 +412,11 @@ export const FEATURE_CATALOG = Object.freeze({
             {
               action: "history:search",
               resourceId: "owner-history",
-              inputConstraint: { query: "{{nonce}}", groupIds: ["{{group:A}}"], limit: 1 },
+              inputConstraint: {
+                query: "gbxhistory1-{{nonce}}",
+                groupIds: ["{{group:A}}"],
+                limit: 1,
+              },
             },
           ],
         },
@@ -391,7 +432,7 @@ export const FEATURE_CATALOG = Object.freeze({
           kind: "trace",
           type: "history_retrieval",
           where: {
-            query: "{{nonce}}",
+            query: "gbxhistory1-{{nonce}}",
             groups: ["{{group:A}}"],
             resources: ["group:{{group:A}}"],
             sourceKind: "channel_message",
@@ -418,7 +459,7 @@ export const FEATURE_CATALOG = Object.freeze({
               action: "history:read",
               resourceId: "group:{{group:A}}",
               inputConstraint: {
-                query: "{{nonce}}",
+                query: "gbxhistory1-{{nonce}}",
                 limit: 1,
               },
             },
@@ -439,7 +480,7 @@ export const FEATURE_CATALOG = Object.freeze({
           kind: "trace",
           type: "history_retrieval",
           where: {
-            query: "{{nonce}}",
+            query: "gbxhistory1-{{nonce}}",
             groups: ["{{group:A}}"],
             resources: ["group:{{group:A}}"],
             sourceKind: "channel_message",
@@ -449,7 +490,7 @@ export const FEATURE_CATALOG = Object.freeze({
         },
         {
           kind: "history_coverage",
-          query: "{{nonce}}",
+          query: "gbxhistory1-{{nonce}}",
           groupId: "{{group:A}}",
           count: 1,
         },
@@ -472,7 +513,7 @@ export const FEATURE_CATALOG = Object.freeze({
               action: "history:search",
               resourceId: "owner-history",
               inputConstraint: {
-                query: "{{nonce}}",
+                query: "gbxhistory1-{{nonce}}",
                 groupIds: ["{{group:A}}"],
                 limit: 1,
               },
@@ -494,7 +535,7 @@ export const FEATURE_CATALOG = Object.freeze({
           kind: "trace",
           type: "history_retrieval",
           where: {
-            query: "{{nonce}}",
+            query: "gbxhistory1-{{nonce}}",
             groups: ["{{group:A}}"],
             resources: ["group:{{group:A}}"],
             sourceKind: "channel_message",
@@ -504,7 +545,7 @@ export const FEATURE_CATALOG = Object.freeze({
         },
         {
           kind: "history_coverage",
-          query: "{{nonce}}",
+          query: "gbxhistory1-{{nonce}}",
           groupId: "{{group:A}}",
           count: 1,
         },
@@ -527,7 +568,7 @@ export const FEATURE_CATALOG = Object.freeze({
               action: "history:read",
               resourceId: "group:{{group:A}}",
               inputConstraint: {
-                query: "{{nonce}}",
+                query: "gbxhistory1-{{nonce}}",
                 limit: 1,
               },
             },
@@ -548,7 +589,7 @@ export const FEATURE_CATALOG = Object.freeze({
           kind: "trace",
           type: "history_retrieval",
           where: {
-            query: "{{nonce}}",
+            query: "gbxhistory1-{{nonce}}",
             groups: ["{{group:A}}"],
             resources: ["group:{{group:A}}"],
             sourceKind: "channel_message",
@@ -558,14 +599,14 @@ export const FEATURE_CATALOG = Object.freeze({
         },
         {
           kind: "history_coverage",
-          query: "{{nonce}}",
+          query: "gbxhistory1-{{nonce}}",
           groupId: "{{group:A}}",
           count: 1,
         },
         {
           kind: "history_result",
           tool: "group_history_search",
-          query: "{{nonce}}",
+          query: "gbxhistory1-{{nonce}}",
           groupId: "{{group:A}}",
           result: "hit",
           count: 1,
@@ -589,7 +630,7 @@ export const FEATURE_CATALOG = Object.freeze({
               action: "history:search",
               resourceId: "owner-history",
               inputConstraint: {
-                query: "{{nonce}}",
+                query: "gbxhistory1-{{nonce}}",
                 groupIds: ["{{group:A}}"],
                 limit: 1,
               },
@@ -611,7 +652,7 @@ export const FEATURE_CATALOG = Object.freeze({
           kind: "trace",
           type: "history_retrieval",
           where: {
-            query: "{{nonce}}",
+            query: "gbxhistory1-{{nonce}}",
             groups: ["{{group:A}}"],
             resources: ["group:{{group:A}}"],
             sourceKind: "channel_message",
@@ -621,14 +662,14 @@ export const FEATURE_CATALOG = Object.freeze({
         },
         {
           kind: "history_coverage",
-          query: "{{nonce}}",
+          query: "gbxhistory1-{{nonce}}",
           groupId: "{{group:A}}",
           count: 1,
         },
         {
           kind: "history_result",
           tool: "owner_history_search",
-          query: "{{nonce}}",
+          query: "gbxhistory1-{{nonce}}",
           groupId: "{{group:A}}",
           result: "no_match",
           count: 1,
@@ -712,12 +753,12 @@ export const FEATURE_CATALOG = Object.freeze({
       executionStatus: "planned",
       tools: ["media_generate"],
       coveragePlan:
-        "Generate only after budget approval; bind Asset creation and successful delivery to the same private Run.",
+        "Dedicated schema 7 runs one 1K image and one four-second video. Bind each retained Asset, exact sender Buffer witness, two sent deliveries and actual double-account attachment to its unique Owner-private Run. Real QQ coverage remains pending; broader media operations are not covered.",
       mutation: "isolated",
       fixture:
-        "designated shared QQ acceptance identity and stable GLASSBOX_DATA_DIR; confirm external media budget",
+        "designated shared QQ acceptance identity and stable GLASSBOX_DATA_DIR; explicitly enable the two fixed generations and retained test Assets",
       cleanup:
-        "retain the Asset ID and delivery evidence; require an approved Asset deletion path or report BLOCKED because delivery cannot be recalled",
+        "verify exact temporary lease revocation; retain test Assets, messages and append-only audit evidence. Unknown sending or interrupted checkpoints block the next run; never regenerate or resend automatically",
     },
     {
       id: "agent-operations-read-and-lifecycle",
@@ -1262,11 +1303,16 @@ function bindToSuiteCase(testCase, suiteCases, gaps, suiteConfig) {
     valid = false;
   }
   const needsGroupA =
-    testCase.assertions?.some((a) => a.kind === "group_info") ||
+    testCase.assertions?.some(
+      (a) => a.kind === "group_info" || a.kind === "aggregate_projection",
+    ) ||
     (testCase.tools ?? []).some((name) =>
-      ["group_history_search", "owner_history_search", "qq_group_members"].includes(name),
+      ["group_history_search", "owner_history_search"].includes(name),
     );
-  if (needsGroupA && !suiteConfig) {
+  const needsGroupB = testCase.assertions?.some(
+    (assertion) => assertion.kind === "group_member_role",
+  );
+  if ((needsGroupA || needsGroupB) && !suiteConfig) {
     gaps.push({
       code: "SUITE_CONFIG_REQUIRED",
       caseId: testCase.id,
@@ -1280,6 +1326,7 @@ function bindToSuiteCase(testCase, suiteCases, gaps, suiteConfig) {
       { schemaVersion: 2, cases: [suiteCase] },
       suiteConfig ?? {
         groups: suiteCase.chat === "private" ? [] : [{ alias: suiteCase.chat, id: "10001" }],
+        bot: { qq: "10002" },
       },
     );
   } catch {

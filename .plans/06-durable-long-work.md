@@ -1,6 +1,6 @@
 # P6 Durable Long Work and Workers
 
-Status: IMPLEMENTATION IN PROGRESS. Tracking Issue: #33.
+Status: IMPLEMENTATION RECORDED; ISSUE #33 CLOSED (2026-09-30). Remaining Linux-native and real QQ acceptance is tracked by Issue #30. The incomplete acceptance gates below remain open and must not be inferred from #33 closure.
 
 ## Scope and gates
 

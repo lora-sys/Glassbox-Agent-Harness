@@ -1,4 +1,5 @@
 import test from "node:test";
+import { historyInputDigest } from "../lib/history-input-evidence.mjs";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
@@ -118,21 +119,31 @@ function fixture(t) {
     items: [],
   };
   const events = [
-    history,
     {
       type: "tool_call",
+      timestamp: "2026-10-06T00:00:59.000Z",
       runId: "recall-run",
+      principalId: "owner",
       toolCallId: "call-1",
       data: {
+        runId: "recall-run",
+        principalId: "owner",
+        toolCallId: "call-1",
         name: "owner_history_search",
-        input: { query, groupIds: ["123"], limit: 1, until },
+        ...historyInputDigest({ query, groupIds: ["123"], limit: 1, until }),
       },
     },
+    history,
     {
       type: "tool_result",
+      timestamp: "2026-10-06T00:01:01.000Z",
       runId: "recall-run",
+      principalId: "owner",
       toolCallId: "call-1",
       data: {
+        runId: "recall-run",
+        principalId: "owner",
+        toolCallId: "call-1",
         name: "owner_history_search",
         isError: false,
         outputSha256: digest(toolOutput),
@@ -221,7 +232,7 @@ test("cross-group exclusion requires the same succeeded Owner and a later privat
 
 test("cross-group exclusion rejects forged Tool evidence and a real A match", (t) => {
   const forged = fixture(t);
-  forged.events[0].resultStatus = "matches_found";
+  forged.events[1].resultStatus = "matches_found";
   assert.throws(() => observeHistoryExclusionResult(forged.assertion, forged));
 
   const targetMatch = fixture(t);

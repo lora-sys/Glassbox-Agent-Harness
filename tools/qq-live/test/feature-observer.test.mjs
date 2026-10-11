@@ -48,6 +48,27 @@ test("history evidence binds exact query and complete source scope without paylo
     assert.throws(() => validateFeatureAssertions([{ ...history, where: { groups: invalid } }]));
   assert.throws(() => validateFeatureAssertions([{ ...history, where: { items: [] } }]));
 });
+test("fixed leased group-member cases can read the execution-input witness event", () => {
+  const assertion = {
+    kind: "trace",
+    type: "qq_tool_execution_input_verified",
+    where: { name: "qq_group_members" },
+    count: 1,
+  };
+  const event = {
+    type: "qq_tool_execution_input_verified",
+    runId: "run-members",
+    data: { name: "qq_group_members" },
+  };
+  assert.equal(
+    observeFeature([assertion], { events: [event], runId: "run-members" }).status,
+    "PASS",
+  );
+  assert.throws(
+    () => observeFeature([assertion], { events: [event], runId: "other-run" }),
+    /功能事件/,
+  );
+});
 test("successful tool result requires matching current Run and call", () => {
   assert.equal(observeFeature([assertion], { events, runId: "run-1" }).status, "PASS");
   assert.throws(() => observeFeature([assertion], { events, runId: "run-2" }), /功能事件/);
@@ -205,4 +226,20 @@ test("state proves persisted result and originating Run without reading payload"
     "write",
   );
   assert.equal(observeFeature([assertions[1]], { db, events, runId: "run-1" }).status, "PASS");
+});
+
+test("intent refusal can require zero calls while successful-result evidence still requires a call", () => {
+  const refused = {
+    kind: "trace",
+    type: "tool_call",
+    where: { name: "qq_group_members" },
+    count: 0,
+  };
+  assert.equal(observeFeature([refused], { events: [], runId: "run-1" }).status, "PASS");
+  const call = { type: "tool_call", runId: "run-1", data: { name: "qq_group_members" } };
+  assert.throws(() => observeFeature([refused], { events: [call], runId: "run-1" }), {
+    code: "FEATURE_TRACE",
+  });
+  assert.throws(() => validateFeatureAssertions([{ ...refused, count: -1 }]));
+  assert.throws(() => validateFeatureAssertions([{ ...refused, type: "tool_result" }]));
 });

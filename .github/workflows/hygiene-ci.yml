@@ -144,7 +144,7 @@ jobs:
           fail-on-severity: high
           fail-on-scopes: runtime, development
           retry-on-snapshot-warnings: true
-          timeout: 180
+          retry-on-snapshot-warnings-timeout: 600
 
   pull-request-hygiene:
     name: Pull request title hygiene

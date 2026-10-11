@@ -5,6 +5,7 @@ import { PiRunExecutionAdapter } from "../runtime/pi/run-adapter.js";
 import { ProviderCallError } from "../runtime/pi/provider-outcome.js";
 import { TOOL_DESCRIPTORS } from "../runtime/pi/tool-plane.js";
 import type { PiRuntimeAdapter } from "../runtime/pi/types.js";
+import type { PiRunContext } from "../runtime/pi/types.js";
 import {
   groupRun,
   GROUP_RUN_READ_TOOLS,
@@ -15,6 +16,11 @@ import {
 
 const { fixture, afterEachCleanup } = createApplicationFixtureScope();
 afterEach(afterEachCleanup);
+
+type BotRoleObservationBinding = {
+  observation: NonNullable<PiRunContext["botGroupRoleObservation"]>;
+  authorize: () => Promise<void>;
+};
 
 describe("configured group Run capability authority", () => {
   const CO_OWNER = "10006";
@@ -33,12 +39,18 @@ describe("configured group Run capability authority", () => {
     memberRole: () => "owner" | "admin" | "member" = () => role,
     failAction?: string,
     onAction?: (action: Action) => void,
+    botRole: "owner" | "admin" | "member" = "member",
+    beforeActionReply?: (action: Action) => Promise<void>,
+    memberMuteUntil?: (userId: string) => number,
   ) {
     const f = await fixture(
       async (input) => ({ status: "succeeded", text: `answer:${input.text}` }),
       {
         coOwnerId: CO_OWNER,
         memberRole,
+        memberRoleForUser: (userId) => (userId === "10001" ? botRole : memberRole()),
+        ...(beforeActionReply === undefined ? {} : { beforeActionReply }),
+        ...(memberMuteUntil === undefined ? {} : { memberMuteUntil }),
         ...(failAction === undefined ? {} : { failAction }),
         ...(onAction === undefined ? {} : { onAction }),
       },
@@ -61,7 +73,10 @@ describe("configured group Run capability authority", () => {
       conversationId: run.conversation.id,
       runId: run.run.id,
     };
-    expect(context.caller.scope).toMatchObject({ chatType: "group", chatId: GROUP });
+    expect(context.caller.scope).toMatchObject({
+      chatType: "group",
+      chatId: GROUP,
+    });
     return { f, a, application, context, groupInput: run };
   }
 
@@ -145,8 +160,13 @@ describe("configured group Run capability authority", () => {
     const tools = application.createRuntimeTools(() => context);
     const groups = tools.find((tool) => tool.name === "qq_groups");
     if (!groups) throw new Error("missing qq_groups");
-    const result = await groups.execute("call", { operation: "get_group_info" });
-    expect(result.details).toMatchObject({ status: "ok", data: { group_id: Number(GROUP) } });
+    const result = await groups.execute("call", {
+      operation: "get_group_info",
+    });
+    expect(result.details).toMatchObject({
+      status: "ok",
+      data: { group_id: Number(GROUP) },
+    });
   });
 
   it("gives a QQ admin only current-group moderation and re-verifies before execution", async () => {
@@ -168,6 +188,20 @@ describe("configured group Run capability authority", () => {
     expect(names).not.toContain("qq_group_settings");
     expect(names).not.toContain("owner_group_admin");
     const runtimeContext = Object.assign(context, {
+      recordQqToolExecutionInput: async (
+        record: Parameters<NonNullable<PiRunContext["recordQqToolExecutionInput"]>>[0],
+      ) => {
+        const cursor = await f.app.trace.append(
+          context.runId,
+          {
+            type: "qq_tool_execution_input_verified",
+            runId: context.runId,
+            ...record,
+          },
+          "glassbox-tool-evidence",
+        );
+        await f.app.store.evidence.advanceTrace(context.caller, cursor);
+      },
       requiredToolName: "qq_group_moderation",
       requiredToolInput: {
         groupId: GROUP,
@@ -473,7 +507,10 @@ describe("configured group Run capability authority", () => {
       .find((tool) => tool.name === "qq_group_moderation");
     if (!moderation) throw new Error("missing qq_group_moderation");
     const failure = await moderation
-      .execute("call", { operation: "set_group_whole_ban", params: { enable: true } })
+      .execute("call", {
+        operation: "set_group_whole_ban",
+        params: { enable: true },
+      })
       .then(
         () => undefined,
         (error: unknown) => error,
@@ -618,7 +655,9 @@ describe("configured group Run capability authority", () => {
       abort: async () => {},
       cleanup: async () => {},
     };
-    const executor = new PiRunExecutionAdapter(runtime, { isOwner: async () => false });
+    const executor = new PiRunExecutionAdapter(runtime, {
+      isOwner: async () => false,
+    });
     return async (text: string) => {
       await executor.execute({ ...input, text });
       return seen.at(-1);
@@ -657,4 +696,547 @@ describe("configured group Run capability authority", () => {
       }),
     ).not.toContain("owner_history_search");
   });
+
+  it("observes only the configured Bot role after an authorized group moderation requirement", async () => {
+    const { application, a, context, f } = await configuredGroup(
+      "admin",
+      () => "admin",
+      undefined,
+      undefined,
+      "admin",
+    );
+    await application.setGroupCategory(a, {
+      groupId: GROUP,
+      category: "group.moderate",
+      enabled: true,
+    });
+    const runContext = context as PiRunContext;
+    runContext.authorizedToolNames = await application.resolveRunToolNames(context);
+    runContext.requiredToolName = "qq_group_moderation";
+    runContext.requiredToolInput = {
+      groupId: GROUP,
+      operation: "set_group_ban",
+      params: { user_id: 10004, duration: 60 },
+    };
+    runContext.recordQqToolExecutionInput = async (record) => {
+      const cursor = await f.app.trace.append(
+        runContext.runId!,
+        {
+          type: "qq_tool_execution_input_verified",
+          runId: runContext.runId,
+          ...record,
+        },
+        "glassbox-tool-evidence",
+      );
+      await f.app.store.evidence.advanceTrace(runContext.caller!, cursor);
+    };
+    const observe = (
+      application as unknown as {
+        observeBotGroupRoleForModeration(
+          context: PiRunContext,
+          groupId: string,
+          toolInput: Readonly<Record<string, unknown>>,
+        ): Promise<BotRoleObservationBinding | undefined>;
+      }
+    ).observeBotGroupRoleForModeration.bind(application);
+
+    const result = await observe(runContext, GROUP, runContext.requiredToolInput);
+    expect(result?.observation).toEqual({
+      groupId: GROUP,
+      role: "qq_group_admin",
+    });
+    await expect(result?.authorize()).resolves.toBeUndefined();
+    const lookup = await f.actions.take(
+      (action) =>
+        action.action === "get_group_member_info" &&
+        action.params.group_id === GROUP_ID &&
+        action.params.user_id === 10001,
+    );
+    expect(lookup.params).toMatchObject({
+      group_id: GROUP_ID,
+      user_id: 10001,
+      no_cache: true,
+    });
+    expect(
+      f.actionLog.some(
+        (action) => action.action === "get_group_member_info" && action.params.user_id === 10002,
+      ),
+    ).toBe(true);
+    expect(
+      f.actionLog.some(
+        (action) => action.action === "get_group_member_info" && action.params.user_id === 10001,
+      ),
+    ).toBe(true);
+    const trace = await f.app.trace.readPage(context.runId);
+    expect(trace.records.map((record) => record.event)).toContainEqual(
+      expect.objectContaining({
+        type: "bot_native_group_role_observation",
+        principalId: context.caller.principalId,
+        resourceId: "group:" + GROUP,
+        groupId: GROUP,
+        observationStatus: "verified",
+        observedRole: "qq_group_admin",
+        roleSubject: "configured_bot_account",
+      }),
+    );
+    expect(trace.records.map((record) => record.event)).not.toContainEqual(
+      expect.objectContaining({ type: "native_group_role_verification" }),
+    );
+    await application.setGroupCategory(a, {
+      groupId: GROUP,
+      category: "group.moderate",
+      enabled: false,
+    });
+    await expect(result?.authorize()).rejects.toThrow("bot_group_role_authority_changed");
+  });
+
+  it("does not read the Bot role for a group requester without moderation authority", async () => {
+    const { application, a, context, f } = await configuredGroup("member");
+    await application.setGroupCategory(a, {
+      groupId: GROUP,
+      category: "group.moderate",
+      enabled: true,
+    });
+    const runContext = context as PiRunContext;
+    runContext.authorizedToolNames = await application.resolveRunToolNames(context);
+    runContext.requiredToolName = "qq_group_moderation";
+    runContext.requiredToolInput = {
+      groupId: GROUP,
+      operation: "set_group_ban",
+      params: { user_id: 10004, duration: 60 },
+    };
+    const observe = (
+      application as unknown as {
+        observeBotGroupRoleForModeration(
+          context: PiRunContext,
+          groupId: string,
+          toolInput: Readonly<Record<string, unknown>>,
+        ): Promise<BotRoleObservationBinding | undefined>;
+      }
+    ).observeBotGroupRoleForModeration.bind(application);
+
+    await expect(observe(runContext, GROUP, runContext.requiredToolInput)).resolves.toBeUndefined();
+    expect(f.actionLog.some((action) => action.action === "get_group_member_info")).toBe(false);
+    expect(runContext.botGroupRoleObservation).toBeUndefined();
+  });
+
+  it("allows the Owner-private assigned-group path without checking the Owner's QQ role", async () => {
+    const { application, a, f } = await configuredGroup(
+      "member",
+      () => "member",
+      undefined,
+      undefined,
+      "admin",
+    );
+    await application.setGroupCategory(a, {
+      groupId: GROUP,
+      category: "group.moderate",
+      enabled: true,
+    });
+    const runContext = a as PiRunContext;
+    runContext.authorizedToolNames = await application.resolveRunToolNames(a);
+    runContext.requiredToolName = "qq_group_moderation";
+    runContext.requiredToolInput = {
+      groupId: GROUP,
+      operation: "set_group_ban",
+      params: { user_id: 10004, duration: 60 },
+    };
+    expect(runContext.authorizedToolNames).toContain("qq_group_moderation");
+    const observe = (
+      application as unknown as {
+        observeBotGroupRoleForModeration(
+          context: PiRunContext,
+          groupId: string,
+          toolInput: Readonly<Record<string, unknown>>,
+        ): Promise<BotRoleObservationBinding | undefined>;
+      }
+    ).observeBotGroupRoleForModeration.bind(application);
+
+    const result = await observe(runContext, GROUP, runContext.requiredToolInput);
+    expect(result?.observation).toEqual({
+      groupId: GROUP,
+      role: "qq_group_admin",
+    });
+    await expect(result?.authorize()).resolves.toBeUndefined();
+    const lookup = await f.actions.take(
+      (action) =>
+        action.action === "get_group_member_info" &&
+        action.params.group_id === GROUP_ID &&
+        action.params.user_id === 10001,
+    );
+    expect(lookup.params.user_id).toBe(10001);
+    expect(
+      f.actionLog.some(
+        (action) =>
+          action.action === "get_group_member_info" && action.params.user_id === 3526039967,
+      ),
+    ).toBe(false);
+  });
+
+  it("drops the Bot role fact when category authority is revoked during its provider read", async () => {
+    let releaseBotRead!: () => void;
+    let signalBotRead!: () => void;
+    const botReadStarted = new Promise<void>((resolve) => {
+      signalBotRead = resolve;
+    });
+    const botReadGate = new Promise<void>((resolve) => {
+      releaseBotRead = resolve;
+    });
+    const { application, a, context } = await configuredGroup(
+      "admin",
+      () => "admin",
+      undefined,
+      undefined,
+      "admin",
+      async (action) => {
+        if (action.action === "get_group_member_info" && action.params.user_id === 10001) {
+          signalBotRead();
+          await botReadGate;
+        }
+      },
+    );
+    await application.setGroupCategory(a, {
+      groupId: GROUP,
+      category: "group.moderate",
+      enabled: true,
+    });
+    const runContext = context as PiRunContext;
+    runContext.authorizedToolNames = await application.resolveRunToolNames(context);
+    runContext.requiredToolName = "qq_group_moderation";
+    runContext.requiredToolInput = {
+      groupId: GROUP,
+      operation: "set_group_ban",
+      params: { user_id: 10004, duration: 60 },
+    };
+    const observe = (
+      application as unknown as {
+        observeBotGroupRoleForModeration(
+          context: PiRunContext,
+          groupId: string,
+          toolInput: Readonly<Record<string, unknown>>,
+        ): Promise<BotRoleObservationBinding | undefined>;
+      }
+    ).observeBotGroupRoleForModeration.bind(application);
+    const pending = observe(runContext, GROUP, runContext.requiredToolInput);
+    await botReadStarted;
+    await application.setGroupCategory(a, {
+      groupId: GROUP,
+      category: "group.moderate",
+      enabled: false,
+    });
+    releaseBotRead();
+    await expect(pending).resolves.toBeUndefined();
+    expect(runContext.botGroupRoleObservation).toBeUndefined();
+  });
+
+  it("blocks the provider when category authority changes after Bot read and before context send", async () => {
+    const { application, a, groupInput } = await configuredGroup(
+      "admin",
+      () => "admin",
+      undefined,
+      undefined,
+      "admin",
+    );
+    await application.setGroupCategory(a, {
+      groupId: GROUP,
+      category: "group.moderate",
+      enabled: true,
+    });
+    let providerRunCount = 0;
+    let sessionContext: PiRunContext | undefined;
+    const runtime: PiRuntimeAdapter = {
+      initialize: async () => {},
+      createOrRestoreSession: async (_conversation, _profile, runContext) => {
+        sessionContext = runContext;
+        if (runContext)
+          runContext.authorizedToolNames = await application.resolveRunToolNames(
+            runContext as unknown as OwnerContext,
+          );
+        return {
+          conversationId: groupInput.conversation.id,
+          runtimeSessionId: "bot-role-revoke-session",
+          profileName: "qq-group",
+          agentDir: "agent",
+          createdAt: new Date(0).toISOString(),
+          lastActiveAt: new Date(0).toISOString(),
+        };
+      },
+      getModelCapacity: () => ({
+        contextWindowTokens: 32_768,
+        outputReserveTokens: 4_096,
+        thinkingReserveTokens: 0,
+        safetyMarginTokens: 512,
+      }),
+      run: async () => {
+        providerRunCount += 1;
+        return { status: "completed", text: "unused", toolCalls: [] };
+      },
+      abort: async () => {},
+      cleanup: async () => {},
+    };
+    const observe = (
+      application as unknown as {
+        observeBotGroupRoleForModeration(
+          context: PiRunContext,
+          groupId: string,
+          toolInput: Readonly<Record<string, unknown>>,
+        ): Promise<
+          | {
+              observation: NonNullable<PiRunContext["botGroupRoleObservation"]>;
+              authorize: () => Promise<void>;
+            }
+          | undefined
+        >;
+      }
+    ).observeBotGroupRoleForModeration.bind(application);
+    const executor = new PiRunExecutionAdapter(runtime, {
+      isOwner: async () => false,
+      observeBotGroupRole: async (input) => {
+        const binding = await observe(input.context, input.groupId, input.toolInput);
+        if (binding)
+          await application.setGroupCategory(a, {
+            groupId: GROUP,
+            category: "group.moderate",
+            enabled: false,
+          });
+        return binding;
+      },
+    });
+
+    await expect(
+      executor.execute({
+        ...groupInput,
+        text: "把群 10005 的成员 10004 禁言 30 秒",
+      }),
+    ).resolves.toMatchObject({
+      status: "failed",
+      failureCode: "gate_refused",
+      runtimeAttempted: false,
+    });
+    expect(providerRunCount).toBe(0);
+    expect(sessionContext?.botGroupRoleObservation).toBeUndefined();
+  });
+
+  it("reports an unknown Bot role without changing an authorized moderation surface", async () => {
+    const f = await fixture(
+      async (input) => ({ status: "succeeded", text: "answer:" + input.text }),
+      {
+        failActionWhen: (action) =>
+          action.action === "get_group_member_info" && action.params.user_id === 10001,
+        memberRoleForUser: () => "admin",
+      },
+    );
+    f.send(1, "owner-a", true, 10002);
+    const ownerRun = await f.started.take();
+    await f.reply("answer:owner-a");
+    const owner: OwnerContext = {
+      caller: ownerRun.caller,
+      conversationId: ownerRun.conversation.id,
+      runId: ownerRun.run.id,
+    };
+    const application = groupRun(f.app);
+    await application.setGroupAccess(owner, { groupId: GROUP, enabled: true });
+    await application.setGroupCategory(owner, {
+      groupId: GROUP,
+      category: "group.moderate",
+      enabled: true,
+    });
+    f.send(2, "group-admin", false, 10002, GROUP_ID, "admin");
+    const groupRunInput = await f.started.take();
+    await f.reply("answer:group-admin");
+    const context = {
+      caller: groupRunInput.caller,
+      conversationId: groupRunInput.conversation.id,
+      runId: groupRunInput.run.id,
+    } as PiRunContext;
+    context.authorizedToolNames = await application.resolveRunToolNames(
+      context as unknown as OwnerContext,
+    );
+    context.requiredToolName = "qq_group_moderation";
+    context.requiredToolInput = {
+      groupId: GROUP,
+      operation: "set_group_ban",
+      params: { user_id: 10004, duration: 60 },
+    };
+    const observe = (
+      f.app as unknown as {
+        observeBotGroupRoleForModeration(
+          context: PiRunContext,
+          groupId: string,
+          toolInput: Readonly<Record<string, unknown>>,
+        ): Promise<BotRoleObservationBinding | undefined>;
+      }
+    ).observeBotGroupRoleForModeration.bind(f.app);
+
+    const result = await observe(context, GROUP, context.requiredToolInput);
+    expect(result?.observation).toEqual({ groupId: GROUP, role: "unknown" });
+    await expect(result?.authorize()).resolves.toBeUndefined();
+    expect(context.authorizedToolNames).toContain("qq_group_moderation");
+    const trace = await f.app.trace.readPage(context.runId!);
+    expect(trace.records.map((record) => record.event)).toContainEqual(
+      expect.objectContaining({
+        type: "bot_native_group_role_observation",
+        observationStatus: "failed",
+        observedRole: null,
+        roleSubject: "configured_bot_account",
+      }),
+    );
+  });
+  it.each(["mute", "unmute"] as const)(
+    "checks the lease-bound native %s state before invoking the real capability",
+    async (phase) => {
+      const expected = phase === "mute" ? 0 : Math.floor(Date.now() / 1000) + 60;
+      const { application, a, f } = await configuredGroup(
+        "member",
+        () => "member",
+        undefined,
+        undefined,
+        "admin",
+        undefined,
+        () => expected,
+      );
+      await application.setGroupCategory(a, {
+        groupId: GROUP,
+        category: "group.moderate",
+        enabled: true,
+      });
+      const input = {
+        groupId: GROUP,
+        operation: "set_group_ban",
+        params: { user_id: 10004, duration: phase === "mute" ? 60 : 0 },
+      };
+      const context: PiRunContext & OwnerContext = {
+        ...a,
+        recordQqToolExecutionInput: async (record) => {
+          const cursor = await f.app.trace.append(
+            a.runId,
+            {
+              type: "qq_tool_execution_input_verified",
+              runId: a.runId,
+              ...record,
+            },
+            "glassbox-tool-evidence",
+          );
+          await f.app.store.evidence.advanceTrace(a.caller, cursor);
+        },
+        requiredToolName: "qq_group_moderation",
+        requiredToolInput: input,
+        acceptanceLease: {
+          leaseId: "lease-native-state",
+          marker: "a".repeat(32),
+          toolsSha256: "b".repeat(64),
+          assertActive: () => true,
+          filterToolNames: (names) => [...names],
+          getToolInputRestrictions: () => [
+            {
+              action: "group:moderate",
+              resourceId: "group:" + GROUP,
+              inputConstraint: input,
+            },
+          ],
+          checkToolCall: () => true,
+          getNativeMuteStatePrecondition: () => ({
+            kind: "qq-member-mute-state",
+            phase,
+            expectedMuteUntil: expected,
+          }),
+        },
+      };
+      const tool = application
+        .createRuntimeTools(() => context)
+        .find((item) => item.name === "qq_group_moderation");
+      if (!tool) throw new Error("missing moderation Tool");
+      await expect(tool.execute("native-state", input)).resolves.toMatchObject({
+        details: { status: "ok" },
+      });
+      const memberIndex = f.actionLog.findIndex(
+        (item) => item.action === "get_group_member_info" && item.params.user_id === 10004,
+      );
+      const mutationIndex = f.actionLog.findIndex((item) => item.action === "set_group_ban");
+      expect(memberIndex).toBeGreaterThanOrEqual(0);
+      expect(mutationIndex).toBeGreaterThan(memberIndex);
+      expect(f.actionLog[memberIndex]?.params.no_cache).toBe(true);
+      const trace = await f.app.trace.readPage(a.runId);
+      expect(trace.records.map((record) => record.event)).toContainEqual(
+        expect.objectContaining({
+          type: "native_mute_state_precondition_verified",
+          phase,
+          leaseId: "lease-native-state",
+        }),
+      );
+    },
+  );
+
+  it.each(["changed", "expired", "lease-revoked"] as const)(
+    "refuses %s unmute without calling set_group_ban",
+    async (failure) => {
+      let active = true;
+      const expected = Math.floor(Date.now() / 1000) + (failure === "expired" ? -1 : 60);
+      const observed = failure === "changed" ? expected + 60 : expected;
+      const { application, a, f } = await configuredGroup(
+        "member",
+        () => "member",
+        undefined,
+        undefined,
+        "admin",
+        async (action) => {
+          if (failure === "lease-revoked" && action.action === "get_group_member_info")
+            active = false;
+        },
+        () => observed,
+      );
+      await application.setGroupCategory(a, {
+        groupId: GROUP,
+        category: "group.moderate",
+        enabled: true,
+      });
+      const input = {
+        groupId: GROUP,
+        operation: "set_group_ban",
+        params: { user_id: 10004, duration: 0 },
+      };
+      const context: PiRunContext & OwnerContext = {
+        ...a,
+        requiredToolName: "qq_group_moderation",
+        requiredToolInput: input,
+        acceptanceLease: {
+          leaseId: "lease-native-denial",
+          marker: "c".repeat(32),
+          toolsSha256: "d".repeat(64),
+          assertActive: () => active,
+          filterToolNames: (names) => [...names],
+          getToolInputRestrictions: () => [
+            {
+              action: "group:moderate",
+              resourceId: "group:" + GROUP,
+              inputConstraint: input,
+            },
+          ],
+          checkToolCall: () => active,
+          getNativeMuteStatePrecondition: () => ({
+            kind: "qq-member-mute-state",
+            phase: "unmute",
+            expectedMuteUntil: expected,
+          }),
+        },
+      };
+      const tool = application
+        .createRuntimeTools(() => context)
+        .find((item) => item.name === "qq_group_moderation");
+      if (!tool) throw new Error("missing moderation Tool");
+      await expect(tool.execute("native-denial", input)).rejects.toThrow(
+        failure === "lease-revoked"
+          ? "acceptance_lease_denied"
+          : "acceptance_mute_state_precondition_denied",
+      );
+      expect(f.actionLog.some((item) => item.action === "get_group_member_info")).toBe(true);
+      expect(f.actionLog.some((item) => item.action === "set_group_ban")).toBe(false);
+      const trace = await f.app.trace.readPage(a.runId);
+      expect(trace.records.map((record) => record.event)).not.toContainEqual(
+        expect.objectContaining({
+          type: "native_mute_state_precondition_verified",
+        }),
+      );
+    },
+  );
 });

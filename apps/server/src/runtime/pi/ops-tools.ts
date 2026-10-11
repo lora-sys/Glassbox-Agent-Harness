@@ -263,7 +263,7 @@ export function createOpsTools(options: {
       action: "task:accept",
       resourceId: (params) => `task-${params.taskId}`,
       execute: async (params, context) => {
-        await options.service.accept(context.caller, params.taskId);
+        await options.service.accept(context.caller, params.taskId, context);
         return { accepted: true };
       },
     }),

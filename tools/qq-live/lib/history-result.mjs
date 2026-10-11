@@ -1,21 +1,29 @@
 import { createHash } from "node:crypto";
 import { fail } from "./core.mjs";
 import { observeHistoryCoverage, validateHistoryCoverageAssertion } from "./history-coverage.mjs";
+import { verifyHistoryInputEvidence } from "./history-input-evidence.mjs";
 
 const hash = (text) => createHash("sha256").update(text, "utf8").digest("hex");
-const canonical = (value) => {
-  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
-  if (value && typeof value === "object")
-    return `{${Object.keys(value)
-      .sort()
-      .map((key) => `${JSON.stringify(key)}:${canonical(value[key])}`)
-      .join(",")}}`;
-  return JSON.stringify(value);
-};
 function invalid() {
   fail("FEATURE_HISTORY_RESULT", "本轮历史结果或独立来源证据未被证明。", "INCONCLUSIVE");
 }
+const exactKeys = (value, keys) =>
+  value !== null &&
+  typeof value === "object" &&
+  !Array.isArray(value) &&
+  Object.keys(value).sort().join(",") ===
+    [...keys].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)).join(",");
 
+function validIdentity(event, data, runId, principalId, toolCallId) {
+  return (
+    event?.runId === runId &&
+    event?.principalId === principalId &&
+    event?.toolCallId === toolCallId &&
+    data?.runId === runId &&
+    data?.principalId === principalId &&
+    data?.toolCallId === toolCallId
+  );
+}
 export function validateHistoryResultAssertion(assertion) {
   if (
     !assertion ||
@@ -53,32 +61,82 @@ function protectedHistoryResultTrace(assertion, events, runId, input) {
     events,
     runId,
   );
-  const history = events.find(
-    (event) => event?.runId === runId && event.type === "history_retrieval",
-  );
-  const calls = events.filter((event) => event?.runId === runId && event.type === "tool_call");
-  const results = events.filter((event) => event?.runId === runId && event.type === "tool_result");
+  const historyRows = events
+    .map((event, index) => ({ event, index }))
+    .filter(({ event }) => event?.runId === runId && event.type === "history_retrieval");
+  const calls = events
+    .map((event, index) => ({ event, index }))
+    .filter(({ event }) => event?.runId === runId && event.type === "tool_call");
+  const results = events
+    .map((event, index) => ({ event, index }))
+    .filter(({ event }) => event?.runId === runId && event.type === "tool_result");
+  if (historyRows.length !== 1 || calls.length !== 1 || results.length !== 1) invalid();
+  const historyRow = historyRows[0];
+  const callRow = calls[0];
+  const resultRow = results[0];
+  const history = historyRow.event;
+  const call = callRow.event;
+  const result = resultRow.event;
   const output = history.toolOutput;
   const expectedCount = assertion.result === "hit" ? 1 : 0;
+  const principalId = history.principalId;
+  const toolCallId = call.toolCallId;
+  const callTimestamp = Date.parse(call.timestamp ?? "");
+  const observedAt = history.coverage?.observedAt;
+  const observedAtMs = Date.parse(observedAt ?? "");
+  const resultTimestamp = Date.parse(result.timestamp ?? "");
+  try {
+    verifyHistoryInputEvidence(call, input);
+  } catch {
+    invalid();
+  }
   if (
     coverage.returned !== expectedCount ||
     history.resultStatus !== (expectedCount ? "matches_found" : "no_matches_in_searched_window") ||
-    calls.length !== 1 ||
-    results.length !== 1 ||
-    calls[0].data?.name !== assertion.tool ||
-    results[0].data?.name !== assertion.tool ||
-    !calls[0].toolCallId ||
-    calls[0].toolCallId !== results[0].toolCallId ||
-    results[0].data?.isError !== false ||
-    canonical(calls[0].data?.input) !== canonical(input) ||
+    typeof principalId !== "string" ||
+    principalId.length === 0 ||
+    typeof toolCallId !== "string" ||
+    toolCallId.length === 0 ||
+    callRow.index >= historyRow.index ||
+    historyRow.index >= resultRow.index ||
+    call.data?.name !== assertion.tool ||
+    result.data?.name !== assertion.tool ||
+    !exactKeys(call.data, [
+      "runId",
+      "principalId",
+      "toolCallId",
+      "name",
+      "inputSha256",
+      "inputBytes",
+    ]) ||
+    !validIdentity(call, call.data, runId, principalId, toolCallId) ||
+    !validIdentity(result, result.data, runId, principalId, toolCallId) ||
+    !exactKeys(result.data, [
+      "runId",
+      "principalId",
+      "toolCallId",
+      "name",
+      "isError",
+      "outputBytes",
+      "outputSha256",
+    ]) ||
+    result.data?.isError !== false ||
+    !Number.isFinite(callTimestamp) ||
+    typeof observedAt !== "string" ||
+    !Number.isFinite(observedAtMs) ||
+    new Date(observedAtMs).toISOString() !== observedAt ||
+    !Number.isFinite(resultTimestamp) ||
+    Object.hasOwn(history, "timestamp") ||
+    callTimestamp > observedAtMs ||
+    observedAtMs > resultTimestamp ||
     !output ||
     Object.keys(output).sort().join(",") !== "bytes,sha256" ||
     !/^[a-f0-9]{64}$/.test(output.sha256 ?? "") ||
     !Number.isSafeInteger(output.bytes) ||
     output.bytes < 1 ||
     output.bytes > 1024 * 1024 ||
-    results[0].data?.outputBytes !== output.bytes ||
-    results[0].data?.outputSha256 !== output.sha256
+    result.data?.outputBytes !== output.bytes ||
+    result.data?.outputSha256 !== output.sha256
   )
     invalid();
   return { history, item: history.items[0] };

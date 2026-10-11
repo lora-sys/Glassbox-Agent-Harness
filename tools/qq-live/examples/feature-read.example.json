@@ -4,7 +4,7 @@
     {
       "id": "qq-group-a-root-files-read",
       "chat": "private",
-      "prompt": "请只调用 qq_group_files 的 get_group_root_files 操作查询测试群 {{group:A}} 的根目录第一页。只计算实际返回的 files 和 folders 数组长度，回复一行 QQGROUPFILES {{nonce}} files=文件数 folders=文件夹数。不要使用 Markdown，不要添加群号、文件名称、文件标识、上传者或其他内容，不要解析下载地址，不要读取其他页或修改状态。",
+      "prompt": "帮我看看测试群 {{group:A}} 群文件根目录第一页有几个文件和文件夹。只统计这一页，不下载，也不要提供文件名、文件标识或上传者。请按一行回复 QQGROUPFILES {{nonce}} files=文件数 folders=文件夹数，方便我核对。",
       "expectContains": ["{{nonce}}"],
       "sideEffect": "none",
       "leaseTools": [
@@ -43,7 +43,7 @@
     {
       "id": "qq-group-a-info-read",
       "chat": "private",
-      "prompt": "请只调用 qq_groups 的 get_group_info 操作查询测试群 {{group:A}}。用实际 member_count 和 max_member_count 填入 count 和 capacity，只回复一行 QQGROUPINFO {{nonce}} count=人数 capacity=容量。不要使用 Markdown，不要添加群号、群名、解释或其他内容，不要修改任何状态。",
+      "prompt": "帮我查一下测试群 {{group:A}} 现在有多少人，群容量是多少。只告诉我人数和容量，不用提供群名或修改设置。请按一行回复 QQGROUPINFO {{nonce}} count=人数 capacity=容量，方便我核对。",
       "expectContains": ["{{nonce}}"],
       "sideEffect": "none",
       "leaseTools": [
@@ -82,7 +82,7 @@
     {
       "id": "ops-status-read",
       "chat": "private",
-      "prompt": "请调用 ops_status 查询当前授权可见的任务与 Worker 汇总数量。不要读取单个任务或修改状态。回复摘要和测试编号 {{nonce}}。",
+      "prompt": "帮我看一下当前可以查看的任务和 Worker 汇总数量。不用打开单个任务，也不要修改状态。回复时带上测试编号 {{nonce}}。",
       "expectContains": ["{{nonce}}"],
       "sideEffect": "none",
       "leaseTools": [
@@ -112,7 +112,7 @@
     {
       "id": "qq-account-status-read",
       "chat": "private",
-      "prompt": "请只调用 qq_account_status 的 get_status 操作，说明机器人当前在线状态。不要输出 QQ 号码或版本以外的账号标识。回复状态和测试编号 {{nonce}}。",
+      "prompt": "帮我检查一下机器人当前是否在线。只告诉我在线状态，不用提供账号号码或其他账号资料。回复时带上测试编号 {{nonce}}。",
       "expectContains": ["{{nonce}}"],
       "sideEffect": "none",
       "leaseTools": [
@@ -144,7 +144,7 @@
     {
       "id": "qq-managed-groups-inventory-read",
       "chat": "private",
-      "prompt": "请调用 qq_groups 查看我管理的群列表，只报告群数量，不要输出群号、群名、成员信息或聊天内容。回复数量和测试编号 {{nonce}}。",
+      "prompt": "帮我看一下我目前管理了多少个群。只告诉我数量，不用列出群号、群名或聊天内容。回复时带上测试编号 {{nonce}}。",
       "expectContains": ["{{nonce}}"],
       "sideEffect": "none",
       "leaseTools": [
@@ -174,7 +174,7 @@
     {
       "id": "qq-group-member-count-read",
       "chat": "private",
-      "prompt": "请只调用 qq_group_members 的 get_group_member_list 操作读取测试群 A 的成员数量。只报告人数，不输出 QQ 号、昵称、群名片、角色或其他成员资料。回复人数和测试编号 {{nonce}}。",
+      "prompt": "帮我查一下测试群 {{group:A}} 现在有多少成员。只告诉我人数，不要列出成员号码、昵称或其他资料。回复时带上测试编号 {{nonce}}。",
       "expectContains": ["{{nonce}}"],
       "sideEffect": "none",
       "leaseTools": [
@@ -210,9 +210,52 @@
       ]
     },
     {
+      "id": "qq-bot-group-role-read",
+      "chat": "private",
+      "prompt": "你现在在测试群 {{group:B}} 里是管理员吗？请实际查一下。请按一行回复 QQBOTGROUPROLE {{nonce}} role=角色，方便我核对。",
+      "expectContains": ["{{nonce}}"],
+      "sideEffect": "none",
+      "leaseTools": [
+        {
+          "name": "qq_group_members",
+          "operations": [
+            {
+              "action": "group:members:read",
+              "resourceId": "group:{{group:B}}",
+              "inputConstraint": {
+                "groupId": "{{group:B}}",
+                "operation": "get_group_member_info",
+                "params": {
+                  "user_id": "{{bot}}"
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "featureAssertions": [
+        {
+          "kind": "trace",
+          "type": "tool_result",
+          "where": {
+            "name": "qq_group_members",
+            "isError": false
+          },
+          "count": 1
+        },
+        {
+          "kind": "group_member_role",
+          "tool": "qq_group_members",
+          "groupId": "{{group:B}}",
+          "userId": "{{bot}}",
+          "count": 1
+        }
+      ]
+    },
+    {
       "id": "qq-capability-registry-read",
       "chat": "private",
-      "prompt": "请调用 qq_capability_search，查询 group.read 类别中已授权的只读群能力，只报告能力数量，不输出群号、群名、成员信息或聊天内容。回复数量和测试编号 {{nonce}}。",
+      "prompt": "帮我看一下目前可用的群只读能力有多少项。只告诉我数量，不用读取群资料或聊天内容。回复时带上测试编号 {{nonce}}。",
       "expectContains": ["{{nonce}}"],
       "sideEffect": "none",
       "leaseTools": [
@@ -244,7 +287,7 @@
     {
       "id": "history-current-group-nonce",
       "chat": "A",
-      "prompt": "请只调用 group_history_search，以当前测试编号 {{nonce}} 精确搜索本群。限制返回 1 条。只说明检索结果是否找到这条编号，不引用任何其他消息。{{nonce}}",
+      "prompt": "请在本群聊天记录中查找测试标记 gbxhistory1-{{nonce}}，最多查看一条。只告诉我是否找到，不要引用其他消息。回复时带上本轮编号 {{nonce}}。",
       "expectContains": ["{{nonce}}"],
       "sideEffect": "none",
       "leaseTools": [
@@ -255,7 +298,7 @@
               "action": "history:read",
               "resourceId": "group:{{group:A}}",
               "inputConstraint": {
-                "query": "{{nonce}}",
+                "query": "gbxhistory1-{{nonce}}",
                 "limit": 1
               }
             }
@@ -276,7 +319,7 @@
           "kind": "trace",
           "type": "history_retrieval",
           "where": {
-            "query": "{{nonce}}",
+            "query": "gbxhistory1-{{nonce}}",
             "groups": ["{{group:A}}"],
             "resources": ["group:{{group:A}}"],
             "sourceKind": "channel_message",
@@ -289,7 +332,7 @@
     {
       "id": "history-owner-group-a-nonce",
       "chat": "private",
-      "prompt": "请只调用 owner_history_search，在测试群 A 中以当前测试编号 {{nonce}} 精确搜索，限制返回 1 条。只说明是否找到这条编号，不引用任何其他消息。回复测试编号 {{nonce}}。",
+      "prompt": "请在测试群 {{group:A}} 的聊天记录中查找测试标记 gbxhistory1-{{nonce}}，最多查看一条。只告诉我是否找到，不要引用其他消息。回复时带上本轮编号 {{nonce}}。",
       "expectContains": ["{{nonce}}"],
       "sideEffect": "none",
       "leaseTools": [
@@ -300,7 +343,7 @@
               "action": "history:search",
               "resourceId": "owner-history",
               "inputConstraint": {
-                "query": "{{nonce}}",
+                "query": "gbxhistory1-{{nonce}}",
                 "groupIds": ["{{group:A}}"],
                 "limit": 1
               }
@@ -322,7 +365,7 @@
           "kind": "trace",
           "type": "history_retrieval",
           "where": {
-            "query": "{{nonce}}",
+            "query": "gbxhistory1-{{nonce}}",
             "groups": ["{{group:A}}"],
             "resources": ["group:{{group:A}}"],
             "sourceKind": "channel_message",
@@ -335,7 +378,7 @@
     {
       "id": "history-current-group-complete",
       "chat": "A",
-      "prompt": "请只调用 group_history_search，以当前测试编号 {{nonce}} 精确搜索本群。限制返回 1 条。只说明检索结果是否找到这条编号，不引用任何其他消息。{{nonce}}",
+      "prompt": "请在本群聊天记录中查找测试标记 gbxhistory1-{{nonce}}，最多查看一条。只告诉我是否找到，不要引用其他消息。回复时带上本轮编号 {{nonce}}。",
       "expectContains": ["{{nonce}}"],
       "sideEffect": "none",
       "leaseTools": [
@@ -346,7 +389,7 @@
               "action": "history:read",
               "resourceId": "group:{{group:A}}",
               "inputConstraint": {
-                "query": "{{nonce}}",
+                "query": "gbxhistory1-{{nonce}}",
                 "limit": 1
               }
             }
@@ -367,7 +410,7 @@
           "kind": "trace",
           "type": "history_retrieval",
           "where": {
-            "query": "{{nonce}}",
+            "query": "gbxhistory1-{{nonce}}",
             "groups": ["{{group:A}}"],
             "resources": ["group:{{group:A}}"],
             "sourceKind": "channel_message",
@@ -377,7 +420,7 @@
         },
         {
           "kind": "history_coverage",
-          "query": "{{nonce}}",
+          "query": "gbxhistory1-{{nonce}}",
           "groupId": "{{group:A}}",
           "count": 1
         }
@@ -386,7 +429,7 @@
     {
       "id": "history-owner-group-a-complete",
       "chat": "private",
-      "prompt": "请只调用 owner_history_search，在测试群 A 中以当前测试编号 {{nonce}} 精确搜索，限制返回 1 条。只说明是否找到这条编号，不引用任何其他消息。回复测试编号 {{nonce}}。",
+      "prompt": "请在测试群 {{group:A}} 的聊天记录中查找测试标记 gbxhistory1-{{nonce}}，最多查看一条。只告诉我是否找到，不要引用其他消息。回复时带上本轮编号 {{nonce}}。",
       "expectContains": ["{{nonce}}"],
       "sideEffect": "none",
       "leaseTools": [
@@ -397,7 +440,7 @@
               "action": "history:search",
               "resourceId": "owner-history",
               "inputConstraint": {
-                "query": "{{nonce}}",
+                "query": "gbxhistory1-{{nonce}}",
                 "groupIds": ["{{group:A}}"],
                 "limit": 1
               }
@@ -419,7 +462,7 @@
           "kind": "trace",
           "type": "history_retrieval",
           "where": {
-            "query": "{{nonce}}",
+            "query": "gbxhistory1-{{nonce}}",
             "groups": ["{{group:A}}"],
             "resources": ["group:{{group:A}}"],
             "sourceKind": "channel_message",
@@ -429,7 +472,7 @@
         },
         {
           "kind": "history_coverage",
-          "query": "{{nonce}}",
+          "query": "gbxhistory1-{{nonce}}",
           "groupId": "{{group:A}}",
           "count": 1
         }
@@ -438,7 +481,7 @@
     {
       "id": "history-current-group-hit",
       "chat": "A",
-      "prompt": "调用 group_history_search，用 {{nonce}} 查询本群，limit=1。说明结果并回复 {{nonce}}。",
+      "prompt": "请在本群聊天记录中查找测试标记 gbxhistory1-{{nonce}}，最多查看一条。只告诉我是否找到，不要引用其他消息。回复时带上本轮编号 {{nonce}}。",
       "expectContains": ["{{nonce}}"],
       "sideEffect": "none",
       "leaseTools": [
@@ -449,7 +492,7 @@
               "action": "history:read",
               "resourceId": "group:{{group:A}}",
               "inputConstraint": {
-                "query": "{{nonce}}",
+                "query": "gbxhistory1-{{nonce}}",
                 "limit": 1
               }
             }
@@ -470,7 +513,7 @@
           "kind": "trace",
           "type": "history_retrieval",
           "where": {
-            "query": "{{nonce}}",
+            "query": "gbxhistory1-{{nonce}}",
             "groups": ["{{group:A}}"],
             "resources": ["group:{{group:A}}"],
             "sourceKind": "channel_message",
@@ -480,14 +523,14 @@
         },
         {
           "kind": "history_coverage",
-          "query": "{{nonce}}",
+          "query": "gbxhistory1-{{nonce}}",
           "groupId": "{{group:A}}",
           "count": 1
         },
         {
           "kind": "history_result",
           "tool": "group_history_search",
-          "query": "{{nonce}}",
+          "query": "gbxhistory1-{{nonce}}",
           "groupId": "{{group:A}}",
           "result": "hit",
           "count": 1
@@ -497,7 +540,7 @@
     {
       "id": "history-owner-group-a-no-match",
       "chat": "private",
-      "prompt": "调用 owner_history_search，仅查询群 {{group:A}}，query={{nonce}}、limit=1。说明有无匹配并回复 {{nonce}}。",
+      "prompt": "请在测试群 {{group:A}} 的聊天记录中查找测试标记 gbxhistory1-{{nonce}}，最多查看一条。只告诉我是否找到，不要引用其他消息。回复时带上本轮编号 {{nonce}}。",
       "expectContains": ["{{nonce}}"],
       "sideEffect": "none",
       "leaseTools": [
@@ -508,7 +551,7 @@
               "action": "history:search",
               "resourceId": "owner-history",
               "inputConstraint": {
-                "query": "{{nonce}}",
+                "query": "gbxhistory1-{{nonce}}",
                 "groupIds": ["{{group:A}}"],
                 "limit": 1
               }
@@ -530,7 +573,7 @@
           "kind": "trace",
           "type": "history_retrieval",
           "where": {
-            "query": "{{nonce}}",
+            "query": "gbxhistory1-{{nonce}}",
             "groups": ["{{group:A}}"],
             "resources": ["group:{{group:A}}"],
             "sourceKind": "channel_message",
@@ -540,14 +583,14 @@
         },
         {
           "kind": "history_coverage",
-          "query": "{{nonce}}",
+          "query": "gbxhistory1-{{nonce}}",
           "groupId": "{{group:A}}",
           "count": 1
         },
         {
           "kind": "history_result",
           "tool": "owner_history_search",
-          "query": "{{nonce}}",
+          "query": "gbxhistory1-{{nonce}}",
           "groupId": "{{group:A}}",
           "result": "no_match",
           "count": 1

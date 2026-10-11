@@ -19,6 +19,7 @@ const BOOT_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/
 const PHASES = new Set(["before_send", "lease_intent", "prepared", "sent", "observed"]);
 const SCOPE_KEYS = ["connectionId", "botId", "chatType", "chatId", "senderId", "threadId"];
 const RUNTIME_KEYS = ["checkout", "dataDirectory", "commit", "pid", "connectionId", "threadId"];
+const DEVELOPMENT_RUNTIME_KEYS = [...RUNTIME_KEYS, "development", "sourceTreeSha256"];
 const PROCESS_KEYS = ["pid", "bootId", "startTicks"];
 const ROW_KEYS = [
   "schemaVersion",
@@ -87,11 +88,14 @@ function sameScope(a, b) {
 }
 
 function sameRuntime(a, b) {
-  return (
-    exactKeys(a, RUNTIME_KEYS) &&
-    exactKeys(b, RUNTIME_KEYS) &&
-    RUNTIME_KEYS.every((key) => a[key] === b[key])
-  );
+  const keys = runtimeKeys(a);
+  return keys !== undefined && exactKeys(b, keys) && keys.every((key) => a[key] === b[key]);
+}
+
+function runtimeKeys(value) {
+  if (exactKeys(value, RUNTIME_KEYS)) return RUNTIME_KEYS;
+  if (exactKeys(value, DEVELOPMENT_RUNTIME_KEYS)) return DEVELOPMENT_RUNTIME_KEYS;
+  return undefined;
 }
 
 function decodeUtf8(bytes, label) {
@@ -156,8 +160,11 @@ function parseLines(text, label) {
 }
 
 function validateRuntime(originRuntime, runtime) {
-  if (!exactKeys(originRuntime, RUNTIME_KEYS) || !runtime || typeof runtime !== "object")
+  const originKeys = runtimeKeys(originRuntime);
+  const currentKeys = runtimeKeys(runtime);
+  if (!originKeys || !currentKeys || originKeys.join("\0") !== currentKeys.join("\0"))
     reject("MEMORY_RECORD_RUNTIME", "The saved Runtime identity is incomplete.");
+  const developmentRuntime = originKeys === DEVELOPMENT_RUNTIME_KEYS;
   if (
     originRuntime.checkout !== runtime.checkout ||
     originRuntime.dataDirectory !== runtime.dataDirectory ||
@@ -171,7 +178,12 @@ function validateRuntime(originRuntime, runtime) {
     originRuntime.pid < 1 ||
     typeof originRuntime.connectionId !== "string" ||
     !originRuntime.connectionId ||
-    !(originRuntime.threadId === null || typeof originRuntime.threadId === "string")
+    !(originRuntime.threadId === null || typeof originRuntime.threadId === "string") ||
+    (developmentRuntime &&
+      (originRuntime.development !== true ||
+        runtime.development !== true ||
+        !/^[a-f0-9]{64}$/.test(originRuntime.sourceTreeSha256 ?? "") ||
+        originRuntime.sourceTreeSha256 !== runtime.sourceTreeSha256))
   )
     reject("MEMORY_RECORD_RUNTIME", "The saved Runtime does not match the current Runtime.");
 }
@@ -324,7 +336,7 @@ function validateSteps(row, origin, workflow) {
       acceptance.caseId !== `memory-${stage}` ||
       acceptance.traceVerified !== true ||
       acceptance.featureStatus !== "PASS" ||
-      !exactKeys(acceptance.runtime, RUNTIME_KEYS) ||
+      !runtimeKeys(acceptance.runtime) ||
       !sameJson(acceptance.runtime, origin.runtime)
     )
       reject("MEMORY_RECORD_STEPS", "A completed Memory step lacks its exact PASS evidence.");

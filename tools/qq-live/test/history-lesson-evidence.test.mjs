@@ -13,6 +13,7 @@ import {
 } from "../lib/history-isolation-scenario.mjs";
 import { HISTORY_FAMILY_ID } from "../lib/history-family-evidence.mjs";
 import { HISTORY_ISOLATION_FAMILY_ID } from "../lib/history-isolation-family-evidence.mjs";
+import { historyInputDigest } from "../lib/history-input-evidence.mjs";
 import { historySnippet } from "../lib/history-result.mjs";
 import { toolManifestDigest } from "../lib/core.mjs";
 import { appendLesson } from "../../../.agents/skills/qq-live-testing/scripts/record-lesson.mjs";
@@ -158,7 +159,7 @@ async function archivedFixture(t, family) {
   const sourceMarker = tokens[0];
   const sourceText =
     family === "seed"
-      ? `seed ${sourceMarker} ${"x".repeat(60)}`
+      ? `seed gbxhistory1-${sourceMarker} ${"x".repeat(60)}`
       : `seed ${sourceMarker} ${sentinel} ${"x".repeat(60)}`;
   const until = new Date(nowSec * 1000).toISOString();
   const recordId = "11111111-1111-4111-8111-111111111111";
@@ -195,13 +196,18 @@ async function archivedFixture(t, family) {
     const replyText = `${token} verified reply`;
     const replyHash = hash(replyText);
     const startedAt = new Date(time * 1000 - 5000).toISOString();
+    const historyObservedAt = new Date(time * 1000).toISOString();
+    const toolCallId = `call-${index}`;
     const expiresAt = time * 1000 + 60 * 60 * 1000;
     const leaseId = `00000000-0000-4000-8000-00000000000${index + 1}`;
     const toolsSha256 = toolManifestDigest(leaseTools);
     const scopeSha256 = hash(key);
     const seedGroupId = family === "seed" ? "20001" : "20002";
     const searchedGroupId = index === 0 ? seedGroupId : "20001";
-    const query = index === 0 ? token : seedToken;
+    const query =
+      assertions.find(
+        (assertion) => assertion.kind === "trace" && assertion.type === "history_retrieval",
+      )?.where.query ?? (index === 0 ? token : seedToken);
     const toolName =
       assertions.find(
         (a) =>
@@ -396,7 +402,7 @@ async function archivedFixture(t, family) {
             sync: { stop: "end_of_source", pagesWalked: 1 },
           },
         ],
-        observedAt: occurredAt,
+        observedAt: historyObservedAt,
       },
     };
     const events = [
@@ -434,21 +440,34 @@ async function archivedFixture(t, family) {
       {
         type: "tool_call",
         runId,
-        toolCallId: `call-${index}`,
-        data: { name: toolName, input: toolInput },
+        principalId: ownerId,
+        timestamp: new Date(time * 1000 - 1000).toISOString(),
+        toolCallId,
+        data: {
+          runId,
+          principalId: ownerId,
+          toolCallId,
+          name: toolName,
+          ...historyInputDigest(toolInput),
+        },
       },
+      historyEvent,
       {
         type: "tool_result",
         runId,
-        toolCallId: `call-${index}`,
+        principalId: ownerId,
+        timestamp: new Date(time * 1000 + 1000).toISOString(),
+        toolCallId,
         data: {
+          runId,
+          principalId: ownerId,
+          toolCallId,
           name: toolName,
           isError: false,
           outputBytes: Buffer.byteLength(output, "utf8"),
           outputSha256: outputHash,
         },
       },
-      historyEvent,
     ];
     traces.push({ runId, events });
     const atRegistered = new Date(time * 1000 - 3000).toISOString();

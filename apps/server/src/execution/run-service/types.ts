@@ -266,6 +266,8 @@ export interface RunServiceOptions {
     artifactIds?: readonly string[];
     mediaAssetIds?: readonly string[];
   }>;
+  /** Rechecks protocol authority before learning or executor effects. A result ends dispatch. */
+  beforeExecution?: (input: ExecutionInput) => Promise<ExecutionResult | undefined>;
   /** Creates pending learning evidence after current Run authorization and before inference. */
   captureLearning?: (input: ExecutionInput) => Promise<string | undefined>;
   /** Fixed diagnostic codes only; provider errors and protected payloads are excluded. */

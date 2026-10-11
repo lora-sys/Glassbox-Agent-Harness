@@ -460,7 +460,8 @@ test("workflow checks out trusted base scripts only and dependency review retrie
     /- name: Check out trusted base workflow code only\n        uses: actions\/checkout@v7/u,
   );
   assert.match(hygiene, /retry-on-snapshot-warnings: true/u);
-  assert.match(hygiene, /timeout: 180/u);
+  assert.match(hygiene, /retry-on-snapshot-warnings-timeout: 600/u);
+  assert.doesNotMatch(hygiene, /^\s+timeout: \d+$/mu);
   assert.match(
     hygiene,
     /- name: Review dependency changes\n        uses: actions\/dependency-review-action@v5\n        with:\n          fail-on-severity: high/u,

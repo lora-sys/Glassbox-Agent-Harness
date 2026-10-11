@@ -14,7 +14,9 @@ export function validateHistoryCoverageAssertion(assertion) {
     assertion.kind !== "history_coverage" ||
     assertion.count !== 1 ||
     typeof assertion.query !== "string" ||
-    !/^(?:[a-f0-9]{32}|\{\{nonce\}\})$/u.test(assertion.query) ||
+    !/^(?:[a-f0-9]{32}|gbxhistory1-(?:[a-f0-9]{32}|\{\{nonce\}\})|\{\{nonce\}\})$/u.test(
+      assertion.query,
+    ) ||
     typeof assertion.groupId !== "string" ||
     !/^(?:[1-9]\d{0,15}|\{\{group:A\}\})$/u.test(assertion.groupId)
   )

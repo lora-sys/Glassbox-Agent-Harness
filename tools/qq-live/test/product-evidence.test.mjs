@@ -1,24 +1,39 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
+import { Worker } from "node:worker_threads";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import {
   caseEvidence,
+  openProductEvidenceDatabase,
   readTraceEvents,
   runtimeSnapshot,
   runtimeInspectionSnapshot,
   verifyMessageBindings,
   verifyTraceEvidence,
+  verifyAuthorizationProjectionTrace,
   verifyLeaseTraceEvidence,
   verifyGroupMemberCountEvidence,
   verifyCaseWithLeaseCleanup,
   verifyFailedCaseCleanupInDatabase,
   verifyFailedCaseCleanup,
+  filteredAuthorizationEvidence,
 } from "../lib/product-evidence.mjs";
 import { observeFeature } from "../lib/feature-observer.mjs";
+import { serviceSourceTreeSha256 } from "../../../scripts/service-source-identity.mjs";
+
+function git(cwd, ...args) {
+  return execFileSync("git", args, {
+    cwd,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
+}
 
 function memberCountTrace(
   input = { groupId: "20001", operation: "get_group_member_list", params: {} },
@@ -84,6 +99,71 @@ test("offline QQ permits only read-only recovery inspection with the same servic
       code: "RUNTIME_UNVERIFIED",
     });
   }
+});
+
+test("development runtime binds expected, current and launch source tree without weakening clean mode", (t) => {
+  const checkout = mkdtempSync(join(tmpdir(), "qq-runtime-source-"));
+  t.after(() => rmSync(checkout, { recursive: true, force: true }));
+  git(checkout, "init", "-q", "-b", "main");
+  git(checkout, "config", "user.name", "Fixture");
+  git(checkout, "config", "user.email", "fixture@example.invalid");
+  writeFileSync(join(checkout, "app.mjs"), "export const value = 1;\n");
+  git(checkout, "add", "--all");
+  git(checkout, "commit", "-q", "-m", "fixture");
+  const expectedCommit = git(checkout, "rev-parse", "HEAD");
+  const expectedSourceTreeSha256 = serviceSourceTreeSha256(checkout);
+  const dataDirectory = join(checkout, "data");
+  const runtime = {
+    checkout,
+    dataDirectory,
+    expectedCommit,
+    expectedSourceTreeSha256,
+    connectionId: "qq-live",
+  };
+  let launchSourceTreeSha256 = expectedSourceTreeSha256;
+  const status = {
+    dataDirectory,
+    processes: [
+      {
+        name: "glassbox",
+        running: true,
+        status: "running",
+        pid: 123,
+        checkout,
+        launchCommit: expectedCommit,
+        launchClean: false,
+        get launchSourceTreeSha256() {
+          return launchSourceTreeSha256;
+        },
+      },
+    ],
+    glassboxReady: true,
+    onebotReady: true,
+  };
+  const capture = (command, args, options) => {
+    if (command === "git") {
+      if (args[0] === "ls-files")
+        return execFileSync(command, args, { ...options, encoding: null });
+      return execFileSync(command, args, options);
+    }
+    if (command === process.execPath) return JSON.stringify(status);
+    throw new Error("Unexpected runtime probe.");
+  };
+
+  const snapshot = runtimeSnapshot(runtime, capture);
+  assert.equal(snapshot.development, true);
+  assert.equal(snapshot.sourceTreeSha256, expectedSourceTreeSha256);
+  assert.equal(snapshot.commit, expectedCommit);
+  assert.throws(
+    () => runtimeSnapshot({ ...runtime, expectedSourceTreeSha256: "z".repeat(64) }, capture),
+    { code: "RUNTIME_CONFIG" },
+  );
+  launchSourceTreeSha256 = "b".repeat(64);
+  assert.throws(() => runtimeSnapshot(runtime, capture), { code: "RUNTIME_SOURCE_TREE" });
+  launchSourceTreeSha256 = expectedSourceTreeSha256;
+
+  writeFileSync(join(checkout, "app.mjs"), "export const value = 2;\n");
+  assert.throws(() => runtimeSnapshot(runtime, capture), { code: "RUNTIME_SOURCE_TREE" });
 });
 
 test("feature evidence requires server lease identity and the narrowed Tool surface", () => {
@@ -169,6 +249,7 @@ test("Trace reader passes the runs directory to gbxtrace", () => {
     assert.equal(args[2], "run-123");
     assert.equal(args.filter((value) => value === "tool_call").length, 1);
     assert.equal(args.filter((value) => value === "tool_result").length, 1);
+    assert.equal(args.filter((value) => value === "authorization_projection_receipt").length, 1);
     assert.equal(args.at(-2), "--data-dir");
     assert.equal(args.at(-1), join(dataDirectory, "runs"));
     assert.equal(options.encoding, "utf8");
@@ -369,6 +450,277 @@ function filteredSourceFixture() {
   return { ...fixture, witness, insertWitness, at };
 }
 
+function projectionReceiptFixture() {
+  const fixture = evidenceFixture();
+  const { db, scopeKey } = fixture;
+  db.exec(
+    [
+      "ALTER TABLE authorization_decisions_all ADD COLUMN principal_id TEXT",
+      "ALTER TABLE authorization_decisions_all ADD COLUMN scope_key TEXT",
+      "ALTER TABLE authorization_decisions_all ADD COLUMN delivery_source TEXT",
+      "ALTER TABLE authorization_decisions_all ADD COLUMN created_at TEXT",
+      "ALTER TABLE authorization_decisions_all ADD COLUMN resource_id TEXT",
+      "ALTER TABLE authorization_decisions_all ADD COLUMN reason TEXT",
+      "ALTER TABLE authorization_decisions_all ADD COLUMN conversation_id TEXT",
+      "CREATE TABLE resources(id TEXT, kind TEXT)",
+      "INSERT INTO resources VALUES ('group:20001','qq_group')",
+      "CREATE TABLE ops_trace_events(event_id TEXT, ts TEXT, type TEXT, run_id TEXT, principal_id TEXT, data_json TEXT)",
+    ].join("; "),
+  );
+  const at = db.prepare("SELECT created_at FROM runs WHERE id='r'").get().created_at;
+  db.prepare("INSERT INTO authorization_decisions_all VALUES (?,?,?,?,?,?,?,?,?,?,?)").run(
+    "projection-deny",
+    "r",
+    "group:files:write",
+    "DENY",
+    "principal-owner-1",
+    scopeKey,
+    null,
+    at,
+    "group:20001",
+    "no_grant",
+    "conversation-r",
+  );
+  const receiptId = "projection-receipt-1";
+  const inputSha256 = createHash("sha256").update("{}", "utf8").digest("hex");
+  const receipt = {
+    schema: "glassbox.authorization-projection-receipt.v1",
+    receiptId,
+    kind: "managed_group_inventory",
+    purpose: "managed_group_category_availability",
+    conversationId: "conversation-r",
+    scopeKey,
+    toolName: "qq_groups",
+    toolCallId: "inventory-call",
+    inputSha256,
+    inputBytes: 2,
+    outputSha256: "c".repeat(64),
+    outputBytes: 42,
+    decisions: [
+      {
+        decisionId: "projection-deny",
+        action: "group:files:write",
+        resourceId: "group:20001",
+        purpose: "managed_group_category_availability",
+      },
+    ],
+  };
+  const insertReceipt = (data = receipt, run = "r", principal = "principal-owner-1", ts = at) =>
+    db
+      .prepare("INSERT INTO ops_trace_events VALUES (?,?,?,?,?,?)")
+      .run(
+        randomUUID(),
+        ts,
+        "authorization.projection_receipt",
+        run,
+        principal,
+        JSON.stringify(data),
+      );
+  insertReceipt();
+  return { ...fixture, receipt, insertReceipt };
+}
+
+function projectionTrace(receipt, overrides = {}) {
+  const common = { runId: "r", principalId: "principal-owner-1", toolCallId: receipt.toolCallId };
+  return [
+    {
+      ...common,
+      type: "tool_call",
+      timestamp: "2026-10-07T00:00:00.000Z",
+      data: {
+        ...common,
+        name: receipt.toolName,
+        projectionInputSha256: receipt.inputSha256,
+        projectionInputBytes: receipt.inputBytes,
+        ...overrides.call,
+      },
+    },
+    {
+      ...common,
+      type: "authorization_projection_receipt",
+      timestamp: "2026-10-07T00:00:01.000Z",
+      receiptEventId: receipt.receiptId,
+      schema: receipt.schema,
+      receiptId: receipt.receiptId,
+      kind: receipt.kind,
+      purpose: receipt.purpose,
+      conversationId: receipt.conversationId,
+      scopeKey: receipt.scopeKey,
+      toolName: receipt.toolName,
+      toolCallId: receipt.toolCallId,
+      inputSha256: receipt.inputSha256,
+      inputBytes: receipt.inputBytes,
+      outputSha256: receipt.outputSha256,
+      outputBytes: receipt.outputBytes,
+      decisions: receipt.decisions,
+      ...overrides.receipt,
+    },
+    {
+      ...common,
+      type: "tool_result",
+      timestamp: "2026-10-07T00:00:02.000Z",
+      data: {
+        ...common,
+        name: receipt.toolName,
+        isError: false,
+        outputSha256: receipt.outputSha256,
+        outputBytes: receipt.outputBytes,
+        ...overrides.result,
+      },
+    },
+  ];
+}
+
+test("category availability DENY stays recorded and requires the exact paired projection receipt", (t) => {
+  const f = projectionReceiptFixture();
+  t.after(() => f.db.close());
+  const evidence = caseEvidence(f.db, f.c, f.config);
+  assert.equal(
+    evidence.decisions.find((decision) => decision.id === "projection-deny").decision,
+    "DENY",
+  );
+  assert.deepEqual(evidence.filteredDecisions, []);
+  assert.equal(evidence.authorizationProjectionReceipts.length, 1);
+  verifyAuthorizationProjectionTrace(
+    projectionTrace(evidence.authorizationProjectionReceipts[0]),
+    evidence.runId,
+    evidence.principalId,
+    evidence.authorizationProjectionReceipts,
+  );
+});
+
+test("projection receipt chronology uses gbxtrace row time and sequence when the event omits timestamp", (t) => {
+  const f = projectionReceiptFixture();
+  t.after(() => f.db.close());
+  const evidence = caseEvidence(f.db, f.c, f.config);
+  const rows = projectionTrace(evidence.authorizationProjectionReceipts[0]).map((event, index) => {
+    const row = {
+      ...event,
+      traceSequence: index + 10,
+      traceTimestamp: event.timestamp,
+    };
+    if (event.type === "authorization_projection_receipt") delete row.timestamp;
+    return row;
+  });
+  verifyAuthorizationProjectionTrace(
+    rows,
+    evidence.runId,
+    evidence.principalId,
+    evidence.authorizationProjectionReceipts,
+  );
+  const outOfOrder = rows.map((event) => ({ ...event }));
+  outOfOrder[1].traceSequence = outOfOrder[2].traceSequence + 1;
+  assert.throws(
+    () =>
+      verifyAuthorizationProjectionTrace(
+        outOfOrder,
+        evidence.runId,
+        evidence.principalId,
+        evidence.authorizationProjectionReceipts,
+      ),
+    { code: "AUTHORIZATION_EVIDENCE" },
+  );
+});
+
+test("projection receipts fail closed for revocation, scope drift, reuse, wrong purpose and changed output", (t) => {
+  const cases = [
+    (f) =>
+      f.db.exec(
+        "UPDATE authorization_decisions_all SET decision='ALLOW' WHERE id='projection-deny'",
+      ),
+    (f) => f.db.exec("DELETE FROM ops_trace_events WHERE type='authorization.projection_receipt'"),
+    (f) =>
+      f.db.exec(
+        "UPDATE authorization_decisions_all SET scope_key='other-scope' WHERE id='projection-deny'",
+      ),
+    (f) => {
+      const at = f.db.prepare("SELECT created_at FROM runs WHERE id='r'").get().created_at;
+      f.db
+        .prepare("INSERT INTO authorization_decisions_all VALUES (?,?,?,?,?,?,?,?,?,?,?)")
+        .run(
+          "projection-deny-partial",
+          "r",
+          "group:moderate",
+          "DENY",
+          "principal-owner-1",
+          f.scopeKey,
+          null,
+          at,
+          "group:20001",
+          "no_grant",
+          "conversation-r",
+        );
+    },
+    (f) => f.insertReceipt({ ...f.receipt, scopeKey: "other-scope" }),
+    (f) =>
+      f.insertReceipt({
+        ...f.receipt,
+        decisions: [{ ...f.receipt.decisions[0], action: "delivery:send" }],
+      }),
+    (f) => f.insertReceipt({ ...f.receipt, receiptId: "projection-receipt-2" }),
+    (f) =>
+      f.db.exec(
+        "UPDATE authorization_decisions_all SET reason='unknown_reason' WHERE id='projection-deny'",
+      ),
+  ];
+  for (const change of cases) {
+    const f = projectionReceiptFixture();
+    t.after(() => f.db.close());
+    change(f);
+    assert.throws(() => caseEvidence(f.db, f.c, f.config), { code: "AUTHORIZATION_EVIDENCE" });
+  }
+  const f = projectionReceiptFixture();
+  t.after(() => f.db.close());
+  const evidence = caseEvidence(f.db, f.c, f.config);
+  const receipts = evidence.authorizationProjectionReceipts;
+  const mutatedInput = JSON.stringify({ query: "changed" });
+  const mutatedInputEvidence = {
+    projectionInputSha256: createHash("sha256").update(mutatedInput, "utf8").digest("hex"),
+    projectionInputBytes: Buffer.byteLength(mutatedInput, "utf8"),
+  };
+  for (const call of [
+    { projectionInputSha256: "d".repeat(64) },
+    mutatedInputEvidence,
+    { projectionInputBytes: receipts[0].inputBytes + 1 },
+    { projectionInputSha256: undefined, projectionInputBytes: undefined },
+  ]) {
+    assert.throws(
+      () =>
+        verifyAuthorizationProjectionTrace(
+          projectionTrace(receipts[0], { call }),
+          evidence.runId,
+          evidence.principalId,
+          receipts,
+        ),
+      { code: "AUTHORIZATION_EVIDENCE" },
+    );
+  }
+  assert.throws(
+    () =>
+      verifyAuthorizationProjectionTrace(
+        projectionTrace(receipts[0], {
+          result: { outputSha256: "d".repeat(64) },
+        }),
+        evidence.runId,
+        evidence.principalId,
+        receipts,
+      ),
+    { code: "AUTHORIZATION_EVIDENCE" },
+  );
+  const wrongPrincipalTrace = projectionTrace(receipts[0]);
+  wrongPrincipalTrace[1].principalId = "another-principal";
+  assert.throws(
+    () =>
+      verifyAuthorizationProjectionTrace(
+        wrongPrincipalTrace,
+        evidence.runId,
+        evidence.principalId,
+        receipts,
+      ),
+    { code: "AUTHORIZATION_EVIDENCE" },
+  );
+});
+
 test("source denial remains a DENY and passes only with an exact durable exclusion witness", (t) => {
   const { db, c, config, insertWitness } = filteredSourceFixture();
   t.after(() => db.close());
@@ -388,6 +740,144 @@ test("source denial remains a DENY and passes only with an exact durable exclusi
   ]);
   db.exec("INSERT INTO ops_trace_events SELECT * FROM ops_trace_events");
   assert.throws(() => caseEvidence(db, c, config), { code: "AUTHORIZATION_EVIDENCE" });
+});
+
+function mixedProjectionAndHistoryFixture() {
+  const f = projectionReceiptFixture();
+  const { db, scopeKey, receipt } = f;
+  const at = db.prepare("SELECT created_at FROM runs WHERE id='r'").get().created_at;
+  const categories = [
+    { id: "projection-deny-2", action: "group:moderate", resourceId: "group:20002" },
+    { id: "projection-deny-3", action: "group:settings:write", resourceId: "group:20003" },
+    { id: "projection-deny-4", action: "group:files:write", resourceId: "group:20004" },
+  ];
+  for (const category of categories) {
+    db.prepare("INSERT INTO resources VALUES (?, 'qq_group')").run(category.resourceId);
+    db.prepare("INSERT INTO authorization_decisions_all VALUES (?,?,?,?,?,?,?,?,?,?,?)").run(
+      category.id,
+      "r",
+      category.action,
+      "DENY",
+      "principal-owner-1",
+      scopeKey,
+      null,
+      at,
+      category.resourceId,
+      "no_grant",
+      "conversation-r",
+    );
+  }
+  const categoryEntries = [
+    ...receipt.decisions,
+    ...categories.map(({ id, action, resourceId }) => ({
+      decisionId: id,
+      action,
+      resourceId,
+      purpose: "managed_group_category_availability",
+    })),
+  ];
+  const combinedReceipt = { ...receipt, decisions: categoryEntries };
+  db.prepare(
+    "UPDATE ops_trace_events SET data_json=? WHERE type='authorization.projection_receipt'",
+  ).run(JSON.stringify(combinedReceipt));
+  for (let index = 0; index < 27; index += 1) {
+    const id = `history-deny-${index}`;
+    db.prepare("INSERT INTO authorization_decisions_all VALUES (?,?,?,?,?,?,?,?,?,?,?)").run(
+      id,
+      "r",
+      "history:read",
+      "DENY",
+      "principal-owner-1",
+      scopeKey,
+      null,
+      at,
+      "group:20001",
+      "source_policy_denied",
+      "conversation-r",
+    );
+    db.prepare("INSERT INTO ops_trace_events VALUES (?,?,?,?,?,?)").run(
+      `history-exclusion-${index}`,
+      at,
+      "authorization.filtered",
+      "r",
+      "principal-owner-1",
+      JSON.stringify({
+        decisionId: id,
+        projection: "conversation-history",
+        outcome: "excluded",
+      }),
+    );
+  }
+  const decisions = db
+    .prepare("SELECT id, decision, action FROM authorization_decisions_all WHERE run_id='r'")
+    .all();
+  return { ...f, decisions };
+}
+
+test("mixed managed-group projection receipts and history exclusions cover only their own DENYs", (t) => {
+  const f = mixedProjectionAndHistoryFixture();
+  t.after(() => f.db.close());
+  const result = filteredAuthorizationEvidence(
+    f.db,
+    { id: "r", principal_id: "principal-owner-1" },
+    f.scopeKey,
+    f.decisions,
+  );
+  assert.equal(result.length, 27);
+  assert.equal(new Set(result.map((item) => item.decisionId)).size, 27);
+  assert.ok(result.every((item) => item.projection === "conversation-history"));
+});
+
+test("mixed denial coverage rejects a missing history exclusion or invalid projection receipt", (t) => {
+  for (const mutate of [
+    (f) => f.db.prepare("DELETE FROM ops_trace_events WHERE event_id='history-exclusion-13'").run(),
+    (f) => {
+      const invalid = { ...f.receipt, unexpected: true };
+      const data = {
+        ...invalid,
+        decisions: [
+          ...f.receipt.decisions,
+          {
+            decisionId: "projection-deny-2",
+            action: "group:moderate",
+            resourceId: "group:20002",
+            purpose: "managed_group_category_availability",
+          },
+          {
+            decisionId: "projection-deny-3",
+            action: "group:settings:write",
+            resourceId: "group:20003",
+            purpose: "managed_group_category_availability",
+          },
+          {
+            decisionId: "projection-deny-4",
+            action: "group:files:write",
+            resourceId: "group:20004",
+            purpose: "managed_group_category_availability",
+          },
+        ],
+      };
+      f.db
+        .prepare(
+          "UPDATE ops_trace_events SET data_json=? WHERE type='authorization.projection_receipt'",
+        )
+        .run(JSON.stringify(data));
+    },
+  ]) {
+    const f = mixedProjectionAndHistoryFixture();
+    t.after(() => f.db.close());
+    mutate(f);
+    assert.throws(
+      () =>
+        filteredAuthorizationEvidence(
+          f.db,
+          { id: "r", principal_id: "principal-owner-1" },
+          f.scopeKey,
+          f.decisions,
+        ),
+      { code: "AUTHORIZATION_EVIDENCE" },
+    );
+  }
 });
 
 test("document source exclusions use the same strict pairing contract as history sources", (t) => {
@@ -1276,4 +1766,170 @@ test("isolation reply proof checks actual QQ content even when report hash and n
     verifyMessageBindings(duplicate.c, duplicate.config, duplicate.clients, duplicate.delivery),
     { code: "MESSAGE_BINDING" },
   );
+});
+
+function lockedDatabaseWorker(databasePath, releaseAfterReadMs) {
+  const source = `
+    const { parentPort, workerData } = require("node:worker_threads");
+    const { DatabaseSync } = require("node:sqlite");
+    const db = new DatabaseSync(workerData.databasePath);
+    db.exec("BEGIN EXCLUSIVE");
+    parentPort.postMessage("locked");
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      db.exec("ROLLBACK");
+      db.close();
+      parentPort.postMessage("released");
+    };
+    parentPort.on("message", (message) => {
+      if (message === "release") release();
+      if (message === "start-read" && workerData.releaseAfterReadMs !== null)
+        setTimeout(release, workerData.releaseAfterReadMs);
+    });
+  `;
+  return new Worker(source, {
+    eval: true,
+    workerData: { databasePath, releaseAfterReadMs },
+  });
+}
+
+function workerMessage(worker, expected) {
+  return new Promise((resolveMessage, reject) => {
+    const onMessage = (message) => {
+      if (message !== expected) return;
+      worker.off("message", onMessage);
+      worker.off("error", onError);
+      resolveMessage();
+    };
+    const onError = (error) => {
+      worker.off("message", onMessage);
+      reject(error);
+    };
+    worker.on("message", onMessage);
+    worker.once("error", onError);
+  });
+}
+
+function lockedDbFixture(t) {
+  const directory = mkdtempSync(join(tmpdir(), "qq-evidence-readonly-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const databasePath = join(directory, "glassbox.db");
+  const db = new DatabaseSync(databasePath);
+  db.exec("PRAGMA journal_mode=DELETE; PRAGMA user_version=29");
+  db.close();
+  return databasePath;
+}
+
+test("product evidence readonly database waits for a transient exclusive SQLite lock", async (t) => {
+  const databasePath = lockedDbFixture(t);
+  const worker = lockedDatabaseWorker(databasePath, 250);
+  t.after(async () => worker.terminate());
+  await workerMessage(worker, "locked");
+  const released = workerMessage(worker, "released");
+  const originalPrepare = DatabaseSync.prototype.prepare;
+  DatabaseSync.prototype.prepare = function (sql, ...args) {
+    if (sql === "PRAGMA user_version") worker.postMessage("start-read");
+    return originalPrepare.call(this, sql, ...args);
+  };
+  const startedAt = Date.now();
+  let db;
+  let elapsedMs;
+  try {
+    db = openProductEvidenceDatabase(databasePath);
+    assert.equal(db.prepare("PRAGMA user_version").get().user_version, 29);
+    elapsedMs = Date.now() - startedAt;
+  } finally {
+    DatabaseSync.prototype.prepare = originalPrepare;
+    db?.close();
+  }
+  await released;
+  assert.ok(elapsedMs >= 100, `SQLite read returned before lock release (${elapsedMs}ms)`);
+});
+
+test("product evidence readonly database fails closed after its bounded busy timeout", async (t) => {
+  const databasePath = lockedDbFixture(t);
+  const worker = lockedDatabaseWorker(databasePath, null);
+  let releasedByTest = false;
+  t.after(async () => {
+    if (!releasedByTest) worker.postMessage("release");
+    await worker.terminate();
+  });
+  await workerMessage(worker, "locked");
+  const released = workerMessage(worker, "released");
+  const originalPrepare = DatabaseSync.prototype.prepare;
+  DatabaseSync.prototype.prepare = function (sql, ...args) {
+    if (sql === "PRAGMA user_version") worker.postMessage("start-read");
+    return originalPrepare.call(this, sql, ...args);
+  };
+  const startedAt = Date.now();
+  try {
+    const db = openProductEvidenceDatabase(databasePath);
+    assert.throws(
+      () => db.prepare("PRAGMA user_version").get(),
+      (error) => error?.code === "ERR_SQLITE_ERROR" && /locked/u.test(error.message),
+    );
+    db.close();
+  } finally {
+    DatabaseSync.prototype.prepare = originalPrepare;
+  }
+  const elapsedMs = Date.now() - startedAt;
+  assert.ok(
+    elapsedMs >= 4500,
+    `SQLite read failed before the 5000 ms busy timeout (${elapsedMs}ms)`,
+  );
+  worker.postMessage("release");
+  await released;
+  releasedByTest = true;
+});
+
+test("product evidence database helper opens readonly and does not change the database", (t) => {
+  const databasePath = lockedDbFixture(t);
+  const db = openProductEvidenceDatabase(databasePath);
+  assert.equal(db.prepare("PRAGMA user_version").get().user_version, 29);
+  assert.throws(
+    () => db.exec("PRAGMA user_version = 30"),
+    (error) => error?.code === "ERR_SQLITE_ERROR" && /readonly/u.test(error.message),
+  );
+  db.close();
+  const verification = new DatabaseSync(databasePath, { readOnly: true });
+  assert.equal(verification.prepare("PRAGMA user_version").get().user_version, 29);
+  verification.close();
+});
+
+test("capability discovery receipts use the production tool-definition resource kind", (t) => {
+  const f = projectionReceiptFixture();
+  t.after(() => f.db.close());
+  f.db.exec(
+    "UPDATE resources SET id='tool:qq_group_local_settings',kind='tool-definition'; UPDATE authorization_decisions_all SET action='tool:discover',resource_id='tool:qq_group_local_settings' WHERE id='projection-deny'; DELETE FROM ops_trace_events",
+  );
+  const receipt = {
+    ...f.receipt,
+    kind: "capability_search",
+    purpose: "capability_search_availability",
+    toolName: "qq_capability_search",
+    decisions: [
+      {
+        decisionId: "projection-deny",
+        action: "tool:discover",
+        resourceId: "tool:qq_group_local_settings",
+        purpose: "capability_tool_discovery_availability",
+      },
+    ],
+  };
+  f.insertReceipt(receipt);
+  const evidence = caseEvidence(f.db, f.c, f.config);
+  assert.equal(evidence.authorizationProjectionReceipts.length, 1);
+  assert.equal(evidence.decisions.find((row) => row.id === "projection-deny").decision, "DENY");
+  verifyAuthorizationProjectionTrace(
+    projectionTrace(evidence.authorizationProjectionReceipts[0]),
+    evidence.runId,
+    evidence.principalId,
+    evidence.authorizationProjectionReceipts,
+  );
+  for (const kind of ["tool", "qq_group", "memory"]) {
+    f.db.prepare("UPDATE resources SET kind=?").run(kind);
+    assert.throws(() => caseEvidence(f.db, f.c, f.config), { code: "AUTHORIZATION_EVIDENCE" });
+  }
 });

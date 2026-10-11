@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { Type } from "typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -5,11 +6,13 @@ import type { DomainStore } from "../../persistence/index.js";
 import { MediaAssetStore } from "../../media/media-asset-store.js";
 import { downloadPublicMediaOutput } from "../../media/download-public-output.js";
 import type {
+  ImageGenerationRequest,
   ImageRatio,
   MediaGenerationProvider,
   MediaProviderFailure,
   VideoRatio,
   VideoGenerationJob,
+  VideoGenerationRequest,
 } from "../../media/provider.js";
 import { assertPublicWebUrl, dohResolveWebHost } from "../../web/network-guard.js";
 import {
@@ -18,6 +21,7 @@ import {
   type ProtectedToolContext,
 } from "./protected-tools.js";
 import type { PiRunContext } from "./types.js";
+import { ProviderCallError } from "./provider-outcome.js";
 
 export const MEDIA_GENERATION_TOOL = "media_generate";
 export const MEDIA_GENERATION_RESOURCE = "media-generation";
@@ -96,8 +100,18 @@ function imageMime(data: Buffer): "image/png" | "image/jpeg" | "image/webp" {
   throw new Error("media_output_invalid_image");
 }
 
-function fixedFailure(status: MediaProviderFailure): string {
-  return `media_${status}`;
+function failMedia(status: MediaProviderFailure | "output_too_large"): never {
+  const outcome = [
+    "auth_missing",
+    "quota_exhausted",
+    "rate_limited",
+    "capability_unavailable",
+  ].includes(status)
+    ? "provider_unavailable"
+    : status === "timeout"
+      ? "unknown"
+      : "provider_failed";
+  throw new ProviderCallError(outcome, `media_${status}`);
 }
 
 async function validateReferenceUrls(input: MediaToolInput): Promise<void> {
@@ -112,6 +126,49 @@ async function validateReferenceUrls(input: MediaToolInput): Promise<void> {
   }
 }
 
+function sha256(value: string | Buffer): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+async function recordMediaGenerationAdmission(
+  context: ProtectedToolContext,
+  provider: string,
+  mediaType: "image" | "video",
+  providerInput: ImageGenerationRequest | VideoGenerationRequest,
+  metadata: {
+    mode: string;
+    size?: string;
+    seconds?: number;
+    ratio?: string;
+    referenceCount: number;
+    hasFirstFrame: boolean;
+    hasLastFrame: boolean;
+  },
+  recordEvidence: (record: Record<string, unknown>, context: ProtectedToolContext) => Promise<void>,
+): Promise<void> {
+  if (!context.toolCallId) throw new Error("media_tool_call_id_required");
+  const providerInputJson = JSON.stringify(providerInput);
+  if (typeof providerInputJson !== "string") throw new Error("media_provider_input_invalid");
+  const prompt = providerInput.prompt;
+  await recordEvidence(
+    {
+      type: "media_generation_request_admitted",
+      schemaVersion: 1,
+      runId: context.runId,
+      principalId: context.caller.principalId,
+      toolCallId: context.toolCallId,
+      provider,
+      mediaType,
+      providerInputSha256: sha256(providerInputJson),
+      providerInputBytes: Buffer.byteLength(providerInputJson, "utf8"),
+      promptSha256: sha256(prompt),
+      promptBytes: Buffer.byteLength(prompt, "utf8"),
+      ...metadata,
+    },
+    context,
+  );
+}
+
 export function createMediaGenerationTools(options: {
   store: DomainStore;
   getContext: () => PiRunContext | undefined;
@@ -123,7 +180,11 @@ export function createMediaGenerationTools(options: {
   return [
     createProtectedTool<
       MediaToolInput,
-      { assets?: readonly string[]; status: string; requestedResolution?: string }
+      {
+        assets?: readonly string[];
+        status: string;
+        requestedResolution?: string;
+      }
     >({
       name: MEDIA_GENERATION_TOOL,
       label: "生成图片或视频",
@@ -148,7 +209,9 @@ export function createMediaGenerationTools(options: {
             }),
           ),
           ratio: Type.Optional(
-            Type.String({ enum: ["1:1", "3:4", "4:3", "16:9", "9:16", "2:3", "3:2", "21:9"] }),
+            Type.String({
+              enum: ["1:1", "3:4", "4:3", "16:9", "9:16", "2:3", "3:2", "21:9"],
+            }),
           ),
           seconds: Type.Optional(Type.Integer({ minimum: 4, maximum: 12 })),
           images: Type.Optional(
@@ -172,7 +235,7 @@ export function createMediaGenerationTools(options: {
       execute: async (input, context, signal) => {
         if (input.action === "image") {
           if (!options.provider.capabilities.includes("image") || !options.provider.generateImage)
-            return { status: "media_capability_unavailable" };
+            return failMedia("capability_unavailable");
           const mode = inputString(input, "mode", "text2image");
           if (mode !== "text2image" && mode !== "img2img" && mode !== "compose")
             throw new Error("invalid_media_input");
@@ -182,23 +245,43 @@ export function createMediaGenerationTools(options: {
           await validateReferenceUrls(input);
           if (input.ratio && !IMAGE_RATIOS.includes(input.ratio as ImageRatio))
             throw new Error("invalid_media_input");
-          consumeMutationIntent(context, MEDIA_GENERATION_TOOL, { action: input.action });
-          const result = await options.provider.generateImage(
+          if (!context.toolCallId) throw new Error("media_tool_call_id_required");
+          consumeMutationIntent(context, MEDIA_GENERATION_TOOL, {
+            action: input.action,
+          });
+          const providerInput: ImageGenerationRequest = {
+            mode: mode as ImageGenerationRequest["mode"],
+            prompt: input.prompt,
+            size: size as ImageGenerationRequest["size"],
+            ...(input.ratio ? { ratio: input.ratio as ImageRatio } : {}),
+            ...(input.images
+              ? {
+                  images: input.images.map(({ url }) => ({
+                    type: "url" as const,
+                    url,
+                  })),
+                }
+              : {}),
+            output: "base64",
+          };
+          await recordMediaGenerationAdmission(
+            context,
+            providerId("image"),
+            "image",
+            providerInput,
             {
               mode,
-              prompt: input.prompt,
               size,
-              ...(input.ratio ? { ratio: input.ratio as ImageRatio } : {}),
-              ...(input.images
-                ? { images: input.images.map(({ url }) => ({ type: "url" as const, url })) }
-                : {}),
-              output: "base64",
+              ...(providerInput.ratio ? { ratio: providerInput.ratio } : {}),
+              referenceCount: providerInput.images?.length ?? 0,
+              hasFirstFrame: false,
+              hasLastFrame: false,
             },
-            signal,
+            options.recordEvidence,
           );
-          if (result.status !== "ready") return { status: fixedFailure(result.status) };
-          if (result.images.length === 0 || result.images.length > 3)
-            return { status: fixedFailure("failed") };
+          const result = await options.provider.generateImage(providerInput, signal);
+          if (result.status !== "ready") return failMedia(result.status);
+          if (result.images.length === 0 || result.images.length > 3) return failMedia("failed");
           const images: Array<{
             mimeType: "image/png" | "image/jpeg" | "image/webp";
             data: Buffer;
@@ -212,7 +295,7 @@ export function createMediaGenerationTools(options: {
                     maxBytes: MAX_IMAGE_BYTES,
                     signal,
                   });
-            if (data.length > MAX_IMAGE_BYTES) return { status: "media_output_too_large" };
+            if (data.length > MAX_IMAGE_BYTES) return failMedia("output_too_large");
             if ("base64" in output && data.toString("base64") !== output.base64)
               throw new Error("media_output_invalid_image");
             const mimeType = imageMime(data);
@@ -253,25 +336,43 @@ export function createMediaGenerationTools(options: {
           !options.provider.createVideo ||
           !options.provider.pollVideo
         )
-          return { status: "media_capability_unavailable" };
+          return failMedia("capability_unavailable");
         if (input.ratio && !VIDEO_RATIOS.includes(input.ratio as VideoRatio))
           throw new Error("invalid_media_input");
         await validateReferenceUrls(input);
-        consumeMutationIntent(context, MEDIA_GENERATION_TOOL, { action: input.action });
-        const job = await options.provider.createVideo(
+        if (!context.toolCallId) throw new Error("media_tool_call_id_required");
+        consumeMutationIntent(context, MEDIA_GENERATION_TOOL, {
+          action: input.action,
+        });
+        const providerInput: VideoGenerationRequest = {
+          mode: mode as VideoGenerationRequest["mode"],
+          prompt: input.prompt,
+          ...(input.seconds === undefined ? {} : { seconds: input.seconds }),
+          ...(input.ratio ? { aspectRatio: input.ratio as VideoRatio } : {}),
+          ...(input.firstFrame ? { firstFrame: input.firstFrame } : {}),
+          ...(input.lastFrame ? { lastFrame: input.lastFrame } : {}),
+          ...(input.images ? { images: input.images.map(({ url }) => url) } : {}),
+        };
+        await recordMediaGenerationAdmission(
+          context,
+          providerId("video"),
+          "video",
+          providerInput,
           {
             mode,
-            prompt: input.prompt,
-            ...(input.seconds === undefined ? {} : { seconds: input.seconds }),
-            ...(input.ratio ? { aspectRatio: input.ratio as VideoRatio } : {}),
-            ...(input.firstFrame ? { firstFrame: input.firstFrame } : {}),
-            ...(input.lastFrame ? { lastFrame: input.lastFrame } : {}),
-            ...(input.images ? { images: input.images.map(({ url }) => url) } : {}),
+            ...(providerInput.seconds === undefined ? {} : { seconds: providerInput.seconds }),
+            ...(providerInput.aspectRatio ? { ratio: providerInput.aspectRatio } : {}),
+            referenceCount:
+              (providerInput.images?.length ?? 0) +
+              Number(providerInput.firstFrame !== undefined) +
+              Number(providerInput.lastFrame !== undefined),
+            hasFirstFrame: providerInput.firstFrame !== undefined,
+            hasLastFrame: providerInput.lastFrame !== undefined,
           },
-          signal,
+          options.recordEvidence,
         );
-        if (job.status !== "pending" && job.status !== "completed")
-          return { status: fixedFailure(job.status) };
+        const job = await options.provider.createVideo(providerInput, signal);
+        if (job.status !== "pending" && job.status !== "completed") return failMedia(job.status);
         const startedAt = Date.now();
         let completed: VideoGenerationJob = job;
         let waitMs = 5_000;
@@ -282,17 +383,14 @@ export function createMediaGenerationTools(options: {
           waitMs = Math.min(Math.round(waitMs * 1.4), 20_000);
         }
         if (completed.status !== "completed")
-          return {
-            status:
-              completed.status === "pending" ? "media_timeout" : fixedFailure(completed.status),
-          };
+          return failMedia(completed.status === "pending" ? "timeout" : completed.status);
         if (signal?.aborted) throw new Error("Operation cancelled");
         const data = await downloadPublicMediaOutput(completed.url, {
           maxBytes: MAX_VIDEO_BYTES,
           signal,
         });
         if (signal?.aborted) throw new Error("Operation cancelled");
-        if (data.length > MAX_VIDEO_BYTES) return { status: "media_output_too_large" };
+        if (data.length > MAX_VIDEO_BYTES) return failMedia("output_too_large");
         const asset = await options.assets.write(
           {
             principalId: context.caller.principalId,
@@ -322,7 +420,7 @@ export function createMediaGenerationTools(options: {
       },
       projectResult: (result) =>
         result.assets?.length
-          ? `Media generation ${result.status}.${result.requestedResolution ? ` Provider requested video resolution ${result.requestedResolution}; image size options do not apply to video.` : ""} Include each delivery marker exactly once in the final response: ${result.assets.map((id) => `[asset:${id}]`).join(" ")}`
+          ? `Media generation ${result.status}.${result.requestedResolution ? ` Provider requested video resolution ${result.requestedResolution}; image size options do not apply to video.` : ""} Glassbox will deliver the generated attachments after the Run completes and delivery authorization passes. Do not claim receipt before delivery. Asset references: ${result.assets.map((id) => `[asset:${id}]`).join(" ")}`
           : `Media generation ${result.status}.`,
     }),
   ];

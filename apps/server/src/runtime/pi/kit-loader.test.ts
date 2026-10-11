@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -20,6 +21,26 @@ async function fixture() {
   return { directory, loader: new KitLoader(directory) };
 }
 
+function git(directory: string, ...args: string[]): string {
+  return execFileSync("git", args, {
+    cwd: directory,
+    encoding: "utf8",
+    timeout: 5_000,
+    maxBuffer: 64 * 1024,
+    stdio: ["ignore", "pipe", "ignore"],
+  }).trim();
+}
+
+async function gitFixture() {
+  const { directory } = await fixture();
+  git(directory, "init");
+  git(directory, "config", "user.name", "Kit Loader Test");
+  git(directory, "config", "user.email", "kit-loader-test@example.invalid");
+  git(directory, "add", "-A");
+  git(directory, "commit", "-m", "Kit fixture");
+  return { directory, commit: git(directory, "rev-parse", "HEAD") };
+}
+
 it("checks the actual Pi version and rejects runtime paths outside the isolated root", async () => {
   const { directory, loader } = await fixture();
   expect(loader.verifyCompatibility("0.85.1").compatible).toBe(true);
@@ -30,6 +51,85 @@ it("checks the actual Pi version and rejects runtime paths outside the isolated 
     isolateSessionState: true,
   };
   expect(() => loader.resolveAgentDir(profile, directory)).toThrow("escapes isolated root");
+});
+
+it("validates a Kit Git checkout against the configured commit and clean tree", async () => {
+  const { directory, commit } = await gitFixture();
+  const loader = new KitLoader(directory, commit);
+  const verified = loader.verifyCompatibility("0.85.1");
+  expect(verified.compatible).toBe(true);
+  expect(verified.details).toMatchObject({
+    configuredKitCommit: commit,
+    actualKitCommit: commit,
+    kitCommitVerified: true,
+    kitWorkingTreeClean: true,
+    kitSourceType: "git-checkout",
+  });
+  expect(loader.buildRuntimeConfig("test", directory).kitCommit).toBe(commit);
+
+  const mismatched = new KitLoader(directory, "f".repeat(40)).verifyCompatibility("0.85.1");
+  expect(mismatched.compatible).toBe(false);
+  expect(mismatched.details).toMatchObject({
+    actualKitCommit: commit,
+    kitCommitVerified: false,
+    kitWorkingTreeClean: true,
+  });
+});
+
+it("rejects a Git Kit source changed after compatibility verification", async () => {
+  const { directory, commit } = await gitFixture();
+  const loader = new KitLoader(directory, commit);
+  expect(loader.verifyCompatibility("0.85.1").compatible).toBe(true);
+
+  await writeFile(join(directory, "untracked-after-initialize.txt"), "changed");
+  expect(() => loader.runtimeEvidence("test")).toThrow(
+    "does not match its configured commit or is not clean",
+  );
+
+  await rm(join(directory, "untracked-after-initialize.txt"));
+  await writeFile(join(directory, "profiles/test.json"), JSON.stringify({ name: "test" }));
+  git(directory, "add", "-A");
+  git(directory, "commit", "-m", "Changed Kit after initialization");
+  expect(() => loader.runtimeEvidence("test")).toThrow(
+    "does not match its configured commit or is not clean",
+  );
+});
+
+it("does not use a parent repository to identify a packaged Kit", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "glassbox-kit-parent-repo-"));
+  directories.push(parent);
+  const directory = join(parent, "lora-pi-kit");
+  await mkdir(directory, { recursive: true });
+  await cp(fileURLToPath(new URL("./fixtures/lora-pi-kit", import.meta.url)), directory, {
+    recursive: true,
+  });
+  git(parent, "init");
+
+  const verified = new KitLoader(directory).verifyCompatibility("0.85.1");
+  expect(verified.compatible).toBe(true);
+  expect(verified.details).toMatchObject({
+    actualKitCommit: null,
+    kitCommitVerified: false,
+    kitSourceType: "distribution",
+  });
+});
+
+it("leaves a packaged Kit commit unknown when Git metadata is absent", async () => {
+  const { loader } = await fixture();
+  const verified = loader.verifyCompatibility("0.85.1");
+  expect(verified.compatible).toBe(true);
+  expect(verified.details).toMatchObject({
+    actualKitCommit: null,
+    kitCommitVerified: false,
+    kitWorkingTreeClean: null,
+    kitSourceType: "distribution",
+  });
+  expect(loader.runtimeEvidence("test")).toMatchObject({
+    actualKitCommit: null,
+    configuredKitCommit: expect.any(String),
+    kitCommitVerified: false,
+  });
+  expect(loader.buildRuntimeConfig("test").kitCommit).toBe("unknown");
 });
 
 it("lists every Kit profile so profile-selection drift fails before a Run", async () => {

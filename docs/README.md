@@ -14,7 +14,7 @@ Use one source of truth per topic.
 
 | Topic | Source of truth |
 | --- | --- |
-| Current implementation order and completion gate | `../.plans/03-personal-agent-foundation.md` |
+| Current implementation records and remaining acceptance gates | `../.plans/06-durable-long-work.md`, `../.plans/issue-24-closeout.md`, and `../.plans/roadmap.md` |
 | Long-term phase sequence | `../.plans/roadmap.md` |
 | Stable repository invariants | `../AGENTS.md` |
 | Runtime ownership / Pi SDK / runtime roles | `runtime-strategy.md` |
@@ -26,7 +26,13 @@ Use one source of truth per topic.
 | Persistence / storage / observability / projections | `data-observability.md` |
 | Interactive demo curriculum | `interactive-demos.md` |
 | Web Management UI 设计规范 / UI Primitives / 验收标准 | `ui-design.md` |
-| Upstream research pins | `../upstream/*/SOURCES.md` |
+| Linux runtime migration and parity acceptance | `linux-runtime-migration.md` |
+| Owner Pi sandbox and browser deployment boundary | `owner-pi-sandbox.md` |
+| Authorization decision archive | `authorization-archive.md` |
+| NapCat Linux deployment template | `napcat-linux.compose.yml` |
+| Trace investigation and event reference | `../.agents/skills/glassbox-ops/SKILL.md`, `../.agents/skills/glassbox-ops/references/trace-events.md` |
+| Documentation freshness audit | `../.plans/issue-156-doc-freshness.md` |
+| Upstream research pins | `../upstream/README.md`, `../upstream/manifest.json`, and `../upstream/*/SOURCES.md` |
 
 Do not duplicate detailed implementation rules across several documents. Link to the owner document instead.
 

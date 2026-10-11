@@ -10,8 +10,8 @@ const details = {
   remark: "private provider data".repeat(100),
 };
 const result = (data: Record<string, unknown> = details) => ({
-  content: [{ type: "text", text: JSON.stringify(data) }],
-  details: data,
+  content: [{ type: "text", text: JSON.stringify({ status: "ok", data }) }],
+  details: { status: "ok", data },
 });
 
 describe("group metadata Trace projection", () => {
@@ -44,6 +44,17 @@ describe("group metadata Trace projection", () => {
       null,
       [],
       { details },
+      { content: [{ type: "text", text: JSON.stringify(details) }], details },
+      {
+        content: [{ type: "text", text: JSON.stringify({ status: "error", data: details }) }],
+        details: { status: "error", data: details },
+      },
+      {
+        content: [
+          { type: "text", text: JSON.stringify({ status: "ok", data: details, extra: true }) },
+        ],
+        details: { status: "ok", data: details, extra: true },
+      },
       { ...result(), extra: true },
       { ...result(), content: [{ type: "text", text: "wrong" }] },
       { ...result(), content: [{ type: "image", text: JSON.stringify(details) }] },

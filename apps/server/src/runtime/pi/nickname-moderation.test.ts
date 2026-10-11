@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { expect, it, vi } from "vite-plus/test";
 import { openDomainStore } from "../../persistence/index.js";
 import type { TrustedChannelScope } from "../../identity/scope.js";
@@ -98,6 +99,8 @@ async function fixture(
     text: "禁言 Ripped 30 秒",
     executionRef: "pi:test",
   });
+  const inputWitnesses: Array<Record<string, unknown>> = [];
+  const eventOrder: string[] = [];
   let context: PiRunContext = {
     caller: { principalId, scope },
     runId: accepted.run.id,
@@ -108,6 +111,10 @@ async function fixture(
         : ["qq_group_moderation", "qq_group_members"],
     requiredToolName: "qq_group_moderation",
     requiredToolInput: { ...input, groupId },
+    recordQqToolExecutionInput: async (record) => {
+      inputWitnesses.push(record);
+      eventOrder.push(`witness:${record.action}`);
+    },
   };
   const calls: Array<{ action: string; params: Record<string, unknown>; principalId: string }> = [];
   let roster: unknown = options.roster ?? defaultRoster;
@@ -133,8 +140,10 @@ async function fixture(
       if (resolutionError) throw resolutionError;
       resolutions.push(resolution);
     },
-    invoke: async ({ action, params, context: caller }) => {
+    invoke: async ({ action, params, context: caller, recordVerifiedInput }) => {
+      if (action === "set_group_ban") await recordVerifiedInput?.();
       calls.push({ action, params: { ...params }, principalId: caller.caller.principalId });
+      eventOrder.push(`provider:${action}`);
       if (action === "get_group_member_list") {
         await onRoster?.();
         return roster;
@@ -167,6 +176,8 @@ async function fixture(
     call,
     tool,
     resolutions,
+    inputWitnesses,
+    eventOrder,
     set resolutionError(value: Error | undefined) {
       resolutionError = value;
     },
@@ -426,7 +437,12 @@ it.each([false, true])(
         cleanup: async () => {},
         disposeSession: async () => {},
       };
-      const result = await new PiRunExecutionAdapter(runtime).execute({
+      const evidenceRecords: Array<Record<string, unknown>> = [];
+      const result = await new PiRunExecutionAdapter(runtime, {
+        onEvidence: async (record) => {
+          evidenceRecords.push(record);
+        },
+      }).execute({
         caller: f.context.caller!,
         conversation: f.accepted.conversation,
         run: f.accepted.run,
@@ -440,8 +456,27 @@ it.each([false, true])(
       if (denied) {
         expect(result).toMatchObject({ status: "failed", text: expect.stringContaining("QQ 号") });
         expect(f.calls).toEqual([]);
+        expect(
+          evidenceRecords.filter((record) => record.type === "qq_tool_execution_input_verified"),
+        ).toEqual([]);
       } else {
         expect(result).toMatchObject({ status: "succeeded", text: "已禁言。" });
+        expect(
+          evidenceRecords.filter((record) => record.type === "qq_tool_execution_input_verified"),
+        ).toMatchObject([
+          {
+            runId: f.accepted.run.id,
+            conversationId: f.accepted.conversation.id,
+            principalId: f.context.caller?.principalId,
+            toolCallId: "call",
+            toolName: "qq_group_moderation",
+            leaseId: null,
+            action: "set_group_ban",
+            resourceId: groupResourceId(groupId),
+            inputBytes: expect.any(Number),
+            inputSha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
+          },
+        ]);
         expect(f.calls.at(-1)?.params).toEqual({
           group_id: Number(groupId),
           user_id: 10004,
@@ -553,6 +588,25 @@ it("records only the resolved target and authorization receipt before mutation",
       },
     ]);
     expect(JSON.stringify(f.resolutions)).not.toContain("Ripped");
+    const serializedInput = JSON.stringify({
+      duration: 30,
+      group_id: Number(groupId),
+      user_id: 10004,
+    });
+    expect(f.inputWitnesses).toEqual([
+      {
+        conversationId: f.accepted.conversation.id,
+        principalId: "owner",
+        toolCallId: "call",
+        toolName: "qq_group_moderation",
+        leaseId: null,
+        action: "set_group_ban",
+        resourceId: groupResourceId(groupId),
+        inputSha256: createHash("sha256").update(serializedInput, "utf8").digest("hex"),
+        inputBytes: Buffer.byteLength(serializedInput, "utf8"),
+      },
+    ]);
+    expect(f.eventOrder.slice(-2)).toEqual(["witness:set_group_ban", "provider:set_group_ban"]);
   } finally {
     await f.store.close();
   }

@@ -117,10 +117,11 @@ function validFolder(value: unknown): value is { [key: string]: JsonValue } {
 /** Payload-free evidence from the complete returned provider page in the protected Tool result. */
 export function groupFilesEvidence(result: unknown):
   | {
-      schemaVersion: 1;
+      schemaVersion: 2;
       fileCount: number;
       folderCount: number;
       listingSha256: string;
+      metadataSha256: string;
     }
   | undefined {
   try {
@@ -135,24 +136,28 @@ export function groupFilesEvidence(result: unknown):
       result.content[0].type !== "text" ||
       typeof result.content[0].text !== "string" ||
       !isRecord(result.details) ||
-      !hasExactKeys(result.details, ["files", "folders"]) ||
-      !Array.isArray(result.details.files) ||
-      !Array.isArray(result.details.folders) ||
-      result.details.files.length + result.details.folders.length > 50 ||
+      !hasExactKeys(result.details, ["data", "status"]) ||
+      result.details.status !== "ok" ||
+      !isRecord(result.details.data) ||
+      !hasExactKeys(result.details.data, ["files", "folders"]) ||
+      !Array.isArray(result.details.data.files) ||
+      !Array.isArray(result.details.data.folders) ||
+      result.details.data.files.length + result.details.data.folders.length > 50 ||
       !validJsonValue(result.details)
     )
       return undefined;
 
-    const serializedDetails = JSON.stringify(result.details);
+    const serializedEnvelope = JSON.stringify(result.details);
     if (
-      typeof serializedDetails !== "string" ||
-      Buffer.byteLength(serializedDetails, "utf8") > 256 * 1024 ||
-      result.content[0].text !== serializedDetails
+      typeof serializedEnvelope !== "string" ||
+      Buffer.byteLength(serializedEnvelope, "utf8") > 256 * 1024 ||
+      result.content[0].text !== serializedEnvelope
     )
       return undefined;
 
-    const files = result.details.files;
-    const folders = result.details.folders;
+    const details = result.details.data;
+    const files = details.files as JsonValue[];
+    const folders = details.folders as JsonValue[];
     if (!files.every(validFile) || !folders.every(validFolder)) return undefined;
     const groupIds = [...files, ...folders].map((row) => validGroupId(row.group_id));
     if (groupIds.some((groupId) => groupId === undefined) || new Set(groupIds).size > 1)
@@ -163,12 +168,23 @@ export function groupFilesEvidence(result: unknown):
     )
       return undefined;
 
-    const canonical = canonicalJson(result.details as JsonValue);
+    const canonical = canonicalJson(details as JsonValue);
+    // Keep file_id in the full listing digest. The metadata digest compares
+    // every other file-row field and the complete folders array.
+    const metadata: JsonValue = {
+      files: files.map((file) => {
+        const { file_id: _fileId, ...rest } = file as Record<string, JsonValue>;
+        return rest;
+      }),
+      folders,
+    };
+    const canonicalMetadata = canonicalJson(metadata);
     return {
-      schemaVersion: 1,
+      schemaVersion: 2,
       fileCount: files.length,
       folderCount: folders.length,
       listingSha256: createHash("sha256").update(canonical, "utf8").digest("hex"),
+      metadataSha256: createHash("sha256").update(canonicalMetadata, "utf8").digest("hex"),
     };
   } catch {
     return undefined;

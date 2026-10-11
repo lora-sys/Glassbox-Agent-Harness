@@ -24,6 +24,21 @@
     "enabled": false,
     "retainAuditConfirmed": false
   },
+  "groupPolicyFixtures": {
+    "enabled": false,
+    "retainAuditConfirmed": false,
+    "groupId": "填写群B号"
+  },
+  "mediaFixtures": {
+    "enabled": false,
+    "retainAssetsConfirmed": false,
+    "timeoutMs": 600000
+  },
+  "groupPolicyFixtures": {
+    "enabled": false,
+    "retainAuditConfirmed": false,
+    "groupId": "填写群B号"
+  },
   "safety": {
     "acceptanceServiceConfirmed": false,
     "soleConsumerConfirmed": false,
@@ -31,9 +46,10 @@
   },
   "moderation": {
     "enabled": false,
-    "group": "A",
+    "group": "B",
     "target": "",
     "consentConfirmed": false,
+    "consentConfirmedAt": "",
     "consentUntil": "",
     "durationSeconds": 60,
     "emergencyCleanupViaDriver": false

@@ -22,6 +22,11 @@ const RUNTIME = {
   connectionId: "qq-onebot-main",
   threadId: null,
 };
+const DEVELOPMENT_RUNTIME = {
+  ...RUNTIME,
+  development: true,
+  sourceTreeSha256: "8".repeat(64),
+};
 const ORIGIN = {
   runtime: { ...RUNTIME, pid: 772 },
   process: {
@@ -240,10 +245,24 @@ async function loadRecord(pending, rows, options = {}) {
     pendingPath: "/locks/driver.memory-pending.json",
     driverQQ: DRIVER,
     scope: SCOPE,
-    runtime: RUNTIME,
+    runtime: options.expectedRuntime ?? RUNTIME,
     read: source.read,
   });
   return { result, source };
+}
+
+function withDevelopmentRuntime(rows, runtime = DEVELOPMENT_RUNTIME) {
+  const recordedRuntime = { ...runtime, pid: ORIGIN.runtime.pid };
+  let previous = null;
+  for (const row of rows) {
+    row.origin.runtime = structuredClone(recordedRuntime);
+    for (const step of row.steps) step.productAcceptance.runtime = structuredClone(recordedRuntime);
+    row.previousSha256 = previous;
+    delete row.checkpointSha256;
+    row.checkpointSha256 = digest(JSON.stringify(row));
+    previous = row.checkpointSha256;
+  }
+  return rows;
 }
 
 function validFeedbackRows() {
@@ -603,6 +622,48 @@ test("validates recovery attempt identity and fixed reject message through obser
   assert.equal(result.pending.recoveryAttempt.phase, "observed");
   assert.equal(result.pending.recoveryAttempt.cleanupRunId, "run-reject-0004");
   assert.equal(result.pending.recoveryAttempt.stage, "reject");
+});
+
+test("preserves exact six-field and explicit eight-field development Runtime identities", async () => {
+  const rows = withDevelopmentRuntime(validFeedbackRows());
+  const { result } = await loadRecord(rows.at(-1), rows, { expectedRuntime: DEVELOPMENT_RUNTIME });
+  assert.deepEqual(result.origin.runtime, { ...DEVELOPMENT_RUNTIME, pid: ORIGIN.runtime.pid });
+
+  const differentExpectedSource = {
+    ...DEVELOPMENT_RUNTIME,
+    sourceTreeSha256: "7".repeat(64),
+  };
+  await assert.rejects(loadRecord(rows.at(-1), rows, { expectedRuntime: differentExpectedSource }));
+
+  const changed = withDevelopmentRuntime(validFeedbackRows());
+  changed[2].origin.runtime.sourceTreeSha256 = "7".repeat(64);
+  changed[2] = attachHash(changed[2]);
+  for (let index = 3; index < changed.length; index++) {
+    changed[index].previousSha256 = changed[index - 1].checkpointSha256;
+    changed[index] = attachHash(changed[index]);
+  }
+  await assert.rejects(
+    loadRecord(changed.at(-1), changed, { expectedRuntime: DEVELOPMENT_RUNTIME }),
+  );
+});
+
+test("rejects development Runtime extra fields and development-to-clean downgrade", async () => {
+  const extra = withDevelopmentRuntime(validFeedbackRows());
+  extra[0].origin.runtime.unreviewed = true;
+  extra[0] = attachHash(extra[0]);
+  for (let index = 1; index < extra.length; index++) {
+    extra[index].previousSha256 = extra[index - 1].checkpointSha256;
+    extra[index] = attachHash(extra[index]);
+  }
+  await assert.rejects(loadRecord(extra.at(-1), extra, { expectedRuntime: DEVELOPMENT_RUNTIME }));
+
+  const developmentRows = withDevelopmentRuntime(validFeedbackRows());
+  await assert.rejects(loadRecord(developmentRows.at(-1), developmentRows));
+
+  const cleanRows = validFeedbackRows();
+  await assert.rejects(
+    loadRecord(cleanRows.at(-1), cleanRows, { expectedRuntime: DEVELOPMENT_RUNTIME }),
+  );
 });
 
 test("CLI checkpoint projection remains readable after coordinator adds cleanup evidence", async () => {

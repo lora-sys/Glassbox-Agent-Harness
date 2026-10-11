@@ -7,9 +7,44 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { world, baseConfig } from "./fixture.mjs";
 import { digest } from "../lib/core.mjs";
-import { acquireRunLock } from "../cli.mjs";
+import { acquireRunLock, shouldCreateSafetyStop, shouldWriteLatest } from "../cli.mjs";
 import { verifyMemoryProcessStopped } from "../lib/memory-process.mjs";
 const cli = fileURLToPath(new URL("../cli.mjs", import.meta.url));
+
+test("resume-media updates latest only after verified two-stage completion", () => {
+  assert.equal(shouldWriteLatest("resume-media", { status: "BLOCKED" }, null), false);
+  assert.equal(
+    shouldWriteLatest(
+      "resume-media",
+      { status: "INCONCLUSIVE" },
+      { status: "MEDIA_RECOVERY_COMPLETE" },
+    ),
+    false,
+  );
+  assert.equal(shouldWriteLatest("resume-media", { status: "PASS" }, null), false);
+  assert.equal(
+    shouldWriteLatest("resume-media", { status: "PASS" }, { status: "MEDIA_RECOVERY_COMPLETE" }),
+    true,
+  );
+  assert.equal(shouldWriteLatest("run", { status: "FAIL" }, null), true);
+});
+
+test("acceptance memory cleanup rejects custom execution and repeated input before config or QQ access", async (t) => {
+  const d = await dir(t);
+  for (const options of [
+    [],
+    ["--input", "manifest.json", "--case", "group-A"],
+    ["--input", "manifest.json", "--scenarios", "custom.json"],
+    ["--input", "manifest.json", "--input", "other.json"],
+    ["--input", "manifest.json", "--pr", "https://example.invalid/pr"],
+  ]) {
+    const result = await run(["cleanup-acceptance-memory", ...options], d);
+    assert.notEqual(result.code, 0);
+    assert.ok(result.stderr.includes("ARGUMENT"), result.stderr);
+    assert.ok(!result.stderr.includes("CONNECT_TIMEOUT"));
+    assert.ok(!result.stderr.includes("CONFIG_READ"));
+  }
+});
 
 test("lesson registration rejects execution flags before reading configuration or sending", async (t) => {
   const d = await dir(t);
@@ -28,6 +63,185 @@ test("lesson registration rejects execution flags before reading configuration o
   const invalid = await run(["record-lesson", "--input", input], d);
   assert.notEqual(invalid.code, 0);
   assert.ok(!`${invalid.stdout}${invalid.stderr}`.includes("do-not-expose-this-value"));
+});
+
+test("media recovery CLI requires its fixed report, family, and both reviewed hashes", async (t) => {
+  const d = await dir(t);
+  for (const args of [
+    ["resume-media"],
+    ["resume-media", "--live", "--report", "report.json"],
+    [
+      "resume-media",
+      "--live",
+      "--report",
+      "report.json",
+      "--case",
+      "other-case",
+      "--scenarios",
+      "suite.json",
+      "--approve-suite",
+      "a".repeat(64),
+      "--approve-recovery",
+      "b".repeat(64),
+    ],
+    [
+      "resume-media",
+      "--live",
+      "--report",
+      "report.json",
+      "--case",
+      "media-private-delivery",
+      "--scenarios",
+      "suite.json",
+      "--approve-suite",
+      "a".repeat(64),
+      "--approve-recovery",
+      "invalid",
+    ],
+  ]) {
+    const result = await run(args, d);
+    assert.notEqual(result.code, 0);
+    assert.ok(result.stderr.includes("ARGUMENT"), result.stderr);
+    assert.ok(!result.stderr.includes("CONNECT_TIMEOUT"));
+  }
+  const plan = await run(["plan-media-recovery"], d);
+  assert.notEqual(plan.code, 0);
+  assert.ok(plan.stderr.includes("ARGUMENT"), plan.stderr);
+});
+
+test("media delivery-gap cleanup CLI accepts only its fixed plan and approved archive options", async (t) => {
+  const d = await dir(t);
+  for (const args of [
+    ["plan-media-delivery-gap-cleanup"],
+    ["plan-media-delivery-gap-cleanup", "--report", "report.json", "--live"],
+    ["reconcile-media-delivery-gap-cleanup", "--report", "report.json", "--live"],
+    [
+      "reconcile-media-delivery-gap-cleanup",
+      "--report",
+      "report.json",
+      "--approve-plan",
+      "a".repeat(64),
+    ],
+    [
+      "reconcile-media-delivery-gap-cleanup",
+      "--report",
+      "report.json",
+      "--live",
+      "--approve-plan",
+      "invalid",
+    ],
+    [
+      "reconcile-media-delivery-gap-cleanup",
+      "--report",
+      "report.json",
+      "--live",
+      "--approve-plan",
+      "a".repeat(64),
+      "--case",
+      "other",
+    ],
+  ]) {
+    const result = await run(args, d);
+    assert.equal(result.code, 2);
+    assert.match(result.stderr, /ARGUMENT/);
+    assert.doesNotMatch(`${result.stdout}${result.stderr}`, /CONNECT_TIMEOUT/);
+  }
+  const help = await run(["help"], d);
+  assert.match(help.stdout, /plan-media-delivery-gap-cleanup --report/);
+  assert.match(help.stdout, /reconcile-media-delivery-gap-cleanup --report/);
+});
+
+test("unfinished media cleanup intent blocks live sends and delivery before network access", async (t) => {
+  const d = await dir(t);
+  const configPath = join(d, "config.json");
+  const lockRoot = join(d, ".glassbox-qq-live-locks");
+  await mkdir(lockRoot, { recursive: true, mode: 0o700 });
+  await writeFile(configPath, JSON.stringify(baseConfig()));
+  await writeFile(
+    join(lockRoot, `${digest("10001").slice(0, 24)}.media-cleanup-intent.json`),
+    '{"kind":"qq-live-media-delivery-gap-cleanup-intent"}\n',
+    { mode: 0o600 },
+  );
+  const blockedRun = await run(
+    ["run", "--live", "--config", configPath, "--out", join(d, "reports")],
+    d,
+  );
+  assert.notEqual(blockedRun.code, 0);
+  assert.match(blockedRun.stderr, /MEDIA_DELIVERY_GAP_CLEANUP_REQUIRED/);
+  assert.doesNotMatch(`${blockedRun.stdout}${blockedRun.stderr}`, /CONNECT_TIMEOUT/);
+
+  const blockedDelivery = await run(
+    [
+      "deliver",
+      "--live",
+      "--config",
+      configPath,
+      "--pr",
+      "https://example.invalid/pr/1",
+      "--scenarios",
+      "scenarios.json",
+      "--reports",
+      "manifest.json",
+      "--approve-suite",
+      "a".repeat(64),
+    ],
+    d,
+  );
+  assert.notEqual(blockedDelivery.code, 0);
+  assert.match(blockedDelivery.stderr, /MEDIA_DELIVERY_GAP_CLEANUP_REQUIRED/);
+  assert.doesNotMatch(`${blockedDelivery.stdout}${blockedDelivery.stderr}`, /CONNECT_TIMEOUT/);
+});
+
+test("unfinished media-release intent blocks every live run before OneBot connection", async (t) => {
+  const d = await dir(t);
+  const scenarioPath = new URL("../examples/media-private.example.json", import.meta.url);
+  const scenarioText = await readFile(scenarioPath, "utf8");
+  const configPath = join(d, "config.json");
+  const out = join(d, "reports");
+  const lockRoot = join(d, ".glassbox-qq-live-locks");
+  await mkdir(out, { recursive: true });
+  await mkdir(lockRoot, { recursive: true });
+  await writeFile(
+    join(lockRoot, `${digest("10001").slice(0, 24)}.media-release-intent.json`),
+    "malformed intent\n",
+    {
+      mode: 0o600,
+    },
+  );
+  await writeFile(
+    configPath,
+    JSON.stringify({
+      ...baseConfig(),
+      runtime: {},
+      mediaFixtures: {
+        enabled: true,
+        retainAssetsConfirmed: true,
+        timeoutMs: 1000,
+      },
+    }),
+  );
+  const result = await run(
+    [
+      "run",
+      "--live",
+      "--case",
+      "media-private-delivery",
+      "--scenarios",
+      fileURLToPath(scenarioPath),
+      "--approve-suite",
+      digest(scenarioText),
+      "--config",
+      configPath,
+      "--out",
+      out,
+    ],
+    d,
+  );
+  assert.notEqual(result.code, 0);
+  const latest = JSON.parse(await readFile(join(out, "latest.json"), "utf8"));
+  assert.equal(latest.error.code, "MEDIA_RECOVERY_RELEASE_REQUIRED");
+  assert.equal(latest.environment, undefined);
+  assert.ok(!result.stderr.includes("CONNECT_TIMEOUT"));
 });
 async function run(args, dir, extraEnv = {}) {
   return new Promise((resolve) => {
@@ -54,6 +268,306 @@ async function dir(t) {
   t.after(() => rm(d, { recursive: true, force: true }));
   return d;
 }
+test("acceptance-memory reconciliation CLI validates its fixed arguments and dispatches read-only plans", async (t) => {
+  const d = await dir(t);
+  const configPath = join(d, "config.json");
+  const config = baseConfig();
+  delete config.safety;
+  await writeFile(configPath, JSON.stringify(config));
+
+  for (const options of [
+    ["--input", "manifest.json"],
+    ["--input", "manifest.json", "--cleanup-report", "report.json", "--case", "other"],
+    ["--input", "manifest.json", "--cleanup-report", "report.json", "--input", "again.json"],
+  ]) {
+    const result = await run(
+      ["reconcile-acceptance-memory", "--config", configPath, ...options],
+      d,
+    );
+    assert.equal(result.code, 2);
+    assert.match(result.stderr, /ARGUMENT/);
+    assert.doesNotMatch(`${result.stdout}${result.stderr}`, /CONNECT_TIMEOUT/);
+  }
+  const help = await run(["help"], d);
+  assert.match(
+    help.stdout,
+    /reconcile-acceptance-memory --input <manifest-json> --cleanup-report <report-json>/,
+  );
+
+  const dry = await run(
+    [
+      "reconcile-acceptance-memory",
+      "--config",
+      configPath,
+      "--input",
+      join(d, "missing-manifest.json"),
+      "--cleanup-report",
+      join(d, "missing-cleanup-report.json"),
+      "--out",
+      join(d, "reports"),
+    ],
+    d,
+  );
+  assert.equal(dry.code, 3);
+  assert.match(dry.stderr, /CLEANUP_READ/);
+  assert.doesNotMatch(`${dry.stdout}${dry.stderr}`, /CONNECT_TIMEOUT/);
+
+  const live = await run(
+    [
+      "reconcile-acceptance-memory",
+      "--config",
+      configPath,
+      "--input",
+      join(d, "missing-manifest.json"),
+      "--cleanup-report",
+      join(d, "missing-cleanup-report.json"),
+      "--live",
+      "--approve-suite",
+      "a".repeat(64),
+    ],
+    d,
+  );
+  assert.equal(live.code, 2);
+  assert.match(live.stderr, /ACCEPTANCE_SERVICE_REQUIRED/);
+  assert.doesNotMatch(`${live.stdout}${live.stderr}`, /CONNECT_TIMEOUT/);
+});
+
+test("completed cleanup reconciliation has a bounded read-only command and rejects execution flags", async (t) => {
+  const d = await dir(t);
+  for (const options of [
+    [],
+    ["--input", "manifest.json"],
+    ["--cleanup-failure", "failure.json"],
+    ["--input", "manifest.json", "--cleanup-failure", "failure.json", "--live"],
+    [
+      "--input",
+      "manifest.json",
+      "--cleanup-failure",
+      "failure.json",
+      "--approve-suite",
+      "a".repeat(64),
+    ],
+    [
+      "--input",
+      "manifest.json",
+      "--cleanup-failure",
+      "failure.json",
+      "--cleanup-failure",
+      "other.json",
+    ],
+  ]) {
+    const result = await run(["reconcile-completed-cleanup", ...options], d);
+    assert.notEqual(result.code, 0);
+    assert.match(result.stderr, /ARGUMENT/);
+    assert.doesNotMatch(`${result.stdout}${result.stderr}`, /CONNECT_TIMEOUT|CONFIG_READ/);
+  }
+  const help = await run(["help"], d);
+  assert.match(
+    help.stdout,
+    /reconcile-completed-cleanup --input <manifest-json> --cleanup-failure <failed-report-json>/,
+  );
+});
+
+test("cleanup report option is unavailable to ordinary commands", async (t) => {
+  const d = await dir(t);
+  const result = await run(["run", "--cleanup-report", join(d, "report.json")], d);
+  assert.equal(result.code, 2);
+  assert.match(result.stderr, /ARGUMENT/);
+  assert.doesNotMatch(`${result.stdout}${result.stderr}`, /CONFIG_READ|CONNECT_TIMEOUT/);
+});
+
+test("a known history failure releases STOP only after verified restore and cleanup", () => {
+  const report = {
+    status: "FAIL",
+    cases: [],
+    groupPolicyAcceptance: {
+      status: "GROUP_POLICY_RESTORED_FEATURE_FAILED",
+      requiresReconciliation: false,
+      cleanupVerified: true,
+      actualQqDeliveryVerified: true,
+    },
+    productAcceptance: { status: "FAIL", cleanupVerified: true },
+    groupPolicyFinalStateProof: { status: "GROUP_POLICY_FINAL_STATE_VERIFIED" },
+  };
+  assert.equal(shouldCreateSafetyStop(report, { pendingGroupPolicyFixtureCreated: true }), false);
+  for (const mutate of [
+    (value) => (value.groupPolicyAcceptance.cleanupVerified = false),
+    (value) => (value.groupPolicyAcceptance.requiresReconciliation = true),
+    (value) => (value.productAcceptance.cleanupVerified = false),
+    (value) => (value.groupPolicyFinalStateProof.status = "INCONCLUSIVE"),
+  ]) {
+    const changed = structuredClone(report);
+    mutate(changed);
+    assert.equal(
+      shouldCreateSafetyStop(changed, {
+        pendingGroupPolicyFixtureCreated: true,
+      }),
+      true,
+    );
+  }
+});
+
+test("unverified acceptance-memory ARCHIVE_INTENT blocks normal live runs before QQ connection", async (t) => {
+  const d = await dir(t);
+  const w = await world();
+  t.after(() => w.close());
+  const configPath = join(d, "config.json");
+  const out = join(d, "reports");
+  const config = { ...w.config, runtime: {} };
+  await writeFile(configPath, JSON.stringify(config));
+  const planned = await run(["plan", "--config", configPath], d);
+  assert.equal(planned.code, 0, planned.stderr);
+  const suiteSha256 = JSON.parse(planned.stdout).suiteSha256;
+  const archive = join(
+    out,
+    "acceptance-memory-reconciliation",
+    "11111111-1111-4111-8111-111111111111",
+  );
+  await mkdir(archive, { recursive: true });
+  await writeFile(join(archive, "intent.json"), JSON.stringify({ status: "ARCHIVE_INTENT" }));
+  const result = await run(
+    ["run", "--live", "--approve-suite", suiteSha256, "--config", configPath, "--out", out],
+    d,
+  );
+  assert.equal(result.code, 2, `${result.stdout}${result.stderr}`);
+  assert.equal(w.driver.authCount, 0);
+  assert.equal(w.bot.authCount, 0);
+  assert.equal(w.actions.length, 0);
+  const latest = JSON.parse(await readFile(join(out, "latest.json"), "utf8"));
+  assert.equal(latest.error.code, "MEMORY_RECONCILIATION_REQUIRED");
+});
+
+test("schema 8 plans four fixed Worker stages and refuses disabled live fixtures", async (t) => {
+  const d = await dir(t);
+  const config = join(d, "config.json");
+  const scenarios = join(d, "worker.json");
+  await writeFile(config, JSON.stringify(baseConfig()));
+  await writeFile(
+    scenarios,
+    JSON.stringify({
+      schemaVersion: 8,
+      cases: [
+        {
+          id: "task-worker-artifact-lifecycle",
+          kind: "task-worker-artifact-lifecycle",
+          chat: "private",
+        },
+      ],
+    }),
+  );
+  const result = await run(["plan", "--config", config, "--scenarios", scenarios], d);
+  assert.equal(result.code, 0, result.stderr);
+  const plan = JSON.parse(result.stdout);
+  assert.deepEqual(
+    plan.taskWorkerPlan.stages.map((s) => s.stage),
+    ["create", "delegate", "inspect", "accept"],
+  );
+  assert.match(plan.suiteSha256, /^[a-f0-9]{64}$/);
+  const refused = await run(
+    [
+      "run",
+      "--live",
+      "--config",
+      config,
+      "--scenarios",
+      scenarios,
+      "--case",
+      "task-worker-artifact-lifecycle",
+    ],
+    d,
+  );
+  assert.notEqual(refused.code, 0);
+  assert.ok(refused.stderr.includes("TASK_WORKER_FIXTURE_DISABLED"), refused.stderr);
+  assert.ok(!refused.stderr.includes("CONNECT_TIMEOUT"));
+});
+test("schema 7 plan displays both fixed media stages without connecting QQ", async (t) => {
+  const d = await dir(t);
+  const config = join(d, "config.json");
+  const scenarios = join(d, "media.json");
+  await writeFile(config, JSON.stringify(baseConfig()));
+  await writeFile(
+    scenarios,
+    JSON.stringify({
+      schemaVersion: 7,
+      cases: [
+        {
+          id: "media-private-delivery",
+          kind: "media-private-delivery",
+          chat: "private",
+        },
+      ],
+    }),
+  );
+  const result = await run(["plan", "--config", config, "--scenarios", scenarios], d);
+  assert.equal(result.code, 0, result.stderr);
+  const plan = JSON.parse(result.stdout);
+  assert.deepEqual(
+    plan.mediaPlan.stages.map((s) => s.stage),
+    ["image-1k", "video-4s"],
+  );
+  assert.ok(plan.mediaPlan.stages.every((s) => s.spec.chat === "private"));
+  assert.equal(plan.mediaPlan.familyId, "media-private-delivery");
+  assert.match(plan.suiteSha256, /^[a-f0-9]{64}$/);
+});
+test("media live entry rejects disabled fixtures and non-fixed selection before connecting", async (t) => {
+  const d = await dir(t);
+  const configPath = join(d, "config.json");
+  const scenarios = join(d, "media.json");
+  await writeFile(
+    scenarios,
+    JSON.stringify({
+      schemaVersion: 7,
+      cases: [
+        {
+          id: "media-private-delivery",
+          kind: "media-private-delivery",
+          chat: "private",
+        },
+      ],
+    }),
+  );
+  for (const variant of [
+    {
+      selected: "media-private-delivery",
+      config: baseConfig(),
+      code: "MEDIA_FIXTURE_DISABLED",
+    },
+    { selected: "private", config: baseConfig(), code: "CASE_FAMILY_REQUIRED" },
+    {
+      selected: "media-private-delivery",
+      config: {
+        ...baseConfig(),
+        maxMessages: 1,
+        mediaFixtures: {
+          enabled: true,
+          retainAssetsConfirmed: true,
+          timeoutMs: 1000,
+        },
+      },
+      code: "MESSAGE_BUDGET",
+    },
+  ]) {
+    await writeFile(configPath, JSON.stringify(variant.config));
+    const result = await run(
+      [
+        "run",
+        "--live",
+        "--case",
+        variant.selected,
+        "--config",
+        configPath,
+        "--scenarios",
+        scenarios,
+        "--approve-suite",
+        "invalid",
+      ],
+      d,
+    );
+    assert.equal(result.code, 2);
+    assert.ok(result.stderr.includes(variant.code), result.stderr);
+    assert.ok(!result.stderr.includes("CONNECT_TIMEOUT"));
+  }
+});
 test("Linux live-run lock captures identity before opening and fsyncs the complete record", async (t) => {
   const d = await dir(t);
   const lockPath = join(d, "account.lock");
@@ -108,7 +622,9 @@ test("Linux identity capture and lock persistence failures leave no half-lock", 
       identityRequired: true,
       platform: "linux",
       captureProcess: async () => {
-        throw Object.assign(new Error("capture failed"), { code: "MEMORY_PROCESS_BOOT" });
+        throw Object.assign(new Error("capture failed"), {
+          code: "MEMORY_PROCESS_BOOT",
+        });
       },
     }),
     { code: "MEMORY_PROCESS_BOOT" },
@@ -201,7 +717,9 @@ test("Linux child-process lock records durable process identity for recovery che
   const stored = JSON.parse(await readFile(lockPath, "utf8"));
   assert.equal(stored.pid, child.pid);
   assert.deepEqual(stored.process, identity);
-  await assert.rejects(verifyMemoryProcessStopped(identity), { code: "MEMORY_PROCESS_RUNNING" });
+  await assert.rejects(verifyMemoryProcessStopped(identity), {
+    code: "MEMORY_PROCESS_RUNNING",
+  });
   child.stdin.end("stop");
   const exitCode = await new Promise((resolve) => child.once("exit", resolve));
   assert.equal(exitCode, 0);
@@ -435,6 +953,49 @@ test("pending Memory fixtures block the account even with another report directo
   assert.equal(w.actions.length, 0);
   assert.equal(await readFile(pending, "utf8"), "{}");
 });
+test("an incomplete pre-Run STOP archive blocks a new live CLI run before OneBot connects", async (t) => {
+  const d = await dir(t);
+  const w = await world();
+  t.after(() => w.close());
+  const configPath = join(d, "config.json");
+  const out = join(d, "reports");
+  const interrupted = join(out, "pre-run-stop-reconciliation", "2026-10-07T00-00-00.000Z_deadbeef");
+  await writeFile(configPath, JSON.stringify(w.config));
+  await mkdir(interrupted, { recursive: true, mode: 0o700 });
+  const result = await run(["run", "--live", "--config", configPath, "--out", out], d);
+  assert.equal(result.code, 2);
+  assert.ok(result.stderr.includes("PRE_RUN_STOP_RECONCILIATION_REQUIRED"), result.stderr);
+  assert.equal(w.actions.length, 0);
+});
+test("an incomplete pre-Run STOP archive blocks live delivery before merge", async (t) => {
+  const d = await dir(t);
+  const configPath = join(d, "config.json");
+  const out = join(d, "reports");
+  const interrupted = join(out, "pre-run-stop-reconciliation", "2026-10-07T00-00-00.000Z_deadbeef");
+  await writeFile(configPath, JSON.stringify({ ...baseConfig(), runtime: {} }));
+  await mkdir(interrupted, { recursive: true, mode: 0o700 });
+  const result = await run(
+    [
+      "deliver",
+      "--live",
+      "--config",
+      configPath,
+      "--out",
+      out,
+      "--pr",
+      "https://github.com/example/repo/pull/1",
+      "--scenarios",
+      "scenarios.json",
+      "--reports",
+      "reports.json",
+      "--approve-suite",
+      "a".repeat(64),
+    ],
+    d,
+  );
+  assert.equal(result.code, 2);
+  assert.match(result.stderr, /PRE_RUN_STOP_RECONCILIATION_REQUIRED/);
+});
 test("default sends are blocked without runtime and identity-bound zero-tool approval", async (t) => {
   const d = await dir(t),
     w = await world();
@@ -501,7 +1062,11 @@ test("structured read suite plans locally but cannot run without runtime identit
             {
               name: "ops_status",
               operations: [
-                { action: "ops:status", resourceId: "agent-operations", inputConstraint: {} },
+                {
+                  action: "ops:status",
+                  resourceId: "agent-operations",
+                  inputConstraint: {},
+                },
               ],
             },
           ],
@@ -686,7 +1251,10 @@ test("schema 3 Memory run rejects missing case, approval, fixture enablement and
 
   await writeFile(
     configPath,
-    JSON.stringify({ ...config, memoryFixtures: { enabled: false, retainAuditConfirmed: true } }),
+    JSON.stringify({
+      ...config,
+      memoryFixtures: { enabled: false, retainAuditConfirmed: true },
+    }),
   );
   const disabled = await run([...chosen, "--approve-suite", suiteSha256], d);
   assert.equal(disabled.code, 2);
@@ -747,7 +1315,7 @@ test("history plan resolves the configured group but approves the original suite
       {
         id: "history-test",
         chat: "A",
-        prompt: "Search group_history_search for {{nonce}} with limit 1",
+        prompt: "帮我查找群里的 gbxhistory1-{{nonce}}，只返回一条结果。",
         expectContains: ["{{nonce}}"],
         sideEffect: "none",
         leaseTools: [
@@ -757,7 +1325,7 @@ test("history plan resolves the configured group but approves the original suite
               {
                 action: "history:read",
                 resourceId: "group:{{group:A}}",
-                inputConstraint: { query: "{{nonce}}", limit: 1 },
+                inputConstraint: { query: "gbxhistory1-{{nonce}}", limit: 1 },
               },
             ],
           },
@@ -773,7 +1341,7 @@ test("history plan resolves the configured group but approves the original suite
             kind: "trace",
             type: "history_retrieval",
             where: {
-              query: "{{nonce}}",
+              query: "gbxhistory1-{{nonce}}",
               groups: ["{{group:A}}"],
               resources: ["group:{{group:A}}"],
               sourceKind: "channel_message",
@@ -792,7 +1360,7 @@ test("history plan resolves the configured group but approves the original suite
   assert.equal(plan.suiteSha256, digest(suiteText));
   assert.equal(plan.cases[0].leaseTools[0].operations[0].resourceId, "group:20001");
   assert.deepEqual(plan.cases[0].featureAssertions[1].where.groups, ["20001"]);
-  assert.equal(plan.cases[0].featureAssertions[1].where.query, "{{nonce}}");
+  assert.equal(plan.cases[0].featureAssertions[1].where.query, "gbxhistory1-{{nonce}}");
 });
 test("invalid configuration blocks before networking", async (t) => {
   const d = await dir(t);
@@ -820,7 +1388,10 @@ test("transport plan fixes the three zero-tool cases and binds identities into a
   );
   assert.match(plan.suiteSha256, /^[a-f0-9]{64}$/);
 
-  const changed = { ...config, groups: [config.groups[0], { ...config.groups[1], id: "20009" }] };
+  const changed = {
+    ...config,
+    groups: [config.groups[0], { ...config.groups[1], id: "20009" }],
+  };
   await writeFile(p, JSON.stringify(changed));
   const replanned = await run(["plan", "--config", p], d);
   assert.notEqual(JSON.parse(replanned.stdout).suiteSha256, plan.suiteSha256);
@@ -929,6 +1500,129 @@ test("moderation live command is blocked before creating files or connecting", a
   assert.equal(w.bot.authCount, 0);
 });
 
+test("fixed moderation plan is reviewable locally and run requires a source pin before connecting", async (t) => {
+  const d = await dir(t);
+  const w = await world({ mode: "pretend" });
+  t.after(() => w.close());
+  const config = {
+    ...w.config,
+    groups: [w.config.groups[0], { alias: "B", id: "1126022432" }],
+    runtime: {
+      checkout: d,
+      dataDirectory: join(d, "data"),
+      expectedCommit: "a".repeat(40),
+      connectionId: "qq-main",
+    },
+    moderation: {
+      ...w.config.moderation,
+      enabled: true,
+      group: "B",
+      target: "10003",
+      consentConfirmed: true,
+      consentConfirmedAt: new Date().toISOString(),
+      consentUntil: new Date(Date.now() + 60 * 60_000).toISOString(),
+      durationSeconds: 45,
+    },
+  };
+  const path = join(d, "config.json");
+  await writeFile(path, JSON.stringify(config));
+  const result = await run(["plan", "--config", path, "--case", "qq-group-moderation-exact-b"], d);
+  assert.equal(result.code, 0, result.stderr);
+  const plan = JSON.parse(result.stdout);
+  assert.equal(plan.familyId, "qq-group-moderation-exact-b");
+  assert.equal(plan.plan.groupId, "1126022432");
+  assert.deepEqual(
+    plan.plan.stages.map((entry) => entry.stage),
+    ["mute", "unmute"],
+  );
+  assert.equal(plan.plan.durationSeconds, 45);
+  assert.match(plan.suiteSha256, /^[a-f0-9]{64}$/u);
+  const blockedRun = await run(
+    [
+      "run",
+      "--live",
+      "--config",
+      path,
+      "--case",
+      "qq-group-moderation-exact-b",
+      "--approve-suite",
+      plan.suiteSha256,
+      "--out",
+      join(d, "reports"),
+    ],
+    d,
+  );
+  assert.equal(blockedRun.code, 2);
+  assert.match(blockedRun.stderr, /MODERATION_RUNTIME_SOURCE_REQUIRED/);
+  await assert.rejects(stat(join(d, "reports")), { code: "ENOENT" });
+  assert.equal(w.driver.authCount, 0);
+  assert.equal(w.bot.authCount, 0);
+});
+
+test("fixed moderation run rejects stale consent and undersized message budget before connecting", async (t) => {
+  const d = await dir(t);
+  const w = await world({ mode: "pretend" });
+  t.after(() => w.close());
+  const config = {
+    ...w.config,
+    groups: [w.config.groups[0], { alias: "B", id: "1126022432" }],
+    runtime: {
+      checkout: d,
+      dataDirectory: join(d, "data"),
+      expectedCommit: "a".repeat(40),
+      connectionId: "qq-main",
+    },
+    moderation: {
+      ...w.config.moderation,
+      enabled: true,
+      group: "B",
+      target: "10003",
+      consentConfirmed: true,
+      consentConfirmedAt: new Date(Date.now() - 16 * 60_000).toISOString(),
+      consentUntil: new Date(Date.now() + 60 * 60_000).toISOString(),
+    },
+  };
+  const path = join(d, "config.json");
+  await writeFile(path, JSON.stringify(config));
+  const result = await run(
+    [
+      "run",
+      "--live",
+      "--config",
+      path,
+      "--case",
+      "qq-group-moderation-exact-b",
+      "--approve-suite",
+      "a".repeat(64),
+    ],
+    d,
+  );
+  assert.equal(result.code, 2);
+  assert.match(result.stderr, /MODERATION_SCENARIO/);
+  assert.equal(w.driver.authCount, 0);
+  assert.equal(w.bot.authCount, 0);
+});
+
+test("an unfinished moderation guard blocks live delivery before merge or network access", async (t) => {
+  const d = await dir(t);
+  const w = await world({ mode: "pretend" });
+  t.after(() => w.close());
+  const configPath = join(d, "config.json");
+  await writeFile(configPath, JSON.stringify(w.config));
+  const { createHash } = await import("node:crypto");
+  const account = createHash("sha256").update(w.config.driver.qq).digest("hex").slice(0, 24);
+  const lockDirectory = join(d, ".glassbox-qq-live-locks");
+  await import("node:fs/promises").then(({ mkdir }) => mkdir(lockDirectory, { mode: 0o700 }));
+  await writeFile(join(lockDirectory, `${account}.moderation-pending.json`), "pending\n", {
+    mode: 0o600,
+  });
+  const result = await run(["deliver", "--live", "--config", configPath, "--pr", "123"], d);
+  assert.equal(result.code, 3);
+  assert.match(result.stderr, /MODERATION_RECONCILIATION_REQUIRED/);
+  assert.equal(w.driver.authCount, 0);
+  assert.equal(w.bot.authCount, 0);
+});
+
 test("history family plan exposes fixed seed and evidence-derived recall without network", async (t) => {
   const d = await dir(t),
     p = join(d, "config.json"),
@@ -938,7 +1632,13 @@ test("history family plan exposes fixed seed and evidence-derived recall without
     suite,
     JSON.stringify({
       schemaVersion: 4,
-      cases: [{ id: "history-group-seed-private-recall", kind: "history-seed", chat: "A" }],
+      cases: [
+        {
+          id: "history-group-seed-private-recall",
+          kind: "history-seed",
+          chat: "A",
+        },
+      ],
     }),
   );
   const r = await run(["plan", "--config", p, "--scenarios", suite], d);
@@ -962,7 +1662,13 @@ test("isolation family plan exposes B seed and A-only exclusion without network"
     suite,
     JSON.stringify({
       schemaVersion: 5,
-      cases: [{ id: "history-cross-group-isolation", kind: "history-isolation", chat: "B" }],
+      cases: [
+        {
+          id: "history-cross-group-isolation",
+          kind: "history-isolation",
+          chat: "B",
+        },
+      ],
     }),
   );
   const r = await run(["plan", "--config", p, "--scenarios", suite], d);

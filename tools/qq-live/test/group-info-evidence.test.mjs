@@ -23,7 +23,11 @@ const providerResult = () => ({
 function fixture({ result = providerResult(), params, inputGroupId = groupId } = {}) {
   const input = { groupId: inputGroupId, operation: "get_group_info" };
   if (params !== undefined) input.params = params;
-  const wrapped = { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
+  const envelope = { status: "ok", data: result };
+  const wrapped = {
+    content: [{ type: "text", text: JSON.stringify(envelope) }],
+    details: envelope,
+  };
   const outputHead = JSON.stringify(wrapped);
   const callId = "call-group-info-1";
   const events = [
@@ -168,8 +172,8 @@ test("group info observer accepts trusted evidence for a UTF-8 truncated protect
   for (let size = 300; size < 500; size += 1) {
     result = { ...providerResult(), provider_extension: `${"a".repeat(size)}中tail` };
     full = JSON.stringify({
-      content: [{ type: "text", text: JSON.stringify(result) }],
-      details: result,
+      content: [{ type: "text", text: JSON.stringify({ status: "ok", data: result }) }],
+      details: { status: "ok", data: result },
     });
     head = Buffer.from(full, "utf8").subarray(0, 512).toString("utf8");
     if (Buffer.byteLength(head, "utf8") > 512) break;
@@ -209,6 +213,24 @@ test("group info observer accepts trusted evidence for a UTF-8 truncated protect
   }
 });
 
+test("group info observer rejects flat, unsuccessful and extended provider envelopes", () => {
+  const f = fixture();
+  const result = providerResult();
+  for (const details of [
+    result,
+    { status: "error", data: result },
+    { status: "ok", data: result, extra: true },
+  ]) {
+    const head = JSON.stringify({
+      content: [{ type: "text", text: JSON.stringify(details) }],
+      details,
+    });
+    expectInconclusive(() =>
+      observeGroupInfoResult(f.assertion, { events: replaceOutput(f.events, head), runId }),
+    );
+  }
+});
+
 test("group info observer rejects bad group, invalid name and unsafe count values", () => {
   const f = fixture();
   for (const result of [
@@ -220,8 +242,8 @@ test("group info observer rejects bad group, invalid name and unsafe count value
     { ...providerResult(), max_member_count: Number.MAX_SAFE_INTEGER + 1 },
   ]) {
     const head = JSON.stringify({
-      content: [{ type: "text", text: JSON.stringify(result) }],
-      details: result,
+      content: [{ type: "text", text: JSON.stringify({ status: "ok", data: result }) }],
+      details: { status: "ok", data: result },
     });
     expectInconclusive(() =>
       observeGroupInfoResult(f.assertion, { events: replaceOutput(f.events, head), runId }),
@@ -241,6 +263,81 @@ test("group info observer rejects bad group, invalid name and unsafe count value
       groupId,
     ),
   );
+});
+
+test("group info observer pairs a rejected retry with its fixed pre-provider reason and binds the success", async () => {
+  const f = fixture();
+  const rejectedCall = {
+    type: "tool_call",
+    runId,
+    toolCallId: "call-group-info-invalid",
+    data: { toolCallId: "call-group-info-invalid", name: "qq_groups" },
+  };
+  const rejectedResult = {
+    type: "tool_result",
+    runId,
+    toolCallId: rejectedCall.toolCallId,
+    data: {
+      toolCallId: rejectedCall.toolCallId,
+      name: "qq_groups",
+      isError: true,
+      failureCode: "input_validation_failed",
+    },
+  };
+  const events = [rejectedCall, rejectedResult, ...f.events];
+  assert.deepEqual(observeGroupInfoResult(f.assertion, { events, runId }), f.observation);
+  assert.deepEqual(await verify(f, { events }), {
+    status: "PASS",
+    groupId,
+    groupNameSha256: hash(groupName),
+  });
+
+  const leaseDenied = structuredClone(rejectedResult);
+  leaseDenied.data.failureCode = "acceptance_lease_input_mismatch";
+  assert.deepEqual(
+    observeGroupInfoResult(f.assertion, {
+      events: [rejectedCall, leaseDenied, ...f.events],
+      runId,
+    }),
+    f.observation,
+  );
+});
+
+test("group info observer rejects unknown retry failures, unpaired retries and multiple successes", () => {
+  const f = fixture();
+  const rejectedCall = {
+    type: "tool_call",
+    runId,
+    toolCallId: "call-group-info-rejected",
+    data: { toolCallId: "call-group-info-rejected", name: "qq_groups" },
+  };
+  const rejectedResult = {
+    type: "tool_result",
+    runId,
+    toolCallId: rejectedCall.toolCallId,
+    data: {
+      toolCallId: rejectedCall.toolCallId,
+      name: "qq_groups",
+      isError: true,
+      failureCode: "provider_failed",
+    },
+  };
+  expectInconclusive(() =>
+    observeGroupInfoResult(f.assertion, {
+      events: [rejectedCall, rejectedResult, ...f.events],
+      runId,
+    }),
+  );
+  expectInconclusive(() =>
+    observeGroupInfoResult(f.assertion, { events: [rejectedCall, ...f.events], runId }),
+  );
+  const repeated = structuredClone(f.events);
+  repeated.push(structuredClone(f.events[0]), structuredClone(f.events[1]));
+  repeated[2].toolCallId = "call-group-info-second";
+  repeated[2].data.toolCallId = "call-group-info-second";
+  repeated[3].toolCallId = "call-group-info-second";
+  repeated[3].data.toolCallId = "call-group-info-second";
+  expectInconclusive(() => observeGroupInfoResult(f.assertion, { events: repeated, runId }));
 });
 
 test("group info observer rejects duplicate activity, mismatched call ids and unsupported params", () => {

@@ -1,6 +1,8 @@
+import { verifyQqLiveNativeMuteStatePrecondition } from "../acceptance/qq-live-native-mute-state.js";
 import { join } from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { AccessDeniedError } from "../auth/service.js";
+import { qqCategoryCondition } from "../auth/policy-condition.js";
 import { chmod, mkdtemp, rm } from "node:fs/promises";
 import type { IncomingMessage } from "node:http";
 import { tmpdir } from "node:os";
@@ -14,6 +16,7 @@ import {
 } from "@glassbox/contracts";
 import { ChannelProfileStore } from "../config/channel-profiles.js";
 import { GroupRuntimeStore } from "../config/group-runtime.js";
+import { loadRuntimeReplies } from "../config/runtime-replies.js";
 import type { ModelProfileStore } from "../config/model-profiles.js";
 import { ExecutorConfiguration } from "../config/executors.js";
 import { IngressEvidenceLog, type GroupIngressEvidenceCounts } from "./ingress-evidence.js";
@@ -100,6 +103,12 @@ import {
   SKILL_READ_TOOL,
 } from "../runtime/pi/skill-tools.js";
 import type { ProtectedToolContext } from "../runtime/pi/protected-tools.js";
+import {
+  authorizationProjectionResult,
+  type ProjectionDecisionEvidence,
+  type ProjectionKind,
+  type ProjectionPurpose,
+} from "../runtime/pi/authorization-projection.js";
 import {
   createOwnerMemoryTools,
   OWNER_MEMORY_ADMIN_TOOL,
@@ -208,6 +217,10 @@ import {
   type QqLiveLeaseBinding,
   type QqLiveLeaseTool,
 } from "../acceptance/qq-live-lease.js";
+import {
+  isBoundQqLiveLearningInput,
+  type QqLiveLearningBinding,
+} from "../acceptance/qq-live-learning-binding.js";
 import { createIsolatedPiTools } from "../runtime/pi/sandbox-pi-tools.js";
 import type { IsolatedPiSession } from "../runtime/pi/sandbox-pi-tools.js";
 import {
@@ -241,6 +254,12 @@ const ACTIONS = [
   "eval:write",
 ] as const;
 const TOOL_DISCOVERY_ACTION = "tool:discover";
+const PROJECTION_AVAILABILITY_ACTIONS = new Set([
+  "group:files:write",
+  "group:moderate",
+  "group:settings:write",
+]);
+
 const toolResourceId = (name: string) => `tool:${name}`;
 
 /**
@@ -269,6 +288,20 @@ const HISTORY_SYNC_MAX_PAGES = 5;
  */
 const HISTORY_POLL_MAX_PAGES = 5;
 const HISTORY_BACKFILL_MAX_PAGES = 20;
+interface HistoryBackfillProgress {
+  boundaryMessageId: string;
+  cursor?: string;
+}
+
+interface HistorySyncWalkResult {
+  outcome: HistorySyncOutcome;
+  latestMessageId?: string;
+  continuationCursor?: string;
+}
+
+function historyTargetKey(connectionId: string, groupId: string): string {
+  return JSON.stringify([connectionId, groupId]);
+}
 /** Seconds between background archive walks. Overridable for tests and slow providers. */
 const HISTORY_POLL_INTERVAL_MS = Number(process.env.GLASSBOX_HISTORY_POLL_INTERVAL_MS ?? 60_000);
 
@@ -355,6 +388,7 @@ interface ManagedGroupFacts {
   version: number;
   /** The categories whose group-scoped Action is currently ALLOW for this Principal. */
   grantedCategories: QqCapabilityCategory[];
+  availabilityDecisions: ProjectionDecisionEvidence[];
   /** The execution-time `history:read` decision for this Principal and group. */
   historyRead: boolean;
   /** The execution-time `group:read` decision, which gates the live provider observation. */
@@ -378,6 +412,50 @@ function idFromInput(input: unknown): string {
 
 /** Service composition. Only management HTTP handlers receive this object.
  * Incoming QQ messages receive RunService's scoped ingress API instead. */
+interface QqLiveAcceptanceHandoff {
+  key: string;
+  principalId: string;
+  scope: TrustedChannelScope;
+  messageId: string;
+  leaseId: string;
+  textSha256: string;
+  promise: Promise<QqLiveLearningBinding | undefined>;
+  resolve: (binding: QqLiveLearningBinding | undefined) => void;
+  settled: boolean;
+}
+
+function qqLiveAcceptanceHandoffKey(input: {
+  principalId: string;
+  scope: TrustedChannelScope;
+  textSha256: string;
+}): string {
+  // scopeKey intentionally omits sender identity, so include senderId explicitly.
+  return JSON.stringify([
+    input.principalId,
+    scopeKey(input.scope),
+    input.scope.senderId,
+    input.textSha256,
+  ]);
+}
+
+async function waitForQqLiveAcceptanceHandoff(
+  promise: Promise<QqLiveLearningBinding | undefined>,
+  signal: AbortSignal,
+): Promise<QqLiveLearningBinding | undefined> {
+  if (signal.aborted) return undefined;
+  let onAbort!: () => void;
+  const aborted = new Promise<undefined>((resolve) => {
+    onAbort = () => resolve(undefined);
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
+  });
+  try {
+    return await Promise.race([promise, aborted]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
+}
+
 export class ManagementApplication {
   readonly store: DomainStore;
   readonly channels: ChannelProfileStore;
@@ -409,8 +487,9 @@ export class ManagementApplication {
   private readonly qqLiveLeases = new QqLiveLeaseRegistry();
   private readonly qqLiveRunBindings = new Map<
     string,
-    QqLiveLeaseBinding & { marker: string; toolsSha256: string }
+    QqLiveLearningBinding & { marker: string; toolsSha256: string }
   >();
+  private readonly qqLiveAcceptanceHandoffs = new Map<string, QqLiveAcceptanceHandoff>();
   private readonly browserCleanups = new Map<string, Set<() => Promise<void>>>();
   private readonly deliveryPolicy: ReturnType<typeof createQqDeliveryPolicy>;
   private readonly kitLoader: KitLoader;
@@ -421,15 +500,6 @@ export class ManagementApplication {
   private readonly ingressStartedAt = new Date().toISOString();
   private readonly ingressEvidence: IngressEvidenceLog;
   /**
-   * Per-channel count of messages dropped because the connection was not ready.
-   *
-   * Held apart from `states` on purpose: `updateChannelState` replaces that whole entry on
-   * every transition, so a counter living there would be wiped the moment the connection
-   * recovered — which is exactly when the operator still needs to see that it happened. Held
-   * apart from `ingressEvidence` because a private drop belongs to no group.
-   */
-  private readonly channelDroppedNotReady = new Map<string, number>();
-  /**
    * Channels that have reached `ready` at least once in this process.
    *
    * A first connect is not a reconnect: backfilling on it would re-walk history the group
@@ -438,6 +508,9 @@ export class ManagementApplication {
    */
   private readonly connectionEverReady = new Set<string>();
   private readonly historyPoller: GroupHistoryPoller;
+  private readonly historyHighWater = new Map<string, string>();
+  private readonly historyBackfills = new Map<string, HistoryBackfillProgress>();
+  private readonly historySyncFlights = new Map<string, Promise<HistorySyncOutcome>>();
   private operations: Promise<unknown> = Promise.resolve();
   private accepting = false;
   private releaseIngress!: () => void;
@@ -475,7 +548,7 @@ export class ManagementApplication {
       // Resolved per tick rather than captured at start, so a newly configured group or a
       // group whose history capability was switched off both take effect on the next tick.
       listTargets: () => this.historySyncTargets(),
-      run: (target, walk) => this.syncGroupHistory(target.connectionId, target.groupId, walk),
+      run: (target, walk) => this.syncPolledGroupHistory(target, walk),
     });
     const agnes = new AgnesMediaProvider({ apiKey: process.env.AGNES_API_KEY });
     this.mediaProvider =
@@ -525,7 +598,65 @@ export class ManagementApplication {
       store,
       queuedPollMs: options.temporal ? 2_000 : 0,
       resolveExecution: (reference) => this.execution(reference),
+      beforeExecution: async (input) => {
+        if (!hasQqLiveAcceptanceMarker(input.text)) return undefined;
+        const handoff = this.qqLiveAcceptanceHandoffs.get(
+          qqLiveAcceptanceHandoffKey({
+            principalId: input.caller.principalId,
+            scope: input.caller.scope,
+            textSha256: canonicalQqLiveTextSha256(input.text),
+          }),
+        );
+        const binding = handoff
+          ? await waitForQqLiveAcceptanceHandoff(handoff.promise, input.signal)
+          : undefined;
+        if (input.signal.aborted) return undefined;
+        const storedBinding = this.qqLiveRunBindings.get(input.run.id);
+        const activeBinding = binding && {
+          leaseId: binding.leaseId,
+          principalId: binding.principalId,
+          scope: binding.scope,
+          messageId: binding.messageId,
+          runId: binding.runId,
+        };
+        if (
+          !binding ||
+          !storedBinding ||
+          !isBoundQqLiveLearningInput(binding, input) ||
+          !isBoundQqLiveLearningInput(storedBinding, input) ||
+          binding.runId !== input.run.id ||
+          storedBinding.leaseId !== binding.leaseId ||
+          storedBinding.messageId !== binding.messageId ||
+          storedBinding.textSha256 !== binding.textSha256 ||
+          !activeBinding ||
+          !this.qqLiveLeases.isActive(activeBinding)
+        )
+          return {
+            status: "failed",
+            failureCode: "gate_refused",
+            runtimeAttempted: false,
+            text: "测试消息的临时权限已失效，请重新登记后再试。",
+          };
+        return undefined;
+      },
       captureLearning: async (input) => {
+        const binding = this.qqLiveRunBindings.get(input.run.id);
+        if (hasQqLiveAcceptanceMarker(input.text)) {
+          const activeBinding = binding && {
+            leaseId: binding.leaseId,
+            principalId: binding.principalId,
+            scope: binding.scope,
+            messageId: binding.messageId,
+            runId: binding.runId,
+          };
+          if (
+            !isBoundQqLiveLearningInput(binding, input) ||
+            !activeBinding ||
+            !this.qqLiveLeases.isActive(activeBinding)
+          )
+            throw new Error("qq_live_learning_binding_unavailable");
+          return undefined;
+        }
         const candidate = await this.store.learning.captureCurrentMessage({
           caller: input.caller,
           conversationId: input.conversation.id,
@@ -544,7 +675,10 @@ export class ManagementApplication {
             try {
               return await connection.send(input);
             } catch {
-              return { status: "unknown" as const, code: "transport_error" as const };
+              return {
+                status: "unknown" as const,
+                code: "transport_error" as const,
+              };
             }
           };
           if (delivery.payloadKind === "browser_artifact") {
@@ -570,12 +704,33 @@ export class ManagementApplication {
                 text: "浏览器截图",
                 image: { pngBase64: artifact.data.toString("base64") },
               });
-              return sent.status === "confirmed"
-                ? { status: "sent", externalId: sent.messageId }
-                : {
-                    status: sent.status,
-                    reason: "code" in sent ? sent.code : "artifact_unavailable",
-                  };
+              if (sent.status !== "confirmed")
+                return {
+                  status: sent.status,
+                  reason: "code" in sent ? sent.code : "artifact_unavailable",
+                };
+              try {
+                const cursor = await this.trace.append(
+                  delivery.runId,
+                  {
+                    type: "media_delivery_sent",
+                    schemaVersion: 1,
+                    runId: delivery.runId,
+                    deliveryId: delivery.id,
+                    assetId: delivery.payloadText,
+                    externalId: sent.messageId,
+                    mimeType: artifact.mimeType,
+                    sizeBytes: artifact.data.byteLength,
+                    sha256: createHash("sha256").update(artifact.data).digest("hex"),
+                  },
+                  "glassbox-media-delivery",
+                );
+                await this.store.evidence.advanceTrace(caller, cursor);
+              } catch {
+                // The provider confirmed the send. Missing evidence cannot make it safe to retry.
+                return { status: "unknown", reason: "unclassified" };
+              }
+              return { status: "sent", externalId: sent.messageId };
             } catch {
               return { status: "failed" };
             }
@@ -620,12 +775,33 @@ export class ManagementApplication {
                           },
                         })
                       : { status: "failed" as const };
-              return sent.status === "confirmed"
-                ? { status: "sent", externalId: sent.messageId }
-                : {
-                    status: sent.status,
-                    reason: "code" in sent ? sent.code : "artifact_unavailable",
-                  };
+              if (sent.status !== "confirmed")
+                return {
+                  status: sent.status,
+                  reason: "code" in sent ? sent.code : "artifact_unavailable",
+                };
+              try {
+                const cursor = await this.trace.append(
+                  delivery.runId,
+                  {
+                    type: "media_delivery_sent",
+                    schemaVersion: 1,
+                    runId: delivery.runId,
+                    deliveryId: delivery.id,
+                    assetId: delivery.payloadText,
+                    externalId: sent.messageId,
+                    mimeType: artifact.mimeType,
+                    sizeBytes: artifact.data.byteLength,
+                    sha256: createHash("sha256").update(artifact.data).digest("hex"),
+                  },
+                  "glassbox-media-delivery",
+                );
+                await this.store.evidence.advanceTrace(caller, cursor);
+              } catch {
+                // The provider confirmed the send. Missing evidence cannot make it safe to retry.
+                return { status: "unknown", reason: "unclassified" };
+              }
+              return { status: "sent", externalId: sent.messageId };
             } catch {
               return { status: "failed" };
             }
@@ -642,10 +818,31 @@ export class ManagementApplication {
       },
       onEvent: (event) => this.recordEvent(event),
       prepareDelivery: async (candidate, { caller, run }) => {
+        // Successful generation is durable delivery input. The model's prose is not an
+        // attachment manifest: it may omit markers even when the authorized Tool succeeded.
+        const generatedIds: string[] = [];
+        if (run.status === "succeeded" && caller.scope.chatType === "private") {
+          let cursor: string | undefined;
+          do {
+            const page = await this.trace.readPage(run.id, { cursor, limit: 200 });
+            for (const record of page.records) {
+              const event = record.event as Record<string, unknown>;
+              if (
+                record.provenance === "glassbox-media" &&
+                event.type === "media_generation_completed" &&
+                Array.isArray(event.assetIds)
+              )
+                for (const id of event.assetIds)
+                  if (typeof id === "string" && !generatedIds.includes(id)) generatedIds.push(id);
+            }
+            cursor = page.nextCursor ?? undefined;
+          } while (cursor !== undefined);
+        }
         const ids = [
-          ...new Set(
-            [...candidate.matchAll(DELIVERY_UUID)].map((match) => match[0]!.toLowerCase()),
-          ),
+          ...new Set([
+            ...generatedIds,
+            ...[...candidate.matchAll(DELIVERY_UUID)].map((match) => match[0]!.toLowerCase()),
+          ]),
         ];
         const allowed: string[] = [];
         const allowedMediaAssets: string[] = [];
@@ -658,7 +855,11 @@ export class ManagementApplication {
                 binding.conversationId === run.conversationId &&
                 binding.principalId === caller.principalId
               ) {
-                const artifact = await this.readBrowserArtifact({ id, binding, caller });
+                const artifact = await this.readBrowserArtifact({
+                  id,
+                  binding,
+                  caller,
+                });
                 if (artifact.sizeBytes <= 2 * 1024 * 1024) allowed.push(id);
                 continue;
               }
@@ -803,7 +1004,11 @@ export class ManagementApplication {
               ...(attempt ? { taskId: attempt.taskId } : {}),
               taskAttemptId: lease.executionId,
               principalId: lease.principalId,
-              data: { workspaceId: lease.workspaceId, leaseId: lease.leaseId, state: "released" },
+              data: {
+                workspaceId: lease.workspaceId,
+                leaseId: lease.leaseId,
+                state: "released",
+              },
             });
           } catch {
             // A missing or disconnected Herdr pane is not positive stop evidence.
@@ -1024,7 +1229,11 @@ export class ManagementApplication {
         .then((state) => {
           const checkedAt = new Date().toISOString();
           if (this.temporalProbe === probe)
-            this.temporalProbeCache = { state, checkedAt, sampledAtMs: Date.now() };
+            this.temporalProbeCache = {
+              state,
+              checkedAt,
+              sampledAtMs: Date.now(),
+            };
           return { state, checkedAt };
         });
       this.temporalProbePending = pending;
@@ -1095,9 +1304,12 @@ export class ManagementApplication {
   }
 
   /** Read an Artifact by opaque ID, deriving its Run and Principal from private service metadata. */
-  async readBrowserArtifactById(
-    id: string,
-  ): Promise<{ id: string; data: string; mimeType: "image/png"; sizeBytes: number }> {
+  async readBrowserArtifactById(id: string): Promise<{
+    id: string;
+    data: string;
+    mimeType: "image/png";
+    sizeBytes: number;
+  }> {
     try {
       if (!this.browserArtifacts) throw new Error("browser_artifact_not_found");
       const binding = await this.browserArtifacts.binding(id);
@@ -1416,15 +1628,25 @@ export class ManagementApplication {
     const binding = this.qqLiveRunBindings.get(input.run.id);
     if (!binding) return undefined;
     const current: QqLiveLeaseBinding = { ...binding, runId: input.run.id };
-    if (!this.qqLiveLeases.isActive(current)) return undefined;
     return {
       leaseId: binding.leaseId,
       marker: binding.marker,
       toolsSha256: binding.toolsSha256,
       assertActive: () => this.qqLiveLeases.isActive(current),
       filterToolNames: (names) =>
-        this.qqLiveLeases.filterToolNames({ ...current, availableToolNames: names }),
+        this.qqLiveLeases.filterToolNames({
+          ...current,
+          availableToolNames: names,
+        }),
+      getToolInputRestrictions: (toolName) =>
+        this.qqLiveLeases.getToolInputRestrictions({ ...current, toolName }),
       checkToolCall: (call) => this.qqLiveLeases.checkToolCall({ ...current, ...call }).allowed,
+      diagnoseToolCall: (call) => this.qqLiveLeases.diagnoseToolCall({ ...current, ...call }),
+      getNativeMuteStatePrecondition: (call) =>
+        this.qqLiveLeases.getNativeMuteStatePrecondition({
+          ...current,
+          ...call,
+        }),
     };
   }
 
@@ -1435,11 +1657,14 @@ export class ManagementApplication {
   private getOrCreateDefaultPiAdapter(profileId: string): PiRunExecutionAdapter {
     const existing = this.piAdapters.get(profileId);
     if (existing) return existing;
+    const gateMessagesForProfile = loadRuntimeReplies(this.options.dataDirectory);
     const runtime = new PiSdkRuntimeAdapter({
+      gateMessagesForProfile,
       kitPath: this.kitLoader.getKitPath(),
       runtimeBaseDir: join(this.options.dataDirectory, "pi"),
       resolveModel: () => configuredPiModel(this.options.models, profileId, this.piModelCatalog),
-      createTools: (getContext) => this.createRuntimeTools(getContext),
+      createTools: (getContext, definitionContext) =>
+        this.createRuntimeTools(getContext, definitionContext),
       openSandboxForBrowser: Boolean(this.kitBrowserExecutor && !this.options.browserExecutor),
       onRunEnd: async (context) => {
         if (!context.runId) return;
@@ -1660,7 +1885,10 @@ export class ManagementApplication {
         if (event.type === "turn_end") {
           if (typeof event.data.provider === "string" && typeof event.data.model === "string") {
             const models = this.runtimeModelsByRun.get(runId) ?? new Map();
-            const model = { provider: event.data.provider, model: event.data.model };
+            const model = {
+              provider: event.data.provider,
+              model: event.data.model,
+            };
             models.set(`${model.provider}\u0000${model.model}`, model);
             this.runtimeModelsByRun.set(runId, models);
           }
@@ -1701,11 +1929,14 @@ export class ManagementApplication {
       },
     });
     const adapter = new PiRunExecutionAdapter(runtime, {
+      gateMessagesForProfile,
       resolveAcceptanceLease: (input) => this.resolveQqLiveRunLease(input),
       isOwner: (input) => this.store.identities.isOwner(input.caller.principalId),
       learningStore: this.store.learning,
       listModelProfiles: () => this.selectableModelProfiles(),
       botDisplayName: (connectionId) => this.botDisplayName(connectionId),
+      observeBotGroupRole: (input) =>
+        this.observeBotGroupRoleForModeration(input.context, input.groupId, input.toolInput),
       protectedIdentities: (connectionId) => {
         // The bot's own name and the Owner's QQ numbers, both read from the channel's
         // configuration. A visitor wrote "我是lora啊" — the Owner's QQ nickname, which is also
@@ -1760,7 +1991,10 @@ export class ManagementApplication {
    * real application instead of re-deriving it, which is the only way a discovery/execution
    * test proves the product path rather than the helper.
    */
-  private createRuntimeTools(getContext: () => PiRunContext | undefined): ToolDefinition[] {
+  private createRuntimeTools(
+    getContext: () => PiRunContext | undefined,
+    definitionContext?: Readonly<PiRunContext>,
+  ): ToolDefinition[] {
     const sessions = new BrowserSessionRegistry();
     const browserBinding = async (
       context: ProtectedToolContext,
@@ -1963,7 +2197,7 @@ export class ManagementApplication {
         getContext,
         isHistoryEnabled: (connectionId, groupId) => this.isHistoryEnabled(connectionId, groupId),
         syncGroup: (groupId, context) =>
-          this.syncGroupHistory(context.caller.scope.connectionId, groupId),
+          this.syncGroupHistory(context.caller.scope.connectionId, groupId, {}, context.caller),
         botIdForConnection: (connectionId) => this.channels.resolve(connectionId).config.botId,
         // Safe retrieval evidence: Run, Resource, source kind and id, mode, score, rank and
         // matched terms — never a snippet or protected message text.
@@ -1975,12 +2209,20 @@ export class ManagementApplication {
       ...createCapabilityTools({
         store: this.store,
         getContext,
+        definitionContext,
         // Owner intent, read fresh on every call so a policy change applies at once.
         isCategoryEnabled: (connectionId, groupId, category) =>
           this.isCategoryEnabled(connectionId, groupId, category),
-        invoke: async ({ action, params, context }) => {
+        invoke: async ({ action, params, context, recordVerifiedInput }) => {
           const connection = this.connections.get(context.caller.scope.connectionId);
           if (!connection) throw new Error("channel_not_connected");
+          await this.verifyQqLiveMuteStateBeforeProvider(context, action, params);
+          if (action === "get_group_member_info" || action === "set_group_ban") {
+            // Only the two QQ acceptance operations carry this witness. Its closure was
+            // built from the server-normalized provider input and runs after native prechecks.
+            if (!recordVerifiedInput) throw new Error("verified_input_evidence_unavailable");
+            await recordVerifiedInput();
+          }
           const providerResult = requireProviderSuccess(
             await connection.invokeCapability({ action, params }),
           );
@@ -1997,7 +2239,10 @@ export class ManagementApplication {
             const groupId = String(params.group_id);
             const userId = String(params.user_id);
             const expectedRole = params.enable ? "qq_group_admin" : "qq_group_member";
-            const observed = await connection.getGroupMemberRole({ groupId, userId });
+            const observed = await connection.getGroupMemberRole({
+              groupId,
+              userId,
+            });
             const verified = observed.status === "ok" && observed.role === expectedRole;
             const cursor = await this.trace.append(
               context.runId,
@@ -2103,10 +2348,314 @@ export class ManagementApplication {
             throw new ProviderCallError("unknown", "provider_unknown");
           throw new ProviderCallError("provider_failed", "provider_failed");
         },
-        search: (input) => this.searchCapabilities(input.context, input),
-        projectManagedGroups: (context) => this.projectManagedGroups(context),
+        search: (input) => this.searchCapabilities(input.context, input, input.toolInput),
+        projectManagedGroups: (context, input) => this.projectManagedGroups(context, input),
       }),
     ];
+  }
+
+  /** Checks the exact native mute state immediately before a lease-bound mutation. */
+  private async verifyQqLiveMuteStateBeforeProvider(
+    context: PiRunContext,
+    operation: string,
+    params: Record<string, string | number | boolean>,
+  ): Promise<void> {
+    const lease = context.acceptanceLease;
+    if (operation !== "set_group_ban" || !lease?.getNativeMuteStatePrecondition) return;
+    const caller = context.caller;
+    if (!caller || !context.runId || !context.conversationId)
+      throw new Error("acceptance_lease_denied");
+    const groupId = String(params.group_id);
+    const toolInput = {
+      groupId,
+      operation,
+      params: { user_id: params.user_id, duration: params.duration },
+    };
+    const boundCall = {
+      toolName: "qq_group_moderation",
+      action: "group:moderate",
+      resourceId: groupResourceId(groupId),
+      toolInput,
+    };
+    const precondition = lease.getNativeMuteStatePrecondition(boundCall);
+    if (precondition === null) return;
+    const authorize = async (): Promise<void> => {
+      if (
+        !lease.assertActive() ||
+        !lease.checkToolCall(boundCall) ||
+        !(await this.resolveRunToolNames(context)).includes(boundCall.toolName) ||
+        !(await this.isCategoryEnabled(caller.scope.connectionId, groupId, "group.moderate"))
+      )
+        throw new Error("acceptance_lease_denied");
+      const decision = await this.store.authorization.check({
+        caller,
+        resourceId: boundCall.resourceId,
+        action: boundCall.action,
+        policyCondition: qqCategoryCondition(caller, groupId, "group.moderate"),
+        conversationId: context.conversationId,
+        runId: context.runId,
+      });
+      if (
+        decision.decision !== "ALLOW" ||
+        (caller.scope.chatType === "private" &&
+          !(await this.store.authorization.hasActiveGrant({
+            principalId: caller.principalId,
+            resourceId: boundCall.resourceId,
+            action: GROUP_ASSIGN_ACTION,
+            scope: caller.scope,
+          })))
+      )
+        throw new Error("acceptance_lease_denied");
+    };
+    await authorize();
+    const connection = this.connections.get(caller.scope.connectionId);
+    if (!connection) throw new Error("channel_not_connected");
+    const memberState = requireProviderSuccess(
+      await connection.invokeCapability({
+        action: "get_group_member_info",
+        params: {
+          group_id: Number(groupId),
+          user_id: Number(params.user_id),
+          no_cache: true,
+        },
+      }),
+    ).data;
+    await authorize();
+    const verification = verifyQqLiveNativeMuteStatePrecondition({
+      ...boundCall,
+      precondition,
+      memberState,
+      nowSeconds: Math.floor(Date.now() / 1000),
+    });
+    if (verification.status !== "verified")
+      throw new ProviderCallError("denied", "acceptance_mute_state_precondition_denied");
+    if (caller.scope.chatType === "group") {
+      const senderRole = await connection.getGroupMemberRole({
+        groupId,
+        userId: caller.scope.senderId,
+      });
+      if (
+        senderRole.status !== "ok" ||
+        !["qq_group_admin", "qq_group_owner"].includes(senderRole.role)
+      )
+        throw new Error("native_group_role_denied");
+      await authorize();
+    }
+    const cursor = await this.trace.append(
+      context.runId,
+      {
+        type: "native_mute_state_precondition_verified",
+        runId: context.runId,
+        conversationId: context.conversationId,
+        principalId: caller.principalId,
+        resourceId: boundCall.resourceId,
+        leaseId: lease.leaseId,
+        phase: verification.phase,
+        expectedMuteUntil: precondition.expectedMuteUntil,
+      },
+      "glassbox-qq-mute-state",
+    );
+    await this.store.evidence.advanceTrace(caller, cursor);
+    await authorize();
+    // Recheck the snapshot's time condition after evidence I/O. This is not another QQ
+    // read and cannot detect changes after that read; QQ provides no compare-and-set API.
+    if (
+      verifyQqLiveNativeMuteStatePrecondition({
+        ...boundCall,
+        precondition,
+        memberState,
+        nowSeconds: Math.floor(Date.now() / 1000),
+      }).status !== "verified"
+    )
+      throw new ProviderCallError("denied", "acceptance_mute_state_precondition_denied");
+  }
+
+  /**
+   * Gives the model a fresh fact about the configured Bot's role for an already-authorized
+   * moderation request. This is not evidence about the requester and cannot grant permission.
+   */
+  private async observeBotGroupRoleForModeration(
+    context: PiRunContext,
+    groupId: string,
+    toolInput: Readonly<Record<string, unknown>>,
+  ): Promise<
+    | {
+        observation: NonNullable<PiRunContext["botGroupRoleObservation"]>;
+        authorize: () => Promise<void>;
+      }
+    | undefined
+  > {
+    const caller = context.caller;
+    const required = context.requiredToolInput;
+    const invalid =
+      !caller ||
+      !context.runId ||
+      !context.conversationId ||
+      context.requiredToolName !== "qq_group_moderation" ||
+      !required ||
+      required.groupId !== groupId ||
+      groupId !== toolInput.groupId ||
+      required.operation !== toolInput.operation ||
+      !caller.scope ||
+      (caller.scope.chatType === "group" && caller.scope.chatId !== groupId);
+    if (invalid || !caller || !context.runId || !context.conversationId) return undefined;
+
+    const isOwner = await this.store.identities.isOwner(caller.principalId);
+    if (caller.scope.chatType === "private" && !isOwner) return undefined;
+    const configured = this.channels.resolve(caller.scope.connectionId);
+    if (
+      configured.config.botId !== caller.scope.botId ||
+      !configured.config.groupIds.includes(groupId) ||
+      !context.authorizedToolNames?.includes("qq_group_moderation")
+    )
+      return undefined;
+    if (
+      (caller.scope.chatType === "private" &&
+        !(await this.store.authorization.hasActiveGrant({
+          principalId: caller.principalId,
+          resourceId: groupResourceId(groupId),
+          action: GROUP_ASSIGN_ACTION,
+          scope: caller.scope,
+        }))) ||
+      !(await this.isCategoryEnabled(caller.scope.connectionId, groupId, "group.moderate"))
+    )
+      return undefined;
+
+    const capability = QQ_CAPABILITIES.find(
+      (entry) =>
+        entry.tool === "qq_group_moderation" &&
+        entry.category === "group.moderate" &&
+        entry.resource === "group" &&
+        entry.operations.some((entry) => entry.action === toolInput.operation),
+    );
+    if (!capability) return undefined;
+    const currentAuthority = async (): Promise<boolean> => {
+      if (
+        !context.authorizedToolNames?.includes(capability.tool) ||
+        !(await this.resolveRunToolNames(context)).includes(capability.tool) ||
+        (context.acceptanceLease !== undefined && !context.acceptanceLease.assertActive()) ||
+        !(await this.isCategoryEnabled(caller.scope.connectionId, groupId, capability.category)) ||
+        (caller.scope.chatType === "private" &&
+          !(await this.store.authorization.hasActiveGrant({
+            principalId: caller.principalId,
+            resourceId: groupResourceId(groupId),
+            action: GROUP_ASSIGN_ACTION,
+            scope: caller.scope,
+          })))
+      )
+        return false;
+      const discovery = await this.store.authorization.check({
+        caller,
+        resourceId: toolResourceId(capability.tool),
+        action: TOOL_DISCOVERY_ACTION,
+        conversationId: context.conversationId,
+        runId: context.runId,
+      });
+      if (discovery.decision !== "ALLOW") return false;
+      const action = await this.store.authorization.check({
+        caller,
+        resourceId: groupResourceId(groupId),
+        action: capability.action,
+        policyCondition: qqCategoryCondition(caller, groupId, capability.category),
+        conversationId: context.conversationId,
+        runId: context.runId,
+      });
+      if (action.decision !== "ALLOW") return false;
+      if (
+        context.acceptanceLease &&
+        !context.acceptanceLease.checkToolCall({
+          toolName: capability.tool,
+          action: capability.action,
+          resourceId: groupResourceId(groupId),
+          toolInput,
+        })
+      )
+        return false;
+      return true;
+    };
+    if (!(await currentAuthority())) return undefined;
+
+    const connection = this.connections.get(caller.scope.connectionId);
+    if (!connection) return undefined;
+    const requesterStillAuthorized = async (): Promise<boolean> => {
+      if (caller.scope.chatType !== "group") return true;
+      const allowedRequesterRoles = capability.nativeGroupRoles ?? [];
+      const requesterRole = await connection.getGroupMemberRole({
+        groupId,
+        userId: caller.scope.senderId,
+      });
+      const allowed =
+        requesterRole.status === "ok" && allowedRequesterRoles.includes(requesterRole.role);
+      const cursor = await this.trace.append(
+        context.runId!,
+        {
+          type: "requester_native_group_role_precheck",
+          runId: context.runId,
+          conversationId: context.conversationId,
+          principalId: caller.principalId,
+          resourceId: groupResourceId(groupId),
+          groupId,
+          senderId: caller.scope.senderId,
+          observedRole: requesterRole.status === "ok" ? requesterRole.role : null,
+          verificationStatus:
+            requesterRole.status === "ok"
+              ? allowed
+                ? "verified"
+                : "mismatch"
+              : requesterRole.status === "unknown"
+                ? "unknown"
+                : requesterRole.code === "not_connected"
+                  ? "unavailable"
+                  : "failed",
+          requestedTool: capability.tool,
+          requestedOperation: toolInput.operation,
+          authorizationDecision: allowed ? "ALLOW" : "DENY",
+        },
+        "glassbox-qq-role-precheck",
+      );
+      await this.store.evidence.advanceTrace(caller, cursor);
+      return allowed;
+    };
+    if (!(await requesterStillAuthorized()) || !(await currentAuthority())) return undefined;
+
+    const observed = await connection.getGroupMemberRole({
+      groupId,
+      userId: configured.config.botId,
+    });
+    if (!(await currentAuthority())) return undefined;
+    if (!(await requesterStillAuthorized()) || !(await currentAuthority())) return undefined;
+    const observationStatus =
+      observed?.status === "ok"
+        ? "verified"
+        : observed?.status === "unknown"
+          ? "unknown"
+          : observed?.code === "not_connected"
+            ? "unavailable"
+            : "failed";
+    const role = observed?.status === "ok" ? observed.role : "unknown";
+    const cursor = await this.trace.append(
+      context.runId,
+      {
+        type: "bot_native_group_role_observation",
+        runId: context.runId,
+        conversationId: context.conversationId,
+        principalId: caller.principalId,
+        resourceId: groupResourceId(groupId),
+        groupId,
+        observationStatus,
+        observedRole: role === "unknown" ? null : role,
+        roleSubject: "configured_bot_account",
+      },
+      "glassbox-qq-bot-role",
+    );
+    await this.store.evidence.advanceTrace(caller, cursor);
+    if (!(await currentAuthority())) return undefined;
+    return {
+      observation: { groupId, role },
+      authorize: async () => {
+        if (!(await currentAuthority())) throw new Error("bot_group_role_authority_changed");
+      },
+    };
   }
 
   /** One group's durable Owner intent for a capability class. Not an authorization decision. */
@@ -2201,7 +2750,10 @@ export class ManagementApplication {
     const classified = new Set<string>();
     const scopeGates = new Map<string, ToolExclusionReason>();
     const classify = (
-      entries: readonly { name: string; exclusion: ToolExclusionReason | null }[],
+      entries: readonly {
+        name: string;
+        exclusion: ToolExclusionReason | null;
+      }[],
     ) => {
       for (const entry of entries) {
         classified.add(entry.name);
@@ -2230,7 +2782,11 @@ export class ManagementApplication {
       classified.add(name);
       if (
         !(await this.isWebEnabled(
-          { caller: context.caller, conversationId: context.conversationId, runId: context.runId },
+          {
+            caller: context.caller,
+            conversationId: context.conversationId,
+            runId: context.runId,
+          },
           capability,
         ))
       )
@@ -2666,7 +3222,12 @@ export class ManagementApplication {
           const checkedAt = Date.now();
           const latencyMs = Math.max(0, checkedAt - startedAt);
           if (measurement === "provider_runtime")
-            this.runtimeHealthByProfile.set(profileId, { state, checkedAt, latencyMs, reasonCode });
+            this.runtimeHealthByProfile.set(profileId, {
+              state,
+              checkedAt,
+              latencyMs,
+              reasonCode,
+            });
           const observationCursor = await this.trace.append(
             input.run.id,
             {
@@ -2951,10 +3512,57 @@ export class ManagementApplication {
     await this.store.evidence.advanceTrace(caller, cursor);
   }
 
+  private reserveQqLiveAcceptanceHandoff(input: {
+    principalId: string;
+    scope: TrustedChannelScope;
+    messageId: string;
+    leaseId: string;
+    textSha256: string;
+  }): QqLiveAcceptanceHandoff | undefined {
+    const key = qqLiveAcceptanceHandoffKey(input);
+    const existing = this.qqLiveAcceptanceHandoffs.get(key);
+    if (existing)
+      return existing.principalId === input.principalId &&
+        existing.leaseId === input.leaseId &&
+        existing.messageId === input.messageId &&
+        scopeKey(existing.scope) === scopeKey(input.scope) &&
+        existing.scope.senderId === input.scope.senderId &&
+        existing.textSha256 === input.textSha256
+        ? existing
+        : undefined;
+    let resolve!: (binding: QqLiveLearningBinding | undefined) => void;
+    const promise = new Promise<QqLiveLearningBinding | undefined>((complete) => {
+      resolve = complete;
+    });
+    const handoff: QqLiveAcceptanceHandoff = {
+      key,
+      principalId: input.principalId,
+      scope: structuredClone(input.scope),
+      messageId: input.messageId,
+      leaseId: input.leaseId,
+      textSha256: input.textSha256,
+      promise,
+      resolve: (binding) => {
+        if (handoff.settled) return;
+        handoff.settled = true;
+        resolve(binding);
+        if (!binding && this.qqLiveAcceptanceHandoffs.get(key) === handoff)
+          this.qqLiveAcceptanceHandoffs.delete(key);
+      },
+      settled: false,
+    };
+    this.qqLiveAcceptanceHandoffs.set(key, handoff);
+    return handoff;
+  }
+
   private async revokeQqLiveRunBinding(runId: string): Promise<void> {
     const binding = this.qqLiveRunBindings.get(runId);
     if (!binding) return;
     this.qqLiveRunBindings.delete(runId);
+    for (const [key, handoff] of this.qqLiveAcceptanceHandoffs) {
+      const bound = handoff.settled ? await handoff.promise : undefined;
+      if (bound?.runId === runId) this.qqLiveAcceptanceHandoffs.delete(key);
+    }
     if (!this.qqLiveLeases.revoke(binding.leaseId)) return;
     await appendQqLiveAcceptanceAudit(this.options.dataDirectory, {
       event: "lease_revoked",
@@ -2967,7 +3575,7 @@ export class ManagementApplication {
 
   listChannels(): PublicChannelProfile[] {
     return this.channels.list().map((channel) => {
-      const droppedNotReady = this.channelDroppedNotReady.get(channel.id);
+      const droppedNotReady = this.ingressEvidence.channelDroppedNotReadyFor(channel.id);
       return {
         ...channel,
         ...this.states.get(channel.id),
@@ -3015,7 +3623,11 @@ export class ManagementApplication {
         if (!previous) return;
         for (const [senderId, principalId] of previousMembers) {
           if (previous.botId === next.botId && nextMembers.get(senderId) === principalId) continue;
-          const identity = { connectionId: previous.connectionId, botId: previous.botId, senderId };
+          const identity = {
+            connectionId: previous.connectionId,
+            botId: previous.botId,
+            senderId,
+          };
           await this.store.authorization.revokeSenderScopes(identity);
           await this.store.identities.unbind(identity);
         }
@@ -3026,7 +3638,10 @@ export class ManagementApplication {
       for (const member of addedMembers) {
         for (const location of [
           { chatType: "private" as const, chatId: member.senderId },
-          ...channel.groupIds.map((chatId) => ({ chatType: "group" as const, chatId })),
+          ...channel.groupIds.map((chatId) => ({
+            chatType: "group" as const,
+            chatId,
+          })),
         ]) {
           const history = await this.store.authorization.listScopeHistory({
             resourceId: agentResourceId(AGENT_ID),
@@ -3060,7 +3675,10 @@ export class ManagementApplication {
     if (!configured.token)
       throw new ManagementError("INVALID_CONFIGURATION", CHANNEL_SAFE_ERRORS.configuration);
     if (!execution || (configured.config.groupIds.length > 0 && !execution.supportsGroup)) {
-      this.states.set(id, { connectionState: "error", lastError: CHANNEL_SAFE_ERRORS.execution });
+      this.states.set(id, {
+        connectionState: "error",
+        lastError: CHANNEL_SAFE_ERRORS.execution,
+      });
       throw new ManagementError("INVALID_CONFIGURATION", CHANNEL_SAFE_ERRORS.execution);
     }
     this.states.set(id, { connectionState: "connecting" });
@@ -3102,7 +3720,10 @@ export class ManagementApplication {
         if (state.status === "ready") {
           const reconnected = this.connectionEverReady.has(id);
           this.connectionEverReady.add(id);
-          if (reconnected) void this.backfillGroupHistory(id);
+          if (reconnected) {
+            this.markHistoryBackfillBoundaries(id, configured.config.groupIds);
+            void this.backfillGroupHistory(id);
+          }
         }
         if (!remember && state.status === "ready") {
           void provisionConfiguredAccess()
@@ -3135,7 +3756,12 @@ export class ManagementApplication {
         let leaseResolution:
           | { kind: "ordinary" }
           | { kind: "denied"; reason: string }
-          | { kind: "acceptance"; leaseId: string; marker: string; toolsSha256: string } = {
+          | {
+              kind: "acceptance";
+              leaseId: string;
+              marker: string;
+              toolsSha256: string;
+            } = {
           kind: "ordinary",
         };
         if (hasQqLiveAcceptanceMarker(message.text)) {
@@ -3249,89 +3875,161 @@ export class ManagementApplication {
             : {}),
           ...(imageFailureCode ? { imageFailureCode } : images.length > 0 ? { images } : {}),
         };
-        const accepted = await this.store.conversations.acceptIncoming(incoming);
-        if (leaseResolution.kind === "acceptance") {
-          const binding: QqLiveLeaseBinding = {
-            leaseId: leaseResolution.leaseId,
-            principalId: accepted.caller.principalId,
-            scope: message.scope,
+        const acceptanceHandoff =
+          leaseResolution.kind === "acceptance" && caller
+            ? this.reserveQqLiveAcceptanceHandoff({
+                principalId: caller.principalId,
+                scope: message.scope,
+                messageId: message.messageId,
+                leaseId: leaseResolution.leaseId,
+                textSha256: canonicalQqLiveTextSha256(message.text),
+              })
+            : undefined;
+        if (leaseResolution.kind === "acceptance" && !acceptanceHandoff) {
+          await appendQqLiveAcceptanceAudit(this.options.dataDirectory, {
+            event: "message_denied",
             messageId: message.messageId,
-            runId: accepted.run.id,
-          };
-          if (this.qqLiveLeases.bindRun(binding)) {
-            let auditRecorded = false;
-            try {
+            scope: message.scope,
+            ...(caller ? { principalId: caller.principalId } : {}),
+            leaseId: leaseResolution.leaseId,
+            reason: "run_handoff_unavailable",
+          }).catch(() => undefined);
+          return;
+        }
+        let accepted: Awaited<ReturnType<typeof this.store.conversations.acceptIncoming>>;
+        try {
+          accepted = await this.store.conversations.acceptIncoming(incoming);
+        } catch (error) {
+          acceptanceHandoff?.resolve(undefined);
+          throw error;
+        }
+        try {
+          if (leaseResolution.kind === "acceptance") {
+            const binding: QqLiveLeaseBinding = {
+              leaseId: leaseResolution.leaseId,
+              principalId: accepted.caller.principalId,
+              scope: message.scope,
+              messageId: message.messageId,
+              runId: accepted.run.id,
+            };
+            if (this.qqLiveLeases.bindRun(binding)) {
+              const textSha256 = canonicalQqLiveTextSha256(message.text);
+              let auditRecorded = false;
+              try {
+                await appendQqLiveAcceptanceAudit(this.options.dataDirectory, {
+                  event: "run_bound",
+                  messageId: message.messageId,
+                  scope: message.scope,
+                  principalId: accepted.caller.principalId,
+                  leaseId: leaseResolution.leaseId,
+                  runId: accepted.run.id,
+                  marker: leaseResolution.marker,
+                  textSha256,
+                  toolsSha256: leaseResolution.toolsSha256,
+                });
+                auditRecorded = true;
+              } catch {
+                // The persisted message keeps its marker, so the execution wrapper will
+                // settle this Run as gate_refused after revocation. Never execute an
+                // acceptance Run without its durable binding evidence.
+                this.qqLiveLeases.revoke(leaseResolution.leaseId);
+              }
+              if (auditRecorded) {
+                this.qqLiveRunBindings.set(accepted.run.id, {
+                  ...binding,
+                  runMessageId: accepted.run.messageId,
+                  textSha256,
+                  marker: leaseResolution.marker,
+                  toolsSha256: leaseResolution.toolsSha256,
+                });
+                const boundRun = await this.store.conversations
+                  .getRun(accepted.caller, accepted.run.id)
+                  .catch(() => undefined);
+                if (
+                  !boundRun ||
+                  (boundRun.status !== "queued" &&
+                    boundRun.status !== "running" &&
+                    boundRun.status !== "cancelling")
+                )
+                  await this.revokeQqLiveRunBinding(accepted.run.id);
+              }
+            } else {
               await appendQqLiveAcceptanceAudit(this.options.dataDirectory, {
-                event: "run_bound",
+                event: "message_denied",
                 messageId: message.messageId,
                 scope: message.scope,
                 principalId: accepted.caller.principalId,
                 leaseId: leaseResolution.leaseId,
+                reason: "run_binding_failed",
+              }).catch(() => undefined);
+            }
+          }
+          // A Run's Trace starts at message_received, which is the only place the two halves of
+          // the ingress path are stitched together: the drop that never became a Run is invisible
+          // in the run's own file, and the run's own file is the only place the message text is
+          // available to correlate.
+          if (!accepted.duplicate) await this.runs.recordMessageReceived(incoming, accepted.run);
+          if (!accepted.duplicate && message.scope.nativeGroupRole) {
+            const cursor = await this.trace.append(
+              accepted.run.id,
+              {
+                type: "native_group_role_observed",
                 runId: accepted.run.id,
-                marker: leaseResolution.marker,
-                textSha256: canonicalQqLiveTextSha256(message.text),
-                toolsSha256: leaseResolution.toolsSha256,
-              });
-              auditRecorded = true;
-            } catch {
-              // The persisted message keeps its marker, so the execution wrapper will
-              // settle this Run as gate_refused after revocation. Never execute an
-              // acceptance Run without its durable binding evidence.
-              this.qqLiveLeases.revoke(leaseResolution.leaseId);
+                conversationId: accepted.conversation.id,
+                principalId: accepted.caller.principalId,
+                resourceId: groupResourceId(message.scope.chatId),
+                groupId: message.scope.chatId,
+                senderId: message.scope.senderId,
+                observedRole: message.scope.nativeGroupRole.role,
+                roleSource: message.scope.nativeGroupRole.source,
+                observedAt: message.scope.nativeGroupRole.observedAt,
+              },
+              "glassbox-qq-role",
+            );
+            await this.store.evidence.advanceTrace(accepted.caller, cursor);
+          }
+          if (acceptanceHandoff) {
+            const binding = this.qqLiveRunBindings.get(accepted.run.id);
+            const active = binding && {
+              leaseId: binding.leaseId,
+              principalId: binding.principalId,
+              scope: binding.scope,
+              messageId: binding.messageId,
+              runId: binding.runId,
+            };
+            acceptanceHandoff.resolve(
+              binding &&
+                binding.principalId === acceptanceHandoff.principalId &&
+                binding.messageId === acceptanceHandoff.messageId &&
+                binding.textSha256 === acceptanceHandoff.textSha256 &&
+                scopeKey(binding.scope) === scopeKey(acceptanceHandoff.scope) &&
+                binding.scope.senderId === acceptanceHandoff.scope.senderId &&
+                active &&
+                this.qqLiveLeases.isActive(active)
+                ? binding
+                : undefined,
+            );
+          }
+          await this.runs.enqueueAccepted(accepted);
+        } finally {
+          if (acceptanceHandoff) {
+            const resolvedBinding = acceptanceHandoff.settled
+              ? await acceptanceHandoff.promise
+              : undefined;
+            if (!resolvedBinding) {
+              const binding = this.qqLiveRunBindings.get(accepted.run.id);
+              if (binding) await this.revokeQqLiveRunBinding(accepted.run.id);
+              else if (this.qqLiveLeases.revoke(acceptanceHandoff.leaseId))
+                await appendQqLiveAcceptanceAudit(this.options.dataDirectory, {
+                  event: "lease_revoked",
+                  principalId: acceptanceHandoff.principalId,
+                  leaseId: acceptanceHandoff.leaseId,
+                  scope: acceptanceHandoff.scope,
+                }).catch(() => undefined);
+              acceptanceHandoff.resolve(undefined);
             }
-            if (auditRecorded) {
-              this.qqLiveRunBindings.set(accepted.run.id, {
-                ...binding,
-                marker: leaseResolution.marker,
-                toolsSha256: leaseResolution.toolsSha256,
-              });
-              const boundRun = await this.store.conversations
-                .getRun(accepted.caller, accepted.run.id)
-                .catch(() => undefined);
-              if (
-                !boundRun ||
-                (boundRun.status !== "queued" &&
-                  boundRun.status !== "running" &&
-                  boundRun.status !== "cancelling")
-              )
-                await this.revokeQqLiveRunBinding(accepted.run.id);
-            }
-          } else {
-            await appendQqLiveAcceptanceAudit(this.options.dataDirectory, {
-              event: "message_denied",
-              messageId: message.messageId,
-              scope: message.scope,
-              principalId: accepted.caller.principalId,
-              leaseId: leaseResolution.leaseId,
-              reason: "run_binding_failed",
-            }).catch(() => undefined);
           }
         }
-        // A Run's Trace starts at message_received, which is the only place the two halves of
-        // the ingress path are stitched together: the drop that never became a Run is invisible
-        // in the run's own file, and the run's own file is the only place the message text is
-        // available to correlate.
-        if (!accepted.duplicate) await this.runs.recordMessageReceived(incoming, accepted.run);
-        if (!accepted.duplicate && message.scope.nativeGroupRole) {
-          const cursor = await this.trace.append(
-            accepted.run.id,
-            {
-              type: "native_group_role_observed",
-              runId: accepted.run.id,
-              conversationId: accepted.conversation.id,
-              principalId: accepted.caller.principalId,
-              resourceId: groupResourceId(message.scope.chatId),
-              groupId: message.scope.chatId,
-              senderId: message.scope.senderId,
-              observedRole: message.scope.nativeGroupRole.role,
-              roleSource: message.scope.nativeGroupRole.source,
-              observedAt: message.scope.nativeGroupRole.observedAt,
-            },
-            "glassbox-qq-role",
-          );
-          await this.store.evidence.advanceTrace(accepted.caller, cursor);
-        }
-        await this.runs.enqueueAccepted(accepted);
       },
     });
     this.connections.set(id, adapter);
@@ -3356,7 +4054,10 @@ export class ManagementApplication {
           : error instanceof OneBotConnectionError && error.code === "identity_mismatch"
             ? "identity"
             : "connection";
-      this.states.set(id, { connectionState: "error", lastError: CHANNEL_SAFE_ERRORS[key] });
+      this.states.set(id, {
+        connectionState: "error",
+        lastError: CHANNEL_SAFE_ERRORS[key],
+      });
       throw new ManagementError("CONNECTION_FAILED", CHANNEL_SAFE_ERRORS[key], 503);
     }
   }
@@ -3584,7 +4285,12 @@ export class ManagementApplication {
       // The Run's own group scope is the audience it already owns, so this is the one delivery
       // authority a group Run can hold. It is granted only because Glassbox configured
       // this group. Bot membership alone registers nothing and grants nothing.
-      await this.grantGroupDelivery({ principalId, scope, groupId: scope.chatId, initialOnly });
+      await this.grantGroupDelivery({
+        principalId,
+        scope,
+        groupId: scope.chatId,
+        initialOnly,
+      });
       // Discovery is a superset of authority, exactly as for the Owner-private scope: the
       // Run's candidate list narrows it to policy, so a category change applies on the next
       // Run with no re-grant and a revoked category cannot survive as stale discovery.
@@ -3819,7 +4525,10 @@ export class ManagementApplication {
       visibility: "public",
       ifAbsent: true,
     });
-    const caller: CallerContext = { principalId: input.principalId, scope: input.scope };
+    const caller: CallerContext = {
+      principalId: input.principalId,
+      scope: input.scope,
+    };
     const existing = await this.store.authorization.check({
       caller,
       resourceId,
@@ -3889,7 +4598,12 @@ export class ManagementApplication {
   private async setGroupAccess(
     context: ProtectedToolContext,
     input: { groupId: string; enabled: boolean },
-  ): Promise<{ groupId: string; enabled: boolean; enabledSkills: string[]; version: number }> {
+  ): Promise<{
+    groupId: string;
+    enabled: boolean;
+    enabledSkills: string[];
+    version: number;
+  }> {
     return this.serialize(async () => {
       const caller = context.caller;
       const isOwner = await this.store.identities.isOwner(caller.principalId);
@@ -3902,7 +4616,10 @@ export class ManagementApplication {
         throw new Error("bot_not_in_group");
 
       const groupResource = groupResourceId(input.groupId);
-      const actingOwner = { principalId: caller.principalId, scope: caller.scope };
+      const actingOwner = {
+        principalId: caller.principalId,
+        scope: caller.scope,
+      };
       const groupScopes = this.groupScopes(configured, input.groupId);
       // True only once no Owner is left assigned. Enabling always touches the transport; a
       // disable touches it only when the acting Owner was the group's last one.
@@ -4079,7 +4796,11 @@ export class ManagementApplication {
       ...this.groupRunToolNames().map((name) => toolResourceId(name)),
       groupResource,
     ])
-      await this.store.authorization.revokeScope({ principalId, resourceId, scope });
+      await this.store.authorization.revokeScope({
+        principalId,
+        resourceId,
+        scope,
+      });
   }
 
   /**
@@ -4212,10 +4933,51 @@ export class ManagementApplication {
       }
       for (const groupId of configured.config.groupIds) {
         if (!(await this.isHistoryEnabled(connectionId, groupId))) continue;
-        targets.push({ connectionId, groupId });
+        const caller = await this.authorizedHistoryCollectionCaller(configured, groupId);
+        if (caller) targets.push({ connectionId, groupId, caller });
       }
     }
     return targets;
+  }
+
+  /** Resolve a real configured Owner identity with current authority for this Resource. */
+  private async authorizedHistoryCollectionCaller(
+    configured: ReturnType<ChannelProfileStore["resolve"]>,
+    groupId: string,
+  ): Promise<CallerContext | undefined> {
+    for (const candidate of this.ownerPrivateScopes(configured)) {
+      if (await this.historyReadAllowed(configured.config.connectionId, groupId, candidate))
+        return candidate;
+    }
+    return undefined;
+  }
+
+  /** Recheck membership, Owner intent and history:read authority before each provider read. */
+  private async historyReadAllowed(
+    connectionId: string,
+    groupId: string,
+    caller: CallerContext,
+  ): Promise<boolean> {
+    let configured: ReturnType<ChannelProfileStore["resolve"]>;
+    try {
+      configured = this.channels.resolve(connectionId);
+    } catch {
+      return false;
+    }
+    if (
+      caller.scope.connectionId !== connectionId ||
+      caller.scope.botId !== configured.config.botId ||
+      !configured.config.groupIds.includes(groupId) ||
+      !(await this.isHistoryEnabled(connectionId, groupId))
+    )
+      return false;
+    const decision = await this.store.authorization.check({
+      caller,
+      resourceId: groupResourceId(groupId),
+      action: HISTORY_READ_ACTION,
+      policyCondition: qqCategoryCondition(caller, groupId, "group.history"),
+    });
+    return decision.decision === "ALLOW";
   }
 
   /**
@@ -4236,13 +4998,82 @@ export class ManagementApplication {
       return;
     }
     for (const target of targets) {
+      const key = historyTargetKey(target.connectionId, target.groupId);
+      if (!this.historyBackfills.has(key)) continue;
       await this.historyPoller.backfill(target, HISTORY_BACKFILL_MAX_PAGES).catch(() => undefined);
     }
   }
 
+  /** Captures each group's last observed message before asynchronous target discovery yields. */
+  private markHistoryBackfillBoundaries(connectionId: string, groupIds: readonly string[]): void {
+    for (const groupId of groupIds) {
+      const key = historyTargetKey(connectionId, groupId);
+      const boundaryMessageId = this.historyHighWater.get(key);
+      // There is no outage window to close until this process has observed at least one
+      // message for the group. The regular poll will establish that boundary.
+      if (boundaryMessageId !== undefined && !this.historyBackfills.has(key))
+        this.historyBackfills.set(key, { boundaryMessageId });
+    }
+  }
+
+  /** Serializes the regular poll and reconnect backfill for one group. */
+  private async syncPolledGroupHistory(
+    target: HistorySyncTarget,
+    options: { maxPages: number; mode: "poll" | "backfill" },
+  ): Promise<HistorySyncOutcome> {
+    const key = historyTargetKey(target.connectionId, target.groupId);
+    const previous = this.historySyncFlights.get(key);
+    const next = (previous ?? Promise.resolve({ pagesWalked: 0, stop: "end_of_source" as const }))
+      .catch(() => ({ pagesWalked: 0, stop: "provider_failed" as const }))
+      .then(() => this.runPolledGroupHistory(target, options, key));
+    this.historySyncFlights.set(key, next);
+    try {
+      return await next;
+    } finally {
+      if (this.historySyncFlights.get(key) === next) this.historySyncFlights.delete(key);
+    }
+  }
+
+  private async runPolledGroupHistory(
+    target: HistorySyncTarget,
+    options: { maxPages: number; mode: "poll" | "backfill" },
+    key: string,
+  ): Promise<HistorySyncOutcome> {
+    let progress = this.historyBackfills.get(key);
+    if (options.mode === "backfill" && progress === undefined) {
+      const boundaryMessageId = this.historyHighWater.get(key);
+      if (boundaryMessageId === undefined) return { pagesWalked: 0, stop: "provider_unknown" };
+      progress = { boundaryMessageId };
+      this.historyBackfills.set(key, progress);
+    }
+
+    if (progress !== undefined) {
+      const walk = await this.walkGroupHistory(target.connectionId, target.groupId, {
+        maxPages: options.maxPages,
+        ...(target.caller === undefined ? {} : { caller: target.caller }),
+        ...(progress.cursor === undefined ? {} : { cursor: progress.cursor }),
+        stopAtMessageId: progress.boundaryMessageId,
+      });
+      if (walk.continuationCursor !== undefined) progress.cursor = walk.continuationCursor;
+      if (walk.outcome.stop === "cursor_boundary_reached" || walk.outcome.stop === "end_of_source")
+        this.historyBackfills.delete(key);
+      return walk.outcome;
+    }
+
+    const walk = await this.walkGroupHistory(target.connectionId, target.groupId, {
+      maxPages: options.maxPages,
+      ...(target.caller === undefined ? {} : { caller: target.caller }),
+    });
+    if (walk.latestMessageId !== undefined && !this.historyBackfills.has(key))
+      this.historyHighWater.set(key, walk.latestMessageId);
+    return walk.outcome;
+  }
+
   /**
    * Pulls real group history through the existing authenticated OneBot connection into
-   * the durable archive. Only called for a group whose `history:read` decision was ALLOW.
+   * the durable archive. Both background collection and request-driven calls recheck current
+   * configured membership, `group.history` policy and the acting Principal's `history:read`
+   * grant before each provider page.
    *
    * Older history is reachable: the walk follows the provider's `nextCursor` backwards for
    * up to `maxPages` pages, so a single recent page is never the only thing archived. It
@@ -4256,17 +5087,54 @@ export class ManagementApplication {
     connectionId: string,
     groupId: string,
     options: { maxPages?: number; since?: string; until?: string } = {},
+    caller?: CallerContext,
   ): Promise<HistorySyncOutcome> {
+    const walk = await this.walkGroupHistory(connectionId, groupId, {
+      ...options,
+      caller,
+    });
+    const key = historyTargetKey(connectionId, groupId);
+    if (walk.latestMessageId !== undefined && !this.historyBackfills.has(key))
+      this.historyHighWater.set(key, walk.latestMessageId);
+    return walk.outcome;
+  }
+
+  private async walkGroupHistory(
+    connectionId: string,
+    groupId: string,
+    options: {
+      maxPages?: number;
+      since?: string;
+      until?: string;
+      cursor?: string;
+      stopAtMessageId?: string;
+      caller?: CallerContext;
+    } = {},
+  ): Promise<HistorySyncWalkResult> {
+    if (
+      options.caller === undefined ||
+      !(await this.historyReadAllowed(connectionId, groupId, options.caller))
+    )
+      return { outcome: { pagesWalked: 0, stop: "authorization_denied" } };
     const connection = this.connections.get(connectionId);
-    if (!connection) return { pagesWalked: 0, stop: "provider_unavailable" };
+    if (!connection) return { outcome: { pagesWalked: 0, stop: "provider_unavailable" } };
     const maxPages = Math.max(1, Math.min(options.maxPages ?? HISTORY_SYNC_MAX_PAGES, 20));
     const seen = new Set<string>();
-    let cursor: string | undefined;
+    let cursor = options.cursor;
     let pagesWalked = 0;
     let skippedOwnMessages = 0;
-    const done = (stop: HistorySyncStop): HistorySyncOutcome =>
-      skippedOwnMessages === 0 ? { pagesWalked, stop } : { pagesWalked, stop, skippedOwnMessages };
+    let latestMessageId: string | undefined;
+    const done = (stop: HistorySyncStop, continuationCursor?: string): HistorySyncWalkResult => ({
+      outcome:
+        skippedOwnMessages === 0
+          ? { pagesWalked, stop }
+          : { pagesWalked, stop, skippedOwnMessages },
+      ...(latestMessageId === undefined ? {} : { latestMessageId }),
+      ...(continuationCursor === undefined ? {} : { continuationCursor }),
+    });
     for (let page = 0; page < maxPages; page += 1) {
+      if (!(await this.historyReadAllowed(connectionId, groupId, options.caller)))
+        return done("authorization_denied");
       const result = await connection.getGroupHistory({
         groupId,
         cursor,
@@ -4281,9 +5149,20 @@ export class ManagementApplication {
               : "provider_failed",
         );
       pagesWalked += 1;
+      // Authority can change while the provider request is in flight. Recheck before any
+      // returned message enters the archive.
+      if (!(await this.historyReadAllowed(connectionId, groupId, options.caller)))
+        return done("authorization_denied");
+      if (page === 0 && options.cursor === undefined)
+        latestMessageId = result.messages[0]?.messageId;
       let reachedBound = false;
+      let reachedCursorBoundary = false;
       let newMessages = 0;
       for (const message of result.messages) {
+        if (options.stopAtMessageId === message.messageId) {
+          reachedCursorBoundary = true;
+          break;
+        }
         if (options.since && message.occurredAt < options.since) {
           reachedBound = true;
           continue;
@@ -4298,6 +5177,8 @@ export class ManagementApplication {
           skippedOwnMessages += 1;
           continue;
         }
+        if (!(await this.historyReadAllowed(connectionId, groupId, options.caller)))
+          return done("authorization_denied");
         newMessages += 1;
         await this.archive.ingest({
           channel: "qq-onebot",
@@ -4311,6 +5192,7 @@ export class ManagementApplication {
           occurredAt: message.occurredAt,
         });
       }
+      if (reachedCursorBoundary) return done("cursor_boundary_reached");
       const next = result.nextCursor;
       if (next === undefined)
         return done(result.messages.length === 0 ? "end_of_source" : "provider_unknown");
@@ -4319,12 +5201,14 @@ export class ManagementApplication {
         // page containing only the already-seen cursor is its end-of-source signal. A
         // larger repeated page is still a stalled provider and must remain partial.
         return done(
-          newMessages === 0 && result.messages.length <= 1 ? "end_of_source" : "cursor_stuck",
+          result.messages.length === 1 && result.messages[0]?.messageId === cursor
+            ? "end_of_source"
+            : "cursor_stuck",
         );
       cursor = next;
       if (reachedBound) return done("since_bound_reached");
     }
-    return done("page_bound_reached");
+    return done("page_bound_reached", cursor);
   }
 
   private async manageGroup(
@@ -4340,11 +5224,19 @@ export class ManagementApplication {
       return WEB_CAPABILITIES.includes(input.category as WebCapability)
         ? this.setGroupWebCapability(
             context,
-            input as { groupId: string; category: WebCapability; enabled: boolean },
+            input as {
+              groupId: string;
+              category: WebCapability;
+              enabled: boolean;
+            },
           )
         : this.setGroupCategory(
             context,
-            input as { groupId: string; category: QqCapabilityCategory; enabled: boolean },
+            input as {
+              groupId: string;
+              category: QqCapabilityCategory;
+              enabled: boolean;
+            },
           );
     if (input.action === "set_memory_source") return this.setGroupMemorySource(context, input);
     if (input.action === "set_history") return this.setGroupHistory(context, input);
@@ -4477,7 +5369,11 @@ export class ManagementApplication {
   ): Promise<void> {
     const cursor = await this.trace.append(
       context.runId,
-      { ...event, runId: context.runId, principalId: context.caller.principalId },
+      {
+        ...event,
+        runId: context.runId,
+        principalId: context.caller.principalId,
+      },
       "glassbox-owner-control",
     );
     await this.store.evidence.advanceTrace(context.caller, cursor);
@@ -4485,7 +5381,11 @@ export class ManagementApplication {
 
   private async setGroupCategory(
     context: ProtectedToolContext,
-    input: { groupId: string; category: QqCapabilityCategory; enabled: boolean },
+    input: {
+      groupId: string;
+      category: QqCapabilityCategory;
+      enabled: boolean;
+    },
   ): Promise<unknown> {
     return this.serialize(async () => {
       await this.requireManagedGroup(context, input.groupId);
@@ -4510,7 +5410,12 @@ export class ManagementApplication {
         enabled: input.enabled,
         policyVersion: version,
       });
-      return { groupId: input.groupId, category: input.category, enabled: input.enabled, version };
+      return {
+        groupId: input.groupId,
+        category: input.category,
+        enabled: input.enabled,
+        version,
+      };
     });
   }
 
@@ -4535,7 +5440,12 @@ export class ManagementApplication {
         enabled: input.enabled,
         policyVersion: version,
       });
-      return { groupId: input.groupId, category: input.category, enabled: input.enabled, version };
+      return {
+        groupId: input.groupId,
+        category: input.category,
+        enabled: input.enabled,
+        version,
+      };
     });
   }
 
@@ -4638,10 +5548,13 @@ export class ManagementApplication {
       // projection so a category and `historyRead` cannot disagree about the same Action.
       // The map dies with the call: nothing is cached across projections or Runs, so a
       // revoke, a new Conversation or a new Run is always re-evaluated.
-      const decisions = new Map<string, boolean>();
+      const decisions = new Map<
+        string,
+        { allowed: boolean; evidence: ProjectionDecisionEvidence }
+      >();
       const allowed = async (action: string): Promise<boolean> => {
         const known = decisions.get(action);
-        if (known !== undefined) return known;
+        if (known !== undefined) return known.allowed;
         const decision = await this.store.authorization.check({
           caller,
           resourceId,
@@ -4650,7 +5563,16 @@ export class ManagementApplication {
           runId: context.runId,
         });
         const granted = decision.decision === "ALLOW";
-        decisions.set(action, granted);
+        decisions.set(action, {
+          allowed: granted,
+          evidence: {
+            decisionId: decision.id,
+            action,
+            resourceId,
+            decision: decision.decision,
+            reason: decision.reason,
+          },
+        });
         return granted;
       };
       // A category counts as granted only when every group-scoped Action it confers is
@@ -4670,11 +5592,21 @@ export class ManagementApplication {
         policy: policies.get(groupId)?.policy ?? DEFAULT_GROUP_CAPABILITY_POLICY,
         version: policies.get(groupId)?.version ?? 0,
         grantedCategories,
+        availabilityDecisions: [
+          ...new Set(
+            QQ_CAPABILITY_CATEGORIES.flatMap((category) => this.categoryActions(category)),
+          ),
+        ]
+          .map((action) => decisions.get(action)?.evidence)
+          .filter((entry): entry is ProjectionDecisionEvidence => entry !== undefined),
         // The `history:read` decision itself — the same Action the history Tools check — not
         // a flag inferred from the category that happens to contain it.
         historyRead: await allowed(HISTORY_READ_ACTION),
         groupRead: await allowed(GROUP_READ_ACTION),
-        skills: { enabledSkills: [...runtime.enabledSkills], version: runtime.version },
+        skills: {
+          enabledSkills: [...runtime.enabledSkills],
+          version: runtime.version,
+        },
       });
     }
     return facts;
@@ -4699,7 +5631,11 @@ export class ManagementApplication {
   private async observeGroup(
     connection: OneBotAdapter | undefined,
     groupId: string,
-  ): Promise<{ name: string | null; reachable: boolean | null; botMembership: boolean | null }> {
+  ): Promise<{
+    name: string | null;
+    reachable: boolean | null;
+    botMembership: boolean | null;
+  }> {
     if (!connection) return { name: null, reachable: null, botMembership: null };
     try {
       const result = await connection.getGroupInfo({ groupId });
@@ -4722,7 +5658,10 @@ export class ManagementApplication {
    * group is ALLOW, so a protected group fact is re-authorized before any provider call and a
    * denied group never causes one.
    */
-  private async projectManagedGroups(context: AuthorizationContext): Promise<unknown> {
+  private async projectManagedGroups(
+    context: AuthorizationContext,
+    toolInput?: Record<string, unknown>,
+  ): Promise<unknown> {
     const connection = this.connections.get(context.caller.scope.connectionId);
     const facts = await this.managedGroupFacts(context);
     const groups = [];
@@ -4751,7 +5690,26 @@ export class ManagementApplication {
         version: fact.version,
       });
     }
-    return { connectionId: context.caller.scope.connectionId, groups };
+    const result = { connectionId: context.caller.scope.connectionId, groups };
+    if (toolInput === undefined || !context.conversationId || !context.runId) return result;
+    return this.authorizationProjection(
+      {
+        caller: context.caller,
+        conversationId: context.conversationId,
+        runId: context.runId,
+      },
+      "qq_groups",
+      "managed_group_inventory",
+      "managed_group_category_availability",
+      toolInput,
+      facts.flatMap((fact) =>
+        fact.availabilityDecisions.map((entry) => ({
+          ...entry,
+          purpose: "managed_group_category_availability" as const,
+        })),
+      ),
+      result,
+    );
   }
 
   async probeCapabilities(channelId: string, groupId: string): Promise<CapabilityProbeReport> {
@@ -4811,7 +5769,11 @@ export class ManagementApplication {
    */
   private async searchCapabilities(
     context: ProtectedToolContext,
-    input: { query: string | undefined; groupIds: readonly string[] | undefined },
+    input: {
+      query: string | undefined;
+      groupIds: readonly string[] | undefined;
+    },
+    toolInput: Record<string, unknown>,
   ): Promise<unknown> {
     const caller = context.caller;
     const facts = await this.managedGroupFacts(context);
@@ -4820,6 +5782,12 @@ export class ManagementApplication {
     const considered = requested ? facts.filter((fact) => requested.has(fact.groupId)) : facts;
 
     const entries: CapabilitySearchEntry[] = [];
+    const availabilityDenials: ProjectionDecisionEvidence[] = facts.flatMap((fact) =>
+      fact.availabilityDecisions.map((entry) => ({
+        ...entry,
+        purpose: "capability_group_category_availability" as const,
+      })),
+    );
     for (const capability of QQ_CAPABILITIES) {
       // Discovery is re-checked per Run rather than trusted from the Tool surface.
       const discovery = await this.store.authorization.check({
@@ -4829,7 +5797,18 @@ export class ManagementApplication {
         conversationId: context.conversationId,
         runId: context.runId,
       });
-      if (discovery.decision !== "ALLOW") continue;
+      if (discovery.decision !== "ALLOW") {
+        if (discovery.decision === "DENY")
+          availabilityDenials.push({
+            decisionId: discovery.id,
+            action: TOOL_DISCOVERY_ACTION,
+            resourceId: toolResourceId(capability.tool),
+            decision: discovery.decision,
+            reason: discovery.reason,
+            purpose: "capability_tool_discovery_availability",
+          });
+        continue;
+      }
 
       if (capability.resource === "account") {
         const decision = await this.store.authorization.check({
@@ -4868,11 +5847,104 @@ export class ManagementApplication {
       });
     }
 
-    return {
+    const result = {
       query: input.query ?? null,
       groups: considered.map((fact) => fact.groupId),
       capabilities: matchCapabilityEntries(entries, input.query),
     };
+    return this.authorizationProjection(
+      context,
+      "qq_capability_search",
+      "capability_search",
+      "capability_search_availability",
+      toolInput,
+      availabilityDenials,
+      result,
+    );
+  }
+
+  private authorizationProjection(
+    context: AuthorizationContext & { conversationId: string; runId: string },
+    toolName: string,
+    kind: ProjectionKind,
+    purpose: ProjectionPurpose,
+    input: Record<string, unknown>,
+    decisions: ProjectionDecisionEvidence[],
+    result: unknown,
+  ): unknown {
+    const deniedNoGrant = decisions.filter(
+      (entry) =>
+        entry.decision === "DENY" &&
+        entry.reason === "no_grant" &&
+        ((kind === "managed_group_inventory" &&
+          entry.purpose === "managed_group_category_availability" &&
+          PROJECTION_AVAILABILITY_ACTIONS.has(entry.action)) ||
+          (kind === "capability_search" &&
+            entry.purpose === "capability_group_category_availability" &&
+            PROJECTION_AVAILABILITY_ACTIONS.has(entry.action)) ||
+          (kind === "capability_search" &&
+            entry.purpose === "capability_tool_discovery_availability" &&
+            entry.action === TOOL_DISCOVERY_ACTION &&
+            entry.resourceId === toolResourceId("qq_group_local_settings"))),
+    );
+    if (!deniedNoGrant.length) return result;
+    return authorizationProjectionResult(result, {
+      kind,
+      purpose,
+      decisions: deniedNoGrant,
+      input,
+      record: async ({ context: callContext, input: inputEvidence, output }) => {
+        if (
+          callContext.runId !== context.runId ||
+          callContext.conversationId !== context.conversationId ||
+          callContext.caller.principalId !== context.caller.principalId ||
+          callContext.caller.scope !== context.caller.scope ||
+          !callContext.toolCallId
+        )
+          throw new Error("authorization_projection_context_changed");
+        const receiptId = randomUUID();
+        const data = {
+          schema: "glassbox.authorization-projection-receipt.v1",
+          receiptId,
+          kind,
+          purpose,
+          conversationId: context.conversationId,
+          scopeKey: scopeKey(context.caller.scope),
+          toolName,
+          toolCallId: callContext.toolCallId,
+          inputSha256: inputEvidence.inputSha256,
+          inputBytes: inputEvidence.inputBytes,
+          outputSha256: output.outputSha256,
+          outputBytes: output.outputBytes,
+          decisions: deniedNoGrant.map(
+            ({ decisionId, action, resourceId, purpose: decisionPurpose }) => ({
+              decisionId,
+              action,
+              resourceId,
+              purpose: decisionPurpose ?? purpose,
+            }),
+          ),
+        };
+        await this.store.tasks.recordTrace({
+          type: "authorization.projection_receipt",
+          runId: context.runId,
+          principalId: context.caller.principalId,
+          data,
+        });
+        const cursor = await this.trace.append(
+          context.runId,
+          {
+            type: "authorization_projection_receipt",
+            ...data,
+            receiptEventId: receiptId,
+            runId: context.runId,
+            principalId: context.caller.principalId,
+          },
+          "glassbox-authorization-projection",
+        );
+        await this.store.evidence.advanceTrace(context.caller, cursor);
+      },
+    });
   }
 
   private async setGroupSkill(
@@ -5039,7 +6111,10 @@ export class ManagementApplication {
     // The group assignment may have been revoked while the Raw Trace file was being read.
     // Re-authorize before returning even the bounded metadata projection.
     await this.requireManagedRoleAuditGroup(channelId, groupId);
-    return { audits, ingressDiagnostics: this.groupIngressDiagnosticsFor(channelId, groupId) };
+    return {
+      audits,
+      ingressDiagnostics: this.groupIngressDiagnosticsFor(channelId, groupId),
+    };
   }
 
   private groupIngressDiagnosticsFor(
@@ -5057,9 +6132,8 @@ export class ManagementApplication {
     // message dropped because the connection was not ready. It has no group projection to be
     // counted in, and before this branch it was recorded nowhere at all.
     if (diagnostic.groupId === undefined) {
-      if (diagnostic.stage !== "dropped") return;
-      const dropped = this.channelDroppedNotReady.get(channelId) ?? 0;
-      this.channelDroppedNotReady.set(channelId, Math.min(1_000_000, dropped + 1));
+      if (diagnostic.stage === "dropped")
+        this.ingressEvidence.recordChannelDroppedNotReady(channelId, new Date().toISOString());
       return;
     }
     if (!this.channels.resolve(channelId).config.groupIds.includes(diagnostic.groupId)) return;
@@ -5191,7 +6265,10 @@ export class ManagementApplication {
       longWorkBackend: {
         ...backend,
         ...(liveServer.state === "unavailable"
-          ? { state: "unavailable" as const, reason: "Temporal live probe failed" }
+          ? {
+              state: "unavailable" as const,
+              reason: "Temporal live probe failed",
+            }
           : {}),
         liveServer,
       },

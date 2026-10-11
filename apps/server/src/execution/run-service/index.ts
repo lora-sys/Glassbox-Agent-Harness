@@ -732,26 +732,48 @@ export class RunService {
             caller: structuredClone(caller),
             signal: active.controller.signal,
           };
-          executorStarted = true;
-          if (this.options.captureLearning) {
-            try {
-              const candidateId = await this.options.captureLearning(executionInput);
-              if (candidateId) {
-                await this.emit({
-                  type: "learning_candidate_created",
-                  runId,
-                  conversationId: input.conversation.id,
-                  candidateId,
-                  scopeType: caller.scope.chatType === "group" ? "group" : "global",
-                });
+          const preflight = await this.options.beforeExecution?.(executionInput);
+          if (active.controller.signal.aborted) {
+            result = { status: "cancelled" };
+          } else if (preflight !== undefined) {
+            result = preflight;
+          } else {
+            if (this.options.beforeExecution) {
+              const currentAuthorization = await this.options.store.authorization.check({
+                caller,
+                resourceId: `agent:${input.conversation.agentId}`,
+                action: "run:create",
+                conversationId: input.conversation.id,
+                runId,
+              });
+              if (currentAuthorization.decision !== "ALLOW")
+                throw new AccessDeniedError(currentAuthorization);
+            }
+            if (active.controller.signal.aborted) {
+              result = { status: "cancelled" };
+            } else {
+              executorStarted = true;
+              if (this.options.captureLearning) {
+                try {
+                  const candidateId = await this.options.captureLearning(executionInput);
+                  if (candidateId) {
+                    await this.emit({
+                      type: "learning_candidate_created",
+                      runId,
+                      conversationId: input.conversation.id,
+                      candidateId,
+                      scopeType: caller.scope.chatType === "group" ? "group" : "global",
+                    });
+                  }
+                } catch {
+                  this.report("evidence_failed", runId);
+                }
               }
-            } catch {
-              this.report("evidence_failed", runId);
+              result = await adapter.execute({
+                ...executionInput,
+              });
             }
           }
-          result = await adapter.execute({
-            ...executionInput,
-          });
         }
       }
     } catch (error) {
@@ -881,21 +903,26 @@ export class RunService {
     const prepared = this.options.prepareDelivery
       ? await this.options.prepareDelivery(candidate, { caller, run })
       : { allowed: true, text: candidate, reasons: [], candidateSha256: "not-recorded" };
-    if (!existing && (!prepared.allowed || !prepared.text)) {
+    const contentBlocked = !prepared.allowed || !prepared.text;
+    // The original result remains evidence and stays excluded from model Context. A fixed
+    // status notice carries no candidate data and still uses normal delivery authorization.
+    const deliveryText = contentBlocked
+      ? "这次回复未通过发送检查，内容已保留供检查。请勿重复提交可能已经执行的操作。"
+      : prepared.text!;
+    if (!existing && contentBlocked) {
       const newlyBlocked = await this.options.store.conversations.excludeRunFromContext(
         caller,
         run.id,
       );
-      if (!newlyBlocked) return;
-      await this.emit({
-        type: "delivery_blocked",
-        runId: run.id,
-        conversationId: run.conversationId,
-        reasons: [...prepared.reasons],
-        candidateSha256: prepared.candidateSha256,
-        candidateBytes: Buffer.byteLength(candidate, "utf8"),
-      });
-      return;
+      if (newlyBlocked)
+        await this.emit({
+          type: "delivery_blocked",
+          runId: run.id,
+          conversationId: run.conversationId,
+          reasons: [...prepared.reasons],
+          candidateSha256: prepared.candidateSha256,
+          candidateBytes: Buffer.byteLength(candidate, "utf8"),
+        });
     }
     try {
       if (!existing)
@@ -903,7 +930,7 @@ export class RunService {
           runId: run.id,
           dedupKey: "result",
           destination: caller.scope,
-          payloadText: prepared.text!,
+          payloadText: deliveryText,
           payloadKind: "result",
         });
       if (prepared.allowed)

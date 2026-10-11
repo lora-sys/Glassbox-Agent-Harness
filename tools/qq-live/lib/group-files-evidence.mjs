@@ -134,10 +134,16 @@ export function projectGroupFiles(details, expectedGroupId) {
     seenFolders.add(folder.folder_id);
   }
 
+  const metadata = {
+    files: files.map(({ file_id: _fileId, ...rest }) => rest),
+    folders,
+  };
+  const canonicalMetadata = pureJsonCanonical(metadata);
   return {
     fileCount: files.length,
     folderCount: folders.length,
     listingSha256: digest(Buffer.from(canonicalDetails, "utf8")),
+    metadataSha256: digest(Buffer.from(canonicalMetadata, "utf8")),
   };
 }
 
@@ -165,33 +171,37 @@ function parseCanonicalJson(value) {
 function validateSafeGroupFiles(value) {
   if (
     !isRecord(value) ||
-    Object.keys(value).sort().join(",") !== "fileCount,folderCount,listingSha256" ||
+    Object.keys(value).sort().join(",") !== "fileCount,folderCount,listingSha256,metadataSha256" ||
     !Number.isSafeInteger(value.fileCount) ||
     value.fileCount < 0 ||
     !Number.isSafeInteger(value.folderCount) ||
     value.folderCount < 0 ||
     value.fileCount + value.folderCount > 50 ||
-    !/^[0-9a-f]{64}$/u.test(value.listingSha256 ?? "")
+    !/^[0-9a-f]{64}$/u.test(value.listingSha256 ?? "") ||
+    !/^[0-9a-f]{64}$/u.test(value.metadataSha256 ?? "")
   )
     invalid("GROUP_FILES_EVIDENCE", "INCONCLUSIVE");
   return {
     fileCount: value.fileCount,
     folderCount: value.folderCount,
     listingSha256: value.listingSha256,
+    metadataSha256: value.metadataSha256,
   };
 }
 
 function validateTraceGroupFiles(value) {
   if (
     !isRecord(value) ||
-    Object.keys(value).sort().join(",") !== "fileCount,folderCount,listingSha256,schemaVersion" ||
-    value.schemaVersion !== 1
+    Object.keys(value).sort().join(",") !==
+      "fileCount,folderCount,listingSha256,metadataSha256,schemaVersion" ||
+    value.schemaVersion !== 2
   )
     invalid();
   return validateSafeGroupFiles({
     fileCount: value.fileCount,
     folderCount: value.folderCount,
     listingSha256: value.listingSha256,
+    metadataSha256: value.metadataSha256,
   });
 }
 
@@ -209,22 +219,75 @@ function groupFilesEvents(events, runId) {
       event.type === "tool_result" &&
       (event.data?.name === "qq_group_files" || event.name === "qq_group_files"),
   );
-  const fileCalls = calls.filter(
-    (event) => event.data?.input?.operation === "get_group_root_files",
-  );
-  if (fileCalls.length !== 1 || calls.length !== 1 || results.length !== 1) invalid();
-  const [call] = fileCalls;
-  const [result] = results;
+  const maxRejectedAttempts = 3;
+  if (calls.length < 1 || calls.length > maxRejectedAttempts + 1 || results.length !== calls.length)
+    invalid();
+  const successfulCalls = calls.filter((call) => {
+    const matchingResults = results.filter(
+      (result) =>
+        result.toolCallId === call.toolCallId || result.data?.toolCallId === call.toolCallId,
+    );
+    return matchingResults.length === 1 && matchingResults[0].data?.isError === false;
+  });
+  if (successfulCalls.length !== 1) invalid();
+  const expectedGroupId = successfulCalls[0]?.data?.input?.groupId;
+  const pairs = [];
+  const ids = new Set();
+  for (const call of calls) {
+    const callId = call.toolCallId;
+    if (
+      typeof callId !== "string" ||
+      !callId ||
+      ids.has(callId) ||
+      call.data?.toolCallId !== callId
+    )
+      invalid();
+    ids.add(callId);
+    const matches = results.filter(
+      (result) => result.toolCallId === callId || result.data?.toolCallId === callId,
+    );
+    if (
+      matches.length !== 1 ||
+      matches[0].toolCallId !== callId ||
+      matches[0].data?.toolCallId !== callId
+    )
+      invalid();
+    pairs.push({
+      call,
+      result: matches[0],
+      callIndex: events.indexOf(call),
+      resultIndex: events.indexOf(matches[0]),
+    });
+  }
   if (
-    events.indexOf(call) >= events.indexOf(result) ||
-    typeof call.toolCallId !== "string" ||
-    !call.toolCallId ||
-    call.data?.toolCallId !== call.toolCallId ||
-    result.toolCallId !== call.toolCallId ||
-    result.data?.toolCallId !== call.toolCallId ||
-    result.data?.isError !== false
+    results.some((result) => !ids.has(result.toolCallId)) ||
+    pairs.some(
+      (pair) => pair.callIndex < 0 || pair.resultIndex < 0 || pair.callIndex >= pair.resultIndex,
+    )
   )
     invalid();
+  pairs.sort((left, right) => left.callIndex - right.callIndex);
+  for (let index = 0; index < pairs.length - 1; index += 1) {
+    const rejected = pairs[index];
+    const input = rejected.call.data?.input;
+    const invalidInputShape =
+      !isRecord(input) ||
+      Object.keys(input).some((key) => !["groupId", "operation", "params"].includes(key)) ||
+      input.groupId !== expectedGroupId ||
+      input.operation !== "get_group_root_files" ||
+      (Object.hasOwn(input, "params") &&
+        (!isRecord(input.params) || Object.keys(input.params).length > 0));
+    const failureCode = rejected.result.data?.failureCode;
+    if (
+      rejected.result.data?.isError !== true ||
+      !["input_validation_failed", "acceptance_lease_input_mismatch"].includes(failureCode) ||
+      (failureCode === "input_validation_failed" && !invalidInputShape) ||
+      rejected.resultIndex >= pairs[index + 1].callIndex
+    )
+      invalid();
+  }
+  const { call, result } = pairs.at(-1);
+  if (result.data?.isError !== false) invalid();
   return { call, result };
 }
 
@@ -251,8 +314,8 @@ export function observeGroupFilesResult(assertion, { events, runId }) {
     !/^[0-9a-f]{64}$/u.test(data.outputSha256) ||
     !isRecord(data.groupFiles) ||
     Object.keys(data.groupFiles).sort().join(",") !==
-      "fileCount,folderCount,listingSha256,schemaVersion" ||
-    data.groupFiles.schemaVersion !== 1
+      "fileCount,folderCount,listingSha256,metadataSha256,schemaVersion" ||
+    data.groupFiles.schemaVersion !== 2
   )
     invalid();
   const safe = validateTraceGroupFiles(data.groupFiles);
@@ -275,8 +338,12 @@ export function observeGroupFilesResult(assertion, { events, runId }) {
       wrapper.content[0].type !== "text" ||
       typeof wrapper.content[0].text !== "string" ||
       !isRecord(wrapper.details) ||
+      Object.keys(wrapper.details).sort().join(",") !== "data,status" ||
+      wrapper.details.status !== "ok" ||
+      !isRecord(wrapper.details.data) ||
+      Object.keys(wrapper.details.data).sort().join(",") !== "files,folders" ||
       wrapper.content[0].text !== JSON.stringify(wrapper.details) ||
-      canonical(projectGroupFiles(wrapper.details, assertion.groupId)) !== canonical(safe)
+      canonical(projectGroupFiles(wrapper.details.data, assertion.groupId)) !== canonical(safe)
     )
       invalid();
   } else if (data.outputTruncated === true) {
@@ -395,15 +462,17 @@ export async function verifyGroupFilesEvidence(
   } catch {
     invalid("GROUP_FILES_MISMATCH", "INCONCLUSIVE");
   }
-  if (canonical(independent) !== canonical(safeObserved(observed)))
-    invalid("GROUP_FILES_MISMATCH", "INCONCLUSIVE");
-  return { status: "PASS", fileCount: observed.fileCount, folderCount: observed.folderCount };
-}
-
-function safeObserved(observed) {
-  return {
+  const expectedRepeatedRead = {
     fileCount: observed.fileCount,
     folderCount: observed.folderCount,
-    listingSha256: observed.listingSha256,
+    metadataSha256: observed.metadataSha256,
   };
+  const actualRepeatedRead = {
+    fileCount: independent.fileCount,
+    folderCount: independent.folderCount,
+    metadataSha256: independent.metadataSha256,
+  };
+  if (canonical(actualRepeatedRead) !== canonical(expectedRepeatedRead))
+    invalid("GROUP_FILES_MISMATCH", "INCONCLUSIVE");
+  return { status: "PASS", fileCount: observed.fileCount, folderCount: observed.folderCount };
 }

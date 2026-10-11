@@ -53,7 +53,7 @@ function expectedHistoryAssertions(toolName, groupId) {
       kind: "trace",
       type: "history_retrieval",
       where: {
-        query: "{{nonce}}",
+        query: "gbxhistory1-{{nonce}}",
         groups: [groupId],
         resources: [`group:${groupId}`],
         sourceKind: "channel_message",
@@ -102,6 +102,59 @@ function validateGroupMembersCase(c, config) {
     fail(
       "FEATURE_GROUP_MEMBERS_SCOPE",
       "群成员数量用例必须在 Owner 私聊中限定到群 A 的名单读取及完整聚合 Trace。",
+    );
+}
+
+function validateBotGroupRoleCase(c, config) {
+  const group = configGroup(config, "B");
+  const botId = config?.bot?.qq;
+  if (!validGroupId(botId)) fail("FEATURE_BOT_BINDING", "Bot 群角色用例需要配置唯一 Bot 身份。");
+  const expectedOperation = {
+    action: "group:members:read",
+    resourceId: `group:${group.id}`,
+    inputConstraint: {
+      groupId: group.id,
+      operation: "get_group_member_info",
+      params: { user_id: botId },
+    },
+  };
+  const templateOperation = {
+    action: "group:members:read",
+    resourceId: "group:{{group:B}}",
+    inputConstraint: {
+      groupId: "{{group:B}}",
+      operation: "get_group_member_info",
+      params: { user_id: "{{bot}}" },
+    },
+  };
+  const traceAssertion = {
+    kind: "trace",
+    type: "tool_result",
+    where: { name: "qq_group_members", isError: false },
+    count: 1,
+  };
+  const roleAssertion = {
+    kind: "group_member_role",
+    tool: "qq_group_members",
+    groupId: "{{group:B}}",
+    userId: "{{bot}}",
+    count: 1,
+  };
+  if (
+    c.id !== "qq-bot-group-role-read" ||
+    c.chat !== "private" ||
+    c.prompt !==
+      "你现在在测试群 {{group:B}} 里是管理员吗？请实际查一下。请按一行回复 QQBOTGROUPROLE {{nonce}} role=角色，方便我核对。" ||
+    c.leaseTools.length !== 1 ||
+    c.leaseTools[0]?.name !== "qq_group_members" ||
+    c.leaseTools[0].operations.length !== 1 ||
+    (canonical(c.leaseTools[0].operations[0]) !== canonical(expectedOperation) &&
+      canonical(c.leaseTools[0].operations[0]) !== canonical(templateOperation)) ||
+    canonical(c.featureAssertions) !== canonical([traceAssertion, roleAssertion])
+  )
+    fail(
+      "FEATURE_GROUP_MEMBER_ROLE_SCOPE",
+      "Bot 群角色用例必须在 Owner 私聊中只查询配置 Bot 在群 B 的角色。",
     );
 }
 
@@ -185,7 +238,7 @@ function validateHistoryCase(c, tool, config) {
     expectedOperation = {
       action: "history:read",
       resourceId: tool.operations[0].resourceId,
-      inputConstraint: { query: "{{nonce}}", limit: 1 },
+      inputConstraint: { query: "gbxhistory1-{{nonce}}", limit: 1 },
     };
   } else {
     if (c.chat !== "private")
@@ -202,7 +255,7 @@ function validateHistoryCase(c, tool, config) {
     expectedOperation = {
       action: "history:search",
       resourceId: "owner-history",
-      inputConstraint: { query: "{{nonce}}", limit: 1, groupIds: actualGroupIds },
+      inputConstraint: { query: "gbxhistory1-{{nonce}}", limit: 1, groupIds: actualGroupIds },
     };
   }
   if (canonical(tool.operations[0]) !== canonical(expectedOperation))
@@ -212,14 +265,14 @@ function validateHistoryCase(c, tool, config) {
   const resolvedAssertions = expectedHistoryAssertions(tool.name, groupId);
   const withCoverage = (assertions, id) => [
     ...assertions,
-    { kind: "history_coverage", query: "{{nonce}}", groupId: id, count: 1 },
+    { kind: "history_coverage", query: "gbxhistory1-{{nonce}}", groupId: id, count: 1 },
   ];
   const withResult = (assertions, id) => [
     ...withCoverage(assertions, id),
     {
       kind: "history_result",
       tool: tool.name,
-      query: "{{nonce}}",
+      query: "gbxhistory1-{{nonce}}",
       groupId: id,
       result: tool.name === "group_history_search" ? "hit" : "no_match",
       count: 1,
@@ -240,13 +293,19 @@ function validateHistoryCase(c, tool, config) {
 }
 
 /** Resolve only the explicit group placeholders used by approved history suite templates. */
-export function resolveReadFeatureCase(testCase, resolveGroup) {
+export function resolveReadFeatureCase(testCase, resolveGroup, resolveBot) {
   if (typeof resolveGroup !== "function")
     fail("FEATURE_GROUP_BINDING", "历史用例需要受信任的群别名解析器。");
   const resolveValue = (value) => {
     if (typeof value === "string") {
       const result = value.replace(/\{\{([^{}]+)\}\}/gu, (placeholder, name) => {
         if (name === "nonce") return placeholder;
+        if (name === "bot") {
+          const botId = resolveBot?.();
+          if (!validGroupId(botId))
+            fail("FEATURE_BOT_BINDING", "Bot 群角色用例需要配置唯一 Bot 身份。");
+          return botId;
+        }
         const match = /^group:([A-Z])$/u.exec(name);
         if (!match || !TEST_GROUP_ALIASES.has(match[1]))
           fail(
@@ -363,7 +422,18 @@ export function validateReadFeatureSpecs(raw, config) {
       c.leaseTools.some((tool) => tool.name === "qq_group_files")
     )
       validateGroupFilesCase(c, config);
-    if (c.leaseTools.some((tool) => tool.name === "qq_group_members"))
+    if (
+      c.featureAssertions.some((assertion) => assertion.kind === "group_member_role") ||
+      c.leaseTools.some(
+        (tool) =>
+          tool.name === "qq_group_members" &&
+          tool.operations.some(
+            (operation) => operation.inputConstraint.operation === "get_group_member_info",
+          ),
+      )
+    )
+      validateBotGroupRoleCase(c, config);
+    else if (c.leaseTools.some((tool) => tool.name === "qq_group_members"))
       validateGroupMembersCase(c, config);
     if (
       !c.featureAssertions.some(
@@ -383,6 +453,10 @@ export function validateReadFeatureSpecs(raw, config) {
 export function resolveReadFeatureSpecs(raw, config) {
   const cases = validateReadFeatureSpecs(raw, config);
   return cases.map((testCase) =>
-    resolveReadFeatureCase(testCase, (alias) => configGroup(config, alias).id),
+    resolveReadFeatureCase(
+      testCase,
+      (alias) => configGroup(config, alias).id,
+      () => config?.bot?.qq,
+    ),
   );
 }

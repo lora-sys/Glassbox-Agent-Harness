@@ -15,16 +15,19 @@ const folder = {
   total_file_count: 2,
   create_time: 1_728_000_000,
 };
-const toolResult = (details: Record<string, unknown>) => ({
-  content: [{ type: "text", text: JSON.stringify(details) }],
-  details,
-});
+const toolResult = (details: Record<string, unknown>) => {
+  const envelope = { status: "ok", data: details };
+  return {
+    content: [{ type: "text", text: JSON.stringify(envelope) }],
+    details: envelope,
+  };
+};
 
 describe("group file listing Trace projection", () => {
   it("projects provider rows to counts and a digest without retaining entry data", () => {
     const details = { files: [file], folders: [folder] };
     const evidence = groupFilesEvidence(toolResult(details));
-    expect(evidence).toMatchObject({ schemaVersion: 1, fileCount: 1, folderCount: 1 });
+    expect(evidence).toMatchObject({ schemaVersion: 2, fileCount: 1, folderCount: 1 });
     expect(evidence?.listingSha256).toMatch(/^[a-f0-9]{64}$/u);
     expect(JSON.stringify(evidence)).not.toContain("root.txt");
     expect(JSON.stringify(evidence)).not.toContain("folder-id");
@@ -75,9 +78,37 @@ describe("group file listing Trace projection", () => {
     );
   });
 
+  it("keeps the full listing digest while comparing metadata without file_id", () => {
+    const first = { files: [{ ...file }], folders: [{ ...folder }] };
+    const regeneratedId = {
+      files: [{ ...file, file_id: "new-napcat-cache-key" }],
+      folders: [{ ...folder }],
+    };
+    const firstEvidence = groupFilesEvidence(toolResult(first));
+    const regeneratedEvidence = groupFilesEvidence(toolResult(regeneratedId));
+    expect(firstEvidence?.schemaVersion).toBe(2);
+    expect(firstEvidence?.listingSha256).not.toBe(regeneratedEvidence?.listingSha256);
+    expect(firstEvidence?.metadataSha256).toBe(regeneratedEvidence?.metadataSha256);
+
+    const changedFileMetadata = {
+      files: [{ ...regeneratedId.files[0], file_name: "changed.txt" }],
+      folders: regeneratedId.folders,
+    };
+    expect(groupFilesEvidence(toolResult(changedFileMetadata))?.metadataSha256).not.toBe(
+      firstEvidence?.metadataSha256,
+    );
+    const changedFolder = {
+      files: regeneratedId.files,
+      folders: [{ ...folder, total_file_count: folder.total_file_count + 1 }],
+    };
+    expect(groupFilesEvidence(toolResult(changedFolder))?.metadataSha256).not.toBe(
+      firstEvidence?.metadataSha256,
+    );
+  });
+
   it("accepts an empty provider listing", () => {
     expect(groupFilesEvidence(toolResult({ files: [], folders: [] }))).toMatchObject({
-      schemaVersion: 1,
+      schemaVersion: 2,
       fileCount: 0,
       folderCount: 0,
     });
@@ -97,7 +128,7 @@ describe("group file listing Trace projection", () => {
     ).toBeUndefined();
   });
 
-  it("rejects malformed wrappers, content mismatches, and extra wrapper keys", () => {
+  it("requires the exact successful provider envelope and canonical wrapper text", () => {
     const valid = toolResult({ files: [file], folders: [folder] });
     const malformed = [
       null,
@@ -108,6 +139,20 @@ describe("group file listing Trace projection", () => {
       { ...valid, content: [{ type: "image", text: JSON.stringify(valid.details) }] },
       { ...valid, content: [valid.content[0], valid.content[0]] },
       { content: valid.content, details: { ...valid.details, extra: true } },
+      { ...valid, details: { status: "failed", data: { files: [file], folders: [folder] } } },
+      {
+        ...valid,
+        details: { status: "ok", data: { files: [file], folders: [folder], extra: true } },
+      },
+      {
+        ...valid,
+        details: { status: "ok", data: { files: [file], folders: [folder] }, extra: true },
+      },
+      { ...valid, details: { files: [file], folders: [folder] } },
+      {
+        ...valid,
+        content: [{ type: "text", text: JSON.stringify({ status: "ok", data: valid.details }) }],
+      },
     ];
     for (const value of malformed) expect(groupFilesEvidence(value)).toBeUndefined();
   });
@@ -116,6 +161,10 @@ describe("group file listing Trace projection", () => {
     const invalidDetails = [
       { files: [{ ...file, group_id: "2000" }], folders: [] },
       { files: [{ ...file, file_id: "" }], folders: [] },
+      {
+        files: [{ group_id: file.group_id, file_name: file.file_name, file_size: file.file_size }],
+        folders: [],
+      },
       { files: [{ ...file, file_id: "x".repeat(4097) }], folders: [] },
       { files: [{ ...file, file_name: "文".repeat(683) }], folders: [] },
       { files: [{ ...file, file_size: -1 }], folders: [] },

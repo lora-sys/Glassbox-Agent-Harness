@@ -44,10 +44,12 @@ export type RequiredEvidenceDomain =
   | "owner_history_search"
   | "group_metadata"
   | "group_members"
+  | "bot_group_role"
   | "group_history_page"
   | "group_content"
   | "group_files"
   | "account_status"
+  | "account_identity"
   | "browser_open"
   | "browser_title"
   | "browser_screenshot";
@@ -118,7 +120,8 @@ const REFUSAL_WORDS = "不要|不用|无需|不需要|请勿|不许|停止|别�
  * The verbs that ask to be told, shown or handed something. Longest first, so a negation before
  * 查看 is read as governing 查看 rather than the 查 that 查看 starts with.
  */
-const REQUEST_VERBS = "搜索|查找|查看|查询|检索|列出|列表|显示|告诉|搜|翻|查|看|读";
+const REQUEST_VERBS =
+  "搜索|查找|查看|查询|检索|列出|列表|显示|告诉|搜|翻|查|看|读|禁言|闭嘴|踢出|踢掉|移出群|删除|上传|设置";
 
 /**
  * A negation that governs a request: the request's own verb follows it.
@@ -176,7 +179,7 @@ function withoutRefusedClauses(text: string): string {
   if (!REFUSED_REQUEST.test(text)) return text;
   return (text.match(PUNCTUATION_SPAN) ?? [])
     .filter((span) => !REFUSED_REQUEST.test(span))
-    .join(" ");
+    .join("，");
 }
 
 /** The requests a message makes that ask for something, in order. */
@@ -240,7 +243,7 @@ export function ownerHistorySearchRequested(rawText: string): boolean {
     )
   )
     return false;
-  return /(?:搜索|搜|查找|查|检索|查询)[^。！？\n]{0,120}(?:群\s*(?:的)?\s*(?:历史|聊天记录|消息记录|群聊记录|聊天历史|历史消息)|已授权[^。！？\n]{0,40}(?:历史|聊天记录|消息记录))/u.test(
+  return /(?:搜索|搜|查找|查|检索|查询)[^。！？\n]{0,120}(?:群\s*(?:[1-9]\d{4,15}\s*)?(?:的)?\s*(?:历史|聊天记录|消息记录|群聊记录|聊天历史|历史消息)|已授权[^。！？\n]{0,40}(?:历史|聊天记录|消息记录))/u.test(
     asking,
   );
 }
@@ -302,6 +305,7 @@ const CAPABILITY_ACTION =
 export const CAPABILITY_QUESTION = new RegExp(
   [
     "如何|怎么|能否|能不能|可否|可以吗",
+    `可以[^。！？\\n]{0,24}(?:${CAPABILITY_ACTION.source})[^。！？\\n]{0,24}(?:吗|么)`,
     "(?:谁|我|管理员|群主|成员|机器人|你)[^。！？\\n]{0,80}可以[^。！？\\n]{0,80}吗",
     `(?:${CAPABILITY_NOUN.source})[^。！？\\n]{0,16}(?:${CAPABILITY_ASK.source})`,
     `(?:${CAPABILITY_ASK.source})[^。！？\\n]{0,16}(?:${CAPABILITY_NOUN.source})`,
@@ -339,6 +343,8 @@ interface LiveDomain {
   readonly tool: string;
   /** The domain's own nouns. A request has to name one of these. */
   readonly nouns: RegExp;
+  /** Optional domain-specific request predicate for nouns that can appear in a refusal. */
+  readonly requested?: (request: string) => boolean;
   /** The provider operation that answers it, omitted when the Tool's own default is right. */
   readonly operation?: string;
   /**
@@ -359,7 +365,39 @@ interface LiveDomain {
  * evidence: it is authorized by the mutation-intent gate, and asking to *know* something is
  * never a reason to change it.
  */
+function asksAccountIdentity(request: string): boolean {
+  const identityRequest =
+    /(?:查询|查一下|查看|核对|检查|告诉我|显示|提供|给我|报出|说出)[^。！？\n]{0,24}?(?:QQ\s*(?:号码|号)|账号(?:号码|信息|资料)?|登录账号)|(?:QQ\s*(?:号码|号)|账号(?:号码|信息|资料)?|登录账号)[^。！？\n]{0,12}(?:是多少|是什么|哪一个|几号)/giu;
+  const refusalPrefix = `(?:${REFUSAL_WORDS})\\s*(?:再)?\\s*(?:在[^，,。！？!?\\n]{1,12}?(?:中|里)\\s*)?`;
+  const refusedIdentity = new RegExp(`${refusalPrefix}$`, "u");
+  const embeddedRefusal = new RegExp(`${refusalPrefix}(?:提供|给我|报出|说出|核对|检查)`, "u");
+  // A refusal applies to this identity request, not a later status or group read in the span.
+  return [...request.matchAll(identityRequest)].some(
+    (match) =>
+      !refusedIdentity.test(request.slice(0, match.index)) && !embeddedRefusal.test(match[0]),
+  );
+}
+
+/** A bot role is a fresh QQ member fact, not a Glassbox capability setting. */
+function asksBotGroupRole(request: string): boolean {
+  const text = request.replace(/"[^"\n]*"|“[^”\n]*”|「[^」\n]*」|『[^』\n]*』/gu, "");
+  return (
+    /(?:你|机器人|\bbot\b)[^。！？\n]{0,60}(?:管理员|群主|群内角色|群里角色|群身份|群[^。！？\n]{0,24}身份)|(?:查询|查看|核对|检查)[^。！？\n]{0,20}(?:你|机器人|\bbot\b)[^。！？\n]{0,40}角色/iu.test(
+      text,
+    ) &&
+    /(?:查询|查看|查一下|核对|检查|告诉我|是不是|是否|是什么|是[^。！？\n]{0,40}吗)/u.test(text)
+  );
+}
+
 const LIVE_DOMAINS: readonly LiveDomain[] = Object.freeze([
+  {
+    domain: "bot_group_role",
+    tool: "qq_group_members",
+    nouns: /管理员|群主|角色|群[^。！？\n]{0,24}身份/u,
+    requested: asksBotGroupRole,
+    operation: "get_group_member_info",
+    currentGroup: true,
+  },
   {
     domain: "group_members",
     tool: "qq_group_members",
@@ -403,14 +441,23 @@ const LIVE_DOMAINS: readonly LiveDomain[] = Object.freeze([
     // A short connective is allowed between the group word and the noun, so "这个群当前资料"
     // is a profile read. A longer gap is not: "群里发的资料" is about something in the group,
     // not about the group.
-    nouns: /(?:群|本群|该群)\s*(?:的|当前|现在|目前)?\s*(?:资料|信息|名称|简介|头像)/u,
+    nouns:
+      /(?:群|本群|该群)\s*(?:[1-9]\d{4,15}\s*)?(?:的|当前|现在|目前)?\s*(?:资料|信息|名称|简介|头像|容量|(?:实际)?人数|有多少人|多少人)|\bget_group_info\b/iu,
     operation: "get_group_info",
     currentGroup: true,
   },
   {
     domain: "account_status",
     tool: "qq_account_status",
-    nouns: /账号|登录状态|机器人状态/u,
+    nouns: /(?:在线状态|是否在线|当前在线|现在在线|在线吗|登录状态|机器人状态)/u,
+    operation: "get_status",
+    currentGroup: false,
+  },
+  {
+    domain: "account_identity",
+    tool: "qq_account_status",
+    nouns: /(?:QQ\s*(?:号码|号)|账号(?:号码|信息|资料)?|登录账号)/iu,
+    requested: asksAccountIdentity,
     operation: "get_login_info",
     currentGroup: false,
   },
@@ -433,6 +480,8 @@ export interface RequiredEvidenceInput {
   readonly text: string;
   readonly chatType: "private" | "group";
   readonly isOwner: boolean;
+  /** Bot identity resolved from the current trusted Channel scope. */
+  readonly botId: string;
 }
 
 export function officialSourceVerificationRequested(rawText: string): boolean {
@@ -519,7 +568,10 @@ export function requiredEvidenceFor(input: RequiredEvidenceInput): RequiredEvide
       required.push({
         domain: domain.domain,
         tool: domain.tool,
-        input: domain.operation === undefined ? {} : { operation: domain.operation },
+        input: {
+          ...(domain.operation === undefined ? {} : { operation: domain.operation }),
+          ...(domain.domain === "bot_group_role" ? { params: { user_id: input.botId } } : {}),
+        },
       });
     }
     return required;
@@ -542,6 +594,7 @@ export function requiredEvidenceFor(input: RequiredEvidenceInput): RequiredEvide
       input: {
         ...(domain.currentGroup && group !== undefined ? { groupId: group } : {}),
         ...(domain.operation === undefined ? {} : { operation: domain.operation }),
+        ...(domain.domain === "bot_group_role" ? { params: { user_id: input.botId } } : {}),
       },
     });
   }
@@ -587,11 +640,13 @@ function liveDomainsRequested(
       !POLICY_QUESTION.test(request),
   );
   if (asking.length === 0) return [];
-  if (!READ_VERB.test(text)) return [];
   return LIVE_DOMAINS.filter(
     (domain) =>
       (scope === "named-group" || domain.currentGroup) &&
-      asking.some((request) => domain.nouns.test(request)),
+      asking.some(
+        (request) =>
+          domain.nouns.test(request) && (domain.requested?.(request) ?? READ_VERB.test(text)),
+      ),
   );
 }
 

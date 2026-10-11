@@ -1080,7 +1080,7 @@ it("retains a Task and binding when dispatch fails without silently retrying the
           data: expect.objectContaining({
             status: "WAITING_INPUT",
             reason: "worker_dispatch_incomplete",
-            failure: { phase: "prompt_agent", errorName: "Error" },
+            failure: { phase: "prompt_agent", errorName: "Error", code: "worker_dispatch_failed" },
           }),
         }),
       ]),
@@ -1137,7 +1137,7 @@ it("fails an unbound dispatch and stops a worker launched before verification fa
           data: expect.objectContaining({
             status: "FAILED",
             reason: "worker_dispatch_unbound",
-            failure: { phase: "verify_worker", errorName: "Error" },
+            failure: { phase: "verify_worker", errorName: "Error", code: "worker_dispatch_failed" },
           }),
         }),
       ]),

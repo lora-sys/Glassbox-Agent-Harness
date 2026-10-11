@@ -108,6 +108,115 @@ afterEach(async () => {
 });
 
 describe("P4A durable learning truth", () => {
+  it("binds each rejected candidate audit to its exact Owner governance decision in one Run", async () => {
+    const { store } = await fixture();
+    await store.conversations.createAgent("personal");
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: "agent:personal",
+      action: "run:create",
+      scope: privateScope,
+      effect: "allow",
+    });
+    const cleanupRun = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: privateScope,
+      messageId: "cleanup-batch-input",
+      text: "Reject only the prepared fixture candidates.",
+      executionRef: "fixture-runtime",
+    });
+    const cleanupContext = {
+      caller: owner,
+      conversationId: cleanupRun.conversation.id,
+      runId: cleanupRun.run.id,
+    };
+    const candidateIds: string[] = [];
+    for (let index = 0; index < 9; index++) {
+      const sourceRun = await store.conversations.acceptIncoming({
+        agentId: "personal",
+        scope: privateScope,
+        messageId: `cleanup-source-${index}`,
+        text: `Disposable review fixture ${index}.`,
+        executionRef: "fixture-runtime",
+      });
+      const sourceRef = `run:${sourceRun.run.id}`;
+      const sourceContext = {
+        caller: owner,
+        conversationId: sourceRun.conversation.id,
+        runId: sourceRun.run.id,
+      };
+      const candidate = await store.learning.createCandidate(sourceContext, {
+        candidateKind: "assertion",
+        subject: { kind: "user", id: "owner" },
+        scope: { type: "global" },
+        proposedType: "semantic_fact",
+        statement: `Disposable candidate ${index}.`,
+        content: { statement: `Disposable candidate ${index}.` },
+        source: { kind: "chat", ref: sourceRef },
+        sourceEvidence: [
+          {
+            evidenceId: `cleanup-source-evidence-${index}`,
+            kind: "chat_message",
+            ref: sourceRef,
+            capturedAt: new Date().toISOString(),
+            trustLevel: "high",
+          },
+        ],
+        mergeHint: { strategy: "manual_review_required" },
+        extensions: {},
+      });
+      candidateIds.push(candidate.candidateId);
+    }
+
+    for (const candidateId of candidateIds) {
+      expect(await store.learning.candidateReviewStatus(cleanupContext, candidateId)).toBe(
+        "pending",
+      );
+      const rejected = await store.learning.rejectCandidate(cleanupContext, candidateId);
+      expect(rejected.status).toBe("rejected");
+    }
+
+    const auditRows = await store.db.transaction(async (tx) => {
+      return tx.execute({
+        sql: `SELECT a.target_id, a.decision_id, d.run_id, d.principal_id, d.resource_id, d.action, d.decision
+              FROM memory_audit_events a
+              JOIN authorization_decisions_all d ON d.id = a.decision_id
+              WHERE a.action = 'reject' AND a.run_id = ? ORDER BY a.sequence`,
+        args: [cleanupRun.run.id],
+      });
+    });
+    expect(auditRows.rows).toHaveLength(9);
+    expect(new Set(auditRows.rows.map((row) => row.decision_id)).size).toBe(9);
+    expect(auditRows.rows).toEqual(
+      expect.arrayContaining(
+        candidateIds.map((candidateId) =>
+          expect.objectContaining({
+            target_id: candidateId,
+            run_id: cleanupRun.run.id,
+            principal_id: "owner",
+            resource_id: "owner-memory",
+            action: "memory:govern",
+            decision: "ALLOW",
+          }),
+        ),
+      ),
+    );
+    const finalStatuses = await store.db.transaction(async (tx) => {
+      return tx.execute({
+        sql: `SELECT id, status, promoted_memory_id FROM memory_candidates WHERE id IN (${candidateIds
+          .map(() => "?")
+          .join(",")}) ORDER BY id`,
+        args: candidateIds,
+      });
+    });
+    expect(finalStatuses.rows).toHaveLength(9);
+    expect(
+      finalStatuses.rows.every(
+        (row) => row.status === "rejected" && row.promoted_memory_id === null,
+      ),
+    ).toBe(true);
+  });
+
   it("keeps group Memory isolated and pending until Owner review", async () => {
     const { store } = await fixture();
     const groupMemoryScope = {

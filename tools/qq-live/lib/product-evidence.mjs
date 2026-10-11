@@ -1,6 +1,7 @@
 import { verifyLeaseCleanupEvidence } from "./lease-cleanup-evidence.mjs";
 import { execFileSync } from "node:child_process";
-import { DatabaseSync } from "node:sqlite";
+import { readFile } from "node:fs/promises";
+import { serviceSourceTreeSha256 } from "../../../scripts/service-source-identity.mjs";
 import { resolve, join } from "node:path";
 import { fail, digest, toolManifestDigest } from "./core.mjs";
 import {
@@ -14,12 +15,16 @@ import {
 import { observeFeature, validateFeatureAssertions } from "./feature-observer.mjs";
 import { verifyGroupInfoEvidence } from "./group-info-evidence.mjs";
 import { verifyGroupFilesEvidence } from "./group-files-evidence.mjs";
+import { verifyGroupMemberRoleEvidence } from "./group-member-role-evidence.mjs";
 import {
   transportSmokeSpecs,
   transportSuiteHash,
   validateTransportCase,
 } from "./transport-suite.mjs";
 import { tasteFixtureStep } from "./taste-scenario.mjs";
+import { isFixedPreRunReadCase } from "./pre-run-cleanup-cases.mjs";
+import { verifyPreRunCleanupReport } from "./pre-run-cleanup-report.mjs";
+import { openReadOnlyDatabase } from "./read-only-database.mjs";
 
 const TASTE_ASSERTION_FAILURES = new Set([
   "TASTE_FEEDBACK",
@@ -38,8 +43,13 @@ function exactKeys(value, expected) {
     value !== null &&
     typeof value === "object" &&
     !Array.isArray(value) &&
-    JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...expected].sort())
+    JSON.stringify(Object.keys(value).sort((a, b) => a.localeCompare(b))) ===
+      JSON.stringify([...expected].sort((a, b) => a.localeCompare(b)))
   );
+}
+
+export function openProductEvidenceDatabase(path) {
+  return openReadOnlyDatabase(path);
 }
 
 export function runtimeSnapshot(runtime, capture = execFileSync) {
@@ -55,6 +65,8 @@ function serviceSnapshot(runtime, capture, requireOnebot) {
   if (
     !runtime ||
     !/^[a-f0-9]{40}$/.test(runtime.expectedCommit ?? "") ||
+    (runtime.expectedSourceTreeSha256 !== undefined &&
+      !/^[a-f0-9]{64}$/.test(runtime.expectedSourceTreeSha256)) ||
     !runtime.checkout ||
     !runtime.dataDirectory ||
     !validIdentifier(runtime.connectionId) ||
@@ -73,8 +85,21 @@ function serviceSnapshot(runtime, capture, requireOnebot) {
       stdio: ["ignore", "pipe", "pipe"],
     }).trim();
   const commit = git(["rev-parse", "HEAD"]);
-  if (commit !== runtime.expectedCommit || git(["status", "--porcelain"]))
-    fail("RUNTIME_VERSION", "待测 checkout 必须干净，且 HEAD 必须等于指定提交。");
+  const dirty = git(["status", "--porcelain"]) !== "";
+  if (commit !== runtime.expectedCommit)
+    fail("RUNTIME_VERSION", "待测 checkout 的 HEAD 必须等于指定提交。");
+  let sourceTreeSha256;
+  if (runtime.expectedSourceTreeSha256 === undefined) {
+    if (dirty) fail("RUNTIME_VERSION", "待测 checkout 必须干净，且 HEAD 必须等于指定提交。");
+  } else {
+    try {
+      sourceTreeSha256 = serviceSourceTreeSha256(checkout, capture);
+    } catch {
+      fail("RUNTIME_SOURCE_TREE", "无法核对显式开发验收的当前源代码树。");
+    }
+    if (sourceTreeSha256 !== runtime.expectedSourceTreeSha256)
+      fail("RUNTIME_SOURCE_TREE", "当前源代码树与显式开发验收哈希不一致。");
+  }
   const status = JSON.parse(
     capture(
       process.execPath,
@@ -102,9 +127,21 @@ function serviceSnapshot(runtime, capture, requireOnebot) {
     (requireOnebot && !status.onebotReady)
   )
     fail("RUNTIME_UNVERIFIED", "服务管理器未确认待测进程、数据目录或 OneBot 就绪。");
-  if (processInfo.launchCommit !== commit || processInfo.launchClean !== true)
-    fail("RUNTIME_LAUNCH_VERSION", "进程启动时未记录本次干净提交。请通过服务管理器重启待测版本。");
-  return {
+  if (processInfo.launchCommit !== commit)
+    fail("RUNTIME_LAUNCH_VERSION", "进程启动时未记录本次指定提交。请通过服务管理器重启待测版本。");
+  if (runtime.expectedSourceTreeSha256 === undefined) {
+    if (processInfo.launchClean !== true)
+      fail(
+        "RUNTIME_LAUNCH_VERSION",
+        "进程启动时未记录本次干净提交。请通过服务管理器重启待测版本。",
+      );
+  } else if (
+    processInfo.launchClean !== false ||
+    processInfo.launchSourceTreeSha256 !== runtime.expectedSourceTreeSha256
+  ) {
+    fail("RUNTIME_SOURCE_TREE", "进程启动时记录的源代码树与指定哈希不一致。");
+  }
+  const snapshot = {
     checkout,
     dataDirectory,
     commit,
@@ -112,6 +149,22 @@ function serviceSnapshot(runtime, capture, requireOnebot) {
     connectionId: runtime.connectionId,
     threadId: runtime.threadId ?? null,
   };
+  if (runtime.expectedSourceTreeSha256 !== undefined) {
+    let currentSourceTreeSha256;
+    try {
+      currentSourceTreeSha256 = serviceSourceTreeSha256(checkout, capture);
+    } catch {
+      fail("RUNTIME_SOURCE_TREE", "无法复核显式开发验收的当前源代码树。");
+    }
+    if (
+      currentSourceTreeSha256 !== sourceTreeSha256 ||
+      currentSourceTreeSha256 !== runtime.expectedSourceTreeSha256 ||
+      git(["rev-parse", "HEAD"]) !== commit
+    )
+      fail("RUNTIME_SOURCE_TREE", "验收期间源代码树或 HEAD 发生变化。");
+    return { ...snapshot, development: true, sourceTreeSha256: currentSourceTreeSha256 };
+  }
+  return snapshot;
 }
 
 function validIdentifier(value) {
@@ -165,12 +218,171 @@ function scopeMatches(actual, expected) {
   );
 }
 
-function filteredAuthorizationEvidence(db, run, expectedScopeKey, decisions) {
+const PROJECTION_GROUP_ACTIONS = new Set([
+  "group:files:write",
+  "group:moderate",
+  "group:settings:write",
+]);
+
+function authorizationProjectionEvidence(db, run, expectedScopeKey, decisions = []) {
+  const potential = decisions.some(
+    (decision) =>
+      PROJECTION_GROUP_ACTIONS.has(decision.action) || decision.action === "tool:discover",
+  );
+  let rows;
+  try {
+    rows = db
+      .prepare(
+        "SELECT event_id, ts, run_id, principal_id, data_json FROM ops_trace_events WHERE run_id=? AND type='authorization.projection_receipt'",
+      )
+      .all(run.id);
+  } catch {
+    if (potential) throw new Error("projection receipt store unavailable");
+    return [];
+  }
+  if (!potential && rows.length === 0) return [];
+  const metadata = db
+    .prepare(
+      "SELECT d.id, d.action, d.resource_id, d.principal_id, d.scope_key, d.delivery_source, d.created_at, d.decision, d.reason, d.conversation_id, r.kind AS resource_kind FROM authorization_decisions_all d LEFT JOIN resources r ON r.id=d.resource_id WHERE d.run_id=?",
+    )
+    .all(run.id);
+  const receipts = [];
+  const mapped = new Map();
+  for (const row of rows) {
+    let data;
+    try {
+      data = JSON.parse(row.data_json);
+    } catch {
+      throw new Error("invalid projection receipt JSON");
+    }
+    if (
+      !data ||
+      typeof data !== "object" ||
+      Array.isArray(data) ||
+      Object.keys(data).sort().join(",") !==
+        "conversationId,decisions,inputBytes,inputSha256,kind,outputBytes,outputSha256,purpose,receiptId,schema,scopeKey,toolCallId,toolName"
+    )
+      throw new Error("invalid projection receipt shape");
+    const kindTool =
+      (data.kind === "managed_group_inventory" &&
+        data.purpose === "managed_group_category_availability" &&
+        data.toolName === "qq_groups") ||
+      (data.kind === "capability_search" &&
+        data.purpose === "capability_search_availability" &&
+        data.toolName === "qq_capability_search");
+    if (
+      !kindTool ||
+      data.schema !== "glassbox.authorization-projection-receipt.v1" ||
+      !validIdentifier(data.receiptId) ||
+      !validIdentifier(data.toolCallId) ||
+      !validIdentifier(data.conversationId) ||
+      row.run_id !== run.id ||
+      row.principal_id !== run.principal_id ||
+      data.scopeKey !== expectedScopeKey ||
+      !/^[a-f0-9]{64}$/u.test(data.inputSha256 ?? "") ||
+      !Number.isSafeInteger(data.inputBytes) ||
+      data.inputBytes < 2 ||
+      data.inputBytes > 64 * 1024 ||
+      !/^[a-f0-9]{64}$/u.test(data.outputSha256 ?? "") ||
+      !Number.isSafeInteger(data.outputBytes) ||
+      data.outputBytes < 1 ||
+      data.outputBytes > 16 * 1024 * 1024 ||
+      !Array.isArray(data.decisions) ||
+      data.decisions.length < 1 ||
+      !Number.isFinite(Date.parse(row.ts))
+    )
+      throw new Error("invalid projection receipt binding");
+    const entryIds = new Set();
+    for (const entry of data.decisions) {
+      if (
+        !entry ||
+        typeof entry !== "object" ||
+        Array.isArray(entry) ||
+        Object.keys(entry).sort().join(",") !== "action,decisionId,purpose,resourceId" ||
+        !validIdentifier(entry.decisionId) ||
+        !validIdentifier(entry.resourceId) ||
+        entryIds.has(entry.decisionId)
+      )
+        throw new Error("invalid projection receipt decision list");
+      entryIds.add(entry.decisionId);
+      const decision = metadata.filter((candidate) => candidate.id === entry.decisionId);
+      if (decision.length !== 1) throw new Error("ambiguous projection decision");
+      const d = decision[0];
+      const categoryAvailability =
+        data.kind === "managed_group_inventory" &&
+        entry.purpose === "managed_group_category_availability" &&
+        PROJECTION_GROUP_ACTIONS.has(entry.action) &&
+        /^group:[1-9][0-9]{0,15}$/u.test(entry.resourceId);
+      const searchCategoryAvailability =
+        data.kind === "capability_search" &&
+        entry.purpose === "capability_group_category_availability" &&
+        PROJECTION_GROUP_ACTIONS.has(entry.action) &&
+        /^group:[1-9][0-9]{0,15}$/u.test(entry.resourceId);
+      const discoveryAvailability =
+        data.kind === "capability_search" &&
+        entry.purpose === "capability_tool_discovery_availability" &&
+        entry.action === "tool:discover" &&
+        entry.resourceId === "tool:qq_group_local_settings";
+      if (
+        !(categoryAvailability || searchCategoryAvailability || discoveryAvailability) ||
+        d.action !== entry.action ||
+        d.resource_id !== entry.resourceId ||
+        d.decision !== "DENY" ||
+        d.reason !== "no_grant" ||
+        d.principal_id !== run.principal_id ||
+        d.scope_key !== expectedScopeKey ||
+        d.delivery_source !== null ||
+        d.conversation_id !== data.conversationId ||
+        (discoveryAvailability && d.resource_kind !== "tool-definition") ||
+        ((categoryAvailability || searchCategoryAvailability) && d.resource_kind !== "qq_group") ||
+        !Number.isFinite(Date.parse(d.created_at)) ||
+        Date.parse(row.ts) < Date.parse(d.created_at)
+      )
+        throw new Error("projection receipt does not describe a category availability denial");
+      if (mapped.has(entry.decisionId)) throw new Error("projection decision reused");
+      mapped.set(entry.decisionId, { receipt: data, eventId: row.event_id, decision: d });
+    }
+    receipts.push({
+      ...data,
+      eventId: row.event_id,
+      ts: row.ts,
+      runId: row.run_id,
+      principalId: row.principal_id,
+    });
+  }
+  const eligible = metadata.filter(
+    (d) =>
+      d.decision === "DENY" &&
+      d.reason === "no_grant" &&
+      d.principal_id === run.principal_id &&
+      d.scope_key === expectedScopeKey &&
+      d.delivery_source === null &&
+      (PROJECTION_GROUP_ACTIONS.has(d.action) ||
+        (d.action === "tool:discover" && d.resource_id === "tool:qq_group_local_settings")),
+  );
+  if (eligible.some((d) => !mapped.has(d.id)))
+    throw new Error("projection availability denial missing receipt");
+  return receipts;
+}
+
+export function filteredAuthorizationEvidence(db, run, expectedScopeKey, decisions) {
   const rejected = decisions.filter((decision) => decision.decision !== "ALLOW");
   if (!rejected.length) return [];
   try {
     if (rejected.some((decision) => decision.decision !== "DENY"))
       throw new Error("not a denied source");
+    const projectionReceipts = authorizationProjectionEvidence(
+      db,
+      run,
+      expectedScopeKey,
+      decisions,
+    );
+    const projectedIds = new Set(
+      projectionReceipts.flatMap((receipt) => receipt.decisions.map((item) => item.decisionId)),
+    );
+    const unprojectedRejected = rejected.filter((decision) => !projectedIds.has(decision.id));
+    if (unprojectedRejected.length === 0) return [];
+    const denied = unprojectedRejected;
     const metadata = db
       .prepare(
         "SELECT d.id, d.action, d.resource_id, d.principal_id, d.scope_key, d.delivery_source, d.created_at, r.kind AS resource_kind FROM authorization_decisions_all d LEFT JOIN resources r ON r.id=d.resource_id WHERE d.run_id=? AND d.decision='DENY'",
@@ -183,7 +395,7 @@ function filteredAuthorizationEvidence(db, run, expectedScopeKey, decisions) {
       .all(run.id);
     const allowedProjections = new Set(["conversation-history", "task-list", "ops-health-records"]);
     const receipts = [];
-    const rejectedIds = new Set(rejected.map((decision) => decision.id));
+    const rejectedIds = new Set(denied.map((decision) => decision.id));
     for (const row of rows) {
       const data = JSON.parse(row.data_json);
       if (
@@ -231,7 +443,7 @@ function filteredAuthorizationEvidence(db, run, expectedScopeKey, decisions) {
       });
     }
     if (
-      rejected.some(
+      denied.some(
         (decision) => receipts.filter((row) => row.decisionId === decision.id).length !== 1,
       )
     )
@@ -285,6 +497,17 @@ export function caseEvidence(db, c, config) {
   if (!decisions.some((d) => d.decision === "ALLOW"))
     fail("AUTHORIZATION_EVIDENCE", "对应 Run 的授权证据不满足收发验收。", "INCONCLUSIVE");
   const filteredDecisions = filteredAuthorizationEvidence(db, run, expectedScopeKey, decisions);
+  let authorizationProjectionReceipts;
+  try {
+    authorizationProjectionReceipts = authorizationProjectionEvidence(
+      db,
+      run,
+      expectedScopeKey,
+      decisions,
+    );
+  } catch {
+    fail("AUTHORIZATION_EVIDENCE", "授权投影收据与当前拒绝决策不一致。", "INCONCLUSIVE");
+  }
   const deliveries = db
     .prepare("SELECT id, status, external_id, destination_scope_key FROM deliveries WHERE run_id=?")
     .all(run.id);
@@ -296,17 +519,133 @@ export function caseEvidence(db, c, config) {
   return {
     caseId: c.id,
     runId: run.id,
+    principalId: run.principal_id,
     runCreatedAt: run.created_at,
     scope,
     decisions,
     filteredDecisions,
+    authorizationProjectionReceipts,
     deliveries,
     delivery: scopedDeliveries[0],
   };
 }
 
-export function verifyTraceEvidence(events, c, config, delivery) {
+export function verifyAuthorizationProjectionTrace(events, runId, principalId, receipts) {
+  const eventTimestamp = (event) => event.timestamp ?? event.traceTimestamp;
+  const canonicalTimestamp = (value) => {
+    if (typeof value !== "string") return false;
+    const millis = Date.parse(value);
+    return Number.isFinite(millis) && new Date(millis).toISOString() === value;
+  };
+  const rawReceipts = events.filter((event) => event.type === "authorization_projection_receipt");
+  if (rawReceipts.length !== receipts.length)
+    fail("AUTHORIZATION_EVIDENCE", "授权投影收据与 Raw Trace 数量不一致。", "INCONCLUSIVE");
+  for (const receipt of receipts) {
+    const matches = rawReceipts.filter((event) => event.receiptEventId === receipt.receiptId);
+    if (
+      matches.length !== 1 ||
+      matches[0].runId !== runId ||
+      matches[0].principalId !== principalId
+    )
+      fail("AUTHORIZATION_EVIDENCE", "授权投影收据未绑定到对应 Run 和 Principal。", "INCONCLUSIVE");
+    const raw = matches[0];
+    const expectedData = { ...receipt, receiptEventId: receipt.receiptId };
+    delete expectedData.eventId;
+    delete expectedData.ts;
+    delete expectedData.runId;
+    delete expectedData.principalId;
+    const actualData = { ...raw };
+    delete actualData.type;
+    delete actualData.timestamp;
+    delete actualData.traceTimestamp;
+    delete actualData.traceSequence;
+    delete actualData.sessionId;
+    delete actualData.runId;
+    delete actualData.principalId;
+    const canonical = (value) =>
+      Array.isArray(value)
+        ? value.map(canonical)
+        : value && typeof value === "object"
+          ? Object.fromEntries(
+              Object.keys(value)
+                .sort()
+                .map((key) => [key, canonical(value[key])]),
+            )
+          : value;
+    if (JSON.stringify(canonical(actualData)) !== JSON.stringify(canonical(expectedData)))
+      fail("AUTHORIZATION_EVIDENCE", "授权投影收据与数据库证据不一致。", "INCONCLUSIVE");
+    const calls = events.filter(
+      (event) =>
+        event.type === "tool_call" &&
+        event.runId === runId &&
+        event.principalId === principalId &&
+        event.toolCallId === receipt.toolCallId &&
+        event.data?.runId === runId &&
+        event.data?.principalId === principalId &&
+        event.data?.toolCallId === receipt.toolCallId &&
+        event.data?.name === receipt.toolName,
+    );
+    const results = events.filter(
+      (event) =>
+        event.type === "tool_result" &&
+        event.runId === runId &&
+        event.principalId === principalId &&
+        event.toolCallId === receipt.toolCallId &&
+        event.data?.runId === runId &&
+        event.data?.principalId === principalId &&
+        event.data?.toolCallId === receipt.toolCallId &&
+        event.data?.name === receipt.toolName &&
+        event.data?.isError === false &&
+        event.data?.outputSha256 === receipt.outputSha256 &&
+        event.data?.outputBytes === receipt.outputBytes,
+    );
+    if (
+      calls.length !== 1 ||
+      results.length !== 1 ||
+      calls[0].data?.projectionInputSha256 !== receipt.inputSha256 ||
+      calls[0].data?.projectionInputBytes !== receipt.inputBytes
+    )
+      fail("AUTHORIZATION_EVIDENCE", "授权投影收据没有唯一成功的同调用结果。", "INCONCLUSIVE");
+    const callIndex = events.indexOf(calls[0]);
+    const receiptIndex = events.indexOf(raw);
+    const resultIndex = events.indexOf(results[0]);
+    const callTimestamp = eventTimestamp(calls[0]);
+    const receiptTimestamp = eventTimestamp(raw);
+    const resultTimestamp = eventTimestamp(results[0]);
+    const callTime = Date.parse(callTimestamp);
+    const receiptTime = Date.parse(receiptTimestamp);
+    const resultTime = Date.parse(resultTimestamp);
+    const hasTraceSequence =
+      Number.isSafeInteger(calls[0].traceSequence) &&
+      Number.isSafeInteger(raw.traceSequence) &&
+      Number.isSafeInteger(results[0].traceSequence);
+    if (
+      callIndex < 0 ||
+      !(callIndex < receiptIndex && receiptIndex < resultIndex) ||
+      !canonicalTimestamp(callTimestamp) ||
+      !canonicalTimestamp(receiptTimestamp) ||
+      !canonicalTimestamp(resultTimestamp) ||
+      (hasTraceSequence &&
+        !(
+          calls[0].traceSequence < raw.traceSequence && raw.traceSequence < results[0].traceSequence
+        )) ||
+      !(callTime <= receiptTime && receiptTime <= resultTime)
+    )
+      fail("AUTHORIZATION_EVIDENCE", "授权投影收据的调用顺序无效。", "INCONCLUSIVE");
+  }
+}
+
+export function verifyTraceEvidence(
+  events,
+  c,
+  config,
+  delivery,
+  authorizationProjectionReceipts = [],
+  runId,
+  principalId,
+) {
   const scope = expectedScope(c, config);
+  verifyAuthorizationProjectionTrace(events, runId, principalId, authorizationProjectionReceipts);
   if (
     !events.some(
       (e) =>
@@ -572,6 +911,8 @@ export function readTraceEvents(
         "--type",
         "session_start",
         "--type",
+        "authorization_projection_receipt",
+        "--type",
         "tool_call",
         "--type",
         "tool_result",
@@ -618,34 +959,27 @@ export async function verifyCaseLeaseCleanupEvidence(db, dataDirectory, caseReco
 function failedCaseCleanupCandidates(report, config) {
   const cases = report?.cases;
   const failed = Array.isArray(cases) ? cases.at(-1) : undefined;
-  const reply = failed?.replies?.length === 1 ? failed.replies[0] : undefined;
+  const replyFailure =
+    report?.status === "FAIL" &&
+    failed?.status === "FAIL" &&
+    failed.code === "REPLY_ASSERTION_FAILED" &&
+    isKnownTerminalCaseRecord(failed);
+  const fixedTimeout =
+    ["FAIL", "INCONCLUSIVE"].includes(report?.status) && isAccountStatusReadTimeoutCase(failed);
   if (
     report?.mode !== "run" ||
-    report.status !== "FAIL" ||
+    (!replyFailure && !fixedTimeout) ||
     !Array.isArray(cases) ||
     !cases.length ||
     cases.length > config.maxMessages ||
-    failed?.status !== "FAIL" ||
-    failed.code !== "REPLY_ASSERTION_FAILED" ||
-    failed.sendAttempted !== true ||
-    !validIdentifier(failed.sentMessageId) ||
-    ((!Array.isArray(failed.featureAssertions) || !failed.featureAssertions.length) &&
+    (!fixedTimeout &&
+      (!Array.isArray(failed.featureAssertions) || !failed.featureAssertions.length) &&
       failed.transportOnly !== true) ||
     !failed.acceptanceLease ||
     failed.leaseRegistrationAttempted !== true ||
-    failed.leaseRevoked !== true ||
-    !reply ||
-    reply.route !== failed.route ||
-    reply.matches !== false ||
-    !validIdentifier(reply.messageId) ||
-    !/^[a-f0-9]{64}$/u.test(reply.textSha256 ?? "") ||
-    !Number.isSafeInteger(reply.textBytes) ||
-    reply.textBytes < 0 ||
-    typeof reply.receivedAt !== "string" ||
-    !Number.isFinite(Date.parse(reply.receivedAt)) ||
-    failed.anomalies?.includes("WRONG_DESTINATION")
+    failed.leaseRevoked !== true
   )
-    fail("CLEANUP_ONLY_UNSUPPORTED", "仅支持已确认回复断言失败的许可清理核验。", "INCONCLUSIVE");
+    fail("CLEANUP_ONLY_UNSUPPORTED", "仅支持固定终态用例的许可清理核验。", "INCONCLUSIVE");
   const ids = new Set();
   for (const c of cases) {
     if (typeof c.id !== "string" || !c.id || ids.has(c.id))
@@ -659,6 +993,173 @@ function failedCaseCleanupCandidates(report, config) {
     (c) =>
       c.featureAssertions || c.acceptanceLease || c.leaseRegistrationAttempted || c.transportOnly,
   );
+}
+
+const ACCOUNT_STATUS_READ_PROMPT =
+  "帮我检查一下机器人当前是否在线。只告诉我在线状态，不用提供账号号码或其他账号资料。回复时带上测试编号 {{nonce}}。";
+const ACCOUNT_STATUS_READ_TOOLS = [
+  {
+    name: "qq_account_status",
+    operations: [
+      {
+        action: "account:status:read",
+        resourceId: "agent:personal",
+        inputConstraint: { operation: "get_status" },
+      },
+    ],
+  },
+];
+const ACCOUNT_STATUS_READ_ASSERTIONS = [
+  {
+    kind: "trace",
+    type: "tool_result",
+    where: { name: "qq_account_status", isError: false },
+    count: 1,
+  },
+];
+
+function isAccountStatusReadTimeoutCase(caseRecord) {
+  const token = caseRecord?.token;
+  const binding = caseRecord?.inputBinding;
+  const expectedPrompt =
+    typeof token === "string"
+      ? "GLASSBOX_ACCEPTANCE_V1 " +
+        token +
+        "\n" +
+        ACCOUNT_STATUS_READ_PROMPT.replaceAll("{{nonce}}", token)
+      : "";
+  return (
+    caseRecord?.id === "qq-account-status-read" &&
+    caseRecord.status === "INCONCLUSIVE" &&
+    caseRecord.code === "REPLY_TIMEOUT" &&
+    caseRecord.route === "private" &&
+    caseRecord.sendAttempted === true &&
+    caseRecord.leaseRegistrationAttempted === true &&
+    caseRecord.leaseRevoked === true &&
+    caseRecord.inputObserved === true &&
+    !caseRecord.transportOnly &&
+    /^[a-f0-9]{32}$/u.test(token ?? "") &&
+    caseRecord.prompt === expectedPrompt &&
+    JSON.stringify(caseRecord.expected) === JSON.stringify([token]) &&
+    Array.isArray(caseRecord.replies) &&
+    caseRecord.replies.length === 0 &&
+    Array.isArray(caseRecord.anomalies) &&
+    caseRecord.anomalies.length === 0 &&
+    Array.isArray(caseRecord.leasedToolNames) &&
+    JSON.stringify(caseRecord.leasedToolNames) === JSON.stringify(["qq_account_status"]) &&
+    toolManifestDigest(ACCOUNT_STATUS_READ_TOOLS) === caseRecord.acceptanceLease?.toolsSha256 &&
+    Number.isSafeInteger(caseRecord.acceptanceLease?.expiresAt) &&
+    /^[a-f0-9-]{36}$/iu.test(caseRecord.acceptanceLease?.leaseId ?? "") &&
+    Array.isArray(caseRecord.featureAssertions) &&
+    toolManifestDigest(caseRecord.featureAssertions) ===
+      toolManifestDigest(ACCOUNT_STATUS_READ_ASSERTIONS) &&
+    !!binding &&
+    exactKeys(
+      binding,
+      messageTimeBindingKeys(binding, [
+        "driverMessageId",
+        "botMessageId",
+        "realSequence",
+        "time",
+        "textSha256",
+      ]),
+    ) &&
+    Object.hasOwn(binding, "driverTime") &&
+    validIdentifier(binding.driverMessageId) &&
+    validIdentifier(binding.botMessageId) &&
+    binding.driverMessageId === caseRecord.sentMessageId &&
+    /^[1-9]\d{0,29}$/u.test(binding.realSequence ?? "") &&
+    validMessageTimeBinding(binding) &&
+    /^[a-f0-9]{64}$/u.test(binding.textSha256 ?? "") &&
+    caseRecord.botInputMessageId === binding.botMessageId &&
+    Array.isArray(caseRecord.botInputMessageIds) &&
+    caseRecord.botInputMessageIds.length === 1 &&
+    caseRecord.botInputMessageIds[0] === binding.botMessageId &&
+    Array.isArray(caseRecord.botInputCandidates) &&
+    caseRecord.botInputCandidates.length === 1 &&
+    caseRecord.botInputCandidates[0]?.messageId === binding.botMessageId &&
+    caseRecord.botInputCandidates[0]?.textSha256 === binding.textSha256
+  );
+}
+
+async function verifyAccountStatusReadTimeoutCleanup(db, dataDirectory, caseRecord, config) {
+  const unsupported = () =>
+    fail(
+      "CLEANUP_ONLY_UNSUPPORTED",
+      "账号状态超时用例不满足固定只读许可清理条件。",
+      "INCONCLUSIVE",
+    );
+  let cleanupVerified = false;
+  try {
+    if (!isAccountStatusReadTimeoutCase(caseRecord)) unsupported();
+    const scope = expectedScope(caseRecord, config);
+    const expectedScopeKey = scopeKey(scope);
+    const candidates = db
+      .prepare(
+        "SELECT r.id, r.status, r.scope_json, r.created_at, r.principal_id, r.message_id, m.external_id, m.scope_key, m.text, m.created_at AS message_created_at FROM runs r JOIN messages m ON m.id=r.message_id WHERE m.external_id=? AND m.scope_key=?",
+      )
+      .all(caseRecord.inputBinding.botMessageId, expectedScopeKey);
+    const matches = candidates.filter((row) => {
+      try {
+        const actualScope = JSON.parse(row.scope_json);
+        return (
+          scopeMatches(actualScope, scope) &&
+          Number.isFinite(Date.parse(row.created_at)) &&
+          Date.parse(row.created_at) >= Date.parse(caseRecord.startedAt) - 2_000
+        );
+      } catch {
+        return false;
+      }
+    });
+    const sourceMessages = db
+      .prepare("SELECT id, text, created_at FROM messages WHERE external_id=? AND scope_key=?")
+      .all(caseRecord.inputBinding.botMessageId, expectedScopeKey);
+    if (
+      matches.length !== 1 ||
+      sourceMessages.length !== 1 ||
+      sourceMessages[0].id !== matches[0]?.message_id ||
+      !Number.isFinite(Date.parse(sourceMessages[0].created_at)) ||
+      Date.parse(sourceMessages[0].created_at) < Date.parse(caseRecord.startedAt) - 2_000 ||
+      matches[0].id === undefined ||
+      !validIdentifier(matches[0].id) ||
+      matches[0].status !== "failed" ||
+      typeof matches[0].principal_id !== "string" ||
+      !matches[0].principal_id ||
+      typeof matches[0].message_id !== "string" ||
+      typeof matches[0].text !== "string" ||
+      matches[0].external_id !== caseRecord.inputBinding.botMessageId ||
+      matches[0].scope_key !== expectedScopeKey ||
+      matches[0].text !== caseRecord.prompt ||
+      digest(matches[0].text) !== caseRecord.inputBinding.textSha256
+    )
+      unsupported();
+    const deliveries = db
+      .prepare("SELECT status, external_id, destination_scope_key FROM deliveries WHERE run_id=?")
+      .all(matches[0].id);
+    if (
+      deliveries.length !== 1 ||
+      deliveries[0].status !== "sent" ||
+      !validIdentifier(deliveries[0].external_id) ||
+      deliveries[0].destination_scope_key !== expectedScopeKey
+    )
+      unsupported();
+    await verifyCaseLeaseCleanupEvidence(db, dataDirectory, caseRecord, {
+      runId: matches[0].id,
+      scope,
+    });
+    cleanupVerified = true;
+    return {
+      caseId: caseRecord.id,
+      runId: matches[0].id,
+      cleanupVerified: true,
+      cleanupOnly: true,
+      actualQqDeliveryVerified: false,
+      persistedDeliveryStatus: "sent",
+    };
+  } catch (error) {
+    if (error && typeof error === "object") error.cleanupVerified = cleanupVerified;
+    throw error;
+  }
 }
 
 function isKnownTerminalCaseRecord(caseRecord) {
@@ -686,6 +1187,8 @@ function isKnownTerminalCaseRecord(caseRecord) {
 export async function verifyFailedCaseCleanupInDatabase(db, dataDirectory, caseRecord, config) {
   let cleanupVerified = false;
   try {
+    if (isAccountStatusReadTimeoutCase(caseRecord))
+      return await verifyAccountStatusReadTimeoutCleanup(db, dataDirectory, caseRecord, config);
     if (!isKnownTerminalCaseRecord(caseRecord))
       fail("CLEANUP_ONLY_UNSUPPORTED", "用例不是可核验的终态回复结果。", "INCONCLUSIVE");
     const isTransportOnly = caseRecord.transportOnly === true;
@@ -711,6 +1214,399 @@ export async function verifyFailedCaseCleanupInDatabase(db, dataDirectory, caseR
   }
 }
 
+const FAILED_ACCOUNT_STATUS_PROMPT =
+  "帮我检查一下机器人当前是否在线。只告诉我在线状态，不用提供账号号码或其他账号资料。回复时带上测试编号 {{nonce}}。";
+
+function fixedFailedAccountStatusCase(report) {
+  const c = report?.cases?.length === 1 ? report.cases[0] : undefined;
+  const token = c?.token;
+  const binding = c?.inputBinding;
+  const expectedPrompt = /^[a-f0-9]{32}$/u.test(token ?? "")
+    ? `GLASSBOX_ACCEPTANCE_V1 ${token}\n${FAILED_ACCOUNT_STATUS_PROMPT.replaceAll("{{nonce}}", token)}`
+    : "";
+  return c?.id === "qq-account-status-read" &&
+    report?.mode === "run" &&
+    report.status === "INCONCLUSIVE" &&
+    c.status === "FAIL" &&
+    c.code === "REPLY_ASSERTION_FAILED" &&
+    c.route === "private" &&
+    c.sendAttempted === true &&
+    c.inputObserved === true &&
+    c.leaseRegistrationAttempted === true &&
+    c.leaseRevoked === true &&
+    c.prompt === expectedPrompt &&
+    JSON.stringify(c.expected) === JSON.stringify([token]) &&
+    c.productRunId == null &&
+    Array.isArray(c.leasedToolNames) &&
+    JSON.stringify(c.leasedToolNames) === JSON.stringify(["qq_account_status"]) &&
+    c.acceptanceLease?.toolsSha256 === toolManifestDigest(ACCOUNT_STATUS_READ_TOOLS) &&
+    Number.isSafeInteger(c.acceptanceLease?.expiresAt) &&
+    /^[a-f0-9-]{36}$/iu.test(c.acceptanceLease?.leaseId ?? "") &&
+    Array.isArray(c.featureAssertions) &&
+    toolManifestDigest(c.featureAssertions) ===
+      toolManifestDigest(ACCOUNT_STATUS_READ_ASSERTIONS) &&
+    Array.isArray(c.replies) &&
+    c.replies.length === 1 &&
+    c.replies[0]?.route === "private" &&
+    c.replies[0]?.matches === false &&
+    typeof c.replies[0]?.receivedAt === "string" &&
+    Number.isFinite(Date.parse(c.replies[0].receivedAt)) &&
+    /^[a-f0-9]{64}$/u.test(c.replies[0]?.textSha256 ?? "") &&
+    Number.isSafeInteger(c.replies[0]?.textBytes) &&
+    c.replies[0].textBytes > 0 &&
+    validIdentifier(c.sentMessageId) &&
+    binding !== null &&
+    typeof binding === "object" &&
+    exactKeys(
+      binding,
+      messageTimeBindingKeys(binding, [
+        "driverMessageId",
+        "botMessageId",
+        "realSequence",
+        "time",
+        "textSha256",
+      ]),
+    ) &&
+    binding.driverMessageId === c.sentMessageId &&
+    validIdentifier(binding.driverMessageId) &&
+    validIdentifier(binding.botMessageId) &&
+    /^[1-9]\d{0,29}$/u.test(binding.realSequence ?? "") &&
+    validMessageTimeBinding(binding) &&
+    binding.textSha256 === digest(c.prompt) &&
+    c.botInputMessageId === binding.botMessageId &&
+    Array.isArray(c.botInputMessageIds) &&
+    JSON.stringify(c.botInputMessageIds) === JSON.stringify([binding.botMessageId]) &&
+    Array.isArray(c.botInputCandidates) &&
+    c.botInputCandidates.length === 1 &&
+    c.botInputCandidates[0]?.messageId === binding.botMessageId &&
+    c.botInputCandidates[0]?.textSha256 === binding.textSha256 &&
+    report.productAcceptance?.status === "INCONCLUSIVE" &&
+    report.productAcceptance?.code === "RUN_EVIDENCE" &&
+    report.productAcceptance?.cleanupRequired === true &&
+    report.productAcceptance?.cleanupVerified === false &&
+    Array.isArray(report.productAcceptance?.cases) &&
+    report.productAcceptance.cases.length === 0
+    ? c
+    : null;
+}
+
+function accountStatusFailureTrace(events, caseRecord, runId) {
+  const sessions = events.filter(
+    (event) => event.runId === runId && event.type === "session_start",
+  );
+  const calls = events.filter((event) => event.runId === runId && event.type === "tool_call");
+  const results = events.filter((event) => event.runId === runId && event.type === "tool_result");
+  if (sessions.length !== 2 || calls.length !== 3 || results.length !== 3)
+    fail("FAILED_READ_TRACE", "只读失败 Run 的固定工具调用序列不匹配。", "INCONCLUSIVE");
+  const leases = sessions.map((event) => event.data?.acceptanceLease);
+  if (
+    sessions.some(
+      (event, index) =>
+        event.principalId !== "owner" ||
+        JSON.stringify(event.data?.authorizedTools) !== JSON.stringify(["qq_account_status"]) ||
+        JSON.stringify(event.data?.toolSurface?.selected?.map((item) => item.name)) !==
+          JSON.stringify(["qq_account_status"]) ||
+        event.data?.toolSurface?.selected?.[0]?.provider !== "qq-napcat" ||
+        leases[index]?.leaseId !== caseRecord.acceptanceLease.leaseId ||
+        leases[index]?.marker !== caseRecord.token ||
+        leases[index]?.toolsSha256 !== caseRecord.acceptanceLease.toolsSha256 ||
+        JSON.stringify(leases[index]?.narrowedTools) !== JSON.stringify(["qq_account_status"]),
+    )
+  )
+    fail("FAILED_READ_TRACE", "失败 Run 的账号状态工具面或许可绑定不匹配。", "INCONCLUSIVE");
+  const callShapes = calls.map((event) => ({
+    id: event.data?.toolCallId,
+    name: event.data?.name,
+    input: event.data?.input,
+  }));
+  const resultById = new Map(results.map((event) => [event.data?.toolCallId, event.data]));
+  const [first, status, identity] = callShapes;
+  if (
+    calls.some((event) => event.principalId !== "owner") ||
+    callShapes.some((call) => call.name !== "qq_account_status" || !call.id) ||
+    first.input !== undefined ||
+    resultById.get(first.id)?.failureCode !== "input_validation_failed" ||
+    status.input?.operation !== "get_status" ||
+    resultById.get(status.id)?.isError !== false ||
+    identity.input?.operation !== "get_login_info" ||
+    resultById.get(identity.id)?.failureCode !== "acceptance_lease_input_mismatch"
+  )
+    fail("FAILED_READ_TRACE", "账号状态失败 Run 的工具结果或拒绝原因不匹配。", "INCONCLUSIVE");
+  return {
+    sessionStartCount: sessions.length,
+    toolCallCount: calls.length,
+    toolResultCount: results.length,
+    statusReadCount: 1,
+    identityLeaseDenialCount: 1,
+    malformedInputDenialCount: 1,
+    callOrder: ["invalid_input", "get_status", "get_login_info_denied_by_lease"],
+  };
+}
+
+function fixedSafeStatusRefusal(text, token) {
+  return (
+    typeof text === "string" &&
+    Buffer.byteLength(text, "utf8") > 0 &&
+    Buffer.byteLength(text, "utf8") <= 160 &&
+    !/[0-9]/u.test(text) &&
+    !text.includes(token) &&
+    !/(?:账号|号码|QQ\s*(?:号|号码)|昵称|user_id|botId)/iu.test(text) &&
+    /(?:无法|不能|未能|暂时)/u.test(text) &&
+    /(?:查询|确认|获取|读取|提供|检查)/u.test(text)
+  );
+}
+
+/** Reconcile only the fixed failed private account-status read. The feature remains FAIL. */
+export async function verifyFailedReadReport(
+  report,
+  config,
+  {
+    readRuntime = () => runtimeSnapshot(config.runtime),
+    clients,
+    readTrace = readTraceEvents,
+  } = {},
+) {
+  let db;
+  try {
+    const c = fixedFailedAccountStatusCase(report);
+    if (!c || !clients?.bot?.allowMessageRead || !clients?.driver?.allowMessageRead)
+      fail(
+        "FAILED_READ_CLEANUP_UNSUPPORTED",
+        "失败账号状态报告不符合固定只读核验条件。",
+        "INCONCLUSIVE",
+      );
+    const suite = await readFile(new URL("../examples/feature-read.example.json", import.meta.url));
+    if (report.suiteSha256 !== digest(suite))
+      fail("FAILED_READ_SUITE", "失败账号状态报告未绑定固定验收套件。", "INCONCLUSIVE");
+    const before = await Promise.resolve().then(readRuntime);
+    if (!report.runtime || JSON.stringify(report.runtime) !== JSON.stringify(before))
+      fail("RUNTIME_CHANGED", "失败账号状态 Run 的服务身份与报告不一致。", "INCONCLUSIVE");
+    const scope = expectedScope(c, config);
+    const expectedScopeKey = scopeKey(scope);
+    db = openProductEvidenceDatabase(join(before.dataDirectory, "glassbox.db"));
+    const runCandidates = db
+      .prepare(
+        "SELECT r.id, r.status, r.failure_code, r.scope_json, r.created_at, r.principal_id, r.message_id, r.result_text, m.external_id, m.scope_key, m.text, m.created_at AS message_created_at FROM runs r JOIN messages m ON m.id=r.message_id WHERE m.external_id=? AND m.scope_key=?",
+      )
+      .all(c.inputBinding.botMessageId, expectedScopeKey)
+      .filter((row) => {
+        try {
+          return (
+            scopeMatches(JSON.parse(row.scope_json), scope) &&
+            Date.parse(row.created_at) >= Date.parse(c.startedAt) - 2_000
+          );
+        } catch {
+          return false;
+        }
+      });
+    const inputRows = db
+      .prepare(
+        "SELECT id, text, created_at, scope_key FROM messages WHERE external_id=? AND scope_key=?",
+      )
+      .all(c.inputBinding.botMessageId, expectedScopeKey);
+    if (
+      runCandidates.length !== 1 ||
+      inputRows.length !== 1 ||
+      runCandidates[0].status !== "failed" ||
+      runCandidates[0].failure_code !== "required_evidence_missing" ||
+      runCandidates[0].principal_id !== "owner" ||
+      runCandidates[0].message_id !== inputRows[0].id ||
+      inputRows[0].scope_key !== expectedScopeKey ||
+      inputRows[0].text !== c.prompt ||
+      digest(inputRows[0].text) !== c.inputBinding.textSha256 ||
+      runCandidates[0].external_id !== c.inputBinding.botMessageId ||
+      !fixedSafeStatusRefusal(runCandidates[0].result_text, c.token)
+    )
+      fail("FAILED_READ_RUN", "只读失败 Run、输入或安全拒答证据不匹配。", "INCONCLUSIVE");
+    const [run] = runCandidates;
+    const deliveries = db
+      .prepare(
+        "SELECT id, status, external_id, destination_scope_key, payload_text, payload_kind FROM deliveries WHERE run_id=?",
+      )
+      .all(run.id);
+    const reply = c.replies[0];
+    if (
+      deliveries.length !== 1 ||
+      deliveries[0].status !== "sent" ||
+      deliveries[0].destination_scope_key !== expectedScopeKey ||
+      deliveries[0].payload_kind !== "result" ||
+      deliveries[0].external_id === c.sentMessageId ||
+      deliveries[0].payload_text !== run.result_text ||
+      digest(deliveries[0].payload_text) !== reply.textSha256 ||
+      Buffer.byteLength(deliveries[0].payload_text, "utf8") !== reply.textBytes
+    )
+      fail("FAILED_READ_DELIVERY", "失败 Run 的唯一私聊投递与报告回复不一致。", "INCONCLUSIVE");
+    const decisions = db
+      .prepare(
+        "SELECT id, principal_id, resource_id, action, decision FROM authorization_decisions_all WHERE run_id=? AND action='account:status:read'",
+      )
+      .all(run.id);
+    if (
+      !decisions.length ||
+      decisions.some(
+        (decision) =>
+          decision.principal_id !== run.principal_id ||
+          decision.resource_id !== "agent:personal" ||
+          decision.decision !== "ALLOW",
+      )
+    )
+      fail("FAILED_READ_AUTHORIZATION", "失败 Run 没有一致的账号状态读取授权。", "INCONCLUSIVE");
+
+    clients.bot.allowMessageRead(c.inputBinding.botMessageId);
+    clients.driver.allowMessageRead(c.inputBinding.driverMessageId);
+    clients.bot.allowMessageRead(String(deliveries[0].external_id));
+    clients.driver.allowMessageRead(reply.messageId);
+    const inputBot = await boundMessage(clients.bot, c.inputBinding.botMessageId, {
+      selfId: config.bot.qq,
+      senderId: config.driver.qq,
+      messageType: "private",
+      textSha256: c.inputBinding.textSha256,
+      afterTime: c.startedAt,
+    });
+    const inputDriver = await boundMessage(clients.driver, c.inputBinding.driverMessageId, {
+      selfId: config.driver.qq,
+      senderId: config.driver.qq,
+      messageType: "private",
+      textSha256: c.inputBinding.textSha256,
+      afterTime: c.startedAt,
+    });
+    const inputMatch = compareSameMessage(inputBot, inputDriver);
+    sameMessageBinding(c.inputBinding, inputMatch);
+    const replyBot = await boundMessage(clients.bot, String(deliveries[0].external_id), {
+      selfId: config.bot.qq,
+      senderId: config.bot.qq,
+      messageType: "private",
+      textSha256: reply.textSha256,
+      forbiddenContains: [c.token],
+      afterTime: c.startedAt,
+    });
+    const replyDriver = await boundMessage(clients.driver, reply.messageId, {
+      selfId: config.driver.qq,
+      senderId: config.bot.qq,
+      messageType: "private",
+      textSha256: reply.textSha256,
+      forbiddenContains: [c.token],
+      afterTime: c.startedAt,
+    });
+    const replyMatch = compareSameMessage(replyBot, replyDriver);
+    if (
+      replyMatch.textSha256 !== reply.textSha256 ||
+      replyBot.messageId !== String(deliveries[0].external_id) ||
+      replyDriver.messageId !== reply.messageId ||
+      Math.floor(Date.parse(reply.receivedAt) / 1000) !== replyMatch.time ||
+      !messageReplyTimesFollowInput(inputMatch, replyMatch)
+    )
+      fail("FAILED_READ_REPLY", "两端读取的私聊拒答与报告回复不一致。", "INCONCLUSIVE");
+
+    const trace = await readTrace(before.checkout, before.dataDirectory, run.id);
+    const events = trace.events?.map((row) => row.event) ?? [];
+    const ingressTrace = events.filter(
+      (event) =>
+        event.runId === run.id &&
+        event.type === "message_received" &&
+        String(event.externalId) === c.inputBinding.botMessageId,
+    );
+    const sentTrace = events.filter(
+      (event) =>
+        event.runId === run.id &&
+        event.type === "delivery_changed" &&
+        event.deliveryId === deliveries[0].id &&
+        event.status === "sent" &&
+        String(event.externalId) === String(deliveries[0].external_id),
+    );
+    if (
+      ingressTrace.length !== 1 ||
+      ingressTrace[0].connectionId !== scope.connectionId ||
+      String(ingressTrace[0].botId) !== scope.botId ||
+      ingressTrace[0].chatType !== "private" ||
+      String(ingressTrace[0].chatId) !== scope.chatId ||
+      String(ingressTrace[0].senderId) !== scope.senderId ||
+      ingressTrace[0].textSha256 !== c.inputBinding.textSha256 ||
+      sentTrace.length !== 1
+    )
+      fail("FAILED_READ_TRACE", "入站或投递 Trace 未绑定固定私聊 scope。", "INCONCLUSIVE");
+    const traceProof = accountStatusFailureTrace(events, c, run.id);
+    const lease = await verifyCaseLeaseCleanupEvidence(db, before.dataDirectory, c, {
+      runId: run.id,
+      scope,
+    });
+    const after = await Promise.resolve().then(readRuntime);
+    if (JSON.stringify(before) !== JSON.stringify(after))
+      fail("RUNTIME_CHANGED", "失败账号状态清理核验期间服务身份发生变化。", "INCONCLUSIVE");
+    const proofBase = {
+      proofKind: "fixed-qq-account-status-read-failed-run-v1",
+      caseId: c.id,
+      productRunId: run.id,
+      productRunStatus: run.status,
+      productRunFailureCode: run.failure_code,
+      inputBinding: structuredClone(c.inputBinding),
+      reply: {
+        botMessageId: String(deliveries[0].external_id),
+        driverMessageId: reply.messageId,
+        receivedAt: reply.receivedAt,
+        textSha256: reply.textSha256,
+        textBytes: reply.textBytes,
+        realSequence: replyMatch.realSequence,
+        time: replyMatch.time,
+        driverTime: replyMatch.driverTime,
+      },
+      delivery: {
+        id: deliveries[0].id,
+        status: deliveries[0].status,
+        externalId: deliveries[0].external_id,
+        destinationScopeKey: deliveries[0].destination_scope_key,
+      },
+      lease: {
+        leaseId: lease.leaseId,
+        marker: c.token,
+        toolsSha256: c.acceptanceLease.toolsSha256,
+        runId: lease.runId,
+        revoked: lease.revoked,
+      },
+      trace: traceProof,
+      authorization: {
+        accountStatusReadDecisionCount: decisions.length,
+        decisionIdsSha256: digest(JSON.stringify(decisions.map((item) => item.id).sort())),
+      },
+      safeRefusal: {
+        textSha256: digest(run.result_text),
+        textBytes: Buffer.byteLength(run.result_text, "utf8"),
+        markerAbsent: !run.result_text.includes(c.token),
+        accountIdentityAbsent: !/(?:账号|号码|QQ\s*(?:号|号码)|昵称|user_id|botId)/iu.test(
+          run.result_text,
+        ),
+        numericIdentifierAbsent: !/[0-9]/u.test(run.result_text),
+        refusalCuePresent: /(?:无法|不能|未能|暂时)/u.test(run.result_text),
+      },
+    };
+    const proof = { ...proofBase, proofSha256: digest(JSON.stringify(proofBase)) };
+    return {
+      status: "CLEANUP_RECONCILED",
+      runtime: after,
+      cases: [
+        {
+          caseId: c.id,
+          productRunId: run.id,
+          productRunStatus: "failed",
+          productRunFailureCode: "required_evidence_missing",
+          cleanupVerified: true,
+          cleanupOnly: true,
+          featureStatus: "FAIL",
+          actualQqDeliveryVerified: true,
+          productIngressVerified: true,
+          productRunObserved: true,
+          leaseId: lease.leaseId,
+          marker: c.token,
+          toolsSha256: c.acceptanceLease.toolsSha256,
+          proof,
+        },
+      ],
+    };
+  } finally {
+    db?.close();
+  }
+}
+
 export async function verifyFailedCaseCleanup(report, config, capture = execFileSync) {
   let cleanupVerified = false;
   let db;
@@ -718,10 +1614,26 @@ export async function verifyFailedCaseCleanup(report, config, capture = execFile
     const after = runtimeSnapshot(config.runtime, capture);
     if (!report?.runtime || JSON.stringify(report.runtime) !== JSON.stringify(after))
       fail("RUNTIME_CHANGED", "测试期间服务进程或代码版本发生变化。", "INCONCLUSIVE");
+    const preRunCase = report?.cases?.length === 1 ? report.cases[0] : undefined;
+    if (
+      report?.mode === "run" &&
+      isFixedPreRunReadCase(preRunCase?.id) &&
+      preRunCase.status === "BLOCKED" &&
+      preRunCase.code === "API_REJECTED"
+    ) {
+      const cleanup = await verifyPreRunCleanupReport(report, config, {
+        readRuntime: () => runtimeSnapshot(config.runtime, capture),
+      });
+      const finalRuntime = runtimeSnapshot(config.runtime, capture);
+      if (JSON.stringify(after) !== JSON.stringify(finalRuntime))
+        fail("RUNTIME_CHANGED", "测试期间服务进程或代码版本发生变化。", "INCONCLUSIVE");
+      cleanupVerified = true;
+      return cleanup;
+    }
     const cases = failedCaseCleanupCandidates(report, config);
     if (!cases.length)
       fail("CLEANUP_ONLY_UNSUPPORTED", "报告没有需要核验的许可清理。", "INCONCLUSIVE");
-    db = new DatabaseSync(join(after.dataDirectory, "glassbox.db"), { readOnly: true });
+    db = openProductEvidenceDatabase(join(after.dataDirectory, "glassbox.db"));
     const receipts = [];
     for (const c of cases)
       receipts.push(await verifyFailedCaseCleanupInDatabase(db, after.dataDirectory, c, config));
@@ -792,7 +1704,7 @@ export async function verifyKnownTasteFeatureFailureCleanup(
     after = runtimeSnapshot(config.runtime, capture);
     if (!expectedRuntime || JSON.stringify(expectedRuntime) !== JSON.stringify(after))
       fail("RUNTIME_CHANGED", "服务身份与已确认的偏好失败 Run 不一致。", "INCONCLUSIVE");
-    db = new DatabaseSync(join(after.dataDirectory, "glassbox.db"), { readOnly: true });
+    db = openProductEvidenceDatabase(join(after.dataDirectory, "glassbox.db"));
     const verified = await verifyCaseWithLeaseCleanup(
       db,
       after.dataDirectory,
@@ -813,7 +1725,15 @@ export async function verifyKnownTasteFeatureFailureCleanup(
           ["tool_result"],
         );
         const events = trace.events?.map((row) => row.event) ?? [];
-        verifyTraceEvidence(events, caseRecord, config, evidence.delivery);
+        verifyTraceEvidence(
+          events,
+          caseRecord,
+          config,
+          evidence.delivery,
+          evidence.authorizationProjectionReceipts,
+          evidence.runId,
+          evidence.principalId,
+        );
         verifyLeaseTraceEvidence(events, caseRecord, evidence.runId);
         const feature = observeFeature(caseRecord.featureAssertions, {
           db,
@@ -926,7 +1846,7 @@ export async function verifyTransportOnlyCaseEvidence(
     after = runtimeSnapshot(config.runtime, capture);
     if (!expectedRuntime || JSON.stringify(expectedRuntime) !== JSON.stringify(after))
       fail("RUNTIME_CHANGED", "服务版本或进程与传输用例开始时不一致。", "INCONCLUSIVE");
-    db = new DatabaseSync(join(after.dataDirectory, "glassbox.db"), { readOnly: true });
+    db = openProductEvidenceDatabase(join(after.dataDirectory, "glassbox.db"));
     const verified = await verifyCaseWithLeaseCleanup(
       db,
       after.dataDirectory,
@@ -941,7 +1861,15 @@ export async function verifyTransportOnlyCaseEvidence(
         );
         const trace = readTraceEvents(after.checkout, after.dataDirectory, evidence.runId, capture);
         const events = trace.events?.map((row) => row.event) ?? [];
-        verifyTraceEvidence(events, caseRecord, config, evidence.delivery);
+        verifyTraceEvidence(
+          events,
+          caseRecord,
+          config,
+          evidence.delivery,
+          evidence.authorizationProjectionReceipts,
+          evidence.runId,
+          evidence.principalId,
+        );
         verifyTransportOnlyLeaseTraceEvidence(events, caseRecord, evidence.runId);
         return { messageBinding };
       },
@@ -1043,9 +1971,7 @@ export async function verifyProductEvidence(report, config, clients) {
     report.cases.some((c) => c.moderation || c.transportOnly === true)
   )
     fail("ACCEPTANCE_SCOPE", "产品证据验收仅支持通过的固定收发用例。");
-  const db = new DatabaseSync(join(after.dataDirectory, "glassbox.db"), {
-    readOnly: true,
-  });
+  const db = openProductEvidenceDatabase(join(after.dataDirectory, "glassbox.db"));
   try {
     const cases = [];
     for (const c of report.cases) {
@@ -1069,6 +1995,8 @@ export async function verifyProductEvidence(report, config, clients) {
             )
           )
             featureTypes.push("history_retrieval");
+          if (c.leasedToolNames?.includes("qq_group_members"))
+            featureTypes.push("qq_tool_execution_input_verified");
           const trace = readTraceEvents(
             after.checkout,
             after.dataDirectory,
@@ -1076,8 +2004,21 @@ export async function verifyProductEvidence(report, config, clients) {
             execFileSync,
             featureTypes,
           );
-          const events = trace.events?.map((row) => row.event) ?? [];
-          verifyTraceEvidence(events, c, config, evidence.delivery);
+          const events =
+            trace.events?.map((row) => ({
+              ...row.event,
+              traceSequence: row.seq,
+              traceTimestamp: row.ts,
+            })) ?? [];
+          verifyTraceEvidence(
+            events,
+            c,
+            config,
+            evidence.delivery,
+            evidence.authorizationProjectionReceipts,
+            evidence.runId,
+            evidence.principalId,
+          );
           verifyLeaseTraceEvidence(events, c, evidence.runId);
           const feature = c.featureAssertions
             ? observeFeature(c.featureAssertions, {
@@ -1106,9 +2047,18 @@ export async function verifyProductEvidence(report, config, clients) {
             evidence.runId,
             messageBinding.reply.groupFiles,
           );
+          const groupMemberRole = await verifyGroupMemberRoleEvidence(
+            c,
+            feature,
+            config,
+            clients,
+            events,
+            evidence.runId,
+          );
           return {
             messageBinding,
             ...(feature ? { feature } : {}),
+            ...(groupMemberRole ? { groupMemberRole } : {}),
           };
         },
       );

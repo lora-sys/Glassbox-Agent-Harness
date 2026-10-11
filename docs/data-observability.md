@@ -39,6 +39,8 @@ Conversation content. Losing the group grant before the response is sent denies 
 
 ## Service / authority map
 
+This map includes planned service choices and group-assignment concepts. It does not assert that every external service is configured. Current structured storage is local libSQL/SQLite; the local Trace implementation uses append-only JSONL files, with R2 retained as an object-storage target.
+
 | Responsibility | Service / authority |
 | --- | --- |
 | Personal Agent product control plane | Glassbox server |
@@ -48,11 +50,11 @@ Conversation content. Losing the group grant before the response is sent denies 
 | QQ transport | Glassbox server + NapCat / OneBot |
 | Agent Operations control plane | Glassbox server |
 | Live coding-worker workspaces / worktrees / panes / Agent lifecycle | Herdr |
-| Task / TaskAttempt / AttentionItem / WorkerBinding truth | Glassbox server + Turso |
+| Task / TaskAttempt / AttentionItem / WorkerBinding truth | Glassbox server + local libSQL/SQLite |
 | Herdr reconciliation | Glassbox server through `HerdrBridge` |
 | Optional bounded Herdr stage recipe | `herdr-workflows`; never canonical Task truth |
-| Structured durable product state | Turso |
-| Raw append-only Trace / large evidence | Cloudflare R2 where appropriate |
+| Structured durable product state | Local libSQL/SQLite, Turso-compatible |
+| Raw append-only Trace / large evidence | Local JSONL Trace; Cloudflare R2 is an object-storage target |
 | Owner Web authentication | Better Auth |
 | Email transport later | AgentMail |
 | Secrets | Infisical |
@@ -60,14 +62,16 @@ Conversation content. Losing the group grant before the response is sent denies 
 | Infrastructure uptime / error monitoring | Better Stack |
 | Webhook reliability when used | Hookdeck |
 | Delayed HTTP task delivery when later required | Upstash QStash |
-| Group schedule truth | Glassbox server + Turso |
-| Group assignment / progress / reminder / report truth | Glassbox server + Turso |
-| Group Tool registry and bindings | Glassbox server + Turso metadata; executable implementation stays in reviewed runtime code / Kit resources |
+| Group schedule truth, planned | Glassbox server + local libSQL/SQLite |
+| Group assignment / progress / reminder / report truth, planned | Glassbox server + local libSQL/SQLite |
+| General group Tool registry and bindings, planned | Glassbox server + local libSQL/SQLite metadata; executable implementation stays in reviewed runtime code / Kit resources |
 | Human remote operations access | SSH; Moshi may be an optional client |
 
-## Turso product state
+## Local libSQL/SQLite product state
 
-Turso is the default structured durable store for Glassbox product truth.
+Glassbox uses `@libsql/client` with a local `file:` SQLite database. `localDatabaseUrl` in `apps/server/src/persistence/database.ts` accepts a local path or `:memory:` and rejects remote URLs and network paths. This is Turso-compatible storage, not a configured remote Turso service. The current schema version is 29 in `apps/server/src/persistence/schema.ts`.
+
+The list below combines implemented records with planned product concepts. `MemoryCandidate`, `CanonicalMemory` and `FeedbackEvent` are implemented in `apps/server/src/learning/` and the shared Memory contracts. `TasteEntry`, `OwnerInsight`, and the group assignment/registry records are conceptual; they do not name existing tables. See `docs/memory-taste.md` and `docs/owner-group-operations.md` for that distinction.
 
 Current / planned records include:
 
@@ -85,8 +89,8 @@ message dedupe
 runtime session binding
 visibility / Share metadata
 
-GroupPolicy
-ToolDefinition metadata
+GroupCapabilityPolicy, implemented
+ToolDefinition metadata, planned
 ToolVersion metadata
 GroupToolBinding
 ScheduleDefinition
@@ -105,11 +109,10 @@ WorkerBinding
 Herdr reconciliation metadata
 
 FeedbackEvent
-TasteCandidate
-TasteEntry
-Taste confidence / scope / provenance
-Memory metadata
-OwnerInsight metadata
+MemoryCandidate
+CanonicalMemory, including preference records for Taste
+Memory confidence / scope / provenance
+OwnerInsight metadata, planned
 Rules metadata when represented as product state
 Skill registry metadata
 Journal / Asset metadata
@@ -126,7 +129,7 @@ Trace events contain only Principal, group Resource, sender id, normalized obser
 roles, role source, verification status, requested Tool and operation, Run, Conversation, and a
 safe authorization status. Provider response bodies and error text are excluded.
 
-The browser does not receive direct Turso credentials.
+The browser does not receive direct database credentials or database access.
 
 ## Runtime distribution identity
 
@@ -148,12 +151,12 @@ model / provider identity
 
 This metadata may live in Run / runtime configuration records and Trace projections.
 
-Do not store the entire Kit package payload in Turso merely for provenance.
+Do not store the entire Kit package payload in the local database merely for provenance.
 
 ## Product truth vs Pi / Lora PI Kit state
 
 ```text
-Glassbox / Turso
+Glassbox / local libSQL/SQLite
   Agent identity
   Principal
   Authorization
@@ -188,7 +191,7 @@ The same Kit can be used by several roles without making those roles the same Ag
 ## Product truth vs Herdr live execution
 
 ```text
-Glassbox / Turso
+Glassbox / local libSQL/SQLite
   Task
   TaskAttempt history
   Attention Queue
@@ -225,10 +228,10 @@ A connection gap does not silently change Task truth.
 Rules, Skills, Taste, and Memory have different authority.
 
 ```text
-Glassbox / Turso
+Glassbox / local libSQL/SQLite
   FeedbackEvent
-  TasteCandidate
-  TasteEntry
+  MemoryCandidate
+  CanonicalMemory with type = preference for Taste
   confidence
   scope
   promotion / demotion
@@ -252,14 +255,16 @@ Taste is preference, not permission.
 
 A single edit is evidence, not a permanent preference.
 
-Large before/after feedback artifacts may live in R2 while Turso stores structured FeedbackEvent metadata and references.
+Large before/after feedback artifacts may live in R2 while the local database stores structured FeedbackEvent metadata and references.
 
 ## Group operations state
 
-Group scheduling and assignment delivery follow the same durable-state rule as other Glassbox product behavior.
+The current `group_capability_policies` table stores versioned `GroupCapabilityPolicy` records. `owner_group_admin` controls access, Skills, capability categories, history and Memory-source switches. These switches narrow the runtime Tool set and source reads; they do not replace authorization.
+
+The group scheduling, assignment and report model below remains planned. It follows the same durable-state rule as implemented product behavior. Durable Task/Activity continuations already exist, but they do not implement this group-assignment domain.
 
 ```text
-Turso
+Local libSQL/SQLite
   schedule definition
   occurrence identity
   assignment state
@@ -276,7 +281,7 @@ For the first single-group pilot, an in-process scheduler is acceptable if sched
 
 A later QStash or similar timer transport may replace the wake-up mechanism without becoming schedule truth.
 
-Tool executable code should not be stored as arbitrary chat-generated blobs and loaded directly into production. Turso may store Tool metadata, version references, configuration, permission manifests, and group bindings. Reviewed code or Kit resources own executable implementation.
+Tool executable code should not be stored as arbitrary chat-generated blobs and loaded directly into production. The local database may store Tool metadata, version references, configuration, permission manifests, and group bindings. Reviewed code or Kit resources own executable implementation.
 
 See `docs/owner-group-operations.md`.
 
@@ -315,7 +320,7 @@ Raw event volume is not itself a user-facing metric.
 ## Storage split
 
 ```text
-Turso
+Local libSQL/SQLite
   structured product truth
   searchable metadata
   FTS / Vector when later used
@@ -405,7 +410,7 @@ Linux server
   NapCat
   Herdr
   coding Workers / worktrees
-  Turso-compatible durable state
+  local libSQL/SQLite durable state, Turso-compatible
 ```
 
 Do not encode desktop GUI state, Moshi state, developer terminal-window identity, or machine-specific absolute paths as durable domain truth.
@@ -438,7 +443,7 @@ Elasticsearch
 Meilisearch
 ```
 
-Turso covers current structured / search / statistics needs. R2 covers large / raw data. Herdr covers live coding-worker execution. Lora PI Kit covers reproducible Pi distribution. Additional infrastructure should be introduced only for a concrete active-Plan requirement.
+Local libSQL/SQLite covers current structured / search / statistics needs. R2 is the object-storage target for large / raw data. Herdr covers live coding-worker execution. Lora PI Kit covers reproducible Pi distribution. Additional infrastructure should be introduced only for a concrete active-Plan requirement.
 
 ## Source-policy conditions on authorization decisions
 
@@ -539,26 +544,12 @@ connection is reconfigured. Historical Bot attribution remains an explicit contr
 migration follow-up; this slice does not claim Bot-isolated archive provenance.
 
 
-## Exact Channel history time windows
-
-Schema v28 adds an indexed integer `occurred_at_ms` projection to `channel_messages`.
-The migration backfills at most 500 rows per read using the timestamp formats already
-accepted by `Date.parse`. It retains each original `occurred_at` string and message body;
-Raw Trace is unchanged. Unparseable legacy timestamps remain stored with a NULL time
-projection. Time-bounded reads exclude them; untimed reads retain their original evidence.
-
-New ingestion and deduplicated enrichment validate timestamps and store canonical UTC
-text plus exact integer milliseconds. History Tools and source reads compare inclusive
-millisecond bounds before SQL LIMIT, keeping the existing authorized group, source-class
-and trusted connection filters. The retriever's secondary filter compares instants before
-duplicate suppression. Equivalent UTC and offset inputs select the same records; invalid
-bounds, reversed windows and invalid limits return fixed input-error codes. Time precision
-is the existing JavaScript Date millisecond precision, with no Julian-day floating-point
-arithmetic.
-
 ## QQ acceptance evidence
 
 New `history_retrieval` events record the result status and the expected successful Tool return's SHA-256 and UTF-8 byte count. Each returned item records its archive UUID, projected text digest and bytes, sender identity and occurrence time. No projected text or nickname is added to these fields. The protected Tool result retains only its existing output digest and byte count; acceptance compares both records before claiming result proof. Trace access remains protected, and these identifiers are not added to public projections. Old events are unchanged. New result assertions cannot use old events that lack this evidence.
+
+Protected `group_history_search` and `owner_history_search` Tool calls omit raw arguments. New calls record `inputSha256` and `inputBytes` after JSON round-trip normalization and recursive lexical object-key ordering. Arrays retain their order. Evidence is omitted for invalid arguments, structures deeper than 16 levels, or JSON larger than 64 KiB. Acceptance compares these fields with the fixed scenario arguments before checking retrieval results. Historical calls without this evidence remain inconclusive; their Trace is not rewritten. A partial source walk describes only the searched window and cannot prove that a message was absent.
+
 
 The scoped acceptance observer reads only the exact current-input archive row for positive proof, or a target-group nonce count for a no-match proof. It verifies the Owner Run and source scope independently and returns sanitized counts. A complete archive search window does not establish absence outside that source window.
 
@@ -586,4 +577,30 @@ QQ live reply binding retains the Bot-local message ID and the driver-local mess
 
 For successful qq_groups metadata results, tool_result.data.groupInfo records schemaVersion 1, groupId, groupNameSha256, memberCount and maxMemberCount. The runtime derives these fields from the actual protected Tool result after validating the content/details envelope and raw provider fields. The existing full output byte count and SHA256 remain bound to that same result. The 512-byte outputHead limit stays unchanged. Invalid envelopes, failed results, inventory listings and other Tools do not produce this projection. Historical events are not rewritten. Real metadata acceptance additionally requires an independent fixed Bot read and actual two-account text replies whose counts match the projection.
 
-A successful qq_group_files result may include data.groupFiles with schemaVersion 1, fileCount, folderCount and listingSha256. It derives only from a validated protected root-list-shaped result. The digest covers canonical complete returned-page JSON, with sorted object keys and preserved array order, including extra provider metadata. Counts and digest do not imply complete-directory coverage. No file name, file ID or uploader field enters this projection. Existing full result digest/bytes and 512-byte outputHead remain unchanged. Historical events missing this projection cannot satisfy the new root-page acceptance case.
+A successful qq_group_files result now includes data.groupFiles with schemaVersion 2, fileCount, folderCount, listingSha256 and metadataSha256. It derives only from a validated protected root-list-shaped result. listingSha256 covers canonical complete returned-page JSON, with sorted object keys and preserved array order, including extra provider metadata. metadataSha256 uses the same page with each file's ephemeral file_id removed, for independent consecutive reads. Counts and digests do not imply complete-directory coverage. No file name, file ID or uploader field enters this projection. Existing full result digest/bytes and 512-byte outputHead remain unchanged. Historical version 1 events remain unchanged and cannot satisfy the version 2 root-page acceptance case.
+
+Confirmed media sending appends a version 1 media_delivery_sent event with provenance glassbox-media-delivery. Its flat fields bind runId, deliveryId, assetId, externalId, mimeType, sizeBytes and sha256 to the exact Buffer handed to OneBot. No prompt, URL, path or content is recorded. This is a sender witness. Receiving-side QQ attachment identity and retained sender Asset decoding require separate acceptance evidence; the witness does not prove received or transcoded bytes are identical. Trace append or delivery-state failure after a confirmed send remains unknown and must not replay the send.
+
+## Exact Channel history time windows
+
+Schema v28 adds an indexed integer `occurred_at_ms` projection to `channel_messages`.
+The migration backfills at most 500 rows per read using the timestamp formats already
+accepted by `Date.parse`. It retains each original `occurred_at` string and message body;
+Raw Trace is unchanged. Unparseable legacy timestamps remain stored with a NULL time
+projection. Time-bounded reads exclude them; untimed reads retain their original evidence.
+
+New ingestion and deduplicated enrichment validate timestamps and store canonical UTC
+text plus exact integer milliseconds. History Tools and source reads compare inclusive
+millisecond bounds before SQL LIMIT, keeping the existing authorized group, source-class
+and trusted connection filters. The retriever's secondary filter compares instants before
+duplicate suppression. Equivalent UTC and offset inputs select the same records; invalid
+bounds, reversed windows and invalid limits return fixed input-error codes. Time precision
+is the existing JavaScript Date millisecond precision, with no Julian-day floating-point
+arithmetic.
+
+
+## Channel default routing provenance
+
+Schema v29 adds nullable `runs.channel_default_execution_ref`. Trusted ingress can record the Channel default execution reference separately from the Run's selected `execution_ref` when applying an Owner model preference. Runtime routing uses this provenance to distinguish a saved preference from an explicit one-Run selection before considering recovery to the Channel default.
+
+Historical and explicit Runs remain unmarked. The migration does not infer old routing provenance or rewrite Run results. See `apps/server/src/persistence/schema.ts`, `apps/server/src/conversation/store.ts`, and the ingress/routing paths in `apps/server/src/management/application.ts`.

@@ -13,6 +13,7 @@ import {
   toolManifestDigest,
   digest,
 } from "../lib/core.mjs";
+import { boundMediaMessage } from "../lib/message-binding.mjs";
 test("Tool specification hashing matches the server canonical JSON contract", () => {
   const tools = [
     {
@@ -53,7 +54,7 @@ test("Tool specification hashing matches the server canonical JSON contract", ()
   );
 });
 import { muteUntil } from "../lib/moderation.mjs";
-import { validateSpecs, Recorder } from "../lib/runner.mjs";
+import { validateSpecs, Recorder, replyCase } from "../lib/runner.mjs";
 import { boundMessage, compareSameMessage } from "../lib/message-binding.mjs";
 import { baseConfig } from "./fixture.mjs";
 const throwsCode = (f, code) => assert.throws(f, (e) => e.code === code);
@@ -78,6 +79,35 @@ const boundExpected = () => ({
 });
 test("configuration accepts isolated armed fixture", () =>
   assert.equal(validateConfig(baseConfig(), { live: true }).groups.length, 2));
+test("development source identity accepts only an explicit SHA256", () => {
+  const config = { ...baseConfig(), runtime: { expectedSourceTreeSha256: "a".repeat(64) } };
+  assert.equal(validateConfig(config).runtime.expectedSourceTreeSha256, "a".repeat(64));
+  for (const expectedSourceTreeSha256 of ["", "z".repeat(64), 17])
+    throwsCode(
+      () => validateConfig({ ...config, runtime: { expectedSourceTreeSha256 } }),
+      "CONFIG_RUNTIME",
+    );
+});
+test("media fixture timeout is bounded separately from ordinary reads", () => {
+  const c = baseConfig();
+  c.mediaFixtures = { enabled: true, retainAssetsConfirmed: true, timeoutMs: 600000 };
+  const valid = validateConfig(c);
+  assert.equal(valid.mediaFixtures.timeoutMs, 600000);
+  assert.equal(valid.timeoutMs, c.timeoutMs);
+  for (const timeoutMs of [0, 900001, 1.5])
+    throwsCode(
+      () => validateConfig({ ...c, mediaFixtures: { ...c.mediaFixtures, timeoutMs } }),
+      "CONFIG_LIMIT",
+    );
+  for (const mediaFixtures of [
+    null,
+    [],
+    { enabled: true },
+    { ...c.mediaFixtures, extra: true },
+    { ...c.mediaFixtures, enabled: "true" },
+  ])
+    throwsCode(() => validateConfig({ ...c, mediaFixtures }), "CONFIG_MEDIA_FIXTURE");
+});
 test("same identities are rejected", () => {
   const c = baseConfig();
   c.bot.qq = c.driver.qq;
@@ -122,6 +152,16 @@ test("consent required", () => {
   c.moderation.consentConfirmed = false;
   throwsCode(() => validateModeration(c), "CONSENT_REQUIRED");
 });
+test("moderation consent must be recorded during the current 15 minute window", () => {
+  const c = baseConfig();
+  c.moderation.consentConfirmedAt = new Date(Date.now() - 16 * 60_000).toISOString();
+  throwsCode(() => validateModeration(c), "CONSENT_REQUIRED");
+});
+test("moderation target is limited to group B", () => {
+  const c = baseConfig();
+  c.moderation.group = "A";
+  throwsCode(() => validateModeration(c), "MODERATION_TARGET");
+});
 test("long mute forbidden", () => {
   const c = baseConfig();
   c.moderation.durationSeconds = 3600;
@@ -164,6 +204,66 @@ test("diagnostics ignore stack getters and arbitrary thrown objects", () => {
   assert.equal(safeError({ name: "TypeError", stack: "secret" }).diagnostic, undefined);
 });
 test("CQ metadata is not parsed as text", () => assert.equal(textOf("[CQ:at,qq=10002]hi"), "hi"));
+test("SQLite diagnostics retain only a bounded numeric result code", () => {
+  const error = Object.assign(new Error("secret SQLite payload"), {
+    code: "ERR_SQLITE_ERROR",
+    errcode: 5,
+    errstr: "secret SQLite payload",
+  });
+  assert.equal(safeError(error).diagnostic.sqliteCode, 5);
+  assert.ok(!JSON.stringify(safeError(error)).includes("secret SQLite payload"));
+  for (const errcode of ["5", -1, 65536, Infinity]) {
+    error.errcode = errcode;
+    assert.equal(safeError(error).diagnostic.sqliteCode, undefined);
+  }
+  error.errcode = 5;
+  error.code = "untrusted provider code";
+  assert.equal(safeError(error).diagnostic.sqliteCode, undefined);
+});
+test("SQLite diagnostics do not invoke property getters", () => {
+  const error = new Error("secret");
+  Object.defineProperty(error, "code", {
+    get() {
+      throw new Error("secret getter");
+    },
+  });
+  Object.defineProperty(error, "errcode", {
+    get() {
+      throw new Error("secret getter");
+    },
+  });
+  assert.equal(safeError(error).diagnostic.sqliteCode, undefined);
+});
+test("SQLite diagnostics retain only a bounded numeric result code", () => {
+  const error = Object.assign(new Error("secret SQLite payload"), {
+    code: "ERR_SQLITE_ERROR",
+    errcode: 5,
+    errstr: "secret SQLite payload",
+  });
+  assert.equal(safeError(error).diagnostic.sqliteCode, 5);
+  assert.ok(!JSON.stringify(safeError(error)).includes("secret SQLite payload"));
+  for (const errcode of ["5", -1, 65536, Infinity]) {
+    error.errcode = errcode;
+    assert.equal(safeError(error).diagnostic.sqliteCode, undefined);
+  }
+  error.errcode = 5;
+  error.code = "untrusted provider code";
+  assert.equal(safeError(error).diagnostic.sqliteCode, undefined);
+});
+test("SQLite diagnostics do not invoke property getters", () => {
+  const error = new Error("secret");
+  Object.defineProperty(error, "code", {
+    get() {
+      throw new Error("secret getter");
+    },
+  });
+  Object.defineProperty(error, "errcode", {
+    get() {
+      throw new Error("secret getter");
+    },
+  });
+  assert.equal(safeError(error).diagnostic.sqliteCode, undefined);
+});
 test("unsafe numeric identifiers rejected", () => assert.equal(id(2 ** 60), ""));
 test("negative message ID supported", () => assert.equal(messageId(-7), "-7"));
 test("bound message returns identity metadata without its body", async () => {
@@ -277,6 +377,115 @@ test("old run marker cannot satisfy a new run", () => {
   assert.equal(r.cases[0].replies.length, 0);
 });
 
+test("fresh same-route reply without the nonce is recorded as a failed assertion", () => {
+  const r = new Recorder(baseConfig());
+  const c = r.begin("account-status", "private", "check status {{nonce}}", ["{{nonce}"]);
+  const text = "The account is online.";
+  r.ingest("driver", {
+    self_id: 10001,
+    post_type: "message",
+    message_type: "private",
+    user_id: 10002,
+    message_id: 501,
+    time: Math.floor(Date.now() / 1000),
+    message: [{ type: "text", data: { text } }],
+  });
+
+  assert.equal(c.replies.length, 1);
+  assert.equal(c.replies[0].matches, false);
+  assert.equal(c.replies[0].textBytes, Buffer.byteLength(text));
+  assert.equal(c.replies[0].textSha256, digest(text));
+  assert.equal(JSON.stringify(c).includes(text), false);
+  assert.equal(JSON.stringify(r.events).includes(text), false);
+});
+
+test("old unmarked same-route reply is not associated with an active case", () => {
+  const r = new Recorder(baseConfig());
+  const c = r.begin("account-status", "private", "check status {{nonce}}", ["{{nonce}"]);
+  r.ingest("driver", {
+    self_id: 10001,
+    post_type: "message",
+    message_type: "private",
+    user_id: 10002,
+    message_id: 502,
+    time: Math.floor(c.startedMs / 1000) - 10,
+    message: "The account is online.",
+  });
+  assert.equal(c.replies.length, 0);
+});
+
+test("replyCase classifies a captured fresh reply without the nonce as an assertion failure", async () => {
+  const config = { ...baseConfig(), timeoutMs: 20, settleMs: 0 };
+  const recorder = new Recorder(config);
+  const currentTime = Math.floor(Date.now() / 1000);
+  const promptText = (messageId) => ({
+    self_id: messageId === 101 ? 10001 : 10002,
+    message_id: messageId,
+    message_type: "private",
+    user_id: 10001,
+    real_seq: "901",
+    time: currentTime,
+    sender: { user_id: 10001 },
+    message: [{ type: "text", data: { text: recorder.cases[0].prompt } }],
+  });
+  const clients = {
+    driver: {
+      problem: null,
+      async call(action) {
+        if (action === "send_private_msg") {
+          recorder.ingest("bot", {
+            self_id: 10002,
+            post_type: "message",
+            message_type: "private",
+            user_id: 10001,
+            message_id: 201,
+            time: currentTime,
+            message: [{ type: "text", data: { text: recorder.cases[0].prompt } }],
+          });
+          recorder.ingest("driver", {
+            self_id: 10001,
+            post_type: "message",
+            message_type: "private",
+            user_id: 10002,
+            message_id: 301,
+            time: currentTime,
+            message: [{ type: "text", data: { text: "The account is online." } }],
+          });
+          return { message_id: 101 };
+        }
+        if (action === "get_msg") return promptText(101);
+        throw new Error("unexpected driver API call");
+      },
+    },
+    bot: {
+      problem: null,
+      allowMessageRead() {},
+      async call(action) {
+        if (action === "get_msg") return promptText(201);
+        throw new Error("unexpected bot API call");
+      },
+    },
+  };
+
+  const result = await replyCase(
+    config,
+    clients,
+    recorder,
+    {
+      id: "account-status",
+      chat: "private",
+      prompt: "check status {{nonce}}",
+      expectContains: ["{{nonce}"],
+    },
+    undefined,
+  );
+  assert.equal(result.status, "FAIL");
+  assert.equal(result.code, "REPLY_ASSERTION_FAILED");
+  assert.equal(result.replies.length, 1);
+  assert.equal(result.replies[0].matches, false);
+  assert.equal(JSON.stringify(result).includes("The account is online."), false);
+});
+
 test("bound reply excludes fixture content using the actual fetched body", async () => {
   const client = { call: async () => boundFixture() };
   const expected = { ...boundExpected(), forbiddenContains: ["isolated-fixture-sentinel"] };
@@ -383,4 +592,62 @@ test("reply cannot bypass the isolation fixture check by changing its letter cas
     }),
     { code: "MESSAGE_BINDING_MISMATCH" },
   );
+});
+
+test("media binding checks the received caption, media type, accounts and fresh message identity", async () => {
+  const expected = {
+    selfId: "10002",
+    senderId: "10001",
+    messageType: "private",
+    mediaType: "image",
+    caption: "fixed image caption",
+    afterTime: new Date(Date.now() - 1000).toISOString(),
+  };
+  const result = {
+    message_id: "123456",
+    real_seq: "456789",
+    time: Math.floor(Date.now() / 1000),
+    self_id: "10002",
+    user_id: "10001",
+    message_type: "private",
+    message: [
+      { type: "text", data: { text: expected.caption } },
+      { type: "image", data: { file: "private-local-media-handle" } },
+    ],
+  };
+  const client = {
+    call: async (method, input) => {
+      assert.equal(method, "get_msg");
+      assert.deepEqual(input, { message_id: "123456" });
+      return result;
+    },
+  };
+  const binding = await boundMediaMessage(client, "123456", expected);
+  assert.equal(binding.mediaType, "image");
+  assert.equal(binding.captionSha256, digest(expected.caption));
+  assert.equal(binding.segmentCount, 2);
+  assert.equal(Object.hasOwn(binding, "file"), false);
+  for (const change of [
+    (message) => {
+      message.message[1].type = "video";
+    },
+    (message) => {
+      message.message[0].data.text = "different caption";
+    },
+    (message) => {
+      message.message.push({ type: "text", data: { text: "extra" } });
+    },
+    (message) => {
+      message.user_id = "10003";
+    },
+    (message) => {
+      message.real_seq = "not-decimal";
+    },
+  ]) {
+    const altered = structuredClone(result);
+    change(altered);
+    await assert.rejects(boundMediaMessage({ call: async () => altered }, "123456", expected), {
+      code: "MESSAGE_BINDING_MISMATCH",
+    });
+  }
 });

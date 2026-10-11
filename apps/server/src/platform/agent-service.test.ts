@@ -249,7 +249,9 @@ describe("service commands with unverified Linux ownership", () => {
     onSignal = () => {
       observedTicks = "99999";
     };
-    await expect(runServiceCommand("down", [])).rejects.toThrow("Cannot verify");
+    await expect(runServiceCommand("down", [])).rejects.toThrow(
+      "Cannot reverify the same process before forced shutdown; service state was preserved.",
+    );
     expect(kill.mock.calls.filter(([, signal]) => signal !== 0)).toEqual([[pid, "SIGTERM"]]);
     expect(io.rm).not.toHaveBeenCalled();
     expect(stdout).not.toHaveBeenCalled();
@@ -339,6 +341,53 @@ describe("service commands with unverified Linux ownership", () => {
     expect(stdout).not.toHaveBeenCalled();
   });
 
+  it.each(["unchanged", "changed", "unrecorded"] as const)(
+    "verifies the previous launch source before rollback: %s",
+    async (source) => {
+      state[0] = {
+        ...baseEntry,
+        ...(source === "unrecorded" ? {} : { launchCommit: "a".repeat(40), launchClean: true }),
+      };
+      const fixtureSpawn = io.spawn.getMockImplementation()!;
+      let attempts = 0;
+      io.spawn.mockImplementation((command: string, spawnedArgs: string[]) => {
+        attempts += 1;
+        if (attempts === 1) {
+          if (source === "changed") {
+            io.execFileSync.mockImplementation((_command: string, args: string[]) =>
+              args[0] === "rev-parse" ? "b".repeat(40) : "",
+            );
+          }
+          throw new Error("candidate failed");
+        }
+        return fixtureSpawn(command, spawnedArgs);
+      });
+      const error = await runServiceCommand("switch", [
+        "--checkout",
+        resolve("/srv/candidate"),
+      ]).catch((error: unknown) => error);
+      if (source === "unchanged") {
+        expect(error).toEqual(new Error("candidate failed"));
+        expect(io.spawn).toHaveBeenCalledTimes(2);
+        expect(state).toEqual([
+          expect.objectContaining({
+            cwd: baseEntry.cwd,
+            launchCommit: "a".repeat(40),
+            launchClean: true,
+          }),
+        ]);
+      } else {
+        expect(error).toBeInstanceOf(AggregateError);
+        expect((error as AggregateError).errors.map((item: Error) => item.message)).toEqual([
+          "candidate failed",
+          "Cannot restore previous checkout: launch source is missing or has changed",
+        ]);
+        expect(io.spawn).toHaveBeenCalledOnce();
+        expect(state).toEqual([]);
+      }
+    },
+  );
+
   it("refuses an older rollback after a failed candidate upgrades the shared schema", async () => {
     const candidate = resolve("/srv/candidate");
     const previousSchema = join(baseEntry.cwd, "apps/server/src/persistence/schema.ts");
@@ -423,5 +472,76 @@ describe("existing service ownership contracts", () => {
     );
     expect(kill).not.toHaveBeenCalled();
     expect(io.spawn).not.toHaveBeenCalled();
+  });
+});
+
+describe("configured production checkout (#111)", () => {
+  const production = resolve("/srv/production");
+  const candidate = resolve("/srv/candidate");
+  const sha = "a".repeat(40);
+
+  function launchConfig(glassbox: Record<string, unknown>) {
+    const fixtureRead = io.readFile.getMockImplementation()!;
+    io.readFile.mockImplementation(async (path: string) =>
+      path.endsWith("service-launch.json")
+        ? JSON.stringify({ version: 1, glassbox })
+        : fixtureRead(path),
+    );
+  }
+
+  function gitAnswers(head: string) {
+    io.execFileAsync.mockImplementation(async (_command: string, commandArgs: string[]) => {
+      if (commandArgs.includes("symbolic-ref")) return { stdout: "main\n" };
+      if (commandArgs.includes("rev-parse") && commandArgs.includes("HEAD"))
+        return { stdout: `${head}\n` };
+      return { stdout: "" };
+    });
+  }
+
+  it("starts the configured checkout and reports its stable source commit", async () => {
+    state = [];
+    launchConfig({ checkout: production });
+    gitAnswers(sha);
+    await runServiceCommand("up", []);
+    expect(io.spawn).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.arrayContaining([join(production, "apps/server/src/index.ts")]),
+      expect.objectContaining({ cwd: production }),
+    );
+    expect(stdout).toHaveBeenCalledWith(expect.stringContaining(`"checkout":"${production}"`));
+  });
+
+  it("checks the configured commit before starting or stopping Glassbox", async () => {
+    launchConfig({ checkout: production, expectedCommit: "b".repeat(40) });
+    gitAnswers(sha);
+    await expect(runServiceCommand("up", [])).rejects.toThrow(
+      `Checkout HEAD is ${sha}, but service-launch.json expects ${"b".repeat(40)}`,
+    );
+    expect(io.spawn).not.toHaveBeenCalled();
+    expect(io.writeFile).not.toHaveBeenCalled();
+
+    await expect(runServiceCommand("switch", [])).rejects.toThrow("service-launch.json expects");
+    expect(kill.mock.calls.filter(([, signal]) => signal !== 0)).toEqual([]);
+    expect(io.spawn).not.toHaveBeenCalled();
+  });
+
+  it("allows an explicit candidate checkout to override the configured pin", async () => {
+    launchConfig({ checkout: production, expectedCommit: "b".repeat(40) });
+    gitAnswers(sha);
+    await runServiceCommand("switch", ["--checkout", candidate]);
+    expect(kill.mock.calls.filter(([, signal]) => signal !== 0)).toEqual([[pid, "SIGTERM"]]);
+    expect(io.spawn).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.arrayContaining([join(candidate, "apps/server/src/index.ts")]),
+      expect.objectContaining({ cwd: candidate }),
+    );
+  });
+
+  it("rejects relative paths and malformed commit pins", async () => {
+    state = [];
+    launchConfig({ checkout: "relative/path" });
+    await expect(runServiceCommand("up", [])).rejects.toThrow("Invalid Glassbox launch");
+    launchConfig({ expectedCommit: "main" });
+    await expect(runServiceCommand("up", [])).rejects.toThrow("Invalid Glassbox launch");
   });
 });

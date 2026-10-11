@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { OneBot } from "../lib/onebot.mjs";
-import { Recorder, doctor, replyCase } from "../lib/runner.mjs";
+import { Recorder, doctor, replyCase, privateAccountPreflightOnly } from "../lib/runner.mjs";
 import { moderationCase } from "../lib/moderation.mjs";
 import { transportSmokeSpecs } from "../lib/transport-suite.mjs";
 import { world } from "./fixture.mjs";
@@ -316,6 +316,98 @@ test("doctor refuses a mismatched driver membership returned by the Bot", async 
   };
   await assert.rejects(doctor(w.config, w.clients), (e) => e.code === "GROUP_MEMBERSHIP");
 });
+
+test("private fixture preflight checks both identities and status without unrelated group queries", async (t) => {
+  const w = await setup(t);
+  const original = w.clients.bot.call.bind(w.clients.bot);
+  w.clients.bot.call = async (action, ...args) => {
+    if (action === "get_group_member_info") throw new Error("unrelated group query unavailable");
+    return original(action, ...args);
+  };
+  const result = await doctor(w.config, w.clients, { groupAliases: [] });
+  for (const role of ["driver", "bot"]) {
+    assert.equal(result[role].identityVerified, true);
+    assert.equal(result[role].online, true);
+    assert.equal(result[role].groupMembershipRequired, false);
+    assert.deepEqual(result[role].groups, []);
+    assert.deepEqual(
+      w.actions.filter((action) => action.role === role).map((action) => action.action),
+      ["get_login_info", "get_status", "get_version_info"],
+    );
+  }
+  await assert.rejects(doctor(w.config, w.clients), /unrelated group query unavailable/u);
+  assert.equal(w.actions.filter((action) => action.action.startsWith("send_")).length, 0);
+});
+
+test("private fixture preflight still rejects an offline account or wrong identity", async (t) => {
+  const offline = await setup(t, { online: false });
+  await assert.rejects(doctor(offline.config, offline.clients, { groupAliases: [] }), {
+    code: "ACCOUNT_OFFLINE",
+  });
+  const wrong = await setup(t);
+  const original = wrong.clients.driver.call.bind(wrong.clients.driver);
+  wrong.clients.driver.call = async (action, ...args) =>
+    action === "get_login_info"
+      ? { user_id: Number(wrong.config.bot.qq) }
+      : original(action, ...args);
+  await assert.rejects(doctor(wrong.config, wrong.clients, { groupAliases: [] }), {
+    code: "LOGIN_IDENTITY",
+  });
+});
+
+test("preflight refuses invalid group scopes before any API call and checks selected membership", async (t) => {
+  const w = await setup(t);
+  for (const options of [
+    { groupAliases: ["unknown"] },
+    { groupAliases: ["A", "A"] },
+    { groupAliases: "A" },
+    { skip: true },
+  ])
+    await assert.rejects(doctor(w.config, w.clients, options), { code: "PREFLIGHT_SCOPE" });
+  assert.equal(w.actions.length, 0);
+  const result = await doctor(w.config, w.clients, { groupAliases: ["B"] });
+  assert.equal(result.bot.groupMembershipRequired, true);
+  assert.deepEqual(
+    result.bot.groups.map((group) => group.alias),
+    ["B"],
+  );
+  assert.deepEqual(
+    result.driver.groups.map((group) => group.alias),
+    ["B"],
+  );
+  assert.ok(
+    w.actions
+      .filter((action) => action.action === "get_group_member_info")
+      .every((action) => String(action.params.group_id) === "20002"),
+  );
+});
+
+test("preflight refuses invalid group scopes before any API call and checks selected membership", async (t) => {
+  const w = await setup(t);
+  for (const options of [
+    { groupAliases: ["unknown"] },
+    { groupAliases: ["A", "A"] },
+    { groupAliases: "A" },
+    { skip: true },
+  ])
+    await assert.rejects(doctor(w.config, w.clients, options), { code: "PREFLIGHT_SCOPE" });
+  assert.equal(w.actions.length, 0);
+  const result = await doctor(w.config, w.clients, { groupAliases: ["B"] });
+  assert.equal(result.bot.groupMembershipRequired, true);
+  assert.deepEqual(
+    result.bot.groups.map((group) => group.alias),
+    ["B"],
+  );
+  assert.deepEqual(
+    result.driver.groups.map((group) => group.alias),
+    ["B"],
+  );
+  assert.ok(
+    w.actions
+      .filter((action) => action.action === "get_group_member_info")
+      .every((action) => String(action.params.group_id) === "20002"),
+  );
+});
 test("private round trip binds different account-local IDs to the same input", async (t) => {
   const w = await setup(t);
   const c = await replyCase(w.config, w.clients, w.recorder, spec);
@@ -394,6 +486,7 @@ test("API rejection with message_id never passes", async (t) => {
   const c = await replyCase(w.config, w.clients, w.recorder, spec);
   assert.notEqual(c.status, "PASS");
   assert.equal(c.code, "API_REJECTED");
+  assert.deepEqual(c.transportFailure, { retcode: 100 });
 });
 test("send timeout is not retried", async (t) => {
   const w = await setup(t, { ack: "timeout" });

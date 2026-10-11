@@ -2,7 +2,14 @@
 
 状态：**DESIGN FREEZE v2 — 统一设计契约与实现入口**
 
-本文件是 Glassbox Web 管理后台（Web Management UI）的统一设计规范与唯一文档入口。
+本文件是 Glassbox Web 管理后台（Web Management UI）的设计总览与主要导航入口。它汇总 Design Freeze v2 的设计约束，不是当前后端能力或验收状态清单。
+
+文档分工：
+- 本文件用于查阅设计原则、页面职责和视觉规范
+- [`docs/ui/README.md`](ui/README.md) 保留前端交付流的冻结契约、原始校验值与历史验证记录，并链接本总览
+- [`docs/design-inputs/README.md`](design-inputs/README.md) 是原始外部输入归档；`docs/ui/` 中的同名冻结文件保留交付时的副本
+
+涉及当前实现状态、存储、命令或授权边界时，以 `AGENTS.md`、相关架构文档和当前代码为准。下文的 P3 目标及原型中的 Turso 等服务标签属于当时设计语境，不证明当前服务已部署；当前数据库是本地 libSQL/SQLite。
 
 它系统整合了外部设计材料（Design Freeze v2）的全部事实、设计原则、信息架构、组件基元（Primitives）、视觉交互规范、评估验收清单、Vercel 合规要求以及已确认/待确认边界。
 

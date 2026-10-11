@@ -1,3 +1,4 @@
+import { parseRuntimeReplies } from "../../config/runtime-replies.js";
 import { mkdtemp, rm } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -12,6 +13,7 @@ import type {
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { toolSchemaEvidence } from "./tool-schema-evidence.js";
 import {
   botNameClause,
   capacityFromModel,
@@ -210,6 +212,39 @@ describe("identityRulesClause", () => {
     );
   });
 
+  it("describes the configured Bot role as separate from the group sender", () => {
+    const clause = identityRulesClause(
+      { senderId: "2498701175", isOwner: false, sharedConversation: true },
+      { groupId: "1126022432", role: "qq_group_admin" },
+    );
+    expect(clause).toContain(
+      "Fresh QQ role observation for target group 1126022432: the configured bot account is an administrator.",
+    );
+    expect(clause).toContain("This fact describes the bot account only.");
+    expect(clause).toContain("It does not grant the sender permission");
+    expect(clause).not.toContain("the sender is an administrator");
+  });
+
+  it("does not require a QQ admin role from the Owner in private chat", () => {
+    const clause = identityRulesClause(
+      { senderId: "3526039967", isOwner: true, sharedConversation: false },
+      { groupId: "1126022432", role: "qq_group_admin" },
+    );
+    expect(clause).toContain("configured bot account is an administrator");
+    expect(clause).not.toContain("Owner must be");
+    expect(clause).not.toContain("sender is an administrator");
+  });
+
+  it("describes an unreadable Bot role as unknown instead of a member", () => {
+    const clause = identityRulesClause(
+      { senderId: "2498701175", isOwner: false, sharedConversation: true },
+      { groupId: "1126022432", role: "unknown" },
+    );
+    expect(clause).toContain("the configured bot account's role is unknown");
+    expect(clause).toContain("Do not say it is or is not an administrator.");
+    expect(clause).not.toContain("the configured bot account is a member");
+  });
+
   it("only accepts a name the prompt itself gave", () => {
     // The old wording let a Tool result supply a name, which is exactly the hole the QQ
     // nickname walked through: `get_login_info` did return one.
@@ -224,9 +259,32 @@ describe("identityRulesClause", () => {
 });
 
 describe("glassboxSystemPrompt", () => {
+  it("uses the configured profile reply snapshot in both private and group prompts", () => {
+    const resolve = parseRuntimeReplies({
+      version: 1,
+      profiles: {
+        "qq-group": { notPermittedInGroup: "当前群没有开放这项操作。" },
+      },
+    });
+    const messages = resolve("qq-group");
+    for (const sharedConversation of [false, true]) {
+      const prompt = glassboxSystemPrompt("Base prompt", {
+        sharedConversation,
+        gateMessages: messages,
+      });
+      expect(prompt).toContain('"notPermittedInGroup":"当前群没有开放这项操作。"');
+      expect(prompt).not.toContain('"notPermittedInGroup":"该操作未在群聊中开放，未执行。"');
+      expect(prompt).toContain("never identity, authorization, or Tool availability");
+    }
+  });
+
   it("adds the group rules to a shared Conversation and leaves a private one alone", () => {
-    const group = glassboxSystemPrompt("Base prompt", { sharedConversation: true });
-    const priv = glassboxSystemPrompt("Base prompt", { sharedConversation: false });
+    const group = glassboxSystemPrompt("Base prompt", {
+      sharedConversation: true,
+    });
+    const priv = glassboxSystemPrompt("Base prompt", {
+      sharedConversation: false,
+    });
     const omitted = glassboxSystemPrompt("Base prompt");
     // The observed failure: a Run with no Tool call wrote that it had tested this Run's tools.
     // The base ban covers narrating names, parameters, counts and coverage metadata, and none
@@ -245,7 +303,9 @@ describe("glassboxSystemPrompt", () => {
 
   it("keeps the base rules in both branches", () => {
     for (const shared of [true, false]) {
-      const prompt = glassboxSystemPrompt("Base prompt", { sharedConversation: shared });
+      const prompt = glassboxSystemPrompt("Base prompt", {
+        sharedConversation: shared,
+      });
       expect(prompt.startsWith("Base prompt\n\n")).toBe(true);
       expect(prompt).toContain("Reply in concise plain text suitable for QQ");
       expect(prompt).toContain("do not narrate Tool names");
@@ -267,13 +327,21 @@ it("records metadata evidence from the actual qq_groups result while preserving 
     max_member_count: 200,
     extra: "private-extra".repeat(100),
   };
-  const output = { content: [{ type: "text", text: JSON.stringify(metadata) }], details: metadata };
+  const providerEnvelope = { status: "ok", data: metadata };
+  const output = {
+    content: [{ type: "text", text: JSON.stringify(providerEnvelope) }],
+    details: providerEnvelope,
+  };
   let listener: ((event: AgentSessionEvent) => void) | undefined;
   const results: Record<string, unknown>[] = [];
   const fakeSession = {
     sessionId: "group-info-session",
     messages: [
-      { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "done" }],
+        stopReason: "stop",
+      },
     ],
     subscribe(callback: (event: AgentSessionEvent) => void) {
       listener = callback;
@@ -300,7 +368,11 @@ it("records metadata evidence from the actual qq_groups result while preserving 
           toolCallId: `call-${index}`,
           args: {},
         } as never);
-        listener?.({ type: "tool_execution_end", toolCallId: `call-${index}`, ...entry } as never);
+        listener?.({
+          type: "tool_execution_end",
+          toolCallId: `call-${index}`,
+          ...entry,
+        } as never);
       }
       listener?.({ type: "agent_end", messages: [], willRetry: false });
     },
@@ -381,13 +453,21 @@ it("records root file page evidence from the actual qq_group_files result while 
     ],
     folders: [],
   };
-  const output = { content: [{ type: "text", text: JSON.stringify(metadata) }], details: metadata };
+  const providerEnvelope = { status: "ok", data: metadata };
+  const output = {
+    content: [{ type: "text", text: JSON.stringify(providerEnvelope) }],
+    details: providerEnvelope,
+  };
   let listener: ((event: AgentSessionEvent) => void) | undefined;
   const results: Record<string, unknown>[] = [];
   const fakeSession = {
     sessionId: "group-files-session",
     messages: [
-      { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "done" }],
+        stopReason: "stop",
+      },
     ],
     subscribe(callback: (event: AgentSessionEvent) => void) {
       listener = callback;
@@ -414,7 +494,11 @@ it("records root file page evidence from the actual qq_group_files result while 
           toolCallId: `call-${index}`,
           args: { groupId: "20001", operation: "get_group_root_files" },
         } as never);
-        listener?.({ type: "tool_execution_end", toolCallId: `call-${index}`, ...entry } as never);
+        listener?.({
+          type: "tool_execution_end",
+          toolCallId: `call-${index}`,
+          ...entry,
+        } as never);
       }
       listener?.({ type: "agent_end", messages: [], willRetry: false });
     },
@@ -453,10 +537,25 @@ it("records root file page evidence from the actual qq_group_files result while 
     outputBytes: Buffer.byteLength(JSON.stringify(output)),
     outputSha256: createHash("sha256").update(JSON.stringify(output)).digest("hex"),
     groupFiles: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       fileCount: 1,
       folderCount: 0,
       listingSha256: createHash("sha256").update(JSON.stringify(expectedListing)).digest("hex"),
+      metadataSha256: createHash("sha256")
+        .update(
+          JSON.stringify({
+            files: [
+              {
+                extra: metadata.files[0].extra,
+                file_name: "fixture private name",
+                file_size: 12,
+                group_id: 20001,
+              },
+            ],
+            folders: [],
+          }),
+        )
+        .digest("hex"),
     },
   });
   expect(results[0].outputHead).toBe(
@@ -521,6 +620,7 @@ describe("PiSdkRuntimeAdapter", () => {
     const events: string[] = [];
     let authorizedTools: unknown;
     let acceptanceEvidence: unknown;
+    let sessionToolSchemaEvidence: unknown;
     let authorizedSkills: unknown;
     let modelVisibleSkills: unknown;
     let skillPolicy: unknown;
@@ -549,7 +649,10 @@ describe("PiSdkRuntimeAdapter", () => {
         listener?.({
           type: "message_update",
           message: {} as never,
-          assistantMessageEvent: { type: "text_delta", delta: "hello from pi" } as never,
+          assistantMessageEvent: {
+            type: "text_delta",
+            delta: "hello from pi",
+          } as never,
         });
         listener?.({
           type: "tool_execution_start",
@@ -570,7 +673,10 @@ describe("PiSdkRuntimeAdapter", () => {
           toolName: "owner_group_admin",
           result: {
             content: [
-              { type: "text", text: "Schema validation failed: mutation_already_attempted" },
+              {
+                type: "text",
+                text: "Schema validation failed: mutation_already_attempted",
+              },
             ],
           },
           isError: true,
@@ -582,7 +688,13 @@ describe("PiSdkRuntimeAdapter", () => {
             provider: "openai",
             model: "test-model",
             stopReason: "stop",
-            usage: { input: 12, output: 4, cacheRead: 0, cacheWrite: 0, totalTokens: 16 },
+            usage: {
+              input: 12,
+              output: 4,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 16,
+            },
           } as never,
           toolResults: [] as never,
         });
@@ -605,6 +717,7 @@ describe("PiSdkRuntimeAdapter", () => {
         if (event.type === "session_start") {
           authorizedTools = event.data.authorizedTools;
           acceptanceEvidence = event.data.acceptanceLease;
+          sessionToolSchemaEvidence = event.data.toolSchemaEvidence;
           authorizedSkills = event.data.authorizedSkills;
           modelVisibleSkills = event.data.modelVisibleSkills;
           skillPolicy = event.data.skillPolicy;
@@ -642,6 +755,22 @@ describe("PiSdkRuntimeAdapter", () => {
         toolsSha256: "4d93a3f0fd2449068b6579b750e7394ca8dc090283f0f3ac4027c934c35a38e1",
         assertActive: () => true,
         filterToolNames: (names) => [...names],
+        getToolInputRestrictions: (toolName) =>
+          toolName === "owner_group_admin"
+            ? [
+                {
+                  action: "group:manage",
+                  resourceId: "owner-control",
+                  inputConstraint: {
+                    action: "set_capability",
+                    groupId: "1126022432",
+                    category: "group.settings",
+                    sourceClass: "history",
+                    enabled: true,
+                  },
+                },
+              ]
+            : [],
         checkToolCall: () => true,
       },
     };
@@ -650,7 +779,10 @@ describe("PiSdkRuntimeAdapter", () => {
 
     expect(binding.conversationId).toBe(conversation.id);
     expect(binding.runtimeSessionId).not.toBe(conversation.id);
-    expect(result).toMatchObject({ status: "completed", text: "hello from pi" });
+    expect(result).toMatchObject({
+      status: "completed",
+      text: "hello from pi",
+    });
     expect(authorizedTools).toEqual(["owner_group_admin", "skill_read"]);
     expect(acceptanceEvidence).toEqual({
       leaseId: "lease-fixture",
@@ -658,6 +790,7 @@ describe("PiSdkRuntimeAdapter", () => {
       narrowedTools: ["owner_group_admin", "skill_read"],
       toolsSha256: "4d93a3f0fd2449068b6579b750e7394ca8dc090283f0f3ac4027c934c35a38e1",
     });
+    expect(sessionToolSchemaEvidence).toBeUndefined();
     // The resolved surface is handed back on the Run context too: the execution adapter binds
     // a required Tool only when this Run could really call it.
     expect(context.authorizedToolNames).toEqual(["owner_group_admin", "skill_read"]);
@@ -740,7 +873,7 @@ describe("PiSdkRuntimeAdapter", () => {
           type: "tool_execution_start",
           toolCallId: "cap-1",
           toolName: "qq_capability_search",
-          args: { category: "group.settings", limit: 20, query: "how do I mute a member" },
+          args: { query: "q".repeat(120), groupIds: ["20001", "20002"] },
         } as never);
         listener?.({
           type: "tool_execution_end",
@@ -822,14 +955,31 @@ describe("PiSdkRuntimeAdapter", () => {
       "session_end",
     ]);
     expect(calls).toEqual([
-      // The `query` key is withheld; the enumerable arguments still identify the call.
+      // Query text and nested filters stay out of Raw Trace. The canonical digest binds the
+      // complete actual call input to the server projection receipt.
       expect.objectContaining({
         name: "qq_capability_search",
-        input: { category: "group.settings", limit: 20 },
+        projectionInputSha256: createHash("sha256")
+          .update(
+            JSON.stringify({
+              groupIds: ["20001", "20002"],
+              query: "q".repeat(120),
+            }),
+            "utf8",
+          )
+          .digest("hex"),
+        projectionInputBytes: Buffer.byteLength(
+          JSON.stringify({
+            groupIds: ["20001", "20002"],
+            query: "q".repeat(120),
+          }),
+          "utf8",
+        ),
       }),
       // A body-bearing Tool records the call itself but not what it asked for.
       expect.objectContaining({ name: "group_history_search" }),
     ]);
+    expect(calls[0]).not.toHaveProperty("input");
     expect(calls[1]).not.toHaveProperty("input");
 
     expect(results[0]).toMatchObject({
@@ -848,6 +998,7 @@ describe("PiSdkRuntimeAdapter", () => {
     // The withheld body must not appear anywhere in the recorded evidence.
     for (const recorded of [...calls, ...results]) {
       expect(JSON.stringify(recorded)).not.toContain("secret meeting tomorrow at nine");
+      expect(JSON.stringify(recorded)).not.toContain("q".repeat(120));
     }
   });
 
@@ -858,7 +1009,11 @@ describe("PiSdkRuntimeAdapter", () => {
     const fakeSession = {
       sessionId: "pi-session-surface",
       messages: [
-        { role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "ok" }],
+          stopReason: "stop",
+        },
       ],
       subscribe(callback: (event: AgentSessionEvent) => void) {
         listener = callback;
@@ -990,7 +1145,10 @@ describe("PiSdkRuntimeAdapter", () => {
           secondCallResults = context.messages
             .filter((message) => message.role === "toolResult")
             .map((message) => {
-              const content = message.content as Array<{ type: string; text?: string }>;
+              const content = message.content as Array<{
+                type: string;
+                text?: string;
+              }>;
               return content
                 .filter((part) => part.type === "text")
                 .map((part) => part.text)
@@ -1006,7 +1164,14 @@ describe("PiSdkRuntimeAdapter", () => {
                 arguments: {},
               }))
             : providerCalls === 2
-              ? [{ type: "toolCall", id: "budget-replay", name: "fixture_one", arguments: {} }]
+              ? [
+                  {
+                    type: "toolCall",
+                    id: "budget-replay",
+                    name: "fixture_one",
+                    arguments: {},
+                  },
+                ]
               : [{ type: "text", text: "done" }];
         const message = {
           role: "assistant",
@@ -1014,19 +1179,32 @@ describe("PiSdkRuntimeAdapter", () => {
           api: "openai-completions",
           provider: "fixture-provider",
           model: "budget-model",
-          usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2 },
+          usage: {
+            input: 1,
+            output: 1,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 2,
+          },
           stopReason: providerCalls < 3 ? "toolUse" : "stop",
           timestamp: Date.now(),
         } as never;
         const stream = createAssistantMessageEventStream();
         queueMicrotask(() => {
           stream.push({ type: "start", partial: message });
-          stream.push({ type: "done", reason: providerCalls < 3 ? "toolUse" : "stop", message });
+          stream.push({
+            type: "done",
+            reason: providerCalls < 3 ? "toolUse" : "stop",
+            message,
+          });
         });
         return stream;
       },
     } as unknown as ModelRuntime;
-    const largeResult = JSON.stringify({ source: "fixture", payload: "x".repeat(6_000) });
+    const largeResult = JSON.stringify({
+      source: "fixture",
+      payload: "x".repeat(6_000),
+    });
     const adapter = new PiSdkRuntimeAdapter({
       kitPath: fileURLToPath(new URL("./fixtures/lora-pi-kit", import.meta.url)),
       runtimeBaseDir,
@@ -1041,7 +1219,13 @@ describe("PiSdkRuntimeAdapter", () => {
           if (name === "fixture_one") firstToolExecutions++;
           return name === "fixture_image"
             ? {
-                content: [{ type: "image", data: "a".repeat(20_000), mimeType: "image/png" }],
+                content: [
+                  {
+                    type: "image",
+                    data: "a".repeat(20_000),
+                    mimeType: "image/png",
+                  },
+                ],
                 details: {},
               }
             : { content: [{ type: "text", text: largeResult }], details: {} };
@@ -1096,7 +1280,10 @@ describe("PiSdkRuntimeAdapter", () => {
       maxTokens: 256_000,
     } as never;
     const originalModel = structuredClone(model);
-    const observed: Array<{ maxTokens?: number; thinkingBudgets?: Record<string, number> }> = [];
+    const observed: Array<{
+      maxTokens?: number;
+      thinkingBudgets?: Record<string, number>;
+    }> = [];
     let payloadText = "small serialized provider payload";
     let payloadCheck: Promise<unknown> | undefined;
     let providerOnPayload: ((payload: unknown, model: unknown) => unknown) | undefined;
@@ -1116,7 +1303,10 @@ describe("PiSdkRuntimeAdapter", () => {
           onPayload?: (payload: unknown, model: unknown) => unknown;
         },
       ) => {
-        observed.push({ maxTokens: options.maxTokens, thinkingBudgets: options.thinkingBudgets });
+        observed.push({
+          maxTokens: options.maxTokens,
+          thinkingBudgets: options.thinkingBudgets,
+        });
         if (calls === 1) {
           secondProviderSawToolResult =
             (context as { messages?: Array<{ role: string }> }).messages?.some(
@@ -1147,14 +1337,24 @@ describe("PiSdkRuntimeAdapter", () => {
           api: "openai-completions",
           provider: "fixture-provider",
           model: "equal-window-model",
-          usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2 },
+          usage: {
+            input: 1,
+            output: 1,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 2,
+          },
           stopReason: calls === 1 ? "toolUse" : "stop",
           timestamp: Date.now(),
         } as never;
         const stream = createAssistantMessageEventStream();
         queueMicrotask(() => {
           stream.push({ type: "start", partial: message });
-          stream.push({ type: "done", reason: calls === 1 ? "toolUse" : "stop", message });
+          stream.push({
+            type: "done",
+            reason: calls === 1 ? "toolUse" : "stop",
+            message,
+          });
         });
         return stream;
       },
@@ -1237,7 +1437,10 @@ describe("PiSdkRuntimeAdapter", () => {
     let providerCalls = 0;
     let projectedProviderMessages: Array<{ role: string; content?: unknown }> = [];
     let nextProviderMessages: Array<{ role: string; content?: unknown }> = [];
-    const toolResult = JSON.stringify({ source: "current-turn", payload: "y".repeat(2_000) });
+    const toolResult = JSON.stringify({
+      source: "current-turn",
+      payload: "y".repeat(2_000),
+    });
     const modelRuntime = {
       hasConfiguredAuth: () => true,
       checkAuth: async () => undefined,
@@ -1251,9 +1454,21 @@ describe("PiSdkRuntimeAdapter", () => {
         if (providerCalls === 3) nextProviderMessages = structuredClone(context.messages);
         const content =
           providerCalls === 1
-            ? [{ type: "text", text: `historic-secret-token-needle ${"z".repeat(9_000)}` }]
+            ? [
+                {
+                  type: "text",
+                  text: `historic-secret-token-needle ${"z".repeat(9_000)}`,
+                },
+              ]
             : providerCalls === 2
-              ? [{ type: "toolCall", id: "new-turn-call", name: "current_read", arguments: {} }]
+              ? [
+                  {
+                    type: "toolCall",
+                    id: "new-turn-call",
+                    name: "current_read",
+                    arguments: {},
+                  },
+                ]
               : [{ type: "text", text: "completed" }];
         const message = {
           role: "assistant",
@@ -1261,14 +1476,24 @@ describe("PiSdkRuntimeAdapter", () => {
           api: "openai-completions",
           provider: "fixture-provider",
           model: "projected-budget-model",
-          usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2 },
+          usage: {
+            input: 1,
+            output: 1,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 2,
+          },
           stopReason: providerCalls === 2 ? "toolUse" : "stop",
           timestamp: Date.now(),
         } as never;
         const stream = createAssistantMessageEventStream();
         queueMicrotask(() => {
           stream.push({ type: "start", partial: message });
-          stream.push({ type: "done", reason: providerCalls === 2 ? "toolUse" : "stop", message });
+          stream.push({
+            type: "done",
+            reason: providerCalls === 2 ? "toolUse" : "stop",
+            message,
+          });
         });
         return stream;
       },
@@ -1284,7 +1509,10 @@ describe("PiSdkRuntimeAdapter", () => {
           label: "current_read",
           description: "Read current turn fixture",
           parameters: Type.Object({}),
-          execute: async () => ({ content: [{ type: "text", text: toolResult }], details: {} }),
+          execute: async () => ({
+            content: [{ type: "text", text: toolResult }],
+            details: {},
+          }),
         },
       ],
       resolveToolNames: async () => ["current_read"],
@@ -1376,7 +1604,13 @@ describe("PiSdkRuntimeAdapter", () => {
             cacheWrite: 0,
             reasoning: 2,
             totalTokens: 2,
-            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            cost: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              total: 0,
+            },
           },
           stopReason: "stop",
           timestamp: Date.now(),
@@ -1389,20 +1623,30 @@ describe("PiSdkRuntimeAdapter", () => {
       },
     } as unknown as ModelRuntime;
 
-    const tool = (name: string): ToolDefinition => ({
+    const tool = (
+      name: string,
+      parameters: ToolDefinition["parameters"] = Type.Object({}),
+    ): ToolDefinition => ({
       name,
       label: name,
       description: `Fixture ${name}`,
-      parameters: Type.Object({}),
-      execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
+      parameters,
+      execute: async () => ({
+        content: [{ type: "text", text: "ok" }],
+        details: {},
+      }),
     });
+    const selectedHistoryTool = tool(
+      "qq_group_history",
+      Type.Object({ groupId: Type.Literal("1121579672") }),
+    );
 
     const adapter = new PiSdkRuntimeAdapter({
       kitPath: fileURLToPath(new URL("./fixtures/lora-pi-kit", import.meta.url)),
       runtimeBaseDir,
       model,
       modelRuntime,
-      customTools: [tool("qq_group_history"), tool("owner_group_admin"), tool("read")],
+      customTools: [selectedHistoryTool, tool("owner_group_admin"), tool("read")],
       resolveToolCandidates: async () => [
         { name: "qq_group_history", exclusion: null },
         { name: "owner_group_admin", exclusion: "scope_not_permitted" },
@@ -1447,6 +1691,15 @@ describe("PiSdkRuntimeAdapter", () => {
     await adapter.run(binding, run, "say hello", context);
 
     expect(surface).toBeDefined();
+    const schemaEvidence = sessionEvidence?.toolSchemaEvidence as ReturnType<
+      typeof toolSchemaEvidence
+    >;
+    expect(schemaEvidence).toEqual(toolSchemaEvidence([selectedHistoryTool]));
+    expect(schemaEvidence.tools.map((entry) => entry.name)).toEqual(["qq_group_history"]);
+    const changedSchema = toolSchemaEvidence([
+      tool("qq_group_history", Type.Object({ groupId: Type.Literal("1121579673") })),
+    ]);
+    expect(changedSchema.sha256).not.toBe(schemaEvidence.sha256);
     expect(capturedContext?.tools?.map((entry) => entry.name)).toEqual(
       surface?.selected.map((entry) => entry.name),
     );
@@ -1454,12 +1707,17 @@ describe("PiSdkRuntimeAdapter", () => {
     expect(capturedContext?.tools?.map((entry) => entry.name)).not.toContain("read");
     expect(surface?.excluded).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ name: "owner_group_admin", reason: "scope_not_permitted" }),
+        expect.objectContaining({
+          name: "owner_group_admin",
+          reason: "scope_not_permitted",
+        }),
         expect.objectContaining({ name: "read", reason: "disabled_by_host" }),
       ]),
     );
     expect(sessionEvidence?.thinkingLevel).toBeNull();
-    expect(sessionEvidence?.modelCapacity).toMatchObject({ contextWindowTokens: 8_192 });
+    expect(sessionEvidence?.modelCapacity).toMatchObject({
+      contextWindowTokens: 8_192,
+    });
     expect(turnEvidence?.durationMs).toEqual(expect.any(Number));
     expect(turnEvidence?.contextBudget).toMatchObject({
       policyVersion: "p5a-context-v1",
@@ -1641,7 +1899,11 @@ describe("PiSdkRuntimeAdapter", () => {
           async prompt(p: string) {
             receivedPrompts.push({ sessionId: sId, prompt: p });
             listener?.({ type: "agent_start" });
-            listener?.({ type: "turn_end", message: {} as never, toolResults: [] });
+            listener?.({
+              type: "turn_end",
+              message: {} as never,
+              toolResults: [],
+            });
             listener?.({ type: "agent_end", messages: [], willRetry: false });
           },
           async abort() {},
@@ -1874,7 +2136,12 @@ describe("PiSdkRuntimeAdapter", () => {
     );
     await adapter.run(
       groupBinding,
-      { ...run, id: "run-group", conversationId: "conv-group", principalId: "visitor" },
+      {
+        ...run,
+        id: "run-group",
+        conversationId: "conv-group",
+        principalId: "visitor",
+      },
       "hello",
       groupContext,
     );
@@ -1914,7 +2181,11 @@ describe("PiSdkRuntimeAdapter provider outcomes", () => {
         ({
           sessionId: "pi-session-outcomes",
           messages: [
-            { role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" },
+            {
+              role: "assistant",
+              content: [{ type: "text", text: "ok" }],
+              stopReason: "stop",
+            },
           ],
           subscribe(callback: (event: AgentSessionEvent) => void) {
             for (const call of calls)
@@ -1941,7 +2212,10 @@ describe("PiSdkRuntimeAdapter provider outcomes", () => {
     });
 
     await adapter.initialize();
-    const context: PiRunContext = { runId: run.id, conversationId: conversation.id };
+    const context: PiRunContext = {
+      runId: run.id,
+      conversationId: conversation.id,
+    };
     const binding = await adapter.createOrRestoreSession(conversation, "test", context);
     const result = await adapter.run(binding, run, "hello", context);
     await adapter.cleanup();
@@ -1998,7 +2272,10 @@ describe("PiSdkRuntimeAdapter provider outcomes", () => {
         isError: true,
       },
     ]);
-    expect(result.toolCalls[0]).toMatchObject({ failed: true, outcome: "denied" });
+    expect(result.toolCalls[0]).toMatchObject({
+      failed: true,
+      outcome: "denied",
+    });
   });
 
   it("keeps a Glassbox gate refusal distinguishable from a Tool that broke", async () => {
@@ -2088,7 +2365,13 @@ it.each([
           api: "openai-completions",
           provider: "fixture-provider",
           model: "moderation-prompt-fixture",
-          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 },
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 0,
+          },
           stopReason: "stop",
           timestamp: Date.now(),
         } as never;

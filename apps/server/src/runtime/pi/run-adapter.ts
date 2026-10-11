@@ -18,7 +18,10 @@ import {
 } from "../../efficiency/index.js";
 import { deriveRequestCapacity, type RequestCapacityBudget } from "./request-budget.js";
 import { exactTerms } from "../../retrieval/exact-term.js";
-import type { QqCapabilityCategory } from "../../channels/onebot/capabilities.js";
+import {
+  QQ_CAPABILITY_CATEGORIES,
+  type QqCapabilityCategory,
+} from "../../channels/onebot/capabilities.js";
 import { WEB_CAPABILITIES } from "../../management/web-capability-policy.js";
 import type { PiRunContext, PiRuntimeAdapter, PiRuntimeProfileName, PiRunResult } from "./types.js";
 import { hasQqLiveAcceptanceMarker } from "../../acceptance/qq-live-lease.js";
@@ -32,6 +35,7 @@ import { requiredCallClause, satisfiesRequiredInput } from "./protected-tools.js
 import { OWNER_GROUP_ADMIN_TOOL } from "./owner-tools.js";
 import { OWNER_MEMORY_ADMIN_TOOL } from "./owner-memory-tools.js";
 import { MEDIA_GENERATION_TOOL } from "./media-tools.js";
+import { GATE_MESSAGES, type GateMessages } from "./gate-messages.js";
 import { OWNER_MODEL_ADMIN_TOOL } from "./owner-model-tools.js";
 import {
   asksLiveQqFact,
@@ -95,9 +99,16 @@ function ownerMemoryCommand(text: string): RequiredToolCall | undefined {
   }
   // A pasted read command may keep its closing quotation mark. It is not part of the ID.
   const get = /^\/memory get ([^\s”]+)”?$/u.exec(command);
-  if (get) return { name: OWNER_MEMORY_ADMIN_TOOL, input: { action: "get", id: get[1] } };
+  if (get)
+    return {
+      name: OWNER_MEMORY_ADMIN_TOOL,
+      input: { action: "get", id: get[1] },
+    };
   if (command === "/memory candidates")
-    return { name: OWNER_MEMORY_ADMIN_TOOL, input: { action: "list_candidates" } };
+    return {
+      name: OWNER_MEMORY_ADMIN_TOOL,
+      input: { action: "list_candidates" },
+    };
   if (command === "/memory ok")
     return { name: OWNER_MEMORY_ADMIN_TOOL, input: { action: "confirm" } };
   const source =
@@ -128,7 +139,12 @@ function ownerMemoryCommand(text: string): RequiredToolCall | undefined {
     if (!scope) return undefined;
     return {
       name: OWNER_MEMORY_ADMIN_TOOL,
-      input: { action: "feedback", ...scope, signalType: feedback[2], statement: feedback[3] },
+      input: {
+        action: "feedback",
+        ...scope,
+        signalType: feedback[2],
+        statement: feedback[3],
+      },
     };
   }
   const changed = /^\/memory (update|supersede) (\S+) (.+)$/u.exec(command);
@@ -153,7 +169,10 @@ function ownerMemoryCommand(text: string): RequiredToolCall | undefined {
   }
   const governed = /^\/memory (promote|reject|expire|revoke|retire) (\S+)$/u.exec(command);
   if (governed)
-    return { name: OWNER_MEMORY_ADMIN_TOOL, input: { action: governed[1], id: governed[2] } };
+    return {
+      name: OWNER_MEMORY_ADMIN_TOOL,
+      input: { action: governed[1], id: governed[2] },
+    };
 
   const naturalSource =
     /(?:提取|导入|创建|生成).*(?:候选|candidate)|(?:候选|candidate).*(?:提取|导入|创建|生成)/iu.test(
@@ -230,6 +249,38 @@ function ownerTaskDelegationRequest(text: string): RequiredToolCall | undefined 
   return { name: "task_delegate", input: title ? { title } : {} };
 }
 
+/**
+ * Exact Owner command for a capability switch: `/capability <groupId> <category> on|off`.
+ *
+ * Natural language still works through the heuristics below, but a command that names every
+ * field needs no guessing, so it cannot be mis-resolved to another group or category. The
+ * result is a required Tool call: the Run is only allowed to say the switch took effect if
+ * that exact `set_capability` call succeeded, which is the evidence gate. The category is
+ * checked against the closed set here as well as in the Tool, so an unknown name is not
+ * required (and therefore not silently accepted) at all.
+ */
+export function ownerCapabilityCommand(text: string): RequiredToolCall | undefined {
+  const match = /^\/capability[ \t]+([1-9]\d{4,15})[ \t]+([a-z][a-z0-9_.]*)[ \t]+(on|off)$/u.exec(
+    text.trim(),
+  );
+  if (!match) return undefined;
+  const category = match[2]!;
+  if (
+    !(QQ_CAPABILITY_CATEGORIES as readonly string[]).includes(category) &&
+    !(WEB_CAPABILITIES as readonly string[]).includes(category)
+  )
+    return undefined;
+  return {
+    name: OWNER_GROUP_ADMIN_TOOL,
+    input: {
+      action: "set_capability",
+      groupId: match[1],
+      category,
+      enabled: match[3] === "on",
+    },
+  };
+}
+
 /** Exact Owner commands bind durable mutations to this message's Task, Step and version. */
 export function ownerDurableTaskCommand(text: string): RequiredToolCall | undefined {
   const command = text.trim();
@@ -301,6 +352,9 @@ function namedMemberId(text: string): number | undefined {
 function namedMuteDuration(text: string): number | undefined {
   const clause = muteRequestClause(text);
   if (clause === undefined) return undefined;
+  const explicitRequest = parseExplicitGroupModerationClause(clause);
+  if (explicitRequest) return explicitRequest.duration;
+  if (startsExplicitGroupModerationRequest(clause)) return undefined;
   if (/\d+\s*(?:至|到|~|～|-|–|或(?:者)?)\s*\d+\s*(?:秒|分钟|分|小时|时|天)/u.test(clause))
     return undefined;
   const matches = [
@@ -314,16 +368,91 @@ function namedMuteDuration(text: string): number | undefined {
   return Number(match[1]) * scale;
 }
 
+/** A comma directly after a bare imperative is a pause before its object, not a new action. */
+function joinMuteVerbPause(text: string): string {
+  return text.replace(
+    /(^|[。！？!?\n])((?:(?:请|麻烦|帮我|马上|现在)\s*)*(?:禁言|闭嘴))[，,]\s*([^，,。！？!?；;\n]+)(?=$|[。！？!?\n])/gu,
+    (original, boundary: string, command: string, targetAndDuration: string) => {
+      if (
+        !/\S.+\d{1,9}\s*(?:秒|分钟|分|小时|时|天)\s*$/u.test(targetAndDuration) ||
+        /不要|不用|请勿|不许|另外|然后|同时|并且|查看|查询|禁言|闭嘴/u.test(targetAndDuration)
+      )
+        return original;
+      return `${boundary}${command} ${targetAndDuration}`;
+    },
+  );
+}
+
 function muteRequestClause(text: string): string | undefined {
   const clauses = text.split(/[，,。！？!?；;\n]/u).filter((part) => /禁言|闭嘴/u.test(part));
   // One mutation intent cannot choose between, or combine fields from, multiple requests.
   return clauses.length === 1 ? clauses[0] : undefined;
 }
 
+type ExplicitGroupModerationRequest = {
+  target: string;
+  duration: number;
+};
+
+function startsExplicitGroupModerationRequest(text: string): boolean {
+  const normalized = text.trim().replace(/^[“「『"']\s*/u, "");
+  return /^(?:(?:请|麻烦|帮我|马上|现在)\s*)?在群(?:\s|$)/u.test(normalized);
+}
+
+function looksLikeExplicitGroupModerationRequest(text: string): boolean {
+  const normalized = text.trim().replace(/^[“「『"']\s*/u, "");
+  return (
+    startsExplicitGroupModerationRequest(normalized) &&
+    /(?:将|把|解除)\s+QQ\b/u.test(normalized) &&
+    /禁言|闭嘴/u.test(normalized)
+  );
+}
+
+function isUnambiguousGroupModerationRequest(text: string): boolean {
+  const clause = muteRequestClause(text);
+  if (!clause || !parseExplicitGroupModerationClause(clause)) return false;
+  const remainder = text.replace(clause, "");
+  return !/(?:在群\s*[1-9]\d{4,15}|群\s*[1-9]\d{4,15}|QQ\s*[1-9]\d{4,14}|禁言|闭嘴)/u.test(
+    remainder,
+  );
+}
+
+/**
+ * Parse an explicit group and numeric target from one moderation clause. An unmute is the
+ * provider's zero-second set_group_ban operation.
+ */
+function parseExplicitGroupModerationClause(
+  clause: string,
+): ExplicitGroupModerationRequest | undefined {
+  const normalized = clause.trim();
+  const mute =
+    /^(?:(?:请|麻烦|帮我|马上|现在)\s*)?在群\s+([1-9]\d{4,15})\s+(?:将|把)\s+QQ\s+([1-9]\d{4,14})\s+禁言\s+(\d{1,9})\s*(秒|分钟|分|小时|时|天)$/u.exec(
+      normalized,
+    );
+  if (mute) {
+    const unit = mute[4];
+    const scale =
+      unit === "秒" ? 1 : unit === "天" ? 86_400 : unit === "分钟" || unit === "分" ? 60 : 3_600;
+    return { target: mute[2]!, duration: Number(mute[3]) * scale };
+  }
+  const unmute =
+    /^(?:(?:请|麻烦|帮我|马上|现在)\s*)?在群\s+[1-9]\d{4,15}\s+解除\s+QQ\s+([1-9]\d{4,14})\s+的禁言$/u.exec(
+      normalized,
+    );
+  return unmute ? { target: unmute[1]!, duration: 0 } : undefined;
+}
+
 /** Extract only a literal target in a single mute clause, never an ID inferred by the model. */
 function namedMuteTarget(text: string): string | undefined {
   const clause = muteRequestClause(text);
   if (!clause) return undefined;
+  const explicitRequest = parseExplicitGroupModerationClause(clause);
+  if (explicitRequest) return explicitRequest.target;
+  if (
+    startsExplicitGroupModerationRequest(clause) ||
+    (/^[“「『"']/u.test(clause.trim()) && /在群/u.test(clause))
+  )
+    return undefined;
   const command = clause
     .trim()
     .replace(/^(?:(?:请|麻烦|帮我|马上|现在)\s*)+/u, "")
@@ -344,7 +473,10 @@ function namedMuteTarget(text: string): string | undefined {
   if (quotes[selector[0]!] === selector.at(-1)) selector = selector.slice(1, -1);
   if (!selector || selector.length > 128 || /\p{Cc}/u.test(selector) || /禁言|闭嘴/u.test(selector))
     return undefined;
-  return selector;
+  // QQ/QQ号 identifies an account when followed by one complete numeric ID. Keep
+  // every other literal selector intact for the existing unique nickname resolution.
+  const qqIdentifier = /^QQ(?:号)?\s*([1-9]\d{4,14})$/iu.exec(selector);
+  return qqIdentifier?.[1] ?? selector;
 }
 
 function mutationRequestFields(
@@ -546,7 +678,10 @@ export const MUTATION_REQUESTS: readonly {
 ]);
 
 /** Capability categories an Owner-private message can name, with the words that name them. */
-const CAPABILITY_WORDS: readonly { category: QqCapabilityCategory; words: RegExp }[] = [
+const CAPABILITY_WORDS: readonly {
+  category: QqCapabilityCategory;
+  words: RegExp;
+}[] = [
   { category: "group.history", words: /历史|聊天记录|消息记录/iu },
   { category: "group.members", words: /成员/iu },
   { category: "group.content", words: /公告|精华/iu },
@@ -559,7 +694,10 @@ const CAPABILITY_WORDS: readonly { category: QqCapabilityCategory; words: RegExp
 ];
 
 /** Memory source classes an Owner-private message can name. */
-const SOURCE_CLASS_WORDS: readonly { sourceClass: QqSourceClass; words: RegExp }[] = [
+const SOURCE_CLASS_WORDS: readonly {
+  sourceClass: QqSourceClass;
+  words: RegExp;
+}[] = [
   { sourceClass: "history", words: /历史|聊天记录/iu },
   { sourceClass: "notice", words: /公告/iu },
   { sourceClass: "essence", words: /精华/iu },
@@ -577,6 +715,7 @@ const SOURCE_CLASS_WORDS: readonly { sourceClass: QqSourceClass; words: RegExp }
  * a file, an order — never binds the Tool.
  */
 export interface PiRunExecutionAdapterOptions {
+  gateMessagesForProfile?: (profile: PiRuntimeProfileName) => GateMessages;
   resolveAcceptanceLease?: (input: ExecutionInput) => PiRunContext["acceptanceLease"] | undefined;
   isOwner?: (input: ExecutionInput) => Promise<boolean>;
   learningStore?: LearningStore;
@@ -590,6 +729,18 @@ export interface PiRunExecutionAdapterOptions {
    * Returning undefined means the channel configured no name.
    */
   botDisplayName?: (connectionId: string) => string | undefined;
+  /** Observe the configured bot's role only after the current Run has required moderation. */
+  observeBotGroupRole?: (input: {
+    context: PiRunContext;
+    groupId: string;
+    toolInput: Readonly<Record<string, unknown>>;
+  }) => Promise<
+    | {
+        observation: NonNullable<PiRunContext["botGroupRoleObservation"]>;
+        authorize: () => Promise<void>;
+      }
+    | undefined
+  >;
   /**
    * Identities a group member may not claim to be, and that a Run may not attribute to the
    * sender it is answering.
@@ -626,6 +777,19 @@ export interface PiRunExecutionAdapterOptions {
  * safe evidence: Tool names, domains and outcomes, never provider text or protected content.
  */
 export type RunEvidenceRecord =
+  | {
+      type: "qq_tool_execution_input_verified";
+      runId: string;
+      conversationId: string;
+      principalId: string;
+      toolCallId: string;
+      toolName: "qq_group_members" | "qq_group_moderation";
+      leaseId: string | null;
+      action: "get_group_member_info" | "set_group_ban";
+      resourceId: string;
+      inputSha256: string;
+      inputBytes: number;
+    }
   | {
       type: "learning_context";
       runId: string;
@@ -751,6 +915,7 @@ function requiredToolCall(
   authorizedToolNames?: readonly string[],
   modelProfiles: readonly PublicModelProfile[] = [],
   acceptanceMemoryText?: string,
+  gateMessages: GateMessages = GATE_MESSAGES,
 ): RequiredToolCall | undefined {
   if (input.caller.scope.chatType === "group") {
     if (groupHistorySearchRequested(input.text) || groupHistorySearchFollowUpRequested(input)) {
@@ -769,7 +934,7 @@ function requiredToolCall(
         },
       };
     }
-    const text = requestClauses(input.text);
+    const text = requestClauses(joinMuteVerbPause(input.text));
     const mutation = MUTATION_REQUESTS.find((entry) => entry.words.test(text));
     if (!mutation) return undefined;
     // Group-native roles get only the explicit local subset. `set_group_admin` and file writes
@@ -791,7 +956,9 @@ function requiredToolCall(
   const rawText = input.text;
   const durableCommand = ownerDurableTaskCommand(rawText);
   if (durableCommand) return durableCommand;
-  const mediaIntent = mediaRequestIntentForInput(input);
+  const capabilityCommand = ownerCapabilityCommand(rawText);
+  if (capabilityCommand) return capabilityCommand;
+  const mediaIntent = mediaRequestIntentForInput(input, gateMessages);
   if (mediaIntent === "image") return { name: MEDIA_GENERATION_TOOL, input: { action: "image" } };
   if (mediaIntent === "video") return { name: MEDIA_GENERATION_TOOL, input: { action: "video" } };
   if (authorizedToolNames?.includes(OWNER_MODEL_ADMIN_TOOL)) {
@@ -825,7 +992,10 @@ function requiredToolCall(
   if (capabilityStateQuestion(rawText) && authorizedToolNames?.includes(OWNER_GROUP_ADMIN_TOOL)) {
     const capabilityGroupId = namedGroupId(rawText);
     if (capabilityGroupId)
-      return { name: OWNER_GROUP_ADMIN_TOOL, input: { action: "get", groupId: capabilityGroupId } };
+      return {
+        name: OWNER_GROUP_ADMIN_TOOL,
+        input: { action: "get", groupId: capabilityGroupId },
+      };
     if (/群/u.test(rawText)) return { name: OWNER_GROUP_ADMIN_TOOL, input: { action: "get" } };
   }
   const groupId = namedGroupId(text);
@@ -857,7 +1027,12 @@ function requiredToolCall(
       if (category)
         return {
           name: OWNER_GROUP_ADMIN_TOOL,
-          input: { action: "set_capability", groupId, category, enabled: enabling },
+          input: {
+            action: "set_capability",
+            groupId,
+            category,
+            enabled: enabling,
+          },
         };
     }
   }
@@ -978,14 +1153,14 @@ function mediaRequestIntent(text: string): "image" | "video" | "ambiguous" | und
   for (const request of requestClauses(text).split(/，|但是|但|不过|而是/u)) {
     const clause = request.trim();
     if (
-      /(?:不要|别|无需|不用|禁止|请勿|不许|停止)(?:再)?(?:为我|给我|帮我)?(?:生成|画|绘制|制作|创作|编辑|修改|合成|改图)/u.test(
+      /(?:不要|别|无需|不用|禁止|请勿|不许|停止)(?:再)?(?:为我|给我|帮我)?(?:生成|画|绘制|制作|创作|编辑|修改|合成|改图|做)/u.test(
         clause,
       ) ||
-      /(?:能|可以|能否|是否能|会不会)(?:生成|画|绘制|制作)[^。！？!?]*[吗么]$/u.test(clause)
+      /(?:能|可以|能否|是否能|会不会|会)(?:生成|画|绘制|制作|做)[^。！？!?]*[吗么]$/u.test(clause)
     )
       continue;
-    if (/(?:翻译|解释|是什么意思|怎么说)/u.test(clause)) continue;
-    if (!/(?:生成|画|绘制|制作|创作|编辑|修改|合成|改图)/u.test(clause)) continue;
+    if (/(?:翻译|解释|是什么意思|怎么说|怎么做|如何做)/u.test(clause)) continue;
+    if (!/(?:生成|画|绘制|制作|创作|编辑|修改|合成|改图|做)/u.test(clause)) continue;
     if (/(?:图片|图像|视频|照片|海报)(?:的|用的)?提示词/u.test(clause)) continue;
     if (/(?:文字描述|用文字|一段文字|代码|脚本|报告|故事|文章|文案)[。！？!?]?$/u.test(clause))
       continue;
@@ -1007,6 +1182,7 @@ function mediaRequestIntent(text: string): "image" | "video" | "ambiguous" | und
 
 function mediaRequestIntentForInput(
   input: Pick<ExecutionInput, "text" | "history">,
+  gateMessages: GateMessages = GATE_MESSAGES,
 ): "image" | "video" | "ambiguous" | undefined {
   const directIntent = mediaRequestIntent(input.text);
   if (directIntent) return directIntent;
@@ -1027,9 +1203,9 @@ function mediaRequestIntentForInput(
   const clarification = input.history.at(-1);
   const precedingRequest = input.history.at(-2);
   return clarification?.role === "assistant" &&
-    clarification.text
-      .trim()
-      .startsWith("请说明你想要图片、视频，还是文字描述。当前请求未执行。") &&
+    [gateMessages.mediaClarify, GATE_MESSAGES.mediaClarify].some((text) =>
+      clarification.text.trim().startsWith(text),
+    ) &&
     precedingRequest?.role === "user" &&
     mediaRequestIntent(precedingRequest.text) === "ambiguous"
     ? selectedIntent
@@ -1550,8 +1726,9 @@ function blockedMutationRequest(
   input: ExecutionInput,
   isOwner: boolean,
   modelProfiles: readonly PublicModelProfile[] = [],
+  gateMessages: GateMessages = GATE_MESSAGES,
 ): BlockedMutation | undefined {
-  const mediaIntent = mediaRequestIntentForInput(input);
+  const mediaIntent = mediaRequestIntentForInput(input, gateMessages);
   if (mediaIntent === "ambiguous")
     return { operation: "media:generate", reason: "incomplete_parameters" };
   if (mediaIntent && (input.caller.scope.chatType !== "private" || !isOwner))
@@ -1559,6 +1736,19 @@ function blockedMutationRequest(
       operation: "media:generate",
       reason: input.caller.scope.chatType === "group" ? "not_permitted_in_group" : "not_permitted",
     };
+  if (
+    input.caller.scope.chatType === "private" &&
+    isOwner &&
+    looksLikeExplicitGroupModerationRequest(input.text)
+  ) {
+    const clause = muteRequestClause(input.text);
+    if (
+      !isUnambiguousGroupModerationRequest(input.text) ||
+      !clause ||
+      !parseExplicitGroupModerationClause(clause)
+    )
+      return { operation: "set_group_ban", reason: "incomplete_parameters" };
+  }
   if (explicitModelChangeCommand(input.text)) {
     if (input.caller.scope.chatType === "group")
       return { operation: "model:switch", reason: "not_permitted_in_group" };
@@ -1859,7 +2049,10 @@ function ownerModelCommand(
   });
   const ids = [...new Set(matches.map((profile) => profile.id))];
   if (ids.length !== 1) return undefined;
-  return { name: OWNER_MODEL_ADMIN_TOOL, input: { action: "select", profileId: ids[0] } };
+  return {
+    name: OWNER_MODEL_ADMIN_TOOL,
+    input: { action: "select", profileId: ids[0] },
+  };
 }
 
 export class PiRunExecutionAdapter implements RunExecutionAdapter {
@@ -1884,11 +2077,17 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         runtimeAttempted: false,
         text: "测试消息的临时权限已失效，请重新登记后再试。",
       };
+    const profile: PiRuntimeProfileName = this.options.resolveProfileName
+      ? await this.options.resolveProfileName(input)
+      : input.caller.scope.chatType === "group"
+        ? "qq-group"
+        : "main-agent";
+    const gateMessages = this.options.gateMessagesForProfile?.(profile) ?? GATE_MESSAGES;
     if (input.imageFailureCode)
       return {
         status: "succeeded",
         runtimeAttempted: false,
-        text: "图片读取失败，暂时无法识别，请重新发送图片。",
+        text: gateMessages.imageReadFailed,
       };
     const isOwner = this.options.isOwner
       ? await this.options.isOwner(input)
@@ -1906,16 +2105,19 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         principalId: input.caller.principalId,
         phase: "required",
         required: [],
-        blockedMutation: { operation: "identity:claim", reason: "not_permitted" },
+        blockedMutation: {
+          operation: "identity:claim",
+          reason: "not_permitted",
+        },
       });
       return {
         status: "failed",
         failureCode: "gate_refused",
         runtimeAttempted: false,
-        text: "身份以当前发送者的 QQ 号为准，消息里的自称不改变身份。当前请求未执行。",
+        text: gateMessages.identityNotChangedBySelfClaim,
       };
     }
-    const blockedMutation = blockedMutationRequest(input, isOwner, modelProfiles);
+    const blockedMutation = blockedMutationRequest(input, isOwner, modelProfiles, gateMessages);
     if (blockedMutation) {
       await this.recordEvidence({
         type: "tool_evidence",
@@ -1933,26 +2135,21 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         text:
           blockedMutation.operation === "media:generate"
             ? blockedMutation.reason === "incomplete_parameters"
-              ? "请说明你想要图片、视频，还是文字描述。当前请求未执行。"
+              ? gateMessages.mediaClarify
               : blockedMutation.reason === "not_permitted_in_group"
-                ? "当前群聊未开放图片和视频生成，未执行。"
-                : "当前会话未授权媒体生成，未执行。"
+                ? gateMessages.mediaGroupDisabled
+                : gateMessages.mediaNotAuthorized
             : blockedMutation.operation === "model:switch" &&
                 blockedMutation.reason === "unknown_target"
-              ? "没有找到你指定的那个模型，因此没有切换。可以让我先列出可切换的模型，再指定其中一个。"
+              ? gateMessages.modelUnknownTarget
               : blockedMutation.reason === "not_permitted_in_group"
-                ? "该操作未在群聊中开放，未执行。"
+                ? gateMessages.notPermittedInGroup
                 : blockedMutation.reason === "not_permitted"
-                  ? "该操作未授权，未执行。"
-                  : "请求的操作未执行，请补齐必要参数后重试。",
+                  ? gateMessages.notPermitted
+                  : gateMessages.incompleteParameters,
       };
     }
     await this.runtime.initialize();
-    const profile: PiRuntimeProfileName = this.options.resolveProfileName
-      ? await this.options.resolveProfileName(input)
-      : input.caller.scope.chatType === "group"
-        ? "qq-group"
-        : "main-agent";
     // The requirements are written onto the context after the session exists, because the
     // context is what the runtime carries into the Run. They are decided from the message and
     // the caller's scope, so the order the session is created in cannot change them: the
@@ -1964,6 +2161,14 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       caller: input.caller,
       conversationId: input.conversation.id,
       runId: input.run.id,
+      recordQqToolExecutionInput: async (record) => {
+        if (!this.options.onEvidence) throw new Error("verified_input_evidence_unavailable");
+        await this.options.onEvidence({
+          type: "qq_tool_execution_input_verified",
+          runId: input.run.id,
+          ...record,
+        });
+      },
       ...(acceptanceLease ? { acceptanceLease } : {}),
       callerIdentity: {
         senderId: input.caller.scope.senderId,
@@ -2002,7 +2207,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         status: "failed",
         failureCode: "model_capability_missing",
         runtimeAttempted: false,
-        text: "当前配置的模型不支持识别图片，因此没有发送图片。请切换到支持视觉输入的模型后重试。",
+        text: gateMessages.imageModelUnsupported,
       };
     }
     const required = requiredToolCall(
@@ -2011,6 +2216,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       context.authorizedToolNames,
       modelProfiles,
       acceptanceMemoryText,
+      gateMessages,
     );
     if (required?.name === "qq_group_moderation" && required.input.operation === "set_group_ban") {
       const params = required.input.params as Record<string, unknown> | undefined;
@@ -2025,7 +2231,10 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
           principalId: input.caller.principalId,
           phase: "required",
           required: [],
-          blockedMutation: { operation: "set_group_ban", reason: "incomplete_parameters" },
+          blockedMutation: {
+            operation: "set_group_ban",
+            reason: "incomplete_parameters",
+          },
         });
         await this.runtime.disposeSession?.(binding.runtimeSessionId);
         return {
@@ -2046,14 +2255,17 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
           principalId: input.caller.principalId,
           phase: "required",
           required: [],
-          blockedMutation: { operation: "set_group_ban", reason: "incomplete_parameters" },
+          blockedMutation: {
+            operation: "set_group_ban",
+            reason: "incomplete_parameters",
+          },
         });
         await this.runtime.disposeSession?.(binding.runtimeSessionId);
         return {
           status: "failed",
           failureCode: "gate_refused",
           providerSessionId: binding.runtimeSessionId,
-          text: "请在禁言指令中明确指定目标群号、成员及禁言时长。未执行禁言。",
+          text: gateMessages.moderationParametersMissing,
         };
       }
       if (
@@ -2068,26 +2280,49 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
           principalId: input.caller.principalId,
           phase: "required",
           required: [],
-          blockedMutation: { operation: "set_group_ban", reason: "not_permitted_in_group" },
+          blockedMutation: {
+            operation: "set_group_ban",
+            reason: "not_permitted_in_group",
+          },
         });
         await this.runtime.disposeSession?.(binding.runtimeSessionId);
         return {
           status: "failed",
           failureCode: "gate_refused",
           providerSessionId: binding.runtimeSessionId,
-          text: "群聊中的禁言请求只能针对当前群，请在目标群重新发起请求。未执行禁言。",
+          text: gateMessages.moderationWrongGroup,
         };
       }
       Object.freeze(required.input.params);
       Object.freeze(required.input);
     }
-    const requiredCalls = required
-      ? [{ name: required.name, input: required.input }, ...(required.additional ?? [])]
-      : [];
     if (required !== undefined) {
       context.requiredToolName = required.name;
       context.requiredToolInput = required.input;
     }
+    if (
+      required?.name === "qq_group_moderation" &&
+      typeof required.input.groupId === "string" &&
+      this.options.observeBotGroupRole
+    ) {
+      try {
+        const observation = await this.options.observeBotGroupRole({
+          context,
+          groupId: required.input.groupId,
+          toolInput: required.input,
+        });
+        if (observation?.observation.groupId === required.input.groupId) {
+          context.botGroupRoleObservation = observation.observation;
+          context.authorizeBotGroupRoleObservation = observation.authorize;
+        }
+      } catch {
+        // This fact guides the explanation only. A failed read leaves the role unknown to the
+        // model and cannot change the required action or its execution-time authorization.
+      }
+    }
+    const requiredCalls = required
+      ? [{ name: required.name, input: required.input }, ...(required.additional ?? [])]
+      : [];
     // §2 — the factual domains the current message cannot be answered without observing. Read
     // from the message alone: the surface the Run got decides whether the requirement can be
     // met, never whether it exists, so a Run whose surface withholds the Tool fails closed
@@ -2096,6 +2331,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       text: input.text,
       chatType: input.caller.scope.chatType === "group" ? "group" : "private",
       isOwner,
+      botId: input.caller.scope.botId,
     });
     if (evidence.length > 0) context.requiredEvidence = evidence;
     await this.recordEvidence({
@@ -2107,7 +2343,10 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       required: evidence,
       ...(required === undefined
         ? {}
-        : { requiredToolName: required.name, requiredToolInput: required.input }),
+        : {
+            requiredToolName: required.name,
+            requiredToolInput: required.input,
+          }),
     });
     if (explicitModelChangeCommand(input.text) && isOwner && required === undefined) {
       await this.recordEvidence({
@@ -2124,7 +2363,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         status: "failed",
         failureCode: "gate_refused",
         runtimeAttempted: false,
-        text: "模型切换工具当前不可用，未执行。",
+        text: gateMessages.modelToolUnavailable,
         providerSessionId: binding.runtimeSessionId,
       };
     }
@@ -2135,7 +2374,10 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
     try {
       if (input.signal.aborted) {
         await this.runtime.abort(binding.runtimeSessionId);
-        return { status: "cancelled", providerSessionId: binding.runtimeSessionId };
+        return {
+          status: "cancelled",
+          providerSessionId: binding.runtimeSessionId,
+        };
       }
       const capacity = this.runtime.getModelCapacity?.(binding.runtimeSessionId);
       if (!capacity) {
@@ -2280,12 +2522,20 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
           status: "failed",
           failureCode: "pre_provider_context_overflow",
           runtimeAttempted: false,
-          text: "当前请求超过已配置模型的上下文容量，未发送给模型。",
+          text: gateMessages.contextOverflow,
           providerSessionId: binding.runtimeSessionId,
         };
       context.authorizeProviderContext = async () => {
         if (context.acceptanceLease && !context.acceptanceLease.assertActive())
           throw new Error("acceptance_lease_denied");
+        if (context.authorizeBotGroupRoleObservation) {
+          try {
+            await context.authorizeBotGroupRoleObservation();
+          } catch {
+            context.botGroupRoleObservation = undefined;
+            throw new Error("bot_group_role_authority_changed");
+          }
+        }
         if (!this.options.learningStore) return;
         await this.options.learningStore.authorizeContext(
           {
@@ -2310,7 +2560,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       const refusedContext = {
         status: "failed" as const,
         failureCode: "gate_refused" as const,
-        text: "来源授权已变化，已停止继续请求模型。",
+        text: gateMessages.sourceAuthorityChanged,
         providerSessionId: binding.runtimeSessionId,
       };
       if (!(await contextAllowed())) return { ...refusedContext, runtimeAttempted: false };
@@ -2368,7 +2618,10 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         const evidenceCalls = resolveEvidence(evidence, observedCalls).flatMap(
           (resolution, index) => {
             if (resolution.outcome === "success") return [];
-            const candidate = { name: evidence[index]!.tool, input: evidence[index]!.input };
+            const candidate = {
+              name: evidence[index]!.tool,
+              input: evidence[index]!.input,
+            };
             // One exact required call also satisfies a generic evidence requirement for the same
             // Tool. Asking for both produced a retry that told the model to run the same search
             // twice, once with the bound identifier and once without it.
@@ -2538,7 +2791,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         return {
           status: "failed",
           failureCode: "required_action_not_completed",
-          text: moderationFailureReply() ?? "请求的操作未执行，请稍后重试。",
+          text: moderationFailureReply() ?? gateMessages.requiredActionMissing,
           providerSessionId: binding.runtimeSessionId,
         };
       if (missingEvidence)
@@ -2546,10 +2799,10 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
           status: "failed",
           failureCode: "required_evidence_missing",
           text: missingEvidenceDomains.some((domain) => domain.startsWith("browser_"))
-            ? "浏览器操作未完成，无法确认页面或提供截图。"
+            ? gateMessages.browserEvidenceMissing
             : missingEvidenceDomains.some((domain) => domain.startsWith("web_"))
-              ? "网页检索或读取未完成，因此无法确认。"
-              : "未能从 QQ 获取该信息，因此无法确认。",
+              ? gateMessages.webEvidenceMissing
+              : gateMessages.qqEvidenceMissing,
           providerSessionId: binding.runtimeSessionId,
         };
       // The claim about a change nobody performed. The requirement checks above read what the
@@ -2589,12 +2842,15 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
           principalId: input.caller.principalId,
           phase: "required",
           required: [],
-          blockedMutation: { operation: "policy:capability", reason: "not_permitted" },
+          blockedMutation: {
+            operation: "policy:capability",
+            reason: "not_permitted",
+          },
         });
         return {
           status: "failed",
           failureCode: "claimed_change_not_performed",
-          text: "本次 Run 没有执行被要求的变更，因此我不会声称它已经完成。请以管理面或群里的实际状态为准。",
+          text: gateMessages.claimedChangeNotPerformed,
           providerSessionId: binding.runtimeSessionId,
         };
       }
@@ -2641,7 +2897,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
           return {
             status: "failed",
             failureCode: "gate_refused",
-            text: "未能从 QQ 获取完整的请求字段，因此无法确认。",
+            text: gateMessages.qqFieldsMissing,
             providerSessionId: binding.runtimeSessionId,
           };
         result = { ...result, text: projected };
@@ -2663,12 +2919,15 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
           principalId: input.caller.principalId,
           phase: "required",
           required: [],
-          blockedMutation: { operation: "identity:attribute", reason: "not_permitted" },
+          blockedMutation: {
+            operation: "identity:attribute",
+            reason: "not_permitted",
+          },
         });
         return {
           status: "failed",
           failureCode: "gate_refused",
-          text: "身份以当前发送者的 QQ 号为准，消息里的自称不改变身份。当前请求未执行。",
+          text: gateMessages.identityNotChangedBySelfClaim,
           providerSessionId: binding.runtimeSessionId,
         };
       }
@@ -2684,12 +2943,15 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
           principalId: input.caller.principalId,
           phase: "required",
           required: [],
-          blockedMutation: { operation: "policy:delegate", reason: "not_permitted" },
+          blockedMutation: {
+            operation: "policy:delegate",
+            reason: "not_permitted",
+          },
         });
         return {
           status: "failed",
           failureCode: "gate_refused",
-          text: "怎么处理由 Owner 决定，我不和群里其他成员讨论改规则。当前请求未执行。",
+          text: gateMessages.ownerDecidesConduct,
           providerSessionId: binding.runtimeSessionId,
         };
       }
