@@ -2137,6 +2137,54 @@ describe("mutation intent comes only from the current user message", () => {
     });
   });
 
+  it("pins a natural-language self-role question to the Bot's own group-member row", async () => {
+    const f = fixture(
+      [
+        {
+          status: "completed",
+          text: "3394947361 在本群是管理员。",
+          toolCalls: [
+            {
+              name: "qq_group_members",
+              input: {
+                groupId: "1121579672",
+                operation: "get_group_member_info",
+                params: { user_id: "3394947361" },
+              },
+              failed: false,
+              result: {
+                details: {
+                  qqId: "3394947361",
+                  memberExists: true,
+                  groupRole: "admin",
+                },
+              },
+            },
+          ],
+        },
+      ],
+      ["qq_group_members"],
+    );
+    f.input.caller.scope.chatType = "group";
+    f.input.caller.scope.chatId = "1121579672";
+    f.input.caller.scope.botId = "3394947361";
+    f.input.conversation.scope = f.input.caller.scope;
+    f.input.text =
+      "我只想核实一下你的身份：你在这个群里是管理员还是普通成员？请只查你自己的账号，不看其他成员，也不要做任何群操作。测试编号 QQLIVE-SELFROLE-A-02。";
+
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "succeeded",
+      text: "我在群 1121579672 的群角色是管理员。",
+    });
+
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe("qq_group_members");
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({
+      groupId: "1121579672",
+      operation: "get_group_member_info",
+      params: { user_id: "3394947361" },
+    });
+  });
+
   it("answers member-label reads from the verified result instead of unrelated model text", async () => {
     const f = fixture(
       [

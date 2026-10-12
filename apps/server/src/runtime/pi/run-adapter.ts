@@ -1017,6 +1017,16 @@ function moderationPreconditionsFor(
   return Object.keys(value).length === 0 ? undefined : value;
 }
 
+function botGroupRoleQuestion(text: string): boolean {
+  if (/(?:禁言|解禁|踢出|设置群|修改群|mute|ban)/iu.test(text)) return false;
+  const selfInGroup =
+    /(?:(?:你|机器人|Bot)在(?:当前|本|这个|该)?群(?:里|中)?|(?:你|机器人|Bot)(?:自己的|的)(?:群内|群中|群里)?(?:身份|角色))/iu.test(
+      text,
+    );
+  const asksRole = /(?:管理员|群主|普通成员|群角色|成员角色|成员身份)/u.test(text);
+  return selfInGroup && asksRole;
+}
+
 function requiredToolCall(
   input: ExecutionInput,
   isOwner: boolean,
@@ -1026,6 +1036,19 @@ function requiredToolCall(
   gateMessages: GateMessages = GATE_MESSAGES,
 ): RequiredToolCall | undefined {
   if (input.caller.scope.chatType === "group") {
+    // Pin a Bot self-role read to the trusted Bot ID before tool discovery can include history or unrelated member reads.
+    if (botGroupRoleQuestion(input.text)) {
+      const { botId, chatId } = input.caller.scope;
+      if (/^[1-9]\d{4,14}$/u.test(botId) && /^[1-9]\d{0,15}$/u.test(chatId))
+        return {
+          name: "qq_group_members",
+          input: {
+            groupId: chatId,
+            operation: "get_group_member_info",
+            params: { user_id: botId },
+          },
+        };
+    }
     if (groupHistorySearchRequested(input.text) || groupHistorySearchFollowUpRequested(input)) {
       // A single segmented identifier is a literal query, not prose for the model to reinterpret.
       // Bind it into the required input so a call for a different value cannot satisfy this Run.
@@ -2283,6 +2306,45 @@ function projectMemberProfileReply(
   return `QQ ${userId} 在群 ${String(groupId)} 的${fields.join("，")}。`;
 }
 
+function projectBotGroupRoleReply(
+  text: string,
+  requiredInput: Record<string, unknown>,
+  toolCalls: readonly PiRunResult["toolCalls"][number][],
+): string | undefined {
+  if (!botGroupRoleQuestion(text) || requiredInput.operation !== "get_group_member_info")
+    return undefined;
+  const params = recordFrom(requiredInput.params);
+  const rawUserId = params?.user_id;
+  const groupId = requiredInput.groupId;
+  if (
+    (typeof rawUserId !== "string" && typeof rawUserId !== "number") ||
+    (typeof groupId !== "string" && typeof groupId !== "number")
+  )
+    return undefined;
+  const userId = String(rawUserId);
+  const group = String(groupId);
+  const call = [...toolCalls].reverse().find((candidate) => {
+    if (candidate.name !== "qq_group_members" || candidate.failed !== false) return false;
+    const actualParams = recordFrom(candidate.input.params);
+    return (
+      String(candidate.input.groupId) === group &&
+      candidate.input.operation === "get_group_member_info" &&
+      String(actualParams?.user_id) === userId
+    );
+  });
+  const details = recordFrom(recordFrom(call?.result)?.details);
+  if (details?.memberExists !== true || String(details.qqId) !== userId) return undefined;
+  const role =
+    details.groupRole === "owner"
+      ? "群主"
+      : details.groupRole === "admin"
+        ? "管理员"
+        : details.groupRole === "member"
+          ? "普通成员"
+          : undefined;
+  return role ? `我在群 ${group} 的群角色是${role}。` : undefined;
+}
+
 export class PiRunExecutionAdapter implements RunExecutionAdapter {
   readonly supportsGroup = true;
   readonly supportsTaskStepModel = true;
@@ -3184,6 +3246,26 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
           return {
             status: "failed",
             failureCode: "gate_refused",
+            text: gateMessages.qqFieldsMissing,
+            providerSessionId: binding.runtimeSessionId,
+          };
+        result = { ...result, text: projected };
+      }
+      if (
+        botGroupRoleQuestion(input.text) &&
+        requiredName === "qq_group_members" &&
+        context.requiredToolInput &&
+        result.status === "completed"
+      ) {
+        const projected = projectBotGroupRoleReply(
+          input.text,
+          context.requiredToolInput,
+          observedCalls,
+        );
+        if (!projected)
+          return {
+            status: "failed",
+            failureCode: "required_evidence_missing",
             text: gateMessages.qqFieldsMissing,
             providerSessionId: binding.runtimeSessionId,
           };
