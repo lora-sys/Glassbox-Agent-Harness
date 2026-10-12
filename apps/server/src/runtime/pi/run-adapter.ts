@@ -474,10 +474,47 @@ function parseExplicitGroupModerationClause(
   return unmute ? { target: unmute[1]!, duration: 0 } : undefined;
 }
 
+function normalizeMuteSelector(value: string | undefined): string | undefined {
+  let selector = value?.trim();
+  if (!selector) return undefined;
+  const quotes: Readonly<Record<string, string>> = {
+    '"': '"',
+    "'": "'",
+    "“": "”",
+    "「": "」",
+    "『": "』",
+  };
+  if (quotes[selector[0]!] === selector.at(-1)) selector = selector.slice(1, -1);
+  if (!selector || selector.length > 128 || /\p{Cc}/u.test(selector) || /禁言|闭嘴/u.test(selector))
+    return undefined;
+  return selector;
+}
+
+/** Extract a literal after an explicit nickname or group-card label. */
+function labelledMuteSelector(clause: string): string | null | undefined {
+  const labels = [...clause.matchAll(/(?:群昵称|群名片|昵称|名片)/gu)];
+  if (labels.length === 0) return undefined;
+  if (labels.length > 1) return null;
+  const label =
+    /(?:群昵称|群名片|昵称|名片)(?:\s*(?:是|叫|为|叫做|叫作|[:：])\s*|\s+|(?=["'“「『]))/u;
+  if (!label.test(clause)) return undefined;
+  const match =
+    /(?:群昵称|群名片|昵称|名片)(?:\s*(?:是|叫|为|叫做|叫作|[:：])\s*|\s+|(?=["'“「『]))(?:"([^"]+)"|'([^']+)'|“([^”]+)”|「([^」]+)」|『([^』]+)』|([^，,。！？!?；;\n]+?)(?=\s*(?:的(?:群成员|成员|群员|群友|人|那位|那个人|那个成员|那名群员)|(?:把|将)?(?:禁言|闭嘴))))/u.exec(
+      clause,
+    );
+  if (!match) return null;
+  const quoted = match.slice(1, 6).find((value) => value !== undefined);
+  const unquoted = match[6];
+  if (unquoted !== undefined && /(?:或(?:者)?|还是|和|以及)/u.test(unquoted)) return null;
+  return normalizeMuteSelector(quoted ?? unquoted) ?? null;
+}
+
 /** Extract only a literal target in a single mute clause, never an ID inferred by the model. */
 function namedMuteTarget(text: string): string | undefined {
   const clause = muteActionClause(text);
   if (!clause) return undefined;
+  const labelled = labelledMuteSelector(clause);
+  if (labelled !== undefined) return labelled ?? undefined;
   const explicitRequest = parseExplicitGroupModerationClause(clause);
   if (explicitRequest) return explicitRequest.target;
   if (
@@ -495,18 +532,8 @@ function namedMuteTarget(text: string): string | undefined {
     .replace(/\d{1,9}\s*(?:秒|分钟|分|小时|时|天)\s*$/u, "")
     .trim();
   const match = /^(?:禁言|闭嘴)\s*(.+)$/u.exec(command) ?? /^(.+?)\s*(?:禁言|闭嘴)$/u.exec(command);
-  let selector = match?.[1]?.replace(/^(?:成员|群员|用户)\s*/u, "").trim();
+  const selector = normalizeMuteSelector(match?.[1]?.replace(/^(?:成员|群员|用户)\s*/u, ""));
   if (!selector) return undefined;
-  const quotes: Readonly<Record<string, string>> = {
-    '"': '"',
-    "'": "'",
-    "“": "”",
-    "「": "」",
-    "『": "』",
-  };
-  if (quotes[selector[0]!] === selector.at(-1)) selector = selector.slice(1, -1);
-  if (!selector || selector.length > 128 || /\p{Cc}/u.test(selector) || /禁言|闭嘴/u.test(selector))
-    return undefined;
   // QQ/QQ号 identifies an account when followed by one complete numeric ID. Keep
   // every other literal selector intact for the existing unique nickname resolution.
   const qqIdentifier = /^QQ\s*(?:号)?\s*([1-9]\d{4,14})$/iu.exec(selector);

@@ -5502,6 +5502,46 @@ it.each([
 );
 
 it.each([
+  ["把群里昵称叫 Brian 的成员禁言 30 秒", "Brian", 30],
+  ["请把群名片是「Ripped Space」的群友禁言 2 分钟", "Ripped Space", 120],
+  ["按群昵称 小明 禁言 1 小时", "小明", 3600],
+])(
+  "binds a descriptive group nickname to the exact selector: %s",
+  async (text, memberSelector, duration) => {
+    const empty: PiRunResult = { status: "completed", text: "未执行", toolCalls: [] };
+    const f = fixture([empty, empty], ["qq_group_moderation"]);
+    f.input.caller.scope.chatType = "group";
+    f.input.caller.scope.chatId = "1126022432";
+    f.input.conversation.scope = f.input.caller.scope;
+    f.input.text = text;
+    await f.executor.execute(f.input);
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({
+      groupId: "1126022432",
+      operation: "set_group_ban",
+      memberSelector,
+      params: { duration },
+    });
+  },
+);
+
+it.each([
+  "把群里昵称叫 Brian 或 Amy 的成员禁言 30 秒",
+  "把群名片是 Brian 和 Amy 的群友禁言 30 秒",
+  "把群昵称「Brian」或群名片「Amy」的成员禁言 30 秒",
+])("does not guess between descriptive nickname targets: %s", async (text) => {
+  const f = fixture([], ["qq_group_moderation"]);
+  f.input.caller.scope.chatType = "group";
+  f.input.caller.scope.chatId = "1126022432";
+  f.input.conversation.scope = f.input.caller.scope;
+  f.input.text = text;
+  await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+    status: "failed",
+    failureCode: "gate_refused",
+  });
+  expect(f.run).not.toHaveBeenCalled();
+});
+
+it.each([
   "把 QQ 3654774349 禁言 30 秒。",
   "把 QQ 号 3654774349 禁言 30 秒",
   "把QQ号3654774349禁言30秒",

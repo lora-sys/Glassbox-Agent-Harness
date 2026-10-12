@@ -748,8 +748,11 @@ begins. Durations in unrelated clauses do not change a complete mute request. A 
 cannot silently retarget a different named group.
 
 Nickname/card matching is exact and case-sensitive, with no Unicode normalization,
-whitespace normalization, substring or fuzzy matching. The parser removes only syntax
-quotes and surrounding command whitespace. Multiple matching fields or duplicate records
+whitespace normalization, substring or fuzzy matching. The current-message parser also accepts
+explicit labels such as "把群里昵称叫 Brian 的成员禁言 30 秒" and
+"把群名片是「Ripped Space」的群友禁言 2 分钟". It places only the literal name in
+`memberSelector`; it never asks the model to supply a QQ ID. Unquoted alternatives fail closed.
+The parser removes only syntax quotes and surrounding command whitespace. Multiple matching fields or duplicate records
 for one QQ ID identify one member. Matches across multiple QQ IDs are ambiguous. An
 absent, ambiguous, malformed, or unauthorized roster produces a fixed response asking for
 the member's QQ number; it never triggers a model-chosen fallback target.
