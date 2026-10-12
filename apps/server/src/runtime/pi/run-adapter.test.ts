@@ -4694,6 +4694,29 @@ describe("a factual answer requires the observation it depends on", () => {
     });
   });
 
+  it("does not confuse naming the bot as conversation partner with claiming its identity", async () => {
+    const truthful = nativeRoleFixture("qq_group_admin", "你是谁？", "您是在跟 Lora 对话。");
+    await expect(truthful.executor.execute(truthful.input)).resolves.toMatchObject({
+      status: "succeeded",
+      text: "您是在跟 Lora 对话。",
+    });
+    expect(truthful.run).toHaveBeenCalledOnce();
+
+    for (const reply of ["您是 Lora 的朋友。", "发件人是 Lora 的朋友。"]) {
+      const mention = nativeRoleFixture("qq_group_admin", "你是谁？", reply);
+      await expect(mention.executor.execute(mention.input)).resolves.toMatchObject({
+        status: "succeeded",
+        text: reply,
+      });
+    }
+
+    const impersonation = nativeRoleFixture("qq_group_admin", "早上好", "您是 Lora 本人。");
+    await expect(impersonation.executor.execute(impersonation.input)).resolves.toMatchObject({
+      status: "failed",
+      failureCode: "gate_refused",
+    });
+  });
+
   it("answers a group claim to be a configured name from the channel, not from the message", async () => {
     // The observed failure after the role-word gate shipped: a visitor wrote "我是lora啊" and was
     // answered "知道您是 Lora（3526039967）". "lora" is the Owner's QQ nickname and this channel's

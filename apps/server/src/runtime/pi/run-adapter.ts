@@ -1579,28 +1579,35 @@ function misattributesSender(
     .map((identity) => identity.trim())
     .filter((identity) => identity.length > 0)
     .map((identity) => identity.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"));
-  const named = escaped.length > 0 ? new RegExp(escaped.join("|"), "iu") : undefined;
+  // The attributed span must be the identity itself, not a longer predicate that merely
+  // mentions the identity. In "您是在跟 Lora 对话", Lora is the conversation partner.
+  const namedSpan =
+    escaped.length > 0
+      ? new RegExp(`^(?:${escaped.join("|")})\\s*(?:本人|本尊)?$`, "iu")
+      : undefined;
+  const spanIsNamedIdentity = (span: string): boolean => {
+    const core = span
+      .replace(/[（(][^）)]*[）)]?\s*$/u, "")
+      .replace(/^[\s"'“”‘’「」『』]+|[\s"'“”‘’「」『』]+$/gu, "");
+    return namedSpan?.test(core) ?? false;
+  };
   // A conditional does not assert its premise, so "就算您是 Lora，我也没有禁言能力" is the Run
   // refusing on both branches and asserting the identity on neither.
   const conditional = /(?:就算|即使|哪怕|如果|假如|即便|除非|万一)[^。！？!?；;\n]{0,30}(?:您|你)/u;
-  // An identity the Run attaches to the message's own sender. Two forms, both anchored to a word
-  // that carries the attribution rather than to any distance from a name: an explicit role the
-  // sender is said to occupy, and a sentence that names the message itself as its subject. The
-  // copula may not be negated, which is what separates "发件人就是 Owner" from "发件人不是 Lora".
+  // An identity is attributed to the sender here only when 本人 is attached to a configured name.
+  // Message-subject statements are checked below against the complete predicate after the name.
   const attributesNamedSender =
     escaped.length > 0
       ? new RegExp(
           [
             `(?:作为|身为|来自|属于|正是|就是)[^。！？!?；;，,\\n不没非别勿]{0,8}(?:${escaped.join("|")})[^。！？!?；;，,\\n]{0,8}本人`,
-            `(?:发件人|发送者|对方|此消息|该消息|这条消息|消息来自)[^。！？!?；;，,\\n不没非别勿]{0,4}(?:是|为)[^。！？!?；;，,\\n]{0,8}(?:${escaped.join("|")})`,
           ].join("|"),
           "iu",
         )
       : undefined;
   const senderRolePrefix =
-    /(?:发件人|发送者|对方|此消息|该消息|这条消息|消息来自)[^。！？!?；;，,\n不没非别勿]{0,4}(?:是|为)[^。！？!?；;，,\n]{0,8}$/u;
-  const addressedRolePrefix =
-    /(?:您|你|阁下)[^。！？!?；;，,\n不没非别勿]{0,6}?(?:是|为)[^。！？!?；;，,\n]{0,16}$/u;
+    /(?:发件人|发送者|对方|此消息|该消息|这条消息|消息来自)[^。！？!?；;，,\n不没非别勿]{0,4}(?:是|为)\s*$/u;
+  const addressedRolePrefix = /(?:您|你|阁下)[^。！？!?；;，,\n不没非别勿]{0,6}?(?:是|为)\s*$/u;
   for (const sentence of reply.split(/(?<=[。！？!?；;\n])/u)) {
     if (/[？?]/u.test(sentence)) continue;
     if (conditional.test(sentence)) continue;
@@ -1609,22 +1616,35 @@ function misattributesSender(
     );
     for (const addressed of addressedClaims) {
       const attributed = addressed[1] ?? "";
-      const number = /(\d{5,11})/u.exec(attributed);
+      const number =
+        /^\s*(?:qq\s*号?\s*)?([1-9]\d{4,10})(?!\d)(?:\s*(?:本人|本尊))?\s*(?:$|[（(])/iu.exec(
+          attributed,
+        );
       if (number && observed && number[1] !== observed) return true;
-      if (named?.test(attributed)) return true;
-      if (unobservedRoleMentions(attributed, scope).length > 0) return true;
+      if (spanIsNamedIdentity(attributed)) return true;
     }
     if (attributesNamedSender?.test(sentence)) return true;
-    const unobserved = [
-      ...unobservedRoleMentions(sentence, scope),
-      ...(escaped.length > 0 ? sentence.matchAll(new RegExp(escaped.join("|"), "giu")) : []),
-    ];
+    const roleMentions = unobservedRoleMentions(sentence, scope);
+    const nameMentions =
+      escaped.length > 0 ? [...sentence.matchAll(new RegExp(escaped.join("|"), "giu"))] : [];
     if (
-      unobserved.some((match) => {
+      roleMentions.some((match) => {
         const prefix = sentence.slice(0, match.index);
         return (
           hasIdentityAssertionPrefix(prefix, senderRolePrefix) ||
           hasIdentityAssertionPrefix(prefix, addressedRolePrefix)
+        );
+      })
+    )
+      return true;
+    // A protected name is attributed only when the complete predicate names that identity.
+    if (
+      nameMentions.some((match) => {
+        const prefix = sentence.slice(0, match.index);
+        return (
+          (hasIdentityAssertionPrefix(prefix, senderRolePrefix) ||
+            hasIdentityAssertionPrefix(prefix, addressedRolePrefix)) &&
+          spanIsNamedIdentity(sentence.slice(match.index).replace(/[。！？!?；;，,\n].*$/u, ""))
         );
       })
     )
