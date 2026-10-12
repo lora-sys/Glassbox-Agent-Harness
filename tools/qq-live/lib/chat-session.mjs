@@ -318,7 +318,23 @@ export class ChatSession {
     for (const role of ["driver", "bot"]) {
       try {
         const status = await this.clients[role].call("get_status");
-        accounts[role] = { qq: this.config[role].qq, online: status.online === true };
+        const login = await this.clients[role].call("get_login_info");
+        const observedQQ = id(login?.user_id);
+        const identityMatches = observedQQ === this.config[role].qq;
+        accounts[role] = {
+          qq: this.config[role].qq,
+          observedQQ,
+          identityMatches,
+          online: status.online === true && identityMatches,
+          ...(!identityMatches
+            ? {
+                error: {
+                  code: "LOGIN_IDENTITY_MISMATCH",
+                  message: "NapCat account does not match the configured QQ identity.",
+                },
+              }
+            : {}),
+        };
       } catch (error) {
         accounts[role] = { qq: this.config[role].qq, online: false, error: safeFailure(error) };
       }
