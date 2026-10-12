@@ -742,3 +742,55 @@ describe("fresh bot group role evidence", () => {
     expect(resolveEvidence([expected], [])[0]?.outcome).toBe("not_called");
   });
 });
+
+describe("group member profile evidence", () => {
+  it("binds an Owner-private nickname and card query to the named QQ member", () => {
+    const text = "帮我查一下 OATP 群 1121579672 里 QQ 2498701175 的群昵称和群名片，告诉我就行。";
+    expect(requiredEvidenceFor(ownerPrivate(text))).toEqual([
+      {
+        domain: "group_member_profile",
+        tool: "qq_group_members",
+        input: {
+          groupId: "1121579672",
+          operation: "get_group_member_info",
+          params: { user_id: "2498701175" },
+        },
+      },
+    ]);
+
+    const naturalQuestion =
+      "帮我查一下 OATP 群 1121579672 里 QQ 2498701175 的群昵称和群名片是什么？只告诉我查到的信息，不要修改任何群资料。";
+    expect(requiredEvidenceFor(ownerPrivate(naturalQuestion))).toEqual([
+      {
+        domain: "group_member_profile",
+        tool: "qq_group_members",
+        input: {
+          groupId: "1121579672",
+          operation: "get_group_member_info",
+          params: { user_id: "2498701175" },
+        },
+      },
+    ]);
+  });
+
+  it("does not expose member labels to a group Run", () => {
+    expect(domains(inGroup("查一下本群 QQ 2498701175 的群昵称和群名片"))).not.toContain(
+      "group_member_profile",
+    );
+  });
+
+  it("uses the scoped member list when a profile query does not name a QQ number", () => {
+    expect(
+      requiredEvidenceFor(ownerPrivate("查一下 OATP 群 1121579672 里这个人的群昵称和群名片")),
+    ).toEqual([
+      {
+        domain: "group_member_profile",
+        tool: "qq_group_members",
+        input: {
+          groupId: "1121579672",
+          operation: "get_group_member_list",
+        },
+      },
+    ]);
+  });
+});

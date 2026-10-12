@@ -42,6 +42,7 @@ import {
   capabilityStateQuestion,
   groupHistorySearchRequested,
   groupHistorySearchSender,
+  groupMemberProfileRequest,
   namedGroupId,
   officialSourceVerificationRequested,
   ownerHistorySearchRequested,
@@ -1095,6 +1096,17 @@ function requiredToolCall(
   }
   const groupId = namedGroupId(text);
   if (!groupId) return undefined;
+  const memberProfile = groupMemberProfileRequest(text);
+  if (memberProfile) {
+    return {
+      name: "qq_group_members",
+      input: {
+        groupId,
+        operation: memberProfile.userId ? "get_group_member_info" : "get_group_member_list",
+        ...(memberProfile.userId ? { params: { user_id: memberProfile.userId } } : {}),
+      },
+    };
+  }
   // A question about what a group *contains* is answered by live QQ evidence, not by reading
   // the group's Glassbox configuration. Requiring both would make the Run fail closed on a
   // Tool that cannot answer the question it was asked.
@@ -2175,6 +2187,62 @@ function ownerModelCommand(
   };
 }
 
+function recordFrom(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function projectMemberProfileReply(
+  text: string,
+  requiredInput: Record<string, unknown>,
+  toolCalls: readonly PiRunResult["toolCalls"][number][],
+): string | undefined {
+  const requested = groupMemberProfileRequest(text);
+  const userId = requested?.userId;
+  const params = recordFrom(requiredInput.params);
+  const groupId = requiredInput.groupId;
+  if (
+    !userId ||
+    requiredInput.operation !== "get_group_member_info" ||
+    String(params?.user_id) !== userId ||
+    (typeof groupId !== "string" && typeof groupId !== "number")
+  )
+    return undefined;
+
+  const call = [...toolCalls].reverse().find((candidate) => {
+    if (candidate.name !== "qq_group_members" || candidate.failed !== false) return false;
+    const actualGroupId = candidate.input.groupId;
+    const actualParams = recordFrom(candidate.input.params);
+    return (
+      String(actualGroupId) === String(groupId) &&
+      candidate.input.operation === "get_group_member_info" &&
+      String(actualParams?.user_id) === userId
+    );
+  });
+  const details = recordFrom(recordFrom(call?.result)?.details);
+  if (details?.memberExists !== true || String(details.qqId) !== userId) return undefined;
+
+  const wantNickname = /(?:群昵称|成员昵称|群员昵称|群友昵称)/u.test(text);
+  const wantCard = /(?:群名片|成员名片|群员名片|群友名片)/u.test(text);
+  const label = (field: "nickname" | "card") => {
+    const value = details[field];
+    return typeof value === "string" && value !== "" && value.length <= 64 && !/\p{Cc}/u.test(value)
+      ? value
+      : undefined;
+  };
+  const nickname = wantNickname ? label("nickname") : undefined;
+  const card = wantCard ? label("card") : undefined;
+  if ((wantNickname && !nickname) || (wantCard && !card) || (!wantNickname && !wantCard))
+    return undefined;
+
+  const fields = [
+    ...(nickname ? [`群昵称是 ${nickname}`] : []),
+    ...(card ? [`群名片是 ${card}`] : []),
+  ];
+  return `QQ ${userId} 在群 ${String(groupId)} 的${fields.join("，")}。`;
+}
+
 export class PiRunExecutionAdapter implements RunExecutionAdapter {
   readonly supportsGroup = true;
   readonly supportsTaskStepModel = true;
@@ -3048,6 +3116,29 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
           return {
             status: "failed",
             failureCode: "gate_refused",
+            text: gateMessages.qqFieldsMissing,
+            providerSessionId: binding.runtimeSessionId,
+          };
+        result = { ...result, text: projected };
+      }
+      const memberProfile = groupMemberProfileRequest(input.text);
+      if (
+        memberProfile?.userId &&
+        requiredName === "qq_group_members" &&
+        context.requiredToolInput &&
+        evidence.length === 1 &&
+        evidence[0]?.domain === "group_member_profile" &&
+        result.status === "completed"
+      ) {
+        const projected = projectMemberProfileReply(
+          input.text,
+          context.requiredToolInput,
+          observedCalls,
+        );
+        if (!projected)
+          return {
+            status: "failed",
+            failureCode: "required_evidence_missing",
             text: gateMessages.qqFieldsMissing,
             providerSessionId: binding.runtimeSessionId,
           };

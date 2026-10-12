@@ -44,6 +44,7 @@ export type RequiredEvidenceDomain =
   | "owner_history_search"
   | "group_metadata"
   | "group_members"
+  | "group_member_profile"
   | "bot_group_role"
   | "group_history_page"
   | "group_content"
@@ -121,7 +122,7 @@ const REFUSAL_WORDS = "不要|不用|无需|不需要|请勿|不许|停止|别�
  * 查看 is read as governing 查看 rather than the 查 that 查看 starts with.
  */
 const REQUEST_VERBS =
-  "搜索|查找|查看|查询|检索|列出|列表|显示|告诉|搜|翻|查|看|读|禁言|闭嘴|踢出|踢掉|移出群|删除|上传|设置";
+  "搜索|查找|查看|查询|检索|列出|列表|显示|告诉|搜|翻|查|看|读|禁言|闭嘴|踢出|踢掉|移出群|删除|上传|设置|修改|更改|改动";
 
 /**
  * A negation that governs a request: the request's own verb follows it.
@@ -257,6 +258,22 @@ export function ownerHistorySearchRequested(rawText: string): boolean {
 const READ_VERB =
   /(?:有哪些|有哪几个|有什么|是哪些|是什么|都是谁|多少人|多少个|几个|列表|列出|查看|查询|查一下|看一下|看看|显示|告诉我|现在|当前|最新的|是不是|是否)/u;
 
+const GROUP_MEMBER_PROFILE_NOUN =
+  /(?:群昵称|群名片|成员昵称|成员名片|群员昵称|群员名片|群友昵称|群友名片)/u;
+
+/** A private Owner read of a member label, optionally bound to an exact QQ number. */
+export function groupMemberProfileRequest(text: string): { readonly userId?: string } | undefined {
+  const request = requests(text).find(
+    (candidate) => GROUP_MEMBER_PROFILE_NOUN.test(candidate) && READ_VERB.test(candidate),
+  );
+  if (!request) return undefined;
+  const match =
+    /(?:QQ\s*(?:号)?|(?:成员|群员|群友|用户)\s*(?:QQ\s*(?:号)?)?)\s*([1-9]\d{4,14})/iu.exec(
+      request,
+    );
+  return match ? { userId: match[1] } : {};
+}
+
 /**
  * The verbs that make a message an instruction to change something.
  *
@@ -352,6 +369,8 @@ interface LiveDomain {
    * group. False when the Tool addresses a group the message must name.
    */
   readonly currentGroup: boolean;
+  /** Member labels are visible only to an Owner-private Run. */
+  readonly ownerPrivateOnly?: boolean;
 }
 
 /**
@@ -404,6 +423,14 @@ const LIVE_DOMAINS: readonly LiveDomain[] = Object.freeze([
     nouns: /成员|群员/u,
     operation: "get_group_member_list",
     currentGroup: true,
+  },
+  {
+    domain: "group_member_profile",
+    tool: "qq_group_members",
+    nouns: GROUP_MEMBER_PROFILE_NOUN,
+    requested: (request) => groupMemberProfileRequest(request) !== undefined,
+    currentGroup: true,
+    ownerPrivateOnly: true,
   },
   {
     domain: "group_content",
@@ -513,6 +540,7 @@ export function requiredEvidenceFor(input: RequiredEvidenceInput): RequiredEvide
   const text = requestClauses(input.text);
   const required: RequiredEvidence[] = [];
   const group = namedGroupId(text);
+  const memberProfile = groupMemberProfileRequest(text);
   const explicitUrl = /https?:\/\/[^\s，,。！？!?]+/iu.exec(text)?.[0];
   const explicitBrowser = /(?:浏览器|\bbrowser\b)/iu.test(text);
   if (explicitBrowser && explicitUrl && /(?:打开|访问|open|navigate)/iu.test(text)) {
@@ -593,7 +621,14 @@ export function requiredEvidenceFor(input: RequiredEvidenceInput): RequiredEvide
       tool: domain.tool,
       input: {
         ...(domain.currentGroup && group !== undefined ? { groupId: group } : {}),
-        ...(domain.operation === undefined ? {} : { operation: domain.operation }),
+        ...(domain.domain === "group_member_profile"
+          ? {
+              operation: memberProfile?.userId ? "get_group_member_info" : "get_group_member_list",
+              ...(memberProfile?.userId ? { params: { user_id: memberProfile.userId } } : {}),
+            }
+          : domain.operation === undefined
+            ? {}
+            : { operation: domain.operation }),
         ...(domain.domain === "bot_group_role" ? { params: { user_id: input.botId } } : {}),
       },
     });
@@ -642,7 +677,7 @@ function liveDomainsRequested(
   if (asking.length === 0) return [];
   return LIVE_DOMAINS.filter(
     (domain) =>
-      (scope === "named-group" || domain.currentGroup) &&
+      (scope === "named-group" || (domain.currentGroup && !domain.ownerPrivateOnly)) &&
       asking.some(
         (request) =>
           domain.nouns.test(request) && (domain.requested?.(request) ?? READ_VERB.test(text)),

@@ -2094,6 +2094,167 @@ describe("mutation intent comes only from the current user message", () => {
     });
   });
 
+  it("routes a private member nickname and card query to the exact live member read", async () => {
+    const f = fixture(
+      [
+        {
+          status: "completed",
+          text: "群昵称是 Brian，群名片是 3526039967。",
+          toolCalls: [
+            {
+              name: "qq_group_members",
+              input: {
+                groupId: "1121579672",
+                operation: "get_group_member_info",
+                params: { user_id: "2498701175" },
+              },
+              failed: false,
+              result: {
+                details: {
+                  qqId: "2498701175",
+                  memberExists: true,
+                  groupRole: "member",
+                  card: "3526039967",
+                  nickname: "Brian",
+                },
+              },
+            },
+          ],
+        },
+      ],
+      ["qq_group_members"],
+    );
+    f.input.text = "帮我查一下 OATP 群 1121579672 里 QQ 2498701175 的群昵称和群名片，告诉我就行。";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "succeeded",
+      text: "QQ 2498701175 在群 1121579672 的群昵称是 Brian，群名片是 3526039967。",
+    });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe("qq_group_members");
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({
+      groupId: "1121579672",
+      operation: "get_group_member_info",
+      params: { user_id: "2498701175" },
+    });
+  });
+
+  it("answers member-label reads from the verified result instead of unrelated model text", async () => {
+    const f = fixture(
+      [
+        {
+          status: "completed",
+          text: "群 1121579672 信息（工具实测返回）：OATP，当前成员数 5。",
+          toolCalls: [
+            {
+              name: "qq_group_members",
+              input: {
+                groupId: "1121579672",
+                operation: "get_group_member_info",
+                params: { user_id: "2498701175" },
+              },
+              failed: false,
+              result: {
+                details: {
+                  qqId: "2498701175",
+                  memberExists: true,
+                  groupRole: "member",
+                  card: "3526039967",
+                  nickname: "Brian",
+                },
+              },
+            },
+            {
+              name: "qq_groups",
+              input: { groupId: "1121579672", operation: "get_group_info" },
+              failed: false,
+              result: {
+                details: {
+                  status: "ok",
+                  data: { group_id: 1121579672, group_name: "OATP", member_count: 5 },
+                },
+              },
+            },
+          ],
+        },
+      ],
+      ["qq_group_members", "qq_groups"],
+    );
+    f.input.text =
+      "帮我查一下 OATP 群 1121579672 里 QQ 2498701175 的群昵称和群名片是什么？只告诉我查到的信息，不要修改任何群资料。";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "succeeded",
+      text: "QQ 2498701175 在群 1121579672 的群昵称是 Brian，群名片是 3526039967。",
+    });
+  });
+
+  it("withholds a member-label answer when QQ omits a requested field", async () => {
+    const f = fixture(
+      [
+        {
+          status: "completed",
+          text: "群昵称是 Lora，群名片是 lora。",
+          toolCalls: [
+            {
+              name: "qq_group_members",
+              input: {
+                groupId: "1121579672",
+                operation: "get_group_member_info",
+                params: { user_id: "2498701175" },
+              },
+              failed: false,
+              result: {
+                details: {
+                  qqId: "2498701175",
+                  memberExists: true,
+                  groupRole: "member",
+                  nickname: "Brian",
+                },
+              },
+            },
+          ],
+        },
+      ],
+      ["qq_group_members"],
+    );
+    f.input.text = "查一下群 1121579672 里 QQ 2498701175 的群昵称和群名片。";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "failed",
+      failureCode: "required_evidence_missing",
+      text: "未能从 QQ 获取完整的请求字段，因此无法确认。",
+    });
+  });
+
+  it("routes an unqualified private member-label query to the named group's member list", async () => {
+    const f = fixture(
+      [
+        {
+          status: "completed",
+          text: "群昵称是 Brian。",
+          toolCalls: [
+            {
+              name: "qq_group_members",
+              input: {
+                groupId: "1121579672",
+                operation: "get_group_member_list",
+              },
+              failed: false,
+            },
+          ],
+        },
+      ],
+      ["qq_group_members"],
+    );
+    f.input.text = "查一下 OATP 群 1121579672 里 Brian 的群昵称和群名片。";
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+      status: "succeeded",
+      text: "群昵称是 Brian。",
+    });
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolName).toBe("qq_group_members");
+    expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({
+      groupId: "1121579672",
+      operation: "get_group_member_list",
+    });
+  });
+
   it("requires the exact operation on the exact group the current Owner message names", async () => {
     const f = fixture([
       {
