@@ -521,7 +521,11 @@ describe("group history delivery authority", () => {
       undefined,
       {} as never,
     );
-    expect(result.details).toEqual({ role: "qq_group_member" });
+    expect(result.details).toEqual({
+      qqId: "10004",
+      memberExists: true,
+      groupRole: "member",
+    });
 
     await application.setGroupCategory(context, {
       groupId: configuredGroup,

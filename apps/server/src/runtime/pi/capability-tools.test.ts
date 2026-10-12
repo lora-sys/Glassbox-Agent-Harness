@@ -669,12 +669,14 @@ it("binds a group Run to its own group and refuses a model-supplied one", async 
         caller: { principalId: "owner", scope: ownerGroupScope },
         runId: accepted.run.id,
         conversationId: accepted.conversation.id,
+        recordQqToolExecutionInput: async () => {},
       }),
       isCategoryEnabled: async (conn, groupId, category) => {
         const stored = await store.capabilities.read(conn, groupId);
         return stored?.policy.categories[category] === true;
       },
       invoke: async (input) => {
+        await input.recordVerifiedInput?.();
         calls.push({ action: input.action, params: input.params });
         if (input.action === "get_group_member_list")
           return [
@@ -691,6 +693,13 @@ it("binds a group Run to its own group and refuses a model-supplied one", async 
               mute_time: 0,
             },
           ];
+        if (input.action === "get_group_member_info")
+          return {
+            group_id: input.params.group_id,
+            user_id: input.params.user_id,
+            role: "member",
+            nickname: "private-nickname",
+          };
         return { ok: true, action: input.action };
       },
       search: async () => ({ capabilities: [] }),
@@ -708,6 +717,12 @@ it("binds a group Run to its own group and refuses a model-supplied one", async 
     expect(result.content?.[0]?.text).toBe('{"memberCount":2}');
     expect(JSON.stringify(result)).not.toContain("private-nickname");
     expect(JSON.stringify(result)).not.toContain("10004");
+    const oneMember = await call(members, {
+      operation: "get_group_member_info",
+      params: { user_id: 10004 },
+    });
+    expect(oneMember.details).toEqual({ qqId: "10004", memberExists: true, groupRole: "member" });
+    expect(JSON.stringify(oneMember)).not.toContain("private-nickname");
   } finally {
     await store.close();
   }
@@ -1090,7 +1105,7 @@ it("reaches the provider only when policy and grant agree, binding group_id serv
       operation: "get_group_member_list",
     });
     expect(calls).toEqual([{ action: "get_group_member_list", params: { group_id: 100 } }]);
-    expect(result.details).toEqual({ memberCount: 2 });
+    expect(result.details).toMatchObject({ memberCount: 2 });
   } finally {
     await store.close();
   }
@@ -1117,7 +1132,7 @@ it("fails closed when the group member provider returns an unexpected shape", as
   }
 });
 
-it("validates every member identity before returning only the aggregate count", async () => {
+it("validates member identities before returning Owner-private details", async () => {
   const { store, accepted } = await fixture();
   try {
     await enableCategory(store, "group.members");
@@ -1127,6 +1142,7 @@ it("validates every member identity before returning only the aggregate count", 
       [{ user_id: "not-a-qq-id" }],
       [{ user_id: 0 }],
       [{ user_id: 10004 }, { user_id: 10004 }],
+      [{ user_id: 10004, role: "unknown" }],
     ]) {
       const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
       const created = tools(store, accepted, calls, undefined, malformed);
@@ -1148,14 +1164,40 @@ it("validates every member identity before returning only the aggregate count", 
       groupId: "100",
       operation: "get_group_member_list",
     });
-    expect(result.details).toEqual({ memberCount: 0 });
-    expect(result.content?.[0]?.text).toBe('{"memberCount":0}');
+    expect(result.details).toEqual({ memberCount: 0, members: [], truncated: false });
+    expect(result.content?.[0]?.text).toBe('{"memberCount":0,"members":[],"truncated":false}');
   } finally {
     await store.close();
   }
 });
 
-it("projects a member-info read to the verified native role only", async () => {
+it("shows bounded member details only in the Owner's private chat", async () => {
+  const { store, accepted } = await fixture();
+  try {
+    await enableCategory(store, "group.members");
+    await grantGroupAction(store, "group:members:read", "100");
+    const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
+    const created = tools(store, accepted, calls);
+    const result = await call(toolByName(created, "qq_group_members"), {
+      groupId: "100",
+      operation: "get_group_member_list",
+    });
+    expect(result.details).toEqual({
+      memberCount: 2,
+      members: [
+        { qqId: "10004", groupRole: "member", nickname: "private-nickname" },
+        { qqId: "10005", groupRole: "admin", nickname: "another-private-nickname" },
+      ],
+      truncated: false,
+    });
+    expect(JSON.stringify(result)).not.toContain("mute_time");
+    expect(JSON.stringify(result)).not.toContain("123");
+  } finally {
+    await store.close();
+  }
+});
+
+it("projects one verified member as an existing member with an explicit group role", async () => {
   const { store, accepted } = await fixture();
   try {
     await enableCategory(store, "group.members");
@@ -1173,11 +1215,17 @@ it("projects a member-info read to the verified native role only", async () => {
         params: { group_id: 100, user_id: 10004 },
       },
     ]);
-    expect(result.details).toEqual({ role: "qq_group_member" });
-    expect(result.content?.[0]?.text).toBe('{"role":"qq_group_member"}');
-    expect(JSON.stringify(result)).not.toContain("private-nickname");
-    expect(JSON.stringify(result)).not.toContain("private-card");
-    expect(JSON.stringify(result)).not.toContain("10004");
+    expect(result.details).toEqual({
+      qqId: "10004",
+      memberExists: true,
+      groupRole: "member",
+      card: "private-card",
+      nickname: "private-nickname",
+    });
+    expect(result.content?.[0]?.text).toBe(
+      '{"qqId":"10004","memberExists":true,"groupRole":"member","card":"private-card","nickname":"private-nickname"}',
+    );
+    expect(JSON.stringify(result)).not.toContain("mute_time");
   } finally {
     await store.close();
   }

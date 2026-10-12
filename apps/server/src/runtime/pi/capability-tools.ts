@@ -884,6 +884,16 @@ async function resolveModerationMember(
  * binding, the operation allowlist, the Owner-policy gate and the mutation-intent gate have
  * exactly one implementation.
  */
+function projectedMemberLabels(member: Record<string, unknown>) {
+  const label = (field: "card" | "nickname") => {
+    const text = member[field];
+    return typeof text === "string" && text.length <= 64 && !/\p{Cc}/u.test(text) && text
+      ? { [field]: text }
+      : {};
+  };
+  return { ...label("card"), ...label("nickname") };
+}
+
 async function executeProviderCall(
   capability: QqCapability,
   params: CapabilityToolInput,
@@ -1102,10 +1112,9 @@ async function executeProviderCall(
     return { botId: safeQqId(result.user_id) };
   }
   if (capability.tool === "qq_group_members" && action === "get_group_member_list") {
-    // The request is authorized to read group membership, but that does not make every
-    // provider profile field necessary or safe to expose to a group audience. Keep the
-    // model-visible result at the aggregate level. Fail closed on unexpected provider
-    // shapes so a future protocol change cannot fall back to raw member records.
+    // Group audiences receive only the count. The Owner's private chat may receive a
+    // bounded identity, role and display-name projection for explicit member inspection.
+    // Never fall back to raw provider rows when the response shape changes.
     if (
       !Array.isArray(result) ||
       result.some((member) => !isRecord(member) || !safeQqId(member.user_id))
@@ -1116,11 +1125,23 @@ async function executeProviderCall(
     );
     if (new Set(memberIds).size !== memberIds.length)
       throw new ProviderCallError("provider_failed", "invalid_response");
-    return { memberCount: result.length };
+    if (context.caller.principalId !== "owner" || context.caller.scope.chatType !== "private")
+      return { memberCount: result.length };
+    const members = result.slice(0, 50).map((value) => {
+      const member = value as Record<string, unknown>;
+      if (member.role !== "owner" && member.role !== "admin" && member.role !== "member")
+        throw new ProviderCallError("provider_failed", "invalid_response");
+      return {
+        qqId: safeQqId(member.user_id)!,
+        groupRole: member.role,
+        ...projectedMemberLabels(member),
+      };
+    });
+    return { memberCount: result.length, members, truncated: result.length > members.length };
   }
   if (capability.tool === "qq_group_members" && action === "get_group_member_info") {
-    // The model requests one member, but only the verified native role is needed by the
-    // authorization surface. Match both identities before disclosing even that projection.
+    // Match both native identities before reporting existence and group role. Explicit
+    // field names keep the member's role distinct from the Tool's permission category.
     const expectedGroupId = safeQqId(providerParams.group_id);
     const expectedUserId = safeQqId(providerParams.user_id);
     if (
@@ -1132,13 +1153,10 @@ async function executeProviderCall(
       (result.role !== "owner" && result.role !== "admin" && result.role !== "member")
     )
       throw new ProviderCallError("provider_failed", "invalid_response");
-    const role =
-      result.role === "owner"
-        ? "qq_group_owner"
-        : result.role === "admin"
-          ? "qq_group_admin"
-          : "qq_group_member";
-    return { role };
+    const identity = { qqId: expectedUserId, memberExists: true, groupRole: result.role };
+    if (context.caller.principalId !== "owner" || context.caller.scope.chatType !== "private")
+      return identity;
+    return { ...identity, ...projectedMemberLabels(result) };
   }
   return result;
 }

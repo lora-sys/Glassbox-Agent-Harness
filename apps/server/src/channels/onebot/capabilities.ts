@@ -106,7 +106,8 @@ export const QQ_CAPABILITIES: readonly QqCapability[] = [
       group("get_group_member_list", ["group_id"]),
       group("get_group_member_info", ["group_id", "user_id", "no_cache"], ["group_id", "user_id"]),
     ],
-    description: "Read the member count of a managed group or one member's verified QQ role.",
+    description:
+      "Read a managed group's member count, bounded Owner-private member details, or one member's verified QQ group role.",
   },
   {
     tool: "qq_group_history",

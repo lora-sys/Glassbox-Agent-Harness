@@ -395,7 +395,11 @@ function muteActionClause(text: string): string | undefined {
   const clauses = text.split(/[，,。！？!?；;\n]/u).filter((part) => /禁言|闭嘴/u.test(part));
   const requests = clauses.filter(
     (clause) =>
-      !/(?:目前|当前|现在|尚未|此前).{0,12}(?:没有|未|不).{0,8}(?:被)?(?:禁言|闭嘴)/u.test(clause),
+      !/(?:目前|当前|现在|尚未|此前).{0,12}(?:没有|未|不).{0,8}(?:被)?(?:禁言|闭嘴)/u.test(
+        clause,
+      ) &&
+      !/禁言(?:功能|能力|权限|接口)/u.test(clause) &&
+      !/^\s*只禁言(?:这个|该)(?:账号|人|成员)\s*$/u.test(clause),
   );
   if (requests.length !== 1) return undefined;
   const actions = requests.filter((clause) => {
@@ -485,6 +489,7 @@ function namedMuteTarget(text: string): string | undefined {
     .trim()
     .replace(/^(?:(?:请|麻烦|帮我|马上|现在)\s*)+/u, "")
     .replace(/^(?:把|将|给|对)\s*/u, "")
+    .replace(/^本群\s*/u, "")
     .replace(/^群\s*[1-9]\d{4,15}\s*(?:里的|的|里|中)?\s*/u, "")
     .replace(/^(?:把|将|给|对)\s*/u, "")
     .replace(/\d{1,9}\s*(?:秒|分钟|分|小时|时|天)\s*$/u, "")
@@ -1075,10 +1080,17 @@ function requiredToolCall(
     new RegExp(`(?:^|[^\\w.])${category.replaceAll(".", "\\.")}(?=$|[^\\w.])`, "iu").test(text),
   )?.category;
   if (explicitCategory || /能力|capability/iu.test(text)) {
+    // A revocation may mention the earlier enable that it is undoing. Treat that
+    // historical verb as context, not as a second requested mutation.
+    const revokingPriorEnable =
+      /(?:撤销|撤回|收回)[^。！？\n]{0,40}(?:刚才|之前|此前|上次|上一轮)?[^。！？\n]{0,12}(?:启用|开启|打开|允许)/u.test(
+        text,
+      );
     const enabling =
-      /启用|开启|打开|允许|恢复|加入/u.test(text) ||
-      /^(?:请|帮我)?\s*开(?=\s*(?:群\s*)?[1-9]\d{4,15})/u.test(text);
-    const disabling = /关闭|停用|禁用|取消|移除/u.test(text);
+      !revokingPriorEnable &&
+      (/启用|开启|打开|允许|恢复|加入/u.test(text) ||
+        /^(?:请|帮我)?\s*开(?=\s*(?:群\s*)?[1-9]\d{4,15})/u.test(text));
+    const disabling = /关闭|停用|禁用|取消|移除|撤销|撤回|收回/u.test(text);
     const refused =
       /(?:不要|不用|无需|不需要|请勿|不许|停止|别|禁止)\s*(?:再)?\s*(?:开|启用|开启|打开|允许|恢复|加入|关闭|停用|禁用|取消|移除)/u.test(
         text,
@@ -1820,6 +1832,16 @@ function blockedMutationRequest(
     )
       return { operation: "set_group_ban", reason: "incomplete_parameters" };
   }
+  // A trusted ordinary-member role cannot authorize moderation. Refuse a concrete mute
+  // command before the model can turn its missing Tool into a false statement about the
+  // bot's or the Owner's abilities.
+  if (
+    input.caller.scope.chatType === "group" &&
+    input.caller.scope.nativeGroupRole?.role === "qq_group_member" &&
+    muteActionClause(input.text) &&
+    namedMuteDuration(input.text) !== undefined
+  )
+    return { operation: "set_group_ban", reason: "not_permitted" };
   if (explicitModelChangeCommand(input.text)) {
     if (input.caller.scope.chatType === "group")
       return { operation: "model:switch", reason: "not_permitted_in_group" };

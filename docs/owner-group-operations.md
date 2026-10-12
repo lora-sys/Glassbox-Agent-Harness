@@ -772,8 +772,12 @@ The existing one-attempt mutation gate applies even after an unknown or failed p
 response. Cancellation during resolution or role verification prevents dispatch.
 
 The application verifies OneBot success before projecting `get_login_info`,
-`get_group_member_list` and `get_group_member_info` response data. Their Tools still check
-identity and response shape before returning a bot ID, count or role. All other provider
+`get_group_member_list` and `get_group_member_info` response data. Group Runs receive only
+the member count. An authorized Owner-private Run may receive at most 50 member QQ IDs,
+native group roles, group cards and nicknames, together with the full count and a truncation
+flag. A single-member query reports the verified QQ ID, existence and native group role,
+with a bounded group card and nickname only in the Owner's private chat. The Tools check
+identity and response shape and exclude other provider profile fields. All other provider
 operations retain their existing success-envelope contract. Failed and unknown envelopes
 are never treated as successful data, and nested objects with a `data` key are not unwrapped.
 

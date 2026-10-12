@@ -195,8 +195,12 @@ it.each([
   {
     name: "qq_group_members",
     input: { groupId: "10003", operation: "get_group_member_list" },
-    data: [{ user_id: 10004, nickname: "private-member-name" }],
-    expected: { memberCount: 1 },
+    data: [{ user_id: 10004, role: "member", nickname: "private-member-name" }],
+    expected: {
+      memberCount: 1,
+      members: [{ qqId: "10004", groupRole: "member", nickname: "private-member-name" }],
+      truncated: false,
+    },
   },
   {
     name: "qq_group_members",
@@ -211,7 +215,12 @@ it.each([
       role: "admin",
       nickname: "private-member-name",
     },
-    expected: { role: "qq_group_admin" },
+    expected: {
+      qqId: "10004",
+      memberExists: true,
+      groupRole: "admin",
+      nickname: "private-member-name",
+    },
   },
 ])(
   "projects verified OneBot data through ManagementApplication and the actual Tool: $input.operation",
@@ -221,7 +230,8 @@ it.each([
       f.response = { status: "ok", data };
       const result = await f.call(name, input);
       expect(result.details).toEqual(expected);
-      expect(JSON.stringify(result)).not.toContain("private-");
+      if (name === "qq_account_status") expect(JSON.stringify(result)).not.toContain("private-");
+      else expect(JSON.stringify(result)).toContain("private-member-name");
     } finally {
       await f.close();
     }

@@ -24,13 +24,13 @@ import { muteUntil } from "./moderation.mjs";
 import { writeDurableReport } from "./durable-report.mjs";
 
 const SOURCE_PIN = Object.freeze({
-  commit: "40e279855b34962b08942038ae039eb28792a8ba",
-  sourceTreeSha256: "780d9861d93bec86f6afc0c832f9272761964b617a96f455816d86fcb25b37c5",
+  commit: "7ad1f9e8481ee540bacc2117af12569e39e61315",
+  sourceTreeSha256: "05cf20f195badd1b1c34e11b74c365c1a7ebeb87dc946289033353ca7ee1f99e",
   executionFiles: Object.freeze({
     "apps/server/src/runtime/pi/protected-tools.ts":
-      "16c29c45197407c46f3138543c88301c8acac97d1a9240725beb8cd4ec643fcd",
+      "1ae70be50003194a61d94e636bb130b35d48e4079f27bbfe86b434ae1aacaf25",
     "apps/server/src/runtime/pi/capability-tools.ts":
-      "e74a55c6ff047cb21defeeedddbc6d67fed7392ad49720d9e08a3fc830b42680",
+      "9e50e2b1305d815ed9a41ac515f939276cde0fdbaa8f22236f421f6e673b5367",
   }),
 });
 const STOP_TEXT =

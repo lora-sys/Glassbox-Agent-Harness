@@ -1,9 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { lstat, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { digest, toolManifestDigest } from "../lib/core.mjs";
 import {
@@ -342,9 +343,8 @@ test("binds the producer STARTED attempt shape to the failed report", () => {
   assert.throws(() => verifyModerationAttempt(attempt, report, "different-run"));
 });
 
-const v9Checkout = "/home/yanbingzhao/src/glassbox-qq-live-frozen-input-evidence-v9-20261008";
-const v9Commit = "40e279855b34962b08942038ae039eb28792a8ba";
-const v9Tree = "780d9861d93bec86f6afc0c832f9272761964b617a96f455816d86fcb25b37c5";
+const v9Commit = "7ad1f9e8481ee540bacc2117af12569e39e61315";
+const v9Tree = "05cf20f195badd1b1c34e11b74c365c1a7ebeb87dc946289033353ca7ee1f99e";
 
 async function planEntryFixture(t, { attemptStatus = "STARTED" } = {}) {
   const root = await mkdtemp(join(tmpdir(), "moderation-recovery-entry-"));
@@ -352,11 +352,25 @@ async function planEntryFixture(t, { attemptStatus = "STARTED" } = {}) {
   const out = join(root, "out");
   const locksDirectory = join(root, "locks");
   const dataDirectory = join(root, "data");
+  const v9Checkout = join(root, "source");
   await Promise.all([
     mkdir(out, { mode: 0o700 }),
     mkdir(locksDirectory, { mode: 0o700 }),
     mkdir(dataDirectory, { mode: 0o700 }),
+    mkdir(v9Checkout, { mode: 0o700 }),
   ]);
+  for (const relative of [
+    "apps/server/src/runtime/pi/protected-tools.ts",
+    "apps/server/src/runtime/pi/capability-tools.ts",
+  ]) {
+    const destination = join(v9Checkout, relative);
+    await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
+    const pinnedSource = execFileSync("git", ["show", `${v9Commit}:${relative}`], {
+      cwd: process.cwd(),
+      maxBuffer: 5 * 1024 * 1024,
+    });
+    await writeFile(destination, pinnedSource, { mode: 0o600 });
+  }
 
   const startMs = Date.now() - 20_000;
   const startedAt = new Date(startMs).toISOString();

@@ -2652,6 +2652,7 @@ describe("mutation intent comes only from the current user message", () => {
 
   it.each([
     ["关闭群 1121579672 的 group.moderate", false],
+    ["立即撤销刚才为本次实机测试开启的 OATP 群 1121579672 group.moderate 能力", false],
     ["开启群 1121579672 的 group.members", true],
     ["给 1121579672 禁用群管理能力", false],
   ])("pins the policy category and direction for %s", async (text, enabled) => {
@@ -3957,6 +3958,28 @@ describe("a factual answer requires the observation it depends on", () => {
     });
     return { ...f, executor: new PiRunExecutionAdapter(f.runtime, options) };
   }
+
+  it.each(["给@1365222923 禁言1分钟", "给3394947361禁言1分钟"])(
+    "refuses a native ordinary member's mute command before the model: %s",
+    async (text) => {
+      const f = memberFixture([]);
+      f.input.caller.principalId = "qq-visitor-2498701175";
+      f.input.caller.scope.senderId = "2498701175";
+      f.input.caller.scope.nativeGroupRole = {
+        role: "qq_group_member",
+        source: "onebot_message_sender",
+        observedAt: "2026-10-11T13:25:17.000Z",
+      };
+      f.input.text = text;
+      await expect(f.executor.execute(f.input)).resolves.toMatchObject({
+        status: "failed",
+        failureCode: "gate_refused",
+        runtimeAttempted: false,
+        text: "该操作未授权，未执行。",
+      });
+      expect(f.run).not.toHaveBeenCalled();
+    },
+  );
 
   const members = (overrides: Record<string, unknown> = {}): PiRunResult => ({
     status: "completed",
@@ -5483,6 +5506,7 @@ it.each([
   "把 QQ 号 3654774349 禁言 30 秒",
   "把QQ号3654774349禁言30秒",
   "禁言 QQ 3654774349 30 秒",
+  "请把本群 QQ 3654774349 禁言 30 秒，用来验证你作为管理员的禁言功能。只禁言这个账号，不要动其他人。",
 ])("binds an explicit QQ identifier as a numeric target: %s", async (text) => {
   const empty: PiRunResult = { status: "completed", text: "未执行", toolCalls: [] };
   const f = fixture([empty, empty], ["qq_group_moderation"]);
