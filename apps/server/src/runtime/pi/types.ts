@@ -163,6 +163,8 @@ export interface PiRunContext {
   authorizeBotGroupRoleObservation?: () => Promise<void>;
   callerIdentity?: {
     senderId: string;
+    /** Trusted QQ identity of the configured bot account for this Channel. */
+    botId?: string;
     isOwner: boolean;
     /** True when this Conversation's location is shared by several senders. */
     sharedConversation: boolean;

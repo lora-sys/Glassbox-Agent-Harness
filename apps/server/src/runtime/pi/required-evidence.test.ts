@@ -93,6 +93,27 @@ describe("required evidence for a live QQ fact", () => {
     ]);
   });
 
+  it("uses the group-info count for aggregate-only member questions", () => {
+    const request =
+      "帮我看看 OATP 群 1121579672 目前大约有多少成员，只告诉我总人数，不要列出成员，也不要改群设置。";
+    expect(requiredEvidenceFor(ownerPrivate(request))).toEqual([
+      {
+        domain: "group_member_count",
+        tool: "qq_groups",
+        input: { groupId: "1121579672", operation: "get_group_info" },
+      },
+    ]);
+    expect(
+      requiredEvidenceFor(inGroup("请告诉我本群大约有多少成员，只说数量，不要列名单。")),
+    ).toEqual([
+      {
+        domain: "group_member_count",
+        tool: "qq_groups",
+        input: { operation: "get_group_info" },
+      },
+    ]);
+  });
+
   it("requires the notice read for a question about the notice", () => {
     expect(requiredEvidenceFor(inGroup("群公告是什么？"))).toEqual([
       {
@@ -654,6 +675,30 @@ describe("resolving required evidence against a Run's calls", () => {
       { domain: "browser_screenshot", tool: "browser", outcome: "not_called" },
     ]);
     expect(unobservedEvidence(missingArtifact)).toHaveLength(1);
+  });
+
+  it("requires a verified provider member_count for an aggregate member-count answer", () => {
+    const count = requiredEvidenceFor(
+      ownerPrivate("查询 OATP 群 1121579672 目前有多少成员，只告诉我人数。"),
+    );
+    expect(count).toEqual([
+      {
+        domain: "group_member_count",
+        tool: "qq_groups",
+        input: { groupId: "1121579672", operation: "get_group_info" },
+      },
+    ]);
+    const call: ObservedToolCall = {
+      name: "qq_groups",
+      input: { groupId: "1121579672", operation: "get_group_info" },
+      failed: false,
+      outcome: "success",
+      result: { member_count: 5 },
+    };
+    expect(resolveEvidence(count, [call])[0]?.outcome).toBe("success");
+    expect(resolveEvidence(count, [{ ...call, result: { group_name: "OATP" } }])[0]?.outcome).toBe(
+      "not_called",
+    );
   });
 });
 

@@ -22,6 +22,7 @@ import {
   composeToolDescriptorCatalog,
   describeToolDrift,
   describeToolSurface,
+  narrowToolCandidatesToRequiredTools,
   type ToolDescriptor,
   toolDescriptor,
   toolOperationalState,
@@ -722,6 +723,23 @@ describe("P5 effective Tool surface snapshot", () => {
 
     expect(surface.selected.map((entry) => entry.name)).toEqual(["qq_group_history"]);
     expect(surface.undescribed).toEqual(["mystery_tool"]);
+  });
+});
+
+describe("request-selected Tool surfaces", () => {
+  it("narrows only authorized candidates and preserves authorization decisions", () => {
+    const candidates = [
+      { name: "qq_groups", exclusion: null },
+      { name: "qq_group_members", exclusion: null },
+      { name: "qq_group_moderation", exclusion: "policy_disabled" as const },
+    ];
+
+    expect(narrowToolCandidatesToRequiredTools(candidates, ["qq_groups"])).toEqual([
+      { name: "qq_groups", exclusion: null },
+      { name: "qq_group_members", exclusion: "not_selected_for_request" },
+      { name: "qq_group_moderation", exclusion: "policy_disabled" },
+    ]);
+    expect(narrowToolCandidatesToRequiredTools(candidates, [])).toEqual(candidates);
   });
 });
 

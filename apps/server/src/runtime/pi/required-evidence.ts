@@ -43,6 +43,7 @@ export type RequiredEvidenceDomain =
   | "group_history_search"
   | "owner_history_search"
   | "group_metadata"
+  | "group_member_count"
   | "group_members"
   | "group_member_profile"
   | "bot_group_role"
@@ -261,6 +262,12 @@ const READ_VERB =
 const GROUP_MEMBER_PROFILE_NOUN =
   /(?:群昵称|群名片|成员昵称|成员名片|群员昵称|群员名片|群友昵称|群友名片)/u;
 
+function groupMemberCountRequest(request: string): boolean {
+  return /(?:群|本群|该群)[^。！？\n]{0,48}(?:多少(?:个)?(?:群员|成员)|(?:群员|成员)(?:总数|人数|数量)|总人数)/u.test(
+    request,
+  );
+}
+
 /** A private Owner read of a member label, optionally bound to an exact QQ number. */
 export function groupMemberProfileRequest(text: string): { readonly userId?: string } | undefined {
   const request = requests(text).find(
@@ -418,9 +425,18 @@ const LIVE_DOMAINS: readonly LiveDomain[] = Object.freeze([
     currentGroup: true,
   },
   {
+    domain: "group_member_count",
+    tool: "qq_groups",
+    nouns: /群|本群|该群/u,
+    requested: (request) => groupMemberCountRequest(request) && READ_VERB.test(request),
+    operation: "get_group_info",
+    currentGroup: true,
+  },
+  {
     domain: "group_members",
     tool: "qq_group_members",
     nouns: /成员|群员/u,
+    requested: (request) => !groupMemberCountRequest(request) && READ_VERB.test(request),
     operation: "get_group_member_list",
     currentGroup: true,
   },
@@ -470,6 +486,7 @@ const LIVE_DOMAINS: readonly LiveDomain[] = Object.freeze([
     // not about the group.
     nouns:
       /(?:群|本群|该群)\s*(?:[1-9]\d{4,15}\s*)?(?:的|当前|现在|目前)?\s*(?:资料|信息|名称|简介|头像|容量|(?:实际)?人数|有多少人|多少人)|\bget_group_info\b/iu,
+    requested: (request) => !groupMemberCountRequest(request) && READ_VERB.test(request),
     operation: "get_group_info",
     currentGroup: true,
   },
@@ -740,7 +757,28 @@ function callObserved(evidence: RequiredEvidence, call: ObservedToolCall): boole
     call.failed === false &&
     satisfiesRequiredInput(evidence.input, call.input);
   if (!matches) return false;
-  return evidence.domain !== "browser_screenshot" || hasArtifactId(call.result);
+  if (evidence.domain === "browser_screenshot") return hasArtifactId(call.result);
+  if (evidence.domain === "group_member_count") return hasGroupMemberCount(call.result);
+  return true;
+}
+
+/** A count request needs the provider's actual member_count field, not a successful empty read. */
+function hasGroupMemberCount(value: unknown, depth = 0): boolean {
+  if (depth > 5 || value === null || value === undefined) return false;
+  if (typeof value === "string") {
+    try {
+      return hasGroupMemberCount(JSON.parse(value) as unknown, depth + 1);
+    } catch {
+      return false;
+    }
+  }
+  if (Array.isArray(value)) return value.some((item) => hasGroupMemberCount(item, depth + 1));
+  if (typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+  const count = record.member_count ?? record.memberCount;
+  if (typeof count === "number") return Number.isSafeInteger(count) && count >= 0;
+  if (typeof count === "string" && /^\d+$/u.test(count)) return Number.isSafeInteger(Number(count));
+  return Object.values(record).some((item) => hasGroupMemberCount(item, depth + 1));
 }
 
 /** A screenshot is evidence only when the browser Tool returned its durable Artifact id. */

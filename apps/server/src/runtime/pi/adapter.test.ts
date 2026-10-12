@@ -1104,6 +1104,80 @@ describe("PiSdkRuntimeAdapter", () => {
     await adapter.cleanup();
   });
 
+  it("narrows authorized provider Tools to the required live QQ fact before session creation", async () => {
+    const runtimeBaseDir = await mkdtemp(join(tmpdir(), "glassbox-pi-required-tool-surface-"));
+    directories.push(runtimeBaseDir);
+    let surface: unknown;
+    let listener: ((event: AgentSessionEvent) => void) | undefined;
+    const fakeSession = {
+      sessionId: "pi-session-required-surface",
+      messages: [],
+      subscribe(callback: (event: AgentSessionEvent) => void) {
+        listener = callback;
+        return () => {
+          listener = undefined;
+        };
+      },
+      async prompt() {
+        listener?.({ type: "agent_start" });
+        listener?.({ type: "agent_end", messages: [], willRetry: false });
+      },
+      async abort() {},
+      dispose() {},
+    };
+
+    const adapter = new PiSdkRuntimeAdapter({
+      kitPath: fileURLToPath(new URL("./fixtures/lora-pi-kit", import.meta.url)),
+      runtimeBaseDir,
+      resolveToolCandidates: async () => [
+        { name: "qq_groups", exclusion: null },
+        { name: "qq_group_members", exclusion: null },
+        { name: "qq_group_moderation", exclusion: "policy_disabled" },
+      ],
+      resolveSkillNames: async () => ({ names: [] }),
+      onEvent: (event) => {
+        if (event.type === "session_start") surface = event.data.toolSurface;
+      },
+      createSession: async () => fakeSession as never,
+    });
+
+    await adapter.initialize();
+    const context: PiRunContext = {
+      runId: run.id,
+      conversationId: conversation.id,
+      caller: {
+        principalId: "owner",
+        scope: {
+          connectionId: "qq",
+          botId: "bot",
+          chatType: "private",
+          chatId: "owner",
+          senderId: "owner",
+        },
+      },
+      requiredEvidence: [
+        {
+          domain: "group_member_count",
+          tool: "qq_groups",
+          input: { groupId: "1121579672", operation: "get_group_info" },
+        },
+      ],
+    };
+
+    const binding = await adapter.createOrRestoreSession(conversation, "test", context);
+    await adapter.run(binding, run, "count group members", context);
+
+    expect(context.authorizedToolNames).toEqual(["qq_groups"]);
+    expect(surface).toMatchObject({
+      selected: [{ name: "qq_groups" }],
+      excluded: [
+        { name: "qq_group_members", reason: "not_selected_for_request" },
+        { name: "qq_group_moderation", reason: "policy_disabled" },
+      ],
+    });
+    await adapter.cleanup();
+  });
+
   it("shares the Tool-result turn budget, compacts structured overflow, and removes image payloads", async () => {
     // The 10,000-token window is what makes the compaction observable, so the image payload has
     // to stay small enough that the system prompt still fits under it: that prompt grows every

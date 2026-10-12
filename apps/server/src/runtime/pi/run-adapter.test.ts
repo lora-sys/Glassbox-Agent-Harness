@@ -5095,6 +5095,7 @@ describe("a factual answer requires the observation it depends on", () => {
     });
     expect(f.run.mock.calls[0]?.[3]?.callerIdentity).toEqual({
       senderId: "2498701175",
+      botId: "bot",
       isOwner: false,
       sharedConversation: true,
     });
@@ -5111,6 +5112,7 @@ describe("a factual answer requires the observation it depends on", () => {
     expect(f.run).toHaveBeenCalledOnce();
     expect(f.run.mock.calls[0]?.[3]?.callerIdentity).toEqual({
       senderId: "3526039967",
+      botId: "bot",
       isOwner: true,
       sharedConversation: true,
     });
@@ -5139,6 +5141,7 @@ describe("a factual answer requires the observation it depends on", () => {
     // Kit placeholder would put the rename back out of the operator's reach.
     expect(unnamed.run.mock.calls[0]?.[3]?.callerIdentity).toEqual({
       senderId: unnamed.input.caller.scope.senderId,
+      botId: "bot",
       isOwner: true,
       sharedConversation: true,
     });
@@ -5666,6 +5669,11 @@ it.each([
   ["把群里昵称叫 Brian 的成员禁言 30 秒", "Brian", 30],
   ["请把群名片是「Ripped Space」的群友禁言 2 分钟", "Ripped Space", 120],
   ["按群昵称 小明 禁言 1 小时", "小明", 3600],
+  [
+    "把群名片为“3526039967”的那位普通成员禁言 5 秒，作为这次实机测试。请按群名片唯一匹配，不要改成按 QQ 号；如果匹配不唯一、对方不是普通成员、当前已被禁言，或你没有管理员权限，就停止并说明原因。成功后告诉我执行结果。",
+    "3526039967",
+    5,
+  ],
 ])(
   "binds a descriptive group nickname to the exact selector: %s",
   async (text, memberSelector, duration) => {
@@ -5684,6 +5692,30 @@ it.each([
     });
   },
 );
+
+it("keeps a numeric group card as a label and binds requested mute safety checks", async () => {
+  const empty: PiRunResult = { status: "completed", text: "未执行", toolCalls: [] };
+  const f = fixture([empty, empty], ["qq_group_moderation"]);
+  f.input.caller.scope.chatType = "group";
+  f.input.caller.scope.chatId = "1121579672";
+  f.input.conversation.scope = f.input.caller.scope;
+  f.input.text =
+    "把群名片为“3526039967”的那位普通成员禁言 5 秒，作为这次实机测试。请按群名片唯一匹配，不要改成按 QQ 号；如果匹配不唯一、对方不是普通成员、当前已被禁言，或你没有管理员权限，就停止并说明原因。成功后告诉我执行结果。";
+
+  await f.executor.execute(f.input);
+
+  expect(f.run.mock.calls[0]?.[3]?.requiredToolInput).toEqual({
+    groupId: "1121579672",
+    operation: "set_group_ban",
+    memberSelector: "3526039967",
+    params: { duration: 5 },
+  });
+  expect(f.run.mock.calls[0]?.[3]?.requiredModerationPreconditions).toEqual({
+    botMustBeAdmin: true,
+    targetMustBeOrdinaryMember: true,
+    targetMustNotBeMuted: true,
+  });
+});
 
 it.each([
   "把群里昵称叫 Brian 或 Amy 的成员禁言 30 秒",

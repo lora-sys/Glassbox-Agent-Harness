@@ -385,15 +385,26 @@ function joinMuteVerbPause(text: string): string {
   );
 }
 
+/** Status conditions containing the mute verb are not separate moderation requests. */
+function isMuteStateCondition(clause: string): boolean {
+  return /^(?:(?:如果|若|假如|一旦)\s*)?(?:(?:目标|对方|该成员|成员)\s*)?(?:(?:目前|当前|现在)\s*)?(?:(?:已经|尚未|没有|未|不|已)\s*)?(?:被)?(?:禁言|闭嘴)$/u.test(
+    clause.trim(),
+  );
+}
+
 function muteRequestClause(text: string): string | undefined {
-  const clauses = text.split(/[，,。！？!?；;\n]/u).filter((part) => /禁言|闭嘴/u.test(part));
+  const clauses = text
+    .split(/[，,。！？!?；;\n]/u)
+    .filter((part) => /禁言|闭嘴/u.test(part) && !isMuteStateCondition(part));
   // One mutation intent cannot choose between, or combine fields from, multiple requests.
   return clauses.length === 1 ? clauses[0] : undefined;
 }
 
 /** The command clause that names a target and a duration, excluding mute-state conditions. */
 function muteActionClause(text: string): string | undefined {
-  const clauses = text.split(/[，,。！？!?；;\n]/u).filter((part) => /禁言|闭嘴/u.test(part));
+  const clauses = text
+    .split(/[，,。！？!?；;\n]/u)
+    .filter((part) => /禁言|闭嘴/u.test(part) && !isMuteStateCondition(part));
   const requests = clauses.filter(
     (clause) =>
       !/(?:目前|当前|现在|尚未|此前).{0,12}(?:没有|未|不).{0,8}(?:被)?(?:禁言|闭嘴)/u.test(
@@ -548,8 +559,11 @@ function mutationRequestFields(
   const params = mutation.params(text);
   if (params !== undefined) return { params };
   if (mutation.operation !== "set_group_ban") return {};
+  const clause = muteActionClause(text);
+  const labelledTarget = clause === undefined ? undefined : labelledMuteSelector(clause);
   const target = namedMuteTarget(text);
-  const memberSelector = target && !/^\d+$/u.test(target) ? target : undefined;
+  const memberSelector =
+    target && (labelledTarget !== undefined || !/^\d+$/u.test(target)) ? target : undefined;
   const duration = namedMuteDuration(text);
   return {
     ...(memberSelector === undefined ? {} : { memberSelector }),
@@ -666,8 +680,13 @@ export const MUTATION_REQUESTS: readonly {
     operation: "set_group_ban",
     words: /禁言|闭嘴/iu,
     params: (text) => {
+      const clause = muteActionClause(text);
+      const labelledTarget = clause === undefined ? undefined : labelledMuteSelector(clause);
       const target = namedMuteTarget(text);
-      const user_id = target && /^[1-9]\d{4,14}$/u.test(target) ? Number(target) : undefined;
+      const user_id =
+        target && labelledTarget === undefined && /^[1-9]\d{4,14}$/u.test(target)
+          ? Number(target)
+          : undefined;
       const duration = namedMuteDuration(text);
       if (user_id === undefined || duration === undefined) return undefined;
       return { user_id, duration };
@@ -992,7 +1011,8 @@ function moderationPreconditionsFor(
     // supported predicates explicitly instead of letting the model decide them from prose.
     if (/管理员|群主/u.test(text)) value.botMustBeAdmin = true;
     if (/普通成员/u.test(text)) value.targetMustBeOrdinaryMember = true;
-    if (/没有被禁言|未被禁言|不被禁言|目前没有禁言/u.test(text)) value.targetMustNotBeMuted = true;
+    if (/没有被禁言|未被禁言|不被禁言|目前没有禁言|(?:当前|目前|现在)?已(?:经)?被禁言/u.test(text))
+      value.targetMustNotBeMuted = true;
   }
   return Object.keys(value).length === 0 ? undefined : value;
 }
@@ -2340,13 +2360,25 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
                     : gateMessages.incompleteParameters,
       };
     }
+    const evidence = requiredEvidenceFor({
+      text: input.text,
+      chatType: input.caller.scope.chatType === "group" ? "group" : "private",
+      isOwner,
+      botId: input.caller.scope.botId,
+    });
+    const requiredForToolSelection = requiredToolCall(
+      input,
+      isOwner,
+      [OWNER_GROUP_ADMIN_TOOL, OWNER_MEMORY_ADMIN_TOOL, OWNER_MODEL_ADMIN_TOOL],
+      modelProfiles,
+      acceptanceMemoryText,
+      gateMessages,
+    );
     await this.runtime.initialize();
-    // The requirements are written onto the context after the session exists, because the
-    // context is what the runtime carries into the Run. They are decided from the message and
-    // the caller's scope, so the order the session is created in cannot change them: the
-    // surface the runtime resolves alongside it decides only whether the Run can satisfy them.
-    // The identity facts travel with it for the same reason: a session outlives the Run that
-    // opened it, and the sender of the next Run may be somebody else entirely.
+    // Required evidence and the message's lexical Tool requirement are known before session
+    // creation. The runtime first authorizes its candidates, then narrows that allowed surface
+    // to these selected Tools. The actual required call is checked again against the resulting
+    // surface below. Identity facts are Run-scoped because a Conversation can outlive its sender.
     const context: PiRunContext = {
       ...(input.executionMode === "task_step_model" ? { executionMode: input.executionMode } : {}),
       caller: input.caller,
@@ -2363,12 +2395,26 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       ...(acceptanceLease ? { acceptanceLease } : {}),
       callerIdentity: {
         senderId: input.caller.scope.senderId,
+        botId: input.caller.scope.botId,
         isOwner,
         // A group is one Conversation shared by everyone in it; a private one has a single
         // speaker by construction, so it never needs the rules below.
         sharedConversation: input.caller.scope.chatType === "group",
         ...(botDisplayName === undefined ? {} : { botDisplayName }),
       },
+      ...(evidence.length > 0 ? { requiredEvidence: evidence } : {}),
+      ...(requiredForToolSelection
+        ? {
+            requiredToolName: requiredForToolSelection.name,
+            requiredToolInput: requiredForToolSelection.input,
+            ...(requiredForToolSelection.requiredModerationPreconditions
+              ? {
+                  requiredModerationPreconditions:
+                    requiredForToolSelection.requiredModerationPreconditions,
+                }
+              : {}),
+          }
+        : {}),
       ...(input.images?.length ? { images: input.images } : {}),
     };
     const binding = await this.runtime.createOrRestoreSession(
@@ -2409,8 +2455,17 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       acceptanceMemoryText,
       gateMessages,
     );
-    if (required?.requiredModerationPreconditions)
-      context.requiredModerationPreconditions = required.requiredModerationPreconditions;
+    if (required) {
+      context.requiredToolName = required.name;
+      context.requiredToolInput = required.input;
+      if (required.requiredModerationPreconditions)
+        context.requiredModerationPreconditions = required.requiredModerationPreconditions;
+      else delete context.requiredModerationPreconditions;
+    } else {
+      delete context.requiredToolName;
+      delete context.requiredToolInput;
+      delete context.requiredModerationPreconditions;
+    }
 
     if (required?.name === "qq_group_moderation" && required.input.operation === "set_group_ban") {
       const params = required.input.params as Record<string, unknown> | undefined;
@@ -2521,13 +2576,6 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
     // from the message alone: the surface the Run got decides whether the requirement can be
     // met, never whether it exists, so a Run whose surface withholds the Tool fails closed
     // rather than answering a live question it had no way to observe.
-    const evidence = requiredEvidenceFor({
-      text: input.text,
-      chatType: input.caller.scope.chatType === "group" ? "group" : "private",
-      isOwner,
-      botId: input.caller.scope.botId,
-    });
-    if (evidence.length > 0) context.requiredEvidence = evidence;
     await this.recordEvidence({
       type: "tool_evidence",
       runId: input.run.id,

@@ -196,6 +196,12 @@ function tools(
     definitionContext: {
       caller: { principalId: "owner", scope: definitionScope },
       ...(definitionLease ? { acceptanceLease: definitionLease } : {}),
+      ...(required === undefined
+        ? {}
+        : {
+            requiredToolName: required.name,
+            requiredToolInput: required.input,
+          }),
     },
   });
 }
@@ -499,6 +505,27 @@ it("publishes exact parameter requirements for each QQ operation", async () => {
     expect(kick.properties.params?.required).toEqual(["user_id"]);
     expect(kick.properties.params?.properties).toHaveProperty("reject_add_request");
     expect(operation("set_group_whole_ban").properties.params?.required).toEqual(["enable"]);
+  } finally {
+    await store.close();
+  }
+});
+
+it("limits the provider schema to the requested QQ read operation", async () => {
+  const { store, accepted } = await fixture();
+  try {
+    const created = tools(store, accepted, [], {
+      name: "qq_groups",
+      input: { groupId: "100", operation: "get_group_info" },
+    });
+    const schema = toolByName(created, "qq_groups").parameters as {
+      anyOf?: Array<{ properties: { operation?: { const?: string } } }>;
+      properties?: { operation?: { const?: string } };
+    };
+    const variants = schema.anyOf ?? (schema.properties ? [{ properties: schema.properties }] : []);
+
+    expect(variants.map((variant) => variant.properties.operation?.const)).toEqual([
+      "get_group_info",
+    ]);
   } finally {
     await store.close();
   }

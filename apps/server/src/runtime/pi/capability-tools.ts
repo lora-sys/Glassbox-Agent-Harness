@@ -461,6 +461,7 @@ function restrictionMatchesScope(
 function providerToolOperationParameters(
   capability: QqCapability,
   chatType?: "private" | "group",
+  allowedOperations?: readonly string[],
 ): TSchema[] {
   const groupIdSchema = Type.String({
     pattern: "^[1-9]\\d{0,15}$",
@@ -475,9 +476,15 @@ function providerToolOperationParameters(
           ? groupIdSchema
           : undefined;
   const groupIdProperty: TProperties = groupId === undefined ? {} : { groupId };
-  const variants = capability.operations.map((operation) => {
-    const modelParams = operation.params.filter((name) => name !== "group_id");
-    const requiredParams = new Set(operation.required.filter((name) => name !== "group_id"));
+  const operations =
+    allowedOperations === undefined
+      ? capability.operations
+      : capability.operations.filter((operation) => allowedOperations.includes(operation.action));
+  const variants = operations.map((operation) => {
+    const modelParams = (operation.params ?? []).filter((name) => name !== "group_id");
+    const requiredParams = new Set(
+      (operation.required ?? []).filter((name) => name !== "group_id"),
+    );
     const params = Object.fromEntries(
       modelParams.map((name) => [
         name,
@@ -531,14 +538,44 @@ function providerToolParameters(
   capability: QqCapability,
   allowListing = false,
   chatType?: "private" | "group",
+  allowedOperations?: readonly string[],
 ): TSchema {
-  const variants = providerToolOperationParameters(capability, chatType);
+  const variants = providerToolOperationParameters(capability, chatType, allowedOperations);
   return unionSchema([
     ...(allowListing && chatType !== "group"
       ? [Type.Object({}, { additionalProperties: false })]
       : []),
     ...variants,
   ])!;
+}
+
+function requiredOperationsFor(
+  capability: QqCapability,
+  definitionContext: Readonly<PiRunContext> | undefined,
+): readonly string[] | undefined {
+  if (definitionContext?.acceptanceLease) return undefined;
+  const evidence =
+    definitionContext?.requiredEvidence?.filter((entry) => entry.tool === capability.tool) ?? [];
+  const requiredToolMatches = definitionContext?.requiredToolName === capability.tool;
+  const requiredToolOperation = requiredToolMatches
+    ? definitionContext?.requiredToolInput?.operation
+    : undefined;
+  const operations: unknown[] = [
+    ...evidence.map((entry) => entry.input.operation),
+    ...(requiredToolOperation === undefined ? [] : [requiredToolOperation]),
+  ];
+  if (operations.length === 0) return undefined;
+  if (operations.some((operation) => typeof operation !== "string"))
+    throw new Error("required_evidence_operation_missing");
+  const selected = [...new Set(operations as string[])];
+  if (
+    selected.length === 0 ||
+    selected.some(
+      (operation) => !capability.operations.some((candidate) => candidate.action === operation),
+    )
+  )
+    throw new Error("required_evidence_operation_unavailable");
+  return selected;
 }
 
 function projectProviderToolParameters(
@@ -678,8 +715,8 @@ function providerToolDescription(
 ): string {
   const operations = allowedOperations
     .map((operation) => {
-      const modelParams = operation.params.filter((name) => name !== "group_id");
-      const required = operation.required.filter((name) => name !== "group_id");
+      const modelParams = (operation.params ?? []).filter((name) => name !== "group_id");
+      const required = (operation.required ?? []).filter((name) => name !== "group_id");
       return modelParams.length === 0
         ? `${operation.action}: has no params fields; omit params or use {}`
         : `${operation.action}: params may contain ${modelParams.join(", ")}; required ${required.join(", ") || "nothing"}`;
@@ -1344,6 +1381,7 @@ export function createCapabilityTools(
   ).map((capability) => {
     let parameters: TSchema;
     let description: string;
+    const requiredOperations = requiredOperationsFor(capability, definitionContext);
     if (capability.tool === CAPABILITY_SEARCH_TOOL) {
       const restrictions = lease?.getToolInputRestrictions(capability.tool);
       const projected = capabilitySearchParameters(definitionContext, restrictions);
@@ -1387,24 +1425,54 @@ export function createCapabilityTools(
         );
       }
     } else if (capability.tool === GROUP_INVENTORY_TOOL) {
-      parameters = providerToolParameters(capability, true, definitionChatType);
+      const allowListing = requiredOperations === undefined;
+      parameters = providerToolParameters(
+        capability,
+        allowListing,
+        definitionChatType,
+        requiredOperations,
+      );
+      const exposedOperations =
+        requiredOperations === undefined
+          ? capability.operations
+          : capability.operations.filter((operation) =>
+              requiredOperations.includes(operation.action),
+            );
       description =
         definitionChatType === "group"
           ? providerToolDescription(
               capability,
-              capability.operations,
+              exposedOperations,
               definitionChatType,
               "Read metadata for the current QQ group.",
             )
-          : `Input {} lists the Owner's managed QQ groups without operation or groupId. To read metadata, set operation and provide groupId. ${providerToolDescription(
-              capability,
-              capability.operations,
-              definitionChatType,
-              "Read provider metadata for a managed QQ group.",
-            )}`;
+          : allowListing
+            ? `Input {} lists the Owner's managed QQ groups without operation or groupId. To read metadata, set operation and provide groupId. ${providerToolDescription(
+                capability,
+                exposedOperations,
+                definitionChatType,
+                "Read provider metadata for a managed QQ group.",
+              )}`
+            : providerToolDescription(
+                capability,
+                exposedOperations,
+                definitionChatType,
+                "Read provider metadata for the authorized QQ group.",
+              );
     } else {
-      parameters = providerToolParameters(capability, false, definitionChatType);
-      description = providerToolDescription(capability, capability.operations, definitionChatType);
+      const exposedOperations =
+        requiredOperations === undefined
+          ? capability.operations
+          : capability.operations.filter((operation) =>
+              requiredOperations.includes(operation.action),
+            );
+      parameters = providerToolParameters(
+        capability,
+        false,
+        definitionChatType,
+        requiredOperations,
+      );
+      description = providerToolDescription(capability, exposedOperations, definitionChatType);
     }
 
     if (capability.tool === CAPABILITY_SEARCH_TOOL)

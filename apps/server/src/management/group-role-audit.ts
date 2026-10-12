@@ -20,6 +20,7 @@ const SURFACE_REASONS = new Set([
   "scope_not_permitted",
   "policy_disabled",
   "discovery_denied",
+  "not_selected_for_request",
   "no_caller_context",
   "unclassified",
 ]);
