@@ -64,6 +64,7 @@ describe("QQ live lease application wiring", () => {
   });
 
   it("registers through management, then accepts and binds the exact Pi message", async () => {
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("isolated provider fixture"));
     const fixture = await fixtures.fixture(
       async (input) => ({ status: "succeeded", text: input.text }),
       { executionRef: "pi:lease-fixture", piModelProfile },
@@ -120,18 +121,15 @@ describe("QQ live lease application wiring", () => {
     });
     expect(JSON.stringify(runBound)).not.toContain("Reply with one word.");
     expect(JSON.stringify(runBound)).not.toContain(text);
-    if (latest && (latest.status === "queued" || latest.status === "running"))
-      await fixture.app.runs.cancel(
-        (await fixture.app.store.identities.resolve(acceptedScope))!,
-        latest.id,
-      );
-    await vi.waitFor(async () => {
-      const terminalAudit = await readFile(
-        join(fixture.directory, "qq-live-acceptance-audit.jsonl"),
-        "utf8",
-      );
-      expect(terminalAudit).toContain('"event":"lease_revoked"');
-    });
+    const caller = await fixture.app.store.identities.resolve(acceptedScope);
+    if (!caller) throw new Error("Owner caller was not restored");
+    const terminal = await fixture.app.runs.waitForRun(caller, latest.id);
+    expect(terminal.status).not.toBe("queued");
+    const terminalAudit = await readFile(
+      join(fixture.directory, "qq-live-acceptance-audit.jsonl"),
+      "utf8",
+    );
+    expect(terminalAudit).toContain('"event":"lease_revoked"');
     const internals = fixture.app as unknown as {
       qqLiveLeases: QqLiveLeaseRegistry;
       qqLiveRunBindings: Map<string, unknown>;
