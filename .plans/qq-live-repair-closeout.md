@@ -90,3 +90,12 @@
 - The repository compose pin targets NapCat v4.18.30. The config was validated with non-live placeholder values. The live containers still use the previous image digest. No real QQ test can pass until Bot port 6701 is ready.
 - PR #142 now points to 01895f4425258567bef522e2d73edcde25c91d61. Local verify:full and verify:commit passed with 3,095 tests passed and one existing optional Herdr test skipped. GitHub checks are still running.
 - PR #140 is open and conflicting with PR #142. Their current changed-file lists overlap in 18 paths. PR #140 lists Issues #109, #110, #111, #112, and #117; all five issues remain open. PR #142 already covers #109, #111, #112, and #117. Keep #110 automatic unknown-send retry excluded because it can duplicate a message.
+
+
+## 2026-10-13 Bot runtime update
+
+- The Bot driver Compose image was updated to the pinned v4.18.30 digest. Its existing config and NTQQ bind mounts were preserved. The Owner container was not restarted.
+- The first Compose invocation used the directory-derived project name and briefly started a second container against the same account mounts. It was stopped and removed immediately. The existing project label was then verified as glassbox-qq-live-driver, and only that project was recreated. A final container check showed one Bot container and one Owner container. The operations skill now records the explicit project-name requirement.
+- NapCat reported the Bot login state expired, rejected quick login, and generated a QR. The latest qq-chat status still reports Owner online and Bot WS_NOT_READY. Port 6700 listens; port 6701 does not. The user must confirm the current 6100 QR before real acceptance can continue.
+- No new real QQ messages or group actions were executed after the update.
+- PR #142 head ef47bd4 has local commit verification passed. The full suite reports 3,095 passed and one existing optional Herdr skip. GitHub CI is still pending for code and dependency review.
