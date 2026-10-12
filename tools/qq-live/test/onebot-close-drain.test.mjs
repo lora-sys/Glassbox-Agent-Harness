@@ -113,3 +113,28 @@ test("closeAndDrain keeps message observers active until the peer confirms closu
   socket.emit("close", { code: 1000 });
   await drain;
 });
+
+test("identity mismatch reports a bounded classification without exposing the received ID", () => {
+  const { value } = client();
+  value.onFrame(
+    JSON.stringify({ post_type: "meta_event", meta_event_type: "lifecycle", self_id: 10001 }),
+  );
+  assert.equal(value.problem.code, "EVENT_IDENTITY");
+  assert.deepEqual(value.problem.identityDiagnostic, {
+    expectedRole: "bot",
+    observedIdentity: "other_configured_account",
+    postType: "meta_event",
+    metaEventType: "lifecycle",
+  });
+  assert.equal(JSON.stringify(value.problem.identityDiagnostic).includes("10001"), false);
+});
+
+test("identity mismatch distinguishes absent account identity from malformed identity", () => {
+  const missing = client().value;
+  missing.onFrame(JSON.stringify({ post_type: "meta_event", meta_event_type: "lifecycle" }));
+  assert.equal(missing.problem.identityDiagnostic.observedIdentity, "missing");
+
+  const invalid = client().value;
+  invalid.onFrame(JSON.stringify({ post_type: "meta_event", self_id: 0 }));
+  assert.equal(invalid.problem.identityDiagnostic.observedIdentity, "invalid");
+});

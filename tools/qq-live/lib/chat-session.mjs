@@ -179,9 +179,32 @@ function sameInput(a, b) {
   );
 }
 function safeFailure(error) {
+  const identityDiagnostic = error?.identityDiagnostic;
+  const safeIdentityDiagnostic =
+    error?.code === "EVENT_IDENTITY" &&
+    identityDiagnostic &&
+    ["driver", "bot"].includes(identityDiagnostic.expectedRole) &&
+    ["missing", "invalid", "other_configured_account", "unrecognized"].includes(
+      identityDiagnostic.observedIdentity,
+    ) &&
+    ["meta_event", "message", "message_sent", "notice", "request", "other"].includes(
+      identityDiagnostic.postType,
+    ) &&
+    (identityDiagnostic.metaEventType === undefined ||
+      ["heartbeat", "lifecycle"].includes(identityDiagnostic.metaEventType))
+      ? {
+          expectedRole: identityDiagnostic.expectedRole,
+          observedIdentity: identityDiagnostic.observedIdentity,
+          postType: identityDiagnostic.postType,
+          ...(identityDiagnostic.metaEventType
+            ? { metaEventType: identityDiagnostic.metaEventType }
+            : {}),
+        }
+      : undefined;
   return {
     code: error?.code ?? "CHAT_ERROR",
     message: String(error?.message ?? error).slice(0, 1000),
+    ...(safeIdentityDiagnostic ? { identityDiagnostic: safeIdentityDiagnostic } : {}),
   };
 }
 export class ChatSession {

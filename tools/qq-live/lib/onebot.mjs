@@ -158,8 +158,11 @@ export class OneBot {
       ws.addEventListener("close", onError, { once: true });
     });
   }
-  break(code, message) {
-    if (!this.closed) this.problem ??= new LiveError(code, message);
+  break(code, message, identityDiagnostic) {
+    if (!this.closed && !this.problem) {
+      this.problem = new LiveError(code, message);
+      if (identityDiagnostic) this.problem.identityDiagnostic = identityDiagnostic;
+    }
     for (const item of this.pending.values()) {
       clearTimeout(item.timer);
       item.reject(new LiveError(code, message));
@@ -227,7 +230,30 @@ export class OneBot {
     }
     if (!obj.post_type) return;
     if (id(obj.self_id) !== this.account.qq) {
-      this.break("EVENT_IDENTITY", "OneBot 事件账号与配置不符。");
+      const observedId = id(obj.self_id);
+      const otherAccount = ["driver", "bot"].find(
+        (role) => role !== this.role && observedId === id(this.config[role]?.qq),
+      );
+      const postType = ["meta_event", "message", "message_sent", "notice", "request"].includes(
+        obj.post_type,
+      )
+        ? obj.post_type
+        : "other";
+      const metaEventType = ["heartbeat", "lifecycle"].includes(obj.meta_event_type)
+        ? obj.meta_event_type
+        : undefined;
+      this.break("EVENT_IDENTITY", "OneBot 事件账号与配置不符。", {
+        expectedRole: this.role,
+        observedIdentity: !Object.hasOwn(obj, "self_id")
+          ? "missing"
+          : !observedId
+            ? "invalid"
+            : otherAccount
+              ? "other_configured_account"
+              : "unrecognized",
+        postType,
+        ...(metaEventType ? { metaEventType } : {}),
+      });
       return;
     }
     if (

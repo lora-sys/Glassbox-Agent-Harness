@@ -144,6 +144,35 @@ test("unknown sends remain unknown after observer restart without retry", async 
   assert.equal((await again.send(input)).sendStatus, "unknown");
   assert.equal(f.clients.driver.calls.filter((c) => c.action.startsWith("send_")).length, 0);
 });
+test("status keeps only the allow-listed OneBot identity diagnostic", async (t) => {
+  const f = fixture(t);
+  const session = f.session();
+  await session.start();
+  t.after(() => session.close());
+  const error = Object.assign(new Error("OneBot event account did not match."), {
+    code: "EVENT_IDENTITY",
+    identityDiagnostic: {
+      expectedRole: "driver",
+      observedIdentity: "missing",
+      postType: "meta_event",
+      metaEventType: "lifecycle",
+      eventBody: "must not be projected",
+    },
+  });
+  f.clients.driver.call = async (action) => {
+    if (action === "get_status") throw error;
+    return { user_id: f.config.driver.qq };
+  };
+  const status = await session.status();
+  assert.deepEqual(status.accounts.driver.error.identityDiagnostic, {
+    expectedRole: "driver",
+    observedIdentity: "missing",
+    postType: "meta_event",
+    metaEventType: "lifecycle",
+  });
+  assert.equal(JSON.stringify(status).includes("eventBody"), false);
+});
+
 test("observer retains late images and videos after text without a scenario schema", async (t) => {
   const f = fixture(t);
   const session = f.session();
