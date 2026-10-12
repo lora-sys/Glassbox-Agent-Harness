@@ -4,7 +4,7 @@
     "glassbox-ops": {
       "source": "./.agents/skills/glassbox-ops",
       "sourceType": "local",
-      "computedHash": "372615ef3e2da9dc021b4cb613e7c044ecb93705a9324d58689acdf120627b02"
+      "computedHash": "f6eec4a845228f56a0df1426ff9934987852fa3f0d4f008abb2c2f2a42ba74e5"
     }
   }
 }

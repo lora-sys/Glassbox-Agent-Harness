@@ -37,6 +37,10 @@ description: Glassbox 项目的环境启动、服务管理与 trace 调试手册
 一次条件化诊断示例：Bot 的 OneBot 状态为 offline，WebUI 的 CheckLoginStatus 同时报告 isOffline=true。刷新二维码后，原生 onUserLoggedIn 仍提示当前账号已登录，无法重复登录。这确认了原生登录状态冲突，不是单纯的界面状态。用户明确授权修复后，只调用 Bot WebUI 的原生 RestartNapCat 工作进程入口。该操作保留容器、账号目录和设备配置；没有删除或重建状态。重启后 WebUI 报告 isLogin=false、isOffline=false、loginPhase=qrcode_scanned、coreReady=false，等待用户手机确认。生成二维码或扫码 accepted 都不代表 coreReady，也不代表真实消息收发通过。
 只有在再次确认账号 offline、确认原生重复登录冲突，并取得用户明确授权后，才按这个精确入口修复。不要把此示例推广为 timeout、单独 -10003 或其他状态下的自动重启规则。
 
+**NapCat Compose 项目名**：本机 Bot Compose 文件为 /home/yanbingzhao/.napcat-qq-live-driver/compose.yml，现有容器标签的项目名是 glassbox-qq-live-driver，服务名是 driver。从 .napcat-qq-live-driver 目录直接运行 docker compose up 会按目录名创建 napcat-qq-live-driver 项目，不会更新原容器；新容器可能挂载同一份 config 和 NTQQ 目录。重建或升级前，先读取目标容器的 com.docker.compose.project、service、config_files 标签，使用对应项目名显式传入 -p，并确认同一账号目录只有一个活动容器。不要从目录名猜项目名，不要并行启动同一账号目录。镜像升级是独立的版本变更，不用于刷新二维码；只有找到对应版本缺陷证据且用户授权后才执行。
+
+NapCat v4.18.30 包含静默离线后的 Worker 恢复。QQ 服务端撤销登录态时，快速登录仍会失败并需要手机扫码；升级不能保证登录态永不失效。
+
 **跑任何调试前先确认环境**（服务是否在、数据目录对不对、有多少 run 可查）：
 
 ```bash
