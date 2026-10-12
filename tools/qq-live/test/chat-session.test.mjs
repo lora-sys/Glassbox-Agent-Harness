@@ -178,16 +178,39 @@ test("status reports a connected instance as offline when its QQ identity change
   const session = f.session();
   await session.start();
   t.after(() => session.close());
-  const originalCall = f.clients.driver.call.bind(f.clients.driver);
-  f.clients.driver.call = async (action, params) =>
-    action === "get_login_info" ? { user_id: f.config.bot.qq } : originalCall(action, params);
+  const driver = f.clients.driver;
+  const callsBefore = driver.calls.length;
+  driver.call = async (action, params) => {
+    driver.calls.push({ action, params });
+    if (action === "get_login_info") return { user_id: f.config.bot.qq };
+    if (action === "get_status") return { online: true };
+    if (action.startsWith("send_")) return { message_id: "71" };
+    throw new Error("unexpected action");
+  };
+
   const status = await session.status();
   assert.equal(status.accounts.driver.qq, f.config.driver.qq);
   assert.equal(status.accounts.driver.observedQQ, f.config.bot.qq);
   assert.equal(status.accounts.driver.identityMatches, false);
   assert.equal(status.accounts.driver.online, false);
-  assert.equal(status.accounts.driver.error.code, "LOGIN_IDENTITY_MISMATCH");
-  assert.equal(f.clients.driver.calls.filter((call) => call.action.startsWith("send_")).length, 0);
+  assert.equal(status.accounts.driver.error.code, "ACCOUNT_IDENTITY_MISMATCH");
+  assert.equal(
+    status.accounts.driver.error.identityDiagnostic.observedIdentity,
+    "other_configured_account",
+  );
+  assert.deepEqual(
+    driver.calls.slice(callsBefore).map((call) => call.action),
+    ["get_login_info"],
+  );
+
+  await assert.rejects(
+    session.send({ requestId: randomUUID(), chat: "private", text: "check account identity only" }),
+    /both QQ accounts must be online/,
+  );
+  assert.equal(
+    driver.calls.slice(callsBefore).some((call) => call.action.startsWith("send_")),
+    false,
+  );
 });
 
 test("observer retains late images and videos after text without a scenario schema", async (t) => {

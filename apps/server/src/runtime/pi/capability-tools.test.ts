@@ -510,6 +510,40 @@ it("publishes exact parameter requirements for each QQ operation", async () => {
   }
 });
 
+it("requires a group-card value in the model-facing QQ settings schema", async () => {
+  const { store, accepted } = await fixture();
+  try {
+    const settings = toolByName(
+      tools(store, accepted, [], {
+        name: "qq_group_settings",
+        input: {
+          groupId: "100",
+          operation: "set_group_card",
+          params: { user_id: 10004, card: "Brian" },
+        },
+      }),
+      "qq_group_settings",
+    );
+
+    expect(() =>
+      validateTool(settings, {
+        groupId: "100",
+        operation: "set_group_card",
+        params: { user_id: 10004 },
+      }),
+    ).toThrow();
+    expect(() =>
+      validateTool(settings, {
+        groupId: "100",
+        operation: "set_group_card",
+        params: { user_id: 10004, card: "Brian" },
+      }),
+    ).not.toThrow();
+  } finally {
+    await store.close();
+  }
+});
+
 it("limits the provider schema to the requested QQ read operation", async () => {
   const { store, accepted } = await fixture();
   try {

@@ -190,7 +190,7 @@ export const QQ_CAPABILITIES: readonly QqCapability[] = [
     resource: "group",
     operations: [
       group("set_group_name", ["group_id", "group_name"], ["group_id", "group_name"]),
-      group("set_group_card", ["group_id", "user_id", "card"], ["group_id", "user_id"]),
+      group("set_group_card", ["group_id", "user_id", "card"], ["group_id", "user_id", "card"]),
     ],
     description: "Change the current group's name or one member's card as its QQ group owner.",
     nativeGroupRoles: ["qq_group_owner"],
@@ -204,7 +204,7 @@ export const QQ_CAPABILITIES: readonly QqCapability[] = [
     resource: "group",
     operations: [
       group("set_group_name", ["group_id", "group_name"], ["group_id", "group_name"]),
-      group("set_group_card", ["group_id", "user_id", "card"], ["group_id", "user_id"]),
+      group("set_group_card", ["group_id", "user_id", "card"], ["group_id", "user_id", "card"]),
       group(
         "set_group_admin",
         ["group_id", "user_id", "enable"],

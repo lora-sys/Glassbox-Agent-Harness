@@ -178,10 +178,30 @@ function sameInput(a, b) {
     Math.abs(a.time - b.time) <= 2
   );
 }
+
+function accountIdentityMismatch(config, role, account) {
+  const observed = id(account?.user_id);
+  const matchesOtherRole = ["driver", "bot"].some(
+    (otherRole) => otherRole !== role && config[otherRole]?.qq === observed,
+  );
+  return Object.assign(new Error("Connected QQ account does not match the configured role."), {
+    code: "ACCOUNT_IDENTITY_MISMATCH",
+    identityDiagnostic: {
+      expectedRole: role,
+      observedIdentity: !observed
+        ? "missing"
+        : matchesOtherRole
+          ? "other_configured_account"
+          : "unrecognized",
+      postType: "other",
+    },
+  });
+}
+
 function safeFailure(error) {
   const identityDiagnostic = error?.identityDiagnostic;
   const safeIdentityDiagnostic =
-    error?.code === "EVENT_IDENTITY" &&
+    ["EVENT_IDENTITY", "ACCOUNT_IDENTITY_MISMATCH"].includes(error?.code) &&
     identityDiagnostic &&
     ["driver", "bot"].includes(identityDiagnostic.expectedRole) &&
     ["missing", "invalid", "other_configured_account", "unrecognized"].includes(
@@ -239,10 +259,8 @@ export class ChatSession {
       });
       await client.connect();
       const account = await client.call("get_login_info");
-      requireValue(
-        id(account?.user_id) === this.config[role].qq,
-        `Wrong ${role} QQ account; no send performed.`,
-      );
+      if (id(account?.user_id) !== this.config[role].qq)
+        throw accountIdentityMismatch(this.config, role, account);
       this.journal.append({ kind: "connected", account: role, accountId: this.config[role].qq });
     })()
       .catch((error) => {
@@ -317,23 +335,27 @@ export class ChatSession {
     const accounts = {};
     for (const role of ["driver", "bot"]) {
       try {
-        const status = await this.clients[role].call("get_status");
-        const login = await this.clients[role].call("get_login_info");
-        const observedQQ = id(login?.user_id);
+        const client = this.clients[role];
+        const account = await client.call("get_login_info");
+        const observedQQ = id(account?.user_id);
         const identityMatches = observedQQ === this.config[role].qq;
+        if (!identityMatches) {
+          const error = accountIdentityMismatch(this.config, role, account);
+          accounts[role] = {
+            qq: this.config[role].qq,
+            observedQQ,
+            identityMatches,
+            online: false,
+            error: safeFailure(error),
+          };
+          continue;
+        }
+        const status = await client.call("get_status");
         accounts[role] = {
           qq: this.config[role].qq,
           observedQQ,
           identityMatches,
-          online: status.online === true && identityMatches,
-          ...(!identityMatches
-            ? {
-                error: {
-                  code: "LOGIN_IDENTITY_MISMATCH",
-                  message: "NapCat account does not match the configured QQ identity.",
-                },
-              }
-            : {}),
+          online: status.online === true,
         };
       } catch (error) {
         accounts[role] = { qq: this.config[role].qq, online: false, error: safeFailure(error) };

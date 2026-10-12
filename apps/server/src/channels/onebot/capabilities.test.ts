@@ -166,6 +166,25 @@ describe("QQ capability registry", () => {
     ).toBeDefined();
   });
 
+  it("requires a card value before exposing the group-card mutation", () => {
+    for (const toolName of ["qq_group_local_settings", "qq_group_settings"]) {
+      const settings = qqCapability(toolName)!;
+      expect(
+        resolveQqOperation(settings, "set_group_card", {
+          group_id: 100,
+          user_id: 10004,
+        }),
+      ).toBeUndefined();
+      expect(
+        resolveQqOperation(settings, "set_group_card", {
+          group_id: 100,
+          user_id: 10004,
+          card: "Brian",
+        }),
+      ).toBeDefined();
+    }
+  });
+
   it("rejects QQ operation parameters with the wrong value type", () => {
     const moderation = qqCapability("qq_group_moderation")!;
     expect(
