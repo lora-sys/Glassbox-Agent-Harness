@@ -1,6 +1,7 @@
 services:
   napcat:
-    image: mlikiowa/napcat-docker@sha256:41b1a8e10953065f4796ab19c0c8760cd3175376be976c5480710d29a77357ee
+    # NapCat v4.18.30 includes recovery for silent QQ session loss.
+    image: mlikiowa/napcat-docker@sha256:335f9310198504d8d07aba91cc91d89215269891919c26eb4e46052ff8bb176d
     restart: unless-stopped
     environment:
       NAPCAT_UID: ${NAPCAT_UID:?Set the Linux user ID}

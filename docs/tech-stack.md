@@ -81,7 +81,7 @@ have its dependencies installed. The command checks the target before stopping G
 waits for the old database lock to clear, and restores the previous checkout if startup fails.
 It rejects a checkout whose database code is older than the shared database before stopping
 the current service. Bring that checkout forward to the current schema before testing it.
-`agent:status` shows the running checkout and whether Glassbox and OneBot ports are ready.
+`agent:status` shows the running checkout, Glassbox readiness, and readiness of its primary local OneBot endpoint at `127.0.0.1:6700`. It does not verify the QQ identity or the separate live-test Bot endpoint.\n\nUse `npm run qq:chat -- status` to check each account's reported identity and OneBot connection before sending a real message.
 Avoid concurrent switches because both commands change the same service process registry.
 Keep external provider keys in the access-restricted `service-launch.json` environment
 section when the service needs them after restart. The process registry does not store the

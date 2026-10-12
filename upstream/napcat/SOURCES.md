@@ -1,5 +1,18 @@
 # NapCat source index
 
+## Runtime image pin
+
+The Linux deployment compose file pins `mlikiowa/napcat-docker` v4.18.30 at digest
+`sha256:335f9310198504d8d07aba91cc91d89215269891919c26eb4e46052ff8bb176d`. This runtime pin is
+separate from the OneBot action-contract source pin below. NapCat v4.18.30 waits 60 seconds after
+a silent offline signal, then restarts its Worker and tries quick login. If QQ rejects quick login,
+the account still requires a new QR confirmation. This improves recovery after a session expires;
+it cannot prevent QQ from revoking a session.
+
+The version was validated in an isolated container without a network or account-state mounts. That
+check confirms container and WebUI startup only. Real account recovery still requires a controlled
+live test after the user is available.
+
 Reference project: `NapNeko/NapCatQQ`
 
 Pinned commit: `109d0c1dff755875f3b79795e99cee6115289fbb`
