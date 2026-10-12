@@ -81,3 +81,12 @@
 - 两个运行中的 NapCat 容器仍使用镜像摘要 sha256:41b1a8e10953065f4796ab19c0c8760cd3175376be976c5480710d29a77357ee。独立下载的官方 v4.18.30 镜像摘要为 sha256:335f9310198504d8d07aba91cc91d89215269891919c26eb4e46052ff8bb176d。它的发布说明包含静默离线后等待 60 秒、重启 Worker 并尝试快速登录的修复；快速登录失败仍要求扫码。
 - 上游 issue #2071 描述了与本项目历史 UI 看似在线、OneBot 不再收消息相符的静默离线路径。当前本机历史日志没有足够的匹配事件，不能确认所有 QQ 掉线都是这个根因。新镜像只在无网络、无持久卷的隔离容器中测试，WebUI 返回重定向；未测试 QQ 登录、自动恢复或真实收发。
 - 已将仓库部署 compose 更新到固定的 v4.18.30 镜像摘要，并更正文档：agent:status.onebotReady 只检查 6700，账号身份和 Bot 6701 状态以 qq:chat status 为准。该修改尚未部署到运行中的容器。
+
+
+## 2026-10-13 latest verification
+
+- After the 6100 login operation, both the configured account marker and WebUI auto-login setting identify the Bot account. Its OneBot configuration enables port 6701, but no process listens there. qq-chat status remains WS_NOT_READY. The Owner OneBot connection on 6700 remains online.
+- The Glassbox process remains on commit ede59656382fcefadc989bd94b0efc6f47233379 in /home/yanbingzhao/src/qq-self-role-surface with data in /home/yanbingzhao/.glassbox. No NapCat container or account directory was changed during this check.
+- The repository compose pin targets NapCat v4.18.30. The config was validated with non-live placeholder values. The live containers still use the previous image digest. No real QQ test can pass until Bot port 6701 is ready.
+- PR #142 now points to 01895f4425258567bef522e2d73edcde25c91d61. Local verify:full and verify:commit passed with 3,095 tests passed and one existing optional Herdr test skipped. GitHub checks are still running.
+- PR #140 is open and conflicting with PR #142. Their current changed-file lists overlap in 18 paths. PR #140 lists Issues #109, #110, #111, #112, and #117; all five issues remain open. PR #142 already covers #109, #111, #112, and #117. Keep #110 automatic unknown-send retry excluded because it can duplicate a message.
