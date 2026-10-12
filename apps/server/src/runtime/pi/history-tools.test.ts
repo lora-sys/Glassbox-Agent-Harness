@@ -1402,11 +1402,12 @@ it("produces a result the QQ Delivery Gate accepts, where the raw detail is refu
 
     expect(policy.prepare(answer)).toMatchObject({ allowed: true, reasons: [] });
     // The same answer built from the unprojected detail is exactly what the real Run hit:
-    // the internal record id trips the gate.
+    // the private record id is removed before delivery.
     const fromDetail = `消息 ID 是 ${(details as { items: Array<{ id: string }> }).items[0]!.id}。`;
     expect(policy.prepare(fromDetail)).toMatchObject({
-      allowed: false,
-      reasons: ["internal-uuid"],
+      allowed: true,
+      text: "消息 ID 是 【内部编号已隐藏】。",
+      redactedInternalUuidCount: 1,
     });
   } finally {
     await store.close();

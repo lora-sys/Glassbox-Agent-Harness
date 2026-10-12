@@ -24,6 +24,7 @@ import {
   type RunTransport,
   type SendOutcome,
 } from "./index.js";
+import { createQqDeliveryPolicy } from "../../delivery/content-policy.js";
 
 const group: TrustedChannelScope = {
   connectionId: "test-connection",
@@ -1283,6 +1284,46 @@ describe("durable Run scheduling", () => {
     await instance.drain();
     expect(execute.mock.calls[1]?.[0].history).toEqual([]);
     expect((await instance.getRun(owner(), next.run.id)).status).toBe("succeeded");
+  });
+
+  it("redacts internal UUIDs in a result, delivers the useful explanation, and records safe evidence", async () => {
+    const { store } = await fixture();
+    const sentPayloads: string[] = [];
+    const send = vi.fn(
+      async (request: Parameters<RunTransport["send"]>[0]): Promise<SendOutcome> => {
+        sentPayloads.push(request.delivery.payloadText);
+        return { status: "sent" };
+      },
+    );
+    const id = "83a4513a-742f-4d87-b047-ec67cc775c98";
+    const { instance, events } = service(
+      store,
+      {
+        supportsGroup: true,
+        execute: async () => ({
+          status: "succeeded",
+          text: `任务没能创建，内部编号 ${id}。`,
+        }),
+      },
+      { send },
+      { prepareDelivery: async (candidate) => createQqDeliveryPolicy().prepare(candidate) },
+    );
+    await instance.start();
+    const accepted = await instance.receive(input("redacted-result"));
+    await instance.drain();
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(sentPayloads).toEqual(["任务没能创建，内部编号 【内部编号已隐藏】。"]);
+    expect(JSON.stringify(sentPayloads)).not.toContain(id);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "delivery_content_redacted",
+        runId: accepted.run.id,
+        redactedInternalUuidCount: 1,
+      }),
+    );
+    expect(JSON.stringify(events)).not.toContain(id);
+    expect(events.some((event) => event.type === "delivery_blocked")).toBe(false);
   });
 
   it("keeps cancelling until the executor confirms its outcome", async () => {

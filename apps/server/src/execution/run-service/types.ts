@@ -210,6 +210,13 @@ export type RunServiceEvent =
       candidateSha256: string;
       candidateBytes: number;
     }
+  | {
+      type: "delivery_content_redacted";
+      runId: string;
+      conversationId: string;
+      redactedInternalUuidCount: number;
+      candidateSha256: string;
+    }
   /**
    * A delivery authorization refused the Run's answer.
    *
@@ -265,6 +272,7 @@ export interface RunServiceOptions {
     candidateSha256: string;
     artifactIds?: readonly string[];
     mediaAssetIds?: readonly string[];
+    redactedInternalUuidCount?: number;
   }>;
   /** Rechecks protocol authority before learning or executor effects. A result ends dispatch. */
   beforeExecution?: (input: ExecutionInput) => Promise<ExecutionResult | undefined>;

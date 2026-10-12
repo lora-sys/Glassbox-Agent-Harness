@@ -3,6 +3,7 @@ export const OPS_STATE_CODES = [
   "worker_file_authority_missing",
   "worker_not_started",
   "worker_binding_unverified",
+  "task_not_ready_for_rework",
 ] as const;
 
 export type OpsStateCode = (typeof OPS_STATE_CODES)[number];

@@ -1456,7 +1456,7 @@ export class AuthorizedOpsService {
     return this.withTaskOperation(taskId, async () => {
       const current = await this.binding(caller, taskId, "task:rework");
       await this.authorize(caller, `task-${taskId}`, "worker:prompt");
-      if (current.task.status !== "REVIEW") throw new Error("Task is not ready for rework");
+      if (current.task.status !== "REVIEW") throw new OpsStateError("task_not_ready_for_rework");
       if (this.workspaceBoundary)
         await this.closeWorker(current.task.activeAttemptId!, {
           paneId: current.binding.paneId,

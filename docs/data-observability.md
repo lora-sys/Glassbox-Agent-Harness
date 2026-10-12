@@ -396,6 +396,8 @@ An allowed authorization decision becomes a delivery source only after its prote
 
 The append-only delivery_blocked event stores reason codes, candidate byte count and a SHA-256 digest. It does not store the blocked candidate in that event. The original protected Run result remains subject to its existing database and authorization boundary.
 
+Unknown UUID-shaped identifiers in a candidate are replaced with a fixed placeholder before QQ delivery. Glassbox records only the replacement count and the original candidate digest in an append-only delivery_content_redacted event. Verified same-Run Artifact and Asset IDs keep their existing authorized delivery path. Other content findings, including secrets, private paths and private-network URLs, still block the candidate and use delivery_blocked evidence.
+
 ## Server deployment rule
 
 Local testing and the production Linux server use the same product contracts.

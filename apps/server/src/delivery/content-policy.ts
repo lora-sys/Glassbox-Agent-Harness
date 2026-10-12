@@ -10,6 +10,7 @@ export interface DeliveryContentDecision {
   candidateSha256: string;
   artifactIds?: readonly string[];
   mediaAssetIds?: readonly string[];
+  redactedInternalUuidCount?: number;
 }
 
 export const DELIVERY_UUID =
@@ -79,11 +80,20 @@ export function createQqDeliveryPolicy(
         [...allowedArtifacts, ...allowedMediaAssets].map((id) => id.toLowerCase()),
       );
       const initial = inspect(candidate, allowedArtifactIds);
-      if (initial.length > 0) return { allowed: false, reasons: initial, candidateSha256 };
-      const visibleCandidate = candidate.replace(
-        /\[asset:([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\]/giu,
-        (_marker, id: string) => (allowedArtifactIds.has(id.toLowerCase()) ? "" : _marker),
-      );
+      if (initial.some((reason) => reason !== "internal-uuid"))
+        return { allowed: false, reasons: initial, candidateSha256 };
+      const redactedInternalUuidCount = [...candidate.matchAll(DELIVERY_UUID)].filter(
+        (match) => !allowedArtifactIds.has(match[0]!.toLowerCase()),
+      ).length;
+      const visibleCandidate = candidate
+        .replace(
+          /\[asset:([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\]/giu,
+          (_marker, id: string) =>
+            allowedArtifactIds.has(id.toLowerCase()) ? "" : "【未验证资源编号已隐藏】",
+        )
+        .replace(DELIVERY_UUID, (id) =>
+          allowedArtifactIds.has(id.toLowerCase()) ? id : "【内部编号已隐藏】",
+        );
       const text = renderQqPlainText(visibleCandidate);
       if (!text) return { allowed: false, reasons: ["empty-rendered-output"], candidateSha256 };
       const rendered = inspect(text, allowedArtifactIds);
@@ -95,6 +105,7 @@ export function createQqDeliveryPolicy(
             reasons: [],
             candidateSha256,
             artifactIds: allowedArtifacts,
+            ...(redactedInternalUuidCount > 0 ? { redactedInternalUuidCount } : {}),
             ...(allowedMediaAssets.length > 0 ? { mediaAssetIds: allowedMediaAssets } : {}),
           };
     },

@@ -909,6 +909,14 @@ export class RunService {
     const deliveryText = contentBlocked
       ? "这次回复未通过发送检查，内容已保留供检查。请勿重复提交可能已经执行的操作。"
       : prepared.text!;
+    if (!existing && (prepared.redactedInternalUuidCount ?? 0) > 0)
+      await this.emit({
+        type: "delivery_content_redacted",
+        runId: run.id,
+        conversationId: run.conversationId,
+        redactedInternalUuidCount: prepared.redactedInternalUuidCount!,
+        candidateSha256: prepared.candidateSha256,
+      });
     if (!existing && contentBlocked) {
       const newlyBlocked = await this.options.store.conversations.excludeRunFromContext(
         caller,

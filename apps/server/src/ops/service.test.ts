@@ -997,7 +997,7 @@ it("preserves a failed rework attempt and never replays an uncertain prompt", as
       prompt: "Bounded work",
     });
     const binding = (await store.tasks.getWorkerBinding(task.activeAttemptId!))!;
-    await store.tasks.observeWorker(binding, "done");
+    expect(task.status).not.toBe("REVIEW");
     for (const action of ["task:rework", "worker:prompt"])
       await store.authorization.grant({
         principalId: "owner",
@@ -1006,6 +1006,10 @@ it("preserves a failed rework attempt and never replays an uncertain prompt", as
         scope: caller.scope,
         effect: "allow",
       });
+    await expect(
+      service.rework(caller, task.id, "Not reviewed yet", "Do not run"),
+    ).rejects.toMatchObject({ code: "task_not_ready_for_rework" });
+    await store.tasks.observeWorker(binding, "done");
     const prompt = vi.spyOn(bridge, "promptAgent").mockRejectedValue(new Error("SECRET_FAILURE"));
     const reworked = await service.rework(caller, task.id, "Missing case", "Add case");
     expect(reworked.status).toBe("WAITING_INPUT");
