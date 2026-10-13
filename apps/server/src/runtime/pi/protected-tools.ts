@@ -2,6 +2,7 @@ import type { AuthorizationPolicyCondition } from "../../auth/policy-condition.j
 import type { AgentToolResult, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "typebox";
 import type { CallerContext } from "../../identity/scope.js";
+import type { PiRunContext } from "./types.js";
 import { AccessDeniedError, type AuthorizationService } from "../../auth/service.js";
 import { ProviderCallError } from "./provider-outcome.js";
 import { OPS_STATE_CODES } from "../../ops/errors.js";
@@ -38,6 +39,28 @@ export interface ProtectedToolContext {
     resourceId: string;
     toolInput: Readonly<Record<string, unknown>>;
   }) => Promise<void>;
+}
+
+export function createProtectedToolContextProvider(
+  getRunContext: () => PiRunContext | undefined,
+): () => ProtectedToolContext | undefined {
+  return () => {
+    const value = getRunContext();
+    return value?.caller && value.conversationId && value.runId
+      ? {
+          caller: value.caller,
+          conversationId: value.conversationId,
+          runId: value.runId,
+          ...(value.acceptanceLease ? { acceptanceLease: value.acceptanceLease } : {}),
+          ...(value.requiredToolName === undefined
+            ? {}
+            : { requiredToolName: value.requiredToolName }),
+          ...(value.requiredToolInput === undefined
+            ? {}
+            : { requiredToolInput: value.requiredToolInput }),
+        }
+      : undefined;
+  };
 }
 
 export interface VerifiedProtectedToolInput {

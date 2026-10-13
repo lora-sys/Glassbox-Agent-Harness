@@ -23,6 +23,7 @@ import { AuthorizedQQSourceReader } from "../../retrieval/qq-source-reader.js";
 import { groupResourceId } from "../../retrieval/source-resolver.js";
 import {
   createProtectedTool,
+  createProtectedToolContextProvider,
   ToolInputError,
   type ProtectedToolContext,
 } from "./protected-tools.js";
@@ -702,23 +703,7 @@ export function createOwnerMemoryTools(options: {
   store: DomainStore;
   getContext: () => PiRunContext | undefined;
 }): ToolDefinition[] {
-  const getContext = (): ProtectedToolContext | undefined => {
-    const value = options.getContext();
-    return value?.caller && value.conversationId && value.runId
-      ? {
-          caller: value.caller,
-          conversationId: value.conversationId,
-          runId: value.runId,
-          ...(value.acceptanceLease ? { acceptanceLease: value.acceptanceLease } : {}),
-          ...(value.requiredToolName === undefined
-            ? {}
-            : { requiredToolName: value.requiredToolName }),
-          ...(value.requiredToolInput === undefined
-            ? {}
-            : { requiredToolInput: value.requiredToolInput }),
-        }
-      : undefined;
-  };
+  const getContext = createProtectedToolContextProvider(options.getContext);
   return [
     createProtectedTool<OwnerMemoryToolInput>({
       name: OWNER_MEMORY_ADMIN_TOOL,
