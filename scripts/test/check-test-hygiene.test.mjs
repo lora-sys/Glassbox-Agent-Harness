@@ -104,3 +104,32 @@ test("AST comparison permits intentional assertion changes only with a review ma
   assert.deepEqual(result.errors, []);
   assert.match(result.warnings[0], /manual review required/u);
 });
+
+test("AST comparison permits only exact one-to-one reviewed test replacements", () => {
+  const result = inspectTestSources([
+    {
+      path: "fixture.test.mjs",
+      oldSource: 'test("old behavior", () => assert.equal(attempts, 3));',
+      newSource:
+        "// test-contract-change: GH-194 send outcomes stay unknown\n" +
+        '// test-contract-replacement: "old behavior" => "preserves unknown outcome"\n' +
+        'test("preserves unknown outcome", () => assert.equal(attempts, 1));',
+    },
+  ]);
+  assert.deepEqual(result.errors, []);
+  assert.deepEqual(result.deletedTests, []);
+  assert.match(result.warnings[0], /replaced with "preserves unknown outcome"/u);
+
+  const invalid = inspectTestSources([
+    {
+      path: "fixture.test.mjs",
+      oldSource: 'test("old behavior", () => assert.equal(attempts, 3));',
+      newSource:
+        "// test-contract-change: GH-194 send outcomes stay unknown\n" +
+        '// test-contract-replacement: "old behavior" => "missing replacement"\n' +
+        'test("preserves unknown outcome", () => assert.equal(attempts, 1));',
+    },
+  ]);
+  assert.ok(invalid.errors.includes("invalid-test-replacement"));
+  assert.ok(invalid.errors.includes("reduced-test-coverage"));
+});

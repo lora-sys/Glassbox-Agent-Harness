@@ -1,4 +1,9 @@
-// test-contract-change: ISSUE-194 assert delivery retry boundaries and recovery of persisted queued Runs.
+// test-contract-change: ISSUE-194 preserve unknown delivery outcomes and recovery of persisted queued Runs.
+// test-contract-replacement: "durable result delivery and recovery > retries an unconfirmed send with the same delivery and settles once on success (#110)" => "durable result delivery and recovery > does not resend a timeout outcome whose delivery is unknown"
+// test-contract-replacement: "durable result delivery and recovery > settles unknown with attention after bounded retries are exhausted (#110)" => "durable result delivery and recovery > keeps a disconnected delivery unknown and records Owner attention"
+// test-contract-replacement: "durable result delivery and recovery > rechecks delivery authority before each automatic retry (#110)" => "durable result delivery and recovery > does not retry an unknown send_error after delivery authority changes"
+// test-contract-replacement: "durable result delivery and recovery > does not retry after service shutdown during backoff (#110)" => "durable result delivery and recovery > does not replay an unknown transport error after service shutdown"
+// test-contract-replacement: "durable result delivery and recovery > never retries a confirmed failure or unclassified response (#110)" => "durable result delivery and recovery > sends a confirmed API rejection once and preserves its failure"
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -157,7 +162,6 @@ function service(
     concurrency?: number;
     queuedPollMs?: number;
     deliveryTimeoutMs?: number;
-    deliveryRetryDelaysMs?: readonly number[];
     prepareDelivery?: ConstructorParameters<typeof RunService>[0]["prepareDelivery"];
     captureLearning?: ConstructorParameters<typeof RunService>[0]["captureLearning"];
     beforeExecution?: ConstructorParameters<typeof RunService>[0]["beforeExecution"];
@@ -179,6 +183,29 @@ function service(
   });
   services.push(instance);
   return { instance, events, errors };
+}
+
+async function sendResultOnce(outcome: SendOutcome, messageId: string) {
+  const { store, grants } = await fixture();
+  let attempts = 0;
+  const { instance, events } = service(
+    store,
+    { supportsGroup: true, execute: async () => ({ status: "succeeded", text: "result" }) },
+    {
+      send: async ({ delivery }) => {
+        if (delivery.payloadKind === "ack") return { status: "sent" };
+        attempts += 1;
+        return outcome;
+      },
+    },
+  );
+  await instance.start();
+  const accepted = await instance.receive(input(messageId));
+  await instance.drain();
+  const delivery = (await store.lifecycle.listDeliveries(owner(), accepted.run.id)).items.find(
+    (item) => item.payloadKind === "result",
+  );
+  return { store, grants, instance, events, accepted, attempts: () => attempts, delivery };
 }
 
 it("publishes a durable Task review notice through the exact origin audience", async () => {
@@ -1939,7 +1966,7 @@ describe("durable result delivery and recovery", () => {
           return new Promise(() => {});
         },
       },
-      { deliveryTimeoutMs: 50, deliveryRetryDelaysMs: [1] },
+      { deliveryTimeoutMs: 50 },
     );
     await instance.start();
     const accepted = await instance.receive(input("timeout-send"));
@@ -1963,175 +1990,127 @@ describe("durable result delivery and recovery", () => {
     ).toBe("unknown");
   });
 
-  it("retries an unconfirmed send with the same delivery and settles once on success (#110)", async () => {
-    const { store } = await fixture();
-    const seen: string[] = [];
-    let resultAttempts = 0;
-    const { instance, events } = service(
-      store,
-      { supportsGroup: true, execute: async () => ({ status: "succeeded", text: "result" }) },
-      {
-        send: async ({ delivery }) => {
-          if (delivery.payloadKind === "ack") return { status: "sent" };
-          seen.push(delivery.id);
-          resultAttempts += 1;
-          return resultAttempts < 3
-            ? { status: "unknown", reason: "timeout" }
-            : { status: "sent", externalId: "m-1" };
-        },
-      },
-      { deliveryRetryDelaysMs: [1, 1] },
+  it("does not resend a timeout outcome whose delivery is unknown", async () => {
+    const result = await sendResultOnce(
+      { status: "unknown", reason: "timeout" },
+      "single-send-timeout",
     );
-    await instance.start();
-    const accepted = await instance.receive(input("retry-send"));
-    await instance.drain();
-    expect(resultAttempts).toBe(3);
-    expect(new Set(seen).size).toBe(1);
-    expect(events).toContainEqual(
-      expect.objectContaining({ type: "delivery_changed", status: "sent", attempts: 3 }),
+    expect(result.attempts()).toBe(1);
+    expect(result.delivery).toMatchObject({ status: "unknown" });
+    expect(result.events).toContainEqual(
+      expect.objectContaining({ type: "delivery_changed", status: "unknown", reason: "timeout" }),
     );
-    expect(
-      (await store.lifecycle.listDeliveries(owner(), accepted.run.id)).items.find(
-        (item) => item.payloadKind === "result",
-      )?.status,
-    ).toBe("sent");
   });
 
-  it("settles unknown with attention after bounded retries are exhausted (#110)", async () => {
-    const { store } = await fixture();
-    let resultAttempts = 0;
-    const { instance, events } = service(
-      store,
-      { supportsGroup: true, execute: async () => ({ status: "succeeded", text: "result" }) },
-      {
-        send: async ({ delivery }) => {
-          if (delivery.payloadKind === "ack") return { status: "sent" };
-          resultAttempts += 1;
-          return { status: "unknown", reason: "disconnected" };
-        },
-      },
-      { deliveryRetryDelaysMs: [1, 1] },
+  it("keeps a disconnected delivery unknown and records Owner attention", async () => {
+    const result = await sendResultOnce(
+      { status: "unknown", reason: "disconnected" },
+      "single-send-disconnected",
     );
-    await instance.start();
-    await instance.receive(input("retry-exhausted"));
-    await instance.drain();
-    expect(resultAttempts).toBe(3);
-    expect(events).toContainEqual(
-      expect.objectContaining({
-        type: "delivery_changed",
-        status: "unknown",
-        reason: "disconnected",
-        attempts: 3,
-      }),
-    );
-    expect((await store.tasks.listAttentionItems())[0]!.summary).toContain("disconnected");
+    expect(result.attempts()).toBe(1);
+    expect(result.delivery).toMatchObject({ status: "unknown" });
+    expect((await result.store.tasks.listAttentionItems())[0]!.summary).toContain("disconnected");
   });
 
-  it("rechecks delivery authority before each automatic retry (#110)", async () => {
-    const { store, grants } = await fixture();
-    vi.useFakeTimers();
-    const firstAttempt = deferred<void>();
-    let resultAttempts = 0;
-    const { instance, events } = service(
-      store,
-      { supportsGroup: true, execute: async () => ({ status: "succeeded", text: "result" }) },
-      {
-        send: async ({ delivery }) => {
-          if (delivery.payloadKind === "ack") return { status: "sent" };
-          resultAttempts += 1;
-          firstAttempt.resolve();
-          return { status: "unknown", reason: "timeout" };
-        },
-      },
-      { deliveryRetryDelaysMs: [1_000] },
+  it("does not retry an unknown send_error after delivery authority changes", async () => {
+    const result = await sendResultOnce(
+      { status: "unknown", reason: "send_error" },
+      "single-send-error",
     );
-    await instance.start();
-    const accepted = await instance.receive(input("retry-revoked-during-backoff"));
-    await firstAttempt.promise;
-    await store.authorization.revoke(grants.get(scopeKey(group) + "delivery:send")!);
+    await result.store.authorization.revoke(result.grants.get(scopeKey(group) + "delivery:send")!);
+    await expect(
+      result.instance.retryDelivery(owner(), result.accepted.run.id, result.delivery!.id),
+    ).rejects.toThrow();
+    expect(result.attempts()).toBe(1);
+    expect(result.delivery).toMatchObject({ status: "unknown" });
+  });
 
-    await vi.advanceTimersByTimeAsync(1_000);
-    await instance.drain();
+  it("does not replay an unknown transport error after service shutdown", async () => {
+    const result = await sendResultOnce(
+      { status: "unknown", reason: "transport_error" },
+      "single-send-stopped",
+    );
+    await result.instance.stop();
+    await result.instance.start();
+    await result.instance.drain();
+    expect(result.attempts()).toBe(1);
+    expect(result.delivery).toMatchObject({ status: "unknown" });
+  });
 
-    expect(resultAttempts).toBe(1);
-    expect(
-      (await store.lifecycle.listDeliveries(owner(), accepted.run.id)).items.find(
-        (item) => item.payloadKind === "result",
-      )?.status,
-    ).toBe("unknown");
-    expect((await store.tasks.listAttentionItems())[0]!.summary).toContain("timeout");
-    expect(events).toContainEqual(
+  it("sends a confirmed API rejection once and preserves its failure", async () => {
+    const result = await sendResultOnce(
+      { status: "failed", reason: "api_rejected" },
+      "single-send-api-rejected",
+    );
+    expect(result.attempts()).toBe(1);
+    expect(result.delivery).toMatchObject({ status: "failed" });
+    expect(result.events).toContainEqual(
       expect.objectContaining({
         type: "delivery_changed",
-        status: "unknown",
-        retryStoppedReason: "authorization_changed",
+        status: "failed",
+        reason: "api_rejected",
       }),
     );
   });
 
-  it("does not retry after service shutdown during backoff (#110)", async () => {
-    const { store } = await fixture();
-    vi.useFakeTimers();
-    const firstAttempt = deferred<void>();
-    let resultAttempts = 0;
-    const { instance, events } = service(
-      store,
-      { supportsGroup: true, execute: async () => ({ status: "succeeded", text: "result" }) },
-      {
-        send: async ({ delivery }) => {
-          if (delivery.payloadKind === "ack") return { status: "sent" };
-          resultAttempts += 1;
-          firstAttempt.resolve();
-          return { status: "unknown", reason: "disconnected" };
-        },
-      },
-      { deliveryRetryDelaysMs: [1_000] },
+  it("does not resend an invalid response with unknown delivery status", async () => {
+    const result = await sendResultOnce(
+      { status: "unknown", reason: "invalid_response" },
+      "single-send-invalid-response",
     );
-    await instance.start();
-    await instance.receive(input("retry-stopped-during-backoff"));
-    await firstAttempt.promise;
-    await instance.stop();
-    await vi.advanceTimersByTimeAsync(1_000);
-    await instance.drain();
-
-    expect(resultAttempts).toBe(1);
-    expect((await store.tasks.listAttentionItems())[0]!.summary).toContain("disconnected");
-    expect(events).toContainEqual(
+    expect(result.attempts()).toBe(1);
+    expect(result.delivery).toMatchObject({ status: "unknown" });
+    expect(result.events).toContainEqual(
       expect.objectContaining({
         type: "delivery_changed",
         status: "unknown",
-        retryStoppedReason: "service_stopped",
+        reason: "invalid_response",
       }),
     );
   });
 
-  it.each([
-    { status: "failed", reason: "api_rejected" },
-    { status: "unknown", reason: "invalid_response" },
-    { status: "unknown", reason: "async_response" },
-  ] as const)(
-    "never retries a confirmed failure or unclassified response (#110)",
-    async (outcome) => {
-      const { store } = await fixture();
-      let resultAttempts = 0;
-      const { instance } = service(
-        store,
-        { supportsGroup: true, execute: async () => ({ status: "succeeded", text: "result" }) },
-        {
-          send: async ({ delivery }) => {
-            if (delivery.payloadKind === "ack") return { status: "sent" };
-            resultAttempts += 1;
-            return outcome;
-          },
-        },
-        { deliveryRetryDelaysMs: [1, 1] },
-      );
-      await instance.start();
-      await instance.receive(input(`no-retry-${outcome.reason}`));
-      await instance.drain();
-      expect(resultAttempts).toBe(1);
-    },
-  );
+  it("does not resend an asynchronous response with unknown delivery status", async () => {
+    const result = await sendResultOnce(
+      { status: "unknown", reason: "async_response" },
+      "single-send-async-response",
+    );
+    expect(result.attempts()).toBe(1);
+    expect(result.delivery).toMatchObject({ status: "unknown" });
+    expect(result.events).toContainEqual(
+      expect.objectContaining({
+        type: "delivery_changed",
+        status: "unknown",
+        reason: "async_response",
+      }),
+    );
+  });
+
+  it("does not resend after the delivery timeout expires", async () => {
+    const result = await sendResultOnce(
+      { status: "unknown", reason: "delivery_timeout" },
+      "single-send-delivery-timeout",
+    );
+    expect(result.attempts()).toBe(1);
+    expect(result.delivery).toMatchObject({ status: "unknown" });
+  });
+
+  it("does not resend after the transport reports an error", async () => {
+    const result = await sendResultOnce(
+      { status: "unknown", reason: "transport_error" },
+      "single-send-transport-error",
+    );
+    expect(result.attempts()).toBe(1);
+    expect(result.delivery).toMatchObject({ status: "unknown" });
+  });
+
+  it("does not resend an unclassified outcome", async () => {
+    const result = await sendResultOnce(
+      { status: "unknown", reason: "unclassified" },
+      "single-send-unclassified",
+    );
+    expect(result.attempts()).toBe(1);
+    expect(result.delivery).toMatchObject({ status: "unknown" });
+  });
 
   it("recovers execution facts and queued work without replaying active or uncertain work", async () => {
     const { store } = await fixture();

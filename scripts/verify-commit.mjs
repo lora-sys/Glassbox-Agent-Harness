@@ -151,6 +151,15 @@ function getTestIntegrityIssues(entries, sourcePairs = []) {
       ],
     });
   }
+  if (integrity.errors.includes("invalid-test-replacement")) {
+    issues.push({
+      message:
+        "Commit blocked: test replacements need one exact reviewed old-to-new title mapping.",
+      details: [
+        "  Check test-contract-replacement markers and the test-contract-change review marker.",
+      ],
+    });
+  }
   const assertionChanges = integrity.errors.filter((error) => error.startsWith('Test "'));
   if (assertionChanges.length > 0) {
     issues.push({

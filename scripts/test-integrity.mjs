@@ -3,6 +3,15 @@ import ts from "typescript";
 const TEST_DSL = new Set(["describe", "it", "test"]);
 const DISABLED_DSL = new Set(["skip", "only", "todo", "skipIf"]);
 const REVIEW_MARKER = /^\s*\/\/\s*test-contract-change:\s*(\S+)\s+(.+)$/mu;
+const REPLACEMENT_MARKER =
+  /^\s*\/\/\s*test-contract-replacement:\s*"([^"\n]+)"\s*=>\s*"([^"\n]+)"\s*$/gmu;
+
+function testReplacements(sourceText) {
+  return [...sourceText.matchAll(REPLACEMENT_MARKER)].map((match) => ({
+    oldTitle: match[1],
+    newTitle: match[2],
+  }));
+}
 
 function expressionName(node) {
   if (ts.isIdentifier(node)) return node.text;
@@ -123,6 +132,7 @@ export function analyzeTestSource(filePath, sourceText) {
         ts.flattenDiagnosticMessageText(diagnostic.messageText, " "),
       ),
       reviewMarker: REVIEW_MARKER.exec(sourceText)?.[0],
+      replacements: testReplacements(sourceText),
     };
   }
 
@@ -179,6 +189,7 @@ export function analyzeTestSource(filePath, sourceText) {
     alwaysPassing,
     parseErrors: [],
     reviewMarker: REVIEW_MARKER.exec(sourceText)?.[0],
+    replacements: testReplacements(sourceText),
   };
 }
 
@@ -221,6 +232,30 @@ export function inspectTestSources(sourcePairs) {
 
   const oldByTitle = byTitle(before);
   const newByTitle = byTitle(after);
+  const replacements = new Map();
+  const replacementTargets = new Set();
+  for (const analysis of newAnalyses) {
+    for (const replacement of analysis.replacements) {
+      const oldMatches = oldByTitle.get(replacement.oldTitle) ?? [];
+      const newMatches = newByTitle.get(replacement.newTitle) ?? [];
+      if (
+        !analysis.reviewMarker ||
+        replacement.oldTitle === replacement.newTitle ||
+        oldMatches.length !== 1 ||
+        newMatches.length !== 1 ||
+        replacements.has(replacement.oldTitle) ||
+        replacementTargets.has(replacement.newTitle)
+      ) {
+        errors.push("invalid-test-replacement");
+        continue;
+      }
+      replacements.set(replacement.oldTitle, {
+        newTitle: replacement.newTitle,
+        reviewMarker: analysis.reviewMarker,
+      });
+      replacementTargets.add(replacement.newTitle);
+    }
+  }
   for (const [title, oldGroup] of oldByTitle) {
     const candidates = [...(newByTitle.get(title) ?? [])];
     for (const oldTest of oldGroup) {
@@ -240,7 +275,22 @@ export function inspectTestSources(sourcePairs) {
         if (marker) warnings.push(change + "; manual review required by " + marker.trim() + ".");
         else errors.push(change);
       } else {
-        deletedTests.push(title);
+        const replacement = replacements.get(title);
+        const candidates = replacement ? newByTitle.get(replacement.newTitle) : undefined;
+        if (candidates?.length === 1) {
+          candidates.pop();
+          warnings.push(
+            'Test "' +
+              title +
+              '" replaced with "' +
+              replacement.newTitle +
+              '"; manual review required by ' +
+              replacement.reviewMarker.trim() +
+              ".",
+          );
+        } else {
+          deletedTests.push(title);
+        }
       }
     }
   }

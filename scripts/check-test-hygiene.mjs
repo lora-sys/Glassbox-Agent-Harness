@@ -26,6 +26,8 @@ export function inspectTestDiff(entriesText, _diff, sourcePairs = []) {
   if (integrity.alwaysPassing.length > 0) errors.push("always-passing-assertions");
   if (integrity.parseErrors.length > 0) errors.push("test-parse-errors");
   if (integrity.errors.includes("reduced-test-coverage")) errors.push("reduced-test-coverage");
+  if (integrity.errors.includes("invalid-test-replacement"))
+    errors.push("invalid-test-replacement");
   errors.push(...integrity.errors.filter((error) => error.startsWith('Test "')));
   return {
     entries,
@@ -94,6 +96,8 @@ function main() {
       console.error("- Always-passing assertions are not accepted.");
     if (result.errors.includes("reduced-test-coverage"))
       console.error("- Existing test cases and their assertions must be preserved.");
+    if (result.errors.includes("invalid-test-replacement"))
+      console.error("- Test replacements need an exact reviewed old-to-new title mapping.");
     for (const error of result.errors.filter((item) => item.startsWith('Test "')))
       console.error(
         "- " + error + "; add a test-contract-change marker for intentional contracts.",
