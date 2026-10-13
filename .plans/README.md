@@ -1,20 +1,12 @@
 # Plans
 
-This directory contains the active implementation plans and durable technical findings.
+This directory contains implementation plans, completed acceptance records, and durable technical findings.
 
-## Active plans
+## Current implementation scope
 
-P3 completed on 2026-09-19.
+No numbered implementation Plan is active. P3, P4A, P4B, the Issue #21 repository refactor, P5A, P5B, and the implementation of Issue #24 are complete.
 
-P4A, P4B, and Issue #21 are complete. Issue #24 owns the current closeout before the next product phase:
-
-```text
-issue-24-closeout.md
-  Issue #24
-  Delivery-source reauthorization, Herdr Worker workspace occupancy, acceptance
-```
-
-The P4 and Issue #21 plans remain as completed architecture and acceptance records. This closeout does not implement P5 product behavior.
+Issue #24 remains open for real QQ Owner delegation acceptance. Issue #30 tracks the Linux-native acceptance prerequisite. Keep the completed plans below as architecture and acceptance records. Select new implementation work from an open Issue in `roadmap.md` and its linked plan, when one exists.
 
 ## Completed P4 plans
 
@@ -28,15 +20,16 @@ The P4 and Issue #21 plans remain as completed architecture and acceptance recor
   Authorized retrieval / QQ history search
 ```
 
-## Read order for the current closeout
+## Read order for a selected Issue
 
 1. `../AGENTS.md`
-2. `issue-24-closeout.md`
-3. Issue #24
-4. only the relevant files under `findings/`
-5. current production code and focused tests
+2. The active Plan, when one exists. Otherwise select the open Issue from `roadmap.md` that owns the requested work.
+3. The selected Issue and its linked plan, when one exists.
+4. The relevant architecture document from `../docs/`.
+5. Only the relevant files under `findings/`.
+6. Relevant upstream sources, then current production code and focused tests.
 
-`README.md` defines product direction. `AGENTS.md` defines stable engineering and safety rules. The active plan and its Issue define the implementation scope.
+`README.md` defines product direction. `AGENTS.md` defines stable engineering and safety rules. An active Plan and its Issue define implementation scope. When no active Plan exists, the selected open Issue and `roadmap.md` define scope.
 
 ## Historical phases
 
