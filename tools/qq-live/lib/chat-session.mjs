@@ -137,6 +137,24 @@ function credentials(config, role) {
   );
   return { ...process.env, [a.tokenEnv]: matches[0].token };
 }
+export function projectChatRuntimeStatus(status) {
+  const processes = status.processes?.filter((p) => p.name === "glassbox") ?? [];
+  return {
+    ready:
+      status.glassboxReady === true &&
+      (status.onebotReady === true || status.onebotListener?.listening === true) &&
+      processes.length === 1 &&
+      processes[0].running === true,
+    dataDirectory: status.dataDirectory,
+    processes: processes.map((p) => ({
+      pid: p.pid,
+      running: p.running,
+      checkout: p.checkout,
+      commit: p.launchCommit,
+      sourceTreeSha256: p.launchSourceTreeSha256,
+    })),
+  };
+}
 export function inspectChatRuntime(config) {
   const checkout = config.runtime.checkout;
   const status = JSON.parse(
@@ -152,22 +170,7 @@ export function inspectChatRuntime(config) {
       },
     ),
   );
-  const processes = status.processes?.filter((p) => p.name === "glassbox") ?? [];
-  return {
-    ready:
-      status.glassboxReady === true &&
-      status.onebotReady === true &&
-      processes.length === 1 &&
-      processes[0].running === true,
-    dataDirectory: status.dataDirectory,
-    processes: processes.map((p) => ({
-      pid: p.pid,
-      running: p.running,
-      checkout: p.checkout,
-      commit: p.launchCommit,
-      sourceTreeSha256: p.launchSourceTreeSha256,
-    })),
-  };
+  return projectChatRuntimeStatus(status);
 }
 function sameInput(a, b) {
   return (

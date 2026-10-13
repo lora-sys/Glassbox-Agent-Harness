@@ -10,6 +10,7 @@ import {
   ChatSession,
   chatConfig,
   projectChatEvent,
+  projectChatRuntimeStatus,
   routeFor,
 } from "../lib/chat-session.mjs";
 import { serve, rpc } from "../chat.mjs";
@@ -83,6 +84,40 @@ function fixture(t) {
     },
   };
 }
+test("runtime status accepts the current OneBot listener contract and rejects an offline listener", () => {
+  const status = {
+    dataDirectory: "/data",
+    glassboxReady: true,
+    onebotListener: { host: "127.0.0.1", port: 6700, listening: true },
+    processes: [
+      {
+        name: "glassbox",
+        pid: 42,
+        running: true,
+        checkout: "/checkout",
+        launchCommit: "abc123",
+      },
+    ],
+  };
+  const ready = projectChatRuntimeStatus(status);
+  assert.equal(ready.ready, true);
+  assert.equal(ready.processes[0].pid, 42);
+  assert.equal(
+    projectChatRuntimeStatus({
+      ...status,
+      onebotListener: { ...status.onebotListener, listening: false },
+    }).ready,
+    false,
+  );
+  assert.equal(
+    projectChatRuntimeStatus({
+      ...status,
+      onebotListener: undefined,
+      onebotReady: true,
+    }).ready,
+    true,
+  );
+});
 test("free text routes only to configured private/group chats and excludes other members", (t) => {
   const { config } = fixture(t);
   assert.equal(routeFor(config, "B"), "20002");
