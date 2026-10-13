@@ -16,7 +16,12 @@ import {
   type ContextDemandEstimate,
   type ContextProjectionResult,
 } from "../../efficiency/index.js";
-import { deriveRequestCapacity, type RequestCapacityBudget } from "./request-budget.js";
+import {
+  deriveRequestCapacity,
+  REQUEST_CAPACITY_POLICY_VERSION,
+  type RequestCapacityBudget,
+  type RequestCapacityPolicyVersion,
+} from "./request-budget.js";
 import { exactTerms } from "../../retrieval/exact-term.js";
 import {
   QQ_CAPABILITY_CATEGORIES,
@@ -45,7 +50,6 @@ import {
   groupMemberProfileRequest,
   namedGroupId,
   officialSourceVerificationRequested,
-  ownerHistorySearchRequested,
   requestClauses,
   requiredEvidenceFor,
   resolveEvidence,
@@ -889,7 +893,7 @@ export type RunEvidenceRecord =
       runId: string;
       principalId: string;
       conversationId: string;
-      policyVersion: "p5a-context-v1" | "p5a-pi-dynamic-output-v1";
+      policyVersion: RequestCapacityPolicyVersion;
       estimateSource: "unicode_conservative";
       demandTokens: number;
       contextWindowTokens: number;
@@ -1033,6 +1037,7 @@ function botGroupRoleQuestion(text: string): boolean {
 
 function requiredToolCall(
   input: ExecutionInput,
+  evidence: readonly RequiredEvidence[],
   isOwner: boolean,
   authorizedToolNames?: readonly string[],
   modelProfiles: readonly PublicModelProfile[] = [],
@@ -1040,20 +1045,26 @@ function requiredToolCall(
   gateMessages: GateMessages = GATE_MESSAGES,
 ): RequiredToolCall | undefined {
   if (input.caller.scope.chatType === "group") {
-    // Pin a Bot self-role read to the trusted Bot ID before tool discovery can include history or unrelated member reads.
     if (botGroupRoleQuestion(input.text)) {
       const { botId, chatId } = input.caller.scope;
-      if (/^[1-9]\d{4,14}$/u.test(botId) && /^[1-9]\d{0,15}$/u.test(chatId))
+      if (/^[1-9]\d{4,14}$/u.test(botId) && /^[1-9]\d{0,15}$/u.test(chatId)) {
+        const roleEvidence = evidence.find((item) => item.domain === "bot_group_role");
         return {
-          name: "qq_group_members",
+          name: roleEvidence?.tool ?? "qq_group_members",
           input: {
             groupId: chatId,
-            operation: "get_group_member_info",
-            params: { user_id: botId },
+            ...(roleEvidence?.input ?? {
+              operation: "get_group_member_info",
+              params: { user_id: botId },
+            }),
           },
         };
+      }
     }
-    if (groupHistorySearchRequested(input.text) || groupHistorySearchFollowUpRequested(input)) {
+    if (
+      evidence.some((item) => item.domain === "group_history_search") ||
+      groupHistorySearchFollowUpRequested(input)
+    ) {
       // A single segmented identifier is a literal query, not prose for the model to reinterpret.
       // Bind it into the required input so a call for a different value cannot satisfy this Run.
       // Bare digit runs are excluded because they can name a sender rather than message text.
@@ -1121,7 +1132,9 @@ function requiredToolCall(
     )
   )
     return undefined;
-  if (ownerHistorySearchRequested(rawText)) return { name: OWNER_HISTORY_SEARCH_TOOL, input: {} };
+  const ownerHistoryEvidence = evidence.find((item) => item.domain === "owner_history_search");
+  if (ownerHistoryEvidence)
+    return { name: ownerHistoryEvidence.tool, input: ownerHistoryEvidence.input };
   // A capability question is not a request — requestClauses drops it, so the reduced text below
   // carries nothing to bind — but it is still a question about a durable row, and the only
   // answer that can stand behind it is one a read produced this Run. Without this requirement
@@ -1143,17 +1156,9 @@ function requiredToolCall(
   }
   const groupId = namedGroupId(text);
   if (!groupId) return undefined;
-  const memberProfile = groupMemberProfileRequest(text);
-  if (memberProfile) {
-    return {
-      name: "qq_group_members",
-      input: {
-        groupId,
-        operation: memberProfile.userId ? "get_group_member_info" : "get_group_member_list",
-        ...(memberProfile.userId ? { params: { user_id: memberProfile.userId } } : {}),
-      },
-    };
-  }
+  const memberProfileEvidence = evidence.find((item) => item.domain === "group_member_profile");
+  if (memberProfileEvidence)
+    return { name: memberProfileEvidence.tool, input: memberProfileEvidence.input };
   // A question about what a group *contains* is answered by live QQ evidence, not by reading
   // the group's Glassbox configuration. Requiring both would make the Run fail closed on a
   // Tool that cannot answer the question it was asked.
@@ -2454,6 +2459,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
     });
     const requiredForToolSelection = requiredToolCall(
       input,
+      evidence,
       isOwner,
       [OWNER_GROUP_ADMIN_TOOL, OWNER_MEMORY_ADMIN_TOOL, OWNER_MODEL_ADMIN_TOOL],
       modelProfiles,
@@ -2535,6 +2541,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
     }
     const required = requiredToolCall(
       input,
+      evidence,
       isOwner,
       context.authorizedToolNames,
       modelProfiles,
@@ -2846,9 +2853,8 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         runId: input.run.id,
         principalId: input.caller.principalId,
         conversationId: input.conversation.id,
-        policyVersion: projection.requestBudget?.dynamic
-          ? "p5a-pi-dynamic-output-v1"
-          : "p5a-context-v1",
+        policyVersion:
+          projection.requestBudget?.policyVersion ?? REQUEST_CAPACITY_POLICY_VERSION.static,
         estimateSource: "unicode_conservative",
         demandTokens: projection.demand.estimatedMaterialTokens,
         contextWindowTokens: projection.effectiveCapacity.contextWindowTokens,

@@ -13,6 +13,7 @@ import { parseRuntimeReplies } from "../../config/runtime-replies.js";
 import { piProfileName, PiRunExecutionAdapter, projectRunHistory } from "./run-adapter.js";
 import type { RunEvidenceRecord } from "./run-adapter.js";
 import type { PiRunResult, PiRuntimeAdapter } from "./types.js";
+import { REQUEST_INTENT_CORPUS } from "./request-intent.test-fixtures.js";
 
 function fixture(results: PiRunResult[], authorizedToolNames: string[] = []) {
   const run = vi.fn(async (..._args: Parameters<PiRuntimeAdapter["run"]>) => results.shift()!);
@@ -6143,4 +6144,46 @@ it.each([
   expect(f.createOrRestoreSession.mock.calls[0]?.[2]?.requiredToolName).toBeUndefined();
   expect(outcome.text).not.toContain("请明确指定一次禁言时长");
   expect(outcome.status).toBe("succeeded");
+});
+
+describe("natural-language intent corpus through the Pi Run adapter", () => {
+  it.each(REQUEST_INTENT_CORPUS)("$id binds the same required evidence", async (scenario) => {
+    const responseCall =
+      scenario.requiredToolCall ??
+      (scenario.requiredEvidence[0]
+        ? {
+            name: scenario.requiredEvidence[0].tool,
+            input: scenario.requiredEvidence[0].input,
+          }
+        : undefined);
+    const f = fixture([
+      {
+        status: "completed",
+        text: "已按实时查询结果回答。",
+        toolCalls: responseCall
+          ? [
+              {
+                name: responseCall.name,
+                input: responseCall.input,
+                failed: false,
+                result: scenario.toolResult,
+              },
+            ]
+          : [],
+      },
+    ]);
+    f.input.text = scenario.input.text;
+
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    const context = f.run.mock.calls[0]?.[3];
+    expect(context?.requiredEvidence ?? []).toEqual(scenario.requiredEvidence);
+    if (scenario.requiredToolCall) {
+      expect(context).toMatchObject({
+        requiredToolName: scenario.requiredToolCall.name,
+        requiredToolInput: scenario.requiredToolCall.input,
+      });
+    } else {
+      expect(context).not.toHaveProperty("requiredToolName");
+    }
+  });
 });

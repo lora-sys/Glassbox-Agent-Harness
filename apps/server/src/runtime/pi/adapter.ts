@@ -40,6 +40,7 @@ import { requiredCallClause, toolGateFailureCode } from "./protected-tools.js";
 import {
   availableRequestInputHeadroom,
   deriveRequestCapacity,
+  REQUEST_CAPACITY_POLICY_VERSION,
   type RequestCapacityBudget,
 } from "./request-budget.js";
 import type { RequiredEvidence } from "./required-evidence.js";
@@ -1263,9 +1264,7 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
             const projection = projectContextBudget(measured.demand, effectiveCapacity);
             if (!projection.ok) {
               active.contextBudgetEvidence = {
-                policyVersion: request.budget.dynamic
-                  ? "p5a-pi-dynamic-output-v1"
-                  : "p5a-context-v1",
+                policyVersion: request.budget.policyVersion,
                 estimateSource: "unicode_and_bounded_image_bytes",
                 overflow: projection.overflow.kind,
                 capacityTokens: capacity.contextWindowTokens,
@@ -1289,7 +1288,7 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
                 projection.projection.projectedTokens,
               );
             active.contextBudgetEvidence = {
-              policyVersion: request.budget.dynamic ? "p5a-pi-dynamic-output-v1" : "p5a-context-v1",
+              policyVersion: request.budget.policyVersion,
               estimateSource: "unicode_conservative",
               capacityTokens: capacity.contextWindowTokens,
               outputReserveTokens: effectiveCapacity.outputReserveTokens,
@@ -1511,9 +1510,8 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
             if (payloadTokens > maxInputTokens) {
               active.contextBudgetEvidence = {
                 ...active.contextBudgetEvidence,
-                policyVersion: active.requestBudget?.dynamic
-                  ? "p5a-pi-dynamic-output-v1"
-                  : "p5a-context-v1",
+                policyVersion:
+                  active.requestBudget?.policyVersion ?? REQUEST_CAPACITY_POLICY_VERSION.static,
                 estimateSource: "unicode_conservative",
                 providerPayloadTokens: payloadTokens,
                 inputBudgetTokens: maxInputTokens,
@@ -1687,7 +1685,7 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
               "context_budget_overflow:provider_payload_exceeds_capacity";
             active.contextBudgetEvidence = {
               ...active.contextBudgetEvidence,
-              policyVersion: request.budget.dynamic ? "p5a-pi-dynamic-output-v1" : "p5a-context-v1",
+              policyVersion: request.budget.policyVersion,
               estimateSource: "unicode_conservative",
               providerPayloadTokens: payloadTokens,
               inputBudgetTokens: maxInputTokens,

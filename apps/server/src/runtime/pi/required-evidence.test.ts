@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vite-plus/test";
+import { REQUEST_INTENT_CORPUS } from "./request-intent.test-fixtures.js";
 import { GROUP_HISTORY_SEARCH_TOOL, OWNER_HISTORY_SEARCH_TOOL } from "./history-tools.js";
 import {
   asksLiveQqFact,
@@ -837,5 +838,12 @@ describe("group member profile evidence", () => {
         },
       },
     ]);
+  });
+});
+
+describe("cross-stage natural-language intent corpus", () => {
+  it.each(REQUEST_INTENT_CORPUS)("$id keeps its shared clauses and evidence", (scenario) => {
+    expect(requestClauses(scenario.input.text)).toBe(scenario.clauses);
+    expect(requiredEvidenceFor(scenario.input)).toEqual(scenario.requiredEvidence);
   });
 });
