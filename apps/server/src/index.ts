@@ -18,6 +18,7 @@ import { RawTraceStore, TRACE_PROVENANCE, TRACE_PROVENANCE_CLAUDECODE } from "./
 import { loadTrace } from "./trace/load.js";
 import type { TraceEntry } from "./trace/store.js";
 import { replayTrace } from "./state/replay.js";
+import { finalizeBackgroundTurn } from "./trace/background-turn-finalizer.js";
 import { screenValue } from "./screening/index.js";
 import {
   attachWebSocketServer,
@@ -699,35 +700,26 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       // P6.4: Collect the event stream for up to 30 s in the background
       sessionAdapter
         .collectTurnEvents(thread.id, turn.id, 30_000, traceCollector)
-        .then((result) => {
-          // S8: post-turn workspace scan for file changes omitted from events
-          try {
-            var scanResult = sessionAdapter.scanAndFireHooks(workspace);
-            if (scanResult.changes.length > 0) {
-              var fileItemId = "git-" + (turn.id || "").slice(0, 8);
-              traceStore.append(sessionId, {
-                method: "item/fileChange",
-                params: { itemId: fileItemId, turnId: turn.id, changes: scanResult.changes },
-              });
-              traceCollector("item/fileChange", {
-                itemId: fileItemId,
-                turnId: turn.id,
-                changes: scanResult.changes,
-              });
-            }
-          } catch {
-            /* best-effort */
-          }
-
-          const replayResult = replayTrace(sessionId);
-          broadcastDerivedState(
+        .then((result) =>
+          finalizeBackgroundTurn({
             sessionId,
-            replayResult.state as unknown as Record<string, unknown>,
-          );
-          if (result.turnStatus !== "inProgress") broadcastSessionEnded(sessionId);
-          // Clear active turn once it ends
-          settleSessionTurn(sessionId, turn.id, result.turnStatus);
-        })
+            turnId: turn.id,
+            workspace,
+            adapter: sessionAdapter,
+            result,
+            traceCollector,
+            reportBackgroundEvidenceFailure: (failedSessionId, outcome) => {
+              console.error("[background] workspace evidence capture failed", {
+                sessionId: failedSessionId,
+                ...outcome,
+              });
+            },
+            replayTrace,
+            broadcastDerivedState,
+            broadcastSessionEnded,
+            settleSessionTurn,
+          }),
+        )
         .catch((err) => {
           console.error(`[run-test background] session ${sessionId} failed:`, err);
         })
@@ -886,34 +878,26 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 
       sessionAdapter
         .collectTurnEvents(thread.id, turn.id, 30_000, traceCollector)
-        .then((result) => {
-          // S8: post-turn workspace scan for file changes omitted from events
-          try {
-            var scanResult = sessionAdapter.scanAndFireHooks(workspace);
-            if (scanResult.changes.length > 0) {
-              var fileItemId = "git-" + (turn.id || "").slice(0, 8);
-              traceStore.append(sessionId, {
-                method: "item/fileChange",
-                params: { itemId: fileItemId, turnId: turn.id, changes: scanResult.changes },
-              });
-              traceCollector("item/fileChange", {
-                itemId: fileItemId,
-                turnId: turn.id,
-                changes: scanResult.changes,
-              });
-            }
-          } catch {
-            /* best-effort */
-          }
-
-          const replayResult = replayTrace(sessionId);
-          broadcastDerivedState(
+        .then((result) =>
+          finalizeBackgroundTurn({
             sessionId,
-            replayResult.state as unknown as Record<string, unknown>,
-          );
-          if (result.turnStatus !== "inProgress") broadcastSessionEnded(sessionId);
-          settleSessionTurn(sessionId, turn.id, result.turnStatus);
-        })
+            turnId: turn.id,
+            workspace,
+            adapter: sessionAdapter,
+            result,
+            traceCollector,
+            reportBackgroundEvidenceFailure: (failedSessionId, outcome) => {
+              console.error("[background] workspace evidence capture failed", {
+                sessionId: failedSessionId,
+                ...outcome,
+              });
+            },
+            replayTrace,
+            broadcastDerivedState,
+            broadcastSessionEnded,
+            settleSessionTurn,
+          }),
+        )
         .catch((err) => {
           console.error(`[run-stream background] session ${sessionId} failed:`, err);
         })
@@ -1480,34 +1464,26 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 
       sessionAdapter
         .collectTurnEvents(thread.id, turn.id, 30_000, traceCollector)
-        .then((result) => {
-          // S8: post-turn workspace scan for file changes omitted from events
-          try {
-            var scanResult = sessionAdapter.scanAndFireHooks(workspace);
-            if (scanResult.changes.length > 0) {
-              var fileItemId = "git-" + (turn.id || "").slice(0, 8);
-              traceStore.append(sessionId, {
-                method: "item/fileChange",
-                params: { itemId: fileItemId, turnId: turn.id, changes: scanResult.changes },
-              });
-              traceCollector("item/fileChange", {
-                itemId: fileItemId,
-                turnId: turn.id,
-                changes: scanResult.changes,
-              });
-            }
-          } catch {
-            /* best-effort */
-          }
-
-          const replayResult = replayTrace(sessionId);
-          broadcastDerivedState(
+        .then((result) =>
+          finalizeBackgroundTurn({
             sessionId,
-            replayResult.state as unknown as Record<string, unknown>,
-          );
-          if (result.turnStatus !== "inProgress") broadcastSessionEnded(sessionId);
-          settleSessionTurn(sessionId, turn.id, result.turnStatus);
-        })
+            turnId: turn.id,
+            workspace,
+            adapter: sessionAdapter,
+            result,
+            traceCollector,
+            reportBackgroundEvidenceFailure: (failedSessionId, outcome) => {
+              console.error("[background] workspace evidence capture failed", {
+                sessionId: failedSessionId,
+                ...outcome,
+              });
+            },
+            replayTrace,
+            broadcastDerivedState,
+            broadcastSessionEnded,
+            settleSessionTurn,
+          }),
+        )
         .catch((err) => {
           console.error(`[run-demo background] session ${sessionId} failed:`, err);
         })
