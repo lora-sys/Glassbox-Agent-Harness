@@ -267,6 +267,18 @@ function eventSummary(entry) {
       if (isError) return paint(C.red, `ERROR ${name} failureCode=${failureCode ?? "-"}`);
       return output !== undefined ? `${name} output=${compact(output, 160)}` : `${name} (ok)`;
     }
+    case "authorization_projection_receipt": {
+      const decisions = pick("decisions");
+      return `kind=${str(pick("kind")) ?? "-"} purpose=${str(pick("purpose")) ?? "-"} tool=${str(pick("toolName")) ?? "-"} decisions=${Array.isArray(decisions) ? decisions.length : 0} inputBytes=${pick("inputBytes") ?? "-"} outputBytes=${pick("outputBytes") ?? "-"}`;
+    }
+    case "bot_native_group_role_observation":
+      return `group=${short(pick("groupId"), 10)} status=${str(pick("observationStatus")) ?? "-"} role=${str(pick("observedRole")) ?? "-"} subject=${str(pick("roleSubject")) ?? "-"}`;
+    case "requester_native_group_role_precheck":
+      return `group=${short(pick("groupId"), 10)} sender=${short(pick("senderId"), 10)} role=${str(pick("observedRole")) ?? "-"} status=${str(pick("verificationStatus")) ?? "-"} tool=${str(pick("requestedTool")) ?? "-"} action=${str(pick("requestedOperation")) ?? "-"} decision=${str(pick("authorizationDecision")) ?? "-"}`;
+    case "moderation_target_resolution":
+      return `group=${short(pick("groupId"), 10)} target=${short(pick("resolvedUserId"), 10)} duration=${pick("duration") ?? "-"} method=${str(pick("method")) ?? "-"} rosterDecision=${short(pick("rosterReadDecisionId"), 10)}`;
+    case "qq_moderation_preconditions":
+      return `resource=${short(pick("resourceId"), 10)} target=${short(pick("targetUserId"), 10)} status=${str(pick("verificationStatus")) ?? "-"} requested=${compact(pick("requested") ?? [], 100)} checks=${compact(pick("checks") ?? {}, 120)}`;
     case "qq_tool_execution_input_verified":
       return `tool=${str(pick("toolName")) ?? "-"} action=${str(pick("action")) ?? "-"} resource=${short(pick("resourceId"), 10)} call=${short(pick("toolCallId"), 12)} bytes=${pick("inputBytes") ?? "-"} sha=${short(pick("inputSha256"), 12)} lease=${short(pick("leaseId"), 10)}`;
     case "native_mute_state_precondition_verified":
@@ -323,6 +335,8 @@ function eventSummary(entry) {
       return `group=${short(pick("groupId"), 10)} verified=${str(pick("verifiedRole")) ?? "-"} status=${str(pick("status")) ?? "-"}`;
     case "media_generation_completed":
       return `provider=${str(pick("provider")) ?? "-"} mediaType=${str(pick("mediaType")) ?? "-"} assets=${(pick("assetIds") ?? []).length}`;
+    case "media_generation_request_admitted":
+      return `provider=${str(pick("provider")) ?? "-"} mediaType=${str(pick("mediaType")) ?? "-"} mode=${str(pick("mode")) ?? "-"} bytes=${pick("providerInputBytes") ?? "-"} promptBytes=${pick("promptBytes") ?? "-"} seconds=${pick("seconds") ?? "-"} ratio=${str(pick("ratio")) ?? "-"} refs=${pick("referenceCount") ?? "-"}`;
     case "media_delivery_sent":
       return `delivery=${short(pick("deliveryId"))} asset=${short(pick("assetId"))} external=${short(pick("externalId"), 14)} mime=${str(pick("mimeType")) ?? "-"} bytes=${pick("sizeBytes") ?? "-"} sha=${short(pick("sha256"), 12)}`;
     case "learning_candidate_created":

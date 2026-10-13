@@ -196,6 +196,20 @@ per-file byte count and SHA-256 digest
 excluded Skill source paths and reasons
 ```
 
+### Glassbox repository mirrors
+
+The repository-local copies have a separate role from the upstream `lora-sys/skills`
+source. `.agents/skills` is the Codex-facing source. The repository's `skills-lock.json`
+points its local `glassbox-ops` package entry to that path. `.claude/skills` mirrors
+the shared operator instructions for Claude Code.
+
+The `glassbox-ops` and `qq-live-testing` skill trees contain shared procedures, references,
+and scripts. Their relative file lists and contents must match after line-ending
+normalization. `tools/qq-live/test/skill-parity.test.mjs` checks both trees. Put host-specific
+commands and runtime adapters in the host instructions, not in only one copy of a shared
+procedure. The upstream `lora-sys/skills` repository remains the source for Skills bundled
+into Lora PI Kit releases.
+
 ### Bundled does not mean always loaded
 
 The release may contain many Skills.
