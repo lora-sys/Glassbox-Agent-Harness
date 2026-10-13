@@ -157,6 +157,19 @@ The Task remains the product-level work record. A Task with `orchestrationMode: 
 
 Accept, rework, and cancel carry the exact ALLOW decision used by the request. Legacy Task writes match that decision to the current active grant for the same Principal, Task Resource, Action, and scope inside the write transaction. Creator-policy grants remain valid only for the Task's recorded creator and origin scope. Durable Step writes perform the same current-grant check in their transaction. When a user-driven review or cancellation closes or stops a Herdr Worker, Glassbox checks the same Action again immediately before the external request. If cancellation already committed and that final check fails, Glassbox records cleanup failure and leaves the Worker untouched.
 
+### Task action matrix
+
+The legacy mode remains for historical Tasks. New work uses durable orchestration. The two modes share authorization decisions and preserve separate state transitions.
+
+| Action | Legacy Task | Durable Task |
+| --- | --- | --- |
+| Accept | A Task in `REVIEW` moves to `DONE` in one authorized transaction. Its active TaskAttempt becomes succeeded. | A reviewed Step can be accepted independently with its expected version and current grant. The Task reaches `DONE` only through Task-level acceptance after the durable graph is complete and no waits or leases remain. |
+| Rework | A Task in `REVIEW` moves to `RUNNING` with a new TaskAttempt. Earlier attempts and evidence remain intact. | Rework targets one reviewed Step by ID and expected version. It creates a fresh attempt only after active or quarantined leases are cleared. Earlier attempts remain intact. |
+| Cancel | One authorized transaction moves a nonterminal Task to `CANCELED` and records the active attempt cancellation. Required Herdr cleanup is separately reauthorized before the external request. | Glassbox records a durable cancellation request. Temporal cancels waits and future Steps. The Task remains unresolved until running Steps and Worker leases settle; an unknown Worker outcome stays quarantined. |
+| Worker observation | Legacy WorkerBinding records the observed lifecycle state for its TaskAttempt. | Durable Worker observation preserves completion evidence for the Temporal owner. Management observation cannot settle the Step or accept the Task. |
+
+The shared Herdr bridge normalizes events and snapshots before either mode consumes them. Legacy and durable state mappers keep their own persistence and settlement rules. `service.test.ts`, `long-work-store.test.ts`, `durable-worker-observer.test.ts`, and `reconciler.test.ts` cover the corresponding authorization, transition, restart, and observation boundaries.
+
 ### TaskAttempt
 
 One real execution or rework attempt. Never overwrite prior attempts to make a later attempt look like the original run succeeded.
