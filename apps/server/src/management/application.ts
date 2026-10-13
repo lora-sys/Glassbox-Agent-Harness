@@ -172,6 +172,7 @@ import {
 import { ChannelArchiveStore } from "../retrieval/channel-archive.js";
 import { groupResourceId, resolveAssignedGroupIds } from "../retrieval/source-resolver.js";
 import { GroupHistoryPoller, type HistorySyncTarget } from "./history-poller.js";
+import { admitOneBotIncomingMessage, resolveOneBotExecutionSelection } from "./onebot-ingress.js";
 import {
   AuthorizedOpsService,
   type LongWorkRuntimePort,
@@ -3918,49 +3919,21 @@ export class ManagementApplication {
         // Marker messages resolve only against an identity already trusted for this exact
         // incoming scope. Do not let normal visitor provisioning turn a marked message into
         // a caller before the lease is checked.
-        let caller = await this.store.identities.resolve(message.scope);
-        let leaseResolution:
-          | { kind: "ordinary" }
-          | { kind: "denied"; reason: string }
-          | {
-              kind: "acceptance";
-              leaseId: string;
-              marker: string;
-              toolsSha256: string;
-            } = {
-          kind: "ordinary",
-        };
-        if (hasQqLiveAcceptanceMarker(message.text)) {
-          leaseResolution = caller
-            ? this.qqLiveLeases.resolveInbound({
-                principalId: caller.principalId,
-                scope: message.scope,
-                messageId: message.messageId,
-                text: message.text,
-              })
-            : { kind: "denied", reason: "lease_unavailable" };
-          if (leaseResolution.kind !== "acceptance") {
-            await appendQqLiveAcceptanceAudit(this.options.dataDirectory, {
-              event: "message_denied",
-              messageId: message.messageId,
-              scope: message.scope,
-              ...(caller ? { principalId: caller.principalId } : {}),
-              reason:
-                leaseResolution.kind === "denied"
-                  ? leaseResolution.reason
-                  : "marker_resolution_failed",
-            }).catch(() => undefined);
-            return;
-          }
-        }
-        if (message.scope.chatType === "group") {
-          // Group assignments can change while the socket stays connected. Resolve the
-          // current profile instead of preserving the connect-time allowlist in this closure.
-          if (leaseResolution.kind === "ordinary") {
-            await this.provisionAddressedGroupMember(this.channels.resolve(id), message.scope);
-            caller = await this.store.identities.resolve(message.scope);
-          }
-        }
+        const admission = await admitOneBotIncomingMessage(message, {
+          resolveCaller: (scope) => this.store.identities.resolve(scope),
+          hasAcceptanceMarker: hasQqLiveAcceptanceMarker,
+          resolveAcceptance: (input) => this.qqLiveLeases.resolveInbound(input),
+          auditDenied: (record) => appendQqLiveAcceptanceAudit(this.options.dataDirectory, record),
+          // Resolve the latest group profile because assignments can change while the
+          // OneBot connection stays open.
+          provisionAddressedGroupMember: (scope) =>
+            this.provisionAddressedGroupMember(this.channels.resolve(id), scope),
+        });
+        if (!admission) return;
+        const caller = admission.caller;
+        const leaseResolution = admission.leaseResolution;
+        const scope = admission.scope;
+        const messageId = admission.messageId;
         const hasImage = message.parts.some((part) => part.type === "image");
         const control =
           hasImage || leaseResolution.kind !== "ordinary"
@@ -3979,22 +3952,21 @@ export class ManagementApplication {
           return;
         }
         const channelSelection = this.channels.resolve(id);
-        const executionKind = /^(pi|model):/u.exec(configured.executionRef)?.[1];
-        const ownerPrivate =
-          message.scope.chatType === "private" &&
-          message.scope.senderId === configured.config.ownerId;
-        const runExecutionRef =
-          ownerPrivate && channelSelection.modelOverrideProfileId && executionKind
-            ? `${executionKind}:${channelSelection.modelOverrideProfileId}`
-            : configured.executionRef;
+        const executionSelection = resolveOneBotExecutionSelection({
+          scope,
+          ownerId: configured.config.ownerId,
+          configuredExecutionRef: configured.executionRef,
+          modelOverrideProfileId: channelSelection.modelOverrideProfileId,
+        });
+        const runExecutionRef = executionSelection.executionRef;
         if (
           leaseResolution.kind === "acceptance" &&
           !this.supportsQqLiveLeaseExecution(runExecutionRef)
         ) {
           await appendQqLiveAcceptanceAudit(this.options.dataDirectory, {
             event: "message_denied",
-            messageId: message.messageId,
-            scope: message.scope,
+            messageId,
+            scope,
             ...(caller ? { principalId: caller.principalId } : {}),
             leaseId: leaseResolution.leaseId,
             reason: "unsupported_execution_backend",
@@ -4032,12 +4004,12 @@ export class ManagementApplication {
         if (imageFailureCode) images.length = 0;
         const incoming: StoredIncomingMessage = {
           agentId: AGENT_ID,
-          scope: message.scope,
-          messageId: message.messageId,
+          scope,
+          messageId,
           text: message.text || (hasImage ? "请描述这张图片。" : ""),
           executionRef: runExecutionRef,
-          ...(ownerPrivate && channelSelection.modelOverrideProfileId && executionKind
-            ? { channelDefaultExecutionRef: configured.executionRef }
+          ...(executionSelection.channelDefaultExecutionRef
+            ? { channelDefaultExecutionRef: executionSelection.channelDefaultExecutionRef }
             : {}),
           ...(imageFailureCode ? { imageFailureCode } : images.length > 0 ? { images } : {}),
         };
@@ -4045,8 +4017,8 @@ export class ManagementApplication {
           leaseResolution.kind === "acceptance" && caller
             ? this.reserveQqLiveAcceptanceHandoff({
                 principalId: caller.principalId,
-                scope: message.scope,
-                messageId: message.messageId,
+                scope,
+                messageId,
                 leaseId: leaseResolution.leaseId,
                 textSha256: canonicalQqLiveTextSha256(message.text),
               })
@@ -4054,8 +4026,8 @@ export class ManagementApplication {
         if (leaseResolution.kind === "acceptance" && !acceptanceHandoff) {
           await appendQqLiveAcceptanceAudit(this.options.dataDirectory, {
             event: "message_denied",
-            messageId: message.messageId,
-            scope: message.scope,
+            messageId,
+            scope,
             ...(caller ? { principalId: caller.principalId } : {}),
             leaseId: leaseResolution.leaseId,
             reason: "run_handoff_unavailable",
@@ -4074,8 +4046,8 @@ export class ManagementApplication {
             const binding: QqLiveLeaseBinding = {
               leaseId: leaseResolution.leaseId,
               principalId: accepted.caller.principalId,
-              scope: message.scope,
-              messageId: message.messageId,
+              scope,
+              messageId,
               runId: accepted.run.id,
             };
             if (this.qqLiveLeases.bindRun(binding)) {
@@ -4084,8 +4056,8 @@ export class ManagementApplication {
               try {
                 await appendQqLiveAcceptanceAudit(this.options.dataDirectory, {
                   event: "run_bound",
-                  messageId: message.messageId,
-                  scope: message.scope,
+                  messageId,
+                  scope,
                   principalId: accepted.caller.principalId,
                   leaseId: leaseResolution.leaseId,
                   runId: accepted.run.id,
@@ -4122,8 +4094,8 @@ export class ManagementApplication {
             } else {
               await appendQqLiveAcceptanceAudit(this.options.dataDirectory, {
                 event: "message_denied",
-                messageId: message.messageId,
-                scope: message.scope,
+                messageId,
+                scope,
                 principalId: accepted.caller.principalId,
                 leaseId: leaseResolution.leaseId,
                 reason: "run_binding_failed",
@@ -4135,7 +4107,7 @@ export class ManagementApplication {
           // in the run's own file, and the run's own file is the only place the message text is
           // available to correlate.
           if (!accepted.duplicate) await this.runs.recordMessageReceived(incoming, accepted.run);
-          if (!accepted.duplicate && message.scope.nativeGroupRole) {
+          if (!accepted.duplicate && scope.nativeGroupRole) {
             const cursor = await this.trace.append(
               accepted.run.id,
               {
@@ -4143,12 +4115,12 @@ export class ManagementApplication {
                 runId: accepted.run.id,
                 conversationId: accepted.conversation.id,
                 principalId: accepted.caller.principalId,
-                resourceId: groupResourceId(message.scope.chatId),
-                groupId: message.scope.chatId,
-                senderId: message.scope.senderId,
-                observedRole: message.scope.nativeGroupRole.role,
-                roleSource: message.scope.nativeGroupRole.source,
-                observedAt: message.scope.nativeGroupRole.observedAt,
+                resourceId: groupResourceId(scope.chatId),
+                groupId: scope.chatId,
+                senderId: scope.senderId,
+                observedRole: scope.nativeGroupRole.role,
+                roleSource: scope.nativeGroupRole.source,
+                observedAt: scope.nativeGroupRole.observedAt,
               },
               "glassbox-qq-role",
             );
