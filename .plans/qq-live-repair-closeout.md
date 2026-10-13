@@ -99,3 +99,65 @@
 - NapCat reported the Bot login state expired, rejected quick login, and generated a QR. The latest qq-chat status still reports Owner online and Bot WS_NOT_READY. Port 6700 listens; port 6701 does not. The user must confirm the current 6100 QR before real acceptance can continue.
 - No new real QQ messages or group actions were executed after the update.
 - PR #142 head ef47bd4 has local commit verification passed. The full suite reports 3,095 passed and one existing optional Herdr skip. GitHub CI is still pending for code and dependency review.
+
+## 2026-10-13 Bot QR confirmation checkpoint
+
+- After the user reported scanning the wrong account, only the Bot NapCat container was restarted. Its existing config and account-volume mounts were preserved; the Owner container and Glassbox service were not restarted.
+- The Bot startup reported that its saved quick-login state had expired, then entered QR login. The QR itself is intentionally not recorded. This explains the current Bot outage at the NapCat session layer; it does not establish the cause of every earlier QQ logout.
+- A fresh qq-chat status still showed Owner online and Bot WS_NOT_READY. Port 6700 listened; 6701 did not. The current real-QQ gate is confirmation of the Bot account on the 6100 page, followed by verifying 6701 and the account identity before sending any message.
+- No test message or group action was sent. No credentials, QR links, account files, or message contents were copied or modified.
+
+## 2026-10-13 PR overlap review
+
+- GitHub currently reports PR #142 open, draft, and mergeable at head 420b89b64aa1bf9611962b81dc0bd20430842b1c. Its Text portability and Hygiene CI runs both completed successfully. Review submissions are empty.
+- PR #140 remains open and conflicting. It changes 27 files; 26 also appear in PR #142. The history poller implementation for #109 is already present in both candidates. PR #142 also contains the configured gate wording and evidence-bound capability command for #112, launch checkout identity safeguards for #111, and the narrowed reply identity check for #117. All five issues #109, #110, #111, #112, and #117 remain open.
+- PR #140's #110 bounded retry resends transport-unknown QQ deliveries. The same immutable delivery ID does not guarantee QQ deduplication. Keep this change out under the no-automatic-retry rule; preserve the unknown outcome and investigate through Trace.
+- Do not merge PR #140 as a unit. After PR #142 acceptance, compare any remaining #111, #112, and #117 changes against the merged implementation and port only independently justified gaps with focused tests.
+
+## 2026-10-13 Linux NapCat persistence path investigation
+
+- Read-only directory metadata shows both separate QQ data mounts contain nt_qq/global/login.db and nt_qq/global/nt_data/msf/machine-info, while neither mount has a top-level global directory. The two machine-info hashes differ. No account file was opened, copied, moved, or changed.
+- Both active containers use host networking and separate data mounts. Bot runs the pinned v4.18.30 image; Owner uses the older image digest 41b1a8. The current offline Bot startup rejected its saved quick-login state and fell back to QR.
+- NapCat upstream PR #2099 merged on 2026-10-11. It changes Linux global data from nt_qq/global to global and migrates the old path only when the new path is absent. The official v4.18.30 release predates that merge. This is a concrete local persistence defect candidate, but it does not prove that QQ-side revocation never occurs.
+- Upstream NapCat issue #2079 reports two separate QQ containers losing sessions close together despite separate persistent mounts; the maintainer closed it as QQ risk control. Local persistence and automatic recovery reduce avoidable failures but cannot prevent QQ from revoking a session.
+- The official NapCat release page lists v4.18.30 as latest, which predates PR #2099. The PR provides a temporary Docker image built from c358c86 and labels it for cleanup after 120 hours. Its pinned OCI index digest is sha256:9d9fc425c0a4dfb9a7aa8f84a6181f741ad12a589b86b844959eb3e4dd57e188. Do not use it as a deployment image.
+
+
+## 2026-10-13 Bot persistence test image checkpoint
+
+- Rechecked the local mapping from mounted configuration and the account marker: WebUI 6100 is Bot 3394947361 with OneBot 6701; WebUI 6098 is Owner 3526039967 with OneBot 6700.
+- The Bot test Compose now pins the temporary upstream PR #2099 image digest above. The existing Bot config and QQ data bind mounts remain in place. Owner and the separate docs NapCat deployment container were not changed.
+- The local Compose uses localhost/napcat:pr-2099-c358c86 with pull_policy never. That local-only tag points to the same digest and remains available in this workstation cache after upstream cleanup. The active Bot container still references the pinned digest.
+- The single Glassbox process remains on /home/yanbingzhao/src/qq-self-role-surface at commit ede59656382fcefadc989bd94b0efc6f47233379 with /home/yanbingzhao/.glassbox. PR #142 remains in a separate worktree at 420b89b. No service switch has occurred.
+- A first Compose invocation used the directory-derived project name and briefly started a second Bot container against the same bind mount. It was stopped and removed promptly. The correct existing project, glassbox-qq-live-driver, was then recreated in place. The active process list now has one Bot NapCat using the volume.
+- The new image has the expected Linux data layout: global/nt_db/login.db and global/nt_data/msf/machine-info exist, and nt_qq/global no longer exists. No account file content was opened or copied.
+- Bot still reports WS_NOT_READY and 6701 is not listening. The migration does not establish a QQ session.
+- Owner remains online on 6700 in the older docs-napcat-1 image, created 2026-09-14, with login.db and machine-info under nt_qq/global. That running Owner container was not changed. Its path migration and restart recovery remain unverified. No test message or group action has been sent. Real acceptance remains gated on confirming Bot 3394947361 in the 6100 page and verifying get_login_info plus OneBot readiness.
+
+
+## 2026-10-13 Tool schema and discovery audit
+
+- QQ capability Tools have fixed TypeBox operation schemas. Object alternatives are exposed through an object envelope with nested params, while anyOf preserves exact operation validation. The runtime validates inputs with TypeBox Value and rechecks the acceptance lease at execution.
+- A schema projection defect did recur in real tests: the Owner managed-group inventory incorrectly required a group ID, lease-derived inputs were missing from model-visible schemas, and a root union led Pi to serialize nested params incorrectly. The candidate repairs these contracts rather than removing schema validation.
+- Required-evidence classification narrows already-authorized Tools for recognized factual requests before Pi session creation. Ordinary messages with no required-evidence match retain the authorized surface. Progressive lazy discovery is not implemented; the architecture document describes it as a possible future option.
+- Seven focused runtime files passed 263 tests, including the actual Pi argument validator, intent-required Tool selection and nickname moderation. Nine qq-live observer and reply files passed 98 tests. These tests do not measure real-model latency.
+- Issue #155's candidate observer now uses the wrapped status/data success envelope and verifies the complete Tool output. Its mismatch and group-files companion tests pass, but fresh live QQ evidence remains required.
+- Measure selected Tool count, serialized schema size and model request duration from a fresh natural-language Run before changing discovery architecture. No current evidence attributes the reported delay to Tool count.
+
+## 2026-10-13 Post-scan status checkpoint
+
+- The user reported that the Bot QR confirmation was complete. The 6100 account marker and WebUI auto-login account both identify Bot 3394947361. The Bot container is running with the migrated data layout and the pinned PR #2099 image.
+- A fresh `qq-chat status` still reports Owner 3526039967 online and Bot 3394947361 offline with WS_NOT_READY. Port 6701 is not listening. No live test message was sent in this checkpoint.
+- The PR #142 candidate passed `npm run verify:full`; `git diff --check` passed. PR #142 remains open and draft at the candidate head. PR #140 remains open with conflicts. Real QQ acceptance remains pending Bot OneBot readiness.
+
+## 2026-10-13 Upstream logout and recovery evidence
+
+- NapCat PR #2099 merged into upstream main on Oct 11. It corrects the Linux global-data path and migrates existing `nt_qq/global` data when the destination is absent. The Bot test image is built from the reviewed PR commit and has already migrated its existing account data. The Owner container still runs the older image and its existing path layout; it remains untouched while the account is online. See [NapCat PR #2099](https://github.com/NapNeko/NapCatQQ/pull/2099).
+- NapCat issue #2079 documents two different accounts on one Docker host simultaneously requiring QR reauthorization despite separate persistent volumes and no shared account. The issue was closed after a maintainer identified risk control. This is evidence that QQ-side session revocation can happen outside Glassbox; it is not proof of the exact cause for our accounts. See [NapCat issue #2079](https://github.com/NapNeko/NapCatQQ/issues/2079).
+- NapCat release notes for v4.18.32 describe recovery from silent offline state by restarting the Worker and trying quick login. This can recover some session failures, but an explicit QQ authorization revocation still needs phone confirmation. See [NapCat releases](https://github.com/NapNeko/NapCatQQ/releases).
+- Local protection remains necessary: independent account directories, correct WebUI-to-account mapping, the Linux path migration, no duplicate Glassbox consumers, and identity-checked `qq-chat status`. No local measure can guarantee that QQ will never revoke an account session.
+
+## 2026-10-13 Service status semantics
+
+- The managed status command reported `onebotReady: true` solely because port 6700 accepted TCP. It did not inspect the Bot endpoint on 6701 or QQ identity. The candidate now returns `onebotListener` with the checked host, port, and listening boolean. Account identity and online checks remain in `qq-chat status`.
+- Focused agent-service status tests passed 4/4. The candidate full verification passed after the code change. The running Glassbox remains on `/home/yanbingzhao/src/qq-self-role-surface`; development remains on PR #142 branch `codex/qq-live-followup-20261011`. No service switch or NapCat restart occurred.

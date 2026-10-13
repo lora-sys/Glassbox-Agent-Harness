@@ -200,5 +200,9 @@ test("a listening endpoint with matching source does not make an earlier-boot pr
   );
   assert.equal(status.processes[0].status, "stopped");
   assert.equal(status.glassboxReady, false);
+  assert.equal(status.onebotListener.host, "127.0.0.1");
+  assert.equal(status.onebotListener.port, 6700);
+  assert.equal(typeof status.onebotListener.listening, "boolean");
+  assert.equal("onebotReady" in status, false);
   assert.equal(child.exitCode, null);
 });

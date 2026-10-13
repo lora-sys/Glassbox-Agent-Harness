@@ -789,9 +789,13 @@ async function status(): Promise<void> {
     port <= 65535
       ? await endpointAvailable({ host: "127.0.0.1", port })
       : false;
-  const onebotReady = await endpointAvailable({ host: "127.0.0.1", port: 6700 });
+  const onebotListener = {
+    host: "127.0.0.1",
+    port: 6700,
+    listening: await endpointAvailable({ host: "127.0.0.1", port: 6700 }),
+  };
   process.stdout.write(
-    `${JSON.stringify({ dataDirectory, configPath, processes, glassboxReady, onebotReady }, null, 2)}\n`,
+    `${JSON.stringify({ dataDirectory, configPath, processes, glassboxReady, onebotListener }, null, 2)}\n`,
   );
 }
 
