@@ -1,3 +1,4 @@
+// test-contract-change: GH-194 guard authorized Worker closure before durable acceptance
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -142,7 +143,7 @@ it("captures a declared Worker text file before review and rechecks grants when 
       scope: caller.scope,
       effect: "allow",
     });
-    await store.authorization.grant({
+    const acceptGrantId = await store.authorization.grant({
       principalId: caller.principalId,
       resourceId: `task-${task.id}`,
       action: "task:accept",
@@ -150,7 +151,44 @@ it("captures a declared Worker text file before review and rechecks grants when 
       effect: "allow",
     });
     const reviewed = (await store.longWork.listSteps(task.id))[0]!;
-    await service.acceptStep(caller, task.id, step.id, reviewed.version);
+    const getBinding = store.tasks.getWorkerBinding.bind(store.tasks);
+    let enterBinding!: () => void;
+    const bindingRead = new Promise<void>((resolve) => (enterBinding = resolve));
+    let releaseBinding!: () => void;
+    const bindingGate = new Promise<void>((resolve) => (releaseBinding = resolve));
+    const readBinding = vi
+      .spyOn(store.tasks, "getWorkerBinding")
+      .mockImplementation(async (attemptId) => {
+        const value = await getBinding(attemptId);
+        if (attemptId === attempt.id) {
+          enterBinding();
+          await bindingGate;
+        }
+        return value;
+      });
+    const closeAgent = vi.spyOn(bridge, "closeAgent");
+    try {
+      const acceptance = service.acceptStep(caller, task.id, step.id, reviewed.version);
+      await bindingRead;
+      await store.authorization.revoke(acceptGrantId);
+      releaseBinding();
+      await expect(acceptance).rejects.toMatchObject({ name: "AccessDeniedError" });
+    } finally {
+      releaseBinding();
+      readBinding.mockRestore();
+    }
+    expect(closeAgent).not.toHaveBeenCalled();
+    expect((await store.longWork.listSteps(task.id))[0]).toMatchObject({ status: "review" });
+    await store.authorization.grant({
+      principalId: caller.principalId,
+      resourceId: `task-${task.id}`,
+      action: "task:accept",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    const acceptedReview = (await store.longWork.listSteps(task.id))[0]!;
+    await service.acceptStep(caller, task.id, step.id, acceptedReview.version);
+    expect(closeAgent).toHaveBeenCalledOnce();
 
     const recoveryTask = await store.tasks.createTask({
       title: "Recover captured Worker file",

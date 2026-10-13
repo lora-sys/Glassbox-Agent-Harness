@@ -636,16 +636,25 @@ it("does not let legacy whole-Task operations bypass a durable graph", async () 
     const longWork = await fixture(db);
     await longWork.createGraph("task-1", [step("a")], "a", limits, system);
     const legacy = new TaskStore(db);
+    const taskActionOrigin = {
+      decisionId: "mode-guard-only",
+      actorPrincipalId: "owner",
+      scopeKey: "test",
+    };
     await expect(legacy.createAttempt({ taskId: "task-1" })).rejects.toThrow();
     await expect(legacy.updateTaskStatus("task-1", "DONE")).rejects.toThrow(
       "step-aware status transitions",
     );
-    await expect(legacy.cancelTask("task-1")).rejects.toThrow("step-aware cancellation");
+    await expect(legacy.cancelTask("task-1", undefined, taskActionOrigin)).rejects.toThrow(
+      "step-aware cancellation",
+    );
     await db.transaction(async (tx) => {
       await tx.execute("UPDATE tasks SET status = 'REVIEW' WHERE id = 'task-1'");
     });
-    await expect(legacy.acceptTask("task-1", "owner")).rejects.toThrow("step-aware acceptance");
-    await expect(legacy.reworkTask("task-1", "retry", "owner")).rejects.toThrow(
+    await expect(legacy.acceptTask("task-1", taskActionOrigin)).rejects.toThrow(
+      "step-aware acceptance",
+    );
+    await expect(legacy.reworkTask("task-1", "retry", taskActionOrigin)).rejects.toThrow(
       "step-aware rework",
     );
     expect((await legacy.getTask("task-1"))?.status).toBe("REVIEW");

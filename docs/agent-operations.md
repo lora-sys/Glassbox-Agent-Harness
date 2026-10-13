@@ -154,6 +154,9 @@ CANCELED
 
 The Task remains the product-level work record. A Task with `orchestrationMode: "durable"` also has a versioned Step graph, a root Step, active Step IDs, a current phase, a waiting reason, and a policy revision. Step state and TaskAttempt state do not replace Task-level review and acceptance.
 
+
+Accept, rework, and cancel carry the exact ALLOW decision used by the request. Legacy Task writes match that decision to the current active grant for the same Principal, Task Resource, Action, and scope inside the write transaction. Creator-policy grants remain valid only for the Task's recorded creator and origin scope. Durable Step writes perform the same current-grant check in their transaction. When a user-driven review or cancellation closes or stops a Herdr Worker, Glassbox checks the same Action again immediately before the external request. If cancellation already committed and that final check fails, Glassbox records cleanup failure and leaves the Worker untouched.
+
 ### TaskAttempt
 
 One real execution or rework attempt. Never overwrite prior attempts to make a later attempt look like the original run succeeded.

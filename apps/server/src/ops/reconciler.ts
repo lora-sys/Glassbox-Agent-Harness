@@ -1,6 +1,6 @@
 import type { HerdrBridge, HerdrEvent, HerdrSessionSnapshot } from "./herdr-bridge.js";
 import { DurableWorkerObserver } from "./durable-worker-observer.js";
-import { TaskStore } from "./task-store.js";
+import { TaskStore, type TaskActionAuthorization } from "./task-store.js";
 
 export class OpsReconciler {
   private subscriptionId: string | null = null;
@@ -190,17 +190,25 @@ export class OpsReconciler {
   }
 
   /** Explicit product review action: ACCEPT */
-  async acceptTask(taskId: string): Promise<void> {
-    await this.store.acceptTask(taskId);
+  async acceptTask(taskId: string, origin: TaskActionAuthorization): Promise<void> {
+    await this.store.acceptTask(taskId, origin);
   }
 
   /** Explicit product review action: REWORK */
-  async reworkTask(taskId: string, reworkReason: string): Promise<void> {
-    await this.store.reworkTask(taskId, reworkReason);
+  async reworkTask(
+    taskId: string,
+    reworkReason: string,
+    origin: TaskActionAuthorization,
+  ): Promise<void> {
+    await this.store.reworkTask(taskId, reworkReason, origin);
   }
 
   /** Explicit product cancel action */
-  async cancelTask(taskId: string, reason?: string): Promise<void> {
-    await this.store.cancelTask(taskId, reason);
+  async cancelTask(
+    taskId: string,
+    reason: string | undefined,
+    origin: TaskActionAuthorization,
+  ): Promise<void> {
+    await this.store.cancelTask(taskId, reason, origin);
   }
 }

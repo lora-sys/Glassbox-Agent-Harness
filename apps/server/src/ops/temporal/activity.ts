@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { AgentTask, TaskStep, TaskWaitPolicy } from "@glassbox/contracts";
 import type { DomainStore } from "../../application/domain-store.js";
+import { scopeKey } from "../../identity/scope.js";
 import { AccessDeniedError } from "../../auth/service.js";
 import type { RunRecord } from "../../conversation/store.js";
 import { getLongWorkCaller, authorizeLongWorkAction } from "../long-work-authority.js";
@@ -465,7 +466,11 @@ async function settleCancelledChildStep(
         });
         await wakeChild?.(child.id).catch(() => undefined);
       } else if (["NEW", "QUEUED"].includes(child.status) && !child.activeAttemptId)
-        await store.tasks.cancelTask(child.id, "Parent Task cancellation", caller.principalId);
+        await store.tasks.cancelTask(child.id, "Parent Task cancellation", {
+          decisionId: decision.id,
+          actorPrincipalId: caller.principalId,
+          scopeKey: scopeKey(caller.scope),
+        });
       return "pending";
     }
   }

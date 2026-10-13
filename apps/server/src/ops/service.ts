@@ -24,6 +24,7 @@ import {
 } from "../auth/service.js";
 import { scopeKey, type CallerContext } from "../identity/scope.js";
 import type { DomainStore } from "../persistence/index.js";
+import type { TaskActionAuthorization } from "./task-store.js";
 import { stringColumn } from "../persistence/database.js";
 import type { HerdrBridge } from "./herdr-bridge.js";
 import { OpsStateError, type WorkerDispatchFailure } from "./errors.js";
@@ -329,6 +330,17 @@ export class AuthorizedOpsService {
       throw error;
     }
     return { file, lease };
+  }
+
+  private taskActionAuthorization(
+    caller: CallerContext,
+    decision: AuthorizationDecision,
+  ): TaskActionAuthorization {
+    return {
+      decisionId: decision.id,
+      actorPrincipalId: caller.principalId,
+      scopeKey: scopeKey(caller.scope),
+    };
   }
 
   private async authorize(
@@ -674,24 +686,31 @@ export class AuthorizedOpsService {
   private async closeWorker(
     attemptId: string,
     worker: { paneId: string; agentName: string; herdrSession: string },
+    beforeClose?: () => Promise<void>,
   ): Promise<void> {
     if (!this.workspaceBoundary) {
+      await beforeClose?.();
       await this.bridge.stopAgent(worker);
       return;
     }
     const current = this.workerLease(attemptId);
     if (!current) {
+      await beforeClose?.();
       await this.bridge.closeAgent(worker);
       return;
     }
-    const writes = this.workspaceBoundary!.writes;
+    const close = async () => {
+      await beforeClose?.();
+      await this.bridge.closeAgent(worker);
+    };
+    const writes = this.workspaceBoundary.writes;
     if (current.state === "quarantined") {
       await writes.releaseQuarantined(current.lease, async () => {
-        await this.bridge.closeAgent(worker);
+        await close();
         return true;
       });
     } else {
-      await writes.closeAndRelease(current.lease, () => this.bridge.closeAgent(worker));
+      await writes.closeAndRelease(current.lease, close);
     }
     await this.recordWorkerLease(attemptId, current.lease, "released");
   }
@@ -736,7 +755,11 @@ export class AuthorizedOpsService {
     }
   }
 
-  private async recoverUnboundLease(taskId: string, attemptId: string): Promise<void> {
+  private async recoverUnboundLease(
+    taskId: string,
+    attemptId: string,
+    beforeClose?: () => Promise<void>,
+  ): Promise<void> {
     const current = this.workerLease(attemptId);
     if (!current || !this.workspaceBoundary) return;
     const events = await this.store.tasks.listTraceEvents({
@@ -756,12 +779,14 @@ export class AuthorizedOpsService {
       .filter((pane) => pane.agentName === current.lease.sandboxSessionId);
     if (panes.length > 1) throw new Error("Worker launch identity is ambiguous");
     const close = async () => {
-      if (panes[0])
+      if (panes[0]) {
+        await beforeClose?.();
         await this.bridge.closeAgent({
           paneId: panes[0].paneId,
           agentName: current.lease.sandboxSessionId,
           herdrSession: snapshot.sessionId,
         });
+      }
       const verified = await this.bridge.getSnapshot();
       if (
         verified.sessionId !== snapshot.sessionId ||
@@ -1050,13 +1075,17 @@ export class AuthorizedOpsService {
   async closeClaimedWorker(
     attemptId: string,
     worker: { paneId: string; agentName: string; herdrSession: string },
+    beforeClose?: () => Promise<void>,
   ): Promise<void> {
     try {
-      if (this.workspaceBoundary) await this.closeWorker(attemptId, worker);
-      else await this.bridge.closeAgent(worker);
+      if (this.workspaceBoundary) await this.closeWorker(attemptId, worker, beforeClose);
+      else {
+        await beforeClose?.();
+        await this.bridge.closeAgent(worker);
+      }
     } catch (error) {
       const current = this.workerLease(attemptId);
-      if (current?.state === "active") {
+      if (current?.state === "active" && !(error instanceof AccessDeniedError)) {
         this.workspaceBoundary!.writes.quarantine(current.lease);
         await this.recordWorkerLease(attemptId, current.lease, "quarantined");
       }
@@ -1100,33 +1129,47 @@ export class AuthorizedOpsService {
     }
   }
 
-  private async closeReviewedWorker(taskId: string, stepId: string): Promise<void> {
+  private async closeReviewedWorker(
+    caller: CallerContext,
+    taskId: string,
+    stepId: string,
+    action: "task:accept" | "task:rework",
+    evidence?: RunEvidence,
+  ): Promise<AuthorizationDecision | undefined> {
     const step = (await this.store.longWork.listSteps(taskId)).find((item) => item.id === stepId);
-    if (step?.kind !== "herdr_worker" || step.status !== "review") return;
+    if (step?.kind !== "herdr_worker" || step.status !== "review") return undefined;
     const attempt = (await this.store.tasks.listAttempts(taskId))
       .filter((item) => item.stepId === stepId)
       .at(-1);
-    if (!this.workspaceBoundary && !attempt) return;
+    if (!this.workspaceBoundary && !attempt) return undefined;
     if (!attempt || attempt.status !== "review")
       throw new Error("Reviewed Worker Attempt is missing");
     const binding = await this.store.tasks.getWorkerBinding(attempt.id);
-    if (!this.workspaceBoundary && !binding) return;
+    if (!this.workspaceBoundary && !binding) return undefined;
     if (!binding?.agentName) throw new Error("Reviewed Worker binding is unavailable");
-    await this.closeClaimedWorker(attempt.id, {
-      paneId: binding.paneId,
-      agentName: binding.agentName,
-      herdrSession: binding.herdrSession,
-    });
+    const decision = await this.authorize(caller, `task-${taskId}`, action, evidence);
+    await this.closeClaimedWorker(
+      attempt.id,
+      {
+        paneId: binding.paneId,
+        agentName: binding.agentName,
+        herdrSession: binding.herdrSession,
+      },
+      async () => {
+        await this.authorize(caller, `task-${taskId}`, action, evidence);
+      },
+    );
+    return decision;
   }
 
   private async binding(caller: CallerContext, taskId: string, action: string) {
-    await this.authorize(caller, `task-${taskId}`, action);
+    const decision = await this.authorize(caller, `task-${taskId}`, action);
     const task = await this.store.tasks.getTask(taskId);
     if (!task?.activeAttemptId) throw new OpsStateError("worker_not_started");
     const binding = await this.store.tasks.getWorkerBinding(task.activeAttemptId);
     if (!binding) throw new OpsStateError("worker_not_started");
     if (!binding.agentName) throw new OpsStateError("worker_binding_unverified");
-    return { task, binding };
+    return { task, binding, decision };
   }
 
   async readWorker(caller: CallerContext, taskId: string, evidence?: RunEvidence) {
@@ -1377,19 +1420,35 @@ export class AuthorizedOpsService {
         evidence?.runId,
       );
     } else {
+      let writeDecision = decision;
       if (this.workspaceBoundary) {
         if (task?.status !== "REVIEW") throw new Error("Task is not ready for acceptance");
         const binding = task.activeAttemptId
           ? await this.store.tasks.getWorkerBinding(task.activeAttemptId)
           : null;
         if (binding?.agentName)
-          await this.closeWorker(task.activeAttemptId!, {
-            paneId: binding.paneId,
-            agentName: binding.agentName,
-            herdrSession: binding.herdrSession,
-          });
+          await this.closeWorker(
+            task.activeAttemptId!,
+            {
+              paneId: binding.paneId,
+              agentName: binding.agentName,
+              herdrSession: binding.herdrSession,
+            },
+            async () => {
+              writeDecision = await this.authorize(
+                caller,
+                `task-${taskId}`,
+                "task:accept",
+                evidence,
+              );
+            },
+          );
       }
-      await this.store.tasks.acceptTask(taskId, caller.principalId, evidence?.runId);
+      await this.store.tasks.acceptTask(
+        taskId,
+        this.taskActionAuthorization(caller, writeDecision),
+        evidence?.runId,
+      );
     }
   }
 
@@ -1404,14 +1463,20 @@ export class AuthorizedOpsService {
     const task = await this.store.tasks.getTask(taskId);
     if (task?.orchestrationMode !== "durable")
       throw new Error("Step acceptance requires a durable Task");
-    await this.closeReviewedWorker(taskId, stepId);
+    const closeDecision = await this.closeReviewedWorker(
+      caller,
+      taskId,
+      stepId,
+      "task:accept",
+      evidence,
+    );
     const step = await this.store.longWork.acceptDurableStep({
       taskId,
       stepId,
       expectedStepVersion,
       origin: {
         kind: "decision",
-        decisionId: decision.id,
+        decisionId: closeDecision?.id ?? decision.id,
         actorPrincipalId: caller.principalId,
       },
     });
@@ -1431,7 +1496,13 @@ export class AuthorizedOpsService {
     const task = await this.store.tasks.getTask(taskId);
     if (task?.orchestrationMode !== "durable")
       throw new Error("Step rework requires a durable Task");
-    await this.closeReviewedWorker(taskId, stepId);
+    const closeDecision = await this.closeReviewedWorker(
+      caller,
+      taskId,
+      stepId,
+      "task:rework",
+      evidence,
+    );
     const step = await this.store.longWork.reworkDurableStep({
       taskId,
       stepId,
@@ -1439,7 +1510,7 @@ export class AuthorizedOpsService {
       reason,
       origin: {
         kind: "decision",
-        decisionId: decision.id,
+        decisionId: closeDecision?.id ?? decision.id,
         actorPrincipalId: caller.principalId,
       },
     });
@@ -1457,13 +1528,24 @@ export class AuthorizedOpsService {
       const current = await this.binding(caller, taskId, "task:rework");
       await this.authorize(caller, `task-${taskId}`, "worker:prompt");
       if (current.task.status !== "REVIEW") throw new OpsStateError("task_not_ready_for_rework");
+      let writeDecision = current.decision;
       if (this.workspaceBoundary)
-        await this.closeWorker(current.task.activeAttemptId!, {
-          paneId: current.binding.paneId,
-          agentName: current.binding.agentName!,
-          herdrSession: current.binding.herdrSession,
-        });
-      const result = await this.store.tasks.reworkTask(taskId, reason, caller.principalId);
+        await this.closeWorker(
+          current.task.activeAttemptId!,
+          {
+            paneId: current.binding.paneId,
+            agentName: current.binding.agentName!,
+            herdrSession: current.binding.herdrSession,
+          },
+          async () => {
+            writeDecision = await this.authorize(caller, `task-${taskId}`, "task:rework");
+          },
+        );
+      const result = await this.store.tasks.reworkTask(
+        taskId,
+        reason,
+        this.taskActionAuthorization(caller, writeDecision),
+      );
       let context: WorkerContext | undefined;
       let started = false;
       let worker: StartedWorker | undefined;
@@ -1599,7 +1681,12 @@ export class AuthorizedOpsService {
       const alreadyCanceled = task.status === "CANCELED";
       if (!alreadyCanceled) {
         try {
-          await this.store.tasks.cancelTask(taskId, reason, caller.principalId, evidence?.runId);
+          await this.store.tasks.cancelTask(
+            taskId,
+            reason,
+            this.taskActionAuthorization(caller, decision),
+            evidence?.runId,
+          );
         } catch (error) {
           if ((await this.store.tasks.getTask(taskId))?.status !== "CANCELED") throw error;
         }
@@ -1607,11 +1694,17 @@ export class AuthorizedOpsService {
       if (binding && task.activeAttemptId) {
         try {
           if (!binding.agentName) throw new OpsStateError("worker_binding_unverified");
-          await this.closeWorker(task.activeAttemptId, {
-            paneId: binding.paneId,
-            agentName: binding.agentName,
-            herdrSession: binding.herdrSession,
-          });
+          await this.closeWorker(
+            task.activeAttemptId,
+            {
+              paneId: binding.paneId,
+              agentName: binding.agentName,
+              herdrSession: binding.herdrSession,
+            },
+            async () => {
+              await this.authorize(caller, `task-${taskId}`, "task:cancel", evidence);
+            },
+          );
           if (alreadyCanceled)
             await this.store.tasks.resolveAttentionByTask(taskId, "ops_connection_problem");
         } catch (error) {
@@ -1624,7 +1717,9 @@ export class AuthorizedOpsService {
         }
       } else if (task.activeAttemptId && this.workerLease(task.activeAttemptId)) {
         try {
-          await this.recoverUnboundLease(taskId, task.activeAttemptId);
+          await this.recoverUnboundLease(taskId, task.activeAttemptId, async () => {
+            await this.authorize(caller, `task-${taskId}`, "task:cancel", evidence);
+          });
           await this.store.tasks.resolveAttentionByTask(taskId, "ops_connection_problem");
         } catch (error) {
           await this.store.tasks.recordWorkerCleanupProblem(

@@ -1,8 +1,10 @@
 import { expect, it, vi } from "vite-plus/test";
 import type { TaskStep } from "@glassbox/contracts";
 import { openDomainStore, AccessDeniedError, type CallerContext } from "../persistence/index.js";
+import { scopeKey } from "../identity/scope.js";
+import { taskPolicyResourceId } from "../auth/task-policy.js";
 import { FakeHerdrBridge } from "./fake-herdr-bridge.js";
-import { AuthorizedOpsService } from "./service.js";
+import { AuthorizedOpsService, type WorkerWorkspaceBoundary } from "./service.js";
 
 it("links a child with a current subset of parent Step permissions and rejects revocation", async () => {
   const store = await openDomainStore({ databasePath: ":memory:" });
@@ -957,6 +959,288 @@ it("delegates an existing authorized Task once even when callers race", async ()
         expect.objectContaining({ type: "task.worker_bound", taskId: task.id }),
       ]),
     );
+  } finally {
+    await store.close();
+  }
+});
+
+it("rechecks creator Task policy grants inside legacy review writes", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  const caller: CallerContext = {
+    principalId: "owner",
+    scope: {
+      connectionId: "test",
+      botId: "bot",
+      chatType: "private",
+      chatId: "owner",
+      senderId: "owner",
+    },
+  };
+  try {
+    await store.identities.bindOwner(caller.principalId, caller.scope);
+    const task = await store.tasks.createTask({
+      title: "Creator policy acceptance",
+      creatorPrincipalId: caller.principalId,
+      authorizationScope: caller.scope,
+    });
+    const attempt = await store.tasks.createAttempt({ taskId: task.id });
+    const binding = {
+      herdrSession: "policy-session",
+      workspaceId: "policy-workspace",
+      paneId: "policy-pane",
+    };
+    await store.tasks.bindWorker({
+      taskAttemptId: attempt.id,
+      ...binding,
+      agentName: "policy-worker",
+      agentKind: "test",
+    });
+    await store.tasks.observeWorker(binding, "done");
+    await store.authorization.grant({
+      principalId: caller.principalId,
+      resourceId: taskPolicyResourceId(caller),
+      action: "task:accept",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    const decision = await store.authorization.check({
+      caller,
+      resourceId: `task-${task.id}`,
+      action: "task:accept",
+    });
+    expect(decision.decision).toBe("ALLOW");
+    await store.tasks.acceptTask(task.id, {
+      decisionId: decision.id,
+      actorPrincipalId: caller.principalId,
+      scopeKey: scopeKey(caller.scope),
+    });
+    expect((await store.tasks.getTask(task.id))?.status).toBe("DONE");
+  } finally {
+    await store.close();
+  }
+});
+
+it("rechecks legacy Task grants inside accept, rework, and cancel writes", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  const caller: CallerContext = {
+    principalId: "owner",
+    scope: {
+      connectionId: "test",
+      botId: "bot",
+      chatType: "private",
+      chatId: "owner",
+      senderId: "owner",
+    },
+  };
+  try {
+    await store.identities.bindOwner("owner", caller.scope);
+    await store.authorization.registerResource({
+      id: "agent-operations",
+      kind: "ops",
+      visibility: "public",
+    });
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: "agent-operations",
+      action: "task:delegate",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    const bridge = new FakeHerdrBridge();
+    const service = new AuthorizedOpsService(store, bridge);
+    const stop = vi.spyOn(bridge, "stopAgent");
+
+    for (const action of ["task:accept", "task:rework", "task:cancel"] as const) {
+      const task = await service.delegate(caller, {
+        title: "Revoked " + action,
+        workspaceId: "isolated",
+        agentKind: "pi",
+        prompt: "Bounded work",
+      });
+      const binding = (await store.tasks.getWorkerBinding(task.activeAttemptId!))!;
+      await store.tasks.observeWorker(binding, "done");
+      const grantId = await store.authorization.grant({
+        principalId: "owner",
+        resourceId: "task-" + task.id,
+        action,
+        scope: caller.scope,
+        effect: "allow",
+      });
+      if (action === "task:rework")
+        await store.authorization.grant({
+          principalId: "owner",
+          resourceId: "task-" + task.id,
+          action: "worker:prompt",
+          scope: caller.scope,
+          effect: "allow",
+        });
+
+      if (action === "task:accept") {
+        const write = store.tasks.acceptTask.bind(store.tasks);
+        const barrier = vi.spyOn(store.tasks, "acceptTask").mockImplementation(async (...args) => {
+          await store.authorization.revoke(grantId);
+          return write(...args);
+        });
+        try {
+          await expect(service.accept(caller, task.id)).rejects.toThrow(
+            "Matching task:accept ALLOW decision is required",
+          );
+        } finally {
+          barrier.mockRestore();
+        }
+      } else if (action === "task:rework") {
+        const write = store.tasks.reworkTask.bind(store.tasks);
+        const barrier = vi.spyOn(store.tasks, "reworkTask").mockImplementation(async (...args) => {
+          await store.authorization.revoke(grantId);
+          return write(...args);
+        });
+        try {
+          await expect(
+            service.rework(caller, task.id, "revoke before write", "continue"),
+          ).rejects.toThrow("Matching task:rework ALLOW decision is required");
+        } finally {
+          barrier.mockRestore();
+        }
+      } else {
+        const write = store.tasks.cancelTask.bind(store.tasks);
+        const barrier = vi.spyOn(store.tasks, "cancelTask").mockImplementation(async (...args) => {
+          await store.authorization.revoke(grantId);
+          return write(...args);
+        });
+        try {
+          await expect(service.cancel(caller, task.id, "revoke before write")).rejects.toThrow(
+            "Matching task:cancel ALLOW decision is required",
+          );
+        } finally {
+          barrier.mockRestore();
+        }
+        expect(stop).not.toHaveBeenCalled();
+      }
+
+      expect((await store.tasks.getTask(task.id))?.status).toBe("REVIEW");
+      expect(await store.tasks.listAttempts(task.id)).toHaveLength(1);
+    }
+  } finally {
+    await store.close();
+  }
+});
+
+it("rechecks legacy Task authority immediately before closing a reviewed Worker", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  const caller: CallerContext = {
+    principalId: "owner",
+    scope: {
+      connectionId: "test",
+      botId: "bot",
+      chatType: "private",
+      chatId: "owner",
+      senderId: "owner",
+    },
+  };
+  try {
+    await store.identities.bindOwner("owner", caller.scope);
+    await store.authorization.registerResource({
+      id: "agent-operations",
+      kind: "ops",
+      visibility: "public",
+    });
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: "agent-operations",
+      action: "task:delegate",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    const bridge = new FakeHerdrBridge();
+    const seedService = new AuthorizedOpsService(store, bridge);
+    const boundary: WorkerWorkspaceBoundary = {
+      registry: {} as WorkerWorkspaceBoundary["registry"],
+      writes: { listUnresolved: () => [] } as unknown as WorkerWorkspaceBoundary["writes"],
+    };
+    const service = new AuthorizedOpsService(store, bridge, undefined, undefined, boundary);
+    const close = vi.spyOn(bridge, "closeAgent");
+
+    for (const action of ["task:accept", "task:rework", "task:cancel"] as const) {
+      const task = await seedService.delegate(caller, {
+        title: "Close gate " + action,
+        workspaceId: "isolated",
+        agentKind: "pi",
+        prompt: "Bounded work",
+      });
+      const binding = (await store.tasks.getWorkerBinding(task.activeAttemptId!))!;
+      await store.tasks.observeWorker(binding, "done");
+      const grantId = await store.authorization.grant({
+        principalId: "owner",
+        resourceId: "task-" + task.id,
+        action,
+        scope: caller.scope,
+        effect: "allow",
+      });
+      if (action === "task:rework")
+        await store.authorization.grant({
+          principalId: "owner",
+          resourceId: "task-" + task.id,
+          action: "worker:prompt",
+          scope: caller.scope,
+          effect: "allow",
+        });
+
+      if (action === "task:cancel") {
+        const write = store.tasks.cancelTask.bind(store.tasks);
+        const revokeAfterWrite = vi
+          .spyOn(store.tasks, "cancelTask")
+          .mockImplementation(async (...args) => {
+            const result = await write(...args);
+            await store.authorization.revoke(grantId);
+            return result;
+          });
+        try {
+          await expect(service.cancel(caller, task.id)).resolves.toBeUndefined();
+        } finally {
+          revokeAfterWrite.mockRestore();
+        }
+        expect(close).not.toHaveBeenCalled();
+        expect((await store.tasks.getTask(task.id))?.status).toBe("CANCELED");
+        expect(await store.tasks.listTraceEvents({ taskId: task.id })).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ type: "worker.cleanup_failed", taskId: task.id }),
+          ]),
+        );
+        continue;
+      }
+
+      const getBinding = store.tasks.getWorkerBinding.bind(store.tasks);
+      let enter!: () => void;
+      const entered = new Promise<void>((resolve) => (enter = resolve));
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => (release = resolve));
+      const read = vi
+        .spyOn(store.tasks, "getWorkerBinding")
+        .mockImplementation(async (attemptId) => {
+          const value = await getBinding(attemptId);
+          if (attemptId === task.activeAttemptId) {
+            enter();
+            await gate;
+          }
+          return value;
+        });
+      try {
+        const operation =
+          action === "task:accept"
+            ? service.accept(caller, task.id)
+            : service.rework(caller, task.id, "revoke before close", "continue");
+        await entered;
+        await store.authorization.revoke(grantId);
+        release();
+        await expect(operation).rejects.toBeInstanceOf(AccessDeniedError);
+      } finally {
+        release();
+        read.mockRestore();
+      }
+      expect(close).not.toHaveBeenCalled();
+      expect((await store.tasks.getTask(task.id))?.status).toBe("REVIEW");
+      expect(await store.tasks.listAttempts(task.id)).toHaveLength(1);
+    }
   } finally {
     await store.close();
   }

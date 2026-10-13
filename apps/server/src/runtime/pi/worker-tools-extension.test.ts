@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { expect, it } from "vite-plus/test";
 import { openDomainStore } from "../../persistence/index.js";
+import { scopeKey } from "../../identity/scope.js";
 import { executeWorkerFileTool, type WorkerToolContext } from "./worker-tools-extension.js";
 
 it("rechecks grants and active attempt for each worker file operation and records safe evidence", async () => {
@@ -96,7 +97,29 @@ it("rechecks grants and active attempt for each worker file operation and record
     await expect(
       executeWorkerFileTool(context, "traversal", "read", { path: "../glassbox.db" }),
     ).rejects.toThrow();
-    await store.tasks.cancelTask(task.id, "stop");
+    await store.authorization.registerResource({
+      id: `task-${task.id}`,
+      kind: "task",
+      visibility: "private",
+      ownerId: caller.principalId,
+    });
+    await store.authorization.grant({
+      principalId: caller.principalId,
+      resourceId: `task-${task.id}`,
+      action: "task:cancel",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    const cancellation = await store.authorization.check({
+      caller,
+      resourceId: `task-${task.id}`,
+      action: "task:cancel",
+    });
+    await store.tasks.cancelTask(task.id, "stop", {
+      decisionId: cancellation.id,
+      actorPrincipalId: caller.principalId,
+      scopeKey: scopeKey(caller.scope),
+    });
     await expect(
       executeWorkerFileTool(context, "after-cancel", "read", { path: "result.ts" }),
     ).rejects.toThrow();
