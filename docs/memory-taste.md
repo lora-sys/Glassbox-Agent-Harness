@@ -49,6 +49,14 @@ This document defines the ownership and learning boundary between Rules, Skills,
 
 P3, P4A and P4B are complete. `.plans/04a-memory-taste.md` and Issue #9 record the learning implementation; `.plans/04b-authorized-retrieval-history.md` and Issue #10 record authorized retrieval and QQ history search. The current learning implementation lives in `apps/server/src/learning/`; later sections retain explicitly labeled conceptual designs.
 
+## Automatic Run Context
+
+Ordinary QQ Runs automatically retrieve only exact current-group Memory for group
+Conversations and Owner-global Memory for Owner private Conversations. Project Memory
+remains an explicit Owner-private operation until Glassbox has a trusted server-side
+project binding for the Run. Free text, group nicknames, and model-selected project IDs
+must not grant that binding.
+
 ## Decision
 
 Do not collapse Rules, Skills, Taste, and Memory into one prompt file or one generic memory bucket.
