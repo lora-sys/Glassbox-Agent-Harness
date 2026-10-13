@@ -1766,6 +1766,8 @@ describe("PiSdkRuntimeAdapter", () => {
     await adapter.run(binding, run, "say hello", context);
 
     expect(surface).toBeDefined();
+    expect(sessionEvidence?.toolDiscoveryDurationMs).toEqual(expect.any(Number));
+    expect(Number.isFinite(sessionEvidence?.toolDiscoveryDurationMs)).toBe(true);
     const schemaEvidence = sessionEvidence?.toolSchemaEvidence as ReturnType<
       typeof toolSchemaEvidence
     >;

@@ -74,6 +74,7 @@ interface ActiveSession {
   /** The classified surface, when discovery could report one. Recorded as Run evidence. */
   toolSurface?: EffectiveToolSurface;
   toolSchemaEvidence?: ToolSchemaEvidence;
+  toolDiscoveryDurationMs?: number;
   authorizedSkillNames: readonly string[];
   modelVisibleSkillNames: readonly string[];
   skillPolicy: Record<string, unknown>;
@@ -1030,10 +1031,13 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
       enabledSkills: authorizedSkillNames,
     };
     const runtimeEvidence = this.loader.runtimeEvidence(profileName, authorizedSkillNames);
-    const discoveredCandidates =
-      context && this.options.resolveToolCandidates
-        ? await this.options.resolveToolCandidates(context)
-        : undefined;
+    let discoveredCandidates: readonly ToolSurfaceCandidate[] | undefined;
+    let toolDiscoveryDurationMs: number | undefined;
+    if (context && this.options.resolveToolCandidates) {
+      const startedAt = performance.now();
+      discoveredCandidates = await this.options.resolveToolCandidates(context);
+      toolDiscoveryDurationMs = Math.max(0, Math.round(performance.now() - startedAt));
+    }
     const requiredToolNames = [
       ...new Set([
         ...(context?.requiredEvidence?.map((evidence) => evidence.tool) ?? []),
@@ -1136,6 +1140,7 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
       authorizedToolNames: authorizedToolNames ?? [],
       toolSurface,
       toolSchemaEvidence: this.toolSchemaEvidenceBySession.get(session.sessionId),
+      toolDiscoveryDurationMs,
       authorizedSkillNames,
       modelVisibleSkillNames,
       skillPolicy: structuredClone(resolvedSkills.policy ?? { source: "kit-profile" }),
@@ -1821,6 +1826,9 @@ export class PiSdkRuntimeAdapter implements PiRuntimeAdapter {
           // supplies names, and never fabricated here — a missing surface is a fact too.
           ...(active.toolSurface ? { toolSurface: active.toolSurface } : {}),
           ...(active.toolSchemaEvidence ? { toolSchemaEvidence: active.toolSchemaEvidence } : {}),
+          ...(active.toolDiscoveryDurationMs === undefined
+            ? {}
+            : { toolDiscoveryDurationMs: active.toolDiscoveryDurationMs }),
           authorizedSkills: active.authorizedSkillNames,
           modelVisibleSkills: active.modelVisibleSkillNames,
           skillPolicy: active.skillPolicy,

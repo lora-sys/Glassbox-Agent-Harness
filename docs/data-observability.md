@@ -564,9 +564,11 @@ and the relevant identifiers, expiry, scope hash or fixed denial reason. They do
 message bodies, credentials or Tool inputs. A restriction is not an authorization grant, so
 these entries do not create grant/revoke product evidence.
 
-Run Raw Trace remains append-only. `session_start` records the applicable lease identity and
-final narrowed Tool names. The acceptance observer reads Raw Trace through gbxtrace, matches
-the exact scoped input and delivery, and correlates Tool call/result identifiers in that Run.
+Run Raw Trace remains append-only. `session_start` records the applicable lease identity, final
+narrowed Tool names, and `toolDiscoveryDurationMs`, the elapsed time spent resolving the Run's
+Tool candidates before the Pi session starts. This field excludes provider response time and
+session creation. The acceptance observer reads Raw Trace through gbxtrace, matches the exact
+scoped input and delivery, and correlates Tool call/result identifiers in that Run.
 Independent state checks use fixed read-only queries for explicitly identified acceptance
 resources and their Run provenance. Arbitrary queries and scripts are not acceptance observers.
 
