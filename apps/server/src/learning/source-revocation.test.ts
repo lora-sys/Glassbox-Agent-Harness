@@ -1,3 +1,4 @@
+// test-contract-change: ISSUE-194 preserve source revocation in bounded Memory Context scans.
 import { expect, it, vi } from "vite-plus/test";
 import { sourcePolicyFixture as fixture } from "./source-policy-test-fixture.js";
 import { archiveDecisionBatch } from "../persistence/decision-archive.js";
@@ -17,6 +18,14 @@ it("withholds imported candidates, promotion, and canonical Memory after exact s
       "memory_source_denied",
     );
     expect(await f.store.learning.listMemories({ caller: f.caller })).toEqual([]);
+    expect(
+      await f.store.learning.listGlobalMemoryContextCandidates({ caller: f.caller }),
+    ).toMatchObject({
+      memories: [],
+      candidateCount: 0,
+      scannedCount: 1,
+      truncated: false,
+    });
     await expect(f.store.learning.getCandidate({ caller: f.caller }, pendingId)).rejects.toThrow(
       "memory_source_denied",
     );

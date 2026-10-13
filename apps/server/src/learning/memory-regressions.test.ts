@@ -1,3 +1,4 @@
+// test-contract-change: ISSUE-194 cover 101/41 context scan boundaries and bounded coverage.
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -60,6 +61,119 @@ it.each(
     expect(inspected.filter((row) => row.lifecycleState === "expired")).toHaveLength(limit + 1);
     if (kind === "group")
       expect(inspected.filter((row) => row.sensitivity !== "public")).toHaveLength(2 * (limit + 1));
+  } finally {
+    await f.store.close();
+  }
+});
+
+it.each([
+  { kind: "global" as const, recentCount: 100 },
+  { kind: "group" as const, recentCount: 40 },
+])(
+  "retrieves a relevant older $kind Memory beyond the previous $recentCount-row cutoff",
+  async ({ kind, recentCount }) => {
+    const f = await fixture();
+    try {
+      const base = {
+        ...f.base,
+        scope: kind === "group" ? f.groupScope : f.base.scope,
+        sensitivity: "public" as const,
+      };
+      const relevant = await f.store.learning.writeExplicit(f.context, {
+        ...base,
+        statement: "A unique older project handoff detail",
+      });
+      const recentIds: string[] = [];
+      for (let index = 0; index < recentCount; index += 1) {
+        const memory = await f.store.learning.writeExplicit(f.context, {
+          ...base,
+          statement: "A recent unrelated detail " + index,
+        });
+        recentIds.push(memory.memoryId);
+      }
+      await f.store.db.transaction(async (tx) => {
+        await tx.execute({
+          sql: "UPDATE memories SET updated_at = ? WHERE id = ?",
+          args: ["2000-01-01T00:00:00.000Z", relevant.memoryId],
+        });
+        for (const [index, id] of recentIds.entries())
+          await tx.execute({
+            sql: "UPDATE memories SET updated_at = ? WHERE id = ?",
+            args: [new Date(Date.UTC(2026, 0, 1, 0, index + 1)).toISOString(), id],
+          });
+      });
+
+      const selection =
+        kind === "group"
+          ? await f.store.learning.listGroupMemoryContextCandidates(
+              f.groupContext,
+              "group:100",
+              f.groupScope,
+              { candidateLimit: recentCount + 1, scanLimit: recentCount + 1 },
+            )
+          : await f.store.learning.listGlobalMemoryContextCandidates(f.context, {
+              candidateLimit: recentCount + 1,
+              scanLimit: recentCount + 1,
+            });
+
+      expect(selection.memories.map((memory) => memory.memoryId)).toContain(relevant.memoryId);
+      expect(selection).toMatchObject({
+        candidateCount: recentCount + 1,
+        scannedCount: recentCount + 1,
+        scanLimit: recentCount + 1,
+        truncated: false,
+      });
+    } finally {
+      await f.store.close();
+    }
+  },
+);
+
+it("does not mark an empty Memory Context scan as a protected content source", async () => {
+  const f = await fixture();
+  try {
+    const accepted = await f.store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: f.scope,
+      messageId: "empty-memory-context",
+      text: "Check whether any Memory is available.",
+      executionRef: "fixture",
+    });
+    await f.store.learning.listGlobalMemoryContextCandidates({
+      caller: f.caller,
+      conversationId: accepted.conversation.id,
+      runId: accepted.run.id,
+    });
+    const decisions = await f.store.db.transaction((tx) =>
+      tx.execute({
+        sql: "SELECT delivery_source FROM authorization_decisions WHERE run_id = ? AND resource_id = 'owner-memory' AND action = 'memory:read'",
+        args: [accepted.run.id],
+      }),
+    );
+    expect(decisions.rows.every((row) => row.delivery_source !== "content_source")).toBe(true);
+  } finally {
+    await f.store.close();
+  }
+});
+
+it("stops the Memory Context scan at its explicit bound and reports incomplete coverage", async () => {
+  const f = await fixture();
+  try {
+    for (let index = 0; index < 80; index += 1)
+      await f.store.learning.writeExplicit(f.context, {
+        ...f.base,
+        statement: "Recent fixture memory " + index,
+      });
+    const selection = await f.store.learning.listGlobalMemoryContextCandidates(f.context, {
+      candidateLimit: 100,
+      scanLimit: 64,
+    });
+    expect(selection).toMatchObject({
+      candidateCount: 64,
+      scannedCount: 64,
+      scanLimit: 64,
+      truncated: true,
+    });
   } finally {
     await f.store.close();
   }

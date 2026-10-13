@@ -1,3 +1,4 @@
+// test-contract-change: ISSUE-194 cover bounded authorized Memory retrieval and scan evidence.
 import { describe, expect, it, vi } from "vite-plus/test";
 import type { QqNativeGroupRole } from "../../identity/scope.js";
 import type { ExecutionInput } from "../../execution/run-service/types.js";
@@ -722,7 +723,13 @@ describe("Pi required Tool execution", () => {
     const authorizeContext = vi.fn(async () => {});
     const learningStore = {
       authorizeContext,
-      listGroupMemories: vi.fn(async () => [activeMemory]),
+      listGroupMemoryContextCandidates: vi.fn(async () => ({
+        memories: [activeMemory],
+        candidateCount: 1,
+        scannedCount: 1,
+        scanLimit: 128,
+        truncated: false,
+      })),
       markGroupMemoriesUsed,
     } as unknown as LearningStore;
     const learningEvidence: RunEvidenceRecord[] = [];
@@ -762,6 +769,10 @@ describe("Pi required Tool execution", () => {
       conversationId: "conversation-1",
       scopeType: "group",
       status: "loaded",
+      candidateCount: 1,
+      scannedCount: 1,
+      scanLimit: 128,
+      truncated: false,
       memoryIds: ["memory_group_fact"],
     });
   });
@@ -790,7 +801,13 @@ describe("Pi required Tool execution", () => {
     const executor = new PiRunExecutionAdapter(f.runtime, {
       learningStore: {
         authorizeContext: vi.fn(async () => {}),
-        listGroupMemories: vi.fn(async () => [activeMemory]),
+        listGroupMemoryContextCandidates: vi.fn(async () => ({
+          memories: [activeMemory],
+          candidateCount: 1,
+          scannedCount: 1,
+          scanLimit: 128,
+          truncated: false,
+        })),
         markGroupMemoriesUsed: vi.fn(async () => [activeMemory]),
       } as unknown as LearningStore,
       onLearningEvidence: (record) => {
@@ -807,6 +824,10 @@ describe("Pi required Tool execution", () => {
         type: "learning_context",
         scopeType: "group",
         status: "loaded",
+        candidateCount: 1,
+        scannedCount: 1,
+        scanLimit: 128,
+        truncated: false,
         memoryIds: ["memory_group_response_preference"],
       }),
     );

@@ -878,6 +878,10 @@ export type RunEvidenceRecord =
       conversationId: string;
       scopeType: "global" | "group" | "none";
       status: "loaded" | "empty" | "unavailable" | "omitted_for_budget";
+      candidateCount: number;
+      scannedCount: number;
+      scanLimit: number;
+      truncated: boolean;
       memoryIds: string[];
     }
   | {
@@ -2728,6 +2732,12 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
       let learningItems: ExecutionInput["learningContext"] = [];
       let learningScopeType: "global" | "group" | "none" = "none";
       let learningStatus: "loaded" | "empty" | "unavailable" | "omitted_for_budget" = "empty";
+      let learningScan = {
+        candidateCount: 0,
+        scannedCount: 0,
+        scanLimit: 0,
+        truncated: false,
+      };
       if (this.options.learningStore) {
         const operation = {
           caller: input.caller,
@@ -2744,18 +2754,32 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
               botId: input.caller.scope.botId,
               groupId: input.caller.scope.chatId,
             };
-            memories = await this.options.learningStore.listGroupMemories(
+            const selection = await this.options.learningStore.listGroupMemoryContextCandidates(
               operation,
               groupResourceId(groupScope.groupId),
               groupScope,
-              40,
+              { candidateLimit: 64, scanLimit: 128 },
             );
+            memories = selection.memories;
+            learningScan = {
+              candidateCount: selection.candidateCount,
+              scannedCount: selection.scannedCount,
+              scanLimit: selection.scanLimit,
+              truncated: selection.truncated,
+            };
           } else if (isOwner) {
             learningScopeType = "global";
-            memories = await this.options.learningStore.listMemories(operation, {
-              scope: { type: "global" },
-              limit: 100,
-            });
+            const selection = await this.options.learningStore.listGlobalMemoryContextCandidates(
+              operation,
+              { candidateLimit: 128, scanLimit: 256 },
+            );
+            memories = selection.memories;
+            learningScan = {
+              candidateCount: selection.candidateCount,
+              scannedCount: selection.scannedCount,
+              scanLimit: selection.scanLimit,
+              truncated: selection.truncated,
+            };
           } else {
             memories = [];
           }
@@ -2814,6 +2838,7 @@ export class PiRunExecutionAdapter implements RunExecutionAdapter {
         conversationId: input.conversation.id,
         scopeType: learningScopeType,
         status: learningStatus,
+        ...learningScan,
         memoryIds: learningItems.map((item) => item.memoryId),
       });
       const budgetEvidence: Extract<RunEvidenceRecord, { type: "context_budget" }> = {
