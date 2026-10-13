@@ -53,3 +53,12 @@ The parent statically imports the child entry's inert script URL. An explicit ma
 PR #132 commit `e4c384e` passed Ubuntu CI, but Windows job `110582654021` rejected the raw drive path passed to Node's `--import` with `ERR_UNSUPPORTED_ESM_URL_SCHEME`. The helper now converts the resolved tsx loader path with `pathToFileURL(loader).href`. Process exit, cancellation and cleanup ordering are unchanged.
 
 A real-child regression uses a loader filename containing spaces, `#` and `%`, verifies the encoded `file:///` argument and round-trip path, and checks the native drive prefix on Windows. Before the fix it failed because Node interpreted `#` as a URL fragment; afterward all 38 focused memory/helper tests passed. Both changed files pass lint and type checks without warnings. Native Windows verification and aggregate gates for this follow-up remain pending. The same helper and regression are copied unchanged into PR #130.
+
+
+## 2026-10-14 QQ Taste and Worker diagnostic fixtures
+
+The Windows qq-live-taste-fixture.test.ts and ops-worker-diagnostics.test.ts cases also opened file-backed DomainStores and removed their temporary directories in the same process. They now run their unchanged lifecycle assertions in short-lived fixture processes through the existing runFixtureProcess helper. The parent removes each directory only after the helper observes the child's close event. Store close errors are no longer swallowed.
+
+The two cases and process-helper tests passed together three times on native Windows, six tests per run. Linux verify:full passed with 3,134 unit tests, one optional Herdr test skipped, 1,211 script tests, core lint and types across 546 files, and the Web build.
+
+An initial full Windows unit run passed 3,129 tests and skipped one optional test, but the queued-lease restart case returned interrupted instead of failed/gate_refused. The test mocked its immediate wake but left the production two-second durable queue poll active. Under a slow suite, that poll could dispatch the queued Run before the test reopened the application; closing the old application then interrupted it. The test now stops the scheduler before sending the fixture message, so it accurately models process exit before dispatch. The targeted case passes on Linux and Windows, and the full Windows unit suite now passes 3,130 tests with one optional test skipped. No SQLite cleanup failures occurred.
