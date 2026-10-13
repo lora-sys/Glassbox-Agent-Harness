@@ -2320,7 +2320,21 @@ export class ManagementApplication {
             runId: context.runId,
           };
           const authorizeRead = async (): Promise<string> => {
-            const current = this.resolveRunToolNames(context);
+            const membersDescriptor = TOOL_DESCRIPTORS.find(
+              (descriptor) => descriptor.name === members.tool,
+            );
+            const memberCandidate = membersDescriptor
+              ? (
+                  await this.resolveRunToolCandidates(
+                    {
+                      ...context,
+                      requiredEvidence: undefined,
+                      requiredToolName: undefined,
+                    },
+                    [membersDescriptor],
+                  )
+                )[0]
+              : undefined;
             const discovery = await this.store.authorization.check({
               caller,
               resourceId: toolResourceId(members.tool),
@@ -2329,7 +2343,8 @@ export class ManagementApplication {
               runId: context.runId,
             });
             if (
-              !(await current).includes(members.tool) ||
+              !memberCandidate ||
+              memberCandidate.exclusion !== null ||
               !(await this.isCategoryEnabled(
                 caller.scope.connectionId,
                 groupId,
@@ -2853,6 +2868,12 @@ export class ManagementApplication {
       }));
     const isOwner = await this.store.identities.isOwner(context.caller.principalId);
     const scope = context.caller.scope;
+    const requiredToolNames = new Set([
+      ...(context.requiredEvidence?.map((evidence) => evidence.tool) ?? []),
+      ...(context.requiredToolName ? [context.requiredToolName] : []),
+    ]);
+    const requestToolSelection =
+      !context.acceptanceLease && requiredToolNames.size > 0 ? requiredToolNames : undefined;
     const capabilityCategories =
       scope.chatType === "group"
         ? enabledCategories(
@@ -2870,6 +2891,7 @@ export class ManagementApplication {
     // discovery grant.
     const classified = new Set<string>();
     const scopeGates = new Map<string, ToolExclusionReason>();
+    const registeredNames = new Set(registered.map((descriptor) => descriptor.name));
     const classify = (
       entries: readonly {
         name: string;
@@ -2900,8 +2922,11 @@ export class ManagementApplication {
       [WEB_SEARCH_TOOL, "web.search"],
       [WEB_FETCH_TOOL, "web.fetch"],
     ] as const) {
+      if (!registeredNames.has(name)) continue;
       classified.add(name);
-      if (
+      if (requestToolSelection && !requestToolSelection.has(name)) {
+        scopeGates.set(name, "not_selected_for_request");
+      } else if (
         !(await this.isWebEnabled(
           {
             caller: context.caller,
@@ -2913,24 +2938,34 @@ export class ManagementApplication {
       )
         scopeGates.set(name, "policy_disabled");
     }
-    classified.add(BROWSER_TOOL);
-    const webContext = {
-      caller: context.caller,
-      conversationId: context.conversationId,
-      runId: context.runId,
-    };
-    if (
-      !(await this.isWebEnabled(webContext, "browser.read")) &&
-      !(await this.isWebEnabled(webContext, "browser.interact"))
-    )
-      scopeGates.set(BROWSER_TOOL, "policy_disabled");
+    if (registeredNames.has(BROWSER_TOOL)) {
+      classified.add(BROWSER_TOOL);
+      const webContext = {
+        caller: context.caller,
+        conversationId: context.conversationId,
+        runId: context.runId,
+      };
+      if (requestToolSelection && !requestToolSelection.has(BROWSER_TOOL)) {
+        scopeGates.set(BROWSER_TOOL, "not_selected_for_request");
+      } else if (
+        !(await this.isWebEnabled(webContext, "browser.read")) &&
+        !(await this.isWebEnabled(webContext, "browser.interact"))
+      )
+        scopeGates.set(BROWSER_TOOL, "policy_disabled");
+    }
 
     // The Agent Ops and Owner-control surface is Owner-private. A group Run reaches neither,
     // however the Owner's own grants look, so this is a scope boundary rather than a policy.
     const ownerPrivate = isOwner && scope.chatType === "private";
-    const selectedWorkspace = ownerPrivate
-      ? await this.workspaces.resolveSelected(context.caller.principalId).catch(() => null)
-      : null;
+    const requiredPiBuiltin = [...(requestToolSelection ?? [])].some((name) =>
+      GLASSBOX_HOST_EXCLUDED_PI_TOOLS.includes(name),
+    );
+    const selectedWorkspace =
+      ownerPrivate &&
+      registered.some((descriptor) => descriptor.origin === "pi_builtin") &&
+      (!requestToolSelection || requiredPiBuiltin)
+        ? await this.workspaces.resolveSelected(context.caller.principalId).catch(() => null)
+        : null;
     if (selectedWorkspace) context.workspaceId = selectedWorkspace.id;
     for (const name of OPS_TOOL_NAMES) {
       classified.add(name);
@@ -2946,13 +2981,29 @@ export class ManagementApplication {
     if (!ownerPrivate) scopeGates.set(MEDIA_GENERATION_TOOL, "scope_not_permitted");
     classified.add(SKILL_READ_TOOL);
     if (!context.authorizedSkillNames?.length) scopeGates.set(SKILL_READ_TOOL, "policy_disabled");
+    for (const descriptor of registered) {
+      if (descriptor.origin !== "pi_builtin") continue;
+      classified.add(descriptor.name);
+      if (!ownerPrivate) scopeGates.set(descriptor.name, "scope_not_permitted");
+    }
 
     const candidates: ToolSurfaceCandidate[] = [];
     for (const descriptor of registered) {
+      if (!classified.has(descriptor.name)) {
+        candidates.push({ name: descriptor.name, exclusion: "unclassified" });
+        continue;
+      }
+      const initialGate = scopeGates.get(descriptor.name);
+      if (initialGate !== undefined) {
+        candidates.push({ name: descriptor.name, exclusion: initialGate });
+        continue;
+      }
+      if (requestToolSelection && !requestToolSelection.has(descriptor.name)) {
+        candidates.push({ name: descriptor.name, exclusion: "not_selected_for_request" });
+        continue;
+      }
       if (descriptor.origin === "pi_builtin") {
-        classified.add(descriptor.name);
-        if (!ownerPrivate) scopeGates.set(descriptor.name, "scope_not_permitted");
-        else if (!this.sandboxRuntime?.availableTools.has(descriptor.name))
+        if (!this.sandboxRuntime?.availableTools.has(descriptor.name))
           scopeGates.set(descriptor.name, "backend_unavailable");
         else if (!selectedWorkspace) scopeGates.set(descriptor.name, "policy_disabled");
         else {
@@ -2982,12 +3033,6 @@ export class ManagementApplication {
             }
           }
         }
-      }
-      // A registered Tool no rule classified is a wiring bug. Withholding it keeps it out of
-      // the model's surface and makes the gap visible instead of silently offering it.
-      if (!classified.has(descriptor.name)) {
-        candidates.push({ name: descriptor.name, exclusion: "unclassified" });
-        continue;
       }
       const gate = scopeGates.get(descriptor.name);
       if (gate !== undefined) {

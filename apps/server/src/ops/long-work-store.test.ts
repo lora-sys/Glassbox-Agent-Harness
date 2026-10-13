@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { expect, it } from "vite-plus/test";
 import type { TaskStep } from "@glassbox/contracts";
 import { DomainDatabase } from "../persistence/database.js";
+import { taskPolicyResourceIdForScope } from "../auth/task-policy.js";
 import {
   LongWorkStore,
   MAX_CHILD_TASK_ANCESTOR_DEPTH,
@@ -167,20 +168,44 @@ async function settleWorkerStep(
 
 async function addAcceptDecision(
   db: DomainDatabase,
-  overrides: { id?: string; principal?: string; action?: string; scope?: string } = {},
+  overrides: {
+    id?: string;
+    principal?: string;
+    action?: string;
+    scope?: string;
+    policy?: boolean;
+    withoutGrant?: boolean;
+    grantAction?: string;
+  } = {},
 ): Promise<string> {
   const id = overrides.id ?? "accept-decision";
+  const principal = overrides.principal ?? "owner";
+  const action = overrides.action ?? "task:accept";
+  const scope = overrides.scope ?? "test";
+  const grantId = overrides.withoutGrant ? null : `${id}-grant`;
+  const grantResource = overrides.policy
+    ? taskPolicyResourceIdForScope(principal, scope)
+    : "task-task-1";
   await db.transaction(async (tx) => {
     await tx.execute({
-      sql: "INSERT INTO authorization_decisions(id,principal_id,resource_id,action,scope_key,decision,reason,created_at) VALUES (?,?,?,?,?,'ALLOW','test',?)",
-      args: [
-        id,
-        overrides.principal ?? "owner",
-        "task-task-1",
-        overrides.action ?? "task:accept",
-        overrides.scope ?? "test",
-        now,
-      ],
+      sql: "INSERT OR IGNORE INTO principals(id,kind,created_at) VALUES (?,'owner',?)",
+      args: [principal, now],
+    });
+    if (overrides.policy) {
+      await tx.execute({
+        sql: "INSERT OR IGNORE INTO resources(id,kind,visibility,owner_id) VALUES (?,'task-policy','private','owner')",
+        args: [grantResource],
+      });
+    }
+    if (grantId) {
+      await tx.execute({
+        sql: "INSERT INTO grants(id,principal_id,resource_id,action,scope_key,effect,created_at) VALUES (?,?,?,?,?,'allow',?)",
+        args: [grantId, principal, grantResource, overrides.grantAction ?? action, scope, now],
+      });
+    }
+    await tx.execute({
+      sql: "INSERT INTO authorization_decisions(id,principal_id,resource_id,action,scope_key,decision,reason,grant_id,created_at) VALUES (?,?,?,?,?,'ALLOW','test',?,?)",
+      args: [id, principal, "task-task-1", action, scope, grantId, now],
     });
   });
   return id;
@@ -190,29 +215,39 @@ async function addStepDecision(
   db: DomainDatabase,
   action: "task:accept" | "task:rework",
   id: string,
-  overrides: { principal?: string; resource?: string; scope?: string; revoked?: boolean } = {},
+  overrides: {
+    principal?: string;
+    resource?: string;
+    scope?: string;
+    revoked?: boolean;
+    policy?: boolean;
+  } = {},
 ): Promise<void> {
   const grantId = `${id}-grant`;
+  const principal = overrides.principal ?? "owner";
+  const resource = overrides.resource ?? "task-task-1";
+  const scope = overrides.scope ?? "test";
+  const grantResource = overrides.policy
+    ? taskPolicyResourceIdForScope(principal, scope)
+    : resource;
   await db.transaction(async (tx) => {
     await tx.execute({
       sql: "INSERT OR IGNORE INTO principals(id,kind,created_at) VALUES (?,'owner',?)",
-      args: [overrides.principal ?? "owner", now],
+      args: [principal, now],
     });
+    if (overrides.policy) {
+      await tx.execute({
+        sql: "INSERT OR IGNORE INTO resources(id,kind,visibility,owner_id) VALUES (?,'task-policy','private','owner')",
+        args: [grantResource],
+      });
+    }
     await tx.execute({
       sql: "INSERT OR IGNORE INTO resources(id,kind,visibility,owner_id) VALUES (?,'task','private','owner')",
       args: [overrides.resource ?? "task-task-1"],
     });
     await tx.execute({
       sql: "INSERT INTO grants(id,principal_id,resource_id,action,scope_key,effect,created_at,revoked_at) VALUES (?,?,?,?,?,'allow',?,?)",
-      args: [
-        grantId,
-        overrides.principal ?? "owner",
-        overrides.resource ?? "task-task-1",
-        action,
-        overrides.scope ?? "test",
-        now,
-        overrides.revoked ? now : null,
-      ],
+      args: [grantId, principal, grantResource, action, scope, now, overrides.revoked ? now : null],
     });
     await tx.execute({
       sql: "INSERT INTO authorization_decisions(id,principal_id,resource_id,action,scope_key,decision,reason,grant_id,created_at) VALUES (?,?,?,?,?,'ALLOW','test',?,?)",
@@ -238,38 +273,43 @@ async function addCancelDecision(
     action?: string;
     scope?: string;
     grantId?: string;
+    withoutGrant?: boolean;
+    policy?: boolean;
   } = {},
 ): Promise<string> {
   const id = overrides.id ?? "cancel-decision";
+  const principal = overrides.principal ?? "owner";
+  const resource = overrides.resource ?? "task-task-1";
+  const action = overrides.action ?? "task:cancel";
+  const scope = overrides.scope ?? "test";
+  const grantId = overrides.withoutGrant ? null : (overrides.grantId ?? `${id}-grant`);
+  const grantResource = overrides.policy
+    ? taskPolicyResourceIdForScope(principal, scope)
+    : resource;
   await db.transaction(async (tx) => {
-    if (overrides.grantId) {
+    await tx.execute({
+      sql: "INSERT OR IGNORE INTO principals(id,kind,created_at) VALUES (?,'owner',?)",
+      args: [principal, now],
+    });
+    if (overrides.policy) {
+      await tx.execute({
+        sql: "INSERT OR IGNORE INTO resources(id,kind,visibility,owner_id) VALUES (?,'task-policy','private','owner')",
+        args: [grantResource],
+      });
+    }
+    if (grantId) {
       await tx.execute({
         sql: "INSERT OR IGNORE INTO resources(id,kind,visibility,owner_id) VALUES (?,'task','private','owner')",
-        args: [overrides.resource ?? "task-task-1"],
+        args: [resource],
       });
       await tx.execute({
         sql: "INSERT INTO grants(id,principal_id,resource_id,action,scope_key,effect,created_at) VALUES (?,?,?,?,?,'allow',?)",
-        args: [
-          overrides.grantId,
-          overrides.principal ?? "owner",
-          overrides.resource ?? "task-task-1",
-          overrides.action ?? "task:cancel",
-          overrides.scope ?? "test",
-          now,
-        ],
+        args: [grantId, principal, grantResource, action, scope, now],
       });
     }
     await tx.execute({
       sql: "INSERT INTO authorization_decisions(id,principal_id,resource_id,action,scope_key,decision,reason,grant_id,created_at) VALUES (?,?,?,?,?,'ALLOW','test',?,?)",
-      args: [
-        id,
-        overrides.principal ?? "owner",
-        overrides.resource ?? "task-task-1",
-        overrides.action ?? "task:cancel",
-        overrides.scope ?? "test",
-        overrides.grantId ?? null,
-        now,
-      ],
+      args: [id, principal, resource, action, scope, grantId, now],
     });
   });
   return id;
@@ -3000,6 +3040,17 @@ it("requires an exact, current task cancellation ALLOW decision", async () => {
         actorPrincipalId: "owner",
       }),
     ).rejects.toThrow("Matching Task cancellation ALLOW decision is required");
+    const grantlessDecisionId = await addCancelDecision(db, {
+      id: "cancel-grantless",
+      withoutGrant: true,
+    });
+    await expect(
+      store.requestDurableCancellation("task-1", {
+        kind: "decision",
+        decisionId: grantlessDecisionId,
+        actorPrincipalId: "owner",
+      }),
+    ).rejects.toThrow("Matching Task cancellation ALLOW decision is required");
     expect((await store.listSteps("task-1"))[0]?.status).toBe("pending");
   } finally {
     await db.close();
@@ -3056,7 +3107,21 @@ it("moves a completed durable graph to review and accepts it with matching autho
       id: "accept-wrong-principal",
       principal: "other",
     });
-    for (const decisionId of [actionMismatch, scopeMismatch, principalMismatch]) {
+    const grantless = await addAcceptDecision(db, {
+      id: "accept-grantless",
+      withoutGrant: true,
+    });
+    const mismatchedGrant = await addAcceptDecision(db, {
+      id: "accept-mismatched-grant",
+      grantAction: "task:cancel",
+    });
+    for (const decisionId of [
+      actionMismatch,
+      scopeMismatch,
+      principalMismatch,
+      grantless,
+      mismatchedGrant,
+    ]) {
       await expect(
         store.acceptDurableTask("task-1", {
           kind: "decision",
@@ -3092,7 +3157,7 @@ it("moves a completed durable graph to review and accepts it with matching autho
       }),
     ).rejects.toThrow("Matching Task acceptance ALLOW decision is required");
 
-    const decisionId = await addAcceptDecision(db);
+    const decisionId = await addAcceptDecision(db, { policy: true });
     await store.acceptDurableTask("task-1", {
       kind: "decision",
       decisionId,
@@ -3786,7 +3851,7 @@ it("accepts a reviewed durable Step with a current matching grant and keeps Task
       ).rejects.toThrow("Matching Step acceptance ALLOW decision is required");
     }
 
-    await addStepDecision(db, "task:accept", "accept-step");
+    await addStepDecision(db, "task:accept", "accept-step", { policy: true });
     const step = await store.acceptDurableStep({
       taskId: "task-1",
       stepId: "worker",

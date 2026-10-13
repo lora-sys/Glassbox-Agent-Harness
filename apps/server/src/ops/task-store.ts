@@ -1,5 +1,5 @@
 import { readTaskSourceRows, reauthorizeSourceRows } from "../auth/source-dependencies.js";
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import type { InValue, Row, Transaction } from "@libsql/client";
 import type {
   AgentOpsSnapshot,
@@ -23,6 +23,10 @@ import {
   type CallerContext,
 } from "../identity/scope.js";
 import { taskPolicyResourceId } from "../auth/task-policy.js";
+import {
+  requireCurrentTaskActionAuthorization,
+  type CurrentTaskActionAuthorization,
+} from "./task-action-authorization.js";
 import { recordFilteredDecision } from "../auth/filtered-decision.js";
 import { authorizedValue, evaluate, type AuthorizedResult } from "../auth/service.js";
 
@@ -221,57 +225,7 @@ function parseAttention(row: Row): AttentionItem {
   };
 }
 
-export type TaskActionAuthorization = {
-  decisionId: string;
-  actorPrincipalId: string;
-  scopeKey: string;
-};
-
-async function requireCurrentTaskActionAuthorization(
-  tx: Transaction,
-  taskId: string,
-  action: "task:accept" | "task:rework" | "task:cancel",
-  origin: TaskActionAuthorization,
-): Promise<void> {
-  requireIdentifier(origin.decisionId);
-  requireIdentifier(origin.actorPrincipalId);
-  if (typeof origin.scopeKey !== "string" || !origin.scopeKey)
-    throw new Error("Task action scope is required");
-  const policyResourceId = `task-policy:${createHash("sha256")
-    .update(JSON.stringify([origin.actorPrincipalId, origin.scopeKey]))
-    .digest("hex")}`;
-  const decision = await tx.execute({
-    sql: `SELECT d.id FROM authorization_decisions d JOIN grants g ON g.id = d.grant_id
-      WHERE d.id = ? AND d.principal_id = ? AND d.resource_id = ? AND d.action = ?
-        AND d.scope_key = ? AND d.decision = 'ALLOW' AND g.revoked_at IS NULL
-        AND g.principal_id = d.principal_id
-        AND (g.resource_id = d.resource_id OR (
-          g.resource_id = ? AND EXISTS (
-            SELECT 1 FROM tasks t WHERE t.id = ? AND t.creator_principal_id = d.principal_id
-              AND t.origin_scope_key = d.scope_key
-          )
-        ))
-        AND g.action = d.action AND g.scope_key = d.scope_key
-        AND (g.effect = 'allow' OR (
-          g.effect = 'approval' AND d.reason = 'approved' AND d.approval_id IS NOT NULL
-          AND EXISTS (
-            SELECT 1 FROM approvals a WHERE a.id = d.approval_id AND a.grant_id = g.id
-              AND a.consumed_at IS NOT NULL AND a.expires_at > ?
-          )
-        ))`,
-    args: [
-      origin.decisionId,
-      origin.actorPrincipalId,
-      `task-${taskId}`,
-      action,
-      origin.scopeKey,
-      policyResourceId,
-      taskId,
-      new Date().toISOString(),
-    ],
-  });
-  if (!decision.rows[0]) throw new Error(`Matching ${action} ALLOW decision is required`);
-}
+export type TaskActionAuthorization = CurrentTaskActionAuthorization;
 
 export class TaskStore {
   constructor(private readonly db: DomainDatabase) {}
@@ -1252,7 +1206,12 @@ export class TaskStore {
       const task = parseTask(res.rows[0]);
       if (res.rows[0].orchestration_mode !== "legacy")
         throw new Error("Durable Task requires step-aware acceptance");
-      await requireCurrentTaskActionAuthorization(tx, taskId, "task:accept", origin);
+      await requireCurrentTaskActionAuthorization(tx, {
+        taskId,
+        action: "task:accept",
+        authorization: origin,
+        errorMessage: "Matching task:accept ALLOW decision is required",
+      });
       if (task.status !== "REVIEW") {
         throw new Error(`Cannot accept task in status ${task.status}; must be in REVIEW`);
       }
@@ -1329,7 +1288,12 @@ export class TaskStore {
       const task = parseTask(res.rows[0]);
       if (res.rows[0].orchestration_mode !== "legacy")
         throw new Error("Durable Task requires step-aware rework");
-      await requireCurrentTaskActionAuthorization(tx, taskId, "task:rework", origin);
+      await requireCurrentTaskActionAuthorization(tx, {
+        taskId,
+        action: "task:rework",
+        authorization: origin,
+        errorMessage: "Matching task:rework ALLOW decision is required",
+      });
       if (task.status !== "REVIEW") {
         throw new Error(
           `Cannot request rework for task in status ${task.status}; must be in REVIEW`,
@@ -1425,7 +1389,12 @@ export class TaskStore {
       const task = parseTask(res.rows[0]);
       if (res.rows[0].orchestration_mode !== "legacy")
         throw new Error("Durable Task requires step-aware cancellation");
-      await requireCurrentTaskActionAuthorization(tx, taskId, "task:cancel", origin);
+      await requireCurrentTaskActionAuthorization(tx, {
+        taskId,
+        action: "task:cancel",
+        authorization: origin,
+        errorMessage: "Matching task:cancel ALLOW decision is required",
+      });
       if (task.status === "DONE" || task.status === "CANCELED") {
         throw new Error(`Cannot cancel task in terminal status ${task.status}`);
       }

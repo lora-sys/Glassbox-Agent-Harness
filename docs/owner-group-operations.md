@@ -210,6 +210,14 @@ A profile cannot grant authority that Glassbox policy did not grant.
 
 Most Runs should receive a small direct Tool surface.
 
+The current runtime builds that surface before the Pi model call. When trusted `requiredToolName`
+or `requiredEvidence` selects one or more Tools and no acceptance lease is active, Glassbox keeps
+the full candidate record, marks unrelated entries `not_selected_for_request`, and performs
+per-Tool discovery authorization only for the selected entries. Their schemas are not sent to Pi.
+Ordinary Runs without a required Tool still use the normal scope-based discovery surface. This
+reduces request-specific Tool work, but it is not incremental discovery after the model starts.
+Execution still checks the real Action and Resource again.
+
 When a group has many allowed capabilities, Glassbox may add progressive discovery.
 
 A safe discovery Tool may return only authorized metadata such as:
