@@ -1,4 +1,4 @@
-// test-contract-change: ISSUE-194 add bounded delivery retry and assert local timeouts are never resent.
+// test-contract-change: ISSUE-194 assert delivery retry boundaries and recovery of persisted queued Runs.
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -74,6 +74,46 @@ it("executes the exact approved Run once and still honors revocation", async () 
       })
     ).decision,
   ).toBe("DENY");
+});
+
+it("recovers a persisted ingress Run after its in-memory enqueue wake is lost", async () => {
+  const { store } = await fixture();
+  vi.useFakeTimers();
+  const incoming = input("missed-ingress-wake", "Please answer this message once.");
+  const execute = vi.fn(async () => ({ status: "succeeded" as const, text: "recovered response" }));
+  const send = vi.fn(async (request: Parameters<RunTransport["send"]>[0]) => ({
+    status: "sent" as const,
+    externalId: request.delivery.id,
+  }));
+  const { instance } = service(
+    store,
+    { supportsGroup: true, execute },
+    { send },
+    { queuedPollMs: 500 },
+  );
+
+  await instance.start();
+  const accepted = await store.conversations.acceptIncoming(incoming);
+  await instance.recordMessageReceived(incoming, accepted.run);
+
+  // Simulate the OneBot callback failing after durable acceptance and Trace append,
+  // before enqueueAccepted can kick the in-memory scheduler.
+  await vi.advanceTimersByTimeAsync(500);
+  await instance.drain();
+
+  expect((await instance.getRun(owner(), accepted.run.id)).status).toBe("succeeded");
+  expect(execute).toHaveBeenCalledTimes(1);
+  expect(
+    send.mock.calls.filter(([request]) => request.delivery.payloadKind === "result"),
+  ).toHaveLength(1);
+
+  // Repeated durable queue scans must not replay the completed Run or its delivery.
+  await vi.advanceTimersByTimeAsync(1_000);
+  await instance.drain();
+  expect(execute).toHaveBeenCalledTimes(1);
+  expect(
+    send.mock.calls.filter(([request]) => request.delivery.payloadKind === "result"),
+  ).toHaveLength(1);
 });
 
 function deferred<T>() {

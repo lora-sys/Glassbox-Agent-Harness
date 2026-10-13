@@ -596,7 +596,10 @@ export class ManagementApplication {
     this.evaluator = createRunEvaluator({ store, trace: this.trace });
     this.runs = new RunService({
       store,
-      queuedPollMs: options.temporal ? 2_000 : 0,
+      // Ingress persists a queued Run before it records all evidence and wakes the
+      // scheduler. Poll the durable queue in every mode so a missed in-memory wake
+      // cannot strand an accepted QQ message until the next process restart.
+      queuedPollMs: 2_000,
       resolveExecution: (reference) => this.execution(reference),
       beforeExecution: async (input) => {
         if (!hasQqLiveAcceptanceMarker(input.text)) return undefined;
