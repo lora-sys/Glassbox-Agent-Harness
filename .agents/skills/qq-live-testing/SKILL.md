@@ -45,20 +45,21 @@ trace 把实际输入关联到 Run，展示模型和工具事件、授权结果�
 
 修复后运行相关隔离测试，切到正确业务版本，再用相同自然语言回归。按仓库流程处理 Issue、PR 和 CI；聊天入口不自动给 PASS，也不自动合并。
 
-账号确认应先核对 NapCat 保存的快速登录账号、容器启动账号和实例页面地址。开始扫码前，把目标 QQ 号和对应页面地址一并告知用户；只有页面当前选择的 QQ 号与目标号码一致时才扫码，不能只看昵称或页面是否能打开。用户确认扫码后，通过同一实例重新查询 get_login_info 和 get_status。只有账号号匹配且 online=true，才算登录完成。若页面提示 QQ Is Logined、选中账号不一致或 OneBot 未连接，停止扫码和重启操作，先核对实例映射、登录选择器和 NapCat 持久配置，不要删除或重建账号目录。 本机启动脚本会读取持久化的 glassbox-account 账号标记，覆盖容器环境变量 ACCOUNT，再用 -q 启动 QQ。核对实际启动账号时，以账号标记、QQ 进程的 -q 参数和 OneBot user_id 为准，不能只看 docker inspect 显示的 ACCOUNT 环境变量。
+账号确认应先核对 NapCat 保存的快速登录账号、容器启动账号和实例页面地址。开始扫码前，把目标 QQ 号和对应页面地址一并告知用户；只有页面当前选择的 QQ 号与目标号码一致时才扫码，不能只看昵称或页面是否能打开。用户确认扫码后，通过同一实例重新查询 get_login_info 和 get_status。只有账号号匹配且 online=true，才算登录完成。若页面提示 QQ Is Logined、选中账号不一致或 OneBot 未连接，停止扫码和重启操作，先核对实例映射、登录选择器和 NapCat 持久配置，不要删除或重建账号目录。
 
-若两套曾扫反，按当前明确分工修正持久启动配置，再分别查询 get_login_info；不要重建账号目录或改设备信息。当前 WSL 验收实例的常见映射是 Owner WebUI 6098 对应 OneBot 6700，Bot WebUI 6100 对应 OneBot 6701。此映射只是提示，每次扫码前仍要核对实际配置和目标账号。
+WebUI 的 /web_login 只表示 WebUI Token 会话需要登录，不证明 QQ 账号在线或离线；/qq_login 才显示 QQ 登录流程。两者都不能替代 OneBot 身份与在线状态核验。本机启动脚本会读取持久化的 glassbox-account 账号标记，覆盖容器环境变量 ACCOUNT，再用 -q 启动 QQ。核对实际启动账号时，以账号标记、QQ 进程的 -q 参数和 OneBot user_id 为准，不能只看 docker inspect 显示的 ACCOUNT 环境变量。
 
-Linux Docker NapCat 的登录状态排查还要核对 QQ 数据根目录。NapCat 上游 PR #2099 于 2026-10-11 合并，修正 Linux global 路径，并在新目录不存在时迁移旧的 nt_qq/global。当前可用的是提交 c358c86 的临时 PR 测试镜像，镜像说明保留 120 小时；它只用于本机开发验收，不是稳定版或部署镜像。使用时固定摘要并保留原账号卷，不要手工移动、删除或合并目录。等待正式稳定镜像包含此修复后再用于部署。若登录库只存在于旧路径，不要手工移动、删除或合并目录；先确认实际镜像包含该迁移，且新目录不存在，再通过支持的启动迁移处理。官方发布说明和迁移实现见 https://github.com/NapNeko/NapCatQQ/pull/2099 。
+若两套曾扫反，按当前明确分工修正持久启动配置，再分别查询 get_login_info；不要重建账号目录或改设备信息。当前 WSL 验收实例常见映射是 Owner WebUI 6098 对应 OneBot 6700，Bot WebUI 6100 对应 OneBot 6701。此映射只是提示，每次扫码前仍要核对实际配置和目标账号。
 
-同机双账号几乎同时要求重新扫码也有上游相似报告，维护者将其归为 QQ 风控，分开的持久卷不能保证平台不撤销会话。保留时间线、容器和账号目录，避免无必要地重复重启或扫码；不能承诺本地代码能阻止 QQ 服务端撤销授权。参考 https://github.com/NapNeko/NapCatQQ/issues/2079 。
+Linux Docker NapCat 的状态排查要记录实际镜像摘要、容器启动时间、账号参数、配置挂载和 QQ 数据根目录。仓库 Compose 文件只描述单账号默认部署，不能据此推断本机双账号运行时。Linux global 路径曾由 NapCat PR #2099 调整；镜像升级时先确认该镜像是否包含路径迁移，再保留现有卷并通过上游支持的迁移处理旧数据。不要手工移动、删除或合并账号目录。PR 测试镜像不是稳定部署版本，不能只凭标签判断运行代码；以实际镜像摘要和构建来源为准。参考 [NapCat PR #2099](https://github.com/NapNeko/NapCatQQ/pull/2099)。
 
-NapCat 明确拒绝快速登录并切换到二维码时，保留同一个容器、配置和账号卷，只请账号持有人在对应页面确认当前账号。完成后重新查询 get_login_info 和 get_status；账号身份匹配且 online=true 之前，不发送测试消息。不要读取或转发原始二维码 URL、令牌或未经筛选的登录日志。
+NapCat Framework 将二维码会话失败 ErrType 1, ErrCode 3 映射为二维码过期提示。若日志持续生成新二维码，先确认是否出现扫码成功记录，再核对 OneBot get_login_info 与 get_status。不要把 WebUI 状态、二维码刷新或社区对风控的推测当成 QQ 登录成功或已知根因。保留时间线、容器和账号目录；QQ 服务端可以撤销会话，本地代码不能保证免扫码恢复。不要读取或转发原始二维码 URL、令牌或未经筛选的登录日志。
+
+NapCat 明确拒绝快速登录并切换到二维码时，保留同一个容器、配置和账号卷，只请账号持有人在对应页面确认当前账号。完成后重新查询 get_login_info 和 get_status；账号身份匹配且 online=true 之前，不发送测试消息。
 
 QQ 离线时继续使用 read 和 trace 调查，观察器会重新连接 WebSocket。不要把登录授权失效当成业务测试失败，不要循环重启 QQ。确认需要手机授权时再请账号持有人登录。
 
 若两套 QQ 同时掉线，先保留容器和账号目录，记录各自的 `KickedOffLine` 时间、容器启动时间、代理进程状态和 Glassbox checkout。区分 QQ 发来的登录失效通知、NapCat 内部 Worker 重启、Docker 容器重启和 Glassbox 服务切换。WebUI 显示在线后还要用新消息核对实际收发。QQ 服务端撤销授权时，持久目录只能保留设备和会话资料，不能保证免扫码恢复；未找到具体触发因素时不要声称已经解决。
-
 
 ## Tool schema and latency checks
 
