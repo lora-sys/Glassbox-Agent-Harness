@@ -103,6 +103,6 @@ it("explains an ungranted configured Worker workspace without leaking paths or i
       ).rejects.toThrow("worker_not_started");
   } finally {
     await store.close();
-    await rm(directory, { recursive: true, force: true });
+    await rm(directory, { recursive: true, force: true, maxRetries: 30, retryDelay: 100 });
   }
 });

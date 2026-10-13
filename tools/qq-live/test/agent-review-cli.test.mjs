@@ -5,6 +5,7 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { deriveAgentReviewBinding } from "../lib/agent-review-cli.mjs";
+import { sanitizedGitEnvironment } from "../../../scripts/git-environment.mjs";
 
 async function repositoryFixture(t) {
   const root = await mkdtemp(join(tmpdir(), "agent-review-cli-"));
@@ -13,15 +14,11 @@ async function repositoryFixture(t) {
     execFileSync("git", args, {
       cwd: root,
       encoding: "utf8",
-      env: {
-        ...process.env,
-        GIT_AUTHOR_NAME: "fixture author",
-        GIT_AUTHOR_EMAIL: "fixture@example.test",
-        GIT_COMMITTER_NAME: "fixture author",
-        GIT_COMMITTER_EMAIL: "fixture@example.test",
-      },
+      env: sanitizedGitEnvironment(),
     }).trim();
   git("init", "-b", "main");
+  git("config", "user.name", "fixture author");
+  git("config", "user.email", "fixture@example.test");
   git("remote", "add", "origin", "https://github.com/example/project.git");
   await writeFile(join(root, "README.md"), "base\n");
   git("add", "README.md");

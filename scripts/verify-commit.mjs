@@ -2,6 +2,8 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
+import { sanitizedGitEnvironment } from "./git-environment.mjs";
+import { inspectTestSources } from "./test-integrity.mjs";
 import {
   lookupTestCache,
   prepareTestCache,
@@ -37,13 +39,8 @@ const FULL_TEST_FALLBACK = [
   ],
 ];
 
-/** Git hooks export repository selectors which must not escape into disposable test repos. */
 function verificationChildEnvironment(environment = process.env) {
-  const child = { ...environment };
-  for (const key of Object.keys(child)) {
-    if (key.startsWith("GIT_")) delete child[key];
-  }
-  return child;
+  return sanitizedGitEnvironment(environment);
 }
 
 function run(command, args) {
@@ -69,6 +66,7 @@ function capture(command, args) {
     cwd: process.cwd(),
     encoding: "utf8",
     maxBuffer: 64 * 1024 * 1024,
+    env: sanitizedGitEnvironment(),
     shell: false,
   });
 
@@ -113,7 +111,7 @@ function isTestFilePath(path) {
   return TEST_FILE.test(path);
 }
 
-function getTestIntegrityIssues(entries, diff) {
+function getTestIntegrityIssues(entries, sourcePairs = []) {
   const issues = [];
   const deletedTests = entries.filter(
     ({ status, path }) => status.startsWith("D") && isTestFilePath(path),
@@ -121,47 +119,85 @@ function getTestIntegrityIssues(entries, diff) {
   if (deletedTests.length > 0) {
     issues.push({
       message: "Commit blocked: existing test files cannot be deleted.",
-      details: deletedTests.map((entry) => `  ${entry.status} ${entry.path}`),
+      details: deletedTests.map((entry) => "  " + entry.status + " " + entry.path),
     });
   }
 
-  const addedLines = diff
-    .split(/\r?\n/)
-    .filter((line) => line.startsWith("+") && !line.startsWith("+++"))
-    .map((line) => line.slice(1));
-  const removedLines = diff
-    .split(/\r?\n/)
-    .filter((line) => line.startsWith("-") && !line.startsWith("---"))
-    .map((line) => line.slice(1));
-
-  const disabledTest = addedLines.find((line) =>
-    /(?:describe|it|test)\.(?:skip|only)|\.skipIf\(|\.todo\(/.test(line),
-  );
-  if (disabledTest) {
+  const integrity = inspectTestSources(sourcePairs);
+  if (integrity.disabled.length > 0) {
     issues.push({
       message: "Commit blocked: staged changes disable or isolate a test.",
-      details: [`  ${disabledTest.trim()}`],
+      details: integrity.disabled.map((item) => "  " + item),
     });
   }
-
-  const declaration = /^\s*(?:describe|it|test)(?:\.\w+)?\s*\(/;
-  const removedDeclarations = removedLines.filter((line) => declaration.test(line)).length;
-  const addedDeclarations = addedLines.filter((line) => declaration.test(line)).length;
-  if (removedDeclarations > addedDeclarations) {
+  if (integrity.alwaysPassing.length > 0) {
     issues.push({
-      message: "Commit blocked: staged changes reduce the number of test declarations.",
-      details: ["Update the implementation instead of weakening existing coverage."],
+      message: "Commit blocked: staged changes add an always-passing assertion.",
+      details: integrity.alwaysPassing.map((item) => "  " + item),
     });
   }
+  if (integrity.parseErrors.length > 0) {
+    issues.push({
+      message: "Commit blocked: changed test source could not be parsed.",
+      details: integrity.parseErrors.map((item) => "  " + item),
+    });
+  }
+  if (integrity.errors.includes("reduced-test-coverage")) {
+    issues.push({
+      message: "Commit blocked: staged changes remove an existing test case.",
+      details: [
+        ...integrity.deletedTests.map((title) => "  " + title),
+        "Update the implementation or move the existing test with its original title.",
+      ],
+    });
+  }
+  const assertionChanges = integrity.errors.filter((error) => error.startsWith('Test "'));
+  if (assertionChanges.length > 0) {
+    issues.push({
+      message:
+        "Commit blocked: staged changes alter an existing test's assertion structure without a review marker.",
+      details: assertionChanges.map((item) => "  " + item),
+    });
+  }
+  for (const warning of integrity.warnings) console.warn("Test integrity review: " + warning);
   return issues;
 }
 
+function readGitContent(args) {
+  const result = spawnSync("git", args, {
+    cwd: process.cwd(),
+    encoding: "utf8",
+    maxBuffer: 64 * 1024 * 1024,
+    env: sanitizedGitEnvironment(),
+    shell: false,
+  });
+  if (result.error) throw result.error;
+  return result.status === 0 ? result.stdout : undefined;
+}
+
+function testSourcePairs(entries, revision = "HEAD") {
+  const sources = [];
+  for (const entry of entries) {
+    const oldPath = entry.status.startsWith("A") ? undefined : entry.path;
+    const newPath = entry.status.startsWith("D") ? undefined : (entry.target ?? entry.path);
+    const oldIsTest = oldPath && isTestFilePath(oldPath);
+    const newIsTest = newPath && isTestFilePath(newPath);
+    if (!oldIsTest && !newIsTest) continue;
+    sources.push({
+      oldPath,
+      newPath,
+      oldSource: oldIsTest ? readGitContent(["show", revision + ":" + oldPath]) : undefined,
+      newSource: newIsTest ? readGitContent(["show", ":" + newPath]) : undefined,
+    });
+  }
+  return sources;
+}
+
 function verifyTestIntegrity(entries) {
-  const diff = capture("git", ["diff", "--cached", "--unified=0", "--", ...TEST_DIFF_PATHS]);
-  const issues = getTestIntegrityIssues(entries, diff);
+  const issues = getTestIntegrityIssues(entries, testSourcePairs(entries));
   if (issues.length > 0) {
     for (const issue of issues) {
-      console.error(`\n${issue.message}`);
+      console.error("\n" + issue.message);
       for (const detail of issue.details) console.error(detail);
     }
     process.exit(1);
@@ -288,15 +324,38 @@ const SCRIPT_TESTS = [
   "scripts/test/dependency-snapshot.test.mjs",
   "scripts/test/vite-plus-alias.test.mjs",
   "scripts/service-source-identity.test.mjs",
-  "scripts/test/agent-service-source-identity.test.mjs",
   "scripts/test/service-shutdown.test.mjs",
-  "scripts/test/agent-service-shutdown.integration.test.mjs",
-  ...discoverQqLiveTests(),
   ".agents/skills/qq-live-testing/scripts/helpers.test.mjs",
   ".claude/skills/qq-live-testing/scripts/helpers.test.mjs",
   "scripts/verify-commit.test.mjs",
   "scripts/migrate-windows-workspaces.test.mjs",
 ];
+
+const LINUX_SCRIPT_TESTS = [
+  "scripts/test/agent-service-shutdown.integration.test.mjs",
+  "scripts/test/agent-service-source-identity.test.mjs",
+];
+
+function selectQqLiveTests(entries, platform = process.platform, full = false) {
+  if (platform !== "linux") return [];
+  const paths = entries.flatMap(({ path, target }) => (target ? [path, target] : [path]));
+  const affectsQqLive = paths.some(
+    (path) =>
+      path.startsWith("tools/qq-live/") ||
+      path.startsWith("apps/server/src/channels/onebot/") ||
+      path.startsWith("apps/server/src/runtime/pi/"),
+  );
+  if (!full && !affectsQqLive) return [];
+  return discoverQqLiveTests();
+}
+
+function scriptTestsFor(entries, platform = process.platform, full = false) {
+  return [
+    ...SCRIPT_TESTS,
+    ...(platform === "linux" ? LINUX_SCRIPT_TESTS : []),
+    ...selectQqLiveTests(entries, platform, full),
+  ];
+}
 
 function runFullVerification() {
   const entries = stagedEntries();
@@ -304,7 +363,10 @@ function runFullVerification() {
   runStagedChecks(entries);
   console.log("Full verification: core checks, selector checks, unit suite once, and web build.");
   run("vp", ["run", "check:core"]);
-  run(process.execPath, ["--test", ...SCRIPT_TESTS]);
+  const scriptTests = scriptTestsFor(entries, process.platform, true);
+  if (process.platform !== "linux")
+    console.log("Linux-only integration tests are deferred to Linux validation.");
+  run(process.execPath, ["--test", ...scriptTests]);
   runTestCommandWithCache(["run", "test:unit"], "full unit suite");
   run("vp", ["run", "build:web"]);
   console.log("\nFull verification passed.");
@@ -325,6 +387,8 @@ export {
   verificationChildEnvironment,
   capture,
   discoverQqLiveTests,
+  selectQqLiveTests,
+  scriptTestsFor,
   canReuseTestCache,
   getTestIntegrityIssues,
   isTestFilePath,
@@ -341,7 +405,12 @@ if (isMain) {
     const entries = stagedEntries();
     verifyTestIntegrity(entries);
     runStagedChecks(entries);
-    run(process.execPath, ["--test", ...SCRIPT_TESTS]);
+    const changedEntries = workingTreeEntries();
+    const plan = selectTestPlan(changedEntries);
+    const scriptTests = scriptTestsFor(changedEntries, process.platform, plan.mode === "full");
+    if (process.platform !== "linux" && changedEntries.length > 0)
+      console.log("Linux-only integration tests are deferred to Linux validation.");
+    run(process.execPath, ["--test", ...scriptTests]);
     runChangedTests();
     console.log("\nCommit verification passed.");
   }

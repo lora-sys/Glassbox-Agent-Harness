@@ -499,13 +499,22 @@ vp run test:regression
 ```
 
 `vp run verify:commit` is the required pre-commit gate. Vite+ installs the repository-owned
-`.vite-hooks/pre-commit` dispatcher during `vp install`. The gate checks staged files and test
-integrity, then uses Vitest's changed dependency graph for ordinary changes. Shared contracts,
-authorization, persistence, runtime setup, test/build configuration, validation scripts,
-deletions, renames, and unknown areas run the full unit suite. Test deletion, disabled tests,
-and reduced test declaration counts are rejected.
+`.vite-hooks/pre-commit` dispatcher during `vp install`. The gate compares test ASTs from HEAD with the Git index before using Vitest's changed dependency
+graph for ordinary changes. Shared contracts, authorization, persistence, runtime setup,
+test/build configuration, validation scripts, deletions, renames, and unknown areas run the full
+unit suite. It rejects deleted test files or cases, disabled tests, always-passing assertions,
+and changed assertion structures. An intentional test-contract change uses a file-level
+// test-contract-change: <issue-or-PR> <reason> marker. The gate reports the marker as a manual
+review requirement. Reviewers must verify the reason against the changed behavior.
 
-`vp run verify:full` is the full acceptance gate. It runs core lint and types, validation-selector
+QQ live Node regressions run on Linux when tools/qq-live, OneBot channel, or Pi runtime code
+changes. The Linux full gate always runs the complete QQ live suite, including Linux-specific
+checkpoint tests. Windows commit verification defers this QQ live acceptance suite and Linux process-identity integration tests.
+It still runs platform-independent verification tests. Git child processes remove inherited
+GIT_* selectors, and disposable Git fixtures verify their repository directories remain inside
+their temporary roots.
+
+vp run verify:full is the full acceptance gate. It runs core lint and types, validation-selector
 tests, the deterministic unit suite once, and the web build. `test:e2e` and `test:regression`
 remain targeted commands for their listed cases. Their test files are included in `test:unit`,
 so the full gate does not run those suites a second time. The commit gate reports changed paths,

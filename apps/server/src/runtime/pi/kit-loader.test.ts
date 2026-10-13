@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, expect, it } from "vite-plus/test";
 import { KitLoader } from "./kit-loader.js";
+import { sanitizedGitEnvironment } from "../../../../../scripts/git-environment.mjs";
 
 const directories: string[] = [];
 afterEach(async () => {
@@ -28,6 +29,7 @@ function git(directory: string, ...args: string[]): string {
     timeout: 5_000,
     maxBuffer: 64 * 1024,
     stdio: ["ignore", "pipe", "ignore"],
+    env: sanitizedGitEnvironment(),
   }).trim();
 }
 

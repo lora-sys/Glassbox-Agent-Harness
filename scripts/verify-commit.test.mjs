@@ -1,12 +1,15 @@
+// test-contract-change: ISSUE-194 selector, AST integrity, and Git isolation checks update gate assertions
 import test from "node:test";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   verificationChildEnvironment,
   discoverQqLiveTests,
+  selectQqLiveTests,
+  scriptTestsFor,
   canReuseTestCache,
   getTestIntegrityIssues,
   isTestFilePath,
@@ -83,12 +86,18 @@ test("parses rename entries without losing either path", () => {
 });
 
 test("allows test-file renames while preserving declaration-count checks", () => {
-  const callStart = ["it", "("].join("");
-  const diff = `-${callStart}"before"()\n+${callStart}"after"()`;
+  const source = 'it("before", () => assert.equal(actual, expected));';
   assert.deepEqual(
     getTestIntegrityIssues(
       [{ status: "R100", path: "before.test.ts", target: "after.test.ts" }],
-      diff,
+      [
+        {
+          oldPath: "before.test.ts",
+          newPath: "after.test.ts",
+          oldSource: source,
+          newSource: source,
+        },
+      ],
     ),
     [],
   );
@@ -98,23 +107,25 @@ test("case modules balance moved declarations and remain protected against delet
   const casePath = "apps/server/src/management/application-channel-cases.ts";
   assert.equal(isTestFilePath(casePath), true);
   assert.ok(testDiffPaths.includes("apps/server/src/management/application-*-cases.ts"));
-
-  const callStart = ["it", "("].join("");
-  const movedDeclaration = `-${callStart}"existing case"()\n+${callStart}"existing case"()`;
+  const oldSource = 'it("existing case", () => assert.equal(actual, expected));';
+  const movedSources = [
+    { path: "apps/server/src/management/application.test.ts", oldSource, newSource: "" },
+    { path: casePath, oldSource: undefined, newSource: oldSource },
+  ];
   assert.deepEqual(
     getTestIntegrityIssues(
       [
         { status: "M", path: "apps/server/src/management/application.test.ts" },
         { status: "A", path: casePath },
       ],
-      movedDeclaration,
+      movedSources,
     ),
     [],
   );
 
   const deletionIssues = getTestIntegrityIssues(
     [{ status: "D", path: casePath }],
-    `-${callStart}"existing case"()`,
+    [{ oldPath: casePath, oldSource, newSource: undefined }],
   );
   assert.ok(deletionIssues.some((issue) => issue.message.includes("test files cannot be deleted")));
 });
@@ -128,17 +139,56 @@ test("blocks deletion of existing test files", () => {
 });
 
 test("blocks reducing test declarations and disabling a test", () => {
-  const callStart = ["test", "("].join("");
-  const reduced = getTestIntegrityIssues([], `-${callStart}"case")`);
-  assert.match(reduced[0].message, /reduce the number/);
+  const source = 'test("case", () => assert.equal(actual, expected));';
+  const reduced = getTestIntegrityIssues(
+    [],
+    [{ path: "fixture.test.mjs", oldSource: source, newSource: "" }],
+  );
+  assert.match(reduced[0].message, /remove an existing test case/);
 
-  const disabled = ["test", ".", "skip("].join("");
-  const disabledIssues = getTestIntegrityIssues([], `+${disabled}"case")`);
-  assert.match(disabledIssues[0].message, /disable or isolate/);
+  const disabled = getTestIntegrityIssues(
+    [],
+    [{ path: "fixture.test.mjs", oldSource: undefined, newSource: 'test.skip("case", () => {});' }],
+  );
+  assert.match(disabled[0].message, /disable or isolate/);
 
-  const conditionalSkip = ["it", ".skipIf", "(", "environment", ")"].join("");
-  const conditionalSkipIssues = getTestIntegrityIssues([], `+${conditionalSkip}("case")`);
-  assert.match(conditionalSkipIssues[0].message, /disable or isolate/);
+  const conditionalSkip = getTestIntegrityIssues(
+    [],
+    [
+      {
+        path: "fixture.test.mjs",
+        oldSource: undefined,
+        newSource: 'it.skipIf(environment)("case", () => {});',
+      },
+    ],
+  );
+  assert.match(conditionalSkip[0].message, /disable or isolate/);
+});
+
+test("QQ live scripts are selected by scope and remain mandatory in the Linux full gate", () => {
+  const docs = [{ status: "M", path: "docs/tech-stack.md" }];
+  assert.deepEqual(selectQqLiveTests(docs, "linux"), []);
+  assert.deepEqual(selectQqLiveTests(docs, "win32"), []);
+  const qq = [{ status: "M", path: "tools/qq-live/lib/chat-session.mjs" }];
+  assert.ok(selectQqLiveTests(qq, "linux").length > 0);
+  assert.deepEqual(selectQqLiveTests(qq, "win32"), []);
+  assert.ok(
+    scriptTestsFor([], "linux", true).includes(
+      "tools/qq-live/test/task-worker-checkpoint.test.mjs",
+    ),
+  );
+  const linuxOnly = [
+    "scripts/test/agent-service-shutdown.integration.test.mjs",
+    "scripts/test/agent-service-source-identity.test.mjs",
+  ];
+  for (const path of linuxOnly) {
+    assert.ok(scriptTestsFor([], "linux").includes(path));
+    assert.ok(!scriptTestsFor([], "win32").includes(path));
+  }
+  assert.deepEqual(
+    scriptTestsFor([], "win32", true).filter((path) => path.startsWith("tools/qq-live/")),
+    [],
+  );
 });
 
 test("test cache key changes with repository files, HEAD, toolchain, platform, and environment", () => {
@@ -267,12 +317,72 @@ test("empty QQ regression directory blocks gate discovery", () => {
 
 test("captures large test diffs without dropping integrity evidence at the tail", async () => {
   const { capture } = await import("./verify-commit.mjs");
-  const disabled = ["it", ".", "skip("].join("") + "'disabled', () => {});";
-  const tail = JSON.stringify(`+${disabled}\n`);
-  const program = String.raw`process.stdout.write("+// fixture\n".repeat(120000) + ${tail})`;
+  const disabled = ["test", ".", "skip("].join("") + "'disabled', () => {});";
+  const tail = JSON.stringify("+" + disabled + "\\n");
+  const program = 'process.stdout.write("+// fixture\\n".repeat(120000) + ' + tail + ")";
   const diff = capture(process.execPath, ["-e", program]);
   assert.ok(Buffer.byteLength(diff) > 1024 * 1024);
-  assert.ok(getTestIntegrityIssues([], diff).some((issue) => issue.message.includes("disable")));
+  assert.match(diff, /disabled/u);
+});
+
+test("QQ test Git fixtures cannot mutate an outer repository through inherited selectors", () => {
+  const root = mkdtempSync(join(tmpdir(), "qq-fixture-git-isolation-"));
+  try {
+    const outer = join(root, "outer");
+    mkdirSync(outer);
+    const clean = verificationChildEnvironment(process.env);
+    const git = (args, env = clean) =>
+      execFileSync("git", args, { cwd: outer, env, encoding: "utf8" }).trim();
+
+    git(["init", "--quiet", "-b", "main"]);
+    writeFileSync(join(outer, "tracked.txt"), "outer repository data");
+    git(["add", "tracked.txt"]);
+    git([
+      "-c",
+      "user.name=outer",
+      "-c",
+      "user.email=outer@example.test",
+      "commit",
+      "-m",
+      "outer fixture",
+    ]);
+    const headBefore = git(["rev-parse", "HEAD"]);
+    const indexPath = join(outer, ".git", "index");
+    const configPath = join(outer, ".git", "config");
+    const indexBefore = readFileSync(indexPath);
+    const configBefore = readFileSync(configPath);
+    const statusBefore = git(["status", "--porcelain"]);
+
+    const hostileEnvironment = {
+      ...clean,
+      GIT_DIR: join(outer, ".git"),
+      GIT_WORK_TREE: outer,
+      GIT_INDEX_FILE: indexPath,
+      GIT_COMMON_DIR: join(outer, ".git"),
+      GIT_PREFIX: "",
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "user.name",
+      GIT_CONFIG_VALUE_0: "injected fixture",
+    };
+    const run = spawnSync(
+      process.execPath,
+      ["--test", join(process.cwd(), "tools/qq-live/test/product-evidence.test.mjs")],
+      {
+        cwd: process.cwd(),
+        env: hostileEnvironment,
+        encoding: "utf8",
+        maxBuffer: 16 * 1024 * 1024,
+        timeout: 120000,
+      },
+    );
+    assert.equal(run.status, 0, run.stderr + run.stdout);
+    assert.equal(git(["rev-parse", "HEAD"]), headBefore);
+    assert.deepEqual(readFileSync(indexPath), indexBefore);
+    assert.deepEqual(readFileSync(configPath), configBefore);
+    assert.equal(git(["status", "--porcelain"]), statusBefore);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("validation children cannot inherit hook repository selectors into fixture Git operations", () => {

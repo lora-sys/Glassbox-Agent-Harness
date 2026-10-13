@@ -22,6 +22,7 @@ async function runFixture() {
   let executions = 0;
   const service = new RunService({
     store,
+    deliveryRetryDelaysMs: [],
     resolveExecution: () => ({
       supportsGroup: true,
       execute: async () => {

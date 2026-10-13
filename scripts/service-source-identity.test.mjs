@@ -1,16 +1,26 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdtempSync,
+  mkdirSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { serviceSourceIdentity, serviceSourceTreeSha256 } from "./service-source-identity.mjs";
+import { sanitizedGitEnvironment } from "./git-environment.mjs";
 
 function git(cwd, ...args) {
   return execFileSync("git", args, {
     cwd,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
+    env: sanitizedGitEnvironment(),
   }).trim();
 }
 
@@ -27,6 +37,7 @@ function fixture(t) {
   return checkout;
 }
 
+// test-contract-change: ISSUE-194 verify symlink and executable-bit hashing when the host supports those filesystem features.
 test("source tree digest includes tracked and unignored untracked sources, modes and symlink targets", (t) => {
   const checkout = fixture(t);
   writeFileSync(join(checkout, "ignored-secret.txt"), "excluded");
@@ -40,13 +51,28 @@ test("source tree digest includes tracked and unignored untracked sources, modes
 
   mkdirSync(join(checkout, "assets"));
   writeFileSync(join(checkout, "assets", "payload"), "same");
-  symlinkSync("payload", join(checkout, "assets", "link"));
+  const withPayload = serviceSourceTreeSha256(checkout);
+  let symlinkCreated = false;
+  try {
+    symlinkSync("payload", join(checkout, "assets", "link"));
+    symlinkCreated = true;
+  } catch (error) {
+    assert.ok(["EACCES", "EPERM", "ENOTSUP", "UNKNOWN"].includes(error?.code));
+  }
   const withLink = serviceSourceTreeSha256(checkout);
-  symlinkSync("missing", join(checkout, "assets", "other-link"));
-  assert.notEqual(serviceSourceTreeSha256(checkout), withLink);
+  assert.equal(withLink !== withPayload, symlinkCreated);
+  if (symlinkCreated) {
+    symlinkSync("missing", join(checkout, "assets", "other-link"));
+    assert.notEqual(serviceSourceTreeSha256(checkout), withLink);
+  }
 
-  chmodSync(join(checkout, "tracked.mjs"), 0o755);
-  assert.notEqual(serviceSourceTreeSha256(checkout), withLink);
+  const modePath = join(checkout, "tracked.mjs");
+  const beforeMode = statSync(modePath).mode & 0o111;
+  const beforeModeHash = serviceSourceTreeSha256(checkout);
+  chmodSync(modePath, 0o755);
+  const afterMode = statSync(modePath).mode & 0o111;
+  const afterModeHash = serviceSourceTreeSha256(checkout);
+  assert.equal(afterModeHash !== beforeModeHash, afterMode !== beforeMode);
 });
 
 test("launch identity keeps clean commit evidence compatible and hashes dirty snapshots", (t) => {

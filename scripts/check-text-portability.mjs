@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { sanitizedGitEnvironment } from "./git-environment.mjs";
 import { readFileSync } from "node:fs";
 
 // Windows-authored text usually reaches Linux intact, but a handful of artifacts
@@ -39,7 +40,10 @@ function fail(message) {
 }
 
 function git(args, options = {}) {
-  const result = spawnSync("git", args, options);
+  const result = spawnSync("git", args, {
+    ...options,
+    env: sanitizedGitEnvironment(options?.env ?? process.env),
+  });
   if (result.error) throw result.error;
   if (result.status !== 0) {
     throw new Error(`git ${args.join(" ")} failed: ${result.stderr ?? ""}`);

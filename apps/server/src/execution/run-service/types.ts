@@ -191,6 +191,9 @@ export type RunServiceEvent =
       deliveryId: string;
       status: DeliveryRecord["status"];
       reason?: DeliveryReason;
+      /** Present only after a retry; counts every transport attempt. */
+      attempts?: number;
+      retryStoppedReason?: "authorization_changed" | "service_stopped";
       /** Channel-native id of the sent message, when the transport confirmed one. */
       externalId?: string;
     }
@@ -256,6 +259,8 @@ export interface RunServiceOptions {
   /** Polls the shared durable queue when an external coordinator inserts internal Runs. */
   queuedPollMs?: number;
   deliveryTimeoutMs?: number;
+  /** Backoff before each re-send of an unconfirmed delivery; at most five retries. */
+  deliveryRetryDelaysMs?: readonly number[];
   /**
    * How long after a Run finishes a restart may still publish it. Defaults to two hours; a Run
    * holding a delivery that never reached a final state is restored regardless of age.

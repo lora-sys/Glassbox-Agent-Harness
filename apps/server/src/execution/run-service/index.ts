@@ -86,6 +86,13 @@ const DEFAULT_RESTORE_WINDOW_MS = 2 * 60 * 60 * 1000;
 const MAX_RESTORE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 const DISPATCH_RETRY_DELAYS_MS = [500, 1_000, 2_000] as const;
 const DISPATCH_SETTLEMENT_RETRY_MS = 1_000;
+/** Backoff before each re-send of an unconfirmed delivery. */
+const DEFAULT_DELIVERY_RETRY_DELAYS_MS = [1_000, 3_000] as const;
+const RETRYABLE_UNKNOWN_REASONS: ReadonlySet<string> = new Set([
+  "timeout",
+  "disconnected",
+  "send_error",
+]);
 
 /** Session task ownership adapts OpenHarness's gateway bridge. Durable queue
  * order, current authorization and immutable deliveries belong to DomainStore. */
@@ -94,6 +101,7 @@ export class RunService {
   private readonly concurrency: number;
   private readonly queuedPollMs: number;
   private readonly deliveryTimeoutMs: number;
+  private readonly deliveryRetryDelaysMs: readonly number[];
   private readonly restoreWindowMs: number;
   private readonly active = new Map<string, ActiveRun>();
   private readonly blocked = new Set<string>();
@@ -110,6 +118,14 @@ export class RunService {
     this.concurrency = options.concurrency ?? 2;
     this.queuedPollMs = options.queuedPollMs ?? 0;
     this.deliveryTimeoutMs = options.deliveryTimeoutMs ?? 15_000;
+    const retryDelays = options.deliveryRetryDelaysMs ?? DEFAULT_DELIVERY_RETRY_DELAYS_MS;
+    if (
+      !Array.isArray(retryDelays) ||
+      retryDelays.length > 5 ||
+      retryDelays.some((delay) => !Number.isInteger(delay) || delay < 0 || delay > 60_000)
+    )
+      throw new Error("Invalid delivery retry delays");
+    this.deliveryRetryDelaysMs = [...retryDelays];
     this.restoreWindowMs = options.restoreWindowMs ?? DEFAULT_RESTORE_WINDOW_MS;
     if (!Number.isInteger(this.concurrency) || this.concurrency < 1 || this.concurrency > 32)
       throw new Error("Invalid Run concurrency");
@@ -1139,6 +1155,72 @@ export class RunService {
     }
     if (!lease) return;
     await this.emit({ type: "delivery_changed", runId, deliveryId, status: "sending" });
+
+    let outcome: SendOutcome;
+    let attempts = 0;
+    let retryStoppedReason: "authorization_changed" | "service_stopped" | undefined;
+    let sendLease = lease;
+    for (;;) {
+      attempts += 1;
+      outcome = await this.sendOnce(caller.scope, sendLease.delivery);
+      const retryDelay = this.deliveryRetryDelaysMs[attempts - 1];
+      if (
+        outcome.status !== "unknown" ||
+        retryDelay === undefined ||
+        !RETRYABLE_UNKNOWN_REASONS.has(outcome.reason ?? "unclassified")
+      )
+        break;
+
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, retryDelay));
+      if (!this.started) {
+        retryStoppedReason = "service_stopped";
+        break;
+      }
+      try {
+        const retryLease = await this.options.store.lifecycle.claimDelivery(
+          caller,
+          runId,
+          deliveryId,
+        );
+        // A null result means the current lease still owns the sending row. claimDelivery
+        // rechecks the caller, Run and delivery sources before it returns that null.
+        if (retryLease) sendLease = retryLease;
+      } catch (error) {
+        if (!(error instanceof AccessDeniedError)) throw error;
+        retryStoppedReason = "authorization_changed";
+        break;
+      }
+    }
+
+    const reason =
+      outcome.status === "sent" ? undefined : deliveryReason(outcome.status, outcome.reason);
+    try {
+      await sendLease.settle(
+        outcome.status,
+        outcome.status === "sent" ? outcome.externalId : undefined,
+        reason,
+      );
+      await this.emit({
+        type: "delivery_changed",
+        runId,
+        deliveryId,
+        status: outcome.status,
+        ...(reason ? { reason } : {}),
+        ...(attempts > 1 ? { attempts } : {}),
+        ...(retryStoppedReason ? { retryStoppedReason } : {}),
+        ...(outcome.status === "sent" && outcome.externalId
+          ? { externalId: outcome.externalId }
+          : {}),
+      });
+    } catch {
+      this.report("delivery_failed", runId);
+    }
+  }
+
+  private async sendOnce(
+    destination: CallerContext["scope"],
+    delivery: DeliveryRecord,
+  ): Promise<SendOutcome> {
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<SendOutcome>((resolve) => {
@@ -1152,8 +1234,8 @@ export class RunService {
       outcome = await Promise.race([
         this.options.transport
           .send({
-            destination: structuredClone(caller.scope),
-            delivery: structuredClone(lease.delivery),
+            destination: structuredClone(destination),
+            delivery: structuredClone(delivery),
             signal: controller.signal,
           })
           .catch((): SendOutcome => ({ status: "unknown", reason: "transport_error" })),
@@ -1166,27 +1248,7 @@ export class RunService {
     } finally {
       clearTimeout(timer);
     }
-    const reason =
-      outcome.status === "sent" ? undefined : deliveryReason(outcome.status, outcome.reason);
-    try {
-      await lease.settle(
-        outcome.status,
-        outcome.status === "sent" ? outcome.externalId : undefined,
-        reason,
-      );
-      await this.emit({
-        type: "delivery_changed",
-        runId,
-        deliveryId,
-        status: outcome.status,
-        ...(reason ? { reason } : {}),
-        ...(outcome.status === "sent" && outcome.externalId
-          ? { externalId: outcome.externalId }
-          : {}),
-      });
-    } catch {
-      this.report("delivery_failed", runId);
-    }
+    return outcome;
   }
 
   private async emit(event: RunServiceEvent): Promise<void> {

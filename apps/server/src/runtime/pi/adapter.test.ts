@@ -1,3 +1,4 @@
+// test-contract-change: PR-142 Pi adapter tests verify request budgets and normalized event evidence
 import { parseRuntimeReplies } from "../../config/runtime-replies.js";
 import { mkdtemp, rm } from "node:fs/promises";
 import { createHash } from "node:crypto";

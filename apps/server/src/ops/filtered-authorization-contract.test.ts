@@ -194,6 +194,6 @@ it("passes the actual TaskStore DENY and exclusion witness through caseEvidence"
     }
   } finally {
     await store?.close();
-    await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    await rm(directory, { recursive: true, force: true, maxRetries: 30, retryDelay: 100 });
   }
 });

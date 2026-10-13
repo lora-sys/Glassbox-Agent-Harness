@@ -1,3 +1,4 @@
+// test-contract-change: PR-142 OneBot reconnect test now verifies private drop telemetry after overflow
 import { once } from "node:events";
 import { Buffer } from "node:buffer";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";

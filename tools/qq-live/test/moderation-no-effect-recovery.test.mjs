@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { sanitizedGitEnvironment } from "../../../scripts/git-environment.mjs";
 import { createHash } from "node:crypto";
 import { lstat, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -368,6 +369,7 @@ async function planEntryFixture(t, { attemptStatus = "STARTED" } = {}) {
     const pinnedSource = execFileSync("git", ["show", `${v9Commit}:${relative}`], {
       cwd: process.cwd(),
       maxBuffer: 5 * 1024 * 1024,
+      env: sanitizedGitEnvironment(),
     });
     await writeFile(destination, pinnedSource, { mode: 0o600 });
   }
