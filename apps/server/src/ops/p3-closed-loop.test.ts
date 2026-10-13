@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import { type Audience } from "@glassbox/contracts";
 import { openDomainStore, type DomainStore } from "../persistence/index.js";
+import { scopeKey } from "../identity/scope.js";
 import { parseOneBotConfig } from "../channels/onebot/config.js";
 import { normalizeOneBotMessage } from "../channels/onebot/normalize.js";
 import { FakeHerdrBridge } from "./fake-herdr-bridge.js";
@@ -259,7 +260,14 @@ describe("P3.0 Test Harness, Contracts, and Minimal Closed Loop", () => {
   it("completes full Agent Operations lifecycle with FakeHerdrBridge, rework, and review", async () => {
     const store = await createStore();
     await store.conversations.createAgent("personal");
-    await store.identities.createPrincipal("owner", "owner");
+    const ownerScope = {
+      connectionId: FIXTURE_CONNECTION_ID,
+      botId: FIXTURE_BOT_ID,
+      chatType: "private" as const,
+      chatId: FIXTURE_OWNER_ID,
+      senderId: FIXTURE_OWNER_ID,
+    };
+    await store.identities.bindOwner("owner", ownerScope);
     const bridge = new FakeHerdrBridge("test-herdr-session");
     const reconciler = new OpsReconciler(store.tasks, bridge);
     await reconciler.start();
@@ -270,6 +278,7 @@ describe("P3.0 Test Harness, Contracts, and Minimal Closed Loop", () => {
       description: "Write unit tests and AST parser",
       priority: "high",
       creatorPrincipalId: "owner",
+      authorizationScope: ownerScope,
     });
     expect(task.status).toBe("NEW");
 
@@ -331,7 +340,23 @@ describe("P3.0 Test Harness, Contracts, and Minimal Closed Loop", () => {
     // Reviewer requests rework without losing prior attempt history
     await store.tasks.updateAttemptStatus(attempt1.id, "review", "Completed initial draft");
     const priorEvidence = await store.tasks.getAttempt(attempt1.id);
-    await reconciler.reworkTask(task.id, "AST visitor is incomplete; add visitor tests");
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: `task-${task.id}`,
+      action: "task:rework",
+      scope: ownerScope,
+      effect: "allow",
+    });
+    const reworkDecision = await store.authorization.check({
+      caller: { principalId: "owner", scope: ownerScope },
+      resourceId: `task-${task.id}`,
+      action: "task:rework",
+    });
+    await reconciler.reworkTask(task.id, "AST visitor is incomplete; add visitor tests", {
+      decisionId: reworkDecision.id,
+      actorPrincipalId: "owner",
+      scopeKey: scopeKey(ownerScope),
+    });
 
     updatedTask = await store.tasks.getTask(task.id);
     expect(updatedTask?.status).toBe("RUNNING");
@@ -365,7 +390,23 @@ describe("P3.0 Test Harness, Contracts, and Minimal Closed Loop", () => {
     expect(updatedTask?.status).toBe("REVIEW");
 
     // 7. Review Action: ACCEPT
-    await reconciler.acceptTask(task.id);
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: `task-${task.id}`,
+      action: "task:accept",
+      scope: ownerScope,
+      effect: "allow",
+    });
+    const acceptDecision = await store.authorization.check({
+      caller: { principalId: "owner", scope: ownerScope },
+      resourceId: `task-${task.id}`,
+      action: "task:accept",
+    });
+    await reconciler.acceptTask(task.id, {
+      decisionId: acceptDecision.id,
+      actorPrincipalId: "owner",
+      scopeKey: scopeKey(ownerScope),
+    });
 
     updatedTask = await store.tasks.getTask(task.id);
     expect(updatedTask?.status).toBe("DONE");

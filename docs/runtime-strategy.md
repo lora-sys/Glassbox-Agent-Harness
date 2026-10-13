@@ -78,6 +78,18 @@ Lora PI Kit is not a second runtime and is not the Personal Agent identity.
 
 It is the distribution and runtime customization layer loaded into Pi.
 
+### Execution capability matrix
+
+The adapters below share Glassbox identity, authorization, Run evidence and Task policy. Their execution contracts differ, so one adapter cannot replace another without proving the rows below equivalent.
+
+| Path | Runtime and state | Tools | Result handling | Scope |
+| --- | --- | --- | --- | --- |
+| Main Personal Agent Run | `PiSdkRuntimeAdapter` uses a Pi SDK session for the durable Conversation. | Glassbox selects an authorized Tool surface before the model sees it. Each Tool call authorizes again at execution and before releasing its result. | The Run passes through the current Delivery Gate. | Private and group Channel Runs. |
+| Durable Task Model Step | `configuredModelAdapter` invokes the configured provider through the copied Agent loop for one internal Run linked to a TaskAttempt. | No Tools are available to the Model Step. | Output stays attached to the Step for review. It is not automatically delivered. | Durable Task Steps only. |
+| Codex or Claude Worker | A runtime harness starts the configured external coding Agent for its Worker attempt. Herdr owns the live process and pane facts. | Only explicitly configured protected Worker Tools are exposed. | Glassbox records the WorkerBinding and attempt evidence. Glassbox review and acceptance decide Task state. | Worker capability depends on the adapter and isolation evidence. |
+
+`apps/server/src/runtime/pi/adapter.test.ts` covers Pi SDK sessions and provider payload checks. `apps/server/src/execution/model-adapter.test.ts` covers the isolated Model Step path. Codex and Claude harness tests cover their separate process and cancellation contracts. These tests do not establish live Herdr or QQ acceptance.
+
 ## Ownership
 
 ### Glassbox owns

@@ -1,3 +1,4 @@
+// test-contract-change: ISSUE-194 parse persisted source identity JSON across platform path separators
 import { EventEmitter } from "node:events";
 import { join, resolve } from "node:path";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
@@ -508,7 +509,8 @@ describe("configured production checkout (#111)", () => {
       expect.arrayContaining([join(production, "apps/server/src/index.ts")]),
       expect.objectContaining({ cwd: production }),
     );
-    expect(stdout).toHaveBeenCalledWith(expect.stringContaining(`"checkout":"${production}"`));
+    const output = stdout.mock.calls.map(([chunk]) => String(chunk)).join("");
+    expect(JSON.parse(output)).toMatchObject({ checkout: production, commit: sha });
   });
 
   it("checks the configured commit before starting or stopping Glassbox", async () => {

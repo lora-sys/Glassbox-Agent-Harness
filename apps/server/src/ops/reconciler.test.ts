@@ -3,11 +3,50 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { openDomainStore, type DomainStore } from "../persistence/index.js";
+import { scopeKey, type CallerContext } from "../identity/scope.js";
 import { FakeHerdrBridge } from "./fake-herdr-bridge.js";
 import { OpsReconciler } from "./reconciler.js";
 
 const stores: DomainStore[] = [];
 const directories: string[] = [];
+const ownerCaller: CallerContext = {
+  principalId: "owner",
+  scope: {
+    connectionId: "reconciler-test",
+    botId: "reconciler-bot",
+    chatType: "private",
+    chatId: "owner",
+    senderId: "owner",
+  },
+};
+
+async function taskActionOrigin(store: DomainStore, taskId: string, action: string) {
+  await store.identities.bindOwner(ownerCaller.principalId, ownerCaller.scope);
+  await store.authorization.registerResource({
+    id: `task-${taskId}`,
+    kind: "task",
+    visibility: "private",
+    ownerId: ownerCaller.principalId,
+    ifAbsent: true,
+  });
+  await store.authorization.grant({
+    principalId: ownerCaller.principalId,
+    resourceId: `task-${taskId}`,
+    action,
+    scope: ownerCaller.scope,
+    effect: "allow",
+  });
+  const decision = await store.authorization.check({
+    caller: ownerCaller,
+    resourceId: `task-${taskId}`,
+    action,
+  });
+  return {
+    decisionId: decision.id,
+    actorPrincipalId: ownerCaller.principalId,
+    scopeKey: scopeKey(ownerCaller.scope),
+  };
+}
 
 async function storeAt(databasePath = ":memory:"): Promise<DomainStore> {
   const store = await openDomainStore({ databasePath });
@@ -399,7 +438,8 @@ describe("OpsReconciler safety", () => {
       state: "done",
       timestamp: new Date().toISOString(),
     });
-    const reworked = await store.tasks.reworkTask(task.id, "fix it");
+    const origin = await taskActionOrigin(store, task.id, "task:rework");
+    const reworked = await store.tasks.reworkTask(task.id, "fix it", origin);
 
     await reconciler.handleEvent({
       type: "agent.state",
@@ -445,9 +485,11 @@ describe("OpsReconciler safety", () => {
       timestamp: new Date().toISOString(),
     });
 
+    const acceptOrigin = await taskActionOrigin(store, task.id, "task:accept");
+    const reworkOrigin = await taskActionOrigin(store, task.id, "task:rework");
     const outcomes = await Promise.allSettled([
-      store.tasks.acceptTask(task.id, "owner"),
-      store.tasks.reworkTask(task.id, "more tests", "owner"),
+      store.tasks.acceptTask(task.id, acceptOrigin),
+      store.tasks.reworkTask(task.id, "more tests", reworkOrigin),
     ]);
     expect(outcomes.filter((outcome) => outcome.status === "fulfilled")).toHaveLength(1);
     expect(outcomes.filter((outcome) => outcome.status === "rejected")).toHaveLength(1);

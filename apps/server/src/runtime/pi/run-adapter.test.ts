@@ -1,3 +1,4 @@
+// test-contract-change: ISSUE-194 cover bounded authorized Memory retrieval and scan evidence.
 import { describe, expect, it, vi } from "vite-plus/test";
 import type { QqNativeGroupRole } from "../../identity/scope.js";
 import type { ExecutionInput } from "../../execution/run-service/types.js";
@@ -12,6 +13,7 @@ import { parseRuntimeReplies } from "../../config/runtime-replies.js";
 import { piProfileName, PiRunExecutionAdapter, projectRunHistory } from "./run-adapter.js";
 import type { RunEvidenceRecord } from "./run-adapter.js";
 import type { PiRunResult, PiRuntimeAdapter } from "./types.js";
+import { REQUEST_INTENT_CORPUS } from "./request-intent.test-fixtures.js";
 
 function fixture(results: PiRunResult[], authorizedToolNames: string[] = []) {
   const run = vi.fn(async (..._args: Parameters<PiRuntimeAdapter["run"]>) => results.shift()!);
@@ -698,6 +700,64 @@ describe("Pi required Tool execution", () => {
     },
   );
 
+  it("does not auto-load Project Memory into an Owner-private Run without a trusted binding", async () => {
+    const f = fixture([
+      { status: "completed", text: "No project context was loaded.", toolCalls: [] },
+    ]);
+    f.input.text = "请总结一下当前问题背景。";
+    const projectMemory = {
+      memoryId: "project_only_memory",
+      type: "semantic_fact",
+      content: { statement: "PROJECT-ONLY-DO-NOT-LOAD" },
+      scope: { type: "project", projectId: "glassbox" },
+      sensitivity: "public",
+      lifecycleState: "active",
+    } as unknown as CanonicalMemory;
+    const listGlobal = vi.fn(async () => ({
+      memories: [],
+      candidateCount: 0,
+      scannedCount: 0,
+      scanLimit: 256,
+      truncated: false,
+    }));
+    const listProject = vi.fn(async () => ({
+      memories: [projectMemory],
+      candidateCount: 1,
+      scannedCount: 1,
+      scanLimit: 128,
+      truncated: false,
+    }));
+    const learningEvidence: RunEvidenceRecord[] = [];
+    const executor = new PiRunExecutionAdapter(f.runtime, {
+      learningStore: {
+        authorizeContext: vi.fn(async () => {}),
+        listGlobalMemoryContextCandidates: listGlobal,
+        listProjectMemoryContextCandidates: listProject,
+      } as unknown as LearningStore,
+      onLearningEvidence: (record) => {
+        learningEvidence.push(record);
+      },
+    });
+
+    await expect(executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(listGlobal).toHaveBeenCalledOnce();
+    expect(listProject).not.toHaveBeenCalled();
+    expect(f.run.mock.calls[0]?.[2]).not.toContain("PROJECT-ONLY-DO-NOT-LOAD");
+    expect(learningEvidence).toContainEqual({
+      type: "learning_context",
+      runId: "run-1",
+      principalId: "owner",
+      conversationId: "conversation-1",
+      scopeType: "global",
+      status: "empty",
+      candidateCount: 0,
+      scannedCount: 0,
+      scanLimit: 256,
+      truncated: false,
+      memoryIds: [],
+    });
+  });
+
   it("injects only authorized group Memory as bounded reference data before the current message", async () => {
     const f = fixture([{ status: "completed", text: "本群每月聚会一次。", toolCalls: [] }]);
     f.input.caller.scope.chatType = "group";
@@ -722,7 +782,13 @@ describe("Pi required Tool execution", () => {
     const authorizeContext = vi.fn(async () => {});
     const learningStore = {
       authorizeContext,
-      listGroupMemories: vi.fn(async () => [activeMemory]),
+      listGroupMemoryContextCandidates: vi.fn(async () => ({
+        memories: [activeMemory],
+        candidateCount: 1,
+        scannedCount: 1,
+        scanLimit: 128,
+        truncated: false,
+      })),
       markGroupMemoriesUsed,
     } as unknown as LearningStore;
     const learningEvidence: RunEvidenceRecord[] = [];
@@ -762,6 +828,10 @@ describe("Pi required Tool execution", () => {
       conversationId: "conversation-1",
       scopeType: "group",
       status: "loaded",
+      candidateCount: 1,
+      scannedCount: 1,
+      scanLimit: 128,
+      truncated: false,
       memoryIds: ["memory_group_fact"],
     });
   });
@@ -790,7 +860,13 @@ describe("Pi required Tool execution", () => {
     const executor = new PiRunExecutionAdapter(f.runtime, {
       learningStore: {
         authorizeContext: vi.fn(async () => {}),
-        listGroupMemories: vi.fn(async () => [activeMemory]),
+        listGroupMemoryContextCandidates: vi.fn(async () => ({
+          memories: [activeMemory],
+          candidateCount: 1,
+          scannedCount: 1,
+          scanLimit: 128,
+          truncated: false,
+        })),
         markGroupMemoriesUsed: vi.fn(async () => [activeMemory]),
       } as unknown as LearningStore,
       onLearningEvidence: (record) => {
@@ -807,6 +883,10 @@ describe("Pi required Tool execution", () => {
         type: "learning_context",
         scopeType: "group",
         status: "loaded",
+        candidateCount: 1,
+        scannedCount: 1,
+        scanLimit: 128,
+        truncated: false,
         memoryIds: ["memory_group_response_preference"],
       }),
     );
@@ -6122,4 +6202,46 @@ it.each([
   expect(f.createOrRestoreSession.mock.calls[0]?.[2]?.requiredToolName).toBeUndefined();
   expect(outcome.text).not.toContain("请明确指定一次禁言时长");
   expect(outcome.status).toBe("succeeded");
+});
+
+describe("natural-language intent corpus through the Pi Run adapter", () => {
+  it.each(REQUEST_INTENT_CORPUS)("$id binds the same required evidence", async (scenario) => {
+    const responseCall =
+      scenario.requiredToolCall ??
+      (scenario.requiredEvidence[0]
+        ? {
+            name: scenario.requiredEvidence[0].tool,
+            input: scenario.requiredEvidence[0].input,
+          }
+        : undefined);
+    const f = fixture([
+      {
+        status: "completed",
+        text: "已按实时查询结果回答。",
+        toolCalls: responseCall
+          ? [
+              {
+                name: responseCall.name,
+                input: responseCall.input,
+                failed: false,
+                result: scenario.toolResult,
+              },
+            ]
+          : [],
+      },
+    ]);
+    f.input.text = scenario.input.text;
+
+    await expect(f.executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    const context = f.run.mock.calls[0]?.[3];
+    expect(context?.requiredEvidence ?? []).toEqual(scenario.requiredEvidence);
+    if (scenario.requiredToolCall) {
+      expect(context).toMatchObject({
+        requiredToolName: scenario.requiredToolCall.name,
+        requiredToolInput: scenario.requiredToolCall.input,
+      });
+    } else {
+      expect(context).not.toHaveProperty("requiredToolName");
+    }
+  });
 });

@@ -685,6 +685,9 @@ describe("QQ live lease application wiring", () => {
       tools: [],
     });
     vi.spyOn(fixture.app.runs, "enqueueAccepted").mockResolvedValue();
+    // This test models a process exit before queued work is dispatched. Disable the durable
+    // poller too, or a slow Windows test run can dispatch the Run before reopen().
+    await fixture.app.runs.stop();
     fixture.send(707, text, true);
 
     let queuedRun:

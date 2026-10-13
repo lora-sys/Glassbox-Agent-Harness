@@ -218,7 +218,6 @@ function applyFlowLayout(
 ) {
   const X = 120;
   const ANSWER_X = 760;
-  const _MAX_WIDTH = 520;
   const LINE_H = 22;
   const GAP = 18;
   const PAD_Y = 14;
@@ -267,7 +266,6 @@ function applyFlowLayout(
 
   // Position Answer shapes in the second column, aligned with their turn
   for (const t of answerTemplates) {
-    const _turnIdx = (t.meta as any).turnIndex ?? 0;
     const turnId = (t.meta as any).itemId || "";
     // Find the turn shape in the regular column to align with
     const turnShape = regularTemplates.find(

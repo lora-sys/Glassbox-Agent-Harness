@@ -1,3 +1,9 @@
+// test-contract-change: ISSUE-194 preserve unknown delivery outcomes and recovery of persisted queued Runs.
+// test-contract-replacement: "durable result delivery and recovery > retries an unconfirmed send with the same delivery and settles once on success (#110)" => "durable result delivery and recovery > does not resend a timeout outcome whose delivery is unknown"
+// test-contract-replacement: "durable result delivery and recovery > settles unknown with attention after bounded retries are exhausted (#110)" => "durable result delivery and recovery > keeps a disconnected delivery unknown and records Owner attention"
+// test-contract-replacement: "durable result delivery and recovery > rechecks delivery authority before each automatic retry (#110)" => "durable result delivery and recovery > does not retry an unknown send_error after delivery authority changes"
+// test-contract-replacement: "durable result delivery and recovery > does not retry after service shutdown during backoff (#110)" => "durable result delivery and recovery > does not replay an unknown transport error after service shutdown"
+// test-contract-replacement: "durable result delivery and recovery > never retries a confirmed failure or unclassified response (#110)" => "durable result delivery and recovery > sends a confirmed API rejection once and preserves its failure"
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -75,6 +81,46 @@ it("executes the exact approved Run once and still honors revocation", async () 
   ).toBe("DENY");
 });
 
+it("recovers a persisted ingress Run after its in-memory enqueue wake is lost", async () => {
+  const { store } = await fixture();
+  vi.useFakeTimers();
+  const incoming = input("missed-ingress-wake", "Please answer this message once.");
+  const execute = vi.fn(async () => ({ status: "succeeded" as const, text: "recovered response" }));
+  const send = vi.fn(async (request: Parameters<RunTransport["send"]>[0]) => ({
+    status: "sent" as const,
+    externalId: request.delivery.id,
+  }));
+  const { instance } = service(
+    store,
+    { supportsGroup: true, execute },
+    { send },
+    { queuedPollMs: 500 },
+  );
+
+  await instance.start();
+  const accepted = await store.conversations.acceptIncoming(incoming);
+  await instance.recordMessageReceived(incoming, accepted.run);
+
+  // Simulate the OneBot callback failing after durable acceptance and Trace append,
+  // before enqueueAccepted can kick the in-memory scheduler.
+  await vi.advanceTimersByTimeAsync(500);
+  await instance.drain();
+
+  expect((await instance.getRun(owner(), accepted.run.id)).status).toBe("succeeded");
+  expect(execute).toHaveBeenCalledTimes(1);
+  expect(
+    send.mock.calls.filter(([request]) => request.delivery.payloadKind === "result"),
+  ).toHaveLength(1);
+
+  // Repeated durable queue scans must not replay the completed Run or its delivery.
+  await vi.advanceTimersByTimeAsync(1_000);
+  await instance.drain();
+  expect(execute).toHaveBeenCalledTimes(1);
+  expect(
+    send.mock.calls.filter(([request]) => request.delivery.payloadKind === "result"),
+  ).toHaveLength(1);
+});
+
 function deferred<T>() {
   let resolvePromise!: (value: T) => void;
   const promise = new Promise<T>((resolve) => {
@@ -137,6 +183,29 @@ function service(
   });
   services.push(instance);
   return { instance, events, errors };
+}
+
+async function sendResultOnce(outcome: SendOutcome, messageId: string) {
+  const { store, grants } = await fixture();
+  let attempts = 0;
+  const { instance, events } = service(
+    store,
+    { supportsGroup: true, execute: async () => ({ status: "succeeded", text: "result" }) },
+    {
+      send: async ({ delivery }) => {
+        if (delivery.payloadKind === "ack") return { status: "sent" };
+        attempts += 1;
+        return outcome;
+      },
+    },
+  );
+  await instance.start();
+  const accepted = await instance.receive(input(messageId));
+  await instance.drain();
+  const delivery = (await store.lifecycle.listDeliveries(owner(), accepted.run.id)).items.find(
+    (item) => item.payloadKind === "result",
+  );
+  return { store, grants, instance, events, accepted, attempts: () => attempts, delivery };
 }
 
 it("publishes a durable Task review notice through the exact origin audience", async () => {
@@ -1885,12 +1954,14 @@ describe("durable result delivery and recovery", () => {
     const { store } = await fixture();
     vi.useFakeTimers();
     const sendStarted = deferred<AbortSignal>();
+    let resultAttempts = 0;
     const { instance, events } = service(
       store,
       { supportsGroup: true, execute: async () => ({ status: "succeeded", text: "result" }) },
       {
         send: async ({ delivery, signal }) => {
           if (delivery.payloadKind === "ack") return { status: "sent" };
+          resultAttempts += 1;
           sendStarted.resolve(signal);
           return new Promise(() => {});
         },
@@ -1903,6 +1974,7 @@ describe("durable result delivery and recovery", () => {
     await vi.advanceTimersByTimeAsync(50);
     await instance.drain();
     expect(signal.aborted).toBe(true);
+    expect(resultAttempts).toBe(1);
     expect(events).toContainEqual(
       expect.objectContaining({
         type: "delivery_changed",
@@ -1916,6 +1988,128 @@ describe("durable result delivery and recovery", () => {
         (item) => item.payloadKind === "result",
       )?.status,
     ).toBe("unknown");
+  });
+
+  it("does not resend a timeout outcome whose delivery is unknown", async () => {
+    const result = await sendResultOnce(
+      { status: "unknown", reason: "timeout" },
+      "single-send-timeout",
+    );
+    expect(result.attempts()).toBe(1);
+    expect(result.delivery).toMatchObject({ status: "unknown" });
+    expect(result.events).toContainEqual(
+      expect.objectContaining({ type: "delivery_changed", status: "unknown", reason: "timeout" }),
+    );
+  });
+
+  it("keeps a disconnected delivery unknown and records Owner attention", async () => {
+    const result = await sendResultOnce(
+      { status: "unknown", reason: "disconnected" },
+      "single-send-disconnected",
+    );
+    expect(result.attempts()).toBe(1);
+    expect(result.delivery).toMatchObject({ status: "unknown" });
+    expect((await result.store.tasks.listAttentionItems())[0]!.summary).toContain("disconnected");
+  });
+
+  it("does not retry an unknown send_error after delivery authority changes", async () => {
+    const result = await sendResultOnce(
+      { status: "unknown", reason: "send_error" },
+      "single-send-error",
+    );
+    await result.store.authorization.revoke(result.grants.get(scopeKey(group) + "delivery:send")!);
+    await expect(
+      result.instance.retryDelivery(owner(), result.accepted.run.id, result.delivery!.id),
+    ).rejects.toThrow();
+    expect(result.attempts()).toBe(1);
+    expect(result.delivery).toMatchObject({ status: "unknown" });
+  });
+
+  it("does not replay an unknown transport error after service shutdown", async () => {
+    const result = await sendResultOnce(
+      { status: "unknown", reason: "transport_error" },
+      "single-send-stopped",
+    );
+    await result.instance.stop();
+    await result.instance.start();
+    await result.instance.drain();
+    expect(result.attempts()).toBe(1);
+    expect(result.delivery).toMatchObject({ status: "unknown" });
+  });
+
+  it("sends a confirmed API rejection once and preserves its failure", async () => {
+    const result = await sendResultOnce(
+      { status: "failed", reason: "api_rejected" },
+      "single-send-api-rejected",
+    );
+    expect(result.attempts()).toBe(1);
+    expect(result.delivery).toMatchObject({ status: "failed" });
+    expect(result.events).toContainEqual(
+      expect.objectContaining({
+        type: "delivery_changed",
+        status: "failed",
+        reason: "api_rejected",
+      }),
+    );
+  });
+
+  it("does not resend an invalid response with unknown delivery status", async () => {
+    const result = await sendResultOnce(
+      { status: "unknown", reason: "invalid_response" },
+      "single-send-invalid-response",
+    );
+    expect(result.attempts()).toBe(1);
+    expect(result.delivery).toMatchObject({ status: "unknown" });
+    expect(result.events).toContainEqual(
+      expect.objectContaining({
+        type: "delivery_changed",
+        status: "unknown",
+        reason: "invalid_response",
+      }),
+    );
+  });
+
+  it("does not resend an asynchronous response with unknown delivery status", async () => {
+    const result = await sendResultOnce(
+      { status: "unknown", reason: "async_response" },
+      "single-send-async-response",
+    );
+    expect(result.attempts()).toBe(1);
+    expect(result.delivery).toMatchObject({ status: "unknown" });
+    expect(result.events).toContainEqual(
+      expect.objectContaining({
+        type: "delivery_changed",
+        status: "unknown",
+        reason: "async_response",
+      }),
+    );
+  });
+
+  it("does not resend after the delivery timeout expires", async () => {
+    const result = await sendResultOnce(
+      { status: "unknown", reason: "delivery_timeout" },
+      "single-send-delivery-timeout",
+    );
+    expect(result.attempts()).toBe(1);
+    expect(result.delivery).toMatchObject({ status: "unknown" });
+  });
+
+  it("does not resend after the transport reports an error", async () => {
+    const result = await sendResultOnce(
+      { status: "unknown", reason: "transport_error" },
+      "single-send-transport-error",
+    );
+    expect(result.attempts()).toBe(1);
+    expect(result.delivery).toMatchObject({ status: "unknown" });
+  });
+
+  it("does not resend an unclassified outcome", async () => {
+    const result = await sendResultOnce(
+      { status: "unknown", reason: "unclassified" },
+      "single-send-unclassified",
+    );
+    expect(result.attempts()).toBe(1);
+    expect(result.delivery).toMatchObject({ status: "unknown" });
   });
 
   it("recovers execution facts and queued work without replaying active or uncertain work", async () => {

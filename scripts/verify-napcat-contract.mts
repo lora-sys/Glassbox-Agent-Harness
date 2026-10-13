@@ -12,6 +12,7 @@
  */
 
 import { execFileSync } from "node:child_process";
+import { sanitizedGitEnvironment } from "./git-environment.mjs";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { NAPCAT_CONTRACT_SNAPSHOT } from "../apps/server/src/channels/onebot/capabilities.ts";
@@ -55,6 +56,7 @@ function main(): void {
     const report = verifyNapCatContract({
       revision: execFileSync("git", ["-C", root, "rev-parse", "HEAD"], {
         encoding: "utf8",
+        env: sanitizedGitEnvironment(),
       }).trim(),
       routerSource: readFileSync(join(root, ACTION_DIR, "router.ts"), "utf8"),
       actionSources: readActionSources(root),

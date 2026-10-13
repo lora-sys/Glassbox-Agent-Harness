@@ -7,6 +7,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { readLinuxProcessIdentity } from "../service-process-identity.mts";
 import { serviceSourceIdentity } from "../service-source-identity.mjs";
+import { sanitizedGitEnvironment } from "../git-environment.mjs";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const serviceCli = join(repoRoot, "scripts/agent-service.mts");
@@ -24,16 +25,20 @@ function dirtySourceFixture(t) {
   const checkout = mkdtempSync(join(tmpdir(), "agent-service-source-checkout-"));
   chmodSync(checkout, 0o700);
   t.after(() => rmSync(checkout, { recursive: true, force: true }));
-  execFileSync("git", ["init", "--quiet"], { cwd: checkout });
-  execFileSync("git", ["config", "user.name", "Glassbox test"], { cwd: checkout });
-  execFileSync("git", ["config", "user.email", "glassbox-test@example.invalid"], {
-    cwd: checkout,
-  });
+  const git = (...args) =>
+    execFileSync("git", args, {
+      cwd: checkout,
+      env: sanitizedGitEnvironment(),
+      encoding: "utf8",
+    });
+  git("init", "--quiet");
+  git("config", "user.name", "Glassbox test");
+  git("config", "user.email", "glassbox-test@example.invalid");
   const entry = join(checkout, "index.ts");
-  writeFileSync(entry, "export const source = 'committed';\n");
-  execFileSync("git", ["add", "index.ts"], { cwd: checkout });
-  execFileSync("git", ["commit", "--quiet", "-m", "fixture"], { cwd: checkout });
-  writeFileSync(entry, "export const source = 'dirty';\n");
+  writeFileSync(entry, "export const source = 'committed';\\n");
+  git("add", "index.ts");
+  git("commit", "--quiet", "-m", "fixture");
+  writeFileSync(entry, "export const source = 'dirty';\\n");
   return checkout;
 }
 

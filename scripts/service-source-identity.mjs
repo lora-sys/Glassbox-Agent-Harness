@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { lstatSync, readFileSync, readlinkSync, realpathSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
+import { sanitizedGitEnvironment } from "./git-environment.mjs";
 
 function hashField(hash, bytes) {
   const length = Buffer.alloc(8);
@@ -17,6 +18,7 @@ export function serviceSourceTreeSha256(checkout, capture = execFileSync) {
     timeout: 15000,
     maxBuffer: 64 * 1024 * 1024,
     stdio: ["ignore", "pipe", "pipe"],
+    env: sanitizedGitEnvironment(),
   });
   if (!Buffer.isBuffer(listed) || listed.length === 0 || listed.at(-1) !== 0)
     throw new Error("Git source paths are unavailable.");
@@ -75,6 +77,7 @@ export function serviceSourceIdentity(checkout, capture = execFileSync) {
         encoding: "utf8",
         timeout: 5000,
         stdio: ["ignore", "pipe", "pipe"],
+        env: sanitizedGitEnvironment(),
       }).trim();
     const commit = git(["rev-parse", "HEAD"]);
     if (!/^[a-f0-9]{40}$/.test(commit)) return undefined;

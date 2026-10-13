@@ -1139,33 +1139,8 @@ export class RunService {
     }
     if (!lease) return;
     await this.emit({ type: "delivery_changed", runId, deliveryId, status: "sending" });
-    const controller = new AbortController();
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<SendOutcome>((resolve) => {
-      timer = setTimeout(() => {
-        controller.abort();
-        resolve({ status: "unknown", reason: "delivery_timeout" });
-      }, this.deliveryTimeoutMs);
-    });
-    let outcome: SendOutcome;
-    try {
-      outcome = await Promise.race([
-        this.options.transport
-          .send({
-            destination: structuredClone(caller.scope),
-            delivery: structuredClone(lease.delivery),
-            signal: controller.signal,
-          })
-          .catch((): SendOutcome => ({ status: "unknown", reason: "transport_error" })),
-        timeout,
-      ]);
-      if (!outcome || !["sent", "failed", "unknown"].includes(outcome.status))
-        outcome = { status: "unknown", reason: "invalid_response" };
-    } catch {
-      outcome = { status: "unknown", reason: "transport_error" };
-    } finally {
-      clearTimeout(timer);
-    }
+    const outcome = await this.sendOnce(caller.scope, lease.delivery);
+
     const reason =
       outcome.status === "sent" ? undefined : deliveryReason(outcome.status, outcome.reason);
     try {
@@ -1187,6 +1162,40 @@ export class RunService {
     } catch {
       this.report("delivery_failed", runId);
     }
+  }
+
+  private async sendOnce(
+    destination: CallerContext["scope"],
+    delivery: DeliveryRecord,
+  ): Promise<SendOutcome> {
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<SendOutcome>((resolve) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        resolve({ status: "unknown", reason: "delivery_timeout" });
+      }, this.deliveryTimeoutMs);
+    });
+    let outcome: SendOutcome;
+    try {
+      outcome = await Promise.race([
+        this.options.transport
+          .send({
+            destination: structuredClone(destination),
+            delivery: structuredClone(delivery),
+            signal: controller.signal,
+          })
+          .catch((): SendOutcome => ({ status: "unknown", reason: "transport_error" })),
+        timeout,
+      ]);
+      if (!outcome || !["sent", "failed", "unknown"].includes(outcome.status))
+        outcome = { status: "unknown", reason: "invalid_response" };
+    } catch {
+      outcome = { status: "unknown", reason: "transport_error" };
+    } finally {
+      clearTimeout(timer);
+    }
+    return outcome;
   }
 
   private async emit(event: RunServiceEvent): Promise<void> {

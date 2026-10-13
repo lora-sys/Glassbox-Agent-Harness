@@ -1,12 +1,13 @@
+// test-contract-change: ISSUE-194 new disposable Git-dir and common-dir boundary assertions
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { Worker } from "node:worker_threads";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import {
   caseEvidence,
@@ -26,13 +27,37 @@ import {
 } from "../lib/product-evidence.mjs";
 import { observeFeature } from "../lib/feature-observer.mjs";
 import { serviceSourceTreeSha256 } from "../../../scripts/service-source-identity.mjs";
+import { sanitizedGitEnvironment } from "../../../scripts/git-environment.mjs";
 
 function git(cwd, ...args) {
   return execFileSync("git", args, {
     cwd,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
+    env: sanitizedGitEnvironment(),
   }).trim();
+}
+
+function assertDisposableGitRepository(directory) {
+  const root = realpathSync.native(resolve(directory));
+  const gitDirectory = realpathSync.native(
+    resolve(root, git(root, "rev-parse", "--absolute-git-dir")),
+  );
+  const commonDirectory = realpathSync.native(
+    resolve(root, git(root, "rev-parse", "--git-common-dir")),
+  );
+  const isContained = (path) => {
+    const pathFromRoot = relative(root, path);
+    return (
+      pathFromRoot === "" ||
+      (!isAbsolute(pathFromRoot) && pathFromRoot !== ".." && !pathFromRoot.startsWith(".." + sep))
+    );
+  };
+  assert.ok(isContained(gitDirectory), "fixture git-dir must stay inside its disposable checkout");
+  assert.ok(
+    isContained(commonDirectory),
+    "fixture common-dir must stay inside its disposable checkout",
+  );
 }
 
 function memberCountTrace(
@@ -105,6 +130,7 @@ test("development runtime binds expected, current and launch source tree without
   const checkout = mkdtempSync(join(tmpdir(), "qq-runtime-source-"));
   t.after(() => rmSync(checkout, { recursive: true, force: true }));
   git(checkout, "init", "-q", "-b", "main");
+  assertDisposableGitRepository(checkout);
   git(checkout, "config", "user.name", "Fixture");
   git(checkout, "config", "user.email", "fixture@example.invalid");
   writeFileSync(join(checkout, "app.mjs"), "export const value = 1;\n");

@@ -4,6 +4,7 @@ import { appendFileSync } from "node:fs";
 import { dirname, resolve, join, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
+import { sanitizedGitEnvironment } from "../../scripts/git-environment.mjs";
 import { createHash, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { validateConfig, fail, safeError, sleep, digest, exitCode } from "./lib/core.mjs";
@@ -546,6 +547,7 @@ function workspace() {
         timeout: 5000,
         maxBuffer: 1024 * 1024,
         stdio: ["ignore", "pipe", "ignore"],
+        env: sanitizedGitEnvironment(),
       }).trim();
     const diff = git(["diff", "HEAD", "--no-ext-diff", "--no-textconv"]);
     return {

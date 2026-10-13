@@ -460,6 +460,7 @@ it("projects native QQ roles only onto the current group's configured mutation s
   ).not.toContain("qq_group_moderation");
 });
 
+// test-contract-change: ISSUE-194 preserve the object root in QQ moderation schemas.
 it("publishes exact parameter requirements for each QQ operation", async () => {
   const { store, accepted } = await fixture();
   try {
@@ -475,6 +476,7 @@ it("publishes exact parameter requirements for each QQ operation", async () => {
       [],
     );
     const schema = toolByName(created, "qq_group_moderation").parameters as {
+      type?: string;
       anyOf: Array<{
         properties: {
           operation: { const: string };
@@ -487,6 +489,7 @@ it("publishes exact parameter requirements for each QQ operation", async () => {
         required?: string[];
       }>;
     };
+    expect(schema.type).toBe("object");
     const operation = (name: string) => {
       const variant = schema.anyOf.find((entry) => entry.properties.operation.const === name);
       if (!variant) throw new Error(`missing operation schema ${name}`);

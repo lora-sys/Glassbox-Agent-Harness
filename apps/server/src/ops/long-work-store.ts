@@ -28,6 +28,7 @@ import { parseCheckpointWriteSpec, parseTaskGetSpec } from "./tool-step-spec.js"
 import { parseWorkerTextFileSpec } from "./worker-file-spec.js";
 import { reconstructTaskOriginScope } from "./long-work-authority.js";
 import { TaskNotificationStore } from "./task-notification-store.js";
+import { requireCurrentTaskActionAuthorization } from "./task-action-authorization.js";
 
 /** Only trusted services may call this store. A decision ID records evidence; it does not
  * prove that a grant is still current. Callers must reauthorize before protected work. */
@@ -3922,16 +3923,13 @@ export class LongWorkStore {
       if (task.orchestration_mode !== "durable") throw new Error("Task is not durable work");
       const scope = optionalString(task, "origin_scope_key");
       if (!scope) throw new Error("Task scope is required for cancellation authorization");
-      const decision = await tx.execute({
-        sql: `SELECT d.id,d.grant_id FROM authorization_decisions d
-          LEFT JOIN grants g ON g.id = d.grant_id
-          WHERE d.id = ? AND d.principal_id = ? AND d.resource_id = ?
-            AND d.action = 'task:cancel' AND d.scope_key = ? AND d.decision = 'ALLOW'
-            AND (d.grant_id IS NULL OR (g.id IS NOT NULL AND g.revoked_at IS NULL))`,
-        args: [origin.decisionId, origin.actorPrincipalId, `task-${taskId}`, scope],
+      await requireCurrentTaskActionAuthorization(tx, {
+        taskId,
+        action: "task:cancel",
+        authorization: { ...origin, scopeKey: scope },
+        taskScopeKey: scope,
+        errorMessage: "Matching Task cancellation ALLOW decision is required",
       });
-      if (!decision.rows[0])
-        throw new Error("Matching Task cancellation ALLOW decision is required");
 
       const cancellationState = stringColumn(task, "cancellation_state");
       const currentStatus = stringColumn(task, "status");
@@ -4061,23 +4059,21 @@ export class LongWorkStore {
     requireIdentifier(origin.actorPrincipalId);
     await this.db.transaction(async (tx) => {
       const task = await this.requireTask(tx, taskId);
-      const decision = await tx.execute({
-        sql: `SELECT d.id FROM authorization_decisions d
-          LEFT JOIN grants g ON g.id = d.grant_id
-          WHERE d.id = ? AND d.principal_id = ? AND d.resource_id = ?
-            AND d.action = 'task:accept' AND d.scope_key = ? AND d.decision = 'ALLOW'
-            AND (? IS NULL OR d.run_id = ?)
-            AND (d.grant_id IS NULL OR (g.id IS NOT NULL AND g.revoked_at IS NULL))`,
-        args: [
-          origin.decisionId,
-          origin.actorPrincipalId,
-          `task-${taskId}`,
-          task.origin_scope_key,
-          runId ?? null,
-          runId ?? null,
-        ],
+      const taskScopeKey = stringColumn(task, "origin_scope_key");
+      await requireCurrentTaskActionAuthorization(tx, {
+        taskId,
+        action: "task:accept",
+        authorization: { ...origin, scopeKey: taskScopeKey },
+        taskScopeKey,
+        errorMessage: "Matching Task acceptance ALLOW decision is required",
       });
-      if (!decision.rows[0]) throw new Error("Matching Task acceptance ALLOW decision is required");
+      if (runId !== undefined) {
+        const run = await tx.execute({
+          sql: "SELECT run_id FROM authorization_decisions WHERE id = ? AND run_id = ?",
+          args: [origin.decisionId, runId],
+        });
+        if (!run.rows[0]) throw new Error("Task acceptance Run evidence mismatch");
+      }
       if (task.orchestration_mode !== "durable") throw new Error("Task is not durable work");
       if (task.status !== "REVIEW") throw new Error("Task must be in REVIEW before acceptance");
       const now = new Date().toISOString();
@@ -4132,19 +4128,14 @@ export class LongWorkStore {
 
     return this.db.transaction(async (tx) => {
       const task = await this.requireActiveDurableTask(tx, input.taskId);
-      const decision = await tx.execute({
-        sql: `SELECT d.id FROM authorization_decisions d JOIN grants g ON g.id = d.grant_id
-          WHERE d.id = ? AND d.principal_id = ? AND d.resource_id = ?
-            AND d.action = 'task:accept' AND d.scope_key = ? AND d.decision = 'ALLOW'
-            AND g.revoked_at IS NULL`,
-        args: [
-          origin.decisionId,
-          origin.actorPrincipalId,
-          `task-${input.taskId}`,
-          task.origin_scope_key,
-        ],
+      const taskScopeKey = stringColumn(task, "origin_scope_key");
+      await requireCurrentTaskActionAuthorization(tx, {
+        taskId: input.taskId,
+        action: "task:accept",
+        authorization: { ...origin, scopeKey: taskScopeKey },
+        taskScopeKey,
+        errorMessage: "Matching Step acceptance ALLOW decision is required",
       });
-      if (!decision.rows[0]) throw new Error("Matching Step acceptance ALLOW decision is required");
       const step = await this.requireStep(tx, input.taskId, input.stepId);
       if (step.status !== "review" || Number(step.version) !== input.expectedStepVersion)
         throw new Error("Step acceptance conflict");
@@ -4225,19 +4216,14 @@ export class LongWorkStore {
 
     return this.db.transaction(async (tx) => {
       const task = await this.requireActiveDurableTask(tx, input.taskId);
-      const decision = await tx.execute({
-        sql: `SELECT d.id FROM authorization_decisions d JOIN grants g ON g.id = d.grant_id
-          WHERE d.id = ? AND d.principal_id = ? AND d.resource_id = ?
-            AND d.action = 'task:rework' AND d.scope_key = ? AND d.decision = 'ALLOW'
-            AND g.revoked_at IS NULL`,
-        args: [
-          origin.decisionId,
-          origin.actorPrincipalId,
-          `task-${input.taskId}`,
-          task.origin_scope_key,
-        ],
+      const taskScopeKey = stringColumn(task, "origin_scope_key");
+      await requireCurrentTaskActionAuthorization(tx, {
+        taskId: input.taskId,
+        action: "task:rework",
+        authorization: { ...origin, scopeKey: taskScopeKey },
+        taskScopeKey,
+        errorMessage: "Matching Step rework ALLOW decision is required",
       });
-      if (!decision.rows[0]) throw new Error("Matching Step rework ALLOW decision is required");
       const step = await this.requireStep(tx, input.taskId, input.stepId);
       const blockedChild = step.kind === "child_task" && step.status === "blocked";
       const closedUnknownWorker = step.kind === "herdr_worker" && step.status === "blocked";

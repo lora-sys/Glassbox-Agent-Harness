@@ -172,6 +172,7 @@ import {
 import { ChannelArchiveStore } from "../retrieval/channel-archive.js";
 import { groupResourceId, resolveAssignedGroupIds } from "../retrieval/source-resolver.js";
 import { GroupHistoryPoller, type HistorySyncTarget } from "./history-poller.js";
+import { admitOneBotIncomingMessage, resolveOneBotExecutionSelection } from "./onebot-ingress.js";
 import {
   AuthorizedOpsService,
   type LongWorkRuntimePort,
@@ -596,7 +597,10 @@ export class ManagementApplication {
     this.evaluator = createRunEvaluator({ store, trace: this.trace });
     this.runs = new RunService({
       store,
-      queuedPollMs: options.temporal ? 2_000 : 0,
+      // Ingress persists a queued Run before it records all evidence and wakes the
+      // scheduler. Poll the durable queue in every mode so a missed in-memory wake
+      // cannot strand an accepted QQ message until the next process restart.
+      queuedPollMs: 2_000,
       resolveExecution: (reference) => this.execution(reference),
       beforeExecution: async (input) => {
         if (!hasQqLiveAcceptanceMarker(input.text)) return undefined;
@@ -2317,7 +2321,21 @@ export class ManagementApplication {
             runId: context.runId,
           };
           const authorizeRead = async (): Promise<string> => {
-            const current = this.resolveRunToolNames(context);
+            const membersDescriptor = TOOL_DESCRIPTORS.find(
+              (descriptor) => descriptor.name === members.tool,
+            );
+            const memberCandidate = membersDescriptor
+              ? (
+                  await this.resolveRunToolCandidates(
+                    {
+                      ...context,
+                      requiredEvidence: undefined,
+                      requiredToolName: undefined,
+                    },
+                    [membersDescriptor],
+                  )
+                )[0]
+              : undefined;
             const discovery = await this.store.authorization.check({
               caller,
               resourceId: toolResourceId(members.tool),
@@ -2326,7 +2344,8 @@ export class ManagementApplication {
               runId: context.runId,
             });
             if (
-              !(await current).includes(members.tool) ||
+              !memberCandidate ||
+              memberCandidate.exclusion !== null ||
               !(await this.isCategoryEnabled(
                 caller.scope.connectionId,
                 groupId,
@@ -2850,6 +2869,12 @@ export class ManagementApplication {
       }));
     const isOwner = await this.store.identities.isOwner(context.caller.principalId);
     const scope = context.caller.scope;
+    const requiredToolNames = new Set([
+      ...(context.requiredEvidence?.map((evidence) => evidence.tool) ?? []),
+      ...(context.requiredToolName ? [context.requiredToolName] : []),
+    ]);
+    const requestToolSelection =
+      !context.acceptanceLease && requiredToolNames.size > 0 ? requiredToolNames : undefined;
     const capabilityCategories =
       scope.chatType === "group"
         ? enabledCategories(
@@ -2867,6 +2892,7 @@ export class ManagementApplication {
     // discovery grant.
     const classified = new Set<string>();
     const scopeGates = new Map<string, ToolExclusionReason>();
+    const registeredNames = new Set(registered.map((descriptor) => descriptor.name));
     const classify = (
       entries: readonly {
         name: string;
@@ -2897,8 +2923,11 @@ export class ManagementApplication {
       [WEB_SEARCH_TOOL, "web.search"],
       [WEB_FETCH_TOOL, "web.fetch"],
     ] as const) {
+      if (!registeredNames.has(name)) continue;
       classified.add(name);
-      if (
+      if (requestToolSelection && !requestToolSelection.has(name)) {
+        scopeGates.set(name, "not_selected_for_request");
+      } else if (
         !(await this.isWebEnabled(
           {
             caller: context.caller,
@@ -2910,24 +2939,34 @@ export class ManagementApplication {
       )
         scopeGates.set(name, "policy_disabled");
     }
-    classified.add(BROWSER_TOOL);
-    const webContext = {
-      caller: context.caller,
-      conversationId: context.conversationId,
-      runId: context.runId,
-    };
-    if (
-      !(await this.isWebEnabled(webContext, "browser.read")) &&
-      !(await this.isWebEnabled(webContext, "browser.interact"))
-    )
-      scopeGates.set(BROWSER_TOOL, "policy_disabled");
+    if (registeredNames.has(BROWSER_TOOL)) {
+      classified.add(BROWSER_TOOL);
+      const webContext = {
+        caller: context.caller,
+        conversationId: context.conversationId,
+        runId: context.runId,
+      };
+      if (requestToolSelection && !requestToolSelection.has(BROWSER_TOOL)) {
+        scopeGates.set(BROWSER_TOOL, "not_selected_for_request");
+      } else if (
+        !(await this.isWebEnabled(webContext, "browser.read")) &&
+        !(await this.isWebEnabled(webContext, "browser.interact"))
+      )
+        scopeGates.set(BROWSER_TOOL, "policy_disabled");
+    }
 
     // The Agent Ops and Owner-control surface is Owner-private. A group Run reaches neither,
     // however the Owner's own grants look, so this is a scope boundary rather than a policy.
     const ownerPrivate = isOwner && scope.chatType === "private";
-    const selectedWorkspace = ownerPrivate
-      ? await this.workspaces.resolveSelected(context.caller.principalId).catch(() => null)
-      : null;
+    const requiredPiBuiltin = [...(requestToolSelection ?? [])].some((name) =>
+      GLASSBOX_HOST_EXCLUDED_PI_TOOLS.includes(name),
+    );
+    const selectedWorkspace =
+      ownerPrivate &&
+      registered.some((descriptor) => descriptor.origin === "pi_builtin") &&
+      (!requestToolSelection || requiredPiBuiltin)
+        ? await this.workspaces.resolveSelected(context.caller.principalId).catch(() => null)
+        : null;
     if (selectedWorkspace) context.workspaceId = selectedWorkspace.id;
     for (const name of OPS_TOOL_NAMES) {
       classified.add(name);
@@ -2943,13 +2982,29 @@ export class ManagementApplication {
     if (!ownerPrivate) scopeGates.set(MEDIA_GENERATION_TOOL, "scope_not_permitted");
     classified.add(SKILL_READ_TOOL);
     if (!context.authorizedSkillNames?.length) scopeGates.set(SKILL_READ_TOOL, "policy_disabled");
+    for (const descriptor of registered) {
+      if (descriptor.origin !== "pi_builtin") continue;
+      classified.add(descriptor.name);
+      if (!ownerPrivate) scopeGates.set(descriptor.name, "scope_not_permitted");
+    }
 
     const candidates: ToolSurfaceCandidate[] = [];
     for (const descriptor of registered) {
+      if (!classified.has(descriptor.name)) {
+        candidates.push({ name: descriptor.name, exclusion: "unclassified" });
+        continue;
+      }
+      const initialGate = scopeGates.get(descriptor.name);
+      if (initialGate !== undefined) {
+        candidates.push({ name: descriptor.name, exclusion: initialGate });
+        continue;
+      }
+      if (requestToolSelection && !requestToolSelection.has(descriptor.name)) {
+        candidates.push({ name: descriptor.name, exclusion: "not_selected_for_request" });
+        continue;
+      }
       if (descriptor.origin === "pi_builtin") {
-        classified.add(descriptor.name);
-        if (!ownerPrivate) scopeGates.set(descriptor.name, "scope_not_permitted");
-        else if (!this.sandboxRuntime?.availableTools.has(descriptor.name))
+        if (!this.sandboxRuntime?.availableTools.has(descriptor.name))
           scopeGates.set(descriptor.name, "backend_unavailable");
         else if (!selectedWorkspace) scopeGates.set(descriptor.name, "policy_disabled");
         else {
@@ -2979,12 +3034,6 @@ export class ManagementApplication {
             }
           }
         }
-      }
-      // A registered Tool no rule classified is a wiring bug. Withholding it keeps it out of
-      // the model's surface and makes the gap visible instead of silently offering it.
-      if (!classified.has(descriptor.name)) {
-        candidates.push({ name: descriptor.name, exclusion: "unclassified" });
-        continue;
       }
       const gate = scopeGates.get(descriptor.name);
       if (gate !== undefined) {
@@ -3870,49 +3919,21 @@ export class ManagementApplication {
         // Marker messages resolve only against an identity already trusted for this exact
         // incoming scope. Do not let normal visitor provisioning turn a marked message into
         // a caller before the lease is checked.
-        let caller = await this.store.identities.resolve(message.scope);
-        let leaseResolution:
-          | { kind: "ordinary" }
-          | { kind: "denied"; reason: string }
-          | {
-              kind: "acceptance";
-              leaseId: string;
-              marker: string;
-              toolsSha256: string;
-            } = {
-          kind: "ordinary",
-        };
-        if (hasQqLiveAcceptanceMarker(message.text)) {
-          leaseResolution = caller
-            ? this.qqLiveLeases.resolveInbound({
-                principalId: caller.principalId,
-                scope: message.scope,
-                messageId: message.messageId,
-                text: message.text,
-              })
-            : { kind: "denied", reason: "lease_unavailable" };
-          if (leaseResolution.kind !== "acceptance") {
-            await appendQqLiveAcceptanceAudit(this.options.dataDirectory, {
-              event: "message_denied",
-              messageId: message.messageId,
-              scope: message.scope,
-              ...(caller ? { principalId: caller.principalId } : {}),
-              reason:
-                leaseResolution.kind === "denied"
-                  ? leaseResolution.reason
-                  : "marker_resolution_failed",
-            }).catch(() => undefined);
-            return;
-          }
-        }
-        if (message.scope.chatType === "group") {
-          // Group assignments can change while the socket stays connected. Resolve the
-          // current profile instead of preserving the connect-time allowlist in this closure.
-          if (leaseResolution.kind === "ordinary") {
-            await this.provisionAddressedGroupMember(this.channels.resolve(id), message.scope);
-            caller = await this.store.identities.resolve(message.scope);
-          }
-        }
+        const admission = await admitOneBotIncomingMessage(message, {
+          resolveCaller: (scope) => this.store.identities.resolve(scope),
+          hasAcceptanceMarker: hasQqLiveAcceptanceMarker,
+          resolveAcceptance: (input) => this.qqLiveLeases.resolveInbound(input),
+          auditDenied: (record) => appendQqLiveAcceptanceAudit(this.options.dataDirectory, record),
+          // Resolve the latest group profile because assignments can change while the
+          // OneBot connection stays open.
+          provisionAddressedGroupMember: (scope) =>
+            this.provisionAddressedGroupMember(this.channels.resolve(id), scope),
+        });
+        if (!admission) return;
+        const caller = admission.caller;
+        const leaseResolution = admission.leaseResolution;
+        const scope = admission.scope;
+        const messageId = admission.messageId;
         const hasImage = message.parts.some((part) => part.type === "image");
         const control =
           hasImage || leaseResolution.kind !== "ordinary"
@@ -3931,22 +3952,21 @@ export class ManagementApplication {
           return;
         }
         const channelSelection = this.channels.resolve(id);
-        const executionKind = /^(pi|model):/u.exec(configured.executionRef)?.[1];
-        const ownerPrivate =
-          message.scope.chatType === "private" &&
-          message.scope.senderId === configured.config.ownerId;
-        const runExecutionRef =
-          ownerPrivate && channelSelection.modelOverrideProfileId && executionKind
-            ? `${executionKind}:${channelSelection.modelOverrideProfileId}`
-            : configured.executionRef;
+        const executionSelection = resolveOneBotExecutionSelection({
+          scope,
+          ownerId: configured.config.ownerId,
+          configuredExecutionRef: configured.executionRef,
+          modelOverrideProfileId: channelSelection.modelOverrideProfileId,
+        });
+        const runExecutionRef = executionSelection.executionRef;
         if (
           leaseResolution.kind === "acceptance" &&
           !this.supportsQqLiveLeaseExecution(runExecutionRef)
         ) {
           await appendQqLiveAcceptanceAudit(this.options.dataDirectory, {
             event: "message_denied",
-            messageId: message.messageId,
-            scope: message.scope,
+            messageId,
+            scope,
             ...(caller ? { principalId: caller.principalId } : {}),
             leaseId: leaseResolution.leaseId,
             reason: "unsupported_execution_backend",
@@ -3984,12 +4004,12 @@ export class ManagementApplication {
         if (imageFailureCode) images.length = 0;
         const incoming: StoredIncomingMessage = {
           agentId: AGENT_ID,
-          scope: message.scope,
-          messageId: message.messageId,
+          scope,
+          messageId,
           text: message.text || (hasImage ? "请描述这张图片。" : ""),
           executionRef: runExecutionRef,
-          ...(ownerPrivate && channelSelection.modelOverrideProfileId && executionKind
-            ? { channelDefaultExecutionRef: configured.executionRef }
+          ...(executionSelection.channelDefaultExecutionRef
+            ? { channelDefaultExecutionRef: executionSelection.channelDefaultExecutionRef }
             : {}),
           ...(imageFailureCode ? { imageFailureCode } : images.length > 0 ? { images } : {}),
         };
@@ -3997,8 +4017,8 @@ export class ManagementApplication {
           leaseResolution.kind === "acceptance" && caller
             ? this.reserveQqLiveAcceptanceHandoff({
                 principalId: caller.principalId,
-                scope: message.scope,
-                messageId: message.messageId,
+                scope,
+                messageId,
                 leaseId: leaseResolution.leaseId,
                 textSha256: canonicalQqLiveTextSha256(message.text),
               })
@@ -4006,8 +4026,8 @@ export class ManagementApplication {
         if (leaseResolution.kind === "acceptance" && !acceptanceHandoff) {
           await appendQqLiveAcceptanceAudit(this.options.dataDirectory, {
             event: "message_denied",
-            messageId: message.messageId,
-            scope: message.scope,
+            messageId,
+            scope,
             ...(caller ? { principalId: caller.principalId } : {}),
             leaseId: leaseResolution.leaseId,
             reason: "run_handoff_unavailable",
@@ -4026,8 +4046,8 @@ export class ManagementApplication {
             const binding: QqLiveLeaseBinding = {
               leaseId: leaseResolution.leaseId,
               principalId: accepted.caller.principalId,
-              scope: message.scope,
-              messageId: message.messageId,
+              scope,
+              messageId,
               runId: accepted.run.id,
             };
             if (this.qqLiveLeases.bindRun(binding)) {
@@ -4036,8 +4056,8 @@ export class ManagementApplication {
               try {
                 await appendQqLiveAcceptanceAudit(this.options.dataDirectory, {
                   event: "run_bound",
-                  messageId: message.messageId,
-                  scope: message.scope,
+                  messageId,
+                  scope,
                   principalId: accepted.caller.principalId,
                   leaseId: leaseResolution.leaseId,
                   runId: accepted.run.id,
@@ -4074,8 +4094,8 @@ export class ManagementApplication {
             } else {
               await appendQqLiveAcceptanceAudit(this.options.dataDirectory, {
                 event: "message_denied",
-                messageId: message.messageId,
-                scope: message.scope,
+                messageId,
+                scope,
                 principalId: accepted.caller.principalId,
                 leaseId: leaseResolution.leaseId,
                 reason: "run_binding_failed",
@@ -4087,7 +4107,7 @@ export class ManagementApplication {
           // in the run's own file, and the run's own file is the only place the message text is
           // available to correlate.
           if (!accepted.duplicate) await this.runs.recordMessageReceived(incoming, accepted.run);
-          if (!accepted.duplicate && message.scope.nativeGroupRole) {
+          if (!accepted.duplicate && scope.nativeGroupRole) {
             const cursor = await this.trace.append(
               accepted.run.id,
               {
@@ -4095,12 +4115,12 @@ export class ManagementApplication {
                 runId: accepted.run.id,
                 conversationId: accepted.conversation.id,
                 principalId: accepted.caller.principalId,
-                resourceId: groupResourceId(message.scope.chatId),
-                groupId: message.scope.chatId,
-                senderId: message.scope.senderId,
-                observedRole: message.scope.nativeGroupRole.role,
-                roleSource: message.scope.nativeGroupRole.source,
-                observedAt: message.scope.nativeGroupRole.observedAt,
+                resourceId: groupResourceId(scope.chatId),
+                groupId: scope.chatId,
+                senderId: scope.senderId,
+                observedRole: scope.nativeGroupRole.role,
+                roleSource: scope.nativeGroupRole.source,
+                observedAt: scope.nativeGroupRole.observedAt,
               },
               "glassbox-qq-role",
             );

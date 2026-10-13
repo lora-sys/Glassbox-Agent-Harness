@@ -1,3 +1,4 @@
+// test-contract-change: PR-142 Pi adapter tests verify request budgets and normalized event evidence
 import { parseRuntimeReplies } from "../../config/runtime-replies.js";
 import { mkdtemp, rm } from "node:fs/promises";
 import { createHash } from "node:crypto";
@@ -1765,6 +1766,8 @@ describe("PiSdkRuntimeAdapter", () => {
     await adapter.run(binding, run, "say hello", context);
 
     expect(surface).toBeDefined();
+    expect(sessionEvidence?.toolDiscoveryDurationMs).toEqual(expect.any(Number));
+    expect(Number.isFinite(sessionEvidence?.toolDiscoveryDurationMs)).toBe(true);
     const schemaEvidence = sessionEvidence?.toolSchemaEvidence as ReturnType<
       typeof toolSchemaEvidence
     >;

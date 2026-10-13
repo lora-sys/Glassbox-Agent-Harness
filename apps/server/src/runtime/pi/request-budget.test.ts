@@ -32,6 +32,7 @@ function demand(overrides: Partial<ContextDemandEstimate> = {}): ContextDemandEs
 }
 
 describe("Pi request capacity", () => {
+  // test-contract-change: ISSUE-194 assert centralized static and dynamic policy versions.
   it("preserves the static reserve for models whose combined reserve is below the window", () => {
     const base: ModelCapacity = {
       contextWindowTokens: 256_000,
@@ -42,16 +43,18 @@ describe("Pi request capacity", () => {
     const result = deriveRequestCapacity(base, demand(), null);
     expect(result).toMatchObject({
       ok: true,
-      budget: { dynamic: false, capacity: base },
+      budget: { dynamic: false, capacity: base, policyVersion: "p5a-context-v1" },
     });
   });
 
+  // test-contract-change: ISSUE-194 assert centralized static and dynamic policy versions.
   it("derives a split request reserve from full current input without mutating the model ceiling", () => {
     const base = { ...equal256kCapacity };
     const result = deriveRequestCapacity(base, demand(), "medium");
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     const derived = result.budget.capacity;
+    expect(result.budget.policyVersion).toBe("p5a-pi-dynamic-output-v1");
     expect(result.budget.fullInputDemandTokens).toBe(72_000);
     expect(derived.outputReserveTokens + derived.thinkingReserveTokens).toBe(
       256_000 - 4_096 - 72_000,

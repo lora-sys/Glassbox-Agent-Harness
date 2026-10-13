@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { sanitizedGitEnvironment } from "./git-environment.mjs";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
@@ -88,7 +89,10 @@ if (!lockedRouterVersion || tanstackConfig.targetVersion !== lockedRouterVersion
   fail("TanStack Router targetVersion must match the locked @tanstack/react-start version.");
 }
 
-const trackedPaths = execFileSync("git", ["ls-files", "-z"], { encoding: "utf8" })
+const trackedPaths = execFileSync("git", ["ls-files", "-z"], {
+  encoding: "utf8",
+  env: sanitizedGitEnvironment(),
+})
   .split("\0")
   .filter(Boolean)
   .map((path) => path.replaceAll("\\", "/"));

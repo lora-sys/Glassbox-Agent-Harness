@@ -5,8 +5,10 @@ import type { CallerContext } from "../../identity/scope.js";
 import { ProviderCallError } from "./provider-outcome.js";
 import { authorizationProjectionResult } from "./authorization-projection.js";
 import { safeToolOutput } from "./tool-output-evidence.js";
+import type { PiRunContext } from "./types.js";
 import {
   createProtectedTool,
+  createProtectedToolContextProvider,
   requiredCallClause,
   toolGateFailureCode,
   ToolInputError,
@@ -28,6 +30,49 @@ const caller: CallerContext = {
 const allowAll = {
   check: vi.fn(async () => ({ decision: "ALLOW" as const, reason: "granted" })),
 } as unknown as AuthorizationService;
+
+describe("createProtectedToolContextProvider", () => {
+  it("projects the current caller and message-bound fields without caching prior Run state", () => {
+    const acceptanceLease: NonNullable<PiRunContext["acceptanceLease"]> = {
+      leaseId: "lease-1",
+      marker: "marker-1",
+      toolsSha256: "0".repeat(64),
+      assertActive: () => true,
+      filterToolNames: (names) => [...names],
+      getToolInputRestrictions: () => [],
+      checkToolCall: () => true,
+    };
+    let current: PiRunContext = {
+      caller,
+      conversationId: "conversation-1",
+      runId: "run-1",
+      acceptanceLease,
+      requiredToolName: "owner_group_admin",
+      requiredToolInput: { action: "get", groupId: "group-1" },
+    };
+    const getContext = createProtectedToolContextProvider(() => current);
+
+    expect(getContext()).toEqual({
+      caller,
+      conversationId: "conversation-1",
+      runId: "run-1",
+      acceptanceLease,
+      requiredToolName: "owner_group_admin",
+      requiredToolInput: { action: "get", groupId: "group-1" },
+    });
+
+    current = { ...current, runId: "run-2" };
+    expect(getContext()).toMatchObject({ runId: "run-2" });
+  });
+
+  it.each([
+    { conversationId: "conversation-1", runId: "run-1" },
+    { caller, runId: "run-1" },
+    { caller, conversationId: "conversation-1" },
+  ] satisfies PiRunContext[])("requires caller, conversation, and Run identity", (context) => {
+    expect(createProtectedToolContextProvider(() => context)()).toBeUndefined();
+  });
+});
 
 function tool(
   execute: (params: Record<string, unknown>, context: ProtectedToolContext) => Promise<unknown>,

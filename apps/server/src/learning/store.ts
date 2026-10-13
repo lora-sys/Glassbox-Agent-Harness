@@ -333,6 +333,37 @@ function deepMerge(
   return result;
 }
 
+export interface MemoryContextSelection {
+  memories: CanonicalMemory[];
+  candidateCount: number;
+  scannedCount: number;
+  scanLimit: number;
+  truncated: boolean;
+}
+
+export type MemoryContextSelectionOptions = {
+  candidateLimit?: number;
+  scanLimit?: number;
+};
+
+function memoryContextSelectionLimits(
+  options: MemoryContextSelectionOptions,
+  defaults: { candidateLimit: number; scanLimit: number },
+): { candidateLimit: number; scanLimit: number } {
+  const candidateLimit = options.candidateLimit ?? defaults.candidateLimit;
+  const scanLimit = options.scanLimit ?? defaults.scanLimit;
+  if (
+    !Number.isInteger(candidateLimit) ||
+    candidateLimit < 1 ||
+    candidateLimit > 256 ||
+    !Number.isInteger(scanLimit) ||
+    scanLimit < 1 ||
+    scanLimit > 512
+  )
+    throw new Error("Invalid memory context scan limits");
+  return { candidateLimit, scanLimit };
+}
+
 export class LearningStore {
   constructor(
     private readonly db: DomainDatabase,
@@ -354,7 +385,13 @@ export class LearningStore {
         if (decision && decision.decision !== "ALLOW")
           throw new MemorySourceDeniedError(decision, request);
         const value = await operation(tx);
-        const records: unknown[] = Array.isArray(value) ? value : [value];
+        const containedMemories =
+          value && typeof value === "object" && "memories" in value ? value.memories : undefined;
+        const records: unknown[] = Array.isArray(value)
+          ? value
+          : Array.isArray(containedMemories)
+            ? containedMemories
+            : [value];
         // The current Run still depends on the Owner collection gate, but this read
         // does not make already-public group content private for future derivation.
         // Underlying QQ sources remain independently constrained.
@@ -377,9 +414,7 @@ export class LearningStore {
           decision &&
           context.runId &&
           classifyProtectedReadAction(action, undefined) === "content_source" &&
-          value !== null &&
-          value !== undefined &&
-          (!Array.isArray(value) || value.length > 0)
+          records.length > 0
         )
           await tx.execute({
             sql: "UPDATE authorization_decisions SET delivery_source = ? WHERE id = ?",
@@ -886,6 +921,112 @@ export class LearningStore {
       },
       groupResourceId,
     );
+  }
+
+  /** Bounded Owner-global candidate scan for ordinary Run Context. */
+  async listGlobalMemoryContextCandidates(
+    context: LearningOperationContext,
+    options: MemoryContextSelectionOptions = {},
+  ): Promise<MemoryContextSelection> {
+    const limits = memoryContextSelectionLimits(options, {
+      candidateLimit: 128,
+      scanLimit: 256,
+    });
+    const scope = { type: "global" as const };
+    await this.authorize(context, MEMORY_READ_ACTION);
+    return this.sourceTransaction(context, MEMORY_READ_ACTION, (tx) =>
+      this.scanMemoryContextCandidates(tx, context, {
+        clauses: [
+          "scope_json = ?",
+          "lifecycle_state = 'active'",
+          "(expires_at IS NULL OR expires_at > ?)",
+        ],
+        args: [json(scope), new Date().toISOString()],
+        resourceId: OWNER_MEMORY_RESOURCE,
+        ...limits,
+      }),
+    );
+  }
+
+  /** Bounded exact-scope public candidate scan for group Run Context. */
+  async listGroupMemoryContextCandidates(
+    context: LearningOperationContext,
+    groupResourceId: string,
+    scope: Extract<GlassboxMemoryScope, { type: "group" }>,
+    options: MemoryContextSelectionOptions = {},
+  ): Promise<MemoryContextSelection> {
+    validateCurrentGroupScope(context, groupResourceId, scope);
+    const limits = memoryContextSelectionLimits(options, {
+      candidateLimit: 64,
+      scanLimit: 128,
+    });
+    await this.authorizeResource(context, groupResourceId, GROUP_MEMORY_READ_ACTION);
+    return this.sourceTransaction(
+      context,
+      GROUP_MEMORY_READ_ACTION,
+      (tx) =>
+        this.scanMemoryContextCandidates(tx, context, {
+          clauses: [
+            "scope_json = ?",
+            "lifecycle_state = 'active'",
+            "sensitivity = 'public'",
+            "(expires_at IS NULL OR expires_at > ?)",
+          ],
+          args: [json(scope), new Date().toISOString()],
+          resourceId: groupResourceId,
+          ...limits,
+        }),
+      groupResourceId,
+    );
+  }
+
+  private async scanMemoryContextCandidates(
+    tx: Transaction,
+    context: LearningOperationContext,
+    options: {
+      clauses: string[];
+      args: Array<string | number>;
+      resourceId: string;
+      candidateLimit: number;
+      scanLimit: number;
+    },
+  ): Promise<MemoryContextSelection> {
+    const rows = (
+      await tx.execute({
+        sql:
+          "SELECT id FROM memories WHERE " +
+          options.clauses.join(" AND ") +
+          " ORDER BY updated_at DESC, id ASC LIMIT ?",
+        args: [...options.args, options.scanLimit + 1],
+      })
+    ).rows;
+    const memories: CanonicalMemory[] = [];
+    let scannedCount = 0;
+    let truncated = rows.length > options.scanLimit;
+    for (const row of rows.slice(0, options.scanLimit)) {
+      scannedCount += 1;
+      const id = stringColumn(row, "id");
+      if (!(await this.visibleSources(tx, context, { kind: "memory", id }, options.resourceId)))
+        continue;
+      const body = await tx.execute({
+        sql: "SELECT * FROM memories WHERE id = ?",
+        args: [id],
+      });
+      const memory = body.rows[0] ? memoryFromRow(body.rows[0]) : undefined;
+      if (!memory) continue;
+      memories.push(memory);
+      if (memories.length >= options.candidateLimit) {
+        truncated = rows.length > scannedCount;
+        break;
+      }
+    }
+    return {
+      memories,
+      candidateCount: memories.length,
+      scannedCount,
+      scanLimit: options.scanLimit,
+      truncated,
+    };
   }
 
   /** Last check after asynchronous prompt preparation and before provider exposure. */

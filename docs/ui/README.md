@@ -139,7 +139,7 @@ All pages must be composed exclusively from the primitives cataloged in [`UI_PRI
 - `DetailRail`: Sliding/stacking context panel with close button, ESC key handler, and focus restoration.
 - `SummaryBar`: Compact KPI and key summary strips (not giant decorative cards).
 - `EntityMark` & `Status`: Semantic entity badges and state indicators with distinct text and color.
-- `PrimaryButton`, `SecondaryButton`, `DangerButton`: High-contrast, keyboard-accessible action buttons.
+- Primary, secondary, and danger button roles define appearance and destructive-action semantics. They are design guidance; management pages do not currently share React button components.
 - `Tabs`: Accessible tab navigation with URL query parameter synchronization.
 - `SettingsGroup`: Native form field grouping with semantic labels.
 - `MasterDetail`, `TraceRunList`, `TraceEvent`, `TraceInspector`: Trace viewing and inspection primitives.

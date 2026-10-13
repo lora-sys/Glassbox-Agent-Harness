@@ -1,3 +1,4 @@
+// test-contract-change: ISSUE-194 compares full AST test contracts including one-line changes
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -6,6 +7,7 @@ import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { inspectTestDiff } from "../check-test-hygiene.mjs";
+import { inspectTestSources } from "../test-integrity.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, "../..");
@@ -46,21 +48,88 @@ test("the exact PR 142 test diff above 1 MiB is checked without truncation", asy
     maxBuffer,
     env: { ...process.env, GITHUB_EVENT_PATH: eventPath },
   });
-  assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /Test hygiene checks passed for 88 changed test paths/u);
+  assert.equal(result.status, 1, result.stderr);
+  const output = result.stdout + result.stderr;
+  assert.match(output, /Test hygiene checks failed/u);
+  assert.match(output, /records a private message dropped while the connection is not ready/u);
+  assert.match(output, /persists the birth token when starting a new service/u);
+  assert.match(output, /Pi session boundary/u);
+  assert.match(output, /declared capacities/u);
 });
 
 test("large diff tail still rejects a disabled marker and removed declaration", () => {
-  const testSkipMarker = ["test", "skip"].join(".");
-  const diff = [
-    `-${"x".repeat(1_058_500)}`,
-    '-test("removed declaration", () => {});',
-    `+const lateDisabled = ${testSkipMarker}("late disabled test", () => {});`,
-  ].join("\n");
-  assert.ok(Buffer.byteLength(diff, "utf8") > 1024 * 1024);
-  const result = inspectTestDiff("M\tfixture.test.mjs\n", diff);
+  const padding = "/*" + "x".repeat(1_058_500) + "*/";
+  const oldSource = padding + 'test("removed declaration", () => {});';
+  const newSource = padding + 'test.skip("late disabled test", () => {});';
+  const result = inspectTestDiff("M", "", [{ path: "fixture.test.mjs", oldSource, newSource }]);
+  assert.ok(Buffer.byteLength(newSource, "utf8") > 1024 * 1024);
   assert.equal(result.disabledTest, true);
   assert.equal(result.removedDeclarations, 1);
-  assert.equal(result.addedDeclarations, 0);
-  assert.deepEqual(result.errors, ["disabled-tests", "reduced-test-declarations"]);
+  assert.equal(result.addedDeclarations, 1);
+  assert.deepEqual(result.errors, ["disabled-tests", "reduced-test-coverage"]);
+});
+
+test("AST comparison rejects a same-line test deletion and assertion weakening", () => {
+  const removed = inspectTestSources([
+    {
+      path: "fixture.test.mjs",
+      oldSource:
+        'test("first", () => assert.equal(actual, expected)); test("second", () => assert.ok(done));',
+      newSource: 'test("second", () => assert.ok(done));',
+    },
+  ]);
+  assert.ok(removed.errors.includes("reduced-test-coverage"));
+  assert.deepEqual(removed.deletedTests, ["first"]);
+
+  const weakened = inspectTestSources([
+    {
+      path: "fixture.test.mjs",
+      oldSource: 'test("keeps the result check", () => assert.equal(actual, expected));',
+      newSource: 'test("keeps the result check", () => assert.ok(true));',
+    },
+  ]);
+  assert.ok(weakened.errors.includes("always-passing-assertions"));
+  assert.ok(weakened.errors.some((error) => error.startsWith('Test "keeps the result check"')));
+});
+
+test("AST comparison permits intentional assertion changes only with a review marker", () => {
+  const result = inspectTestSources([
+    {
+      path: "fixture.test.mjs",
+      oldSource: 'test("contract", () => assert.equal(actual, "old"));',
+      newSource:
+        '// test-contract-change: GH-194 new response contract\ntest("contract", () => assert.equal(actual, "new"));',
+    },
+  ]);
+  assert.deepEqual(result.errors, []);
+  assert.match(result.warnings[0], /manual review required/u);
+});
+
+test("AST comparison permits only exact one-to-one reviewed test replacements", () => {
+  const result = inspectTestSources([
+    {
+      path: "fixture.test.mjs",
+      oldSource: 'test("old behavior", () => assert.equal(attempts, 3));',
+      newSource:
+        "// test-contract-change: GH-194 send outcomes stay unknown\n" +
+        '// test-contract-replacement: "old behavior" => "preserves unknown outcome"\n' +
+        'test("preserves unknown outcome", () => assert.equal(attempts, 1));',
+    },
+  ]);
+  assert.deepEqual(result.errors, []);
+  assert.deepEqual(result.deletedTests, []);
+  assert.match(result.warnings[0], /replaced with "preserves unknown outcome"/u);
+
+  const invalid = inspectTestSources([
+    {
+      path: "fixture.test.mjs",
+      oldSource: 'test("old behavior", () => assert.equal(attempts, 3));',
+      newSource:
+        "// test-contract-change: GH-194 send outcomes stay unknown\n" +
+        '// test-contract-replacement: "old behavior" => "missing replacement"\n' +
+        'test("preserves unknown outcome", () => assert.equal(attempts, 1));',
+    },
+  ]);
+  assert.ok(invalid.errors.includes("invalid-test-replacement"));
+  assert.ok(invalid.errors.includes("reduced-test-coverage"));
 });

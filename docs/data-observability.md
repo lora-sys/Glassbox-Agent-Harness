@@ -392,6 +392,8 @@ unobserved execution state remains unknown.
 
 QQ result delivery applies a content gate before it creates a Delivery. The gate checks the raw model candidate, renders QQ plain text, and checks the rendered text again. A blocked candidate creates no Delivery and is excluded from later model Context.
 
+For an unconfirmed transport outcome, RunService retries the same immutable Delivery after one and three seconds by default. It rechecks the delivery authorization before each retry and stops if authority changes or the service stops. Deployments may configure up to five retries. It never retries a platform-confirmed failure, an unclassified response, or the local `delivery_timeout`, because the original send may still be running. Exhausted retries settle as `unknown` and create Owner attention with the outcome and attempt count. Reusing the Delivery ID preserves trace correlation but does not guarantee that QQ will deduplicate a message accepted before a lost response.
+
 An allowed authorization decision becomes a delivery source only after its protected read actually returns. The decision stores the source class. Before initial delivery and every retry, Glassbox rechecks the original read Action against current authority. A content source also requires a separate `delivery:send` decision for that Resource. Protected search gates are rechecked as Actions; concrete search results retain their own content-source decisions. The same source checks apply before an earlier answer enters a later Run's Context. Older decisions retain conservative legacy source classes after database migration.
 
 The append-only delivery_blocked event stores reason codes, candidate byte count and a SHA-256 digest. It does not store the blocked candidate in that event. The original protected Run result remains subject to its existing database and authorization boundary.
@@ -562,9 +564,11 @@ and the relevant identifiers, expiry, scope hash or fixed denial reason. They do
 message bodies, credentials or Tool inputs. A restriction is not an authorization grant, so
 these entries do not create grant/revoke product evidence.
 
-Run Raw Trace remains append-only. `session_start` records the applicable lease identity and
-final narrowed Tool names. The acceptance observer reads Raw Trace through gbxtrace, matches
-the exact scoped input and delivery, and correlates Tool call/result identifiers in that Run.
+Run Raw Trace remains append-only. `session_start` records the applicable lease identity, final
+narrowed Tool names, and `toolDiscoveryDurationMs`, the elapsed time spent resolving the Run's
+Tool candidates before the Pi session starts. This field excludes provider response time and
+session creation. The acceptance observer reads Raw Trace through gbxtrace, matches the exact
+scoped input and delivery, and correlates Tool call/result identifiers in that Run.
 Independent state checks use fixed read-only queries for explicitly identified acceptance
 resources and their Run provenance. Arbitrary queries and scripts are not acceptance observers.
 

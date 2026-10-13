@@ -4,8 +4,17 @@ import {
 } from "@earendil-works/pi-ai/api/simple-options";
 import type { ContextDemandEstimate, ModelCapacity } from "../../efficiency/index.js";
 
+export const REQUEST_CAPACITY_POLICY_VERSION = {
+  static: "p5a-context-v1",
+  dynamic: "p5a-pi-dynamic-output-v1",
+} as const;
+
+export type RequestCapacityPolicyVersion =
+  (typeof REQUEST_CAPACITY_POLICY_VERSION)[keyof typeof REQUEST_CAPACITY_POLICY_VERSION];
+
 export interface RequestCapacityBudget {
   capacity: ModelCapacity;
+  policyVersion: RequestCapacityPolicyVersion;
   dynamic: boolean;
   fullInputDemandTokens: number;
   minimumOutputTokens: number;
@@ -66,6 +75,7 @@ export function deriveRequestCapacity(
       ok: true,
       budget: {
         capacity: baseCapacity,
+        policyVersion: REQUEST_CAPACITY_POLICY_VERSION.static,
         dynamic: false,
         fullInputDemandTokens: fullInputTokens,
         minimumOutputTokens: MIN_ANSWER_TOKENS,
@@ -102,6 +112,7 @@ export function deriveRequestCapacity(
     ok: true,
     budget: {
       capacity,
+      policyVersion: REQUEST_CAPACITY_POLICY_VERSION.dynamic,
       dynamic: true,
       fullInputDemandTokens: fullInputTokens,
       minimumOutputTokens,

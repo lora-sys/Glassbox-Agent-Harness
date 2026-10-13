@@ -1,5 +1,6 @@
 import { expect, it } from "vite-plus/test";
 import { AccessDeniedError, openDomainStore, type CallerContext } from "../persistence/index.js";
+import { scopeKey } from "../identity/scope.js";
 import { FakeHerdrBridge } from "./fake-herdr-bridge.js";
 import { AuthorizedOpsService } from "./service.js";
 
@@ -57,7 +58,17 @@ it("returns caller-visible Ops health using durable acceptance and explicit Herd
       agentKind: "test",
     });
     await store.tasks.observeWorker(acceptedWorker, "done");
-    await store.tasks.acceptTask(acceptedTask.id, caller.principalId);
+    await grant(store, `task-${acceptedTask.id}`, "task:accept");
+    const acceptance = await store.authorization.check({
+      caller,
+      resourceId: `task-${acceptedTask.id}`,
+      action: "task:accept",
+    });
+    await store.tasks.acceptTask(acceptedTask.id, {
+      decisionId: acceptance.id,
+      actorPrincipalId: caller.principalId,
+      scopeKey: scopeKey(caller.scope),
+    });
     await grant(store, `task-${acceptedTask.id}`, "task:read");
 
     const reviewTask = await store.tasks.createTask({

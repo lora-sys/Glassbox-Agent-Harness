@@ -243,7 +243,7 @@ describe("4. Real Route Construction & Headers", () => {
   it("constructs correct /manage/ws-ticket request and parses ticket", async () => {
     let capturedBody = "";
 
-    const fetchMock = vi.fn().mockImplementation((url, init) => {
+    const fetchMock = vi.fn().mockImplementation((_url, init) => {
       capturedBody = init?.body;
       return Promise.resolve({
         status: 200,

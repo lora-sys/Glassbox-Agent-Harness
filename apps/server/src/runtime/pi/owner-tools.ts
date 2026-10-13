@@ -11,6 +11,7 @@ import { WEB_CAPABILITIES, type WebCapability } from "../../management/web-capab
 import {
   consumeMutationIntent,
   createProtectedTool,
+  createProtectedToolContextProvider,
   type ProtectedToolContext,
 } from "./protected-tools.js";
 import type { PiRunContext } from "./types.js";
@@ -107,23 +108,7 @@ export function createOwnerTools(options: {
   getContext: () => PiRunContext | undefined;
   manageGroup: (context: ProtectedToolContext, input: OwnerGroupAdminInput) => Promise<unknown>;
 }): ToolDefinition[] {
-  const getContext = (): ProtectedToolContext | undefined => {
-    const value = options.getContext();
-    return value?.caller && value.conversationId && value.runId
-      ? {
-          caller: value.caller,
-          conversationId: value.conversationId,
-          runId: value.runId,
-          ...(value.acceptanceLease ? { acceptanceLease: value.acceptanceLease } : {}),
-          ...(value.requiredToolName === undefined
-            ? {}
-            : { requiredToolName: value.requiredToolName }),
-          ...(value.requiredToolInput === undefined
-            ? {}
-            : { requiredToolInput: value.requiredToolInput }),
-        }
-      : undefined;
-  };
+  const getContext = createProtectedToolContextProvider(options.getContext);
   return [
     createProtectedTool<OwnerGroupAdminToolInput>({
       name: OWNER_GROUP_ADMIN_TOOL,

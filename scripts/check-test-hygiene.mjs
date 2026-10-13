@@ -2,6 +2,8 @@ import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { sanitizedGitEnvironment } from "./git-environment.mjs";
+import { inspectTestSources } from "./test-integrity.mjs";
 
 const MAX_GIT_OUTPUT_BYTES = 8 * 1024 * 1024;
 const TEST_PATHS = [
@@ -11,43 +13,40 @@ const TEST_PATHS = [
   "apps/server/src/management/application-*-cases.ts",
 ];
 
-export function inspectTestDiff(entriesText, diff) {
+export function inspectTestDiff(entriesText, _diff, sourcePairs = []) {
   const entries = entriesText
-    .split(/\r?\n/)
+    .split(/\r?\n/u)
     .filter(Boolean)
     .map((line) => line.split("\t"));
   const deletedTests = entries.filter(([status]) => status.startsWith("D"));
-  const addedLines = [];
-  const removedLines = [];
-  for (const line of diff.split(/\r?\n/)) {
-    if (line.startsWith("+") && !line.startsWith("+++")) addedLines.push(line.slice(1));
-    if (line.startsWith("-") && !line.startsWith("---")) removedLines.push(line.slice(1));
-  }
-  const disabledTest = addedLines.some((line) =>
-    /(?:describe|it|test)\.(?:skip|only)|\.skipIf\(|\.todo\(/.test(line),
-  );
-  const testDeclaration = /^\s*(?:describe|it|test)(?:\.\w+)?\s*\(/;
-  const removedDeclarations = removedLines.filter((line) => testDeclaration.test(line)).length;
-  const addedDeclarations = addedLines.filter((line) => testDeclaration.test(line)).length;
+  const integrity = inspectTestSources(sourcePairs);
   const errors = [];
   if (deletedTests.length > 0) errors.push("deleted-tests");
-  if (disabledTest) errors.push("disabled-tests");
-  if (removedDeclarations > addedDeclarations) errors.push("reduced-test-declarations");
+  if (integrity.disabled.length > 0) errors.push("disabled-tests");
+  if (integrity.alwaysPassing.length > 0) errors.push("always-passing-assertions");
+  if (integrity.parseErrors.length > 0) errors.push("test-parse-errors");
+  if (integrity.errors.includes("reduced-test-coverage")) errors.push("reduced-test-coverage");
+  if (integrity.errors.includes("invalid-test-replacement"))
+    errors.push("invalid-test-replacement");
+  errors.push(...integrity.errors.filter((error) => error.startsWith('Test "')));
   return {
     entries,
     deletedTests,
-    addedDeclarations,
-    removedDeclarations,
-    disabledTest,
+    addedDeclarations: integrity.afterCount,
+    removedDeclarations: integrity.deletedTests.length,
+    disabledTest: integrity.disabled.length > 0,
+    alwaysPassing: integrity.alwaysPassing,
+    parseErrors: integrity.parseErrors,
+    warnings: integrity.warnings,
     errors,
   };
 }
-
 function git(args) {
   try {
     return execFileSync("git", args, {
       encoding: "utf8",
       maxBuffer: MAX_GIT_OUTPUT_BYTES,
+      env: sanitizedGitEnvironment(),
     });
   } catch (error) {
     if (error?.code === "ENOBUFS") {
@@ -73,18 +72,36 @@ function main() {
 
   const range = `${base}...${head}`;
   const entriesText = git(["diff", "--find-renames", "--name-status", range, "--", ...TEST_PATHS]);
-  const diff = git(["diff", "--unified=0", range, "--", ...TEST_PATHS]);
-  const result = inspectTestDiff(entriesText, diff);
+  const entries = entriesText
+    .split(/\r?\n/u)
+    .filter(Boolean)
+    .map((line) => line.split("\t"));
+  const sourcePairs = entries.map(([status, oldPath, newPath]) => {
+    const from = status.startsWith("A") ? undefined : oldPath;
+    const to = status.startsWith("D") ? undefined : (newPath ?? oldPath);
+    return {
+      oldPath: from,
+      newPath: to,
+      oldSource: from ? git(["show", base + ":" + from]) : undefined,
+      newSource: to ? git(["show", head + ":" + to]) : undefined,
+    };
+  });
+  const result = inspectTestDiff(entriesText, "", sourcePairs);
   if (result.errors.length > 0) {
     console.error("Test hygiene checks failed:");
     for (const [status, ...paths] of result.deletedTests)
       console.error(`- Test files cannot be deleted: ${status} ${paths.join(" -> ")}`);
     if (result.disabledTest) console.error("- Tests cannot be skipped, isolated, or marked todo.");
-    if (result.errors.includes("reduced-test-declarations")) {
+    if (result.errors.includes("always-passing-assertions"))
+      console.error("- Always-passing assertions are not accepted.");
+    if (result.errors.includes("reduced-test-coverage"))
+      console.error("- Existing test cases and their assertions must be preserved.");
+    if (result.errors.includes("invalid-test-replacement"))
+      console.error("- Test replacements need an exact reviewed old-to-new title mapping.");
+    for (const error of result.errors.filter((item) => item.startsWith('Test "')))
       console.error(
-        "- Changes reduce the number of test declarations. Update implementation instead of weakening coverage.",
+        "- " + error + "; add a test-contract-change marker for intentional contracts.",
       );
-    }
     process.exitCode = 1;
     return;
   }

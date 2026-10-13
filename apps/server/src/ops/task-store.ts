@@ -23,6 +23,10 @@ import {
   type CallerContext,
 } from "../identity/scope.js";
 import { taskPolicyResourceId } from "../auth/task-policy.js";
+import {
+  requireCurrentTaskActionAuthorization,
+  type CurrentTaskActionAuthorization,
+} from "./task-action-authorization.js";
 import { recordFilteredDecision } from "../auth/filtered-decision.js";
 import { authorizedValue, evaluate, type AuthorizedResult } from "../auth/service.js";
 
@@ -220,6 +224,8 @@ function parseAttention(row: Row): AttentionItem {
     resolvedAt: optionalString(row, "resolved_at"),
   };
 }
+
+export type TaskActionAuthorization = CurrentTaskActionAuthorization;
 
 export class TaskStore {
   constructor(private readonly db: DomainDatabase) {}
@@ -1183,7 +1189,7 @@ export class TaskStore {
    */
   async acceptTask(
     taskId: string,
-    reviewerPrincipalId?: string,
+    origin: TaskActionAuthorization,
     runId?: string,
   ): Promise<AgentTask> {
     requireIdentifier(taskId);
@@ -1200,6 +1206,12 @@ export class TaskStore {
       const task = parseTask(res.rows[0]);
       if (res.rows[0].orchestration_mode !== "legacy")
         throw new Error("Durable Task requires step-aware acceptance");
+      await requireCurrentTaskActionAuthorization(tx, {
+        taskId,
+        action: "task:accept",
+        authorization: origin,
+        errorMessage: "Matching task:accept ALLOW decision is required",
+      });
       if (task.status !== "REVIEW") {
         throw new Error(`Cannot accept task in status ${task.status}; must be in REVIEW`);
       }
@@ -1231,7 +1243,7 @@ export class TaskStore {
         taskId,
         taskAttemptId: task.activeAttemptId ?? undefined,
         runId,
-        principalId: reviewerPrincipalId,
+        principalId: origin.actorPrincipalId,
         data: {
           previousStatus: task.status,
           newStatus: "DONE",
@@ -1256,7 +1268,7 @@ export class TaskStore {
   async reworkTask(
     taskId: string,
     reworkReason: string,
-    reviewerPrincipalId?: string,
+    origin: TaskActionAuthorization,
   ): Promise<{ task: AgentTask; newAttempt: TaskAttempt }> {
     requireIdentifier(taskId);
     if (!reworkReason || reworkReason.trim() === "") {
@@ -1276,6 +1288,12 @@ export class TaskStore {
       const task = parseTask(res.rows[0]);
       if (res.rows[0].orchestration_mode !== "legacy")
         throw new Error("Durable Task requires step-aware rework");
+      await requireCurrentTaskActionAuthorization(tx, {
+        taskId,
+        action: "task:rework",
+        authorization: origin,
+        errorMessage: "Matching task:rework ALLOW decision is required",
+      });
       if (task.status !== "REVIEW") {
         throw new Error(
           `Cannot request rework for task in status ${task.status}; must be in REVIEW`,
@@ -1318,7 +1336,7 @@ export class TaskStore {
         type: "task.reworked",
         taskId,
         taskAttemptId: newAttemptId,
-        principalId: reviewerPrincipalId,
+        principalId: origin.actorPrincipalId,
         data: {
           priorAttemptId: task.activeAttemptId,
           newAttemptNumber: attemptNumber,
@@ -1353,8 +1371,8 @@ export class TaskStore {
    */
   async cancelTask(
     taskId: string,
-    reason?: string,
-    callerPrincipalId?: string,
+    reason: string | undefined,
+    origin: TaskActionAuthorization,
     runId?: string,
   ): Promise<AgentTask> {
     requireIdentifier(taskId);
@@ -1371,6 +1389,12 @@ export class TaskStore {
       const task = parseTask(res.rows[0]);
       if (res.rows[0].orchestration_mode !== "legacy")
         throw new Error("Durable Task requires step-aware cancellation");
+      await requireCurrentTaskActionAuthorization(tx, {
+        taskId,
+        action: "task:cancel",
+        authorization: origin,
+        errorMessage: "Matching task:cancel ALLOW decision is required",
+      });
       if (task.status === "DONE" || task.status === "CANCELED") {
         throw new Error(`Cannot cancel task in terminal status ${task.status}`);
       }
@@ -1402,7 +1426,7 @@ export class TaskStore {
         taskId,
         taskAttemptId: task.activeAttemptId ?? undefined,
         runId,
-        principalId: callerPrincipalId,
+        principalId: origin.actorPrincipalId,
         data: {
           reason: reason ?? "Task canceled",
         },

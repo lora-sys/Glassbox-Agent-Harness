@@ -1,3 +1,4 @@
+// test-contract-change: PR-142 model catalog tests verify independent context and output capacities
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";

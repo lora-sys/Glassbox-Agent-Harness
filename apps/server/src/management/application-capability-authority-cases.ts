@@ -123,6 +123,39 @@ describe("configured group Run capability authority", () => {
     expect(new Set(candidates.map((entry) => entry.name)).size).toBe(TOOL_DESCRIPTORS.length);
   });
 
+  it("checks only the required Tool grant before building a request-specific surface", async () => {
+    const { application, context, f } = await configuredGroup();
+    const countDecisions = async () =>
+      f.app.store.db.transaction(async (tx) => {
+        const result = await tx.execute("SELECT COUNT(*) AS count FROM authorization_decisions");
+        return Number(result.rows[0]?.count ?? 0);
+      });
+    const beforeFullSurface = await countDecisions();
+    const fullSurface = await application.resolveRunToolCandidates(context);
+    const afterFullSurface = await countDecisions();
+    expect(fullSurface).toHaveLength(TOOL_DESCRIPTORS.length);
+    const fullSurfaceChecks = afterFullSurface - beforeFullSurface;
+    const candidates = await application.resolveRunToolCandidates({
+      ...context,
+      requiredToolName: "qq_groups",
+    });
+    const after = await countDecisions();
+
+    expect(candidates).toHaveLength(TOOL_DESCRIPTORS.length);
+    expect(
+      candidates.filter((entry) => entry.exclusion === null).map((entry) => entry.name),
+    ).toEqual(["qq_groups"]);
+    expect(candidates.find((entry) => entry.name === "qq_group_members")?.exclusion).toBe(
+      "not_selected_for_request",
+    );
+    expect(candidates.find((entry) => entry.name === "qq_group_moderation")?.exclusion).toBe(
+      "scope_not_permitted",
+    );
+    expect(fullSurfaceChecks).toBeGreaterThan(1);
+    expect(after - afterFullSurface).toBe(1);
+    expect(after - afterFullSurface).toBeLessThan(fullSurfaceChecks);
+  });
+
   it("withholds a registered Tool that no discovery rule classified", async () => {
     const { application, context } = await configuredGroup();
 
