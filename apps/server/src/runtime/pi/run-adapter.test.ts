@@ -700,6 +700,64 @@ describe("Pi required Tool execution", () => {
     },
   );
 
+  it("does not auto-load Project Memory into an Owner-private Run without a trusted binding", async () => {
+    const f = fixture([
+      { status: "completed", text: "No project context was loaded.", toolCalls: [] },
+    ]);
+    f.input.text = "请总结一下当前问题背景。";
+    const projectMemory = {
+      memoryId: "project_only_memory",
+      type: "semantic_fact",
+      content: { statement: "PROJECT-ONLY-DO-NOT-LOAD" },
+      scope: { type: "project", projectId: "glassbox" },
+      sensitivity: "public",
+      lifecycleState: "active",
+    } as unknown as CanonicalMemory;
+    const listGlobal = vi.fn(async () => ({
+      memories: [],
+      candidateCount: 0,
+      scannedCount: 0,
+      scanLimit: 256,
+      truncated: false,
+    }));
+    const listProject = vi.fn(async () => ({
+      memories: [projectMemory],
+      candidateCount: 1,
+      scannedCount: 1,
+      scanLimit: 128,
+      truncated: false,
+    }));
+    const learningEvidence: RunEvidenceRecord[] = [];
+    const executor = new PiRunExecutionAdapter(f.runtime, {
+      learningStore: {
+        authorizeContext: vi.fn(async () => {}),
+        listGlobalMemoryContextCandidates: listGlobal,
+        listProjectMemoryContextCandidates: listProject,
+      } as unknown as LearningStore,
+      onLearningEvidence: (record) => {
+        learningEvidence.push(record);
+      },
+    });
+
+    await expect(executor.execute(f.input)).resolves.toMatchObject({ status: "succeeded" });
+    expect(listGlobal).toHaveBeenCalledOnce();
+    expect(listProject).not.toHaveBeenCalled();
+    expect(f.run.mock.calls[0]?.[2]).not.toContain("PROJECT-ONLY-DO-NOT-LOAD");
+    expect(learningEvidence).toContainEqual({
+      type: "learning_context",
+      runId: "run-1",
+      principalId: "owner",
+      conversationId: "conversation-1",
+      scopeType: "global",
+      status: "empty",
+      candidateCount: 0,
+      scannedCount: 0,
+      scanLimit: 256,
+      truncated: false,
+      memoryIds: [],
+    });
+  });
+
   it("injects only authorized group Memory as bounded reference data before the current message", async () => {
     const f = fixture([{ status: "completed", text: "本群每月聚会一次。", toolCalls: [] }]);
     f.input.caller.scope.chatType = "group";
