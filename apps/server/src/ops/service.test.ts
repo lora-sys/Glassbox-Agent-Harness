@@ -829,6 +829,219 @@ it("authorizes durable Step acceptance and rework at the service boundary", asyn
   }
 });
 
+it("rechecks durable Step authority before closing a reviewed Worker and in the write transaction", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  const caller: CallerContext = {
+    principalId: "owner",
+    scope: {
+      connectionId: "test",
+      botId: "bot",
+      chatType: "private",
+      chatId: "owner",
+      senderId: "owner",
+    },
+  };
+  const bridge = new FakeHerdrBridge();
+  try {
+    await store.identities.bindOwner("owner", caller.scope);
+    const task = await store.tasks.createTask({
+      title: "Review Worker close authorization",
+      creatorPrincipalId: "owner",
+      authorizationScope: caller.scope,
+    });
+    for (const action of ["task:plan", "task:continue"])
+      await store.authorization.grant({
+        principalId: "owner",
+        resourceId: `task-${task.id}`,
+        action,
+        scope: caller.scope,
+        effect: "allow",
+      });
+    const runtime = {
+      available: () => true,
+      start: vi.fn(async () => undefined),
+      wake: vi.fn(async () => undefined),
+    };
+    const service = new AuthorizedOpsService(store, bridge, undefined, runtime);
+    const stepIds = ["revoke-accept", "revoke-rework", "revoke-at-commit"];
+    const makeStep = (id: string) => ({
+      id,
+      taskId: task.id,
+      kind: "herdr_worker" as const,
+      title: id,
+      status: "pending" as const,
+      dependencyIds: [],
+      dependencyPolicy: {
+        failed: "block" as const,
+        cancelled: "cancel" as const,
+        skipped: "skip" as const,
+      },
+      maxAttempts: 2,
+      requiredCapabilities: [],
+      delegatedPermissionSet: [],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      version: 1,
+    });
+    await service.planExistingTask(caller, task.id, stepIds.map(makeStep), stepIds[0]!);
+    const continuation = await store.authorization.check({
+      caller,
+      resourceId: `task-${task.id}`,
+      action: "task:continue",
+    });
+    const workers = new Map<string, { paneId: string }>();
+
+    for (const stepId of stepIds) {
+      await store.longWork.transitionStep({
+        taskId: task.id,
+        stepId,
+        expectedVersion: 1,
+        from: "pending",
+        to: "ready",
+        origin: { kind: "system", reason: "test ready" },
+      });
+      const claim = await store.longWork.claimReadyStep({
+        taskId: task.id,
+        stepId,
+        expectedStepVersion: 2,
+        attemptId: `${stepId}-attempt`,
+        leaseId: `${stepId}-lease`,
+        ownerInstanceId: "service-test",
+        leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+        origin: {
+          kind: "decision",
+          decisionId: continuation.id,
+          actorPrincipalId: caller.principalId,
+        },
+      });
+      const worker = await bridge.startAgent({
+        workspaceId: "review-workspace",
+        agentKind: "pi",
+        agentName: `glassbox-${stepId}`,
+      });
+      const binding = await store.tasks.bindWorker({
+        taskAttemptId: claim.attempt.id,
+        herdrSession: "fake-herdr-session",
+        workspaceId: "review-workspace",
+        paneId: worker.paneId,
+        agentName: worker.agentName,
+        agentKind: "pi",
+        lastObservedAgentState: "done",
+      });
+      const lease = await store.longWork.attachClaimedWorkerBinding({
+        taskId: task.id,
+        stepId,
+        attemptId: claim.attempt.id,
+        leaseId: claim.lease.id,
+        workerBindingId: binding.id,
+        ownerInstanceId: claim.lease.ownerInstanceId,
+        expectedStepVersion: claim.step.version,
+        expectedLeaseVersion: claim.lease.version,
+        origin: {
+          kind: "decision",
+          decisionId: continuation.id,
+          actorPrincipalId: caller.principalId,
+        },
+      });
+      await store.longWork.settleClaimedStep({
+        taskId: task.id,
+        stepId,
+        attemptId: claim.attempt.id,
+        leaseId: claim.lease.id,
+        ownerInstanceId: claim.lease.ownerInstanceId,
+        expectedStepVersion: claim.step.version,
+        expectedLeaseVersion: lease.version,
+        workerBindingId: binding.id,
+        outcome: "review",
+        evidenceRef: `trace:${stepId}`,
+        origin: { kind: "system", reason: "test review" },
+      });
+      workers.set(stepId, { paneId: worker.paneId });
+    }
+
+    const closeWorker = bridge.closeAgent.bind(bridge);
+    const close = vi.spyOn(bridge, "closeAgent");
+    for (const [action, stepId] of [
+      ["task:accept", "revoke-accept"],
+      ["task:rework", "revoke-rework"],
+    ] as const) {
+      const grantId = await store.authorization.grant({
+        principalId: caller.principalId,
+        resourceId: `task-${task.id}`,
+        action,
+        scope: caller.scope,
+        effect: "allow",
+      });
+      let entered!: () => void;
+      const reachedBinding = new Promise<void>((resolve) => (entered = resolve));
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => (release = resolve));
+      const getBinding = store.tasks.getWorkerBinding.bind(store.tasks);
+      const barrier = vi.spyOn(store.tasks, "getWorkerBinding").mockImplementation(async (id) => {
+        const value = await getBinding(id);
+        if (id === `${stepId}-attempt`) {
+          entered();
+          await gate;
+        }
+        return value;
+      });
+      try {
+        const operation =
+          action === "task:accept"
+            ? service.acceptStep(caller, task.id, stepId, 4)
+            : service.reworkStep(caller, task.id, stepId, 4, "Retry the reviewed work");
+        await reachedBinding;
+        await store.authorization.revoke(grantId);
+        release();
+        await expect(operation).rejects.toBeInstanceOf(AccessDeniedError);
+      } finally {
+        release();
+        barrier.mockRestore();
+      }
+      expect(close).not.toHaveBeenCalled();
+      expect(
+        (await store.longWork.listSteps(task.id)).find((step) => step.id === stepId)?.status,
+      ).toBe("review");
+      expect((await store.tasks.getAttempt(`${stepId}-attempt`))?.status).toBe("review");
+      expect(
+        (await bridge.getSnapshot()).workspaces.flatMap((workspace) => workspace.panes),
+      ).toEqual(
+        expect.arrayContaining([expect.objectContaining({ paneId: workers.get(stepId)!.paneId })]),
+      );
+    }
+
+    const commitGrant = await store.authorization.grant({
+      principalId: caller.principalId,
+      resourceId: `task-${task.id}`,
+      action: "task:accept",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    close.mockImplementationOnce(async (worker) => {
+      await store.authorization.revoke(commitGrant);
+      await closeWorker(worker);
+    });
+    await expect(service.acceptStep(caller, task.id, "revoke-at-commit", 4)).rejects.toThrow(
+      "Matching Step acceptance ALLOW decision is required",
+    );
+    expect(close).toHaveBeenCalledOnce();
+    expect(
+      (await store.longWork.listSteps(task.id)).find((step) => step.id === "revoke-at-commit")
+        ?.status,
+    ).toBe("review");
+    expect((await store.tasks.getAttempt("revoke-at-commit-attempt"))?.status).toBe("review");
+    expect(
+      (await bridge.getSnapshot()).workspaces.flatMap((workspace) => workspace.panes),
+    ).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ paneId: workers.get("revoke-at-commit")!.paneId }),
+      ]),
+    );
+  } finally {
+    await store.close();
+  }
+});
+
 it("rechecks Worker source authority before reading terminal output", async () => {
   const store = await openDomainStore({ databasePath: ":memory:" });
   const caller: CallerContext = {
