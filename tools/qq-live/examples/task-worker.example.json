@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 8,
+  "cases": [
+    {
+      "id": "task-worker-artifact-lifecycle",
+      "kind": "task-worker-artifact-lifecycle",
+      "chat": "private"
+    }
+  ]
+}

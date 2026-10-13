@@ -1,0 +1,320 @@
+
+> glassbox-qq-live@0.1.0 test
+> node --test test/core.test.mjs test/integration.test.mjs test/cli.test.mjs
+
+TAP version 13
+# Subtest: init creates config and refuses overwriting
+ok 1 - init creates config and refuses overwriting
+  ---
+  duration_ms: 118.992899
+  type: 'test'
+  ...
+# Subtest: help requires no credentials or network
+ok 2 - help requires no credentials or network
+  ---
+  duration_ms: 43.425633
+  type: 'test'
+  ...
+# Subtest: invalid configuration blocks before networking
+ok 3 - invalid configuration blocks before networking
+  ---
+  duration_ms: 58.44126
+  type: 'test'
+  ...
+# Subtest: CLI performs three local-fixture round trips and writes report
+ok 4 - CLI performs three local-fixture round trips and writes report
+  ---
+  duration_ms: 1923.857622
+  type: 'test'
+  ...
+# Subtest: STOP file blocks all outgoing messages
+ok 5 - STOP file blocks all outgoing messages
+  ---
+  duration_ms: 73.777764
+  type: 'test'
+  ...
+# Subtest: missing --live is not silently accepted
+ok 6 - missing --live is not silently accepted
+  ---
+  duration_ms: 45.737423
+  type: 'test'
+  ...
+# Subtest: unknown case cannot produce an empty pass
+ok 7 - unknown case cannot produce an empty pass
+  ---
+  duration_ms: 43.59415
+  type: 'test'
+  ...
+# Subtest: ambiguous moderation creates persistent safety STOP
+ok 8 - ambiguous moderation creates persistent safety STOP
+  ---
+  duration_ms: 1601.737516
+  type: 'test'
+  ...
+# Subtest: configuration accepts isolated armed fixture
+ok 9 - configuration accepts isolated armed fixture
+  ---
+  duration_ms: 1.821784
+  type: 'test'
+  ...
+# Subtest: same identities are rejected
+ok 10 - same identities are rejected
+  ---
+  duration_ms: 0.499933
+  type: 'test'
+  ...
+# Subtest: same endpoints are rejected
+ok 11 - same endpoints are rejected
+  ---
+  duration_ms: 0.161523
+  type: 'test'
+  ...
+# Subtest: remote plain WS rejected
+ok 12 - remote plain WS rejected
+  ---
+  duration_ms: 0.157327
+  type: 'test'
+  ...
+# Subtest: credentials in URL rejected
+ok 13 - credentials in URL rejected
+  ---
+  duration_ms: 0.107432
+  type: 'test'
+  ...
+# Subtest: expired window rejected
+ok 14 - expired window rejected
+  ---
+  duration_ms: 0.215264
+  type: 'test'
+  ...
+# Subtest: live state confirmation required
+ok 15 - live state confirmation required
+  ---
+  duration_ms: 0.286091
+  type: 'test'
+  ...
+# Subtest: unbounded timeouts rejected
+ok 16 - unbounded timeouts rejected
+  ---
+  duration_ms: 0.184007
+  type: 'test'
+  ...
+# Subtest: duplicate group rejected
+ok 17 - duplicate group rejected
+  ---
+  duration_ms: 0.329607
+  type: 'test'
+  ...
+# Subtest: moderation target cannot be driver
+ok 18 - moderation target cannot be driver
+  ---
+  duration_ms: 0.465852
+  type: 'test'
+  ...
+# Subtest: consent required
+ok 19 - consent required
+  ---
+  duration_ms: 0.178889
+  type: 'test'
+  ...
+# Subtest: long mute forbidden
+ok 20 - long mute forbidden
+  ---
+  duration_ms: 0.122014
+  type: 'test'
+  ...
+# Subtest: unknown mute state is not treated as zero
+ok 21 - unknown mute state is not treated as zero
+  ---
+  duration_ms: 0.102465
+  type: 'test'
+  ...
+# Subtest: millisecond mute timestamp rejected
+ok 22 - millisecond mute timestamp rejected
+  ---
+  duration_ms: 0.087132
+  type: 'test'
+  ...
+# Subtest: no cases is not PASS
+ok 23 - no cases is not PASS
+  ---
+  duration_ms: 0.147232
+  type: 'test'
+  ...
+# Subtest: mixed failure cannot pass
+ok 24 - mixed failure cannot pass
+  ---
+  duration_ms: 0.083335
+  type: 'test'
+  ...
+# Subtest: tokens and terminal escapes redacted
+ok 25 - tokens and terminal escapes redacted
+  ---
+  duration_ms: 0.578351
+  type: 'test'
+  ...
+# Subtest: arbitrary exception is not leaked
+ok 26 - arbitrary exception is not leaked
+  ---
+  duration_ms: 0.241935
+  type: 'test'
+  ...
+# Subtest: CQ metadata is not parsed as text
+ok 27 - CQ metadata is not parsed as text
+  ---
+  duration_ms: 0.145009
+  type: 'test'
+  ...
+# Subtest: unsafe numeric identifiers rejected
+ok 28 - unsafe numeric identifiers rejected
+  ---
+  duration_ms: 0.074402
+  type: 'test'
+  ...
+# Subtest: negative message ID supported
+ok 29 - negative message ID supported
+  ---
+  duration_ms: 0.075524
+  type: 'test'
+  ...
+# Subtest: custom suite must retain nonce
+ok 30 - custom suite must retain nonce
+  ---
+  duration_ms: 0.20582
+  type: 'test'
+  ...
+# Subtest: custom suite cannot claim side effects
+ok 31 - custom suite cannot claim side effects
+  ---
+  duration_ms: 0.150266
+  type: 'test'
+  ...
+# Subtest: unrelated private messages are not retained
+ok 32 - unrelated private messages are not retained
+  ---
+  duration_ms: 0.652734
+  type: 'test'
+  ...
+# Subtest: old run marker cannot satisfy a new run
+ok 33 - old run marker cannot satisfy a new run
+  ---
+  duration_ms: 0.140401
+  type: 'test'
+  ...
+# Subtest: real localhost WebSocket handshake uses Bearer header
+ok 34 - real localhost WebSocket handshake uses Bearer header
+  ---
+  duration_ms: 42.783124
+  type: 'test'
+  ...
+# Subtest: private round trip accepts input before send acknowledgment
+ok 35 - private round trip accepts input before send acknowledgment
+  ---
+  duration_ms: 110.314718
+  type: 'test'
+  ...
+# Subtest: group round trip validates receiving account and route
+ok 36 - group round trip validates receiving account and route
+  ---
+  duration_ms: 109.129692
+  type: 'test'
+  ...
+# Subtest: wrong-group reply fails
+ok 37 - wrong-group reply fails
+  ---
+  duration_ms: 7.486977
+  type: 'test'
+  ...
+# Subtest: replayed same message does not become a duplicate reply
+ok 38 - replayed same message does not become a duplicate reply
+  ---
+  duration_ms: 109.751659
+  type: 'test'
+  ...
+# Subtest: distinct duplicate replies fail
+ok 39 - distinct duplicate replies fail
+  ---
+  duration_ms: 106.255072
+  type: 'test'
+  ...
+# Subtest: API rejection with message_id never passes
+ok 40 - API rejection with message_id never passes
+  ---
+  duration_ms: 8.867327
+  type: 'test'
+  ...
+# Subtest: send timeout is not retried
+ok 41 - send timeout is not retried
+  ---
+  duration_ms: 1005.067148
+  type: 'test'
+  ...
+# Subtest: Bot input without reply is inconclusive
+ok 42 - Bot input without reply is inconclusive
+  ---
+  duration_ms: 1010.221284
+  type: 'test'
+  ...
+# Subtest: reply assertion mismatch fails
+ok 43 - reply assertion mismatch fails
+  ---
+  duration_ms: 1016.522879
+  type: 'test'
+  ...
+# Subtest: offline account blocks doctor
+ok 44 - offline account blocks doctor
+  ---
+  duration_ms: 5.073523
+  type: 'test'
+  ...
+# Subtest: unapproved targets and direct Bot mutations are blocked
+ok 45 - unapproved targets and direct Bot mutations are blocked
+  ---
+  duration_ms: 3.018878
+  type: 'test'
+  ...
+# Subtest: direct driver mute forbidden even when emergency cleanup allowed
+ok 46 - direct driver mute forbidden even when emergency cleanup allowed
+  ---
+  duration_ms: 2.289309
+  type: 'test'
+  ...
+# Subtest: moderation proves independent notice and state then chat unmute
+ok 47 - moderation proves independent notice and state then chat unmute
+  ---
+  duration_ms: 6.478669
+  type: 'test'
+  ...
+# Subtest: missing mute state prevents any moderation message
+ok 48 - missing mute state prevents any moderation message
+  ---
+  duration_ms: 2.787319
+  type: 'test'
+  ...
+# Subtest: already muted member is left untouched
+ok 49 - already muted member is left untouched
+  ---
+  duration_ms: 4.437605
+  type: 'test'
+  ...
+# Subtest: claimed reply without moderation effect cannot pass
+ok 50 - claimed reply without moderation effect cannot pass
+  ---
+  duration_ms: 1509.94726
+  type: 'test'
+  ...
+# Subtest: cancel prevents outgoing messages
+ok 51 - cancel prevents outgoing messages
+  ---
+  duration_ms: 3.421003
+  type: 'test'
+  ...
+1..51
+# tests 51
+# suites 0
+# pass 51
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 5162.689195

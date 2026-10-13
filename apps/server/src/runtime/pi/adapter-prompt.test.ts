@@ -143,6 +143,20 @@ describe("identityRulesClause", () => {
     }
   });
 
+  it("distinguishes the configured bot QQ identity from the current sender", () => {
+    const prompt = identityRulesClause({
+      senderId: "2498701175",
+      botId: "3394947361",
+      isOwner: false,
+      sharedConversation: true,
+    });
+
+    expect(prompt).toContain("configured bot account in this Channel is QQ 3394947361");
+    expect(prompt).toContain("distinct from the current sender below");
+    expect(prompt).toContain("use this configured bot QQ identity");
+    expect(prompt).toContain("QQ 2498701175");
+  });
+
   it("tells the Owner they are the Owner without naming who else is one", () => {
     const prompt = identityRulesClause({
       senderId: "3526039967",

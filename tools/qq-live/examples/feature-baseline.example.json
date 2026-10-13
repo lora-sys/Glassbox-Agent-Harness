@@ -1,0 +1,628 @@
+{
+  "schemaVersion": 6,
+  "cases": [
+    {
+      "id": "qq-group-a-root-files-read",
+      "chat": "private",
+      "prompt": "帮我看一下测试群 {{group:A}} 的群文件，根目录第一页有几个文件、几个文件夹？只看这一页，不下载文件，也不用告诉我文件名或上传者。请把结果写成一行 QQGROUPFILES {{nonce}} files=文件数 folders=文件夹数，方便我核对。",
+      "expectContains": ["{{nonce}}"],
+      "sideEffect": "none",
+      "leaseTools": [
+        {
+          "name": "qq_group_files",
+          "operations": [
+            {
+              "action": "group:files:read",
+              "resourceId": "group:{{group:A}}",
+              "inputConstraint": {
+                "groupId": "{{group:A}}",
+                "operation": "get_group_root_files"
+              }
+            }
+          ]
+        }
+      ],
+      "featureAssertions": [
+        {
+          "kind": "trace",
+          "type": "tool_result",
+          "where": {
+            "name": "qq_group_files",
+            "isError": false
+          },
+          "count": 1
+        },
+        {
+          "kind": "group_files",
+          "tool": "qq_group_files",
+          "groupId": "{{group:A}}",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "qq-group-a-info-read",
+      "chat": "private",
+      "prompt": "帮我查一下测试群 {{group:A}} 的群信息。现在有多少人，群容量是多少？只查人数和容量，不用修改任何设置，也不用告诉我群名。请把结果写成一行 QQGROUPINFO {{nonce}} count=人数 capacity=容量，方便我核对。",
+      "expectContains": ["{{nonce}}"],
+      "sideEffect": "none",
+      "leaseTools": [
+        {
+          "name": "qq_groups",
+          "operations": [
+            {
+              "action": "group:read",
+              "resourceId": "group:{{group:A}}",
+              "inputConstraint": {
+                "groupId": "{{group:A}}",
+                "operation": "get_group_info"
+              }
+            }
+          ]
+        }
+      ],
+      "featureAssertions": [
+        {
+          "kind": "trace",
+          "type": "tool_result",
+          "where": {
+            "name": "qq_groups",
+            "isError": false
+          },
+          "count": 1
+        },
+        {
+          "kind": "group_info",
+          "tool": "qq_groups",
+          "groupId": "{{group:A}}",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "ops-status-read",
+      "chat": "private",
+      "prompt": "帮我看一下当前可以查看的任务和 Worker 汇总数量。不用打开单个任务，也不要修改状态。回复时带上测试编号 {{nonce}}。",
+      "expectContains": ["{{nonce}}"],
+      "sideEffect": "none",
+      "leaseTools": [
+        {
+          "name": "ops_status",
+          "operations": [
+            {
+              "action": "ops:status",
+              "resourceId": "agent-operations",
+              "inputConstraint": {}
+            }
+          ]
+        }
+      ],
+      "featureAssertions": [
+        {
+          "kind": "trace",
+          "type": "tool_result",
+          "where": {
+            "name": "ops_status",
+            "isError": false
+          },
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "qq-account-status-read",
+      "chat": "private",
+      "prompt": "帮我检查一下机器人当前是否在线。只告诉我在线状态，不用提供账号号码或其他账号资料。回复时带上测试编号 {{nonce}}。",
+      "expectContains": ["{{nonce}}"],
+      "sideEffect": "none",
+      "leaseTools": [
+        {
+          "name": "qq_account_status",
+          "operations": [
+            {
+              "action": "account:status:read",
+              "resourceId": "agent:personal",
+              "inputConstraint": {
+                "operation": "get_status"
+              }
+            }
+          ]
+        }
+      ],
+      "featureAssertions": [
+        {
+          "kind": "trace",
+          "type": "tool_result",
+          "where": {
+            "name": "qq_account_status",
+            "isError": false
+          },
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "qq-managed-groups-inventory-read",
+      "chat": "private",
+      "prompt": "帮我看一下我目前管理了多少个群。只告诉我数量，不用列出群号、群名或聊天内容。回复时带上测试编号 {{nonce}}。",
+      "expectContains": ["{{nonce}}"],
+      "sideEffect": "none",
+      "leaseTools": [
+        {
+          "name": "qq_groups",
+          "operations": [
+            {
+              "action": "group:read",
+              "resourceId": "agent:personal",
+              "inputConstraint": {}
+            }
+          ]
+        }
+      ],
+      "featureAssertions": [
+        {
+          "kind": "trace",
+          "type": "tool_result",
+          "where": {
+            "name": "qq_groups",
+            "isError": false
+          },
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "qq-group-member-count-read",
+      "chat": "private",
+      "prompt": "帮我查一下测试群 {{group:A}} 现在有多少成员。只告诉我人数，不要列出成员号码、昵称或其他资料。回复时带上测试编号 {{nonce}}。",
+      "expectContains": ["{{nonce}}"],
+      "sideEffect": "none",
+      "leaseTools": [
+        {
+          "name": "qq_group_members",
+          "operations": [
+            {
+              "action": "group:members:read",
+              "resourceId": "group:{{group:A}}",
+              "inputConstraint": {
+                "groupId": "{{group:A}}",
+                "operation": "get_group_member_list"
+              }
+            }
+          ]
+        }
+      ],
+      "featureAssertions": [
+        {
+          "kind": "trace",
+          "type": "tool_result",
+          "where": {
+            "name": "qq_group_members",
+            "isError": false
+          },
+          "count": 1
+        },
+        {
+          "kind": "aggregate_projection",
+          "tool": "qq_group_members",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "qq-bot-group-role-read",
+      "chat": "private",
+      "prompt": "你现在在测试群 {{group:B}} 里是管理员吗？请实际查一下。请按一行回复 QQBOTGROUPROLE {{nonce}} role=角色，方便我核对。",
+      "expectContains": ["{{nonce}}"],
+      "sideEffect": "none",
+      "leaseTools": [
+        {
+          "name": "qq_group_members",
+          "operations": [
+            {
+              "action": "group:members:read",
+              "resourceId": "group:{{group:B}}",
+              "inputConstraint": {
+                "groupId": "{{group:B}}",
+                "operation": "get_group_member_info",
+                "params": {
+                  "user_id": "{{bot}}"
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "featureAssertions": [
+        {
+          "kind": "trace",
+          "type": "tool_result",
+          "where": {
+            "name": "qq_group_members",
+            "isError": false
+          },
+          "count": 1
+        },
+        {
+          "kind": "group_member_role",
+          "tool": "qq_group_members",
+          "groupId": "{{group:B}}",
+          "userId": "{{bot}}",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "qq-capability-registry-read",
+      "chat": "private",
+      "prompt": "帮我看一下目前可用的群只读能力有多少项。只告诉我数量，不用读取群资料或聊天内容。回复时带上测试编号 {{nonce}}。",
+      "expectContains": ["{{nonce}}"],
+      "sideEffect": "none",
+      "leaseTools": [
+        {
+          "name": "qq_capability_search",
+          "operations": [
+            {
+              "action": "qq:capability:read",
+              "resourceId": "agent:personal",
+              "inputConstraint": {
+                "query": "group.read"
+              }
+            }
+          ]
+        }
+      ],
+      "featureAssertions": [
+        {
+          "kind": "trace",
+          "type": "tool_result",
+          "where": {
+            "name": "qq_capability_search",
+            "isError": false
+          },
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "history-current-group-nonce",
+      "chat": "A",
+      "prompt": "请在本群聊天记录中查找测试标记 gbxhistory1-{{nonce}}，最多查看一条。只告诉我是否找到，不要引用其他消息。回复时带上本轮编号 {{nonce}}。",
+      "expectContains": ["{{nonce}}"],
+      "sideEffect": "none",
+      "leaseTools": [
+        {
+          "name": "group_history_search",
+          "operations": [
+            {
+              "action": "history:read",
+              "resourceId": "group:{{group:A}}",
+              "inputConstraint": {
+                "query": "gbxhistory1-{{nonce}}",
+                "limit": 1
+              }
+            }
+          ]
+        }
+      ],
+      "featureAssertions": [
+        {
+          "kind": "trace",
+          "type": "tool_result",
+          "where": {
+            "name": "group_history_search",
+            "isError": false
+          },
+          "count": 1
+        },
+        {
+          "kind": "trace",
+          "type": "history_retrieval",
+          "where": {
+            "query": "gbxhistory1-{{nonce}}",
+            "groups": ["{{group:A}}"],
+            "resources": ["group:{{group:A}}"],
+            "sourceKind": "channel_message",
+            "retrievalMode": "lexical"
+          },
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "history-owner-group-a-nonce",
+      "chat": "private",
+      "prompt": "请在测试群 {{group:A}} 的聊天记录中查找测试标记 gbxhistory1-{{nonce}}，最多查看一条。只告诉我是否找到，不要引用其他消息。回复时带上本轮编号 {{nonce}}。",
+      "expectContains": ["{{nonce}}"],
+      "sideEffect": "none",
+      "leaseTools": [
+        {
+          "name": "owner_history_search",
+          "operations": [
+            {
+              "action": "history:search",
+              "resourceId": "owner-history",
+              "inputConstraint": {
+                "query": "gbxhistory1-{{nonce}}",
+                "groupIds": ["{{group:A}}"],
+                "limit": 1
+              }
+            }
+          ]
+        }
+      ],
+      "featureAssertions": [
+        {
+          "kind": "trace",
+          "type": "tool_result",
+          "where": {
+            "name": "owner_history_search",
+            "isError": false
+          },
+          "count": 1
+        },
+        {
+          "kind": "trace",
+          "type": "history_retrieval",
+          "where": {
+            "query": "gbxhistory1-{{nonce}}",
+            "groups": ["{{group:A}}"],
+            "resources": ["group:{{group:A}}"],
+            "sourceKind": "channel_message",
+            "retrievalMode": "lexical"
+          },
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "memory-project-promote-expire",
+      "kind": "memory-lifecycle",
+      "workflow": "promote-expire",
+      "chat": "private"
+    },
+    {
+      "id": "memory-project-feedback-reject",
+      "kind": "memory-lifecycle",
+      "workflow": "feedback-reject",
+      "chat": "private"
+    },
+    {
+      "id": "taste-project-feedback-lifecycle",
+      "kind": "taste-lifecycle",
+      "chat": "private"
+    },
+    {
+      "id": "history-current-group-complete",
+      "chat": "A",
+      "prompt": "请在本群聊天记录中查找测试标记 gbxhistory1-{{nonce}}，最多查看一条。只告诉我是否找到，不要引用其他消息。回复时带上本轮编号 {{nonce}}。",
+      "expectContains": ["{{nonce}}"],
+      "sideEffect": "none",
+      "leaseTools": [
+        {
+          "name": "group_history_search",
+          "operations": [
+            {
+              "action": "history:read",
+              "resourceId": "group:{{group:A}}",
+              "inputConstraint": {
+                "query": "gbxhistory1-{{nonce}}",
+                "limit": 1
+              }
+            }
+          ]
+        }
+      ],
+      "featureAssertions": [
+        {
+          "kind": "trace",
+          "type": "tool_result",
+          "where": {
+            "name": "group_history_search",
+            "isError": false
+          },
+          "count": 1
+        },
+        {
+          "kind": "trace",
+          "type": "history_retrieval",
+          "where": {
+            "query": "gbxhistory1-{{nonce}}",
+            "groups": ["{{group:A}}"],
+            "resources": ["group:{{group:A}}"],
+            "sourceKind": "channel_message",
+            "retrievalMode": "lexical"
+          },
+          "count": 1
+        },
+        {
+          "kind": "history_coverage",
+          "query": "gbxhistory1-{{nonce}}",
+          "groupId": "{{group:A}}",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "history-owner-group-a-complete",
+      "chat": "private",
+      "prompt": "请在测试群 {{group:A}} 的聊天记录中查找测试标记 gbxhistory1-{{nonce}}，最多查看一条。只告诉我是否找到，不要引用其他消息。回复时带上本轮编号 {{nonce}}。",
+      "expectContains": ["{{nonce}}"],
+      "sideEffect": "none",
+      "leaseTools": [
+        {
+          "name": "owner_history_search",
+          "operations": [
+            {
+              "action": "history:search",
+              "resourceId": "owner-history",
+              "inputConstraint": {
+                "query": "gbxhistory1-{{nonce}}",
+                "groupIds": ["{{group:A}}"],
+                "limit": 1
+              }
+            }
+          ]
+        }
+      ],
+      "featureAssertions": [
+        {
+          "kind": "trace",
+          "type": "tool_result",
+          "where": {
+            "name": "owner_history_search",
+            "isError": false
+          },
+          "count": 1
+        },
+        {
+          "kind": "trace",
+          "type": "history_retrieval",
+          "where": {
+            "query": "gbxhistory1-{{nonce}}",
+            "groups": ["{{group:A}}"],
+            "resources": ["group:{{group:A}}"],
+            "sourceKind": "channel_message",
+            "retrievalMode": "lexical"
+          },
+          "count": 1
+        },
+        {
+          "kind": "history_coverage",
+          "query": "gbxhistory1-{{nonce}}",
+          "groupId": "{{group:A}}",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "history-current-group-hit",
+      "chat": "A",
+      "prompt": "请在本群聊天记录中查找测试标记 gbxhistory1-{{nonce}}，最多查看一条。只告诉我是否找到，不要引用其他消息。回复时带上本轮编号 {{nonce}}。",
+      "expectContains": ["{{nonce}}"],
+      "sideEffect": "none",
+      "leaseTools": [
+        {
+          "name": "group_history_search",
+          "operations": [
+            {
+              "action": "history:read",
+              "resourceId": "group:{{group:A}}",
+              "inputConstraint": {
+                "query": "gbxhistory1-{{nonce}}",
+                "limit": 1
+              }
+            }
+          ]
+        }
+      ],
+      "featureAssertions": [
+        {
+          "kind": "trace",
+          "type": "tool_result",
+          "where": {
+            "name": "group_history_search",
+            "isError": false
+          },
+          "count": 1
+        },
+        {
+          "kind": "trace",
+          "type": "history_retrieval",
+          "where": {
+            "query": "gbxhistory1-{{nonce}}",
+            "groups": ["{{group:A}}"],
+            "resources": ["group:{{group:A}}"],
+            "sourceKind": "channel_message",
+            "retrievalMode": "lexical"
+          },
+          "count": 1
+        },
+        {
+          "kind": "history_coverage",
+          "query": "gbxhistory1-{{nonce}}",
+          "groupId": "{{group:A}}",
+          "count": 1
+        },
+        {
+          "kind": "history_result",
+          "tool": "group_history_search",
+          "query": "gbxhistory1-{{nonce}}",
+          "groupId": "{{group:A}}",
+          "result": "hit",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "history-owner-group-a-no-match",
+      "chat": "private",
+      "prompt": "请在测试群 {{group:A}} 的聊天记录中查找测试标记 gbxhistory1-{{nonce}}，最多查看一条。只告诉我是否找到，不要引用其他消息。回复时带上本轮编号 {{nonce}}。",
+      "expectContains": ["{{nonce}}"],
+      "sideEffect": "none",
+      "leaseTools": [
+        {
+          "name": "owner_history_search",
+          "operations": [
+            {
+              "action": "history:search",
+              "resourceId": "owner-history",
+              "inputConstraint": {
+                "query": "gbxhistory1-{{nonce}}",
+                "groupIds": ["{{group:A}}"],
+                "limit": 1
+              }
+            }
+          ]
+        }
+      ],
+      "featureAssertions": [
+        {
+          "kind": "trace",
+          "type": "tool_result",
+          "where": {
+            "name": "owner_history_search",
+            "isError": false
+          },
+          "count": 1
+        },
+        {
+          "kind": "trace",
+          "type": "history_retrieval",
+          "where": {
+            "query": "gbxhistory1-{{nonce}}",
+            "groups": ["{{group:A}}"],
+            "resources": ["group:{{group:A}}"],
+            "sourceKind": "channel_message",
+            "retrievalMode": "lexical"
+          },
+          "count": 1
+        },
+        {
+          "kind": "history_coverage",
+          "query": "gbxhistory1-{{nonce}}",
+          "groupId": "{{group:A}}",
+          "count": 1
+        },
+        {
+          "kind": "history_result",
+          "tool": "owner_history_search",
+          "query": "gbxhistory1-{{nonce}}",
+          "groupId": "{{group:A}}",
+          "result": "no_match",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "history-group-seed-private-recall",
+      "kind": "history-seed",
+      "chat": "A"
+    },
+    {
+      "id": "history-cross-group-isolation",
+      "kind": "history-isolation",
+      "chat": "B"
+    }
+  ]
+}

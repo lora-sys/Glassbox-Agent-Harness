@@ -84,17 +84,68 @@ export interface PiRunResult {
   failure?: import("./failure-diagnostics.js").PiFailureDiagnostic;
 }
 
-import type { CallerContext } from "../../identity/scope.js";
+import type { CallerContext, QqNativeGroupRole } from "../../identity/scope.js";
 import type { ToolExecutionOutcome } from "./tool-plane.js";
 import type { RequiredEvidence } from "./required-evidence.js";
 
 export interface PiRunContext {
+  /** Current-message conditions for one mute request. Server-owned and never model-visible. */
+  requiredModerationPreconditions?: {
+    botMustBeAdmin?: boolean;
+    targetMustBeOrdinaryMember?: boolean;
+    targetMustNotBeMuted?: boolean;
+  };
+  /** Server-owned, message-bound restriction. It is never serialized into model context. */
+  acceptanceLease?: {
+    leaseId: string;
+    marker: string;
+    toolsSha256: string;
+    assertActive(): boolean;
+    filterToolNames(names: readonly string[]): string[];
+    getToolInputRestrictions(toolName: string): readonly {
+      action: string;
+      resourceId: string;
+      inputConstraint: { [key: string]: unknown };
+    }[];
+    checkToolCall(input: {
+      toolName: string;
+      action: string;
+      resourceId: string;
+      toolInput: Readonly<Record<string, unknown>>;
+    }): boolean;
+    /** Execution-only native state condition. It is not projected into model parameters. */
+    getNativeMuteStatePrecondition?(input: {
+      toolName: string;
+      action: string;
+      resourceId: string;
+      toolInput: Readonly<Record<string, unknown>>;
+    }): import("../../acceptance/qq-live-lease.js").QqLiveNativeMuteStatePrecondition | null;
+    /** Server-owned fixed diagnostics; never includes arguments or constraint values. */
+    diagnoseToolCall?(input: {
+      toolName: string;
+      action: string;
+      resourceId: string;
+      toolInput: Readonly<Record<string, unknown>>;
+    }): string | undefined;
+  };
   /** Server-owned authorization callback; never populated from model or Tool input. */
   authorizeProviderContext?: () => Promise<void>;
   /** Rechecks mutable server-owned policy for Skill metadata already in the prompt. */
   authorizeSkillContext?: () => Promise<void>;
   /** Trusted server execution mode, not inferred from prompt text. */
   executionMode?: "task_step_model";
+  /** Records only a bounded digest witness after protected-input checks have passed. */
+  recordQqToolExecutionInput?: (input: {
+    conversationId: string;
+    principalId: string;
+    toolCallId: string;
+    toolName: "qq_group_members" | "qq_group_moderation";
+    leaseId: string | null;
+    action: "get_group_member_info" | "set_group_ban";
+    resourceId: string;
+    inputSha256: string;
+    inputBytes: number;
+  }) => Promise<void>;
   caller?: CallerContext;
   /**
    * Who is speaking right now, resolved from the Channel binding rather than from the message.
@@ -103,8 +154,17 @@ export interface PiRunContext {
    * This carries the current sender instead, which is the only thing that can answer "who am I
    * talking to" — and the prompt's identity rules are written against it.
    */
+  /** Fresh server observation of the configured bot account in one authorized target group. */
+  botGroupRoleObservation?: {
+    groupId: string;
+    role: QqNativeGroupRole | "unknown";
+  };
+  /** Rechecks the exact authorization binding before every provider context is sent. */
+  authorizeBotGroupRoleObservation?: () => Promise<void>;
   callerIdentity?: {
     senderId: string;
+    /** Trusted QQ identity of the configured bot account for this Channel. */
+    botId?: string;
     isOwner: boolean;
     /** True when this Conversation's location is shared by several senders. */
     sharedConversation: boolean;
@@ -169,6 +229,7 @@ export interface PiRuntimeAdapter {
   getRunContext?(runtimeSessionId: string): PiRunContext | undefined;
   getModelSupportsImages?(runtimeSessionId: string): boolean;
   getModelCapacity?(runtimeSessionId: string): EfficiencyModelCapacity | undefined;
+  getThinkingLevel?(runtimeSessionId: string): string | null | undefined;
   getStaticContextEstimate?(runtimeSessionId: string):
     | {
         systemTokens: number;

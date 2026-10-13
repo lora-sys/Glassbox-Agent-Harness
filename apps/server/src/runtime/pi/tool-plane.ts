@@ -739,6 +739,7 @@ export type ToolExclusionReason =
   | "scope_not_permitted"
   | "policy_disabled"
   | "discovery_denied"
+  | "not_selected_for_request"
   | "no_caller_context"
   /**
    * Glassbox registers this Tool but no discovery rule classified it.
@@ -756,7 +757,7 @@ export type ToolExclusionReason =
  * scope rule, a new exclusion reason. Surfaces written under different revisions stay
  * readable, so an old Run's evidence is never reinterpreted through newer rules.
  */
-export const TOOL_SURFACE_POLICY_VERSION = "tool-surface-policy-v1";
+export const TOOL_SURFACE_POLICY_VERSION = "tool-surface-policy-v2";
 
 export interface ToolSurfaceEntry {
   name: string;
@@ -806,6 +807,26 @@ export interface ToolSurfaceCandidate {
   name: string;
   /** `null` when this Run's discovery selected the Tool. */
   exclusion: ToolExclusionReason | null;
+}
+
+/**
+ * Narrow an already-authorized surface to the Tools needed for this Run's required evidence.
+ *
+ * This is selection, not authorization: denied candidates keep their original reason, while
+ * authorized but unrelated Tools are omitted from the model-visible surface. An empty
+ * requirement set leaves ordinary conversational discovery unchanged.
+ */
+export function narrowToolCandidatesToRequiredTools(
+  candidates: readonly ToolSurfaceCandidate[],
+  requiredToolNames: readonly string[],
+): ToolSurfaceCandidate[] {
+  const required = new Set(requiredToolNames);
+  if (required.size === 0) return [...candidates];
+  return candidates.map((candidate) =>
+    candidate.exclusion === null && !required.has(candidate.name)
+      ? { ...candidate, exclusion: "not_selected_for_request" }
+      : candidate,
+  );
 }
 
 function surfaceEntry(
@@ -928,6 +949,7 @@ export type ToolExecutionOutcome =
  */
 export function toolOutcomeFromFailure(code: string): ToolExecutionOutcome {
   switch (code) {
+    case "worker_file_authority_missing":
     case "authorization_denied":
     case "capability_category_disabled":
     case "context_missing":

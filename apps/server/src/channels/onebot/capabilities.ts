@@ -106,7 +106,8 @@ export const QQ_CAPABILITIES: readonly QqCapability[] = [
       group("get_group_member_list", ["group_id"]),
       group("get_group_member_info", ["group_id", "user_id", "no_cache"], ["group_id", "user_id"]),
     ],
-    description: "Read the member count of a managed group or one member's verified QQ role.",
+    description:
+      "Read a managed group's member count, bounded Owner-private member details, or one member's verified QQ group role.",
   },
   {
     tool: "qq_group_history",
@@ -189,7 +190,7 @@ export const QQ_CAPABILITIES: readonly QqCapability[] = [
     resource: "group",
     operations: [
       group("set_group_name", ["group_id", "group_name"], ["group_id", "group_name"]),
-      group("set_group_card", ["group_id", "user_id", "card"], ["group_id", "user_id"]),
+      group("set_group_card", ["group_id", "user_id", "card"], ["group_id", "user_id", "card"]),
     ],
     description: "Change the current group's name or one member's card as its QQ group owner.",
     nativeGroupRoles: ["qq_group_owner"],
@@ -203,7 +204,7 @@ export const QQ_CAPABILITIES: readonly QqCapability[] = [
     resource: "group",
     operations: [
       group("set_group_name", ["group_id", "group_name"], ["group_id", "group_name"]),
-      group("set_group_card", ["group_id", "user_id", "card"], ["group_id", "user_id"]),
+      group("set_group_card", ["group_id", "user_id", "card"], ["group_id", "user_id", "card"]),
       group(
         "set_group_admin",
         ["group_id", "user_id", "enable"],

@@ -5,7 +5,7 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
-import { afterEach, describe, expect, it } from "vite-plus/test";
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import {
   OneBotAdapter,
   type OneBotAdapterOptions,
@@ -1114,6 +1114,85 @@ describe("OneBot forward WebSocket", () => {
     await adapter.stop();
     expect(acceptanceAborted).toBe(true);
   });
+  it("waits for entered ingress, drops queued callbacks and serializes restart", async () => {
+    const fake = await server();
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let release!: () => void;
+    const holdEntered = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let callbackFinished = false;
+    const received: string[] = [];
+    const { adapter, diagnostics } = client(fake.endpoint, {
+      maxPendingIncoming: 2,
+      onIncoming: async (message) => {
+        received.push(message.messageId);
+        if (message.messageId === "-7") {
+          entered();
+          await holdEntered;
+          callbackFinished = true;
+        }
+      },
+    });
+    await adapter.start();
+    const firstSocket = await fake.connections.next();
+    firstSocket.send(JSON.stringify(inbound()));
+    await started;
+    await diagnostics.next((diagnostic) => diagnostic.stage === "normalized");
+
+    firstSocket.send(JSON.stringify(inbound({ message_id: -8 })));
+    await diagnostics.next((diagnostic) => diagnostic.stage === "normalized");
+
+    let stopResolved = false;
+    const stopping = adapter.stop().then(() => {
+      stopResolved = true;
+    });
+    const restarting = adapter.start();
+    await once(firstSocket, "close");
+    expect(stopResolved).toBe(false);
+    expect(callbackFinished).toBe(false);
+    expect(received).toEqual(["-7"]);
+    expect(adapter.state.status).not.toBe("stopped");
+
+    release();
+    await stopping;
+    const secondSocket = await fake.connections.next();
+    await fake.actions.next((action) => action.action === "get_login_info");
+    await restarting;
+    expect(callbackFinished).toBe(true);
+    expect(received).toEqual(["-7"]);
+    expect(adapter.state.status).toBe("ready");
+    secondSocket.terminate();
+  });
+
+  it("does not deadlock when an ingress callback stops its adapter", async () => {
+    const fake = await server();
+    let callbackDone!: () => void;
+    const finished = new Promise<void>((resolve) => {
+      callbackDone = resolve;
+    });
+    let adapter!: OneBotAdapter;
+    adapter = new OneBotAdapter({
+      config: parseOneBotConfig({ ...base, endpoint: fake.endpoint }),
+      token: "explicit-test-token",
+      requestTimeoutMs: 500,
+      reconnectDelayMs: 20,
+      onIncoming: async () => {
+        await adapter.stop();
+        callbackDone();
+      },
+    });
+    cleanup.push(() => adapter.stop());
+    await adapter.start();
+    const socket = await fake.connections.next();
+    socket.send(JSON.stringify(inbound()));
+    await finished;
+    expect(adapter.state.status).toBe("stopped");
+  });
+
   it("disconnects oversized WebSocket payloads before accepting messages", async () => {
     const fake = await server();
     let calls = 0;
@@ -1291,36 +1370,50 @@ describe("OneBot forward WebSocket", () => {
     });
     const { adapter, errors, diagnostics } = client(fake.endpoint, {
       maxPendingIncoming: 1,
-      onIncoming: async () => {
+      onIncoming: async (_message, signal) => {
         entered();
-        await new Promise<void>(() => {});
+        if (signal.aborted) return;
+        await new Promise<void>((resolve) => {
+          signal.addEventListener("abort", () => resolve(), { once: true });
+        });
       },
     });
     await adapter.start();
     const socket = await fake.connections.next();
-    socket.send(JSON.stringify(inbound()));
-    await started;
-    // Back to back, because the second one is what makes the third one droppable: it
-    // overflows the acceptance queue and pushes the adapter out of `ready`, and the message
-    // behind it is still on the same socket when the teardown has not been processed yet.
-    socket.send(JSON.stringify(inbound({ message_id: 8 })));
-    socket.send(
-      JSON.stringify(
-        inbound({
-          message_type: "private",
-          sub_type: "friend",
-          message: "promote the first candidate",
-          message_id: 9,
-        }),
-      ),
-    );
-    expect(await errors.next()).toMatchObject({ code: "ingress_overflow", messageId: "8" });
-    // A private drop used to leave no trace at all: the diagnostic projection is keyed by
-    // group id, so a private message had nothing to be counted in.
-    expect(await diagnostics.next((diagnostic) => diagnostic.stage === "dropped")).toEqual({
-      stage: "dropped",
-      reason: "not_ready",
-    });
-    await adapter.stop();
+    const terminate = Reflect.get(WebSocket.prototype, "terminate") as (this: WebSocket) => void;
+    const terminateSpy = vi
+      .spyOn(WebSocket.prototype, "terminate")
+      .mockImplementation(function (this: WebSocket) {
+        if (this.url !== fake.endpoint) terminate.call(this);
+      });
+    try {
+      socket.send(JSON.stringify(inbound()));
+      await started;
+      socket.send(JSON.stringify(inbound({ message_id: 8 })));
+      expect(await errors.next()).toMatchObject({ code: "ingress_overflow", messageId: "8" });
+      expect(adapter.state.status).toBe("reconnecting");
+      expect(terminateSpy).toHaveBeenCalledOnce();
+      // Keep this adapter connection alive long enough to deliver a real subsequent frame
+      // after overflow has made the adapter not ready. The connection is still closed in finally.
+      socket.send(
+        JSON.stringify(
+          inbound({
+            message_type: "private",
+            sub_type: "friend",
+            message: "promote the first candidate",
+            message_id: 9,
+          }),
+        ),
+      );
+      // A private drop used to leave no trace at all: the diagnostic projection is keyed by
+      // group id, so a private message had nothing to be counted in.
+      expect(await diagnostics.next((diagnostic) => diagnostic.stage === "dropped")).toEqual({
+        stage: "dropped",
+        reason: "not_ready",
+      });
+    } finally {
+      terminateSpy.mockRestore();
+      await adapter.stop();
+    }
   });
 });

@@ -4053,8 +4053,9 @@ export class LongWorkStore {
   }
 
   /** Accepts a durable Task only with a matching recorded authorization decision. */
-  async acceptDurableTask(taskId: string, origin: LongWorkOrigin): Promise<void> {
+  async acceptDurableTask(taskId: string, origin: LongWorkOrigin, runId?: string): Promise<void> {
     requireIdentifier(taskId);
+    if (runId !== undefined) requireIdentifier(runId);
     if (origin.kind !== "decision") throw new Error("Task acceptance needs a principal decision");
     requireIdentifier(origin.decisionId);
     requireIdentifier(origin.actorPrincipalId);
@@ -4065,8 +4066,16 @@ export class LongWorkStore {
           LEFT JOIN grants g ON g.id = d.grant_id
           WHERE d.id = ? AND d.principal_id = ? AND d.resource_id = ?
             AND d.action = 'task:accept' AND d.scope_key = ? AND d.decision = 'ALLOW'
+            AND (? IS NULL OR d.run_id = ?)
             AND (d.grant_id IS NULL OR (g.id IS NOT NULL AND g.revoked_at IS NULL))`,
-        args: [origin.decisionId, origin.actorPrincipalId, `task-${taskId}`, task.origin_scope_key],
+        args: [
+          origin.decisionId,
+          origin.actorPrincipalId,
+          `task-${taskId}`,
+          task.origin_scope_key,
+          runId ?? null,
+          runId ?? null,
+        ],
       });
       if (!decision.rows[0]) throw new Error("Matching Task acceptance ALLOW decision is required");
       if (task.orchestration_mode !== "durable") throw new Error("Task is not durable work");
@@ -4088,12 +4097,13 @@ export class LongWorkStore {
         metadata: { previousStatus: "REVIEW", status: "DONE", completedAt: now },
       });
       await tx.execute({
-        sql: `INSERT INTO ops_trace_events(event_id,ts,type,task_id,principal_id,data_json)
-          VALUES (?,?, 'task.accepted',?,?,?)`,
+        sql: `INSERT INTO ops_trace_events(event_id,ts,type,task_id,run_id,principal_id,data_json)
+          VALUES (?,?, 'task.accepted',?,?,?,?)`,
         args: [
           randomUUID(),
           now,
           taskId,
+          runId ?? null,
           origin.actorPrincipalId,
           JSON.stringify({ previousStatus: "REVIEW", newStatus: "DONE", completedAt: now }),
         ],

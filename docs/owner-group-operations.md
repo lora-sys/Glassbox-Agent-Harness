@@ -748,8 +748,11 @@ begins. Durations in unrelated clauses do not change a complete mute request. A 
 cannot silently retarget a different named group.
 
 Nickname/card matching is exact and case-sensitive, with no Unicode normalization,
-whitespace normalization, substring or fuzzy matching. The parser removes only syntax
-quotes and surrounding command whitespace. Multiple matching fields or duplicate records
+whitespace normalization, substring or fuzzy matching. The current-message parser also accepts
+explicit labels such as "把群里昵称叫 Brian 的成员禁言 30 秒" and
+"把群名片是「Ripped Space」的群友禁言 2 分钟". It places only the literal name in
+`memberSelector`; it never asks the model to supply a QQ ID. Unquoted alternatives fail closed.
+The parser removes only syntax quotes and surrounding command whitespace. Multiple matching fields or duplicate records
 for one QQ ID identify one member. Matches across multiple QQ IDs are ambiguous. An
 absent, ambiguous, malformed, or unauthorized roster produces a fixed response asking for
 the member's QQ number; it never triggers a model-chosen fallback target.
@@ -772,8 +775,12 @@ The existing one-attempt mutation gate applies even after an unknown or failed p
 response. Cancellation during resolution or role verification prevents dispatch.
 
 The application verifies OneBot success before projecting `get_login_info`,
-`get_group_member_list` and `get_group_member_info` response data. Their Tools still check
-identity and response shape before returning a bot ID, count or role. All other provider
+`get_group_member_list` and `get_group_member_info` response data. Group Runs receive only
+the member count. An authorized Owner-private Run may receive at most 50 member QQ IDs,
+native group roles, group cards and nicknames, together with the full count and a truncation
+flag. A single-member query reports the verified QQ ID, existence and native group role,
+with a bounded group card and nickname only in the Owner's private chat. The Tools check
+identity and response shape and exclude other provider profile fields. All other provider
 operations retain their existing success-envelope contract. Failed and unknown envelopes
 are never treated as successful data, and nested objects with a `data` key are not unwrapped.
 
@@ -781,3 +788,15 @@ Model-facing group capability call examples omit the server-bound `groupId`. The
 required input still retains it for mutation authorization, completion checks and evidence.
 Owner-private call examples keep their explicit group target. Both the initial Pi prompt and
 retry instructions use the same projection.
+
+
+## Bot role observations for moderation
+
+The requesting sender's nativeGroupRole and the configured Bot's native QQ role are distinct facts. For an exact moderation request, the server may read only the configured Bot ID in the bound authorized group after Tool discovery, category, operation and acceptance-lease checks, including the existing target assignment for Owner-private requests. Group requests additionally recheck the requesting sender's native management role. Owner-private requests follow Owner authorization and do not require the Owner's QQ group management role.
+
+The role-only observation has its own Trace event and per-Run authorization callback. Current authority is rechecked after the read and before every provider context call. Revocation clears the fact and refuses that context. Unknown remains unknown; it cannot become a claim that the Bot lacks administrator status. Bot role never grants caller authority or replaces the Tool result required to prove a moderation action. No historical Trace is amended with new observations.
+
+
+Real QQ acceptance leases can carry a nativeMuteState condition for one exact set_group_ban operation. The condition is server-owned execution metadata, not a model parameter or QQ argument. Before invoking the mutation, the server reads the same target through no-cache member info, checks its identity, ordinary-member role and exact expected mute timestamp, then rechecks authorization and the lease. Mute requires a currently unmuted target; unmute requires the previously verified window to remain active. A changed or expired window refuses the operation. This read is not atomic with QQ mutation because OneBot has no compare-and-set API.
+
+The acceptance observer requires a same-Run, same-lease native_mute_state_precondition_verified witness between Tool start and successful result, plus independent QQ operation notices and current member state. Missing evidence remains unverified. Natural expiration is not evidence of a successful unmute. Unknown mutation or cleanup state remains blocked without automatic resending.

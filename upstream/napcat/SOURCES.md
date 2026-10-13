@@ -1,5 +1,18 @@
 # NapCat source index
 
+## Runtime image pin
+
+The Linux deployment compose file pins `mlikiowa/napcat-docker` v4.18.30 at digest
+`sha256:335f9310198504d8d07aba91cc91d89215269891919c26eb4e46052ff8bb176d`. This runtime pin is
+separate from the OneBot action-contract source pin below. NapCat v4.18.30 waits 60 seconds after
+a silent offline signal, then restarts its Worker and tries quick login. If QQ rejects quick login,
+the account still requires a new QR confirmation. This improves recovery after a session expires;
+it cannot prevent QQ from revoking a session.
+
+The version was validated in an isolated container without a network or account-state mounts. That
+check confirms container and WebUI startup only. Real account recovery still requires a controlled
+live test after the user is available.
+
 Reference project: `NapNeko/NapCatQQ`
 
 Pinned commit: `109d0c1dff755875f3b79795e99cee6115289fbb`
@@ -117,6 +130,18 @@ get_group_msg_history
 through the current OneBot connection.
 
 Group history remains a protected source and is authorized before retrieval.
+
+For private acceptance receipt recovery, the pinned action is
+`get_friend_msg_history`, declared by `ActionName.GetFriendMsgHistory` in
+`packages/napcat-onebot/action/router.ts` and implemented in
+`packages/napcat-onebot/action/go-cqhttp/GetFriendMsgHistory.ts`. Its payload
+requires `user_id` and `count`; `message_seq`, `reverse_order`,
+`disable_get_url`, `parse_mult_msg`, `quick_reply`, and the compatibility
+`reverseOrder` are optional. Its response is `{ messages: [...] }`. The live
+acceptance adapter uses only the configured Bot as `user_id`, requests at most
+20 records, disables URL fetching, and returns message hashes and identifiers
+without exposing message text. This is a fixed audit read, not a model Tool or
+a general history search surface.
 
 The pinned `GetGroupMsgHistory` action treats `message_seq` as an opaque short message id.
 It resolves that id through `MessageUnique` before calling QQ. Response `message_seq` values

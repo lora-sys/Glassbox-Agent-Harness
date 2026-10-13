@@ -18,7 +18,6 @@ describe("QQ delivery presentation", () => {
     ["POSIX path", "目录是 /home/owner/private"],
     ["loopback URL", "服务在 http://127.0.0.1:3030/manage"],
     ["internal domain", "服务在 https://api.service.internal/manage"],
-    ["internal UUID", "run 83a4513a-742f-4d87-b047-ec67cc775c98"],
     ["configured value", "profile p3-internal-model"],
   ])("blocks %s before QQ delivery", (_name, candidate) => {
     const policy = createQqDeliveryPolicy({ forbiddenValues: ["p3-internal-model"] });
@@ -52,8 +51,23 @@ describe("QQ delivery presentation", () => {
     expect(
       policy.prepare(`截图 Artifact：${artifactId}；Run：${otherId}`, [artifactId]),
     ).toMatchObject({
+      allowed: true,
+      text: `截图 Artifact：${artifactId}；Run：【内部编号已隐藏】`,
+      redactedInternalUuidCount: 1,
+    });
+  });
+
+  it("redacts unknown UUIDs but still blocks other unsafe content", () => {
+    const id = "83a4513a-742f-4d87-b047-ec67cc775c98";
+    const policy = createQqDeliveryPolicy({ forbiddenValues: ["private-profile"] });
+    expect(policy.prepare(`任务失败，内部编号 ${id}。`)).toMatchObject({
+      allowed: true,
+      text: "任务失败，内部编号 【内部编号已隐藏】。",
+      redactedInternalUuidCount: 1,
+    });
+    expect(policy.prepare(`配置 private-profile 失败，编号 ${id}。`)).toMatchObject({
       allowed: false,
-      reasons: ["internal-uuid"],
+      reasons: ["internal-uuid", expect.stringMatching(/^configured:/u)],
     });
   });
 
@@ -66,8 +80,9 @@ describe("QQ delivery presentation", () => {
       mediaAssetIds: [assetId],
     });
     expect(policy.prepare(`图片已生成 [asset:${assetId}]`)).toMatchObject({
-      allowed: false,
-      reasons: ["internal-uuid"],
+      allowed: true,
+      text: "图片已生成 【未验证资源编号已隐藏】",
+      redactedInternalUuidCount: 1,
     });
   });
 

@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
 import {
@@ -37,11 +37,21 @@ const FULL_TEST_FALLBACK = [
   ],
 ];
 
+/** Git hooks export repository selectors which must not escape into disposable test repos. */
+function verificationChildEnvironment(environment = process.env) {
+  const child = { ...environment };
+  for (const key of Object.keys(child)) {
+    if (key.startsWith("GIT_")) delete child[key];
+  }
+  return child;
+}
+
 function run(command, args) {
   console.log(`\n> ${command} ${args.join(" ")}`);
   const result = spawnSync(command, args, {
     cwd: process.cwd(),
     stdio: "inherit",
+    env: verificationChildEnvironment(),
     shell: false,
   });
 
@@ -58,6 +68,7 @@ function capture(command, args) {
   const result = spawnSync(command, args, {
     cwd: process.cwd(),
     encoding: "utf8",
+    maxBuffer: 64 * 1024 * 1024,
     shell: false,
   });
 
@@ -262,7 +273,27 @@ function runTestCommandWithCache(args, scope) {
 
 // Scripts are outside the unit suite's include pattern, so their tests only run where a runner
 // names them. Listing them here is what keeps them from being files nobody executes.
+/** Keep every current and newly added QQ regression in both delivery gates. */
+function discoverQqLiveTests(repoRoot = fileURLToPath(new URL("../", import.meta.url))) {
+  const names = readdirSync(resolve(repoRoot, "tools/qq-live/test"), { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".test.mjs"))
+    .map((entry) => `tools/qq-live/test/${entry.name}`)
+    .sort();
+  if (!names.length) throw new Error("QQ live regression directory has no test files");
+  return names;
+}
+
 const SCRIPT_TESTS = [
+  "scripts/test/check-test-hygiene.test.mjs",
+  "scripts/test/dependency-snapshot.test.mjs",
+  "scripts/test/vite-plus-alias.test.mjs",
+  "scripts/service-source-identity.test.mjs",
+  "scripts/test/agent-service-source-identity.test.mjs",
+  "scripts/test/service-shutdown.test.mjs",
+  "scripts/test/agent-service-shutdown.integration.test.mjs",
+  ...discoverQqLiveTests(),
+  ".agents/skills/qq-live-testing/scripts/helpers.test.mjs",
+  ".claude/skills/qq-live-testing/scripts/helpers.test.mjs",
   "scripts/verify-commit.test.mjs",
   "scripts/migrate-windows-workspaces.test.mjs",
 ];
@@ -291,6 +322,9 @@ function runStagedChecks(entries) {
 }
 
 export {
+  verificationChildEnvironment,
+  capture,
+  discoverQqLiveTests,
   canReuseTestCache,
   getTestIntegrityIssues,
   isTestFilePath,

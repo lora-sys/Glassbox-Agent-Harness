@@ -26,6 +26,7 @@ import { scopeKey, type CallerContext } from "../identity/scope.js";
 import type { DomainStore } from "../persistence/index.js";
 import { stringColumn } from "../persistence/database.js";
 import type { HerdrBridge } from "./herdr-bridge.js";
+import { OpsStateError, type WorkerDispatchFailure } from "./errors.js";
 import { DEFAULT_TASK_GRAPH_LIMITS } from "./task-graph.js";
 import { parseCheckpointWriteSpec, parseTaskGetSpec } from "./tool-step-spec.js";
 import { parseWorkerTextFileSpec } from "./worker-file-spec.js";
@@ -267,7 +268,7 @@ export class AuthorizedOpsService {
       });
       if (decision.decision === "ALLOW") allowedActions.push(action);
     }
-    if (!allowedActions.length) throw new Error("No delegated file authority");
+    if (!allowedActions.length) throw new OpsStateError("worker_file_authority_missing");
     const writable = allowedActions.includes("worker:file:write");
     if (productWorkspaceId) {
       const workspaceAction = writable ? "workspace:write" : "workspace:read";
@@ -795,7 +796,7 @@ export class AuthorizedOpsService {
       conversationId?: string;
       runId?: string;
     },
-  ): Promise<AgentTask> {
+  ): Promise<AgentTask & { dispatchFailure?: WorkerDispatchFailure }> {
     await this.authorize(
       caller,
       input.taskId ? `task-${input.taskId}` : OPS_RESOURCE,
@@ -819,6 +820,7 @@ export class AuthorizedOpsService {
       let worker: StartedWorker | undefined;
       let dispatchSession: string | undefined;
       let phase = "worker_context";
+      let dispatchFailure: WorkerDispatchFailure | undefined;
       try {
         context = await this.workerContext(caller, task.id, attempt.id, input.worktreePath);
         phase = "snapshot";
@@ -886,12 +888,19 @@ export class AuthorizedOpsService {
         });
       } catch (error) {
         await this.failedDispatch(attempt.id, context, started, worker, dispatchSession);
-        await this.store.tasks.recordDispatchProblem(task.id, attempt.id, caller.principalId, {
+        dispatchFailure = {
           phase,
+          code: error instanceof OpsStateError ? error.code : "worker_dispatch_failed",
+        };
+        await this.store.tasks.recordDispatchProblem(task.id, attempt.id, caller.principalId, {
+          ...dispatchFailure,
           errorName: safeErrorName(error),
         });
       }
-      return (await this.store.tasks.getTask(task.id))!;
+      return {
+        ...(await this.store.tasks.getTask(task.id))!,
+        ...(dispatchFailure ? { dispatchFailure } : {}),
+      };
     });
   }
 
@@ -1113,10 +1122,10 @@ export class AuthorizedOpsService {
   private async binding(caller: CallerContext, taskId: string, action: string) {
     await this.authorize(caller, `task-${taskId}`, action);
     const task = await this.store.tasks.getTask(taskId);
-    if (!task?.activeAttemptId) throw new Error(`Task has no active attempt: ${taskId}`);
+    if (!task?.activeAttemptId) throw new OpsStateError("worker_not_started");
     const binding = await this.store.tasks.getWorkerBinding(task.activeAttemptId);
-    if (!binding) throw new Error(`Task attempt has no WorkerBinding: ${task.activeAttemptId}`);
-    if (!binding.agentName) throw new Error("Worker binding has no verified agent identity");
+    if (!binding) throw new OpsStateError("worker_not_started");
+    if (!binding.agentName) throw new OpsStateError("worker_binding_unverified");
     return { task, binding };
   }
 
@@ -1354,15 +1363,19 @@ export class AuthorizedOpsService {
     await this.bridge.promptAgent({ paneId: binding.paneId, agentName: binding.agentName, prompt });
   }
 
-  async accept(caller: CallerContext, taskId: string): Promise<void> {
-    const decision = await this.authorize(caller, `task-${taskId}`, "task:accept");
+  async accept(caller: CallerContext, taskId: string, evidence?: RunEvidence): Promise<void> {
+    const decision = await this.authorize(caller, `task-${taskId}`, "task:accept", evidence);
     const task = await this.store.tasks.getTask(taskId);
     if (task?.orchestrationMode === "durable") {
-      await this.store.longWork.acceptDurableTask(taskId, {
-        kind: "decision",
-        decisionId: decision.id,
-        actorPrincipalId: caller.principalId,
-      });
+      await this.store.longWork.acceptDurableTask(
+        taskId,
+        {
+          kind: "decision",
+          decisionId: decision.id,
+          actorPrincipalId: caller.principalId,
+        },
+        evidence?.runId,
+      );
     } else {
       if (this.workspaceBoundary) {
         if (task?.status !== "REVIEW") throw new Error("Task is not ready for acceptance");
@@ -1376,7 +1389,7 @@ export class AuthorizedOpsService {
             herdrSession: binding.herdrSession,
           });
       }
-      await this.store.tasks.acceptTask(taskId, caller.principalId);
+      await this.store.tasks.acceptTask(taskId, caller.principalId, evidence?.runId);
     }
   }
 
@@ -1443,7 +1456,7 @@ export class AuthorizedOpsService {
     return this.withTaskOperation(taskId, async () => {
       const current = await this.binding(caller, taskId, "task:rework");
       await this.authorize(caller, `task-${taskId}`, "worker:prompt");
-      if (current.task.status !== "REVIEW") throw new Error("Task is not ready for rework");
+      if (current.task.status !== "REVIEW") throw new OpsStateError("task_not_ready_for_rework");
       if (this.workspaceBoundary)
         await this.closeWorker(current.task.activeAttemptId!, {
           paneId: current.binding.paneId,
@@ -1548,8 +1561,9 @@ export class AuthorizedOpsService {
     caller: CallerContext,
     taskId: string,
     reason?: string,
+    evidence?: RunEvidence,
   ): Promise<boolean | undefined> {
-    const decision = await this.authorize(caller, `task-${taskId}`, "task:cancel");
+    const decision = await this.authorize(caller, `task-${taskId}`, "task:cancel", evidence);
     return this.withTaskOperation(taskId, async () => {
       const task = await this.store.tasks.getTask(taskId);
       if (task?.orchestrationMode === "durable") {
@@ -1585,14 +1599,14 @@ export class AuthorizedOpsService {
       const alreadyCanceled = task.status === "CANCELED";
       if (!alreadyCanceled) {
         try {
-          await this.store.tasks.cancelTask(taskId, reason, caller.principalId);
+          await this.store.tasks.cancelTask(taskId, reason, caller.principalId, evidence?.runId);
         } catch (error) {
           if ((await this.store.tasks.getTask(taskId))?.status !== "CANCELED") throw error;
         }
       }
       if (binding && task.activeAttemptId) {
         try {
-          if (!binding.agentName) throw new Error("Worker binding has no verified agent identity");
+          if (!binding.agentName) throw new OpsStateError("worker_binding_unverified");
           await this.closeWorker(task.activeAttemptId, {
             paneId: binding.paneId,
             agentName: binding.agentName,

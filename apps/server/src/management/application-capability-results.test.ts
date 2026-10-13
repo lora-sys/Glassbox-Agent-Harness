@@ -1,6 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { expect, it } from "vite-plus/test";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -69,6 +70,23 @@ async function fixture() {
     conversationId: accepted.conversation.id,
     authorizedToolNames: ["qq_account_status", "qq_group_members", "qq_group_moderation"],
   };
+  const verifiedInputs: Array<{
+    runId: string;
+    conversationId: string;
+    principalId: string;
+    toolCallId: string;
+    toolName: "qq_group_members" | "qq_group_moderation";
+    leaseId: string | null;
+    action: "get_group_member_info" | "set_group_ban";
+    resourceId: string;
+    inputSha256: string;
+    inputBytes: number;
+  }> = [];
+  const executionOrder: string[] = [];
+  context.recordQqToolExecutionInput = async (record) => {
+    executionOrder.push("witness");
+    verifiedInputs.push({ runId: context.runId!, ...record });
+  };
   const calls: Array<{ action: string; params: Record<string, unknown> }> = [];
   const responses = new Map<string, OneBotCapabilityResult>();
   let response: OneBotCapabilityResult = { status: "ok", data: null };
@@ -83,21 +101,30 @@ async function fixture() {
         stop(): Promise<void>;
       }
     >;
-    createRuntimeTools(getContext: () => PiRunContext): ToolDefinition[];
+    createRuntimeTools(
+      getContext: () => PiRunContext,
+      definitionContext?: Readonly<PiRunContext>,
+    ): ToolDefinition[];
   };
   application.connections.set("fixture", {
     invokeCapability: async (input) => {
+      executionOrder.push("provider");
       calls.push(input);
       return responses.get(input.action) ?? response;
     },
     stop: async () => {},
   });
-  const tools = application.createRuntimeTools(() => context);
+  const toolsFor = (value: PiRunContext) => application.createRuntimeTools(() => value, value);
+  const tools = toolsFor(context);
   return {
     context,
     calls,
+    verifiedInputs,
+    executionOrder,
     responses,
     app,
+    tools,
+    toolsFor,
     set response(value: OneBotCapabilityResult) {
       response = value;
     },
@@ -112,6 +139,52 @@ async function fixture() {
   };
 }
 
+it("passes the SDK definition context through the application capability factory", async () => {
+  const f = await fixture();
+  try {
+    const branches = (schema: unknown) => {
+      const value = schema as {
+        anyOf?: Array<{
+          properties?: Record<string, unknown>;
+          required?: string[];
+        }>;
+        properties?: Record<string, unknown>;
+        required?: string[];
+      };
+      return value.anyOf ?? [value];
+    };
+    const privateMembers = branches(
+      f.tools.find((tool) => tool.name === "qq_group_members")!.parameters,
+    );
+    expect(privateMembers.length).toBeGreaterThan(0);
+    for (const branch of privateMembers) {
+      expect(branch.properties).toHaveProperty("groupId");
+      expect(branch.required).toContain("groupId");
+    }
+
+    const scope = {
+      ...f.context.caller!.scope,
+      chatType: "group" as const,
+      chatId: "10003",
+    };
+    const groupContext: PiRunContext = {
+      ...f.context,
+      caller: { principalId: "owner", scope },
+    };
+    const groupTools = f.toolsFor(groupContext);
+    const groupMembers = branches(
+      groupTools.find((tool) => tool.name === "qq_group_members")!.parameters,
+    );
+    expect(groupMembers.length).toBeGreaterThan(0);
+    for (const branch of groupMembers) {
+      expect(branch.properties).not.toHaveProperty("groupId");
+      expect(branch.required ?? []).not.toContain("groupId");
+    }
+  } finally {
+    await f.close();
+  }
+});
+
 it.each([
   {
     name: "qq_account_status",
@@ -122,14 +195,32 @@ it.each([
   {
     name: "qq_group_members",
     input: { groupId: "10003", operation: "get_group_member_list" },
-    data: [{ user_id: 10004, nickname: "private-member-name" }],
-    expected: { memberCount: 1 },
+    data: [{ user_id: 10004, role: "member", nickname: "private-member-name" }],
+    expected: {
+      memberCount: 1,
+      members: [{ qqId: "10004", groupRole: "member", nickname: "private-member-name" }],
+      truncated: false,
+    },
   },
   {
     name: "qq_group_members",
-    input: { groupId: "10003", operation: "get_group_member_info", params: { user_id: 10004 } },
-    data: { user_id: 10004, group_id: 10003, role: "admin", nickname: "private-member-name" },
-    expected: { role: "qq_group_admin" },
+    input: {
+      groupId: "10003",
+      operation: "get_group_member_info",
+      params: { user_id: 10004 },
+    },
+    data: {
+      user_id: 10004,
+      group_id: 10003,
+      role: "admin",
+      nickname: "private-member-name",
+    },
+    expected: {
+      qqId: "10004",
+      memberExists: true,
+      groupRole: "admin",
+      nickname: "private-member-name",
+    },
   },
 ])(
   "projects verified OneBot data through ManagementApplication and the actual Tool: $input.operation",
@@ -139,12 +230,67 @@ it.each([
       f.response = { status: "ok", data };
       const result = await f.call(name, input);
       expect(result.details).toEqual(expected);
-      expect(JSON.stringify(result)).not.toContain("private-");
+      if (name === "qq_account_status") expect(JSON.stringify(result)).not.toContain("private-");
+      else expect(JSON.stringify(result)).toContain("private-member-name");
     } finally {
       await f.close();
     }
   },
 );
+
+it("records a digest of the normalized Bot-role provider input before OneBot invocation", async () => {
+  const f = await fixture();
+  try {
+    f.response = {
+      status: "ok",
+      data: { group_id: 10003, user_id: 10004, role: "admin" },
+    };
+    await f.call("qq_group_members", {
+      groupId: "10003",
+      operation: "get_group_member_info",
+      params: { user_id: 10004 },
+    });
+    const canonical = '{"group_id":10003,"user_id":10004}';
+    expect(f.verifiedInputs).toEqual([
+      {
+        runId: f.context.runId,
+        conversationId: f.context.conversationId,
+        principalId: "owner",
+        toolCallId: "fixture",
+        toolName: "qq_group_members",
+        leaseId: null,
+        action: "get_group_member_info",
+        resourceId: "group:10003",
+        inputSha256: createHash("sha256").update(canonical, "utf8").digest("hex"),
+        inputBytes: Buffer.byteLength(canonical, "utf8"),
+      },
+    ]);
+    expect(f.executionOrder).toEqual(["witness", "provider"]);
+    expect(JSON.stringify(f.verifiedInputs)).not.toMatch(/params|user_id|group_id/u);
+  } finally {
+    await f.close();
+  }
+});
+
+it("does not invoke OneBot when verified-input evidence persistence fails", async () => {
+  const f = await fixture();
+  try {
+    f.context.recordQqToolExecutionInput = async () => {
+      throw new Error("trace_write_failed");
+    };
+    await expect(
+      f.call("qq_group_members", {
+        groupId: "10003",
+        operation: "get_group_member_info",
+        params: { user_id: 10004 },
+      }),
+    ).rejects.toThrow("protected_tool_failed");
+    expect(f.calls).toEqual([]);
+    expect(f.executionOrder).toEqual([]);
+  } finally {
+    await f.close();
+  }
+});
 
 it("keeps the generic mutation success envelope and refuses failed provider envelopes", async () => {
   const f = await fixture();
@@ -192,7 +338,10 @@ it("resolves a nickname through the real application projection and records its 
     expect(result.details).toEqual({ status: "ok", data: null });
     expect(f.calls).toEqual([
       { action: "get_group_member_list", params: { group_id: 10003 } },
-      { action: "set_group_ban", params: { group_id: 10003, user_id: 10004, duration: 30 } },
+      {
+        action: "set_group_ban",
+        params: { group_id: 10003, user_id: 10004, duration: 30 },
+      },
     ]);
     const trace = await f.app.trace.readPage(f.context.runId!);
     expect(JSON.stringify(trace)).toContain("moderation_target_resolution");
@@ -234,7 +383,10 @@ it.each([
   try {
     f.response = response;
     await expect(
-      f.call("qq_group_members", { groupId: "10003", operation: "get_group_member_list" }),
+      f.call("qq_group_members", {
+        groupId: "10003",
+        operation: "get_group_member_list",
+      }),
     ).rejects.toThrow(/^provider_/u);
   } finally {
     await f.close();
@@ -244,9 +396,15 @@ it.each([
 it("refuses a nested data-shaped object instead of blindly unwrapping it", async () => {
   const f = await fixture();
   try {
-    f.response = { status: "ok", data: { data: [{ user_id: 10004, nickname: "private-name" }] } };
+    f.response = {
+      status: "ok",
+      data: { data: [{ user_id: 10004, nickname: "private-name" }] },
+    };
     await expect(
-      f.call("qq_group_members", { groupId: "10003", operation: "get_group_member_list" }),
+      f.call("qq_group_members", {
+        groupId: "10003",
+        operation: "get_group_member_list",
+      }),
     ).rejects.toThrow("invalid_response");
   } finally {
     await f.close();

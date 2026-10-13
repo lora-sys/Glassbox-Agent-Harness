@@ -5,7 +5,7 @@
 // 既慢又不一致。这个 CLI 把"起环境、找 run、看 trace、溯源"固定成确定性命令。
 //
 // 只读：本 CLI 只读取 trace 文件，不写任何数据。Raw Trace 是不可变证据，永远不要改写它。
-// 数据目录解析顺序与服务启动器一致：--data-dir > GLASSBOX_DATA_DIR > ~/.glassbox/runs > <repo>/.glassbox/runs
+// --data-dir 指定 runs 目录；GLASSBOX_DATA_DIR 指定产品根目录，Trace 在其 runs/ 子目录。
 
 import { promises as fs } from "node:fs";
 import { createConnection } from "node:net";
@@ -19,13 +19,15 @@ const DEFAULT_PORT = 3030;
 
 function repoRootFromHere() {
   // <repo>/.agents/skills/glassbox-ops/scripts/gbxtrace.mjs -> 上溯 5 层
-  return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../../..");
+  return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../..");
 }
 
 async function resolveRunsDir(flagValue) {
+  // Explicit targets must not silently fall back to another product's evidence.
+  if (flagValue) return { dir: path.resolve(flagValue), source: "flag" };
+  if (process.env.GLASSBOX_DATA_DIR)
+    return { dir: path.resolve(process.env.GLASSBOX_DATA_DIR, "runs"), source: "environment" };
   const candidates = [];
-  if (flagValue) candidates.push(path.resolve(flagValue));
-  if (process.env.GLASSBOX_DATA_DIR) candidates.push(path.resolve(process.env.GLASSBOX_DATA_DIR));
   candidates.push(path.join(os.homedir(), ".glassbox", "runs"));
   candidates.push(path.join(repoRootFromHere(), ".glassbox", "runs"));
   for (const dir of candidates) {
@@ -265,6 +267,22 @@ function eventSummary(entry) {
       if (isError) return paint(C.red, `ERROR ${name} failureCode=${failureCode ?? "-"}`);
       return output !== undefined ? `${name} output=${compact(output, 160)}` : `${name} (ok)`;
     }
+    case "authorization_projection_receipt": {
+      const decisions = pick("decisions");
+      return `kind=${str(pick("kind")) ?? "-"} purpose=${str(pick("purpose")) ?? "-"} tool=${str(pick("toolName")) ?? "-"} decisions=${Array.isArray(decisions) ? decisions.length : 0} inputBytes=${pick("inputBytes") ?? "-"} outputBytes=${pick("outputBytes") ?? "-"}`;
+    }
+    case "bot_native_group_role_observation":
+      return `group=${short(pick("groupId"), 10)} status=${str(pick("observationStatus")) ?? "-"} role=${str(pick("observedRole")) ?? "-"} subject=${str(pick("roleSubject")) ?? "-"}`;
+    case "requester_native_group_role_precheck":
+      return `group=${short(pick("groupId"), 10)} sender=${short(pick("senderId"), 10)} role=${str(pick("observedRole")) ?? "-"} status=${str(pick("verificationStatus")) ?? "-"} tool=${str(pick("requestedTool")) ?? "-"} action=${str(pick("requestedOperation")) ?? "-"} decision=${str(pick("authorizationDecision")) ?? "-"}`;
+    case "moderation_target_resolution":
+      return `group=${short(pick("groupId"), 10)} target=${short(pick("resolvedUserId"), 10)} duration=${pick("duration") ?? "-"} method=${str(pick("method")) ?? "-"} rosterDecision=${short(pick("rosterReadDecisionId"), 10)}`;
+    case "qq_moderation_preconditions":
+      return `resource=${short(pick("resourceId"), 10)} target=${short(pick("targetUserId"), 10)} status=${str(pick("verificationStatus")) ?? "-"} requested=${compact(pick("requested") ?? [], 100)} checks=${compact(pick("checks") ?? {}, 120)}`;
+    case "qq_tool_execution_input_verified":
+      return `tool=${str(pick("toolName")) ?? "-"} action=${str(pick("action")) ?? "-"} resource=${short(pick("resourceId"), 10)} call=${short(pick("toolCallId"), 12)} bytes=${pick("inputBytes") ?? "-"} sha=${short(pick("inputSha256"), 12)} lease=${short(pick("leaseId"), 10)}`;
+    case "native_mute_state_precondition_verified":
+      return `resource=${short(pick("resourceId"), 10)} phase=${str(pick("phase")) ?? "-"} expectedMuteUntil=${pick("expectedMuteUntil") ?? "-"} lease=${short(pick("leaseId"), 10)}`;
     case "tool_evidence":
       return `phase=${pick("phase") ?? "-"} ${compact(pick("required", "resolutions") ?? {}, 140)}`;
     case "routing_decision": {
@@ -317,6 +335,10 @@ function eventSummary(entry) {
       return `group=${short(pick("groupId"), 10)} verified=${str(pick("verifiedRole")) ?? "-"} status=${str(pick("status")) ?? "-"}`;
     case "media_generation_completed":
       return `provider=${str(pick("provider")) ?? "-"} mediaType=${str(pick("mediaType")) ?? "-"} assets=${(pick("assetIds") ?? []).length}`;
+    case "media_generation_request_admitted":
+      return `provider=${str(pick("provider")) ?? "-"} mediaType=${str(pick("mediaType")) ?? "-"} mode=${str(pick("mode")) ?? "-"} bytes=${pick("providerInputBytes") ?? "-"} promptBytes=${pick("promptBytes") ?? "-"} seconds=${pick("seconds") ?? "-"} ratio=${str(pick("ratio")) ?? "-"} refs=${pick("referenceCount") ?? "-"}`;
+    case "media_delivery_sent":
+      return `delivery=${short(pick("deliveryId"))} asset=${short(pick("assetId"))} external=${short(pick("externalId"), 14)} mime=${str(pick("mimeType")) ?? "-"} bytes=${pick("sizeBytes") ?? "-"} sha=${short(pick("sha256"), 12)}`;
     case "learning_candidate_created":
       return compact(pick("candidate") ?? data, 140);
     default: {
@@ -1371,7 +1393,7 @@ const USAGE = `gbxtrace — Glassbox run / raw-trace 调试 CLI（只读）
 通用选项:
   --json                              输出 JSON（供后续处理）
   --full                               展开明细（show 的 message_chunk / ingress 的逐条）
-  --data-dir <path>                    覆盖 runs 目录（默认 GLASSBOX_DATA_DIR → ~/.glassbox/runs）
+  --data-dir <path>                    覆盖 runs 目录（默认 GLASSBOX_DATA_DIR/runs → ~/.glassbox/runs）
 
 示例:
   gbxtrace runs --status failed --limit 5

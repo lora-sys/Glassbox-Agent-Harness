@@ -216,6 +216,112 @@ it("requests durable cancellation before settling and reports a running Step hon
   }
 });
 
+it("binds Task cancellation authorization and audit to the cleanup Run", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  const caller: CallerContext = {
+    principalId: "owner",
+    scope: {
+      connectionId: "test",
+      botId: "bot",
+      chatType: "private",
+      chatId: "owner",
+      senderId: "owner",
+    },
+  };
+  try {
+    await store.identities.bindOwner("owner", caller.scope);
+    await store.conversations.createAgent("personal");
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: "agent:personal",
+      action: "run:create",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    const creation = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: caller.scope,
+      messageId: "task-create-run-message",
+      text: "Create fixture Task",
+      executionRef: "pi:test",
+    });
+    const cleanup = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: caller.scope,
+      messageId: "task-cancel-run-message",
+      text: "Cancel fixture Task",
+      executionRef: "pi:test",
+    });
+    const task = await store.tasks.createTask({
+      title: "Run-bound fixture",
+      creatorPrincipalId: caller.principalId,
+      authorizationScope: caller.scope,
+      runId: creation.run.id,
+      conversationId: creation.conversation.id,
+    });
+    await store.authorization.grant({
+      principalId: caller.principalId,
+      resourceId: `task-${task.id}`,
+      action: "task:cancel",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    const service = new AuthorizedOpsService(store, new FakeHerdrBridge());
+
+    await expect(
+      service.cancel(caller, task.id, undefined, {
+        runId: cleanup.run.id,
+        conversationId: cleanup.conversation.id,
+      }),
+    ).resolves.toBeUndefined();
+
+    const evidence = await store.db.transaction(async (tx) => {
+      const taskRows = await tx.execute({
+        sql: "SELECT run_id, status FROM tasks WHERE id = ?",
+        args: [task.id],
+      });
+      const events = await tx.execute({
+        sql: "SELECT type, run_id FROM ops_trace_events WHERE task_id = ? ORDER BY sequence",
+        args: [task.id],
+      });
+      const decisions = await tx.execute({
+        sql: "SELECT run_id FROM authorization_decisions_all WHERE resource_id = ? AND action = 'task:cancel'",
+        args: [`task-${task.id}`],
+      });
+      return { task: taskRows.rows[0], events: events.rows, decisions: decisions.rows };
+    });
+    expect(evidence.task).toEqual({ run_id: creation.run.id, status: "CANCELED" });
+    expect(evidence.events).toEqual([
+      { type: "task.created", run_id: creation.run.id },
+      { type: "task.canceled", run_id: cleanup.run.id },
+    ]);
+    expect(evidence.decisions).toEqual([{ run_id: cleanup.run.id }]);
+
+    const legacyTask = await store.tasks.createTask({
+      title: "Non-Run cancellation",
+      creatorPrincipalId: caller.principalId,
+      authorizationScope: caller.scope,
+    });
+    await store.authorization.grant({
+      principalId: caller.principalId,
+      resourceId: `task-${legacyTask.id}`,
+      action: "task:cancel",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    await service.cancel(caller, legacyTask.id);
+    const legacyEvent = await store.db.transaction(async (tx) =>
+      tx.execute({
+        sql: "SELECT run_id FROM ops_trace_events WHERE task_id = ? AND type = 'task.canceled'",
+        args: [legacyTask.id],
+      }),
+    );
+    expect(legacyEvent.rows).toEqual([{ run_id: null }]);
+  } finally {
+    await store.close();
+  }
+});
+
 it("authorizes durable graph planning and step reads on the exact Task", async () => {
   const store = await openDomainStore({ databasePath: ":memory:" });
   const caller: CallerContext = {
@@ -891,7 +997,7 @@ it("preserves a failed rework attempt and never replays an uncertain prompt", as
       prompt: "Bounded work",
     });
     const binding = (await store.tasks.getWorkerBinding(task.activeAttemptId!))!;
-    await store.tasks.observeWorker(binding, "done");
+    expect(task.status).not.toBe("REVIEW");
     for (const action of ["task:rework", "worker:prompt"])
       await store.authorization.grant({
         principalId: "owner",
@@ -900,6 +1006,10 @@ it("preserves a failed rework attempt and never replays an uncertain prompt", as
         scope: caller.scope,
         effect: "allow",
       });
+    await expect(
+      service.rework(caller, task.id, "Not reviewed yet", "Do not run"),
+    ).rejects.toMatchObject({ code: "task_not_ready_for_rework" });
+    await store.tasks.observeWorker(binding, "done");
     const prompt = vi.spyOn(bridge, "promptAgent").mockRejectedValue(new Error("SECRET_FAILURE"));
     const reworked = await service.rework(caller, task.id, "Missing case", "Add case");
     expect(reworked.status).toBe("WAITING_INPUT");
@@ -974,7 +1084,7 @@ it("retains a Task and binding when dispatch fails without silently retrying the
           data: expect.objectContaining({
             status: "WAITING_INPUT",
             reason: "worker_dispatch_incomplete",
-            failure: { phase: "prompt_agent", errorName: "Error" },
+            failure: { phase: "prompt_agent", errorName: "Error", code: "worker_dispatch_failed" },
           }),
         }),
       ]),
@@ -1031,7 +1141,7 @@ it("fails an unbound dispatch and stops a worker launched before verification fa
           data: expect.objectContaining({
             status: "FAILED",
             reason: "worker_dispatch_unbound",
-            failure: { phase: "verify_worker", errorName: "Error" },
+            failure: { phase: "verify_worker", errorName: "Error", code: "worker_dispatch_failed" },
           }),
         }),
       ]),

@@ -4,7 +4,7 @@ import { mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/
 import net from "node:net";
 import { DatabaseSync } from "node:sqlite";
 import lockfile from "proper-lockfile";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { getServiceDataDir } from "../apps/server/src/platform/paths.js";
@@ -19,8 +19,11 @@ import {
 } from "./service-process-identity.mjs";
 
 const execFile = promisify(execFileCallback);
+import { serviceSourceIdentity } from "./service-source-identity.mjs";
+import { stopVerifiedProcess } from "./service-shutdown.mjs";
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const dataDirectory = getServiceDataDir();
+const DATABASE_COMPATIBILITY_BUSY_TIMEOUT_MS = 5_000;
 const statePath = join(dataDirectory, "service-processes.json");
 const priorStatePath = `${statePath}.previous`;
 const configPath = join(dataDirectory, "service-launch.json");
@@ -37,6 +40,14 @@ interface ProcessConfig {
 
 interface GlassboxConfig {
   env?: Record<string, string>;
+  checkout?: string;
+  expectedCommit?: string;
+}
+
+interface CheckoutIdentity {
+  checkout: string | null;
+  branch: string | null;
+  commit: string | null;
 }
 
 interface LaunchConfig {
@@ -51,6 +62,9 @@ interface ProcessState extends ProcessConfig {
   pid: number;
   startedAt: string;
   linuxIdentity?: LinuxProcessIdentity;
+  launchCommit?: string;
+  launchClean?: boolean;
+  launchSourceTreeSha256?: string;
 }
 
 type ProcessStatus = "running" | "stopped" | "unknown";
@@ -60,8 +74,33 @@ interface StartOptions {
   checkout?: string;
 }
 
-async function checkoutRoot(input?: string): Promise<string> {
-  const candidate = input ?? repoRoot;
+async function git(cwd: string, args: string[]): Promise<string | undefined> {
+  try {
+    const result = await execFile("git", ["-C", cwd, ...args], { windowsHide: true });
+    const text = typeof result?.stdout === "string" ? result.stdout.trim() : "";
+    return text.length > 0 ? text : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function checkoutIdentity(checkout: string): Promise<CheckoutIdentity> {
+  return {
+    checkout,
+    branch: (await git(checkout, ["symbolic-ref", "--short", "-q", "HEAD"])) ?? null,
+    commit: (await git(checkout, ["rev-parse", "HEAD"])) ?? null,
+  };
+}
+
+async function defaultCheckout(configured: string | undefined): Promise<string> {
+  if (configured) return configured;
+  const common = await git(repoRoot, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+  if (common && basename(common) === ".git") return dirname(common);
+  return repoRoot;
+}
+
+async function checkoutRoot(input?: string, config?: LaunchConfig): Promise<string> {
+  const candidate = input ?? (await defaultCheckout(config?.glassbox?.checkout));
   if (!isAbsolute(candidate)) throw new Error("Checkout path must be absolute");
   const root = await realpath(candidate);
   const manifest = JSON.parse(await readFile(join(root, "package.json"), "utf8")) as {
@@ -72,11 +111,21 @@ async function checkoutRoot(input?: string): Promise<string> {
     throw new Error("Glassbox server entry is unavailable");
   if (!(await stat(join(root, "node_modules/tsx"))).isDirectory())
     throw new Error("Checkout dependencies are unavailable; install them before switching");
+  const expected = config?.glassbox?.expectedCommit;
+  if (expected && input === undefined) {
+    const { commit } = await checkoutIdentity(root);
+    if (commit !== expected)
+      throw new Error(
+        `Checkout HEAD is ${commit ?? "unreadable"}, but service-launch.json expects ${expected}`,
+      );
+  }
   return root;
 }
 
-async function assertDatabaseCompatible(checkout: string): Promise<void> {
-  const databasePath = join(dataDirectory, "glassbox.db");
+export async function assertDatabaseCompatible(
+  checkout: string,
+  databasePath = join(dataDirectory, "glassbox.db"),
+): Promise<void> {
   try {
     if (!(await stat(databasePath)).isFile()) return;
   } catch (error) {
@@ -89,7 +138,10 @@ async function assertDatabaseCompatible(checkout: string): Promise<void> {
   );
   const supported = /export\s+const\s+CURRENT_SCHEMA_VERSION\s*=\s*(\d+)\s*;/u.exec(schemaSource);
   if (!supported) throw new Error("Target checkout does not declare a readable database version");
-  const database = new DatabaseSync(databasePath, { readOnly: true });
+  const database = new DatabaseSync(databasePath, {
+    readOnly: true,
+    timeout: DATABASE_COMPATIBILITY_BUSY_TIMEOUT_MS,
+  });
   let current: number;
   try {
     current = Number(
@@ -151,9 +203,20 @@ function glassboxConfig(value: unknown): GlassboxConfig | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value))
     throw new Error("Invalid Glassbox launch configuration");
   const item = value as Record<string, unknown>;
-  if (Object.keys(item).some((key) => key !== "env"))
+  if (Object.keys(item).some((key) => !["env", "checkout", "expectedCommit"].includes(key)))
     throw new Error("Invalid Glassbox launch configuration");
-  return item.env === undefined ? {} : { env: environment(item.env, "Glassbox") };
+  if (
+    (item.checkout !== undefined &&
+      (typeof item.checkout !== "string" || !isAbsolute(item.checkout))) ||
+    (item.expectedCommit !== undefined &&
+      (typeof item.expectedCommit !== "string" || !/^[0-9a-f]{40}$/u.test(item.expectedCommit)))
+  )
+    throw new Error("Invalid Glassbox launch configuration");
+  return {
+    ...(item.env === undefined ? {} : { env: environment(item.env, "Glassbox") }),
+    ...(item.checkout === undefined ? {} : { checkout: resolve(item.checkout as string) }),
+    ...(item.expectedCommit === undefined ? {} : { expectedCommit: item.expectedCommit }),
+  };
 }
 
 async function loadConfig(): Promise<LaunchConfig> {
@@ -183,16 +246,32 @@ function stateEntry(value: unknown): ProcessState {
   if (
     Object.keys(item).some(
       (key) =>
-        !["name", "pid", "startedAt", "executable", "args", "cwd", "env", "linuxIdentity"].includes(
-          key,
-        ),
+        ![
+          "name",
+          "pid",
+          "startedAt",
+          "executable",
+          "args",
+          "cwd",
+          "env",
+          "linuxIdentity",
+          "launchCommit",
+          "launchClean",
+          "launchSourceTreeSha256",
+        ].includes(key),
     ) ||
     !["herdr", "napcat", "glassbox"].includes(String(item.name)) ||
     !Number.isSafeInteger(item.pid) ||
     (item.pid as number) < 1 ||
     typeof item.startedAt !== "string" ||
     Number.isNaN(Date.parse(item.startedAt)) ||
-    (item.linuxIdentity !== undefined && !isLinuxProcessIdentity(item.linuxIdentity))
+    (item.linuxIdentity !== undefined && !isLinuxProcessIdentity(item.linuxIdentity)) ||
+    (item.launchCommit !== undefined &&
+      (typeof item.launchCommit !== "string" || !/^[a-f0-9]{40}$/.test(item.launchCommit))) ||
+    (item.launchClean !== undefined && typeof item.launchClean !== "boolean") ||
+    (item.launchSourceTreeSha256 !== undefined &&
+      (typeof item.launchSourceTreeSha256 !== "string" ||
+        !/^[a-f0-9]{64}$/.test(item.launchSourceTreeSha256)))
   )
     throw new Error("Invalid service state");
   const config = processConfig(
@@ -209,6 +288,11 @@ function stateEntry(value: unknown): ProcessState {
     name: item.name as ProcessName,
     pid: item.pid as number,
     startedAt: item.startedAt,
+    ...(item.launchCommit === undefined ? {} : { launchCommit: item.launchCommit as string }),
+    ...(item.launchClean === undefined ? {} : { launchClean: item.launchClean as boolean }),
+    ...(item.launchSourceTreeSha256 === undefined
+      ? {}
+      : { launchSourceTreeSha256: item.launchSourceTreeSha256 as string }),
     ...(item.linuxIdentity === undefined ? {} : { linuxIdentity: item.linuxIdentity }),
     ...config,
   };
@@ -358,6 +442,13 @@ async function processStatus(entry: ProcessState): Promise<ProcessStatus> {
       : "stopped";
   }
   if (await linuxProcessHasExited(entry.pid)) return "stopped";
+  const currentIdentity = await readLinuxProcessIdentity(entry.pid);
+  if (
+    entry.linuxIdentity &&
+    currentIdentity &&
+    currentIdentity.bootId !== entry.linuxIdentity.bootId
+  )
+    return "stopped";
   if (await verifyLinuxProcess(entry)) return "running";
   if (await linuxProcessHasExited(entry.pid)) return "stopped";
   return alive(entry.pid) ? "unknown" : "stopped";
@@ -385,6 +476,10 @@ async function startProcess(name: ProcessName, config: ProcessConfig): Promise<P
     throw new Error(`${name} executable is unavailable`);
   if (config.cwd && !(await stat(config.cwd)).isDirectory())
     throw new Error(`${name} working directory is unavailable`);
+  const sourceIdentity =
+    name === "glassbox" ? serviceSourceIdentity(config.cwd ?? repoRoot) : undefined;
+  if (sourceIdentity?.launchClean === false && !sourceIdentity.launchSourceTreeSha256)
+    throw new Error("Cannot start Glassbox from a dirty checkout without a source tree digest");
   const descriptor = openSync(logPath, "a");
   try {
     const child = spawn(config.executable, config.args, {
@@ -404,6 +499,7 @@ async function startProcess(name: ProcessName, config: ProcessConfig): Promise<P
       ...config,
       pid: child.pid,
       startedAt: new Date().toISOString(),
+      ...sourceIdentity,
       ...(linuxIdentity === undefined ? {} : { linuxIdentity }),
     };
   } finally {
@@ -502,35 +598,33 @@ async function stopEntry(entry: ProcessState): Promise<void> {
   if (process.platform === "win32") {
     if (entry.name === "glassbox") await requestGlassboxShutdown(entry).catch(() => undefined);
     else await execFile("taskkill.exe", ["/PID", String(entry.pid), "/T"]).catch(() => undefined);
-  } else {
-    process.kill(entry.pid, "SIGTERM");
-  }
-  const gracefulDeadline = Date.now() + 5_000;
-  const stillRunning = async () =>
-    process.platform === "win32"
-      ? alive(entry.pid)
-      : (await knownProcessStatus(entry)) === "running";
-  while ((await stillRunning()) && Date.now() < gracefulDeadline)
-    await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
-  if (!(await stillRunning())) return;
-  if ((await knownProcessStatus(entry)) === "stopped") return;
-  if (process.platform === "win32")
+    const gracefulDeadline = Date.now() + 5_000;
+    while (alive(entry.pid) && Date.now() < gracefulDeadline)
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
+    if (!alive(entry.pid)) return;
+    if ((await knownProcessStatus(entry)) === "stopped") return;
     await execFile("taskkill.exe", ["/PID", String(entry.pid), "/T", "/F"]);
-  else process.kill(entry.pid, "SIGKILL");
-  const forcedDeadline = Date.now() + 5_000;
-  while ((await stillRunning()) && Date.now() < forcedDeadline)
-    await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
-  if (await stillRunning()) throw new Error(`${entry.name} did not stop`);
+    const forcedDeadline = Date.now() + 5_000;
+    while (alive(entry.pid) && Date.now() < forcedDeadline)
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
+    if (alive(entry.pid)) throw new Error(`${entry.name} did not stop`);
+    return;
+  }
+  await stopVerifiedProcess({
+    getStatus: () => processStatus(entry),
+    signal: () => process.kill(entry.pid, "SIGTERM"),
+    force: () => process.kill(entry.pid, "SIGKILL"),
+  });
 }
 
 async function up(options: StartOptions = {}): Promise<void> {
-  const checkout = await checkoutRoot(options.checkout);
+  const config = await loadConfig();
+  const checkout = await checkoutRoot(options.checkout, config);
   await assertDatabaseCompatible(checkout);
   await mkdir(dataDirectory, { recursive: true, mode: 0o700 });
   const prior = await loadState();
   const live = await runningState(prior);
   await writeState(live);
-  const config = await loadConfig();
   const desired: Array<[ProcessName, ProcessConfig | undefined]> = [
     ["herdr", config.herdr],
     ["napcat", options.skipNapcat ? undefined : config.napcat],
@@ -577,13 +671,21 @@ async function up(options: StartOptions = {}): Promise<void> {
     await writeState(live.filter((entry) => !started.includes(entry)));
     throw error;
   }
+  const glassbox = live.find((entry) => entry.name === "glassbox");
   process.stdout.write(
-    `${JSON.stringify({ status: "started", processes: live.map(({ name, pid }) => ({ name, pid })), logPath })}\n`,
+    `${JSON.stringify({
+      status: "started",
+      checkout,
+      commit: glassbox?.launchCommit ?? null,
+      processes: live.map(({ name, pid }) => ({ name, pid })),
+      logPath,
+    })}\n`,
   );
 }
 
 async function switchCheckout(options: StartOptions = {}): Promise<void> {
-  const checkout = await checkoutRoot(options.checkout);
+  const config = await loadConfig();
+  const checkout = await checkoutRoot(options.checkout, config);
   await assertDatabaseCompatible(checkout);
   const prior = await loadState();
   const live = await runningState(prior);
@@ -608,6 +710,10 @@ async function switchCheckout(options: StartOptions = {}): Promise<void> {
       // an older checkout or restore an old snapshot over newer durable state.
       if (!previous.cwd) throw new Error("Cannot verify previous checkout for rollback");
       await assertDatabaseCompatible(await checkoutRoot(previous.cwd));
+      if (!(await isCurrentSourceIdentity(previous)))
+        throw new Error(
+          "Cannot restore previous checkout: launch source is missing or has changed",
+        );
       const restored = await startProcess("glassbox", {
         executable: previous.executable,
         args: previous.args,
@@ -627,7 +733,23 @@ async function switchCheckout(options: StartOptions = {}): Promise<void> {
     }
     throw error;
   }
-  process.stdout.write(`${JSON.stringify({ status: "switched", checkout })}\n`);
+  const current = (await loadState()).find((entry) => entry.name === "glassbox");
+  process.stdout.write(
+    `${JSON.stringify({ status: "switched", checkout, commit: current?.launchCommit ?? null })}\n`,
+  );
+}
+
+async function isCurrentSourceIdentity(entry: ProcessState): Promise<boolean> {
+  if (entry.name !== "glassbox" || !entry.launchCommit) return false;
+  const current = serviceSourceIdentity(entry.cwd ?? repoRoot);
+  if (!current || current.launchCommit !== entry.launchCommit) return false;
+  if (entry.launchClean === true) return current.launchClean;
+  return (
+    entry.launchClean === false &&
+    current.launchClean === false &&
+    typeof entry.launchSourceTreeSha256 === "string" &&
+    current.launchSourceTreeSha256 === entry.launchSourceTreeSha256
+  );
 }
 
 async function status(): Promise<void> {
@@ -641,18 +763,39 @@ async function status(): Promise<void> {
         ...(alive(entry.pid) ? { pid: entry.pid } : {}),
         running: status === "running",
         status,
-        ...(entry.name === "glassbox" ? { checkout: entry.cwd ?? null } : {}),
+        ...(entry.name === "glassbox"
+          ? {
+              checkout: entry.cwd ?? null,
+              startedAt: entry.startedAt,
+              launchCommit: entry.launchCommit ?? null,
+              launchClean: entry.launchClean ?? null,
+              launchSourceTreeSha256: entry.launchSourceTreeSha256 ?? null,
+              checkoutSourceVerified: await isCurrentSourceIdentity(entry),
+            }
+          : {}),
       };
     }),
   );
   const port = Number(config.glassbox?.env?.PORT ?? process.env.PORT ?? "3030");
+  const glassboxEntry = state.find((entry) => entry.name === "glassbox");
+  const glassboxSourceVerified = glassboxEntry
+    ? await isCurrentSourceIdentity(glassboxEntry)
+    : false;
   const glassboxReady =
-    Number.isInteger(port) && port > 0 && port <= 65535
+    processes.some((entry) => entry.name === "glassbox" && entry.running) &&
+    glassboxSourceVerified &&
+    Number.isInteger(port) &&
+    port > 0 &&
+    port <= 65535
       ? await endpointAvailable({ host: "127.0.0.1", port })
       : false;
-  const onebotReady = await endpointAvailable({ host: "127.0.0.1", port: 6700 });
+  const onebotListener = {
+    host: "127.0.0.1",
+    port: 6700,
+    listening: await endpointAvailable({ host: "127.0.0.1", port: 6700 }),
+  };
   process.stdout.write(
-    `${JSON.stringify({ dataDirectory, configPath, processes, glassboxReady, onebotReady }, null, 2)}\n`,
+    `${JSON.stringify({ dataDirectory, configPath, processes, glassboxReady, onebotListener }, null, 2)}\n`,
   );
 }
 

@@ -1,5 +1,6 @@
 import { AccessDeniedError } from "../../auth/service.js";
 import { qqCategoryCondition } from "../../auth/policy-condition.js";
+import { createHash } from "node:crypto";
 /**
  * Runtime Tools for authorized Channel history search.
  *
@@ -136,6 +137,10 @@ export type HistorySyncStop =
   | "end_of_source"
   /** The walk reached the `since` it was given; older history was deliberately not fetched. */
   | "since_bound_reached"
+  /** A bounded background backfill reached the newest message seen before the outage. */
+  | "cursor_boundary_reached"
+  /** The current Principal no longer has the required history:read authority. */
+  | "authorization_denied"
   /** The walk hit its own page bound with more history still available. */
   | "page_bound_reached"
   /** The provider kept returning the same cursor, so paging could not advance. */
@@ -394,6 +399,9 @@ export interface HistoryRetrievalEvidence {
   resources: string[];
   sourceKind: "channel_message";
   retrievalMode: "lexical";
+  resultStatus: HistorySearchDetails["resultStatus"];
+  /** Digest and byte length of the exact protected Tool result returned to Pi. */
+  toolOutput: { sha256: string; bytes: number };
   /** Restates `coverage.considered`, so the window's size is readable without the nested record. */
   considered: number;
   /** Restates `coverage.truncated`, so the same fact is not recorded two ways. */
@@ -404,6 +412,11 @@ export interface HistoryRetrievalEvidence {
    */
   coverage: HistorySearchCoverage;
   items: Array<{
+    recordId: string;
+    textSha256: string;
+    textBytes: number;
+    occurredAt: string | null;
+    senderId: string | null;
     resourceId: string;
     sourceId: string;
     rank: number;
@@ -762,7 +775,12 @@ export function createHistoryTools(options: {
   const getContext = (): ProtectedToolContext | undefined => {
     const value = options.getContext();
     return value?.caller && value.conversationId && value.runId
-      ? { caller: value.caller, conversationId: value.conversationId, runId: value.runId }
+      ? {
+          caller: value.caller,
+          conversationId: value.conversationId,
+          runId: value.runId,
+          ...(value.acceptanceLease ? { acceptanceLease: value.acceptanceLease } : {}),
+        }
       : undefined;
   };
 
@@ -908,6 +926,11 @@ export function createHistoryTools(options: {
       if (error instanceof AccessDeniedError) throw new ToolInputError("protected_read_revoked");
       throw error;
     }
+    const toolResult = {
+      content: [{ type: "text" as const, text: JSON.stringify(projectHistorySearch(details)) }],
+      details,
+    };
+    const serializedToolResult = JSON.stringify(toolResult);
     await options.recordEvidence?.(
       {
         type: "history_retrieval",
@@ -919,10 +942,20 @@ export function createHistoryTools(options: {
         resources: searched.map(groupResourceId),
         sourceKind: "channel_message",
         retrievalMode: "lexical",
+        resultStatus: details.resultStatus,
+        toolOutput: {
+          sha256: createHash("sha256").update(serializedToolResult, "utf8").digest("hex"),
+          bytes: Buffer.byteLength(serializedToolResult, "utf8"),
+        },
         considered: coverage.considered,
         truncated: coverage.truncated,
         coverage,
         items: items.map((item) => ({
+          recordId: item.id,
+          textSha256: createHash("sha256").update(item.snippet, "utf8").digest("hex"),
+          textBytes: Buffer.byteLength(item.snippet, "utf8"),
+          occurredAt: item.occurredAt ?? null,
+          senderId: item.senderId ?? null,
           resourceId: item.resourceId,
           sourceId: item.sourceId,
           rank: item.rank,

@@ -9,6 +9,7 @@ import {
 import { scopeKey } from "../identity/scope.js";
 import { classifyProtectedReadAction } from "../auth/service.js";
 import { createCapabilityTools } from "../runtime/pi/capability-tools.js";
+import type { PiRunContext } from "../runtime/pi/types.js";
 import { createProtectedTool } from "../runtime/pi/protected-tools.js";
 import { Type } from "typebox";
 import { OWNER_CONTROL_RESOURCE, OWNER_GROUP_ADMIN_TOOL } from "../runtime/pi/owner-tools.js";
@@ -171,7 +172,12 @@ describe("group history delivery authority", () => {
     f: Awaited<ReturnType<typeof fixture>>,
     caller: CallerContext,
     resourceId: string,
-  ) => f.app.store.authorization.check({ caller, resourceId, action: "delivery:send" });
+  ) =>
+    f.app.store.authorization.check({
+      caller,
+      resourceId,
+      action: "delivery:send",
+    });
 
   it("classifies content reads, protected search gates and write Actions", () => {
     for (const action of [
@@ -210,7 +216,10 @@ describe("group history delivery authority", () => {
     f.send(1, "owner-a", true, 10002);
     const ownerA = await f.started.take();
     await f.reply("answer:owner-a");
-    await application.setGroupAccess(ownerContext(ownerA), { groupId: GROUP, enabled: true });
+    await application.setGroupAccess(ownerContext(ownerA), {
+      groupId: GROUP,
+      enabled: true,
+    });
 
     f.send(2, `${SEARCH}本群历史里的 P4B-A-1349`, false, 10002, GROUP_ID);
     const run = await f.started.take();
@@ -287,7 +296,9 @@ describe("group history delivery authority", () => {
   });
 
   it("rechecks a protected history search gate without requiring delivery on its gate Resource", async () => {
-    const { f, application, searches } = await historyFixture({ persistentDatabase: true });
+    const { f, application, searches } = await historyFixture({
+      persistentDatabase: true,
+    });
     f.send(1, "owner-a", true, 10002);
     const ownerA = await f.started.take();
     await f.reply("answer:owner-a");
@@ -375,7 +386,10 @@ describe("group history delivery authority", () => {
     const owner = await f.started.take();
     await f.reply("answer:owner-a");
     const context = ownerContext(owner);
-    await application.setGroupAccess(context, { groupId: GROUP, enabled: true });
+    await application.setGroupAccess(context, {
+      groupId: GROUP,
+      enabled: true,
+    });
 
     // Use the ordinary `read` Action on a protected Resource, as generic protected Tools do.
     await f.app.store.authorization.grant({
@@ -450,9 +464,29 @@ describe("group history delivery authority", () => {
     f.send(1, "owner-a", true, 10002);
     const owner = await f.started.take();
     await f.reply("answer:owner-a");
-    const context = ownerContext(owner);
+    const baseContext = ownerContext(owner);
+    const context = {
+      ...baseContext,
+      recordQqToolExecutionInput: async (
+        record: Parameters<NonNullable<PiRunContext["recordQqToolExecutionInput"]>>[0],
+      ) => {
+        const cursor = await f.app.trace.append(
+          baseContext.runId,
+          {
+            type: "qq_tool_execution_input_verified",
+            runId: baseContext.runId,
+            ...record,
+          },
+          "glassbox-tool-evidence",
+        );
+        await f.app.store.evidence.advanceTrace(baseContext.caller, cursor);
+      },
+    };
     const configuredGroup = "10003";
-    await application.setGroupAccess(context, { groupId: configuredGroup, enabled: true });
+    await application.setGroupAccess(context, {
+      groupId: configuredGroup,
+      enabled: true,
+    });
     await application.setGroupCategory(context, {
       groupId: configuredGroup,
       category: "group.members",
@@ -463,11 +497,14 @@ describe("group history delivery authority", () => {
       store: f.app.store,
       getContext: () => context,
       isCategoryEnabled: async () => true,
-      invoke: async ({ params }) => ({
-        group_id: params.group_id,
-        user_id: params.user_id,
-        role: "member",
-      }),
+      invoke: async ({ params, recordVerifiedInput }) => {
+        await recordVerifiedInput?.();
+        return {
+          group_id: params.group_id,
+          user_id: params.user_id,
+          role: "member",
+        };
+      },
       search: async () => [],
       projectManagedGroups: async () => [],
     });
@@ -484,7 +521,11 @@ describe("group history delivery authority", () => {
       undefined,
       {} as never,
     );
-    expect(result.details).toEqual({ role: "qq_group_member" });
+    expect(result.details).toEqual({
+      qqId: "10004",
+      memberExists: true,
+      groupRole: "member",
+    });
 
     await application.setGroupCategory(context, {
       groupId: configuredGroup,
@@ -531,7 +572,10 @@ describe("group history delivery authority", () => {
       .createRuntimeTools(() => owner)
       .find((tool) => tool.name === OWNER_GROUP_ADMIN_TOOL);
     if (!groupAdmin) throw new Error("missing owner group admin tool");
-    const read = await groupAdmin.execute("owner-group-read", { action: "get", groupId: GROUP });
+    const read = await groupAdmin.execute("owner-group-read", {
+      action: "get",
+      groupId: GROUP,
+    });
     expect(read.details).toBeDefined();
     const ownerDelivery = await f.app.store.lifecycle.createDelivery(owner.caller, {
       runId: owner.runId,
@@ -555,7 +599,10 @@ describe("group history delivery authority", () => {
   it("holds delivery authority for one assigned group in one scope, never for another", async () => {
     const { f, application, a, b } = await twoOwners();
     await application.setGroupAccess(a, { groupId: GROUP, enabled: true });
-    await application.setGroupAccess(b, { groupId: OTHER_GROUP, enabled: true });
+    await application.setGroupAccess(b, {
+      groupId: OTHER_GROUP,
+      enabled: true,
+    });
 
     // Each Owner's private chat may receive only the group that Owner assigned.
     expect((await deliveryDecision(f, a.caller, `group:${GROUP}`)).decision).toBe("ALLOW");
@@ -580,7 +627,10 @@ describe("group history delivery authority", () => {
       (
         await deliveryDecision(
           f,
-          { principalId: "owner", scope: scopeFor("group", OTHER_GROUP, "10002") },
+          {
+            principalId: "owner",
+            scope: scopeFor("group", OTHER_GROUP, "10002"),
+          },
           `group:${GROUP}`,
         )
       ).decision,
@@ -612,7 +662,10 @@ describe("group history delivery authority", () => {
     f.send(1, "owner-a", true, 10002);
     const ownerA = await f.started.take();
     await f.reply("answer:owner-a");
-    await application.setGroupAccess(ownerContext(ownerA), { groupId: GROUP, enabled: true });
+    await application.setGroupAccess(ownerContext(ownerA), {
+      groupId: GROUP,
+      enabled: true,
+    });
 
     f.send(2, "visitor-private", true, 10004);
     const visitor = await f.started.take();
@@ -764,7 +817,9 @@ describe("group history delivery authority", () => {
   it.each(["absent", "revoked"])(
     "backfills the explicit delivery grant for a persisted assignment across a restart (%s policy)",
     async (policy) => {
-      const { f, application, a } = await twoOwners({ persistentDatabase: true });
+      const { f, application, a } = await twoOwners({
+        persistentDatabase: true,
+      });
       await application.setGroupAccess(a, { groupId: GROUP, enabled: true });
 
       // The database the previous version left behind: the assignment and its read authority
@@ -939,7 +994,10 @@ describe("skill catalog delivery authority", () => {
   it("keeps the Skill read itself authorized, so the recheck has a source to re-decide", async () => {
     const f = await connect();
     const decision = await f.app.store.authorization.check({
-      caller: { principalId: "owner", scope: scopeFor("private", OWNER, OWNER) },
+      caller: {
+        principalId: "owner",
+        scope: scopeFor("private", OWNER, OWNER),
+      },
       resourceId: SKILL_CATALOG_RESOURCE,
       action: SKILL_READ_ACTION,
     });
@@ -994,7 +1052,10 @@ describe("skill catalog delivery authority", () => {
       );
 
       // A member of that group who is in no configuration list at all.
-      const visitor = { principalId: "qq-visitor-10007", scope: scopeFor("group", GROUP, "10007") };
+      const visitor = {
+        principalId: "qq-visitor-10007",
+        scope: scopeFor("group", GROUP, "10007"),
+      };
       f.send(2, "visitor-a", false, 10007, Number(GROUP));
       // No reply is awaited: this Run is the one that cannot deliver yet.
       await f.started.take();

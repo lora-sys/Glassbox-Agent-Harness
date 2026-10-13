@@ -72,7 +72,7 @@ describe("GroupHistoryPoller", () => {
         timer.fire();
         await poller.tick();
         expect(attempts).toBe(2);
-        expect(run).toHaveBeenCalledExactlyOnceWith(target, { maxPages: 1 });
+        expect(run).toHaveBeenCalledExactlyOnceWith(target, { maxPages: 1, mode: "poll" });
         expect(poller.record("qq", "100")?.error).toBeNull();
       } finally {
         await poller.stop();
@@ -93,13 +93,17 @@ describe("GroupHistoryPoller", () => {
 
   it("walks every current target on a tick, at the tick page bound", async () => {
     const timer = fakeTimer();
-    const walked: Array<{ target: HistorySyncTarget; maxPages: number }> = [];
+    const walked: Array<{
+      target: HistorySyncTarget;
+      maxPages: number;
+      mode: "poll" | "backfill";
+    }> = [];
     const poller = new GroupHistoryPoller({
       intervalMs: 60_000,
       maxPages: 5,
       listTargets: () => [target, other],
       run: async (walkedTarget, walk) => {
-        walked.push({ target: walkedTarget, maxPages: walk.maxPages });
+        walked.push({ target: walkedTarget, maxPages: walk.maxPages, mode: walk.mode });
         return { pagesWalked: 1, stop: "end_of_source" };
       },
       setTimer: timer.setTimer,
@@ -111,8 +115,8 @@ describe("GroupHistoryPoller", () => {
     await poller.tick();
 
     expect(walked).toEqual([
-      { target, maxPages: 5 },
-      { target: other, maxPages: 5 },
+      { target, maxPages: 5, mode: "poll" },
+      { target: other, maxPages: 5, mode: "poll" },
     ]);
     expect(poller.record("qq", "100")).toMatchObject({
       outcome: { pagesWalked: 1, stop: "end_of_source" },
@@ -177,11 +181,13 @@ describe("GroupHistoryPoller", () => {
   it("backfills deeper than a tick, because the newest page after a reconnect starts after the gap", async () => {
     const timer = fakeTimer();
     const walked: number[] = [];
+    const modes: string[] = [];
     const poller = new GroupHistoryPoller({
       maxPages: 5,
       listTargets: () => [target],
       run: async (_target, walk) => {
         walked.push(walk.maxPages);
+        modes.push(walk.mode);
         return { pagesWalked: walk.maxPages, stop: "page_bound_reached" };
       },
       setTimer: timer.setTimer,
@@ -192,6 +198,7 @@ describe("GroupHistoryPoller", () => {
     await poller.backfill(target, 20);
 
     expect(walked).toEqual([5, 20]);
+    expect(modes).toEqual(["poll", "backfill"]);
     expect(poller.record("qq", "100")?.outcome).toEqual({
       pagesWalked: 20,
       stop: "page_bound_reached",

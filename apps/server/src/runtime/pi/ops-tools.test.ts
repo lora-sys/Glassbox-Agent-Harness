@@ -4,6 +4,113 @@ import { FakeHerdrBridge } from "../../ops/fake-herdr-bridge.js";
 import { AuthorizedOpsService } from "../../ops/service.js";
 import { createOpsTools } from "./ops-tools.js";
 
+it("uses the trusted Pi cleanup Run for task_cancel rather than model input", async () => {
+  const store = await openDomainStore({ databasePath: ":memory:" });
+  const caller = {
+    principalId: "owner",
+    scope: {
+      connectionId: "qq",
+      botId: "bot",
+      chatType: "private" as const,
+      chatId: "owner",
+      senderId: "owner",
+    },
+  };
+  try {
+    await store.identities.bindOwner("owner", caller.scope);
+    await store.conversations.createAgent("personal");
+    await store.authorization.grant({
+      principalId: "owner",
+      resourceId: "agent:personal",
+      action: "run:create",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    const creation = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: caller.scope,
+      messageId: "task-tool-create-run",
+      text: "Create fixture Task",
+      executionRef: "pi:test",
+    });
+    const cleanup = await store.conversations.acceptIncoming({
+      agentId: "personal",
+      scope: caller.scope,
+      messageId: "task-tool-cancel-run",
+      text: "Cancel fixture Task",
+      executionRef: "pi:test",
+    });
+    const task = await store.tasks.createTask({
+      title: "Tool Run provenance",
+      creatorPrincipalId: caller.principalId,
+      authorizationScope: caller.scope,
+      runId: creation.run.id,
+      conversationId: creation.conversation.id,
+    });
+    await store.authorization.grant({
+      principalId: caller.principalId,
+      resourceId: `task-${task.id}`,
+      action: "task:cancel",
+      scope: caller.scope,
+      effect: "allow",
+    });
+    const tools = createOpsTools({
+      store,
+      service: new AuthorizedOpsService(store, new FakeHerdrBridge()),
+      getContext: () => ({
+        caller,
+        runId: cleanup.run.id,
+        conversationId: cleanup.conversation.id,
+      }),
+      workerTarget: { workspaceId: "configured", agentKind: "test" },
+    });
+    const cancel = tools.find((tool) => tool.name === "task_cancel")!;
+    expect(cancel.parameters).toMatchObject({ additionalProperties: false });
+    expect(cancel.parameters).not.toHaveProperty("properties.runId");
+    expect(cancel.parameters).not.toHaveProperty("properties.conversationId");
+    await cancel.execute(
+      "cancel",
+      {
+        taskId: task.id,
+        runId: creation.run.id,
+        conversationId: "model-forged-conversation",
+      },
+      undefined,
+      undefined,
+      {} as never,
+    );
+
+    const evidence = await store.db.transaction(async (tx) => {
+      const rows = await tx.execute({
+        sql: "SELECT type, run_id FROM ops_trace_events WHERE task_id = ? AND type IN ('task.created', 'task.canceled') ORDER BY sequence",
+        args: [task.id],
+      });
+      const taskRow = await tx.execute({
+        sql: "SELECT run_id FROM tasks WHERE id = ?",
+        args: [task.id],
+      });
+      const decisions = await tx.execute({
+        sql: "SELECT run_id, conversation_id FROM authorization_decisions_all WHERE resource_id = ? AND action = 'task:cancel'",
+        args: [`task-${task.id}`],
+      });
+      return { events: rows.rows, task: taskRow.rows[0], decisions: decisions.rows };
+    });
+    expect(evidence.events).toEqual([
+      { type: "task.created", run_id: creation.run.id },
+      { type: "task.canceled", run_id: cleanup.run.id },
+    ]);
+    expect(evidence.task).toEqual({ run_id: creation.run.id });
+    expect(evidence.decisions.length).toBeGreaterThan(0);
+    for (const decision of evidence.decisions)
+      expect(decision).toEqual({
+        run_id: cleanup.run.id,
+        conversation_id: cleanup.conversation.id,
+      });
+  } finally {
+    await store.close();
+  }
+});
+
 it("denies an ungranted Pi delegate before starting any worker", async () => {
   const store = await openDomainStore({ databasePath: ":memory:" });
   const bridge = new FakeHerdrBridge();

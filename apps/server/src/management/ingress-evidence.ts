@@ -27,7 +27,7 @@ export type IngressEvidenceReason = "normalized" | IngressDropReason;
 export interface IngressEvidenceEntry {
   ts: string;
   channelId: string;
-  groupId: string;
+  groupId?: string;
   reason: IngressEvidenceReason;
 }
 
@@ -85,6 +85,7 @@ const diagnosticKey = (channelId: string, groupId: string): string => `${channel
  */
 export class IngressEvidenceLog {
   private readonly counts = new Map<string, GroupIngressEvidenceCounts>();
+  private readonly channelDroppedNotReady = new Map<string, number>();
 
   private constructor(private readonly logPath: string) {}
 
@@ -128,7 +129,14 @@ export class IngressEvidenceLog {
   }
 
   private apply(entry: IngressEvidenceEntry): void {
-    if (!entry?.groupId || !entry.channelId || !entry.reason) return;
+    if (!entry?.channelId || !entry.reason || !entry.ts) return;
+    if (entry.groupId === undefined) {
+      if (entry.reason !== "not_ready") return;
+      const current = this.channelDroppedNotReady.get(entry.channelId) ?? 0;
+      this.channelDroppedNotReady.set(entry.channelId, Math.min(COUNT_CEILING, current + 1));
+      return;
+    }
+    if (!entry.groupId) return;
     const key = diagnosticKey(entry.channelId, entry.groupId);
     const current = this.counts.get(key) ?? EMPTY_COUNTS();
     if (current.serviceStartedAt === "") current.serviceStartedAt = entry.ts;
@@ -157,6 +165,11 @@ export class IngressEvidenceLog {
     );
   }
 
+  /** The durable count of private messages dropped while this channel was not ready. */
+  channelDroppedNotReadyFor(channelId: string): number | undefined {
+    return this.channelDroppedNotReady.get(channelId);
+  }
+
   /** Records one message the Agent answered. */
   recordNormalized(channelId: string, groupId: string, ts: string): void {
     this.apply({ ts, channelId, groupId, reason: "normalized" });
@@ -167,6 +180,13 @@ export class IngressEvidenceLog {
   recordDropped(channelId: string, groupId: string, reason: IngressDropReason, ts: string): void {
     this.apply({ ts, channelId, groupId, reason });
     this.append({ ts, channelId, groupId, reason });
+  }
+
+  /** Records a private message dropped before ingress without inventing a group scope. */
+  recordChannelDroppedNotReady(channelId: string, ts: string): void {
+    const entry: IngressEvidenceEntry = { ts, channelId, reason: "not_ready" };
+    this.apply(entry);
+    this.append(entry);
   }
 
   private append(entry: IngressEvidenceEntry): void {

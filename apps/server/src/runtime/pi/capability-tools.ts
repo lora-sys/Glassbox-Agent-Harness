@@ -1,5 +1,6 @@
 import { qqCategoryCondition } from "../../auth/policy-condition.js";
 import { AccessDeniedError, type AuthorizationRequest } from "../../auth/service.js";
+import { createHash } from "node:crypto";
 /**
  * Runtime Tools for the QQ Capability Registry.
  *
@@ -37,7 +38,8 @@ import { AccessDeniedError, type AuthorizationRequest } from "../../auth/service
  *    enumerate the Owner's managed set.
  */
 
-import { Type } from "typebox";
+import { Type, type TProperties, type TSchema } from "typebox";
+import { Value } from "typebox/value";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { DomainStore } from "../../persistence/index.js";
 import { agentResourceId } from "../../persistence/index.js";
@@ -99,13 +101,46 @@ export const GROUP_RUN_CAPABILITY_CATEGORIES: readonly QqCapabilityCategory[] = 
 
 const GROUP_ID_PATTERN = /^[1-9]\d{0,15}$/u;
 
+function canonicalVerifiedInput(value: unknown, seen = new Set<object>(), depth = 0): string {
+  if (depth > 16) throw new ToolInputError("verified_input_evidence_invalid");
+  if (value === null || typeof value === "string" || typeof value === "boolean")
+    return JSON.stringify(value);
+  if (typeof value === "number" && Number.isFinite(value)) return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    if (seen.has(value)) throw new ToolInputError("verified_input_evidence_invalid");
+    seen.add(value);
+    const result = `[${value.map((item) => canonicalVerifiedInput(item, seen, depth + 1)).join(",")}]`;
+    seen.delete(value);
+    return result;
+  }
+  if (!isRecord(value) || seen.has(value) || Object.getPrototypeOf(value) !== Object.prototype)
+    throw new ToolInputError("verified_input_evidence_invalid");
+  seen.add(value);
+  const result = `{${Object.keys(value)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalVerifiedInput(value[key], seen, depth + 1)}`)
+    .join(",")}}`;
+  seen.delete(value);
+  return result;
+}
+
+function verifiedInputDigest(value: Readonly<Record<string, unknown>>) {
+  const serialized = canonicalVerifiedInput(value);
+  const inputBytes = Buffer.byteLength(serialized, "utf8");
+  if (inputBytes > 64 * 1024) throw new ToolInputError("verified_input_evidence_invalid");
+  return {
+    inputSha256: createHash("sha256").update(serialized, "utf8").digest("hex"),
+    inputBytes,
+  };
+}
+
 export type QqProviderParams = Record<string, string | number | boolean>;
 
 export interface CapabilityToolInput extends Record<string, unknown> {
   groupId?: string;
   operation?: string;
   params?: QqProviderParams;
-  /** Exact current-message card/nickname. Only set_group_ban accepts this alternative to user_id. */
+  /** Exact QQ user ID, card, or nickname. Only set_group_ban accepts this alternative to user_id. */
   memberSelector?: string;
 }
 
@@ -123,6 +158,8 @@ export interface CapabilityInvocation {
   /** The exact parameter set Glassbox will forward. Never taken verbatim from the model. */
   params: QqProviderParams;
   context: ProtectedToolContext;
+  /** Must be awaited after native preconditions and immediately before the provider call. */
+  recordVerifiedInput?: () => Promise<void>;
 }
 
 /**
@@ -154,22 +191,35 @@ export function capabilityToolEligibility(input: {
       // A group Run is confined to its group. Read Tools remain available to members. A
       // mutation is considered only when this message carried an allowed QQ-native role.
       if (capability.resource !== "group")
-        return { name: capability.tool, exclusion: "scope_not_permitted" as const };
+        return {
+          name: capability.tool,
+          exclusion: "scope_not_permitted" as const,
+        };
       const readOnly = GROUP_RUN_CAPABILITY_CATEGORIES.includes(capability.category);
       const nativeRoleAllowed =
         input.nativeGroupRole !== undefined &&
         capability.nativeGroupRoles?.includes(input.nativeGroupRole) === true;
       if (!readOnly && !nativeRoleAllowed)
-        return { name: capability.tool, exclusion: "scope_not_permitted" as const };
+        return {
+          name: capability.tool,
+          exclusion: "scope_not_permitted" as const,
+        };
       return {
         name: capability.tool,
         exclusion: enabled.has(capability.category) ? null : ("policy_disabled" as const),
       };
     }
     // A Visitor-private Run reaches no QQ capability at all.
-    if (!input.isOwner) return { name: capability.tool, exclusion: "scope_not_permitted" as const };
+    if (!input.isOwner)
+      return {
+        name: capability.tool,
+        exclusion: "scope_not_permitted" as const,
+      };
     if (capability.ownerPrivate === false)
-      return { name: capability.tool, exclusion: "scope_not_permitted" as const };
+      return {
+        name: capability.tool,
+        exclusion: "scope_not_permitted" as const,
+      };
     // Account status is the Owner's own provider state and is always readable by the Owner.
     if (capability.resource === "account") return { name: capability.tool, exclusion: null };
     return {
@@ -255,28 +305,20 @@ function createCapabilitySearchTool(options: {
   capability: QqCapability;
   authService: DomainStore["authorization"];
   getContext: () => ProtectedToolContext | undefined;
+  parameters: TSchema;
+  description: string;
   search: (input: {
     query: string | undefined;
     groupIds: readonly string[] | undefined;
     context: ProtectedToolContext;
+    toolInput: Record<string, unknown>;
   }) => Promise<unknown>;
 }): ToolDefinition {
   return createProtectedTool<CapabilitySearchToolInput>({
     name: options.capability.tool,
     label: options.capability.tool,
-    description: options.capability.description,
-    parameters: Type.Object(
-      {
-        query: Type.Optional(Type.String({ maxLength: CAPABILITY_QUERY_MAX_LENGTH })),
-        groupIds: Type.Optional(
-          Type.Array(Type.String({ pattern: "^[1-9]\\d{0,15}$" }), {
-            minItems: 1,
-            maxItems: CAPABILITY_GROUP_FILTER_MAX,
-          }),
-        ),
-      },
-      { additionalProperties: false },
-    ),
+    description: options.description,
+    parameters: options.parameters,
     action: options.capability.action,
     // The registry search describes the Agent's own capability surface, not a group's, so it
     // is gated on the Agent Resource. A non-private scope resolves to a sentinel that was
@@ -292,6 +334,7 @@ function createCapabilitySearchTool(options: {
         query: validatedCapabilityQuery(params.query),
         groupIds: validatedCapabilityGroupFilter(params.groupIds),
         context,
+        toolInput: params,
       }),
   });
 }
@@ -310,16 +353,138 @@ function createCapabilitySearchTool(options: {
  */
 export const GROUP_INVENTORY_TOOL = "qq_groups";
 
-function providerToolParameters(capability: QqCapability, allowListing = false) {
-  const groupId = Type.Optional(
-    Type.String({
-      pattern: "^[1-9]\\d{0,15}$",
-      description: "Required only in Owner private chat. Omit inside a group.",
-    }),
-  );
-  const variants = capability.operations.map((operation) => {
-    const modelParams = operation.params.filter((name) => name !== "group_id");
-    const requiredParams = new Set(operation.required.filter((name) => name !== "group_id"));
+type ToolInputRestriction = {
+  action: string;
+  resourceId: string;
+  inputConstraint: { [key: string]: unknown };
+};
+
+function unionSchema(schemas: readonly TSchema[]): TSchema | undefined {
+  if (schemas.length === 0) return undefined;
+  if (schemas.length === 1) return schemas[0];
+  if (!schemas.every((schema) => "type" in schema && schema.type === "object"))
+    return Type.Union([...schemas]);
+  // Keep exact operation alternatives as validation constraints, and also expose one
+  // object envelope. Providers must be able to see that nested params is an object
+  // without inferring its shape from a root union or serializing it as a JSON string.
+  const objects = schemas as readonly (TSchema & {
+    properties: Record<string, TSchema>;
+    required?: readonly string[];
+  })[];
+  const names = [...new Set(objects.flatMap((schema) => Object.keys(schema.properties)))];
+  const properties: TProperties = {};
+  for (const name of names) {
+    const alternatives = objects.flatMap((schema) =>
+      schema.properties[name] ? [schema.properties[name]!] : [],
+    );
+    const property = unionSchema(alternatives)!;
+    properties[name] = objects.every((schema) => schema.required?.includes(name))
+      ? property
+      : Type.Optional(property);
+  }
+  return Type.Object(properties, { additionalProperties: false, anyOf: [...schemas] });
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+/** Intersects a JSON lease constraint with one already-authorized TypeBox schema. */
+function constrainSchema(schema: TSchema, constraint: unknown): TSchema | undefined {
+  if (!Value.Check(schema, constraint)) return undefined;
+
+  if (constraint === null) return Type.Null();
+  if (
+    typeof constraint === "string" ||
+    typeof constraint === "number" ||
+    typeof constraint === "boolean"
+  )
+    return Type.Literal(constraint);
+
+  if (Array.isArray(constraint)) {
+    const objectSchema = schema as TSchema & {
+      type?: string;
+      items?: TSchema | TSchema[];
+    };
+    if (objectSchema.type !== "array" || !objectSchema.items || Array.isArray(objectSchema.items))
+      return undefined;
+    const items = constraint.map((item) => constrainSchema(objectSchema.items as TSchema, item));
+    if (items.some((item) => item === undefined)) return undefined;
+    return Type.Tuple(items as TSchema[]);
+  }
+
+  if (!isPlainObject(constraint)) return undefined;
+  const objectSchema = schema as TSchema & {
+    type?: string;
+    properties?: Record<string, TSchema>;
+    required?: string[];
+  };
+  if (objectSchema.type !== "object" || !objectSchema.properties) return undefined;
+  const constraintKeys = Object.keys(constraint);
+  if (constraintKeys.some((key) => !Object.hasOwn(objectSchema.properties!, key))) return undefined;
+
+  const properties: TProperties = {};
+  for (const [key, property] of Object.entries(objectSchema.properties)) {
+    const constrained = Object.hasOwn(constraint, key);
+    const required = objectSchema.required?.includes(key) ?? false;
+    // A lease exposes constrained fields and fields the base schema itself requires.
+    if (!constrained && !required) continue;
+    const narrowed = constrained ? constrainSchema(property, constraint[key]) : property;
+    if (!narrowed) return undefined;
+    properties[key] = narrowed;
+  }
+  return Type.Object(properties, { additionalProperties: false });
+}
+
+function groupResourceTarget(resourceId: string): string | undefined {
+  const match = /^group:([1-9]\d{0,15})$/u.exec(resourceId);
+  return match?.[1];
+}
+
+function restrictionMatchesScope(
+  capability: QqCapability,
+  restriction: ToolInputRestriction,
+  chatType: "private" | "group" | undefined,
+  chatId: string | undefined,
+): boolean {
+  if (restriction.action !== capability.action) return false;
+  if (capability.resource === "account")
+    return restriction.resourceId === agentResourceId("personal");
+  if (chatType === "private") return groupResourceTarget(restriction.resourceId) !== undefined;
+  if (chatType === "group")
+    return chatId !== undefined && restriction.resourceId === groupResourceId(chatId);
+  return false;
+}
+
+function providerToolOperationParameters(
+  capability: QqCapability,
+  chatType?: "private" | "group",
+  allowedOperations?: readonly string[],
+): TSchema[] {
+  const groupIdSchema = Type.String({
+    pattern: "^[1-9]\\d{0,15}$",
+    description: "Required only in Owner private chat. Omit inside a group.",
+  });
+  const groupId =
+    capability.resource !== "group"
+      ? undefined
+      : chatType === undefined
+        ? Type.Optional(groupIdSchema)
+        : chatType === "private"
+          ? groupIdSchema
+          : undefined;
+  const groupIdProperty: TProperties = groupId === undefined ? {} : { groupId };
+  const operations =
+    allowedOperations === undefined
+      ? capability.operations
+      : capability.operations.filter((operation) => allowedOperations.includes(operation.action));
+  const variants = operations.map((operation) => {
+    const modelParams = (operation.params ?? []).filter((name) => name !== "group_id");
+    const requiredParams = new Set(
+      (operation.required ?? []).filter((name) => name !== "group_id"),
+    );
     const params = Object.fromEntries(
       modelParams.map((name) => [
         name,
@@ -330,10 +495,12 @@ function providerToolParameters(capability: QqCapability, allowListing = false) 
     );
     return Type.Object(
       {
-        groupId,
+        ...groupIdProperty,
         operation: Type.Literal(operation.action),
         ...(modelParams.length === 0
-          ? { params: Type.Optional(Type.Object({}, { additionalProperties: false })) }
+          ? {
+              params: Type.Optional(Type.Object({}, { additionalProperties: false })),
+            }
           : {
               params:
                 requiredParams.size > 0
@@ -348,9 +515,14 @@ function providerToolParameters(capability: QqCapability, allowListing = false) 
     variants.push(
       Type.Object(
         {
-          groupId,
+          ...groupIdProperty,
           operation: Type.Literal("set_group_ban"),
-          memberSelector: Type.String({ minLength: 1, maxLength: 128 }),
+          memberSelector: Type.String({
+            minLength: 1,
+            maxLength: 128,
+            description:
+              'Exact QQ user ID, group card, or nickname from the current request. Example: {"memberSelector":"12345","params":{"duration":5}}. When using memberSelector, do not include params.user_id.',
+          }),
           params: Type.Object(
             { duration: providerParameterSchema("duration") },
             { additionalProperties: false },
@@ -359,9 +531,152 @@ function providerToolParameters(capability: QqCapability, allowListing = false) 
         { additionalProperties: false },
       ),
     );
-  if (allowListing)
-    return Type.Union([Type.Object({ groupId }, { additionalProperties: false }), ...variants]);
-  return variants.length === 1 ? variants[0]! : Type.Union(variants);
+  return variants;
+}
+
+function providerToolParameters(
+  capability: QqCapability,
+  allowListing = false,
+  chatType?: "private" | "group",
+  allowedOperations?: readonly string[],
+): TSchema {
+  const variants = providerToolOperationParameters(capability, chatType, allowedOperations);
+  return unionSchema([
+    ...(allowListing && chatType !== "group"
+      ? [Type.Object({}, { additionalProperties: false })]
+      : []),
+    ...variants,
+  ])!;
+}
+
+function requiredOperationsFor(
+  capability: QqCapability,
+  definitionContext: Readonly<PiRunContext> | undefined,
+): readonly string[] | undefined {
+  if (definitionContext?.acceptanceLease) return undefined;
+  const evidence =
+    definitionContext?.requiredEvidence?.filter((entry) => entry.tool === capability.tool) ?? [];
+  const requiredToolMatches = definitionContext?.requiredToolName === capability.tool;
+  const requiredToolOperation = requiredToolMatches
+    ? definitionContext?.requiredToolInput?.operation
+    : undefined;
+  const operations: unknown[] = [
+    ...evidence.map((entry) => entry.input.operation),
+    ...(requiredToolOperation === undefined ? [] : [requiredToolOperation]),
+  ];
+  if (operations.length === 0) return undefined;
+  if (operations.some((operation) => typeof operation !== "string"))
+    throw new Error("required_evidence_operation_missing");
+  const selected = [...new Set(operations as string[])];
+  if (
+    selected.length === 0 ||
+    selected.some(
+      (operation) => !capability.operations.some((candidate) => candidate.action === operation),
+    )
+  )
+    throw new Error("required_evidence_operation_unavailable");
+  return selected;
+}
+
+function projectProviderToolParameters(
+  capability: QqCapability,
+  allowListing: boolean,
+  definitionContext: Readonly<PiRunContext> | undefined,
+  restrictions: readonly ToolInputRestriction[],
+):
+  | {
+      parameters: TSchema;
+      operations: QqCapability["operations"];
+      listing: boolean;
+    }
+  | undefined {
+  const scope = definitionContext?.caller?.scope;
+  const chatType = scope?.chatType;
+  const variants = providerToolOperationParameters(capability, chatType);
+  const narrowed: TSchema[] = [];
+  const operations: QqCapability["operations"][number][] = [];
+  let listing = false;
+
+  for (const restriction of restrictions) {
+    if (!isPlainObject(restriction.inputConstraint)) continue;
+
+    if (
+      allowListing &&
+      chatType === "private" &&
+      restriction.action === capability.action &&
+      restriction.resourceId === agentResourceId("personal") &&
+      Object.keys(restriction.inputConstraint).length === 0
+    ) {
+      narrowed.push(Type.Object({}, { additionalProperties: false }));
+      listing = true;
+      continue;
+    }
+
+    if (!restrictionMatchesScope(capability, restriction, chatType, scope?.chatId)) continue;
+
+    const operationName = restriction.inputConstraint.operation;
+    if (typeof operationName !== "string") continue;
+    const operation = capability.operations.find((candidate) => candidate.action === operationName);
+    if (!operation) continue;
+    const branches = variants.filter(
+      (candidate) =>
+        (
+          candidate as TSchema & {
+            properties?: Record<string, { const?: unknown }>;
+          }
+        ).properties?.operation?.const === operationName,
+    );
+    if (branches.length === 0) continue;
+
+    const constraint = { ...restriction.inputConstraint };
+    if (capability.resource === "group" && chatType === "private") {
+      const groupId = groupResourceTarget(restriction.resourceId);
+      if (!groupId) continue;
+      if (constraint.groupId !== undefined && constraint.groupId !== groupId) continue;
+      constraint.groupId = groupId;
+    }
+    const operationSchemas = branches
+      .map((branch) => constrainSchema(branch, constraint))
+      .filter((schema): schema is TSchema => schema !== undefined);
+    if (operationSchemas.length === 0) continue;
+    narrowed.push(...operationSchemas);
+    operations.push(operation);
+  }
+
+  const parameters = unionSchema(narrowed);
+  if (!parameters) return undefined;
+  return { parameters, operations, listing };
+}
+
+function capabilitySearchParameters(
+  definitionContext: Readonly<PiRunContext> | undefined,
+  restrictions?: readonly ToolInputRestriction[],
+): TSchema | undefined {
+  const base = Type.Object(
+    {
+      query: Type.Optional(Type.String({ maxLength: CAPABILITY_QUERY_MAX_LENGTH })),
+      groupIds: Type.Optional(
+        Type.Array(Type.String({ pattern: "^[1-9]\\d{0,15}$" }), {
+          minItems: 1,
+          maxItems: CAPABILITY_GROUP_FILTER_MAX,
+        }),
+      ),
+    },
+    { additionalProperties: false },
+  );
+  if (!restrictions) return base;
+  const capability = QQ_CAPABILITIES.find((entry) => entry.tool === CAPABILITY_SEARCH_TOOL)!;
+  const scope = definitionContext?.caller?.scope;
+  if (scope?.chatType !== "private") return undefined;
+  const projected = restrictions
+    .filter(
+      (restriction) =>
+        restriction.action === capability.action &&
+        restriction.resourceId === agentResourceId("personal"),
+    )
+    .map((restriction) => constrainSchema(base, restriction.inputConstraint))
+    .filter((schema): schema is TSchema => schema !== undefined);
+  return unionSchema(projected);
 }
 
 function providerParameterSchema(name: string) {
@@ -392,19 +707,34 @@ function providerParameterSchema(name: string) {
   }
 }
 
-function providerToolDescription(capability: QqCapability): string {
-  const operations = capability.operations
+function providerToolDescription(
+  capability: QqCapability,
+  allowedOperations: QqCapability["operations"] = capability.operations,
+  chatType?: "private" | "group",
+  baseDescription = capability.description,
+): string {
+  const operations = allowedOperations
     .map((operation) => {
-      const modelParams = operation.params.filter((name) => name !== "group_id");
-      const required = operation.required.filter((name) => name !== "group_id");
-      return `${operation.action}: params may contain ${modelParams.join(", ") || "nothing"}; required ${required.join(", ") || "nothing"}`;
+      const modelParams = (operation.params ?? []).filter((name) => name !== "group_id");
+      const required = (operation.required ?? []).filter((name) => name !== "group_id");
+      return modelParams.length === 0
+        ? `${operation.action}: has no params fields; omit params or use {}`
+        : `${operation.action}: params may contain ${modelParams.join(", ")}; required ${required.join(", ") || "nothing"}`;
     })
     .join(". ");
   const memberResolution =
     capability.tool === "qq_group_moderation"
-      ? " For set_group_ban only, a current-message nickname/card may use memberSelector with params.duration and no user_id. The server requires current member-read permission and one exact match. Never infer an ID from history. If resolution fails, ask for the target's QQ user ID."
+      ? ` For set_group_ban only, use memberSelector with params.duration and no params.user_id. memberSelector may be the exact QQ user ID, nickname, or group card from the current request. Example: {"memberSelector":"12345","params":{"duration":5}}. The server checks the current roster and requires one exact match. Never infer an ID from history.`
       : "";
-  return `${capability.description}${memberResolution} Set operation to one listed action. Put provider arguments in params. In a group omit groupId. In Owner private chat provide groupId. ${operations}.`;
+  const groupBinding =
+    capability.resource !== "group"
+      ? ""
+      : chatType === "group"
+        ? " In group chat, omit groupId; the current group is bound by the conversation."
+        : chatType === "private"
+          ? " In Owner private chat, put groupId at the top level beside operation."
+          : " In group chat, omit groupId because the current group is bound by the conversation. In Owner private chat, put groupId at the top level beside operation.";
+  return `${baseDescription}${memberResolution} Set operation to one listed action. params must be a JSON object, not a quoted JSON string. Put only its listed provider fields in params; never include group_id there.${groupBinding} ${operations}.`;
 }
 
 function safeQqId(value: unknown): string | undefined {
@@ -421,6 +751,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 interface ProviderCallOptions {
+  /** Definition-time scope from the trusted Run context; controls only model-visible schema. */
+  definitionChatType?: "private" | "group";
   /** Durable Owner intent for one group's capability class. Not an authorization decision. */
   isCategoryEnabled: (
     connectionId: string,
@@ -448,7 +780,7 @@ interface ProviderCallOptions {
       groupId: string;
       resolvedUserId: string;
       duration: number;
-      method: "exact_card" | "exact_nickname" | "exact_card_and_nickname";
+      method: "exact_qq_id" | "exact_card" | "exact_nickname" | "exact_card_and_nickname";
       rosterReadDecisionId: string;
     },
     context: ProtectedToolContext,
@@ -460,6 +792,19 @@ interface ProviderCallOptions {
     capability: QqCapability;
     operation: string;
   }) => Promise<QqNativeGroupRole>;
+  /** Checks current-message moderation conditions against fresh, authorized QQ state. */
+  verifyModerationPreconditions?: (input: {
+    context: ProtectedToolContext;
+    groupId: string;
+    userId: number;
+    preconditions: NonNullable<ProtectedToolContext["requiredModerationPreconditions"]>;
+  }) => Promise<
+    Readonly<{
+      botIsAdmin?: true;
+      targetIsOrdinaryMember?: true;
+      targetIsNotMuted?: true;
+    }>
+  >;
 }
 
 /** The first unique roster result stays bound to this Run's original immutable request. */
@@ -480,7 +825,10 @@ async function resolveModerationMember(
   duration: number,
   options: ProviderCallOptions,
   signal?: AbortSignal,
-): Promise<{ userId: number; authorizeMutation: (mutation: QqCapability) => Promise<void> }> {
+): Promise<{
+  userId: number;
+  authorizeMutation: (mutation: QqCapability) => Promise<void>;
+}> {
   const members = QQ_CAPABILITIES.find((entry) => entry.tool === "qq_group_members")!;
   if (!options.authorizeMemberResolution) throw new ToolInputError("moderation_member_id_required");
   const read = await options.authorizeMemberResolution(context, groupId);
@@ -507,11 +855,18 @@ async function resolveModerationMember(
     )
   )
     throw new ToolInputError("moderation_member_id_required");
-  // Exact, case-sensitive Unicode code-unit matching. No normalization or fuzzy fallback.
-  // A matching card and nickname belonging to the same QQ ID are one target.
+  // Numeric selectors identify an exact QQ ID. Text selectors use exact, case-sensitive
+  // Unicode code-unit matching against the current card or nickname. No fuzzy fallback.
+  // A matching ID, card, and nickname belonging to the same QQ ID are one target.
+  const selectedQqId = safeQqId(memberSelector);
   const matches = new Set(
     roster
-      .filter((member) => member.card === memberSelector || member.nickname === memberSelector)
+      .filter(
+        (member) =>
+          (selectedQqId !== undefined && safeQqId(member.user_id) === selectedQqId) ||
+          member.card === memberSelector ||
+          member.nickname === memberSelector,
+      )
       .map((member) => Number(safeQqId(member.user_id))),
   );
   if (matches.size === 0) throw new ToolInputError("moderation_member_not_found");
@@ -542,7 +897,13 @@ async function resolveModerationMember(
         resolvedUserId: String(userId),
         duration,
         method:
-          card && nickname ? "exact_card_and_nickname" : card ? "exact_card" : "exact_nickname",
+          selectedQqId !== undefined && selectedQqId === String(userId)
+            ? "exact_qq_id"
+            : card && nickname
+              ? "exact_card_and_nickname"
+              : card
+                ? "exact_card"
+                : "exact_nickname",
         rosterReadDecisionId: read.decisionId,
       },
       context,
@@ -560,6 +921,16 @@ async function resolveModerationMember(
  * binding, the operation allowlist, the Owner-policy gate and the mutation-intent gate have
  * exactly one implementation.
  */
+function projectedMemberLabels(member: Record<string, unknown>) {
+  const label = (field: "card" | "nickname") => {
+    const text = member[field];
+    return typeof text === "string" && text.length <= 64 && !/\p{Cc}/u.test(text) && text
+      ? { [field]: text }
+      : {};
+  };
+  return { ...label("card"), ...label("nickname") };
+}
+
 async function executeProviderCall(
   capability: QqCapability,
   params: CapabilityToolInput,
@@ -634,11 +1005,15 @@ async function executeProviderCall(
   // model. Retrieved text cannot supply that either. The compared parameters are the
   // model-supplied provider parameters — the server-derived `group_id` is not one of
   // them, so the message never has to (and cannot) restate the group the Run bound.
+  const numericSelector = memberSelector === undefined ? undefined : safeQqId(memberSelector);
   const mutationInput = {
     groupId: groupId!,
     operation: action,
-    params: supplied,
-    ...(memberSelector === undefined ? {} : { memberSelector }),
+    params:
+      action === "set_group_ban" && numericSelector !== undefined
+        ? { ...supplied, user_id: Number(numericSelector) }
+        : supplied,
+    ...(memberSelector === undefined || numericSelector !== undefined ? {} : { memberSelector }),
   };
   if (capability.risk !== "read") requireMutationIntent(context, capability.tool, mutationInput);
 
@@ -672,15 +1047,97 @@ async function executeProviderCall(
       throw new ToolAuthorizationError("native_group_role_denied");
   }
 
+  const moderationPreconditions = context.requiredModerationPreconditions;
+  let verifiedModerationPreconditions:
+    | Readonly<{
+        botIsAdmin?: true;
+        targetIsOrdinaryMember?: true;
+        targetIsNotMuted?: true;
+      }>
+    | undefined;
+  if (
+    capability.tool === "qq_group_moderation" &&
+    action === "set_group_ban" &&
+    moderationPreconditions
+  ) {
+    const targetId = Number(providerParams.user_id);
+    if (!Number.isSafeInteger(targetId) || targetId <= 0 || !options.verifyModerationPreconditions)
+      throw new ToolInputError("moderation_precondition_unverified");
+    verifiedModerationPreconditions = await options.verifyModerationPreconditions({
+      context,
+      groupId: groupId!,
+      userId: targetId,
+      preconditions: moderationPreconditions,
+    });
+    if (
+      (moderationPreconditions.botMustBeAdmin &&
+        verifiedModerationPreconditions.botIsAdmin !== true) ||
+      (moderationPreconditions.targetMustBeOrdinaryMember &&
+        verifiedModerationPreconditions.targetIsOrdinaryMember !== true) ||
+      (moderationPreconditions.targetMustNotBeMuted &&
+        verifiedModerationPreconditions.targetIsNotMuted !== true)
+    )
+      throw new ToolInputError("moderation_precondition_unverified");
+  }
+
   if (memberSelector !== undefined) {
     // The exact roster receipt and mutation authority share one final transaction after
     // evidence, role and category I/O. Separate awaited checks leave a revocation window.
     await authorizeResolvedMutation!(capability);
   }
+  if (
+    context.acceptanceLease &&
+    !context.acceptanceLease.checkToolCall({
+      toolName: capability.tool,
+      action: capability.action,
+      resourceId: capabilityResourceId({
+        resource: capability.resource,
+        scope: context.caller.scope,
+        groupId,
+      }),
+      toolInput: params,
+    })
+  )
+    throw new ToolInputError("acceptance_lease_denied");
   if (signal?.aborted) throw new Error("Operation cancelled");
   if (capability.risk !== "read") consumeMutationIntent(context, capability.tool, mutationInput);
 
-  const result = await options.invoke({ capability, action, params: providerParams, context });
+  const requiresInputWitness =
+    (capability.tool === "qq_group_members" && action === "get_group_member_info") ||
+    (capability.tool === "qq_group_moderation" && action === "set_group_ban");
+  let inputWitnessRecorded = false;
+  const recordVerifiedInput = requiresInputWitness
+    ? async () => {
+        if (inputWitnessRecorded) throw new ToolInputError("verified_input_evidence_duplicate");
+        if (!context.onVerifiedInput)
+          throw new ToolInputError("verified_input_evidence_unavailable");
+        const resourceId = capabilityResourceId({
+          resource: capability.resource,
+          scope: context.caller.scope,
+          groupId,
+        });
+        await context.onVerifiedInput({
+          action,
+          resourceId,
+          toolInput: providerParams,
+        });
+        inputWitnessRecorded = true;
+      }
+    : undefined;
+  const result = await options.invoke({
+    capability,
+    action,
+    params: providerParams,
+    context,
+    ...(recordVerifiedInput ? { recordVerifiedInput } : {}),
+  });
+  if (requiresInputWitness && !inputWitnessRecorded)
+    throw new ToolInputError("verified_input_evidence_unavailable");
+  if (verifiedModerationPreconditions)
+    return {
+      providerResult: result,
+      verifiedModerationPreconditions,
+    };
   if (capability.tool === "qq_account_status" && action === "get_login_info") {
     // The provider answers with the account's QQ nickname beside its number. The nickname is
     // whatever NapCat read off QQ: nobody configured it here, it changes without this server
@@ -692,10 +1149,9 @@ async function executeProviderCall(
     return { botId: safeQqId(result.user_id) };
   }
   if (capability.tool === "qq_group_members" && action === "get_group_member_list") {
-    // The request is authorized to read group membership, but that does not make every
-    // provider profile field necessary or safe to expose to a group audience. Keep the
-    // model-visible result at the aggregate level. Fail closed on unexpected provider
-    // shapes so a future protocol change cannot fall back to raw member records.
+    // Group audiences receive only the count. The Owner's private chat may receive a
+    // bounded identity, role and display-name projection for explicit member inspection.
+    // Never fall back to raw provider rows when the response shape changes.
     if (
       !Array.isArray(result) ||
       result.some((member) => !isRecord(member) || !safeQqId(member.user_id))
@@ -706,11 +1162,23 @@ async function executeProviderCall(
     );
     if (new Set(memberIds).size !== memberIds.length)
       throw new ProviderCallError("provider_failed", "invalid_response");
-    return { memberCount: result.length };
+    if (context.caller.principalId !== "owner" || context.caller.scope.chatType !== "private")
+      return { memberCount: result.length };
+    const members = result.slice(0, 50).map((value) => {
+      const member = value as Record<string, unknown>;
+      if (member.role !== "owner" && member.role !== "admin" && member.role !== "member")
+        throw new ProviderCallError("provider_failed", "invalid_response");
+      return {
+        qqId: safeQqId(member.user_id)!,
+        groupRole: member.role,
+        ...projectedMemberLabels(member),
+      };
+    });
+    return { memberCount: result.length, members, truncated: result.length > members.length };
   }
   if (capability.tool === "qq_group_members" && action === "get_group_member_info") {
-    // The model requests one member, but only the verified native role is needed by the
-    // authorization surface. Match both identities before disclosing even that projection.
+    // Match both native identities before reporting existence and group role. Explicit
+    // field names keep the member's role distinct from the Tool's permission category.
     const expectedGroupId = safeQqId(providerParams.group_id);
     const expectedUserId = safeQqId(providerParams.user_id);
     if (
@@ -722,13 +1190,10 @@ async function executeProviderCall(
       (result.role !== "owner" && result.role !== "admin" && result.role !== "member")
     )
       throw new ProviderCallError("provider_failed", "invalid_response");
-    const role =
-      result.role === "owner"
-        ? "qq_group_owner"
-        : result.role === "admin"
-          ? "qq_group_admin"
-          : "qq_group_member";
-    return { role };
+    const identity = { qqId: expectedUserId, memberExists: true, groupRole: result.role };
+    if (context.caller.principalId !== "owner" || context.caller.scope.chatType !== "private")
+      return identity;
+    return { ...identity, ...projectedMemberLabels(result) };
   }
   return result;
 }
@@ -737,13 +1202,13 @@ function createProviderCapabilityTool(
   capability: QqCapability,
   store: DomainStore,
   getContext: () => ProtectedToolContext | undefined,
-  options: ProviderCallOptions,
+  options: ProviderCallOptions & { parameters: TSchema; description: string },
 ): ToolDefinition {
   return createProtectedTool<CapabilityToolInput>({
     name: capability.tool,
     label: capability.tool,
-    description: providerToolDescription(capability),
-    parameters: providerToolParameters(capability),
+    description: options.description,
+    parameters: options.parameters,
     action: capability.action,
     policyCondition: (params, context) => {
       const resource = capabilityResourceId({
@@ -766,6 +1231,27 @@ function createProviderCapabilityTool(
       }),
     authService: store.authorization,
     getContext,
+    onVerifiedInput: async (input, context) => {
+      const isRoleRead =
+        input.toolName === "qq_group_members" && input.action === "get_group_member_info";
+      const isModeration =
+        input.toolName === "qq_group_moderation" && input.action === "set_group_ban";
+      if (!isRoleRead && !isModeration) return;
+      const record = context.recordQqToolExecutionInput;
+      if (!record) throw new ToolInputError("verified_input_evidence_unavailable");
+      const { inputSha256, inputBytes } = verifiedInputDigest(input.toolInput);
+      await record({
+        conversationId: context.conversationId,
+        principalId: context.caller.principalId,
+        toolCallId: input.toolCallId,
+        toolName: input.toolName as "qq_group_members" | "qq_group_moderation",
+        leaseId: context.acceptanceLease?.leaseId ?? null,
+        action: input.action as "get_group_member_info" | "set_group_ban",
+        resourceId: input.resourceId,
+        inputSha256,
+        inputBytes,
+      });
+    },
     execute: (params, context, signal) =>
       executeProviderCall(capability, params, context, options, signal),
   });
@@ -776,14 +1262,19 @@ function createGroupInventoryTool(
     capability: QqCapability;
     authService: DomainStore["authorization"];
     getContext: () => ProtectedToolContext | undefined;
-    projectManagedGroups: (context: ProtectedToolContext) => Promise<unknown>;
+    parameters: TSchema;
+    description: string;
+    projectManagedGroups: (
+      context: ProtectedToolContext,
+      toolInput: Record<string, unknown>,
+    ) => Promise<unknown>;
   } & ProviderCallOptions,
 ): ToolDefinition {
   return createProtectedTool<CapabilityToolInput>({
     name: options.capability.tool,
     label: options.capability.tool,
-    description: options.capability.description,
-    parameters: providerToolParameters(options.capability, true),
+    description: options.description,
+    parameters: options.parameters,
     action: options.capability.action,
     policyCondition: (params, context) => {
       const resource = capabilityResourceId({
@@ -816,7 +1307,7 @@ function createGroupInventoryTool(
       // inventory's definition, not a hint, so a call that breaks either is refused.
       if (context.caller.scope.chatType !== "private" || params.groupId !== undefined)
         throw new ToolInputError("invalid_capability_group");
-      return options.projectManagedGroups(context);
+      return options.projectManagedGroups(context, params);
     },
   });
 }
@@ -835,9 +1326,15 @@ export function createCapabilityTools(
       query: string | undefined;
       groupIds: readonly string[] | undefined;
       context: ProtectedToolContext;
+      toolInput: Record<string, unknown>;
     }) => Promise<unknown>;
     /** Builds the Owner's managed-group inventory. Reads no provider action. */
-    projectManagedGroups: (context: ProtectedToolContext) => Promise<unknown>;
+    projectManagedGroups: (
+      context: ProtectedToolContext,
+      toolInput: Record<string, unknown>,
+    ) => Promise<unknown>;
+    /** Immutable server-owned context supplied while the Pi session is constructed. */
+    definitionContext?: Readonly<PiRunContext>;
   } & ProviderCallOptions,
 ): ToolDefinition[] {
   const getContext = (): ProtectedToolContext | undefined => {
@@ -847,22 +1344,144 @@ export function createCapabilityTools(
           caller: value.caller,
           conversationId: value.conversationId,
           runId: value.runId,
+          ...(value.recordQqToolExecutionInput
+            ? { recordQqToolExecutionInput: value.recordQqToolExecutionInput }
+            : {}),
+          ...(value.acceptanceLease ? { acceptanceLease: value.acceptanceLease } : {}),
           ...(value.requiredToolName === undefined
             ? {}
             : { requiredToolName: value.requiredToolName }),
           ...(value.requiredToolInput === undefined
             ? {}
             : { requiredToolInput: value.requiredToolInput }),
+          ...(value.requiredModerationPreconditions === undefined
+            ? {}
+            : { requiredModerationPreconditions: value.requiredModerationPreconditions }),
         }
       : undefined;
   };
 
-  return QQ_CAPABILITIES.map((capability) => {
+  const { definitionContext, ...providerOptions } = options;
+  const definitionChatType = definitionContext?.caller?.scope.chatType;
+  const lease = definitionContext?.acceptanceLease;
+  if (lease && !lease.assertActive()) throw new Error("acceptance_lease_unavailable");
+  let selectedNames: Set<string> | undefined;
+  if (lease) {
+    try {
+      selectedNames = new Set(
+        lease.filterToolNames(QQ_CAPABILITIES.map((capability) => capability.tool)),
+      );
+    } catch {
+      throw new Error("acceptance_lease_unavailable");
+    }
+  }
+
+  return QQ_CAPABILITIES.filter(
+    (capability) => selectedNames === undefined || selectedNames.has(capability.tool),
+  ).map((capability) => {
+    let parameters: TSchema;
+    let description: string;
+    const requiredOperations = requiredOperationsFor(capability, definitionContext);
+    if (capability.tool === CAPABILITY_SEARCH_TOOL) {
+      const restrictions = lease?.getToolInputRestrictions(capability.tool);
+      const projected = capabilitySearchParameters(definitionContext, restrictions);
+      if (!projected) throw new Error("acceptance_lease_schema_unavailable");
+      parameters = projected;
+      description = lease
+        ? "Search the QQ capability registry using the filters fixed for this Run."
+        : capability.description;
+    } else if (lease) {
+      const restrictions = lease.getToolInputRestrictions(capability.tool);
+      const projected = projectProviderToolParameters(
+        capability,
+        capability.tool === GROUP_INVENTORY_TOOL,
+        definitionContext,
+        restrictions,
+      );
+      if (!projected) throw new Error("acceptance_lease_schema_unavailable");
+      parameters = projected.parameters;
+      if (capability.tool === GROUP_INVENTORY_TOOL && projected.listing) {
+        description =
+          projected.operations.length === 0
+            ? "List the Owner's managed QQ groups. Input {} lists groups without operation or groupId."
+            : `Input {} lists the Owner's managed QQ groups without operation or groupId. To read metadata, set operation and provide groupId. ${providerToolDescription(
+                capability,
+                projected.operations,
+                definitionContext?.caller?.scope.chatType,
+                "Read provider metadata for an authorized QQ group.",
+              )}`;
+      } else if (capability.tool === GROUP_INVENTORY_TOOL) {
+        description = providerToolDescription(
+          capability,
+          projected.operations,
+          definitionContext?.caller?.scope.chatType,
+          "Read metadata for the authorized QQ group.",
+        );
+      } else {
+        description = providerToolDescription(
+          capability,
+          projected.operations,
+          definitionContext?.caller?.scope.chatType,
+        );
+      }
+    } else if (capability.tool === GROUP_INVENTORY_TOOL) {
+      const allowListing = requiredOperations === undefined;
+      parameters = providerToolParameters(
+        capability,
+        allowListing,
+        definitionChatType,
+        requiredOperations,
+      );
+      const exposedOperations =
+        requiredOperations === undefined
+          ? capability.operations
+          : capability.operations.filter((operation) =>
+              requiredOperations.includes(operation.action),
+            );
+      description =
+        definitionChatType === "group"
+          ? providerToolDescription(
+              capability,
+              exposedOperations,
+              definitionChatType,
+              "Read metadata for the current QQ group.",
+            )
+          : allowListing
+            ? `Input {} lists the Owner's managed QQ groups without operation or groupId. To read metadata, set operation and provide groupId. ${providerToolDescription(
+                capability,
+                exposedOperations,
+                definitionChatType,
+                "Read provider metadata for a managed QQ group.",
+              )}`
+            : providerToolDescription(
+                capability,
+                exposedOperations,
+                definitionChatType,
+                "Read provider metadata for the authorized QQ group.",
+              );
+    } else {
+      const exposedOperations =
+        requiredOperations === undefined
+          ? capability.operations
+          : capability.operations.filter((operation) =>
+              requiredOperations.includes(operation.action),
+            );
+      parameters = providerToolParameters(
+        capability,
+        false,
+        definitionChatType,
+        requiredOperations,
+      );
+      description = providerToolDescription(capability, exposedOperations, definitionChatType);
+    }
+
     if (capability.tool === CAPABILITY_SEARCH_TOOL)
       return createCapabilitySearchTool({
         capability,
         authService: options.store.authorization,
         getContext,
+        parameters,
+        description,
         search: options.search,
       });
     if (capability.tool === GROUP_INVENTORY_TOOL)
@@ -870,13 +1489,19 @@ export function createCapabilityTools(
         capability,
         authService: options.store.authorization,
         getContext,
+        parameters,
+        description,
         isCategoryEnabled: options.isCategoryEnabled,
         invoke: options.invoke,
         verifyNativeGroupRole: options.verifyNativeGroupRole,
         projectManagedGroups: options.projectManagedGroups,
+        definitionChatType,
       });
     return createProviderCapabilityTool(capability, options.store, getContext, {
-      ...options,
+      ...providerOptions,
+      definitionChatType,
+      parameters,
+      description,
       authorizeMemberResolution: async (context, groupId) => {
         const members = QQ_CAPABILITIES.find((entry) => entry.tool === "qq_group_members")!;
         const request: AuthorizationRequest = {
@@ -931,7 +1556,13 @@ export function createCapabilityTools(
               throw new ToolInputError("capability_category_disabled");
             try {
               await options.store.authorization.authorizeReadResultsAndAction(
-                [{ request, decisionId: decision.id, source: "content_source" }],
+                [
+                  {
+                    request,
+                    decisionId: decision.id,
+                    source: "content_source",
+                  },
+                ],
                 {
                   caller: context.caller,
                   resourceId: groupResourceId(groupId),

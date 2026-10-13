@@ -5,7 +5,7 @@ description: Glassbox 项目的环境启动、服务管理与 trace 调试手册
 
 # Glassbox 运行与调试
 
-这个 skill 把两类重复劳动固定下来：**把整套环境跑起来**，和**从 Raw Trace 里定位问题**。核心纪律只有一条：trace 相关操作永远走本 skill 附带的 `gbxtrace` CLI，不要临时写解析脚本——脚本每次重写、字段名每次猜错，而 CLI 已经把 430 个真实 run 的事件结构校准过了。
+这个 skill 固定服务管理和 Raw Trace 排查步骤。Trace 查询使用本 skill 附带的 `gbxtrace` CLI。事件字段以当前仓库的读取器和参考文档为准，不依赖历史机器上的 run 数量。
 
 ## 开始前必读
 
@@ -13,29 +13,29 @@ description: Glassbox 项目的环境启动、服务管理与 trace 调试手册
 
 ## 一、环境认知（关键事实）
 
-| 事实           | 值                                                                                                                                   |
-| :------------- | :----------------------------------------------------------------------------------------------------------------------------------- |
-| 技术栈         | Node >= 24.12.0、npm 12.0.2 工作区、Vite+（入口命令 `vp`）                                                                           |
-| 服务管理       | `npm run agent:up / agent:status / agent:logs / agent:down / agent:switch`（Windows 下长驻服务必须用这套，不要用 `vp run agent:up`） |
-| 管理 CLI       | `npm run glassbox -- <命令>`（status / doctor / runs / trace show / eval …）                                                         |
-| Raw Trace 位置 | `~/.glassbox/runs/<runId>/trace.jsonl`（`GLASSBOX_DATA_DIR` 优先；服务启动器会把它指向同一个目录）                                   |
-| 服务日志       | `~/.glassbox/service.log`（混有二进制/ANSI 字节，用 `grep -a`；NapCat 登录/掉线证据在这里）                                          |
-| 提交门禁       | `vp run verify:commit`（每次 commit 前，禁止 `--no-verify`）；PR 前 `vp run verify:full`                                             |
-| 起环境最短路径 | `vp install` → `npm run agent:up` → `npm run agent:status`（共享库 schema 版本高于当前 checkout 支持版本时，见下方跨 checkout 规则） |
+| 事实           | 值                                                                                                                       |
+| :------------- | :----------------------------------------------------------------------------------------------------------------------- |
+| 技术栈         | Node >= 24.12.0、npm 12.0.2 工作区、Vite+（入口命令 `vp`）                                                               |
+| 服务管理       | `npm run agent:up / agent:status / agent:logs / agent:down / agent:switch`（Windows 下长驻服务不要用 `vp run agent:up`） |
+| 管理 CLI       | `npm run glassbox -- <命令>`（status / doctor / runs / trace show / eval …）                                             |
+| Raw Trace 位置 | `<数据目录>/runs/<runId>/trace.jsonl`（数据目录由 `GLASSBOX_DATA_DIR` 指定，未设置时为 `~/.glassbox`）                   |
+| 服务日志       | `<数据目录>/service.log`（混有二进制/ANSI 字节，用 `grep -a`；先从 `agent:status` 或启动配置确认数据目录）               |
+| 提交门禁       | `vp run verify:commit`（每次 commit 前，禁止 `--no-verify`）；PR 前 `vp run verify:full`                                 |
+| 起环境最短路径 | `vp install` → `npm run agent:up` → `npm run agent:status`（共享库版本由启动器与目标 checkout 动态比较）                 |
 
-服务启动器只启动 Glassbox；`service-launch.json`（在数据目录里）里配了 NapCat / Herdr 才会一并启动。它不拉代码、不切分支、不装依赖。QQ、NapCat、模型凭据不进 `.env`，走管理界面或 CLI 保存。
+`agent:up` 根据数据目录中的 `service-launch.json` 启动缺少的 Glassbox 服务，以及其中明确配置的 Herdr 或 NapCat。它不拉代码、不切分支、不装依赖。`agent:switch` 只重启 Glassbox，不重启或重建 NapCat。QQ、NapCat、模型凭据不进 `.env`，走管理界面或 CLI 保存。
 
-**本机环境事实**（换机器/换数据目录时以 `gbx env` 输出为准，不要默认）：
+**每次操作前读取动态环境事实**：
 
-- 服务端口不一定是 3030。`service-launch.json` 的 `glassbox.env.PORT` 是真实端口（本机是 43030）。管理 CLI 默认读 `PORT` 环境变量，缺省 3030——所以裸跑 `npm run glassbox -- status` 可能 CONNECTION_FAILED，正确做法是先 `gbx env` 拿到端口，再 `PORT=<端口> npm run glassbox -- <命令>`。
-- `agent:status` 会报告服务进程来自哪个 checkout。在当前仓库改代码不等于作用于运行中的服务；跨 worktree 调试先用 `npm run agent:switch -- --checkout <路径>` 再 `agent:status` 确认（改状态操作，先说明再执行）。
-- OneBot 就绪（`onebotReady`）不等于 QQ 已登录。被踢下线后 NapCat 会反复弹二维码，任何旧消息或模拟事件都不能替代重新扫码。二维码图片在 NapCat 数据目录的 `cache/qrcode.png`，扫码是用户动作，agent 只能指路。
-- **跨 checkout 的 schema 版本门**：`agent:up` 前会比对「目标 checkout 支持的 schema 版本」（读该 checkout `apps/server/src/persistence/schema.ts` 的 `CURRENT_SCHEMA_VERSION`）和共享库 `~/.glassbox/glassbox.db` 的 `PRAGMA user_version`。库比 checkout 新就拒绝启动并报 `Target checkout supports database version N, but shared data uses M`——这是安全设计，不是 bug。本机现状：共享库 v12（由未合入 main 的 `codex/issue-37-memory-taste-loop` 分支迁移产生），main 只支持 v11。所以**从 main 起服务必须带 `--checkout` 指向支持 v12 的 worktree**：
-  ```bash
-  npm run agent:up -- --checkout "C:/Users/yanBingZhao/.codex/worktrees/issue-9-taste-autolearn/Glassbox-Agent-Harness"
-  ```
-  该 worktree 目录名是旧的（issue-9），分支实际是 issue-37；以 `agent:status` 输出的 `checkout` 字段为准，不要信目录名。等 v12 迁移合入 main 后才能裸跑 `npm run agent:up`。
-- **启动器自身的坑**：`agent:up` 报 `Target checkout does not declare a readable database version` 且 checkout 明明是好的 = 启动器解析不了版本号（老版本从 `database.ts` 抠字面数字，而代码早已改成 `CURRENT_SCHEMA_VERSION` 常量）。修复版在 `codex/issue-36-qq-image-input` 分支（从 `schema.ts` 读），main 曾落后于此；遇到此错先确认运行的 `scripts/agent-service.mts` 是不是已含该修复，不要跑去改 schema.ts。
+- 运行 `npm run agent:status` 确认 Glassbox 进程、PID、checkout、启动 commit、源码是否干净，以及 `checkoutSourceVerified`。Linux 上状态还会核对可执行文件、完整参数、boot ID 和 PID 启动时间。PID 存活本身不足以证明它是当前服务。
+- 运行 `gbx env` 确认数据目录和端口。端口从当前 `service-launch.json` 的 `glassbox.env.PORT` 或 `PORT` 环境变量读取；不能假设为 3030 或其他固定端口。管理 CLI 使用自定义端口时，显式传入 `PORT=<端口>`。
+- `agent:switch -- --checkout <绝对路径>` 只切换 Glassbox。NapCat、Herdr、QQ 登录和 OneBot 配置保持运行。切换前会检查目标代码支持的 schema，再停止 Glassbox；目标版本低于共享库时拒绝切换。检查连接使用只读 SQLite，busy timeout 为 5000 毫秒。短暂写锁会等待释放，持续锁定或查询错误仍会失败关闭。
+- schema 版本每次从目标 checkout 的 `apps/server/src/persistence/schema.ts` 中读取 `CURRENT_SCHEMA_VERSION`，从共享数据库读取 `PRAGMA user_version`。先确认数据目录，再比较当前值；不要把某次机器上的 schema 或分支状态当成默认值，也不要为绕过拒绝而改写数据库版本。
+- 一次状态核验样例：2026-10-08，Glassbox PID 592317，数据目录 `/home/yanbingzhao/.glassbox`，端口 43031，共享 schema v29。这只是当时的快照，不是默认配置。
+  只有当前账号状态明确报告 `online: false`，qq-live 将明确且无否定或矛盾的原生登录失效提示严格分类为 `ACCOUNT_REAUTH_REQUIRED`，或已认证的 NapCat WebUI 同时显示 `isLogin: false`、`loginPhase: waiting_qrcode`、`coreReady: false` 且没有 OneBot listener 时，才可请用户确认是否用手机登录。最后一种状态只证明当前未登录并等待二维码确认，不证明登录授权已过期。请求超时、端口状态或单独的 `-10003` 都不足以请求登录。不要自动重建 NapCat 数据、删除登录状态或重启以刷新二维码。登录操作由用户在本地 NapCat WebUI 完成。
+
+一次条件化诊断示例：Bot 的 OneBot 状态为 offline，WebUI 的 CheckLoginStatus 同时报告 isOffline=true。刷新二维码后，原生 onUserLoggedIn 仍提示当前账号已登录，无法重复登录。这确认了原生登录状态冲突，不是单纯的界面状态。用户明确授权修复后，只调用 Bot WebUI 的原生 RestartNapCat 工作进程入口。该操作保留容器、账号目录和设备配置；没有删除或重建状态。重启后 WebUI 报告 isLogin=false、isOffline=false、loginPhase=qrcode_scanned、coreReady=false，等待用户手机确认。生成二维码或扫码 accepted 都不代表 coreReady，也不代表真实消息收发通过。
+只有在再次确认账号 offline、确认原生重复登录冲突，并取得用户明确授权后，才按这个精确入口修复。不要把此示例推广为 timeout、单独 -10003 或其他状态下的自动重启规则。
 
 **跑任何调试前先确认环境**（服务是否在、数据目录对不对、有多少 run 可查）：
 
@@ -62,7 +62,7 @@ node .agents/skills/glassbox-ops/scripts/gbxtrace.mjs env
 | `gbx types`                               | 本地全部 run 的事件类型与终态分布（校准对 trace 的预期）                                                                                                                                                            |
 | `gbx drift`                               | **文档漂移检测**：本地 trace 里出现、但 `references/trace-events.md` 没记录的事件类型，附样本 JSON                                                                                                                  |
 
-所有命令支持 `--json`（机器可读，便于二次处理）和 `--data-dir <path>`（覆盖数据目录）。runId 支持不冲突的前缀。出错时退出码 2 并给出原因。
+所有命令支持 `--json`。`GLASSBOX_DATA_DIR` 与服务管理器一致，指定 Glassbox 数据根目录，CLI 从其 `runs/` 子目录读取 Trace。`--data-dir <path>` 保持原有契约，直接指定 runs 目录，例如 `--data-dir /home/yanbingzhao/.glassbox/runs`。显式目录或环境配置缺失时，不回退到另一套产品数据。没有显式配置时，依次检查用户目录和当前技能所属仓库的 `.glassbox/runs`。runId 支持不冲突的前缀。出错时退出码 2 并给出原因。
 
 常用组合：
 
@@ -83,7 +83,7 @@ gbx show <runId> --json                 # 交给后续处理
 
 按症状选入口，但顺序不变：**环境 → 找 run → 时间线 → 按证据下钻 → 交叉验证**。
 
-1. **环境**：`gbx env`。端口不可达先 `npm run agent:up`（若报 `supports database version N, but shared data uses M`，按「一」里的跨 checkout 规则带 `--checkout` 重起；报 `does not declare a readable database version` 是启动器 bug，见「一」）；数据目录不对用 `--data-dir` 或核对 `GLASSBOX_DATA_DIR`。
+1. **环境**：先看 `npm run agent:status` 和 `gbx env`。服务未运行时再用 `npm run agent:up`；要换 checkout 时使用 `npm run agent:switch -- --checkout <绝对路径>`。若版本检查拒绝目标，比较该 checkout 的 `CURRENT_SCHEMA_VERSION` 与共享库 `PRAGMA user_version`。若目标没有可读取的版本声明，检查选定 checkout 的 `schema.ts` 和服务管理器代码；不要改数据库版本绕过检查。数据目录不对时核对 `GLASSBOX_DATA_DIR`。
 2. **找 run**：用户说"刚才那条消息不对"→ `gbx runs` 按时间对齐；说"挂了/没回复"→ `gbx runs --status failed` 或 `gbx failures`；完全不知道 → `gbx replay`（先看六段哪段空）再 `gbx show`。**那段时间连 run 都没有 → 跳过 run 直接 `gbx ingress`**。
 3. **回放**：`gbx replay <runId>` 按"入站 → 路由 → 会话与 runtime → 模型回合 → 产出 → 投递"逐段报有没有证据，并列出时间空洞。空的那段就是排查起点。一个健康 run 的形状是：
    `message_received → run_queued → run_started → routing_decision → tool_evidence → context_budget → session_start → turn_start → (tool_call → tool_result)* → turn_end → runtime_usage → session_end → run_finished → delivery_changed(sending → sent)`。

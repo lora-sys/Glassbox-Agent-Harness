@@ -108,7 +108,12 @@ export interface BrowserToolEvidence {
 function contextFrom(getContext: () => PiRunContext | undefined): ProtectedToolContext | undefined {
   const value = getContext();
   return value?.caller && value.conversationId && value.runId
-    ? { caller: value.caller, conversationId: value.conversationId, runId: value.runId }
+    ? {
+        caller: value.caller,
+        conversationId: value.conversationId,
+        runId: value.runId,
+        ...(value.acceptanceLease ? { acceptanceLease: value.acceptanceLease } : {}),
+      }
     : undefined;
 }
 

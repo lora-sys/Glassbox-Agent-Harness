@@ -1,5 +1,6 @@
 export const persistedEnvironmentKeys = new Set([
   "PORT",
+  "NODE_USE_ENV_PROXY",
   "GLASSBOX_TEMPORAL_ADDRESS",
   "GLASSBOX_TEMPORAL_NAMESPACE",
   "LORA_PI_KIT_PATH",

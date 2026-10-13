@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { Buffer } from "node:buffer";
 import WebSocket, { type RawData } from "ws";
 import type { TrustedChannelScope } from "../../identity/scope.js";
@@ -291,6 +292,8 @@ export class OneBotAdapter {
   #retryCount = 0;
   #pending = new Map<string, PendingRequest>();
   #incomingQueue: Promise<void> = Promise.resolve();
+  #incomingContext = new AsyncLocalStorage<boolean>();
+  #stopOperation: Promise<void> | undefined;
   /**
    * Messages that arrived on a live socket before the identity check finished.
    *
@@ -543,6 +546,7 @@ export class OneBotAdapter {
   }
 
   async start(): Promise<void> {
+    if (this.#stopOperation) await this.#stopOperation;
     if (this.#state.status === "ready") return;
     if (this.#attempt) return this.#attempt;
     this.#active = true;
@@ -559,7 +563,30 @@ export class OneBotAdapter {
     }
   }
 
-  async stop(): Promise<void> {
+  stop(): Promise<void> {
+    if (this.#stopOperation) return this.#stopOperation;
+    let resolve!: () => void;
+    let reject!: (error: unknown) => void;
+    const operation = new Promise<void>((complete, fail) => {
+      resolve = complete;
+      reject = fail;
+    });
+    this.#stopOperation = operation;
+    void this.#stopInternal().then(
+      () => {
+        if (this.#stopOperation === operation) this.#stopOperation = undefined;
+        resolve();
+      },
+      (error) => {
+        if (this.#stopOperation === operation) this.#stopOperation = undefined;
+        reject(error);
+      },
+    );
+    return operation;
+  }
+
+  async #stopInternal(): Promise<void> {
+    const calledFromIncoming = this.#incomingContext.getStore() === true;
     this.#active = false;
     this.#generation++;
     this.#incomingAbort.abort();
@@ -578,8 +605,10 @@ export class OneBotAdapter {
         socket.terminate();
       });
     }
-    // A stopped adapter never reaches `ready`, so anything still waiting for verification
-    // would sit here until someone restarted it and got a batch of stale messages.
+    const attempt = this.#attempt;
+    if (attempt) await attempt.catch(() => undefined);
+    if (!calledFromIncoming) await this.#incomingQueue;
+    // A stopped adapter never reaches 'ready', so messages waiting for verification are cleared.
     this.#beforeVerification = [];
     this.#setState({ status: "stopped" });
   }
@@ -1012,7 +1041,7 @@ export class OneBotAdapter {
       .then(async () => {
         if (!this.#active || signal.aborted || generation !== this.#generation) return;
         try {
-          await this.#options.onIncoming(message, signal);
+          await this.#incomingContext.run(true, () => this.#options.onIncoming(message, signal));
         } catch {
           this.#ingressError({
             code: "acceptance_failed",

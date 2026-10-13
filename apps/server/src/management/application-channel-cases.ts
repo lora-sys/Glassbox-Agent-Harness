@@ -10,6 +10,8 @@ import { WebSocketServer } from "ws";
 import { ModelProfileStore } from "../config/model-profiles.js";
 import { ChannelProfileStore } from "../config/channel-profiles.js";
 import type { ExecutionInput, ExecutionResult } from "../execution/run-service/types.js";
+import type { PiRunContext } from "../runtime/pi/types.js";
+import { canonicalQqLiveTextSha256, QqLiveLeaseRegistry } from "../acceptance/qq-live-lease.js";
 import type { TrustedChannelScope } from "../persistence/index.js";
 import { ManagementApplication } from "./application.js";
 import { SKILL_CATALOG_RESOURCE, SKILL_READ_ACTION } from "../runtime/pi/skill-tools.js";
@@ -19,6 +21,96 @@ const { fixture, afterEachCleanup, cleanup, removeDirectory } = createApplicatio
 afterEach(afterEachCleanup);
 
 describe("channel to durable run composition", () => {
+  it("preserves a revoked bound lease as fail-closed Run context", async () => {
+    const f = await fixture(async () => ({ status: "succeeded", text: "unused" }));
+    const internals = f.app as unknown as {
+      qqLiveLeases: QqLiveLeaseRegistry;
+      qqLiveRunBindings: Map<
+        string,
+        {
+          leaseId: string;
+          principalId: string;
+          scope: TrustedChannelScope;
+          messageId: string;
+          runId: string;
+          marker: string;
+          toolsSha256: string;
+        }
+      >;
+      resolveQqLiveRunLease(input: ExecutionInput): PiRunContext["acceptanceLease"] | undefined;
+    };
+    const scope: TrustedChannelScope = {
+      connectionId: "fixture",
+      botId: "10001",
+      chatType: "private",
+      chatId: "10002",
+      senderId: "10002",
+    };
+    const marker = "00112233445566778899aabbccddeeff";
+    const text = "GLASSBOX_ACCEPTANCE_V1 " + marker + String.fromCharCode(10) + "request";
+    const now = Date.now();
+    const registered = internals.qqLiveLeases.register({
+      principalId: "owner",
+      scope,
+      marker,
+      textSha256: canonicalQqLiveTextSha256(text),
+      ttlMs: 10_000,
+      expiresAt: now + 10_000,
+      tools: [
+        {
+          name: "qq_group_members",
+          operations: [
+            {
+              action: "qq:group:members:read",
+              resourceId: "group:10003",
+              inputConstraint: { groupId: "10003" },
+            },
+          ],
+        },
+      ],
+    });
+    const binding = {
+      leaseId: registered.leaseId,
+      principalId: "owner",
+      scope,
+      messageId: "message-1",
+      runId: "run-revoked",
+    };
+    internals.qqLiveLeases.resolveInbound({
+      principalId: "owner",
+      scope,
+      messageId: binding.messageId,
+      text,
+    });
+    expect(internals.qqLiveLeases.bindRun(binding)).toBe(true);
+    internals.qqLiveRunBindings.set(binding.runId, {
+      ...binding,
+      marker,
+      toolsSha256: registered.toolsSha256,
+    });
+    expect(internals.qqLiveLeases.revoke(registered.leaseId)).toBe(true);
+
+    const lease = internals.resolveQqLiveRunLease({
+      run: { id: binding.runId },
+    } as ExecutionInput);
+    expect(lease).toBeDefined();
+    expect(lease?.assertActive()).toBe(false);
+    expect(lease?.filterToolNames(["qq_group_members"])).toEqual([]);
+    expect(lease?.getToolInputRestrictions("qq_group_members")).toEqual([]);
+    const call = {
+      toolName: "qq_group_members",
+      action: "qq:group:members:read",
+      resourceId: "group:10003",
+      toolInput: { groupId: "10003" },
+    };
+    expect(lease?.checkToolCall(call)).toBe(false);
+    expect(lease?.diagnoseToolCall?.(call)).toBe("acceptance_lease_unavailable");
+    internals.qqLiveRunBindings.delete(binding.runId);
+    expect(
+      internals.resolveQqLiveRunLease({ run: { id: binding.runId } } as ExecutionInput),
+    ).toBeUndefined();
+  });
+
   it("returns zeroed ingress diagnostics when a managed group has no Runs yet", async () => {
     const f = await fixture(async () => ({ status: "succeeded", text: "unused" }));
     const ownerScope: TrustedChannelScope = {
@@ -863,9 +955,19 @@ describe("channel to durable run composition", () => {
     const input = await f.started.take();
     await f.app.runs.waitForRun(input.caller, input.run.id);
     await f.app.runs.drain();
-    expect((await f.app.store.lifecycle.listDeliveries(input.caller, input.run.id)).items).toEqual(
-      [],
-    );
+    const deliveries = (await f.app.store.lifecycle.listDeliveries(input.caller, input.run.id))
+      .items;
+    expect(deliveries).toMatchObject([
+      {
+        payloadKind: "result",
+        status: "sent",
+        payloadText: "这次回复未通过发送检查，内容已保留供检查。请勿重复提交可能已经执行的操作。",
+      },
+    ]);
+    expect(JSON.stringify(deliveries)).not.toContain("fixture-token");
+    expect(
+      JSON.stringify(f.actionLog.filter((entry) => entry.action === "send_private_msg")),
+    ).not.toContain("fixture-token");
     const trace = await f.app.trace.readPage(input.run.id);
     expect(JSON.stringify(trace)).not.toContain("fixture-token");
     expect(

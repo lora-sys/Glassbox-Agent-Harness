@@ -138,11 +138,21 @@ jobs:
       contents: read
       pull-requests: read
     steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Verify the reviewed Vite+ alias before advisory exception
+        id: reviewed-vite-plus
+        run: node scripts/check-vite-plus-alias.mjs
+
       - name: Review dependency changes
         uses: actions/dependency-review-action@v5
         with:
           fail-on-severity: high
           fail-on-scopes: runtime, development
+          allow-ghsas: ${{ steps.reviewed-vite-plus.outputs.allow-ghsas }}
+          retry-on-snapshot-warnings: true
+          retry-on-snapshot-warnings-timeout: 600
 
   pull-request-hygiene:
     name: Pull request title hygiene

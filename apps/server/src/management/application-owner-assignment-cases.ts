@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vite-plus/test";
 import { createApplicationFixtureScope } from "./application-test-helpers.js";
 import { QQ_CAPABILITY_CATEGORIES } from "../channels/onebot/capabilities.js";
 import { DEFAULT_OWNER_GROUP_CATEGORIES, DEFAULT_OWNER_GROUP_POLICY } from "./application.js";
+import { safeToolOutput } from "../runtime/pi/tool-output-evidence.js";
 import {
   startWindowsPhaseTiming,
   type WindowsPhaseTiming,
@@ -527,6 +528,70 @@ describe("per-Owner managed group assignment", () => {
       "qq_account_status",
       "qq_capability_search",
     ]);
+  });
+
+  it("records category and discovery DENYs only beside their exact successful projection Tool result", async () => {
+    const { f, application, a } = await owners();
+    await application.setGroupAccess(a, { groupId: GROUP, enabled: true });
+    const tool = searchTool(application, a);
+    const result = await tool.execute("projection-search-call", { query: "moderation" });
+    expect(result.details).toMatchObject({ query: "moderation", groups: [GROUP] });
+    const receipts = await f.app.store.tasks.listTraceEvents({
+      type: "authorization.projection_receipt",
+    });
+    const receipt = receipts.find((event) => event.runId === a.runId);
+    expect(receipt?.principalId).toBe(a.caller.principalId);
+    expect(receipt?.data).toMatchObject({
+      schema: "glassbox.authorization-projection-receipt.v1",
+      kind: "capability_search",
+      purpose: "capability_search_availability",
+      conversationId: a.conversationId,
+      toolName: "qq_capability_search",
+      toolCallId: "projection-search-call",
+      outputSha256: expect.any(String),
+      outputBytes: expect.any(Number),
+    });
+    const decisions = receipt?.data.decisions as Array<Record<string, unknown>>;
+    expect(decisions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          action: "group:files:write",
+          purpose: "capability_group_category_availability",
+        }),
+        expect.objectContaining({
+          action: "group:moderate",
+          purpose: "capability_group_category_availability",
+        }),
+        expect.objectContaining({
+          action: "group:settings:write",
+          purpose: "capability_group_category_availability",
+        }),
+        expect.objectContaining({
+          action: "tool:discover",
+          resourceId: "tool:qq_group_local_settings",
+          purpose: "capability_tool_discovery_availability",
+        }),
+      ]),
+    );
+    expect(JSON.stringify(receipt?.data)).not.toContain("moderation");
+    const normalized = safeToolOutput("qq_capability_search", result);
+    expect(receipt?.data.outputSha256).toBe(normalized.outputSha256);
+    expect(receipt?.data.outputBytes).toBe(normalized.outputBytes);
+    const trace = await f.app.trace.readPage(a.runId);
+    const rawReceipt = trace.records
+      .map((record) => record.event as Record<string, unknown>)
+      .find(
+        (event) =>
+          event.type === "authorization_projection_receipt" &&
+          event.receiptEventId === receipt?.data.receiptId,
+      );
+    expect(rawReceipt).toMatchObject({
+      runId: a.runId,
+      principalId: a.caller.principalId,
+      receiptEventId: receipt?.data.receiptId,
+      outputSha256: receipt?.data.outputSha256,
+      outputBytes: receipt?.data.outputBytes,
+    });
   });
 
   it("never surfaces a server-only, deferred or raw provider primitive", async () => {

@@ -229,10 +229,22 @@ export function createApplicationFixtureScope() {
       timing?: WindowsPhaseTiming;
       /** Current provider role returned by the execution-time member lookup. */
       memberRole?: () => "owner" | "admin" | "member";
+      /** Role by provider user id, so the Bot and message sender can differ in one fixture. */
+      memberRoleForUser?: (userId: string) => "owner" | "admin" | "member";
+      /** Current target mute timestamp for execution-precondition tests. */
+      memberMuteUntil?: (userId: string) => number;
+      /** Pauses one fake provider response so tests can change authorization while it is in flight. */
+      beforeActionReply?: (action: Action) => Promise<void>;
       /** One provider mutation to reject after caller authorization has passed. */
       failAction?: string;
+      /** One provider failure selected by its exact request, for Bot-only read failure tests. */
+      failActionWhen?: (action: Action) => boolean;
       /** Deterministic media adapter for media Tool and delivery tests. */
       mediaProvider?: MediaGenerationProvider;
+      /** Execution reference used by one fixture, defaulting to the fake direct adapter. */
+      executionRef?: string;
+      /** Disposable loopback-only model profile for actual Pi ingress wiring tests. */
+      piModelProfile?: Record<string, unknown>;
       /** Isolated Pi config directory for tests that exercise native Pi model routing. */
       piAgentDirectory?: string | null;
       /** Pi model configuration written to the default Glassbox main-agent directory. */
@@ -272,7 +284,7 @@ export function createApplicationFixtureScope() {
     server.on("connection", (socket) => {
       activeSocket = socket;
       sockets.put(socket);
-      socket.on("message", (raw) => {
+      socket.on("message", async (raw) => {
         const bytes = Array.isArray(raw)
           ? Buffer.concat(raw)
           : raw instanceof ArrayBuffer
@@ -286,7 +298,11 @@ export function createApplicationFixtureScope() {
         // A rejected `get_group_info` is the peer's own failure reply: `status: "failed"` with a
         // non-zero `retcode`, which the adapter maps to a provider error rather than to data.
         const groupInfoFailed = action.action === "get_group_info" && groupInfoFails;
-        const actionFailed = groupInfoFailed || action.action === options.failAction;
+        const actionFailed =
+          groupInfoFailed ||
+          action.action === options.failAction ||
+          options.failActionWhen?.(action) === true;
+        await options.beforeActionReply?.(action);
         socket.send(
           JSON.stringify({
             echo: action.echo,
@@ -305,7 +321,17 @@ export function createApplicationFixtureScope() {
                     ? {
                         group_id: action.params.group_id,
                         user_id: action.params.user_id,
-                        role: options.memberRole?.() ?? "member",
+                        ...(options.memberMuteUntil === undefined
+                          ? {}
+                          : {
+                              shut_up_timestamp: options.memberMuteUntil(
+                                String(action.params.user_id),
+                              ),
+                            }),
+                        role:
+                          options.memberRoleForUser?.(String(action.params.user_id)) ??
+                          options.memberRole?.() ??
+                          "member",
                       }
                     : action.action === "get_group_msg_history"
                       ? { messages: options.history?.(action.params) ?? [] }
@@ -316,6 +342,7 @@ export function createApplicationFixtureScope() {
     });
     await once(server, "listening");
     const models = await ModelProfileStore.open(directory);
+    if (options.piModelProfile) await models.save(options.piModelProfile);
     const executors = new Map<string, RunExecutionAdapter>([
       [
         "claude-code",
@@ -364,7 +391,7 @@ export function createApplicationFixtureScope() {
         visitorIds: ["10004"],
         groupIds: ["10003"],
         token: "fixture-token",
-        executionRef: "claude-code",
+        executionRef: options.executionRef ?? "claude-code",
       }),
     );
     await timed("fixture-connect", () => app.connectChannel("fixture"));

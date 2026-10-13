@@ -12,11 +12,11 @@ import {
 } from "./required-evidence.js";
 
 function inGroup(text: string): RequiredEvidenceInput {
-  return { text, chatType: "group", isOwner: false };
+  return { text, chatType: "group", isOwner: false, botId: "3394947361" };
 }
 
 function ownerPrivate(text: string): RequiredEvidenceInput {
-  return { text, chatType: "private", isOwner: true };
+  return { text, chatType: "private", isOwner: true, botId: "3394947361" };
 }
 
 /** The domain names required for a message, in the order the policy reports them. */
@@ -93,6 +93,27 @@ describe("required evidence for a live QQ fact", () => {
     ]);
   });
 
+  it("uses the group-info count for aggregate-only member questions", () => {
+    const request =
+      "帮我看看 OATP 群 1121579672 目前大约有多少成员，只告诉我总人数，不要列出成员，也不要改群设置。";
+    expect(requiredEvidenceFor(ownerPrivate(request))).toEqual([
+      {
+        domain: "group_member_count",
+        tool: "qq_groups",
+        input: { groupId: "1121579672", operation: "get_group_info" },
+      },
+    ]);
+    expect(
+      requiredEvidenceFor(inGroup("请告诉我本群大约有多少成员，只说数量，不要列名单。")),
+    ).toEqual([
+      {
+        domain: "group_member_count",
+        tool: "qq_groups",
+        input: { operation: "get_group_info" },
+      },
+    ]);
+  });
+
   it("requires the notice read for a question about the notice", () => {
     expect(requiredEvidenceFor(inGroup("群公告是什么？"))).toEqual([
       {
@@ -129,6 +150,32 @@ describe("required evidence for a live QQ fact", () => {
     ]);
   });
 
+  it("recognizes explicit get_group_info requests and natural group count or capacity questions", () => {
+    const expected = [
+      {
+        domain: "group_metadata",
+        tool: "qq_groups",
+        input: { groupId: "1121579672", operation: "get_group_info" },
+      },
+    ];
+    expect(
+      requiredEvidenceFor(
+        ownerPrivate(
+          "请只调用 qq_groups 的 get_group_info 操作查询测试群 1121579672。用实际 member_count 和 max_member_count 填入 count 和 capacity。",
+        ),
+      ),
+    ).toEqual(expected);
+    expect(requiredEvidenceFor(ownerPrivate("查询群 1121579672 有多少人，群容量是多少？"))).toEqual(
+      expected,
+    );
+    expect(requiredEvidenceFor(ownerPrivate("查询群 1121579672 的实际人数"))).toEqual(expected);
+  });
+
+  it("does not treat material posted in a group as the group metadata", () => {
+    expect(asksLiveQqFact("帮我查看群里发的资料")).toBe(false);
+    expect(asksLiveQqFact("帮我查看群里有人分享的头像")).toBe(false);
+  });
+
   it("requires the history page for a question about recent messages", () => {
     expect(requiredEvidenceFor(inGroup("这个群当前最新的消息是什么"))).toEqual([
       {
@@ -152,12 +199,30 @@ describe("required evidence for a live QQ fact", () => {
     ]);
   });
 
+  it("recognizes the fixed seed scenario's natural history-search request", () => {
+    expect(
+      requiredEvidenceFor(
+        inGroup("请搜索本群历史，查找编号 gbxhistory1-a1234567890123456789012345678901。"),
+      ),
+    ).toEqual([{ domain: "group_history_search", tool: GROUP_HISTORY_SEARCH_TOOL, input: {} }]);
+  });
+
   it("requires the history Tool when an explicit sender filter comes before the history noun", () => {
     expect(
       requiredEvidenceFor(
         inGroup("请搜索发送者 QQ 3067670134 发的群历史，查找包含 P4-NOMATCH-86731 的消息。"),
       ),
     ).toEqual([{ domain: "group_history_search", tool: GROUP_HISTORY_SEARCH_TOOL, input: {} }]);
+  });
+
+  it("requires Owner history search for a natural request naming the group and search term", () => {
+    expect(
+      requiredEvidenceFor(
+        ownerPrivate(
+          "请搜索群 20001 的历史记录，查找编号 gbxhistory1-a1234567890123456789012345678901。",
+        ),
+      ),
+    ).toEqual([{ domain: "owner_history_search", tool: OWNER_HISTORY_SEARCH_TOOL, input: {} }]);
   });
 
   it("never requires a group-scoped domain for a group Run's account status", () => {
@@ -330,7 +395,12 @@ describe("required evidence stays narrow", () => {
     expect(domains(ownerPrivate("查看群 1126022432 有哪些成员"))).toEqual(["group_members"]);
     // Nothing about the requirement is derived from a Tool list, so there is no input that
     // could withhold one.
-    expect(Object.keys(inGroup("群文件有哪些？")).sort()).toEqual(["chatType", "isOwner", "text"]);
+    expect(Object.keys(inGroup("群文件有哪些？")).sort()).toEqual([
+      "botId",
+      "chatType",
+      "isOwner",
+      "text",
+    ]);
   });
 
   it("never also requires the live history page for an explicit history search", () => {
@@ -360,6 +430,7 @@ describe("required evidence stays narrow", () => {
         text: "查看群 1126022432 有哪些成员",
         chatType: "private",
         isOwner: false,
+        botId: "3394947361",
       }),
     ).toEqual([]);
   });
@@ -400,12 +471,108 @@ describe("required evidence on the Owner-private surface", () => {
     expect(requiredEvidenceFor(ownerPrivate("群成员有哪些？"))).toEqual([]);
   });
 
-  it("requires the account status read when the Owner asks for it", () => {
-    expect(requiredEvidenceFor(ownerPrivate("机器人登录状态是什么"))).toEqual([
+  it("requires the account status read with the status operation", () => {
+    expect(requiredEvidenceFor(ownerPrivate("机器人当前在线状态是什么"))).toEqual([
       {
         domain: "account_status",
         tool: "qq_account_status",
+        input: { operation: "get_status" },
+      },
+    ]);
+  });
+
+  it.each(["提供", "给我", "报出", "说出", "核对", "检查"])(
+    "keeps a status read separate from a refused identity request using %s",
+    (verb) => {
+      expect(
+        requiredEvidenceFor(
+          ownerPrivate(
+            `检查机器人当前是否在线，只告诉我在线状态，不用${verb}账号号码或其他账号资料。`,
+          ),
+        ),
+      ).toEqual([
+        {
+          domain: "account_status",
+          tool: "qq_account_status",
+          input: { operation: "get_status" },
+        },
+      ]);
+      expect(requiredEvidenceFor(ownerPrivate(`不用${verb}账号号码。`))).toEqual([]);
+    },
+  );
+
+  it("keeps modifiers inside the scope of an identity refusal", () => {
+    expect(requiredEvidenceFor(ownerPrivate("不要在群里告诉我账号号码"))).toEqual([]);
+    expect(
+      requiredEvidenceFor(ownerPrivate("请不要在回复中提供账号号码，请告诉我机器人当前在线状态")),
+    ).toEqual([
+      {
+        domain: "account_status",
+        tool: "qq_account_status",
+        input: { operation: "get_status" },
+      },
+    ]);
+  });
+
+  it.each([
+    "检查机器人当前在线状态时不用提供账号号码",
+    "检查机器人当前在线状态时不要在群里提供账号号码",
+  ])("does not span an inline identity refusal from the status-check verb: %s", (text) => {
+    expect(requiredEvidenceFor(ownerPrivate(text))).toEqual([
+      {
+        domain: "account_status",
+        tool: "qq_account_status",
+        input: { operation: "get_status" },
+      },
+    ]);
+  });
+
+  it("does not let a refused identity request erase a later group read", () => {
+    expect(requiredEvidenceFor(ownerPrivate("不用提供QQ号码再查询群 1121579672 的人数"))).toEqual([
+      {
+        domain: "group_metadata",
+        tool: "qq_groups",
+        input: { groupId: "1121579672", operation: "get_group_info" },
+      },
+    ]);
+  });
+
+  it.each(["我已经核对机器人登录状态，不用再查", "之前检查过机器人在线状态"])(
+    "does not interpret a completed status check as a new read: %s",
+    (text) => expect(requiredEvidenceFor(ownerPrivate(text))).toEqual([]),
+  );
+
+  it("retains a positive identity request beside a refused status read", () => {
+    expect(
+      requiredEvidenceFor(ownerPrivate("不用查看机器人在线状态，请告诉我机器人的 QQ 号码。")),
+    ).toEqual([
+      {
+        domain: "account_identity",
+        tool: "qq_account_status",
         input: { operation: "get_login_info" },
+      },
+    ]);
+  });
+
+  it("reads account identity only when the Owner requests it", () => {
+    expect(requiredEvidenceFor(ownerPrivate("请告诉我机器人的 QQ 号码。"))).toEqual([
+      {
+        domain: "account_identity",
+        tool: "qq_account_status",
+        input: { operation: "get_login_info" },
+      },
+    ]);
+    expect(
+      requiredEvidenceFor(
+        ownerPrivate(
+          "帮我检查一下机器人当前是否在线。只告诉我在线状态，不用发账号号码或其他账号资料。",
+        ),
+      ),
+    ).toEqual([
+      {
+        domain: "account_status",
+        tool: "qq_account_status",
+        input: { operation: "get_status" },
       },
     ]);
   });
@@ -509,6 +676,30 @@ describe("resolving required evidence against a Run's calls", () => {
     ]);
     expect(unobservedEvidence(missingArtifact)).toHaveLength(1);
   });
+
+  it("requires a verified provider member_count for an aggregate member-count answer", () => {
+    const count = requiredEvidenceFor(
+      ownerPrivate("查询 OATP 群 1121579672 目前有多少成员，只告诉我人数。"),
+    );
+    expect(count).toEqual([
+      {
+        domain: "group_member_count",
+        tool: "qq_groups",
+        input: { groupId: "1121579672", operation: "get_group_info" },
+      },
+    ]);
+    const call: ObservedToolCall = {
+      name: "qq_groups",
+      input: { groupId: "1121579672", operation: "get_group_info" },
+      failed: false,
+      outcome: "success",
+      result: { member_count: 5 },
+    };
+    expect(resolveEvidence(count, [call])[0]?.outcome).toBe("success");
+    expect(resolveEvidence(count, [{ ...call, result: { group_name: "OATP" } }])[0]?.outcome).toBe(
+      "not_called",
+    );
+  });
 });
 
 describe("whether a message asks a live QQ fact at all", () => {
@@ -522,5 +713,129 @@ describe("whether a message asks a live QQ fact at all", () => {
     // this to tell them apart.
     expect(asksLiveQqFact("查看群 1126022432 的历史配置状态")).toBe(false);
     expect(asksLiveQqFact("查询群 1126022432 当前有哪些技能")).toBe(false);
+  });
+});
+
+describe("fresh bot group role evidence", () => {
+  const privateQuestion = "你现在在测试群 1126022432 里是管理员吗？请实际查一下。";
+  const expected = {
+    domain: "bot_group_role" as const,
+    tool: "qq_group_members",
+    input: {
+      groupId: "1126022432",
+      operation: "get_group_member_info",
+      params: { user_id: "3394947361" },
+    },
+  };
+
+  it("binds an Owner-private role question to the named group and trusted bot", () => {
+    expect(requiredEvidenceFor(ownerPrivate(privateQuestion))).toEqual([expected]);
+    expect(asksLiveQqFact(privateQuestion)).toBe(true);
+  });
+
+  it.each([
+    "你在本群是管理员吗？",
+    "机器人是不是群主？",
+    "请查询你在本群的角色。",
+    "你现在在这个群里是什么身份，能不能管理禁言？先查清楚告诉我，这次不要禁言任何人。",
+    "你在群里是什么身份？",
+  ])("requires a fresh scoped member read for %s", (text) =>
+    expect(requiredEvidenceFor(inGroup(text))).toEqual([
+      {
+        ...expected,
+        input: { operation: "get_group_member_info", params: { user_id: "3394947361" } },
+      },
+    ]),
+  );
+
+  it.each([
+    "怎么查看你在群 1126022432 的管理员身份？",
+    "不要查询你在群 1126022432 的管理员身份。",
+    "把你设为群 1126022432 的管理员。",
+    "请翻译“你在群 1126022432 是管理员吗”。",
+    "你在群 1126022432 的管理员工具是否启用？",
+  ])("does not turn instructions or quoted text into a native role read: %s", (text) => {
+    expect(requiredEvidenceFor(ownerPrivate(text))).toEqual([]);
+  });
+
+  it("does not guess an unnamed private group", () => {
+    expect(requiredEvidenceFor(ownerPrivate("你在群里是管理员吗？"))).toEqual([]);
+  });
+
+  it.each([
+    {
+      operation: "get_group_member_info",
+      groupId: "1121579672",
+      params: { user_id: "3394947361" },
+    },
+    {
+      operation: "get_group_member_info",
+      groupId: "1126022432",
+      params: { user_id: "3526039967" },
+    },
+    { operation: "get_group_member_list", groupId: "1126022432" },
+  ])("rejects a successful read of another identity, group or operation", (input) => {
+    expect(
+      resolveEvidence([expected], [{ name: "qq_group_members", input, failed: false }])[0]?.outcome,
+    ).toBe("not_called");
+  });
+
+  it("accepts only a successful exact role read", () => {
+    const call = { name: "qq_group_members", input: expected.input, failed: false };
+    expect(resolveEvidence([expected], [call])[0]?.outcome).toBe("success");
+    expect(resolveEvidence([expected], [{ ...call, failed: true }])[0]?.outcome).toBe("not_called");
+    expect(resolveEvidence([expected], [])[0]?.outcome).toBe("not_called");
+  });
+});
+
+describe("group member profile evidence", () => {
+  it("binds an Owner-private nickname and card query to the named QQ member", () => {
+    const text = "帮我查一下 OATP 群 1121579672 里 QQ 2498701175 的群昵称和群名片，告诉我就行。";
+    expect(requiredEvidenceFor(ownerPrivate(text))).toEqual([
+      {
+        domain: "group_member_profile",
+        tool: "qq_group_members",
+        input: {
+          groupId: "1121579672",
+          operation: "get_group_member_info",
+          params: { user_id: "2498701175" },
+        },
+      },
+    ]);
+
+    const naturalQuestion =
+      "帮我查一下 OATP 群 1121579672 里 QQ 2498701175 的群昵称和群名片是什么？只告诉我查到的信息，不要修改任何群资料。";
+    expect(requiredEvidenceFor(ownerPrivate(naturalQuestion))).toEqual([
+      {
+        domain: "group_member_profile",
+        tool: "qq_group_members",
+        input: {
+          groupId: "1121579672",
+          operation: "get_group_member_info",
+          params: { user_id: "2498701175" },
+        },
+      },
+    ]);
+  });
+
+  it("does not expose member labels to a group Run", () => {
+    expect(domains(inGroup("查一下本群 QQ 2498701175 的群昵称和群名片"))).not.toContain(
+      "group_member_profile",
+    );
+  });
+
+  it("uses the scoped member list when a profile query does not name a QQ number", () => {
+    expect(
+      requiredEvidenceFor(ownerPrivate("查一下 OATP 群 1121579672 里这个人的群昵称和群名片")),
+    ).toEqual([
+      {
+        domain: "group_member_profile",
+        tool: "qq_group_members",
+        input: {
+          groupId: "1121579672",
+          operation: "get_group_member_list",
+        },
+      },
+    ]);
   });
 });

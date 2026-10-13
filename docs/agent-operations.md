@@ -417,6 +417,12 @@ Trace
 
 Avoid hardcoded development-machine paths and desktop-only dependencies.
 
+Legacy Task delegation records `task.worker_dispatch_confirmed` only after the actual Worker has received its prompt successfully. The append-only Ops event binds the Task, TaskAttempt, WorkerBinding, delegation Run and Principal to the observed Herdr session, workspace, pane and Agent identity. It does not contain prompt content or a prompt digest. The Task retains its creation Run, and the existing Worker binding event keeps its original meaning. Failed dispatch does not create a confirmation, and older records are not backfilled.
+
+When a Worker file operation uses a product Workspace, its `worker.tool` event records both `decisionId` for the Worker file permission and `workspaceDecisionId` for the Workspace permission. Acceptance rechecks both decisions against their Principal, Resource, Action, scope and creation Run. A historical event without the Workspace decision reference cannot prove Workspace authorization. Existing events remain unchanged.
+
+Final acceptance inspection uses historical events and each Run's original Trace for earlier stages, then independently reads the current terminal state and retained artifact. Current DONE state cannot substitute for historical creation, delegation or review evidence. An acceptance manifest and a successful guarded call can demonstrate enforcement by the pinned runtime, but sanitized Trace does not contain the omitted prompt or Worker file input bytes.
+
 ## Security rules
 
 Herdr is a high-authority execution surface.
@@ -562,3 +568,22 @@ conclusive post-send evidence.
 Committed management access checks the remote address against `127.0.0.1`, `::1`, and IPv4-mapped loopback, then checks the allowed Host, optional Origin, and Bearer management token. See [`management/access.ts`](../apps/server/src/management/access.ts).
 
 The [Issue #156 audit](https://github.com/lora-sys/Glassbox-Agent-Harness/issues/156) also described an uncommitted LAN-address allowlist and `0.0.0.0` listener change. Those changes are not part of the committed implementation documented here. If adopted, they require a separate authorization-boundary review and a documentation update in the same change.
+
+
+## Worker dispatch diagnostics
+
+A legacy delegation that cannot start still records its failed TaskAttempt. Its result includes
+`dispatchFailure.phase` and a fixed `dispatchFailure.code`; the same code is appended to the
+Task trace. Missing file grants for the configured Worker resource produce
+`worker_file_authority_missing`. This does not grant access or launch Herdr. Configuration changes
+to the Worker target require explicit grants through local management for that target.
+
+Status and output tools return `worker_not_started` when the authorized Task has no attempt or
+WorkerBinding, and `worker_binding_unverified` when its Worker identity is unverified. Provider
+messages and workspace paths are not included in these codes. An unknown dispatch error remains
+`worker_dispatch_failed`; callers must inspect partial launch evidence before retrying.
+
+When a completed Run's answer fails the outgoing content policy, the original candidate stays
+in protected evidence and is excluded from later model Context. Glassbox sends a fixed notice
+through the same delivery authorization and deduplication path. The notice does not claim that
+an operation was rolled back or not performed. Denied delivery authority still prevents sending.

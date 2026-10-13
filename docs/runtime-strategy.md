@@ -255,6 +255,10 @@ An installed MCP Tool is still subject to Glassbox authorization when used throu
 
 Glassbox selects the Tool schema list for each Run before it creates the Pi session. A Tool requires an explicit discovery grant for the current Principal and location before Pi receives its name, description or parameters. The Tool re-authorizes its concrete Resource and Action again when Pi calls it.
 
+For an exact QQ acceptance lease, definition-time projection also intersects the authorized operation, Resource and structured input with the existing Tool schema. Unleased Tools are excluded before construction. An expired lease or an incompatible constraint fails closed. Private managed-group inventory accepts an empty object; private provider queries require the authorized group ID, while group queries derive their group from the trusted location. Schema narrowing does not replace call-time authorization.
+
+The real Pi adapter records `toolSchemaEvidence` on `session_start` for the selected custom Tool definitions passed to Pi. The evidence contains canonical SHA-256 fingerprints and byte counts for names, descriptions and parameters, without retaining schema literals. This is a definition fingerprint, not proof of a Provider wire payload or a successful Tool execution. Fake adapters that did not construct definitions leave this evidence absent.
+
     Run caller and location
     → Tool discovery authorization
     → selected Pi Tool schemas
@@ -549,3 +553,56 @@ excluded. The fallback receives the same authorized Run input and does not creat
 change the saved preference, or retry an uncertain provider failure. Requested execution identity
 stays unchanged; append-only routing and evaluation evidence records the actual selected route
 and fallback reason.
+
+## Pi model ceilings and request budgets
+
+Native Pi models and credentials come from the configured Pi agent directory. Glassbox keeps
+the model's declared `contextWindow` and `maxTokens` unchanged. They are independent capacity
+ceilings, so equal values do not mean capacity is unknown or leave every request with zero
+input space.
+
+When the output ceiling spans the context window, Glassbox derives the current request's
+output and thinking reserves from its authorized input, available context and Pi's answer and
+thinking floors. The history projection, assembled-payload check and public Pi stream options
+use that same request budget. A later turn recalculates it as the context changes. This budget
+does not modify the Pi model or persist a replacement model configuration. Missing or invalid
+capacity still blocks execution before a provider request.
+
+Dynamic requests record `p5a-pi-dynamic-output-v1` and the derived numeric reserves in Trace.
+The existing static-reserve path keeps `p5a-context-v1`; historical evidence is unchanged.
+
+## Real QQ acceptance restrictions
+
+Local authenticated management may register a short-lived restriction for one prepared Owner
+QQ test message. It binds the trusted Principal, complete Channel scope, canonical text hash,
+external message ID and Run. Registration narrows authority; ordinary identity resolution,
+discovery, authorization, delivery and mutation-intent checks remain mandatory.
+
+The Pi runtime intersects model-visible Tool definitions with the restriction before composing
+its Tool surface. Protected calls check Tool, action, resource and structured input both before
+authorization and immediately after its asynchronous check. Provider-context requests recheck
+active restrictions, including Runs with no permitted Tools. Unsupported execution origins
+cannot register a restriction. A queued or recovered marked Run without its live binding fails
+before provider work. Restart never recreates authority from a marker in message text.
+
+Registry state is process-local and expires within thirty minutes. Local management may revoke
+by lease ID or marker. Marker revocation supports cleanup when registration succeeded but its
+response was lost. Unconfirmed cleanup blocks later acceptance and merge. Ordinary messages
+without the reserved marker follow their existing execution path.
+
+
+### Runtime reply configuration
+
+The trusted local `runtime-replies.json` file has version 1 and optional per-profile message overrides. Unknown profiles or keys, blank strings, invalid control characters and oversized files fail validation. Defaults live in `runtime/pi/gate-messages.ts`. The application loads one immutable resolver when it creates a runtime adapter and passes the same resolver to Pi prompt construction and execution gates. A wording override changes neither Principal nor authorization nor Tool availability. Existing adapters keep their selected snapshot until recreated. Media clarification follow-ups recognize both the selected wording and the old default.
+
+The exact Owner-private `/capability <groupId> <category> on|off` command requires the matching successful `owner_group_admin.set_capability` input. A missing Tool or mismatched result cannot support a completed-operation reply. Current call-time authorization and input-bound acceptance leases still apply.
+
+
+### Current QQ bot role evidence
+
+A question about the Bot's native administrator or owner role requires a successful
+`qq_group_members` call with `operation: get_group_member_info`. The evidence binds
+`params.user_id` to the Bot identity from the trusted Channel scope. Owner-private
+questions also bind the named group. Group questions use the current authorized group.
+A missing, failed, or mismatched read cannot support a factual role answer. This evidence
+requirement neither exposes the Tool nor grants permission to execute it.

@@ -1,14 +1,17 @@
 import type { HistorySyncOutcome } from "../runtime/pi/history-tools.js";
+import type { CallerContext } from "../identity/scope.js";
 
 /** One configured group whose history this server is responsible for pulling. */
 export interface HistorySyncTarget {
   connectionId: string;
   groupId: string;
+  /** The configured Owner scope whose current history:read grant authorizes collection. */
+  caller?: CallerContext;
 }
 
 export type HistorySyncRun = (
   target: HistorySyncTarget,
-  options: { maxPages: number },
+  options: { maxPages: number; mode: "poll" | "backfill" },
 ) => Promise<HistorySyncOutcome>;
 
 /** What the last sync of one target actually did, so a silent stall is visible. */
@@ -136,14 +139,16 @@ export class GroupHistoryPoller {
    * deeper walk, and the same idempotent ingest dedupes what the gap already covered.
    */
   async backfill(target: HistorySyncTarget, maxPages: number): Promise<HistorySyncOutcome> {
-    return this.recorded(target, async () => this.run(target, { maxPages }));
+    return this.recorded(target, async () => this.run(target, { maxPages, mode: "backfill" }));
   }
 
   private async walk(): Promise<void> {
     const targets = await this.listTargets();
     for (const target of targets) {
       if (this.stopped) return;
-      await this.recorded(target, async () => this.run(target, { maxPages: this.maxPages }));
+      await this.recorded(target, async () =>
+        this.run(target, { maxPages: this.maxPages, mode: "poll" }),
+      );
     }
   }
 
